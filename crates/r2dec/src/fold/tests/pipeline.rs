@@ -1,7 +1,11 @@
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+    use std::{
+        collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+        ops::Deref,
+        sync::Arc,
+    };
 
     use crate::analysis::PtrArith;
     use crate::fold::context::{EffectRenderProofKind, empty_function_facts};
@@ -15,8 +19,8 @@ mod tests {
     use r2il::{ArchSpec, R2ILBlock, R2ILOp, RegisterDef, SpaceId, Varnode};
     use r2types::{
         CalleeArgEffect, CalleeFact, CalleeReturnRelation, ExternalField, ExternalStackBase,
-        ExternalStackVarSpec, ExternalStruct, ExternalTypeDb, FieldAccessCertificate, Signedness,
-        SolvedTypes, SolverDiagnostics, StackSlotKey, StructShape, TypeArena, TypeId, TypeOracle,
+        ExternalStackVarSpec, ExternalStruct, ExternalTypeDb, Signedness, SolvedTypes,
+        SolverDiagnostics, StackSlotKey, StructShape, TypeArena, TypeId, TypeOracle,
         VisibleBinding, VisibleBindingKind,
     };
 
@@ -41,35 +45,6 @@ mod tests {
         SSAVar::new(name, version, size)
     }
 
-    fn insert_test_stack_slot(
-        render: &mut r2types::FunctionRenderFacts,
-        object: r2ssa::ObjectId,
-        base: r2ssa::StackAddressBase,
-        offset: i64,
-    ) {
-        let id = r2ssa::SemanticId::stack_slot(object);
-        render.certified_entities.insert(
-            id,
-            r2types::CertifiedEntity::StackSlot {
-                id,
-                object,
-                base,
-                offset,
-                size: None,
-            },
-        );
-    }
-
-    fn test_stack_render_facts(
-        object: r2ssa::ObjectId,
-        base: r2ssa::StackAddressBase,
-        offset: i64,
-    ) -> r2types::FunctionRenderFacts {
-        let mut render = r2types::FunctionRenderFacts::default();
-        insert_test_stack_slot(&mut render, object, base, offset);
-        render
-    }
-
     fn make_block(ops: Vec<SSAOp>) -> SSABlock {
         SSABlock {
             addr: 0x1000,
@@ -87,8 +62,13 @@ mod tests {
         arch.add_register(RegisterDef::sub("EDI", 0x10, 4, "RDI"));
         arch.add_register(RegisterDef::new("RSI", 0x18, 8));
         arch.add_register(RegisterDef::sub("ESI", 0x18, 4, "RSI"));
+        arch.add_register(RegisterDef::new("RDX", 0x38, 8));
+        arch.add_register(RegisterDef::new("RCX", 0x40, 8));
+        arch.add_register(RegisterDef::new("R8", 0x48, 8));
+        arch.add_register(RegisterDef::new("R9", 0x50, 8));
         arch.add_register(RegisterDef::new("RBP", 0x20, 8));
         arch.add_register(RegisterDef::new("RSP", 0x28, 8));
+        arch.add_register(RegisterDef::new("RIP", 0x30, 8));
         arch
     }
 
@@ -96,16 +76,191 @@ mod tests {
         let mut arch = ArchSpec::new("aarch64");
         arch.add_register(RegisterDef::new("x0", 0x4000, 8));
         arch.add_register(RegisterDef::sub("w0", 0x4000, 4, "x0"));
+        for index in 1..8 {
+            let offset = 0x4000 + index * 8;
+            arch.add_register(RegisterDef::new(format!("x{index}"), offset, 8));
+            arch.add_register(RegisterDef::sub(
+                format!("w{index}"),
+                offset,
+                4,
+                format!("x{index}"),
+            ));
+        }
         arch.add_register(RegisterDef::new("x8", 0x4040, 8));
         arch.add_register(RegisterDef::sub("w8", 0x4040, 4, "x8"));
         arch.add_register(RegisterDef::new("x20", 0x40a0, 8));
         arch.add_register(RegisterDef::sub("w20", 0x40a0, 4, "x20"));
         arch.add_register(RegisterDef::new("x30", 0x40f0, 8));
+        arch.add_register(RegisterDef::new("sp", 0x4100, 8));
         arch
     }
 
-    fn prepared_from_r2il_blocks(blocks: &[R2ILBlock], arch: &ArchSpec) -> r2ssa::SsaArtifact {
-        r2ssa::SsaArtifact::for_decompile(blocks, Some(arch)).expect("prepared SSA should build")
+    struct SourceOwnedPreparedFixture {
+        facts: r2types::function_facts::SourceOwnedFunctionFacts,
+    }
+
+    impl SourceOwnedPreparedFixture {
+        fn new(prepared: r2ssa::SsaArtifact) -> Self {
+            Self::new_with_context(prepared, r2types::ParsedExternalContext::default())
+        }
+
+        fn new_with_context(
+            prepared: r2ssa::SsaArtifact,
+            parsed_context: r2types::ParsedExternalContext,
+        ) -> Self {
+            let source = Arc::new(prepared);
+            let request =
+                r2types::TypeWritebackAnalysisRequest::new(Arc::clone(&source), parsed_context)
+                    .expect("fixture assumptions must match the exact source");
+            let analysis = r2types::build_source_owned_type_writeback_analysis(request)
+                .expect("fixture must produce source-owned analysis");
+            let facts = analysis
+                .finalize_for_decompile(r2types::DecompileFinalization {
+                    kind: r2types::DecompileRouteKind::Standard,
+                    reason: "r2dec fold pipeline source fixture".to_string(),
+                    fallback_comment: None,
+                })
+                .expect("fixture must finalize against its exact source");
+            Self { facts }
+        }
+
+        fn with_name(self, name: impl Into<String>) -> Self {
+            let source = self.facts.shared_source();
+            drop(self.facts);
+            let prepared = Arc::try_unwrap(source)
+                .expect("fixture must retain the only prepared source owner")
+                .with_name(name);
+            Self::new(prepared)
+        }
+
+        fn with_context(self, parsed_context: r2types::ParsedExternalContext) -> Self {
+            let source = self.facts.shared_source();
+            drop(self.facts);
+            let prepared = Arc::try_unwrap(source)
+                .expect("fixture must retain the only prepared source owner");
+            Self::new_with_context(prepared, parsed_context)
+        }
+
+        fn function_facts(&self) -> &r2types::FunctionFacts {
+            self.facts.report()
+        }
+    }
+
+    impl Deref for SourceOwnedPreparedFixture {
+        type Target = r2ssa::SsaArtifact;
+
+        fn deref(&self) -> &Self::Target {
+            self.facts.source()
+        }
+    }
+
+    fn source_owned_fixture(prepared: r2ssa::SsaArtifact) -> SourceOwnedPreparedFixture {
+        SourceOwnedPreparedFixture::new(prepared)
+    }
+
+    fn prepared_from_r2il_blocks(
+        blocks: &[R2ILBlock],
+        arch: &ArchSpec,
+    ) -> SourceOwnedPreparedFixture {
+        let storage = |offset| r2ssa::CanonicalStorageId {
+            space: r2ssa::CanonicalStorageSpace::Register,
+            offset,
+            size: 8,
+        };
+        let (calling_convention, parameter_offsets, return_storage, return_address, stack_pointer) =
+            if arch.name.eq_ignore_ascii_case("aarch64") {
+                (
+                    "aapcs64",
+                    (0..8).map(|index| 0x4000 + index * 8).collect::<Vec<_>>(),
+                    storage(0x4000),
+                    storage(0x40f0),
+                    storage(0x4100),
+                )
+            } else {
+                (
+                    "sysv64",
+                    vec![0x10, 0x18, 0x38, 0x40, 0x48, 0x50],
+                    storage(0),
+                    storage(0x30),
+                    storage(0x28),
+                )
+            };
+        let parameters = parameter_offsets
+            .into_iter()
+            .enumerate()
+            .map(|(index, offset)| {
+                r2ssa::SourceAbiParameterSpec::new(index as u32, storage(offset))
+            })
+            .collect::<Vec<_>>();
+        let interface = r2ssa::SourceFunctionInterface::new_exact(
+            b"r2dec-fold-pipeline-source-v1".to_vec(),
+            calling_convention,
+            parameters,
+            r2ssa::SourceFunctionReturn::Register {
+                storage: return_storage,
+            },
+            [],
+        )
+        .and_then(|interface| interface.with_return_address_storage(return_address))
+        .and_then(|interface| interface.with_stack_pointer_storage(stack_pointer))
+        .expect("exact source interface");
+        source_owned_fixture(
+            r2ssa::SsaArtifact::for_decompile_with_interface(blocks, Some(arch), interface)
+                .expect("prepared SSA should build"),
+        )
+    }
+
+    fn prepared_x86_with_stack_slot(
+        blocks: &[R2ILBlock],
+        arch: &ArchSpec,
+        base: r2ssa::StackAddressBase,
+        offset: i64,
+        size: u32,
+    ) -> SourceOwnedPreparedFixture {
+        let storage = |offset| r2ssa::CanonicalStorageId {
+            space: r2ssa::CanonicalStorageSpace::Register,
+            offset,
+            size: 8,
+        };
+        let base_storage = match base {
+            r2ssa::StackAddressBase::FramePointer => storage(0x20),
+            r2ssa::StackAddressBase::StackPointer => storage(0x28),
+        };
+        let parameters = [0x10, 0x18, 0x38, 0x40, 0x48, 0x50]
+            .into_iter()
+            .enumerate()
+            .map(|(index, offset)| {
+                r2ssa::SourceAbiParameterSpec::new(index as u32, storage(offset))
+            })
+            .collect::<Vec<_>>();
+        let interface = r2ssa::SourceFunctionInterface::new_exact(
+            b"r2dec-fold-pipeline-stack-source-v1".to_vec(),
+            "sysv64",
+            parameters,
+            r2ssa::SourceFunctionReturn::Register {
+                storage: storage(0),
+            },
+            [r2ssa::SourceStackSlotSpec::new_local(
+                base,
+                base_storage,
+                offset,
+                size,
+            )],
+        )
+        .and_then(|interface| interface.with_return_address_storage(storage(0x30)))
+        .and_then(|interface| interface.with_stack_pointer_storage(storage(0x28)))
+        .and_then(|interface| {
+            if base == r2ssa::StackAddressBase::FramePointer {
+                interface.with_frame_pointer_storage(storage(0x20))
+            } else {
+                Ok(interface)
+            }
+        })
+        .expect("exact stack source interface");
+        source_owned_fixture(
+            r2ssa::SsaArtifact::for_decompile_with_interface(blocks, Some(arch), interface)
+                .expect("prepared stack SSA should build"),
+        )
     }
 
     fn call_arg(expr: CExpr) -> crate::analysis::CallArgBinding {
@@ -385,7 +540,7 @@ mod tests {
             .insert(alias.to_string(), source_call);
     }
 
-    fn prepared_zero_arg_helper_call(name: &str) -> r2ssa::SsaArtifact {
+    fn prepared_zero_arg_helper_call(name: &str) -> SourceOwnedPreparedFixture {
         let arch = make_test_arch_x86_64();
         let mut entry = R2ILBlock::new(0x1000, 4);
         entry.push(R2ILOp::Copy {
@@ -398,7 +553,38 @@ mod tests {
         prepared_from_r2il_blocks(&[entry], &arch).with_name(name)
     }
 
-    fn prepared_zero_arg_helper_return(name: &str) -> r2ssa::SsaArtifact {
+    fn prepared_zero_arg_helper_call_with_stack_slot(
+        name: &str,
+        base: r2ssa::StackAddressBase,
+        offset: i64,
+    ) -> SourceOwnedPreparedFixture {
+        let arch = make_test_arch_x86_64();
+        let mut entry = R2ILBlock::new(0x1000, 4);
+        entry.push(R2ILOp::Copy {
+            dst: Varnode::unique(1, 8),
+            src: Varnode::constant(0x401050, 8),
+        });
+        entry.push(R2ILOp::Call {
+            target: Varnode::unique(1, 8),
+        });
+        let base_offset = match base {
+            r2ssa::StackAddressBase::FramePointer => 0x20,
+            r2ssa::StackAddressBase::StackPointer => 0x28,
+        };
+        entry.push(R2ILOp::IntSub {
+            dst: Varnode::unique(0x500, 8),
+            a: Varnode::register(base_offset, 8),
+            b: Varnode::constant(offset.unsigned_abs(), 8),
+        });
+        entry.push(R2ILOp::Store {
+            space: SpaceId::Ram,
+            addr: Varnode::unique(0x500, 8),
+            val: Varnode::constant(0, 8),
+        });
+        prepared_x86_with_stack_slot(&[entry], &arch, base, offset, 8).with_name(name)
+    }
+
+    fn prepared_zero_arg_helper_return(name: &str) -> SourceOwnedPreparedFixture {
         let arch = make_test_arch_x86_64();
         let mut entry = R2ILBlock::new(0x1000, 4);
         entry.push(R2ILOp::Copy {
@@ -778,6 +964,12 @@ mod tests {
         source_call: (u64, usize),
     ) -> r2types::FunctionCallResultFacts {
         let mut facts = test_call_result_facts(prepared);
+        let (&object, slot) = prepared
+            .certificates()
+            .stack_slots
+            .iter()
+            .find(|(_, slot)| slot.offset == -8)
+            .expect("owner mutation requires an exact source-declared stack slot");
         let callsite = r2types::CallsiteKey {
             block_addr: source_call.0,
             op_index: source_call.1,
@@ -790,36 +982,23 @@ mod tests {
         for value in values {
             if let Some(fact) = facts.by_value.get_mut(&value) {
                 fact.owner = Some(r2ssa::ValueOwner::StackSlot {
-                    object: r2ssa::ObjectId(1),
-                    offset: -8,
+                    object,
+                    offset: slot.offset,
                 });
             }
         }
         facts
     }
 
-    fn install_stack_owner_function_facts(
-        ctx: &mut FoldingContext<'_>,
-        prepared: &r2ssa::SsaArtifact,
+    fn install_stack_owner_function_facts<'a>(
+        ctx: &mut FoldingContext<'a>,
+        prepared: &'a SourceOwnedPreparedFixture,
         call_result_facts: r2types::FunctionCallResultFacts,
         name: &str,
         offset: i64,
     ) {
-        let mut render_facts = test_render_facts(prepared);
-        for fact in call_result_facts.by_value.values() {
-            if let Some(r2ssa::ValueOwner::StackSlot {
-                object,
-                offset: owner_offset,
-            }) = fact.owner
-            {
-                insert_test_stack_slot(
-                    &mut render_facts,
-                    object,
-                    r2ssa::StackAddressBase::StackPointer,
-                    owner_offset,
-                );
-            }
-        }
+        ctx.inputs.function_facts = prepared.function_facts();
+        let render_facts = test_render_facts(prepared);
         mutate_function_facts(ctx, |function_facts| {
             function_facts.replace_type_facts(r2types::FunctionTypeFacts {
                 stack_slots: BTreeMap::from([(
@@ -840,126 +1019,16 @@ mod tests {
                 ..r2types::FunctionTypeFacts::default()
             });
             function_facts.set_call_results(call_result_facts);
-            function_facts.set_render(render_facts);
         });
-    }
-
-    fn test_control_facts(prepared: &r2ssa::SsaArtifact) -> r2types::FunctionControlFacts {
-        let predicates = prepared.predicates();
-        let certificates = prepared.certificates();
-        let sorted_u64s = |values: &[u64]| {
-            let mut values = values.to_vec();
-            values.sort_unstable();
-            values
-        };
-        let branch_predicates = predicates
-            .predicates
-            .values()
-            .map(|predicate| {
-                (
-                    predicate.block_addr,
-                    r2types::BranchPredicateFact {
-                        id: predicate.id,
-                        block_addr: predicate.block_addr,
-                        condition: predicate.condition,
-                        comparison: predicate.comparison.as_ref().map(|comparison| {
-                            r2types::PredicateComparisonFact {
-                                kind: comparison.kind,
-                                lhs: comparison.lhs,
-                                rhs: comparison.rhs,
-                            }
-                        }),
-                        evaluated_comparison: predicate.evaluated_comparison.as_ref().map(
-                            |comparison| r2types::PredicateComparisonFact {
-                                kind: comparison.kind,
-                                lhs: comparison.lhs,
-                                rhs: comparison.rhs,
-                            },
-                        ),
-                        render_comparison: predicate.comparison.as_ref().map(|comparison| {
-                            r2types::PredicateComparisonFact {
-                                kind: comparison.kind,
-                                lhs: comparison.lhs,
-                                rhs: comparison.rhs,
-                            }
-                        }),
-                        true_target: predicate.true_target,
-                        false_target: predicate.false_target,
-                    },
-                )
-            })
-            .collect();
-        let block_assumptions = predicates
-            .block_assumptions
-            .iter()
-            .map(|(block_addr, assumptions)| {
-                (
-                    *block_addr,
-                    assumptions
-                        .iter()
-                        .map(|assumption| r2types::ControlBlockAssumptionFact {
-                            predecessor: assumption.predecessor,
-                            predicate: assumption.predicate,
-                            truth: assumption.truth,
-                        })
-                        .collect(),
-                )
-            })
-            .collect();
-        let loops = certificates
-            .loops
-            .iter()
-            .map(|(loop_id, cert)| {
-                (
-                    *loop_id,
-                    r2types::LoopStructureFact {
-                        loop_id: *loop_id,
-                        proof_node: cert.proof_node.to_string(),
-                        header: cert.header,
-                        condition: cert.condition,
-                        condition_value: cert
-                            .condition
-                            .and_then(|id| predicates.predicates.get(&id).map(|p| p.condition)),
-                        body: sorted_u64s(&cert.body),
-                        latches: sorted_u64s(&cert.latches),
-                        exits: sorted_u64s(&cert.exits),
-                    },
-                )
-            })
-            .collect();
-        let switches = predicates
-            .switches
-            .iter()
-            .map(|(block_addr, switch)| {
-                (
-                    *block_addr,
-                    r2types::SwitchSelectorFact {
-                        proof_node: r2ssa::ProofNodeId::switch_certificate(*block_addr).to_string(),
-                        block_addr: switch.block_addr,
-                        selector: switch.selector,
-                        cases: switch.cases.clone(),
-                        default: switch.default,
-                    },
-                )
-            })
-            .collect();
-        r2types::FunctionControlFacts {
-            branch_predicates,
-            block_assumptions,
-            loops,
-            switches,
-            control_domains: prepared.control_domains().clone(),
-        }
-    }
-
-    fn test_render_facts(prepared: &r2ssa::SsaArtifact) -> r2types::FunctionRenderFacts {
-        let mut facts = r2types::FunctionFacts::default()
-            .with_render(r2types::FunctionRenderFacts::from_prepared(prepared));
-        facts.populate_certified_parameter_exprs(
-            prepared,
-            &r2types::ParamSlotResolver::from_arch_name(Some("x86-64")),
+        assert_eq!(
+            ctx.inputs.function_facts.render_facts(),
+            &render_facts,
+            "stack-owner rendering must come from the exact source-owned report"
         );
-        facts.render_facts().clone()
+    }
+
+    fn test_render_facts(prepared: &SourceOwnedPreparedFixture) -> r2types::FunctionRenderFacts {
+        prepared.function_facts().render_facts().clone()
     }
 
     fn install_function_facts(ctx: &mut FoldingContext<'_>, facts: r2types::FunctionFacts) {
@@ -984,15 +1053,6 @@ mod tests {
             type_facts.callee_facts = facts;
             function_facts.replace_type_facts(type_facts);
         });
-    }
-
-    fn function_facts_for_prepared(prepared: &r2ssa::SsaArtifact) -> r2types::FunctionFacts {
-        r2types::FunctionFacts::new(r2types::FunctionTypeFacts::default(), None)
-            .with_callsites(test_callsite_facts(prepared))
-            .with_call_results(test_call_result_facts(prepared))
-            .with_call_render(test_call_render_facts(prepared))
-            .with_control(test_control_facts(prepared))
-            .with_render(test_render_facts(prepared))
     }
 
     fn install_function_callsite_facts(
@@ -1035,15 +1095,28 @@ mod tests {
         mutate_function_facts(ctx, |function_facts| function_facts.set_control(facts));
     }
 
-    fn install_function_render_facts(
-        ctx: &mut FoldingContext<'_>,
-        facts: r2types::FunctionRenderFacts,
-    ) {
-        mutate_function_facts(ctx, |function_facts| function_facts.set_render(facts));
-    }
-
     fn remove_function_render_facts(ctx: &mut FoldingContext<'_>) {
-        install_function_render_facts(ctx, r2types::FunctionRenderFacts::default());
+        let mut facts = r2types::FunctionFacts::new(
+            ctx.inputs.function_facts.type_facts().clone(),
+            ctx.inputs.function_facts.semantic_artifact().cloned(),
+        );
+        facts = facts.with_assumptions(ctx.inputs.function_facts.assumptions().clone());
+        if let Some(callsites) = ctx.inputs.function_facts.callsites().cloned() {
+            facts.set_callsites(callsites);
+        }
+        if let Some(call_results) = ctx.inputs.function_facts.call_results().cloned() {
+            facts.set_call_results(call_results);
+        }
+        if let Some(call_render) = ctx.inputs.function_facts.call_render().cloned() {
+            facts.set_call_render(call_render);
+        }
+        if let Some(control) = ctx.inputs.function_facts.control().cloned() {
+            facts.set_control(control);
+        }
+        if let Some(route) = ctx.inputs.function_facts.decompile_route().cloned() {
+            facts = facts.with_decompile_route(route);
+        }
+        install_function_facts(ctx, facts);
     }
 
     fn standard_route_for_test(reason: &str) -> r2types::DecompileRouteFacts {
@@ -1053,11 +1126,6 @@ mod tests {
             fallback_comment: None,
             skip_runtime_type_inference: true,
             use_prepared_semantic_view: true,
-            proof_coverage: r2sym::ProofCoverage::default(),
-            render_permission: r2sym::RenderPermission::residual(
-                r2sym::ProofOwner::R2engine,
-                reason,
-            ),
         }
     }
 
@@ -1098,30 +1166,6 @@ mod tests {
         });
     }
 
-    fn install_string_literal_render_fact(
-        ctx: &mut FoldingContext<'_>,
-        value: r2ssa::ValueId,
-        address: u64,
-        text: &str,
-    ) {
-        let mut render_facts = ctx
-            .inputs
-            .function_facts
-            .render()
-            .cloned()
-            .unwrap_or_else(r2types::FunctionRenderFacts::default);
-        render_facts.string_literals_by_value.insert(
-            value,
-            r2types::function_facts::StringLiteralRenderFact {
-                value,
-                address,
-                text: text.to_string(),
-                source: r2types::function_facts::StringLiteralRenderSource::TypedFunctionFacts,
-            },
-        );
-        install_function_render_facts(ctx, render_facts);
-    }
-
     fn test_call_render_facts(prepared: &r2ssa::SsaArtifact) -> r2types::FunctionCallRenderFacts {
         let call_results = test_call_result_facts(prepared);
         let by_callsite = prepared
@@ -1157,20 +1201,20 @@ mod tests {
     }
 
     fn make_x86_64_ctx_with_prepared<'a>(
-        prepared_ssa: &'a r2ssa::SsaArtifact,
+        prepared_ssa: &'a SourceOwnedPreparedFixture,
     ) -> FoldingContext<'a> {
         let mut ctx = make_x86_64_ctx();
         ctx.inputs.prepared_ssa = Some(prepared_ssa);
-        install_function_facts(&mut ctx, function_facts_for_prepared(prepared_ssa));
+        ctx.inputs.function_facts = prepared_ssa.function_facts();
         ctx
     }
 
     fn make_aarch64_ctx_with_prepared<'a>(
-        prepared_ssa: &'a r2ssa::SsaArtifact,
+        prepared_ssa: &'a SourceOwnedPreparedFixture,
     ) -> FoldingContext<'a> {
         let mut ctx = make_aarch64_ctx();
         ctx.inputs.prepared_ssa = Some(prepared_ssa);
-        install_function_facts(&mut ctx, function_facts_for_prepared(prepared_ssa));
+        ctx.inputs.function_facts = prepared_ssa.function_facts();
         ctx
     }
 
@@ -1313,14 +1357,14 @@ mod tests {
         entry.push(R2ILOp::Return {
             target: Varnode::constant(0, 8),
         });
-        let prepared = prepared_from_r2il_blocks(&[entry], &arch).with_name("certified_stack_name");
-        let render_facts = || {
-            test_stack_render_facts(
-                r2ssa::ObjectId(1),
-                r2ssa::StackAddressBase::FramePointer,
-                -8,
-            )
-        };
+        let prepared = prepared_x86_with_stack_slot(
+            &[entry],
+            &arch,
+            r2ssa::StackAddressBase::FramePointer,
+            -8,
+            8,
+        )
+        .with_name("certified_stack_name");
         let stack_binding = |ty| VisibleBinding {
             name: "buf".to_string(),
             ty,
@@ -1334,7 +1378,6 @@ mod tests {
         };
 
         let mut missing_type_ctx = make_x86_64_ctx_with_prepared(&prepared);
-        install_function_render_facts(&mut missing_type_ctx, render_facts());
         install_certified_function_facts(&mut missing_type_ctx);
         missing_type_ctx.inputs.visible_bindings = Box::leak(Box::new(vec![stack_binding(None)]));
         missing_type_ctx
@@ -1373,7 +1416,6 @@ mod tests {
         );
 
         let mut typed_ctx = make_x86_64_ctx_with_prepared(&prepared);
-        install_function_render_facts(&mut typed_ctx, render_facts());
         typed_ctx.inputs.visible_bindings = Box::leak(Box::new(vec![stack_binding(Some(
             crate::ctype_to_type_like(&CType::Int(32)),
         ))]));
@@ -1899,7 +1941,8 @@ mod tests {
         });
         let prepared = prepared_from_r2il_blocks(&[entry], &arch)
             .with_name("prepared_direct_call_normalization");
-        let ctx = make_x86_64_ctx_with_prepared(&prepared);
+        let mut ctx = make_x86_64_ctx();
+        ctx.inputs.prepared_ssa = Some(&prepared);
 
         assert!(
             ctx.inputs.callee_resolution().is_none(),
@@ -2119,23 +2162,25 @@ mod tests {
         entry.push(R2ILOp::Call {
             target: Varnode::constant(0x401000, 8),
         });
-        let prepared = prepared_from_r2il_blocks(&[entry], &arch).with_name("prepared_policy");
-        let mut ctx = make_x86_64_ctx_with_prepared(&prepared);
-        install_function_callee_facts(
-            &mut ctx,
-            BTreeMap::from([(
-                0x401000,
-                minimal_import_callee_fact(0x401000, "sym.imp.one_arg"),
-            )]),
-        );
-        ctx.set_known_function_signatures(HashMap::from([(
-            "sym.imp.one_arg".to_string(),
-            FunctionType {
-                return_type: CType::Void,
-                params: vec![CType::Int(32)],
-                variadic: false,
-            },
-        )]));
+        let prepared = prepared_from_r2il_blocks(&[entry], &arch)
+            .with_name("prepared_policy")
+            .with_context(r2types::ParsedExternalContext {
+                callee_facts: BTreeMap::from([(
+                    0x401000,
+                    minimal_import_callee_fact(0x401000, "sym.imp.one_arg"),
+                )]),
+                known_function_signatures: HashMap::from([(
+                    "sym.imp.one_arg".to_string(),
+                    FunctionType {
+                        return_type: CType::Void,
+                        params: vec![CType::Int(32)],
+                        variadic: false,
+                    }
+                    .into(),
+                )]),
+                ..r2types::ParsedExternalContext::default()
+            });
+        let ctx = make_x86_64_ctx_with_prepared(&prepared);
 
         let poisoned_rendered_callee = CExpr::Var("sym.local_poison".to_string());
         assert!(
@@ -5647,7 +5692,7 @@ mod tests {
             .expect("rdi selector value");
         let mut ctx = make_x86_64_ctx();
         ctx.inputs.prepared_ssa = Some(&prepared);
-        install_function_render_facts(&mut ctx, test_render_facts(&prepared));
+        ctx.inputs.function_facts = prepared.function_facts();
         install_function_control_facts(
             &mut ctx,
             r2types::FunctionControlFacts {
@@ -5756,7 +5801,7 @@ mod tests {
             .expect("rdi selector value");
         let mut ctx = make_x86_64_ctx();
         ctx.inputs.prepared_ssa = Some(&prepared);
-        install_function_render_facts(&mut ctx, test_render_facts(&prepared));
+        ctx.inputs.function_facts = prepared.function_facts();
         install_function_control_facts(
             &mut ctx,
             r2types::FunctionControlFacts {
@@ -6887,10 +6932,11 @@ mod tests {
         .expect("exact return-address storage")
         .with_stack_pointer_storage(stack_pointer)
         .expect("exact stack-pointer storage");
-        let prepared =
+        let prepared = source_owned_fixture(
             r2ssa::SsaArtifact::for_decompile_with_interface(&[entry], Some(&arch), interface)
                 .expect("typed prepared SSA should build")
-                .with_name("defining_load_owner");
+                .with_name("defining_load_owner"),
+        );
         let block = prepared
             .function()
             .get_block(0x1000)
@@ -11591,7 +11637,11 @@ mod tests {
 
     #[test]
     fn certified_call_result_alias_accepts_prepared_function_facts_owner() {
-        let prepared = prepared_zero_arg_helper_call("certified_prepared_owner");
+        let prepared = prepared_zero_arg_helper_call_with_stack_slot(
+            "certified_prepared_owner",
+            r2ssa::StackAddressBase::StackPointer,
+            -8,
+        );
         let mut ctx = make_x86_64_ctx();
         ctx.inputs.prepared_ssa = Some(&prepared);
         let source_call = (0x1000, 1);
@@ -11641,7 +11691,11 @@ mod tests {
 
     #[test]
     fn certified_stack_home_store_suppression_requires_value_owner_fact() {
-        let prepared = prepared_zero_arg_helper_call("certified_stack_home_store_direct_owner");
+        let prepared = prepared_zero_arg_helper_call_with_stack_slot(
+            "certified_stack_home_store_direct_owner",
+            r2ssa::StackAddressBase::StackPointer,
+            -8,
+        );
         let source_call = (0x1000, 1);
         let mut ctx = make_x86_64_ctx_with_prepared(&prepared);
         let call_result_facts =
@@ -11711,8 +11765,24 @@ mod tests {
             dst: Varnode::register(0x10, 8),
             src: Varnode::register(0x00, 8),
         });
-        let prepared = prepared_from_r2il_blocks(&[entry], &arch)
-            .with_name("certified_stack_home_store_local_recovered_value");
+        entry.push(R2ILOp::IntSub {
+            dst: Varnode::unique(0x500, 8),
+            a: Varnode::register(0x28, 8),
+            b: Varnode::constant(8, 8),
+        });
+        entry.push(R2ILOp::Store {
+            space: SpaceId::Ram,
+            addr: Varnode::unique(0x500, 8),
+            val: Varnode::constant(0, 8),
+        });
+        let prepared = prepared_x86_with_stack_slot(
+            &[entry],
+            &arch,
+            r2ssa::StackAddressBase::StackPointer,
+            -8,
+            8,
+        )
+        .with_name("certified_stack_home_store_local_recovered_value");
         let source_call = (0x1000, 1);
         let mut ctx = make_x86_64_ctx_with_prepared(&prepared);
         let mut facts = test_call_result_facts_with_owner_for_source(&prepared, source_call);
@@ -12073,7 +12143,11 @@ mod tests {
 
     #[test]
     fn call_source_proof_certified_rendered_call_rejects_prepared_owner_without_function_fact() {
-        let prepared = prepared_zero_arg_helper_call("certified_source");
+        let prepared = prepared_zero_arg_helper_call_with_stack_slot(
+            "certified_source",
+            r2ssa::StackAddressBase::StackPointer,
+            -8,
+        );
         let helper_call = CExpr::call(CExpr::Var("sym.helper".to_string()), Vec::new());
 
         let mut exact_ctx = make_x86_64_ctx_with_prepared(&prepared);
@@ -18777,7 +18851,11 @@ mod tests {
 
     #[test]
     fn certified_statement_call_disposition_overrides_local_assignment_materialization() {
-        let prepared = prepared_zero_arg_helper_call("certified_call_disposition_side_effect");
+        let prepared = prepared_zero_arg_helper_call_with_stack_slot(
+            "certified_call_disposition_side_effect",
+            r2ssa::StackAddressBase::StackPointer,
+            -8,
+        );
         let source_call = (0x1000, 1);
         let mut ctx = make_x86_64_ctx_with_prepared(&prepared);
         install_certified_function_facts(&mut ctx);
@@ -18801,14 +18879,6 @@ mod tests {
             )]),
             ..PreparedSemanticView::default()
         })));
-        install_function_render_facts(
-            &mut ctx,
-            test_stack_render_facts(
-                r2ssa::ObjectId(1),
-                r2ssa::StackAddressBase::StackPointer,
-                -8,
-            ),
-        );
         ctx.inputs.visible_bindings = Box::leak(Box::new(vec![visible_stack_binding(
             "buf",
             Some(CType::Int(32)),
@@ -18992,25 +19062,13 @@ mod tests {
             )]),
             ..PreparedSemanticView::default()
         })));
-        let mut render_facts = test_render_facts(&prepared);
-        let arg_id = r2ssa::SemanticId::expression(call_cert.argument_values[0]);
-        render_facts
-            .certified_exprs
-            .entry(arg_id)
-            .and_modify(|cert| cert.fact.renderable = true)
-            .or_insert(r2types::CertifiedExpr {
-                id: arg_id,
-                fact: r2types::ExpressionRenderFact {
-                    value: call_cert.argument_values[0],
-                    defining_inst: None,
-                    width: 8,
-                    renderable: true,
-                },
-                inputs: Vec::new(),
-                bindings: BTreeSet::new(),
-                guarded_phi: None,
-            });
-        install_function_render_facts(&mut ctx, render_facts);
+        assert!(
+            ctx.inputs
+                .function_facts
+                .render_facts()
+                .expression_is_renderable(call_cert.argument_values[0]),
+            "the exact source-owned report must authorize the constant call argument"
+        );
 
         ctx.clear_effect_render_proofs();
 
@@ -19040,9 +19098,25 @@ mod tests {
             dst: Varnode::register(0x10, 8),
             src: Varnode::register(0x00, 8),
         });
+        entry.push(R2ILOp::IntSub {
+            dst: Varnode::unique(0x500, 8),
+            a: Varnode::register(0x28, 8),
+            b: Varnode::constant(8, 8),
+        });
+        entry.push(R2ILOp::Store {
+            space: SpaceId::Ram,
+            addr: Varnode::unique(0x500, 8),
+            val: Varnode::constant(0, 8),
+        });
 
-        let prepared = prepared_from_r2il_blocks(&[entry], &arch)
-            .with_name("certified_call_result_stack_alias");
+        let prepared = prepared_x86_with_stack_slot(
+            &[entry],
+            &arch,
+            r2ssa::StackAddressBase::StackPointer,
+            -8,
+            8,
+        )
+        .with_name("certified_call_result_stack_alias");
         let source_call = (0x1000, 1);
         let call_results = test_call_result_facts_with_owner_for_source(&prepared, source_call);
         let prepared_view = || PreparedSemanticView {
@@ -19102,14 +19176,6 @@ mod tests {
         );
         certified_alias_ctx.inputs.prepared_semantic_view =
             Some(Box::leak(Box::new(prepared_view())));
-        install_function_render_facts(
-            &mut certified_alias_ctx,
-            test_stack_render_facts(
-                r2ssa::ObjectId(1),
-                r2ssa::StackAddressBase::StackPointer,
-                -8,
-            ),
-        );
         certified_alias_ctx.inputs.visible_bindings =
             Box::leak(Box::new(vec![visible_stack_binding(
                 "alias",
@@ -19345,23 +19411,9 @@ mod tests {
 
         let prepared = prepared_from_r2il_blocks(&[entry], &arch)
             .with_name("certified_memory_index_without_fact");
-        let load_cert = prepared
-            .memory_certificate_for_op_site(0x1000, 0, false)
-            .expect("load memory certificate");
-        let store_cert = prepared
-            .memory_certificate_for_op_site(0x1000, 1, true)
-            .expect("store memory certificate");
-        let mut render_facts = test_render_facts(&prepared);
-        render_facts
-            .certified_effects
-            .remove(&r2ssa::SemanticId::memory_access(load_cert.access));
-        render_facts
-            .certified_effects
-            .remove(&r2ssa::SemanticId::memory_access(store_cert.access));
-
         let mut ctx = make_x86_64_ctx_with_prepared(&prepared);
         install_certified_function_facts(&mut ctx);
-        install_function_render_facts(&mut ctx, render_facts);
+        remove_function_render_facts(&mut ctx);
         let block = prepared.function().get_block(0x1000).expect("entry");
 
         ctx.current_block_addr.set(Some(0x1000));
@@ -19718,63 +19770,6 @@ mod tests {
     }
 
     #[test]
-    fn certified_string_addr_call_arg_requires_matching_value_address() {
-        let arch = make_test_arch_x86_64();
-        let mut entry = R2ILBlock::new(0x1000, 4);
-        entry.push(R2ILOp::Copy {
-            dst: Varnode::register(0x10, 8),
-            src: Varnode::constant(0x402000, 8),
-        });
-        entry.push(R2ILOp::Copy {
-            dst: Varnode::unique(1, 8),
-            src: Varnode::constant(0x401050, 8),
-        });
-        entry.push(R2ILOp::Call {
-            target: Varnode::unique(1, 8),
-        });
-
-        let prepared =
-            prepared_from_r2il_blocks(&[entry], &arch).with_name("matching_string_addr_call_arg");
-        let mut ctx = make_x86_64_ctx_with_prepared(&prepared);
-        install_certified_function_facts(&mut ctx);
-        ctx.set_function_names(HashMap::from([(0x401050, "sym.helper".to_string())]));
-        install_callsite_resolution(&mut ctx, (0x1000, 2), 0x401050, "sym.helper", None);
-        let call_cert = prepared
-            .callsite_certificate_for_op(0x1000, 2)
-            .expect("callsite certificate");
-        install_string_literal_render_fact(
-            &mut ctx,
-            call_cert.argument_values[0],
-            0x402000,
-            "matched",
-        );
-        ctx.inputs.prepared_semantic_view = Some(Box::leak(Box::new(PreparedSemanticView {
-            call_view_by_site: BTreeMap::from([(
-                (0x1000, 2),
-                crate::analysis::PreparedCallView {
-                    direct_target: Some(0x401050),
-                    callee_identity: Some(r2types::CalleeIdentity::from_name("sym.helper")),
-                    authoritative_args: vec![CExpr::StringLit("matched".to_string())],
-                    authoritative_arg_values: vec![call_cert.argument_values[0]],
-                    result_owner: None,
-                    render_fact: None,
-                },
-            )]),
-            ..PreparedSemanticView::default()
-        })));
-
-        let block = prepared.function().get_block(0x1000).expect("entry");
-        let stmt = ctx
-            .op_to_stmt_with_args(&block.ops[2], block.addr, 2)
-            .expect("call stmt");
-
-        let CStmt::Expr(CExpr::Call { args, .. }) = stmt else {
-            panic!("expected certified call expression, got {stmt:?}");
-        };
-        assert_eq!(args, vec![CExpr::StringLit("matched".to_string())]);
-    }
-
-    #[test]
     fn certified_prepared_string_arg_rejects_poisoned_render_text() {
         let arch = make_test_arch_x86_64();
         let mut entry = R2ILBlock::new(0x1000, 4);
@@ -19799,12 +19794,6 @@ mod tests {
         let call_cert = prepared
             .callsite_certificate_for_op(0x1000, 2)
             .expect("callsite certificate");
-        install_string_literal_render_fact(
-            &mut ctx,
-            call_cert.argument_values[0],
-            0x402000,
-            "matched",
-        );
         ctx.inputs.prepared_semantic_view = Some(Box::leak(Box::new(PreparedSemanticView {
             call_view_by_site: BTreeMap::from([(
                 (0x1000, 2),
@@ -19832,8 +19821,8 @@ mod tests {
         };
         assert_eq!(
             args,
-            vec![CExpr::StringLit("matched".to_string())],
-            "prepared string text must be ignored in favor of FunctionFacts value evidence"
+            vec![CExpr::IntLit(0x402000)],
+            "prepared string text must be ignored without exact source-owned string evidence"
         );
     }
 
@@ -19921,7 +19910,7 @@ mod tests {
 
         let prepared =
             prepared_from_r2il_blocks(&[entry, left, right, exit], &arch).with_name("phi_carrier");
-        let render_facts = r2types::FunctionRenderFacts::from_prepared(&prepared);
+        let render_facts = test_render_facts(&prepared);
         let normalized = crate::normalize::materialize_certified_loop_carriers(
             prepared.function(),
             &prepared,
@@ -19992,19 +19981,20 @@ mod tests {
 
         let prepared = prepared_from_r2il_blocks(&[entry, header, exit, latch], &arch)
             .with_name("certified_loop_carrier_entry");
-        let render_facts = r2types::FunctionRenderFacts::from_prepared(&prepared);
+        let render_facts = test_render_facts(&prepared);
         let normalized = crate::normalize::materialize_certified_loop_carriers(
             prepared.function(),
             &prepared,
             &render_facts,
         );
         let mut ctx = make_aarch64_ctx_with_prepared(&prepared);
-        mutate_function_facts(&mut ctx, |facts| {
-            facts.populate_certified_parameter_exprs(
-                &prepared,
-                &r2types::ParamSlotResolver::from_arch_name(Some("aarch64")),
-            );
-        });
+        assert!(
+            ctx.inputs
+                .function_facts
+                .render_facts()
+                .has_certified_parameter(0),
+            "exact source-owned finalization must retain the entry parameter proof"
+        );
         install_test_x86_64_signature(&mut ctx);
         install_certified_function_facts(&mut ctx);
         let fold_blocks = normalized.blocks().cloned().collect::<Vec<_>>();
@@ -21077,11 +21067,7 @@ mod tests {
             prepared_from_r2il_blocks(&[entry], &arch).with_name("certified_return_missing_fact");
         let mut ctx = make_x86_64_ctx_with_prepared(&prepared);
         install_certified_function_facts(&mut ctx);
-        let mut render_facts = ctx.inputs.function_facts.render_facts().clone();
-        if let Some(id) = render_facts.return_effects_by_op.remove(&(0x1000, 1)) {
-            render_facts.certified_effects.remove(&id);
-        }
-        install_function_render_facts(&mut ctx, render_facts);
+        remove_function_render_facts(&mut ctx);
 
         let block = prepared.function().get_block(0x1000).expect("entry");
         let stmts = ctx.fold_block(block, block.addr);
@@ -21151,16 +21137,9 @@ mod tests {
 
         let prepared = prepared_from_r2il_blocks(&[entry], &arch)
             .with_name("certified_return_load_missing_memory_fact");
-        let load_cert = prepared
-            .memory_certificate_for_op_site(0x1000, 0, false)
-            .expect("load memory certificate");
         let mut ctx = make_x86_64_ctx_with_prepared(&prepared);
         install_certified_function_facts(&mut ctx);
-        let mut render_facts = ctx.inputs.function_facts.render_facts().clone();
-        render_facts
-            .certified_effects
-            .remove(&r2ssa::SemanticId::memory_access(load_cert.access));
-        install_function_render_facts(&mut ctx, render_facts);
+        remove_function_render_facts(&mut ctx);
 
         let block = prepared.function().get_block(0x1000).expect("entry");
         let stmts = ctx.fold_block(block, block.addr);
@@ -21276,9 +21255,10 @@ mod tests {
     fn certified_return_call_requires_function_call_result_fact() {
         let prepared = prepared_zero_arg_helper_return("certified_return_call_result");
         let mut ctx = make_x86_64_ctx_with_prepared(&prepared);
-        mutate_function_facts(&mut ctx, |facts| {
-            facts.attach_prepared_decompile_evidence(&prepared)
-        });
+        assert!(
+            ctx.inputs.function_facts.call_results().is_some(),
+            "source-owned finalization must retain the exact call-result evidence"
+        );
         install_certified_function_facts(&mut ctx);
         let source_call = (0x1000, 1);
         ctx.set_function_names(HashMap::from([(0x401050, "sym.helper".to_string())]));
@@ -21430,42 +21410,61 @@ mod tests {
     fn certified_member_rendering_allows_exact_field_certificate() {
         let arch = make_test_arch_x86_64();
         let mut entry = R2ILBlock::new(0x1000, 4);
+        entry.push(R2ILOp::IntAdd {
+            dst: Varnode::unique(0x100, 8),
+            a: Varnode::register(0x10, 8),
+            b: Varnode::constant(8, 8),
+        });
         entry.push(R2ILOp::Load {
             dst: Varnode::register(0x00, 8),
             space: SpaceId::Ram,
-            addr: Varnode::register(0x10, 8),
+            addr: Varnode::unique(0x100, 8),
         });
-        let prepared = prepared_from_r2il_blocks(&[entry], &arch).with_name("field_with_cert");
+        let external_type_db = ExternalTypeDb {
+            structs: [(
+                "demostruct".to_string(),
+                ExternalStruct {
+                    name: "DemoStruct".to_string(),
+                    fields: [(
+                        8,
+                        ExternalField {
+                            name: "hash".to_string(),
+                            offset: 8,
+                            ty: Some("uint64_t".to_string()),
+                        },
+                    )]
+                    .into_iter()
+                    .collect(),
+                },
+            )]
+            .into_iter()
+            .collect(),
+            ..ExternalTypeDb::default()
+        };
+        let prepared = prepared_from_r2il_blocks(&[entry], &arch)
+            .with_name("field_with_cert")
+            .with_context(r2types::ParsedExternalContext {
+                register_params: vec![r2types::ExternalRegisterParamSpec {
+                    name: "arg0".to_string(),
+                    ty: Some(r2types::CTypeLike::Pointer(Box::new(
+                        r2types::CTypeLike::Struct("DemoStruct".to_string()),
+                    ))),
+                    reg: "RDI".to_string(),
+                }],
+                external_type_db,
+                ..r2types::ParsedExternalContext::default()
+            });
         let mut ctx = make_x86_64_ctx_with_prepared(&prepared);
         install_hash_field_layout(&mut ctx);
-        ctx.inputs.field_access_certificates = Box::leak(Box::new(vec![FieldAccessCertificate {
-            slot: 0,
-            field_offset: 8,
-            field_name: "hash".to_string(),
-            field_type: Some("uint64_t".to_string()),
-        }]));
-        let cert = prepared
-            .memory_certificate_for_op_site(0x1000, 0, false)
-            .expect("prepared load memory certificate");
-        let mut render_facts = ctx.inputs.function_facts.render_facts().clone();
-        render_facts
-            .member_accesses_by_op
-            .entry((0x1000, 0, false))
-            .or_default()
-            .push(r2types::MemberAccessRenderFact {
-                access: cert.access,
-                block_addr: 0x1000,
-                op_index: 0,
-                object: cert.object,
-                is_write: false,
-                field_offset: 8,
-                field_name: "hash".to_string(),
-                field_type: None,
-                access_width: 8,
-            });
-        install_function_render_facts(&mut ctx, render_facts);
+        ctx.inputs.field_access_certificates = Box::leak(Box::new(
+            prepared
+                .function_facts()
+                .type_facts()
+                .field_access_certificates
+                .clone(),
+        ));
         ctx.current_block_addr.set(Some(0x1000));
-        ctx.current_op_idx.set(Some(0));
+        ctx.current_op_idx.set(Some(1));
 
         let addr = crate::analysis::NormalizedAddr {
             base: crate::analysis::BaseRef::Value(crate::analysis::ValueRef::new(make_var(
@@ -21476,7 +21475,7 @@ mod tests {
             offset_bytes: 8,
         };
         let mut visited = HashSet::new();
-        let expr = ctx.render_access_expr_from_addr(&addr, 8, false, 0, &mut visited);
+        let expr = ctx.render_access_expr_from_addr(&addr, 8, false, 1, &mut visited);
 
         assert!(
             matches!(expr.as_ref(), Some(CExpr::PtrMember { member, .. } | CExpr::Member { member, .. }) if member == "hash"),
@@ -22531,9 +22530,15 @@ mod tests {
                 .and_then(|interface| interface.with_stack_pointer_storage(stack_pointer))
                 .and_then(|interface| interface.with_frame_pointer_storage(frame_pointer))
                 .expect("exact frame-local source interface");
-                r2ssa::SsaArtifact::for_decompile_with_interface(&[entry], Some(&arch), interface)
+                source_owned_fixture(
+                    r2ssa::SsaArtifact::for_decompile_with_interface(
+                        &[entry],
+                        Some(&arch),
+                        interface,
+                    )
                     .expect("prepared exact stack-owner fixture")
-                    .with_name("stack_owner_exact")
+                    .with_name("stack_owner_exact"),
+                )
             } else {
                 prepared_from_r2il_blocks(&[entry], &arch).with_name("stack_owner_fallback")
             };
@@ -22585,8 +22590,12 @@ mod tests {
                         ..r2types::FunctionTypeFacts::default()
                     });
                     function_facts.set_call_results(call_result_facts);
-                    function_facts.set_render(render_facts);
                 });
+                assert_eq!(
+                    ctx.inputs.function_facts.render_facts(),
+                    &render_facts,
+                    "exact frame-local source must produce the retained render facts"
+                );
             }
             ctx.set_external_stack_vars(HashMap::from([(
                 -8,

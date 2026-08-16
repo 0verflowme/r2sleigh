@@ -19,6 +19,7 @@ use r2sym::{
     SymbolicReachabilityStatus, compile_derived_summary_return_postcondition,
     compile_function_semantics_with_scope,
 };
+use std::sync::Arc;
 use z3::Context;
 use z3::ast::{BV, Bool};
 
@@ -1194,18 +1195,14 @@ fn test_query_target_guided_can_reach_finds_target_under_tight_budget() {
 #[test]
 fn compile_function_semantics_prunes_self_xor_dead_branch() {
     let arch = make_x86_64_arch();
-    let func = SsaArtifact::for_symbolic(&make_self_xor_guard_blocks(), Some(&arch))
-        .expect("symbolic ssa");
+    let func = Arc::new(
+        SsaArtifact::for_symbolic(&make_self_xor_guard_blocks(), Some(&arch))
+            .expect("symbolic ssa"),
+    );
     let ctx = Context::thread_local();
 
-    let artifact = compile_function_semantics_with_scope(
-        &ctx,
-        &func,
-        None,
-        Some(&arch),
-        &r2sym::FunctionSymbolSnapshot::default(),
-        r2sym::SummaryProfile::Default,
-    );
+    let artifact =
+        compile_function_semantics_with_scope(&ctx, &func, None, r2sym::SummaryProfile::Default);
     let region = region_for_anchor(&artifact, 0x1000);
 
     assert_eq!(
@@ -1226,7 +1223,7 @@ fn compile_function_semantics_prunes_self_xor_dead_branch() {
 }
 
 #[test]
-fn compile_function_semantics_with_scope_prunes_helper_return_dead_branch() {
+fn compile_function_semantics_with_scope_refuses_manual_helper_branch_authority() {
     let arch = make_x86_64_arch();
     let root_blocks = vec![
         R2ILBlock {
@@ -1297,18 +1294,20 @@ fn compile_function_semantics_with_scope_prunes_helper_return_dead_branch() {
         SsaArtifact::for_decompile(&root_blocks, Some(&arch)).expect("root decompile function");
     let helper =
         SsaArtifact::for_symbolic(&helper_blocks, Some(&arch)).expect("helper symbolic function");
+    let root = Arc::new(root);
+    let helper = Arc::new(helper);
     let scope = r2sym::PreparedFunctionScope::new(
         0x1000,
         vec![
             r2sym::ScopedPreparedFunction {
                 id: r2ssa::InterprocFunctionId(0x1000),
                 name: Some("root".to_string()),
-                prepared: root.clone(),
+                prepared: Arc::clone(&root),
             },
             r2sym::ScopedPreparedFunction {
                 id: r2ssa::InterprocFunctionId(0x2000),
                 name: Some("helper_zero".to_string()),
-                prepared: helper,
+                prepared: Arc::clone(&helper),
             },
         ],
     )
@@ -1319,8 +1318,6 @@ fn compile_function_semantics_with_scope_prunes_helper_return_dead_branch() {
         &ctx,
         &root,
         Some(&scope),
-        Some(&arch),
-        &r2sym::FunctionSymbolSnapshot::default(),
         r2sym::SummaryProfile::Default,
     );
     let region = region_for_anchor(&artifact, 0x1004);
@@ -1328,21 +1325,16 @@ fn compile_function_semantics_with_scope_prunes_helper_return_dead_branch() {
         region.frontier,
         std::collections::BTreeSet::from([0x1008, 0x1010])
     );
-    assert!(region.control.iter().any(|fact| {
+    assert!(!region.control.iter().any(|fact| {
         fact.value.target == 0x1010
             && fact.value.status == SymbolicReachabilityStatus::Unreachable
             && fact.value.branch_truth == Some(true)
     }));
-    assert!(region.control.iter().any(|fact| {
-        fact.value.target == 0x1008
-            && fact.value.status == SymbolicReachabilityStatus::Reachable
-            && fact.value.branch_truth == Some(false)
-    }));
-    assert_eq!(artifact.diagnostics.branches_pruned, 1);
+    assert_eq!(artifact.diagnostics.branches_pruned, 0);
 }
 
 #[test]
-fn compile_function_semantics_with_scope_marks_helper_scope_compiled() {
+fn compile_function_semantics_with_scope_does_not_promote_manual_helper_scope() {
     let arch = make_x86_64_arch();
     let root_blocks = vec![
         R2ILBlock {
@@ -1413,18 +1405,20 @@ fn compile_function_semantics_with_scope_marks_helper_scope_compiled() {
         SsaArtifact::for_decompile(&root_blocks, Some(&arch)).expect("root decompile function");
     let helper =
         SsaArtifact::for_symbolic(&helper_blocks, Some(&arch)).expect("helper symbolic function");
+    let root = Arc::new(root);
+    let helper = Arc::new(helper);
     let scope = r2sym::PreparedFunctionScope::new(
         0x1000,
         vec![
             r2sym::ScopedPreparedFunction {
                 id: r2ssa::InterprocFunctionId(0x1000),
                 name: Some("root".to_string()),
-                prepared: root.clone(),
+                prepared: Arc::clone(&root),
             },
             r2sym::ScopedPreparedFunction {
                 id: r2ssa::InterprocFunctionId(0x2000),
                 name: Some("helper_zero".to_string()),
-                prepared: helper,
+                prepared: Arc::clone(&helper),
             },
         ],
     )
@@ -1435,8 +1429,6 @@ fn compile_function_semantics_with_scope_marks_helper_scope_compiled() {
         &ctx,
         &root,
         Some(&scope),
-        Some(&arch),
-        &r2sym::FunctionSymbolSnapshot::default(),
         r2sym::SummaryProfile::Default,
     );
 
@@ -1445,15 +1437,15 @@ fn compile_function_semantics_with_scope_marks_helper_scope_compiled() {
         .expect("native artifact body")
         .summary;
 
-    assert_eq!(compiled.stage, RefinementStage::Compiled);
-    assert_eq!(summary.closure_functions, 2);
-    assert_eq!(summary.helper_functions, 1);
-    assert!(summary.derived_summaries >= 1);
-    assert_eq!(compiled.diagnostics.branches_pruned, 1);
+    assert_eq!(compiled.stage, RefinementStage::Raw);
+    assert_eq!(summary.closure_functions, 1);
+    assert_eq!(summary.helper_functions, 0);
+    assert_eq!(summary.derived_summaries, 0);
+    assert_eq!(compiled.diagnostics.branches_pruned, 0);
 }
 
 #[test]
-fn compile_function_semantics_with_scope_prunes_helper_return_spilled_dead_branch() {
+fn compile_function_semantics_with_scope_refuses_manual_spilled_helper_authority() {
     let arch = make_x86_64_arch();
     let root_blocks = vec![
         R2ILBlock {
@@ -1544,18 +1536,20 @@ fn compile_function_semantics_with_scope_prunes_helper_return_spilled_dead_branc
         SsaArtifact::for_decompile(&root_blocks, Some(&arch)).expect("root decompile function");
     let helper =
         SsaArtifact::for_symbolic(&helper_blocks, Some(&arch)).expect("helper symbolic function");
+    let root = Arc::new(root);
+    let helper = Arc::new(helper);
     let scope = r2sym::PreparedFunctionScope::new(
         0x1000,
         vec![
             r2sym::ScopedPreparedFunction {
                 id: r2ssa::InterprocFunctionId(0x1000),
                 name: Some("root".to_string()),
-                prepared: root.clone(),
+                prepared: Arc::clone(&root),
             },
             r2sym::ScopedPreparedFunction {
                 id: r2ssa::InterprocFunctionId(0x2000),
                 name: Some("helper_zero".to_string()),
-                prepared: helper,
+                prepared: Arc::clone(&helper),
             },
         ],
     )
@@ -1566,8 +1560,6 @@ fn compile_function_semantics_with_scope_prunes_helper_return_spilled_dead_branc
         &ctx,
         &root,
         Some(&scope),
-        Some(&arch),
-        &r2sym::FunctionSymbolSnapshot::default(),
         r2sym::SummaryProfile::Default,
     );
     let region = region_for_anchor(&artifact, 0x1004);
@@ -1575,21 +1567,16 @@ fn compile_function_semantics_with_scope_prunes_helper_return_spilled_dead_branc
         region.frontier,
         std::collections::BTreeSet::from([0x1008, 0x1010])
     );
-    assert!(region.control.iter().any(|fact| {
+    assert!(!region.control.iter().any(|fact| {
         fact.value.target == 0x1010
             && fact.value.status == SymbolicReachabilityStatus::Unreachable
             && fact.value.branch_truth == Some(true)
     }));
-    assert!(region.control.iter().any(|fact| {
-        fact.value.target == 0x1008
-            && fact.value.status == SymbolicReachabilityStatus::Reachable
-            && fact.value.branch_truth == Some(false)
-    }));
-    assert_eq!(artifact.diagnostics.branches_pruned, 1);
+    assert_eq!(artifact.diagnostics.branches_pruned, 0);
 }
 
 #[test]
-fn compile_function_semantics_with_scope_prunes_helper_return_dead_branch_via_eax_alias() {
+fn compile_function_semantics_with_scope_refuses_manual_eax_helper_authority() {
     let arch = make_x86_64_arch();
     let root_blocks = vec![
         R2ILBlock {
@@ -1660,18 +1647,20 @@ fn compile_function_semantics_with_scope_prunes_helper_return_dead_branch_via_ea
         SsaArtifact::for_decompile(&root_blocks, Some(&arch)).expect("root decompile function");
     let helper =
         SsaArtifact::for_symbolic(&helper_blocks, Some(&arch)).expect("helper symbolic function");
+    let root = Arc::new(root);
+    let helper = Arc::new(helper);
     let scope = r2sym::PreparedFunctionScope::new(
         0x1000,
         vec![
             r2sym::ScopedPreparedFunction {
                 id: r2ssa::InterprocFunctionId(0x1000),
                 name: Some("root".to_string()),
-                prepared: root.clone(),
+                prepared: Arc::clone(&root),
             },
             r2sym::ScopedPreparedFunction {
                 id: r2ssa::InterprocFunctionId(0x2000),
                 name: Some("helper_zero".to_string()),
-                prepared: helper,
+                prepared: Arc::clone(&helper),
             },
         ],
     )
@@ -1682,8 +1671,6 @@ fn compile_function_semantics_with_scope_prunes_helper_return_dead_branch_via_ea
         &ctx,
         &root,
         Some(&scope),
-        Some(&arch),
-        &r2sym::FunctionSymbolSnapshot::default(),
         r2sym::SummaryProfile::Default,
     );
     let region = region_for_anchor(&artifact, 0x1004);
@@ -1691,17 +1678,12 @@ fn compile_function_semantics_with_scope_prunes_helper_return_dead_branch_via_ea
         region.frontier,
         std::collections::BTreeSet::from([0x1008, 0x1010])
     );
-    assert!(region.control.iter().any(|fact| {
-        fact.value.target == 0x1010
-            && fact.value.status == SymbolicReachabilityStatus::Reachable
-            && fact.value.branch_truth == Some(true)
-    }));
-    assert!(region.control.iter().any(|fact| {
+    assert!(!region.control.iter().any(|fact| {
         fact.value.target == 0x1008
             && fact.value.status == SymbolicReachabilityStatus::Unreachable
             && fact.value.branch_truth == Some(false)
     }));
-    assert_eq!(artifact.diagnostics.branches_pruned, 1);
+    assert_eq!(artifact.diagnostics.branches_pruned, 0);
 }
 
 #[test]
@@ -2590,18 +2572,20 @@ fn derived_helper_summary_solves_return_transform() {
         SsaArtifact::for_symbolic(&root_blocks, Some(&arch)).expect("root symbolic function");
     let helper =
         SsaArtifact::for_symbolic(&helper_blocks, Some(&arch)).expect("helper symbolic function");
+    let root = Arc::new(root);
+    let helper = Arc::new(helper);
     let scope = r2sym::PreparedFunctionScope::new(
         0x1000,
         vec![
             r2sym::ScopedPreparedFunction {
                 id: r2ssa::InterprocFunctionId(0x1000),
                 name: Some("root".to_string()),
-                prepared: root.clone(),
+                prepared: Arc::clone(&root),
             },
             r2sym::ScopedPreparedFunction {
                 id: r2ssa::InterprocFunctionId(0x2000),
                 name: Some("helper_xor".to_string()),
-                prepared: helper,
+                prepared: Arc::clone(&helper),
             },
         ],
     )
@@ -2616,6 +2600,7 @@ fn derived_helper_summary_solves_return_transform() {
     let _ = registry.install_scope_summaries_for_explorer(
         &mut explorer,
         &ctx,
+        &root,
         &scope,
         Some(&arch),
         &std::collections::HashMap::new(),
@@ -2715,23 +2700,26 @@ fn derived_helper_summary_solves_transitive_return_chain() {
         SsaArtifact::for_symbolic(&helper1_blocks, Some(&arch)).expect("helper1 symbolic function");
     let helper2 =
         SsaArtifact::for_symbolic(&helper2_blocks, Some(&arch)).expect("helper2 symbolic function");
+    let root = Arc::new(root);
+    let helper1 = Arc::new(helper1);
+    let helper2 = Arc::new(helper2);
     let scope = r2sym::PreparedFunctionScope::new(
         0x1000,
         vec![
             r2sym::ScopedPreparedFunction {
                 id: r2ssa::InterprocFunctionId(0x1000),
                 name: Some("root".to_string()),
-                prepared: root.clone(),
+                prepared: Arc::clone(&root),
             },
             r2sym::ScopedPreparedFunction {
                 id: r2ssa::InterprocFunctionId(0x2000),
                 name: Some("helper_wrapper".to_string()),
-                prepared: helper1,
+                prepared: Arc::clone(&helper1),
             },
             r2sym::ScopedPreparedFunction {
                 id: r2ssa::InterprocFunctionId(0x3000),
                 name: Some("helper_xor".to_string()),
-                prepared: helper2,
+                prepared: Arc::clone(&helper2),
             },
         ],
     )
@@ -2761,6 +2749,7 @@ fn derived_helper_summary_solves_transitive_return_chain() {
     let diagnostics = registry.install_scope_summaries_for_explorer(
         &mut explorer,
         &ctx,
+        &root,
         &scope,
         Some(&arch),
         &std::collections::HashMap::new(),
@@ -2866,18 +2855,20 @@ fn derived_helper_summary_preserves_pointer_write_value() {
         SsaArtifact::for_symbolic(&root_blocks, Some(&arch)).expect("root symbolic function");
     let helper =
         SsaArtifact::for_symbolic(&helper_blocks, Some(&arch)).expect("helper symbolic function");
+    let root = Arc::new(root);
+    let helper = Arc::new(helper);
     let scope = r2sym::PreparedFunctionScope::new(
         0x1000,
         vec![
             r2sym::ScopedPreparedFunction {
                 id: r2ssa::InterprocFunctionId(0x1000),
                 name: Some("root".to_string()),
-                prepared: root.clone(),
+                prepared: Arc::clone(&root),
             },
             r2sym::ScopedPreparedFunction {
                 id: r2ssa::InterprocFunctionId(0x2000),
                 name: Some("helper_store".to_string()),
-                prepared: helper,
+                prepared: Arc::clone(&helper),
             },
         ],
     )
@@ -2890,6 +2881,7 @@ fn derived_helper_summary_preserves_pointer_write_value() {
     let _ = registry.install_scope_summaries_for_explorer(
         &mut explorer,
         &ctx,
+        &root,
         &scope,
         Some(&arch),
         &std::collections::HashMap::new(),
@@ -2984,18 +2976,20 @@ fn derived_helper_summary_compiles_backward_memory_terms() {
         SsaArtifact::for_symbolic(&root_blocks, Some(&arch)).expect("root symbolic function");
     let helper =
         SsaArtifact::for_symbolic(&helper_blocks, Some(&arch)).expect("helper symbolic function");
+    let root = Arc::new(root);
+    let helper = Arc::new(helper);
     let scope = r2sym::PreparedFunctionScope::new(
         0x1000,
         vec![
             r2sym::ScopedPreparedFunction {
                 id: r2ssa::InterprocFunctionId(0x1000),
                 name: Some("root".to_string()),
-                prepared: root.clone(),
+                prepared: Arc::clone(&root),
             },
             r2sym::ScopedPreparedFunction {
                 id: r2ssa::InterprocFunctionId(0x2000),
                 name: Some("helper_store".to_string()),
-                prepared: helper,
+                prepared: Arc::clone(&helper),
             },
         ],
     )
@@ -3053,6 +3047,7 @@ fn derived_helper_summary_compiles_backward_memory_terms() {
     let _ = registry.install_scope_summaries_for_explorer(
         &mut explorer,
         &ctx,
+        &root,
         &scope,
         Some(&arch),
         &std::collections::HashMap::new(),
@@ -3221,18 +3216,20 @@ fn derived_helper_summary_compiles_region_backed_global_memory_terms() {
         SsaArtifact::for_symbolic(&root_blocks, Some(&arch)).expect("root symbolic function");
     let helper =
         SsaArtifact::for_symbolic(&helper_blocks, Some(&arch)).expect("helper symbolic function");
+    let root = Arc::new(root);
+    let helper = Arc::new(helper);
     let scope = r2sym::PreparedFunctionScope::new(
         0x1000,
         vec![
             r2sym::ScopedPreparedFunction {
                 id: r2ssa::InterprocFunctionId(0x1000),
                 name: Some("root".to_string()),
-                prepared: root.clone(),
+                prepared: Arc::clone(&root),
             },
             r2sym::ScopedPreparedFunction {
                 id: r2ssa::InterprocFunctionId(0x3000),
                 name: Some("helper_store".to_string()),
-                prepared: helper,
+                prepared: Arc::clone(&helper),
             },
         ],
     )
@@ -3251,6 +3248,7 @@ fn derived_helper_summary_compiles_region_backed_global_memory_terms() {
     let _ = registry.install_scope_summaries_for_explorer(
         &mut explorer,
         &ctx,
+        &root,
         &scope,
         Some(&arch),
         &std::collections::HashMap::new(),
@@ -3359,18 +3357,20 @@ fn derived_helper_summary_compiles_region_backed_stack_memory_terms() {
         SsaArtifact::for_symbolic(&root_blocks, Some(&arch)).expect("root symbolic function");
     let helper =
         SsaArtifact::for_symbolic(&helper_blocks, Some(&arch)).expect("helper symbolic function");
+    let root = Arc::new(root);
+    let helper = Arc::new(helper);
     let scope = r2sym::PreparedFunctionScope::new(
         0x1000,
         vec![
             r2sym::ScopedPreparedFunction {
                 id: r2ssa::InterprocFunctionId(0x1000),
                 name: Some("root".to_string()),
-                prepared: root.clone(),
+                prepared: Arc::clone(&root),
             },
             r2sym::ScopedPreparedFunction {
                 id: r2ssa::InterprocFunctionId(0x3000),
                 name: Some("helper_store".to_string()),
-                prepared: helper,
+                prepared: Arc::clone(&helper),
             },
         ],
     )
@@ -3389,6 +3389,7 @@ fn derived_helper_summary_compiles_region_backed_stack_memory_terms() {
     let _ = registry.install_scope_summaries_for_explorer(
         &mut explorer,
         &ctx,
+        &root,
         &scope,
         Some(&arch),
         &std::collections::HashMap::new(),
@@ -3497,18 +3498,20 @@ fn derived_helper_summary_compiles_region_backed_replay_memory_terms() {
         SsaArtifact::for_symbolic(&root_blocks, Some(&arch)).expect("root symbolic function");
     let helper =
         SsaArtifact::for_symbolic(&helper_blocks, Some(&arch)).expect("helper symbolic function");
+    let root = Arc::new(root);
+    let helper = Arc::new(helper);
     let scope = r2sym::PreparedFunctionScope::new(
         0x1000,
         vec![
             r2sym::ScopedPreparedFunction {
                 id: r2ssa::InterprocFunctionId(0x1000),
                 name: Some("root".to_string()),
-                prepared: root.clone(),
+                prepared: Arc::clone(&root),
             },
             r2sym::ScopedPreparedFunction {
                 id: r2ssa::InterprocFunctionId(0x3000),
                 name: Some("helper_store".to_string()),
-                prepared: helper,
+                prepared: Arc::clone(&helper),
             },
         ],
     )
@@ -3527,6 +3530,7 @@ fn derived_helper_summary_compiles_region_backed_replay_memory_terms() {
     let _ = registry.install_scope_summaries_for_explorer(
         &mut explorer,
         &ctx,
+        &root,
         &scope,
         Some(&arch),
         &std::collections::HashMap::new(),
@@ -3640,18 +3644,20 @@ fn derived_helper_summary_region_alias_falls_back_to_residual() {
         SsaArtifact::for_symbolic(&root_blocks, Some(&arch)).expect("root symbolic function");
     let helper =
         SsaArtifact::for_symbolic(&helper_blocks, Some(&arch)).expect("helper symbolic function");
+    let root = Arc::new(root);
+    let helper = Arc::new(helper);
     let scope = r2sym::PreparedFunctionScope::new(
         0x1000,
         vec![
             r2sym::ScopedPreparedFunction {
                 id: r2ssa::InterprocFunctionId(0x1000),
                 name: Some("root".to_string()),
-                prepared: root.clone(),
+                prepared: Arc::clone(&root),
             },
             r2sym::ScopedPreparedFunction {
                 id: r2ssa::InterprocFunctionId(0x3000),
                 name: Some("helper_alias_store".to_string()),
-                prepared: helper,
+                prepared: Arc::clone(&helper),
             },
         ],
     )
@@ -3670,6 +3676,7 @@ fn derived_helper_summary_region_alias_falls_back_to_residual() {
     let _ = registry.install_scope_summaries_for_explorer(
         &mut explorer,
         &ctx,
+        &root,
         &scope,
         Some(&arch),
         &std::collections::HashMap::new(),
@@ -3788,18 +3795,20 @@ fn derived_helper_summary_coalesces_adjacent_byte_writes_into_slice() {
         SsaArtifact::for_symbolic(&root_blocks, Some(&arch)).expect("root symbolic function");
     let helper =
         SsaArtifact::for_symbolic(&helper_blocks, Some(&arch)).expect("helper symbolic function");
+    let root = Arc::new(root);
+    let helper = Arc::new(helper);
     let scope = r2sym::PreparedFunctionScope::new(
         0x1000,
         vec![
             r2sym::ScopedPreparedFunction {
                 id: r2ssa::InterprocFunctionId(0x1000),
                 name: Some("root".to_string()),
-                prepared: root.clone(),
+                prepared: Arc::clone(&root),
             },
             r2sym::ScopedPreparedFunction {
                 id: r2ssa::InterprocFunctionId(0x2000),
                 name: Some("helper_store_pair".to_string()),
-                prepared: helper,
+                prepared: Arc::clone(&helper),
             },
         ],
     )
@@ -3840,6 +3849,7 @@ fn derived_helper_summary_coalesces_adjacent_byte_writes_into_slice() {
     let _ = registry.install_scope_summaries_for_explorer(
         &mut explorer,
         &ctx,
+        &root,
         &scope,
         Some(&arch),
         &std::collections::HashMap::new(),
@@ -3945,18 +3955,20 @@ fn derived_helper_summary_compiles_backward_memory_slice_at_offset() {
         SsaArtifact::for_symbolic(&root_blocks, Some(&arch)).expect("root symbolic function");
     let helper =
         SsaArtifact::for_symbolic(&helper_blocks, Some(&arch)).expect("helper symbolic function");
+    let root = Arc::new(root);
+    let helper = Arc::new(helper);
     let scope = r2sym::PreparedFunctionScope::new(
         0x1000,
         vec![
             r2sym::ScopedPreparedFunction {
                 id: r2ssa::InterprocFunctionId(0x1000),
                 name: Some("root".to_string()),
-                prepared: root.clone(),
+                prepared: Arc::clone(&root),
             },
             r2sym::ScopedPreparedFunction {
                 id: r2ssa::InterprocFunctionId(0x2000),
                 name: Some("helper_store_offset".to_string()),
-                prepared: helper,
+                prepared: Arc::clone(&helper),
             },
         ],
     )
@@ -4005,6 +4017,7 @@ fn derived_helper_summary_compiles_backward_memory_slice_at_offset() {
     let _ = registry.install_scope_summaries_for_explorer(
         &mut explorer,
         &ctx,
+        &root,
         &scope,
         Some(&arch),
         &std::collections::HashMap::new(),
@@ -4111,18 +4124,20 @@ fn derived_helper_summary_compiles_backward_memory_slice_via_ptradd() {
         SsaArtifact::for_symbolic(&root_blocks, Some(&arch)).expect("root symbolic function");
     let helper =
         SsaArtifact::for_symbolic(&helper_blocks, Some(&arch)).expect("helper symbolic function");
+    let root = Arc::new(root);
+    let helper = Arc::new(helper);
     let scope = r2sym::PreparedFunctionScope::new(
         0x1000,
         vec![
             r2sym::ScopedPreparedFunction {
                 id: r2ssa::InterprocFunctionId(0x1000),
                 name: Some("root".to_string()),
-                prepared: root.clone(),
+                prepared: Arc::clone(&root),
             },
             r2sym::ScopedPreparedFunction {
                 id: r2ssa::InterprocFunctionId(0x2000),
                 name: Some("helper_store_ptradd".to_string()),
-                prepared: helper,
+                prepared: Arc::clone(&helper),
             },
         ],
     )
@@ -4154,6 +4169,7 @@ fn derived_helper_summary_compiles_backward_memory_slice_via_ptradd() {
     let _ = registry.install_scope_summaries_for_explorer(
         &mut explorer,
         &ctx,
+        &root,
         &scope,
         Some(&arch),
         &std::collections::HashMap::new(),
@@ -4259,18 +4275,20 @@ fn derived_helper_summary_preserves_negative_pointer_write_value() {
         SsaArtifact::for_symbolic(&root_blocks, Some(&arch)).expect("root symbolic function");
     let helper =
         SsaArtifact::for_symbolic(&helper_blocks, Some(&arch)).expect("helper symbolic function");
+    let root = Arc::new(root);
+    let helper = Arc::new(helper);
     let scope = r2sym::PreparedFunctionScope::new(
         0x1000,
         vec![
             r2sym::ScopedPreparedFunction {
                 id: r2ssa::InterprocFunctionId(0x1000),
                 name: Some("root".to_string()),
-                prepared: root.clone(),
+                prepared: Arc::clone(&root),
             },
             r2sym::ScopedPreparedFunction {
                 id: r2ssa::InterprocFunctionId(0x2000),
                 name: Some("helper_store_prev".to_string()),
-                prepared: helper,
+                prepared: Arc::clone(&helper),
             },
         ],
     )
@@ -4328,6 +4346,7 @@ fn derived_helper_summary_preserves_negative_pointer_write_value() {
     let _ = registry.install_scope_summaries_for_explorer(
         &mut explorer,
         &ctx,
+        &root,
         &scope,
         Some(&arch),
         &std::collections::HashMap::new(),
@@ -4437,18 +4456,20 @@ fn derived_helper_summary_compiles_backward_memory_slice_via_ptrsub() {
         SsaArtifact::for_symbolic(&root_blocks, Some(&arch)).expect("root symbolic function");
     let helper =
         SsaArtifact::for_symbolic(&helper_blocks, Some(&arch)).expect("helper symbolic function");
+    let root = Arc::new(root);
+    let helper = Arc::new(helper);
     let scope = r2sym::PreparedFunctionScope::new(
         0x1000,
         vec![
             r2sym::ScopedPreparedFunction {
                 id: r2ssa::InterprocFunctionId(0x1000),
                 name: Some("root".to_string()),
-                prepared: root.clone(),
+                prepared: Arc::clone(&root),
             },
             r2sym::ScopedPreparedFunction {
                 id: r2ssa::InterprocFunctionId(0x2000),
                 name: Some("helper_store_ptrsub".to_string()),
-                prepared: helper,
+                prepared: Arc::clone(&helper),
             },
         ],
     )
@@ -4480,6 +4501,7 @@ fn derived_helper_summary_compiles_backward_memory_slice_via_ptrsub() {
     let _ = registry.install_scope_summaries_for_explorer(
         &mut explorer,
         &ctx,
+        &root,
         &scope,
         Some(&arch),
         &std::collections::HashMap::new(),
@@ -4538,18 +4560,20 @@ fn derived_helper_summary_compiles_backward_return_precondition() {
         SsaArtifact::for_symbolic(&root_blocks, Some(&arch)).expect("root symbolic function");
     let helper =
         SsaArtifact::for_symbolic(&helper_blocks, Some(&arch)).expect("helper symbolic function");
+    let root = Arc::new(root);
+    let helper = Arc::new(helper);
     let scope = r2sym::PreparedFunctionScope::new(
         0x1000,
         vec![
             r2sym::ScopedPreparedFunction {
                 id: r2ssa::InterprocFunctionId(0x1000),
                 name: Some("root".to_string()),
-                prepared: root,
+                prepared: Arc::clone(&root),
             },
             r2sym::ScopedPreparedFunction {
                 id: r2ssa::InterprocFunctionId(0x2000),
                 name: Some("helper_xor".to_string()),
-                prepared: helper.clone(),
+                prepared: Arc::clone(&helper),
             },
         ],
     )
@@ -4646,23 +4670,26 @@ fn derived_helper_summary_reports_recursive_scc_diagnostics() {
         .expect("helper_a symbolic function");
     let helper_b = SsaArtifact::for_symbolic(&helper_b_blocks, Some(&arch))
         .expect("helper_b symbolic function");
+    let root = Arc::new(root);
+    let helper_a = Arc::new(helper_a);
+    let helper_b = Arc::new(helper_b);
     let scope = r2sym::PreparedFunctionScope::new(
         0x1000,
         vec![
             r2sym::ScopedPreparedFunction {
                 id: r2ssa::InterprocFunctionId(0x1000),
                 name: Some("root".to_string()),
-                prepared: root,
+                prepared: Arc::clone(&root),
             },
             r2sym::ScopedPreparedFunction {
                 id: r2ssa::InterprocFunctionId(0x2000),
                 name: Some("helper_a".to_string()),
-                prepared: helper_a,
+                prepared: Arc::clone(&helper_a),
             },
             r2sym::ScopedPreparedFunction {
                 id: r2ssa::InterprocFunctionId(0x3000),
                 name: Some("helper_b".to_string()),
-                prepared: helper_b,
+                prepared: Arc::clone(&helper_b),
             },
         ],
     )

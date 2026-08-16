@@ -1,18 +1,20 @@
 //! Closed semantic-C functions with certified plain RAM memory effects.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
 use r2cert::{
-    CERTIFIED_PLAIN_RAM_MEMORY_RETURN_CONTRACT_VERSION, CertifiedArtifactOrigin,
-    CertifiedMachineProjection, CertifiedMemoryExecutionPolicy, CertifiedMemoryStatement,
-    CertifiedMemoryStatementKind, CertifiedSourceTerminator, CertifiedTypedRegionKind,
+    CERTIFICATION_SCHEMA_VERSION, CERTIFIED_PLAIN_RAM_MEMORY_RETURN_CONTRACT_VERSION,
+    CertifiedArtifactOrigin, CertifiedFramePreservation, CertifiedMachineProjection,
+    CertifiedMemoryExecutionPolicy, CertifiedMemoryStatement, CertifiedMemoryStatementKind,
+    CertifiedNormalizedStackRange, CertifiedPrivateFrameValueFlow, CertifiedPrivateStackRegion,
+    CertifiedSourceTerminator, CertifiedStackDiscipline, CertifiedTypedRegionKind,
     LedgerClosureError, TypedRegionMapping, certify_plain_ram_memory_return_region,
 };
 use r2ssa::{
     CanonicalInstructionId, MachineAddressSpace, MachineBuildError, MachineMemoryEndianness,
-    MachineType, MachineValueBinding, MachineValueUse, SemanticInstructionState,
-    TrustedSsaArtifact,
+    MachineType, MachineValueBinding, MachineValueUse, ObjectId, SemanticInstructionState,
+    SsaArtifact, TrustedSsaArtifact,
 };
 use serde::Serialize;
 
@@ -36,12 +38,57 @@ pub enum CertifiedMemorySemanticCFunctionScope {
     SingleTerminalReturnBlockWithPlainRamMemory,
 }
 
+/// One exact private stack interval projected as a source-ordered C local.
+/// The name is renderer-owned; object, range, width, and accesses are retained
+/// only from the source-owned stack-discipline and MemorySSA certificates.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub(crate) struct CertifiedPrivateStackLocal {
+    local_index: u32,
+    object: ObjectId,
+    range: CertifiedNormalizedStackRange,
+    width_bits: u32,
+    memory_order: Box<[CanonicalInstructionId]>,
+    address_producers: BTreeSet<CanonicalInstructionId>,
+    region: CertifiedPrivateStackRegion,
+    load_flows: Box<[CertifiedPrivateFrameValueFlow]>,
+}
+
+impl CertifiedPrivateStackLocal {
+    pub(crate) const fn local_index(&self) -> u32 {
+        self.local_index
+    }
+
+    pub(crate) const fn object(&self) -> ObjectId {
+        self.object
+    }
+
+    pub(crate) const fn range(&self) -> CertifiedNormalizedStackRange {
+        self.range
+    }
+
+    pub(crate) const fn width_bits(&self) -> u32 {
+        self.width_bits
+    }
+
+    pub(crate) const fn memory_order(&self) -> &[CanonicalInstructionId] {
+        &self.memory_order
+    }
+
+    pub(crate) fn address_producers(&self) -> &BTreeSet<CanonicalInstructionId> {
+        &self.address_producers
+    }
+
+    pub(crate) const fn load_flows(&self) -> &[CertifiedPrivateFrameValueFlow] {
+        &self.load_flows
+    }
+}
+
 /// A sealed complete function for the narrow plain-RAM helper ABI.
 ///
 /// The duplicated memory and return manifests are intentional mutation guards:
 /// rendering is permitted only while they exactly match the source-ordered
 /// typed block and the final source return.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct CertifiedMemorySemanticCFunction {
     schema_version: u32,
     scope: CertifiedMemorySemanticCFunctionScope,
@@ -49,6 +96,9 @@ pub struct CertifiedMemorySemanticCFunction {
     origin: CertifiedArtifactOrigin,
     layer: SemanticCBlockStepLayer,
     memory_order: Box<[CanonicalInstructionId]>,
+    private_stack_locals: Box<[CertifiedPrivateStackLocal]>,
+    private_stack_discipline: Option<CertifiedStackDiscipline>,
+    frame_preservation: Option<CertifiedFramePreservation>,
     return_producer: CanonicalInstructionId,
     returned_value: Option<MachineValueBinding>,
     typed_output_seal: CertifiedTypedOutputSeal,
@@ -66,6 +116,7 @@ pub enum CertifiedMemorySemanticCFunctionError {
     MissingMemory,
     UnsupportedInput,
     UnsupportedMemory(CanonicalInstructionId),
+    UnsupportedPrivateStack(CanonicalInstructionId),
     InvalidReturn,
     UndefinedValue(MachineValueBinding),
     InvalidFunction(Vec<String>),
@@ -140,10 +191,226 @@ fn memory_order(layer: &SemanticCBlockStepLayer) -> Vec<CanonicalInstructionId> 
         .collect()
 }
 
+fn private_stack_locals(
+    artifact: &SsaArtifact,
+    certified: &CertifiedMachineProjection,
+    layer: &SemanticCBlockStepLayer,
+) -> Result<Vec<CertifiedPrivateStackLocal>, CertifiedMemorySemanticCFunctionError> {
+    let Some(stack) = certified.stack_discipline() else {
+        return Ok(Vec::new());
+    };
+    if stack.origin() != certified.origin() {
+        return Err(CertifiedMemorySemanticCFunctionError::InvalidFunction(
+            vec!["private stack discipline origin mismatch".to_string()],
+        ));
+    }
+
+    let mut access_regions = BTreeMap::new();
+    for (region_index, region) in stack.private_regions().iter().enumerate() {
+        let [object] = region.objects() else {
+            return Err(CertifiedMemorySemanticCFunctionError::InvalidFunction(
+                vec!["private stack local does not name exactly one object".to_string()],
+            ));
+        };
+        let range = region.accessed_range();
+        let width_bits = range.size_bytes().checked_mul(8).ok_or_else(|| {
+            CertifiedMemorySemanticCFunctionError::InvalidFunction(vec![
+                "private stack local width overflow".to_string(),
+            ])
+        })?;
+        if !matches!(width_bits, 8 | 16 | 32 | 64) {
+            return Err(CertifiedMemorySemanticCFunctionError::InvalidFunction(
+                vec!["private stack local has an unsupported scalar width".to_string()],
+            ));
+        }
+        for access in region.accesses() {
+            let statement = access.statement();
+            if statement.object() != *object
+                || access.range() != range
+                || statement.width_bits() != width_bits
+            {
+                return Err(
+                    CertifiedMemorySemanticCFunctionError::UnsupportedPrivateStack(
+                        statement.producer(),
+                    ),
+                );
+            }
+            if access_regions
+                .insert(statement.access(), (region_index, access))
+                .is_some()
+            {
+                return Err(
+                    CertifiedMemorySemanticCFunctionError::UnsupportedPrivateStack(
+                        statement.producer(),
+                    ),
+                );
+            }
+        }
+    }
+
+    let mut selected = vec![Vec::new(); stack.private_regions().len()];
+    let mut selected_flows = vec![Vec::new(); stack.private_regions().len()];
+    let mut selected_address_producers = vec![BTreeSet::new(); stack.private_regions().len()];
+    let mut allowed_address_users = BTreeMap::new();
+    let mut initialized = vec![false; stack.private_regions().len()];
+    for step in layer.steps() {
+        let Some(reference) = step.memory() else {
+            continue;
+        };
+        let statement = layer.resolve_memory_statement(reference).ok_or(
+            CertifiedMemorySemanticCFunctionError::UnsupportedMemory(step.source()),
+        )?;
+        let Some((region_index, access)) = access_regions.get(&statement.access()).copied() else {
+            continue;
+        };
+        if access.statement() != statement || step.source() != statement.producer() {
+            return Err(
+                CertifiedMemorySemanticCFunctionError::UnsupportedPrivateStack(step.source()),
+            );
+        }
+        if let Some(producer) = statement.address().producer() {
+            let definition = artifact
+                .graph()
+                .def_inst(statement.address().binding().value())
+                .ok_or(
+                    CertifiedMemorySemanticCFunctionError::UnsupportedPrivateStack(step.source()),
+                )?;
+            let source = artifact
+                .obligations()
+                .instruction_for_inst(definition)
+                .ok_or(
+                    CertifiedMemorySemanticCFunctionError::UnsupportedPrivateStack(step.source()),
+                )?;
+            let instruction = artifact.graph().inst(definition).ok_or(
+                CertifiedMemorySemanticCFunctionError::UnsupportedPrivateStack(step.source()),
+            )?;
+            if source.id != producer
+                || instruction.output != Some(statement.address().binding().value())
+            {
+                return Err(
+                    CertifiedMemorySemanticCFunctionError::UnsupportedPrivateStack(step.source()),
+                );
+            }
+            selected_address_producers[region_index].insert(producer);
+            allowed_address_users
+                .entry(statement.address().binding().value())
+                .or_insert_with(BTreeSet::new)
+                .insert(statement.access().inst);
+        }
+        match statement.kind() {
+            CertifiedMemoryStatementKind::Write { .. } => initialized[region_index] = true,
+            CertifiedMemoryStatementKind::Read { .. } => {
+                if !initialized[region_index] {
+                    return Err(
+                        CertifiedMemorySemanticCFunctionError::UnsupportedPrivateStack(
+                            step.source(),
+                        ),
+                    );
+                }
+                let region = &stack.private_regions()[region_index];
+                let flow = certified
+                    .private_frame_value_flow(statement.access())
+                    .ok_or(
+                        CertifiedMemorySemanticCFunctionError::UnsupportedPrivateStack(
+                            step.source(),
+                        ),
+                    )?;
+                if flow.origin() != certified.origin()
+                    || flow.region() != region
+                    || flow.object() != statement.object()
+                    || flow.range() != access.range()
+                    || flow.load().statement() != statement
+                    || flow.root_version().object != statement.object()
+                    || flow.definition(flow.root_version()).is_none()
+                {
+                    return Err(
+                        CertifiedMemorySemanticCFunctionError::UnsupportedPrivateStack(
+                            step.source(),
+                        ),
+                    );
+                }
+                selected_flows[region_index].push(flow.clone());
+            }
+        }
+        selected[region_index].push(step.source());
+    }
+
+    for (address, allowed_users) in allowed_address_users {
+        if artifact
+            .graph()
+            .use_sites(address)
+            .iter()
+            .any(|use_site| !allowed_users.contains(&use_site.inst))
+        {
+            let producer = artifact
+                .graph()
+                .def_inst(address)
+                .and_then(|definition| artifact.obligations().instruction_for_inst(definition))
+                .map_or(
+                    CanonicalInstructionId {
+                        block_addr: artifact.function().entry,
+                        site: r2ssa::CanonicalInstructionSite::Op(0),
+                    },
+                    |source| source.id,
+                );
+            return Err(CertifiedMemorySemanticCFunctionError::UnsupportedPrivateStack(producer));
+        }
+    }
+
+    let mut locals = Vec::new();
+    for (region_index, region) in stack.private_regions().iter().enumerate() {
+        let order = std::mem::take(&mut selected[region_index]);
+        let flows = std::mem::take(&mut selected_flows[region_index]);
+        let address_producers = std::mem::take(&mut selected_address_producers[region_index]);
+        if order.is_empty() {
+            continue;
+        }
+        let [object] = region.objects() else {
+            unreachable!("private regions were validated above")
+        };
+        let width_bits = region
+            .accessed_range()
+            .size_bytes()
+            .checked_mul(8)
+            .expect("private region width was validated above");
+        locals.push(CertifiedPrivateStackLocal {
+            local_index: u32::try_from(region_index).map_err(|_| {
+                CertifiedMemorySemanticCFunctionError::InvalidFunction(vec![
+                    "private stack local index overflow".to_string(),
+                ])
+            })?,
+            object: *object,
+            range: region.accessed_range(),
+            width_bits,
+            memory_order: order.into_boxed_slice(),
+            address_producers,
+            region: region.clone(),
+            load_flows: flows.into_boxed_slice(),
+        });
+    }
+    Ok(locals)
+}
+
 impl CertifiedMemorySemanticCFunction {
     /// Construct the complete proof chain internally from one immutable trusted
     /// source artifact. No caller-supplied permit or typed node can cross this seam.
     pub fn from_artifact(
+        trusted: &TrustedSsaArtifact,
+    ) -> Result<Self, CertifiedMemorySemanticCFunctionError> {
+        let function = Self::build_from_artifact(trusted)?;
+        function.render_body()?;
+        Ok(function)
+    }
+
+    /// Build the exact source-ordered memory substrate for a stronger typed
+    /// renderer whose signature and lvalue spelling are sealed separately.
+    pub(crate) fn from_artifact_for_typed_layer(
+        trusted: &TrustedSsaArtifact,
+    ) -> Result<Self, CertifiedMemorySemanticCFunctionError> {
+        Self::build_from_artifact(trusted)
+    }
+
+    fn build_from_artifact(
         trusted: &TrustedSsaArtifact,
     ) -> Result<Self, CertifiedMemorySemanticCFunctionError> {
         let certified = CertifiedMachineProjection::from_artifact(trusted)?;
@@ -229,6 +496,13 @@ impl CertifiedMemorySemanticCFunction {
         if memory_order.is_empty() {
             return Err(CertifiedMemorySemanticCFunctionError::MissingMemory);
         }
+        let private_stack_locals = private_stack_locals(trusted.artifact(), &certified, &layer)?;
+        let private_stack_discipline = (!private_stack_locals.is_empty())
+            .then(|| certified.stack_discipline().cloned())
+            .flatten();
+        let frame_preservation = (!private_stack_locals.is_empty())
+            .then(|| certified.frame_preservation().cloned())
+            .flatten();
         let mappings = typed_region_mappings(layer.accounting());
         let ledger_closure = certify_plain_ram_memory_return_region(
             layer.accounting().origin(),
@@ -249,6 +523,9 @@ impl CertifiedMemorySemanticCFunction {
             origin: layer.accounting().origin().clone(),
             layer,
             memory_order: memory_order.into_boxed_slice(),
+            private_stack_locals: private_stack_locals.into_boxed_slice(),
+            private_stack_discipline,
+            frame_preservation,
             return_producer,
             returned_value,
             typed_output_seal,
@@ -259,7 +536,6 @@ impl CertifiedMemorySemanticCFunction {
                 audit.invalid,
             ));
         }
-        function.render_body()?;
         Ok(function)
     }
 
@@ -281,6 +557,75 @@ impl CertifiedMemorySemanticCFunction {
 
     pub const fn memory_order(&self) -> &[CanonicalInstructionId] {
         &self.memory_order
+    }
+
+    pub(crate) fn private_stack_access_map(
+        &self,
+    ) -> Result<
+        BTreeMap<CanonicalInstructionId, &CertifiedPrivateStackLocal>,
+        CertifiedMemorySemanticCFunctionError,
+    > {
+        let mut accesses = BTreeMap::new();
+        for local in &self.private_stack_locals {
+            for producer in local.memory_order() {
+                if accesses.insert(*producer, local).is_some() {
+                    return Err(
+                        CertifiedMemorySemanticCFunctionError::UnsupportedPrivateStack(*producer),
+                    );
+                }
+            }
+        }
+        Ok(accesses)
+    }
+
+    pub(crate) const fn private_stack_locals(&self) -> &[CertifiedPrivateStackLocal] {
+        &self.private_stack_locals
+    }
+
+    pub(crate) fn non_private_memory_order(
+        &self,
+    ) -> Result<Vec<CanonicalInstructionId>, CertifiedMemorySemanticCFunctionError> {
+        let private = self.private_stack_access_map()?;
+        Ok(self
+            .memory_order
+            .iter()
+            .filter(|producer| !private.contains_key(producer))
+            .copied()
+            .collect())
+    }
+
+    pub(crate) fn private_stack_address_producers(&self) -> BTreeSet<CanonicalInstructionId> {
+        self.private_stack_locals
+            .iter()
+            .flat_map(|local| local.address_producers().iter().copied())
+            .collect()
+    }
+
+    pub(crate) fn private_stack_transport_producers(&self) -> BTreeSet<CanonicalInstructionId> {
+        let mut producers = self
+            .private_stack_discipline
+            .iter()
+            .flat_map(|stack| {
+                stack
+                    .assignments()
+                    .iter()
+                    .map(|assignment| assignment.producer())
+            })
+            .collect::<BTreeSet<_>>();
+        if let Some(frame) = &self.frame_preservation {
+            producers.insert(frame.frame_relation().producer());
+            producers.extend(
+                frame
+                    .entry_save_copies()
+                    .iter()
+                    .map(|copy| copy.entity().producer()),
+            );
+            for restore in frame.restores() {
+                producers.extend(restore.restore_copies().iter().map(|copy| copy.producer()));
+                producers.insert(restore.restore_assignment().producer());
+            }
+        }
+        producers
     }
 
     pub fn returned(&self) -> Option<&SemanticCReturn> {
@@ -364,6 +709,9 @@ impl CertifiedMemorySemanticCFunction {
         {
             invalid.push("memory effect manifest differs from source order".to_string());
         }
+        if let Err(error) = self.validate_private_stack_manifest() {
+            invalid.push(format!("private stack local manifest is invalid: {error}"));
+        }
         let returned = self.returned();
         let actual_returned_value = returned.and_then(|returned| match returned.values() {
             [] => Some(None),
@@ -384,8 +732,170 @@ impl CertifiedMemorySemanticCFunction {
         CertifiedMemorySemanticCFunctionAuditReport { invalid }
     }
 
-    /// Render strict C11 whose only memory operations are calls through the
-    /// declared width/endian-specific RAM helper ABI.
+    fn validate_private_stack_manifest(&self) -> Result<(), CertifiedMemorySemanticCFunctionError> {
+        let mut local_indices = BTreeSet::new();
+        let mut statements = BTreeMap::new();
+        for step in self.layer.steps() {
+            let Some(reference) = step.memory() else {
+                continue;
+            };
+            let statement = self.layer.resolve_memory_statement(reference).ok_or(
+                CertifiedMemorySemanticCFunctionError::UnsupportedMemory(step.source()),
+            )?;
+            statements.insert(step.source(), statement);
+        }
+        let access_map = self.private_stack_access_map()?;
+        match (
+            &self.private_stack_discipline,
+            self.private_stack_locals.is_empty(),
+        ) {
+            (None, true) => {}
+            (Some(stack), false)
+                if stack.schema_version() == CERTIFICATION_SCHEMA_VERSION
+                    && stack.origin() == &self.origin => {}
+            _ => {
+                return Err(CertifiedMemorySemanticCFunctionError::InvalidFunction(
+                    vec!["private stack discipline owner mismatch".to_string()],
+                ));
+            }
+        }
+        if self
+            .frame_preservation
+            .as_ref()
+            .is_some_and(|frame| frame.origin() != &self.origin)
+        {
+            return Err(CertifiedMemorySemanticCFunctionError::InvalidFunction(
+                vec!["private frame-preservation owner mismatch".to_string()],
+            ));
+        }
+        let mut address_producers = BTreeSet::new();
+        for local in &self.private_stack_locals {
+            if !local_indices.insert(local.local_index())
+                || local.region.objects() != [local.object()]
+                || local.region.accessed_range() != local.range()
+                || self.private_stack_discipline.as_ref().is_none_or(|stack| {
+                    !stack
+                        .private_regions()
+                        .iter()
+                        .any(|region| region == &local.region)
+                })
+                || local.range().size_bytes().checked_mul(8) != Some(local.width_bits())
+                || local.memory_order().is_empty()
+            {
+                return Err(CertifiedMemorySemanticCFunctionError::InvalidFunction(
+                    vec!["private stack local identity mismatch".to_string()],
+                ));
+            }
+            if local
+                .address_producers()
+                .iter()
+                .any(|producer| !address_producers.insert(*producer))
+            {
+                return Err(CertifiedMemorySemanticCFunctionError::InvalidFunction(
+                    vec!["private stack address producer is shared across locals".to_string()],
+                ));
+            }
+            let mut load_flows = local
+                .load_flows
+                .iter()
+                .map(|flow| (flow.load().statement().access(), flow))
+                .collect::<BTreeMap<_, _>>();
+            if load_flows.len() != local.load_flows.len() {
+                return Err(CertifiedMemorySemanticCFunctionError::InvalidFunction(
+                    vec!["private stack local repeats a load-flow certificate".to_string()],
+                ));
+            }
+            for producer in local.memory_order() {
+                let statement = statements.get(producer).copied().ok_or(
+                    CertifiedMemorySemanticCFunctionError::UnsupportedPrivateStack(*producer),
+                )?;
+                let access = local
+                    .region
+                    .accesses()
+                    .iter()
+                    .find(|access| access.statement() == statement)
+                    .ok_or(
+                        CertifiedMemorySemanticCFunctionError::UnsupportedPrivateStack(*producer),
+                    )?;
+                if statement.object() != local.object()
+                    || statement.width_bits() != local.width_bits()
+                    || access.range() != local.range()
+                {
+                    return Err(
+                        CertifiedMemorySemanticCFunctionError::UnsupportedPrivateStack(*producer),
+                    );
+                }
+                if statement
+                    .address()
+                    .producer()
+                    .is_some_and(|producer| !local.address_producers().contains(&producer))
+                {
+                    return Err(
+                        CertifiedMemorySemanticCFunctionError::UnsupportedPrivateStack(*producer),
+                    );
+                }
+                if matches!(statement.kind(), CertifiedMemoryStatementKind::Read { .. }) {
+                    let flow = load_flows.remove(&statement.access()).ok_or(
+                        CertifiedMemorySemanticCFunctionError::UnsupportedPrivateStack(*producer),
+                    )?;
+                    if flow.origin() != &self.origin
+                        || flow.region() != &local.region
+                        || flow.object() != local.object()
+                        || flow.range() != local.range()
+                        || flow.load().statement() != statement
+                        || flow.root_version().object != local.object()
+                        || flow.definition(flow.root_version()).is_none()
+                    {
+                        return Err(
+                            CertifiedMemorySemanticCFunctionError::UnsupportedPrivateStack(
+                                *producer,
+                            ),
+                        );
+                    }
+                }
+            }
+            if !load_flows.is_empty() {
+                return Err(CertifiedMemorySemanticCFunctionError::InvalidFunction(
+                    vec!["private stack local retains an unused load-flow certificate".to_string()],
+                ));
+            }
+        }
+        if access_map
+            .keys()
+            .any(|producer| !self.memory_order.contains(producer))
+        {
+            return Err(CertifiedMemorySemanticCFunctionError::InvalidFunction(
+                vec!["private stack local access is absent from memory order".to_string()],
+            ));
+        }
+        for producer in address_producers {
+            let entity = self
+                .layer
+                .steps()
+                .iter()
+                .find(|step| step.source() == producer)
+                .and_then(|step| step.value())
+                .and_then(|reference| self.layer.resolve_value(reference))
+                .ok_or(CertifiedMemorySemanticCFunctionError::UnsupportedPrivateStack(producer))?;
+            if !self.private_stack_locals.iter().any(|local| {
+                local.memory_order().iter().any(|memory_producer| {
+                    statements.get(memory_producer).is_some_and(|statement| {
+                        statement.address().producer() == Some(producer)
+                            && statement.address().binding() == entity.output()
+                    })
+                })
+            }) {
+                return Err(
+                    CertifiedMemorySemanticCFunctionError::UnsupportedPrivateStack(producer),
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Render strict C11. Public RAM stays behind the declared helper ABI;
+    /// exact private stack regions are scalar-replaced only while their sealed
+    /// stack-discipline and MemorySSA witnesses remain intact.
     pub fn render_certified_c(&self) -> Result<String, CertifiedMemorySemanticCFunctionError> {
         let report = self.audit();
         if !report.has_exact_closed_memory_return() {
@@ -413,15 +923,70 @@ impl CertifiedMemorySemanticCFunction {
         output.push_str(&render_logical_parameter_declarations(interface)?);
         output.push_str(") {\n");
         output.push_str(&render_parameter_graph_binding_prologue(interface)?);
+        let mut defined = interface
+            .parameters()
+            .iter()
+            .filter_map(|parameter| parameter.value())
+            .collect::<BTreeSet<_>>();
+        let mut materialized = expressions.materialized_expression_roots(&defined)?;
+        let private_stack = self.private_stack_access_map()?;
+        let private_stack_address_producers = self.private_stack_address_producers();
+        let private_stack_transport_producers = self.private_stack_transport_producers();
+        let mut initialized_private_stack = BTreeSet::new();
         for step in self.layer.steps() {
             if let Some(reference) = step.memory() {
                 let statement = self.layer.resolve_memory_statement(reference).ok_or(
                     CertifiedMemorySemanticCFunctionError::UnsupportedMemory(step.source()),
                 )?;
+                if let Some(local) = private_stack.get(&step.source()) {
+                    let local_name = private_stack_local_name(local);
+                    match statement.kind() {
+                        CertifiedMemoryStatementKind::Read { result } => {
+                            let root = expressions.memory_read_root(statement)?;
+                            let ty = storage_type(result.ty())?;
+                            writeln!(
+                                &mut output,
+                                "\t{ty} {} = ({ty}){local_name};",
+                                value_name(result.binding()),
+                            )
+                            .expect("String writes cannot fail");
+                            defined.insert(result.binding());
+                            if let Some(root) = root
+                                && materialized.insert(root, result.binding()).is_some()
+                            {
+                                return Err(
+                                    CertifiedMemorySemanticCFunctionError::UnsupportedMemory(
+                                        step.source(),
+                                    ),
+                                );
+                            }
+                        }
+                        CertifiedMemoryStatementKind::Write { value } => {
+                            let ty = storage_type(value.ty())?;
+                            if initialized_private_stack.insert(local.local_index()) {
+                                writeln!(
+                                    &mut output,
+                                    "\t{ty} {local_name} = ({ty})({});",
+                                    render_value_use(value),
+                                )
+                                .expect("String writes cannot fail");
+                            } else {
+                                writeln!(
+                                    &mut output,
+                                    "\t{local_name} = ({ty})({});",
+                                    render_value_use(value),
+                                )
+                                .expect("String writes cannot fail");
+                            }
+                        }
+                    }
+                    continue;
+                }
                 let helper = memory_helper_name(statement);
                 let address = render_value_use(statement.address());
                 match statement.kind() {
                     CertifiedMemoryStatementKind::Read { result } => {
+                        let root = expressions.memory_read_root(statement)?;
                         writeln!(
                             &mut output,
                             "\t{} {} = {helper}((uint64_t)({address}));",
@@ -429,6 +994,14 @@ impl CertifiedMemorySemanticCFunction {
                             value_name(result.binding())
                         )
                         .expect("String writes cannot fail");
+                        defined.insert(result.binding());
+                        if let Some(root) = root
+                            && materialized.insert(root, result.binding()).is_some()
+                        {
+                            return Err(CertifiedMemorySemanticCFunctionError::UnsupportedMemory(
+                                step.source(),
+                            ));
+                        }
                     }
                     CertifiedMemoryStatementKind::Write { value } => {
                         writeln!(
@@ -442,6 +1015,11 @@ impl CertifiedMemorySemanticCFunction {
                 }
                 continue;
             }
+            if private_stack_address_producers.contains(&step.source())
+                || private_stack_transport_producers.contains(&step.source())
+            {
+                continue;
+            }
             let Some(reference) = step.value() else {
                 continue;
             };
@@ -453,9 +1031,22 @@ impl CertifiedMemorySemanticCFunction {
                 "\t{} {} = {};",
                 storage_type(expressions.expr_type(entity.root())?)?,
                 value_name(entity.output()),
-                expressions.render_expr(entity.root(), &mut helpers)?
+                expressions.render_expr_with_materialized_roots(
+                    entity.root(),
+                    &materialized,
+                    &mut helpers,
+                )?
             )
             .expect("String writes cannot fail");
+            defined.insert(entity.output());
+            if materialized
+                .insert(entity.root(), entity.output())
+                .is_some()
+            {
+                return Err(CertifiedMemorySemanticCFunctionError::UnsupportedMemory(
+                    step.source(),
+                ));
+            }
         }
         let returned_name = self.returned_value.map(value_name);
         writeln!(
@@ -480,52 +1071,56 @@ impl CertifiedMemorySemanticCFunction {
             .filter_map(|parameter| parameter.value())
             .collect::<BTreeSet<_>>();
         let mut observed_memory = Vec::new();
+        let private_stack = self.private_stack_access_map()?;
+        let private_stack_address_producers = self.private_stack_address_producers();
+        let private_stack_transport_producers = self.private_stack_transport_producers();
+        let mut initialized_private_stack = BTreeSet::new();
+        let mut materialized = expressions.materialized_expression_roots(&defined)?;
         for step in self.layer.steps() {
             if let Some(reference) = step.memory() {
                 let statement = self.layer.resolve_memory_statement(reference).ok_or(
                     CertifiedMemorySemanticCFunctionError::UnsupportedMemory(step.source()),
                 )?;
                 validate_memory_statement(statement)?;
-                require_value_use_defined(statement.address(), &defined)?;
+                let private_local = private_stack.get(&step.source()).copied();
+                if let Some(local) = private_local {
+                    if local.object() != statement.object()
+                        || local.width_bits() != statement.width_bits()
+                    {
+                        return Err(
+                            CertifiedMemorySemanticCFunctionError::UnsupportedPrivateStack(
+                                step.source(),
+                            ),
+                        );
+                    }
+                } else {
+                    require_value_use_defined(statement.address(), &defined)?;
+                }
                 observed_memory.push(statement.producer());
                 match statement.kind() {
                     CertifiedMemoryStatementKind::Read { result } => {
+                        if private_local.is_some_and(|local| {
+                            !initialized_private_stack.contains(&local.local_index())
+                        }) {
+                            return Err(
+                                CertifiedMemorySemanticCFunctionError::UnsupportedPrivateStack(
+                                    step.source(),
+                                ),
+                            );
+                        }
+                        let root = expressions.memory_read_root(statement)?;
                         let entity = step
                             .value()
-                            .and_then(|reference| self.layer.resolve_value(reference))
-                            .filter(|entity| entity.output() == result.binding())
-                            .ok_or(CertifiedMemorySemanticCFunctionError::UnsupportedMemory(
-                                step.source(),
-                            ))?;
-                        let expression = expressions.expr(entity.root()).ok_or(
-                            CertifiedMemorySemanticCFunctionError::UnsupportedMemory(step.source()),
-                        )?;
-                        let SemanticCExprKind::MemoryRead {
-                            access,
-                            object,
-                            space,
-                            endianness,
-                            word_size_bytes,
-                            address,
-                            width_bits,
-                        } = expression.kind()
-                        else {
+                            .and_then(|reference| self.layer.resolve_value(reference));
+                        if entity.is_some_and(|entity| {
+                            entity.output() != result.binding() || Some(entity.root()) != root
+                        }) {
                             return Err(CertifiedMemorySemanticCFunctionError::UnsupportedMemory(
                                 step.source(),
                             ));
-                        };
-                        if *access != statement.access()
-                            || *object != statement.object()
-                            || *space != statement.space()
-                            || *endianness != statement.endianness()
-                            || *word_size_bytes != statement.word_size_bytes()
-                            || *width_bits != statement.width_bits()
-                            || expression.ty() != result.ty()
-                            || !expression_matches_value_use(
-                                expressions,
-                                *address,
-                                statement.address(),
-                            )
+                        }
+                        if let Some(root) = root
+                            && materialized.insert(root, result.binding()).is_some()
                         {
                             return Err(CertifiedMemorySemanticCFunctionError::UnsupportedMemory(
                                 step.source(),
@@ -540,8 +1135,16 @@ impl CertifiedMemorySemanticCFunction {
                             ));
                         }
                         require_value_use_defined(value, &defined)?;
+                        if let Some(local) = private_local {
+                            initialized_private_stack.insert(local.local_index());
+                        }
                     }
                 }
+                continue;
+            }
+            if private_stack_address_producers.contains(&step.source())
+                || private_stack_transport_producers.contains(&step.source())
+            {
                 continue;
             }
             if let Some(reference) = step.value() {
@@ -552,6 +1155,7 @@ impl CertifiedMemorySemanticCFunction {
                 collect_expression_inputs(
                     expressions,
                     entity.root(),
+                    &materialized,
                     &mut BTreeSet::new(),
                     &mut inputs,
                 )?;
@@ -560,8 +1164,20 @@ impl CertifiedMemorySemanticCFunction {
                         *undefined,
                     ));
                 }
-                expressions.render_expr(entity.root(), &mut SemanticCHelperSet::default())?;
+                expressions.render_expr_with_materialized_roots(
+                    entity.root(),
+                    &materialized,
+                    &mut SemanticCHelperSet::default(),
+                )?;
                 defined.insert(entity.output());
+                if materialized
+                    .insert(entity.root(), entity.output())
+                    .is_some()
+                {
+                    return Err(CertifiedMemorySemanticCFunctionError::UnsupportedMemory(
+                        step.source(),
+                    ));
+                }
             }
         }
         if observed_memory.as_slice() != self.memory_order.as_ref() {
@@ -577,6 +1193,10 @@ impl CertifiedMemorySemanticCFunction {
         }
         Ok(())
     }
+}
+
+pub(crate) fn private_stack_local_name(local: &CertifiedPrivateStackLocal) -> String {
+    format!("r2s_stack_{}", local.local_index())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -604,8 +1224,7 @@ fn validate_memory_statement(
             statement.endianness(),
             MachineMemoryEndianness::Little | MachineMemoryEndianness::Big
         )
-        || statement.execution()
-            != CertifiedMemoryExecutionPolicy::ExactlyOnceInSourceOrderViaHelper
+        || statement.execution() != CertifiedMemoryExecutionPolicy::ExactlyOnceInSourceOrder
         || !matches!(
             statement.address().ty(),
             MachineType::Address {
@@ -634,34 +1253,18 @@ fn require_value_use_defined(
     Ok(())
 }
 
-fn expression_matches_value_use(
-    expressions: &crate::semantic_c::SemanticCExpressionLayer,
-    expression: SemanticCExprId,
-    value: &MachineValueUse,
-) -> bool {
-    expressions.expr(expression).is_some_and(|expression| {
-        expression.ty() == value.ty()
-            && match (expression.kind(), value.constant()) {
-                (
-                    SemanticCExprKind::Constant {
-                        binding,
-                        value: actual,
-                    },
-                    Some(expected),
-                ) => *binding == value.binding() && *actual == expected,
-                (SemanticCExprKind::Input { binding }, None) => *binding == value.binding(),
-                _ => false,
-            }
-    })
-}
-
 fn collect_expression_inputs(
     expressions: &crate::semantic_c::SemanticCExpressionLayer,
     expression: SemanticCExprId,
+    materialized: &BTreeMap<SemanticCExprId, MachineValueBinding>,
     visited: &mut BTreeSet<SemanticCExprId>,
     inputs: &mut BTreeSet<MachineValueBinding>,
 ) -> Result<(), CertifiedMemorySemanticCFunctionError> {
     if !visited.insert(expression) {
+        return Ok(());
+    }
+    if let Some(binding) = materialized.get(&expression) {
+        inputs.insert(*binding);
         return Ok(());
     }
     let expression =
@@ -676,6 +1279,7 @@ fn collect_expression_inputs(
         }
         SemanticCExprKind::Constant { .. } => {}
         SemanticCExprKind::MemoryRead { .. } => {
+            eprintln!("unmaterialized memory read expression {expression:?}");
             return Err(CertifiedMemorySemanticCFunctionError::UnsupportedMemory(
                 expression
                     .source_instructions()
@@ -693,28 +1297,28 @@ fn collect_expression_inputs(
         | SemanticCExprKind::BooleanNot { input }
         | SemanticCExprKind::Cast { input, .. }
         | SemanticCExprKind::Extract { input, .. } => {
-            collect_expression_inputs(expressions, *input, visited, inputs)?;
+            collect_expression_inputs(expressions, *input, materialized, visited, inputs)?;
         }
         SemanticCExprKind::Arithmetic { left, right, .. }
         | SemanticCExprKind::ArithmeticFlag { left, right, .. }
         | SemanticCExprKind::Bitwise { left, right, .. }
         | SemanticCExprKind::Boolean { left, right, .. }
         | SemanticCExprKind::Compare { left, right, .. } => {
-            collect_expression_inputs(expressions, *left, visited, inputs)?;
-            collect_expression_inputs(expressions, *right, visited, inputs)?;
+            collect_expression_inputs(expressions, *left, materialized, visited, inputs)?;
+            collect_expression_inputs(expressions, *right, materialized, visited, inputs)?;
         }
         SemanticCExprKind::Shift { value, count, .. } => {
-            collect_expression_inputs(expressions, *value, visited, inputs)?;
-            collect_expression_inputs(expressions, *count, visited, inputs)?;
+            collect_expression_inputs(expressions, *value, materialized, visited, inputs)?;
+            collect_expression_inputs(expressions, *count, materialized, visited, inputs)?;
         }
         SemanticCExprKind::Select {
             condition,
             if_true,
             if_false,
         } => {
-            collect_expression_inputs(expressions, *condition, visited, inputs)?;
-            collect_expression_inputs(expressions, *if_true, visited, inputs)?;
-            collect_expression_inputs(expressions, *if_false, visited, inputs)?;
+            collect_expression_inputs(expressions, *condition, materialized, visited, inputs)?;
+            collect_expression_inputs(expressions, *if_true, materialized, visited, inputs)?;
+            collect_expression_inputs(expressions, *if_false, materialized, visited, inputs)?;
         }
     }
     Ok(())

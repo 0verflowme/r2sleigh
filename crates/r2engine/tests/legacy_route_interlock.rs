@@ -2,7 +2,7 @@ use r2engine::{EngineFunctionDecompileRequestInput, EngineFunctionInput, EngineS
 use r2il::{R2ILBlock, R2ILOp, Varnode};
 
 #[test]
-fn detached_production_input_refuses_before_legacy_certified_c() {
+fn detached_production_input_refuses_before_source_owned_certified_c() {
     let mut block = R2ILBlock::new(0x401000, 4);
     block.push(R2ILOp::Return {
         target: Varnode::constant(0, 8),
@@ -26,15 +26,11 @@ fn detached_production_input_refuses_before_legacy_certified_c() {
         .decompile_route()
         .expect("engine response route");
     assert_eq!(route.kind, r2types::DecompileRouteKind::FallbackComment);
-    assert_eq!(
-        route.render_permission.kind,
-        r2sym::RenderPermissionKind::Refuse
-    );
-    assert_eq!(route.render_permission.owner, r2sym::ProofOwner::R2engine);
     assert!(
         route
-            .render_permission
             .reason
+            .as_deref()
+            .unwrap_or_default()
             .contains("engine analysis requires an immutable source snapshot")
     );
     assert!(response.output.contains("r2dec fallback:"));

@@ -4,11 +4,13 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use r2il::ArchSpec;
 
-use crate::SSAVar;
+use crate::machine_context::SourceMachineContext;
+use crate::{CanonicalStorageId, CanonicalStorageSpace, MachineArchitectureFamily, SSAVar};
 
 #[derive(Debug, Clone)]
 struct AbiSlot {
     size: u32,
+    storage: Option<CanonicalStorageId>,
 }
 
 /// Architecture calling-convention profile shared by SSA fact producers.
@@ -18,9 +20,95 @@ pub struct AbiProfile {
     ret_aliases: BTreeSet<String>,
     alias_to_arg: BTreeMap<String, usize>,
     alias_is_ret: BTreeSet<String>,
+    source_owned: bool,
 }
 
 impl AbiProfile {
+    pub(crate) fn from_machine_context(context: &SourceMachineContext) -> Option<Self> {
+        let memory = context.memory_model();
+        let abi = context.abi_model();
+        if !memory.is_available()
+            || !memory.is_coherent()
+            || !abi.is_available()
+            || !abi.is_coherent()
+        {
+            return None;
+        }
+        let expected_bits = match context.architecture_family() {
+            MachineArchitectureFamily::X86
+            | MachineArchitectureFamily::Arm
+            | MachineArchitectureFamily::RiscV32
+            | MachineArchitectureFamily::Mips32
+            | MachineArchitectureFamily::PowerPc32 => 32,
+            MachineArchitectureFamily::X86_64
+            | MachineArchitectureFamily::AArch64
+            | MachineArchitectureFamily::RiscV64
+            | MachineArchitectureFamily::Mips64
+            | MachineArchitectureFamily::PowerPc64 => 64,
+            MachineArchitectureFamily::Unknown => return None,
+        };
+        if memory.default_address_bits() != expected_bits {
+            return None;
+        }
+
+        let mut arguments = abi.argument_registers().to_vec();
+        arguments.sort_by_key(|slot| slot.index());
+        if arguments
+            .iter()
+            .enumerate()
+            .any(|(index, slot)| slot.index() as usize != index)
+        {
+            return None;
+        }
+        let mut out = Self {
+            source_owned: true,
+            ..Self::default()
+        };
+        let mut argument_storages = BTreeSet::new();
+        for slot in arguments {
+            let storage = slot.storage();
+            if storage.space != CanonicalStorageSpace::Register
+                || storage.size == 0
+                || !argument_storages.insert(storage)
+            {
+                return None;
+            }
+            out.args.push(AbiSlot {
+                size: storage.size,
+                storage: Some(storage),
+            });
+            let mut aliases = 0usize;
+            for (name, candidate) in context.register_storages_by_name() {
+                if storage_contains(storage, *candidate) {
+                    out.alias_to_arg.insert(name.clone(), slot.index() as usize);
+                    aliases += 1;
+                }
+            }
+            if aliases == 0 {
+                return None;
+            }
+        }
+
+        for slot in abi.return_registers() {
+            let storage = slot.storage();
+            if storage.space != CanonicalStorageSpace::Register || storage.size == 0 {
+                return None;
+            }
+            let mut aliases = 0usize;
+            for (name, candidate) in context.register_storages_by_name() {
+                if storage_contains(storage, *candidate) {
+                    out.ret_aliases.insert(name.clone());
+                    out.alias_is_ret.insert(name.clone());
+                    aliases += 1;
+                }
+            }
+            if aliases == 0 {
+                return None;
+            }
+        }
+        Some(out)
+    }
+
     pub fn from_arch(arch: Option<&ArchSpec>) -> Self {
         let Some(arch) = arch else {
             return Self::default();
@@ -142,7 +230,10 @@ impl AbiProfile {
     ) -> Self {
         let mut out = Self::default();
         for (index, (primary, size, aliases)) in args.into_iter().enumerate() {
-            out.args.push(AbiSlot { size });
+            out.args.push(AbiSlot {
+                size,
+                storage: None,
+            });
             out.alias_to_arg.insert(primary.to_string(), index);
             for alias in aliases {
                 out.alias_to_arg.insert((*alias).to_string(), index);
@@ -175,6 +266,19 @@ impl AbiProfile {
         (var.size == slot.size).then_some(index)
     }
 
+    pub(crate) fn exact_argument_index_for_storage(
+        &self,
+        storage: CanonicalStorageId,
+    ) -> Option<usize> {
+        self.args
+            .iter()
+            .position(|slot| slot.storage == Some(storage))
+    }
+
+    pub(crate) const fn is_source_owned(&self) -> bool {
+        self.source_owned
+    }
+
     pub fn is_return_register(&self, name: &str) -> bool {
         self.alias_is_ret.contains(&name.to_ascii_lowercase())
     }
@@ -182,4 +286,17 @@ impl AbiProfile {
     pub fn argument_count(&self) -> usize {
         self.args.len()
     }
+}
+
+fn storage_contains(container: CanonicalStorageId, candidate: CanonicalStorageId) -> bool {
+    if container.space != candidate.space || candidate.size == 0 {
+        return false;
+    }
+    candidate
+        .offset
+        .checked_add(u64::from(candidate.size))
+        .zip(container.offset.checked_add(u64::from(container.size)))
+        .is_some_and(|(candidate_end, container_end)| {
+            candidate.offset >= container.offset && candidate_end <= container_end
+        })
 }

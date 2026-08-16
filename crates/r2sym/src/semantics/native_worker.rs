@@ -740,6 +740,7 @@ pub fn function_semantic_summary_seed_for_name_with_linkage(
     };
 
     Some(FunctionSemanticSummary {
+        schema_version: r2ssa::interproc::INTERPROC_SUMMARY_SCHEMA_VERSION,
         id,
         name: Some(normalized.to_string()),
         linkage,

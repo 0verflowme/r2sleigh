@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 
 use r2il::R2ILBlock;
 use r2ssa::{CFGRiskSummary, SSAFunction, SsaArtifact};
-use r2types::{DecompileCapabilityView, FunctionFacts, FunctionTypeFacts};
+use r2types::{DecompileCapabilityView, FunctionFacts};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -170,21 +170,12 @@ fn provisional_decompile_route(
     reason: Option<String>,
     fallback_comment: Option<String>,
 ) -> r2types::DecompileRouteFacts {
-    let render_reason = fallback_comment
-        .clone()
-        .or_else(|| reason.clone())
-        .unwrap_or_else(|| "engine route not finalized".to_string());
     r2types::DecompileRouteFacts {
         kind,
         reason,
         fallback_comment,
         skip_runtime_type_inference: !matches!(kind, r2types::DecompileRouteKind::Standard),
         use_prepared_semantic_view: matches!(kind, r2types::DecompileRouteKind::Standard),
-        proof_coverage: r2sym::ProofCoverage::default(),
-        render_permission: r2sym::RenderPermission::refuse(
-            r2sym::ProofOwner::R2engine,
-            render_reason,
-        ),
     }
 }
 
@@ -193,15 +184,11 @@ pub struct EngineDiagnostics {
     pub plan: Option<EnginePlan>,
     pub route_reason: Option<String>,
     pub semantic_kernel_render: Option<EngineSemanticKernelRender>,
-    /// Legacy route coverage retained for diagnostics, never exact render authority.
-    pub proof_coverage: Option<r2sym::ProofCoverage>,
-    /// Legacy route claim retained for compatibility, never exact render authority.
-    pub render_permission: Option<r2sym::RenderPermission>,
     pub warnings: Vec<String>,
     pub refusal: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct EngineRouteContext<'a> {
     pub func_name: &'a str,
     pub function_facts: &'a FunctionFacts,
@@ -216,8 +203,8 @@ impl<'a> EngineRouteContext<'a> {
         cfg_summary: &'a CFGRiskSummary,
     ) -> Self {
         let semantic_claims = function_facts
-            .semantic_artifact()
-            .map(r2sym::SemanticArtifact::semantic_claim_summary)
+            .semantic_report()
+            .map(r2sym::SemanticArtifactReport::semantic_claim_summary)
             .unwrap_or_else(r2sym::SemanticClaimSummary::empty);
         Self {
             func_name,
@@ -257,7 +244,6 @@ pub struct EngineTypeRouteDecision {
     pub kind: EngineTypeRouteKind,
     pub prefer_bounded_type_plan: bool,
     pub reason: Option<String>,
-    pub apply_artifact_signature_hint: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -295,27 +281,11 @@ impl EngineTypedRouteDecision {
         }
     }
 
-    pub fn proof_coverage(&self) -> Option<r2sym::ProofCoverage> {
-        match self {
-            Self::Decompile(decision) => Some(decision.route.proof_coverage.clone()),
-            Self::Types(_) => None,
-        }
-    }
-
-    pub fn render_permission(&self) -> Option<r2sym::RenderPermission> {
-        match self {
-            Self::Decompile(decision) => Some(decision.route.render_permission.clone()),
-            Self::Types(_) => None,
-        }
-    }
-
     pub fn diagnostics(&self) -> EngineDiagnostics {
         EngineDiagnostics {
             plan: Some(self.plan()),
             route_reason: self.reason(),
             semantic_kernel_render: None,
-            proof_coverage: self.proof_coverage(),
-            render_permission: self.render_permission(),
             refusal: self.refusal(),
             warnings: Vec::new(),
         }
@@ -557,20 +527,6 @@ fn native_linear_artifact_plan_allows_summary_route(
         )
 }
 
-pub(super) fn proof_coverage_from_type_facts(
-    type_facts: &FunctionTypeFacts,
-) -> r2sym::ProofCoverage {
-    r2sym::ProofCoverage {
-        certified_field_accesses: type_facts.field_access_certificates.len(),
-        certified_array_indexes: type_facts.array_index_certificates.len(),
-        certified_out_params: type_facts
-            .source_authorized_out_param_certificates()
-            .count(),
-        certified_signatures: usize::from(type_facts.render_authorized_signature().is_some()),
-        ..r2sym::ProofCoverage::default()
-    }
-}
-
 pub fn select_engine_plan(
     request: EngineRequestKind,
     route: Option<&r2types::DecompileRouteFacts>,
@@ -656,6 +612,26 @@ pub(crate) fn semantic_route_plan_from_context(
             None,
         );
     }
+    if let Some(artifact) = context.function_facts.semantic_artifact()
+        && artifact.execution == r2sym::ExecutionModel::Native
+        && artifact.granularity == r2sym::ArtifactGranularity::SummaryOnly
+    {
+        let comment = crate::semantic_fallback_comment_for_facts(
+            context.func_name,
+            context.function_facts,
+        )
+        .unwrap_or_else(|| {
+            crate::artifact_guard_fallback_comment(
+                context.func_name,
+                "summary-only semantic report is advisory and cannot authorize executable C",
+            )
+        });
+        return provisional_decompile_route(
+            r2types::DecompileRouteKind::FallbackComment,
+            Some(comment.clone()),
+            Some(comment),
+        );
+    }
     if let Some(comment) =
         preferred_semantic_fallback_comment(context.func_name, context.function_facts)
     {
@@ -718,54 +694,14 @@ pub(crate) fn decompile_route_decision(
         Some(&route),
         Some(function_facts),
     );
-    let proof_coverage = prepared
-        .map(|prepared| r2sym::ProofCoverage::from_prepared_certificates(prepared.certificates()))
-        .unwrap_or_default()
-        .merge(function_facts.proof_coverage().clone())
-        .merge(proof_coverage_from_type_facts(function_facts.type_facts()));
-    let render_permission = legacy_render_permission_for_decompile_route(&route);
     let mut route = route;
     route.skip_runtime_type_inference =
         should_skip_runtime_type_inference(prepared, function_facts);
     route.use_prepared_semantic_view = should_use_prepared_semantic_view(prepared, function_facts);
-    route.proof_coverage = proof_coverage;
-    route.render_permission = render_permission;
     EngineRouteDecision {
         request: EngineRequestKind::Decompile,
         plan,
         route,
-    }
-}
-
-/// Retains the legacy route diagnostic without granting render authority.
-/// Exact executable C is authorized only by the typed-region permits consumed
-/// by the semantic-kernel renderers.
-fn legacy_render_permission_for_decompile_route(
-    route: &r2types::DecompileRouteFacts,
-) -> r2sym::RenderPermission {
-    match route.kind {
-        r2types::DecompileRouteKind::Standard => r2sym::RenderPermission::residual(
-            r2sym::ProofOwner::R2engine,
-            "legacy Standard proof counters cannot authorize production output; r2cert typed-region authorization is required",
-        ),
-        r2types::DecompileRouteKind::FallbackComment => r2sym::RenderPermission::refuse(
-            r2sym::ProofOwner::R2engine,
-            route
-                .fallback_comment
-                .clone()
-                .or_else(|| route.reason.clone())
-                .unwrap_or_else(|| "engine decompile route refused".to_string()),
-        ),
-        r2types::DecompileRouteKind::VmSummary
-        | r2types::DecompileRouteKind::SummaryIslands
-        | r2types::DecompileRouteKind::LinearWorker
-        | r2types::DecompileRouteKind::StructuredWorker => r2sym::RenderPermission::summary(
-            r2sym::ProofOwner::R2engine,
-            route
-                .reason
-                .clone()
-                .unwrap_or_else(|| "engine selected summary route".to_string()),
-        ),
     }
 }
 
@@ -775,20 +711,6 @@ pub(crate) fn semantic_route_reason(route: &r2types::DecompileRouteFacts) -> Opt
         .reason
         .clone()
         .or_else(|| route.fallback_comment.clone())
-}
-
-#[cfg(test)]
-pub(crate) fn detached_semantic_route_plan(
-    func_name: &str,
-    blocks: &[R2ILBlock],
-    function_facts: &FunctionFacts,
-) -> Option<r2types::DecompileRouteFacts> {
-    let ssa_func = SSAFunction::from_blocks_raw_no_arch(blocks)?;
-    Some(semantic_route_plan(
-        func_name,
-        function_facts,
-        &ssa_func.cfg_risk_summary(),
-    ))
 }
 
 pub fn cfg_guard_reason(blocks: &[R2ILBlock]) -> Option<String> {
@@ -890,7 +812,6 @@ pub fn type_route_decision(
             kind: EngineTypeRouteKind::BoundedCfg,
             prefer_bounded_type_plan: true,
             reason: Some(type_cfg_bounded_reason(cfg_summary)),
-            apply_artifact_signature_hint: false,
         };
     }
 
@@ -902,8 +823,7 @@ pub fn type_route_decision(
             plan: EnginePlan::SemanticSummary,
             kind: EngineTypeRouteKind::SemanticFallback,
             prefer_bounded_type_plan: true,
-            reason: Some("semantic fallback type projection".to_string()),
-            apply_artifact_signature_hint: true,
+            reason: Some("semantic summary retained as advisory type evidence".to_string()),
         };
     }
 
@@ -913,7 +833,6 @@ pub fn type_route_decision(
         kind: EngineTypeRouteKind::FullWriteback,
         prefer_bounded_type_plan: false,
         reason: None,
-        apply_artifact_signature_hint: false,
     }
 }
 
@@ -1198,8 +1117,8 @@ fn has_dense_summary_only_memory_worker(capability: &DecompileCapabilityView) ->
 
 pub(super) fn has_renderable_native_linear_worker_summary(function_facts: &FunctionFacts) -> bool {
     let Some(native) = function_facts
-        .semantic_artifact()
-        .and_then(r2sym::SemanticArtifact::native_body)
+        .semantic_report()
+        .and_then(r2sym::SemanticArtifactReport::native_body)
     else {
         return false;
     };
@@ -1300,8 +1219,8 @@ fn has_weak_summary_arg_contract_conflict(function_facts: &FunctionFacts) -> boo
         return false;
     };
     let Some(native) = function_facts
-        .semantic_artifact()
-        .and_then(r2sym::SemanticArtifact::native_body)
+        .semantic_report()
+        .and_then(r2sym::SemanticArtifactReport::native_body)
     else {
         return false;
     };

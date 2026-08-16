@@ -155,8 +155,8 @@ Detached symbolic commands are unavailable. `a:sla.sym`, `a:sla.sym.paths`,
 that build a detached symbolic scope cannot establish source authority from
 live plugin state.
 
-Symbolic execution requires a borrowed ABI-138/snapshot-schema-11 function
-snapshot through accessor-schema 4 from radare2's locked snapshot transaction.
+Symbolic execution requires a borrowed ABI-139/snapshot-schema-12 function
+snapshot through accessor-schema 5 from radare2's locked snapshot transaction.
 The snapshot is deep-copied synchronously into source-interface-schema 10 and
 then treated as immutable. Missing, stale, or incomplete source authority is
 refused; there is no detached fallback or replacement plugin API.

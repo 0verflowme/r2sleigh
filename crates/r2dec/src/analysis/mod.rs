@@ -1,7 +1,6 @@
-use std::{
-    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
-    sync::OnceLock,
-};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+#[cfg(test)]
+use std::sync::OnceLock;
 
 use r2ssa::{FunctionSSABlock, SSAVar, ValueId};
 use r2types::{CalleeFact, CalleeResolutionFacts, InterprocSummaryView, TypeOracle};
@@ -30,8 +29,10 @@ pub(crate) use prepared_semantic::{
     build_prepared_runtime_facts_with_control,
 };
 
+#[cfg(test)]
 static EMPTY_CALLEE_FACTS: OnceLock<BTreeMap<u64, CalleeFact>> = OnceLock::new();
 
+#[cfg(test)]
 pub(crate) fn empty_callee_facts() -> &'static BTreeMap<u64, CalleeFact> {
     EMPTY_CALLEE_FACTS.get_or_init(BTreeMap::new)
 }
@@ -522,6 +523,7 @@ impl UseInfo {
         use_info::analyze_with_control(blocks, env, control)
     }
 
+    #[cfg(test)]
     pub(crate) fn analyze_for_local_struct_accesses(
         blocks: &[SSABlock],
         env: &PassEnv<'_>,

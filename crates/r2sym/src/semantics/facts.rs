@@ -3,9 +3,8 @@ use std::time::Duration;
 
 use r2il::ArchSpec;
 use r2ssa::{
-    FunctionSemanticSummary, InterprocFunctionId, InterprocFunctionInput, InterprocSolveConfig,
-    SsaArtifact, SummaryMemoryEffect, SummaryMemoryEffectKind, SummaryMemoryRegion,
-    solve_interproc_summary_set,
+    InterprocFunctionId, PreparedInterprocSummarySet, SsaArtifact, SummaryMemoryEffect,
+    SummaryMemoryEffectKind, SummaryMemoryRegion,
 };
 use serde::{Deserialize, Serialize};
 use z3::Context;
@@ -441,67 +440,52 @@ fn joined_large_cfg_summary_memory_terms(
         .collect()
 }
 
-fn large_cfg_root_summary(func: &SsaArtifact, arch: &ArchSpec) -> Option<FunctionSemanticSummary> {
-    let id = InterprocFunctionId(func.entry);
-    let input = InterprocFunctionInput {
-        id,
-        name: func.function().name.clone(),
-        prepared: func,
-    };
-    solve_interproc_summary_set(
-        &[input],
-        Some(arch),
-        Some(id),
-        &BTreeMap::new(),
-        InterprocSolveConfig::default(),
-    )
-    .summaries
-    .remove(&id)
-}
-
-fn append_large_cfg_summary_memory_terms(
-    func: &SsaArtifact,
-    arch: &ArchSpec,
-    regions: &mut BTreeMap<RegionKey, SemanticRegion>,
-) -> Vec<NativeWorkerSummary> {
-    let Some(summary) = large_cfg_root_summary(func, arch) else {
-        return Vec::new();
-    };
-    let worker_summaries =
-        super::native_worker::summaries_from_interproc_summary_unbounded(func.entry, &summary);
-    let terms = joined_large_cfg_summary_memory_terms(&summary.memory_effects);
-    if terms.is_empty() {
-        return worker_summaries;
-    }
-    let mut by_anchor = BTreeMap::<u64, SemanticRegion>::new();
-    for region in std::mem::take(regions).into_values() {
-        by_anchor.insert(region.anchor, region);
-    }
-    let region = ensure_semantic_region(&mut by_anchor, func.entry);
-    push_region_memory_terms(region, terms);
-    *regions = by_anchor
-        .into_values()
-        .map(|region| (region.key(), region))
-        .collect();
-    worker_summaries
-}
-
 pub fn augment_semantic_artifact_with_interproc_summary(
     artifact: &mut SemanticArtifact,
-    anchor: u64,
-    summary: &FunctionSemanticSummary,
+    summaries: &PreparedInterprocSummarySet,
 ) -> usize {
-    let SemanticArtifactBody::Native(native) = &mut artifact.body else {
+    let prepared = artifact.shared_prepared();
+    if !summaries.matches_root(&prepared) {
+        return 0;
+    }
+    let Some(root) = summaries.report().root else {
+        return 0;
+    };
+    if root != InterprocFunctionId(prepared.entry) {
+        return 0;
+    }
+    let Some(summary) = summaries
+        .report()
+        .summaries
+        .get(&root)
+        .filter(|summary| summary.id == root)
+    else {
+        return 0;
+    };
+    let anchor = root.0;
+    let SemanticArtifactBody::Native(native) = &artifact.report().body else {
         return 0;
     };
 
-    let mut worker_summaries = std::mem::take(&mut native.summary.worker_summaries);
+    let mut worker_summaries = native.summary.worker_summaries.clone();
     worker_summaries
         .extend(super::native_worker::summaries_from_interproc_summary_unbounded(anchor, summary));
-    native.summary.worker_summaries =
-        super::native_worker::bounded_worker_summaries(worker_summaries);
+    let worker_summaries = super::native_worker::bounded_worker_summaries(worker_summaries);
+    let worker_summaries_changed = worker_summaries != native.summary.worker_summaries;
 
     let terms = joined_large_cfg_summary_memory_terms(&summary.memory_effects);
+    if !worker_summaries_changed && terms.is_empty() {
+        return 0;
+    }
+    if !artifact.retain_interproc_provenance(summaries) {
+        return 0;
+    }
+    let SemanticArtifactBody::Native(native) = &mut artifact.report_mut().body else {
+        return 0;
+    };
+    if worker_summaries_changed {
+        native.summary.worker_summaries = worker_summaries;
+    }
     if terms.is_empty() {
         return 0;
     }
@@ -897,9 +881,9 @@ fn install_derived_summary_set<'ctx>(
 ) {
     let prepared = scope
         .and_then(|scope| scope.root())
-        .map(|root| &root.prepared)
+        .map(|root| root.prepared.as_ref())
         .unwrap_or(func);
-    let _ = registry.install_interproc_summaries_for_function(
+    let _ = registry.install_interproc_summary_report_for_function(
         explorer,
         prepared,
         &derived.interproc,
@@ -928,8 +912,10 @@ fn install_symbolic_fact_hooks<'ctx>(
     else {
         return;
     };
-    if let Some(scope) = scope {
-        let derived = registry.derive_symbolic_summaries(ctx, scope, Some(arch), symbol_map);
+    if let Some(scope) = scope
+        && let Ok(derived) =
+            registry.derive_source_owned_symbolic_summaries(ctx, scope, Some(arch), symbol_map)
+    {
         install_derived_summary_set(explorer, &registry, func, Some(scope), &derived, symbol_map);
         return;
     }
@@ -1148,8 +1134,9 @@ pub(super) fn collect_large_cfg_canonical_semantic_regions_with_limit(
         let branch_blocks = limited_branch_blocks(func, branch_limit);
         if let Some(registry) =
             SummaryRegistry::with_profile_for_arch_and_symbols(arch, symbol_map, summary_profile)
+            && let Ok(derived) =
+                registry.derive_source_owned_symbolic_summaries(ctx, scope, Some(arch), symbol_map)
         {
-            let derived = registry.derive_symbolic_summaries(ctx, scope, Some(arch), symbol_map);
             collect_canonical_semantic_regions_with_derived_for_branch_blocks(
                 ctx,
                 func,
@@ -1213,13 +1200,10 @@ pub(super) fn collect_large_cfg_canonical_semantic_regions_with_limit(
         }
     };
     let mut canonical_worker_domain = Vec::new();
-    if branch_limit > 0 {
-        canonical_worker_domain.extend(append_large_cfg_summary_memory_terms(
-            func,
-            arch,
-            &mut collected.regions,
-        ));
-    }
+    // Interprocedural memory terms are authority-bearing and may only enter
+    // through `augment_semantic_artifact_with_interproc_summary`, which checks
+    // a retained `PreparedInterprocSummarySet` against the exact artifact.
+    // This ownerless collection path remains residual for those terms.
     canonical_worker_domain.extend(append_large_cfg_memory_transfer_terms(
         func,
         &mut collected.regions,
@@ -1268,13 +1252,12 @@ pub(super) fn collect_canonical_semantic_regions_with_scope_and_profile(
         );
     }
 
-    if let Some(scope) = scope {
-        let Some(registry) =
+    if let Some(scope) = scope
+        && let Some(registry) =
             SummaryRegistry::with_profile_for_arch_and_symbols(arch, symbol_map, summary_profile)
-        else {
-            return CollectedNativeSemanticRegions::default();
-        };
-        let derived = registry.derive_symbolic_summaries(ctx, scope, Some(arch), symbol_map);
+        && let Ok(derived) =
+            registry.derive_source_owned_symbolic_summaries(ctx, scope, Some(arch), symbol_map)
+    {
         return collect_canonical_semantic_regions_with_derived(
             ctx,
             func,
@@ -1315,15 +1298,18 @@ pub(super) fn collect_canonical_semantic_regions_with_scope_and_profile(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
     use crate::{
         ArtifactGranularity, ExecutionModel, NativeArtifactBody, NativeFunctionSummary,
         NativeWorkerSummaryKind, RefinementStage, SemanticArtifactDiagnostics,
+        SemanticArtifactReport,
     };
-    use r2il::{RegisterDef, SpaceId, Varnode};
+    use r2il::{R2ILBlock, R2ILOp, RegisterDef, SpaceId, Varnode};
     use r2ssa::{
-        CanonicalStorageId, CanonicalStorageSpace, SourceAbiParameterSpec, SourceFunctionInterface,
-        SourceFunctionReturn,
+        CanonicalStorageId, CanonicalStorageSpace, InterprocSolveConfig, SourceAbiParameterSpec,
+        SourceFunctionInterface, SourceFunctionReturn,
     };
 
     fn register_storage(offset: u64, size: u32) -> CanonicalStorageId {
@@ -1651,59 +1637,6 @@ mod tests {
     }
 
     #[test]
-    fn large_cfg_summary_pass_surfaces_bounded_arg_memory_effects() {
-        let mut arch = ArchSpec::new("aarch64");
-        arch.addr_size = 8;
-        arch.add_register(RegisterDef::new("x0", 0x00, 8));
-        arch.add_register(RegisterDef::new("x1", 0x08, 8));
-
-        let mut block = r2il::R2ILBlock::new(0x2000, 4);
-        block.push(r2il::R2ILOp::Load {
-            dst: Varnode::unique(0, 1),
-            space: SpaceId::Ram,
-            addr: Varnode::register(0x08, 8),
-        });
-        block.push(r2il::R2ILOp::Store {
-            space: SpaceId::Ram,
-            addr: Varnode::register(0x00, 8),
-            val: Varnode::unique(0, 1),
-        });
-
-        let artifact = SsaArtifact::for_symbolic(&[block], Some(&arch))
-            .expect("copy-shaped fixture should build SSA");
-        let mut regions = BTreeMap::new();
-        let worker_summaries =
-            append_large_cfg_summary_memory_terms(&artifact, &arch, &mut regions);
-        let terms = regions
-            .values()
-            .flat_map(|region| region.memory.iter())
-            .collect::<Vec<_>>();
-
-        assert!(terms.iter().any(|term| {
-            term.value.term.binding.as_deref() == Some("read_arg1")
-                && matches!(
-                    term.value.term.region,
-                    BackwardMemoryRegion::Argument { index: 1 }
-                )
-        }));
-        assert!(terms.iter().any(|term| {
-            term.value.term.binding.as_deref() == Some("write_arg0")
-                && matches!(
-                    term.value.term.region,
-                    BackwardMemoryRegion::Argument { index: 0 }
-                )
-        }));
-        assert!(worker_summaries.iter().any(|summary| {
-            matches!(summary.kind, NativeWorkerSummaryKind::MemoryRead)
-                && summary.arg_indices().contains(&1)
-        }));
-        assert!(worker_summaries.iter().any(|summary| {
-            matches!(summary.kind, NativeWorkerSummaryKind::MemoryWrite)
-                && summary.out_param_indices().contains(&0)
-        }));
-    }
-
-    #[test]
     fn large_cfg_summary_join_preserves_distinct_memory_effect_classes() {
         let mut effects = (0..48)
             .map(|index| SummaryMemoryEffect {
@@ -1775,69 +1708,78 @@ mod tests {
     #[test]
     fn interproc_summary_augmentation_adds_native_memory_terms() {
         let root = InterprocFunctionId(0x3000);
-        let summary = FunctionSemanticSummary {
-            id: root,
-            name: Some("sym.copy_worker".to_string()),
-            linkage: r2ssa::FunctionSemanticLinkage::Unknown,
-            arg_count_hint: Some(1),
-            direct_callees: BTreeSet::new(),
-            callsite_count: 0,
-            has_unknown_calls: false,
-            arg_effects: BTreeMap::new(),
-            memory_effects: vec![SummaryMemoryEffect {
-                kind: SummaryMemoryEffectKind::Write,
-                location: r2ssa::SummaryMemoryLocation {
-                    region: SummaryMemoryRegion::Arg { index: 0 },
-                    range: Some(r2ssa::SummaryMemoryRange {
-                        offset_lo: 0,
-                        offset_hi: 7,
-                        width: Some(8),
-                    }),
-                },
+        let (arch, interface) = exact_affine_aarch64_fixture();
+        let mut block = R2ILBlock::new(0x3000, 1);
+        block.push(R2ILOp::Store {
+            space: SpaceId::Ram,
+            addr: Varnode::register(0x00, 8),
+            val: Varnode::constant(0, 8),
+        });
+        block.push(R2ILOp::Return {
+            target: Varnode::constant(0, 8),
+        });
+        let prepared = Arc::new(
+            SsaArtifact::for_decompile_with_interface(&[block], Some(&arch), interface)
+                .expect("source summary SSA"),
+        );
+        let summaries = r2ssa::solve_prepared_interproc_summary_set(
+            Arc::clone(&prepared),
+            &[r2ssa::PreparedInterprocFunctionInput {
+                id: root,
+                name: Some("sym.copy_worker".to_string()),
+                prepared: &prepared,
             }],
-            transfer_effects: Vec::new(),
-            allocation_effects: Vec::new(),
-            lifetime_effects: Vec::new(),
-            sync_effects: Vec::new(),
-            atomic_effects: Vec::new(),
-            return_relation: r2ssa::SummaryReturnRelation::Unknown,
-            reads_global_memory: false,
-            writes_global_memory: false,
-            touches_unknown_memory: false,
-        };
-        let mut artifact = SemanticArtifact {
-            stage: RefinementStage::Residual,
-            granularity: ArtifactGranularity::SummaryOnly,
-            execution: ExecutionModel::Native,
-            body: SemanticArtifactBody::Native(NativeArtifactBody {
-                summary: NativeFunctionSummary {
-                    slice_class: crate::SliceClass::Worker,
-                    role_identity: None,
-                    closure_functions: 1,
-                    helper_functions: 0,
-                    derived_summaries: 0,
-                    derived_diagnostics: crate::sim::DerivedSummaryDiagnostics::default(),
-                    region_summaries: Vec::new(),
-                    worker_summaries: Vec::new(),
+            InterprocSolveConfig::default(),
+        )
+        .expect("prepared summary");
+        let root_summary = summaries
+            .report()
+            .summaries
+            .get(&root)
+            .expect("root summary");
+        assert!(root_summary.has_unknown_calls);
+        assert_eq!(
+            root_summary.return_relation,
+            r2ssa::SummaryReturnRelation::Unknown
+        );
+        let mut artifact = SemanticArtifact::new(
+            prepared,
+            SemanticArtifactReport {
+                schema_version: crate::SEMANTIC_ARTIFACT_SCHEMA_VERSION,
+                stage: RefinementStage::Residual,
+                granularity: ArtifactGranularity::SummaryOnly,
+                execution: ExecutionModel::Native,
+                body: SemanticArtifactBody::Native(NativeArtifactBody {
+                    summary: NativeFunctionSummary {
+                        slice_class: crate::SliceClass::Worker,
+                        role_identity: None,
+                        closure_functions: 1,
+                        helper_functions: 0,
+                        derived_summaries: 0,
+                        derived_diagnostics: crate::sim::DerivedSummaryDiagnostics::default(),
+                        region_summaries: Vec::new(),
+                        worker_summaries: Vec::new(),
+                    },
+                    regions: BTreeMap::new(),
+                }),
+                diagnostics: SemanticArtifactDiagnostics {
+                    branches_evaluated: 0,
+                    branches_pruned: 0,
+                    branches_unknown: 0,
+                    skipped_missing_arch: false,
+                    skipped_large_cfg: true,
+                    residual_reasons: vec![crate::ResidualReason::LargeCfg],
+                    interpreter: None,
+                    ambiguous_targets: Vec::new(),
                 },
-                regions: BTreeMap::new(),
-            }),
-            diagnostics: SemanticArtifactDiagnostics {
-                branches_evaluated: 0,
-                branches_pruned: 0,
-                branches_unknown: 0,
-                skipped_missing_arch: false,
-                skipped_large_cfg: true,
-                residual_reasons: vec![crate::ResidualReason::LargeCfg],
-                interpreter: None,
-                ambiguous_targets: Vec::new(),
             },
-        };
+        )
+        .expect("current semantic facts schema");
 
-        let added =
-            augment_semantic_artifact_with_interproc_summary(&mut artifact, 0x3000, &summary);
+        let added = augment_semantic_artifact_with_interproc_summary(&mut artifact, &summaries);
 
-        assert_eq!(added, 1);
+        assert_eq!(added, 7);
+        assert!(!artifact.has_helper_provenance());
         let native = artifact.native_body().expect("native semantic body");
         assert!(native.summary.worker_summaries.iter().any(|summary| {
             matches!(summary.kind, NativeWorkerSummaryKind::MemoryWrite)
@@ -1851,5 +1793,82 @@ mod tests {
                     BackwardMemoryRegion::Argument { index: 0 }
                 )
         }));
+    }
+
+    #[test]
+    fn interproc_summary_augmentation_rejects_foreign_rebuilt_owner() {
+        let (arch, interface) = exact_affine_aarch64_fixture();
+        let mut block = R2ILBlock::new(0x3000, 1);
+        block.push(R2ILOp::Store {
+            space: SpaceId::Ram,
+            addr: Varnode::register(0x00, 8),
+            val: Varnode::constant(0, 8),
+        });
+        block.push(R2ILOp::Return {
+            target: Varnode::constant(0, 8),
+        });
+        let requested = Arc::new(
+            SsaArtifact::for_decompile_with_interface(
+                std::slice::from_ref(&block),
+                Some(&arch),
+                interface.clone(),
+            )
+            .expect("requested SSA"),
+        );
+        let foreign = Arc::new(
+            SsaArtifact::for_decompile_with_interface(&[block], Some(&arch), interface)
+                .expect("foreign rebuilt SSA"),
+        );
+        let summaries = r2ssa::solve_prepared_interproc_summary_set(
+            Arc::clone(&foreign),
+            &[r2ssa::PreparedInterprocFunctionInput {
+                id: InterprocFunctionId(foreign.entry),
+                name: None,
+                prepared: &foreign,
+            }],
+            InterprocSolveConfig::default(),
+        )
+        .expect("foreign prepared summary");
+        let mut artifact = SemanticArtifact::new(
+            requested,
+            SemanticArtifactReport {
+                schema_version: crate::SEMANTIC_ARTIFACT_SCHEMA_VERSION,
+                stage: RefinementStage::Residual,
+                granularity: ArtifactGranularity::SummaryOnly,
+                execution: ExecutionModel::Native,
+                body: SemanticArtifactBody::Native(NativeArtifactBody {
+                    summary: NativeFunctionSummary {
+                        slice_class: crate::SliceClass::Worker,
+                        role_identity: None,
+                        closure_functions: 1,
+                        helper_functions: 0,
+                        derived_summaries: 0,
+                        derived_diagnostics: crate::sim::DerivedSummaryDiagnostics::default(),
+                        region_summaries: Vec::new(),
+                        worker_summaries: Vec::new(),
+                    },
+                    regions: BTreeMap::new(),
+                }),
+                diagnostics: SemanticArtifactDiagnostics {
+                    branches_evaluated: 0,
+                    branches_pruned: 0,
+                    branches_unknown: 0,
+                    skipped_missing_arch: false,
+                    skipped_large_cfg: true,
+                    residual_reasons: vec![crate::ResidualReason::LargeCfg],
+                    interpreter: None,
+                    ambiguous_targets: Vec::new(),
+                },
+            },
+        )
+        .expect("current semantic facts schema");
+        let before = artifact.report().clone();
+
+        assert_eq!(
+            augment_semantic_artifact_with_interproc_summary(&mut artifact, &summaries),
+            0
+        );
+        assert_eq!(artifact.report(), &before);
+        assert!(!artifact.has_helper_provenance());
     }
 }

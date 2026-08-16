@@ -1797,12 +1797,17 @@ fn merge_register_ranges(ranges: &mut Vec<(u64, u64)>, incoming: &[(u64, u64)]) 
     *ranges != previous
 }
 
+struct TerminalStorageLiveness {
+    uncovered_register_ranges: Vec<(u64, u64)>,
+    preserved_definitions: HashSet<VarKey>,
+}
+
 fn transfer_terminal_storage_liveness(
     func: &SSAFunction,
     block_addr: u64,
     projection: TerminalStorageProjection,
     live_out: &[(u64, u64)],
-) -> Option<(Vec<(u64, u64)>, HashSet<VarKey>)> {
+) -> Option<TerminalStorageLiveness> {
     let block = func.get_block(block_addr)?;
     let mut uncovered = live_out.to_vec();
     let mut preserved = HashSet::new();
@@ -1847,7 +1852,10 @@ fn transfer_terminal_storage_liveness(
             }
         }
     }
-    Some((uncovered, preserved))
+    Some(TerminalStorageLiveness {
+        uncovered_register_ranges: uncovered,
+        preserved_definitions: preserved,
+    })
 }
 
 fn collect_preserved_projection_defs(
@@ -1880,11 +1888,12 @@ fn collect_preserved_projection_defs(
         let Some(live_out) = live_out_by_block.get(&block_addr) else {
             continue;
         };
-        let Some((live_in, _)) =
+        let Some(liveness) =
             transfer_terminal_storage_liveness(func, block_addr, projection, live_out)
         else {
             continue;
         };
+        let live_in = liveness.uncovered_register_ranges;
         if live_in.is_empty() {
             continue;
         }
@@ -1896,10 +1905,10 @@ fn collect_preserved_projection_defs(
     }
 
     for (block_addr, live_out) in live_out_by_block {
-        if let Some((_, block_preserved)) =
+        if let Some(liveness) =
             transfer_terminal_storage_liveness(func, block_addr, projection, &live_out)
         {
-            preserved.extend(block_preserved);
+            preserved.extend(liveness.preserved_definitions);
         }
     }
     preserved
@@ -1925,13 +1934,13 @@ fn collect_preserved_return_defs_in_terminal_blocks(
         if !cfg_block.is_return() {
             continue;
         }
-        let Some((uncovered, block_preserved)) =
+        let Some(liveness) =
             transfer_terminal_storage_liveness(func, block.addr, projection, &seed)
         else {
             continue;
         };
-        if uncovered.is_empty() {
-            preserved.extend(block_preserved);
+        if liveness.uncovered_register_ranges.is_empty() {
+            preserved.extend(liveness.preserved_definitions);
         }
     }
     preserved
@@ -2002,11 +2011,11 @@ where
         },
         Load { dst, space, addr } => Load {
             dst: dst.clone(),
-            space: space.clone(),
+            space: *space,
             addr: map(addr),
         },
         Store { space, addr, val } => Store {
-            space: space.clone(),
+            space: *space,
             addr: map(addr),
             val: map(val),
         },
@@ -2020,7 +2029,7 @@ where
             ordering,
         } => LoadLinked {
             dst: dst.clone(),
-            space: space.clone(),
+            space: *space,
             addr: map(addr),
             ordering: *ordering,
         },
@@ -2032,7 +2041,7 @@ where
             ordering,
         } => StoreConditional {
             result: result.clone(),
-            space: space.clone(),
+            space: *space,
             addr: map(addr),
             val: map(val),
             ordering: *ordering,
@@ -2046,7 +2055,7 @@ where
             ordering,
         } => AtomicCAS {
             dst: dst.clone(),
-            space: space.clone(),
+            space: *space,
             addr: map(addr),
             expected: map(expected),
             replacement: map(replacement),
@@ -2060,7 +2069,7 @@ where
             ordering,
         } => LoadGuarded {
             dst: dst.clone(),
-            space: space.clone(),
+            space: *space,
             addr: map(addr),
             guard: map(guard),
             ordering: *ordering,
@@ -2072,7 +2081,7 @@ where
             guard,
             ordering,
         } => StoreGuarded {
-            space: space.clone(),
+            space: *space,
             addr: map(addr),
             val: map(val),
             guard: map(guard),

@@ -1212,7 +1212,7 @@ impl<'ctx> PathExplorer<'ctx> {
         }
         scope
             .and_then(|scope| scope.function_containing_block(pc))
-            .map(|function| &function.prepared)
+            .map(|function| function.prepared.as_ref())
     }
 
     fn exception_bridge_guidance_target(
@@ -2971,6 +2971,7 @@ impl<'ctx> PathExplorer<'ctx> {
         scope: Option<&PreparedFunctionScope>,
         initial_state: SymState<'ctx>,
     ) -> Vec<PathResult<'ctx>> {
+        let scope = scope.and_then(|scope| scope.exact_for_artifact(func));
         if self.config.max_completed_paths == Some(0) {
             return Vec::new();
         }
@@ -3013,6 +3014,7 @@ impl<'ctx> PathExplorer<'ctx> {
         initial_state: SymState<'ctx>,
         target_addr: u64,
     ) -> Option<PathResult<'ctx>> {
+        let scope = scope.and_then(|scope| scope.exact_for_artifact(func));
         self.find_path_to_in_scope_with_feasibility(func, scope, initial_state, target_addr, true)
     }
 
@@ -3085,6 +3087,7 @@ impl<'ctx> PathExplorer<'ctx> {
         initial_state: SymState<'ctx>,
         target_addr: u64,
     ) -> Vec<PathResult<'ctx>> {
+        let scope = scope.and_then(|scope| scope.exact_for_artifact(func));
         let mut mode = DriverMode::FindAll {
             target_addr,
             require_feasible: true,
@@ -3160,6 +3163,7 @@ impl<'ctx> PathExplorer<'ctx> {
 mod tests {
     use super::*;
     use std::rc::Rc;
+    use std::sync::Arc;
 
     use r2il::{ArchSpec, R2ILBlock, R2ILOp, RegisterDef, SpaceId, Varnode};
     use r2ssa::{InterprocFunctionId, SsaArtifact};
@@ -3236,8 +3240,10 @@ mod tests {
     #[test]
     fn max_state_budget_remains_distinct_from_execution_control() {
         let ctx = Context::thread_local();
-        let mut config = ExploreConfig::default();
-        config.max_states = 0;
+        let config = ExploreConfig {
+            max_states: 0,
+            ..ExploreConfig::default()
+        };
         let mut explorer = PathExplorer::with_config(&ctx, config);
         let function = terminal_test_function();
         let summary = explorer.summarize_function(&function, SymState::new(&ctx, function.entry));
@@ -3913,16 +3919,17 @@ mod tests {
                 op_metadata: Default::default(),
             },
         ];
-        let func = SsaArtifact::for_symbolic(&blocks, None).expect("symbolic function");
-        let runtime_source =
-            SsaArtifact::for_symbolic(&[blocks[1].clone()], None).expect("runtime source function");
+        let func = Arc::new(SsaArtifact::for_symbolic(&blocks, None).expect("symbolic function"));
+        let runtime_source = Arc::new(
+            SsaArtifact::for_symbolic(&[blocks[1].clone()], None).expect("runtime source function"),
+        );
         let scope = crate::PreparedFunctionScope::new(
             0x1000,
             vec![
                 crate::ScopedPreparedFunction {
                     id: InterprocFunctionId(0x1000),
                     name: Some("root".to_string()),
-                    prepared: func.clone(),
+                    prepared: Arc::clone(&func),
                 },
                 crate::ScopedPreparedFunction {
                     id: InterprocFunctionId(0x3000),
@@ -4034,40 +4041,44 @@ mod tests {
     #[test]
     fn unresolved_indirect_pc_requires_one_exact_domain_candidate() {
         let ctx = Context::thread_local();
-        let static_func = SsaArtifact::for_symbolic(
-            &[R2ILBlock {
-                addr: 0x1000,
-                size: 1,
-                ops: vec![R2ILOp::Nop],
-                switch_info: None,
-                op_metadata: Default::default(),
-            }],
-            None,
-        )
-        .expect("static function");
-        let runtime_source = SsaArtifact::for_symbolic(
-            &[R2ILBlock {
-                addr: 0x3000,
-                size: 1,
-                ops: vec![R2ILOp::Nop],
-                switch_info: None,
-                op_metadata: Default::default(),
-            }],
-            None,
-        )
-        .expect("runtime source function");
+        let static_func = Arc::new(
+            SsaArtifact::for_symbolic(
+                &[R2ILBlock {
+                    addr: 0x1000,
+                    size: 1,
+                    ops: vec![R2ILOp::Nop],
+                    switch_info: None,
+                    op_metadata: Default::default(),
+                }],
+                None,
+            )
+            .expect("static function"),
+        );
+        let runtime_source = Arc::new(
+            SsaArtifact::for_symbolic(
+                &[R2ILBlock {
+                    addr: 0x3000,
+                    size: 1,
+                    ops: vec![R2ILOp::Nop],
+                    switch_info: None,
+                    op_metadata: Default::default(),
+                }],
+                None,
+            )
+            .expect("runtime source function"),
+        );
         let scope = crate::PreparedFunctionScope::new(
             0x1000,
             vec![
                 crate::ScopedPreparedFunction {
                     id: InterprocFunctionId(0x1000),
                     name: Some("static".to_string()),
-                    prepared: static_func.clone(),
+                    prepared: Arc::clone(&static_func),
                 },
                 crate::ScopedPreparedFunction {
                     id: InterprocFunctionId(0x3000),
                     name: Some("runtime_source".to_string()),
-                    prepared: runtime_source.clone(),
+                    prepared: Arc::clone(&runtime_source),
                 },
             ],
         )
@@ -4205,20 +4216,23 @@ mod tests {
                 op_metadata: Default::default(),
             },
         ];
-        let root = SsaArtifact::for_symbolic(&root_blocks, Some(&arch)).expect("root symbolic");
-        let thunk = SsaArtifact::for_symbolic(&thunk_blocks, Some(&arch)).expect("thunk symbolic");
+        let root =
+            Arc::new(SsaArtifact::for_symbolic(&root_blocks, Some(&arch)).expect("root symbolic"));
+        let thunk = Arc::new(
+            SsaArtifact::for_symbolic(&thunk_blocks, Some(&arch)).expect("thunk symbolic"),
+        );
         let scope = crate::PreparedFunctionScope::new(
             0x1000,
             vec![
                 crate::ScopedPreparedFunction {
                     id: InterprocFunctionId(0x1000),
                     name: Some("root".to_string()),
-                    prepared: root.clone(),
+                    prepared: Arc::clone(&root),
                 },
                 crate::ScopedPreparedFunction {
                     id: InterprocFunctionId(0x2000),
                     name: Some("thunk".to_string()),
-                    prepared: thunk,
+                    prepared: Arc::clone(&thunk),
                 },
             ],
         )
@@ -4238,6 +4252,38 @@ mod tests {
             "target-guided queries should follow direct calls into scoped thunk/helper blocks"
         );
         assert_eq!(found.unwrap().final_pc(), 0x3000);
+
+        let foreign_root = Arc::new(
+            SsaArtifact::for_symbolic(&root_blocks, Some(&arch)).expect("foreign root symbolic"),
+        );
+        let foreign_scope = crate::PreparedFunctionScope::new(
+            0x1000,
+            vec![
+                crate::ScopedPreparedFunction {
+                    id: InterprocFunctionId(0x1000),
+                    name: Some("foreign_root".to_string()),
+                    prepared: foreign_root,
+                },
+                crate::ScopedPreparedFunction {
+                    id: InterprocFunctionId(0x2000),
+                    name: Some("foreign_thunk".to_string()),
+                    prepared: thunk,
+                },
+            ],
+        )
+        .expect("self-consistent foreign scope");
+        let mut foreign_explorer = PathExplorer::new(&ctx);
+        foreign_explorer.set_target_guided_queries(true);
+        let foreign = foreign_explorer.find_path_to_in_scope(
+            &root,
+            Some(&foreign_scope),
+            SymState::new(&ctx, 0x1000),
+            0x3000,
+        );
+        assert!(
+            foreign.is_none(),
+            "same-content foreign root authority must not authorize helper execution"
+        );
     }
 
     #[test]
@@ -4593,16 +4639,18 @@ mod tests {
                 target: make_const(0, 8),
             }],
         }];
-        let root = SsaArtifact::for_symbolic(&root_blocks, Some(&arch)).expect("root symbolic");
-        let handler =
-            SsaArtifact::for_symbolic(&handler_blocks, Some(&arch)).expect("handler symbolic");
+        let root =
+            Arc::new(SsaArtifact::for_symbolic(&root_blocks, Some(&arch)).expect("root symbolic"));
+        let handler = Arc::new(
+            SsaArtifact::for_symbolic(&handler_blocks, Some(&arch)).expect("handler symbolic"),
+        );
         let scope = crate::PreparedFunctionScope::new(
             0x1000,
             vec![
                 crate::ScopedPreparedFunction {
                     id: InterprocFunctionId(0x1000),
                     name: Some("root".to_string()),
-                    prepared: root.clone(),
+                    prepared: Arc::clone(&root),
                 },
                 crate::ScopedPreparedFunction {
                     id: InterprocFunctionId(0x2000),
@@ -4703,16 +4751,18 @@ mod tests {
                 target: make_const(0, 8),
             }],
         }];
-        let root = SsaArtifact::for_symbolic(&root_blocks, Some(&arch)).expect("root symbolic");
-        let handler =
-            SsaArtifact::for_symbolic(&handler_blocks, Some(&arch)).expect("handler symbolic");
+        let root =
+            Arc::new(SsaArtifact::for_symbolic(&root_blocks, Some(&arch)).expect("root symbolic"));
+        let handler = Arc::new(
+            SsaArtifact::for_symbolic(&handler_blocks, Some(&arch)).expect("handler symbolic"),
+        );
         let scope = crate::PreparedFunctionScope::new(
             0x1000,
             vec![
                 crate::ScopedPreparedFunction {
                     id: InterprocFunctionId(0x1000),
                     name: Some("root".to_string()),
-                    prepared: root.clone(),
+                    prepared: Arc::clone(&root),
                 },
                 crate::ScopedPreparedFunction {
                     id: InterprocFunctionId(0x2000),
@@ -4822,16 +4872,18 @@ mod tests {
                 target: make_const(0, 8),
             }],
         }];
-        let root = SsaArtifact::for_symbolic(&root_blocks, Some(&arch)).expect("root symbolic");
-        let handler =
-            SsaArtifact::for_symbolic(&handler_blocks, Some(&arch)).expect("handler symbolic");
+        let root =
+            Arc::new(SsaArtifact::for_symbolic(&root_blocks, Some(&arch)).expect("root symbolic"));
+        let handler = Arc::new(
+            SsaArtifact::for_symbolic(&handler_blocks, Some(&arch)).expect("handler symbolic"),
+        );
         let scope = crate::PreparedFunctionScope::new(
             0x1000,
             vec![
                 crate::ScopedPreparedFunction {
                     id: InterprocFunctionId(0x1000),
                     name: Some("root".to_string()),
-                    prepared: root.clone(),
+                    prepared: Arc::clone(&root),
                 },
                 crate::ScopedPreparedFunction {
                     id: InterprocFunctionId(0x2000),
@@ -4952,16 +5004,18 @@ mod tests {
                 target: make_const(0, 8),
             }],
         }];
-        let root = SsaArtifact::for_symbolic(&root_blocks, Some(&arch)).expect("root symbolic");
-        let handler =
-            SsaArtifact::for_symbolic(&handler_blocks, Some(&arch)).expect("handler symbolic");
+        let root =
+            Arc::new(SsaArtifact::for_symbolic(&root_blocks, Some(&arch)).expect("root symbolic"));
+        let handler = Arc::new(
+            SsaArtifact::for_symbolic(&handler_blocks, Some(&arch)).expect("handler symbolic"),
+        );
         let scope = crate::PreparedFunctionScope::new(
             0x1000,
             vec![
                 crate::ScopedPreparedFunction {
                     id: InterprocFunctionId(0x1000),
                     name: Some("root".to_string()),
-                    prepared: root.clone(),
+                    prepared: Arc::clone(&root),
                 },
                 crate::ScopedPreparedFunction {
                     id: InterprocFunctionId(0x2000),
@@ -5073,13 +5127,14 @@ mod tests {
                 ],
             },
         ];
-        let root = SsaArtifact::for_symbolic(&root_blocks, Some(&arch)).expect("root symbolic");
+        let root =
+            Arc::new(SsaArtifact::for_symbolic(&root_blocks, Some(&arch)).expect("root symbolic"));
         let scope = crate::PreparedFunctionScope::new(
             0x1000,
             vec![crate::ScopedPreparedFunction {
                 id: InterprocFunctionId(0x1000),
                 name: Some("root".to_string()),
-                prepared: root.clone(),
+                prepared: Arc::clone(&root),
             }],
         )
         .expect("scope");
@@ -5095,7 +5150,13 @@ mod tests {
                 "sym.imp.KERNEL32.dll_RaiseException".to_string(),
             ),
         ]);
-        crate::install_runtime_hooks_for_scope(&mut explorer, &scope, Some(&arch), &symbol_map);
+        crate::install_runtime_hooks_for_scope(
+            &mut explorer,
+            &root,
+            &scope,
+            Some(&arch),
+            &symbol_map,
+        );
 
         assert_eq!(
             explorer.exception_bridge_guidance_target(&root, Some(&scope), 0x7000),

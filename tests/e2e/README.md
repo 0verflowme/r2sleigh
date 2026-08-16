@@ -21,7 +21,7 @@ For deterministic command-output diffs, use `tests/r2r`.
 
 2. Build the plugin:
    ```bash
-   cargo build --release -p r2plugin
+   cargo build --release -p r2sleigh-plugin
    ```
 
 3. Ensure `r2` is in your PATH with the plugin loaded.
@@ -70,7 +70,7 @@ cargo test -- --nocapture
 From workspace root:
 
 ```bash
-cargo test -p r2sleigh-e2e-tests
+cargo test --manifest-path tests/e2e/Cargo.toml
 ```
 
 ## Test Structure

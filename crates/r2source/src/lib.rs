@@ -71,11 +71,16 @@ impl FunctionIdentity {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FunctionPresentation {
     display_name: Box<str>,
+    parameter_names: Box<[Box<str>]>,
 }
 
 impl FunctionPresentation {
     pub fn display_name(&self) -> &str {
         &self.display_name
+    }
+
+    pub fn parameter_names(&self) -> &[Box<str>] {
+        &self.parameter_names
     }
 }
 
@@ -264,9 +269,9 @@ impl OwnedFunctionImage {
     }
 }
 
-/// Advisory call metadata copied from the source snapshot.  Schema 7 does not
-/// claim exact call-site identity, so this data cannot create a call
-/// certificate.  It is retained only for diagnostics and future comparison
+/// Advisory call metadata copied from the source snapshot. This projection
+/// does not claim exact call-site identity, so it cannot create a call
+/// certificate. It is retained only for diagnostics and future comparison
 /// with machine-derived call identities.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AdvisoryCallSite {
@@ -415,7 +420,16 @@ impl OwnedFunctionSnapshot {
         {
             return Err(SnapshotValidationError::InvalidMachineProfile);
         }
-        if presentation.display_name.contains('\0') {
+        if presentation.display_name.contains('\0')
+            || presentation
+                .parameter_names
+                .iter()
+                .any(|name| name.contains('\0'))
+            || function_interface.as_ref().is_some_and(|interface| {
+                presentation.parameter_names.len() != interface.parameters().len()
+            })
+            || function_interface.is_none() && !presentation.parameter_names.is_empty()
+        {
             return Err(SnapshotValidationError::InvalidPresentation);
         }
         if source_revision_identity.is_empty() {
@@ -566,6 +580,7 @@ mod tests {
             FunctionIdentity { address: 0x1000 },
             FunctionPresentation {
                 display_name: "fixture".into(),
+                parameter_names: Box::new([]),
             },
             OwnedFunctionImage {
                 entry_address: 0x1000,
@@ -693,10 +708,12 @@ mod tests {
             return_mechanism: true,
             stack_allocation_contract: true,
         };
+        let mut presentation = valid.presentation().clone();
+        presentation.parameter_names = [Box::<str>::from("value")].into();
         let captured = OwnedFunctionSnapshot::from_captured_parts(
             valid.machine().clone(),
             *valid.function(),
-            valid.presentation().clone(),
+            presentation,
             valid.image().clone(),
             Box::new([]),
             Box::from([7]),
@@ -706,9 +723,14 @@ mod tests {
         )
         .expect("coherent interface capture");
         assert_eq!(captured.function_interface(), Some(&interface));
+        assert_eq!(
+            captured.presentation().parameter_names()[0].as_ref(),
+            "value"
+        );
         assert!(captured.captured_fields().has_return_mechanism());
         assert!(captured.captured_fields().has_frame_pointer_storage());
         assert!(captured.captured_fields().has_stack_allocation_contract());
+        let exact_presentation = captured.presentation().clone();
 
         let narrow = |offset| CanonicalStorageId {
             space: CanonicalStorageSpace::Register,
@@ -752,7 +774,7 @@ mod tests {
             OwnedFunctionSnapshot::from_captured_parts(
                 valid.machine().clone(),
                 *valid.function(),
-                valid.presentation().clone(),
+                exact_presentation.clone(),
                 valid.image().clone(),
                 Box::new([]),
                 Box::from([7]),
@@ -769,7 +791,7 @@ mod tests {
             OwnedFunctionSnapshot::from_captured_parts(
                 valid.machine().clone(),
                 *valid.function(),
-                valid.presentation().clone(),
+                exact_presentation.clone(),
                 valid.image().clone(),
                 Box::new([]),
                 Box::from([7]),
@@ -811,7 +833,7 @@ mod tests {
             OwnedFunctionSnapshot::from_captured_parts(
                 valid.machine().clone(),
                 *valid.function(),
-                valid.presentation().clone(),
+                exact_presentation.clone(),
                 valid.image().clone(),
                 Box::new([]),
                 Box::from([7]),
@@ -826,7 +848,7 @@ mod tests {
         let captured_without_frame_pointer = OwnedFunctionSnapshot::from_captured_parts(
             valid.machine().clone(),
             *valid.function(),
-            valid.presentation().clone(),
+            exact_presentation.clone(),
             valid.image().clone(),
             Box::new([]),
             Box::from([7]),
@@ -848,7 +870,7 @@ mod tests {
             OwnedFunctionSnapshot::from_captured_parts(
                 valid.machine().clone(),
                 *valid.function(),
-                valid.presentation().clone(),
+                exact_presentation.clone(),
                 valid.image().clone(),
                 Box::new([]),
                 Box::from([7]),
@@ -910,7 +932,7 @@ mod tests {
             OwnedFunctionSnapshot::from_captured_parts(
                 valid.machine().clone(),
                 *valid.function(),
-                valid.presentation().clone(),
+                exact_presentation,
                 valid.image().clone(),
                 Box::new([]),
                 Box::from([7]),

@@ -21,3 +21,4 @@ default = []
 r2sleigh-lift = { path = "../r2sleigh-lift", features = ["arm", "x86"] }
 r2source = { path = "../r2source" }
 serde_json.workspace = true
+z3.workspace = true

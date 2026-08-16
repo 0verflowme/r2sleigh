@@ -1,7 +1,7 @@
 //! Integration tests for r2sleigh plugin.
 //!
 //! These tests invoke radare2 with the r2sleigh plugin and validate output.
-//! Run with: `cargo test -p r2sleigh-e2e-tests`
+//! Run with: `cargo test --manifest-path tests/e2e/Cargo.toml`
 
 use e2e::{r2_cmd, r2_cmd_timeout, release_plugin_path, require_binary, vuln_test_binary};
 use serde_json::Value;
@@ -389,6 +389,65 @@ mod check_secret_phase5 {
             "{description} failed\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn genuine_struct_array_certified_c_preserves_source_presentation_and_compiles_strictly() {
+        let binary = repo_path("tests/e2e/vuln_test_x86");
+        let result = r2_cmd_timeout(
+            binary.to_str().expect("UTF-8 struct-array fixture path"),
+            "e bin.dbginfo=true; oo; aaa; s 0x100000e70; pdd",
+            Duration::from_secs(120),
+        );
+        result.assert_ok();
+        let generated = &result.stdout;
+        for required in [
+            "typedef struct DemoStruct {",
+            "int32_t test_struct_array_index(DemoStruct *arr, int32_t idx, int32_t v)",
+            "&arr[idx].third",
+            "&arr[idx].fourteenth",
+        ] {
+            assert!(
+                generated.contains(required),
+                "genuine struct-array CertifiedC must contain {required:?}:\n{generated}"
+            );
+        }
+        for forbidden in [
+            "r2dec residual:",
+            "sla_struct_",
+            "*(arr +",
+            "[idx].f_8",
+            "[idx].f_34",
+        ] {
+            assert!(
+                !generated.contains(forbidden),
+                "genuine struct-array CertifiedC must not contain {forbidden:?}:\n{generated}"
+            );
+        }
+
+        let scratch = ScratchDir::new();
+        let generated_c = scratch.join("struct_array_certified.c");
+        let generated_o = scratch.join("struct_array_certified.o");
+        fs::write(&generated_c, generated).expect("write genuine struct-array CertifiedC");
+        run_checked(
+            Command::new("clang")
+                .args([
+                    "-std=c11",
+                    "-pedantic-errors",
+                    "-Wall",
+                    "-Wextra",
+                    "-Werror",
+                    "-c",
+                ])
+                .arg(&generated_c)
+                .arg("-o")
+                .arg(&generated_o),
+            "strictly compile genuine struct-array CertifiedC",
+        );
+        assert!(
+            generated_o.is_file(),
+            "strict compilation must produce an object file"
         );
     }
 
@@ -1112,11 +1171,9 @@ mod ffi {
     fn mem_access_has_memory_class(mem_access_json: &str, memory_class: &str) -> bool {
         let parsed: Value = serde_json::from_str(mem_access_json).expect("valid mem_access json");
         parsed.as_array().is_some_and(|items| {
-            items.iter().any(|item| {
-                item.get("memory_class")
-                    .and_then(Value::as_str)
-                    == Some(memory_class)
-            })
+            items
+                .iter()
+                .any(|item| item.get("memory_class").and_then(Value::as_str) == Some(memory_class))
         })
     }
 
@@ -1128,9 +1185,17 @@ mod ffi {
         let parsed: Value = serde_json::from_str(mem_access_json).expect("valid mem_access json");
         parsed.as_array().is_some_and(|items| {
             items.iter().any(|item| {
-                item.get("stack").and_then(Value::as_bool) == Some(true)
-                    && item.get("stack_base").and_then(Value::as_str) == Some(stack_base)
-                    && item.get("stack_offset").and_then(Value::as_i64) == Some(stack_offset)
+                item.get("schema_version").and_then(Value::as_u64) == Some(1)
+                    && item
+                        .get("stack_address")
+                        .and_then(|stack| stack.get("base"))
+                        .and_then(Value::as_str)
+                        == Some(stack_base)
+                    && item
+                        .get("stack_address")
+                        .and_then(|stack| stack.get("offset"))
+                        .and_then(Value::as_i64)
+                        == Some(stack_offset)
             })
         })
     }
@@ -1296,7 +1361,6 @@ mod ffi {
 // - Data xrefs: SSA-derived data-flow references (get_data_refs callback)
 // - Taint coverage: functions with taint annotations (post_analysis callback)
 // - Risk classification: functions tagged with risk levels
-// - Variable recovery: stack variables and register arguments
 
 mod analysis_quality_benchmark {
     use super::*;
@@ -1623,7 +1687,6 @@ mod analysis_quality_benchmark {
         eprintln!("  - Sleigh plugin value-add is at analysis layer, not ESIL layer:");
         eprintln!("    * SSA-derived string/global refs (get_data_refs callback)");
         eprintln!("    * Automatic taint analysis with risk classification (post_analysis)");
-        eprintln!("    * Variable recovery from SSA (recover_vars callback)");
         eprintln!("  - All sleigh-added xrefs target real data addresses:");
         eprintln!("    * String literals in .rodata");
         eprintln!("    * Global variables in .data/.bss");

@@ -81,16 +81,18 @@ residual/refused; they never become guessed C.
 
 Durable graph/context/topology snapshots are replay diagnostics, not bearer
 tokens. Runtime proofs derived from one immutable `SsaArtifact` share an opaque
-run-local authority seal. Clones retain the seal; independently rebuilt or
-foreign artifacts receive a different seal even if their diagnostic bytes are
-equal. Ledgers, effects, controls, and region permits must share that seal.
+run-local authority seal. Only cloning the retaining `Arc<SsaArtifact>`
+preserves the exact allocation and authority; independently rebuilt,
+assumption-conditioned, or foreign artifacts receive a different seal even if
+their diagnostic bytes are equal. Ledgers, effects, controls, and region
+permits must share that seal.
 
 `r2source` owns the only coherent source capture. Its
 `OwnedFunctionSnapshot` has no public constructor from blocks, layouts,
 interfaces, hashes, or revision values. A synchronous radare ABI adapter must
 deep-copy the opaque callback payload, validate the closed machine tuple and
 bounded image, then create one run-local `Arc` lineage. Function names are
-presentation fields and are excluded from semantic identity and cache keys.
+presentation fields and are excluded from semantic fingerprints and identities.
 Source CFG and call metadata remain advisory until the trusted Sleigh decoder
 independently derives and exactly matches them.
 

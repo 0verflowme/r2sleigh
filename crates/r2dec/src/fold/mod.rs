@@ -5,7 +5,7 @@ pub(crate) mod op_lower;
 pub(crate) mod stack;
 
 use crate::ast::CStmt;
-pub use context::FoldingContext;
+pub(crate) use context::FoldingContext;
 pub(crate) type SSABlock = r2ssa::FunctionSSABlock;
 use r2ssa::SSAOp;
 

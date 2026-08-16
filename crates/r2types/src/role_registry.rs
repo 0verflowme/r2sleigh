@@ -3892,20 +3892,30 @@ mod tests {
             target: r2il::Varnode::constant(0, 8),
         });
         let arch = r2il::ArchSpec::new("test");
-        let function = r2ssa::SsaArtifact::for_symbolic(&[block], Some(&arch)).expect("ssa");
-        let imported_summary = r2sym::function_semantic_summary_seed_for_name_with_linkage(
+        let function = std::sync::Arc::new(
+            r2ssa::SsaArtifact::for_symbolic(&[block], Some(&arch)).expect("ssa"),
+        );
+        let mut imported_summary = r2ssa::FunctionSemanticSummary::unknown(
             r2ssa::InterprocFunctionId(function.entry),
-            "memcpy",
-            r2ssa::FunctionSemanticLinkage::Imported,
-        )
-        .expect("typed imported summary seed");
-        let imported_artifact = r2sym::compile_native_worker_summary_artifact(
-            &function,
-            None,
-            Some(&imported_summary),
-            true,
-        )
-        .expect("compiled imported worker");
+            Some("copy_file_data".to_string()),
+        );
+        imported_summary.linkage = r2ssa::FunctionSemanticLinkage::Imported;
+        imported_summary
+            .transfer_effects
+            .push(r2ssa::SummaryTransferEffect {
+                dst: r2ssa::SummaryMemoryLocation {
+                    region: r2ssa::SummaryMemoryRegion::Arg { index: 4 },
+                    range: None,
+                },
+                src: r2ssa::SummaryMemoryLocation {
+                    region: r2ssa::SummaryMemoryRegion::Arg { index: 0 },
+                    range: None,
+                },
+                len: r2ssa::SummaryTransferLength::Const(8),
+            });
+        let imported_artifact =
+            r2sym::compile_named_native_worker_summary_report(&imported_summary, true)
+                .expect("compiled imported worker report");
         let imported_role = imported_artifact
             .native_body()
             .and_then(|native| native.summary.role_identity.as_deref())
@@ -3918,50 +3928,26 @@ mod tests {
             imported_role.linkage,
             r2ssa::FunctionSemanticLinkage::Imported
         );
-        assert_eq!(imported_role.source_names, vec!["memcpy".to_string()]);
+        assert_eq!(
+            imported_role.source_names,
+            vec!["copy_file_data".to_string()]
+        );
         assert!(imported_role.evidence.allows_narrowing());
 
-        let memcpy =
-            signature_hint_for_role_identity(imported_role, 0).expect("imported memcpy contract");
-        assert_eq!(memcpy.ret_type, Some(void_pointer_type()));
-        assert_eq!(memcpy.params.len(), 3);
-        let memcpy_projection = type_projection_for_role_identity(imported_role, 0)
-            .expect("imported memcpy projection");
-        assert_eq!(memcpy_projection.ret_type, Some(void_pointer_type()));
+        let imported_signature = signature_hint_for_role_identity(imported_role, 0)
+            .expect("imported file-transfer contract");
+        assert_eq!(imported_signature.ret_type, Some(typedef_type("intmax_t")));
+        assert_eq!(imported_signature.params.len(), 11);
+        let imported_projection = type_projection_for_role_identity(imported_role, 0)
+            .expect("imported file-transfer projection");
+        assert_eq!(imported_projection.ret_type, Some(typedef_type("intmax_t")));
+        assert_eq!(function.function().entry, imported_summary.id.0);
 
         let mut internal_summary = imported_summary;
         internal_summary.linkage = r2ssa::FunctionSemanticLinkage::Internal;
         assert!(
-            r2sym::compile_named_native_worker_summary_artifact(&internal_summary, true).is_none()
+            r2sym::compile_named_native_worker_summary_report(&internal_summary, true).is_none()
         );
-        let internal_artifact = r2sym::compile_native_worker_summary_artifact(
-            &function,
-            None,
-            Some(&internal_summary),
-            true,
-        )
-        .expect("compiled structural worker");
-        let internal_role = internal_artifact
-            .native_body()
-            .and_then(|native| native.summary.role_identity.as_deref())
-            .expect("compiled structural role identity");
-        assert_eq!(
-            internal_role.source,
-            r2sym::NativeWorkerRoleSource::Structural
-        );
-        assert_eq!(
-            internal_role.linkage,
-            r2ssa::FunctionSemanticLinkage::Internal
-        );
-        assert!(internal_role.source_names.is_empty());
-        let structural_memcpy = signature_hint_for_role_identity(internal_role, 0)
-            .expect("structural memory-transfer contract");
-        assert_eq!(structural_memcpy.ret_type, None);
-        assert_ne!(structural_memcpy, memcpy);
-        let structural_projection = type_projection_for_role_identity(internal_role, 0)
-            .expect("structural memory-transfer projection");
-        assert_eq!(structural_projection.ret_type, None);
-        assert_ne!(structural_projection, memcpy_projection);
     }
 
     #[test]

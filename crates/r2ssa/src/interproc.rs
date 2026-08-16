@@ -6,6 +6,7 @@
 //! whole-program SSA graph.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use r2il::{ArchSpec, MemoryOrdering, SpaceId};
 use serde::{Deserialize, Serialize};
@@ -16,6 +17,28 @@ use crate::graph::{InstPayload, ValueId};
 use crate::op::SSAOp;
 use crate::semantic::ObjectKind;
 use crate::{CallSiteId, SSAVar};
+
+/// Current serialized interprocedural report schema.
+///
+/// Version 1 denotes the historical unversioned encoding. Version 2 is the
+/// first encoding that carries and mirrors an explicit schema stamp at both
+/// the report-set and per-function levels.
+pub const INTERPROC_SUMMARY_SCHEMA_VERSION: u32 = 2;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InterprocSummarySchemaError {
+    ReportSchemaVersion {
+        found: u32,
+    },
+    FunctionSchemaVersion {
+        id: InterprocFunctionId,
+        found: u32,
+    },
+    FunctionIdentityMismatch {
+        key: InterprocFunctionId,
+        summary_id: InterprocFunctionId,
+    },
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct InterprocFunctionId(pub u64);
@@ -172,29 +195,31 @@ pub enum FunctionSemanticLinkage {
     Imported,
 }
 
+fn deserialize_required_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FunctionSemanticSummary {
+    pub schema_version: u32,
     pub id: InterprocFunctionId,
     pub name: Option<String>,
-    #[serde(default)]
     pub linkage: FunctionSemanticLinkage,
-    #[serde(default)]
+    #[serde(deserialize_with = "deserialize_required_option")]
     pub arg_count_hint: Option<usize>,
     pub direct_callees: BTreeSet<u64>,
     pub callsite_count: usize,
     pub has_unknown_calls: bool,
     pub arg_effects: BTreeMap<usize, SummaryArgEffect>,
-    #[serde(default)]
     pub memory_effects: Vec<SummaryMemoryEffect>,
-    #[serde(default)]
     pub transfer_effects: Vec<SummaryTransferEffect>,
-    #[serde(default)]
     pub allocation_effects: Vec<SummaryAllocationEffect>,
-    #[serde(default)]
     pub lifetime_effects: Vec<SummaryLifetimeEffect>,
-    #[serde(default)]
     pub sync_effects: Vec<SummarySyncEffect>,
-    #[serde(default)]
     pub atomic_effects: Vec<SummaryAtomicEffect>,
     pub return_relation: SummaryReturnRelation,
     pub reads_global_memory: bool,
@@ -203,8 +228,14 @@ pub struct FunctionSemanticSummary {
 }
 
 impl FunctionSemanticSummary {
+    /// Whether this report uses the current non-authoritative wire schema.
+    pub const fn has_current_schema(&self) -> bool {
+        self.schema_version == INTERPROC_SUMMARY_SCHEMA_VERSION
+    }
+
     pub fn unknown(id: InterprocFunctionId, name: Option<String>) -> Self {
         Self {
+            schema_version: INTERPROC_SUMMARY_SCHEMA_VERSION,
             id,
             name,
             linkage: FunctionSemanticLinkage::Unknown,
@@ -389,6 +420,7 @@ impl FunctionSemanticSummary {
         };
 
         Some(Self {
+            schema_version: INTERPROC_SUMMARY_SCHEMA_VERSION,
             id,
             name: Some(normalized.to_string()),
             linkage: FunctionSemanticLinkage::Unknown,
@@ -428,11 +460,125 @@ pub struct InterprocSummaryDiagnostics {
     pub max_scc_size: usize,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// Serializable interprocedural report data.
+///
+/// This value does not retain an SSA owner and therefore is not authority for
+/// type writeback or certification. Consumers that need source-owned evidence
+/// must use [`PreparedInterprocSummarySet`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InterprocSummarySet {
+    pub schema_version: u32,
     pub root: Option<InterprocFunctionId>,
     pub summaries: BTreeMap<InterprocFunctionId, FunctionSemanticSummary>,
     pub diagnostics: InterprocSummaryDiagnostics,
+}
+
+impl Default for InterprocSummarySet {
+    fn default() -> Self {
+        Self {
+            schema_version: INTERPROC_SUMMARY_SCHEMA_VERSION,
+            root: None,
+            summaries: BTreeMap::new(),
+            diagnostics: InterprocSummaryDiagnostics::default(),
+        }
+    }
+}
+
+impl InterprocSummarySet {
+    /// Validate the complete report projection against the current wire
+    /// schema. This never upgrades or normalizes older report data.
+    pub fn validate_current_schema(&self) -> Result<(), InterprocSummarySchemaError> {
+        if self.schema_version != INTERPROC_SUMMARY_SCHEMA_VERSION {
+            return Err(InterprocSummarySchemaError::ReportSchemaVersion {
+                found: self.schema_version,
+            });
+        }
+        validate_function_summary_map(&self.summaries)
+    }
+
+    /// Validate the complete report projection against the current wire
+    /// schema, including each nested function summary and its map identity.
+    pub fn has_current_schema(&self) -> bool {
+        self.validate_current_schema().is_ok()
+    }
+}
+
+fn validate_function_summary_map(
+    summaries: &BTreeMap<InterprocFunctionId, FunctionSemanticSummary>,
+) -> Result<(), InterprocSummarySchemaError> {
+    for (key, summary) in summaries {
+        if summary.schema_version != INTERPROC_SUMMARY_SCHEMA_VERSION {
+            return Err(InterprocSummarySchemaError::FunctionSchemaVersion {
+                id: *key,
+                found: summary.schema_version,
+            });
+        }
+        if *key != summary.id {
+            return Err(InterprocSummarySchemaError::FunctionIdentityMismatch {
+                key: *key,
+                summary_id: summary.id,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Source-owned interprocedural evidence sealed to one exact SSA allocation.
+///
+/// The private fields deliberately prevent promoting a serialized
+/// [`InterprocSummarySet`] back into authoritative evidence.
+#[derive(Debug, Clone)]
+pub struct PreparedInterprocSummarySet {
+    root: InterprocFunctionId,
+    owners: BTreeMap<InterprocFunctionId, Arc<SsaArtifact>>,
+    report: InterprocSummarySet,
+}
+
+impl PreparedInterprocSummarySet {
+    /// Borrow the exact immutable SSA owner used to produce this evidence.
+    pub fn root(&self) -> &Arc<SsaArtifact> {
+        self.owners
+            .get(&self.root)
+            .expect("prepared interproc root owner is retained")
+    }
+
+    /// Borrow every exact immutable SSA owner used to produce this evidence.
+    pub fn owners(&self) -> &BTreeMap<InterprocFunctionId, Arc<SsaArtifact>> {
+        &self.owners
+    }
+
+    /// Borrow one exact immutable SSA owner by its function identity.
+    pub fn owner(&self, id: InterprocFunctionId) -> Option<&Arc<SsaArtifact>> {
+        self.owners.get(&id)
+    }
+
+    /// Borrow the report projection produced from the retained root.
+    pub fn report(&self) -> &InterprocSummarySet {
+        &self.report
+    }
+
+    /// Return whether `root` is the exact retained SSA allocation.
+    pub fn matches_root(&self, root: &Arc<SsaArtifact>) -> bool {
+        Arc::ptr_eq(self.root(), root)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreparedInterprocSummaryError {
+    MissingRoot,
+    DuplicateRoot,
+    MislabeledRoot,
+    ForeignRoot,
+    DuplicateFunction,
+    MislabeledFunction,
+    ManualFunction,
+    ForeignFunction,
+    UnknownOrIncoherentMachineContext,
+    ArchitectureMismatch,
+    ManualRootWithHelpers,
+    FunctionBlockRangeOverflow,
+    OverlappingFunctionBlockRanges,
+    NonConverged,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -451,6 +597,18 @@ pub struct InterprocFunctionInput<'a> {
     pub id: InterprocFunctionId,
     pub name: Option<String>,
     pub prepared: &'a SsaArtifact,
+}
+
+/// One exact owned input to an authoritative interprocedural solve.
+///
+/// Unlike [`InterprocFunctionInput`], this form retains the caller's `Arc`, so
+/// every helper contributing evidence remains alive for the lifetime of the
+/// returned [`PreparedInterprocSummarySet`].
+#[derive(Debug, Clone)]
+pub struct PreparedInterprocFunctionInput<'a> {
+    pub id: InterprocFunctionId,
+    pub name: Option<String>,
+    pub prepared: &'a Arc<SsaArtifact>,
 }
 
 fn formal_arg_index_for_var(abi: &AbiProfile, var: &SSAVar) -> Option<usize> {
@@ -484,6 +642,7 @@ enum SummaryValueObservation {
 struct CallObservation {
     target: u64,
     args: Vec<SummaryOperand>,
+    result_storage: Option<crate::CanonicalStorageId>,
 }
 
 #[derive(Debug, Clone)]
@@ -501,6 +660,32 @@ struct LocalSummaryFacts {
     atomic_effects: BTreeSet<SummaryAtomicEffect>,
     return_observations: Vec<SummaryValueObservation>,
     call_observations: BTreeMap<CallSiteId, CallObservation>,
+    call_carriers_converged: bool,
+}
+
+#[derive(Debug)]
+struct CallArgumentState {
+    by_call: BTreeMap<CallSiteId, Vec<SummaryOperand>>,
+    converged: bool,
+}
+
+fn require_converged_call_carriers(
+    local: &LocalSummaryFacts,
+) -> Result<(), PreparedInterprocSummaryError> {
+    local
+        .call_carriers_converged
+        .then_some(())
+        .ok_or(PreparedInterprocSummaryError::NonConverged)
+}
+
+fn require_converged_summary_report(
+    report: &InterprocSummarySet,
+) -> Result<(), PreparedInterprocSummaryError> {
+    report
+        .diagnostics
+        .converged
+        .then_some(())
+        .ok_or(PreparedInterprocSummaryError::NonConverged)
 }
 
 fn exact_range(offset: i64, size: u32) -> Option<SummaryMemoryRange> {
@@ -538,6 +723,70 @@ fn unknown_location() -> SummaryMemoryLocation {
     SummaryMemoryLocation {
         region: SummaryMemoryRegion::Unknown,
         range: None,
+    }
+}
+
+fn prepared_obligations_require_unknown_effects(prepared: &SsaArtifact) -> bool {
+    let inventory = prepared.obligations();
+    !inventory.is_complete()
+        || inventory.obligations().values().any(|obligation| {
+            obligation.id.kind == crate::SemanticObligationKind::VolatileOrUnknownEffect
+        })
+}
+
+fn unknown_call_argument_state(
+    prepared: &SsaArtifact,
+    abi: &AbiProfile,
+    converged: bool,
+) -> CallArgumentState {
+    CallArgumentState {
+        by_call: prepared
+            .call_sites()
+            .by_id
+            .keys()
+            .map(|call_id| (*call_id, unknown_call_arguments(prepared, abi, *call_id)))
+            .collect(),
+        converged,
+    }
+}
+
+fn mark_unknown_call_effects(
+    has_unknown_calls: &mut bool,
+    arg_effects: &mut BTreeMap<usize, SummaryArgEffect>,
+    memory_effects: &mut BTreeSet<SummaryMemoryEffect>,
+    args: Option<&[SummaryOperand]>,
+) {
+    *has_unknown_calls = true;
+    if let Some(args) = args {
+        for actual in args {
+            let SummaryOperand::Arg(idx) = actual else {
+                continue;
+            };
+            let effect = arg_effects.entry(*idx).or_default();
+            effect.mark_read();
+            effect.mark_write();
+            effect.escape = true;
+            for kind in [
+                SummaryMemoryEffectKind::Read,
+                SummaryMemoryEffectKind::Write,
+                SummaryMemoryEffectKind::Escape,
+            ] {
+                memory_effects.insert(SummaryMemoryEffect {
+                    kind,
+                    location: arg_location(*idx, None, None),
+                });
+            }
+        }
+    }
+    for kind in [
+        SummaryMemoryEffectKind::Read,
+        SummaryMemoryEffectKind::Write,
+        SummaryMemoryEffectKind::Escape,
+    ] {
+        memory_effects.insert(SummaryMemoryEffect {
+            kind,
+            location: unknown_location(),
+        });
     }
 }
 
@@ -628,13 +877,18 @@ fn summary_arg_count_hint(inputs: SummaryArgCountInputs<'_>) -> Option<usize> {
     hint
 }
 
+/// Solve serializable report data without retaining source authority.
+///
+/// This entrypoint remains useful for simulation and reporting. Its result
+/// must not authorize type writeback or certification.
 pub fn solve_interproc_summary_set(
     functions: &[InterprocFunctionInput<'_>],
     arch: Option<&ArchSpec>,
     root: Option<InterprocFunctionId>,
     seed_summaries: &BTreeMap<InterprocFunctionId, FunctionSemanticSummary>,
     config: InterprocSolveConfig,
-) -> InterprocSummarySet {
+) -> Result<InterprocSummarySet, InterprocSummarySchemaError> {
+    validate_function_summary_map(seed_summaries)?;
     let abi = AbiProfile::from_arch(arch);
     let mut locals = BTreeMap::new();
     let mut current = seed_summaries.clone();
@@ -647,6 +901,22 @@ pub fn solve_interproc_summary_set(
         locals.insert(function.id, (function.name.clone(), local));
     }
 
+    Ok(solve_interproc_summary_set_from_locals(
+        locals,
+        current,
+        root,
+        config,
+        functions.len(),
+    ))
+}
+
+fn solve_interproc_summary_set_from_locals(
+    locals: BTreeMap<InterprocFunctionId, (Option<String>, LocalSummaryFacts)>,
+    mut current: BTreeMap<InterprocFunctionId, FunctionSemanticSummary>,
+    root: Option<InterprocFunctionId>,
+    config: InterprocSolveConfig,
+    scope_size: usize,
+) -> InterprocSummarySet {
     let sccs = compute_summary_sccs(&locals);
     let max_iterations = config.max_iterations.max(1);
     let mut iterations = 0usize;
@@ -678,17 +948,182 @@ pub fn solve_interproc_summary_set(
     }
 
     InterprocSummarySet {
+        schema_version: INTERPROC_SUMMARY_SCHEMA_VERSION,
         root,
         summaries: current,
         diagnostics: InterprocSummaryDiagnostics {
             iterations,
             max_iterations,
             converged,
-            scope_size: functions.len(),
+            scope_size,
             scc_count: sccs.len(),
             max_scc_size,
         },
     }
+}
+
+fn validate_prepared_interproc_block_ranges(
+    functions: &[PreparedInterprocFunctionInput<'_>],
+) -> Result<(), PreparedInterprocSummaryError> {
+    validate_interproc_block_ranges(functions.iter().flat_map(|function| {
+        function
+            .prepared
+            .function()
+            .blocks()
+            .map(move |block| (function.id, block.addr, block.size))
+    }))
+}
+
+fn validate_interproc_block_ranges(
+    blocks: impl IntoIterator<Item = (InterprocFunctionId, u64, u32)>,
+) -> Result<(), PreparedInterprocSummaryError> {
+    let mut ranges = blocks
+        .into_iter()
+        .map(|(owner, start, size)| {
+            start
+                .checked_add(u64::from(size))
+                .map(|end| (start, end, owner))
+                .ok_or(PreparedInterprocSummaryError::FunctionBlockRangeOverflow)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    ranges.sort_unstable();
+    for (index, &(start, end, owner)) in ranges.iter().enumerate() {
+        for &(other_start, _, other_owner) in &ranges[index + 1..] {
+            if other_start >= end {
+                break;
+            }
+            if owner != other_owner && start < end {
+                return Err(PreparedInterprocSummaryError::OverlappingFunctionBlockRanges);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn require_trusted_root_for_helper_scope(
+    root_provenance: crate::SsaArtifactProvenanceKind,
+    scope_size: usize,
+) -> Result<(), PreparedInterprocSummaryError> {
+    if scope_size > 1 && root_provenance != crate::SsaArtifactProvenanceKind::TrustedSource {
+        return Err(PreparedInterprocSummaryError::ManualRootWithHelpers);
+    }
+    Ok(())
+}
+
+/// Solve interprocedural evidence owned by one exact prepared SSA root.
+///
+/// Exactly one input must identify the root by function id, entry, and
+/// artifact authority. Independently rebuilt, omitted, duplicated, or
+/// mislabeled roots are refused before any report is sealed. Every helper id
+/// must equal its prepared entry and be unique. This authoritative path is
+/// deliberately seedless; external and name-derived seeds remain report-only.
+pub fn solve_prepared_interproc_summary_set(
+    root: Arc<SsaArtifact>,
+    functions: &[PreparedInterprocFunctionInput<'_>],
+    config: InterprocSolveConfig,
+) -> Result<PreparedInterprocSummarySet, PreparedInterprocSummaryError> {
+    let root_id = InterprocFunctionId(root.function().entry);
+    let mut function_ids = BTreeSet::new();
+    for function in functions {
+        if function.id.0 != function.prepared.function().entry {
+            return Err(if function.prepared.authority() == root.authority() {
+                PreparedInterprocSummaryError::MislabeledRoot
+            } else {
+                PreparedInterprocSummaryError::MislabeledFunction
+            });
+        }
+        if !function_ids.insert(function.id) {
+            return Err(if function.id == root_id {
+                PreparedInterprocSummaryError::DuplicateRoot
+            } else {
+                PreparedInterprocSummaryError::DuplicateFunction
+            });
+        }
+    }
+    let root_candidates = functions
+        .iter()
+        .filter(|function| {
+            function.id == root_id
+                || function.prepared.function().entry == root.function().entry
+                || function.prepared.authority() == root.authority()
+        })
+        .collect::<Vec<_>>();
+
+    if root_candidates.len() > 1 {
+        return Err(PreparedInterprocSummaryError::DuplicateRoot);
+    }
+    let Some(root_input) = root_candidates.first() else {
+        return Err(PreparedInterprocSummaryError::MissingRoot);
+    };
+    if root_input.id != root_id || root_input.prepared.function().entry != root.function().entry {
+        return Err(PreparedInterprocSummaryError::MislabeledRoot);
+    }
+    if !Arc::ptr_eq(root_input.prepared, &root) {
+        return Err(PreparedInterprocSummaryError::ForeignRoot);
+    }
+    validate_prepared_interproc_block_ranges(functions)?;
+
+    let root_family = root.machine_context().architecture_family();
+    let root_revision = root
+        .machine_context()
+        .function_interface()
+        .map(|interface| interface.revision_identity())
+        .ok_or(PreparedInterprocSummaryError::UnknownOrIncoherentMachineContext)?;
+    let mut owners = BTreeMap::new();
+    let mut locals = BTreeMap::new();
+    let mut current = BTreeMap::new();
+    for function in functions {
+        if function.prepared.machine_context().architecture_family() != root_family {
+            return Err(PreparedInterprocSummaryError::ArchitectureMismatch);
+        }
+        if !function
+            .prepared
+            .machine_context()
+            .call_site_interfaces_are_coherent()
+        {
+            return Err(PreparedInterprocSummaryError::UnknownOrIncoherentMachineContext);
+        }
+        let abi = AbiProfile::from_machine_context(function.prepared.machine_context())
+            .ok_or(PreparedInterprocSummaryError::UnknownOrIncoherentMachineContext)?;
+        if function.id != root_id {
+            if function.prepared.provenance_kind()
+                != crate::SsaArtifactProvenanceKind::TrustedSource
+            {
+                return Err(PreparedInterprocSummaryError::ManualFunction);
+            }
+            let helper_revision = function
+                .prepared
+                .machine_context()
+                .function_interface()
+                .map(|interface| interface.revision_identity())
+                .ok_or(PreparedInterprocSummaryError::UnknownOrIncoherentMachineContext)?;
+            if helper_revision != root_revision {
+                return Err(PreparedInterprocSummaryError::ForeignFunction);
+            }
+        }
+        let local = collect_source_owned_summary_facts(function.prepared, &abi);
+        require_converged_call_carriers(&local)?;
+        owners.insert(function.id, Arc::clone(function.prepared));
+        // Names supplied by a scope are presentation advice, not evidence
+        // retained by the exact prepared owner. Authoritative summaries must
+        // therefore be invariant to that detached advice.
+        current.insert(function.id, initial_summary(function.id, None, &local));
+        locals.insert(function.id, (None, local));
+    }
+    require_trusted_root_for_helper_scope(root.provenance_kind(), functions.len())?;
+    let report = solve_interproc_summary_set_from_locals(
+        locals,
+        current,
+        Some(root_id),
+        config,
+        functions.len(),
+    );
+    require_converged_summary_report(&report)?;
+    Ok(PreparedInterprocSummarySet {
+        root: root_id,
+        owners,
+        report,
+    })
 }
 
 fn compute_summary_sccs(
@@ -811,6 +1246,7 @@ fn initial_summary(
         return_relation: &return_relation,
     });
     FunctionSemanticSummary {
+        schema_version: INTERPROC_SUMMARY_SCHEMA_VERSION,
         id,
         name,
         linkage: FunctionSemanticLinkage::Unknown,
@@ -838,6 +1274,7 @@ fn resolve_summary(
     local: &LocalSummaryFacts,
     current: &BTreeMap<InterprocFunctionId, FunctionSemanticSummary>,
 ) -> FunctionSemanticSummary {
+    let mut has_unknown_calls = local.has_unknown_calls;
     let mut arg_effects = local.arg_effects.clone();
     let mut memory_effects = local.memory_effects.clone();
     let mut transfer_effects = local.transfer_effects.clone();
@@ -845,10 +1282,19 @@ fn resolve_summary(
     let mut lifetime_effects = local.lifetime_effects.clone();
     let mut sync_effects = local.sync_effects.clone();
     let mut atomic_effects = local.atomic_effects.clone();
+    let mut has_unresolved_direct_call = false;
     for call in local.call_observations.values() {
         let Some(callee) = current.get(&InterprocFunctionId(call.target)) else {
+            has_unresolved_direct_call = true;
+            mark_unknown_call_effects(
+                &mut has_unknown_calls,
+                &mut arg_effects,
+                &mut memory_effects,
+                Some(&call.args),
+            );
             continue;
         };
+        has_unknown_calls |= callee.has_unknown_calls;
         for (idx, effect) in &callee.arg_effects {
             let Some(actual) = call.args.get(*idx) else {
                 continue;
@@ -884,7 +1330,11 @@ fn resolve_summary(
     }
     let (reads_global_memory, writes_global_memory, touches_unknown_memory) =
         summarize_memory_effect_flags(&memory_effects);
-    let return_relation = resolve_return_relation_with_wrapper_fallback(local, current);
+    let return_relation = if local.has_unknown_calls || has_unresolved_direct_call {
+        SummaryReturnRelation::Unknown
+    } else {
+        resolve_return_relation_with_wrapper_fallback(local, current)
+    };
     let arg_count_hint = summary_arg_count_hint(SummaryArgCountInputs {
         base: local.arg_count_hint,
         arg_effects: &arg_effects,
@@ -898,13 +1348,14 @@ fn resolve_summary(
     });
 
     FunctionSemanticSummary {
+        schema_version: INTERPROC_SUMMARY_SCHEMA_VERSION,
         id,
         name,
         linkage: FunctionSemanticLinkage::Unknown,
         arg_count_hint,
         direct_callees: local.direct_callees.clone(),
         callsite_count: local.callsite_count,
-        has_unknown_calls: local.has_unknown_calls,
+        has_unknown_calls,
         arg_effects,
         memory_effects: memory_effects.iter().copied().collect(),
         transfer_effects: transfer_effects.iter().copied().collect(),
@@ -1104,6 +1555,7 @@ fn resolve_single_call_wrapper_return_relation(
     }
 
     let call = local.call_observations.values().next()?;
+    call.result_storage?;
     let callee = current.get(&InterprocFunctionId(call.target))?;
     match &callee.return_relation {
         SummaryReturnRelation::Arg(idx) => match call.args.get(*idx) {
@@ -1131,9 +1583,63 @@ fn resolve_return_relation_with_wrapper_fallback(
     }
 }
 
+fn exact_call_result_storage(
+    prepared: &SsaArtifact,
+    call_site: CallSiteId,
+) -> Option<crate::CanonicalStorageId> {
+    let interface = prepared.machine_context().call_site_interface(call_site)?;
+    if !interface.is_complete() {
+        return None;
+    }
+    match interface.result() {
+        crate::SourceCallResult::Register { storage }
+            if Some(storage) == exact_function_return_storage(prepared) =>
+        {
+            Some(storage)
+        }
+        crate::SourceCallResult::Register { .. } => None,
+        crate::SourceCallResult::Void => None,
+    }
+}
+
+fn exact_function_return_storage(prepared: &SsaArtifact) -> Option<crate::CanonicalStorageId> {
+    match prepared
+        .machine_context()
+        .function_interface()?
+        .return_kind()
+    {
+        crate::SourceFunctionReturn::Register { storage } => Some(storage),
+        crate::SourceFunctionReturn::Void => None,
+    }
+}
+
 fn collect_local_summary_facts(prepared: &SsaArtifact, abi: &AbiProfile) -> LocalSummaryFacts {
+    collect_local_summary_facts_with_obligation_authority(prepared, abi, false)
+}
+
+fn collect_source_owned_summary_facts(
+    prepared: &SsaArtifact,
+    abi: &AbiProfile,
+) -> LocalSummaryFacts {
+    collect_local_summary_facts_with_obligation_authority(prepared, abi, true)
+}
+
+fn collect_local_summary_facts_with_obligation_authority(
+    prepared: &SsaArtifact,
+    abi: &AbiProfile,
+    source_owned: bool,
+) -> LocalSummaryFacts {
     let function = prepared.function();
-    let state_by_call = collect_call_arg_state(prepared, abi);
+    let source_requires_unknown_effects =
+        source_owned && prepared_obligations_require_unknown_effects(prepared);
+    let observed_call_argument_state = collect_call_arg_state(prepared, abi);
+    let call_argument_state = if source_requires_unknown_effects {
+        unknown_call_argument_state(prepared, abi, observed_call_argument_state.converged)
+    } else {
+        observed_call_argument_state
+    };
+    let state_by_call = &call_argument_state.by_call;
+    let mut has_volatile_or_unknown_effects = source_requires_unknown_effects;
     let mut out = LocalSummaryFacts {
         arg_count_hint: Some(0),
         direct_callees: BTreeSet::new(),
@@ -1148,50 +1654,45 @@ fn collect_local_summary_facts(prepared: &SsaArtifact, abi: &AbiProfile) -> Loca
         atomic_effects: BTreeSet::new(),
         return_observations: Vec::new(),
         call_observations: BTreeMap::new(),
+        call_carriers_converged: call_argument_state.converged,
     };
+
+    if source_requires_unknown_effects {
+        let formal_arguments = (0..abi.argument_count())
+            .map(SummaryOperand::Arg)
+            .collect::<Vec<_>>();
+        mark_unknown_call_effects(
+            &mut out.has_unknown_calls,
+            &mut out.arg_effects,
+            &mut out.memory_effects,
+            Some(&formal_arguments),
+        );
+    }
 
     for (call_id, call) in &prepared.call_sites().by_id {
         match call.direct_target {
             Some(target) => {
                 out.direct_callees.insert(target);
-                let args = state_by_call.get(call_id).cloned().unwrap_or_else(|| {
-                    (0..abi.argument_count()).map(SummaryOperand::Arg).collect()
-                });
-                out.call_observations
-                    .insert(*call_id, CallObservation { target, args });
+                let args = state_by_call
+                    .get(call_id)
+                    .cloned()
+                    .unwrap_or_else(|| unknown_call_arguments(prepared, abi, *call_id));
+                out.call_observations.insert(
+                    *call_id,
+                    CallObservation {
+                        target,
+                        args,
+                        result_storage: exact_call_result_storage(prepared, *call_id),
+                    },
+                );
             }
             None => {
-                out.has_unknown_calls = true;
-                if let Some(args) = state_by_call.get(call_id) {
-                    for actual in args {
-                        if let SummaryOperand::Arg(idx) = actual {
-                            let effect = out.arg_effects.entry(*idx).or_default();
-                            effect.mark_read();
-                            effect.mark_write();
-                            effect.escape = true;
-                            out.memory_effects.insert(SummaryMemoryEffect {
-                                kind: SummaryMemoryEffectKind::Read,
-                                location: arg_location(*idx, None, None),
-                            });
-                            out.memory_effects.insert(SummaryMemoryEffect {
-                                kind: SummaryMemoryEffectKind::Write,
-                                location: arg_location(*idx, None, None),
-                            });
-                            out.memory_effects.insert(SummaryMemoryEffect {
-                                kind: SummaryMemoryEffectKind::Escape,
-                                location: arg_location(*idx, None, None),
-                            });
-                        }
-                    }
-                }
-                out.memory_effects.insert(SummaryMemoryEffect {
-                    kind: SummaryMemoryEffectKind::Read,
-                    location: unknown_location(),
-                });
-                out.memory_effects.insert(SummaryMemoryEffect {
-                    kind: SummaryMemoryEffectKind::Write,
-                    location: unknown_location(),
-                });
+                mark_unknown_call_effects(
+                    &mut out.has_unknown_calls,
+                    &mut out.arg_effects,
+                    &mut out.memory_effects,
+                    state_by_call.get(call_id).map(Vec::as_slice),
+                );
             }
         }
     }
@@ -1314,12 +1815,67 @@ fn collect_local_summary_facts(prepared: &SsaArtifact, abi: &AbiProfile) -> Loca
                         &out.call_observations,
                     ));
                 }
+                SSAOp::CallOther { inputs, .. } => {
+                    has_volatile_or_unknown_effects = true;
+                    let args = inputs
+                        .iter()
+                        .map(|input| classify_var_operand(prepared, abi, input, 0))
+                        .collect::<Vec<_>>();
+                    mark_unknown_call_effects(
+                        &mut out.has_unknown_calls,
+                        &mut out.arg_effects,
+                        &mut out.memory_effects,
+                        Some(&args),
+                    );
+                }
+                op if has_volatile_or_unknown_effect(op) => {
+                    has_volatile_or_unknown_effects = true;
+                    mark_unknown_call_effects(
+                        &mut out.has_unknown_calls,
+                        &mut out.arg_effects,
+                        &mut out.memory_effects,
+                        None,
+                    );
+                }
                 _ => {}
             }
         }
     }
 
+    if has_volatile_or_unknown_effects {
+        out.return_observations.clear();
+        out.return_observations
+            .push(SummaryValueObservation::Unknown);
+    }
+
     out
+}
+
+/// Keep this classification aligned with the operations for which obligation
+/// collection emits `VolatileOrUnknownEffect`. None of these operations carry
+/// exact preservation authority for call carriers or observable memory.
+fn has_volatile_or_unknown_effect(op: &SSAOp) -> bool {
+    matches!(
+        op,
+        SSAOp::CallOther { .. } | SSAOp::Unimplemented | SSAOp::CpuId { .. } | SSAOp::New { .. }
+    )
+}
+
+fn apply_call_carrier_transfer(
+    prepared: &SsaArtifact,
+    abi: &AbiProfile,
+    state: &mut CallCarrierMap,
+    op: &SSAOp,
+) {
+    if matches!(op, SSAOp::Call { .. } | SSAOp::CallInd { .. })
+        || has_volatile_or_unknown_effect(op)
+    {
+        state
+            .values_mut()
+            .for_each(|value| *value = CallCarrierState::Unknown);
+    } else if let Some(dst) = op.dst() {
+        update_call_carrier_state(prepared, abi, state, dst);
+    }
 }
 
 fn memory_access_is_local_stack(prepared: &SsaArtifact, addr: &SSAVar, space: SpaceId) -> bool {
@@ -1387,20 +1943,30 @@ fn classify_memory_access_location_value(
     }
 
     for candidate in &candidates {
+        if let Some(var) = prepared.value_var(*candidate)
+            && let Some(idx) = formal_arg_index_for_var(abi, var)
+        {
+            return arg_location(idx, Some(0), Some(width));
+        }
         if let Some(expression) = prepared.addresses().parameter_expression(*candidate) {
+            let parameter = match expression
+                .parameter_storage
+                .and_then(|storage| abi.exact_argument_index_for_storage(storage))
+            {
+                Some(parameter) => parameter,
+                None if abi.is_source_owned() => return unknown_location(),
+                None => expression.parameter,
+            };
             return arg_location(
-                expression.parameter,
+                parameter,
                 expression.terms.is_empty().then_some(expression.offset),
                 expression.terms.is_empty().then_some(width),
             );
         }
-        if let Some(var) = prepared.value_var(*candidate) {
-            if let Some(idx) = formal_arg_index_for_var(abi, var) {
-                return arg_location(idx, Some(0), Some(width));
-            }
-            if let Some(address) = parse_const_name(&var.name) {
-                return global_location(address, Some(0), Some(width));
-            }
+        if let Some(var) = prepared.value_var(*candidate)
+            && let Some(address) = parse_const_name(&var.name)
+        {
+            return global_location(address, Some(0), Some(width));
         }
 
         if let Some(object_id) = prepared.objects().object_for_value(*candidate, space)
@@ -1408,6 +1974,9 @@ fn classify_memory_access_location_value(
         {
             match object.kind {
                 ObjectKind::Parameter { index, .. } => {
+                    if abi.is_source_owned() {
+                        return unknown_location();
+                    }
                     return arg_location(index, None, None);
                 }
                 ObjectKind::Global { address, .. } => {
@@ -1563,35 +2132,64 @@ fn summary_const_value(
     }
 }
 
-fn collect_call_arg_state(
+fn collect_call_arg_state(prepared: &SsaArtifact, abi: &AbiProfile) -> CallArgumentState {
+    collect_call_arg_state_with_iteration_limit(prepared, abi, 64)
+}
+
+fn collect_call_arg_state_with_iteration_limit(
     prepared: &SsaArtifact,
     abi: &AbiProfile,
-) -> BTreeMap<CallSiteId, Vec<SummaryOperand>> {
+    max_iterations: usize,
+) -> CallArgumentState {
     let function = prepared.function();
-    let graph = prepared.graph();
-    let mut in_states = BTreeMap::<u64, BTreeMap<usize, ValueId>>::new();
-    let mut out_states = BTreeMap::<u64, BTreeMap<usize, ValueId>>::new();
+    let tracked = tracked_call_carriers(prepared, abi);
+    let entry_state = tracked
+        .iter()
+        .map(|carrier| {
+            let value = match carrier {
+                CallCarrierKey::Storage(storage) => prepared
+                    .machine_context()
+                    .abi_model()
+                    .argument_registers()
+                    .iter()
+                    .find(|slot| slot.storage() == *storage)
+                    .map(|slot| CallCarrierState::EntryArg(slot.index() as usize))
+                    .unwrap_or(CallCarrierState::Unknown),
+                CallCarrierKey::LegacyArg(index) => CallCarrierState::EntryArg(*index),
+            };
+            (*carrier, value)
+        })
+        .collect::<BTreeMap<_, _>>();
+    let unknown_state = tracked
+        .iter()
+        .map(|storage| (*storage, CallCarrierState::Unknown))
+        .collect::<BTreeMap<_, _>>();
+    let mut in_states = BTreeMap::<u64, CallCarrierMap>::new();
+    let mut out_states = BTreeMap::<u64, CallCarrierMap>::new();
     let mut changed = true;
     let mut iterations = 0usize;
-    while changed && iterations < 64 {
+    while changed && iterations < max_iterations.max(1) {
         iterations += 1;
         changed = false;
         for &block_addr in function.block_addrs() {
             let preds = function.predecessors(block_addr);
-            let mut state = if preds.is_empty() {
-                BTreeMap::new()
+            let mut state = if block_addr == function.entry {
+                if preds.is_empty() {
+                    entry_state.clone()
+                } else {
+                    let merged = merge_pred_states(&out_states, &preds, &tracked);
+                    merge_call_carrier_states(&entry_state, &merged, &tracked)
+                }
+            } else if preds.is_empty() {
+                unknown_state.clone()
             } else {
-                merge_pred_states(&out_states, &preds)
+                merge_pred_states(&out_states, &preds, &tracked)
             };
             let Some(block) = function.get_block(block_addr) else {
                 continue;
             };
             for phi in &block.phis {
-                if let Some(idx) = abi.argument_index(&phi.dst.name)
-                    && let Some(value_id) = graph.value_id_for_var(&phi.dst)
-                {
-                    state.insert(idx, value_id);
-                }
+                update_call_carrier_state(prepared, abi, &mut state, &phi.dst);
             }
             let old = in_states.insert(block_addr, state.clone());
             if old.as_ref() != Some(&state) {
@@ -1599,12 +2197,7 @@ fn collect_call_arg_state(
             }
 
             for op in &block.ops {
-                if let Some(dst) = op.dst()
-                    && let Some(idx) = abi.argument_index(&dst.name)
-                    && let Some(value_id) = graph.value_id_for_var(dst)
-                {
-                    state.insert(idx, value_id);
-                }
+                apply_call_carrier_transfer(prepared, abi, &mut state, op);
             }
             let new_state = state;
             let old = out_states.insert(block_addr, new_state.clone());
@@ -1612,6 +2205,10 @@ fn collect_call_arg_state(
                 changed = true;
             }
         }
+    }
+
+    if changed {
+        return unknown_call_argument_state(prepared, abi, false);
     }
 
     let mut by_call = BTreeMap::new();
@@ -1624,36 +2221,160 @@ fn collect_call_arg_state(
         };
         let mut state = in_states.get(&block_addr).cloned().unwrap_or_default();
         for phi in &block.phis {
-            if let Some(idx) = abi.argument_index(&phi.dst.name)
-                && let Some(value_id) = graph.value_id_for_var(&phi.dst)
-            {
-                state.insert(idx, value_id);
-            }
+            update_call_carrier_state(prepared, abi, &mut state, &phi.dst);
         }
         for (op_idx, op) in block.ops.iter().enumerate() {
             if op_idx == call_op_idx {
-                let args = (0..abi.argument_count())
-                    .map(|idx| {
-                        state
-                            .get(&idx)
-                            .cloned()
-                            .map(|value_id| classify_value_operand(prepared, abi, value_id, 0))
-                            .unwrap_or(SummaryOperand::Arg(idx))
+                let args = call_argument_carriers(prepared, abi, call_id)
+                    .map(|carriers| {
+                        carriers
+                            .into_iter()
+                            .map(|carrier| match state.get(&carrier) {
+                                Some(CallCarrierState::EntryArg(index)) => {
+                                    SummaryOperand::Arg(*index)
+                                }
+                                Some(CallCarrierState::Value(value_id)) => {
+                                    classify_value_operand(prepared, abi, *value_id, 0)
+                                }
+                                Some(CallCarrierState::Unknown) | None => SummaryOperand::Unknown,
+                            })
+                            .collect::<Vec<_>>()
                     })
-                    .collect::<Vec<_>>();
+                    .unwrap_or_else(|| unknown_call_arguments(prepared, abi, call_id));
                 by_call.insert(call_id, args);
                 break;
             }
-            if let Some(dst) = op.dst()
-                && let Some(idx) = abi.argument_index(&dst.name)
-                && let Some(value_id) = graph.value_id_for_var(dst)
-            {
-                state.insert(idx, value_id);
-            }
+            apply_call_carrier_transfer(prepared, abi, &mut state, op);
         }
     }
 
-    by_call
+    for call_id in prepared.call_sites().by_id.keys() {
+        by_call
+            .entry(*call_id)
+            .or_insert_with(|| unknown_call_arguments(prepared, abi, *call_id));
+    }
+
+    CallArgumentState {
+        by_call,
+        converged: true,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CallCarrierState {
+    EntryArg(usize),
+    Value(ValueId),
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum CallCarrierKey {
+    Storage(crate::CanonicalStorageId),
+    LegacyArg(usize),
+}
+
+type CallCarrierMap = BTreeMap<CallCarrierKey, CallCarrierState>;
+
+fn tracked_call_carriers(prepared: &SsaArtifact, abi: &AbiProfile) -> BTreeSet<CallCarrierKey> {
+    if !abi.is_source_owned() {
+        return (0..abi.argument_count())
+            .map(CallCarrierKey::LegacyArg)
+            .collect();
+    }
+    prepared
+        .machine_context()
+        .abi_model()
+        .argument_registers()
+        .iter()
+        .map(|slot| CallCarrierKey::Storage(slot.storage()))
+        .chain(
+            prepared
+                .machine_context()
+                .call_site_interfaces()
+                .values()
+                .flat_map(|interface| interface.arguments())
+                .map(|argument| CallCarrierKey::Storage(argument.storage())),
+        )
+        .collect()
+}
+
+fn storages_overlap(left: crate::CanonicalStorageId, right: crate::CanonicalStorageId) -> bool {
+    if left.space != right.space || left.size == 0 || right.size == 0 {
+        return false;
+    }
+    left.offset
+        .checked_add(u64::from(left.size))
+        .zip(right.offset.checked_add(u64::from(right.size)))
+        .is_none_or(|(left_end, right_end)| left.offset < right_end && right.offset < left_end)
+}
+
+fn update_call_carrier_state(
+    prepared: &SsaArtifact,
+    abi: &AbiProfile,
+    state: &mut CallCarrierMap,
+    var: &SSAVar,
+) {
+    let Some(value_id) = prepared.graph().value_id_for_var(var) else {
+        return;
+    };
+    let storage = prepared
+        .graph()
+        .value(value_id)
+        .and_then(|value| value.canonical_storage);
+    let legacy_arg = (!abi.is_source_owned())
+        .then(|| abi.argument_index(&var.name))
+        .flatten();
+    for (carrier, value) in state.iter_mut() {
+        match *carrier {
+            CallCarrierKey::Storage(carrier) => {
+                if storage == Some(carrier) {
+                    *value = CallCarrierState::Value(value_id);
+                } else if storage.is_some_and(|storage| storages_overlap(carrier, storage)) {
+                    *value = CallCarrierState::Unknown;
+                }
+            }
+            CallCarrierKey::LegacyArg(index) if legacy_arg == Some(index) => {
+                *value = CallCarrierState::Value(value_id);
+            }
+            CallCarrierKey::LegacyArg(_) => {}
+        }
+    }
+}
+
+fn call_argument_carriers(
+    prepared: &SsaArtifact,
+    abi: &AbiProfile,
+    call_id: CallSiteId,
+) -> Option<Vec<CallCarrierKey>> {
+    let machine = prepared.machine_context();
+    if !abi.is_source_owned() {
+        return Some(
+            (0..abi.argument_count())
+                .map(CallCarrierKey::LegacyArg)
+                .collect(),
+        );
+    }
+    let interface = machine.call_site_interface(call_id)?;
+    interface.is_complete().then(|| {
+        interface
+            .arguments()
+            .iter()
+            .map(|argument| CallCarrierKey::Storage(argument.storage()))
+            .collect()
+    })
+}
+
+fn unknown_call_arguments(
+    prepared: &SsaArtifact,
+    abi: &AbiProfile,
+    call_id: CallSiteId,
+) -> Vec<SummaryOperand> {
+    let count = prepared
+        .machine_context()
+        .call_site_interface(call_id)
+        .map(|interface| interface.arguments().len())
+        .unwrap_or_else(|| abi.argument_count());
+    (0..count).map(|_| SummaryOperand::Unknown).collect()
 }
 
 pub fn observe_call_arguments(
@@ -1661,6 +2382,7 @@ pub fn observe_call_arguments(
     abi: &AbiProfile,
 ) -> BTreeMap<CallSiteId, Vec<CallArgObservation>> {
     collect_call_arg_state(prepared, abi)
+        .by_call
         .into_iter()
         .map(|(call_id, args)| {
             let args = args
@@ -1677,38 +2399,51 @@ pub fn observe_call_arguments(
 }
 
 fn merge_pred_states(
-    in_states: &BTreeMap<u64, BTreeMap<usize, ValueId>>,
+    in_states: &BTreeMap<u64, CallCarrierMap>,
     preds: &[u64],
-) -> BTreeMap<usize, ValueId> {
-    let mut out = BTreeMap::new();
-    let mut keys = BTreeSet::new();
-    for pred in preds {
-        if let Some(state) = in_states.get(pred) {
-            keys.extend(state.keys().copied());
-        }
-    }
-    for key in keys {
-        let mut value: Option<ValueId> = None;
-        let mut same = true;
-        for pred in preds {
-            let cur = in_states
-                .get(pred)
-                .and_then(|state| state.get(&key))
-                .copied();
-            match (value, cur) {
-                (None, Some(cur)) => value = Some(cur),
-                (Some(existing), Some(cur)) if existing == cur => {}
-                _ => {
-                    same = false;
-                    break;
-                }
-            }
-        }
-        if same && let Some(value) = value {
-            out.insert(key, value);
-        }
-    }
-    out
+    tracked: &BTreeSet<CallCarrierKey>,
+) -> CallCarrierMap {
+    let unknown = tracked
+        .iter()
+        .map(|storage| (*storage, CallCarrierState::Unknown))
+        .collect::<CallCarrierMap>();
+    let mut states = preds
+        .iter()
+        .map(|pred| in_states.get(pred).unwrap_or(&unknown));
+    let Some(first) = states.next() else {
+        return unknown;
+    };
+    states.fold(first.clone(), |merged, state| {
+        merge_call_carrier_states(&merged, state, tracked)
+    })
+}
+
+fn merge_call_carrier_states(
+    left: &CallCarrierMap,
+    right: &CallCarrierMap,
+    tracked: &BTreeSet<CallCarrierKey>,
+) -> CallCarrierMap {
+    tracked
+        .iter()
+        .map(|storage| {
+            let left = left
+                .get(storage)
+                .copied()
+                .unwrap_or(CallCarrierState::Unknown);
+            let right = right
+                .get(storage)
+                .copied()
+                .unwrap_or(CallCarrierState::Unknown);
+            (
+                *storage,
+                if left == right {
+                    left
+                } else {
+                    CallCarrierState::Unknown
+                },
+            )
+        })
+        .collect()
 }
 
 fn classify_return_target(
@@ -1782,10 +2517,12 @@ fn recover_return_observation_from_epilogue(
                     .graph()
                     .inst_id_for_op_site(block_addr, scan_idx)
                     .and_then(|inst_id| prepared.call_sites().by_inst.get(&inst_id).copied())?;
-                return calls
-                    .get(&call_id)
-                    .cloned()
-                    .map(SummaryValueObservation::Call);
+                let call = calls.get(&call_id)?;
+                let result_storage = call.result_storage?;
+                if Some(result_storage) != exact_function_return_storage(prepared) {
+                    return None;
+                }
+                return Some(SummaryValueObservation::Call(call.clone()));
             }
             _ => {
                 let Some(dst) = op.dst() else {
@@ -1819,7 +2556,7 @@ fn classify_value_observation(
         SummaryOperand::Arg(idx) => SummaryValueObservation::Arg(idx),
         SummaryOperand::Const(value) => SummaryValueObservation::Const(value),
         SummaryOperand::Unknown => {
-            if let Some(call_id) = return_call_site_for_value(prepared, abi, value_id)
+            if let Some(call_id) = return_call_site_for_value(prepared, abi, value_id, calls)
                 && let Some(call) = calls.get(&call_id)
             {
                 SummaryValueObservation::Call(call.clone())
@@ -1836,6 +2573,7 @@ fn return_call_site_for_value(
     prepared: &SsaArtifact,
     abi: &AbiProfile,
     value_id: ValueId,
+    calls: &BTreeMap<CallSiteId, CallObservation>,
 ) -> Option<CallSiteId> {
     let single_call_site = || {
         (prepared.call_sites().by_id.len() == 1)
@@ -1848,17 +2586,23 @@ fn return_call_site_for_value(
         return None;
     }
 
+    let exact_result_matches = |call_site: CallSiteId| {
+        let result = calls.get(&call_site)?.result_storage?;
+        let value_storage = graph.value(value_id)?.canonical_storage?;
+        (result == value_storage).then_some(call_site)
+    };
+
     let Some(def_inst) = graph.def_inst(value_id) else {
-        return single_call_site();
+        return single_call_site().and_then(exact_result_matches);
     };
     let Some(inst) = graph.inst(def_inst) else {
-        return single_call_site();
+        return single_call_site().and_then(exact_result_matches);
     };
     let Some(block) = graph.blocks.get(inst.block.0 as usize) else {
-        return single_call_site();
+        return single_call_site().and_then(exact_result_matches);
     };
     let Some(inst_pos) = block.insts.iter().position(|id| *id == def_inst) else {
-        return single_call_site();
+        return single_call_site().and_then(exact_result_matches);
     };
 
     for scan_pos in (0..=inst_pos).rev() {
@@ -1871,14 +2615,19 @@ fn return_call_site_for_value(
         };
         match op {
             SSAOp::Call { .. } | SSAOp::CallInd { .. } => {
-                return prepared.call_sites().by_inst.get(&scan_inst_id).copied();
+                return prepared
+                    .call_sites()
+                    .by_inst
+                    .get(&scan_inst_id)
+                    .copied()
+                    .and_then(exact_result_matches);
             }
             SSAOp::CallDefine { .. } => continue,
             _ => break,
         }
     }
 
-    single_call_site()
+    single_call_site().and_then(exact_result_matches)
 }
 
 fn classify_var_operand(
@@ -2077,6 +2826,7 @@ mod tests {
         arch.add_register(RegisterDef::new("rax", 0, 8));
         arch.add_register(RegisterDef::new("rdi", 8, 8));
         arch.add_register(RegisterDef::new("rip", 16, 8));
+        arch.add_register(RegisterDef::new("rsp", 24, 8));
         arch
     }
 
@@ -2120,6 +2870,7 @@ mod tests {
             atomic_effects: BTreeSet::new(),
             return_observations: Vec::new(),
             call_observations: BTreeMap::new(),
+            call_carriers_converged: true,
         }
     }
 
@@ -2230,6 +2981,760 @@ mod tests {
         }
     }
 
+    fn prepared_owner(addr: u64, arch: &ArchSpec) -> Arc<SsaArtifact> {
+        let storage = |offset| crate::CanonicalStorageId {
+            space: crate::CanonicalStorageSpace::Register,
+            offset,
+            size: 8,
+        };
+        let interface = crate::SourceFunctionInterface::new_exact(
+            b"prepared-interproc-owner".to_vec(),
+            "sysv64",
+            [crate::SourceAbiParameterSpec::new(0, storage(8))],
+            crate::SourceFunctionReturn::Register {
+                storage: storage(0),
+            },
+            [],
+        )
+        .and_then(|interface| interface.with_return_address_storage(storage(16)))
+        .and_then(|interface| interface.with_stack_pointer_storage(storage(24)))
+        .expect("exact prepared interproc interface");
+        Arc::new(
+            SsaArtifact::for_decompile_with_interface(
+                &[block(
+                    addr,
+                    vec![R2ILOp::Return {
+                        target: Varnode::constant(0, 8),
+                    }],
+                )],
+                Some(arch),
+                interface,
+            )
+            .expect("prepared root"),
+        )
+    }
+
+    #[test]
+    fn prepared_summary_set_retains_exact_root_owner() {
+        let arch = x86_64_arch();
+        let root = prepared_owner(0x4000, &arch);
+        let weak = Arc::downgrade(&root);
+        let independent = prepared_owner(0x4000, &arch);
+        let prepared = solve_prepared_interproc_summary_set(
+            Arc::clone(&root),
+            &[PreparedInterprocFunctionInput {
+                id: InterprocFunctionId(0x4000),
+                name: Some("root".to_string()),
+                prepared: &root,
+            }],
+            InterprocSolveConfig::default(),
+        )
+        .expect("source-owned summary");
+
+        assert!(prepared.matches_root(&root));
+        assert!(!prepared.matches_root(&independent));
+        assert!(Arc::ptr_eq(prepared.root(), &root));
+        assert_eq!(prepared.owners().len(), 1);
+        assert!(
+            prepared
+                .owner(InterprocFunctionId(0x4000))
+                .is_some_and(|owner| Arc::ptr_eq(owner, &root))
+        );
+        assert_eq!(prepared.report().root, Some(InterprocFunctionId(0x4000)));
+        drop(root);
+        assert!(
+            weak.upgrade()
+                .is_some_and(|owner| Arc::ptr_eq(&owner, prepared.root()))
+        );
+        drop(prepared);
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn prepared_summary_set_invalidates_incomplete_source_boundary() {
+        let arch = x86_64_arch();
+        let root = prepared_owner(0x4100, &arch);
+        assert!(root.obligations().obligations().values().any(|obligation| {
+            obligation.id.kind == crate::SemanticObligationKind::VolatileOrUnknownEffect
+        }));
+
+        let prepared = solve_prepared_interproc_summary_set(
+            Arc::clone(&root),
+            &[PreparedInterprocFunctionInput {
+                id: InterprocFunctionId(0x4100),
+                name: None,
+                prepared: &root,
+            }],
+            InterprocSolveConfig::default(),
+        )
+        .expect("source-owned summary remains conservatively representable");
+        let summary = prepared
+            .report()
+            .summaries
+            .get(&InterprocFunctionId(0x4100))
+            .expect("root summary");
+
+        assert!(summary.has_unknown_calls);
+        assert!(summary.touches_unknown_memory);
+        assert_eq!(summary.return_relation, SummaryReturnRelation::Unknown);
+        for kind in [
+            SummaryMemoryEffectKind::Read,
+            SummaryMemoryEffectKind::Write,
+            SummaryMemoryEffectKind::Escape,
+        ] {
+            assert!(summary.memory_effects.contains(&SummaryMemoryEffect {
+                kind,
+                location: unknown_location(),
+            }));
+        }
+    }
+
+    #[test]
+    fn interproc_report_schema_round_trips_and_validates_nested_stamps() {
+        let id = InterprocFunctionId(0x4100);
+        let report = InterprocSummarySet {
+            schema_version: INTERPROC_SUMMARY_SCHEMA_VERSION,
+            root: Some(id),
+            summaries: BTreeMap::from([(id, FunctionSemanticSummary::unknown(id, None))]),
+            diagnostics: InterprocSummaryDiagnostics::default(),
+        };
+        assert!(report.has_current_schema());
+
+        let encoded = serde_json::to_value(&report).expect("serialize interproc report");
+        assert_eq!(
+            encoded
+                .get("schema_version")
+                .and_then(|value| value.as_u64()),
+            Some(u64::from(INTERPROC_SUMMARY_SCHEMA_VERSION))
+        );
+        let nested = encoded
+            .get("summaries")
+            .and_then(|value| value.as_object())
+            .and_then(|summaries| summaries.values().next())
+            .expect("serialized function summary");
+        assert_eq!(
+            nested
+                .get("schema_version")
+                .and_then(|value| value.as_u64()),
+            Some(u64::from(INTERPROC_SUMMARY_SCHEMA_VERSION))
+        );
+        let decoded: InterprocSummarySet =
+            serde_json::from_value(encoded.clone()).expect("deserialize current report");
+        assert_eq!(decoded, report);
+        assert!(decoded.has_current_schema());
+
+        for required_field in [
+            "linkage",
+            "arg_count_hint",
+            "memory_effects",
+            "transfer_effects",
+            "allocation_effects",
+            "lifetime_effects",
+            "sync_effects",
+            "atomic_effects",
+        ] {
+            let mut missing_field = encoded.clone();
+            missing_field
+                .get_mut("summaries")
+                .and_then(|value| value.as_object_mut())
+                .and_then(|summaries| summaries.values_mut().next())
+                .and_then(|summary| summary.as_object_mut())
+                .expect("serialized function summary object")
+                .remove(required_field)
+                .unwrap_or_else(|| panic!("serialized summary must contain {required_field}"));
+            assert!(
+                serde_json::from_value::<InterprocSummarySet>(missing_field).is_err(),
+                "current schema must require {required_field}"
+            );
+        }
+
+        let mut stale_report = encoded.clone();
+        stale_report["schema_version"] = serde_json::json!(1);
+        let stale_report: InterprocSummarySet =
+            serde_json::from_value(stale_report).expect("deserialize explicit old report schema");
+        assert!(!stale_report.has_current_schema());
+
+        let mut stale_summary = encoded.clone();
+        *stale_summary
+            .get_mut("summaries")
+            .and_then(|value| value.as_object_mut())
+            .and_then(|summaries| summaries.values_mut().next())
+            .and_then(|summary| summary.get_mut("schema_version"))
+            .expect("nested schema stamp") = serde_json::json!(1);
+        let stale_summary: InterprocSummarySet =
+            serde_json::from_value(stale_summary).expect("deserialize explicit old nested schema");
+        assert!(!stale_summary.has_current_schema());
+
+        let mut unversioned = encoded;
+        unversioned
+            .as_object_mut()
+            .expect("serialized report object")
+            .remove("schema_version");
+        assert!(serde_json::from_value::<InterprocSummarySet>(unversioned).is_err());
+    }
+
+    #[test]
+    fn report_only_solver_rejects_stale_or_mislabeled_seeds() {
+        let id = InterprocFunctionId(0x4200);
+        let mut stale = FunctionSemanticSummary::unknown(id, None);
+        stale.schema_version = 1;
+        assert_eq!(
+            solve_interproc_summary_set(
+                &[],
+                None,
+                None,
+                &BTreeMap::from([(id, stale)]),
+                InterprocSolveConfig::default(),
+            ),
+            Err(InterprocSummarySchemaError::FunctionSchemaVersion { id, found: 1 })
+        );
+
+        let foreign_id = InterprocFunctionId(0x4300);
+        let mislabeled = FunctionSemanticSummary::unknown(foreign_id, None);
+        assert_eq!(
+            solve_interproc_summary_set(
+                &[],
+                None,
+                None,
+                &BTreeMap::from([(id, mislabeled)]),
+                InterprocSolveConfig::default(),
+            ),
+            Err(InterprocSummarySchemaError::FunctionIdentityMismatch {
+                key: id,
+                summary_id: foreign_id,
+            })
+        );
+    }
+
+    #[test]
+    fn prepared_summary_set_ignores_detached_name_advice() {
+        let arch = x86_64_arch();
+        let root = prepared_owner(0x4000, &arch);
+        let solve = |name| {
+            solve_prepared_interproc_summary_set(
+                Arc::clone(&root),
+                &[PreparedInterprocFunctionInput {
+                    id: InterprocFunctionId(0x4000),
+                    name,
+                    prepared: &root,
+                }],
+                InterprocSolveConfig::default(),
+            )
+            .expect("source-owned summary")
+        };
+
+        let first = solve(Some("sym.imp.malloc".to_string()));
+        let second = solve(Some("renamed_advisory".to_string()));
+
+        assert_eq!(first.report(), second.report());
+        assert_eq!(
+            first
+                .report()
+                .summaries
+                .get(&InterprocFunctionId(0x4000))
+                .expect("root summary")
+                .name,
+            None
+        );
+    }
+
+    #[test]
+    fn prepared_summary_set_models_missing_direct_callee_as_unknown() {
+        let arch = x86_64_arch();
+        let storage = |offset| crate::CanonicalStorageId {
+            space: crate::CanonicalStorageSpace::Register,
+            offset,
+            size: 8,
+        };
+        let revision = b"prepared-interproc-missing-direct-callee";
+        let function_interface = crate::SourceFunctionInterface::new_exact(
+            revision.to_vec(),
+            "sysv64",
+            [crate::SourceAbiParameterSpec::new(0, storage(8))],
+            crate::SourceFunctionReturn::Register {
+                storage: storage(0),
+            },
+            [],
+        )
+        .and_then(|interface| interface.with_return_address_storage(storage(16)))
+        .and_then(|interface| interface.with_stack_pointer_storage(storage(24)))
+        .expect("exact function interface");
+        let target = c(0x5000, 8);
+        let call_interface = crate::SourceCallSiteInterface::new(
+            revision.to_vec(),
+            crate::SourceCallSiteIdentity::new(
+                0x4000,
+                0,
+                crate::CanonicalStorageId::from_varnode(&target),
+            ),
+            true,
+            "sysv64",
+            [crate::SourceCallArgumentSpec::new(0, storage(8))],
+            false,
+            false,
+            crate::SourceCallResult::Register {
+                storage: storage(0),
+            },
+        )
+        .expect("exact external callsite interface");
+        let root = Arc::new(
+            SsaArtifact::for_decompile_with_interfaces(
+                &[block(
+                    0x4000,
+                    vec![
+                        R2ILOp::Call {
+                            target: target.clone(),
+                        },
+                        R2ILOp::Return { target: reg(0, 8) },
+                    ],
+                )],
+                Some(&arch),
+                Some(function_interface),
+                vec![call_interface],
+            )
+            .expect("prepared external-call root"),
+        );
+
+        let prepared = solve_prepared_interproc_summary_set(
+            Arc::clone(&root),
+            &[PreparedInterprocFunctionInput {
+                id: InterprocFunctionId(0x4000),
+                name: None,
+                prepared: &root,
+            }],
+            InterprocSolveConfig::default(),
+        )
+        .expect("source-owned summary");
+        let summary = prepared
+            .report()
+            .summaries
+            .get(&InterprocFunctionId(0x4000))
+            .expect("root summary");
+
+        assert_eq!(summary.direct_callees, BTreeSet::from([0x5000]));
+        assert!(summary.has_unknown_calls);
+        assert!(summary.touches_unknown_memory);
+        assert_eq!(summary.return_relation, SummaryReturnRelation::Unknown);
+        assert_eq!(
+            summary.arg_effects.get(&0),
+            Some(&SummaryArgEffect {
+                read: true,
+                write: true,
+                escape: true,
+                free: false,
+            })
+        );
+        for kind in [
+            SummaryMemoryEffectKind::Read,
+            SummaryMemoryEffectKind::Write,
+        ] {
+            assert!(summary.memory_effects.contains(&SummaryMemoryEffect {
+                kind,
+                location: unknown_location(),
+            }));
+        }
+        for kind in [
+            SummaryMemoryEffectKind::Read,
+            SummaryMemoryEffectKind::Write,
+            SummaryMemoryEffectKind::Escape,
+        ] {
+            assert!(summary.memory_effects.contains(&SummaryMemoryEffect {
+                kind,
+                location: arg_location(0, None, None),
+            }));
+        }
+    }
+
+    #[test]
+    fn prepared_summary_set_refuses_foreign_independently_rebuilt_root() {
+        let arch = x86_64_arch();
+        let root = prepared_owner(0x4000, &arch);
+        let foreign = prepared_owner(0x4000, &arch);
+        let error = solve_prepared_interproc_summary_set(
+            root,
+            &[PreparedInterprocFunctionInput {
+                id: InterprocFunctionId(0x4000),
+                name: Some("foreign".to_string()),
+                prepared: &foreign,
+            }],
+            InterprocSolveConfig::default(),
+        )
+        .expect_err("foreign root must refuse");
+
+        assert_eq!(error, PreparedInterprocSummaryError::ForeignRoot);
+    }
+
+    #[test]
+    fn prepared_summary_set_refuses_missing_root() {
+        let arch = x86_64_arch();
+        let error = solve_prepared_interproc_summary_set(
+            prepared_owner(0x4000, &arch),
+            &[],
+            InterprocSolveConfig::default(),
+        )
+        .expect_err("missing root must refuse");
+
+        assert_eq!(error, PreparedInterprocSummaryError::MissingRoot);
+    }
+
+    #[test]
+    fn prepared_summary_set_refuses_duplicate_root() {
+        let arch = x86_64_arch();
+        let root = prepared_owner(0x4000, &arch);
+        let error = solve_prepared_interproc_summary_set(
+            Arc::clone(&root),
+            &[
+                PreparedInterprocFunctionInput {
+                    id: InterprocFunctionId(0x4000),
+                    name: Some("root-a".to_string()),
+                    prepared: &root,
+                },
+                PreparedInterprocFunctionInput {
+                    id: InterprocFunctionId(0x4000),
+                    name: Some("root-b".to_string()),
+                    prepared: &root,
+                },
+            ],
+            InterprocSolveConfig::default(),
+        )
+        .expect_err("duplicate root must refuse");
+
+        assert_eq!(error, PreparedInterprocSummaryError::DuplicateRoot);
+    }
+
+    #[test]
+    fn prepared_summary_set_refuses_mislabeled_root() {
+        let arch = x86_64_arch();
+        let root = prepared_owner(0x4000, &arch);
+        let error = solve_prepared_interproc_summary_set(
+            Arc::clone(&root),
+            &[PreparedInterprocFunctionInput {
+                id: InterprocFunctionId(0x5000),
+                name: Some("wrong-id".to_string()),
+                prepared: &root,
+            }],
+            InterprocSolveConfig::default(),
+        )
+        .expect_err("mislabeled root must refuse");
+
+        assert_eq!(error, PreparedInterprocSummaryError::MislabeledRoot);
+    }
+
+    #[test]
+    fn prepared_summary_set_refuses_mislabeled_helper() {
+        let arch = x86_64_arch();
+        let root = prepared_owner(0x4000, &arch);
+        let helper = prepared_owner(0x5000, &arch);
+        let error = solve_prepared_interproc_summary_set(
+            Arc::clone(&root),
+            &[
+                PreparedInterprocFunctionInput {
+                    id: InterprocFunctionId(0x4000),
+                    name: Some("root".to_string()),
+                    prepared: &root,
+                },
+                PreparedInterprocFunctionInput {
+                    id: InterprocFunctionId(0x6000),
+                    name: Some("wrong-helper-id".to_string()),
+                    prepared: &helper,
+                },
+            ],
+            InterprocSolveConfig::default(),
+        )
+        .expect_err("mislabeled helper must refuse");
+
+        assert_eq!(error, PreparedInterprocSummaryError::MislabeledFunction);
+    }
+
+    #[test]
+    fn prepared_summary_set_refuses_duplicate_helper_id() {
+        let arch = x86_64_arch();
+        let root = prepared_owner(0x4000, &arch);
+        let helper_a = prepared_owner(0x5000, &arch);
+        let helper_b = prepared_owner(0x5000, &arch);
+        let error = solve_prepared_interproc_summary_set(
+            Arc::clone(&root),
+            &[
+                PreparedInterprocFunctionInput {
+                    id: InterprocFunctionId(0x4000),
+                    name: Some("root".to_string()),
+                    prepared: &root,
+                },
+                PreparedInterprocFunctionInput {
+                    id: InterprocFunctionId(0x5000),
+                    name: Some("helper-a".to_string()),
+                    prepared: &helper_a,
+                },
+                PreparedInterprocFunctionInput {
+                    id: InterprocFunctionId(0x5000),
+                    name: Some("helper-b".to_string()),
+                    prepared: &helper_b,
+                },
+            ],
+            InterprocSolveConfig::default(),
+        )
+        .expect_err("duplicate helper id must refuse");
+
+        assert_eq!(error, PreparedInterprocSummaryError::DuplicateFunction);
+    }
+
+    #[test]
+    fn prepared_summary_set_refuses_manual_helper_owner() {
+        let arch = x86_64_arch();
+        let root = prepared_owner(0x4000, &arch);
+        let helper = prepared_owner(0x5000, &arch);
+        let error = solve_prepared_interproc_summary_set(
+            Arc::clone(&root),
+            &[
+                PreparedInterprocFunctionInput {
+                    id: InterprocFunctionId(0x4000),
+                    name: Some("root".to_string()),
+                    prepared: &root,
+                },
+                PreparedInterprocFunctionInput {
+                    id: InterprocFunctionId(0x5000),
+                    name: Some("manual-helper".to_string()),
+                    prepared: &helper,
+                },
+            ],
+            InterprocSolveConfig::default(),
+        )
+        .expect_err("manual helper must not become prepared evidence");
+
+        assert_eq!(error, PreparedInterprocSummaryError::ManualFunction);
+    }
+
+    #[test]
+    fn prepared_summary_set_refuses_overlapping_function_ranges() {
+        let arch = x86_64_arch();
+        let root = prepared_owner(0x4000, &arch);
+        let helper = prepared_owner(0x4002, &arch);
+        let error = solve_prepared_interproc_summary_set(
+            Arc::clone(&root),
+            &[
+                PreparedInterprocFunctionInput {
+                    id: InterprocFunctionId(0x4000),
+                    name: None,
+                    prepared: &root,
+                },
+                PreparedInterprocFunctionInput {
+                    id: InterprocFunctionId(0x4002),
+                    name: None,
+                    prepared: &helper,
+                },
+            ],
+            InterprocSolveConfig::default(),
+        )
+        .expect_err("cross-function block overlap must refuse authoritative evidence");
+
+        assert_eq!(
+            error,
+            PreparedInterprocSummaryError::OverlappingFunctionBlockRanges
+        );
+    }
+
+    #[test]
+    fn prepared_summary_set_refuses_function_range_overflow() {
+        let error =
+            validate_interproc_block_ranges([(InterprocFunctionId(u64::MAX - 1), u64::MAX - 1, 4)])
+                .expect_err("overflowing block range must fail preflight");
+
+        assert_eq!(
+            error,
+            PreparedInterprocSummaryError::FunctionBlockRangeOverflow
+        );
+    }
+
+    #[test]
+    fn prepared_summary_set_requires_trusted_root_for_helper_scope() {
+        assert_eq!(
+            require_trusted_root_for_helper_scope(crate::SsaArtifactProvenanceKind::Manual, 2,),
+            Err(PreparedInterprocSummaryError::ManualRootWithHelpers)
+        );
+        assert_eq!(
+            require_trusted_root_for_helper_scope(
+                crate::SsaArtifactProvenanceKind::TrustedSource,
+                2,
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn prepared_summary_set_does_not_promote_report_only_seeds() {
+        let arch = x86_64_arch();
+        let root = prepared_owner(0x4000, &arch);
+        let root_input = InterprocFunctionInput {
+            id: InterprocFunctionId(0x4000),
+            name: Some("root".to_string()),
+            prepared: root.as_ref(),
+        };
+        let seed_id = InterprocFunctionId(0x7000);
+        let seed = FunctionSemanticSummary::unknown(seed_id, Some("external-seed".to_string()));
+        let raw = solve_interproc_summary_set(
+            std::slice::from_ref(&root_input),
+            Some(&arch),
+            Some(InterprocFunctionId(0x4000)),
+            &BTreeMap::from([(seed_id, seed)]),
+            InterprocSolveConfig::default(),
+        )
+        .expect("current report-only seed schema");
+        let prepared = solve_prepared_interproc_summary_set(
+            Arc::clone(&root),
+            &[PreparedInterprocFunctionInput {
+                id: InterprocFunctionId(0x4000),
+                name: Some("root".to_string()),
+                prepared: &root,
+            }],
+            InterprocSolveConfig::default(),
+        )
+        .expect("seedless prepared summary");
+
+        assert!(raw.summaries.contains_key(&seed_id));
+        assert!(!prepared.report().summaries.contains_key(&seed_id));
+    }
+
+    #[test]
+    fn prepared_summary_set_refuses_unknown_source_architecture() {
+        let mut arch = x86_64_arch();
+        arch.name = "unknown-64-bit-family".to_string();
+        let root = prepared_owner(0x4000, &arch);
+        let error = solve_prepared_interproc_summary_set(
+            Arc::clone(&root),
+            &[PreparedInterprocFunctionInput {
+                id: InterprocFunctionId(0x4000),
+                name: Some("root".to_string()),
+                prepared: &root,
+            }],
+            InterprocSolveConfig::default(),
+        )
+        .expect_err("unknown family must refuse authoritative summary");
+
+        assert_eq!(
+            error,
+            PreparedInterprocSummaryError::UnknownOrIncoherentMachineContext
+        );
+    }
+
+    #[test]
+    fn prepared_summary_set_refuses_cross_family_helper() {
+        let root_arch = x86_64_arch();
+        let mut helper_arch = x86_64_arch();
+        helper_arch.name = "aarch64".to_string();
+        let root = prepared_owner(0x4000, &root_arch);
+        let helper = prepared_owner(0x5000, &helper_arch);
+        let error = solve_prepared_interproc_summary_set(
+            Arc::clone(&root),
+            &[
+                PreparedInterprocFunctionInput {
+                    id: InterprocFunctionId(0x4000),
+                    name: Some("root".to_string()),
+                    prepared: &root,
+                },
+                PreparedInterprocFunctionInput {
+                    id: InterprocFunctionId(0x5000),
+                    name: Some("helper".to_string()),
+                    prepared: &helper,
+                },
+            ],
+            InterprocSolveConfig::default(),
+        )
+        .expect_err("cross-family helper must refuse authoritative summary");
+
+        assert_eq!(error, PreparedInterprocSummaryError::ArchitectureMismatch);
+    }
+
+    #[test]
+    fn prepared_summary_set_refuses_nonconverged_report() {
+        let report = InterprocSummarySet {
+            diagnostics: InterprocSummaryDiagnostics {
+                converged: false,
+                ..InterprocSummaryDiagnostics::default()
+            },
+            ..InterprocSummarySet::default()
+        };
+
+        assert_eq!(
+            require_converged_summary_report(&report),
+            Err(PreparedInterprocSummaryError::NonConverged),
+            "partial fixed points must not be sealed"
+        );
+    }
+
+    #[test]
+    fn prepared_summary_uses_exact_abi_carrier_not_callconv_label() {
+        let mut arch = x86_64_arch();
+        arch.add_register(RegisterDef::new("rcx", 32, 8));
+        let storage = |offset| crate::CanonicalStorageId {
+            space: crate::CanonicalStorageSpace::Register,
+            offset,
+            size: 8,
+        };
+        let interface = crate::SourceFunctionInterface::new_exact(
+            b"prepared-interproc-exact-abi".to_vec(),
+            "misleading-sysv-label",
+            [crate::SourceAbiParameterSpec::new(0, storage(32))],
+            crate::SourceFunctionReturn::Void,
+            [],
+        )
+        .and_then(|interface| interface.with_return_address_storage(storage(16)))
+        .and_then(|interface| interface.with_stack_pointer_storage(storage(24)))
+        .expect("exact prepared ABI interface");
+        let root = Arc::new(
+            SsaArtifact::for_decompile_with_interface(
+                &[block(
+                    0x4000,
+                    vec![
+                        R2ILOp::IntAdd {
+                            dst: tmp(0x10, 8),
+                            a: reg(32, 8),
+                            b: Varnode::constant(4, 8),
+                        },
+                        R2ILOp::Store {
+                            space: SpaceId::Ram,
+                            addr: tmp(0x10, 8),
+                            val: Varnode::constant(0, 1),
+                        },
+                        R2ILOp::Return {
+                            target: Varnode::constant(0, 8),
+                        },
+                    ],
+                )],
+                Some(&arch),
+                interface,
+            )
+            .expect("prepared exact ABI root"),
+        );
+        let prepared = solve_prepared_interproc_summary_set(
+            Arc::clone(&root),
+            &[PreparedInterprocFunctionInput {
+                id: InterprocFunctionId(0x4000),
+                name: Some("root".to_string()),
+                prepared: &root,
+            }],
+            InterprocSolveConfig::default(),
+        )
+        .expect("source-owned summary");
+        let summary = prepared
+            .report()
+            .summaries
+            .get(&InterprocFunctionId(0x4000))
+            .expect("root summary");
+
+        assert!(summary.memory_effects.iter().any(|effect| {
+            effect.kind == SummaryMemoryEffectKind::Write
+                && effect.location.region == (SummaryMemoryRegion::Arg { index: 0 })
+                && effect.location.range.is_some_and(|range| {
+                    range.offset_lo == 4 && range.offset_hi == 4 && range.width == Some(1)
+                })
+        }));
+        assert!(
+            !summary.memory_effects.iter().any(|effect| {
+                effect.location.region == (SummaryMemoryRegion::Arg { index: 3 })
+            })
+        );
+    }
+
     #[test]
     fn seed_summary_models_malloc_and_memcpy() {
         let malloc =
@@ -2316,7 +3821,7 @@ mod tests {
     }
 
     #[test]
-    fn solve_summary_set_propagates_heap_alloc_and_returned_arg() {
+    fn report_only_summary_does_not_promote_unbound_call_returns() {
         let arch = x86_64_arch();
         let alloc_block = block(
             0x1000,
@@ -2368,26 +3873,27 @@ mod tests {
             Some(InterprocFunctionId(0x3000)),
             &seeds,
             InterprocSolveConfig::default(),
-        );
+        )
+        .expect("current report-only seed schema");
 
         assert_eq!(
             set.summaries
                 .get(&InterprocFunctionId(0x1000))
                 .expect("alloc summary")
                 .return_relation,
-            SummaryReturnRelation::HeapAlloc
+            SummaryReturnRelation::Unknown
         );
         assert_eq!(
             set.summaries
                 .get(&InterprocFunctionId(0x3000))
                 .expect("wrapper summary")
                 .return_relation,
-            SummaryReturnRelation::HeapAlloc
+            SummaryReturnRelation::Unknown
         );
     }
 
     #[test]
-    fn solve_summary_set_recovers_wrapper_return_through_ip_return_op() {
+    fn report_only_ip_return_requires_exact_call_result_carrier() {
         let arch = x86_64_arch();
         let alloc_block = block(
             0x1000,
@@ -2420,19 +3926,20 @@ mod tests {
             Some(InterprocFunctionId(0x1000)),
             &seeds,
             InterprocSolveConfig::default(),
-        );
+        )
+        .expect("current report-only seed schema");
 
         assert_eq!(
             set.summaries
                 .get(&InterprocFunctionId(0x1000))
                 .expect("alloc summary")
                 .return_relation,
-            SummaryReturnRelation::HeapAlloc
+            SummaryReturnRelation::Unknown
         );
     }
 
     #[test]
-    fn solve_summary_set_uses_single_call_wrapper_fallback_for_opaque_return_register() {
+    fn opaque_single_call_wrapper_does_not_promote_unbound_return() {
         let mut arch = ArchSpec::new("x86:LE:64:default");
         arch.addr_size = 8;
         let wrapper_block = block(
@@ -2463,14 +3970,15 @@ mod tests {
             Some(InterprocFunctionId(0x401000)),
             &seeds,
             InterprocSolveConfig::default(),
-        );
+        )
+        .expect("current report-only seed schema");
 
         assert_eq!(
             set.summaries
                 .get(&InterprocFunctionId(0x401000))
                 .expect("wrapper summary")
                 .return_relation,
-            SummaryReturnRelation::HeapAlloc
+            SummaryReturnRelation::Unknown
         );
     }
 
@@ -2499,7 +4007,8 @@ mod tests {
             Some(InterprocFunctionId(0x3500)),
             &BTreeMap::new(),
             InterprocSolveConfig::default(),
-        );
+        )
+        .expect("current report-only seed schema");
 
         assert_eq!(
             set.summaries
@@ -2535,7 +4044,8 @@ mod tests {
             Some(InterprocFunctionId(0x4000)),
             &BTreeMap::new(),
             InterprocSolveConfig::default(),
-        );
+        )
+        .expect("current report-only seed schema");
         assert!(
             set.summaries
                 .get(&InterprocFunctionId(0x4000))
@@ -2573,7 +4083,8 @@ mod tests {
             Some(InterprocFunctionId(0x4050)),
             &BTreeMap::new(),
             InterprocSolveConfig::default(),
-        );
+        )
+        .expect("current report-only seed schema");
         let summary = set
             .summaries
             .get(&InterprocFunctionId(0x4050))
@@ -2623,7 +4134,8 @@ mod tests {
             Some(InterprocFunctionId(0x4060)),
             &BTreeMap::new(),
             InterprocSolveConfig::default(),
-        );
+        )
+        .expect("current report-only seed schema");
         let summary = set
             .summaries
             .get(&InterprocFunctionId(0x4060))
@@ -2664,7 +4176,8 @@ mod tests {
             Some(InterprocFunctionId(0x4100)),
             &BTreeMap::new(),
             InterprocSolveConfig::default(),
-        );
+        )
+        .expect("current report-only seed schema");
         let summary = set
             .summaries
             .get(&InterprocFunctionId(0x4100))
@@ -2734,7 +4247,8 @@ mod tests {
             Some(InterprocFunctionId(0x4200)),
             &BTreeMap::new(),
             InterprocSolveConfig::default(),
-        );
+        )
+        .expect("current report-only seed schema");
         let summary = set
             .summaries
             .get(&InterprocFunctionId(0x4200))
@@ -3004,5 +4518,514 @@ mod tests {
         let args = observations.get(&call_id).expect("call args");
         assert_eq!(args.first(), Some(&CallArgObservation::Const(1)));
         assert_eq!(args.get(1), Some(&CallArgObservation::Const(0x1400_3d0f)));
+    }
+
+    #[test]
+    fn call_arg_observer_does_not_reuse_pre_call_carriers_after_call() {
+        let arch = windows_x64_arch();
+        let prepared = SsaArtifact::for_symbolic(
+            &[block(
+                0x6000,
+                vec![
+                    R2ILOp::Copy {
+                        dst: reg(8, 8),
+                        src: c(7, 8),
+                    },
+                    R2ILOp::Call {
+                        target: c(0x7000, 8),
+                    },
+                    R2ILOp::Call {
+                        target: c(0x8000, 8),
+                    },
+                    R2ILOp::Return { target: c(0, 8) },
+                ],
+            )],
+            Some(&arch),
+        )
+        .expect("ssa");
+
+        let observations = observe_call_arguments(&prepared, &AbiProfile::windows_x64());
+        let mut calls = prepared
+            .call_sites()
+            .by_id
+            .iter()
+            .map(|(id, call)| (call.at, *id))
+            .collect::<Vec<_>>();
+        calls.sort_by_key(|(at, _)| *at);
+        let first = observations.get(&calls[0].1).expect("first call args");
+        let second = observations.get(&calls[1].1).expect("second call args");
+
+        assert_eq!(first.first(), Some(&CallArgObservation::Const(7)));
+        assert_eq!(second.first(), Some(&CallArgObservation::Unknown));
+    }
+
+    #[test]
+    fn volatile_or_unknown_effects_clobber_call_carriers_and_observable_state() {
+        let arch = windows_x64_arch();
+        let cases = [
+            (
+                "callother",
+                R2ILOp::CallOther {
+                    output: None,
+                    userop: 7,
+                    inputs: Vec::new(),
+                },
+            ),
+            ("unimplemented", R2ILOp::Unimplemented),
+            ("cpuid", R2ILOp::CpuId { dst: tmp(0x90, 8) }),
+            (
+                "new",
+                R2ILOp::New {
+                    dst: tmp(0x98, 8),
+                    src: c(8, 8),
+                },
+            ),
+        ];
+
+        for (label, unknown_op) in cases {
+            let prepared = SsaArtifact::for_symbolic(
+                &[block(
+                    0x6800,
+                    vec![
+                        R2ILOp::Copy {
+                            dst: reg(8, 8),
+                            src: c(7, 8),
+                        },
+                        unknown_op,
+                        R2ILOp::Call {
+                            target: c(0x7000, 8),
+                        },
+                        R2ILOp::Return { target: c(0, 8) },
+                    ],
+                )],
+                Some(&arch),
+            )
+            .unwrap_or_else(|| panic!("{label} SSA"));
+            let abi = AbiProfile::windows_x64();
+            let observations = observe_call_arguments(&prepared, &abi);
+            let call_id = prepared
+                .call_sites()
+                .by_id
+                .keys()
+                .next()
+                .copied()
+                .unwrap_or_else(|| panic!("{label} callsite"));
+            let args = observations
+                .get(&call_id)
+                .unwrap_or_else(|| panic!("{label} args"));
+            let local = collect_local_summary_facts(&prepared, &abi);
+
+            assert_eq!(
+                args.first(),
+                Some(&CallArgObservation::Unknown),
+                "{label} must not preserve the pre-effect carrier"
+            );
+            assert!(local.has_unknown_calls, "{label} must remain observable");
+            for kind in [
+                SummaryMemoryEffectKind::Read,
+                SummaryMemoryEffectKind::Write,
+            ] {
+                assert!(
+                    local.memory_effects.contains(&SummaryMemoryEffect {
+                        kind,
+                        location: unknown_location(),
+                    }),
+                    "{label} must carry unknown {kind:?} memory"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn volatile_or_unknown_effects_invalidate_pre_effect_return_relations() {
+        let arch = windows_x64_arch();
+        for (label, return_seed) in [("constant", c(1, 8)), ("entry argument", reg(8, 8))] {
+            let prepared = SsaArtifact::for_symbolic(
+                &[block(
+                    0x6900,
+                    vec![
+                        R2ILOp::Copy {
+                            dst: reg(0, 8),
+                            src: return_seed,
+                        },
+                        R2ILOp::CallOther {
+                            output: None,
+                            userop: 9,
+                            inputs: Vec::new(),
+                        },
+                        R2ILOp::Return { target: reg(0, 8) },
+                    ],
+                )],
+                Some(&arch),
+            )
+            .unwrap_or_else(|| panic!("{label} return SSA"));
+            let local = collect_local_summary_facts(&prepared, &AbiProfile::windows_x64());
+            let summary = initial_summary(InterprocFunctionId(0x6900), None, &local);
+
+            assert_eq!(
+                local.return_observations,
+                vec![SummaryValueObservation::Unknown],
+                "{label} continuity must be erased"
+            );
+            assert_eq!(summary.return_relation, SummaryReturnRelation::Unknown);
+        }
+    }
+
+    #[test]
+    fn callother_maps_explicit_argument_and_unknown_escape() {
+        let arch = x86_64_arch();
+        let prepared = SsaArtifact::for_symbolic(
+            &[block(
+                0x69a0,
+                vec![
+                    R2ILOp::CallOther {
+                        output: None,
+                        userop: 11,
+                        inputs: vec![reg(8, 8)],
+                    },
+                    R2ILOp::Return { target: c(0, 8) },
+                ],
+            )],
+            Some(&arch),
+        )
+        .expect("callother SSA");
+        let local = collect_local_summary_facts(&prepared, &AbiProfile::from_arch(Some(&arch)));
+
+        assert_eq!(
+            local.arg_effects.get(&0),
+            Some(&SummaryArgEffect {
+                read: true,
+                write: true,
+                escape: true,
+                free: false,
+            })
+        );
+        assert!(local.memory_effects.contains(&SummaryMemoryEffect {
+            kind: SummaryMemoryEffectKind::Escape,
+            location: unknown_location(),
+        }));
+    }
+
+    #[test]
+    fn resolved_summary_propagates_transitive_unknown_calls() {
+        let mut local = empty_local_summary(BTreeSet::from([0x7100]));
+        local.call_observations.insert(
+            CallSiteId(0),
+            CallObservation {
+                target: 0x7100,
+                args: Vec::new(),
+                result_storage: None,
+            },
+        );
+        let mut callee = FunctionSemanticSummary::unknown(InterprocFunctionId(0x7100), None);
+        callee.has_unknown_calls = true;
+        let summary = resolve_summary(
+            InterprocFunctionId(0x7000),
+            None,
+            &local,
+            &BTreeMap::from([(callee.id, callee)]),
+        );
+
+        assert!(summary.has_unknown_calls);
+    }
+
+    #[test]
+    fn call_return_relation_requires_complete_nonvoid_result_carrier() {
+        let arch = x86_64_arch();
+        let storage = |offset| crate::CanonicalStorageId {
+            space: crate::CanonicalStorageSpace::Register,
+            offset,
+            size: 8,
+        };
+        let revision = b"interproc-exact-call-result";
+        let target = c(0x7100, 8);
+        let function_interface = || {
+            crate::SourceFunctionInterface::new_exact(
+                revision.to_vec(),
+                "sysv64",
+                [],
+                crate::SourceFunctionReturn::Register {
+                    storage: storage(0),
+                },
+                [],
+            )
+            .and_then(|interface| interface.with_return_address_storage(storage(16)))
+            .and_then(|interface| interface.with_stack_pointer_storage(storage(24)))
+            .expect("exact function interface")
+        };
+        for (label, complete, result, expected) in [
+            (
+                "exact",
+                true,
+                crate::SourceCallResult::Register {
+                    storage: storage(0),
+                },
+                SummaryReturnRelation::Const(7),
+            ),
+            (
+                "void",
+                true,
+                crate::SourceCallResult::Void,
+                SummaryReturnRelation::Unknown,
+            ),
+            (
+                "incomplete",
+                false,
+                crate::SourceCallResult::Register {
+                    storage: storage(0),
+                },
+                SummaryReturnRelation::Unknown,
+            ),
+            (
+                "foreign-carrier",
+                true,
+                crate::SourceCallResult::Register {
+                    storage: storage(8),
+                },
+                SummaryReturnRelation::Unknown,
+            ),
+        ] {
+            let call_interface = crate::SourceCallSiteInterface::new(
+                revision.to_vec(),
+                crate::SourceCallSiteIdentity::new(
+                    0x7000,
+                    0,
+                    crate::CanonicalStorageId::from_varnode(&target),
+                ),
+                complete,
+                "sysv64",
+                [],
+                false,
+                false,
+                result,
+            )
+            .expect("callsite interface");
+            let prepared = SsaArtifact::for_decompile_with_interfaces(
+                &[block(
+                    0x7000,
+                    vec![
+                        R2ILOp::Call {
+                            target: target.clone(),
+                        },
+                        R2ILOp::Return { target: reg(16, 8) },
+                    ],
+                )],
+                Some(&arch),
+                Some(function_interface()),
+                vec![call_interface],
+            )
+            .unwrap_or_else(|| panic!("{label} prepared SSA"));
+            let abi = AbiProfile::from_machine_context(prepared.machine_context())
+                .unwrap_or_else(|| panic!("{label} ABI"));
+            let local = collect_local_summary_facts(&prepared, &abi);
+            let mut callee = FunctionSemanticSummary::unknown(InterprocFunctionId(0x7100), None);
+            callee.return_relation = SummaryReturnRelation::Const(7);
+            let summary = resolve_summary(
+                InterprocFunctionId(0x7000),
+                None,
+                &local,
+                &BTreeMap::from([(callee.id, callee)]),
+            );
+
+            assert_eq!(
+                summary.return_relation, expected,
+                "{label} call-result authority must control the return relation"
+            );
+        }
+    }
+
+    #[test]
+    fn call_carrier_nonconvergence_degrades_all_observations() {
+        let arch = x86_64_arch();
+        let prepared = SsaArtifact::for_symbolic(
+            &[
+                block(
+                    0x1000,
+                    vec![R2ILOp::Branch {
+                        target: c(0x1010, 8),
+                    }],
+                ),
+                block(
+                    0x1010,
+                    vec![
+                        R2ILOp::Call {
+                            target: c(0x8000, 8),
+                        },
+                        R2ILOp::Return { target: c(0, 8) },
+                    ],
+                ),
+            ],
+            Some(&arch),
+        )
+        .expect("advisory SSA");
+        let state = collect_call_arg_state_with_iteration_limit(
+            &prepared,
+            &AbiProfile::from_arch(Some(&arch)),
+            1,
+        );
+
+        assert!(!state.converged);
+        assert!(
+            state
+                .by_call
+                .values()
+                .flatten()
+                .all(|arg| *arg == SummaryOperand::Unknown)
+        );
+
+        let mut local = empty_local_summary(BTreeSet::new());
+        local.call_carriers_converged = state.converged;
+        assert_eq!(
+            require_converged_call_carriers(&local),
+            Err(PreparedInterprocSummaryError::NonConverged),
+            "authoritative sealing must refuse the degraded state"
+        );
+    }
+
+    #[test]
+    fn call_arg_observer_preserves_ambiguous_join_as_unknown() {
+        let arch = windows_x64_arch();
+        let prepared = SsaArtifact::for_symbolic(
+            &[
+                block(
+                    0x6000,
+                    vec![R2ILOp::CBranch {
+                        target: c(0x6008, 8),
+                        cond: c(1, 1),
+                    }],
+                ),
+                block(
+                    0x6004,
+                    vec![
+                        R2ILOp::Copy {
+                            dst: reg(8, 8),
+                            src: c(1, 8),
+                        },
+                        R2ILOp::Branch {
+                            target: c(0x600c, 8),
+                        },
+                    ],
+                ),
+                block(
+                    0x6008,
+                    vec![
+                        R2ILOp::Copy {
+                            dst: reg(8, 8),
+                            src: c(2, 8),
+                        },
+                        R2ILOp::Branch {
+                            target: c(0x600c, 8),
+                        },
+                    ],
+                ),
+                block(
+                    0x600c,
+                    vec![
+                        R2ILOp::Call {
+                            target: c(0x7000, 8),
+                        },
+                        R2ILOp::Return { target: c(0, 8) },
+                    ],
+                ),
+            ],
+            Some(&arch),
+        )
+        .expect("ssa");
+
+        let observations = observe_call_arguments(&prepared, &AbiProfile::windows_x64());
+        let call_id = prepared
+            .call_sites()
+            .by_id
+            .keys()
+            .next()
+            .copied()
+            .expect("callsite");
+        let args = observations.get(&call_id).expect("call args");
+
+        assert_eq!(args.first(), Some(&CallArgObservation::Unknown));
+    }
+
+    #[test]
+    fn source_owned_call_observer_requires_exact_complete_call_carriers() {
+        let mut arch = x86_64_arch();
+        arch.add_register(RegisterDef::new("rcx", 32, 8));
+        let storage = |offset| crate::CanonicalStorageId {
+            space: crate::CanonicalStorageSpace::Register,
+            offset,
+            size: 8,
+        };
+        let revision = b"interproc-exact-call-carriers";
+        let function_interface = || {
+            crate::SourceFunctionInterface::new_exact(
+                revision.to_vec(),
+                "sysv64",
+                [crate::SourceAbiParameterSpec::new(0, storage(8))],
+                crate::SourceFunctionReturn::Void,
+                [],
+            )
+            .and_then(|interface| interface.with_return_address_storage(storage(16)))
+            .and_then(|interface| interface.with_stack_pointer_storage(storage(24)))
+            .expect("exact function interface")
+        };
+        let target = c(0x7000, 8);
+        let blocks = [block(
+            0x6000,
+            vec![
+                R2ILOp::Copy {
+                    dst: reg(32, 8),
+                    src: c(9, 8),
+                },
+                R2ILOp::Call {
+                    target: target.clone(),
+                },
+                R2ILOp::Return { target: c(0, 8) },
+            ],
+        )];
+        let call_interface = |complete| {
+            crate::SourceCallSiteInterface::new(
+                revision.to_vec(),
+                crate::SourceCallSiteIdentity::new(
+                    0x6000,
+                    1,
+                    crate::CanonicalStorageId::from_varnode(&target),
+                ),
+                complete,
+                "win64",
+                [crate::SourceCallArgumentSpec::new(0, storage(32))],
+                false,
+                false,
+                crate::SourceCallResult::Void,
+            )
+            .expect("callsite interface")
+        };
+        let complete = SsaArtifact::for_decompile_with_interfaces(
+            &blocks,
+            Some(&arch),
+            Some(function_interface()),
+            vec![call_interface(true)],
+        )
+        .expect("complete call carrier artifact");
+        let incomplete = SsaArtifact::for_decompile_with_interfaces(
+            &blocks,
+            Some(&arch),
+            Some(function_interface()),
+            vec![call_interface(false)],
+        )
+        .expect("incomplete call carrier artifact");
+        let complete_abi =
+            AbiProfile::from_machine_context(complete.machine_context()).expect("source-owned ABI");
+        let incomplete_abi = AbiProfile::from_machine_context(incomplete.machine_context())
+            .expect("source-owned ABI");
+        let complete_args = observe_call_arguments(&complete, &complete_abi)
+            .into_values()
+            .next()
+            .expect("complete call args");
+        let incomplete_args = observe_call_arguments(&incomplete, &incomplete_abi)
+            .into_values()
+            .next()
+            .expect("incomplete call args");
+
+        assert_eq!(complete_args.first(), Some(&CallArgObservation::Const(9)));
+        assert_eq!(incomplete_args.first(), Some(&CallArgObservation::Unknown));
     }
 }

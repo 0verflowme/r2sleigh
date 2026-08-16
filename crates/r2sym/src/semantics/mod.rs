@@ -11,21 +11,19 @@ mod vm;
 
 pub(crate) use artifact::TargetQueryRouteInput;
 pub use artifact::{
-    ResidualReason, SemanticArtifact, SemanticArtifactBody, SemanticConfidence, SemanticEvidence,
-    SemanticEvidenceAmbiguity, SemanticEvidenceCoverage, SemanticEvidenceProvenance,
-    SemanticEvidenceReason, SemanticEvidenceSoundness, SliceClass,
+    ResidualReason, SemanticArtifact, SemanticArtifactBody, SemanticArtifactReport,
+    SemanticConfidence, SemanticEvidence, SemanticEvidenceAmbiguity, SemanticEvidenceCoverage,
+    SemanticEvidenceProvenance, SemanticEvidenceReason, SemanticEvidenceSoundness, SliceClass,
 };
 pub use cache::{SEMANTIC_ARTIFACT_SCHEMA_VERSION, stable_scope_hash};
 pub use claims::{
-    CheckedClaim, PROOF_COVERAGE_SCHEMA_VERSION, ProofCoverage, ProofFailure, ProofObligation,
-    ProofObligationKind, ProofOwner, RenderPermission, RenderPermissionKind,
     SEMANTIC_CLAIM_SCHEMA_VERSION, SemanticClaim, SemanticClaimKind, SemanticClaimSource,
     SemanticClaimSummary, SemanticTypeSeedKind, SummaryRoleCertificate, SummaryRouteCertificate,
     SummaryRouteCertificateKind,
 };
 pub use compiler::compile_semantic_artifact_default_with_scope;
 pub use compiler::{
-    compile_function_semantics_with_scope, compile_named_native_worker_summary_artifact,
+    compile_function_semantics_with_scope, compile_named_native_worker_summary_report,
     compile_native_worker_summary_artifact, compile_query_semantic_artifact_with_scope,
     compile_semantic_artifact_with_scope,
     compile_summary_dense_worker_artifact_from_interproc_summary,

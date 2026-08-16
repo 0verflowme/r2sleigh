@@ -43,7 +43,9 @@ belongs there. Most semantic/type/cache/route fixes should move upstream.
 3. `r2plugin` is orchestration/FFI glue only.
 4. Do not reconstruct missing semantics downstream.
 5. Prefer typed contracts over JSON blobs and stringly maps.
-6. `r2types::FunctionFacts` is the canonical combined type+semantic contract.
+6. `r2types::FunctionFacts` is the advisory combined type+semantic report;
+   `r2types::SourceOwnedFunctionFacts`, retaining the exact
+   `Arc<r2ssa::SsaArtifact>`, is the runtime authority seam.
 7. `r2types::FunctionTypeFacts` is the canonical type/layout/signature payload.
 8. `r2sym::SemanticArtifact` is the canonical semantic artifact.
 9. `r2sym` owns semantic policy and evidence; consumers interpret it.
@@ -253,7 +255,8 @@ Use this map by default:
   - layout inference
   - external type context normalization
   - canonical `FunctionTypeFacts`
-  - canonical combined `FunctionFacts`
+  - advisory combined `FunctionFacts` reports
+  - exact source-owned runtime authority through `SourceOwnedFunctionFacts`
 - `crates/r2engine`
   - typed request orchestration
   - route selection for decompile/type/query requests
@@ -292,11 +295,14 @@ These are the preferred subsystem seams:
 - `r2types::FunctionTypeFacts`
   - canonical type/layout/signature payload
 - `r2types::FunctionFacts`
-  - canonical combined type+semantic payload
+  - advisory combined type+semantic report
+- `r2types::SourceOwnedFunctionFacts`
+  - canonical runtime authority retaining the exact `Arc<r2ssa::SsaArtifact>`
 - `r2engine` typed request/response APIs
   - canonical orchestration surface for plugin command paths
-- `r2dec::SemanticRoutePlan`
-  - render route selected by `r2engine` from canonical upstream capabilities
+- `r2types::DecompileRouteFacts`
+  - render route selected by `r2engine` and sealed into
+    `SourceOwnedFunctionFacts`
 
 If a caller needs more information, extend these contracts instead of creating
 parallel wrappers.

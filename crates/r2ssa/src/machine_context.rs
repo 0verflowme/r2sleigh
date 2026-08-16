@@ -24,7 +24,90 @@ pub use r2source::{
     StackAddressBase,
 };
 
-pub const MACHINE_CONTEXT_SCHEMA_VERSION: u32 = 14;
+pub const MACHINE_CONTEXT_SCHEMA_VERSION: u32 = 15;
+
+/// Canonical architecture family captured from the exact lifting profile.
+///
+/// This is semantic source identity, unlike calling-convention or register
+/// presentation strings. Unknown families remain explicit so architecture-
+/// specific consumers can fail closed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub enum MachineArchitectureFamily {
+    #[default]
+    Unknown,
+    X86,
+    X86_64,
+    Arm,
+    AArch64,
+    RiscV32,
+    RiscV64,
+    Mips32,
+    Mips64,
+    PowerPc32,
+    PowerPc64,
+}
+
+impl MachineArchitectureFamily {
+    /// Project an architecture description into the same typed family used by
+    /// immutable machine-context authority.
+    pub fn from_arch_spec(arch: Option<&ArchSpec>) -> Self {
+        let Some(arch) = arch else {
+            return Self::Unknown;
+        };
+        let name = arch.name.trim().to_ascii_lowercase();
+        let address_size = effective_arch_address_size(arch);
+        if matches!(name.as_str(), "x86-64" | "x86_64" | "x64" | "amd64")
+            || ((name == "x86" || name.starts_with("x86:")) && address_size == 8)
+        {
+            Self::X86_64
+        } else if matches!(name.as_str(), "x86-32" | "i386" | "i686")
+            || ((name == "x86" || name.starts_with("x86:")) && address_size == 4)
+        {
+            Self::X86
+        } else if name == "aarch64"
+            || name == "arm64"
+            || name.starts_with("aarch64:")
+            || name.starts_with("arm64:")
+        {
+            Self::AArch64
+        } else if (name == "arm" || name.starts_with("arm:")) && address_size == 4
+            || name.starts_with("armv")
+        {
+            Self::Arm
+        } else if name == "riscv32"
+            || name == "rv32"
+            || name.starts_with("rv32")
+            || ((name == "riscv" || name.starts_with("riscv:")) && address_size == 4)
+        {
+            Self::RiscV32
+        } else if name == "riscv64"
+            || name == "rv64"
+            || name.starts_with("rv64")
+            || ((name == "riscv" || name.starts_with("riscv:")) && address_size == 8)
+        {
+            Self::RiscV64
+        } else if (name == "mips" || name.starts_with("mips:") || name.starts_with("mips32"))
+            && address_size == 4
+        {
+            Self::Mips32
+        } else if name.starts_with("mips64")
+            || ((name == "mips" || name.starts_with("mips:")) && address_size == 8)
+        {
+            Self::Mips64
+        } else if (name == "ppc" || name.starts_with("ppc:") || name.starts_with("powerpc"))
+            && address_size == 4
+        {
+            Self::PowerPc32
+        } else if name.starts_with("ppc64")
+            || ((name == "ppc" || name.starts_with("ppc:") || name.starts_with("powerpc"))
+                && address_size == 8)
+        {
+            Self::PowerPc64
+        } else {
+            Self::Unknown
+        }
+    }
+}
 /// One canonical register carrier in the immutable ABI snapshot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct MachineAbiRegisterSlot {
@@ -402,6 +485,7 @@ fn return_mechanism_matches_machine(
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SourceMachineContext {
     schema_version: u32,
+    architecture_family: MachineArchitectureFamily,
     memory_model: MachineMemoryModel,
     function_interface: Option<SourceFunctionInterface>,
     abi_model: MachineAbiModel,
@@ -721,6 +805,7 @@ impl SourceMachineContext {
                 )
             })
             .collect();
+        let architecture_family = MachineArchitectureFamily::from_arch_spec(arch);
         let memory_model = MachineMemoryModel::from_arch(arch);
         let frame_pointer_storage = function_interface
             .as_ref()
@@ -845,6 +930,7 @@ impl SourceMachineContext {
             .collect();
         Self {
             schema_version: MACHINE_CONTEXT_SCHEMA_VERSION,
+            architecture_family,
             memory_model,
             function_interface,
             abi_model,
@@ -858,6 +944,10 @@ impl SourceMachineContext {
 
     pub const fn schema_version(&self) -> u32 {
         self.schema_version
+    }
+
+    pub const fn architecture_family(&self) -> MachineArchitectureFamily {
+        self.architecture_family
     }
 
     pub const fn memory_model(&self) -> &MachineMemoryModel {
@@ -929,8 +1019,21 @@ impl SourceMachineContext {
     /// machine/source fact that can affect prepared semantics or certification.
     pub(crate) fn semantic_identity_bytes(&self) -> Box<[u8]> {
         let mut writer = MachineContextIdentityWriter::new();
-        writer.bytes(b"r2ssa-machine-context-semantic-v1");
+        writer.bytes(b"r2ssa-machine-context-semantic-v2");
         writer.u32(self.schema_version);
+        writer.u8(match self.architecture_family {
+            MachineArchitectureFamily::Unknown => 0,
+            MachineArchitectureFamily::X86 => 1,
+            MachineArchitectureFamily::X86_64 => 2,
+            MachineArchitectureFamily::Arm => 3,
+            MachineArchitectureFamily::AArch64 => 4,
+            MachineArchitectureFamily::RiscV32 => 5,
+            MachineArchitectureFamily::RiscV64 => 6,
+            MachineArchitectureFamily::Mips32 => 7,
+            MachineArchitectureFamily::Mips64 => 8,
+            MachineArchitectureFamily::PowerPc32 => 9,
+            MachineArchitectureFamily::PowerPc64 => 10,
+        });
 
         let memory = &self.memory_model;
         writer.u32(memory.schema_version());
@@ -1154,6 +1257,29 @@ mod tests {
         arch.add_register(RegisterDef::new("target", 16, 8));
         arch.add_register(RegisterDef::new("arg", 24, 8));
         arch
+    }
+
+    #[test]
+    fn architecture_family_is_typed_schema_bound_semantic_identity() {
+        let x86 = ArchSpec::new("x86:LE:64:default");
+        let arm = ArchSpec::new("AARCH64:LE:64:v8A");
+        let x86_context = SourceMachineContext::from_blocks(&[], Some(&x86));
+        let arm_context = SourceMachineContext::from_blocks(&[], Some(&arm));
+
+        assert_eq!(MACHINE_CONTEXT_SCHEMA_VERSION, 15);
+        assert_eq!(x86_context.schema_version(), 15);
+        assert_eq!(
+            x86_context.architecture_family(),
+            MachineArchitectureFamily::X86_64
+        );
+        assert_eq!(
+            arm_context.architecture_family(),
+            MachineArchitectureFamily::AArch64
+        );
+        assert_ne!(
+            x86_context.semantic_identity_bytes(),
+            arm_context.semantic_identity_bytes()
+        );
     }
 
     #[test]

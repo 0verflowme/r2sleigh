@@ -29,11 +29,11 @@ typedef struct R2ILBlock R2ILBlock;
 
 #define R2SLEIGH_CAPABILITIES_V2 ((((((R2SLEIGH_CAP_DECOMPILE_V2 | R2SLEIGH_CAP_TYPE_FUNCTION_V2) | R2SLEIGH_CAP_RESPONSE_INFO_V2) | R2SLEIGH_CAP_EXECUTION_CONTROL_V2) | R2SLEIGH_CAP_LIFT_CORE_V2) | R2SLEIGH_CAP_PLANNER_QUERY_V2) | R2SLEIGH_CAP_OPAQUE_RADARE_SNAPSHOT_V2)
 
-#define R2SLEIGH_RADARE_ABI_V2 138
+#define R2SLEIGH_RADARE_ABI_V2 139
 
-#define R2SLEIGH_RADARE_FUNCTION_SNAPSHOT_SCHEMA_V2 11
+#define R2SLEIGH_RADARE_FUNCTION_SNAPSHOT_SCHEMA_V2 12
 
-#define R2SLEIGH_RADARE_SNAPSHOT_ACCESSOR_SCHEMA_V2 4
+#define R2SLEIGH_RADARE_SNAPSHOT_ACCESSOR_SCHEMA_V2 5
 
 #define R2SLEIGH_STATUS_OK_V2 0
 
@@ -143,8 +143,6 @@ typedef struct R2ILBlock R2ILBlock;
 
 #define R2SLEIGH_QUERY_ANNOTATIONS_V2 3
 
-#define R2SLEIGH_QUERY_RECOVERED_VARS_V2 7
-
 #define R2SLEIGH_QUERY_DATA_REFS_V2 8
 
 #define R2SLEIGH_DATA_REF_SCHEMA_V2 1
@@ -170,8 +168,6 @@ typedef struct R2ILBlock R2ILBlock;
 #define R2SLEIGH_TYPE_WRITEBACK_AGGRESSIVE_V2 2
 
 #define R2SLEIGH_AUTO_CALLBACK_ANALYZE_FUNCTION_V2 0
-
-#define R2SLEIGH_AUTO_CALLBACK_RECOVER_VARS_V2 1
 
 #define R2SLEIGH_AUTO_CALLBACK_DATA_REFS_V2 2
 
@@ -555,6 +551,7 @@ typedef struct R2SleighRadareFunctionInterfaceViewV2 {
 
 typedef struct R2SleighRadareParameterViewV2 {
   uint32_t index;
+  size_t name_length;
   struct R2SleighRadareRegisterStorageViewV2 storage;
   uint32_t logical_type_id;
   struct R2SleighRadareCarrierProjectionV2 carrier;
@@ -664,6 +661,7 @@ typedef struct R2SleighRadareAccessorsV2 {
   uint8_t (*interface_calling_convention)(const void*, uint8_t*, size_t);
   uint8_t (*interface_storage_name)(const void*, int32_t, uint8_t*, size_t);
   uint8_t (*parameter_view)(const void*, size_t, struct R2SleighRadareParameterViewV2*);
+  uint8_t (*parameter_name)(const void*, size_t, uint8_t*, size_t);
   uint8_t (*parameter_storage_name)(const void*, size_t, uint8_t*, size_t);
   uint8_t (*stack_slot_view)(const void*, size_t, struct R2SleighRadareStackSlotViewV2*);
   uint8_t (*stack_slot_string)(const void*, size_t, int32_t, uint8_t*, size_t);
@@ -692,7 +690,7 @@ typedef struct R2SleighRadareAccessorsV2 {
 } R2SleighRadareAccessorsV2;
 
 /**
- * Borrowed opaque radare2 ABI 138 snapshot plus its immutable accessor table.
+ * Borrowed opaque radare2 ABI 139 snapshot plus its immutable accessor table.
  * Both pointers are valid only for the duration of one synchronous `execute`
  * callback. Rust deep-copies the source before returning to the caller.
  */

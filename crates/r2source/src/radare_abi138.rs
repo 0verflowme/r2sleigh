@@ -1,4 +1,4 @@
-//! Audited synchronous ingress for radare2 ABI 138 snapshot schema 11.
+//! Audited synchronous ingress for radare2 ABI 139 snapshot schema 12.
 //!
 //! The wire API contains only opaque handles, scalars, and caller-owned output
 //! buffers. It deliberately cannot expose radare2 internals or assemble source
@@ -12,9 +12,9 @@ use std::sync::Arc;
 
 use super::*;
 
-pub const RADARE_ABI_VERSION: u32 = 138;
-pub const RADARE_FUNCTION_SNAPSHOT_SCHEMA_VERSION: u32 = 11;
-pub const RADARE_SNAPSHOT_ACCESSOR_SCHEMA_VERSION: u32 = 4;
+pub const RADARE_ABI_VERSION: u32 = 139;
+pub const RADARE_FUNCTION_SNAPSHOT_SCHEMA_VERSION: u32 = 12;
+pub const RADARE_SNAPSHOT_ACCESSOR_SCHEMA_VERSION: u32 = 5;
 
 pub const RADARE_ENDIAN_LITTLE: u32 = 0x4321;
 pub const RADARE_ENDIAN_BIG: u32 = 0x1234;
@@ -135,6 +135,7 @@ pub struct RadareAbi138CarrierProjection {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RadareAbi138ParameterView {
     pub index: u32,
+    pub name_length: usize,
     pub storage: RadareAbi138RegisterStorageView,
     pub logical_type_id: u32,
     pub carrier: RadareAbi138CarrierProjection,
@@ -315,6 +316,7 @@ pub struct RadareAbi138Accessors {
     pub interface_calling_convention: Option<RadareStringFn>,
     pub interface_storage_name: Option<RadareInterfaceStorageNameFn>,
     pub parameter_view: Option<RadareParameterViewFn>,
+    pub parameter_name: Option<RadareIndexedStringFn>,
     pub parameter_storage_name: Option<RadareIndexedStringFn>,
     pub stack_slot_view: Option<RadareStackSlotViewFn>,
     pub stack_slot_string: Option<RadareStackSlotStringFn>,
@@ -365,7 +367,7 @@ pub enum RadareAbi138CaptureError {
 
 impl std::fmt::Display for RadareAbi138CaptureError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "radare ABI 138 snapshot capture failed: {self:?}")
+        write!(f, "radare ABI 139 snapshot capture failed: {self:?}")
     }
 }
 
@@ -892,7 +894,7 @@ unsafe fn capture_stack_slots(
             (3, view.arg_name_length),
             (4, view.home_reg_length),
         ] {
-            // SAFETY: string kind is from the closed schema-11 vocabulary.
+            // SAFETY: string kind is from the closed schema-12 vocabulary.
             let _ = unsafe {
                 copy_stack_slot_string(snapshot, string_fn, index, kind, length, budget)
             }?;
@@ -1086,13 +1088,15 @@ unsafe fn capture_stack_allocation_contract(
         .map_err(|_| RadareAbi138CaptureError::InvalidInterface)
 }
 
+type CapturedInterface = (SourceFunctionInterface, Box<[Box<str>]>);
+
 unsafe fn capture_interface(
     snapshot: *const c_void,
     accessors: &RadareAbi138Accessors,
     top: &RadareAbi138SnapshotView,
     revision: &[u8],
     budget: &mut CaptureBudget,
-) -> Result<SourceFunctionInterface, RadareAbi138CaptureError> {
+) -> Result<CapturedInterface, RadareAbi138CaptureError> {
     let view_fn = required(accessors.interface_view, "interface_view")?;
     let cc_fn = required(
         accessors.interface_calling_convention,
@@ -1100,7 +1104,9 @@ unsafe fn capture_interface(
     )?;
     let storage_name_fn = required(accessors.interface_storage_name, "interface_storage_name")?;
     let parameter_view_fn = required(accessors.parameter_view, "parameter_view")?;
-    let parameter_name_fn = required(accessors.parameter_storage_name, "parameter_storage_name")?;
+    let parameter_name_fn = required(accessors.parameter_name, "parameter_name")?;
+    let parameter_storage_name_fn =
+        required(accessors.parameter_storage_name, "parameter_storage_name")?;
     let mut view = RadareAbi138FunctionInterfaceView::default();
     // SAFETY: callback validity is guaranteed by the caller.
     callback_ok(unsafe { view_fn(snapshot, &mut view) }, "interface_view")?;
@@ -1149,6 +1155,7 @@ unsafe fn capture_interface(
     }
 
     let mut parameters = Vec::with_capacity(view.num_parameters);
+    let mut parameter_names = Vec::with_capacity(view.num_parameters);
     let mut logical_parameters = Vec::with_capacity(view.num_parameters);
     for index in 0..view.num_parameters {
         let mut parameter = RadareAbi138ParameterView::default();
@@ -1161,19 +1168,31 @@ unsafe fn capture_interface(
             return Err(RadareAbi138CaptureError::InvalidInterface);
         }
         // SAFETY: callback writes an owned string of the advertised size.
-        let parameter_name = unsafe {
+        let parameter_storage_name = unsafe {
             copy_indexed_string(
                 snapshot,
-                parameter_name_fn,
+                parameter_storage_name_fn,
                 index,
                 parameter.storage.name_length,
                 "parameter_storage_name",
                 budget,
             )
         }?;
-        if parameter_name.is_empty() {
+        if parameter_storage_name.is_empty() {
             return Err(RadareAbi138CaptureError::InvalidInterface);
         }
+        // SAFETY: callback writes an owned presentation string of the advertised size.
+        let parameter_name = unsafe {
+            copy_indexed_string(
+                snapshot,
+                parameter_name_fn,
+                index,
+                parameter.name_length,
+                "parameter_name",
+                budget,
+            )
+        }?;
+        parameter_names.push(parameter_name.into_boxed_str());
         parameters.push(SourceAbiParameterSpec::new(
             parameter.index,
             storage(parameter.storage)?,
@@ -1360,7 +1379,7 @@ unsafe fn capture_interface(
     }?;
     // SAFETY: both callbacks are copied from the validated table and all
     // returned bytes are deep-copied while the snapshot borrow remains live.
-    unsafe {
+    let interface = unsafe {
         capture_frame_pointer_storage(
             snapshot,
             accessors,
@@ -1368,7 +1387,8 @@ unsafe fn capture_interface(
             interface,
             budget,
         )
-    }
+    }?;
+    Ok((interface, parameter_names.into_boxed_slice()))
 }
 
 unsafe fn capture_image(
@@ -1639,7 +1659,7 @@ unsafe fn capture_advisory_calls(
     Ok(calls.into_boxed_slice())
 }
 
-/// Deep-copy one borrowed radare2 ABI 138/schema-11 snapshot synchronously.
+/// Deep-copy one borrowed radare2 ABI 139/schema-12 snapshot synchronously.
 ///
 /// This is the only public source-authority mint. It performs no symbol lookup
 /// and retains no foreign pointers.
@@ -1738,13 +1758,19 @@ pub unsafe fn capture_radare_abi138(
     let advisory_calls =
         unsafe { capture_advisory_calls(input.snapshot, &accessors, &first, &mut budget) }?;
     // SAFETY: interface child counts are validated before each access.
-    let function_interface = if first.capabilities & RADARE_CAP_EXACT_FUNCTION_INTERFACE != 0 {
+    let captured_interface = if first.capabilities & RADARE_CAP_EXACT_FUNCTION_INTERFACE != 0 {
         Some(unsafe {
             capture_interface(input.snapshot, &accessors, &first, &revision, &mut budget)
         }?)
     } else {
         None
     };
+    let function_interface = captured_interface
+        .as_ref()
+        .map(|(interface, _)| interface.clone());
+    let parameter_names = captured_interface
+        .map(|(_, parameter_names)| parameter_names)
+        .unwrap_or_default();
 
     // Repeat the source-owned top view after every deep copy. Minting authority
     // is forbidden if any captured count, capability, range, or identity moved.
@@ -1778,6 +1804,7 @@ pub unsafe fn capture_radare_abi138(
         },
         FunctionPresentation {
             display_name: function_name.into_boxed_str(),
+            parameter_names,
         },
         image,
         advisory_calls,

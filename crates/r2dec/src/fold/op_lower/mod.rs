@@ -2109,11 +2109,6 @@ impl<'a> FoldingContext<'a> {
         }
     }
 
-    /// Set whether to hide stack frame boilerplate.
-    pub fn set_hide_stack_frame(&mut self, hide: bool) {
-        self.hide_stack_frame = hide;
-    }
-
     #[cfg(test)]
     pub fn set_function_names(&mut self, names: HashMap<u64, String>) {
         self.inputs.function_names = Box::leak(Box::new(names));
@@ -2226,7 +2221,7 @@ impl<'a> FoldingContext<'a> {
 
     /// Analyze function structure to detect return patterns.
     /// This finds the exit block and blocks that branch to it.
-    pub fn analyze_function_structure(&mut self, func: &SSAFunction) {
+    pub(crate) fn analyze_function_structure(&mut self, func: &SSAFunction) {
         self.state.return_blocks.clear();
         self.state.return_stack_slots.clear();
         self.state
@@ -2871,12 +2866,14 @@ impl<'a> FoldingContext<'a> {
     }
 
     /// Analyze a block to collect use counts and definitions.
-    pub fn analyze_block(&mut self, block: &SSABlock) {
+    #[cfg(test)]
+    pub(crate) fn analyze_block(&mut self, block: &SSABlock) {
         self.analyze_blocks(std::slice::from_ref(block));
     }
 
     /// Analyze multiple blocks (for function-level folding).
-    pub fn analyze_blocks(&mut self, blocks: &[SSABlock]) {
+    #[cfg(test)]
+    pub(crate) fn analyze_blocks(&mut self, blocks: &[SSABlock]) {
         let execution = r2ssa::SsaExecutionControl::default();
         let control =
             crate::DecompileWorkControl::new(&execution, crate::DecompileWorkPhase::Structuring);
@@ -2884,7 +2881,7 @@ impl<'a> FoldingContext<'a> {
             .expect("default decompiler work control cannot stop");
     }
 
-    pub fn analyze_blocks_with_control(
+    pub(crate) fn analyze_blocks_with_control(
         &mut self,
         blocks: &[SSABlock],
         control: crate::DecompileWorkControl<'_>,
@@ -13185,7 +13182,7 @@ impl<'a> FoldingContext<'a> {
     }
 
     /// Convert a block to folded C statements.
-    pub fn fold_block(&self, block: &SSABlock, current_block_addr: u64) -> Vec<CStmt> {
+    pub(crate) fn fold_block(&self, block: &SSABlock, current_block_addr: u64) -> Vec<CStmt> {
         self.current_block_addr.set(Some(current_block_addr));
         self.current_op_idx.set(None);
         let mut stmts = Vec::new();

@@ -727,28 +727,28 @@ rustc_session::declare_lint!(
 rustc_session::declare_lint!(
     /// ### What it does
     ///
-    /// Warns when public `r2dec` semantic-summary render entrypoints accept a
-    /// caller-supplied `SemanticRoutePlan`, or render VM summaries without
-    /// checking `FunctionFacts::decompile_route`.
+    /// Warns when public `r2dec` semantic-summary render entrypoints accept
+    /// detached `FunctionFacts`, `FunctionTypeFacts`, `SemanticArtifactReport`,
+    /// or a caller-supplied route instead of one exact `DecompilerInput`.
     ///
     /// ### Why is this bad?
     ///
-    /// The decompile route is part of the canonical `FunctionFacts` contract.
-    /// A separate route argument lets r2engine or direct callers render summary
-    /// output under a policy that differs from the facts payload and route authority.
+    /// `DecompilerInput` retains immutable `SourceOwnedFunctionFacts`, which in
+    /// turn retains the exact prepared SSA allocation. Detached reports and
+    /// route arguments can otherwise be paired with a foreign source owner.
     ///
     /// ### Example
     ///
     /// ```rust
-    /// pub fn render_semantic_worker_summary(..., route: &SemanticRoutePlan, ...)
-    /// pub fn render_vm_semantic_summary(..., type_facts: &FunctionTypeFacts, ...)
+    /// pub fn render_semantic_worker_summary(..., facts: &FunctionFacts, ...)
+    /// pub fn render_vm_semantic_summary(..., report: &SemanticArtifactReport, ...)
     /// ```
     ///
-    /// Read `FunctionFacts::decompile_route()` and require the matching summary
-    /// render permission before emitting summary output.
+    /// Accept `&DecompilerInput`, derive its retained report, and require the
+    /// matching summary render permission before emitting summary output.
     pub R2DEC_SUMMARY_RENDER_ROUTE_SIDE_CHANNEL,
     Warn,
-    "r2dec summary rendering must derive route permission from FunctionFacts"
+    "r2dec summary rendering must require exact source-owned DecompilerInput"
 );
 
 rustc_session::declare_lint!(
@@ -779,43 +779,41 @@ rustc_session::declare_lint!(
 rustc_session::declare_lint!(
     /// ### What it does
     ///
-    /// Warns when `r2engine` applies decompile route, render permission, or
+    /// Warns when `r2engine` applies decompile-route or
     /// callsite/callee evidence by filling request/context side-channel fields.
     ///
     /// ### Why is this bad?
     ///
-    /// The decompile spine is `FunctionFacts`. Engine-owned route, refusal,
-    /// proof coverage, render permission, and callee resolution must travel through
-    /// `FunctionFacts`; otherwise plugin/decompiler callers
-    /// can observe different policy depending on which side channel was set.
+    /// The decompile spine is one consuming `TypeWritebackAnalysis` finalization
+    /// into immutable `SourceOwnedFunctionFacts`. Side-channel fields can diverge
+    /// from the exact prepared SSA owner later retained by `DecompilerInput`.
     ///
     /// ### Example
     ///
     /// ```rust
     /// context.with_semantic_route(Some(route));
-    /// context.with_render_permission(Some(permission));
     /// EngineDecompileRequest { callee_resolution: Some(facts), ..request }
     /// ```
     ///
-    /// Use instead `FunctionFacts::set_decompile_route(...)` and
-    /// `FunctionFacts::set_callee_resolution(...)`.
+    /// Derive evidence during source-owned analysis and consume
+    /// `finalize_for_decompile(...)` once.
     pub R2ENGINE_DECOMPILER_CONTEXT_ROUTE_SIDE_CHANNEL,
     Warn,
-    "r2engine must carry decompile route decisions through FunctionFacts"
+    "r2engine must carry decompile policy through exact source-owned finalization"
 );
 
 rustc_session::declare_lint!(
     /// ### What it does
     ///
     /// Warns when `r2engine` passes, converts, or exposes renderer-local route
-    /// plans beside `FunctionFacts`.
+    /// plans beside the source-owned decompile input.
     ///
     /// ### Why is this bad?
     ///
     /// `r2engine` owns route selection, but the render boundary must carry that
-    /// decision through `FunctionFacts::decompile_route`. Passing a route as a
-    /// sibling argument recreates the removed r2engine/r2dec side channel and
-    /// can diverge from facts-owned route and refusal state.
+    /// decision through the `SourceOwnedFunctionFacts` retained by
+    /// `DecompilerInput`. Passing a route as a sibling argument recreates the
+    /// removed r2engine/r2dec side channel.
     ///
     /// ### Example
     ///
@@ -823,19 +821,18 @@ rustc_session::declare_lint!(
     /// r2dec::render_semantic_worker_summary(name, facts, &route.to_decompiler_route(), config)
     /// ```
     ///
-    /// Stamp route facts onto `FunctionFacts` before render and call r2dec APIs
-    /// with only the facts-owned route authority.
+    /// Consume `TypeWritebackAnalysis::finalize_for_decompile`, construct one
+    /// `DecompilerInput`, and pass only that exact owner to r2dec.
     pub R2ENGINE_R2DEC_SUMMARY_RENDER_ROUTE_SIDE_CHANNEL,
     Warn,
-    "r2engine must not pass decompile routes beside FunctionFacts into r2dec summary rendering"
+    "r2engine must not pass decompile routes beside source-owned DecompilerInput"
 );
 
 rustc_session::declare_lint!(
     /// ### What it does
     ///
-    /// Warns when production `r2engine` code directly attaches callee,
-    /// callsite, call-result, or control facts to `FunctionFacts` outside the
-    /// canonical decompile-facts assembly helper.
+    /// Warns when production `r2engine` directly mutates raw `FunctionFacts`
+    /// call, control, semantic, or route evidence.
     ///
     /// ### Why is this bad?
     ///
@@ -850,25 +847,24 @@ rustc_session::declare_lint!(
     /// function_facts.set_control(...);
     /// ```
     ///
-    /// Use instead `attach_prepared_decompile_evidence(...)` or
-    /// `function_facts_for_decompile(...)`.
+    /// Build `TypeWritebackAnalysis` from the exact source owner in `r2types`.
     pub R2ENGINE_DECOMPILE_FACTS_SPINE_OWNERSHIP,
     Warn,
-    "r2engine must assemble decompile FunctionFacts through the canonical spine helper"
+    "r2engine must not mutate detached FunctionFacts authority"
 );
 
 rustc_session::declare_lint!(
     /// ### What it does
     ///
-    /// Warns when summary decompile route/refusal state is carried beside
-    /// `FunctionFacts` in `EngineSummaryDecompileRequest` or render falls back
-    /// to a request-local comment.
+    /// Warns when summary decompile route/refusal state is carried in
+    /// `EngineSummaryDecompileRequest` or render falls back to a request-local
+    /// comment instead of the finalized source-owned input.
     ///
     /// ### Why is this bad?
     ///
     /// Summary decompile is still part of the decompile product path. If guard
-    /// state or fallback comments live on the request, render decisions can
-    /// diverge from the canonical `FunctionFacts::decompile_route` contract.
+    /// state or fallback comments live on a detached request, render decisions
+    /// can diverge from the exact source-owned route contract.
     ///
     /// ### Example
     ///
@@ -879,11 +875,11 @@ rustc_session::declare_lint!(
     /// }
     /// ```
     ///
-    /// Stamp `DecompileRouteFacts` onto `FunctionFacts` before render and read
-    /// summary output only from that facts-owned route.
+    /// Consume `TypeWritebackAnalysis::finalize_for_decompile`, then render only
+    /// through the resulting `DecompilerInput`.
     pub R2ENGINE_SUMMARY_DECOMPILE_ROUTE_SIDE_CHANNEL,
     Warn,
-    "r2engine summary decompile route/refusal state must live in FunctionFacts"
+    "r2engine summary decompile route/refusal state must come from source-owned finalization"
 );
 
 rustc_session::declare_lint!(
@@ -991,24 +987,25 @@ rustc_session::declare_lint!(
     /// artifact.function_facts.types.signature_certificate = certificate;
     /// ```
     ///
-    /// Use `FunctionFacts::apply_decompile_type_override(...)` instead.
+    /// Put typed overrides in the parsed source context before building the
+    /// source-owned type analysis.
     pub R2ENGINE_DECOMPILE_TYPE_OVERRIDE_SIDE_CHANNEL,
     Warn,
-    "r2engine decompile type overrides must be applied through FunctionFacts"
+    "r2engine decompile type overrides must precede source-owned analysis"
 );
 
 rustc_session::declare_lint!(
     /// ### What it does
     ///
     /// Warns when the production `r2engine` decompile render request carries a
-    /// fallback/refusal comment outside `FunctionFacts`.
+    /// fallback/refusal comment beside the finalized source-owned facts.
     ///
     /// ### Why is this bad?
     ///
     /// Decompile refusal and fallback output are route decisions. A request
-    /// field such as `fallback_comment` can disagree with
-    /// `FunctionFacts::decompile_route`, letting render output be controlled by
-    /// a side channel that canonical facts and downstream consumers do not own.
+    /// field such as `fallback_comment` can disagree with the route sealed by
+    /// consuming `TypeWritebackAnalysis`, letting render output be controlled
+    /// by a side channel that the exact source owner does not retain.
     ///
     /// ### Example
     ///
@@ -1019,10 +1016,11 @@ rustc_session::declare_lint!(
     /// request.fallback_comment.clone()
     /// ```
     ///
-    /// Use `FunctionFacts::decompile_fallback_comment()` instead.
+    /// Put the comment in `DecompileFinalization` before consuming
+    /// `TypeWritebackAnalysis::finalize_for_decompile`.
     pub R2ENGINE_DECOMPILE_FALLBACK_COMMENT_SIDE_CHANNEL,
     Warn,
-    "r2engine decompile fallback comments must be carried by FunctionFacts"
+    "r2engine fallback comments must be sealed by source-owned finalization"
 );
 
 rustc_session::declare_lint!(
@@ -1106,53 +1104,26 @@ rustc_session::declare_lint!(
 rustc_session::declare_lint!(
     /// ### What it does
     ///
-    /// Warns when `decompiler_input_from_prepared_facts` replans or restamps
-    /// the decompile route after `function_facts_for_decompile` has already
-    /// attached route facts.
+    /// Warns when `r2engine` reconstructs decompile authority from raw facts or
+    /// legacy route-stamping helpers instead of consuming `TypeWritebackAnalysis`.
     ///
     /// ### Why is this bad?
     ///
-    /// `FunctionFacts::decompile_route` is the single render contract. Recomputing
-    /// an `EngineRouteDecision` while building `r2dec::DecompilerInput` creates a
-    /// second route authority and can diverge from the facts payload used for
-    /// downstream rendering.
+    /// Only `TypeWritebackAnalysis::finalize_for_decompile(self, ...)` may seal
+    /// immutable `SourceOwnedFunctionFacts`. A detached builder can pair a plan,
+    /// report, or route with an unrelated prepared SSA allocation.
     ///
     /// ### Example
     ///
     /// ```rust
-    /// let route_decision = decompile_route_decision(...);
-    /// let context = decompiler_context_with_route_decision(context, &route_decision);
+    /// writeback.stamp_decompile_route(route);
+    /// let facts = writeback.into_source_owned_facts();
     /// ```
     ///
-    /// Build the context directly from the already stamped `FunctionFacts`.
-    pub R2ENGINE_DECOMPILER_INPUT_ROUTE_REPLAN_SIDE_CHANNEL,
+    /// Consume `writeback.finalize_for_decompile(finalization)` exactly once.
+    pub R2ENGINE_DECOMPILER_INPUT_REQUIRES_SOURCE_OWNER,
     Warn,
-    "r2engine decompiler input assembly must not replan routes outside FunctionFacts"
-);
-
-rustc_session::declare_lint!(
-    /// ### What it does
-    ///
-    /// Warns when `r2engine::decompiler_input_from_prepared_facts` is exposed
-    /// outside tests.
-    ///
-    /// ### Why is this bad?
-    ///
-    /// Normal decompile requests must enter through `EngineSession` so request
-    /// preparation, route diagnostics, refusal policy, and render permission stay
-    /// owned by `r2engine`. A production-visible raw `DecompilerInput`
-    /// constructor gives callers a side door into `r2dec`.
-    ///
-    /// ### Example
-    ///
-    /// ```rust
-    /// pub fn decompiler_input_from_prepared_facts(...) -> r2dec::DecompilerInput
-    /// ```
-    ///
-    /// Gate this helper with `#[cfg(test)]`.
-    pub R2ENGINE_DECOMPILER_INPUT_HELPER_TEST_SUPPORT_ONLY,
-    Warn,
-    "r2engine raw decompiler input assembly must be test-support only"
+    "r2engine decompiler input must consume exact source-owned type analysis"
 );
 
 rustc_session::declare_lint!(
@@ -1177,18 +1148,18 @@ rustc_session::declare_lint!(
     /// function_facts.set_render(decompile_render_facts(prepared));
     /// ```
     ///
-    /// Use `FunctionFacts::attach_prepared_decompile_evidence(...)`.
+    /// Let `build_source_owned_type_writeback_analysis(...)` derive and retain
+    /// prepared evidence from its exact `Arc<SsaArtifact>`.
     pub R2ENGINE_PREPARED_DECOMPILE_EVIDENCE_SIDE_CHANNEL,
     Warn,
-    "r2engine must attach prepared decompile evidence through FunctionFacts"
+    "r2engine must derive prepared decompile evidence through source-owned analysis"
 );
 
 rustc_session::declare_lint!(
     /// ### What it does
     ///
-    /// Warns when production `r2dec::DecompilerContext` defines decompile route,
-    /// render permission, or render-policy side-channel fields/mutators outside
-    /// `FunctionFacts`.
+    /// Warns when production `r2dec::DecompilerContext` defines decompile-route
+    /// or render-policy side-channel fields/mutators outside the source-owned input.
     ///
     /// ### Why is this bad?
     ///
@@ -1202,14 +1173,13 @@ rustc_session::declare_lint!(
     /// ```rust
     /// struct DecompilerContext {
     ///     semantic_route: Option<SemanticRoutePlan>,
-    ///     render_permission: Option<RenderPermission>,
     /// }
     /// ```
     ///
-    /// Use `FunctionFacts::with_decompile_route(...)` instead.
+    /// Project the immutable report only from `DecompilerInput`.
     pub R2DEC_DECOMPILER_CONTEXT_ROUTE_SIDE_CHANNEL,
     Warn,
-    "r2dec must carry decompile route decisions through FunctionFacts"
+    "r2dec must carry decompile routes through source-owned DecompilerInput"
 );
 
 rustc_session::declare_lint!(
@@ -1233,10 +1203,10 @@ rustc_session::declare_lint!(
     /// }
     /// ```
     ///
-    /// Use `FunctionFacts::with_callee_resolution(...)` instead.
+    /// Project callee evidence only from source-owned `DecompilerInput`.
     pub R2DEC_DECOMPILER_CONTEXT_CALLEE_RESOLUTION_SIDE_CHANNEL,
     Warn,
-    "r2dec must carry callee resolution through FunctionFacts"
+    "r2dec must carry callee resolution through source-owned DecompilerInput"
 );
 
 rustc_session::declare_lint!(
@@ -1259,11 +1229,11 @@ rustc_session::declare_lint!(
     /// context.with_type_facts(type_facts);
     /// ```
     ///
-    /// Use `DecompilerContext::from_function_facts(...)` or
-    /// `Decompiler::set_function_facts(...)`.
+    /// Seal the evidence as `SourceOwnedFunctionFacts` in `r2types`, then pass
+    /// that single owner through `DecompilerInput::new(...)`.
     pub R2DEC_DIRECT_TYPE_FACTS_MUTATOR,
     Warn,
-    "r2dec production code must carry type evidence through FunctionFacts"
+    "r2dec production code must carry type evidence through SourceOwnedFunctionFacts"
 );
 
 rustc_session::declare_lint!(
@@ -1289,8 +1259,10 @@ rustc_session::declare_lint!(
     /// );
     /// ```
     ///
-    /// Use `FunctionFacts::attach_prepared_decompile_evidence(...)` before
-    /// constructing the `r2dec` context.
+    /// Build one `TypeWritebackAnalysis` with
+    /// `build_source_owned_type_writeback_analysis(...)`, finalize it for the
+    /// engine-selected decompile route, and pass the sealed
+    /// `SourceOwnedFunctionFacts` through `DecompilerInput::new(...)`.
     pub R2DEC_LOCAL_SIGNATURE_ENRICHMENT,
     Warn,
     "r2dec must consume known callee signatures from FunctionFacts, not enrich them from names locally"
@@ -1950,10 +1922,7 @@ rustc_session::declare_lint!(
     /// r2types::type_writeback_authority_report_with_policy(...);
     /// r2engine::type_writeback_authority_report_for_policy(...);
     /// r2engine::type_writeback_plan_report_for_policy(...);
-    /// r2engine::bounded_cfg_type_writeback_plan(...);
-    /// r2engine::bounded_cfg_type_writeback_plan_report(...);
     /// r2engine::type_writeback_external_struct_names(...);
-    /// r2engine::semantic_fallback_type_writeback_plan_report(...);
     /// r2engine::type_writeback_field_access_certificate_names(...);
     /// r2types::type_writeback_var_type_apply_decision(...);
     /// r2types::signature_register_arg_rename_decision(...);
@@ -2034,7 +2003,7 @@ rustc_session::declare_lint!(
     /// ### Example
     ///
     /// ```rust
-    /// r2types::build_type_writeback_analysis(input);
+    /// r2types::build_source_owned_type_writeback_analysis(request);
     /// r2types::infer_local_struct_artifacts_from_ssa(...);
     /// r2types::FunctionFacts::new(...);
     /// ```
@@ -2245,8 +2214,8 @@ rustc_session::declare_lint!(
     ///
     /// Symbolic scope report fields are derived from typed
     /// `PreparedFunctionScope` evidence and are part of the engine-owned
-    /// function-analysis report DTO. Plugin glue may pass scope facts through
-    /// to `r2engine`, but must not shape `payloads`, `seeds`, or report merge
+    /// function-analysis report DTO. Plugin glue may pass the prepared scope
+    /// through to `r2engine`, but must not shape payloads or report merge
     /// policy locally.
     ///
     /// ### Example
@@ -2791,7 +2760,7 @@ rustc_session::declare_lint!(
     ///
     /// ```rust
     /// fn decompile_one_function(...) {
-    ///     r2dec::DecompilerInput::new(ssa, context);
+    ///     r2dec::DecompilerInput::new(source_owned_facts);
     ///     r2dec::lower_function_to_c(&input);
     /// }
     /// ```
@@ -3120,13 +3089,13 @@ rustc_session::declare_lint!(
     /// ### What it does
     ///
     /// Warns when production `r2engine` or `r2dec` assigns directly to canonical
-    /// `FunctionFacts` owner fields such as `types`, `summary_view`,
-    /// `assumption_usage`, `proof`, `render`, or `control`.
+    /// `FunctionFacts` report fields such as `types`, `summary_view`,
+    /// `assumption_usage`, `render`, or `control`.
     ///
     /// ### Why is this bad?
     ///
     /// `FunctionFacts` is the typed combined contract. Direct field writes in
-    /// consumers create silent side channels where type, semantic, proof, or
+    /// consumers create silent side channels where type, semantic, or
     /// render evidence can be replaced without the canonical invariant methods
     /// that refresh plans and normalize certificates.
     ///
@@ -3136,9 +3105,8 @@ rustc_session::declare_lint!(
     /// function_facts.types = type_facts;
     /// ```
     ///
-    /// Use instead `FunctionFacts` mutation methods such as
-    /// `replace_type_facts(...)`, `set_summary_set(...)`, or
-    /// `merge_proof_coverage(...)`.
+    /// Derive runtime evidence through the source-owned analysis builder and
+    /// consuming finalization path.
     pub R2TYPES_FUNCTION_FACTS_FIELD_OWNERSHIP,
     Warn,
     "FunctionFacts owner fields must be mutated through r2types methods"
@@ -3184,8 +3152,7 @@ rustc_session::declare_lint_pass!(R2sleighLintPass => [
     R2ENGINE_DECOMPILE_FALLBACK_COMMENT_SIDE_CHANNEL,
     R2ENGINE_ARTIFACTS_FACTS_SIDE_CHANNEL,
     R2ENGINE_DECOMPILE_ROUTE_TYPE_FACTS_SIDE_CHANNEL,
-    R2ENGINE_DECOMPILER_INPUT_ROUTE_REPLAN_SIDE_CHANNEL,
-    R2ENGINE_DECOMPILER_INPUT_HELPER_TEST_SUPPORT_ONLY,
+    R2ENGINE_DECOMPILER_INPUT_REQUIRES_SOURCE_OWNER,
     R2ENGINE_PREPARED_DECOMPILE_EVIDENCE_SIDE_CHANNEL,
     R2DEC_DECOMPILER_CONTEXT_ROUTE_SIDE_CHANNEL,
     R2DEC_DECOMPILER_CONTEXT_CALLEE_RESOLUTION_SIDE_CHANNEL,
@@ -3307,8 +3274,7 @@ pub fn register_lints(sess: &rustc_session::Session, lint_store: &mut rustc_lint
         R2ENGINE_CACHE_POLICY_OWNERSHIP,
         R2ENGINE_ARTIFACTS_FACTS_SIDE_CHANNEL,
         R2ENGINE_DECOMPILE_ROUTE_TYPE_FACTS_SIDE_CHANNEL,
-        R2ENGINE_DECOMPILER_INPUT_ROUTE_REPLAN_SIDE_CHANNEL,
-        R2ENGINE_DECOMPILER_INPUT_HELPER_TEST_SUPPORT_ONLY,
+        R2ENGINE_DECOMPILER_INPUT_REQUIRES_SOURCE_OWNER,
         R2ENGINE_PREPARED_DECOMPILE_EVIDENCE_SIDE_CHANNEL,
         R2DEC_DECOMPILER_CONTEXT_ROUTE_SIDE_CHANNEL,
         R2DEC_DECOMPILER_CONTEXT_CALLEE_RESOLUTION_SIDE_CHANNEL,
@@ -3576,7 +3542,7 @@ impl<'tcx> LateLintPass<'tcx> for R2sleighLintPass {
                 cx,
                 R2DEC_SUMMARY_RENDER_ROUTE_SIDE_CHANNEL,
                 item.span,
-                "r2dec summary render APIs must derive route permission from FunctionFacts::decompile_route",
+                "r2dec summary render APIs must accept DecompilerInput and derive route permission from its exact source-owned facts",
             );
         }
 
@@ -3624,7 +3590,7 @@ impl<'tcx> LateLintPass<'tcx> for R2sleighLintPass {
                 cx,
                 R2ENGINE_DECOMPILER_CONTEXT_ROUTE_SIDE_CHANNEL,
                 item.span,
-                "r2engine must carry decompile route/callee evidence through FunctionFacts, not request or context side channels",
+                "r2engine must carry decompile route/callee evidence through consuming source-owned finalization",
             );
         }
 
@@ -3648,7 +3614,7 @@ impl<'tcx> LateLintPass<'tcx> for R2sleighLintPass {
                 cx,
                 R2ENGINE_DECOMPILE_FACTS_SPINE_OWNERSHIP,
                 item.span,
-                "r2engine must assemble decompile evidence through attach_prepared_decompile_evidence/function_facts_for_decompile",
+                "r2engine must not mutate raw FunctionFacts after source-owned analysis",
             );
         }
 
@@ -3720,7 +3686,7 @@ impl<'tcx> LateLintPass<'tcx> for R2sleighLintPass {
                 cx,
                 R2ENGINE_DECOMPILE_TYPE_OVERRIDE_SIDE_CHANNEL,
                 item.span,
-                "r2engine must apply decompile type overrides through FunctionFacts",
+                "r2engine must apply type overrides before building source-owned analysis",
             );
         }
 
@@ -3732,7 +3698,19 @@ impl<'tcx> LateLintPass<'tcx> for R2sleighLintPass {
                 cx,
                 R2ENGINE_DECOMPILE_FALLBACK_COMMENT_SIDE_CHANNEL,
                 item.span,
-                "r2engine must carry decompile fallback comments through FunctionFacts",
+                "r2engine must carry fallback comments through DecompileFinalization",
+            );
+        }
+
+        if is_r2engine_span(cx, item.span)
+            && !item_is_test_only(cx, item)
+            && engine_whole_analysis_cache_item(cx, item)
+        {
+            span_lint(
+                cx,
+                R2ENGINE_CACHE_POLICY_OWNERSHIP,
+                item.span,
+                "r2engine must keep whole-analysis execution request-local and stateless",
             );
         }
 
@@ -3762,24 +3740,13 @@ impl<'tcx> LateLintPass<'tcx> for R2sleighLintPass {
 
         if is_r2engine_span(cx, item.span)
             && !item_is_test_only(cx, item)
-            && engine_decompiler_input_route_replan_side_channel_item(cx, item)
+            && engine_decompiler_input_requires_source_owner_item(cx, item)
         {
             span_lint(
                 cx,
-                R2ENGINE_DECOMPILER_INPUT_ROUTE_REPLAN_SIDE_CHANNEL,
+                R2ENGINE_DECOMPILER_INPUT_REQUIRES_SOURCE_OWNER,
                 item.span,
-                "r2engine decompiler input assembly must use the FunctionFacts route already attached by function_facts_for_decompile",
-            );
-        }
-
-        if is_r2engine_span(cx, item.span)
-            && engine_decompiler_input_helper_not_test_support_only_item(cx, item)
-        {
-            span_lint(
-                cx,
-                R2ENGINE_DECOMPILER_INPUT_HELPER_TEST_SUPPORT_ONLY,
-                item.span,
-                "r2engine raw decompiler input helper must be hidden behind cfg(test) or the explicit test-support feature",
+                "r2engine must consume TypeWritebackAnalysis::finalize_for_decompile before constructing DecompilerInput",
             );
         }
 
@@ -3791,7 +3758,7 @@ impl<'tcx> LateLintPass<'tcx> for R2sleighLintPass {
                 cx,
                 R2ENGINE_PREPARED_DECOMPILE_EVIDENCE_SIDE_CHANNEL,
                 item.span,
-                "r2engine must attach prepared decompile evidence through FunctionFacts, not individual proof-map builders or setters",
+                "r2engine must derive prepared evidence inside source-owned analysis, not individual proof-map builders or setters",
             );
         }
 
@@ -3916,7 +3883,15 @@ impl<'tcx> LateLintPass<'tcx> for R2sleighLintPass {
 
         if is_r2engine_span(cx, item.span)
             && !impl_item_is_test_only(cx, item)
-            && item.ident.name.as_str() == "clear_analysis_artifacts_for_function"
+            && matches!(
+                item.ident.name.as_str(),
+                "clear_analysis_artifacts_for_function"
+                    | "cached_artifacts"
+                    | "cached_artifacts_with_decision"
+                    | "insert_artifacts"
+                    | "cache_plan"
+                    | "cache_profile"
+            )
         {
             span_lint(
                 cx,
@@ -5015,10 +4990,6 @@ fn plugin_type_writeback_policy_expr(cx: &LateContext<'_>, expr: &Expr<'_>) -> b
                 "type_writeback_authority_report_with_policy",
                 "type_writeback_authority_report_for_policy",
                 "type_writeback_plan_report_for_policy",
-                "bounded_cfg_type_writeback_plan",
-                "bounded_cfg_type_writeback_plan_report",
-                "semantic_fallback_type_writeback_plan",
-                "semantic_fallback_type_writeback_plan_report",
                 "type_writeback_external_struct_names",
                 "type_writeback_field_access_certificate_names",
                 "writeback_var_name_is_generated",
@@ -5077,8 +5048,7 @@ fn plugin_direct_type_writeback_analysis_expr(cx: &LateContext<'_>, expr: &Expr<
         return false;
     };
     if [
-        "build_type_writeback_analysis",
-        "build_type_writeback_analysis_with_semantics",
+        "build_source_owned_type_writeback_analysis",
         "infer_local_struct_artifacts_from_ssa",
         "local_field_accesses_from_struct_artifacts",
     ]
@@ -5569,8 +5539,7 @@ fn r2dec_missing_route_defaults_to_standard_item(cx: &LateContext<'_>, item: &It
             snippet.contains("decompile_route()")
                 && (snippet.contains("SemanticRoutePlan::Standard")
                     || (snippet.contains("DecompileRouteFacts")
-                        && snippet.contains("DecompileRouteKind::FallbackComment")
-                        && snippet.contains("RenderPermission::refuse")))
+                        && snippet.contains("DecompileRouteKind::FallbackComment")))
         })
 }
 
@@ -5589,7 +5558,7 @@ fn r2dec_build_function_requires_route_item(cx: &LateContext<'_>, item: &Item<'_
                 "pub fn build_function_from_input(&self, input: &DecompilerInput) -> CFunction",
             ) && (!snippet.contains("let Some(semantic_route)")
                 || !snippet.contains("function_facts.decompile_route()")
-                || !snippet.contains("render_permission_residual_reason"))
+                || !snippet.contains("route_is_summary_boundary"))
         })
 }
 
@@ -5606,15 +5575,22 @@ fn r2dec_summary_render_route_side_channel_item(cx: &LateContext<'_>, item: &Ite
                 .map_or(snippet.as_str(), |(sig, _)| sig);
             if snippet.contains("pub fn render_semantic_worker_summary(") {
                 return signature.contains("SemanticRoutePlan")
-                    || !signature.contains("FunctionFacts")
+                    || signature.contains("FunctionFacts")
+                    || signature.contains("FunctionTypeFacts")
+                    || signature.contains("SemanticArtifactReport")
+                    || !signature.contains("DecompilerInput")
+                    || !snippet.contains("input.function_facts()")
                     || !snippet.contains("decompile_route()")
-                    || !snippet.contains("RenderPermissionKind::SummaryComment");
+                    || !snippet.contains("route_is_summary_boundary");
             }
             if snippet.contains("pub fn render_vm_semantic_summary(") {
-                return !signature.contains("FunctionFacts")
+                return signature.contains("FunctionFacts")
+                    || signature.contains("FunctionTypeFacts")
+                    || signature.contains("SemanticArtifactReport")
+                    || !signature.contains("DecompilerInput")
+                    || !snippet.contains("input.function_facts()")
                     || !snippet.contains("decompile_route()")
-                    || !snippet.contains("DecompileRouteKind::VmSummary")
-                    || !snippet.contains("RenderPermissionKind::SummaryComment");
+                    || !snippet.contains("DecompileRouteKind::VmSummary");
             }
             false
         })
@@ -6582,7 +6558,6 @@ fn plugin_engine_policy_ownership_item(cx: &LateContext<'_>, item: &Item<'_>) ->
         .span_to_snippet(item.span)
         .is_ok_and(|snippet| {
             let banned_items = [
-                "static TYPE_WRITEBACK_CACHE",
                 "fn auto_callback_policy_for_depth",
                 "fn auto_callback_plan_for_depth",
                 "fn function_exceeds_auto_callback_budget",
@@ -6591,7 +6566,6 @@ fn plugin_engine_policy_ownership_item(cx: &LateContext<'_>, item: &Item<'_>) ->
                 "fn caller_prefers_bounded_type_plan",
                 "fn analysis_policy_for_depth",
                 "fn r2sleigh_interproc_helper_scope_budget_allows",
-                "fn engine_analyze_request_with_scope_facts",
                 "pub extern \"C\" fn r2dec_function_with_context",
                 "pub extern \"C\" fn r2dec_function_with_context_scope",
                 "pub extern \"C\" fn r2dec_function_with_session_context",
@@ -6600,7 +6574,7 @@ fn plugin_engine_policy_ownership_item(cx: &LateContext<'_>, item: &Item<'_>) ->
                 "pub extern \"C\" fn r2dec_named_native_worker_summary",
                 "pub extern \"C\" fn r2dec_semantic_worker_linearization_scope_ffi",
                 "pub extern \"C\" fn r2dec_block_guard_comment_ffi",
-                "fn build_interproc_summary_set_with_scope_facts",
+                "fn build_prepared_interproc_summary_set",
                 "fn function_root_interproc_summary",
                 "pub fn interproc_root_summary",
                 "struct EngineInterprocRootSummaryRequest",
@@ -6620,9 +6594,6 @@ fn plugin_engine_policy_ownership_item(cx: &LateContext<'_>, item: &Item<'_>) ->
             banned_items.iter().any(|needle| snippet.contains(needle))
                 || (snippet.contains("fn build_function_analysis_shared_bundle")
                     && snippet.contains("EngineAnalyzeRequest::full_semantics_for_function"))
-                || (snippet.contains(
-                    "fn build_function_analysis_artifact_with_scope_context_and_scope_facts",
-                ) && snippet.contains("EngineAnalyzeRequest::full_semantics_for_function"))
                 || (snippet.contains("fn infer_signature_cc_from_analysis")
                     && snippet.contains("collect_register_type_hints"))
                 || (snippet.contains("fn recover_vars_for_ffi")
@@ -6637,6 +6608,29 @@ fn engine_artifacts_facts_side_channel_item(cx: &LateContext<'_>, item: &Item<'_
         .is_ok_and(|snippet| {
             snippet.contains("struct EngineArtifacts")
                 && (snippet.contains("semantic_artifact") || snippet.contains("route:"))
+        })
+}
+
+fn engine_whole_analysis_cache_item(cx: &LateContext<'_>, item: &Item<'_>) -> bool {
+    cx.sess()
+        .source_map()
+        .span_to_snippet(item.span)
+        .is_ok_and(|snippet| {
+            [
+                "mod cache;",
+                "struct SessionCache",
+                "struct AnalysisCache",
+                "struct EngineSessionCacheMetrics",
+                "enum CacheDecision",
+                "enum AnalysisReuse",
+                "fn cached_artifacts",
+                "fn cached_artifacts_with_decision",
+                "fn insert_artifacts",
+                "fn cache_plan",
+                "fn cache_profile",
+            ]
+            .iter()
+            .any(|needle| snippet.contains(needle))
         })
 }
 
@@ -6659,44 +6653,25 @@ fn plugin_engine_policy_ownership_expr(cx: &LateContext<'_>, expr: &Expr<'_>) ->
                 "compile_summary_dense_worker_artifact_from_interproc_summary",
                 "compile_semantic_artifact_default_with_scope",
                 "augment_semantic_artifact_with_interproc_summary",
-                "build_semantic_type_fallback_plan",
-                "guarded_worker_summary",
-                "function_semantic_summary_seed_for_name",
-                "function_semantic_summary_seed_for_name_with_linkage",
-                "has_native_worker_summary_family",
-                "render_direct_named_native_worker_summary",
                 "decompile_route_decision",
                 "function_analysis_report_payload_from_type_response",
                 "auto_callback_plan_for_policy",
-                "build_interproc_summary_set_with_scope_facts",
-                "solve_interproc_summary_set",
+                "build_prepared_interproc_summary_set",
+                "solve_prepared_interproc_summary_set",
                 "full_semantics",
                 "from_compile_missing_semantics",
-                "should_use_direct_named_native_worker_decompile",
-                "should_use_direct_named_native_worker_type_projection",
             ]
             .iter()
             .any(|name| expr_path_last_segment_is(callee, name))
         }
-        ExprKind::MethodCall(method, _, _, _) => {
-            matches!(
-                method.ident.as_str(),
-                "decompile_summary" | "decompile_summary_preprobe" | "type_function"
-            )
-        }
+        ExprKind::MethodCall(method, _, _, _) => method.ident.as_str() == "type_function",
         ExprKind::Struct(qpath, fields, _) => {
             (qpath_last_segment_is(qpath, "EngineTypeAnalysisRequest")
                 && fields
                     .iter()
                     .any(|field| field.ident.name.as_str() == "caller_prefers_bounded_type_plan"))
-                || (qpath_last_segment_is(qpath, "EngineSummaryDecompileRequest")
-                    && fields
-                        .iter()
-                        .any(|field| field.ident.name.as_str() == "fallback_comment"))
-                || qpath_last_segment_is(qpath, "EngineDetachedSemanticWorkerSummaryRequest")
                 || qpath_last_segment_is(qpath, "EngineAnalyzeRequestParts")
                 || qpath_last_segment_is(qpath, "EngineAnalyzeRequest")
-                || qpath_last_segment_is(qpath, "EngineSummaryPreprobeRequest")
         }
         ExprKind::Path(_) => {
             cx.sess()
@@ -6705,7 +6680,6 @@ fn plugin_engine_policy_ownership_expr(cx: &LateContext<'_>, expr: &Expr<'_>) ->
                 .is_ok_and(|snippet| {
                     snippet.ends_with("EngineSemanticMode::Full")
                         || snippet.ends_with("EngineSemanticMode::Optional")
-                        || snippet.ends_with("EngineSemanticRoutePlan")
                 })
         }
         _ => false,
@@ -6780,14 +6754,18 @@ fn engine_decompile_facts_spine_ownership_item(cx: &LateContext<'_>, item: &Item
     let Ok(snippet) = cx.sess().source_map().span_to_snippet(item.span) else {
         return false;
     };
-    if snippet.contains("fn attach_prepared_decompile_evidence(") {
-        return false;
-    }
     [
         ".set_callee_resolution(",
         ".set_callsites(",
         ".set_call_results(",
+        ".set_call_render(",
         ".set_control(",
+        ".set_render(",
+        ".set_semantics(",
+        ".set_decompile_route(",
+        ".apply_decompile_type_override(",
+        ".attach_prepared_decompile_evidence(",
+        ".populate_certified_",
     ]
     .iter()
     .any(|needle| snippet.contains(needle))
@@ -6962,37 +6940,16 @@ fn engine_decompile_route_type_facts_side_channel_item(
         && snippet.contains("type_facts:")
 }
 
-fn engine_decompiler_input_route_replan_side_channel_item(
+fn engine_decompiler_input_requires_source_owner_item(
     cx: &LateContext<'_>,
     item: &Item<'_>,
 ) -> bool {
     let Ok(snippet) = cx.sess().source_map().span_to_snippet(item.span) else {
         return false;
     };
-    if snippet.contains("fn decompiler_input_from_prepared_facts")
-        && (snippet.contains("decompile_route_decision(")
-            || snippet.contains("decompiler_context_with_route_decision("))
-    {
-        return true;
-    }
-    if !snippet.contains("fn decompile_function") {
-        return false;
-    }
-    let Some(facts_at) = snippet.find("function_facts_for_decompile(") else {
-        return false;
-    };
-    snippet[facts_at..].contains("decompile_route_decision(")
-}
-
-fn engine_decompiler_input_helper_not_test_support_only_item(
-    cx: &LateContext<'_>,
-    item: &Item<'_>,
-) -> bool {
-    let Ok(snippet) = cx.sess().source_map().span_to_snippet(item.span) else {
-        return false;
-    };
-    snippet.contains("pub fn decompiler_input_from_prepared_facts")
-        && !snippet.contains("#[cfg(test)]")
+    snippet.contains("fn decompiler_input_from_prepared_facts")
+        || snippet.contains(".stamp_decompile_route(")
+        || snippet.contains(".into_source_owned_facts(")
 }
 
 fn r2dec_decompiler_context_route_side_channel_item(cx: &LateContext<'_>, item: &Item<'_>) -> bool {
@@ -8353,7 +8310,7 @@ fn r2engine_decompile_response_exposes_function_facts_not_route_decision() {
 
     assert!(
         body.contains("pub function_facts: FunctionFacts"),
-        "EngineDecompileResponse must return the stamped FunctionFacts spine"
+        "EngineDecompileResponse may expose only the immutable source-owned facts projection"
     );
     assert!(
         !body.contains("pub decision: EngineRouteDecision"),
@@ -8362,53 +8319,46 @@ fn r2engine_decompile_response_exposes_function_facts_not_route_decision() {
 }
 
 #[test]
-fn r2engine_decompile_does_not_replan_after_functionfacts_stamping() {
+fn r2engine_decompile_consumes_source_owned_finalization_once() {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../..")
         .join("crates/r2engine/src/lib.rs");
     let source = std::fs::read_to_string(&path)
         .unwrap_or_else(|err| panic!("failed to read {}: {err}", path.display()));
-    let start = source
-        .find("fn decompile(&self, request: EngineDecompileRequest)")
-        .unwrap_or_else(|| panic!("missing EngineSession::decompile"));
-    let end = source[start..]
-        .find("\n    pub fn symbolic_summary")
-        .map(|offset| start + offset)
-        .unwrap_or_else(|| panic!("missing method after EngineSession::decompile"));
-    let body = &source[start..end];
+    let production = source
+        .split("\n#[cfg(test)]\nmod tests {")
+        .next()
+        .expect("r2engine production source prefix");
+    let decompile_function = source_between(
+        production,
+        "pub(crate) fn decompile_function(",
+        "pub fn decompile_function_from_input(",
+    );
 
     assert!(
-        body.contains("decompile_diagnostics_from_function_facts(&request.function_facts)"),
-        "EngineSession::decompile must derive diagnostics from stamped FunctionFacts"
+        decompile_function.contains("let EngineAnalysisArtifact {")
+            && decompile_function.contains("type_analysis,")
+            && decompile_function.contains("type_analysis.finalize_for_decompile(finalization)"),
+        "EngineSession::decompile_function must consume its retained type analysis"
+    );
+    assert_eq!(
+        production
+            .matches(".finalize_for_decompile(finalization)")
+            .count(),
+        1,
+        "r2engine must have exactly one consuming decompile finalization"
     );
     for forbidden in [
-        "plan_decompile_request(",
-        "decompile_route_facts_from_decision(",
-        "set_decompile_route(",
-        "EngineTypedRouteDecision::Decompile",
+        "decompiler_input_from_prepared_facts",
+        ".stamp_decompile_route(",
+        ".into_source_owned_facts(",
+        "response_function_facts.set_",
     ] {
         assert!(
-            !body.contains(forbidden),
-            "EngineSession::decompile must not replan or restamp the facts-owned decompile route: {forbidden:?}"
+            !production.contains(forbidden),
+            "r2engine must not reconstruct or mutate source-owned facts after sealing: {forbidden:?}"
         );
     }
-
-    let facts_start = source
-        .find("pub fn function_facts_for_decompile(")
-        .unwrap_or_else(|| panic!("missing function_facts_for_decompile"));
-    let facts_end = source[facts_start..]
-        .find("\n#[cfg(test)]")
-        .map(|offset| facts_start + offset)
-        .unwrap_or_else(|| panic!("missing function_facts_for_decompile end marker"));
-    let facts_body = &source[facts_start..facts_end];
-    assert!(
-        facts_body.contains("if function_facts.decompile_route().is_none()"),
-        "function_facts_for_decompile must preserve an already stamped FunctionFacts route"
-    );
-    assert!(
-        !facts_body.contains("function_facts.set_decompile_route(Some(route_decision.route.clone()));\n    function_facts"),
-        "function_facts_for_decompile must not unconditionally overwrite a stamped route"
-    );
 }
 
 #[test]
@@ -8501,8 +8451,8 @@ fn r2plugin_renderer_dependency_stays_deleted() {
         .next()
         .unwrap_or(manifest.as_str());
     assert!(
-        !manifest.contains("r2dec = { path = \"../crates/r2dec\" }"),
-        "r2plugin must not depend on renderer/decompiler directly, even in dev-dependencies"
+        !dependencies.contains("r2dec = { path = \"../crates/r2dec\" }"),
+        "r2plugin production dependencies must not include renderer/decompiler"
     );
     for forbidden in ["features = [\"dec\"]"] {
         assert!(
@@ -8573,7 +8523,7 @@ fn r2dec_certified_render_context_uses_function_render_facts_for_exprs_and_retur
 }
 
 #[test]
-fn r2dec_certified_return_expr_uses_functionfacts_not_prepared_or_visible_fallbacks() {
+fn r2dec_certified_return_expr_uses_exact_prepared_and_render_facts() {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../..")
         .join("crates/r2dec/src/fold/op_lower/mod.rs");
@@ -8585,15 +8535,17 @@ fn r2dec_certified_return_expr_uses_functionfacts_not_prepared_or_visible_fallba
         .unwrap_or_else(|| panic!("missing {start_marker} in {}", path.display()));
     let rest = &source[start..];
     let end = rest
-        .find("fn certified_return_expr_contains_raw_storage_name")
+        .find("fn certified_expr_for_prepared_var")
         .unwrap_or_else(|| panic!("missing certified return helper end marker"));
     let body = &rest[..end];
 
     for required in [
-        "self.certified_call_result_fact_for_value(value)",
-        "self.render_certified_memory_expr_for_fact(",
+        ".call_result_certificate_for_value(value)",
+        "result.relation.is_identity()",
+        "self.certified_call_result_expr_for_value(value)",
+        "self.certified_structural_expr_for_value(value, 0, &mut BTreeSet::new())",
         "self.certified_const_expr(var)",
-        "proof.expression_is_renderable(value)",
+        "self.render_certified_value_expr_for_var(var)",
     ] {
         assert!(
             body.contains(required),
@@ -8605,7 +8557,6 @@ fn r2dec_certified_return_expr_uses_functionfacts_not_prepared_or_visible_fallba
         "prepared_semantic_view",
         "owner_expr_for_value_id",
         "owner_expr_for_var",
-        "prepared_canonical_value_root",
         "stack_reload_certificate_for_value",
         "render_memory_access_from_visible_expr",
         "memory_certificate_for_op_site",
@@ -8655,7 +8606,7 @@ fn r2dec_runtime_type_inference_does_not_seed_raw_function_names() {
 }
 
 #[test]
-fn r2dec_internal_decompile_requires_prepared_artifact() {
+fn r2dec_internal_decompile_requires_source_owned_input() {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../..")
         .join("crates/r2dec/src/lib.rs");
@@ -8672,10 +8623,12 @@ fn r2dec_internal_decompile_requires_prepared_artifact() {
     let body = &rest[..end];
 
     assert!(
-        body.contains("prepared: &r2ssa::SsaArtifact"),
-        "build_function_internal must require prepared SsaArtifact evidence by type"
+        body.contains("input: &DecompilerInput")
+            && body.contains("let prepared = input.prepared_ssa();"),
+        "build_function_internal must derive prepared SSA from exact source-owned DecompilerInput"
     );
     for forbidden in [
+        "prepared: &r2ssa::SsaArtifact",
         "prepared: Option<&r2ssa::SsaArtifact>",
         "prepared.is_some()",
         "prepared.expect(",
@@ -9133,42 +9086,30 @@ fn r2dec_certified_member_render_uses_function_render_facts() {
         "certified member rendering should still require type-layout field certificates"
     );
 
-    let lib_path = root.join("crates/r2dec/src/lib.rs");
-    let lib = std::fs::read_to_string(&lib_path)
-        .unwrap_or_else(|err| panic!("failed to read {}: {err}", lib_path.display()));
-    let verifier_marker = "fn proved_member_access_counts";
-    let verifier_start = lib
-        .find(verifier_marker)
-        .unwrap_or_else(|| panic!("missing {verifier_marker} in {}", lib_path.display()));
-    let verifier_rest = &lib[verifier_start..];
-    let verifier_end = verifier_rest
-        .find("fn collect_certified_stmt_contract")
-        .unwrap_or_else(|| {
-            panic!("missing collect_certified_stmt_contract after {verifier_marker}")
-        });
-    let verifier = &verifier_rest[..verifier_end];
-
-    assert!(
-        verifier.contains("effect_render_proofs")
-            && verifier.contains("memory_access_for_op")
-            && verifier.contains("proof.address")
-            && verifier.contains("proof.value")
-            && verifier.contains("member_accesses_by_op")
-            && verifier.contains("field_name.to_ascii_lowercase()"),
-        "certified output verifier must compare rendered member names to emitted memory proofs tied to FunctionRenderFacts member proofs"
-    );
+    let aggregate_path = root.join("crates/r2dec/src/semantic_aggregate_function.rs");
+    let aggregate = std::fs::read_to_string(&aggregate_path)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", aggregate_path.display()));
+    for required in [
+        "pub fn from_artifact(\n        trusted: &TrustedSsaArtifact,",
+        "CertifiedMemorySemanticCFunction::from_artifact_for_typed_layer(trusted)?",
+        "CertifiedMachineProjection::from_artifact(trusted)?",
+        "certificate.origin() != memory_origin",
+        "every memory statement must have exactly one aggregate certificate",
+        "aggregate accesses mix revision, base parameter, or layout authority",
+    ] {
+        assert!(
+            aggregate.contains(required),
+            "typed aggregate rendering must preserve exact source-owned member authority {required:?}"
+        );
+    }
     for forbidden in [
-        "render_facts.member_accesses_by_op.values().flatten()",
-        "certified_layout_field_names",
-        "first_uncertified_return_field_member",
-        "field_access_certificates",
-        "certified_names",
+        "fn proved_member_access_counts",
         "certified_count >= counts.field_accesses",
         "certified_count >= counts.return_field_members",
     ] {
         assert!(
-            !verifier.contains(forbidden),
-            "certified output verifier must not bless field syntax from name-only/type-only proof {forbidden:?}"
+            !aggregate.contains(forbidden),
+            "typed aggregate rendering must not restore generic proof-counter authority {forbidden:?}"
         );
     }
 }
@@ -9273,33 +9214,17 @@ fn r2dec_certified_array_and_semantic_render_do_not_use_aggregate_or_pretty_fall
     let lib_path = root.join("crates/r2dec/src/lib.rs");
     let lib = std::fs::read_to_string(&lib_path)
         .unwrap_or_else(|err| panic!("failed to read {}: {err}", lib_path.display()));
-    let verifier_marker = "fn array_accesses_are_certified";
-    let verifier_start = lib
-        .find(verifier_marker)
-        .unwrap_or_else(|| panic!("missing {verifier_marker} in {}", lib_path.display()));
-    let verifier_rest = &lib[verifier_start..];
-    let verifier_end = verifier_rest
-        .find("fn field_accesses_are_certified")
-        .unwrap_or_else(|| panic!("missing field_accesses_are_certified after {verifier_marker}"));
-    let verifier = &verifier_rest[..verifier_end];
-    assert!(
-        verifier.contains("effect_render_proofs")
-            && verifier.contains("memory_access_for_op")
-            && verifier.contains("proof.address")
-            && verifier.contains("proof.value")
-            && verifier.contains("array_accesses_by_op")
-            && verifier.contains("array.access == memory.access"),
-        "array rendering must be certified from emitted memory proofs tied to exact FunctionRenderFacts array-access proof"
-    );
     for forbidden in [
+        "fn array_accesses_are_certified",
+        "fn field_accesses_are_certified",
         "array_index_certificates",
         "certified_array_indexes",
         "certified_array_field_names",
         "certified_count >= counts.array_accesses",
     ] {
         assert!(
-            !verifier.contains(forbidden),
-            "array render verification must not use aggregate/type-only proof {forbidden:?}"
+            !lib.contains(forbidden),
+            "generic Standard rendering must not restore aggregate/type-only proof authority {forbidden:?}"
         );
     }
 }
@@ -9358,8 +9283,8 @@ fn r2dec_certified_branch_condition_refuses_without_functionfacts_comparison() {
     for required in [
         "self.control_facts()?.branch_for_block(block.addr)?",
         "predicate.condition",
-        ".comparison",
-        "self.prepared_compare_provenance_expr(comparison)",
+        ".prepared_predicate_comparison_at_block(predicate, block.addr)",
+        "self.prepared_compare_provenance_expr(comparison, Some(block.addr))",
     ] {
         assert!(
             body.contains(required),
@@ -9452,7 +9377,8 @@ fn r2dec_certified_branch_comparison_operands_use_render_facts_only() {
     );
     assert!(
         prepared_compare.contains("if self.requires_certified_rendering()")
-            && prepared_compare.contains("return self.certified_compare_provenance_expr(prov);"),
+            && prepared_compare
+                .contains("return self.certified_compare_provenance_expr(prov, block_addr);"),
         "prepared comparison rendering must delegate to certified comparison renderer in certified mode"
     );
 
@@ -9464,8 +9390,8 @@ fn r2dec_certified_branch_comparison_operands_use_render_facts_only() {
     for required in [
         "self.prepared_var_for_value_id(prov.lhs)",
         "self.prepared_var_for_value_id(prov.rhs)",
-        "self.certified_predicate_operand_expr(lhs_var, compare_width)",
-        "self.certified_predicate_operand_expr(rhs_var, compare_width)",
+        "self.certified_predicate_operand_expr(lhs_var, compare_width, block_addr)",
+        "self.certified_predicate_operand_expr(rhs_var, compare_width, block_addr)",
         "self.compare_provenance_expr_from_operands(prov, lhs, rhs)",
     ] {
         assert!(
@@ -9815,7 +9741,6 @@ fn r2engine_decompile_raw_request_stays_private() {
     for required in [
         "pub fn single_function(",
         "pub fn with_input_quality(",
-        "scope_facts: InterprocScopeFacts::empty()",
         "interproc_max_iterations: 1",
         "symbolic_scope: None",
     ] {
@@ -9844,43 +9769,70 @@ fn r2engine_decompile_raw_request_stays_private() {
     }
 }
 
-#[test]
-fn r2engine_raw_decompiler_input_helper_is_test_only() {
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
-    let engine_manifest_path = root.join("crates/r2engine/Cargo.toml");
-    let plugin_manifest_path = root.join("r2plugin/Cargo.toml");
-    let engine_path = root.join("crates/r2engine/src/lib.rs");
-    let engine_manifest = std::fs::read_to_string(&engine_manifest_path)
-        .unwrap_or_else(|err| panic!("failed to read {}: {err}", engine_manifest_path.display()));
-    let plugin_manifest = std::fs::read_to_string(&plugin_manifest_path)
-        .unwrap_or_else(|err| panic!("failed to read {}: {err}", plugin_manifest_path.display()));
-    let engine_source = std::fs::read_to_string(&engine_path)
-        .unwrap_or_else(|err| panic!("failed to read {}: {err}", engine_path.display()));
+#[cfg(test)]
+fn source_between<'a>(source: &'a str, marker: &str, end_marker: &str) -> &'a str {
+    let start = source
+        .find(marker)
+        .unwrap_or_else(|| panic!("missing source item {marker:?}"));
+    let rest = &source[start..];
+    let end = rest
+        .find(end_marker)
+        .unwrap_or_else(|| panic!("missing source boundary {end_marker:?} after {marker:?}"));
+    &rest[..end]
+}
 
-    for (label, source) in [
-        ("r2engine manifest", engine_manifest.as_str()),
-        ("r2plugin manifest", plugin_manifest.as_str()),
-        ("r2engine source", engine_source.as_str()),
+#[test]
+fn r2dec_summary_renderers_require_source_owned_input() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+    let dec_path = root.join("crates/r2dec/src/lib.rs");
+    let dec_source = std::fs::read_to_string(&dec_path)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", dec_path.display()));
+    let production = dec_source
+        .split("\n#[cfg(test)]\nmod tests {")
+        .next()
+        .expect("r2dec production source prefix");
+
+    for function in [
+        "pub fn render_semantic_worker_summary(",
+        "pub fn render_vm_semantic_summary(",
     ] {
+        let start = production
+            .find(function)
+            .unwrap_or_else(|| panic!("missing source-owned summary renderer {function:?}"));
+        let rest = &production[start..];
+        let signature_end = rest
+            .find('{')
+            .unwrap_or_else(|| panic!("missing renderer body for {function:?}"));
+        let signature = &rest[..signature_end];
         assert!(
-            !source.contains("decompiler-input-test-support"),
-            "{label} must not expose the deleted raw decompiler input test-support feature"
+            signature.contains("&DecompilerInput"),
+            "{function} must require exact source-owned DecompilerInput"
+        );
+        for forbidden in [
+            "FunctionFacts",
+            "FunctionTypeFacts",
+            "SemanticArtifactReport",
+            "SemanticRoutePlan",
+        ] {
+            assert!(
+                !signature.contains(forbidden),
+                "{function} must not accept detached authority {forbidden:?}"
+            );
+        }
+        let body_end = if function.contains("render_vm_semantic_summary") {
+            "pub fn render_semantic_worker_summary("
+        } else {
+            "fn append_summary_return_if_needed("
+        };
+        let body = source_between(rest, function, body_end);
+        assert!(
+            body.contains("input.function_facts()")
+                && body.contains("decompile_route()")
+                && (body.contains("route_is_summary_boundary")
+                    || body.contains("DecompileRouteKind::VmSummary")),
+            "{function} must derive summary permission from its exact owner"
         );
     }
-
-    let helper_start = engine_source
-        .find("pub fn decompiler_input_from_prepared_facts")
-        .unwrap_or_else(|| panic!("missing decompiler_input_from_prepared_facts test helper"));
-    let helper_prefix_start = helper_start.saturating_sub(64);
-    let helper_prefix = &engine_source[helper_prefix_start..helper_start];
-    assert!(
-        helper_prefix.contains("#[cfg(test)]"),
-        "raw r2dec::DecompilerInput assembly helper must be cfg(test)-only"
-    );
-    assert!(
-        !helper_prefix.contains("feature ="),
-        "raw r2dec::DecompilerInput assembly helper must not be feature-gated into production"
-    );
 }
 
 #[test]
@@ -9914,9 +9866,15 @@ fn r2engine_whole_analysis_and_render_caches_are_absent() {
     for forbidden in [
         "mod cache;",
         "SessionCache<",
+        "struct AnalysisCache",
+        "EngineSessionCacheMetrics",
         "analysis_cache:",
         "cached_analysis",
         "insert_analysis",
+        "cache_plan",
+        "cache_profile",
+        "AnalysisReuse::Reused",
+        "function_analysis_identity",
         "pub use cache::{CacheCounters, EngineSessionCacheMetrics, SessionCache}",
         "pub use cache::SessionCache",
         "pub fn cached_artifacts",
@@ -9967,6 +9925,380 @@ fn r2engine_whole_analysis_and_render_caches_are_absent() {
                 "{label} must not use r2engine render/cache internals: {forbidden:?}"
             );
         }
+    }
+}
+
+#[test]
+fn source_owned_type_analysis_is_the_only_authoritative_builder() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+    let engine_path = root.join("crates/r2engine/src/lib.rs");
+    let types_lib_path = root.join("crates/r2types/src/lib.rs");
+    let types_function_facts_path = root.join("crates/r2types/src/function_facts.rs");
+    let types_writeback_path = root.join("crates/r2types/src/writeback.rs");
+    let dec_lib_path = root.join("crates/r2dec/src/lib.rs");
+    let dec_variable_path = root.join("crates/r2dec/src/variable.rs");
+    let sym_compiler_path = root.join("crates/r2sym/src/semantics/compiler.rs");
+    let sym_facts_path = root.join("crates/r2sym/src/semantics/facts.rs");
+    let plugin_lib_path = root.join("r2plugin/src/lib.rs");
+    let plugin_types_path = root.join("r2plugin/src/types.rs");
+    let engine = std::fs::read_to_string(&engine_path)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", engine_path.display()));
+    let types_lib = std::fs::read_to_string(&types_lib_path)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", types_lib_path.display()));
+    let types_function_facts =
+        std::fs::read_to_string(&types_function_facts_path).unwrap_or_else(|err| {
+            panic!(
+                "failed to read {}: {err}",
+                types_function_facts_path.display()
+            )
+        });
+    let types_writeback = std::fs::read_to_string(&types_writeback_path)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", types_writeback_path.display()));
+    let dec_lib = std::fs::read_to_string(&dec_lib_path)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", dec_lib_path.display()));
+    let dec_variable = std::fs::read_to_string(&dec_variable_path)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", dec_variable_path.display()));
+    let sym_compiler = std::fs::read_to_string(&sym_compiler_path)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", sym_compiler_path.display()));
+    let sym_facts = std::fs::read_to_string(&sym_facts_path)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", sym_facts_path.display()));
+    let plugin_lib = std::fs::read_to_string(&plugin_lib_path)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", plugin_lib_path.display()));
+    let plugin_types = std::fs::read_to_string(&plugin_types_path)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", plugin_types_path.display()));
+    let engine_production = engine
+        .split("\n#[cfg(test)]\nmod tests {")
+        .next()
+        .expect("r2engine production source prefix");
+    let types_function_facts_production = types_function_facts
+        .split("\n#[cfg(test)]\nmod tests {")
+        .next()
+        .expect("r2types FunctionFacts production source prefix");
+    let types_writeback_production = types_writeback
+        .split("\n#[cfg(test)]\nmod tests {")
+        .next()
+        .expect("r2types writeback production source prefix");
+    let source_owned_struct = source_between(
+        types_function_facts_production,
+        "pub struct SourceOwnedFunctionFacts",
+        "impl SourceOwnedFunctionFacts",
+    );
+    let source_owned_impl = source_between(
+        types_function_facts_production,
+        "impl SourceOwnedFunctionFacts",
+        "impl FunctionFacts",
+    );
+    let type_analysis_struct = source_between(
+        types_writeback_production,
+        "pub struct TypeWritebackAnalysis",
+        "pub struct DecompileFinalization",
+    );
+    let type_analysis_impl = source_between(
+        types_writeback_production,
+        "impl TypeWritebackAnalysis",
+        "pub enum TypeWritebackAnalysisError",
+    );
+    let engine_artifact_struct = source_between(
+        engine_production,
+        "pub struct EngineAnalysisArtifact",
+        "impl EngineAnalysisArtifact",
+    );
+    let engine_artifact_impl = source_between(
+        engine_production,
+        "impl EngineAnalysisArtifact",
+        "pub enum EngineSemanticMode",
+    );
+    let engine_type_response_struct = source_between(
+        engine_production,
+        "pub struct EngineTypeAnalysisResponse",
+        "impl EngineTypeAnalysisResponse",
+    );
+    let engine_decompile_runtime = source_between(
+        engine_production,
+        "fn decompile_with_r2dec_control_and_kernel_policy",
+        "fn render_engine_decompile_request",
+    );
+
+    for required in [
+        "r2types::TypeWritebackAnalysisRequest::new(",
+        ".with_semantic_artifact(semantic_artifact)",
+        ".with_interproc_summary(interproc_summary_set)",
+        "r2types::build_source_owned_type_writeback_analysis(writeback_request)",
+        "r2ssa::solve_prepared_interproc_summary_set(",
+    ] {
+        assert!(
+            engine.contains(required),
+            "r2engine must retain the single bound-owner analysis path: {required:?}"
+        );
+    }
+    assert_eq!(
+        engine_production
+            .matches("r2types::build_source_owned_type_writeback_analysis(")
+            .count(),
+        1,
+        "r2engine must have exactly one authoritative source-owned type-analysis builder call"
+    );
+    assert!(
+        types_lib.contains("build_source_owned_type_writeback_analysis,"),
+        "r2types must export the source-owned type-analysis builder"
+    );
+    assert!(
+        types_lib.contains("SourceOwnedFunctionFacts")
+            && types_function_facts.contains("pub struct SourceOwnedFunctionFacts")
+            && types_function_facts.contains("pub(crate) fn seal(")
+            && types_function_facts.contains("pub(crate) fn with_prepared_interproc_summary(")
+            && types_function_facts.contains("pub(crate) fn set_semantics("),
+        "r2types must expose one opaque owner while semantic/interproc attachment remains crate-private"
+    );
+    assert!(
+        source_owned_struct.contains("source: Arc<r2ssa::SsaArtifact>")
+            && source_owned_struct.contains("report: FunctionFacts")
+            && !source_owned_struct.contains("pub source:")
+            && !source_owned_struct.contains("pub report:")
+            && !source_owned_struct.contains("Serialize")
+            && !source_owned_struct.contains("Deserialize"),
+        "SourceOwnedFunctionFacts must retain private, non-deserializable exact-owner state"
+    );
+    for forbidden in [
+        "pub fn seal(",
+        "pub fn report_mut(",
+        "pub fn source_mut(",
+        "pub fn into_parts(",
+        "pub fn set_",
+        "pub fn replace_",
+        "pub fn with_",
+        "pub fn canonicalize",
+        "DerefMut",
+        "AsMut<",
+    ] {
+        assert!(
+            !source_owned_impl.contains(forbidden),
+            "sealed SourceOwnedFunctionFacts must remain immutable: {forbidden:?}"
+        );
+    }
+    assert!(
+        !types_function_facts.contains("pub fn merge_proof_coverage"),
+        "detached FunctionFacts must not expose arbitrary proof-coverage mutation"
+    );
+    for forbidden in [
+        "pub fn from_prepared(prepared: &r2ssa::SsaArtifact)",
+        "pub fn with_render(",
+        "pub fn set_render(",
+        "pub fn set_decompile_route(",
+        "pub fn attach_prepared_decompile_evidence(",
+        "pub fn populate_certified_parameter_exprs(",
+        "pub fn populate_member_access_render_facts_from_field_certificates(",
+        "pub fn populate_array_access_render_facts_from_scalar_candidates(",
+        "pub fn populate_certified_loop_carrier_types(",
+    ] {
+        assert!(
+            !types_function_facts.contains(forbidden),
+            "detached FunctionFacts source-derived mutation must stay private: {forbidden:?}"
+        );
+    }
+    for (call, expected) in [
+        (".attach_prepared_decompile_evidence(", 1usize),
+        (".populate_certified_parameter_exprs(", 1),
+        (
+            ".populate_member_access_render_facts_from_field_certificates(",
+            1,
+        ),
+        (
+            ".populate_array_access_render_facts_from_scalar_candidates(",
+            1,
+        ),
+        ("FunctionRenderFacts::from_prepared(", 1),
+    ] {
+        assert_eq!(
+            types_function_facts_production.matches(call).count(),
+            expected,
+            "source-derived FunctionFacts mutation must remain confined to the one owner path: {call:?}"
+        );
+    }
+    for call in [".set_semantics(", ".with_prepared_interproc_summary("] {
+        assert_eq!(
+            types_writeback.matches(call).count(),
+            1,
+            "semantic/interproc owner attachment must remain confined to the source-owned builder: {call:?}"
+        );
+    }
+    assert!(
+        types_writeback.contains("pub fn build_source_owned_type_writeback_analysis(")
+            && types_writeback.contains("source: Arc<SsaArtifact>")
+            && types_writeback.contains("semantic_artifact: Option<r2sym::SemanticArtifact>")
+            && types_writeback
+                .contains("interproc_summary: Option<r2ssa::PreparedInterprocSummarySet>"),
+        "the canonical r2types request must retain exact SSA, semantic, and interproc owners"
+    );
+    assert!(
+        type_analysis_struct.contains("source: Arc<SsaArtifact>")
+            && type_analysis_struct.contains("function_facts: FunctionFacts")
+            && type_analysis_struct.contains("plan: TypeWritebackPlan")
+            && !type_analysis_struct.contains("pub source:")
+            && !type_analysis_struct.contains("pub function_facts:")
+            && !type_analysis_struct.contains("pub plan:"),
+        "TypeWritebackAnalysis must retain one private source+facts+plan owner"
+    );
+    assert!(
+        type_analysis_impl.contains("pub fn finalize_for_decompile(")
+            && type_analysis_impl.contains("mut self,")
+            && !type_analysis_impl.contains("pub fn finalize_for_decompile(\n        &mut self")
+            && type_analysis_impl
+                .contains("SourceOwnedFunctionFacts::seal(self.source, self.function_facts)"),
+        "decompile finalization must consume TypeWritebackAnalysis and seal its exact owner"
+    );
+    for forbidden in [
+        "pub fn function_facts_mut(",
+        "pub fn plan_mut(",
+        "pub fn stamp_decompile_route(",
+        "pub fn into_source_owned_facts(",
+        "pub fn set_",
+        "pub fn apply_",
+    ] {
+        assert!(
+            !type_analysis_impl.contains(forbidden),
+            "TypeWritebackAnalysis must not expose detached or post-analysis mutation: {forbidden:?}"
+        );
+    }
+    assert!(
+        engine_artifact_struct.contains("type_analysis: r2types::TypeWritebackAnalysis")
+            && !engine_artifact_struct.contains("pub type_analysis:")
+            && !engine_artifact_struct.contains("function_facts: FunctionFacts")
+            && !engine_artifact_struct.contains("writeback_plan: TypeWritebackPlan"),
+        "EngineAnalysisArtifact must retain the private inseparable type-analysis owner"
+    );
+    assert!(
+        engine_artifact_impl.contains("fn new(")
+            && !engine_artifact_impl.contains("pub fn new(")
+            && engine_artifact_impl.contains("pub fn type_analysis(&self)")
+            && engine_artifact_impl.contains("-> &r2types::TypeWritebackAnalysis"),
+        "EngineAnalysisArtifact construction must stay private with read-only owner access"
+    );
+    assert!(
+        engine_type_response_struct.contains("type_analysis: r2types::TypeWritebackAnalysis")
+            && engine_type_response_struct
+                .lines()
+                .filter(|line| line.trim_start().starts_with("pub "))
+                .all(|line| line.contains("pub struct EngineTypeAnalysisResponse")),
+        "EngineTypeAnalysisResponse owner and projection fields must remain private"
+    );
+    assert!(
+        !engine_decompile_runtime.contains(".set_"),
+        "runtime decompile must not mutate a FunctionFacts projection after source-owned sealing"
+    );
+
+    for forbidden in [
+        "precomputed_semantic_artifact",
+        "InterprocScopeFacts",
+        "scope_facts",
+        "pattern_ssa_func",
+        "build_interproc_summary_set_with_scope_facts",
+        "SemanticArtifact::from_report",
+        "PreparedInterprocSummarySet::from_report",
+    ] {
+        for (label, source) in [
+            ("r2engine", engine.as_str()),
+            ("r2plugin/src/lib.rs", plugin_lib.as_str()),
+            ("r2plugin/src/types.rs", plugin_types.as_str()),
+        ] {
+            assert!(
+                !source.contains(forbidden),
+                "{label} must not reintroduce detached owner plumbing {forbidden:?}"
+            );
+        }
+    }
+
+    for forbidden in [
+        "fn decompiler_input_from_prepared_facts",
+        "pub fn function_facts_for_decompile",
+        "pub fn build_engine_analysis_from_parts",
+        "pub fn type_writeback_payload_from_parts",
+        ".stamp_decompile_route(",
+        ".into_source_owned_facts(",
+        "response_function_facts.set_",
+        ".set_callee_resolution(",
+        ".set_callsites(",
+        ".set_call_results(",
+        ".set_call_render(",
+        ".set_control(",
+        ".set_render(",
+        ".set_semantics(",
+        ".set_decompile_route(",
+        ".apply_decompile_type_override(",
+        ".attach_prepared_decompile_evidence(",
+        ".populate_certified_",
+        "EngineBoundedCfgTypeWriteback",
+        "bounded_cfg_type_writeback",
+    ] {
+        assert!(
+            !engine_production.contains(forbidden),
+            "r2engine must not reintroduce raw authority, post-seal mutation, or bounded mutation payloads: {forbidden:?}"
+        );
+    }
+
+    for forbidden in [
+        "canonicalize_function_facts",
+        "pub fn set_function_facts",
+        "pub fn recover_prepared",
+        "fn from_function_facts",
+        "fn with_function_facts",
+    ] {
+        for (label, source) in [
+            ("r2dec/src/lib.rs", dec_lib.as_str()),
+            ("r2dec/src/variable.rs", dec_variable.as_str()),
+        ] {
+            assert!(
+                !source.contains(forbidden),
+                "{label} must not split or mutate sealed source-owned evidence: {forbidden:?}"
+            );
+        }
+    }
+    assert!(
+        dec_lib.contains("pub fn new(source_owned_facts:")
+            && dec_variable.contains("pub(crate) fn recover_input("),
+        "r2dec must admit and recover through one source-owned input"
+    );
+
+    for forbidden in [
+        "solve_interproc_summary_set(",
+        "function_semantic_summary_seed_for_name",
+        "SemanticArtifact::from_report",
+        "PreparedInterprocSummarySet::from_report",
+    ] {
+        for (label, source) in [
+            ("r2sym semantic compiler", sym_compiler.as_str()),
+            ("r2sym semantic facts", sym_facts.as_str()),
+        ] {
+            assert!(
+                !source.contains(forbidden),
+                "{label} must not promote ownerless/name-derived reports: {forbidden:?}"
+            );
+        }
+    }
+
+    for forbidden in [
+        "build_type_writeback_analysis,",
+        "build_type_writeback_analysis_with_semantics,",
+        "build_semantic_type_fallback_plan,",
+        "signature_projection_for_semantic_artifact,",
+        "field_access_certificates_from_struct_artifacts,",
+    ] {
+        assert!(
+            !types_lib.contains(forbidden),
+            "r2types must not export detached report/certificate builder {forbidden:?}"
+        );
+    }
+    for forbidden in [
+        "semantic_fallback_type_writeback_plan",
+        "type_facts_with_summary_projection",
+        "build_semantic_type_fallback_plan",
+        "signature_projection_for_semantic_artifact",
+        "field_access_certificates_from_struct_artifacts",
+    ] {
+        assert!(
+            !engine.contains(forbidden),
+            "r2engine must not reconstruct type authority from detached semantic reports or certificates: {forbidden:?}"
+        );
     }
 }
 
@@ -10143,14 +10475,23 @@ fn r2sleigh_export_dec_is_residual_only_and_does_not_depend_on_r2dec() {
 }
 
 #[test]
-fn r2dec_raw_code_generator_is_not_public_api() {
+fn r2dec_raw_render_pipeline_is_not_public_api() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
     let lib_path = root.join("crates/r2dec/src/lib.rs");
     let codegen_path = root.join("crates/r2dec/src/codegen.rs");
+    let fold_path = root.join("crates/r2dec/src/fold/mod.rs");
+    let fold_context_path = root.join("crates/r2dec/src/fold/context.rs");
+    let structure_path = root.join("crates/r2dec/src/structure.rs");
     let lib_source = std::fs::read_to_string(&lib_path)
         .unwrap_or_else(|err| panic!("failed to read {}: {err}", lib_path.display()));
     let codegen_source = std::fs::read_to_string(&codegen_path)
         .unwrap_or_else(|err| panic!("failed to read {}: {err}", codegen_path.display()));
+    let fold_source = std::fs::read_to_string(&fold_path)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", fold_path.display()));
+    let fold_context_source = std::fs::read_to_string(&fold_context_path)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", fold_context_path.display()));
+    let structure_source = std::fs::read_to_string(&structure_path)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", structure_path.display()));
 
     for forbidden in [
         "pub mod codegen;",
@@ -10183,20 +10524,57 @@ fn r2dec_raw_code_generator_is_not_public_api() {
             && lib_source.contains("pub use codegen::CodeGenConfig;"),
         "r2dec should expose only configuration, not raw AST-to-C rendering"
     );
+
+    for forbidden in ["pub mod fold;", "pub use structure::{"] {
+        assert!(
+            !lib_source.contains(forbidden),
+            "r2dec must not expose raw folding or structuring outside DecompilerInput: {forbidden:?}"
+        );
+    }
+    assert!(
+        lib_source.contains("pub(crate) mod fold;")
+            && lib_source.contains("pub use fold::lower_ssa_ops_to_stmts;")
+            && lib_source.contains("pub(crate) use structure::ControlFlowStructurer;"),
+        "r2dec must keep folding/structuring internal while preserving the residual-only raw SSA export"
+    );
+    assert!(
+        !fold_source.contains("pub use context::FoldingContext;")
+            && fold_source.contains("pub(crate) use context::FoldingContext;"),
+        "FoldingContext must remain crate-private"
+    );
+    assert!(
+        !fold_context_source.contains("pub struct FoldingContext"),
+        "FoldingContext must not become a public construction seam"
+    );
+    for forbidden in [
+        "pub struct ControlFlowStructurer",
+        "pub struct ControlRenderProof",
+        "pub enum ControlRenderProofKind",
+        "pub enum ControlTransferRenderProof",
+        "pub enum ControlTransferRenderProofKind",
+    ] {
+        assert!(
+            !structure_source.contains(forbidden),
+            "raw structuring state and proof bookkeeping must remain crate-private: {forbidden:?}"
+        );
+    }
 }
 
 #[test]
-fn r2dec_certified_standard_preserves_final_ast_proof_identity() {
+fn r2dec_standard_residualizes_and_typed_output_requires_exact_seal() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
     let lib_path = root.join("crates/r2dec/src/lib.rs");
     let structure_path = root.join("crates/r2dec/src/structure.rs");
     let op_lower_path = root.join("crates/r2dec/src/fold/op_lower/mod.rs");
+    let certified_region_path = root.join("crates/r2dec/src/certified_region.rs");
     let lib_source = std::fs::read_to_string(&lib_path)
         .unwrap_or_else(|err| panic!("failed to read {}: {err}", lib_path.display()));
     let structure_source = std::fs::read_to_string(&structure_path)
         .unwrap_or_else(|err| panic!("failed to read {}: {err}", structure_path.display()));
     let op_lower_source = std::fs::read_to_string(&op_lower_path)
         .unwrap_or_else(|err| panic!("failed to read {}: {err}", op_lower_path.display()));
+    let certified_region_source = std::fs::read_to_string(&certified_region_path)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", certified_region_path.display()));
 
     assert!(
         structure_source.contains("pub(crate) fn structure_preserving_render_proof_identity"),
@@ -10247,51 +10625,30 @@ fn r2dec_certified_standard_preserves_final_ast_proof_identity() {
         .unwrap_or_else(|| panic!("missing build_function_internal end marker"));
     let render_body = &render_rest[..render_end];
     for required in [
-        "if route_is_standard(semantic_route) && !certified_rendering_required",
-        "Standard executable rendering requires engine-owned CertifiedC permission",
-        "certified_standard_mode && route_is_standard(semantic_route)",
-        "signature_has_complete_render_param_types(signature)",
-        "structurer.structure_preserving_render_proof_identity()",
-        "if !certified_standard_mode && route_is_standard(semantic_route)",
-        "fold_ctx.normalize_final_stmt_calls(body_stmt)",
-        "fold_ctx.prune_duplicate_call_statements_by_source(&mut c_function.body)",
-        "if !certified_standard_mode {",
-        "prune_dead_temp_assignments_in_function_body(&mut c_function, &fold_ctx)",
+        "input: &'a DecompilerInput",
+        "let prepared = input.prepared_ssa();",
+        "if route_is_standard(semantic_route)",
+        "Standard executable rendering is unavailable; r2cert typed-region authorization is required",
+        "return Ok(residual_function_for_render_boundary(&func_name, reason));",
     ] {
         assert!(
             render_body.contains(required),
             "certified Standard render path must keep post-proof mutations out of certified mode: {required:?}"
         );
     }
-    let validator_start = lib_source
-        .find("fn certified_standard_output_residual_reason_with_effect_proofs")
-        .unwrap_or_else(|| panic!("missing certified Standard output validator"));
-    let validator_rest = &lib_source[validator_start..];
-    let validator_end = validator_rest
-        .find("\nfn expression_proof_is_materialized_phi_copy")
-        .unwrap_or_else(|| panic!("missing certified Standard output validator end marker"));
-    let validator_body = &validator_rest[..validator_end];
-    for forbidden in [
-        "proof_counts.returns.max(render_facts.returns_by_op.len())",
-        "raw_memory_proofs.max(render_facts.memory_accesses.len())",
-    ] {
-        assert!(
-            !validator_body.contains(forbidden),
-            "certified final-output validation must count emitted effect proofs, not global source facts: {forbidden:?}"
-        );
-    }
     for required in [
-        "certified_control_transfer_residual_reason(func)",
-        "CStmt::Break => Some(format!(",
-        "CStmt::Continue => Some(format!(",
-        "CStmt::Goto(label) => Some(format!(",
-        "unproved switch case fallthrough",
-        "unproved switch default fallthrough",
-        "certified_stmt_list_is_terminal(&case.body)",
+        "pub struct CertifiedTypedOutputSeal",
+        "fn exact_typed_output_manifest",
+        "actual != expected",
+        "mappings.len() != expected.len()",
+        "counts.values().any(|count| *count != 1)",
+        "pub(crate) fn new<'a>(",
+        "pub(crate) fn matches_region<'a>(",
+        "ledger_closure.matches_ledger(",
     ] {
         assert!(
-            lib_source.contains(required),
-            "certified final-output validation must reject unproved control transfers and switch fallthrough: {required:?}"
+            certified_region_source.contains(required),
+            "typed executable output must require an exact source-owned seal: {required:?}"
         );
     }
     for forbidden in [
@@ -10307,40 +10664,19 @@ fn r2dec_certified_standard_preserves_final_ast_proof_identity() {
             "certified Standard render path must not mutate final AST after proof capture: {forbidden:?}"
         );
     }
-    let params_start = lib_source
-        .find("fn params_from_authorized_signature")
-        .unwrap_or_else(|| panic!("missing params_from_authorized_signature"));
-    let params_rest = &lib_source[params_start..];
-    let params_end = params_rest
-        .find("\nfn signature_has_complete_render_param_types")
-        .unwrap_or_else(|| panic!("missing params_from_authorized_signature end marker"));
-    let params_body = &params_rest[..params_end];
-    assert!(
-        !params_body.contains("CType::Unknown"),
-        "certified render-authorized signature params must not silently materialize unknown C types"
-    );
-
-    assert!(
-        !op_lower_source.contains("fn prune_duplicate_tail_call_statements"),
-        "certified tail-call pruning deleted executable calls after proof capture and must stay removed"
-    );
-    assert!(
-        !op_lower_source.contains("fn certified_unique_scalar_stack_return_expr"),
-        "certified stack-return recovery is a renderer-side repair and must stay deleted"
-    );
-    let duplicate_start = op_lower_source
-        .find("fn duplicate_pruning_source_for_call_expr")
-        .unwrap_or_else(|| panic!("missing duplicate pruning helper"));
-    let duplicate_rest = &op_lower_source[duplicate_start..];
-    let duplicate_end = duplicate_rest
-        .find("\n    fn collect_certified_rendered_call_sources_for_stmt")
-        .unwrap_or_else(|| panic!("missing duplicate pruning helper end"));
-    let duplicate_body = &duplicate_rest[..duplicate_end];
-    assert!(
-        duplicate_body.contains("self.requires_certified_rendering()")
-            && duplicate_body.contains("None"),
-        "duplicate-call pruning must fail closed in certified rendering"
-    );
+    for forbidden in [
+        "fn params_from_authorized_signature",
+        "fn signature_has_complete_render_param_types",
+        "fn certified_standard_output_residual_reason_with_effect_proofs",
+        "fn prune_duplicate_tail_call_statements",
+        "fn certified_unique_scalar_stack_return_expr",
+        "fn duplicate_pruning_source_for_call_expr",
+    ] {
+        assert!(
+            !lib_source.contains(forbidden) && !op_lower_source.contains(forbidden),
+            "retired generic Standard repair/authorization helper must stay deleted: {forbidden:?}"
+        );
+    }
 }
 
 #[test]
@@ -10407,8 +10743,10 @@ fn r2plugin_auto_callbacks_do_not_own_policy_in_c() {
     let callbacks = &source[callback_start..callback_end];
 
     assert!(
-        source.contains(concat!("r2sleigh_", "auto_callback_plan_for_depth")),
-        "C callbacks must ask r2engine-owned auto-callback policy through FFI"
+        source.contains("static R2SleighAutoCallbackPlanV2 sleigh_v2_query_auto_callback")
+            && source.contains("sleigh_v2_planner_query (R2SLEIGH_PLANNER_AUTO_CALLBACK_V2")
+            && source.contains("return response.auto_callback;"),
+        "C callbacks must ask r2engine-owned auto-callback policy through the typed planner query"
     );
 
     for forbidden in [
@@ -10539,17 +10877,12 @@ fn r2plugin_session_debug_command_family_and_abi_stay_deleted() {
 fn r2plugin_legacy_debug_command_redirects_stay_deleted() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
     let c_path = root.join("r2plugin/r_anal_sleigh.c");
-    let r2r_path = root.join("tests/r2r/db/extras/r2sleigh_integration_extended");
     let c_source = std::fs::read_to_string(&c_path)
         .unwrap_or_else(|err| panic!("failed to read {}: {err}", c_path.display()));
-    let r2r_source = std::fs::read_to_string(&r2r_path)
-        .unwrap_or_else(|err| panic!("failed to read {}: {err}", r2r_path.display()));
 
     for required in [
         "static bool sleigh_direct_sla_debug_only_command",
-        "static bool sleigh_direct_sym_debug_only_command",
         "sleigh_direct_sla_debug_only_command (cmd)",
-        "sleigh_direct_sym_debug_only_command (cmd)",
     ] {
         assert!(
             c_source.contains(required),
@@ -10557,6 +10890,7 @@ fn r2plugin_legacy_debug_command_redirects_stay_deleted() {
         );
     }
     for forbidden in [
+        "sleigh_direct_sym_debug_only_command",
         "sleigh_legacy_debug_replacement",
         "sleigh_legacy_sym_debug_replacement",
         "command moved to",
@@ -10569,15 +10903,11 @@ fn r2plugin_legacy_debug_command_redirects_stay_deleted() {
             !c_source.contains(forbidden),
             "plugin must not retain legacy debug command redirect {forbidden:?}"
         );
-        assert!(
-            !r2r_source.contains(forbidden),
-            "r2r must not preserve legacy debug redirect oracle {forbidden:?}"
-        );
     }
 }
 
 #[test]
-fn r2dec_certified_param_aliases_require_functionfacts_bindings() {
+fn r2dec_standard_residualizes_before_positional_param_aliases() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
     let lib_path = root.join("crates/r2dec/src/lib.rs");
     let stack_path = root.join("crates/r2dec/src/fold/stack.rs");
@@ -10617,8 +10947,17 @@ fn r2dec_certified_param_aliases_require_functionfacts_bindings() {
         .unwrap_or_else(|| panic!("missing end of production build_param_register_aliases call"));
     let call = &call_rest[..call_end];
     assert!(
-        call.contains("!certified_standard_mode"),
-        "certified Standard rendering must disable ABI/recovered positional param aliases"
+        call.contains("true"),
+        "non-Standard renderer may retain positional parameter aliases"
+    );
+    let standard_boundary = lib_source
+        .find("if route_is_standard(semantic_route)")
+        .unwrap_or_else(|| panic!("missing Standard residual boundary"));
+    assert!(
+        standard_boundary < production_call
+            && lib_source[standard_boundary..production_call]
+                .contains("Standard executable rendering is unavailable"),
+        "Standard rendering must residualize before positional aliases are constructed"
     );
 
     let stack_marker = "pub(super) fn arg_alias_for_register_name";
@@ -10643,7 +10982,7 @@ fn r2dec_certified_param_aliases_require_functionfacts_bindings() {
 }
 
 #[test]
-fn r2dec_certified_structuring_skips_slot_merge_return_repair() {
+fn r2dec_certified_structuring_requires_exact_merge_proofs() {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../..")
         .join("crates/r2dec/src/structure.rs");
@@ -10659,25 +10998,13 @@ fn r2dec_certified_structuring_skips_slot_merge_return_repair() {
         .find("Region::WhileLoop")
         .unwrap_or_else(|| panic!("missing Region::WhileLoop after {marker}"));
     let if_then_else = &rest[..end];
-    let non_certified_at = if_then_else
-        .find("&& !self.fold_ctx.requires_certified_rendering()")
-        .or_else(|| if_then_else.find("if !self.fold_ctx.requires_certified_rendering()"))
-        .unwrap_or_else(|| panic!("if/else structuring must have a non-certified repair block"));
     let slot_repair_at = if_then_else
         .find("self.try_structure_if_else_with_slot_merge_returns")
         .unwrap_or_else(|| panic!("missing slot-merge return repair call"));
     let register_repair_at = if_then_else
         .find("self.try_structure_if_else_with_register_merge_returns")
         .unwrap_or_else(|| panic!("missing register-merge return repair call"));
-    assert!(
-        non_certified_at < slot_repair_at && slot_repair_at < register_repair_at,
-        "slot-merge return repair must be gated before certified structuring reaches register/FunctionFacts paths"
-    );
-    let before_slot = &if_then_else[non_certified_at..slot_repair_at];
-    assert!(
-        before_slot.contains("try_structure_symbolic_actionable_if"),
-        "slot-merge return repair must stay inside the non-certified local repair block"
-    );
+    assert!(slot_repair_at < register_repair_at);
     let between_slot_and_register = &if_then_else[slot_repair_at..register_repair_at];
     assert!(
         between_slot_and_register.contains("return rewritten"),
@@ -10692,26 +11019,26 @@ fn r2dec_certified_structuring_skips_slot_merge_return_repair() {
         .find("fn try_structure_if_else_with_register_merge_returns")
         .unwrap_or_else(|| panic!("missing register merge function after slot merge function"));
     let slot_fn = &slot_fn_rest[..slot_fn_end];
-    let certified_refusal_at = slot_fn
-        .find("if self.fold_ctx.requires_certified_rendering()")
-        .unwrap_or_else(|| {
-            panic!("slot-merge return repair must defensively refuse certified mode")
-        });
+    let certified_mode_at = slot_fn
+        .find("let certified = self.fold_ctx.requires_certified_rendering();")
+        .unwrap_or_else(|| panic!("slot-merge rendering must identify certified mode"));
     let frame_slot_at = slot_fn
         .find(".frame_slot_merges_map()")
         .unwrap_or_else(|| panic!("slot-merge return repair must read frame_slot_merges_map"));
     assert!(
-        certified_refusal_at < frame_slot_at,
-        "slot-merge return repair must refuse certified mode before reading local frame-slot merge data"
+        certified_mode_at < frame_slot_at,
+        "slot-merge rendering must establish certified mode before inspecting the merge summary"
     );
-    for forbidden in [
-        "self.certified_branch_render_proof",
-        "self.control_render_proofs.push",
-        "record_return_value_render_proof",
+    for required in [
+        "self.certified_region_terminates_with_slot_merge(then_region, summary)",
+        "self.certified_region_terminates_with_slot_merge(else_region, summary)",
+        "self.certified_branch_render_proof(cond_block, predicate, condition_value)?",
+        "self.fold_ctx.effect_render_proof_checkpoint()",
+        "self.control_render_proofs.push(proof.clone())",
     ] {
         assert!(
-            !slot_fn.contains(forbidden),
-            "slot-merge return repair must not mint certified proof state: {forbidden:?}"
+            slot_fn.contains(required),
+            "certified slot-merge rendering must require exact typed proof {required:?}"
         );
     }
 
@@ -10725,9 +11052,7 @@ fn r2dec_certified_structuring_skips_slot_merge_return_repair() {
     let append_body = &append_rest[..append_end];
     let append_certified_at = append_body
         .find("if self.fold_ctx.requires_certified_rendering()")
-        .unwrap_or_else(|| {
-            panic!("append_merged_slot_return_if_needed must refuse certified mode")
-        });
+        .unwrap_or_else(|| panic!("append helper must branch for certified mode"));
     let append_return_at = append_body
         .find("CStmt::Return(Some(expr))")
         .unwrap_or_else(|| {
@@ -10735,8 +11060,18 @@ fn r2dec_certified_structuring_skips_slot_merge_return_repair() {
         });
     assert!(
         append_certified_at < append_return_at,
-        "slot merge append helper must refuse certified mode before constructing executable returns"
+        "slot merge append helper must prove certified return before constructing it"
     );
+    for required in [
+        "certified_merged_slot_return_candidate_for_region(",
+        "record_certified_call_render_proofs_for_stmt(&return_stmt)?",
+        "record_return_value_render_proof(proof_block, proof_op, proof_value)",
+    ] {
+        assert!(
+            append_body.contains(required),
+            "certified slot-merge return must carry exact effect/return proof {required:?}"
+        );
+    }
 
     let rewrite_start = source
         .find("fn rewrite_trailing_return_with_merged_expr")
@@ -10826,51 +11161,20 @@ fn r2dec_certified_if_rendering_uses_branch_render_proof_gate() {
 }
 
 #[test]
-fn r2dec_certified_final_return_normalization_does_not_recover_local_semantics() {
+fn r2dec_final_ast_return_repair_stays_deleted() {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../..")
         .join("crates/r2dec/src/fold/op_lower/mod.rs");
     let source = std::fs::read_to_string(&path)
         .unwrap_or_else(|err| panic!("failed to read {}: {err}", path.display()));
-    let marker = "pub(crate) fn normalize_final_stmt_calls";
-    let start = source
-        .find(marker)
-        .unwrap_or_else(|| panic!("missing {marker} in {}", path.display()));
-    let rest = &source[start..];
-    let end = rest
-        .find("fn normalize_final_stmt_expr")
-        .unwrap_or_else(|| panic!("missing normalize_final_stmt_expr after {marker}"));
-    let body = &rest[..end];
-    let return_at = body
-        .find("CStmt::Return(expr)")
-        .unwrap_or_else(|| panic!("{marker} must handle return statements"));
-    let other_at = body[return_at..]
-        .find("other => other")
-        .map(|offset| return_at + offset)
-        .unwrap_or(body.len());
-    let return_arm = &body[return_at..other_at];
-    let certified_at = return_arm
-        .find("if self.requires_certified_rendering()")
-        .unwrap_or_else(|| panic!("return arm must branch for certified rendering"));
-    let legacy_at = return_arm[certified_at..]
-        .find("normalize_final_return_expr_candidate(expr)")
-        .map(|offset| certified_at + offset)
-        .unwrap_or_else(|| {
-            panic!("return arm must keep legacy return normalization after certified branch")
-        });
-    let certified_branch = &return_arm[certified_at..legacy_at];
-
     for forbidden in [
+        "fn normalize_final_stmt_calls",
+        "fn normalize_final_stmt_expr",
         "normalize_final_return_expr_candidate",
-        "normalize_final_call_expr",
-        "resolve_return_candidate",
-        "semanticize_visible_expr",
-        "best_visible_definition",
-        "lookup_definition",
     ] {
         assert!(
-            !certified_branch.contains(forbidden),
-            "certified final return normalization must not use local semantic fallback {forbidden:?}"
+            !source.contains(forbidden),
+            "retired final-AST return repair must stay deleted: {forbidden:?}"
         );
     }
 }
@@ -10917,8 +11221,8 @@ fn r2dec_certified_rendering_does_not_materialize_raw_carrier_locals() {
     }
 
     assert!(
-        source.contains("lower.starts_with(\"value_\")"),
-        "generated carrier names must remain uncertified render artifacts"
+        source.contains("Standard executable rendering is unavailable; r2cert typed-region authorization is required"),
+        "generic Standard rendering must residualize instead of materializing synthetic carriers"
     );
 }
 
@@ -11243,9 +11547,6 @@ fn r2dec_certified_stack_home_store_suppression_uses_value_owner_fact_only() {
         "call_result_source_for_ssa_name",
         "has_certified_call_result_owner_fact_for_source",
         "stable_owned_call_result_name_for_source",
-        "resolve_stack_var",
-        "visible_names_share_stack_slot",
-        "stack_offset_for_visible_storage_name(&owner_name)",
     ] {
         assert!(
             !certified.contains(forbidden),
@@ -11354,7 +11655,7 @@ fn function_facts_spine_fields_stay_private() {
         );
     }
     let attach_start = facts_source
-        .find("pub fn attach_prepared_decompile_evidence")
+        .find("fn attach_prepared_decompile_evidence")
         .expect("missing attach_prepared_decompile_evidence");
     let attach_rest = &facts_source[attach_start..];
     let attach_end = attach_rest
@@ -11402,12 +11703,18 @@ fn function_facts_spine_fields_stay_private() {
         );
     }
     for required in [
+        "pub fn source_owned_facts(&self) -> &r2types::function_facts::SourceOwnedFunctionFacts",
+        "pub fn prepared_ssa(&self) -> &r2ssa::SsaArtifact",
         "pub fn function_facts(&self) -> &FunctionFacts",
-        "pub fn context(&self) -> &DecompilerContext",
     ] {
         assert!(
             r2dec_source.contains(required),
             "r2dec must expose read-only spine accessor: {required}"
         );
     }
+    assert!(
+        r2dec_source.contains("fn context_projection(&self) -> DecompilerContext")
+            && !r2dec_source.contains("pub fn context_projection"),
+        "DecompilerContext projection must remain private to the exact source-owned input"
+    );
 }

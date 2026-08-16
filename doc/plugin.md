@@ -26,7 +26,6 @@ Plugin Callbacks
 ----------------
 
 sleigh_op: Lifts instructions during aaa. Generates ESIL.
-sleigh_recover_vars: Provides SSA-derived variables for afva.
 sleigh_analyze_fcn: Per-function SSA analysis after af (also auto-applies DATA xrefs).
 sleigh_get_data_refs: Def-use xrefs callback used by radare2 during aar when supported.
 sleigh_post_analysis: Native post-analysis enrichment during aa/aaa/aaaa.
@@ -58,15 +57,15 @@ Function-Level:
 
 Direct `a:sla.dec` and `a:sla.decj` requests are intentionally unavailable:
 they do not run inside radare2's locked snapshot transaction and therefore
-cannot construct source authority. `pdd` receives one ABI-138/snapshot-schema-11
-borrowed snapshot through accessor-schema 4, deep-copies it synchronously into
+cannot construct source authority. `pdd` receives one ABI-139/snapshot-schema-12
+borrowed snapshot through accessor-schema 5, deep-copies it synchronously into
 source-interface-schema 10, and either completes from that immutable source or
 refuses. It never falls back to live blocks, names, or detached test metadata.
 
 Detached symbolic commands are unavailable for the same reason. This includes
 `a:sla.sym`, `a:sla.sym.paths`, `a:sym.runj`, the `a:sym.explore*` and
 `a:sym.solve*` families, and commands that construct a symbolic scope from live
-plugin state. Symbolic execution requires the same borrowed ABI-138 snapshot;
+plugin state. Symbolic execution requires the same borrowed ABI-139 snapshot;
 the plugin does not expose a replacement command or API for detached inputs.
 
 Executable semantic C is authorized only through the generic source-obligation
@@ -127,13 +126,20 @@ of the V2 ABI.
 Configuration
 -------------
 
-`a:sla.mem` JSON is backward compatible and keeps legacy keys:
+`a:sla.debug.mem` emits one canonical JSON array. Every access object has:
 
-- `addr`
-- `size`
-- `write`
+- `schema_version` (`1`)
+- `type` (`load`, `store`, `load_linked`, `store_conditional`, `atomic_cas`,
+  `load_guarded`, or `store_guarded`)
+- `size_bytes`
+- `address` (a typed varnode object)
 
-When available, it also emits additive memory semantics/topology fields:
+Stores and atomic/guarded operations add their applicable typed varnodes as
+`value`, `expected`, `replacement`, `result`, or `guard`. A structurally
+resolved stack address is represented only as
+`stack_address: {"base": "RSP", "offset": 0}`.
+
+When available, access objects also emit memory semantics/topology fields:
 
 - `ordering`
 - `atomic_kind`

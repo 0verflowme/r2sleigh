@@ -503,15 +503,54 @@ pub fn route_skips_eager_scope_summaries(route: &crate::TargetQueryRoutePlan) ->
     )
 }
 
+pub struct SymbolicHookInstallContext<'ctx, 'a> {
+    z3_ctx: &'ctx Context,
+    prepared: &'a SsaArtifact,
+    scope: &'a PreparedFunctionScope,
+    arch: Option<&'a ArchSpec>,
+    symbol_map: &'a std::collections::HashMap<u64, String>,
+    summary_profile: SummaryProfile,
+    policy: &'a QueryExecutionPolicy,
+}
+
+impl<'ctx, 'a> SymbolicHookInstallContext<'ctx, 'a> {
+    pub fn new(
+        z3_ctx: &'ctx Context,
+        prepared: &'a SsaArtifact,
+        scope: &'a PreparedFunctionScope,
+        arch: Option<&'a ArchSpec>,
+        symbol_map: &'a std::collections::HashMap<u64, String>,
+        summary_profile: SummaryProfile,
+        policy: &'a QueryExecutionPolicy,
+    ) -> Self {
+        Self {
+            z3_ctx,
+            prepared,
+            scope,
+            arch,
+            symbol_map,
+            summary_profile,
+            policy,
+        }
+    }
+}
+
 pub fn install_symbolic_hooks_for_query_policy<'ctx>(
     explorer: &mut PathExplorer<'ctx>,
-    z3_ctx: &'ctx Context,
-    scope: &PreparedFunctionScope,
-    arch: Option<&ArchSpec>,
-    symbol_map: &std::collections::HashMap<u64, String>,
-    summary_profile: SummaryProfile,
-    policy: &QueryExecutionPolicy,
+    context: SymbolicHookInstallContext<'ctx, '_>,
 ) {
+    let SymbolicHookInstallContext {
+        z3_ctx,
+        prepared,
+        scope,
+        arch,
+        symbol_map,
+        summary_profile,
+        policy,
+    } = context;
+    let Some(scope) = scope.exact_for_artifact(prepared) else {
+        return;
+    };
     if policy.install_scope_summaries
         && let Some(arch) = arch
         && let Some(registry) =
@@ -520,13 +559,14 @@ pub fn install_symbolic_hooks_for_query_policy<'ctx>(
         let _ = registry.install_scope_summaries_for_explorer(
             explorer,
             z3_ctx,
+            prepared,
             scope,
             Some(arch),
             symbol_map,
         );
     }
     if policy.install_runtime_hooks {
-        install_runtime_hooks_for_scope(explorer, scope, arch, symbol_map);
+        install_runtime_hooks_for_scope(explorer, prepared, scope, arch, symbol_map);
     }
 }
 
@@ -833,6 +873,7 @@ fn build_target_query_inputs<'a>(
     assumption_conflicted: bool,
     allow_continuation_bridge: bool,
 ) -> TargetQueryRouteInput<'a> {
+    let artifact = artifact.filter(|artifact| artifact.shares_artifact(func));
     let mut inputs = artifact
         .map(|artifact| artifact.target_query_route_input(target_addr, assumption_conflicted))
         .unwrap_or_else(|| TargetQueryRouteInput {
@@ -874,6 +915,7 @@ pub fn selected_target_query_route_in_scope(
     target_addr: u64,
     assumption_conflicted: bool,
 ) -> crate::TargetQueryRoutePlan {
+    let scope = scope.and_then(|scope| scope.exact_for_artifact(func));
     build_target_query_inputs(
         explorer,
         func,
@@ -2067,6 +2109,7 @@ impl<'ctx> PathExplorer<'ctx> {
         mut initial_state: SymState<'ctx>,
         target_addr: u64,
     ) -> ReachabilityResult<'ctx> {
+        let scope = scope.and_then(|scope| scope.exact_for_artifact(func));
         let assumption_outcome = assumption_usage_for_query(self, func, &mut initial_state);
         let query = execute_target_query_paths(
             self,
@@ -2155,6 +2198,7 @@ impl<'ctx> PathExplorer<'ctx> {
         mut initial_state: SymState<'ctx>,
         target_pc: u64,
     ) -> PathConditionResult<'ctx> {
+        let scope = scope.and_then(|scope| scope.exact_for_artifact(func));
         let assumption_outcome = assumption_usage_for_query(self, func, &mut initial_state);
         let query = execute_target_query_paths(
             self,
@@ -2228,6 +2272,7 @@ impl<'ctx> PathExplorer<'ctx> {
         mut initial_state: SymState<'ctx>,
         target_addr: u64,
     ) -> SolveResult<'ctx> {
+        let scope = scope.and_then(|scope| scope.exact_for_artifact(func));
         let assumption_outcome = assumption_usage_for_query(self, func, &mut initial_state);
         let validation_initial_state = initial_state.fork();
         let query = execute_target_query_first_path(
@@ -2334,6 +2379,7 @@ impl<'ctx> PathExplorer<'ctx> {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::sync::Arc;
 
     use super::{
         CompiledPreconditionMode, PreconditionApplication, apply_best_compiled_precondition,
@@ -2344,10 +2390,10 @@ mod tests {
         BackwardMemoryCondition, BackwardMemoryRegion, ControlFact, ExecutionModel, Judged,
         MemoryFact, NativeArtifactBody, NativeFunctionSummary, RefinementStage, RegionKey,
         ResidualReason, SatResult, SemanticArtifact, SemanticArtifactBody,
-        SemanticArtifactDiagnostics, SemanticEvidence, SemanticEvidenceReason, SemanticRegion,
-        SliceClass, SymQueryConfig, SymState, TargetFact, TargetQueryExecutionRoute,
-        TargetQueryPlan, VmBinaryOp, VmGuardCondition, VmGuardedExit, VmStateUpdate, VmStepSummary,
-        VmTransferArm, VmValueExpr,
+        SemanticArtifactDiagnostics, SemanticArtifactReport, SemanticEvidence,
+        SemanticEvidenceReason, SemanticRegion, SliceClass, SymQueryConfig, SymState, TargetFact,
+        TargetQueryExecutionRoute, TargetQueryPlan, VmBinaryOp, VmGuardCondition, VmGuardedExit,
+        VmStateUpdate, VmStepSummary, VmTransferArm, VmValueExpr,
     };
     use r2il::{R2ILBlock, R2ILOp, SpaceId, Varnode};
     use r2ssa::{
@@ -2361,7 +2407,20 @@ mod tests {
     const TMP0: u64 = 0x80;
     const TMP1: u64 = 0x88;
 
-    fn test_semantic_artifact(
+    fn test_prepared() -> Arc<SsaArtifact> {
+        let mut block = R2ILBlock::new(0x1000, 1);
+        block.push(R2ILOp::Return {
+            target: Varnode::constant(0, 8),
+        });
+        Arc::new(SsaArtifact::for_symbolic(&[block], None).expect("test SSA"))
+    }
+
+    fn bind_test_report(report: SemanticArtifactReport) -> SemanticArtifact {
+        SemanticArtifact::new(test_prepared(), report).expect("current query test semantic schema")
+    }
+
+    fn test_semantic_artifact_for(
+        prepared: Arc<SsaArtifact>,
         stage: RefinementStage,
         slice_class: SliceClass,
         residual_reasons: Vec<ResidualReason>,
@@ -2384,28 +2443,50 @@ mod tests {
         } else {
             ArtifactGranularity::WholeFunction
         };
-        SemanticArtifact {
-            stage,
-            granularity,
-            execution: ExecutionModel::Native,
-            body: SemanticArtifactBody::Native(NativeArtifactBody {
-                summary: NativeFunctionSummary {
-                    slice_class,
-                    role_identity: None,
-                    closure_functions: 0,
-                    helper_functions: 0,
-                    derived_summaries: 0,
-                    derived_diagnostics: crate::sim::DerivedSummaryDiagnostics::default(),
-                    region_summaries: Vec::new(),
-                    worker_summaries: Vec::new(),
+        SemanticArtifact::new(
+            prepared,
+            SemanticArtifactReport {
+                schema_version: crate::SEMANTIC_ARTIFACT_SCHEMA_VERSION,
+                stage,
+                granularity,
+                execution: ExecutionModel::Native,
+                body: SemanticArtifactBody::Native(NativeArtifactBody {
+                    summary: NativeFunctionSummary {
+                        slice_class,
+                        role_identity: None,
+                        closure_functions: 0,
+                        helper_functions: 0,
+                        derived_summaries: 0,
+                        derived_diagnostics: crate::sim::DerivedSummaryDiagnostics::default(),
+                        region_summaries: Vec::new(),
+                        worker_summaries: Vec::new(),
+                    },
+                    regions,
+                }),
+                diagnostics: SemanticArtifactDiagnostics {
+                    residual_reasons,
+                    ..diagnostics
                 },
-                regions,
-            }),
-            diagnostics: SemanticArtifactDiagnostics {
-                residual_reasons,
-                ..diagnostics
             },
-        }
+        )
+        .expect("current query test semantic schema")
+    }
+
+    fn test_semantic_artifact(
+        stage: RefinementStage,
+        slice_class: SliceClass,
+        residual_reasons: Vec<ResidualReason>,
+        regions: Vec<SemanticRegion>,
+        diagnostics: SemanticArtifactDiagnostics,
+    ) -> SemanticArtifact {
+        test_semantic_artifact_for(
+            test_prepared(),
+            stage,
+            slice_class,
+            residual_reasons,
+            regions,
+            diagnostics,
+        )
     }
 
     fn make_region(anchor: u64, frontier: &[u64]) -> SemanticRegion {
@@ -2431,6 +2512,79 @@ mod tests {
             interpreter: None,
             ambiguous_targets: Vec::new(),
         }
+    }
+
+    #[test]
+    fn target_query_drops_semantics_from_rebuilt_identical_ssa() {
+        let blocks = make_residual_precondition_blocks();
+        let requested = Arc::new(SsaArtifact::for_symbolic(&blocks, None).expect("requested SSA"));
+        let rebuilt = Arc::new(SsaArtifact::for_symbolic(&blocks, None).expect("rebuilt SSA"));
+        let mut region = make_region(0x1000, &[0x1010, 0x1004]);
+        region.control.push(Judged::new(
+            ControlFact {
+                target: 0x1010,
+                status: crate::SymbolicReachabilityStatus::Reachable,
+                branch_truth: Some(true),
+                condition: Some("guard".to_string()),
+                compiled: Some(BackwardConditionSummary {
+                    simplified: "guard".to_string(),
+                    terms: vec!["guard".to_string()],
+                    memory_terms: Vec::new(),
+                    backward_memory_substitutions: 0,
+                    backward_memory_candidate_enumerations: 0,
+                    backward_memory_residual_fallbacks: 0,
+                    precision: BackwardConditionPrecision::Exact,
+                    supported_paths: 1,
+                    total_paths: 1,
+                }),
+            },
+            SemanticEvidence::exact(),
+        ));
+        region.targets.push(Judged::new(
+            TargetFact {
+                target: 0x1010,
+                status: crate::SymbolicReachabilityStatus::Reachable,
+                branch_truth: Some(true),
+            },
+            SemanticEvidence::exact(),
+        ));
+        let artifact = test_semantic_artifact_for(
+            Arc::clone(&requested),
+            RefinementStage::Compiled,
+            SliceClass::Worker,
+            Vec::new(),
+            vec![region],
+            default_diagnostics(),
+        );
+        let ctx = Context::thread_local();
+        let mut explorer = SymQueryConfig::default().make_explorer(&ctx);
+
+        let exact = super::build_target_query_inputs(
+            &mut explorer,
+            &requested,
+            None,
+            Some(&artifact),
+            0x1010,
+            false,
+            false,
+        )
+        .route;
+        assert!(matches!(
+            exact.execution,
+            TargetQueryExecutionRoute::ArtifactCondition { .. }
+        ));
+
+        let foreign = super::build_target_query_inputs(
+            &mut explorer,
+            &rebuilt,
+            None,
+            Some(&artifact),
+            0x1010,
+            false,
+            false,
+        )
+        .route;
+        assert_eq!(foreign, crate::TargetQueryRoutePlan::dynamic_fallback());
     }
 
     fn make_reg(offset: u64, size: u32) -> Varnode {
@@ -3956,7 +4110,8 @@ mod tests {
 
     #[test]
     fn vm_artifacts_preserve_interpreter_slice_class() {
-        let artifact = SemanticArtifact {
+        let artifact = bind_test_report(SemanticArtifactReport {
+            schema_version: crate::SEMANTIC_ARTIFACT_SCHEMA_VERSION,
             stage: RefinementStage::Compiled,
             granularity: ArtifactGranularity::SummaryOnly,
             execution: ExecutionModel::Vm,
@@ -3966,7 +4121,7 @@ mod tests {
                 transfer_summary: None,
             })),
             diagnostics: default_diagnostics(),
-        };
+        });
 
         assert_eq!(artifact.slice_class(), Some(SliceClass::InterpreterSwitch));
     }

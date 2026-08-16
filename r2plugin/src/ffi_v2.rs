@@ -31,9 +31,9 @@ pub const R2SLEIGH_CAPABILITIES_V2: u64 = R2SLEIGH_CAP_DECOMPILE_V2
     | R2SLEIGH_CAP_LIFT_CORE_V2
     | R2SLEIGH_CAP_PLANNER_QUERY_V2
     | R2SLEIGH_CAP_OPAQUE_RADARE_SNAPSHOT_V2;
-pub const R2SLEIGH_RADARE_ABI_V2: u32 = 138;
-pub const R2SLEIGH_RADARE_FUNCTION_SNAPSHOT_SCHEMA_V2: u32 = 11;
-pub const R2SLEIGH_RADARE_SNAPSHOT_ACCESSOR_SCHEMA_V2: u32 = 4;
+pub const R2SLEIGH_RADARE_ABI_V2: u32 = 139;
+pub const R2SLEIGH_RADARE_FUNCTION_SNAPSHOT_SCHEMA_V2: u32 = 12;
+pub const R2SLEIGH_RADARE_SNAPSHOT_ACCESSOR_SCHEMA_V2: u32 = 5;
 
 pub const R2SLEIGH_STATUS_OK_V2: u32 = 0;
 pub const R2SLEIGH_STATUS_INVALID_ARGUMENT_V2: u32 = 1;
@@ -90,7 +90,6 @@ pub const R2SLEIGH_ANALYSIS_FUNCTION_CFG_JSON_V2: u32 = 16;
 pub const R2SLEIGH_QUERY_BLOCK_VALUES_V2: u32 = 1;
 pub const R2SLEIGH_QUERY_TAINT_SUMMARY_V2: u32 = 2;
 pub const R2SLEIGH_QUERY_ANNOTATIONS_V2: u32 = 3;
-pub const R2SLEIGH_QUERY_RECOVERED_VARS_V2: u32 = 7;
 pub const R2SLEIGH_QUERY_DATA_REFS_V2: u32 = 8;
 pub const R2SLEIGH_DATA_REF_SCHEMA_V2: u32 = 1;
 pub const R2SLEIGH_PLANNER_QUERY_SCHEMA_V2: u32 = 1;
@@ -104,7 +103,6 @@ pub const R2SLEIGH_TYPE_WRITEBACK_OFF_V2: u32 = 0;
 pub const R2SLEIGH_TYPE_WRITEBACK_BALANCED_V2: u32 = 1;
 pub const R2SLEIGH_TYPE_WRITEBACK_AGGRESSIVE_V2: u32 = 2;
 pub const R2SLEIGH_AUTO_CALLBACK_ANALYZE_FUNCTION_V2: u32 = 0;
-pub const R2SLEIGH_AUTO_CALLBACK_RECOVER_VARS_V2: u32 = 1;
 pub const R2SLEIGH_AUTO_CALLBACK_DATA_REFS_V2: u32 = 2;
 pub const R2SLEIGH_AUTO_CALLBACK_POST_ANALYSIS_TAINT_V2: u32 = 3;
 pub const R2SLEIGH_AUTO_CALLBACK_POST_ANALYSIS_XREF_V2: u32 = 4;
@@ -169,7 +167,7 @@ pub struct R2SleighStringViewV2 {
     pub len: usize,
 }
 
-/// Borrowed opaque radare2 ABI 138 snapshot plus its immutable accessor table.
+/// Borrowed opaque radare2 ABI 139 snapshot plus its immutable accessor table.
 /// Both pointers are valid only for the duration of one synchronous `execute`
 /// callback. Rust deep-copies the source before returning to the caller.
 #[repr(C)]
@@ -247,6 +245,7 @@ pub struct R2SleighRadareCarrierProjectionV2 {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct R2SleighRadareParameterViewV2 {
     pub index: u32,
+    pub name_length: usize,
     pub storage: R2SleighRadareRegisterStorageViewV2,
     pub logical_type_id: u32,
     pub carrier: R2SleighRadareCarrierProjectionV2,
@@ -386,6 +385,7 @@ pub struct R2SleighRadareAccessorsV2 {
     pub parameter_view: Option<
         unsafe extern "C" fn(*const c_void, usize, *mut R2SleighRadareParameterViewV2) -> u8,
     >,
+    pub parameter_name: Option<unsafe extern "C" fn(*const c_void, usize, *mut u8, usize) -> u8>,
     pub parameter_storage_name:
         Option<unsafe extern "C" fn(*const c_void, usize, *mut u8, usize) -> u8>,
     pub stack_slot_view: Option<
@@ -1381,9 +1381,6 @@ unsafe fn free_analysis_result_payload(result: &R2SleighAnalysisResultV2) {
             super::analysis::taint::r2taint_function_summary_free(result.raw.cast())
         }
         R2SLEIGH_QUERY_ANNOTATIONS_V2 => super::r2sleigh_annotations_free(result.raw.cast()),
-        R2SLEIGH_QUERY_RECOVERED_VARS_V2 => {
-            super::types::r2sleigh_recovered_vars_free(result.raw.cast())
-        }
         R2SLEIGH_QUERY_DATA_REFS_V2 => super::types::r2sleigh_data_refs_free(result.raw.cast()),
         _ => {}
     }
@@ -1795,14 +1792,6 @@ fn response_diagnostics_json(
         "warnings": &diagnostics.warnings,
         "refusal": diagnostics.refusal.as_deref(),
         "semantic_kernel_render": semantic_kernel_render,
-        "proof_coverage": diagnostics
-            .proof_coverage
-            .as_ref()
-            .map(|value| format!("{value:?}")),
-        "render_permission": diagnostics
-            .render_permission
-            .as_ref()
-            .map(|value| format!("{value:?}")),
     })
     .to_string())
 }
@@ -2313,16 +2302,16 @@ extern "C" fn lift_block_set_switch_info(
         let payload = registry
             .entry_mut(key, LiftHandleKind::Block, "lifted block")?
             .payload as *mut R2ILBlock;
-        if super::r2il_block_set_switch_info(
-            payload,
+        if super::r2il_block_set_switch_info(super::R2ILSwitchInfoInput {
+            block: payload,
             switch_addr,
             min_val,
             max_val,
             default_target,
-            has_default as i32,
-            cases.as_ptr(),
-            cases.len(),
-        ) == 0
+            has_default: has_default as i32,
+            cases: cases.as_ptr(),
+            case_count: cases.len(),
+        }) == 0
         {
             return Err(BoundaryError::invalid("switch metadata was rejected"));
         }
@@ -2610,18 +2599,14 @@ extern "C" fn analysis_render(
             R2SLEIGH_ANALYSIS_FUNCTION_CFG_JSON_V2 => {
                 super::analysis::cfg::r2cfg_function_json(context, blocks.as_ptr(), blocks.len())
             }
-            kind if matches!(
-                kind,
-                R2SLEIGH_ANALYSIS_BLOCK_ESIL_V2
-                    | R2SLEIGH_ANALYSIS_BLOCK_OP_JSON_V2
-                    | R2SLEIGH_ANALYSIS_BLOCK_REGS_READ_V2
-                    | R2SLEIGH_ANALYSIS_BLOCK_REGS_WRITE_V2
-                    | R2SLEIGH_ANALYSIS_BLOCK_MEMORY_V2
-                    | R2SLEIGH_ANALYSIS_BLOCK_VARNODES_V2
-                    | R2SLEIGH_ANALYSIS_BLOCK_SSA_V2
-                    | R2SLEIGH_ANALYSIS_BLOCK_DEFUSE_V2
-            ) =>
-            {
+            R2SLEIGH_ANALYSIS_BLOCK_ESIL_V2
+            | R2SLEIGH_ANALYSIS_BLOCK_OP_JSON_V2
+            | R2SLEIGH_ANALYSIS_BLOCK_REGS_READ_V2
+            | R2SLEIGH_ANALYSIS_BLOCK_REGS_WRITE_V2
+            | R2SLEIGH_ANALYSIS_BLOCK_MEMORY_V2
+            | R2SLEIGH_ANALYSIS_BLOCK_VARNODES_V2
+            | R2SLEIGH_ANALYSIS_BLOCK_SSA_V2
+            | R2SLEIGH_ANALYSIS_BLOCK_DEFUSE_V2 => {
                 return Err(BoundaryError::invalid(
                     "block render requires exactly one block",
                 ));
@@ -2697,13 +2682,6 @@ extern "C" fn analysis_query(
                 .cast()
             }
             R2SLEIGH_QUERY_ANNOTATIONS_V2 => super::r2sleigh_analyze_fcn_annotations_typed(
-                context,
-                blocks.as_ptr(),
-                blocks.len(),
-                request.function_addr,
-            )
-            .cast(),
-            R2SLEIGH_QUERY_RECOVERED_VARS_V2 => super::types::r2sleigh_recover_vars_typed(
                 context,
                 blocks.as_ptr(),
                 blocks.len(),
@@ -2788,13 +2766,6 @@ extern "C" fn analysis_result_view(
                 view.primary =
                     super::r2sleigh_annotations_items(result.raw.cast(), &mut view.primary_count)
                         .cast();
-            }
-            R2SLEIGH_QUERY_RECOVERED_VARS_V2 => {
-                view.primary = super::types::r2sleigh_recovered_vars_items(
-                    result.raw.cast(),
-                    &mut view.primary_count,
-                )
-                .cast();
             }
             R2SLEIGH_QUERY_DATA_REFS_V2 => {
                 view.primary = super::types::r2sleigh_data_refs_items(
@@ -2883,9 +2854,6 @@ fn planner_auto_callback_kind(raw: u32) -> Option<r2engine::EngineAutoCallbackKi
         R2SLEIGH_AUTO_CALLBACK_ANALYZE_FUNCTION_V2 => {
             Some(r2engine::EngineAutoCallbackKind::AnalyzeFunction)
         }
-        R2SLEIGH_AUTO_CALLBACK_RECOVER_VARS_V2 => {
-            Some(r2engine::EngineAutoCallbackKind::RecoverVars)
-        }
         R2SLEIGH_AUTO_CALLBACK_DATA_REFS_V2 => Some(r2engine::EngineAutoCallbackKind::DataRefs),
         R2SLEIGH_AUTO_CALLBACK_POST_ANALYSIS_TAINT_V2 => {
             Some(r2engine::EngineAutoCallbackKind::PostAnalysisTaint)
@@ -2902,7 +2870,6 @@ fn planner_auto_callback_kind_value(kind: r2engine::EngineAutoCallbackKind) -> u
         r2engine::EngineAutoCallbackKind::AnalyzeFunction => {
             R2SLEIGH_AUTO_CALLBACK_ANALYZE_FUNCTION_V2
         }
-        r2engine::EngineAutoCallbackKind::RecoverVars => R2SLEIGH_AUTO_CALLBACK_RECOVER_VARS_V2,
         r2engine::EngineAutoCallbackKind::DataRefs => R2SLEIGH_AUTO_CALLBACK_DATA_REFS_V2,
         r2engine::EngineAutoCallbackKind::PostAnalysisTaint => {
             R2SLEIGH_AUTO_CALLBACK_POST_ANALYSIS_TAINT_V2
@@ -3217,6 +3184,12 @@ mod tests {
                 kind: u32::MAX,
                 ..request
             },
+            // Callback kind 1 was RecoverVars and must remain tombstoned.
+            R2SleighPlannerQueryRequestV2 {
+                kind: R2SLEIGH_PLANNER_AUTO_CALLBACK_V2,
+                callback_kind: 1,
+                ..request
+            },
             R2SleighPlannerQueryRequestV2 {
                 kind: R2SLEIGH_PLANNER_AUTO_CALLBACK_V2,
                 callback_kind: u32::MAX,
@@ -3469,7 +3442,8 @@ mod tests {
             (api.analysis_result_view)(analysis_result, &mut analysis_view),
             R2SLEIGH_STATUS_INVALID_ARGUMENT_V2
         );
-        for deleted_kind in [4, 5, 6] {
+        // Query kind 7 was RecoveredVars and must remain tombstoned.
+        for deleted_kind in [4, 5, 6, 7] {
             let deleted_request = R2SleighAnalysisQueryRequestV2 {
                 kind: deleted_kind,
                 ..query_request
@@ -3568,8 +3542,14 @@ mod tests {
             (api.lift_context_create)(arch_view, ptr::null_mut()),
             R2SLEIGH_STATUS_INVALID_ARGUMENT_V2
         );
+        let mut context_output_storage = std::mem::MaybeUninit::<[*mut R2ILContext; 2]>::uninit();
+        let misaligned_context_output = context_output_storage
+            .as_mut_ptr()
+            .cast::<u8>()
+            .wrapping_add(1)
+            .cast::<*mut R2ILContext>();
         assert_eq!(
-            (api.lift_context_create)(arch_view, 1usize as *mut *mut R2ILContext),
+            (api.lift_context_create)(arch_view, misaligned_context_output),
             R2SLEIGH_STATUS_INVALID_ARGUMENT_V2
         );
         let mut block = ptr::null_mut();
@@ -3588,7 +3568,7 @@ mod tests {
         assert!(block.is_null());
         assert_eq!(
             (api.lift_instruction)(
-                align_of::<R2ILContext>() as *mut R2ILContext,
+                std::ptr::NonNull::<R2ILContext>::dangling().as_ptr(),
                 R2SleighByteViewV2 {
                     data: ptr::null(),
                     len: R2SLEIGH_MAX_FUNCTION_INPUT_BYTES_V2 + 1,
@@ -3598,8 +3578,14 @@ mod tests {
             ),
             R2SLEIGH_STATUS_LIMIT_EXCEEDED_V2
         );
+        let mut op_count_output_storage = std::mem::MaybeUninit::<[usize; 2]>::uninit();
+        let misaligned_op_count_output = op_count_output_storage
+            .as_mut_ptr()
+            .cast::<u8>()
+            .wrapping_add(1)
+            .cast::<usize>();
         assert_eq!(
-            (api.lift_block_op_count)(ptr::null(), 1usize as *mut usize),
+            (api.lift_block_op_count)(ptr::null(), misaligned_op_count_output),
             R2SLEIGH_STATUS_INVALID_ARGUMENT_V2
         );
         let mut unknown_size = 0;
@@ -3637,7 +3623,7 @@ mod tests {
         let cases = [R2SleighSwitchCaseV2::default()];
         assert_eq!(
             (api.lift_block_set_switch_info)(
-                align_of::<R2ILBlock>() as *mut R2ILBlock,
+                std::ptr::NonNull::<R2ILBlock>::dangling().as_ptr(),
                 0,
                 0,
                 0,
@@ -3740,7 +3726,7 @@ mod tests {
         assert_semantic_kernel_render_diagnostics(
             r2engine::EngineSemanticKernelRegion::AggregateMemberTerminalReturnFunction,
             "aggregate_member_terminal_return_function",
-            4,
+            6,
         );
     }
 
@@ -3764,12 +3750,12 @@ mod tests {
             (
                 r2engine::EngineSemanticKernelRegion::AggregateMemberTerminalReturnFunction,
                 "aggregate_member_terminal_return_function",
-                4,
+                6,
             ),
             (
                 r2engine::EngineSemanticKernelRegion::PlainRamMemoryTerminalReturnFunction,
                 "plain_ram_memory_terminal_return_function",
-                3,
+                4,
             ),
             (
                 r2engine::EngineSemanticKernelRegion::DirectCallTerminalReturnFunction,
@@ -4353,8 +4339,8 @@ mod tests {
         let api = unsafe { &*r2sleigh_api_v2() };
         assert_eq!(api.abi_version, R2SLEIGH_ABI_V2);
         assert_eq!(api.radare_abi_version, R2SLEIGH_RADARE_ABI_V2);
-        assert_eq!(R2SLEIGH_RADARE_FUNCTION_SNAPSHOT_SCHEMA_V2, 11);
-        assert_eq!(R2SLEIGH_RADARE_SNAPSHOT_ACCESSOR_SCHEMA_V2, 4);
+        assert_eq!(R2SLEIGH_RADARE_FUNCTION_SNAPSHOT_SCHEMA_V2, 12);
+        assert_eq!(R2SLEIGH_RADARE_SNAPSHOT_ACCESSOR_SCHEMA_V2, 5);
         assert_eq!(api.struct_size as usize, size_of::<R2SleighApiV2>());
         assert_eq!(api.request_size as usize, size_of::<R2SleighRequestV2>());
         assert_eq!(

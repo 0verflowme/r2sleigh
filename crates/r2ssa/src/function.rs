@@ -93,10 +93,11 @@ pub enum FunctionPrepareMode {
 
 /// Unforgeable run-local identity for one immutable SSA artifact.
 ///
-/// Cloning an artifact retains this identity. Rebuilding identical source
-/// bytes creates a distinct identity, so downstream proof owners can reject
-/// artifact-local handles from an independently reconstructed graph without
-/// relying on names, addresses, or a probabilistic hash.
+/// Moving or sharing an artifact through [`Arc`] retains this identity.
+/// Rebuilding identical source bytes creates a distinct identity, so
+/// downstream proof owners can reject artifact-local handles from an
+/// independently reconstructed graph without relying on names, addresses, or
+/// a probabilistic hash.
 #[derive(Clone)]
 pub struct SsaArtifactAuthority(Arc<()>);
 
@@ -137,7 +138,7 @@ fn coherent_function_interface(
 }
 
 /// Canonical SSA artifact consumed by downstream analysis layers.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct SsaArtifact {
     authority: SsaArtifactAuthority,
     provenance: SsaArtifactProvenance,
@@ -225,7 +226,7 @@ enum SsaArtifactProvenance {
 /// Generic/manual [`SsaArtifact`] constructors cannot produce this wrapper.
 #[derive(Debug, Clone)]
 pub struct TrustedSsaArtifact {
-    artifact: SsaArtifact,
+    artifact: Arc<SsaArtifact>,
     lift_authority: GenuineLiftedFunctionAuthority,
     source_blocks: Arc<[R2ILBlock]>,
     arch: ArchSpec,
@@ -900,7 +901,7 @@ impl TrustedSsaArtifact {
             return Err(SsaPrepareError::MalformedInput);
         }
         Ok(Self {
-            artifact,
+            artifact: Arc::new(artifact),
             lift_authority,
             source_blocks: blocks.into(),
             arch,
@@ -913,8 +914,20 @@ impl TrustedSsaArtifact {
 
     /// Read-only analysis view. This does not allow a generic artifact to be
     /// converted back into a trusted wrapper.
-    pub const fn artifact(&self) -> &SsaArtifact {
-        &self.artifact
+    pub fn artifact(&self) -> &SsaArtifact {
+        self.artifact.as_ref()
+    }
+
+    /// Shared ownership of the exact immutable artifact retained by this
+    /// trusted wrapper.
+    pub fn shared_artifact(&self) -> Arc<SsaArtifact> {
+        Arc::clone(&self.artifact)
+    }
+
+    /// Whether `artifact` is the exact allocation retained by this trusted
+    /// wrapper. Equal content from an independent allocation is not enough.
+    pub fn shares_artifact(&self, artifact: &Arc<SsaArtifact>) -> bool {
+        Arc::ptr_eq(&self.artifact, artifact)
     }
 
     pub const fn lift_authority(&self) -> &GenuineLiftedFunctionAuthority {

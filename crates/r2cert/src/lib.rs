@@ -38,9 +38,9 @@ mod private_frame_conditional_join;
 mod private_frame_value_flow;
 
 pub use aggregate_member::{
-    CERTIFIED_AGGREGATE_MEMBER_ACCESS_CONTRACT_VERSION, CertifiedAggregateMemberAccess,
-    CertifiedAggregateMemberAccessSemantics, CertifiedAggregateStructuredAccess,
-    CertifiedNaturalScalarAggregateLayout,
+    CERTIFIED_AGGREGATE_MEMBER_ACCESS_CONTRACT_VERSION, CertifiedAggregateElementIndex,
+    CertifiedAggregateMemberAccess, CertifiedAggregateMemberAccessSemantics,
+    CertifiedAggregateStructuredAccess, CertifiedNaturalScalarAggregateLayout,
 };
 pub use private_frame_conditional_join::{
     CertifiedInertPrivateFrameJoinPhi, CertifiedPrivateFrameConditionalArm,
@@ -53,7 +53,7 @@ pub use private_frame_value_flow::{
     CertifiedPrivateFrameVersionDefinition,
 };
 
-pub const CERTIFICATION_SCHEMA_VERSION: u32 = 34;
+pub const CERTIFICATION_SCHEMA_VERSION: u32 = 36;
 
 /// Unforgeable run-local identity for one proof authority domain.
 ///
@@ -490,7 +490,7 @@ fn projected_parameter_storage(
     let abi_bits = u64::from(abi_storage.size).checked_mul(8)?;
     let carrier = logical.carrier();
     let size_bits = carrier.size_bits();
-    if carrier.offset_bits() != 0 || size_bits == 0 || size_bits % 8 != 0 {
+    if carrier.offset_bits() != 0 || size_bits == 0 || !size_bits.is_multiple_of(8) {
         return None;
     }
     match carrier.kind() {
@@ -883,9 +883,11 @@ pub enum CertifiedMemoryStatementKind {
 /// Required execution policy for certified memory statements.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum CertifiedMemoryExecutionPolicy {
-    /// Evaluate exactly once in certified source order through an address-space
-    /// helper. An ordinary C pointer dereference is not permitted evidence.
-    ExactlyOnceInSourceOrderViaHelper,
+    /// Evaluate exactly once in certified source order. The generic rendering
+    /// uses an address-space helper; a stronger exact typed-region certificate
+    /// may instead project the same private access through a sealed C lvalue.
+    /// An ordinary unproven C pointer dereference is never permitted evidence.
+    ExactlyOnceInSourceOrder,
 }
 
 /// Sealed evidence for one plain source Load or Store.
@@ -979,7 +981,7 @@ impl CertifiedMemoryStatement {
                 self.endianness,
                 MachineMemoryEndianness::Little | MachineMemoryEndianness::Big
             )
-            || self.execution != CertifiedMemoryExecutionPolicy::ExactlyOnceInSourceOrderViaHelper
+            || self.execution != CertifiedMemoryExecutionPolicy::ExactlyOnceInSourceOrder
             || obligation.instruction != self.producer
             || obligation.kind != expected_kind
             || obligation.component
@@ -2651,7 +2653,7 @@ pub enum CertifiedTypedRegionKind {
 }
 
 pub const CERTIFIED_TERMINAL_RETURN_REGION_CONTRACT_VERSION: u32 = 5;
-pub const CERTIFIED_PLAIN_RAM_MEMORY_RETURN_CONTRACT_VERSION: u32 = 3;
+pub const CERTIFIED_PLAIN_RAM_MEMORY_RETURN_CONTRACT_VERSION: u32 = 4;
 pub const CERTIFIED_DIRECT_CALL_TERMINAL_RETURN_CONTRACT_VERSION: u32 = 3;
 pub const CERTIFIED_CONDITIONAL_TERMINAL_RETURN_CONTRACT_VERSION: u32 = 3;
 pub const CERTIFIED_SWITCH_TERMINAL_RETURN_CONTRACT_VERSION: u32 = 3;
@@ -2935,9 +2937,7 @@ fn exact_terminal_return_mechanical_reads(
             return None;
         };
         let statement = effect.statement_evidence()?;
-        let Some(mapping) = mappings.get(&obligation.id) else {
-            return None;
-        };
+        let mapping = mappings.get(&obligation.id)?;
         if effect.disposition()
             != &(EffectDisposition::AbsorbedIntoStatement {
                 producer: obligation.id.instruction,
@@ -2945,8 +2945,7 @@ fn exact_terminal_return_mechanical_reads(
             || mapping.source_disposition() != effect.disposition()
             || statement.producer() != obligation.id.instruction
             || statement.source_obligations() != &BTreeSet::from([obligation.id])
-            || statement.execution()
-                != CertifiedMemoryExecutionPolicy::ExactlyOnceInSourceOrderViaHelper
+            || statement.execution() != CertifiedMemoryExecutionPolicy::ExactlyOnceInSourceOrder
             || !matches!(
                 statement.kind(),
                 CertifiedMemoryStatementKind::Read { result }
@@ -2996,8 +2995,7 @@ fn exact_terminal_frame_memory_obligations(
             )
         );
         if !kind_matches
-            || statement.execution()
-                != CertifiedMemoryExecutionPolicy::ExactlyOnceInSourceOrderViaHelper
+            || statement.execution() != CertifiedMemoryExecutionPolicy::ExactlyOnceInSourceOrder
             || statement.source_obligations().is_empty()
         {
             return None;
@@ -3355,7 +3353,7 @@ pub fn certify_plain_ram_memory_return_region(
                             MachineMemoryEndianness::Little | MachineMemoryEndianness::Big
                         )
                         && statement.execution()
-                            == CertifiedMemoryExecutionPolicy::ExactlyOnceInSourceOrderViaHelper
+                            == CertifiedMemoryExecutionPolicy::ExactlyOnceInSourceOrder
                         && effect.disposition()
                             == &EffectDisposition::AbsorbedIntoStatement {
                                 producer: statement.producer(),
@@ -5597,8 +5595,10 @@ fn certified_return_controls(
             }
             _ => continue,
         };
-        let Some((values, register_compositions)) =
-            certified_return_shapes(artifact, inst.id, producer, boundary)?
+        let Some(CertifiedReturnShapes {
+            values,
+            register_compositions,
+        }) = certified_return_shapes(artifact, inst.id, producer, boundary)?
         else {
             continue;
         };
@@ -5639,18 +5639,17 @@ fn certified_return_controls(
     Ok(returns)
 }
 
+struct CertifiedReturnShapes {
+    values: Vec<CertifiedReturnValue>,
+    register_compositions: Vec<CertifiedReturnRegisterComposition>,
+}
+
 fn certified_return_shapes(
     artifact: &SsaArtifact,
     boundary_at: InstId,
     return_producer: CanonicalInstructionId,
     boundary: &SourceReturnBoundaryFact,
-) -> Result<
-    Option<(
-        Vec<CertifiedReturnValue>,
-        Vec<CertifiedReturnRegisterComposition>,
-    )>,
-    MachineBuildError,
-> {
+) -> Result<Option<CertifiedReturnShapes>, MachineBuildError> {
     let machine_context = artifact.machine_context();
     let expected_slots = machine_context
         .abi_model()
@@ -5722,7 +5721,10 @@ fn certified_return_shapes(
         };
         register_compositions.push(composition);
     }
-    Ok(Some((values, register_compositions)))
+    Ok(Some(CertifiedReturnShapes {
+        values,
+        register_compositions,
+    }))
 }
 
 fn certified_return_register_definition(
@@ -6499,7 +6501,7 @@ fn try_certified_memory_statement(
         endianness: space_model.endianness(),
         word_size_bytes: space_model.word_size_bytes(),
         width_bits,
-        execution: CertifiedMemoryExecutionPolicy::ExactlyOnceInSourceOrderViaHelper,
+        execution: CertifiedMemoryExecutionPolicy::ExactlyOnceInSourceOrder,
         kind,
         source_obligations: BTreeSet::from([obligation]),
     };
@@ -7096,6 +7098,24 @@ impl FrameAffine {
             })
         }
     }
+}
+
+#[derive(Clone, Copy)]
+struct FrameAffineRegisterContext<'a> {
+    artifact: &'a SsaArtifact,
+    projection: &'a MachineProjection,
+    entry_stack_pointer: ValueId,
+    stack_pointer_storage: CanonicalStorageId,
+    register_storage: CanonicalStorageId,
+    width_bits: u32,
+}
+
+struct FrameStackedReturnContext<'a> {
+    artifact: &'a SsaArtifact,
+    memory_statements: &'a BTreeMap<CanonicalInstructionId, CertifiedMemoryStatement>,
+    entry_stack_pointer: ValueId,
+    stack_pointer_storage: CanonicalStorageId,
+    width_bits: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -7711,36 +7731,36 @@ fn frame_affine_assignment_input(
 }
 
 fn frame_affine_register_assignment_for_inst(
-    artifact: &SsaArtifact,
-    projection: &MachineProjection,
+    context: FrameAffineRegisterContext<'_>,
     inst: InstId,
-    entry_stack_pointer: ValueId,
-    stack_pointer_storage: CanonicalStorageId,
-    frame_pointer_storage: CanonicalStorageId,
-    width_bits: u32,
     affine: &mut BTreeMap<ValueId, Option<FrameAffine>>,
 ) -> Option<CertifiedFrameRegisterAssignment> {
-    let graph_inst = artifact.graph().inst(inst)?;
+    let graph_inst = context.artifact.graph().inst(inst)?;
     let output = graph_inst.output?;
-    let input =
-        frame_affine_assignment_input(artifact, inst, entry_stack_pointer, width_bits, affine)?;
+    let input = frame_affine_assignment_input(
+        context.artifact,
+        inst,
+        context.entry_stack_pointer,
+        context.width_bits,
+        affine,
+    )?;
     let relation = frame_affine_value(
-        artifact,
+        context.artifact,
         output,
-        entry_stack_pointer,
-        width_bits,
+        context.entry_stack_pointer,
+        context.width_bits,
         affine,
         &mut BTreeSet::new(),
     )?;
     let mut assignment = frame_register_assignment_for_inst(
-        artifact,
-        projection,
+        context.artifact,
+        context.projection,
         inst,
         input,
-        frame_pointer_storage,
+        context.register_storage,
     )?;
     assignment.normalized_affine_relation = Some(CertifiedFrameAffineRelation {
-        base_storage: stack_pointer_storage,
+        base_storage: context.stack_pointer_storage,
         offset_bytes: relation.signed_offset()?,
         width_bits: relation.width_bits,
     });
@@ -7748,16 +7768,12 @@ fn frame_affine_register_assignment_for_inst(
 }
 
 fn frame_affine_register_assignment_matches(
-    artifact: &SsaArtifact,
-    projection: &MachineProjection,
+    context: FrameAffineRegisterContext<'_>,
     assignment: &CertifiedFrameRegisterAssignment,
-    entry_stack_pointer: ValueId,
-    stack_pointer_storage: CanonicalStorageId,
-    frame_pointer_storage: CanonicalStorageId,
-    width_bits: u32,
     affine: &mut BTreeMap<ValueId, Option<FrameAffine>>,
 ) -> bool {
-    let Some(instruction) = artifact
+    let Some(instruction) = context
+        .artifact
         .obligations()
         .instructions()
         .get(&assignment.producer)
@@ -7765,17 +7781,7 @@ fn frame_affine_register_assignment_matches(
         return false;
     };
     instruction.source.graph_inst().is_some_and(|inst| {
-        frame_affine_register_assignment_for_inst(
-            artifact,
-            projection,
-            inst,
-            entry_stack_pointer,
-            stack_pointer_storage,
-            frame_pointer_storage,
-            width_bits,
-            affine,
-        )
-        .as_ref()
+        frame_affine_register_assignment_for_inst(context, inst, affine).as_ref()
             == Some(assignment)
     })
 }
@@ -7790,13 +7796,15 @@ fn stack_pointer_assignment_for_inst(
     affine: &mut BTreeMap<ValueId, Option<FrameAffine>>,
 ) -> Option<CertifiedStackPointerAssignment> {
     let assignment = frame_affine_register_assignment_for_inst(
-        artifact,
-        projection,
+        FrameAffineRegisterContext {
+            artifact,
+            projection,
+            entry_stack_pointer,
+            stack_pointer_storage,
+            register_storage: stack_pointer_storage,
+            width_bits,
+        },
         inst,
-        entry_stack_pointer,
-        stack_pointer_storage,
-        stack_pointer_storage,
-        width_bits,
         affine,
     )?;
     Some(CertifiedStackPointerAssignment {
@@ -7960,18 +7968,30 @@ fn frame_normalized_range(
     })
 }
 
-fn frame_stacked_return_read(
+fn frame_statement_has_exact_nonstack_object(
     artifact: &SsaArtifact,
+    statement: &CertifiedMemoryStatement,
+) -> bool {
+    matches!(
+        artifact.objects().objects.get(&statement.object()),
+        Some(object)
+            if matches!(
+                object.kind,
+                ObjectKind::Parameter { .. }
+                    | ObjectKind::Global { .. }
+                    | ObjectKind::HeapAlloc { .. }
+            )
+    )
+}
+
+fn frame_stacked_return_read(
+    context: FrameStackedReturnContext<'_>,
     control: &CertifiedReturnControl,
     return_inst: InstId,
-    memory_statements: &BTreeMap<CanonicalInstructionId, CertifiedMemoryStatement>,
-    entry_stack_pointer: ValueId,
-    stack_pointer_storage: CanonicalStorageId,
-    width_bits: u32,
     exit_offset: i64,
     affine: &mut BTreeMap<ValueId, Option<FrameAffine>>,
 ) -> Option<CertifiedMemoryStatement> {
-    let interface = artifact.machine_context().function_interface()?;
+    let interface = context.artifact.machine_context().function_interface()?;
     let return_address_storage = interface.return_address_storage()?;
     let mechanism = interface.return_mechanism()?;
     let address_size = mechanism.address_size_bytes();
@@ -7980,15 +8000,15 @@ fn frame_stacked_return_read(
         || mechanism.slot_size_bytes() != address_size
         || mechanism.stack_pointer_delta_bytes() != address_size
         || exit_offset != i64::from(address_size)
-        || address_bits != width_bits
+        || address_bits != context.width_bits
         || return_address_storage.size != address_size
-        || stack_pointer_storage.size != address_size
+        || context.stack_pointer_storage.size != address_size
         || control.return_address().storage() != return_address_storage
         || control.control_target().binding().width_bits() != address_bits
     {
         return None;
     }
-    let memory_model = artifact.machine_context().memory_model();
+    let memory_model = context.artifact.machine_context().memory_model();
     let ram = memory_model.space(r2il::SpaceId::Ram)?;
     if !memory_model.is_available()
         || !memory_model.is_coherent()
@@ -8002,7 +8022,8 @@ fn frame_stacked_return_read(
         offset: mechanism.stack_offset(),
         size_bytes: mechanism.slot_size_bytes(),
     };
-    let reads = memory_statements
+    let reads = context
+        .memory_statements
         .values()
         .filter(|statement| {
             statement.space() == MachineAddressSpace::Ram
@@ -8010,17 +8031,21 @@ fn frame_stacked_return_read(
                 && statement.width_bits() == address_bits
                 && statement.endianness() == ram.endianness()
                 && frame_normalized_range(
-                    artifact,
+                    context.artifact,
                     statement,
-                    entry_stack_pointer,
-                    width_bits,
+                    context.entry_stack_pointer,
+                    context.width_bits,
                     affine,
                 ) == Some(return_range)
                 && matches!(statement.kind(), CertifiedMemoryStatementKind::Read { result }
                     if result == control.control_target()
                         && result == control.return_address().value()
                         && result.producer() == Some(statement.producer()))
-                && frame_instruction_dominates(artifact, statement.access().inst, return_inst)
+                && frame_instruction_dominates(
+                    context.artifact,
+                    statement.access().inst,
+                    return_inst,
+                )
         })
         .cloned()
         .collect::<Vec<_>>();
@@ -8102,6 +8127,14 @@ fn frame_evidence_from_certified_parts(
     }
 
     let mut affine = BTreeMap::new();
+    let frame_relation_context = FrameAffineRegisterContext {
+        artifact,
+        projection,
+        entry_stack_pointer,
+        stack_pointer_storage,
+        register_storage: frame_pointer_storage,
+        width_bits,
+    };
     let mut relation: Option<(CertifiedFrameRegisterAssignment, InstId, ValueId)> = None;
     let mut restore_candidates = Vec::<FrameRestoreCandidate>::new();
     for inst in &graph.insts {
@@ -8120,13 +8153,8 @@ fn frame_evidence_from_certified_parts(
         .is_some()
         {
             let assignment = frame_affine_register_assignment_for_inst(
-                artifact,
-                projection,
+                frame_relation_context,
                 inst.id,
-                entry_stack_pointer,
-                stack_pointer_storage,
-                frame_pointer_storage,
-                width_bits,
                 &mut affine,
             )?;
             if relation.replace((assignment, inst.id, output)).is_some() {
@@ -8215,13 +8243,8 @@ fn frame_evidence_from_certified_parts(
     )?;
     if relation_affine.width_bits != width_bits
         || !frame_affine_register_assignment_matches(
-            artifact,
-            projection,
+            frame_relation_context,
             &frame_relation,
-            entry_stack_pointer,
-            stack_pointer_storage,
-            frame_pointer_storage,
-            width_bits,
             &mut affine,
         )
     {
@@ -8392,10 +8415,7 @@ fn frame_evidence_from_certified_parts(
             width_bits,
             &mut affine,
         ) else {
-            if matches!(
-                artifact.objects().objects.get(&statement.object()),
-                Some(object) if matches!(object.kind, ObjectKind::Global { .. })
-            ) {
+            if frame_statement_has_exact_nonstack_object(artifact, statement) {
                 continue;
             }
             return None;
@@ -8534,13 +8554,15 @@ fn frame_evidence_from_certified_parts(
             (false, 0) => None,
             (false, _) => return None,
             (true, _) => Some(frame_stacked_return_read(
-                artifact,
+                FrameStackedReturnContext {
+                    artifact,
+                    memory_statements,
+                    entry_stack_pointer,
+                    stack_pointer_storage,
+                    width_bits,
+                },
                 control,
                 return_inst,
-                memory_statements,
-                entry_stack_pointer,
-                stack_pointer_storage,
-                width_bits,
                 exit_offset,
                 &mut affine,
             )?),
@@ -8598,10 +8620,7 @@ fn frame_evidence_from_certified_parts(
                 width_bits,
                 &mut affine,
             ) else {
-                if matches!(
-                    artifact.objects().objects.get(&statement.object()),
-                    Some(object) if matches!(object.kind, ObjectKind::Global { .. })
-                ) {
+                if frame_statement_has_exact_nonstack_object(artifact, statement) {
                     continue;
                 }
                 return None;
@@ -8898,13 +8917,15 @@ fn stack_discipline_evidence_from_certified_parts(
         };
         let return_address_read = if mechanism.is_some() {
             let read = frame_stacked_return_read(
-                artifact,
+                FrameStackedReturnContext {
+                    artifact,
+                    memory_statements,
+                    entry_stack_pointer: entry_stack_pointer_value,
+                    stack_pointer_storage,
+                    width_bits,
+                },
                 control,
                 return_inst,
-                memory_statements,
-                entry_stack_pointer_value,
-                stack_pointer_storage,
-                width_bits,
                 expected_exit_offset,
                 &mut affine,
             )?;
@@ -9020,10 +9041,7 @@ fn stack_discipline_evidence_from_certified_parts(
             &mut affine,
         );
         let Some(range) = normalized else {
-            if matches!(
-                artifact.objects().objects.get(&statement.object()),
-                Some(object) if matches!(object.kind, ObjectKind::Global { .. })
-            ) {
+            if frame_statement_has_exact_nonstack_object(artifact, statement) {
                 continue;
             }
             return None;
@@ -9742,16 +9760,18 @@ impl CertifiedMachineFunction {
             );
         let private_frame_conditional_joins =
             private_frame_conditional_join::certified_private_frame_conditional_joins(
-                artifact,
-                &origin,
-                &topology,
-                stack_discipline.as_ref(),
-                frame_preservation.as_ref(),
-                &private_frame_value_flows,
-                &direct_controls,
-                &conditional_controls,
-                &return_controls,
-                certification.ledger(),
+                private_frame_conditional_join::PrivateFrameConditionalJoinCertificationInput {
+                    artifact,
+                    origin: &origin,
+                    topology: &topology,
+                    stack: stack_discipline.as_ref(),
+                    frame: frame_preservation.as_ref(),
+                    flows: &private_frame_value_flows,
+                    direct_controls: &direct_controls,
+                    conditional_controls: &conditional_controls,
+                    return_controls: &return_controls,
+                    ledger: certification.ledger(),
+                },
             );
         Ok(Self {
             origin,
@@ -10501,16 +10521,18 @@ impl CertifiedMachineProjection {
             );
         let private_frame_conditional_joins =
             private_frame_conditional_join::certified_private_frame_conditional_joins(
-                artifact,
-                &origin,
-                &topology,
-                stack_discipline.as_ref(),
-                frame_preservation.as_ref(),
-                &private_frame_value_flows,
-                &direct_controls,
-                &conditional_controls,
-                &return_controls,
-                certification.ledger(),
+                private_frame_conditional_join::PrivateFrameConditionalJoinCertificationInput {
+                    artifact,
+                    origin: &origin,
+                    topology: &topology,
+                    stack: stack_discipline.as_ref(),
+                    frame: frame_preservation.as_ref(),
+                    flows: &private_frame_value_flows,
+                    direct_controls: &direct_controls,
+                    conditional_controls: &conditional_controls,
+                    return_controls: &return_controls,
+                    ledger: certification.ledger(),
+                },
             );
         Ok(Self {
             origin,
@@ -11541,6 +11563,7 @@ mod tests {
         CustomSaveAndRestore,
         StaleSplitAllocation,
         GlobalLoad,
+        ParameterMemory,
         UnknownPointerLoad,
         WrongAffineRoot,
         EntrySelfLoop,
@@ -12060,6 +12083,7 @@ mod tests {
             | FrameMutation::CustomSaveAndRestore
             | FrameMutation::StaleSplitAllocation
             | FrameMutation::GlobalLoad
+            | FrameMutation::ParameterMemory
             | FrameMutation::UnknownPointerLoad
             | FrameMutation::WrongAffineRoot
             | FrameMutation::EntrySelfLoop
@@ -12081,7 +12105,18 @@ mod tests {
             | FrameMutation::ImplicitPrivateStack
             | FrameMutation::ImplicitPrivateStackOverlap => {}
         }
-        if matches!(mutation, FrameMutation::GlobalLoad) {
+        if matches!(mutation, FrameMutation::ParameterMemory) {
+            block.push(R2ILOp::Store {
+                space: SpaceId::Ram,
+                addr: Varnode::register(40, 8),
+                val: Varnode::constant(0x1122_3344, 4),
+            });
+            block.push(R2ILOp::Load {
+                dst: unrelated_load.clone(),
+                space: SpaceId::Ram,
+                addr: Varnode::register(40, 8),
+            });
+        } else if matches!(mutation, FrameMutation::GlobalLoad) {
             block.push(R2ILOp::Load {
                 dst: unrelated_load.clone(),
                 space: SpaceId::Ram,
@@ -12101,9 +12136,10 @@ mod tests {
                 b: Varnode::constant(8, 8),
             });
             restore_address
-        } else if matches!(mutation, FrameMutation::RestoreBeforeRelation) {
-            sp.clone()
-        } else if matches!(mutation, FrameMutation::ZeroObligationRelation) {
+        } else if matches!(
+            mutation,
+            FrameMutation::RestoreBeforeRelation | FrameMutation::ZeroObligationRelation
+        ) {
             sp.clone()
         } else {
             fp.clone()
@@ -12282,7 +12318,11 @@ mod tests {
             });
         }
 
-        let mut arch = ArchSpec::new("preserved-frame-test");
+        let mut arch = ArchSpec::new(if matches!(mutation, FrameMutation::ParameterMemory) {
+            "x86-64"
+        } else {
+            "preserved-frame-test"
+        });
         arch.addr_size = 8;
         arch.add_register(RegisterDef::new("fp", 0, 8));
         arch.add_register(RegisterDef::sub("fp_low", 0, 4, "fp"));
@@ -12291,6 +12331,9 @@ mod tests {
         arch.add_register(RegisterDef::new("other", 24, 8));
         arch.add_register(RegisterDef::new("ret", 32, 8));
         arch.add_register(RegisterDef::sub("ret_low", 32, 1, "ret"));
+        if matches!(mutation, FrameMutation::ParameterMemory) {
+            arch.add_register(RegisterDef::new("rdi", 40, 8));
+        }
         arch.add_space(AddressSpace::ram(8));
         arch.add_space(AddressSpace::new(SpaceId::Custom(1), "other-memory", 8));
         let storage = |offset| CanonicalStorageId {
@@ -12311,19 +12354,50 @@ mod tests {
                 8,
             )]
         };
-        let interface = SourceFunctionInterface::new_exact(
-            b"preserved-frame-revision-1".to_vec(),
-            "test-frame-abi",
-            [],
-            if matches!(mutation, FrameMutation::ComposedReturn) {
-                SourceFunctionReturn::Register {
-                    storage: storage(32),
-                }
-            } else {
-                SourceFunctionReturn::Void
-            },
-            stack_slots,
-        )
+        let return_kind = if matches!(mutation, FrameMutation::ComposedReturn) {
+            SourceFunctionReturn::Register {
+                storage: storage(32),
+            }
+        } else {
+            SourceFunctionReturn::Void
+        };
+        let interface = if matches!(mutation, FrameMutation::ParameterMemory) {
+            let logical_value = SourceLogicalValue::new(
+                1,
+                r2ssa::SourceCarrierProjection::new(SourceCarrierKind::Full, 0, 64),
+            );
+            let type_graph = r2ssa::SourceTypeGraph::new(
+                [
+                    r2ssa::SourceType::new(0, r2ssa::SourceTypeKind::UnsignedInteger, 32, 32),
+                    r2ssa::SourceType::new(
+                        1,
+                        r2ssa::SourceTypeKind::Pointer { target_type_id: 0 },
+                        64,
+                        64,
+                    ),
+                ],
+                [],
+            )
+            .expect("parameter-memory source type graph");
+            SourceFunctionInterface::new_exact_with_logical_types(
+                b"preserved-frame-revision-1".to_vec(),
+                "test-frame-abi",
+                [SourceAbiParameterSpec::new(0, storage(40))],
+                return_kind,
+                stack_slots,
+                [logical_value],
+                None,
+                Some(type_graph),
+            )
+        } else {
+            SourceFunctionInterface::new_exact(
+                b"preserved-frame-revision-1".to_vec(),
+                "test-frame-abi",
+                [],
+                return_kind,
+                stack_slots,
+            )
+        }
         .and_then(|interface| interface.with_return_address_storage(storage(16)))
         .and_then(|interface| interface.with_stack_pointer_storage(storage(8)))
         .expect("exact preserved-frame interface");
@@ -13272,6 +13346,7 @@ mod tests {
             FrameMutation::DirectLoadRestore,
             FrameMutation::SplitAllocation,
             FrameMutation::GlobalLoad,
+            FrameMutation::ParameterMemory,
             FrameMutation::ComposedReturn,
         ] {
             assert!(
@@ -13334,13 +13409,15 @@ mod tests {
             .id;
         let mut affine = BTreeMap::new();
         assert!(frame_affine_register_assignment_matches(
-            &artifact,
-            &projection,
+            FrameAffineRegisterContext {
+                artifact: &artifact,
+                projection: &projection,
+                entry_stack_pointer,
+                stack_pointer_storage: evidence.stack_pointer_storage,
+                register_storage: evidence.frame_pointer_storage,
+                width_bits: 64,
+            },
             &relation,
-            entry_stack_pointer,
-            evidence.stack_pointer_storage,
-            evidence.frame_pointer_storage,
-            64,
             &mut affine,
         ));
 
@@ -13358,13 +13435,15 @@ mod tests {
             .expect("independent machine input");
         let assert_invalid = |assignment: &CertifiedFrameRegisterAssignment| {
             assert!(!frame_affine_register_assignment_matches(
-                &artifact,
-                &projection,
+                FrameAffineRegisterContext {
+                    artifact: &artifact,
+                    projection: &projection,
+                    entry_stack_pointer,
+                    stack_pointer_storage: evidence.stack_pointer_storage,
+                    register_storage: evidence.frame_pointer_storage,
+                    width_bits: 64,
+                },
                 assignment,
-                entry_stack_pointer,
-                evidence.stack_pointer_storage,
-                evidence.frame_pointer_storage,
-                64,
                 &mut BTreeMap::new(),
             ));
         };

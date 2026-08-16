@@ -11,6 +11,12 @@
 #ifdef R2SLEIGH_QUERY_RUNTIME_SOURCES_V2
 #error "mutable runtime-source query must not be public"
 #endif
+#ifdef R2SLEIGH_QUERY_RECOVERED_VARS_V2
+#error "retired recovered-variable query must not be public"
+#endif
+#ifdef R2SLEIGH_AUTO_CALLBACK_RECOVER_VARS_V2
+#error "retired recover-vars callback must not be public"
+#endif
 #ifdef R2SLEIGH_CAP_NATIVE_REQUEST_GRAPH_V2
 #error "detached native-request capability must not be public"
 #endif
@@ -94,9 +100,9 @@ int main(void) {
 	R2SleighPlannerQueryResponseV2 planner_response = {0};
 	request_payload.radare_snapshot = &radare_snapshot;
 	const R2SleighApiV2 *api = r2sleigh_api_v2 ();
-	if (R2SLEIGH_RADARE_ABI_V2 != 138
-		|| R2SLEIGH_RADARE_FUNCTION_SNAPSHOT_SCHEMA_V2 != 11
-		|| R2SLEIGH_RADARE_SNAPSHOT_ACCESSOR_SCHEMA_V2 != 4
+	if (R2SLEIGH_RADARE_ABI_V2 != 139
+		|| R2SLEIGH_RADARE_FUNCTION_SNAPSHOT_SCHEMA_V2 != 12
+		|| R2SLEIGH_RADARE_SNAPSHOT_ACCESSOR_SCHEMA_V2 != 5
 		|| stack_allocation.growth != 1
 		|| stack_allocation.implicit_active_sp_bytes != 128
 		|| radare_snapshot.struct_size != sizeof (R2SleighRadareSnapshotInputV2)
@@ -178,9 +184,17 @@ int main(void) {
 		return 8;
 	}
 	planner_query.kind = R2SLEIGH_PLANNER_AUTO_CALLBACK_V2;
+	planner_query.callback_kind = 1;
+	if (api->planner_query (&planner_query, &planner_response) != R2SLEIGH_STATUS_INVALID_ARGUMENT_V2
+		|| planner_response.abi_version != 0
+		|| planner_response.struct_size != 0
+		|| planner_response.schema_version != 0
+		|| planner_response.kind != 0) {
+		return 9;
+	}
 	planner_query.callback_kind = UINT32_MAX;
 	if (api->planner_query (&planner_query, &planner_response) != R2SLEIGH_STATUS_INVALID_ARGUMENT_V2) {
-		return 9;
+		return 15;
 	}
 	planner_query.callback_kind = 0;
 

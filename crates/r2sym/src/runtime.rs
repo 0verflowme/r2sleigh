@@ -365,7 +365,9 @@ pub fn seed_scope_state_for_arch<'ctx>(
     arch: Option<&ArchSpec>,
 ) {
     seed_default_state_for_arch(state, prepared, arch);
-    seed_process_like_main_arguments(state, prepared, scope, arch);
+    if scope.exact_for_artifact(prepared).is_some() {
+        seed_process_like_main_arguments(state, prepared, scope, arch);
+    }
 }
 
 const STACK_WINDOW_BELOW: u64 = 0x8000;
@@ -579,10 +581,14 @@ fn apply_windows_runtime_hook<'ctx>(
 
 pub fn install_runtime_hooks_for_scope<'ctx>(
     explorer: &mut PathExplorer<'ctx>,
+    prepared: &SsaArtifact,
     scope: &PreparedFunctionScope,
     arch: Option<&ArchSpec>,
     symbol_map: &HashMap<u64, String>,
 ) {
+    let Some(scope) = scope.exact_for_artifact(prepared) else {
+        return;
+    };
     let Some(arch) = arch else {
         return;
     };
@@ -629,6 +635,7 @@ mod tests {
     use r2il::{AddressSpace, ArchSpec, R2ILBlock, R2ILOp, RegisterDef, SpaceId, Varnode};
     use r2ssa::{InterprocFunctionId, SsaArtifact};
     use std::collections::HashMap;
+    use std::sync::Arc;
     use z3::Context;
 
     fn make_main_seed_arch(addr_size: u32) -> ArchSpec {
@@ -644,7 +651,7 @@ mod tests {
         arch
     }
 
-    fn make_main_seed_scope(arch: &ArchSpec) -> (SsaArtifact, PreparedFunctionScope) {
+    fn make_main_seed_scope(arch: &ArchSpec) -> (Arc<SsaArtifact>, PreparedFunctionScope) {
         let mut block = R2ILBlock::new(0x1000, 1);
         block.push(R2ILOp::Copy {
             dst: Varnode::unique(0x10, 8),
@@ -661,15 +668,17 @@ mod tests {
         block.push(R2ILOp::Return {
             target: Varnode::constant(0, 8),
         });
-        let prepared = SsaArtifact::for_symbolic(&[block], Some(arch))
-            .expect("ssa")
-            .with_name("main");
+        let prepared = Arc::new(
+            SsaArtifact::for_symbolic(&[block], Some(arch))
+                .expect("ssa")
+                .with_name("main"),
+        );
         let scope = PreparedFunctionScope::new(
             0x1000,
             vec![ScopedPreparedFunction {
                 id: InterprocFunctionId(0x1000),
                 name: Some("main".to_string()),
-                prepared: prepared.clone(),
+                prepared: Arc::clone(&prepared),
             }],
         )
         .expect("scope");
@@ -736,6 +745,14 @@ mod tests {
             Some(0),
             "argv[1] should remain NUL-terminated",
         );
+
+        let foreign = prepared.with_assumptions(&r2ssa::AssumptionSet::default());
+        let mut foreign_state = SymState::new(&ctx, 0x1000);
+        seed_scope_state_for_arch(&mut foreign_state, &foreign, &scope, Some(&arch));
+        assert!(
+            foreign_state.get_register("RDX_0").as_concrete().is_none(),
+            "foreign scope authority must not seed process-like argv state"
+        );
     }
 
     #[test]
@@ -766,7 +783,7 @@ mod tests {
     fn install_runtime_hooks_uses_symbol_map_imports_even_without_scope_calls() {
         let ctx = Context::thread_local();
         let arch = make_main_seed_arch(8);
-        let (_prepared, scope) = make_main_seed_scope(&arch);
+        let (_prepared, _scope) = make_main_seed_scope(&arch);
         let blocks = vec![
             R2ILBlock {
                 addr: 0x2000,
@@ -812,11 +829,20 @@ mod tests {
                 }],
             },
         ];
-        let func = SsaArtifact::for_symbolic(&blocks, Some(&arch)).expect("ssa");
+        let func = Arc::new(SsaArtifact::for_symbolic(&blocks, Some(&arch)).expect("ssa"));
+        let scope = PreparedFunctionScope::new(
+            func.entry,
+            vec![ScopedPreparedFunction {
+                id: InterprocFunctionId(func.entry),
+                name: Some("runtime_hook_root".to_string()),
+                prepared: Arc::clone(&func),
+            }],
+        )
+        .expect("exact scope");
         let mut explorer = PathExplorer::new(&ctx);
         let symbol_map =
             HashMap::from([(0x401000, "sym.imp.KERNEL32.dll_VirtualAlloc".to_string())]);
-        install_runtime_hooks_for_scope(&mut explorer, &scope, Some(&arch), &symbol_map);
+        install_runtime_hooks_for_scope(&mut explorer, &func, &scope, Some(&arch), &symbol_map);
 
         let mut state = SymState::new(&ctx, 0x2000);
         state.set_concrete("RDX_0", 0x1000, 64);

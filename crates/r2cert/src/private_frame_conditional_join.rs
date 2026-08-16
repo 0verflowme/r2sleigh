@@ -36,7 +36,7 @@ pub struct CertifiedPrivateFrameTransparentBranch {
 /// join. A fallthrough carries topology only: it owns no control obligation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub enum CertifiedPrivateFrameJoinTransfer {
-    Direct(CertifiedDirectControl),
+    Direct(Box<CertifiedDirectControl>),
     Fallthrough { block_addr: u64, target: u64 },
 }
 
@@ -606,9 +606,9 @@ fn exact_return_address_read_producer(
     .then_some(read.producer())
 }
 
-fn direct_controls_by_block<'a>(
-    controls: &'a BTreeMap<CanonicalInstructionId, CertifiedDirectControl>,
-) -> Option<BTreeMap<u64, &'a CertifiedDirectControl>> {
+fn direct_controls_by_block(
+    controls: &BTreeMap<CanonicalInstructionId, CertifiedDirectControl>,
+) -> Option<BTreeMap<u64, &CertifiedDirectControl>> {
     let mut by_block = BTreeMap::new();
     for control in controls.values() {
         if by_block
@@ -641,18 +641,33 @@ fn exact_branch_block(
         && (!branch_only || block.instructions() == [control.producer()])
 }
 
-fn certify_arm(
-    source: &r2ssa::SemanticObligationInventory,
-    topology: &CertifiedSourceTopology,
+struct ArmRouteContext<'a, 'control> {
+    source: &'a r2ssa::SemanticObligationInventory,
+    topology: &'a CertifiedSourceTopology,
+    controls: &'a BTreeMap<u64, &'control CertifiedDirectControl>,
+    ledger: &'a ObligationLedger,
+}
+
+#[derive(Clone, Copy)]
+struct ArmRouteInput {
     start: u64,
     header: u64,
     terminal: u64,
     join: u64,
-    store: &CertifiedPrivateFrameStore,
-    controls: &BTreeMap<u64, &CertifiedDirectControl>,
-    ledger: &ObligationLedger,
+    store_producer: CanonicalInstructionId,
+}
+
+struct ArmCertificationInput<'a> {
+    route: ArmRouteInput,
+    store: &'a CertifiedPrivateFrameStore,
+}
+
+fn certify_arm(
+    context: &ArmRouteContext<'_, '_>,
+    input: ArmCertificationInput<'_>,
 ) -> Option<CertifiedPrivateFrameConditionalArm> {
-    if store.statement().producer().block_addr != terminal
+    let ArmCertificationInput { route, store } = input;
+    if store.statement().producer().block_addr != route.terminal
         || !matches!(
             store.statement().kind(),
             CertifiedMemoryStatementKind::Write { .. }
@@ -660,40 +675,30 @@ fn certify_arm(
     {
         return None;
     }
-    let (transparent, transfer) = certify_arm_route(
-        source,
-        topology,
-        start,
-        header,
-        terminal,
-        join,
-        store.statement().producer(),
-        controls,
-        ledger,
-    )?;
+    let (transparent, transfer) = certify_arm_route(context, route)?;
     Some(CertifiedPrivateFrameConditionalArm {
-        entry_target: start,
+        entry_target: route.start,
         transparent,
-        store_block: terminal,
+        store_block: route.terminal,
         store: store.clone(),
         join_transfer: transfer,
     })
 }
 
 fn certify_arm_route(
-    source: &r2ssa::SemanticObligationInventory,
-    topology: &CertifiedSourceTopology,
-    start: u64,
-    header: u64,
-    terminal: u64,
-    join: u64,
-    store_producer: CanonicalInstructionId,
-    controls: &BTreeMap<u64, &CertifiedDirectControl>,
-    ledger: &ObligationLedger,
+    context: &ArmRouteContext<'_, '_>,
+    input: ArmRouteInput,
 ) -> Option<(
     Box<[CertifiedPrivateFrameTransparentBranch]>,
     CertifiedPrivateFrameJoinTransfer,
 )> {
+    let ArmRouteInput {
+        start,
+        header,
+        terminal,
+        join,
+        store_producer,
+    } = input;
     let mut current = start;
     let mut predecessor = header;
     let mut seen = BTreeSet::new();
@@ -702,11 +707,11 @@ fn certify_arm_route(
         if current == header || current == join || !seen.insert(current) {
             return None;
         }
-        let control = *controls.get(&current)?;
-        if control.validate(source).is_err()
-            || !direct_control_is_ledgered(control, ledger)
+        let control = *context.controls.get(&current)?;
+        if control.validate(context.source).is_err()
+            || !direct_control_is_ledgered(control, context.ledger)
             || !exact_branch_block(
-                topology,
+                context.topology,
                 current,
                 predecessor,
                 control.target(),
@@ -726,24 +731,31 @@ fn certify_arm_route(
     if !seen.insert(terminal) {
         return None;
     }
-    let block = topology.block(terminal)?;
+    let block = context.topology.block(terminal)?;
     if block.predecessors() != [predecessor] || block.successors() != [join] {
         return None;
     }
     let transfer = match block.terminator() {
         CertifiedSourceTerminator::Branch { target } if *target == join => {
-            let control = *controls.get(&terminal)?;
-            if control.validate(source).is_err()
-                || !direct_control_is_ledgered(control, ledger)
-                || !exact_branch_block(topology, terminal, predecessor, join, control, false)
+            let control = *context.controls.get(&terminal)?;
+            if control.validate(context.source).is_err()
+                || !direct_control_is_ledgered(control, context.ledger)
+                || !exact_branch_block(
+                    context.topology,
+                    terminal,
+                    predecessor,
+                    join,
+                    control,
+                    false,
+                )
             {
                 return None;
             }
-            CertifiedPrivateFrameJoinTransfer::Direct(control.clone())
+            CertifiedPrivateFrameJoinTransfer::Direct(Box::new(control.clone()))
         }
         CertifiedSourceTerminator::Fallthrough { next }
             if *next == join
-                && !controls.contains_key(&terminal)
+                && !context.controls.contains_key(&terminal)
                 && block.instructions().last() == Some(&store_producer) =>
         {
             CertifiedPrivateFrameJoinTransfer::Fallthrough {
@@ -996,18 +1008,42 @@ fn exact_private_access_coverage(
     (stack_accesses == selected_accesses).then_some(auxiliary)
 }
 
+#[derive(Clone, Copy)]
+struct ConditionalJoinCertificationContext<'a> {
+    artifact: &'a SsaArtifact,
+    origin: &'a CertifiedArtifactOrigin,
+    topology: &'a CertifiedSourceTopology,
+    stack: &'a CertifiedStackDiscipline,
+    frame: Option<&'a CertifiedFramePreservation>,
+    flows: &'a BTreeMap<StructuredAccessId, CertifiedPrivateFrameValueFlow>,
+    direct_controls: &'a BTreeMap<CanonicalInstructionId, CertifiedDirectControl>,
+    ledger: &'a ObligationLedger,
+}
+
+#[derive(Clone, Copy)]
+struct ConditionalJoinControls<'a> {
+    conditional: &'a CertifiedConditionalControl,
+    return_control: &'a CertifiedReturnControl,
+}
+
 fn certify_conditional_join(
-    artifact: &SsaArtifact,
-    origin: &CertifiedArtifactOrigin,
-    topology: &CertifiedSourceTopology,
-    stack: &CertifiedStackDiscipline,
-    frame: Option<&CertifiedFramePreservation>,
-    flows: &BTreeMap<StructuredAccessId, CertifiedPrivateFrameValueFlow>,
-    direct_controls: &BTreeMap<CanonicalInstructionId, CertifiedDirectControl>,
-    conditional: &CertifiedConditionalControl,
-    return_control: &CertifiedReturnControl,
-    ledger: &ObligationLedger,
+    context: &ConditionalJoinCertificationContext<'_>,
+    controls: ConditionalJoinControls<'_>,
 ) -> Option<CertifiedPrivateFrameConditionalJoin> {
+    let ConditionalJoinCertificationContext {
+        artifact,
+        origin,
+        topology,
+        stack,
+        frame,
+        flows,
+        direct_controls,
+        ledger,
+    } = *context;
+    let ConditionalJoinControls {
+        conditional,
+        return_control,
+    } = controls;
     if !origin.is_valid()
         || origin.authority.artifact.as_ref() != Some(artifact.authority())
         || origin.source() != artifact.obligations()
@@ -1016,9 +1052,9 @@ fn certify_conditional_join(
         || stack.schema_version() != CERTIFICATION_SCHEMA_VERSION
         || topology != origin.topology()
         || flows.values().any(|flow| flow.origin() != origin)
-        || !conditional.validate(origin.source()).is_ok()
+        || conditional.validate(origin.source()).is_err()
         || !conditional_control_is_ledgered(conditional, ledger)
-        || !return_control.validate(origin.source()).is_ok()
+        || return_control.validate(origin.source()).is_err()
         || !return_control_is_ledgered(return_control, ledger)
         || conditional.producer().block_addr != topology.entry_addr()
     {
@@ -1078,6 +1114,12 @@ fn certify_conditional_join(
         return None;
     }
     let controls = direct_controls_by_block(direct_controls)?;
+    let arm_context = ArmRouteContext {
+        source: origin.source(),
+        topology,
+        controls: &controls,
+        ledger,
+    };
     let store_by_block = BTreeMap::from([
         (stores[0].0, stores[0].1.clone()),
         (stores[1].0, stores[1].1.clone()),
@@ -1091,27 +1133,33 @@ fn certify_conditional_join(
     if true_terminal == false_terminal {
         return None;
     }
+    let true_store = store_by_block.get(&true_terminal)?;
     let true_arm = certify_arm(
-        origin.source(),
-        topology,
-        conditional.true_target(),
-        header,
-        true_terminal,
-        *join,
-        store_by_block.get(&true_terminal)?,
-        &controls,
-        ledger,
+        &arm_context,
+        ArmCertificationInput {
+            route: ArmRouteInput {
+                start: conditional.true_target(),
+                header,
+                terminal: true_terminal,
+                join: *join,
+                store_producer: true_store.statement().producer(),
+            },
+            store: true_store,
+        },
     )?;
+    let false_store = store_by_block.get(&false_terminal)?;
     let false_arm = certify_arm(
-        origin.source(),
-        topology,
-        conditional.false_target(),
-        header,
-        false_terminal,
-        *join,
-        store_by_block.get(&false_terminal)?,
-        &controls,
-        ledger,
+        &arm_context,
+        ArmCertificationInput {
+            route: ArmRouteInput {
+                start: conditional.false_target(),
+                header,
+                terminal: false_terminal,
+                join: *join,
+                store_producer: false_store.statement().producer(),
+            },
+            store: false_store,
+        },
     )?;
     let selected_direct = true_arm
         .transparent()
@@ -1268,18 +1316,35 @@ fn arm_terminal(
     Some(current)
 }
 
+pub(super) struct PrivateFrameConditionalJoinCertificationInput<'a> {
+    pub(super) artifact: &'a SsaArtifact,
+    pub(super) origin: &'a CertifiedArtifactOrigin,
+    pub(super) topology: &'a CertifiedSourceTopology,
+    pub(super) stack: Option<&'a CertifiedStackDiscipline>,
+    pub(super) frame: Option<&'a CertifiedFramePreservation>,
+    pub(super) flows: &'a BTreeMap<StructuredAccessId, CertifiedPrivateFrameValueFlow>,
+    pub(super) direct_controls: &'a BTreeMap<CanonicalInstructionId, CertifiedDirectControl>,
+    pub(super) conditional_controls:
+        &'a BTreeMap<CanonicalInstructionId, CertifiedConditionalControl>,
+    pub(super) return_controls: &'a BTreeMap<CanonicalInstructionId, CertifiedReturnControl>,
+    pub(super) ledger: &'a ObligationLedger,
+}
+
 pub(super) fn certified_private_frame_conditional_joins(
-    artifact: &SsaArtifact,
-    origin: &CertifiedArtifactOrigin,
-    topology: &CertifiedSourceTopology,
-    stack: Option<&CertifiedStackDiscipline>,
-    frame: Option<&CertifiedFramePreservation>,
-    flows: &BTreeMap<StructuredAccessId, CertifiedPrivateFrameValueFlow>,
-    direct_controls: &BTreeMap<CanonicalInstructionId, CertifiedDirectControl>,
-    conditional_controls: &BTreeMap<CanonicalInstructionId, CertifiedConditionalControl>,
-    return_controls: &BTreeMap<CanonicalInstructionId, CertifiedReturnControl>,
-    ledger: &ObligationLedger,
+    input: PrivateFrameConditionalJoinCertificationInput<'_>,
 ) -> BTreeMap<u64, CertifiedPrivateFrameConditionalJoin> {
+    let PrivateFrameConditionalJoinCertificationInput {
+        artifact,
+        origin,
+        topology,
+        stack,
+        frame,
+        flows,
+        direct_controls,
+        conditional_controls,
+        return_controls,
+        ledger,
+    } = input;
     let Some(stack) = stack else {
         return BTreeMap::new();
     };
@@ -1290,7 +1355,7 @@ pub(super) fn certified_private_frame_conditional_joins(
     else {
         return BTreeMap::new();
     };
-    let Some(join) = certify_conditional_join(
+    let context = ConditionalJoinCertificationContext {
         artifact,
         origin,
         topology,
@@ -1298,9 +1363,14 @@ pub(super) fn certified_private_frame_conditional_joins(
         frame,
         flows,
         direct_controls,
-        conditional,
-        return_control,
         ledger,
+    };
+    let Some(join) = certify_conditional_join(
+        &context,
+        ConditionalJoinControls {
+            conditional,
+            return_control,
+        },
     ) else {
         return BTreeMap::new();
     };
@@ -1648,21 +1718,48 @@ mod tests {
             .producer()
     }
 
+    fn arm_route_context<'a, 'control>(
+        fixture: &'a RouteFixture,
+        controls: &'a BTreeMap<u64, &'control CertifiedDirectControl>,
+    ) -> ArmRouteContext<'a, 'control> {
+        ArmRouteContext {
+            source: fixture.origin.source(),
+            topology: &fixture.topology,
+            controls,
+            ledger: &fixture.ledger,
+        }
+    }
+
+    fn arm_route_input(
+        fixture: &RouteFixture,
+        start: u64,
+        header: u64,
+        terminal: u64,
+        join: u64,
+    ) -> ArmRouteInput {
+        ArmRouteInput {
+            start,
+            header,
+            terminal,
+            join,
+            store_producer: write_producer(fixture, terminal),
+        }
+    }
+
     #[test]
     fn accepts_zero_and_one_branch_only_forwarders() {
         for with_chain in [false, true] {
             let fixture = route_fixture(with_chain, RouteMutation::None);
             let controls = direct_controls_by_block(&fixture.direct).expect("controls by block");
             let (transparent, transfer) = certify_arm_route(
-                fixture.origin.source(),
-                &fixture.topology,
-                fixture.conditional.true_target(),
-                fixture.conditional.producer().block_addr,
-                0x5010,
-                0x5014,
-                write_producer(&fixture, 0x5010),
-                &controls,
-                &fixture.ledger,
+                &arm_route_context(&fixture, &controls),
+                arm_route_input(
+                    &fixture,
+                    fixture.conditional.true_target(),
+                    fixture.conditional.producer().block_addr,
+                    0x5010,
+                    0x5014,
+                ),
             )
             .expect("exact arm route");
             assert_eq!(transparent.len(), usize::from(with_chain));
@@ -1670,15 +1767,14 @@ mod tests {
             assert_eq!(transfer.target(), 0x5014);
             assert!(transfer.direct().is_some());
             let (false_transparent, false_transfer) = certify_arm_route(
-                fixture.origin.source(),
-                &fixture.topology,
-                fixture.conditional.false_target(),
-                fixture.conditional.producer().block_addr,
-                0x5004,
-                0x5014,
-                write_producer(&fixture, 0x5004),
-                &controls,
-                &fixture.ledger,
+                &arm_route_context(&fixture, &controls),
+                arm_route_input(
+                    &fixture,
+                    fixture.conditional.false_target(),
+                    fixture.conditional.producer().block_addr,
+                    0x5004,
+                    0x5014,
+                ),
             )
             .expect("unchanged direct false-arm route");
             assert!(false_transparent.is_empty());
@@ -1707,15 +1803,14 @@ mod tests {
         let producer = write_producer(&fixture, 0x5010);
         assert_eq!(block.instructions().last(), Some(&producer));
         let (transparent, transfer) = certify_arm_route(
-            fixture.origin.source(),
-            &fixture.topology,
-            fixture.conditional.true_target(),
-            fixture.conditional.producer().block_addr,
-            0x5010,
-            0x5014,
-            producer,
-            &controls,
-            &fixture.ledger,
+            &arm_route_context(&fixture, &controls),
+            arm_route_input(
+                &fixture,
+                fixture.conditional.true_target(),
+                fixture.conditional.producer().block_addr,
+                0x5010,
+                0x5014,
+            ),
         )
         .expect("sealed fallthrough route");
         assert!(transparent.is_empty());
@@ -1752,15 +1847,14 @@ mod tests {
         ));
         assert!(
             certify_arm_route(
-                wrong_next.origin.source(),
-                &wrong_next.topology,
-                wrong_next.conditional.true_target(),
-                wrong_next.conditional.producer().block_addr,
-                0x5010,
-                0x5014,
-                write_producer(&wrong_next, 0x5010),
-                &controls,
-                &wrong_next.ledger,
+                &arm_route_context(&wrong_next, &controls),
+                arm_route_input(
+                    &wrong_next,
+                    wrong_next.conditional.true_target(),
+                    wrong_next.conditional.producer().block_addr,
+                    0x5010,
+                    0x5014,
+                ),
             )
             .is_none()
         );
@@ -1769,15 +1863,14 @@ mod tests {
         let controls = direct_controls_by_block(&exact.direct).unwrap();
         assert!(
             certify_arm_route(
-                exact.origin.source(),
-                &exact.topology,
-                exact.conditional.true_target(),
-                0xdead,
-                0x5010,
-                0x5014,
-                write_producer(&exact, 0x5010),
-                &controls,
-                &exact.ledger,
+                &arm_route_context(&exact, &controls),
+                arm_route_input(
+                    &exact,
+                    exact.conditional.true_target(),
+                    0xdead,
+                    0x5010,
+                    0x5014,
+                ),
             )
             .is_none()
         );
@@ -1796,15 +1889,14 @@ mod tests {
         );
         assert!(
             certify_arm_route(
-                nonfinal.origin.source(),
-                &nonfinal.topology,
-                nonfinal.conditional.true_target(),
-                nonfinal.conditional.producer().block_addr,
-                0x5010,
-                0x5014,
-                producer,
-                &controls,
-                &nonfinal.ledger,
+                &arm_route_context(&nonfinal, &controls),
+                arm_route_input(
+                    &nonfinal,
+                    nonfinal.conditional.true_target(),
+                    nonfinal.conditional.producer().block_addr,
+                    0x5010,
+                    0x5014,
+                ),
             )
             .is_none()
         );
@@ -1820,15 +1912,14 @@ mod tests {
         controls.insert(0x5010, &stray);
         assert!(
             certify_arm_route(
-                exact.origin.source(),
-                &exact.topology,
-                exact.conditional.true_target(),
-                exact.conditional.producer().block_addr,
-                0x5010,
-                0x5014,
-                write_producer(&exact, 0x5010),
-                &controls,
-                &exact.ledger,
+                &arm_route_context(&exact, &controls),
+                arm_route_input(
+                    &exact,
+                    exact.conditional.true_target(),
+                    exact.conditional.producer().block_addr,
+                    0x5010,
+                    0x5014,
+                ),
             )
             .is_none()
         );
@@ -1838,15 +1929,14 @@ mod tests {
         let controls = direct_controls_by_block(&exact.direct).unwrap();
         assert!(
             certify_arm_route(
-                exact.origin.source(),
-                &exact.topology,
-                swapped.true_target(),
-                swapped.producer().block_addr,
-                0x5010,
-                0x5014,
-                write_producer(&exact, 0x5010),
-                &controls,
-                &exact.ledger,
+                &arm_route_context(&exact, &controls),
+                arm_route_input(
+                    &exact,
+                    swapped.true_target(),
+                    swapped.producer().block_addr,
+                    0x5010,
+                    0x5014,
+                ),
             )
             .is_none()
         );
@@ -1858,15 +1948,14 @@ mod tests {
         let controls = direct_controls_by_block(&payload.direct).unwrap();
         assert!(
             certify_arm_route(
-                payload.origin.source(),
-                &payload.topology,
-                payload.conditional.true_target(),
-                payload.conditional.producer().block_addr,
-                0x5010,
-                0x5014,
-                write_producer(&payload, 0x5010),
-                &controls,
-                &payload.ledger,
+                &arm_route_context(&payload, &controls),
+                arm_route_input(
+                    &payload,
+                    payload.conditional.true_target(),
+                    payload.conditional.producer().block_addr,
+                    0x5010,
+                    0x5014,
+                ),
             )
             .is_none()
         );
@@ -1875,15 +1964,14 @@ mod tests {
         let controls = direct_controls_by_block(&wrong.direct).unwrap();
         assert!(
             certify_arm_route(
-                wrong.origin.source(),
-                &wrong.topology,
-                wrong.conditional.true_target(),
-                wrong.conditional.producer().block_addr,
-                0x5010,
-                0x5014,
-                write_producer(&wrong, 0x5010),
-                &controls,
-                &wrong.ledger,
+                &arm_route_context(&wrong, &controls),
+                arm_route_input(
+                    &wrong,
+                    wrong.conditional.true_target(),
+                    wrong.conditional.producer().block_addr,
+                    0x5010,
+                    0x5014,
+                ),
             )
             .is_none()
         );

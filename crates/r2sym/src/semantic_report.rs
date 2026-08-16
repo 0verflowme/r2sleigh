@@ -623,7 +623,7 @@ fn compiled_semantic_info_with_seed(
     let native_region_summary_kinds = native_region_summary_kinds(native);
     let memory_fact_count = memory_summaries.len();
     CompiledSemanticInfo {
-        schema_version: crate::SEMANTIC_ARTIFACT_SCHEMA_VERSION,
+        schema_version: compiled.report().schema_version,
         stage: match compiled.stage {
             crate::RefinementStage::Raw => "raw",
             crate::RefinementStage::Compiled => "compiled",
@@ -764,49 +764,63 @@ fn compiled_semantic_info_with_seed(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use crate::{
         ArtifactGranularity, ExecutionModel, NativeArtifactBody, NativeFunctionSummary,
         RefinementStage, SemanticArtifact, SemanticArtifactBody, SemanticArtifactDiagnostics,
-        SliceClass,
+        SemanticArtifactReport, SliceClass,
     };
+    use r2il::{R2ILBlock, R2ILOp, Varnode};
+    use r2ssa::SsaArtifact;
 
     use super::compiled_semantic_info;
 
     #[test]
     fn compiled_semantic_info_preserves_owner_schema_shape() {
-        let artifact = SemanticArtifact {
-            stage: RefinementStage::Compiled,
-            granularity: ArtifactGranularity::SummaryOnly,
-            execution: ExecutionModel::Native,
-            body: SemanticArtifactBody::Native(NativeArtifactBody {
-                summary: NativeFunctionSummary {
-                    slice_class: SliceClass::Worker,
-                    role_identity: None,
-                    closure_functions: 3,
-                    helper_functions: 2,
-                    derived_summaries: 1,
-                    derived_diagnostics: crate::DerivedSummaryDiagnostics {
-                        attempted: 4,
-                        budget_exhausted: 1,
-                        scc_count: 2,
-                        ..crate::DerivedSummaryDiagnostics::default()
+        let mut block = R2ILBlock::new(0x1000, 1);
+        block.push(R2ILOp::Return {
+            target: Varnode::constant(0, 8),
+        });
+        let prepared = Arc::new(SsaArtifact::for_symbolic(&[block], None).expect("test SSA"));
+        let artifact = SemanticArtifact::new(
+            prepared,
+            SemanticArtifactReport {
+                schema_version: crate::SEMANTIC_ARTIFACT_SCHEMA_VERSION,
+                stage: RefinementStage::Compiled,
+                granularity: ArtifactGranularity::SummaryOnly,
+                execution: ExecutionModel::Native,
+                body: SemanticArtifactBody::Native(NativeArtifactBody {
+                    summary: NativeFunctionSummary {
+                        slice_class: SliceClass::Worker,
+                        role_identity: None,
+                        closure_functions: 3,
+                        helper_functions: 2,
+                        derived_summaries: 1,
+                        derived_diagnostics: crate::DerivedSummaryDiagnostics {
+                            attempted: 4,
+                            budget_exhausted: 1,
+                            scc_count: 2,
+                            ..crate::DerivedSummaryDiagnostics::default()
+                        },
+                        region_summaries: Vec::new(),
+                        worker_summaries: Vec::new(),
                     },
-                    region_summaries: Vec::new(),
-                    worker_summaries: Vec::new(),
+                    regions: Default::default(),
+                }),
+                diagnostics: SemanticArtifactDiagnostics {
+                    branches_evaluated: 0,
+                    branches_pruned: 7,
+                    branches_unknown: 5,
+                    skipped_missing_arch: false,
+                    skipped_large_cfg: true,
+                    residual_reasons: Vec::new(),
+                    interpreter: None,
+                    ambiguous_targets: Vec::new(),
                 },
-                regions: Default::default(),
-            }),
-            diagnostics: SemanticArtifactDiagnostics {
-                branches_evaluated: 0,
-                branches_pruned: 7,
-                branches_unknown: 5,
-                skipped_missing_arch: false,
-                skipped_large_cfg: true,
-                residual_reasons: Vec::new(),
-                interpreter: None,
-                ambiguous_targets: Vec::new(),
             },
-        };
+        )
+        .expect("current compiled semantic info schema");
 
         let value = serde_json::to_value(compiled_semantic_info(&artifact))
             .expect("serialize compiled semantic info");

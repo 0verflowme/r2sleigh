@@ -64,7 +64,7 @@ fn worker_summary_is_memory_write(summary: &r2sym::NativeWorkerSummary) -> bool 
     summary.kind == r2sym::NativeWorkerSummaryKind::MemoryWrite
 }
 
-pub(crate) fn certified_out_param_labels(type_facts: &FunctionTypeFacts) -> Vec<String> {
+pub(crate) fn reported_out_param_labels(type_facts: &FunctionTypeFacts) -> Vec<String> {
     type_facts
         .source_authorized_out_param_certificates()
         .map(|cert| {
@@ -77,7 +77,7 @@ pub(crate) fn certified_out_param_labels(type_facts: &FunctionTypeFacts) -> Vec<
         .collect()
 }
 
-pub(crate) fn certified_field_access_labels(type_facts: &FunctionTypeFacts) -> Vec<String> {
+pub(crate) fn reported_field_access_labels(type_facts: &FunctionTypeFacts) -> Vec<String> {
     let mut certificates = type_facts
         .field_access_certificates
         .iter()
@@ -113,6 +113,7 @@ pub(crate) fn certified_field_access_labels(type_facts: &FunctionTypeFacts) -> V
 pub(crate) fn render_for_route(
     func_name: &str,
     function_facts: &FunctionFacts,
+    semantic_artifact: &r2sym::SemanticArtifactReport,
     route: &r2types::DecompileRouteFacts,
     codegen_config: CodeGenConfig,
 ) -> Option<String> {
@@ -128,14 +129,13 @@ pub(crate) fn render_for_route(
         }
         _ => return None,
     };
-    let semantic_artifact = function_facts.semantic_artifact()?;
     let is_summary_island_route = route.kind == r2types::DecompileRouteKind::SummaryIslands;
     let is_structured_worker_route = route.kind == r2types::DecompileRouteKind::StructuredWorker;
     let is_residual_route = !is_summary_island_route
         && (matches!(semantic_artifact.stage, r2sym::RefinementStage::Residual)
             || !semantic_artifact.diagnostics.residual_reasons.is_empty());
     let claim_summary = semantic_artifact.semantic_claim_summary();
-    let certified_out_param_count = function_facts
+    let reported_out_param_count = function_facts
         .type_facts()
         .source_authorized_out_param_certificates()
         .count();
@@ -219,7 +219,7 @@ pub(crate) fn render_for_route(
         claim_summary.structural_value_claims,
         claim_summary.summary_role_certificates.len(),
         claim_summary.pointer_param_indices.len(),
-        certified_out_param_count,
+        reported_out_param_count,
         claim_summary.name_hint_claims,
         claim_summary.residual_claims
     )));
@@ -329,11 +329,11 @@ pub(crate) fn render_for_route(
         ));
     }
 
-    let certified_fields = certified_field_access_labels(function_facts.type_facts());
-    if !certified_fields.is_empty() {
+    let reported_fields = reported_field_access_labels(function_facts.type_facts());
+    if !reported_fields.is_empty() {
         body.push(CStmt::comment(format!(
-            "certified field accesses: {}",
-            certified_fields.join(", ")
+            "reported field accesses: {}",
+            reported_fields.join(", ")
         )));
     }
 
@@ -343,11 +343,11 @@ pub(crate) fn render_for_route(
                 "summary return: {return_relation:?}"
             )));
         }
-        let certified_out_params = certified_out_param_labels(function_facts.type_facts());
-        if !certified_out_params.is_empty() {
+        let reported_out_params = reported_out_param_labels(function_facts.type_facts());
+        if !reported_out_params.is_empty() {
             body.push(CStmt::comment(format!(
-                "certified out params: {}",
-                certified_out_params.join(", ")
+                "reported out params: {}",
+                reported_out_params.join(", ")
             )));
         }
         if rollup.transfer_count
@@ -415,7 +415,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn certified_out_param_labels_require_source_identity() {
+    fn reported_out_param_labels_require_source_identity() {
         let type_facts = FunctionTypeFacts {
             out_param_certificates: vec![
                 r2types::OutParamCertificate {
@@ -441,11 +441,11 @@ mod tests {
             ..FunctionTypeFacts::default()
         };
 
-        assert_eq!(certified_out_param_labels(&type_facts), vec!["1:out"]);
+        assert_eq!(reported_out_param_labels(&type_facts), vec!["1:out"]);
     }
 
     #[test]
-    fn certified_field_access_labels_use_signature_parameter_names() {
+    fn reported_field_access_labels_use_signature_parameter_names() {
         let type_facts = FunctionTypeFacts {
             merged_signature: Some(r2types::FunctionSignatureSpec {
                 ret_type: None,
@@ -465,15 +465,12 @@ mod tests {
             ..FunctionTypeFacts::default()
         };
 
-        assert_eq!(
-            certified_field_access_labels(&type_facts),
-            vec!["out->hash"]
-        );
+        assert_eq!(reported_field_access_labels(&type_facts), vec!["out->hash"]);
     }
 
     #[test]
     fn summary_comment_out_args_count_requires_certified_type_facts() {
-        let mut semantic_artifact = crate::test_native_semantic_artifact(
+        let mut semantic_artifact = crate::test_native_semantic_report(
             r2sym::RefinementStage::Compiled,
             r2sym::ArtifactGranularity::Regioned,
             r2sym::SliceClass::Worker,
@@ -507,23 +504,18 @@ mod tests {
                     r2sym::SemanticEvidenceReason::SummaryBudget,
                 ),
             });
-        let function_facts =
-            FunctionFacts::new(FunctionTypeFacts::default(), Some(semantic_artifact));
+        let function_facts = FunctionFacts::new(FunctionTypeFacts::default(), None);
 
         let output = render_for_route(
             "dbg.write_out",
             &function_facts,
+            &semantic_artifact,
             &r2types::DecompileRouteFacts {
                 kind: r2types::DecompileRouteKind::LinearWorker,
                 reason: Some("test summary".to_string()),
                 fallback_comment: None,
                 skip_runtime_type_inference: true,
                 use_prepared_semantic_view: false,
-                proof_coverage: r2sym::ProofCoverage::default(),
-                render_permission: r2sym::RenderPermission::summary(
-                    r2sym::ProofOwner::R2engine,
-                    "test summary",
-                ),
             },
             CodeGenConfig::default(),
         )

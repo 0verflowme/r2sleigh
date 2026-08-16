@@ -15,13 +15,23 @@ use crate::{
     SsaGraph, StructuredAccessId, StructuredMemoryAccessFact, ValueId,
 };
 
-pub const AGGREGATE_ACCESS_PROJECTION_SCHEMA_VERSION: u32 = 2;
+pub const AGGREGATE_ACCESS_PROJECTION_SCHEMA_VERSION: u32 = 3;
 
 /// Exact scalar value carried by one projected memory effect.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum AggregateAccessBinding {
     Read { result: ValueId },
     Write { value: ValueId },
+}
+
+/// Exact source-layout array index retained by one aggregate access.
+///
+/// The coefficient is not caller policy: it is admitted only when it equals
+/// the byte size of the revision-bound aggregate layout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct AggregateElementIndexProjection {
+    pub value: ValueId,
+    pub stride_bytes: u64,
 }
 
 /// One exact access to a scalar member in a source-owned aggregate layout.
@@ -35,6 +45,7 @@ pub struct AggregateAccessProjection {
     pub aggregate_id: u32,
     pub member_id: u32,
     pub member_type_id: u32,
+    pub element_index: Option<AggregateElementIndexProjection>,
     pub byte_offset: u64,
     pub byte_width: u32,
     pub space: SpaceId,
@@ -171,7 +182,7 @@ pub(crate) fn collect_aggregate_access_projections(
         let Some(expression) = addresses.parameter_expression(access.address) else {
             continue;
         };
-        if !expression.terms.is_empty() || expression.offset < 0 {
+        if expression.offset < 0 {
             continue;
         }
         let Ok(parameter_index) = u32::try_from(expression.parameter) else {
@@ -217,6 +228,24 @@ pub(crate) fn collect_aggregate_access_projections(
         else {
             continue;
         };
+        if aggregate.size_bits() == 0 || !aggregate.size_bits().is_multiple_of(8) {
+            continue;
+        }
+        let aggregate_size_bytes = aggregate.size_bits() / 8;
+        let element_index = match expression.terms.as_slice() {
+            [] => None,
+            [term]
+                if term.coefficient > 0
+                    && u64::try_from(term.coefficient) == Ok(aggregate_size_bytes)
+                    && graph.value(term.value).is_some() =>
+            {
+                Some(AggregateElementIndexProjection {
+                    value: term.value,
+                    stride_bytes: aggregate_size_bytes,
+                })
+            }
+            _ => continue,
+        };
         let Ok(byte_offset) = u64::try_from(expression.offset) else {
             continue;
         };
@@ -252,6 +281,7 @@ pub(crate) fn collect_aggregate_access_projections(
             aggregate_id,
             member_id: member.member_id(),
             member_type_id: member.type_id(),
+            element_index,
             byte_offset,
             byte_width: access.width,
             space,
@@ -465,6 +495,7 @@ mod tests {
         assert_eq!(load.aggregate_id, 0);
         assert_eq!(load.member_id, 2);
         assert_eq!(load.member_type_id, 1);
+        assert_eq!(load.element_index, None);
         assert_eq!((load.byte_offset, load.byte_width), (8, 4));
         assert_eq!(load.space, SpaceId::Ram);
         assert_eq!(load.access, load_access);
@@ -563,7 +594,57 @@ mod tests {
             space: SpaceId::Ram,
             addr: Varnode::unique(0x30, 8),
         });
-        assert!(artifact(&[dynamic], true).aggregate_accesses().is_empty());
+        let indexed = artifact(&[dynamic], true);
+        let indexed_access = StructuredAccessId {
+            inst: indexed
+                .graph()
+                .inst_id_for_op_site(0x1000, 3)
+                .expect("indexed load instruction"),
+            ordinal: 0,
+        };
+        let indexed_projection = indexed
+            .aggregate_accesses()
+            .projection(REVISION, indexed_access)
+            .expect("exact aggregate-stride index projection");
+        let index = indexed_projection
+            .element_index
+            .expect("indexed projection must retain its exact SSA index");
+        assert_eq!(index.stride_bytes, 56);
+        assert_eq!(
+            indexed
+                .addresses()
+                .parameter_expression(indexed.structured().memory_accesses[&indexed_access].address)
+                .and_then(|expression| expression.terms.first())
+                .map(|term| term.value),
+            Some(index.value)
+        );
+
+        let mut wrong_stride = R2ILBlock::new(0x1000, 4);
+        wrong_stride.push(R2ILOp::IntMult {
+            dst: Varnode::unique(0x10, 8),
+            a: Varnode::register(8, 8),
+            b: Varnode::constant(48, 8),
+        });
+        wrong_stride.push(R2ILOp::IntAdd {
+            dst: Varnode::unique(0x20, 8),
+            a: Varnode::register(0, 8),
+            b: Varnode::unique(0x10, 8),
+        });
+        wrong_stride.push(R2ILOp::IntAdd {
+            dst: Varnode::unique(0x30, 8),
+            a: Varnode::unique(0x20, 8),
+            b: Varnode::constant(8, 8),
+        });
+        wrong_stride.push(R2ILOp::Load {
+            dst: Varnode::unique(0x40, 4),
+            space: SpaceId::Ram,
+            addr: Varnode::unique(0x30, 8),
+        });
+        assert!(
+            artifact(&[wrong_stride], true)
+                .aggregate_accesses()
+                .is_empty()
+        );
 
         let mut aliased = R2ILBlock::new(0x1000, 4);
         aliased.push(R2ILOp::IntAdd {

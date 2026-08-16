@@ -14,7 +14,7 @@ use r2il::{MemoryOrdering, SpaceId};
 /// Version of the byte-level semantic fingerprint contract.
 ///
 /// Bump this whenever a tag or field encoding below changes.
-pub const SSA_SEMANTIC_FINGERPRINT_SCHEMA_VERSION: u32 = 3;
+pub const SSA_SEMANTIC_FINGERPRINT_SCHEMA_VERSION: u32 = 4;
 
 const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
@@ -338,16 +338,19 @@ fn canonical_blocks(graph: &SsaGraph) -> (Vec<&GraphBlock>, BTreeMap<BlockId, u3
     (blocks, ids)
 }
 
+type CanonicalPhiSourceKey = (u32, Option<CanonicalStorageId>, u32, Option<u64>);
+type CanonicalPhiSortKey = (
+    Option<CanonicalStorageId>,
+    u32,
+    Option<u64>,
+    Vec<CanonicalPhiSourceKey>,
+);
+
 fn phi_sort_key(
     graph: &SsaGraph,
     inst: &GraphInst,
     block_ids: &BTreeMap<BlockId, u32>,
-) -> (
-    Option<CanonicalStorageId>,
-    u32,
-    Option<u64>,
-    Vec<(u32, Option<CanonicalStorageId>, u32, Option<u64>)>,
-) {
+) -> CanonicalPhiSortKey {
     let output = inst.output.and_then(|value| graph.value(value));
     let mut sources = match &inst.payload {
         InstPayload::Phi { predecessors } => predecessors
@@ -2400,7 +2403,7 @@ mod tests {
     }
 
     #[test]
-    fn semantic_fingerprint_schema_is_v3() {
-        assert_eq!(SSA_SEMANTIC_FINGERPRINT_SCHEMA_VERSION, 3);
+    fn semantic_fingerprint_schema_is_v4() {
+        assert_eq!(SSA_SEMANTIC_FINGERPRINT_SCHEMA_VERSION, 4);
     }
 }

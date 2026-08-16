@@ -845,7 +845,7 @@ fn typed_genuine_block_successors(
         .any(|op| matches!(op, R2ILOp::Call { .. } | R2ILOp::CallInd { .. }))
     {
         return Err(LiftError::Unsupported(
-            "schema-7 source snapshots do not carry exact call-site closure".to_string(),
+            "advisory source call metadata cannot establish exact call-site closure".to_string(),
         ));
     }
     let fallthrough = block
@@ -872,7 +872,7 @@ fn typed_genuine_block_successors(
                 LiftError::Parse("trusted conditional branch target is not constant".to_string())
             }),
         Some(R2ILOp::BranchInd { .. }) => Err(LiftError::Unsupported(
-            "schema-7 advisory switch metadata cannot close an indirect branch".to_string(),
+            "advisory source switch metadata cannot close an indirect branch".to_string(),
         )),
         Some(R2ILOp::Call { .. } | R2ILOp::CallInd { .. }) => unreachable!("calls refused above"),
         None => Ok(vec![(
@@ -890,7 +890,7 @@ fn validate_owned_snapshot_cfg(
 ) -> Result<()> {
     if !source.advisory_calls().is_empty() {
         return Err(LiftError::Unsupported(
-            "schema-7 advisory calls cannot create trusted call authority".to_string(),
+            "advisory source calls cannot create trusted call authority".to_string(),
         ));
     }
     if source.image().blocks().len() != blocks.len() {
@@ -906,7 +906,7 @@ fn validate_owned_snapshot_cfg(
         }
         if source_block.switch_instruction().is_some() {
             return Err(LiftError::Unsupported(
-                "schema-7 advisory switches cannot create trusted switch authority".to_string(),
+                "advisory source switches cannot create trusted switch authority".to_string(),
             ));
         }
         let mut machine = typed_genuine_block_successors(lifted_block)?;

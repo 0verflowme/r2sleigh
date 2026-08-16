@@ -8,11 +8,14 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::rc::Rc;
 use std::sync::Arc;
 
-use r2il::ArchSpec;
+use r2il::{AddressSpace, ArchSpec, Endianness, RegisterDef};
 use r2ssa::{
-    FunctionSemanticSummary, InterprocFunctionId, InterprocFunctionInput, InterprocSolveConfig,
-    InterprocSummarySet, SsaArtifact, SummaryMemoryEffectKind, SummaryMemoryRegion,
-    SummaryReturnRelation, solve_interproc_summary_set,
+    CanonicalStorageId, CanonicalStorageSpace, FunctionSemanticSummary, InterprocFunctionId,
+    InterprocFunctionInput, InterprocSolveConfig, InterprocSummarySet, MachineArchitectureFamily,
+    MachineMemoryEndianness, PreparedInterprocFunctionInput, PreparedInterprocSummaryError,
+    PreparedInterprocSummarySet, SsaArtifact, SsaArtifactProvenanceKind, SummaryMemoryEffectKind,
+    SummaryMemoryRegion, SummaryReturnRelation, solve_interproc_summary_set,
+    solve_prepared_interproc_summary_set,
 };
 use serde::{Deserialize, Serialize};
 use z3::ast::{Ast, BV, Bool};
@@ -161,8 +164,8 @@ pub trait FunctionSummary<'ctx>: Send + Sync {
 /// Calling convention description for retrieving arguments and return values.
 #[derive(Clone, Debug)]
 pub struct CallConv {
-    arg_registers: Vec<&'static str>,
-    ret_register: &'static str,
+    arg_registers: Vec<String>,
+    ret_register: String,
     arg_bits: u32,
     ret_bits: u32,
 }
@@ -176,8 +179,8 @@ impl CallConv {
         ret_bits: u32,
     ) -> Self {
         Self {
-            arg_registers,
-            ret_register,
+            arg_registers: arg_registers.into_iter().map(str::to_string).collect(),
+            ret_register: ret_register.to_string(),
             arg_bits,
             ret_bits,
         }
@@ -195,6 +198,9 @@ impl CallConv {
 
     /// Architecture-derived calling convention used by the symbolic runtime.
     pub fn for_arch_spec(arch: &ArchSpec) -> Option<Self> {
+        if let Some(callconv) = source_owned_callconv_from_arch_projection(arch) {
+            return callconv;
+        }
         let arch_name = arch.name.to_ascii_lowercase();
         let looks_x86 = arch_name.contains("x86") || arch_name == "x64" || arch_name == "amd64";
         let looks_64 = arch.addr_size == 8 || arch.addr_size == 64 || arch_name.contains("64");
@@ -223,12 +229,7 @@ impl CallConv {
         arch: &ArchSpec,
         symbol_map: &HashMap<u64, String>,
     ) -> Option<Self> {
-        let arch_name = arch.name.to_ascii_lowercase();
-        let looks_x86 = arch_name.contains("x86") || arch_name == "x64" || arch_name == "amd64";
-        let looks_64 = arch.addr_size == 8 || arch.addr_size == 64 || arch_name.contains("64");
-        if looks_x86 && looks_64 && symbol_map_looks_windows(symbol_map) {
-            return Some(Self::x86_64_windows());
-        }
+        let _ = symbol_map;
         Self::for_arch_spec(arch)
     }
 
@@ -263,7 +264,7 @@ impl CallConv {
 
     pub(crate) fn write_return<'ctx>(&self, state: &mut SymState<'ctx>, value: SymValue<'ctx>) {
         let mut keys = BTreeSet::new();
-        for alias in register_aliases(self.ret_register) {
+        for alias in register_aliases(&self.ret_register) {
             if let Some(key) = find_register_key(state, alias) {
                 keys.insert(key);
             }
@@ -282,8 +283,8 @@ impl CallConv {
         }
     }
 
-    pub(crate) fn arg_register_name(&self, index: usize) -> Option<&'static str> {
-        self.arg_registers.get(index).copied()
+    pub(crate) fn arg_register_name(&self, index: usize) -> Option<&str> {
+        self.arg_registers.get(index).map(String::as_str)
     }
 
     pub(crate) fn arg_capacity(&self) -> usize {
@@ -298,26 +299,158 @@ impl CallConv {
         self.ret_bits
     }
 
-    pub(crate) fn ret_register_name(&self) -> &'static str {
-        self.ret_register
+    pub(crate) fn ret_register_name(&self) -> &str {
+        &self.ret_register
     }
 
     pub(crate) fn return_value<'ctx>(&self, state: &SymState<'ctx>) -> SymValue<'ctx> {
-        self.read_register(state, self.ret_register)
+        self.read_register(state, &self.ret_register)
     }
 }
 
-fn symbol_map_looks_windows(symbol_map: &HashMap<u64, String>) -> bool {
-    symbol_map.values().any(|name| {
-        let lower = name.to_ascii_lowercase();
-        lower.contains(".dll_")
-            || lower.contains("kernel32")
-            || lower.contains("ntdll")
-            || lower.contains("msvcrt")
-            || lower.ends_with("addvectoredexceptionhandler")
-            || lower.ends_with("raiseexception")
-            || lower.ends_with("virtualalloc")
-    })
+const SOURCE_ABI_VARIANT_PREFIX: &str = "r2sym-source-abi-v1:";
+const SOURCE_ABI_UNAVAILABLE_VARIANT: &str = "r2sym-source-abi-v1:unavailable";
+
+fn source_owned_callconv_from_arch_projection(arch: &ArchSpec) -> Option<Option<CallConv>> {
+    if arch.variant == SOURCE_ABI_UNAVAILABLE_VARIANT {
+        return Some(None);
+    }
+    let payload = arch.variant.strip_prefix(SOURCE_ABI_VARIANT_PREFIX)?;
+    let mut fields = payload.split(';');
+    let arguments = fields.next()?.strip_prefix("args=")?;
+    let arg_bits = fields.next()?.strip_prefix("argbits=")?.parse().ok()?;
+    let ret_register = fields.next()?.strip_prefix("ret=")?.trim();
+    let ret_bits = fields.next()?.strip_prefix("retbits=")?.parse().ok()?;
+    if fields.next().is_some() || arg_bits == 0 || ret_bits == 0 {
+        return Some(None);
+    }
+    if ret_register.is_empty() {
+        return Some(None);
+    }
+    let arg_registers = arguments
+        .split(',')
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    Some(Some(CallConv {
+        arg_registers,
+        ret_register: ret_register.to_string(),
+        arg_bits,
+        ret_bits,
+    }))
+}
+
+fn source_register_name(prepared: &SsaArtifact, storage: CanonicalStorageId) -> Option<String> {
+    prepared
+        .machine_context()
+        .register_storages_by_name()
+        .iter()
+        .filter(|(_, candidate)| **candidate == storage)
+        .map(|(name, _)| name)
+        .cloned()
+        .min()
+}
+
+fn source_endianness(endianness: MachineMemoryEndianness) -> Option<Endianness> {
+    match endianness {
+        MachineMemoryEndianness::Little => Some(Endianness::Little),
+        MachineMemoryEndianness::Big => Some(Endianness::Big),
+        MachineMemoryEndianness::Mixed => Some(Endianness::Mixed),
+        MachineMemoryEndianness::Custom => Some(Endianness::Custom),
+        MachineMemoryEndianness::Unknown => None,
+    }
+}
+
+fn source_architecture_name(family: MachineArchitectureFamily) -> Option<&'static str> {
+    match family {
+        MachineArchitectureFamily::Unknown => None,
+        MachineArchitectureFamily::X86 => Some("x86"),
+        MachineArchitectureFamily::X86_64 => Some("x86-64"),
+        MachineArchitectureFamily::Arm => Some("arm"),
+        MachineArchitectureFamily::AArch64 => Some("aarch64"),
+        MachineArchitectureFamily::RiscV32 => Some("riscv32"),
+        MachineArchitectureFamily::RiscV64 => Some("riscv64"),
+        MachineArchitectureFamily::Mips32 => Some("mips32"),
+        MachineArchitectureFamily::Mips64 => Some("mips64"),
+        MachineArchitectureFamily::PowerPc32 => Some("ppc32"),
+        MachineArchitectureFamily::PowerPc64 => Some("ppc64"),
+    }
+}
+
+/// Reconstruct the symbolic runtime's presentation profile exclusively from
+/// the immutable machine context retained by `prepared`.
+pub(crate) fn source_arch_spec(prepared: &SsaArtifact) -> Option<ArchSpec> {
+    let context = prepared.machine_context();
+    let memory = context.memory_model();
+    if !memory.is_available() || !memory.is_coherent() {
+        return None;
+    }
+    let name = source_architecture_name(context.architecture_family())?;
+    let address_bits = memory.default_address_bits();
+    if address_bits == 0 || !address_bits.is_multiple_of(8) {
+        return None;
+    }
+    let mut arch = ArchSpec::new(name);
+    arch.addr_size = address_bits / 8;
+    arch.alignment = memory.alignment_bytes().max(1);
+    arch.memory_endianness = source_endianness(memory.default_endianness())?;
+    arch.instruction_endianness = arch.memory_endianness;
+    arch.spaces = memory
+        .spaces()
+        .iter()
+        .map(|space| {
+            if space.address_bits() == 0 || !space.address_bits().is_multiple_of(8) {
+                return None;
+            }
+            let mut projected = AddressSpace::new(
+                space.space(),
+                space.space().to_string(),
+                space.address_bits() / 8,
+            );
+            projected.word_size = space.word_size_bytes();
+            projected.is_default = space.space() == r2il::SpaceId::Ram;
+            projected.endianness = Some(source_endianness(space.endianness())?);
+            Some(projected)
+        })
+        .collect::<Option<Vec<_>>>()?;
+    arch.registers = context
+        .register_storages_by_name()
+        .iter()
+        .filter(|(_, storage)| storage.space == CanonicalStorageSpace::Register)
+        .map(|(name, storage)| RegisterDef::new(name.clone(), storage.offset, storage.size))
+        .collect();
+
+    let abi = context.abi_model();
+    arch.variant = if abi.is_available() && abi.is_coherent() {
+        let argument_slots = abi.argument_registers();
+        let arguments = argument_slots
+            .iter()
+            .map(|slot| source_register_name(prepared, slot.storage()))
+            .collect::<Option<Vec<_>>>()?;
+        let arg_bits = match argument_slots.first() {
+            Some(slot) => slot.storage().size.checked_mul(8)?,
+            None => address_bits,
+        };
+        if argument_slots
+            .iter()
+            .any(|slot| slot.storage().size.checked_mul(8) != Some(arg_bits))
+        {
+            return None;
+        }
+        let Some(returned_slot) = abi.return_registers().first() else {
+            arch.variant = SOURCE_ABI_UNAVAILABLE_VARIANT.to_string();
+            return Some(arch);
+        };
+        let returned = source_register_name(prepared, returned_slot.storage())?;
+        let ret_bits = returned_slot.storage().size.checked_mul(8)?;
+        format!(
+            "{SOURCE_ABI_VARIANT_PREFIX}args={};argbits={arg_bits};ret={returned};retbits={ret_bits}",
+            arguments.join(",")
+        )
+    } else {
+        SOURCE_ABI_UNAVAILABLE_VARIANT.to_string()
+    };
+    Some(arch)
 }
 
 #[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
@@ -338,7 +471,7 @@ pub enum ScopedFunctionProvenance {
 pub struct ScopedPreparedFunction {
     pub id: InterprocFunctionId,
     pub name: Option<String>,
-    pub prepared: SsaArtifact,
+    pub prepared: Arc<SsaArtifact>,
 }
 
 #[derive(Debug, Clone)]
@@ -363,14 +496,40 @@ impl PreparedFunctionScope {
         provenance: BTreeMap<InterprocFunctionId, ScopedFunctionProvenance>,
     ) -> Option<Self> {
         let root = InterprocFunctionId(root_addr);
-        let mut by_id = BTreeMap::new();
-        for function in functions {
-            by_id.insert(function.id, function);
+        let mut ids = BTreeSet::new();
+        if functions.iter().any(|function| {
+            function.id.0 != function.prepared.function().entry || !ids.insert(function.id)
+        }) {
+            return None;
         }
+        if !block_ranges_are_disjoint(functions.iter().flat_map(|function| {
+            function
+                .prepared
+                .function()
+                .blocks()
+                .map(|block| (block.addr, block.size))
+        })) {
+            return None;
+        }
+        let by_id = functions
+            .into_iter()
+            .map(|function| (function.id, function))
+            .collect::<BTreeMap<_, _>>();
         if !by_id.contains_key(&root)
             || provenance.len() != by_id.len()
             || provenance.keys().any(|id| !by_id.contains_key(id))
         {
+            return None;
+        }
+        let root_function = by_id.get(&root)?;
+        if by_id.values().any(|function| {
+            function.id != root
+                && !scope_helper_is_source_coherent(
+                    root_function,
+                    function,
+                    provenance.get(&function.id).copied(),
+                )
+        }) {
             return None;
         }
         Some(Self {
@@ -386,6 +545,60 @@ impl PreparedFunctionScope {
 
     pub fn root(&self) -> Option<&ScopedPreparedFunction> {
         self.functions.get(&self.root)
+    }
+
+    /// Return this scope only when its root is the exact SSA authority supplied
+    /// by the caller. Equal entry addresses or independently rebuilt content do
+    /// not authorize helper execution.
+    pub fn exact_for_artifact(&self, artifact: &SsaArtifact) -> Option<&Self> {
+        let root = self.root()?;
+        (self.root == InterprocFunctionId(artifact.function().entry)
+            && root.id == self.root
+            && root.prepared.function().entry == artifact.function().entry
+            && root.prepared.authority() == artifact.authority())
+        .then_some(self)
+    }
+
+    pub(crate) fn source_authorized_for_semantics(
+        &self,
+        artifact: &Arc<SsaArtifact>,
+    ) -> Option<Self> {
+        self.exact_for_artifact(artifact.as_ref())?;
+        let root = self.root()?.clone();
+        if self.provenance_of(&root) != Some(ScopedFunctionProvenance::Analyzed) {
+            return None;
+        }
+        let mut functions = vec![root];
+        for helper in self.helper_functions() {
+            match self.provenance_of(helper)? {
+                ScopedFunctionProvenance::RuntimeMaterialized => continue,
+                ScopedFunctionProvenance::Analyzed
+                    if helper.prepared.provenance_kind()
+                        == SsaArtifactProvenanceKind::TrustedSource =>
+                {
+                    functions.push(helper.clone());
+                }
+                ScopedFunctionProvenance::Analyzed => return None,
+            }
+        }
+        let provenance = functions
+            .iter()
+            .map(|function| (function.id, ScopedFunctionProvenance::Analyzed))
+            .collect();
+        Self::new_with_provenance(self.root.0, functions, provenance)
+    }
+
+    pub(crate) fn matches_interproc_owners(&self, summaries: &PreparedInterprocSummarySet) -> bool {
+        let Some(root) = self.root() else {
+            return false;
+        };
+        summaries.matches_root(&root.prepared)
+            && summaries.owners().len() == self.functions.len()
+            && self.functions.iter().all(|(id, function)| {
+                summaries
+                    .owner(*id)
+                    .is_some_and(|owner| Arc::ptr_eq(owner, &function.prepared))
+            })
     }
 
     pub fn functions(&self) -> &BTreeMap<InterprocFunctionId, ScopedPreparedFunction> {
@@ -415,17 +628,65 @@ impl PreparedFunctionScope {
             .filter(move |function| function.id != self.root)
     }
 
-    pub fn with_prepared_root(&self, prepared: &SsaArtifact) -> Option<Self> {
+    pub fn with_prepared_root(&self, prepared: Arc<SsaArtifact>) -> Option<Self> {
         let mut functions = self.functions.values().cloned().collect::<Vec<_>>();
-        for function in &mut functions {
-            if function.id == self.root {
-                function.prepared = prepared.clone();
-                if function.name.is_none() {
-                    function.name = prepared.function().name.clone();
-                }
-            }
+        let root = functions
+            .iter_mut()
+            .find(|function| function.id == self.root)?;
+        if root.name.is_none() {
+            root.name = prepared.function().name.clone();
         }
+        root.prepared = prepared;
         Self::new_with_provenance(self.root.0, functions, self.provenance.clone())
+    }
+}
+
+fn block_ranges_are_disjoint(ranges: impl IntoIterator<Item = (u64, u32)>) -> bool {
+    let mut checked = Vec::new();
+    for (start, size) in ranges {
+        let Some(end) = start.checked_add(u64::from(size)) else {
+            return false;
+        };
+        if end == start {
+            return false;
+        }
+        checked.push((start, end));
+    }
+    checked.sort_unstable();
+    !checked.windows(2).any(|ranges| ranges[1].0 < ranges[0].1)
+}
+
+fn scope_helper_is_source_coherent(
+    root: &ScopedPreparedFunction,
+    helper: &ScopedPreparedFunction,
+    provenance: Option<ScopedFunctionProvenance>,
+) -> bool {
+    let root_context = root.prepared.machine_context();
+    let helper_context = helper.prepared.machine_context();
+    if provenance.is_none()
+        || root_context.architecture_family() != helper_context.architecture_family()
+        || root_context.memory_model() != helper_context.memory_model()
+        || root_context.register_storages_by_name() != helper_context.register_storages_by_name()
+        || !root_context.call_site_interfaces_are_coherent()
+        || !helper_context.call_site_interfaces_are_coherent()
+    {
+        return false;
+    }
+    if provenance == Some(ScopedFunctionProvenance::RuntimeMaterialized) {
+        return true;
+    }
+    if root.prepared.provenance_kind() != helper.prepared.provenance_kind() {
+        return false;
+    }
+    match (
+        root_context.function_interface(),
+        helper_context.function_interface(),
+    ) {
+        (Some(root_interface), Some(helper_interface)) => {
+            root_interface.revision_identity() == helper_interface.revision_identity()
+        }
+        (None, None) => root.prepared.provenance_kind() == SsaArtifactProvenanceKind::Manual,
+        _ => false,
     }
 }
 
@@ -584,6 +845,16 @@ impl<'ctx> SummaryRegistry<'ctx> {
         Some(Self::with_profile(CallConv::for_arch_spec(arch)?, profile))
     }
 
+    /// Create a registry from the exact ABI carrier snapshot retained by one
+    /// prepared artifact. Missing or incoherent source ABI data fails closed.
+    pub(crate) fn with_profile_for_prepared(
+        prepared: &SsaArtifact,
+        profile: SummaryProfile,
+    ) -> Option<Self> {
+        let arch = source_arch_spec(prepared)?;
+        Some(Self::with_profile(CallConv::for_arch_spec(&arch)?, profile))
+    }
+
     /// Create a registry using symbol-map environment hints when the architecture is ambiguous.
     pub fn with_profile_for_arch_and_symbols(
         arch: &ArchSpec,
@@ -629,11 +900,25 @@ impl<'ctx> SummaryRegistry<'ctx> {
         addr: u64,
         name: &str,
     ) -> bool {
+        self.install_for_explorer_with_provenance(explorer, addr, name, ())
+    }
+
+    fn install_for_explorer_with_provenance<P>(
+        &self,
+        explorer: &mut PathExplorer<'ctx>,
+        addr: u64,
+        name: &str,
+        provenance: P,
+    ) -> bool
+    where
+        P: 'ctx,
+    {
         let Some(summary) = self.summaries.get(name).cloned() else {
             return false;
         };
         let callconv = self.callconv.clone();
         explorer.register_call_hook(addr, move |state| {
+            let _retain_exact_provenance = &provenance;
             apply_summary(state, &*summary, &callconv)
         });
         true
@@ -646,6 +931,19 @@ impl<'ctx> SummaryRegistry<'ctx> {
         prepared: &SsaArtifact,
         symbol_map: &HashMap<u64, String>,
     ) -> SummaryInstallStats {
+        self.install_known_symbols_for_function_with_provenance(explorer, prepared, symbol_map, ())
+    }
+
+    fn install_known_symbols_for_function_with_provenance<P>(
+        &self,
+        explorer: &mut PathExplorer<'ctx>,
+        prepared: &SsaArtifact,
+        symbol_map: &HashMap<u64, String>,
+        provenance: P,
+    ) -> SummaryInstallStats
+    where
+        P: Clone + 'ctx,
+    {
         let mut stats = SummaryInstallStats::default();
         let mut targets = BTreeSet::new();
         for call in prepared.call_sites().by_id.values() {
@@ -672,7 +970,12 @@ impl<'ctx> SummaryRegistry<'ctx> {
                 stats.duplicates += 1;
                 continue;
             }
-            if self.install_for_explorer(explorer, target, summary_name) {
+            if self.install_for_explorer_with_provenance(
+                explorer,
+                target,
+                summary_name,
+                provenance.clone(),
+            ) {
                 stats.installed += 1;
             } else {
                 stats.skipped_unknown += 1;
@@ -686,13 +989,58 @@ impl<'ctx> SummaryRegistry<'ctx> {
     /// Manual core summaries keep precedence. Generic hooks are only installed
     /// for direct targets that have an interproc summary but no core-summary
     /// normalization match.
+    ///
+    /// Install interprocedural hooks only from a summary owner sealed to the
+    /// exact prepared SSA allocation being explored.
     pub fn install_interproc_summaries_for_function(
+        &self,
+        explorer: &mut PathExplorer<'ctx>,
+        prepared: &Arc<SsaArtifact>,
+        summary_set: &PreparedInterprocSummarySet,
+        symbol_map: &HashMap<u64, String>,
+    ) -> Option<SummaryInstallStats> {
+        if !summary_set.matches_root(prepared) {
+            return None;
+        }
+        self.install_interproc_summary_report_for_function_with_provenance(
+            explorer,
+            prepared.as_ref(),
+            summary_set.report(),
+            symbol_map,
+            summary_set.clone(),
+        )
+    }
+
+    /// Install a detached report only for crate-local, synchronous exploration.
+    /// Escaping installers must use an owner-retaining wrapper instead.
+    pub(crate) fn install_interproc_summary_report_for_function(
         &self,
         explorer: &mut PathExplorer<'ctx>,
         prepared: &SsaArtifact,
         summary_set: &InterprocSummarySet,
         symbol_map: &HashMap<u64, String>,
-    ) -> SummaryInstallStats {
+    ) -> Option<SummaryInstallStats> {
+        self.install_interproc_summary_report_for_function_with_provenance(
+            explorer,
+            prepared,
+            summary_set,
+            symbol_map,
+            (),
+        )
+    }
+
+    fn install_interproc_summary_report_for_function_with_provenance<P>(
+        &self,
+        explorer: &mut PathExplorer<'ctx>,
+        prepared: &SsaArtifact,
+        summary_set: &InterprocSummarySet,
+        symbol_map: &HashMap<u64, String>,
+        provenance: P,
+    ) -> Option<SummaryInstallStats>
+    where
+        P: Clone + 'ctx,
+    {
+        summary_set.validate_current_schema().ok()?;
         let mut stats = SummaryInstallStats::default();
         let mut targets = BTreeSet::new();
         for call in prepared.call_sites().by_id.values() {
@@ -701,7 +1049,7 @@ impl<'ctx> SummaryRegistry<'ctx> {
             }
         }
         if targets.is_empty() {
-            return stats;
+            return Some(stats);
         }
 
         let mut seen = BTreeSet::new();
@@ -727,13 +1075,15 @@ impl<'ctx> SummaryRegistry<'ctx> {
                 continue;
             }
             let callconv = self.callconv.clone();
+            let provenance = provenance.clone();
             explorer.register_call_hook(target, move |state| {
+                let _retain_exact_provenance = &provenance;
                 apply_interproc_summary(state, &summary, &callconv)
             });
             stats.installed += 1;
         }
 
-        stats
+        Some(stats)
     }
 
     pub fn has_core_summary_name(&self, name: &str) -> bool {
@@ -741,6 +1091,12 @@ impl<'ctx> SummaryRegistry<'ctx> {
             .is_some_and(|summary_name| self.summaries.contains_key(summary_name))
     }
 
+    /// Derive report-only symbolic summaries for simulation and query hooks.
+    ///
+    /// The returned interprocedural report does not retain source authority and
+    /// must not authorize a [`crate::SemanticArtifact`], type inference, or
+    /// writeback. Source-owned semantic compilation must use
+    /// [`Self::derive_source_owned_symbolic_summaries`] instead.
     pub fn derive_symbolic_summaries(
         &self,
         ctx: &'ctx z3::Context,
@@ -748,7 +1104,41 @@ impl<'ctx> SummaryRegistry<'ctx> {
         arch: Option<&ArchSpec>,
         symbol_map: &HashMap<u64, String>,
     ) -> DerivedSummarySet<'ctx> {
-        let interproc = build_interproc_summary_set(scope, arch, symbol_map);
+        let interproc = build_advisory_interproc_summary_set(scope, arch);
+        self.derive_symbolic_summaries_from_interproc(ctx, scope, arch, symbol_map, interproc)
+    }
+
+    /// Derive summaries only after sealing the interprocedural solve to the
+    /// exact prepared root and helper allocations.
+    ///
+    /// The returned [`DerivedSummarySet`] still contains only a detached report
+    /// projection. Its use for semantic compilation is valid only while the
+    /// caller retains the exact source-owned scope as artifact provenance.
+    pub(crate) fn derive_source_owned_symbolic_summaries(
+        &self,
+        ctx: &'ctx z3::Context,
+        scope: &PreparedFunctionScope,
+        arch: Option<&ArchSpec>,
+        symbol_map: &HashMap<u64, String>,
+    ) -> Result<DerivedSummarySet<'ctx>, PreparedInterprocSummaryError> {
+        let interproc = build_source_owned_interproc_summary_set(scope)?;
+        Ok(self.derive_symbolic_summaries_from_interproc(
+            ctx,
+            scope,
+            arch,
+            symbol_map,
+            interproc.report().clone(),
+        ))
+    }
+
+    fn derive_symbolic_summaries_from_interproc(
+        &self,
+        ctx: &'ctx z3::Context,
+        scope: &PreparedFunctionScope,
+        arch: Option<&ArchSpec>,
+        symbol_map: &HashMap<u64, String>,
+        interproc: InterprocSummarySet,
+    ) -> DerivedSummarySet<'ctx> {
         let mut summaries: BTreeMap<InterprocFunctionId, Rc<DerivedFunctionSummary<'ctx>>> =
             BTreeMap::new();
         let mut diagnostics = DerivedSummaryDiagnostics::default();
@@ -840,36 +1230,68 @@ impl<'ctx> SummaryRegistry<'ctx> {
         &self,
         explorer: &mut PathExplorer<'ctx>,
         ctx: &'ctx z3::Context,
+        prepared: &SsaArtifact,
         scope: &PreparedFunctionScope,
         arch: Option<&ArchSpec>,
         symbol_map: &HashMap<u64, String>,
     ) -> DerivedSummaryDiagnostics {
+        let Some(scope) = scope.exact_for_artifact(prepared) else {
+            return DerivedSummaryDiagnostics::default();
+        };
         let derived = self.derive_symbolic_summaries(ctx, scope, arch, symbol_map);
         if let Some(root) = scope.root() {
-            let _ = self.install_interproc_summaries_for_function(
+            let retained_scope = PreparedFunctionScope::clone(scope);
+            let _ = self.install_interproc_summary_report_for_function_with_provenance(
                 explorer,
                 &root.prepared,
                 &derived.interproc,
                 symbol_map,
+                retained_scope.clone(),
             );
-            let _ = self.install_derived_summaries_for_function(
+            let _ = self.install_derived_summaries_for_function_with_provenance(
                 explorer,
                 &root.prepared,
                 &derived.summaries,
                 symbol_map,
+                retained_scope.clone(),
             );
-            let _ = self.install_known_symbols_for_function(explorer, &root.prepared, symbol_map);
+            let _ = self.install_known_symbols_for_function_with_provenance(
+                explorer,
+                &root.prepared,
+                symbol_map,
+                retained_scope,
+            );
         }
         derived.diagnostics
     }
 
-    pub fn install_derived_summaries_for_function(
+    pub(crate) fn install_derived_summaries_for_function(
         &self,
         explorer: &mut PathExplorer<'ctx>,
         prepared: &SsaArtifact,
         summaries: &BTreeMap<InterprocFunctionId, Rc<DerivedFunctionSummary<'ctx>>>,
         symbol_map: &HashMap<u64, String>,
     ) -> SummaryInstallStats {
+        self.install_derived_summaries_for_function_with_provenance(
+            explorer,
+            prepared,
+            summaries,
+            symbol_map,
+            (),
+        )
+    }
+
+    fn install_derived_summaries_for_function_with_provenance<P>(
+        &self,
+        explorer: &mut PathExplorer<'ctx>,
+        prepared: &SsaArtifact,
+        summaries: &BTreeMap<InterprocFunctionId, Rc<DerivedFunctionSummary<'ctx>>>,
+        symbol_map: &HashMap<u64, String>,
+        provenance: P,
+    ) -> SummaryInstallStats
+    where
+        P: Clone + 'ctx,
+    {
         let mut stats = SummaryInstallStats::default();
         let mut targets = BTreeSet::new();
         for call in prepared.call_sites().by_id.values() {
@@ -899,11 +1321,15 @@ impl<'ctx> SummaryRegistry<'ctx> {
                 continue;
             }
             let callconv = self.callconv.clone();
+            let provenance = provenance.clone();
             explorer.register_derived_call_hook(
                 target,
                 summary.clone(),
                 callconv.clone(),
-                move |state| apply_derived_summary(state, &summary, &callconv),
+                move |state| {
+                    let _retain_exact_provenance = &provenance;
+                    apply_derived_summary(state, &summary, &callconv)
+                },
             );
             stats.installed += 1;
         }
@@ -1055,39 +1481,54 @@ fn with_budget_exhausted_completion<'ctx>(
     next
 }
 
-fn build_interproc_summary_set(
+fn build_advisory_interproc_summary_set(
     scope: &PreparedFunctionScope,
     arch: Option<&ArchSpec>,
-    symbol_map: &HashMap<u64, String>,
 ) -> InterprocSummarySet {
-    let mut inputs = Vec::new();
-    let mut seeds = BTreeMap::new();
-    for function in scope.functions().values() {
-        if is_runtime_materialized_scope_function(scope, function) {
-            continue;
-        }
-        if let Some(name) = symbol_map.get(&function.id.0)
-            && let Some(summary) = crate::function_semantic_summary_seed_for_name_with_linkage(
-                function.id,
-                name,
-                r2ssa::FunctionSemanticLinkage::Imported,
-            )
-        {
-            seeds.insert(function.id, summary);
-            continue;
-        }
-        inputs.push(InterprocFunctionInput {
+    let Some(root) = scope.root() else {
+        return InterprocSummarySet::default();
+    };
+    let inputs = scope
+        .functions()
+        .values()
+        .filter(|function| !is_runtime_materialized_scope_function(scope, function))
+        .map(|function| InterprocFunctionInput {
             id: function.id,
             name: function.name.clone(),
-            prepared: &function.prepared,
-        });
-    }
+            prepared: function.prepared.as_ref(),
+        })
+        .collect::<Vec<_>>();
 
     solve_interproc_summary_set(
         &inputs,
         arch,
-        Some(scope.root_id()),
-        &seeds,
+        Some(root.id),
+        &BTreeMap::new(),
+        InterprocSolveConfig::default(),
+    )
+    .unwrap_or_default()
+}
+
+fn build_source_owned_interproc_summary_set(
+    scope: &PreparedFunctionScope,
+) -> Result<PreparedInterprocSummarySet, PreparedInterprocSummaryError> {
+    let root = scope
+        .root()
+        .ok_or(PreparedInterprocSummaryError::MissingRoot)?;
+    let inputs = scope
+        .functions()
+        .values()
+        .filter(|function| !is_runtime_materialized_scope_function(scope, function))
+        .map(|function| PreparedInterprocFunctionInput {
+            id: function.id,
+            name: function.name.clone(),
+            prepared: &function.prepared,
+        })
+        .collect::<Vec<_>>();
+
+    solve_prepared_interproc_summary_set(
+        Arc::clone(&root.prepared),
+        &inputs,
         InterprocSolveConfig::default(),
     )
 }
@@ -1180,7 +1621,7 @@ fn derive_symbolic_summary_for_function<'ctx>(
         ..crate::path::ExploreConfig::default()
     };
     let mut explorer = PathExplorer::with_config(ctx, config);
-    let _ = registry.install_interproc_summaries_for_function(
+    let _ = registry.install_interproc_summary_report_for_function(
         &mut explorer,
         &function.prepared,
         interproc,
@@ -2867,6 +3308,363 @@ mod tests {
         }
     }
 
+    fn returning_artifact(addr: u64) -> SsaArtifact {
+        SsaArtifact::for_symbolic(
+            &[R2ILBlock {
+                addr,
+                size: 1,
+                ops: vec![R2ILOp::Return {
+                    target: const_vn(0, 8),
+                }],
+                switch_info: None,
+                op_metadata: Default::default(),
+            }],
+            Some(&test_arch()),
+        )
+        .expect("returning artifact")
+    }
+
+    fn exact_interproc_arch() -> ArchSpec {
+        let mut arch = ArchSpec::new("x86-64");
+        arch.addr_size = 8;
+        arch.add_register(RegisterDef::new("RAX", 0x00, 8));
+        arch.add_register(RegisterDef::new("RSP", 0x08, 8));
+        arch.add_register(RegisterDef::new("RIP", 0x10, 8));
+        arch
+    }
+
+    fn exact_interproc_artifact(addr: u64, ops: Vec<R2ILOp>) -> Arc<SsaArtifact> {
+        let arch = exact_interproc_arch();
+        let storage = |offset| r2ssa::CanonicalStorageId {
+            space: r2ssa::CanonicalStorageSpace::Register,
+            offset,
+            size: 8,
+        };
+        let interface = r2ssa::SourceFunctionInterface::new_exact(
+            b"r2sym-interproc-hook-owner".to_vec(),
+            "sysv64",
+            std::iter::empty::<r2ssa::SourceAbiParameterSpec>(),
+            r2ssa::SourceFunctionReturn::Register {
+                storage: storage(0x00),
+            },
+            std::iter::empty::<r2ssa::SourceStackSlotSpec>(),
+        )
+        .and_then(|interface| interface.with_stack_pointer_storage(storage(0x08)))
+        .and_then(|interface| interface.with_return_address_storage(storage(0x10)))
+        .expect("exact interproc hook interface");
+        Arc::new(
+            SsaArtifact::for_decompile_with_interface(
+                &[R2ILBlock {
+                    addr,
+                    size: 1,
+                    ops,
+                    switch_info: None,
+                    op_metadata: Default::default(),
+                }],
+                Some(&arch),
+                interface,
+            )
+            .expect("exact interproc hook root"),
+        )
+    }
+
+    fn exact_interproc_root(addr: u64) -> Arc<SsaArtifact> {
+        exact_interproc_artifact(
+            addr,
+            vec![R2ILOp::Return {
+                target: const_vn(0, 8),
+            }],
+        )
+    }
+
+    #[test]
+    fn interproc_hook_installation_requires_exact_owner_and_current_schema() {
+        let root = exact_interproc_root(0x401000);
+        let input = PreparedInterprocFunctionInput {
+            id: InterprocFunctionId(root.function().entry),
+            name: Some("root".to_string()),
+            prepared: &root,
+        };
+        let summaries = solve_prepared_interproc_summary_set(
+            Arc::clone(&root),
+            &[input],
+            InterprocSolveConfig::default(),
+        )
+        .expect("source-owned interproc report");
+        let foreign = exact_interproc_root(0x401000);
+        let ctx = z3::Context::thread_local();
+        let mut explorer = PathExplorer::new(&ctx);
+        let registry = SummaryRegistry::new(CallConv::x86_64_sysv());
+        let symbols = HashMap::new();
+
+        assert!(
+            registry
+                .install_interproc_summaries_for_function(
+                    &mut explorer,
+                    &root,
+                    &summaries,
+                    &symbols,
+                )
+                .is_some()
+        );
+        assert!(
+            registry
+                .install_interproc_summaries_for_function(
+                    &mut explorer,
+                    &foreign,
+                    &summaries,
+                    &symbols,
+                )
+                .is_none()
+        );
+
+        let mut stale = summaries.report().clone();
+        stale.schema_version = stale.schema_version.saturating_sub(1);
+        assert!(
+            registry
+                .install_interproc_summary_report_for_function(
+                    &mut explorer,
+                    root.as_ref(),
+                    &stale,
+                    &symbols,
+                )
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn installed_interproc_hook_retains_exact_owner_until_explorer_drop() {
+        let root_addr = 0x401000;
+        let root = exact_interproc_artifact(
+            root_addr,
+            vec![
+                R2ILOp::Call {
+                    target: const_vn(root_addr, 8),
+                },
+                R2ILOp::Return {
+                    target: const_vn(0, 8),
+                },
+            ],
+        );
+        let weak = Arc::downgrade(&root);
+        let summaries = solve_prepared_interproc_summary_set(
+            Arc::clone(&root),
+            &[PreparedInterprocFunctionInput {
+                id: InterprocFunctionId(root_addr),
+                name: None,
+                prepared: &root,
+            }],
+            InterprocSolveConfig::default(),
+        )
+        .expect("source-owned recursive summary");
+        let ctx = z3::Context::thread_local();
+        let mut explorer = PathExplorer::new(&ctx);
+        let registry = SummaryRegistry::new(CallConv::x86_64_sysv());
+        let installed = registry
+            .install_interproc_summaries_for_function(
+                &mut explorer,
+                &root,
+                &summaries,
+                &HashMap::new(),
+            )
+            .expect("matching prepared summary");
+        assert_eq!(installed.installed, 1);
+
+        drop(summaries);
+        drop(root);
+        assert!(weak.upgrade().is_some());
+        drop(explorer);
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn installed_scope_hook_retains_exact_helper_until_explorer_drop() {
+        let root_addr = 0x401000;
+        let helper_addr = 0x402000;
+        let root = exact_interproc_artifact(
+            root_addr,
+            vec![
+                R2ILOp::Call {
+                    target: const_vn(helper_addr, 8),
+                },
+                R2ILOp::Return {
+                    target: const_vn(0, 8),
+                },
+            ],
+        );
+        let helper = exact_interproc_root(helper_addr);
+        let helper_weak = Arc::downgrade(&helper);
+        let scope = PreparedFunctionScope::new(
+            root_addr,
+            vec![
+                ScopedPreparedFunction {
+                    id: InterprocFunctionId(root_addr),
+                    name: None,
+                    prepared: Arc::clone(&root),
+                },
+                ScopedPreparedFunction {
+                    id: InterprocFunctionId(helper_addr),
+                    name: None,
+                    prepared: Arc::clone(&helper),
+                },
+            ],
+        )
+        .expect("exact manual scope");
+        let report = r2ssa::solve_interproc_summary_set(
+            &[
+                r2ssa::InterprocFunctionInput {
+                    id: InterprocFunctionId(root_addr),
+                    name: None,
+                    prepared: &root,
+                },
+                r2ssa::InterprocFunctionInput {
+                    id: InterprocFunctionId(helper_addr),
+                    name: None,
+                    prepared: &helper,
+                },
+            ],
+            Some(&exact_interproc_arch()),
+            Some(InterprocFunctionId(root_addr)),
+            &BTreeMap::new(),
+            InterprocSolveConfig::default(),
+        )
+        .expect("current advisory interproc report");
+        let ctx = z3::Context::thread_local();
+        let mut explorer = PathExplorer::new(&ctx);
+        let registry = SummaryRegistry::new(CallConv::x86_64_sysv());
+        let installed = registry
+            .install_interproc_summary_report_for_function_with_provenance(
+                &mut explorer,
+                root.as_ref(),
+                &report,
+                &HashMap::new(),
+                scope.clone(),
+            )
+            .expect("current report");
+        assert_eq!(installed.installed, 1);
+
+        drop(report);
+        drop(scope);
+        drop(helper);
+        drop(root);
+        assert!(helper_weak.upgrade().is_some());
+        drop(explorer);
+        assert!(helper_weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn installed_scope_core_hook_retains_exact_helper_until_explorer_drop() {
+        let root_addr = 0x401000;
+        let helper_addr = 0x402000;
+        let root = exact_interproc_artifact(
+            root_addr,
+            vec![
+                R2ILOp::Call {
+                    target: const_vn(helper_addr, 8),
+                },
+                R2ILOp::Return {
+                    target: const_vn(0, 8),
+                },
+            ],
+        );
+        let helper = exact_interproc_root(helper_addr);
+        let helper_weak = Arc::downgrade(&helper);
+        let scope = PreparedFunctionScope::new(
+            root_addr,
+            vec![
+                ScopedPreparedFunction {
+                    id: InterprocFunctionId(root_addr),
+                    name: None,
+                    prepared: Arc::clone(&root),
+                },
+                ScopedPreparedFunction {
+                    id: InterprocFunctionId(helper_addr),
+                    name: None,
+                    prepared: Arc::clone(&helper),
+                },
+            ],
+        )
+        .expect("exact manual scope");
+        let ctx = z3::Context::thread_local();
+        let mut explorer = PathExplorer::new(&ctx);
+        let registry = SummaryRegistry::with_core(CallConv::x86_64_sysv());
+        let symbols = HashMap::from([(helper_addr, "memcpy".to_string())]);
+        let _ = registry.install_scope_summaries_for_explorer(
+            &mut explorer,
+            &ctx,
+            root.as_ref(),
+            &scope,
+            Some(&exact_interproc_arch()),
+            &symbols,
+        );
+
+        drop(scope);
+        drop(helper);
+        drop(root);
+        assert!(helper_weak.upgrade().is_some());
+        drop(explorer);
+        assert!(helper_weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn advisory_derivation_does_not_promote_manual_scope_or_name_seeds() {
+        let root_addr = 0x401000;
+        let helper_addr = 0x402000;
+        let root = exact_interproc_artifact(
+            root_addr,
+            vec![
+                R2ILOp::Call {
+                    target: const_vn(helper_addr, 8),
+                },
+                R2ILOp::Return {
+                    target: const_vn(0, 8),
+                },
+            ],
+        );
+        let helper = exact_interproc_root(helper_addr);
+        let scope = PreparedFunctionScope::new(
+            root_addr,
+            vec![
+                ScopedPreparedFunction {
+                    id: InterprocFunctionId(root_addr),
+                    name: Some("root".to_string()),
+                    prepared: root,
+                },
+                ScopedPreparedFunction {
+                    id: InterprocFunctionId(helper_addr),
+                    name: Some("memcpy".to_string()),
+                    prepared: helper,
+                },
+            ],
+        )
+        .expect("exact manual scope");
+        let ctx = z3::Context::thread_local();
+        let registry = SummaryRegistry::new(CallConv::x86_64_sysv());
+        let arch = exact_interproc_arch();
+        let derived =
+            registry.derive_symbolic_summaries(&ctx, &scope, Some(&arch), &HashMap::new());
+        let helper_summary = derived
+            .interproc
+            .summaries
+            .get(&InterprocFunctionId(helper_addr))
+            .expect("advisory helper report");
+
+        assert_eq!(derived.interproc.root, Some(InterprocFunctionId(root_addr)));
+        assert!(helper_summary.memory_effects.is_empty());
+        assert!(helper_summary.transfer_effects.is_empty());
+        assert!(helper_summary.allocation_effects.is_empty());
+        assert!(matches!(
+            registry.derive_source_owned_symbolic_summaries(
+                &ctx,
+                &scope,
+                Some(&arch),
+                &HashMap::new(),
+            ),
+            Err(PreparedInterprocSummaryError::ManualFunction)
+                | Err(PreparedInterprocSummaryError::ManualRootWithHelpers)
+        ));
+    }
+
     #[test]
     fn empty_summary_substitutions_are_identity() {
         let ctx = z3::Context::thread_local();
@@ -2890,6 +3688,20 @@ mod tests {
         assert!(
             SummaryRegistry::with_profile_for_arch(&arch, SummaryProfile::PathListing).is_some()
         );
+    }
+
+    #[test]
+    fn imported_names_do_not_select_a_detached_calling_convention() {
+        let arch = test_arch();
+        let imported = HashMap::from([(0x2000, "kernel32.dll_VirtualAlloc".to_string())]);
+        let empty = HashMap::new();
+        let with_import =
+            CallConv::for_arch_spec_and_symbols(&arch, &imported).expect("x86 callconv");
+        let without_import =
+            CallConv::for_arch_spec_and_symbols(&arch, &empty).expect("x86 callconv");
+
+        assert_eq!(with_import.arg_registers, without_import.arg_registers);
+        assert_eq!(with_import.ret_register, without_import.ret_register);
     }
 
     #[test]
@@ -3048,9 +3860,13 @@ mod tests {
             switch_info: None,
             op_metadata: Default::default(),
         }];
-        let root_a = SsaArtifact::for_symbolic(&blocks_a, Some(&test_arch())).expect("root a");
-        let root_b = SsaArtifact::for_symbolic(&blocks_b, Some(&test_arch())).expect("root b");
-        let helper = SsaArtifact::for_symbolic(&helper_blocks, Some(&test_arch())).expect("helper");
+        let root_a =
+            Arc::new(SsaArtifact::for_symbolic(&blocks_a, Some(&test_arch())).expect("root a"));
+        let root_b =
+            Arc::new(SsaArtifact::for_symbolic(&blocks_b, Some(&test_arch())).expect("root b"));
+        let helper = Arc::new(
+            SsaArtifact::for_symbolic(&helper_blocks, Some(&test_arch())).expect("helper"),
+        );
 
         let scope = PreparedFunctionScope::new(
             0x1000,
@@ -3063,14 +3879,25 @@ mod tests {
                 ScopedPreparedFunction {
                     id: InterprocFunctionId(0x2000),
                     name: Some("helper".to_string()),
-                    prepared: helper.clone(),
+                    prepared: Arc::clone(&helper),
                 },
             ],
         )
         .expect("scope");
 
-        let rebound = scope.with_prepared_root(&root_b).expect("rebound scope");
+        let rebound = scope
+            .with_prepared_root(Arc::clone(&root_b))
+            .expect("rebound scope");
         let rebound_root = rebound.root().expect("rebound root");
+        assert!(Arc::ptr_eq(&rebound_root.prepared, &root_b));
+        assert!(Arc::ptr_eq(
+            &rebound
+                .functions()
+                .get(&InterprocFunctionId(0x2000))
+                .expect("helper")
+                .prepared,
+            &helper,
+        ));
         assert_eq!(rebound_root.prepared.entry, root_b.entry);
         assert_eq!(rebound_root.prepared.function().blocks().count(), 1);
         assert_eq!(
@@ -3086,20 +3913,12 @@ mod tests {
 
     #[test]
     fn scoped_function_provenance_not_display_name_controls_runtime_exclusion() {
-        let blocks = vec![R2ILBlock {
-            addr: 0x1000,
-            size: 1,
-            ops: vec![R2ILOp::Return {
-                target: const_vn(0, 8),
-            }],
-            switch_info: None,
-            op_metadata: Default::default(),
-        }];
-        let root = SsaArtifact::for_symbolic(&blocks, Some(&test_arch())).expect("root");
-        let helper = root
-            .clone()
-            .with_name("runtime.materialized.display-only".to_string());
-        let runtime = root.clone().with_name("ordinary-display-name".to_string());
+        let root = Arc::new(returning_artifact(0x1000));
+        let helper = Arc::new(
+            returning_artifact(0x2000).with_name("runtime.materialized.display-only".to_string()),
+        );
+        let runtime =
+            Arc::new(returning_artifact(0x3000).with_name("ordinary-display-name".to_string()));
         let root_id = InterprocFunctionId(0x1000);
         let helper_id = InterprocFunctionId(0x2000);
         let runtime_id = InterprocFunctionId(0x3000);
@@ -3109,7 +3928,7 @@ mod tests {
                 ScopedPreparedFunction {
                     id: root_id,
                     name: Some("root".to_string()),
-                    prepared: root,
+                    prepared: Arc::clone(&root),
                 },
                 ScopedPreparedFunction {
                     id: helper_id,
@@ -3119,7 +3938,7 @@ mod tests {
                 ScopedPreparedFunction {
                     id: runtime_id,
                     name: Some("ordinary-display-name".to_string()),
-                    prepared: runtime,
+                    prepared: Arc::clone(&runtime),
                 },
             ],
             BTreeMap::from([
@@ -3134,36 +3953,222 @@ mod tests {
         let runtime = scope.functions().get(&runtime_id).expect("runtime source");
         assert!(!is_runtime_materialized_scope_function(&scope, helper));
         assert!(is_runtime_materialized_scope_function(&scope, runtime));
+
+        let runtime_only = PreparedFunctionScope::new_with_provenance(
+            root_id.0,
+            vec![
+                ScopedPreparedFunction {
+                    id: root_id,
+                    name: None,
+                    prepared: Arc::clone(&root),
+                },
+                ScopedPreparedFunction {
+                    id: runtime_id,
+                    name: None,
+                    prepared: Arc::clone(&runtime.prepared),
+                },
+            ],
+            BTreeMap::from([
+                (root_id, ScopedFunctionProvenance::Analyzed),
+                (runtime_id, ScopedFunctionProvenance::RuntimeMaterialized),
+            ]),
+        )
+        .expect("runtime-only scope");
+        let semantic_scope = runtime_only
+            .source_authorized_for_semantics(&root)
+            .expect("runtime materialization is excluded, not promoted");
+        assert_eq!(semantic_scope.functions().len(), 1);
+        assert!(semantic_scope.functions().contains_key(&root_id));
     }
 
     #[test]
-    fn imported_symbol_snapshot_alone_enables_name_backed_summary_seed() {
-        let root = SsaArtifact::for_symbolic(
-            &[R2ILBlock {
-                addr: 0x1000,
-                size: 1,
-                ops: vec![R2ILOp::Return {
-                    target: const_vn(0, 8),
-                }],
-                switch_info: None,
-                op_metadata: Default::default(),
+    fn prepared_function_scope_rejects_duplicate_or_mislabeled_functions() {
+        let root = Arc::new(returning_artifact(0x1000));
+        let duplicate = PreparedFunctionScope::new(
+            0x1000,
+            vec![
+                ScopedPreparedFunction {
+                    id: InterprocFunctionId(0x1000),
+                    name: Some("root".to_string()),
+                    prepared: Arc::clone(&root),
+                },
+                ScopedPreparedFunction {
+                    id: InterprocFunctionId(0x1000),
+                    name: Some("duplicate".to_string()),
+                    prepared: root,
+                },
+            ],
+        );
+        assert!(duplicate.is_none());
+
+        let mislabeled = PreparedFunctionScope::new(
+            0x1000,
+            vec![ScopedPreparedFunction {
+                id: InterprocFunctionId(0x1000),
+                name: Some("mislabeled".to_string()),
+                prepared: Arc::new(returning_artifact(0x2000)),
             }],
-            Some(&test_arch()),
-        )
-        .expect("root");
-        let helper = SsaArtifact::for_symbolic(
-            &[R2ILBlock {
-                addr: 0x2000,
-                size: 1,
-                ops: vec![R2ILOp::Return {
-                    target: const_vn(0, 8),
+        );
+        assert!(mislabeled.is_none());
+
+        let helper = |entry, shared| {
+            Arc::new(
+                SsaArtifact::for_symbolic(
+                    &[
+                        R2ILBlock {
+                            addr: entry,
+                            size: 1,
+                            ops: vec![R2ILOp::Branch {
+                                target: const_vn(shared, 8),
+                            }],
+                            switch_info: None,
+                            op_metadata: Default::default(),
+                        },
+                        R2ILBlock {
+                            addr: shared,
+                            size: 1,
+                            ops: vec![R2ILOp::Return {
+                                target: const_vn(0, 8),
+                            }],
+                            switch_info: None,
+                            op_metadata: Default::default(),
+                        },
+                    ],
+                    Some(&test_arch()),
+                )
+                .expect("helper artifact"),
+            )
+        };
+        let overlapping = PreparedFunctionScope::new(
+            0x1000,
+            vec![
+                ScopedPreparedFunction {
+                    id: InterprocFunctionId(0x1000),
+                    name: Some("root".to_string()),
+                    prepared: Arc::new(returning_artifact(0x1000)),
+                },
+                ScopedPreparedFunction {
+                    id: InterprocFunctionId(0x2000),
+                    name: Some("helper_a".to_string()),
+                    prepared: helper(0x2000, 0x4000),
+                },
+                ScopedPreparedFunction {
+                    id: InterprocFunctionId(0x3000),
+                    name: Some("helper_b".to_string()),
+                    prepared: helper(0x3000, 0x4000),
+                },
+            ],
+        );
+        assert!(overlapping.is_none());
+
+        let partial_overlap = PreparedFunctionScope::new(
+            0x1000,
+            vec![
+                ScopedPreparedFunction {
+                    id: InterprocFunctionId(0x1000),
+                    name: Some("wide_root".to_string()),
+                    prepared: Arc::new(
+                        SsaArtifact::for_symbolic(
+                            &[R2ILBlock {
+                                addr: 0x1000,
+                                size: 8,
+                                ops: vec![R2ILOp::Return {
+                                    target: const_vn(0, 8),
+                                }],
+                                switch_info: None,
+                                op_metadata: Default::default(),
+                            }],
+                            Some(&test_arch()),
+                        )
+                        .expect("wide root"),
+                    ),
+                },
+                ScopedPreparedFunction {
+                    id: InterprocFunctionId(0x1004),
+                    name: Some("interior_helper".to_string()),
+                    prepared: Arc::new(returning_artifact(0x1004)),
+                },
+            ],
+        );
+        assert!(partial_overlap.is_none());
+
+        assert!(!block_ranges_are_disjoint([(u64::MAX, 1)]));
+    }
+
+    #[test]
+    fn prepared_function_scope_rejects_helper_machine_context_mismatch() {
+        let root = Arc::new(returning_artifact(0x1000));
+        let mut foreign_arch = ArchSpec::new("aarch64");
+        foreign_arch.addr_size = 8;
+        foreign_arch.add_register(RegisterDef::new("x0", 0, 8));
+        let foreign_helper = Arc::new(
+            SsaArtifact::for_symbolic(
+                &[R2ILBlock {
+                    addr: 0x2000,
+                    size: 1,
+                    ops: vec![R2ILOp::Return {
+                        target: const_vn(0, 8),
+                    }],
+                    switch_info: None,
+                    op_metadata: Default::default(),
                 }],
-                switch_info: None,
-                op_metadata: Default::default(),
-            }],
-            Some(&test_arch()),
-        )
-        .expect("helper");
+                Some(&foreign_arch),
+            )
+            .expect("foreign helper"),
+        );
+
+        assert!(
+            PreparedFunctionScope::new(
+                0x1000,
+                vec![
+                    ScopedPreparedFunction {
+                        id: InterprocFunctionId(0x1000),
+                        name: Some("root".to_string()),
+                        prepared: root,
+                    },
+                    ScopedPreparedFunction {
+                        id: InterprocFunctionId(0x2000),
+                        name: Some("foreign".to_string()),
+                        prepared: foreign_helper,
+                    },
+                ],
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn import_like_name_cannot_promote_an_abi_incoherent_scope() {
+        let root = Arc::new(
+            SsaArtifact::for_symbolic(
+                &[R2ILBlock {
+                    addr: 0x1000,
+                    size: 1,
+                    ops: vec![R2ILOp::Return {
+                        target: const_vn(0, 8),
+                    }],
+                    switch_info: None,
+                    op_metadata: Default::default(),
+                }],
+                Some(&test_arch()),
+            )
+            .expect("root"),
+        );
+        let helper = Arc::new(
+            SsaArtifact::for_symbolic(
+                &[R2ILBlock {
+                    addr: 0x2000,
+                    size: 1,
+                    ops: vec![R2ILOp::Return {
+                        target: const_vn(0, 8),
+                    }],
+                    switch_info: None,
+                    op_metadata: Default::default(),
+                }],
+                Some(&test_arch()),
+            )
+            .expect("helper"),
+        );
         let scope = PreparedFunctionScope::new(
             0x1000,
             vec![
@@ -3180,40 +4185,10 @@ mod tests {
             ],
         )
         .expect("scope");
-        let imported = crate::FunctionSymbolSnapshot::try_from_symbols([crate::FunctionSymbol {
-            addr: 0x2000,
-            name: "malloc".to_string(),
-            linkage: r2ssa::FunctionSemanticLinkage::Imported,
-        }])
-        .unwrap();
-        let internal = crate::FunctionSymbolSnapshot::try_from_symbols([crate::FunctionSymbol {
-            addr: 0x2000,
-            name: "malloc".to_string(),
-            linkage: r2ssa::FunctionSemanticLinkage::Internal,
-        }])
-        .unwrap();
-
-        let imported_set = build_interproc_summary_set(&scope, None, imported.imported_names());
-        let imported_summary = imported_set
-            .summaries
-            .get(&InterprocFunctionId(0x2000))
-            .expect("imported helper summary");
-        assert_eq!(
-            imported_summary.linkage,
-            r2ssa::FunctionSemanticLinkage::Imported
+        assert!(
+            build_source_owned_interproc_summary_set(&scope).is_err(),
+            "manual import-like helpers must not become source-owned summaries"
         );
-        assert!(!imported_summary.allocation_effects.is_empty());
-
-        let internal_set = build_interproc_summary_set(&scope, None, internal.imported_names());
-        let internal_summary = internal_set
-            .summaries
-            .get(&InterprocFunctionId(0x2000))
-            .expect("internal helper summary");
-        assert_ne!(
-            internal_summary.linkage,
-            r2ssa::FunctionSemanticLinkage::Imported
-        );
-        assert!(internal_summary.allocation_effects.is_empty());
     }
 
     #[test]

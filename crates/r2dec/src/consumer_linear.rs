@@ -2,7 +2,7 @@ use std::fmt::Write as _;
 
 pub(crate) fn render_semantic_worker_linearization(
     plan: &r2types::TypeWritebackPlan,
-    semantic_artifact: Option<&r2sym::SemanticArtifact>,
+    semantic_artifact: Option<&r2sym::SemanticArtifactReport>,
     reason: &str,
 ) -> String {
     let mut out = String::new();
@@ -91,7 +91,7 @@ pub(crate) fn render_semantic_worker_linearization(
 
     let mut emitted_any = false;
     for region in semantic_artifact
-        .map(r2sym::SemanticArtifact::actionable_regions)
+        .map(r2sym::SemanticArtifactReport::actionable_regions)
         .unwrap_or_default()
         .into_iter()
         .take(6)

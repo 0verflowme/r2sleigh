@@ -12,7 +12,7 @@ This is not a full formal verification system. It is a local proof kernel for
 the decompiler pipeline:
 
 ```
-canonical facts + evidence -> checked claim -> render permission
+canonical facts + evidence -> closed typed ledger -> opaque typed-output seal
 ```
 
 Owners
@@ -21,13 +21,13 @@ Owners
 - `../radare2`: typed function/type/import/debug context and dirty epochs.
 - `r2ssa`: CFG, def-use, memory, stack, callsite, return, and control
   certificates.
-- `r2sym`: semantic evidence, semantic claims, proof vocabulary, summary
+- `r2sym`: source-bound semantic evidence, semantic claims, summary
   applicability, ambiguity, and refusal policy.
 - `r2types`: type/layout/signature projection from typed context and semantic
   evidence.
-- `r2engine`: request-local route selection by proof coverage, budgets, and
+- `r2engine`: request-local typed-route selection by exact owners, budgets, and
   refusal.
-- `r2dec`: rendering only from render permissions, certificates, and residuals.
+- `r2dec`: rendering only from typed-output seals, certificates, and residuals.
 - `r2plugin`: typed context collection, FFI, command dispatch, and apply/render
   glue only.
 
@@ -70,14 +70,16 @@ Rules
 Current Implementation State
 ----------------------------
 
-The first tranche adds:
+The current source-owned spine provides:
 
-- proof vocabulary in `r2sym`
 - structural certificate carriers in `r2ssa::PreparedFunctionFacts`
-- proof coverage in `r2types::FunctionFacts`
-- engine route diagnostics carrying proof coverage
-- an initial `r2dec` gate that residualizes standard loop/switch output when
-  prepared control certificates are missing
+- an advisory report DTO in `r2types::FunctionFacts`
+- runtime authority in `r2types::SourceOwnedFunctionFacts`, which retains the
+  exact `Arc<r2ssa::SsaArtifact>` used to derive the report
+- typed engine route diagnostics with no detached counter or legacy permission
+  compatibility layer
+- `r2dec` gates that render semantic-kernel C only from exact typed-region seals
+  and otherwise emit summary comments, residuals, or refusals
 - closure-gate checks for incomplete reports and fake-output counters
 
 The remaining rewrite work is to make expression, memory/layout, callsite, and

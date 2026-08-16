@@ -563,11 +563,14 @@ mod tests {
         let text = output.replace("\r\n", "\n");
         let lines: Vec<&str> = text.lines().collect();
         assert!(!lines.is_empty(), "r2cmd output must not be empty");
-        assert_eq!(lines.len() % 2, 0, "r2cmd output must be line-paired");
+        assert!(
+            lines.len().is_multiple_of(2),
+            "r2cmd output must be line-paired"
+        );
         let mut normalized = Vec::new();
         for (idx, line) in lines.iter().enumerate() {
             let line = line.trim_end();
-            if idx % 2 == 0 {
+            if idx.is_multiple_of(2) {
                 assert!(line.starts_with("# "), "expected sidecar at index {}", idx);
                 let sidecar: Value =
                     serde_json::from_str(line.trim_start_matches("# ")).expect("sidecar json");

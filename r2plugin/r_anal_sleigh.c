@@ -16,20 +16,20 @@
 #include <string.h>
 #include "r2sleigh_api_v2.h"
 
-#if R2_ABIVERSION != 138
-#error "r2sleigh borrowed snapshot transport requires exactly radare2 ABI 138"
+#if R2_ABIVERSION != 139
+#error "r2sleigh borrowed snapshot transport requires exactly radare2 ABI 139"
 #endif
-#if R2SLEIGH_RADARE_ABI_V2 != 138
-#error "r2sleigh generated V2 header must target exactly radare2 ABI 138"
+#if R2SLEIGH_RADARE_ABI_V2 != 139
+#error "r2sleigh generated V2 header must target exactly radare2 ABI 139"
 #endif
-#if R_ANAL_FUNCTION_SNAPSHOT_SCHEMA_VERSION != 11
-#error "r2sleigh borrowed snapshot transport requires function snapshot schema 11"
+#if R_ANAL_FUNCTION_SNAPSHOT_SCHEMA_VERSION != 12
+#error "r2sleigh borrowed snapshot transport requires function snapshot schema 12"
 #endif
-#if R2SLEIGH_RADARE_FUNCTION_SNAPSHOT_SCHEMA_V2 != 11
-#error "r2sleigh generated V2 header must target function snapshot schema 11"
+#if R2SLEIGH_RADARE_FUNCTION_SNAPSHOT_SCHEMA_V2 != 12
+#error "r2sleigh generated V2 header must target function snapshot schema 12"
 #endif
-#if R2SLEIGH_RADARE_SNAPSHOT_ACCESSOR_SCHEMA_V2 != 4
-#error "r2sleigh generated V2 header must target snapshot accessor schema 4"
+#if R2SLEIGH_RADARE_SNAPSHOT_ACCESSOR_SCHEMA_V2 != 5
+#error "r2sleigh generated V2 header must target snapshot accessor schema 5"
 #endif
 
 static bool sleigh_radare_storage_view(R2SleighRadareRegisterStorageViewV2 *destination, const RAnalSnapshotRegisterStorageView *source) {
@@ -201,6 +201,7 @@ static bool sleigh_radare_parameter_copy(R2SleighRadareParameterViewV2 *destinat
 	}
 	R2SleighRadareParameterViewV2 result = {
 		.index = source->index,
+		.name_length = source->name_length,
 		.logical_type_id = source->logical_type_id,
 	};
 	if (!sleigh_radare_storage_view (&result.storage, &source->storage)
@@ -223,6 +224,12 @@ static uint8_t sleigh_radare_parameter_view(const void *opaque, size_t index, R2
 static uint8_t sleigh_radare_parameter_storage_name(const void *opaque, size_t index, uint8_t *buffer, size_t buffer_size) {
 	return opaque && buffer
 		&& r_anal_function_snapshot_parameter_storage_name (
+			opaque, index, (char *)buffer, buffer_size)? 1: 0;
+}
+
+static uint8_t sleigh_radare_parameter_name(const void *opaque, size_t index, uint8_t *buffer, size_t buffer_size) {
+	return opaque && buffer
+		&& r_anal_function_snapshot_parameter_name (
 			opaque, index, (char *)buffer, buffer_size)? 1: 0;
 }
 
@@ -606,6 +613,7 @@ static const R2SleighRadareAccessorsV2 sleigh_radare_accessors = {
 	.interface_calling_convention = sleigh_radare_interface_calling_convention,
 	.interface_storage_name = sleigh_radare_interface_storage_name,
 	.parameter_view = sleigh_radare_parameter_view,
+	.parameter_name = sleigh_radare_parameter_name,
 	.parameter_storage_name = sleigh_radare_parameter_storage_name,
 	.stack_slot_view = sleigh_radare_stack_slot_view,
 	.stack_slot_string = sleigh_radare_stack_slot_string,
@@ -685,14 +693,6 @@ typedef struct {
 #define R2SLEIGH_CONTEXT_BASE_ENUM 2
 #define R2SLEIGH_CONTEXT_BASE_TYPEDEF 3
 #define R2SLEIGH_CONTEXT_BASE_ATOMIC 4
-typedef struct {
-	const char *name;
-	const char *type_name;
-	const char *reg;
-	long long delta;
-	char kind;
-	int is_arg;
-} R2SleighRecoveredVar;
 typedef struct {
 	unsigned long long from;
 	unsigned long long to;
@@ -4032,7 +4032,7 @@ static char *sleigh_decompile_execute(RAnal *anal, RAnalFunction *fcn, bool json
 	return json_projection
 		? sleigh_engine_v2_error_json ("borrowed_snapshot_required",
 			R2SLEIGH_STATUS_UNSUPPORTED_V2,
-			"decompilation requires the ABI-138 borrowed snapshot provider")
+			"decompilation requires the ABI-139 borrowed snapshot provider")
 		: NULL;
 }
 
@@ -4114,7 +4114,7 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 	if (sleigh_direct_sym_snapshot_required_command (cmd)) {
 		R_LOG_ERROR ("r2sleigh: symbolic execution requires a borrowed function snapshot");
 		if (cons) {
-			r_cons_println (cons, "r2sleigh: symbolic execution requires the ABI-138 borrowed function snapshot provider");
+			r_cons_println (cons, "r2sleigh: symbolic execution requires the ABI-139 borrowed function snapshot provider");
 		}
 		return strdup ("");
 	}
@@ -4897,139 +4897,6 @@ static bool sleigh_analyze_fcn(RAnal *anal, RAnalFunction *fcn) {
 	return committed;
 }
 
-/* Helper to free RAnalVarProt */
-static void var_prot_free(void *ptr) {
-	if (!ptr) {
-		return;
-	}
-	RAnalVarProt *prot = (RAnalVarProt *)ptr;
-	free (prot->name);
-	free (prot->type);
-	free (prot);
-}
-
-/* Called during variable recovery (afva) */
-static RList *sleigh_recover_vars(RAnal *anal, RAnalFunction *fcn) {
-	if (!fcn || !anal) {
-		return NULL;
-	}
-	if (!auto_callback_allows_function (
-		anal,
-		fcn,
-		R2SLEIGH_AUTO_CALLBACK_RECOVER_VARS_V2,
-		"recover_vars")) {
-		return NULL;
-	}
-
-	R2ILContext *ctx = get_context (anal);
-	if (!ctx) {
-		return NULL;
-	}
-
-	BlockArray blocks;
-	if (!lift_function_blocks (anal, fcn, ctx, &blocks)) {
-		return NULL;
-	}
-
-	R2SleighAnalysisResultV2 *typed_vars = NULL;
-	R2SleighAnalysisResultViewV2 typed_vars_view = {0};
-	(void)sleigh_v2_analysis_query (R2SLEIGH_QUERY_RECOVERED_VARS_V2,
-		ctx, (const R2ILBlock *const *)blocks.blocks, blocks.count,
-		fcn->addr, &typed_vars, &typed_vars_view);
-	size_t typed_count = typed_vars_view.primary_count;
-	const R2SleighRecoveredVar *typed_items =
-		(const R2SleighRecoveredVar *)typed_vars_view.primary;
-
-	block_array_free (&blocks);
-
-	if (!typed_items || typed_count == 0) {
-		if (typed_vars) {
-			(void)sleigh_v2_analysis_result_release (&typed_vars);
-		}
-		return NULL;
-	}
-
-	RList *vars = r_list_newf ((RListFree)var_prot_free);
-	if (!vars) {
-		(void)sleigh_v2_analysis_result_release (&typed_vars);
-		return NULL;
-	}
-
-	for (size_t i = 0; i < typed_count; i++) {
-		const R2SleighRecoveredVar *item = &typed_items[i];
-		RAnalVarProt *prot = R_NEW0 (RAnalVarProt);
-		if (!prot) {
-			continue;
-		}
-
-		prot->name = strdup (item->name ? item->name : "");
-		prot->type = strdup (item->type_name ? item->type_name : "int64_t");
-		prot->delta = (st64)item->delta;
-		prot->isarg = item->is_arg != 0;
-
-		/* Parse kind: "r" = register, "s" = stack, "b" = bp-relative */
-		if (item->kind) {
-			switch (item->kind) {
-			case 'r':
-				/* Register-based argument: use r_reg_get to find index */
-				if (item->reg && *item->reg && anal->reg) {
-					/* Try uppercase version (Sleigh uses uppercase reg names) */
-					char *upper_reg = strdup (item->reg);
-					if (upper_reg) {
-						for (char *p = upper_reg; *p; p++) {
-							*p = toupper ((unsigned char)*p);
-						}
-					}
-					RRegItem *ri = upper_reg
-						? r_reg_get (anal->reg, upper_reg, R_REG_TYPE_GPR)
-						: NULL;
-					if (!ri) {
-						/* Try original case as fallback */
-						ri = r_reg_get (anal->reg, item->reg, R_REG_TYPE_GPR);
-					}
-					free (upper_reg);
-					if (ri) {
-						prot->kind = R_ANAL_VAR_KIND_REG;
-						prot->delta = ri->index;
-					} else {
-						/* Reg lookup failed, skip this arg */
-						free (prot->name);
-						free (prot->type);
-						free (prot);
-						continue;
-					}
-				} else {
-					/* No reg name provided, skip */
-					free (prot->name);
-					free (prot->type);
-					free (prot);
-					continue;
-				}
-				break;
-			case 's':
-				prot->kind = R_ANAL_VAR_KIND_SPV;
-				break;
-			case 'b':
-				prot->kind = R_ANAL_VAR_KIND_BPV;
-				break;
-			default:
-				prot->kind = R_ANAL_VAR_KIND_SPV;
-			}
-		}
-
-		r_list_append (vars, prot);
-	}
-
-	(void)sleigh_v2_analysis_result_release (&typed_vars);
-
-	if (r_list_empty (vars)) {
-		r_list_free (vars);
-		return NULL;
-	}
-
-	return vars;
-}
-
 static RAnalRefType data_ref_type_from_json(RAnal *anal, ut64 to_addr, const char *type_name) {
 	if (type_name && *type_name) {
 		switch (type_name[0]) {
@@ -5640,7 +5507,6 @@ RAnalPlugin r_anal_plugin_sleigh = {
 	/* Deep integration callbacks */
 	.pre_analysis = sleigh_pre_analysis,
 	.analyze_fcn = sleigh_analyze_fcn,
-	.recover_vars = sleigh_recover_vars,
 	.get_data_refs = sleigh_get_data_refs,
 	.post_analysis = sleigh_post_analysis,
 	.decompile = sleigh_decompile,

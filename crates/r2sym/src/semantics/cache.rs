@@ -2,7 +2,7 @@ use r2ssa::{SSA_SEMANTIC_FINGERPRINT_SCHEMA_VERSION, stable_ssa_semantic_fingerp
 
 use crate::sim::{PreparedFunctionScope, ScopedFunctionProvenance};
 
-pub const SEMANTIC_ARTIFACT_SCHEMA_VERSION: u32 = 13;
+pub const SEMANTIC_ARTIFACT_SCHEMA_VERSION: u32 = 14;
 
 const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
@@ -136,7 +136,7 @@ mod tests {
             vec![ScopedPreparedFunction {
                 id,
                 name: Some(name.to_string()),
-                prepared: prepared.with_name(name),
+                prepared: std::sync::Arc::new(prepared.with_name(name)),
             }],
         )
         .expect("scope")
@@ -283,12 +283,12 @@ mod tests {
                 ScopedPreparedFunction {
                     id: root_id,
                     name: Some(root_name.to_string()),
-                    prepared: make_leaf(root_id.0).with_name(root_name),
+                    prepared: std::sync::Arc::new(make_leaf(root_id.0).with_name(root_name)),
                 },
                 ScopedPreparedFunction {
                     id: helper_id,
                     name: Some(helper_name.to_string()),
-                    prepared: make_leaf(helper_id.0).with_name(helper_name),
+                    prepared: std::sync::Arc::new(make_leaf(helper_id.0).with_name(helper_name)),
                 },
             ],
             BTreeMap::from([

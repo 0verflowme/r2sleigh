@@ -47,7 +47,7 @@ pub use abi::AbiProfile;
 pub use address::{AddressProvenanceFacts, AffineAddressTerm, ParameterAddressExpression};
 pub use aggregate_access::{
     AGGREGATE_ACCESS_PROJECTION_SCHEMA_VERSION, AggregateAccessBinding, AggregateAccessProjection,
-    AggregateAccessProjectionFacts,
+    AggregateAccessProjectionFacts, AggregateElementIndexProjection,
 };
 pub use assumption::{
     AnalysisAssumption, AnalysisAssumptionConflict, AssumptionProvenance, AssumptionScope,
@@ -84,11 +84,13 @@ pub use graph::{
 pub use interproc::{
     CallArgObservation, FunctionSemanticLinkage, FunctionSemanticSummary, InterprocFunctionId,
     InterprocFunctionInput, InterprocSolveConfig, InterprocSummaryDiagnostics, InterprocSummarySet,
+    PreparedInterprocFunctionInput, PreparedInterprocSummaryError, PreparedInterprocSummarySet,
     SummaryAllocationEffect, SummaryArgEffect, SummaryAtomicEffect, SummaryAtomicOp,
     SummaryAtomicOrdering, SummaryLifetimeEffect, SummaryLifetimeOp, SummaryMemoryEffect,
     SummaryMemoryEffectKind, SummaryMemoryLocation, SummaryMemoryRange, SummaryMemoryRegion,
     SummaryReturnRelation, SummarySyncEffect, SummarySyncOp, SummaryTransferEffect,
     SummaryTransferLength, observe_call_arguments, solve_interproc_summary_set,
+    solve_prepared_interproc_summary_set,
 };
 pub use machine::{
     MachineAddressProvenance, MachineAddressSpace, MachineArithmeticFlagOp, MachineArithmeticMode,
@@ -100,7 +102,7 @@ pub use machine::{
 };
 pub use machine_context::{
     MACHINE_CONTEXT_SCHEMA_VERSION, MachineAbiModel, MachineAbiRegisterSlot,
-    MachineMemoryEndianness, MachineMemoryModel, MachineMemorySpace,
+    MachineArchitectureFamily, MachineMemoryEndianness, MachineMemoryModel, MachineMemorySpace,
     SOURCE_CALL_SITE_INTERFACE_SCHEMA_VERSION, SOURCE_FUNCTION_INTERFACE_SCHEMA_VERSION,
     SOURCE_TYPE_GRAPH_SCHEMA_VERSION, SourceAbiParameterSpec, SourceAggregateLayout,
     SourceAggregateMember, SourceCallArgumentSpec, SourceCallResult, SourceCallSiteIdentity,

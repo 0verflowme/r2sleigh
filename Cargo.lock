@@ -863,6 +863,7 @@ dependencies = [
  "r2types",
  "serde",
  "serde_json",
+ "z3",
 ]
 
 [[package]]
@@ -979,6 +980,7 @@ dependencies = [
  "r2sleigh-lift",
  "r2source",
  "serde",
+ "serde_json",
  "sleigh-config",
 ]
 

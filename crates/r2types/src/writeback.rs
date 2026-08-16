@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
+use std::sync::Arc;
 
 use r2ssa::{
     FunctionSSABlock, FunctionSemanticSummary, InterprocSummarySet, MemoryVersion, ObjectKind,
@@ -29,7 +30,8 @@ use crate::facts::{
     SignatureCertificate, SignatureCertificateSource, SignatureProjectionResult,
     SignatureProjectionSource, VisibleBinding, VisibleBindingKind, parse_type_like_spec,
 };
-use crate::function_facts::{FunctionFacts, InterprocSummaryView};
+use crate::function_facts::{FunctionFacts, InterprocSummaryView, SourceOwnedFunctionFacts};
+use crate::inferred_signature_from_signature_spec;
 use crate::model::Signedness;
 use crate::prepare::recover_vars_arch_profile;
 use crate::signedness::{ScalarSignednessEvidence, infer_scalar_signedness};
@@ -191,6 +193,10 @@ pub struct TypeWritebackDiagnostics {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// Advisory local-inference report.
+///
+/// This detached projection is not certificate authority. Authoritative
+/// writeback derives it internally from a retained [`SsaArtifact`] owner.
 pub struct LocalStructArtifacts {
     pub struct_decls: Vec<StructDeclCandidate>,
     pub slot_type_overrides: HashMap<usize, String>,
@@ -471,7 +477,7 @@ pub fn signature_certificate_source_names(
         .unwrap_or_default()
 }
 
-pub fn signature_writeback_decision(type_facts: &FunctionTypeFacts) -> SignatureWritebackDecision {
+fn signature_writeback_decision(type_facts: &FunctionTypeFacts) -> SignatureWritebackDecision {
     let Some(certificate) = type_facts.signature_certificate.as_ref() else {
         return SignatureWritebackDecision {
             authorized: false,
@@ -582,7 +588,8 @@ fn evidence_names(evidence: &[WritebackEvidence]) -> Vec<String> {
         .collect()
 }
 
-pub fn type_writeback_mutation_plan(
+#[cfg(test)]
+fn type_writeback_mutation_plan(
     plan: &TypeWritebackPlan,
     budget: TypeWritebackMutationBudget,
     type_facts: &FunctionTypeFacts,
@@ -595,7 +602,7 @@ pub fn type_writeback_mutation_plan(
     )
 }
 
-pub fn type_writeback_mutation_plan_with_policy(
+fn type_writeback_mutation_plan_with_policy(
     plan: &TypeWritebackPlan,
     budget: TypeWritebackMutationBudget,
     type_facts: &FunctionTypeFacts,
@@ -866,7 +873,7 @@ pub fn type_writeback_mutation_plan_with_policy(
     }
 }
 
-pub fn type_writeback_authority_report_with_policy(
+fn type_writeback_authority_report_with_policy(
     plan: &TypeWritebackPlan,
     budget: TypeWritebackMutationBudget,
     type_facts: &FunctionTypeFacts,
@@ -916,7 +923,8 @@ pub fn type_writeback_authority_report_with_policy(
     }
 }
 
-pub fn type_writeback_authority_report(
+#[cfg(test)]
+fn type_writeback_authority_report(
     plan: &TypeWritebackPlan,
     budget: TypeWritebackMutationBudget,
     type_facts: &FunctionTypeFacts,
@@ -931,30 +939,346 @@ pub fn type_writeback_authority_report(
     )
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct TypeWritebackAnalysis {
-    pub signature: InferredSignature,
-    pub function_facts: FunctionFacts,
-    pub type_facts: FunctionTypeFacts,
-    pub plan: TypeWritebackPlan,
+    source: Arc<SsaArtifact>,
+    function_facts: FunctionFacts,
+    plan: TypeWritebackPlan,
 }
 
-pub struct TypeWritebackAnalysisInput<'a> {
-    pub function_name: &'a str,
-    pub ptr_bits: u32,
-    pub inferred_signature: InferredSignature,
-    pub recovered_vars: &'a [RecoveredVariable],
-    pub ssa_blocks: &'a [SSABlock],
-    pub parsed_context: ParsedExternalContext,
-    pub local_structs: LocalStructArtifacts,
-    pub interproc_summary_set: Option<InterprocSummarySet>,
-    pub diagnostics: TypeWritebackDiagnostics,
+#[derive(Debug, Clone)]
+pub struct DecompileFinalization {
+    pub kind: crate::DecompileRouteKind,
+    pub reason: String,
+    pub fallback_comment: Option<String>,
 }
 
-pub struct TypeWritebackSemanticInputs<'a> {
-    pub artifact: &'a r2sym::SemanticArtifact,
-    pub local_field_accesses: &'a [LocalFieldAccessFact],
+impl TypeWritebackAnalysis {
+    pub fn source(&self) -> &SsaArtifact {
+        self.source.as_ref()
+    }
+
+    pub fn shared_source(&self) -> Arc<SsaArtifact> {
+        Arc::clone(&self.source)
+    }
+
+    pub fn matches_source(&self, source: &Arc<SsaArtifact>) -> bool {
+        Arc::ptr_eq(&self.source, source)
+    }
+
+    pub fn function_facts(&self) -> &FunctionFacts {
+        &self.function_facts
+    }
+
+    fn enrich_from_source_for_decompile(&mut self) -> bool {
+        if crate::prepare::prepared_arch_name(self.source.as_ref()).is_none() {
+            return false;
+        }
+        let prior_facts = self.function_facts.clone();
+        let prior_plan = self.plan.clone();
+        let Some(applied_constraints) =
+            SourceOwnedFunctionFacts::enrich_report_from_source_for_decompile(
+                self.source.as_ref(),
+                &mut self.function_facts,
+            )
+        else {
+            return false;
+        };
+        if applied_constraints > 0
+            && !self.refresh_plan_after_source_constraints(&prior_facts, applied_constraints)
+        {
+            self.function_facts = prior_facts;
+            self.plan = prior_plan;
+            return false;
+        }
+        true
+    }
+
+    pub fn signature(&self) -> &InferredSignature {
+        &self.plan.signature
+    }
+
+    pub fn type_facts(&self) -> &FunctionTypeFacts {
+        self.function_facts.type_facts()
+    }
+
+    pub fn plan(&self) -> &TypeWritebackPlan {
+        &self.plan
+    }
+
+    pub fn authority_report(
+        &self,
+        budget: TypeWritebackMutationBudget,
+        apply_policy: TypeWritebackApplyPolicy,
+    ) -> TypeWritebackAuthorityReport {
+        type_writeback_authority_report_with_policy(
+            &self.plan,
+            budget,
+            self.function_facts.type_facts(),
+            apply_policy,
+            self.source.function().cfg_risk_summary().block_count,
+        )
+    }
+
+    pub fn finalize_for_decompile(
+        mut self,
+        finalization: DecompileFinalization,
+    ) -> Result<SourceOwnedFunctionFacts, TypeWritebackAnalysisError> {
+        if !SourceOwnedFunctionFacts::stamp_report_decompile_route(
+            &mut self.function_facts,
+            finalization.kind,
+            finalization.reason,
+            finalization.fallback_comment,
+        ) {
+            return Err(TypeWritebackAnalysisError::IncompatibleDecompileRoute);
+        }
+        SourceOwnedFunctionFacts::seal(self.source, self.function_facts)
+            .ok_or(TypeWritebackAnalysisError::FunctionFactsSourceMismatch)
+    }
+
+    fn refresh_plan_after_source_constraints(
+        &mut self,
+        prior_facts: &FunctionFacts,
+        expected_constraints: usize,
+    ) -> bool {
+        let Some(signature) = self
+            .function_facts
+            .type_facts()
+            .render_authorized_signature()
+            .cloned()
+        else {
+            return false;
+        };
+        let source = self.source.as_ref();
+        let Some(arch_name) = crate::prepare::prepared_arch_name(source) else {
+            return false;
+        };
+        let ptr_bits = source
+            .machine_context()
+            .memory_model()
+            .default_address_bits();
+        if ptr_bits == 0 {
+            return false;
+        }
+        let function_name = source
+            .function()
+            .name
+            .as_deref()
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("fcn.{:x}", source.function().entry));
+        let mut plan = self.plan.clone();
+        let prior_confidence = plan.signature.confidence;
+        let prior_callconv_confidence = plan.signature.callconv_confidence;
+        plan.signature = inferred_signature_from_signature_spec(
+            &function_name,
+            arch_name,
+            ptr_bits,
+            self.function_facts.type_facts().callconv.as_deref(),
+            &signature,
+        );
+        plan.signature.confidence = plan.signature.confidence.max(prior_confidence);
+        plan.signature.callconv_confidence = plan
+            .signature
+            .callconv_confidence
+            .max(prior_callconv_confidence);
+        let prior_signature = prior_facts.type_facts().merged_signature.as_ref();
+        let changed_slots = signature
+            .params
+            .iter()
+            .enumerate()
+            .filter_map(|(slot, parameter)| {
+                (prior_signature
+                    .and_then(|signature| signature.params.get(slot))
+                    .and_then(|parameter| parameter.ty.as_ref())
+                    != parameter.ty.as_ref())
+                .then_some(slot)
+            })
+            .collect::<BTreeSet<_>>();
+        if changed_slots.len() != expected_constraints {
+            return false;
+        }
+        let mut refreshed_slots = BTreeSet::new();
+        for candidate in plan
+            .var_type_candidates
+            .iter_mut()
+            .filter(|candidate| candidate.isarg)
+        {
+            let Some(register) = candidate.reg.as_deref() else {
+                return false;
+            };
+            let Some(slot) =
+                exact_source_argument_slot_for_register(self.source.as_ref(), register)
+            else {
+                return false;
+            };
+            if !changed_slots.contains(&slot) {
+                continue;
+            }
+            if !refreshed_slots.insert(slot) {
+                return false;
+            }
+            let Some(ty) = signature
+                .params
+                .get(slot)
+                .and_then(|parameter| parameter.ty.as_ref())
+            else {
+                return false;
+            };
+            let var_type = render_signature_type(ty, ptr_bits);
+            let size = estimate_c_type_size_bytes(&var_type, ptr_bits) as u32;
+            candidate.var_type = var_type;
+            candidate.size = size;
+            candidate.source = WritebackSource::CalleeSignature;
+            if !candidate
+                .evidence
+                .contains(&WritebackEvidence::CertifiedCallArgument)
+            {
+                candidate
+                    .evidence
+                    .push(WritebackEvidence::CertifiedCallArgument);
+            }
+        }
+        if refreshed_slots != changed_slots {
+            return false;
+        }
+        self.plan = plan;
+        true
+    }
 }
+
+fn exact_source_argument_slot_for_register(source: &SsaArtifact, register: &str) -> Option<usize> {
+    let context = source.machine_context();
+    let register_storage = context.register_storage(register)?;
+    if register_storage.space != r2ssa::CanonicalStorageSpace::Register
+        || register_storage.size == 0
+    {
+        return None;
+    }
+    let interface = context.function_interface()?;
+    let abi = context.abi_model();
+    if !abi.is_available() || !abi.is_coherent() {
+        return None;
+    }
+    let mut matches = interface.parameters().iter().filter(|parameter| {
+        let parameter_storage = parameter.storage();
+        if parameter_storage.space != register_storage.space
+            || parameter_storage.offset != register_storage.offset
+            || register_storage.size > parameter_storage.size
+        {
+            return false;
+        }
+        let mut abi_slots = abi
+            .argument_registers()
+            .iter()
+            .filter(|slot| slot.index() == parameter.index());
+        abi_slots
+            .next()
+            .is_some_and(|slot| slot.storage() == parameter_storage)
+            && abi_slots.next().is_none()
+    });
+    let parameter = matches.next()?;
+    if matches.next().is_some() {
+        return None;
+    }
+    usize::try_from(parameter.index()).ok()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TypeWritebackAnalysisError {
+    ForeignSemanticArtifact,
+    ForeignInterprocSummary,
+    InterprocSummarySchema(r2ssa::interproc::InterprocSummarySchemaError),
+    MissingMachinePointerWidth,
+    IncoherentMachineMemoryModel,
+    AssumptionSetMismatch,
+    FunctionFactsSourceMismatch,
+    IncompatibleDecompileRoute,
+    SourceEnrichmentFailed,
+}
+
+#[derive(Debug, Clone)]
+pub struct TypeWritebackAnalysisRequest {
+    source: Arc<SsaArtifact>,
+    parsed_context: ParsedExternalContext,
+    semantic_artifact: Option<r2sym::SemanticArtifact>,
+    interproc_summary: Option<r2ssa::PreparedInterprocSummarySet>,
+}
+
+impl TypeWritebackAnalysisRequest {
+    pub fn new(
+        source: Arc<SsaArtifact>,
+        parsed_context: ParsedExternalContext,
+    ) -> Result<Self, TypeWritebackAnalysisError> {
+        if source.facts().assumptions != parsed_context.assumptions {
+            return Err(TypeWritebackAnalysisError::AssumptionSetMismatch);
+        }
+        Ok(Self {
+            source,
+            parsed_context,
+            semantic_artifact: None,
+            interproc_summary: None,
+        })
+    }
+
+    pub fn with_semantic_artifact(
+        mut self,
+        semantic_artifact: r2sym::SemanticArtifact,
+    ) -> Result<Self, TypeWritebackAnalysisError> {
+        if !Arc::ptr_eq(&semantic_artifact.shared_prepared(), &self.source) {
+            return Err(TypeWritebackAnalysisError::ForeignSemanticArtifact);
+        }
+        self.semantic_artifact = Some(semantic_artifact);
+        Ok(self)
+    }
+
+    pub fn with_interproc_summary(
+        mut self,
+        interproc_summary: r2ssa::PreparedInterprocSummarySet,
+    ) -> Result<Self, TypeWritebackAnalysisError> {
+        if !interproc_summary.matches_root(&self.source) {
+            return Err(TypeWritebackAnalysisError::ForeignInterprocSummary);
+        }
+        self.interproc_summary = Some(interproc_summary);
+        Ok(self)
+    }
+
+    pub fn source(&self) -> &Arc<SsaArtifact> {
+        &self.source
+    }
+
+    pub fn parsed_context(&self) -> &ParsedExternalContext {
+        &self.parsed_context
+    }
+}
+
+struct DerivedTypeWritebackAnalysis {
+    signature: InferredSignature,
+    function_facts: FunctionFacts,
+    type_facts: FunctionTypeFacts,
+    plan: TypeWritebackPlan,
+}
+
+struct DerivedTypeWritebackAnalysisInput<'a> {
+    function_name: &'a str,
+    ptr_bits: u32,
+    inferred_signature: InferredSignature,
+    recovered_vars: &'a [RecoveredVariable],
+    ssa_blocks: &'a [SSABlock],
+    parsed_context: ParsedExternalContext,
+    local_structs: LocalStructArtifacts,
+    interproc_summary_set: Option<InterprocSummarySet>,
+    diagnostics: TypeWritebackDiagnostics,
+}
+
+struct DerivedTypeWritebackSemanticInputs<'a> {
+    artifact: &'a r2sym::SemanticArtifactReport,
+    local_field_accesses: &'a [LocalFieldAccessFact],
+}
+
+#[cfg(test)]
+type TypeWritebackAnalysisInput<'a> = DerivedTypeWritebackAnalysisInput<'a>;
+#[cfg(test)]
+type TypeWritebackSemanticInputs<'a> = DerivedTypeWritebackSemanticInputs<'a>;
 
 #[cfg(kani)]
 mod kani_proofs {
@@ -2013,16 +2337,8 @@ fn role_identity_has_certified_summary_role(
         .any(|kind| certified_role_kinds.contains(kind))
 }
 
-pub fn signature_hint_for_semantic_artifact(
-    semantic_artifact: &r2sym::SemanticArtifact,
-    current_param_count: usize,
-) -> Option<FunctionSignatureSpec> {
-    signature_projection_for_semantic_artifact(semantic_artifact, current_param_count)
-        .map(|projection| projection.signature)
-}
-
-pub fn signature_projection_for_semantic_artifact(
-    semantic_artifact: &r2sym::SemanticArtifact,
+fn signature_projection_for_semantic_artifact(
+    semantic_artifact: &r2sym::SemanticArtifactReport,
     current_param_count: usize,
 ) -> Option<FunctionSignatureProjection> {
     let native = semantic_artifact.native_body()?;
@@ -2222,11 +2538,12 @@ fn apply_semantic_claim_type_seeds(
 impl SemanticTypeProjection {
     fn from_inputs(
         summary_view: &InterprocSummaryView,
-        semantic_artifact: Option<&r2sym::SemanticArtifact>,
+        semantic_artifact: Option<&r2sym::SemanticArtifactReport>,
         ptr_bits: u32,
     ) -> Self {
         let mut projection = Self::default();
-        let claim_summary = semantic_artifact.map(r2sym::SemanticArtifact::semantic_claim_summary);
+        let claim_summary =
+            semantic_artifact.map(r2sym::SemanticArtifactReport::semantic_claim_summary);
         if let Some(claims) = claim_summary.as_ref() {
             apply_semantic_claim_type_seeds(&mut projection, claims, ptr_bits);
         }
@@ -2299,7 +2616,8 @@ impl SemanticTypeProjection {
                 projection.pointer_param_indices.insert(effect.arg);
             }
         }
-        if let Some(native) = semantic_artifact.and_then(r2sym::SemanticArtifact::native_body) {
+        if let Some(native) = semantic_artifact.and_then(r2sym::SemanticArtifactReport::native_body)
+        {
             if let Some(role) = native.summary.role_identity.as_ref()
                 && let Some(role_projection) =
                     crate::role_registry::type_projection_for_role_identity(role, 0)
@@ -3609,17 +3927,22 @@ fn applied_type_assumption_parameter_slots(
 }
 
 fn build_type_writeback_analysis_inner(
-    mut input: TypeWritebackAnalysisInput<'_>,
-    semantic_inputs: Option<TypeWritebackSemanticInputs<'_>>,
+    mut input: DerivedTypeWritebackAnalysisInput<'_>,
+    semantic_inputs: Option<DerivedTypeWritebackSemanticInputs<'_>>,
     prep_facts: Option<&r2ssa::DecompilePrepFacts>,
-) -> TypeWritebackAnalysis {
+) -> DerivedTypeWritebackAnalysis {
     if input.parsed_context.stack_slots.is_empty()
         && !input.parsed_context.external_stack_vars.is_empty()
     {
         input.parsed_context.stack_slots =
             stack_slots_from_legacy_external_stack_vars(&input.parsed_context.external_stack_vars);
     }
-    let summary_view = InterprocSummaryView::new(input.interproc_summary_set.clone());
+    // This inner projection builder is also used by detached report-only
+    // tests. Invalid advisory reports lose all interprocedural evidence here;
+    // the source-owned entrypoint validates and propagates the exact schema
+    // error before calling this function.
+    let summary_view =
+        InterprocSummaryView::new(input.interproc_summary_set.clone()).unwrap_or_default();
 
     let semantic_projection = SemanticTypeProjection::from_inputs(
         &summary_view,
@@ -4017,84 +4340,137 @@ fn build_type_writeback_analysis_inner(
         diagnostics: diagnostics.clone(),
     };
 
-    TypeWritebackAnalysis {
+    DerivedTypeWritebackAnalysis {
         signature: input.inferred_signature,
-        function_facts: FunctionFacts::new(
-            type_facts.clone(),
-            semantic_inputs
-                .as_ref()
-                .map(|semantic| semantic.artifact.clone()),
-        )
-        .with_assumptions(input.parsed_context.assumptions.clone())
-        .with_summary_view(summary_view)
-        .with_diagnostics(type_facts.diagnostics.clone())
-        .with_assumption_usage(type_assumption_usage),
+        function_facts: FunctionFacts::new(type_facts.clone(), None)
+            .with_assumptions(input.parsed_context.assumptions.clone())
+            .with_summary_view(summary_view)
+            .with_diagnostics(type_facts.diagnostics.clone())
+            .with_assumption_usage(type_assumption_usage),
         type_facts,
         plan,
     }
 }
 
-pub fn build_type_writeback_analysis(
-    input: TypeWritebackAnalysisInput<'_>,
-) -> TypeWritebackAnalysis {
+#[cfg(test)]
+fn build_type_writeback_analysis(
+    input: DerivedTypeWritebackAnalysisInput<'_>,
+) -> DerivedTypeWritebackAnalysis {
     build_type_writeback_analysis_inner(input, None, None)
 }
 
-pub fn build_type_writeback_analysis_with_prep_facts(
-    input: TypeWritebackAnalysisInput<'_>,
+#[cfg(test)]
+fn build_type_writeback_analysis_with_prep_facts(
+    input: DerivedTypeWritebackAnalysisInput<'_>,
     prep_facts: &r2ssa::DecompilePrepFacts,
-) -> TypeWritebackAnalysis {
+) -> DerivedTypeWritebackAnalysis {
     build_type_writeback_analysis_inner(input, None, Some(prep_facts))
 }
 
-pub fn build_type_writeback_analysis_with_semantics(
-    input: TypeWritebackAnalysisInput<'_>,
-    semantic_inputs: TypeWritebackSemanticInputs<'_>,
-) -> TypeWritebackAnalysis {
+#[cfg(test)]
+fn build_type_writeback_analysis_with_semantics(
+    input: DerivedTypeWritebackAnalysisInput<'_>,
+    semantic_inputs: DerivedTypeWritebackSemanticInputs<'_>,
+) -> DerivedTypeWritebackAnalysis {
     build_type_writeback_analysis_inner(input, Some(semantic_inputs), None)
 }
 
-pub fn build_type_writeback_analysis_with_semantics_and_prep_facts(
-    input: TypeWritebackAnalysisInput<'_>,
-    semantic_inputs: TypeWritebackSemanticInputs<'_>,
-    prep_facts: &r2ssa::DecompilePrepFacts,
-) -> TypeWritebackAnalysis {
-    build_type_writeback_analysis_inner(input, Some(semantic_inputs), Some(prep_facts))
+pub fn build_source_owned_type_writeback_analysis(
+    request: TypeWritebackAnalysisRequest,
+) -> Result<TypeWritebackAnalysis, TypeWritebackAnalysisError> {
+    let TypeWritebackAnalysisRequest {
+        source,
+        parsed_context,
+        semantic_artifact,
+        interproc_summary,
+    } = request;
+    if source.facts().assumptions != parsed_context.assumptions {
+        return Err(TypeWritebackAnalysisError::AssumptionSetMismatch);
+    }
+    let memory_model = source.machine_context().memory_model();
+    if !memory_model.is_available() || !memory_model.is_coherent() {
+        return Err(TypeWritebackAnalysisError::IncoherentMachineMemoryModel);
+    }
+    let ptr_bits = memory_model.default_address_bits();
+    if ptr_bits == 0 {
+        return Err(TypeWritebackAnalysisError::MissingMachinePointerWidth);
+    }
+    let function_name = source
+        .function()
+        .name
+        .clone()
+        .unwrap_or_else(|| format!("fcn.{:x}", source.function().entry));
+    let ssa_blocks = source.local_ssa_blocks();
+    let inferred_signature = crate::infer_signature_from_prepared_ssa(source.as_ref());
+    let recovered_vars = crate::prepare::recover_vars_from_prepared_ssa(source.as_ref(), ptr_bits);
+    let mut diagnostics = TypeWritebackDiagnostics::default();
+    let arch_name = crate::prepare::prepared_arch_name(source.as_ref());
+    let local_structs = infer_local_struct_artifacts_from_prepared_ssa(
+        source.as_ref(),
+        arch_name,
+        ptr_bits,
+        &mut diagnostics,
+    );
+    let local_field_accesses = local_field_accesses_from_struct_artifacts(&local_structs);
+    let interproc_report = interproc_summary
+        .as_ref()
+        .map(|summary| summary.report().clone());
+    require_current_interproc_report_for_source_owned(interproc_report.as_ref())?;
+    let derived_input = DerivedTypeWritebackAnalysisInput {
+        function_name: &function_name,
+        ptr_bits,
+        inferred_signature,
+        recovered_vars: &recovered_vars,
+        ssa_blocks: &ssa_blocks,
+        parsed_context,
+        local_structs,
+        interproc_summary_set: interproc_report,
+        diagnostics,
+    };
+    let semantic_inputs =
+        semantic_artifact
+            .as_ref()
+            .map(|artifact| DerivedTypeWritebackSemanticInputs {
+                artifact: artifact.report(),
+                local_field_accesses: &local_field_accesses,
+            });
+    let derived = build_type_writeback_analysis_inner(
+        derived_input,
+        semantic_inputs,
+        source.decompile_prep_facts(),
+    );
+    let mut function_facts = derived.function_facts;
+    if let Some(semantic_artifact) = semantic_artifact {
+        function_facts.set_semantics(Some(semantic_artifact));
+    }
+    if let Some(interproc_summary) = interproc_summary {
+        function_facts = function_facts.with_prepared_interproc_summary(interproc_summary);
+    }
+    debug_assert_eq!(derived.signature, derived.plan.signature);
+    debug_assert_eq!(derived.type_facts, *function_facts.type_facts());
+    let mut analysis = TypeWritebackAnalysis {
+        source,
+        function_facts,
+        plan: derived.plan,
+    };
+    if !analysis.enrich_from_source_for_decompile() {
+        return Err(TypeWritebackAnalysisError::SourceEnrichmentFailed);
+    }
+    Ok(analysis)
 }
 
-pub fn augment_function_type_facts_with_summary_evidence(
-    type_facts: &mut FunctionTypeFacts,
-    semantic_artifact: &r2sym::SemanticArtifact,
-    ptr_bits: u32,
-) {
-    let projection = SemanticTypeProjection::from_inputs(
-        &InterprocSummaryView::default(),
-        Some(semantic_artifact),
-        ptr_bits,
-    );
-    type_facts
-        .out_param_certificates
-        .extend(out_param_certificates_from_projection(
-            &projection,
-            type_facts.merged_signature.as_ref(),
-            ptr_bits,
-        ));
-    type_facts.out_param_certificates.sort();
-    type_facts.out_param_certificates.dedup();
-    type_facts
-        .field_access_certificates
-        .extend(summary_field_access_certificates_from_semantics(
-            semantic_artifact,
-            type_facts.merged_signature.as_ref(),
-            &type_facts.external_type_db,
-            ptr_bits,
-        ));
-    type_facts.field_access_certificates.sort();
-    type_facts.field_access_certificates.dedup();
+fn require_current_interproc_report_for_source_owned(
+    report: Option<&InterprocSummarySet>,
+) -> Result<(), TypeWritebackAnalysisError> {
+    report
+        .map(InterprocSummarySet::validate_current_schema)
+        .transpose()
+        .map(|_| ())
+        .map_err(TypeWritebackAnalysisError::InterprocSummarySchema)
 }
 
 fn collect_semantic_slot_profiles(
-    artifact: Option<&r2sym::SemanticArtifact>,
+    artifact: Option<&r2sym::SemanticArtifactReport>,
     ptr_bits: u32,
 ) -> BTreeMap<usize, BTreeMap<u64, String>> {
     fn reliable_post_memory_terms(
@@ -4235,7 +4611,7 @@ fn collect_semantic_slot_profiles(
 }
 
 fn summary_field_access_certificates_from_semantics(
-    artifact: &r2sym::SemanticArtifact,
+    artifact: &r2sym::SemanticArtifactReport,
     merged_signature: Option<&FunctionSignatureSpec>,
     type_db: &ExternalTypeDb,
     ptr_bits: u32,
@@ -4340,75 +4716,9 @@ fn push_summary_location_field_access_certificates(
     }
 }
 
-fn semantic_stage_label(artifact: &r2sym::SemanticArtifact) -> &'static str {
-    match (artifact.execution, artifact.stage, artifact.granularity) {
-        (r2sym::ExecutionModel::Vm, _, _) => "vm_summary",
-        (_, r2sym::RefinementStage::Raw, _) => "raw",
-        (_, r2sym::RefinementStage::Compiled, r2sym::ArtifactGranularity::Regioned) => {
-            "island_compiled"
-        }
-        (_, r2sym::RefinementStage::Compiled, _) => "compiled",
-        (_, r2sym::RefinementStage::Residual, _) => "residual",
-    }
-}
-
-fn semantic_slice_class_label(slice_class: r2sym::SliceClass) -> &'static str {
-    match slice_class {
-        r2sym::SliceClass::Wrapper => "wrapper",
-        r2sym::SliceClass::Worker => "worker",
-        r2sym::SliceClass::RecursiveGroup => "recursive_group",
-        r2sym::SliceClass::InterpreterSwitch => "interpreter_switch",
-        r2sym::SliceClass::InterpreterIndirect => "interpreter_indirect",
-        r2sym::SliceClass::GenericLarge => "generic_large",
-    }
-}
-
-fn semantic_residual_reason_label(reason: r2sym::ResidualReason) -> &'static str {
-    match reason {
-        r2sym::ResidualReason::MissingArch => "missing_arch",
-        r2sym::ResidualReason::LargeCfg => "large_cfg",
-        r2sym::ResidualReason::SummaryBudgetExhausted => "summary_budget_exhausted",
-        r2sym::ResidualReason::SccBudgetExhausted => "scc_budget_exhausted",
-        r2sym::ResidualReason::InterpreterRequiresStepSummary => {
-            "interpreter_requires_step_summary"
-        }
-    }
-}
-
-fn semantic_fallback_warning(artifact: &r2sym::SemanticArtifact) -> String {
-    let slice_class = artifact
-        .slice_class()
-        .map(semantic_slice_class_label)
-        .unwrap_or("unknown");
-    let mode = semantic_stage_label(artifact);
-    let mut warning = format!("semantic fallback: {slice_class} slice in {mode} mode");
-    if !artifact.diagnostics.residual_reasons.is_empty() {
-        warning.push_str(" (");
-        warning.push_str(
-            &artifact
-                .diagnostics
-                .residual_reasons
-                .iter()
-                .map(|reason| semantic_residual_reason_label(*reason))
-                .collect::<Vec<_>>()
-                .join(", "),
-        );
-        warning.push(')');
-    }
-    if let Some(native) = artifact.native_body()
-        && !native.regions.is_empty()
-    {
-        warning.push_str(&format!(
-            "; regions={}, actionable_conditions={}, exact_conditions={}",
-            native.regions.len(),
-            native.actionable_control_count(),
-            native.exact_control_count(),
-        ));
-    }
-    warning
-}
-
-pub fn semantic_artifact_prefers_bounded_type_plan(artifact: &r2sym::SemanticArtifact) -> bool {
+pub fn semantic_artifact_prefers_bounded_type_plan(
+    artifact: &r2sym::SemanticArtifactReport,
+) -> bool {
     if !artifact.type_plan().allows_native_augmentation() {
         return true;
     }
@@ -4432,196 +4742,6 @@ pub fn semantic_artifact_prefers_bounded_type_plan(artifact: &r2sym::SemanticArt
                 .actionable_regions()
                 .into_iter()
                 .any(|region| !region.actionable_memory_terms().is_empty()))
-}
-
-pub fn build_semantic_type_fallback_plan(
-    function_name: &str,
-    arch_name: &str,
-    ptr_bits: u32,
-    artifact: &r2sym::SemanticArtifact,
-) -> TypeWritebackPlan {
-    let mut warnings = vec![semantic_fallback_warning(artifact)];
-    if !artifact.type_plan().allows_native_augmentation() {
-        warnings.push("type analysis not ready from semantic capability".to_string());
-    }
-    let mut local_structs = LocalStructArtifacts::default();
-    augment_local_struct_artifacts_with_semantics(&mut local_structs, artifact, ptr_bits);
-    let mut signature = InferredSignature {
-        function_name: function_name.to_string(),
-        signature: format!("void {}(void)", function_name),
-        ret_type: "void".to_string(),
-        params: Vec::new(),
-        callconv: "unknown".to_string(),
-        arch: arch_name.to_string(),
-        confidence: 0,
-        callconv_confidence: 0,
-    };
-    let empty_summary_view = InterprocSummaryView::new(None);
-    apply_semantic_artifact_signature_hint_to_inferred(&mut signature, artifact, ptr_bits);
-    let semantic_projection =
-        SemanticTypeProjection::from_inputs(&empty_summary_view, Some(artifact), ptr_bits);
-    warnings.extend(semantic_projection.refusal_warnings());
-    apply_semantic_projection_to_fallback_signature(&mut signature, &semantic_projection, ptr_bits);
-    if let Some(merged_signature) = merge_slot_type_overrides_into_signature(
-        inferred_signature_to_spec(&signature, ptr_bits),
-        &local_structs.slot_type_overrides,
-        &HashSet::new(),
-        &ExternalTypeDb::default(),
-        ptr_bits,
-        false,
-    ) {
-        apply_signature_context_overrides(&mut signature, Some(&merged_signature), ptr_bits);
-    }
-    if !local_structs.struct_decls.is_empty() {
-        warnings.push(format!(
-            "semantic regions projected {} struct candidate(s)",
-            local_structs.struct_decls.len()
-        ));
-    }
-
-    TypeWritebackPlan {
-        signature,
-        var_type_candidates: Vec::new(),
-        var_rename_candidates: Vec::new(),
-        struct_decls: local_structs.struct_decls,
-        global_type_links: Vec::new(),
-        diagnostics: TypeWritebackDiagnostics {
-            conflicts: Vec::new(),
-            warnings,
-            solver_warnings: Vec::new(),
-        },
-    }
-}
-
-fn apply_semantic_projection_to_fallback_signature(
-    signature: &mut InferredSignature,
-    projection: &SemanticTypeProjection,
-    ptr_bits: u32,
-) -> bool {
-    let mut changed = false;
-    if let Some(ret_ty) = projection.return_type_hint.as_ref() {
-        let existing_ty = parse_type_like_spec(&signature.ret_type, ptr_bits);
-        let should_replace = is_generic_type_string(&signature.ret_type)
-            || existing_ty.as_ref().is_some_and(|existing| {
-                summary_hint_can_replace_weak_existing(existing, ret_ty, ptr_bits)
-                    || matches!(ret_ty, CTypeLike::Void)
-                        && crate::signature_return_hint_can_replace_existing(
-                            existing,
-                            Some(ret_ty),
-                            ptr_bits,
-                        )
-            });
-        if should_replace {
-            let rendered = render_signature_type(ret_ty, ptr_bits);
-            if signature.ret_type != rendered {
-                signature.ret_type = rendered;
-                changed = true;
-            }
-        }
-    }
-
-    let max_index = projection
-        .param_type_hints
-        .keys()
-        .chain(projection.param_name_hints.keys())
-        .chain(projection.pointer_param_indices.iter())
-        .chain(projection.out_param_indices.iter())
-        .copied()
-        .max();
-    let Some(max_index) = max_index else {
-        if changed {
-            signature.signature = format_signature(
-                &signature.function_name,
-                &signature.ret_type,
-                &signature.params,
-            );
-            signature.confidence = signature.confidence.max(55);
-        }
-        return changed;
-    };
-
-    while signature.params.len() <= max_index {
-        let idx = signature.params.len();
-        let ty = projection
-            .param_type_hints
-            .get(&idx)
-            .cloned()
-            .or_else(|| {
-                (projection.pointer_param_indices.contains(&idx)
-                    || projection.out_param_indices.contains(&idx))
-                .then(void_pointer_type)
-            })
-            .unwrap_or_else(|| typedef_type("uintptr_t"));
-        signature.params.push(InferredSignatureParam {
-            name: projection
-                .param_name_hints
-                .get(&idx)
-                .cloned()
-                .unwrap_or_else(|| format!("arg{idx}")),
-            param_type: render_signature_type(&ty, ptr_bits),
-        });
-        changed = true;
-    }
-
-    for idx in 0..=max_index {
-        if let Some(param) = signature.params.get_mut(idx) {
-            if let Some(name) = projection.param_name_hints.get(&idx)
-                && (param.name.is_empty() || is_generic_arg_name(&param.name))
-            {
-                param.name = name.clone();
-                changed = true;
-            }
-            if inferred_param_has_authoritative_named_scalar_role(param, ptr_bits) {
-                continue;
-            }
-            if let Some(ty) = projection.param_type_hints.get(&idx) {
-                let existing_ty = parse_type_like_spec(&param.param_type, ptr_bits);
-                if is_generic_type_string(&param.param_type)
-                    || existing_ty.as_ref().is_some_and(|existing| {
-                        summary_hint_can_replace_weak_existing(existing, ty, ptr_bits)
-                    })
-                {
-                    let rendered = render_signature_type(ty, ptr_bits);
-                    if param.param_type != rendered {
-                        param.param_type = rendered;
-                        changed = true;
-                    }
-                }
-            }
-        }
-    }
-
-    signature.signature = format_signature(
-        &signature.function_name,
-        &signature.ret_type,
-        &signature.params,
-    );
-    if changed {
-        signature.confidence = signature.confidence.max(55);
-    }
-    changed
-}
-
-pub fn apply_semantic_artifact_signature_hint_to_inferred(
-    signature: &mut InferredSignature,
-    artifact: &r2sym::SemanticArtifact,
-    ptr_bits: u32,
-) -> bool {
-    let Some(projection) =
-        signature_projection_for_semantic_artifact(artifact, signature.params.len())
-    else {
-        return false;
-    };
-    let result = apply_signature_projection_to_inferred(signature, projection, ptr_bits);
-    if !result.was_applied() {
-        return false;
-    }
-    signature.signature = format_signature(
-        &signature.function_name,
-        &signature.ret_type,
-        &signature.params,
-    );
-    true
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -5455,31 +5575,6 @@ fn prepared_parameter_indexed_accesses(prepared: &SsaArtifact) -> Vec<ScalarArra
     candidates
 }
 
-/// Infer layout from the normalized pattern artifact while binding render
-/// candidates to the distinct SSA artifact consumed by the decompiler.
-/// Layout evidence and executable op-site identity have separate owners; a
-/// candidate from one artifact must never be projected onto the other by
-/// block/op coordinates alone.
-pub fn infer_local_struct_artifacts_from_prepared_views(
-    layout: &SsaArtifact,
-    render: &SsaArtifact,
-    arch_name: Option<&str>,
-    ptr_bits: u32,
-    diagnostics: &mut TypeWritebackDiagnostics,
-) -> LocalStructArtifacts {
-    let mut artifacts =
-        infer_local_struct_artifacts_from_prepared_ssa(layout, arch_name, ptr_bits, diagnostics);
-    let mut render_diagnostics = TypeWritebackDiagnostics::default();
-    let render_artifacts = infer_local_struct_artifacts_from_prepared_ssa(
-        render,
-        arch_name,
-        ptr_bits,
-        &mut render_diagnostics,
-    );
-    artifacts.indexed_accesses = render_artifacts.indexed_accesses;
-    artifacts
-}
-
 fn infer_local_struct_artifacts_from_blocks(
     ssa_blocks: &[LocalStructInferenceBlock],
     memory_versions: Option<&LocalMemoryVersionFacts>,
@@ -6166,6 +6261,7 @@ fn infer_local_struct_artifacts_from_blocks(
     }
 }
 
+/// Project advisory local field observations without granting certificates.
 pub fn local_field_accesses_from_struct_artifacts(
     local_structs: &LocalStructArtifacts,
 ) -> Vec<LocalFieldAccessFact> {
@@ -6184,7 +6280,7 @@ pub fn local_field_accesses_from_struct_artifacts(
     accesses
 }
 
-pub fn field_access_certificates_from_struct_artifacts(
+fn field_access_certificates_from_struct_artifacts(
     local_structs: &LocalStructArtifacts,
 ) -> Vec<crate::FieldAccessCertificate> {
     local_field_accesses_from_struct_artifacts(local_structs)
@@ -7906,19 +8002,6 @@ fn profile_minimum_stride(fields: &BTreeMap<u64, String>, ptr_bits: u32) -> Opti
         .iter()
         .filter_map(|(offset, ty)| offset.checked_add(estimate_c_type_size_bytes(ty, ptr_bits)))
         .max()
-}
-
-pub fn augment_local_struct_artifacts_with_semantics(
-    local_structs: &mut LocalStructArtifacts,
-    artifact: &r2sym::SemanticArtifact,
-    ptr_bits: u32,
-) {
-    let projection = SemanticTypeProjection::from_inputs(
-        &InterprocSummaryView::default(),
-        Some(artifact),
-        ptr_bits,
-    );
-    augment_local_struct_artifacts_with_projection(local_structs, &projection, ptr_bits);
 }
 
 fn augment_local_struct_artifacts_with_projection(
@@ -11161,6 +11244,459 @@ mod tests {
     use super::*;
     use std::collections::{BTreeMap, BTreeSet};
 
+    fn source_owned_worker_fixture(entry: u64) -> (Arc<SsaArtifact>, r2il::ArchSpec) {
+        let mut arch = r2il::ArchSpec::new("x86-64");
+        arch.add_register(r2il::RegisterDef::new("rax", 0x00, 8));
+        arch.add_register(r2il::RegisterDef::new("rip", 0x08, 8));
+        arch.add_register(r2il::RegisterDef::new("rsp", 0x10, 8));
+        arch.add_register(r2il::RegisterDef::new("rdi", 0x20, 8));
+        arch.add_register(r2il::RegisterDef::new("edi", 0x20, 4));
+        let loaded = r2il::Varnode::unique(0x10, 1);
+        let predicate = r2il::Varnode::unique(0x11, 1);
+        let block = r2il::R2ILBlock {
+            addr: entry,
+            size: 4,
+            ops: vec![
+                r2il::R2ILOp::Load {
+                    dst: loaded.clone(),
+                    space: r2il::SpaceId::Ram,
+                    addr: r2il::Varnode::register(0x20, 8),
+                },
+                r2il::R2ILOp::IntEqual {
+                    dst: predicate.clone(),
+                    a: loaded,
+                    b: r2il::Varnode::constant(0, 1),
+                },
+                r2il::R2ILOp::CBranch {
+                    target: r2il::Varnode::constant(entry, 8),
+                    cond: predicate,
+                },
+            ],
+            switch_info: None,
+            op_metadata: Default::default(),
+        };
+        let storage = |offset| r2ssa::CanonicalStorageId {
+            space: r2ssa::CanonicalStorageSpace::Register,
+            offset,
+            size: 8,
+        };
+        let interface = r2ssa::SourceFunctionInterface::new_exact(
+            b"source-owned-writeback".to_vec(),
+            "sysv64",
+            [r2ssa::SourceAbiParameterSpec::new(0, storage(0x20))],
+            r2ssa::SourceFunctionReturn::Void,
+            [],
+        )
+        .and_then(|interface| interface.with_return_address_storage(storage(0x08)))
+        .and_then(|interface| interface.with_stack_pointer_storage(storage(0x10)))
+        .expect("exact source-owned writeback interface");
+        let source = Arc::new(
+            SsaArtifact::for_decompile_with_interface(&[block], Some(&arch), interface)
+                .expect("prepared source owner"),
+        );
+        (source, arch)
+    }
+
+    fn prepared_summary_for(source: &Arc<SsaArtifact>) -> r2ssa::PreparedInterprocSummarySet {
+        let input = r2ssa::PreparedInterprocFunctionInput {
+            id: r2ssa::InterprocFunctionId(source.function().entry),
+            name: source.function().name.clone(),
+            prepared: source,
+        };
+        r2ssa::solve_prepared_interproc_summary_set(
+            Arc::clone(source),
+            &[input],
+            r2ssa::InterprocSolveConfig::default(),
+        )
+        .expect("source-owned summary")
+    }
+
+    #[test]
+    fn source_owned_writeback_retains_exact_prepared_owners() {
+        let (source, _) = source_owned_worker_fixture(0x401000);
+        let summary = prepared_summary_for(&source);
+        let semantic =
+            r2sym::compile_native_worker_summary_artifact(&source, None, Some(&summary), true)
+                .expect("source-owned semantic artifact");
+        let request = TypeWritebackAnalysisRequest::new(
+            Arc::clone(&source),
+            ParsedExternalContext::default(),
+        )
+        .expect("matching source assumptions")
+        .with_semantic_artifact(semantic)
+        .expect("matching semantic owner")
+        .with_interproc_summary(summary)
+        .expect("matching interprocedural owner");
+
+        let analysis = build_source_owned_type_writeback_analysis(request)
+            .expect("source-owned writeback analysis");
+
+        assert!(analysis.matches_source(&source));
+        assert!(
+            analysis
+                .function_facts()
+                .semantic_artifact()
+                .expect("retained semantic owner")
+                .shares_artifact(source.as_ref())
+        );
+        assert!(
+            analysis
+                .function_facts()
+                .prepared_interproc_summary()
+                .expect("retained interprocedural owner")
+                .matches_root(&source)
+        );
+    }
+
+    #[test]
+    fn source_owned_writeback_without_semantics_retains_exact_allocation() {
+        let (source, _) = source_owned_worker_fixture(0x401100);
+        let (foreign, _) = source_owned_worker_fixture(0x401100);
+        let weak = Arc::downgrade(&source);
+        let request = TypeWritebackAnalysisRequest::new(
+            Arc::clone(&source),
+            ParsedExternalContext::default(),
+        )
+        .expect("matching source assumptions");
+
+        let analysis = build_source_owned_type_writeback_analysis(request)
+            .expect("semantics-free source-owned writeback");
+
+        assert!(analysis.matches_source(&source));
+        assert!(!analysis.matches_source(&foreign));
+        assert!(analysis.function_facts().semantic_artifact().is_none());
+        assert!(
+            analysis
+                .function_facts()
+                .prepared_interproc_summary()
+                .is_none()
+        );
+        let shared = analysis.shared_source();
+        assert!(Arc::ptr_eq(&shared, &source));
+        drop(source);
+        assert!(weak.upgrade().is_some());
+        assert!(analysis.function_facts().render().is_some());
+        let owned = analysis
+            .finalize_for_decompile(DecompileFinalization {
+                kind: crate::DecompileRouteKind::Standard,
+                reason: "test route".to_string(),
+                fallback_comment: Some("ignored executable-looking payload".to_string()),
+            })
+            .expect("compatible route finalizes exact owner");
+        assert!(owned.report().input_quality().is_none());
+        let route = owned
+            .report()
+            .decompile_route()
+            .expect("source-owned route");
+        assert_eq!(route.kind, crate::DecompileRouteKind::Standard);
+        assert_eq!(route.reason.as_deref(), Some("test route"));
+        assert!(route.skip_runtime_type_inference);
+        assert!(route.use_prepared_semantic_view);
+        assert!(route.fallback_comment.is_none());
+        drop(shared);
+        assert!(weak.upgrade().is_some());
+        drop(owned);
+        assert!(weak.upgrade().is_none());
+    }
+
+    fn constrained_refresh_test_analysis(
+        source: Arc<SsaArtifact>,
+        current_param_bits: u32,
+        candidates: Vec<VarTypeCandidate>,
+    ) -> TypeWritebackAnalysis {
+        TypeWritebackAnalysis {
+            source,
+            function_facts: FunctionFacts::new(
+                certified_signature_facts("renamed_parameter", current_param_bits),
+                None,
+            ),
+            plan: TypeWritebackPlan {
+                signature: inferred_test_signature("fcn.refresh", "presentation_only"),
+                var_type_candidates: candidates,
+                var_rename_candidates: Vec::new(),
+                struct_decls: Vec::new(),
+                global_type_links: Vec::new(),
+                diagnostics: TypeWritebackDiagnostics::default(),
+            },
+        }
+    }
+
+    fn constrained_refresh_candidate(register: Option<&str>, name: &str) -> VarTypeCandidate {
+        VarTypeCandidate {
+            name: name.to_string(),
+            kind: "r".to_string(),
+            delta: 0,
+            var_type: "int64_t".to_string(),
+            isarg: true,
+            reg: register.map(str::to_string),
+            size: 8,
+            confidence: 80,
+            source: WritebackSource::LocalInferred,
+            evidence: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn constrained_plan_refresh_uses_exact_storage_alias_and_updates_size() {
+        let (source, _) = source_owned_worker_fixture(0x401200);
+        let prior_facts = FunctionFacts::new(certified_signature_facts("old_name", 64), None);
+        let mut analysis = constrained_refresh_test_analysis(
+            source,
+            8,
+            vec![constrained_refresh_candidate(
+                Some("edi"),
+                "does_not_match_signature",
+            )],
+        );
+
+        assert!(analysis.refresh_plan_after_source_constraints(&prior_facts, 1));
+        let candidate = &analysis.plan().var_type_candidates[0];
+        assert_eq!(candidate.var_type, "int8_t");
+        assert_eq!(candidate.size, 1);
+        assert_eq!(candidate.source, WritebackSource::CalleeSignature);
+        assert!(
+            candidate
+                .evidence
+                .contains(&WritebackEvidence::CertifiedCallArgument)
+        );
+    }
+
+    #[test]
+    fn constrained_plan_refresh_refuses_name_only_foreign_and_duplicate_bindings_atomically() {
+        let (source, _) = source_owned_worker_fixture(0x401300);
+        let prior_facts = FunctionFacts::new(certified_signature_facts("old_name", 64), None);
+        let mutations = [
+            vec![constrained_refresh_candidate(None, "renamed_parameter")],
+            vec![constrained_refresh_candidate(
+                Some("rax"),
+                "renamed_parameter",
+            )],
+            vec![
+                constrained_refresh_candidate(Some("rdi"), "first"),
+                constrained_refresh_candidate(Some("edi"), "second"),
+            ],
+        ];
+
+        for candidates in mutations {
+            let mut analysis =
+                constrained_refresh_test_analysis(Arc::clone(&source), 8, candidates);
+            let prior_plan = analysis.plan().clone();
+            assert!(!analysis.refresh_plan_after_source_constraints(&prior_facts, 1));
+            assert_eq!(analysis.plan(), &prior_plan);
+        }
+    }
+
+    #[test]
+    fn source_owned_authority_report_uses_retained_cfg_block_count() {
+        let (source, _) = source_owned_worker_fixture(0x401400);
+        let function_facts = FunctionFacts::new(certified_signature_facts("value", 32), None);
+        let plan = empty_writeback_plan("fcn.authority");
+        let analysis = TypeWritebackAnalysis {
+            source: Arc::clone(&source),
+            function_facts: function_facts.clone(),
+            plan: plan.clone(),
+        };
+        let budget = TypeWritebackMutationBudget::new(64, usize::MAX, usize::MAX);
+        let policy = TypeWritebackApplyPolicy::balanced();
+
+        assert_eq!(
+            analysis.authority_report(budget, policy),
+            type_writeback_authority_report_with_policy(
+                &plan,
+                budget,
+                function_facts.type_facts(),
+                policy,
+                source.function().cfg_risk_summary().block_count,
+            )
+        );
+    }
+
+    #[test]
+    fn source_owned_function_facts_has_no_serde_contract() {
+        trait AmbiguousIfSerialize<Marker> {
+            fn marker() {}
+        }
+        impl<T: ?Sized> AmbiguousIfSerialize<()> for T {}
+        impl<T: ?Sized + serde::Serialize> AmbiguousIfSerialize<u8> for T {}
+
+        trait AmbiguousIfDeserialize<Marker> {
+            fn marker() {}
+        }
+        impl<T: ?Sized> AmbiguousIfDeserialize<()> for T {}
+        impl<T: serde::de::DeserializeOwned> AmbiguousIfDeserialize<u8> for T {}
+
+        let _ = <SourceOwnedFunctionFacts as AmbiguousIfSerialize<_>>::marker;
+        let _ = <SourceOwnedFunctionFacts as AmbiguousIfDeserialize<_>>::marker;
+    }
+
+    #[test]
+    fn source_owned_enrichment_refuses_missing_interface_without_mutation() {
+        let mut arch = r2il::ArchSpec::new("x86-64");
+        arch.add_register(r2il::RegisterDef::new("rax", 0, 8));
+        let source = Arc::new(
+            SsaArtifact::for_decompile(&[r2il::R2ILBlock::new(0x401800, 1)], Some(&arch))
+                .expect("prepared source without interface"),
+        );
+        let request = TypeWritebackAnalysisRequest::new(source, ParsedExternalContext::default())
+            .expect("matching assumptions");
+        assert_eq!(
+            build_source_owned_type_writeback_analysis(request)
+                .expect_err("missing exact interface cannot produce source-owned analysis"),
+            TypeWritebackAnalysisError::SourceEnrichmentFailed
+        );
+    }
+
+    #[test]
+    fn source_owned_writeback_propagates_interproc_schema_error() {
+        let stale = InterprocSummarySet {
+            schema_version: 1,
+            ..InterprocSummarySet::default()
+        };
+
+        assert_eq!(
+            require_current_interproc_report_for_source_owned(Some(&stale)),
+            Err(TypeWritebackAnalysisError::InterprocSummarySchema(
+                r2ssa::interproc::InterprocSummarySchemaError::ReportSchemaVersion { found: 1 },
+            ))
+        );
+    }
+
+    #[test]
+    fn detached_advisory_writeback_drops_invalid_interproc_schema() {
+        let stale = InterprocSummarySet {
+            schema_version: 1,
+            ..InterprocSummarySet::default()
+        };
+
+        let view = InterprocSummaryView::new(Some(stale)).unwrap_or_default();
+        assert!(view.as_set().is_none());
+        assert!(view.root_summary().is_none());
+        assert!(view.pointer_param_indices().is_empty());
+    }
+
+    #[test]
+    fn source_owned_writeback_refuses_foreign_and_conditioned_evidence() {
+        let (source, _) = source_owned_worker_fixture(0x402000);
+        let (foreign, _) = source_owned_worker_fixture(0x402000);
+        let foreign_summary = prepared_summary_for(&foreign);
+        let foreign_semantic = r2sym::compile_native_worker_summary_artifact(
+            &foreign,
+            None,
+            Some(&foreign_summary),
+            true,
+        )
+        .expect("foreign semantic artifact");
+
+        assert_eq!(
+            TypeWritebackAnalysisRequest::new(
+                Arc::clone(&source),
+                ParsedExternalContext::default(),
+            )
+            .expect("matching source assumptions")
+            .with_semantic_artifact(foreign_semantic)
+            .expect_err("independently rebuilt semantic owner must be refused"),
+            TypeWritebackAnalysisError::ForeignSemanticArtifact
+        );
+        assert_eq!(
+            TypeWritebackAnalysisRequest::new(
+                Arc::clone(&source),
+                ParsedExternalContext::default(),
+            )
+            .expect("matching source assumptions")
+            .with_interproc_summary(foreign_summary)
+            .expect_err("independently rebuilt interprocedural owner must be refused"),
+            TypeWritebackAnalysisError::ForeignInterprocSummary
+        );
+
+        let source_summary = prepared_summary_for(&source);
+        let source_semantic = r2sym::compile_native_worker_summary_artifact(
+            &source,
+            None,
+            Some(&source_summary),
+            true,
+        )
+        .expect("base semantic artifact");
+        let assumptions = r2ssa::AssumptionSet::new(vec![r2ssa::AnalysisAssumption {
+            id: None,
+            subject: r2ssa::AssumptionSubject::Parameter { index: 0 },
+            value: r2ssa::AssumptionValue::TypeHint {
+                ty: "unsigned char *".to_string(),
+            },
+            scope: r2ssa::AssumptionScope::Function,
+            provenance: r2ssa::AssumptionProvenance::User,
+        }]);
+        let conditioned = Arc::new(source.with_assumptions(&assumptions));
+        assert_eq!(
+            TypeWritebackAnalysisRequest::new(
+                Arc::clone(&conditioned),
+                ParsedExternalContext::default(),
+            )
+            .expect_err("unconditioned context must not authorize conditioned SSA"),
+            TypeWritebackAnalysisError::AssumptionSetMismatch
+        );
+        let conditioned_context = ParsedExternalContext {
+            assumptions: assumptions.clone(),
+            ..ParsedExternalContext::default()
+        };
+        assert_eq!(
+            TypeWritebackAnalysisRequest::new(
+                Arc::clone(&conditioned),
+                conditioned_context.clone(),
+            )
+            .expect("exact conditioned request")
+            .with_semantic_artifact(source_semantic)
+            .expect_err("base semantic owner must not authorize conditioned SSA"),
+            TypeWritebackAnalysisError::ForeignSemanticArtifact
+        );
+
+        let conditioned_summary = prepared_summary_for(&conditioned);
+        let conditioned_semantic = r2sym::compile_native_worker_summary_artifact(
+            &conditioned,
+            None,
+            Some(&conditioned_summary),
+            true,
+        )
+        .expect("conditioned semantic artifact");
+        let conditioned_request =
+            TypeWritebackAnalysisRequest::new(Arc::clone(&conditioned), conditioned_context)
+                .expect("exact conditioned request")
+                .with_semantic_artifact(conditioned_semantic)
+                .expect("exact conditioned semantic owner")
+                .with_interproc_summary(conditioned_summary)
+                .expect("exact conditioned interproc owner");
+        assert!(
+            build_source_owned_type_writeback_analysis(conditioned_request)
+                .expect("conditioned writeback")
+                .matches_source(&conditioned)
+        );
+    }
+
+    #[test]
+    fn source_owned_writeback_refuses_incoherent_nonzero_memory_model() {
+        let mut arch = r2il::ArchSpec::new("x86-64");
+        arch.add_space(r2il::AddressSpace::ram(8));
+        arch.add_space(r2il::AddressSpace::ram(8));
+        let block = r2il::R2ILBlock::new(0x403000, 1);
+        let source = Arc::new(
+            SsaArtifact::for_decompile(&[block], Some(&arch)).expect("prepared incoherent source"),
+        );
+        assert_eq!(
+            source
+                .machine_context()
+                .memory_model()
+                .default_address_bits(),
+            64
+        );
+        assert!(!source.machine_context().memory_model().is_coherent());
+        let request = TypeWritebackAnalysisRequest::new(source, ParsedExternalContext::default())
+            .expect("empty assumptions match");
+        assert_eq!(
+            build_source_owned_type_writeback_analysis(request)
+                .expect_err("incoherent memory model must refuse"),
+            TypeWritebackAnalysisError::IncoherentMachineMemoryModel
+        );
+    }
+
     #[test]
     fn canonical_frame_stack_slots_preserve_signed_displacement() {
         let raw = StackSlotKey {
@@ -13296,12 +13832,13 @@ mod tests {
         skipped_large_cfg: bool,
         residual_reasons: Vec<r2sym::ResidualReason>,
         regions: Vec<r2sym::SemanticRegion>,
-    ) -> r2sym::SemanticArtifact {
+    ) -> r2sym::SemanticArtifactReport {
         let regions = regions
             .into_iter()
             .map(|region| (region.key(), region))
             .collect::<BTreeMap<_, _>>();
-        r2sym::SemanticArtifact {
+        r2sym::SemanticArtifactReport {
+            schema_version: r2sym::SEMANTIC_ARTIFACT_SCHEMA_VERSION,
             stage,
             granularity: r2sym::ArtifactGranularity::Regioned,
             execution: r2sym::ExecutionModel::Native,
@@ -13325,7 +13862,7 @@ mod tests {
     fn test_artifact_with_role_identity(
         role_name: &str,
         summary_kind: r2sym::NativeWorkerSummaryKind,
-    ) -> r2sym::SemanticArtifact {
+    ) -> r2sym::SemanticArtifactReport {
         let mut artifact = test_artifact(
             r2sym::RefinementStage::Compiled,
             r2sym::SliceClass::Worker,
@@ -13372,7 +13909,7 @@ mod tests {
         input: TypeWritebackAnalysisInput<'_>,
         role_name: &str,
         summary_kind: r2sym::NativeWorkerSummaryKind,
-    ) -> TypeWritebackAnalysis {
+    ) -> DerivedTypeWritebackAnalysis {
         let artifact = test_artifact_with_role_identity(role_name, summary_kind);
         build_type_writeback_analysis_with_semantics(
             input,
@@ -13423,7 +13960,7 @@ mod tests {
             });
 
         let projection = SemanticTypeProjection::from_inputs(
-            &InterprocSummaryView::new(None),
+            &InterprocSummaryView::default(),
             Some(&artifact),
             64,
         );
@@ -13481,7 +14018,7 @@ mod tests {
             });
 
         let projection = SemanticTypeProjection::from_inputs(
-            &InterprocSummaryView::new(None),
+            &InterprocSummaryView::default(),
             Some(&artifact),
             64,
         );
@@ -13527,7 +14064,7 @@ mod tests {
             });
 
         let projection = SemanticTypeProjection::from_inputs(
-            &InterprocSummaryView::new(None),
+            &InterprocSummaryView::default(),
             Some(&artifact),
             64,
         );
@@ -13536,15 +14073,6 @@ mod tests {
         assert!(!projection.out_param_indices.contains(&0));
         assert!(!projection.param_type_hints.contains_key(&0));
         assert!(projection.refusal_warnings().iter().any(|warning| {
-            warning.contains("generic memory summary") && warning.contains("out-pointer projection")
-        }));
-
-        let plan = build_semantic_type_fallback_plan("fcn.401020", "x86-64", 64, &artifact);
-        assert!(
-            plan.signature.params.is_empty(),
-            "generic memory write must not fabricate fallback pointer params"
-        );
-        assert!(plan.diagnostics.warnings.iter().any(|warning| {
             warning.contains("generic memory summary") && warning.contains("out-pointer projection")
         }));
     }
@@ -13595,7 +14123,7 @@ mod tests {
             });
 
         let projection = SemanticTypeProjection::from_inputs(
-            &InterprocSummaryView::new(None),
+            &InterprocSummaryView::default(),
             Some(&artifact),
             64,
         );
@@ -13652,7 +14180,7 @@ mod tests {
             });
 
         let projection = SemanticTypeProjection::from_inputs(
-            &InterprocSummaryView::new(None),
+            &InterprocSummaryView::default(),
             Some(&artifact),
             64,
         );
@@ -13759,7 +14287,7 @@ mod tests {
             });
 
         let projection = SemanticTypeProjection::from_inputs(
-            &InterprocSummaryView::new(None),
+            &InterprocSummaryView::default(),
             Some(&artifact),
             64,
         );
@@ -13780,15 +14308,6 @@ mod tests {
             projection.param_type_hints.get(&1),
             Some(&byte_pointer_type())
         );
-
-        let plan =
-            build_semantic_type_fallback_plan("readlinebuffer_delim", "x86-64", 64, &artifact);
-        assert_eq!(plan.signature.params.len(), 2);
-        assert_eq!(plan.signature.ret_type, "void");
-        assert_eq!(plan.signature.params[0].name, "output");
-        assert_eq!(plan.signature.params[1].name, "stream");
-        assert_eq!(plan.signature.params[0].param_type, "uint8_t*");
-        assert_eq!(plan.signature.params[1].param_type, "uint8_t*");
     }
 
     #[test]
@@ -13844,7 +14363,7 @@ mod tests {
             });
 
         let projection = SemanticTypeProjection::from_inputs(
-            &InterprocSummaryView::new(None),
+            &InterprocSummaryView::default(),
             Some(&artifact),
             64,
         );
@@ -13934,6 +14453,7 @@ mod tests {
             },
         );
         let summary_set = r2ssa::InterprocSummarySet {
+            schema_version: r2ssa::interproc::INTERPROC_SUMMARY_SCHEMA_VERSION,
             root: Some(root),
             summaries: BTreeMap::from([(root, summary)]),
             diagnostics: Default::default(),
@@ -14005,6 +14525,7 @@ mod tests {
         let root = r2ssa::InterprocFunctionId(0x401000);
         let summary = r2ssa::FunctionSemanticSummary::unknown(root, Some("dbg.main".to_string()));
         let summary_set = r2ssa::InterprocSummarySet {
+            schema_version: r2ssa::interproc::INTERPROC_SUMMARY_SCHEMA_VERSION,
             root: Some(root),
             summaries: BTreeMap::from([(root, summary)]),
             diagnostics: Default::default(),
@@ -14368,10 +14889,12 @@ mod tests {
         };
         let root = r2ssa::InterprocFunctionId(0x401000);
         let summary_set = InterprocSummarySet {
+            schema_version: r2ssa::interproc::INTERPROC_SUMMARY_SCHEMA_VERSION,
             root: Some(root),
             summaries: BTreeMap::from([(
                 root,
                 FunctionSemanticSummary {
+                    schema_version: r2ssa::interproc::INTERPROC_SUMMARY_SCHEMA_VERSION,
                     id: root,
                     name: Some("sym.demo".to_string()),
                     linkage: r2ssa::FunctionSemanticLinkage::Unknown,
@@ -14403,7 +14926,7 @@ mod tests {
             diagnostics: Default::default(),
         };
         let projection = SemanticTypeProjection::from_inputs(
-            &InterprocSummaryView::new(Some(summary_set)),
+            &InterprocSummaryView::new(Some(summary_set)).expect("current interproc report schema"),
             None,
             64,
         );
@@ -14439,10 +14962,12 @@ mod tests {
     fn interproc_heap_alloc_summary_upgrades_pointer_sized_scalar_return() {
         let root = r2ssa::InterprocFunctionId(0x401000);
         let summary_set = InterprocSummarySet {
+            schema_version: r2ssa::interproc::INTERPROC_SUMMARY_SCHEMA_VERSION,
             root: Some(root),
             summaries: BTreeMap::from([(
                 root,
                 FunctionSemanticSummary {
+                    schema_version: r2ssa::interproc::INTERPROC_SUMMARY_SCHEMA_VERSION,
                     id: root,
                     name: Some("sym.alloc_wrapper".to_string()),
                     linkage: r2ssa::FunctionSemanticLinkage::Unknown,
@@ -14502,11 +15027,13 @@ mod tests {
         let root = r2ssa::InterprocFunctionId(0x401100);
         let helper = r2ssa::InterprocFunctionId(0x401200);
         let summary_set = InterprocSummarySet {
+            schema_version: r2ssa::interproc::INTERPROC_SUMMARY_SCHEMA_VERSION,
             root: Some(root),
             summaries: BTreeMap::from([
                 (
                     root,
                     FunctionSemanticSummary {
+                        schema_version: r2ssa::interproc::INTERPROC_SUMMARY_SCHEMA_VERSION,
                         id: root,
                         name: Some("sym.identity".to_string()),
                         linkage: r2ssa::FunctionSemanticLinkage::Unknown,
@@ -14530,6 +15057,7 @@ mod tests {
                 (
                     helper,
                     FunctionSemanticSummary {
+                        schema_version: r2ssa::interproc::INTERPROC_SUMMARY_SCHEMA_VERSION,
                         id: helper,
                         name: Some("sym.helper".to_string()),
                         linkage: r2ssa::FunctionSemanticLinkage::Unknown,
@@ -14598,8 +15126,7 @@ mod tests {
 
     #[test]
     fn local_inferred_scalar_param_narrows_external_wide_signature() {
-        let mut parsed_context = ParsedExternalContext::default();
-        parsed_context.current_signature = Some(FunctionSignatureSpec {
+        let current_signature = FunctionSignatureSpec {
             ret_type: Some(CTypeLike::Int {
                 bits: 64,
                 signedness: Signedness::Signed,
@@ -14611,8 +15138,12 @@ mod tests {
                     signedness: Signedness::Unsigned,
                 }),
             }],
-        });
-        parsed_context.merged_signature = parsed_context.current_signature.clone();
+        };
+        let parsed_context = ParsedExternalContext {
+            current_signature: Some(current_signature.clone()),
+            merged_signature: Some(current_signature),
+            ..ParsedExternalContext::default()
+        };
 
         let vars = [RecoveredVariable {
             name: "arg0".to_string(),
@@ -14665,8 +15196,7 @@ mod tests {
 
     #[test]
     fn recovered_stack_arg_binds_to_canonical_signature_slot() {
-        let mut parsed_context = ParsedExternalContext::default();
-        parsed_context.current_signature = Some(FunctionSignatureSpec {
+        let current_signature = FunctionSignatureSpec {
             ret_type: Some(CTypeLike::Int {
                 bits: 64,
                 signedness: Signedness::Signed,
@@ -14678,8 +15208,12 @@ mod tests {
                     signedness: Signedness::Signed,
                 }),
             }],
-        });
-        parsed_context.merged_signature = parsed_context.current_signature.clone();
+        };
+        let parsed_context = ParsedExternalContext {
+            current_signature: Some(current_signature.clone()),
+            merged_signature: Some(current_signature),
+            ..ParsedExternalContext::default()
+        };
 
         let vars = [
             RecoveredVariable {
@@ -14765,8 +15299,7 @@ mod tests {
 
     #[test]
     fn exact_named_external_size_signature_blocks_local_byte_narrowing() {
-        let mut parsed_context = ParsedExternalContext::default();
-        parsed_context.current_signature = Some(FunctionSignatureSpec {
+        let current_signature = FunctionSignatureSpec {
             ret_type: Some(typedef_type("size_t")),
             params: vec![
                 FunctionParamSpec {
@@ -14795,8 +15328,12 @@ mod tests {
                     }),
                 },
             ],
-        });
-        parsed_context.merged_signature = parsed_context.current_signature.clone();
+        };
+        let parsed_context = ParsedExternalContext {
+            current_signature: Some(current_signature.clone()),
+            merged_signature: Some(current_signature),
+            ..ParsedExternalContext::default()
+        };
 
         let vars = [RecoveredVariable {
             name: "arg1".to_string(),
@@ -14863,8 +15400,7 @@ mod tests {
 
     #[test]
     fn authoritative_external_signature_keeps_param_count_over_longer_local_signature() {
-        let mut parsed_context = ParsedExternalContext::default();
-        parsed_context.current_signature = Some(FunctionSignatureSpec {
+        let current_signature = FunctionSignatureSpec {
             ret_type: Some(CTypeLike::Pointer(Box::new(CTypeLike::Int {
                 bits: 8,
                 signedness: Signedness::Signed,
@@ -14885,8 +15421,12 @@ mod tests {
                     }),
                 },
             ],
-        });
-        parsed_context.merged_signature = parsed_context.current_signature.clone();
+        };
+        let parsed_context = ParsedExternalContext {
+            current_signature: Some(current_signature.clone()),
+            merged_signature: Some(current_signature),
+            ..ParsedExternalContext::default()
+        };
 
         let analysis = build_type_writeback_analysis(TypeWritebackAnalysisInput {
             function_name: "sym.alloc_and_copy",
@@ -16703,8 +17243,7 @@ mod tests {
 
     #[test]
     fn local_struct_override_replaces_weak_generic_ptr_sized_integer_param() {
-        let mut parsed_context = ParsedExternalContext::default();
-        parsed_context.current_signature = Some(FunctionSignatureSpec {
+        let current_signature = FunctionSignatureSpec {
             ret_type: Some(CTypeLike::Int {
                 bits: 32,
                 signedness: Signedness::Signed,
@@ -16716,8 +17255,12 @@ mod tests {
                     signedness: Signedness::Signed,
                 }),
             }],
-        });
-        parsed_context.merged_signature = parsed_context.current_signature.clone();
+        };
+        let parsed_context = ParsedExternalContext {
+            current_signature: Some(current_signature.clone()),
+            merged_signature: Some(current_signature),
+            ..ParsedExternalContext::default()
+        };
 
         let local_structs = LocalStructArtifacts {
             struct_decls: vec![StructDeclCandidate {
@@ -16974,6 +17517,7 @@ mod tests {
         summary_set.summaries.insert(
             root,
             r2ssa::FunctionSemanticSummary {
+                schema_version: r2ssa::interproc::INTERPROC_SUMMARY_SCHEMA_VERSION,
                 id: root,
                 name: Some("sym.alloc_wrapper".to_string()),
                 linkage: r2ssa::FunctionSemanticLinkage::Unknown,
@@ -17046,6 +17590,7 @@ mod tests {
         summary_set.summaries.insert(
             root,
             r2ssa::FunctionSemanticSummary {
+                schema_version: r2ssa::interproc::INTERPROC_SUMMARY_SCHEMA_VERSION,
                 id: root,
                 name: Some("sym.side_effect_worker".to_string()),
                 linkage: r2ssa::FunctionSemanticLinkage::Unknown,
@@ -17111,6 +17656,7 @@ mod tests {
         summary.arg_count_hint = arg_count_hint;
         summary.reads_global_memory = true;
         r2ssa::InterprocSummarySet {
+            schema_version: r2ssa::interproc::INTERPROC_SUMMARY_SCHEMA_VERSION,
             root: Some(root),
             summaries: BTreeMap::from([(root, summary)]),
             diagnostics: Default::default(),
@@ -17131,12 +17677,13 @@ mod tests {
             },
         );
         let summary_set = r2ssa::InterprocSummarySet {
+            schema_version: r2ssa::interproc::INTERPROC_SUMMARY_SCHEMA_VERSION,
             root: Some(root),
             summaries: BTreeMap::from([(root, summary.clone())]),
             diagnostics: Default::default(),
         };
         let projection = SemanticTypeProjection::from_inputs(
-            &InterprocSummaryView::new(Some(summary_set)),
+            &InterprocSummaryView::new(Some(summary_set)).expect("current interproc report schema"),
             None,
             64,
         );
@@ -17154,12 +17701,13 @@ mod tests {
             },
         );
         let summary_set = r2ssa::InterprocSummarySet {
+            schema_version: r2ssa::interproc::INTERPROC_SUMMARY_SCHEMA_VERSION,
             root: Some(root),
             summaries: BTreeMap::from([(root, summary)]),
             diagnostics: Default::default(),
         };
         let projection = SemanticTypeProjection::from_inputs(
-            &InterprocSummaryView::new(Some(summary_set)),
+            &InterprocSummaryView::new(Some(summary_set)).expect("current interproc report schema"),
             None,
             64,
         );
@@ -17183,12 +17731,14 @@ mod tests {
             },
         );
         let summary_set = r2ssa::InterprocSummarySet {
+            schema_version: r2ssa::interproc::INTERPROC_SUMMARY_SCHEMA_VERSION,
             root: Some(root),
             summaries: BTreeMap::from([(root, summary)]),
             diagnostics: Default::default(),
         };
         let projection = SemanticTypeProjection::from_inputs(
-            &InterprocSummaryView::new(Some(summary_set.clone())),
+            &InterprocSummaryView::new(Some(summary_set.clone()))
+                .expect("current interproc report schema"),
             None,
             64,
         );
@@ -17241,6 +17791,7 @@ mod tests {
             },
         );
         let summary_set = r2ssa::InterprocSummarySet {
+            schema_version: r2ssa::interproc::INTERPROC_SUMMARY_SCHEMA_VERSION,
             root: Some(root),
             summaries: BTreeMap::from([(root, summary)]),
             diagnostics: Default::default(),
@@ -17308,6 +17859,7 @@ mod tests {
             },
         });
         let summary_set = r2ssa::InterprocSummarySet {
+            schema_version: r2ssa::interproc::INTERPROC_SUMMARY_SCHEMA_VERSION,
             root: Some(root),
             summaries: BTreeMap::from([(root, summary)]),
             diagnostics: Default::default(),
@@ -17393,7 +17945,7 @@ mod tests {
             });
 
         let projection = SemanticTypeProjection::from_inputs(
-            &InterprocSummaryView::new(None),
+            &InterprocSummaryView::default(),
             Some(&artifact),
             64,
         );
@@ -17700,11 +18252,12 @@ mod tests {
             callconv_confidence: 40,
         };
 
-        assert!(apply_semantic_artifact_signature_hint_to_inferred(
-            &mut signature,
-            &artifact,
-            64
-        ));
+        let projection =
+            signature_projection_for_semantic_artifact(&artifact, signature.params.len())
+                .expect("certified structural role projection");
+        assert!(
+            apply_signature_projection_to_inferred(&mut signature, projection, 64).was_applied()
+        );
         assert_eq!(signature.params[0].name, "string");
         assert_eq!(signature.params[1].name, "len");
         assert_eq!(signature.params[2].name, "flags");
@@ -17742,7 +18295,7 @@ mod tests {
             evidence: r2sym::SemanticEvidence::heuristic(r2sym::SemanticEvidenceReason::NameHint),
         }));
 
-        let mut signature = InferredSignature {
+        let signature = InferredSignature {
             function_name: "sym.printf_fetchargs".to_string(),
             signature: "int64_t sym.printf_fetchargs(int64_t arg1)".to_string(),
             ret_type: "int64_t".to_string(),
@@ -17756,11 +18309,9 @@ mod tests {
             callconv_confidence: 40,
         };
 
-        assert!(!apply_semantic_artifact_signature_hint_to_inferred(
-            &mut signature,
-            &artifact,
-            64
-        ));
+        assert!(
+            signature_projection_for_semantic_artifact(&artifact, signature.params.len()).is_none()
+        );
         assert_eq!(signature.ret_type, "int64_t");
         assert_eq!(signature.params.len(), 1);
         assert_eq!(signature.params[0].name, "arg1");
@@ -17805,7 +18356,7 @@ mod tests {
         assert!(claims.has_type_projection_claims());
         assert!(claims.summary_role_certificates.is_empty());
 
-        let mut signature = InferredSignature {
+        let signature = InferredSignature {
             function_name: "sym.printf_fetchargs".to_string(),
             signature: "int64_t sym.printf_fetchargs(int64_t arg1)".to_string(),
             ret_type: "int64_t".to_string(),
@@ -17819,11 +18370,9 @@ mod tests {
             callconv_confidence: 40,
         };
 
-        assert!(!apply_semantic_artifact_signature_hint_to_inferred(
-            &mut signature,
-            &artifact,
-            64
-        ));
+        assert!(
+            signature_projection_for_semantic_artifact(&artifact, signature.params.len()).is_none()
+        );
         assert_eq!(signature.ret_type, "int64_t");
         assert_eq!(signature.params.len(), 1);
         assert_eq!(signature.params[0].name, "arg1");
@@ -18037,109 +18586,6 @@ mod tests {
         assert_eq!(analysis.signature.params[1].name, "fmt");
         assert_eq!(analysis.signature.params[1].param_type, "int8_t*");
         assert_eq!(analysis.signature.params[2].param_type, "int64_t");
-    }
-
-    #[test]
-    fn semantic_type_fallback_plan_uses_worker_role_signature_hint() {
-        let mut artifact = test_artifact(
-            r2sym::RefinementStage::Compiled,
-            r2sym::SliceClass::Worker,
-            false,
-            Vec::new(),
-            Vec::new(),
-        );
-        let r2sym::SemanticArtifactBody::Native(native) = &mut artifact.body else {
-            panic!("expected native artifact");
-        };
-        native
-            .summary
-            .worker_summaries
-            .push(r2sym::NativeWorkerSummary {
-                anchor: 0x401000,
-                kind: r2sym::NativeWorkerSummaryKind::DiagnosticWrapper,
-                dst: None,
-                src: None,
-                memory: Some(r2ssa::SummaryMemoryLocation {
-                    region: r2ssa::SummaryMemoryRegion::Arg { index: 1 },
-                    range: None,
-                }),
-                len: None,
-                allocation: None,
-                lifetime: None,
-                sync: None,
-                atomic: None,
-                parser: None,
-                loop_summary: None,
-                evidence: r2sym::SemanticEvidence::likely(
-                    r2sym::SemanticEvidenceReason::SummaryBudget,
-                ),
-            });
-
-        let plan = build_semantic_type_fallback_plan("sym.diagnose", "x86-64", 64, &artifact);
-
-        assert_eq!(plan.signature.params.len(), 2);
-        assert_eq!(plan.signature.params[0].name, "errnum");
-        assert_eq!(plan.signature.params[0].param_type, "errno_t");
-        assert_eq!(plan.signature.params[1].name, "fmt");
-        assert_eq!(plan.signature.params[1].param_type, "int8_t*");
-
-        let mut main_artifact = test_artifact(
-            r2sym::RefinementStage::Compiled,
-            r2sym::SliceClass::Worker,
-            false,
-            Vec::new(),
-            Vec::new(),
-        );
-        let r2sym::SemanticArtifactBody::Native(native) = &mut main_artifact.body else {
-            panic!("expected native artifact");
-        };
-        native
-            .summary
-            .worker_summaries
-            .push(r2sym::NativeWorkerSummary {
-                anchor: 0x401000,
-                kind: r2sym::NativeWorkerSummaryKind::MemoryRead,
-                dst: None,
-                src: None,
-                memory: Some(r2ssa::SummaryMemoryLocation {
-                    region: r2ssa::SummaryMemoryRegion::Arg { index: 0 },
-                    range: None,
-                }),
-                len: None,
-                allocation: None,
-                lifetime: None,
-                sync: None,
-                atomic: None,
-                parser: None,
-                loop_summary: None,
-                evidence: r2sym::SemanticEvidence::likely(
-                    r2sym::SemanticEvidenceReason::SummaryBudget,
-                ),
-            });
-        native
-            .summary
-            .worker_summaries
-            .push(r2sym::NativeWorkerSummary {
-                anchor: 0x401000,
-                kind: r2sym::NativeWorkerSummaryKind::ProgramOrchestrator,
-                dst: None,
-                src: None,
-                memory: None,
-                len: None,
-                allocation: None,
-                lifetime: None,
-                sync: None,
-                atomic: None,
-                parser: None,
-                loop_summary: None,
-                evidence: r2sym::SemanticEvidence::likely(
-                    r2sym::SemanticEvidenceReason::SummaryBudget,
-                ),
-            });
-
-        let main_plan = build_semantic_type_fallback_plan("dbg.main", "x86-64", 64, &main_artifact);
-        assert_eq!(main_plan.signature.ret_type, "void");
-        assert!(main_plan.signature.params.is_empty());
     }
 
     #[test]
@@ -18813,31 +19259,6 @@ mod tests {
         maybe_upgrade_param_to_pointer(&summary, &mut merged, &mut signature, 64);
 
         assert_eq!(signature.params[0].param_type, "int");
-
-        let mut fallback_signature = InferredSignature {
-            function_name: "dbg.main".to_string(),
-            signature: "int dbg.main (int argc)".to_string(),
-            ret_type: "int".to_string(),
-            params: vec![InferredSignatureParam {
-                name: "argc".to_string(),
-                param_type: "int".to_string(),
-            }],
-            callconv: "unknown".to_string(),
-            arch: "x86-64".to_string(),
-            confidence: 80,
-            callconv_confidence: 0,
-        };
-        let mut fallback_projection = SemanticTypeProjection::default();
-        fallback_projection
-            .param_type_hints
-            .insert(0, signed_byte_pointer_type());
-        assert!(!apply_semantic_projection_to_fallback_signature(
-            &mut fallback_signature,
-            &fallback_projection,
-            64
-        ));
-        assert_eq!(fallback_signature.params[0].param_type, "int");
-        assert_eq!(fallback_signature.confidence, 80);
     }
 
     #[test]
@@ -19135,6 +19556,7 @@ mod tests {
     #[test]
     fn summary_to_callee_fact_does_not_infer_import_linkage_from_summary_name() {
         let summary = r2ssa::FunctionSemanticSummary {
+            schema_version: r2ssa::interproc::INTERPROC_SUMMARY_SCHEMA_VERSION,
             id: r2ssa::InterprocFunctionId(0x401080),
             name: Some("sym.imp.memcpy".to_string()),
             linkage: r2ssa::FunctionSemanticLinkage::Unknown,
@@ -19200,6 +19622,7 @@ mod tests {
         summary_set.summaries.insert(
             root,
             r2ssa::FunctionSemanticSummary {
+                schema_version: r2ssa::interproc::INTERPROC_SUMMARY_SCHEMA_VERSION,
                 id: root,
                 name: Some("sym.wrapper_user".to_string()),
                 linkage: r2ssa::FunctionSemanticLinkage::Unknown,
@@ -19223,6 +19646,7 @@ mod tests {
         summary_set.summaries.insert(
             helper,
             r2ssa::FunctionSemanticSummary {
+                schema_version: r2ssa::interproc::INTERPROC_SUMMARY_SCHEMA_VERSION,
                 id: helper,
                 name: Some("sym.memcpy_like".to_string()),
                 linkage: r2ssa::FunctionSemanticLinkage::Unknown,
@@ -19396,6 +19820,7 @@ mod tests {
             },
         );
         let summary_set = r2ssa::InterprocSummarySet {
+            schema_version: r2ssa::interproc::INTERPROC_SUMMARY_SCHEMA_VERSION,
             root: Some(root),
             summaries: BTreeMap::from([(root, root_summary), (helper, helper_summary)]),
             diagnostics: Default::default(),
@@ -19475,10 +19900,12 @@ mod tests {
     fn interproc_memory_effect_summary_upgrades_generic_pointer_like_params() {
         let root = r2ssa::InterprocFunctionId(0x401300);
         let summary_set = InterprocSummarySet {
+            schema_version: r2ssa::interproc::INTERPROC_SUMMARY_SCHEMA_VERSION,
             root: Some(root),
             summaries: BTreeMap::from([(
                 root,
                 FunctionSemanticSummary {
+                    schema_version: r2ssa::interproc::INTERPROC_SUMMARY_SCHEMA_VERSION,
                     id: root,
                     name: Some("sym.ptr_user".to_string()),
                     linkage: r2ssa::FunctionSemanticLinkage::Unknown,
@@ -19574,7 +20001,12 @@ mod tests {
         );
         let mut local_structs = LocalStructArtifacts::default();
 
-        augment_local_struct_artifacts_with_semantics(&mut local_structs, &artifact, 64);
+        let projection = SemanticTypeProjection::from_inputs(
+            &InterprocSummaryView::default(),
+            Some(&artifact),
+            64,
+        );
+        augment_local_struct_artifacts_with_projection(&mut local_structs, &projection, 64);
 
         assert_eq!(
             local_structs
@@ -19623,7 +20055,12 @@ mod tests {
         );
         let mut local_structs = LocalStructArtifacts::default();
 
-        augment_local_struct_artifacts_with_semantics(&mut local_structs, &artifact, 64);
+        let projection = SemanticTypeProjection::from_inputs(
+            &InterprocSummaryView::default(),
+            Some(&artifact),
+            64,
+        );
+        augment_local_struct_artifacts_with_projection(&mut local_structs, &projection, 64);
 
         assert!(
             local_structs.slot_field_profiles.is_empty(),
@@ -19659,7 +20096,12 @@ mod tests {
         );
         let mut local_structs = LocalStructArtifacts::default();
 
-        augment_local_struct_artifacts_with_semantics(&mut local_structs, &artifact, 64);
+        let projection = SemanticTypeProjection::from_inputs(
+            &InterprocSummaryView::default(),
+            Some(&artifact),
+            64,
+        );
+        augment_local_struct_artifacts_with_projection(&mut local_structs, &projection, 64);
 
         assert_eq!(
             local_structs
@@ -19668,69 +20110,6 @@ mod tests {
                 .and_then(|profile| profile.get(&8))
                 .map(String::as_str),
             Some("int32_t")
-        );
-    }
-
-    #[test]
-    fn semantic_type_fallback_plan_uses_typed_symbolic_summary() {
-        let artifact = test_artifact(
-            r2sym::RefinementStage::Residual,
-            r2sym::SliceClass::Worker,
-            true,
-            vec![r2sym::ResidualReason::LargeCfg],
-            vec![r2sym::SemanticRegion {
-                anchor: 0x401000,
-                frontier: BTreeSet::from([0x401010]),
-                control: vec![r2sym::Judged::new(
-                    r2sym::ControlFact {
-                        target: 0x401010,
-                        status: r2sym::SymbolicReachabilityStatus::Reachable,
-                        branch_truth: Some(true),
-                        condition: Some("x == 0".to_string()),
-                        compiled: Some(test_exact_compiled_condition("x == 0", Vec::new())),
-                    },
-                    r2sym::SemanticEvidence::exact(),
-                )],
-                memory: vec![r2sym::Judged::new(
-                    r2sym::MemoryFact {
-                        term: test_arg_memory_term(8, 4),
-                    },
-                    r2sym::SemanticEvidence::exact(),
-                )],
-                pre: Vec::new(),
-                post: Vec::new(),
-                targets: vec![r2sym::Judged::new(
-                    r2sym::TargetFact {
-                        target: 0x401010,
-                        status: r2sym::SymbolicReachabilityStatus::Reachable,
-                        branch_truth: Some(true),
-                    },
-                    r2sym::SemanticEvidence::exact(),
-                )],
-            }],
-        );
-
-        let plan = build_semantic_type_fallback_plan("fcn.401000", "x86-64", 64, &artifact);
-
-        assert_eq!(plan.signature.params.len(), 1);
-        assert!(plan.signature.params[0].param_type.contains("struct "));
-        assert_eq!(plan.struct_decls.len(), 1);
-        assert!(plan
-            .diagnostics
-            .warnings
-            .iter()
-            .any(|warning| warning.contains("semantic fallback: worker slice in residual mode")));
-        assert!(
-            plan.diagnostics
-                .warnings
-                .iter()
-                .any(|warning| warning.contains("regions=1"))
-        );
-        assert!(
-            plan.diagnostics
-                .warnings
-                .iter()
-                .any(|warning| warning.contains("projected 1 struct candidate"))
         );
     }
 

@@ -1448,7 +1448,7 @@ mod tests {
         summary.arg_count_hint = Some(arity);
         let mut set = r2ssa::InterprocSummarySet::default();
         set.summaries.insert(id, summary);
-        InterprocSummaryView::new(Some(set))
+        InterprocSummaryView::new(Some(set)).expect("current interproc report schema")
     }
 
     fn registry_with_non_variadic_arity(name: &str, arity: usize) -> SignatureRegistry {

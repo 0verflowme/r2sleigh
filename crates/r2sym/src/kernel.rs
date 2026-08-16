@@ -506,17 +506,17 @@ mod tests {
                 crate::ScopedPreparedFunction {
                     id: InterprocFunctionId(0x3000),
                     name: Some("helper_b".to_string()),
-                    prepared: helper_b,
+                    prepared: std::sync::Arc::new(helper_b),
                 },
                 crate::ScopedPreparedFunction {
                     id: InterprocFunctionId(0x1000),
                     name: Some("root".to_string()),
-                    prepared: root,
+                    prepared: std::sync::Arc::new(root),
                 },
                 crate::ScopedPreparedFunction {
                     id: InterprocFunctionId(0x2000),
                     name: Some("helper_a".to_string()),
-                    prepared: helper_a,
+                    prepared: std::sync::Arc::new(helper_a),
                 },
             ],
         )
@@ -572,7 +572,7 @@ mod tests {
             vec![crate::ScopedPreparedFunction {
                 id: InterprocFunctionId(0x1000),
                 name: Some("root".to_string()),
-                prepared: root,
+                prepared: std::sync::Arc::new(root),
             }],
         )
         .expect("scope");

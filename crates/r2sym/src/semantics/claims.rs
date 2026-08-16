@@ -13,7 +13,6 @@ use super::region::{
 };
 
 pub const SEMANTIC_CLAIM_SCHEMA_VERSION: u32 = 2;
-pub const PROOF_COVERAGE_SCHEMA_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum SemanticClaimKind {
@@ -41,284 +40,6 @@ pub enum SemanticTypeSeedKind {
     Size,
     Return,
     StructField,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub enum ProofOwner {
-    Radare2,
-    R2ssa,
-    R2sym,
-    R2types,
-    R2engine,
-    R2dec,
-    R2plugin,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub enum ProofObligationKind {
-    Control,
-    Loop,
-    Switch,
-    Expression,
-    MemoryAccess,
-    StackSlot,
-    FieldAccess,
-    ArrayIndex,
-    Callsite,
-    ReturnValue,
-    Signature,
-    SummaryRole,
-    SummaryRoute,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ProofObligation {
-    pub kind: ProofObligationKind,
-    pub owner: ProofOwner,
-    pub anchor: u64,
-    pub label: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ProofFailure {
-    pub obligation: ProofObligation,
-    pub reason: String,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub enum RenderPermissionKind {
-    SummaryComment,
-    Residual,
-    Refuse,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RenderPermission {
-    pub kind: RenderPermissionKind,
-    pub owner: ProofOwner,
-    pub reason: String,
-}
-
-impl RenderPermission {
-    pub fn summary(owner: ProofOwner, reason: impl Into<String>) -> Self {
-        Self {
-            kind: RenderPermissionKind::SummaryComment,
-            owner,
-            reason: reason.into(),
-        }
-    }
-
-    pub fn residual(owner: ProofOwner, reason: impl Into<String>) -> Self {
-        Self {
-            kind: RenderPermissionKind::Residual,
-            owner,
-            reason: reason.into(),
-        }
-    }
-
-    pub fn refuse(owner: ProofOwner, reason: impl Into<String>) -> Self {
-        Self {
-            kind: RenderPermissionKind::Refuse,
-            owner,
-            reason: reason.into(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CheckedClaim<T> {
-    pub value: T,
-    pub permission: RenderPermission,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub obligations: Vec<ProofObligation>,
-}
-
-impl<T> CheckedClaim<T> {
-    pub fn new(value: T, permission: RenderPermission) -> Self {
-        Self {
-            value,
-            permission,
-            obligations: Vec::new(),
-        }
-    }
-
-    pub fn with_obligations<I>(mut self, obligations: I) -> Self
-    where
-        I: IntoIterator<Item = ProofObligation>,
-    {
-        self.obligations = obligations.into_iter().collect();
-        self
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ProofCoverage {
-    pub schema_version: u32,
-    pub certified_loops: usize,
-    pub certified_switches: usize,
-    pub certified_if_regions: usize,
-    pub certified_expressions: usize,
-    pub certified_memory_accesses: usize,
-    pub certified_stack_slots: usize,
-    pub certified_callsites: usize,
-    pub certified_returns: usize,
-    pub certified_field_accesses: usize,
-    pub certified_array_indexes: usize,
-    pub certified_out_params: usize,
-    pub certified_signatures: usize,
-    pub certified_summary_roles: usize,
-    /// Semantic summary claims that can explain a summary route. This is not
-    /// proof that native control/dataflow was reconstructed as certified C.
-    #[serde(alias = "summary_comments")]
-    pub semantic_summary_comments: usize,
-    /// Honest semantic residuals/refusals emitted by analysis. This is not a
-    /// certified render/writeback fact.
-    #[serde(alias = "residuals")]
-    pub semantic_residuals: usize,
-    pub refusals: usize,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub failures: Vec<ProofFailure>,
-}
-
-impl Default for ProofCoverage {
-    fn default() -> Self {
-        Self {
-            schema_version: PROOF_COVERAGE_SCHEMA_VERSION,
-            certified_loops: 0,
-            certified_switches: 0,
-            certified_if_regions: 0,
-            certified_expressions: 0,
-            certified_memory_accesses: 0,
-            certified_stack_slots: 0,
-            certified_callsites: 0,
-            certified_returns: 0,
-            certified_field_accesses: 0,
-            certified_array_indexes: 0,
-            certified_out_params: 0,
-            certified_signatures: 0,
-            certified_summary_roles: 0,
-            semantic_summary_comments: 0,
-            semantic_residuals: 0,
-            refusals: 0,
-            failures: Vec::new(),
-        }
-    }
-}
-
-impl ProofCoverage {
-    pub fn from_prepared_certificates(certificates: &r2ssa::PreparedFunctionCertificates) -> Self {
-        let mut failures = Vec::new();
-        for failure in &certificates.failures {
-            failures.push(ProofFailure {
-                obligation: ProofObligation {
-                    kind: proof_obligation_kind_from_label(failure.obligation),
-                    owner: proof_owner_from_label(failure.owner),
-                    anchor: failure.anchor,
-                    label: failure.obligation.to_string(),
-                },
-                reason: failure.reason.clone(),
-            });
-        }
-        Self {
-            certified_loops: certificates.loops.len(),
-            certified_switches: certificates.switches.len(),
-            certified_if_regions: certificates.if_regions.len(),
-            certified_expressions: certificates.expressions.len(),
-            certified_memory_accesses: certificates.memory_accesses.len(),
-            certified_stack_slots: certificates.stack_slots.len(),
-            certified_callsites: certificates.callsites.len(),
-            certified_returns: certificates.returns.len(),
-            failures,
-            ..Self::default()
-        }
-    }
-
-    pub fn from_semantic_claims(claims: &SemanticClaimSummary) -> Self {
-        let certified_summary_roles = claims.summary_role_certificates.len();
-        Self {
-            semantic_summary_comments: claims.renderable_summary_claims,
-            semantic_residuals: claims.residual_claims,
-            certified_summary_roles,
-            failures: claims
-                .claims
-                .iter()
-                .filter(|claim| claim.is_name_hint_only())
-                .map(|claim| ProofFailure {
-                    obligation: ProofObligation {
-                        kind: match claim.kind {
-                            SemanticClaimKind::Control => ProofObligationKind::Control,
-                            SemanticClaimKind::Memory => ProofObligationKind::MemoryAccess,
-                            SemanticClaimKind::Value => ProofObligationKind::Expression,
-                            SemanticClaimKind::TypeSeed => ProofObligationKind::SummaryRole,
-                        },
-                        owner: ProofOwner::R2sym,
-                        anchor: claim.anchor,
-                        label: claim.label.clone(),
-                    },
-                    reason: "name hint is weak evidence and cannot certify rendering".to_string(),
-                })
-                .collect(),
-            ..Self::default()
-        }
-    }
-
-    pub fn merge(mut self, other: Self) -> Self {
-        self.schema_version = self.schema_version.max(other.schema_version);
-        self.certified_loops += other.certified_loops;
-        self.certified_switches += other.certified_switches;
-        self.certified_if_regions += other.certified_if_regions;
-        self.certified_expressions += other.certified_expressions;
-        self.certified_memory_accesses += other.certified_memory_accesses;
-        self.certified_stack_slots += other.certified_stack_slots;
-        self.certified_callsites += other.certified_callsites;
-        self.certified_returns += other.certified_returns;
-        self.certified_field_accesses += other.certified_field_accesses;
-        self.certified_array_indexes += other.certified_array_indexes;
-        self.certified_out_params += other.certified_out_params;
-        self.certified_signatures += other.certified_signatures;
-        self.certified_summary_roles += other.certified_summary_roles;
-        self.semantic_summary_comments += other.semantic_summary_comments;
-        self.semantic_residuals += other.semantic_residuals;
-        self.refusals += other.refusals;
-        self.failures.extend(other.failures);
-        self
-    }
-
-    pub fn has_fake_semantics_risk(&self) -> bool {
-        !self.failures.is_empty() || self.refusals > 0
-    }
-}
-
-fn proof_owner_from_label(owner: &str) -> ProofOwner {
-    match owner {
-        "radare2" => ProofOwner::Radare2,
-        "r2ssa" => ProofOwner::R2ssa,
-        "r2sym" => ProofOwner::R2sym,
-        "r2types" => ProofOwner::R2types,
-        "r2engine" => ProofOwner::R2engine,
-        "r2dec" => ProofOwner::R2dec,
-        "r2plugin" => ProofOwner::R2plugin,
-        _ => ProofOwner::R2engine,
-    }
-}
-
-fn proof_obligation_kind_from_label(kind: &str) -> ProofObligationKind {
-    match kind {
-        "control" => ProofObligationKind::Control,
-        "loop" => ProofObligationKind::Loop,
-        "switch" => ProofObligationKind::Switch,
-        "expression" => ProofObligationKind::Expression,
-        "memory_access" => ProofObligationKind::MemoryAccess,
-        "stack_slot" => ProofObligationKind::StackSlot,
-        "field_access" => ProofObligationKind::FieldAccess,
-        "array_index" => ProofObligationKind::ArrayIndex,
-        "callsite" => ProofObligationKind::Callsite,
-        "return_value" => ProofObligationKind::ReturnValue,
-        "signature" => ProofObligationKind::Signature,
-        "summary_role" => ProofObligationKind::SummaryRole,
-        "summary_route" => ProofObligationKind::SummaryRoute,
-        _ => ProofObligationKind::Control,
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -989,13 +710,10 @@ mod tests {
         assert!(claims.arg_has_pointer_evidence(0));
         assert!(claims.size_param_indices.contains(&1));
         assert_eq!(claims.name_hint_claims, 0);
-
-        let coverage = ProofCoverage::from_semantic_claims(&claims);
-        assert_eq!(coverage.certified_summary_roles, 1);
     }
 
     #[test]
-    fn proof_coverage_does_not_certify_out_params_from_semantic_claims() {
+    fn claim_summary_projects_out_param_evidence() {
         let worker = NativeWorkerSummary {
             anchor: 0x1000,
             kind: NativeWorkerSummaryKind::NumericTransform,
@@ -1015,52 +733,6 @@ mod tests {
         let claims = SemanticClaimSummary::from_native_body(&native_body(worker));
 
         assert!(claims.arg_has_out_param_evidence(0));
-        let coverage = ProofCoverage::from_semantic_claims(&claims);
-        assert_eq!(
-            coverage.certified_out_params, 0,
-            "r2types::FunctionTypeFacts owns certified out-param proof"
-        );
-    }
-
-    #[test]
-    fn proof_coverage_does_not_certify_field_accesses_from_semantic_claims() {
-        let mut claims = SemanticClaimSummary::empty();
-        claims.claims.push(SemanticClaim {
-            stable_id: 0x44,
-            kind: SemanticClaimKind::TypeSeed,
-            source: SemanticClaimSource::Structural,
-            evidence: SemanticEvidence::likely(SemanticEvidenceReason::PartialPathCoverage)
-                .with_coverage(SemanticEvidenceCoverage::Bounded),
-            anchor: 0x1000,
-            target: None,
-            arg_index: Some(0),
-            width: Some(8),
-            summary_kind: None,
-            type_seed: Some(SemanticTypeSeedKind::StructField),
-            label: "semantic struct-field seed".to_string(),
-        });
-
-        let coverage = ProofCoverage::from_semantic_claims(&claims);
-        assert_eq!(
-            coverage.certified_field_accesses, 0,
-            "r2types::FunctionTypeFacts owns certified field/layout proof"
-        );
-    }
-
-    #[test]
-    fn proof_coverage_keeps_semantic_report_counters_out_of_certified_counts() {
-        let mut claims = SemanticClaimSummary::empty();
-        claims.renderable_summary_claims = 2;
-        claims.residual_claims = 3;
-
-        let coverage = ProofCoverage::from_semantic_claims(&claims);
-
-        assert_eq!(coverage.semantic_summary_comments, 2);
-        assert_eq!(coverage.semantic_residuals, 3);
-        assert_eq!(coverage.certified_loops, 0);
-        assert_eq!(coverage.certified_expressions, 0);
-        assert_eq!(coverage.certified_memory_accesses, 0);
-        assert_eq!(coverage.certified_summary_roles, 0);
     }
 
     #[test]
@@ -1087,22 +759,11 @@ mod tests {
         assert!(claims.summary_role_certificates.is_empty());
         assert!(!claims.arg_has_pointer_evidence(0));
         assert!(claims.name_hint_claims > 0);
-
-        let coverage = ProofCoverage::from_semantic_claims(&claims);
-        assert_eq!(coverage.certified_summary_roles, 0);
     }
 
     #[test]
     fn claim_summary_uses_current_schema_version() {
         let claims = SemanticClaimSummary::empty();
         assert_eq!(claims.schema_version, SEMANTIC_CLAIM_SCHEMA_VERSION);
-    }
-
-    #[test]
-    fn proof_coverage_uses_current_schema_version() {
-        assert_eq!(
-            ProofCoverage::default().schema_version,
-            PROOF_COVERAGE_SCHEMA_VERSION
-        );
     }
 }

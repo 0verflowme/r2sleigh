@@ -1,5 +1,6 @@
 use std::cell::{Cell, OnceCell};
 use std::collections::{BTreeMap, HashMap, HashSet};
+#[cfg(test)]
 use std::sync::OnceLock;
 
 use crate::analysis;
@@ -135,15 +136,12 @@ impl<'a> FoldInputs<'a> {
         self.function_facts.render()
     }
 
-    pub(crate) fn semantic_artifact(&self) -> Option<&'a r2sym::SemanticArtifact> {
-        self.function_facts.semantic_artifact()
-    }
-
     pub(crate) fn summary_view(&self) -> Option<&'a InterprocSummaryView> {
         Some(self.function_facts.summary_view())
     }
 }
 
+#[cfg(test)]
 pub(crate) fn empty_function_facts() -> &'static FunctionFacts {
     static EMPTY_FUNCTION_FACTS: OnceLock<FunctionFacts> = OnceLock::new();
     EMPTY_FUNCTION_FACTS.get_or_init(FunctionFacts::default)
@@ -157,7 +155,16 @@ pub(crate) struct FoldState {
     pub(crate) return_stack_slots: HashSet<i64>,
 }
 
-pub struct FoldingContext<'a> {
+/// Internal executable-folding state.
+///
+/// Public callers must enter through [`crate::DecompilerInput`], which retains
+/// the exact source-owned facts for its prepared SSA. Raw SSA exports use the
+/// residual-only [`crate::fold::lower_ssa_ops_to_stmts`] boundary instead.
+///
+/// ```compile_fail
+/// let _ = r2dec::fold::FoldingContext::new(64);
+/// ```
+pub(crate) struct FoldingContext<'a> {
     pub(crate) inputs: FoldInputs<'a>,
     pub(crate) state: FoldState,
     pub(crate) current_block_addr: Cell<Option<u64>>,
@@ -183,6 +190,7 @@ pub struct FoldingContext<'a> {
 }
 
 impl FoldArchConfig {
+    #[cfg(test)]
     pub(crate) fn for_ptr_size(ptr_size: u32) -> Self {
         let sp_name = if ptr_size == 64 {
             "rsp".to_string()
@@ -391,8 +399,10 @@ impl<'a> FoldingContext<'a> {
             });
     }
 
-    /// Test convenience constructor.
-    pub fn new(ptr_size: u32) -> Self {
+    /// Internal/test convenience constructor. It deliberately has no
+    /// source-owned authority and therefore cannot be a public render entry.
+    #[cfg(test)]
+    pub(crate) fn new(ptr_size: u32) -> Self {
         #[cfg(test)]
         static EMPTY_U64_STRING: OnceLock<HashMap<u64, String>> = OnceLock::new();
         static EMPTY_STACK_SLOTS: OnceLock<BTreeMap<StackSlotKey, ExternalStackSlotSpec>> =

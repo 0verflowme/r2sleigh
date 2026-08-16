@@ -18,7 +18,7 @@ EOF_EXPECT
 CMDS=<<EOF_CMDS
 wx 488945f8000000000000000000000000
 s 0 >/dev/null
-a:sla.debug.mem | jq -c 'length == 1 and .[0].write == true and .[0].stack == true and .[0].stack_base == "RBP" and .[0].stack_offset == -8'
+a:sla.debug.mem | jq -c 'length == 1 and .[0].schema_version == 1 and .[0].type == "store" and .[0].stack_address.base == "RBP" and .[0].stack_address.offset == -8'
 EOF_CMDS
 RUN
 
@@ -33,7 +33,7 @@ wx 48837df8000000000000000000000000
 s 0 >/dev/null
 a:sla.debug.regs > /tmp/r2sleigh_core_regs.json
 a:sla.debug.mem > /tmp/r2sleigh_core_mem.json
-jq -n -c --slurpfile regs /tmp/r2sleigh_core_regs.json --slurpfile mem /tmp/r2sleigh_core_mem.json '($regs[0].write | index("ZF") != null) and ($regs[0].write | index("CF") != null) and (($mem[0] | map(select(.write == false and .stack == true and .stack_offset == -8)) | length) == 1)'
+jq -n -c --slurpfile regs /tmp/r2sleigh_core_regs.json --slurpfile mem /tmp/r2sleigh_core_mem.json '($regs[0].write | index("ZF") != null) and ($regs[0].write | index("CF") != null) and (($mem[0] | map(select(.type == "load" and .stack_address.offset == -8)) | length) == 1)'
 EOF_CMDS
 RUN
 
@@ -63,7 +63,7 @@ wx 488b45fc000000000000000000000000
 s 0 >/dev/null
 a:sla.debug.regs > /tmp/r2sleigh_core_regs.json
 a:sla.debug.mem > /tmp/r2sleigh_core_mem.json
-jq -n -c --slurpfile regs /tmp/r2sleigh_core_regs.json --slurpfile mem /tmp/r2sleigh_core_mem.json '($regs[0].write | index("RAX") != null) and (($mem[0] | map(select(.write == false and .stack == true and .stack_offset == -4)) | length) == 1)'
+jq -n -c --slurpfile regs /tmp/r2sleigh_core_regs.json --slurpfile mem /tmp/r2sleigh_core_mem.json '($regs[0].write | index("RAX") != null) and (($mem[0] | map(select(.type == "load" and .stack_address.offset == -4)) | length) == 1)'
 EOF_CMDS
 RUN
 

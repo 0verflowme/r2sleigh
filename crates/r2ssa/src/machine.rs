@@ -1148,12 +1148,8 @@ impl MachineFunction {
             return Err(MachineBuildError::EntityMismatch(inst.id));
         }
         for (child, expected) in inputs.iter().zip(&inst.inputs) {
-            let binding = leaf_binding(
-                self.arena
-                    .get(*child)
-                    .ok_or(MachineBuildError::EntityMismatch(inst.id))?,
-            )
-            .ok_or(MachineBuildError::EntityMismatch(inst.id))?;
+            let binding = operand_leaf_binding(&self.arena, *child)
+                .ok_or(MachineBuildError::EntityMismatch(inst.id))?;
             if binding.value != *expected {
                 return Err(MachineBuildError::EntityMismatch(inst.id));
             }
@@ -1410,6 +1406,37 @@ impl MachineBuilder {
             .collect()
     }
 
+    fn narrowed_operand_nodes(
+        &mut self,
+        graph: &crate::graph::SsaGraph,
+        inst: &GraphInst,
+        expected: usize,
+        result_bits: u32,
+    ) -> Result<Vec<MachineExprId>, MachineBuildError> {
+        let inputs = self.operand_nodes(graph, inst, expected)?;
+        inputs
+            .into_iter()
+            .map(|input| {
+                let input_bits = self.nodes[input.index()].ty.width_bits();
+                if input_bits < result_bits {
+                    return Err(MachineBuildError::WidthMismatch {
+                        inst: inst.id,
+                        expected_bits: result_bits,
+                        actual_bits: input_bits,
+                    });
+                }
+                if input_bits == result_bits {
+                    return Ok(input);
+                }
+                Ok(self.push(
+                    integer_type(result_bits, MachineSignedness::Unsigned),
+                    None,
+                    MachineExprKind::Extract { input, lsb_bits: 0 },
+                ))
+            })
+            .collect()
+    }
+
     fn lower_inst(
         &mut self,
         artifact: &SsaArtifact,
@@ -1580,7 +1607,11 @@ impl MachineBuilder {
                 ))
             }
             SSAOp::IntAnd { .. } | SSAOp::IntOr { .. } | SSAOp::IntXor { .. } => {
-                let inputs = self.operand_nodes(graph, inst, 2)?;
+                // Sleigh may write the low part of a wider bitwise operation
+                // directly into a narrower varnode. Make that truncation
+                // explicit in the typed machine expression instead of
+                // accepting mismatched child widths.
+                let inputs = self.narrowed_operand_nodes(graph, inst, 2, output.width_bits)?;
                 let op = match op {
                     SSAOp::IntAnd { .. } => MachineBitwiseOp::And,
                     SSAOp::IntOr { .. } => MachineBitwiseOp::Or,
@@ -1903,11 +1934,15 @@ fn bit_vector(
     })
 }
 
-fn leaf_binding(expr: &MachineExpr) -> Option<MachineValueBinding> {
-    match expr.kind {
+fn operand_leaf_binding(
+    arena: &MachineExprArena,
+    expr: MachineExprId,
+) -> Option<MachineValueBinding> {
+    match arena.get(expr)?.kind {
         MachineExprKind::Source { binding } | MachineExprKind::Constant { binding, .. } => {
             Some(binding)
         }
+        MachineExprKind::Extract { input, lsb_bits: 0 } => operand_leaf_binding(arena, input),
         _ => None,
     }
 }
@@ -2296,6 +2331,48 @@ mod tests {
             .expect("multiply disposition");
         assert_eq!(entity.producer(), disposition.id);
         assert_eq!(entity.source_obligations(), &disposition.obligations);
+    }
+
+    #[test]
+    fn narrow_bitwise_result_explicitly_extracts_low_operand_bits() {
+        let artifact = artifact_with_ops([R2ILOp::IntAnd {
+            dst: Varnode::unique(0x10, 4),
+            a: Varnode::register(0, 8),
+            b: Varnode::constant(0xff, 8),
+        }]);
+
+        let machine =
+            MachineFunction::from_artifact(&artifact).expect("typed narrow bitwise expression");
+        let entity = machine.entities().first().expect("bitwise entity");
+        let root = machine.expr(entity.root()).expect("bitwise root");
+        let MachineExprKind::Bitwise { left, right, .. } = root.kind() else {
+            panic!("expected bitwise root, got {:?}", root.kind());
+        };
+        for input in [left, right] {
+            let narrowed = machine.expr(*input).expect("narrowed operand");
+            assert_eq!(
+                narrowed.ty(),
+                &integer_type(32, MachineSignedness::Unsigned)
+            );
+            let MachineExprKind::Extract { input, lsb_bits } = narrowed.kind() else {
+                panic!(
+                    "expected explicit low-bit extract, got {:?}",
+                    narrowed.kind()
+                );
+            };
+            assert_eq!(*lsb_bits, 0);
+            assert_eq!(
+                machine
+                    .expr(*input)
+                    .expect("wide source operand")
+                    .ty()
+                    .width_bits(),
+                64
+            );
+        }
+        machine
+            .validate_against(&artifact)
+            .expect("narrow bitwise expression remains source-bound");
     }
 
     #[test]

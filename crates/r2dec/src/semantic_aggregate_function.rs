@@ -3,7 +3,7 @@
 //! The rendered field expression supplies only a certified byte address to the
 //! existing RAM helper ABI. It is never used as an ordinary C load or store.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::fmt::Write as _;
 
 use r2cert::{
@@ -13,8 +13,9 @@ use r2cert::{
 };
 use r2ssa::{
     CanonicalInstructionId, CanonicalStorageId, InstPayload, MachineBuildError, MachineSignedness,
-    MachineValueBinding, SSAOp, SourceCarrierKind, SourceFunctionInterface, SourceFunctionReturn,
-    SourceTypeGraph, SourceTypeKind, SsaArtifact, StructuredAccessId, TrustedSsaArtifact,
+    MachineValueBinding, MachineValueUse, SSAOp, SourceCarrierKind, SourceFunctionInterface,
+    SourceFunctionReturn, SourceTypeGraph, SourceTypeKind, SsaArtifact, StructuredAccessId,
+    TrustedSsaArtifact, ValueId,
 };
 use serde::Serialize;
 
@@ -24,10 +25,10 @@ use crate::semantic_c::{
 };
 use crate::semantic_memory_function::{
     CertifiedMemorySemanticCFunction, CertifiedMemorySemanticCFunctionError,
-    PLAIN_RAM_HELPER_DECLARATIONS, memory_helper_name, render_value_use,
+    PLAIN_RAM_HELPER_DECLARATIONS, memory_helper_name, private_stack_local_name, render_value_use,
 };
 
-pub const CERTIFIED_AGGREGATE_MEMBER_SEMANTIC_C_FUNCTION_SCHEMA_VERSION: u32 = 4;
+pub const CERTIFIED_AGGREGATE_MEMBER_SEMANTIC_C_FUNCTION_SCHEMA_VERSION: u32 = 6;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum CertifiedAggregateMemberSemanticCFunctionScope {
@@ -43,6 +44,7 @@ pub enum CertifiedAggregateScalarSignedness {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CertifiedAggregateStructMemberManifest {
     member_id: u32,
+    name: String,
     type_id: u32,
     offset_bits: u64,
     size_bits: u64,
@@ -53,6 +55,10 @@ pub struct CertifiedAggregateStructMemberManifest {
 impl CertifiedAggregateStructMemberManifest {
     pub const fn member_id(&self) -> u32 {
         self.member_id
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
     }
 
     pub const fn type_id(&self) -> u32 {
@@ -81,6 +87,7 @@ pub struct CertifiedAggregateStructLayoutManifest {
     pointer_type_id: u32,
     struct_type_id: u32,
     aggregate_id: u32,
+    name: String,
     size_bits: u64,
     align_bits: u64,
     members: Box<[CertifiedAggregateStructMemberManifest]>,
@@ -97,6 +104,10 @@ impl CertifiedAggregateStructLayoutManifest {
 
     pub const fn aggregate_id(&self) -> u32 {
         self.aggregate_id
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
     }
 
     pub const fn size_bits(&self) -> u64 {
@@ -130,6 +141,7 @@ pub enum CertifiedAggregateSemanticCParameterKind {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CertifiedAggregateSemanticCParameter {
     index: u32,
+    name: String,
     storage: CanonicalStorageId,
     binding: Option<MachineValueBinding>,
     kind: CertifiedAggregateSemanticCParameterKind,
@@ -138,6 +150,10 @@ pub struct CertifiedAggregateSemanticCParameter {
 impl CertifiedAggregateSemanticCParameter {
     pub const fn index(&self) -> u32 {
         self.index
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
     }
 
     pub const fn storage(&self) -> CanonicalStorageId {
@@ -173,6 +189,27 @@ pub enum CertifiedAggregateMemberRenderDirection {
     Write { value: MachineValueBinding },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct CertifiedAggregateElementRenderIndex {
+    binding: MachineValueBinding,
+    stride_bytes: u64,
+    source_parameter_index: Option<u32>,
+}
+
+impl CertifiedAggregateElementRenderIndex {
+    pub const fn binding(self) -> MachineValueBinding {
+        self.binding
+    }
+
+    pub const fn stride_bytes(self) -> u64 {
+        self.stride_bytes
+    }
+
+    pub const fn source_parameter_index(self) -> Option<u32> {
+        self.source_parameter_index
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CertifiedAggregateMemberRenderAccess {
     producer: CanonicalInstructionId,
@@ -180,6 +217,7 @@ pub struct CertifiedAggregateMemberRenderAccess {
     parameter_index: u32,
     member_id: u32,
     member_type_id: u32,
+    element_index: Option<CertifiedAggregateElementRenderIndex>,
     byte_offset: u64,
     byte_width: u32,
     address: MachineValueBinding,
@@ -207,6 +245,10 @@ impl CertifiedAggregateMemberRenderAccess {
 
     pub const fn member_type_id(&self) -> u32 {
         self.member_type_id
+    }
+
+    pub const fn element_index(&self) -> Option<CertifiedAggregateElementRenderIndex> {
+        self.element_index
     }
 
     pub const fn byte_offset(&self) -> u64 {
@@ -237,11 +279,13 @@ impl CertifiedAggregateMemberRenderAccess {
 /// A closed aggregate-member function layered on the existing plain-RAM
 /// terminal-return typed-output seal. Aggregate spelling introduces no new
 /// source obligation and therefore carries no duplicate authority.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct CertifiedAggregateMemberSemanticCFunction {
     schema_version: u32,
     scope: CertifiedAggregateMemberSemanticCFunctionScope,
     name: String,
+    source_display_name: String,
+    source_parameter_names: Box<[Box<str>]>,
     origin: CertifiedArtifactOrigin,
     interface_revision: Box<[u8]>,
     source_interface: SourceFunctionInterface,
@@ -252,6 +296,7 @@ pub struct CertifiedAggregateMemberSemanticCFunction {
     accesses: Box<[CertifiedAggregateMemberRenderAccess]>,
     memory_order: Box<[CanonicalInstructionId]>,
     address_producers: BTreeSet<CanonicalInstructionId>,
+    address_values: BTreeSet<MachineValueBinding>,
     memory: CertifiedMemorySemanticCFunction,
 }
 
@@ -315,6 +360,102 @@ fn scalar_signedness(kind: SourceTypeKind) -> Option<CertifiedAggregateScalarSig
     }
 }
 
+fn is_c_keyword(name: &str) -> bool {
+    matches!(
+        name,
+        "auto"
+            | "break"
+            | "case"
+            | "char"
+            | "const"
+            | "continue"
+            | "default"
+            | "do"
+            | "double"
+            | "else"
+            | "enum"
+            | "extern"
+            | "float"
+            | "for"
+            | "goto"
+            | "if"
+            | "inline"
+            | "int"
+            | "long"
+            | "register"
+            | "restrict"
+            | "return"
+            | "short"
+            | "signed"
+            | "sizeof"
+            | "static"
+            | "struct"
+            | "switch"
+            | "typedef"
+            | "union"
+            | "unsigned"
+            | "void"
+            | "volatile"
+            | "while"
+            | "_Alignas"
+            | "_Alignof"
+            | "_Atomic"
+            | "_Bool"
+            | "_Complex"
+            | "_Generic"
+            | "_Imaginary"
+            | "_Noreturn"
+            | "_Static_assert"
+            | "_Thread_local"
+    )
+}
+
+fn c_identifier(source: &str, fallback: impl FnOnce() -> String) -> String {
+    let mut rendered = String::with_capacity(source.len());
+    for (position, byte) in source.bytes().enumerate() {
+        let allowed = byte.is_ascii_alphanumeric() || byte == b'_';
+        let starts_identifier = byte.is_ascii_alphabetic() || byte == b'_';
+        if allowed && (position != 0 || starts_identifier) {
+            rendered.push(char::from(byte));
+        } else if allowed {
+            rendered.push('_');
+            rendered.push(char::from(byte));
+        } else {
+            rendered.push('_');
+        }
+    }
+    if rendered.is_empty() || is_c_keyword(&rendered) {
+        fallback()
+    } else {
+        rendered
+    }
+}
+
+fn c_function_identifier(source: &str, fallback: impl FnOnce() -> String) -> String {
+    let basename = source
+        .rsplit_once('.')
+        .map_or(source, |(_, basename)| basename);
+    c_identifier(basename, fallback)
+}
+
+fn unique_c_identifier(
+    source: &str,
+    fallback: impl Fn() -> String,
+    used: &mut BTreeSet<String>,
+) -> String {
+    let mut rendered = c_identifier(source, &fallback);
+    if used.insert(rendered.clone()) {
+        return rendered;
+    }
+    rendered = fallback();
+    let mut suffix = 0_u32;
+    while !used.insert(rendered.clone()) {
+        suffix = suffix.saturating_add(1);
+        rendered = format!("{}_{}", fallback(), suffix);
+    }
+    rendered
+}
+
 fn layout_manifest(
     layout: &CertifiedNaturalScalarAggregateLayout,
 ) -> Option<CertifiedAggregateStructLayoutManifest> {
@@ -336,6 +477,7 @@ fn layout_manifest(
     {
         return None;
     }
+    let mut used_member_names = BTreeSet::new();
     let members = layout
         .aggregate()
         .members()
@@ -344,6 +486,11 @@ fn layout_manifest(
         .map(|(member, member_type)| {
             Some(CertifiedAggregateStructMemberManifest {
                 member_id: member.member_id(),
+                name: unique_c_identifier(
+                    member.name(),
+                    || format!("field_{}", member.member_id()),
+                    &mut used_member_names,
+                ),
                 type_id: member.type_id(),
                 offset_bits: member.offset_bits(),
                 size_bits: member.size_bits(),
@@ -356,6 +503,9 @@ fn layout_manifest(
         pointer_type_id,
         struct_type_id,
         aggregate_id,
+        name: c_identifier(layout.aggregate().name(), || {
+            format!("r2s_struct_{aggregate_id}")
+        }),
         size_bits: layout.aggregate().size_bits(),
         align_bits: layout.aggregate().align_bits(),
         members: members.into_boxed_slice(),
@@ -364,6 +514,7 @@ fn layout_manifest(
 
 fn access_manifest(
     certificate: &CertifiedAggregateMemberAccess,
+    source_parameter_index: Option<u32>,
 ) -> Option<CertifiedAggregateMemberRenderAccess> {
     let projection = certificate.projection();
     let statement = certificate.memory_statement();
@@ -392,6 +543,13 @@ fn access_manifest(
         parameter_index: projection.source_parameter_index,
         member_id: projection.member_id,
         member_type_id: projection.member_type_id,
+        element_index: certificate.element_index().map(|index| {
+            CertifiedAggregateElementRenderIndex {
+                binding: index.value().binding(),
+                stride_bytes: index.stride_bytes(),
+                source_parameter_index,
+            }
+        }),
         byte_offset: projection.byte_offset,
         byte_width: projection.byte_width,
         address: statement.address().binding(),
@@ -414,20 +572,24 @@ fn semantic_parameter_by_index(
 fn parameter_manifests(
     source: &SourceFunctionInterface,
     semantic: &[SemanticCParameter],
+    source_names: &[Box<str>],
     pointer_parameter_index: u32,
     pointer_layout: &CertifiedAggregateStructLayoutManifest,
 ) -> Option<Vec<CertifiedAggregateSemanticCParameter>> {
     let graph = source.type_graph()?;
     if source.parameters().len() != semantic.len()
         || source.parameters().len() != source.parameter_logical_values().len()
+        || source.parameters().len() != source_names.len()
     {
         return None;
     }
+    let mut used_names = BTreeSet::new();
     source
         .parameters()
         .iter()
         .zip(source.parameter_logical_values())
-        .map(|(source_parameter, logical)| {
+        .zip(source_names)
+        .map(|((source_parameter, logical), source_name)| {
             let semantic_parameter =
                 semantic_parameter_by_index(semantic, source_parameter.index())?;
             let projection = semantic_parameter.projection();
@@ -487,6 +649,11 @@ fn parameter_manifests(
             };
             Some(CertifiedAggregateSemanticCParameter {
                 index: source_parameter.index(),
+                name: unique_c_identifier(
+                    source_name,
+                    || format!("arg_{}", source_parameter.index()),
+                    &mut used_names,
+                ),
                 storage: source_parameter.storage(),
                 binding: semantic_parameter.value(),
                 kind,
@@ -557,105 +724,241 @@ fn returned_binding(
         })
 }
 
-fn direct_address_producers(
+#[derive(Debug, Default)]
+struct CertifiedAggregateAddressSlice {
+    producers: BTreeSet<CanonicalInstructionId>,
+    values: BTreeSet<MachineValueBinding>,
+}
+
+fn is_affine_address_transport(payload: &InstPayload) -> bool {
+    matches!(
+        payload,
+        InstPayload::Op(
+            SSAOp::Copy { .. }
+                | SSAOp::Cast { .. }
+                | SSAOp::New { .. }
+                | SSAOp::IntZExt { .. }
+                | SSAOp::IntSExt { .. }
+                | SSAOp::Trunc { .. }
+                | SSAOp::Subpiece { offset: 0, .. }
+                | SSAOp::IntNegate { .. }
+                | SSAOp::IntAdd { .. }
+                | SSAOp::IntSub { .. }
+                | SSAOp::IntMult { .. }
+                | SSAOp::IntLeft { .. }
+                | SSAOp::PtrAdd { .. }
+                | SSAOp::PtrSub { .. }
+        )
+    )
+}
+
+fn collect_address_value(
     artifact: &SsaArtifact,
-    pointer: MachineValueBinding,
-    accesses: &[CertifiedAggregateMemberRenderAccess],
-) -> Result<BTreeSet<CanonicalInstructionId>, CertifiedAggregateMemberSemanticCFunctionError> {
-    let pointer_value = pointer.value();
-    let mut producers = BTreeSet::new();
-    let mut allowed_pointer_users = BTreeSet::new();
-    let mut memory_by_address = BTreeMap::<_, BTreeSet<_>>::new();
-    for access in accesses {
-        if access.address.value() == pointer_value && access.byte_offset == 0 {
-            allowed_pointer_users.insert(access.access.inst);
-            if access.statement.address().producer().is_some() {
-                return Err(
-                    CertifiedAggregateMemberSemanticCFunctionError::UnsupportedAddress(
-                        access.producer,
-                    ),
-                );
-            }
-            continue;
-        }
-        memory_by_address
-            .entry(access.address.value())
-            .or_default()
-            .insert(access.access.inst);
-        let Some(definition) = artifact.graph().def_inst(access.address.value()) else {
-            return Err(
-                CertifiedAggregateMemberSemanticCFunctionError::UnsupportedAddress(access.producer),
-            );
-        };
-        let Some(instruction) = artifact.graph().inst(definition) else {
-            return Err(
-                CertifiedAggregateMemberSemanticCFunctionError::UnsupportedAddress(access.producer),
-            );
-        };
-        let InstPayload::Op(SSAOp::IntAdd { .. }) = &instruction.payload else {
-            return Err(
-                CertifiedAggregateMemberSemanticCFunctionError::UnsupportedAddress(access.producer),
-            );
-        };
-        if instruction.output != Some(access.address.value()) || instruction.inputs.len() != 2 {
-            return Err(
-                CertifiedAggregateMemberSemanticCFunctionError::UnsupportedAddress(access.producer),
-            );
-        }
-        let constant_matches = |value| {
-            artifact
-                .graph()
-                .value(value)
-                .and_then(|value| value.var.constant_bits())
-                == Some(access.byte_offset)
-        };
-        if !((instruction.inputs[0] == pointer_value && constant_matches(instruction.inputs[1]))
-            || (instruction.inputs[1] == pointer_value && constant_matches(instruction.inputs[0])))
-        {
-            return Err(
-                CertifiedAggregateMemberSemanticCFunctionError::UnsupportedAddress(access.producer),
-            );
-        }
-        let Some(source) = artifact.obligations().instruction_for_inst(definition) else {
-            return Err(
-                CertifiedAggregateMemberSemanticCFunctionError::UnsupportedAddress(access.producer),
-            );
-        };
-        if access.statement.address().producer() != Some(source.id) {
-            return Err(
-                CertifiedAggregateMemberSemanticCFunctionError::UnsupportedAddress(access.producer),
-            );
-        }
-        allowed_pointer_users.insert(definition);
-        producers.insert(source.id);
-    }
-    if artifact
-        .graph()
-        .use_sites(pointer_value)
-        .iter()
-        .any(|use_site| !allowed_pointer_users.contains(&use_site.inst))
-    {
+    access: &CertifiedAggregateMemberRenderAccess,
+    value: ValueId,
+    visiting: &mut BTreeSet<ValueId>,
+    visited: &mut BTreeSet<ValueId>,
+    slice: &mut CertifiedAggregateAddressSlice,
+) -> Result<(), CertifiedAggregateMemberSemanticCFunctionError> {
+    if !visiting.insert(value) {
         return Err(
-            CertifiedAggregateMemberSemanticCFunctionError::UnsupportedAddress(
-                accesses[0].producer,
-            ),
+            CertifiedAggregateMemberSemanticCFunctionError::UnsupportedAddress(access.producer),
         );
     }
-    for (address, memory_users) in memory_by_address {
-        if artifact
-            .graph()
-            .use_sites(address)
-            .iter()
-            .any(|use_site| !memory_users.contains(&use_site.inst))
-        {
-            return Err(
-                CertifiedAggregateMemberSemanticCFunctionError::UnsupportedAddress(
-                    accesses[0].producer,
-                ),
-            );
+    if !visited.insert(value) {
+        visiting.remove(&value);
+        return Ok(());
+    }
+    let graph_value = artifact.graph().value(value).ok_or(
+        CertifiedAggregateMemberSemanticCFunctionError::UnsupportedAddress(access.producer),
+    )?;
+    let projection = access.certificate.projection();
+    let is_index = access
+        .element_index
+        .is_some_and(|index| index.binding().value() == value);
+    let is_base = artifact
+        .addresses()
+        .parameter_expression(value)
+        .is_some_and(|expression| {
+            usize::try_from(projection.source_parameter_index) == Ok(expression.parameter)
+                && expression.parameter_storage == Some(access.certificate.parameter().storage())
+                && expression.terms.is_empty()
+                && expression.offset == 0
+        });
+    if graph_value.var.constant_bits().is_some() || is_index || is_base {
+        visiting.remove(&value);
+        return Ok(());
+    }
+    let definition = artifact.graph().def_inst(value).ok_or(
+        CertifiedAggregateMemberSemanticCFunctionError::UnsupportedAddress(access.producer),
+    )?;
+    let instruction = artifact.graph().inst(definition).ok_or(
+        CertifiedAggregateMemberSemanticCFunctionError::UnsupportedAddress(access.producer),
+    )?;
+    if instruction.output != Some(value) || !is_affine_address_transport(&instruction.payload) {
+        return Err(
+            CertifiedAggregateMemberSemanticCFunctionError::UnsupportedAddress(access.producer),
+        );
+    }
+    let source = artifact
+        .obligations()
+        .instruction_for_inst(definition)
+        .ok_or(
+            CertifiedAggregateMemberSemanticCFunctionError::UnsupportedAddress(access.producer),
+        )?;
+    slice.producers.insert(source.id);
+    slice.values.insert(
+        MachineValueUse::from_artifact(artifact, value)
+            .map_err(CertifiedAggregateMemberSemanticCFunctionError::Machine)?
+            .binding(),
+    );
+    for input in &instruction.inputs {
+        collect_address_value(artifact, access, *input, visiting, visited, slice)?;
+    }
+    visiting.remove(&value);
+    Ok(())
+}
+
+fn exact_address_slice(
+    artifact: &SsaArtifact,
+    accesses: &[CertifiedAggregateMemberRenderAccess],
+) -> Result<CertifiedAggregateAddressSlice, CertifiedAggregateMemberSemanticCFunctionError> {
+    let mut slice = CertifiedAggregateAddressSlice::default();
+    let mut visited = BTreeSet::new();
+    for access in accesses {
+        collect_address_value(
+            artifact,
+            access,
+            access.address.value(),
+            &mut BTreeSet::new(),
+            &mut visited,
+            &mut slice,
+        )?;
+    }
+    Ok(slice)
+}
+
+fn exact_unary_transport_input(
+    artifact: &SsaArtifact,
+    value: ValueId,
+    signedness: CertifiedAggregateScalarSignedness,
+    allow_extension: bool,
+) -> Option<ValueId> {
+    let definition = artifact.graph().def_inst(value)?;
+    let instruction = artifact.graph().inst(definition)?;
+    let [input] = instruction.inputs.as_slice() else {
+        return None;
+    };
+    let output_width = MachineValueUse::from_artifact(artifact, value)
+        .ok()?
+        .binding()
+        .width_bits();
+    let input_width = MachineValueUse::from_artifact(artifact, *input)
+        .ok()?
+        .binding()
+        .width_bits();
+    let accepted = match &instruction.payload {
+        InstPayload::Op(SSAOp::Copy { .. } | SSAOp::Cast { .. } | SSAOp::New { .. }) => {
+            input_width == output_width
+        }
+        InstPayload::Op(SSAOp::IntSExt { .. }) => {
+            allow_extension
+                && signedness == CertifiedAggregateScalarSignedness::Signed
+                && input_width < output_width
+        }
+        InstPayload::Op(SSAOp::IntZExt { .. }) => {
+            allow_extension
+                && signedness == CertifiedAggregateScalarSignedness::Unsigned
+                && input_width < output_width
+        }
+        InstPayload::Phi { .. } | InstPayload::Op(_) => false,
+    };
+    accepted.then_some(*input)
+}
+
+fn exact_transport_reaches(
+    artifact: &SsaArtifact,
+    mut value: ValueId,
+    target: ValueId,
+    signedness: CertifiedAggregateScalarSignedness,
+    allow_extension: bool,
+) -> bool {
+    let mut visited = BTreeSet::new();
+    while visited.insert(value) {
+        if value == target {
+            return true;
+        }
+        let Some(input) = exact_unary_transport_input(artifact, value, signedness, allow_extension)
+        else {
+            return false;
+        };
+        value = input;
+    }
+    false
+}
+
+fn exact_index_source_parameter(
+    artifact: &SsaArtifact,
+    memory: &CertifiedMemorySemanticCFunction,
+    parameters: &[CertifiedAggregateSemanticCParameter],
+    index: MachineValueBinding,
+) -> Option<u32> {
+    let mut candidates = BTreeSet::new();
+    for parameter in parameters {
+        let CertifiedAggregateSemanticCParameterKind::Scalar {
+            width_bits,
+            signedness,
+            ..
+        } = parameter.kind
+        else {
+            continue;
+        };
+        let Some(parameter_binding) = parameter.binding else {
+            continue;
+        };
+        for local in memory.private_stack_locals() {
+            for flow in local.load_flows() {
+                let CertifiedMemoryStatementKind::Read { result } = flow.load().statement().kind()
+                else {
+                    continue;
+                };
+                if result.binding().width_bits() != u32::try_from(width_bits).ok()?
+                    || !exact_transport_reaches(
+                        artifact,
+                        index.value(),
+                        result.binding().value(),
+                        signedness,
+                        true,
+                    )
+                {
+                    continue;
+                }
+                let Some(store) = flow
+                    .definition(flow.root_version())
+                    .and_then(|item| item.store())
+                else {
+                    continue;
+                };
+                let CertifiedMemoryStatementKind::Write { value } = store.statement().kind() else {
+                    continue;
+                };
+                if value.binding().width_bits() == parameter_binding.width_bits()
+                    && exact_transport_reaches(
+                        artifact,
+                        value.binding().value(),
+                        parameter_binding.value(),
+                        signedness,
+                        false,
+                    )
+                {
+                    candidates.insert(parameter.index);
+                }
+            }
         }
     }
-    Ok(producers)
+    let mut candidates = candidates.into_iter();
+    let parameter = candidates.next()?;
+    candidates.next().is_none().then_some(parameter)
 }
 
 impl CertifiedAggregateMemberSemanticCFunction {
@@ -663,7 +966,7 @@ impl CertifiedAggregateMemberSemanticCFunction {
         trusted: &TrustedSsaArtifact,
     ) -> Result<Self, CertifiedAggregateMemberSemanticCFunctionError> {
         let artifact = trusted.artifact();
-        let memory = CertifiedMemorySemanticCFunction::from_artifact(trusted)?;
+        let memory = CertifiedMemorySemanticCFunction::from_artifact_for_typed_layer(trusted)?;
         let certified = CertifiedMachineProjection::from_artifact(trusted)?;
         let memory_origin = memory.layer().accounting().origin();
         if certified.origin() != memory_origin {
@@ -688,6 +991,8 @@ impl CertifiedAggregateMemberSemanticCFunction {
             .type_graph()
             .ok_or(CertifiedAggregateMemberSemanticCFunctionError::MissingTypeGraph)?;
 
+        let private_stack = memory.private_stack_access_map()?;
+        let non_private_memory_order = memory.non_private_memory_order()?;
         let mut accesses = Vec::new();
         for step in memory.layer().steps() {
             let Some(reference) = step.memory() else {
@@ -696,6 +1001,9 @@ impl CertifiedAggregateMemberSemanticCFunction {
             let statement = memory.layer().resolve_memory_statement(reference).ok_or(
                 CertifiedAggregateMemberSemanticCFunctionError::MissingAggregate(step.source()),
             )?;
+            if private_stack.contains_key(&step.source()) {
+                continue;
+            }
             let certificate = certified
                 .aggregate_member_access(statement.access())
                 .ok_or(
@@ -707,12 +1015,12 @@ impl CertifiedAggregateMemberSemanticCFunction {
                     CertifiedAggregateMemberSemanticCFunctionError::MissingAggregate(step.source()),
                 );
             }
-            accesses.push(access_manifest(certificate).ok_or(
+            accesses.push(access_manifest(certificate, None).ok_or(
                 CertifiedAggregateMemberSemanticCFunctionError::MissingAggregate(step.source()),
             )?);
         }
         if accesses.is_empty()
-            || accesses.len() != memory.memory_order().len()
+            || accesses.len() != non_private_memory_order.len()
             || accesses.len() != certified.aggregate_member_accesses().len()
         {
             return Err(
@@ -729,11 +1037,11 @@ impl CertifiedAggregateMemberSemanticCFunction {
         let layout = layout_manifest(first.certificate.layout()).ok_or(
             CertifiedAggregateMemberSemanticCFunctionError::MissingAggregate(first.producer),
         )?;
-        let revision = first.certificate.interface_revision();
+        let revision = first.certificate.interface_revision().to_vec();
         let graph = first.certificate.source_type_graph();
         if accesses.iter().any(|access| {
             access.parameter_index != pointer_parameter_index
-                || access.certificate.interface_revision() != revision
+                || access.certificate.interface_revision() != revision.as_slice()
                 || access.certificate.source_type_graph() != graph
                 || layout_manifest(access.certificate.layout()).as_ref() != Some(&layout)
                 || access.certificate.parameter().index() != pointer_parameter_index
@@ -747,7 +1055,7 @@ impl CertifiedAggregateMemberSemanticCFunction {
                 ]),
             );
         }
-        if source_interface.revision_identity() != revision
+        if source_interface.revision_identity() != revision.as_slice()
             || source_interface.type_graph() != Some(graph)
         {
             return Err(
@@ -757,9 +1065,12 @@ impl CertifiedAggregateMemberSemanticCFunction {
             );
         }
 
+        let source_display_name = trusted.source().presentation().display_name().to_string();
+        let source_parameter_names = trusted.source().presentation().parameter_names().to_vec();
         let parameters = parameter_manifests(
             &source_interface,
             semantic_interface.parameters(),
+            trusted.source().presentation().parameter_names(),
             pointer_parameter_index,
             &layout,
         )
@@ -812,6 +1123,12 @@ impl CertifiedAggregateMemberSemanticCFunction {
                 ),
             );
         }
+        for access in &mut accesses {
+            if let Some(index) = access.element_index.as_mut() {
+                index.source_parameter_index =
+                    exact_index_source_parameter(artifact, &memory, &parameters, index.binding);
+            }
+        }
         let returned_binding = returned_binding(&memory)
             .ok_or(CertifiedAggregateMemberSemanticCFunctionError::InvalidReturn)?;
         let return_kind = return_manifest(
@@ -820,8 +1137,8 @@ impl CertifiedAggregateMemberSemanticCFunction {
             returned_binding,
         )
         .ok_or(CertifiedAggregateMemberSemanticCFunctionError::InvalidReturn)?;
-        let address_producers = direct_address_producers(artifact, pointer_binding, &accesses)?;
-        for producer in &address_producers {
+        let address_slice = exact_address_slice(artifact, &accesses)?;
+        for producer in &address_slice.producers {
             let Some(step) = memory
                 .layer()
                 .steps()
@@ -836,11 +1153,7 @@ impl CertifiedAggregateMemberSemanticCFunction {
                 || step
                     .value()
                     .and_then(|reference| memory.layer().resolve_value(reference))
-                    .is_none_or(|entity| {
-                        !accesses
-                            .iter()
-                            .any(|access| entity.output() == access.address)
-                    })
+                    .is_none_or(|entity| !address_slice.values.contains(&entity.output()))
             {
                 return Err(
                     CertifiedAggregateMemberSemanticCFunctionError::UnsupportedAddress(*producer),
@@ -848,20 +1161,33 @@ impl CertifiedAggregateMemberSemanticCFunction {
             }
         }
 
+        let fallback_name = || {
+            format!(
+                "certified_aggregate_sub_{:x}",
+                memory.layer().accounting().block_addr()
+            )
+        };
+        let mut name = c_function_identifier(&source_display_name, fallback_name);
+        if name == layout.name {
+            name = fallback_name();
+        }
         let function = Self {
             schema_version: CERTIFIED_AGGREGATE_MEMBER_SEMANTIC_C_FUNCTION_SCHEMA_VERSION,
             scope: CertifiedAggregateMemberSemanticCFunctionScope::SingleTerminalReturnBlockWithExactAggregateMembers,
-            name: format!("certified_aggregate_sub_{:x}", memory.layer().accounting().block_addr()),
+            name,
+            source_display_name,
+            source_parameter_names: source_parameter_names.into_boxed_slice(),
             origin: memory_origin.clone(),
-            interface_revision: revision.to_vec().into_boxed_slice(),
+            interface_revision: revision.into_boxed_slice(),
             source_interface,
             pointer_parameter_index,
             layout,
             parameters: parameters.into_boxed_slice(),
             return_kind,
-            memory_order: memory.memory_order().to_vec().into_boxed_slice(),
+            memory_order: non_private_memory_order.into_boxed_slice(),
             accesses: accesses.into_boxed_slice(),
-            address_producers,
+            address_producers: address_slice.producers,
+            address_values: address_slice.values,
             memory,
         };
         let audit = function.audit();
@@ -952,6 +1278,19 @@ impl CertifiedAggregateMemberSemanticCFunction {
         if self.interface_revision.as_ref() != self.source_interface.revision_identity() {
             invalid.push("aggregate interface revision mismatch".to_string());
         }
+        let fallback_name = || {
+            format!(
+                "certified_aggregate_sub_{:x}",
+                self.memory.layer().accounting().block_addr()
+            )
+        };
+        let mut expected_name = c_function_identifier(&self.source_display_name, fallback_name);
+        if expected_name == self.layout.name {
+            expected_name = fallback_name();
+        }
+        if self.name != expected_name {
+            invalid.push("aggregate function presentation mismatch".to_string());
+        }
         let Some(semantic_interface) = semantic_interface else {
             invalid.push("aggregate function has no semantic interface".to_string());
             return CertifiedAggregateMemberSemanticCFunctionAuditReport { invalid };
@@ -959,6 +1298,7 @@ impl CertifiedAggregateMemberSemanticCFunction {
         let expected_parameters = parameter_manifests(
             &self.source_interface,
             semantic_interface.parameters(),
+            &self.source_parameter_names,
             self.pointer_parameter_index,
             &self.layout,
         );
@@ -975,24 +1315,52 @@ impl CertifiedAggregateMemberSemanticCFunction {
         if expected_return.as_ref() != Some(&self.return_kind) {
             invalid.push("aggregate return manifest mismatch".to_string());
         }
-        if self.memory_order.as_ref() != self.memory.memory_order() {
-            invalid.push("aggregate memory order mismatch".to_string());
+        match self.memory.non_private_memory_order() {
+            Ok(order) if self.memory_order.as_ref() == order.as_slice() => {}
+            _ => invalid.push("aggregate memory order mismatch".to_string()),
         }
-        let expected_address_producers = self
-            .accesses
+        let expected_address_values = self
+            .address_producers
             .iter()
-            .filter_map(|access| access.statement.address().producer())
+            .filter_map(|producer| {
+                self.memory
+                    .layer()
+                    .steps()
+                    .iter()
+                    .find(|step| step.source() == *producer)
+                    .and_then(|step| step.value())
+                    .and_then(|reference| self.memory.layer().resolve_value(reference))
+                    .map(|entity| entity.output())
+            })
             .collect::<BTreeSet<_>>();
-        if expected_address_producers != self.address_producers {
-            invalid.push("aggregate address-producer manifest mismatch".to_string());
+        if expected_address_values != self.address_values
+            || expected_address_values.len() != self.address_producers.len()
+        {
+            invalid.push("aggregate address-slice manifest mismatch".to_string());
         }
         if self.accesses.len() != self.memory_order.len() {
             invalid.push("aggregate access count differs from memory count".to_string());
         }
         for (position, access) in self.accesses.iter().enumerate() {
-            let expected = access_manifest(&access.certificate);
+            let source_parameter_index = access
+                .element_index
+                .and_then(CertifiedAggregateElementRenderIndex::source_parameter_index);
+            let expected = access_manifest(&access.certificate, source_parameter_index);
             if expected.as_ref() != Some(access) {
                 invalid.push(format!("aggregate access manifest mismatch at {position}"));
+            }
+            if source_parameter_index.is_some_and(|source_parameter_index| {
+                self.parameters.iter().all(|parameter| {
+                    parameter.index != source_parameter_index
+                        || !matches!(
+                            parameter.kind,
+                            CertifiedAggregateSemanticCParameterKind::Scalar { .. }
+                        )
+                })
+            }) {
+                invalid.push(format!(
+                    "aggregate index source parameter mismatch at {position}"
+                ));
             }
             if access.producer
                 != self
@@ -1080,6 +1448,16 @@ impl CertifiedAggregateMemberSemanticCFunction {
             );
         }
         let mut observed = Vec::new();
+        let mut defined = self
+            .parameters
+            .iter()
+            .filter_map(|parameter| parameter.binding)
+            .collect::<BTreeSet<_>>();
+        let expressions = self.memory.layer().accounting().expression_layer();
+        let mut materialized = expressions.materialized_expression_roots(&defined)?;
+        let private_stack = self.memory.private_stack_access_map()?;
+        let private_stack_address_producers = self.memory.private_stack_address_producers();
+        let private_stack_transport_producers = self.memory.private_stack_transport_producers();
         for step in self.memory.layer().steps() {
             if let Some(reference) = step.memory() {
                 let statement = self
@@ -1091,6 +1469,22 @@ impl CertifiedAggregateMemberSemanticCFunction {
                             step.source(),
                         ),
                     )?;
+                if private_stack.contains_key(&step.source()) {
+                    if let CertifiedMemoryStatementKind::Read { result } = statement.kind() {
+                        defined.insert(result.binding());
+                        let root = expressions.memory_read_root(statement)?;
+                        if root.is_some_and(|root| {
+                            materialized.insert(root, result.binding()).is_some()
+                        }) {
+                            return Err(
+                                CertifiedAggregateMemberSemanticCFunctionError::MissingAggregate(
+                                    step.source(),
+                                ),
+                            );
+                        }
+                    }
+                    continue;
+                }
                 let access = self
                     .accesses
                     .iter()
@@ -1103,6 +1497,9 @@ impl CertifiedAggregateMemberSemanticCFunction {
                 if access.statement != *statement
                     || access.access != statement.access()
                     || access.address != statement.address().binding()
+                    || access
+                        .element_index
+                        .is_some_and(|index| !defined.contains(&index.binding()))
                 {
                     return Err(
                         CertifiedAggregateMemberSemanticCFunctionError::MissingAggregate(
@@ -1110,19 +1507,32 @@ impl CertifiedAggregateMemberSemanticCFunction {
                         ),
                     );
                 }
+                if let CertifiedMemoryStatementKind::Read { result } = statement.kind() {
+                    defined.insert(result.binding());
+                    let root = expressions.memory_read_root(statement)?;
+                    if root
+                        .is_some_and(|root| materialized.insert(root, result.binding()).is_some())
+                    {
+                        return Err(
+                            CertifiedAggregateMemberSemanticCFunctionError::MissingAggregate(
+                                step.source(),
+                            ),
+                        );
+                    }
+                }
                 observed.push(step.source());
+                continue;
+            }
+            if private_stack_address_producers.contains(&step.source())
+                || private_stack_transport_producers.contains(&step.source())
+            {
                 continue;
             }
             if self.address_producers.contains(&step.source()) {
                 let entity = step
                     .value()
                     .and_then(|reference| self.memory.layer().resolve_value(reference));
-                if entity.is_none_or(|entity| {
-                    !self
-                        .accesses
-                        .iter()
-                        .any(|access| access.address == entity.output())
-                }) {
+                if entity.is_none_or(|entity| !self.address_values.contains(&entity.output())) {
                     return Err(
                         CertifiedAggregateMemberSemanticCFunctionError::UnsupportedAddress(
                             step.source(),
@@ -1138,11 +1548,22 @@ impl CertifiedAggregateMemberSemanticCFunction {
                         step.source()
                     )]),
                 )?;
-                self.memory
-                    .layer()
-                    .accounting()
-                    .expression_layer()
-                    .render_expr(entity.root(), &mut SemanticCHelperSet::default())?;
+                expressions.render_expr_with_materialized_roots(
+                    entity.root(),
+                    &materialized,
+                    &mut SemanticCHelperSet::default(),
+                )?;
+                defined.insert(entity.output());
+                if materialized
+                    .insert(entity.root(), entity.output())
+                    .is_some()
+                {
+                    return Err(
+                        CertifiedAggregateMemberSemanticCFunctionError::InvalidFunction(vec![
+                            format!("duplicate materialized value for {}", step.source()),
+                        ]),
+                    );
+                }
             }
         }
         if observed.as_slice() != self.memory_order.as_ref() {
@@ -1167,12 +1588,23 @@ impl CertifiedAggregateMemberSemanticCFunction {
         output.push('\n');
         self.render_layout(&mut output)?;
         self.render_signature(&mut output)?;
+        let mut defined = BTreeSet::new();
         for parameter in &self.parameters {
-            let argument_name = format!("arg_{}", parameter.index);
+            let argument_name = &parameter.name;
             match &parameter.kind {
                 CertifiedAggregateSemanticCParameterKind::AggregatePointer { .. } => {
-                    writeln!(&mut output, "\t(void){argument_name};")
+                    if let Some(binding) = parameter.binding {
+                        writeln!(
+                            &mut output,
+                            "\tuint64_t {} = (uint64_t)(uintptr_t){argument_name};",
+                            value_name(binding),
+                        )
                         .expect("String writes cannot fail");
+                        defined.insert(binding);
+                    } else {
+                        writeln!(&mut output, "\t(void){argument_name};")
+                            .expect("String writes cannot fail");
+                    }
                 }
                 CertifiedAggregateSemanticCParameterKind::Scalar { width_bits, .. } => {
                     writeln!(&mut output, "\t(void){argument_name};")
@@ -1209,10 +1641,16 @@ impl CertifiedAggregateMemberSemanticCFunction {
                         .expect("String writes cannot fail");
                         writeln!(&mut output, "\t(void){};", value_name(binding))
                             .expect("String writes cannot fail");
+                        defined.insert(binding);
                     }
                 }
             }
         }
+        let mut materialized = expressions.materialized_expression_roots(&defined)?;
+        let private_stack = self.memory.private_stack_access_map()?;
+        let private_stack_address_producers = self.memory.private_stack_address_producers();
+        let private_stack_transport_producers = self.memory.private_stack_transport_producers();
+        let mut initialized_private_stack = BTreeSet::new();
         for step in self.memory.layer().steps() {
             if let Some(reference) = step.memory() {
                 let statement = self
@@ -1220,14 +1658,71 @@ impl CertifiedAggregateMemberSemanticCFunction {
                     .layer()
                     .resolve_memory_statement(reference)
                     .expect("audited memory statement");
+                if let Some(local) = private_stack.get(&step.source()) {
+                    let local_name = private_stack_local_name(local);
+                    match statement.kind() {
+                        CertifiedMemoryStatementKind::Read { result } => {
+                            let root = expressions.memory_read_root(statement)?;
+                            let ty = storage_type(result.ty())?;
+                            writeln!(
+                                &mut output,
+                                "\t{ty} {} = ({ty}){local_name};",
+                                value_name(result.binding()),
+                            )
+                            .expect("String writes cannot fail");
+                            writeln!(&mut output, "\t(void){};", value_name(result.binding()))
+                                .expect("String writes cannot fail");
+                            defined.insert(result.binding());
+                            if root.is_some_and(|root| {
+                                materialized.insert(root, result.binding()).is_some()
+                            }) {
+                                return Err(
+                                    CertifiedAggregateMemberSemanticCFunctionError::MissingAggregate(
+                                        step.source(),
+                                    ),
+                                );
+                            }
+                        }
+                        CertifiedMemoryStatementKind::Write { value } => {
+                            let ty = storage_type(value.ty())?;
+                            if initialized_private_stack.insert(local.local_index()) {
+                                writeln!(
+                                    &mut output,
+                                    "\t{ty} {local_name} = ({ty})({});",
+                                    render_value_use(value),
+                                )
+                                .expect("String writes cannot fail");
+                            } else {
+                                writeln!(
+                                    &mut output,
+                                    "\t{local_name} = ({ty})({});",
+                                    render_value_use(value),
+                                )
+                                .expect("String writes cannot fail");
+                            }
+                        }
+                    }
+                    continue;
+                }
                 let access = self
                     .accesses
                     .iter()
                     .find(|access| access.producer == step.source())
                     .expect("audited aggregate access");
                 let helper = memory_helper_name(statement);
-                let pointer = format!("arg_{}", access.parameter_index);
-                let field = format!("field_{}", access.member_id);
+                let pointer = self
+                    .parameters
+                    .iter()
+                    .find(|parameter| parameter.index == access.parameter_index)
+                    .map(|parameter| parameter.name.as_str())
+                    .expect("audited aggregate pointer parameter");
+                let field = self
+                    .layout
+                    .members
+                    .iter()
+                    .find(|member| member.member_id == access.member_id)
+                    .map(|member| member.name.as_str())
+                    .expect("audited aggregate member");
                 let qualifier = if matches!(
                     access.direction,
                     CertifiedAggregateMemberRenderDirection::Read { .. }
@@ -1236,10 +1731,27 @@ impl CertifiedAggregateMemberSemanticCFunction {
                 } else {
                     "uint8_t"
                 };
-                let address =
-                    format!("((uint64_t)(uintptr_t)(({qualifier} *)&{pointer}->{field}))");
+                let member = access.element_index.map_or_else(
+                    || format!("{pointer}->{field}"),
+                    |index| {
+                        let rendered_index = index
+                            .source_parameter_index()
+                            .and_then(|source_parameter_index| {
+                                self.parameters
+                                    .iter()
+                                    .find(|parameter| parameter.index == source_parameter_index)
+                            })
+                            .map_or_else(
+                                || value_name(index.binding()),
+                                |parameter| parameter.name.clone(),
+                            );
+                        format!("{pointer}[{rendered_index}].{field}")
+                    },
+                );
+                let address = format!("((uint64_t)(uintptr_t)(({qualifier} *)&{member}))");
                 match statement.kind() {
                     CertifiedMemoryStatementKind::Read { result } => {
+                        let root = expressions.memory_read_root(statement)?;
                         writeln!(
                             &mut output,
                             "\t{} {} = {helper}({address});",
@@ -1247,6 +1759,18 @@ impl CertifiedAggregateMemberSemanticCFunction {
                             value_name(result.binding())
                         )
                         .expect("String writes cannot fail");
+                        writeln!(&mut output, "\t(void){};", value_name(result.binding()))
+                            .expect("String writes cannot fail");
+                        defined.insert(result.binding());
+                        if root.is_some_and(|root| {
+                            materialized.insert(root, result.binding()).is_some()
+                        }) {
+                            return Err(
+                                CertifiedAggregateMemberSemanticCFunctionError::MissingAggregate(
+                                    step.source(),
+                                ),
+                            );
+                        }
                     }
                     CertifiedMemoryStatementKind::Write { value } => {
                         writeln!(
@@ -1258,6 +1782,11 @@ impl CertifiedAggregateMemberSemanticCFunction {
                         .expect("String writes cannot fail");
                     }
                 }
+                continue;
+            }
+            if private_stack_address_producers.contains(&step.source())
+                || private_stack_transport_producers.contains(&step.source())
+            {
                 continue;
             }
             if self.address_producers.contains(&step.source()) {
@@ -1281,9 +1810,27 @@ impl CertifiedAggregateMemberSemanticCFunction {
                         .ty()
                 )?,
                 value_name(entity.output()),
-                expressions.render_expr(entity.root(), &mut helpers)?
+                expressions.render_expr_with_materialized_roots(
+                    entity.root(),
+                    &materialized,
+                    &mut helpers,
+                )?
             )
             .expect("String writes cannot fail");
+            writeln!(&mut output, "\t(void){};", value_name(entity.output()))
+                .expect("String writes cannot fail");
+            defined.insert(entity.output());
+            if materialized
+                .insert(entity.root(), entity.output())
+                .is_some()
+            {
+                return Err(
+                    CertifiedAggregateMemberSemanticCFunctionError::InvalidFunction(vec![format!(
+                        "duplicate materialized value for {}",
+                        step.source()
+                    )]),
+                );
+            }
         }
         match self.return_kind {
             CertifiedAggregateSemanticCReturn::Void => output.push_str("\treturn;\n"),
@@ -1331,14 +1878,14 @@ impl CertifiedAggregateMemberSemanticCFunction {
         &self,
         output: &mut String,
     ) -> Result<(), CertifiedAggregateMemberSemanticCFunctionError> {
-        let struct_name = format!("r2s_struct_{}", self.layout.aggregate_id);
+        let struct_name = &self.layout.name;
         writeln!(output, "typedef struct {struct_name} {{").expect("String writes cannot fail");
         for member in &self.layout.members {
             writeln!(
                 output,
-                "\t{} field_{};",
+                "\t{} {};",
                 scalar_c_type(member.signedness, member.size_bits)?,
-                member.member_id
+                member.name
             )
             .expect("String writes cannot fail");
         }
@@ -1358,8 +1905,8 @@ impl CertifiedAggregateMemberSemanticCFunction {
         for member in &self.layout.members {
             writeln!(
                 output,
-                "_Static_assert(offsetof({struct_name}, field_{}) == {}U, \"member offset mismatch\");",
-                member.member_id,
+                "_Static_assert(offsetof({struct_name}, {}) == {}U, \"member offset mismatch\");",
+                member.name,
                 member.offset_bits / 8
             )
             .expect("String writes cannot fail");
@@ -1386,21 +1933,19 @@ impl CertifiedAggregateMemberSemanticCFunction {
                 output.push_str(", ");
             }
             match parameter.kind {
-                CertifiedAggregateSemanticCParameterKind::AggregatePointer { .. } => write!(
-                    output,
-                    "r2s_struct_{} *arg_{}",
-                    self.layout.aggregate_id, parameter.index
-                )
-                .expect("String writes cannot fail"),
+                CertifiedAggregateSemanticCParameterKind::AggregatePointer { .. } => {
+                    write!(output, "{} *{}", self.layout.name, parameter.name)
+                        .expect("String writes cannot fail")
+                }
                 CertifiedAggregateSemanticCParameterKind::Scalar {
                     width_bits,
                     signedness,
                     ..
                 } => write!(
                     output,
-                    "{} arg_{}",
+                    "{} {}",
                     scalar_c_type(signedness, width_bits)?,
-                    parameter.index
+                    parameter.name
                 )
                 .expect("String writes cannot fail"),
             }
@@ -1650,11 +2195,13 @@ mod tests {
             pointer_type_id: 2,
             struct_type_id: 0,
             aggregate_id: 0,
+            name: "TestOnlyAggregate".to_string(),
             size_bits: 56 * 8,
             align_bits: 32,
             members: (0..14)
                 .map(|member_id| CertifiedAggregateStructMemberManifest {
                     member_id,
+                    name: format!("member_{member_id}"),
                     type_id: 3,
                     offset_bits: u64::from(member_id) * 32,
                     size_bits: 32,
@@ -1698,6 +2245,10 @@ mod tests {
                 ),
             )?,
         ])
+    }
+
+    fn manifest_parameter_names() -> Box<[Box<str>]> {
+        [Box::<str>::from("pointer"), Box::<str>::from("scalar")].into()
     }
 
     fn load_return_artifact_with_graph(graph: SourceTypeGraph) -> SsaArtifact {
@@ -1829,11 +2380,15 @@ mod tests {
                 signedness: MachineSignedness::Signed,
             })
         );
-        let manifest = parameter_manifests(&source, &semantic, 0, &parameter_manifest_layout())
-            .expect("exact aggregate parameter manifest");
+        let names = manifest_parameter_names();
+        let manifest =
+            parameter_manifests(&source, &semantic, &names, 0, &parameter_manifest_layout())
+                .expect("exact aggregate parameter manifest");
         let [pointer, scalar] = manifest.as_slice() else {
             panic!("exact pointer and scalar parameter manifests")
         };
+        assert_eq!(pointer.name(), "pointer");
+        assert_eq!(scalar.name(), "scalar");
         assert!(matches!(
             pointer.kind(),
             CertifiedAggregateSemanticCParameterKind::AggregatePointer {
@@ -1851,6 +2406,27 @@ mod tests {
                 carrier_width_bits: 64,
             }
         ));
+    }
+
+    #[test]
+    fn source_presentation_names_are_c_safe_and_collision_free() {
+        assert_eq!(c_function_identifier("dbg.test.name", String::new), "name");
+        assert_eq!(
+            c_identifier("struct", || "fallback".to_string()),
+            "fallback"
+        );
+        assert_eq!(c_identifier("9lives", String::new), "_9lives");
+        assert_eq!(c_identifier("field-name", String::new), "field_name");
+
+        let mut used = BTreeSet::new();
+        assert_eq!(
+            unique_c_identifier("field-name", || "field_0".to_string(), &mut used),
+            "field_name"
+        );
+        assert_eq!(
+            unique_c_identifier("field_name", || "field_1".to_string(), &mut used),
+            "field_1"
+        );
     }
 
     #[test]
@@ -1888,6 +2464,7 @@ mod tests {
             parameter_manifests(
                 &type_id_mutation,
                 &semantic,
+                &manifest_parameter_names(),
                 0,
                 &parameter_manifest_layout(),
             ),
@@ -1907,6 +2484,7 @@ mod tests {
             parameter_manifests(
                 &source,
                 &full_width_semantic,
+                &manifest_parameter_names(),
                 0,
                 &parameter_manifest_layout(),
             ),
@@ -1923,7 +2501,13 @@ mod tests {
         let unsigned_semantic = validated_manifest_parameters(&unsigned_source)
             .expect("valid alternate unsigned projection");
         assert_eq!(
-            parameter_manifests(&source, &unsigned_semantic, 0, &parameter_manifest_layout(),),
+            parameter_manifests(
+                &source,
+                &unsigned_semantic,
+                &manifest_parameter_names(),
+                0,
+                &parameter_manifest_layout(),
+            ),
             None,
             "the sealed unsigned logical type cannot satisfy signed source authority"
         );

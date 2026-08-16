@@ -20,7 +20,7 @@ use super::{
     CertifiedMemoryExecutionPolicy, CertifiedMemoryStatement, CertifiedMemoryStatementKind,
 };
 
-pub const CERTIFIED_AGGREGATE_MEMBER_ACCESS_CONTRACT_VERSION: u32 = 2;
+pub const CERTIFIED_AGGREGATE_MEMBER_ACCESS_CONTRACT_VERSION: u32 = 3;
 
 /// Complete naturally aligned scalar layout reached through one pointer type.
 ///
@@ -123,6 +123,23 @@ pub enum CertifiedAggregateMemberAccessSemantics {
     },
 }
 
+/// Exact affine array index used by one aggregate-member access.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CertifiedAggregateElementIndex {
+    value: MachineValueUse,
+    stride_bytes: u64,
+}
+
+impl CertifiedAggregateElementIndex {
+    pub const fn value(&self) -> &MachineValueUse {
+        &self.value
+    }
+
+    pub const fn stride_bytes(&self) -> u64 {
+        self.stride_bytes
+    }
+}
+
 /// Sealed proof that one plain RAM access is exactly one naturally laid-out
 /// scalar member of an ABI pointer parameter.
 ///
@@ -138,6 +155,7 @@ pub struct CertifiedAggregateMemberAccess {
     parameter_logical_value: SourceLogicalValue,
     source_type_graph: SourceTypeGraph,
     layout: CertifiedNaturalScalarAggregateLayout,
+    element_index: Option<CertifiedAggregateElementIndex>,
     projection: AggregateAccessProjection,
     structured_access: CertifiedAggregateStructuredAccess,
     space: MachineAddressSpace,
@@ -177,6 +195,10 @@ impl CertifiedAggregateMemberAccess {
 
     pub const fn layout(&self) -> &CertifiedNaturalScalarAggregateLayout {
         &self.layout
+    }
+
+    pub const fn element_index(&self) -> Option<&CertifiedAggregateElementIndex> {
+        self.element_index.as_ref()
     }
 
     pub const fn projection(&self) -> &AggregateAccessProjection {
@@ -396,6 +418,22 @@ fn try_certified_aggregate_member_access(
     {
         return Ok(None);
     }
+    let Some(layout) = certified_natural_scalar_layout(type_graph, projection) else {
+        return Ok(None);
+    };
+    let element_index = match projection.element_index {
+        None => None,
+        Some(index)
+            if index.stride_bytes > 0
+                && index.stride_bytes.checked_mul(8) == Some(layout.aggregate().size_bits()) =>
+        {
+            Some(CertifiedAggregateElementIndex {
+                value: MachineValueUse::from_artifact(artifact, index.value)?,
+                stride_bytes: index.stride_bytes,
+            })
+        }
+        Some(_) => return Ok(None),
+    };
 
     let Some(structured) = artifact.structured().memory_accesses.get(&access_key) else {
         return Ok(None);
@@ -415,13 +453,20 @@ fn try_certified_aggregate_member_access(
             != Some(projection.space)
         || artifact.graph().op_site_for_inst(access_key.inst)
             != Some((structured.block_addr, structured.op_index))
-        || !address_expression.terms.is_empty()
         || address_expression.offset < 0
         || u64::try_from(address_expression.offset) != Ok(projection.byte_offset)
         || u32::try_from(address_expression.parameter) != Ok(projection.source_parameter_index)
         || address_expression.parameter_storage != Some(parameter.storage())
     {
         return Ok(None);
+    }
+    match (address_expression.terms.as_slice(), element_index.as_ref()) {
+        ([], None) => {}
+        ([term], Some(index))
+            if term.value == index.value().binding().value()
+                && term.coefficient > 0
+                && u64::try_from(term.coefficient) == Ok(index.stride_bytes()) => {}
+        _ => return Ok(None),
     }
 
     let Some(source_disposition) = artifact
@@ -459,8 +504,7 @@ fn try_certified_aggregate_member_access(
         || memory_statement.address().memory_access() != Some(access_key)
         || memory_statement.space() != MachineAddressSpace::from(projection.space)
         || memory_statement.width_bits() != width_bits
-        || memory_statement.execution()
-            != CertifiedMemoryExecutionPolicy::ExactlyOnceInSourceOrderViaHelper
+        || memory_statement.execution() != CertifiedMemoryExecutionPolicy::ExactlyOnceInSourceOrder
         || memory_obligation.instruction != source_disposition.id
         || memory_obligation.kind != expected_obligation_kind
         || memory_obligation.component
@@ -532,9 +576,6 @@ fn try_certified_aggregate_member_access(
         _ => return Ok(None),
     };
 
-    let Some(layout) = certified_natural_scalar_layout(type_graph, projection) else {
-        return Ok(None);
-    };
     Ok(Some(CertifiedAggregateMemberAccess {
         schema_version: CERTIFICATION_SCHEMA_VERSION,
         contract_version: CERTIFIED_AGGREGATE_MEMBER_ACCESS_CONTRACT_VERSION,
@@ -544,6 +585,7 @@ fn try_certified_aggregate_member_access(
         parameter_logical_value,
         source_type_graph: type_graph.clone(),
         layout,
+        element_index,
         projection: projection.clone(),
         structured_access: CertifiedAggregateStructuredAccess {
             access: structured.id,
@@ -562,6 +604,42 @@ fn try_certified_aggregate_member_access(
         memory_statement: memory_statement.clone(),
         memory_obligation,
     }))
+}
+
+pub(super) fn certified_aggregate_member_accesses(
+    artifact: &SsaArtifact,
+    origin: &CertifiedArtifactOrigin,
+    abi_parameters: &BTreeMap<u32, CertifiedAbiParameter>,
+    memory_statements: &BTreeMap<CanonicalInstructionId, CertifiedMemoryStatement>,
+) -> Result<BTreeMap<StructuredAccessId, CertifiedAggregateMemberAccess>, MachineBuildError> {
+    let facts = artifact.aggregate_accesses();
+    if facts.schema_version() != AGGREGATE_ACCESS_PROJECTION_SCHEMA_VERSION {
+        return Ok(BTreeMap::new());
+    }
+    let Some(interface) = artifact.machine_context().function_interface() else {
+        return Ok(BTreeMap::new());
+    };
+    let Some(projections) = facts.projections_for_revision(interface.revision_identity()) else {
+        return Ok(BTreeMap::new());
+    };
+    let mut certified = BTreeMap::new();
+    for (access, projection) in projections {
+        let Some(candidate) = try_certified_aggregate_member_access(
+            artifact,
+            origin,
+            abi_parameters,
+            memory_statements,
+            *access,
+            projection,
+        )?
+        else {
+            continue;
+        };
+        if certified.insert(*access, candidate).is_some() {
+            return Err(MachineBuildError::ObligationMismatch(access.inst));
+        }
+    }
+    Ok(certified)
 }
 
 #[cfg(test)]
@@ -606,40 +684,4 @@ mod tests {
             assert!(!mutation);
         }
     }
-}
-
-pub(super) fn certified_aggregate_member_accesses(
-    artifact: &SsaArtifact,
-    origin: &CertifiedArtifactOrigin,
-    abi_parameters: &BTreeMap<u32, CertifiedAbiParameter>,
-    memory_statements: &BTreeMap<CanonicalInstructionId, CertifiedMemoryStatement>,
-) -> Result<BTreeMap<StructuredAccessId, CertifiedAggregateMemberAccess>, MachineBuildError> {
-    let facts = artifact.aggregate_accesses();
-    if facts.schema_version() != AGGREGATE_ACCESS_PROJECTION_SCHEMA_VERSION {
-        return Ok(BTreeMap::new());
-    }
-    let Some(interface) = artifact.machine_context().function_interface() else {
-        return Ok(BTreeMap::new());
-    };
-    let Some(projections) = facts.projections_for_revision(interface.revision_identity()) else {
-        return Ok(BTreeMap::new());
-    };
-    let mut certified = BTreeMap::new();
-    for (access, projection) in projections {
-        let Some(candidate) = try_certified_aggregate_member_access(
-            artifact,
-            origin,
-            abi_parameters,
-            memory_statements,
-            *access,
-            projection,
-        )?
-        else {
-            continue;
-        };
-        if certified.insert(*access, candidate).is_some() {
-            return Err(MachineBuildError::ObligationMismatch(access.inst));
-        }
-    }
-    Ok(certified)
 }

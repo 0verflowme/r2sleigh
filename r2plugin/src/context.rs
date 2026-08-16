@@ -5,7 +5,6 @@ use r2sleigh_lift::Disassembler;
 pub(crate) struct PluginCtxView<'a> {
     pub(crate) arch: Option<&'a ArchSpec>,
     pub(crate) disasm: &'a Disassembler,
-    pub(crate) semantic_metadata_enabled: bool,
 }
 
 pub(crate) fn require_ctx_view<'a>(ctx: *const R2ILContext) -> Option<PluginCtxView<'a>> {
@@ -18,6 +17,5 @@ pub(crate) fn require_ctx_view<'a>(ctx: *const R2ILContext) -> Option<PluginCtxV
     Some(PluginCtxView {
         arch: ctx_ref.arch.as_ref(),
         disasm,
-        semantic_metadata_enabled: ctx_ref.semantic_metadata_enabled,
     })
 }

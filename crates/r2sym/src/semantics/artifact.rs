@@ -1,3 +1,6 @@
+use std::sync::Arc;
+
+use r2ssa::{InterprocFunctionId, PreparedInterprocSummarySet, SsaArtifact};
 use serde::{Deserialize, Serialize};
 
 use super::claims::SemanticClaimSummary;
@@ -11,6 +14,7 @@ use super::region::{
     SemanticArtifactDiagnostics, SemanticRegion, SemanticTargetConditionSource, VmArtifactBody,
 };
 use super::vm::InterpreterKind;
+use crate::sim::PreparedFunctionScope;
 
 #[derive(Debug, Clone)]
 pub(crate) struct TargetQueryRouteInput<'a> {
@@ -389,8 +393,12 @@ pub enum SemanticArtifactBody {
     Vm(Box<VmArtifactBody>),
 }
 
+/// Serializable semantic analysis data. This report is non-authoritative and
+/// cannot be promoted into a runtime artifact without recompiling against an
+/// exact prepared SSA owner.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SemanticArtifact {
+pub struct SemanticArtifactReport {
+    pub schema_version: u32,
     pub stage: RefinementStage,
     pub granularity: ArtifactGranularity,
     pub execution: ExecutionModel,
@@ -398,12 +406,214 @@ pub struct SemanticArtifact {
     pub diagnostics: SemanticArtifactDiagnostics,
 }
 
-impl SemanticArtifact {
+impl SemanticArtifactReport {
     pub fn normalized(mut self) -> Self {
         self.diagnostics = self.diagnostics.normalized();
         self
     }
+}
 
+/// Runtime semantic analysis bound to the exact immutable SSA owner from
+/// which it was compiled.
+///
+/// Construction is crate-private, the retained owner is never serialized,
+/// and deserialized reports cannot regain runtime authority.
+#[derive(Debug, Clone)]
+pub struct SemanticArtifact {
+    prepared: Arc<SsaArtifact>,
+    report: SemanticArtifactReport,
+    provenance: SemanticArtifactProvenance,
+}
+
+#[derive(Debug, Clone, Default)]
+struct SemanticArtifactProvenance {
+    interproc: Vec<PreparedInterprocSummarySet>,
+    scopes: Vec<PreparedFunctionScope>,
+}
+
+impl PartialEq for SemanticArtifact {
+    fn eq(&self, other: &Self) -> bool {
+        self.prepared.authority() == other.prepared.authority() && self.report == other.report
+    }
+}
+
+impl Eq for SemanticArtifact {}
+
+impl std::ops::Deref for SemanticArtifact {
+    type Target = SemanticArtifactReport;
+
+    fn deref(&self) -> &Self::Target {
+        &self.report
+    }
+}
+
+impl SemanticArtifact {
+    pub(crate) fn new(prepared: Arc<SsaArtifact>, report: SemanticArtifactReport) -> Option<Self> {
+        if report.schema_version != crate::SEMANTIC_ARTIFACT_SCHEMA_VERSION {
+            return None;
+        }
+        Some(Self {
+            prepared,
+            report,
+            provenance: SemanticArtifactProvenance::default(),
+        })
+    }
+
+    pub(crate) fn new_with_interproc_provenance(
+        prepared: Arc<SsaArtifact>,
+        report: SemanticArtifactReport,
+        summaries: &PreparedInterprocSummarySet,
+    ) -> Option<Self> {
+        let mut artifact = Self::new(prepared, report)?;
+        artifact
+            .retain_interproc_provenance(summaries)
+            .then_some(artifact)
+    }
+
+    pub(crate) fn new_with_scope_provenance(
+        prepared: Arc<SsaArtifact>,
+        report: SemanticArtifactReport,
+        scope: &PreparedFunctionScope,
+    ) -> Option<Self> {
+        let mut artifact = Self::new(prepared, report)?;
+        artifact.retain_scope_provenance(scope).then_some(artifact)
+    }
+
+    pub fn normalized(mut self) -> Self {
+        self.report = self.report.normalized();
+        self
+    }
+
+    pub fn report(&self) -> &SemanticArtifactReport {
+        &self.report
+    }
+
+    pub fn prepared(&self) -> &SsaArtifact {
+        self.prepared.as_ref()
+    }
+
+    pub fn shared_prepared(&self) -> Arc<SsaArtifact> {
+        Arc::clone(&self.prepared)
+    }
+
+    pub fn shares_artifact(&self, prepared: &SsaArtifact) -> bool {
+        self.prepared.authority() == prepared.authority()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_helper_provenance(&self) -> bool {
+        !self.provenance.interproc.is_empty() || !self.provenance.scopes.is_empty()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retains_helper_provenance_owner(&self, owner: &Arc<SsaArtifact>) -> bool {
+        self.provenance.interproc.iter().any(|summaries| {
+            summaries.owners().values().any(|candidate| {
+                !Arc::ptr_eq(candidate, &self.prepared) && Arc::ptr_eq(candidate, owner)
+            })
+        }) || self.provenance.scopes.iter().any(|scope| {
+            scope.functions().values().any(|function| {
+                !Arc::ptr_eq(&function.prepared, &self.prepared)
+                    && Arc::ptr_eq(&function.prepared, owner)
+            })
+        })
+    }
+
+    pub(crate) fn retain_interproc_provenance(
+        &mut self,
+        summaries: &PreparedInterprocSummarySet,
+    ) -> bool {
+        if !summaries.matches_root(&self.prepared) {
+            return false;
+        }
+        if !interproc_summary_uses_owned_helper(summaries) {
+            return true;
+        }
+        if !self
+            .provenance
+            .interproc
+            .iter()
+            .any(|retained| same_interproc_owners(retained, summaries))
+        {
+            self.provenance.interproc.push(summaries.clone());
+        }
+        true
+    }
+
+    pub(crate) fn retain_scope_provenance(&mut self, scope: &PreparedFunctionScope) -> bool {
+        let Some(root) = scope.root() else {
+            return false;
+        };
+        if !Arc::ptr_eq(&root.prepared, &self.prepared) {
+            return false;
+        }
+        if scope.helper_functions().next().is_none() {
+            return true;
+        }
+        if !self
+            .provenance
+            .scopes
+            .iter()
+            .any(|retained| same_scope_owners(retained, scope))
+        {
+            self.provenance.scopes.push(scope.clone());
+        }
+        true
+    }
+
+    pub(crate) fn report_mut(&mut self) -> &mut SemanticArtifactReport {
+        &mut self.report
+    }
+}
+
+fn interproc_summary_uses_owned_helper(summaries: &PreparedInterprocSummarySet) -> bool {
+    let Some(root) = summaries.report().root else {
+        return false;
+    };
+    let mut pending = vec![root];
+    let mut visited = std::collections::BTreeSet::new();
+    while let Some(function) = pending.pop() {
+        if !visited.insert(function) {
+            continue;
+        }
+        let Some(summary) = summaries.report().summaries.get(&function) else {
+            continue;
+        };
+        for callee in &summary.direct_callees {
+            let callee = InterprocFunctionId(*callee);
+            if callee != root && summaries.owner(callee).is_some() {
+                return true;
+            }
+            pending.push(callee);
+        }
+    }
+    false
+}
+
+fn same_interproc_owners(
+    left: &PreparedInterprocSummarySet,
+    right: &PreparedInterprocSummarySet,
+) -> bool {
+    left.owners().len() == right.owners().len()
+        && left.owners().iter().all(|(id, owner)| {
+            right
+                .owner(*id)
+                .is_some_and(|candidate| Arc::ptr_eq(owner, candidate))
+        })
+}
+
+fn same_scope_owners(left: &PreparedFunctionScope, right: &PreparedFunctionScope) -> bool {
+    left.root_id() == right.root_id()
+        && left.functions().len() == right.functions().len()
+        && left.functions().iter().all(|(id, function)| {
+            right
+                .functions()
+                .get(id)
+                .is_some_and(|candidate| Arc::ptr_eq(&function.prepared, &candidate.prepared))
+        })
+}
+
+impl SemanticArtifactReport {
     fn downgrade_query_route_to_residual(
         route: TargetQueryRoutePlan,
         reason: impl Into<String>,
@@ -755,12 +965,17 @@ impl SemanticArtifactDiagnostics {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use proptest::prelude::*;
+    use r2il::{R2ILBlock, R2ILOp, Varnode};
+    use r2ssa::SsaArtifact;
 
     use super::{
         ResidualReason, SemanticArtifact, SemanticArtifactBody, SemanticArtifactDiagnostics,
-        SemanticConfidence, SemanticEvidence, SemanticEvidenceAmbiguity, SemanticEvidenceCoverage,
-        SemanticEvidenceProvenance, SemanticEvidenceReason, SemanticEvidenceSoundness, SliceClass,
+        SemanticArtifactReport, SemanticConfidence, SemanticEvidence, SemanticEvidenceAmbiguity,
+        SemanticEvidenceCoverage, SemanticEvidenceProvenance, SemanticEvidenceReason,
+        SemanticEvidenceSoundness, SliceClass,
     };
     use crate::sim::DerivedSummaryDiagnostics;
     use crate::{
@@ -768,8 +983,17 @@ mod tests {
         RefinementStage,
     };
 
-    fn native_artifact(diagnostics: SemanticArtifactDiagnostics) -> SemanticArtifact {
-        SemanticArtifact {
+    fn test_prepared() -> Arc<SsaArtifact> {
+        let mut block = R2ILBlock::new(0x1000, 1);
+        block.push(R2ILOp::Return {
+            target: Varnode::constant(0, 8),
+        });
+        Arc::new(SsaArtifact::for_symbolic(&[block], None).expect("test SSA"))
+    }
+
+    fn native_report(diagnostics: SemanticArtifactDiagnostics) -> SemanticArtifactReport {
+        SemanticArtifactReport {
+            schema_version: crate::SEMANTIC_ARTIFACT_SCHEMA_VERSION,
             stage: RefinementStage::Compiled,
             granularity: ArtifactGranularity::WholeFunction,
             execution: ExecutionModel::Native,
@@ -787,6 +1011,62 @@ mod tests {
                 regions: Default::default(),
             }),
             diagnostics,
+        }
+    }
+
+    fn native_artifact(diagnostics: SemanticArtifactDiagnostics) -> SemanticArtifact {
+        SemanticArtifact::new(test_prepared(), native_report(diagnostics))
+            .expect("current test semantic artifact schema")
+    }
+
+    fn empty_diagnostics() -> SemanticArtifactDiagnostics {
+        SemanticArtifactDiagnostics {
+            branches_evaluated: 0,
+            branches_pruned: 0,
+            branches_unknown: 0,
+            skipped_missing_arch: false,
+            skipped_large_cfg: false,
+            residual_reasons: Vec::new(),
+            interpreter: None,
+            ambiguous_targets: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn report_round_trip_does_not_reconstruct_runtime_authority() {
+        let report = native_report(empty_diagnostics());
+        let encoded = serde_json::to_string(&report).expect("serialize report");
+        let decoded: SemanticArtifactReport =
+            serde_json::from_str(&encoded).expect("deserialize report");
+
+        assert_eq!(decoded, report);
+        assert_eq!(
+            decoded.schema_version,
+            crate::SEMANTIC_ARTIFACT_SCHEMA_VERSION
+        );
+        assert_eq!(decoded.slice_class(), Some(SliceClass::Worker));
+        assert!(decoded.native_body().is_some());
+        assert!(decoded.vm_body().is_none());
+        assert!(decoded.semantic_claim_summary().claims.is_empty());
+        assert_eq!(decoded.exact_control_count(), 0);
+        assert_eq!(decoded.actionable_control_count(), 0);
+        let _ = decoded.build_plan();
+        let _ = decoded.query_plan();
+        let _ = decoded.target_query_plan(0x1000);
+        let _ = decoded.target_query_route_plan(0x1000);
+        let _ = decoded.type_plan();
+        let _ = decoded.decompile_plan();
+    }
+
+    #[test]
+    fn semantic_artifact_refuses_noncurrent_report_schema() {
+        for schema_version in [
+            crate::SEMANTIC_ARTIFACT_SCHEMA_VERSION.saturating_sub(1),
+            crate::SEMANTIC_ARTIFACT_SCHEMA_VERSION.saturating_add(1),
+        ] {
+            let mut report = native_report(empty_diagnostics());
+            report.schema_version = schema_version;
+            assert!(SemanticArtifact::new(test_prepared(), report).is_none());
         }
     }
 

@@ -1,0 +1,10 @@
+warning: r2plugin must not assemble FunctionFacts/type-writeback analysis directly; route through r2engine
+  --> $DIR/direct_type_writeback_analysis.rs:6:5
+   |
+LL |     r2types::build_source_owned_type_writeback_analysis();
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(r2plugin_direct_type_writeback_analysis_ownership)]` on by default
+
+warning: 1 warning emitted
+

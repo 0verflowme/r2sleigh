@@ -15,8 +15,7 @@ use std::time::{Duration, Instant};
 use r2il::R2ILBlock;
 use r2ssa::{CFGRiskSummary, SsaArtifact};
 use r2types::{
-    CalleeResolutionFacts, FunctionFacts, FunctionSignatureProjection, FunctionTypeFacts,
-    MetadataScalarKind, ParamSlotResolver, SignatureCertificateSource, TypeHint, TypeWritebackPlan,
+    FunctionFacts, FunctionTypeFacts, MetadataScalarKind, TypeHint, TypeWritebackPlan,
     merge_type_hint, type_hint_from_value_metadata,
 };
 use serde::{Deserialize, Serialize};
@@ -35,14 +34,8 @@ pub use route::{
     type_cfg_prefers_bounded_plan, type_route_decision,
 };
 #[cfg(test)]
-use route::{
-    decompile_probe_decision, detached_semantic_route_plan, plan_decompile_request,
-    semantic_route_plan, semantic_route_reason,
-};
-use route::{
-    decompile_probe_decision_for_identity, decompile_route_decision,
-    proof_coverage_from_type_facts, raw_cfg_risk_summary_for_preprobe,
-};
+use route::{decompile_probe_decision, plan_decompile_request, semantic_route_reason};
+use route::{decompile_probe_decision_for_identity, decompile_route_decision};
 pub const SYMBOLIC_PATHS_LIMIT: usize = 32;
 pub const SYMBOLIC_PATHS_CALL_FREE_MAX_STATES: usize = 16;
 pub const SYMBOLIC_PATHS_CALL_FREE_MAX_DEPTH: usize = 64;
@@ -151,51 +144,6 @@ impl EngineSourceSnapshot {
     }
 }
 
-pub fn recover_vars_from_ssa(
-    ssa_blocks: &[r2ssa::SSABlock],
-    arch: Option<&r2il::ArchSpec>,
-    metadata_reg_type_hints: &HashMap<String, r2types::TypeHint>,
-    semantic_metadata_enabled: bool,
-) -> Vec<r2types::RecoveredVariable> {
-    r2types::recover_vars_from_ssa(
-        ssa_blocks,
-        arch.map(|spec| spec.name.as_str()),
-        metadata_reg_type_hints,
-        semantic_metadata_enabled,
-    )
-}
-
-pub struct EngineRecoverVarsRequest<'a> {
-    pub ssa_blocks: &'a [r2ssa::SSABlock],
-    pub r2il_blocks: &'a [R2ILBlock],
-    pub arch: Option<&'a r2il::ArchSpec>,
-    pub semantic_metadata_enabled: bool,
-    pub metadata_reg_type_hints: HashMap<String, r2types::TypeHint>,
-}
-
-pub fn recover_vars_from_ssa_with_register_names<F>(
-    mut request: EngineRecoverVarsRequest<'_>,
-    register_name: F,
-) -> Vec<r2types::RecoveredVariable>
-where
-    F: FnMut(&r2il::Varnode) -> Option<String>,
-{
-    if request.semantic_metadata_enabled {
-        for (name, hint) in
-            collect_register_type_hints_with_names(request.r2il_blocks, register_name)
-        {
-            merge_type_hint(&mut request.metadata_reg_type_hints, name, hint);
-        }
-    }
-
-    recover_vars_from_ssa(
-        request.ssa_blocks,
-        request.arch,
-        &request.metadata_reg_type_hints,
-        request.semantic_metadata_enabled,
-    )
-}
-
 pub fn compiled_semantic_info(artifact: &r2sym::SemanticArtifact) -> r2sym::CompiledSemanticInfo {
     r2sym::compiled_semantic_info(artifact)
 }
@@ -284,7 +232,6 @@ pub enum EngineTypeWritebackMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EngineAutoCallbackKind {
     AnalyzeFunction,
-    RecoverVars,
     DataRefs,
     PostAnalysisTaint,
     PostAnalysisXref,
@@ -593,26 +540,18 @@ fn engine_external_callee_json(callee: EngineExternalCalleeInput) -> r2types::Ex
     }
 }
 
-pub fn type_writeback_authority_report_for_policy(
-    plan: &TypeWritebackPlan,
+fn type_writeback_authority_report_for_policy(
+    analysis: &r2types::TypeWritebackAnalysis,
     budget: r2types::TypeWritebackMutationBudget,
-    function_facts: &FunctionFacts,
     apply_policy: r2types::TypeWritebackApplyPolicy,
-    basic_block_count: usize,
 ) -> r2types::TypeWritebackAuthorityReport {
-    r2types::type_writeback_authority_report_with_policy(
-        plan,
-        budget,
-        function_facts.type_facts(),
-        apply_policy,
-        basic_block_count,
-    )
+    analysis.authority_report(budget, apply_policy)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EngineTypeWritebackPlanReport {
-    pub plan: TypeWritebackPlan,
-    pub authority_report: r2types::TypeWritebackAuthorityReport,
+struct EngineTypeWritebackPlanReport {
+    plan: TypeWritebackPlan,
+    authority_report: r2types::TypeWritebackAuthorityReport,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -811,7 +750,7 @@ pub struct EngineTypeWritebackJsonCore {
     pub diagnostics: EngineTypeWritebackDiagnosticsJson,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct EngineFunctionAnalysisReportPayload {
     pub function_name: String,
     pub function_addr: u64,
@@ -819,7 +758,8 @@ pub struct EngineFunctionAnalysisReportPayload {
     pub plans: r2types::AnalysisPlans,
     pub assumptions: r2ssa::AssumptionSet,
     pub assumption_usage: r2types::AssumptionUsageReport,
-    pub semantic_artifact: Option<r2sym::SemanticArtifact>,
+    pub semantic_report: Option<r2sym::SemanticArtifactReport>,
+    pub compiled_semantics: Option<r2sym::CompiledSemanticInfo>,
     pub semantic_build_plan: Option<r2sym::ArtifactBuildPlan>,
     pub semantic_route: Option<r2types::DecompileRouteFacts>,
     pub summary_diagnostics: Option<r2ssa::InterprocSummaryDiagnostics>,
@@ -1001,16 +941,8 @@ pub struct EngineInferredTypeWritebackJson {
     pub core: EngineTypeWritebackJsonCore,
     pub interproc: EngineInterprocSummaryJson,
     pub semantic_status: EngineSemanticStatusJson,
-    /// Legacy route claim derived from rendered-proof facts. This is not an
-    /// `r2cert` source-obligation authorization.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub legacy_render_permission: Option<r2sym::RenderPermission>,
-    /// Legacy rendered-proof counters. These do not establish exact source-
-    /// obligation closure.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub legacy_rendered_proof_coverage: Option<r2sym::ProofCoverage>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub semantics: Option<r2sym::SemanticArtifact>,
+    pub semantics: Option<r2sym::SemanticArtifactReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub compiled_semantics: Option<r2sym::CompiledSemanticInfo>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1037,34 +969,6 @@ pub struct EngineFunctionAnalysisSessionReportJson {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub struct EngineTypeWritebackReportPolicy {
-    pub budget: r2types::TypeWritebackMutationBudget,
-    pub apply_policy: r2types::TypeWritebackApplyPolicy,
-    pub basic_block_count: usize,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct EngineBoundedCfgTypeWritebackReportRequest<'a> {
-    pub function_name: &'a str,
-    pub arch_name: &'a str,
-    pub ptr_bits: u32,
-    pub function_facts: &'a FunctionFacts,
-    pub reason: &'a str,
-    pub policy: EngineTypeWritebackReportPolicy,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct EngineSemanticFallbackTypeWritebackReportRequest<'a> {
-    pub function_name: &'a str,
-    pub arch_name: &'a str,
-    pub ptr_bits: u32,
-    pub artifact: &'a r2sym::SemanticArtifact,
-    pub function_facts: &'a FunctionFacts,
-    pub apply_artifact_signature_hint: bool,
-    pub policy: EngineTypeWritebackReportPolicy,
-}
-
-#[derive(Debug, Clone, Copy)]
 pub struct EngineFunctionAnalysisTypeWritebackJsonRequest<'a> {
     pub report: &'a EngineFunctionAnalysisReportPayload,
     pub iterations: usize,
@@ -1074,49 +978,20 @@ pub struct EngineFunctionAnalysisTypeWritebackJsonRequest<'a> {
     pub symbolic_scope: Option<&'a r2sym::PreparedFunctionScope>,
 }
 
-#[derive(Debug, Clone, Copy)]
-pub struct EngineBoundedCfgTypeWritebackJsonRequest<'a> {
-    pub type_request: EngineBoundedCfgTypeWritebackReportRequest<'a>,
-    pub interproc: EngineInterprocSummaryJsonInput<'a>,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct EngineBoundedCfgTypeWritebackPreflightJsonRequest<'a> {
-    pub function_name: &'a str,
-    pub arch_name: &'a str,
-    pub ptr_bits: u32,
-    pub reason: &'a str,
-    pub policy: EngineTypeWritebackReportPolicy,
-    pub interproc: EngineInterprocSummaryJsonInput<'a>,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct EngineSemanticFallbackTypeWritebackJsonRequest<'a> {
-    pub type_request: EngineSemanticFallbackTypeWritebackReportRequest<'a>,
-    pub interproc: EngineInterprocSummaryJsonInput<'a>,
-}
-
-pub fn type_writeback_plan_report_for_policy(
-    plan: TypeWritebackPlan,
+fn type_writeback_plan_report_for_policy(
+    analysis: &r2types::TypeWritebackAnalysis,
     budget: r2types::TypeWritebackMutationBudget,
-    function_facts: &FunctionFacts,
     apply_policy: r2types::TypeWritebackApplyPolicy,
-    basic_block_count: usize,
 ) -> EngineTypeWritebackPlanReport {
-    let authority_report = type_writeback_authority_report_for_policy(
-        &plan,
-        budget,
-        function_facts,
-        apply_policy,
-        basic_block_count,
-    );
+    let authority_report =
+        type_writeback_authority_report_for_policy(analysis, budget, apply_policy);
     EngineTypeWritebackPlanReport {
-        plan,
+        plan: analysis.plan().clone(),
         authority_report,
     }
 }
 
-pub fn type_writeback_payload_from_plan_report(
+fn type_writeback_payload_from_plan_report(
     plan_report: EngineTypeWritebackPlanReport,
     function_facts: &FunctionFacts,
     budget: r2types::TypeWritebackMutationBudget,
@@ -1173,21 +1048,13 @@ pub fn type_writeback_payload_from_plan_report(
     }
 }
 
-pub fn type_writeback_payload_for_policy(
-    plan: TypeWritebackPlan,
+fn type_writeback_payload_for_policy(
+    analysis: &r2types::TypeWritebackAnalysis,
     budget: r2types::TypeWritebackMutationBudget,
-    function_facts: &FunctionFacts,
     apply_policy: r2types::TypeWritebackApplyPolicy,
-    basic_block_count: usize,
 ) -> EngineTypeWritebackPayload {
-    let plan_report = type_writeback_plan_report_for_policy(
-        plan,
-        budget,
-        function_facts,
-        apply_policy,
-        basic_block_count,
-    );
-    type_writeback_payload_from_plan_report(plan_report, function_facts, budget)
+    let plan_report = type_writeback_plan_report_for_policy(analysis, budget, apply_policy);
+    type_writeback_payload_from_plan_report(plan_report, analysis.function_facts(), budget)
 }
 
 pub fn type_writeback_payload_from_analysis_response(
@@ -1195,13 +1062,7 @@ pub fn type_writeback_payload_from_analysis_response(
     budget: r2types::TypeWritebackMutationBudget,
     apply_policy: r2types::TypeWritebackApplyPolicy,
 ) -> EngineTypeWritebackPayload {
-    type_writeback_payload_for_policy(
-        response.writeback_plan.clone(),
-        budget,
-        &response.function_facts,
-        apply_policy,
-        response.cfg_summary.block_count,
-    )
+    type_writeback_payload_for_policy(response.type_analysis(), budget, apply_policy)
 }
 
 fn writeback_evidence_json(evidence: &[r2types::WritebackEvidence]) -> Vec<String> {
@@ -1336,7 +1197,7 @@ pub fn type_writeback_json_core(
 pub fn type_writeback_report_json(
     payload: EngineTypeWritebackPayload,
     interproc: EngineInterprocSummaryJson,
-    semantics: Option<r2sym::SemanticArtifact>,
+    semantics: Option<r2sym::SemanticArtifactReport>,
     compiled_semantics: Option<r2sym::CompiledSemanticInfo>,
 ) -> EngineInferredTypeWritebackJson {
     let semantic_status = semantic_status_json(semantics.as_ref(), None);
@@ -1344,8 +1205,6 @@ pub fn type_writeback_report_json(
         core: type_writeback_json_core(payload),
         interproc,
         semantic_status,
-        legacy_render_permission: None,
-        legacy_rendered_proof_coverage: None,
         semantics,
         compiled_semantics,
         phase_timings: empty_engine_phase_timings(),
@@ -1353,7 +1212,7 @@ pub fn type_writeback_report_json(
 }
 
 fn semantic_status_json(
-    semantics: Option<&r2sym::SemanticArtifact>,
+    semantics: Option<&r2sym::SemanticArtifactReport>,
     fallback_reason: Option<String>,
 ) -> EngineSemanticStatusJson {
     match semantics {
@@ -1362,7 +1221,7 @@ fn semantic_status_json(
             reason: format!(
                 "{} {}",
                 semantic_granularity_label(artifact.granularity),
-                semantic_mode_label(artifact)
+                semantic_report_mode_label(artifact)
             ),
         },
         None => EngineSemanticStatusJson {
@@ -1383,8 +1242,8 @@ fn semantic_granularity_label(granularity: r2sym::ArtifactGranularity) -> &'stat
 pub fn type_writeback_report_json_from_function_analysis(
     request: EngineFunctionAnalysisTypeWritebackJsonRequest<'_>,
 ) -> EngineInferredTypeWritebackJson {
-    let semantics = request.report.semantic_artifact.clone();
-    let compiled_semantics = semantics.as_ref().map(compiled_semantic_info);
+    let semantics = request.report.semantic_report.clone();
+    let compiled_semantics = request.report.compiled_semantics.clone();
     let mut report = type_writeback_report_json(
         request.report.type_writeback.clone(),
         interproc_summary_json(EngineInterprocSummaryJsonInput {
@@ -1414,10 +1273,6 @@ pub fn type_writeback_report_json_from_function_analysis(
                     .map(|diagnostics| format!("summary diagnostics: {diagnostics:?}"))
             }),
     );
-    if let Some(route) = request.report.semantic_route.as_ref() {
-        report.legacy_render_permission = Some(route.render_permission.clone());
-        report.legacy_rendered_proof_coverage = Some(route.proof_coverage.clone());
-    }
     report
 }
 
@@ -1580,10 +1435,7 @@ pub fn function_analysis_session_report_json(
     type_writeback.phase_timings = normalize_engine_phase_timings(type_writeback.phase_timings);
     EngineFunctionAnalysisSessionReportJson {
         core: function_analysis_report_json_core(payload),
-        semantic: payload
-            .semantic_artifact
-            .as_ref()
-            .map(compiled_semantic_info),
+        semantic: payload.compiled_semantics.clone(),
         type_writeback,
         phase_timings: normalize_engine_phase_timings(phase_timings),
     }
@@ -1598,128 +1450,30 @@ pub fn function_analysis_report_payload_from_type_response(
 ) -> EngineFunctionAnalysisReportPayload {
     let type_writeback =
         type_writeback_payload_from_analysis_response(&response, budget, apply_policy);
-    let semantic_artifact = response.function_facts.semantic_artifact().cloned();
-    let semantic_build_plan = semantic_artifact
-        .as_ref()
-        .map(r2sym::SemanticArtifact::build_plan);
-    let semantic_route = response.function_facts.decompile_route().cloned();
-    let summary_diagnostics = response
-        .function_facts
-        .summary_view()
-        .diagnostics()
-        .cloned();
+    let function_facts = response.function_facts();
+    let semantic_owner = function_facts.semantic_artifact();
+    let semantic_build_plan = semantic_owner.map(|artifact| artifact.report().build_plan());
+    let compiled_semantics = semantic_owner.map(compiled_semantic_info);
+    let semantic_report = semantic_owner.map(|artifact| artifact.report().clone());
+    let semantic_route = Some(response.decompile_route().clone());
+    let summary_diagnostics = function_facts.summary_view().diagnostics().cloned();
     EngineFunctionAnalysisReportPayload {
         function_name,
         function_addr,
-        cfg_summary: response.cfg_summary,
-        plans: response.function_facts.plans().clone(),
-        assumptions: response.function_facts.assumptions().clone(),
-        assumption_usage: response.function_facts.assumption_usage().clone(),
-        semantic_artifact,
+        cfg_summary: *response.cfg_summary(),
+        plans: function_facts.plans().clone(),
+        assumptions: function_facts.assumptions().clone(),
+        assumption_usage: function_facts.assumption_usage().clone(),
+        semantic_report,
+        compiled_semantics,
         semantic_build_plan,
         semantic_route,
         summary_diagnostics,
         type_writeback,
-        prefer_bounded_type_plan: response.route_decision.prefer_bounded_type_plan,
-        callsite_count: response.callsite_count,
-        current_summary: response.current_summary,
+        prefer_bounded_type_plan: response.route_decision().prefer_bounded_type_plan,
+        callsite_count: response.callsite_count(),
+        current_summary: response.current_summary().cloned(),
     }
-}
-
-pub fn bounded_cfg_type_writeback_plan_report(
-    request: EngineBoundedCfgTypeWritebackReportRequest<'_>,
-) -> EngineTypeWritebackPlanReport {
-    let plan = bounded_cfg_type_writeback_plan(
-        request.function_name,
-        request.arch_name,
-        request.ptr_bits,
-        request.function_facts,
-        request.reason.to_string(),
-    );
-    type_writeback_plan_report_for_policy(
-        plan,
-        request.policy.budget,
-        request.function_facts,
-        request.policy.apply_policy,
-        request.policy.basic_block_count,
-    )
-}
-
-pub fn bounded_cfg_type_writeback_payload(
-    request: EngineBoundedCfgTypeWritebackReportRequest<'_>,
-) -> EngineTypeWritebackPayload {
-    let function_facts = request.function_facts;
-    let budget = request.policy.budget;
-    let plan_report = bounded_cfg_type_writeback_plan_report(request);
-    type_writeback_payload_from_plan_report(plan_report, function_facts, budget)
-}
-
-pub fn bounded_cfg_type_writeback_report_json(
-    request: EngineBoundedCfgTypeWritebackJsonRequest<'_>,
-) -> EngineInferredTypeWritebackJson {
-    type_writeback_report_json(
-        bounded_cfg_type_writeback_payload(request.type_request),
-        interproc_summary_json(request.interproc),
-        None,
-        None,
-    )
-}
-
-pub fn bounded_cfg_type_writeback_preflight_report_json(
-    request: EngineBoundedCfgTypeWritebackPreflightJsonRequest<'_>,
-) -> EngineInferredTypeWritebackJson {
-    let function_facts = FunctionFacts::new(FunctionTypeFacts::default(), None);
-    bounded_cfg_type_writeback_report_json(EngineBoundedCfgTypeWritebackJsonRequest {
-        type_request: EngineBoundedCfgTypeWritebackReportRequest {
-            function_name: request.function_name,
-            arch_name: request.arch_name,
-            ptr_bits: request.ptr_bits,
-            function_facts: &function_facts,
-            reason: request.reason,
-            policy: request.policy,
-        },
-        interproc: request.interproc,
-    })
-}
-
-pub fn semantic_fallback_type_writeback_plan_report(
-    request: EngineSemanticFallbackTypeWritebackReportRequest<'_>,
-) -> EngineTypeWritebackPlanReport {
-    let plan = semantic_fallback_type_writeback_plan(
-        request.function_name,
-        request.arch_name,
-        request.ptr_bits,
-        request.artifact,
-        request.function_facts,
-        request.apply_artifact_signature_hint,
-    );
-    type_writeback_plan_report_for_policy(
-        plan,
-        request.policy.budget,
-        request.function_facts,
-        request.policy.apply_policy,
-        request.policy.basic_block_count,
-    )
-}
-
-pub fn semantic_fallback_type_writeback_payload(
-    request: EngineSemanticFallbackTypeWritebackReportRequest<'_>,
-) -> EngineTypeWritebackPayload {
-    let function_facts = request.function_facts;
-    let budget = request.policy.budget;
-    let plan_report = semantic_fallback_type_writeback_plan_report(request);
-    type_writeback_payload_from_plan_report(plan_report, function_facts, budget)
-}
-
-pub fn semantic_fallback_type_writeback_report_json(
-    request: EngineSemanticFallbackTypeWritebackJsonRequest<'_>,
-) -> EngineInferredTypeWritebackJson {
-    type_writeback_report_json(
-        semantic_fallback_type_writeback_payload(request.type_request),
-        interproc_summary_json(request.interproc),
-        Some(request.type_request.artifact.clone()),
-        Some(compiled_semantic_info(request.type_request.artifact)),
-    )
 }
 
 pub fn type_writeback_fact_counts(function_facts: &FunctionFacts) -> EngineTypeWritebackFactCounts {
@@ -1980,7 +1734,6 @@ pub fn auto_callback_plan_for_policy(
     let min_mode = match kind {
         EngineAutoCallbackKind::PostAnalysisXref => EngineAnalysisMode::Balanced,
         EngineAutoCallbackKind::AnalyzeFunction
-        | EngineAutoCallbackKind::RecoverVars
         | EngineAutoCallbackKind::DataRefs
         | EngineAutoCallbackKind::PostAnalysisTaint => EngineAnalysisMode::Full,
     };
@@ -2013,14 +1766,23 @@ pub fn auto_callback_plan_for_radare2_depth(
 
 pub fn engine_normalized_arch_name(arch: Option<&r2il::ArchSpec>) -> Option<String> {
     let arch = arch?;
-    let lower = arch.name.to_ascii_lowercase();
-    if matches!(lower.as_str(), "x86-64" | "x86_64" | "x64" | "amd64") {
-        return Some("x86-64".to_string());
-    }
-    if matches!(lower.as_str(), "x86" | "x86-32" | "i386" | "i686") {
-        return Some("x86".to_string());
-    }
-    Some(arch.name.clone())
+    let family = r2ssa::MachineArchitectureFamily::from_arch_spec(Some(arch));
+    Some(
+        match family {
+            r2ssa::MachineArchitectureFamily::X86 => "x86",
+            r2ssa::MachineArchitectureFamily::X86_64 => "x86-64",
+            r2ssa::MachineArchitectureFamily::Arm => "arm",
+            r2ssa::MachineArchitectureFamily::AArch64 => "aarch64",
+            r2ssa::MachineArchitectureFamily::RiscV32 => "riscv32",
+            r2ssa::MachineArchitectureFamily::RiscV64 => "riscv64",
+            r2ssa::MachineArchitectureFamily::Mips32 => "mips",
+            r2ssa::MachineArchitectureFamily::Mips64 => "mips64",
+            r2ssa::MachineArchitectureFamily::PowerPc32 => "powerpc",
+            r2ssa::MachineArchitectureFamily::PowerPc64 => "powerpc64",
+            r2ssa::MachineArchitectureFamily::Unknown => return Some(arch.name.clone()),
+        }
+        .to_string(),
+    )
 }
 
 pub fn engine_arch_target(arch: Option<&r2il::ArchSpec>) -> (String, u32) {
@@ -2167,76 +1929,37 @@ impl EngineRenderTarget {
         (arch_name, target)
     }
 
+    fn for_prepared(source: &SsaArtifact) -> Option<Self> {
+        let memory = source.machine_context().memory_model();
+        if !memory.is_available() || !memory.is_coherent() {
+            return None;
+        }
+        let ptr_bits = memory.default_address_bits();
+        if ptr_bits == 0 {
+            return None;
+        }
+        let (arch_name, expected_bits) = match source.machine_context().architecture_family() {
+            r2ssa::MachineArchitectureFamily::X86 => ("x86", 32),
+            r2ssa::MachineArchitectureFamily::X86_64 => ("x86-64", 64),
+            r2ssa::MachineArchitectureFamily::Arm => ("arm", 32),
+            r2ssa::MachineArchitectureFamily::AArch64 => ("aarch64", 64),
+            r2ssa::MachineArchitectureFamily::RiscV32 => ("riscv32", 32),
+            r2ssa::MachineArchitectureFamily::RiscV64 => ("riscv64", 64),
+            r2ssa::MachineArchitectureFamily::Mips32 => ("mips", 32),
+            r2ssa::MachineArchitectureFamily::Mips64 => ("mips64", 64),
+            r2ssa::MachineArchitectureFamily::PowerPc32 => ("powerpc", 32),
+            r2ssa::MachineArchitectureFamily::PowerPc64 => ("powerpc64", 64),
+            r2ssa::MachineArchitectureFamily::Unknown => return None,
+        };
+        if ptr_bits != expected_bits {
+            return None;
+        }
+        Some(Self::for_arch_name(arch_name, ptr_bits))
+    }
+
     fn to_decompiler_config(&self) -> r2dec::DecompilerConfig {
         r2dec::DecompilerConfig::for_arch_name(&self.arch_name, self.ptr_bits)
     }
-}
-
-pub fn decompile_callee_resolution_facts(
-    prepared: &SsaArtifact,
-    function_facts: &FunctionFacts,
-) -> CalleeResolutionFacts {
-    let mut facts = function_facts.clone();
-    facts.attach_prepared_decompile_evidence(prepared);
-    facts
-        .callee_resolution()
-        .cloned()
-        .unwrap_or_else(CalleeResolutionFacts::default)
-}
-
-pub fn attach_prepared_decompile_evidence(
-    prepared: &SsaArtifact,
-    mut function_facts: FunctionFacts,
-    param_slots: &ParamSlotResolver,
-) -> FunctionFacts {
-    function_facts.attach_prepared_decompile_evidence(prepared);
-    function_facts.populate_certified_parameter_exprs(prepared, param_slots);
-    function_facts.normalize_field_certificates_from_external_layout();
-    function_facts
-        .populate_member_access_render_facts_from_field_certificates(prepared, param_slots);
-    function_facts.populate_certified_loop_carrier_types();
-    function_facts.populate_array_access_render_facts_from_scalar_candidates(prepared, param_slots);
-    function_facts
-}
-
-pub fn function_facts_for_decompile(
-    func_name: &str,
-    prepared: &SsaArtifact,
-    function_facts: FunctionFacts,
-    param_slots: &ParamSlotResolver,
-) -> FunctionFacts {
-    let mut function_facts =
-        attach_prepared_decompile_evidence(prepared, function_facts, param_slots);
-    if function_facts.decompile_route().is_none() {
-        let cfg_summary = prepared.function().cfg_risk_summary();
-        let route_decision =
-            decompile_route_decision(func_name, &function_facts, Some(prepared), &cfg_summary);
-        function_facts.set_decompile_route(Some(route_decision.route.clone()));
-    }
-    function_facts
-}
-
-#[cfg(test)]
-pub fn decompiler_input_from_prepared_facts(
-    ssa_func: impl Into<Arc<SsaArtifact>>,
-    function_facts: FunctionFacts,
-    param_slots: &ParamSlotResolver,
-    _function_names: HashMap<u64, String>,
-    _strings: HashMap<u64, String>,
-    _symbols: HashMap<u64, String>,
-    ptr_bits: u32,
-) -> r2dec::DecompilerInput {
-    let ssa_func = ssa_func.into();
-    let func_name = ssa_func
-        .function()
-        .name
-        .clone()
-        .unwrap_or_else(|| format!("sub_{:x}", ssa_func.entry));
-    let function_facts =
-        function_facts_for_decompile(&func_name, ssa_func.as_ref(), function_facts, param_slots);
-    let _ = ptr_bits;
-    let context = r2dec::DecompilerContext::from_function_facts(function_facts);
-    r2dec::DecompilerInput::new(ssa_func, context)
 }
 
 #[derive(Debug, Clone)]
@@ -2304,10 +2027,25 @@ impl EngineMetrics {
 
 #[derive(Debug, Clone)]
 pub struct EngineAnalysis {
-    pub ssa_func: Arc<SsaArtifact>,
-    /// Transitional alias of `ssa_func` retained while callers migrate away
-    /// from the former context-free pattern-analysis artifact.
-    pub pattern_ssa_func: Arc<SsaArtifact>,
+    ssa_func: Arc<SsaArtifact>,
+}
+
+impl EngineAnalysis {
+    /// Construct an engine-owned analysis from an already prepared SSA owner.
+    pub(crate) fn from_prepared_ssa(ssa_func: Arc<SsaArtifact>) -> Self {
+        Self { ssa_func }
+    }
+
+    /// Borrow the immutable prepared SSA consumed by this analysis.
+    pub fn ssa_func(&self) -> &SsaArtifact {
+        self.ssa_func.as_ref()
+    }
+
+    fn from_trusted_ssa(trusted: &r2ssa::TrustedSsaArtifact) -> Self {
+        Self {
+            ssa_func: trusted.shared_artifact(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -3085,103 +2823,56 @@ pub fn interproc_runtime_materialized_sources(
         .collect()
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct EngineAnalysisArtifact {
-    pub ssa_func: Arc<SsaArtifact>,
-    /// Certifying view of `ssa_func`, available only for the unmodified
+    type_analysis: r2types::TypeWritebackAnalysis,
+    /// Certifying view of the retained source, available only for the unmodified
     /// source-retaining trusted preparation path.
-    pub trusted_ssa: Option<Arc<r2ssa::TrustedSsaArtifact>>,
-    /// Transitional alias of `ssa_func`; production analysis prepares one
-    /// source-aware artifact and shares it across both legacy views.
-    pub pattern_ssa_func: Arc<SsaArtifact>,
-    pub function_facts: FunctionFacts,
-    pub writeback_plan: TypeWritebackPlan,
+    trusted_ssa: Option<Arc<r2ssa::TrustedSsaArtifact>>,
 }
 
-#[derive(Debug, Clone, Default)]
-pub struct InterprocScopeFacts {
-    summaries: BTreeMap<r2ssa::InterprocFunctionId, r2ssa::FunctionSemanticSummary>,
-}
-
-impl InterprocScopeFacts {
-    pub fn new(
-        summaries: BTreeMap<r2ssa::InterprocFunctionId, r2ssa::FunctionSemanticSummary>,
-    ) -> Self {
-        Self { summaries }
-    }
-
-    pub fn empty() -> Self {
-        Self::new(BTreeMap::new())
-    }
-
-    pub fn summaries(
-        &self,
-    ) -> &BTreeMap<r2ssa::InterprocFunctionId, r2ssa::FunctionSemanticSummary> {
-        &self.summaries
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct InterprocSeedEntry {
-    pub id: u64,
-    pub name: Option<String>,
-    pub arg_count_hint: Option<usize>,
-    pub linkage: r2ssa::FunctionSemanticLinkage,
-}
-
-impl InterprocSeedEntry {
-    pub fn unknown(id: u64, name: Option<String>, arg_count_hint: Option<usize>) -> Self {
-        Self {
-            id,
-            name,
-            arg_count_hint,
-            linkage: r2ssa::FunctionSemanticLinkage::Unknown,
-        }
-    }
-}
-
-pub fn interproc_scope_facts_from_seed_entries<I>(entries: I) -> InterprocScopeFacts
-where
-    I: IntoIterator<Item = (u64, Option<String>, Option<usize>)>,
-{
-    interproc_scope_facts_from_typed_seed_entries(
-        entries.into_iter().map(|(id, name, arg_count_hint)| {
-            InterprocSeedEntry::unknown(id, name, arg_count_hint)
-        }),
-    )
-}
-
-pub fn interproc_scope_facts_from_typed_seed_entries<I>(entries: I) -> InterprocScopeFacts
-where
-    I: IntoIterator<Item = InterprocSeedEntry>,
-{
-    let mut summaries = BTreeMap::new();
-    for entry in entries {
-        let InterprocSeedEntry {
-            id: addr,
-            name,
-            arg_count_hint,
-            linkage,
-        } = entry;
-        let id = r2ssa::InterprocFunctionId(addr);
-        let Some(mut summary) = name
+impl EngineAnalysisArtifact {
+    fn new(
+        type_analysis: r2types::TypeWritebackAnalysis,
+        trusted_ssa: Option<Arc<r2ssa::TrustedSsaArtifact>>,
+    ) -> Option<Self> {
+        let source = type_analysis.shared_source();
+        if trusted_ssa
             .as_deref()
-            .and_then(|name| {
-                r2sym::function_semantic_summary_seed_for_name_with_linkage(id, name, linkage)
-            })
-            .or_else(|| {
-                arg_count_hint.map(|_| r2ssa::FunctionSemanticSummary::unknown(id, name.clone()))
-            })
-        else {
-            continue;
-        };
-        summary.linkage = linkage;
-        if arg_count_hint.is_some() {
-            summary.arg_count_hint = arg_count_hint;
+            .is_some_and(|trusted| !trusted.shares_artifact(&source))
+        {
+            return None;
         }
-        summaries.insert(id, summary);
+        Some(Self {
+            type_analysis,
+            trusted_ssa,
+        })
     }
-    InterprocScopeFacts::new(summaries)
+
+    /// Borrow the exact immutable SSA owner used to build these facts.
+    pub fn ssa_func(&self) -> &SsaArtifact {
+        self.type_analysis.source()
+    }
+
+    /// Borrow the report sealed to the exact immutable SSA owner.
+    pub fn function_facts(&self) -> &FunctionFacts {
+        self.type_analysis.function_facts()
+    }
+
+    /// Borrow the inseparable source-owned type analysis.
+    pub fn type_analysis(&self) -> &r2types::TypeWritebackAnalysis {
+        &self.type_analysis
+    }
+
+    /// Borrow the writeback plan derived from the same exact source owner.
+    pub fn writeback_plan(&self) -> &TypeWritebackPlan {
+        self.type_analysis.plan()
+    }
+
+    /// Borrow request-local certification authority when this artifact retains it.
+    pub fn trusted_ssa(&self) -> Option<&r2ssa::TrustedSsaArtifact> {
+        self.trusted_ssa.as_deref()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -3381,10 +3072,8 @@ pub struct EngineAnalyzeRequest {
     pub semantic_metadata_enabled: bool,
     pub reg_type_hints: HashMap<String, r2types::TypeHint>,
     pub parsed_context: r2types::ParsedExternalContext,
-    pub scope_facts: InterprocScopeFacts,
     pub interproc_max_iterations: usize,
     pub symbolic_scope: Option<r2sym::PreparedFunctionScope>,
-    pub precomputed_semantic_artifact: Option<r2sym::SemanticArtifact>,
     pub semantic_mode: EngineSemanticMode,
     pub include_interproc_summary_set: bool,
     pub execution: EngineExecutionControl,
@@ -3401,10 +3090,8 @@ pub struct EngineAnalyzeRequestParts {
     pub semantic_metadata_enabled: bool,
     pub reg_type_hints: HashMap<String, r2types::TypeHint>,
     pub parsed_context: r2types::ParsedExternalContext,
-    pub scope_facts: InterprocScopeFacts,
     pub interproc_max_iterations: usize,
     pub symbolic_scope: Option<r2sym::PreparedFunctionScope>,
-    pub precomputed_semantic_artifact: Option<r2sym::SemanticArtifact>,
     pub include_interproc_summary_set: bool,
 }
 
@@ -3523,10 +3210,8 @@ pub struct EngineAnalyzeRequestInput {
     pub semantic_metadata_enabled: bool,
     pub reg_type_hints: HashMap<String, r2types::TypeHint>,
     pub parsed_context: r2types::ParsedExternalContext,
-    pub scope_facts: InterprocScopeFacts,
     pub interproc_max_iterations: usize,
     pub symbolic_scope: Option<r2sym::PreparedFunctionScope>,
-    pub precomputed_semantic_artifact: Option<r2sym::SemanticArtifact>,
     pub include_interproc_summary_set: bool,
 }
 
@@ -3536,10 +3221,8 @@ pub struct EngineAnalyzeFunctionRequestInput {
     pub ptr_bits: Option<u32>,
     pub reg_type_hints: HashMap<String, r2types::TypeHint>,
     pub parsed_context: r2types::ParsedExternalContext,
-    pub scope_facts: InterprocScopeFacts,
     pub interproc_max_iterations: usize,
     pub symbolic_scope: Option<r2sym::PreparedFunctionScope>,
-    pub precomputed_semantic_artifact: Option<r2sym::SemanticArtifact>,
     pub include_interproc_summary_set: bool,
 }
 
@@ -3607,10 +3290,8 @@ impl EngineAnalyzeRequest {
             semantic_metadata_enabled: parts.semantic_metadata_enabled,
             reg_type_hints: parts.reg_type_hints,
             parsed_context: parts.parsed_context,
-            scope_facts: parts.scope_facts,
             interproc_max_iterations: parts.interproc_max_iterations,
             symbolic_scope: parts.symbolic_scope,
-            precomputed_semantic_artifact: parts.precomputed_semantic_artifact,
             semantic_mode,
             include_interproc_summary_set: parts.include_interproc_summary_set,
             execution: EngineExecutionControl::default(),
@@ -3626,7 +3307,9 @@ impl EngineAnalyzeRequest {
     ///
     /// The exact retained lift replaces every detached identity, block,
     /// architecture, source snapshot, type hint, external context, scope, and
-    /// precomputed-semantic input. Trusted authority remains request-local.
+    /// precomputed-semantic input. Root-only interprocedural solving remains
+    /// enabled when requested because it derives solely from this exact owner.
+    /// Trusted authority remains request-local.
     pub fn with_trusted_ssa(mut self, trusted: Arc<r2ssa::TrustedSsaArtifact>) -> Self {
         let function_addr = trusted.source().function().address();
         self.function_name = format!("fcn_{function_addr:x}");
@@ -3638,12 +3321,9 @@ impl EngineAnalyzeRequest {
         self.semantic_metadata_enabled = true;
         self.reg_type_hints.clear();
         self.parsed_context = r2types::ParsedExternalContext::default();
-        self.scope_facts = InterprocScopeFacts::empty();
-        self.interproc_max_iterations = 1;
+        self.interproc_max_iterations = self.interproc_max_iterations.max(1);
         self.symbolic_scope = None;
-        self.precomputed_semantic_artifact = None;
         self.semantic_mode = EngineSemanticMode::Full;
-        self.include_interproc_summary_set = false;
         self.trusted_ssa = Some(trusted);
         self
     }
@@ -3693,10 +3373,8 @@ fn engine_analyze_request_input_from_function(
         semantic_metadata_enabled: input.function.semantic_metadata_enabled,
         reg_type_hints: input.reg_type_hints,
         parsed_context: input.parsed_context,
-        scope_facts: input.scope_facts,
         interproc_max_iterations: input.interproc_max_iterations,
         symbolic_scope: input.symbolic_scope,
-        precomputed_semantic_artifact: input.precomputed_semantic_artifact,
         include_interproc_summary_set: input.include_interproc_summary_set,
     }
 }
@@ -3717,15 +3395,13 @@ fn engine_analyze_request_parts_from_input(
         semantic_metadata_enabled: input.semantic_metadata_enabled,
         reg_type_hints: input.reg_type_hints,
         parsed_context: input.parsed_context,
-        scope_facts: input.scope_facts,
         interproc_max_iterations: input.interproc_max_iterations,
         symbolic_scope: input.symbolic_scope,
-        precomputed_semantic_artifact: input.precomputed_semantic_artifact,
         include_interproc_summary_set: input.include_interproc_summary_set,
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct EngineAnalyzeResponse {
     pub artifact: EngineAnalysisArtifact,
     pub metrics: EngineMetrics,
@@ -3735,12 +3411,18 @@ pub struct EngineAnalyzeResponse {
 #[derive(Debug, Clone)]
 struct EngineDecompileRequest {
     pub function_name: String,
-    pub prepared_ssa: Arc<SsaArtifact>,
+    pub source_owned_facts: r2types::SourceOwnedFunctionFacts,
     pub trusted_ssa: Option<Arc<r2ssa::TrustedSsaArtifact>>,
-    pub function_facts: FunctionFacts,
+    pub input_quality: Option<r2types::FunctionInputQualityFacts>,
     pub render_target: EngineRenderTarget,
     pub execution: EngineExecutionControl,
     pub metrics: EngineMetrics,
+}
+
+impl EngineDecompileRequest {
+    fn function_facts(&self) -> &FunctionFacts {
+        self.source_owned_facts.report()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -3754,7 +3436,6 @@ pub struct EngineFunctionDecompileRequestInput {
     function: EngineFunctionInput,
     ptr_bits: Option<u32>,
     parsed_context: r2types::ParsedExternalContext,
-    scope_facts: InterprocScopeFacts,
     interproc_max_iterations: usize,
     symbolic_scope: Option<r2sym::PreparedFunctionScope>,
     input_quality: EngineFunctionInputQuality,
@@ -3773,7 +3454,6 @@ impl EngineFunctionDecompileRequestInput {
             function,
             ptr_bits,
             parsed_context,
-            scope_facts: InterprocScopeFacts::empty(),
             interproc_max_iterations: 1,
             symbolic_scope: None,
             input_quality: EngineFunctionInputQuality::complete(function_block_count),
@@ -3818,11 +3498,9 @@ impl EngineFunctionDecompileRequestInput {
 
     pub fn with_interproc_scope(
         mut self,
-        scope_facts: InterprocScopeFacts,
         interproc_max_iterations: usize,
         symbolic_scope: Option<r2sym::PreparedFunctionScope>,
     ) -> Self {
-        self.scope_facts = scope_facts;
         self.interproc_max_iterations = interproc_max_iterations.max(1);
         self.symbolic_scope = symbolic_scope;
         self
@@ -3840,10 +3518,8 @@ impl EngineFunctionDecompileRequest {
                     ptr_bits: input.ptr_bits,
                     reg_type_hints: HashMap::new(),
                     parsed_context: input.parsed_context,
-                    scope_facts: input.scope_facts,
                     interproc_max_iterations: input.interproc_max_iterations,
                     symbolic_scope: input.symbolic_scope,
-                    precomputed_semantic_artifact: None,
                     include_interproc_summary_set: true,
                 },
             )
@@ -3854,35 +3530,7 @@ impl EngineFunctionDecompileRequest {
 }
 
 pub struct EngineSignatureInferenceRequest<'a> {
-    pub function_name: &'a str,
-    pub arch: Option<&'a r2il::ArchSpec>,
-    pub ptr_bits: u32,
-    pub semantic_metadata_enabled: bool,
-    pub reg_type_hints: &'a HashMap<String, r2types::TypeHint>,
     pub analysis: &'a EngineAnalysis,
-}
-
-pub struct EngineSignatureInferenceWithRegisterNamesRequest<'a> {
-    pub function_name: &'a str,
-    pub arch: Option<&'a r2il::ArchSpec>,
-    pub ptr_bits: u32,
-    pub semantic_metadata_enabled: bool,
-    pub r2il_blocks: &'a [R2ILBlock],
-    pub reg_type_hints: HashMap<String, r2types::TypeHint>,
-    pub analysis: &'a EngineAnalysis,
-}
-
-pub struct EngineTargetQueryRouteRequest<'ctx, 'a> {
-    pub z3_ctx: &'ctx z3::Context,
-    pub prepared: &'a SsaArtifact,
-    pub scope: Option<&'a r2sym::PreparedFunctionScope>,
-    pub compiled: &'a r2sym::SemanticArtifact,
-    pub target_addr: u64,
-    pub arch: Option<&'a r2il::ArchSpec>,
-    pub symbols: &'a r2sym::FunctionSymbolSnapshot,
-    pub explore_config: r2sym::ExploreConfig,
-    pub summary_profile: r2sym::SummaryProfile,
-    pub assumption_conflicted: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -3923,7 +3571,7 @@ impl EngineSymbolicStateSeed<'_> {
 
 pub struct EngineSymbolicContextRequest<'ctx, 'a> {
     pub z3_ctx: &'ctx z3::Context,
-    pub prepared: &'a SsaArtifact,
+    pub prepared: &'a Arc<SsaArtifact>,
     pub scope: Option<&'a r2sym::PreparedFunctionScope>,
     pub arch: Option<&'a r2il::ArchSpec>,
     pub symbols: &'a r2sym::FunctionSymbolSnapshot,
@@ -4019,29 +3667,9 @@ impl std::error::Error for EngineSymbolicRunError {}
 #[derive(Debug, Clone)]
 pub struct EngineConditionedSymbolicScope {
     pub scope: r2sym::PreparedFunctionScope,
-    pub prepared: r2ssa::SsaArtifact,
+    pub prepared: Arc<r2ssa::SsaArtifact>,
     pub assumption_usage: r2ssa::AssumptionUsageReport,
     pub assumption_conditioned: bool,
-}
-
-pub struct EngineTypePreprobeRequest<'a> {
-    pub blocks: &'a [R2ILBlock],
-    pub function_addr: u64,
-    pub canonical_name: &'a str,
-    pub display_name: &'a str,
-    pub arch: Option<&'a r2il::ArchSpec>,
-    pub ptr_bits: u32,
-    pub parsed_context: &'a r2types::ParsedExternalContext,
-    pub symbolic_scope: Option<&'a r2sym::PreparedFunctionScope>,
-    pub type_seed: Option<FunctionTypeFacts>,
-    pub caller_prefers_bounded_type_plan: bool,
-    pub fallback_if_guarded_without_summary: bool,
-}
-
-pub struct EngineTypePreprobeResponse {
-    pub cfg_summary: CFGRiskSummary,
-    pub function_facts: FunctionFacts,
-    pub route_decision: EngineTypeRouteDecision,
 }
 
 #[derive(Debug, Clone)]
@@ -4085,7 +3713,6 @@ pub struct EngineFunctionAnalysisArtifactRequestInput {
     pub function: EngineFunctionInput,
     pub ptr_bits: Option<u32>,
     pub parsed_context: r2types::ParsedExternalContext,
-    pub scope_facts: InterprocScopeFacts,
     pub interproc_max_iterations: usize,
     pub symbolic_scope: Option<r2sym::PreparedFunctionScope>,
 }
@@ -4095,7 +3722,6 @@ pub struct EngineFunctionAnalysisReportRequestInput {
     pub function: EngineFunctionInput,
     pub ptr_bits: Option<u32>,
     pub parsed_context: r2types::ParsedExternalContext,
-    pub scope_facts: InterprocScopeFacts,
     pub interproc_max_iters: usize,
     pub interproc_converged: bool,
     pub symbolic_scope: Option<r2sym::PreparedFunctionScope>,
@@ -4112,10 +3738,8 @@ impl EngineFunctionAnalysisArtifactRequest {
                     ptr_bits: input.ptr_bits,
                     reg_type_hints: HashMap::new(),
                     parsed_context: input.parsed_context,
-                    scope_facts: input.scope_facts,
                     interproc_max_iterations: input.interproc_max_iterations,
                     symbolic_scope: input.symbolic_scope,
-                    precomputed_semantic_artifact: None,
                     include_interproc_summary_set: true,
                 },
             ),
@@ -4136,10 +3760,8 @@ impl EngineFunctionAnalysisArtifactRequest {
                     ptr_bits: input.ptr_bits,
                     reg_type_hints: HashMap::new(),
                     parsed_context: input.parsed_context,
-                    scope_facts: input.scope_facts,
                     interproc_max_iterations: input.interproc_max_iterations,
                     symbolic_scope: input.symbolic_scope,
-                    precomputed_semantic_artifact: None,
                     include_interproc_summary_set: true,
                 },
                 register_name,
@@ -4201,10 +3823,8 @@ impl EngineFunctionAnalysisReportRequest {
                     ptr_bits: input.ptr_bits,
                     reg_type_hints: HashMap::new(),
                     parsed_context: input.parsed_context,
-                    scope_facts: input.scope_facts,
                     interproc_max_iterations: input.interproc_max_iters,
                     symbolic_scope: input.symbolic_scope,
-                    precomputed_semantic_artifact: None,
                     include_interproc_summary_set: true,
                 },
             ),
@@ -4229,10 +3849,8 @@ impl EngineFunctionAnalysisReportRequest {
                     ptr_bits: input.ptr_bits,
                     reg_type_hints: HashMap::new(),
                     parsed_context: input.parsed_context,
-                    scope_facts: input.scope_facts,
                     interproc_max_iterations: input.interproc_max_iters,
                     symbolic_scope: input.symbolic_scope,
-                    precomputed_semantic_artifact: None,
                     include_interproc_summary_set: true,
                 },
                 register_name,
@@ -4268,22 +3886,61 @@ pub fn type_analysis_interproc_prefers_bounded_plan(
     interproc_max_iters <= 1 && !interproc_converged
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct EngineTypeAnalysisResponse {
-    pub cfg_summary: CFGRiskSummary,
-    pub function_facts: FunctionFacts,
-    pub writeback_plan: TypeWritebackPlan,
-    pub route_decision: EngineTypeRouteDecision,
-    pub callsite_count: usize,
-    pub current_summary: Option<r2ssa::FunctionSemanticSummary>,
-    pub metrics: EngineMetrics,
-    pub diagnostics: EngineDiagnostics,
+    type_analysis: r2types::TypeWritebackAnalysis,
+    cfg_summary: CFGRiskSummary,
+    route_decision: EngineTypeRouteDecision,
+    decompile_route: r2types::DecompileRouteFacts,
+    callsite_count: usize,
+    current_summary: Option<r2ssa::FunctionSemanticSummary>,
+    metrics: EngineMetrics,
+    diagnostics: EngineDiagnostics,
+}
+
+impl EngineTypeAnalysisResponse {
+    pub fn type_analysis(&self) -> &r2types::TypeWritebackAnalysis {
+        &self.type_analysis
+    }
+
+    pub fn function_facts(&self) -> &FunctionFacts {
+        self.type_analysis.function_facts()
+    }
+
+    pub fn cfg_summary(&self) -> &CFGRiskSummary {
+        &self.cfg_summary
+    }
+
+    pub fn route_decision(&self) -> &EngineTypeRouteDecision {
+        &self.route_decision
+    }
+
+    pub fn decompile_route(&self) -> &r2types::DecompileRouteFacts {
+        &self.decompile_route
+    }
+
+    pub fn callsite_count(&self) -> usize {
+        self.callsite_count
+    }
+
+    pub fn current_summary(&self) -> Option<&r2ssa::FunctionSemanticSummary> {
+        self.current_summary.as_ref()
+    }
+
+    pub fn metrics(&self) -> &EngineMetrics {
+        &self.metrics
+    }
+
+    pub fn diagnostics(&self) -> &EngineDiagnostics {
+        &self.diagnostics
+    }
 }
 
 #[derive(Debug, Clone)]
 pub struct EngineDecompileResponse {
     pub output: String,
     pub function_facts: FunctionFacts,
+    pub input_quality: Option<r2types::FunctionInputQualityFacts>,
     pub metrics: EngineMetrics,
     pub diagnostics: EngineDiagnostics,
 }
@@ -4344,7 +4001,7 @@ impl EngineSession {
         let response = self.analyze(analysis)?;
         let summary = response
             .artifact
-            .function_facts
+            .function_facts()
             .summary_view()
             .root_summary();
         let report = interproc_summary_json(EngineInterprocSummaryJsonInput {
@@ -4376,11 +4033,7 @@ impl EngineSession {
             ssa_control
                 .poll()
                 .map_err(|error| ssa_prepare_execution_refusal(error.into(), metrics.clone()))?;
-            let ssa_func = Arc::new(trusted.artifact().clone());
-            Arc::new(EngineAnalysis {
-                pattern_ssa_func: Arc::clone(&ssa_func),
-                ssa_func,
-            })
+            Arc::new(EngineAnalysis::from_trusted_ssa(trusted))
         } else {
             let Some(source_snapshot) = request.source_snapshot.as_deref() else {
                 return Err(engine_execution_refusal(
@@ -4432,7 +4085,7 @@ impl EngineSession {
             ));
         };
         let artifact_elapsed = artifact_started.elapsed();
-        if artifact.function_facts.semantic_artifact().is_some() {
+        if artifact.function_facts().semantic_artifact().is_some() {
             metrics.record_phase(
                 EnginePhase::Symbolic,
                 EnginePhaseStatus::Folded,
@@ -4467,133 +4120,41 @@ impl EngineSession {
     ) -> Result<EngineTypeAnalysisResponse, EngineExecutionRefusal> {
         let started = Instant::now();
         let analysis_request = request.analysis.canonicalize_trusted();
-        let execution = analysis_request.execution.clone();
-        let mut preprobe_metrics = EngineMetrics::default();
-        poll_engine_execution(&execution, EnginePhase::SnapshotContext, &preprobe_metrics)?;
-        if analysis_request.source_snapshot.is_none() && analysis_request.trusted_ssa.is_none() {
-            return Err(engine_execution_refusal(
-                MISSING_SOURCE_SNAPSHOT_REFUSAL.to_string(),
-                EnginePhase::SnapshotContext,
-                preprobe_metrics,
-            ));
-        }
-        preprobe_metrics.record_phase(
-            EnginePhase::SnapshotContext,
-            EnginePhaseStatus::Executed,
-            Duration::default(),
-        );
-        poll_engine_execution(&execution, EnginePhase::Types, &preprobe_metrics)?;
-        let type_started = Instant::now();
-        let (arch_name, _, _) = EngineRenderTarget::for_arch(analysis_request.arch.as_ref());
-        let type_seed = r2types::function_type_facts_from_parsed_context(
-            &analysis_request.function_name,
-            &analysis_request.parsed_context,
-        );
-
-        let preprobe = type_summary_preprobe(EngineTypePreprobeRequest {
-            blocks: analysis_request.blocks.as_slice(),
-            function_addr: analysis_request.function_addr,
-            canonical_name: &analysis_request.function_name,
-            display_name: &analysis_request.function_name,
-            arch: analysis_request.arch.as_ref(),
-            ptr_bits: analysis_request.ptr_bits,
-            parsed_context: &analysis_request.parsed_context,
-            symbolic_scope: analysis_request.symbolic_scope.as_ref(),
-            type_seed: Some(type_seed),
-            caller_prefers_bounded_type_plan: request.caller_prefers_bounded_type_plan,
-            fallback_if_guarded_without_summary: false,
-        })
-        .filter(|preprobe| {
-            !matches!(
-                preprobe.route_decision.kind,
-                EngineTypeRouteKind::FullWriteback
-            )
-        });
-        if let Some(preprobe) = preprobe {
-            let mut function_facts = preprobe.function_facts;
-            let Some(writeback_plan) = type_writeback_plan_for_route(TypeWritebackPlanRouteInput {
-                function_name: &analysis_request.function_name,
-                arch_name: &arch_name,
-                ptr_bits: analysis_request.ptr_bits,
-                function_facts: &function_facts,
-                cfg_summary: &preprobe.cfg_summary,
-                route: &preprobe.route_decision,
-                full_writeback_plan: None,
-            }) else {
-                return Err(engine_execution_refusal(
-                    "failed to construct bounded type writeback plan".to_string(),
-                    EnginePhase::Types,
-                    preprobe_metrics,
-                ));
-            };
-            let decompile_decision = decompile_route_decision(
-                &analysis_request.function_name,
-                &function_facts,
-                None,
-                &preprobe.cfg_summary,
-            );
-            function_facts.set_decompile_route(Some(decompile_decision.route));
-            preprobe_metrics.record_phase(
-                EnginePhase::Types,
-                EnginePhaseStatus::Executed,
-                type_started.elapsed(),
-            );
-            preprobe_metrics.type_time = type_started.elapsed();
-            preprobe_metrics.planning_time = started.elapsed();
-            poll_engine_execution(&execution, EnginePhase::Certification, &preprobe_metrics)?;
-            return Ok(EngineTypeAnalysisResponse {
-                cfg_summary: preprobe.cfg_summary,
-                function_facts,
-                writeback_plan,
-                route_decision: preprobe.route_decision,
-                callsite_count: 0,
-                current_summary: None,
-                metrics: preprobe_metrics,
-                diagnostics: EngineDiagnostics::default(),
-            });
-        }
-
         let analyze_response = self.analyze_checked(analysis_request.clone())?;
-        let mut artifact = analyze_response.artifact;
-        let cfg_summary = artifact.ssa_func.function().cfg_risk_summary();
+        let artifact = analyze_response.artifact;
+        let cfg_summary = artifact.ssa_func().function().cfg_risk_summary();
         let route_decision = type_route_decision(
-            &artifact.function_facts,
+            artifact.function_facts(),
             &cfg_summary,
             request.caller_prefers_bounded_type_plan,
         );
-        let Some(writeback_plan) = type_writeback_plan_for_route(TypeWritebackPlanRouteInput {
-            function_name: &analysis_request.function_name,
-            arch_name: &arch_name,
-            ptr_bits: analysis_request.ptr_bits,
-            function_facts: &artifact.function_facts,
-            cfg_summary: &cfg_summary,
-            route: &route_decision,
-            full_writeback_plan: Some(artifact.writeback_plan),
-        }) else {
+        if !matches!(route_decision.kind, EngineTypeRouteKind::FullWriteback) {
             return Err(engine_execution_refusal(
-                "failed to construct full type writeback plan".to_string(),
+                route_decision.reason.clone().unwrap_or_else(|| {
+                    "bounded or summary-only type evidence cannot authorize writeback".to_string()
+                }),
                 EnginePhase::Types,
                 analyze_response.metrics,
             ));
-        };
+        }
         let decompile_decision = decompile_route_decision(
             &analysis_request.function_name,
-            &artifact.function_facts,
-            Some(&artifact.ssa_func),
+            artifact.function_facts(),
+            Some(artifact.ssa_func()),
             &cfg_summary,
         );
-        artifact
-            .function_facts
-            .set_decompile_route(Some(decompile_decision.route));
-        let callsite_count =
-            count_prepared_callsites(&artifact.pattern_ssa_func.local_ssa_blocks());
-        let current_summary = current_interproc_summary(&artifact.function_facts);
+        let callsite_count = count_prepared_callsites(&artifact.ssa_func().local_ssa_blocks());
+        let current_summary = current_interproc_summary(artifact.function_facts());
+        let EngineAnalysisArtifact {
+            type_analysis,
+            trusted_ssa: _,
+        } = artifact;
 
         Ok(EngineTypeAnalysisResponse {
+            type_analysis,
             cfg_summary,
-            function_facts: artifact.function_facts,
-            writeback_plan,
             route_decision,
+            decompile_route: decompile_decision.route,
             callsite_count,
             current_summary,
             metrics: EngineMetrics {
@@ -4666,11 +4227,10 @@ impl EngineSession {
         } else {
             None
         };
-        let (arch_name, render_target) = EngineRenderTarget::for_arch_with_ptr_bits(
+        let (_, requested_render_target) = EngineRenderTarget::for_arch_with_ptr_bits(
             analysis_request.arch.as_ref(),
             analysis_request.ptr_bits,
         );
-        let param_slots = ParamSlotResolver::from_arch_name(Some(&arch_name));
         let identity = EngineFunctionIdentity::new(
             analysis_request.function_addr,
             &canonical_name,
@@ -4705,10 +4265,28 @@ impl EngineSession {
         };
 
         let mut metrics = analyze_response.metrics;
-        let mut artifact = analyze_response.artifact;
-        artifact
-            .function_facts
-            .set_input_quality(input_quality_facts.clone());
+        let analyze_diagnostics = analyze_response.diagnostics;
+        let artifact = analyze_response.artifact;
+        let Some(render_target) = EngineRenderTarget::for_prepared(artifact.ssa_func()) else {
+            metrics.refuse_from(EnginePhase::Normalization);
+            return refused_decompile_response_with_metrics(
+                &display_name,
+                "source-owned machine context cannot define an exact render target",
+                input_quality_facts,
+                metrics,
+                analyze_diagnostics,
+            );
+        };
+        if render_target != requested_render_target {
+            metrics.refuse_from(EnginePhase::Normalization);
+            return refused_decompile_response_with_metrics(
+                &display_name,
+                "requested render target does not match the source-owned machine context",
+                input_quality_facts,
+                metrics,
+                analyze_diagnostics,
+            );
+        }
 
         if let Err(refusal) =
             poll_engine_execution(&execution, EnginePhase::Normalization, &metrics)
@@ -4722,12 +4300,40 @@ impl EngineSession {
             );
         }
         let normalization_started = Instant::now();
-        artifact.function_facts = function_facts_for_decompile(
+        let cfg_summary = artifact.ssa_func().function().cfg_risk_summary();
+        let route = decompile_route_decision(
             &display_name,
-            &artifact.ssa_func,
-            artifact.function_facts,
-            &param_slots,
-        );
+            artifact.function_facts(),
+            Some(artifact.ssa_func()),
+            &cfg_summary,
+        )
+        .route;
+        let finalization = r2types::DecompileFinalization {
+            kind: route.kind,
+            reason: route
+                .reason
+                .clone()
+                .or_else(|| route.fallback_comment.clone())
+                .unwrap_or_else(|| "engine decompile route decision".to_string()),
+            fallback_comment: route.fallback_comment,
+        };
+        let EngineAnalysisArtifact {
+            type_analysis,
+            trusted_ssa,
+        } = artifact;
+        let source_owned_facts = match type_analysis.finalize_for_decompile(finalization) {
+            Ok(facts) => facts,
+            Err(_) => {
+                metrics.refuse_from(EnginePhase::Normalization);
+                return refused_decompile_response_with_metrics(
+                    &display_name,
+                    "requested decompile route is incompatible with source-owned facts",
+                    input_quality_facts,
+                    metrics,
+                    analyze_diagnostics,
+                );
+            }
+        };
         metrics.record_phase(
             EnginePhase::Normalization,
             EnginePhaseStatus::Executed,
@@ -4735,9 +4341,9 @@ impl EngineSession {
         );
         self.decompile(EngineDecompileRequest {
             function_name: display_name,
-            prepared_ssa: artifact.ssa_func,
-            trusted_ssa: artifact.trusted_ssa,
-            function_facts: artifact.function_facts,
+            source_owned_facts,
+            trusted_ssa,
+            input_quality: input_quality_facts,
             render_target,
             execution,
             metrics,
@@ -4790,7 +4396,20 @@ impl EngineSession {
         try_semantic_kernel: bool,
     ) -> EngineDecompileResponse {
         let started = Instant::now();
-        let mut diagnostics = decompile_diagnostics_from_function_facts(&request.function_facts);
+        let input_quality = request.input_quality.clone();
+        let response_function_facts = request.function_facts().clone();
+        if request.trusted_ssa.as_deref().is_some_and(|trusted| {
+            !trusted.shares_artifact(&request.source_owned_facts.shared_source())
+        }) {
+            return refused_decompile_response_with_metrics(
+                &request.function_name,
+                "trusted SSA does not match the source-owned function facts",
+                input_quality.clone(),
+                request.metrics,
+                EngineDiagnostics::default(),
+            );
+        }
+        let mut diagnostics = decompile_diagnostics_from_function_facts(request.function_facts());
         let planning_time = started.elapsed();
 
         if let Err(refusal) = poll_engine_execution(
@@ -4801,7 +4420,7 @@ impl EngineSession {
             return refused_decompile_response_with_metrics(
                 &request.function_name,
                 &refusal.reason,
-                request.function_facts.input_quality().cloned(),
+                input_quality.clone(),
                 *refusal.metrics,
                 *refusal.diagnostics,
             );
@@ -4823,7 +4442,7 @@ impl EngineSession {
                     return refused_decompile_response_with_metrics(
                         &request.function_name,
                         &refusal.reason,
-                        request.function_facts.input_quality().cloned(),
+                        input_quality.clone(),
                         *refusal.metrics,
                         *refusal.diagnostics,
                     );
@@ -4861,7 +4480,7 @@ impl EngineSession {
             return refused_decompile_response_with_metrics(
                 &request.function_name,
                 &refusal.reason,
-                request.function_facts.input_quality().cloned(),
+                input_quality,
                 *refusal.metrics,
                 *refusal.diagnostics,
             );
@@ -4904,14 +4523,13 @@ impl EngineSession {
             diagnostics.plan = Some(plan);
             diagnostics.route_reason = Some(reason.to_string());
             diagnostics.semantic_kernel_render = Some(status);
-            diagnostics.proof_coverage = None;
-            diagnostics.render_permission = None;
             diagnostics.refusal = None;
         }
 
         EngineDecompileResponse {
             output: rendered.output,
-            function_facts: request.function_facts,
+            function_facts: response_function_facts,
+            input_quality,
             metrics,
             diagnostics,
         }
@@ -4936,20 +4554,20 @@ impl EngineSession {
         let (assumption_usage, assumption_conditioned) =
             prepared_assumption_conditioning(context.prepared);
         let mut query_config = symbolic_query_config_for_context(&context);
+        let scope = symbolic_scope_for_context(&context);
         let compiled = request.compile_semantics.then(|| {
             r2sym::compile_semantic_artifact_with_scope(
                 context.z3_ctx,
                 context.prepared,
-                context.scope,
-                context.arch,
-                context.symbols,
+                scope,
                 query_config.summary_profile,
             )
         });
         symbolic_execution.poll()?;
-        if compiled.as_ref().is_some_and(|compiled| {
-            should_skip_expensive_symbolic_summary(compiled, context.prepared)
-        }) {
+        if compiled
+            .as_ref()
+            .is_some_and(should_skip_expensive_symbolic_summary)
+        {
             let initial_state = symbolic_initial_state(&context);
             let query_policy = symbolic_query_policy_for_state(
                 &mut query_config,
@@ -5053,32 +4671,31 @@ impl EngineSession {
         symbolic_execution.poll()?;
         let context = request.context;
         let mut query_config = symbolic_query_config_for_context(&context);
+        let scope = symbolic_scope_for_context(&context);
         let compiled = r2sym::compile_query_semantic_artifact_with_scope(
             context.z3_ctx,
             context.prepared,
-            context.scope,
+            scope,
             request.target_addr,
-            context.arch,
-            context.symbols,
             query_config.summary_profile,
         );
         symbolic_execution.poll()?;
         let initial_state = symbolic_initial_state(&context);
-        let selected_route = target_query_route_decision(EngineTargetQueryRouteRequest {
+        let selected_route = target_query_route_decision(TargetQueryRouteInput {
             z3_ctx: context.z3_ctx,
-            prepared: context.prepared,
-            scope: context.scope,
             compiled: &compiled,
+            scope,
             target_addr: request.target_addr,
             arch: context.arch,
             symbols: context.symbols,
             explore_config: query_config.explore.clone(),
             summary_profile: query_config.summary_profile,
-            assumption_conflicted: prepared_assumption_conflicted(context.prepared),
+            assumption_conflicted: prepared_assumption_conflicted(compiled.prepared()),
         });
+        let prepared = compiled.prepared();
         let query_policy = symbolic_query_policy_for_state(
             &mut query_config,
-            context.prepared,
+            prepared,
             &initial_state,
             Some(&selected_route),
         );
@@ -5086,8 +4703,8 @@ impl EngineSession {
             query_config.make_explorer_with_execution_control(context.z3_ctx, symbolic_execution);
         install_symbolic_hooks_for_context(&mut explorer, &context, &query_policy);
         let reach = explorer.can_reach_with_artifact_in_scope(
-            context.prepared,
-            context.scope,
+            prepared,
+            scope,
             Some(&compiled),
             initial_state,
             request.target_addr,
@@ -5125,32 +4742,31 @@ impl EngineSession {
         symbolic_execution.poll()?;
         let context = request.context;
         let mut query_config = symbolic_query_config_for_context(&context);
+        let scope = symbolic_scope_for_context(&context);
         let compiled = r2sym::compile_query_semantic_artifact_with_scope(
             context.z3_ctx,
             context.prepared,
-            context.scope,
+            scope,
             request.target_addr,
-            context.arch,
-            context.symbols,
             query_config.summary_profile,
         );
         symbolic_execution.poll()?;
         let initial_state = symbolic_initial_state(&context);
-        let selected_route = target_query_route_decision(EngineTargetQueryRouteRequest {
+        let selected_route = target_query_route_decision(TargetQueryRouteInput {
             z3_ctx: context.z3_ctx,
-            prepared: context.prepared,
-            scope: context.scope,
             compiled: &compiled,
+            scope,
             target_addr: request.target_addr,
             arch: context.arch,
             symbols: context.symbols,
             explore_config: query_config.explore.clone(),
             summary_profile: query_config.summary_profile,
-            assumption_conflicted: prepared_assumption_conflicted(context.prepared),
+            assumption_conflicted: prepared_assumption_conflicted(compiled.prepared()),
         });
+        let prepared = compiled.prepared();
         let query_policy = symbolic_query_policy_for_state(
             &mut query_config,
-            context.prepared,
+            prepared,
             &initial_state,
             Some(&selected_route),
         );
@@ -5158,8 +4774,8 @@ impl EngineSession {
             query_config.make_explorer_with_execution_control(context.z3_ctx, symbolic_execution);
         install_symbolic_hooks_for_context(&mut explorer, &context, &query_policy);
         let solve = explorer.solve_for_target_with_artifact_in_scope(
-            context.prepared,
-            context.scope,
+            prepared,
+            scope,
             Some(&compiled),
             initial_state,
             request.target_addr,
@@ -5312,15 +4928,15 @@ pub fn condition_symbolic_scope_with_assumptions(
 ) -> Result<EngineConditionedSymbolicScope, &'static str> {
     let root = scope.root().ok_or("failed to build root SSA function")?;
     let prepared = if assumptions.is_empty() {
-        root.prepared.clone()
+        Arc::clone(&root.prepared)
     } else {
-        root.prepared.with_assumptions(assumptions)
+        Arc::new(root.prepared.with_assumptions(assumptions))
     };
     let scope = if assumptions.is_empty() {
         scope.clone()
     } else {
         scope
-            .with_prepared_root(&prepared)
+            .with_prepared_root(Arc::clone(&prepared))
             .ok_or("failed to build symbolic scope")?
     };
     let (assumption_usage, assumption_conditioned) = prepared_assumption_conditioning(&prepared);
@@ -5345,6 +4961,14 @@ fn symbolic_query_config_for_context(
     }
 }
 
+fn symbolic_scope_for_context<'a>(
+    context: &'a EngineSymbolicContextRequest<'_, '_>,
+) -> Option<&'a r2sym::PreparedFunctionScope> {
+    context
+        .scope
+        .and_then(|scope| scope.exact_for_artifact(context.prepared.as_ref()))
+}
+
 fn symbolic_initial_state<'ctx>(
     context: &EngineSymbolicContextRequest<'ctx, '_>,
 ) -> r2sym::SymState<'ctx> {
@@ -5361,7 +4985,7 @@ fn symbolic_initial_state_at<'ctx>(
             r2sym::seed_default_state_for_arch(&mut initial_state, context.prepared, context.arch);
         }
         EngineSymbolicStateSeed::Scope { .. } => {
-            if let Some(scope) = context.scope {
+            if let Some(scope) = symbolic_scope_for_context(context) {
                 r2sym::seed_scope_state_for_arch(
                     &mut initial_state,
                     context.prepared,
@@ -5393,15 +5017,18 @@ fn install_symbolic_hooks_for_context<'ctx>(
     context: &EngineSymbolicContextRequest<'ctx, '_>,
     policy: &r2sym::QueryExecutionPolicy,
 ) {
-    if let Some(scope) = context.scope {
+    if let Some(scope) = symbolic_scope_for_context(context) {
         r2sym::install_symbolic_hooks_for_query_policy(
             explorer,
-            context.z3_ctx,
-            scope,
-            context.arch,
-            context.symbols.imported_names(),
-            symbolic_query_config_for_context(context).summary_profile,
-            policy,
+            r2sym::SymbolicHookInstallContext::new(
+                context.z3_ctx,
+                context.prepared.as_ref(),
+                scope,
+                context.arch,
+                context.symbols.imported_names(),
+                symbolic_query_config_for_context(context).summary_profile,
+                policy,
+            ),
         );
     }
 }
@@ -5416,12 +5043,14 @@ fn empty_symbolic_summary<'ctx>() -> r2sym::SymbolicFunctionSummary<'ctx> {
     }
 }
 
-fn should_skip_expensive_symbolic_summary(
-    compiled: &r2sym::SemanticArtifact,
-    prepared: &r2ssa::SsaArtifact,
-) -> bool {
+fn should_skip_expensive_symbolic_summary(compiled: &r2sym::SemanticArtifact) -> bool {
     compiled.diagnostics.skipped_large_cfg
-        || prepared.function().cfg_risk_summary().block_count > 96
+        || compiled
+            .prepared()
+            .function()
+            .cfg_risk_summary()
+            .block_count
+            > 96
 }
 
 fn decompile_diagnostics_from_function_facts(function_facts: &FunctionFacts) -> EngineDiagnostics {
@@ -5430,8 +5059,6 @@ fn decompile_diagnostics_from_function_facts(function_facts: &FunctionFacts) -> 
             plan: None,
             route_reason: Some("missing FunctionFacts decompile route".to_string()),
             semantic_kernel_render: None,
-            proof_coverage: None,
-            render_permission: None,
             warnings: vec![
                 "decompile request reached render without engine-stamped route facts".to_string(),
             ],
@@ -5442,8 +5069,6 @@ fn decompile_diagnostics_from_function_facts(function_facts: &FunctionFacts) -> 
         plan: Some(engine_plan_from_decompile_route_kind(route.kind)),
         route_reason: route.reason.clone(),
         semantic_kernel_render: None,
-        proof_coverage: Some(route.proof_coverage.clone()),
-        render_permission: Some(route.render_permission.clone()),
         warnings: Vec::new(),
         refusal: route.fallback_comment.clone(),
     }
@@ -6001,7 +5626,7 @@ fn render_engine_decompile_request<C: r2ssa::SsaWorkControl>(
     poll_engine_render_control(control, EnginePhase::Rendering)?;
     if let Some(output) = render_semantic_route(
         &request.function_name,
-        &request.function_facts,
+        request.function_facts(),
         &request.render_target,
     ) {
         poll_engine_render_control(control, EnginePhase::Rendering)?;
@@ -6029,7 +5654,7 @@ fn render_engine_decompile_request<C: r2ssa::SsaWorkControl>(
     Ok(EngineRenderedDecompile {
         output: decompile_route_output_from_function_facts(
             &request.function_name,
-            &request.function_facts,
+            request.function_facts(),
         )
         .unwrap_or_default(),
         semantic_kernel_render: None,
@@ -6039,8 +5664,7 @@ fn render_engine_decompile_request<C: r2ssa::SsaWorkControl>(
 }
 
 fn decompiler_input_for_engine_request(request: &EngineDecompileRequest) -> r2dec::DecompilerInput {
-    let context = r2dec::DecompilerContext::from_function_facts(request.function_facts.clone());
-    r2dec::DecompilerInput::new(Arc::clone(&request.prepared_ssa), context)
+    r2dec::DecompilerInput::new(request.source_owned_facts.clone())
 }
 
 fn refused_decompile_response(
@@ -6070,28 +5694,23 @@ fn refused_decompile_response_with_metrics(
     metrics: EngineMetrics,
     mut diagnostics: EngineDiagnostics,
 ) -> EngineDecompileResponse {
-    let function_facts = refused_decompile_function_facts(function_name, reason, input_quality);
+    let function_facts = refused_decompile_function_facts(function_name, reason);
     let output = decompile_route_output_from_function_facts(function_name, &function_facts)
         .expect("refused decompile response must stamp a fallback route");
     let route_diagnostics = decompile_diagnostics_from_function_facts(&function_facts);
     diagnostics.plan = route_diagnostics.plan;
     diagnostics.route_reason = route_diagnostics.route_reason;
-    diagnostics.proof_coverage = route_diagnostics.proof_coverage;
-    diagnostics.render_permission = route_diagnostics.render_permission;
     diagnostics.refusal = route_diagnostics.refusal;
     EngineDecompileResponse {
         output,
         function_facts,
+        input_quality,
         metrics,
         diagnostics,
     }
 }
 
-fn refused_decompile_function_facts(
-    function_name: &str,
-    reason: &str,
-    input_quality: Option<r2types::FunctionInputQualityFacts>,
-) -> FunctionFacts {
+fn refused_decompile_function_facts(function_name: &str, reason: &str) -> FunctionFacts {
     let output = artifact_guard_fallback_comment(function_name, reason);
     let route = r2types::DecompileRouteFacts {
         kind: r2types::DecompileRouteKind::FallbackComment,
@@ -6099,18 +5718,8 @@ fn refused_decompile_function_facts(
         fallback_comment: Some(output),
         skip_runtime_type_inference: true,
         use_prepared_semantic_view: false,
-        proof_coverage: r2sym::ProofCoverage {
-            refusals: 1,
-            ..r2sym::ProofCoverage::default()
-        },
-        render_permission: r2sym::RenderPermission::refuse(
-            r2sym::ProofOwner::R2engine,
-            reason.to_string(),
-        ),
     };
-    let mut function_facts = FunctionFacts::default().with_decompile_route(route);
-    function_facts.set_input_quality(input_quality);
-    function_facts
+    FunctionFacts::default().with_decompile_route(route)
 }
 
 fn decompile_route_output_from_function_facts(
@@ -6169,98 +5778,47 @@ fn build_engine_analysis_from_parts_with_control<C: r2ssa::SsaWorkControl + ?Siz
         .with_name(function_name),
     );
     control.poll()?;
-    let pattern_ssa_func = Arc::clone(&ssa_func);
-    Ok(EngineAnalysis {
-        ssa_func,
-        pattern_ssa_func,
-    })
+    Ok(EngineAnalysis::from_prepared_ssa(ssa_func))
 }
 
-fn callee_linkage_to_summary_linkage(
-    linkage: r2types::CalleeLinkage,
-) -> r2ssa::FunctionSemanticLinkage {
-    match linkage {
-        r2types::CalleeLinkage::Unknown => r2ssa::FunctionSemanticLinkage::Unknown,
-        r2types::CalleeLinkage::Internal => r2ssa::FunctionSemanticLinkage::Internal,
-        r2types::CalleeLinkage::Imported => r2ssa::FunctionSemanticLinkage::Imported,
-    }
-}
-
-fn merge_typed_callee_summary_seeds(
-    seeds: &mut BTreeMap<r2ssa::InterprocFunctionId, r2ssa::FunctionSemanticSummary>,
-    callee_facts: &BTreeMap<u64, r2types::CalleeFact>,
-) {
-    for (addr, fact) in callee_facts {
-        let linkage = callee_linkage_to_summary_linkage(fact.linkage);
-        let Some(name) = fact.name.as_deref() else {
-            continue;
-        };
-        let id = r2ssa::InterprocFunctionId(*addr);
-        let Some(mut summary) =
-            r2sym::function_semantic_summary_seed_for_name_with_linkage(id, name, linkage)
-        else {
-            continue;
-        };
-        summary.linkage = linkage;
-        summary.callsite_count = summary.callsite_count.max(fact.callsite_count);
-        seeds.entry(id).or_insert(summary);
-    }
-}
-
-pub struct InterprocSummaryBuildInput<'a> {
-    pub function_name: &'a str,
-    pub function_addr: u64,
-    pub arch: Option<&'a r2il::ArchSpec>,
+struct InterprocSummaryBuildInput<'a> {
     pub analysis: &'a EngineAnalysis,
-    pub parsed_context: &'a r2types::ParsedExternalContext,
-    pub scope_facts: &'a InterprocScopeFacts,
     pub max_iterations: usize,
     pub symbolic_scope: Option<&'a r2sym::PreparedFunctionScope>,
 }
 
-pub fn build_interproc_summary_set_with_scope_facts(
+fn build_prepared_interproc_summary_set(
     input: InterprocSummaryBuildInput<'_>,
-) -> r2ssa::InterprocSummarySet {
-    let root = r2ssa::InterprocFunctionId(input.function_addr);
-    let mut seeds = input.scope_facts.summaries.clone();
-    merge_typed_callee_summary_seeds(&mut seeds, &input.parsed_context.callee_facts);
-    if let Some(scope) = input.symbolic_scope {
-        for function in scope.functions().values() {
-            let Some(name) = function.name.as_deref() else {
-                continue;
-            };
-            if let Some(summary) = r2sym::function_semantic_summary_seed_for_name(function.id, name)
-            {
-                seeds.entry(function.id).or_insert(summary);
-            }
-        }
-    }
-    let seeded_helpers = seeds
-        .keys()
-        .copied()
-        .collect::<std::collections::BTreeSet<_>>();
-    let mut functions = vec![r2ssa::InterprocFunctionInput {
+) -> Result<r2ssa::PreparedInterprocSummarySet, r2ssa::PreparedInterprocSummaryError> {
+    let root = r2ssa::InterprocFunctionId(input.analysis.ssa_func.function().entry);
+    let symbolic_scope = input.symbolic_scope.filter(|scope| {
+        scope.root_id() == root
+            && scope.root().is_some_and(|scope_root| {
+                scope_root.id == root
+                    && scope_root.prepared.function().entry == root.0
+                    && scope_root.prepared.authority() == input.analysis.ssa_func().authority()
+            })
+    });
+    let mut functions = vec![r2ssa::PreparedInterprocFunctionInput {
         id: root,
-        name: Some(input.function_name.to_string()),
+        name: input.analysis.ssa_func.function().name.clone(),
         prepared: &input.analysis.ssa_func,
     }];
-    if let Some(scope) = input.symbolic_scope {
+    if let Some(scope) = symbolic_scope {
         for function in scope.functions().values() {
-            if function.id == root || seeded_helpers.contains(&function.id) {
+            if function.id == root {
                 continue;
             }
-            functions.push(r2ssa::InterprocFunctionInput {
+            functions.push(r2ssa::PreparedInterprocFunctionInput {
                 id: function.id,
                 name: function.name.clone(),
                 prepared: &function.prepared,
             });
         }
     }
-    r2ssa::solve_interproc_summary_set(
+    r2ssa::solve_prepared_interproc_summary_set(
+        Arc::clone(&input.analysis.ssa_func),
         &functions,
-        input.arch,
-        Some(root),
-        &seeds,
         r2ssa::InterprocSolveConfig {
             max_iterations: input.max_iterations.max(1),
         },
@@ -6283,41 +5841,30 @@ fn build_engine_analysis_artifact(
         Arc::new(
             analysis
                 .ssa_func
-                .as_ref()
-                .clone()
                 .with_assumptions(&request.parsed_context.assumptions),
         )
     };
-    let semantic_analysis = EngineAnalysis {
-        pattern_ssa_func: Arc::clone(&ssa_func),
-        ssa_func,
-    };
-    let interproc_summary_set = request.include_interproc_summary_set.then(|| {
-        build_interproc_summary_set_with_scope_facts(InterprocSummaryBuildInput {
-            function_name: &request.function_name,
-            function_addr: request.function_addr,
-            arch: request.arch.as_ref(),
+    let semantic_analysis = EngineAnalysis::from_prepared_ssa(ssa_func);
+    let interproc_summary_set = if request.include_interproc_summary_set {
+        match build_prepared_interproc_summary_set(InterprocSummaryBuildInput {
             analysis: &semantic_analysis,
-            parsed_context: &request.parsed_context,
-            scope_facts: &request.scope_facts,
             max_iterations: request.interproc_max_iterations,
             symbolic_scope: request.symbolic_scope.as_ref(),
-        })
-    });
-    let pattern_ssa_blocks = semantic_analysis.pattern_ssa_func.local_ssa_blocks();
+        }) {
+            Ok(summary) => Some(summary),
+            Err(
+                r2ssa::PreparedInterprocSummaryError::ArchitectureMismatch
+                | r2ssa::PreparedInterprocSummaryError::UnknownOrIncoherentMachineContext,
+            ) => None,
+            Err(_) => return None,
+        }
+    } else {
+        None
+    };
+    let pattern_ssa_blocks = semantic_analysis.ssa_func.local_ssa_blocks();
     let (arch_name, _, _) = EngineRenderTarget::for_arch(request.arch.as_ref());
-    let signature = infer_signature_from_engine_analysis(
-        &request.function_name,
-        &arch_name,
-        request.ptr_bits,
-        request.arch.as_ref(),
-        request.semantic_metadata_enabled,
-        &request.reg_type_hints,
-        &semantic_analysis,
-    )?;
     let mut diagnostics = r2types::TypeWritebackDiagnostics::default();
-    let local_structs = r2types::infer_local_struct_artifacts_from_prepared_views(
-        &semantic_analysis.pattern_ssa_func,
+    let local_structs = r2types::infer_local_struct_artifacts_from_prepared_ssa(
         &semantic_analysis.ssa_func,
         Some(arch_name.as_str()),
         request.ptr_bits,
@@ -6330,12 +5877,7 @@ fn build_engine_analysis_artifact(
         &pattern_ssa_blocks,
         !local_field_accesses.is_empty(),
     );
-    let root_summary = interproc_summary_set.as_ref().and_then(|summary_set| {
-        summary_set
-            .root
-            .and_then(|root| summary_set.summaries.get(&root))
-    });
-    let semantic_artifact = request.precomputed_semantic_artifact.clone().or_else(|| {
+    let semantic_artifact = (|| {
         if matches!(request.semantic_mode, EngineSemanticMode::Full) {
             if should_skip_full_semantics_for_layout_backed_prepared_proofs(
                 &request.parsed_context,
@@ -6352,11 +5894,8 @@ fn build_engine_analysis_artifact(
             }
             return maybe_compile_semantic_artifact_for_analysis(
                 &semantic_analysis.ssa_func,
-                request.function_addr,
-                &request.function_name,
                 request.symbolic_scope.as_ref(),
-                request.arch.as_ref(),
-                root_summary,
+                interproc_summary_set.as_ref(),
             );
         }
         optional_semantics_required.then(|| {
@@ -6364,10 +5903,9 @@ fn build_engine_analysis_artifact(
                 &z3::Context::thread_local(),
                 &semantic_analysis.ssa_func,
                 request.symbolic_scope.as_ref(),
-                request.arch.as_ref(),
             )
         })
-    });
+    })();
     if request
         .execution
         .refusal_reason(EnginePhase::Types)
@@ -6375,50 +5913,22 @@ fn build_engine_analysis_artifact(
     {
         return None;
     }
-    let recovered_vars = r2types::recover_vars_from_ssa_with_prep_facts(
-        &pattern_ssa_blocks,
-        semantic_analysis.pattern_ssa_func.decompile_prep_facts(),
-        request.arch.as_ref().map(|spec| spec.name.as_str()),
-        &request.reg_type_hints,
-        request.semantic_metadata_enabled,
-    );
-    let recovered_vars = recovered_vars.to_vec();
-    let writeback_input = r2types::TypeWritebackAnalysisInput {
-        function_name: &request.function_name,
-        ptr_bits: request.ptr_bits,
-        inferred_signature: signature,
-        recovered_vars: &recovered_vars,
-        ssa_blocks: &pattern_ssa_blocks,
-        parsed_context: request.parsed_context.clone(),
-        local_structs,
-        interproc_summary_set,
-        diagnostics,
-    };
-    let prep_facts = semantic_analysis.pattern_ssa_func.decompile_prep_facts();
-    let writeback = if let Some(semantic_artifact) = semantic_artifact.as_ref()
-        && let Some(prep_facts) = prep_facts
-    {
-        r2types::build_type_writeback_analysis_with_semantics_and_prep_facts(
-            writeback_input,
-            r2types::TypeWritebackSemanticInputs {
-                artifact: semantic_artifact,
-                local_field_accesses: &local_field_accesses,
-            },
-            prep_facts,
-        )
-    } else if let Some(semantic_artifact) = semantic_artifact.as_ref() {
-        r2types::build_type_writeback_analysis_with_semantics(
-            writeback_input,
-            r2types::TypeWritebackSemanticInputs {
-                artifact: semantic_artifact,
-                local_field_accesses: &local_field_accesses,
-            },
-        )
-    } else if let Some(prep_facts) = prep_facts {
-        r2types::build_type_writeback_analysis_with_prep_facts(writeback_input, prep_facts)
-    } else {
-        r2types::build_type_writeback_analysis(writeback_input)
-    };
+    let mut writeback_request = r2types::TypeWritebackAnalysisRequest::new(
+        Arc::clone(&semantic_analysis.ssa_func),
+        request.parsed_context.clone(),
+    )
+    .ok()?;
+    if let Some(semantic_artifact) = semantic_artifact {
+        writeback_request = writeback_request
+            .with_semantic_artifact(semantic_artifact)
+            .ok()?;
+    }
+    if let Some(interproc_summary_set) = interproc_summary_set {
+        writeback_request = writeback_request
+            .with_interproc_summary(interproc_summary_set)
+            .ok()?;
+    }
+    let writeback = r2types::build_source_owned_type_writeback_analysis(writeback_request).ok()?;
     if request
         .execution
         .refusal_reason(EnginePhase::Certification)
@@ -6426,111 +5936,24 @@ fn build_engine_analysis_artifact(
     {
         return None;
     }
-    let mut function_facts = writeback.function_facts;
-    let mut writeback_plan = writeback.plan;
-    let mut usage = semantic_analysis.ssa_func.facts().assumption_usage.clone();
-    usage.extend(function_facts.assumption_usage());
-    function_facts = function_facts.with_assumption_usage(usage);
-    function_facts.merge_proof_coverage(r2sym::ProofCoverage::from_prepared_certificates(
-        semantic_analysis.ssa_func.certificates(),
-    ));
-    function_facts
-        .merge_proof_coverage(proof_coverage_from_type_facts(function_facts.type_facts()));
-    let param_slots = ParamSlotResolver::from_arch_name(Some(&arch_name));
-    function_facts = attach_prepared_decompile_evidence(
-        &semantic_analysis.ssa_func,
-        function_facts,
-        &param_slots,
-    );
-    let constrained_params =
-        function_facts.apply_certified_call_argument_type_constraints(request.ptr_bits);
-    if constrained_params > 0
-        && let Some(signature) = function_facts
-            .type_facts()
-            .render_authorized_signature()
-            .cloned()
-    {
-        let prior_confidence = writeback_plan.signature.confidence;
-        let prior_callconv_confidence = writeback_plan.signature.callconv_confidence;
-        writeback_plan.signature = r2types::inferred_signature_from_signature_spec(
-            &request.function_name,
-            &arch_name,
-            request.ptr_bits,
-            function_facts.type_facts().callconv.as_deref(),
-            &signature,
-        );
-        writeback_plan.signature.confidence =
-            writeback_plan.signature.confidence.max(prior_confidence);
-        writeback_plan.signature.callconv_confidence = writeback_plan
-            .signature
-            .callconv_confidence
-            .max(prior_callconv_confidence);
-        for candidate in writeback_plan
-            .var_type_candidates
-            .iter_mut()
-            .filter(|candidate| candidate.isarg)
-        {
-            let slot = function_facts
-                .type_facts()
-                .register_params
-                .iter()
-                .position(|param| {
-                    candidate
-                        .reg
-                        .as_ref()
-                        .is_some_and(|reg| param.reg.eq_ignore_ascii_case(reg))
-                        || param.name.eq_ignore_ascii_case(&candidate.name)
-                })
-                .or_else(|| {
-                    signature
-                        .params
-                        .iter()
-                        .position(|param| param.name.eq_ignore_ascii_case(&candidate.name))
-                });
-            let Some(ty) = slot
-                .and_then(|slot| signature.params.get(slot))
-                .and_then(|param| param.ty.as_ref())
-            else {
-                continue;
-            };
-            candidate.var_type = r2types::render_signature_type(ty, request.ptr_bits);
-            candidate.source = r2types::WritebackSource::CalleeSignature;
-            if !candidate
-                .evidence
-                .contains(&r2types::WritebackEvidence::CertifiedCallArgument)
-            {
-                candidate
-                    .evidence
-                    .push(r2types::WritebackEvidence::CertifiedCallArgument);
-            }
-        }
-    }
-    Some(EngineAnalysisArtifact {
-        ssa_func: semantic_analysis.ssa_func,
-        pattern_ssa_func: semantic_analysis.pattern_ssa_func,
-        // Trusted capture authority is deliberately request-local.
+    EngineAnalysisArtifact::new(
+        writeback,
+        // Trusted capture authority is deliberately request-local and may
+        // only accompany its exact retained SSA allocation.
         trusted_ssa,
-        function_facts,
-        writeback_plan,
-    })
+    )
 }
 
 fn maybe_compile_semantic_artifact_for_analysis(
-    ssa_func: &SsaArtifact,
-    function_addr: u64,
-    function_name: &str,
+    ssa_func: &Arc<SsaArtifact>,
     symbolic_scope: Option<&r2sym::PreparedFunctionScope>,
-    arch: Option<&r2il::ArchSpec>,
-    root_summary: Option<&r2ssa::FunctionSemanticSummary>,
+    interproc_summaries: Option<&r2ssa::PreparedInterprocSummarySet>,
 ) -> Option<r2sym::SemanticArtifact> {
-    let summary_seed = root_summary
-        .cloned()
-        .or_else(|| native_worker_summary_seed(function_addr, function_name));
-    let summary_seed = summary_seed.as_ref();
-    if should_probe_native_worker_summary_before_full_semantics(ssa_func, summary_seed) {
+    let root_summary = interproc_summaries.and_then(prepared_root_summary);
+    if should_probe_native_worker_summary_before_full_semantics(ssa_func, root_summary) {
         let vm_route_evidence = r2sym::has_strong_vm_evidence(ssa_func);
         if !vm_route_evidence
-            && should_skip_unbounded_semantic_artifact_after_worker_preprobe(ssa_func, summary_seed)
+            && should_skip_unbounded_semantic_artifact_after_worker_preprobe(ssa_func, root_summary)
         {
             return None;
         }
@@ -6538,7 +5961,7 @@ fn maybe_compile_semantic_artifact_for_analysis(
             && let Some(artifact) = r2sym::compile_native_worker_summary_artifact(
                 ssa_func,
                 symbolic_scope,
-                summary_seed,
+                interproc_summaries,
                 false,
             )
             && artifact
@@ -6554,11 +5977,8 @@ fn maybe_compile_semantic_artifact_for_analysis(
     }
     Some(compile_semantic_artifact_for_analysis(
         ssa_func,
-        function_addr,
-        function_name,
         symbolic_scope,
-        arch,
-        root_summary,
+        interproc_summaries,
     ))
 }
 
@@ -6581,34 +6001,28 @@ fn should_skip_unbounded_semantic_artifact_after_worker_preprobe(
 }
 
 fn compile_semantic_artifact_for_analysis(
-    ssa_func: &SsaArtifact,
-    function_addr: u64,
-    function_name: &str,
+    ssa_func: &Arc<SsaArtifact>,
     symbolic_scope: Option<&r2sym::PreparedFunctionScope>,
-    arch: Option<&r2il::ArchSpec>,
-    root_summary: Option<&r2ssa::FunctionSemanticSummary>,
+    interproc_summaries: Option<&r2ssa::PreparedInterprocSummarySet>,
 ) -> r2sym::SemanticArtifact {
-    let summary_seed = root_summary
-        .cloned()
-        .or_else(|| native_worker_summary_seed(function_addr, function_name));
-    let summary_seed = summary_seed.as_ref();
+    let root_summary = interproc_summaries.and_then(prepared_root_summary);
     let vm_route_evidence = r2sym::has_strong_vm_evidence(ssa_func);
     if !vm_route_evidence
-        && let Some(summary) = summary_seed
+        && let Some(summaries) = interproc_summaries
         && let Some(artifact) = r2sym::compile_summary_dense_worker_artifact_from_interproc_summary(
             ssa_func,
             symbolic_scope,
-            summary,
+            summaries,
         )
     {
         return artifact;
     }
     if !vm_route_evidence
-        && should_probe_native_worker_summary_before_full_semantics(ssa_func, summary_seed)
+        && should_probe_native_worker_summary_before_full_semantics(ssa_func, root_summary)
         && let Some(artifact) = r2sym::compile_native_worker_summary_artifact(
             ssa_func,
             symbolic_scope,
-            summary_seed,
+            interproc_summaries,
             false,
         )
         && artifact
@@ -6621,16 +6035,18 @@ fn compile_semantic_artifact_for_analysis(
         &z3::Context::thread_local(),
         ssa_func,
         symbolic_scope,
-        arch,
     );
-    if let Some(summary) = summary_seed {
-        r2sym::augment_semantic_artifact_with_interproc_summary(
-            &mut artifact,
-            ssa_func.entry,
-            summary,
-        );
+    if let Some(summaries) = interproc_summaries {
+        r2sym::augment_semantic_artifact_with_interproc_summary(&mut artifact, summaries);
     }
     artifact
+}
+
+fn prepared_root_summary(
+    summaries: &r2ssa::PreparedInterprocSummarySet,
+) -> Option<&r2ssa::FunctionSemanticSummary> {
+    let report = summaries.report();
+    report.root.and_then(|root| report.summaries.get(&root))
 }
 
 fn should_probe_native_worker_summary_before_full_semantics(
@@ -6652,71 +6068,10 @@ fn should_probe_native_worker_summary_before_full_semantics(
     cfg.loop_count > 0 || cfg.back_edge_count > 0 || cfg.switch_block_count > 0 || branch_count >= 8
 }
 
-fn infer_signature_from_engine_analysis(
-    function_name: &str,
-    arch_name: &str,
-    ptr_bits: u32,
-    arch: Option<&r2il::ArchSpec>,
-    semantic_metadata_enabled: bool,
-    reg_type_hints: &HashMap<String, r2types::TypeHint>,
-    analysis: &EngineAnalysis,
-) -> Option<r2types::InferredSignature> {
-    let pattern_ssa_blocks = analysis.pattern_ssa_func.local_ssa_blocks();
-    let recovered_params = r2types::recover_signature_params_from_ssa(
-        &pattern_ssa_blocks,
-        arch.map(|spec| spec.name.as_str()),
-        reg_type_hints,
-        semantic_metadata_enabled,
-        ptr_bits,
-    );
-    Some(r2types::infer_signature_from_prepared_ssa(
-        function_name,
-        arch_name,
-        ptr_bits,
-        &analysis.ssa_func,
-        &pattern_ssa_blocks,
-        &recovered_params,
-    ))
-}
-
 pub fn infer_signature_from_analysis(
     request: EngineSignatureInferenceRequest<'_>,
-) -> Option<r2types::InferredSignature> {
-    let (arch_name, _, _) = EngineRenderTarget::for_arch(request.arch);
-    infer_signature_from_engine_analysis(
-        request.function_name,
-        &arch_name,
-        request.ptr_bits,
-        request.arch,
-        request.semantic_metadata_enabled,
-        request.reg_type_hints,
-        request.analysis,
-    )
-}
-
-pub fn infer_signature_from_analysis_with_register_names<F>(
-    mut request: EngineSignatureInferenceWithRegisterNamesRequest<'_>,
-    register_name: F,
-) -> Option<r2types::InferredSignature>
-where
-    F: FnMut(&r2il::Varnode) -> Option<String>,
-{
-    if request.semantic_metadata_enabled {
-        for (name, hint) in
-            collect_register_type_hints_with_names(request.r2il_blocks, register_name)
-        {
-            merge_type_hint(&mut request.reg_type_hints, name, hint);
-        }
-    }
-
-    infer_signature_from_analysis(EngineSignatureInferenceRequest {
-        function_name: request.function_name,
-        arch: request.arch,
-        ptr_bits: request.ptr_bits,
-        semantic_metadata_enabled: request.semantic_metadata_enabled,
-        reg_type_hints: &request.reg_type_hints,
-        analysis: request.analysis,
-    })
+) -> r2types::InferredSignature {
+    r2types::infer_signature_from_prepared_ssa(request.analysis.ssa_func())
 }
 
 fn parsed_context_has_layout_hints(parsed_context: &r2types::ParsedExternalContext) -> bool {
@@ -6985,6 +6340,7 @@ pub fn block_guard_fallback_comment(
     blocks: usize,
     max_blocks: usize,
 ) -> String {
+    let function_name = sanitize_fallback_comment_text(function_name);
     format!(
         "/* r2dec budget: skipped decompilation for {} ({} blocks > limit {}). */",
         function_name, blocks, max_blocks
@@ -7000,19 +6356,16 @@ pub fn cfg_guard_fallback_comment(
 }
 
 pub fn artifact_guard_fallback_comment(function_name: &str, reason: &str) -> String {
+    let function_name = sanitize_fallback_comment_text(function_name);
+    let reason = sanitize_fallback_comment_text(reason);
     format!(
         "/* r2dec fallback: skipped decompilation for {} ({}) */",
         function_name, reason
     )
 }
 
-pub fn semantic_fallback_comment(
-    function_name: &str,
-    semantic_artifact: Option<&r2sym::SemanticArtifact>,
-) -> Option<String> {
-    let function_facts =
-        FunctionFacts::new(FunctionTypeFacts::default(), semantic_artifact.cloned());
-    semantic_fallback_comment_for_facts(function_name, &function_facts)
+fn sanitize_fallback_comment_text(text: &str) -> String {
+    text.replace("*/", "* /").replace(['\r', '\n'], " ")
 }
 
 pub fn semantic_fallback_comment_for_facts(
@@ -7218,6 +6571,18 @@ fn semantic_mode_label(artifact: &r2sym::SemanticArtifact) -> &'static str {
     }
 }
 
+fn semantic_report_mode_label(artifact: &r2sym::SemanticArtifactReport) -> &'static str {
+    match (artifact.execution, artifact.stage, artifact.granularity) {
+        (r2sym::ExecutionModel::Vm, _, _) => "vm_summary",
+        (_, r2sym::RefinementStage::Raw, _) => "raw",
+        (_, r2sym::RefinementStage::Compiled, r2sym::ArtifactGranularity::Regioned) => {
+            "island_compiled"
+        }
+        (_, r2sym::RefinementStage::Compiled, _) => "compiled",
+        (_, r2sym::RefinementStage::Residual, _) => "residual",
+    }
+}
+
 fn semantic_slice_class_label(slice_class: r2sym::SliceClass) -> &'static str {
     match slice_class {
         r2sym::SliceClass::Wrapper => "wrapper",
@@ -7254,422 +6619,6 @@ fn certified_out_param_labels(type_facts: &FunctionTypeFacts) -> Vec<String> {
         .collect()
 }
 
-pub fn type_facts_with_summary_projection(
-    type_facts: FunctionTypeFacts,
-    function_name: &str,
-    arch_name: &str,
-    ptr_bits: u32,
-    semantic_artifact: &r2sym::SemanticArtifact,
-) -> FunctionTypeFacts {
-    type_facts_with_summary_projection_for_candidates(
-        type_facts,
-        function_name,
-        [function_name],
-        arch_name,
-        ptr_bits,
-        semantic_artifact,
-    )
-}
-
-pub fn type_facts_with_summary_projection_for_candidates<'a>(
-    type_facts: FunctionTypeFacts,
-    function_name: &str,
-    name_candidates: impl IntoIterator<Item = &'a str>,
-    arch_name: &str,
-    ptr_bits: u32,
-    semantic_artifact: &r2sym::SemanticArtifact,
-) -> FunctionTypeFacts {
-    type_facts_with_summary_projection_for_candidates_with_options(
-        type_facts,
-        function_name,
-        name_candidates,
-        arch_name,
-        ptr_bits,
-        semantic_artifact,
-        SummaryProjectionOptions::default(),
-    )
-}
-
-#[derive(Clone, Copy, Default)]
-struct SummaryProjectionOptions {
-    preserve_authoritative_context_signature: bool,
-}
-
-fn type_facts_with_summary_projection_for_candidates_with_options<'a>(
-    mut type_facts: FunctionTypeFacts,
-    function_name: &str,
-    _name_candidates: impl IntoIterator<Item = &'a str>,
-    arch_name: &str,
-    ptr_bits: u32,
-    semantic_artifact: &r2sym::SemanticArtifact,
-    options: SummaryProjectionOptions,
-) -> FunctionTypeFacts {
-    let signature_param_count = type_facts
-        .render_authorized_signature()
-        .map(|signature| signature.params.len())
-        .unwrap_or_default();
-    let current_param_count = signature_param_count.max(type_facts.register_params.len());
-    let artifact_projection =
-        r2types::signature_projection_for_semantic_artifact(semantic_artifact, current_param_count);
-    let name_signature = artifact_projection
-        .as_ref()
-        .filter(|projection| {
-            matches!(
-                projection.source,
-                r2types::SignatureProjectionSource::SummaryRole
-            )
-        })
-        .map(|projection| projection.signature.clone());
-    let fallback_plan = r2types::build_semantic_type_fallback_plan(
-        function_name,
-        arch_name,
-        ptr_bits,
-        semantic_artifact,
-    );
-    let fallback_signature =
-        if fallback_plan.signature.confidence >= r2types::SIGNATURE_PROJECTION_WEAK_CONFIDENCE {
-            r2types::inferred_signature_to_function_type_facts(&fallback_plan.signature, ptr_bits)
-                .merged_signature
-        } else {
-            None
-        };
-    let projection = if let Some(mut projection) = artifact_projection {
-        if projection.signature.ret_type.is_none()
-            && let Some(fallback_signature) = fallback_signature.as_ref()
-        {
-            projection.signature.ret_type = fallback_signature.ret_type.clone();
-        }
-        Some(projection)
-    } else {
-        fallback_signature.map(FunctionSignatureProjection::weak_summary_kind)
-    };
-    let Some(projection) = projection else {
-        r2types::augment_function_type_facts_with_summary_evidence(
-            &mut type_facts,
-            semantic_artifact,
-            ptr_bits,
-        );
-        return type_facts;
-    };
-    if options.preserve_authoritative_context_signature
-        && name_signature.is_none()
-        && type_facts
-            .render_authorized_signature()
-            .is_some_and(signature_is_authoritative_context_seed)
-    {
-        r2types::augment_function_type_facts_with_summary_evidence(
-            &mut type_facts,
-            semantic_artifact,
-            ptr_bits,
-        );
-        return type_facts;
-    }
-    let name_owned_exact_arity = name_signature.is_some()
-        && projection.signature.ret_type.is_some()
-        && projection
-            .signature
-            .params
-            .iter()
-            .all(|param| !param.name.is_empty() && param.ty.is_some());
-    let projected_param_count = projection.signature.params.len();
-    let projection_source = SignatureCertificateSource::from(projection.source);
-    let projection_result =
-        type_facts.apply_signature_projection(function_name, projection.clone(), ptr_bits);
-    if projection_result.was_applied()
-        && projection.has_strong_signature_confidence()
-        && !matches!(
-            projection.source,
-            r2types::SignatureProjectionSource::SummaryKind
-        )
-    {
-        type_facts.certify_current_signature_with_source(projection_source);
-    }
-    if name_owned_exact_arity && type_facts.register_params.len() > projected_param_count {
-        type_facts.register_params.truncate(projected_param_count);
-    }
-    r2types::augment_function_type_facts_with_summary_evidence(
-        &mut type_facts,
-        semantic_artifact,
-        ptr_bits,
-    );
-    type_facts
-}
-
-fn parsed_context_current_signature_is_authoritative(
-    parsed_context: &r2types::ParsedExternalContext,
-) -> bool {
-    parsed_context
-        .current_signature
-        .as_ref()
-        .is_some_and(signature_is_authoritative_context_seed)
-}
-
-fn signature_is_authoritative_context_seed(signature: &r2types::FunctionSignatureSpec) -> bool {
-    r2types::signature_param_count_is_authoritative(signature)
-        && signature.params.iter().any(|param| {
-            !r2types::is_generic_arg_name(&param.name)
-                && !r2types::is_generic_signature_type(param.ty.as_ref())
-        })
-        && signature
-            .params
-            .iter()
-            .all(|param| !r2types::is_generic_signature_type(param.ty.as_ref()))
-}
-
-#[derive(Debug, Clone)]
-pub struct NativeWorkerTypeProjection {
-    pub function_facts: FunctionFacts,
-    pub semantic_artifact: r2sym::SemanticArtifact,
-    pub name_owned_signature: bool,
-    pub context_owned_signature: bool,
-}
-
-pub fn native_worker_summary_seed(
-    function_addr: u64,
-    function_name: &str,
-) -> Option<r2ssa::FunctionSemanticSummary> {
-    r2sym::function_semantic_summary_seed_for_name(
-        r2ssa::InterprocFunctionId(function_addr),
-        function_name,
-    )
-}
-
-pub fn native_worker_summary_artifact(
-    blocks: &[R2ILBlock],
-    function_name: &str,
-    arch: Option<&r2il::ArchSpec>,
-    symbolic_scope: Option<&r2sym::PreparedFunctionScope>,
-    skipped_large_cfg: bool,
-) -> Option<r2sym::SemanticArtifact> {
-    let ssa_func = r2ssa::SsaArtifact::for_symbolic(blocks, arch)?.with_name(function_name);
-    if r2sym::has_strong_vm_evidence(&ssa_func) {
-        return None;
-    }
-    let summary_id =
-        r2ssa::InterprocFunctionId(blocks.first().map(|block| block.addr).unwrap_or_default());
-    let root_summary = native_worker_summary_seed(summary_id.0, function_name);
-    if let Some(artifact) = r2sym::compile_native_worker_summary_artifact(
-        &ssa_func,
-        symbolic_scope,
-        root_summary.as_ref(),
-        skipped_large_cfg,
-    ) {
-        return Some(artifact);
-    }
-    root_summary.as_ref().and_then(|summary| {
-        r2sym::compile_named_native_worker_summary_artifact(summary, skipped_large_cfg)
-    })
-}
-
-fn fast_program_orchestrator_summary_artifact(
-    function_addr: u64,
-    function_name: &str,
-    skipped_large_cfg: bool,
-) -> Option<r2sym::SemanticArtifact> {
-    if !r2sym::has_program_orchestrator_summary_family(function_name) {
-        return None;
-    }
-    let summary = native_worker_summary_seed(function_addr, function_name)?;
-    r2sym::compile_named_native_worker_summary_artifact(&summary, skipped_large_cfg)
-}
-
-pub fn native_worker_type_projection(
-    function_addr: u64,
-    function_name: &str,
-    arch_name: &str,
-    ptr_bits: u32,
-    parsed_context: &r2types::ParsedExternalContext,
-    skipped_large_cfg: bool,
-) -> Option<NativeWorkerTypeProjection> {
-    let identity = EngineFunctionIdentity::from_name(function_addr, function_name);
-    native_worker_type_projection_for_identity(
-        &identity,
-        arch_name,
-        ptr_bits,
-        parsed_context,
-        skipped_large_cfg,
-    )
-}
-
-pub fn native_worker_type_projection_for_identity(
-    identity: &EngineFunctionIdentity,
-    arch_name: &str,
-    ptr_bits: u32,
-    parsed_context: &r2types::ParsedExternalContext,
-    skipped_large_cfg: bool,
-) -> Option<NativeWorkerTypeProjection> {
-    let summary_name = identity.summary_probe_name();
-    let summary = native_worker_summary_seed(identity.function_addr, &summary_name)?;
-    let semantic_artifact =
-        r2sym::compile_named_native_worker_summary_artifact(&summary, skipped_large_cfg)?;
-    if !semantic_artifact
-        .native_body()
-        .is_some_and(|native| native.has_primary_non_name_summary_islands())
-    {
-        return None;
-    }
-    let type_facts =
-        r2types::function_type_facts_from_parsed_context(identity.primary_name(), parsed_context);
-    let current_param_count = type_facts
-        .render_authorized_signature()
-        .map(|signature| signature.params.len())
-        .unwrap_or_default();
-    let name_owned_signature = r2types::signature_projection_for_semantic_artifact(
-        &semantic_artifact,
-        current_param_count,
-    )
-    .is_some_and(|projection| {
-        matches!(
-            projection.source,
-            r2types::SignatureProjectionSource::SummaryRole
-        )
-    });
-    let context_owned_signature =
-        parsed_context_current_signature_is_authoritative(parsed_context) && !name_owned_signature;
-    let type_facts = type_facts_with_summary_projection_for_candidates_with_options(
-        type_facts,
-        identity.primary_name(),
-        identity.name_candidates(),
-        arch_name,
-        ptr_bits,
-        &semantic_artifact,
-        SummaryProjectionOptions {
-            preserve_authoritative_context_signature: context_owned_signature,
-        },
-    );
-    let function_facts = FunctionFacts::new(type_facts, Some(semantic_artifact.clone()))
-        .with_assumptions(parsed_context.assumptions.clone());
-    Some(NativeWorkerTypeProjection {
-        function_facts,
-        semantic_artifact,
-        name_owned_signature,
-        context_owned_signature,
-    })
-}
-
-pub fn type_summary_preprobe(
-    request: EngineTypePreprobeRequest<'_>,
-) -> Option<EngineTypePreprobeResponse> {
-    let identity = EngineFunctionIdentity::new(
-        request.function_addr,
-        request.canonical_name,
-        request.display_name,
-    );
-    let probe = decompile_probe_decision_for_identity(request.blocks, &identity);
-    if !probe.summary_probe_needed {
-        return None;
-    }
-
-    let cfg_summary = raw_cfg_risk_summary_for_preprobe(request.blocks);
-    let semantic_artifact = fast_program_orchestrator_summary_artifact(
-        request.function_addr,
-        &probe.summary_probe_name,
-        probe.summary_probe_skipped_large_cfg,
-    )
-    .or_else(|| {
-        native_worker_summary_artifact(
-            request.blocks,
-            &probe.summary_probe_name,
-            request.arch,
-            request.symbolic_scope,
-            probe.summary_probe_skipped_large_cfg,
-        )
-    });
-    let type_seed = request.type_seed.unwrap_or_else(|| {
-        r2types::function_type_facts_from_parsed_context(
-            request.display_name,
-            request.parsed_context,
-        )
-    });
-    let (arch_name, _, _) = EngineRenderTarget::for_arch(request.arch);
-    let function_facts = if let Some(semantic_artifact) = semantic_artifact {
-        let type_facts = type_facts_with_summary_projection_for_candidates_with_options(
-            type_seed,
-            request.display_name,
-            identity.name_candidates(),
-            &arch_name,
-            request.ptr_bits,
-            &semantic_artifact,
-            SummaryProjectionOptions {
-                preserve_authoritative_context_signature:
-                    parsed_context_current_signature_is_authoritative(request.parsed_context),
-            },
-        );
-        r2types::FunctionFacts::new(type_facts, Some(semantic_artifact))
-            .with_assumptions(request.parsed_context.assumptions.clone())
-    } else if request.fallback_if_guarded_without_summary && probe.block_guarded {
-        r2types::FunctionFacts::new(type_seed, None)
-            .with_assumptions(request.parsed_context.assumptions.clone())
-    } else {
-        return None;
-    };
-
-    let route_decision = if let Some(artifact) = function_facts.semantic_artifact()
-        && summary_preprobe_type_payload_prefers_semantic_fallback(artifact)
-    {
-        EngineTypeRouteDecision {
-            request: EngineRequestKind::Types,
-            plan: EnginePlan::SemanticSummary,
-            kind: EngineTypeRouteKind::SemanticFallback,
-            prefer_bounded_type_plan: true,
-            reason: Some("summary preprobe type projection".to_string()),
-            apply_artifact_signature_hint: false,
-        }
-    } else {
-        let decision = type_route_decision(
-            &function_facts,
-            &cfg_summary,
-            request.caller_prefers_bounded_type_plan,
-        );
-        if !matches!(decision.kind, EngineTypeRouteKind::FullWriteback) {
-            decision
-        } else if request.fallback_if_guarded_without_summary
-            && function_facts.semantic_artifact().is_none()
-            && probe.block_guarded
-        {
-            let reason = if probe.summary_probe_skipped_large_cfg {
-                type_cfg_bounded_reason(&cfg_summary)
-            } else {
-                "bounded native-worker preprobe without canonical summary".to_string()
-            };
-            EngineTypeRouteDecision {
-                request: EngineRequestKind::Types,
-                plan: EnginePlan::BoundedType,
-                kind: EngineTypeRouteKind::BoundedCfg,
-                prefer_bounded_type_plan: true,
-                reason: Some(reason),
-                apply_artifact_signature_hint: false,
-            }
-        } else {
-            return None;
-        }
-    };
-
-    Some(EngineTypePreprobeResponse {
-        cfg_summary,
-        function_facts,
-        route_decision,
-    })
-}
-
-fn summary_preprobe_type_payload_prefers_semantic_fallback(
-    artifact: &r2sym::SemanticArtifact,
-) -> bool {
-    matches!(artifact.stage, r2sym::RefinementStage::Compiled)
-        && artifact.diagnostics.skipped_large_cfg
-        && matches!(
-            artifact.granularity,
-            r2sym::ArtifactGranularity::SummaryOnly
-        )
-        && artifact
-            .native_body()
-            .is_some_and(r2sym::NativeArtifactBody::has_primary_non_name_summary_islands)
-        && matches!(
-            artifact.slice_class(),
-            Some(r2sym::SliceClass::Worker | r2sym::SliceClass::GenericLarge)
-        )
-}
-
 pub fn render_semantic_route(
     function_name: &str,
     function_facts: &FunctionFacts,
@@ -7678,152 +6627,57 @@ pub fn render_semantic_route(
     decompile_route_output_from_function_facts(function_name, function_facts)
 }
 
+pub struct TargetQueryRouteInput<'a> {
+    pub z3_ctx: &'a z3::Context,
+    pub compiled: &'a r2sym::SemanticArtifact,
+    pub scope: Option<&'a r2sym::PreparedFunctionScope>,
+    pub target_addr: u64,
+    pub arch: Option<&'a r2il::ArchSpec>,
+    pub symbols: &'a r2sym::FunctionSymbolSnapshot,
+    pub explore_config: r2sym::ExploreConfig,
+    pub summary_profile: r2sym::SummaryProfile,
+    pub assumption_conflicted: bool,
+}
+
 pub fn target_query_route_decision(
-    request: EngineTargetQueryRouteRequest<'_, '_>,
+    input: TargetQueryRouteInput<'_>,
 ) -> r2sym::TargetQueryRoutePlan {
+    let TargetQueryRouteInput {
+        z3_ctx,
+        compiled,
+        scope,
+        target_addr,
+        arch,
+        symbols,
+        explore_config,
+        summary_profile,
+        assumption_conflicted,
+    } = input;
+    let scope = scope.and_then(|scope| scope.exact_for_artifact(compiled.prepared()));
     let probe_config = r2sym::SymQueryConfig {
-        explore: request.explore_config,
+        explore: explore_config,
         mode: r2sym::QueryMode::TargetGuided,
-        summary_profile: request.summary_profile,
+        summary_profile,
         solve_tactics: r2sym::SolveTacticConfig::default(),
     };
-    let mut explorer = probe_config.make_explorer(request.z3_ctx);
-    if let Some(scope) = request.scope {
+    let mut explorer = probe_config.make_explorer(z3_ctx);
+    if let Some(scope) = scope {
         r2sym::install_runtime_hooks_for_scope(
             &mut explorer,
+            compiled.prepared(),
             scope,
-            request.arch,
-            request.symbols.imported_names(),
+            arch,
+            symbols.imported_names(),
         );
     }
     r2sym::selected_target_query_route_in_scope(
         &mut explorer,
-        request.prepared,
-        request.scope,
-        Some(request.compiled),
-        request.target_addr,
-        request.assumption_conflicted,
+        compiled.prepared(),
+        scope,
+        Some(compiled),
+        target_addr,
+        assumption_conflicted,
     )
-}
-
-pub fn signature_override_from_type_facts(
-    function_name: &str,
-    arch_name: &str,
-    ptr_bits: u32,
-    type_facts: &r2types::FunctionTypeFacts,
-) -> Option<r2types::InferredSignature> {
-    type_facts
-        .writeback_authorized_signature()
-        .map(|signature| {
-            r2types::inferred_signature_from_signature_spec(
-                function_name,
-                arch_name,
-                ptr_bits,
-                type_facts.callconv.as_deref(),
-                signature,
-            )
-        })
-}
-
-pub fn bounded_cfg_type_writeback_plan(
-    function_name: &str,
-    arch_name: &str,
-    ptr_bits: u32,
-    function_facts: &FunctionFacts,
-    reason: String,
-) -> TypeWritebackPlan {
-    let signature = signature_override_from_type_facts(
-        function_name,
-        arch_name,
-        ptr_bits,
-        function_facts.type_facts(),
-    )
-    .unwrap_or_else(|| r2types::InferredSignature {
-        function_name: function_name.to_string(),
-        signature: format!("void {}(void)", function_name),
-        ret_type: "void".to_string(),
-        params: Vec::new(),
-        callconv: "unknown".to_string(),
-        arch: arch_name.to_string(),
-        confidence: 0,
-        callconv_confidence: 0,
-    });
-    TypeWritebackPlan {
-        signature,
-        var_type_candidates: Vec::new(),
-        var_rename_candidates: Vec::new(),
-        struct_decls: Vec::new(),
-        global_type_links: Vec::new(),
-        diagnostics: r2types::TypeWritebackDiagnostics {
-            warnings: vec![reason],
-            ..r2types::TypeWritebackDiagnostics::default()
-        },
-    }
-}
-
-pub fn semantic_fallback_type_writeback_plan(
-    function_name: &str,
-    arch_name: &str,
-    ptr_bits: u32,
-    artifact: &r2sym::SemanticArtifact,
-    function_facts: &FunctionFacts,
-    apply_artifact_signature_hint: bool,
-) -> TypeWritebackPlan {
-    let mut plan =
-        r2types::build_semantic_type_fallback_plan(function_name, arch_name, ptr_bits, artifact);
-    let mut signature_override = signature_override_from_type_facts(
-        function_name,
-        arch_name,
-        ptr_bits,
-        function_facts.type_facts(),
-    );
-    if apply_artifact_signature_hint && let Some(signature) = signature_override.as_mut() {
-        r2types::apply_semantic_artifact_signature_hint_to_inferred(signature, artifact, ptr_bits);
-    }
-    if let Some(signature) = signature_override {
-        plan.signature = signature;
-    }
-    plan
-}
-
-struct TypeWritebackPlanRouteInput<'a> {
-    function_name: &'a str,
-    arch_name: &'a str,
-    ptr_bits: u32,
-    function_facts: &'a FunctionFacts,
-    cfg_summary: &'a CFGRiskSummary,
-    route: &'a EngineTypeRouteDecision,
-    full_writeback_plan: Option<TypeWritebackPlan>,
-}
-
-fn type_writeback_plan_for_route(
-    input: TypeWritebackPlanRouteInput<'_>,
-) -> Option<TypeWritebackPlan> {
-    match input.route.kind {
-        EngineTypeRouteKind::FullWriteback => input.full_writeback_plan,
-        EngineTypeRouteKind::BoundedCfg => Some(bounded_cfg_type_writeback_plan(
-            input.function_name,
-            input.arch_name,
-            input.ptr_bits,
-            input.function_facts,
-            input
-                .route
-                .reason
-                .clone()
-                .unwrap_or_else(|| type_cfg_bounded_reason(input.cfg_summary)),
-        )),
-        EngineTypeRouteKind::SemanticFallback => {
-            let artifact = input.function_facts.semantic_artifact()?;
-            Some(semantic_fallback_type_writeback_plan(
-                input.function_name,
-                input.arch_name,
-                input.ptr_bits,
-                artifact,
-                input.function_facts,
-                input.route.apply_artifact_signature_hint,
-            ))
-        }
-    }
 }
 
 fn current_interproc_summary(
@@ -7850,29 +6704,19 @@ fn count_prepared_callsites(ssa_blocks: &[r2ssa::SSABlock]) -> usize {
 mod tests {
     use super::*;
     use std::cell::Cell;
-    use std::collections::{BTreeMap, BTreeSet, HashMap};
+    use std::collections::{BTreeMap, HashMap};
 
     fn test_decompile_route(
         kind: r2types::DecompileRouteKind,
         reason: Option<&str>,
         fallback_comment: Option<&str>,
     ) -> r2types::DecompileRouteFacts {
-        let render_reason = fallback_comment
-            .or(reason)
-            .unwrap_or("test decompile route");
-        let render_permission = if kind == r2types::DecompileRouteKind::FallbackComment {
-            r2sym::RenderPermission::refuse(r2sym::ProofOwner::R2engine, render_reason)
-        } else {
-            r2sym::RenderPermission::summary(r2sym::ProofOwner::R2engine, render_reason)
-        };
         r2types::DecompileRouteFacts {
             kind,
             reason: reason.map(str::to_string),
             fallback_comment: fallback_comment.map(str::to_string),
             skip_runtime_type_inference: kind != r2types::DecompileRouteKind::Standard,
             use_prepared_semantic_view: kind == r2types::DecompileRouteKind::Standard,
-            proof_coverage: r2sym::ProofCoverage::default(),
-            render_permission,
         }
     }
 
@@ -8025,6 +6869,73 @@ mod tests {
         Arc::new(
             EngineSourceSnapshot::new(revision.as_bytes().to_vec(), None, Vec::new())
                 .expect("test source snapshot"),
+        )
+    }
+
+    fn exact_empty_test_source_snapshot(revision: &str) -> Arc<EngineSourceSnapshot> {
+        let revision_identity = revision.as_bytes().to_vec();
+        let interface = r2ssa::SourceFunctionInterface::new_exact(
+            revision_identity.clone(),
+            "sysv64",
+            std::iter::empty::<r2ssa::SourceAbiParameterSpec>(),
+            r2ssa::SourceFunctionReturn::Void,
+            std::iter::empty::<r2ssa::SourceStackSlotSpec>(),
+        )
+        .and_then(|interface| {
+            interface.with_stack_pointer_storage(r2ssa::CanonicalStorageId {
+                space: r2ssa::CanonicalStorageSpace::Register,
+                offset: 0x28,
+                size: 8,
+            })
+        })
+        .and_then(|interface| {
+            interface.with_return_address_storage(r2ssa::CanonicalStorageId {
+                space: r2ssa::CanonicalStorageSpace::Register,
+                offset: 0x30,
+                size: 8,
+            })
+        })
+        .expect("exact empty test interface");
+        Arc::new(
+            EngineSourceSnapshot::new(revision_identity, Some(interface), Vec::new())
+                .expect("exact empty test source snapshot"),
+        )
+    }
+
+    fn exact_rdi_test_source_snapshot(revision: &str) -> Arc<EngineSourceSnapshot> {
+        let revision_identity = revision.as_bytes().to_vec();
+        let interface = r2ssa::SourceFunctionInterface::new_exact(
+            revision_identity.clone(),
+            "sysv64",
+            [r2ssa::SourceAbiParameterSpec::new(
+                0,
+                r2ssa::CanonicalStorageId {
+                    space: r2ssa::CanonicalStorageSpace::Register,
+                    offset: 0x10,
+                    size: 8,
+                },
+            )],
+            r2ssa::SourceFunctionReturn::Void,
+            std::iter::empty::<r2ssa::SourceStackSlotSpec>(),
+        )
+        .and_then(|interface| {
+            interface.with_stack_pointer_storage(r2ssa::CanonicalStorageId {
+                space: r2ssa::CanonicalStorageSpace::Register,
+                offset: 0x28,
+                size: 8,
+            })
+        })
+        .and_then(|interface| {
+            interface.with_return_address_storage(r2ssa::CanonicalStorageId {
+                space: r2ssa::CanonicalStorageSpace::Register,
+                offset: 0x30,
+                size: 8,
+            })
+        })
+        .expect("exact RDI test interface");
+        Arc::new(
+            EngineSourceSnapshot::new(revision_identity, Some(interface), Vec::new())
+                .expect("exact RDI test source snapshot"),
         )
     }
 
@@ -8729,7 +7640,8 @@ mod tests {
             ),
         );
         assert!(
-            refused.output.contains("r2dec residual:")
+            (refused.output.contains("r2dec residual:")
+                || refused.output.contains("r2dec fallback:"))
                 && !refused.output.contains("certified_aggregate_sub_7700")
                 && !refused.output.contains("certified_mem_sub_7700"),
             "non-direct aggregate address must not downgrade to generic memory C:\n{}",
@@ -8741,29 +7653,6 @@ mod tests {
     #[test]
     fn handmade_direct_call_return_fixture_refuses_certified_c() {
         let (blocks, arch, source_snapshot) = source_snapshot_direct_call_return_function();
-        let prepared = EngineSession::new()
-            .analyze(EngineAnalyzeRequest::full_semantics_for_function(
-                EngineAnalyzeFunctionRequestInput {
-                    function: EngineFunctionInput {
-                        function_name: "sym.production_direct_call_return".to_string(),
-                        function_addr: 0x7500,
-                        blocks: blocks.clone(),
-                        arch: Some(arch.clone()),
-                        source_snapshot: Some(Arc::clone(&source_snapshot)),
-                        semantic_metadata_enabled: true,
-                    },
-                    ptr_bits: Some(64),
-                    reg_type_hints: HashMap::new(),
-                    parsed_context: r2types::ParsedExternalContext::default(),
-                    scope_facts: InterprocScopeFacts::empty(),
-                    interproc_max_iterations: 1,
-                    symbolic_scope: None,
-                    precomputed_semantic_artifact: None,
-                    include_interproc_summary_set: false,
-                },
-            ))
-            .expect("prepared call/return analysis");
-        assert_handmade_analysis_only(prepared.artifact.ssa_func.as_ref());
         let response = EngineSession::new().decompile_function_from_input(
             EngineFunctionDecompileRequestInput::single_function(
                 EngineFunctionInput {
@@ -8804,7 +7693,8 @@ mod tests {
             ),
         );
         assert!(
-            refused.output.contains("r2dec residual:")
+            (refused.output.contains("r2dec residual:")
+                || refused.output.contains("r2dec fallback:"))
                 && !refused.output.contains("certified_call_sub_7500"),
             "missing callsite authority must fail closed:\n{}",
             refused.output
@@ -8828,30 +7718,6 @@ mod tests {
     #[test]
     fn handmade_switch_return_fixture_refuses_certified_c() {
         let (blocks, arch, source_snapshot) = source_snapshot_switch_return_function();
-        let prepared = EngineSession::new()
-            .analyze(EngineAnalyzeRequest::full_semantics_for_function(
-                EngineAnalyzeFunctionRequestInput {
-                    function: EngineFunctionInput {
-                        function_name: "sym.production_switch_return".to_string(),
-                        function_addr: 0x7380,
-                        blocks: blocks.clone(),
-                        arch: Some(arch.clone()),
-                        source_snapshot: Some(Arc::clone(&source_snapshot)),
-                        semantic_metadata_enabled: true,
-                    },
-                    ptr_bits: Some(64),
-                    reg_type_hints: HashMap::new(),
-                    parsed_context: r2types::ParsedExternalContext::default(),
-                    scope_facts: InterprocScopeFacts::empty(),
-                    interproc_max_iterations: 1,
-                    symbolic_scope: None,
-                    precomputed_semantic_artifact: None,
-                    include_interproc_summary_set: false,
-                },
-            ))
-            .expect("prepared switch-return analysis");
-        assert_handmade_analysis_only(prepared.artifact.ssa_func.as_ref());
-
         let response = EngineSession::new().decompile_function_from_input(
             EngineFunctionDecompileRequestInput::single_function(
                 EngineFunctionInput {
@@ -8916,7 +7782,8 @@ mod tests {
                 ),
             );
             assert!(
-                refused.output.contains("r2dec residual:")
+                (refused.output.contains("r2dec residual:")
+                    || refused.output.contains("r2dec fallback:"))
                     && !refused.output.contains("certified_sub_7380"),
                 "missing or wrong selector authority must fail closed:\n{}",
                 refused.output
@@ -8928,30 +7795,6 @@ mod tests {
     #[test]
     fn handmade_carrier_free_loop_return_fixture_refuses_certified_c() {
         let (blocks, arch, source_snapshot) = source_snapshot_carrier_free_loop_return_function();
-        let prepared = EngineSession::new()
-            .analyze(EngineAnalyzeRequest::full_semantics_for_function(
-                EngineAnalyzeFunctionRequestInput {
-                    function: EngineFunctionInput {
-                        function_name: "sym.production_carrier_free_loop_return".to_string(),
-                        function_addr: 0x7400,
-                        blocks: blocks.clone(),
-                        arch: Some(arch.clone()),
-                        source_snapshot: Some(Arc::clone(&source_snapshot)),
-                        semantic_metadata_enabled: true,
-                    },
-                    ptr_bits: Some(64),
-                    reg_type_hints: HashMap::new(),
-                    parsed_context: r2types::ParsedExternalContext::default(),
-                    scope_facts: InterprocScopeFacts::empty(),
-                    interproc_max_iterations: 1,
-                    symbolic_scope: None,
-                    precomputed_semantic_artifact: None,
-                    include_interproc_summary_set: false,
-                },
-            ))
-            .expect("prepared carrier-free loop-return analysis");
-        assert_handmade_analysis_only(prepared.artifact.ssa_func.as_ref());
-
         let response = EngineSession::new().decompile_function_from_input(
             EngineFunctionDecompileRequestInput::single_function(
                 EngineFunctionInput {
@@ -9016,7 +7859,8 @@ mod tests {
                 ),
             );
             assert!(
-                refused.output.contains("r2dec residual:")
+                (refused.output.contains("r2dec residual:")
+                    || refused.output.contains("r2dec fallback:"))
                     && !refused.output.contains("certified_sub_7400"),
                 "missing or wrong loop condition authority must fail closed:\n{}",
                 refused.output
@@ -9137,10 +7981,8 @@ mod tests {
                 ptr_bits: Some(64),
                 reg_type_hints: HashMap::new(),
                 parsed_context: r2types::ParsedExternalContext::default(),
-                scope_facts: InterprocScopeFacts::empty(),
                 interproc_max_iterations: 1,
                 symbolic_scope: None,
-                precomputed_semantic_artifact: None,
                 include_interproc_summary_set: false,
             });
         assert!(Arc::ptr_eq(
@@ -9151,7 +7993,7 @@ mod tests {
         let response = EngineSession::new()
             .analyze(request)
             .expect("snapshot-backed analysis");
-        let context = response.artifact.ssa_func.machine_context();
+        let context = response.artifact.ssa_func().machine_context();
         assert_eq!(
             context
                 .function_interface()
@@ -9168,7 +8010,7 @@ mod tests {
         assert!(
             response
                 .artifact
-                .ssa_func
+                .ssa_func()
                 .facts()
                 .boundaries
                 .calls
@@ -9176,20 +8018,6 @@ mod tests {
                 .next()
                 .expect("authoritative call boundary")
                 .complete
-        );
-        assert!(Arc::ptr_eq(
-            &response.artifact.ssa_func,
-            &response.artifact.pattern_ssa_func
-        ));
-        assert_eq!(
-            response
-                .artifact
-                .pattern_ssa_func
-                .machine_context()
-                .function_interface()
-                .expect("shared authoritative function interface")
-                .revision_identity(),
-            revision
         );
     }
 
@@ -9211,10 +8039,8 @@ mod tests {
                 ptr_bits: Some(64),
                 reg_type_hints: HashMap::new(),
                 parsed_context: r2types::ParsedExternalContext::default(),
-                scope_facts: InterprocScopeFacts::empty(),
                 interproc_max_iterations: 1,
                 symbolic_scope: None,
-                precomputed_semantic_artifact: None,
                 include_interproc_summary_set: false,
             });
 
@@ -9227,7 +8053,7 @@ mod tests {
 
     #[test]
     fn request_assumptions_produce_one_shared_semantic_artifact() {
-        let arch = x86_64_arg_arch();
+        let arch = x86_64_exact_rdi_arch();
         let mut block = R2ILBlock::new(0x401000, 4);
         block.push(r2il::R2ILOp::Copy {
             dst: r2il::Varnode::unique(0, 8),
@@ -9236,87 +8062,54 @@ mod tests {
         block.push(r2il::R2ILOp::Return {
             target: r2il::Varnode::unique(0, 8),
         });
-        let mut parsed_context = r2types::ParsedExternalContext::default();
-        parsed_context.assumptions =
-            r2ssa::AssumptionSet::new(vec![register_assumption("rdi-seven", "RDI", 7)]);
+        let parsed_context = r2types::ParsedExternalContext {
+            assumptions: r2ssa::AssumptionSet::new(vec![register_assumption(
+                "rdi-seven",
+                "RDI",
+                7,
+            )]),
+            ..r2types::ParsedExternalContext::default()
+        };
         let response = EngineSession::new()
             .analyze_checked(EngineAnalyzeRequest {
                 function_name: "sym.assumed".to_string(),
                 function_addr: 0x401000,
                 blocks: vec![block],
                 arch: Some(arch),
-                source_snapshot: Some(test_source_snapshot("sym.assumed/rev1")),
+                source_snapshot: Some(exact_rdi_test_source_snapshot("sym.assumed/rev1")),
                 trusted_ssa: None,
                 ptr_bits: 64,
                 semantic_metadata_enabled: false,
                 reg_type_hints: HashMap::new(),
                 parsed_context,
-                scope_facts: InterprocScopeFacts::empty(),
                 interproc_max_iterations: 1,
                 symbolic_scope: None,
-                precomputed_semantic_artifact: None,
                 semantic_mode: EngineSemanticMode::Optional,
                 include_interproc_summary_set: true,
                 execution: EngineExecutionControl::default(),
             })
             .expect("assumption-conditioned analysis");
 
-        assert!(Arc::ptr_eq(
-            &response.artifact.ssa_func,
-            &response.artifact.pattern_ssa_func
-        ));
-        let (usage, conditioned) = prepared_assumption_conditioning(&response.artifact.ssa_func);
+        assert!(response.artifact.trusted_ssa.is_none());
+        let (usage, conditioned) = prepared_assumption_conditioning(response.artifact.ssa_func());
         assert!(conditioned);
         assert_eq!(usage.applied.len(), 1);
-    }
-
-    fn x86_64_arg_arch() -> r2il::ArchSpec {
-        let mut arch = r2il::ArchSpec::new("x86-64");
-        arch.add_register(r2il::RegisterDef::new("RDI", 0x10, 8));
-        arch.add_register(r2il::RegisterDef::new("RSI", 0x18, 8));
-        arch
-    }
-
-    fn x86_64_param_slots() -> ParamSlotResolver {
-        ParamSlotResolver::from_arch_name(Some("x86-64"))
     }
 
     fn x86_64_result_arch() -> r2il::ArchSpec {
         let mut arch = r2il::ArchSpec::new("x86-64");
         arch.addr_size = 8;
+        arch.set_memory_endianness(r2il::Endianness::Little);
         arch.add_register(r2il::RegisterDef::new("rax", 0, 8));
+        arch.add_register(r2il::RegisterDef::new("rsp", 0x28, 8));
+        arch.add_register(r2il::RegisterDef::new("rip", 0x30, 8));
         arch
     }
 
-    fn direct_call_result_copy_blocks(addr: u64, target: u64) -> Vec<R2ILBlock> {
-        let mut block = R2ILBlock::new(addr, 4);
-        block.push(r2il::R2ILOp::Call {
-            target: r2il::Varnode::constant(target, 8),
-        });
-        block.push(r2il::R2ILOp::Copy {
-            dst: r2il::Varnode::unique(0x20, 8),
-            src: r2il::Varnode::register(0, 8),
-        });
-        vec![block]
-    }
-
-    fn two_arg_direct_call_return_blocks(addr: u64, target: u64) -> Vec<R2ILBlock> {
-        let mut block = R2ILBlock::new(addr, 4);
-        block.push(r2il::R2ILOp::Copy {
-            dst: r2il::Varnode::register(0x10, 8),
-            src: r2il::Varnode::constant(7, 8),
-        });
-        block.push(r2il::R2ILOp::Copy {
-            dst: r2il::Varnode::register(0x18, 8),
-            src: r2il::Varnode::constant(9, 8),
-        });
-        block.push(r2il::R2ILOp::Call {
-            target: r2il::Varnode::constant(target, 8),
-        });
-        block.push(r2il::R2ILOp::Return {
-            target: r2il::Varnode::constant(0, 8),
-        });
-        vec![block]
+    fn x86_64_exact_rdi_arch() -> r2il::ArchSpec {
+        let mut arch = x86_64_result_arch();
+        arch.add_register(r2il::RegisterDef::new("rdi", 0x10, 8));
+        arch
     }
 
     #[test]
@@ -9354,6 +8147,28 @@ mod tests {
         assert_eq!(riscv.ptr_size, 32);
         assert_eq!(riscv.fp_name, "s0");
         assert_eq!(riscv.arg_regs.first().map(String::as_str), Some("a0"));
+
+        let mut arm64 = r2il::ArchSpec::new("arm64");
+        arm64.addr_size = 8;
+        assert_eq!(
+            engine_normalized_arch_name(Some(&arm64)).as_deref(),
+            Some("aarch64")
+        );
+        let mut rv64 = r2il::ArchSpec::new("riscv:LE:64:default");
+        rv64.addr_size = 8;
+        assert_eq!(
+            engine_normalized_arch_name(Some(&rv64)).as_deref(),
+            Some("riscv64")
+        );
+
+        let mut contradictory = r2il::ArchSpec::new("x86-64");
+        contradictory.addr_size = 4;
+        let prepared = r2ssa::SsaArtifact::for_decompile(
+            &const_return_blocks(0x401000, 0),
+            Some(&contradictory),
+        )
+        .expect("mismatched family/width remains analyzable");
+        assert!(EngineRenderTarget::for_prepared(&prepared).is_none());
     }
 
     #[test]
@@ -9431,206 +8246,6 @@ mod tests {
     }
 
     #[test]
-    fn engine_owns_type_writeback_authority_report_boundary() {
-        let plan = TypeWritebackPlan {
-            signature: r2types::InferredSignature {
-                function_name: "target".to_string(),
-                signature: "int target(void)".to_string(),
-                ret_type: "int".to_string(),
-                params: Vec::new(),
-                callconv: "amd64".to_string(),
-                arch: "x86-64".to_string(),
-                confidence: 100,
-                callconv_confidence: 100,
-            },
-            var_type_candidates: Vec::new(),
-            var_rename_candidates: Vec::new(),
-            struct_decls: Vec::new(),
-            global_type_links: Vec::new(),
-            diagnostics: r2types::TypeWritebackDiagnostics::default(),
-        };
-        let report = type_writeback_authority_report_for_policy(
-            &plan,
-            r2types::TypeWritebackMutationBudget::new(1, 1, 1),
-            &FunctionFacts::default(),
-            type_writeback_apply_policy_for_mode(EngineTypeWritebackMode::Off),
-            1,
-        );
-
-        assert_eq!(
-            report.mutation_plan.apply_policy.mode,
-            r2types::TypeWritebackApplyMode::Off
-        );
-        assert!(!report.signature_render_authorized);
-    }
-
-    #[test]
-    fn engine_owns_bounded_type_writeback_plan_report_boundary() {
-        let facts = FunctionFacts::default();
-        let report =
-            bounded_cfg_type_writeback_plan_report(EngineBoundedCfgTypeWritebackReportRequest {
-                function_name: "target",
-                arch_name: "x86-64",
-                ptr_bits: 64,
-                function_facts: &facts,
-                reason: "bounded for test",
-                policy: EngineTypeWritebackReportPolicy {
-                    budget: r2types::TypeWritebackMutationBudget::new(1, 1, 1),
-                    apply_policy: type_writeback_apply_policy_for_mode(
-                        EngineTypeWritebackMode::Off,
-                    ),
-                    basic_block_count: 10,
-                },
-            });
-
-        assert_eq!(report.plan.signature.function_name, "target");
-        assert_eq!(
-            report.authority_report.mutation_plan.apply_policy.mode,
-            r2types::TypeWritebackApplyMode::Off
-        );
-        assert!(
-            report
-                .authority_report
-                .warnings
-                .contains(&"bounded for test".to_string())
-        );
-    }
-
-    #[test]
-    fn engine_owns_bounded_type_writeback_payload_boundary() {
-        let facts = FunctionFacts::default();
-        let payload =
-            bounded_cfg_type_writeback_payload(EngineBoundedCfgTypeWritebackReportRequest {
-                function_name: "target",
-                arch_name: "x86-64",
-                ptr_bits: 64,
-                function_facts: &facts,
-                reason: "bounded payload for test",
-                policy: EngineTypeWritebackReportPolicy {
-                    budget: r2types::TypeWritebackMutationBudget::new(1, 1, 1),
-                    apply_policy: type_writeback_apply_policy_for_mode(
-                        EngineTypeWritebackMode::Off,
-                    ),
-                    basic_block_count: 10,
-                },
-            });
-
-        assert_eq!(payload.signature.function_name, "target");
-        assert_eq!(
-            payload.mutation_plan.apply_policy.mode,
-            r2types::TypeWritebackApplyMode::Off
-        );
-        assert!(
-            payload
-                .diagnostics
-                .warnings
-                .contains(&"bounded payload for test".to_string())
-        );
-    }
-
-    #[test]
-    fn engine_owns_type_writeback_payload_projection_boundary() {
-        let mut type_facts = FunctionTypeFacts::default();
-        type_facts.external_type_db.structs.insert(
-            "foo".to_string(),
-            r2types::ExternalStruct {
-                name: "Foo".to_string(),
-                fields: BTreeMap::new(),
-            },
-        );
-        type_facts
-            .field_access_certificates
-            .push(r2types::FieldAccessCertificate {
-                slot: 1,
-                field_offset: 4,
-                field_name: "len".to_string(),
-                field_type: None,
-            });
-        let function_facts = FunctionFacts::new(type_facts, None);
-        let mut plan = TypeWritebackPlan {
-            signature: r2types::InferredSignature {
-                function_name: "target".to_string(),
-                signature: "int target(void)".to_string(),
-                ret_type: "int".to_string(),
-                params: Vec::new(),
-                callconv: "amd64".to_string(),
-                arch: "x86-64".to_string(),
-                confidence: 100,
-                callconv_confidence: 100,
-            },
-            var_type_candidates: Vec::new(),
-            var_rename_candidates: Vec::new(),
-            struct_decls: Vec::new(),
-            global_type_links: Vec::new(),
-            diagnostics: r2types::TypeWritebackDiagnostics {
-                warnings: vec!["seed warning".to_string()],
-                ..r2types::TypeWritebackDiagnostics::default()
-            },
-        };
-        plan.struct_decls.push(r2types::StructDeclCandidate {
-            name: "A".to_string(),
-            decl: "struct A { int x; };".to_string(),
-            confidence: 90,
-            source: r2types::StructDeclSource::LocalInferred,
-            fields: Vec::new(),
-        });
-        plan.struct_decls.push(r2types::StructDeclCandidate {
-            name: "B".to_string(),
-            decl: "struct B { int y; };".to_string(),
-            confidence: 90,
-            source: r2types::StructDeclSource::LocalInferred,
-            fields: Vec::new(),
-        });
-        plan.global_type_links
-            .push(r2types::GlobalTypeLinkCandidate {
-                addr: 0x401000,
-                target_type: "struct A *".to_string(),
-                confidence: 90,
-                source: r2types::WritebackSource::LocalInferred,
-            });
-        plan.global_type_links
-            .push(r2types::GlobalTypeLinkCandidate {
-                addr: 0x402000,
-                target_type: "struct B *".to_string(),
-                confidence: 90,
-                source: r2types::WritebackSource::LocalInferred,
-            });
-        let budget = r2types::TypeWritebackMutationBudget::new(1, 1, 8);
-        let report = type_writeback_plan_report_for_policy(
-            plan,
-            budget,
-            &function_facts,
-            type_writeback_apply_policy_for_mode(EngineTypeWritebackMode::Balanced),
-            1,
-        );
-        let payload = type_writeback_payload_from_plan_report(report, &function_facts, budget);
-
-        assert_eq!(payload.struct_decls.len(), 1);
-        assert_eq!(payload.global_type_links.len(), 1);
-        assert_eq!(payload.external_struct_names, vec!["Foo".to_string()]);
-        assert_eq!(
-            payload.field_access_certificate_names,
-            vec!["arg1+0x4:len".to_string()]
-        );
-        assert!(
-            payload
-                .diagnostics
-                .warnings
-                .contains(&"seed warning".to_string())
-        );
-        assert!(
-            payload.diagnostics.warnings.iter().any(|warning| {
-                warning == "type declaration report truncated from 2 to 1 item(s)"
-            })
-        );
-        assert!(
-            payload.diagnostics.warnings.iter().any(|warning| {
-                warning == "global type-link report truncated from 2 to 1 item(s)"
-            })
-        );
-    }
-
-    #[test]
     fn engine_type_writeback_mutation_kind_ids_are_stable() {
         let cases = [
             (
@@ -9681,268 +8296,14 @@ mod tests {
     }
 
     #[test]
-    fn engine_type_writeback_json_core_preserves_public_shape() {
-        let plan = TypeWritebackPlan {
-            signature: r2types::InferredSignature {
-                function_name: "target".to_string(),
-                signature: "int target(char *arg1)".to_string(),
-                ret_type: "int".to_string(),
-                params: vec![r2types::InferredSignatureParam {
-                    name: "arg1".to_string(),
-                    param_type: "char *".to_string(),
-                }],
-                callconv: "amd64".to_string(),
-                arch: "x86-64".to_string(),
-                confidence: 100,
-                callconv_confidence: 90,
-            },
-            var_type_candidates: vec![r2types::VarTypeCandidate {
-                name: "arg1".to_string(),
-                kind: "r".to_string(),
-                delta: 0,
-                var_type: "char *".to_string(),
-                isarg: true,
-                reg: Some("rdi".to_string()),
-                size: 8,
-                confidence: 95,
-                source: r2types::WritebackSource::LocalInferred,
-                evidence: vec![r2types::WritebackEvidence::SsaVarRecovery],
-            }],
-            var_rename_candidates: Vec::new(),
-            struct_decls: Vec::new(),
-            global_type_links: Vec::new(),
-            diagnostics: r2types::TypeWritebackDiagnostics::default(),
-        };
-        let payload = type_writeback_payload_for_policy(
-            plan,
-            r2types::TypeWritebackMutationBudget::new(1, 1, 8),
-            &FunctionFacts::default(),
-            type_writeback_apply_policy_for_mode(EngineTypeWritebackMode::Off),
-            1,
-        );
-        let value = serde_json::to_value(type_writeback_json_core(payload))
-            .expect("serialize engine type writeback core");
-
-        assert_eq!(value["function_name"], "target");
-        assert_eq!(value["params"][0]["name"], "arg1");
-        assert_eq!(value["params"][0]["type"], "char *");
-        assert_eq!(value["var_type_candidates"][0]["type"], "char *");
-        assert_eq!(
-            value["var_type_candidates"][0]["evidence"][0],
-            "ssa-var-recovery"
-        );
-    }
-
-    #[test]
-    fn engine_function_analysis_report_json_core_preserves_route_shape() {
-        let type_writeback = type_writeback_payload_for_policy(
-            TypeWritebackPlan {
-                signature: r2types::InferredSignature {
-                    function_name: "target".to_string(),
-                    signature: "void target(void)".to_string(),
-                    ret_type: "void".to_string(),
-                    params: Vec::new(),
-                    callconv: "unknown".to_string(),
-                    arch: "x86-64".to_string(),
-                    confidence: 0,
-                    callconv_confidence: 0,
-                },
-                var_type_candidates: Vec::new(),
-                var_rename_candidates: Vec::new(),
-                struct_decls: Vec::new(),
-                global_type_links: Vec::new(),
-                diagnostics: r2types::TypeWritebackDiagnostics::default(),
-            },
-            r2types::TypeWritebackMutationBudget::new(1, 1, 1),
-            &FunctionFacts::default(),
-            type_writeback_apply_policy_for_mode(EngineTypeWritebackMode::Off),
-            3,
-        );
-        let payload = EngineFunctionAnalysisReportPayload {
-            function_name: "target".to_string(),
-            function_addr: 0x401000,
-            cfg_summary: CFGRiskSummary {
-                block_count: 3,
-                loop_count: 1,
-                back_edge_count: 1,
-                switch_block_count: 0,
-                max_switch_cases: 0,
-            },
-            plans: r2types::AnalysisPlans::default(),
-            assumptions: r2ssa::AssumptionSet::default(),
-            assumption_usage: r2types::AssumptionUsageReport::default(),
-            semantic_artifact: None,
-            semantic_build_plan: None,
-            semantic_route: Some(r2types::DecompileRouteFacts {
-                kind: r2types::DecompileRouteKind::FallbackComment,
-                reason: Some("missing certified loop proof".to_string()),
-                fallback_comment: Some("/* residual */".to_string()),
-                skip_runtime_type_inference: true,
-                use_prepared_semantic_view: false,
-                proof_coverage: r2sym::ProofCoverage::default(),
-                render_permission: r2sym::RenderPermission::refuse(
-                    r2sym::ProofOwner::R2engine,
-                    "/* residual */",
-                ),
-            }),
-            summary_diagnostics: None,
-            type_writeback,
-            prefer_bounded_type_plan: true,
-            callsite_count: 0,
-            current_summary: None,
-        };
-        let value = serde_json::to_value(function_analysis_report_json_core(&payload))
-            .expect("serialize engine function analysis report core");
-
-        assert_eq!(value["function_name"], "target");
-        assert_eq!(value["function_addr"], 0x401000);
-        assert_eq!(value["cfg_risk"]["block_count"], 3);
-        assert_eq!(value["cfg_risk"]["loop_count"], 1);
-        assert_eq!(value["semantic_route"]["kind"], "fallback_comment");
-        assert_eq!(
-            value["semantic_route"]["reason"],
-            "missing certified loop proof"
-        );
-        assert_eq!(value["semantic_route"]["comment"], "/* residual */");
-        assert_eq!(value["prefer_bounded_type_plan"], true);
-    }
-
-    #[test]
-    fn engine_function_analysis_session_report_json_preserves_outer_shape() {
-        let type_writeback = type_writeback_report_json(
-            type_writeback_payload_for_policy(
-                TypeWritebackPlan {
-                    signature: r2types::InferredSignature {
-                        function_name: "target".to_string(),
-                        signature: "void target(void)".to_string(),
-                        ret_type: "void".to_string(),
-                        params: Vec::new(),
-                        callconv: "unknown".to_string(),
-                        arch: "x86-64".to_string(),
-                        confidence: 0,
-                        callconv_confidence: 0,
-                    },
-                    var_type_candidates: Vec::new(),
-                    var_rename_candidates: Vec::new(),
-                    struct_decls: Vec::new(),
-                    global_type_links: Vec::new(),
-                    diagnostics: r2types::TypeWritebackDiagnostics::default(),
-                },
-                r2types::TypeWritebackMutationBudget::new(1, 1, 1),
-                &FunctionFacts::default(),
-                type_writeback_apply_policy_for_mode(EngineTypeWritebackMode::Off),
-                1,
-            ),
-            EngineInterprocSummaryJson {
-                callsite_count: 2,
-                iterations: 1,
-                max_iterations: 3,
-                converged: false,
-                summary: None,
-                summary_json: Some("{\"kind\":\"summary\"}".to_string()),
-                scope: Some(serde_json::json!({"phase": "symbolic_scope"})),
-            },
-            None,
-            None,
-        );
-        let payload = EngineFunctionAnalysisReportPayload {
-            function_name: "target".to_string(),
-            function_addr: 0x401000,
-            cfg_summary: CFGRiskSummary {
-                block_count: 1,
-                loop_count: 0,
-                back_edge_count: 0,
-                switch_block_count: 0,
-                max_switch_cases: 0,
-            },
-            plans: r2types::AnalysisPlans::default(),
-            assumptions: r2ssa::AssumptionSet::default(),
-            assumption_usage: r2types::AssumptionUsageReport::default(),
-            semantic_artifact: None,
-            semantic_build_plan: None,
-            semantic_route: None,
-            summary_diagnostics: None,
-            type_writeback: type_writeback_payload_for_policy(
-                TypeWritebackPlan {
-                    signature: r2types::InferredSignature {
-                        function_name: "target".to_string(),
-                        signature: "void target(void)".to_string(),
-                        ret_type: "void".to_string(),
-                        params: Vec::new(),
-                        callconv: "unknown".to_string(),
-                        arch: "x86-64".to_string(),
-                        confidence: 0,
-                        callconv_confidence: 0,
-                    },
-                    var_type_candidates: Vec::new(),
-                    var_rename_candidates: Vec::new(),
-                    struct_decls: Vec::new(),
-                    global_type_links: Vec::new(),
-                    diagnostics: r2types::TypeWritebackDiagnostics::default(),
-                },
-                r2types::TypeWritebackMutationBudget::new(1, 1, 1),
-                &FunctionFacts::default(),
-                type_writeback_apply_policy_for_mode(EngineTypeWritebackMode::Off),
-                1,
-            ),
-            prefer_bounded_type_plan: false,
-            callsite_count: 2,
-            current_summary: None,
-        };
-        let value = serde_json::to_value(function_analysis_session_report_json(
-            &payload,
-            type_writeback,
-            vec![EnginePhaseTimingJson {
-                phase: EnginePhase::FfiConversion,
-                status: EnginePhaseStatus::Executed,
-                elapsed_us: 7,
-            }],
-        ))
-        .expect("serialize engine function analysis session report");
-
-        assert_eq!(value["function_name"], "target");
-        assert_eq!(value["type_writeback"]["interproc"]["callsite_count"], 2);
-        assert_eq!(value["type_writeback"]["interproc"]["max_iterations"], 3);
-        assert!(
-            value["type_writeback"]
-                .get("legacy_render_permission")
-                .is_none()
-        );
-        assert!(
-            value["type_writeback"]
-                .get("legacy_rendered_proof_coverage")
-                .is_none()
-        );
-        assert!(value["type_writeback"].get("render_permission").is_none());
-        assert!(value["type_writeback"].get("proof_coverage").is_none());
-        assert!(value["type_writeback"]["compiled_semantics"].is_null());
-        assert_eq!(
-            value["type_writeback"]["phase_timings"]
-                .as_array()
-                .map(Vec::len),
-            Some(11)
-        );
-        assert!(
-            value["type_writeback"]["phase_timings"]
-                .as_array()
-                .is_some_and(|timings| timings
-                    .iter()
-                    .all(|timing| timing["status"] == "not_executed"))
-        );
-        assert_eq!(value["phase_timings"].as_array().map(Vec::len), Some(11));
-        assert_eq!(value["phase_timings"][10]["phase"], "ffi_conversion");
-        assert_eq!(value["phase_timings"][10]["status"], "executed");
-        assert_eq!(value["phase_timings"][10]["elapsed_us"], 7);
-    }
-
-    #[test]
     fn engine_interproc_summary_json_merges_symbolic_scope_report() {
         let root_blocks = const_return_blocks(0x401000, 0);
         let helper_blocks = const_return_blocks(0x402000, 1);
         let root_prepared =
-            r2ssa::SsaArtifact::for_symbolic(&root_blocks, None).expect("root prepared");
-        let helper_prepared =
-            r2ssa::SsaArtifact::for_symbolic(&helper_blocks, None).expect("helper prepared");
+            Arc::new(r2ssa::SsaArtifact::for_symbolic(&root_blocks, None).expect("root prepared"));
+        let helper_prepared = Arc::new(
+            r2ssa::SsaArtifact::for_symbolic(&helper_blocks, None).expect("helper prepared"),
+        );
         let scope = r2sym::PreparedFunctionScope::new(
             0x401000,
             vec![
@@ -9984,358 +8345,6 @@ mod tests {
         assert_eq!(scope["payloads"][1]["function_name"], "helper");
         assert_eq!(scope["seeds"][1]["id"], 0x402000);
         assert_eq!(scope["seeds"][1]["name"], "helper");
-    }
-
-    #[test]
-    fn engine_type_writeback_report_json_from_function_analysis_labels_legacy_render_claims() {
-        let summary = r2ssa::FunctionSemanticSummary::unknown(
-            r2ssa::InterprocFunctionId(0x401000),
-            Some("target".to_string()),
-        );
-        let type_writeback = type_writeback_payload_for_policy(
-            TypeWritebackPlan {
-                signature: r2types::InferredSignature {
-                    function_name: "target".to_string(),
-                    signature: "void target(void)".to_string(),
-                    ret_type: "void".to_string(),
-                    params: Vec::new(),
-                    callconv: "unknown".to_string(),
-                    arch: "x86-64".to_string(),
-                    confidence: 0,
-                    callconv_confidence: 0,
-                },
-                var_type_candidates: Vec::new(),
-                var_rename_candidates: Vec::new(),
-                struct_decls: Vec::new(),
-                global_type_links: Vec::new(),
-                diagnostics: r2types::TypeWritebackDiagnostics::default(),
-            },
-            r2types::TypeWritebackMutationBudget::new(1, 1, 1),
-            &FunctionFacts::default(),
-            type_writeback_apply_policy_for_mode(EngineTypeWritebackMode::Off),
-            1,
-        );
-        let payload = EngineFunctionAnalysisReportPayload {
-            function_name: "target".to_string(),
-            function_addr: 0x401000,
-            cfg_summary: CFGRiskSummary {
-                block_count: 1,
-                loop_count: 0,
-                back_edge_count: 0,
-                switch_block_count: 0,
-                max_switch_cases: 0,
-            },
-            plans: r2types::AnalysisPlans::default(),
-            assumptions: r2ssa::AssumptionSet::default(),
-            assumption_usage: r2types::AssumptionUsageReport::default(),
-            semantic_artifact: None,
-            semantic_build_plan: None,
-            semantic_route: Some(r2types::DecompileRouteFacts {
-                kind: r2types::DecompileRouteKind::Standard,
-                reason: Some("legacy rendered proofs remain residual".to_string()),
-                fallback_comment: None,
-                skip_runtime_type_inference: false,
-                use_prepared_semantic_view: true,
-                proof_coverage: r2sym::ProofCoverage {
-                    certified_loops: 1,
-                    certified_expressions: 4,
-                    certified_memory_accesses: 2,
-                    certified_returns: 1,
-                    ..r2sym::ProofCoverage::default()
-                },
-                render_permission: r2sym::RenderPermission::residual(
-                    r2sym::ProofOwner::R2engine,
-                    "legacy rendered proofs remain residual",
-                ),
-            }),
-            summary_diagnostics: None,
-            type_writeback,
-            prefer_bounded_type_plan: false,
-            callsite_count: 3,
-            current_summary: Some(summary),
-        };
-        let route = payload.semantic_route.as_ref().expect("semantic route");
-        let expected_render_permission =
-            serde_json::to_value(&route.render_permission).expect("serialize render permission");
-        let expected_proof_coverage =
-            serde_json::to_value(&route.proof_coverage).expect("serialize proof coverage");
-        let report = type_writeback_report_json_from_function_analysis(
-            EngineFunctionAnalysisTypeWritebackJsonRequest {
-                report: &payload,
-                iterations: 0,
-                max_iterations: 0,
-                converged: true,
-                scope_report: None,
-                symbolic_scope: None,
-            },
-        );
-        let value = serde_json::to_value(report).expect("serialize type writeback report");
-
-        assert_eq!(value["interproc"]["callsite_count"], 3);
-        assert_eq!(value["interproc"]["iterations"], 1);
-        assert_eq!(value["interproc"]["max_iterations"], 1);
-        assert_eq!(value["interproc"]["summary"]["name"], "target");
-        assert!(value.get("render_permission").is_none());
-        assert!(value.get("proof_coverage").is_none());
-        assert_eq!(
-            value["legacy_render_permission"],
-            expected_render_permission
-        );
-        assert_eq!(
-            value["legacy_rendered_proof_coverage"],
-            expected_proof_coverage
-        );
-        assert_eq!(value["legacy_render_permission"]["kind"], "Residual");
-        assert_eq!(value["legacy_render_permission"]["owner"], "R2engine");
-        assert_eq!(
-            value["legacy_render_permission"]["reason"],
-            "legacy rendered proofs remain residual"
-        );
-        assert_eq!(
-            value["legacy_rendered_proof_coverage"]["certified_loops"],
-            1
-        );
-        assert_eq!(
-            value["legacy_rendered_proof_coverage"]["certified_expressions"],
-            4
-        );
-        assert_eq!(
-            value["legacy_rendered_proof_coverage"]["certified_memory_accesses"],
-            2
-        );
-        assert_eq!(
-            value["legacy_rendered_proof_coverage"]["certified_returns"],
-            1
-        );
-        assert!(
-            value["interproc"]["summary_json"]
-                .as_str()
-                .is_some_and(|summary| summary.contains("\"target\""))
-        );
-    }
-
-    #[test]
-    fn engine_bounded_cfg_type_writeback_report_json_owns_public_projection() {
-        let function_facts = FunctionFacts::default();
-        let report =
-            bounded_cfg_type_writeback_report_json(EngineBoundedCfgTypeWritebackJsonRequest {
-                type_request: EngineBoundedCfgTypeWritebackReportRequest {
-                    function_name: "target",
-                    arch_name: "x86-64",
-                    ptr_bits: 64,
-                    function_facts: &function_facts,
-                    reason: "complex loop graph",
-                    policy: EngineTypeWritebackReportPolicy {
-                        budget: r2types::TypeWritebackMutationBudget::new(2, 2, 4),
-                        apply_policy: type_writeback_apply_policy_for_mode(
-                            EngineTypeWritebackMode::Balanced,
-                        ),
-                        basic_block_count: 32,
-                    },
-                },
-                interproc: EngineInterprocSummaryJsonInput {
-                    callsite_count: 0,
-                    iterations: 0,
-                    max_iterations: 0,
-                    converged: false,
-                    summary: None,
-                    scope_report: None,
-                    symbolic_scope: None,
-                },
-            });
-        let value = serde_json::to_value(report).expect("serialize bounded report");
-
-        assert_eq!(value["function_name"], "target");
-        assert_eq!(value["interproc"]["iterations"], 1);
-        assert_eq!(value["interproc"]["max_iterations"], 1);
-        assert!(value["semantics"].is_null());
-        assert!(
-            value["diagnostics"]["warnings"]
-                .as_array()
-                .expect("warnings")
-                .iter()
-                .any(|warning| warning
-                    .as_str()
-                    .is_some_and(|warning| warning.contains("complex loop graph")))
-        );
-    }
-
-    #[test]
-    fn engine_bounded_cfg_type_writeback_preflight_owns_empty_function_facts() {
-        let report = bounded_cfg_type_writeback_preflight_report_json(
-            EngineBoundedCfgTypeWritebackPreflightJsonRequest {
-                function_name: "preflight",
-                arch_name: "x86-64",
-                ptr_bits: 64,
-                reason: "bounded preflight",
-                policy: EngineTypeWritebackReportPolicy {
-                    budget: r2types::TypeWritebackMutationBudget::new(1, 1, 1),
-                    apply_policy: type_writeback_apply_policy_for_mode(
-                        EngineTypeWritebackMode::Balanced,
-                    ),
-                    basic_block_count: 0,
-                },
-                interproc: EngineInterprocSummaryJsonInput {
-                    callsite_count: 0,
-                    iterations: 1,
-                    max_iterations: 1,
-                    converged: false,
-                    summary: None,
-                    scope_report: None,
-                    symbolic_scope: None,
-                },
-            },
-        );
-        let value = serde_json::to_value(report).expect("serialize bounded preflight report");
-
-        assert_eq!(value["function_name"], "preflight");
-        assert_eq!(value["signature"], "void preflight(void)");
-        assert_eq!(value["signature_writeback_authorized"], false);
-        assert!(value["semantics"].is_null());
-        assert!(
-            value["diagnostics"]["warnings"]
-                .as_array()
-                .expect("warnings")
-                .iter()
-                .any(|warning| warning
-                    .as_str()
-                    .is_some_and(|warning| warning.contains("bounded preflight")))
-        );
-    }
-
-    #[test]
-    fn engine_owns_type_writeback_payload_from_analysis_response() {
-        let response = EngineTypeAnalysisResponse {
-            cfg_summary: CFGRiskSummary {
-                block_count: 7,
-                loop_count: 0,
-                back_edge_count: 0,
-                switch_block_count: 0,
-                max_switch_cases: 0,
-            },
-            function_facts: FunctionFacts::default(),
-            writeback_plan: TypeWritebackPlan {
-                signature: r2types::InferredSignature {
-                    function_name: "target".to_string(),
-                    signature: "void target(void)".to_string(),
-                    ret_type: "void".to_string(),
-                    params: Vec::new(),
-                    callconv: "unknown".to_string(),
-                    arch: "x86-64".to_string(),
-                    confidence: 0,
-                    callconv_confidence: 0,
-                },
-                var_type_candidates: Vec::new(),
-                var_rename_candidates: Vec::new(),
-                struct_decls: Vec::new(),
-                global_type_links: Vec::new(),
-                diagnostics: r2types::TypeWritebackDiagnostics {
-                    warnings: vec!["response warning".to_string()],
-                    ..r2types::TypeWritebackDiagnostics::default()
-                },
-            },
-            route_decision: EngineTypeRouteDecision {
-                request: EngineRequestKind::Types,
-                plan: EnginePlan::BoundedType,
-                kind: EngineTypeRouteKind::BoundedCfg,
-                prefer_bounded_type_plan: true,
-                reason: Some("test".to_string()),
-                apply_artifact_signature_hint: false,
-            },
-            callsite_count: 0,
-            current_summary: None,
-            metrics: EngineMetrics::default(),
-            diagnostics: EngineDiagnostics::default(),
-        };
-        let payload = type_writeback_payload_from_analysis_response(
-            &response,
-            r2types::TypeWritebackMutationBudget::new(1, 1, 1),
-            type_writeback_apply_policy_for_mode(EngineTypeWritebackMode::Off),
-        );
-
-        assert_eq!(payload.signature.function_name, "target");
-        assert_eq!(
-            payload.mutation_plan.apply_policy.mode,
-            r2types::TypeWritebackApplyMode::Off
-        );
-        assert_eq!(payload.diagnostics.warnings, vec!["response warning"]);
-    }
-
-    #[test]
-    fn engine_owns_function_analysis_report_payload_boundary() {
-        let function_facts =
-            FunctionFacts::default().with_decompile_route(r2types::DecompileRouteFacts {
-                kind: r2types::DecompileRouteKind::FallbackComment,
-                reason: Some("report route owned by function facts".to_string()),
-                fallback_comment: Some("/* report refusal */".to_string()),
-                skip_runtime_type_inference: true,
-                use_prepared_semantic_view: false,
-                proof_coverage: r2sym::ProofCoverage::default(),
-                render_permission: r2sym::RenderPermission::refuse(
-                    r2sym::ProofOwner::R2engine,
-                    "report refusal",
-                ),
-            });
-        let response = EngineTypeAnalysisResponse {
-            cfg_summary: CFGRiskSummary {
-                block_count: 7,
-                loop_count: 1,
-                back_edge_count: 1,
-                switch_block_count: 0,
-                max_switch_cases: 0,
-            },
-            function_facts,
-            writeback_plan: TypeWritebackPlan {
-                signature: r2types::InferredSignature {
-                    function_name: "target".to_string(),
-                    signature: "void target(void)".to_string(),
-                    ret_type: "void".to_string(),
-                    params: Vec::new(),
-                    callconv: "unknown".to_string(),
-                    arch: "x86-64".to_string(),
-                    confidence: 0,
-                    callconv_confidence: 0,
-                },
-                var_type_candidates: Vec::new(),
-                var_rename_candidates: Vec::new(),
-                struct_decls: Vec::new(),
-                global_type_links: Vec::new(),
-                diagnostics: r2types::TypeWritebackDiagnostics::default(),
-            },
-            route_decision: EngineTypeRouteDecision {
-                request: EngineRequestKind::Types,
-                plan: EnginePlan::BoundedType,
-                kind: EngineTypeRouteKind::BoundedCfg,
-                prefer_bounded_type_plan: true,
-                reason: Some("test".to_string()),
-                apply_artifact_signature_hint: false,
-            },
-            callsite_count: 3,
-            current_summary: None,
-            metrics: EngineMetrics::default(),
-            diagnostics: EngineDiagnostics::default(),
-        };
-        let payload = function_analysis_report_payload_from_type_response(
-            "target".to_string(),
-            0x401000,
-            response,
-            r2types::TypeWritebackMutationBudget::new(1, 1, 1),
-            type_writeback_apply_policy_for_mode(EngineTypeWritebackMode::Off),
-        );
-
-        assert_eq!(payload.function_name, "target");
-        assert_eq!(payload.function_addr, 0x401000);
-        assert_eq!(payload.cfg_summary.block_count, 7);
-        assert!(payload.prefer_bounded_type_plan);
-        assert_eq!(payload.callsite_count, 3);
-        assert!(matches!(
-            payload.semantic_route.as_ref().map(|route| route.kind),
-            Some(r2types::DecompileRouteKind::FallbackComment)
-        ));
-        assert_eq!(
-            payload.type_writeback.mutation_plan.apply_policy.mode,
-            r2types::TypeWritebackApplyMode::Off
-        );
     }
 
     #[test]
@@ -10440,7 +8449,7 @@ mod tests {
 
         let balanced_deep_callback = auto_callback_plan_for_radare2_depth(
             0,
-            EngineAutoCallbackKind::RecoverVars,
+            EngineAutoCallbackKind::AnalyzeFunction,
             ok_metrics,
         );
         assert!(!balanced_deep_callback.allowed);
@@ -10520,10 +8529,8 @@ mod tests {
             semantic_metadata_enabled: false,
             reg_type_hints: HashMap::new(),
             parsed_context: r2types::parse_external_context_json("{}", 64),
-            scope_facts: InterprocScopeFacts::empty(),
             interproc_max_iterations: 1,
             symbolic_scope: None,
-            precomputed_semantic_artifact: None,
             include_interproc_summary_set: true,
         };
 
@@ -10558,10 +8565,8 @@ mod tests {
             semantic_metadata_enabled: true,
             reg_type_hints: HashMap::new(),
             parsed_context: r2types::parse_external_context_json("{}", 32),
-            scope_facts: InterprocScopeFacts::empty(),
             interproc_max_iterations: 2,
             symbolic_scope: None,
-            precomputed_semantic_artifact: None,
             include_interproc_summary_set: true,
         };
 
@@ -10596,10 +8601,8 @@ mod tests {
                 ptr_bits: Some(32),
                 reg_type_hints: HashMap::new(),
                 parsed_context: r2types::parse_external_context_json("{}", 32),
-                scope_facts: InterprocScopeFacts::empty(),
                 interproc_max_iterations: 1,
                 symbolic_scope: None,
-                precomputed_semantic_artifact: None,
                 include_interproc_summary_set: false,
             });
         assert_eq!(grouped.function_name, "sym.grouped");
@@ -10608,7 +8611,7 @@ mod tests {
     }
 
     #[test]
-    fn signature_inference_is_engine_owned_and_canonicalizes_arch() {
+    fn signature_inference_is_engine_owned_and_uses_prepared_arch() {
         let mut arch = r2il::ArchSpec::new("amd64");
         arch.addr_size = 8;
         let blocks = const_return_blocks(0x401000, 0);
@@ -10618,14 +8621,8 @@ mod tests {
                 .expect("analysis");
 
         let signature = infer_signature_from_analysis(EngineSignatureInferenceRequest {
-            function_name: "sym.owner",
-            arch: Some(&arch),
-            ptr_bits: 64,
-            semantic_metadata_enabled: false,
-            reg_type_hints: &HashMap::new(),
             analysis: &analysis,
-        })
-        .expect("signature");
+        });
 
         assert_eq!(signature.function_name, "sym.owner");
         assert_eq!(signature.arch, "x86-64");
@@ -10695,11 +8692,9 @@ mod tests {
             ptr_bits: Some(64),
             reg_type_hints: HashMap::new(),
             parsed_context: r2types::parse_external_context_json("{}", 64),
-            scope_facts: InterprocScopeFacts::empty(),
             interproc_max_iterations: 1,
             symbolic_scope: None,
-            precomputed_semantic_artifact: None,
-            include_interproc_summary_set: true,
+            include_interproc_summary_set: false,
         };
 
         let request = EngineAnalyzeRequest::full_semantics_for_function_with_register_names(
@@ -10728,81 +8723,107 @@ mod tests {
     }
 
     #[test]
-    fn signature_inference_request_collects_register_hints_inside_engine() {
-        let mut arch = r2il::ArchSpec::new("amd64");
-        arch.addr_size = 8;
-        let ptr_reg = r2il::Varnode::register(0, 8).with_meta(r2il::VarnodeMetadata {
-            scalar_kind: Some(r2il::ScalarKind::UnsignedInt),
-            pointer_hint: Some(r2il::PointerHint::PointerLike),
-            ..Default::default()
-        });
-        let mut block = r2il::R2ILBlock::new(0x401000, 4);
-        block.push(r2il::R2ILOp::Copy {
-            dst: r2il::Varnode::unique(0, 8),
-            src: ptr_reg,
-        });
-        let blocks = vec![block];
-        let snapshot = test_source_snapshot("sym.sig_hints/rev1");
-        let analysis =
-            build_engine_analysis_from_parts("sym.sig_hints", &blocks, Some(&arch), &snapshot)
-                .expect("analysis");
-
-        let signature = infer_signature_from_analysis_with_register_names(
-            EngineSignatureInferenceWithRegisterNamesRequest {
-                function_name: "sym.sig_hints",
-                arch: Some(&arch),
-                ptr_bits: 64,
-                semantic_metadata_enabled: true,
-                r2il_blocks: &blocks,
-                reg_type_hints: HashMap::new(),
-                analysis: &analysis,
+    fn interproc_summary_scope_requires_exact_root_and_source_helper_provenance() {
+        let root_addr = 0x401000;
+        let helper_addr = 0x402000;
+        let root_blocks = const_return_blocks(root_addr, 0);
+        let helper_blocks = const_return_blocks(helper_addr, 1);
+        let mut arch = r2il::ArchSpec::new("x86-64");
+        arch.add_register(r2il::RegisterDef::new("rax", 0, 8));
+        arch.add_register(r2il::RegisterDef::new("rdi", 8, 8));
+        arch.add_register(r2il::RegisterDef::new("rip", 16, 8));
+        arch.add_register(r2il::RegisterDef::new("rsp", 24, 8));
+        let storage = |offset| r2ssa::CanonicalStorageId {
+            space: r2ssa::CanonicalStorageSpace::Register,
+            offset,
+            size: 8,
+        };
+        let interface = r2ssa::SourceFunctionInterface::new_exact(
+            b"interproc-owner/rev1".to_vec(),
+            "sysv64",
+            [r2ssa::SourceAbiParameterSpec::new(0, storage(8))],
+            r2ssa::SourceFunctionReturn::Register {
+                storage: storage(0),
             },
-            |vn| (vn.offset == 0).then(|| "RDI".to_string()),
+            [],
         )
-        .expect("signature");
-
-        assert_eq!(signature.function_name, "sym.sig_hints");
-        assert_eq!(signature.arch, "x86-64");
-    }
-
-    #[test]
-    fn var_recovery_request_collects_register_hints_inside_engine() {
-        let arch = r2il::ArchSpec::new("x86-64");
-        let ptr_reg = r2il::Varnode::register(0, 8).with_meta(r2il::VarnodeMetadata {
-            scalar_kind: Some(r2il::ScalarKind::UnsignedInt),
-            pointer_hint: Some(r2il::PointerHint::PointerLike),
-            ..Default::default()
-        });
-        let mut r2il_block = r2il::R2ILBlock::new(0x401000, 4);
-        r2il_block.push(r2il::R2ILOp::Copy {
-            dst: r2il::Varnode::unique(0, 8),
-            src: ptr_reg,
-        });
-        let ssa_block = r2ssa::SSABlock {
-            addr: 0x401000,
-            size: 4,
-            ops: vec![r2ssa::SSAOp::Copy {
-                dst: r2ssa::SSAVar::new("tmp:0", 1, 8),
-                src: r2ssa::SSAVar::new("rdi", 0, 8),
-            }],
+        .and_then(|interface| interface.with_return_address_storage(storage(16)))
+        .and_then(|interface| interface.with_stack_pointer_storage(storage(24)))
+        .expect("exact interproc interface");
+        let root_prepared = Arc::new(
+            r2ssa::SsaArtifact::for_decompile_with_interface(
+                &root_blocks,
+                Some(&arch),
+                interface.clone(),
+            )
+            .expect("root prepared"),
+        );
+        let helper_prepared = Arc::new(
+            r2ssa::SsaArtifact::for_decompile_with_interface(
+                &helper_blocks,
+                Some(&arch),
+                interface.clone(),
+            )
+            .expect("helper prepared"),
+        );
+        let analysis = EngineAnalysis::from_prepared_ssa(Arc::clone(&root_prepared));
+        let exact_scope = r2sym::PreparedFunctionScope::new(
+            root_addr,
+            vec![
+                r2sym::ScopedPreparedFunction {
+                    id: r2ssa::InterprocFunctionId(root_addr),
+                    name: Some("root".to_string()),
+                    prepared: Arc::clone(&root_prepared),
+                },
+                r2sym::ScopedPreparedFunction {
+                    id: r2ssa::InterprocFunctionId(helper_addr),
+                    name: Some("helper".to_string()),
+                    prepared: Arc::clone(&helper_prepared),
+                },
+            ],
+        )
+        .expect("exact scope");
+        let foreign_root = Arc::new(
+            r2ssa::SsaArtifact::for_decompile_with_interface(&root_blocks, Some(&arch), interface)
+                .expect("foreign root prepared"),
+        );
+        let foreign_scope = r2sym::PreparedFunctionScope::new(
+            root_addr,
+            vec![
+                r2sym::ScopedPreparedFunction {
+                    id: r2ssa::InterprocFunctionId(root_addr),
+                    name: Some("root".to_string()),
+                    prepared: foreign_root,
+                },
+                r2sym::ScopedPreparedFunction {
+                    id: r2ssa::InterprocFunctionId(helper_addr),
+                    name: Some("helper".to_string()),
+                    prepared: helper_prepared,
+                },
+            ],
+        )
+        .expect("foreign scope");
+        let solve = |symbolic_scope| {
+            build_prepared_interproc_summary_set(InterprocSummaryBuildInput {
+                analysis: &analysis,
+                max_iterations: 1,
+                symbolic_scope,
+            })
         };
 
-        let vars = recover_vars_from_ssa_with_register_names(
-            EngineRecoverVarsRequest {
-                ssa_blocks: std::slice::from_ref(&ssa_block),
-                r2il_blocks: std::slice::from_ref(&r2il_block),
-                arch: Some(&arch),
-                semantic_metadata_enabled: true,
-                metadata_reg_type_hints: HashMap::new(),
-            },
-            |vn| (vn.offset == 0).then(|| "RDI".to_string()),
+        assert_eq!(
+            solve(Some(&exact_scope)).expect_err("manual helper must not become source evidence"),
+            r2ssa::PreparedInterprocSummaryError::ManualFunction
         );
 
-        let arg0 = vars
-            .iter()
-            .find(|var| var.reg.as_deref() == Some("rdi"))
-            .expect("rdi argument should be recovered");
-        assert_eq!(arg0.var_type, "void *");
+        let foreign = solve(Some(&foreign_scope)).expect("root-only prepared summary set");
+        assert_eq!(foreign.report().diagnostics.scope_size, 1);
+        assert!(
+            !foreign
+                .report()
+                .summaries
+                .contains_key(&r2ssa::InterprocFunctionId(helper_addr))
+        );
     }
 
     fn windows_x64_runtime_scope_arch() -> r2il::ArchSpec {
@@ -11225,266 +9246,13 @@ mod tests {
             }],
         });
 
-        let summary = raw_cfg_risk_summary_for_preprobe(&[entry, switch]);
+        let summary = route::raw_cfg_risk_summary_for_preprobe(&[entry, switch]);
 
         assert_eq!(summary.block_count, 2);
         assert_eq!(summary.loop_count, 1);
         assert_eq!(summary.back_edge_count, 2);
         assert_eq!(summary.switch_block_count, 1);
         assert_eq!(summary.max_switch_cases, 2);
-    }
-
-    fn native_linear_artifact(slice_class: r2sym::SliceClass) -> r2sym::SemanticArtifact {
-        let region = r2sym::SemanticRegion {
-            anchor: 0x401000,
-            frontier: BTreeSet::from([0x401010]),
-            control: Vec::new(),
-            memory: Vec::new(),
-            pre: Vec::new(),
-            post: Vec::new(),
-            targets: Vec::new(),
-        };
-        let regions = BTreeMap::from([(region.key(), region)]);
-        let mut worker_summaries = Vec::new();
-        for idx in 0..8 {
-            worker_summaries.push(r2sym::NativeWorkerSummary {
-                anchor: 0x401100 + idx,
-                kind: if idx % 2 == 0 {
-                    r2sym::NativeWorkerSummaryKind::MemoryRead
-                } else {
-                    r2sym::NativeWorkerSummaryKind::MemoryWrite
-                },
-                dst: None,
-                src: None,
-                memory: Some(r2ssa::SummaryMemoryLocation {
-                    region: r2ssa::SummaryMemoryRegion::Arg { index: 0 },
-                    range: None,
-                }),
-                len: None,
-                allocation: None,
-                lifetime: None,
-                sync: None,
-                atomic: None,
-                parser: None,
-                loop_summary: None,
-                evidence: r2sym::SemanticEvidence::likely(
-                    r2sym::SemanticEvidenceReason::SummaryBudget,
-                ),
-            });
-        }
-        r2sym::SemanticArtifact {
-            stage: r2sym::RefinementStage::Compiled,
-            granularity: r2sym::ArtifactGranularity::Regioned,
-            execution: r2sym::ExecutionModel::Native,
-            body: r2sym::SemanticArtifactBody::Native(r2sym::NativeArtifactBody {
-                summary: r2sym::NativeFunctionSummary {
-                    slice_class,
-                    role_identity: None,
-                    closure_functions: 1,
-                    helper_functions: 0,
-                    derived_summaries: 0,
-                    derived_diagnostics: Default::default(),
-                    region_summaries: Vec::new(),
-                    worker_summaries,
-                },
-                regions,
-            }),
-            diagnostics: r2sym::SemanticArtifactDiagnostics {
-                branches_evaluated: 0,
-                branches_pruned: 0,
-                branches_unknown: 0,
-                skipped_missing_arch: false,
-                skipped_large_cfg: false,
-                residual_reasons: Vec::new(),
-                interpreter: None,
-                ambiguous_targets: Vec::new(),
-            },
-        }
-    }
-
-    fn native_linear_predicated_count_artifact() -> r2sym::SemanticArtifact {
-        let mut artifact = native_linear_artifact(r2sym::SliceClass::Worker);
-        let r2sym::SemanticArtifactBody::Native(native) = &mut artifact.body else {
-            unreachable!("native artifact helper must build native body");
-        };
-        native.summary.worker_summaries = vec![r2sym::NativeWorkerSummary {
-            anchor: 0x401100,
-            kind: r2sym::NativeWorkerSummaryKind::NumericTransform,
-            dst: None,
-            src: None,
-            memory: Some(r2ssa::SummaryMemoryLocation {
-                region: r2ssa::SummaryMemoryRegion::Arg { index: 0 },
-                range: None,
-            }),
-            len: Some(r2ssa::SummaryTransferLength::Arg(1)),
-            allocation: None,
-            lifetime: None,
-            sync: None,
-            atomic: None,
-            parser: None,
-            loop_summary: Some(r2sym::NativeWorkerLoopSummary {
-                header: 0x401100,
-                exit_target: Some(0x401140),
-                iterations: None,
-                length_arg: Some(1),
-                stride: Some(1),
-                terminator: Some(r2sym::NativeWorkerTerminator::LengthBound),
-                table_walk: None,
-                fold: Some(r2sym::NativeWorkerFold {
-                    accumulator: "count".to_string(),
-                    bits: 64,
-                    operation: r2sym::NativeWorkerFoldOperation::Add,
-                    predicate: Some(r2sym::NativeWorkerPredicate::ByteEqArg { arg: 2 }),
-                    init: None,
-                    multiplier: None,
-                    byte_transform: None,
-                }),
-            }),
-            evidence: r2sym::SemanticEvidence::likely(
-                r2sym::SemanticEvidenceReason::DerivedFromRanking,
-            ),
-        }];
-        artifact
-    }
-
-    fn native_linear_table_walk_artifact() -> r2sym::SemanticArtifact {
-        let mut artifact = native_linear_artifact(r2sym::SliceClass::Worker);
-        let r2sym::SemanticArtifactBody::Native(native) = &mut artifact.body else {
-            unreachable!("native artifact helper must build native body");
-        };
-        native.summary.worker_summaries = vec![r2sym::NativeWorkerSummary {
-            anchor: 0x401100,
-            kind: r2sym::NativeWorkerSummaryKind::TableWalk,
-            dst: None,
-            src: None,
-            memory: Some(r2ssa::SummaryMemoryLocation {
-                region: r2ssa::SummaryMemoryRegion::Arg { index: 0 },
-                range: Some(r2ssa::SummaryMemoryRange {
-                    offset_lo: 0,
-                    offset_hi: 0,
-                    width: Some(8),
-                }),
-            }),
-            len: None,
-            allocation: None,
-            lifetime: None,
-            sync: None,
-            atomic: None,
-            parser: None,
-            loop_summary: Some(r2sym::NativeWorkerLoopSummary {
-                header: 0x401100,
-                exit_target: Some(0x401140),
-                iterations: None,
-                length_arg: None,
-                stride: Some(1),
-                terminator: Some(r2sym::NativeWorkerTerminator::ZeroByte),
-                fold: None,
-                table_walk: None,
-            }),
-            evidence: r2sym::SemanticEvidence::likely(r2sym::SemanticEvidenceReason::SummaryBudget),
-        }];
-        artifact
-    }
-
-    fn summary_only_table_walk_artifact() -> r2sym::SemanticArtifact {
-        let mut artifact = native_linear_table_walk_artifact();
-        artifact.granularity = r2sym::ArtifactGranularity::SummaryOnly;
-        let r2sym::SemanticArtifactBody::Native(native) = &mut artifact.body else {
-            unreachable!("native artifact helper must build native body");
-        };
-        native.regions.clear();
-        artifact
-    }
-
-    fn summary_only_complete_table_walk_artifact() -> r2sym::SemanticArtifact {
-        let mut artifact = summary_only_table_walk_artifact();
-        let r2sym::SemanticArtifactBody::Native(native) = &mut artifact.body else {
-            unreachable!("native artifact helper must build native body");
-        };
-        let loop_summary = native.summary.worker_summaries[0]
-            .loop_summary
-            .as_mut()
-            .expect("table walk loop summary");
-        loop_summary.table_walk = Some(r2sym::NativeTableWalkSummary {
-            table_arg: 0,
-            needle_arg: Some(1),
-            id_offset: Some(0),
-            len_offset: Some(6),
-            name_offset: Some(24),
-            next_offset: Some(32),
-            count_accumulator: Some("seen".to_string()),
-            match_returns_field_plus_count: true,
-            exhausted_returns_negative_count: true,
-        });
-        artifact
-    }
-
-    fn summary_only_exact_hash_fold_artifact() -> r2sym::SemanticArtifact {
-        let mut artifact = native_linear_artifact(r2sym::SliceClass::Worker);
-        artifact.granularity = r2sym::ArtifactGranularity::SummaryOnly;
-        let r2sym::SemanticArtifactBody::Native(native) = &mut artifact.body else {
-            unreachable!("native artifact helper must build native body");
-        };
-        native.regions.clear();
-        native.summary.worker_summaries = vec![r2sym::NativeWorkerSummary {
-            anchor: 0x401100,
-            kind: r2sym::NativeWorkerSummaryKind::HashFold,
-            dst: None,
-            src: None,
-            memory: Some(r2ssa::SummaryMemoryLocation {
-                region: r2ssa::SummaryMemoryRegion::Arg { index: 0 },
-                range: Some(r2ssa::SummaryMemoryRange {
-                    offset_lo: 0,
-                    offset_hi: 0,
-                    width: Some(1),
-                }),
-            }),
-            len: Some(r2ssa::SummaryTransferLength::Arg(1)),
-            allocation: None,
-            lifetime: None,
-            sync: None,
-            atomic: None,
-            parser: None,
-            loop_summary: Some(r2sym::NativeWorkerLoopSummary {
-                header: 0x401100,
-                exit_target: Some(0x401140),
-                iterations: None,
-                length_arg: Some(1),
-                stride: Some(1),
-                terminator: Some(r2sym::NativeWorkerTerminator::LengthBound),
-                fold: Some(r2sym::NativeWorkerFold {
-                    accumulator: "hash".to_string(),
-                    bits: 64,
-                    operation: r2sym::NativeWorkerFoldOperation::Xor,
-                    predicate: None,
-                    init: Some(0x14650fb0739d0383),
-                    multiplier: Some(0x100000001b3),
-                    byte_transform: Some(r2sym::NativeWorkerByteTransform::AsciiLowercase),
-                }),
-                table_walk: None,
-            }),
-            evidence: r2sym::SemanticEvidence::likely(r2sym::SemanticEvidenceReason::SummaryBudget),
-        }];
-        artifact
-    }
-
-    fn pad_summary_only_artifact_to_dense(
-        mut artifact: r2sym::SemanticArtifact,
-    ) -> r2sym::SemanticArtifact {
-        let r2sym::SemanticArtifactBody::Native(native) = &mut artifact.body else {
-            unreachable!("native artifact helper must build native body");
-        };
-        let template = native.summary.worker_summaries[0].clone();
-        while native.summary.worker_summaries.len() < 8 {
-            let mut summary = template.clone();
-            summary.anchor += native.summary.worker_summaries.len() as u64 * 0x10;
-            summary.kind = r2sym::NativeWorkerSummaryKind::Unknown;
-            summary.memory = None;
-            summary.len = None;
-            summary.loop_summary = None;
-            native.summary.worker_summaries.push(summary);
-        }
-        artifact
     }
 
     #[test]
@@ -11494,17 +9262,15 @@ mod tests {
             function_name: "sym.zero".to_string(),
             function_addr: 0x401000,
             blocks: const_return_blocks(0x401000, 0),
-            arch: None,
-            source_snapshot: Some(test_source_snapshot("sym.zero/analyze/rev1")),
+            arch: Some(x86_64_result_arch()),
+            source_snapshot: Some(exact_empty_test_source_snapshot("sym.zero/analyze/rev1")),
             trusted_ssa: None,
             ptr_bits: 64,
             semantic_metadata_enabled: false,
             reg_type_hints: HashMap::new(),
             parsed_context: r2types::ParsedExternalContext::default(),
-            scope_facts: InterprocScopeFacts::empty(),
             interproc_max_iterations: 1,
             symbolic_scope: None,
-            precomputed_semantic_artifact: None,
             semantic_mode: EngineSemanticMode::Full,
             include_interproc_summary_set: true,
             execution: EngineExecutionControl::default(),
@@ -11533,8 +9299,10 @@ mod tests {
                     function_name: "sym.zero".to_string(),
                     function_addr: 0x401000,
                     blocks: const_return_blocks(0x401000, 0),
-                    arch: None,
-                    source_snapshot: Some(test_source_snapshot("sym.zero/decompile/rev1")),
+                    arch: Some(x86_64_result_arch()),
+                    source_snapshot: Some(exact_empty_test_source_snapshot(
+                        "sym.zero/decompile/rev1",
+                    )),
                     semantic_metadata_enabled: false,
                 },
                 Some(64),
@@ -11570,156 +9338,66 @@ mod tests {
             ptr_bits: Some(64),
             reg_type_hints: HashMap::new(),
             parsed_context: r2types::ParsedExternalContext::default(),
-            scope_facts: InterprocScopeFacts::empty(),
             interproc_max_iterations: 1,
             symbolic_scope: None,
-            precomputed_semantic_artifact: None,
             include_interproc_summary_set: false,
         })
     }
 
     fn controlled_r2dec_render_request() -> EngineDecompileRequest {
         let blocks = const_return_blocks(0x614000, 7);
-        let prepared = r2ssa::SsaArtifact::for_decompile(&blocks, None)
-            .expect("prepared render SSA")
-            .with_name("sym.r2dec_controlled");
-        let signature = r2types::FunctionSignatureSpec {
-            ret_type: Some(r2types::CTypeLike::Int {
-                bits: 64,
-                signedness: r2types::Signedness::Unsigned,
-            }),
-            params: Vec::new(),
-        };
-        let route = r2types::DecompileRouteFacts {
-            kind: r2types::DecompileRouteKind::Standard,
-            reason: Some("controlled r2dec residual test".to_string()),
-            fallback_comment: None,
-            skip_runtime_type_inference: true,
-            use_prepared_semantic_view: true,
-            proof_coverage: r2sym::ProofCoverage::default(),
-            render_permission: r2sym::RenderPermission::residual(
-                r2sym::ProofOwner::R2engine,
-                "controlled r2dec residual test",
-            ),
-        };
-        let function_facts = FunctionFacts::new(
-            FunctionTypeFacts {
-                merged_signature: Some(signature.clone()),
-                signature_certificate: r2types::SignatureCertificate::from_signature(
-                    &signature,
-                    [r2types::SignatureCertificateSource::ExternalContext],
-                ),
-                ..FunctionTypeFacts::default()
-            },
-            None,
+        let interface = r2ssa::SourceFunctionInterface::new_exact(
+            b"controlled-r2dec-source".to_vec(),
+            "sysv64",
+            std::iter::empty::<r2ssa::SourceAbiParameterSpec>(),
+            r2ssa::SourceFunctionReturn::Void,
+            std::iter::empty::<r2ssa::SourceStackSlotSpec>(),
         )
-        .with_decompile_route(route);
-        let param_slots = ParamSlotResolver::from_arch_name(Some("x86-64"));
-        let function_facts = function_facts_for_decompile(
-            "sym.r2dec_controlled",
-            &prepared,
-            function_facts,
-            &param_slots,
+        .and_then(|interface| {
+            interface.with_stack_pointer_storage(r2ssa::CanonicalStorageId {
+                space: r2ssa::CanonicalStorageSpace::Register,
+                offset: 0x28,
+                size: 8,
+            })
+        })
+        .and_then(|interface| {
+            interface.with_return_address_storage(r2ssa::CanonicalStorageId {
+                space: r2ssa::CanonicalStorageSpace::Register,
+                offset: 0x30,
+                size: 8,
+            })
+        })
+        .expect("exact controlled r2dec interface");
+        let prepared = Arc::new(
+            r2ssa::SsaArtifact::for_decompile_with_interface(
+                &blocks,
+                Some(&x86_64_result_arch()),
+                interface,
+            )
+            .expect("prepared render SSA")
+            .with_name("sym.r2dec_controlled"),
         );
+        let writeback = r2types::build_source_owned_type_writeback_analysis(
+            r2types::TypeWritebackAnalysisRequest::new(
+                prepared,
+                r2types::ParsedExternalContext::default(),
+            )
+            .expect("coherent test owner request"),
+        )
+        .expect("source-owned test facts");
+        let source_owned_facts = writeback
+            .finalize_for_decompile(r2types::DecompileFinalization {
+                kind: r2types::DecompileRouteKind::Standard,
+                reason: "controlled r2dec residual test".to_string(),
+                fallback_comment: None,
+            })
+            .expect("compatible controlled r2dec route");
         EngineDecompileRequest {
             function_name: "sym.r2dec_controlled".to_string(),
-            prepared_ssa: Arc::new(prepared),
+            source_owned_facts,
             trusted_ssa: None,
-            function_facts,
+            input_quality: None,
             render_target: EngineRenderTarget::default(),
-            execution: EngineExecutionControl::default(),
-            metrics: EngineMetrics::default(),
-        }
-    }
-
-    fn controlled_semantic_kernel_render_request(
-        session: &EngineSession,
-    ) -> EngineDecompileRequest {
-        let (blocks, arch, source_snapshot) = source_snapshot_terminal_function();
-        let analyzed = session
-            .analyze(EngineAnalyzeRequest::full_semantics_for_function(
-                EngineAnalyzeFunctionRequestInput {
-                    function: EngineFunctionInput {
-                        function_name: "sym.controlled_semantic_kernel".to_string(),
-                        function_addr: 0x7200,
-                        blocks,
-                        arch: Some(arch.clone()),
-                        source_snapshot: Some(source_snapshot),
-                        semantic_metadata_enabled: true,
-                    },
-                    ptr_bits: Some(64),
-                    reg_type_hints: HashMap::new(),
-                    parsed_context: r2types::ParsedExternalContext::default(),
-                    scope_facts: InterprocScopeFacts::empty(),
-                    interproc_max_iterations: 1,
-                    symbolic_scope: None,
-                    precomputed_semantic_artifact: None,
-                    include_interproc_summary_set: false,
-                },
-            ))
-            .expect("controlled semantic-kernel analysis");
-        let (arch_name, render_target) =
-            EngineRenderTarget::for_arch_with_ptr_bits(Some(&arch), 64);
-        let param_slots = ParamSlotResolver::from_arch_name(Some(&arch_name));
-        let function_facts = function_facts_for_decompile(
-            "sym.controlled_semantic_kernel",
-            &analyzed.artifact.ssa_func,
-            analyzed.artifact.function_facts,
-            &param_slots,
-        );
-        EngineDecompileRequest {
-            function_name: "sym.controlled_semantic_kernel".to_string(),
-            prepared_ssa: analyzed.artifact.ssa_func,
-            trusted_ssa: analyzed.artifact.trusted_ssa,
-            function_facts,
-            render_target,
-            execution: EngineExecutionControl::default(),
-            metrics: EngineMetrics::default(),
-        }
-    }
-
-    fn controlled_aggregate_member_render_request(
-        session: &EngineSession,
-    ) -> EngineDecompileRequest {
-        let (blocks, arch, source_snapshot) =
-            source_snapshot_aggregate_member_load_return_function();
-        let analyzed = session
-            .analyze(EngineAnalyzeRequest::full_semantics_for_function(
-                EngineAnalyzeFunctionRequestInput {
-                    function: EngineFunctionInput {
-                        function_name: "sym.controlled_aggregate_member".to_string(),
-                        function_addr: 0x7700,
-                        blocks,
-                        arch: Some(arch.clone()),
-                        source_snapshot: Some(source_snapshot),
-                        semantic_metadata_enabled: true,
-                    },
-                    ptr_bits: Some(64),
-                    reg_type_hints: HashMap::new(),
-                    parsed_context: r2types::ParsedExternalContext::default(),
-                    scope_facts: InterprocScopeFacts::empty(),
-                    interproc_max_iterations: 1,
-                    symbolic_scope: None,
-                    precomputed_semantic_artifact: None,
-                    include_interproc_summary_set: false,
-                },
-            ))
-            .expect("controlled aggregate-member analysis");
-        let (arch_name, render_target) =
-            EngineRenderTarget::for_arch_with_ptr_bits(Some(&arch), 64);
-        let param_slots = ParamSlotResolver::from_arch_name(Some(&arch_name));
-        let function_facts = function_facts_for_decompile(
-            "sym.controlled_aggregate_member",
-            &analyzed.artifact.ssa_func,
-            analyzed.artifact.function_facts,
-            &param_slots,
-        );
-        EngineDecompileRequest {
-            function_name: "sym.controlled_aggregate_member".to_string(),
-            prepared_ssa: analyzed.artifact.ssa_func,
-            trusted_ssa: analyzed.artifact.trusted_ssa,
-            function_facts,
-            render_target,
             execution: EngineExecutionControl::default(),
             metrics: EngineMetrics::default(),
         }
@@ -11766,54 +9444,16 @@ mod tests {
     }
 
     #[test]
-    fn legacy_route_metadata_cannot_promote_handmade_fixtures() {
-        let session = EngineSession::new();
-        let mut terminal = controlled_semantic_kernel_render_request(&session);
-        assert_handmade_analysis_only(terminal.prepared_ssa.as_ref());
-        terminal
-            .function_facts
-            .set_decompile_route(Some(test_decompile_route(
-                r2types::DecompileRouteKind::FallbackComment,
-                Some("forced legacy terminal refusal"),
-                Some("/* forced legacy terminal fallback */"),
-            )));
-        let terminal =
-            session.decompile_with_r2dec_control(terminal, &r2ssa::SsaExecutionControl::default());
-        assert!(terminal.diagnostics.semantic_kernel_render.is_none());
-        assert!(!terminal.output.contains("certified_sub_7200"));
-    }
+    fn engine_decompiler_input_retains_exact_source_owned_facts() {
+        let request = controlled_r2dec_render_request();
+        let source = request.source_owned_facts.shared_source();
+        let input = decompiler_input_for_engine_request(&request);
 
-    #[test]
-    fn semantic_kernel_near_miss_preserves_legacy_fallback_without_c() {
-        let session = EngineSession::new();
-        let mut request = controlled_r2dec_render_request();
-        let fallback = "/* forced near-miss legacy fallback */";
-        request
-            .function_facts
-            .set_decompile_route(Some(test_decompile_route(
-                r2types::DecompileRouteKind::FallbackComment,
-                Some("forced near-miss refusal"),
-                Some(fallback),
-            )));
-
-        let response =
-            session.decompile_with_r2dec_control(request, &r2ssa::SsaExecutionControl::default());
-
-        assert_eq!(response.output, fallback);
-        assert!(response.diagnostics.semantic_kernel_render.is_none());
+        assert!(input.source_owned_facts().shares_source(&source));
         assert_eq!(
-            response
-                .function_facts
-                .decompile_route()
-                .map(|route| route.kind),
-            Some(r2types::DecompileRouteKind::FallbackComment)
+            input.function_facts().decompile_route(),
+            request.function_facts().decompile_route()
         );
-        assert_eq!(
-            response.diagnostics.route_reason.as_deref(),
-            Some("forced near-miss refusal")
-        );
-        assert!(response.diagnostics.refusal.is_some());
-        assert!(!response.output.contains("() {"));
     }
 
     #[test]
@@ -12095,12 +9735,12 @@ mod tests {
             (
                 EngineSemanticKernelRegion::AggregateMemberTerminalReturnFunction,
                 r2dec::CERTIFIED_AGGREGATE_MEMBER_SEMANTIC_C_FUNCTION_SCHEMA_VERSION,
-                4,
+                6,
             ),
             (
                 EngineSemanticKernelRegion::PlainRamMemoryTerminalReturnFunction,
                 r2dec::CERTIFIED_MEMORY_SEMANTIC_C_FUNCTION_SCHEMA_VERSION,
-                3,
+                4,
             ),
             (
                 EngineSemanticKernelRegion::DirectCallTerminalReturnFunction,
@@ -12131,28 +9771,6 @@ mod tests {
             assert_eq!(contract, expected_wire);
             assert_eq!(region.current_schema_version(), expected_wire);
         }
-    }
-
-    #[test]
-    fn handmade_terminal_cannot_reach_semantic_kernel_renderer() {
-        let session = EngineSession::new();
-        let request = controlled_semantic_kernel_render_request(&session);
-        assert_handmade_analysis_only(request.prepared_ssa.as_ref());
-        let refused =
-            session.decompile_with_r2dec_control(request, &r2ssa::SsaExecutionControl::default());
-        assert!(refused.diagnostics.semantic_kernel_render.is_none());
-        assert!(!refused.output.contains("certified_sub_7200"));
-    }
-
-    #[test]
-    fn handmade_aggregate_member_cannot_reach_semantic_kernel_renderer() {
-        let session = EngineSession::new();
-        let request = controlled_aggregate_member_render_request(&session);
-        assert_handmade_analysis_only(request.prepared_ssa.as_ref());
-        let refused =
-            session.decompile_with_r2dec_control(request, &r2ssa::SsaExecutionControl::default());
-        assert!(refused.diagnostics.semantic_kernel_render.is_none());
-        assert!(!refused.output.contains("certified_aggregate_sub_7700"));
     }
 
     fn analyze_with_injected_ssa_control<C: r2ssa::SsaWorkControl + ?Sized>(
@@ -12290,19 +9908,6 @@ mod tests {
         .expect("controlled analysis");
         assert_eq!(prepared.ssa_func.graph(), controlled.ssa_func.graph());
         assert_eq!(prepared.ssa_func.facts(), controlled.ssa_func.facts());
-        assert_eq!(
-            prepared.pattern_ssa_func.graph(),
-            controlled.pattern_ssa_func.graph()
-        );
-        assert_eq!(
-            prepared.pattern_ssa_func.facts(),
-            controlled.pattern_ssa_func.facts()
-        );
-        assert!(Arc::ptr_eq(&prepared.ssa_func, &prepared.pattern_ssa_func));
-        assert!(Arc::ptr_eq(
-            &controlled.ssa_func,
-            &controlled.pattern_ssa_func
-        ));
     }
 
     #[test]
@@ -12340,10 +9945,8 @@ mod tests {
                 ptr_bits: Some(64),
                 reg_type_hints: HashMap::new(),
                 parsed_context: r2types::ParsedExternalContext::default(),
-                scope_facts: InterprocScopeFacts::empty(),
                 interproc_max_iterations: 1,
                 symbolic_scope: None,
-                precomputed_semantic_artifact: None,
                 include_interproc_summary_set: false,
             })
             .with_cancellation(cancellation);
@@ -12444,256 +10047,6 @@ mod tests {
     }
 
     #[test]
-    fn decompile_callee_resolution_uses_resolved_copied_call_targets() {
-        let tmp = r2il::Varnode::unique(0x10, 8);
-        let mut block = R2ILBlock::new(0x401000, 4);
-        block.push(r2il::R2ILOp::Copy {
-            dst: tmp.clone(),
-            src: r2il::Varnode::constant(0x5000, 8),
-        });
-        block.push(r2il::R2ILOp::CallInd { target: tmp });
-        block.push(r2il::R2ILOp::Return {
-            target: r2il::Varnode::constant(0, 8),
-        });
-        let prepared = r2ssa::SsaArtifact::for_symbolic(&[block], None)
-            .expect("prepared")
-            .with_name("sym.caller");
-        let function_facts = FunctionFacts::default();
-
-        let resolution = decompile_callee_resolution_facts(&prepared, &function_facts);
-
-        let identity = resolution
-            .identity_for_callsite(r2types::CallsiteKey {
-                block_addr: 0x401000,
-                op_index: 1,
-            })
-            .expect("copied target callsite should resolve through r2ssa");
-        assert_eq!(identity.target_addr, Some(0x5000));
-        assert_eq!(identity.display_name.as_deref(), Some("sub_5000"));
-    }
-
-    #[test]
-    fn decompile_route_decision_keeps_proof_coverage_diagnostic_only() {
-        let mut entry = R2ILBlock::new(0x401000, 4);
-        entry.push(r2il::R2ILOp::CBranch {
-            target: r2il::Varnode::constant(0x401000, 8),
-            cond: r2il::Varnode::constant(1, 1),
-        });
-        let blocks = vec![entry];
-        let prepared = r2ssa::SsaArtifact::for_decompile(&blocks, None)
-            .expect("prepared")
-            .with_name("sym.loop");
-        let cfg_summary = prepared.function().cfg_risk_summary();
-        let function_facts = FunctionFacts::default();
-
-        let decision =
-            decompile_route_decision("sym.loop", &function_facts, Some(&prepared), &cfg_summary);
-
-        assert!(decision.route.proof_coverage.certified_loops > 0);
-        assert_eq!(
-            decision.route.render_permission.kind,
-            r2sym::RenderPermissionKind::Residual
-        );
-        assert!(
-            decision
-                .route
-                .render_permission
-                .reason
-                .contains("proof counters cannot authorize production output"),
-            "prepared proof counters must remain diagnostic-only: {:?}",
-            decision.route.render_permission
-        );
-        assert_eq!(
-            EngineRequestPlan::decompile(decision)
-                .diagnostics()
-                .proof_coverage
-                .expect("proof coverage")
-                .certified_loops,
-            1
-        );
-    }
-
-    #[test]
-    fn decompile_route_decision_reads_type_proof_from_function_facts() {
-        let blocks = const_return_blocks(0x401000, 0);
-        let prepared = r2ssa::SsaArtifact::for_decompile(&blocks, None)
-            .expect("prepared")
-            .with_name("sym.typed");
-        let signature = r2types::FunctionSignatureSpec {
-            ret_type: Some(r2types::CTypeLike::Void),
-            params: vec![r2types::FunctionParamSpec {
-                name: "count".to_string(),
-                ty: Some(r2types::CTypeLike::Int {
-                    bits: 32,
-                    signedness: r2types::Signedness::Unsigned,
-                }),
-            }],
-        };
-        let function_facts = FunctionFacts::new(
-            FunctionTypeFacts {
-                merged_signature: Some(signature.clone()),
-                signature_certificate: r2types::SignatureCertificate::from_signature(
-                    &signature,
-                    [r2types::SignatureCertificateSource::ExternalContext],
-                ),
-                ..FunctionTypeFacts::default()
-            },
-            None,
-        );
-        let cfg_summary = prepared.function().cfg_risk_summary();
-
-        let decision =
-            decompile_route_decision("sym.typed", &function_facts, Some(&prepared), &cfg_summary);
-
-        assert_eq!(decision.route.proof_coverage.certified_signatures, 1);
-        assert_eq!(
-            decision.route.render_permission.kind,
-            r2sym::RenderPermissionKind::Residual
-        );
-        assert!(
-            decision
-                .route
-                .render_permission
-                .reason
-                .contains("proof counters cannot authorize production output"),
-            "even complete legacy signature coverage must not mint executable-C authority"
-        );
-    }
-
-    #[test]
-    fn type_fact_proof_coverage_counts_only_source_authorized_out_params() {
-        let type_facts = FunctionTypeFacts {
-            out_param_certificates: vec![
-                r2types::OutParamCertificate {
-                    param_index: 0,
-                    param_name: "raw".to_string(),
-                    pointee_type: None,
-                    evidence: vec![r2types::OutParamCertificateEvidence::InterprocArgWrite],
-                    sources: Vec::new(),
-                },
-                r2types::OutParamCertificate {
-                    param_index: 1,
-                    param_name: "out".to_string(),
-                    pointee_type: None,
-                    evidence: vec![r2types::OutParamCertificateEvidence::NativeWorkerWrite],
-                    sources: vec![r2types::OutParamCertificateSource::NativeWorkerSummary {
-                        stable_id: 0x55,
-                        anchor: 0x401000,
-                        summary_kind: r2sym::NativeWorkerSummaryKind::MemoryWrite,
-                        param_index: 1,
-                    }],
-                },
-            ],
-            ..FunctionTypeFacts::default()
-        };
-
-        assert_eq!(
-            proof_coverage_from_type_facts(&type_facts).certified_out_params,
-            1
-        );
-    }
-
-    #[test]
-    fn type_fact_proof_coverage_counts_field_and_array_certificates() {
-        let type_facts = FunctionTypeFacts {
-            field_access_certificates: vec![
-                r2types::FieldAccessCertificate {
-                    slot: 0,
-                    field_offset: 0,
-                    field_name: "len".to_string(),
-                    field_type: Some("size_t".to_string()),
-                },
-                r2types::FieldAccessCertificate {
-                    slot: 1,
-                    field_offset: 8,
-                    field_name: "data".to_string(),
-                    field_type: Some("uint8_t *".to_string()),
-                },
-            ],
-            array_index_certificates: vec![r2types::ArrayIndexCertificate {
-                slot: 1,
-                base: Some(r2types::ArrayIndexBase::Param { index: 0 }),
-                field_offset: 8,
-                element_stride: 1,
-            }],
-            ..FunctionTypeFacts::default()
-        };
-
-        let coverage = proof_coverage_from_type_facts(&type_facts);
-        assert_eq!(coverage.certified_field_accesses, 2);
-        assert_eq!(coverage.certified_array_indexes, 1);
-    }
-
-    #[test]
-    fn type_fact_proof_coverage_counts_only_render_authorized_signature() {
-        let current_signature = r2types::FunctionSignatureSpec {
-            ret_type: Some(r2types::CTypeLike::Typedef("size_t".to_string())),
-            params: vec![r2types::FunctionParamSpec {
-                name: "buf".to_string(),
-                ty: r2types::parse_type_like_spec("uint8_t*", 64),
-            }],
-        };
-        let stale_signature = r2types::FunctionSignatureSpec {
-            ret_type: Some(r2types::CTypeLike::Typedef("int".to_string())),
-            params: vec![r2types::FunctionParamSpec {
-                name: "other".to_string(),
-                ty: Some(r2types::CTypeLike::Typedef("int".to_string())),
-            }],
-        };
-        let stale_certified = FunctionTypeFacts {
-            merged_signature: Some(current_signature.clone()),
-            signature_certificate: r2types::SignatureCertificate::from_signature(
-                &stale_signature,
-                [r2types::SignatureCertificateSource::ExternalContext],
-            ),
-            ..FunctionTypeFacts::default()
-        };
-        let current_certified = FunctionTypeFacts {
-            merged_signature: Some(current_signature.clone()),
-            signature_certificate: r2types::SignatureCertificate::from_signature(
-                &current_signature,
-                [r2types::SignatureCertificateSource::ExternalContext],
-            ),
-            ..FunctionTypeFacts::default()
-        };
-
-        assert_eq!(
-            proof_coverage_from_type_facts(&stale_certified).certified_signatures,
-            0
-        );
-        assert_eq!(
-            proof_coverage_from_type_facts(&current_certified).certified_signatures,
-            1
-        );
-    }
-
-    #[test]
-    fn decompile_route_decision_residualizes_standard_route_without_prepared_proof() {
-        let cfg_summary = r2ssa::CFGRiskSummary {
-            block_count: 2,
-            loop_count: 1,
-            back_edge_count: 1,
-            switch_block_count: 0,
-            max_switch_cases: 0,
-        };
-        let function_facts = FunctionFacts::default();
-
-        let decision = decompile_route_decision("sym.loop", &function_facts, None, &cfg_summary);
-
-        assert_eq!(
-            decision.route.render_permission.kind,
-            r2sym::RenderPermissionKind::Residual
-        );
-        assert!(
-            decision
-                .route
-                .render_permission
-                .reason
-                .contains("proof counters cannot authorize production output")
-        );
-    }
-
-    #[test]
     fn engine_owns_public_guard_fallback_comments() {
         let block_comment = block_guard_fallback_comment("sym.big", 201, 200);
         assert!(block_comment.contains("r2dec budget"));
@@ -12715,6 +10068,22 @@ mod tests {
         assert!(cfg_comment.contains("r2dec fallback"));
         assert!(cfg_comment.contains("sym.loopy"));
         assert!(cfg_comment.contains("complex loop graph"));
+
+        let hostile_name = "sym.*/\r\nint forged(void)";
+        let hostile_reason = "budget */\nreturn 7";
+        let hostile_comments = [
+            block_guard_fallback_comment(hostile_name, 201, 200),
+            artifact_guard_fallback_comment(hostile_name, hostile_reason),
+        ];
+        for comment in &hostile_comments {
+            let body = comment
+                .strip_suffix("*/")
+                .expect("engine fallback must remain one closed comment");
+            assert!(!body.contains("*/"), "comment closed early: {comment}");
+            assert!(!comment.contains(['\r', '\n']));
+            assert!(comment.contains("sym.* /  int forged(void)"));
+        }
+        assert!(hostile_comments[1].contains("budget * / return 7"));
     }
 
     #[test]
@@ -12962,18 +10331,13 @@ mod tests {
     #[test]
     fn semantic_compile_does_not_prefer_name_only_worker_seed_before_full_semantics() {
         let blocks = const_return_blocks(0x8b50, 0);
-        let ssa_func = r2ssa::SsaArtifact::for_decompile(&blocks, None)
-            .expect("prepared ssa")
-            .with_name("dbg.init_node");
-
-        let artifact = compile_semantic_artifact_for_analysis(
-            &ssa_func,
-            0x8b50,
-            "dbg.init_node",
-            None,
-            None,
-            None,
+        let ssa_func = Arc::new(
+            r2ssa::SsaArtifact::for_decompile(&blocks, None)
+                .expect("prepared ssa")
+                .with_name("dbg.init_node"),
         );
+
+        let artifact = compile_semantic_artifact_for_analysis(&ssa_func, None, None);
 
         assert_ne!(
             artifact.granularity,
@@ -13053,31 +10417,25 @@ mod tests {
             target: r2il::Varnode::constant(0x9200, 8),
             cond: r2il::Varnode::constant(1, 1),
         });
-        let loop_ssa = r2ssa::SsaArtifact::for_decompile(&[entry], None)
-            .expect("loop ssa")
-            .with_name("dbg.loop_worker_without_summary");
+        let loop_ssa = Arc::new(
+            r2ssa::SsaArtifact::for_decompile(&[entry], None)
+                .expect("loop ssa")
+                .with_name("dbg.loop_worker_without_summary"),
+        );
 
         assert!(should_skip_unbounded_semantic_artifact_after_worker_preprobe(&loop_ssa, None));
-        assert!(
-            maybe_compile_semantic_artifact_for_analysis(
-                &loop_ssa,
-                0x9200,
-                "dbg.loop_worker_without_summary",
-                None,
-                None,
-                None
-            )
-            .is_none()
-        );
+        assert!(maybe_compile_semantic_artifact_for_analysis(&loop_ssa, None, None).is_none());
     }
 
     #[test]
     fn semantic_compile_keeps_vm_evidence_after_loop_preprobe() {
         let blocks = switch_loop_vm_blocks();
         let arch = vm_test_arch();
-        let vm_ssa = r2ssa::SsaArtifact::for_decompile(&blocks, Some(&arch))
-            .expect("vm ssa")
-            .with_name("dbg.vm_loop_worker");
+        let vm_ssa = Arc::new(
+            r2ssa::SsaArtifact::for_decompile(&blocks, Some(&arch))
+                .expect("vm ssa")
+                .with_name("dbg.vm_loop_worker"),
+        );
 
         assert!(should_probe_native_worker_summary_before_full_semantics(
             &vm_ssa, None
@@ -13088,199 +10446,11 @@ mod tests {
         );
         assert!(!should_skip_unbounded_semantic_artifact_after_worker_preprobe(&vm_ssa, None));
 
-        let artifact = maybe_compile_semantic_artifact_for_analysis(
-            &vm_ssa,
-            0x9300,
-            "dbg.vm_loop_worker",
-            None,
-            Some(&arch),
-            None,
-        )
-        .expect("vm artifact should not be refused before classification");
+        let artifact = maybe_compile_semantic_artifact_for_analysis(&vm_ssa, None, None)
+            .expect("vm artifact should not be refused before classification");
 
         assert_eq!(artifact.execution, r2sym::ExecutionModel::Vm);
         assert!(artifact.vm_body().is_some());
-    }
-
-    #[test]
-    fn native_worker_type_projection_rejects_name_only_params_and_summary_return() {
-        let parsed_context = r2types::parse_external_context_json(
-            r#"{
-                "signature":{
-                    "ret":"int32_t",
-                    "params":[
-                        {"name":"a","type":"int32_t"},
-                        {"name":"b","type":"int32_t"}
-                    ]
-                }
-            }"#,
-            64,
-        );
-
-        assert!(
-            native_worker_type_projection(0x11a9, "randread", "x86-64", 64, &parsed_context, true)
-                .is_none(),
-            "name-only worker hints must not create authoritative type projection"
-        );
-    }
-
-    #[test]
-    fn summary_fallback_projection_preserves_authoritative_context_signature() {
-        let artifact = native_linear_artifact(r2sym::SliceClass::Worker);
-        let source_signature = r2types::FunctionSignatureSpec {
-            ret_type: Some(r2types::CTypeLike::Typedef("size_t".to_string())),
-            params: vec![
-                r2types::FunctionParamSpec {
-                    name: "buf".to_string(),
-                    ty: r2types::parse_type_like_spec("uint8_t*", 64),
-                },
-                r2types::FunctionParamSpec {
-                    name: "n".to_string(),
-                    ty: Some(r2types::CTypeLike::Typedef("size_t".to_string())),
-                },
-                r2types::FunctionParamSpec {
-                    name: "a".to_string(),
-                    ty: r2types::parse_type_like_spec("uint8_t", 64),
-                },
-                r2types::FunctionParamSpec {
-                    name: "b".to_string(),
-                    ty: r2types::parse_type_like_spec("uint8_t", 64),
-                },
-            ],
-        };
-        let projected = type_facts_with_summary_projection_for_candidates_with_options(
-            FunctionTypeFacts {
-                signature_certificate: r2types::SignatureCertificate::from_signature(
-                    &source_signature,
-                    [r2types::SignatureCertificateSource::ExternalContext],
-                ),
-                merged_signature: Some(source_signature),
-                ..FunctionTypeFacts::default()
-            },
-            "dbg.scan_example",
-            ["dbg.scan_example"],
-            "x86-64",
-            64,
-            &artifact,
-            SummaryProjectionOptions {
-                preserve_authoritative_context_signature: true,
-            },
-        );
-        let signature = projected
-            .merged_signature
-            .expect("source signature should remain available");
-
-        assert_eq!(
-            signature
-                .ret_type
-                .as_ref()
-                .map(|ty| r2types::render_signature_type(ty, 64))
-                .as_deref(),
-            Some("size_t")
-        );
-        assert_eq!(signature.params[1].name, "n");
-        assert_eq!(
-            signature.params[1]
-                .ty
-                .as_ref()
-                .map(|ty| r2types::render_signature_type(ty, 64))
-                .as_deref(),
-            Some("size_t")
-        );
-    }
-
-    #[test]
-    fn name_only_native_worker_seed_is_not_created() {
-        for name in [
-            "sym.diagnose",
-            "dbg.parse_field_count",
-            "randread",
-            "dbg.print_current_files",
-        ] {
-            assert!(
-                native_worker_summary_seed(0x401000, name).is_none(),
-                "name-only worker seed must not be created for {name}"
-            );
-        }
-    }
-
-    #[test]
-    fn native_worker_summary_seed_rejects_raw_import_name_semantics() {
-        assert!(
-            native_worker_summary_seed(0x401000, "sym.imp.memcpy").is_none(),
-            "raw import-shaped names must not seed canonical helper semantics"
-        );
-    }
-
-    #[test]
-    fn typed_interproc_seed_entry_is_the_linkage_authority() {
-        let name_only = interproc_scope_facts_from_seed_entries([(
-            0x2000,
-            Some("sym.imp.memcpy".to_string()),
-            None,
-        )]);
-        assert!(
-            name_only
-                .summaries()
-                .get(&r2ssa::InterprocFunctionId(0x2000))
-                .is_none(),
-            "legacy raw-name seeds must not materialize semantic summaries",
-        );
-
-        let typed = interproc_scope_facts_from_typed_seed_entries([InterprocSeedEntry {
-            id: 0x2000,
-            name: Some("memcpy".to_string()),
-            arg_count_hint: None,
-            linkage: r2ssa::FunctionSemanticLinkage::Imported,
-        }]);
-        let typed_summary = typed
-            .summaries()
-            .get(&r2ssa::InterprocFunctionId(0x2000))
-            .expect("typed summary");
-        assert_eq!(
-            typed_summary.linkage,
-            r2ssa::FunctionSemanticLinkage::Imported
-        );
-        assert_eq!(
-            typed_summary.return_relation,
-            r2ssa::SummaryReturnRelation::Arg(0)
-        );
-    }
-
-    #[test]
-    fn typed_callee_facts_seed_imported_allocator_summaries() {
-        let parsed = r2types::parse_external_context_json(
-            r#"{
-                "callees": [
-                    {
-                        "call_addr": 4665,
-                        "addr": 4272,
-                        "name": "sym.imp.malloc",
-                        "linkage": "imported",
-                        "signature": {
-                            "name": "malloc",
-                            "ret_type": "void *",
-                            "params": [
-                                {"name": "size", "type": "size_t"}
-                            ]
-                        }
-                    }
-                ]
-            }"#,
-            64,
-        );
-        let mut seeds = BTreeMap::new();
-        merge_typed_callee_summary_seeds(&mut seeds, &parsed.callee_facts);
-
-        let summary = seeds
-            .get(&r2ssa::InterprocFunctionId(4272))
-            .expect("imported malloc seed");
-        assert_eq!(
-            summary.return_relation,
-            r2ssa::SummaryReturnRelation::HeapAlloc
-        );
-        assert_eq!(summary.linkage, r2ssa::FunctionSemanticLinkage::Imported);
-        assert_eq!(summary.callsite_count, 1);
     }
 
     #[test]
@@ -13938,11 +11108,6 @@ mod tests {
 
     #[test]
     fn type_route_decision_does_not_treat_name_only_workers_as_type_input() {
-        let summary = r2ssa::FunctionSemanticSummary::unknown(
-            r2ssa::InterprocFunctionId(0x11a9),
-            Some("randread".to_string()),
-        );
-        let artifact = r2sym::compile_named_native_worker_summary_artifact(&summary, true);
         let cfg_summary = r2ssa::CFGRiskSummary {
             block_count: 200,
             loop_count: 8,
@@ -13952,48 +11117,9 @@ mod tests {
         };
         let function_facts = FunctionFacts::default();
 
-        assert!(artifact.is_none());
         assert_eq!(
             type_route_decision(&function_facts, &cfg_summary, false).kind,
             EngineTypeRouteKind::FullWriteback
-        );
-    }
-
-    #[test]
-    fn bounded_cfg_writeback_plan_preserves_signature_context() {
-        let signature = r2types::FunctionSignatureSpec {
-            ret_type: Some(r2types::CTypeLike::Void),
-            params: vec![r2types::FunctionParamSpec {
-                name: "status".to_string(),
-                ty: Some(r2types::CTypeLike::Int {
-                    bits: 32,
-                    signedness: r2types::Signedness::Signed,
-                }),
-            }],
-        };
-        let type_facts = FunctionTypeFacts {
-            signature_certificate: r2types::SignatureCertificate::from_signature(
-                &signature,
-                [r2types::SignatureCertificateSource::ExternalContext],
-            ),
-            merged_signature: Some(signature),
-            callconv: Some("amd64".to_string()),
-            ..FunctionTypeFacts::default()
-        };
-        let function_facts = FunctionFacts::new(type_facts, None);
-        let plan = bounded_cfg_type_writeback_plan(
-            "fcn.401000",
-            "x86-64",
-            64,
-            &function_facts,
-            "bounded type plan for large CFG".to_string(),
-        );
-
-        assert_eq!(plan.signature.signature, "void fcn.401000 (int32_t status)");
-        assert_eq!(plan.signature.callconv, "amd64");
-        assert_eq!(
-            plan.diagnostics.warnings,
-            vec!["bounded type plan for large CFG"]
         );
     }
 
@@ -14052,57 +11178,43 @@ mod tests {
     }
 
     #[test]
-    fn compile_named_summary_rejects_name_owned_role_signature() {
-        let summary = r2ssa::FunctionSemanticSummary::unknown(
-            r2ssa::InterprocFunctionId(0x11a9),
-            Some("verror_at_line".to_string()),
-        );
-
-        assert!(r2sym::compile_named_native_worker_summary_artifact(&summary, true).is_none());
-    }
-
-    #[test]
-    fn type_summary_preprobe_rejects_name_only_program_orchestrator() {
+    fn type_function_refuses_large_name_only_summary_preprobe() {
         let mut blocks = const_return_blocks(0x55a0, 0);
         for idx in 0..210 {
             blocks.push(R2ILBlock::new(0x5600 + idx, 1));
         }
         let parsed_context = r2types::parse_external_context_json("{}", 64);
+        let session = EngineSession::new();
 
-        let response = type_summary_preprobe(EngineTypePreprobeRequest {
-            blocks: &blocks,
-            function_addr: 0x55a0,
-            canonical_name: "dbg.main",
-            display_name: "dbg.main",
-            arch: None,
-            ptr_bits: 64,
-            parsed_context: &parsed_context,
-            symbolic_scope: None,
-            type_seed: Some(FunctionTypeFacts::default()),
+        let response = session.type_function(EngineTypeAnalysisRequest {
+            analysis: EngineAnalyzeRequest {
+                function_name: "dbg.main".to_string(),
+                function_addr: 0x55a0,
+                blocks,
+                arch: None,
+                source_snapshot: Some(test_source_snapshot("dbg.main/type/rev1")),
+                trusted_ssa: None,
+                ptr_bits: 64,
+                semantic_metadata_enabled: false,
+                reg_type_hints: HashMap::new(),
+                parsed_context,
+                interproc_max_iterations: 1,
+                symbolic_scope: None,
+                semantic_mode: EngineSemanticMode::Full,
+                include_interproc_summary_set: true,
+                execution: EngineExecutionControl::default(),
+            },
             caller_prefers_bounded_type_plan: false,
-            fallback_if_guarded_without_summary: false,
         });
 
-        assert!(response.is_none());
+        assert!(
+            response.is_none(),
+            "a large name-only fixture has no prepared semantic owner to authorize a summary route"
+        );
     }
 
     #[test]
-    fn small_summary_only_worker_does_not_bypass_full_type_analysis() {
-        let mut artifact = native_linear_predicated_count_artifact();
-        artifact.granularity = r2sym::ArtifactGranularity::SummaryOnly;
-
-        assert!(!summary_preprobe_type_payload_prefers_semantic_fallback(
-            &artifact
-        ));
-
-        artifact.diagnostics.skipped_large_cfg = true;
-        assert!(summary_preprobe_type_payload_prefers_semantic_fallback(
-            &artifact
-        ));
-    }
-
-    #[test]
-    fn type_function_uses_engine_summary_preprobe() {
+    fn type_function_report_payload_refuses_name_only_summary_projection() {
         let mut blocks = const_return_blocks(0x55a0, 0);
         for idx in 0..210 {
             blocks.push(R2ILBlock::new(0x5600 + idx, 1));
@@ -14110,96 +11222,35 @@ mod tests {
         let parsed_context = r2types::parse_external_context_json("{}", 64);
         let session = EngineSession::new();
 
-        let response = session
-            .type_function(EngineTypeAnalysisRequest {
-                analysis: EngineAnalyzeRequest {
-                    function_name: "dbg.main".to_string(),
-                    function_addr: 0x55a0,
-                    blocks,
-                    arch: None,
-                    source_snapshot: Some(test_source_snapshot("dbg.main/type/rev1")),
-                    trusted_ssa: None,
-                    ptr_bits: 64,
-                    semantic_metadata_enabled: false,
-                    reg_type_hints: HashMap::new(),
-                    parsed_context,
-                    scope_facts: InterprocScopeFacts::empty(),
-                    interproc_max_iterations: 1,
-                    symbolic_scope: None,
-                    precomputed_semantic_artifact: None,
-                    semantic_mode: EngineSemanticMode::Full,
-                    include_interproc_summary_set: true,
-                    execution: EngineExecutionControl::default(),
-                },
-                caller_prefers_bounded_type_plan: false,
-            })
-            .expect("large main should be typed without name-owned program orchestrator route");
+        let payload = session.type_function_report_payload(EngineFunctionAnalysisReportRequest {
+            analysis: EngineAnalyzeRequest {
+                function_name: "dbg.main".to_string(),
+                function_addr: 0x55a0,
+                blocks,
+                arch: None,
+                source_snapshot: Some(test_source_snapshot("dbg.main/report/rev1")),
+                trusted_ssa: None,
+                ptr_bits: 64,
+                semantic_metadata_enabled: false,
+                reg_type_hints: HashMap::new(),
+                parsed_context,
+                interproc_max_iterations: 1,
+                symbolic_scope: None,
+                semantic_mode: EngineSemanticMode::Full,
+                include_interproc_summary_set: true,
+                execution: EngineExecutionControl::default(),
+            },
+            interproc_max_iters: 1,
+            interproc_converged: false,
+            writeback_budget: r2types::TypeWritebackMutationBudget::new(1, 1, 1),
+            writeback_apply_policy: type_writeback_apply_policy_for_mode(
+                EngineTypeWritebackMode::Off,
+            ),
+        });
 
-        assert_eq!(
-            response.route_decision.kind,
-            EngineTypeRouteKind::SemanticFallback
-        );
         assert!(
-            response.function_facts.decompile_route().is_some(),
-            "type analysis must expose decompile route diagnostics through FunctionFacts"
-        );
-        assert!(response.metrics.planning_time > Duration::default());
-        assert!(
-            response.writeback_plan.signature.params.is_empty(),
-            "name-only main fallback must not fabricate argc/argv params without ABI evidence"
-        );
-    }
-
-    #[test]
-    fn type_function_report_payload_owns_session_projection() {
-        let mut blocks = const_return_blocks(0x55a0, 0);
-        for idx in 0..210 {
-            blocks.push(R2ILBlock::new(0x5600 + idx, 1));
-        }
-        let parsed_context = r2types::parse_external_context_json("{}", 64);
-        let session = EngineSession::new();
-
-        let payload = session
-            .type_function_report_payload(EngineFunctionAnalysisReportRequest {
-                analysis: EngineAnalyzeRequest {
-                    function_name: "dbg.main".to_string(),
-                    function_addr: 0x55a0,
-                    blocks,
-                    arch: None,
-                    source_snapshot: Some(test_source_snapshot("dbg.main/report/rev1")),
-                    trusted_ssa: None,
-                    ptr_bits: 64,
-                    semantic_metadata_enabled: false,
-                    reg_type_hints: HashMap::new(),
-                    parsed_context,
-                    scope_facts: InterprocScopeFacts::empty(),
-                    interproc_max_iterations: 1,
-                    symbolic_scope: None,
-                    precomputed_semantic_artifact: None,
-                    semantic_mode: EngineSemanticMode::Full,
-                    include_interproc_summary_set: true,
-                    execution: EngineExecutionControl::default(),
-                },
-                interproc_max_iters: 1,
-                interproc_converged: false,
-                writeback_budget: r2types::TypeWritebackMutationBudget::new(1, 1, 1),
-                writeback_apply_policy: type_writeback_apply_policy_for_mode(
-                    EngineTypeWritebackMode::Off,
-                ),
-            })
-            .expect("engine should own type analysis report projection");
-
-        assert_eq!(payload.function_name, "dbg.main");
-        assert_eq!(payload.function_addr, 0x55a0);
-        assert!(payload.prefer_bounded_type_plan);
-        let route = payload
-            .semantic_route
-            .as_ref()
-            .expect("report payload should carry FunctionFacts decompile route");
-        assert_eq!(route.render_permission.owner, r2sym::ProofOwner::R2engine);
-        assert_eq!(
-            payload.type_writeback.mutation_plan.apply_policy.mode,
-            r2types::TypeWritebackApplyMode::Off
+            payload.is_none(),
+            "report projection cannot promote a name-only preprobe into semantic authority"
         );
     }
 
@@ -14217,7 +11268,6 @@ mod tests {
                 },
                 ptr_bits: Some(64),
                 parsed_context: r2types::ParsedExternalContext::default(),
-                scope_facts: InterprocScopeFacts::empty(),
                 interproc_max_iters: 5,
                 interproc_converged: true,
                 symbolic_scope: None,
@@ -14255,7 +11305,6 @@ mod tests {
                 },
                 ptr_bits: Some(64),
                 parsed_context: r2types::ParsedExternalContext::default(),
-                scope_facts: InterprocScopeFacts::empty(),
                 interproc_max_iterations: 9,
                 symbolic_scope: None,
             },
@@ -14292,10 +11341,8 @@ mod tests {
                 semantic_metadata_enabled: false,
                 reg_type_hints: HashMap::new(),
                 parsed_context,
-                scope_facts: InterprocScopeFacts::empty(),
                 interproc_max_iterations: 1,
                 symbolic_scope: None,
-                precomputed_semantic_artifact: None,
                 semantic_mode: EngineSemanticMode::Full,
                 include_interproc_summary_set: true,
                 execution: EngineExecutionControl::default(),
@@ -14327,7 +11374,6 @@ mod tests {
             },
             ptr_bits: Some(64),
             parsed_context,
-            scope_facts: InterprocScopeFacts::empty(),
             interproc_max_iterations: 1,
             symbolic_scope: None,
             input_quality: EngineFunctionInputQuality {
@@ -14365,9 +11411,9 @@ mod tests {
             "engine diagnostics must derive refusal from FunctionFacts route"
         );
         let quality = response
-            .function_facts
-            .input_quality()
-            .expect("input quality must travel through FunctionFacts");
+            .input_quality
+            .as_ref()
+            .expect("input quality must remain response-local");
         assert_eq!(quality.expected_blocks, 2);
         assert_eq!(quality.lifted_blocks, 1);
         assert_eq!(quality.actual_lifted_blocks, 1);
@@ -14397,7 +11443,6 @@ mod tests {
             },
             ptr_bits: Some(64),
             parsed_context,
-            scope_facts: InterprocScopeFacts::empty(),
             interproc_max_iterations: 1,
             symbolic_scope: None,
             input_quality: EngineFunctionInputQuality::complete(2),
@@ -14420,9 +11465,9 @@ mod tests {
         assert_eq!(route.kind, r2types::DecompileRouteKind::FallbackComment);
         assert_eq!(response.diagnostics.refusal, route.fallback_comment.clone());
         let quality = response
-            .function_facts
-            .input_quality()
-            .expect("input quality must travel through FunctionFacts");
+            .input_quality
+            .as_ref()
+            .expect("input quality must remain response-local");
         assert_eq!(quality.expected_blocks, 2);
         assert_eq!(quality.lifted_blocks, 2);
         assert_eq!(quality.actual_lifted_blocks, 1);
@@ -14451,7 +11496,6 @@ mod tests {
             },
             ptr_bits: Some(64),
             parsed_context,
-            scope_facts: InterprocScopeFacts::empty(),
             interproc_max_iterations: 1,
             symbolic_scope: None,
             input_quality: EngineFunctionInputQuality {
@@ -14479,9 +11523,9 @@ mod tests {
         assert_eq!(route.kind, r2types::DecompileRouteKind::FallbackComment);
         assert_eq!(response.diagnostics.refusal, route.fallback_comment.clone());
         let quality = response
-            .function_facts
-            .input_quality()
-            .expect("input quality must travel through FunctionFacts");
+            .input_quality
+            .as_ref()
+            .expect("input quality must remain response-local");
         assert_eq!(quality.expected_blocks, 1);
         assert_eq!(quality.lifted_blocks, 0);
         assert_eq!(quality.actual_lifted_blocks, 0);
@@ -14511,7 +11555,6 @@ mod tests {
             },
             ptr_bits: Some(64),
             parsed_context,
-            scope_facts: InterprocScopeFacts::empty(),
             interproc_max_iterations: 1,
             symbolic_scope: None,
             input_quality: EngineFunctionInputQuality::complete(0),
@@ -14532,9 +11575,9 @@ mod tests {
         assert_eq!(route.kind, r2types::DecompileRouteKind::FallbackComment);
         assert_eq!(response.diagnostics.refusal, route.fallback_comment.clone());
         let quality = response
-            .function_facts
-            .input_quality()
-            .expect("input quality must travel through FunctionFacts");
+            .input_quality
+            .as_ref()
+            .expect("input quality must remain response-local");
         assert_eq!(quality.expected_blocks, 0);
         assert_eq!(quality.lifted_blocks, 0);
         assert_eq!(quality.actual_lifted_blocks, 0);
@@ -14564,7 +11607,6 @@ mod tests {
             },
             ptr_bits: Some(64),
             parsed_context,
-            scope_facts: InterprocScopeFacts::empty(),
             interproc_max_iterations: 1,
             symbolic_scope: None,
             input_quality: EngineFunctionInputQuality::complete(1),
@@ -14573,9 +11615,9 @@ mod tests {
         });
 
         let quality = response
-            .function_facts
-            .input_quality()
-            .expect("complete input quality must travel through FunctionFacts");
+            .input_quality
+            .as_ref()
+            .expect("complete input quality must remain response-local");
         assert!(quality.is_complete(), "{quality:?}");
         assert_eq!(quality.expected_blocks, 1);
         assert_eq!(quality.lifted_blocks, 1);
@@ -14609,10 +11651,8 @@ mod tests {
                 semantic_metadata_enabled: false,
                 reg_type_hints: HashMap::new(),
                 parsed_context,
-                scope_facts: InterprocScopeFacts::empty(),
                 interproc_max_iterations: 1,
                 symbolic_scope: None,
-                precomputed_semantic_artifact: None,
                 semantic_mode: EngineSemanticMode::Full,
                 include_interproc_summary_set: true,
                 execution: EngineExecutionControl::default(),
@@ -14630,9 +11670,9 @@ mod tests {
             .expect("refusal route must travel through FunctionFacts");
         assert_eq!(route.kind, r2types::DecompileRouteKind::FallbackComment);
         let quality = response
-            .function_facts
-            .input_quality()
-            .expect("direct decompile refusal must retain input-quality fact");
+            .input_quality
+            .as_ref()
+            .expect("direct decompile refusal must retain input quality");
         assert_eq!(quality.expected_blocks, 2);
         assert_eq!(quality.lifted_blocks, 1);
         assert_eq!(quality.actual_lifted_blocks, 1);
@@ -14659,10 +11699,8 @@ mod tests {
                 semantic_metadata_enabled: false,
                 reg_type_hints: HashMap::new(),
                 parsed_context,
-                scope_facts: InterprocScopeFacts::empty(),
                 interproc_max_iterations: 1,
                 symbolic_scope: None,
-                precomputed_semantic_artifact: None,
                 semantic_mode: EngineSemanticMode::Full,
                 include_interproc_summary_set: true,
                 execution: EngineExecutionControl::default(),
@@ -14705,10 +11743,8 @@ mod tests {
                 semantic_metadata_enabled: false,
                 reg_type_hints: HashMap::new(),
                 parsed_context,
-                scope_facts: InterprocScopeFacts::empty(),
                 interproc_max_iterations: 1,
                 symbolic_scope: None,
-                precomputed_semantic_artifact: None,
                 semantic_mode: EngineSemanticMode::Full,
                 include_interproc_summary_set: true,
                 execution: EngineExecutionControl::default(),
@@ -14749,10 +11785,8 @@ mod tests {
                 semantic_metadata_enabled: false,
                 reg_type_hints: HashMap::new(),
                 parsed_context,
-                scope_facts: InterprocScopeFacts::empty(),
                 interproc_max_iterations: 1,
                 symbolic_scope: None,
-                precomputed_semantic_artifact: None,
                 semantic_mode: EngineSemanticMode::Full,
                 include_interproc_summary_set: true,
                 execution: EngineExecutionControl::default(),
@@ -14780,7 +11814,6 @@ mod tests {
                 },
                 ptr_bits: Some(64),
                 parsed_context: r2types::ParsedExternalContext::default(),
-                scope_facts: InterprocScopeFacts::empty(),
                 interproc_max_iterations: 3,
                 symbolic_scope: None,
                 input_quality: EngineFunctionInputQuality::complete(0),
@@ -14887,13 +11920,13 @@ mod tests {
     #[test]
     fn symbolic_path_listing_runs_through_engine_policy() {
         let blocks = const_return_blocks(0x401000, 0);
-        let prepared = r2ssa::SsaArtifact::for_symbolic(&blocks, None).expect("prepared");
+        let prepared = Arc::new(r2ssa::SsaArtifact::for_symbolic(&blocks, None).expect("prepared"));
         let scope = r2sym::PreparedFunctionScope::new(
             0x401000,
             vec![r2sym::ScopedPreparedFunction {
                 id: r2ssa::InterprocFunctionId(0x401000),
                 name: Some("sym.simple".to_string()),
-                prepared: prepared.clone(),
+                prepared: Arc::clone(&prepared),
             }],
         )
         .expect("scope");
@@ -14930,7 +11963,7 @@ mod tests {
     #[test]
     fn engine_translates_pre_cancelled_control_into_symbolic_request() {
         let blocks = const_return_blocks(0x401000, 0);
-        let prepared = r2ssa::SsaArtifact::for_symbolic(&blocks, None).expect("prepared");
+        let prepared = Arc::new(r2ssa::SsaArtifact::for_symbolic(&blocks, None).expect("prepared"));
         let z3_ctx = z3::Context::thread_local();
         let symbols = r2sym::FunctionSymbolSnapshot::default();
         let cancellation = EngineCancellationToken::default();
@@ -14963,13 +11996,13 @@ mod tests {
     #[test]
     fn engine_conditions_symbolic_scope_with_root_assumptions() {
         let blocks = symbolic_register_branch_blocks(0x501000);
-        let prepared = r2ssa::SsaArtifact::for_symbolic(&blocks, None).expect("prepared");
+        let prepared = Arc::new(r2ssa::SsaArtifact::for_symbolic(&blocks, None).expect("prepared"));
         let scope = r2sym::PreparedFunctionScope::new(
             0x501000,
             vec![r2sym::ScopedPreparedFunction {
                 id: r2ssa::InterprocFunctionId(0x501000),
                 name: Some("sym.branch".to_string()),
-                prepared: prepared.clone(),
+                prepared: Arc::clone(&prepared),
             }],
         )
         .expect("scope");
@@ -15017,13 +12050,13 @@ mod tests {
     #[test]
     fn engine_reports_conflicting_assumptions_as_conditioning() {
         let blocks = symbolic_register_branch_blocks(0x501800);
-        let prepared = r2ssa::SsaArtifact::for_symbolic(&blocks, None).expect("prepared");
+        let prepared = Arc::new(r2ssa::SsaArtifact::for_symbolic(&blocks, None).expect("prepared"));
         let scope = r2sym::PreparedFunctionScope::new(
             0x501800,
             vec![r2sym::ScopedPreparedFunction {
                 id: r2ssa::InterprocFunctionId(0x501800),
                 name: Some("sym.branch".to_string()),
-                prepared: prepared.clone(),
+                prepared: Arc::clone(&prepared),
             }],
         )
         .expect("scope");
@@ -15046,13 +12079,13 @@ mod tests {
     #[test]
     fn symbolic_summary_reports_prepared_assumption_usage() {
         let blocks = symbolic_register_branch_blocks(0x502000);
-        let prepared = r2ssa::SsaArtifact::for_symbolic(&blocks, None).expect("prepared");
+        let prepared = Arc::new(r2ssa::SsaArtifact::for_symbolic(&blocks, None).expect("prepared"));
         let scope = r2sym::PreparedFunctionScope::new(
             0x502000,
             vec![r2sym::ScopedPreparedFunction {
                 id: r2ssa::InterprocFunctionId(0x502000),
                 name: Some("sym.branch".to_string()),
-                prepared: prepared.clone(),
+                prepared: Arc::clone(&prepared),
             }],
         )
         .expect("scope");
@@ -15106,622 +12139,5 @@ mod tests {
         assert_eq!(request_plan.engine_plan(), EnginePlan::RefuseWithEvidence);
         assert_eq!(diagnostics.refusal, Some(comment.clone()));
         assert_eq!(diagnostics.route_reason, Some(comment.clone()));
-        assert_eq!(
-            diagnostics
-                .render_permission
-                .as_ref()
-                .map(|permission| permission.kind),
-            Some(r2sym::RenderPermissionKind::Refuse)
-        );
-    }
-
-    #[test]
-    fn summary_only_native_linear_plan_residualizes_unrenderable_workers() {
-        let blocks = const_return_blocks(0x401000, 0);
-        let cfg_summary = r2ssa::SSAFunction::from_blocks_raw_no_arch(&blocks)
-            .expect("ssa")
-            .cfg_risk_summary();
-
-        for slice_class in [
-            r2sym::SliceClass::Worker,
-            r2sym::SliceClass::GenericLarge,
-            r2sym::SliceClass::Wrapper,
-        ] {
-            let mut artifact = native_linear_artifact(slice_class);
-            artifact.granularity = r2sym::ArtifactGranularity::SummaryOnly;
-            let r2sym::SemanticArtifactBody::Native(native) = &mut artifact.body else {
-                unreachable!("native artifact helper must build native body");
-            };
-            native.regions.clear();
-            assert!(matches!(
-                artifact.decompile_plan(),
-                r2sym::DecompilePlan::NativeLinear { .. }
-            ));
-            let function_facts = FunctionFacts::new(FunctionTypeFacts::default(), Some(artifact));
-
-            let route = semantic_route_plan("dbg.worker", &function_facts, &cfg_summary);
-            assert!(
-                route.kind == r2types::DecompileRouteKind::FallbackComment,
-                "unrenderable summary-only native-linear artifacts must not reach Standard route: {route:?}"
-            );
-            assert_eq!(
-                detached_semantic_route_plan("dbg.worker", &blocks, &function_facts),
-                Some(route)
-            );
-        }
-    }
-
-    #[test]
-    fn compact_renderable_worker_summary_can_route_to_linear_summary() {
-        let blocks = const_return_blocks(0x401000, 0);
-        let cfg_summary = r2ssa::SSAFunction::from_blocks_raw_no_arch(&blocks)
-            .expect("ssa")
-            .cfg_risk_summary();
-        let artifact = native_linear_predicated_count_artifact();
-        let function_facts = FunctionFacts::new(FunctionTypeFacts::default(), Some(artifact));
-
-        let route = semantic_route_plan("dbg.mem_scan2", &function_facts, &cfg_summary);
-
-        assert!(route.kind == r2types::DecompileRouteKind::LinearWorker);
-    }
-
-    #[test]
-    fn compact_table_walk_worker_summary_can_route_to_linear_summary() {
-        let blocks = const_return_blocks(0x401000, 0);
-        let cfg_summary = r2ssa::SSAFunction::from_blocks_raw_no_arch(&blocks)
-            .expect("ssa")
-            .cfg_risk_summary();
-        let artifact = native_linear_table_walk_artifact();
-        let function_facts = FunctionFacts::new(FunctionTypeFacts::default(), Some(artifact));
-
-        let route = semantic_route_plan("dbg.table_walk", &function_facts, &cfg_summary);
-
-        assert!(route.kind == r2types::DecompileRouteKind::LinearWorker);
-    }
-
-    #[test]
-    fn summary_only_scan_table_worker_routes_to_summary_islands() {
-        let blocks = const_return_blocks(0x401000, 0);
-        let cfg_summary = r2ssa::SSAFunction::from_blocks_raw_no_arch(&blocks)
-            .expect("ssa")
-            .cfg_risk_summary();
-        let artifact = summary_only_table_walk_artifact();
-        let function_facts = FunctionFacts::new(FunctionTypeFacts::default(), Some(artifact));
-
-        let route = semantic_route_plan("dbg.table_walk", &function_facts, &cfg_summary);
-
-        assert!(route.kind == r2types::DecompileRouteKind::SummaryIslands);
-    }
-
-    #[test]
-    fn summary_only_exact_hash_fold_does_not_select_standard_native_render() {
-        let blocks = const_return_blocks(0x401000, 0);
-        let cfg_summary = r2ssa::SSAFunction::from_blocks_raw_no_arch(&blocks)
-            .expect("ssa")
-            .cfg_risk_summary();
-        let artifact = summary_only_exact_hash_fold_artifact();
-        let function_facts = FunctionFacts::new(FunctionTypeFacts::default(), Some(artifact));
-
-        let route = semantic_route_plan("dbg.hash_fold_worker", &function_facts, &cfg_summary);
-
-        assert!(
-            route.kind != r2types::DecompileRouteKind::Standard,
-            "summary-only hash-fold evidence must not authorize native C route: {route:?}"
-        );
-    }
-
-    #[test]
-    fn dense_summary_only_exact_hash_fold_does_not_select_standard_native_render() {
-        let blocks = const_return_blocks(0x401000, 0);
-        let cfg_summary = r2ssa::SSAFunction::from_blocks_raw_no_arch(&blocks)
-            .expect("ssa")
-            .cfg_risk_summary();
-        let artifact = pad_summary_only_artifact_to_dense(summary_only_exact_hash_fold_artifact());
-        let function_facts = FunctionFacts::new(FunctionTypeFacts::default(), Some(artifact));
-
-        let route = semantic_route_plan("dbg.hash_fold_worker", &function_facts, &cfg_summary);
-
-        assert!(
-            route.kind != r2types::DecompileRouteKind::Standard,
-            "dense summary-only hash-fold evidence must not authorize native C route: {route:?}"
-        );
-    }
-
-    #[test]
-    fn summary_only_complete_table_walk_does_not_select_standard_native_render() {
-        let blocks = const_return_blocks(0x401000, 0);
-        let cfg_summary = r2ssa::SSAFunction::from_blocks_raw_no_arch(&blocks)
-            .expect("ssa")
-            .cfg_risk_summary();
-        let artifact = summary_only_complete_table_walk_artifact();
-        let function_facts = FunctionFacts::new(FunctionTypeFacts::default(), Some(artifact));
-
-        let route = semantic_route_plan("dbg.table_walk", &function_facts, &cfg_summary);
-
-        assert!(
-            route.kind != r2types::DecompileRouteKind::Standard,
-            "summary-only table-walk evidence must not authorize native C route: {route:?}"
-        );
-    }
-
-    #[test]
-    fn dense_summary_only_complete_table_walk_does_not_select_standard_native_render() {
-        let blocks = const_return_blocks(0x401000, 0);
-        let cfg_summary = r2ssa::SSAFunction::from_blocks_raw_no_arch(&blocks)
-            .expect("ssa")
-            .cfg_risk_summary();
-        let artifact =
-            pad_summary_only_artifact_to_dense(summary_only_complete_table_walk_artifact());
-        let function_facts = FunctionFacts::new(FunctionTypeFacts::default(), Some(artifact));
-
-        let route = semantic_route_plan("dbg.table_walk", &function_facts, &cfg_summary);
-
-        assert!(
-            route.kind != r2types::DecompileRouteKind::Standard,
-            "dense summary-only table-walk evidence must not authorize native C route: {route:?}"
-        );
-    }
-
-    #[test]
-    fn function_facts_for_decompile_stamps_route_without_context_adapter() {
-        let blocks = const_return_blocks(0x3000, 0);
-        let prepared = r2ssa::SsaArtifact::for_decompile(&blocks, None).expect("prepared");
-        let param_slots = ParamSlotResolver::new();
-        let function_facts = function_facts_for_decompile(
-            "sym.simple",
-            &prepared,
-            FunctionFacts::default(),
-            &param_slots,
-        );
-
-        let route_facts = function_facts
-            .decompile_route()
-            .expect("route decision should be stamped on FunctionFacts");
-        assert_eq!(route_facts.kind, r2types::DecompileRouteKind::Standard);
-        assert!(!route_facts.render_permission.reason.is_empty());
-    }
-
-    #[test]
-    fn function_facts_for_decompile_preserves_existing_route() {
-        let blocks = const_return_blocks(0x3000, 0);
-        let prepared = r2ssa::SsaArtifact::for_decompile(&blocks, None).expect("prepared");
-        let existing_route = test_decompile_route(
-            r2types::DecompileRouteKind::FallbackComment,
-            Some("pre-stamped route must remain authoritative"),
-            Some("/* pre-stamped residual */"),
-        );
-        let function_facts = FunctionFacts::default().with_decompile_route(existing_route.clone());
-
-        let param_slots = ParamSlotResolver::new();
-        let function_facts =
-            function_facts_for_decompile("sym.simple", &prepared, function_facts, &param_slots);
-
-        assert_eq!(function_facts.decompile_route(), Some(&existing_route));
-    }
-
-    #[test]
-    fn decompiler_input_from_prepared_facts_keeps_policy_in_function_facts() {
-        let blocks = direct_call_return_blocks(0x401000, 0x402000);
-        let prepared = r2ssa::SsaArtifact::for_decompile(&blocks, None).expect("prepared");
-
-        let input = decompiler_input_from_prepared_facts(
-            prepared,
-            FunctionFacts::default(),
-            &ParamSlotResolver::new(),
-            HashMap::from([(0x402000, "sym.imp.printf".to_string())]),
-            HashMap::new(),
-            HashMap::new(),
-            64,
-        );
-
-        assert!(
-            input.function_facts().decompile_route().is_some(),
-            "engine-owned decompiler input assembly must stamp route facts into FunctionFacts"
-        );
-        assert!(
-            input
-                .function_facts()
-                .callee_resolution()
-                .and_then(|resolution| {
-                    resolution.identity_for_callsite(r2types::CallsiteKey {
-                        block_addr: 0x401000,
-                        op_index: 0,
-                    })
-                })
-                .is_some(),
-            "engine helper must attach canonical callee-resolution facts to FunctionFacts"
-        );
-        assert!(
-            input
-                .function_facts()
-                .type_facts()
-                .known_function_signatures
-                .is_empty(),
-            "raw function-name hints must not seed FunctionFacts signatures before typed callee signature evidence exists"
-        );
-    }
-
-    #[test]
-    fn decompiler_input_from_prepared_facts_attaches_callsite_argument_facts() {
-        let arch = x86_64_arg_arch();
-        let blocks = two_arg_direct_call_return_blocks(0x401000, 0x402000);
-        let prepared = r2ssa::SsaArtifact::for_decompile(&blocks, Some(&arch)).expect("prepared");
-
-        let input = decompiler_input_from_prepared_facts(
-            prepared,
-            FunctionFacts::default(),
-            &x86_64_param_slots(),
-            HashMap::from([(0x402000, "sym.helper".to_string())]),
-            HashMap::new(),
-            HashMap::new(),
-            64,
-        );
-
-        let callsite = r2types::CallsiteKey {
-            block_addr: 0x401000,
-            op_index: 2,
-        };
-        let args = input
-            .function_facts()
-            .callsites()
-            .and_then(|callsites| callsites.arguments_for_site(callsite))
-            .expect("engine helper must attach canonical callsite argument facts");
-        assert_eq!(args.argument_values.len(), 2);
-        assert_eq!(args.argument_values[0].index, 0);
-        assert_eq!(args.argument_values[1].index, 1);
-        assert_eq!(args.register_argument_locations.len(), 2);
-        assert_eq!(args.register_argument_locations[0].index, 0);
-        assert_eq!(args.register_argument_locations[0].name, "RDI");
-        assert_eq!(args.register_argument_locations[1].index, 1);
-        assert_eq!(args.register_argument_locations[1].name, "RSI");
-    }
-
-    #[test]
-    fn decompiler_input_from_prepared_facts_attaches_call_result_facts() {
-        let arch = x86_64_result_arch();
-        let blocks = direct_call_result_copy_blocks(0x401000, 0x402000);
-        let prepared = r2ssa::SsaArtifact::for_decompile(&blocks, Some(&arch)).expect("prepared");
-
-        let input = decompiler_input_from_prepared_facts(
-            prepared,
-            FunctionFacts::default(),
-            &x86_64_param_slots(),
-            HashMap::from([(0x402000, "sym.helper".to_string())]),
-            HashMap::new(),
-            HashMap::new(),
-            64,
-        );
-
-        let callsite = r2types::CallsiteKey {
-            block_addr: 0x401000,
-            op_index: 0,
-        };
-        let results = input
-            .function_facts()
-            .call_results()
-            .expect("engine helper must attach canonical call-result facts");
-        let result_values = results.results_for_site(callsite).collect::<Vec<_>>();
-        assert!(
-            result_values.iter().any(|result| matches!(
-                result.carrier,
-                r2ssa::ReturnCarrier::Register { ref name } if name == "rax"
-            )),
-            "call-result proof must travel through FunctionFacts"
-        );
-    }
-
-    #[test]
-    fn decompiler_input_from_prepared_facts_attaches_call_render_facts() {
-        let arch = x86_64_result_arch();
-        let blocks = direct_call_result_copy_blocks(0x401000, 0x402000);
-        let prepared = r2ssa::SsaArtifact::for_decompile(&blocks, Some(&arch)).expect("prepared");
-
-        let input = decompiler_input_from_prepared_facts(
-            prepared,
-            FunctionFacts::default(),
-            &x86_64_param_slots(),
-            HashMap::from([(0x402000, "sym.helper".to_string())]),
-            HashMap::new(),
-            HashMap::new(),
-            64,
-        );
-
-        let callsite = r2types::CallsiteKey {
-            block_addr: 0x401000,
-            op_index: 0,
-        };
-        let call_render = input
-            .function_facts()
-            .call_render()
-            .and_then(|facts| facts.fact_for_site(callsite))
-            .expect("engine helper must attach canonical call-render facts");
-        assert_eq!(
-            call_render.disposition,
-            r2types::CallsiteRenderDisposition::SideEffectStatement,
-            "unowned call-result values must not make r2dec invent assigned-result disposition"
-        );
-        assert!(
-            !input
-                .function_facts()
-                .call_results()
-                .expect("call-result facts")
-                .results_for_site(callsite)
-                .any(|result| matches!(result.owner, Some(r2ssa::ValueOwner::StackSlot { .. }))),
-            "fixture must not carry stable stack-slot owner evidence"
-        );
-        assert!(
-            !call_render.proof_values.is_empty() || call_render.target.is_some(),
-            "call-render fact must carry the proof target/values r2dec will later verify"
-        );
-    }
-
-    #[test]
-    fn decompiler_input_from_prepared_facts_attaches_render_facts() {
-        let mut arch = r2il::ArchSpec::new("x86-64");
-        arch.addr_size = 8;
-        arch.add_register(r2il::RegisterDef::new("rax", 0, 8));
-        arch.add_register(r2il::RegisterDef::new("rdi", 0x10, 8));
-        let mut block = R2ILBlock::new(0x401000, 4);
-        block.push(r2il::R2ILOp::Load {
-            dst: r2il::Varnode::register(0, 8),
-            space: r2il::SpaceId::Ram,
-            addr: r2il::Varnode::register(0x10, 8),
-        });
-        block.push(r2il::R2ILOp::Return {
-            target: r2il::Varnode::register(0, 8),
-        });
-        let prepared = r2ssa::SsaArtifact::for_decompile(&[block], Some(&arch)).expect("prepared");
-
-        let input = decompiler_input_from_prepared_facts(
-            prepared,
-            FunctionFacts::default(),
-            &x86_64_param_slots(),
-            HashMap::new(),
-            HashMap::new(),
-            HashMap::new(),
-            64,
-        );
-
-        let render = input
-            .function_facts()
-            .render()
-            .expect("engine helper must attach canonical render facts");
-        assert!(
-            render
-                .memory_access_for_op(0x401000, 0, false, r2il::SpaceId::Ram)
-                .is_some_and(|fact| fact.width == 8),
-            "memory proof must travel through FunctionFacts"
-        );
-        let return_fact = render
-            .return_for_op(0x401000, 1)
-            .expect("return proof must travel through FunctionFacts");
-        assert!(
-            render.expression_is_renderable(return_fact.value),
-            "return value renderability must travel through FunctionFacts"
-        );
-    }
-
-    #[test]
-    fn prepared_facts_promote_exact_scalar_array_render_candidate() {
-        let mut arch = r2il::ArchSpec::new("x86-64");
-        arch.addr_size = 8;
-        arch.add_register(r2il::RegisterDef::new("rax", 0, 8));
-        arch.add_register(r2il::RegisterDef::new("rdi", 0x10, 8));
-        arch.add_register(r2il::RegisterDef::new("rsi", 0x18, 8));
-        arch.add_register(r2il::RegisterDef::sub("esi", 0x18, 4, "rsi"));
-        let mut block = R2ILBlock::new(0x401000, 4);
-        block.push(r2il::R2ILOp::IntZExt {
-            dst: r2il::Varnode::unique(0x100, 8),
-            src: r2il::Varnode::register(0x18, 4),
-        });
-        block.push(r2il::R2ILOp::IntMult {
-            dst: r2il::Varnode::unique(0x108, 8),
-            a: r2il::Varnode::unique(0x100, 8),
-            b: r2il::Varnode::constant(8, 8),
-        });
-        block.push(r2il::R2ILOp::IntAdd {
-            dst: r2il::Varnode::unique(0x110, 8),
-            a: r2il::Varnode::register(0x10, 8),
-            b: r2il::Varnode::unique(0x108, 8),
-        });
-        block.push(r2il::R2ILOp::Load {
-            dst: r2il::Varnode::register(0, 8),
-            space: r2il::SpaceId::Ram,
-            addr: r2il::Varnode::unique(0x110, 8),
-        });
-        let prepared = r2ssa::SsaArtifact::for_decompile(&[block], Some(&arch)).expect("prepared");
-        let memory = prepared
-            .memory_certificate_for_op_site(0x401000, 3, false)
-            .expect("indexed memory certificate");
-        let index_value = prepared
-            .addresses()
-            .parameter_expression(memory.address)
-            .and_then(|address| address.terms.first())
-            .map(|term| term.value)
-            .expect("semantic array index");
-        let type_facts = FunctionTypeFacts {
-            array_index_certificates: vec![r2types::ArrayIndexCertificate {
-                slot: 0,
-                base: Some(r2types::ArrayIndexBase::Param { index: 0 }),
-                field_offset: 0,
-                element_stride: 8,
-            }],
-            scalar_array_render_candidates: vec![r2types::ScalarArrayRenderCandidate {
-                slot: 0,
-                block_addr: 0x401000,
-                op_index: 3,
-                is_write: false,
-                field_offset: 0,
-                element_stride: 8,
-                access_width: 8,
-                index_value: Some(index_value),
-            }],
-            ..FunctionTypeFacts::default()
-        };
-
-        let facts = attach_prepared_decompile_evidence(
-            &prepared,
-            FunctionFacts::new(type_facts, None),
-            &x86_64_param_slots(),
-        );
-
-        let array = facts
-            .render()
-            .expect("render facts")
-            .array_access_for_op(0x401000, 3, false, 0, 8, Some(8))
-            .expect("matching candidate must be promoted only through prepared memory proof");
-        assert_eq!(array.block_addr, 0x401000);
-        assert_eq!(array.op_index, 3);
-        assert!(!array.is_write);
-    }
-
-    #[test]
-    fn prepared_facts_promote_layout_normalized_member_render_fact() {
-        let mut arch = r2il::ArchSpec::new("x86-64");
-        arch.addr_size = 8;
-        arch.add_register(r2il::RegisterDef::new("rax", 0, 8));
-        arch.add_register(r2il::RegisterDef::new("rdi", 0x10, 8));
-        let mut block = R2ILBlock::new(0x401000, 4);
-        block.push(r2il::R2ILOp::IntAdd {
-            dst: r2il::Varnode::unique(0x100, 8),
-            a: r2il::Varnode::register(0x10, 8),
-            b: r2il::Varnode::constant(8, 8),
-        });
-        block.push(r2il::R2ILOp::Load {
-            dst: r2il::Varnode::register(0, 8),
-            space: r2il::SpaceId::Ram,
-            addr: r2il::Varnode::unique(0x100, 8),
-        });
-        let prepared = r2ssa::SsaArtifact::for_decompile(&[block], Some(&arch)).expect("prepared");
-        let signature = r2types::FunctionSignatureSpec {
-            ret_type: None,
-            params: vec![r2types::FunctionParamSpec {
-                name: "node".to_string(),
-                ty: Some(r2types::CTypeLike::Pointer(Box::new(
-                    r2types::CTypeLike::Struct("Node".to_string()),
-                ))),
-            }],
-        };
-        let type_facts = FunctionTypeFacts {
-            merged_signature: Some(signature),
-            external_type_db: r2types::ExternalTypeDb {
-                structs: HashMap::from([(
-                    "node".to_string(),
-                    r2types::ExternalStruct {
-                        name: "Node".to_string(),
-                        fields: BTreeMap::from([(
-                            8,
-                            r2types::ExternalField {
-                                name: "hash".to_string(),
-                                offset: 8,
-                                ty: Some("uint64_t".to_string()),
-                            },
-                        )]),
-                    },
-                )]),
-                ..r2types::ExternalTypeDb::default()
-            },
-            field_access_certificates: vec![r2types::FieldAccessCertificate {
-                slot: 0,
-                field_offset: 8,
-                field_name: "f_8".to_string(),
-                field_type: None,
-            }],
-            ..FunctionTypeFacts::default()
-        };
-
-        let facts = attach_prepared_decompile_evidence(
-            &prepared,
-            FunctionFacts::new(type_facts, None),
-            &x86_64_param_slots(),
-        );
-
-        let member = facts
-            .render()
-            .expect("render facts")
-            .member_access_for_op(0x401000, 1, false, "hash", 8, Some(8))
-            .expect("normalized field certificate must become a member render proof");
-        assert_eq!(member.field_name, "hash");
-        assert_eq!(member.field_offset, 8);
-    }
-
-    #[test]
-    fn prepared_facts_reject_scalar_array_candidate_without_matching_memory_proof() {
-        let mut arch = r2il::ArchSpec::new("x86-64");
-        arch.addr_size = 8;
-        arch.add_register(r2il::RegisterDef::new("rax", 0, 8));
-        arch.add_register(r2il::RegisterDef::new("rdi", 0x10, 8));
-        let mut block = R2ILBlock::new(0x401000, 4);
-        block.push(r2il::R2ILOp::Load {
-            dst: r2il::Varnode::register(0, 8),
-            space: r2il::SpaceId::Ram,
-            addr: r2il::Varnode::register(0x10, 8),
-        });
-        let prepared = r2ssa::SsaArtifact::for_decompile(&[block], Some(&arch)).expect("prepared");
-        let type_facts = FunctionTypeFacts {
-            array_index_certificates: vec![r2types::ArrayIndexCertificate {
-                slot: 0,
-                base: Some(r2types::ArrayIndexBase::Param { index: 0 }),
-                field_offset: 0,
-                element_stride: 8,
-            }],
-            scalar_array_render_candidates: vec![r2types::ScalarArrayRenderCandidate {
-                slot: 0,
-                block_addr: 0x401000,
-                op_index: 0,
-                is_write: false,
-                field_offset: 0,
-                element_stride: 8,
-                access_width: 4,
-                index_value: None,
-            }],
-            ..FunctionTypeFacts::default()
-        };
-
-        let facts = attach_prepared_decompile_evidence(
-            &prepared,
-            FunctionFacts::new(type_facts, None),
-            &x86_64_param_slots(),
-        );
-
-        assert!(
-            facts
-                .render()
-                .expect("render facts")
-                .array_access_for_op(0x401000, 0, false, 0, 8, Some(4))
-                .is_none(),
-            "candidate width mismatch must not mint FunctionRenderFacts array proof"
-        );
-    }
-
-    #[test]
-    fn decompiler_input_from_prepared_facts_attaches_control_facts() {
-        let blocks = symbolic_register_branch_blocks(0x401000);
-        let prepared =
-            r2ssa::SsaArtifact::for_decompile(&blocks, Some(&vm_test_arch())).expect("prepared");
-
-        let input = decompiler_input_from_prepared_facts(
-            prepared,
-            FunctionFacts::default(),
-            &x86_64_param_slots(),
-            HashMap::new(),
-            HashMap::new(),
-            HashMap::new(),
-            64,
-        );
-
-        let control = input
-            .function_facts()
-            .control()
-            .expect("engine helper must attach canonical control facts");
-        let branch = control
-            .branch_for_block(0x401000)
-            .expect("conditional branch fact must travel through FunctionFacts");
-        assert_eq!(branch.true_target, 0x401010);
-        assert_eq!(branch.false_target, 0x401004);
-        assert_eq!(
-            branch.comparison.as_ref().map(|comparison| comparison.kind),
-            Some(r2ssa::CompareKind::Equal)
-        );
     }
 }

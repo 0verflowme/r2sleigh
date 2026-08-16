@@ -17,14 +17,14 @@ use crate::fold::context::{EffectRenderProof, EffectRenderProofKind};
 use crate::region::{Region, RegionAnalyzer, RegionTransferKind};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ControlRenderProofKind {
+pub(crate) enum ControlRenderProofKind {
     Branch,
     Loop,
     Switch,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ControlRenderProof {
+pub(crate) struct ControlRenderProof {
     pub kind: ControlRenderProofKind,
     pub anchor: u64,
     pub branch_condition: Option<PredicateId>,
@@ -40,23 +40,6 @@ pub struct ControlRenderProof {
 }
 
 impl ControlRenderProof {
-    pub fn new(kind: ControlRenderProofKind, anchor: u64) -> Self {
-        Self {
-            kind,
-            anchor,
-            branch_condition: None,
-            branch_condition_value: None,
-            loop_condition: None,
-            loop_condition_value: None,
-            loop_body_blocks: Vec::new(),
-            loop_latches: Vec::new(),
-            loop_exits: Vec::new(),
-            switch_selector: None,
-            switch_cases: Vec::new(),
-            switch_default: None,
-        }
-    }
-
     fn branch_proof(
         anchor: u64,
         branch_condition: Option<PredicateId>,
@@ -125,73 +108,10 @@ impl ControlRenderProof {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ControlTransferRenderProofKind {
-    Break,
-    Continue,
-    Goto,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ControlTransferRenderProof {
-    Break {
-        loop_header: u64,
-        source: u64,
-        target: u64,
-    },
-    Continue {
-        loop_header: u64,
-        source: u64,
-        target: u64,
-    },
-    Goto {
-        loop_header: u64,
-        source: u64,
-        target: u64,
-        lowered_target: u64,
-        path: Vec<u64>,
-        label: String,
-    },
-}
-
-impl ControlTransferRenderProof {
-    pub const fn kind(&self) -> ControlTransferRenderProofKind {
-        match self {
-            Self::Break { .. } => ControlTransferRenderProofKind::Break,
-            Self::Continue { .. } => ControlTransferRenderProofKind::Continue,
-            Self::Goto { .. } => ControlTransferRenderProofKind::Goto,
-        }
-    }
-
-    pub const fn loop_header(&self) -> u64 {
-        match self {
-            Self::Break { loop_header, .. }
-            | Self::Continue { loop_header, .. }
-            | Self::Goto { loop_header, .. } => *loop_header,
-        }
-    }
-
-    pub const fn source(&self) -> u64 {
-        match self {
-            Self::Break { source, .. }
-            | Self::Continue { source, .. }
-            | Self::Goto { source, .. } => *source,
-        }
-    }
-
-    pub const fn target(&self) -> u64 {
-        match self {
-            Self::Break { target, .. }
-            | Self::Continue { target, .. }
-            | Self::Goto { target, .. } => *target,
-        }
-    }
-}
-
 /// Control flow structurer.
 ///
 /// Converts a region tree into structured C statements.
-pub struct ControlFlowStructurer<'a, 'o> {
+pub(crate) struct ControlFlowStructurer<'a, 'o> {
     func: &'a SSAFunction,
     /// Folding context for expression optimization.
     fold_ctx: &'o FoldingContext<'o>,
@@ -213,8 +133,6 @@ pub struct ControlFlowStructurer<'a, 'o> {
     safety_reason: Option<String>,
     /// Structured control nodes emitted by this structurer, in render order.
     control_render_proofs: Vec<ControlRenderProof>,
-    /// Exact loop-transfer nodes emitted by this structurer, in render order.
-    control_transfer_render_proofs: Vec<ControlTransferRenderProof>,
     /// Merge blocks owned by enclosing regions and therefore emitted there.
     deferred_merge_blocks: Vec<u64>,
     /// Exact lexical control-domain alternatives currently being emitted.
@@ -473,7 +391,8 @@ struct SwitchRegionView<'r> {
 
 impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
     /// Create a new structurer using a pre-analyzed folding context.
-    pub fn new(func: &'a SSAFunction, fold_ctx: &'o FoldingContext<'o>) -> Self {
+    #[cfg(test)]
+    pub(crate) fn new(func: &'a SSAFunction, fold_ctx: &'o FoldingContext<'o>) -> Self {
         let region_analyzer = RegionAnalyzer::new(func);
         let safety_budget_max = Self::compute_safety_budget(func.num_blocks());
 
@@ -491,7 +410,6 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             safety_budget_max,
             safety_reason: None,
             control_render_proofs: Vec::new(),
-            control_transfer_render_proofs: Vec::new(),
             deferred_merge_blocks: Vec::new(),
             active_domains: vec![RenderedBlockDomain::default()],
             rendered_block_domains: BTreeMap::new(),
@@ -501,7 +419,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
     }
 
     /// Create a structurer that cooperatively polls during region and AST work.
-    pub fn new_with_control(
+    pub(crate) fn new_with_control(
         func: &'a SSAFunction,
         fold_ctx: &'o FoldingContext<'o>,
         control: DecompileWorkControl<'a>,
@@ -524,39 +442,12 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             safety_budget_max,
             safety_reason: None,
             control_render_proofs: Vec::new(),
-            control_transfer_render_proofs: Vec::new(),
             deferred_merge_blocks: Vec::new(),
             active_domains: vec![RenderedBlockDomain::default()],
             rendered_block_domains: BTreeMap::new(),
             structured_region_blocks: BTreeSet::new(),
             transfer_target_domains: BTreeMap::new(),
         })
-    }
-
-    /// Create a structurer without expression folding (for comparison).
-    pub fn new_unfolded(func: &'a SSAFunction, fold_ctx: &'o FoldingContext<'o>) -> Self {
-        let safety_budget_max = Self::compute_safety_budget(func.num_blocks());
-        Self {
-            func,
-            fold_ctx,
-            folded_block_cache: HashMap::new(),
-            labels: HashMap::new(),
-            emitted_labels: BTreeSet::new(),
-            label_counter: 0,
-            region_analyzer: Some(RegionAnalyzer::new(func)),
-            control: None,
-            stop_reason: Cell::new(None),
-            safety_budget_remaining: safety_budget_max,
-            safety_budget_max,
-            safety_reason: None,
-            control_render_proofs: Vec::new(),
-            control_transfer_render_proofs: Vec::new(),
-            deferred_merge_blocks: Vec::new(),
-            active_domains: vec![RenderedBlockDomain::default()],
-            rendered_block_domains: BTreeMap::new(),
-            structured_region_blocks: BTreeSet::new(),
-            transfer_target_domains: BTreeMap::new(),
-        }
     }
 
     fn compute_safety_budget(num_blocks: usize) -> usize {
@@ -594,10 +485,6 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         true
     }
 
-    fn finish_controlled<T>(&self, value: T) -> Result<T, DecompileExecutionStop> {
-        self.stop_reason.get().map_or(Ok(value), Err)
-    }
-
     fn consume_safety_budget(&mut self, units: usize) -> bool {
         if self.safety_budget_remaining >= units {
             self.safety_budget_remaining -= units;
@@ -614,20 +501,18 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
     }
 
     /// Returns the reason why structuring short-circuited, if any.
-    pub fn safety_reason(&self) -> Option<&str> {
+    #[cfg(test)]
+    pub(crate) fn safety_reason(&self) -> Option<&str> {
         self.safety_reason.as_deref()
     }
 
-    pub fn execution_stop(&self) -> Option<DecompileExecutionStop> {
+    pub(crate) fn execution_stop(&self) -> Option<DecompileExecutionStop> {
         self.stop_reason.get()
     }
 
-    pub fn control_render_proofs(&self) -> &[ControlRenderProof] {
+    #[cfg(test)]
+    pub(crate) fn control_render_proofs(&self) -> &[ControlRenderProof] {
         &self.control_render_proofs
-    }
-
-    pub fn control_transfer_render_proofs(&self) -> &[ControlTransferRenderProof] {
-        &self.control_transfer_render_proofs
     }
 
     fn record_branch_render_proof(
@@ -817,33 +702,19 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
     }
 
     /// Get the set of variable names that survive folding (for filtering declarations).
-    pub fn emitted_var_names(&self) -> HashSet<String> {
+    pub(crate) fn emitted_var_names(&self) -> HashSet<String> {
         let blocks: Vec<_> = self.func.blocks().cloned().collect();
         self.fold_ctx.emitted_var_names(&blocks)
     }
 
     /// Structure the function's control flow.
-    pub fn structure(&mut self) -> CStmt {
+    pub(crate) fn structure(&mut self) -> CStmt {
         let stmt = self.structure_preserving_render_proof_identity();
         if self.safety_reason.is_some() {
             return CStmt::Empty;
         }
         // Post-process: flatten, simplify loops, remove redundant control flow.
         Self::cleanup(stmt)
-    }
-
-    /// Structure the function, returning cooperative stop distinctly from safety residuals.
-    pub fn structure_with_control(&mut self) -> Result<CStmt, DecompileExecutionStop> {
-        let stmt = self.structure_preserving_render_proof_identity_with_control()?;
-        self.control
-            .expect("controlled structurer has a work control")
-            .poll()?;
-        let stmt = Self::cleanup_with_control(
-            stmt,
-            self.control
-                .expect("controlled structurer has a work control"),
-        )?;
-        self.finish_controlled(stmt)
     }
 
     /// Structure control flow without post-proof AST rewrites.
@@ -856,20 +727,9 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         self.structure_preserving_render_proof_identity_impl()
     }
 
-    pub(crate) fn structure_preserving_render_proof_identity_with_control(
-        &mut self,
-    ) -> Result<CStmt, DecompileExecutionStop> {
-        if !self.poll() {
-            return self.finish_controlled(CStmt::Empty);
-        }
-        let stmt = self.structure_preserving_render_proof_identity_impl();
-        self.finish_controlled(stmt)
-    }
-
     fn structure_preserving_render_proof_identity_impl(&mut self) -> CStmt {
         self.reset_safety_budget();
         self.control_render_proofs.clear();
-        self.control_transfer_render_proofs.clear();
         self.active_domains = vec![RenderedBlockDomain::default()];
         self.rendered_block_domains.clear();
         self.emitted_labels.clear();
@@ -1027,25 +887,15 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             } => {
                 let merge_owned_by_ancestor =
                     merge_block.is_some_and(|merge| self.deferred_merge_blocks.contains(&merge));
-                if !merge_owned_by_ancestor {
-                    if !self.fold_ctx.requires_certified_rendering()
-                        && let Some(rewritten) = self.try_structure_symbolic_actionable_if(
-                            *cond_block,
-                            then_region,
-                            else_region.as_deref(),
-                            *merge_block,
-                        )
-                    {
-                        return rewritten;
-                    }
-                    if let Some(rewritten) = self.try_structure_if_else_with_slot_merge_returns(
+                if !merge_owned_by_ancestor
+                    && let Some(rewritten) = self.try_structure_if_else_with_slot_merge_returns(
                         *cond_block,
                         then_region,
                         else_region.as_deref(),
                         *merge_block,
-                    ) {
-                        return rewritten;
-                    }
+                    )
+                {
+                    return rewritten;
                 }
                 if !merge_owned_by_ancestor
                     && let Some(rewritten) = self.try_structure_if_else_with_register_merge_returns(
@@ -1271,23 +1121,15 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             }
             Region::Transfer {
                 loop_header,
-                source,
                 target,
                 kind,
-            } if *kind == RegionTransferKind::Continue && target == loop_header => {
-                self.control_transfer_render_proofs
-                    .push(ControlTransferRenderProof::Continue {
-                        loop_header: *loop_header,
-                        source: *source,
-                        target: *target,
-                    });
-                CStmt::Continue
-            }
+                ..
+            } if *kind == RegionTransferKind::Continue && target == loop_header => CStmt::Continue,
             Region::Transfer {
                 loop_header,
-                source,
                 target,
                 kind,
+                ..
             } if *kind == RegionTransferKind::Exit
                 && self
                     .region_analyzer
@@ -1295,12 +1137,6 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                     .and_then(|analyzer| analyzer.get_loop_fallthrough(*loop_header))
                     == Some(*target) =>
             {
-                self.control_transfer_render_proofs
-                    .push(ControlTransferRenderProof::Break {
-                        loop_header: *loop_header,
-                        source: *source,
-                        target: *target,
-                    });
                 CStmt::Break
             }
             Region::Transfer {
@@ -1323,16 +1159,6 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                             if !self.record_transfer_target_domain(*loop_header, lowered_target) {
                                 return CStmt::Empty;
                             }
-                            self.control_transfer_render_proofs.push(
-                                ControlTransferRenderProof::Goto {
-                                    loop_header: *loop_header,
-                                    source: *source,
-                                    target: *target,
-                                    lowered_target,
-                                    path,
-                                    label: label.clone(),
-                                },
-                            );
                             return CStmt::Goto(label);
                         }
                         Err(reason) => Some(reason),
@@ -1499,22 +1325,6 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
     fn get_switch_expression(&mut self, addr: u64) -> Option<(CExpr, Option<ValueId>)> {
         let switch_addr = self.unique_switch_block().unwrap_or(addr);
         let block = self.func.get_block(switch_addr)?;
-
-        if let Some(vm_step) = self
-            .fold_ctx
-            .inputs
-            .semantic_artifact()
-            .and_then(|artifact| artifact.vm_step_for_dispatch_header(switch_addr))
-            .or_else(|| {
-                self.fold_ctx
-                    .inputs
-                    .semantic_artifact()
-                    .and_then(|artifact| artifact.vm_transfer_for_dispatch_header(switch_addr))
-            })
-            && let Some(selector) = vm_step.selector.as_ref()
-        {
-            return Some((CExpr::Var(selector.clone()), None));
-        }
 
         if let Some((expr, selector)) = self
             .fold_ctx
@@ -1753,199 +1563,6 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         }
 
         Some((true_target?, false_target?))
-    }
-
-    fn symbolic_exact_reachable_target(&self, cond_block: u64) -> Option<u64> {
-        self.fold_ctx
-            .inputs
-            .semantic_artifact()?
-            .exact_reachable_target_for_block(cond_block)
-    }
-
-    #[cfg(test)]
-    fn symbolic_actionable_reachable_target(&self, cond_block: u64) -> Option<u64> {
-        self.fold_ctx
-            .inputs
-            .semantic_artifact()?
-            .actionable_reachable_target_for_block(cond_block)
-    }
-
-    fn structure_region_suffix_from_target(
-        &mut self,
-        region: &Region,
-        target: u64,
-    ) -> Option<CStmt> {
-        match region {
-            Region::Block(addr) => (*addr == target).then(|| self.structure_block(*addr)),
-            Region::Sequence(regions) => {
-                let start_idx = regions
-                    .iter()
-                    .position(|child| child.blocks().contains(&target))?;
-                let mut stmts = Vec::new();
-                Self::append_stmt_body_flat(
-                    &mut stmts,
-                    self.structure_region_suffix_from_target(&regions[start_idx], target)?,
-                );
-                for child in &regions[start_idx + 1..] {
-                    Self::append_stmt_body_flat(&mut stmts, self.structure_region(child));
-                }
-                Some(if stmts.len() == 1 {
-                    stmts.into_iter().next().unwrap_or(CStmt::Empty)
-                } else {
-                    CStmt::Block(stmts)
-                })
-            }
-            Region::IfThenElse {
-                cond_block,
-                then_region,
-                else_region,
-                merge_block,
-            } => {
-                if *cond_block == target {
-                    return Some(self.structure_region(region));
-                }
-                let mut stmts = if then_region.blocks().contains(&target) {
-                    let mut stmts = Vec::new();
-                    Self::append_stmt_body_flat(
-                        &mut stmts,
-                        self.structure_region_suffix_from_target(then_region, target)?,
-                    );
-                    stmts
-                } else if else_region
-                    .as_deref()
-                    .is_some_and(|region| region.blocks().contains(&target))
-                {
-                    let mut stmts = Vec::new();
-                    Self::append_stmt_body_flat(
-                        &mut stmts,
-                        self.structure_region_suffix_from_target(else_region.as_deref()?, target)?,
-                    );
-                    stmts
-                } else if merge_block.is_some_and(|merge| merge == target) {
-                    vec![self.structure_block(target)]
-                } else {
-                    return None;
-                };
-                if let Some(merge_addr) = merge_block.filter(|merge| *merge != target) {
-                    Self::append_stmt_body_flat(&mut stmts, self.structure_block(merge_addr));
-                }
-                Some(if stmts.len() == 1 {
-                    stmts.into_iter().next().unwrap_or(CStmt::Empty)
-                } else {
-                    CStmt::Block(stmts)
-                })
-            }
-            Region::WhileLoop { header, body } => {
-                if *header == target {
-                    Some(self.structure_region(region))
-                } else if body.blocks().contains(&target) {
-                    self.structure_region_suffix_from_target(body, target)
-                } else {
-                    None
-                }
-            }
-            Region::DoWhileLoop { body, cond_block } => {
-                if *cond_block == target {
-                    return Some(self.structure_block(*cond_block));
-                }
-                if !body.blocks().contains(&target) {
-                    return None;
-                }
-                let mut stmts = Vec::new();
-                Self::append_stmt_body_flat(
-                    &mut stmts,
-                    self.structure_region_suffix_from_target(body, target)?,
-                );
-                Self::append_stmt_body_flat(&mut stmts, self.structure_block(*cond_block));
-                Some(if stmts.len() == 1 {
-                    stmts.into_iter().next().unwrap_or(CStmt::Empty)
-                } else {
-                    CStmt::Block(stmts)
-                })
-            }
-            Region::MultiExit { head, .. } => head
-                .blocks()
-                .contains(&target)
-                .then(|| self.structure_region_suffix_from_target(head, target))
-                .flatten(),
-            Region::Transfer {
-                target: transfer_target,
-                ..
-            } => (*transfer_target == target).then_some(CStmt::Empty),
-            Region::Switch {
-                switch_block,
-                cases,
-                default,
-                merge_block,
-            } => {
-                if *switch_block == target {
-                    return Some(self.structure_region(region));
-                }
-                let mut stmts = if let Some((_, case_region)) = cases
-                    .iter()
-                    .find(|(_, case_region)| case_region.blocks().contains(&target))
-                {
-                    let mut stmts = Vec::new();
-                    Self::append_stmt_body_flat(
-                        &mut stmts,
-                        self.structure_region_suffix_from_target(case_region, target)?,
-                    );
-                    stmts
-                } else if default
-                    .as_deref()
-                    .is_some_and(|region| region.blocks().contains(&target))
-                {
-                    let mut stmts = Vec::new();
-                    Self::append_stmt_body_flat(
-                        &mut stmts,
-                        self.structure_region_suffix_from_target(default.as_deref()?, target)?,
-                    );
-                    stmts
-                } else if merge_block.is_some_and(|merge| merge == target) {
-                    vec![self.structure_block(target)]
-                } else {
-                    return None;
-                };
-                if let Some(merge_addr) = merge_block.filter(|merge| *merge != target) {
-                    Self::append_stmt_body_flat(&mut stmts, self.structure_block(merge_addr));
-                }
-                Some(if stmts.len() == 1 {
-                    stmts.into_iter().next().unwrap_or(CStmt::Empty)
-                } else {
-                    CStmt::Block(stmts)
-                })
-            }
-            Region::Irreducible { blocks, .. } => blocks
-                .contains(&target)
-                .then(|| self.structure_block(target)),
-        }
-    }
-
-    fn try_structure_symbolic_actionable_if(
-        &mut self,
-        cond_block: u64,
-        then_region: &Region,
-        else_region: Option<&Region>,
-        merge_block: Option<u64>,
-    ) -> Option<CStmt> {
-        let reachable_target = self.symbolic_exact_reachable_target(cond_block)?;
-        let reachable_stmt = if then_region.blocks().contains(&reachable_target) {
-            self.structure_region_suffix_from_target(then_region, reachable_target)?
-        } else {
-            let else_region = else_region?;
-            self.structure_region_suffix_from_target(else_region, reachable_target)?
-        };
-
-        let mut prefix = self.structure_block_prefix_stmts(cond_block);
-        Self::append_stmt_body_flat(&mut prefix, reachable_stmt);
-        if let Some(merge_addr) = merge_block {
-            Self::append_stmt_body_flat(&mut prefix, self.structure_block(merge_addr));
-        }
-        Some(if prefix.len() == 1 {
-            prefix.into_iter().next().unwrap_or(CStmt::Empty)
-        } else {
-            CStmt::Block(prefix)
-        })
     }
 
     /// Structure a single basic block.
@@ -2661,63 +2278,6 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         // Recurse first, then simplify
         let stmt = Self::cleanup_recurse(stmt);
         Self::flatten(stmt)
-    }
-
-    pub(crate) fn cleanup_with_control(
-        stmt: CStmt,
-        control: DecompileWorkControl<'_>,
-    ) -> Result<CStmt, DecompileExecutionStop> {
-        Self::poll_stmt_tree(&stmt, control)?;
-        let stmt = Self::cleanup(stmt);
-        Self::poll_stmt_tree(&stmt, control)?;
-        Ok(stmt)
-    }
-
-    fn poll_stmt_tree(
-        stmt: &CStmt,
-        control: DecompileWorkControl<'_>,
-    ) -> Result<(), DecompileExecutionStop> {
-        control.poll()?;
-        match stmt {
-            CStmt::Block(stmts) => {
-                for stmt in stmts {
-                    Self::poll_stmt_tree(stmt, control)?;
-                }
-            }
-            CStmt::If {
-                then_body,
-                else_body,
-                ..
-            } => {
-                Self::poll_stmt_tree(then_body, control)?;
-                if let Some(else_body) = else_body {
-                    Self::poll_stmt_tree(else_body, control)?;
-                }
-            }
-            CStmt::While { body, .. } | CStmt::DoWhile { body, .. } => {
-                Self::poll_stmt_tree(body, control)?;
-            }
-            CStmt::For { init, body, .. } => {
-                if let Some(init) = init {
-                    Self::poll_stmt_tree(init, control)?;
-                }
-                Self::poll_stmt_tree(body, control)?;
-            }
-            CStmt::Switch { cases, default, .. } => {
-                for case in cases {
-                    for stmt in &case.body {
-                        Self::poll_stmt_tree(stmt, control)?;
-                    }
-                }
-                if let Some(default) = default {
-                    for stmt in default {
-                        Self::poll_stmt_tree(stmt, control)?;
-                    }
-                }
-            }
-            _ => {}
-        }
-        Ok(())
     }
 
     /// Recursively clean up children first, then apply local simplifications.
@@ -5410,7 +4970,8 @@ mod tests {
     use crate::region::Region;
     use r2il::{ArchSpec, R2ILBlock, R2ILOp, RegisterDef, Varnode};
     use r2ssa::{BlockTerminator, PhiNode, PredicateId, SSAFunction, SSAOp, SSAVar, SsaArtifact};
-    use std::collections::{BTreeMap, BTreeSet, HashMap};
+    use std::collections::{BTreeSet, HashMap};
+    use std::sync::Arc;
 
     #[test]
     fn control_bdd_proves_disjoint_duplicated_path_coverage() {
@@ -5469,36 +5030,6 @@ mod tests {
         );
     }
 
-    fn test_structured_worker_route(reason: &str) -> r2types::DecompileRouteFacts {
-        r2types::DecompileRouteFacts {
-            kind: r2types::DecompileRouteKind::StructuredWorker,
-            reason: Some(reason.to_string()),
-            fallback_comment: None,
-            skip_runtime_type_inference: true,
-            use_prepared_semantic_view: false,
-            proof_coverage: r2sym::ProofCoverage::default(),
-            render_permission: r2sym::RenderPermission::summary(
-                r2sym::ProofOwner::R2engine,
-                reason,
-            ),
-        }
-    }
-
-    fn standard_route_for_test(reason: &str) -> r2types::DecompileRouteFacts {
-        r2types::DecompileRouteFacts {
-            kind: r2types::DecompileRouteKind::Standard,
-            reason: Some(reason.to_string()),
-            fallback_comment: None,
-            skip_runtime_type_inference: true,
-            use_prepared_semantic_view: true,
-            proof_coverage: r2sym::ProofCoverage::default(),
-            render_permission: r2sym::RenderPermission::residual(
-                r2sym::ProofOwner::R2engine,
-                reason,
-            ),
-        }
-    }
-
     fn install_function_facts(ctx: &mut FoldingContext<'_>, facts: r2types::FunctionFacts) {
         ctx.inputs.function_facts = Box::leak(Box::new(facts));
         ctx.inputs.certified_rendering_required = false;
@@ -5509,84 +5040,70 @@ mod tests {
         ctx.inputs.certified_rendering_required = true;
     }
 
-    fn install_semantic_artifact(ctx: &mut FoldingContext<'_>, artifact: r2sym::SemanticArtifact) {
-        let certified_rendering_required = ctx.inputs.certified_rendering_required;
-        let mut function_facts = ctx.inputs.function_facts.clone();
-        function_facts.set_semantics(Some(artifact));
-        install_function_facts(ctx, function_facts);
-        ctx.inputs.certified_rendering_required = certified_rendering_required;
-    }
-
-    fn certified_function_facts(
-        control: r2types::FunctionControlFacts,
-        render: r2types::FunctionRenderFacts,
-    ) -> r2types::FunctionFacts {
-        let mut facts = r2types::FunctionFacts::default()
-            .with_control(control)
-            .with_render(render)
-            .with_decompile_route(standard_route_for_test("test typed render facts"));
-        add_test_x86_64_signature(&mut facts);
-        facts
-    }
-
-    fn add_test_x86_64_signature(facts: &mut r2types::FunctionFacts) {
-        let signature = r2types::FunctionSignatureSpec {
-            ret_type: Some(r2types::CTypeLike::Int {
-                bits: 64,
-                signedness: r2types::Signedness::Signed,
-            }),
-            params: vec![r2types::FunctionParamSpec {
-                name: "arg1".to_string(),
-                ty: Some(r2types::CTypeLike::Int {
-                    bits: 64,
-                    signedness: r2types::Signedness::Signed,
-                }),
-            }],
-        };
-        let certificate = r2types::SignatureCertificate::from_signature(
-            &signature,
-            [r2types::SignatureCertificateSource::LocalInference],
-        )
-        .expect("typed test signature");
-        let mut types = facts.type_facts().clone();
-        types.merged_signature = Some(signature);
-        types.signature_certificate = Some(certificate);
-        facts.replace_type_facts(types);
-    }
-
     fn test_arch() -> ArchSpec {
         let mut arch = ArchSpec::new("x86-64");
         arch.add_register(RegisterDef::new("RAX", 0x00, 8));
         arch.add_register(RegisterDef::new("RDI", 0x10, 8));
         arch.add_register(RegisterDef::new("RBP", 0x20, 8));
         arch.add_register(RegisterDef::new("RSP", 0x28, 8));
+        arch.add_register(RegisterDef::new("RIP", 0x30, 8));
         arch
     }
 
-    fn function_with_single_block(addr: u64) -> SSAFunction {
-        let mut block = R2ILBlock::new(addr, 4);
-        block.push(R2ILOp::Return {
-            target: Varnode::constant(0, 8),
-        });
-        SSAFunction::from_blocks_with_arch(&[block], Some(&test_arch()))
-            .expect("ssa function")
-            .with_name("vm_summary_demo")
+    fn exact_test_interface(revision: &[u8]) -> r2ssa::SourceFunctionInterface {
+        let storage = |offset| r2ssa::CanonicalStorageId {
+            space: r2ssa::CanonicalStorageSpace::Register,
+            offset,
+            size: 8,
+        };
+        r2ssa::SourceFunctionInterface::new_exact(
+            revision.to_vec(),
+            "sysv64",
+            [r2ssa::SourceAbiParameterSpec::new(0, storage(0x10))],
+            r2ssa::SourceFunctionReturn::Register {
+                storage: storage(0),
+            },
+            [],
+        )
+        .and_then(|interface| interface.with_return_address_storage(storage(0x30)))
+        .and_then(|interface| interface.with_stack_pointer_storage(storage(0x28)))
+        .expect("exact test source interface")
     }
 
-    fn function_with_return_blocks(addrs: &[u64]) -> SSAFunction {
-        let blocks = addrs
-            .iter()
-            .map(|addr| {
-                let mut block = R2ILBlock::new(*addr, 4);
-                block.push(R2ILOp::Return {
-                    target: Varnode::constant(0, 8),
-                });
-                block
+    fn prepared_with_exact_interface(
+        blocks: &[R2ILBlock],
+        revision: &[u8],
+        name: &str,
+    ) -> SsaArtifact {
+        SsaArtifact::for_decompile_with_interface(
+            blocks,
+            Some(&test_arch()),
+            exact_test_interface(revision),
+        )
+        .expect("prepared source-owned artifact")
+        .with_name(name)
+    }
+
+    fn source_owned_test_facts(
+        prepared: SsaArtifact,
+        reason: &str,
+    ) -> (Arc<SsaArtifact>, r2types::SourceOwnedFunctionFacts) {
+        let source = Arc::new(prepared);
+        let request = r2types::TypeWritebackAnalysisRequest::new(
+            Arc::clone(&source),
+            r2types::ParsedExternalContext::default(),
+        )
+        .expect("matching source assumptions");
+        let owner = r2types::build_source_owned_type_writeback_analysis(request)
+            .expect("source-owned type analysis")
+            .finalize_for_decompile(r2types::DecompileFinalization {
+                kind: r2types::DecompileRouteKind::Standard,
+                reason: reason.to_string(),
+                fallback_comment: None,
             })
-            .collect::<Vec<_>>();
-        SSAFunction::from_blocks_with_arch(&blocks, Some(&test_arch()))
-            .expect("ssa function")
-            .with_name("worker_region_demo")
+            .expect("source-owned decompile facts");
+        assert!(owner.shares_source(&source));
+        (source, owner)
     }
 
     fn function_with_switch_block_and_unrelated_sub() -> SSAFunction {
@@ -5672,40 +5189,11 @@ mod tests {
             target: Varnode::constant(1, 8),
         });
 
-        SsaArtifact::for_decompile(&[switch_block, case_zero, case_one], Some(&test_arch()))
-            .expect("prepared switch artifact")
-            .with_name("certified_switch_structuring")
-    }
-
-    fn function_with_conditional_return_blocks(
-        cond_block: u64,
-        true_target: u64,
-        false_target: u64,
-    ) -> SSAFunction {
-        let mut cond = R2ILBlock::new(cond_block, 4);
-        cond.push(R2ILOp::IntEqual {
-            dst: Varnode::register(0x80, 1),
-            a: Varnode::register(0x10, 8),
-            b: Varnode::constant(0, 8),
-        });
-        cond.push(R2ILOp::CBranch {
-            target: Varnode::constant(true_target, 8),
-            cond: Varnode::register(0x80, 1),
-        });
-
-        let mut false_block = R2ILBlock::new(false_target, 4);
-        false_block.push(R2ILOp::Return {
-            target: Varnode::constant(0, 8),
-        });
-
-        let mut true_block = R2ILBlock::new(true_target, 4);
-        true_block.push(R2ILOp::Return {
-            target: Varnode::constant(1, 8),
-        });
-
-        SSAFunction::from_blocks_with_arch(&[cond, false_block, true_block], Some(&test_arch()))
-            .expect("ssa function")
-            .with_name("worker_structured_demo")
+        prepared_with_exact_interface(
+            &[switch_block, case_zero, case_one],
+            b"certified-switch-structuring",
+            "certified_switch_structuring",
+        )
     }
 
     fn prepared_with_conditional_return_blocks(
@@ -5734,9 +5222,11 @@ mod tests {
             target: Varnode::constant(1, 8),
         });
 
-        SsaArtifact::for_decompile(&[cond, false_block, true_block], Some(&test_arch()))
-            .expect("prepared ssa artifact")
-            .with_name("certified_branch_structuring")
+        prepared_with_exact_interface(
+            &[cond, false_block, true_block],
+            b"certified-branch-structuring",
+            "certified_branch_structuring",
+        )
     }
 
     fn prepared_with_guarded_while_loop() -> SsaArtifact {
@@ -5761,155 +5251,11 @@ mod tests {
             target: Varnode::constant(0, 8),
         });
 
-        SsaArtifact::for_decompile(&[header, body, exit], Some(&test_arch()))
-            .expect("prepared while artifact")
-            .with_name("certified_loop_structuring")
-    }
-
-    fn render_facts_for_prepared(prepared: &SsaArtifact) -> r2types::FunctionRenderFacts {
-        let mut facts = r2types::FunctionFacts::default()
-            .with_render(r2types::FunctionRenderFacts::from_prepared(prepared));
-        facts.populate_certified_parameter_exprs(
-            prepared,
-            &r2types::ParamSlotResolver::from_arch_name(Some("x86-64")),
-        );
-        facts.render_facts().clone()
-    }
-
-    fn control_facts_for_guarded_while_loop(
-        prepared: &SsaArtifact,
-        include_loop: bool,
-    ) -> r2types::FunctionControlFacts {
-        let predicate = prepared
-            .predicates()
-            .predicates
-            .values()
-            .find(|predicate| predicate.block_addr == 0x1000)
-            .expect("loop header predicate");
-        let mut facts = r2types::FunctionControlFacts::default();
-        facts.branch_predicates.insert(
-            0x1000,
-            r2types::BranchPredicateFact {
-                id: predicate.id,
-                block_addr: predicate.block_addr,
-                condition: predicate.condition,
-                comparison: predicate.comparison.as_ref().map(|comparison| {
-                    r2types::PredicateComparisonFact {
-                        kind: comparison.kind,
-                        lhs: comparison.lhs,
-                        rhs: comparison.rhs,
-                    }
-                }),
-                evaluated_comparison: predicate.evaluated_comparison.as_ref().map(|comparison| {
-                    r2types::PredicateComparisonFact {
-                        kind: comparison.kind,
-                        lhs: comparison.lhs,
-                        rhs: comparison.rhs,
-                    }
-                }),
-                render_comparison: predicate.comparison.as_ref().map(|comparison| {
-                    r2types::PredicateComparisonFact {
-                        kind: comparison.kind,
-                        lhs: comparison.lhs,
-                        rhs: comparison.rhs,
-                    }
-                }),
-                true_target: predicate.true_target,
-                false_target: predicate.false_target,
-            },
-        );
-        if include_loop {
-            facts.loops.insert(
-                r2ssa::LoopId(0),
-                r2types::LoopStructureFact {
-                    loop_id: r2ssa::LoopId(0),
-                    proof_node: "FunctionFacts.loop:LoopId(0)".to_string(),
-                    header: 0x1000,
-                    condition: Some(predicate.id),
-                    condition_value: Some(predicate.condition),
-                    body: vec![0x1000, 0x1004],
-                    latches: vec![0x1004],
-                    exits: vec![0x1008],
-                },
-            );
-        }
-        facts.control_domains = prepared.control_domains().clone();
-        facts
-    }
-
-    fn control_facts_for_switch(
-        prepared: &SsaArtifact,
-        include_cases: bool,
-    ) -> r2types::FunctionControlFacts {
-        let selector = prepared
-            .graph()
-            .values
-            .iter()
-            .find(|value| value.var.name.eq_ignore_ascii_case("rdi") && value.var.version == 0)
-            .map(|value| value.id)
-            .expect("rdi selector value");
-        r2types::FunctionControlFacts {
-            switches: BTreeMap::from([(
-                0x1000,
-                r2types::SwitchSelectorFact {
-                    proof_node: r2ssa::ProofNodeId::switch_certificate(0x1000).to_string(),
-                    block_addr: 0x1000,
-                    selector: Some(selector),
-                    cases: if include_cases {
-                        vec![(0, 0x1010), (1, 0x1020)]
-                    } else {
-                        Vec::new()
-                    },
-                    default: None,
-                },
-            )]),
-            control_domains: prepared.control_domains().clone(),
-            ..r2types::FunctionControlFacts::default()
-        }
-    }
-
-    fn function_with_multi_block_true_arm(
-        cond_block: u64,
-        true_entry: u64,
-        true_tail: u64,
-        false_target: u64,
-    ) -> SSAFunction {
-        let mut cond = R2ILBlock::new(cond_block, 4);
-        cond.push(R2ILOp::IntEqual {
-            dst: Varnode::register(0x80, 1),
-            a: Varnode::register(0x10, 8),
-            b: Varnode::constant(0, 8),
-        });
-        cond.push(R2ILOp::CBranch {
-            target: Varnode::constant(true_entry, 8),
-            cond: Varnode::register(0x80, 1),
-        });
-
-        let mut false_block = R2ILBlock::new(false_target, 4);
-        false_block.push(R2ILOp::Return {
-            target: Varnode::constant(0, 8),
-        });
-
-        let mut true_head = R2ILBlock::new(true_entry, 4);
-        true_head.push(R2ILOp::Copy {
-            dst: Varnode::register(0x00, 8),
-            src: Varnode::constant(1, 8),
-        });
-        true_head.push(R2ILOp::Branch {
-            target: Varnode::constant(true_tail, 8),
-        });
-
-        let mut true_tail_block = R2ILBlock::new(true_tail, 4);
-        true_tail_block.push(R2ILOp::Return {
-            target: Varnode::register(0x00, 8),
-        });
-
-        SSAFunction::from_blocks_with_arch(
-            &[cond, false_block, true_head, true_tail_block],
-            Some(&test_arch()),
+        prepared_with_exact_interface(
+            &[header, body, exit],
+            b"certified-loop-structuring",
+            "certified_loop_structuring",
         )
-        .expect("ssa function")
-        .with_name("worker_multiblock_demo")
     }
 
     fn function_with_transparent_branch_to_merge() -> SSAFunction {
@@ -6207,18 +5553,14 @@ mod tests {
 
     #[test]
     fn certified_branch_structuring_requires_function_facts_predicate() {
-        let prepared = prepared_with_conditional_return_blocks(0x1000, 0x1010, 0x1004);
-        let mut function_facts = r2types::FunctionFacts::default();
-        function_facts.attach_prepared_decompile_evidence(&prepared);
+        let (prepared, source_owned) = source_owned_test_facts(
+            prepared_with_conditional_return_blocks(0x1000, 0x1010, 0x1004),
+            "test typed branch",
+        );
 
         let mut certified_ctx = FoldingContext::new(64);
-        certified_ctx.inputs.prepared_ssa = Some(&prepared);
-        function_facts.set_render(render_facts_for_prepared(&prepared));
-        add_test_x86_64_signature(&mut function_facts);
-        install_typed_function_facts(
-            &mut certified_ctx,
-            function_facts.with_decompile_route(standard_route_for_test("test typed branch")),
-        );
+        certified_ctx.inputs.prepared_ssa = Some(prepared.as_ref());
+        install_typed_function_facts(&mut certified_ctx, source_owned.report().clone());
         let mut certified_structurer =
             ControlFlowStructurer::new(prepared.function(), &certified_ctx);
         let certified_stmt = certified_structurer.structure();
@@ -6228,13 +5570,12 @@ mod tests {
         );
 
         let mut missing_control_ctx = FoldingContext::new(64);
-        missing_control_ctx.inputs.prepared_ssa = Some(&prepared);
-        install_typed_function_facts(
-            &mut missing_control_ctx,
-            r2types::FunctionFacts::default()
-                .with_render(render_facts_for_prepared(&prepared))
-                .with_decompile_route(standard_route_for_test("test typed missing branch proof")),
-        );
+        missing_control_ctx.inputs.prepared_ssa = Some(prepared.as_ref());
+        let mut missing_control = source_owned.report().clone();
+        let mut control = missing_control.control_facts().clone();
+        control.branch_predicates.clear();
+        missing_control.set_control(control);
+        install_typed_function_facts(&mut missing_control_ctx, missing_control);
         let mut missing_control_structurer =
             ControlFlowStructurer::new(prepared.function(), &missing_control_ctx);
         let missing_control_stmt = missing_control_structurer.structure();
@@ -6251,19 +5592,16 @@ mod tests {
 
     #[test]
     fn certified_loop_structuring_requires_function_facts_loop_structure() {
-        let prepared = prepared_with_guarded_while_loop();
+        let (prepared, source_owned) =
+            source_owned_test_facts(prepared_with_guarded_while_loop(), "test typed loop");
         let region = Region::WhileLoop {
             header: 0x1000,
             body: Box::new(Region::Block(0x1004)),
         };
 
-        let certified_control = control_facts_for_guarded_while_loop(&prepared, true);
         let mut certified_ctx = FoldingContext::new(64);
-        certified_ctx.inputs.prepared_ssa = Some(&prepared);
-        install_typed_function_facts(
-            &mut certified_ctx,
-            certified_function_facts(certified_control, render_facts_for_prepared(&prepared)),
-        );
+        certified_ctx.inputs.prepared_ssa = Some(prepared.as_ref());
+        install_typed_function_facts(&mut certified_ctx, source_owned.report().clone());
         let mut certified_structurer =
             ControlFlowStructurer::new(prepared.function(), &certified_ctx);
         let certified_stmt = certified_structurer.structure_region(&region);
@@ -6285,13 +5623,13 @@ mod tests {
             "a true edge that exits the loop must invert the branch predicate, got {cond:?}"
         );
 
-        let missing_loop_control = control_facts_for_guarded_while_loop(&prepared, false);
         let mut missing_loop_ctx = FoldingContext::new(64);
-        missing_loop_ctx.inputs.prepared_ssa = Some(&prepared);
-        install_typed_function_facts(
-            &mut missing_loop_ctx,
-            certified_function_facts(missing_loop_control, render_facts_for_prepared(&prepared)),
-        );
+        missing_loop_ctx.inputs.prepared_ssa = Some(prepared.as_ref());
+        let mut missing_loop = source_owned.report().clone();
+        let mut control = missing_loop.control_facts().clone();
+        control.loops.clear();
+        missing_loop.set_control(control);
+        install_typed_function_facts(&mut missing_loop_ctx, missing_loop);
         let mut missing_loop_structurer =
             ControlFlowStructurer::new(prepared.function(), &missing_loop_ctx);
         let missing_loop_stmt = missing_loop_structurer.structure_region(&region);
@@ -6307,19 +5645,16 @@ mod tests {
 
     #[test]
     fn certified_switch_structuring_requires_function_facts_case_targets() {
-        let prepared = prepared_with_switch_block_and_cases();
+        let (prepared, source_owned) =
+            source_owned_test_facts(prepared_with_switch_block_and_cases(), "test typed switch");
         let cases = vec![
             (Some(0), Box::new(Region::Block(0x1010))),
             (Some(1), Box::new(Region::Block(0x1020))),
         ];
 
-        let certified_control = control_facts_for_switch(&prepared, true);
         let mut certified_ctx = FoldingContext::new(64);
-        certified_ctx.inputs.prepared_ssa = Some(&prepared);
-        install_typed_function_facts(
-            &mut certified_ctx,
-            certified_function_facts(certified_control, render_facts_for_prepared(&prepared)),
-        );
+        certified_ctx.inputs.prepared_ssa = Some(prepared.as_ref());
+        install_typed_function_facts(&mut certified_ctx, source_owned.report().clone());
         let mut certified_structurer =
             ControlFlowStructurer::new(prepared.function(), &certified_ctx);
         let certified_stmt =
@@ -6333,13 +5668,18 @@ mod tests {
             "certified switch structuring must not synthesize case exits without exact transfer facts: {certified_stmt:?}"
         );
 
-        let selector_only_control = control_facts_for_switch(&prepared, false);
         let mut selector_only_ctx = FoldingContext::new(64);
-        selector_only_ctx.inputs.prepared_ssa = Some(&prepared);
-        install_typed_function_facts(
-            &mut selector_only_ctx,
-            certified_function_facts(selector_only_control, render_facts_for_prepared(&prepared)),
-        );
+        selector_only_ctx.inputs.prepared_ssa = Some(prepared.as_ref());
+        let mut selector_only = source_owned.report().clone();
+        let mut control = selector_only.control_facts().clone();
+        control
+            .switches
+            .get_mut(&0x1000)
+            .expect("source-owned switch proof")
+            .cases
+            .clear();
+        selector_only.set_control(control);
+        install_typed_function_facts(&mut selector_only_ctx, selector_only);
         let mut selector_only_structurer =
             ControlFlowStructurer::new(prepared.function(), &selector_only_ctx);
         let selector_only_stmt =
@@ -7549,746 +6889,6 @@ mod tests {
         assert!(
             matches!(cleaned, CStmt::For { .. }),
             "Suffix-equivalent loop vars (local/local_4) should be treated as matching"
-        );
-    }
-
-    #[test]
-    fn uses_vm_transfer_selector_when_vm_step_is_absent() {
-        let func = function_with_single_block(0x1000);
-        let mut ctx = FoldingContext::new(64);
-        let artifact = r2sym::SemanticArtifact {
-            stage: r2sym::RefinementStage::Residual,
-            granularity: r2sym::ArtifactGranularity::SummaryOnly,
-            execution: r2sym::ExecutionModel::Vm,
-            body: r2sym::SemanticArtifactBody::Vm(Box::new(r2sym::VmArtifactBody {
-                interpreter: None,
-                step_summary: None,
-                transfer_summary: Some(r2sym::VmStepSummary {
-                    kind: r2sym::InterpreterKind::SwitchDispatch,
-                    loop_header: 0x1000,
-                    dispatch_header: 0x1000,
-                    selector: Some("vm.sel".to_string()),
-                    dispatch_targets: vec![0x1004],
-                    default_target: None,
-                    case_values_by_target: BTreeMap::from([(0x1004, vec![1, 2])]),
-                    loop_latches: vec![0x1000],
-                    state_inputs: vec!["state".to_string()],
-                    state_outputs: vec!["state".to_string()],
-                    step_blocks: vec![0x1000],
-                    handler_regions: BTreeMap::from([(0x1004, vec![0x1004, 0x1008])]),
-                    handler_state_inputs: BTreeMap::from([(0x1004, vec!["state".to_string()])]),
-                    handler_state_outputs: BTreeMap::from([(0x1004, vec!["state".to_string()])]),
-                    handler_state_updates: BTreeMap::from([(
-                        0x1004,
-                        vec![r2sym::VmStateUpdate {
-                            output: "state".to_string(),
-                            expr: "state + 1".to_string(),
-                            value: r2sym::VmValueExpr::Expr("state + 1".to_string()),
-                            exact: false,
-                        }],
-                    )]),
-                    handler_exit_guards: BTreeMap::new(),
-                    handler_memory_read_effects: BTreeMap::new(),
-                    handler_memory_write_effects: BTreeMap::new(),
-                    handler_memory_reads: BTreeMap::from([(0x1004, 1)]),
-                    handler_memory_writes: BTreeMap::from([(0x1004, 1)]),
-                    handler_calls: BTreeMap::from([(0x1004, 0)]),
-                    handler_conditional_branches: BTreeMap::from([(0x1004, 0)]),
-                    handler_exit_targets: BTreeMap::from([(0x1004, vec![0x1008])]),
-                    redispatch_handlers: vec![0x1000],
-                    returning_handlers: vec![],
-                    truncated_handlers: vec![],
-                    transfers: vec![r2sym::VmTransferArm {
-                        handler_target: 0x1004,
-                        case_values: vec![1, 2],
-                        region_blocks: vec![0x1004, 0x1008],
-                        exit_targets: vec![0x1008],
-                        exit_guards: Vec::new(),
-                        state_updates: vec![r2sym::VmStateUpdate {
-                            output: "state".to_string(),
-                            expr: "state + 1".to_string(),
-                            value: r2sym::VmValueExpr::Expr("state + 1".to_string()),
-                            exact: false,
-                        }],
-                        selector_update: None,
-                        memory_reads: Vec::new(),
-                        memory_writes: Vec::new(),
-                        residual_guards: false,
-                        residual_memory_effects: false,
-                        exact: false,
-                        redispatch: false,
-                        may_return: false,
-                        truncated: false,
-                    }],
-                }),
-            })),
-            diagnostics: r2sym::SemanticArtifactDiagnostics {
-                branches_evaluated: 0,
-                branches_pruned: 0,
-                branches_unknown: 0,
-                skipped_missing_arch: false,
-                skipped_large_cfg: false,
-                residual_reasons: Vec::new(),
-                interpreter: None,
-                ambiguous_targets: Vec::new(),
-            },
-        };
-        install_semantic_artifact(&mut ctx, artifact);
-
-        let mut structurer = ControlFlowStructurer::new(&func, &ctx);
-        assert_eq!(
-            structurer.get_switch_expression(0x1000),
-            Some((CExpr::Var("vm.sel".to_string()), None))
-        );
-    }
-
-    #[test]
-    fn symbolic_exact_reachable_target_uses_control_island_fallback() {
-        let func = function_with_single_block(0x2000);
-        let mut ctx = FoldingContext::new(64);
-        let region = crate::test_semantic_region(
-            0x2000,
-            BTreeSet::from([0x2004, 0x2008]),
-            vec![
-                crate::test_control_fact(
-                    0x2004,
-                    r2sym::SymbolicReachabilityStatus::Reachable,
-                    None,
-                    Some("x == 0"),
-                    None,
-                    r2sym::SemanticEvidence::exact(),
-                ),
-                crate::test_control_fact(
-                    0x2008,
-                    r2sym::SymbolicReachabilityStatus::Unreachable,
-                    None,
-                    Some("!(x == 0)"),
-                    None,
-                    r2sym::SemanticEvidence::exact(),
-                ),
-            ],
-            Vec::new(),
-        );
-        install_semantic_artifact(
-            &mut ctx,
-            crate::test_native_semantic_artifact(
-                r2sym::RefinementStage::Compiled,
-                r2sym::ArtifactGranularity::Regioned,
-                r2sym::SliceClass::Worker,
-                false,
-                Vec::new(),
-                vec![region],
-            ),
-        );
-
-        let structurer = ControlFlowStructurer::new(&func, &ctx);
-        assert_eq!(
-            structurer.symbolic_exact_reachable_target(0x2000),
-            Some(0x2004)
-        );
-    }
-
-    #[test]
-    fn certified_structuring_refuses_symbolic_exact_target_branch_elision() {
-        let func = function_with_conditional_return_blocks(0x2000, 0x2004, 0x2008);
-        let mut ctx = FoldingContext::new(64);
-        install_typed_function_facts(
-            &mut ctx,
-            r2types::FunctionFacts::default()
-                .with_decompile_route(standard_route_for_test("test typed exact target refusal")),
-        );
-        let region = crate::test_semantic_region(
-            0x2000,
-            BTreeSet::from([0x2004, 0x2008]),
-            vec![
-                crate::test_control_fact(
-                    0x2004,
-                    r2sym::SymbolicReachabilityStatus::Reachable,
-                    Some(true),
-                    Some("x == 0"),
-                    None,
-                    r2sym::SemanticEvidence::exact(),
-                ),
-                crate::test_control_fact(
-                    0x2008,
-                    r2sym::SymbolicReachabilityStatus::Unreachable,
-                    Some(false),
-                    Some("!(x == 0)"),
-                    None,
-                    r2sym::SemanticEvidence::exact(),
-                ),
-            ],
-            Vec::new(),
-        );
-        install_semantic_artifact(
-            &mut ctx,
-            crate::test_native_semantic_artifact(
-                r2sym::RefinementStage::Compiled,
-                r2sym::ArtifactGranularity::Regioned,
-                r2sym::SliceClass::Worker,
-                false,
-                Vec::new(),
-                vec![region],
-            ),
-        );
-
-        let region = Region::IfThenElse {
-            cond_block: 0x2000,
-            then_region: Box::new(Region::Block(0x2004)),
-            else_region: Some(Box::new(Region::Block(0x2008))),
-            merge_block: None,
-        };
-        let mut structurer = ControlFlowStructurer::new(&func, &ctx);
-        let stmt = structurer.structure_region(&region);
-
-        assert!(
-            !stmt_contains_if(&stmt),
-            "certified mode must not elide or render a branch from r2sym exact target side-channel proof: {stmt:?}"
-        );
-        assert!(
-            stmt_contains_comment(&stmt, "unresolved branch condition")
-                || stmt_contains_comment(&stmt, "uncertified branch structure"),
-            "missing FunctionFacts control proof should residualize exact-target branch elision, got {stmt:?}"
-        );
-    }
-
-    #[test]
-    fn symbolic_actionable_reachable_target_uses_likely_control_island_fallback() {
-        let func = function_with_single_block(0x2000);
-        let mut ctx = FoldingContext::new(64);
-        let likely =
-            r2sym::SemanticEvidence::likely(r2sym::SemanticEvidenceReason::PartialPathCoverage);
-        let region = crate::test_semantic_region(
-            0x2000,
-            BTreeSet::from([0x2004, 0x2008]),
-            vec![
-                crate::test_control_fact(
-                    0x2004,
-                    r2sym::SymbolicReachabilityStatus::Reachable,
-                    None,
-                    Some("x == 0"),
-                    Some(r2sym::BackwardConditionSummary {
-                        simplified: "x == 0".to_string(),
-                        terms: vec!["x == 0".to_string()],
-                        memory_terms: Vec::new(),
-                        backward_memory_substitutions: 0,
-                        backward_memory_candidate_enumerations: 0,
-                        backward_memory_residual_fallbacks: 0,
-                        precision: r2sym::BackwardConditionPrecision::OverApprox,
-                        supported_paths: 1,
-                        total_paths: 2,
-                    }),
-                    likely.clone(),
-                ),
-                crate::test_control_fact(
-                    0x2008,
-                    r2sym::SymbolicReachabilityStatus::Unreachable,
-                    None,
-                    Some("!(x == 0)"),
-                    None,
-                    likely.clone(),
-                ),
-            ],
-            Vec::new(),
-        );
-        install_semantic_artifact(
-            &mut ctx,
-            crate::test_native_semantic_artifact(
-                r2sym::RefinementStage::Compiled,
-                r2sym::ArtifactGranularity::Regioned,
-                r2sym::SliceClass::Worker,
-                false,
-                Vec::new(),
-                vec![region],
-            ),
-        );
-
-        let structurer = ControlFlowStructurer::new(&func, &ctx);
-        assert_eq!(
-            structurer.symbolic_actionable_reachable_target(0x2000),
-            Some(0x2004)
-        );
-    }
-
-    #[test]
-    fn symbolic_actionable_if_refuses_likely_target_without_exact_reachability() {
-        let func = function_with_return_blocks(&[0x2000, 0x2004, 0x2008]);
-        let mut ctx = FoldingContext::new(64);
-        let likely =
-            r2sym::SemanticEvidence::likely(r2sym::SemanticEvidenceReason::PartialPathCoverage);
-        let region = crate::test_semantic_region(
-            0x2000,
-            BTreeSet::from([0x2004, 0x2008]),
-            vec![
-                crate::test_control_fact(
-                    0x2008,
-                    r2sym::SymbolicReachabilityStatus::Reachable,
-                    None,
-                    Some("x == 0"),
-                    Some(r2sym::BackwardConditionSummary {
-                        simplified: "x == 0".to_string(),
-                        terms: vec!["x == 0".to_string()],
-                        memory_terms: Vec::new(),
-                        backward_memory_substitutions: 0,
-                        backward_memory_candidate_enumerations: 0,
-                        backward_memory_residual_fallbacks: 0,
-                        precision: r2sym::BackwardConditionPrecision::OverApprox,
-                        supported_paths: 1,
-                        total_paths: 2,
-                    }),
-                    likely.clone(),
-                ),
-                crate::test_control_fact(
-                    0x2004,
-                    r2sym::SymbolicReachabilityStatus::Unreachable,
-                    None,
-                    Some("!(x == 0)"),
-                    Some(r2sym::BackwardConditionSummary {
-                        simplified: "!(x == 0)".to_string(),
-                        terms: vec!["!(x == 0)".to_string()],
-                        memory_terms: Vec::new(),
-                        backward_memory_substitutions: 0,
-                        backward_memory_candidate_enumerations: 0,
-                        backward_memory_residual_fallbacks: 0,
-                        precision: r2sym::BackwardConditionPrecision::OverApprox,
-                        supported_paths: 1,
-                        total_paths: 2,
-                    }),
-                    likely.clone(),
-                ),
-            ],
-            Vec::new(),
-        );
-        install_semantic_artifact(
-            &mut ctx,
-            crate::test_native_semantic_artifact(
-                r2sym::RefinementStage::Compiled,
-                r2sym::ArtifactGranularity::Regioned,
-                r2sym::SliceClass::Worker,
-                false,
-                Vec::new(),
-                vec![region],
-            ),
-        );
-
-        let mut structurer = ControlFlowStructurer::new(&func, &ctx);
-        let then_region = crate::region::Region::Sequence(vec![
-            crate::region::Region::Block(0x2004),
-            crate::region::Region::Block(0x2008),
-        ]);
-
-        let rewritten =
-            structurer.try_structure_symbolic_actionable_if(0x2000, &then_region, None, None);
-        assert!(
-            rewritten.is_none(),
-            "likely/actionable reachability is not enough to erase a native branch"
-        );
-    }
-
-    #[test]
-    fn structured_worker_route_refuses_executable_if_from_summary_region() {
-        let func = function_with_conditional_return_blocks(0x2000, 0x2004, 0x2008);
-        let mut ctx = FoldingContext::new(64);
-        let region = r2sym::SemanticRegion {
-            anchor: 0x2000,
-            frontier: std::collections::BTreeSet::from([0x2004, 0x2008]),
-            control: vec![
-                r2sym::Judged::new(
-                    r2sym::ControlFact {
-                        target: 0x2004,
-                        status: r2sym::SymbolicReachabilityStatus::Reachable,
-                        branch_truth: Some(true),
-                        condition: Some("x == 0".to_string()),
-                        compiled: Some(r2sym::BackwardConditionSummary {
-                            simplified: "x == 0".to_string(),
-                            terms: vec!["x == 0".to_string()],
-                            memory_terms: vec![r2sym::BackwardMemoryCondition {
-                                region: r2sym::BackwardMemoryRegion::Argument { index: 0 },
-                                address: r2sym::SemanticMemoryAddress::exact(0),
-                                size: 1,
-                                evidence: r2sym::SemanticEvidence::exact(),
-                                binding: None,
-                                expr: "*arg0".to_string(),
-                                value_expr: Some("0x0:8".to_string()),
-                                exact_value: true,
-                            }],
-                            backward_memory_substitutions: 0,
-                            backward_memory_candidate_enumerations: 0,
-                            backward_memory_residual_fallbacks: 0,
-                            precision: r2sym::BackwardConditionPrecision::Exact,
-                            supported_paths: 1,
-                            total_paths: 1,
-                        }),
-                    },
-                    r2sym::SemanticEvidence::exact(),
-                ),
-                r2sym::Judged::new(
-                    r2sym::ControlFact {
-                        target: 0x2008,
-                        status: r2sym::SymbolicReachabilityStatus::Unreachable,
-                        branch_truth: Some(false),
-                        condition: Some("!(x == 0)".to_string()),
-                        compiled: None,
-                    },
-                    r2sym::SemanticEvidence::exact(),
-                ),
-            ],
-            memory: vec![r2sym::Judged::new(
-                r2sym::MemoryFact {
-                    term: r2sym::BackwardMemoryCondition {
-                        region: r2sym::BackwardMemoryRegion::Argument { index: 0 },
-                        address: r2sym::SemanticMemoryAddress::exact(0),
-                        size: 1,
-                        evidence: r2sym::SemanticEvidence::exact(),
-                        binding: None,
-                        expr: "*arg0".to_string(),
-                        value_expr: Some("0x0:8".to_string()),
-                        exact_value: true,
-                    },
-                },
-                r2sym::SemanticEvidence::exact(),
-            )],
-            pre: Vec::new(),
-            post: Vec::new(),
-            targets: vec![
-                r2sym::Judged::new(
-                    r2sym::TargetFact {
-                        target: 0x2004,
-                        status: r2sym::SymbolicReachabilityStatus::Reachable,
-                        branch_truth: Some(true),
-                    },
-                    r2sym::SemanticEvidence::exact(),
-                ),
-                r2sym::Judged::new(
-                    r2sym::TargetFact {
-                        target: 0x2008,
-                        status: r2sym::SymbolicReachabilityStatus::Unreachable,
-                        branch_truth: Some(false),
-                    },
-                    r2sym::SemanticEvidence::exact(),
-                ),
-            ],
-        };
-        let artifact = r2sym::SemanticArtifact {
-            stage: r2sym::RefinementStage::Compiled,
-            granularity: r2sym::ArtifactGranularity::Regioned,
-            execution: r2sym::ExecutionModel::Native,
-            body: r2sym::SemanticArtifactBody::Native(r2sym::NativeArtifactBody {
-                summary: r2sym::NativeFunctionSummary {
-                    slice_class: r2sym::SliceClass::Worker,
-                    role_identity: None,
-                    closure_functions: 1,
-                    helper_functions: 0,
-                    derived_summaries: 0,
-                    derived_diagnostics: Default::default(),
-                    region_summaries: Vec::new(),
-                    worker_summaries: Vec::new(),
-                },
-                regions: BTreeMap::from([(region.key(), region)]),
-            }),
-            diagnostics: r2sym::SemanticArtifactDiagnostics {
-                branches_evaluated: 1,
-                branches_pruned: 1,
-                branches_unknown: 0,
-                skipped_missing_arch: false,
-                skipped_large_cfg: true,
-                residual_reasons: vec![r2sym::ResidualReason::LargeCfg],
-                interpreter: None,
-                ambiguous_targets: Vec::new(),
-            },
-        };
-        install_semantic_artifact(&mut ctx, artifact);
-
-        let mut structurer = ControlFlowStructurer::new(&func, &ctx);
-        let routed = crate::consumer_structured::primary_body_for_semantic_route(
-            &test_structured_worker_route("large native worker summarized as typed islands"),
-            &mut structurer,
-            Vec::new,
-        );
-        assert!(
-            !stmt_contains_if(&routed.body_stmt),
-            "summary-permission route must not emit executable if statements, got {:?}",
-            routed.body_stmt
-        );
-        assert!(
-            stmt_contains_comment(
-                &routed.body_stmt,
-                "render contract: summary facts only; no executable native C reconstructed"
-            ),
-            "summary-permission route must state the render contract, got {:?}",
-            routed.body_stmt
-        );
-    }
-
-    #[test]
-    fn structured_worker_route_refuses_likely_false_branch_projection() {
-        let func = function_with_conditional_return_blocks(0x2000, 0x2008, 0x2004);
-        let mut ctx = FoldingContext::new(64);
-        let likely =
-            r2sym::SemanticEvidence::likely(r2sym::SemanticEvidenceReason::DerivedFromRanking);
-        let region = r2sym::SemanticRegion {
-            anchor: 0x2000,
-            frontier: std::collections::BTreeSet::from([0x2004, 0x2008]),
-            control: vec![
-                r2sym::Judged::new(
-                    r2sym::ControlFact {
-                        target: 0x2008,
-                        status: r2sym::SymbolicReachabilityStatus::Unreachable,
-                        branch_truth: Some(true),
-                        condition: Some("x == 0".to_string()),
-                        compiled: None,
-                    },
-                    likely.clone(),
-                ),
-                r2sym::Judged::new(
-                    r2sym::ControlFact {
-                        target: 0x2004,
-                        status: r2sym::SymbolicReachabilityStatus::Reachable,
-                        branch_truth: Some(false),
-                        condition: Some("!(x == 0)".to_string()),
-                        compiled: Some(r2sym::BackwardConditionSummary {
-                            simplified: "!(x == 0)".to_string(),
-                            terms: vec!["!(x == 0)".to_string()],
-                            memory_terms: vec![r2sym::BackwardMemoryCondition {
-                                region: r2sym::BackwardMemoryRegion::Argument { index: 0 },
-                                address: r2sym::SemanticMemoryAddress::exact(0),
-                                size: 1,
-                                evidence: likely.clone(),
-                                binding: None,
-                                expr: "*arg0".to_string(),
-                                value_expr: Some("0x1:8".to_string()),
-                                exact_value: true,
-                            }],
-                            backward_memory_substitutions: 0,
-                            backward_memory_candidate_enumerations: 0,
-                            backward_memory_residual_fallbacks: 0,
-                            precision: r2sym::BackwardConditionPrecision::OverApprox,
-                            supported_paths: 1,
-                            total_paths: 2,
-                        }),
-                    },
-                    likely.clone(),
-                ),
-            ],
-            memory: vec![r2sym::Judged::new(
-                r2sym::MemoryFact {
-                    term: r2sym::BackwardMemoryCondition {
-                        region: r2sym::BackwardMemoryRegion::Argument { index: 0 },
-                        address: r2sym::SemanticMemoryAddress::exact(0),
-                        size: 1,
-                        evidence: likely.clone(),
-                        binding: None,
-                        expr: "*arg0".to_string(),
-                        value_expr: Some("0x1:8".to_string()),
-                        exact_value: true,
-                    },
-                },
-                likely.clone(),
-            )],
-            pre: Vec::new(),
-            post: Vec::new(),
-            targets: vec![
-                r2sym::Judged::new(
-                    r2sym::TargetFact {
-                        target: 0x2008,
-                        status: r2sym::SymbolicReachabilityStatus::Unreachable,
-                        branch_truth: Some(true),
-                    },
-                    likely.clone(),
-                ),
-                r2sym::Judged::new(
-                    r2sym::TargetFact {
-                        target: 0x2004,
-                        status: r2sym::SymbolicReachabilityStatus::Reachable,
-                        branch_truth: Some(false),
-                    },
-                    likely.clone(),
-                ),
-            ],
-        };
-        let artifact = r2sym::SemanticArtifact {
-            stage: r2sym::RefinementStage::Compiled,
-            granularity: r2sym::ArtifactGranularity::Regioned,
-            execution: r2sym::ExecutionModel::Native,
-            body: r2sym::SemanticArtifactBody::Native(r2sym::NativeArtifactBody {
-                summary: r2sym::NativeFunctionSummary {
-                    slice_class: r2sym::SliceClass::Worker,
-                    role_identity: None,
-                    closure_functions: 0,
-                    helper_functions: 0,
-                    derived_summaries: 0,
-                    derived_diagnostics: Default::default(),
-                    region_summaries: Vec::new(),
-                    worker_summaries: Vec::new(),
-                },
-                regions: BTreeMap::from([(region.key(), region)]),
-            }),
-            diagnostics: r2sym::SemanticArtifactDiagnostics {
-                branches_evaluated: 1,
-                branches_pruned: 0,
-                branches_unknown: 0,
-                skipped_missing_arch: false,
-                skipped_large_cfg: true,
-                residual_reasons: vec![r2sym::ResidualReason::LargeCfg],
-                interpreter: None,
-                ambiguous_targets: Vec::new(),
-            },
-        };
-        install_semantic_artifact(&mut ctx, artifact);
-
-        let mut structurer = ControlFlowStructurer::new(&func, &ctx);
-        let routed = crate::consumer_structured::primary_body_for_semantic_route(
-            &test_structured_worker_route("likely semantic worker reachability"),
-            &mut structurer,
-            Vec::new,
-        );
-        assert!(
-            !stmt_contains_if(&routed.body_stmt),
-            "likely/actionable reachability must stay comment-only under summary permission, got {:?}",
-            routed.body_stmt
-        );
-        assert!(
-            stmt_contains_comment(
-                &routed.body_stmt,
-                "render contract: summary facts only; no executable native C reconstructed"
-            ),
-            "summary-permission route must state the render contract, got {:?}",
-            routed.body_stmt
-        );
-    }
-
-    #[test]
-    fn structured_worker_route_refuses_multi_block_suffix_projection() {
-        let func = function_with_multi_block_true_arm(0x2000, 0x2008, 0x200c, 0x2004);
-        let mut ctx = FoldingContext::new(64);
-        let region = r2sym::SemanticRegion {
-            anchor: 0x2000,
-            frontier: BTreeSet::from([0x2008, 0x2004]),
-            control: vec![
-                r2sym::Judged::new(
-                    r2sym::ControlFact {
-                        target: 0x2008,
-                        status: r2sym::SymbolicReachabilityStatus::Reachable,
-                        branch_truth: Some(true),
-                        condition: Some("x == 0".to_string()),
-                        compiled: Some(r2sym::BackwardConditionSummary {
-                            simplified: "x == 0".to_string(),
-                            terms: vec!["x == 0".to_string()],
-                            memory_terms: vec![r2sym::BackwardMemoryCondition {
-                                region: r2sym::BackwardMemoryRegion::Argument { index: 0 },
-                                address: r2sym::SemanticMemoryAddress::exact(0),
-                                size: 1,
-                                evidence: r2sym::SemanticEvidence::exact(),
-                                binding: None,
-                                expr: "*arg0".to_string(),
-                                value_expr: Some("0x0:8".to_string()),
-                                exact_value: true,
-                            }],
-                            backward_memory_substitutions: 0,
-                            backward_memory_candidate_enumerations: 0,
-                            backward_memory_residual_fallbacks: 0,
-                            precision: r2sym::BackwardConditionPrecision::Exact,
-                            supported_paths: 1,
-                            total_paths: 1,
-                        }),
-                    },
-                    r2sym::SemanticEvidence::exact(),
-                ),
-                r2sym::Judged::new(
-                    r2sym::ControlFact {
-                        target: 0x2004,
-                        status: r2sym::SymbolicReachabilityStatus::Unreachable,
-                        branch_truth: Some(false),
-                        condition: Some("!(x == 0)".to_string()),
-                        compiled: None,
-                    },
-                    r2sym::SemanticEvidence::exact(),
-                ),
-            ],
-            memory: vec![r2sym::Judged::new(
-                r2sym::MemoryFact {
-                    term: r2sym::BackwardMemoryCondition {
-                        region: r2sym::BackwardMemoryRegion::Argument { index: 0 },
-                        address: r2sym::SemanticMemoryAddress::exact(0),
-                        size: 1,
-                        evidence: r2sym::SemanticEvidence::exact(),
-                        binding: None,
-                        expr: "*arg0".to_string(),
-                        value_expr: Some("0x0:8".to_string()),
-                        exact_value: true,
-                    },
-                },
-                r2sym::SemanticEvidence::exact(),
-            )],
-            pre: Vec::new(),
-            post: Vec::new(),
-            targets: vec![
-                r2sym::Judged::new(
-                    r2sym::TargetFact {
-                        target: 0x2008,
-                        status: r2sym::SymbolicReachabilityStatus::Reachable,
-                        branch_truth: Some(true),
-                    },
-                    r2sym::SemanticEvidence::exact(),
-                ),
-                r2sym::Judged::new(
-                    r2sym::TargetFact {
-                        target: 0x2004,
-                        status: r2sym::SymbolicReachabilityStatus::Unreachable,
-                        branch_truth: Some(false),
-                    },
-                    r2sym::SemanticEvidence::exact(),
-                ),
-            ],
-        };
-        let artifact = r2sym::SemanticArtifact {
-            stage: r2sym::RefinementStage::Compiled,
-            granularity: r2sym::ArtifactGranularity::Regioned,
-            execution: r2sym::ExecutionModel::Native,
-            body: r2sym::SemanticArtifactBody::Native(r2sym::NativeArtifactBody {
-                summary: r2sym::NativeFunctionSummary {
-                    slice_class: r2sym::SliceClass::Worker,
-                    role_identity: None,
-                    closure_functions: 0,
-                    helper_functions: 0,
-                    derived_summaries: 0,
-                    derived_diagnostics: Default::default(),
-                    region_summaries: Vec::new(),
-                    worker_summaries: Vec::new(),
-                },
-                regions: BTreeMap::from([(region.key(), region)]),
-            }),
-            diagnostics: r2sym::SemanticArtifactDiagnostics {
-                branches_evaluated: 1,
-                branches_pruned: 0,
-                branches_unknown: 0,
-                skipped_missing_arch: false,
-                skipped_large_cfg: true,
-                residual_reasons: vec![r2sym::ResidualReason::LargeCfg],
-                interpreter: None,
-                ambiguous_targets: Vec::new(),
-            },
-        };
-        install_semantic_artifact(&mut ctx, artifact);
-
-        let mut structurer = ControlFlowStructurer::new(&func, &ctx);
-        let routed = crate::consumer_structured::primary_body_for_semantic_route(
-            &test_structured_worker_route("semantic worker target suffix"),
-            &mut structurer,
-            Vec::new,
-        );
-        assert!(
-            !stmt_contains_if(&routed.body_stmt),
-            "summary-permission route must not emit target suffix C, got {:?}",
-            routed.body_stmt
-        );
-        assert!(
-            stmt_contains_comment(
-                &routed.body_stmt,
-                "render contract: summary facts only; no executable native C reconstructed"
-            ),
-            "summary-permission route must state the render contract, got {:?}",
-            routed.body_stmt
         );
     }
 }

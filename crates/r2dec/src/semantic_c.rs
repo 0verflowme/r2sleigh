@@ -1150,6 +1150,7 @@ pub enum SemanticCError {
     InvalidExpandedLeaf(MachineValueBinding),
     InvalidExpandedRoot(SemanticCExprId),
     AmbiguousExpandedInput(MachineValueBinding),
+    AmbiguousMaterializedExpression(SemanticCExprId),
     CyclicExpandedExpression(SemanticCExprId),
     MissingMemoryRewrite(StructuredAccessId),
     DuplicateMemoryRewrite(StructuredAccessId),
@@ -1213,6 +1214,7 @@ trait CertifiedSemanticSource {
     fn stack_slots(&self) -> &BTreeMap<StackAddressRoot, CertifiedStackSlot>;
     fn topology(&self) -> &CertifiedSourceTopology;
     fn frame_preservation(&self) -> Option<&CertifiedFramePreservation>;
+    fn stack_discipline(&self) -> Option<&CertifiedStackDiscipline>;
     fn return_control_for_producer(
         &self,
         producer: CanonicalInstructionId,
@@ -1262,6 +1264,10 @@ impl CertifiedSemanticSource for CertifiedMachineFunction {
 
     fn frame_preservation(&self) -> Option<&CertifiedFramePreservation> {
         CertifiedMachineFunction::frame_preservation(self)
+    }
+
+    fn stack_discipline(&self) -> Option<&CertifiedStackDiscipline> {
+        CertifiedMachineFunction::stack_discipline(self)
     }
 
     fn return_control_for_producer(
@@ -1318,6 +1324,10 @@ impl CertifiedSemanticSource for CertifiedMachineProjection {
 
     fn frame_preservation(&self) -> Option<&CertifiedFramePreservation> {
         CertifiedMachineProjection::frame_preservation(self)
+    }
+
+    fn stack_discipline(&self) -> Option<&CertifiedStackDiscipline> {
+        CertifiedMachineProjection::stack_discipline(self)
     }
 
     fn return_control_for_producer(
@@ -1641,6 +1651,21 @@ pub(crate) fn certified_private_entry_stack_pointer_input(
     let (Some(join), Some(stack)) = (join, stack) else {
         return Err(SemanticCError::InvalidCertifiedPrivateFrameInput);
     };
+    if join.schema_version() != CERTIFICATION_SCHEMA_VERSION
+        || join.origin() != certified.origin()
+        || join.header() != certified.topology().entry_addr()
+        || certified.private_frame_conditional_join(join.header()) != Some(join)
+    {
+        return Err(SemanticCError::InvalidCertifiedPrivateFrameInput);
+    }
+    certified_entry_stack_pointer_input(certified, stack, join.header())
+}
+
+fn certified_entry_stack_pointer_input(
+    certified: &impl CertifiedSemanticSource,
+    stack: &CertifiedStackDiscipline,
+    header: u64,
+) -> Result<CertifiedPrivateEntryStackPointerInput, SemanticCError> {
     let origin = certified.origin();
     let entry = stack.entry_stack_pointer();
     let width_bits = stack
@@ -1649,12 +1674,9 @@ pub(crate) fn certified_private_entry_stack_pointer_input(
         .checked_mul(8)
         .ok_or(SemanticCError::InvalidCertifiedPrivateFrameInput)?;
     if origin.schema_version() != CERTIFICATION_SCHEMA_VERSION
-        || join.schema_version() != CERTIFICATION_SCHEMA_VERSION
         || stack.schema_version() != CERTIFICATION_SCHEMA_VERSION
-        || join.origin() != origin
         || stack.origin() != origin
-        || join.header() != certified.topology().entry_addr()
-        || certified.private_frame_conditional_join(join.header()) != Some(join)
+        || header != certified.topology().entry_addr()
         || certified.stack_discipline() != Some(stack)
         || entry.binding().width_bits() != width_bits
         || entry.producer().is_some()
@@ -1667,7 +1689,7 @@ pub(crate) fn certified_private_entry_stack_pointer_input(
         binding: entry.binding(),
         ty: entry.ty().clone(),
         storage: stack.stack_pointer_storage(),
-        header: join.header(),
+        header,
     })
 }
 
@@ -1719,17 +1741,16 @@ fn classify_input(
         .unwrap_or(SemanticCInputOrigin::UnclassifiedSource)
 }
 
+struct ExactExpressionDependencies {
+    dependencies: BTreeMap<CanonicalInstructionId, BTreeSet<CanonicalInstructionId>>,
+    output_producers: BTreeMap<ValueId, CanonicalInstructionId>,
+    outputs: BTreeMap<CanonicalInstructionId, MachineValueBinding>,
+}
+
 fn exact_expression_dependencies(
     certified: &impl CertifiedSemanticSource,
     machine: MachineView<'_>,
-) -> Result<
-    (
-        BTreeMap<CanonicalInstructionId, BTreeSet<CanonicalInstructionId>>,
-        BTreeMap<ValueId, CanonicalInstructionId>,
-        BTreeMap<CanonicalInstructionId, MachineValueBinding>,
-    ),
-    SemanticCError,
-> {
+) -> Result<ExactExpressionDependencies, SemanticCError> {
     let mut dependencies = BTreeMap::new();
     let mut output_producers = BTreeMap::new();
     let mut outputs = BTreeMap::new();
@@ -1776,7 +1797,11 @@ fn exact_expression_dependencies(
             return Err(SemanticCError::InvalidReturnMechanics(entity.producer()));
         }
     }
-    Ok((dependencies, output_producers, outputs))
+    Ok(ExactExpressionDependencies {
+        dependencies,
+        output_producers,
+        outputs,
+    })
 }
 
 fn add_return_mechanics_closure(
@@ -1871,7 +1896,8 @@ fn derive_return_mechanics_plan(
     certified: &impl CertifiedSemanticSource,
 ) -> Result<ReturnMechanicsPlan, SemanticCError> {
     let machine = certified.machine_view();
-    let (dependencies, _, _) = exact_expression_dependencies(certified, machine)?;
+    let ExactExpressionDependencies { dependencies, .. } =
+        exact_expression_dependencies(certified, machine)?;
     let interface = certified.machine_context().function_interface();
     let mut controls = Vec::new();
     for block in certified.topology().blocks() {
@@ -2231,8 +2257,11 @@ fn derive_mechanics(
     SemanticCError,
 > {
     let machine = certified.machine_view();
-    let (mut dependencies, output_producers, outputs) =
-        exact_expression_dependencies(certified, machine)?;
+    let ExactExpressionDependencies {
+        mut dependencies,
+        output_producers,
+        outputs,
+    } = exact_expression_dependencies(certified, machine)?;
     let Some(frame) = certified.frame_preservation() else {
         let all_candidates = return_plan
             .candidates
@@ -2564,7 +2593,17 @@ impl SemanticCExpressionLayer {
     }
 
     fn from_source(certified: &impl CertifiedSemanticSource) -> Result<Self, SemanticCError> {
-        Self::from_source_with_private_entry_stack_pointer(certified, None)
+        let entry_stack_pointer = certified
+            .stack_discipline()
+            .map(|stack| {
+                certified_entry_stack_pointer_input(
+                    certified,
+                    stack,
+                    certified.topology().entry_addr(),
+                )
+            })
+            .transpose()?;
+        Self::from_source_with_private_entry_stack_pointer(certified, entry_stack_pointer.as_ref())
     }
 
     fn from_source_with_private_entry_stack_pointer(
@@ -3014,12 +3053,86 @@ impl SemanticCExpressionLayer {
         })
     }
 
+    pub(crate) fn memory_read_root(
+        &self,
+        statement: &CertifiedMemoryStatement,
+    ) -> Result<Option<SemanticCExprId>, SemanticCError> {
+        let mut matches = self
+            .expressions
+            .iter()
+            .enumerate()
+            .filter_map(|(index, expression)| {
+                let SemanticCExprKind::MemoryRead {
+                    access,
+                    object,
+                    space,
+                    endianness,
+                    word_size_bytes,
+                    address: _,
+                    width_bits,
+                } = expression.kind()
+                else {
+                    return None;
+                };
+                let result = match statement.kind() {
+                    CertifiedMemoryStatementKind::Read { result } => result,
+                    CertifiedMemoryStatementKind::Write { .. } => return None,
+                };
+                (*access == statement.access()
+                    && *object == statement.object()
+                    && *space == statement.space()
+                    && *endianness == statement.endianness()
+                    && *word_size_bytes == statement.word_size_bytes()
+                    && *width_bits == statement.width_bits()
+                    && expression.ty() == result.ty())
+                .then_some(SemanticCExprId(u32::try_from(index).ok()?))
+            });
+        let root = matches.next();
+        if matches.next().is_some() {
+            return Err(SemanticCError::DuplicateMemoryRewrite(statement.access()));
+        }
+        Ok(root)
+    }
+
     pub(crate) fn render_expr(
         &self,
         id: SemanticCExprId,
         helpers: &mut SemanticCHelperSet,
     ) -> Result<String, SemanticCError> {
         let rendered = self.render_expr_inner(id, &mut SemanticCRenderMode::Ordinary, helpers)?;
+        Ok(rendered.source)
+    }
+
+    pub(crate) fn materialized_expression_roots(
+        &self,
+        bindings: &BTreeSet<MachineValueBinding>,
+    ) -> Result<BTreeMap<SemanticCExprId, MachineValueBinding>, SemanticCError> {
+        let mut roots = BTreeMap::new();
+        for entity in self
+            .entities()
+            .iter()
+            .filter(|entity| bindings.contains(&entity.output()))
+        {
+            if roots.insert(entity.root(), entity.output()).is_some() {
+                return Err(SemanticCError::AmbiguousMaterializedExpression(
+                    entity.root(),
+                ));
+            }
+        }
+        Ok(roots)
+    }
+
+    pub(crate) fn render_expr_with_materialized_roots(
+        &self,
+        id: SemanticCExprId,
+        materialized: &BTreeMap<SemanticCExprId, MachineValueBinding>,
+        helpers: &mut SemanticCHelperSet,
+    ) -> Result<String, SemanticCError> {
+        let rendered = self.render_expr_inner(
+            id,
+            &mut SemanticCRenderMode::Materialized(materialized),
+            helpers,
+        )?;
         Ok(rendered.source)
     }
 
@@ -3091,12 +3204,25 @@ impl SemanticCExpressionLayer {
             .ok_or(SemanticCError::MissingSemanticExpression(id))?;
         let width = expr.ty.width_bits();
         let ctype = storage_type(&expr.ty)?;
+        if let SemanticCRenderMode::Materialized(materialized) = mode
+            && let Some(binding) = materialized.get(&id)
+        {
+            if binding.width_bits() != expr.ty().width_bits() {
+                return Err(SemanticCError::InvalidCertifiedFunctionInterface);
+            }
+            return Ok(RenderedSemanticExpr {
+                source: value_name(*binding),
+                substitutions: 0,
+            });
+        }
         if let SemanticCExprKind::Input { binding } = &expr.kind {
             return match mode {
-                SemanticCRenderMode::Ordinary => Ok(RenderedSemanticExpr {
-                    source: value_name(*binding),
-                    substitutions: 0,
-                }),
+                SemanticCRenderMode::Ordinary | SemanticCRenderMode::Materialized(_) => {
+                    Ok(RenderedSemanticExpr {
+                        source: value_name(*binding),
+                        substitutions: 0,
+                    })
+                }
                 SemanticCRenderMode::Expanded(context) => {
                     if context.ambiguous_outputs.contains(binding) {
                         return Err(SemanticCError::AmbiguousExpandedInput(*binding));
@@ -3116,7 +3242,7 @@ impl SemanticCExpressionLayer {
         }
         if matches!(expr.kind(), SemanticCExprKind::MemoryRead { .. }) {
             return match mode {
-                SemanticCRenderMode::Ordinary => {
+                SemanticCRenderMode::Ordinary | SemanticCRenderMode::Materialized(_) => {
                     Err(SemanticCError::MemoryReadRequiresCertifiedStatement(id))
                 }
                 SemanticCRenderMode::Expanded(context) => {
@@ -3535,6 +3661,7 @@ struct RenderedSemanticExpr {
 
 enum SemanticCRenderMode<'a, 'rewrite> {
     Ordinary,
+    Materialized(&'a BTreeMap<SemanticCExprId, MachineValueBinding>),
     Expanded(&'a mut SemanticCExpandedRenderContext<'rewrite>),
 }
 

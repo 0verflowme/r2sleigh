@@ -1366,9 +1366,9 @@ mod tests {
     }
 
     #[test]
-    fn authority_bound_ids_follow_only_exact_artifact_clones() {
-        let original = artifact("r0");
-        let cloned = original.clone();
+    fn authority_bound_ids_follow_only_exact_artifact_shares() {
+        let original = std::sync::Arc::new(artifact("r0"));
+        let shared = std::sync::Arc::clone(&original);
         let rebuilt = artifact("r0");
         let assumed = original.with_assumptions(&AssumptionSet::default());
         let original_id = original
@@ -1376,7 +1376,7 @@ mod tests {
             .unique_entry_value(register_storage())
             .unwrap()
             .handle();
-        let cloned_id = cloned
+        let shared_id = shared
             .execution_view()
             .unique_entry_value(register_storage())
             .unwrap()
@@ -1392,8 +1392,8 @@ mod tests {
             .unwrap()
             .handle();
 
-        assert_eq!(original_id, cloned_id);
-        assert_eq!(hash_of(&original_id), hash_of(&cloned_id));
+        assert_eq!(original_id, shared_id);
+        assert_eq!(hash_of(&original_id), hash_of(&shared_id));
         assert_ne!(original_id, rebuilt_id);
         assert_ne!(original_id, assumed_id);
         assert_ne!(hash_of(&original_id), hash_of(&rebuilt_id));
@@ -1401,7 +1401,7 @@ mod tests {
         assert!(
             original
                 .execution_view()
-                .resolve_value(&cloned_id)
+                .resolve_value(&shared_id)
                 .is_some()
         );
         assert!(
@@ -1413,7 +1413,7 @@ mod tests {
 
         let mut ids = HashSet::new();
         ids.insert(original_id);
-        ids.insert(cloned_id);
+        ids.insert(shared_id);
         ids.insert(rebuilt_id);
         ids.insert(assumed_id);
         assert_eq!(ids.len(), 3);

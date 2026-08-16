@@ -7,10 +7,11 @@ use std::collections::{HashMap, HashSet};
 
 use r2ssa::{ObjectKind, SSAFunction, SSAOp, SSAVar, SsaArtifact};
 use r2types::{
-    CTypeLike, ExternalStackBase, ExternalStackSlotRole, FunctionFacts, FunctionTypeFacts,
-    StackSlotKey, VisibleBinding, VisibleBindingKind,
+    CTypeLike, ExternalStackBase, ExternalStackSlotRole, FunctionTypeFacts, StackSlotKey,
+    VisibleBinding, VisibleBindingKind,
 };
 
+use crate::DecompilerInput;
 use crate::analysis::utils;
 use crate::ast::{BinaryOp, CExpr, CType};
 
@@ -169,11 +170,6 @@ impl VariableRecovery {
         }
     }
 
-    /// Set canonical function facts for type/layout-guided variable recovery.
-    pub fn set_function_facts(&mut self, function_facts: &FunctionFacts) {
-        self.type_facts = function_facts.type_facts().clone().canonicalized();
-    }
-
     /// Set externally recovered type/layout facts.
     #[cfg(test)]
     pub fn set_type_facts(&mut self, type_facts: FunctionTypeFacts) {
@@ -301,8 +297,10 @@ impl VariableRecovery {
         self.recover_non_stack_variables(func);
     }
 
-    /// Recover variables from the canonical prepared SSA artifact.
-    pub fn recover_prepared(&mut self, prepared: &SsaArtifact) {
+    /// Recover variables from one source-owned decompiler input.
+    pub(crate) fn recover_input(&mut self, input: &DecompilerInput) {
+        self.type_facts = input.function_facts().type_facts().clone();
+        let prepared = input.prepared_ssa();
         let func = prepared.function();
         self.find_stack_variables(func, Some(prepared));
         self.recover_non_stack_variables(func);

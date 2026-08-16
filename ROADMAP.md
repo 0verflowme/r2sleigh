@@ -30,14 +30,15 @@ Current State (May 2026)
 ------------------------
 
 The foundation reset is mostly complete. The project is now typed-request-first:
-`r2plugin` is mostly orchestration glue, and semantic ownership sits in the Rust
-crates that own the facts.
+`r2plugin` is command/FFI glue, while source-owned runtime facts and semantic
+authority stay with the Rust crates that own them.
 
 Current ownership shape:
 
 - `r2ssa`: SSA, def-use, prepared facts, deterministic dataflow inputs.
 - `r2sym`: semantic artifacts, evidence, summaries, replay/query behavior.
-- `r2types`: canonical `FunctionFacts`, type projection, writeback facts.
+- `r2types`: advisory `FunctionFacts`, source-owned runtime facts, type
+  projection, and writeback facts.
 - `r2engine`: request orchestration, route planning, execution metrics, cost model.
 - `r2dec`: lowering, structuring, and rendering from canonical facts.
 - `r2plugin`: radare2 command dispatch, typed context collection, FFI, apply/render glue.
@@ -73,8 +74,8 @@ Recent high-value progress:
 - expanded r2r/plugin validation around typed requests and decompiler behavior
 - added the initial `r2engine` crate so plugin decompile routing can move out of
   command glue and into an explicit request/planner boundary
-- added the first certifying decompiler proof spine:
-  `CheckedClaim`, proof failures, proof coverage, and render permissions
+- added the first certifying decompiler proof spine, since replaced by exact
+  source owners, closed typed ledgers, typed routes, and opaque output seals
 - added prepared SSA certificate surfaces for control, expression, memory,
   stack-slot, callsite, and return-value facts
 - bridged return-register writes into `ReturnValueCertificate` evidence for
@@ -93,6 +94,9 @@ Recent high-value progress:
   `r10_1` artifacts
 - updated plugin/r2r coverage for certified C, proof residuals, and raw artifact
   rejection; `tests/r2r` is green on 95 plugin tests
+- made exact prepared ownership allocation-bound: downstream runtime owners
+  retain `Arc<r2ssa::SsaArtifact>`, and only cloning that `Arc` preserves the
+  exact allocation and its run-local authority
 
 Archived pre-removal benchmark signal (not current authority):
 
@@ -161,7 +165,8 @@ Latest certifying proof-loop status:
 Completed:
 
 - proof contract documentation and initial proof-kernel types
-- `ProofCoverage` and render-permission reporting through the typed route
+- retired detached proof counters and render-permission compatibility fields;
+  typed route facts plus opaque typed-output seals now carry runtime policy
 - prepared SSA certificates for loops, switches, if regions, expressions,
   memory accesses, stack slots, callsites, and return values
 - return-value proof bridge from return-exit predecessor register writes
@@ -426,8 +431,8 @@ Architecture Rewrite Direction
 
 The next large step is a spine rewrite, not a blank-slate rewrite of every
 crate. The current ownership map is right, but route selection, summary
-classification, callsite/type provenance, and plugin orchestration still have
-too much heuristic glue.
+classification, and callsite/type provenance still have too much heuristic
+glue.
 
 The intended fact flow is:
 
@@ -511,7 +516,6 @@ expanded:
 - decompiler-side stack placeholder cleanup
 - remaining switch rendering that lacks exact render-node/certificate identity
 - fixed semantic worker island caps instead of evidence-ranked scheduling
-- plugin-side detached summary/decompile orchestration
 - large decompiler thread stack as a workaround for recursive structuring
 - benchmark averages that can mask incomplete status, timeouts, executable
   semantic-oracle failures, or fake-output classes
@@ -550,7 +554,7 @@ Strategic Principles
    - budgets, residual reasons, confidence, and evidence must stay explicit
 
 7. Proof beats appearance.
-   - high-level C is allowed only after a checker grants render permission
+   - high-level C is allowed only after the checker seals exact typed output
    - failed proof obligations become residuals or refusals, not prettier guesses
    - summary reuse and caps can make analysis cheaper, but cannot justify semantics
 
@@ -565,9 +569,9 @@ makes every rendered construct traceable to its canonical owner.
 
 Deliverables:
 
-- design document for checked claims, proof obligations, proof failures, and
-  render permissions
-- typed claim wrapper, for example `CheckedClaim<T>`
+- design document for source-owned obligations, closed ledgers, typed routes,
+  and opaque output seals
+- opaque typed-output seal retaining exact source identity
 - canonical proof failure reasons that can be surfaced in engine reports,
   decompiler residuals, and benchmarks
 - recurring negative tests for fake loops, fake switches, fake stack slots,
@@ -961,29 +965,22 @@ Completed proof-closure work:
     r2sleigh-plugin`, clippy for both crates, and `make -C tests/r2r run`
     are green on 94 plugin tests.
 59. Removed out-param proof double-ownership from `r2sym`: semantic claims can
-    still seed type analysis, but `ProofCoverage::from_semantic_claims()` no
-    longer increments `certified_out_params`. Certified out-parameter proof now
+    still seed type analysis, while certified out-parameter proof now
     comes only from `r2types::FunctionTypeFacts` source-authorized certificates.
     A focused r2sym regression, package tests for `r2sym`, `r2types`,
     `r2engine`, `r2dec`, and `r2sleigh-plugin`, and clippy for those crates are
     green.
 60. Removed field/layout proof double-ownership from `r2sym`: semantic
-    `StructField` type-seed claims no longer increment
-    `ProofCoverage::certified_field_accesses`. Certified field/layout proof now
+    `StructField` type-seed claims do not authorize rendering. Certified field/layout proof now
     comes from `r2types::FunctionTypeFacts` field certificates and prepared
     render proof, not raw semantic claim rollups. A focused r2sym regression,
     package tests for `r2sym`, `r2types`, `r2engine`, `r2dec`, and
     `r2sleigh-plugin`, clippy for those crates, and `make -C tests/r2r run`
     are green on 94 plugin tests.
-61. Split semantic report counters from certified proof counters in
-    `r2sym::ProofCoverage`: summary-route comments and residual counts are now
-    explicitly named `semantic_summary_comments` and `semantic_residuals`, with
-    legacy serde aliases only for reading old payloads. The proof coverage
-    schema advanced to version 3 so engine render-cache keys and diagnostics
-    cannot silently mix the two meanings. A focused r2sym regression proves
-    semantic report counters do not inflate certified render/writeback counts;
-    package tests for `r2sym`, `r2types`, `r2engine`, `r2dec`, and
-    `r2sleigh-plugin`, formatting, and clippy for those crates are green.
+61. Historical: semantic report counters were separated from certified proof
+    counters. Both detached counter and permission surfaces are now deleted;
+    semantic reports remain advisory and exact owners plus typed seals govern
+    rendering and writeback.
 62. Made summary-projection output explicitly non-native-CFG: summary-rendered
     loops now say `summary projection (not native CFG)`, route comments include
     a render contract that native CFG/control was not reconstructed, and
@@ -1507,7 +1504,9 @@ Remaining:
 
 Done:
 
-- `r2types::FunctionFacts` is the canonical combined type+semantic contract
+- `r2types::FunctionFacts` is the advisory combined type+semantic report
+- `r2types::SourceOwnedFunctionFacts` is the canonical runtime owner retaining
+  the exact `Arc<r2ssa::SsaArtifact>` used to derive that report
 - `r2types::FunctionTypeFacts` is the canonical type/layout/signature payload
 - semantic role hints strengthen signatures and aggregate identity
 - generated local aggregates no longer override authoritative semantic roles
@@ -1661,7 +1660,7 @@ Success criteria:
   or rendered as explicit residuals
 - focused Coreutils remains green while setup/command time improves
 
-### P0a - Proof Kernel And Render Permissions
+### P0a - Proof Kernel And Typed Output Seals
 
 Goal:
 
@@ -1670,9 +1669,9 @@ certified C, summary comments, residuals, and refusals.
 
 Deliverables:
 
-- done: `CheckedClaim<T>` or equivalent typed claim carrier
-- done: proof failures with canonical owner buckets
-- done: render permission type shared by `r2engine` and `r2dec`
+- done: exact source owners and typed certificate carriers
+- done: closed-ledger failures with canonical owner buckets
+- done: typed route facts and opaque typed-output seals across the runtime seam
 - done: first output gates for proof residuals and raw SSA/register artifacts
 - remaining: benchmark counters for all proof failures and fake-output classes
 - remaining: recurring negative gates for fake loops, fake switches, fake stack

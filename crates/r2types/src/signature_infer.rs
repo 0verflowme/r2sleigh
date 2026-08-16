@@ -1,13 +1,14 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 
-use r2ssa::{ObjectKind, SSABlock, SSAFunction, SSAOp, SSAVar, SsaArtifact};
+use r2ssa::{ObjectKind, SSAFunction, SSAOp, SSAVar, SsaArtifact};
 
 use crate::convert::CTypeLike;
 use crate::facts::{FunctionSignatureSpec, FunctionType, FunctionTypeFacts, signature_strength};
 use crate::inference::TypeInference;
 use crate::model::Signedness;
 use crate::prepare::{
-    SignatureTypeEvidenceContext, scalar_register_family_key, ssa_var_is_register_like,
+    SignatureTypeEvidenceContext, prepared_arch_name, recover_signature_params_from_prepared_ssa,
+    scalar_register_family_key, ssa_var_is_register_like,
 };
 use crate::signature::SignatureRegistry;
 use crate::signedness::{ScalarSignednessEvidence, infer_scalar_signedness};
@@ -64,18 +65,20 @@ pub struct RecoveredSignatureParam {
     pub initial_ty: CTypeLike,
 }
 
-pub fn infer_signature_from_prepared_ssa(
-    function_name: &str,
-    arch_name: &str,
-    ptr_bits: u32,
-    prepared: &SsaArtifact,
-    pattern_ssa_blocks: &[SSABlock],
-    recovered_params: &[RecoveredSignatureParam],
-) -> InferredSignature {
-    let evidence_ctx = crate::prepare::collect_signature_type_evidence_context_with_arch(
-        pattern_ssa_blocks,
-        Some(arch_name),
-    );
+pub fn infer_signature_from_prepared_ssa(prepared: &SsaArtifact) -> InferredSignature {
+    let function_name = prepared
+        .function()
+        .name
+        .clone()
+        .unwrap_or_else(|| format!("fcn.{:x}", prepared.function().entry));
+    let ptr_bits = prepared
+        .machine_context()
+        .memory_model()
+        .default_address_bits();
+    let ssa_blocks = prepared.local_ssa_blocks();
+    let recovered_params = recover_signature_params_from_prepared_ssa(prepared, ptr_bits);
+    let arch_name = prepared_arch_name(prepared).unwrap_or("");
+    let evidence_ctx = crate::prepare::collect_signature_type_evidence_context(&ssa_blocks);
     let mut type_inference = TypeInference::new(ptr_bits);
     type_inference.set_prepared_ssa(prepared);
     type_inference.infer_function(prepared);
@@ -123,7 +126,12 @@ pub fn infer_signature_from_prepared_ssa(
             &param.evidence,
         );
     }
-    refine_parameter_signedness(arch_name, prepared, recovered_params, &mut canonical_params);
+    refine_parameter_signedness(
+        arch_name,
+        prepared,
+        &recovered_params,
+        &mut canonical_params,
+    );
 
     let (ret_type, ret_evidence) = infer_signature_return_type_from_prepared(
         prepared,
@@ -133,7 +141,7 @@ pub fn infer_signature_from_prepared_ssa(
     );
     let input_counts = collect_version0_input_regs(prepared);
     build_inferred_signature(
-        function_name,
+        &function_name,
         arch_name,
         ptr_bits,
         &canonical_params,
@@ -252,7 +260,7 @@ fn refine_parameter_signedness(
                     .iter()
                     .map(|(source, reload)| (source, reload)),
             ),
-        Some(arch_name),
+        (!arch_name.is_empty()).then_some(arch_name),
     );
     let mut pointee_evidence = HashMap::<(usize, u32), BTreeSet<ScalarSignednessEvidence>>::new();
     for access in prepared.certificates().memory_accesses.values() {
@@ -1626,25 +1634,9 @@ mod tests {
                 1,
             ),
         );
-        let pattern_blocks = prepared.local_ssa_blocks();
-        let recovered = [RecoveredSignatureParam {
-            name: "code".to_string(),
-            arg_index: 0,
-            ssa_var: SSAVar::new("x0", 0, 8),
-            initial_ty: CTypeLike::Int {
-                bits: 64,
-                signedness: Signedness::Signed,
-            },
-        }];
-        let inferred = infer_signature_from_prepared_ssa(
-            "decode",
-            "aarch64",
-            64,
-            &prepared,
-            &pattern_blocks,
-            &recovered,
-        );
+        let inferred = infer_signature_from_prepared_ssa(&prepared);
 
+        assert_eq!(inferred.arch, "aarch64");
         assert_eq!(inferred.params[0].param_type, "uint8_t*");
     }
 
@@ -1696,30 +1688,7 @@ mod tests {
                 parameter,
             ),
         );
-        let pattern_blocks = prepared.local_ssa_blocks();
-        let recovered = [RecoveredSignatureParam {
-            name: "length".to_string(),
-            arg_index: 0,
-            ssa_var: SSAVar::new("x0", 0, 8),
-            initial_ty: CTypeLike::Int {
-                bits: 64,
-                signedness: Signedness::Unknown,
-            },
-        }];
-        let parameter_home_aliases = certified_parameter_home_aliases(&prepared, &recovered);
-
-        assert!(parameter_home_aliases.iter().any(|(source, reload)| {
-            source == &recovered[0].ssa_var && reload.size == recovered[0].ssa_var.size
-        }));
-
-        let inferred = infer_signature_from_prepared_ssa(
-            "bounded",
-            "aarch64",
-            64,
-            &prepared,
-            &pattern_blocks,
-            &recovered,
-        );
+        let inferred = infer_signature_from_prepared_ssa(&prepared);
 
         assert_eq!(inferred.params[0].param_type, "uint64_t");
     }
@@ -1793,16 +1762,7 @@ mod tests {
             target: r2il::Varnode::register(8, 8),
         });
         let prepared = SsaArtifact::for_patterns(&[block], Some(&arch)).expect("prepared SSA");
-        let pattern_blocks = prepared.local_ssa_blocks();
-
-        let inferred = infer_signature_from_prepared_ssa(
-            "narrow_return",
-            "x86-64",
-            64,
-            &prepared,
-            &pattern_blocks,
-            &[],
-        );
+        let inferred = infer_signature_from_prepared_ssa(&prepared);
 
         assert_eq!(inferred.ret_type, "uint32_t");
     }
@@ -1815,16 +1775,7 @@ mod tests {
             target: r2il::Varnode::register(8, 8),
         });
         let prepared = SsaArtifact::for_patterns(&[block], Some(&arch)).expect("prepared SSA");
-        let pattern_blocks = prepared.local_ssa_blocks();
-
-        let inferred = infer_signature_from_prepared_ssa(
-            "void_return",
-            "x86-64",
-            64,
-            &prepared,
-            &pattern_blocks,
-            &[],
-        );
+        let inferred = infer_signature_from_prepared_ssa(&prepared);
 
         assert_eq!(inferred.ret_type, "void");
     }

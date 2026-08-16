@@ -2398,38 +2398,32 @@ fn collect_source_boundary_facts(
                     }
                     _ => {}
                 }
-                match stack_pointer_storage {
-                    Some(storage) => {
-                        exit_stack_pointer = graph
-                            .op_site_for_inst(inst.id)
-                            .and_then(|(block_addr, op_index)| {
-                                reaching_preserved_abi_value_in_block(
-                                    function,
-                                    graph,
-                                    machine_context,
-                                    block_addr,
-                                    op_index,
-                                    storage,
-                                )
-                            })
-                            .map(|state| match state {
-                                ReachingAbiState::PreservedEntry => {
-                                    SourceReturnStackPointerFact::PreservedEntry { storage }
-                                }
-                                ReachingAbiState::Value(value) => {
-                                    SourceReturnStackPointerFact::ReachingValue { storage, value }
-                                }
-                            });
-                        complete &= exit_stack_pointer.is_some();
-                    }
-                    None => {}
+                if let Some(storage) = stack_pointer_storage {
+                    exit_stack_pointer = graph
+                        .op_site_for_inst(inst.id)
+                        .and_then(|(block_addr, op_index)| {
+                            reaching_preserved_abi_value_in_block(
+                                function,
+                                graph,
+                                machine_context,
+                                block_addr,
+                                op_index,
+                                storage,
+                            )
+                        })
+                        .map(|state| match state {
+                            ReachingAbiState::PreservedEntry => {
+                                SourceReturnStackPointerFact::PreservedEntry { storage }
+                            }
+                            ReachingAbiState::Value(value) => {
+                                SourceReturnStackPointerFact::ReachingValue { storage, value }
+                            }
+                        });
+                    complete &= exit_stack_pointer.is_some();
                 }
-                match return_address_storage {
-                    Some(storage) => {
-                        return_address = exact_return_address_fact(graph, inst, storage);
-                        complete &= return_address.is_some();
-                    }
-                    None => {}
+                if let Some(storage) = return_address_storage {
+                    return_address = exact_return_address_fact(graph, inst, storage);
+                    complete &= return_address.is_some();
                 }
             }
             facts.returns.insert(
@@ -2503,7 +2497,7 @@ fn projected_formal_parameter_storage(
         || carrier.offset_bits() != 0
         || carrier.size_bits() == 0
         || carrier.size_bits() != source_type.size_bits()
-        || carrier.size_bits() % 8 != 0
+        || !carrier.size_bits().is_multiple_of(8)
     {
         return None;
     }
@@ -4661,21 +4655,28 @@ fn process_call_result_flow_block(
                 let value = graph.value_id_for_var(val);
                 let stack_access = value
                     .and_then(|value| {
-                        stack_memory_access_at(
+                        stack_memory_access_at(StackMemoryAccessInput {
                             function,
                             graph,
                             structured,
                             objects,
-                            block.addr,
+                            block_addr: block.addr,
                             op_index,
-                            true,
-                            Some(value),
-                        )
+                            is_write: true,
+                            value: Some(value),
+                        })
                     })
                     .or_else(|| {
-                        stack_memory_access_at(
-                            function, graph, structured, objects, block.addr, op_index, true, None,
-                        )
+                        stack_memory_access_at(StackMemoryAccessInput {
+                            function,
+                            graph,
+                            structured,
+                            objects,
+                            block_addr: block.addr,
+                            op_index,
+                            is_write: true,
+                            value: None,
+                        })
                     });
                 let Some((object, offset, _access)) = stack_access else {
                     continue;
@@ -4710,16 +4711,18 @@ fn process_call_result_flow_block(
                 let Some(dst_value) = graph.value_id_for_var(dst) else {
                     continue;
                 };
-                let Some((object, offset, access)) = stack_memory_access_at(
-                    function,
-                    graph,
-                    structured,
-                    objects,
-                    block.addr,
-                    op_index,
-                    false,
-                    Some(dst_value),
-                ) else {
+                let Some((object, offset, access)) =
+                    stack_memory_access_at(StackMemoryAccessInput {
+                        function,
+                        graph,
+                        structured,
+                        objects,
+                        block_addr: block.addr,
+                        op_index,
+                        is_write: false,
+                        value: Some(dst_value),
+                    })
+                else {
                     continue;
                 };
                 let Some(source) = state.stack_owners.get(&(object, offset)) else {
@@ -4780,28 +4783,38 @@ fn insert_call_result_certificate(
     call_results.insert(cert.value, cert);
 }
 
-fn stack_memory_access_at(
-    function: &SSAFunction,
-    graph: &SsaGraph,
-    structured: &StructuredDataflowFacts,
-    objects: &ObjectModel,
+struct StackMemoryAccessInput<'a> {
+    function: &'a SSAFunction,
+    graph: &'a SsaGraph,
+    structured: &'a StructuredDataflowFacts,
+    objects: &'a ObjectModel,
     block_addr: u64,
     op_index: usize,
     is_write: bool,
     value: Option<ValueId>,
+}
+
+fn stack_memory_access_at(
+    input: StackMemoryAccessInput<'_>,
 ) -> Option<(ObjectId, i64, StructuredAccessId)> {
-    structured
+    input
+        .structured
         .memory_accesses
         .iter()
         .filter(|(_, access)| {
-            access.block_addr == block_addr
-                && access.op_index == op_index
-                && access.is_write == is_write
-                && value.is_none_or(|value| access.value == Some(value))
-                && ram_memory_access_matches_source(function, graph, objects, access)
+            access.block_addr == input.block_addr
+                && access.op_index == input.op_index
+                && access.is_write == input.is_write
+                && input.value.is_none_or(|value| access.value == Some(value))
+                && ram_memory_access_matches_source(
+                    input.function,
+                    input.graph,
+                    input.objects,
+                    access,
+                )
         })
         .filter_map(|(access_id, access)| {
-            stack_object_offset(objects, access.object)
+            stack_object_offset(input.objects, access.object)
                 .map(|offset| (access.object, offset, *access_id))
         })
         .next()
@@ -7145,16 +7158,16 @@ mod tests {
             &access,
         ));
         assert_eq!(
-            super::stack_memory_access_at(
-                artifact.function(),
-                artifact.graph(),
-                &structured,
-                &objects,
-                access.block_addr,
-                access.op_index,
-                false,
-                access.value,
-            ),
+            super::stack_memory_access_at(super::StackMemoryAccessInput {
+                function: artifact.function(),
+                graph: artifact.graph(),
+                structured: &structured,
+                objects: &objects,
+                block_addr: access.block_addr,
+                op_index: access.op_index,
+                is_write: false,
+                value: access.value,
+            }),
             Some((access.object, -8, access.id))
         );
         let facts = artifact.facts();

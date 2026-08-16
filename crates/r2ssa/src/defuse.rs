@@ -225,10 +225,10 @@ pub fn dead_ops(block: &SSABlock) -> Vec<usize> {
         }
 
         // Check if this operation's output is used
-        if let Some(dst) = op.dst() {
-            if !info.exact_uses.contains_key(dst) {
-                dead.push(idx);
-            }
+        if let Some(dst) = op.dst()
+            && !info.exact_uses.contains_key(dst)
+        {
+            dead.push(idx);
         }
     }
 
@@ -240,10 +240,10 @@ pub fn find_constants(block: &SSABlock) -> HashMap<SSAVar, u64> {
     let mut constants = HashMap::new();
 
     for op in &block.ops {
-        if let SSAOp::Copy { dst, src } = op {
-            if let Some(value) = src.constant_bits() {
-                constants.insert(dst.clone(), value);
-            }
+        if let SSAOp::Copy { dst, src } = op
+            && let Some(value) = src.constant_bits()
+        {
+            constants.insert(dst.clone(), value);
         }
     }
 

@@ -48,6 +48,7 @@ impl SemanticTypeHintCache {
     }
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LocalStructFieldAccessProfile {
     pub(crate) arg_index: usize,
@@ -77,6 +78,7 @@ pub(crate) fn analyze_with_control(
     )
 }
 
+#[cfg(test)]
 pub(crate) fn analyze_for_local_struct_accesses(blocks: &[SSABlock], env: &PassEnv<'_>) -> UseInfo {
     let execution = SsaExecutionControl::default();
     let control = DecompileWorkControl::new(&execution, DecompileWorkPhase::Structuring);
@@ -2075,6 +2077,7 @@ fn switch_selector_candidate_score(info: &UseInfo, value: &SemanticValue) -> i32
     score
 }
 
+#[cfg(test)]
 pub(crate) fn collect_local_struct_field_access_profiles(
     info: &UseInfo,
     func: &SSAFunction,
@@ -2134,6 +2137,7 @@ pub(crate) fn collect_local_struct_field_access_profiles(
     out
 }
 
+#[cfg(test)]
 fn struct_field_access_profile_for_addr(
     info: &UseInfo,
     addr: &SSAVar,
@@ -2163,6 +2167,7 @@ fn struct_field_access_profile_for_addr(
     })
 }
 
+#[cfg(test)]
 fn arg_slot_for_value_ref(
     info: &UseInfo,
     value_ref: &ValueRef,

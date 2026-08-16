@@ -1,4 +1,4 @@
-warning: r2engine must carry decompile route/callee evidence through FunctionFacts, not request or context side channels
+warning: r2engine must carry decompile route/callee evidence through consuming source-owned finalization
   --> $DIR/decompiler_context_side_channel.rs:3:1
    |
 LL | / struct EngineDecompileRequest {
@@ -8,7 +8,7 @@ LL | | }
    |
    = note: `#[warn(r2engine_decompiler_context_route_side_channel)]` on by default
 
-warning: r2engine must carry decompile route/callee evidence through FunctionFacts, not request or context side channels
+warning: r2engine must carry decompile route/callee evidence through consuming source-owned finalization
   --> $DIR/decompiler_context_side_channel.rs:7:1
    |
 LL | / struct DecompileRenderCacheKeyInput {

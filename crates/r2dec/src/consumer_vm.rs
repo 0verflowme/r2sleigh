@@ -238,7 +238,7 @@ fn render_vm_case_labels(out: &mut String, vm_step: &r2sym::VmStepSummary, targe
 pub(crate) fn render_vm_semantic_summary(
     func_name: &str,
     function_facts: &FunctionFacts,
-    semantic_artifact: &r2sym::SemanticArtifact,
+    semantic_artifact: &r2sym::SemanticArtifactReport,
 ) -> Option<String> {
     let vm_body = semantic_artifact.vm_body()?;
     let vm_step = vm_body
@@ -293,68 +293,120 @@ pub(crate) fn render_vm_semantic_summary(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
+    use std::sync::Arc;
 
     use super::*;
-    use r2types::{
-        CTypeLike, CertifiedEntity, FunctionParamSpec, FunctionRenderFacts, FunctionSignatureSpec,
-        FunctionTypeFacts, SignatureCertificate, SignatureCertificateSource, Signedness,
-    };
+    use r2il::{ArchSpec, R2ILBlock, R2ILOp, RegisterDef, Varnode};
 
-    fn signed_int(bits: u32) -> CTypeLike {
-        CTypeLike::Int {
-            bits,
-            signedness: Signedness::Signed,
+    fn source_owned_vm_facts() -> r2types::SourceOwnedFunctionFacts {
+        let mut arch = ArchSpec::new("x86-64");
+        for (name, offset, size) in [
+            ("RAX", 0x00, 8),
+            ("EAX", 0x00, 4),
+            ("RDI", 0x10, 8),
+            ("RSI", 0x18, 8),
+            ("ESI", 0x18, 4),
+            ("RDX", 0x20, 8),
+            ("RSP", 0x28, 8),
+            ("RIP", 0x30, 8),
+        ] {
+            arch.add_register(RegisterDef::new(name, offset, size));
         }
+        let mut block = R2ILBlock::new(0x401000, 4);
+        block.push(R2ILOp::Load {
+            dst: Varnode::unique(0x100, 1),
+            space: r2il::SpaceId::Ram,
+            addr: Varnode::register(0x10, 8),
+        });
+        block.push(R2ILOp::IntSExt {
+            dst: Varnode::unique(0x108, 8),
+            src: Varnode::unique(0x100, 1),
+        });
+        block.push(R2ILOp::Copy {
+            dst: Varnode::unique(0x110, 4),
+            src: Varnode::register(0x18, 4),
+        });
+        block.push(R2ILOp::Copy {
+            dst: Varnode::register(0x00, 4),
+            src: Varnode::constant(0, 4),
+        });
+        block.push(R2ILOp::Return {
+            target: Varnode::register(0x00, 4),
+        });
+
+        let storage = |offset| r2ssa::CanonicalStorageId {
+            space: r2ssa::CanonicalStorageSpace::Register,
+            offset,
+            size: 8,
+        };
+        let full64 = r2ssa::SourceCarrierProjection::new(r2ssa::SourceCarrierKind::Full, 0, 64);
+        let low32 = r2ssa::SourceCarrierProjection::new(r2ssa::SourceCarrierKind::LowBits, 0, 32);
+        let type_graph = r2ssa::SourceTypeGraph::new(
+            [
+                r2ssa::SourceType::new(0, r2ssa::SourceTypeKind::SignedInteger, 8, 8),
+                r2ssa::SourceType::new(
+                    1,
+                    r2ssa::SourceTypeKind::Pointer { target_type_id: 0 },
+                    64,
+                    64,
+                ),
+                r2ssa::SourceType::new(2, r2ssa::SourceTypeKind::SignedInteger, 32, 32),
+                r2ssa::SourceType::new(3, r2ssa::SourceTypeKind::SignedInteger, 64, 64),
+            ],
+            [],
+        )
+        .expect("exact VM signature types");
+        let interface = r2ssa::SourceFunctionInterface::new_exact_with_logical_types(
+            b"vm-signature-certified-parameters".to_vec(),
+            "sysv64",
+            [
+                r2ssa::SourceAbiParameterSpec::new(0, storage(0x10)),
+                r2ssa::SourceAbiParameterSpec::new(1, storage(0x18)),
+                r2ssa::SourceAbiParameterSpec::new(2, storage(0x20)),
+            ],
+            r2ssa::SourceFunctionReturn::Register {
+                storage: storage(0),
+            },
+            [],
+            [
+                r2ssa::SourceLogicalValue::new(1, full64),
+                r2ssa::SourceLogicalValue::new(2, low32),
+                r2ssa::SourceLogicalValue::new(3, full64),
+            ],
+            Some(r2ssa::SourceLogicalValue::new(2, low32)),
+            Some(type_graph),
+        )
+        .and_then(|interface| interface.with_return_address_storage(storage(0x30)))
+        .and_then(|interface| interface.with_stack_pointer_storage(storage(0x28)))
+        .expect("exact VM source interface");
+        let source = Arc::new(
+            r2ssa::SsaArtifact::for_decompile_with_interface(&[block], Some(&arch), interface)
+                .expect("prepared VM source owner")
+                .with_name("tiny_vm_dispatch"),
+        );
+        let request = r2types::TypeWritebackAnalysisRequest::new(
+            Arc::clone(&source),
+            r2types::ParsedExternalContext::default(),
+        )
+        .expect("matching VM source assumptions");
+        let owner = r2types::build_source_owned_type_writeback_analysis(request)
+            .expect("source-owned VM type analysis")
+            .finalize_for_decompile(r2types::DecompileFinalization {
+                kind: r2types::DecompileRouteKind::Standard,
+                reason: "test VM signature".to_string(),
+                fallback_comment: None,
+            })
+            .expect("source-owned VM decompile facts");
+        assert!(owner.shares_source(&source));
+        owner
     }
 
     #[test]
     fn vm_signature_keeps_only_certified_generic_parameters() {
-        let signature = FunctionSignatureSpec {
-            ret_type: Some(signed_int(32)),
-            params: vec![
-                FunctionParamSpec {
-                    name: "arg0".to_string(),
-                    ty: Some(CTypeLike::Pointer(Box::new(signed_int(8)))),
-                },
-                FunctionParamSpec {
-                    name: "arg1".to_string(),
-                    ty: Some(signed_int(32)),
-                },
-                FunctionParamSpec {
-                    name: "arg2".to_string(),
-                    ty: Some(signed_int(64)),
-                },
-            ],
-        };
-        let mut render = FunctionRenderFacts::default();
-        for slot in 0..2 {
-            let id = r2ssa::SemanticId::parameter(slot).expect("parameter id");
-            render.certified_entities.insert(
-                id,
-                CertifiedEntity::Parameter {
-                    id,
-                    slot: slot as u32,
-                    entry_values: BTreeSet::new(),
-                    carrier_width: 64,
-                },
-            );
-        }
-        let facts = FunctionFacts::new(
-            FunctionTypeFacts {
-                signature_certificate: SignatureCertificate::from_signature(
-                    &signature,
-                    [SignatureCertificateSource::LocalInference],
-                ),
-                merged_signature: Some(signature),
-                ..FunctionTypeFacts::default()
-            },
-            None,
-        )
-        .with_render(render);
+        let source_owned = source_owned_vm_facts();
 
         assert_eq!(
-            vm_summary_signature_comment("tiny_vm_dispatch", &facts).as_deref(),
+            vm_summary_signature_comment("tiny_vm_dispatch", source_owned.report()).as_deref(),
             Some("int32_t tiny_vm_dispatch(int8_t* arg0, int32_t arg1)")
         );
     }

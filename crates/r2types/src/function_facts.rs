@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
@@ -421,7 +422,7 @@ impl FunctionRenderFacts {
     ///
     /// This is the only owner for translating prepared certificates into
     /// certified expressions, entities, effects, and op-site indexes.
-    pub fn from_prepared(prepared: &r2ssa::SsaArtifact) -> Self {
+    fn from_prepared(prepared: &r2ssa::SsaArtifact) -> Self {
         prepared_render_facts(prepared)
     }
 
@@ -1315,7 +1316,7 @@ pub struct StackCallArgumentLocationFact {
 }
 
 impl AnalysisPlans {
-    pub fn from_semantics(semantics: Option<&r2sym::SemanticArtifact>) -> Self {
+    pub fn from_semantics(semantics: Option<&r2sym::SemanticArtifactReport>) -> Self {
         let Some(semantics) = semantics else {
             return Self::default();
         };
@@ -1328,14 +1329,14 @@ impl AnalysisPlans {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct InterprocSummaryView {
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub set: Option<r2ssa::InterprocSummarySet>,
+    set: Option<r2ssa::InterprocSummarySet>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub rollup: Option<SummaryEffectRollup>,
+    rollup: Option<SummaryEffectRollup>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub helpers: Vec<SummaryHelperView>,
+    helpers: Vec<SummaryHelperView>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1438,8 +1439,6 @@ pub struct DecompileRouteFacts {
     pub fallback_comment: Option<String>,
     pub skip_runtime_type_inference: bool,
     pub use_prepared_semantic_view: bool,
-    pub proof_coverage: r2sym::ProofCoverage,
-    pub render_permission: r2sym::RenderPermission,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1470,14 +1469,19 @@ impl FunctionInputQualityFacts {
 }
 
 impl InterprocSummaryView {
-    pub fn new(set: Option<r2ssa::InterprocSummarySet>) -> Self {
+    pub fn new(
+        set: Option<r2ssa::InterprocSummarySet>,
+    ) -> Result<Self, r2ssa::interproc::InterprocSummarySchemaError> {
+        if let Some(set) = set.as_ref() {
+            set.validate_current_schema()?;
+        }
         let rollup = summary_rollup(set.as_ref());
         let helpers = helper_views(set.as_ref());
-        Self {
+        Ok(Self {
             set,
             rollup,
             helpers,
-        }
+        })
     }
 
     pub fn as_set(&self) -> Option<&r2ssa::InterprocSummarySet> {
@@ -1531,11 +1535,17 @@ impl InterprocSummaryView {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// Advisory function-analysis report.
+///
+/// This detached view is useful for diagnostics and rendering at report
+/// boundaries. It may retain opaque semantic or interprocedural evidence
+/// owners, but it does not itself require one exact prepared SSA source and
+/// cannot be promoted into source-dependent certification.
+#[derive(Debug, Clone, Default)]
 pub struct FunctionFacts {
     types: FunctionTypeFacts,
     semantics: Option<r2sym::SemanticArtifact>,
-    proof: r2sym::ProofCoverage,
+    interproc_summary: Option<r2ssa::PreparedInterprocSummarySet>,
     decompile_route: Option<DecompileRouteFacts>,
     input_quality: Option<FunctionInputQualityFacts>,
     callee_resolution: CalleeResolutionFacts,
@@ -1551,18 +1561,209 @@ pub struct FunctionFacts {
     assumption_usage: r2ssa::AssumptionUsageReport,
 }
 
+/// Opaque source-owned function facts.
+///
+/// The exact prepared SSA allocation is retained alongside its advisory
+/// report. There is deliberately no public promotion or parts constructor:
+/// authoritative instances are sealed only by source-owned writeback after
+/// all semantic, interprocedural, assumption, and machine-context checks pass.
+#[derive(Debug, Clone)]
+pub struct SourceOwnedFunctionFacts {
+    source: Arc<r2ssa::SsaArtifact>,
+    report: FunctionFacts,
+}
+
+impl SourceOwnedFunctionFacts {
+    pub(crate) fn seal(source: Arc<r2ssa::SsaArtifact>, mut report: FunctionFacts) -> Option<Self> {
+        // Canonicalization is part of sealing. Runtime consumers must observe
+        // this exact report and may not clone then normalize it independently.
+        report.canonicalize_type_facts();
+        if report.assumptions() != &source.facts().assumptions
+            || report
+                .semantic_artifact()
+                .is_some_and(|artifact| !artifact.shares_artifact(source.as_ref()))
+            || report
+                .prepared_interproc_summary()
+                .is_some_and(|summary| !summary.matches_root(&source))
+        {
+            return None;
+        }
+        Some(Self { source, report })
+    }
+
+    pub fn source(&self) -> &r2ssa::SsaArtifact {
+        self.source.as_ref()
+    }
+
+    pub fn shared_source(&self) -> Arc<r2ssa::SsaArtifact> {
+        Arc::clone(&self.source)
+    }
+
+    pub fn shares_source(&self, source: &Arc<r2ssa::SsaArtifact>) -> bool {
+        Arc::ptr_eq(&self.source, source)
+    }
+
+    pub fn report(&self) -> &FunctionFacts {
+        &self.report
+    }
+
+    pub(crate) fn stamp_report_decompile_route(
+        report: &mut FunctionFacts,
+        kind: DecompileRouteKind,
+        reason: impl Into<String>,
+        fallback_comment: Option<String>,
+    ) -> bool {
+        let reason = reason.into();
+        let reason = if reason.trim().is_empty() {
+            "source-owned decompile route".to_string()
+        } else {
+            reason
+        };
+        let compatible = match kind {
+            DecompileRouteKind::Standard | DecompileRouteKind::FallbackComment => true,
+            DecompileRouteKind::VmSummary => report
+                .semantic_report()
+                .and_then(r2sym::SemanticArtifactReport::vm_body)
+                .is_some(),
+            DecompileRouteKind::StructuredWorker => report
+                .semantic_report()
+                .and_then(r2sym::SemanticArtifactReport::native_body)
+                .is_some_and(|body| !body.regions.is_empty()),
+            DecompileRouteKind::SummaryIslands => report
+                .semantic_report()
+                .and_then(r2sym::SemanticArtifactReport::native_body)
+                .is_some_and(r2sym::NativeArtifactBody::has_summary_islands),
+            DecompileRouteKind::LinearWorker => report
+                .semantic_report()
+                .and_then(r2sym::SemanticArtifactReport::native_body)
+                .is_some_and(|body| !body.summary.worker_summaries.is_empty()),
+        };
+        let (kind, reason, fallback_comment) = if compatible {
+            (kind, reason, fallback_comment)
+        } else {
+            let reason = format!(
+                "source-owned route refused: {:?} is incompatible with retained report",
+                kind
+            );
+            (
+                DecompileRouteKind::FallbackComment,
+                reason.clone(),
+                Some(format!("/* {reason} */")),
+            )
+        };
+        let use_prepared_semantic_view =
+            kind == DecompileRouteKind::Standard && report.render().is_some();
+        report.set_decompile_route(Some(DecompileRouteFacts {
+            kind,
+            reason: Some(reason),
+            fallback_comment: (kind == DecompileRouteKind::FallbackComment)
+                .then_some(fallback_comment)
+                .flatten(),
+            skip_runtime_type_inference: true,
+            use_prepared_semantic_view,
+        }));
+        compatible
+    }
+
+    pub(crate) fn enrich_report_from_source_for_decompile(
+        source: &r2ssa::SsaArtifact,
+        report: &mut FunctionFacts,
+    ) -> Option<usize> {
+        let param_slots = exact_source_param_slot_resolver(source)?;
+        let mut enriched = report.clone();
+        let mut usage = source.facts().assumption_usage.clone();
+        usage.extend(enriched.assumption_usage());
+        enriched.assumption_usage = usage;
+        enriched.attach_prepared_decompile_evidence(source);
+        enriched.populate_certified_parameter_exprs(source, &param_slots);
+        enriched.normalize_field_certificates_from_external_layout();
+        enriched.populate_member_access_render_facts_from_field_certificates(source, &param_slots);
+        enriched.populate_certified_loop_carrier_types();
+        enriched.populate_array_access_render_facts_from_scalar_candidates(source, &param_slots);
+        let applied_constraints = enriched.apply_certified_call_argument_type_constraints(
+            source
+                .machine_context()
+                .memory_model()
+                .default_address_bits(),
+        );
+        *report = enriched;
+        Some(applied_constraints)
+    }
+}
+
+fn exact_source_param_slot_resolver(source: &r2ssa::SsaArtifact) -> Option<ParamSlotResolver> {
+    let context = source.machine_context();
+    let interface = context.function_interface()?;
+    let abi = context.abi_model();
+    if !abi.is_available()
+        || !abi.is_coherent()
+        || abi.argument_registers().len() != interface.parameters().len()
+    {
+        return None;
+    }
+    let mut resolver = ParamSlotResolver::new();
+    let mut indices = BTreeSet::new();
+    let mut parameter_storages = Vec::new();
+    for parameter in interface.parameters() {
+        let slot = usize::try_from(parameter.index()).ok()?;
+        if parameter.storage().space != r2ssa::CanonicalStorageSpace::Register
+            || !indices.insert(slot)
+        {
+            return None;
+        }
+        let mut abi_slots = abi
+            .argument_registers()
+            .iter()
+            .filter(|candidate| candidate.index() == parameter.index());
+        let abi_slot = abi_slots.next()?;
+        if abi_slots.next().is_some() || abi_slot.storage() != parameter.storage() {
+            return None;
+        }
+        parameter_storages.push((slot, parameter.storage()));
+    }
+    let mut matched_slots = BTreeSet::new();
+    for (alias, alias_storage) in context.register_storages_by_name() {
+        if alias_storage.space != r2ssa::CanonicalStorageSpace::Register || alias_storage.size == 0
+        {
+            continue;
+        }
+        let mut matches = parameter_storages.iter().filter(|(_, parameter)| {
+            parameter.space == alias_storage.space
+                && parameter.offset == alias_storage.offset
+                && alias_storage.size <= parameter.size
+        });
+        let Some((slot, _)) = matches.next() else {
+            continue;
+        };
+        if matches.next().is_some() {
+            return None;
+        }
+        let normalized = normalize_param_slot_register_name(alias);
+        if normalized.is_empty()
+            || resolver
+                .slots_by_register
+                .get(&normalized)
+                .is_some_and(|existing| existing != slot)
+        {
+            return None;
+        }
+        resolver.slots_by_register.insert(normalized, *slot);
+        matched_slots.insert(*slot);
+    }
+    if matched_slots.len() != parameter_storages.len() {
+        return None;
+    }
+    Some(resolver)
+}
+
 impl FunctionFacts {
     pub fn new(types: FunctionTypeFacts, semantics: Option<r2sym::SemanticArtifact>) -> Self {
-        let plans = AnalysisPlans::from_semantics(semantics.as_ref());
-        let proof = semantics
-            .as_ref()
-            .map(r2sym::SemanticArtifact::semantic_claim_summary)
-            .map(|claims| r2sym::ProofCoverage::from_semantic_claims(&claims))
-            .unwrap_or_default();
+        let plans =
+            AnalysisPlans::from_semantics(semantics.as_ref().map(r2sym::SemanticArtifact::report));
         Self {
             types,
             semantics,
-            proof,
+            interproc_summary: None,
             decompile_route: None,
             input_quality: None,
             callee_resolution: CalleeResolutionFacts::default(),
@@ -1584,22 +1785,29 @@ impl FunctionFacts {
         self
     }
 
-    pub fn with_summary_set(mut self, set: Option<r2ssa::InterprocSummarySet>) -> Self {
-        self.summary_view = InterprocSummaryView::new(set);
-        self
-    }
-
-    pub fn set_summary_set(&mut self, set: Option<r2ssa::InterprocSummarySet>) {
-        self.summary_view = InterprocSummaryView::new(set);
-    }
-
-    pub fn with_summary_view(mut self, summary_view: InterprocSummaryView) -> Self {
+    pub(crate) fn with_summary_view(mut self, summary_view: InterprocSummaryView) -> Self {
+        self.interproc_summary = None;
         self.summary_view = summary_view;
         self
     }
 
-    pub fn set_summary_view(&mut self, summary_view: InterprocSummaryView) {
+    pub(crate) fn with_prepared_interproc_summary(
+        mut self,
+        summary: r2ssa::PreparedInterprocSummarySet,
+    ) -> Self {
+        if self.semantics.as_ref().is_some_and(|semantics| {
+            !std::sync::Arc::ptr_eq(&semantics.shared_prepared(), summary.root())
+        }) {
+            return self;
+        }
+        let Ok(summary_view) = InterprocSummaryView::new(Some(summary.report().clone())) else {
+            self.summary_view = InterprocSummaryView::default();
+            self.interproc_summary = None;
+            return self;
+        };
         self.summary_view = summary_view;
+        self.interproc_summary = Some(summary);
+        self
     }
 
     pub fn with_diagnostics<I>(mut self, diagnostics: I) -> Self
@@ -1617,11 +1825,6 @@ impl FunctionFacts {
 
     pub fn merge_assumption_usage(&mut self, usage: &r2ssa::AssumptionUsageReport) {
         self.assumption_usage.extend(usage);
-    }
-
-    pub fn with_proof_coverage(mut self, proof: r2sym::ProofCoverage) -> Self {
-        self.proof = proof;
-        self
     }
 
     pub fn with_decompile_route(mut self, route: DecompileRouteFacts) -> Self {
@@ -1707,13 +1910,10 @@ impl FunctionFacts {
         (!self.control.is_empty()).then_some(&self.control)
     }
 
-    pub fn with_render(mut self, render: FunctionRenderFacts) -> Self {
+    #[cfg(test)]
+    fn with_render(mut self, render: FunctionRenderFacts) -> Self {
         self.render = render;
         self
-    }
-
-    pub fn set_render(&mut self, render: FunctionRenderFacts) {
-        self.render = render;
     }
 
     pub fn render(&self) -> Option<&FunctionRenderFacts> {
@@ -1906,16 +2106,12 @@ impl FunctionFacts {
         })
     }
 
-    pub fn set_decompile_route(&mut self, route: Option<DecompileRouteFacts>) {
+    fn set_decompile_route(&mut self, route: Option<DecompileRouteFacts>) {
         self.decompile_route = route;
     }
 
     pub fn decompile_route(&self) -> Option<&DecompileRouteFacts> {
         self.decompile_route.as_ref()
-    }
-
-    pub fn proof_coverage(&self) -> &r2sym::ProofCoverage {
-        &self.proof
     }
 
     pub fn decompile_fallback_comment(&self) -> Option<&str> {
@@ -1930,22 +2126,23 @@ impl FunctionFacts {
             })
     }
 
-    pub fn merge_proof_coverage(&mut self, proof: r2sym::ProofCoverage) {
-        self.proof = std::mem::take(&mut self.proof).merge(proof);
-    }
-
-    pub fn set_semantics(&mut self, semantics: Option<r2sym::SemanticArtifact>) {
+    pub(crate) fn set_semantics(&mut self, semantics: Option<r2sym::SemanticArtifact>) {
+        if semantics.as_ref().is_some_and(|semantics| {
+            self.interproc_summary.as_ref().is_some_and(|summary| {
+                !std::sync::Arc::ptr_eq(&semantics.shared_prepared(), summary.root())
+            })
+        }) {
+            self.interproc_summary = None;
+            self.summary_view = InterprocSummaryView::default();
+        }
         self.semantics = semantics;
         self.refresh_plans();
-        if let Some(semantics) = self.semantics.as_ref() {
-            self.merge_proof_coverage(r2sym::ProofCoverage::from_semantic_claims(
-                &semantics.semantic_claim_summary(),
-            ));
-        }
     }
 
     pub fn refresh_plans(&mut self) {
-        self.plans = AnalysisPlans::from_semantics(self.semantics.as_ref());
+        self.plans = AnalysisPlans::from_semantics(
+            self.semantics.as_ref().map(r2sym::SemanticArtifact::report),
+        );
     }
 
     pub fn canonicalize_type_facts(&mut self) {
@@ -1989,7 +2186,7 @@ impl FunctionFacts {
         }
     }
 
-    pub fn populate_member_access_render_facts_from_field_certificates(
+    fn populate_member_access_render_facts_from_field_certificates(
         &mut self,
         prepared: &r2ssa::SsaArtifact,
         param_slots: &ParamSlotResolver,
@@ -2122,7 +2319,7 @@ impl FunctionFacts {
             .collect()
     }
 
-    pub fn populate_array_access_render_facts_from_scalar_candidates(
+    fn populate_array_access_render_facts_from_scalar_candidates(
         &mut self,
         prepared: &r2ssa::SsaArtifact,
         _param_slots: &ParamSlotResolver,
@@ -2253,12 +2450,12 @@ impl FunctionFacts {
         &self.types
     }
 
-    #[doc(hidden)]
+    #[cfg(test)]
     pub fn __test_type_facts_mut(&mut self) -> &mut FunctionTypeFacts {
         &mut self.types
     }
 
-    #[doc(hidden)]
+    #[cfg(test)]
     pub fn __test_render_facts_mut(&mut self) -> &mut FunctionRenderFacts {
         &mut self.render
     }
@@ -2318,7 +2515,7 @@ impl FunctionFacts {
         true
     }
 
-    pub fn attach_prepared_decompile_evidence(&mut self, prepared: &r2ssa::SsaArtifact) {
+    fn attach_prepared_decompile_evidence(&mut self, prepared: &r2ssa::SsaArtifact) {
         let prepared_callee_resolution = prepared_callee_resolution_facts(prepared, self);
         let prepared_callsites = prepared_callsite_argument_facts(prepared);
         let prepared_call_results = prepared_call_result_facts(prepared);
@@ -2340,7 +2537,7 @@ impl FunctionFacts {
     /// while expression identity is owned by prepared SSA. Every entry alias is
     /// retained; downstream consumers can select a width without guessing from
     /// register spelling.
-    pub fn populate_certified_parameter_exprs(
+    fn populate_certified_parameter_exprs(
         &mut self,
         prepared: &r2ssa::SsaArtifact,
         param_slots: &ParamSlotResolver,
@@ -2455,7 +2652,7 @@ impl FunctionFacts {
     /// an exact parameter or return binding already authorized by the function
     /// signature, or from an exact typed memory-access certificate. Conflicting
     /// projections leave the carrier untyped.
-    pub fn populate_certified_loop_carrier_types(&mut self) {
+    fn populate_certified_loop_carrier_types(&mut self) {
         let signature = self.types.render_authorized_signature().cloned();
         let mut memory_value_types = BTreeMap::<r2ssa::ValueId, CTypeLike>::new();
         let mut conflicting_memory_values = BTreeSet::new();
@@ -2652,18 +2849,40 @@ impl FunctionFacts {
     }
 
     pub fn interproc_summary_set(&self) -> Option<&r2ssa::InterprocSummarySet> {
-        self.summary_view.as_set()
+        self.interproc_summary
+            .as_ref()
+            .map(r2ssa::PreparedInterprocSummarySet::report)
+    }
+
+    /// Borrow the advisory report used by pure projection and rendering.
+    ///
+    /// Unlike [`Self::prepared_interproc_summary`], this report does not prove
+    /// ownership of the prepared SSA source and must not authorize mutation or
+    /// certification.
+    pub fn interproc_summary_report(&self) -> Option<&r2ssa::InterprocSummarySet> {
+        self.interproc_summary
+            .as_ref()
+            .map(r2ssa::PreparedInterprocSummarySet::report)
+            .or_else(|| self.summary_view.as_set())
+    }
+
+    pub fn prepared_interproc_summary(&self) -> Option<&r2ssa::PreparedInterprocSummarySet> {
+        self.interproc_summary.as_ref()
     }
 
     pub fn semantic_artifact(&self) -> Option<&r2sym::SemanticArtifact> {
         self.semantics.as_ref()
     }
 
+    pub fn semantic_report(&self) -> Option<&r2sym::SemanticArtifactReport> {
+        self.semantics.as_ref().map(r2sym::SemanticArtifact::report)
+    }
+
     pub fn summary_rollup(&self) -> Option<&SummaryEffectRollup> {
         self.summary_view.rollup.as_ref()
     }
 
-    #[doc(hidden)]
+    #[cfg(test)]
     pub fn __test_set_summary_rollup(&mut self, rollup: SummaryEffectRollup) {
         self.summary_view.rollup = Some(rollup);
     }
@@ -4129,6 +4348,96 @@ mod tests {
     use crate::{ExternalStackBase, FunctionParamSpec};
     use r2il::{ArchSpec, R2ILBlock, R2ILOp, RegisterDef, SpaceId, Varnode};
     use std::collections::{BTreeMap, HashMap};
+
+    #[test]
+    fn exact_source_param_slots_include_source_owned_low_width_aliases() {
+        let mut arch = ArchSpec::new("x86-64");
+        arch.add_register(RegisterDef::new("rdi", 0x20, 8));
+        arch.add_register(RegisterDef::new("edi", 0x20, 4));
+        arch.add_register(RegisterDef::new("rsp", 0x30, 8));
+        arch.add_register(RegisterDef::new("rip", 0x40, 8));
+        let storage = r2ssa::CanonicalStorageId {
+            space: r2ssa::CanonicalStorageSpace::Register,
+            offset: 0x20,
+            size: 8,
+        };
+        let interface = r2ssa::SourceFunctionInterface::new_exact(
+            b"exact-param-alias".to_vec(),
+            "sysv64",
+            [r2ssa::SourceAbiParameterSpec::new(0, storage)],
+            r2ssa::SourceFunctionReturn::Void,
+            [],
+        )
+        .and_then(|interface| {
+            interface.with_stack_pointer_storage(r2ssa::CanonicalStorageId {
+                space: r2ssa::CanonicalStorageSpace::Register,
+                offset: 0x30,
+                size: 8,
+            })
+        })
+        .and_then(|interface| {
+            interface.with_return_address_storage(r2ssa::CanonicalStorageId {
+                space: r2ssa::CanonicalStorageSpace::Register,
+                offset: 0x40,
+                size: 8,
+            })
+        })
+        .expect("exact interface");
+        let source = r2ssa::SsaArtifact::for_decompile_with_interface(
+            &[R2ILBlock::new(0x1000, 1)],
+            Some(&arch),
+            interface,
+        )
+        .expect("prepared source");
+
+        let resolver = exact_source_param_slot_resolver(&source).expect("exact resolver");
+        assert_eq!(resolver.slot_for_register_name("rdi"), Some(0));
+        assert_eq!(resolver.slot_for_register_name("edi"), Some(0));
+    }
+
+    #[test]
+    fn exact_source_param_slots_refuse_missing_interface() {
+        let mut arch = ArchSpec::new("x86-64");
+        arch.add_register(RegisterDef::new("rdi", 0x20, 8));
+        let source = r2ssa::SsaArtifact::for_decompile(&[R2ILBlock::new(0x1000, 1)], Some(&arch))
+            .expect("prepared source without interface");
+
+        assert!(exact_source_param_slot_resolver(&source).is_none());
+    }
+
+    #[test]
+    fn exact_source_param_slots_accept_exact_empty_interface() {
+        let mut arch = ArchSpec::new("x86-64");
+        arch.add_register(RegisterDef::new("rsp", 0x30, 8));
+        arch.add_register(RegisterDef::new("rip", 0x40, 8));
+        let register_storage = |offset| r2ssa::CanonicalStorageId {
+            space: r2ssa::CanonicalStorageSpace::Register,
+            offset,
+            size: 8,
+        };
+        let interface = r2ssa::SourceFunctionInterface::new_exact(
+            b"exact-empty-interface".to_vec(),
+            "sysv64",
+            [],
+            r2ssa::SourceFunctionReturn::Void,
+            [],
+        )
+        .and_then(|interface| interface.with_stack_pointer_storage(register_storage(0x30)))
+        .and_then(|interface| interface.with_return_address_storage(register_storage(0x40)))
+        .expect("exact empty interface");
+        let source = r2ssa::SsaArtifact::for_decompile_with_interface(
+            &[R2ILBlock::new(0x1000, 1)],
+            Some(&arch),
+            interface,
+        )
+        .expect("prepared source");
+
+        assert!(
+            exact_source_param_slot_resolver(&source)
+                .expect("empty resolver")
+                .is_empty()
+        );
+    }
 
     fn test_control_domain() -> r2ssa::ControlDomain {
         r2ssa::ControlDomain {
@@ -6661,11 +6970,6 @@ mod tests {
             fallback_comment: Some("/* typed fallback */".to_string()),
             skip_runtime_type_inference: true,
             use_prepared_semantic_view: false,
-            proof_coverage: r2sym::ProofCoverage::default(),
-            render_permission: r2sym::RenderPermission::refuse(
-                r2sym::ProofOwner::R2engine,
-                "typed refusal",
-            ),
         };
         let standard_with_comment = DecompileRouteFacts {
             kind: DecompileRouteKind::Standard,
@@ -6673,11 +6977,6 @@ mod tests {
             fallback_comment: Some("/* wrong route */".to_string()),
             skip_runtime_type_inference: false,
             use_prepared_semantic_view: false,
-            proof_coverage: r2sym::ProofCoverage::default(),
-            render_permission: r2sym::RenderPermission::residual(
-                r2sym::ProofOwner::R2engine,
-                "standard route remains residual",
-            ),
         };
 
         assert_eq!(
@@ -6744,6 +7043,7 @@ mod tests {
         let root = r2ssa::InterprocFunctionId(0x401000);
         let helper = r2ssa::InterprocFunctionId(0x402000);
         let set = r2ssa::InterprocSummarySet {
+            schema_version: r2ssa::interproc::INTERPROC_SUMMARY_SCHEMA_VERSION,
             root: Some(root),
             summaries: BTreeMap::from([
                 (root, summary_with_effects(root)),
@@ -6752,7 +7052,7 @@ mod tests {
             diagnostics: Default::default(),
         };
 
-        let view = InterprocSummaryView::new(Some(set));
+        let view = InterprocSummaryView::new(Some(set)).expect("current interproc report schema");
 
         assert_eq!(view.out_param_indices(), vec![1, 2, 3]);
         assert_eq!(
@@ -6802,5 +7102,34 @@ mod tests {
             vec![1, 2, 3]
         );
         assert_eq!(helper_view.pointer_param_indices, vec![0, 1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn interproc_summary_view_rejects_stale_or_mislabeled_reports() {
+        let id = r2ssa::InterprocFunctionId(0x401000);
+        let stale = r2ssa::InterprocSummarySet {
+            schema_version: 1,
+            ..r2ssa::InterprocSummarySet::default()
+        };
+        assert_eq!(
+            InterprocSummaryView::new(Some(stale)),
+            Err(r2ssa::interproc::InterprocSummarySchemaError::ReportSchemaVersion { found: 1 })
+        );
+
+        let summary_id = r2ssa::InterprocFunctionId(0x402000);
+        let mut mislabeled = r2ssa::InterprocSummarySet::default();
+        mislabeled.summaries.insert(
+            id,
+            r2ssa::FunctionSemanticSummary::unknown(summary_id, None),
+        );
+        assert_eq!(
+            InterprocSummaryView::new(Some(mislabeled)),
+            Err(
+                r2ssa::interproc::InterprocSummarySchemaError::FunctionIdentityMismatch {
+                    key: id,
+                    summary_id,
+                }
+            )
+        );
     }
 }

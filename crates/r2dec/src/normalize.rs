@@ -502,7 +502,7 @@ mod tests {
     use super::*;
     use crate::ast::{BinaryOp, UnaryOp};
     use crate::fold::FoldingContext;
-    use r2il::{R2ILBlock, R2ILOp, Varnode};
+    use r2il::{ArchSpec, R2ILBlock, R2ILOp, RegisterDef, Varnode};
     use r2ssa::{PhiNode, SSAFunction, SSAVar};
 
     #[test]
@@ -815,8 +815,36 @@ mod tests {
         exit.push(R2ILOp::Return {
             target: Varnode::register(0, 8),
         });
-        let prepared = r2ssa::SsaArtifact::raw(&[entry, preheader, loop_block, exit], None)
-            .expect("zero-iteration loop fixture");
+        let mut arch = ArchSpec::new("x86-64");
+        arch.addr_size = 8;
+        arch.add_register(RegisterDef::new("RAX", 0, 8));
+        arch.add_register(RegisterDef::new("RSP", 8, 8));
+        arch.add_register(RegisterDef::new("RIP", 16, 8));
+        let storage = |offset| r2ssa::CanonicalStorageId {
+            space: r2ssa::CanonicalStorageSpace::Register,
+            offset,
+            size: 8,
+        };
+        let interface = r2ssa::SourceFunctionInterface::new_exact(
+            b"r2dec-normalize-loop-owner".to_vec(),
+            "sysv64",
+            std::iter::empty::<r2ssa::SourceAbiParameterSpec>(),
+            r2ssa::SourceFunctionReturn::Register {
+                storage: storage(0),
+            },
+            std::iter::empty::<r2ssa::SourceStackSlotSpec>(),
+        )
+        .and_then(|interface| interface.with_stack_pointer_storage(storage(8)))
+        .and_then(|interface| interface.with_return_address_storage(storage(16)))
+        .expect("exact zero-iteration loop interface");
+        let prepared = std::sync::Arc::new(
+            r2ssa::SsaArtifact::for_decompile_with_interface(
+                &[entry, preheader, loop_block, exit],
+                Some(&arch),
+                interface,
+            )
+            .expect("zero-iteration loop fixture"),
+        );
         let carrier = prepared
             .structured()
             .loops
@@ -832,10 +860,25 @@ mod tests {
             .value_var(carrier.dominating_initializers[0].value)
             .expect("carrier initializer")
             .clone();
-        let render_facts = r2types::FunctionRenderFacts::from_prepared(&prepared);
-        let mut normalized =
-            materialize_certified_loop_carriers(prepared.function(), &prepared, &render_facts);
-        materialize_certified_loop_carrier_initializers(&mut normalized, &prepared, &render_facts);
+        let analysis = r2types::build_source_owned_type_writeback_analysis(
+            r2types::TypeWritebackAnalysisRequest::new(
+                std::sync::Arc::clone(&prepared),
+                r2types::ParsedExternalContext::default(),
+            )
+            .expect("matching source assumptions"),
+        )
+        .expect("source-owned loop analysis");
+        let render_facts = analysis.function_facts().render_facts();
+        let mut normalized = materialize_certified_loop_carriers(
+            prepared.function(),
+            prepared.as_ref(),
+            render_facts,
+        );
+        materialize_certified_loop_carrier_initializers(
+            &mut normalized,
+            prepared.as_ref(),
+            render_facts,
+        );
 
         let entry = normalized.get_block(0x2000).expect("entry");
         assert!(entry.ops.iter().any(|op| matches!(

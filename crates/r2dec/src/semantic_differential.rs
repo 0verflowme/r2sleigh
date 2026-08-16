@@ -2918,10 +2918,10 @@ fn execute_private_join_block(
     Ok(())
 }
 
-fn private_join_route<'a>(
-    join: &'a CertifiedPrivateFrameConditionalJoin,
+fn private_join_route(
+    join: &CertifiedPrivateFrameConditionalJoin,
     target: u64,
-) -> Result<(&'a CertifiedPrivateFrameConditionalArm, bool), RunFailure> {
+) -> Result<(&CertifiedPrivateFrameConditionalArm, bool), RunFailure> {
     if target == join.condition().true_target()
         && target == join.true_arm().entry_target()
         && target != join.false_arm().entry_target()
@@ -4209,7 +4209,7 @@ fn execute_semantic_memory(
     executed_accesses: &mut BTreeSet<StructuredAccessId>,
     statement: &r2cert::CertifiedMemoryStatement,
 ) -> Result<(), RunFailure> {
-    if statement.execution() != CertifiedMemoryExecutionPolicy::ExactlyOnceInSourceOrderViaHelper {
+    if statement.execution() != CertifiedMemoryExecutionPolicy::ExactlyOnceInSourceOrder {
         return Err(RunFailure::Invalid(
             "memory execution policy is not exactly-once".to_string(),
         ));
@@ -7828,6 +7828,7 @@ mod tests {
                 .expect("trusted parameter register");
             RadareAbi138ParameterView {
                 index: 0,
+                name_length: name.len(),
                 storage: RadareAbi138RegisterStorageView {
                     name_length: name.len(),
                     offset: register.address.offset,
@@ -7835,7 +7836,6 @@ mod tests {
                 },
                 logical_type_id: interface.parameter_logical_type_id,
                 carrier: interface.parameter_carrier,
-                ..Default::default()
             }
         });
         let scalar_return = interface.scalar_return_register.map(|name| {
@@ -7949,6 +7949,7 @@ mod tests {
             interface_calling_convention: Some(interface_calling_convention),
             interface_storage_name: Some(interface_storage_name),
             parameter_view: Some(parameter_view),
+            parameter_name: Some(parameter_name),
             parameter_storage_name: Some(parameter_name),
             stack_slot_view: Some(stack_slot_view),
             stack_slot_string: Some(stack_slot_string),
@@ -8024,7 +8025,7 @@ mod tests {
             .checked_add(u64::try_from(bytes.len()).expect("fixture size fits u64"))
             .expect("fixture range");
         let successors = (!terminal_return)
-            .then(|| NativeSpanSuccessorFixture {
+            .then_some(NativeSpanSuccessorFixture {
                 kind: 1,
                 target: end,
                 external: true,
@@ -8104,6 +8105,7 @@ mod tests {
             scalar_return_name: Some("x0".into()),
             parameter: Some(RadareAbi138ParameterView {
                 index: 0,
+                name_length: 2,
                 storage: RadareAbi138RegisterStorageView {
                     name_length: 2,
                     offset: x0.address.offset,
@@ -8115,7 +8117,6 @@ mod tests {
                     offset_bits: 0,
                     size_bits: 32,
                 },
-                ..Default::default()
             }),
             parameter_name: Some("x0".into()),
             stack_slots: Vec::new(),
@@ -8144,6 +8145,7 @@ mod tests {
             interface_calling_convention: Some(interface_calling_convention),
             interface_storage_name: Some(interface_storage_name),
             parameter_view: Some(parameter_view),
+            parameter_name: Some(parameter_name),
             parameter_storage_name: Some(parameter_name),
             stack_slot_view: Some(stack_slot_view),
             stack_slot_string: Some(stack_slot_string),
@@ -8276,11 +8278,7 @@ mod tests {
     fn trusted_native_span_fixture(
         bytes: &[u8],
         addr: u64,
-    ) -> (
-        TrustedSsaArtifact,
-        r2il::R2ILBlock,
-        Vec<(u64, u32, u64, u64)>,
-    ) {
+    ) -> (TrustedSsaArtifact, r2il::R2ILBlock, LiftedBlockSpans) {
         trusted_x86_fixture(bytes, addr, false, false)
     }
 
@@ -8562,6 +8560,25 @@ mod tests {
             ]
         );
         assert_zero_op_native_spans_are_exactly_residual(&trusted, &canonical, 2);
+    }
+
+    #[test]
+    fn genuine_trusted_ssa_shares_exact_artifact_ownership() {
+        const ADDR: u64 = 0x401100;
+        let (trusted, _, _) = trusted_native_span_fixture(&[0x31, 0xc0], ADDR);
+
+        let shared = trusted.shared_artifact();
+        let same_artifact = trusted.shared_artifact();
+        assert!(trusted.shares_artifact(&shared));
+        assert!(std::ptr::eq(trusted.artifact(), shared.as_ref()));
+        assert!(std::sync::Arc::ptr_eq(&shared, &same_artifact));
+
+        let weak = std::sync::Arc::downgrade(&shared);
+        drop(same_artifact);
+        drop(trusted);
+        assert!(std::sync::Weak::upgrade(&weak).is_some());
+        drop(shared);
+        assert!(std::sync::Weak::upgrade(&weak).is_none());
     }
 
     #[test]
@@ -9698,7 +9715,17 @@ mod tests {
             certified_private_entry_stack_pointer_input(&projection, Some(projected_join), None,),
             Err(SemanticCError::InvalidCertifiedPrivateFrameInput)
         );
-        assert!(SemanticCExpressionLayer::from_projection(&projection).is_err());
+        let projected_layer = SemanticCExpressionLayer::from_projection(&projection)
+            .expect("exact stack discipline classifies the private entry stack pointer");
+        assert_eq!(
+            projected_layer
+                .input_origins()
+                .get(&stack.entry_stack_pointer().binding()),
+            Some(&SemanticCInputOrigin::CertifiedPrivateEntryStackPointer {
+                storage: stack.stack_pointer_storage(),
+                header,
+            })
+        );
         match SemanticCExpressionLayer::from_private_frame_conditional_join(
             &projection,
             projected_join,

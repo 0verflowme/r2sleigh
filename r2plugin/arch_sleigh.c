@@ -8,8 +8,8 @@
 #include <string.h>
 #include "r2sleigh_plugin.h"
 
-#if R2_ABIVERSION != 138
-#error "r2sleigh lift-core V2 requires exactly radare2 ABI 138"
+#if R2_ABIVERSION != 139
+#error "r2sleigh lift-core V2 requires exactly radare2 ABI 139"
 #endif
 
 static const char *fallback_profile_generic(void) {

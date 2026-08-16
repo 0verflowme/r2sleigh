@@ -310,9 +310,9 @@ impl SourceTypeGraph {
         for (position, source_type) in types.iter().enumerate() {
             if u32::try_from(position) != Ok(source_type.id)
                 || source_type.size_bits == 0
-                || source_type.size_bits % 8 != 0
+                || !source_type.size_bits.is_multiple_of(8)
                 || source_type.align_bits == 0
-                || source_type.align_bits % 8 != 0
+                || !source_type.align_bits.is_multiple_of(8)
                 || !source_type.align_bits.is_power_of_two()
                 || source_type.align_bits > source_type.size_bits
             {
@@ -381,7 +381,7 @@ impl SourceTypeGraph {
                         SourceTypeKind::SignedInteger | SourceTypeKind::UnsignedInteger
                     )
                     || member.size_bits != member_type.size_bits
-                    || member.offset_bits % 8 != 0
+                    || !member.offset_bits.is_multiple_of(8)
                     || source_align_up(cursor, member_type.align_bits) != Some(member.offset_bits)
                 {
                     return Err(SourceTypeGraphError::InvalidMember);

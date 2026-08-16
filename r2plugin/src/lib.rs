@@ -30,6 +30,8 @@ use r2sleigh_export::{
     export_instruction, op_json_named, ssa_op_to_info,
 };
 use r2sleigh_lift::{Disassembler, SemanticMetadataOptions, build_arch_spec};
+#[cfg(test)]
+use r2types::recover_vars_arch_profile;
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
 use std::ptr;
@@ -37,7 +39,7 @@ use std::slice;
 #[cfg(test)]
 use types::parse_const_value;
 #[cfg(test)]
-use types::{recover_vars_arch_profile, size_to_type, ssa_var_block_key};
+use types::{size_to_type, ssa_var_block_key};
 
 /// Opaque context handle for C API.
 pub struct R2ILContext {
@@ -479,16 +481,28 @@ pub(crate) fn r2il_block_validate(ctx: *mut R2ILContext, block: *const R2ILBlock
 ///
 /// Returns 1 when switch metadata was accepted, 0 when the input is absent or
 /// cannot satisfy the r2il switch invariants.
-pub(crate) fn r2il_block_set_switch_info(
-    block: *mut R2ILBlock,
-    switch_addr: u64,
-    min_val: u64,
-    max_val: u64,
-    default_target: u64,
-    has_default: i32,
-    cases: *const R2ILSwitchCaseFfi,
-    case_count: usize,
-) -> i32 {
+pub(crate) struct R2ILSwitchInfoInput {
+    pub(crate) block: *mut R2ILBlock,
+    pub(crate) switch_addr: u64,
+    pub(crate) min_val: u64,
+    pub(crate) max_val: u64,
+    pub(crate) default_target: u64,
+    pub(crate) has_default: i32,
+    pub(crate) cases: *const R2ILSwitchCaseFfi,
+    pub(crate) case_count: usize,
+}
+
+pub(crate) fn r2il_block_set_switch_info(input: R2ILSwitchInfoInput) -> i32 {
+    let R2ILSwitchInfoInput {
+        block,
+        switch_addr,
+        min_val,
+        max_val,
+        default_target,
+        has_default,
+        cases,
+        case_count,
+    } = input;
     if block.is_null() || cases.is_null() || case_count == 0 {
         return 0;
     }
@@ -990,8 +1004,76 @@ pub(crate) fn r2il_block_regs_read(
     CString::new(json_array).map_or(ptr::null_mut(), |c| c.into_raw())
 }
 
-/// Get memory accesses by the block as JSON array.
-/// Each entry includes legacy fields (`addr`, `size`, `write`) and richer metadata.
+const R2IL_MEMORY_ACCESS_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Debug, serde::Serialize)]
+struct R2ILMemoryStackAddress {
+    base: String,
+    offset: i64,
+}
+
+#[derive(Debug, Default, serde::Serialize)]
+struct R2ILMemoryAccessSemantics {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    guarded: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ordering: Option<r2il::MemoryOrdering>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    atomic_kind: Option<r2il::AtomicKind>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    memory_class: Option<r2il::MemoryClass>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    permissions: Option<r2il::MemoryPermissions>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    range: Option<r2il::MemoryRange>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bank_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    segment_id: Option<String>,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct R2ILMemoryAccess {
+    schema_version: u32,
+    #[serde(rename = "type")]
+    access_type: &'static str,
+    size_bytes: u32,
+    address: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stack_address: Option<R2ILMemoryStackAddress>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    value: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    expected: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    replacement: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    result: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    guard: Option<serde_json::Value>,
+    #[serde(flatten)]
+    semantics: R2ILMemoryAccessSemantics,
+}
+
+impl R2ILMemoryAccess {
+    fn new(access_type: &'static str, size_bytes: u32, address: serde_json::Value) -> Self {
+        Self {
+            schema_version: R2IL_MEMORY_ACCESS_SCHEMA_VERSION,
+            access_type,
+            size_bytes,
+            address,
+            stack_address: None,
+            value: None,
+            expected: None,
+            replacement: None,
+            result: None,
+            guard: None,
+            semantics: R2ILMemoryAccessSemantics::default(),
+        }
+    }
+}
+
+/// Get memory accesses by the block as one canonical JSON array.
 /// Internal V2 wrapper immediately adopts the returned CString allocation.
 pub(crate) fn r2il_block_mem_access(
     ctx: *const R2ILContext,
@@ -1011,45 +1093,26 @@ pub(crate) fn r2il_block_mem_access(
     let defs = build_stack_defs(&blk.ops);
     let mut accesses = Vec::new();
 
-    let apply_additive_fields = |access: &mut serde_json::Value,
-                                 op_index: usize,
-                                 space_id: Option<r2il::SpaceId>,
-                                 ordering: Option<r2il::MemoryOrdering>,
-                                 atomic_kind: Option<r2il::AtomicKind>,
-                                 guarded: bool| {
-        if guarded {
-            access["guarded"] = serde_json::Value::Bool(true);
-        }
-        if let Some(ord) = ordering.or_else(|| {
+    let apply_semantics = |access: &mut R2ILMemoryAccess,
+                           op_index: usize,
+                           space_id: Option<r2il::SpaceId>,
+                           ordering: Option<r2il::MemoryOrdering>,
+                           atomic_kind: Option<r2il::AtomicKind>,
+                           guarded: bool| {
+        access.semantics.guarded = guarded.then_some(true);
+        access.semantics.ordering = ordering.or_else(|| {
             blk.op_metadata
                 .get(&op_index)
                 .and_then(|m| m.memory_ordering)
-        }) {
-            access["ordering"] = serde_json::to_value(ord).unwrap_or(serde_json::Value::Null);
-        }
-        if let Some(kind) =
-            atomic_kind.or_else(|| blk.op_metadata.get(&op_index).and_then(|m| m.atomic_kind))
-        {
-            access["atomic_kind"] = serde_json::to_value(kind).unwrap_or(serde_json::Value::Null);
-        }
+        });
+        access.semantics.atomic_kind =
+            atomic_kind.or_else(|| blk.op_metadata.get(&op_index).and_then(|m| m.atomic_kind));
         if let Some(meta) = blk.op_metadata.get(&op_index) {
-            if let Some(memory_class) = meta.memory_class {
-                access["memory_class"] =
-                    serde_json::to_value(memory_class).unwrap_or(serde_json::Value::Null);
-            }
-            if let Some(perms) = meta.permissions {
-                access["permissions"] =
-                    serde_json::to_value(perms).unwrap_or(serde_json::Value::Null);
-            }
-            if let Some(range) = meta.valid_range {
-                access["range"] = serde_json::to_value(range).unwrap_or(serde_json::Value::Null);
-            }
-            if let Some(bank_id) = &meta.bank_id {
-                access["bank_id"] = serde_json::Value::String(bank_id.clone());
-            }
-            if let Some(segment_id) = &meta.segment_id {
-                access["segment_id"] = serde_json::Value::String(segment_id.clone());
-            }
+            access.semantics.memory_class = meta.memory_class;
+            access.semantics.permissions = meta.permissions;
+            access.semantics.range = meta.valid_range;
+            access.semantics.bank_id = meta.bank_id.clone();
+            access.semantics.segment_id = meta.segment_id.clone();
         }
 
         if let Some(space_id) = space_id
@@ -1057,29 +1120,19 @@ pub(crate) fn r2il_block_mem_access(
             && let Some(space) = arch.spaces.iter().find(|s| s.id == space_id)
         {
             if let Some(memory_class) = space.memory_class {
-                access["memory_class"] =
-                    serde_json::to_value(memory_class).unwrap_or(serde_json::Value::Null);
+                access.semantics.memory_class = Some(memory_class);
             }
-            if access.get("permissions").is_none()
-                && let Some(perms) = space.permissions
-            {
-                access["permissions"] =
-                    serde_json::to_value(perms).unwrap_or(serde_json::Value::Null);
+            if access.semantics.permissions.is_none() {
+                access.semantics.permissions = space.permissions;
             }
-            if access.get("range").is_none()
-                && let Some(range) = space.valid_ranges.first()
-            {
-                access["range"] = serde_json::to_value(range).unwrap_or(serde_json::Value::Null);
+            if access.semantics.range.is_none() {
+                access.semantics.range = space.valid_ranges.first().copied();
             }
-            if access.get("bank_id").is_none()
-                && let Some(bank_id) = &space.bank_id
-            {
-                access["bank_id"] = serde_json::Value::String(bank_id.clone());
+            if access.semantics.bank_id.is_none() {
+                access.semantics.bank_id = space.bank_id.clone();
             }
-            if access.get("segment_id").is_none()
-                && let Some(segment_id) = &space.segment_id
-            {
-                access["segment_id"] = serde_json::Value::String(segment_id.clone());
+            if access.semantics.segment_id.is_none() {
+                access.semantics.segment_id = space.segment_id.clone();
             }
         }
     };
@@ -1087,24 +1140,16 @@ pub(crate) fn r2il_block_mem_access(
     for (op_index, op) in blk.ops.iter().enumerate() {
         match op {
             R2ILOp::Load { dst, space, addr } => {
-                let mut access = serde_json::json!({
-                    "type": "load",
-                    "size": dst.size,
-                    "write": false,
-                    "addr": disasm.format_varnode(addr),
-                });
-
-                if let Some(detail) = varnode_to_json(addr, disasm) {
-                    access["addr_detail"] = detail;
-                }
+                let Some(address) = varnode_to_json(addr, disasm) else {
+                    return ptr::null_mut();
+                };
+                let mut access = R2ILMemoryAccess::new("load", dst.size, address);
 
                 if let Some((base, offset)) = resolve_stack_addr(addr, disasm, &defs, &blk.ops) {
-                    access["stack"] = serde_json::Value::Bool(true);
-                    access["stack_offset"] = serde_json::Value::Number(offset.into());
-                    access["stack_base"] = serde_json::Value::String(base);
+                    access.stack_address = Some(R2ILMemoryStackAddress { base, offset });
                 }
 
-                apply_additive_fields(&mut access, op_index, Some(*space), None, None, false);
+                apply_semantics(&mut access, op_index, Some(*space), None, None, false);
                 accesses.push(access);
             }
             R2ILOp::LoadLinked {
@@ -1113,17 +1158,11 @@ pub(crate) fn r2il_block_mem_access(
                 addr,
                 ordering,
             } => {
-                let mut access = serde_json::json!({
-                    "type": "load_linked",
-                    "size": dst.size,
-                    "write": false,
-                    "addr": disasm.format_varnode(addr),
-                });
-
-                if let Some(detail) = varnode_to_json(addr, disasm) {
-                    access["addr_detail"] = detail;
-                }
-                apply_additive_fields(
+                let Some(address) = varnode_to_json(addr, disasm) else {
+                    return ptr::null_mut();
+                };
+                let mut access = R2ILMemoryAccess::new("load_linked", dst.size, address);
+                apply_semantics(
                     &mut access,
                     op_index,
                     Some(*space),
@@ -1134,27 +1173,19 @@ pub(crate) fn r2il_block_mem_access(
                 accesses.push(access);
             }
             R2ILOp::Store { space, addr, val } => {
-                let mut access = serde_json::json!({
-                    "type": "store",
-                    "size": val.size,
-                    "write": true,
-                    "addr": disasm.format_varnode(addr),
-                });
-
-                if let Some(detail) = varnode_to_json(addr, disasm) {
-                    access["addr_detail"] = detail;
-                }
-                if let Some(value) = varnode_to_json(val, disasm) {
-                    access["value"] = value;
-                }
+                let (Some(address), Some(value)) =
+                    (varnode_to_json(addr, disasm), varnode_to_json(val, disasm))
+                else {
+                    return ptr::null_mut();
+                };
+                let mut access = R2ILMemoryAccess::new("store", val.size, address);
+                access.value = Some(value);
 
                 if let Some((base, offset)) = resolve_stack_addr(addr, disasm, &defs, &blk.ops) {
-                    access["stack"] = serde_json::Value::Bool(true);
-                    access["stack_offset"] = serde_json::Value::Number(offset.into());
-                    access["stack_base"] = serde_json::Value::String(base);
+                    access.stack_address = Some(R2ILMemoryStackAddress { base, offset });
                 }
 
-                apply_additive_fields(&mut access, op_index, Some(*space), None, None, false);
+                apply_semantics(&mut access, op_index, Some(*space), None, None, false);
                 accesses.push(access);
             }
             R2ILOp::StoreConditional {
@@ -1164,24 +1195,23 @@ pub(crate) fn r2il_block_mem_access(
                 val,
                 ordering,
             } => {
-                let mut access = serde_json::json!({
-                    "type": "store_conditional",
-                    "size": val.size,
-                    "write": true,
-                    "addr": disasm.format_varnode(addr),
-                });
-                if let Some(detail) = varnode_to_json(addr, disasm) {
-                    access["addr_detail"] = detail;
-                }
-                if let Some(value) = varnode_to_json(val, disasm) {
-                    access["value"] = value;
-                }
-                if let Some(dst) = result
-                    && let Some(result_json) = varnode_to_json(dst, disasm)
-                {
-                    access["result"] = result_json;
-                }
-                apply_additive_fields(
+                let (Some(address), Some(value)) =
+                    (varnode_to_json(addr, disasm), varnode_to_json(val, disasm))
+                else {
+                    return ptr::null_mut();
+                };
+                let mut access = R2ILMemoryAccess::new("store_conditional", val.size, address);
+                access.value = Some(value);
+                access.result = match result {
+                    Some(dst) => {
+                        let Some(result) = varnode_to_json(dst, disasm) else {
+                            return ptr::null_mut();
+                        };
+                        Some(result)
+                    }
+                    None => None,
+                };
+                apply_semantics(
                     &mut access,
                     op_index,
                     Some(*space),
@@ -1199,25 +1229,19 @@ pub(crate) fn r2il_block_mem_access(
                 replacement,
                 ordering,
             } => {
-                let mut access = serde_json::json!({
-                    "type": "atomic_cas",
-                    "size": dst.size,
-                    "write": true,
-                    "addr": disasm.format_varnode(addr),
-                });
-                if let Some(detail) = varnode_to_json(addr, disasm) {
-                    access["addr_detail"] = detail;
-                }
-                if let Some(value) = varnode_to_json(expected, disasm) {
-                    access["expected"] = value;
-                }
-                if let Some(value) = varnode_to_json(replacement, disasm) {
-                    access["replacement"] = value;
-                }
-                if let Some(value) = varnode_to_json(dst, disasm) {
-                    access["result"] = value;
-                }
-                apply_additive_fields(
+                let (Some(address), Some(expected), Some(replacement), Some(result)) = (
+                    varnode_to_json(addr, disasm),
+                    varnode_to_json(expected, disasm),
+                    varnode_to_json(replacement, disasm),
+                    varnode_to_json(dst, disasm),
+                ) else {
+                    return ptr::null_mut();
+                };
+                let mut access = R2ILMemoryAccess::new("atomic_cas", dst.size, address);
+                access.expected = Some(expected);
+                access.replacement = Some(replacement);
+                access.result = Some(result);
+                apply_semantics(
                     &mut access,
                     op_index,
                     Some(*space),
@@ -1234,19 +1258,15 @@ pub(crate) fn r2il_block_mem_access(
                 guard,
                 ordering,
             } => {
-                let mut access = serde_json::json!({
-                    "type": "load_guarded",
-                    "size": dst.size,
-                    "write": false,
-                    "addr": disasm.format_varnode(addr),
-                });
-                if let Some(detail) = varnode_to_json(addr, disasm) {
-                    access["addr_detail"] = detail;
-                }
-                if let Some(value) = varnode_to_json(guard, disasm) {
-                    access["guard"] = value;
-                }
-                apply_additive_fields(
+                let (Some(address), Some(guard)) = (
+                    varnode_to_json(addr, disasm),
+                    varnode_to_json(guard, disasm),
+                ) else {
+                    return ptr::null_mut();
+                };
+                let mut access = R2ILMemoryAccess::new("load_guarded", dst.size, address);
+                access.guard = Some(guard);
+                apply_semantics(
                     &mut access,
                     op_index,
                     Some(*space),
@@ -1263,22 +1283,17 @@ pub(crate) fn r2il_block_mem_access(
                 guard,
                 ordering,
             } => {
-                let mut access = serde_json::json!({
-                    "type": "store_guarded",
-                    "size": val.size,
-                    "write": true,
-                    "addr": disasm.format_varnode(addr),
-                });
-                if let Some(detail) = varnode_to_json(addr, disasm) {
-                    access["addr_detail"] = detail;
-                }
-                if let Some(value) = varnode_to_json(val, disasm) {
-                    access["value"] = value;
-                }
-                if let Some(value) = varnode_to_json(guard, disasm) {
-                    access["guard"] = value;
-                }
-                apply_additive_fields(
+                let (Some(address), Some(value), Some(guard)) = (
+                    varnode_to_json(addr, disasm),
+                    varnode_to_json(val, disasm),
+                    varnode_to_json(guard, disasm),
+                ) else {
+                    return ptr::null_mut();
+                };
+                let mut access = R2ILMemoryAccess::new("store_guarded", val.size, address);
+                access.value = Some(value);
+                access.guard = Some(guard);
+                apply_semantics(
                     &mut access,
                     op_index,
                     Some(*space),
@@ -2654,7 +2669,6 @@ fn r2sleigh_engine_type_function_trusted_output(
             function: trusted_engine_function_input(&trusted),
             ptr_bits: Some(ptr_bits),
             parsed_context: r2types::ParsedExternalContext::default(),
-            scope_facts: r2engine::InterprocScopeFacts::empty(),
             interproc_max_iters: 1,
             interproc_converged: false,
             symbolic_scope: None,
@@ -2682,8 +2696,8 @@ fn r2sleigh_engine_type_function_trusted_output(
             });
         }
     };
-    let metrics = response.metrics.clone();
-    let diagnostics = response.diagnostics.clone();
+    let metrics = response.metrics().clone();
+    let diagnostics = response.diagnostics().clone();
     let report = r2engine::function_analysis_report_payload_from_type_response(
         function_name,
         function_addr,
@@ -2709,7 +2723,7 @@ fn r2sleigh_engine_type_function_trusted_output(
 }
 
 // ============================================================================
-// radare2 Deep Integration FFI - Variable Recovery and Data Refs
+// radare2 Deep Integration FFI - Type Evidence and Data Refs
 // ============================================================================
 
 #[cfg(test)]
@@ -2794,9 +2808,6 @@ struct TypeWritebackDiagnosticsJson {
 #[cfg(test)]
 type InterprocSummaryJson = r2engine::EngineInterprocSummaryJson;
 
-#[cfg(test)]
-type InferredTypeWritebackJson = r2engine::EngineInferredTypeWritebackJson;
-
 #[repr(C)]
 #[cfg(test)]
 pub struct R2SleighTypeWritebackApplyPolicy {
@@ -2833,67 +2844,6 @@ pub struct R2SleighAnnotation {
 pub struct R2SleighAnnotations {
     items: Vec<R2SleighAnnotation>,
     _strings: Vec<CString>,
-}
-
-#[cfg(test)]
-type TypeOutputBudget = r2types::TypeWritebackMutationBudget;
-
-#[cfg(test)]
-fn writeback_plan_json(
-    plan: r2types::TypeWritebackPlan,
-    interproc: InterprocSummaryJson,
-    function_facts: &r2types::FunctionFacts,
-    semantics: Option<r2sym::SemanticArtifact>,
-    compiled_semantics: Option<r2sym::CompiledSemanticInfo>,
-    budget: TypeOutputBudget,
-    basic_block_count: usize,
-) -> InferredTypeWritebackJson {
-    writeback_plan_json_with_policy(WritebackPlanJsonInput {
-        plan,
-        interproc,
-        function_facts,
-        semantics,
-        compiled_semantics,
-        budget,
-        apply_policy: r2engine::type_writeback_apply_policy_for_mode(
-            r2engine::EngineTypeWritebackMode::Balanced,
-        ),
-        basic_block_count,
-    })
-}
-
-#[cfg(test)]
-struct WritebackPlanJsonInput<'a> {
-    plan: r2types::TypeWritebackPlan,
-    interproc: InterprocSummaryJson,
-    function_facts: &'a r2types::FunctionFacts,
-    semantics: Option<r2sym::SemanticArtifact>,
-    compiled_semantics: Option<r2sym::CompiledSemanticInfo>,
-    budget: TypeOutputBudget,
-    apply_policy: r2types::TypeWritebackApplyPolicy,
-    basic_block_count: usize,
-}
-
-#[cfg(test)]
-fn writeback_plan_json_with_policy(input: WritebackPlanJsonInput<'_>) -> InferredTypeWritebackJson {
-    let WritebackPlanJsonInput {
-        plan,
-        interproc,
-        function_facts,
-        semantics,
-        compiled_semantics,
-        budget,
-        apply_policy,
-        basic_block_count,
-    } = input;
-    let payload = r2engine::type_writeback_payload_for_policy(
-        plan,
-        budget,
-        function_facts,
-        apply_policy,
-        basic_block_count,
-    );
-    r2engine::type_writeback_report_json(payload, interproc, semantics, compiled_semantics)
 }
 
 #[cfg(test)]
@@ -3213,7 +3163,7 @@ fn collect_pointer_arg_slot_map(
     arch: Option<&ArchSpec>,
     ptr_bits: u32,
 ) -> std::collections::HashMap<String, usize> {
-    let (arg_regs, _, _) = recover_vars_arch_profile(arch);
+    let (arg_regs, _, _) = recover_vars_arch_profile(arch.map(|spec| spec.name.as_str()));
     let arch_name = arch
         .map(|a| a.name.to_ascii_lowercase())
         .unwrap_or_default();
@@ -5426,16 +5376,16 @@ mod tests {
             },
         ];
 
-        let ok = r2il_block_set_switch_info(
-            &mut block,
-            0x1010,
-            0,
-            7,
-            0x4000,
-            1,
-            cases.as_ptr(),
-            cases.len(),
-        );
+        let ok = r2il_block_set_switch_info(R2ILSwitchInfoInput {
+            block: &mut block,
+            switch_addr: 0x1010,
+            min_val: 0,
+            max_val: 7,
+            default_target: 0x4000,
+            has_default: 1,
+            cases: cases.as_ptr(),
+            case_count: cases.len(),
+        });
         assert_eq!(ok, 1);
 
         let info = block.switch_info.as_ref().expect("switch info");
@@ -5466,16 +5416,16 @@ mod tests {
             },
         ];
 
-        let ok = r2il_block_set_switch_info(
-            &mut block,
-            0x1010,
-            0,
-            1,
-            u64::MAX,
-            0,
-            cases.as_ptr(),
-            cases.len(),
-        );
+        let ok = r2il_block_set_switch_info(R2ILSwitchInfoInput {
+            block: &mut block,
+            switch_addr: 0x1010,
+            min_val: 0,
+            max_val: 1,
+            default_target: u64::MAX,
+            has_default: 0,
+            cases: cases.as_ptr(),
+            case_count: cases.len(),
+        });
         assert_eq!(ok, 0);
         assert!(block.switch_info.is_none());
     }
@@ -6414,7 +6364,7 @@ mod tests {
         }
     }
 
-    fn test_large_cfg_semantic_artifact() -> r2sym::SemanticArtifact {
+    fn test_large_cfg_semantic_report() -> r2sym::SemanticArtifactReport {
         let compiled = test_compiled_condition("x == 0");
         let region = r2sym::SemanticRegion {
             anchor: 0x401000,
@@ -6473,7 +6423,8 @@ mod tests {
                 ),
             ],
         };
-        r2sym::SemanticArtifact {
+        r2sym::SemanticArtifactReport {
+            schema_version: r2sym::SEMANTIC_ARTIFACT_SCHEMA_VERSION,
             stage: r2sym::RefinementStage::Residual,
             granularity: r2sym::ArtifactGranularity::Regioned,
             execution: r2sym::ExecutionModel::Native,
@@ -6504,8 +6455,8 @@ mod tests {
     }
 
     #[test]
-    fn summary_only_semantics_feed_types_instead_of_bounded_fallback() {
-        let mut artifact = test_large_cfg_semantic_artifact();
+    fn summary_only_report_keeps_bounded_type_advisory() {
+        let mut artifact = test_large_cfg_semantic_report();
         artifact.granularity = r2sym::ArtifactGranularity::SummaryOnly;
         let cfg_risk = r2ssa::CFGRiskSummary {
             block_count: 200,
@@ -6514,107 +6465,14 @@ mod tests {
             switch_block_count: 0,
             max_switch_cases: 0,
         };
-        assert!(r2engine::semantic_or_cfg_prefers_bounded_type_plan(
-            &artifact, &cfg_risk
+        assert!(r2types::semantic_artifact_prefers_bounded_type_plan(
+            &artifact
         ));
-        assert!(!r2engine::semantic_artifact_needs_fallback_type_payload(
-            &artifact, &cfg_risk
-        ));
-    }
-
-    #[test]
-    fn semantic_type_fallback_payload_preserves_assumptions() {
-        let compiled = test_large_cfg_semantic_artifact();
-        assert!(
-            r2types::semantic_artifact_prefers_bounded_type_plan(&compiled),
-            "expected large-CFG worker artifact to use bounded semantic type fallback"
-        );
-
-        let assumptions = r2ssa::AssumptionSet::new(vec![r2ssa::AnalysisAssumption {
-            id: Some("seed-rdi".to_string()),
-            scope: r2ssa::AssumptionScope::Function,
-            provenance: r2ssa::AssumptionProvenance::User,
-            subject: r2ssa::AssumptionSubject::Register {
-                name: "rdi".to_string(),
-            },
-            value: r2ssa::AssumptionValue::Constant { value: 0xdead },
-        }]);
-        let signature = r2types::FunctionSignatureSpec {
-            ret_type: Some(r2types::CTypeLike::Void),
-            params: vec![r2types::FunctionParamSpec {
-                name: "status".to_string(),
-                ty: Some(r2types::CTypeLike::Int {
-                    bits: 32,
-                    signedness: r2types::Signedness::Signed,
-                }),
-            }],
-        };
-        let type_facts = r2types::FunctionTypeFacts {
-            signature_certificate: r2types::SignatureCertificate::from_signature(
-                &signature,
-                [r2types::SignatureCertificateSource::ExternalContext],
-            ),
-            merged_signature: Some(signature),
-            ..r2types::FunctionTypeFacts::default()
-        };
-        let function_facts = r2types::FunctionFacts::new(type_facts, Some(compiled.clone()))
-            .with_assumptions(assumptions.clone());
-        let payload = r2engine::semantic_fallback_type_writeback_report_json(
-            r2engine::EngineSemanticFallbackTypeWritebackJsonRequest {
-                type_request: r2engine::EngineSemanticFallbackTypeWritebackReportRequest {
-                    function_name: "fcn.401000",
-                    arch_name: "x86-64",
-                    ptr_bits: 64,
-                    artifact: &compiled,
-                    function_facts: &function_facts,
-                    apply_artifact_signature_hint: false,
-                    policy: r2engine::EngineTypeWritebackReportPolicy {
-                        budget: TypeOutputBudget::new(64, usize::MAX, usize::MAX),
-                        apply_policy: r2engine::type_writeback_apply_policy_for_mode(
-                            r2engine::EngineTypeWritebackMode::Balanced,
-                        ),
-                        basic_block_count: 1,
-                    },
-                },
-                interproc: r2engine::EngineInterprocSummaryJsonInput {
-                    callsite_count: 0,
-                    iterations: 0,
-                    max_iterations: 0,
-                    converged: true,
-                    summary: None,
-                    scope_report: None,
-                    symbolic_scope: None,
-                },
-            },
-        );
-        let value = serde_json::to_value(payload).expect("payload should serialize");
         assert_eq!(
-            value["signature"].as_str(),
-            Some("void fcn.401000 (int32_t status)"),
-            "expected semantic fallback to preserve typed signature: {value:?}"
+            artifact.granularity,
+            r2sym::ArtifactGranularity::SummaryOnly
         );
-        let Some(items) = value["assumptions"]["items"].as_array() else {
-            panic!("expected serialized assumptions, got {value:?}");
-        };
-        assert_eq!(
-            items.len(),
-            1,
-            "expected one serialized assumption: {value:?}"
-        );
-        assert_eq!(
-            items[0]["subject"]["register"]["name"].as_str(),
-            Some("rdi"),
-            "expected register assumption to survive fallback payload: {value:?}"
-        );
-        let Some(warnings) = value["diagnostics"]["warnings"].as_array() else {
-            panic!("expected serialized fallback diagnostics warnings, got {value:?}");
-        };
-        assert!(
-            warnings.iter().any(|warning| warning.as_str().is_some_and(
-                |warning| warning.contains("semantic fallback: worker slice in residual mode")
-            )),
-            "expected semantic fallback warning to survive payload serialization: {value:?}"
-        );
+        assert_eq!(cfg_risk.block_count, 200);
     }
 
     #[test]
@@ -6631,8 +6489,8 @@ mod tests {
         });
         summary.callsite_count = 1;
         assert!(
-            r2sym::compile_named_native_worker_summary_artifact(&summary, true).is_none(),
-            "name-owned diagnostic roles must not materialize typed fallback artifacts"
+            r2sym::compile_named_native_worker_summary_report(&summary, true).is_none(),
+            "name-owned diagnostic roles must not materialize advisory fallback reports"
         );
     }
 
@@ -6644,476 +6502,18 @@ mod tests {
         );
         summary.callsite_count = 1;
         assert!(
-            r2sym::compile_named_native_worker_summary_artifact(&summary, true).is_none(),
-            "name-owned quoting roles must not materialize artifacts that could override context"
+            r2sym::compile_named_native_worker_summary_report(&summary, true).is_none(),
+            "name-owned quoting roles must not materialize reports that could override context"
         );
     }
 
     #[test]
-    fn mutation_plan_materializes_session_writeback_kinds() {
-        let signature_spec = r2types::FunctionSignatureSpec {
-            ret_type: Some(r2types::CTypeLike::Int {
-                bits: 32,
-                signedness: r2types::Signedness::Signed,
-            }),
-            params: vec![r2types::FunctionParamSpec {
-                name: "a".to_string(),
-                ty: Some(r2types::CTypeLike::Int {
-                    bits: 32,
-                    signedness: r2types::Signedness::Signed,
-                }),
-            }],
-        };
-        let signature_certificate = r2types::SignatureCertificate::from_signature(
-            &signature_spec,
-            [r2types::SignatureCertificateSource::ExternalContext],
-        )
-        .expect("external signature should be certifiable");
-        let function_facts = r2types::FunctionFacts::new(
-            r2types::FunctionTypeFacts {
-                merged_signature: Some(signature_spec),
-                signature_certificate: Some(signature_certificate),
-                ..r2types::FunctionTypeFacts::default()
-            },
-            None,
-        );
-        let plan = r2types::TypeWritebackPlan {
-            signature: r2types::InferredSignature {
-                function_name: "dbg.sum".to_string(),
-                signature: "int32_t dbg.sum(int32_t a);".to_string(),
-                ret_type: "int32_t".to_string(),
-                params: vec![r2types::InferredSignatureParam {
-                    name: "a".to_string(),
-                    param_type: "int32_t".to_string(),
-                }],
-                callconv: "amd64".to_string(),
-                arch: "x86-64".to_string(),
-                confidence: 96,
-                callconv_confidence: 90,
-            },
-            var_type_candidates: vec![r2types::VarTypeCandidate {
-                name: "var_8h".to_string(),
-                kind: "b".to_string(),
-                delta: -8,
-                var_type: "int32_t".to_string(),
-                isarg: false,
-                reg: None,
-                size: 4,
-                confidence: 95,
-                source: r2types::WritebackSource::ExternalTypeDb,
-                evidence: vec![r2types::WritebackEvidence::ExternalStackAnnotation],
-            }],
-            var_rename_candidates: vec![r2types::VarRenameCandidate {
-                name: "arg1".to_string(),
-                target_name: "a".to_string(),
-                confidence: 96,
-                source: r2types::WritebackSource::ExistingState,
-                evidence: vec![r2types::WritebackEvidence::ExternalParamName],
-            }],
-            struct_decls: Vec::new(),
-            global_type_links: Vec::new(),
-            diagnostics: r2types::TypeWritebackDiagnostics::default(),
-        };
-
-        let mutation_plan = r2types::type_writeback_mutation_plan(
-            &plan,
-            TypeOutputBudget::new(usize::MAX, usize::MAX, usize::MAX),
-            function_facts.type_facts(),
-        );
-        let kinds = mutation_plan
-            .mutations
-            .iter()
-            .map(|mutation| mutation.kind.as_str())
-            .collect::<Vec<_>>();
-
-        assert_eq!(
-            kinds,
-            vec!["signature", "callconv", "var", "var_type", "var_rename"]
-        );
-        assert_eq!(
-            mutation_plan.mutations[0].signature.as_deref(),
-            Some("int32_t dbg.sum(int32_t a);")
-        );
-        assert_eq!(
-            mutation_plan.mutations[3].type_name.as_deref(),
-            Some("int32_t")
-        );
-        assert_eq!(mutation_plan.mutations[4].old_name.as_deref(), Some("arg1"));
-
-        let payload = writeback_plan_json(
-            plan,
-            InterprocSummaryJson {
-                callsite_count: 0,
-                iterations: 1,
-                max_iterations: 1,
-                converged: true,
-                summary: None,
-                summary_json: None,
-                scope: None,
-            },
-            &function_facts,
-            None,
-            None,
-            TypeOutputBudget::new(64, usize::MAX, usize::MAX),
-            1,
-        );
-        assert!(payload.signature_writeback_authorized);
-        assert!(payload.signature_render_authorized);
-        assert_eq!(payload.signature_writeback_refusal, None);
-        assert_eq!(
-            payload.signature_certificate_sources,
-            vec!["external_context".to_string()]
-        );
-    }
-
-    #[test]
-    fn local_only_signature_certificate_is_not_writeback_authority() {
-        let signature_spec = r2types::FunctionSignatureSpec {
-            ret_type: Some(r2types::CTypeLike::Int {
-                bits: 32,
-                signedness: r2types::Signedness::Signed,
-            }),
-            params: vec![r2types::FunctionParamSpec {
-                name: "value".to_string(),
-                ty: Some(r2types::CTypeLike::Int {
-                    bits: 32,
-                    signedness: r2types::Signedness::Signed,
-                }),
-            }],
-        };
-        let signature_certificate = r2types::SignatureCertificate::from_signature(
-            &signature_spec,
-            [r2types::SignatureCertificateSource::LocalInference],
-        )
-        .expect("exact local signature should be recorded");
-        let function_facts = r2types::FunctionFacts::new(
-            r2types::FunctionTypeFacts {
-                merged_signature: Some(signature_spec),
-                signature_certificate: Some(signature_certificate),
-                ..r2types::FunctionTypeFacts::default()
-            },
-            None,
-        );
-        let plan = r2types::TypeWritebackPlan {
-            signature: r2types::InferredSignature {
-                function_name: "dbg.local".to_string(),
-                signature: "int32_t dbg.local(int32_t value);".to_string(),
-                ret_type: "int32_t".to_string(),
-                params: vec![r2types::InferredSignatureParam {
-                    name: "value".to_string(),
-                    param_type: "int32_t".to_string(),
-                }],
-                callconv: "amd64".to_string(),
-                arch: "x86-64".to_string(),
-                confidence: 96,
-                callconv_confidence: 90,
-            },
-            var_type_candidates: Vec::new(),
-            var_rename_candidates: Vec::new(),
-            struct_decls: Vec::new(),
-            global_type_links: Vec::new(),
-            diagnostics: r2types::TypeWritebackDiagnostics::default(),
-        };
-
-        let payload = writeback_plan_json(
-            plan,
-            InterprocSummaryJson {
-                callsite_count: 0,
-                iterations: 1,
-                max_iterations: 1,
-                converged: true,
-                summary: None,
-                summary_json: None,
-                scope: None,
-            },
-            &function_facts,
-            None,
-            None,
-            TypeOutputBudget::new(64, usize::MAX, usize::MAX),
-            1,
-        );
-
-        assert!(!payload.signature_writeback_authorized);
-        assert!(payload.signature_render_authorized);
-        assert!(
-            payload
-                .signature_writeback_refusal
-                .as_deref()
-                .is_some_and(|reason| reason.contains("certificate sources are not authoritative"))
-        );
-        assert_eq!(
-            payload.signature_certificate_sources,
-            vec!["local_inference".to_string()]
-        );
-        assert!(payload.mutation_plan.mutations.iter().all(|mutation| {
-            !matches!(
-                mutation.kind,
-                r2types::TypeWritebackMutationKind::Signature
-                    | r2types::TypeWritebackMutationKind::Callconv
-            )
-        }));
-        assert!(payload.mutation_plan.diagnostics.iter().any(|diagnostic| {
-            diagnostic.contains("certificate sources are not authoritative")
-        }));
-    }
-
-    #[test]
-    fn stale_signature_certificate_is_not_writeback_authority() {
-        let current_signature = r2types::FunctionSignatureSpec {
-            ret_type: Some(r2types::CTypeLike::Int {
-                bits: 32,
-                signedness: r2types::Signedness::Signed,
-            }),
-            params: vec![r2types::FunctionParamSpec {
-                name: "value".to_string(),
-                ty: Some(r2types::CTypeLike::Int {
-                    bits: 32,
-                    signedness: r2types::Signedness::Signed,
-                }),
-            }],
-        };
-        let stale_signature = r2types::FunctionSignatureSpec {
-            ret_type: Some(r2types::CTypeLike::Int {
-                bits: 32,
-                signedness: r2types::Signedness::Signed,
-            }),
-            params: vec![r2types::FunctionParamSpec {
-                name: "old_value".to_string(),
-                ty: Some(r2types::CTypeLike::Int {
-                    bits: 64,
-                    signedness: r2types::Signedness::Signed,
-                }),
-            }],
-        };
-        let signature_certificate = r2types::SignatureCertificate::from_signature(
-            &stale_signature,
-            [r2types::SignatureCertificateSource::ExternalContext],
-        )
-        .expect("external signature should be certifiable");
-        let function_facts = r2types::FunctionFacts::new(
-            r2types::FunctionTypeFacts {
-                merged_signature: Some(current_signature),
-                signature_certificate: Some(signature_certificate),
-                ..r2types::FunctionTypeFacts::default()
-            },
-            None,
-        );
-        let plan = r2types::TypeWritebackPlan {
-            signature: r2types::InferredSignature {
-                function_name: "dbg.stale".to_string(),
-                signature: "int32_t dbg.stale(int32_t value);".to_string(),
-                ret_type: "int32_t".to_string(),
-                params: vec![r2types::InferredSignatureParam {
-                    name: "value".to_string(),
-                    param_type: "int32_t".to_string(),
-                }],
-                callconv: "amd64".to_string(),
-                arch: "x86-64".to_string(),
-                confidence: 96,
-                callconv_confidence: 90,
-            },
-            var_type_candidates: Vec::new(),
-            var_rename_candidates: Vec::new(),
-            struct_decls: Vec::new(),
-            global_type_links: Vec::new(),
-            diagnostics: r2types::TypeWritebackDiagnostics::default(),
-        };
-
-        let payload = writeback_plan_json(
-            plan,
-            InterprocSummaryJson {
-                callsite_count: 0,
-                iterations: 1,
-                max_iterations: 1,
-                converged: true,
-                summary: None,
-                summary_json: None,
-                scope: None,
-            },
-            &function_facts,
-            None,
-            None,
-            TypeOutputBudget::new(64, usize::MAX, usize::MAX),
-            1,
-        );
-
-        assert!(!payload.signature_writeback_authorized);
-        assert!(!payload.signature_render_authorized);
-        assert!(
-            payload
-                .signature_writeback_refusal
-                .as_deref()
-                .is_some_and(|reason| reason
-                    .contains("SignatureCertificate does not match current merged signature"))
-        );
-        assert!(payload.mutation_plan.mutations.iter().all(|mutation| {
-            !matches!(
-                mutation.kind,
-                r2types::TypeWritebackMutationKind::Signature
-                    | r2types::TypeWritebackMutationKind::Callconv
-            )
-        }));
-        assert!(
-            payload.mutation_plan.diagnostics.iter().any(|diagnostic| {
-                diagnostic.contains("does not match current merged signature")
-            })
-        );
-    }
-
-    #[test]
-    fn mutation_plan_respects_global_type_link_budget() {
-        let plan = r2types::TypeWritebackPlan {
-            signature: r2types::InferredSignature {
-                function_name: "dbg.links".to_string(),
-                signature: "void dbg.links(void);".to_string(),
-                ret_type: "void".to_string(),
-                params: Vec::new(),
-                callconv: "amd64".to_string(),
-                arch: "x86-64".to_string(),
-                confidence: 96,
-                callconv_confidence: 90,
-            },
-            var_type_candidates: Vec::new(),
-            var_rename_candidates: Vec::new(),
-            struct_decls: Vec::new(),
-            global_type_links: vec![
-                r2types::GlobalTypeLinkCandidate {
-                    addr: 0x404000,
-                    target_type: "struct a *".to_string(),
-                    confidence: 90,
-                    source: r2types::WritebackSource::ExternalTypeDb,
-                },
-                r2types::GlobalTypeLinkCandidate {
-                    addr: 0x404008,
-                    target_type: "struct b *".to_string(),
-                    confidence: 90,
-                    source: r2types::WritebackSource::ExternalTypeDb,
-                },
-            ],
-            diagnostics: r2types::TypeWritebackDiagnostics::default(),
-        };
-
-        let type_facts = r2types::FunctionTypeFacts::default();
-        let limited = r2types::type_writeback_mutation_plan(
-            &plan,
-            TypeOutputBudget::new(1, usize::MAX, usize::MAX),
-            &type_facts,
-        );
-        let all = r2types::type_writeback_mutation_plan(
-            &plan,
-            TypeOutputBudget::new(2, usize::MAX, usize::MAX),
-            &type_facts,
-        );
-
-        assert_eq!(
-            limited
-                .mutations
-                .iter()
-                .filter(|mutation| {
-                    mutation.kind == r2types::TypeWritebackMutationKind::TypeLink
-                })
-                .count(),
-            1
-        );
-        assert_eq!(
-            all.mutations
-                .iter()
-                .filter(|mutation| {
-                    mutation.kind == r2types::TypeWritebackMutationKind::TypeLink
-                })
-                .count(),
-            2
-        );
-        assert!(limited.diagnostics.iter().any(|diagnostic| {
-            diagnostic == "global type-link mutation plan truncated from 2 to 1 item(s)"
-        }));
-    }
-
-    #[test]
-    fn type_output_budget_truncates_declarations_and_budgeted_mutations() {
-        let plan = r2types::TypeWritebackPlan {
-            signature: r2types::InferredSignature {
-                function_name: "dbg.types".to_string(),
-                signature: "void dbg.types(void);".to_string(),
-                ret_type: "void".to_string(),
-                params: Vec::new(),
-                callconv: "amd64".to_string(),
-                arch: "x86-64".to_string(),
-                confidence: 96,
-                callconv_confidence: 90,
-            },
-            var_type_candidates: Vec::new(),
-            var_rename_candidates: Vec::new(),
-            struct_decls: vec![
-                r2types::StructDeclCandidate {
-                    name: "struct a".to_string(),
-                    decl: "typedef struct a { int x; } a;".to_string(),
-                    confidence: 90,
-                    source: r2types::StructDeclSource::ExternalTypeDb,
-                    fields: Vec::new(),
-                },
-                r2types::StructDeclCandidate {
-                    name: "struct b".to_string(),
-                    decl: "typedef struct b { int y; } b;".to_string(),
-                    confidence: 90,
-                    source: r2types::StructDeclSource::ExternalTypeDb,
-                    fields: Vec::new(),
-                },
-            ],
-            global_type_links: Vec::new(),
-            diagnostics: r2types::TypeWritebackDiagnostics::default(),
-        };
-
-        let budget = TypeOutputBudget::new(64, 1, 1);
-        let type_facts = r2types::FunctionTypeFacts::default();
-        let mutation_plan = r2types::type_writeback_mutation_plan(&plan, budget, &type_facts);
-        assert_eq!(
-            mutation_plan
-                .mutations
-                .iter()
-                .filter(|mutation| {
-                    mutation.kind == r2types::TypeWritebackMutationKind::TypeDecl
-                })
-                .count(),
-            1
-        );
-        assert!(mutation_plan.diagnostics.iter().any(|diagnostic| {
-            diagnostic == "type declaration mutation plan truncated from 2 to 1 item(s)"
-        }));
-        let payload = writeback_plan_json(
-            plan,
-            InterprocSummaryJson {
-                callsite_count: 0,
-                iterations: 1,
-                max_iterations: 1,
-                converged: true,
-                summary: None,
-                summary_json: None,
-                scope: None,
-            },
-            &r2types::FunctionFacts::default(),
-            None,
-            None,
-            budget,
-            1,
-        );
-        assert_eq!(payload.struct_decls.len(), 1);
-        assert!(
-            payload.diagnostics.warnings.iter().any(|warning| {
-                warning == "type declaration report truncated from 2 to 1 item(s)"
-            })
-        );
-    }
-
-    #[test]
-    fn semantic_fallback_text_reports_canonical_region_counts() {
-        let compiled = test_large_cfg_semantic_artifact();
-        let output = r2engine::semantic_fallback_comment("_401000", Some(&compiled))
-            .expect("typed semantic fallback comment");
-        assert!(output.contains("semantic fallback: worker slice in residual mode"));
-        assert!(output.contains("regions=1"));
-        assert!(output.contains("actionable_conditions=3"));
-        assert!(output.contains("exact_conditions=3"));
+    fn semantic_report_exposes_canonical_region_counts() {
+        let compiled = test_large_cfg_semantic_report();
+        let native = compiled.native_body().expect("native report");
+        assert_eq!(native.regions.len(), 1);
+        assert_eq!(native.actionable_control_count(), 3);
+        assert_eq!(native.exact_control_count(), 3);
     }
 
     #[test]
@@ -8773,7 +8173,7 @@ mod integration_tests {
 
     #[test]
     #[cfg(feature = "x86")]
-    fn lifted_x86_sum_array_recovers_pointer_and_index_parameters() {
+    fn lifted_x86_sum_array_retains_certified_parameter_home_and_residual() {
         fn decode_hex(bytes: &str) -> Vec<u8> {
             let bytes = bytes.as_bytes();
             bytes
@@ -8808,53 +8208,6 @@ mod integration_tests {
                     .expect("lifted sum_array block")
             })
             .collect::<Vec<_>>();
-        let prepared = r2ssa::SsaArtifact::for_patterns(&blocks, Some(&arch))
-            .expect("pattern SSA for sum_array");
-        let pattern_blocks = prepared.local_ssa_blocks();
-        let params = r2types::recover_signature_params_from_ssa(
-            &pattern_blocks,
-            Some("x86-64"),
-            &std::collections::HashMap::new(),
-            false,
-            64,
-        );
-        let arg0 = params
-            .iter()
-            .find(|param| param.name == "arg0")
-            .expect("rdi array argument");
-        let arg1 = params
-            .iter()
-            .find(|param| param.name == "arg1")
-            .expect("rsi length argument");
-
-        assert!(
-            matches!(arg0.initial_ty, r2types::CTypeLike::Pointer(_)),
-            "array base must be pointer-typed, got params={params:?}, blocks={pattern_blocks:?}"
-        );
-        assert_eq!(
-            r2types::render_signature_type(&arg1.initial_ty, 64),
-            "int32_t"
-        );
-
-        let prepared = std::sync::Arc::new(prepared);
-        let analysis = r2engine::EngineAnalysis {
-            ssa_func: prepared.clone(),
-            pattern_ssa_func: prepared,
-        };
-        let signature =
-            r2engine::infer_signature_from_analysis(r2engine::EngineSignatureInferenceRequest {
-                function_name: "sum_array",
-                arch: Some(&arch),
-                ptr_bits: 64,
-                semantic_metadata_enabled: false,
-                reg_type_hints: &std::collections::HashMap::new(),
-                analysis: &analysis,
-            })
-            .expect("fast-mode signature");
-        assert_eq!(signature.params[0].param_type, "int32_t*");
-        assert_eq!(signature.params[1].param_type, "int32_t");
-        assert_eq!(signature.ret_type, "int32_t");
-
         let host_signature = r2types::FunctionSignatureSpec {
             ret_type: Some(r2types::CTypeLike::Int {
                 bits: 64,
@@ -8900,7 +8253,7 @@ mod integration_tests {
             &["RDI", "RSI"],
             &[(0, -8, 8), (1, -12, 4)],
             &[(-16, 4), (-20, 4)],
-            true,
+            false,
             Vec::new(),
         );
         let response = r2engine::EngineSession::new().decompile_function_from_input(
@@ -9059,8 +8412,10 @@ mod integration_tests {
             0x90, 0x90,
         ];
         let block = r2il_lift(context, bytes.as_ptr(), bytes.len(), 0x1000);
-        let mut metadata = r2il::VarnodeMetadata::default();
-        metadata.scalar_kind = Some(r2il::ScalarKind::UnsignedInt);
+        let metadata = r2il::VarnodeMetadata {
+            scalar_kind: Some(r2il::ScalarKind::UnsignedInt),
+            ..r2il::VarnodeMetadata::default()
+        };
         let block_ref = unsafe { &mut *block };
         let op_index = block_ref
             .ops
@@ -9086,9 +8441,12 @@ mod integration_tests {
 
     #[test]
     #[cfg(feature = "x86")]
-    fn memory_render_preserves_additive_semantics_fields() {
+    fn memory_render_has_one_exact_canonical_schema() {
         let arch = CString::new("x86-64").unwrap();
         let context = r2il_arch_init(arch.as_ptr());
+        unsafe {
+            (*context).arch = None;
+        }
         let mut block = R2ILBlock::new(0x1000, 4);
         block.push_with_metadata(
             R2ILOp::Load {
@@ -9123,31 +8481,191 @@ mod integration_tests {
             .into_owned();
         drop_test_ffi_string(raw);
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
-        let access = parsed.as_array().and_then(|items| items.first()).unwrap();
         assert_eq!(
-            access.get("ordering").and_then(serde_json::Value::as_str),
-            Some("acq_rel")
+            parsed,
+            serde_json::json!([{
+                "schema_version": 1,
+                "type": "load",
+                "size_bytes": 8,
+                "address": {"space": "const", "offset": 0x1000, "size": 8},
+                "ordering": "acq_rel",
+                "atomic_kind": "read_modify_write",
+                "memory_class": "stack",
+                "permissions": {
+                    "read": true,
+                    "write": false,
+                    "execute": false,
+                    "volatile": false,
+                    "cacheable": true
+                },
+                "range": {"start": 0x1000, "end": 0x2000},
+                "bank_id": "bank0",
+                "segment_id": "seg0"
+            }])
         );
+        drop_test_context(context);
+    }
+
+    #[test]
+    #[cfg(feature = "x86")]
+    fn memory_render_covers_every_access_kind_without_legacy_keys() {
+        let arch = CString::new("x86-64").unwrap();
+        let context = r2il_arch_init(arch.as_ptr());
+        let rsp = unsafe {
+            (*context)
+                .arch
+                .as_ref()
+                .and_then(|arch| arch.get_register("RSP"))
+                .cloned()
+                .expect("RSP register")
+        };
+        unsafe {
+            (*context).arch = None;
+        }
+
+        let address = Varnode::constant(0x2000, 8);
+        let mut block = R2ILBlock::new(0x1000, 4);
+        block.push(R2ILOp::Load {
+            dst: Varnode::unique(0x10, 4),
+            space: r2il::SpaceId::Ram,
+            addr: Varnode::register(rsp.offset, rsp.size),
+        });
+        block.push(R2ILOp::LoadLinked {
+            dst: Varnode::unique(0x11, 4),
+            space: r2il::SpaceId::Ram,
+            addr: address.clone(),
+            ordering: r2il::MemoryOrdering::Acquire,
+        });
+        block.push(R2ILOp::Store {
+            space: r2il::SpaceId::Ram,
+            addr: address.clone(),
+            val: Varnode::constant(0x21, 4),
+        });
+        block.push(R2ILOp::StoreConditional {
+            result: Some(Varnode::unique(0x12, 1)),
+            space: r2il::SpaceId::Ram,
+            addr: address.clone(),
+            val: Varnode::constant(0x22, 4),
+            ordering: r2il::MemoryOrdering::Release,
+        });
+        block.push(R2ILOp::AtomicCAS {
+            dst: Varnode::unique(0x13, 4),
+            space: r2il::SpaceId::Ram,
+            addr: address.clone(),
+            expected: Varnode::constant(0x23, 4),
+            replacement: Varnode::constant(0x24, 4),
+            ordering: r2il::MemoryOrdering::SeqCst,
+        });
+        block.push(R2ILOp::LoadGuarded {
+            dst: Varnode::unique(0x14, 4),
+            space: r2il::SpaceId::Ram,
+            addr: address.clone(),
+            guard: Varnode::constant(1, 1),
+            ordering: r2il::MemoryOrdering::Relaxed,
+        });
+        block.push(R2ILOp::StoreGuarded {
+            space: r2il::SpaceId::Ram,
+            addr: address,
+            val: Varnode::constant(0x25, 4),
+            guard: Varnode::constant(1, 1),
+            ordering: r2il::MemoryOrdering::AcqRel,
+        });
+
+        let raw = r2il_block_mem_access(context, &block);
+        assert!(!raw.is_null());
+        let json = unsafe { CStr::from_ptr(raw) }
+            .to_string_lossy()
+            .into_owned();
+        drop_test_ffi_string(raw);
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(
-            access
-                .get("atomic_kind")
-                .and_then(serde_json::Value::as_str),
-            Some("read_modify_write")
+            parsed,
+            serde_json::json!([
+                {
+                    "schema_version": 1,
+                    "type": "load",
+                    "size_bytes": 4,
+                    "address": {
+                        "space": "register",
+                        "offset": rsp.offset,
+                        "size": rsp.size,
+                        "name": "RSP"
+                    },
+                    "stack_address": {"base": "RSP", "offset": 0}
+                },
+                {
+                    "schema_version": 1,
+                    "type": "load_linked",
+                    "size_bytes": 4,
+                    "address": {"space": "const", "offset": 0x2000, "size": 8},
+                    "ordering": "acquire",
+                    "atomic_kind": "load_linked"
+                },
+                {
+                    "schema_version": 1,
+                    "type": "store",
+                    "size_bytes": 4,
+                    "address": {"space": "const", "offset": 0x2000, "size": 8},
+                    "value": {"space": "const", "offset": 0x21, "size": 4}
+                },
+                {
+                    "schema_version": 1,
+                    "type": "store_conditional",
+                    "size_bytes": 4,
+                    "address": {"space": "const", "offset": 0x2000, "size": 8},
+                    "value": {"space": "const", "offset": 0x22, "size": 4},
+                    "result": {"space": "unique", "offset": 0x12, "size": 1},
+                    "ordering": "release",
+                    "atomic_kind": "store_conditional"
+                },
+                {
+                    "schema_version": 1,
+                    "type": "atomic_cas",
+                    "size_bytes": 4,
+                    "address": {"space": "const", "offset": 0x2000, "size": 8},
+                    "expected": {"space": "const", "offset": 0x23, "size": 4},
+                    "replacement": {"space": "const", "offset": 0x24, "size": 4},
+                    "result": {"space": "unique", "offset": 0x13, "size": 4},
+                    "ordering": "seq_cst",
+                    "atomic_kind": "compare_exchange"
+                },
+                {
+                    "schema_version": 1,
+                    "type": "load_guarded",
+                    "size_bytes": 4,
+                    "address": {"space": "const", "offset": 0x2000, "size": 8},
+                    "guard": {"space": "const", "offset": 1, "size": 1},
+                    "guarded": true,
+                    "ordering": "relaxed"
+                },
+                {
+                    "schema_version": 1,
+                    "type": "store_guarded",
+                    "size_bytes": 4,
+                    "address": {"space": "const", "offset": 0x2000, "size": 8},
+                    "value": {"space": "const", "offset": 0x25, "size": 4},
+                    "guard": {"space": "const", "offset": 1, "size": 1},
+                    "guarded": true,
+                    "ordering": "acq_rel"
+                }
+            ])
         );
-        assert_eq!(
-            access.get("bank_id").and_then(serde_json::Value::as_str),
-            Some("bank0")
-        );
-        assert_eq!(
-            access.get("segment_id").and_then(serde_json::Value::as_str),
-            Some("seg0")
-        );
-        assert_eq!(
-            access
-                .get("memory_class")
-                .and_then(serde_json::Value::as_str),
-            Some("stack")
-        );
+        for access in parsed.as_array().expect("memory access array") {
+            for legacy in [
+                "addr",
+                "addr_detail",
+                "size",
+                "write",
+                "stack",
+                "stack_base",
+                "stack_offset",
+            ] {
+                assert!(
+                    access.get(legacy).is_none(),
+                    "canonical memory access retained legacy key {legacy}"
+                );
+            }
+        }
         drop_test_context(context);
     }
 }

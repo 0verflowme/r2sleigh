@@ -18,7 +18,7 @@ warning: r2dec must not synthesize CalleeResolutionFacts from raw call targets; 
 LL |     let _ = CalleeResolutionFacts::identity_for_name_in_context();
    |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-warning: r2dec summary render APIs must derive route permission from FunctionFacts::decompile_route
+warning: r2dec summary render APIs must accept DecompilerInput and derive route permission from its exact source-owned facts
   --> $DIR/lib.rs:36:1
    |
 LL | / pub fn render_semantic_worker_summary(
@@ -32,7 +32,7 @@ LL | | }
    |
    = note: `#[warn(r2dec_summary_render_route_side_channel)]` on by default
 
-warning: r2dec summary render APIs must derive route permission from FunctionFacts::decompile_route
+warning: r2dec summary render APIs must accept DecompilerInput and derive route permission from its exact source-owned facts
   --> $DIR/lib.rs:45:1
    |
 LL | / pub fn render_vm_semantic_summary(

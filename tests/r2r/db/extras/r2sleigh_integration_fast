@@ -146,7 +146,7 @@ EOF_EXPECT
 CMDS=<<EOF_CMDS
 wx 488945f8000000000000000000000000
 s 0 >/dev/null
-a:sla.debug.mem | jq -c 'length>0 and (.[0]|has("addr") and has("size") and has("write")) and ((map(select(.stack==true))|length)>0) and ((map(select(.stack==true and ((.stack_offset|type)=="number")))|length)>0)'
+a:sla.debug.mem | jq -c 'length>0 and (.[0]|.schema_version==1 and has("type") and has("size_bytes") and has("address")) and ((map(select(.stack_address != null))|length)>0) and ((map(select((.stack_address.offset|type)=="number"))|length)>0)'
 EOF_CMDS
 RUN
 
@@ -185,7 +185,7 @@ EOF_EXPECT
 CMDS=<<EOF_CMDS
 s `isq~check_secret[0]` >/dev/null
 af
-a:sla.debug.ssa.func | jq -c 'has("blocks") and has("entry_hex") and (.blocks|type=="array") and ((.blocks|length)>0) and ((.blocks|map(has("phis"))|all)) and (.prepared|has("formal_parameters") and has("parameter_addresses"))'
+a:sla.debug.ssa.func | jq -c --argjson target `?vi $$` --arg target_hex `?v $$` '(.schema_version==1) and (.entry==$target) and (.entry_hex==$target_hex) and has("blocks") and (.blocks|type=="array") and ((.blocks|length)>0) and ((.blocks|map(has("phis"))|all)) and (.prepared|has("formal_parameters") and has("parameter_addresses"))'
 EOF_CMDS
 RUN
 

@@ -113,7 +113,7 @@ impl CertifiedPrivateFramePhi {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CertifiedPrivateFrameVersionDefinition {
-    Store(CertifiedPrivateFrameStore),
+    Store(Box<CertifiedPrivateFrameStore>),
     Phi(CertifiedPrivateFramePhi),
 }
 
@@ -293,10 +293,10 @@ impl ExactMemoryStateReplay<'_> {
             return None;
         }
         for inst_id in &graph_block.insts {
-            if let Some(load) = self.loads.get(inst_id) {
-                if load.version() != current || !self.consumed_loads.insert(*inst_id) {
-                    return None;
-                }
+            if let Some(load) = self.loads.get(inst_id)
+                && (load.version() != current || !self.consumed_loads.insert(*inst_id))
+            {
+                return None;
             }
             if let Some(store) = self.stores.get(inst_id) {
                 if store.previous_version() != current
@@ -413,7 +413,7 @@ fn statement_matches_region(
         && statement.space() == MachineAddressSpace::Ram
         && statement.word_size_bytes() == 1
         && statement.width_bits() != 0
-        && statement.width_bits() % 8 == 0
+        && statement.width_bits().is_multiple_of(8)
         && width_bytes == range.size_bytes()
         && access.id == statement.access()
         && access.id.ordinal == 0
@@ -756,7 +756,7 @@ fn flow_for_load(
         if definitions
             .insert(
                 store.next_version(),
-                CertifiedPrivateFrameVersionDefinition::Store(store.clone()),
+                CertifiedPrivateFrameVersionDefinition::Store(Box::new(store.clone())),
             )
             .is_some()
         {

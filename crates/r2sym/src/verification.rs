@@ -267,6 +267,9 @@ pub fn verify_solve_result<'a, 'ctx, B>(
 where
     B: CandidateReplayBackend<'ctx>,
 {
+    let scope = request
+        .scope
+        .and_then(|scope| scope.exact_for_artifact(request.func));
     let residual_reasons = solve_residual_reasons(request.selected_route, request.stats);
     let evidence = evidence_summary_for_route_and_stats(
         request.selected_route,
@@ -288,7 +291,7 @@ where
         if candidate_has_replayable_assignments {
             replay_backend.replay_candidate(CandidateReplayRequest {
                 func: request.func,
-                scope: request.scope,
+                scope,
                 initial_state: request.validation_initial_state,
                 target_addr: request.target_addr,
                 solution,
