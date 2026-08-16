@@ -865,14 +865,14 @@ impl TrustedSsaArtifact {
             .map(|block| block.block().clone())
             .collect::<Vec<_>>();
         let native_spans = genuine_native_instruction_spans(genuine);
-        let interface = source
-            .function_interface()
-            .cloned()
-            .ok_or(SsaPrepareError::MalformedInput)?;
+        // The machine context already models an absent interface: it becomes an
+        // unavailable, incoherent ABI model, and every consumer filters on
+        // coherence. Refusing here instead would suppress the whole function
+        // for a fact the pipeline is built to carry.
         let machine_context = SourceMachineContext::from_blocks_with_interfaces(
             &blocks,
             Some(&arch),
-            Some(interface),
+            source.function_interface().cloned(),
             Vec::new(),
         );
         let function = SSAFunction::from_blocks_for_decompile_with_interface_and_control(

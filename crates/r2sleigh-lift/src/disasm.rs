@@ -1143,24 +1143,6 @@ impl Disassembler {
                 "trusted profile identity was lost while loading Sleigh".to_string(),
             ));
         }
-        let fields = source.captured_fields();
-        let interface = source.function_interface().ok_or_else(|| {
-            LiftError::Unsupported(
-                "trusted SSA requires an owned exact function interface".to_string(),
-            )
-        })?;
-        if !fields.has_function_interface()
-            || !fields.has_exact_stack_slot_roles()
-            || !fields.has_return_address_storage()
-            || !fields.has_stack_pointer_storage()
-            || !interface.stack_slot_roles_complete()
-            || interface.return_address_storage().is_none()
-            || interface.stack_pointer_storage().is_none()
-        {
-            return Err(LiftError::Unsupported(
-                "owned function interface lacks exact stack/return machine roles".to_string(),
-            ));
-        }
         let trusted_arch = disassembler
             .genuine_authority
             .as_ref()
@@ -1170,15 +1152,26 @@ impl Disassembler {
                     "trusted lift lost its exact architecture authority".to_string(),
                 )
             })?;
-        if fields.has_frame_pointer_storage() != interface.frame_pointer_storage().is_some()
-            || !captured_frame_pointer_storage_matches_arch(interface, trusted_arch)
-            || fields.has_return_mechanism() != interface.return_mechanism().is_some()
-            || !captured_return_mechanism_matches_arch(interface, trusted_arch)
-        {
-            return Err(LiftError::Unsupported(
-                "captured frame/return mechanism conflicts with the exact lifted machine"
-                    .to_string(),
-            ));
+        // Lifting is a function of the machine tuple and the image bytes; the
+        // function interface is evidence about the ABI and is never read below.
+        // An absent interface is therefore a fact about the source, not a lift
+        // failure, and the obligations that depend on it residualize downstream
+        // instead of suppressing the whole function.
+        //
+        // A present interface must still agree with the machine that was
+        // actually lifted, because an interface contradicting the machine is
+        // wrong rather than merely missing. Agreement between the interface and
+        // the captured field flags is already an invariant established when the
+        // snapshot is constructed, so it is not re-checked here.
+        if let Some(interface) = source.function_interface() {
+            if !captured_frame_pointer_storage_matches_arch(interface, trusted_arch)
+                || !captured_return_mechanism_matches_arch(interface, trusted_arch)
+            {
+                return Err(LiftError::Unsupported(
+                    "captured frame/return mechanism conflicts with the exact lifted machine"
+                        .to_string(),
+                ));
+            }
         }
         let mut ranges = Vec::with_capacity(source.image().blocks().len());
         let mut blocks = Vec::with_capacity(source.image().blocks().len());
