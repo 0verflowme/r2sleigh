@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Deref;
 use std::sync::{Arc, OnceLock, RwLock};
 
-use r2il::{ArchSpec, R2ILBlock};
+use r2il::{ArchSpec, R2ILBlock, R2ILOp};
 use r2sleigh_lift::{GenuineLiftedFunction, GenuineLiftedFunctionAuthority, TrustedLiftedFunction};
 use r2source::OwnedFunctionSnapshot;
 use serde::{Deserialize, Serialize};
@@ -27,7 +27,8 @@ use crate::defuse::{BackwardSlice, SliceOpRef, backward_slice_from_op, backward_
 use crate::domtree::DomTree;
 use crate::graph::SsaGraph;
 use crate::machine_context::{
-    SourceCallSiteInterface, SourceFunctionInterface, SourceMachineContext, SourceMachineRoles,
+    SourceCallSiteIdentity, SourceCallSiteInterface, SourceFunctionInterface, SourceMachineContext,
+    SourceMachineRoles,
 };
 use crate::naming::{ARCH_DERIVED_CACHE_MAX_ENTRIES, ArchCacheTag, cached_register_name_map};
 use crate::op::SSAOp;
@@ -851,6 +852,63 @@ impl SsaArtifact {
     }
 }
 
+/// Pair each call prototype the source captured with the lifted call it
+/// describes.
+///
+/// The source captures prototypes keyed by instruction address, because a call
+/// site identity names a block address, an operation index and a target
+/// storage, none of which exist before the function is lifted. Here both are
+/// available, so a prototype is matched to a lifted call only when the
+/// instruction it was recorded against and the target it names both agree with
+/// the machine. A prototype that matches nothing, or matches more than one
+/// call, is dropped rather than guessed at.
+fn correlate_call_site_interfaces(
+    source: &OwnedFunctionSnapshot,
+    blocks: &[R2ILBlock],
+) -> Vec<SourceCallSiteInterface> {
+    let mut interfaces = Vec::new();
+    for call in source.advisory_calls() {
+        let Some(prototype) = call.prototype() else {
+            continue;
+        };
+        let mut matches = blocks.iter().flat_map(|block| {
+            block
+                .ops
+                .iter()
+                .enumerate()
+                .filter_map(move |(op_index, op)| match op {
+                    R2ILOp::Call { target } => {
+                        let instruction = block
+                            .op_metadata(op_index)
+                            .and_then(|metadata| metadata.instruction_addr)?;
+                        let storage = CanonicalStorageId::from_varnode(target);
+                        (instruction == call.instruction_address()
+                            && storage.offset == call.target_address())
+                        .then(|| SourceCallSiteIdentity::new(block.addr, op_index, storage))
+                    }
+                    _ => None,
+                })
+        });
+        let (Some(identity), None) = (matches.next(), matches.next()) else {
+            continue;
+        };
+        let Ok(interface) = SourceCallSiteInterface::new(
+            source.source_revision_identity().to_vec(),
+            identity,
+            true,
+            prototype.calling_convention.clone(),
+            prototype.arguments.iter().copied(),
+            prototype.variadic,
+            prototype.noreturn,
+            prototype.result,
+        ) else {
+            continue;
+        };
+        interfaces.push(interface);
+    }
+    interfaces
+}
+
 impl TrustedSsaArtifact {
     /// Prepare one certifiable SSA artifact from a source-retaining canonical
     /// lift. No detached interface, architecture, layout, or raw block input is
@@ -873,12 +931,13 @@ impl TrustedSsaArtifact {
         // unavailable, incoherent ABI model, and every consumer filters on
         // coherence. Refusing here instead would suppress the whole function
         // for a fact the pipeline is built to carry.
+        let call_site_interfaces = correlate_call_site_interfaces(&source, &blocks);
         let machine_context = SourceMachineContext::from_blocks_with_interfaces(
             &blocks,
             Some(&arch),
             source.function_interface().cloned(),
             *source.machine_roles(),
-            Vec::new(),
+            call_site_interfaces,
         );
         let function = SSAFunction::from_blocks_for_decompile_with_interface_and_control(
             &blocks,

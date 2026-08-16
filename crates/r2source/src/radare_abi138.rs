@@ -1605,8 +1605,8 @@ unsafe fn capture_advisory_calls(
             unsafe { view_fn(snapshot, index, &mut view) },
             "call_site_view",
         )?;
-        let _variadic = wire_bool(view.variadic)?;
-        let _noreturn = wire_bool(view.noreturn)?;
+        let variadic = wire_bool(view.variadic)?;
+        let noreturn = wire_bool(view.noreturn)?;
         let complete = wire_bool(view.complete)?;
         if view.num_arguments > MAX_PARAMETERS
             || view.instruction_addr == INVALID_U64
@@ -1646,16 +1646,19 @@ unsafe fn capture_advisory_calls(
                 budget,
             )
         }?;
-        match view.result_kind {
-            0 | 1 if absent_storage(view.result_storage) && result_storage_name.is_empty() => {}
-            2 if !result_storage_name.is_empty() => {
-                let _ = storage(view.result_storage)?;
+        let result = match view.result_kind {
+            0 | 1 if absent_storage(view.result_storage) && result_storage_name.is_empty() => {
+                SourceCallResult::Void
             }
+            2 if !result_storage_name.is_empty() => SourceCallResult::Register {
+                storage: storage(view.result_storage)?,
+            },
             _ => return Err(RadareAbi138CaptureError::InvalidEnum),
-        }
+        };
         if complete && calling_convention.trim().is_empty() {
             return Err(RadareAbi138CaptureError::InvalidAdvisoryCall);
         }
+        let mut arguments = Vec::with_capacity(view.num_arguments);
         for argument_index in 0..view.num_arguments {
             let mut argument = RadareAbi138ParameterView::default();
             // SAFETY: both indices are bounded by stable parent views.
@@ -1686,13 +1689,31 @@ unsafe fn capture_advisory_calls(
                 if !absent_storage(argument.storage) {
                     return Err(RadareAbi138CaptureError::InvalidAdvisoryCall);
                 }
-            } else {
-                let _ = storage(argument.storage)?;
+                // A site whose argument carriers are not all named cannot
+                // describe its own arguments, so no prototype is kept for it.
+                arguments.clear();
+                break;
             }
+            arguments.push(SourceCallArgumentSpec::new(
+                argument.index,
+                storage(argument.storage)?,
+            ));
         }
+        // Only a site radare2 reported as complete, whose carriers it named in
+        // full, describes what the call takes and returns.
+        let prototype = (complete && arguments.len() == view.num_arguments).then(|| {
+            AdvisoryCallPrototype {
+                calling_convention: calling_convention.clone(),
+                arguments: arguments.into_boxed_slice(),
+                variadic,
+                noreturn,
+                result,
+            }
+        });
         calls.push(AdvisoryCallSite {
             instruction_address: view.instruction_addr,
             target_address: view.target_addr,
+            prototype,
         });
     }
     Ok(calls.into_boxed_slice())

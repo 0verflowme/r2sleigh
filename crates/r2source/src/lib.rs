@@ -283,9 +283,33 @@ impl OwnedFunctionImage {
 pub struct AdvisoryCallSite {
     instruction_address: u64,
     target_address: u64,
+    /// The prototype radare2 recovered for this site. Present only when radare2
+    /// reported the site as complete; absent means it described the call but
+    /// not what it takes or returns.
+    prototype: Option<AdvisoryCallPrototype>,
+}
+
+/// Prototype radare2 recovered for one call site, keyed by address.
+///
+/// This deliberately carries no call-site identity. An identity names a block
+/// address, an operation index and a target storage, which exist only once the
+/// function has been lifted, so the correlation happens there rather than here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdvisoryCallPrototype {
+    pub calling_convention: String,
+    pub arguments: Box<[SourceCallArgumentSpec]>,
+    pub variadic: bool,
+    pub noreturn: bool,
+    pub result: SourceCallResult,
 }
 
 impl AdvisoryCallSite {
+    /// Borrow the prototype radare2 recovered for this site, if it recovered
+    /// one.
+    pub const fn prototype(&self) -> Option<&AdvisoryCallPrototype> {
+        self.prototype.as_ref()
+    }
+
     pub const fn instruction_address(&self) -> u64 {
         self.instruction_address
     }
