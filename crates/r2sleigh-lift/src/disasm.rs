@@ -838,16 +838,6 @@ fn validate_genuine_function_cfg(
 fn typed_genuine_block_successors(
     block: &GenuineLiftedBlock,
 ) -> Result<Vec<(AdvisorySuccessorKind, u64, Option<u64>)>> {
-    if block
-        .block
-        .ops
-        .iter()
-        .any(|op| matches!(op, R2ILOp::Call { .. } | R2ILOp::CallInd { .. }))
-    {
-        return Err(LiftError::Unsupported(
-            "advisory source call metadata cannot establish exact call-site closure".to_string(),
-        ));
-    }
     let fallthrough = block
         .block
         .addr
@@ -874,7 +864,16 @@ fn typed_genuine_block_successors(
         Some(R2ILOp::BranchInd { .. }) => Err(LiftError::Unsupported(
             "advisory source switch metadata cannot close an indirect branch".to_string(),
         )),
-        Some(R2ILOp::Call { .. } | R2ILOp::CallInd { .. }) => unreachable!("calls refused above"),
+        // A call leaves the block by falling through to the next instruction.
+        // Where it goes in between is a property of the callee, not of this
+        // function's control flow, so it contributes no successor of its own.
+        // This matches the machine-side closure check, which has always treated
+        // a call terminator as a fallthrough.
+        Some(R2ILOp::Call { .. } | R2ILOp::CallInd { .. }) => Ok(vec![(
+            AdvisorySuccessorKind::Fallthrough,
+            fallthrough,
+            None,
+        )]),
         None => Ok(vec![(
             AdvisorySuccessorKind::Fallthrough,
             fallthrough,
@@ -888,11 +887,12 @@ fn validate_owned_snapshot_cfg(
     source: &OwnedFunctionSnapshot,
     blocks: &[GenuineLiftedBlock],
 ) -> Result<()> {
-    if !source.advisory_calls().is_empty() {
-        return Err(LiftError::Unsupported(
-            "advisory source calls cannot create trusted call authority".to_string(),
-        ));
-    }
+    // Advisory call sites are diagnostic only: they never granted authority to
+    // anything, and no consumer reads them. Refusing a function because radare2
+    // reported the calls it found rejected more information rather than less,
+    // and it suppressed every function that calls anything. Call boundaries are
+    // certified from machine evidence, and residualize when that evidence is
+    // absent.
     if source.image().blocks().len() != blocks.len() {
         return Err(LiftError::Parse(
             "trusted lift does not cover every owned source block".to_string(),
