@@ -713,6 +713,27 @@ fn constant_control_target(target: &Varnode) -> Option<u64> {
         .then_some(target.offset)
 }
 
+/// True when this control operation decides where the block goes.
+///
+/// A branch whose constant target lands inside the block it belongs to never
+/// leaves it, so it is p-code control flow internal to one instruction rather
+/// than the block's terminator. Sleigh emits these routinely: a conditional
+/// move becomes a conditional branch over the move, targeting the following
+/// instruction.
+fn control_op_leaves_block(op: &R2ILOp, block: &GenuineLiftedBlock) -> bool {
+    let stays_inside = |target: &_| {
+        constant_control_target(target).is_some_and(|addr| {
+            addr > block.block.addr
+                && addr <= block.block.addr.saturating_add(u64::from(block.block.size))
+        })
+    };
+    match op {
+        R2ILOp::Branch { target } => !stays_inside(target),
+        R2ILOp::CBranch { target, .. } => !stays_inside(target),
+        _ => true,
+    }
+}
+
 fn genuine_block_successors(block: &GenuineLiftedBlock) -> Result<Vec<u64>> {
     let fallthrough = block
         .block
@@ -740,15 +761,10 @@ fn genuine_block_successors(block: &GenuineLiftedBlock) -> Result<Vec<u64>> {
         // rest of that instruction's own operations by targeting the next
         // instruction. Such a branch never leaves the block, so it decides no
         // successor and may sit anywhere in it.
-        let target_stays_in_block = |target: &_| {
-            constant_control_target(target).is_some_and(|addr| {
-                addr > block.block.addr
-                    && addr <= block.block.addr.saturating_add(u64::from(block.block.size))
-            })
-        };
         let decides_successors = match op {
-            R2ILOp::Branch { target } => !target_stays_in_block(target),
-            R2ILOp::CBranch { target, .. } => !target_stays_in_block(target),
+            R2ILOp::Branch { .. } | R2ILOp::CBranch { .. } => {
+                control_op_leaves_block(op, block)
+            }
             R2ILOp::Return { .. } => true,
             R2ILOp::BranchInd { .. } => block.block.switch_info.is_some(),
             _ => false,
@@ -765,7 +781,12 @@ fn genuine_block_successors(block: &GenuineLiftedBlock) -> Result<Vec<u64>> {
             ));
         }
     }
-    let control = block.block.ops.iter().rev().find(|op| op.is_control_flow());
+    let control = block
+        .block
+        .ops
+        .iter()
+        .rev()
+        .find(|op| op.is_control_flow() && control_op_leaves_block(op, block));
     match control {
         Some(R2ILOp::Return { .. }) => Ok(Vec::new()),
         Some(R2ILOp::Branch { target }) => constant_control_target(target)
@@ -876,7 +897,12 @@ fn typed_genuine_block_successors(
         .addr
         .checked_add(u64::from(block.block.size))
         .ok_or_else(|| LiftError::Parse("trusted block fallthrough overflows".to_string()))?;
-    let control = block.block.ops.iter().rev().find(|op| op.is_control_flow());
+    let control = block
+        .block
+        .ops
+        .iter()
+        .rev()
+        .find(|op| op.is_control_flow() && control_op_leaves_block(op, block));
     match control {
         Some(R2ILOp::Return { .. }) => Ok(Vec::new()),
         Some(R2ILOp::Branch { target }) => constant_control_target(target)
