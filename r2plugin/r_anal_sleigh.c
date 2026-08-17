@@ -15,6 +15,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "r2sleigh_api_v2.h"
+#include "snapshot_wire.h"
 
 /* Support is decided by the presence of the immutable function-snapshot API and
  * by the transport's own contract, never by radare2's ABI number: that number
@@ -4043,8 +4044,48 @@ static char *sleigh_decompile_execute(RAnal *anal, RAnalFunction *fcn, bool json
 		: NULL;
 }
 
+/* Serializes the snapshot through the flat transport and decodes it back,
+ * reporting what crossed. Gated on an environment variable so the accessor
+ * transport stays the live path while the producer is proven against the parser
+ * that will consume it. */
+static void sleigh_walk_selfcheck(const RAnalFunctionSnapshot *snapshot) {
+	if (!r_sys_getenv ("R2SLEIGH_WALK_SELFCHECK")) {
+		return;
+	}
+	R2SleighWireWriter *writer = r2sleigh_wire_writer_new ();
+	if (!writer) {
+		eprintf ("WALKCHK writer alloc failed\n");
+		return;
+	}
+	if (!r2sleigh_wire_write_snapshot (writer, snapshot)) {
+		eprintf ("WALKCHK walk refused the snapshot\n");
+		r2sleigh_wire_writer_free (writer);
+		return;
+	}
+	size_t len = 0;
+	uint8_t *buffer = r2sleigh_wire_writer_finish (writer, &len);
+	r2sleigh_wire_writer_free (writer);
+	if (!buffer) {
+		eprintf ("WALKCHK finish produced no buffer\n");
+		return;
+	}
+	R2SleighSnapshotWireFactsV2 facts = {0};
+	facts.struct_size = sizeof (facts);
+	uint32_t status = r2sleigh_snapshot_wire_decode_v2 (buffer, len, &facts);
+	if (status == R2SLEIGH_SNAPSHOT_WIRE_DECODE_OK_V2) {
+		eprintf ("WALKCHK ok bytes=%zu entry=0x%" PFMT64x " blocks=%u calls=%u iface=%u params=%u\n",
+			len, (ut64)facts.entry_address, facts.block_count,
+			facts.advisory_call_count, facts.has_function_interface,
+			facts.parameter_count);
+	} else {
+		eprintf ("WALKCHK decode failed status=%u bytes=%zu\n", status, len);
+	}
+	free (buffer);
+}
+
 static RCodeMeta *sleigh_decompile(const RAnalFunctionSnapshot *snapshot) {
 	R_RETURN_VAL_IF_FAIL (snapshot, NULL);
+	sleigh_walk_selfcheck (snapshot);
 	const R2SleighRadareSnapshotInputV2 source = {
 		.struct_size = sizeof (source),
 		.abi_version = R2SLEIGH_RADARE_SNAPSHOT_CONTRACT_V2,

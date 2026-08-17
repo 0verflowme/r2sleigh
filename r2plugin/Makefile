@@ -89,8 +89,8 @@ RUST_BUILD_PREREQS := $(RUST_MANIFESTS) $(RUST_SOURCES)
 all: $(RUST_LIB_LOCAL) $(ANAL_PLUGIN_SO) $(ARCH_PLUGIN_SO)
 
 # Build the analysis plugin shared object
-$(ANAL_PLUGIN_SO): r_anal_sleigh.c $(RUST_BUILD_DIR)/$(RUST_LIB).$(RUST_LIB_EXT)
-	$(CC) $(CFLAGS_SO) -o $@ $< $(LDFLAGS)
+$(ANAL_PLUGIN_SO): r_anal_sleigh.c snapshot_wire.c snapshot_walk.c snapshot_wire.h $(RUST_BUILD_DIR)/$(RUST_LIB).$(RUST_LIB_EXT)
+	$(CC) $(CFLAGS_SO) -o $@ r_anal_sleigh.c snapshot_wire.c snapshot_walk.c $(LDFLAGS)
 ifeq ($(UNAME),Darwin)
 	@for from in "$(RUST_LINK_TARGET)" "@loader_path/$(RUST_LIB).$(RUST_LIB_EXT)"; do \
 		if otool -L $@ | grep -Fq "$$from"; then \
@@ -101,7 +101,13 @@ ifeq ($(UNAME),Darwin)
 endif
 
 # Build the architecture plugin shared object
-ARCH_PLUGIN_OBJS = arch_sleigh.o r_anal_sleigh_arch.o
+ARCH_PLUGIN_OBJS = arch_sleigh.o r_anal_sleigh_arch.o snapshot_wire.o snapshot_walk.o
+
+snapshot_wire.o: snapshot_wire.c snapshot_wire.h
+	$(CC) $(CFLAGS_OBJ) -c -o $@ $<
+
+snapshot_walk.o: snapshot_walk.c snapshot_wire.h
+	$(CC) $(CFLAGS_OBJ) -c -o $@ $<
 
 arch_sleigh.o: arch_sleigh.c
 	$(CC) $(CFLAGS_OBJ) -c -o $@ $<

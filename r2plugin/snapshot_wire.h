@@ -64,4 +64,8 @@ uint8_t *r2sleigh_wire_writer_finish(R2SleighWireWriter *writer, size_t *out_len
  * cannot be read. */
 bool r2sleigh_wire_write_snapshot_prefix(R2SleighWireWriter *writer, const void *snapshot);
 
+/* Serialize one whole borrowed snapshot. The buffer this produces is what
+ * r2sleigh_snapshot_wire_decode_v2 parses, so the two must agree exactly. */
+bool r2sleigh_wire_write_snapshot(R2SleighWireWriter *writer, const void *snapshot);
+
 #endif
