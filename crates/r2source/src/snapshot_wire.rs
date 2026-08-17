@@ -2428,4 +2428,66 @@ mod tests {
         buffer.extend_from_slice(&[0, 0, 0, 0]);
         assert!(decode_snapshot(&buffer).is_err());
     }
+
+    /// The same byte vector the C writer asserts in
+    /// r2plugin/tests/snapshot_wire_conformance.c. Both sides pin it, so a
+    /// change to either writer fails a test rather than producing a buffer the
+    /// other side misreads.
+    #[test]
+    fn the_c_conformance_vector_is_byte_stable() {
+        let mut writer = SnapshotWireWriter::new();
+        writer.u8(0x7f);
+        writer.bool(true);
+        writer.u16(0xbeef);
+        writer.u32(0xdead_beef);
+        writer.u64(0x0123_4567_89ab_cdef);
+        writer.i64(-2);
+        writer.bytes(&[1, 2, 3]).expect("bytes");
+        writer.string("rsp").expect("rsp");
+        writer.string("rsp").expect("rsp again");
+        writer.string("rbp").expect("rbp");
+        writer.optional_string(None).expect("absent");
+        let buffer = writer.finish().expect("finish");
+
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&SNAPSHOT_WIRE_MAGIC.to_le_bytes());
+        expected.extend_from_slice(&SNAPSHOT_WIRE_FORMAT_VERSION.to_le_bytes());
+        expected.extend_from_slice(&2u32.to_le_bytes()); // interned strings
+        expected.extend_from_slice(&14u32.to_le_bytes()); // table bytes
+        expected.extend_from_slice(&47u32.to_le_bytes()); // payload bytes
+        expected.extend_from_slice(&0u32.to_le_bytes()); // reserved
+        expected.extend_from_slice(&3u32.to_le_bytes());
+        expected.extend_from_slice(b"rsp");
+        expected.extend_from_slice(&3u32.to_le_bytes());
+        expected.extend_from_slice(b"rbp");
+        expected.push(0x7f);
+        expected.push(0x01);
+        expected.extend_from_slice(&0xbeefu16.to_le_bytes());
+        expected.extend_from_slice(&0xdead_beefu32.to_le_bytes());
+        expected.extend_from_slice(&0x0123_4567_89ab_cdefu64.to_le_bytes());
+        expected.extend_from_slice(&(-2i64).to_le_bytes());
+        expected.extend_from_slice(&3u32.to_le_bytes());
+        expected.extend_from_slice(&[1, 2, 3]);
+        expected.extend_from_slice(&0u32.to_le_bytes());
+        expected.extend_from_slice(&0u32.to_le_bytes());
+        expected.extend_from_slice(&1u32.to_le_bytes());
+        expected.extend_from_slice(&u32::MAX.to_le_bytes());
+
+        assert_eq!(buffer, expected);
+
+        // and the reader must accept its own writer's vector
+        let mut reader = SnapshotWireReader::new(&buffer).expect("header");
+        assert_eq!(reader.u8().expect("u8"), 0x7f);
+        assert!(reader.bool().expect("bool"));
+        assert_eq!(reader.u16().expect("u16"), 0xbeef);
+        assert_eq!(reader.u32().expect("u32"), 0xdead_beef);
+        assert_eq!(reader.u64().expect("u64"), 0x0123_4567_89ab_cdef);
+        assert_eq!(reader.i64().expect("i64"), -2);
+        assert_eq!(reader.bytes().expect("bytes"), &[1, 2, 3]);
+        assert_eq!(reader.string().expect("rsp"), "rsp");
+        assert_eq!(reader.string().expect("rsp again"), "rsp");
+        assert_eq!(reader.string().expect("rbp"), "rbp");
+        assert_eq!(reader.optional_string().expect("absent"), None);
+        reader.finish().expect("consumed exactly");
+    }
 }

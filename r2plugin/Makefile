@@ -172,6 +172,16 @@ ffi-v2-conformance: $(RUST_BUILD_DIR)/$(RUST_LIB).$(RUST_LIB_EXT) tests/ffi_v2_h
 	$(FFI_V2_CONFORMANCE_BIN)
 	sh tests/ffi_v2_symbol_absence.sh $(RUST_BUILD_DIR)/$(RUST_LIB).$(RUST_LIB_EXT)
 
+SNAPSHOT_WIRE_CONFORMANCE_BIN = $(RUST_BUILD_DIR)/snapshot_wire_conformance
+
+# The C writer must stay byte-identical to r2source::snapshot_wire. Both sides
+# pin the same vector, so drift in either fails a test.
+snapshot-wire-conformance: tests/snapshot_wire_conformance.c snapshot_wire.c snapshot_wire.h
+	@mkdir -p $(RUST_BUILD_DIR)
+	$(CC) -Wall -Wextra -I. -o $(SNAPSHOT_WIRE_CONFORMANCE_BIN) \
+		tests/snapshot_wire_conformance.c snapshot_wire.c
+	$(SNAPSHOT_WIRE_CONFORMANCE_BIN)
+
 # Install plugins
 install: $(RUST_LIB_LOCAL) $(ANAL_PLUGIN_SO) $(ARCH_PLUGIN_SO)
 	@mkdir -p $(R2_PLUGIN_DIR)
