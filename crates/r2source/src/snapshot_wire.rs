@@ -340,7 +340,7 @@ use crate::{
     AdvisoryCallPrototype, AdvisoryCallSite, AdvisorySuccessor, AdvisorySuccessorKind,
     CapturedSourceFields, DiagnosticIdentity,
     FunctionIdentity, FunctionPresentation, MachineProfile, OwnedFunctionBlock,
-    OwnedFunctionImage, SourceEndianness,
+    OwnedFunctionImage, OwnedFunctionSnapshot, SnapshotValidationError, SourceEndianness,
 };
 
 const ENDIAN_LITTLE: u8 = 0;
@@ -1397,6 +1397,103 @@ pub(crate) fn read_interface(
     Ok(interface)
 }
 
+
+/// Serialize one whole snapshot into a single buffer.
+///
+/// This is the producer side of the transport: radare2 writes exactly this and
+/// nothing else crosses the boundary.
+pub fn encode_snapshot(snapshot: &OwnedFunctionSnapshot) -> Result<Vec<u8>, SnapshotWireError> {
+    let mut writer = SnapshotWireWriter::new();
+    write_machine_profile(&mut writer, snapshot.machine())?;
+    write_function_identity(&mut writer, snapshot.function());
+    write_presentation(&mut writer, snapshot.presentation())?;
+    write_image(&mut writer, snapshot.image())?;
+    let calls = u32::try_from(snapshot.advisory_calls().len())
+        .map_err(|_| SnapshotWireError::ValueTooWide)?;
+    writer.u32(calls);
+    for site in snapshot.advisory_calls() {
+        write_call_site(&mut writer, site)?;
+    }
+    writer.bytes(snapshot.source_revision_identity())?;
+    match snapshot.function_interface() {
+        Some(interface) => {
+            writer.bool(true);
+            write_interface(&mut writer, interface)?;
+        }
+        None => writer.bool(false),
+    }
+    write_machine_roles(&mut writer, snapshot.machine_roles());
+    write_captured_fields(&mut writer, snapshot.captured_fields());
+    write_diagnostic_identity(&mut writer, snapshot.diagnostic_identity());
+    writer.finish()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnapshotDecodeError {
+    Wire(SnapshotWireError),
+    /// The decoded parts did not satisfy the snapshot's own validation, so no
+    /// source authority is minted from them.
+    Validation(SnapshotValidationError),
+}
+
+impl std::fmt::Display for SnapshotDecodeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Wire(error) => write!(f, "{error}"),
+            Self::Validation(error) => write!(f, "snapshot validation failed: {error:?}"),
+        }
+    }
+}
+
+impl std::error::Error for SnapshotDecodeError {}
+
+impl From<SnapshotWireError> for SnapshotDecodeError {
+    fn from(error: SnapshotWireError) -> Self {
+        Self::Wire(error)
+    }
+}
+
+/// Parse one whole snapshot from a buffer.
+///
+/// The parts go through `from_captured_parts`, the same private mint the
+/// accessor walk uses, so a buffer cannot assemble source authority the
+/// in-crate constructor would refuse.
+pub fn decode_snapshot(buffer: &[u8]) -> Result<OwnedFunctionSnapshot, SnapshotDecodeError> {
+    let mut reader = SnapshotWireReader::new(buffer)?;
+    let machine = read_machine_profile(&mut reader)?;
+    let function = read_function_identity(&mut reader)?;
+    let presentation = read_presentation(&mut reader)?;
+    let image = read_image(&mut reader)?;
+    let call_count = reader.u32()? as usize;
+    let mut advisory_calls = Vec::with_capacity(call_count.min(4096));
+    for _ in 0..call_count {
+        advisory_calls.push(read_call_site(&mut reader)?);
+    }
+    let source_revision_identity: Box<[u8]> = Box::from(reader.bytes()?);
+    let function_interface = if reader.bool()? {
+        Some(read_interface(&mut reader)?)
+    } else {
+        None
+    };
+    let machine_roles = read_machine_roles(&mut reader)?;
+    let captured_fields = read_captured_fields(&mut reader)?;
+    let diagnostics = read_diagnostic_identity(&mut reader)?;
+    reader.finish()?;
+    OwnedFunctionSnapshot::from_captured_parts(
+        machine,
+        function,
+        presentation,
+        image,
+        advisory_calls.into_boxed_slice(),
+        source_revision_identity,
+        function_interface,
+        machine_roles,
+        captured_fields,
+        diagnostics,
+    )
+    .map_err(SnapshotDecodeError::Validation)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2190,5 +2287,145 @@ mod tests {
         let buffer = writer.finish().expect("finish");
         let mut reader = SnapshotWireReader::new(&buffer).expect("header");
         assert!(read_interface(&mut reader).is_err());
+    }
+
+    fn sample_snapshot(
+        function_interface: Option<SourceFunctionInterface>,
+    ) -> OwnedFunctionSnapshot {
+        let captured_fields = CapturedSourceFields {
+            bounded_function_image: true,
+            function_interface: function_interface.is_some(),
+            exact_function_types: function_interface
+                .as_ref()
+                .is_some_and(|interface| interface.type_graph().is_some()),
+            exact_stack_slot_roles: function_interface
+                .as_ref()
+                .is_some_and(SourceFunctionInterface::stack_slot_roles_complete),
+            return_address_storage: false,
+            stack_pointer_storage: false,
+            frame_pointer_storage: false,
+            return_mechanism: false,
+            stack_allocation_contract: false,
+        };
+        OwnedFunctionSnapshot::from_captured_parts(
+            MachineProfile {
+                arch_id: "x86".into(),
+                cpu_id: "x86-64".into(),
+                bits: 64,
+                endianness: SourceEndianness::Little,
+            },
+            FunctionIdentity { address: 0x1000_07c0 },
+            FunctionPresentation {
+                display_name: "safe_array_access".into(),
+                // presentation names must match the interface's parameter count,
+                // and must be absent entirely when there is no interface
+                parameter_names: match function_interface.as_ref() {
+                    Some(interface) => (0..interface.parameters().len())
+                        .map(|index| Box::<str>::from(format!("arg{index}").as_str()))
+                        .collect::<Vec<_>>()
+                        .into_boxed_slice(),
+                    None => Box::new([]),
+                },
+            },
+            OwnedFunctionImage {
+                entry_address: 0x1000_07c0,
+                blocks: vec![OwnedFunctionBlock {
+                    address: 0x1000_07c0,
+                    bytes: Arc::from(&[0x55u8, 0x48, 0x89, 0xe5, 0x5d, 0xc3][..]),
+                    successors: Box::new([]),
+                    switch_instruction: None,
+                }]
+                .into_boxed_slice(),
+                external_exits: Box::new([]),
+                total_source_bytes: 6,
+            },
+            Box::new([]),
+            vec![0xabu8, 0xcd].into_boxed_slice(),
+            function_interface,
+            SourceMachineRoles::new(None, None).expect("roles"),
+            captured_fields,
+            DiagnosticIdentity(0x1234),
+        )
+        .expect("snapshot")
+    }
+
+    fn assert_same_parts(decoded: &OwnedFunctionSnapshot, original: &OwnedFunctionSnapshot) {
+        assert_eq!(decoded.machine(), original.machine());
+        assert_eq!(decoded.function(), original.function());
+        assert_eq!(decoded.presentation(), original.presentation());
+        assert_eq!(decoded.image(), original.image());
+        assert_eq!(decoded.advisory_calls(), original.advisory_calls());
+        assert_eq!(
+            decoded.source_revision_identity(),
+            original.source_revision_identity()
+        );
+        assert_eq!(decoded.function_interface(), original.function_interface());
+        assert_eq!(decoded.machine_roles(), original.machine_roles());
+        assert_eq!(decoded.captured_fields(), original.captured_fields());
+        assert_eq!(
+            decoded.diagnostic_identity(),
+            original.diagnostic_identity()
+        );
+    }
+
+    #[test]
+    fn a_whole_snapshot_round_trips_part_for_part() {
+        let interface = SourceFunctionInterface::new_exact_with_logical_types(
+            vec![0xabu8, 0xcd],
+            "amd64",
+            vec![
+                SourceAbiParameterSpec::new(0, reg(0x38, 8)),
+                SourceAbiParameterSpec::new(1, reg(0x30, 8)),
+            ],
+            SourceFunctionReturn::Register { storage: reg(0, 8) },
+            Vec::new(),
+            vec![
+                SourceLogicalValue::new(
+                    1,
+                    SourceCarrierProjection::new(SourceCarrierKind::Full, 0, 64),
+                ),
+                SourceLogicalValue::new(
+                    1,
+                    SourceCarrierProjection::new(SourceCarrierKind::Full, 0, 64),
+                ),
+            ],
+            Some(SourceLogicalValue::new(
+                1,
+                SourceCarrierProjection::new(SourceCarrierKind::Full, 0, 64),
+            )),
+            Some(reachable_graph()),
+        )
+        .expect("interface");
+
+        for snapshot in [sample_snapshot(None), sample_snapshot(Some(interface))] {
+            let buffer = encode_snapshot(&snapshot).expect("encode");
+            let decoded = decode_snapshot(&buffer).expect("decode");
+            assert_same_parts(&decoded, &snapshot);
+            // encoding the decoded snapshot must reproduce the same bytes, so
+            // the format has no room for two spellings of one snapshot
+            assert_eq!(encode_snapshot(&decoded).expect("re-encode"), buffer);
+        }
+    }
+
+    #[test]
+    fn a_snapshot_buffer_truncated_anywhere_is_refused() {
+        let snapshot = sample_snapshot(None);
+        let buffer = encode_snapshot(&snapshot).expect("encode");
+        for len in 0..buffer.len() {
+            assert!(
+                decode_snapshot(&buffer[..len]).is_err(),
+                "prefix of {len} bytes must not decode"
+            );
+        }
+    }
+
+    #[test]
+    fn trailing_bytes_after_a_snapshot_are_refused() {
+        let snapshot = sample_snapshot(None);
+        let mut buffer = encode_snapshot(&snapshot).expect("encode");
+        let payload = u32::from_le_bytes([buffer[16], buffer[17], buffer[18], buffer[19]]) + 4;
+        buffer[16..20].copy_from_slice(&payload.to_le_bytes());
+        buffer.extend_from_slice(&[0, 0, 0, 0]);
+        assert!(decode_snapshot(&buffer).is_err());
     }
 }
