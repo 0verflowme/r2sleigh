@@ -197,6 +197,14 @@ typedef struct R2ILBlock R2ILBlock;
 
 #define R2SLEIGH_MAX_STRING_BYTES_V2 (1 << 20)
 
+#define R2SLEIGH_SNAPSHOT_WIRE_DECODE_OK_V2 0
+
+#define R2SLEIGH_SNAPSHOT_WIRE_DECODE_INVALID_ARGUMENT_V2 1
+
+#define R2SLEIGH_SNAPSHOT_WIRE_DECODE_MALFORMED_V2 2
+
+#define R2SLEIGH_SNAPSHOT_WIRE_DECODE_REJECTED_V2 3
+
 /**
  * Opaque owner of one tagged structured analysis result.
  */
@@ -222,6 +230,20 @@ typedef struct R2SleighResponseV2 R2SleighResponseV2;
  * `session_reset_cancellation` is valid only between execute calls.
  */
 typedef struct R2SleighSessionV2 R2SleighSessionV2;
+
+/**
+ * Salient facts a decoded snapshot buffer carries, so a producer can assert it
+ * serialized what it intended rather than only that the bytes parsed.
+ */
+typedef struct R2SleighSnapshotWireFactsV2 {
+  uint32_t struct_size;
+  uint64_t entry_address;
+  uint32_t block_count;
+  uint32_t advisory_call_count;
+  uint32_t parameter_count;
+  uint8_t has_function_interface;
+  uint8_t reserved[3];
+} R2SleighSnapshotWireFactsV2;
 
 typedef struct R2SleighSessionConfigV2 {
   uint32_t abi_version;
@@ -732,6 +754,22 @@ typedef struct R2SleighEngineRequestPayloadV2 {
 #ifdef __cplusplus
 extern "C" {
 #endif // __cplusplus
+
+/**
+ * Decode one flat snapshot buffer and report what it contained.
+ *
+ * This is the boundary's whole input in the flat transport: a producer hands
+ * over one buffer, and this is where it is parsed and validated. It exists
+ * ahead of the producer so a serializer can be checked against the parser that
+ * will actually consume it, rather than against a second hand-written vector.
+ *
+ * # Safety
+ * `buffer` must point to `len` readable bytes, and `out` to one writable
+ * `R2SleighSnapshotWireFactsV2` whose `struct_size` this build agrees with.
+ */
+uint32_t r2sleigh_snapshot_wire_decode_v2(const uint8_t *buffer,
+                                          size_t len,
+                                          struct R2SleighSnapshotWireFactsV2 *out);
 
 /**
  * Return the immutable V2 API table. The table and all callback addresses are

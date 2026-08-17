@@ -3013,6 +3013,77 @@ extern "C" fn planner_query(
     })
 }
 
+/// Salient facts a decoded snapshot buffer carries, so a producer can assert it
+/// serialized what it intended rather than only that the bytes parsed.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct R2SleighSnapshotWireFactsV2 {
+    pub struct_size: u32,
+    pub entry_address: u64,
+    pub block_count: u32,
+    pub advisory_call_count: u32,
+    pub parameter_count: u32,
+    pub has_function_interface: u8,
+    pub reserved: [u8; 3],
+}
+
+pub const R2SLEIGH_SNAPSHOT_WIRE_DECODE_OK_V2: u32 = 0;
+pub const R2SLEIGH_SNAPSHOT_WIRE_DECODE_INVALID_ARGUMENT_V2: u32 = 1;
+pub const R2SLEIGH_SNAPSHOT_WIRE_DECODE_MALFORMED_V2: u32 = 2;
+pub const R2SLEIGH_SNAPSHOT_WIRE_DECODE_REJECTED_V2: u32 = 3;
+
+/// Decode one flat snapshot buffer and report what it contained.
+///
+/// This is the boundary's whole input in the flat transport: a producer hands
+/// over one buffer, and this is where it is parsed and validated. It exists
+/// ahead of the producer so a serializer can be checked against the parser that
+/// will actually consume it, rather than against a second hand-written vector.
+///
+/// # Safety
+/// `buffer` must point to `len` readable bytes, and `out` to one writable
+/// `R2SleighSnapshotWireFactsV2` whose `struct_size` this build agrees with.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn r2sleigh_snapshot_wire_decode_v2(
+    buffer: *const u8,
+    len: usize,
+    out: *mut R2SleighSnapshotWireFactsV2,
+) -> u32 {
+    if buffer.is_null() || out.is_null() || len == 0 {
+        return R2SLEIGH_SNAPSHOT_WIRE_DECODE_INVALID_ARGUMENT_V2;
+    }
+    let expected = size_of::<R2SleighSnapshotWireFactsV2>() as u32;
+    // SAFETY: the caller guarantees `out` is writable.
+    if unsafe { (*out).struct_size } != expected {
+        return R2SLEIGH_SNAPSHOT_WIRE_DECODE_INVALID_ARGUMENT_V2;
+    }
+    // SAFETY: the caller guarantees `len` readable bytes at `buffer`.
+    let bytes = unsafe { std::slice::from_raw_parts(buffer, len) };
+    let snapshot = match r2source::snapshot_wire::decode_snapshot(bytes) {
+        Ok(snapshot) => snapshot,
+        Err(r2source::snapshot_wire::SnapshotDecodeError::Wire(_)) => {
+            return R2SLEIGH_SNAPSHOT_WIRE_DECODE_MALFORMED_V2;
+        }
+        Err(r2source::snapshot_wire::SnapshotDecodeError::Validation(_)) => {
+            // The bytes parsed but the parts did not satisfy the snapshot's own
+            // validation, which is a producer bug rather than a framing one.
+            return R2SLEIGH_SNAPSHOT_WIRE_DECODE_REJECTED_V2;
+        }
+    };
+    let interface = snapshot.function_interface();
+    let facts = R2SleighSnapshotWireFactsV2 {
+        struct_size: expected,
+        entry_address: snapshot.image().entry_address(),
+        block_count: snapshot.image().blocks().len() as u32,
+        advisory_call_count: snapshot.advisory_calls().len() as u32,
+        parameter_count: interface.map_or(0, |interface| interface.parameters().len() as u32),
+        has_function_interface: u8::from(interface.is_some()),
+        reserved: [0; 3],
+    };
+    // SAFETY: the caller guarantees `out` is writable.
+    unsafe { *out = facts };
+    R2SLEIGH_SNAPSHOT_WIRE_DECODE_OK_V2
+}
+
 static API_V2: R2SleighApiV2 = R2SleighApiV2 {
     abi_version: R2SLEIGH_ABI_V2,
     struct_size: size_of::<R2SleighApiV2>() as u32,
