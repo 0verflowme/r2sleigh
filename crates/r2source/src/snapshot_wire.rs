@@ -330,8 +330,10 @@ impl<'a> SnapshotWireReader<'a> {
 
 use crate::contracts::{
     CanonicalStorageId, CanonicalStorageSpace, SourceAbiParameterSpec, SourceCallArgumentSpec,
-    SourceCallResult, SourceCarrierKind, SourceCarrierProjection, SourceFunctionReturn,
-    SourceLogicalValue, SourceMachineRoles,
+    SourceAggregateLayout, SourceAggregateMember, SourceCallResult, SourceCarrierKind,
+    SourceCarrierProjection, SourceFunctionReturn, SourceLogicalValue, SourceMachineRoles,
+    SourceReturnMechanism, SourceStackAllocationContract, SourceStackGrowth, SourceStackSlotRole,
+    SourceStackSlotSpec, SourceType, SourceTypeGraph, SourceTypeKind, StackAddressBase,
 };
 use crate::{
     AdvisoryCallPrototype, AdvisoryCallSite, AdvisorySuccessor, AdvisorySuccessorKind,
@@ -907,6 +909,276 @@ pub(crate) fn read_function_return(
     }
 }
 
+
+const TYPE_SIGNED: u8 = 0;
+const TYPE_UNSIGNED: u8 = 1;
+const TYPE_POINTER: u8 = 2;
+const TYPE_STRUCT: u8 = 3;
+
+pub(crate) fn write_type(writer: &mut SnapshotWireWriter, source_type: &SourceType) {
+    writer.u32(source_type.id());
+    match source_type.kind() {
+        SourceTypeKind::SignedInteger => writer.u8(TYPE_SIGNED),
+        SourceTypeKind::UnsignedInteger => writer.u8(TYPE_UNSIGNED),
+        SourceTypeKind::Pointer { target_type_id } => {
+            writer.u8(TYPE_POINTER);
+            writer.u32(target_type_id);
+        }
+        SourceTypeKind::Struct { aggregate_id } => {
+            writer.u8(TYPE_STRUCT);
+            writer.u32(aggregate_id);
+        }
+    }
+    writer.u64(source_type.size_bits());
+    writer.u64(source_type.align_bits());
+}
+
+pub(crate) fn read_type(
+    reader: &mut SnapshotWireReader<'_>,
+) -> Result<SourceType, SnapshotWireError> {
+    let id = reader.u32()?;
+    let kind = match reader.u8()? {
+        TYPE_SIGNED => SourceTypeKind::SignedInteger,
+        TYPE_UNSIGNED => SourceTypeKind::UnsignedInteger,
+        TYPE_POINTER => SourceTypeKind::Pointer {
+            target_type_id: reader.u32()?,
+        },
+        TYPE_STRUCT => SourceTypeKind::Struct {
+            aggregate_id: reader.u32()?,
+        },
+        // Signedness and indirection are not recoverable from anything else in
+        // the record, so an unknown kind is refused.
+        _ => return Err(SnapshotWireError::ValueTooWide),
+    };
+    let size_bits = reader.u64()?;
+    let align_bits = reader.u64()?;
+    Ok(SourceType::new(id, kind, size_bits, align_bits))
+}
+
+pub(crate) fn write_aggregate_member(
+    writer: &mut SnapshotWireWriter,
+    member: &SourceAggregateMember,
+) -> Result<(), SnapshotWireError> {
+    writer.u32(member.member_id());
+    writer.u32(member.type_id());
+    writer.u64(member.offset_bits());
+    writer.u64(member.size_bits());
+    writer.string(member.name())
+}
+
+pub(crate) fn read_aggregate_member(
+    reader: &mut SnapshotWireReader<'_>,
+) -> Result<SourceAggregateMember, SnapshotWireError> {
+    let member_id = reader.u32()?;
+    let type_id = reader.u32()?;
+    let offset_bits = reader.u64()?;
+    let size_bits = reader.u64()?;
+    let name = reader.string()?.to_string();
+    Ok(SourceAggregateMember::new(
+        member_id, type_id, offset_bits, size_bits, name,
+    ))
+}
+
+pub(crate) fn write_aggregate(
+    writer: &mut SnapshotWireWriter,
+    aggregate: &SourceAggregateLayout,
+) -> Result<(), SnapshotWireError> {
+    writer.u32(aggregate.id());
+    writer.u32(aggregate.type_id());
+    writer.u64(aggregate.size_bits());
+    writer.u64(aggregate.align_bits());
+    writer.string(aggregate.name())?;
+    let count =
+        u32::try_from(aggregate.members().len()).map_err(|_| SnapshotWireError::ValueTooWide)?;
+    writer.u32(count);
+    for member in aggregate.members() {
+        write_aggregate_member(writer, member)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn read_aggregate(
+    reader: &mut SnapshotWireReader<'_>,
+) -> Result<SourceAggregateLayout, SnapshotWireError> {
+    let id = reader.u32()?;
+    let type_id = reader.u32()?;
+    let size_bits = reader.u64()?;
+    let align_bits = reader.u64()?;
+    let name = reader.string()?.to_string();
+    let count = reader.u32()? as usize;
+    let mut members = Vec::with_capacity(count.min(4096));
+    for _ in 0..count {
+        members.push(read_aggregate_member(reader)?);
+    }
+    Ok(SourceAggregateLayout::new(
+        id, type_id, size_bits, align_bits, name, members,
+    ))
+}
+
+pub(crate) fn write_type_graph(
+    writer: &mut SnapshotWireWriter,
+    graph: &SourceTypeGraph,
+) -> Result<(), SnapshotWireError> {
+    let types = u32::try_from(graph.types().len()).map_err(|_| SnapshotWireError::ValueTooWide)?;
+    writer.u32(types);
+    for source_type in graph.types() {
+        write_type(writer, source_type);
+    }
+    let aggregates =
+        u32::try_from(graph.aggregates().len()).map_err(|_| SnapshotWireError::ValueTooWide)?;
+    writer.u32(aggregates);
+    for aggregate in graph.aggregates() {
+        write_aggregate(writer, aggregate)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn read_type_graph(
+    reader: &mut SnapshotWireReader<'_>,
+) -> Result<SourceTypeGraph, SnapshotWireError> {
+    let type_count = reader.u32()? as usize;
+    let mut types = Vec::with_capacity(type_count.min(4096));
+    for _ in 0..type_count {
+        types.push(read_type(reader)?);
+    }
+    let aggregate_count = reader.u32()? as usize;
+    let mut aggregates = Vec::with_capacity(aggregate_count.min(4096));
+    for _ in 0..aggregate_count {
+        aggregates.push(read_aggregate(reader)?);
+    }
+    // new() revalidates dense ids, sizes and member bounds, so a buffer cannot
+    // mint a graph the in-crate constructor would have rejected. Every
+    // downstream projection resolves type identities against this graph, so it
+    // is the last place that may accept something unchecked.
+    SourceTypeGraph::new(types, aggregates).map_err(|_| SnapshotWireError::ValueTooWide)
+}
+
+const GROWTH_LOWER: u8 = 0;
+const GROWTH_HIGHER: u8 = 1;
+
+pub(crate) fn write_stack_allocation(
+    writer: &mut SnapshotWireWriter,
+    contract: &SourceStackAllocationContract,
+) {
+    writer.u8(match contract.growth() {
+        SourceStackGrowth::LowerAddresses => GROWTH_LOWER,
+        SourceStackGrowth::HigherAddresses => GROWTH_HIGHER,
+    });
+    writer.u32(contract.implicit_active_sp_bytes());
+}
+
+pub(crate) fn read_stack_allocation(
+    reader: &mut SnapshotWireReader<'_>,
+) -> Result<SourceStackAllocationContract, SnapshotWireError> {
+    let growth = match reader.u8()? {
+        GROWTH_LOWER => SourceStackGrowth::LowerAddresses,
+        GROWTH_HIGHER => SourceStackGrowth::HigherAddresses,
+        // Growth direction decides which side of the entry SP the callee owns,
+        // so a guess would hand out the wrong interval.
+        _ => return Err(SnapshotWireError::ValueTooWide),
+    };
+    let implicit = reader.u32()?;
+    Ok(SourceStackAllocationContract::with_implicit_active_sp_bytes(
+        growth, implicit,
+    ))
+}
+
+const MECHANISM_STACKED: u8 = 0;
+
+pub(crate) fn write_return_mechanism(
+    writer: &mut SnapshotWireWriter,
+    mechanism: &SourceReturnMechanism,
+) {
+    match mechanism {
+        SourceReturnMechanism::Stacked {
+            stack_offset,
+            slot_size_bytes,
+            stack_pointer_delta_bytes,
+            address_size_bytes,
+        } => {
+            writer.u8(MECHANISM_STACKED);
+            writer.i64(*stack_offset);
+            writer.u32(*slot_size_bytes);
+            writer.u32(*stack_pointer_delta_bytes);
+            writer.u32(*address_size_bytes);
+        }
+    }
+}
+
+pub(crate) fn read_return_mechanism(
+    reader: &mut SnapshotWireReader<'_>,
+) -> Result<SourceReturnMechanism, SnapshotWireError> {
+    match reader.u8()? {
+        MECHANISM_STACKED => Ok(SourceReturnMechanism::Stacked {
+            stack_offset: reader.i64()?,
+            slot_size_bytes: reader.u32()?,
+            stack_pointer_delta_bytes: reader.u32()?,
+            address_size_bytes: reader.u32()?,
+        }),
+        _ => Err(SnapshotWireError::ValueTooWide),
+    }
+}
+
+const BASE_FRAME_POINTER: u8 = 0;
+const BASE_STACK_POINTER: u8 = 1;
+const ROLE_UNCLASSIFIED: u8 = 0;
+const ROLE_LOCAL: u8 = 1;
+const ROLE_PARAMETER_HOME: u8 = 2;
+
+pub(crate) fn write_stack_slot(writer: &mut SnapshotWireWriter, slot: &SourceStackSlotSpec) {
+    writer.u8(match slot.base() {
+        StackAddressBase::FramePointer => BASE_FRAME_POINTER,
+        StackAddressBase::StackPointer => BASE_STACK_POINTER,
+    });
+    write_storage(writer, slot.base_storage());
+    writer.i64(slot.offset());
+    writer.u32(slot.size_bytes());
+    match slot.role() {
+        SourceStackSlotRole::UnclassifiedResource => writer.u8(ROLE_UNCLASSIFIED),
+        SourceStackSlotRole::Local => writer.u8(ROLE_LOCAL),
+        SourceStackSlotRole::ParameterHome {
+            parameter_index,
+            home_storage,
+        } => {
+            writer.u8(ROLE_PARAMETER_HOME);
+            writer.u32(parameter_index);
+            write_storage(writer, home_storage);
+        }
+    }
+}
+
+pub(crate) fn read_stack_slot(
+    reader: &mut SnapshotWireReader<'_>,
+) -> Result<SourceStackSlotSpec, SnapshotWireError> {
+    let base = match reader.u8()? {
+        BASE_FRAME_POINTER => StackAddressBase::FramePointer,
+        BASE_STACK_POINTER => StackAddressBase::StackPointer,
+        _ => return Err(SnapshotWireError::ValueTooWide),
+    };
+    let base_storage = read_storage(reader)?;
+    let offset = reader.i64()?;
+    let size_bytes = reader.u32()?;
+    // Role carries authority: a parameter home is not interchangeable with an
+    // unclassified resource, so each is rebuilt through its own constructor.
+    Ok(match reader.u8()? {
+        ROLE_UNCLASSIFIED => SourceStackSlotSpec::new(base, base_storage, offset, size_bytes),
+        ROLE_LOCAL => SourceStackSlotSpec::new_local(base, base_storage, offset, size_bytes),
+        ROLE_PARAMETER_HOME => {
+            let parameter_index = reader.u32()?;
+            let home_storage = read_storage(reader)?;
+            SourceStackSlotSpec::new_parameter_home(
+                base,
+                base_storage,
+                offset,
+                size_bytes,
+                parameter_index,
+                home_storage,
+            )
+        }
+        _ => return Err(SnapshotWireError::ValueTooWide),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1419,6 +1691,132 @@ mod tests {
             let mut reader = SnapshotWireReader::new(&buffer).expect("header");
             assert_eq!(read_abi_parameter(&mut reader).expect("param"), parameter);
             assert_eq!(read_function_return(&mut reader).expect("return"), kind);
+            reader.finish().expect("consumed exactly");
+        }
+    }
+
+    fn sample_graph() -> SourceTypeGraph {
+        SourceTypeGraph::new(
+            vec![
+                SourceType::new(0, SourceTypeKind::SignedInteger, 32, 32),
+                SourceType::new(1, SourceTypeKind::Pointer { target_type_id: 0 }, 64, 64),
+                SourceType::new(2, SourceTypeKind::Struct { aggregate_id: 0 }, 64, 32),
+            ],
+            vec![SourceAggregateLayout::new(
+                0,
+                2,
+                64,
+                32,
+                "Point".to_string(),
+                vec![
+                    SourceAggregateMember::new(0, 0, 0, 32, "x".to_string()),
+                    SourceAggregateMember::new(1, 0, 32, 32, "y".to_string()),
+                ],
+            )],
+        )
+        .expect("graph")
+    }
+
+    #[test]
+    fn a_type_graph_with_aggregates_round_trips() {
+        let graph = sample_graph();
+        let mut writer = SnapshotWireWriter::new();
+        write_type_graph(&mut writer, &graph).expect("write");
+        let buffer = writer.finish().expect("finish");
+        let mut reader = SnapshotWireReader::new(&buffer).expect("header");
+        assert_eq!(read_type_graph(&mut reader).expect("read"), graph);
+        reader.finish().expect("consumed exactly");
+    }
+
+    #[test]
+    fn a_graph_the_constructor_would_reject_is_refused() {
+        // ids must be dense from zero; this buffer declares one type with id 3
+        let mut writer = SnapshotWireWriter::new();
+        writer.u32(1);
+        write_type(
+            &mut writer,
+            &SourceType::new(3, SourceTypeKind::SignedInteger, 32, 32),
+        );
+        writer.u32(0);
+        let buffer = writer.finish().expect("finish");
+        let mut reader = SnapshotWireReader::new(&buffer).expect("header");
+        assert!(read_type_graph(&mut reader).is_err());
+    }
+
+    #[test]
+    fn an_unknown_type_kind_is_refused() {
+        let mut writer = SnapshotWireWriter::new();
+        writer.u32(0);
+        writer.u8(200);
+        writer.u64(32);
+        writer.u64(32);
+        let buffer = writer.finish().expect("finish");
+        let mut reader = SnapshotWireReader::new(&buffer).expect("header");
+        assert!(read_type(&mut reader).is_err());
+    }
+
+    #[test]
+    fn stack_allocation_and_return_mechanism_round_trip() {
+        for growth in [
+            SourceStackGrowth::LowerAddresses,
+            SourceStackGrowth::HigherAddresses,
+        ] {
+            let contract = SourceStackAllocationContract::with_implicit_active_sp_bytes(growth, 8);
+            let mechanism = SourceReturnMechanism::Stacked {
+                stack_offset: -8,
+                slot_size_bytes: 8,
+                stack_pointer_delta_bytes: 8,
+                address_size_bytes: 8,
+            };
+            let mut writer = SnapshotWireWriter::new();
+            write_stack_allocation(&mut writer, &contract);
+            write_return_mechanism(&mut writer, &mechanism);
+            let buffer = writer.finish().expect("finish");
+            let mut reader = SnapshotWireReader::new(&buffer).expect("header");
+            assert_eq!(read_stack_allocation(&mut reader).expect("contract"), contract);
+            assert_eq!(
+                read_return_mechanism(&mut reader).expect("mechanism"),
+                mechanism
+            );
+            reader.finish().expect("consumed exactly");
+        }
+    }
+
+    #[test]
+    fn an_unknown_growth_direction_is_refused() {
+        let mut writer = SnapshotWireWriter::new();
+        writer.u8(9);
+        writer.u32(0);
+        let buffer = writer.finish().expect("finish");
+        let mut reader = SnapshotWireReader::new(&buffer).expect("header");
+        assert!(read_stack_allocation(&mut reader).is_err());
+    }
+
+    #[test]
+    fn every_stack_slot_role_round_trips() {
+        let storage = CanonicalStorageId {
+            space: CanonicalStorageSpace::Register,
+            offset: 0x30,
+            size: 8,
+        };
+        let slots = [
+            SourceStackSlotSpec::new(StackAddressBase::FramePointer, storage, -16, 8),
+            SourceStackSlotSpec::new_local(StackAddressBase::StackPointer, storage, -8, 4),
+            SourceStackSlotSpec::new_parameter_home(
+                StackAddressBase::FramePointer,
+                storage,
+                -24,
+                8,
+                1,
+                storage,
+            ),
+        ];
+        for slot in slots {
+            let mut writer = SnapshotWireWriter::new();
+            write_stack_slot(&mut writer, &slot);
+            let buffer = writer.finish().expect("finish");
+            let mut reader = SnapshotWireReader::new(&buffer).expect("header");
+            assert_eq!(read_stack_slot(&mut reader).expect("read"), slot);
             reader.finish().expect("consumed exactly");
         }
     }
