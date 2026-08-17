@@ -1080,13 +1080,6 @@ pub fn solve_prepared_interproc_summary_set(
         if function.prepared.machine_context().architecture_family() != root_family {
             return Err(PreparedInterprocSummaryError::ArchitectureMismatch);
         }
-        if !function
-            .prepared
-            .machine_context()
-            .call_site_interfaces_are_coherent()
-        {
-            return Err(PreparedInterprocSummaryError::UnknownOrIncoherentMachineContext);
-        }
         let abi = AbiProfile::from_machine_context(function.prepared.machine_context())
             .ok_or(PreparedInterprocSummaryError::UnknownOrIncoherentMachineContext)?;
         if function.id != root_id {

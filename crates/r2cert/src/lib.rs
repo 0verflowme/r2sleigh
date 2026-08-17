@@ -307,9 +307,6 @@ impl CertifiedMachineContext {
                 && source.abi_model().return_registers().is_empty() => {}
             _ => return Err(MachineBuildError::MachineContextMismatch),
         }
-        if !source.call_site_interfaces_are_coherent() {
-            return Err(MachineBuildError::MachineContextMismatch);
-        }
         for (call_site, identity) in source.raw_call_sites_by_id() {
             if artifact
                 .call_sites()

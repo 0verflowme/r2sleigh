@@ -667,8 +667,6 @@ fn scope_helper_is_source_coherent(
         || root_context.architecture_family() != helper_context.architecture_family()
         || root_context.memory_model() != helper_context.memory_model()
         || root_context.register_storages_by_name() != helper_context.register_storages_by_name()
-        || !root_context.call_site_interfaces_are_coherent()
-        || !helper_context.call_site_interfaces_are_coherent()
     {
         return false;
     }

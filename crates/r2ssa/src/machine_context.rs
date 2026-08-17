@@ -25,7 +25,7 @@ pub use r2source::{
     StackAddressBase,
 };
 
-pub const MACHINE_CONTEXT_SCHEMA_VERSION: u32 = 15;
+pub const MACHINE_CONTEXT_SCHEMA_VERSION: u32 = 16;
 
 /// Canonical architecture family captured from the exact lifting profile.
 ///
@@ -494,7 +494,6 @@ pub struct SourceMachineContext {
     register_storages_by_name: BTreeMap<String, CanonicalStorageId>,
     raw_call_sites_by_id: BTreeMap<CallSiteId, SourceCallSiteIdentity>,
     call_site_interfaces: BTreeMap<SourceCallSiteIdentity, SourceCallSiteInterface>,
-    call_site_interfaces_coherent: bool,
     memory_spaces_by_op: BTreeMap<(u64, usize), SpaceId>,
 }
 
@@ -890,7 +889,6 @@ impl SourceMachineContext {
             });
         let mut call_site_interfaces_by_identity = BTreeMap::new();
         let mut claimed_sites = BTreeSet::new();
-        let mut call_site_interfaces_coherent = true;
         for interface in call_site_interfaces {
             let identity = interface.identity();
             let site = (identity.block_addr(), identity.op_index());
@@ -907,16 +905,27 @@ impl SourceMachineContext {
                         .values()
                         .any(|actual| *actual == storage)
                 });
+            // A call site the source described badly says nothing about the
+            // other call sites in this function. Drop the one that does not
+            // hold up and keep the rest, rather than withholding every
+            // interface because one of them was wrong: interfaces are already
+            // stored per identity, so there is nothing shared to protect.
             if interface.schema_version() != SOURCE_CALL_SITE_INTERFACE_SCHEMA_VERSION
                 || expected_call_site_revision.as_deref() != Some(interface.revision_identity())
                 || !raw_call_sites.contains(&identity)
                 || !claimed_sites.insert(site)
                 || !carriers_exist
-                || call_site_interfaces_by_identity
-                    .insert(identity, interface)
-                    .is_some()
             {
-                call_site_interfaces_coherent = false;
+                call_site_interfaces_by_identity.remove(&identity);
+                continue;
+            }
+            if call_site_interfaces_by_identity
+                .insert(identity, interface)
+                .is_some()
+            {
+                // Two interfaces claiming one identity leave no way to tell
+                // which describes the call, so neither is kept.
+                call_site_interfaces_by_identity.remove(&identity);
             }
         }
         let memory_spaces_by_op = blocks
@@ -941,7 +950,6 @@ impl SourceMachineContext {
             register_storages_by_name,
             raw_call_sites_by_id,
             call_site_interfaces: call_site_interfaces_by_identity,
-            call_site_interfaces_coherent,
             memory_spaces_by_op,
         }
     }
@@ -1025,14 +1033,7 @@ impl SourceMachineContext {
         &self.call_site_interfaces
     }
 
-    pub const fn call_site_interfaces_are_coherent(&self) -> bool {
-        self.call_site_interfaces_coherent
-    }
-
     pub fn call_site_interface(&self, call_site: CallSiteId) -> Option<&SourceCallSiteInterface> {
-        if !self.call_site_interfaces_coherent {
-            return None;
-        }
         self.raw_call_site_identity(call_site)
             .and_then(|identity| self.call_site_interfaces.get(&identity))
     }
@@ -1117,7 +1118,6 @@ impl SourceMachineContext {
             writer.u32(call_site.0);
             write_call_identity(&mut writer, *identity);
         }
-        writer.bool(self.call_site_interfaces_coherent);
         writer.usize(self.call_site_interfaces.len());
         for interface in self.call_site_interfaces.values() {
             write_call_site_interface(&mut writer, interface);
@@ -1298,8 +1298,8 @@ mod tests {
         let x86_context = SourceMachineContext::from_blocks(&[], Some(&x86));
         let arm_context = SourceMachineContext::from_blocks(&[], Some(&arm));
 
-        assert_eq!(MACHINE_CONTEXT_SCHEMA_VERSION, 15);
-        assert_eq!(x86_context.schema_version(), 15);
+        assert_eq!(MACHINE_CONTEXT_SCHEMA_VERSION, 16);
+        assert_eq!(x86_context.schema_version(), 16);
         assert_eq!(
             x86_context.architecture_family(),
             MachineArchitectureFamily::X86_64

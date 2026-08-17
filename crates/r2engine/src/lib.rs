@@ -8012,7 +8012,6 @@ mod tests {
             context.abi_model().is_coherent(),
             "authoritative source context must remain coherent: {context:#?}"
         );
-        assert!(context.call_site_interfaces_are_coherent());
         assert_eq!(context.call_site_interfaces().len(), 1);
         assert!(
             response

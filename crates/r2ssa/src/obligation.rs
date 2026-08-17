@@ -1813,11 +1813,6 @@ mod tests {
         .expect("duplicate interface artifact");
         assert!(
             !duplicate
-                .machine_context()
-                .call_site_interfaces_are_coherent()
-        );
-        assert!(
-            !duplicate
                 .facts()
                 .boundaries
                 .calls
@@ -1848,11 +1843,6 @@ mod tests {
         .expect("wrong target artifact");
         assert!(
             !wrong_target_artifact
-                .machine_context()
-                .call_site_interfaces_are_coherent()
-        );
-        assert!(
-            !wrong_target_artifact
                 .facts()
                 .boundaries
                 .calls
@@ -1877,11 +1867,6 @@ mod tests {
             vec![missing_carrier],
         )
         .expect("missing carrier artifact");
-        assert!(
-            !missing_carrier_artifact
-                .machine_context()
-                .call_site_interfaces_are_coherent()
-        );
         assert!(
             !missing_carrier_artifact
                 .facts()
@@ -1958,11 +1943,6 @@ mod tests {
             vec![mismatched_call],
         )
         .expect("revision mismatch artifact");
-        assert!(
-            !mismatched
-                .machine_context()
-                .call_site_interfaces_are_coherent()
-        );
         assert!(
             !mismatched
                 .facts()
