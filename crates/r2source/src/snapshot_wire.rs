@@ -318,6 +318,83 @@ impl<'a> SnapshotWireReader<'a> {
     }
 }
 
+
+// ---------------------------------------------------------------------------
+// Record layouts
+//
+// Each part of a snapshot gets one encode/decode pair here. Decoding rebuilds
+// the same in-crate value the accessor walk produced, so the parser is a drop-in
+// replacement for that pass rather than a second, parallel representation.
+// ---------------------------------------------------------------------------
+
+use crate::{DiagnosticIdentity, FunctionIdentity, MachineProfile, SourceEndianness};
+
+const ENDIAN_LITTLE: u8 = 0;
+const ENDIAN_BIG: u8 = 1;
+
+pub(crate) fn write_machine_profile(
+    writer: &mut SnapshotWireWriter,
+    profile: &MachineProfile,
+) -> Result<(), SnapshotWireError> {
+    writer.string(profile.arch_id())?;
+    writer.string(profile.cpu_id())?;
+    writer.u32(profile.bits());
+    writer.u8(match profile.endianness() {
+        SourceEndianness::Little => ENDIAN_LITTLE,
+        SourceEndianness::Big => ENDIAN_BIG,
+    });
+    Ok(())
+}
+
+pub(crate) fn read_machine_profile(
+    reader: &mut SnapshotWireReader<'_>,
+) -> Result<MachineProfile, SnapshotWireError> {
+    let arch_id = reader.string()?;
+    let cpu_id = reader.string()?;
+    let bits = reader.u32()?;
+    let endianness = match reader.u8()? {
+        ENDIAN_LITTLE => SourceEndianness::Little,
+        ENDIAN_BIG => SourceEndianness::Big,
+        // An unrecognized discriminant is refused rather than defaulted: a
+        // guessed byte order would silently reinterpret every value.
+        _ => return Err(SnapshotWireError::ValueTooWide),
+    };
+    Ok(MachineProfile {
+        arch_id: arch_id.into(),
+        cpu_id: cpu_id.into(),
+        bits,
+        endianness,
+    })
+}
+
+pub(crate) fn write_function_identity(
+    writer: &mut SnapshotWireWriter,
+    identity: &FunctionIdentity,
+) {
+    writer.u64(identity.address());
+}
+
+pub(crate) fn read_function_identity(
+    reader: &mut SnapshotWireReader<'_>,
+) -> Result<FunctionIdentity, SnapshotWireError> {
+    Ok(FunctionIdentity {
+        address: reader.u64()?,
+    })
+}
+
+pub(crate) fn write_diagnostic_identity(
+    writer: &mut SnapshotWireWriter,
+    identity: DiagnosticIdentity,
+) {
+    writer.u64(identity.value());
+}
+
+pub(crate) fn read_diagnostic_identity(
+    reader: &mut SnapshotWireReader<'_>,
+) -> Result<DiagnosticIdentity, SnapshotWireError> {
+    Ok(DiagnosticIdentity(reader.u64()?))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -446,5 +523,52 @@ mod tests {
             reader.u32(),
             Err(SnapshotWireError::PayloadTruncated)
         ));
+    }
+
+    #[test]
+    fn machine_profile_round_trips_both_byte_orders() {
+        for endianness in [SourceEndianness::Little, SourceEndianness::Big] {
+            let profile = MachineProfile {
+                arch_id: "x86".into(),
+                cpu_id: "x86-64".into(),
+                bits: 64,
+                endianness,
+            };
+            let mut writer = SnapshotWireWriter::new();
+            write_machine_profile(&mut writer, &profile).expect("write");
+            let buffer = writer.finish().expect("finish");
+            let mut reader = SnapshotWireReader::new(&buffer).expect("header");
+            assert_eq!(read_machine_profile(&mut reader).expect("read"), profile);
+            reader.finish().expect("consumed exactly");
+        }
+    }
+
+    #[test]
+    fn an_unknown_byte_order_is_refused_not_defaulted() {
+        let mut writer = SnapshotWireWriter::new();
+        writer.string("x86").expect("arch");
+        writer.string("x86-64").expect("cpu");
+        writer.u32(64);
+        writer.u8(9);
+        let buffer = writer.finish().expect("finish");
+        let mut reader = SnapshotWireReader::new(&buffer).expect("header");
+        assert!(read_machine_profile(&mut reader).is_err());
+    }
+
+    #[test]
+    fn identities_round_trip() {
+        let function = FunctionIdentity { address: 0x1000_07c0 };
+        let diagnostic = DiagnosticIdentity(0xfeed_face_dead_beef);
+        let mut writer = SnapshotWireWriter::new();
+        write_function_identity(&mut writer, &function);
+        write_diagnostic_identity(&mut writer, diagnostic);
+        let buffer = writer.finish().expect("finish");
+        let mut reader = SnapshotWireReader::new(&buffer).expect("header");
+        assert_eq!(read_function_identity(&mut reader).expect("fn"), function);
+        assert_eq!(
+            read_diagnostic_identity(&mut reader).expect("diag"),
+            diagnostic
+        );
+        reader.finish().expect("consumed exactly");
     }
 }
