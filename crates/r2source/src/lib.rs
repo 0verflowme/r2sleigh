@@ -13,6 +13,7 @@ use std::sync::Arc;
 
 mod contracts;
 mod radare_abi138;
+pub mod snapshot_wire;
 
 pub use contracts::*;
 pub use radare_abi138::*;
