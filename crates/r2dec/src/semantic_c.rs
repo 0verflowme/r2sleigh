@@ -2814,7 +2814,12 @@ impl SemanticCExpressionLayer {
                     .iter()
                     .filter_map(|edge| output_producers.get(&edge.value()).copied())
                     .collect::<BTreeSet<_>>();
-                if incoming.len() != phi.incoming().len() || expression.inputs() != &incoming {
+                // An incoming value may have no producer instruction of its
+                // own -- it can enter the function or be a projection of a
+                // wider definition -- and the certified expression omits it
+                // too. Whether such a merge is assignable is decided by the
+                // owning region, not here.
+                if expression.inputs() != &incoming {
                     return Err(SemanticCError::CertifiedSourceMismatch(
                         machine_entity.producer(),
                     ));

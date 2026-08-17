@@ -92,6 +92,9 @@ pub enum GuardedReturnFunctionError {
     MissingFunctionInterface,
     MissingCondition,
     MissingReturnedEntity,
+    /// A merge at the join carries a value on some edge that the region cannot
+    /// assign, because nothing on that edge defines it.
+    UnassignableMerge(CanonicalInstructionId),
     UndefinedValueUse(CanonicalInstructionId),
     UnsupportedMemory(CanonicalInstructionId),
 }
@@ -282,10 +285,10 @@ impl CertifiedGuardedReturnFunction {
                 .incoming_from(arm_addr)
                 .ok_or(GuardedReturnFunctionError::NotGuardedTopology)?;
             let header_binding = defined_binding_for_value(header.body(), header_edge.value())
-                .ok_or(GuardedReturnFunctionError::NotGuardedTopology)?;
+                .ok_or(GuardedReturnFunctionError::UnassignableMerge(phi.producer()))?;
             let arm_binding = defined_binding_for_value(&arm, arm_edge.value())
                 .or_else(|| defined_binding_for_value(header.body(), arm_edge.value()))
-                .ok_or(GuardedReturnFunctionError::NotGuardedTopology)?;
+                .ok_or(GuardedReturnFunctionError::UnassignableMerge(phi.producer()))?;
             merges.push(GuardRegionMerge {
                 binding: *binding,
                 header_binding,
