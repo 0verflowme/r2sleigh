@@ -59,13 +59,13 @@ int main(void) {
 	};
 	R2SleighRadareAccessorsV2 radare_accessors = {
 		.struct_size = sizeof (radare_accessors),
-		.abi_version = R2SLEIGH_RADARE_ABI_V2,
+		.abi_version = R2SLEIGH_RADARE_SNAPSHOT_CONTRACT_V2,
 		.snapshot_schema_version = R2SLEIGH_RADARE_FUNCTION_SNAPSHOT_SCHEMA_V2,
 		.accessor_schema_version = R2SLEIGH_RADARE_SNAPSHOT_ACCESSOR_SCHEMA_V2,
 	};
 	R2SleighRadareSnapshotInputV2 radare_snapshot = {
 		.struct_size = sizeof (radare_snapshot),
-		.abi_version = R2SLEIGH_RADARE_ABI_V2,
+		.abi_version = R2SLEIGH_RADARE_SNAPSHOT_CONTRACT_V2,
 		.snapshot_schema_version = R2SLEIGH_RADARE_FUNCTION_SNAPSHOT_SCHEMA_V2,
 		.accessor_schema_version = R2SLEIGH_RADARE_SNAPSHOT_ACCESSOR_SCHEMA_V2,
 		.accessors = &radare_accessors,
@@ -100,7 +100,7 @@ int main(void) {
 	R2SleighPlannerQueryResponseV2 planner_response = {0};
 	request_payload.radare_snapshot = &radare_snapshot;
 	const R2SleighApiV2 *api = r2sleigh_api_v2 ();
-	if (R2SLEIGH_RADARE_ABI_V2 != 139
+	if (R2SLEIGH_RADARE_SNAPSHOT_CONTRACT_V2 != 1
 		|| R2SLEIGH_RADARE_FUNCTION_SNAPSHOT_SCHEMA_V2 != 12
 		|| R2SLEIGH_RADARE_SNAPSHOT_ACCESSOR_SCHEMA_V2 != 5
 		|| stack_allocation.growth != 1
@@ -122,7 +122,7 @@ int main(void) {
 		|| R2SLEIGH_MAX_FUNCTION_INPUT_BYTES_V2 != (16U << 20)
 		|| !api || api->abi_version != R2SLEIGH_ABI_V2
 		|| api->struct_size != sizeof (*api)
-		|| api->radare_abi_version != R2SLEIGH_RADARE_ABI_V2
+		|| api->radare_snapshot_contract != R2SLEIGH_RADARE_SNAPSHOT_CONTRACT_V2
 		|| api->session_config_size != sizeof (R2SleighSessionConfigV2)
 		|| api->request_size != sizeof (R2SleighRequestV2)
 		|| api->engine_request_payload_size != sizeof (R2SleighEngineRequestPayloadV2)

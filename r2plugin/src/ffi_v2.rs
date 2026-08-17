@@ -31,7 +31,13 @@ pub const R2SLEIGH_CAPABILITIES_V2: u64 = R2SLEIGH_CAP_DECOMPILE_V2
     | R2SLEIGH_CAP_LIFT_CORE_V2
     | R2SLEIGH_CAP_PLANNER_QUERY_V2
     | R2SLEIGH_CAP_OPAQUE_RADARE_SNAPSHOT_V2;
-pub const R2SLEIGH_RADARE_ABI_V2: u32 = 139;
+/// Contract identity for the borrowed radare2 snapshot transport.
+///
+/// Deliberately not radare2's `R2_ABIVERSION`: whether this radare2 supports
+/// r2sleigh is answered by `R2SLEIGH_CAP_OPAQUE_RADARE_SNAPSHOT_V2` together
+/// with the snapshot and accessor schema versions, none of which move when an
+/// unrelated radare2 ABI bump happens.
+pub const R2SLEIGH_RADARE_SNAPSHOT_CONTRACT_V2: u32 = 1;
 pub const R2SLEIGH_RADARE_FUNCTION_SNAPSHOT_SCHEMA_V2: u32 = 13;
 pub const R2SLEIGH_RADARE_SNAPSHOT_ACCESSOR_SCHEMA_V2: u32 = 5;
 
@@ -167,7 +173,7 @@ pub struct R2SleighStringViewV2 {
     pub len: usize,
 }
 
-/// Borrowed opaque radare2 ABI 139 snapshot plus its immutable accessor table.
+/// Borrowed opaque radare2 function snapshot plus its immutable accessor table.
 /// Both pointers are valid only for the duration of one synchronous `execute`
 /// callback. Rust deep-copies the source before returning to the caller.
 #[repr(C)]
@@ -507,7 +513,7 @@ assert_wire_layout!(
     r2source::RadareAbi138StackAllocationContractView
 );
 assert_wire_layout!(R2SleighRadareAccessorsV2, r2source::RadareAbi138Accessors);
-const _: [(); R2SLEIGH_RADARE_ABI_V2 as usize] = [(); r2source::RADARE_ABI_VERSION as usize];
+const _: [(); R2SLEIGH_RADARE_SNAPSHOT_CONTRACT_V2 as usize] = [(); r2source::RADARE_SNAPSHOT_CONTRACT_VERSION as usize];
 const _: [(); R2SLEIGH_RADARE_FUNCTION_SNAPSHOT_SCHEMA_V2 as usize] =
     [(); r2source::RADARE_FUNCTION_SNAPSHOT_SCHEMA_VERSION as usize];
 const _: [(); R2SLEIGH_RADARE_SNAPSHOT_ACCESSOR_SCHEMA_V2 as usize] =
@@ -780,7 +786,7 @@ pub struct R2SleighApiV2 {
     pub abi_version: u32,
     pub struct_size: u32,
     pub capabilities: u64,
-    pub radare_abi_version: u32,
+    pub radare_snapshot_contract: u32,
     pub session_config_size: u32,
     pub request_size: u32,
     pub engine_request_payload_size: u32,
@@ -3011,7 +3017,7 @@ static API_V2: R2SleighApiV2 = R2SleighApiV2 {
     abi_version: R2SLEIGH_ABI_V2,
     struct_size: size_of::<R2SleighApiV2>() as u32,
     capabilities: R2SLEIGH_CAPABILITIES_V2,
-    radare_abi_version: R2SLEIGH_RADARE_ABI_V2,
+    radare_snapshot_contract: R2SLEIGH_RADARE_SNAPSHOT_CONTRACT_V2,
     session_config_size: size_of::<R2SleighSessionConfigV2>() as u32,
     request_size: size_of::<R2SleighRequestV2>() as u32,
     engine_request_payload_size: size_of::<R2SleighEngineRequestPayloadV2>() as u32,
@@ -3973,7 +3979,7 @@ mod tests {
     fn opaque_source_rejects_stale_schema_before_foreign_access() {
         let source = R2SleighRadareSnapshotInputV2 {
             struct_size: u32_size::<R2SleighRadareSnapshotInputV2>(),
-            abi_version: R2SLEIGH_RADARE_ABI_V2,
+            abi_version: R2SLEIGH_RADARE_SNAPSHOT_CONTRACT_V2,
             snapshot_schema_version: R2SLEIGH_RADARE_FUNCTION_SNAPSHOT_SCHEMA_V2 - 1,
             accessor_schema_version: R2SLEIGH_RADARE_SNAPSHOT_ACCESSOR_SCHEMA_V2,
             snapshot: ptr::null(),
@@ -3994,7 +4000,7 @@ mod tests {
     fn opaque_source_rejects_null_handles() {
         let source = R2SleighRadareSnapshotInputV2 {
             struct_size: u32_size::<R2SleighRadareSnapshotInputV2>(),
-            abi_version: R2SLEIGH_RADARE_ABI_V2,
+            abi_version: R2SLEIGH_RADARE_SNAPSHOT_CONTRACT_V2,
             snapshot_schema_version: R2SLEIGH_RADARE_FUNCTION_SNAPSHOT_SCHEMA_V2,
             accessor_schema_version: R2SLEIGH_RADARE_SNAPSHOT_ACCESSOR_SCHEMA_V2,
             snapshot: ptr::null(),
@@ -4015,7 +4021,7 @@ mod tests {
     fn opaque_source_honors_cancellation_before_foreign_access() {
         let source = R2SleighRadareSnapshotInputV2 {
             struct_size: u32_size::<R2SleighRadareSnapshotInputV2>(),
-            abi_version: R2SLEIGH_RADARE_ABI_V2,
+            abi_version: R2SLEIGH_RADARE_SNAPSHOT_CONTRACT_V2,
             snapshot_schema_version: R2SLEIGH_RADARE_FUNCTION_SNAPSHOT_SCHEMA_V2,
             accessor_schema_version: R2SLEIGH_RADARE_SNAPSHOT_ACCESSOR_SCHEMA_V2,
             snapshot: std::ptr::NonNull::<u8>::dangling().as_ptr().cast(),
@@ -4343,7 +4349,10 @@ mod tests {
     fn api_table_reports_rust_layouts() {
         let api = unsafe { &*r2sleigh_api_v2() };
         assert_eq!(api.abi_version, R2SLEIGH_ABI_V2);
-        assert_eq!(api.radare_abi_version, R2SLEIGH_RADARE_ABI_V2);
+        assert_eq!(
+            api.radare_snapshot_contract,
+            R2SLEIGH_RADARE_SNAPSHOT_CONTRACT_V2
+        );
         assert_eq!(R2SLEIGH_RADARE_FUNCTION_SNAPSHOT_SCHEMA_V2, 12);
         assert_eq!(R2SLEIGH_RADARE_SNAPSHOT_ACCESSOR_SCHEMA_V2, 5);
         assert_eq!(api.struct_size as usize, size_of::<R2SleighApiV2>());

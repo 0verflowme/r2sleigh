@@ -8,9 +8,8 @@
 #include <string.h>
 #include "r2sleigh_plugin.h"
 
-#if R2_ABIVERSION != 139
-#error "r2sleigh lift-core V2 requires exactly radare2 ABI 139"
-#endif
+/* Lift-core support is a capability of the loaded r2sleigh library, not a
+ * property of radare2's ABI number. */
 
 static const char *fallback_profile_generic(void) {
 	return "gpr\tpc\t.64\t0\t0\n\
@@ -168,7 +167,7 @@ static char *sleigh_arch_regs(RArchSession *as) {
 	const R2SleighApiV2 *api = r2sleigh_api_v2 ();
 	if (!api || api->abi_version != R2SLEIGH_ABI_V2
 		|| api->struct_size != sizeof (*api)
-		|| api->radare_abi_version != R2_ABIVERSION
+		|| !(api->capabilities & R2SLEIGH_CAP_OPAQUE_RADARE_SNAPSHOT_V2)
 		|| api->byte_view_size != sizeof (R2SleighByteViewV2)
 		|| api->string_view_size != sizeof (R2SleighStringViewV2)
 		|| !(api->capabilities & R2SLEIGH_CAP_LIFT_CORE_V2)

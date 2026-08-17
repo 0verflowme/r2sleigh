@@ -16,11 +16,14 @@
 #include <string.h>
 #include "r2sleigh_api_v2.h"
 
-#if R2_ABIVERSION != 139
-#error "r2sleigh borrowed snapshot transport requires exactly radare2 ABI 139"
+/* Support is decided by the presence of the immutable function-snapshot API and
+ * by the transport's own contract, never by radare2's ABI number: that number
+ * moves for unrelated reasons and pinning it broke this plugin on every bump. */
+#ifndef R_ANAL_FUNCTION_SNAPSHOT_SCHEMA_VERSION
+#error "r2sleigh requires a radare2 exposing the immutable function-snapshot API"
 #endif
-#if R2SLEIGH_RADARE_ABI_V2 != 139
-#error "r2sleigh generated V2 header must target exactly radare2 ABI 139"
+#if R2SLEIGH_RADARE_SNAPSHOT_CONTRACT_V2 != 1
+#error "r2sleigh generated V2 header must target snapshot transport contract 1"
 #endif
 #if R_ANAL_FUNCTION_SNAPSHOT_SCHEMA_VERSION != 13
 #error "r2sleigh borrowed snapshot transport requires function snapshot schema 13"
@@ -606,7 +609,7 @@ static uint8_t sleigh_radare_stack_allocation_contract_view(const void *opaque, 
 
 static const R2SleighRadareAccessorsV2 sleigh_radare_accessors = {
 	.struct_size = sizeof (sleigh_radare_accessors),
-	.abi_version = R2SLEIGH_RADARE_ABI_V2,
+	.abi_version = R2SLEIGH_RADARE_SNAPSHOT_CONTRACT_V2,
 	.snapshot_schema_version = R2SLEIGH_RADARE_FUNCTION_SNAPSHOT_SCHEMA_V2,
 	.accessor_schema_version = R2SLEIGH_RADARE_SNAPSHOT_ACCESSOR_SCHEMA_V2,
 	.snapshot_view = sleigh_radare_snapshot_view,
@@ -731,7 +734,7 @@ static const R2SleighApiV2 *sleigh_lift_api_v2(void) {
 	const R2SleighApiV2 *api = r2sleigh_api_v2 ();
 	if (!api || api->abi_version != R2SLEIGH_ABI_V2
 		|| api->struct_size != sizeof (*api)
-		|| api->radare_abi_version != R2_ABIVERSION
+		|| !(api->capabilities & R2SLEIGH_CAP_OPAQUE_RADARE_SNAPSHOT_V2)
 		|| api->byte_view_size != sizeof (R2SleighByteViewV2)
 		|| api->string_view_size != sizeof (R2SleighStringViewV2)
 		|| api->switch_case_size != sizeof (R2SleighSwitchCaseV2)
@@ -1693,7 +1696,7 @@ static char *sleigh_engine_execute_v2_project(uint32_t kind, uint64_t required_c
 	const R2SleighApiV2 *api = sleigh_lift_api_v2 ();
 	if (!api || api->abi_version != R2SLEIGH_ABI_V2
 		|| api->struct_size != sizeof (*api)
-		|| api->radare_abi_version != R2_ABIVERSION
+		|| !(api->capabilities & R2SLEIGH_CAP_OPAQUE_RADARE_SNAPSHOT_V2)
 		|| api->session_config_size != sizeof (R2SleighSessionConfigV2)
 		|| api->request_size != sizeof (R2SleighRequestV2)
 		|| api->engine_request_payload_size != sizeof (R2SleighEngineRequestPayloadV2)
@@ -4036,7 +4039,7 @@ static char *sleigh_decompile_execute(RAnal *anal, RAnalFunction *fcn, bool json
 	return json_projection
 		? sleigh_engine_v2_error_json ("borrowed_snapshot_required",
 			R2SLEIGH_STATUS_UNSUPPORTED_V2,
-			"decompilation requires the ABI-139 borrowed snapshot provider")
+			"decompilation requires the borrowed snapshot provider")
 		: NULL;
 }
 
@@ -4044,7 +4047,7 @@ static RCodeMeta *sleigh_decompile(const RAnalFunctionSnapshot *snapshot) {
 	R_RETURN_VAL_IF_FAIL (snapshot, NULL);
 	const R2SleighRadareSnapshotInputV2 source = {
 		.struct_size = sizeof (source),
-		.abi_version = R2SLEIGH_RADARE_ABI_V2,
+		.abi_version = R2SLEIGH_RADARE_SNAPSHOT_CONTRACT_V2,
 		.snapshot_schema_version = R2SLEIGH_RADARE_FUNCTION_SNAPSHOT_SCHEMA_V2,
 		.accessor_schema_version = R2SLEIGH_RADARE_SNAPSHOT_ACCESSOR_SCHEMA_V2,
 		.snapshot = snapshot,
@@ -4118,7 +4121,7 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 	if (sleigh_direct_sym_snapshot_required_command (cmd)) {
 		R_LOG_ERROR ("r2sleigh: symbolic execution requires a borrowed function snapshot");
 		if (cons) {
-			r_cons_println (cons, "r2sleigh: symbolic execution requires the ABI-139 borrowed function snapshot provider");
+			r_cons_println (cons, "r2sleigh: symbolic execution requires the borrowed function snapshot provider");
 		}
 		return strdup ("");
 	}

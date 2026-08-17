@@ -12,7 +12,15 @@ use std::sync::Arc;
 
 use super::*;
 
-pub const RADARE_ABI_VERSION: u32 = 139;
+/// Contract identity for the borrowed radare2 function-snapshot transport.
+///
+/// This is r2sleigh's own number, not radare2's ABI version. Pinning the
+/// transport to `R2_ABIVERSION` broke the plugin on every unrelated radare2 ABI
+/// bump even when the snapshot API had not moved; support is instead decided by
+/// the snapshot capability flag and by this contract plus the snapshot and
+/// accessor schema versions, all of which change only when the transport
+/// itself changes.
+pub const RADARE_SNAPSHOT_CONTRACT_VERSION: u32 = 1;
 pub const RADARE_FUNCTION_SNAPSHOT_SCHEMA_VERSION: u32 = 13;
 pub const RADARE_SNAPSHOT_ACCESSOR_SCHEMA_VERSION: u32 = 5;
 
@@ -1747,7 +1755,7 @@ pub unsafe fn capture_radare_abi138(
     if input.struct_size != exact_size::<RadareAbi138SnapshotInput>()? {
         return Err(RadareAbi138CaptureError::InvalidInputSize);
     }
-    if input.abi_version != RADARE_ABI_VERSION
+    if input.abi_version != RADARE_SNAPSHOT_CONTRACT_VERSION
         || input.snapshot_schema_version != RADARE_FUNCTION_SNAPSHOT_SCHEMA_VERSION
         || input.accessor_schema_version != RADARE_SNAPSHOT_ACCESSOR_SCHEMA_VERSION
     {
@@ -1761,7 +1769,7 @@ pub unsafe fn capture_radare_abi138(
     // pointer is never dereferenced again.
     let accessors = unsafe { input.accessors.read() };
     if accessors.struct_size != exact_size::<RadareAbi138Accessors>()?
-        || accessors.abi_version != RADARE_ABI_VERSION
+        || accessors.abi_version != RADARE_SNAPSHOT_CONTRACT_VERSION
         || accessors.snapshot_schema_version != RADARE_FUNCTION_SNAPSHOT_SCHEMA_VERSION
         || accessors.accessor_schema_version != RADARE_SNAPSHOT_ACCESSOR_SCHEMA_VERSION
     {
@@ -2095,7 +2103,7 @@ mod tests {
         RadareAbi138SnapshotInput {
             struct_size: u32::try_from(size_of::<RadareAbi138SnapshotInput>())
                 .expect("ABI input size fits u32"),
-            abi_version: RADARE_ABI_VERSION,
+            abi_version: RADARE_SNAPSHOT_CONTRACT_VERSION,
             snapshot_schema_version: RADARE_FUNCTION_SNAPSHOT_SCHEMA_VERSION,
             accessor_schema_version: RADARE_SNAPSHOT_ACCESSOR_SCHEMA_VERSION,
             snapshot: std::ptr::null(),

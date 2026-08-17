@@ -7182,7 +7182,7 @@ mod tests {
     };
 
     use r2source::{
-        RADARE_ABI_VERSION, RADARE_CAP_EXACT_FRAME_POINTER_STORAGE,
+        RADARE_SNAPSHOT_CONTRACT_VERSION, RADARE_CAP_EXACT_FRAME_POINTER_STORAGE,
         RADARE_CAP_EXACT_FUNCTION_INTERFACE, RADARE_CAP_EXACT_FUNCTION_TYPES,
         RADARE_CAP_EXACT_RETURN_MECHANISM, RADARE_CAP_EXACT_STACK_ALLOCATION_CONTRACT,
         RADARE_CAP_EXACT_STACK_SLOT_ROLES, RADARE_CAP_OWNED_BOUNDED_FUNCTION_IMAGE,
@@ -7946,7 +7946,7 @@ mod tests {
         let accessors = RadareAbi138Accessors {
             struct_size: u32::try_from(size_of::<RadareAbi138Accessors>())
                 .expect("accessor size fits u32"),
-            abi_version: RADARE_ABI_VERSION,
+            abi_version: RADARE_SNAPSHOT_CONTRACT_VERSION,
             snapshot_schema_version: RADARE_FUNCTION_SNAPSHOT_SCHEMA_VERSION,
             accessor_schema_version: RADARE_SNAPSHOT_ACCESSOR_SCHEMA_VERSION,
             snapshot_view: Some(snapshot_view),
@@ -7979,7 +7979,7 @@ mod tests {
         let input = RadareAbi138SnapshotInput {
             struct_size: u32::try_from(size_of::<RadareAbi138SnapshotInput>())
                 .expect("input size fits u32"),
-            abi_version: RADARE_ABI_VERSION,
+            abi_version: RADARE_SNAPSHOT_CONTRACT_VERSION,
             snapshot_schema_version: RADARE_FUNCTION_SNAPSHOT_SCHEMA_VERSION,
             accessor_schema_version: RADARE_SNAPSHOT_ACCESSOR_SCHEMA_VERSION,
             snapshot: (&fixture as *const NativeSpanSnapshotFixture).cast(),
@@ -8142,7 +8142,7 @@ mod tests {
         let accessors = RadareAbi138Accessors {
             struct_size: u32::try_from(size_of::<RadareAbi138Accessors>())
                 .expect("accessor size fits u32"),
-            abi_version: RADARE_ABI_VERSION,
+            abi_version: RADARE_SNAPSHOT_CONTRACT_VERSION,
             snapshot_schema_version: RADARE_FUNCTION_SNAPSHOT_SCHEMA_VERSION,
             accessor_schema_version: RADARE_SNAPSHOT_ACCESSOR_SCHEMA_VERSION,
             snapshot_view: Some(snapshot_view),
@@ -8175,7 +8175,7 @@ mod tests {
         let input = RadareAbi138SnapshotInput {
             struct_size: u32::try_from(size_of::<RadareAbi138SnapshotInput>())
                 .expect("input size fits u32"),
-            abi_version: RADARE_ABI_VERSION,
+            abi_version: RADARE_SNAPSHOT_CONTRACT_VERSION,
             snapshot_schema_version: RADARE_FUNCTION_SNAPSHOT_SCHEMA_VERSION,
             accessor_schema_version: RADARE_SNAPSHOT_ACCESSOR_SCHEMA_VERSION,
             snapshot: (&fixture as *const NativeSpanSnapshotFixture).cast(),

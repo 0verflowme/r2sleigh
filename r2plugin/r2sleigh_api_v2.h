@@ -29,7 +29,15 @@ typedef struct R2ILBlock R2ILBlock;
 
 #define R2SLEIGH_CAPABILITIES_V2 ((((((R2SLEIGH_CAP_DECOMPILE_V2 | R2SLEIGH_CAP_TYPE_FUNCTION_V2) | R2SLEIGH_CAP_RESPONSE_INFO_V2) | R2SLEIGH_CAP_EXECUTION_CONTROL_V2) | R2SLEIGH_CAP_LIFT_CORE_V2) | R2SLEIGH_CAP_PLANNER_QUERY_V2) | R2SLEIGH_CAP_OPAQUE_RADARE_SNAPSHOT_V2)
 
-#define R2SLEIGH_RADARE_ABI_V2 139
+/**
+ * Contract identity for the borrowed radare2 snapshot transport.
+ *
+ * Deliberately not radare2's `R2_ABIVERSION`: whether this radare2 supports
+ * r2sleigh is answered by `R2SLEIGH_CAP_OPAQUE_RADARE_SNAPSHOT_V2` together
+ * with the snapshot and accessor schema versions, none of which move when an
+ * unrelated radare2 ABI bump happens.
+ */
+#define R2SLEIGH_RADARE_SNAPSHOT_CONTRACT_V2 1
 
 #define R2SLEIGH_RADARE_FUNCTION_SNAPSHOT_SCHEMA_V2 13
 
@@ -412,7 +420,7 @@ typedef struct R2SleighApiV2 {
   uint32_t abi_version;
   uint32_t struct_size;
   uint64_t capabilities;
-  uint32_t radare_abi_version;
+  uint32_t radare_snapshot_contract;
   uint32_t session_config_size;
   uint32_t request_size;
   uint32_t engine_request_payload_size;
@@ -692,7 +700,7 @@ typedef struct R2SleighRadareAccessorsV2 {
 } R2SleighRadareAccessorsV2;
 
 /**
- * Borrowed opaque radare2 ABI 139 snapshot plus its immutable accessor table.
+ * Borrowed opaque radare2 function snapshot plus its immutable accessor table.
  * Both pointers are valid only for the duration of one synchronous `execute`
  * callback. Rust deep-copies the source before returning to the caller.
  */
