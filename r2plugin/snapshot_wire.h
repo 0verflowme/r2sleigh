@@ -58,4 +58,10 @@ void r2sleigh_wire_optional_string(R2SleighWireWriter *writer, const char *value
  * partially serialized snapshot can never reach the boundary. */
 uint8_t *r2sleigh_wire_writer_finish(R2SleighWireWriter *writer, size_t *out_len);
 
+/* Serialize the machine profile, function identity and function image of one
+ * borrowed snapshot, in the order r2source::snapshot_wire::encode_snapshot
+ * writes them. Returns false and leaves the writer failed if the snapshot
+ * cannot be read. */
+bool r2sleigh_wire_write_snapshot_prefix(R2SleighWireWriter *writer, const void *snapshot);
+
 #endif
