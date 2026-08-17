@@ -98,6 +98,11 @@ static bool walk_successor(R2SleighWireWriter *writer, const RAnalFunctionSnapsh
 	default:
 		return false;
 	}
+	/* The reference capture refuses a case value on any kind but a labelled
+	 * case, so a stray one is a disagreement rather than something to drop. */
+	if (kind != WALK_SUCCESSOR_SWITCH_CASE && view.case_value != 0) {
+		return false;
+	}
 	r2sleigh_wire_u8 (writer, kind);
 	r2sleigh_wire_u64 (writer, view.target_addr);
 	/* A case value belongs to a labelled case and to nothing else, so presence
@@ -141,13 +146,17 @@ static bool walk_block(R2SleighWireWriter *writer, const RAnalFunctionSnapshot *
 			return false;
 		}
 	}
-	/* radare2 reports no switch as a zero address, which is not a valid
-	 * instruction address inside a block. */
-	if (view.switch_addr) {
+	/* Absence of a switch is UT64_MAX, not zero: zero is a legitimate address
+	 * and treating the sentinel as present made every block claim a dispatch it
+	 * does not have. A present address must also fall inside the block. */
+	if (view.switch_addr == UT64_MAX) {
+		r2sleigh_wire_bool (writer, false);
+	} else {
+		if (view.switch_addr < view.addr || view.switch_addr >= view.addr + view.size) {
+			return false;
+		}
 		r2sleigh_wire_bool (writer, true);
 		r2sleigh_wire_u64 (writer, view.switch_addr);
-	} else {
-		r2sleigh_wire_bool (writer, false);
 	}
 	return true;
 }
@@ -186,8 +195,11 @@ static bool walk_presentation(R2SleighWireWriter *writer,
 	}
 	/* Presentation names exist only alongside an interface, and must match its
 	 * parameter count exactly. Without one the list is absent, not empty-looking. */
+	RAnalFunctionSnapshotView top = {0};
 	RAnalFunctionInterfaceSnapshotView interface = {0};
-	if (!r_anal_function_snapshot_interface_view (snapshot, &interface)) {
+	if (!r_anal_function_snapshot_view (snapshot, &top)
+		|| (top.capabilities & R_ANAL_FUNCTION_SNAPSHOT_CAP_EXACT_FUNCTION_INTERFACE) == 0
+		|| !r_anal_function_snapshot_interface_view (snapshot, &interface)) {
 		r2sleigh_wire_u32 (writer, 0);
 		return true;
 	}
@@ -675,8 +687,14 @@ bool r2sleigh_wire_write_snapshot(R2SleighWireWriter *writer, const void *snapsh
 	}
 	r2sleigh_wire_bytes (writer, revision_bytes, sizeof (revision_bytes));
 
+	/* An interface exists only when radare2 minted exact-interface authority.
+	 * The view answering is not enough: a thunk has a readable view that carries
+	 * no recovered prototype, and treating it as one refuses the whole
+	 * snapshot over a return kind radare2 never determined. */
 	RAnalFunctionInterfaceSnapshotView interface = {0};
-	const bool has_interface = r_anal_function_snapshot_interface_view (source, &interface);
+	const bool has_interface = (top.capabilities
+			& R_ANAL_FUNCTION_SNAPSHOT_CAP_EXACT_FUNCTION_INTERFACE) != 0
+		&& r_anal_function_snapshot_interface_view (source, &interface);
 	r2sleigh_wire_bool (writer, has_interface);
 	if (has_interface && !walk_interface (writer, source, &top, &interface)) {
 		return false;
