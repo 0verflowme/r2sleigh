@@ -1682,13 +1682,20 @@ impl Disassembler {
                 // write instead of becoming an SSA value of a register-like RAM
                 // location, which would leave the effect uninventoried and turn
                 // a later read of the same address into a value phi.
-                if dst.space == SpaceId::Ram {
+                if dst.space == SpaceId::Ram || src.space == SpaceId::Ram {
                     let address_size = u32::try_from(self.default_code_space().address_size)
                         .map_err(|_| LiftError::Parse("default code space address size".into()))?;
-                    return Ok(Some(R2ILOp::Store {
+                    if dst.space == SpaceId::Ram {
+                        return Ok(Some(R2ILOp::Store {
+                            space: SpaceId::Ram,
+                            addr: Varnode::constant(dst.offset, address_size),
+                            val: src,
+                        }));
+                    }
+                    return Ok(Some(R2ILOp::Load {
+                        dst,
                         space: SpaceId::Ram,
-                        addr: Varnode::constant(dst.offset, address_size),
-                        val: src,
+                        addr: Varnode::constant(src.offset, address_size),
                     }));
                 }
                 Ok(Some(R2ILOp::Copy { dst, src }))
