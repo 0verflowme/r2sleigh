@@ -346,7 +346,7 @@ use crate::{
 const ENDIAN_LITTLE: u8 = 0;
 const ENDIAN_BIG: u8 = 1;
 
-pub(crate) fn write_machine_profile(
+pub fn write_machine_profile(
     writer: &mut SnapshotWireWriter,
     profile: &MachineProfile,
 ) -> Result<(), SnapshotWireError> {
@@ -360,7 +360,7 @@ pub(crate) fn write_machine_profile(
     Ok(())
 }
 
-pub(crate) fn read_machine_profile(
+pub fn read_machine_profile(
     reader: &mut SnapshotWireReader<'_>,
 ) -> Result<MachineProfile, SnapshotWireError> {
     let arch_id = reader.string()?;
@@ -381,14 +381,14 @@ pub(crate) fn read_machine_profile(
     })
 }
 
-pub(crate) fn write_function_identity(
+pub fn write_function_identity(
     writer: &mut SnapshotWireWriter,
     identity: &FunctionIdentity,
 ) {
     writer.u64(identity.address());
 }
 
-pub(crate) fn read_function_identity(
+pub fn read_function_identity(
     reader: &mut SnapshotWireReader<'_>,
 ) -> Result<FunctionIdentity, SnapshotWireError> {
     Ok(FunctionIdentity {
@@ -396,14 +396,14 @@ pub(crate) fn read_function_identity(
     })
 }
 
-pub(crate) fn write_diagnostic_identity(
+pub fn write_diagnostic_identity(
     writer: &mut SnapshotWireWriter,
     identity: DiagnosticIdentity,
 ) {
     writer.u64(identity.value());
 }
 
-pub(crate) fn read_diagnostic_identity(
+pub fn read_diagnostic_identity(
     reader: &mut SnapshotWireReader<'_>,
 ) -> Result<DiagnosticIdentity, SnapshotWireError> {
     Ok(DiagnosticIdentity(reader.u64()?))
@@ -417,7 +417,7 @@ const SPACE_CONSTANT: u8 = 3;
 const SPACE_CUSTOM: u8 = 4;
 const SPACE_UNKNOWN: u8 = 5;
 
-pub(crate) fn write_storage(writer: &mut SnapshotWireWriter, storage: CanonicalStorageId) {
+pub fn write_storage(writer: &mut SnapshotWireWriter, storage: CanonicalStorageId) {
     match storage.space {
         CanonicalStorageSpace::Ram => writer.u8(SPACE_RAM),
         CanonicalStorageSpace::Register => writer.u8(SPACE_REGISTER),
@@ -433,7 +433,7 @@ pub(crate) fn write_storage(writer: &mut SnapshotWireWriter, storage: CanonicalS
     writer.u32(storage.size);
 }
 
-pub(crate) fn read_storage(
+pub fn read_storage(
     reader: &mut SnapshotWireReader<'_>,
 ) -> Result<CanonicalStorageId, SnapshotWireError> {
     let space = match reader.u8()? {
@@ -454,7 +454,7 @@ pub(crate) fn read_storage(
     })
 }
 
-pub(crate) fn write_optional_storage(
+pub fn write_optional_storage(
     writer: &mut SnapshotWireWriter,
     storage: Option<CanonicalStorageId>,
 ) {
@@ -467,7 +467,7 @@ pub(crate) fn write_optional_storage(
     }
 }
 
-pub(crate) fn read_optional_storage(
+pub fn read_optional_storage(
     reader: &mut SnapshotWireReader<'_>,
 ) -> Result<Option<CanonicalStorageId>, SnapshotWireError> {
     if reader.bool()? {
@@ -477,7 +477,7 @@ pub(crate) fn read_optional_storage(
     }
 }
 
-pub(crate) fn write_presentation(
+pub fn write_presentation(
     writer: &mut SnapshotWireWriter,
     presentation: &FunctionPresentation,
 ) -> Result<(), SnapshotWireError> {
@@ -491,7 +491,7 @@ pub(crate) fn write_presentation(
     Ok(())
 }
 
-pub(crate) fn read_presentation(
+pub fn read_presentation(
     reader: &mut SnapshotWireReader<'_>,
 ) -> Result<FunctionPresentation, SnapshotWireError> {
     let display_name = reader.string()?;
@@ -527,7 +527,7 @@ const CAPTURED_KNOWN_BITS: u16 = CAPTURED_BOUNDED_IMAGE
     | CAPTURED_RETURN_MECHANISM
     | CAPTURED_STACK_ALLOCATION;
 
-pub(crate) fn write_captured_fields(writer: &mut SnapshotWireWriter, fields: CapturedSourceFields) {
+pub fn write_captured_fields(writer: &mut SnapshotWireWriter, fields: CapturedSourceFields) {
     let mut mask = 0u16;
     let mut set = |bit: u16, present: bool| {
         if present {
@@ -546,7 +546,7 @@ pub(crate) fn write_captured_fields(writer: &mut SnapshotWireWriter, fields: Cap
     writer.u16(mask);
 }
 
-pub(crate) fn read_captured_fields(
+pub fn read_captured_fields(
     reader: &mut SnapshotWireReader<'_>,
 ) -> Result<CapturedSourceFields, SnapshotWireError> {
     let mask = reader.u16()?;
@@ -569,12 +569,12 @@ pub(crate) fn read_captured_fields(
     })
 }
 
-pub(crate) fn write_machine_roles(writer: &mut SnapshotWireWriter, roles: &SourceMachineRoles) {
+pub fn write_machine_roles(writer: &mut SnapshotWireWriter, roles: &SourceMachineRoles) {
     write_optional_storage(writer, roles.return_address_storage());
     write_optional_storage(writer, roles.stack_pointer_storage());
 }
 
-pub(crate) fn read_machine_roles(
+pub fn read_machine_roles(
     reader: &mut SnapshotWireReader<'_>,
 ) -> Result<SourceMachineRoles, SnapshotWireError> {
     let return_address_storage = read_optional_storage(reader)?;
@@ -591,7 +591,7 @@ const SUCCESSOR_FALLTHROUGH: u8 = 1;
 const SUCCESSOR_SWITCH_CASE: u8 = 2;
 const SUCCESSOR_SWITCH_DEFAULT: u8 = 3;
 
-pub(crate) fn write_successor(writer: &mut SnapshotWireWriter, successor: &AdvisorySuccessor) {
+pub fn write_successor(writer: &mut SnapshotWireWriter, successor: &AdvisorySuccessor) {
     writer.u8(match successor.kind() {
         AdvisorySuccessorKind::Direct => SUCCESSOR_DIRECT,
         AdvisorySuccessorKind::Fallthrough => SUCCESSOR_FALLTHROUGH,
@@ -609,7 +609,7 @@ pub(crate) fn write_successor(writer: &mut SnapshotWireWriter, successor: &Advis
     writer.bool(successor.is_external());
 }
 
-pub(crate) fn read_successor(
+pub fn read_successor(
     reader: &mut SnapshotWireReader<'_>,
 ) -> Result<AdvisorySuccessor, SnapshotWireError> {
     let kind = match reader.u8()? {
@@ -636,7 +636,7 @@ pub(crate) fn read_successor(
     })
 }
 
-pub(crate) fn write_block(
+pub fn write_block(
     writer: &mut SnapshotWireWriter,
     block: &OwnedFunctionBlock,
 ) -> Result<(), SnapshotWireError> {
@@ -658,7 +658,7 @@ pub(crate) fn write_block(
     Ok(())
 }
 
-pub(crate) fn read_block(
+pub fn read_block(
     reader: &mut SnapshotWireReader<'_>,
 ) -> Result<OwnedFunctionBlock, SnapshotWireError> {
     let address = reader.u64()?;
@@ -681,7 +681,7 @@ pub(crate) fn read_block(
     })
 }
 
-pub(crate) fn write_image(
+pub fn write_image(
     writer: &mut SnapshotWireWriter,
     image: &OwnedFunctionImage,
 ) -> Result<(), SnapshotWireError> {
@@ -703,7 +703,7 @@ pub(crate) fn write_image(
     Ok(())
 }
 
-pub(crate) fn read_image(
+pub fn read_image(
     reader: &mut SnapshotWireReader<'_>,
 ) -> Result<OwnedFunctionImage, SnapshotWireError> {
     let entry_address = reader.u64()?;
@@ -731,7 +731,7 @@ pub(crate) fn read_image(
 const RESULT_VOID: u8 = 0;
 const RESULT_REGISTER: u8 = 1;
 
-pub(crate) fn write_call_result(writer: &mut SnapshotWireWriter, result: &SourceCallResult) {
+pub fn write_call_result(writer: &mut SnapshotWireWriter, result: &SourceCallResult) {
     match result {
         SourceCallResult::Void => writer.u8(RESULT_VOID),
         SourceCallResult::Register { storage } => {
@@ -741,7 +741,7 @@ pub(crate) fn write_call_result(writer: &mut SnapshotWireWriter, result: &Source
     }
 }
 
-pub(crate) fn read_call_result(
+pub fn read_call_result(
     reader: &mut SnapshotWireReader<'_>,
 ) -> Result<SourceCallResult, SnapshotWireError> {
     match reader.u8()? {
@@ -755,7 +755,7 @@ pub(crate) fn read_call_result(
     }
 }
 
-pub(crate) fn write_call_prototype(
+pub fn write_call_prototype(
     writer: &mut SnapshotWireWriter,
     prototype: &AdvisoryCallPrototype,
 ) -> Result<(), SnapshotWireError> {
@@ -773,7 +773,7 @@ pub(crate) fn write_call_prototype(
     Ok(())
 }
 
-pub(crate) fn read_call_prototype(
+pub fn read_call_prototype(
     reader: &mut SnapshotWireReader<'_>,
 ) -> Result<AdvisoryCallPrototype, SnapshotWireError> {
     let calling_convention = reader.string()?.to_string();
@@ -796,7 +796,7 @@ pub(crate) fn read_call_prototype(
     })
 }
 
-pub(crate) fn write_call_site(
+pub fn write_call_site(
     writer: &mut SnapshotWireWriter,
     site: &AdvisoryCallSite,
 ) -> Result<(), SnapshotWireError> {
@@ -814,7 +814,7 @@ pub(crate) fn write_call_site(
     Ok(())
 }
 
-pub(crate) fn read_call_site(
+pub fn read_call_site(
     reader: &mut SnapshotWireReader<'_>,
 ) -> Result<AdvisoryCallSite, SnapshotWireError> {
     let instruction_address = reader.u64()?;
@@ -835,7 +835,7 @@ pub(crate) fn read_call_site(
 const CARRIER_FULL: u8 = 0;
 const CARRIER_LOW_BITS: u8 = 1;
 
-pub(crate) fn write_carrier(writer: &mut SnapshotWireWriter, carrier: SourceCarrierProjection) {
+pub fn write_carrier(writer: &mut SnapshotWireWriter, carrier: SourceCarrierProjection) {
     writer.u8(match carrier.kind() {
         SourceCarrierKind::Full => CARRIER_FULL,
         SourceCarrierKind::LowBits => CARRIER_LOW_BITS,
@@ -844,7 +844,7 @@ pub(crate) fn write_carrier(writer: &mut SnapshotWireWriter, carrier: SourceCarr
     writer.u64(carrier.size_bits());
 }
 
-pub(crate) fn read_carrier(
+pub fn read_carrier(
     reader: &mut SnapshotWireReader<'_>,
 ) -> Result<SourceCarrierProjection, SnapshotWireError> {
     let kind = match reader.u8()? {
@@ -859,12 +859,12 @@ pub(crate) fn read_carrier(
     Ok(SourceCarrierProjection::new(kind, offset_bits, size_bits))
 }
 
-pub(crate) fn write_logical_value(writer: &mut SnapshotWireWriter, value: SourceLogicalValue) {
+pub fn write_logical_value(writer: &mut SnapshotWireWriter, value: SourceLogicalValue) {
     writer.u32(value.type_id());
     write_carrier(writer, value.carrier());
 }
 
-pub(crate) fn read_logical_value(
+pub fn read_logical_value(
     reader: &mut SnapshotWireReader<'_>,
 ) -> Result<SourceLogicalValue, SnapshotWireError> {
     let type_id = reader.u32()?;
@@ -872,7 +872,7 @@ pub(crate) fn read_logical_value(
     Ok(SourceLogicalValue::new(type_id, carrier))
 }
 
-pub(crate) fn write_abi_parameter(
+pub fn write_abi_parameter(
     writer: &mut SnapshotWireWriter,
     parameter: &SourceAbiParameterSpec,
 ) {
@@ -880,7 +880,7 @@ pub(crate) fn write_abi_parameter(
     write_storage(writer, parameter.storage());
 }
 
-pub(crate) fn read_abi_parameter(
+pub fn read_abi_parameter(
     reader: &mut SnapshotWireReader<'_>,
 ) -> Result<SourceAbiParameterSpec, SnapshotWireError> {
     let index = reader.u32()?;
@@ -888,7 +888,7 @@ pub(crate) fn read_abi_parameter(
     Ok(SourceAbiParameterSpec::new(index, storage))
 }
 
-pub(crate) fn write_function_return(writer: &mut SnapshotWireWriter, kind: &SourceFunctionReturn) {
+pub fn write_function_return(writer: &mut SnapshotWireWriter, kind: &SourceFunctionReturn) {
     match kind {
         SourceFunctionReturn::Void => writer.u8(RESULT_VOID),
         SourceFunctionReturn::Register { storage } => {
@@ -898,7 +898,7 @@ pub(crate) fn write_function_return(writer: &mut SnapshotWireWriter, kind: &Sour
     }
 }
 
-pub(crate) fn read_function_return(
+pub fn read_function_return(
     reader: &mut SnapshotWireReader<'_>,
 ) -> Result<SourceFunctionReturn, SnapshotWireError> {
     match reader.u8()? {
@@ -916,7 +916,7 @@ const TYPE_UNSIGNED: u8 = 1;
 const TYPE_POINTER: u8 = 2;
 const TYPE_STRUCT: u8 = 3;
 
-pub(crate) fn write_type(writer: &mut SnapshotWireWriter, source_type: &SourceType) {
+pub fn write_type(writer: &mut SnapshotWireWriter, source_type: &SourceType) {
     writer.u32(source_type.id());
     match source_type.kind() {
         SourceTypeKind::SignedInteger => writer.u8(TYPE_SIGNED),
@@ -934,7 +934,7 @@ pub(crate) fn write_type(writer: &mut SnapshotWireWriter, source_type: &SourceTy
     writer.u64(source_type.align_bits());
 }
 
-pub(crate) fn read_type(
+pub fn read_type(
     reader: &mut SnapshotWireReader<'_>,
 ) -> Result<SourceType, SnapshotWireError> {
     let id = reader.u32()?;
@@ -956,7 +956,7 @@ pub(crate) fn read_type(
     Ok(SourceType::new(id, kind, size_bits, align_bits))
 }
 
-pub(crate) fn write_aggregate_member(
+pub fn write_aggregate_member(
     writer: &mut SnapshotWireWriter,
     member: &SourceAggregateMember,
 ) -> Result<(), SnapshotWireError> {
@@ -967,7 +967,7 @@ pub(crate) fn write_aggregate_member(
     writer.string(member.name())
 }
 
-pub(crate) fn read_aggregate_member(
+pub fn read_aggregate_member(
     reader: &mut SnapshotWireReader<'_>,
 ) -> Result<SourceAggregateMember, SnapshotWireError> {
     let member_id = reader.u32()?;
@@ -980,7 +980,7 @@ pub(crate) fn read_aggregate_member(
     ))
 }
 
-pub(crate) fn write_aggregate(
+pub fn write_aggregate(
     writer: &mut SnapshotWireWriter,
     aggregate: &SourceAggregateLayout,
 ) -> Result<(), SnapshotWireError> {
@@ -998,7 +998,7 @@ pub(crate) fn write_aggregate(
     Ok(())
 }
 
-pub(crate) fn read_aggregate(
+pub fn read_aggregate(
     reader: &mut SnapshotWireReader<'_>,
 ) -> Result<SourceAggregateLayout, SnapshotWireError> {
     let id = reader.u32()?;
@@ -1016,7 +1016,7 @@ pub(crate) fn read_aggregate(
     ))
 }
 
-pub(crate) fn write_type_graph(
+pub fn write_type_graph(
     writer: &mut SnapshotWireWriter,
     graph: &SourceTypeGraph,
 ) -> Result<(), SnapshotWireError> {
@@ -1034,7 +1034,7 @@ pub(crate) fn write_type_graph(
     Ok(())
 }
 
-pub(crate) fn read_type_graph(
+pub fn read_type_graph(
     reader: &mut SnapshotWireReader<'_>,
 ) -> Result<SourceTypeGraph, SnapshotWireError> {
     let type_count = reader.u32()? as usize;
@@ -1057,7 +1057,7 @@ pub(crate) fn read_type_graph(
 const GROWTH_LOWER: u8 = 0;
 const GROWTH_HIGHER: u8 = 1;
 
-pub(crate) fn write_stack_allocation(
+pub fn write_stack_allocation(
     writer: &mut SnapshotWireWriter,
     contract: &SourceStackAllocationContract,
 ) {
@@ -1068,7 +1068,7 @@ pub(crate) fn write_stack_allocation(
     writer.u32(contract.implicit_active_sp_bytes());
 }
 
-pub(crate) fn read_stack_allocation(
+pub fn read_stack_allocation(
     reader: &mut SnapshotWireReader<'_>,
 ) -> Result<SourceStackAllocationContract, SnapshotWireError> {
     let growth = match reader.u8()? {
@@ -1086,7 +1086,7 @@ pub(crate) fn read_stack_allocation(
 
 const MECHANISM_STACKED: u8 = 0;
 
-pub(crate) fn write_return_mechanism(
+pub fn write_return_mechanism(
     writer: &mut SnapshotWireWriter,
     mechanism: &SourceReturnMechanism,
 ) {
@@ -1106,7 +1106,7 @@ pub(crate) fn write_return_mechanism(
     }
 }
 
-pub(crate) fn read_return_mechanism(
+pub fn read_return_mechanism(
     reader: &mut SnapshotWireReader<'_>,
 ) -> Result<SourceReturnMechanism, SnapshotWireError> {
     match reader.u8()? {
@@ -1126,7 +1126,7 @@ const ROLE_UNCLASSIFIED: u8 = 0;
 const ROLE_LOCAL: u8 = 1;
 const ROLE_PARAMETER_HOME: u8 = 2;
 
-pub(crate) fn write_stack_slot(writer: &mut SnapshotWireWriter, slot: &SourceStackSlotSpec) {
+pub fn write_stack_slot(writer: &mut SnapshotWireWriter, slot: &SourceStackSlotSpec) {
     writer.u8(match slot.base() {
         StackAddressBase::FramePointer => BASE_FRAME_POINTER,
         StackAddressBase::StackPointer => BASE_STACK_POINTER,
@@ -1148,7 +1148,7 @@ pub(crate) fn write_stack_slot(writer: &mut SnapshotWireWriter, slot: &SourceSta
     }
 }
 
-pub(crate) fn read_stack_slot(
+pub fn read_stack_slot(
     reader: &mut SnapshotWireReader<'_>,
 ) -> Result<SourceStackSlotSpec, SnapshotWireError> {
     let base = match reader.u8()? {
@@ -1189,7 +1189,7 @@ const INTERFACE_EXACT_SLOTS: u8 = 1;
 const INTERFACE_LOGICAL: u8 = 2;
 const INTERFACE_EXACT_BOTH: u8 = 3;
 
-pub(crate) fn write_interface(
+pub fn write_interface(
     writer: &mut SnapshotWireWriter,
     interface: &SourceFunctionInterface,
 ) -> Result<(), SnapshotWireError> {
@@ -1265,7 +1265,7 @@ pub(crate) fn write_interface(
 /// Rebuild an interface through the same constructor and builder order the
 /// accessor walk uses, so a decoded interface is the one that walk would have
 /// produced rather than a lookalike assembled from the same fields.
-pub(crate) fn read_interface(
+pub fn read_interface(
     reader: &mut SnapshotWireReader<'_>,
 ) -> Result<SourceFunctionInterface, SnapshotWireError> {
     let variant = reader.u8()?;
