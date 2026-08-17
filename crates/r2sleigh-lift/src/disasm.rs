@@ -1673,7 +1673,26 @@ impl Disassembler {
 
         match &instr.op_code {
             // Data movement
-            OpCode::Copy => unary("COPY", |dst, src| R2ILOp::Copy { dst, src }),
+            OpCode::Copy => {
+                let dst = translate::require_output(&source, "COPY").map_err(translate_err)?;
+                let src = translate::require_input(&source, 0, "COPY").map_err(translate_err)?;
+                // A Sleigh direct-address form writes memory through a
+                // RAM-space destination varnode rather than through STORE.
+                // Canonicalize it so an observable memory write stays a memory
+                // write instead of becoming an SSA value of a register-like RAM
+                // location, which would leave the effect uninventoried and turn
+                // a later read of the same address into a value phi.
+                if dst.space == SpaceId::Ram {
+                    let address_size = u32::try_from(self.default_code_space().address_size)
+                        .map_err(|_| LiftError::Parse("default code space address size".into()))?;
+                    return Ok(Some(R2ILOp::Store {
+                        space: SpaceId::Ram,
+                        addr: Varnode::constant(dst.offset, address_size),
+                        val: src,
+                    }));
+                }
+                Ok(Some(R2ILOp::Copy { dst, src }))
+            }
 
             OpCode::Load => translate::translate_load(&source)
                 .map(Some)
