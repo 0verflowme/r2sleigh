@@ -327,7 +327,11 @@ impl<'a> SnapshotWireReader<'a> {
 // replacement for that pass rather than a second, parallel representation.
 // ---------------------------------------------------------------------------
 
-use crate::{DiagnosticIdentity, FunctionIdentity, MachineProfile, SourceEndianness};
+use crate::contracts::{CanonicalStorageId, CanonicalStorageSpace, SourceMachineRoles};
+use crate::{
+    CapturedSourceFields, DiagnosticIdentity, FunctionIdentity, FunctionPresentation,
+    MachineProfile, SourceEndianness,
+};
 
 const ENDIAN_LITTLE: u8 = 0;
 const ENDIAN_BIG: u8 = 1;
@@ -393,6 +397,182 @@ pub(crate) fn read_diagnostic_identity(
     reader: &mut SnapshotWireReader<'_>,
 ) -> Result<DiagnosticIdentity, SnapshotWireError> {
     Ok(DiagnosticIdentity(reader.u64()?))
+}
+
+
+const SPACE_RAM: u8 = 0;
+const SPACE_REGISTER: u8 = 1;
+const SPACE_UNIQUE: u8 = 2;
+const SPACE_CONSTANT: u8 = 3;
+const SPACE_CUSTOM: u8 = 4;
+const SPACE_UNKNOWN: u8 = 5;
+
+pub(crate) fn write_storage(writer: &mut SnapshotWireWriter, storage: CanonicalStorageId) {
+    match storage.space {
+        CanonicalStorageSpace::Ram => writer.u8(SPACE_RAM),
+        CanonicalStorageSpace::Register => writer.u8(SPACE_REGISTER),
+        CanonicalStorageSpace::Unique => writer.u8(SPACE_UNIQUE),
+        CanonicalStorageSpace::Constant => writer.u8(SPACE_CONSTANT),
+        CanonicalStorageSpace::Custom(index) => {
+            writer.u8(SPACE_CUSTOM);
+            writer.u32(index);
+        }
+        CanonicalStorageSpace::Unknown => writer.u8(SPACE_UNKNOWN),
+    }
+    writer.u64(storage.offset);
+    writer.u32(storage.size);
+}
+
+pub(crate) fn read_storage(
+    reader: &mut SnapshotWireReader<'_>,
+) -> Result<CanonicalStorageId, SnapshotWireError> {
+    let space = match reader.u8()? {
+        SPACE_RAM => CanonicalStorageSpace::Ram,
+        SPACE_REGISTER => CanonicalStorageSpace::Register,
+        SPACE_UNIQUE => CanonicalStorageSpace::Unique,
+        SPACE_CONSTANT => CanonicalStorageSpace::Constant,
+        SPACE_CUSTOM => CanonicalStorageSpace::Custom(reader.u32()?),
+        SPACE_UNKNOWN => CanonicalStorageSpace::Unknown,
+        // An unknown space is refused: mapping it onto a known one would move a
+        // value into an address space it never lived in.
+        _ => return Err(SnapshotWireError::ValueTooWide),
+    };
+    Ok(CanonicalStorageId {
+        space,
+        offset: reader.u64()?,
+        size: reader.u32()?,
+    })
+}
+
+pub(crate) fn write_optional_storage(
+    writer: &mut SnapshotWireWriter,
+    storage: Option<CanonicalStorageId>,
+) {
+    match storage {
+        Some(storage) => {
+            writer.bool(true);
+            write_storage(writer, storage);
+        }
+        None => writer.bool(false),
+    }
+}
+
+pub(crate) fn read_optional_storage(
+    reader: &mut SnapshotWireReader<'_>,
+) -> Result<Option<CanonicalStorageId>, SnapshotWireError> {
+    if reader.bool()? {
+        Ok(Some(read_storage(reader)?))
+    } else {
+        Ok(None)
+    }
+}
+
+pub(crate) fn write_presentation(
+    writer: &mut SnapshotWireWriter,
+    presentation: &FunctionPresentation,
+) -> Result<(), SnapshotWireError> {
+    writer.string(presentation.display_name())?;
+    let count = u32::try_from(presentation.parameter_names().len())
+        .map_err(|_| SnapshotWireError::ValueTooWide)?;
+    writer.u32(count);
+    for name in presentation.parameter_names() {
+        writer.string(name)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn read_presentation(
+    reader: &mut SnapshotWireReader<'_>,
+) -> Result<FunctionPresentation, SnapshotWireError> {
+    let display_name = reader.string()?;
+    let count = reader.u32()? as usize;
+    let mut parameter_names = Vec::with_capacity(count.min(1024));
+    for _ in 0..count {
+        parameter_names.push(Box::<str>::from(reader.string()?));
+    }
+    Ok(FunctionPresentation {
+        display_name: display_name.into(),
+        parameter_names: parameter_names.into_boxed_slice(),
+    })
+}
+
+// One bit per captured field, so adding a field costs a bit rather than a byte
+// and an unset bit can never be mistaken for a set one.
+const CAPTURED_BOUNDED_IMAGE: u16 = 1 << 0;
+const CAPTURED_INTERFACE: u16 = 1 << 1;
+const CAPTURED_EXACT_TYPES: u16 = 1 << 2;
+const CAPTURED_EXACT_STACK_SLOT_ROLES: u16 = 1 << 3;
+const CAPTURED_RETURN_ADDRESS: u16 = 1 << 4;
+const CAPTURED_STACK_POINTER: u16 = 1 << 5;
+const CAPTURED_FRAME_POINTER: u16 = 1 << 6;
+const CAPTURED_RETURN_MECHANISM: u16 = 1 << 7;
+const CAPTURED_STACK_ALLOCATION: u16 = 1 << 8;
+const CAPTURED_KNOWN_BITS: u16 = CAPTURED_BOUNDED_IMAGE
+    | CAPTURED_INTERFACE
+    | CAPTURED_EXACT_TYPES
+    | CAPTURED_EXACT_STACK_SLOT_ROLES
+    | CAPTURED_RETURN_ADDRESS
+    | CAPTURED_STACK_POINTER
+    | CAPTURED_FRAME_POINTER
+    | CAPTURED_RETURN_MECHANISM
+    | CAPTURED_STACK_ALLOCATION;
+
+pub(crate) fn write_captured_fields(writer: &mut SnapshotWireWriter, fields: CapturedSourceFields) {
+    let mut mask = 0u16;
+    let mut set = |bit: u16, present: bool| {
+        if present {
+            mask |= bit;
+        }
+    };
+    set(CAPTURED_BOUNDED_IMAGE, fields.bounded_function_image);
+    set(CAPTURED_INTERFACE, fields.function_interface);
+    set(CAPTURED_EXACT_TYPES, fields.exact_function_types);
+    set(CAPTURED_EXACT_STACK_SLOT_ROLES, fields.exact_stack_slot_roles);
+    set(CAPTURED_RETURN_ADDRESS, fields.return_address_storage);
+    set(CAPTURED_STACK_POINTER, fields.stack_pointer_storage);
+    set(CAPTURED_FRAME_POINTER, fields.frame_pointer_storage);
+    set(CAPTURED_RETURN_MECHANISM, fields.return_mechanism);
+    set(CAPTURED_STACK_ALLOCATION, fields.stack_allocation_contract);
+    writer.u16(mask);
+}
+
+pub(crate) fn read_captured_fields(
+    reader: &mut SnapshotWireReader<'_>,
+) -> Result<CapturedSourceFields, SnapshotWireError> {
+    let mask = reader.u16()?;
+    // A bit this reader does not know means the producer captured something it
+    // cannot represent, so the snapshot is refused rather than silently
+    // downgraded to the fields it does understand.
+    if mask & !CAPTURED_KNOWN_BITS != 0 {
+        return Err(SnapshotWireError::ValueTooWide);
+    }
+    Ok(CapturedSourceFields {
+        bounded_function_image: mask & CAPTURED_BOUNDED_IMAGE != 0,
+        function_interface: mask & CAPTURED_INTERFACE != 0,
+        exact_function_types: mask & CAPTURED_EXACT_TYPES != 0,
+        exact_stack_slot_roles: mask & CAPTURED_EXACT_STACK_SLOT_ROLES != 0,
+        return_address_storage: mask & CAPTURED_RETURN_ADDRESS != 0,
+        stack_pointer_storage: mask & CAPTURED_STACK_POINTER != 0,
+        frame_pointer_storage: mask & CAPTURED_FRAME_POINTER != 0,
+        return_mechanism: mask & CAPTURED_RETURN_MECHANISM != 0,
+        stack_allocation_contract: mask & CAPTURED_STACK_ALLOCATION != 0,
+    })
+}
+
+pub(crate) fn write_machine_roles(writer: &mut SnapshotWireWriter, roles: &SourceMachineRoles) {
+    write_optional_storage(writer, roles.return_address_storage());
+    write_optional_storage(writer, roles.stack_pointer_storage());
+}
+
+pub(crate) fn read_machine_roles(
+    reader: &mut SnapshotWireReader<'_>,
+) -> Result<SourceMachineRoles, SnapshotWireError> {
+    let return_address_storage = read_optional_storage(reader)?;
+    let stack_pointer_storage = read_optional_storage(reader)?;
+    // new() revalidates the register constraint, so a buffer cannot mint roles
+    // the in-crate constructor would have rejected.
+    SourceMachineRoles::new(return_address_storage, stack_pointer_storage)
+        .map_err(|_| SnapshotWireError::ValueTooWide)
 }
 
 #[cfg(test)]
@@ -570,5 +750,139 @@ mod tests {
             diagnostic
         );
         reader.finish().expect("consumed exactly");
+    }
+
+    #[test]
+    fn every_storage_space_round_trips() {
+        let spaces = [
+            CanonicalStorageSpace::Ram,
+            CanonicalStorageSpace::Register,
+            CanonicalStorageSpace::Unique,
+            CanonicalStorageSpace::Constant,
+            CanonicalStorageSpace::Custom(7),
+            CanonicalStorageSpace::Unknown,
+        ];
+        for space in spaces {
+            let storage = CanonicalStorageId { space, offset: 0x38, size: 8 };
+            let mut writer = SnapshotWireWriter::new();
+            write_storage(&mut writer, storage);
+            write_optional_storage(&mut writer, None);
+            write_optional_storage(&mut writer, Some(storage));
+            let buffer = writer.finish().expect("finish");
+            let mut reader = SnapshotWireReader::new(&buffer).expect("header");
+            assert_eq!(read_storage(&mut reader).expect("storage"), storage);
+            assert_eq!(read_optional_storage(&mut reader).expect("absent"), None);
+            assert_eq!(
+                read_optional_storage(&mut reader).expect("present"),
+                Some(storage)
+            );
+            reader.finish().expect("consumed exactly");
+        }
+    }
+
+    #[test]
+    fn an_unknown_storage_space_is_refused() {
+        let mut writer = SnapshotWireWriter::new();
+        writer.u8(200);
+        writer.u64(0);
+        writer.u32(8);
+        let buffer = writer.finish().expect("finish");
+        let mut reader = SnapshotWireReader::new(&buffer).expect("header");
+        assert!(read_storage(&mut reader).is_err());
+    }
+
+    #[test]
+    fn presentation_round_trips_including_no_parameters() {
+        for names in [Vec::new(), vec!["arr", "idx", "len"]] {
+            let presentation = FunctionPresentation {
+                display_name: "safe_array_access".into(),
+                parameter_names: names
+                    .iter()
+                    .map(|name| Box::<str>::from(*name))
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice(),
+            };
+            let mut writer = SnapshotWireWriter::new();
+            write_presentation(&mut writer, &presentation).expect("write");
+            let buffer = writer.finish().expect("finish");
+            let mut reader = SnapshotWireReader::new(&buffer).expect("header");
+            assert_eq!(read_presentation(&mut reader).expect("read"), presentation);
+            reader.finish().expect("consumed exactly");
+        }
+    }
+
+    #[test]
+    fn captured_fields_round_trip_each_flag_independently() {
+        let mut fields = CapturedSourceFields {
+            bounded_function_image: true,
+            function_interface: false,
+            exact_function_types: true,
+            exact_stack_slot_roles: false,
+            return_address_storage: true,
+            stack_pointer_storage: true,
+            frame_pointer_storage: false,
+            return_mechanism: true,
+            stack_allocation_contract: false,
+        };
+        for _ in 0..2 {
+            let mut writer = SnapshotWireWriter::new();
+            write_captured_fields(&mut writer, fields);
+            let buffer = writer.finish().expect("finish");
+            let mut reader = SnapshotWireReader::new(&buffer).expect("header");
+            assert_eq!(read_captured_fields(&mut reader).expect("read"), fields);
+            reader.finish().expect("consumed exactly");
+            // flip every flag and round-trip the complement too
+            fields = CapturedSourceFields {
+                bounded_function_image: !fields.bounded_function_image,
+                function_interface: !fields.function_interface,
+                exact_function_types: !fields.exact_function_types,
+                exact_stack_slot_roles: !fields.exact_stack_slot_roles,
+                return_address_storage: !fields.return_address_storage,
+                stack_pointer_storage: !fields.stack_pointer_storage,
+                frame_pointer_storage: !fields.frame_pointer_storage,
+                return_mechanism: !fields.return_mechanism,
+                stack_allocation_contract: !fields.stack_allocation_contract,
+            };
+        }
+    }
+
+    #[test]
+    fn a_captured_field_this_reader_does_not_know_is_refused() {
+        let mut writer = SnapshotWireWriter::new();
+        writer.u16(CAPTURED_KNOWN_BITS | (1 << 12));
+        let buffer = writer.finish().expect("finish");
+        let mut reader = SnapshotWireReader::new(&buffer).expect("header");
+        assert!(read_captured_fields(&mut reader).is_err());
+    }
+
+    #[test]
+    fn machine_roles_round_trip_and_revalidate() {
+        let sp = CanonicalStorageId {
+            space: CanonicalStorageSpace::Register,
+            offset: 0x20,
+            size: 8,
+        };
+        let roles = SourceMachineRoles::new(Some(sp), Some(sp)).expect("roles");
+        let mut writer = SnapshotWireWriter::new();
+        write_machine_roles(&mut writer, &roles);
+        let buffer = writer.finish().expect("finish");
+        let mut reader = SnapshotWireReader::new(&buffer).expect("header");
+        assert_eq!(read_machine_roles(&mut reader).expect("read"), roles);
+        reader.finish().expect("consumed exactly");
+
+        // a role in a non-register space must not survive the crossing
+        let mut writer = SnapshotWireWriter::new();
+        write_optional_storage(
+            &mut writer,
+            Some(CanonicalStorageId {
+                space: CanonicalStorageSpace::Ram,
+                offset: 0,
+                size: 8,
+            }),
+        );
+        write_optional_storage(&mut writer, None);
+        let buffer = writer.finish().expect("finish");
+        let mut reader = SnapshotWireReader::new(&buffer).expect("header");
+        assert!(read_machine_roles(&mut reader).is_err());
     }
 }
