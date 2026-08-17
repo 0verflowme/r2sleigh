@@ -718,26 +718,31 @@ bool r2sleigh_wire_write_snapshot(R2SleighWireWriter *writer, const void *snapsh
 	if (has_interface) {
 		captured |= WALK_CAPTURED_INTERFACE;
 	}
-	if (top.capabilities & R_ANAL_FUNCTION_SNAPSHOT_CAP_EXACT_FUNCTION_TYPES) {
-		captured |= WALK_CAPTURED_EXACT_TYPES;
-	}
-	if (top.capabilities & R_ANAL_FUNCTION_SNAPSHOT_CAP_EXACT_STACK_SLOT_ROLES) {
-		captured |= WALK_CAPTURED_EXACT_SLOT_ROLES;
-	}
-	if (top.capabilities & R_ANAL_FUNCTION_SNAPSHOT_CAP_RETURN_ADDRESS_STORAGE) {
-		captured |= WALK_CAPTURED_RETURN_ADDRESS;
-	}
-	if (top.capabilities & R_ANAL_FUNCTION_SNAPSHOT_CAP_STACK_POINTER_STORAGE) {
-		captured |= WALK_CAPTURED_STACK_POINTER;
-	}
-	if (top.capabilities & R_ANAL_FUNCTION_SNAPSHOT_CAP_EXACT_FRAME_POINTER_STORAGE) {
-		captured |= WALK_CAPTURED_FRAME_POINTER;
-	}
-	if (top.capabilities & R_ANAL_FUNCTION_SNAPSHOT_CAP_EXACT_RETURN_MECHANISM) {
-		captured |= WALK_CAPTURED_RETURN_MECHANISM;
-	}
-	if (top.capabilities & R_ANAL_FUNCTION_SNAPSHOT_CAP_EXACT_STACK_ALLOCATION_CONTRACT) {
-		captured |= WALK_CAPTURED_STACK_ALLOCATION;
+	/* Every remaining flag describes something the interface carries, so with
+	 * no interface there is nothing to have captured. Deriving them from the
+	 * capabilities alone claimed storages that no part of the buffer holds. */
+	if (has_interface) {
+		if (top.capabilities & R_ANAL_FUNCTION_SNAPSHOT_CAP_EXACT_FUNCTION_TYPES) {
+			captured |= WALK_CAPTURED_EXACT_TYPES;
+		}
+		if (top.capabilities & R_ANAL_FUNCTION_SNAPSHOT_CAP_EXACT_STACK_SLOT_ROLES) {
+			captured |= WALK_CAPTURED_EXACT_SLOT_ROLES;
+		}
+		if (top.capabilities & R_ANAL_FUNCTION_SNAPSHOT_CAP_RETURN_ADDRESS_STORAGE) {
+			captured |= WALK_CAPTURED_RETURN_ADDRESS;
+		}
+		if (top.capabilities & R_ANAL_FUNCTION_SNAPSHOT_CAP_STACK_POINTER_STORAGE) {
+			captured |= WALK_CAPTURED_STACK_POINTER;
+		}
+		if (top.capabilities & R_ANAL_FUNCTION_SNAPSHOT_CAP_EXACT_FRAME_POINTER_STORAGE) {
+			captured |= WALK_CAPTURED_FRAME_POINTER;
+		}
+		if (top.capabilities & R_ANAL_FUNCTION_SNAPSHOT_CAP_EXACT_RETURN_MECHANISM) {
+			captured |= WALK_CAPTURED_RETURN_MECHANISM;
+		}
+		if (top.capabilities & R_ANAL_FUNCTION_SNAPSHOT_CAP_EXACT_STACK_ALLOCATION_CONTRACT) {
+			captured |= WALK_CAPTURED_STACK_ALLOCATION;
+		}
 	}
 	r2sleigh_wire_u16 (writer, captured);
 
