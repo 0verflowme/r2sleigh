@@ -746,9 +746,16 @@ typedef struct R2SleighEngineRequestPayloadV2 {
    */
   uint64_t timeout_us;
   /**
-   * Required opaque certifying source.
+   * Opaque certifying source, read through the accessor table.
    */
   const struct R2SleighRadareSnapshotInputV2 *radare_snapshot;
+  /**
+   * The same source serialized into one flat buffer. When present this is
+   * used and the accessor table is not consulted, which is what lets the
+   * callbacks and their size handshakes go away.
+   */
+  const uint8_t *snapshot_buffer;
+  size_t snapshot_buffer_len;
 } R2SleighEngineRequestPayloadV2;
 
 #ifdef __cplusplus

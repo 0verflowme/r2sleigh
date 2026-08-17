@@ -601,8 +601,13 @@ pub struct R2SleighEngineRequestPayloadV2 {
     pub struct_size: u32,
     /// Relative request deadline. Zero disables the deadline.
     pub timeout_us: u64,
-    /// Required opaque certifying source.
+    /// Opaque certifying source, read through the accessor table.
     pub radare_snapshot: *const R2SleighRadareSnapshotInputV2,
+    /// The same source serialized into one flat buffer. When present this is
+    /// used and the accessor table is not consulted, which is what lets the
+    /// callbacks and their size handshakes go away.
+    pub snapshot_buffer: *const u8,
+    pub snapshot_buffer_len: usize,
 }
 
 /// One entry in the stable eleven-phase engine timing inventory.
@@ -1485,6 +1490,26 @@ fn elapsed_us(started: Instant) -> u64 {
     started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64
 }
 
+/// Build a trusted artifact from one flat snapshot buffer.
+///
+/// # Safety
+/// `payload.snapshot_buffer` must point to `snapshot_buffer_len` readable bytes
+/// that stay live for the call.
+unsafe fn capture_trusted_ssa_from_buffer(
+    payload: &R2SleighEngineRequestPayloadV2,
+    execution: &r2engine::EngineExecutionControl,
+) -> Result<Arc<r2ssa::TrustedSsaArtifact>, BoundaryError> {
+    let ssa_control = execution.ssa_execution_control();
+    r2ssa::SsaWorkControl::poll(&ssa_control)
+        .map_err(|error| BoundaryError::engine(format!("trusted ingress stopped: {error}")))?;
+    // SAFETY: the caller guarantees the buffer extent.
+    let bytes =
+        unsafe { std::slice::from_raw_parts(payload.snapshot_buffer, payload.snapshot_buffer_len) };
+    let source = r2source::snapshot_wire::decode_snapshot(bytes)
+        .map_err(|error| BoundaryError::invalid(format!("snapshot buffer rejected: {error}")))?;
+    trusted_from_source(source, execution)
+}
+
 unsafe fn capture_trusted_ssa(
     input: *const R2SleighRadareSnapshotInputV2,
     execution: &r2engine::EngineExecutionControl,
@@ -1510,6 +1535,17 @@ unsafe fn capture_trusted_ssa(
             _ => BoundaryError::invalid(format!("opaque source snapshot refused: {error}")),
         }
     })?;
+    trusted_from_source(source, execution)
+}
+
+/// Lift and prepare one owned snapshot, whichever transport produced it. Both
+/// ingress paths share this so the buffer path cannot drift from the accessor
+/// path in anything after the source is owned.
+fn trusted_from_source(
+    source: r2source::OwnedFunctionSnapshot,
+    execution: &r2engine::EngineExecutionControl,
+) -> Result<Arc<r2ssa::TrustedSsaArtifact>, BoundaryError> {
+    let ssa_control = execution.ssa_execution_control();
     r2ssa::SsaWorkControl::poll(&ssa_control).map_err(|error| {
         BoundaryError::engine(format!(
             "trusted ingress stopped after source capture: {error}"
@@ -1565,7 +1601,8 @@ unsafe fn execute_request(
             "engine payload ABI version or struct size mismatch",
         ));
     }
-    if payload.radare_snapshot.is_null() {
+    let has_buffer = !payload.snapshot_buffer.is_null() && payload.snapshot_buffer_len != 0;
+    if payload.radare_snapshot.is_null() && !has_buffer {
         return Err(BoundaryError::invalid(
             "engine request requires an opaque radare snapshot",
         ));
@@ -1582,7 +1619,13 @@ unsafe fn execute_request(
             .unwrap_or_else(Instant::now)
     });
     let execution = r2engine::EngineExecutionControl::new(cancellation, deadline);
-    let trusted = unsafe { capture_trusted_ssa(payload.radare_snapshot, &execution) }?;
+    // The flat buffer is the whole source when it is present, so the accessor
+    // table is not consulted at all on that path.
+    let trusted = if has_buffer {
+        unsafe { capture_trusted_ssa_from_buffer(payload, &execution) }?
+    } else {
+        unsafe { capture_trusted_ssa(payload.radare_snapshot, &execution) }?
+    };
     let ffi_conversion_elapsed_us = elapsed_us(ffi_started);
     let output = match request.kind {
         R2SLEIGH_REQUEST_DECOMPILE_V2 => {
