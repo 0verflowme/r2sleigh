@@ -13,7 +13,7 @@ use std::sync::Arc;
 use super::*;
 
 pub const RADARE_ABI_VERSION: u32 = 139;
-pub const RADARE_FUNCTION_SNAPSHOT_SCHEMA_VERSION: u32 = 12;
+pub const RADARE_FUNCTION_SNAPSHOT_SCHEMA_VERSION: u32 = 13;
 pub const RADARE_SNAPSHOT_ACCESSOR_SCHEMA_VERSION: u32 = 5;
 
 pub const RADARE_ENDIAN_LITTLE: u32 = 0x4321;
@@ -158,6 +158,8 @@ pub struct RadareAbi138FunctionInterfaceView {
     pub return_type_id: u32,
     pub return_carrier: RadareAbi138CarrierProjection,
     pub logical_types_complete: u8,
+    pub stack_pointer_preserved_across_calls: u8,
+    pub frame_pointer_preserved_across_calls: u8,
 }
 
 #[repr(C)]
@@ -1155,6 +1157,8 @@ unsafe fn capture_interface(
     let stack_roles_complete = wire_bool(view.stack_slot_roles_complete)?;
     let complete = wire_bool(view.complete)?;
     let logical_types_complete = wire_bool(view.logical_types_complete)?;
+    let stack_pointer_preserved = wire_bool(view.stack_pointer_preserved_across_calls)?;
+    let frame_pointer_preserved = wire_bool(view.frame_pointer_preserved_across_calls)?;
     let exact_types = top.capabilities & RADARE_CAP_EXACT_FUNCTION_TYPES != 0;
     let exact_slots = top.capabilities & RADARE_CAP_EXACT_STACK_SLOT_ROLES != 0;
     if !complete
@@ -1350,6 +1354,10 @@ unsafe fn capture_interface(
     }
     .map_err(|_| RadareAbi138CaptureError::InvalidInterface)?;
 
+    interface = interface.with_preserved_call_carriers(
+        stack_pointer_preserved,
+        frame_pointer_preserved,
+    );
     if top.capabilities & RADARE_CAP_RETURN_ADDRESS_STORAGE != 0 {
         // SAFETY: callback writes an owned string of the advertised size.
         let name = unsafe {

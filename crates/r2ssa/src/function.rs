@@ -2457,22 +2457,28 @@ impl SSAFunction {
         } else {
             self.compute_decompile_family_in_states_with_control(family_info, control)?
         };
-        // The source interface identifies the entry stack-pointer carrier, but
-        // does not certify its preservation across calls or unknown effects.
-        // Until such authority exists, do not derive entry-SP-relative facts
-        // for any function containing one of those boundaries.
+        // A call only threatens entry-relative facts if it can leave the stack
+        // and frame carriers changed. The convention states which carriers a
+        // callee restores, and the source now carries that statement, so a
+        // direct or indirect call is no longer a reason to withhold every
+        // entry-relative fact from the function that makes one.
+        //
+        // Operations whose effect the model does not describe are a different
+        // matter: nothing says what they leave behind, so they still stop this.
+        let call_carriers_are_restored = function_interface.is_some_and(|interface| {
+            interface.stack_pointer_preserved_across_calls()
+                && interface.frame_pointer_preserved_across_calls()
+        });
         let entry_stack_roots_are_stable = self.blocks().all(|block| {
-            block.ops.iter().all(|op| {
-                !matches!(
-                    op,
-                    SSAOp::Call { .. }
-                        | SSAOp::CallInd { .. }
-                        | SSAOp::CallDefine { .. }
-                        | SSAOp::CallOther { .. }
-                        | SSAOp::Unimplemented
-                        | SSAOp::CpuId { .. }
-                        | SSAOp::New { .. }
-                )
+            block.ops.iter().all(|op| match op {
+                SSAOp::Call { .. } | SSAOp::CallInd { .. } | SSAOp::CallDefine { .. } => {
+                    call_carriers_are_restored
+                }
+                SSAOp::CallOther { .. }
+                | SSAOp::Unimplemented
+                | SSAOp::CpuId { .. }
+                | SSAOp::New { .. } => false,
+                _ => true,
             })
         });
         let mut facts = DecompilePrepFacts::default();

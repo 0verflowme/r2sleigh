@@ -32,7 +32,7 @@ pub const R2SLEIGH_CAPABILITIES_V2: u64 = R2SLEIGH_CAP_DECOMPILE_V2
     | R2SLEIGH_CAP_PLANNER_QUERY_V2
     | R2SLEIGH_CAP_OPAQUE_RADARE_SNAPSHOT_V2;
 pub const R2SLEIGH_RADARE_ABI_V2: u32 = 139;
-pub const R2SLEIGH_RADARE_FUNCTION_SNAPSHOT_SCHEMA_V2: u32 = 12;
+pub const R2SLEIGH_RADARE_FUNCTION_SNAPSHOT_SCHEMA_V2: u32 = 13;
 pub const R2SLEIGH_RADARE_SNAPSHOT_ACCESSOR_SCHEMA_V2: u32 = 5;
 
 pub const R2SLEIGH_STATUS_OK_V2: u32 = 0;
@@ -268,6 +268,8 @@ pub struct R2SleighRadareFunctionInterfaceViewV2 {
     pub return_type_id: u32,
     pub return_carrier: R2SleighRadareCarrierProjectionV2,
     pub logical_types_complete: u8,
+    pub stack_pointer_preserved_across_calls: u8,
+    pub frame_pointer_preserved_across_calls: u8,
 }
 
 #[repr(C)]

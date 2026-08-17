@@ -785,6 +785,10 @@ pub struct SourceFunctionInterface {
     return_logical_value: Option<SourceLogicalValue>,
     type_graph: Option<SourceTypeGraph>,
     stack_slot_roles_complete: bool,
+    /// The convention states that a callee restores these carriers, so a
+    /// consumer may treat them as surviving a call rather than assuming it.
+    stack_pointer_preserved_across_calls: bool,
+    frame_pointer_preserved_across_calls: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1055,6 +1059,10 @@ impl SourceFunctionInterface {
             return_logical_value,
             type_graph,
             stack_slot_roles_complete: require_exact_stack_slot_roles,
+            // Preservation is recorded by the capture, which is where the
+            // convention is known; a bare interface claims neither.
+            stack_pointer_preserved_across_calls: false,
+            frame_pointer_preserved_across_calls: false,
         })
     }
 
@@ -1396,6 +1404,25 @@ impl SourceFunctionInterface {
 
     pub const fn type_graph(&self) -> Option<&SourceTypeGraph> {
         self.type_graph.as_ref()
+    }
+
+    /// Record that the convention restores these carriers across a call.
+    pub fn with_preserved_call_carriers(
+        mut self,
+        stack_pointer: bool,
+        frame_pointer: bool,
+    ) -> Self {
+        self.stack_pointer_preserved_across_calls = stack_pointer;
+        self.frame_pointer_preserved_across_calls = frame_pointer;
+        self
+    }
+
+    pub const fn stack_pointer_preserved_across_calls(&self) -> bool {
+        self.stack_pointer_preserved_across_calls
+    }
+
+    pub const fn frame_pointer_preserved_across_calls(&self) -> bool {
+        self.frame_pointer_preserved_across_calls
     }
 
     pub const fn stack_slot_roles_complete(&self) -> bool {

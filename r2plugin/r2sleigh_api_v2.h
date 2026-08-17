@@ -31,7 +31,7 @@ typedef struct R2ILBlock R2ILBlock;
 
 #define R2SLEIGH_RADARE_ABI_V2 139
 
-#define R2SLEIGH_RADARE_FUNCTION_SNAPSHOT_SCHEMA_V2 12
+#define R2SLEIGH_RADARE_FUNCTION_SNAPSHOT_SCHEMA_V2 13
 
 #define R2SLEIGH_RADARE_SNAPSHOT_ACCESSOR_SCHEMA_V2 5
 
@@ -547,6 +547,8 @@ typedef struct R2SleighRadareFunctionInterfaceViewV2 {
   uint32_t return_type_id;
   struct R2SleighRadareCarrierProjectionV2 return_carrier;
   uint8_t logical_types_complete;
+  uint8_t stack_pointer_preserved_across_calls;
+  uint8_t frame_pointer_preserved_across_calls;
 } R2SleighRadareFunctionInterfaceViewV2;
 
 typedef struct R2SleighRadareParameterViewV2 {

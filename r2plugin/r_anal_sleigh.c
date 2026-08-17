@@ -22,11 +22,11 @@
 #if R2SLEIGH_RADARE_ABI_V2 != 139
 #error "r2sleigh generated V2 header must target exactly radare2 ABI 139"
 #endif
-#if R_ANAL_FUNCTION_SNAPSHOT_SCHEMA_VERSION != 12
-#error "r2sleigh borrowed snapshot transport requires function snapshot schema 12"
+#if R_ANAL_FUNCTION_SNAPSHOT_SCHEMA_VERSION != 13
+#error "r2sleigh borrowed snapshot transport requires function snapshot schema 13"
 #endif
-#if R2SLEIGH_RADARE_FUNCTION_SNAPSHOT_SCHEMA_V2 != 12
-#error "r2sleigh generated V2 header must target function snapshot schema 12"
+#if R2SLEIGH_RADARE_FUNCTION_SNAPSHOT_SCHEMA_V2 != 13
+#error "r2sleigh generated V2 header must target function snapshot schema 13"
 #endif
 #if R2SLEIGH_RADARE_SNAPSHOT_ACCESSOR_SCHEMA_V2 != 5
 #error "r2sleigh generated V2 header must target snapshot accessor schema 5"
@@ -153,6 +153,10 @@ static uint8_t sleigh_radare_interface_view(const void *opaque, R2SleighRadareFu
 		.complete = source.complete? 1: 0,
 		.return_type_id = source.return_type_id,
 		.logical_types_complete = source.logical_types_complete? 1: 0,
+		.stack_pointer_preserved_across_calls =
+			source.stack_pointer_preserved_across_calls? 1: 0,
+		.frame_pointer_preserved_across_calls =
+			source.frame_pointer_preserved_across_calls? 1: 0,
 	};
 	if (!sleigh_radare_return_kind (&result.return_kind, source.return_kind)
 		|| !sleigh_radare_storage_view (&result.return_storage, &source.return_storage)
