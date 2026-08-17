@@ -329,8 +329,9 @@ impl<'a> SnapshotWireReader<'a> {
 // ---------------------------------------------------------------------------
 
 use crate::contracts::{
-    CanonicalStorageId, CanonicalStorageSpace, SourceCallArgumentSpec, SourceCallResult,
-    SourceMachineRoles,
+    CanonicalStorageId, CanonicalStorageSpace, SourceAbiParameterSpec, SourceCallArgumentSpec,
+    SourceCallResult, SourceCarrierKind, SourceCarrierProjection, SourceFunctionReturn,
+    SourceLogicalValue, SourceMachineRoles,
 };
 use crate::{
     AdvisoryCallPrototype, AdvisoryCallSite, AdvisorySuccessor, AdvisorySuccessorKind,
@@ -827,6 +828,85 @@ pub(crate) fn read_call_site(
     })
 }
 
+
+const CARRIER_FULL: u8 = 0;
+const CARRIER_LOW_BITS: u8 = 1;
+
+pub(crate) fn write_carrier(writer: &mut SnapshotWireWriter, carrier: SourceCarrierProjection) {
+    writer.u8(match carrier.kind() {
+        SourceCarrierKind::Full => CARRIER_FULL,
+        SourceCarrierKind::LowBits => CARRIER_LOW_BITS,
+    });
+    writer.u64(carrier.offset_bits());
+    writer.u64(carrier.size_bits());
+}
+
+pub(crate) fn read_carrier(
+    reader: &mut SnapshotWireReader<'_>,
+) -> Result<SourceCarrierProjection, SnapshotWireError> {
+    let kind = match reader.u8()? {
+        CARRIER_FULL => SourceCarrierKind::Full,
+        CARRIER_LOW_BITS => SourceCarrierKind::LowBits,
+        // The kind decides whether a value is the whole carrier or a truncation
+        // of it, so an unknown one is refused rather than widened.
+        _ => return Err(SnapshotWireError::ValueTooWide),
+    };
+    let offset_bits = reader.u64()?;
+    let size_bits = reader.u64()?;
+    Ok(SourceCarrierProjection::new(kind, offset_bits, size_bits))
+}
+
+pub(crate) fn write_logical_value(writer: &mut SnapshotWireWriter, value: SourceLogicalValue) {
+    writer.u32(value.type_id());
+    write_carrier(writer, value.carrier());
+}
+
+pub(crate) fn read_logical_value(
+    reader: &mut SnapshotWireReader<'_>,
+) -> Result<SourceLogicalValue, SnapshotWireError> {
+    let type_id = reader.u32()?;
+    let carrier = read_carrier(reader)?;
+    Ok(SourceLogicalValue::new(type_id, carrier))
+}
+
+pub(crate) fn write_abi_parameter(
+    writer: &mut SnapshotWireWriter,
+    parameter: &SourceAbiParameterSpec,
+) {
+    writer.u32(parameter.index());
+    write_storage(writer, parameter.storage());
+}
+
+pub(crate) fn read_abi_parameter(
+    reader: &mut SnapshotWireReader<'_>,
+) -> Result<SourceAbiParameterSpec, SnapshotWireError> {
+    let index = reader.u32()?;
+    let storage = read_storage(reader)?;
+    Ok(SourceAbiParameterSpec::new(index, storage))
+}
+
+pub(crate) fn write_function_return(writer: &mut SnapshotWireWriter, kind: &SourceFunctionReturn) {
+    match kind {
+        SourceFunctionReturn::Void => writer.u8(RESULT_VOID),
+        SourceFunctionReturn::Register { storage } => {
+            writer.u8(RESULT_REGISTER);
+            write_storage(writer, *storage);
+        }
+    }
+}
+
+pub(crate) fn read_function_return(
+    reader: &mut SnapshotWireReader<'_>,
+) -> Result<SourceFunctionReturn, SnapshotWireError> {
+    match reader.u8()? {
+        RESULT_VOID => Ok(SourceFunctionReturn::Void),
+        RESULT_REGISTER => Ok(SourceFunctionReturn::Register {
+            storage: read_storage(reader)?,
+        }),
+        _ => Err(SnapshotWireError::ValueTooWide),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1291,5 +1371,55 @@ mod tests {
         let buffer = writer.finish().expect("finish");
         let mut reader = SnapshotWireReader::new(&buffer).expect("header");
         assert!(read_call_result(&mut reader).is_err());
+    }
+
+    #[test]
+    fn carriers_and_logical_values_round_trip() {
+        for kind in [SourceCarrierKind::Full, SourceCarrierKind::LowBits] {
+            let carrier = SourceCarrierProjection::new(kind, 0, 32);
+            let value = SourceLogicalValue::new(4, carrier);
+            let mut writer = SnapshotWireWriter::new();
+            write_carrier(&mut writer, carrier);
+            write_logical_value(&mut writer, value);
+            let buffer = writer.finish().expect("finish");
+            let mut reader = SnapshotWireReader::new(&buffer).expect("header");
+            assert_eq!(read_carrier(&mut reader).expect("carrier"), carrier);
+            assert_eq!(read_logical_value(&mut reader).expect("value"), value);
+            reader.finish().expect("consumed exactly");
+        }
+    }
+
+    #[test]
+    fn an_unknown_carrier_kind_is_refused() {
+        let mut writer = SnapshotWireWriter::new();
+        writer.u8(5);
+        writer.u64(0);
+        writer.u64(32);
+        let buffer = writer.finish().expect("finish");
+        let mut reader = SnapshotWireReader::new(&buffer).expect("header");
+        assert!(read_carrier(&mut reader).is_err());
+    }
+
+    #[test]
+    fn abi_parameters_and_return_kinds_round_trip() {
+        let storage = CanonicalStorageId {
+            space: CanonicalStorageSpace::Register,
+            offset: 0x38,
+            size: 8,
+        };
+        let parameter = SourceAbiParameterSpec::new(2, storage);
+        for kind in [
+            SourceFunctionReturn::Void,
+            SourceFunctionReturn::Register { storage },
+        ] {
+            let mut writer = SnapshotWireWriter::new();
+            write_abi_parameter(&mut writer, &parameter);
+            write_function_return(&mut writer, &kind);
+            let buffer = writer.finish().expect("finish");
+            let mut reader = SnapshotWireReader::new(&buffer).expect("header");
+            assert_eq!(read_abi_parameter(&mut reader).expect("param"), parameter);
+            assert_eq!(read_function_return(&mut reader).expect("return"), kind);
+            reader.finish().expect("consumed exactly");
+        }
     }
 }
