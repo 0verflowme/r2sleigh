@@ -1,3 +1,4 @@
+#include <stdio.h>
 #include "r2sleigh_api_v2.h"
 
 #include <stddef.h>
@@ -51,6 +52,33 @@ static int data_ref_contract_matches(const R2SleighApiV2 *api, uint32_t size, ui
 		&& api->data_ref_schema_version == schema_version;
 }
 
+/* The flat transport's whole input is one buffer, so the decode entry point must
+ * refuse a malformed one rather than interpret it. */
+static int check_snapshot_wire_decode(void) {
+	int failures = 0;
+	R2SleighSnapshotWireFactsV2 facts = { 0 };
+	facts.struct_size = sizeof (facts);
+	if (r2sleigh_snapshot_wire_decode_v2 (NULL, 0, &facts)
+			!= R2SLEIGH_SNAPSHOT_WIRE_DECODE_INVALID_ARGUMENT_V2) {
+		fprintf (stderr, "FAIL: a null buffer must be an invalid argument\n");
+		failures++;
+	}
+	const uint8_t garbage[32] = { 0 };
+	if (r2sleigh_snapshot_wire_decode_v2 (garbage, sizeof (garbage), &facts)
+			!= R2SLEIGH_SNAPSHOT_WIRE_DECODE_MALFORMED_V2) {
+		fprintf (stderr, "FAIL: a buffer without the magic must be malformed\n");
+		failures++;
+	}
+	R2SleighSnapshotWireFactsV2 disagreed = { 0 };
+	disagreed.struct_size = 1;
+	if (r2sleigh_snapshot_wire_decode_v2 (garbage, sizeof (garbage), &disagreed)
+			!= R2SLEIGH_SNAPSHOT_WIRE_DECODE_INVALID_ARGUMENT_V2) {
+		fprintf (stderr, "FAIL: a facts struct this build disagrees with must be refused\n");
+		failures++;
+	}
+	return failures;
+}
+
 int main(void) {
 	R2SleighEngineRequestPayloadV2 request_payload = {
 		.abi_version = R2SLEIGH_ABI_V2,
@@ -101,7 +129,7 @@ int main(void) {
 	request_payload.radare_snapshot = &radare_snapshot;
 	const R2SleighApiV2 *api = r2sleigh_api_v2 ();
 	if (R2SLEIGH_RADARE_SNAPSHOT_CONTRACT_V2 != 1
-		|| R2SLEIGH_RADARE_FUNCTION_SNAPSHOT_SCHEMA_V2 != 12
+		|| R2SLEIGH_RADARE_FUNCTION_SNAPSHOT_SCHEMA_V2 != 13
 		|| R2SLEIGH_RADARE_SNAPSHOT_ACCESSOR_SCHEMA_V2 != 5
 		|| stack_allocation.growth != 1
 		|| stack_allocation.implicit_active_sp_bytes != 128
@@ -240,6 +268,9 @@ int main(void) {
 		|| api->owned_bytes_free (profile) != R2SLEIGH_STATUS_INVALID_ARGUMENT_V2
 		|| api->lift_context_free (context) != R2SLEIGH_STATUS_OK_V2) {
 		return 7;
+	}
+	if (check_snapshot_wire_decode ()) {
+		return 8;
 	}
 	return 0;
 }
