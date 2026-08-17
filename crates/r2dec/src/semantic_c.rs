@@ -12,8 +12,8 @@ use r2cert::{
     CertifiedMemoryStatementKind, CertifiedNormalizedStackRange,
     CertifiedPrivateFrameConditionalJoin, CertifiedReturnControl,
     CertifiedReturnRegisterDefinition, CertifiedReturnRegisterOverlay, CertifiedSourceTerminator,
-    CertifiedSourceTopology, CertifiedStackDiscipline, CertifiedStackSlot, EffectDisposition,
-    ObligationLedger,
+    CertifiedSourceTopology, CertifiedStackDiscipline, CertifiedStackSlot, CertifiedTwoWayJoinPhi,
+    EffectDisposition, ObligationLedger,
 };
 use r2ssa::{
     CallBoundarySlot, CallSiteId, CanonicalInstructionId, CanonicalStorageId,
@@ -445,6 +445,16 @@ pub enum SemanticCInputOrigin {
     CertifiedPrivateEntryStackPointer {
         storage: CanonicalStorageId,
         header: u64,
+    },
+    /// A two-way merge that its owning region assigns on each incoming edge.
+    ///
+    /// The value is one C variable, not an expression: the region declares it
+    /// with the value carried by the edge that reaches the join directly and
+    /// reassigns it inside the guarded body. Only a region holding a
+    /// `CertifiedTwoWayJoinPhi` witness may build this origin.
+    RegionAssignedJoinValue {
+        storage: CanonicalStorageId,
+        join_block: u64,
     },
     UnclassifiedSource,
 }
@@ -1708,7 +1718,14 @@ fn classify_input(
     storage: Option<CanonicalStorageId>,
     interface: Option<&SemanticCFunctionInterface>,
     private_entry_stack_pointer: Option<&CertifiedPrivateEntryStackPointerInput>,
+    region_assigned_join_block: Option<u64>,
 ) -> SemanticCInputOrigin {
+    if let (Some(join_block), Some(storage)) = (region_assigned_join_block, storage) {
+        return SemanticCInputOrigin::RegionAssignedJoinValue {
+            storage,
+            join_block,
+        };
+    }
     if let Some(origin) =
         private_entry_stack_pointer.and_then(|input| match input.classify(binding, ty) {
             origin @ SemanticCInputOrigin::CertifiedPrivateEntryStackPointer { .. } => Some(origin),
@@ -2628,10 +2645,29 @@ impl SemanticCExpressionLayer {
     ) -> Result<Self, SemanticCError> {
         let input =
             certified_private_entry_stack_pointer_input(certified, Some(join), Some(stack))?;
-        Self::from_source_with_private_entry_stack_pointer(certified, Some(&input))
+        Self::from_source_with_private_entry_stack_pointer(certified, Some(&input), None)
+    }
+
+    /// Lower a projection whose owning region holds two-way merge witnesses.
+    ///
+    /// Only a region that certified these merges may build this layer: without
+    /// the witnesses a merge stays a hard error, so no other caller can render
+    /// a variable that nothing assigns.
+    pub(crate) fn from_projection_with_join_phis(
+        certified: &CertifiedMachineProjection,
+        join_phis: &BTreeMap<CanonicalInstructionId, CertifiedTwoWayJoinPhi>,
+    ) -> Result<Self, SemanticCError> {
+        Self::from_source_with_join_phis(certified, Some(join_phis))
     }
 
     fn from_source(certified: &impl CertifiedSemanticSource) -> Result<Self, SemanticCError> {
+        Self::from_source_with_join_phis(certified, None)
+    }
+
+    fn from_source_with_join_phis(
+        certified: &impl CertifiedSemanticSource,
+        join_phis: Option<&BTreeMap<CanonicalInstructionId, CertifiedTwoWayJoinPhi>>,
+    ) -> Result<Self, SemanticCError> {
         let entry_stack_pointer = certified
             .stack_discipline()
             .map(|stack| {
@@ -2642,12 +2678,17 @@ impl SemanticCExpressionLayer {
                 )
             })
             .transpose()?;
-        Self::from_source_with_private_entry_stack_pointer(certified, entry_stack_pointer.as_ref())
+        Self::from_source_with_private_entry_stack_pointer(
+            certified,
+            entry_stack_pointer.as_ref(),
+            join_phis,
+        )
     }
 
     fn from_source_with_private_entry_stack_pointer(
         certified: &impl CertifiedSemanticSource,
         private_entry_stack_pointer: Option<&CertifiedPrivateEntryStackPointerInput>,
+        join_phis: Option<&BTreeMap<CanonicalInstructionId, CertifiedTwoWayJoinPhi>>,
     ) -> Result<Self, SemanticCError> {
         let function_interface = semantic_function_interface(certified)?;
         let machine = certified.machine_view();
@@ -2692,6 +2733,7 @@ impl SemanticCExpressionLayer {
             translated: BTreeMap::new(),
             expressions: Vec::new(),
             inputs: BTreeMap::new(),
+            join_phi_leaves: BTreeMap::new(),
         };
         let mut entities = Vec::new();
 
@@ -2754,14 +2796,54 @@ impl SemanticCExpressionLayer {
                 }
             }
 
-            let root = builder.translate(machine_entity.root())?;
-            let mut expected_sources = expression.inputs().clone();
-            expected_sources.insert(machine_entity.producer());
-            if builder.expressions[root.index()].source_instructions != expected_sources {
-                return Err(SemanticCError::CertifiedSourceMismatch(
+            let witnessed_join_phi = join_phis
+                .and_then(|phis| phis.get(&machine_entity.producer()))
+                .filter(|_| {
+                    matches!(
+                        machine.expr(machine_entity.root()).map(MachineExpr::kind),
+                        Some(MachineExprKind::Phi { .. })
+                    )
+                });
+            let root = if let Some(phi) = witnessed_join_phi {
+                // The merge's accounted dependencies are exactly the producers
+                // of its incoming values. They stay accounted; the region
+                // discharges them by assigning the variable on each edge
+                // instead of nesting them into one expression.
+                let incoming = phi
+                    .incoming()
+                    .iter()
+                    .filter_map(|edge| output_producers.get(&edge.value()).copied())
+                    .collect::<BTreeSet<_>>();
+                if incoming.len() != phi.incoming().len() || expression.inputs() != &incoming {
+                    return Err(SemanticCError::CertifiedSourceMismatch(
+                        machine_entity.producer(),
+                    ));
+                }
+                let ty = machine
+                    .expr(machine_entity.root())
+                    .ok_or(SemanticCError::MissingMachineExpression(
+                        machine_entity.root(),
+                    ))?
+                    .ty()
+                    .clone();
+                builder.push_join_phi_leaf(
+                    machine_entity.output(),
+                    ty,
+                    phi.storage(),
+                    phi.join_block(),
                     machine_entity.producer(),
-                ));
-            }
+                )?
+            } else {
+                let root = builder.translate(machine_entity.root())?;
+                let mut expected_sources = expression.inputs().clone();
+                expected_sources.insert(machine_entity.producer());
+                if builder.expressions[root.index()].source_instructions != expected_sources {
+                    return Err(SemanticCError::CertifiedSourceMismatch(
+                        machine_entity.producer(),
+                    ));
+                }
+                root
+            };
             entities.push(SemanticCEntity {
                 output: machine_entity.output(),
                 root,
@@ -2795,6 +2877,7 @@ impl SemanticCExpressionLayer {
                         *storage,
                         function_interface.as_ref(),
                         private_entry_stack_pointer,
+                        builder.join_phi_leaves.get(binding).copied(),
                     ),
                 )
             })
@@ -4014,6 +4097,7 @@ struct SemanticCBuilder<'a> {
     translated: BTreeMap<MachineExprId, SemanticCExprId>,
     expressions: Vec<SemanticCExpr>,
     inputs: BTreeMap<MachineValueBinding, (MachineType, Option<CanonicalStorageId>)>,
+    join_phi_leaves: BTreeMap<MachineValueBinding, u64>,
 }
 
 fn exact_self_xor_zero_value(
@@ -4138,6 +4222,34 @@ impl SemanticCBuilder<'_> {
             }
         }
         Ok(())
+    }
+
+    /// Materialize one witnessed two-way merge as a leaf variable reference.
+    ///
+    /// The merge's incoming expressions are deliberately not nested here: the
+    /// owning region assigns this variable on each incoming edge, so the leaf
+    /// depends on the merge instruction alone.
+    fn push_join_phi_leaf(
+        &mut self,
+        binding: MachineValueBinding,
+        ty: MachineType,
+        storage: CanonicalStorageId,
+        join_block: u64,
+        producer: CanonicalInstructionId,
+    ) -> Result<SemanticCExprId, SemanticCError> {
+        if let Some((existing, _)) = self.inputs.insert(binding, (ty.clone(), Some(storage)))
+            && existing != ty
+        {
+            return Err(SemanticCError::InconsistentInputType(binding.value()));
+        }
+        self.join_phi_leaves.insert(binding, join_block);
+        let id = SemanticCExprId(self.expressions.len() as u32);
+        self.expressions.push(SemanticCExpr {
+            ty,
+            source_instructions: BTreeSet::from([producer]),
+            kind: SemanticCExprKind::Input { binding },
+        });
+        Ok(id)
     }
 
     fn translate(&mut self, machine_id: MachineExprId) -> Result<SemanticCExprId, SemanticCError> {
@@ -4801,6 +4913,7 @@ mod return_mechanics_tests {
             translated: BTreeMap::new(),
             expressions: Vec::new(),
             inputs: BTreeMap::new(),
+            join_phi_leaves: BTreeMap::new(),
         };
         let translated = builder.translate(root).expect("semantic translation");
         (
@@ -4862,6 +4975,7 @@ mod return_mechanics_tests {
             translated: BTreeMap::new(),
             expressions: Vec::new(),
             inputs: BTreeMap::new(),
+            join_phi_leaves: BTreeMap::new(),
         };
         let mut entities = Vec::new();
         for entity in projection.entities() {

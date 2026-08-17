@@ -1340,6 +1340,32 @@ impl CertifiedSingleBlockAccounting {
     ) -> Result<Self, RegionBuildError> {
         require_source_block(certified.topology(), block_addr)?;
         let expression_layer = SemanticCExpressionLayer::from_projection(certified)?;
+        Self::from_projection_block_with_layer(certified, block_addr, expression_layer)
+    }
+
+    /// Build block-local accounting whose value layer may reference two-way
+    /// merges the owning region has certified.
+    ///
+    /// Reserved for a region holding `CertifiedTwoWayJoinPhi` witnesses: the
+    /// merges become variables that the region itself assigns on each incoming
+    /// edge, so a caller without witnesses must keep using
+    /// `from_projection_block`, where a merge stays a hard error.
+    pub(crate) fn from_projection_block_with_join_phis(
+        certified: &CertifiedMachineProjection,
+        block_addr: u64,
+        join_phis: &BTreeMap<CanonicalInstructionId, r2cert::CertifiedTwoWayJoinPhi>,
+    ) -> Result<Self, RegionBuildError> {
+        require_source_block(certified.topology(), block_addr)?;
+        let expression_layer =
+            SemanticCExpressionLayer::from_projection_with_join_phis(certified, join_phis)?;
+        Self::from_projection_block_with_layer(certified, block_addr, expression_layer)
+    }
+
+    fn from_projection_block_with_layer(
+        certified: &CertifiedMachineProjection,
+        block_addr: u64,
+        expression_layer: SemanticCExpressionLayer,
+    ) -> Result<Self, RegionBuildError> {
         Self::from_parts(
             certified.origin(),
             certified.source(),

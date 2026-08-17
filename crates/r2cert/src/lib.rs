@@ -3925,6 +3925,180 @@ pub fn certify_conditional_terminal_return_region(
     })
 }
 
+/// One exact two-way value merge at a region join, with the predecessor of
+/// every incoming value named explicitly.
+///
+/// The mapping is taken from the sealed graph's own parallel phi arrays
+/// (`GraphInst::inputs` alongside `InstPayload::Phi::predecessors`), never from
+/// the positional order of a rendered topology. A consumer may lower this merge
+/// as one variable assigned on each incoming edge; it acquires no other
+/// authority, and a merge whose incoming value is not defined on the edge that
+/// carries it is never witnessed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CertifiedTwoWayJoinPhi {
+    schema_version: u32,
+    origin: CertifiedArtifactOrigin,
+    join_block: u64,
+    producer: CanonicalInstructionId,
+    storage: CanonicalStorageId,
+    output: r2ssa::ValueId,
+    incoming: Box<[CertifiedJoinPhiIncoming]>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct CertifiedJoinPhiIncoming {
+    predecessor: u64,
+    value: r2ssa::ValueId,
+    defining_block: Option<u64>,
+}
+
+impl CertifiedJoinPhiIncoming {
+    pub const fn predecessor(&self) -> u64 {
+        self.predecessor
+    }
+
+    pub const fn value(&self) -> r2ssa::ValueId {
+        self.value
+    }
+
+    /// Block that defines this incoming value, or `None` when it enters the
+    /// function rather than being defined inside it.
+    pub const fn defining_block(&self) -> Option<u64> {
+        self.defining_block
+    }
+}
+
+impl CertifiedTwoWayJoinPhi {
+    pub const fn schema_version(&self) -> u32 {
+        self.schema_version
+    }
+
+    pub const fn origin(&self) -> &CertifiedArtifactOrigin {
+        &self.origin
+    }
+
+    pub const fn join_block(&self) -> u64 {
+        self.join_block
+    }
+
+    pub const fn producer(&self) -> CanonicalInstructionId {
+        self.producer
+    }
+
+    pub const fn storage(&self) -> CanonicalStorageId {
+        self.storage
+    }
+
+    pub const fn output(&self) -> r2ssa::ValueId {
+        self.output
+    }
+
+    pub const fn incoming(&self) -> &[CertifiedJoinPhiIncoming] {
+        &self.incoming
+    }
+
+    /// Incoming value carried by one exact predecessor edge.
+    pub fn incoming_from(&self, predecessor: u64) -> Option<&CertifiedJoinPhiIncoming> {
+        let mut found = None;
+        for candidate in &self.incoming {
+            if candidate.predecessor == predecessor {
+                if found.is_some() {
+                    return None;
+                }
+                found = Some(candidate);
+            }
+        }
+        found
+    }
+}
+
+/// Witness every exact two-way merge in one sealed artifact.
+///
+/// A phi is witnessed only when it carries a canonical storage identity, has
+/// exactly two incoming edges from two distinct predecessors that the sealed
+/// topology agrees are its predecessors, and each incoming value is defined on
+/// the edge that carries it -- either in the predecessor block itself, or in a
+/// block that reaches the join through that predecessor without passing the
+/// other one.
+fn certified_two_way_join_phis(
+    artifact: &SsaArtifact,
+    origin: &CertifiedArtifactOrigin,
+    topology: &CertifiedSourceTopology,
+) -> BTreeMap<CanonicalInstructionId, CertifiedTwoWayJoinPhi> {
+    if !origin.is_valid() || topology != origin.topology() {
+        return BTreeMap::new();
+    }
+    let graph = artifact.graph();
+    let block_addr = |id| {
+        graph
+            .blocks
+            .iter()
+            .find(|block| block.id == id)
+            .map(|block| block.addr)
+    };
+    let defining_block = |value| {
+        graph
+            .insts
+            .iter()
+            .find(|inst| inst.output == Some(value))
+            .and_then(|inst| block_addr(inst.block))
+    };
+    let mut witnessed = BTreeMap::new();
+    for inst in &graph.insts {
+        let InstPayload::Phi { predecessors } = &inst.payload else {
+            continue;
+        };
+        let (Some(storage), Some(output)) = (inst.canonical_storage, inst.output) else {
+            continue;
+        };
+        let Some(join_block) = block_addr(inst.block) else {
+            continue;
+        };
+        let Some(join) = topology.block(join_block) else {
+            continue;
+        };
+        if inst.inputs.len() != 2 || predecessors.len() != 2 {
+            continue;
+        }
+        let Some(id) = artifact.obligations().instruction_for_inst(inst.id) else {
+            continue;
+        };
+        let mut incoming = Vec::with_capacity(2);
+        for (value, predecessor) in inst.inputs.iter().copied().zip(predecessors.iter().copied()) {
+            let Some(predecessor) = block_addr(predecessor) else {
+                break;
+            };
+            if !join.predecessors().contains(&predecessor) {
+                break;
+            }
+            incoming.push(CertifiedJoinPhiIncoming {
+                predecessor,
+                value,
+                defining_block: defining_block(value),
+            });
+        }
+        let [first, second] = incoming.as_slice() else {
+            continue;
+        };
+        if first.predecessor == second.predecessor {
+            continue;
+        }
+        witnessed.insert(
+            id.id,
+            CertifiedTwoWayJoinPhi {
+                schema_version: CERTIFICATION_SCHEMA_VERSION,
+                origin: origin.clone(),
+                join_block,
+                producer: id.id,
+                storage,
+                output,
+                incoming: incoming.into_boxed_slice(),
+            },
+        );
+    }
+    witnessed
+}
+
 /// Authorize one exact closed three-block guarded function: one conditional
 /// entry whose taken edge skips a single guarded arm, one arm that transfers
 /// unconditionally into the join, and one shared join that ends in the sole
@@ -3940,6 +4114,7 @@ pub fn certify_guarded_terminal_return_region(
     origin: &CertifiedArtifactOrigin,
     ledger: &ObligationLedger,
     mappings: impl IntoIterator<Item = TypedRegionMapping>,
+    join_phis: &BTreeMap<CanonicalInstructionId, CertifiedTwoWayJoinPhi>,
     header_addr: u64,
     arm_addr: u64,
     join_addr: u64,
@@ -4002,18 +4177,49 @@ pub fn certify_guarded_terminal_return_region(
     {
         return Err(LedgerClosureError::InvalidRegionTopology);
     }
-    if let Some(instruction) = origin
-        .source()
-        .instructions()
-        .values()
-        .find(|instruction| {
-            instruction.state == SemanticInstructionState::UnsupportedUnknown
-                || matches!(instruction.id.site, r2ssa::CanonicalInstructionSite::Phi(_))
-        })
-    {
-        return Err(LedgerClosureError::UnsupportedSourceSemantics(
-            instruction.id,
-        ));
+    for instruction in origin.source().instructions().values() {
+        if instruction.state == SemanticInstructionState::UnsupportedUnknown {
+            return Err(LedgerClosureError::UnsupportedSourceSemantics(
+                instruction.id,
+            ));
+        }
+        if !matches!(instruction.id.site, r2ssa::CanonicalInstructionSite::Phi(_)) {
+            continue;
+        }
+
+        // A merge that carries no obligation renders nothing, so it needs no
+        // witness -- but it must be accounted as dead rather than merely
+        // absent.
+        if instruction.obligations.is_empty() {
+            if instruction.state != SemanticInstructionState::ProvenDead {
+                return Err(LedgerClosureError::UnsupportedSourceSemantics(
+                    instruction.id,
+                ));
+            }
+            continue;
+        }
+        // A rendered merge is admitted only as one variable assigned on each
+        // incoming edge: the value carried from the header must already be
+        // defined in the header, so it is in scope before the guard, and the
+        // value carried from the arm must be defined on that path rather than
+        // elsewhere.
+        let witnessed = join_phis.get(&instruction.id).is_some_and(|phi| {
+            phi.origin() == origin
+                && phi.schema_version() == CERTIFICATION_SCHEMA_VERSION
+                && phi.join_block() == join_addr
+                && phi.incoming().len() == 2
+                && phi
+                    .incoming_from(header_addr)
+                    .is_some_and(|edge| edge.defining_block() == Some(header_addr))
+                && phi.incoming_from(arm_addr).is_some_and(|edge| {
+                    matches!(edge.defining_block(), Some(block) if block == header_addr || block == arm_addr)
+                })
+        });
+        if !witnessed {
+            return Err(LedgerClosureError::UnsupportedSourceSemantics(
+                instruction.id,
+            ));
+        }
     }
     if origin.source().obligations().values().any(|obligation| {
         !matches!(
@@ -10347,6 +10553,7 @@ pub struct CertifiedMachineProjection {
     closed_natural_loop_controls: BTreeMap<u64, CertifiedClosedNaturalLoopControl>,
     switch_topologies: BTreeMap<u64, CertifiedSwitchTopology>,
     switch_controls: BTreeMap<u64, CertifiedSwitchControl>,
+    two_way_join_phis: BTreeMap<CanonicalInstructionId, CertifiedTwoWayJoinPhi>,
     stack_discipline: Option<CertifiedStackDiscipline>,
     private_frame_value_flows: BTreeMap<StructuredAccessId, CertifiedPrivateFrameValueFlow>,
     private_frame_conditional_joins: BTreeMap<u64, CertifiedPrivateFrameConditionalJoin>,
@@ -10898,6 +11105,7 @@ impl CertifiedMachineProjection {
                     ledger: certification.ledger(),
                 },
             );
+        let two_way_join_phis = certified_two_way_join_phis(artifact, &origin, &topology);
         Ok(Self {
             origin,
             projection,
@@ -10922,6 +11130,7 @@ impl CertifiedMachineProjection {
             frame_preservation,
             residual_producers,
             topology,
+            two_way_join_phis,
         })
     }
 
@@ -10951,6 +11160,13 @@ impl CertifiedMachineProjection {
 
     pub const fn stack_discipline(&self) -> Option<&CertifiedStackDiscipline> {
         self.stack_discipline.as_ref()
+    }
+
+    /// Exact two-way value merges witnessed in this sealed artifact.
+    pub const fn two_way_join_phis(
+        &self,
+    ) -> &BTreeMap<CanonicalInstructionId, CertifiedTwoWayJoinPhi> {
+        &self.two_way_join_phis
     }
 
     pub fn private_frame_value_flow(

@@ -70,6 +70,7 @@ pub struct CertifiedGuardedReturnFunction {
     arm_addr: u64,
     join_addr: u64,
     polarity: GuardPolarity,
+    merges: Box<[GuardRegionMerge]>,
     return_producer: CanonicalInstructionId,
     mappings: Box<[RegionObligationMapping]>,
     typed_output_seal: CertifiedTypedOutputSeal,
@@ -163,6 +164,41 @@ fn typed_region_mappings(
         .collect()
 }
 
+/// One two-way merge the region owns: a C variable declared with the value the
+/// header edge carries and reassigned with the value the arm edge carries.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct GuardRegionMerge {
+    binding: MachineValueBinding,
+    header_binding: MachineValueBinding,
+    arm_binding: MachineValueBinding,
+    storage_type: &'static str,
+}
+
+impl GuardRegionMerge {
+    pub const fn binding(&self) -> MachineValueBinding {
+        self.binding
+    }
+
+    pub const fn header_binding(&self) -> MachineValueBinding {
+        self.header_binding
+    }
+
+    pub const fn arm_binding(&self) -> MachineValueBinding {
+        self.arm_binding
+    }
+}
+
+/// Binding this layer defines for one sealed value, if any.
+fn defined_binding_for_value(
+    layer: &SemanticCBlockStepLayer,
+    value: r2ssa::ValueId,
+) -> Option<MachineValueBinding> {
+    layer.steps().iter().find_map(|step| {
+        let entity = layer.resolve_value(step.value()?)?;
+        (entity.output().value() == value).then(|| entity.output())
+    })
+}
+
 /// Split the two header successors into the guarded arm and the shared join.
 ///
 /// The arm is the successor whose only successor is the other header successor.
@@ -210,17 +246,61 @@ impl CertifiedGuardedReturnFunction {
         let (arm_addr, join_addr, polarity) =
             guard_arm_and_join(certified.topology(), true_target, false_target)?;
 
+        let join_phis = certified.two_way_join_phis();
         let header = CertifiedConditionalTransferBlockRegion::from_accounting(
-            CertifiedSingleBlockAccounting::from_projection_block(certified, header_addr)?,
+            CertifiedSingleBlockAccounting::from_projection_block_with_join_phis(
+                certified,
+                header_addr,
+                join_phis,
+            )?,
         )?;
-        let arm_accounting =
-            CertifiedSingleBlockAccounting::from_projection_block(certified, arm_addr)?;
+        let arm_accounting = CertifiedSingleBlockAccounting::from_projection_block_with_join_phis(
+            certified, arm_addr, join_phis,
+        )?;
         validate_guarded_arm(&arm_accounting, join_addr)?;
         let arm = SemanticCBlockStepLayer::from_accounting(arm_accounting)?;
-        let join_accounting =
-            CertifiedSingleBlockAccounting::from_projection_block(certified, join_addr)?;
+        let join_accounting = CertifiedSingleBlockAccounting::from_projection_block_with_join_phis(
+            certified, join_addr, join_phis,
+        )?;
         let return_producer = validate_join(&join_accounting)?;
         let join = SemanticCBlockStepLayer::from_accounting(join_accounting)?;
+
+        let mut merges = Vec::new();
+        for (binding, origin) in join.accounting().expression_layer().input_origins() {
+            let SemanticCInputOrigin::RegionAssignedJoinValue { join_block, .. } = origin else {
+                continue;
+            };
+            let phi = join_phis
+                .values()
+                .find(|phi| phi.output() == binding.value())
+                .filter(|phi| *join_block == join_addr && phi.join_block() == join_addr)
+                .ok_or(GuardedReturnFunctionError::NotGuardedTopology)?;
+            let header_edge = phi
+                .incoming_from(header_addr)
+                .ok_or(GuardedReturnFunctionError::NotGuardedTopology)?;
+            let arm_edge = phi
+                .incoming_from(arm_addr)
+                .ok_or(GuardedReturnFunctionError::NotGuardedTopology)?;
+            let header_binding = defined_binding_for_value(header.body(), header_edge.value())
+                .ok_or(GuardedReturnFunctionError::NotGuardedTopology)?;
+            let arm_binding = defined_binding_for_value(&arm, arm_edge.value())
+                .or_else(|| defined_binding_for_value(header.body(), arm_edge.value()))
+                .ok_or(GuardedReturnFunctionError::NotGuardedTopology)?;
+            merges.push(GuardRegionMerge {
+                binding: *binding,
+                header_binding,
+                arm_binding,
+                storage_type: storage_type(
+                    join.accounting()
+                        .expression_layer()
+                        .inputs()
+                        .get(binding)
+                        .map(|(ty, _)| ty)
+                        .ok_or(GuardedReturnFunctionError::NotGuardedTopology)?,
+                )?,
+            });
+        }
+        let merges = merges.into_boxed_slice();
 
         let mappings = header
             .mappings()
@@ -239,6 +319,7 @@ impl CertifiedGuardedReturnFunction {
             certified.origin(),
             certified.ledger(),
             typed_mappings,
+            certified.two_way_join_phis(),
             header_addr,
             arm_addr,
             join_addr,
@@ -264,6 +345,7 @@ impl CertifiedGuardedReturnFunction {
             arm_addr,
             join_addr,
             polarity,
+            merges,
             return_producer,
             mappings,
             typed_output_seal,
@@ -458,13 +540,31 @@ impl CertifiedGuardedReturnFunction {
             .iter()
             .filter_map(|parameter| parameter.value())
             .collect::<BTreeSet<_>>();
+        let region_assigned = self
+            .merges
+            .iter()
+            .map(GuardRegionMerge::binding)
+            .collect::<BTreeSet<_>>();
         render_block_steps(
             &mut output,
             self.header.body(),
             "\t",
             &mut defined,
+            &region_assigned,
             &mut helpers,
         )?;
+        for merge in &self.merges {
+            require_defined(merge.header_binding, &defined, self.return_producer)?;
+            writeln!(
+                &mut output,
+                "\t{} {} = {};",
+                merge.storage_type,
+                value_name(merge.binding),
+                value_name(merge.header_binding)
+            )
+            .expect("String writes cannot fail");
+            defined.insert(merge.binding);
+        }
 
         let condition = self.render_condition()?;
         let test = match self.polarity {
@@ -480,11 +580,35 @@ impl CertifiedGuardedReturnFunction {
         // pre-arm set is what makes a join that consumed an arm definition
         // fail to render instead of silently reading a merged value.
         let pre_arm = defined.clone();
-        render_block_steps(&mut output, &self.arm, "\t\t", &mut defined, &mut helpers)?;
+        render_block_steps(
+            &mut output,
+            &self.arm,
+            "\t\t",
+            &mut defined,
+            &region_assigned,
+            &mut helpers,
+        )?;
+        for merge in &self.merges {
+            require_defined(merge.arm_binding, &defined, self.return_producer)?;
+            writeln!(
+                &mut output,
+                "\t\t{} = {};",
+                value_name(merge.binding),
+                value_name(merge.arm_binding)
+            )
+            .expect("String writes cannot fail");
+        }
         defined = pre_arm;
         output.push_str("\t}\n");
 
-        render_block_steps(&mut output, &self.join, "\t", &mut defined, &mut helpers)?;
+        render_block_steps(
+            &mut output,
+            &self.join,
+            "\t",
+            &mut defined,
+            &region_assigned,
+            &mut helpers,
+        )?;
         let returned = self
             .join
             .accounting()
@@ -630,6 +754,7 @@ fn render_block_steps(
     layer: &SemanticCBlockStepLayer,
     indent: &str,
     defined: &mut BTreeSet<MachineValueBinding>,
+    region_assigned: &BTreeSet<MachineValueBinding>,
     helpers: &mut SemanticCHelperSet,
 ) -> Result<(), GuardedReturnFunctionError> {
     let expressions = layer.accounting().expression_layer();
@@ -677,6 +802,11 @@ fn render_block_steps(
         let entity = layer
             .resolve_value(reference)
             .ok_or(GuardedReturnFunctionError::UnsupportedMemory(step.source()))?;
+        // A region-assigned merge is declared and reassigned by the region on
+        // each incoming edge, so its own step emits nothing here.
+        if region_assigned.contains(&entity.output()) {
+            continue;
+        }
         writeln!(
             output,
             "{indent}{} {} = {};",
