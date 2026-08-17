@@ -85,23 +85,6 @@ int main(void) {
 		.struct_size = sizeof (request_payload),
 		.timeout_us = 10,
 	};
-	R2SleighRadareAccessorsV2 radare_accessors = {
-		.struct_size = sizeof (radare_accessors),
-		.abi_version = R2SLEIGH_RADARE_SNAPSHOT_CONTRACT_V2,
-		.snapshot_schema_version = R2SLEIGH_RADARE_FUNCTION_SNAPSHOT_SCHEMA_V2,
-		.accessor_schema_version = R2SLEIGH_RADARE_SNAPSHOT_ACCESSOR_SCHEMA_V2,
-	};
-	R2SleighRadareSnapshotInputV2 radare_snapshot = {
-		.struct_size = sizeof (radare_snapshot),
-		.abi_version = R2SLEIGH_RADARE_SNAPSHOT_CONTRACT_V2,
-		.snapshot_schema_version = R2SLEIGH_RADARE_FUNCTION_SNAPSHOT_SCHEMA_V2,
-		.accessor_schema_version = R2SLEIGH_RADARE_SNAPSHOT_ACCESSOR_SCHEMA_V2,
-		.accessors = &radare_accessors,
-	};
-	R2SleighRadareStackAllocationContractViewV2 stack_allocation = {
-		.growth = 1,
-		.implicit_active_sp_bytes = 128,
-	};
 	R2SleighSwitchCaseV2 switch_case = {
 		.value = 1,
 		.target = 0x402000,
@@ -126,16 +109,9 @@ int main(void) {
 		.kind = R2SLEIGH_PLANNER_ANALYSIS_POLICY_V2,
 	};
 	R2SleighPlannerQueryResponseV2 planner_response = {0};
-	request_payload.radare_snapshot = &radare_snapshot;
 	const R2SleighApiV2 *api = r2sleigh_api_v2 ();
 	if (R2SLEIGH_RADARE_SNAPSHOT_CONTRACT_V2 != 1
 		|| R2SLEIGH_RADARE_FUNCTION_SNAPSHOT_SCHEMA_V2 != 13
-		|| R2SLEIGH_RADARE_SNAPSHOT_ACCESSOR_SCHEMA_V2 != 5
-		|| stack_allocation.growth != 1
-		|| stack_allocation.implicit_active_sp_bytes != 128
-		|| radare_snapshot.struct_size != sizeof (R2SleighRadareSnapshotInputV2)
-		|| radare_snapshot.accessors != &radare_accessors
-		|| radare_accessors.struct_size != sizeof (R2SleighRadareAccessorsV2)
 		|| R2SLEIGH_RESPONSE_INFO_SCHEMA_V2 != 2
 		|| switch_case.target != 0x402000
 		|| call_identity.op_index != 3
@@ -144,7 +120,6 @@ int main(void) {
 		|| analysis_query.kind != R2SLEIGH_QUERY_BLOCK_VALUES_V2
 		|| analysis_view.kind != 0
 		|| request_payload.timeout_us != 10
-		|| request_payload.radare_snapshot != &radare_snapshot
 		|| R2SLEIGH_MAX_FUNCTION_BLOCKS_V2 != 200
 		|| R2SLEIGH_MAX_SWITCH_CASES_V2 != 4096
 		|| R2SLEIGH_MAX_FUNCTION_INPUT_BYTES_V2 != (16U << 20)
@@ -167,8 +142,6 @@ int main(void) {
 		|| api->data_ref_schema_version != R2SLEIGH_DATA_REF_SCHEMA_V2
 		|| api->planner_query_request_size != sizeof (R2SleighPlannerQueryRequestV2)
 		|| api->planner_query_response_size != sizeof (R2SleighPlannerQueryResponseV2)
-		|| api->radare_snapshot_input_size != sizeof (R2SleighRadareSnapshotInputV2)
-		|| api->radare_accessors_size != sizeof (R2SleighRadareAccessorsV2)
 		|| (api->capabilities & R2SLEIGH_CAPABILITIES_V2) != R2SLEIGH_CAPABILITIES_V2
 		|| !(api->capabilities & R2SLEIGH_CAP_RESPONSE_INFO_V2)
 		|| !(api->capabilities & R2SLEIGH_CAP_EXECUTION_CONTROL_V2)

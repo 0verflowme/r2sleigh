@@ -1090,8 +1090,6 @@ static char *sleigh_engine_execute_v2_project(uint32_t kind, uint64_t required_c
 		|| api->session_config_size != sizeof (R2SleighSessionConfigV2)
 		|| api->request_size != sizeof (R2SleighRequestV2)
 		|| api->engine_request_payload_size != sizeof (R2SleighEngineRequestPayloadV2)
-		|| api->radare_snapshot_input_size != sizeof (R2SleighRadareSnapshotInputV2)
-		|| api->radare_accessors_size != sizeof (R2SleighRadareAccessorsV2)
 		|| api->byte_view_size != sizeof (R2SleighByteViewV2)
 		|| api->phase_timing_size != sizeof (R2SleighPhaseTimingV2)
 		|| api->response_info_size != sizeof (R2SleighResponseInfoV2)

@@ -173,279 +173,22 @@ pub struct R2SleighStringViewV2 {
     pub len: usize,
 }
 
-/// Borrowed opaque radare2 function snapshot plus its immutable accessor table.
-/// Both pointers are valid only for the duration of one synchronous `execute`
-/// callback. Rust deep-copies the source before returning to the caller.
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
-pub struct R2SleighRadareSnapshotInputV2 {
-    pub struct_size: u32,
-    pub abi_version: u32,
-    pub snapshot_schema_version: u32,
-    pub accessor_schema_version: u32,
-    pub snapshot: *const c_void,
-    pub accessors: *const R2SleighRadareAccessorsV2,
-}
 
-#[repr(C)]
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct R2SleighRadareSnapshotViewV2 {
-    pub schema_version: u32,
-    pub struct_size: u32,
-    pub capabilities: u64,
-    pub function_addr: u64,
-    pub function_size: u64,
-    pub bits: i32,
-    pub endian: u32,
-    pub maxstack: i64,
-    pub arch_id_length: usize,
-    pub cpu_id_length: usize,
-    pub function_name_length: usize,
-    pub num_base_types: usize,
-    pub type_context_hash: u64,
-    pub num_call_site_interfaces: usize,
-    pub num_stack_slots: usize,
-    pub revision_identity: u64,
-    pub num_types: usize,
-    pub num_aggregates: usize,
-    pub num_blocks: usize,
-    pub num_external_exits: usize,
-    pub total_source_bytes: usize,
-}
 
-#[repr(C)]
-#[derive(Debug, Clone, Copy, Default)]
-pub struct R2SleighRadareBlockViewV2 {
-    pub addr: u64,
-    pub size: u64,
-    pub num_successors: usize,
-    pub switch_addr: u64,
-}
 
-#[repr(C)]
-#[derive(Debug, Clone, Copy, Default)]
-pub struct R2SleighRadareSuccessorViewV2 {
-    pub kind: i32,
-    pub target_addr: u64,
-    pub case_value: u64,
-    pub external: u8,
-}
 
-#[repr(C)]
-#[derive(Debug, Clone, Copy, Default)]
-pub struct R2SleighRadareRegisterStorageViewV2 {
-    pub name_length: usize,
-    pub offset: u64,
-    pub size: u32,
-}
 
-#[repr(C)]
-#[derive(Debug, Clone, Copy, Default)]
-pub struct R2SleighRadareCarrierProjectionV2 {
-    pub kind: i32,
-    pub offset_bits: u64,
-    pub size_bits: u64,
-}
 
-#[repr(C)]
-#[derive(Debug, Clone, Copy, Default)]
-pub struct R2SleighRadareParameterViewV2 {
-    pub index: u32,
-    pub name_length: usize,
-    pub storage: R2SleighRadareRegisterStorageViewV2,
-    pub logical_type_id: u32,
-    pub carrier: R2SleighRadareCarrierProjectionV2,
-}
 
-#[repr(C)]
-#[derive(Debug, Clone, Copy, Default)]
-pub struct R2SleighRadareFunctionInterfaceViewV2 {
-    pub calling_convention_length: usize,
-    pub num_parameters: usize,
-    pub return_kind: i32,
-    pub return_storage: R2SleighRadareRegisterStorageViewV2,
-    pub return_address_storage: R2SleighRadareRegisterStorageViewV2,
-    pub stack_pointer_storage: R2SleighRadareRegisterStorageViewV2,
-    pub variadic: u8,
-    pub noreturn: u8,
-    pub stack_resources_complete: u8,
-    pub stack_slot_roles_complete: u8,
-    pub complete: u8,
-    pub return_type_id: u32,
-    pub return_carrier: R2SleighRadareCarrierProjectionV2,
-    pub logical_types_complete: u8,
-    pub stack_pointer_preserved_across_calls: u8,
-    pub frame_pointer_preserved_across_calls: u8,
-}
 
-#[repr(C)]
-#[derive(Debug, Clone, Copy, Default)]
-pub struct R2SleighRadareCallSiteViewV2 {
-    pub instruction_addr: u64,
-    pub target_addr: u64,
-    pub calling_convention_length: usize,
-    pub num_arguments: usize,
-    pub result_kind: i32,
-    pub result_storage: R2SleighRadareRegisterStorageViewV2,
-    pub variadic: u8,
-    pub noreturn: u8,
-    pub complete: u8,
-}
 
-#[repr(C)]
-#[derive(Debug, Clone, Copy, Default)]
-pub struct R2SleighRadareTypeGraphViewV2 {
-    pub num_types: usize,
-    pub num_aggregates: usize,
-    pub complete: u8,
-}
 
-#[repr(C)]
-#[derive(Debug, Clone, Copy, Default)]
-pub struct R2SleighRadareTypeViewV2 {
-    pub id: u32,
-    pub kind: i32,
-    pub size_bits: u64,
-    pub align_bits: u64,
-    pub target_type_id: u32,
-    pub aggregate_id: u32,
-}
 
-#[repr(C)]
-#[derive(Debug, Clone, Copy, Default)]
-pub struct R2SleighRadareAggregateViewV2 {
-    pub id: u32,
-    pub type_id: u32,
-    pub size_bits: u64,
-    pub align_bits: u64,
-    pub name_length: usize,
-    pub num_members: usize,
-    pub complete: u8,
-    pub c_layout_compatible: u8,
-}
 
-#[repr(C)]
-#[derive(Debug, Clone, Copy, Default)]
-pub struct R2SleighRadareAggregateMemberViewV2 {
-    pub member_id: u32,
-    pub type_id: u32,
-    pub offset_bits: u64,
-    pub size_bits: u64,
-    pub count: usize,
-    pub name_length: usize,
-}
 
-#[repr(C)]
-#[derive(Debug, Clone, Copy, Default)]
-pub struct R2SleighRadareStackSlotViewV2 {
-    pub name_length: usize,
-    pub type_length: usize,
-    pub base: i32,
-    pub base_name_length: usize,
-    pub base_offset: u64,
-    pub base_size: u32,
-    pub offset: i64,
-    pub size: u32,
-    pub offset_valid: u8,
-    pub role: i32,
-    pub arg_index: i32,
-    pub arg_name_length: usize,
-    pub home_reg_length: usize,
-    pub home_reg_offset: u64,
-    pub home_reg_size: u32,
-}
 
-#[repr(C)]
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct R2SleighRadareReturnMechanismViewV2 {
-    pub kind: i32,
-    pub stack_offset: i64,
-    pub slot_size_bytes: u32,
-    pub stack_pointer_delta_bytes: u32,
-}
 
-#[repr(C)]
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct R2SleighRadareStackAllocationContractViewV2 {
-    pub growth: i32,
-    pub implicit_active_sp_bytes: u32,
-}
 
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
-pub struct R2SleighRadareAccessorsV2 {
-    pub struct_size: u32,
-    pub abi_version: u32,
-    pub snapshot_schema_version: u32,
-    pub accessor_schema_version: u32,
-    pub snapshot_view:
-        Option<unsafe extern "C" fn(*const c_void, *mut R2SleighRadareSnapshotViewV2) -> u8>,
-    pub arch_id: Option<unsafe extern "C" fn(*const c_void, *mut u8, usize) -> u8>,
-    pub cpu_id: Option<unsafe extern "C" fn(*const c_void, *mut u8, usize) -> u8>,
-    pub function_name: Option<unsafe extern "C" fn(*const c_void, *mut u8, usize) -> u8>,
-    pub interface_view: Option<
-        unsafe extern "C" fn(*const c_void, *mut R2SleighRadareFunctionInterfaceViewV2) -> u8,
-    >,
-    pub interface_calling_convention:
-        Option<unsafe extern "C" fn(*const c_void, *mut u8, usize) -> u8>,
-    pub interface_storage_name:
-        Option<unsafe extern "C" fn(*const c_void, i32, *mut u8, usize) -> u8>,
-    pub parameter_view: Option<
-        unsafe extern "C" fn(*const c_void, usize, *mut R2SleighRadareParameterViewV2) -> u8,
-    >,
-    pub parameter_name: Option<unsafe extern "C" fn(*const c_void, usize, *mut u8, usize) -> u8>,
-    pub parameter_storage_name:
-        Option<unsafe extern "C" fn(*const c_void, usize, *mut u8, usize) -> u8>,
-    pub stack_slot_view: Option<
-        unsafe extern "C" fn(*const c_void, usize, *mut R2SleighRadareStackSlotViewV2) -> u8,
-    >,
-    pub stack_slot_string:
-        Option<unsafe extern "C" fn(*const c_void, usize, i32, *mut u8, usize) -> u8>,
-    pub call_site_view:
-        Option<unsafe extern "C" fn(*const c_void, usize, *mut R2SleighRadareCallSiteViewV2) -> u8>,
-    pub call_site_calling_convention:
-        Option<unsafe extern "C" fn(*const c_void, usize, *mut u8, usize) -> u8>,
-    pub call_site_result_storage_name:
-        Option<unsafe extern "C" fn(*const c_void, usize, *mut u8, usize) -> u8>,
-    pub call_argument_view: Option<
-        unsafe extern "C" fn(*const c_void, usize, usize, *mut R2SleighRadareParameterViewV2) -> u8,
-    >,
-    pub call_argument_storage_name:
-        Option<unsafe extern "C" fn(*const c_void, usize, usize, *mut u8, usize) -> u8>,
-    pub type_graph_view:
-        Option<unsafe extern "C" fn(*const c_void, *mut R2SleighRadareTypeGraphViewV2) -> u8>,
-    pub type_view:
-        Option<unsafe extern "C" fn(*const c_void, usize, *mut R2SleighRadareTypeViewV2) -> u8>,
-    pub aggregate_view: Option<
-        unsafe extern "C" fn(*const c_void, usize, *mut R2SleighRadareAggregateViewV2) -> u8,
-    >,
-    pub aggregate_name: Option<unsafe extern "C" fn(*const c_void, usize, *mut u8, usize) -> u8>,
-    pub aggregate_member_view: Option<
-        unsafe extern "C" fn(
-            *const c_void,
-            usize,
-            usize,
-            *mut R2SleighRadareAggregateMemberViewV2,
-        ) -> u8,
-    >,
-    pub aggregate_member_name:
-        Option<unsafe extern "C" fn(*const c_void, usize, usize, *mut u8, usize) -> u8>,
-    pub block_view:
-        Option<unsafe extern "C" fn(*const c_void, usize, *mut R2SleighRadareBlockViewV2) -> u8>,
-    pub block_bytes:
-        Option<unsafe extern "C" fn(*const c_void, usize, usize, *mut u8, usize) -> u8>,
-    pub successor_view: Option<
-        unsafe extern "C" fn(*const c_void, usize, usize, *mut R2SleighRadareSuccessorViewV2) -> u8,
-    >,
-    pub external_exit: Option<unsafe extern "C" fn(*const c_void, usize, *mut u64) -> u8>,
-    pub return_mechanism_view:
-        Option<unsafe extern "C" fn(*const c_void, *mut R2SleighRadareReturnMechanismViewV2) -> u8>,
-    pub frame_pointer_storage_view:
-        Option<unsafe extern "C" fn(*const c_void, *mut R2SleighRadareRegisterStorageViewV2) -> u8>,
-    pub stack_allocation_contract_view: Option<
-        unsafe extern "C" fn(*const c_void, *mut R2SleighRadareStackAllocationContractViewV2) -> u8,
-    >,
-}
 
 macro_rules! assert_wire_layout {
     ($wire:ty, $source:ty) => {
@@ -454,65 +197,6 @@ macro_rules! assert_wire_layout {
     };
 }
 
-assert_wire_layout!(
-    R2SleighRadareSnapshotInputV2,
-    r2source::RadareAbi138SnapshotInput
-);
-assert_wire_layout!(
-    R2SleighRadareSnapshotViewV2,
-    r2source::RadareAbi138SnapshotView
-);
-assert_wire_layout!(R2SleighRadareBlockViewV2, r2source::RadareAbi138BlockView);
-assert_wire_layout!(
-    R2SleighRadareSuccessorViewV2,
-    r2source::RadareAbi138SuccessorView
-);
-assert_wire_layout!(
-    R2SleighRadareRegisterStorageViewV2,
-    r2source::RadareAbi138RegisterStorageView
-);
-assert_wire_layout!(
-    R2SleighRadareCarrierProjectionV2,
-    r2source::RadareAbi138CarrierProjection
-);
-assert_wire_layout!(
-    R2SleighRadareParameterViewV2,
-    r2source::RadareAbi138ParameterView
-);
-assert_wire_layout!(
-    R2SleighRadareFunctionInterfaceViewV2,
-    r2source::RadareAbi138FunctionInterfaceView
-);
-assert_wire_layout!(
-    R2SleighRadareCallSiteViewV2,
-    r2source::RadareAbi138CallSiteView
-);
-assert_wire_layout!(
-    R2SleighRadareTypeGraphViewV2,
-    r2source::RadareAbi138TypeGraphView
-);
-assert_wire_layout!(R2SleighRadareTypeViewV2, r2source::RadareAbi138TypeView);
-assert_wire_layout!(
-    R2SleighRadareAggregateViewV2,
-    r2source::RadareAbi138AggregateView
-);
-assert_wire_layout!(
-    R2SleighRadareAggregateMemberViewV2,
-    r2source::RadareAbi138AggregateMemberView
-);
-assert_wire_layout!(
-    R2SleighRadareStackSlotViewV2,
-    r2source::RadareAbi138StackSlotView
-);
-assert_wire_layout!(
-    R2SleighRadareReturnMechanismViewV2,
-    r2source::RadareAbi138ReturnMechanismView
-);
-assert_wire_layout!(
-    R2SleighRadareStackAllocationContractViewV2,
-    r2source::RadareAbi138StackAllocationContractView
-);
-assert_wire_layout!(R2SleighRadareAccessorsV2, r2source::RadareAbi138Accessors);
 const _: [(); R2SLEIGH_RADARE_SNAPSHOT_CONTRACT_V2 as usize] = [(); r2source::RADARE_SNAPSHOT_CONTRACT_VERSION as usize];
 const _: [(); R2SLEIGH_RADARE_FUNCTION_SNAPSHOT_SCHEMA_V2 as usize] =
     [(); r2source::RADARE_FUNCTION_SNAPSHOT_SCHEMA_VERSION as usize];
@@ -601,11 +285,8 @@ pub struct R2SleighEngineRequestPayloadV2 {
     pub struct_size: u32,
     /// Relative request deadline. Zero disables the deadline.
     pub timeout_us: u64,
-    /// Opaque certifying source, read through the accessor table.
-    pub radare_snapshot: *const R2SleighRadareSnapshotInputV2,
-    /// The same source serialized into one flat buffer. When present this is
-    /// used and the accessor table is not consulted, which is what lets the
-    /// callbacks and their size handshakes go away.
+    /// The certifying source, serialized into one flat buffer. This is the
+    /// whole input: there is no second way to reach a snapshot.
     pub snapshot_buffer: *const u8,
     pub snapshot_buffer_len: usize,
 }
@@ -808,8 +489,6 @@ pub struct R2SleighApiV2 {
     pub data_ref_schema_version: u32,
     pub planner_query_request_size: u32,
     pub planner_query_response_size: u32,
-    pub radare_snapshot_input_size: u32,
-    pub radare_accessors_size: u32,
     pub session_create:
         extern "C" fn(*const R2SleighSessionConfigV2, *mut *mut R2SleighSessionV2) -> u32,
     pub session_free: extern "C" fn(*mut R2SleighSessionV2) -> u32,
@@ -1510,34 +1189,6 @@ unsafe fn capture_trusted_ssa_from_buffer(
     trusted_from_source(source, execution)
 }
 
-unsafe fn capture_trusted_ssa(
-    input: *const R2SleighRadareSnapshotInputV2,
-    execution: &r2engine::EngineExecutionControl,
-) -> Result<Arc<r2ssa::TrustedSsaArtifact>, BoundaryError> {
-    let ssa_control = execution.ssa_execution_control();
-    r2ssa::SsaWorkControl::poll(&ssa_control)
-        .map_err(|error| BoundaryError::engine(format!("trusted ingress stopped: {error}")))?;
-    valid_object_ptr(input, "engine payload radare snapshot")?;
-    // The local wire declarations are compile-time size/alignment checked
-    // against r2source above and preserve the exact repr(C) field order.
-    let source_input = unsafe { &*input.cast::<r2source::RadareAbi138SnapshotInput>() };
-    let source = unsafe { r2source::capture_radare_abi138(source_input) }.map_err(|error| {
-        use r2source::RadareAbi138CaptureError as CaptureError;
-        match error {
-            CaptureError::InvalidInputSize
-            | CaptureError::UnsupportedVersion
-            | CaptureError::InvalidAccessorSize => {
-                BoundaryError::abi(format!("opaque source snapshot refused: {error}"))
-            }
-            CaptureError::BudgetExceeded => {
-                BoundaryError::limit(format!("opaque source snapshot refused: {error}"))
-            }
-            _ => BoundaryError::invalid(format!("opaque source snapshot refused: {error}")),
-        }
-    })?;
-    trusted_from_source(source, execution)
-}
-
 /// Lift and prepare one owned snapshot, whichever transport produced it. Both
 /// ingress paths share this so the buffer path cannot drift from the accessor
 /// path in anything after the source is owned.
@@ -1601,10 +1252,9 @@ unsafe fn execute_request(
             "engine payload ABI version or struct size mismatch",
         ));
     }
-    let has_buffer = !payload.snapshot_buffer.is_null() && payload.snapshot_buffer_len != 0;
-    if payload.radare_snapshot.is_null() && !has_buffer {
+    if payload.snapshot_buffer.is_null() || payload.snapshot_buffer_len == 0 {
         return Err(BoundaryError::invalid(
-            "engine request requires an opaque radare snapshot",
+            "engine request requires a serialized radare snapshot",
         ));
     }
     if !matches!(
@@ -1619,13 +1269,7 @@ unsafe fn execute_request(
             .unwrap_or_else(Instant::now)
     });
     let execution = r2engine::EngineExecutionControl::new(cancellation, deadline);
-    // The flat buffer is the whole source when it is present, so the accessor
-    // table is not consulted at all on that path.
-    let trusted = if has_buffer {
-        unsafe { capture_trusted_ssa_from_buffer(payload, &execution) }?
-    } else {
-        unsafe { capture_trusted_ssa(payload.radare_snapshot, &execution) }?
-    };
+    let trusted = unsafe { capture_trusted_ssa_from_buffer(payload, &execution) }?;
     let ffi_conversion_elapsed_us = elapsed_us(ffi_started);
     let output = match request.kind {
         R2SLEIGH_REQUEST_DECOMPILE_V2 => {
@@ -3148,8 +2792,6 @@ static API_V2: R2SleighApiV2 = R2SleighApiV2 {
     data_ref_schema_version: R2SLEIGH_DATA_REF_SCHEMA_V2,
     planner_query_request_size: size_of::<R2SleighPlannerQueryRequestV2>() as u32,
     planner_query_response_size: size_of::<R2SleighPlannerQueryResponseV2>() as u32,
-    radare_snapshot_input_size: size_of::<R2SleighRadareSnapshotInputV2>() as u32,
-    radare_accessors_size: size_of::<R2SleighRadareAccessorsV2>() as u32,
     session_create,
     session_free,
     session_cancel,
@@ -4058,22 +3700,16 @@ mod tests {
         }
     }
 
-    fn opaque_payload(source: &R2SleighRadareSnapshotInputV2) -> R2SleighEngineRequestPayloadV2 {
-        R2SleighEngineRequestPayloadV2 {
-            abi_version: R2SLEIGH_ABI_V2,
-            struct_size: u32_size::<R2SleighEngineRequestPayloadV2>(),
-            timeout_us: 0,
-            radare_snapshot: source,
-        }
-    }
+
 
     #[test]
-    fn engine_request_requires_opaque_snapshot_before_access() {
+    fn engine_request_requires_a_serialized_snapshot_before_access() {
         let payload = R2SleighEngineRequestPayloadV2 {
             abi_version: R2SLEIGH_ABI_V2,
             struct_size: u32_size::<R2SleighEngineRequestPayloadV2>(),
             timeout_us: 0,
-            radare_snapshot: ptr::null(),
+            snapshot_buffer: ptr::null(),
+            snapshot_buffer_len: 0,
         };
         let error = unsafe {
             execute_request(
@@ -4085,70 +3721,15 @@ mod tests {
         assert_eq!(error.status, R2SLEIGH_STATUS_INVALID_ARGUMENT_V2);
         assert_eq!(
             error.message,
-            "engine request requires an opaque radare snapshot"
+            "engine request requires a serialized radare snapshot"
         );
     }
 
-    #[test]
-    fn opaque_source_rejects_stale_schema_before_foreign_access() {
-        let source = R2SleighRadareSnapshotInputV2 {
-            struct_size: u32_size::<R2SleighRadareSnapshotInputV2>(),
-            abi_version: R2SLEIGH_RADARE_SNAPSHOT_CONTRACT_V2,
-            snapshot_schema_version: R2SLEIGH_RADARE_FUNCTION_SNAPSHOT_SCHEMA_V2 - 1,
-            accessor_schema_version: R2SLEIGH_RADARE_SNAPSHOT_ACCESSOR_SCHEMA_V2,
-            snapshot: ptr::null(),
-            accessors: ptr::null(),
-        };
-        let payload = opaque_payload(&source);
-        let error = unsafe {
-            execute_request(
-                &opaque_request(&payload),
-                r2engine::EngineCancellationToken::default(),
-            )
-        }
-        .expect_err("stale source schema");
-        assert_eq!(error.status, R2SLEIGH_STATUS_ABI_MISMATCH_V2);
-    }
 
-    #[test]
-    fn opaque_source_rejects_null_handles() {
-        let source = R2SleighRadareSnapshotInputV2 {
-            struct_size: u32_size::<R2SleighRadareSnapshotInputV2>(),
-            abi_version: R2SLEIGH_RADARE_SNAPSHOT_CONTRACT_V2,
-            snapshot_schema_version: R2SLEIGH_RADARE_FUNCTION_SNAPSHOT_SCHEMA_V2,
-            accessor_schema_version: R2SLEIGH_RADARE_SNAPSHOT_ACCESSOR_SCHEMA_V2,
-            snapshot: ptr::null(),
-            accessors: ptr::null(),
-        };
-        let payload = opaque_payload(&source);
-        let error = unsafe {
-            execute_request(
-                &opaque_request(&payload),
-                r2engine::EngineCancellationToken::default(),
-            )
-        }
-        .expect_err("null opaque source handles");
-        assert_eq!(error.status, R2SLEIGH_STATUS_INVALID_ARGUMENT_V2);
-    }
 
-    #[test]
-    fn opaque_source_honors_cancellation_before_foreign_access() {
-        let source = R2SleighRadareSnapshotInputV2 {
-            struct_size: u32_size::<R2SleighRadareSnapshotInputV2>(),
-            abi_version: R2SLEIGH_RADARE_SNAPSHOT_CONTRACT_V2,
-            snapshot_schema_version: R2SLEIGH_RADARE_FUNCTION_SNAPSHOT_SCHEMA_V2,
-            accessor_schema_version: R2SLEIGH_RADARE_SNAPSHOT_ACCESSOR_SCHEMA_V2,
-            snapshot: std::ptr::NonNull::<u8>::dangling().as_ptr().cast(),
-            accessors: std::ptr::NonNull::<R2SleighRadareAccessorsV2>::dangling().as_ptr(),
-        };
-        let payload = opaque_payload(&source);
-        let cancellation = r2engine::EngineCancellationToken::default();
-        cancellation.cancel();
-        let error = unsafe { execute_request(&opaque_request(&payload), cancellation) }
-            .expect_err("cancelled opaque ingress");
-        assert_eq!(error.status, R2SLEIGH_STATUS_ENGINE_ERROR_V2);
-        assert!(error.message.contains("trusted ingress stopped"));
-    }
+
+
+
 
     #[test]
     fn execute_contains_panics_and_preserves_borrowed_error() {
@@ -4359,156 +3940,11 @@ mod tests {
         assert_eq!(session_free(session), R2SLEIGH_STATUS_OK_V2);
     }
 
-    #[test]
-    fn radare_return_mechanism_wire_layout_matches_source_append() {
-        assert_eq!(
-            size_of::<R2SleighRadareReturnMechanismViewV2>(),
-            size_of::<r2source::RadareAbi138ReturnMechanismView>()
-        );
-        assert_eq!(
-            std::mem::offset_of!(R2SleighRadareReturnMechanismViewV2, kind),
-            std::mem::offset_of!(r2source::RadareAbi138ReturnMechanismView, kind)
-        );
-        assert_eq!(
-            std::mem::offset_of!(R2SleighRadareReturnMechanismViewV2, stack_offset),
-            std::mem::offset_of!(r2source::RadareAbi138ReturnMechanismView, stack_offset)
-        );
-        assert_eq!(
-            std::mem::offset_of!(R2SleighRadareReturnMechanismViewV2, slot_size_bytes),
-            std::mem::offset_of!(r2source::RadareAbi138ReturnMechanismView, slot_size_bytes)
-        );
-        assert_eq!(
-            std::mem::offset_of!(
-                R2SleighRadareReturnMechanismViewV2,
-                stack_pointer_delta_bytes
-            ),
-            std::mem::offset_of!(
-                r2source::RadareAbi138ReturnMechanismView,
-                stack_pointer_delta_bytes
-            )
-        );
-        assert_eq!(
-            std::mem::offset_of!(R2SleighRadareAccessorsV2, return_mechanism_view),
-            std::mem::offset_of!(r2source::RadareAbi138Accessors, return_mechanism_view)
-        );
-        assert_eq!(
-            std::mem::offset_of!(R2SleighRadareAccessorsV2, return_mechanism_view),
-            std::mem::offset_of!(R2SleighRadareAccessorsV2, external_exit)
-                + size_of::<Option<unsafe extern "C" fn(*const c_void, usize, *mut u64) -> u8>>()
-        );
-    }
 
-    #[test]
-    fn radare_frame_pointer_wire_layout_matches_source_append() {
-        assert_eq!(
-            std::mem::offset_of!(R2SleighRadareAccessorsV2, frame_pointer_storage_view),
-            std::mem::offset_of!(r2source::RadareAbi138Accessors, frame_pointer_storage_view)
-        );
-        assert_eq!(
-            std::mem::offset_of!(R2SleighRadareAccessorsV2, frame_pointer_storage_view),
-            std::mem::offset_of!(R2SleighRadareAccessorsV2, return_mechanism_view)
-                + size_of::<
-                    Option<
-                        unsafe extern "C" fn(
-                            *const c_void,
-                            *mut R2SleighRadareReturnMechanismViewV2,
-                        ) -> u8,
-                    >,
-                >()
-        );
-    }
 
-    #[test]
-    fn radare_stack_allocation_contract_wire_layout_matches_source_append() {
-        assert_eq!(
-            size_of::<R2SleighRadareStackAllocationContractViewV2>(),
-            size_of::<r2source::RadareAbi138StackAllocationContractView>()
-        );
-        assert_eq!(
-            std::mem::offset_of!(R2SleighRadareStackAllocationContractViewV2, growth),
-            std::mem::offset_of!(r2source::RadareAbi138StackAllocationContractView, growth)
-        );
-        assert_eq!(
-            std::mem::offset_of!(
-                R2SleighRadareStackAllocationContractViewV2,
-                implicit_active_sp_bytes
-            ),
-            std::mem::offset_of!(
-                r2source::RadareAbi138StackAllocationContractView,
-                implicit_active_sp_bytes
-            )
-        );
-        assert_eq!(
-            std::mem::offset_of!(R2SleighRadareAccessorsV2, stack_allocation_contract_view),
-            std::mem::offset_of!(
-                r2source::RadareAbi138Accessors,
-                stack_allocation_contract_view
-            )
-        );
-        assert_eq!(
-            std::mem::offset_of!(R2SleighRadareAccessorsV2, stack_allocation_contract_view),
-            std::mem::offset_of!(R2SleighRadareAccessorsV2, frame_pointer_storage_view)
-                + size_of::<
-                    Option<
-                        unsafe extern "C" fn(
-                            *const c_void,
-                            *mut R2SleighRadareRegisterStorageViewV2,
-                        ) -> u8,
-                    >,
-                >()
-        );
-    }
 
-    #[test]
-    fn api_table_reports_rust_layouts() {
-        let api = unsafe { &*r2sleigh_api_v2() };
-        assert_eq!(api.abi_version, R2SLEIGH_ABI_V2);
-        assert_eq!(
-            api.radare_snapshot_contract,
-            R2SLEIGH_RADARE_SNAPSHOT_CONTRACT_V2
-        );
-        assert_eq!(R2SLEIGH_RADARE_FUNCTION_SNAPSHOT_SCHEMA_V2, 12);
-        assert_eq!(R2SLEIGH_RADARE_SNAPSHOT_ACCESSOR_SCHEMA_V2, 5);
-        assert_eq!(api.struct_size as usize, size_of::<R2SleighApiV2>());
-        assert_eq!(api.request_size as usize, size_of::<R2SleighRequestV2>());
-        assert_eq!(
-            api.engine_request_payload_size as usize,
-            size_of::<R2SleighEngineRequestPayloadV2>()
-        );
-        assert_eq!(
-            api.phase_timing_size as usize,
-            size_of::<R2SleighPhaseTimingV2>()
-        );
-        assert_eq!(
-            api.response_info_size as usize,
-            size_of::<R2SleighResponseInfoV2>()
-        );
-        assert_eq!(
-            api.analysis_render_request_size as usize,
-            size_of::<R2SleighAnalysisRenderRequestV2>()
-        );
-        assert_eq!(
-            api.analysis_query_request_size as usize,
-            size_of::<R2SleighAnalysisQueryRequestV2>()
-        );
-        assert_eq!(
-            api.analysis_result_view_size as usize,
-            size_of::<R2SleighAnalysisResultViewV2>()
-        );
-        assert_eq!(
-            api.data_ref_size as usize,
-            size_of::<super::super::types::R2SleighDataRef>()
-        );
-        assert_eq!(api.data_ref_schema_version, R2SLEIGH_DATA_REF_SCHEMA_V2);
-        assert_ne!(api.data_ref_size, 0);
-        assert_ne!(api.data_ref_schema_version, 0);
-        assert_eq!(
-            api.radare_snapshot_input_size as usize,
-            size_of::<R2SleighRadareSnapshotInputV2>()
-        );
-        assert_eq!(
-            api.radare_accessors_size as usize,
-            size_of::<R2SleighRadareAccessorsV2>()
-        );
-    }
+
+
+
+
 }

@@ -5130,10 +5130,10 @@ mod tests {
             .expect("command callback after decompiler provider");
         let provider = &c_source[provider_start..provider_end];
         assert!(
-            provider.contains("const R2SleighRadareSnapshotInputV2 source")
-                && provider.contains(".snapshot = snapshot")
-                && provider.contains(".accessors = &sleigh_radare_accessors")
-                && provider.contains(".radare_snapshot = &source")
+            provider.contains("r2sleigh_wire_writer_new ()")
+                && provider.contains("free (buffer)")
+                && provider.contains("r2sleigh_wire_write_snapshot (writer, snapshot)")
+                && provider.contains(".snapshot_buffer = buffer")
                 && provider.contains("R2SLEIGH_CAP_OPAQUE_RADARE_SNAPSHOT_V2")
                 && provider.contains("sleigh_engine_execute_v2 (")
         );
@@ -5307,11 +5307,11 @@ mod tests {
             .expect("command callback after provider");
         let provider = &c_source[provider_start..provider_end];
         assert!(
-            provider.contains("const R2SleighRadareSnapshotInputV2 source")
-                && provider.contains(".snapshot = snapshot")
-                && provider.contains(".accessors = &sleigh_radare_accessors")
+            provider.contains("r2sleigh_wire_writer_new ()")
+                && provider.contains("free (buffer)")
+                && provider.contains("r2sleigh_wire_write_snapshot (writer, snapshot)")
                 && provider.contains("const R2SleighEngineRequestPayloadV2 payload")
-                && provider.contains(".radare_snapshot = &source")
+                && provider.contains(".snapshot_buffer = buffer")
                 && provider.contains("R2SLEIGH_REQUEST_DECOMPILE_V2")
                 && provider.contains("R2SLEIGH_CAP_OPAQUE_RADARE_SNAPSHOT_V2")
                 && provider.contains("sleigh_engine_execute_v2 ("),
