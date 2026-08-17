@@ -825,17 +825,23 @@ pub(super) fn certified_private_frame_value_flows(
     }) {
         return BTreeMap::new();
     }
+    // Flows are keyed per access, so a region or a load that cannot be
+    // described says nothing about the ones that can. Skip what does not hold
+    // up instead of discarding every flow already established from unrelated
+    // regions; a consumer that needs a particular access still finds it absent.
     let mut flows = BTreeMap::new();
     for region in stack.private_regions() {
         let Some(facts) = exact_region_facts(artifact, origin.topology(), region, ledger) else {
-            return BTreeMap::new();
+            continue;
         };
         for (access, load) in &facts.loads {
             let Some(flow) = flow_for_load(artifact, origin, region, &facts, load) else {
-                return BTreeMap::new();
+                continue;
             };
             if flows.insert(*access, flow).is_some() {
-                return BTreeMap::new();
+                // Two flows for one access leave no way to tell which holds, so
+                // neither is kept.
+                flows.remove(access);
             }
         }
     }
