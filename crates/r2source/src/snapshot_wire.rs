@@ -328,9 +328,13 @@ impl<'a> SnapshotWireReader<'a> {
 // replacement for that pass rather than a second, parallel representation.
 // ---------------------------------------------------------------------------
 
-use crate::contracts::{CanonicalStorageId, CanonicalStorageSpace, SourceMachineRoles};
+use crate::contracts::{
+    CanonicalStorageId, CanonicalStorageSpace, SourceCallArgumentSpec, SourceCallResult,
+    SourceMachineRoles,
+};
 use crate::{
-    AdvisorySuccessor, AdvisorySuccessorKind, CapturedSourceFields, DiagnosticIdentity,
+    AdvisoryCallPrototype, AdvisoryCallSite, AdvisorySuccessor, AdvisorySuccessorKind,
+    CapturedSourceFields, DiagnosticIdentity,
     FunctionIdentity, FunctionPresentation, MachineProfile, OwnedFunctionBlock,
     OwnedFunctionImage, SourceEndianness,
 };
@@ -716,6 +720,110 @@ pub(crate) fn read_image(
         blocks: blocks.into_boxed_slice(),
         external_exits: external_exits.into_boxed_slice(),
         total_source_bytes,
+    })
+}
+
+
+const RESULT_VOID: u8 = 0;
+const RESULT_REGISTER: u8 = 1;
+
+pub(crate) fn write_call_result(writer: &mut SnapshotWireWriter, result: &SourceCallResult) {
+    match result {
+        SourceCallResult::Void => writer.u8(RESULT_VOID),
+        SourceCallResult::Register { storage } => {
+            writer.u8(RESULT_REGISTER);
+            write_storage(writer, *storage);
+        }
+    }
+}
+
+pub(crate) fn read_call_result(
+    reader: &mut SnapshotWireReader<'_>,
+) -> Result<SourceCallResult, SnapshotWireError> {
+    match reader.u8()? {
+        RESULT_VOID => Ok(SourceCallResult::Void),
+        RESULT_REGISTER => Ok(SourceCallResult::Register {
+            storage: read_storage(reader)?,
+        }),
+        // Void and a register result are not interchangeable, so an unknown tag
+        // is refused rather than treated as void.
+        _ => Err(SnapshotWireError::ValueTooWide),
+    }
+}
+
+pub(crate) fn write_call_prototype(
+    writer: &mut SnapshotWireWriter,
+    prototype: &AdvisoryCallPrototype,
+) -> Result<(), SnapshotWireError> {
+    writer.string(&prototype.calling_convention)?;
+    let count = u32::try_from(prototype.arguments.len())
+        .map_err(|_| SnapshotWireError::ValueTooWide)?;
+    writer.u32(count);
+    for argument in prototype.arguments.iter() {
+        writer.u32(argument.index());
+        write_storage(writer, argument.storage());
+    }
+    writer.bool(prototype.variadic);
+    writer.bool(prototype.noreturn);
+    write_call_result(writer, &prototype.result);
+    Ok(())
+}
+
+pub(crate) fn read_call_prototype(
+    reader: &mut SnapshotWireReader<'_>,
+) -> Result<AdvisoryCallPrototype, SnapshotWireError> {
+    let calling_convention = reader.string()?.to_string();
+    let count = reader.u32()? as usize;
+    let mut arguments = Vec::with_capacity(count.min(256));
+    for _ in 0..count {
+        let index = reader.u32()?;
+        let storage = read_storage(reader)?;
+        arguments.push(SourceCallArgumentSpec::new(index, storage));
+    }
+    let variadic = reader.bool()?;
+    let noreturn = reader.bool()?;
+    let result = read_call_result(reader)?;
+    Ok(AdvisoryCallPrototype {
+        calling_convention,
+        arguments: arguments.into_boxed_slice(),
+        variadic,
+        noreturn,
+        result,
+    })
+}
+
+pub(crate) fn write_call_site(
+    writer: &mut SnapshotWireWriter,
+    site: &AdvisoryCallSite,
+) -> Result<(), SnapshotWireError> {
+    writer.u64(site.instruction_address());
+    writer.u64(site.target_address());
+    // Absence is meaningful here: radare2 described the call but not what it
+    // takes or returns, which is not the same as an empty prototype.
+    match site.prototype() {
+        Some(prototype) => {
+            writer.bool(true);
+            write_call_prototype(writer, prototype)?;
+        }
+        None => writer.bool(false),
+    }
+    Ok(())
+}
+
+pub(crate) fn read_call_site(
+    reader: &mut SnapshotWireReader<'_>,
+) -> Result<AdvisoryCallSite, SnapshotWireError> {
+    let instruction_address = reader.u64()?;
+    let target_address = reader.u64()?;
+    let prototype = if reader.bool()? {
+        Some(read_call_prototype(reader)?)
+    } else {
+        None
+    };
+    Ok(AdvisoryCallSite {
+        instruction_address,
+        target_address,
+        prototype,
     })
 }
 
@@ -1128,5 +1236,60 @@ mod tests {
         buffer[16..20].copy_from_slice(&shorter);
         let mut reader = SnapshotWireReader::new(&buffer).expect("header");
         assert!(read_image(&mut reader).is_err());
+    }
+
+    #[test]
+    fn a_call_site_round_trips_with_and_without_a_prototype() {
+        let storage = CanonicalStorageId {
+            space: CanonicalStorageSpace::Register,
+            offset: 0x38,
+            size: 8,
+        };
+        let with_prototype = AdvisoryCallSite {
+            instruction_address: 0x1000_0741,
+            target_address: 0x1000_1980,
+            prototype: Some(AdvisoryCallPrototype {
+                calling_convention: "amd64".to_string(),
+                arguments: vec![
+                    SourceCallArgumentSpec::new(0, storage),
+                    SourceCallArgumentSpec::new(1, storage),
+                ]
+                .into_boxed_slice(),
+                variadic: true,
+                noreturn: false,
+                result: SourceCallResult::Register { storage },
+            }),
+        };
+        let without = AdvisoryCallSite {
+            instruction_address: 0x1000_0757,
+            target_address: 0x1000_1986,
+            prototype: None,
+        };
+        for site in [with_prototype, without] {
+            let mut writer = SnapshotWireWriter::new();
+            write_call_site(&mut writer, &site).expect("write");
+            let buffer = writer.finish().expect("finish");
+            let mut reader = SnapshotWireReader::new(&buffer).expect("header");
+            assert_eq!(read_call_site(&mut reader).expect("read"), site);
+            reader.finish().expect("consumed exactly");
+        }
+    }
+
+    #[test]
+    fn a_void_result_round_trips_and_an_unknown_tag_is_refused() {
+        let mut writer = SnapshotWireWriter::new();
+        write_call_result(&mut writer, &SourceCallResult::Void);
+        let buffer = writer.finish().expect("finish");
+        let mut reader = SnapshotWireReader::new(&buffer).expect("header");
+        assert_eq!(
+            read_call_result(&mut reader).expect("read"),
+            SourceCallResult::Void
+        );
+
+        let mut writer = SnapshotWireWriter::new();
+        writer.u8(9);
+        let buffer = writer.finish().expect("finish");
+        let mut reader = SnapshotWireReader::new(&buffer).expect("header");
+        assert!(read_call_result(&mut reader).is_err());
     }
 }
