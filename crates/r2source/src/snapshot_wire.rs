@@ -333,7 +333,8 @@ use crate::contracts::{
     SourceAggregateLayout, SourceAggregateMember, SourceCallResult, SourceCarrierKind,
     SourceCarrierProjection, SourceFunctionReturn, SourceLogicalValue, SourceMachineRoles,
     SourceReturnMechanism, SourceStackAllocationContract, SourceStackGrowth, SourceStackSlotRole,
-    SourceStackSlotSpec, SourceType, SourceTypeGraph, SourceTypeKind, StackAddressBase,
+    SourceFunctionInterface, SourceStackSlotSpec, SourceType, SourceTypeGraph, SourceTypeKind,
+    StackAddressBase,
 };
 use crate::{
     AdvisoryCallPrototype, AdvisoryCallSite, AdvisorySuccessor, AdvisorySuccessorKind,
@@ -1179,6 +1180,223 @@ pub(crate) fn read_stack_slot(
     })
 }
 
+
+// Which base constructor the producer used. The choice is not derivable from
+// the field values alone: it decides whether the interface claims exact stack
+// slot roles and exact logical types, which is authority, not presentation.
+const INTERFACE_PLAIN: u8 = 0;
+const INTERFACE_EXACT_SLOTS: u8 = 1;
+const INTERFACE_LOGICAL: u8 = 2;
+const INTERFACE_EXACT_BOTH: u8 = 3;
+
+pub(crate) fn write_interface(
+    writer: &mut SnapshotWireWriter,
+    interface: &SourceFunctionInterface,
+) -> Result<(), SnapshotWireError> {
+    let exact_types = interface.type_graph().is_some();
+    let exact_slots = interface.stack_slot_roles_complete();
+    writer.u8(match (exact_types, exact_slots) {
+        (true, true) => INTERFACE_EXACT_BOTH,
+        (true, false) => INTERFACE_LOGICAL,
+        (false, true) => INTERFACE_EXACT_SLOTS,
+        (false, false) => INTERFACE_PLAIN,
+    });
+    writer.bytes(interface.revision_identity())?;
+    writer.string(interface.calling_convention())?;
+
+    let parameters = u32::try_from(interface.parameters().len())
+        .map_err(|_| SnapshotWireError::ValueTooWide)?;
+    writer.u32(parameters);
+    for parameter in interface.parameters() {
+        write_abi_parameter(writer, parameter);
+    }
+    write_function_return(writer, &interface.return_kind());
+
+    let slots = u32::try_from(interface.stack_slots().len())
+        .map_err(|_| SnapshotWireError::ValueTooWide)?;
+    writer.u32(slots);
+    for slot in interface.stack_slots() {
+        write_stack_slot(writer, slot);
+    }
+
+    let logical = u32::try_from(interface.parameter_logical_values().len())
+        .map_err(|_| SnapshotWireError::ValueTooWide)?;
+    writer.u32(logical);
+    for value in interface.parameter_logical_values() {
+        write_logical_value(writer, *value);
+    }
+    match interface.return_logical_value() {
+        Some(value) => {
+            writer.bool(true);
+            write_logical_value(writer, value);
+        }
+        None => writer.bool(false),
+    }
+    match interface.type_graph() {
+        Some(graph) => {
+            writer.bool(true);
+            write_type_graph(writer, graph)?;
+        }
+        None => writer.bool(false),
+    }
+
+    writer.bool(interface.stack_pointer_preserved_across_calls());
+    writer.bool(interface.frame_pointer_preserved_across_calls());
+    write_optional_storage(writer, interface.return_address_storage());
+    write_optional_storage(writer, interface.stack_pointer_storage());
+    write_optional_storage(writer, interface.frame_pointer_storage());
+    match interface.return_mechanism() {
+        Some(mechanism) => {
+            writer.bool(true);
+            write_return_mechanism(writer, &mechanism);
+        }
+        None => writer.bool(false),
+    }
+    match interface.stack_allocation_contract() {
+        Some(contract) => {
+            writer.bool(true);
+            write_stack_allocation(writer, &contract);
+        }
+        None => writer.bool(false),
+    }
+    Ok(())
+}
+
+/// Rebuild an interface through the same constructor and builder order the
+/// accessor walk uses, so a decoded interface is the one that walk would have
+/// produced rather than a lookalike assembled from the same fields.
+pub(crate) fn read_interface(
+    reader: &mut SnapshotWireReader<'_>,
+) -> Result<SourceFunctionInterface, SnapshotWireError> {
+    let variant = reader.u8()?;
+    let revision = reader.bytes()?.to_vec();
+    let calling_convention = reader.string()?.to_string();
+
+    let parameter_count = reader.u32()? as usize;
+    let mut parameters = Vec::with_capacity(parameter_count.min(256));
+    for _ in 0..parameter_count {
+        parameters.push(read_abi_parameter(reader)?);
+    }
+    let return_kind = read_function_return(reader)?;
+
+    let slot_count = reader.u32()? as usize;
+    let mut stack_slots = Vec::with_capacity(slot_count.min(4096));
+    for _ in 0..slot_count {
+        stack_slots.push(read_stack_slot(reader)?);
+    }
+
+    let logical_count = reader.u32()? as usize;
+    let mut logical_parameters = Vec::with_capacity(logical_count.min(256));
+    for _ in 0..logical_count {
+        logical_parameters.push(read_logical_value(reader)?);
+    }
+    let return_logical = if reader.bool()? {
+        Some(read_logical_value(reader)?)
+    } else {
+        None
+    };
+    let type_graph = if reader.bool()? {
+        Some(read_type_graph(reader)?)
+    } else {
+        None
+    };
+
+    let stack_pointer_preserved = reader.bool()?;
+    let frame_pointer_preserved = reader.bool()?;
+    let return_address_storage = read_optional_storage(reader)?;
+    let stack_pointer_storage = read_optional_storage(reader)?;
+    let frame_pointer_storage = read_optional_storage(reader)?;
+    let return_mechanism = if reader.bool()? {
+        Some(read_return_mechanism(reader)?)
+    } else {
+        None
+    };
+    let stack_allocation = if reader.bool()? {
+        Some(read_stack_allocation(reader)?)
+    } else {
+        None
+    };
+
+    let mut interface = match variant {
+        INTERFACE_EXACT_BOTH => SourceFunctionInterface::new_exact_with_logical_types(
+            revision,
+            calling_convention,
+            parameters,
+            return_kind,
+            stack_slots,
+            logical_parameters,
+            return_logical,
+            type_graph,
+        ),
+        INTERFACE_LOGICAL => SourceFunctionInterface::new_with_logical_types(
+            revision,
+            calling_convention,
+            parameters,
+            return_kind,
+            stack_slots,
+            logical_parameters,
+            return_logical,
+            type_graph,
+        ),
+        INTERFACE_EXACT_SLOTS => SourceFunctionInterface::new_exact(
+            revision,
+            calling_convention,
+            parameters,
+            return_kind,
+            stack_slots,
+        ),
+        INTERFACE_PLAIN => SourceFunctionInterface::new(
+            revision,
+            calling_convention,
+            parameters,
+            return_kind,
+            stack_slots,
+        ),
+        _ => return Err(SnapshotWireError::ValueTooWide),
+    }
+    .map_err(|_| SnapshotWireError::ValueTooWide)?;
+
+    interface =
+        interface.with_preserved_call_carriers(stack_pointer_preserved, frame_pointer_preserved);
+    if let Some(storage) = return_address_storage {
+        interface = interface
+            .with_return_address_storage(storage)
+            .map_err(|_| SnapshotWireError::ValueTooWide)?;
+    }
+    if let Some(storage) = stack_pointer_storage {
+        interface = interface
+            .with_stack_pointer_storage(storage)
+            .map_err(|_| SnapshotWireError::ValueTooWide)?;
+    }
+    if let Some(storage) = frame_pointer_storage {
+        interface = interface
+            .with_frame_pointer_storage(storage)
+            .map_err(|_| SnapshotWireError::ValueTooWide)?;
+    }
+    if let Some(SourceReturnMechanism::Stacked {
+        stack_offset,
+        slot_size_bytes,
+        stack_pointer_delta_bytes,
+        address_size_bytes,
+    }) = return_mechanism
+    {
+        interface = interface
+            .with_exact_stacked_return(
+                stack_offset,
+                slot_size_bytes,
+                stack_pointer_delta_bytes,
+                address_size_bytes,
+            )
+            .map_err(|_| SnapshotWireError::ValueTooWide)?;
+    }
+    if let Some(contract) = stack_allocation {
+        interface = interface
+            .with_stack_allocation_contract(contract)
+            .map_err(|_| SnapshotWireError::ValueTooWide)?;
+    }
+    Ok(interface)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1819,5 +2037,158 @@ mod tests {
             assert_eq!(read_stack_slot(&mut reader).expect("read"), slot);
             reader.finish().expect("consumed exactly");
         }
+    }
+
+    fn reg(offset: u64, size: u32) -> CanonicalStorageId {
+        CanonicalStorageId {
+            space: CanonicalStorageSpace::Register,
+            offset,
+            size,
+        }
+    }
+
+    /// Every type must be reachable from the ids an interface uses, so the
+    /// interface fixtures use a graph with nothing spare in it.
+    fn reachable_graph() -> SourceTypeGraph {
+        SourceTypeGraph::new(
+            vec![
+                SourceType::new(0, SourceTypeKind::SignedInteger, 32, 32),
+                SourceType::new(1, SourceTypeKind::Pointer { target_type_id: 0 }, 64, 64),
+            ],
+            Vec::new(),
+        )
+        .expect("graph")
+    }
+
+    #[test]
+    fn every_interface_variant_round_trips() {
+        let params = vec![
+            SourceAbiParameterSpec::new(0, reg(0x38, 8)),
+            SourceAbiParameterSpec::new(1, reg(0x30, 8)),
+        ];
+        let slots = vec![SourceStackSlotSpec::new_local(
+            StackAddressBase::FramePointer,
+            reg(0x20, 8),
+            -8,
+            4,
+        )];
+        let logical = vec![
+            SourceLogicalValue::new(1, SourceCarrierProjection::new(SourceCarrierKind::Full, 0, 64)),
+            SourceLogicalValue::new(1, SourceCarrierProjection::new(SourceCarrierKind::Full, 0, 64)),
+        ];
+        let interfaces = vec![
+            SourceFunctionInterface::new(
+                vec![1u8, 2, 3],
+                "amd64",
+                params.clone(),
+                SourceFunctionReturn::Void,
+                slots.clone(),
+            )
+            .expect("plain"),
+            SourceFunctionInterface::new_exact(
+                vec![1u8, 2, 3],
+                "amd64",
+                params.clone(),
+                SourceFunctionReturn::Register { storage: reg(0, 8) },
+                slots.clone(),
+            )
+            .expect("exact slots"),
+            SourceFunctionInterface::new_with_logical_types(
+                vec![4u8, 5],
+                "amd64",
+                params.clone(),
+                SourceFunctionReturn::Register { storage: reg(0, 8) },
+                slots.clone(),
+                logical.clone(),
+                Some(logical[0]),
+                Some(reachable_graph()),
+            )
+            .expect("logical"),
+            SourceFunctionInterface::new_exact_with_logical_types(
+                vec![6u8],
+                "amd64",
+                params,
+                SourceFunctionReturn::Register { storage: reg(0, 8) },
+                slots,
+                logical.clone(),
+                Some(logical[1]),
+                Some(reachable_graph()),
+            )
+            .expect("exact both"),
+        ];
+        for interface in interfaces {
+            let mut writer = SnapshotWireWriter::new();
+            write_interface(&mut writer, &interface).expect("write");
+            let buffer = writer.finish().expect("finish");
+            let mut reader = SnapshotWireReader::new(&buffer).expect("header");
+            let decoded = read_interface(&mut reader).expect("read");
+            reader.finish().expect("consumed exactly");
+            assert_eq!(decoded, interface);
+        }
+    }
+
+    #[test]
+    fn the_optional_interface_tail_round_trips() {
+        let interface = SourceFunctionInterface::new_exact(
+            vec![9u8],
+            "amd64",
+            vec![SourceAbiParameterSpec::new(0, reg(0x38, 8))],
+            SourceFunctionReturn::Register { storage: reg(0, 8) },
+            Vec::new(),
+        )
+        .expect("base")
+        .with_preserved_call_carriers(true, true)
+        .with_return_address_storage(reg(0x10, 8))
+        .expect("return address")
+        .with_stack_pointer_storage(reg(0x20, 8))
+        .expect("stack pointer")
+        .with_frame_pointer_storage(reg(0x28, 8))
+        .expect("frame pointer")
+        .with_exact_stacked_return(0, 8, 8, 8)
+        .expect("stacked return")
+        .with_stack_allocation_contract(
+            SourceStackAllocationContract::with_implicit_active_sp_bytes(
+                SourceStackGrowth::LowerAddresses,
+                8,
+            ),
+        )
+        .expect("allocation");
+
+        let mut writer = SnapshotWireWriter::new();
+        write_interface(&mut writer, &interface).expect("write");
+        let buffer = writer.finish().expect("finish");
+        let mut reader = SnapshotWireReader::new(&buffer).expect("header");
+        let decoded = read_interface(&mut reader).expect("read");
+        reader.finish().expect("consumed exactly");
+        assert_eq!(decoded, interface);
+        assert!(decoded.stack_pointer_preserved_across_calls());
+        assert!(decoded.frame_pointer_preserved_across_calls());
+        assert_eq!(decoded.frame_pointer_storage(), Some(reg(0x28, 8)));
+        assert!(decoded.return_mechanism().is_some());
+        assert!(decoded.stack_allocation_contract().is_some());
+    }
+
+    #[test]
+    fn an_unknown_interface_variant_is_refused() {
+        let mut writer = SnapshotWireWriter::new();
+        writer.u8(200);
+        writer.bytes(&[1]).expect("revision");
+        writer.string("amd64").expect("cc");
+        writer.u32(0);
+        write_function_return(&mut writer, &SourceFunctionReturn::Void);
+        writer.u32(0);
+        writer.u32(0);
+        writer.bool(false);
+        writer.bool(false);
+        writer.bool(false);
+        writer.bool(false);
+        write_optional_storage(&mut writer, None);
+        write_optional_storage(&mut writer, None);
+        write_optional_storage(&mut writer, None);
+        writer.bool(false);
+        writer.bool(false);
+        let buffer = writer.finish().expect("finish");
+        let mut reader = SnapshotWireReader::new(&buffer).expect("header");
+        assert!(read_interface(&mut reader).is_err());
     }
 }
