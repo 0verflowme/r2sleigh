@@ -129,6 +129,7 @@ pub use r2source::{OwnedFunctionSnapshot, RADARE_FUNCTION_SNAPSHOT_SCHEMA_VERSIO
 pub use semantic::{
     BlockAssumption, CallArgumentCertificate, CallArgumentLocation, CallBoundarySlot,
     CallBoundaryValueFact, CallMemoryEffect, CallResultCertificate, CallResultValueRelation,
+    SourceCallArgumentFact, SourceCallArgumentValue,
     CallSiteFact, CallSiteFacts, CallSiteId, CallsiteCertificate, CompareKind, CompareProvenance,
     ControlDomain, ControlDomainFacts, ControlDomainId, ControlGuard, GlobalObjectKey,
     IfRegionCertificate, LoopCarrierEdgeValue, LoopCarrierFact, LoopCarrierUpdateFact,

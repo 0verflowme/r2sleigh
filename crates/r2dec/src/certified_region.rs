@@ -2859,9 +2859,13 @@ impl CertifiedSingleBlockAccounting {
                         && semantic.arguments().iter().zip(call.arguments()).all(
                             |(semantic_argument, certified_argument)| {
                                 semantic_argument.slot() == certified_argument.slot()
-                                    && semantic_argument.binding()
-                                        == certified_argument.value().binding()
-                                    && semantic_argument.ty() == certified_argument.value().ty()
+                                    // A preserved-entry argument names no
+                                    // value, so this region cannot match one
+                                    // against a semantic argument yet.
+                                    && certified_argument.value().is_some_and(|certified_value| {
+                                        semantic_argument.binding() == certified_value.binding()
+                                            && semantic_argument.ty() == certified_value.ty()
+                                    })
                                     && match (
                                         semantic_argument.value(),
                                         certified_argument.origin(),

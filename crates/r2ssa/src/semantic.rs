@@ -495,6 +495,25 @@ pub struct CallBoundaryValueFact {
     pub value: ValueId,
 }
 
+/// Where a call argument's value comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceCallArgumentValue {
+    /// The function never defines this carrier before the call, so the value
+    /// the callee receives is the one this function was entered with. No SSA
+    /// value is named for it, because nothing in this function read it: a call
+    /// takes its arguments implicitly.
+    PreservedEntry,
+    /// An exact value defined in this function reaches the call.
+    Value(ValueId),
+}
+
+/// One argument carrier at a call boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SourceCallArgumentFact {
+    pub slot: CallBoundarySlot,
+    pub value: SourceCallArgumentValue,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SourceCallBoundaryFact {
     pub call_site: CallSiteId,
@@ -503,7 +522,7 @@ pub struct SourceCallBoundaryFact {
     pub variadic: Option<bool>,
     pub noreturn: Option<bool>,
     pub result_kind: Option<SourceCallResult>,
-    pub arguments: Vec<CallBoundaryValueFact>,
+    pub arguments: Vec<SourceCallArgumentFact>,
     pub results: Vec<CallBoundaryValueFact>,
     /// False until an ABI-aware boundary pass proves that every slot is known.
     pub complete: bool,
@@ -2300,7 +2319,12 @@ fn collect_source_boundary_facts(
                     .arguments()
                     .iter()
                     .filter_map(|argument| {
-                        reaching_abi_value_in_block(
+                        // An argument the function passes straight through from
+                        // its own entry has no definition here and is never read
+                        // explicitly, so no SSA value names it. That is a
+                        // description of where the value comes from, not a
+                        // failure to find it.
+                        reaching_abi_argument_in_block(
                             function,
                             graph,
                             machine_context,
@@ -2308,7 +2332,7 @@ fn collect_source_boundary_facts(
                             op_index,
                             argument.storage(),
                         )
-                        .map(|value| CallBoundaryValueFact {
+                        .map(|value| SourceCallArgumentFact {
                             slot: CallBoundarySlot::Register {
                                 index: argument.index(),
                                 storage: argument.storage(),
@@ -2648,6 +2672,30 @@ fn reaching_abi_value_in_block(
     .and_then(|state| match state {
         ReachingAbiState::PreservedEntry => None,
         ReachingAbiState::Value(value) => Some(value),
+    })
+}
+
+/// Resolve one call argument carrier, keeping the preserved-entry case.
+fn reaching_abi_argument_in_block(
+    function: &SSAFunction,
+    graph: &SsaGraph,
+    machine_context: &SourceMachineContext,
+    block_addr: u64,
+    boundary_op_index: usize,
+    storage: CanonicalStorageId,
+) -> Option<SourceCallArgumentValue> {
+    reaching_abi_value_in_block_with_policy(
+        function,
+        graph,
+        machine_context,
+        block_addr,
+        boundary_op_index,
+        storage,
+        true,
+    )
+    .map(|state| match state {
+        ReachingAbiState::PreservedEntry => SourceCallArgumentValue::PreservedEntry,
+        ReachingAbiState::Value(value) => SourceCallArgumentValue::Value(value),
     })
 }
 

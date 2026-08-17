@@ -5957,9 +5957,16 @@ fn source_direct_call_outcome(
                         .to_string(),
                 ));
             }
+            // The differential interpreter observes values this function
+            // computes. An argument carried in from entry is not one of them.
+            let r2ssa::SourceCallArgumentValue::Value(argument_value) = value.value else {
+                return Err(RunFailure::Invalid(
+                    "direct call argument is carried in from function entry".to_string(),
+                ));
+            };
             Ok(DifferentialCallArgument {
                 slot: value.slot,
-                value: observed_call_value(artifact, initial, run, value.value)?,
+                value: observed_call_value(artifact, initial, run, argument_value)?,
             })
         })
         .collect::<Result<Vec<_>, _>>()?;

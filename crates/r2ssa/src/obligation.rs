@@ -504,21 +504,30 @@ impl SemanticObligationInventory {
                         SemanticObligationComponent::StackOffset(offset)
                     }
                 };
+                // A preserved-entry argument names no value in this function,
+                // so it has no producer to keep live. The argument obligation
+                // still exists: the call reads that carrier either way.
+                let inputs = match argument.value {
+                    crate::semantic::SourceCallArgumentValue::Value(value) => vec![value],
+                    crate::semantic::SourceCallArgumentValue::PreservedEntry => Vec::new(),
+                };
                 seed_instruction_with_inputs(
                     boundary.at,
                     SemanticObligationKind::CallArgument,
                     component,
-                    vec![argument.value],
+                    inputs,
                     &mut required,
                     &mut explicit_inputs,
                     &mut duplicate_seeds,
                 );
-                seed_value_definition(
-                    graph,
-                    argument.value,
-                    SemanticObligationKind::LiveValueProducer,
-                    &mut required,
-                );
+                if let crate::semantic::SourceCallArgumentValue::Value(value) = argument.value {
+                    seed_value_definition(
+                        graph,
+                        value,
+                        SemanticObligationKind::LiveValueProducer,
+                        &mut required,
+                    );
+                }
             }
             for value in &boundary.results {
                 seed_instruction_with_inputs(
@@ -1752,7 +1761,12 @@ mod tests {
             }
         );
         assert_eq!(
-            artifact.graph().def_inst(boundary.arguments[0].value),
+            match boundary.arguments[0].value {
+                crate::semantic::SourceCallArgumentValue::Value(value) => {
+                    artifact.graph().def_inst(value)
+                }
+                crate::semantic::SourceCallArgumentValue::PreservedEntry => None,
+            },
             artifact.graph().inst_id_for_op_site(0x3080, 0)
         );
         assert_eq!(boundary.results.len(), 1);
@@ -2143,10 +2157,13 @@ mod tests {
                 noreturn: Some(false),
                 result_kind: Some(crate::SourceCallResult::Void),
                 arguments: vec![
-                    crate::semantic::CallBoundaryValueFact { slot, value: first },
-                    crate::semantic::CallBoundaryValueFact {
+                    crate::semantic::SourceCallArgumentFact {
                         slot,
-                        value: second,
+                        value: crate::semantic::SourceCallArgumentValue::Value(first),
+                    },
+                    crate::semantic::SourceCallArgumentFact {
+                        slot,
+                        value: crate::semantic::SourceCallArgumentValue::Value(second),
                     },
                 ],
                 results: Vec::new(),

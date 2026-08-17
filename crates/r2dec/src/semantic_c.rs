@@ -3763,10 +3763,11 @@ fn semantic_call_argument_leaf<'a>(
     argument: &CertifiedCallArgument,
     layer: &'a SemanticCExpressionLayer,
 ) -> Option<&'a SemanticCExpr> {
-    let producer = argument.value().producer()?;
+    let value = argument.value()?;
+    let producer = value.producer()?;
     let entity = layer
         .entity_for_producer(producer)
-        .filter(|entity| entity.output() == argument.value().binding())?;
+        .filter(|entity| entity.output() == value.binding())?;
     let mut expression = entity.root();
     let mut visited = BTreeSet::new();
     while visited.insert(expression) {
@@ -3785,26 +3786,32 @@ pub(crate) fn semantic_call_from_control(
 ) -> Result<SemanticCDirectCall, SemanticCError> {
     let mut arguments = Vec::with_capacity(call.arguments().len());
     for argument in call.arguments() {
+        // This region renders each argument from the value that produced it.
+        // An argument carried in from the function's own entry names no value,
+        // so it is not rendered here.
+        let Some(argument_value) = argument.value() else {
+            return Err(SemanticCError::CallBindingMismatch(call.producer()));
+        };
         let value = match argument.origin() {
             CertifiedCallArgumentOrigin::Produced { producer } => {
-                if argument.value().producer() != Some(*producer) {
+                if argument_value.producer() != Some(*producer) {
                     return Err(SemanticCError::CallBindingMismatch(call.producer()));
                 }
                 let entity = layer
                     .entity_for_producer(*producer)
-                    .filter(|entity| entity.output() == argument.value().binding())
+                    .filter(|entity| entity.output() == argument_value.binding())
                     .ok_or(SemanticCError::MissingCallExpression(*producer))?;
-                if layer.expr(entity.root()).map(SemanticCExpr::ty) != Some(argument.value().ty()) {
+                if layer.expr(entity.root()).map(SemanticCExpr::ty) != Some(argument_value.ty()) {
                     return Err(SemanticCError::CallBindingMismatch(call.producer()));
                 }
                 SemanticCCallArgumentValue::Expression(entity.root())
             }
             CertifiedCallArgumentOrigin::Constant { value }
-                if value.width_bits() == argument.value().ty().width_bits()
-                    && (argument.value().constant() == Some(*value)
+                if value.width_bits() == argument_value.ty().width_bits()
+                    && (argument_value.constant() == Some(*value)
                         || semantic_call_argument_leaf(argument, layer).is_some_and(
                             |expression| {
-                                expression.ty() == argument.value().ty()
+                                expression.ty() == argument_value.ty()
                                     && matches!(
                                         expression.kind(),
                                         SemanticCExprKind::Constant {
@@ -3823,7 +3830,7 @@ pub(crate) fn semantic_call_from_control(
                     .and_then(|interface| interface.parameters().get(*index as usize))
                     .filter(|parameter| {
                         parameter.index() == *index
-                            && parameter.ty() == argument.value().ty()
+                            && parameter.ty() == argument_value.ty()
                             && matches!(
                                 argument.slot(),
                                 CallBoundarySlot::Register { storage, .. }
@@ -3834,10 +3841,10 @@ pub(crate) fn semantic_call_from_control(
                 let input = parameter
                     .value()
                     .filter(|input| {
-                        *input == argument.value().binding()
+                        *input == argument_value.binding()
                             || semantic_call_argument_leaf(argument, layer).is_some_and(
                                 |expression| {
-                                    expression.ty() == argument.value().ty()
+                                    expression.ty() == argument_value.ty()
                                         && matches!(
                                             expression.kind(),
                                             SemanticCExprKind::Input { binding }
@@ -3856,9 +3863,9 @@ pub(crate) fn semantic_call_from_control(
         };
         arguments.push(SemanticCCallArgument {
             slot: argument.slot(),
-            binding: argument.value().binding(),
+            binding: argument_value.binding(),
             value,
-            ty: argument.value().ty().clone(),
+            ty: argument_value.ty().clone(),
         });
     }
     Ok(SemanticCDirectCall {

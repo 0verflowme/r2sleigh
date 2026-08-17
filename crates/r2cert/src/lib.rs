@@ -1047,7 +1047,9 @@ pub enum CertifiedCallArgumentOrigin {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CertifiedCallArgument {
     slot: CallBoundarySlot,
-    value: MachineValueUse,
+    /// Absent when the argument is the value this function was entered with:
+    /// nothing here defines or reads that carrier, so no value names it.
+    value: Option<MachineValueUse>,
     origin: CertifiedCallArgumentOrigin,
     source_obligation: SemanticObligationId,
 }
@@ -1057,8 +1059,8 @@ impl CertifiedCallArgument {
         self.slot
     }
 
-    pub const fn value(&self) -> &MachineValueUse {
-        &self.value
+    pub const fn value(&self) -> Option<&MachineValueUse> {
+        self.value.as_ref()
     }
 
     pub const fn origin(&self) -> &CertifiedCallArgumentOrigin {
@@ -1187,20 +1189,22 @@ impl CertifiedDirectCall {
                     argument.source_obligation,
                 ));
             }
-            let origin_matches = match argument.origin {
-                CertifiedCallArgumentOrigin::Produced { producer } => {
-                    argument.value.producer() == Some(producer)
-                        && argument.value.constant().is_none()
+            let origin_matches = match (&argument.origin, argument.value.as_ref()) {
+                (CertifiedCallArgumentOrigin::Produced { producer }, Some(value)) => {
+                    value.producer() == Some(*producer) && value.constant().is_none()
                 }
-                CertifiedCallArgumentOrigin::Constant { value } => {
-                    value.width_bits() == argument.value.binding().width_bits()
-                        && (argument.value.constant() == Some(value)
-                            || (argument.value.constant().is_none()
-                                && argument.value.producer().is_some()))
+                (CertifiedCallArgumentOrigin::Constant { value: constant }, Some(value)) => {
+                    constant.width_bits() == value.binding().width_bits()
+                        && (value.constant() == Some(*constant)
+                            || (value.constant().is_none() && value.producer().is_some()))
                 }
-                CertifiedCallArgumentOrigin::AbiParameter { .. } => {
-                    argument.value.constant().is_none()
+                (CertifiedCallArgumentOrigin::AbiParameter { .. }, Some(value)) => {
+                    value.constant().is_none()
                 }
+                // An argument carried in from this function's own entry names
+                // no value, so only a parameter can account for it.
+                (CertifiedCallArgumentOrigin::AbiParameter { .. }, None) => true,
+                (_, None) => false,
             };
             if !origin_matches {
                 return Err(CertificationError::ObligationNotMapped(
@@ -1213,8 +1217,13 @@ impl CertifiedDirectCall {
                 .ok_or(CertificationError::UnknownObligation(
                     argument.source_obligation,
                 ))?;
+            let expected_inputs = argument
+                .value
+                .as_ref()
+                .map(|value| vec![value.binding().value()])
+                .unwrap_or_default();
             if obligation.source.graph_inst() != Some(self.source_inst)
-                || obligation.inputs != [argument.value.binding().value()]
+                || obligation.inputs != expected_inputs
             {
                 return Err(CertificationError::ObligationNotMapped(
                     argument.source_obligation,
@@ -5119,7 +5128,40 @@ fn certified_direct_calls(
                 {
                     return Err(MachineBuildError::ObligationMismatch(inst.id));
                 }
-                let value_use = MachineValueUse::from_artifact(artifact, value.value)?;
+                let source_obligation = SemanticObligationId {
+                    instruction: producer,
+                    kind: SemanticObligationKind::CallArgument,
+                    component: SemanticObligationComponent::RegisterSlot { index, storage },
+                };
+                // The argument this function was entered with. It is the
+                // parameter occupying that carrier, and it is only certifiable
+                // when exactly one parameter does.
+                if value.value == r2ssa::SourceCallArgumentValue::PreservedEntry {
+                    let matching = artifact
+                        .facts()
+                        .boundaries
+                        .parameters
+                        .iter()
+                        .filter_map(|(parameter_index, parameter)| {
+                            (parameter.abi_storage == storage).then_some(*parameter_index)
+                        })
+                        .collect::<Vec<_>>();
+                    let [parameter_index] = matching.as_slice() else {
+                        return Err(MachineBuildError::ObligationMismatch(inst.id));
+                    };
+                    return Ok(CertifiedCallArgument {
+                        slot: value.slot,
+                        value: None,
+                        origin: CertifiedCallArgumentOrigin::AbiParameter {
+                            index: *parameter_index,
+                        },
+                        source_obligation,
+                    });
+                }
+                let r2ssa::SourceCallArgumentValue::Value(argument_value) = value.value else {
+                    return Err(MachineBuildError::ObligationMismatch(inst.id));
+                };
+                let value_use = MachineValueUse::from_artifact(artifact, argument_value)?;
                 if value_use.binding().width_bits()
                     != storage
                         .size
@@ -5134,13 +5176,9 @@ fn certified_direct_calls(
                 .ok_or(MachineBuildError::ObligationMismatch(inst.id))?;
                 Ok(CertifiedCallArgument {
                     slot: value.slot,
-                    value: value_use,
+                    value: Some(value_use),
                     origin,
-                    source_obligation: SemanticObligationId {
-                        instruction: producer,
-                        kind: SemanticObligationKind::CallArgument,
-                        component: SemanticObligationComponent::RegisterSlot { index, storage },
-                    },
+                    source_obligation,
                 })
             })
             .collect::<Result<Vec<_>, MachineBuildError>>()?;
@@ -6561,7 +6599,7 @@ fn conditional_control_input_producers(
 
 fn direct_call_input_producers(call: &CertifiedDirectCall) -> BTreeSet<CanonicalInstructionId> {
     std::iter::once(call.target_value())
-        .chain(call.arguments().iter().map(CertifiedCallArgument::value))
+        .chain(call.arguments().iter().filter_map(CertifiedCallArgument::value))
         .filter_map(MachineValueUse::producer)
         .collect()
 }
