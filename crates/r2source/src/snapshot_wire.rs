@@ -15,6 +15,7 @@
 //! parts are built on top of them.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 /// Identifies a buffer as this transport before anything else is read.
 pub const SNAPSHOT_WIRE_MAGIC: u32 = 0x5232_5357; // "R2SW"
@@ -329,8 +330,9 @@ impl<'a> SnapshotWireReader<'a> {
 
 use crate::contracts::{CanonicalStorageId, CanonicalStorageSpace, SourceMachineRoles};
 use crate::{
-    CapturedSourceFields, DiagnosticIdentity, FunctionIdentity, FunctionPresentation,
-    MachineProfile, SourceEndianness,
+    AdvisorySuccessor, AdvisorySuccessorKind, CapturedSourceFields, DiagnosticIdentity,
+    FunctionIdentity, FunctionPresentation, MachineProfile, OwnedFunctionBlock,
+    OwnedFunctionImage, SourceEndianness,
 };
 
 const ENDIAN_LITTLE: u8 = 0;
@@ -573,6 +575,148 @@ pub(crate) fn read_machine_roles(
     // the in-crate constructor would have rejected.
     SourceMachineRoles::new(return_address_storage, stack_pointer_storage)
         .map_err(|_| SnapshotWireError::ValueTooWide)
+}
+
+
+const SUCCESSOR_DIRECT: u8 = 0;
+const SUCCESSOR_FALLTHROUGH: u8 = 1;
+const SUCCESSOR_SWITCH_CASE: u8 = 2;
+const SUCCESSOR_SWITCH_DEFAULT: u8 = 3;
+
+pub(crate) fn write_successor(writer: &mut SnapshotWireWriter, successor: &AdvisorySuccessor) {
+    writer.u8(match successor.kind() {
+        AdvisorySuccessorKind::Direct => SUCCESSOR_DIRECT,
+        AdvisorySuccessorKind::Fallthrough => SUCCESSOR_FALLTHROUGH,
+        AdvisorySuccessorKind::SwitchCase => SUCCESSOR_SWITCH_CASE,
+        AdvisorySuccessorKind::SwitchDefault => SUCCESSOR_SWITCH_DEFAULT,
+    });
+    writer.u64(successor.target());
+    match successor.case_value() {
+        Some(value) => {
+            writer.bool(true);
+            writer.u64(value);
+        }
+        None => writer.bool(false),
+    }
+    writer.bool(successor.is_external());
+}
+
+pub(crate) fn read_successor(
+    reader: &mut SnapshotWireReader<'_>,
+) -> Result<AdvisorySuccessor, SnapshotWireError> {
+    let kind = match reader.u8()? {
+        SUCCESSOR_DIRECT => AdvisorySuccessorKind::Direct,
+        SUCCESSOR_FALLTHROUGH => AdvisorySuccessorKind::Fallthrough,
+        SUCCESSOR_SWITCH_CASE => AdvisorySuccessorKind::SwitchCase,
+        SUCCESSOR_SWITCH_DEFAULT => AdvisorySuccessorKind::SwitchDefault,
+        // Edge kind decides control flow, so an unknown one is refused rather
+        // than folded into a direct edge.
+        _ => return Err(SnapshotWireError::ValueTooWide),
+    };
+    let target = reader.u64()?;
+    let case_value = if reader.bool()? {
+        Some(reader.u64()?)
+    } else {
+        None
+    };
+    let external = reader.bool()?;
+    Ok(AdvisorySuccessor {
+        kind,
+        target,
+        case_value,
+        external,
+    })
+}
+
+pub(crate) fn write_block(
+    writer: &mut SnapshotWireWriter,
+    block: &OwnedFunctionBlock,
+) -> Result<(), SnapshotWireError> {
+    writer.u64(block.address());
+    writer.bytes(block.bytes())?;
+    let count = u32::try_from(block.successors().len())
+        .map_err(|_| SnapshotWireError::ValueTooWide)?;
+    writer.u32(count);
+    for successor in block.successors() {
+        write_successor(writer, successor);
+    }
+    match block.switch_instruction() {
+        Some(address) => {
+            writer.bool(true);
+            writer.u64(address);
+        }
+        None => writer.bool(false),
+    }
+    Ok(())
+}
+
+pub(crate) fn read_block(
+    reader: &mut SnapshotWireReader<'_>,
+) -> Result<OwnedFunctionBlock, SnapshotWireError> {
+    let address = reader.u64()?;
+    let bytes: Arc<[u8]> = Arc::from(reader.bytes()?);
+    let count = reader.u32()? as usize;
+    let mut successors = Vec::with_capacity(count.min(4096));
+    for _ in 0..count {
+        successors.push(read_successor(reader)?);
+    }
+    let switch_instruction = if reader.bool()? {
+        Some(reader.u64()?)
+    } else {
+        None
+    };
+    Ok(OwnedFunctionBlock {
+        address,
+        bytes,
+        successors: successors.into_boxed_slice(),
+        switch_instruction,
+    })
+}
+
+pub(crate) fn write_image(
+    writer: &mut SnapshotWireWriter,
+    image: &OwnedFunctionImage,
+) -> Result<(), SnapshotWireError> {
+    writer.u64(image.entry_address());
+    let blocks = u32::try_from(image.blocks().len()).map_err(|_| SnapshotWireError::ValueTooWide)?;
+    writer.u32(blocks);
+    for block in image.blocks() {
+        write_block(writer, block)?;
+    }
+    let exits =
+        u32::try_from(image.external_exits().len()).map_err(|_| SnapshotWireError::ValueTooWide)?;
+    writer.u32(exits);
+    for exit in image.external_exits() {
+        writer.u64(*exit);
+    }
+    let total = u64::try_from(image.total_source_bytes())
+        .map_err(|_| SnapshotWireError::ValueTooWide)?;
+    writer.u64(total);
+    Ok(())
+}
+
+pub(crate) fn read_image(
+    reader: &mut SnapshotWireReader<'_>,
+) -> Result<OwnedFunctionImage, SnapshotWireError> {
+    let entry_address = reader.u64()?;
+    let block_count = reader.u32()? as usize;
+    let mut blocks = Vec::with_capacity(block_count.min(4096));
+    for _ in 0..block_count {
+        blocks.push(read_block(reader)?);
+    }
+    let exit_count = reader.u32()? as usize;
+    let mut external_exits = Vec::with_capacity(exit_count.min(4096));
+    for _ in 0..exit_count {
+        external_exits.push(reader.u64()?);
+    }
+    let total_source_bytes =
+        usize::try_from(reader.u64()?).map_err(|_| SnapshotWireError::ValueTooWide)?;
+    Ok(OwnedFunctionImage {
+        entry_address,
+        blocks: blocks.into_boxed_slice(),
+        external_exits: external_exits.into_boxed_slice(),
+        total_source_bytes,
+    })
 }
 
 #[cfg(test)]
@@ -884,5 +1028,105 @@ mod tests {
         let buffer = writer.finish().expect("finish");
         let mut reader = SnapshotWireReader::new(&buffer).expect("header");
         assert!(read_machine_roles(&mut reader).is_err());
+    }
+
+    fn sample_successor(kind: AdvisorySuccessorKind, case_value: Option<u64>) -> AdvisorySuccessor {
+        AdvisorySuccessor {
+            kind,
+            target: 0x1000,
+            case_value,
+            external: false,
+        }
+    }
+
+    #[test]
+    fn every_successor_kind_round_trips() {
+        let kinds = [
+            (AdvisorySuccessorKind::Direct, None),
+            (AdvisorySuccessorKind::Fallthrough, None),
+            (AdvisorySuccessorKind::SwitchCase, Some(7)),
+            (AdvisorySuccessorKind::SwitchDefault, None),
+        ];
+        for (kind, case_value) in kinds {
+            let successor = sample_successor(kind, case_value);
+            let mut writer = SnapshotWireWriter::new();
+            write_successor(&mut writer, &successor);
+            let buffer = writer.finish().expect("finish");
+            let mut reader = SnapshotWireReader::new(&buffer).expect("header");
+            assert_eq!(read_successor(&mut reader).expect("read"), successor);
+            reader.finish().expect("consumed exactly");
+        }
+    }
+
+    #[test]
+    fn an_unknown_successor_kind_is_refused() {
+        let mut writer = SnapshotWireWriter::new();
+        writer.u8(77);
+        writer.u64(0x1000);
+        writer.bool(false);
+        writer.bool(false);
+        let buffer = writer.finish().expect("finish");
+        let mut reader = SnapshotWireReader::new(&buffer).expect("header");
+        assert!(read_successor(&mut reader).is_err());
+    }
+
+    #[test]
+    fn a_whole_function_image_round_trips() {
+        let image = OwnedFunctionImage {
+            entry_address: 0x1000_07c0,
+            blocks: vec![
+                OwnedFunctionBlock {
+                    address: 0x1000_07c0,
+                    bytes: Arc::from(&[0x55u8, 0x48, 0x89, 0xe5][..]),
+                    successors: vec![
+                        sample_successor(AdvisorySuccessorKind::Direct, None),
+                        sample_successor(AdvisorySuccessorKind::Fallthrough, None),
+                    ]
+                    .into_boxed_slice(),
+                    switch_instruction: None,
+                },
+                OwnedFunctionBlock {
+                    address: 0x1000_07dc,
+                    bytes: Arc::from(&[0x5du8, 0xc3][..]),
+                    successors: Box::new([]),
+                    switch_instruction: Some(0x1000_07d5),
+                },
+            ]
+            .into_boxed_slice(),
+            external_exits: vec![0x2000, 0x3000].into_boxed_slice(),
+            total_source_bytes: 6,
+        };
+        let mut writer = SnapshotWireWriter::new();
+        write_image(&mut writer, &image).expect("write");
+        let buffer = writer.finish().expect("finish");
+        let mut reader = SnapshotWireReader::new(&buffer).expect("header");
+        assert_eq!(read_image(&mut reader).expect("read"), image);
+        reader.finish().expect("consumed exactly");
+    }
+
+    #[test]
+    fn an_image_truncated_mid_block_is_refused() {
+        let image = OwnedFunctionImage {
+            entry_address: 0x40,
+            blocks: vec![OwnedFunctionBlock {
+                address: 0x40,
+                bytes: Arc::from(&[0x90u8][..]),
+                successors: Box::new([]),
+                switch_instruction: None,
+            }]
+            .into_boxed_slice(),
+            external_exits: Box::new([]),
+            total_source_bytes: 1,
+        };
+        let mut writer = SnapshotWireWriter::new();
+        write_image(&mut writer, &image).expect("write");
+        let mut buffer = writer.finish().expect("finish");
+        // drop the trailing byte-count word and re-declare the payload extent
+        buffer.truncate(buffer.len() - 8);
+        let shorter = (u32::from_le_bytes([buffer[16], buffer[17], buffer[18], buffer[19]]) - 8)
+            .to_le_bytes();
+        buffer[16..20].copy_from_slice(&shorter);
+        let mut reader = SnapshotWireReader::new(&buffer).expect("header");
+        assert!(read_image(&mut reader).is_err());
     }
 }
