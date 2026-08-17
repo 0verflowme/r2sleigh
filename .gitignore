@@ -50,3 +50,5 @@ tests/e2e/*_x86
 tests/e2e/target/
 r2plugin/arch_sleigh.o
 r2plugin/r_anal_sleigh_arch.o
+r2plugin/snapshot_wire.o
+r2plugin/snapshot_walk.o
