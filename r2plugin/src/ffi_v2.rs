@@ -1749,6 +1749,9 @@ fn engine_semantic_kernel_region_name(
         r2engine::EngineSemanticKernelRegion::ConditionalTerminalReturnFunction => {
             "conditional_terminal_return_function"
         }
+        r2engine::EngineSemanticKernelRegion::GuardedTerminalReturnFunction => {
+            "guarded_terminal_return_function"
+        }
         r2engine::EngineSemanticKernelRegion::SwitchTerminalReturnFunction => {
             "switch_terminal_return_function"
         }

@@ -4510,6 +4510,10 @@ impl EngineSession {
                     EnginePlan::SemanticStructured,
                     "r2dec sealed exact conditional-return typed-output ownership",
                 ),
+                EngineSemanticKernelRegion::GuardedTerminalReturnFunction => (
+                    EnginePlan::SemanticStructured,
+                    "r2dec sealed exact guarded terminal-return typed-output ownership",
+                ),
                 EngineSemanticKernelRegion::SwitchTerminalReturnFunction => (
                     EnginePlan::SemanticStructured,
                     "r2dec sealed exact switch terminal-return typed-output ownership",
@@ -5103,6 +5107,7 @@ enum EngineSemanticKernelProbe {
     Memory,
     DirectCall,
     Conditional,
+    Guard,
     Switch,
     Loop,
     Terminal,
@@ -5133,6 +5138,7 @@ impl EngineSemanticKernelProbe {
             Self::Memory => "memory",
             Self::DirectCall => "direct-call",
             Self::Conditional => "conditional",
+            Self::Guard => "guard",
             Self::Switch => "switch",
             Self::Loop => "loop",
             Self::Terminal => "terminal",
@@ -5531,6 +5537,28 @@ fn render_semantic_kernel_function<C: r2ssa::SsaWorkControl + ?Sized>(
         Err(error) => {
             trace.not_applicable(EngineSemanticKernelProbe::Conditional, &error.to_string())
         }
+    }
+    poll_engine_render_control(control, EnginePhase::Rendering)?;
+    match r2dec::CertifiedGuardedReturnFunction::from_artifact(trusted) {
+        Ok(function) => match function.render_certified_c() {
+            Ok(output) => {
+                return complete_engine_semantic_kernel_attempt(
+                    control,
+                    EngineSemanticKernelAttempt::Rendered(EngineRenderedDecompile {
+                        output,
+                        structuring_executed: true,
+                        semantic_kernel_render: Some(EngineSemanticKernelRender {
+                            region: EngineSemanticKernelRegion::GuardedTerminalReturnFunction,
+                            region_schema_version: function.schema_version(),
+                            exact_obligation_closure: true,
+                        }),
+                        semantic_kernel_warnings: trace.into_warnings(),
+                    }),
+                );
+            }
+            Err(error) => trace.refused(EngineSemanticKernelProbe::Guard, &error.to_string()),
+        },
+        Err(error) => trace.not_applicable(EngineSemanticKernelProbe::Guard, &error.to_string()),
     }
     poll_engine_render_control(control, EnginePhase::Rendering)?;
     match r2dec::CertifiedSwitchReturnFunction::from_artifact(trusted) {

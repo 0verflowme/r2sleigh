@@ -32,6 +32,7 @@ pub(crate) mod analysis;
 pub mod ast;
 pub mod certified_call;
 pub mod certified_control;
+pub mod certified_if_guard;
 pub mod certified_if_return;
 pub mod certified_loop;
 pub mod certified_loop_return;
@@ -79,6 +80,11 @@ pub use certified_control::{
     ConditionalTransferRegionScope, DirectTransferRegionAuditReport, DirectTransferRegionError,
     DirectTransferRegionScope, FallthroughTransferRegionAuditReport,
     FallthroughTransferRegionError, FallthroughTransferRegionScope,
+};
+pub use certified_if_guard::{
+    CERTIFIED_GUARDED_RETURN_FUNCTION_SCHEMA_VERSION, CertifiedGuardedReturnFunction,
+    GuardPolarity, GuardedReturnFunctionAuditReport, GuardedReturnFunctionError,
+    GuardedReturnFunctionScope,
 };
 pub use certified_if_return::{
     CERTIFIED_CONDITIONAL_RETURN_FUNCTION_SCHEMA_VERSION, CertifiedConditionalReturnArm,

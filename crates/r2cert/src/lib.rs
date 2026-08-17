@@ -2664,6 +2664,7 @@ pub enum CertifiedTypedRegionKind {
     SwitchTerminalReturnFunction,
     CarrierFreeLoopTerminalReturnFunction,
     PrivateFrameConditionalJoinFunction,
+    GuardedTerminalReturnFunction,
 }
 
 pub const CERTIFIED_TERMINAL_RETURN_REGION_CONTRACT_VERSION: u32 = 5;
@@ -2673,6 +2674,7 @@ pub const CERTIFIED_CONDITIONAL_TERMINAL_RETURN_CONTRACT_VERSION: u32 = 3;
 pub const CERTIFIED_SWITCH_TERMINAL_RETURN_CONTRACT_VERSION: u32 = 3;
 pub const CERTIFIED_CARRIER_FREE_LOOP_TERMINAL_RETURN_CONTRACT_VERSION: u32 = 3;
 pub const CERTIFIED_PRIVATE_FRAME_CONDITIONAL_JOIN_CONTRACT_VERSION: u32 = 2;
+pub const CERTIFIED_GUARDED_TERMINAL_RETURN_CONTRACT_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct TypedRegionMapping {
@@ -2756,6 +2758,9 @@ impl CertifiedLedgerClosure {
             CertifiedTypedRegionKind::PrivateFrameConditionalJoinFunction => {
                 self.region_schema_version
                     == CERTIFIED_PRIVATE_FRAME_CONDITIONAL_JOIN_CONTRACT_VERSION
+            }
+            CertifiedTypedRegionKind::GuardedTerminalReturnFunction => {
+                self.region_schema_version == CERTIFIED_GUARDED_TERMINAL_RETURN_CONTRACT_VERSION
             }
         };
         let mapped_obligations = self
@@ -3916,6 +3921,307 @@ pub fn certify_conditional_terminal_return_region(
         origin: origin.clone(),
         region_kind: CertifiedTypedRegionKind::ConditionalTerminalReturnFunction,
         region_schema_version: CERTIFIED_CONDITIONAL_TERMINAL_RETURN_CONTRACT_VERSION,
+        mappings: mappings.into_boxed_slice(),
+    })
+}
+
+/// Authorize one exact closed three-block guarded function: one conditional
+/// entry whose taken edge skips a single guarded arm, one arm that transfers
+/// unconditionally into the join, and one shared join that ends in the sole
+/// terminal return.
+///
+/// This contract admits no value merge. Any phi in the sealed source is
+/// rejected outright, so a join whose live machine state differs between its
+/// two incoming edges can never acquire this permit. Arm and join memory
+/// effects stay ordered statements: a guarded write followed by a join read of
+/// the same address is retained as two exact statements and is never folded
+/// into the stored value.
+pub fn certify_guarded_terminal_return_region(
+    origin: &CertifiedArtifactOrigin,
+    ledger: &ObligationLedger,
+    mappings: impl IntoIterator<Item = TypedRegionMapping>,
+    header_addr: u64,
+    arm_addr: u64,
+    join_addr: u64,
+) -> Result<CertifiedLedgerClosure, LedgerClosureError> {
+    if !origin.is_valid()
+        || !ledger.matches_origin(origin)
+        || !return_machine_state_matches_origin(origin, ledger)
+        || origin
+            .machine_context()
+            .source()
+            .function_interface()
+            .is_none()
+    {
+        return Err(LedgerClosureError::InvalidOrigin);
+    }
+    let topology = origin.topology();
+    if topology.entry_addr() != header_addr
+        || BTreeSet::from([header_addr, arm_addr, join_addr]).len() != 3
+        || topology.blocks().len() != 3
+    {
+        return Err(LedgerClosureError::InvalidRegionTopology);
+    }
+    let header = topology
+        .block(header_addr)
+        .ok_or(LedgerClosureError::InvalidRegionTopology)?;
+    let arm = topology
+        .block(arm_addr)
+        .ok_or(LedgerClosureError::InvalidRegionTopology)?;
+    let join = topology
+        .block(join_addr)
+        .ok_or(LedgerClosureError::InvalidRegionTopology)?;
+    let (true_target, false_target) = match header.terminator() {
+        CertifiedSourceTerminator::ConditionalBranch {
+            true_target,
+            false_target,
+        } => (*true_target, *false_target),
+        _ => return Err(LedgerClosureError::InvalidRegionTopology),
+    };
+    let arm_reaches_join = match arm.terminator() {
+        CertifiedSourceTerminator::Branch { target } => *target == join_addr,
+        CertifiedSourceTerminator::Fallthrough { next } => *next == join_addr,
+        _ => false,
+    };
+    if BTreeSet::from([true_target, false_target]) != BTreeSet::from([arm_addr, join_addr])
+        || !header.predecessors().is_empty()
+        || header.successors().len() != 2
+        || header.successors().iter().copied().collect::<BTreeSet<_>>()
+            != BTreeSet::from([arm_addr, join_addr])
+        || header.instructions().is_empty()
+        || arm.predecessors() != [header_addr]
+        || arm.successors() != [join_addr]
+        || !arm_reaches_join
+        || arm.instructions().is_empty()
+        || join.predecessors().len() != 2
+        || join.predecessors().iter().copied().collect::<BTreeSet<_>>()
+            != BTreeSet::from([header_addr, arm_addr])
+        || !join.successors().is_empty()
+        || !matches!(join.terminator(), CertifiedSourceTerminator::Return)
+        || join.instructions().is_empty()
+    {
+        return Err(LedgerClosureError::InvalidRegionTopology);
+    }
+    if let Some(instruction) = origin
+        .source()
+        .instructions()
+        .values()
+        .find(|instruction| {
+            instruction.state == SemanticInstructionState::UnsupportedUnknown
+                || matches!(instruction.id.site, r2ssa::CanonicalInstructionSite::Phi(_))
+        })
+    {
+        return Err(LedgerClosureError::UnsupportedSourceSemantics(
+            instruction.id,
+        ));
+    }
+    if origin.source().obligations().values().any(|obligation| {
+        !matches!(
+            obligation.id.kind,
+            SemanticObligationKind::LiveValueProducer
+                | SemanticObligationKind::ObservableMemoryRead
+                | SemanticObligationKind::ObservableMemoryWrite
+                | SemanticObligationKind::ControlPredicate
+                | SemanticObligationKind::ControlTransfer
+                | SemanticObligationKind::Return
+                | SemanticObligationKind::ReturnValue
+        )
+    }) {
+        return Err(LedgerClosureError::InvalidRegionTopology);
+    }
+    let report = ledger.audit(origin.source());
+    if !report.has_exactly_one_disposition_per_source() || !report.invalid().is_empty() {
+        return Err(LedgerClosureError::IncompleteLedger);
+    }
+    if let Some(obligation) = report.residualized().iter().chain(report.refused()).next() {
+        return Err(LedgerClosureError::ResidualOrRefusedObligation(*obligation));
+    }
+
+    let predicates = origin
+        .source()
+        .obligations()
+        .values()
+        .filter(|obligation| obligation.id.kind == SemanticObligationKind::ControlPredicate)
+        .collect::<Vec<_>>();
+    let [predicate] = predicates.as_slice() else {
+        return Err(LedgerClosureError::InvalidRegionTopology);
+    };
+    let [predicate_effect] = ledger.effects(predicate.id) else {
+        return Err(LedgerClosureError::IncompleteLedger);
+    };
+    let Some(conditional) = predicate_effect.conditional_control_evidence() else {
+        return Err(LedgerClosureError::InvalidRegionDisposition(predicate.id));
+    };
+    let header_transfers = conditional
+        .source_obligations()
+        .into_iter()
+        .filter(|id| id.kind == SemanticObligationKind::ControlTransfer)
+        .collect::<Vec<_>>();
+    let [header_transfer] = header_transfers.as_slice() else {
+        return Err(LedgerClosureError::InvalidRegionDisposition(predicate.id));
+    };
+    let [transfer_effect] = ledger.effects(*header_transfer) else {
+        return Err(LedgerClosureError::IncompleteLedger);
+    };
+    if transfer_effect.conditional_control_evidence() != Some(conditional)
+        || header.instructions().last() != Some(&conditional.producer())
+        || conditional.true_target() != true_target
+        || conditional.false_target() != false_target
+        || conditional.truthiness() != CertifiedControlTruthiness::NonZeroIsTrue
+        || conditional.source_obligations() != BTreeSet::from([predicate.id, *header_transfer])
+        || predicate_effect.disposition()
+            != &(EffectDisposition::AbsorbedIntoControl {
+                producer: conditional.producer(),
+            })
+        || transfer_effect.disposition()
+            != &(EffectDisposition::AbsorbedIntoControl {
+                producer: conditional.producer(),
+            })
+    {
+        return Err(LedgerClosureError::InvalidRegionDisposition(predicate.id));
+    }
+
+    let interface = origin
+        .machine_context()
+        .source()
+        .function_interface()
+        .expect("checked function interface");
+    let return_producer = *join
+        .instructions()
+        .last()
+        .expect("checked nonempty join block");
+    let return_obligations = origin
+        .source()
+        .obligations()
+        .values()
+        .filter(|obligation| {
+            obligation.id.instruction == return_producer
+                && obligation.id.kind == SemanticObligationKind::Return
+        })
+        .collect::<Vec<_>>();
+    let [return_obligation] = return_obligations.as_slice() else {
+        return Err(LedgerClosureError::InvalidRegionTopology);
+    };
+    let [return_effect] = ledger.effects(return_obligation.id) else {
+        return Err(LedgerClosureError::IncompleteLedger);
+    };
+    let Some(return_control) = return_effect.return_control_evidence() else {
+        return Err(LedgerClosureError::InvalidRegionDisposition(
+            return_obligation.id,
+        ));
+    };
+    if return_control.producer() != return_producer
+        || return_effect.disposition()
+            != &(EffectDisposition::AbsorbedIntoReturn {
+                producer: return_producer,
+            })
+        || !return_control_matches_closure(
+            return_control,
+            interface,
+            ReturnClosureContract::Conditional,
+        )
+    {
+        return Err(LedgerClosureError::InvalidRegionDisposition(
+            return_obligation.id,
+        ));
+    }
+
+    for obligation in origin.source().obligations().values() {
+        let [effect] = ledger.effects(obligation.id) else {
+            return Err(LedgerClosureError::IncompleteLedger);
+        };
+        let valid = match obligation.id.kind {
+            SemanticObligationKind::LiveValueProducer => matches!(
+                effect.disposition(),
+                EffectDisposition::AbsorbedIntoExpression { .. }
+            ),
+            SemanticObligationKind::ObservableMemoryRead
+            | SemanticObligationKind::ObservableMemoryWrite => {
+                effect.statement_evidence().is_some_and(|statement| {
+                    statement.producer() == obligation.id.instruction
+                        && statement.source_obligations() == &BTreeSet::from([obligation.id])
+                        && statement.space() == MachineAddressSpace::Ram
+                        && statement.word_size_bytes() == 1
+                        && matches!(statement.width_bits(), 8 | 16 | 32 | 64)
+                        && matches!(
+                            statement.endianness(),
+                            MachineMemoryEndianness::Little | MachineMemoryEndianness::Big
+                        )
+                        && statement.execution()
+                            == CertifiedMemoryExecutionPolicy::ExactlyOnceInSourceOrder
+                        && effect.disposition()
+                            == &EffectDisposition::AbsorbedIntoStatement {
+                                producer: statement.producer(),
+                            }
+                        && matches!(
+                            (obligation.id.kind, statement.kind()),
+                            (
+                                SemanticObligationKind::ObservableMemoryRead,
+                                CertifiedMemoryStatementKind::Read { .. }
+                            ) | (
+                                SemanticObligationKind::ObservableMemoryWrite,
+                                CertifiedMemoryStatementKind::Write { .. }
+                            )
+                        )
+                })
+            }
+            SemanticObligationKind::ControlPredicate => matches!(
+                effect.disposition(),
+                EffectDisposition::AbsorbedIntoControl { producer }
+                    if producer.block_addr == header_addr
+            ),
+            SemanticObligationKind::ControlTransfer => matches!(
+                effect.disposition(),
+                EffectDisposition::AbsorbedIntoControl { producer }
+                    if producer.block_addr == header_addr || producer.block_addr == arm_addr
+            ),
+            SemanticObligationKind::Return | SemanticObligationKind::ReturnValue => matches!(
+                effect.disposition(),
+                EffectDisposition::AbsorbedIntoReturn { producer }
+                    if producer.block_addr == join_addr
+            ),
+            _ => false,
+        };
+        if !valid {
+            return Err(LedgerClosureError::InvalidRegionDisposition(obligation.id));
+        }
+    }
+
+    let mappings = mappings.into_iter().collect::<Vec<_>>();
+    let mut by_obligation = BTreeMap::<SemanticObligationId, &TypedRegionMapping>::new();
+    for mapping in &mappings {
+        if !origin
+            .source()
+            .obligations()
+            .contains_key(&mapping.obligation)
+        {
+            return Err(LedgerClosureError::UnexpectedMapping(mapping.obligation));
+        }
+        if by_obligation.insert(mapping.obligation, mapping).is_some() {
+            return Err(LedgerClosureError::DuplicateMapping(mapping.obligation));
+        }
+    }
+    for obligation in origin.source().obligations().keys() {
+        let mapping = by_obligation
+            .get(obligation)
+            .ok_or(LedgerClosureError::MissingMapping(*obligation))?;
+        let [effect] = ledger.effects(*obligation) else {
+            return Err(LedgerClosureError::IncompleteLedger);
+        };
+        if effect.disposition() != mapping.source_disposition()
+            || matches!(
+                mapping.source_disposition(),
+                EffectDisposition::Residualized { .. } | EffectDisposition::Refused { .. }
+            )
+        {
+            return Err(LedgerClosureError::DispositionMismatch(*obligation));
+        }
+    }
+    Ok(CertifiedLedgerClosure {
+        schema_version: CERTIFICATION_SCHEMA_VERSION,
+        origin: origin.clone(),
+        region_kind: CertifiedTypedRegionKind::GuardedTerminalReturnFunction,
+        region_schema_version: CERTIFIED_GUARDED_TERMINAL_RETURN_CONTRACT_VERSION,
         mappings: mappings.into_boxed_slice(),
     })
 }

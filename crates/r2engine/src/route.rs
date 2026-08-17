@@ -123,6 +123,7 @@ pub enum EngineSemanticKernelRegion {
     DirectCallTerminalReturnFunction,
     PrivateFrameConditionalJoinFunction,
     ConditionalTerminalReturnFunction,
+    GuardedTerminalReturnFunction,
     SwitchTerminalReturnFunction,
     CarrierFreeLoopTerminalReturnFunction,
 }
@@ -147,6 +148,9 @@ impl EngineSemanticKernelRegion {
             }
             Self::ConditionalTerminalReturnFunction => {
                 r2dec::CERTIFIED_CONDITIONAL_RETURN_FUNCTION_SCHEMA_VERSION
+            }
+            Self::GuardedTerminalReturnFunction => {
+                r2dec::CERTIFIED_GUARDED_RETURN_FUNCTION_SCHEMA_VERSION
             }
             Self::SwitchTerminalReturnFunction => {
                 r2dec::CERTIFIED_SWITCH_RETURN_FUNCTION_SCHEMA_VERSION
