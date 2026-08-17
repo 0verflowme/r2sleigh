@@ -918,7 +918,11 @@ fn solve_interproc_summary_set_from_locals(
     scope_size: usize,
 ) -> InterprocSummarySet {
     let sccs = compute_summary_sccs(&locals);
-    let max_iterations = config.max_iterations.max(1);
+    // Convergence is proven by a pass that changes nothing, so a fixpoint needs
+    // one pass to compute a summary and a second to confirm it. A budget of one
+    // can only ever end mid-change, which reports every summary as unconverged
+    // no matter how simple the function is.
+    let max_iterations = config.max_iterations.max(2);
     let mut iterations = 0usize;
     let mut converged = true;
     let mut max_scc_size = 0usize;
