@@ -17,6 +17,45 @@ dylint_linting::dylint_library!();
 rustc_session::declare_lint!(
     /// ### What it does
     ///
+    /// Warns when `DisplayNames` is read outside a rendering path.
+    ///
+    /// ### Why is this bad?
+    ///
+    /// `DisplayNames` holds the spellings radare2 resolved for addresses and
+    /// parameters. A name says how to print something, not what it does, and a
+    /// decompiler that classifies behaviour from the letters after `sym.imp.`
+    /// invents semantics it cannot justify. The names are kept in a carrier of
+    /// their own so that separation is checkable rather than conventional, and
+    /// the check is this lint: only code that renders may read them.
+    ///
+    /// Semantic classification, route selection and type inference belong to
+    /// `r2sym`, `r2engine` and `r2types` respectively, and each has typed
+    /// evidence for the job.
+    ///
+    /// ### Example
+    ///
+    /// ```rust
+    /// // in r2sym, choosing a summary
+    /// if facts.display_names().name_for(addr) == Some("sym.imp.malloc") {
+    ///     // semantics from a spelling
+    /// }
+    /// ```
+    ///
+    /// Use instead:
+    ///
+    /// ```rust
+    /// if summary.evidence().allocates() {
+    ///     // semantics from evidence
+    /// }
+    /// ```
+    pub DISPLAY_NAMES_OUTSIDE_RENDERING,
+    Warn,
+    "display spellings may only be read where output is rendered"
+);
+
+rustc_session::declare_lint!(
+    /// ### What it does
+    ///
     /// Warns when semantic storage/address classification is encoded as
     /// `starts_with` checks against string prefixes such as `tmp:`, `const:`,
     /// `ram:`, `sym.`, or `obj.`.
@@ -3113,6 +3152,7 @@ rustc_session::declare_lint!(
 );
 
 rustc_session::declare_lint_pass!(R2sleighLintPass => [
+    DISPLAY_NAMES_OUTSIDE_RENDERING,
     STRING_PREFIX_SEMANTIC_CLASSIFICATION,
     R2_JSON_COMMAND_INTERNAL_SEAM,
     R2DEC_DIRECT_KNOWN_SIGNATURE_LOOKUP,
@@ -3234,6 +3274,7 @@ rustc_session::declare_lint_pass!(R2sleighLintPass => [
 pub fn register_lints(sess: &rustc_session::Session, lint_store: &mut rustc_lint::LintStore) {
     dylint_linting::init_config(sess);
     lint_store.register_lints(&[
+        DISPLAY_NAMES_OUTSIDE_RENDERING,
         STRING_PREFIX_SEMANTIC_CLASSIFICATION,
         R2_JSON_COMMAND_INTERNAL_SEAM,
         R2DEC_DIRECT_KNOWN_SIGNATURE_LOOKUP,
@@ -4369,6 +4410,19 @@ impl<'tcx> LateLintPass<'tcx> for R2sleighLintPass {
     fn check_expr(&mut self, cx: &LateContext<'tcx>, expr: &'tcx Expr<'tcx>) {
         if is_canonical_ssa_var_classifier(cx, expr) {
             return;
+        }
+
+        if reads_display_names(expr)
+            && !is_display_name_rendering_span(cx, expr.span)
+            && !is_inside_test_item(cx, expr)
+            && !is_inside_cfg_test_item_source(cx, expr)
+        {
+            span_lint(
+                cx,
+                DISPLAY_NAMES_OUTSIDE_RENDERING,
+                expr.span,
+                "display spellings are for rendering; classify behaviour from typed evidence instead",
+            );
         }
 
         if (is_r2dec_span(cx, expr.span) || is_r2engine_span(cx, expr.span))
@@ -8022,6 +8076,33 @@ fn qpath_last_segment_is(qpath: &QPath<'_>, name: &str) -> bool {
 fn is_r2dec_path(cx: &LateContext<'_>, expr: &Expr<'_>) -> bool {
     let filename = cx.sess().source_map().span_to_filename(expr.span);
     format!("{filename:?}").contains("crates/r2dec/src/")
+}
+
+/// Whether this expression reads the display-name carrier.
+fn reads_display_names(expr: &Expr<'_>) -> bool {
+    match expr.kind {
+        ExprKind::MethodCall(method, _, _, _) => {
+            matches!(
+                method.ident.as_str(),
+                "display_names" | "name_for" | "parameter" | "parameters"
+            )
+        }
+        ExprKind::Field(_, field) => field.as_str() == "display_names",
+        _ => false,
+    }
+}
+
+/// The files allowed to read a display spelling.
+///
+/// `r2source` owns the carrier, and `r2dec` renders. `r2ssa` fills it from the
+/// snapshot, which is a copy rather than a reading, and is allowed for that.
+fn is_display_name_rendering_span(cx: &LateContext<'_>, span: rustc_span::Span) -> bool {
+    let filename = cx.sess().source_map().span_to_filename(span);
+    let filename = format!("{filename:?}");
+    filename.contains("crates/r2source/src/display_names.rs")
+        || filename.contains("crates/r2dec/src/")
+        || filename.contains("crates/r2ssa/src/function.rs")
+        || filename.contains("crates/r2types/src/function_facts.rs")
 }
 
 fn is_r2dec_span(cx: &LateContext<'_>, span: rustc_span::Span) -> bool {
