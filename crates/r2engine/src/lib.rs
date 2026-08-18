@@ -5421,19 +5421,20 @@ fn render_semantic_kernel_function<C: r2ssa::SsaWorkControl + ?Sized>(
                 }),
             );
         }
+        // A probe that cannot certify has said this route does not apply to
+        // this function. It has not said the function cannot be decompiled, and
+        // returning an error here made it say exactly that: the standard
+        // renderer was never reached, so a shape the kernel half-recognised
+        // cost the whole function. Every other probe in this sequence already
+        // records its refusal and carries on; this one is now consistent with
+        // them, and the distinction between a shape that did not match and a
+        // proof that did not close is kept in the trace where it belongs.
         Err(error) => match classify_private_frame_probe_error(&error) {
             EnginePrivateFrameProbeDisposition::NotApplicable => {
                 trace.not_applicable(EngineSemanticKernelProbe::PrivateFrame, &error.to_string())
             }
             EnginePrivateFrameProbeDisposition::Refused => {
-                return Err(engine_semantic_kernel_refusal(
-                    format!(
-                        "private-frame conditional-join certification refused without fallback: {error}"
-                    ),
-                    EnginePhase::Certification,
-                    false,
-                    false,
-                ));
+                trace.refused(EngineSemanticKernelProbe::PrivateFrame, &error.to_string())
             }
         },
     }

@@ -226,7 +226,6 @@ a:sla > /dev/null
 aaa
 pdd `afl~solve_equation$[0]` | jq -Rs '(contains("solve_equation") or contains("sym.solve_equation") or contains("sub_")) and contains("return") and (contains("r2dec fallback:")|not)'
 EOF_CMDS
-BROKEN=1
 RUN
 
 NAME=dec_pd_stays_disassembly
@@ -636,7 +635,6 @@ aaa
 s `afl~solve_equation$[0]` > /dev/null
 pdd | head -n1 | jq -Rs '((contains("void ")|not) and (contains("int32_t") or contains("int64_t")))'
 EOF_CMDS
-BROKEN=1
 RUN
 
 NAME=deep_afvj_fast_mode_reduces_pointer_types
