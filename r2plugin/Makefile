@@ -2,7 +2,11 @@
 
 # Build configuration
 RUST_TARGET ?= release
-RUST_FEATURES ?= x86
+# Every architecture the plugin can lift. Building a subset is supported and
+# occasionally useful, but it must be asked for: a default of x86 alone
+# installs a plugin that answers "unknown architecture 'arm64'" on an ARM host,
+# which reads as a missing backend rather than a build that left it out.
+RUST_FEATURES ?= all-archs
 
 # Paths
 ANAL_PLUGIN_NAME = anal_sleigh
@@ -236,7 +240,7 @@ help:
 	@echo "Variables:"
 	@echo "  RUST_TARGET   - 'release' (default) or 'debug'"
 	@echo "                  use 'dist' for fat-LTO distributable artifacts"
-	@echo "  RUST_FEATURES - Sleigh features: 'x86' (default), 'arm' (ARM32 + AArch64), 'mips', 'riscv', 'all-archs'"
+	@echo "  RUST_FEATURES - Sleigh features: 'all-archs' (default), 'x86', 'arm' (ARM32 + AArch64), 'mips', 'riscv'"
 	@echo ""
 	@echo "Examples:"
 	@echo "  make                           # Build release with x86"

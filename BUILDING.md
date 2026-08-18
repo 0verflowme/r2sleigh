@@ -85,7 +85,7 @@ make RUST_TARGET=dist
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `RUST_TARGET` | `release` | `debug`, `release`, or `dist` |
-| `RUST_FEATURES` | `x86` | Sleigh feature flags |
+| `RUST_FEATURES` | `all-archs` | Sleigh feature flags: `x86`, `arm` (ARM32 + AArch64), `mips`, `riscv`, or `all-archs`. Narrow it only when build time matters more than covering the host. |
 
 Installation
 ------------
