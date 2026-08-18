@@ -275,7 +275,6 @@ pub struct SourceTypeGraph {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SourceTypeGraphError {
-    Empty,
     InvalidType,
     InvalidAggregate,
     InvalidMember,
@@ -304,9 +303,9 @@ impl SourceTypeGraph {
     ) -> Result<Self, SourceTypeGraphError> {
         let types = types.into_iter().collect::<Vec<_>>();
         let aggregates = aggregates.into_iter().collect::<Vec<_>>();
-        if types.is_empty() {
-            return Err(SourceTypeGraphError::Empty);
-        }
+        // A function that mentions no type has an empty graph. That is a
+        // complete account of the types it uses, not an absent one, and
+        // rejecting it refused every function whose body needs nothing named.
         for (position, source_type) in types.iter().enumerate() {
             if u32::try_from(position) != Ok(source_type.id)
                 || source_type.size_bits == 0

@@ -448,8 +448,11 @@ static bool walk_type_graph(R2SleighWireWriter *writer, const RAnalFunctionSnaps
 	if (!r_anal_function_snapshot_type_graph_view (snapshot, &graph) || !graph.complete) {
 		return false;
 	}
-	if (graph.num_types == 0 || graph.num_types > UINT32_MAX
-		|| graph.num_aggregates > UINT32_MAX) {
+	/* A function that mentions no type has an empty type graph, and that is a
+	 * complete description of what it uses rather than a missing one. Refusing
+	 * here rejected the whole snapshot, so a function as small as a lone `ret`
+	 * could not be decompiled at all. */
+	if (graph.num_types > UINT32_MAX || graph.num_aggregates > UINT32_MAX) {
 		return false;
 	}
 	r2sleigh_wire_u32 (writer, (uint32_t)graph.num_types);

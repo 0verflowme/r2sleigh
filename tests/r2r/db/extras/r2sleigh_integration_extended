@@ -600,7 +600,6 @@ s `afl~test_cpuid$[0]` >/dev/null
 s `afl~test_cpuid$[0]` >/dev/null
 pdd | jq -Rs 'contains("callother(")'
 EOF_CMDS
-BROKEN=1
 RUN
 
 NAME=dec_check_secret_signature_uses_int32
