@@ -379,7 +379,6 @@ s `afl~check_secret$[0]` >/dev/null
 s `afl~check_secret$[0]` >/dev/null
 pdd | jq -Rs 'contains("0xdead") and contains("return 0;") and contains("return 1;") and (contains("return rax")|not) and (contains("0 != 57005")|not)'
 EOF_CMDS
-BROKEN=1
 RUN
 
 NAME=dec_entry0_no_self_xor_residue
