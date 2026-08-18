@@ -49,10 +49,9 @@ EOF_EXPECT
 CMDS=<<EOF_CMDS
 a:sla > /dev/null
 aaa
-s dbg.parse_number > /dev/null
+s `afl~parse_number$[0]` > /dev/null
 pdd | jq -Rs 'contains("parse_number") or contains("dbg.parse_number") or contains("sub_")'
 EOF_CMDS
-BROKEN=1
 RUN
 
 NAME=stress_sla_dec_missing_symbol_guidance
@@ -149,10 +148,9 @@ EOF_EXPECT
 CMDS=<<EOF_CMDS
 a:sla > /dev/null
 aaa
-s sym.test_boolxor > /dev/null
+s `afl~test_boolxor$[0]` > /dev/null
 pdd | jq -Rs 'contains("^") and (contains("of_")|not)'
 EOF_CMDS
-BROKEN=1
 RUN
 
 NAME=dec_loop_switch_contains_switch
@@ -164,7 +162,7 @@ EOF_EXPECT
 CMDS=<<EOF_CMDS
 a:sla > /dev/null
 aaa
-s sym.test_loop_switch > /dev/null
+s `afl~test_loop_switch$[0]` > /dev/null
 pdd | jq -Rs 'contains("switch (")'
 EOF_CMDS
 BROKEN=1
@@ -211,7 +209,7 @@ EOF_EXPECT
 CMDS=<<EOF_CMDS
 a:sla > /dev/null
 aaa
-s sym.solve_equation > /dev/null
+s `afl~solve_equation$[0]` > /dev/null
 pdd | jq -Rs '(contains("solve_equation") or contains("sym.solve_equation")) and contains("return") and (contains("r2dec fallback:")|not)'
 EOF_CMDS
 BROKEN=1
@@ -254,10 +252,9 @@ EOF_EXPECT
 CMDS=<<EOF_CMDS
 a:sla > /dev/null
 aaa
-s sym.check_secret > /dev/null
+s `afl~check_secret$[0]` > /dev/null
 pdd | jq -Rs 'contains("int32_t") or contains("int64_t") or contains("uint32_t")'
 EOF_CMDS
-BROKEN=1
 RUN
 
 NAME=dec_check_secret_shows_control_flow
@@ -269,10 +266,9 @@ EOF_EXPECT
 CMDS=<<EOF_CMDS
 a:sla > /dev/null
 aaa
-s sym.check_secret > /dev/null
+s `afl~check_secret$[0]` > /dev/null
 pdd | jq -Rs 'contains("if") and contains("return")'
 EOF_CMDS
-BROKEN=1
 RUN
 
 NAME=dec_solve_equation_has_braces
@@ -284,10 +280,9 @@ EOF_EXPECT
 CMDS=<<EOF_CMDS
 a:sla > /dev/null
 aaa
-s sym.solve_equation > /dev/null
+s `afl~solve_equation$[0]` > /dev/null
 pdd | jq -Rs 'contains("{") and contains("}")'
 EOF_CMDS
-BROKEN=1
 RUN
 
 NAME=dec_guard_inversion_still_has_if_return
@@ -299,10 +294,9 @@ EOF_EXPECT
 CMDS=<<EOF_CMDS
 a:sla > /dev/null
 aaa
-s sym.test_guard_inversion_goto > /dev/null
+s `afl~test_guard_inversion_goto$[0]` > /dev/null
 pdd | jq -Rs 'contains("if (") and contains("return")'
 EOF_CMDS
-BROKEN=1
 RUN
 
 NAME=dec_array_index_neg_preserves_subscript_shape
@@ -365,7 +359,7 @@ EOF_EXPECT
 CMDS=<<EOF_CMDS
 a:sla > /dev/null
 aaa
-s sym.test_guard_tail_return > /dev/null
+s `afl~test_guard_tail_return$[0]` > /dev/null
 pdd | jq -Rs 'contains("if (") and contains("global_tail") and contains("global_counter") and contains("return")'
 EOF_CMDS
 BROKEN=1
@@ -429,10 +423,9 @@ EOF_EXPECT
 CMDS=<<EOF_CMDS
 a:sla > /dev/null
 aaa
-s sym.process_string > /dev/null
+s `afl~process_string$[0]` > /dev/null
 pdd | jq -Rs '(contains("*(rbp")|not)'
 EOF_CMDS
-BROKEN=1
 RUN
 
 NAME=dec_process_string_keeps_single_strlen_owner
@@ -444,7 +437,7 @@ EOF_EXPECT
 CMDS=<<EOF_CMDS
 a:sla > /dev/null
 aaa
-s sym.process_string > /dev/null
+s `afl~process_string$[0]` > /dev/null
 pdd | jq -Rs '(contains("len = sym.imp.strlen(s);")) and ((split("sym.imp.strlen(s)") | length) == 2) and contains("if (len > 100)") and (contains("if (len > 4)") or contains("if (len < 5)")) and contains("return -1;") and contains("return -2;") and contains("return len;")'
 EOF_CMDS
 BROKEN=1
@@ -459,10 +452,9 @@ EOF_EXPECT
 CMDS=<<EOF_CMDS
 a:sla > /dev/null
 aaa
-s sym.process_string > /dev/null
+s `afl~process_string$[0]` > /dev/null
 pdd | jq -Rs '(contains("tmp:")|not) and (test("(^|[^A-Za-z0-9_])t[0-9a-f]+(_[0-9]+)?([^A-Za-z0-9_]|$)")|not)'
 EOF_CMDS
-BROKEN=1
 RUN
 
 NAME=dec_authenticate_keeps_strcmp_condition_shape
@@ -474,7 +466,7 @@ EOF_EXPECT
 CMDS=<<EOF_CMDS
 a:sla > /dev/null
 aaa
-s sym.authenticate > /dev/null
+s `afl~authenticate$[0]` > /dev/null
 pdd | jq -Rs 'contains("sym.imp.strcmp(password, \"secret123\")") and ((contains("!= 0")) or (contains("== 0"))) and (contains("0 != 0")|not) and (contains("0 == 0")|not)'
 EOF_CMDS
 BROKEN=1
@@ -489,7 +481,7 @@ EOF_EXPECT
 CMDS=<<EOF_CMDS
 a:sla > /dev/null
 aaa
-s sym.alloc_and_copy > /dev/null
+s `afl~alloc_and_copy$[0]` > /dev/null
 pdd | jq -Rs 'contains("buf = sym.imp.malloc(len + 1);") and (contains("if (buf == 0)") or contains("if (!buf)")) and contains("return 0;") and contains("sym.imp.memcpy(buf, src, len);") and contains("buf[len] = 0;") and contains("return buf;") and (contains("sym.imp.malloc(sym.imp")|not)'
 EOF_CMDS
 BROKEN=1
@@ -504,7 +496,7 @@ EOF_EXPECT
 CMDS=<<EOF_CMDS
 a:sla > /dev/null
 aaa
-s sym.test_setlocale_wrapper > /dev/null
+s `afl~test_setlocale_wrapper$[0]` > /dev/null
 pdd | jq -Rs 'contains("loc = sym.imp.setlocale(6, \"C\");") and (contains("if (loc != 0)") or contains("if (!loc)")) and (contains("return (int32_t)*loc;") or contains("return *loc;") or contains("return loc[0];") or contains("return (int32_t)loc[0];")) and (contains("return (int32_t)loc;")|not)'
 EOF_CMDS
 BROKEN=1
@@ -519,7 +511,7 @@ EOF_EXPECT
 CMDS=<<EOF_CMDS
 a:sla > /dev/null
 aaa
-s sym.vuln_memcpy > /dev/null
+s `afl~vuln_memcpy$[0]` > /dev/null
 pdd | jq -Rs 'contains("sym.imp.memcpy(buf, user_input, user_len);") and contains("sym.imp.printf(\"Copied: %s\\n\", buf);") and (contains("arg1")|not) and (contains("arg2")|not) and (contains("tmp:")|not) and (contains("*(rbp")|not)'
 EOF_CMDS
 BROKEN=1
@@ -534,7 +526,7 @@ EOF_EXPECT
 CMDS=<<EOF_CMDS
 a:sla > /dev/null
 aaa
-s dbg.vuln_memcpy > /dev/null
+s `afl~vuln_memcpy$[0]` > /dev/null
 pdd | jq -Rs 'contains("int64_t dbg.vuln_memcpy") and contains("sym.imp.memcpy(buf, user_input, user_len);") and contains("sym.imp.printf(\"Copied: %s\\n\", buf);") and (contains("r2dec fallback:")|not)'
 EOF_CMDS
 BROKEN=1
@@ -549,7 +541,7 @@ EOF_EXPECT
 CMDS=<<EOF_CMDS
 a:sla > /dev/null
 aaa
-s sym.my_strdup > /dev/null
+s `afl~my_strdup$[0]` > /dev/null
 pdd | jq -Rs 'contains("len = sym.imp.strlen(s);") and ((split("sym.imp.strlen(s)") | length) == 2) and ((contains("var_10h = sym.imp.malloc(len + 1);")) or contains("dup = sym.imp.malloc(len + 1);")) and ((contains("if (var_10h == 0)")) or contains("if (dup == 0)") or contains("if (!dup)")) and ((contains("sym.imp.memcpy(var_10h, s, len + 1);")) or contains("sym.imp.memcpy(dup, s, len + 1);")) and ((contains("return var_10h;")) or contains("return dup;")) and (contains("tmp:11f80")|not) and (contains("sym.imp.malloc(sym.imp")|not)'
 EOF_CMDS
 BROKEN=1
@@ -564,7 +556,7 @@ EOF_EXPECT
 CMDS=<<EOF_CMDS
 a:sla > /dev/null
 aaa
-s sym.my_strdup > /dev/null
+s `afl~my_strdup$[0]` > /dev/null
 pdd | jq -Rs '(contains("rax =")|not) and (contains("tmp:")|not) and (contains("t3")|not)'
 EOF_CMDS
 BROKEN=1
@@ -579,7 +571,7 @@ EOF_EXPECT
 CMDS=<<EOF_CMDS
 a:sla > /dev/null
 aaa
-s sym.main > /dev/null
+s `afl~main$[0]` > /dev/null
 pdd | jq -Rs 'contains("return 1;") and contains("switch (") and contains("check_secret") and contains("process_string") and contains("authenticate") and contains("alloc_and_copy") and (contains("r2dec fallback:")|not)'
 EOF_CMDS
 BROKEN=1
@@ -594,7 +586,7 @@ EOF_EXPECT
 CMDS=<<EOF_CMDS
 a:sla > /dev/null
 aaaa
-s sym.main > /dev/null
+s `afl~main$[0]` > /dev/null
 pdd | jq -Rs 'contains("return 1;") and contains("switch (") and contains("check_secret") and contains("process_string") and contains("authenticate") and contains("alloc_and_copy") and (contains("r2dec fallback:")|not)'
 EOF_CMDS
 BROKEN=1
@@ -625,10 +617,9 @@ EOF_EXPECT
 CMDS=<<EOF_CMDS
 a:sla > /dev/null
 aaa
-s sym.check_secret > /dev/null
+s `afl~check_secret$[0]` > /dev/null
 pdd | head -n1 | jq -Rs 'contains("int32_t")'
 EOF_CMDS
-BROKEN=1
 RUN
 
 NAME=dec_solve_equation_return_not_void
@@ -640,10 +631,9 @@ EOF_EXPECT
 CMDS=<<EOF_CMDS
 a:sla > /dev/null
 aaa
-s sym.solve_equation > /dev/null
+s `afl~solve_equation$[0]` > /dev/null
 pdd | head -n1 | jq -Rs '((contains("void ")|not) and (contains("int32_t") or contains("int64_t")))'
 EOF_CMDS
-BROKEN=1
 RUN
 
 NAME=deep_afvj_fast_mode_reduces_pointer_types
