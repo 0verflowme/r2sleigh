@@ -1004,6 +1004,7 @@ name = "r2types"
 version = "0.1.0"
 dependencies = [
  "r2il",
+ "r2source",
  "r2ssa",
  "r2sym",
  "serde",

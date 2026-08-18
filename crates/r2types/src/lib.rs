@@ -92,6 +92,7 @@ pub use prepare::{
     size_to_signed_int_type, size_to_type, size_to_unsigned_int_type, ssa_var_block_key,
     ssa_var_key, type_hint_from_value_metadata,
 };
+pub use r2source::DisplayNames;
 pub use r2ssa::AssumptionUsageReport;
 pub use role_registry::{
     normalize_role_name, semantic_typedef_is_authoritative, semantic_typedef_is_pointer,

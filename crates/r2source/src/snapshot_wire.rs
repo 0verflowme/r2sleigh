@@ -139,16 +139,19 @@ impl SnapshotWireWriter {
     /// Emit the finished buffer: header, string table, payload.
     pub fn finish(self) -> Result<Vec<u8>, SnapshotWireError> {
         let mut table = Vec::new();
-        let count = u32::try_from(self.strings.len()).map_err(|_| SnapshotWireError::ValueTooWide)?;
+        let count =
+            u32::try_from(self.strings.len()).map_err(|_| SnapshotWireError::ValueTooWide)?;
         for value in &self.strings {
             let len = u32::try_from(value.len()).map_err(|_| SnapshotWireError::ValueTooWide)?;
             table.extend_from_slice(&len.to_le_bytes());
             table.extend_from_slice(value.as_bytes());
         }
-        let table_bytes = u32::try_from(table.len()).map_err(|_| SnapshotWireError::ValueTooWide)?;
+        let table_bytes =
+            u32::try_from(table.len()).map_err(|_| SnapshotWireError::ValueTooWide)?;
         let payload_bytes =
             u32::try_from(self.payload.len()).map_err(|_| SnapshotWireError::ValueTooWide)?;
-        let mut out = Vec::with_capacity(SNAPSHOT_WIRE_HEADER_BYTES + table.len() + self.payload.len());
+        let mut out =
+            Vec::with_capacity(SNAPSHOT_WIRE_HEADER_BYTES + table.len() + self.payload.len());
         out.extend_from_slice(&SNAPSHOT_WIRE_MAGIC.to_le_bytes());
         out.extend_from_slice(&SNAPSHOT_WIRE_FORMAT_VERSION.to_le_bytes());
         out.extend_from_slice(&count.to_le_bytes());
@@ -223,8 +226,8 @@ impl<'a> SnapshotWireReader<'a> {
             if end > table.len() {
                 return Err(SnapshotWireError::SectionOutOfBounds);
             }
-            let text =
-                std::str::from_utf8(&table[at..end]).map_err(|_| SnapshotWireError::InvalidString(id))?;
+            let text = std::str::from_utf8(&table[at..end])
+                .map_err(|_| SnapshotWireError::InvalidString(id))?;
             if text.contains('\0') {
                 return Err(SnapshotWireError::InvalidString(id));
             }
@@ -319,7 +322,6 @@ impl<'a> SnapshotWireReader<'a> {
     }
 }
 
-
 // ---------------------------------------------------------------------------
 // Record layouts
 //
@@ -329,19 +331,18 @@ impl<'a> SnapshotWireReader<'a> {
 // ---------------------------------------------------------------------------
 
 use crate::contracts::{
-    CanonicalStorageId, CanonicalStorageSpace, SourceAbiParameterSpec, SourceCallArgumentSpec,
-    SourceAggregateLayout, SourceAggregateMember, SourceCallResult, SourceCarrierKind,
-    SourceCarrierProjection, SourceConventionSlots, SourceFunctionReturn, SourceLogicalValue,
-    SourceMachineRoles,
-    SourceReturnMechanism, SourceStackAllocationContract, SourceStackGrowth, SourceStackSlotRole,
-    SourceFunctionInterface, SourceStackSlotSpec, SourceType, SourceTypeGraph, SourceTypeKind,
-    StackAddressBase,
+    CanonicalStorageId, CanonicalStorageSpace, SourceAbiParameterSpec, SourceAggregateLayout,
+    SourceAggregateMember, SourceCallArgumentSpec, SourceCallResult, SourceCarrierKind,
+    SourceCarrierProjection, SourceConventionSlots, SourceFunctionInterface, SourceFunctionReturn,
+    SourceLogicalValue, SourceMachineRoles, SourceReturnMechanism, SourceStackAllocationContract,
+    SourceStackGrowth, SourceStackSlotRole, SourceStackSlotSpec, SourceType, SourceTypeGraph,
+    SourceTypeKind, StackAddressBase,
 };
 use crate::{
     AdvisoryCallPrototype, AdvisoryCallSite, AdvisorySuccessor, AdvisorySuccessorKind,
-    CapturedSourceFields, DiagnosticIdentity,
-    FunctionIdentity, FunctionPresentation, MachineProfile, OwnedFunctionBlock,
-    OwnedFunctionImage, OwnedFunctionSnapshot, SnapshotValidationError, SourceEndianness,
+    CapturedSourceFields, DiagnosticIdentity, FunctionIdentity, FunctionPresentation,
+    MachineProfile, OwnedFunctionBlock, OwnedFunctionImage, OwnedFunctionSnapshot,
+    SnapshotValidationError, SourceEndianness,
 };
 
 const ENDIAN_LITTLE: u8 = 0;
@@ -382,10 +383,7 @@ pub fn read_machine_profile(
     })
 }
 
-pub fn write_function_identity(
-    writer: &mut SnapshotWireWriter,
-    identity: &FunctionIdentity,
-) {
+pub fn write_function_identity(writer: &mut SnapshotWireWriter, identity: &FunctionIdentity) {
     writer.u64(identity.address());
 }
 
@@ -397,10 +395,7 @@ pub fn read_function_identity(
     })
 }
 
-pub fn write_diagnostic_identity(
-    writer: &mut SnapshotWireWriter,
-    identity: DiagnosticIdentity,
-) {
+pub fn write_diagnostic_identity(writer: &mut SnapshotWireWriter, identity: DiagnosticIdentity) {
     writer.u64(identity.value());
 }
 
@@ -409,7 +404,6 @@ pub fn read_diagnostic_identity(
 ) -> Result<DiagnosticIdentity, SnapshotWireError> {
     Ok(DiagnosticIdentity(reader.u64()?))
 }
-
 
 const SPACE_RAM: u8 = 0;
 const SPACE_REGISTER: u8 = 1;
@@ -538,7 +532,10 @@ pub fn write_captured_fields(writer: &mut SnapshotWireWriter, fields: CapturedSo
     set(CAPTURED_BOUNDED_IMAGE, fields.bounded_function_image);
     set(CAPTURED_INTERFACE, fields.function_interface);
     set(CAPTURED_EXACT_TYPES, fields.exact_function_types);
-    set(CAPTURED_EXACT_STACK_SLOT_ROLES, fields.exact_stack_slot_roles);
+    set(
+        CAPTURED_EXACT_STACK_SLOT_ROLES,
+        fields.exact_stack_slot_roles,
+    );
     set(CAPTURED_RETURN_ADDRESS, fields.return_address_storage);
     set(CAPTURED_STACK_POINTER, fields.stack_pointer_storage);
     set(CAPTURED_FRAME_POINTER, fields.frame_pointer_storage);
@@ -586,11 +583,12 @@ pub fn read_machine_roles(
         .map_err(|_| SnapshotWireError::ValueTooWide)
 }
 
-
-pub fn write_convention_slots(writer: &mut SnapshotWireWriter, slots: &SourceConventionSlots)
-    -> Result<(), SnapshotWireError> {
-    let count = u32::try_from(slots.argument_slots().len())
-        .map_err(|_| SnapshotWireError::ValueTooWide)?;
+pub fn write_convention_slots(
+    writer: &mut SnapshotWireWriter,
+    slots: &SourceConventionSlots,
+) -> Result<(), SnapshotWireError> {
+    let count =
+        u32::try_from(slots.argument_slots().len()).map_err(|_| SnapshotWireError::ValueTooWide)?;
     writer.string(slots.calling_convention())?;
     writer.u32(count);
     for storage in slots.argument_slots() {
@@ -672,8 +670,8 @@ pub fn write_block(
 ) -> Result<(), SnapshotWireError> {
     writer.u64(block.address());
     writer.bytes(block.bytes())?;
-    let count = u32::try_from(block.successors().len())
-        .map_err(|_| SnapshotWireError::ValueTooWide)?;
+    let count =
+        u32::try_from(block.successors().len()).map_err(|_| SnapshotWireError::ValueTooWide)?;
     writer.u32(count);
     for successor in block.successors() {
         write_successor(writer, successor);
@@ -716,7 +714,8 @@ pub fn write_image(
     image: &OwnedFunctionImage,
 ) -> Result<(), SnapshotWireError> {
     writer.u64(image.entry_address());
-    let blocks = u32::try_from(image.blocks().len()).map_err(|_| SnapshotWireError::ValueTooWide)?;
+    let blocks =
+        u32::try_from(image.blocks().len()).map_err(|_| SnapshotWireError::ValueTooWide)?;
     writer.u32(blocks);
     for block in image.blocks() {
         write_block(writer, block)?;
@@ -727,8 +726,8 @@ pub fn write_image(
     for exit in image.external_exits() {
         writer.u64(*exit);
     }
-    let total = u64::try_from(image.total_source_bytes())
-        .map_err(|_| SnapshotWireError::ValueTooWide)?;
+    let total =
+        u64::try_from(image.total_source_bytes()).map_err(|_| SnapshotWireError::ValueTooWide)?;
     writer.u64(total);
     Ok(())
 }
@@ -756,7 +755,6 @@ pub fn read_image(
         total_source_bytes,
     })
 }
-
 
 const RESULT_VOID: u8 = 0;
 const RESULT_REGISTER: u8 = 1;
@@ -790,8 +788,8 @@ pub fn write_call_prototype(
     prototype: &AdvisoryCallPrototype,
 ) -> Result<(), SnapshotWireError> {
     writer.string(&prototype.calling_convention)?;
-    let count = u32::try_from(prototype.arguments.len())
-        .map_err(|_| SnapshotWireError::ValueTooWide)?;
+    let count =
+        u32::try_from(prototype.arguments.len()).map_err(|_| SnapshotWireError::ValueTooWide)?;
     writer.u32(count);
     for argument in prototype.arguments.iter() {
         writer.u32(argument.index());
@@ -832,6 +830,7 @@ pub fn write_call_site(
 ) -> Result<(), SnapshotWireError> {
     writer.u64(site.instruction_address());
     writer.u64(site.target_address());
+    writer.string(site.target_name().unwrap_or(""))?;
     // Absence is meaningful here: radare2 described the call but not what it
     // takes or returns, which is not the same as an empty prototype.
     match site.prototype() {
@@ -849,6 +848,7 @@ pub fn read_call_site(
 ) -> Result<AdvisoryCallSite, SnapshotWireError> {
     let instruction_address = reader.u64()?;
     let target_address = reader.u64()?;
+    let target_name = reader.string()?;
     let prototype = if reader.bool()? {
         Some(read_call_prototype(reader)?)
     } else {
@@ -857,10 +857,10 @@ pub fn read_call_site(
     Ok(AdvisoryCallSite {
         instruction_address,
         target_address,
+        target_name: (!target_name.is_empty()).then(|| target_name.to_string()),
         prototype,
     })
 }
-
 
 const CARRIER_FULL: u8 = 0;
 const CARRIER_LOW_BITS: u8 = 1;
@@ -902,10 +902,7 @@ pub fn read_logical_value(
     Ok(SourceLogicalValue::new(type_id, carrier))
 }
 
-pub fn write_abi_parameter(
-    writer: &mut SnapshotWireWriter,
-    parameter: &SourceAbiParameterSpec,
-) {
+pub fn write_abi_parameter(writer: &mut SnapshotWireWriter, parameter: &SourceAbiParameterSpec) {
     writer.u32(parameter.index());
     write_storage(writer, parameter.storage());
 }
@@ -940,7 +937,6 @@ pub fn read_function_return(
     }
 }
 
-
 const TYPE_SIGNED: u8 = 0;
 const TYPE_UNSIGNED: u8 = 1;
 const TYPE_POINTER: u8 = 2;
@@ -964,9 +960,7 @@ pub fn write_type(writer: &mut SnapshotWireWriter, source_type: &SourceType) {
     writer.u64(source_type.align_bits());
 }
 
-pub fn read_type(
-    reader: &mut SnapshotWireReader<'_>,
-) -> Result<SourceType, SnapshotWireError> {
+pub fn read_type(reader: &mut SnapshotWireReader<'_>) -> Result<SourceType, SnapshotWireError> {
     let id = reader.u32()?;
     let kind = match reader.u8()? {
         TYPE_SIGNED => SourceTypeKind::SignedInteger,
@@ -1006,7 +1000,11 @@ pub fn read_aggregate_member(
     let size_bits = reader.u64()?;
     let name = reader.string()?.to_string();
     Ok(SourceAggregateMember::new(
-        member_id, type_id, offset_bits, size_bits, name,
+        member_id,
+        type_id,
+        offset_bits,
+        size_bits,
+        name,
     ))
 }
 
@@ -1109,17 +1107,12 @@ pub fn read_stack_allocation(
         _ => return Err(SnapshotWireError::ValueTooWide),
     };
     let implicit = reader.u32()?;
-    Ok(SourceStackAllocationContract::with_implicit_active_sp_bytes(
-        growth, implicit,
-    ))
+    Ok(SourceStackAllocationContract::with_implicit_active_sp_bytes(growth, implicit))
 }
 
 const MECHANISM_STACKED: u8 = 0;
 
-pub fn write_return_mechanism(
-    writer: &mut SnapshotWireWriter,
-    mechanism: &SourceReturnMechanism,
-) {
+pub fn write_return_mechanism(writer: &mut SnapshotWireWriter, mechanism: &SourceReturnMechanism) {
     match mechanism {
         SourceReturnMechanism::Stacked {
             stack_offset,
@@ -1210,7 +1203,6 @@ pub fn read_stack_slot(
     })
 }
 
-
 // Which base constructor the producer used. The choice is not derivable from
 // the field values alone: it decides whether the interface claims exact stack
 // slot roles and exact logical types, which is authority, not presentation.
@@ -1234,8 +1226,8 @@ pub fn write_interface(
     writer.bytes(interface.revision_identity())?;
     writer.string(interface.calling_convention())?;
 
-    let parameters = u32::try_from(interface.parameters().len())
-        .map_err(|_| SnapshotWireError::ValueTooWide)?;
+    let parameters =
+        u32::try_from(interface.parameters().len()).map_err(|_| SnapshotWireError::ValueTooWide)?;
     writer.u32(parameters);
     for parameter in interface.parameters() {
         write_abi_parameter(writer, parameter);
@@ -1427,7 +1419,6 @@ pub fn read_interface(
     Ok(interface)
 }
 
-
 /// Serialize one whole snapshot into a single buffer.
 ///
 /// This is the producer side of the transport: radare2 writes exactly this and
@@ -1571,7 +1562,10 @@ mod tests {
         writer.string("rbp").expect("string");
         let buffer = writer.finish().expect("finish");
         // two entries in the table, nine references in the payload
-        assert_eq!(u32::from_le_bytes([buffer[8], buffer[9], buffer[10], buffer[11]]), 2);
+        assert_eq!(
+            u32::from_le_bytes([buffer[8], buffer[9], buffer[10], buffer[11]]),
+            2
+        );
         let mut reader = SnapshotWireReader::new(&buffer).expect("header");
         for _ in 0..8 {
             assert_eq!(reader.string().expect("string"), "rsp");
@@ -1689,7 +1683,9 @@ mod tests {
 
     #[test]
     fn identities_round_trip() {
-        let function = FunctionIdentity { address: 0x1000_07c0 };
+        let function = FunctionIdentity {
+            address: 0x1000_07c0,
+        };
         let diagnostic = DiagnosticIdentity(0xfeed_face_dead_beef);
         let mut writer = SnapshotWireWriter::new();
         write_function_identity(&mut writer, &function);
@@ -1715,7 +1711,11 @@ mod tests {
             CanonicalStorageSpace::Unknown,
         ];
         for space in spaces {
-            let storage = CanonicalStorageId { space, offset: 0x38, size: 8 };
+            let storage = CanonicalStorageId {
+                space,
+                offset: 0x38,
+                size: 8,
+            };
             let mut writer = SnapshotWireWriter::new();
             write_storage(&mut writer, storage);
             write_optional_storage(&mut writer, None);
@@ -1948,6 +1948,7 @@ mod tests {
         let with_prototype = AdvisoryCallSite {
             instruction_address: 0x1000_0741,
             target_address: 0x1000_1980,
+            target_name: Some("sym.imp.strcmp".to_string()),
             prototype: Some(AdvisoryCallPrototype {
                 calling_convention: "amd64".to_string(),
                 arguments: vec![
@@ -1960,12 +1961,21 @@ mod tests {
                 result: SourceCallResult::Register { storage },
             }),
         };
+        // A site radare2 could not give a prototype for still has a target, and
+        // the target still has a name: the two travel independently.
         let without = AdvisoryCallSite {
             instruction_address: 0x1000_0757,
             target_address: 0x1000_1986,
+            target_name: Some("sym.imp.malloc".to_string()),
             prototype: None,
         };
-        for site in [with_prototype, without] {
+        let unnamed = AdvisoryCallSite {
+            instruction_address: 0x1000_0763,
+            target_address: 0x1000_1992,
+            target_name: None,
+            prototype: None,
+        };
+        for site in [with_prototype, without, unnamed] {
             let mut writer = SnapshotWireWriter::new();
             write_call_site(&mut writer, &site).expect("write");
             let buffer = writer.finish().expect("finish");
@@ -2121,7 +2131,10 @@ mod tests {
             write_return_mechanism(&mut writer, &mechanism);
             let buffer = writer.finish().expect("finish");
             let mut reader = SnapshotWireReader::new(&buffer).expect("header");
-            assert_eq!(read_stack_allocation(&mut reader).expect("contract"), contract);
+            assert_eq!(
+                read_stack_allocation(&mut reader).expect("contract"),
+                contract
+            );
             assert_eq!(
                 read_return_mechanism(&mut reader).expect("mechanism"),
                 mechanism
@@ -2203,8 +2216,14 @@ mod tests {
             4,
         )];
         let logical = vec![
-            SourceLogicalValue::new(1, SourceCarrierProjection::new(SourceCarrierKind::Full, 0, 64)),
-            SourceLogicalValue::new(1, SourceCarrierProjection::new(SourceCarrierKind::Full, 0, 64)),
+            SourceLogicalValue::new(
+                1,
+                SourceCarrierProjection::new(SourceCarrierKind::Full, 0, 64),
+            ),
+            SourceLogicalValue::new(
+                1,
+                SourceCarrierProjection::new(SourceCarrierKind::Full, 0, 64),
+            ),
         ];
         let interfaces = vec![
             SourceFunctionInterface::new(
@@ -2347,7 +2366,9 @@ mod tests {
                 bits: 64,
                 endianness: SourceEndianness::Little,
             },
-            FunctionIdentity { address: 0x1000_07c0 },
+            FunctionIdentity {
+                address: 0x1000_07c0,
+            },
             FunctionPresentation {
                 display_name: "safe_array_access".into(),
                 // presentation names must match the interface's parameter count,

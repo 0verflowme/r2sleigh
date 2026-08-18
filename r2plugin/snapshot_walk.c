@@ -334,6 +334,14 @@ static bool walk_call_site(R2SleighWireWriter *writer, const RAnalFunctionSnapsh
 	}
 	r2sleigh_wire_u64 (writer, view.instruction_addr);
 	r2sleigh_wire_u64 (writer, view.target_addr);
+	/* Written before the completeness branch: a site radare2 could not give a
+	 * prototype for still has a target, and the target still has a name. */
+	char target_name[WALK_NAME_MAX];
+	if (!r_anal_function_snapshot_call_site_target_name (snapshot, index, target_name,
+			sizeof (target_name))) {
+		return false;
+	}
+	r2sleigh_wire_string (writer, target_name);
 	/* An incomplete site described the call but not what it takes or returns,
 	 * which is a different fact from a call that takes nothing. */
 	if (!view.complete) {

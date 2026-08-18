@@ -8,6 +8,9 @@
 //! Stable hashes remain diagnostics; exact authority is the retained `Arc`
 //! identity of one capture event.
 
+pub mod display_names;
+pub use display_names::DisplayNames;
+
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
@@ -284,6 +287,11 @@ impl OwnedFunctionImage {
 pub struct AdvisoryCallSite {
     instruction_address: u64,
     target_address: u64,
+    /// What radare2 calls the target. Absent when it has no name for it.
+    ///
+    /// This spells the call in rendered output and nothing more: it is not
+    /// evidence about what the callee does, and no analysis reads it.
+    target_name: Option<String>,
     /// The prototype radare2 recovered for this site. Present only when radare2
     /// reported the site as complete; absent means it described the call but
     /// not what it takes or returns.
@@ -317,6 +325,11 @@ impl AdvisoryCallSite {
 
     pub const fn target_address(&self) -> u64 {
         self.target_address
+    }
+
+    /// What radare2 calls the target, when it has a name for it.
+    pub fn target_name(&self) -> Option<&str> {
+        self.target_name.as_deref()
     }
 }
 
@@ -790,7 +803,8 @@ mod tests {
             SourceMachineRoles::default(),
             SourceConventionSlots::new("", [], None).expect("empty convention slots"),
             captured_fields,
-            valid.diagnostic_identity())
+            valid.diagnostic_identity(),
+        )
         .expect("coherent interface capture");
         assert_eq!(captured.function_interface(), Some(&interface));
         assert_eq!(
@@ -835,7 +849,8 @@ mod tests {
                 SourceMachineRoles::default(),
                 SourceConventionSlots::new("", [], None).expect("empty convention slots"),
                 narrow_fields,
-                valid.diagnostic_identity()),
+                valid.diagnostic_identity()
+            ),
             Err(SnapshotValidationError::InvalidFunctionInterface)
         );
 
@@ -853,7 +868,8 @@ mod tests {
                 SourceMachineRoles::default(),
                 SourceConventionSlots::new("", [], None).expect("empty convention slots"),
                 missing_frame_pointer,
-                valid.diagnostic_identity()),
+                valid.diagnostic_identity()
+            ),
             Err(SnapshotValidationError::InvalidFunctionInterface)
         );
 
@@ -871,7 +887,8 @@ mod tests {
                 SourceMachineRoles::default(),
                 SourceConventionSlots::new("", [], None).expect("empty convention slots"),
                 missing_stack_allocation_contract,
-                valid.diagnostic_identity()),
+                valid.diagnostic_identity()
+            ),
             Err(SnapshotValidationError::InvalidFunctionInterface)
         );
 
@@ -914,7 +931,8 @@ mod tests {
                 SourceMachineRoles::default(),
                 SourceConventionSlots::new("", [], None).expect("empty convention slots"),
                 captured_fields,
-                valid.diagnostic_identity()),
+                valid.diagnostic_identity()
+            ),
             Err(SnapshotValidationError::InvalidFunctionInterface)
         );
         let mut fields_without_frame_pointer = captured_fields;
@@ -930,7 +948,8 @@ mod tests {
             SourceMachineRoles::default(),
             SourceConventionSlots::new("", [], None).expect("empty convention slots"),
             fields_without_frame_pointer,
-            valid.diagnostic_identity())
+            valid.diagnostic_identity(),
+        )
         .expect("absent frame bit means no explicit payload");
         assert_eq!(
             captured_without_frame_pointer
@@ -953,7 +972,8 @@ mod tests {
                 SourceMachineRoles::default(),
                 SourceConventionSlots::new("", [], None).expect("empty convention slots"),
                 missing_return_mechanism,
-                valid.diagnostic_identity()),
+                valid.diagnostic_identity()
+            ),
             Err(SnapshotValidationError::InvalidFunctionInterface)
         );
 
@@ -971,7 +991,8 @@ mod tests {
                 SourceMachineRoles::default(),
                 SourceConventionSlots::new("", [], None).expect("empty convention slots"),
                 mechanism_without_interface,
-                valid.diagnostic_identity()),
+                valid.diagnostic_identity()
+            ),
             Err(SnapshotValidationError::InvalidFunctionInterface)
         );
 
@@ -989,7 +1010,8 @@ mod tests {
                 SourceMachineRoles::default(),
                 SourceConventionSlots::new("", [], None).expect("empty convention slots"),
                 frame_pointer_without_interface,
-                valid.diagnostic_identity()),
+                valid.diagnostic_identity()
+            ),
             Err(SnapshotValidationError::InvalidFunctionInterface)
         );
 
@@ -1018,7 +1040,8 @@ mod tests {
                 SourceMachineRoles::default(),
                 SourceConventionSlots::new("", [], None).expect("empty convention slots"),
                 captured_fields,
-                valid.diagnostic_identity()),
+                valid.diagnostic_identity()
+            ),
             Err(SnapshotValidationError::InvalidFunctionInterface)
         );
     }

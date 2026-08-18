@@ -149,6 +149,13 @@ pub struct SsaArtifact {
     facts: PreparedFunctionFacts,
     machine_context: SourceMachineContext,
     aggregate_accesses: AggregateAccessProjectionFacts,
+    /// Spellings the source carried for the addresses this function calls.
+    ///
+    /// Retained rather than recomputed because the snapshot is the only thing
+    /// that ever saw them, and it is gone by the time anything renders. No
+    /// dataflow, ABI or typing decision reads this; it exists so the renderer
+    /// can print `sym.imp.strcmp` where it would otherwise print an address.
+    display_names: r2source::DisplayNames,
 }
 
 /// Public classification of an artifact's construction boundary.
@@ -301,6 +308,7 @@ impl SsaArtifact {
             facts,
             machine_context,
             aggregate_accesses,
+            display_names: r2source::DisplayNames::default(),
         })
     }
 
@@ -639,7 +647,13 @@ impl SsaArtifact {
             facts,
             machine_context: self.machine_context.clone(),
             aggregate_accesses,
+            display_names: self.display_names.clone(),
         }
+    }
+
+    /// Spellings the source carried for the addresses this function calls.
+    pub fn display_names(&self) -> &r2source::DisplayNames {
+        &self.display_names
     }
 
     pub fn objects(&self) -> &ObjectModel {
@@ -932,6 +946,14 @@ impl TrustedSsaArtifact {
         // coherence. Refusing here instead would suppress the whole function
         // for a fact the pipeline is built to carry.
         let call_site_interfaces = correlate_call_site_interfaces(&source, &blocks);
+        // Every call target the source named, whether or not a prototype was
+        // recovered for it: a name and a prototype are independent facts.
+        let mut display_names = r2source::DisplayNames::new();
+        for call in source.advisory_calls() {
+            if let Some(name) = call.target_name() {
+                display_names.insert_function(call.target_address(), name);
+            }
+        }
         // A source without a recovered prototype still describes its ABI in the
         // instructions: a register read before it is written carries a value the
         // caller supplied. Recover that rather than refusing the function, but
@@ -979,6 +1001,7 @@ impl TrustedSsaArtifact {
             control,
         )
         .map_err(SsaPrepareError::from)?;
+        artifact.display_names = display_names;
         if !artifact
             .facts
             .obligations

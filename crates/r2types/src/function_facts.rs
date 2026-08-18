@@ -1549,6 +1549,9 @@ pub struct FunctionFacts {
     decompile_route: Option<DecompileRouteFacts>,
     input_quality: Option<FunctionInputQualityFacts>,
     callee_resolution: CalleeResolutionFacts,
+    /// Spellings radare2 already holds for the addresses this function
+    /// touches. Rendering reads them; nothing that decides behaviour does.
+    display_names: crate::DisplayNames,
     callsites: FunctionCallsiteFacts,
     call_results: FunctionCallResultFacts,
     call_render: FunctionCallRenderFacts,
@@ -1681,16 +1684,15 @@ impl SourceOwnedFunctionFacts {
         let mut usage = source.facts().assumption_usage.clone();
         usage.extend(enriched.assumption_usage());
         enriched.assumption_usage = usage;
+        enriched.display_names.absorb(source.display_names());
         enriched.attach_prepared_decompile_evidence(source);
         if let Some(param_slots) = param_slots.as_ref() {
             enriched.populate_certified_parameter_exprs(source, param_slots);
         }
         enriched.normalize_field_certificates_from_external_layout();
         if let Some(param_slots) = param_slots.as_ref() {
-            enriched.populate_member_access_render_facts_from_field_certificates(
-                source,
-                param_slots,
-            );
+            enriched
+                .populate_member_access_render_facts_from_field_certificates(source, param_slots);
         }
         enriched.populate_certified_loop_carrier_types();
         if let Some(param_slots) = param_slots.as_ref() {
@@ -1783,6 +1785,7 @@ impl FunctionFacts {
             decompile_route: None,
             input_quality: None,
             callee_resolution: CalleeResolutionFacts::default(),
+            display_names: crate::DisplayNames::default(),
             callsites: FunctionCallsiteFacts::default(),
             call_results: FunctionCallResultFacts::default(),
             call_render: FunctionCallRenderFacts::default(),
@@ -1938,6 +1941,21 @@ impl FunctionFacts {
 
     pub fn render_facts(&self) -> &FunctionRenderFacts {
         &self.render
+    }
+
+    /// Spellings for the addresses this function touches.
+    ///
+    /// Rendering asks this what to print. Nothing that decides what a call
+    /// does, which route to take, or what type something has may consult it:
+    /// a name is presentation, and treating it as evidence is how a decompiler
+    /// starts inventing semantics from symbol strings.
+    pub fn display_names(&self) -> &crate::DisplayNames {
+        &self.display_names
+    }
+
+    /// Attach the spellings radare2 already holds.
+    pub fn set_display_names(&mut self, names: crate::DisplayNames) {
+        self.display_names = names;
     }
 
     pub fn control_facts(&self) -> &FunctionControlFacts {
@@ -3004,8 +3022,20 @@ fn prepared_callee_resolution_facts(
         .iter()
         .map(|(name, ty)| (crate::normalize_callee_name(name), ty.clone()))
         .collect::<HashMap<_, _>>();
-    let function_names = HashMap::new();
-    let symbols = HashMap::new();
+    // These were empty maps, so every direct call resolved to nothing and
+    // rendered as `sub_<addr>` even when radare2 had the name all along.
+    let function_names = function_facts
+        .display_names
+        .functions()
+        .iter()
+        .map(|(addr, name)| (*addr, name.clone()))
+        .collect::<HashMap<_, _>>();
+    let symbols = function_facts
+        .display_names
+        .symbols()
+        .iter()
+        .map(|(addr, name)| (*addr, name.clone()))
+        .collect::<HashMap<_, _>>();
     let ctx = CalleeIdentityContext {
         function_names: &function_names,
         symbols: &symbols,

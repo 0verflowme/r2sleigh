@@ -1362,10 +1362,8 @@ unsafe fn capture_interface(
     }
     .map_err(|_| RadareAbi138CaptureError::InvalidInterface)?;
 
-    interface = interface.with_preserved_call_carriers(
-        stack_pointer_preserved,
-        frame_pointer_preserved,
-    );
+    interface =
+        interface.with_preserved_call_carriers(stack_pointer_preserved, frame_pointer_preserved);
     if top.capabilities & RADARE_CAP_RETURN_ADDRESS_STORAGE != 0 {
         // SAFETY: callback writes an owned string of the advertised size.
         let name = unsafe {
@@ -1717,16 +1715,18 @@ unsafe fn capture_advisory_calls(
         }
         // Only a site radare2 reported as complete, whose carriers it named in
         // full, describes what the call takes and returns.
-        let prototype = (complete && arguments.len() == view.num_arguments).then(|| {
-            AdvisoryCallPrototype {
+        let prototype =
+            (complete && arguments.len() == view.num_arguments).then(|| AdvisoryCallPrototype {
                 calling_convention: calling_convention.clone(),
                 arguments: arguments.into_boxed_slice(),
                 variadic,
                 noreturn,
                 result,
-            }
-        });
+            });
         calls.push(AdvisoryCallSite {
+            // The legacy accessor transport predates the name and never
+            // carried one; the flat snapshot buffer is the path that does.
+            target_name: None,
             instruction_address: view.instruction_addr,
             target_address: view.target_addr,
             prototype,
@@ -1891,7 +1891,8 @@ pub unsafe fn capture_radare_abi138(
         function_interface,
         machine_roles,
         // The accessor transport never carried convention candidates.
-        SourceConventionSlots::new("", [], None).map_err(|_| RadareAbi138CaptureError::InvalidMachine)?,
+        SourceConventionSlots::new("", [], None)
+            .map_err(|_| RadareAbi138CaptureError::InvalidMachine)?,
         captured_fields,
         DiagnosticIdentity(first.revision_identity),
     )
