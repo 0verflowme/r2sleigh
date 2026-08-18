@@ -1586,10 +1586,6 @@ fn route_fallback_reason(route: &DecompileRouteFacts) -> Option<&str> {
     })
 }
 
-fn route_is_standard(route: &DecompileRouteFacts) -> bool {
-    route.kind == DecompileRouteKind::Standard
-}
-
 fn route_is_summary_boundary(route: &DecompileRouteFacts) -> bool {
     matches!(
         route.kind,

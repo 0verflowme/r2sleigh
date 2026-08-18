@@ -8081,11 +8081,15 @@ fn is_r2dec_path(cx: &LateContext<'_>, expr: &Expr<'_>) -> bool {
 /// Whether this expression reads the display-name carrier.
 fn reads_display_names(expr: &Expr<'_>) -> bool {
     match expr.kind {
-        ExprKind::MethodCall(method, _, _, _) => {
-            matches!(
-                method.ident.as_str(),
-                "display_names" | "name_for" | "parameter" | "parameters"
-            )
+        // Reaching the carrier at all is the thing being reported.
+        ExprKind::MethodCall(method, _, _, _) if method.ident.as_str() == "display_names" => true,
+        // Its accessors are only interesting when they are being applied to it.
+        // `parameters` in particular is an ordinary name -- a typed function
+        // interface has one too -- and matching it wherever it appeared
+        // reported the interface accessor as if it were a display spelling.
+        ExprKind::MethodCall(method, receiver, _, _) => {
+            matches!(method.ident.as_str(), "name_for" | "parameter" | "parameters")
+                && reads_display_names(receiver)
         }
         ExprKind::Field(_, field) => field.as_str() == "display_names",
         _ => false,
