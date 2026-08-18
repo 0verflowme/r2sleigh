@@ -2170,6 +2170,8 @@ struct DecompilerContext {
     pub symbols: std::collections::HashMap<u64, String>,
     /// Canonical combined type and semantic facts.
     function_facts: FunctionFacts,
+    /// Whether the certification kernel closed an exact obligation here.
+    kernel_certified: bool,
 }
 
 impl DecompilerContext {
@@ -2192,6 +2194,7 @@ impl DecompilerContext {
             #[cfg(test)]
             symbols: std::collections::HashMap::new(),
             function_facts: function_facts.report().clone(),
+            kernel_certified: false,
         }
     }
 
@@ -2213,11 +2216,28 @@ impl DecompilerContext {
 #[derive(Debug, Clone)]
 pub struct DecompilerInput {
     source_owned_facts: r2types::function_facts::SourceOwnedFunctionFacts,
+    kernel_certified: bool,
 }
 
 impl DecompilerInput {
     pub fn new(source_owned_facts: r2types::function_facts::SourceOwnedFunctionFacts) -> Self {
-        Self { source_owned_facts }
+        Self {
+            source_owned_facts,
+            kernel_certified: false,
+        }
+    }
+
+    /// Record that the certification kernel closed an exact obligation for this
+    /// function. The claim belongs to the kernel; this only carries it to the
+    /// rendering so the proof line can state what was established rather than
+    /// inferring it from which route ran.
+    pub fn with_kernel_certification(mut self, certified: bool) -> Self {
+        self.kernel_certified = certified;
+        self
+    }
+
+    pub const fn kernel_certified(&self) -> bool {
+        self.kernel_certified
     }
 
     pub fn source_owned_facts(&self) -> &r2types::function_facts::SourceOwnedFunctionFacts {
@@ -2233,7 +2253,9 @@ impl DecompilerInput {
     }
 
     fn context_projection(&self) -> DecompilerContext {
-        DecompilerContext::from_source_owned(&self.source_owned_facts)
+        let mut context = DecompilerContext::from_source_owned(&self.source_owned_facts);
+        context.kernel_certified = self.kernel_certified;
+        context
     }
 }
 
@@ -3152,7 +3174,7 @@ impl Decompiler {
         prune_unreferenced_local_declarations(&mut c_function);
         normalize_redundant_return_carrier_casts(&mut c_function);
         normalize_declared_assignment_literals(&mut c_function);
-        note_unproven_constructs(&mut c_function, !route_is_standard(semantic_route));
+        note_unproven_constructs(&mut c_function, self.context.kernel_certified);
         work.with_phase(DecompileWorkPhase::Rendering).poll()?;
         Ok(c_function)
     }

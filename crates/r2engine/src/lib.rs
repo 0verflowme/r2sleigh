@@ -5643,17 +5643,32 @@ fn render_engine_decompile_request<C: r2ssa::SsaWorkControl>(
     control: &C,
     try_semantic_kernel: bool,
 ) -> Result<EngineRenderedDecompile, EngineRenderExecutionStop> {
-    let semantic_kernel_warnings = if try_semantic_kernel {
+    // The kernel decides whether an exact obligation closes. It does not decide
+    // what the reader sees. Its own C is written to be checkable against the
+    // SSA -- widths made explicit, every value bound, arithmetic spelled through
+    // helper functions -- and returning it as the answer replaced a readable
+    // rendering of the same function with a transcription of the proof. A
+    // function as simple as `if (x == 0xDEAD) return 1; return 0;` came back as
+    // a single nested ternary over `r2s_wrap_sub`.
+    //
+    // So the certification is kept and the rendering is not. The standard
+    // renderer produces the output either way, and the closed obligation is
+    // carried alongside it: it is a claim about the function, and the function
+    // is still spelled the way a person reads it.
+    let (kernel_certification, semantic_kernel_warnings) = if try_semantic_kernel {
         let (rendered, warnings) = resolve_engine_semantic_kernel_attempt(
             render_semantic_kernel_function(request, control)?,
         )?;
-        if let Some(rendered) = rendered {
-            return Ok(rendered);
+        match rendered {
+            Some(rendered) => (
+                rendered.semantic_kernel_render,
+                rendered.semantic_kernel_warnings,
+            ),
+            None => (None, warnings),
         }
-        warnings
     } else {
         poll_engine_render_control(control, EnginePhase::Rendering)?;
-        Vec::new()
+        (None, Vec::new())
     };
     poll_engine_render_control(control, EnginePhase::Rendering)?;
     if let Some(output) = render_semantic_route(
@@ -5664,20 +5679,21 @@ fn render_engine_decompile_request<C: r2ssa::SsaWorkControl>(
         poll_engine_render_control(control, EnginePhase::Rendering)?;
         return Ok(EngineRenderedDecompile {
             output,
-            semantic_kernel_render: None,
+            semantic_kernel_render: kernel_certification,
             semantic_kernel_warnings,
             structuring_executed: false,
         });
     }
 
-    let input = decompiler_input_for_engine_request(request);
+    let input = decompiler_input_for_engine_request(request)
+        .with_kernel_certification(kernel_certification.is_some());
     let output = r2dec::Decompiler::new(request.render_target.to_decompiler_config())
         .decompile_input_with_control(&input, control)
         .map_err(engine_render_stop_from_decompiler)?;
     if !output.trim().is_empty() {
         return Ok(EngineRenderedDecompile {
             output,
-            semantic_kernel_render: None,
+            semantic_kernel_render: kernel_certification,
             semantic_kernel_warnings,
             structuring_executed: true,
         });
@@ -5689,7 +5705,7 @@ fn render_engine_decompile_request<C: r2ssa::SsaWorkControl>(
             request.function_facts(),
         )
         .unwrap_or_default(),
-        semantic_kernel_render: None,
+        semantic_kernel_render: kernel_certification,
         semantic_kernel_warnings,
         structuring_executed: false,
     })
