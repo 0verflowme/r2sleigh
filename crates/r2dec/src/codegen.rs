@@ -11,6 +11,23 @@ use crate::ast::{BinaryOp, CExpr, CFunction, CLocal, CStmt, CType, UnaryOp};
 /// This handles cases like stack offsets: 0xffffffffffffffb8 represents -72.
 const LIKELY_NEGATIVE_THRESHOLD: u64 = 0xffffffffffff0000;
 
+/// Above this, an integer literal reads better in hexadecimal.
+///
+/// Small numbers are counts, indices and sizes, and a reader wants those in
+/// decimal. Anything larger is almost always a mask, a flag word, an address
+/// or a magic value that was written in hex in the source and is only
+/// recognisable that way: `0xdead` says what `57005` hides.
+const HEX_LITERAL_THRESHOLD: u64 = 0x100;
+
+/// How a non-negative integer literal is spelled.
+pub(crate) fn format_unsigned_literal(value: u64) -> String {
+    if value >= HEX_LITERAL_THRESHOLD {
+        format!("0x{value:x}")
+    } else {
+        value.to_string()
+    }
+}
+
 /// Code generator configuration.
 #[derive(Debug, Clone)]
 pub struct CodeGenConfig {
@@ -381,13 +398,11 @@ impl CodeGenerator {
 
         match expr {
             CExpr::IntLit(val) => {
-                if *val < 0 {
-                    self.output.push_str(&format!("{}", val));
-                } else if *val > 0xffff {
-                    self.output.push_str(&format!("0x{:x}", val));
-                } else {
-                    self.output.push_str(&format!("{}", val));
-                }
+                let rendered = match u64::try_from(*val) {
+                    Ok(magnitude) => format_unsigned_literal(magnitude),
+                    Err(_) => val.to_string(),
+                };
+                self.output.push_str(&rendered);
             }
             CExpr::UIntLit(val) => {
                 // Check if this looks like a negative offset (high bit set, close to max)
@@ -395,10 +410,9 @@ impl CodeGenerator {
                     // Convert to negative: two's complement
                     let neg = (!*val).wrapping_add(1);
                     self.output.push_str(&format!("-0x{:x}", neg));
-                } else if *val > 0xffff {
-                    self.output.push_str(&format!("0x{:x}U", val));
                 } else {
-                    self.output.push_str(&format!("{}U", val));
+                    self.output
+                        .push_str(&format!("{}U", format_unsigned_literal(*val)));
                 }
             }
             CExpr::FloatLit(val) => {
@@ -586,10 +600,11 @@ impl CodeGenerator {
     }
 
     fn emit_positive_literal_magnitude(&mut self, literal: PositiveLiteralMagnitude) {
-        if literal.prefer_hex || literal.value > 0xffff {
+        if literal.prefer_hex {
             self.output.push_str(&format!("0x{:x}", literal.value));
         } else {
-            self.output.push_str(&literal.value.to_string());
+            self.output
+                .push_str(&format_unsigned_literal(literal.value));
         }
     }
 }
@@ -1154,7 +1169,7 @@ mod tests {
                 CExpr::var("a"),
                 CExpr::var("b"),
             )))],
-        params_known: true,
+            params_known: true,
         };
 
         let code = generate(&func);
@@ -1330,7 +1345,7 @@ mod tests {
                 },
             ],
             body: vec![CStmt::Return(None)],
-        params_known: true,
+            params_known: true,
         };
 
         let code = generate(&func);

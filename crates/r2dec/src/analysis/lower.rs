@@ -127,10 +127,7 @@ impl<'a> LowerCtx<'a> {
     pub(crate) fn var_name(&self, var: &SSAVar) -> String {
         if var.is_const() {
             let val = parse_const_value(&var.name).unwrap_or(0);
-            if val > 0xffff {
-                return format!("0x{:x}", val);
-            }
-            return format!("{}", val);
+            return crate::codegen::format_unsigned_literal(val);
         }
 
         let display = var.display_name();
