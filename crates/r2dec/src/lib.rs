@@ -3125,6 +3125,7 @@ impl Decompiler {
             }
             post_rename::rewrite_function_identifiers(&mut c_function, &known_function_names);
         }
+        propagate_single_use_register_carriers(&mut c_function, &fold_ctx);
         rewrite_stack_synonym_uses_to_declared_locals(&mut c_function, &fold_ctx);
         prune_dead_temp_assignments_in_function_body(&mut c_function, &fold_ctx);
         prune_unused_pure_locals(&mut c_function);
@@ -3386,6 +3387,338 @@ fn collect_visible_stack_offsets(
             parse_visible_stack_offset(name, visible_bindings, stack_slots, param_names)
         })
         .collect()
+}
+
+/// Replace a single-use SSA register carrier with the value it copied.
+///
+/// The lifter names every version of a machine register, so bookkeeping the
+/// source did for itself arrives as `x8_8 = arg_28; return x8_8;`. `x8_8` is
+/// not a variable the program has - it is the eighth version of a register -
+/// and declaring one asserts a local that never existed. Where such a carrier
+/// is assigned once from a pure expression and read once afterwards, the read
+/// becomes that expression and the assignment falls to the dead-assignment
+/// prune that already runs.
+///
+/// Propagation is refused when anything between the assignment and the read
+/// writes what the expression reads, because moving a computation past a write
+/// to its own inputs changes what it computes.
+fn propagate_single_use_register_carriers(func: &mut CFunction, fold_ctx: &FoldingContext<'_>) {
+    fn visit_block(stmts: &mut Vec<CStmt>, fold_ctx: &FoldingContext<'_>) {
+        for stmt in stmts.iter_mut() {
+            visit_nested(stmt, fold_ctx);
+        }
+        let mut index = 0;
+        while index < stmts.len() {
+            let Some((name, value)) = carrier_assignment(&stmts[index], fold_ctx) else {
+                index += 1;
+                continue;
+            };
+            let rest = &stmts[index + 1..];
+            if count_var_reads_in_stmts(rest, &name) != 1 {
+                index += 1;
+                continue;
+            }
+            let Some(offset) = rest
+                .iter()
+                .position(|stmt| count_var_reads_in_stmts(std::slice::from_ref(stmt), &name) == 1)
+            else {
+                index += 1;
+                continue;
+            };
+            let reads = expr_var_names(&value);
+            let blocked = rest[..offset].iter().any(|between| {
+                let (_, def) = fold_ctx.stmt_reads_and_def_for_render(between);
+                def.is_some_and(|def| reads.iter().any(|read| read.eq_ignore_ascii_case(&def)))
+            });
+            if blocked {
+                index += 1;
+                continue;
+            }
+            let target = index + 1 + offset;
+            substitute_var_in_stmt(&mut stmts[target], &name, &value);
+            stmts.remove(index);
+        }
+    }
+
+    fn visit_nested(stmt: &mut CStmt, fold_ctx: &FoldingContext<'_>) {
+        match stmt {
+            CStmt::Block(stmts) => visit_block(stmts, fold_ctx),
+            CStmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                visit_nested(then_body, fold_ctx);
+                if let Some(else_body) = else_body {
+                    visit_nested(else_body, fold_ctx);
+                }
+            }
+            CStmt::While { body, .. } | CStmt::DoWhile { body, .. } => visit_nested(body, fold_ctx),
+            CStmt::For { init, body, .. } => {
+                if let Some(init) = init {
+                    visit_nested(init, fold_ctx);
+                }
+                visit_nested(body, fold_ctx);
+            }
+            CStmt::Switch { cases, default, .. } => {
+                for case in cases {
+                    visit_block(&mut case.body, fold_ctx);
+                }
+                if let Some(default) = default {
+                    visit_block(default, fold_ctx);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    visit_block(&mut func.body, fold_ctx);
+}
+
+/// The carrier assigned by this statement, when it is one worth propagating.
+fn carrier_assignment(stmt: &CStmt, fold_ctx: &FoldingContext<'_>) -> Option<(String, CExpr)> {
+    if !fold_ctx.stmt_is_side_effect_free_versioned_register_carrier_for_render(stmt) {
+        return None;
+    }
+    let CStmt::Expr(CExpr::Binary {
+        op: BinaryOp::Assign,
+        left,
+        right,
+    }) = stmt
+    else {
+        return None;
+    };
+    let CExpr::Var(name) = left.as_ref() else {
+        return None;
+    };
+    Some((name.clone(), right.as_ref().clone()))
+}
+
+/// Every variable an expression reads.
+fn expr_var_names(expr: &CExpr) -> Vec<String> {
+    let mut names = Vec::new();
+    expr.visit(&mut |node| {
+        if let CExpr::Var(name) = node {
+            names.push(name.clone());
+        }
+    });
+    names
+}
+
+/// How many times `name` is read across these statements.
+fn count_var_reads_in_stmts(stmts: &[CStmt], name: &str) -> usize {
+    let mut reads = 0;
+    for stmt in stmts {
+        count_var_reads_in_stmt(stmt, name, &mut reads);
+    }
+    reads
+}
+
+fn count_var_reads_in_stmt(stmt: &CStmt, name: &str, reads: &mut usize) {
+    let mut count_expr = |expr: &CExpr, reads: &mut usize| {
+        expr.visit(&mut |node| {
+            if matches!(node, CExpr::Var(found) if found.eq_ignore_ascii_case(name)) {
+                *reads += 1;
+            }
+        });
+    };
+    match stmt {
+        CStmt::Empty
+        | CStmt::Break
+        | CStmt::Continue
+        | CStmt::Goto(_)
+        | CStmt::Label(_)
+        | CStmt::Comment(_) => {}
+        CStmt::Expr(expr) => count_expr(expr, reads),
+        CStmt::Decl { init, .. } => {
+            if let Some(init) = init {
+                count_expr(init, reads);
+            }
+        }
+        CStmt::Return(expr) => {
+            if let Some(expr) = expr {
+                count_expr(expr, reads);
+            }
+        }
+        CStmt::Block(stmts) => {
+            for stmt in stmts {
+                count_var_reads_in_stmt(stmt, name, reads);
+            }
+        }
+        CStmt::If {
+            cond,
+            then_body,
+            else_body,
+        } => {
+            count_expr(cond, reads);
+            count_var_reads_in_stmt(then_body, name, reads);
+            if let Some(else_body) = else_body {
+                count_var_reads_in_stmt(else_body, name, reads);
+            }
+        }
+        CStmt::While { cond, body } | CStmt::DoWhile { body, cond } => {
+            count_expr(cond, reads);
+            count_var_reads_in_stmt(body, name, reads);
+        }
+        CStmt::For {
+            init,
+            cond,
+            update,
+            body,
+        } => {
+            if let Some(init) = init {
+                count_var_reads_in_stmt(init, name, reads);
+            }
+            if let Some(cond) = cond {
+                count_expr(cond, reads);
+            }
+            if let Some(update) = update {
+                count_expr(update, reads);
+            }
+            count_var_reads_in_stmt(body, name, reads);
+        }
+        CStmt::Switch {
+            expr,
+            cases,
+            default,
+        } => {
+            count_expr(expr, reads);
+            for case in cases {
+                for stmt in &case.body {
+                    count_var_reads_in_stmt(stmt, name, reads);
+                }
+            }
+            if let Some(default) = default {
+                for stmt in default {
+                    count_var_reads_in_stmt(stmt, name, reads);
+                }
+            }
+        }
+    }
+}
+
+/// Put `value` wherever `name` is read in this statement.
+fn substitute_var_in_stmt(stmt: &mut CStmt, name: &str, value: &CExpr) {
+    match stmt {
+        CStmt::Empty
+        | CStmt::Break
+        | CStmt::Continue
+        | CStmt::Goto(_)
+        | CStmt::Label(_)
+        | CStmt::Comment(_) => {}
+        CStmt::Expr(expr) => substitute_var_in_expr(expr, name, value),
+        CStmt::Decl { init, .. } => {
+            if let Some(init) = init {
+                substitute_var_in_expr(init, name, value);
+            }
+        }
+        CStmt::Return(expr) => {
+            if let Some(expr) = expr {
+                substitute_var_in_expr(expr, name, value);
+            }
+        }
+        CStmt::Block(stmts) => {
+            for stmt in stmts {
+                substitute_var_in_stmt(stmt, name, value);
+            }
+        }
+        CStmt::If {
+            cond,
+            then_body,
+            else_body,
+        } => {
+            substitute_var_in_expr(cond, name, value);
+            substitute_var_in_stmt(then_body, name, value);
+            if let Some(else_body) = else_body {
+                substitute_var_in_stmt(else_body, name, value);
+            }
+        }
+        CStmt::While { cond, body } | CStmt::DoWhile { body, cond } => {
+            substitute_var_in_expr(cond, name, value);
+            substitute_var_in_stmt(body, name, value);
+        }
+        CStmt::For {
+            init,
+            cond,
+            update,
+            body,
+        } => {
+            if let Some(init) = init {
+                substitute_var_in_stmt(init, name, value);
+            }
+            if let Some(cond) = cond {
+                substitute_var_in_expr(cond, name, value);
+            }
+            if let Some(update) = update {
+                substitute_var_in_expr(update, name, value);
+            }
+            substitute_var_in_stmt(body, name, value);
+        }
+        CStmt::Switch {
+            expr,
+            cases,
+            default,
+        } => {
+            substitute_var_in_expr(expr, name, value);
+            for case in cases {
+                for stmt in &mut case.body {
+                    substitute_var_in_stmt(stmt, name, value);
+                }
+            }
+            if let Some(default) = default {
+                for stmt in default {
+                    substitute_var_in_stmt(stmt, name, value);
+                }
+            }
+        }
+    }
+}
+
+fn substitute_var_in_expr(expr: &mut CExpr, name: &str, value: &CExpr) {
+    if matches!(expr, CExpr::Var(found) if found.eq_ignore_ascii_case(name)) {
+        *expr = value.clone();
+        return;
+    }
+    match expr {
+        CExpr::Unary { operand, .. }
+        | CExpr::Cast { expr: operand, .. }
+        | CExpr::Sizeof(operand)
+        | CExpr::AddrOf(operand)
+        | CExpr::Deref(operand)
+        | CExpr::Paren(operand) => substitute_var_in_expr(operand, name, value),
+        CExpr::Binary { left, right, .. } => {
+            substitute_var_in_expr(left, name, value);
+            substitute_var_in_expr(right, name, value);
+        }
+        CExpr::Ternary {
+            cond,
+            then_expr,
+            else_expr,
+        } => {
+            substitute_var_in_expr(cond, name, value);
+            substitute_var_in_expr(then_expr, name, value);
+            substitute_var_in_expr(else_expr, name, value);
+        }
+        CExpr::Call { func, args } => {
+            substitute_var_in_expr(func, name, value);
+            for arg in args {
+                substitute_var_in_expr(arg, name, value);
+            }
+        }
+        CExpr::Subscript { base, index } => {
+            substitute_var_in_expr(base, name, value);
+            substitute_var_in_expr(index, name, value);
+        }
+        CExpr::Member { base, .. } | CExpr::PtrMember { base, .. } => {
+            substitute_var_in_expr(base, name, value)
+        }
+        CExpr::Comma(items) => {
+            for item in items {
+                substitute_var_in_expr(item, name, value);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn rewrite_stmt_var_aliases(

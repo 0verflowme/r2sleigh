@@ -472,6 +472,24 @@ impl<'a> FoldingContext<'a> {
         });
     }
 
+    /// What a rendered statement reads and what it defines, for the render
+    /// cleanups that run after structuring.
+    pub(crate) fn stmt_reads_and_def_for_render(
+        &self,
+        stmt: &CStmt,
+    ) -> (HashSet<String>, Option<String>) {
+        self.stmt_reads_and_def(stmt)
+    }
+
+    /// Whether a rendered statement copies a value into a versioned machine
+    /// register carrier and does nothing else.
+    pub(crate) fn stmt_is_side_effect_free_versioned_register_carrier_for_render(
+        &self,
+        stmt: &CStmt,
+    ) -> bool {
+        self.stmt_is_side_effect_free_versioned_register_carrier(stmt)
+    }
+
     fn stmt_reads_and_def(&self, stmt: &CStmt) -> (HashSet<String>, Option<String>) {
         let mut reads = HashSet::new();
         let mut def = None;
