@@ -29,7 +29,7 @@ use crate::certified_region::{
     CertifiedSingleBlockAccounting, CertifiedTypedOutputSeal, RegionBuildError,
     RegionObligationMapping, TypedOutputSealError,
 };
-use crate::semantic_c::{
+use crate::semantic_c::{SemanticCDirectCall, 
     SemanticCError, SemanticCHelperSet, SemanticCInputOrigin,
     insert_semantic_c_helpers, logical_return_type, render_logical_parameter_declarations,
     render_logical_return_statement, render_parameter_graph_binding_prologue, storage_type,
@@ -526,6 +526,10 @@ impl CertifiedGuardedReturnFunction {
         if self.has_memory_statements() {
             output.push_str(PLAIN_RAM_HELPER_DECLARATIONS);
         }
+        render_call_declarations(
+            &mut output,
+            &[self.header.body(), &self.arm, &self.join],
+        )?;
         let helper_insertion = output.len();
         write!(
             &mut output,
@@ -752,6 +756,72 @@ fn require_use_defined(
 
 /// Render one block's exact source steps, threading the set of C names already
 /// in scope so every use is proved defined before it is emitted.
+/// Stable name for the external adapter standing in for one callee.
+///
+/// The adapter is per call site, not per target: two calls to the same address
+/// still describe their own arguments, and nothing here models the callee.
+fn call_adapter_name(call: &crate::semantic_c::SemanticCDirectCall) -> String {
+    let identity = call.raw_identity();
+    format!(
+        "r2s_call_{:016x}_at_{:016x}_{}",
+        call.target(),
+        identity.block_addr(),
+        identity.op_index()
+    )
+}
+
+/// Render one call argument by the value that carries it.
+fn render_guard_call_argument(
+    argument: &crate::semantic_c::SemanticCCallArgument,
+) -> Result<String, GuardedReturnFunctionError> {
+    Ok(match argument.value() {
+        crate::semantic_c::SemanticCCallArgumentValue::Expression(_) => {
+            value_name(argument.binding())
+        }
+        crate::semantic_c::SemanticCCallArgumentValue::Constant(value) => format!(
+            "(({})UINT64_C(0x{:x}))",
+            storage_type(argument.ty())?,
+            value.bits()
+        ),
+        crate::semantic_c::SemanticCCallArgumentValue::AbiParameter { input, .. } => {
+            value_name(*input)
+        }
+    })
+}
+
+/// Declare every callee a region reaches, so the rendered C names what it calls
+/// without claiming to know the callee's body.
+fn render_call_declarations(
+    output: &mut String,
+    layers: &[&SemanticCBlockStepLayer],
+) -> Result<(), GuardedReturnFunctionError> {
+    let mut seen = BTreeSet::new();
+    for layer in layers {
+        for call in layer.accounting().semantic_calls() {
+            let name = call_adapter_name(call);
+            if !seen.insert(name.clone()) {
+                continue;
+            }
+            let result_type = match call.result() {
+                Some((_, ty)) => storage_type(ty)?,
+                None => "void",
+            };
+            write!(output, "extern {result_type} {name}(").expect("String writes cannot fail");
+            for (position, argument) in call.arguments().iter().enumerate() {
+                if position > 0 {
+                    output.push_str(", ");
+                }
+                output.push_str(storage_type(argument.ty())?);
+            }
+            output.push_str(");\n");
+        }
+    }
+    if !seen.is_empty() {
+        output.push('\n');
+    }
+    Ok(())
+}
+
 fn render_block_steps(
     output: &mut String,
     layer: &SemanticCBlockStepLayer,
@@ -762,6 +832,15 @@ fn render_block_steps(
 ) -> Result<(), GuardedReturnFunctionError> {
     let expressions = layer.accounting().expression_layer();
     let mut materialized = expressions.materialized_expression_roots(defined)?;
+    // Every call the block accounts for must be emitted. A call the region
+    // admitted but could not render would leave C that silently drops the
+    // effect, which is worse than refusing the function.
+    let mut pending_calls = layer
+        .accounting()
+        .semantic_calls()
+        .iter()
+        .map(SemanticCDirectCall::producer)
+        .collect::<BTreeSet<_>>();
     for step in layer.steps() {
         if let Some(reference) = step.memory() {
             let statement = layer
@@ -799,6 +878,41 @@ fn render_block_steps(
             }
             continue;
         }
+        if let Some(call) = layer
+            .accounting()
+            .semantic_calls()
+            .iter()
+            .find(|call| call.producer() == step.source())
+        {
+            let mut rendered = String::new();
+            write!(&mut rendered, "{}(", call_adapter_name(call))
+                .expect("String writes cannot fail");
+            for (position, argument) in call.arguments().iter().enumerate() {
+                if position > 0 {
+                    rendered.push_str(", ");
+                }
+                rendered.push_str(&render_guard_call_argument(argument)?);
+            }
+            rendered.push(')');
+            pending_calls.remove(&call.producer());
+            match call.result() {
+                Some((binding, ty)) => {
+                    writeln!(
+                        output,
+                        "{indent}{} {} = {rendered};",
+                        storage_type(ty)?,
+                        value_name(*binding)
+                    )
+                    .expect("String writes cannot fail");
+                    defined.insert(*binding);
+                }
+                None => {
+                    writeln!(output, "{indent}{rendered};")
+                        .expect("String writes cannot fail");
+                }
+            }
+            continue;
+        }
         let Some(reference) = step.value() else {
             continue;
         };
@@ -820,6 +934,9 @@ fn render_block_steps(
         .expect("String writes cannot fail");
         defined.insert(entity.output());
         materialized.insert(entity.root(), entity.output());
+    }
+    if let Some(producer) = pending_calls.into_iter().next() {
+        return Err(GuardedReturnFunctionError::UnsupportedMemory(producer));
     }
     Ok(())
 }

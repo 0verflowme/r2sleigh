@@ -3789,6 +3789,13 @@ pub fn certify_conditional_terminal_return_region(
                 | SemanticObligationKind::ControlTransfer
                 | SemanticObligationKind::Return
                 | SemanticObligationKind::ReturnValue
+                // A call is an ordered effect like any other. Excluding it made
+                // every region holding one unrenderable, which is why a function
+                // whose only complexity was calling strcmp stayed residual. The
+                // region renders each call at its own step, so the effect is
+                // emitted in source order rather than dropped.
+                | SemanticObligationKind::Call
+                | SemanticObligationKind::CallArgument
         )
     }) {
         return Err(LedgerClosureError::InvalidRegionTopology);
