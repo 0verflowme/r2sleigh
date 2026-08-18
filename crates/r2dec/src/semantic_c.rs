@@ -1265,6 +1265,9 @@ trait CertifiedSemanticSource {
         &self,
         binding: MachineValueBinding,
     ) -> Option<CanonicalInstructionId>;
+    /// Merges this source certified. Threading these per-caller left paths that
+    /// silently lost them, so the source answers for its own.
+    fn certified_join_phis(&self) -> Option<&BTreeMap<CanonicalInstructionId, CertifiedTwoWayJoinPhi>>;
 }
 
 impl CertifiedSemanticSource for CertifiedMachineFunction {
@@ -1336,6 +1339,12 @@ impl CertifiedSemanticSource for CertifiedMachineFunction {
                 .map(|_| call.producer())
         })
     }
+
+    fn certified_join_phis(
+        &self,
+    ) -> Option<&BTreeMap<CanonicalInstructionId, CertifiedTwoWayJoinPhi>> {
+        None
+    }
 }
 
 impl CertifiedSemanticSource for CertifiedMachineProjection {
@@ -1406,6 +1415,12 @@ impl CertifiedSemanticSource for CertifiedMachineProjection {
                 .filter(|result| result.value().binding() == binding)
                 .map(|_| call.producer())
         })
+    }
+
+    fn certified_join_phis(
+        &self,
+    ) -> Option<&BTreeMap<CanonicalInstructionId, CertifiedTwoWayJoinPhi>> {
+        Some(self.two_way_join_phis())
     }
 }
 
@@ -2783,7 +2798,7 @@ impl SemanticCExpressionLayer {
             expressions: Vec::new(),
             inputs: BTreeMap::new(),
             join_phi_leaves: BTreeMap::new(),
-            join_phis,
+            join_phis: join_phis.or_else(|| certified.certified_join_phis()),
         };
         let mut entities = Vec::new();
 
