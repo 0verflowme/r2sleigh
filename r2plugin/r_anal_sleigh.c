@@ -3521,6 +3521,15 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 	}
 	if (!is_sla_debug_ns) {
 		if (sleigh_direct_sla_debug_only_command (cmd)) {
+			// Engine inspection lives under the debug namespace. Returning an
+			// empty string here left the bare spelling looking like a command
+			// that ran and had nothing to say.
+			R_LOG_ERROR ("r2sleigh: '%s' is engine inspection; use 'a:sla.debug.%s'",
+				cmd, cmd + strlen ("sla."));
+			if (cons) {
+				r_cons_printf (cons, "r2sleigh: use a:sla.debug.%s\n",
+					cmd + strlen ("sla."));
+			}
 			return strdup ("");
 		}
 	}
@@ -3529,6 +3538,7 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 		if (cons) {
 			r_cons_println (cons, "| a:sla        - Show r2sleigh status");
 			r_cons_println (cons, "| pdd - decompile through the borrowed-snapshot provider");
+			r_cons_println (cons, "| a:sla.debug.* - engine inspection (ssa, defuse, dom, cfg, taint, regs, mem, vars)");
 			r_cons_println (cons, "| a:sla.dec / a:sla.decj - unavailable outside that provider");
 			r_cons_println (cons, "| a:sym.* - unavailable without the borrowed function snapshot provider");
 		}
