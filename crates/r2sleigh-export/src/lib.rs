@@ -1,7 +1,7 @@
 //! Unified instruction export pipeline for r2sleigh.
 
 use r2il::{ArchSpec, R2ILBlock, R2ILOp, SpaceId, Varnode, validate_block_full};
-use r2sleigh_lift::{Disassembler, format_op, op_to_esil};
+use r2sleigh_lift::{Disassembler, block_to_esil, format_op, op_to_esil};
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::HashSet;
@@ -176,15 +176,7 @@ fn export_lift(
             }
             Ok(out)
         }
-        ExportFormat::Esil => {
-            let lines = input
-                .block
-                .ops
-                .iter()
-                .map(|op| op_to_esil(input.disasm, op))
-                .collect::<Vec<_>>();
-            Ok(lines.join("\n"))
-        }
+        ExportFormat::Esil => Ok(block_to_esil(input.disasm, input.block)),
         ExportFormat::R2Cmd => {
             let mut out = Vec::new();
             for (idx, op) in input.block.ops.iter().enumerate() {

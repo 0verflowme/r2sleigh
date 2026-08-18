@@ -33,6 +33,8 @@ pub struct Disassembler {
     reg_name_map: HashMap<(u64, u32), String>,
     /// Exact mapping extracted with the architecture metadata for this session.
     space_map: HashMap<AddressSpaceId, SpaceId>,
+    /// Register the processor spec names as the program counter.
+    program_counter: String,
     /// Opaque authority present only for an embedded trusted Sleigh profile.
     genuine_authority: Option<GenuineLiftAuthority>,
     trusted_profile: Option<TrustedSleighProfile>,
@@ -856,7 +858,8 @@ fn validate_genuine_function_cfg(
     let lands_offcut = |target: u64| {
         !starts.contains(&target)
             && layout.blocks.iter().any(|block| {
-                target > block.addr() && target < block.addr().saturating_add(u64::from(block.size()))
+                target > block.addr()
+                    && target < block.addr().saturating_add(u64::from(block.size()))
             })
     };
     let mut internal_successors = HashMap::<u64, Vec<u64>>::new();
@@ -1210,6 +1213,7 @@ impl Disassembler {
         });
 
         Ok(Self {
+            program_counter: program_counter_from_pspec(pspec),
             sleigh,
             arch_name: arch_name.to_string(),
             reg_name_map,
@@ -1322,6 +1326,16 @@ impl Disassembler {
     /// Get the architecture name.
     pub fn arch_name(&self) -> &str {
         &self.arch_name
+    }
+
+    /// The register this processor uses as its program counter.
+    ///
+    /// Taken from the processor spec rather than assumed, because it is `RIP`
+    /// on x86-64, `EIP` on x86 and 16-bit, and `pc` on ARM, MIPS and RISC-V.
+    /// Writing a branch target to the wrong name leaves the branch with no
+    /// effect at all.
+    pub fn program_counter(&self) -> &str {
+        &self.program_counter
     }
 
     /// Get the default code address space.
@@ -2205,6 +2219,28 @@ fn is_stack_register(arch_name: &str, reg: &str) -> bool {
             "sp" | "rsp" | "esp" | "bp" | "rbp" | "ebp" | "fp" | "s0" | "x2" | "x8"
         )
     }
+}
+
+/// Read `<programcounter register="..."/>` out of a Ghidra processor spec.
+fn program_counter_from_pspec(pspec: &str) -> String {
+    const KEY: &str = "programcounter";
+    let Some(rest) = pspec.split_once(KEY).map(|(_, rest)| rest) else {
+        return "pc".to_string();
+    };
+    let Some(rest) = rest.split_once("register=").map(|(_, rest)| rest) else {
+        return "pc".to_string();
+    };
+    let rest = rest.trim_start();
+    let quote = match rest.chars().next() {
+        Some(c @ ('"' | '\'')) => c,
+        _ => return "pc".to_string(),
+    };
+    rest[1..]
+        .split(quote)
+        .next()
+        .filter(|name| !name.is_empty())
+        .unwrap_or("pc")
+        .to_string()
 }
 
 fn is_pc_register(reg: &str) -> bool {

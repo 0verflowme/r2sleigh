@@ -1372,15 +1372,29 @@ mod tests {
     #[test]
     fn storeconditional_esil_uses_zero_success_code() {
         let (disasm, _) = get_disassembler_with_spec("x86-64").expect("disassembler");
+        // Register operands, because a unique has no ESIL spelling on its own:
+        // it only exists once `block_to_esil` has spliced it into a reader.
         let op = r2il::R2ILOp::StoreConditional {
-            result: Some(r2il::Varnode::new(r2il::SpaceId::Unique, 0x10, 1)),
+            result: Some(r2il::Varnode::register(0x00, 8)),
             space: r2il::SpaceId::Ram,
-            addr: r2il::Varnode::new(r2il::SpaceId::Unique, 0x20, 8),
-            val: r2il::Varnode::new(r2il::SpaceId::Unique, 0x30, 8),
+            addr: r2il::Varnode::register(0x08, 8),
+            val: r2il::Varnode::register(0x10, 8),
             ordering: r2il::MemoryOrdering::Relaxed,
         };
         let esil = r2sleigh_lift::op_to_esil(&disasm, &op);
-        assert_eq!(esil, "tmp:0x30,tmp:0x20,=[8],0,tmp:0x10,=");
+        assert_eq!(esil, "rdx,rcx,=[8],0,rax,=");
+    }
+
+    #[test]
+    fn lone_op_refuses_to_spell_a_unique() {
+        let (disasm, _) = get_disassembler_with_spec("x86-64").expect("disassembler");
+        // `tmp:0x30` is neither a number nor a register, so radare2 classifies
+        // it as invalid and drops the operation. Saying so beats printing it.
+        let op = r2il::R2ILOp::Copy {
+            dst: r2il::Varnode::register(0x00, 8),
+            src: r2il::Varnode::new(r2il::SpaceId::Unique, 0x30, 8),
+        };
+        assert_eq!(r2sleigh_lift::op_to_esil(&disasm, &op), "TODO,rax,=");
     }
 
     #[test]

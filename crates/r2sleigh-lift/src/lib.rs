@@ -40,7 +40,7 @@ pub use disasm::{
     GenuineLiftedFunctionAuthority, SemanticMetadataOptions, SemanticMetadataPrecision,
     TrustedLiftedFunction, TrustedSleighProfile,
 };
-pub use esil::{format_op, op_to_esil};
+pub use esil::{OpEsil, block_to_esil, format_op, op_esil, op_to_esil};
 pub use pcode::{PcodeTranslator, RawPcodeOp, RawVarnode};
 use r2il::ArchSpec;
 use r2il::Endianness;

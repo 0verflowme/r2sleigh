@@ -656,14 +656,7 @@ pub(crate) fn r2il_block_to_esil(ctx: *const R2ILContext, block: *const R2ILBloc
         native_size: blk.size as usize,
     };
     match export_instruction(&input, InstructionAction::Lift, ExportFormat::Esil) {
-        Ok(esil_lines) => {
-            let joined = esil_lines
-                .lines()
-                .filter(|line| !line.is_empty())
-                .collect::<Vec<_>>()
-                .join(";");
-            CString::new(joined).map_or(ptr::null_mut(), |s| s.into_raw())
-        }
+        Ok(esil) => CString::new(esil).map_or(ptr::null_mut(), |s| s.into_raw()),
         Err(_) => ptr::null_mut(),
     }
 }

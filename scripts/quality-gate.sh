@@ -235,6 +235,21 @@ run cargo mutants --no-config \
     --no-times \
     --output target/quality-gate/mutants-r2ssa-var
 
+phase "Differential ESIL against radare2's own lifter"
+# Needs the plugin installed, so it is opt-in: R2SLEIGH_ESIL_DIFF_BINARY names an
+# x86-64 binary to step through. Without it the phase is skipped rather than
+# silently passing on nothing.
+if [ -n "${R2SLEIGH_ESIL_DIFF_BINARY:-}" ]; then
+    run python3 scripts/esil_differential.py \
+        --binary "$R2SLEIGH_ESIL_DIFF_BINARY" \
+        --arch "${R2SLEIGH_ESIL_DIFF_ARCH:-x86}" \
+        --bits "${R2SLEIGH_ESIL_DIFF_BITS:-64}" \
+        --start "${R2SLEIGH_ESIL_DIFF_START:-entry0}" \
+        --count "${R2SLEIGH_ESIL_DIFF_COUNT:-120}"
+else
+    printf 'skipped: set R2SLEIGH_ESIL_DIFF_BINARY to run the differential\n'
+fi
+
 if [ "$dry_run" -eq 1 ]; then
     printf '\nquality gate dry run complete\n'
 else
