@@ -212,7 +212,6 @@ aaa
 s `afl~solve_equation$[0]` > /dev/null
 pdd | jq -Rs '(contains("solve_equation") or contains("sym.solve_equation")) and contains("return") and (contains("r2dec fallback:")|not)'
 EOF_CMDS
-BROKEN=1
 RUN
 
 NAME=dec_explicit_address_target_uses_canonical_command
@@ -313,7 +312,6 @@ s `afl~test_array_index_neg$[0]` >/dev/null
 s `afl~test_array_index_neg$[0]` >/dev/null
 pdd | jq -Rs 'contains("test_array_index_neg") and (contains("[-idx]") or contains("[0 - idx]") or contains("[-arg2]") or contains("[0 - arg2]")) and (contains("[0]")|not) and (contains("saved_fp")|not) and (contains("*(rbp")|not)'
 EOF_CMDS
-BROKEN=1
 RUN
 
 NAME=dec_array_index_uses_real_index
@@ -330,7 +328,6 @@ s `afl~test_array_index$[0]` >/dev/null
 s `afl~test_array_index$[0]` >/dev/null
 pdd | jq -Rs 'contains("test_array_index") and (contains("[idx]") or contains("[arg2]")) and (contains("[0]")|not) and (contains("saved_fp")|not)'
 EOF_CMDS
-BROKEN=1
 RUN
 
 NAME=dec_struct_array_index_keeps_member_write_shape

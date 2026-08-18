@@ -167,6 +167,26 @@ fn insert_named(map: &mut BTreeMap<u64, String>, addr: u64, name: String) {
     map.insert(addr, name);
 }
 
+/// Whether radare2 derived this name from the function's address rather than
+/// from anything it knows about the function.
+///
+/// `fcn.1000`, `sub_1000` and the like restate the entry address and say
+/// nothing further, so a consumer that has the address already loses nothing by
+/// treating them as unnamed. A name from a symbol, from debug information, or
+/// set by the user is a fact about the function and is not.
+pub fn is_generated_function_name(name: &str) -> bool {
+    let underscore_hex_addr = name
+        .strip_prefix('_')
+        .is_some_and(|rest| !rest.is_empty() && rest.chars().all(|ch| ch.is_ascii_hexdigit()));
+    name.is_empty()
+        || name.starts_with("fcn.")
+        || name.starts_with("fcn_")
+        || name.starts_with("sub.")
+        || name.starts_with("sub_")
+        || name.starts_with("loc.")
+        || underscore_hex_addr
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

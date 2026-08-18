@@ -993,12 +993,20 @@ impl TrustedSsaArtifact {
             *source.machine_roles(),
             call_site_interfaces,
         );
-        let function = SSAFunction::from_blocks_for_decompile_with_interface_and_control(
+        let mut function = SSAFunction::from_blocks_for_decompile_with_interface_and_control(
             &blocks,
             Some(&arch),
             coherent_function_interface(&machine_context),
             control,
         )?;
+        // What the source calls this function. A name radare2 derived from the
+        // entry address restates the address and is left absent, so consumers
+        // that would only spell it back out are not misled into thinking the
+        // function was named.
+        let presented = source.presentation().display_name();
+        if !r2source::display_names::is_generated_function_name(presented) {
+            function = function.with_name(presented);
+        }
         if function.entry != source.image().entry_address() {
             return Err(SsaPrepareError::MalformedInput);
         }

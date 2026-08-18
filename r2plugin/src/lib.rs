@@ -2603,12 +2603,29 @@ pub(crate) struct EngineV2Output {
     pub(crate) diagnostics: r2engine::EngineDiagnostics,
 }
 
+/// The name the source gives this function, when it gives one.
+///
+/// radare2 already knows what the function is called -- from a symbol, from
+/// debug information, from a name the user set -- and the snapshot carries it.
+/// Deriving a name from the entry address instead discards that and prints
+/// `fcn_1000006b0` for a function the rest of the session calls
+/// `dbg.process_string`. A name radare2 generated from the address itself
+/// carries no more than the address does, so it is not preferred to our own.
+fn source_function_name(trusted: &r2ssa::TrustedSsaArtifact) -> String {
+    let function_addr = trusted.source().function().address();
+    let named = trusted.source().presentation().display_name();
+    if named.is_empty() || r2source::display_names::is_generated_function_name(named) {
+        return format!("fcn_{function_addr:x}");
+    }
+    named.to_string()
+}
+
 fn trusted_engine_function_input(
     trusted: &r2ssa::TrustedSsaArtifact,
 ) -> r2engine::EngineFunctionInput {
     let function_addr = trusted.source().function().address();
     r2engine::EngineFunctionInput {
-        function_name: format!("fcn_{function_addr:x}"),
+        function_name: source_function_name(trusted),
         function_addr,
         blocks: trusted.source_blocks().to_vec(),
         arch: Some(trusted.arch_spec().clone()),
@@ -2647,7 +2664,7 @@ fn r2sleigh_engine_type_function_trusted_output(
     execution: r2engine::EngineExecutionControl,
 ) -> Option<EngineV2Output> {
     let function_addr = trusted.source().function().address();
-    let function_name = format!("fcn_{function_addr:x}");
+    let function_name = source_function_name(&trusted);
     let ptr_bits = helpers::effective_ptr_bits(trusted.arch_spec());
     let policy = r2engine::analysis_policy_for_radare2_depth(0);
     let writeback_budget = r2types::TypeWritebackMutationBudget::new(
