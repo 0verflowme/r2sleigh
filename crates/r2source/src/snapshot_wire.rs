@@ -591,6 +591,7 @@ pub fn write_convention_slots(writer: &mut SnapshotWireWriter, slots: &SourceCon
     -> Result<(), SnapshotWireError> {
     let count = u32::try_from(slots.argument_slots().len())
         .map_err(|_| SnapshotWireError::ValueTooWide)?;
+    writer.string(slots.calling_convention())?;
     writer.u32(count);
     for storage in slots.argument_slots() {
         write_storage(writer, *storage);
@@ -602,6 +603,7 @@ pub fn write_convention_slots(writer: &mut SnapshotWireWriter, slots: &SourceCon
 pub fn read_convention_slots(
     reader: &mut SnapshotWireReader<'_>,
 ) -> Result<SourceConventionSlots, SnapshotWireError> {
+    let calling_convention = reader.string()?.to_string();
     let count = reader.u32()? as usize;
     let mut argument_slots = Vec::with_capacity(count.min(64));
     for _ in 0..count {
@@ -610,7 +612,7 @@ pub fn read_convention_slots(
     let result_slot = read_optional_storage(reader)?;
     // new() revalidates, so a buffer cannot mint candidate slots the in-crate
     // constructor would have rejected.
-    SourceConventionSlots::new(argument_slots, result_slot)
+    SourceConventionSlots::new(calling_convention, argument_slots, result_slot)
         .map_err(|_| SnapshotWireError::ValueTooWide)
 }
 
@@ -2374,7 +2376,7 @@ mod tests {
             vec![0xabu8, 0xcd].into_boxed_slice(),
             function_interface,
             SourceMachineRoles::new(None, None).expect("roles"),
-            SourceConventionSlots::new([], None).expect("empty convention slots"),
+            SourceConventionSlots::new("", [], None).expect("empty convention slots"),
             captured_fields,
             DiagnosticIdentity(0x1234),
         )

@@ -706,10 +706,16 @@ bool r2sleigh_wire_write_snapshot(R2SleighWireWriter *writer, const void *snapsh
 		& R_ANAL_FUNCTION_SNAPSHOT_CAP_RETURN_ADDRESS_STORAGE) != 0;
 	const bool has_stack_pointer = (top.capabilities
 		& R_ANAL_FUNCTION_SNAPSHOT_CAP_STACK_POINTER_STORAGE) != 0;
-	walk_optional_storage (writer, has_interface && has_return_address,
-		&interface.return_address_storage);
-	walk_optional_storage (writer, has_interface && has_stack_pointer,
-		&interface.stack_pointer_storage);
+	/* The machine carriers are collected independently of any recovered
+	 * prototype, so they are reported whenever radare2 resolved them. Gating
+	 * them on an exact interface withheld the carriers from exactly the
+	 * functions that have no interface and most need them. */
+	RAnalFunctionInterfaceSnapshotView carriers = {0};
+	const bool carriers_read = r_anal_function_snapshot_interface_view (source, &carriers);
+	walk_optional_storage (writer, carriers_read && has_return_address,
+		&carriers.return_address_storage);
+	walk_optional_storage (writer, carriers_read && has_stack_pointer,
+		&carriers.stack_pointer_storage);
 
 	/* The convention's candidate slots describe where a caller would leave
 	 * arguments and the result. They are emitted whether or not a prototype was
@@ -722,6 +728,13 @@ bool r2sleigh_wire_write_snapshot(R2SleighWireWriter *writer, const void *snapsh
 	if (num_slots > UINT32_MAX) {
 		return false;
 	}
+	char convention_name[WALK_NAME_MAX] = {0};
+	if (slots_known
+		&& !r_anal_function_snapshot_interface_calling_convention (source, convention_name,
+			sizeof (convention_name))) {
+		return false;
+	}
+	r2sleigh_wire_string (writer, convention_name);
 	r2sleigh_wire_u32 (writer, (uint32_t)num_slots);
 	for (size_t i = 0; i < num_slots; i++) {
 		RAnalSnapshotRegisterStorageView slot = {0};

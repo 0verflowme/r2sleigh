@@ -1891,7 +1891,7 @@ pub unsafe fn capture_radare_abi138(
         function_interface,
         machine_roles,
         // The accessor transport never carried convention candidates.
-        SourceConventionSlots::new([], None).map_err(|_| RadareAbi138CaptureError::InvalidMachine)?,
+        SourceConventionSlots::new("", [], None).map_err(|_| RadareAbi138CaptureError::InvalidMachine)?,
         captured_fields,
         DiagnosticIdentity(first.revision_identity),
     )

@@ -9,7 +9,11 @@
 //! the parameters, and the convention's result slot yields the return. Nothing
 //! here claims a type or a name, both of which compilation genuinely erases.
 
-use r2source::{CanonicalStorageId, CanonicalStorageSpace, SourceConventionSlots};
+use r2source::{
+    CanonicalStorageId, CanonicalStorageSpace, SourceAbiParameterSpec, SourceCarrierKind,
+    SourceCarrierProjection, SourceConventionSlots, SourceFunctionInterface, SourceFunctionReturn,
+    SourceLogicalValue, SourceMachineRoles, SourceType, SourceTypeGraph, SourceTypeKind,
+};
 
 use crate::function::SSAFunction;
 use crate::var::SSAVar;
@@ -149,6 +153,125 @@ fn function_defines(func: &SSAFunction, storage: CanonicalStorageId) -> bool {
     false
 }
 
+/// Build a source interface from what the machine code proves.
+///
+/// Every parameter is an unsigned integer of the register's own width. That is
+/// not a claim about the source type, which compilation erased: it is the same
+/// convention the renderer already applies to every machine value, where a
+/// value is an unsigned bit pattern and signedness comes from the operations
+/// applied to it. Signedness, pointer-ness and names are never asserted.
+///
+/// The return-address and stack-pointer carriers come from the machine roles,
+/// which the source resolves without any recovered prototype. Certification
+/// requires both, so a source lacking either yields no interface rather than a
+/// half-formed one.
+pub fn mint_recovered_interface(
+    recovered: &RecoveredInterface,
+    roles: &SourceMachineRoles,
+    revision_identity: &[u8],
+    calling_convention: &str,
+) -> Option<SourceFunctionInterface> {
+    let return_address_storage = roles.return_address_storage()?;
+    let stack_pointer_storage = roles.stack_pointer_storage()?;
+    if revision_identity.is_empty() || calling_convention.trim().is_empty() {
+        return None;
+    }
+
+    // One integer type per distinct width the interface actually uses, so the
+    // graph describes exactly what is referenced and nothing more.
+    let mut widths: Vec<u32> = Vec::new();
+    let mut width_of = |storage: CanonicalStorageId| -> Option<u32> {
+        let bits = storage.size.checked_mul(8)?;
+        if !matches!(bits, 8 | 16 | 32 | 64) {
+            return None;
+        }
+        if !widths.contains(&bits) {
+            widths.push(bits);
+        }
+        Some(bits)
+    };
+    let parameter_widths = recovered
+        .parameters()
+        .iter()
+        .map(|storage| width_of(*storage))
+        .collect::<Option<Vec<_>>>()?;
+    let result_width = match recovered.result() {
+        Some(storage) => Some(width_of(storage)?),
+        None => None,
+    };
+    widths.sort_unstable();
+
+    let types = widths
+        .iter()
+        .enumerate()
+        .map(|(index, bits)| {
+            SourceType::new(
+                u32::try_from(index).ok()?,
+                SourceTypeKind::UnsignedInteger,
+                u64::from(*bits),
+                u64::from(*bits),
+            )
+            .into()
+        })
+        .collect::<Option<Vec<SourceType>>>()?;
+    let type_graph = SourceTypeGraph::new(types, []).ok()?;
+    let type_id = |bits: u32| -> Option<u32> {
+        widths
+            .iter()
+            .position(|candidate| *candidate == bits)
+            .and_then(|index| u32::try_from(index).ok())
+    };
+    let logical = |bits: u32| -> Option<SourceLogicalValue> {
+        Some(SourceLogicalValue::new(
+            type_id(bits)?,
+            // Full: the value occupies the whole carrier, because the carrier
+            // is the register width the read named.
+            SourceCarrierProjection::new(SourceCarrierKind::Full, 0, u64::from(bits)),
+        ))
+    };
+
+    let parameters = recovered
+        .parameters()
+        .iter()
+        .enumerate()
+        .map(|(index, storage)| {
+            Some(SourceAbiParameterSpec::new(
+                u32::try_from(index).ok()?,
+                *storage,
+            ))
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let parameter_logical_values = parameter_widths
+        .iter()
+        .map(|bits| logical(*bits))
+        .collect::<Option<Vec<_>>>()?;
+    let (return_kind, return_logical_value) = match (recovered.result(), result_width) {
+        (Some(storage), Some(bits)) => (
+            SourceFunctionReturn::Register { storage },
+            Some(logical(bits)?),
+        ),
+        _ => (SourceFunctionReturn::Void, None),
+    };
+
+    // Exact: the stack slot roles are complete because there are none to
+    // classify, which certification requires before it will trust the model.
+    SourceFunctionInterface::new_exact_with_logical_types(
+        revision_identity.to_vec(),
+        calling_convention,
+        parameters,
+        return_kind,
+        [],
+        parameter_logical_values,
+        return_logical_value,
+        Some(type_graph),
+    )
+    .ok()?
+    .with_return_address_storage(return_address_storage)
+    .ok()?
+    .with_stack_pointer_storage(stack_pointer_storage)
+    .ok()
+}
+
 #[cfg(test)]
 mod tests {
     use r2il::{ArchSpec, R2ILBlock, R2ILOp, RegisterDef, Varnode};
@@ -175,6 +298,7 @@ mod tests {
 
     fn candidates() -> SourceConventionSlots {
         SourceConventionSlots::new(
+            "arm64",
             [register(0, 8), register(8, 8), register(16, 8)],
             Some(register(0, 8)),
         )
@@ -268,7 +392,7 @@ mod tests {
             src: Varnode::register(0, 8),
         });
         let func = SSAFunction::from_blocks_with_arch(&[block], Some(&arch)).expect("ssa");
-        let empty = SourceConventionSlots::new([], None).expect("empty");
+        let empty = SourceConventionSlots::new("", [], None).expect("empty");
         assert!(recover_interface(&func, &empty).is_none());
     }
 }

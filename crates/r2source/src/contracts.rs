@@ -2251,6 +2251,7 @@ pub struct SourceMachineRoles {
 /// importing a guessed prototype instead would defeat the purpose.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SourceConventionSlots {
+    calling_convention: String,
     argument_slots: Box<[CanonicalStorageId]>,
     result_slot: Option<CanonicalStorageId>,
 }
@@ -2259,9 +2260,11 @@ impl SourceConventionSlots {
     /// Build the candidate slots, rejecting anything that is not a well-formed
     /// register location or that names the same register twice.
     pub fn new(
+        calling_convention: impl Into<String>,
         argument_slots: impl IntoIterator<Item = CanonicalStorageId>,
         result_slot: Option<CanonicalStorageId>,
     ) -> Result<Self, SourceMachineRolesError> {
+        let calling_convention = calling_convention.into();
         let argument_slots = argument_slots.into_iter().collect::<Vec<_>>();
         if argument_slots
             .iter()
@@ -2278,9 +2281,16 @@ impl SourceConventionSlots {
             }
         }
         Ok(Self {
+            calling_convention,
             argument_slots: argument_slots.into_boxed_slice(),
             result_slot,
         })
+    }
+
+    /// Convention these candidates belong to, named even when no prototype was
+    /// recovered.
+    pub fn calling_convention(&self) -> &str {
+        &self.calling_convention
     }
 
     pub const fn argument_slots(&self) -> &[CanonicalStorageId] {

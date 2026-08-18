@@ -663,7 +663,7 @@ mod tests {
             Box::from([7]),
             None,
             SourceMachineRoles::default(),
-            SourceConventionSlots::new([], None).expect("empty convention slots"),
+            SourceConventionSlots::new("", [], None).expect("empty convention slots"),
             CapturedSourceFields {
                 bounded_function_image: true,
                 function_interface: false,
@@ -788,7 +788,7 @@ mod tests {
             Box::from([7]),
             Some(interface.clone()),
             SourceMachineRoles::default(),
-            SourceConventionSlots::new([], None).expect("empty convention slots"),
+            SourceConventionSlots::new("", [], None).expect("empty convention slots"),
             captured_fields,
             valid.diagnostic_identity())
         .expect("coherent interface capture");
@@ -833,7 +833,7 @@ mod tests {
                 Box::from([7]),
                 Some(wrong_machine_width),
                 SourceMachineRoles::default(),
-                SourceConventionSlots::new([], None).expect("empty convention slots"),
+                SourceConventionSlots::new("", [], None).expect("empty convention slots"),
                 narrow_fields,
                 valid.diagnostic_identity()),
             Err(SnapshotValidationError::InvalidFunctionInterface)
@@ -851,7 +851,7 @@ mod tests {
                 Box::from([7]),
                 Some(interface.clone()),
                 SourceMachineRoles::default(),
-                SourceConventionSlots::new([], None).expect("empty convention slots"),
+                SourceConventionSlots::new("", [], None).expect("empty convention slots"),
                 missing_frame_pointer,
                 valid.diagnostic_identity()),
             Err(SnapshotValidationError::InvalidFunctionInterface)
@@ -869,7 +869,7 @@ mod tests {
                 Box::from([7]),
                 Some(interface.clone()),
                 SourceMachineRoles::default(),
-                SourceConventionSlots::new([], None).expect("empty convention slots"),
+                SourceConventionSlots::new("", [], None).expect("empty convention slots"),
                 missing_stack_allocation_contract,
                 valid.diagnostic_identity()),
             Err(SnapshotValidationError::InvalidFunctionInterface)
@@ -912,7 +912,7 @@ mod tests {
                 Box::from([7]),
                 Some(interface_without_frame_pointer.clone()),
                 SourceMachineRoles::default(),
-                SourceConventionSlots::new([], None).expect("empty convention slots"),
+                SourceConventionSlots::new("", [], None).expect("empty convention slots"),
                 captured_fields,
                 valid.diagnostic_identity()),
             Err(SnapshotValidationError::InvalidFunctionInterface)
@@ -928,7 +928,7 @@ mod tests {
             Box::from([7]),
             Some(interface_without_frame_pointer),
             SourceMachineRoles::default(),
-            SourceConventionSlots::new([], None).expect("empty convention slots"),
+            SourceConventionSlots::new("", [], None).expect("empty convention slots"),
             fields_without_frame_pointer,
             valid.diagnostic_identity())
         .expect("absent frame bit means no explicit payload");
@@ -951,7 +951,7 @@ mod tests {
                 Box::from([7]),
                 Some(interface.clone()),
                 SourceMachineRoles::default(),
-                SourceConventionSlots::new([], None).expect("empty convention slots"),
+                SourceConventionSlots::new("", [], None).expect("empty convention slots"),
                 missing_return_mechanism,
                 valid.diagnostic_identity()),
             Err(SnapshotValidationError::InvalidFunctionInterface)
@@ -969,7 +969,7 @@ mod tests {
                 Box::from([7]),
                 None,
                 SourceMachineRoles::default(),
-                SourceConventionSlots::new([], None).expect("empty convention slots"),
+                SourceConventionSlots::new("", [], None).expect("empty convention slots"),
                 mechanism_without_interface,
                 valid.diagnostic_identity()),
             Err(SnapshotValidationError::InvalidFunctionInterface)
@@ -987,7 +987,7 @@ mod tests {
                 Box::from([7]),
                 None,
                 SourceMachineRoles::default(),
-                SourceConventionSlots::new([], None).expect("empty convention slots"),
+                SourceConventionSlots::new("", [], None).expect("empty convention slots"),
                 frame_pointer_without_interface,
                 valid.diagnostic_identity()),
             Err(SnapshotValidationError::InvalidFunctionInterface)
@@ -1016,7 +1016,7 @@ mod tests {
                 Box::from([7]),
                 Some(wrong_revision),
                 SourceMachineRoles::default(),
-                SourceConventionSlots::new([], None).expect("empty convention slots"),
+                SourceConventionSlots::new("", [], None).expect("empty convention slots"),
                 captured_fields,
                 valid.diagnostic_identity()),
             Err(SnapshotValidationError::InvalidFunctionInterface)

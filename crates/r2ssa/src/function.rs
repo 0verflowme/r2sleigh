@@ -932,10 +932,32 @@ impl TrustedSsaArtifact {
         // coherence. Refusing here instead would suppress the whole function
         // for a fact the pipeline is built to carry.
         let call_site_interfaces = correlate_call_site_interfaces(&source, &blocks);
+        // A source without a recovered prototype still describes its ABI in the
+        // instructions: a register read before it is written carries a value the
+        // caller supplied. Recover that rather than refusing the function, but
+        // never in preference to an interface the source already carries.
+        let function_interface = match source.function_interface().cloned() {
+            Some(interface) => Some(interface),
+            None => SSAFunction::from_blocks_with_arch(&blocks, Some(&arch))
+                .and_then(|preliminary| {
+                    crate::recover_interface::recover_interface(
+                        &preliminary,
+                        source.convention_slots(),
+                    )
+                })
+                .and_then(|recovered| {
+                    crate::recover_interface::mint_recovered_interface(
+                        &recovered,
+                        source.machine_roles(),
+                        source.source_revision_identity(),
+                        source.convention_slots().calling_convention(),
+                    )
+                }),
+        };
         let machine_context = SourceMachineContext::from_blocks_with_interfaces(
             &blocks,
             Some(&arch),
-            source.function_interface().cloned(),
+            function_interface,
             *source.machine_roles(),
             call_site_interfaces,
         );
