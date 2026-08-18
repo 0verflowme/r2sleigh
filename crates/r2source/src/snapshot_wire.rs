@@ -331,7 +331,8 @@ impl<'a> SnapshotWireReader<'a> {
 use crate::contracts::{
     CanonicalStorageId, CanonicalStorageSpace, SourceAbiParameterSpec, SourceCallArgumentSpec,
     SourceAggregateLayout, SourceAggregateMember, SourceCallResult, SourceCarrierKind,
-    SourceCarrierProjection, SourceFunctionReturn, SourceLogicalValue, SourceMachineRoles,
+    SourceCarrierProjection, SourceConventionSlots, SourceFunctionReturn, SourceLogicalValue,
+    SourceMachineRoles,
     SourceReturnMechanism, SourceStackAllocationContract, SourceStackGrowth, SourceStackSlotRole,
     SourceFunctionInterface, SourceStackSlotSpec, SourceType, SourceTypeGraph, SourceTypeKind,
     StackAddressBase,
@@ -585,6 +586,33 @@ pub fn read_machine_roles(
         .map_err(|_| SnapshotWireError::ValueTooWide)
 }
 
+
+pub fn write_convention_slots(writer: &mut SnapshotWireWriter, slots: &SourceConventionSlots)
+    -> Result<(), SnapshotWireError> {
+    let count = u32::try_from(slots.argument_slots().len())
+        .map_err(|_| SnapshotWireError::ValueTooWide)?;
+    writer.u32(count);
+    for storage in slots.argument_slots() {
+        write_storage(writer, *storage);
+    }
+    write_optional_storage(writer, slots.result_slot());
+    Ok(())
+}
+
+pub fn read_convention_slots(
+    reader: &mut SnapshotWireReader<'_>,
+) -> Result<SourceConventionSlots, SnapshotWireError> {
+    let count = reader.u32()? as usize;
+    let mut argument_slots = Vec::with_capacity(count.min(64));
+    for _ in 0..count {
+        argument_slots.push(read_storage(reader)?);
+    }
+    let result_slot = read_optional_storage(reader)?;
+    // new() revalidates, so a buffer cannot mint candidate slots the in-crate
+    // constructor would have rejected.
+    SourceConventionSlots::new(argument_slots, result_slot)
+        .map_err(|_| SnapshotWireError::ValueTooWide)
+}
 
 const SUCCESSOR_DIRECT: u8 = 0;
 const SUCCESSOR_FALLTHROUGH: u8 = 1;
@@ -1423,6 +1451,7 @@ pub fn encode_snapshot(snapshot: &OwnedFunctionSnapshot) -> Result<Vec<u8>, Snap
         None => writer.bool(false),
     }
     write_machine_roles(&mut writer, snapshot.machine_roles());
+    write_convention_slots(&mut writer, snapshot.convention_slots())?;
     write_captured_fields(&mut writer, snapshot.captured_fields());
     write_diagnostic_identity(&mut writer, snapshot.diagnostic_identity());
     writer.finish()
@@ -1476,6 +1505,7 @@ pub fn decode_snapshot(buffer: &[u8]) -> Result<OwnedFunctionSnapshot, SnapshotD
         None
     };
     let machine_roles = read_machine_roles(&mut reader)?;
+    let convention_slots = read_convention_slots(&mut reader)?;
     let captured_fields = read_captured_fields(&mut reader)?;
     let diagnostics = read_diagnostic_identity(&mut reader)?;
     reader.finish()?;
@@ -1488,6 +1518,7 @@ pub fn decode_snapshot(buffer: &[u8]) -> Result<OwnedFunctionSnapshot, SnapshotD
         source_revision_identity,
         function_interface,
         machine_roles,
+        convention_slots,
         captured_fields,
         diagnostics,
     )
@@ -2343,6 +2374,7 @@ mod tests {
             vec![0xabu8, 0xcd].into_boxed_slice(),
             function_interface,
             SourceMachineRoles::new(None, None).expect("roles"),
+            SourceConventionSlots::new([], None).expect("empty convention slots"),
             captured_fields,
             DiagnosticIdentity(0x1234),
         )

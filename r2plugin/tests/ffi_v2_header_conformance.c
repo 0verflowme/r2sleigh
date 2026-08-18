@@ -111,7 +111,7 @@ int main(void) {
 	R2SleighPlannerQueryResponseV2 planner_response = {0};
 	const R2SleighApiV2 *api = r2sleigh_api_v2 ();
 	if (R2SLEIGH_RADARE_SNAPSHOT_CONTRACT_V2 != 1
-		|| R2SLEIGH_RADARE_FUNCTION_SNAPSHOT_SCHEMA_V2 != 13
+		|| R2SLEIGH_RADARE_FUNCTION_SNAPSHOT_SCHEMA_V2 != 14
 		|| R2SLEIGH_RESPONSE_INFO_SCHEMA_V2 != 2
 		|| switch_case.target != 0x402000
 		|| call_identity.op_index != 3

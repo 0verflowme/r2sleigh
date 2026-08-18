@@ -26,11 +26,11 @@
 #if R2SLEIGH_RADARE_SNAPSHOT_CONTRACT_V2 != 1
 #error "r2sleigh generated V2 header must target snapshot transport contract 1"
 #endif
-#if R_ANAL_FUNCTION_SNAPSHOT_SCHEMA_VERSION != 13
-#error "r2sleigh borrowed snapshot transport requires function snapshot schema 13"
+#if R_ANAL_FUNCTION_SNAPSHOT_SCHEMA_VERSION != 14
+#error "r2sleigh borrowed snapshot transport requires function snapshot schema 14"
 #endif
-#if R2SLEIGH_RADARE_FUNCTION_SNAPSHOT_SCHEMA_V2 != 13
-#error "r2sleigh generated V2 header must target function snapshot schema 13"
+#if R2SLEIGH_RADARE_FUNCTION_SNAPSHOT_SCHEMA_V2 != 14
+#error "r2sleigh generated V2 header must target function snapshot schema 14"
 #endif
 
 

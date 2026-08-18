@@ -711,6 +711,28 @@ bool r2sleigh_wire_write_snapshot(R2SleighWireWriter *writer, const void *snapsh
 	walk_optional_storage (writer, has_interface && has_stack_pointer,
 		&interface.stack_pointer_storage);
 
+	/* The convention's candidate slots describe where a caller would leave
+	 * arguments and the result. They are emitted whether or not a prototype was
+	 * recovered, because a consumer recovering parameters from machine code has
+	 * nothing to intersect against without them. */
+	RAnalFunctionInterfaceSnapshotView convention = {0};
+	const bool slots_known = r_anal_function_snapshot_interface_view (source, &convention)
+		&& convention.convention_slots_known;
+	const size_t num_slots = slots_known? convention.num_convention_argument_slots: 0;
+	if (num_slots > UINT32_MAX) {
+		return false;
+	}
+	r2sleigh_wire_u32 (writer, (uint32_t)num_slots);
+	for (size_t i = 0; i < num_slots; i++) {
+		RAnalSnapshotRegisterStorageView slot = {0};
+		if (!r_anal_function_snapshot_convention_argument_slot (source, i, &slot)) {
+			return false;
+		}
+		walk_storage (writer, &slot);
+	}
+	walk_optional_storage (writer, slots_known && convention.convention_result_slot.size != 0,
+		&convention.convention_result_slot);
+
 	uint16_t captured = 0;
 	if (top.capabilities & R_ANAL_FUNCTION_SNAPSHOT_CAP_OWNED_BOUNDED_FUNCTION_IMAGE) {
 		captured |= WALK_CAPTURED_BOUNDED_IMAGE;

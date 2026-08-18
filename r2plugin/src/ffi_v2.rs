@@ -38,7 +38,7 @@ pub const R2SLEIGH_CAPABILITIES_V2: u64 = R2SLEIGH_CAP_DECOMPILE_V2
 /// with the snapshot and accessor schema versions, none of which move when an
 /// unrelated radare2 ABI bump happens.
 pub const R2SLEIGH_RADARE_SNAPSHOT_CONTRACT_V2: u32 = 1;
-pub const R2SLEIGH_RADARE_FUNCTION_SNAPSHOT_SCHEMA_V2: u32 = 13;
+pub const R2SLEIGH_RADARE_FUNCTION_SNAPSHOT_SCHEMA_V2: u32 = 14;
 pub const R2SLEIGH_RADARE_SNAPSHOT_ACCESSOR_SCHEMA_V2: u32 = 5;
 
 pub const R2SLEIGH_STATUS_OK_V2: u32 = 0;

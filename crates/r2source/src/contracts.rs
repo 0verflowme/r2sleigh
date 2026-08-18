@@ -2241,6 +2241,61 @@ pub struct SourceMachineRoles {
     stack_pointer_storage: Option<CanonicalStorageId>,
 }
 
+/// Where the calling convention would place arguments and the result.
+///
+/// This describes the convention, not the function. The slots are known even
+/// when no prototype was recovered, and they say where a caller *would* leave a
+/// value, never that this function takes one. A consumer recovering parameters
+/// from machine code intersects this candidate list against what the function
+/// reads before writing; without it there is nothing to intersect against, and
+/// importing a guessed prototype instead would defeat the purpose.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SourceConventionSlots {
+    argument_slots: Box<[CanonicalStorageId]>,
+    result_slot: Option<CanonicalStorageId>,
+}
+
+impl SourceConventionSlots {
+    /// Build the candidate slots, rejecting anything that is not a well-formed
+    /// register location or that names the same register twice.
+    pub fn new(
+        argument_slots: impl IntoIterator<Item = CanonicalStorageId>,
+        result_slot: Option<CanonicalStorageId>,
+    ) -> Result<Self, SourceMachineRolesError> {
+        let argument_slots = argument_slots.into_iter().collect::<Vec<_>>();
+        if argument_slots
+            .iter()
+            .any(|storage| !valid_register_storage(*storage))
+            || result_slot.is_some_and(|storage| !valid_register_storage(storage))
+        {
+            return Err(SourceMachineRolesError::InvalidRegisterStorage);
+        }
+        // A convention that named one register twice would make the candidate
+        // order meaningless, so it is refused rather than deduplicated.
+        for (index, storage) in argument_slots.iter().enumerate() {
+            if argument_slots[..index].contains(storage) {
+                return Err(SourceMachineRolesError::InvalidRegisterStorage);
+            }
+        }
+        Ok(Self {
+            argument_slots: argument_slots.into_boxed_slice(),
+            result_slot,
+        })
+    }
+
+    pub const fn argument_slots(&self) -> &[CanonicalStorageId] {
+        &self.argument_slots
+    }
+
+    pub const fn result_slot(&self) -> Option<CanonicalStorageId> {
+        self.result_slot
+    }
+
+    pub const fn is_empty(&self) -> bool {
+        self.argument_slots.is_empty() && self.result_slot.is_none()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SourceMachineRolesError {
     InvalidRegisterStorage,

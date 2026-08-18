@@ -21,7 +21,7 @@ use super::*;
 /// accessor schema versions, all of which change only when the transport
 /// itself changes.
 pub const RADARE_SNAPSHOT_CONTRACT_VERSION: u32 = 1;
-pub const RADARE_FUNCTION_SNAPSHOT_SCHEMA_VERSION: u32 = 13;
+pub const RADARE_FUNCTION_SNAPSHOT_SCHEMA_VERSION: u32 = 14;
 pub const RADARE_SNAPSHOT_ACCESSOR_SCHEMA_VERSION: u32 = 5;
 
 pub const RADARE_ENDIAN_LITTLE: u32 = 0x4321;
@@ -1890,6 +1890,8 @@ pub unsafe fn capture_radare_abi138(
         Box::from(revision),
         function_interface,
         machine_roles,
+        // The accessor transport never carried convention candidates.
+        SourceConventionSlots::new([], None).map_err(|_| RadareAbi138CaptureError::InvalidMachine)?,
         captured_fields,
         DiagnosticIdentity(first.revision_identity),
     )
