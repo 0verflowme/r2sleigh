@@ -24,7 +24,6 @@ aaa
 s main
 pdd | jq -Rs 'contains("r2dec fallback: skipped decompilation")'
 EOF_CMDS
-BROKEN=1
 RUN
 
 NAME=stress_ls_endbr64_json_nonempty
@@ -391,7 +390,6 @@ aaa
 s entry0 > /dev/null
 pdd | jq -Rs '(contains(" = eax ^ eax;")|not) and (contains(" = rax ^ rax;")|not)'
 EOF_CMDS
-BROKEN=1
 RUN
 
 NAME=dec_solve_equation_uses_named_stack_var

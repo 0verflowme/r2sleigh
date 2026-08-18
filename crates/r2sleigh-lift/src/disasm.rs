@@ -742,6 +742,18 @@ fn control_op_is_intra_instruction(block: &GenuineLiftedBlock, op_index: usize) 
     })
 }
 
+/// The operation that decides where this block goes, if any.
+fn block_terminator(block: &GenuineLiftedBlock) -> Option<&R2ILOp> {
+    block
+        .block
+        .ops
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(index, op)| op.is_control_flow() && !control_op_is_intra_instruction(block, *index))
+        .map(|(_, op)| op)
+}
+
 fn genuine_block_successors(block: &GenuineLiftedBlock) -> Result<Vec<u64>> {
     let fallthrough = block
         .block
@@ -789,15 +801,7 @@ fn genuine_block_successors(block: &GenuineLiftedBlock) -> Result<Vec<u64>> {
             ));
         }
     }
-    let control = block
-        .block
-        .ops
-        .iter()
-        .enumerate()
-        .rev()
-        .find(|(index, op)| op.is_control_flow() && !control_op_is_intra_instruction(block, *index))
-        .map(|(_, op)| op);
-    match control {
+    match block_terminator(block) {
         Some(R2ILOp::Return { .. }) => Ok(Vec::new()),
         Some(R2ILOp::Branch { target }) => constant_control_target(target)
             .map(|target| vec![target])
@@ -871,14 +875,22 @@ fn validate_genuine_function_cfg(
                 "genuine function branches into the middle of one of its blocks".to_string(),
             ));
         }
-        internal_successors.insert(
-            block.block.addr,
+        // An indirect branch the lift could not resolve may land on any of this
+        // function's blocks. Recording no edge would let the reachability check
+        // below conclude that the blocks only it reaches were invented, which
+        // is the machine's ignorance stated as a finding about the program.
+        let internal = if matches!(block_terminator(block), Some(R2ILOp::BranchInd { .. }))
+            && block.block.switch_info.is_none()
+        {
+            starts.iter().copied().collect()
+        } else {
             successors
                 .iter()
                 .copied()
                 .filter(|successor| starts.contains(successor))
-                .collect(),
-        );
+                .collect()
+        };
+        internal_successors.insert(block.block.addr, internal);
         successor_manifest.push(successors);
     }
     let mut reached = HashSet::new();
@@ -908,15 +920,7 @@ fn typed_genuine_block_successors(
         .addr
         .checked_add(u64::from(block.block.size))
         .ok_or_else(|| LiftError::Parse("trusted block fallthrough overflows".to_string()))?;
-    let control = block
-        .block
-        .ops
-        .iter()
-        .enumerate()
-        .rev()
-        .find(|(index, op)| op.is_control_flow() && !control_op_is_intra_instruction(block, *index))
-        .map(|(_, op)| op);
-    match control {
+    match block_terminator(block) {
         Some(R2ILOp::Return { .. }) => Ok(Vec::new()),
         Some(R2ILOp::Branch { target }) => constant_control_target(target)
             .map(|target| vec![(AdvisorySuccessorKind::Direct, target, None)])
@@ -933,11 +937,39 @@ fn typed_genuine_block_successors(
             .ok_or_else(|| {
                 LiftError::Parse("trusted conditional branch target is not constant".to_string())
             }),
-        // See genuine_block_successors: an unresolved indirect branch names no
-        // edge back into this function. When the source block carries switch
-        // metadata the comparison against the advisory graph is what refuses
-        // the function, and it reports the disagreement it actually found.
-        Some(R2ILOp::BranchInd { .. }) => Ok(Vec::new()),
+        // An unresolved indirect branch names no edge back into this function:
+        // the machine does not know where it goes.
+        //
+        // A jump table is different only in that radare2 resolved it and put
+        // the result on the block. That resolution is not machine evidence and
+        // grants no authority, but it is still the flow this function has, and
+        // reporting no successors here would say the switch block goes nowhere
+        // -- leaving every block it reaches unreachable and the function
+        // refused. The edges are reported so the graphs describe the same
+        // function; what may be claimed about them is settled downstream,
+        // where an unproven construct is marked rather than rejected.
+        Some(R2ILOp::BranchInd { .. }) => Ok(match block.block.switch_info.as_ref() {
+            Some(switch) => {
+                let mut successors = switch
+                    .cases
+                    .iter()
+                    .map(|case| {
+                        (
+                            AdvisorySuccessorKind::SwitchCase,
+                            case.target,
+                            Some(case.value),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                successors.extend(
+                    switch
+                        .default_target
+                        .map(|target| (AdvisorySuccessorKind::SwitchDefault, target, None)),
+                );
+                successors
+            }
+            None => Vec::new(),
+        }),
         // A call leaves the block by falling through to the next instruction.
         // Where it goes in between is a property of the callee, not of this
         // function's control flow, so it contributes no successor of its own.
@@ -978,11 +1010,6 @@ fn validate_owned_snapshot_cfg(
                 "trusted lift block order differs from owned source".to_string(),
             ));
         }
-        if source_block.switch_instruction().is_some() {
-            return Err(LiftError::Unsupported(
-                "advisory source switches cannot create trusted switch authority".to_string(),
-            ));
-        }
         let mut machine = typed_genuine_block_successors(lifted_block)?;
         machine.sort_unstable();
         if machine.windows(2).any(|pair| pair[0] == pair[1]) {
@@ -1019,10 +1046,53 @@ fn validate_owned_snapshot_cfg(
                 .filter(|(_, target, _)| block_starts.contains(target))
                 .collect::<Vec<_>>()
         };
-        if internal(&machine) != internal(&advisory) {
-            return Err(LiftError::Parse(
-                "machine-derived CFG differs from the owned advisory source CFG".to_string(),
-            ));
+        // The two graphs answer the same question from different evidence, and
+        // each knows something the other cannot. Where they disagree, the
+        // question is whether one of them is ignorant or the two contradict
+        // each other; only a contradiction refuses the function.
+        //
+        // The machine cannot resolve a jump table, so it names no edge out of
+        // an indirect branch while radare2, having analysed the table, names
+        // every case. The machine also assumes a call returns, because whether
+        // it does is a property of the callee; radare2 knows `exit` does not
+        // and ends the block there. Neither difference is a disagreement about
+        // this function's instructions, and refusing on either rejects most
+        // real programs -- the first takes out every entry point that switches,
+        // the second every one that can fail.
+        //
+        // What certifies nothing still describes the flow, and is marked
+        // unproven where that matters rather than discarded here.
+        let terminator = block_terminator(lifted_block);
+        let machine_internal = internal(&machine);
+        let advisory_internal = internal(&advisory);
+        let machine_only = machine_internal
+            .iter()
+            .filter(|edge| !advisory_internal.contains(edge))
+            .copied()
+            .collect::<Vec<_>>();
+        let advisory_only = advisory_internal
+            .iter()
+            .filter(|edge| !machine_internal.contains(edge))
+            .copied()
+            .collect::<Vec<_>>();
+
+        let call_may_not_return = matches!(
+            terminator,
+            Some(R2ILOp::Call { .. } | R2ILOp::CallInd { .. })
+        ) && machine_only
+            .iter()
+            .all(|(kind, _, _)| *kind == AdvisorySuccessorKind::Fallthrough);
+        let table_unresolved = matches!(terminator, Some(R2ILOp::BranchInd { .. }))
+            && lifted_block.block().switch_info.is_none();
+
+        if (!machine_only.is_empty() && !call_may_not_return)
+            || (!advisory_only.is_empty() && !table_unresolved)
+        {
+            return Err(LiftError::Parse(format!(
+                "machine-derived CFG contradicts the owned advisory source CFG at {:#x}: \
+                 machine names {machine_only:?}, source names {advisory_only:?}",
+                lifted_block.block().addr,
+            )));
         }
     }
     Ok(())
