@@ -349,3 +349,42 @@ a:sla.debug.ssa.func > /tmp/r2sleigh_large_block_ssa.json
 jq -n -c --slurpfile cfg /tmp/r2sleigh_large_block_cfg.json --slurpfile ssa /tmp/r2sleigh_large_block_ssa.json "(\$cfg[0].blocks[0].size > 256) and ((\$cfg[0].blocks[0].successors | length) > 0) and (\$cfg[0].num_blocks > 1) and (\$ssa[0].num_blocks > 1) and ((\$ssa[0].blocks | length) > 1)"
 EOF_CMDS
 RUN
+
+NAME=pdd renders C for a function the kernel did not certify
+FILE=bins/r2sleigh_vuln_test_x86_64_macho_O2_v1
+ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
+EXPECT=<<EOF
+sla: loaded architecture 'x86-64'
+bool sub_100000790(int32_t arg0, int32_t arg1)
+{
+    /* r2dec proof: rendered without kernel certification, no individual construct is marked */
+    return (arg0 + arg1 ^ 100 | arg0 - arg1 ^ 20) == 0;
+}
+
+EOF
+CMDS=<<EOF
+a:sla
+aaa
+s dbg.complex_check
+pdd
+EOF
+RUN
+
+NAME=pdd says when a render produced no statements rather than showing empty braces
+FILE=bins/r2sleigh_vuln_test_x86_64_macho_O2_v1
+ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
+EXPECT=<<EOF
+sla: loaded architecture 'x86-64'
+/* unknown */ sub_1000019bc(void)
+{
+    /* r2dec proof: rendered without kernel certification, rendering produced no statements */
+}
+
+EOF
+CMDS=<<EOF
+a:sla
+aaa
+s 0x1000019bc
+pdd
+EOF
+RUN

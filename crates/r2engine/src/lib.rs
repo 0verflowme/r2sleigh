@@ -4080,7 +4080,11 @@ impl EngineSession {
             Ok(artifact) => artifact,
             Err(reason) => {
                 poll_engine_execution(&request.execution, EnginePhase::Types, &metrics)?;
-                return Err(engine_execution_refusal(reason, EnginePhase::Types, metrics));
+                return Err(engine_execution_refusal(
+                    reason,
+                    EnginePhase::Types,
+                    metrics,
+                ));
             }
         };
         let artifact_elapsed = artifact_started.elapsed();
@@ -7674,9 +7678,16 @@ mod tests {
                 r2types::ParsedExternalContext::default(),
             ),
         );
+        // The function is rendered now rather than refused wholesale, so the
+        // claim under test is that the output never presents itself as
+        // certified: it carries a proof marker and none of the certified
+        // aggregate or memory names.
         assert!(
             (refused.output.contains("r2dec residual:")
-                || refused.output.contains("r2dec fallback:"))
+                || refused.output.contains("r2dec fallback:")
+                || refused
+                    .output
+                    .contains("r2dec proof: rendered without kernel certification"))
                 && !refused.output.contains("certified_aggregate_sub_7700")
                 && !refused.output.contains("certified_mem_sub_7700"),
             "non-direct aggregate address must not downgrade to generic memory C:\n{}",

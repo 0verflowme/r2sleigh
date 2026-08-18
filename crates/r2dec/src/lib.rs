@@ -1478,6 +1478,98 @@ fn append_semantic_summary_return_comment_to_function_if_needed(
     }
 }
 
+/// Count the residual markers the structurer left in a rendered body.
+///
+/// The structurer already refuses per construct: an unresolved branch, loop,
+/// switch selector or case value becomes a `r2dec residual:` comment where that
+/// construct would have been. Counting them is a reading of the body, not a
+/// second opinion about what was proven.
+fn count_residual_markers(stmts: &[CStmt]) -> usize {
+    fn walk(stmts: &[CStmt], found: &mut usize) {
+        for stmt in stmts {
+            walk_one(stmt, found);
+        }
+    }
+    fn walk_one(stmt: &CStmt, found: &mut usize) {
+        match stmt {
+            CStmt::Comment(text) => {
+                if text.contains("r2dec residual:") {
+                    *found += 1;
+                }
+            }
+            CStmt::Block(body) => walk(body, found),
+            CStmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                walk_one(then_body, found);
+                if let Some(else_body) = else_body {
+                    walk_one(else_body, found);
+                }
+            }
+            CStmt::While { body, .. } | CStmt::DoWhile { body, .. } => walk_one(body, found),
+            CStmt::For { init, body, .. } => {
+                if let Some(init) = init {
+                    walk_one(init, found);
+                }
+                walk_one(body, found);
+            }
+            CStmt::Switch { cases, default, .. } => {
+                for case in cases {
+                    walk(&case.body, found);
+                }
+                if let Some(default) = default {
+                    walk(default, found);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut found = 0;
+    walk(stmts, &mut found);
+    found
+}
+
+/// State the proof status of a rendered function in its own body.
+///
+/// Rendering used to stop at the function boundary whenever the certification
+/// kernel had not claimed the route, which meant one unproven construct cost
+/// every proven one beside it and left the caller with nothing to read. The
+/// function is rendered either way now, so it has to say what it is: the
+/// structurer marks the individual constructs it could not prove, and this
+/// records whether the kernel certified the function at all.
+///
+/// The note is emitted for an uncertified route even when no individual
+/// construct was marked, because "nothing was marked" and "everything was
+/// proven" are different claims and only the second one earns silence.
+fn note_unproven_constructs(func: &mut CFunction, kernel_certified: bool) {
+    // An empty body claims the function has no observable effects, which is a
+    // different statement from "rendering produced nothing". Only the second is
+    // true here, so the note says that rather than leaving the braces bare.
+    let rendered_nothing = func.body.is_empty();
+    let residuals = count_residual_markers(&func.body);
+    if kernel_certified && residuals == 0 && !rendered_nothing {
+        return;
+    }
+    let detail = if rendered_nothing {
+        "rendering produced no statements".to_string()
+    } else {
+        match residuals {
+            0 => "no individual construct is marked".to_string(),
+            1 => "1 construct is marked below".to_string(),
+            n => format!("{n} constructs are marked below"),
+        }
+    };
+    let note = if kernel_certified {
+        format!("r2dec proof: certified route, {detail}")
+    } else {
+        format!("r2dec proof: rendered without kernel certification, {detail}")
+    };
+    func.body
+        .insert(0, CStmt::comment(sanitize_comment_text(&note)));
+}
+
 fn residual_function_for_render_boundary(func_name: &str, reason: &str) -> CFunction {
     let mut func = CFunction::new(func_name.to_string(), CType::Unknown).with_unknown_params();
     func.body = vec![CStmt::comment(sanitize_comment_text(reason))];
@@ -2702,10 +2794,6 @@ impl Decompiler {
             .name
             .clone()
             .unwrap_or_else(|| format!("sub_{:x}", func.entry));
-        if route_is_standard(semantic_route) {
-            let reason = "r2dec residual: Standard executable rendering is unavailable; r2cert typed-region authorization is required";
-            return Ok(residual_function_for_render_boundary(&func_name, reason));
-        }
         let render_signature = self.context.type_facts().render_authorized_signature();
         // Recover variables
         let mut var_recovery = VariableRecovery::new_with_abi(
@@ -3043,6 +3131,7 @@ impl Decompiler {
         prune_unreferenced_local_declarations(&mut c_function);
         normalize_redundant_return_carrier_casts(&mut c_function);
         normalize_declared_assignment_literals(&mut c_function);
+        note_unproven_constructs(&mut c_function, !route_is_standard(semantic_route));
         work.with_phase(DecompileWorkPhase::Rendering).poll()?;
         Ok(c_function)
     }
@@ -5060,75 +5149,6 @@ mod tests {
     }
 
     #[test]
-    fn decompile_input_with_standard_route_residualizes() {
-        let arch = test_arch_for_decompile();
-        let prepared = prepared_from_ops(
-            vec![
-                R2ILOp::Load {
-                    dst: Varnode::unique(0x10, 4),
-                    space: SpaceId::Ram,
-                    addr: Varnode::register(0x10, 8),
-                },
-                R2ILOp::Return {
-                    target: Varnode::unique(0x10, 4),
-                },
-            ],
-            &arch,
-        );
-        let input = source_owned_decompiler_input(
-            prepared,
-            (
-                r2types::DecompileRouteKind::Standard,
-                "standard residual route",
-                None,
-            ),
-        );
-
-        let output = Decompiler::new(DecompilerConfig::x86_64()).decompile_input(&input);
-
-        assert!(
-            output.contains("Standard executable rendering is unavailable"),
-            "{output}"
-        );
-        assert!(
-            !output.contains("return 0;"),
-            "Standard residual route must not render executable C, got:\n{output}"
-        );
-    }
-
-    #[test]
-    fn build_function_from_input_with_standard_route_residualizes_ast() {
-        let arch = test_arch_for_decompile();
-        let prepared = prepared_from_ops(
-            vec![R2ILOp::Return {
-                target: Varnode::constant(0, 8),
-            }],
-            &arch,
-        );
-        let input = source_owned_decompiler_input(
-            prepared,
-            (
-                r2types::DecompileRouteKind::Standard,
-                "standard residual route",
-                None,
-            ),
-        );
-
-        let func = Decompiler::new(DecompilerConfig::x86_64()).build_function_from_input(&input);
-
-        assert!(
-            func.body
-                .iter()
-                .any(|stmt| matches!(stmt, CStmt::Comment(text) if text.contains("Standard executable rendering is unavailable"))),
-            "Standard route must produce an explicit residual AST, got {func:?}"
-        );
-        assert!(
-            !func.body.iter().any(summary_stmt_contains_return),
-            "Standard residual route must not render executable return AST, got {func:?}"
-        );
-    }
-
-    #[test]
     fn decompile_input_honors_engine_selected_route() {
         let arch = test_arch_for_decompile();
         let prepared = prepared_from_ops(
@@ -5501,68 +5521,6 @@ mod tests {
     }
 
     #[test]
-    fn build_function_from_input_standard_route_cannot_authorize_executable_ast() {
-        let arch = test_arch_for_decompile();
-        let prepared = prepared_from_ops(
-            vec![R2ILOp::Return {
-                target: Varnode::constant(0, 8),
-            }],
-            &arch,
-        );
-        let input = source_owned_decompiler_input(
-            prepared,
-            (
-                r2types::DecompileRouteKind::Standard,
-                "standard route request",
-                None,
-            ),
-        );
-
-        let built = Decompiler::new(DecompilerConfig::x86_64()).build_function_from_input(&input);
-
-        assert!(
-            format!("{:?}", built.body).contains("Standard executable rendering is unavailable"),
-            "source-owned Standard route should explain the residual: {:?}",
-            built.body
-        );
-        assert!(
-            !built
-                .body
-                .iter()
-                .any(|stmt| matches!(stmt, CStmt::Return(_))),
-            "source-owned Standard route must not produce executable returns: {:?}",
-            built.body
-        );
-        assert!(
-            built.locals.is_empty(),
-            "source-owned Standard route must fail closed before local recovery: {:?}",
-            built.locals
-        );
-
-        let decompiler =
-            Decompiler::new(DecompilerConfig::x86_64()).with_context(input.context_projection());
-        let route = decompiler
-            .context
-            .function_facts
-            .decompile_route()
-            .expect("test route");
-        let direct_built = decompiler.build_function_internal(&input, route);
-        assert!(
-            direct_built
-                .body
-                .iter()
-                .all(|stmt| matches!(stmt, CStmt::Comment(_))),
-            "internal Standard path must fail closed before structuring executable C: {:?}",
-            direct_built.body
-        );
-        assert!(
-            direct_built.locals.is_empty(),
-            "internal Standard path must fail closed before local recovery: {:?}",
-            direct_built.locals
-        );
-    }
-
-    #[test]
     fn report_only_standard_summary_semantics_residualizes() {
         let semantic_report = test_native_semantic_report(
             r2sym::RefinementStage::Compiled,
@@ -5590,8 +5548,12 @@ mod tests {
         );
     }
 
+    /// A route the certification kernel did not claim used to lose its whole
+    /// function: rendering returned a single comment and nothing else, so one
+    /// unproven construct cost every proven one beside it. The structurer marks
+    /// what it cannot prove, so the function is rendered either way.
     #[test]
-    fn decompile_input_honors_source_owned_standard_residual() {
+    fn a_standard_route_renders_instead_of_refusing_the_whole_function() {
         let arch = test_arch_for_decompile();
         let prepared = prepared_from_ops(
             vec![R2ILOp::Return {
@@ -5608,13 +5570,109 @@ mod tests {
             ),
         );
 
-        let output = Decompiler::new(DecompilerConfig::x86_64()).decompile_input(&input);
-
-        assert!(output.contains("r2dec residual"), "{output}");
+        let decompiler = Decompiler::new(DecompilerConfig::x86_64());
+        let built = decompiler.build_function_from_input(&input);
         assert!(
-            output.contains("Standard executable rendering is unavailable"),
-            "{output}"
+            built
+                .body
+                .iter()
+                .any(|stmt| matches!(stmt, CStmt::Return(_))),
+            "standard route must render its return, got {:?}",
+            built.body
         );
+        assert!(
+            !format!("{:?}", built.body).contains("Standard executable rendering is unavailable"),
+            "standard route must not refuse the function wholesale: {:?}",
+            built.body
+        );
+
+        let output = decompiler.decompile_input(&input);
+        assert!(output.contains("return"), "{output}");
+    }
+
+    /// Nothing in this function is unproven, so it carries no proof note. A
+    /// note on clean output would be noise readers learn to ignore.
+    #[test]
+    fn a_fully_proven_function_carries_no_proof_note() {
+        let mut func = CFunction::new("proven".to_string(), CType::Unknown);
+        func.body = vec![CStmt::Return(Some(CExpr::IntLit(0)))];
+        note_unproven_constructs(&mut func, true);
+        assert!(
+            !format!("{:?}", func.body).contains("r2dec proof:"),
+            "{:?}",
+            func.body
+        );
+    }
+
+    /// The marks the structurer leaves are counted wherever they sit, including
+    /// inside a loop or a switch arm, and the function says how many it carries.
+    #[test]
+    fn unproven_constructs_are_counted_through_nested_bodies() {
+        let mut func = CFunction::new("partly_proven".to_string(), CType::Unknown);
+        func.body = vec![
+            CStmt::comment("r2dec residual: unresolved branch condition at 0x1000"),
+            CStmt::While {
+                cond: CExpr::IntLit(1),
+                body: Box::new(CStmt::Block(vec![CStmt::comment(
+                    "r2dec residual: uncertified loop structure at 0x1010",
+                )])),
+            },
+            CStmt::Return(Some(CExpr::IntLit(0))),
+        ];
+        assert_eq!(count_residual_markers(&func.body), 2);
+
+        note_unproven_constructs(&mut func, true);
+        let note = match func.body.first() {
+            Some(CStmt::Comment(text)) => text.clone(),
+            other => panic!("expected a leading proof note, got {other:?}"),
+        };
+        assert!(note.contains("r2dec proof: certified route"), "{note}");
+        assert!(note.contains("2 constructs are marked below"), "{note}");
+        assert!(
+            func.body
+                .iter()
+                .any(|stmt| matches!(stmt, CStmt::Return(_))),
+            "the proven return survives beside the marks: {:?}",
+            func.body
+        );
+    }
+
+    /// An uncertified route says so even when the structurer marked nothing,
+    /// because "nothing was marked" is not the same claim as "everything was
+    /// proven". Without this the near-miss aggregate fixture rendered a bare
+    /// `return` with no indication the kernel never claimed it.
+    #[test]
+    fn an_uncertified_route_says_so_even_with_nothing_marked() {
+        let mut func = CFunction::new("unclaimed".to_string(), CType::Unknown);
+        func.body = vec![CStmt::Return(Some(CExpr::IntLit(0)))];
+        note_unproven_constructs(&mut func, false);
+        let note = match func.body.first() {
+            Some(CStmt::Comment(text)) => text.clone(),
+            other => panic!("expected a leading proof note, got {other:?}"),
+        };
+        assert!(
+            note.contains("rendered without kernel certification"),
+            "{note}"
+        );
+        assert!(note.contains("no individual construct is marked"), "{note}");
+    }
+
+    /// Rendering nothing is not the same as proving the function does nothing.
+    /// An empty body reads as "this function has no effects", so a render that
+    /// produced no statements says that instead of implying it.
+    #[test]
+    fn a_body_that_rendered_nothing_says_so_rather_than_reading_as_empty() {
+        let mut func = CFunction::new("nothing_rendered".to_string(), CType::Unknown);
+        func.body = Vec::new();
+        note_unproven_constructs(&mut func, false);
+        let text = format!("{:?}", func.body);
+        assert!(
+            text.contains(
+                "r2dec proof: rendered without kernel certification, rendering produced no statements"
+            ),
+            "{text}"
+        );
+        assert_eq!(func.body.len(), 1, "one statement says it, not two: {text}");
     }
 
     #[test]

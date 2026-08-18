@@ -8282,8 +8282,13 @@ mod integration_tests {
                 )
             });
         assert_eq!(len_home.name, "arg1");
+        // Legacy facts stay inspectable and the render stays honest about its
+        // status: the output is marked as uncertified rather than withheld.
         assert!(
-            response.output.contains("r2dec residual:")
+            (response.output.contains("r2dec residual:")
+                || response
+                    .output
+                    .contains("r2dec proof: rendered without kernel certification"))
                 && !response.output.contains("for (int32_t var_14h = 0;")
                 && !response.output.contains("return var_10h;"),
             "legacy facts must remain inspectable without authorizing production executable C; output={} render_facts={:?}",
