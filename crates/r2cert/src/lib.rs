@@ -1041,6 +1041,27 @@ pub enum CertifiedCallArgumentOrigin {
     AbiParameter { index: u32 },
 }
 
+/// The value a call leaves in its result carrier.
+///
+/// This names where the callee's result lands and which value carries it. It
+/// claims nothing about what the callee computed: the convention fixes the
+/// carrier, and the value is simply whatever the call defined there.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CertifiedCallResult {
+    slot: CallBoundarySlot,
+    value: MachineValueUse,
+}
+
+impl CertifiedCallResult {
+    pub const fn slot(&self) -> CallBoundarySlot {
+        self.slot
+    }
+
+    pub const fn value(&self) -> &MachineValueUse {
+        &self.value
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CertifiedCallArgument {
     slot: CallBoundarySlot,
@@ -1088,6 +1109,9 @@ pub struct CertifiedDirectCall {
     target_value: MachineValueUse,
     calling_convention: String,
     arguments: Box<[CertifiedCallArgument]>,
+    /// Absent for a void call. Present when the convention gives the callee a
+    /// result carrier and the call defines it.
+    result: Option<CertifiedCallResult>,
     call_obligation: SemanticObligationId,
 }
 
@@ -1122,6 +1146,10 @@ impl CertifiedDirectCall {
 
     pub fn calling_convention(&self) -> &str {
         &self.calling_convention
+    }
+
+    pub const fn result(&self) -> Option<&CertifiedCallResult> {
+        self.result.as_ref()
     }
 
     pub const fn arguments(&self) -> &[CertifiedCallArgument] {
@@ -5585,15 +5613,13 @@ fn certified_direct_calls(
             || !interface.is_complete()
             || interface.is_variadic()
             || interface.is_noreturn()
-            || !matches!(interface.result(), SourceCallResult::Void)
             || !boundary.complete
             || boundary.call_site != call_site_id
             || boundary.at != inst.id
             || boundary.calling_convention.as_deref() != Some(interface.calling_convention())
             || boundary.variadic != Some(false)
             || boundary.noreturn != Some(false)
-            || boundary.result_kind != Some(SourceCallResult::Void)
-            || !boundary.results.is_empty()
+            || boundary.result_kind != Some(interface.result())
             || boundary.arguments.len() != interface.arguments().len()
         {
             continue;
@@ -5691,6 +5717,41 @@ fn certified_direct_calls(
                 })
             })
             .collect::<Result<Vec<_>, MachineBuildError>>()?;
+        // The convention names the result carrier; the boundary names the value
+        // the call defined there. Both must agree, or the call is not certified.
+        let result = match interface.result() {
+            SourceCallResult::Void => {
+                if !boundary.results.is_empty() {
+                    continue;
+                }
+                None
+            }
+            SourceCallResult::Register { storage } => {
+                let [fact] = boundary.results.as_slice() else {
+                    continue;
+                };
+                if fact.slot
+                    != (CallBoundarySlot::Register {
+                        index: 0,
+                        storage,
+                    })
+                {
+                    continue;
+                }
+                let Ok(value_use) = MachineValueUse::from_artifact(artifact, fact.value) else {
+                    continue;
+                };
+                if value_use.binding().width_bits()
+                    != storage.size.checked_mul(8).unwrap_or(0)
+                {
+                    continue;
+                }
+                Some(CertifiedCallResult {
+                    slot: fact.slot,
+                    value: value_use,
+                })
+            }
+        };
         let call_obligation = SemanticObligationId {
             instruction: producer,
             kind: SemanticObligationKind::Call,
@@ -5708,6 +5769,7 @@ fn certified_direct_calls(
         }
         let call = CertifiedDirectCall {
             schema_version: CERTIFICATION_SCHEMA_VERSION,
+            result,
             producer,
             source_inst: inst.id,
             call_site: call_site_id,
