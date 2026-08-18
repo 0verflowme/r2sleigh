@@ -355,10 +355,10 @@ FILE=bins/r2sleigh_vuln_test_x86_64_macho_O2_v1
 ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
 EXPECT=<<EOF
 sla: loaded architecture 'x86-64'
-bool sub_100000790(int32_t arg0, int32_t arg1)
+bool sub_100000790(int32_t a, int32_t b)
 {
     /* r2dec proof: rendered without kernel certification, no individual construct is marked */
-    return (arg0 + arg1 ^ 100 | arg0 - arg1 ^ 20) == 0;
+    return (a + b ^ 100 | a - b ^ 20) == 0;
 }
 
 EOF

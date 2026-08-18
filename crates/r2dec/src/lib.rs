@@ -1809,6 +1809,24 @@ fn is_summary_ident_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || byte == b'_'
 }
 
+/// Name a parameter the way the source named it, where it did.
+///
+/// The renderer's own fallback is `argN`, which says only the position. The
+/// source often knows better - debug info called it `password` - and that name
+/// travelled with the snapshot all along. It is applied only where a real name
+/// exists, and never over one an external signature already supplied, because
+/// a parsed signature is the more specific statement.
+fn apply_source_parameter_names(params: &mut [ast::CParam], display_names: &r2types::DisplayNames) {
+    for (index, param) in params.iter_mut().enumerate() {
+        if !is_generic_arg_name(&param.name) {
+            continue;
+        }
+        if let Some(name) = display_names.parameter(index) {
+            param.name = name.to_string();
+        }
+    }
+}
+
 fn merge_params_with_external_signature(
     recovered_params: Vec<ast::CParam>,
     signature: Option<&FunctionSignatureSpec>,
@@ -2880,13 +2898,14 @@ impl Decompiler {
                 )
             })
             .collect();
-        let params = merge_params_with_external_signature(
+        let mut params = merge_params_with_external_signature(
             recovered_param_infos
                 .iter()
                 .map(|(_, param)| param.clone())
                 .collect(),
             render_signature,
         );
+        apply_source_parameter_names(&mut params, self.context.function_facts.display_names());
         let param_register_aliases = build_param_register_aliases(
             &params,
             &recovered_param_infos,

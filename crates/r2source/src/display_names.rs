@@ -23,6 +23,12 @@ pub struct DisplayNames {
     functions: BTreeMap<u64, String>,
     symbols: BTreeMap<u64, String>,
     strings: BTreeMap<u64, String>,
+    /// The function's own parameters, in order.
+    ///
+    /// Positional rather than address-keyed, because a parameter is identified
+    /// by where it sits in the signature and not by a place in memory. Still a
+    /// spelling and nothing more: it does not say what the parameter is for.
+    parameters: Vec<String>,
 }
 
 impl DisplayNames {
@@ -30,9 +36,12 @@ impl DisplayNames {
         Self::default()
     }
 
-    /// True when there is nothing to say about any address.
+    /// True when there is nothing to say about anything.
     pub fn is_empty(&self) -> bool {
-        self.functions.is_empty() && self.symbols.is_empty() && self.strings.is_empty()
+        self.functions.is_empty()
+            && self.symbols.is_empty()
+            && self.strings.is_empty()
+            && self.parameters.is_empty()
     }
 
     /// Record the name of a function that starts at `addr`.
@@ -51,6 +60,44 @@ impl DisplayNames {
     /// Record the string literal stored at `addr`.
     pub fn insert_string(&mut self, addr: u64, value: impl Into<String>) {
         insert_named(&mut self.strings, addr, value.into());
+    }
+
+    /// Record the function's parameter names, in signature order.
+    ///
+    /// A generic placeholder is not a name: recording `arg0` would displace the
+    /// renderer's own fallback with something no more informative, and would
+    /// hide that the source never said.
+    pub fn set_parameters<I, S>(&mut self, names: I)
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.parameters = names
+            .into_iter()
+            .map(Into::into)
+            .map(|name| {
+                if is_placeholder_parameter_name(&name) {
+                    String::new()
+                } else {
+                    name
+                }
+            })
+            .collect();
+        while matches!(self.parameters.last(), Some(name) if name.is_empty()) {
+            self.parameters.pop();
+        }
+    }
+
+    /// The name the source gave parameter `index`, if it gave one.
+    pub fn parameter(&self, index: usize) -> Option<&str> {
+        self.parameters
+            .get(index)
+            .map(String::as_str)
+            .filter(|name| !name.is_empty())
+    }
+
+    pub fn parameters(&self) -> &[String] {
+        &self.parameters
     }
 
     pub fn functions(&self) -> &BTreeMap<u64, String> {
@@ -90,7 +137,27 @@ impl DisplayNames {
         for (addr, value) in &other.strings {
             self.strings.entry(*addr).or_insert_with(|| value.clone());
         }
+        if self.parameters.is_empty() {
+            self.parameters = other.parameters.clone();
+        }
     }
+}
+
+/// Whether a name is one of the placeholders a tool invents when it has none.
+fn is_placeholder_parameter_name(name: &str) -> bool {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    for prefix in ["arg", "param", "a", "p"] {
+        if let Some(rest) = trimmed.strip_prefix(prefix)
+            && !rest.is_empty()
+            && rest.bytes().all(|byte| byte.is_ascii_digit())
+        {
+            return true;
+        }
+    }
+    false
 }
 
 fn insert_named(map: &mut BTreeMap<u64, String>, addr: u64, name: String) {
@@ -129,6 +196,28 @@ mod tests {
         names.insert_symbol(0x3000, "");
         names.insert_string(0x3000, "");
         assert!(names.is_empty());
+    }
+
+    /// `arg0` is what the renderer already falls back to, so recording it as
+    /// though the source had said it would hide that the source said nothing.
+    #[test]
+    fn a_placeholder_parameter_name_is_not_recorded() {
+        let mut names = DisplayNames::new();
+        names.set_parameters(["password", "arg1", "", "len"]);
+        assert_eq!(names.parameter(0), Some("password"));
+        assert_eq!(names.parameter(1), None);
+        assert_eq!(names.parameter(2), None);
+        assert_eq!(names.parameter(3), Some("len"));
+        assert_eq!(names.parameter(4), None);
+    }
+
+    /// Trailing placeholders carry nothing, so the list stops at the last name
+    /// the source actually gave.
+    #[test]
+    fn trailing_placeholders_are_dropped() {
+        let mut names = DisplayNames::new();
+        names.set_parameters(["msg", "arg1", "arg2"]);
+        assert_eq!(names.parameters().len(), 1);
     }
 
     #[test]
