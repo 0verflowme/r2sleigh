@@ -35,6 +35,7 @@ pub mod machine;
 pub mod machine_context;
 mod naming;
 pub mod obligation;
+pub mod recover_interface;
 pub mod op;
 pub mod optimize;
 pub mod phi;
