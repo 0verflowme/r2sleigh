@@ -145,7 +145,6 @@ pub(crate) struct UseInfo {
     pub(crate) direct_call_result_aliases: HashSet<String>,
     pub(crate) switch_selector_roots: BTreeMap<u64, SemanticValue>,
     pub(crate) consumed_by_call: HashSet<String>,
-    pub(crate) inlined_call_results: HashSet<(u64, usize)>,
     pub(crate) var_aliases: HashMap<String, String>,
     pub(crate) type_hints: HashMap<String, CType>,
     pub(crate) stack_slots: HashMap<String, StackSlotProvenance>,

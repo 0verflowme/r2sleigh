@@ -9233,50 +9233,6 @@ mod tests {
     }
 
     #[test]
-    fn test_prune_dead_temp_assignments_drops_dead_replayed_call_result() {
-        let mut ctx = make_aarch64_ctx();
-        let source_call = (0x1000, 0);
-        ctx.state.analysis_ctx.use_info.call_result_aliases.insert(
-            source_call,
-            BTreeSet::from(["x0_3".to_string(), "x0_4".to_string()]),
-        );
-        ctx.state
-            .analysis_ctx
-            .use_info
-            .call_result_source_by_alias
-            .insert("x0_3".to_string(), source_call);
-        ctx.state
-            .analysis_ctx
-            .use_info
-            .call_result_source_by_alias
-            .insert("x0_4".to_string(), source_call);
-        let call = CExpr::call(CExpr::Var("fcn.1000".to_string()), vec![CExpr::IntLit(16)]);
-        ctx.state
-            .analysis_ctx
-            .use_info
-            .call_result_exprs
-            .insert(source_call, call.clone());
-        let stmts = vec![
-            CStmt::Expr(CExpr::assign(CExpr::Var("x0_3".to_string()), call.clone())),
-            CStmt::Expr(CExpr::assign(CExpr::Var("x0_4".to_string()), call)),
-            CStmt::Return(Some(CExpr::Var("x0_3".to_string()))),
-        ];
-
-        let pruned = ctx.prune_dead_temp_assignments(stmts);
-
-        assert_eq!(
-            pruned,
-            vec![
-                CStmt::Expr(CExpr::assign(
-                    CExpr::Var("x0_3".to_string()),
-                    CExpr::call(CExpr::Var("fcn.1000".to_string()), vec![CExpr::IntLit(16)]),
-                )),
-                CStmt::Return(Some(CExpr::Var("x0_3".to_string()))),
-            ]
-        );
-    }
-
-    #[test]
     fn test_prune_dead_temp_assignments_keeps_source_less_duplicate_bare_replayed_call() {
         let mut ctx = make_aarch64_ctx();
         let source_call = (0x1000, 0);
@@ -9375,59 +9331,6 @@ mod tests {
                 CStmt::Return(Some(CExpr::IntLit(0))),
             ],
             "a source-less bare rendered call does not prove the later side effect is the same source call"
-        );
-    }
-
-    #[test]
-    fn test_prune_dead_temp_assignments_drops_earlier_same_target_replayed_assignment() {
-        let mut ctx = make_aarch64_ctx();
-        let source_call = (0x1000, 0);
-        let source_id = CallSiteId::from(source_call);
-        ctx.state.analysis_ctx.ownership.call_ownership.insert(
-            source_id,
-            CallOwnershipFact {
-                source: source_id,
-                owner: Some(CallOwner {
-                    visible_name: "owned_result".to_string(),
-                    kind: CallOwnerKind::StableLocal,
-                }),
-                aliases: BTreeSet::new(),
-                direct_aliases: BTreeSet::new(),
-            },
-        );
-        ctx.state
-            .analysis_ctx
-            .ownership
-            .visible_owner_sources
-            .insert("owned_result".to_string(), source_id);
-        let call = CExpr::call(CExpr::Var("fcn.1000".to_string()), vec![CExpr::IntLit(16)]);
-        ctx.state
-            .analysis_ctx
-            .use_info
-            .call_result_exprs
-            .insert(source_call, call.clone());
-        let live_assignment = CStmt::Expr(CExpr::assign(
-            CExpr::Var("owned_result".to_string()),
-            call.clone(),
-        ));
-        let stmts = vec![
-            CStmt::Expr(CExpr::assign(
-                CExpr::Var("owned_result".to_string()),
-                call.clone(),
-            )),
-            live_assignment.clone(),
-            CStmt::Return(Some(CExpr::Var("owned_result".to_string()))),
-        ];
-
-        let pruned = ctx.prune_dead_temp_assignments(stmts);
-
-        assert_eq!(
-            pruned,
-            vec![
-                live_assignment,
-                CStmt::Return(Some(CExpr::Var("owned_result".to_string()))),
-            ],
-            "earlier same-target replayed assignment should drop once a later live assignment owns the source",
         );
     }
 

@@ -290,7 +290,6 @@ fn rerun_semantic_call_analysis_after_result_binding(
     control.poll()?;
     scratch.info.call_args.clear();
     scratch.info.consumed_by_call.clear();
-    scratch.info.inlined_call_results.clear();
     populate_stable_stack_values(scratch, blocks, env);
     populate_frame_object_field_roots(scratch, blocks, env);
     populate_stable_memory_values(scratch, blocks, env);
@@ -310,7 +309,6 @@ struct CallArgCandidate {
 }
 
 type StackCallArg = (i64, CallArgBinding, String, String);
-type StackCallArgCollection = (Vec<StackCallArg>, HashSet<(u64, usize)>);
 
 struct PostCallResultQuery<'a, 'b> {
     info: &'a UseInfo,
@@ -491,8 +489,6 @@ pub(crate) fn preserve_authoritative_facts(info: &mut UseInfo, baseline: &UseInf
 
     info.consumed_by_call
         .extend(baseline.consumed_by_call.iter().cloned());
-    info.inlined_call_results
-        .extend(baseline.inlined_call_results.iter().copied());
 
     for (key, value) in &baseline.forwarded_values {
         if !info.forwarded_values.contains_key(key) {
@@ -5351,7 +5347,6 @@ fn analyze_call_args(scratch: &mut UseScratch, blocks: &[SSABlock], env: &PassEn
                 env,
             };
             let mut found_regs: BTreeMap<String, CallArgCandidate> = BTreeMap::new();
-            let mut direct_inlined_call_results = HashSet::new();
             let mut i = call_idx;
             while i > 0 {
                 i -= 1;
@@ -5395,7 +5390,6 @@ fn analyze_call_args(scratch: &mut UseScratch, blocks: &[SSABlock], env: &PassEn
                                 });
                         let mut binding = result_candidate
                             .map(|(result_call_idx, expr)| {
-                                direct_inlined_call_results.insert((block.addr, result_call_idx));
                                 CallArgBinding::result(SemanticCallArg::FallbackExpr(expr))
                                     .with_source_call(block.addr, result_call_idx)
                             })
@@ -5511,10 +5505,6 @@ fn analyze_call_args(scratch: &mut UseScratch, blocks: &[SSABlock], env: &PassEn
             let mut consumed_keys = Vec::new();
             let imported_like_call_target =
                 call_target_uses_imported_like_args(block.addr, call_idx, op, env);
-            scratch
-                .info
-                .inlined_call_results
-                .extend(direct_inlined_call_results);
             for reg in env.arg_regs {
                 if let Some(candidate) = found_regs.remove(reg) {
                     args.push(candidate.binding);
@@ -5538,7 +5528,7 @@ fn analyze_call_args(scratch: &mut UseScratch, blocks: &[SSABlock], env: &PassEn
                     break;
                 }
             }
-            let (stack_args, inlined_call_results) = collect_immediate_stack_call_args(
+            let stack_args = collect_immediate_stack_call_args(
                 block.addr,
                 ops,
                 call_idx,
@@ -5547,10 +5537,6 @@ fn analyze_call_args(scratch: &mut UseScratch, blocks: &[SSABlock], env: &PassEn
                 &scratch.info,
                 env,
             );
-            scratch
-                .info
-                .inlined_call_results
-                .extend(inlined_call_results);
             if imported_like_call_target
                 || should_append_unknown_stack_args(&scratch.info, &args, &stack_args, env)
             {
@@ -5806,10 +5792,16 @@ fn bind_call_result_alias_definitions(
                 continue;
             }
 
+            // The alias records what this operand holds. It does not license
+            // dropping the call: whether the operand is ever printed is
+            // decided later and may well be no, and a call suppressed here in
+            // favour of a reader that is itself discarded disappears from the
+            // output entirely. The call is emitted at its own site, and a
+            // second rendering reached through the alias is collapsed back to
+            // a mention of the first once the body is complete.
             record_call_result_alias(info, (block.addr, call_idx), &src_key);
             record_direct_call_result_alias(info, &src_key);
             info.insert_definition_for_var(src, call_expr.clone());
-            info.inlined_call_results.insert((block.addr, call_idx));
             if let Some(call_result_defs) = call_result_defs.as_deref_mut() {
                 call_result_defs.insert(src_key.clone(), call_expr.clone());
                 call_result_defs.insert(src_key.to_ascii_lowercase(), call_expr.clone());
@@ -6410,17 +6402,16 @@ fn collect_immediate_stack_call_args(
     lower: &LowerCtx<'_>,
     info: &UseInfo,
     env: &PassEnv<'_>,
-) -> StackCallArgCollection {
+) -> Vec<StackCallArg> {
     let uses_arm64_arg_regs = env
         .arg_regs
         .first()
         .is_some_and(|reg| reg.starts_with('x') || reg.starts_with('w'));
     if !uses_arm64_arg_regs {
-        return (Vec::new(), HashSet::new());
+        return Vec::new();
     }
 
     let mut args = Vec::new();
-    let mut inlined_call_results = HashSet::new();
     let mut owned_result_source_calls = HashSet::new();
     let mut seen_offsets = HashSet::new();
     let mut collecting = false;
@@ -6522,7 +6513,6 @@ fn collect_immediate_stack_call_args(
                             call_result_candidate
                                 .clone()
                                 .map(|(call_idx, expr)| {
-                                    inlined_call_results.insert((block_addr, call_idx));
                                     CallArgBinding::result(SemanticCallArg::FallbackExpr(expr))
                                         .with_source_call(block_addr, call_idx)
                                 })
@@ -6596,7 +6586,7 @@ fn collect_immediate_stack_call_args(
     }
 
     args.sort_by_key(|(offset, _, _, _)| *offset);
-    (args, inlined_call_results)
+    args
 }
 
 fn preserved_input_binding_from_stack_home(

@@ -2065,9 +2065,6 @@ impl<'a> FoldingContext<'a> {
     pub(crate) fn consumed_by_call_set(&self) -> &HashSet<String> {
         &self.use_info().consumed_by_call
     }
-    pub(crate) fn inlined_call_result_set(&self) -> &HashSet<(u64, usize)> {
-        &self.use_info().inlined_call_results
-    }
     pub(crate) fn var_aliases_map(&self) -> &HashMap<String, String> {
         &self.use_info().var_aliases
     }
@@ -13663,37 +13660,6 @@ impl<'a> FoldingContext<'a> {
             return self
                 .should_materialize_call_result_at_source((block.addr, op_idx))
                 .is_none();
-        }
-
-        if self
-            .inlined_call_result_set()
-            .contains(&(block.addr, op_idx))
-        {
-            if self
-                .should_materialize_call_result_at_source((block.addr, op_idx))
-                .is_some()
-            {
-                return false;
-            }
-            return true;
-        }
-
-        let mut next_idx = op_idx + 1;
-        while let Some(SSAOp::CallDefine { dst }) = block.ops.get(next_idx) {
-            let key = dst.display_name();
-            let has_stable_visible_owner = self
-                .stable_owned_call_result_name_for_source((block.addr, op_idx))
-                .is_some_and(|owner| {
-                    !self.is_low_signal_visible_name(&owner)
-                        && !self.is_transient_visible_name(&owner)
-                });
-            if self.should_inline(dst)
-                && matches!(self.definition_for_name(&key), Some(CExpr::Call { .. }))
-                && has_stable_visible_owner
-            {
-                return true;
-            }
-            next_idx += 1;
         }
 
         false

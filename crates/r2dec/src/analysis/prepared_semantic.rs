@@ -19,8 +19,7 @@ use super::{
 };
 use crate::analysis::utils::{
     compare_const_to_expr, compare_const_to_expr_with_width, is_cpu_flag,
-    is_generic_stack_placeholder_alias, is_temporary_constant_or_memory_name,
-    is_temporary_or_memory_name, parse_const_value,
+    is_temporary_constant_or_memory_name, is_temporary_or_memory_name, parse_const_value,
 };
 use crate::ast::{BinaryOp, CExpr, UnaryOp};
 
@@ -380,7 +379,6 @@ pub(crate) fn build_prepared_runtime_facts_with_control(
     overlay_local_struct_semantics(&mut use_info, blocks, env, control)?;
     overlay_prepared_switch_roots(&mut use_info, prepared, view);
     populate_prepared_render_definitions(&mut use_info, blocks, env);
-    finalize_prepared_call_inlining(&mut use_info);
 
     control.poll()?;
     Ok(DecompilerFacts {
@@ -3249,31 +3247,6 @@ fn overlay_prepared_switch_roots(
                     .unwrap_or_else(|| ValueRef::new(selector.clone())),
             )),
         );
-    }
-}
-
-fn finalize_prepared_call_inlining(use_info: &mut UseInfo) {
-    for (site, aliases) in &use_info.call_result_aliases {
-        if aliases.iter().any(|alias| {
-            !use_info.direct_call_result_aliases.contains(alias)
-                && !is_generic_stack_placeholder_alias(alias)
-                && use_info
-                    .call_result_exprs
-                    .get(site)
-                    .is_some_and(|_| use_info.use_counts.get(alias).copied().unwrap_or(0) <= 1)
-        }) {
-            use_info.inlined_call_results.insert(*site);
-            continue;
-        }
-
-        if aliases.iter().any(|alias| {
-            use_info.call_result_exprs.get(site).is_some_and(|_| {
-                !use_info.direct_call_result_aliases.contains(alias)
-                    && use_info.use_counts.get(alias).copied().unwrap_or(0) <= 1
-            })
-        }) {
-            use_info.inlined_call_results.insert(*site);
-        }
     }
 }
 

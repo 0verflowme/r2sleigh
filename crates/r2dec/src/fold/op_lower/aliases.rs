@@ -639,21 +639,9 @@ impl<'a> FoldingContext<'a> {
                     && self.expr_contains_unresolved_memory(rhs);
                 let observable_call_result_owner = self
                     .call_result_candidate_names_have_observable_use(&call_result_candidate_names);
-                let replayed_call_result_has_live_owner = call_result_candidate_names
-                    .iter()
-                    .any(|candidate| live.contains(candidate));
                 let rhs_call_source = matches!(rhs, CExpr::Call { .. })
                     .then_some(source_call_for_target)
                     .flatten();
-                let replayed_call_result_has_live_expr =
-                    rhs_call_source.is_some_and(|source| live_call_sources.contains(&source));
-                let replayed_call_result_has_later_same_assignment =
-                    rhs_call_source.is_some_and(|source| {
-                        live_call_assignment_sources
-                            .contains(&(source, target.to_ascii_lowercase()))
-                    });
-                let replayed_call_result_reuses_target_as_input =
-                    self.call_expr_args_contain_var_name(rhs, target);
                 let target_is_named_stack_owner =
                     self.stack_slot_provenance_for_name(target).is_some()
                         || self.stack_offset_for_visible_storage_name(target).is_some()
@@ -680,15 +668,6 @@ impl<'a> FoldingContext<'a> {
                     && (self.is_low_signal_visible_name(target)
                         || self.is_transient_visible_name(target)
                         || self.inputs.arch.is_return_register_name(&target_base));
-                let dead_replayed_call_result = (((!target_has_live_use
-                    || replayed_call_result_reuses_target_as_input)
-                    && replayed_call_result_has_live_expr)
-                    || replayed_call_result_has_later_same_assignment)
-                    && matches!(rhs, CExpr::Call { .. })
-                    && (replayed_call_result_has_later_same_assignment
-                        || replayed_call_result_reuses_target_as_input
-                        || self.is_low_signal_visible_name(target)
-                        || self.is_prunable_dead_binding_target(target));
                 let dead_transient_call_result = !target_has_live_use
                     && !target_is_pinned
                     && (dead_return_register_owner
@@ -699,8 +678,6 @@ impl<'a> FoldingContext<'a> {
                     && !protected_named_call_result_owner
                     && (self.is_low_signal_visible_name(target)
                         || self.is_prunable_dead_binding_target(target));
-                let dead_replayed_call_result = dead_replayed_call_result
-                    || (dead_transient_call_result && replayed_call_result_has_live_owner);
                 let dead_ephemeral = self.is_prunable_dead_binding_target(target)
                     && !target_is_pinned
                     && !target_has_live_use
@@ -709,9 +686,13 @@ impl<'a> FoldingContext<'a> {
                 let dead_flag_artifact =
                     is_cpu_flag(&target_lower) && !target_has_live_use && self.expr_is_pure(rhs);
 
-                if dead_replayed_call_result {
-                    true
-                } else if dead_transient_call_result {
+                // A call is an event, so a statement carrying one can lose its
+                // target when nothing reads the result, but it can never be
+                // deleted: the program still makes the call. Deciding that a
+                // second rendering of the same site is redundant is not this
+                // pass's judgement to make -- rendering each site once is
+                // settled before the output is pruned.
+                if dead_transient_call_result {
                     stmt = CStmt::Expr(rhs.clone());
                     (reads, def) = self.stmt_reads_and_def(&stmt);
                     false
@@ -719,7 +700,10 @@ impl<'a> FoldingContext<'a> {
                     dead_ephemeral || dead_flag_artifact || dead_certified_raw_memory_carrier
                 }
             } else {
-                false
+                // A statement that is only an expression, and whose evaluation
+                // does nothing, says nothing. Naming a value without using it
+                // is not an observation the program makes.
+                matches!(&stmt, CStmt::Expr(expr) if self.expr_is_pure(expr))
             };
 
             if drop_stmt {
@@ -811,25 +795,6 @@ impl<'a> FoldingContext<'a> {
         self.prune_dead_temp_assignments(rewritten)
     }
 
-    fn call_source_for_statement(&self, stmt: &CStmt) -> Option<(u64, usize)> {
-        match stmt {
-            CStmt::Expr(CExpr::Binary {
-                op: BinaryOp::Assign,
-                left,
-                right,
-                ..
-            }) if matches!(right.as_ref(), CExpr::Call { .. }) => {
-                let CExpr::Var(target) = left.as_ref() else {
-                    return None;
-                };
-                self.call_result_source_for_ssa_name(target)
-                    .or_else(|| self.local_post_call_source_for_ssa_name(target))
-                    .or_else(|| self.source_call_for_visible_owner_name(target))
-            }
-            _ => None,
-        }
-    }
-
     fn collect_call_sources_in_stmt(&self, stmt: &CStmt, out: &mut BTreeSet<(u64, usize)>) {
         match stmt {
             CStmt::Expr(expr)
@@ -915,22 +880,5 @@ impl<'a> FoldingContext<'a> {
         {
             out.insert((source, target.to_ascii_lowercase()));
         }
-    }
-
-    fn call_expr_args_contain_var_name(&self, expr: &CExpr, name: &str) -> bool {
-        let CExpr::Call { args, .. } = expr else {
-            return false;
-        };
-        args.iter().any(|arg| {
-            let mut found = false;
-            arg.visit(&mut |node| {
-                if let CExpr::Var(candidate) = node
-                    && candidate.eq_ignore_ascii_case(name)
-                {
-                    found = true;
-                }
-            });
-            found
-        })
     }
 }

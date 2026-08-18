@@ -211,7 +211,12 @@ fn rewrite_block(
         });
         out.extend(hoists);
 
+        // The same reasoning covers a bare call whose site is already bound:
+        // what is left mentions a value without using it, and says nothing.
         if reassigns_bound_site && is_self_assignment(&stmt) {
+            continue;
+        }
+        if matches!(&stmt, CStmt::Expr(CExpr::Var(_))) {
             continue;
         }
 
@@ -292,7 +297,14 @@ fn rewrite_expr(
 fn introduced_name_for(expr: &CExpr, introduced: &[String]) -> String {
     let callee = match expr {
         CExpr::Call { func, .. } => match func.as_ref() {
-            CExpr::Var(name) => name.rsplit('.').next().unwrap_or(name).to_string(),
+            CExpr::Var(name) => {
+                let tail = name.rsplit('.').next().unwrap_or(name);
+                if tail.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_') {
+                    tail.to_string()
+                } else {
+                    name.replace(|c: char| !c.is_ascii_alphanumeric(), "_")
+                }
+            }
             _ => "call".to_string(),
         },
         _ => "call".to_string(),
@@ -463,5 +475,179 @@ fn for_each_child_block_mut(stmt: &mut CStmt, f: &mut impl FnMut(&mut Vec<CStmt>
             }
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ast::{CLocal, CParam, CType};
+
+    fn call(name: &str) -> CExpr {
+        CExpr::Call {
+            func: Box::new(CExpr::Var(name.to_string())),
+            args: vec![CExpr::IntLit(16)],
+        }
+    }
+
+    fn assign(target: &str, value: CExpr) -> CStmt {
+        CStmt::Expr(CExpr::Binary {
+            op: BinaryOp::Assign,
+            left: Box::new(CExpr::Var(target.to_string())),
+            right: Box::new(value),
+        })
+    }
+
+    fn function(body: Vec<CStmt>) -> CFunction {
+        CFunction {
+            name: "f".to_string(),
+            ret_type: CType::Int(32),
+            params: Vec::<CParam>::new(),
+            locals: Vec::<CLocal>::new(),
+            body,
+            params_known: true,
+        }
+    }
+
+    fn one_site() -> BTreeMap<Source, CExpr> {
+        BTreeMap::from([((0x1000, 0), call("fcn.1000"))])
+    }
+
+    #[test]
+    fn a_second_assignment_of_the_same_site_becomes_a_copy() {
+        let mut func = function(vec![
+            assign("x0_3", call("fcn.1000")),
+            assign("x0_4", call("fcn.1000")),
+            CStmt::Return(Some(CExpr::Var("x0_3".to_string()))),
+        ]);
+
+        bind_each_call_site_once(&mut func, &one_site());
+
+        assert_eq!(
+            func.body,
+            vec![
+                assign("x0_3", call("fcn.1000")),
+                assign("x0_4", CExpr::Var("x0_3".to_string())),
+                CStmt::Return(Some(CExpr::Var("x0_3".to_string()))),
+            ]
+        );
+    }
+
+    #[test]
+    fn reassigning_the_same_target_leaves_nothing_to_say() {
+        let mut func = function(vec![
+            assign("owned", call("fcn.1000")),
+            assign("owned", call("fcn.1000")),
+            CStmt::Return(Some(CExpr::Var("owned".to_string()))),
+        ]);
+
+        bind_each_call_site_once(&mut func, &one_site());
+
+        assert_eq!(
+            func.body,
+            vec![
+                assign("owned", call("fcn.1000")),
+                CStmt::Return(Some(CExpr::Var("owned".to_string()))),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_site_nested_in_an_argument_is_bound_before_the_statement() {
+        let outer = CExpr::Call {
+            func: Box::new(CExpr::Var("use".to_string())),
+            args: vec![call("fcn.1000")],
+        };
+        let mut func = function(vec![
+            CStmt::Expr(outer),
+            assign("owned", call("fcn.1000")),
+            CStmt::Return(Some(CExpr::Var("owned".to_string()))),
+        ]);
+
+        bind_each_call_site_once(&mut func, &one_site());
+
+        assert_eq!(
+            func.body,
+            vec![
+                assign("owned", call("fcn.1000")),
+                CStmt::Expr(CExpr::Call {
+                    func: Box::new(CExpr::Var("use".to_string())),
+                    args: vec![CExpr::Var("owned".to_string())],
+                }),
+                CStmt::Return(Some(CExpr::Var("owned".to_string()))),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_site_the_body_never_names_gets_a_declared_binding() {
+        let mut func = function(vec![
+            CStmt::Expr(call("fcn.1000")),
+            CStmt::Return(Some(call("fcn.1000"))),
+        ]);
+
+        bind_each_call_site_once(&mut func, &one_site());
+
+        assert_eq!(
+            func.body,
+            vec![
+                assign("fcn_1000_result", call("fcn.1000")),
+                CStmt::Return(Some(CExpr::Var("fcn_1000_result".to_string()))),
+            ]
+        );
+        assert_eq!(func.locals.len(), 1);
+        assert_eq!(func.locals[0].name, "fcn_1000_result");
+    }
+
+    #[test]
+    fn sibling_branches_do_not_share_a_binding() {
+        let arm = |target: &str| {
+            Box::new(CStmt::Block(vec![
+                assign(target, call("fcn.1000")),
+                CStmt::Return(Some(CExpr::Var(target.to_string()))),
+            ]))
+        };
+        let mut func = function(vec![CStmt::If {
+            cond: CExpr::Var("c".to_string()),
+            then_body: arm("a"),
+            else_body: Some(arm("b")),
+        }]);
+        let before = func.body.clone();
+
+        bind_each_call_site_once(&mut func, &one_site());
+
+        assert_eq!(func.body, before);
+    }
+
+    #[test]
+    fn two_sites_that_render_alike_are_left_alone() {
+        let sites = BTreeMap::from([
+            ((0x1000, 0), call("fcn.1000")),
+            ((0x2000, 0), call("fcn.1000")),
+        ]);
+        let mut func = function(vec![
+            assign("a", call("fcn.1000")),
+            assign("b", call("fcn.1000")),
+            CStmt::Return(Some(CExpr::Var("b".to_string()))),
+        ]);
+        let before = func.body.clone();
+
+        bind_each_call_site_once(&mut func, &sites);
+
+        assert_eq!(func.body, before);
+    }
+
+    #[test]
+    fn a_site_rendered_once_is_untouched() {
+        let mut func = function(vec![
+            assign("a", call("fcn.1000")),
+            CStmt::Return(Some(CExpr::Var("a".to_string()))),
+        ]);
+        let before = func.body.clone();
+
+        bind_each_call_site_once(&mut func, &one_site());
+
+        assert_eq!(func.body, before);
+        assert!(func.locals.is_empty());
     }
 }
