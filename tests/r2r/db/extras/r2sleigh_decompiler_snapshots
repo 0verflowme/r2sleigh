@@ -13,7 +13,8 @@ int32_t dbg.test_bool_carrier_chain(int32_t x, int32_t y)
 EOF_EXPECT
 CMDS=<<EOF_CMDS
 aaaa
-a:sla.dec sym.test_bool_carrier_chain | python3 normalize_snapshot.py decompiler
+s sym.test_bool_carrier_chain > /dev/null
+pdd | python3 normalize_snapshot.py decompiler
 EOF_CMDS
 BROKEN=1
 RUN
@@ -40,8 +41,10 @@ int32_t dbg.complex_check(int32_t a, int32_t b)
 }
 EOF_EXPECT
 CMDS=<<EOF_CMDS
+a:sla > /dev/null
 aaa
-a:sla.dec sym.complex_check | python3 normalize_snapshot.py decompiler
+s sym.complex_check > /dev/null
+pdd | python3 normalize_snapshot.py decompiler
 EOF_CMDS
 BROKEN=1
 RUN
