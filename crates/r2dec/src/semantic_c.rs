@@ -649,10 +649,19 @@ pub struct SemanticCDirectCall {
     fallthrough: u64,
     calling_convention: String,
     arguments: Box<[SemanticCCallArgument]>,
+    /// The binding the call defines in its result carrier, absent for a void
+    /// call. Naming it lets a consumer render `v = callee(...)` without
+    /// claiming anything about what the callee computed.
+    result: Option<(MachineValueBinding, MachineType)>,
     source_obligations: BTreeSet<SemanticObligationId>,
 }
 
 impl SemanticCDirectCall {
+    /// Binding and type the call defines in its result carrier, if any.
+    pub const fn result(&self) -> Option<&(MachineValueBinding, MachineType)> {
+        self.result.as_ref()
+    }
+
     pub const fn producer(&self) -> CanonicalInstructionId {
         self.producer
     }
@@ -3966,6 +3975,9 @@ pub(crate) fn semantic_call_from_control(
         fallthrough: call.fallthrough(),
         calling_convention: call.calling_convention().to_string(),
         arguments: arguments.into_boxed_slice(),
+        result: call
+            .result()
+            .map(|result| (result.value().binding(), result.value().ty().clone())),
         source_obligations: call.source_obligations(),
     })
 }
