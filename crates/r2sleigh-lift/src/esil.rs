@@ -450,37 +450,98 @@ pub fn format_op(disasm: &Disassembler, op: &R2ILOp) -> String {
     }
 }
 
+/// Number of value bits a varnode carries, clamped to what ESIL can express.
+fn bit_width(v: &r2il::Varnode) -> u32 {
+    (v.size.max(1) * 8).min(64)
+}
+
+/// All-ones mask for `bits`, as an ESIL literal.
+fn mask_literal(bits: u32) -> String {
+    if bits >= 64 {
+        "0xffffffffffffffff".to_string()
+    } else {
+        format!("0x{:x}", (1u64 << bits) - 1)
+    }
+}
+
+/// Sign bit of a `bits`-wide value, as an ESIL literal.
+fn sign_bit_literal(bits: u32) -> String {
+    format!("0x{:x}", 1u64 << (bits.min(64) - 1))
+}
+
+/// ESIL leaves the zero flag, borrow and overflow of the previous `==` on
+/// `esil->old` / `esil->cur`, so every comparison below starts by pushing its
+/// operands into one `==` and then reads the flags it needs. `<` and `>` are
+/// deliberately unused: they compare signed against `esil->lastsz`, which is
+/// the width of the last register touched and is meaningless for the unique
+/// space temporaries most P-code operands live in.
+fn compare_prologue(a: &str, b: &str) -> String {
+    format!("{b},{a},==")
+}
+
+/// `$o` reports the overflow radare2's own lifters expect, except when the
+/// subtrahend is the sign bit itself; the extra term restores that case.
+fn signed_overflow_terms(b: &str, bits: u32) -> String {
+    format!("{},$o,{},{},-,!,^", bits - 1, sign_bit_literal(bits), b)
+}
+
 /// Convert an R2ILOp into an ESIL string.
 ///
-/// ESIL (Evaluable Strings Intermediate Language) uses reverse Polish notation:
-/// - `a,b,+` = a + b
+/// ESIL (Evaluable Strings Intermediate Language) uses reverse Polish notation
+/// in which the *last* operand pushed is the left-hand side of the operation:
+/// - `a,b,+` = b + a
+/// - `a,b,-` = b - a
 /// - `a,b,=` = b = a (assignment)
 /// - `a,[N]` = read N bytes from address a
 /// - `a,b,=[N]` = write N bytes of b to address a
 pub fn op_to_esil(disasm: &Disassembler, op: &R2ILOp) -> String {
     use r2il::R2ILOp::*;
 
-    // Helper to format varnode as lowercase ESIL operand
-    let vn = |v: &r2il::Varnode| disasm.format_varnode(v).to_lowercase();
+    // Helper to format varnode as a lowercase ESIL operand. A ram varnode names
+    // a memory cell, so reading its value is a load, not a bare address.
+    let vn = |v: &r2il::Varnode| -> String {
+        match v.space {
+            r2il::SpaceId::Ram => format!("0x{:x},[{}]", v.offset, v.size.clamp(1, 8)),
+            _ => disasm.format_varnode(v).to_lowercase(),
+        }
+    };
 
-    // Helper to get size suffix for memory operations
+    // The same varnode used as an address rather than as a value.
+    let vaddr = |v: &r2il::Varnode| -> String {
+        match v.space {
+            r2il::SpaceId::Ram => format!("0x{:x}", v.offset),
+            _ => disasm.format_varnode(v).to_lowercase(),
+        }
+    };
+
+    // Assignment suffix for a destination varnode.
+    let asg = |v: &r2il::Varnode| -> String {
+        match v.space {
+            r2il::SpaceId::Ram => format!("0x{:x},=[{}]", v.offset, v.size.clamp(1, 8)),
+            _ => format!("{},=", disasm.format_varnode(v).to_lowercase()),
+        }
+    };
+
+    // Helper to get size suffix for memory operations. ESIL only defines the
+    // widths below, so anything else is clamped rather than spelled as an
+    // operator radare2 would not recognise.
     let size_suffix = |size: u32| -> String {
         match size {
-            1 => "[1]".to_string(),
-            2 => "[2]".to_string(),
-            4 => "[4]".to_string(),
-            8 => "[8]".to_string(),
-            _ => format!("[{}]", size),
+            1 | 2 | 3 | 4 | 8 | 16 => format!("[{size}]"),
+            0 => "[1]".to_string(),
+            n if n < 8 => format!("[{}]", n.next_power_of_two()),
+            n if n < 16 => "[8]".to_string(),
+            _ => "[16]".to_string(),
         }
     };
 
     match op {
         // ========== Data Movement ==========
-        Copy { dst, src } => format!("{},{},=", vn(src), vn(dst)),
+        Copy { dst, src } => format!("{},{}", vn(src), asg(dst)),
 
         Load { dst, addr, .. } => {
             let sz = size_suffix(dst.size);
-            format!("{},{},{},=", vn(addr), sz, vn(dst))
+            format!("{},{},{}", vn(addr), sz, asg(dst))
         }
 
         Store { addr, val, .. } => {
@@ -490,7 +551,7 @@ pub fn op_to_esil(disasm: &Disassembler, op: &R2ILOp) -> String {
         Fence { .. } => String::new(),
         LoadLinked { dst, addr, .. } => {
             let sz = size_suffix(dst.size);
-            format!("{},{},{},=", vn(addr), sz, vn(dst))
+            format!("{},{},{}", vn(addr), sz, asg(dst))
         }
         StoreConditional {
             result, addr, val, ..
@@ -499,7 +560,7 @@ pub fn op_to_esil(disasm: &Disassembler, op: &R2ILOp) -> String {
             // Baseline LL/SC modeling: we only encode the success path in ESIL.
             // SC success is architecturally reported as 0 (non-zero means failure).
             match result {
-                Some(dst) => format!("{},{},={},0,{},=", vn(val), vn(addr), sz, vn(dst)),
+                Some(dst) => format!("{},{},={},0,{}", vn(val), vn(addr), sz, asg(dst)),
                 None => format!("{},{},={}", vn(val), vn(addr), sz),
             }
         }
@@ -511,13 +572,15 @@ pub fn op_to_esil(disasm: &Disassembler, op: &R2ILOp) -> String {
             ..
         } => {
             let sz = size_suffix(dst.size);
+            // `==` leaves nothing on the stack, so the branch condition has to
+            // come from the zero flag it sets.
             format!(
-                "{},{},{},={},{},==,?{{,{},{}={},}}",
+                "{},{},{},{},{},==,$z,?{{,{},{},={},}}",
                 vn(addr),
                 sz,
-                vn(dst),
-                vn(dst),
+                asg(dst),
                 vn(expected),
+                vn(dst),
                 vn(replacement),
                 vn(addr),
                 sz
@@ -527,7 +590,7 @@ pub fn op_to_esil(disasm: &Disassembler, op: &R2ILOp) -> String {
             dst, addr, guard, ..
         } => {
             let sz = size_suffix(dst.size);
-            format!("{},?{{,{},{},{},=,}}", vn(guard), vn(addr), sz, vn(dst))
+            format!("{},?{{,{},{},{},}}", vn(guard), vn(addr), sz, asg(dst))
         }
         StoreGuarded {
             addr, val, guard, ..
@@ -537,122 +600,199 @@ pub fn op_to_esil(disasm: &Disassembler, op: &R2ILOp) -> String {
         }
 
         // ========== Integer Arithmetic ==========
-        IntAdd { dst, a, b } => format!("{},{},+,{},=", vn(a), vn(b), vn(dst)),
-        IntSub { dst, a, b } => format!("{},{},-,{},=", vn(a), vn(b), vn(dst)),
-        IntMult { dst, a, b } => format!("{},{},*,{},=", vn(a), vn(b), vn(dst)),
-        IntDiv { dst, a, b } => format!("{},{},/,{},=", vn(a), vn(b), vn(dst)),
-        IntSDiv { dst, a, b } => format!("{},{},~/,{},=", vn(a), vn(b), vn(dst)),
-        IntRem { dst, a, b } => format!("{},{},%,{},=", vn(a), vn(b), vn(dst)),
-        IntSRem { dst, a, b } => format!("{},{},~%,{},=", vn(a), vn(b), vn(dst)),
-        IntNegate { dst, src } => format!("{},0,-,{},=", vn(src), vn(dst)),
+        IntAdd { dst, a, b } => format!("{},{},+,{}", vn(b), vn(a), asg(dst)),
+        IntSub { dst, a, b } => format!("{},{},-,{}", vn(b), vn(a), asg(dst)),
+        IntMult { dst, a, b } => format!("{},{},*,{}", vn(b), vn(a), asg(dst)),
+        IntDiv { dst, a, b } => format!("{},{},/,{}", vn(b), vn(a), asg(dst)),
+        IntSDiv { dst, a, b } => format!("{},{},~/,{}", vn(b), vn(a), asg(dst)),
+        IntRem { dst, a, b } => format!("{},{},%,{}", vn(b), vn(a), asg(dst)),
+        IntSRem { dst, a, b } => format!("{},{},~%,{}", vn(b), vn(a), asg(dst)),
+        IntNegate { dst, src } => format!("{},0,-,{}", vn(src), asg(dst)),
 
-        // Carry/borrow operations (set flags)
-        IntCarry { dst, a, b } => format!("{},{},+,$c,{},=", vn(a), vn(b), vn(dst)),
-        IntSCarry { dst, a, b } => format!("{},{},+,$o,{},=", vn(a), vn(b), vn(dst)),
-        IntSBorrow { dst, a, b } => format!("{},{},-,$b,{},=", vn(a), vn(b), vn(dst)),
+        // Carry/borrow operations. P-code defines these as self-contained
+        // predicates over both operands, so they are built from an explicit
+        // comparison rather than from flags an earlier instruction happened to
+        // leave behind.
+        IntCarry { dst, a, b } => {
+            let bits = bit_width(a);
+            // carry out of a + b is ((a + b) mod 2^n) <u a
+            format!(
+                "{},{},{},+,{},&,==,{},$b,{}",
+                vn(a),
+                vn(b),
+                vn(a),
+                mask_literal(bits),
+                bits,
+                asg(dst)
+            )
+        }
+        IntSCarry { dst, a, b } => {
+            let bits = bit_width(a);
+            // signed overflow of a + b is set when both operands share a sign
+            // that the sum does not: ~(a ^ b) & (a ^ (a + b)), sign bit taken
+            format!(
+                "{},{},{},^,{},^,{},{},+,{},^,&,>>,1,&,{}",
+                bits - 1,
+                vn(b),
+                vn(a),
+                mask_literal(bits),
+                vn(b),
+                vn(a),
+                vn(a),
+                asg(dst)
+            )
+        }
+        IntSBorrow { dst, a, b } => {
+            let bits = bit_width(a);
+            format!(
+                "{},{},{}",
+                compare_prologue(&vn(a), &vn(b)),
+                signed_overflow_terms(&vn(b), bits),
+                asg(dst)
+            )
+        }
 
         // ========== Logical Operations ==========
-        IntAnd { dst, a, b } => format!("{},{},&,{},=", vn(a), vn(b), vn(dst)),
-        IntOr { dst, a, b } => format!("{},{},|,{},=", vn(a), vn(b), vn(dst)),
-        IntXor { dst, a, b } => format!("{},{},^,{},=", vn(a), vn(b), vn(dst)),
-        IntNot { dst, src } => format!("{},~,{},=", vn(src), vn(dst)),
+        IntAnd { dst, a, b } => format!("{},{},&,{}", vn(b), vn(a), asg(dst)),
+        IntOr { dst, a, b } => format!("{},{},|,{}", vn(b), vn(a), asg(dst)),
+        IntXor { dst, a, b } => format!("{},{},^,{}", vn(b), vn(a), asg(dst)),
+        // ESIL has no bitwise complement; `~` is sign extension. XOR with the
+        // all-ones mask of the operand width is the same value.
+        IntNot { dst, src } => format!(
+            "{},{},^,{}",
+            mask_literal(bit_width(src)),
+            vn(src),
+            asg(dst)
+        ),
 
         // ========== Shift Operations ==========
-        IntLeft { dst, a, b } => format!("{},{},<<,{},=", vn(a), vn(b), vn(dst)),
-        IntRight { dst, a, b } => format!("{},{},>>,{},=", vn(a), vn(b), vn(dst)),
-        IntSRight { dst, a, b } => format!("{},{},>>>,{},=", vn(a), vn(b), vn(dst)),
+        IntLeft { dst, a, b } => format!("{},{},<<,{}", vn(b), vn(a), asg(dst)),
+        IntRight { dst, a, b } => format!("{},{},>>,{}", vn(b), vn(a), asg(dst)),
+        IntSRight { dst, a, b } => format!("{},{},ASR,{}", vn(b), vn(a), asg(dst)),
 
         // ========== Comparison Operations ==========
-        IntEqual { dst, a, b } => format!("{},{},==,{},=", vn(a), vn(b), vn(dst)),
-        IntNotEqual { dst, a, b } => format!("{},{},==,!,{},=", vn(a), vn(b), vn(dst)),
-        IntLess { dst, a, b } => format!("{},{},<,{},=", vn(a), vn(b), vn(dst)),
-        IntSLess { dst, a, b } => format!("{},{},<$,{},=", vn(a), vn(b), vn(dst)),
-        IntLessEqual { dst, a, b } => format!("{},{},<=,{},=", vn(a), vn(b), vn(dst)),
-        IntSLessEqual { dst, a, b } => format!("{},{},<=$,{},=", vn(a), vn(b), vn(dst)),
+        IntEqual { dst, a, b } => format!("{},$z,{}", compare_prologue(&vn(a), &vn(b)), asg(dst)),
+        IntNotEqual { dst, a, b } => {
+            format!("{},$z,!,{}", compare_prologue(&vn(a), &vn(b)), asg(dst))
+        }
+        IntLess { dst, a, b } => format!(
+            "{},{},$b,{}",
+            compare_prologue(&vn(a), &vn(b)),
+            bit_width(a),
+            asg(dst)
+        ),
+        IntLessEqual { dst, a, b } => format!(
+            "{},{},$b,$z,|,{}",
+            compare_prologue(&vn(a), &vn(b)),
+            bit_width(a),
+            asg(dst)
+        ),
+        IntSLess { dst, a, b } => {
+            let bits = bit_width(a);
+            format!(
+                "{},{},$s,{},^,{}",
+                compare_prologue(&vn(a), &vn(b)),
+                bits - 1,
+                signed_overflow_terms(&vn(b), bits),
+                asg(dst)
+            )
+        }
+        IntSLessEqual { dst, a, b } => {
+            let bits = bit_width(a);
+            // every flag is read before the first `^`, which overwrites the
+            // comparison state `$z`, `$s` and `$o` all draw from
+            format!(
+                "{},$z,{},$s,{},^,^,|,{}",
+                compare_prologue(&vn(a), &vn(b)),
+                bits - 1,
+                signed_overflow_terms(&vn(b), bits),
+                asg(dst)
+            )
+        }
 
         // ========== Extension Operations ==========
-        // Zero/sign extension - in ESIL, size is implicit in destination
-        IntZExt { dst, src } => format!("{},{},=", vn(src), vn(dst)),
+        IntZExt { dst, src } => format!(
+            "{},{},&,{}",
+            mask_literal(bit_width(src)),
+            vn(src),
+            asg(dst)
+        ),
         IntSExt { dst, src } => {
-            // Sign extension: use ~~ operator (value,bits,~~)
-            let src_bits = src.size * 8;
-            format!("{},{},~~,{},=", vn(src), src_bits, vn(dst))
+            format!("{},{},~,{}", bit_width(src), vn(src), asg(dst))
         }
 
         // ========== Boolean Operations ==========
-        BoolNot { dst, src } => format!("{},!,{},=", vn(src), vn(dst)),
-        BoolAnd { dst, a, b } => format!("{},{},&&,{},=", vn(a), vn(b), vn(dst)),
-        BoolOr { dst, a, b } => format!("{},{},||,{},=", vn(a), vn(b), vn(dst)),
-        BoolXor { dst, a, b } => format!("{},{},^^,{},=", vn(a), vn(b), vn(dst)),
+        // P-code booleans are already 0 or 1, so the bitwise forms are exact
+        // and ESIL has no dedicated logical connectives.
+        BoolNot { dst, src } => format!("{},!,{}", vn(src), asg(dst)),
+        BoolAnd { dst, a, b } => format!("{},{},&,{}", vn(b), vn(a), asg(dst)),
+        BoolOr { dst, a, b } => format!("{},{},|,{}", vn(b), vn(a), asg(dst)),
+        BoolXor { dst, a, b } => format!("{},{},^,{}", vn(b), vn(a), asg(dst)),
 
         // ========== Bit Manipulation ==========
         Piece { dst, hi, lo } => {
             // Concatenate: dst = (hi << lo.size*8) | lo
-            let shift = lo.size * 8;
-            format!("{},{},<<,{},|,{},=", vn(hi), shift, vn(lo), vn(dst))
+            let shift = (lo.size * 8).min(63);
+            format!("{},{},<<,{},|,{}", shift, vn(hi), vn(lo), asg(dst))
         }
 
         Subpiece { dst, src, offset } => {
-            // Extract: dst = (src >> offset*8) & mask
-            let shift = offset * 8;
+            // Extract: dst = (src >> offset*8) truncated to the destination
+            let shift = (offset * 8).min(63);
+            let keep = mask_literal(bit_width(dst));
             if shift > 0 {
-                format!("{},{},>>,{},=", vn(src), shift, vn(dst))
+                format!("{},{},>>,{},&,{}", shift, vn(src), keep, asg(dst))
             } else {
-                format!("{},{},=", vn(src), vn(dst))
+                format!("{},{},&,{}", keep, vn(src), asg(dst))
             }
         }
 
-        PopCount { dst, src } => format!("{},POPCOUNT,{},=", vn(src), vn(dst)),
-        Lzcount { dst, src } => format!("{},CLZ,{},=", vn(src), vn(dst)),
+        // ESIL has no population count or count-leading-zeros operator, and
+        // inventing one would be silently wrong rather than visibly missing.
+        PopCount { .. } => "TODO".to_string(),
+        Lzcount { .. } => "TODO".to_string(),
 
         // ========== Control Flow ==========
-        Branch { target } => format!("{},pc,=", vn(target)),
+        // A p-code branch target names an address, not the memory at it.
+        Branch { target } => format!("{},pc,=", vaddr(target)),
 
         CBranch { target, cond } => {
             // Conditional branch: if cond then goto target
-            format!("{},?{{,{},pc,=,}}", vn(cond), vn(target))
+            format!("{},?{{,{},pc,=,}}", vn(cond), vaddr(target))
         }
 
         BranchInd { target } => format!("{},pc,=", vn(target)),
 
-        Call { target } => {
-            let ptr_size = ptr_size_for_arch(disasm);
-            let sp = stack_reg_for_arch(disasm);
-            format_call_esil(&vn(target), sp, ptr_size)
-        }
-
-        CallInd { target } => {
-            let ptr_size = ptr_size_for_arch(disasm);
-            let sp = stack_reg_for_arch(disasm);
-            format_call_esil(&vn(target), sp, ptr_size)
-        }
-
-        Return { target: _ } => {
-            let ptr_size = ptr_size_for_arch(disasm);
-            let sp = stack_reg_for_arch(disasm);
-            format_return_esil(sp, ptr_size)
-        }
+        // Sleigh already emits the architectural side effects of a call and a
+        // return - the return-address push, the link register write, the stack
+        // pop - as ordinary p-code. Re-synthesizing them here pushed the return
+        // address twice and moved the stack pointer twice per call.
+        Call { target } => format!("{},pc,=", vaddr(target)),
+        CallInd { target } => format!("{},pc,=", vn(target)),
+        Return { target } => format!("{},pc,=", vn(target)),
 
         // ========== Floating Point ==========
-        FloatAdd { dst, a, b } => format!("{},{},F+,{},=", vn(a), vn(b), vn(dst)),
-        FloatSub { dst, a, b } => format!("{},{},F-,{},=", vn(a), vn(b), vn(dst)),
-        FloatMult { dst, a, b } => format!("{},{},F*,{},=", vn(a), vn(b), vn(dst)),
-        FloatDiv { dst, a, b } => format!("{},{},F/,{},=", vn(a), vn(b), vn(dst)),
-        FloatNeg { dst, src } => format!("0,{},F-,{},=", vn(src), vn(dst)),
-        FloatAbs { dst, src } => format!("{},FABS,{},=", vn(src), vn(dst)),
-        FloatSqrt { dst, src } => format!("{},FSQRT,{},=", vn(src), vn(dst)),
-        FloatCeil { dst, src } => format!("{},FCEIL,{},=", vn(src), vn(dst)),
-        FloatFloor { dst, src } => format!("{},FFLOOR,{},=", vn(src), vn(dst)),
-        FloatRound { dst, src } => format!("{},FROUND,{},=", vn(src), vn(dst)),
-        FloatNaN { dst, src } => format!("{},FISNAN,{},=", vn(src), vn(dst)),
-        FloatEqual { dst, a, b } => format!("{},{},F==,{},=", vn(a), vn(b), vn(dst)),
-        FloatNotEqual { dst, a, b } => format!("{},{},F==,!,{},=", vn(a), vn(b), vn(dst)),
-        FloatLess { dst, a, b } => format!("{},{},F<,{},=", vn(a), vn(b), vn(dst)),
-        FloatLessEqual { dst, a, b } => format!("{},{},F<=,{},=", vn(a), vn(b), vn(dst)),
-        Int2Float { dst, src } => format!("{},I2F,{},=", vn(src), vn(dst)),
-        Float2Int { dst, src } => format!("{},F2I,{},=", vn(src), vn(dst)),
-        FloatFloat { dst, src } => format!("{},F2F,{},=", vn(src), vn(dst)),
-        Trunc { dst, src } => format!("{},FTRUNC,{},=", vn(src), vn(dst)),
+        FloatAdd { dst, a, b } => format!("{},{},F+,{}", vn(b), vn(a), asg(dst)),
+        FloatSub { dst, a, b } => format!("{},{},F-,{}", vn(b), vn(a), asg(dst)),
+        FloatMult { dst, a, b } => format!("{},{},F*,{}", vn(b), vn(a), asg(dst)),
+        FloatDiv { dst, a, b } => format!("{},{},F/,{}", vn(b), vn(a), asg(dst)),
+        FloatNeg { dst, src } => format!("{},-F,{}", vn(src), asg(dst)),
+        FloatSqrt { dst, src } => format!("{},SQRT,{}", vn(src), asg(dst)),
+        FloatCeil { dst, src } => format!("{},CEIL,{}", vn(src), asg(dst)),
+        FloatFloor { dst, src } => format!("{},FLOOR,{}", vn(src), asg(dst)),
+        FloatRound { dst, src } => format!("{},ROUND,{}", vn(src), asg(dst)),
+        // ESIL models neither absolute value nor NaN classification.
+        FloatAbs { .. } => "TODO".to_string(),
+        FloatNaN { .. } => "TODO".to_string(),
+        FloatEqual { dst, a, b } => format!("{},{},F==,{}", vn(b), vn(a), asg(dst)),
+        FloatNotEqual { dst, a, b } => format!("{},{},F!=,{}", vn(b), vn(a), asg(dst)),
+        FloatLess { dst, a, b } => format!("{},{},F<,{}", vn(b), vn(a), asg(dst)),
+        FloatLessEqual { dst, a, b } => format!("{},{},F<=,{}", vn(b), vn(a), asg(dst)),
+        Int2Float { dst, src } => format!("{},I2D,{}", vn(src), asg(dst)),
+        Float2Int { dst, src } => format!("{},D2I,{}", vn(src), asg(dst)),
+        // ESIL's F2D/D2F take an explicit format operand this op does not carry.
+        FloatFloat { .. } => "TODO".to_string(),
+        Trunc { dst, src } => format!("{},D2I,{}", vn(src), asg(dst)),
 
         // ========== Special Operations ==========
         CallOther {
@@ -662,17 +802,15 @@ pub fn op_to_esil(disasm: &Disassembler, op: &R2ILOp) -> String {
         } => format_callother_esil(disasm, output, *userop, inputs),
 
         Nop => String::new(),
-        Unimplemented => "UNIMPL".to_string(),
-        CpuId { dst } => format!("CPUID,{},=", vn(dst)),
+        Unimplemented => "TODO".to_string(),
+        CpuId { .. } => "TODO".to_string(),
         Breakpoint => "BREAK".to_string(),
 
-        // Analysis operations (typically not in raw P-code from disassembly)
-        Multiequal { dst, inputs } => {
-            let args: Vec<String> = inputs.iter().map(&vn).collect();
-            format!("{},PHI,{},=", args.join(","), vn(dst))
-        }
+        // Analysis operations (typically not in raw P-code from disassembly).
+        // A phi has no ESIL spelling; there is no single value to assign.
+        Multiequal { .. } => "TODO".to_string(),
 
-        Indirect { dst, src, .. } => format!("{},{},=", vn(src), vn(dst)),
+        Indirect { dst, src, .. } => format!("{},{}", vn(src), asg(dst)),
 
         PtrAdd {
             dst,
@@ -681,11 +819,11 @@ pub fn op_to_esil(disasm: &Disassembler, op: &R2ILOp) -> String {
             element_size,
         } => {
             format!(
-                "{},{},{},*,+,{},=",
-                vn(base),
-                vn(index),
+                "{},{},*,{},+,{}",
                 element_size,
-                vn(dst)
+                vn(index),
+                vn(base),
+                asg(dst)
             )
         }
 
@@ -696,11 +834,11 @@ pub fn op_to_esil(disasm: &Disassembler, op: &R2ILOp) -> String {
             element_size,
         } => {
             format!(
-                "{},{},{},*,-,{},=",
-                vn(base),
-                vn(index),
+                "{},{},*,{},-,{}",
                 element_size,
-                vn(dst)
+                vn(index),
+                vn(base),
+                asg(dst)
             )
         }
 
@@ -710,14 +848,14 @@ pub fn op_to_esil(disasm: &Disassembler, op: &R2ILOp) -> String {
             offset,
         } => {
             // Segment:offset calculation (x86 real mode style)
-            format!("{},4,<<,{},+,{},=", vn(segment), vn(offset), vn(dst))
+            format!("4,{},<<,{},+,{}", vn(segment), vn(offset), asg(dst))
         }
 
-        New { dst, src } => format!("{},NEW,{},=", vn(src), vn(dst)),
-        Cast { dst, src } => format!("{},{},=", vn(src), vn(dst)),
+        New { .. } => "TODO".to_string(),
+        Cast { dst, src } => format!("{},{}", vn(src), asg(dst)),
 
         Extract { dst, src, position } => {
-            format!("{},{},>>,{},=", vn(src), vn(position), vn(dst))
+            format!("{},{},>>,{}", vn(position), vn(src), asg(dst))
         }
 
         Insert {
@@ -728,11 +866,11 @@ pub fn op_to_esil(disasm: &Disassembler, op: &R2ILOp) -> String {
         } => {
             // Insert value into src at position
             format!(
-                "{},{},<<,{},|,{},=",
-                vn(value),
+                "{},{},<<,{},|,{}",
                 vn(position),
+                vn(value),
                 vn(src),
-                vn(dst)
+                asg(dst)
             )
         }
         Select {
@@ -741,42 +879,14 @@ pub fn op_to_esil(disasm: &Disassembler, op: &R2ILOp) -> String {
             if_true,
             if_false,
         } => format!(
-            "{},?{{,{},{},=,}}{{,{},{},=,}}",
+            "{},?{{,{},{},}}{{,{},{},}}",
             vn(cond),
             vn(if_true),
-            vn(dst),
+            asg(dst),
             vn(if_false),
-            vn(dst)
+            asg(dst)
         ),
     }
-}
-
-fn stack_reg_for_arch(disasm: &Disassembler) -> &'static str {
-    let arch = disasm.arch_name().to_ascii_lowercase();
-    if arch.contains("x86") {
-        if arch.contains("64") { "rsp" } else { "esp" }
-    } else {
-        "sp"
-    }
-}
-
-fn ptr_size_for_arch(disasm: &Disassembler) -> u32 {
-    let arch = disasm.arch_name().to_ascii_lowercase();
-    if arch.contains("64") {
-        8
-    } else if arch.contains("16") {
-        2
-    } else {
-        4
-    }
-}
-
-fn format_call_esil(target: &str, sp_reg: &str, ptr_size: u32) -> String {
-    format!("pc,{ptr_size},{sp_reg},-=,{sp_reg},=[{ptr_size}],{target},pc,=")
-}
-
-fn format_return_esil(sp_reg: &str, ptr_size: u32) -> String {
-    format!("{sp_reg},[{ptr_size}],pc,=,{ptr_size},{sp_reg},+=")
 }
 
 fn format_callother_esil(
@@ -796,26 +906,271 @@ fn format_callother_esil(
 
 #[cfg(test)]
 mod tests {
-    use super::{format_call_esil, format_op, format_return_esil, op_to_esil};
+    use super::{format_op, op_to_esil};
     use crate::Disassembler;
     use r2il::{R2ILOp, Varnode};
 
-    #[test]
-    fn call_esil_uses_x86_64_stack_and_width() {
-        let esil = format_call_esil("0x401000", "rsp", 8);
-        assert_eq!(esil, "pc,8,rsp,-=,rsp,=[8],0x401000,pc,=");
+    fn x86_64() -> Disassembler {
+        Disassembler::from_sla(
+            sleigh_config::processor_x86::SLA_X86_64,
+            sleigh_config::processor_x86::PSPEC_X86_64,
+            "x86-64",
+        )
+        .expect("x86-64 disassembler")
     }
 
-    #[test]
-    fn call_esil_uses_arm64_stack_and_width() {
-        let esil = format_call_esil("0x1000", "sp", 8);
-        assert_eq!(esil, "pc,8,sp,-=,sp,=[8],0x1000,pc,=");
+    fn esil(op: &R2ILOp) -> String {
+        op_to_esil(&x86_64(), op)
     }
 
+    /// The last operand pushed is the left-hand side, so `a - b` has to place
+    /// `b` first. Emitting `a,b,-` computed `b - a`.
     #[test]
-    fn return_esil_supports_32bit_pointer_width() {
-        let esil = format_return_esil("esp", 4);
-        assert_eq!(esil, "esp,[4],pc,=,4,esp,+=");
+    fn non_commutative_arithmetic_puts_the_left_operand_last() {
+        let dst = Varnode::unique(0x100, 4);
+        let a = Varnode::unique(0x200, 4);
+        let b = Varnode::constant(3, 4);
+        assert_eq!(
+            esil(&R2ILOp::IntSub {
+                dst: dst.clone(),
+                a: a.clone(),
+                b: b.clone()
+            }),
+            "0x3,tmp:0x200,-,tmp:0x100,="
+        );
+        assert_eq!(
+            esil(&R2ILOp::IntDiv {
+                dst: dst.clone(),
+                a: a.clone(),
+                b: b.clone()
+            }),
+            "0x3,tmp:0x200,/,tmp:0x100,="
+        );
+        assert_eq!(
+            esil(&R2ILOp::IntSRight { dst, a, b }),
+            "0x3,tmp:0x200,ASR,tmp:0x100,="
+        );
+    }
+
+    /// `>>>`, `<$`, `<=$`, `~~`, `&&`, `||`, `^^`, `POPCOUNT` and `CLZ` are not
+    /// radare2 ESIL operators; emitting them left the expression unevaluated.
+    #[test]
+    fn only_operators_radare2_defines_are_emitted() {
+        const DEFINED: &[&str] = &[
+            "+", "-", "*", "/", "%", "~/", "~%", "&", "|", "^", "!", "<<", ">>", "ASR", "ROR",
+            "ROL", "~", "==", "=", ":=", "?{", "}", "}{", "$z", "$c", "$b", "$s", "$o", "$p",
+            "TODO", "BREAK", "F+", "F-", "F*", "F/", "F==", "F!=", "F<", "F<=", "-F", "SQRT",
+            "CEIL", "FLOOR", "ROUND", "I2D", "D2I",
+        ];
+        let dst = Varnode::unique(0x10, 4);
+        let src = Varnode::unique(0x20, 4);
+        let a = Varnode::unique(0x30, 4);
+        let b = Varnode::unique(0x40, 4);
+        let ops = [
+            R2ILOp::IntSRight {
+                dst: dst.clone(),
+                a: a.clone(),
+                b: b.clone(),
+            },
+            R2ILOp::IntSLess {
+                dst: dst.clone(),
+                a: a.clone(),
+                b: b.clone(),
+            },
+            R2ILOp::IntSLessEqual {
+                dst: dst.clone(),
+                a: a.clone(),
+                b: b.clone(),
+            },
+            R2ILOp::IntLess {
+                dst: dst.clone(),
+                a: a.clone(),
+                b: b.clone(),
+            },
+            R2ILOp::IntLessEqual {
+                dst: dst.clone(),
+                a: a.clone(),
+                b: b.clone(),
+            },
+            R2ILOp::IntEqual {
+                dst: dst.clone(),
+                a: a.clone(),
+                b: b.clone(),
+            },
+            R2ILOp::IntNotEqual {
+                dst: dst.clone(),
+                a: a.clone(),
+                b: b.clone(),
+            },
+            R2ILOp::IntCarry {
+                dst: dst.clone(),
+                a: a.clone(),
+                b: b.clone(),
+            },
+            R2ILOp::IntSCarry {
+                dst: dst.clone(),
+                a: a.clone(),
+                b: b.clone(),
+            },
+            R2ILOp::IntSBorrow {
+                dst: dst.clone(),
+                a: a.clone(),
+                b: b.clone(),
+            },
+            R2ILOp::IntNot {
+                dst: dst.clone(),
+                src: src.clone(),
+            },
+            R2ILOp::IntSExt {
+                dst: dst.clone(),
+                src: src.clone(),
+            },
+            R2ILOp::IntZExt {
+                dst: dst.clone(),
+                src: src.clone(),
+            },
+            R2ILOp::BoolAnd {
+                dst: dst.clone(),
+                a: a.clone(),
+                b: b.clone(),
+            },
+            R2ILOp::BoolOr {
+                dst: dst.clone(),
+                a: a.clone(),
+                b: b.clone(),
+            },
+            R2ILOp::BoolXor {
+                dst: dst.clone(),
+                a: a.clone(),
+                b: b.clone(),
+            },
+            R2ILOp::PopCount {
+                dst: dst.clone(),
+                src: src.clone(),
+            },
+            R2ILOp::Lzcount {
+                dst: dst.clone(),
+                src: src.clone(),
+            },
+            R2ILOp::FloatSqrt {
+                dst: dst.clone(),
+                src: src.clone(),
+            },
+            R2ILOp::FloatNeg {
+                dst: dst.clone(),
+                src: src.clone(),
+            },
+            R2ILOp::FloatAbs {
+                dst: dst.clone(),
+                src: src.clone(),
+            },
+            R2ILOp::Int2Float {
+                dst: dst.clone(),
+                src: src.clone(),
+            },
+            R2ILOp::Float2Int {
+                dst: dst.clone(),
+                src: src.clone(),
+            },
+            R2ILOp::Trunc {
+                dst: dst.clone(),
+                src: src.clone(),
+            },
+            R2ILOp::Unimplemented,
+        ];
+        let disassembler = x86_64();
+        for op in &ops {
+            for token in op_to_esil(&disassembler, op).split(',') {
+                let is_operand = token.is_empty()
+                    || token.starts_with("0x")
+                    || token.starts_with("tmp:")
+                    || token.chars().all(|c| c.is_ascii_digit())
+                    || token.starts_with('[')
+                    || token.starts_with("=[");
+                assert!(
+                    is_operand || DEFINED.contains(&token),
+                    "{op:?} emitted undefined ESIL token {token:?}"
+                );
+            }
+        }
+    }
+
+    /// Verified against radare2's own evaluator over every pairing of the
+    /// boundary values for the width: `ae <expr>` agrees with the P-code
+    /// definition on all of them.
+    #[test]
+    fn comparisons_read_flags_from_an_explicit_compare() {
+        let dst = Varnode::unique(0x10, 1);
+        let a = Varnode::unique(0x20, 4);
+        let b = Varnode::unique(0x30, 4);
+        assert_eq!(
+            esil(&R2ILOp::IntLess {
+                dst: dst.clone(),
+                a: a.clone(),
+                b: b.clone()
+            }),
+            "tmp:0x30,tmp:0x20,==,32,$b,tmp:0x10,="
+        );
+        assert_eq!(
+            esil(&R2ILOp::IntEqual {
+                dst: dst.clone(),
+                a: a.clone(),
+                b: b.clone()
+            }),
+            "tmp:0x30,tmp:0x20,==,$z,tmp:0x10,="
+        );
+        assert_eq!(
+            esil(&R2ILOp::IntSLess {
+                dst: dst.clone(),
+                a: a.clone(),
+                b: b.clone()
+            }),
+            "tmp:0x30,tmp:0x20,==,31,$s,31,$o,0x80000000,tmp:0x30,-,!,^,^,tmp:0x10,="
+        );
+        assert_eq!(
+            esil(&R2ILOp::IntSBorrow { dst, a, b }),
+            "tmp:0x30,tmp:0x20,==,31,$o,0x80000000,tmp:0x30,-,!,^,tmp:0x10,="
+        );
+    }
+
+    /// A branch target is an address. Rendering the ram varnode as a value made
+    /// `jmp 0x100000340` load eight bytes from that address and jump there.
+    #[test]
+    fn branch_targets_are_addresses_not_loads() {
+        assert_eq!(
+            esil(&R2ILOp::Branch {
+                target: Varnode::ram(0x100000340, 8)
+            }),
+            "0x100000340,pc,="
+        );
+        assert_eq!(
+            esil(&R2ILOp::Call {
+                target: Varnode::ram(0x1000004c0, 8)
+            }),
+            "0x1000004c0,pc,="
+        );
+    }
+
+    /// Sleigh already emits the return-address push and the stack pop as
+    /// ordinary p-code; the lifter must not add a second copy.
+    #[test]
+    fn calls_and_returns_do_not_restate_the_stack_effects() {
+        for op in [
+            R2ILOp::Call {
+                target: Varnode::ram(0x1000, 8),
+            },
+            R2ILOp::CallInd {
+                target: Varnode::register(0x10, 8),
+            },
+            R2ILOp::Return {
+                target: Varnode::register(0x10, 8),
+            },
+        ] {
+            let esil = esil(&op);
+            assert!(!esil.contains("rsp"), "{op:?} restated the stack: {esil}");
+            assert!(!esil.contains("=[8]"), "{op:?} restated the push: {esil}");
+            assert!(esil.ends_with("pc,="), "{op:?} must set pc: {esil}");
+        }
     }
 
     #[test]
