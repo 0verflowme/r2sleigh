@@ -446,6 +446,15 @@ pub enum SemanticCInputOrigin {
         storage: CanonicalStorageId,
         header: u64,
     },
+    /// A value a call defined in its result carrier.
+    ///
+    /// The region renders the call as a statement binding this value, so the
+    /// input is not unattributed: it is whatever the callee returned, named at
+    /// the point the call was made and claiming nothing further.
+    CallResult {
+        producer: CanonicalInstructionId,
+        storage: Option<CanonicalStorageId>,
+    },
     /// A two-way merge that its owning region assigns on each incoming edge.
     ///
     /// The value is one C variable, not an expression: the region declares it
@@ -1251,6 +1260,11 @@ trait CertifiedSemanticSource {
         &self,
         producer: CanonicalInstructionId,
     ) -> Option<&CertifiedMemoryStatement>;
+    /// The call, if any, that defines this binding in its result carrier.
+    fn call_defining_result(
+        &self,
+        binding: MachineValueBinding,
+    ) -> Option<CanonicalInstructionId>;
 }
 
 impl CertifiedSemanticSource for CertifiedMachineFunction {
@@ -1311,6 +1325,17 @@ impl CertifiedSemanticSource for CertifiedMachineFunction {
     ) -> Option<&CertifiedMemoryStatement> {
         CertifiedMachineFunction::memory_statement_for_producer(self, producer)
     }
+
+    fn call_defining_result(
+        &self,
+        binding: MachineValueBinding,
+    ) -> Option<CanonicalInstructionId> {
+        self.direct_calls().values().find_map(|call| {
+            call.result()
+                .filter(|result| result.value().binding() == binding)
+                .map(|_| call.producer())
+        })
+    }
 }
 
 impl CertifiedSemanticSource for CertifiedMachineProjection {
@@ -1370,6 +1395,17 @@ impl CertifiedSemanticSource for CertifiedMachineProjection {
         producer: CanonicalInstructionId,
     ) -> Option<&CertifiedMemoryStatement> {
         CertifiedMachineProjection::memory_statement_for_producer(self, producer)
+    }
+
+    fn call_defining_result(
+        &self,
+        binding: MachineValueBinding,
+    ) -> Option<CanonicalInstructionId> {
+        self.direct_calls().values().find_map(|call| {
+            call.result()
+                .filter(|result| result.value().binding() == binding)
+                .map(|_| call.producer())
+        })
     }
 }
 
@@ -1728,7 +1764,11 @@ fn classify_input(
     interface: Option<&SemanticCFunctionInterface>,
     private_entry_stack_pointer: Option<&CertifiedPrivateEntryStackPointerInput>,
     region_assigned_join_block: Option<u64>,
+    call_result_producer: Option<CanonicalInstructionId>,
 ) -> SemanticCInputOrigin {
+    if let Some(producer) = call_result_producer {
+        return SemanticCInputOrigin::CallResult { producer, storage };
+    }
     if let (Some(join_block), Some(storage)) = (region_assigned_join_block, storage) {
         return SemanticCInputOrigin::RegionAssignedJoinValue {
             storage,
@@ -2892,6 +2932,7 @@ impl SemanticCExpressionLayer {
                         function_interface.as_ref(),
                         private_entry_stack_pointer,
                         builder.join_phi_leaves.get(binding).copied(),
+                        certified.call_defining_result(*binding),
                     ),
                 )
             })
