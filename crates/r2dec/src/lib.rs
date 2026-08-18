@@ -63,6 +63,7 @@ pub mod semantic_differential;
 pub mod semantic_function;
 pub mod semantic_memory_function;
 pub mod semantic_stmt;
+pub(crate) mod single_evaluation;
 pub mod structure;
 pub mod variable;
 
@@ -3148,6 +3149,10 @@ impl Decompiler {
         fold_constant_arithmetic_in_function(
             &mut c_function,
             self.context.function_facts.display_names().strings(),
+        );
+        single_evaluation::bind_each_call_site_once(
+            &mut c_function,
+            fold_ctx.call_result_exprs_map(),
         );
         propagate_single_use_register_carriers(&mut c_function, &fold_ctx);
         rewrite_stack_synonym_uses_to_declared_locals(&mut c_function, &fold_ctx);

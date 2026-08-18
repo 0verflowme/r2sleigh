@@ -736,11 +736,7 @@ impl<'a> FoldingContext<'a> {
         }
 
         kept_rev.reverse();
-        if demote_dead_return_register_calls {
-            self.dedup_replayed_call_exprs(kept_rev)
-        } else {
-            kept_rev
-        }
+        kept_rev
     }
 
     pub(crate) fn prune_dead_temp_assignments_in_stmt(&self, stmt: CStmt) -> CStmt {
@@ -936,112 +932,5 @@ impl<'a> FoldingContext<'a> {
             });
             found
         })
-    }
-
-    fn dedup_replayed_call_exprs(&self, stmts: Vec<CStmt>) -> Vec<CStmt> {
-        let mut seen = BTreeSet::new();
-        self.dedup_replayed_call_exprs_in_block(stmts, &mut seen)
-    }
-
-    fn dedup_replayed_call_exprs_in_block(
-        &self,
-        stmts: Vec<CStmt>,
-        seen: &mut BTreeSet<(u64, usize)>,
-    ) -> Vec<CStmt> {
-        let mut out = Vec::with_capacity(stmts.len());
-        for stmt in stmts {
-            if let Some(source) = self.call_source_for_statement(&stmt) {
-                let is_bare_call = matches!(stmt, CStmt::Expr(CExpr::Call { .. }));
-                if is_bare_call && seen.contains(&source) {
-                    continue;
-                }
-                seen.insert(source);
-            }
-            out.push(self.dedup_replayed_call_exprs_in_stmt(stmt, seen));
-        }
-        out
-    }
-
-    fn dedup_replayed_call_exprs_in_stmt(
-        &self,
-        stmt: CStmt,
-        seen: &mut BTreeSet<(u64, usize)>,
-    ) -> CStmt {
-        match stmt {
-            CStmt::Block(stmts) => {
-                CStmt::Block(self.dedup_replayed_call_exprs_in_block(stmts, seen))
-            }
-            CStmt::If {
-                cond,
-                then_body,
-                else_body,
-            } => {
-                let mut then_seen = seen.clone();
-                let then_body =
-                    Box::new(self.dedup_replayed_call_exprs_in_stmt(*then_body, &mut then_seen));
-                let else_body = else_body.map(|stmt| {
-                    let mut else_seen = seen.clone();
-                    Box::new(self.dedup_replayed_call_exprs_in_stmt(*stmt, &mut else_seen))
-                });
-                CStmt::If {
-                    cond,
-                    then_body,
-                    else_body,
-                }
-            }
-            CStmt::While { cond, body } => {
-                let mut body_seen = seen.clone();
-                CStmt::While {
-                    cond,
-                    body: Box::new(self.dedup_replayed_call_exprs_in_stmt(*body, &mut body_seen)),
-                }
-            }
-            CStmt::DoWhile { body, cond } => {
-                let mut body_seen = seen.clone();
-                CStmt::DoWhile {
-                    body: Box::new(self.dedup_replayed_call_exprs_in_stmt(*body, &mut body_seen)),
-                    cond,
-                }
-            }
-            CStmt::For {
-                init,
-                cond,
-                update,
-                body,
-            } => {
-                let mut body_seen = seen.clone();
-                CStmt::For {
-                    init,
-                    cond,
-                    update,
-                    body: Box::new(self.dedup_replayed_call_exprs_in_stmt(*body, &mut body_seen)),
-                }
-            }
-            CStmt::Switch {
-                expr,
-                cases,
-                default,
-            } => {
-                let cases = cases
-                    .into_iter()
-                    .map(|mut case| {
-                        let mut case_seen = seen.clone();
-                        case.body =
-                            self.dedup_replayed_call_exprs_in_block(case.body, &mut case_seen);
-                        case
-                    })
-                    .collect();
-                let default = default.map(|stmts| {
-                    let mut default_seen = seen.clone();
-                    self.dedup_replayed_call_exprs_in_block(stmts, &mut default_seen)
-                });
-                CStmt::Switch {
-                    expr,
-                    cases,
-                    default,
-                }
-            }
-            other => other,
-        }
     }
 }

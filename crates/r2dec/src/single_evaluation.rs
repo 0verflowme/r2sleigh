@@ -1,0 +1,467 @@
+//! One call site, one evaluation.
+//!
+//! A call is an event the program performs, not a value that can be recomputed
+//! on demand. Folding reaches a call site through every value that carries its
+//! result, so the same site can be reconstructed at each of those values and
+//! printed several times over. That is not a cosmetic repetition: three
+//! renderings of `malloc(n)` say the program allocates three times when it
+//! allocates once, and a reader who counts allocations against frees is then
+//! reading a program that does not exist.
+//!
+//! This pass restores the invariant on the rendered function. Within a scope,
+//! the first occurrence of a multiply-rendered call site becomes its binding
+//! and every later occurrence becomes a mention of the bound name. Sites that
+//! appear once are left exactly as they are.
+//!
+//! Sibling branches do not share bindings. A name bound in one arm of an `if`
+//! is neither in scope nor in effect in the other, so each arm starts from the
+//! set of bindings that reached the branch, and a loop body starts afresh on
+//! the same reasoning: what the previous iteration bound is not what this
+//! iteration computes.
+
+use std::collections::BTreeMap;
+
+use crate::ast::{BinaryOp, CExpr, CFunction, CStmt, CType};
+
+/// A call site, identified by the address of the call and its index there.
+type Source = (u64, usize);
+
+/// Resolves a rendered call expression back to the site it came from.
+///
+/// Two distinct sites can render identically -- a program may well call
+/// `malloc(len + 1)` twice -- and in that case the rendering carries no
+/// evidence of which site it is. Such expressions are reported as unresolved
+/// rather than guessed at, because merging two real calls into one would
+/// delete an event the program performs.
+struct CallIndex<'a> {
+    entries: Vec<(&'a CExpr, Source)>,
+}
+
+impl<'a> CallIndex<'a> {
+    fn new(call_exprs: &'a BTreeMap<Source, CExpr>) -> Self {
+        Self {
+            entries: call_exprs
+                .iter()
+                .filter(|(_, expr)| matches!(expr, CExpr::Call { .. }))
+                .map(|(source, expr)| (expr, *source))
+                .collect(),
+        }
+    }
+
+    fn source_of(&self, expr: &CExpr) -> Option<Source> {
+        if !matches!(expr, CExpr::Call { .. }) {
+            return None;
+        }
+        let mut found = None;
+        for (candidate, source) in &self.entries {
+            if *candidate == expr {
+                if found.is_some() {
+                    return None;
+                }
+                found = Some(*source);
+            }
+        }
+        found
+    }
+}
+
+/// Give every call site in `func` exactly one evaluation.
+pub(crate) fn bind_each_call_site_once(func: &mut CFunction, call_exprs: &BTreeMap<Source, CExpr>) {
+    let index = CallIndex::new(call_exprs);
+    if index.entries.is_empty() {
+        return;
+    }
+
+    let mut counts: BTreeMap<Source, usize> = BTreeMap::new();
+    for stmt in &func.body {
+        count_in_stmt(stmt, &index, &mut counts);
+    }
+    let repeated: Vec<Source> = counts
+        .into_iter()
+        .filter(|(_, count)| *count > 1)
+        .map(|(source, _)| source)
+        .collect();
+    if repeated.is_empty() {
+        return;
+    }
+
+    // A site that is already assigned to a variable somewhere in the body has
+    // a name the rest of the function already uses; binding to that same name
+    // keeps the two consistent instead of introducing a synonym.
+    let mut preferred: BTreeMap<Source, String> = BTreeMap::new();
+    for stmt in &func.body {
+        collect_assignment_names(stmt, &index, &repeated, &mut preferred);
+    }
+
+    let mut introduced: Vec<String> = Vec::new();
+    let mut bound: BTreeMap<Source, String> = BTreeMap::new();
+    let body = std::mem::take(&mut func.body);
+    func.body = rewrite_block(
+        body,
+        &index,
+        &repeated,
+        &preferred,
+        &mut bound,
+        &mut introduced,
+    );
+
+    for name in introduced {
+        if !func.locals.iter().any(|local| local.name == name)
+            && !func.params.iter().any(|param| param.name == name)
+        {
+            func.locals.push(crate::ast::CLocal {
+                ty: CType::UInt(64),
+                name,
+                stack_offset: None,
+            });
+        }
+    }
+}
+
+fn count_in_stmt(stmt: &CStmt, index: &CallIndex<'_>, counts: &mut BTreeMap<Source, usize>) {
+    for_each_expr(stmt, &mut |expr| count_in_expr(expr, index, counts));
+    for_each_child_block(stmt, &mut |stmts| {
+        for inner in stmts {
+            count_in_stmt(inner, index, counts);
+        }
+    });
+}
+
+fn count_in_expr(expr: &CExpr, index: &CallIndex<'_>, counts: &mut BTreeMap<Source, usize>) {
+    expr.visit(&mut |node| {
+        if let Some(source) = index.source_of(node) {
+            *counts.entry(source).or_insert(0) += 1;
+        }
+    });
+}
+
+fn collect_assignment_names(
+    stmt: &CStmt,
+    index: &CallIndex<'_>,
+    repeated: &[Source],
+    out: &mut BTreeMap<Source, String>,
+) {
+    if let CStmt::Expr(CExpr::Binary {
+        op: BinaryOp::Assign,
+        left,
+        right,
+    }) = stmt
+        && let CExpr::Var(name) = left.as_ref()
+        && let Some(source) = index.source_of(right)
+        && repeated.contains(&source)
+    {
+        out.entry(source).or_insert_with(|| name.clone());
+    }
+    for_each_child_block(stmt, &mut |stmts| {
+        for inner in stmts {
+            collect_assignment_names(inner, index, repeated, out);
+        }
+    });
+}
+
+fn rewrite_block(
+    stmts: Vec<CStmt>,
+    index: &CallIndex<'_>,
+    repeated: &[Source],
+    preferred: &BTreeMap<Source, String>,
+    bound: &mut BTreeMap<Source, String>,
+    introduced: &mut Vec<String>,
+) -> Vec<CStmt> {
+    let mut out: Vec<CStmt> = Vec::with_capacity(stmts.len());
+    for mut stmt in stmts {
+        // An assignment whose right-hand side is the site itself is already the
+        // binding this pass would otherwise have to invent, so it is adopted
+        // rather than duplicated -- unless the site is bound already, in which
+        // case the assignment is a second evaluation and becomes a copy.
+        if let CStmt::Expr(CExpr::Binary {
+            op: BinaryOp::Assign,
+            left,
+            right,
+        }) = &stmt
+            && let CExpr::Var(name) = left.as_ref()
+            && let Some(source) = index.source_of(right)
+            && repeated.contains(&source)
+            && !bound.contains_key(&source)
+        {
+            bound.insert(source, name.clone());
+            out.push(stmt);
+            continue;
+        }
+
+        // A second assignment of an already-bound site is a second evaluation
+        // of it. Rewriting turns the right-hand side into the bound name, and
+        // what is left says only that the variable still holds what it holds.
+        let reassigns_bound_site = matches!(
+            &stmt,
+            CStmt::Expr(CExpr::Binary { op: BinaryOp::Assign, right, .. })
+                if index.source_of(right).is_some_and(|source| bound.contains_key(&source))
+        );
+
+        let mut hoists: Vec<CStmt> = Vec::new();
+        for_each_expr_mut(&mut stmt, &mut |expr| {
+            rewrite_expr(
+                expr,
+                index,
+                repeated,
+                preferred,
+                bound,
+                introduced,
+                &mut hoists,
+            )
+        });
+        out.extend(hoists);
+
+        if reassigns_bound_site && is_self_assignment(&stmt) {
+            continue;
+        }
+
+        for_each_child_block_mut(&mut stmt, &mut |stmts, shares_scope| {
+            let taken = std::mem::take(stmts);
+            if shares_scope {
+                *stmts = rewrite_block(taken, index, repeated, preferred, bound, introduced);
+            } else {
+                let mut nested = bound.clone();
+                *stmts = rewrite_block(taken, index, repeated, preferred, &mut nested, introduced);
+            }
+        });
+
+        out.push(stmt);
+    }
+    out
+}
+
+fn is_self_assignment(stmt: &CStmt) -> bool {
+    let CStmt::Expr(CExpr::Binary {
+        op: BinaryOp::Assign,
+        left,
+        right,
+    }) = stmt
+    else {
+        return false;
+    };
+    matches!(
+        (left.as_ref(), right.as_ref()),
+        (CExpr::Var(target), CExpr::Var(value)) if target == value
+    )
+}
+
+fn rewrite_expr(
+    expr: &mut CExpr,
+    index: &CallIndex<'_>,
+    repeated: &[Source],
+    preferred: &BTreeMap<Source, String>,
+    bound: &mut BTreeMap<Source, String>,
+    introduced: &mut Vec<String>,
+    hoists: &mut Vec<CStmt>,
+) {
+    // Children first: a call nested in another call's arguments is evaluated
+    // before the call that consumes it, and hoisting in that order keeps the
+    // statements in the order the program runs them.
+    for child in children_mut(expr) {
+        rewrite_expr(child, index, repeated, preferred, bound, introduced, hoists);
+    }
+
+    let Some(source) = index.source_of(expr) else {
+        return;
+    };
+    if !repeated.contains(&source) {
+        return;
+    }
+
+    if let Some(name) = bound.get(&source) {
+        *expr = CExpr::Var(name.clone());
+        return;
+    }
+
+    let name = preferred.get(&source).cloned().unwrap_or_else(|| {
+        let name = introduced_name_for(expr, introduced);
+        introduced.push(name.clone());
+        name
+    });
+    let call = std::mem::replace(expr, CExpr::Var(name.clone()));
+    hoists.push(CStmt::Expr(CExpr::Binary {
+        op: BinaryOp::Assign,
+        left: Box::new(CExpr::Var(name.clone())),
+        right: Box::new(call),
+    }));
+    bound.insert(source, name);
+}
+
+/// A name for a site the body never assigned anywhere, derived from the callee
+/// so the binding still says what it holds.
+fn introduced_name_for(expr: &CExpr, introduced: &[String]) -> String {
+    let callee = match expr {
+        CExpr::Call { func, .. } => match func.as_ref() {
+            CExpr::Var(name) => name.rsplit('.').next().unwrap_or(name).to_string(),
+            _ => "call".to_string(),
+        },
+        _ => "call".to_string(),
+    };
+    let base = format!("{callee}_result");
+    if !introduced.iter().any(|name| *name == base) {
+        return base;
+    }
+    let mut suffix = 2;
+    loop {
+        let candidate = format!("{base}_{suffix}");
+        if !introduced.iter().any(|name| *name == candidate) {
+            return candidate;
+        }
+        suffix += 1;
+    }
+}
+
+fn children_mut(expr: &mut CExpr) -> Vec<&mut CExpr> {
+    match expr {
+        CExpr::IntLit(_)
+        | CExpr::UIntLit(_)
+        | CExpr::FloatLit(_)
+        | CExpr::StringLit(_)
+        | CExpr::CharLit(_)
+        | CExpr::Var(_)
+        | CExpr::SizeofType(_) => Vec::new(),
+        CExpr::Unary { operand, .. } => vec![operand.as_mut()],
+        CExpr::Binary { left, right, .. } => vec![left.as_mut(), right.as_mut()],
+        CExpr::Ternary {
+            cond,
+            then_expr,
+            else_expr,
+        } => vec![cond.as_mut(), then_expr.as_mut(), else_expr.as_mut()],
+        CExpr::Cast { expr, .. } => vec![expr.as_mut()],
+        CExpr::Call { func, args } => {
+            let mut out = vec![func.as_mut()];
+            out.extend(args.iter_mut());
+            out
+        }
+        CExpr::Subscript { base, index } => vec![base.as_mut(), index.as_mut()],
+        CExpr::Member { base, .. } | CExpr::PtrMember { base, .. } => vec![base.as_mut()],
+        CExpr::Sizeof(inner) | CExpr::AddrOf(inner) | CExpr::Deref(inner) | CExpr::Paren(inner) => {
+            vec![inner.as_mut()]
+        }
+        CExpr::Comma(items) => items.iter_mut().collect(),
+    }
+}
+
+fn for_each_expr(stmt: &CStmt, f: &mut impl FnMut(&CExpr)) {
+    match stmt {
+        CStmt::Expr(expr) | CStmt::Return(Some(expr)) => f(expr),
+        CStmt::Decl {
+            init: Some(expr), ..
+        } => f(expr),
+        CStmt::If { cond, .. } => f(cond),
+        CStmt::While { cond, .. } | CStmt::DoWhile { cond, .. } => f(cond),
+        CStmt::For { cond, update, .. } => {
+            if let Some(cond) = cond {
+                f(cond);
+            }
+            if let Some(update) = update {
+                f(update);
+            }
+        }
+        CStmt::Switch { expr, .. } => f(expr),
+        _ => {}
+    }
+}
+
+fn for_each_expr_mut(stmt: &mut CStmt, f: &mut impl FnMut(&mut CExpr)) {
+    match stmt {
+        CStmt::Expr(expr) | CStmt::Return(Some(expr)) => f(expr),
+        CStmt::Decl {
+            init: Some(expr), ..
+        } => f(expr),
+        CStmt::If { cond, .. } => f(cond),
+        CStmt::While { cond, .. } | CStmt::DoWhile { cond, .. } => f(cond),
+        CStmt::For { cond, update, .. } => {
+            if let Some(cond) = cond {
+                f(cond);
+            }
+            if let Some(update) = update {
+                f(update);
+            }
+        }
+        CStmt::Switch { expr, .. } => f(expr),
+        _ => {}
+    }
+}
+
+fn for_each_child_block(stmt: &CStmt, f: &mut impl FnMut(&[CStmt])) {
+    match stmt {
+        CStmt::Block(stmts) => f(stmts),
+        CStmt::If {
+            then_body,
+            else_body,
+            ..
+        } => {
+            f(std::slice::from_ref(then_body.as_ref()));
+            if let Some(body) = else_body {
+                f(std::slice::from_ref(body.as_ref()));
+            }
+        }
+        CStmt::While { body, .. } | CStmt::DoWhile { body, .. } => {
+            f(std::slice::from_ref(body.as_ref()))
+        }
+        CStmt::For { init, body, .. } => {
+            if let Some(init) = init {
+                f(std::slice::from_ref(init.as_ref()));
+            }
+            f(std::slice::from_ref(body.as_ref()));
+        }
+        CStmt::Switch { cases, default, .. } => {
+            for case in cases {
+                f(&case.body);
+            }
+            if let Some(default) = default {
+                f(default);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Visit each nested statement list, saying whether it shares the enclosing
+/// scope's bindings on exit. A plain block always runs, so what it binds still
+/// holds afterwards; a branch arm or a loop body does not.
+fn for_each_child_block_mut(stmt: &mut CStmt, f: &mut impl FnMut(&mut Vec<CStmt>, bool)) {
+    fn as_block(body: &mut Box<CStmt>, f: &mut impl FnMut(&mut Vec<CStmt>, bool), shares: bool) {
+        match body.as_mut() {
+            CStmt::Block(stmts) => f(stmts, shares),
+            other => {
+                let mut stmts = vec![std::mem::replace(other, CStmt::Empty)];
+                f(&mut stmts, shares);
+                *other = if stmts.len() == 1 {
+                    stmts.pop().unwrap_or(CStmt::Empty)
+                } else {
+                    CStmt::Block(stmts)
+                };
+            }
+        }
+    }
+
+    match stmt {
+        CStmt::Block(stmts) => f(stmts, true),
+        CStmt::If {
+            then_body,
+            else_body,
+            ..
+        } => {
+            as_block(then_body, f, false);
+            if let Some(body) = else_body {
+                as_block(body, f, false);
+            }
+        }
+        CStmt::While { body, .. } | CStmt::DoWhile { body, .. } => as_block(body, f, false),
+        CStmt::For { body, .. } => as_block(body, f, false),
+        CStmt::Switch { cases, default, .. } => {
+            for case in cases {
+                let taken = std::mem::take(&mut case.body);
+                let mut stmts = taken;
+                f(&mut stmts, false);
+                case.body = stmts;
+            }
+            if let Some(default) = default {
+                f(default, false);
+            }
+        }
+        _ => {}
+    }
+}
