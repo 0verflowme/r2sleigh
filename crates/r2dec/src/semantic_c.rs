@@ -2783,6 +2783,7 @@ impl SemanticCExpressionLayer {
             expressions: Vec::new(),
             inputs: BTreeMap::new(),
             join_phi_leaves: BTreeMap::new(),
+            join_phis,
         };
         let mut entities = Vec::new();
 
@@ -4156,6 +4157,7 @@ struct SemanticCBuilder<'a> {
     expressions: Vec<SemanticCExpr>,
     inputs: BTreeMap<MachineValueBinding, (MachineType, Option<CanonicalStorageId>)>,
     join_phi_leaves: BTreeMap<MachineValueBinding, u64>,
+    join_phis: Option<&'a BTreeMap<CanonicalInstructionId, CertifiedTwoWayJoinPhi>>,
 }
 
 fn exact_self_xor_zero_value(
@@ -4273,9 +4275,18 @@ impl SemanticCBuilder<'_> {
                     pending.push(*if_false);
                 }
                 MachineExprKind::Phi { .. } => {
-                    return Err(SemanticCError::PhiRequiresCertifiedStructuring(
-                        expression.origin(),
-                    ));
+                    // A certified merge is a variable the region assigns, so it
+                    // depends on nothing here; its incoming values are reached
+                    // through the edges that assign it.
+                    if expression
+                        .origin()
+                        .and_then(|producer| self.join_phis.and_then(|phis| phis.get(&producer)))
+                        .is_none()
+                    {
+                        return Err(SemanticCError::PhiRequiresCertifiedStructuring(
+                            expression.origin(),
+                        ));
+                    }
                 }
             }
         }
@@ -4320,6 +4331,29 @@ impl SemanticCBuilder<'_> {
             .ok_or(SemanticCError::MissingMachineExpression(machine_id))?;
         supported_width(machine_expr.ty().width_bits())?;
         if let MachineExprKind::Phi { .. } = machine_expr.kind() {
+            // A merge the region certified is one variable it assigns on each
+            // incoming edge, so it may appear nested in an expression, not only
+            // as an entity root.
+            if let Some(phi) = machine_expr
+                .origin()
+                .and_then(|producer| self.join_phis.and_then(|phis| phis.get(&producer)))
+                && let Some(binding) = self
+                    .machine
+                    .entities()
+                    .iter()
+                    .find(|entity| entity.output().value() == phi.output())
+                    .map(MachineEntity::output)
+            {
+                let id = self.push_join_phi_leaf(
+                    binding,
+                    machine_expr.ty().clone(),
+                    phi.storage(),
+                    phi.join_block(),
+                    phi.producer(),
+                )?;
+                self.translated.insert(machine_id, id);
+                return Ok(id);
+            }
             return Err(SemanticCError::PhiRequiresCertifiedStructuring(
                 machine_expr.origin(),
             ));
@@ -4972,6 +5006,7 @@ mod return_mechanics_tests {
             expressions: Vec::new(),
             inputs: BTreeMap::new(),
             join_phi_leaves: BTreeMap::new(),
+            join_phis: None,
         };
         let translated = builder.translate(root).expect("semantic translation");
         (
@@ -5034,6 +5069,7 @@ mod return_mechanics_tests {
             expressions: Vec::new(),
             inputs: BTreeMap::new(),
             join_phi_leaves: BTreeMap::new(),
+            join_phis: None,
         };
         let mut entities = Vec::new();
         for entity in projection.entities() {
