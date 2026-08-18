@@ -184,6 +184,22 @@ static bool walk_image(R2SleighWireWriter *writer, const RAnalFunctionSnapshot *
 		}
 		r2sleigh_wire_u64 (writer, target);
 	}
+	if (view->num_string_literals > UINT32_MAX) {
+		return false;
+	}
+	r2sleigh_wire_u32 (writer, (uint32_t)view->num_string_literals);
+	for (size_t i = 0; i < view->num_string_literals; i++) {
+		RAnalSnapshotStringLiteralView literal = {0};
+		if (!r_anal_function_snapshot_string_literal_view (snapshot, i, &literal)) {
+			return false;
+		}
+		char text[WALK_NAME_MAX];
+		if (!r_anal_function_snapshot_string_literal_text (snapshot, i, text, sizeof (text))) {
+			return false;
+		}
+		r2sleigh_wire_u64 (writer, literal.addr);
+		r2sleigh_wire_string (writer, text);
+	}
 	r2sleigh_wire_u64 (writer, (uint64_t)view->total_source_bytes);
 	return true;
 }

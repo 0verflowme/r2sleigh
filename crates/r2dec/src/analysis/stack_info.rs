@@ -281,6 +281,7 @@ fn stack_var_for_addr_var(
     let empty_ptrs: HashMap<String, PtrArith> = HashMap::new();
     let empty_semantic_values: HashMap<String, crate::analysis::SemanticValue> = HashMap::new();
     let lower = LowerCtx {
+        string_literals: crate::analysis::lower::no_string_literals(),
         use_info: None,
         definitions: inputs.definitions,
         semantic_values: &empty_semantic_values,
@@ -472,6 +473,7 @@ fn forwarded_expr_for_value(
     let empty_names: HashSet<String> = HashSet::new();
     let empty_ptrs: HashMap<String, PtrArith> = HashMap::new();
     let lower = LowerCtx {
+        string_literals: crate::analysis::lower::no_string_literals(),
         use_info: Some(use_info),
         definitions,
         semantic_values: &use_info.semantic_values,
@@ -638,6 +640,7 @@ mod tests {
         let strings = HashMap::new();
         let symbols = HashMap::new();
         let env = PassEnv {
+            string_literals: crate::analysis::lower::no_string_literals(),
             ptr_size: arch.ptr_size,
             sp_name: &arch.sp_name,
             fp_name: &arch.fp_name,
@@ -675,6 +678,7 @@ mod tests {
         let strings = HashMap::new();
         let symbols = HashMap::new();
         let env = PassEnv {
+            string_literals: crate::analysis::lower::no_string_literals(),
             ptr_size: arch.ptr_size,
             sp_name: &arch.sp_name,
             fp_name: &arch.fp_name,

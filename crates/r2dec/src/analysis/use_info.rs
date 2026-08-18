@@ -2624,6 +2624,7 @@ fn collect_definitions(
             } else {
                 let expr = {
                     let lower = LowerCtx {
+                        string_literals: env.string_literals,
                         use_info: None,
                         definitions: &scratch.info.definitions,
                         semantic_values: &scratch.info.semantic_values,
@@ -2698,6 +2699,7 @@ fn rebuild_definitions(
                 expr
             } else {
                 let lower = LowerCtx {
+                    string_literals: env.string_literals,
                     use_info: None,
                     definitions: &rebuilt,
                     semantic_values: &scratch.info.semantic_values,
@@ -5325,6 +5327,7 @@ fn analyze_call_args(scratch: &mut UseScratch, blocks: &[SSABlock], env: &PassEn
                 .filter_map(|(idx, op)| op.dst().map(|dst| (dst.display_name(), idx)))
                 .collect::<HashMap<_, _>>();
             let lower = LowerCtx {
+                string_literals: env.string_literals,
                 use_info: None,
                 definitions: &scratch.info.definitions,
                 semantic_values: &scratch.info.semantic_values,
@@ -5573,6 +5576,7 @@ fn analyze_call_args(scratch: &mut UseScratch, blocks: &[SSABlock], env: &PassEn
 
             if let Some(ret_family) = ret_family.as_deref() {
                 let lower = LowerCtx {
+                    string_literals: env.string_literals,
                     use_info: None,
                     definitions: &scratch.info.definitions,
                     semantic_values: &scratch.info.semantic_values,
@@ -5663,6 +5667,7 @@ fn bind_single_use_call_result_definitions(
             .collect::<HashMap<_, _>>();
         for (op_idx, op) in block.ops.iter().enumerate() {
             let lower = LowerCtx {
+                string_literals: env.string_literals,
                 use_info: None,
                 definitions: &scratch.info.definitions,
                 semantic_values: &scratch.info.semantic_values,
@@ -5770,6 +5775,7 @@ fn bind_call_result_alias_definitions(
             let src_key = src.display_name();
             let uses_current_call_result = {
                 let lower = LowerCtx {
+                    string_literals: env.string_literals,
                     use_info: None,
                     definitions: &info.definitions,
                     semantic_values: &info.semantic_values,
@@ -8828,6 +8834,7 @@ mod tests {
 
         fn env(&self) -> PassEnv<'_> {
             PassEnv {
+                string_literals: crate::analysis::lower::no_string_literals(),
                 ptr_size: 64,
                 sp_name: &self.sp_name,
                 fp_name: &self.fp_name,
@@ -9131,6 +9138,7 @@ mod tests {
         let base_env = fixture.env();
         let empty_resolution = r2types::CalleeResolutionFacts::default();
         let env = PassEnv {
+            string_literals: crate::analysis::lower::no_string_literals(),
             callee_resolution: Some(&empty_resolution),
             ..base_env
         };
@@ -9145,6 +9153,7 @@ mod tests {
             .insert(0x401000, "sym.imp.printf".to_string());
         let base_env = fixture.env();
         let env = PassEnv {
+            string_literals: crate::analysis::lower::no_string_literals(),
             callee_resolution: Some(&empty_resolution),
             ..base_env
         };
@@ -9179,6 +9188,7 @@ mod tests {
         };
         let base_env = fixture.env();
         let env = PassEnv {
+            string_literals: crate::analysis::lower::no_string_literals(),
             callee_facts: &callee_facts,
             callee_resolution: Some(&resolution),
             ..base_env
@@ -9214,6 +9224,7 @@ mod tests {
         };
         let base_env = fixture.env();
         let env = PassEnv {
+            string_literals: crate::analysis::lower::no_string_literals(),
             callee_facts: &callee_facts,
             callee_resolution: Some(&resolution),
             ..base_env
@@ -9252,6 +9263,7 @@ mod tests {
         };
         let base_env = fixture.env();
         let env = PassEnv {
+            string_literals: crate::analysis::lower::no_string_literals(),
             callee_facts: &callee_facts,
             callee_resolution: Some(&resolution),
             ..base_env
@@ -9290,6 +9302,7 @@ mod tests {
         };
         let base_env = fixture.env();
         let env = PassEnv {
+            string_literals: crate::analysis::lower::no_string_literals(),
             callee_facts: &callee_facts,
             callee_resolution: Some(&resolution),
             ..base_env
@@ -9317,6 +9330,7 @@ mod tests {
         let fixture = TestEnvFixture::default();
         let base_env = fixture.env();
         let env = PassEnv {
+            string_literals: crate::analysis::lower::no_string_literals(),
             callee_facts: &callee_facts,
             callee_resolution: Some(&resolution),
             ..base_env
@@ -9358,6 +9372,7 @@ mod tests {
         let fixture = TestEnvFixture::default();
         let base_env = fixture.env();
         let env = PassEnv {
+            string_literals: crate::analysis::lower::no_string_literals(),
             callee_facts: &callee_facts,
             callee_resolution: Some(&resolution),
             ..base_env
@@ -9399,6 +9414,7 @@ mod tests {
         let fixture = TestEnvFixture::default();
         let base_env = fixture.env();
         let env = PassEnv {
+            string_literals: crate::analysis::lower::no_string_literals(),
             callee_facts: &callee_facts,
             callee_resolution: Some(&resolution),
             ..base_env
@@ -9434,6 +9450,7 @@ mod tests {
         let fixture = TestEnvFixture::default();
         let base_env = fixture.env();
         let env = PassEnv {
+            string_literals: crate::analysis::lower::no_string_literals(),
             callee_resolution: Some(&resolution),
             ..base_env
         };
@@ -10039,6 +10056,7 @@ mod tests {
 
         let info = analyze(std::slice::from_ref(&block), &env);
         let lower = LowerCtx {
+            string_literals: env.string_literals,
             use_info: Some(&info),
             definitions: &info.definitions,
             semantic_values: &info.semantic_values,
@@ -10163,6 +10181,7 @@ mod tests {
         );
         let base_env = fixture.env();
         let env = PassEnv {
+            string_literals: crate::analysis::lower::no_string_literals(),
             ret_reg_name: "x0",
             callee_facts: &callee_facts,
             callee_resolution: Some(&resolution),
@@ -10237,6 +10256,7 @@ mod tests {
             .insert("argv".to_string(), CType::ptr(CType::ptr(CType::Int(8))));
         let base_env = fixture.env();
         let env = PassEnv {
+            string_literals: crate::analysis::lower::no_string_literals(),
             ret_reg_name: "x0",
             ..base_env
         };
@@ -10396,6 +10416,7 @@ mod tests {
 
         let info = analyze(std::slice::from_ref(&block), &env);
         let lower = LowerCtx {
+            string_literals: env.string_literals,
             use_info: None,
             definitions: &info.definitions,
             semantic_values: &info.semantic_values,

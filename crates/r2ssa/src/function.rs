@@ -954,6 +954,9 @@ impl TrustedSsaArtifact {
                 display_names.insert_function(call.target_address(), name);
             }
         }
+        for (addr, text) in source.image().string_literals() {
+            display_names.insert_string(*addr, text.clone());
+        }
         // A source without a recovered prototype still describes its ABI in the
         // instructions: a register read before it is written carries a value the
         // caller supplied. Recover that rather than refusing the function, but

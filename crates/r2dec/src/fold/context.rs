@@ -87,6 +87,8 @@ pub(crate) struct FoldInputs<'a> {
     #[cfg(test)]
     pub(crate) symbols: &'a HashMap<u64, String>,
     pub(crate) function_facts: &'a FunctionFacts,
+    /// Spellings for addresses this function touches, for rendering only.
+    pub(crate) display_names: &'a r2types::DisplayNames,
     #[cfg(test)]
     #[allow(dead_code)]
     pub(crate) certified_rendering_required: bool,
@@ -424,6 +426,7 @@ impl<'a> FoldingContext<'a> {
         };
 
         let inputs = FoldInputs {
+            display_names: crate::empty_display_names(),
             arch,
             #[cfg(test)]
             function_names: EMPTY_U64_STRING.get_or_init(HashMap::new),

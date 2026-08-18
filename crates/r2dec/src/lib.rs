@@ -2951,6 +2951,7 @@ impl Decompiler {
         });
         let fold_inputs = FoldInputs {
             arch: &fold_arch,
+            display_names: self.context.function_facts.display_names(),
             #[cfg(test)]
             function_names: &self.context.function_names,
             #[cfg(test)]
@@ -3125,6 +3126,10 @@ impl Decompiler {
             }
             post_rename::rewrite_function_identifiers(&mut c_function, &known_function_names);
         }
+        fold_constant_arithmetic_in_function(
+            &mut c_function,
+            self.context.function_facts.display_names().strings(),
+        );
         propagate_single_use_register_carriers(&mut c_function, &fold_ctx);
         rewrite_stack_synonym_uses_to_declared_locals(&mut c_function, &fold_ctx);
         prune_dead_temp_assignments_in_function_body(&mut c_function, &fold_ctx);
@@ -3503,6 +3508,184 @@ fn expr_var_names(expr: &CExpr) -> Vec<String> {
         }
     });
     names
+}
+
+/// Fold arithmetic between integer literals, and name the result when it names
+/// a string.
+///
+/// A PIC address arrives as two constants: `adrp` puts a page in a register and
+/// `add` puts the offset on top, so the renderer had `0x100002000U + 0xbbc`
+/// where the program has one address. The sum is strictly more readable folded,
+/// and folding it is also what lets the string table answer: the table is keyed
+/// by address, and until the two halves are one number there is no address to
+/// look up.
+fn fold_constant_arithmetic_in_function(
+    func: &mut CFunction,
+    strings: &std::collections::BTreeMap<u64, String>,
+) {
+    for stmt in &mut func.body {
+        fold_constant_arithmetic_in_stmt(stmt, strings);
+    }
+}
+
+fn fold_constant_arithmetic_in_stmt(
+    stmt: &mut CStmt,
+    strings: &std::collections::BTreeMap<u64, String>,
+) {
+    let mut fold_expr = |expr: &mut CExpr| fold_constant_arithmetic_in_expr(expr, strings);
+    match stmt {
+        CStmt::Empty
+        | CStmt::Break
+        | CStmt::Continue
+        | CStmt::Goto(_)
+        | CStmt::Label(_)
+        | CStmt::Comment(_) => {}
+        CStmt::Expr(expr) => fold_expr(expr),
+        CStmt::Decl { init, .. } => {
+            if let Some(init) = init {
+                fold_expr(init);
+            }
+        }
+        CStmt::Return(expr) => {
+            if let Some(expr) = expr {
+                fold_expr(expr);
+            }
+        }
+        CStmt::Block(stmts) => {
+            for stmt in stmts {
+                fold_constant_arithmetic_in_stmt(stmt, strings);
+            }
+        }
+        CStmt::If {
+            cond,
+            then_body,
+            else_body,
+        } => {
+            fold_expr(cond);
+            fold_constant_arithmetic_in_stmt(then_body, strings);
+            if let Some(else_body) = else_body {
+                fold_constant_arithmetic_in_stmt(else_body, strings);
+            }
+        }
+        CStmt::While { cond, body } | CStmt::DoWhile { body, cond } => {
+            fold_expr(cond);
+            fold_constant_arithmetic_in_stmt(body, strings);
+        }
+        CStmt::For {
+            init,
+            cond,
+            update,
+            body,
+        } => {
+            if let Some(init) = init {
+                fold_constant_arithmetic_in_stmt(init, strings);
+            }
+            if let Some(cond) = cond {
+                fold_expr(cond);
+            }
+            if let Some(update) = update {
+                fold_expr(update);
+            }
+            fold_constant_arithmetic_in_stmt(body, strings);
+        }
+        CStmt::Switch {
+            expr,
+            cases,
+            default,
+        } => {
+            fold_expr(expr);
+            for case in cases {
+                for stmt in &mut case.body {
+                    fold_constant_arithmetic_in_stmt(stmt, strings);
+                }
+            }
+            if let Some(default) = default {
+                for stmt in default {
+                    fold_constant_arithmetic_in_stmt(stmt, strings);
+                }
+            }
+        }
+    }
+}
+
+/// The unsigned value of an integer literal, ignoring any cast around it.
+fn literal_value(expr: &CExpr) -> Option<u64> {
+    match expr {
+        CExpr::UIntLit(value) => Some(*value),
+        CExpr::IntLit(value) => u64::try_from(*value).ok(),
+        CExpr::Paren(inner) | CExpr::Cast { expr: inner, .. } => literal_value(inner),
+        _ => None,
+    }
+}
+
+fn fold_constant_arithmetic_in_expr(
+    expr: &mut CExpr,
+    strings: &std::collections::BTreeMap<u64, String>,
+) {
+    match expr {
+        CExpr::Unary { operand, .. }
+        | CExpr::Cast { expr: operand, .. }
+        | CExpr::Sizeof(operand)
+        | CExpr::AddrOf(operand)
+        | CExpr::Deref(operand)
+        | CExpr::Paren(operand) => fold_constant_arithmetic_in_expr(operand, strings),
+        CExpr::Binary { op, left, right } => {
+            fold_constant_arithmetic_in_expr(left, strings);
+            fold_constant_arithmetic_in_expr(right, strings);
+            if let (Some(lhs), Some(rhs)) = (literal_value(left), literal_value(right)) {
+                // Wrapping, because the program's arithmetic wraps; a fold that
+                // disagreed with the machine would be worse than no fold.
+                let folded = match op {
+                    BinaryOp::Add => Some(lhs.wrapping_add(rhs)),
+                    BinaryOp::Sub => Some(lhs.wrapping_sub(rhs)),
+                    _ => None,
+                };
+                if let Some(folded) = folded {
+                    *expr = CExpr::UIntLit(folded);
+                }
+            }
+        }
+        CExpr::Ternary {
+            cond,
+            then_expr,
+            else_expr,
+        } => {
+            fold_constant_arithmetic_in_expr(cond, strings);
+            fold_constant_arithmetic_in_expr(then_expr, strings);
+            fold_constant_arithmetic_in_expr(else_expr, strings);
+        }
+        CExpr::Call { func, args } => {
+            fold_constant_arithmetic_in_expr(func, strings);
+            for arg in args {
+                fold_constant_arithmetic_in_expr(arg, strings);
+            }
+        }
+        CExpr::Subscript { base, index } => {
+            fold_constant_arithmetic_in_expr(base, strings);
+            fold_constant_arithmetic_in_expr(index, strings);
+        }
+        CExpr::Member { base, .. } | CExpr::PtrMember { base, .. } => {
+            fold_constant_arithmetic_in_expr(base, strings)
+        }
+        CExpr::Comma(items) => {
+            for item in items {
+                fold_constant_arithmetic_in_expr(item, strings);
+            }
+        }
+        _ => {}
+    }
+    // Once the address is one number the string table can answer for it.
+    if let Some(value) = literal_value(expr)
+        && let Some(text) = strings.get(&value)
+    {
+        *expr = CExpr::StringLit(text.clone());
+    }
+}
+
+/// No spellings, for the fixtures that render without a source snapshot.
+pub(crate) fn empty_display_names() -> &'static r2types::DisplayNames {
+    static EMPTY: std::sync::OnceLock<r2types::DisplayNames> = std::sync::OnceLock::new();
+    EMPTY.get_or_init(r2types::DisplayNames::default)
 }
 
 /// How many times `name` is read across these statements.
@@ -4539,6 +4722,7 @@ fn infer_local_struct_field_accesses(
     }
 
     let env = analysis::PassEnv {
+        string_literals: crate::analysis::lower::no_string_literals(),
         ptr_size: config.ptr_size,
         sp_name: &config.sp_name,
         fp_name: &config.fp_name,
@@ -4708,6 +4892,7 @@ mod tests {
             caller_saved_regs: HashSet::new(),
         }));
         FoldingContext::from_inputs(FoldInputs {
+            display_names: crate::empty_display_names(),
             arch,
             function_names: Box::leak(Box::new(HashMap::new())),
             strings: Box::leak(Box::new(HashMap::new())),
@@ -4800,6 +4985,7 @@ mod tests {
         let visible_bindings = Vec::new();
         let external_type_db = ExternalTypeDb::default();
         let mut ctx = FoldingContext::from_inputs(FoldInputs {
+            display_names: crate::empty_display_names(),
             arch: &arch,
             function_names: &function_names,
             strings: &strings,
@@ -6364,6 +6550,7 @@ mod tests {
             }
         }
         let env = analysis::PassEnv {
+            string_literals: crate::analysis::lower::no_string_literals(),
             ptr_size: config.ptr_size,
             sp_name: &config.sp_name,
             fp_name: &config.fp_name,
@@ -6530,6 +6717,7 @@ mod tests {
             }
         }
         let env = analysis::PassEnv {
+            string_literals: crate::analysis::lower::no_string_literals(),
             ptr_size: config.ptr_size,
             sp_name: &config.sp_name,
             fp_name: &config.fp_name,
@@ -6751,6 +6939,7 @@ mod tests {
             }
         }
         let env = analysis::PassEnv {
+            string_literals: crate::analysis::lower::no_string_literals(),
             ptr_size: config.ptr_size,
             sp_name: &config.sp_name,
             fp_name: &config.fp_name,
@@ -7165,6 +7354,7 @@ mod tests {
             .render_authorized_signature()
             .and_then(|sig| sig.ret_type.as_ref().map(type_like_to_ctype));
         let fold_inputs = FoldInputs {
+            display_names: crate::empty_display_names(),
             arch: &fold_arch,
             function_names: &decompiler.context.function_names,
             strings: &decompiler.context.strings,

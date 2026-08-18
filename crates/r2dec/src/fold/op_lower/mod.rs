@@ -2088,6 +2088,7 @@ impl<'a> FoldingContext<'a> {
     }
     pub(crate) fn to_pass_env(&self) -> analysis::PassEnv<'_> {
         analysis::PassEnv {
+            string_literals: self.inputs.display_names.strings(),
             ptr_size: self.inputs.arch.ptr_size,
             sp_name: &self.inputs.arch.sp_name,
             fp_name: &self.inputs.arch.fp_name,
@@ -2319,6 +2320,7 @@ impl<'a> FoldingContext<'a> {
         }
         let type_hints = self.state.analysis_ctx.semantic().type_hints.clone();
         let env = analysis::PassEnv {
+            string_literals: self.inputs.display_names.strings(),
             ptr_size: self.inputs.arch.ptr_size,
             sp_name: &self.inputs.arch.sp_name,
             fp_name: &self.inputs.arch.fp_name,

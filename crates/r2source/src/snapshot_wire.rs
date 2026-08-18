@@ -726,6 +726,13 @@ pub fn write_image(
     for exit in image.external_exits() {
         writer.u64(*exit);
     }
+    let literals = u32::try_from(image.string_literals().len())
+        .map_err(|_| SnapshotWireError::ValueTooWide)?;
+    writer.u32(literals);
+    for (addr, text) in image.string_literals() {
+        writer.u64(*addr);
+        writer.string(text)?;
+    }
     let total =
         u64::try_from(image.total_source_bytes()).map_err(|_| SnapshotWireError::ValueTooWide)?;
     writer.u64(total);
@@ -746,12 +753,19 @@ pub fn read_image(
     for _ in 0..exit_count {
         external_exits.push(reader.u64()?);
     }
+    let literal_count = reader.u32()? as usize;
+    let mut string_literals = Vec::with_capacity(literal_count.min(4096));
+    for _ in 0..literal_count {
+        let addr = reader.u64()?;
+        string_literals.push((addr, reader.string()?.to_string()));
+    }
     let total_source_bytes =
         usize::try_from(reader.u64()?).map_err(|_| SnapshotWireError::ValueTooWide)?;
     Ok(OwnedFunctionImage {
         entry_address,
         blocks: blocks.into_boxed_slice(),
         external_exits: external_exits.into_boxed_slice(),
+        string_literals: string_literals.into_boxed_slice(),
         total_source_bytes,
     })
 }
@@ -1881,6 +1895,7 @@ mod tests {
     #[test]
     fn a_whole_function_image_round_trips() {
         let image = OwnedFunctionImage {
+            string_literals: Box::new([(0x1000_2bbc, "secret123".to_string())]),
             entry_address: 0x1000_07c0,
             blocks: vec![
                 OwnedFunctionBlock {
@@ -1915,6 +1930,7 @@ mod tests {
     #[test]
     fn an_image_truncated_mid_block_is_refused() {
         let image = OwnedFunctionImage {
+            string_literals: Box::new([(0x1000_2bbc, "secret123".to_string())]),
             entry_address: 0x40,
             blocks: vec![OwnedFunctionBlock {
                 address: 0x40,
@@ -2382,6 +2398,7 @@ mod tests {
                 },
             },
             OwnedFunctionImage {
+                string_literals: Box::new([]),
                 entry_address: 0x1000_07c0,
                 blocks: vec![OwnedFunctionBlock {
                     address: 0x1000_07c0,

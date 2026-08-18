@@ -159,12 +159,21 @@ pub struct OwnedFunctionImage {
     entry_address: u64,
     blocks: Box<[OwnedFunctionBlock]>,
     external_exits: Box<[u64]>,
+    /// String literals the function refers to, with the address each lives at.
+    ///
+    /// Display data: it tells a renderer what to print where a constant points
+    /// at text, and carries no claim about behaviour.
+    string_literals: Box<[(u64, String)]>,
     total_source_bytes: usize,
 }
 
 impl OwnedFunctionImage {
     pub const fn entry_address(&self) -> u64 {
         self.entry_address
+    }
+
+    pub fn string_literals(&self) -> &[(u64, String)] {
+        &self.string_literals
     }
 
     pub const fn blocks(&self) -> &[OwnedFunctionBlock] {
@@ -661,6 +670,7 @@ mod tests {
                 parameter_names: Box::new([]),
             },
             OwnedFunctionImage {
+                string_literals: Box::new([]),
                 entry_address: 0x1000,
                 blocks: vec![OwnedFunctionBlock {
                     address: 0x1000,

@@ -95,6 +95,9 @@ pub(crate) struct PassEnv<'a> {
     pub(crate) strings: &'a HashMap<u64, String>,
     #[cfg(test)]
     pub(crate) symbols: &'a HashMap<u64, String>,
+    /// String literals the source recorded, for rendering a constant that
+    /// points at text as the text it points at.
+    pub(crate) string_literals: &'a BTreeMap<u64, String>,
     pub(crate) callee_facts: &'a BTreeMap<u64, CalleeFact>,
     pub(crate) callee_resolution: Option<&'a CalleeResolutionFacts>,
     pub(crate) summary_view: Option<&'a InterprocSummaryView>,

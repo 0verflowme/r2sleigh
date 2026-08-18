@@ -14,6 +14,13 @@ use super::{
 use crate::address::parse_address_from_var_name;
 use crate::ast::{BinaryOp, CExpr, CType, UnaryOp};
 
+/// No string table, for the analysis passes that never render a literal.
+pub(crate) fn no_string_literals() -> &'static std::collections::BTreeMap<u64, String> {
+    static EMPTY: std::sync::OnceLock<std::collections::BTreeMap<u64, String>> =
+        std::sync::OnceLock::new();
+    EMPTY.get_or_init(std::collections::BTreeMap::new)
+}
+
 pub(crate) struct LowerCtx<'a> {
     pub(crate) use_info: Option<&'a UseInfo>,
     pub(crate) definitions: &'a HashMap<String, CExpr>,
@@ -28,6 +35,9 @@ pub(crate) struct LowerCtx<'a> {
     pub(crate) stack_slots: &'a HashMap<String, StackSlotProvenance>,
     pub(crate) forwarded_values: &'a HashMap<String, ValueProvenance>,
     pub(crate) type_oracle: Option<&'a dyn TypeOracle>,
+    /// String literals the source recorded, for rendering a constant that
+    /// points at text as the text.
+    pub(crate) string_literals: &'a std::collections::BTreeMap<u64, String>,
 }
 
 impl<'a> LowerCtx<'a> {
@@ -719,9 +729,17 @@ impl<'a> LowerCtx<'a> {
         }
     }
 
+    /// The literal stored at `addr`, when the source said what is there.
+    ///
+    /// Only strings resolve. A function or symbol name at an address is a label
+    /// for that address, not the value held in it, and printing one where a
+    /// value belongs would state something the program never says. A string is
+    /// different: it is the content, and `"secret123"` is the same fact as the
+    /// address of those bytes, spelled so a reader can use it.
     fn resolve_addr_literal(&self, addr: u64) -> Option<CExpr> {
-        let _ = addr;
-        None
+        self.string_literals
+            .get(&addr)
+            .map(|text| CExpr::StringLit(text.clone()))
     }
 
     fn binary_expr(&self, op: BinaryOp, a: &SSAVar, b: &SSAVar) -> CExpr {
@@ -1414,6 +1432,7 @@ mod tests {
         let semantic_values = Box::leak(Box::new(HashMap::new()));
         let param_register_aliases = Box::leak(Box::new(HashMap::new()));
         LowerCtx {
+            string_literals: crate::analysis::lower::no_string_literals(),
             use_info: None,
             definitions,
             semantic_values,

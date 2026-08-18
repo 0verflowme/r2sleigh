@@ -1576,6 +1576,9 @@ unsafe fn capture_image(
         external_exits.push(target);
     }
     Ok(OwnedFunctionImage {
+        // The legacy accessor transport predates the string table; the flat
+        // snapshot buffer is the path that carries it.
+        string_literals: Box::new([]),
         entry_address: top.function_addr,
         blocks: blocks.into_boxed_slice(),
         external_exits: external_exits.into_boxed_slice(),

@@ -441,6 +441,7 @@ fn populate_prepared_render_definitions(
             }
             let expr = {
                 let lower = LowerCtx {
+                    string_literals: crate::analysis::lower::no_string_literals(),
                     use_info: Some(use_info),
                     definitions: &use_info.definitions,
                     semantic_values: &use_info.semantic_values,
@@ -4942,6 +4943,7 @@ mod tests {
         let caller_saved_regs = HashSet::new();
         let type_hints = HashMap::from([("result".to_string(), crate::ast::CType::u64())]);
         let env = PassEnv {
+            string_literals: crate::analysis::lower::no_string_literals(),
             ptr_size: 8,
             sp_name: "rsp",
             fp_name: "rbp",
@@ -4974,6 +4976,7 @@ mod tests {
         let caller_saved_regs = HashSet::from(["RCX".to_string()]);
         let type_hints: HashMap<String, crate::ast::CType> = HashMap::new();
         let env = PassEnv {
+            string_literals: crate::analysis::lower::no_string_literals(),
             ptr_size: 8,
             sp_name: "RSP",
             fp_name: "RBP",

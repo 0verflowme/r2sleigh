@@ -766,6 +766,7 @@ mod tests {
         let empty_str = Box::leak(Box::new(HashMap::new()));
         let empty_ty = Box::leak(Box::new(HashMap::new()));
         FoldingContext::from_inputs(FoldInputs {
+            display_names: crate::empty_display_names(),
             arch,
             function_names: empty_u64,
             strings: empty_u64,
@@ -811,6 +812,7 @@ mod tests {
         let empty_str = Box::leak(Box::new(HashMap::new()));
         let empty_ty = Box::leak(Box::new(HashMap::new()));
         FoldingContext::from_inputs(FoldInputs {
+            display_names: crate::empty_display_names(),
             arch,
             function_names: empty_u64,
             strings: empty_u64,
@@ -12562,6 +12564,7 @@ mod tests {
             "r9".to_string(),
         ]));
         let env = PassEnv {
+            string_literals: crate::analysis::lower::no_string_literals(),
             ptr_size: 8,
             sp_name: "rsp",
             fp_name: "rbp",
