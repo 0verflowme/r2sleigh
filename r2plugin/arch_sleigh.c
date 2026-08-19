@@ -115,32 +115,12 @@ static RAnal *sleigh_arch_anal(RArchSession *as) {
 	return core? core->anal: NULL;
 }
 
+/* One mapping, shared with the anal plugin: see sleigh_language_for_machine in
+ * r_anal_sleigh.c. Two copies of this decision used to disagree about
+ * endianness and CPU variants. */
 static const char *sleigh_arch_name(RArchSession *as) {
 	RCore *core = as? (RCore *)as->user: NULL;
-	RBinInfo *info = core? r_bin_get_info (core->bin): NULL;
-	if (!info || !info->arch) {
-		return NULL;
-	}
-	if (!strcmp (info->arch, "x86")) {
-		return info->bits == 64? "x86-64": "x86";
-	}
-	if (!strcmp (info->arch, "arm64") || !strcmp (info->arch, "aarch64")
-			|| (!strcmp (info->arch, "arm") && info->bits == 64)) {
-		return "arm64";
-	}
-	if (!strcmp (info->arch, "arm")) {
-		return "arm";
-	}
-	if (!strcmp (info->arch, "riscv")) {
-		return info->bits == 64? "riscv64": "riscv32";
-	}
-	if (!strncmp (info->arch, "mips", 4)) {
-		if (info->bits == 64) {
-			return info->big_endian? "mips64be": "mips64le";
-		}
-		return info->big_endian? "mips32be": "mips32le";
-	}
-	return NULL;
+	return r2sleigh_language_for_bin_info (core? r_bin_get_info (core->bin): NULL);
 }
 
 static RAnal *sleigh_arch_prepare(RArchSession *as) {

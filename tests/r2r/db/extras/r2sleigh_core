@@ -79,3 +79,93 @@ s 0 >/dev/null
 a:sla.debug.json | jq -c '([.[] | .CallOther? | select((.userop | numbers) and (.inputs | arrays))] | length) > 0 and ([.[] | .CallOther? | select(has("userop_name"))] | length) == 0'
 EOF_CMDS
 RUN
+
+NAME=sla_arm32_selects_a32_language
+FILE=malloc://64
+ARGS=-a arm -b 32 -e scr.color=false -e log.level=0
+EXPECT=<<EOF_EXPECT
+sla: loaded architecture 'arm'
+EOF_EXPECT
+CMDS=<<EOF_CMDS
+a:sla
+EOF_CMDS
+RUN
+
+NAME=sla_arm32_big_endian_selects_big_endian_language
+FILE=malloc://64
+ARGS=-a arm -b 32 -e cfg.bigendian=true -e scr.color=false -e log.level=0
+EXPECT=<<EOF_EXPECT
+sla: loaded architecture 'armbe'
+EOF_EXPECT
+CMDS=<<EOF_CMDS
+a:sla
+EOF_CMDS
+RUN
+
+NAME=sla_arm_thumb_selects_thumb_language
+FILE=malloc://64
+ARGS=-a arm -b 16 -e scr.color=false -e log.level=0
+EXPECT=<<EOF_EXPECT
+sla: loaded architecture 'thumb'
+EOF_EXPECT
+CMDS=<<EOF_CMDS
+a:sla
+EOF_CMDS
+RUN
+
+NAME=sla_arm_thumb_big_endian_selects_big_endian_thumb_language
+FILE=malloc://64
+ARGS=-a arm -b 16 -e cfg.bigendian=true -e scr.color=false -e log.level=0
+EXPECT=<<EOF_EXPECT
+sla: loaded architecture 'thumbbe'
+EOF_EXPECT
+CMDS=<<EOF_CMDS
+a:sla
+EOF_CMDS
+RUN
+
+NAME=sla_arm64_stays_selected_for_64bit_arm
+FILE=malloc://64
+ARGS=-a arm -b 64 -e scr.color=false -e log.level=0
+EXPECT=<<EOF_EXPECT
+sla: loaded architecture 'arm64'
+EOF_EXPECT
+CMDS=<<EOF_CMDS
+a:sla
+EOF_CMDS
+RUN
+
+NAME=sla_mips_endianness_selects_matching_language
+FILE=malloc://64
+ARGS=-a mips -b 32 -e cfg.bigendian=true -e scr.color=false -e log.level=0
+EXPECT=<<EOF_EXPECT
+sla: loaded architecture 'mips32be'
+EOF_EXPECT
+CMDS=<<EOF_CMDS
+a:sla
+EOF_CMDS
+RUN
+
+NAME=sla_micromips_is_refused_not_decoded_as_mips32
+FILE=malloc://64
+ARGS=-a mips -b 32 -e cfg.bigendian=true -e asm.cpu=micro -e scr.color=false -e log.level=0
+EXPECT=<<EOF_EXPECT
+sla: no architecture loaded (unsupported or init failed)
+EOF_EXPECT
+CMDS=<<EOF_CMDS
+a:sla
+EOF_CMDS
+RUN
+
+NAME=sla_arm32_decodes_a32_bytes_not_thumb
+FILE=malloc://64
+ARGS=-a arm -b 32 -e scr.color=false -e log.level=0
+EXPECT=<<EOF_EXPECT
+true
+EOF_EXPECT
+CMDS=<<EOF_CMDS
+wx 000050e30ef0a0e100000000000000
+s 0 >/dev/null
+a:sla.debug.regs | jq -c '(.read | index("r0") != null) and (.write | index("OV") != null) and (.write | index("CY") != null) and (.write | index("r0") == null)'
+EOF_CMDS
+RUN

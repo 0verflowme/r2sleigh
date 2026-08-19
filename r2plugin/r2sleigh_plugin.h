@@ -13,6 +13,9 @@ extern "C" {
 /* Function declarations shared between plugins */
 R2ILContext *get_context(RAnal *anal);
 void r2sleigh_set_arch_override(const char *arch);
+/* The single machine-evidence -> Sleigh language mapping. NULL means refuse:
+ * no bundled language matches the binary's headers. */
+const char *r2sleigh_language_for_bin_info(RBinInfo *info);
 int sleigh_op(RAnal *anal, RAnalOp *op, ut64 addr, const ut8 *data, int len, int mask);
 
 #ifdef __cplusplus

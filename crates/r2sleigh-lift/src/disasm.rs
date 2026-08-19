@@ -87,9 +87,13 @@ impl TrustedSleighProfile {
                 "x86-64",
             ),
             #[cfg(feature = "arm")]
+            // Ghidra's own ARM.ldefs pairs ARM8_le with ARMt, which leaves
+            // TMode clear. A Cortex pspec sets TMode, and Cortex-M is
+            // Thumb-only, so pairing it here would lift every A32 instruction
+            // as Thumb: wrong instruction, wrong length, wrong control flow.
             Self::ArmCortexLe => (
                 sleigh_config::processor_arm::SLA_ARM8_LE,
-                sleigh_config::processor_arm::PSPEC_ARMCORTEX,
+                sleigh_config::processor_arm::PSPEC_ARMT,
                 "ARM",
             ),
             #[cfg(feature = "arm")]

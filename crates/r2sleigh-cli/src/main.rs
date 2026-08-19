@@ -657,14 +657,13 @@ fn get_disassembler_with_spec(arch: &str) -> Result<(Disassembler, r2il::ArchSpe
         "arm" | "arm32" | "arm-le" => {
             let spec = build_arch_spec(
                 sleigh_config::processor_arm::SLA_ARM8_LE,
-                sleigh_config::processor_arm::PSPEC_ARMCORTEX,
+                sleigh_config::processor_arm::PSPEC_ARMT,
                 "arm",
             )
             .map_err(|e| e.to_string())?;
             let disasm = Disassembler::from_sla(
                 sleigh_config::processor_arm::SLA_ARM8_LE,
-                // sleigh-config 1.x does not ship an ARM8 pspec; use a Cortex pspec instead.
-                sleigh_config::processor_arm::PSPEC_ARMCORTEX,
+                sleigh_config::processor_arm::PSPEC_ARMT,
                 "ARM",
             )
             .map_err(|e| e.to_string())?;

@@ -3138,55 +3138,242 @@ static bool release_sleigh_context(void) {
 	return true;
 }
 
+/* ---------------------------------------------------------------------------
+ * Machine evidence -> Sleigh language
+ *
+ * One decision, one implementation. Both entry points (the anal plugin, which
+ * reads asm.arch/asm.bits/asm.cpu/asm.abi/cfg.bigendian, and the arch plugin,
+ * which reads the binary's own headers) funnel their evidence through
+ * SleighMachine and get the same answer.
+ *
+ * A NULL answer is a refusal, and refusing is the correct output whenever no
+ * bundled language matches the evidence. Loading a neighbouring language
+ * instead yields well-formed, confidently wrong disassembly, which is worse
+ * than none.
+ * ------------------------------------------------------------------------ */
+
+typedef struct {
+	const char *arch;	/* asm.arch or RBinInfo.arch */
+	int bits;		/* 16 means Thumb on ARM, real mode on x86 */
+	bool big_endian;
+	const char *cpu;	/* asm.cpu or RBinInfo.cpu, may be NULL */
+	const char *abi;	/* asm.abi or RBinInfo.abi, may be NULL */
+} SleighMachine;
+
+/* ARMv6 introduced BE8: only data is big-endian, instructions stay
+ * little-endian. Pre-v6 big-endian ARM (BE32) fetches instructions big-endian
+ * too. Ghidra draws exactly this line -- ARM:LEBE:32:v8LEInstruction uses
+ * ARM8_le.sla while ARM:BE:32:v8 uses ARM8_be.sla -- and the ELF e_flags bit
+ * is the only evidence, which radare2 surfaces as " be8" inside the ABI
+ * string. */
+static bool sleigh_arm_instructions_are_big_endian(const SleighMachine *m) {
+	if (!m->big_endian) {
+		return false;
+	}
+	return !(m->abi && strstr (m->abi, "be8"));
+}
+
+static const char *sleigh_language_for_arm(const SleighMachine *m) {
+	if (m->bits == 64) {
+		/* Data endianness follows the slaspec, so a big-endian AArch64 image
+		 * needs the big-endian language even though the encoding is fixed. */
+		return m->big_endian? "arm64be": "arm64";
+	}
+	/* radare2 spells Thumb as asm.bits=16; asm.cpu=cortex is Thumb-only. */
+	const bool thumb = (m->bits == 16)
+		|| (m->cpu && !r_str_casecmp (m->cpu, "cortex"));
+	const bool be = sleigh_arm_instructions_are_big_endian (m);
+	if (thumb) {
+		return be? "thumbbe": "thumb";
+	}
+	return be? "armbe": "arm";
+}
+
+/* MIPS release 6 re-encoded and removed instructions the pre-R6 languages
+ * still accept, so it needs its own slaspec rather than the base one. */
+static bool sleigh_mips_cpu_is_r6(const char *cpu) {
+	const size_t len = strlen (cpu);
+	return len >= 2 && !r_str_casecmp (cpu + len - 2, "r6");
+}
+
+/* Set when a machine we otherwise support carries a variant no bundled
+ * language covers. A bare refusal reads as a missing backend, so the caller
+ * says this once instead of leaving `invalid` unexplained. Left NULL for
+ * architectures this build simply does not carry, which stay quiet so other
+ * plugins can take over. */
+static const char *sleigh_refusal_reason = NULL;
+
+static const char *sleigh_refuse(const char *why) {
+	sleigh_refusal_reason = why;
+	return NULL;
+}
+
+static const char *sleigh_language_for_mips(const SleighMachine *m) {
+	const char *arch = m->arch;
+	bool is64 = m->bits >= 64
+		|| !strcmp (arch, "mips64")
+		|| !strcmp (arch, "mips64be")
+		|| !strcmp (arch, "mips64le")
+		|| !strcmp (arch, "mips64el");
+	bool be = m->big_endian;
+	if (!strcmp (arch, "mipsel") || !strcmp (arch, "mips32le")
+			|| !strcmp (arch, "mips32el")
+			|| !strcmp (arch, "mips64le")
+			|| !strcmp (arch, "mips64el")) {
+		be = false;
+	} else if (!strcmp (arch, "mips32be") || !strcmp (arch, "mipsbe")
+			|| !strcmp (arch, "mipseb") || !strcmp (arch, "mips64be")) {
+		be = true;
+	}
+	if (m->cpu) {
+		/* microMIPS and MIPS16e are distinct encodings selected by the
+		 * ISA_MODE context bit. sleigh-config bundles mips32micro.pspec, but
+		 * it only clears RELP: every micromips constructor is additionally
+		 * gated on ISA_MODE=1, which no bundled pspec sets and the lift API
+		 * offers no way to override. Under the base MIPS32 language these
+		 * images decode as real mnemonics at misaligned offsets interleaved
+		 * with `invalid`, so refuse. */
+		if (!r_str_casecmp (m->cpu, "micro") || strstr (m->cpu, "micromips")) {
+			return sleigh_refuse ("microMIPS decoding needs the ISA_MODE context bit, which no bundled processor spec sets");
+		}
+		if (strstr (m->cpu, "mips16") || !r_str_casecmp (m->cpu, "16")) {
+			return sleigh_refuse ("MIPS16e decoding needs the ISA_MODE context bit, which no bundled processor spec sets");
+		}
+		if (sleigh_mips_cpu_is_r6 (m->cpu)) {
+			if (is64) {
+				/* mips64R6.pspec is bundled but no MIPS64 R6 slaspec is. */
+				return sleigh_refuse ("no MIPS64 release-6 slaspec is bundled");
+			}
+			return be? "mips32r6be": "mips32r6le";
+		}
+	}
+	if (is64) {
+		return be? "mips64be": "mips64le";
+	}
+	return be? "mips32be": "mips32le";
+}
+
+static const char *sleigh_language_for_machine(const SleighMachine *m) {
+	sleigh_refusal_reason = NULL;
+	if (!m->arch || !*m->arch) {
+		return NULL;
+	}
+	const char *arch = m->arch;
+	if (!strcmp (arch, "x86")) {
+		if (m->big_endian) {
+			return sleigh_refuse ("no big-endian x86 language exists");
+		}
+		if (m->bits == 16) {
+			return sleigh_refuse ("x86-16 ships a processor spec but no slaspec");
+		}
+		return (m->bits == 64)? "x86-64": "x86";
+	}
+	if (!strcmp (arch, "arm") || !strcmp (arch, "thumb")) {
+		return sleigh_language_for_arm (m);
+	}
+	if (!strcmp (arch, "arm64") || !strcmp (arch, "aarch64")) {
+		SleighMachine wide = *m;
+		wide.bits = 64;
+		return sleigh_language_for_arm (&wide);
+	}
+	if (!strcmp (arch, "riscv") || !strcmp (arch, "riscv32")
+			|| !strcmp (arch, "riscv64") || !strcmp (arch, "rv32")
+			|| !strcmp (arch, "rv64")) {
+		if (m->big_endian) {
+			return sleigh_refuse ("only the little-endian RISC-V languages are bundled");
+		}
+		if (!strcmp (arch, "riscv32") || !strcmp (arch, "rv32")) {
+			return "riscv32";
+		}
+		if (!strcmp (arch, "riscv64") || !strcmp (arch, "rv64")) {
+			return "riscv64";
+		}
+		return (m->bits >= 64)? "riscv64": "riscv32";
+	}
+	if (!strncmp (arch, "mips", 4)) {
+		return sleigh_language_for_mips (m);
+	}
+	return NULL; /* unsupported architecture */
+}
+
+/* The arch plugin's route: decide from the binary's own headers. */
+const char *r2sleigh_language_for_bin_info(RBinInfo *info) {
+	if (!info || !info->arch) {
+		return NULL;
+	}
+	SleighMachine machine = {
+		.arch = info->arch,
+		.bits = info->bits,
+		.big_endian = info->big_endian != 0,
+		.cpu = info->cpu,
+		.abi = info->abi,
+	};
+	return sleigh_language_for_machine (&machine);
+}
+
+/* asm.arch=r2sleigh names this plugin, not a machine. The decoder still
+ * reaches a language through the binary's headers, so answer from that same
+ * evidence rather than reporting nothing loaded. */
+static bool sleigh_arch_is_not_a_machine(const char *arch) {
+	return !strcmp (arch, "r2sleigh") || !strcmp (arch, "null")
+		|| !strcmp (arch, "any");
+}
+
+static const char *sleigh_language_for_anal(RAnal *anal) {
+	RBinInfo *info = anal->binb.bin? r_bin_get_info (anal->binb.bin): NULL;
+	if (sleigh_arch_is_not_a_machine (anal->config->arch)) {
+		return r2sleigh_language_for_bin_info (info);
+	}
+	SleighMachine machine = {
+		.arch = anal->config->arch,
+		.bits = anal->config->bits,
+		.big_endian = R_ARCH_CONFIG_IS_BIG_ENDIAN (anal->config),
+		.cpu = anal->config->cpu,
+		.abi = anal->config->abi,
+	};
+	/* The session config is authoritative, but it carries no BE8 flag of its
+	 * own when the user never set asm.abi; borrow that one fact from the
+	 * headers rather than guessing BE32. */
+	if (!machine.abi && info && info->abi && info->arch
+			&& !strcmp (info->arch, machine.arch)) {
+		machine.abi = info->abi;
+	}
+	return sleigh_language_for_machine (&machine);
+}
+
+static void sleigh_report_refusal(RAnal *anal) {
+	if (!sleigh_refusal_reason) {
+		return;
+	}
+	static char *last = NULL;
+	char *what = r_str_newf ("%s|%d|%s", anal->config->arch, anal->config->bits,
+		anal->config->cpu? anal->config->cpu: "-");
+	if (!what) {
+		return;
+	}
+	if (last && !strcmp (last, what)) {
+		free (what);
+		return;
+	}
+	free (last);
+	last = what;
+	R_LOG_WARN ("r2sleigh: refusing to disassemble: %s", sleigh_refusal_reason);
+}
+
 R2ILContext *get_context(RAnal *anal) {
 	if (!anal || !anal->config || !anal->config->arch[0]) {
 		return NULL;
 	}
-	const char *arch = anal->config->arch;
-	int bits = anal->config->bits;
-
-	/* Determine sleigh arch string */
-	const char *sleigh_arch_str;
-	if (sleigh_arch_override) {
-		sleigh_arch_str = sleigh_arch_override;
-	} else if (!strcmp (arch, "x86")) {
-		sleigh_arch_str = (bits == 64) ? "x86-64" : "x86";
-	} else if (!strcmp (arch, "arm")) {
-		sleigh_arch_str = (bits == 64) ? "arm64" : "arm";
-	} else if (!strcmp (arch, "arm64") || !strcmp (arch, "aarch64")) {
-		sleigh_arch_str = "arm64";
-	} else if (!strcmp (arch, "riscv")) {
-		sleigh_arch_str = (bits >= 64) ? "riscv64" : "riscv32";
-	} else if (!strcmp (arch, "riscv32") || !strcmp (arch, "rv32")) {
-		sleigh_arch_str = "riscv32";
-	} else if (!strcmp (arch, "riscv64") || !strcmp (arch, "rv64")) {
-		sleigh_arch_str = "riscv64";
-	} else if (!strcmp (arch, "mips") || !strcmp (arch, "mips32")
-			|| !strcmp (arch, "mips32be") || !strcmp (arch, "mipsbe")
-			|| !strcmp (arch, "mipseb") || !strcmp (arch, "mipsel")
-			|| !strcmp (arch, "mips32le") || !strcmp (arch, "mips32el")
-			|| !strcmp (arch, "mips64") || !strcmp (arch, "mips64be")
-			|| !strcmp (arch, "mips64le") || !strcmp (arch, "mips64el")) {
-		bool is64 = bits >= 64
-			|| !strcmp (arch, "mips64")
-			|| !strcmp (arch, "mips64be")
-			|| !strcmp (arch, "mips64le")
-			|| !strcmp (arch, "mips64el");
-		bool big_endian = R_ARCH_CONFIG_IS_BIG_ENDIAN (anal->config);
-		if (!strcmp (arch, "mipsel") || !strcmp (arch, "mips32le")
-				|| !strcmp (arch, "mips32el")
-				|| !strcmp (arch, "mips64le")
-				|| !strcmp (arch, "mips64el")) {
-			big_endian = false;
-		} else if (!strcmp (arch, "mips32be") || !strcmp (arch, "mipsbe")
-				|| !strcmp (arch, "mipseb") || !strcmp (arch, "mips64be")) {
-			big_endian = true;
-		}
-		sleigh_arch_str = is64
-			? (big_endian ? "mips64be" : "mips64le")
-			: (big_endian ? "mips32be" : "mips32le");
-	} else {
-		return NULL; /* unsupported arch */
+	const char *sleigh_arch_str = sleigh_arch_override
+		? sleigh_arch_override
+		: sleigh_language_for_anal (anal);
+	if (!sleigh_arch_str) {
+		/* No bundled language matches this machine. Say why once when the
+		 * architecture itself is one we carry, so a refusal is not mistaken
+		 * for a missing backend; stay quiet otherwise so other plugins can
+		 * take over without noise. */
+		sleigh_report_refusal (anal);
+		return NULL;
 	}
 
 	/* Check if we need to reinitialize */
@@ -3661,12 +3848,9 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 			if (ctx) {
 				(void)sleigh_v2_context_arch_name (ctx, &name);
 			}
+			const char *loaded = ctx? (sleigh_arch? sleigh_arch: name): NULL;
 			if (cons) {
-				if (name) {
-					r_cons_printf (cons, "%s\n", name);
-				} else {
-					r_cons_println (cons, "none");
-				}
+				r_cons_println (cons, loaded? loaded: "none");
 			}
 			free (name);
 		}
@@ -3676,10 +3860,14 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 	if (!strcmp (cmd, "sla") || !strcmp (cmd, "sla.info")) {
 		R2ILContext *ctx = get_context (anal);
 		if (ctx) {
+			/* Report the language key that actually selected the slaspec and
+			 * pspec, not the coarser ArchSpec name: "ARM" alone cannot say
+			 * whether A32 or Thumb, little- or big-endian, is in use. */
 			char *name = NULL;
 			(void)sleigh_v2_context_arch_name (ctx, &name);
+			const char *loaded = sleigh_arch? sleigh_arch: (name? name: "unknown");
 			if (cons) {
-				r_cons_printf (cons, "sla: loaded architecture '%s'\n", name ? name : "unknown");
+				r_cons_printf (cons, "sla: loaded architecture '%s'\n", loaded);
 			}
 			free (name);
 		} else {

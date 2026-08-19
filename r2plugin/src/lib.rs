@@ -1943,196 +1943,179 @@ fn op_all_varnodes(op: &R2ILOp) -> Vec<&Varnode> {
 // Architecture Helpers
 // ============================================================================
 
+/// One Sleigh language: the compiled slaspec, the processor spec that pins its
+/// decode context, and the architecture name the rest of the pipeline knows it
+/// by.
+///
+/// The slaspec alone does not determine the decode. `ARM8_le.sla` decodes A32
+/// under `ARMt.pspec` (TMode=0) and Thumb under `ARMtTHUMB.pspec` (TMode=1), so
+/// the pspec is part of the language identity, not a detail. Pairings follow
+/// Ghidra's own `*.ldefs`.
+struct SleighLanguage {
+    sla: &'static [u8],
+    pspec: &'static str,
+    /// Name exposed as `ArchSpec::name`. Downstream ABI selection keys off it,
+    /// so ARM32 stays "ARM" across all four A32/Thumb x LE/BE languages; the
+    /// language actually chosen is reported by its selector key instead.
+    name: &'static str,
+}
+
+/// Resolve a selector key to the one Sleigh language it names.
+///
+/// Returns `None` for keys no bundled language covers. Callers refuse on
+/// `None` rather than substituting a neighbouring language: disassembly under
+/// the wrong language is well-formed and confidently wrong, which is worse
+/// than no disassembly at all.
+fn sleigh_language(arch: &str) -> Option<SleighLanguage> {
+    let (sla, pspec, name) = match arch {
+        #[cfg(feature = "x86")]
+        "x86-64" | "x86_64" | "x64" | "amd64" => (
+            sleigh_config::processor_x86::SLA_X86_64,
+            sleigh_config::processor_x86::PSPEC_X86_64,
+            "x86-64",
+        ),
+        #[cfg(feature = "x86")]
+        "x86" | "x86-32" | "i386" | "i686" => (
+            sleigh_config::processor_x86::SLA_X86,
+            sleigh_config::processor_x86::PSPEC_X86,
+            "x86",
+        ),
+        // ARM32. `ARMt.pspec` sets TMode=0 (A32) and `ARMtTHUMB.pspec` sets
+        // TMode=1 (Thumb); `ARMCortex.pspec` also sets TMode=1 and plants a
+        // Cortex-M vector table over ram:0x0-0x40, so it is only ever right for
+        // a Cortex-M image and never for Linux/Android userland.
+        #[cfg(feature = "arm")]
+        "arm" | "arm32" | "arm-le" => (
+            sleigh_config::processor_arm::SLA_ARM8_LE,
+            sleigh_config::processor_arm::PSPEC_ARMT,
+            "ARM",
+        ),
+        #[cfg(feature = "arm")]
+        "armbe" | "arm-be" | "armeb" => (
+            sleigh_config::processor_arm::SLA_ARM8_BE,
+            sleigh_config::processor_arm::PSPEC_ARMT,
+            "ARM",
+        ),
+        #[cfg(feature = "arm")]
+        "thumb" | "thumb-le" => (
+            sleigh_config::processor_arm::SLA_ARM8_LE,
+            sleigh_config::processor_arm::PSPEC_ARMTTHUMB,
+            "ARM",
+        ),
+        #[cfg(feature = "arm")]
+        "thumbbe" | "thumb-be" | "thumbeb" => (
+            sleigh_config::processor_arm::SLA_ARM8_BE,
+            sleigh_config::processor_arm::PSPEC_ARMTTHUMB,
+            "ARM",
+        ),
+        #[cfg(feature = "arm")]
+        "arm64" | "arm64e" | "aarch64" => (
+            sleigh_config::processor_aarch64::SLA_AARCH64_APPLESILICON,
+            sleigh_config::processor_aarch64::PSPEC_AARCH64,
+            "aarch64",
+        ),
+        #[cfg(feature = "arm")]
+        "arm64be" | "aarch64be" | "aarch64_be" => (
+            sleigh_config::processor_aarch64::SLA_AARCH64BE,
+            sleigh_config::processor_aarch64::PSPEC_AARCH64,
+            "aarch64",
+        ),
+        #[cfg(feature = "mips")]
+        "mips" | "mips32" | "mips32be" | "mipsbe" | "mipseb" => (
+            sleigh_config::processor_mips::SLA_MIPS32BE,
+            sleigh_config::processor_mips::PSPEC_MIPS32,
+            "mips32be",
+        ),
+        #[cfg(feature = "mips")]
+        "mipsel" | "mips32le" | "mips32el" => (
+            sleigh_config::processor_mips::SLA_MIPS32LE,
+            sleigh_config::processor_mips::PSPEC_MIPS32,
+            "mips32le",
+        ),
+        // MIPS Release 6 dropped and re-encoded instructions the pre-R6
+        // languages still accept, so R6 needs its own slaspec.
+        #[cfg(feature = "mips")]
+        "mips32r6be" => (
+            sleigh_config::processor_mips::SLA_MIPS32R6BE,
+            sleigh_config::processor_mips::PSPEC_MIPS32R6,
+            "mips32r6be",
+        ),
+        #[cfg(feature = "mips")]
+        "mips32r6le" => (
+            sleigh_config::processor_mips::SLA_MIPS32R6LE,
+            sleigh_config::processor_mips::PSPEC_MIPS32R6,
+            "mips32r6le",
+        ),
+        #[cfg(feature = "mips")]
+        "mips64" | "mips64be" => (
+            sleigh_config::processor_mips::SLA_MIPS64BE,
+            sleigh_config::processor_mips::PSPEC_MIPS64,
+            "mips64be",
+        ),
+        #[cfg(feature = "mips")]
+        "mips64el" | "mips64le" => (
+            sleigh_config::processor_mips::SLA_MIPS64LE,
+            sleigh_config::processor_mips::PSPEC_MIPS64,
+            "mips64le",
+        ),
+        #[cfg(feature = "riscv")]
+        "riscv64" | "rv64" | "rv64gc" => (
+            sleigh_config::processor_riscv::SLA_RISCV_LP64D,
+            sleigh_config::processor_riscv::PSPEC_RV64GC,
+            "riscv64",
+        ),
+        #[cfg(feature = "riscv")]
+        "riscv32" | "rv32" | "rv32gc" => (
+            sleigh_config::processor_riscv::SLA_RISCV_ILP32D,
+            sleigh_config::processor_riscv::PSPEC_RV32GC,
+            "riscv32",
+        ),
+        _ => return None,
+    };
+    Some(SleighLanguage { sla, pspec, name })
+}
+
+/// Selector keys this build can serve, for the refusal message.
+fn supported_arch_keys() -> Vec<&'static str> {
+    let mut supported: Vec<&'static str> = vec![];
+    #[cfg(feature = "x86")]
+    supported.extend(["x86-64", "x86"]);
+    #[cfg(feature = "arm")]
+    supported.extend([
+        "arm", "armbe", "thumb", "thumbbe", "arm64", "aarch64", "arm64be",
+    ]);
+    #[cfg(feature = "mips")]
+    supported.extend([
+        "mips32be",
+        "mips32le",
+        "mips32r6be",
+        "mips32r6le",
+        "mips64be",
+        "mips64le",
+    ]);
+    #[cfg(feature = "riscv")]
+    supported.extend(["riscv64", "riscv32"]);
+    supported
+}
+
 /// Helper: build a disassembler and ArchSpec for a given arch string.
 fn create_disassembler_for_arch(arch: &str) -> Result<(ArchSpec, Disassembler), String> {
-    match arch.to_lowercase().as_str() {
-        #[cfg(feature = "x86")]
-        "x86-64" | "x86_64" | "x64" | "amd64" => {
-            let spec = build_arch_spec(
-                sleigh_config::processor_x86::SLA_X86_64,
-                sleigh_config::processor_x86::PSPEC_X86_64,
-                "x86-64",
+    let key = arch.to_lowercase();
+    let Some(lang) = sleigh_language(&key) else {
+        let supported = supported_arch_keys();
+        return Err(if supported.is_empty() {
+            "No architectures enabled; build with feature x86, arm, mips, or riscv".to_string()
+        } else {
+            format!(
+                "Unknown architecture '{}'. Supported: {}",
+                arch,
+                supported.join(", ")
             )
-            .map_err(|e| e.to_string())?;
-            let dis = Disassembler::from_sla(
-                sleigh_config::processor_x86::SLA_X86_64,
-                sleigh_config::processor_x86::PSPEC_X86_64,
-                "x86-64",
-            )
-            .map_err(|e| e.to_string())?;
-            Ok((spec, dis))
-        }
-        #[cfg(feature = "x86")]
-        "x86" | "x86-32" | "i386" | "i686" => {
-            let spec = build_arch_spec(
-                sleigh_config::processor_x86::SLA_X86,
-                sleigh_config::processor_x86::PSPEC_X86,
-                "x86",
-            )
-            .map_err(|e| e.to_string())?;
-            let dis = Disassembler::from_sla(
-                sleigh_config::processor_x86::SLA_X86,
-                sleigh_config::processor_x86::PSPEC_X86,
-                "x86",
-            )
-            .map_err(|e| e.to_string())?;
-            Ok((spec, dis))
-        }
-        #[cfg(feature = "arm")]
-        "arm" | "arm32" | "arm-le" => {
-            let spec = build_arch_spec(
-                sleigh_config::processor_arm::SLA_ARM8_LE,
-                // sleigh-config 1.x does not ship an ARM8 pspec; use a Cortex pspec instead.
-                sleigh_config::processor_arm::PSPEC_ARMCORTEX,
-                "ARM",
-            )
-            .map_err(|e| e.to_string())?;
-            let dis = Disassembler::from_sla(
-                sleigh_config::processor_arm::SLA_ARM8_LE,
-                // sleigh-config 1.x does not ship an ARM8 pspec; use a Cortex pspec instead.
-                sleigh_config::processor_arm::PSPEC_ARMCORTEX,
-                "ARM",
-            )
-            .map_err(|e| e.to_string())?;
-            Ok((spec, dis))
-        }
-        #[cfg(feature = "arm")]
-        "arm64" | "arm64e" | "aarch64" => {
-            let spec = build_arch_spec(
-                sleigh_config::processor_aarch64::SLA_AARCH64_APPLESILICON,
-                sleigh_config::processor_aarch64::PSPEC_AARCH64,
-                "aarch64",
-            )
-            .map_err(|e| e.to_string())?;
-            let dis = Disassembler::from_sla(
-                sleigh_config::processor_aarch64::SLA_AARCH64_APPLESILICON,
-                sleigh_config::processor_aarch64::PSPEC_AARCH64,
-                "aarch64",
-            )
-            .map_err(|e| e.to_string())?;
-            Ok((spec, dis))
-        }
-        #[cfg(feature = "mips")]
-        "mips" | "mips32" | "mips32be" | "mipsbe" | "mipseb" => {
-            let spec = build_arch_spec(
-                sleigh_config::processor_mips::SLA_MIPS32BE,
-                sleigh_config::processor_mips::PSPEC_MIPS32,
-                "mips32be",
-            )
-            .map_err(|e| e.to_string())?;
-            let dis = Disassembler::from_sla(
-                sleigh_config::processor_mips::SLA_MIPS32BE,
-                sleigh_config::processor_mips::PSPEC_MIPS32,
-                "mips32be",
-            )
-            .map_err(|e| e.to_string())?;
-            Ok((spec, dis))
-        }
-        #[cfg(feature = "mips")]
-        "mipsel" | "mips32le" | "mips32el" => {
-            let spec = build_arch_spec(
-                sleigh_config::processor_mips::SLA_MIPS32LE,
-                sleigh_config::processor_mips::PSPEC_MIPS32,
-                "mips32le",
-            )
-            .map_err(|e| e.to_string())?;
-            let dis = Disassembler::from_sla(
-                sleigh_config::processor_mips::SLA_MIPS32LE,
-                sleigh_config::processor_mips::PSPEC_MIPS32,
-                "mips32le",
-            )
-            .map_err(|e| e.to_string())?;
-            Ok((spec, dis))
-        }
-        #[cfg(feature = "mips")]
-        "mips64" | "mips64be" => {
-            let spec = build_arch_spec(
-                sleigh_config::processor_mips::SLA_MIPS64BE,
-                sleigh_config::processor_mips::PSPEC_MIPS64,
-                "mips64be",
-            )
-            .map_err(|e| e.to_string())?;
-            let dis = Disassembler::from_sla(
-                sleigh_config::processor_mips::SLA_MIPS64BE,
-                sleigh_config::processor_mips::PSPEC_MIPS64,
-                "mips64be",
-            )
-            .map_err(|e| e.to_string())?;
-            Ok((spec, dis))
-        }
-        #[cfg(feature = "mips")]
-        "mips64el" | "mips64le" => {
-            let spec = build_arch_spec(
-                sleigh_config::processor_mips::SLA_MIPS64LE,
-                sleigh_config::processor_mips::PSPEC_MIPS64,
-                "mips64le",
-            )
-            .map_err(|e| e.to_string())?;
-            let dis = Disassembler::from_sla(
-                sleigh_config::processor_mips::SLA_MIPS64LE,
-                sleigh_config::processor_mips::PSPEC_MIPS64,
-                "mips64le",
-            )
-            .map_err(|e| e.to_string())?;
-            Ok((spec, dis))
-        }
-        #[cfg(feature = "riscv")]
-        "riscv64" | "rv64" | "rv64gc" => {
-            let spec = build_arch_spec(
-                sleigh_config::processor_riscv::SLA_RISCV_LP64D,
-                sleigh_config::processor_riscv::PSPEC_RV64GC,
-                "riscv64",
-            )
-            .map_err(|e| e.to_string())?;
-            let dis = Disassembler::from_sla(
-                sleigh_config::processor_riscv::SLA_RISCV_LP64D,
-                sleigh_config::processor_riscv::PSPEC_RV64GC,
-                "riscv64",
-            )
-            .map_err(|e| e.to_string())?;
-            Ok((spec, dis))
-        }
-        #[cfg(feature = "riscv")]
-        "riscv32" | "rv32" | "rv32gc" => {
-            let spec = build_arch_spec(
-                sleigh_config::processor_riscv::SLA_RISCV_ILP32D,
-                sleigh_config::processor_riscv::PSPEC_RV32GC,
-                "riscv32",
-            )
-            .map_err(|e| e.to_string())?;
-            let dis = Disassembler::from_sla(
-                sleigh_config::processor_riscv::SLA_RISCV_ILP32D,
-                sleigh_config::processor_riscv::PSPEC_RV32GC,
-                "riscv32",
-            )
-            .map_err(|e| e.to_string())?;
-            Ok((spec, dis))
-        }
-        _ => {
-            let mut supported = vec![];
-            #[cfg(feature = "x86")]
-            supported.extend(["x86-64", "x86"]);
-            #[cfg(feature = "arm")]
-            supported.extend(["arm", "arm64", "aarch64"]);
-            #[cfg(feature = "mips")]
-            supported.extend(["mips32be", "mips32le", "mips64be", "mips64le"]);
-            #[cfg(feature = "riscv")]
-            supported.extend(["riscv64", "riscv32"]);
-
-            if supported.is_empty() {
-                Err(
-                    "No architectures enabled; build with feature x86, arm, mips, or riscv"
-                        .to_string(),
-                )
-            } else {
-                Err(format!(
-                    "Unknown architecture '{}'. Supported: {}",
-                    arch,
-                    supported.join(", ")
-                ))
-            }
-        }
-    }
+        });
+    };
+    let spec = build_arch_spec(lang.sla, lang.pspec, lang.name).map_err(|e| e.to_string())?;
+    let dis = Disassembler::from_sla(lang.sla, lang.pspec, lang.name).map_err(|e| e.to_string())?;
+    Ok((spec, dis))
 }
 
 // Symbolic execution and CFG surfaces are implemented under r2plugin/src/analysis/.
@@ -6869,6 +6852,109 @@ mod integration_tests {
         let (spec, _disasm) = create_disassembler_for_arch("arm64").expect("arm64 disassembler");
         assert_eq!(spec.name, "aarch64");
         assert_eq!(spec.addr_size, 8);
+    }
+
+    /// The A32 and Thumb languages share one slaspec and differ only in the
+    /// TMode their processor spec pins, so a wrong pspec is not a cosmetic
+    /// mismatch: it silently reinterprets every instruction. These decode real
+    /// bytes so the pairing cannot drift back.
+    #[cfg(feature = "arm")]
+    fn decode_one(arch: &str, bytes: &[u8]) -> (String, usize) {
+        let (_, disasm) = create_disassembler_for_arch(arch)
+            .unwrap_or_else(|e| panic!("{arch} disassembler: {e}"));
+        let mut window = bytes.to_vec();
+        window.resize(16, 0);
+        disasm
+            .disasm_native(&window, 0x8000)
+            .unwrap_or_else(|e| panic!("{arch} decode: {e}"))
+    }
+
+    #[test]
+    #[cfg(feature = "arm")]
+    fn arm32_decodes_a32_not_thumb() {
+        // e3500000 `cmp r0, #0`, the first instruction of test/bins/elf/errno.
+        let (text, len) = decode_one("arm", &[0x00, 0x00, 0x50, 0xe3]);
+        assert_eq!(len, 4, "A32 instruction must consume 4 bytes, got {text}");
+        assert!(
+            text.to_lowercase().starts_with("cmp r0"),
+            "expected `cmp r0,#0x0`, got {text}"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "arm")]
+    fn arm32_big_endian_decodes_the_same_instruction() {
+        let (text, len) = decode_one("armbe", &[0xe3, 0x50, 0x00, 0x00]);
+        assert_eq!(len, 4, "A32 instruction must consume 4 bytes, got {text}");
+        assert!(
+            text.to_lowercase().starts_with("cmp r0"),
+            "expected `cmp r0,#0x0`, got {text}"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "arm")]
+    fn thumb_decodes_thumb2_wide_instruction() {
+        // f04f 0b00 `mov.w r11, #0`, the entry point of
+        // test/bins/elf/armeb_hello_static.
+        let (text, len) = decode_one("thumb", &[0x4f, 0xf0, 0x00, 0x0b]);
+        assert_eq!(len, 4, "Thumb-2 wide instruction is 4 bytes, got {text}");
+        assert!(
+            text.to_lowercase().contains("mov") && text.contains("r11"),
+            "expected `mov.w r11,#0x0`, got {text}"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "arm")]
+    fn thumb_big_endian_decodes_the_same_instruction() {
+        let (text, len) = decode_one("thumbbe", &[0xf0, 0x4f, 0x0b, 0x00]);
+        assert_eq!(len, 4, "Thumb-2 wide instruction is 4 bytes, got {text}");
+        assert!(
+            text.to_lowercase().contains("mov") && text.contains("r11"),
+            "expected `mov.w r11,#0x0`, got {text}"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "arm")]
+    fn every_arm32_language_reports_the_arm_abi_name() {
+        // Downstream ABI and variable-recovery profiles select ARM32 by this
+        // exact name, so the four A32/Thumb x LE/BE languages must share it.
+        for arch in ["arm", "armbe", "thumb", "thumbbe"] {
+            let (spec, _) = create_disassembler_for_arch(arch)
+                .unwrap_or_else(|e| panic!("{arch} disassembler: {e}"));
+            assert_eq!(spec.name, "ARM", "{arch} must present as ARM");
+            assert_eq!(spec.addr_size, 4);
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "arm")]
+    fn arm_language_endianness_follows_the_selector() {
+        for (arch, endian) in [
+            ("arm", r2il::Endianness::Little),
+            ("thumb", r2il::Endianness::Little),
+            ("armbe", r2il::Endianness::Big),
+            ("thumbbe", r2il::Endianness::Big),
+            ("arm64", r2il::Endianness::Little),
+            ("arm64be", r2il::Endianness::Big),
+        ] {
+            let (spec, _) = create_disassembler_for_arch(arch)
+                .unwrap_or_else(|e| panic!("{arch} disassembler: {e}"));
+            assert_eq!(spec.instruction_endianness, endian, "{arch}");
+            assert_eq!(spec.memory_endianness, endian, "{arch}");
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "mips")]
+    fn mips32r6_language_is_reachable() {
+        for arch in ["mips32r6be", "mips32r6le"] {
+            let (spec, _) = create_disassembler_for_arch(arch)
+                .unwrap_or_else(|e| panic!("{arch} disassembler: {e}"));
+            assert_eq!(spec.name, arch);
+        }
     }
 
     #[test]
