@@ -2274,3 +2274,37 @@ validation and a research project rather than a refactor.
 
 Until one of those is real, the honest statement is the one the renderer now
 makes: this is a rendering, and here is what could not be shown about it.
+
+The Value-Rendering Seam
+------------------------
+
+One question -- what expression does this SSA name denote -- is answered
+independently in at least six places, and they do not agree. Fixing them one at
+a time does not converge: each correction moves the defect to whichever path
+runs next.
+
+The paths found so far, in the order a returned struct-field read reaches them:
+
+1. `fold::op_lower::get_expr`, the value renderer, which consulted forwarding
+   provenance before the value's own definition.
+2. `fold::op_lower::semanticize_visible_expr`, whose dereference arm accepted a
+   candidate equal to its own operand.
+3. `analysis::lower::LowerCtx::get_expr`, which builds the definitions the fold
+   later consults, and which follows provenance first for the same reason.
+4. `fold::op_lower::return_resolver::expand_return_expr_in_context`, a name
+   ladder of its own.
+5. The return-register site in `fold_block`, which expands and re-semanticizes
+   `op_to_expr` output.
+6. `structure.rs`, which synthesizes a trailing return from an expression it
+   derived separately.
+
+The first three now share one rule for the case where a read of memory defines
+the name, which is why `obj->thirteenth + obj->first` lowers correctly; the
+returned expression is still built by the last three and still prints the
+pointer.
+
+The fix is not another rule. It is one entry point for value rendering that
+every path calls, with the context-specific adjustments -- return position,
+call-argument position, condition position -- applied on top of a single
+answer rather than replacing it. Until that exists, a correction anywhere in
+this list is a correction to one caller, and the defect survives in the others.
