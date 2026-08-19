@@ -2364,6 +2364,18 @@ fn scalar_owner_expr_for_value(
         .or_else(|| non_generic_prepared_predicate_expr(view, var))
         .or_else(|| non_generic_prepared_owner_expr(view, var))
         .or_else(|| {
+            // A value that *is* the address of a stack slot is not named by
+            // that slot. `buf` reads what the slot holds; the address is
+            // `&buf`. The owner lookup above already refuses an `AddrOf`
+            // owner for exactly that reason, so re-deriving the same address
+            // from the slot's offset here would put the name back where the
+            // address belongs -- and any arithmetic built on it then reads as
+            // arithmetic on the variable, which is a different location. A
+            // frame base sitting at offset zero is how that shows: `sp + 32`
+            // becomes `buf + 32`.
+            if matches!(view.owner_expr_for_var(var), Some(CExpr::AddrOf(_))) {
+                return None;
+            }
             view.stack_offset_for_var(var)
                 .and_then(|offset| preferred_stack_alias_name(view, offset))
                 .filter(|alias| {
