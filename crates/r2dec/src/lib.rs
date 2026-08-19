@@ -46,6 +46,7 @@ pub mod region;
 pub(crate) mod registers;
 pub(crate) mod single_evaluation;
 pub mod structure;
+pub(crate) mod unrendered;
 pub mod variable;
 
 pub use ast::{BinaryOp, CExpr, CFunction, CStmt, CType, UnaryOp};
@@ -3003,6 +3004,7 @@ impl Decompiler {
         prune_unreferenced_local_declarations(&mut c_function);
         normalize_redundant_return_carrier_casts(&mut c_function);
         normalize_declared_assignment_literals(&mut c_function);
+        unrendered::mark_undeclared_names(&mut c_function);
         note_unproven_constructs(&mut c_function);
         work.with_phase(DecompileWorkPhase::Rendering).poll()?;
         Ok(c_function)
