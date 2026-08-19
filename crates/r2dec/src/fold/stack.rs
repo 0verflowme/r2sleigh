@@ -419,14 +419,7 @@ impl<'a> FoldingContext<'a> {
         if src.version != 0 {
             return false;
         }
-        if self.requires_certified_rendering()
-            && self
-                .prepared_value_id_for_var(dst)
-                .and_then(|value| self.certified_loop_carrier_name_for_value(value))
-                .is_some()
-        {
-            return false;
-        }
+
         let Some(src_alias) = self.arg_alias_for_register_name(&src.name) else {
             return false;
         };

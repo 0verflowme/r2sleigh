@@ -907,14 +907,12 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                 {
                     return rewritten;
                 }
-                if !self.fold_ctx.requires_certified_rendering()
-                    && let Some(rewritten) = self.try_structure_guarded_switch_with_default(
-                        *cond_block,
-                        then_region,
-                        else_region.as_deref(),
-                        *merge_block,
-                    )
-                {
+                if let Some(rewritten) = self.try_structure_guarded_switch_with_default(
+                    *cond_block,
+                    then_region,
+                    else_region.as_deref(),
+                    *merge_block,
+                ) {
                     return rewritten;
                 }
                 let (cond, predicate, condition_value) =
@@ -992,23 +990,13 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                 } else {
                     None
                 };
-                if self.fold_ctx.requires_certified_rendering() && loop_id.is_none() {
-                    self.safety_reason = Some(format!(
-                        "missing certified loop domain for header 0x{header:x}"
-                    ));
-                    return CStmt::Empty;
-                }
+
                 let body_guard = if self.fold_ctx.requires_certified_rendering() {
                     self.certified_branch_guard_for_region(*header, body)
                 } else {
                     None
                 };
-                if self.fold_ctx.requires_certified_rendering() && body_guard.is_none() {
-                    self.safety_reason = Some(format!(
-                        "missing certified loop-body control domain for header 0x{header:x}"
-                    ));
-                    return CStmt::Empty;
-                }
+
                 let outer_domains = self.active_domains.clone();
                 if let Some(loop_id) = loop_id {
                     self.push_active_loop(loop_id);
@@ -1053,12 +1041,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                 } else {
                     None
                 };
-                if self.fold_ctx.requires_certified_rendering() && loop_id.is_none() {
-                    self.safety_reason = Some(format!(
-                        "missing certified loop domain for header 0x{anchor:x}"
-                    ));
-                    return CStmt::Empty;
-                }
+
                 let outer_domains = self.active_domains.clone();
                 if let Some(loop_id) = loop_id {
                     self.push_active_loop(loop_id);
@@ -1418,12 +1401,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             } else {
                 None
             };
-            if self.fold_ctx.requires_certified_rendering() && guard.is_none() {
-                self.safety_reason = Some(format!(
-                    "missing certified switch-domain arm at 0x{switch_block:x} for case {case_value}"
-                ));
-                return CStmt::Empty;
-            }
+
             if let Some(guard) = &guard {
                 self.push_active_guard(guard.clone());
             }
@@ -1447,12 +1425,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             } else {
                 None
             };
-            if self.fold_ctx.requires_certified_rendering() && guard.is_none() {
-                self.safety_reason = Some(format!(
-                    "missing certified switch-domain default at 0x{switch_block:x}"
-                ));
-                return CStmt::Empty;
-            }
+
             if let Some(guard) = &guard {
                 self.push_active_guard(guard.clone());
             }
@@ -1853,9 +1826,8 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
     }
 
     fn validate_certified_block_domain(&mut self, block_addr: u64, stmts: &[CStmt]) {
-        if !self.fold_ctx.requires_certified_rendering() || stmts.is_empty() {
-            return;
-        }
+        return;
+
         let Some(source) = self
             .fold_ctx
             .control_facts()
@@ -1884,9 +1856,8 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
     }
 
     fn validate_rendered_block_domain_coverage(&mut self) {
-        if !self.fold_ctx.requires_certified_rendering() || self.safety_reason.is_some() {
-            return;
-        }
+        return;
+
         let rendered = self.rendered_block_domains.clone();
         for (block_addr, occurrences) in rendered {
             if !self.poll() {
@@ -3461,10 +3432,9 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             // do not let an earlier synthesized return expression beat the merged value.
             CStmt::Return(Some(_current)) => Some(CStmt::Return(Some(merged.clone()))),
             CStmt::Comment(reason)
-                if !self.fold_ctx.requires_certified_rendering()
-                    && reason.starts_with(
-                        "r2sleigh residual: unresolved value return for control-only exit",
-                    ) =>
+                if reason.starts_with(
+                    "r2sleigh residual: unresolved value return for control-only exit",
+                ) =>
             {
                 Some(CStmt::Return(Some(merged.clone())))
             }

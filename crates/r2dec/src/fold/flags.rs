@@ -284,7 +284,7 @@ impl<'a> FoldingContext<'a> {
     }
 
     pub fn extract_condition_from_block(&self, block: &FunctionSSABlock) -> Option<CExpr> {
-        if self.requires_certified_rendering() || self.inputs.prepared_ssa.is_some() {
+        if self.inputs.prepared_ssa.is_some() {
             return self
                 .certified_branch_condition_from_block(block)
                 .map(|(expr, _, _)| expr);

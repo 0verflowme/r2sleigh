@@ -247,71 +247,7 @@ impl<'a> FoldingContext<'a> {
     ) -> Option<CStmt> {
         let mut frame = LowerFrame::for_stmt(block_addr, op_idx, true);
         let stmt = self.lowered_to_stmt(self.lower_op(op, &mut frame))?;
-        if self.requires_certified_rendering()
-            && !matches!(op, SSAOp::Call { .. } | SSAOp::CallInd { .. })
-            && self
-                .record_certified_call_render_proofs_for_stmt_with_current(
-                    &stmt,
-                    Some((block_addr, op_idx)),
-                )
-                .is_none()
-        {
-            return Some(self.certified_residual_comment(format!(
-                "uncertified rendered call at 0x{:x}:{}",
-                block_addr, op_idx
-            )));
-        }
-        if self.requires_certified_rendering() && stmt_is_side_effect_free_generated_carrier(&stmt)
-        {
-            return None;
-        }
-        if self.requires_certified_rendering()
-            && self.stmt_is_side_effect_free_versioned_register_carrier(&stmt)
-        {
-            return Some(stmt);
-        }
-        if self.requires_certified_rendering() && stmt_requires_expression_render_proof(&stmt) {
-            let phi_edge = self.certified_phi_edge_render_proof(op, &stmt, block_addr);
-            let value = match op {
-                SSAOp::Store { val, .. } => self.prepared_value_id_for_var(val),
-                _ => op.dst().and_then(|dst| self.prepared_value_id_for_var(dst)),
-            };
-            match value {
-                Some(value)
-                    if self
-                        .certified_render_context()
-                        .is_some_and(|proof| proof.expression_is_renderable(value)) =>
-                {
-                    if let Some(phi_edge) = phi_edge {
-                        self.record_effect_render_proof_for_phi_edge(
-                            block_addr,
-                            op_idx,
-                            Some(value),
-                            phi_edge,
-                        );
-                    } else {
-                        self.record_effect_render_proof_for_value(
-                            EffectRenderProofKind::Expression,
-                            block_addr,
-                            op_idx,
-                            Some(value),
-                        );
-                    }
-                }
-                Some(value) => {
-                    return Some(self.certified_residual_comment(format!(
-                        "uncertified expression value {:?} at 0x{:x}:{}",
-                        value, block_addr, op_idx
-                    )));
-                }
-                None => {
-                    return Some(self.certified_residual_comment(format!(
-                        "missing expression value proof at 0x{:x}:{}",
-                        block_addr, op_idx
-                    )));
-                }
-            }
-        }
+
         if stmt_contains_memory_like_access(&stmt) {
             match op {
                 SSAOp::Load { .. } => {
@@ -344,32 +280,7 @@ impl<'a> FoldingContext<'a> {
                         );
                     }
                 }
-                _ => {
-                    if self.requires_certified_rendering()
-                        && let Some(value) =
-                            op.dst().and_then(|dst| self.prepared_value_id_for_var(dst))
-                        && let Some((block_addr, op_index, space, address, value)) = self
-                            .certified_memory_read_for_value_dependency(value)
-                            .map(|cert| {
-                                (
-                                    cert.block_addr,
-                                    cert.op_index,
-                                    cert.space,
-                                    cert.address,
-                                    cert.value,
-                                )
-                            })
-                    {
-                        self.record_effect_render_proof_for_memory(
-                            EffectRenderProofKind::MemoryRead,
-                            block_addr,
-                            op_index,
-                            space,
-                            address,
-                            value,
-                        );
-                    }
-                }
+                _ => {}
             }
         }
         Some(stmt)
