@@ -3326,6 +3326,54 @@ fn trusted_source_signature(
     Some((spec, callconv, signature.noreturn()))
 }
 
+/// The prototype of each callee, keyed by the name the call renders with.
+///
+/// Without these an argument is typed by how wide its register is, so a call
+/// to `malloc` takes whatever fits rather than the `size_t` it declares.
+fn trusted_callee_signatures(
+    trusted: &r2ssa::TrustedSsaArtifact,
+    ptr_bits: u32,
+) -> std::collections::HashMap<String, r2types::FunctionType> {
+    trusted
+        .source()
+        .presentation()
+        .callee_signatures()
+        .iter()
+        // A prototype with no parameters and no result is what radare2 writes
+        // for a callee it knows nothing about. Carrying it would say the callee
+        // takes no arguments, which is a claim, and would truncate the ones the
+        // lift recovered.
+        .filter(|(_, signature)| {
+            !signature.parameters().is_empty()
+                || signature
+                    .return_type()
+                    .is_some_and(|spelling| spelling.trim() != "void" && !spelling.is_empty())
+        })
+        .map(|(name, signature)| {
+            (
+                name.to_string(),
+                r2types::FunctionType {
+                    return_type: signature
+                        .return_type()
+                        .and_then(|spelling| source_spelled_type(spelling, ptr_bits))
+                        .unwrap_or(r2types::CTypeLike::Unknown),
+                    params: signature
+                        .parameters()
+                        .iter()
+                        .map(|parameter| {
+                            parameter
+                                .type_spelling()
+                                .and_then(|spelling| source_spelled_type(spelling, ptr_bits))
+                                .unwrap_or(r2types::CTypeLike::Unknown)
+                        })
+                        .collect(),
+                    variadic: false,
+                },
+            )
+        })
+        .collect()
+}
+
 fn trusted_stack_slot_names(
     trusted: &r2ssa::TrustedSsaArtifact,
     ptr_bits: u32,
@@ -3471,6 +3519,7 @@ impl EngineAnalyzeRequest {
         self.reg_type_hints.clear();
         let signature = trusted_source_signature(&trusted, self.ptr_bits);
         self.parsed_context = r2types::ParsedExternalContext {
+            known_function_signatures: trusted_callee_signatures(&trusted, self.ptr_bits),
             stack_slots: trusted_stack_slot_names(&trusted, self.ptr_bits),
             callconv: signature
                 .as_ref()

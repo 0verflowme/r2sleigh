@@ -209,6 +209,51 @@ static bool walk_image(R2SleighWireWriter *writer, const RAnalFunctionSnapshot *
 
 // The prototype radare2 recovered, which is the only place a spelling like
 // size_t survives; the interface carries where values live, not what they are.
+typedef bool (*WalkSignatureStringFn)(const RAnalFunctionSnapshot *snapshot,
+	size_t site, RAnalSnapshotSignatureStringKind kind, size_t index,
+	char *buffer, size_t buffer_size);
+
+static bool walk_signature_body(R2SleighWireWriter *writer,
+		const RAnalFunctionSnapshot *snapshot, size_t site,
+		const RAnalSnapshotSignatureView *view, WalkSignatureStringFn string_fn) {
+	if (view->num_parameters > UINT32_MAX) {
+		return false;
+	}
+	char text[WALK_NAME_MAX];
+	r2sleigh_wire_bool (writer, true);
+	r2sleigh_wire_optional_string (writer,
+		string_fn (snapshot, site, R_ANAL_SNAPSHOT_SIGNATURE_STRING_RETURN_TYPE, 0,
+			text, sizeof (text))? text: NULL);
+	r2sleigh_wire_optional_string (writer,
+		string_fn (snapshot, site, R_ANAL_SNAPSHOT_SIGNATURE_STRING_CALLING_CONVENTION, 0,
+			text, sizeof (text))? text: NULL);
+	r2sleigh_wire_bool (writer, view->noreturn);
+	r2sleigh_wire_u32 (writer, (uint32_t)view->num_parameters);
+	for (size_t i = 0; i < view->num_parameters; i++) {
+		r2sleigh_wire_optional_string (writer,
+			string_fn (snapshot, site, R_ANAL_SNAPSHOT_SIGNATURE_STRING_PARAMETER_NAME, i,
+				text, sizeof (text))? text: NULL);
+		r2sleigh_wire_optional_string (writer,
+			string_fn (snapshot, site, R_ANAL_SNAPSHOT_SIGNATURE_STRING_PARAMETER_TYPE, i,
+				text, sizeof (text))? text: NULL);
+	}
+	return true;
+}
+
+static bool walk_own_signature_string(const RAnalFunctionSnapshot *snapshot,
+		size_t site, RAnalSnapshotSignatureStringKind kind, size_t index,
+		char *buffer, size_t buffer_size) {
+	(void)site;
+	return r_anal_function_snapshot_signature_string (snapshot, kind, index, buffer, buffer_size);
+}
+
+static bool walk_call_site_signature_string(const RAnalFunctionSnapshot *snapshot,
+		size_t site, RAnalSnapshotSignatureStringKind kind, size_t index,
+		char *buffer, size_t buffer_size) {
+	return r_anal_function_snapshot_call_site_signature_string (snapshot, site, kind,
+		index, buffer, buffer_size);
+}
+
 static bool walk_signature(R2SleighWireWriter *writer,
 		const RAnalFunctionSnapshot *snapshot) {
 	RAnalSnapshotSignatureView view = {0};
@@ -216,30 +261,50 @@ static bool walk_signature(R2SleighWireWriter *writer,
 		r2sleigh_wire_bool (writer, false);
 		return true;
 	}
-	if (view.num_parameters > UINT32_MAX) {
-		return false;
-	}
-	char text[WALK_NAME_MAX];
-	r2sleigh_wire_bool (writer, true);
-	r2sleigh_wire_optional_string (writer,
-		r_anal_function_snapshot_signature_string (snapshot,
-			R_ANAL_SNAPSHOT_SIGNATURE_STRING_RETURN_TYPE, 0, text, sizeof (text))
-			? text: NULL);
-	r2sleigh_wire_optional_string (writer,
-		r_anal_function_snapshot_signature_string (snapshot,
-			R_ANAL_SNAPSHOT_SIGNATURE_STRING_CALLING_CONVENTION, 0, text, sizeof (text))
-			? text: NULL);
-	r2sleigh_wire_bool (writer, view.noreturn);
-	r2sleigh_wire_u32 (writer, (uint32_t)view.num_parameters);
-	for (size_t i = 0; i < view.num_parameters; i++) {
-		r2sleigh_wire_optional_string (writer,
-			r_anal_function_snapshot_signature_string (snapshot,
-				R_ANAL_SNAPSHOT_SIGNATURE_STRING_PARAMETER_NAME, i, text, sizeof (text))
-				? text: NULL);
-		r2sleigh_wire_optional_string (writer,
-			r_anal_function_snapshot_signature_string (snapshot,
-				R_ANAL_SNAPSHOT_SIGNATURE_STRING_PARAMETER_TYPE, i, text, sizeof (text))
-				? text: NULL);
+	return walk_signature_body (writer, snapshot, 0, &view, walk_own_signature_string);
+}
+
+/* The prototype of each function this one calls, keyed by the name the call
+ * renders with. A callee named twice is written once: the prototype belongs to
+ * the callee, not to the site. */
+static bool walk_callee_signatures(R2SleighWireWriter *writer,
+		const RAnalFunctionSnapshot *snapshot, const RAnalFunctionSnapshotView *top) {
+	size_t written = 0;
+	for (size_t pass = 0; pass < 2; pass++) {
+		if (pass == 1) {
+			if (written > UINT32_MAX) {
+				return false;
+			}
+			r2sleigh_wire_u32 (writer, (uint32_t)written);
+			written = 0;
+		}
+		for (size_t i = 0; i < top->num_call_site_interfaces; i++) {
+			RAnalSnapshotSignatureView view = {0};
+			char name[WALK_NAME_MAX];
+			if (!r_anal_function_snapshot_call_site_signature_view (snapshot, i, &view)
+				|| !r_anal_function_snapshot_call_site_target_name (snapshot, i, name, sizeof (name))
+				|| !*name) {
+				continue;
+			}
+			bool seen = false;
+			for (size_t j = 0; j < i && !seen; j++) {
+				char earlier[WALK_NAME_MAX];
+				seen = r_anal_function_snapshot_call_site_target_name (snapshot, j,
+					earlier, sizeof (earlier)) && !strcmp (earlier, name);
+			}
+			if (seen) {
+				continue;
+			}
+			if (pass == 0) {
+				written++;
+				continue;
+			}
+			r2sleigh_wire_string (writer, name);
+			if (!walk_signature_body (writer, snapshot, i, &view, walk_call_site_signature_string)) {
+				return false;
+			}
+			written++;
+		}
 	}
 	return true;
 }
@@ -276,7 +341,10 @@ static bool walk_presentation(R2SleighWireWriter *writer,
 		|| !r_anal_function_snapshot_interface_view (snapshot, &interface)) {
 		r2sleigh_wire_u32 (writer, 0);
 		r2sleigh_wire_u32 (writer, 0);
-		return walk_signature (writer, snapshot);
+		if (!walk_signature (writer, snapshot)) {
+			return false;
+		}
+		return walk_callee_signatures (writer, snapshot, &top);
 	}
 	if (interface.num_parameters > UINT32_MAX) {
 		return false;
@@ -335,7 +403,10 @@ static bool walk_presentation(R2SleighWireWriter *writer,
 		r2sleigh_wire_string (writer, name);
 		r2sleigh_wire_optional_string (writer, typed? type: NULL);
 	}
-	return walk_signature (writer, snapshot);
+	if (!walk_signature (writer, snapshot)) {
+		return false;
+	}
+	return walk_callee_signatures (writer, snapshot, &top);
 }
 
 bool r2sleigh_wire_write_snapshot_prefix(R2SleighWireWriter *writer, const void *snapshot) {

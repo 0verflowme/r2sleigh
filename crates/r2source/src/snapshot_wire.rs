@@ -510,23 +510,61 @@ pub fn write_presentation(
         writer.string(slot_name.name())?;
         writer.optional_string(slot_name.type_spelling())?;
     }
-    match presentation.signature() {
-        Some(signature) => {
-            writer.bool(true);
-            writer.optional_string(signature.return_type())?;
-            writer.optional_string(signature.calling_convention())?;
-            writer.bool(signature.noreturn());
-            let count = u32::try_from(signature.parameters().len())
-                .map_err(|_| SnapshotWireError::ValueTooWide)?;
-            writer.u32(count);
-            for parameter in signature.parameters() {
-                writer.optional_string(parameter.name())?;
-                writer.optional_string(parameter.type_spelling())?;
-            }
-        }
-        None => writer.bool(false),
+    write_signature_presentation(writer, presentation.signature())?;
+    let callees = u32::try_from(presentation.callee_signatures().len())
+        .map_err(|_| SnapshotWireError::ValueTooWide)?;
+    writer.u32(callees);
+    for (name, signature) in presentation.callee_signatures() {
+        writer.string(name)?;
+        write_signature_presentation(writer, Some(signature))?;
     }
     Ok(())
+}
+
+fn write_signature_presentation(
+    writer: &mut SnapshotWireWriter,
+    signature: Option<&SourceSignaturePresentation>,
+) -> Result<(), SnapshotWireError> {
+    let Some(signature) = signature else {
+        writer.bool(false);
+        return Ok(());
+    };
+    writer.bool(true);
+    writer.optional_string(signature.return_type())?;
+    writer.optional_string(signature.calling_convention())?;
+    writer.bool(signature.noreturn());
+    let count =
+        u32::try_from(signature.parameters().len()).map_err(|_| SnapshotWireError::ValueTooWide)?;
+    writer.u32(count);
+    for parameter in signature.parameters() {
+        writer.optional_string(parameter.name())?;
+        writer.optional_string(parameter.type_spelling())?;
+    }
+    Ok(())
+}
+
+fn read_signature_presentation(
+    reader: &mut SnapshotWireReader<'_>,
+) -> Result<Option<SourceSignaturePresentation>, SnapshotWireError> {
+    if !reader.bool()? {
+        return Ok(None);
+    }
+    let return_type = reader.optional_string()?.map(str::to_string);
+    let calling_convention = reader.optional_string()?.map(str::to_string);
+    let noreturn = reader.bool()?;
+    let count = reader.u32()? as usize;
+    let mut parameters = Vec::with_capacity(count.min(1024));
+    for _ in 0..count {
+        let name = reader.optional_string()?.map(str::to_string);
+        let type_spelling = reader.optional_string()?.map(str::to_string);
+        parameters.push(SourceSignatureParameter::new(name, type_spelling));
+    }
+    Ok(Some(SourceSignaturePresentation::new(
+        return_type,
+        calling_convention,
+        noreturn,
+        parameters,
+    )))
 }
 
 pub fn read_presentation(
@@ -557,31 +595,24 @@ pub fn read_presentation(
         stack_slot_names
             .push(SourceStackSlotName::new(base, offset, name).with_type_spelling(type_spelling));
     }
-    let signature = if reader.bool()? {
-        let return_type = reader.optional_string()?.map(str::to_string);
-        let calling_convention = reader.optional_string()?.map(str::to_string);
-        let noreturn = reader.bool()?;
-        let count = reader.u32()? as usize;
-        let mut parameters = Vec::with_capacity(count.min(1024));
-        for _ in 0..count {
-            let name = reader.optional_string()?.map(str::to_string);
-            let type_spelling = reader.optional_string()?.map(str::to_string);
-            parameters.push(SourceSignatureParameter::new(name, type_spelling));
-        }
-        Some(SourceSignaturePresentation::new(
-            return_type,
-            calling_convention,
-            noreturn,
-            parameters,
-        ))
-    } else {
-        None
-    };
+    let signature = read_signature_presentation(reader)?;
+    let callee_count = reader.u32()? as usize;
+    let mut callee_signatures = Vec::with_capacity(callee_count.min(4096));
+    for _ in 0..callee_count {
+        let name = Box::<str>::from(reader.string()?);
+        let Some(signature) = read_signature_presentation(reader)? else {
+            return Err(SnapshotWireError::RejectedContract {
+                contract: "SourceSignaturePresentation",
+            });
+        };
+        callee_signatures.push((name, signature));
+    }
     Ok(FunctionPresentation {
         display_name: display_name.into(),
         parameter_names: parameter_names.into_boxed_slice(),
         stack_slot_names: stack_slot_names.into_boxed_slice(),
         signature,
+        callee_signatures: callee_signatures.into_boxed_slice(),
     })
 }
 
@@ -1693,6 +1724,7 @@ mod tests {
         let presentation = FunctionPresentation {
             display_name: "process_string".into(),
             parameter_names: Box::new([]),
+            callee_signatures: Box::new([]),
             signature: Some(SourceSignaturePresentation::new(
                 Some("int"),
                 Some("apcs"),
@@ -1978,6 +2010,7 @@ mod tests {
                 display_name: "safe_array_access".into(),
                 stack_slot_names: Box::new([]),
                 signature: None,
+                callee_signatures: Box::new([]),
                 parameter_names: names
                     .iter()
                     .map(|name| Box::<str>::from(*name))
@@ -2607,6 +2640,7 @@ mod tests {
                 // and must be absent entirely when there is no interface
                 stack_slot_names: Box::new([]),
                 signature: None,
+                callee_signatures: Box::new([]),
                 parameter_names: match function_interface.as_ref() {
                     Some(interface) => (0..interface.parameters().len())
                         .map(|index| Box::<str>::from(format!("arg{index}").as_str()))

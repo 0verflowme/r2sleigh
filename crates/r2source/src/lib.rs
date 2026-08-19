@@ -78,6 +78,7 @@ pub struct FunctionPresentation {
     parameter_names: Box<[Box<str>]>,
     stack_slot_names: Box<[SourceStackSlotName]>,
     signature: Option<SourceSignaturePresentation>,
+    callee_signatures: Box<[(Box<str>, SourceSignaturePresentation)]>,
 }
 
 impl FunctionPresentation {
@@ -95,6 +96,12 @@ impl FunctionPresentation {
 
     pub const fn signature(&self) -> Option<&SourceSignaturePresentation> {
         self.signature.as_ref()
+    }
+
+    /// The prototype of each function this one calls, keyed by the name the
+    /// call renders with.
+    pub fn callee_signatures(&self) -> &[(Box<str>, SourceSignaturePresentation)] {
+        &self.callee_signatures
     }
 }
 
@@ -812,6 +819,7 @@ mod tests {
                 parameter_names: Box::new([]),
                 stack_slot_names: Box::new([]),
                 signature: None,
+                callee_signatures: Box::new([]),
             },
             OwnedFunctionImage {
                 string_literals: Box::new([]),
