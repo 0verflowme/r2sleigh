@@ -2197,3 +2197,41 @@ The target plugin system should eventually have these properties:
 - the public command surface is smaller and smarter, not larger
 
 That is the gold standard we should optimize toward.
+
+Two Open Defects and the Seam They Share
+----------------------------------------
+
+Both remaining known-wrong renderings trace to the same seam, and neither is
+fixable where it shows. Recording the evidence so the next attempt starts from
+it rather than repeating the search.
+
+**A dereference is dropped.** `int test_struct_field(DemoStruct *obj, int v)`
+returns `obj->thirteenth + obj->first` and renders as `obj + obj[12]`: an
+address added to an integer. The load itself is rendered correctly --
+`render_canonical_load_expr` returns `Deref(Var("obj"))`, and the fold's
+`get_expr` returns it unchanged. The wrong value enters through
+`analysis/lower.rs::get_expr`, which is a second, independent answer to "what
+does this name denote". It consults `forwarded_values` provenance before the
+definition, and for a value loaded through a pointer that provenance names the
+slot the *pointer* came from. Guarding the provenance is not enough: with the
+guard in place the next branch, `render_semantic_value_for_var`, returns the
+pointer too, because the semantic value recorded for the load result is the
+address rather than what was read. The conflation is in the semantic-value
+model, not at any one call site.
+
+**Parameter names are withheld.** `process_string(char *s)` renders as
+`process_string(int32_t arg0)` while `authenticate(char *password)` -- an
+identical prototype in the same binary -- recovers its name. radare2 withholds
+the whole function interface, and with it the presentation names, when
+`stack_resources_complete` is false, which happens when two *local* frame slots
+overlap. Removing that conjunct does deliver the names, and it also reveals why
+it is there: radare2 then emits parameter-home slots that are zero-sized or
+unbacked, which `SourceFunctionInterface::new` rejects. Relaxing the Rust
+contract to match trades a missing name for a corrupted interface. The fix
+belongs in radare2's stack-slot collection, which should either describe a
+parameter home or omit the inventory, not emit a malformed one.
+
+The common seam is the second lowering implementation. `analysis/lower.rs` and
+`fold/op_lower` both derive what a name denotes, and they disagree; the frame
+inventory and the prototype are likewise entangled across the snapshot
+boundary. Collapsing each to one owner is the prerequisite, not a follow-up.
