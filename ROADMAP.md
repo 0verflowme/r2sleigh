@@ -2308,3 +2308,44 @@ every path calls, with the context-specific adjustments -- return position,
 call-argument position, condition position -- applied on top of a single
 answer rather than replacing it. Until that exists, a correction anywhere in
 this list is a correction to one caller, and the defect survives in the others.
+
+Where the Leaked Names Come From
+--------------------------------
+
+The undeclared-name detector marks 55 constructs across three fixture
+binaries. Two thirds of them are one symptom, and it was traced as far as
+this before the trail ran into the value-rendering seam recorded above.
+
+The symptom is a parameter assigned the address of its own frame slot:
+
+    int bitwise_check(unsigned int x) { if ((x & 0xF0) == 0x50) ...
+
+    int32_t dbg.bitwise_check(int32_t x) {
+        x = local_10 + 8;          // <- not a statement the program makes
+        if ((x & 240) != 80) {
+
+What the machine does there is `str w0, [var_8h]` followed by two
+`ldr w8, [var_8h]`: the prologue puts the argument in its home slot and reads
+it back twice. Each read is rendered as an assignment whose left side is the
+slot's name and whose right side is the slot's *address*.
+
+Established by tracing:
+
+- The load renderer is not at fault. `render_canonical_load_expr` returns
+  `Var("x")` for both reads, which is right: the slot is named after the
+  parameter, so reading it yields `x`.
+- The name on the left is also right. The load's destination is aliased to `x`
+  because it holds `x`.
+- The statement nonetheless leaves the fold as `x = local_10 + 8`, so the
+  right-hand side is replaced somewhere between the load renderer returning
+  and the statement being assembled.
+- `is_entry_arg_alias_store` exists to drop the prologue store for exactly
+  this shape. Its third recovery path -- follow the stored value back through
+  transparent copies to an entry register -- is unreachable behind an
+  unconditional `return None;`. Enabling it changes nothing measurable, so
+  something earlier already declines; the dead line is noted here rather than
+  removed on speculation.
+
+The remaining step is the same one the seam needs: a single value-rendering
+entry point, so that what the load renderer answers is what the statement
+carries. Until then the marker at least says the line is not program text.
