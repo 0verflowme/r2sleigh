@@ -2879,12 +2879,63 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                 .filter_map(|addr| self.transparent_branch_successor_to_merge(addr, merge_block))
                 .collect::<Vec<_>>();
         }
+        if candidates.is_empty() {
+            candidates = region
+                .blocks()
+                .into_iter()
+                .filter_map(|addr| self.merge_predecessor_through_forwarders(addr, merge_block))
+                .collect::<Vec<_>>();
+        }
         candidates.sort_unstable();
         candidates.dedup();
         match candidates.as_slice() {
             [pred] => Some(*pred),
             _ => None,
         }
+    }
+
+    /// The block that actually reaches `merge_block`, following the empty
+    /// branches a region may leave through.
+    ///
+    /// A region's own blocks do not always name the merge as a successor. A
+    /// compiler will route an arm through a chain of blocks that do nothing
+    /// but branch, and those belong to no arm in particular, so the arm looks
+    /// as though it contributes nothing to the merge and is given no value.
+    /// It contributes whatever the block at the end of that chain stores:
+    /// nothing on the way there can change it, because nothing on the way
+    /// there does anything.
+    ///
+    /// Without this the innermost arm of a nested chain of conditions was left
+    /// with the other arm's value, so `unlock` returned 1 both when its last
+    /// test passed and when it failed.
+    fn merge_predecessor_through_forwarders(&self, addr: u64, merge_block: u64) -> Option<u64> {
+        const MAX_FORWARDERS: usize = 8;
+        let mut current = addr;
+        for _ in 0..MAX_FORWARDERS {
+            let block = self.func.get_block(current)?;
+            if self.func.successors(current).contains(&merge_block) {
+                return Some(current);
+            }
+            let successors = self.transparent_branch_successors(current, block);
+            let [successor] = successors.as_slice() else {
+                return None;
+            };
+            if !block.ops.iter().all(|op| {
+                self.is_transparent_branch_forwarder_op(op)
+                    || self.is_materialized_phi_edge_copy(current, *successor, op)
+            }) {
+                return None;
+            }
+            if self
+                .region_analyzer
+                .as_ref()
+                .is_some_and(|analyzer| analyzer.block_has_loop_transfer(current))
+            {
+                return None;
+            }
+            current = *successor;
+        }
+        None
     }
 
     fn transparent_branch_successor_to_merge(&self, addr: u64, merge_block: u64) -> Option<u64> {
