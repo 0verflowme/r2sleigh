@@ -323,7 +323,7 @@ fn introduced_name_for(expr: &CExpr, introduced: &[String]) -> String {
     }
 }
 
-fn children_mut(expr: &mut CExpr) -> Vec<&mut CExpr> {
+pub(crate) fn children_mut(expr: &mut CExpr) -> Vec<&mut CExpr> {
     match expr {
         CExpr::IntLit(_)
         | CExpr::UIntLit(_)
@@ -375,7 +375,7 @@ fn for_each_expr(stmt: &CStmt, f: &mut impl FnMut(&CExpr)) {
     }
 }
 
-fn for_each_expr_mut(stmt: &mut CStmt, f: &mut impl FnMut(&mut CExpr)) {
+pub(crate) fn for_each_expr_mut(stmt: &mut CStmt, f: &mut impl FnMut(&mut CExpr)) {
     match stmt {
         CStmt::Expr(expr) | CStmt::Return(Some(expr)) => f(expr),
         CStmt::Decl {
@@ -433,7 +433,10 @@ fn for_each_child_block(stmt: &CStmt, f: &mut impl FnMut(&[CStmt])) {
 /// Visit each nested statement list, saying whether it shares the enclosing
 /// scope's bindings on exit. A plain block always runs, so what it binds still
 /// holds afterwards; a branch arm or a loop body does not.
-fn for_each_child_block_mut(stmt: &mut CStmt, f: &mut impl FnMut(&mut Vec<CStmt>, bool)) {
+pub(crate) fn for_each_child_block_mut(
+    stmt: &mut CStmt,
+    f: &mut impl FnMut(&mut Vec<CStmt>, bool),
+) {
     fn as_block(body: &mut Box<CStmt>, f: &mut impl FnMut(&mut Vec<CStmt>, bool), shares: bool) {
         match body.as_mut() {
             CStmt::Block(stmts) => f(stmts, shares),

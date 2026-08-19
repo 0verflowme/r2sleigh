@@ -3004,6 +3004,7 @@ impl Decompiler {
         prune_unreferenced_local_declarations(&mut c_function);
         normalize_redundant_return_carrier_casts(&mut c_function);
         normalize_declared_assignment_literals(&mut c_function);
+        normalize_comparison_operand_order(&mut c_function);
         unrendered::mark_undeclared_names(&mut c_function);
         note_unproven_constructs(&mut c_function);
         work.with_phase(DecompileWorkPhase::Rendering).poll()?;
@@ -4133,11 +4134,41 @@ fn typed_integer_literal_expr(value: u64, is_signed: bool, bits: u32) -> CExpr {
     }
 }
 
+/// Width and signedness of a spelled integer type.
+///
+/// A type carried by name renders as the source wrote it, which is what a
+/// reader wants, but a consumer still has to know how wide it is. Only
+/// spellings whose width is fixed by the language are answered here: `long`
+/// and `size_t` depend on the target and are left unresolved rather than
+/// guessed.
+fn spelled_integer_shape(spelling: &str) -> Option<(bool, u32)> {
+    let normalized = spelling
+        .split_whitespace()
+        .filter(|word| !matches!(*word, "const" | "volatile" | "restrict"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    match normalized.as_str() {
+        "char" | "signed char" | "int8_t" => Some((true, 8)),
+        "unsigned char" | "uint8_t" => Some((false, 8)),
+        "short" | "short int" | "signed short" | "int16_t" => Some((true, 16)),
+        "unsigned short" | "unsigned short int" | "uint16_t" => Some((false, 16)),
+        "int" | "signed" | "signed int" | "int32_t" => Some((true, 32)),
+        "unsigned" | "unsigned int" | "uint32_t" => Some((false, 32)),
+        "int64_t" | "long long" | "signed long long" => Some((true, 64)),
+        "uint64_t" | "unsigned long long" => Some((false, 64)),
+        _ => None,
+    }
+}
+
 fn normalize_literal_for_declared_type(expr: &mut CExpr, ty: &CType) {
     let (is_signed, bits) = match ty {
         CType::Int(bits) => (true, *bits),
         CType::UInt(bits) => (false, *bits),
         CType::Bool => (false, 1),
+        CType::Typedef(name) => match spelled_integer_shape(name) {
+            Some(shape) => shape,
+            None => return,
+        },
         _ => return,
     };
     if bits == 0 || bits > 64 {
@@ -4154,6 +4185,67 @@ fn normalize_literal_for_declared_type(expr: &mut CExpr, ty: &CType) {
         _ => {}
     }
 }
+
+/// Put the constant on the right of a comparison, the way C is written.
+///
+/// The lifted form keeps whichever operand the instruction encoded first, so a
+/// bound reads as `100 < len` where the source said `len > 100`. Mirroring the
+/// operator alongside the operands preserves the meaning exactly.
+fn normalize_comparison_operand_order(func: &mut CFunction) {
+    fn is_literal(expr: &CExpr) -> bool {
+        match expr {
+            CExpr::IntLit(_) | CExpr::UIntLit(_) | CExpr::CharLit(_) => true,
+            CExpr::Paren(inner) => is_literal(inner),
+            _ => false,
+        }
+    }
+
+    fn mirrored(op: BinaryOp) -> Option<BinaryOp> {
+        match op {
+            BinaryOp::Lt => Some(BinaryOp::Gt),
+            BinaryOp::Gt => Some(BinaryOp::Lt),
+            BinaryOp::Le => Some(BinaryOp::Ge),
+            BinaryOp::Ge => Some(BinaryOp::Le),
+            BinaryOp::Eq => Some(BinaryOp::Eq),
+            BinaryOp::Ne => Some(BinaryOp::Ne),
+            _ => None,
+        }
+    }
+
+    fn visit(expr: &mut CExpr) {
+        for child in single_evaluation::children_mut(expr) {
+            visit(child);
+        }
+        let CExpr::Binary { op, left, right } = expr else {
+            return;
+        };
+        let Some(flipped) = mirrored(*op) else {
+            return;
+        };
+        if !is_literal(left) || is_literal(right) {
+            return;
+        }
+        std::mem::swap(left, right);
+        *op = flipped;
+    }
+
+    fn visit_stmt(stmt: &mut CStmt) {
+        single_evaluation::for_each_expr_mut(stmt, &mut visit);
+        single_evaluation::for_each_child_block_mut(stmt, &mut |stmts, _| {
+            for stmt in stmts.iter_mut() {
+                visit_stmt(stmt);
+            }
+        });
+    }
+
+    for stmt in &mut func.body {
+        visit_stmt(stmt);
+    }
+}
+
+/// Key under which the function's own return type rides in the declared-type
+/// map. A local cannot be called this, so it cannot collide with one.
+const RETURN_TYPE_KEY: &str = "\u{0}return";
 
 fn normalize_declared_assignment_literals(func: &mut CFunction) {
     fn visit_expr(expr: &mut CExpr, declared_types: &HashMap<String, CType>) {
@@ -4284,7 +4376,14 @@ fn normalize_declared_assignment_literals(func: &mut CFunction) {
                     }
                 }
             }
-            CStmt::Return(Some(expr)) => visit_expr(expr, declared_types),
+            CStmt::Return(Some(expr)) => {
+                visit_expr(expr, declared_types);
+                // A returned literal is read as the return type, so an all-ones
+                // word coming back from an `int` function is -1, not 0xffffffff.
+                if let Some(ty) = declared_types.get(RETURN_TYPE_KEY) {
+                    normalize_literal_for_declared_type(expr, ty);
+                }
+            }
             CStmt::Empty
             | CStmt::Return(None)
             | CStmt::Break
@@ -4295,7 +4394,7 @@ fn normalize_declared_assignment_literals(func: &mut CFunction) {
         }
     }
 
-    let declared_types = func
+    let mut declared_types = func
         .params
         .iter()
         .map(|param| (param.name.to_ascii_lowercase(), param.ty.clone()))
@@ -4305,6 +4404,7 @@ fn normalize_declared_assignment_literals(func: &mut CFunction) {
                 .map(|local| (local.name.to_ascii_lowercase(), local.ty.clone())),
         )
         .collect::<HashMap<_, _>>();
+    declared_types.insert(RETURN_TYPE_KEY.to_string(), func.ret_type.clone());
     for stmt in &mut func.body {
         visit_stmt(stmt, &declared_types);
     }
