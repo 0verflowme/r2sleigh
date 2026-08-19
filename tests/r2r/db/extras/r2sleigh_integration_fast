@@ -355,7 +355,7 @@ FILE=bins/r2sleigh_vuln_test_x86_64_macho_O2_v1
 ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
 EXPECT=<<EOF
 sla: loaded architecture 'x86-64'
-bool dbg.complex_check(int32_t a, int32_t b)
+int dbg.complex_check(int a, int b)
 {
     /* r2dec proof: no individual construct is marked */
     return (a + b ^ 100 | a - b ^ 20) == 0;

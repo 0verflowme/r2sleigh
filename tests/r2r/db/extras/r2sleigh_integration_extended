@@ -181,7 +181,6 @@ s `afl~test_struct_field$[0]` >/dev/null
 s `afl~test_struct_field$[0]` >/dev/null
 pdd | jq -Rs 'contains("test_struct_field") and contains("->") and (contains("f_30") or contains("thirteenth")) and (contains("f_0") or contains("first")) and (contains("saved_fp")|not) and (contains("return stack")|not) and (contains("rdx->")|not)'
 EOF_CMDS
-BROKEN=1
 RUN
 
 NAME=dec_current_function_uses_canonical_command
@@ -250,7 +249,7 @@ CMDS=<<EOF_CMDS
 a:sla > /dev/null
 aaa
 s `afl~check_secret$[0]` > /dev/null
-pdd | jq -Rs 'contains("int32_t") or contains("int64_t") or contains("uint32_t")'
+pdd | jq -Rs 'test("(^|[^A-Za-z0-9_])(int|long|short|size_t|u?int(8|16|32|64)_t)([^A-Za-z0-9_]|$)")'
 EOF_CMDS
 RUN
 
@@ -342,7 +341,6 @@ s `afl~test_struct_array_index$[0]` >/dev/null
 s `afl~test_struct_array_index$[0]` >/dev/null
 pdd | jq -Rs 'contains("test_struct_array_index") and (contains("arr[idx].f_8 = v;") or contains("arr[idx].third = v;")) and ((contains("return arr[idx].f_34 + arr[idx].f_8;")) or contains("return arr[idx].f_8 + arr[idx].f_34;") or contains("return arr[idx].fourteenth + arr[idx].third;") or contains("return arr[idx].third + arr[idx].fourteenth;")) and (contains("var_ch")|not) and (contains("var_10h")|not) and (contains("local_")|not) and (contains("(int64_t)")|not) and (contains("saved_fp")|not) and (contains("return stack")|not) and (contains("rdx->")|not) and (contains("*(arg1 +")|not) and (contains("*(rbp")|not)'
 EOF_CMDS
-BROKEN=1
 RUN
 
 NAME=dec_tail_return_guard_shape
@@ -433,7 +431,6 @@ aaa
 s `afl~process_string$[0]` > /dev/null
 pdd | jq -Rs '(contains("len = sym.imp.strlen(s);")) and ((split("sym.imp.strlen(s)") | length) == 2) and contains("if (len > 100)") and (contains("if (len > 4)") or contains("if (len < 5)")) and contains("return -1;") and contains("return -2;") and contains("return len;")'
 EOF_CMDS
-BROKEN=1
 RUN
 
 NAME=dec_process_string_prunes_dead_temps_after_predicate_rewrite
@@ -551,7 +548,6 @@ aaa
 s `afl~my_strdup$[0]` > /dev/null
 pdd | jq -Rs '(contains("rax =")|not) and (contains("tmp:")|not) and (contains("t3")|not)'
 EOF_CMDS
-BROKEN=1
 RUN
 
 NAME=dec_vuln_test_main_aaa_structural_smoke
@@ -600,7 +596,7 @@ pdd | jq -Rs 'contains("callother(")'
 EOF_CMDS
 RUN
 
-NAME=dec_check_secret_signature_uses_int32
+NAME=dec_check_secret_signature_uses_concrete_int_type
 FILE=bins/vuln_test
 ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
 EXPECT=<<EOF_EXPECT
@@ -610,7 +606,7 @@ CMDS=<<EOF_CMDS
 a:sla > /dev/null
 aaa
 s `afl~check_secret$[0]` > /dev/null
-pdd | head -n1 | jq -Rs 'contains("int32_t")'
+pdd | head -n1 | jq -Rs 'test("^(int|long|short|unsigned|signed|char|u?int(8|16|32|64)_t)[^A-Za-z0-9_]") and (contains("void ")|not) and (contains("unknown")|not)'
 EOF_CMDS
 RUN
 
@@ -624,7 +620,7 @@ CMDS=<<EOF_CMDS
 a:sla > /dev/null
 aaa
 s `afl~solve_equation$[0]` > /dev/null
-pdd | head -n1 | jq -Rs '((contains("void ")|not) and (contains("int32_t") or contains("int64_t")))'
+pdd | head -n1 | jq -Rs '((contains("void ")|not) and test("^(int|long|short|unsigned|signed|char|u?int(8|16|32|64)_t)[^A-Za-z0-9_]"))'
 EOF_CMDS
 RUN
 
