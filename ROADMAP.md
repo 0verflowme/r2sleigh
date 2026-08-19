@@ -2235,3 +2235,42 @@ The common seam is the second lowering implementation. `analysis/lower.rs` and
 `fold/op_lower` both derive what a name denotes, and they disagree; the frame
 inventory and the prototype are likewise entangled across the snapshot
 boundary. Collapsing each to one owner is the prerequisite, not a follow-up.
+
+What a Certification Layer Would Have to Do
+-------------------------------------------
+
+The plugin carried a certification kernel: nine hand-written recognizers for
+function shapes -- terminal return, and terminal return decorated with a guard,
+a conditional, a switch, one loop, one direct call, one memory access, an
+aggregate member, or a private-frame join -- each building a typed C AST whose
+meaning could be evaluated against canonical SSA. It has been removed. The idea
+is worth keeping and the implementation was not, so the reasoning is recorded
+here rather than in the history.
+
+Three things were wrong with it, and any replacement has to answer all three.
+
+**It recognized shapes, so its reach was whatever had been written down.**
+Roughly one function in ten matched. Coverage grew linearly in hand-written
+modules while the space of function shapes did not, so the gap against the
+ordinary renderer could not close by adding more of them.
+
+**It was not a proof.** The differential evaluated the typed AST against SSA
+over sampled state within bounds, which is a good falsification technique and a
+weaker claim than the word certified suggests. Nothing was sealed; a run that
+found no mismatch had found no mismatch.
+
+**It checked an artifact nobody read.** Its C was written to be checkable --
+explicit widths, every intermediate bound, arithmetic through helper functions
+-- and once that stopped being what the reader saw, the check no longer said
+anything about the output. Whatever it established, it established about a
+rendering that was discarded.
+
+A replacement worth having would check the rendering that is actually printed,
+and would do so without a catalogue of shapes. Both are hard for the same
+reason: the readable AST deliberately omits what a checker needs, so either it
+grows those facts back -- becoming the thing that was deleted -- or the
+SSA-to-AST lowering is validated once, generically, which is translation
+validation and a research project rather than a refactor.
+
+Until one of those is real, the honest statement is the one the renderer now
+makes: this is a rendering, and here is what could not be shown about it.
