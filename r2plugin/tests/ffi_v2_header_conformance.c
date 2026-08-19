@@ -110,9 +110,9 @@ int main(void) {
 	};
 	R2SleighPlannerQueryResponseV2 planner_response = {0};
 	const R2SleighApiV2 *api = r2sleigh_api_v2 ();
-	if (R2SLEIGH_RADARE_SNAPSHOT_CONTRACT_V2 != 1
-		|| R2SLEIGH_RADARE_FUNCTION_SNAPSHOT_SCHEMA_V2 != 14
-		|| R2SLEIGH_RESPONSE_INFO_SCHEMA_V2 != 2
+	/* No radare2 schema number is asserted here: the plugin is gated on the
+	 * capability being present, not on which revision it is at. */
+	if (R2SLEIGH_RESPONSE_INFO_SCHEMA_V2 != 2
 		|| switch_case.target != 0x402000
 		|| call_identity.op_index != 3
 		|| call_identity.target_space != R2SLEIGH_SOURCE_STORAGE_CONSTANT_V2

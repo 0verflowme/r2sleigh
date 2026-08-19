@@ -17,20 +17,17 @@
 #include "r2sleigh_api_v2.h"
 #include "snapshot_wire.h"
 
-/* Support is decided by the presence of the immutable function-snapshot API and
- * by the transport's own contract, never by radare2's ABI number: that number
- * moves for unrelated reasons and pinning it broke this plugin on every bump. */
-#ifndef R_ANAL_FUNCTION_SNAPSHOT_SCHEMA_VERSION
+/* Support is decided by whether radare2 exposes the function-snapshot API, and
+ * by nothing else. Pinning a number -- the ABI number or the schema number --
+ * says the plugin needs one particular revision when what it needs is one
+ * particular capability, and those numbers move for unrelated reasons: the
+ * schema last moved for two booleans on a struct no consumer can see, and stood
+ * still through three changes to the struct every consumer reads. The guards
+ * that actually hold are the linker, which cannot resolve an accessor that is
+ * not there, and the wire conformance test, which compares writer against
+ * reader byte for byte. */
+#ifndef R_ANAL_FUNCTION_SNAPSHOT_API
 #error "r2sleigh requires a radare2 exposing the immutable function-snapshot API"
-#endif
-#if R2SLEIGH_RADARE_SNAPSHOT_CONTRACT_V2 != 1
-#error "r2sleigh generated V2 header must target snapshot transport contract 1"
-#endif
-#if R_ANAL_FUNCTION_SNAPSHOT_SCHEMA_VERSION != 14
-#error "r2sleigh borrowed snapshot transport requires function snapshot schema 14"
-#endif
-#if R2SLEIGH_RADARE_FUNCTION_SNAPSHOT_SCHEMA_V2 != 14
-#error "r2sleigh generated V2 header must target function snapshot schema 14"
 #endif
 
 
