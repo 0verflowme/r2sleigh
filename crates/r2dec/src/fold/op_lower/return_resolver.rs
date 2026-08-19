@@ -857,6 +857,11 @@ impl<'a> FoldingContext<'a> {
                 if let Some(val) = parse_const_value(name) {
                     return self.typed_integer_literal_expr_in_context(val, context);
                 }
+                // A name defined by a read of memory is that read. Expanding it
+                // again here reached a different answer for the same memory.
+                if let Some(memory) = self.memory_read_expr_for_name(name) {
+                    return memory;
+                }
                 if let Some(alias) = self.arg_alias_for_rendered_name(name) {
                     return CExpr::Var(alias);
                 }

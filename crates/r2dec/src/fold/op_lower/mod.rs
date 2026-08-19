@@ -3220,6 +3220,21 @@ impl<'a> FoldingContext<'a> {
     }
 
     /// Get the expression for a variable, potentially inlining its definition.
+    /// What this name reads, when what defines it is a read of memory.
+    ///
+    /// This is the one answer to that question. Anything that expands a name
+    /// and works it out again for itself will sooner or later work out a
+    /// different one, and the difference is not cosmetic: re-deriving `*obj`
+    /// arrived at `obj`, so a struct field printed as the pointer holding it.
+    pub(crate) fn memory_read_expr_for_name(&self, key: &str) -> Option<CExpr> {
+        let raw = self.lookup_definition_raw(key)?;
+        let mut visited = HashSet::new();
+        let semanticized = self.semanticize_visible_expr(&raw, 0, &mut visited);
+        (Self::expr_is_scalar_memory_candidate(&semanticized)
+            || Self::expr_is_structured_memory_candidate(&semanticized))
+        .then_some(semanticized)
+    }
+
     pub fn get_expr(&self, var: &SSAVar) -> CExpr {
         let key = var.display_name();
 
@@ -3251,13 +3266,16 @@ impl<'a> FoldingContext<'a> {
         if let Some(load_expr) = producer_load_expr {
             return load_expr;
         }
-        let raw_memory_expr = self.lookup_definition_raw(&key).and_then(|raw| {
-            let mut raw_semantic_visited = HashSet::new();
-            let semanticized = self.semanticize_visible_expr(&raw, 0, &mut raw_semantic_visited);
-            (Self::expr_is_scalar_memory_candidate(&semanticized)
-                || Self::expr_is_structured_memory_candidate(&semanticized))
-            .then_some(semanticized)
-        });
+        let raw_memory_expr = self.memory_read_expr_for_name(&key);
+        // A value whose own definition reads memory is that read. The aliases
+        // below answer a different question -- which stack slot a value was
+        // forwarded from -- and that is where an address came from, not what
+        // was found at it. A load through an argument pointer is forwarded
+        // from the slot homing the argument, so letting the alias win renders
+        // `*obj` as `obj`, and a struct field read prints the pointer.
+        if let Some(raw_memory) = raw_memory_expr.clone() {
+            return raw_memory;
+        }
         if let Some(offset) = self
             .forwarded_value_for_name(&key)
             .and_then(|prov| prov.stack_slot)
@@ -10200,6 +10218,11 @@ impl<'a> FoldingContext<'a> {
             CExpr::Deref(inner) => {
                 if let CExpr::Var(name) = inner.as_ref()
                     && let Some(candidate) = self.semantic_deref_candidate_for_name(name)
+                    // The candidate must say what `*name` reads. Coming back as
+                    // `name` answers what the name itself denotes, and taking
+                    // that erases the dereference. For a parameter homed on the
+                    // stack it is the slot, so `*obj` became `obj`.
+                    && candidate != **inner
                 {
                     return candidate;
                 }
@@ -12411,21 +12434,30 @@ impl<'a> FoldingContext<'a> {
                     (expr, Some(value))
                 } else {
                     let unresolved = self.get_return_expr(target);
+                    // What the returned name denotes is a question the value
+                    // renderer already answers, and answering it again here
+                    // reached somewhere else: a value loaded through a pointer
+                    // came back as the pointer, so a struct field was returned
+                    // as the address holding it. The read the value carries
+                    // wins; everything else keeps the previous preference.
                     let mut visited = HashSet::new();
                     let target_expr = self
-                        .choose_preferred_visible_expr(
-                            self.render_semantic_value_by_name(
-                                &target.display_name(),
-                                0,
-                                &mut visited,
-                            ),
-                            Some(unresolved.clone()),
-                        )
-                        .and_then(|expr| {
+                        .memory_read_expr_for_name(&target.display_name())
+                        .or_else(|| {
                             self.choose_preferred_visible_expr(
-                                Some(expr),
-                                self.best_visible_definition(&target.display_name()),
+                                self.render_semantic_value_by_name(
+                                    &target.display_name(),
+                                    0,
+                                    &mut visited,
+                                ),
+                                Some(unresolved.clone()),
                             )
+                            .and_then(|expr| {
+                                self.choose_preferred_visible_expr(
+                                    Some(expr),
+                                    self.best_visible_definition(&target.display_name()),
+                                )
+                            })
                         })
                         .unwrap_or(unresolved);
                     let expr = if self.is_control_return_target(target) {
