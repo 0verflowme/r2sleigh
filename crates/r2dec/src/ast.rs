@@ -512,6 +512,24 @@ impl CExpr {
 }
 
 impl BinaryOp {
+    /// True for the operators whose left operand is written, not read.
+    pub const fn writes_left_operand(self) -> bool {
+        matches!(
+            self,
+            Self::Assign
+                | Self::AddAssign
+                | Self::SubAssign
+                | Self::MulAssign
+                | Self::DivAssign
+                | Self::ModAssign
+                | Self::BitAndAssign
+                | Self::BitOrAssign
+                | Self::BitXorAssign
+                | Self::ShlAssign
+                | Self::ShrAssign
+        )
+    }
+
     /// Get the C operator string.
     pub fn as_str(&self) -> &'static str {
         match self {

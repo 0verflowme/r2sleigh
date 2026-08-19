@@ -3767,8 +3767,14 @@ fn substitute_var_in_expr(expr: &mut CExpr, name: &str, value: &CExpr) {
         | CExpr::AddrOf(operand)
         | CExpr::Deref(operand)
         | CExpr::Paren(operand) => substitute_var_in_expr(operand, name, value),
-        CExpr::Binary { left, right, .. } => {
-            substitute_var_in_expr(left, name, value);
+        CExpr::Binary { op, left, right } => {
+            // The left operand of an assignment names storage. Substituting a
+            // value there rewrites what the statement writes into what it
+            // wrote, which is how a slot the source never named rendered as
+            // `1 = 1;`.
+            if !op.writes_left_operand() {
+                substitute_var_in_expr(left, name, value);
+            }
             substitute_var_in_expr(right, name, value);
         }
         CExpr::Ternary {
@@ -4745,6 +4751,40 @@ mod tests {
         SignatureCertificateSource,
     };
     use std::collections::{BTreeMap, BTreeSet, HashMap};
+
+    #[test]
+    fn substitution_leaves_an_assignment_target_alone() {
+        let mut stmt = CStmt::Expr(CExpr::assign(
+            CExpr::Var("local_4".to_string()),
+            CExpr::Var("local_4".to_string()),
+        ));
+        substitute_var_in_stmt(&mut stmt, "local_4", &CExpr::IntLit(1));
+        assert_eq!(
+            stmt,
+            CStmt::Expr(CExpr::assign(
+                CExpr::Var("local_4".to_string()),
+                CExpr::IntLit(1),
+            ))
+        );
+    }
+
+    #[test]
+    fn substitution_leaves_a_compound_assignment_target_alone() {
+        let mut stmt = CStmt::Expr(CExpr::binary(
+            BinaryOp::AddAssign,
+            CExpr::Var("local_4".to_string()),
+            CExpr::Var("local_4".to_string()),
+        ));
+        substitute_var_in_stmt(&mut stmt, "local_4", &CExpr::IntLit(1));
+        assert_eq!(
+            stmt,
+            CStmt::Expr(CExpr::binary(
+                BinaryOp::AddAssign,
+                CExpr::Var("local_4".to_string()),
+                CExpr::IntLit(1),
+            ))
+        );
+    }
 
     #[test]
     fn semantic_memory_address_format_preserves_identity_kind() {
