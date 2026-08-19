@@ -2737,7 +2737,6 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
     ) -> Option<CStmt> {
         let merge_block = merge_block?;
         let else_region = else_region?;
-        let certified = self.fold_ctx.requires_certified_rendering();
 
         let summaries = self
             .fold_ctx
@@ -2758,43 +2757,12 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         if !then_can_rewrite && !else_can_rewrite {
             return None;
         }
-        if certified
-            && (!self.certified_region_terminates_with_slot_merge(then_region, summary)
-                || !self.certified_region_terminates_with_slot_merge(else_region, summary))
-        {
-            return None;
-        }
 
-        let certified_branch = if certified {
-            let (cond, predicate, condition_value) =
-                self.get_branch_condition_with_predicate(cond_block);
-            let cond = cond?;
-            let proof =
-                self.certified_branch_render_proof(cond_block, predicate, condition_value)?;
-            Some((cond, proof))
-        } else {
-            None
-        };
         let control_proof_checkpoint = self.control_render_proofs.len();
         let effect_proof_checkpoint = self.fold_ctx.effect_render_proof_checkpoint();
-        if let Some((_, proof)) = &certified_branch {
-            self.control_render_proofs.push(proof.clone());
-        }
 
-        let mut then_stmt = if certified && then_can_rewrite {
-            CStmt::Empty
-        } else if certified {
-            self.structure_branch_region(cond_block, then_region)
-        } else {
-            self.structure_region(then_region)
-        };
-        let mut else_stmt = if certified && else_can_rewrite {
-            CStmt::Empty
-        } else if certified {
-            self.structure_branch_region(cond_block, else_region)
-        } else {
-            self.structure_region(else_region)
-        };
+        let mut then_stmt = self.structure_region(then_region);
+        let mut else_stmt = self.structure_region(else_region);
         let mut rewrote_any = false;
 
         if then_can_rewrite
@@ -2825,14 +2793,6 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             || !Self::stmt_guarantees_termination(&then_stmt)
             || !Self::stmt_guarantees_termination(&else_stmt)
         {
-            if certified {
-                if self.safety_reason.is_none() {
-                    self.safety_reason = Some(format!(
-                        "certified stack-slot return merge at 0x{merge_block:x} did not preserve terminating paths"
-                    ));
-                }
-                return Some(CStmt::Empty);
-            }
             self.control_render_proofs
                 .truncate(control_proof_checkpoint);
             self.fold_ctx
@@ -2840,20 +2800,15 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             return None;
         }
 
-        let (cond, predicate, condition_value) = if let Some((cond, _)) = certified_branch {
-            (Some(cond), None, None)
-        } else {
-            self.get_branch_condition_with_predicate(cond_block)
-        };
+        let (cond, predicate, condition_value) =
+            self.get_branch_condition_with_predicate(cond_block);
         let cond = cond?;
         let if_stmt = CStmt::If {
             cond,
             then_body: Box::new(then_stmt),
             else_body: Some(Box::new(else_stmt)),
         };
-        if !certified {
-            self.record_branch_render_proof(cond_block, predicate, condition_value);
-        }
+        self.record_branch_render_proof(cond_block, predicate, condition_value);
         let mut prefix = self.structure_block_prefix_stmts(cond_block);
         prefix.push(if_stmt);
         Some(if prefix.len() == 1 {

@@ -590,11 +590,7 @@ impl<'a> FoldingContext<'a> {
     }
 
     pub(super) fn prune_dead_temp_assignments(&self, stmts: Vec<CStmt>) -> Vec<CStmt> {
-        self.prune_dead_temp_assignments_with_options(
-            stmts,
-            true,
-            self.requires_certified_rendering(),
-        )
+        self.prune_dead_temp_assignments_with_options(stmts, true, false)
     }
 
     pub(super) fn prune_dead_temp_assignments_before_structuring(
@@ -661,13 +657,6 @@ impl<'a> FoldingContext<'a> {
                     .to_ascii_lowercase();
                 let dead_return_register_owner = demote_dead_return_register_calls
                     && self.inputs.arch.is_return_register_name(&target_base);
-                let dead_certified_raw_memory_carrier = self.requires_certified_rendering()
-                    && !target_has_live_use
-                    && (!preserve_named_stack_owners || !target_is_named_stack_owner)
-                    && self.expr_contains_unresolved_memory(rhs)
-                    && (self.is_low_signal_visible_name(target)
-                        || self.is_transient_visible_name(target)
-                        || self.inputs.arch.is_return_register_name(&target_base));
                 let dead_transient_call_result = !target_has_live_use
                     && !target_is_pinned
                     && (dead_return_register_owner
@@ -697,7 +686,7 @@ impl<'a> FoldingContext<'a> {
                     (reads, def) = self.stmt_reads_and_def(&stmt);
                     false
                 } else {
-                    dead_ephemeral || dead_flag_artifact || dead_certified_raw_memory_carrier
+                    dead_ephemeral || dead_flag_artifact
                 }
             } else {
                 // A statement that is only an expression, and whose evaluation
