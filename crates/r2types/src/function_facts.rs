@@ -3174,11 +3174,6 @@ fn prepared_callee_resolution_facts(
     function_facts: &FunctionFacts,
 ) -> CalleeResolutionFacts {
     let type_facts = function_facts.types.clone().canonicalized();
-    let known_function_signatures = type_facts
-        .known_function_signatures
-        .iter()
-        .map(|(name, ty)| (crate::normalize_callee_name(name), ty.clone()))
-        .collect::<HashMap<_, _>>();
     // These were empty maps, so every direct call resolved to nothing and
     // rendered as `sub_<addr>` even when radare2 had the name all along.
     let function_names = function_facts
@@ -3193,6 +3188,41 @@ fn prepared_callee_resolution_facts(
         .iter()
         .map(|(addr, name)| (*addr, name.clone()))
         .collect::<HashMap<_, _>>();
+    let mut known_function_signatures = type_facts
+        .known_function_signatures
+        .iter()
+        .map(|(name, ty)| (crate::normalize_callee_name(name), ty.clone()))
+        .collect::<HashMap<_, _>>();
+    // radare2 has no prototype for a fortified `__*_chk` import, so the call
+    // reached inference with neither argument types nor an arity, and an arity
+    // guess would have dropped the size argument it really passes. The embedded
+    // registry answers for the names it knows -- but only where radare2 said
+    // nothing, because a prototype radare2 carries came from the binary's own
+    // type database and outranks anything recovered from a name.
+    let mut registry_signatures = HashMap::new();
+    crate::enrich_known_function_signatures_from_names(
+        &mut registry_signatures,
+        function_names
+            .values()
+            .chain(symbols.values())
+            .map(String::as_str)
+            .chain(
+                type_facts
+                    .callee_facts
+                    .values()
+                    .filter_map(|fact| fact.name.as_deref()),
+            )
+            .collect::<BTreeSet<_>>(),
+        prepared
+            .machine_context()
+            .memory_model()
+            .default_address_bits(),
+    );
+    for (name, signature) in registry_signatures {
+        known_function_signatures
+            .entry(crate::normalize_callee_name(&name))
+            .or_insert(signature);
+    }
     let ctx = CalleeIdentityContext {
         function_names: &function_names,
         symbols: &symbols,

@@ -3,7 +3,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use r2ssa::{ObjectKind, SSAFunction, SSAOp, SSAVar, SsaArtifact};
 
 use crate::convert::CTypeLike;
-use crate::facts::{FunctionSignatureSpec, FunctionType, FunctionTypeFacts, signature_strength};
+use crate::facts::{FunctionSignatureSpec, FunctionType, signature_strength};
 use crate::inference::TypeInference;
 use crate::model::Signedness;
 use crate::prepare::{
@@ -1433,6 +1433,11 @@ pub fn build_inferred_signature(
     }
 }
 
+/// Record a prototype under every spelling of the name it was found by.
+///
+/// A prototype already recorded for a spelling was declared, not looked up, so
+/// it stays: what radare2 or the user says a function takes outranks what a
+/// name resolves to.
 fn insert_known_signature_aliases(
     known: &mut HashMap<String, FunctionType>,
     name: &str,
@@ -1441,20 +1446,30 @@ fn insert_known_signature_aliases(
     if name.is_empty() {
         return;
     }
-    known.insert(name.to_string(), sig.clone());
+    known.entry(name.to_string()).or_insert_with(|| sig.clone());
 
     for prefix in ["sym.imp.", "sym.", "imp.", "dbg.", "fcn."] {
         if let Some(stripped) = name.strip_prefix(prefix)
             && !stripped.is_empty()
         {
-            known.insert(stripped.to_string(), sig.clone());
+            known
+                .entry(stripped.to_string())
+                .or_insert_with(|| sig.clone());
         }
     }
 }
 
-fn normalize_signature_registry_name(name: &str) -> Option<&'static str> {
-    let normalized_owned = name.trim().to_ascii_lowercase();
-    let mut normalized = normalized_owned.as_str();
+/// The registry spelling a linker name stands for.
+///
+/// An import table spells one function many ways: a namespace prefix, a symbol
+/// version suffix, a libc-internal alias. Stripping those is safe because none
+/// of them change the prototype. Collapsing a fortified `__*_chk` name onto its
+/// base function is not: the fortified form takes an extra destination-size
+/// argument, so a caller that trusted the base arity would drop it. Those carry
+/// their own prototypes in the registry instead.
+fn signature_registry_alias(name: &str) -> Option<String> {
+    let lowered = name.trim().to_ascii_lowercase();
+    let mut normalized = lowered.as_str();
 
     for prefix in ["sym.imp.", "sym.", "imp.", "reloc.", "dbg."] {
         while let Some(rest) = normalized.strip_prefix(prefix) {
@@ -1479,68 +1494,67 @@ fn normalize_signature_registry_name(name: &str) -> Option<&'static str> {
         normalized = rest;
     }
 
-    match normalized {
-        "strlen" | "__strlen_chk" => Some("strlen"),
-        "strcmp" => Some("strcmp"),
-        "memcmp" => Some("memcmp"),
-        "memcpy" | "__memcpy_chk" => Some("memcpy"),
-        "memset" => Some("memset"),
-        "malloc" | "__libc_malloc" | "__gi___libc_malloc" => Some("malloc"),
-        "free" => Some("free"),
-        "puts" => Some("puts"),
-        "printf" | "__printf_chk" => Some("printf"),
-        "exit" | "_exit" => Some("exit"),
-        _ => None,
-    }
+    // Different linker name, same prototype.
+    let normalized = match normalized {
+        "__libc_malloc" => "malloc",
+        "_exit" => "exit",
+        other => other,
+    };
+
+    (normalized != name).then(|| normalized.to_string())
 }
 
-pub fn enrich_known_function_signatures_from_names(
-    type_facts: &mut FunctionTypeFacts,
-    function_names: &HashMap<u64, String>,
+/// The prototypes the embedded registry holds for these names.
+///
+/// A call to a libc function radare2 has no type for reaches inference with no
+/// prototype at all, so neither its argument types nor its arity are known. The
+/// registry answer is the whole prototype or nothing: a name that resolves gets
+/// its real parameter list, including the trailing destination size a fortified
+/// `__*_chk` entry point takes, so an arity cap built from it cannot swallow an
+/// argument the call really passes.
+///
+/// These are looked up from a name, so they are the weakest prototype there is.
+/// The caller decides what they may fill in; they never displace a prototype
+/// radare2 or the user already declared.
+pub fn enrich_known_function_signatures_from_names<I, N>(
+    known: &mut HashMap<String, FunctionType>,
+    function_names: I,
     ptr_bits: u32,
-) {
+) where
+    I: IntoIterator<Item = N>,
+    N: AsRef<str>,
+{
     let registry = SignatureRegistry::from_embedded_json();
+    let mut arena = crate::TypeArena::default();
 
-    for name in function_names.values() {
-        let mut candidates = vec![name.clone()];
-        if let Some(sim_name) = normalize_signature_registry_name(name)
-            && sim_name != name
-            && !candidates.iter().any(|candidate| candidate == sim_name)
-        {
-            candidates.push(sim_name.to_string());
-        }
+    for name in function_names {
+        let name = name.as_ref();
+        let alias = signature_registry_alias(name);
+        let resolved = [Some(name), alias.as_deref()]
+            .into_iter()
+            .flatten()
+            .find_map(|candidate| {
+                registry
+                    .resolve(candidate, &mut arena, ptr_bits)
+                    .map(|resolved| (candidate, resolved))
+            });
 
-        let resolved = candidates.into_iter().find_map(|candidate| {
-            let mut arena = crate::TypeArena::default();
-            registry
-                .resolve(&candidate, &mut arena, ptr_bits)
-                .map(|sig| {
-                    (
-                        candidate,
-                        FunctionType {
-                            return_type: crate::to_c_type_like(&arena, sig.ret),
-                            params: sig
-                                .params
-                                .into_iter()
-                                .map(|param| crate::to_c_type_like(&arena, param))
-                                .collect(),
-                            variadic: sig.variadic,
-                        },
-                    )
-                })
-        });
-
-        let Some((resolved_name, sig)) = resolved else {
+        let Some((resolved_name, resolved)) = resolved else {
             continue;
         };
+        let sig = FunctionType {
+            return_type: crate::to_c_type_like(&arena, resolved.ret),
+            params: resolved
+                .params
+                .iter()
+                .map(|param| crate::to_c_type_like(&arena, *param))
+                .collect(),
+            variadic: resolved.variadic,
+        };
 
-        insert_known_signature_aliases(&mut type_facts.known_function_signatures, name, &sig);
-        if resolved_name != *name {
-            insert_known_signature_aliases(
-                &mut type_facts.known_function_signatures,
-                &resolved_name,
-                &sig,
-            );
+        insert_known_signature_aliases(known, name, &sig);
+        if resolved_name != name {
+            insert_known_signature_aliases(known, resolved_name, &sig);
         }
     }
 }
@@ -1847,19 +1861,57 @@ mod tests {
     }
 
     #[test]
-    fn enrich_known_function_signatures_moves_registry_alias_policy_upstream() {
-        let mut facts = FunctionTypeFacts::default();
-        let names = HashMap::from([(0u64, "sym.imp.__printf_chk".to_string())]);
+    fn enrich_known_function_signatures_keeps_fortified_arity() {
+        let mut known = HashMap::new();
 
-        enrich_known_function_signatures_from_names(&mut facts, &names, 64);
+        enrich_known_function_signatures_from_names(&mut known, ["sym.imp.__memcpy_chk"], 64);
 
-        assert!(
-            facts
-                .known_function_signatures
-                .contains_key("sym.imp.__printf_chk")
+        let signature = known
+            .get("__memcpy_chk")
+            .expect("fortified prototype missing");
+        // memcpy's three arguments plus the destination size the fortified
+        // entry point takes. Answering with memcpy's arity would cap a real
+        // four-argument call at three and drop the size the call passes.
+        assert_eq!(signature.params.len(), 4);
+        assert!(!signature.variadic);
+        assert!(known.contains_key("sym.imp.__memcpy_chk"));
+        assert!(!known.contains_key("memcpy"));
+    }
+
+    #[test]
+    fn enrich_known_function_signatures_does_not_displace_a_declared_prototype() {
+        let declared = FunctionType {
+            return_type: CTypeLike::Void,
+            params: Vec::new(),
+            variadic: false,
+        };
+        let mut known = HashMap::from([("memcpy".to_string(), declared.clone())]);
+
+        enrich_known_function_signatures_from_names(&mut known, ["sym.imp.memcpy"], 64);
+
+        assert_eq!(known.get("memcpy"), Some(&declared));
+    }
+
+    #[test]
+    fn enrich_known_function_signatures_reads_through_linker_spellings() {
+        let mut known = HashMap::new();
+
+        enrich_known_function_signatures_from_names(
+            &mut known,
+            ["reloc.__libc_malloc@GLIBC_2.2.5", "sym.imp.__printf_chk"],
+            64,
         );
-        assert!(facts.known_function_signatures.contains_key("__printf_chk"));
-        assert!(facts.known_function_signatures.contains_key("printf"));
+
+        assert!(known.contains_key("malloc"));
+        let printf_chk = known
+            .get("__printf_chk")
+            .expect("fortified printf prototype missing");
+        // The leading `int flag` is not printf's format pointer.
+        assert!(matches!(
+            printf_chk.params.first(),
+            Some(CTypeLike::Int { bits: 32, .. })
+        ));
+        assert!(printf_chk.variadic);
     }
 
     #[test]
