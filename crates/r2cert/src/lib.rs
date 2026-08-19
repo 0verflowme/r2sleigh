@@ -4099,7 +4099,12 @@ fn certified_two_way_join_phis(
             continue;
         };
         let mut incoming = Vec::with_capacity(2);
-        for (value, predecessor) in inst.inputs.iter().copied().zip(predecessors.iter().copied()) {
+        for (value, predecessor) in inst
+            .inputs
+            .iter()
+            .copied()
+            .zip(predecessors.iter().copied())
+        {
             let Some(predecessor) = block_addr(predecessor) else {
                 break;
             };
@@ -5737,20 +5742,13 @@ fn certified_direct_calls(
                 let [fact] = boundary.results.as_slice() else {
                     continue;
                 };
-                if fact.slot
-                    != (CallBoundarySlot::Register {
-                        index: 0,
-                        storage,
-                    })
-                {
+                if fact.slot != (CallBoundarySlot::Register { index: 0, storage }) {
                     continue;
                 }
                 let Ok(value_use) = MachineValueUse::from_artifact(artifact, fact.value) else {
                     continue;
                 };
-                if value_use.binding().width_bits()
-                    != storage.size.checked_mul(8).unwrap_or(0)
-                {
+                if value_use.binding().width_bits() != storage.size.checked_mul(8).unwrap_or(0) {
                     continue;
                 }
                 Some(CertifiedCallResult {
@@ -7177,7 +7175,11 @@ fn conditional_control_input_producers(
 
 fn direct_call_input_producers(call: &CertifiedDirectCall) -> BTreeSet<CanonicalInstructionId> {
     std::iter::once(call.target_value())
-        .chain(call.arguments().iter().filter_map(CertifiedCallArgument::value))
+        .chain(
+            call.arguments()
+                .iter()
+                .filter_map(CertifiedCallArgument::value),
+        )
         .filter_map(MachineValueUse::producer)
         .collect()
 }

@@ -357,7 +357,7 @@ EXPECT=<<EOF
 sla: loaded architecture 'x86-64'
 bool dbg.complex_check(int32_t a, int32_t b)
 {
-    /* r2dec proof: rendered without kernel certification, no individual construct is marked */
+    /* r2dec proof: no individual construct is marked */
     return (a + b ^ 100 | a - b ^ 20) == 0;
 }
 
@@ -377,7 +377,7 @@ EXPECT=<<EOF
 sla: loaded architecture 'x86-64'
 /* unknown */ sym.imp.tcgetattr(void)
 {
-    /* r2dec proof: rendered without kernel certification, rendering produced no statements */
+    /* r2dec proof: rendering produced no statements */
 }
 
 EOF

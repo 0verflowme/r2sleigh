@@ -25,13 +25,12 @@ mod route;
 pub use route::{
     DecompileProbeDecision, EngineDiagnostics, EngineFunctionIdentity, EnginePlan,
     EngineRequestKind, EngineRequestPlan, EngineRouteContext, EngineRouteDecision,
-    EngineSemanticKernelRegion, EngineSemanticKernelRender, EngineTypeRouteDecision,
-    EngineTypeRouteKind, EngineTypedRouteDecision, cfg_guard_reason, cfg_guard_reason_from_summary,
-    plan_type_request, prefer_symbolic_large_worker_decompile, select_engine_plan,
-    semantic_artifact_needs_fallback_type_payload, semantic_or_cfg_prefers_bounded_type_plan,
-    should_guard_program_orchestrator_decompile, should_use_prepared_semantic_view,
-    type_cfg_allows_semantic_plan, type_cfg_bounded_reason, type_cfg_forces_bounded_plan,
-    type_cfg_prefers_bounded_plan, type_route_decision,
+    EngineTypeRouteDecision, EngineTypeRouteKind, EngineTypedRouteDecision, cfg_guard_reason,
+    cfg_guard_reason_from_summary, plan_type_request, prefer_symbolic_large_worker_decompile,
+    select_engine_plan, semantic_artifact_needs_fallback_type_payload,
+    semantic_or_cfg_prefers_bounded_type_plan, should_guard_program_orchestrator_decompile,
+    should_use_prepared_semantic_view, type_cfg_allows_semantic_plan, type_cfg_bounded_reason,
+    type_cfg_forces_bounded_plan, type_cfg_prefers_bounded_plan, type_route_decision,
 };
 #[cfg(test)]
 use route::{decompile_probe_decision, plan_decompile_request, semantic_route_reason};
@@ -4389,15 +4388,6 @@ impl EngineSession {
         request: EngineDecompileRequest,
         render_control: &C,
     ) -> EngineDecompileResponse {
-        self.decompile_with_r2dec_control_and_kernel_policy(request, render_control, true)
-    }
-
-    fn decompile_with_r2dec_control_and_kernel_policy<C: r2ssa::SsaWorkControl>(
-        &self,
-        request: EngineDecompileRequest,
-        render_control: &C,
-        try_semantic_kernel: bool,
-    ) -> EngineDecompileResponse {
         let started = Instant::now();
         let input_quality = request.input_quality.clone();
         let response_function_facts = request.function_facts().clone();
@@ -4430,36 +4420,28 @@ impl EngineSession {
         }
 
         let render_started = Instant::now();
-        let rendered =
-            match render_engine_decompile_request(&request, render_control, try_semantic_kernel) {
-                Ok(rendered) => rendered,
-                Err(stop) => {
-                    let render_time = render_started.elapsed();
-                    let metrics = engine_metrics_for_render_stop(
-                        request.metrics,
-                        &stop,
-                        planning_time,
-                        render_time,
-                    );
-                    let refusal = engine_render_execution_refusal(stop.reason, stop.phase, metrics);
-                    return refused_decompile_response_with_metrics(
-                        &request.function_name,
-                        &refusal.reason,
-                        input_quality.clone(),
-                        *refusal.metrics,
-                        *refusal.diagnostics,
-                    );
-                }
-            };
+        let rendered = match render_engine_decompile_request(&request, render_control) {
+            Ok(rendered) => rendered,
+            Err(stop) => {
+                let render_time = render_started.elapsed();
+                let metrics = engine_metrics_for_render_stop(
+                    request.metrics,
+                    &stop,
+                    planning_time,
+                    render_time,
+                );
+                let refusal = engine_render_execution_refusal(stop.reason, stop.phase, metrics);
+                return refused_decompile_response_with_metrics(
+                    &request.function_name,
+                    &refusal.reason,
+                    input_quality.clone(),
+                    *refusal.metrics,
+                    *refusal.diagnostics,
+                );
+            }
+        };
         let render_time = render_started.elapsed();
         let mut metrics = request.metrics;
-        if rendered.semantic_kernel_render.is_some() {
-            metrics.record_phase(
-                EnginePhase::Certification,
-                EnginePhaseStatus::Folded,
-                Duration::default(),
-            );
-        }
         if rendered.structuring_executed {
             metrics.record_phase(
                 EnginePhase::Structuring,
@@ -4488,51 +4470,6 @@ impl EngineSession {
                 *refusal.diagnostics,
             );
         }
-        if let Some(status) = rendered.semantic_kernel_render {
-            let (plan, reason) = match status.region {
-                EngineSemanticKernelRegion::TerminalReturnBlock => (
-                    EnginePlan::FastLocal,
-                    "r2dec sealed exact terminal-return typed-output ownership",
-                ),
-                EngineSemanticKernelRegion::AggregateMemberTerminalReturnFunction => (
-                    EnginePlan::FastLocal,
-                    "r2dec sealed exact aggregate-member terminal-return typed-output ownership",
-                ),
-                EngineSemanticKernelRegion::PlainRamMemoryTerminalReturnFunction => (
-                    EnginePlan::FastLocal,
-                    "r2dec sealed exact plain-RAM-memory terminal-return typed-output ownership",
-                ),
-                EngineSemanticKernelRegion::DirectCallTerminalReturnFunction => (
-                    EnginePlan::SemanticStructured,
-                    "r2dec sealed exact direct-call terminal-return typed-output ownership",
-                ),
-                EngineSemanticKernelRegion::PrivateFrameConditionalJoinFunction => (
-                    EnginePlan::SemanticStructured,
-                    "r2dec sealed exact private-frame conditional-join typed-output ownership",
-                ),
-                EngineSemanticKernelRegion::ConditionalTerminalReturnFunction => (
-                    EnginePlan::SemanticStructured,
-                    "r2dec sealed exact conditional-return typed-output ownership",
-                ),
-                EngineSemanticKernelRegion::GuardedTerminalReturnFunction => (
-                    EnginePlan::SemanticStructured,
-                    "r2dec sealed exact guarded terminal-return typed-output ownership",
-                ),
-                EngineSemanticKernelRegion::SwitchTerminalReturnFunction => (
-                    EnginePlan::SemanticStructured,
-                    "r2dec sealed exact switch terminal-return typed-output ownership",
-                ),
-                EngineSemanticKernelRegion::CarrierFreeLoopTerminalReturnFunction => (
-                    EnginePlan::SemanticStructured,
-                    "r2dec sealed exact carrier-free loop terminal-return typed-output ownership",
-                ),
-            };
-            diagnostics.plan = Some(plan);
-            diagnostics.route_reason = Some(reason.to_string());
-            diagnostics.semantic_kernel_render = Some(status);
-            diagnostics.refusal = None;
-        }
-
         EngineDecompileResponse {
             output: rendered.output,
             function_facts: response_function_facts,
@@ -5065,7 +5002,6 @@ fn decompile_diagnostics_from_function_facts(function_facts: &FunctionFacts) -> 
         return EngineDiagnostics {
             plan: None,
             route_reason: Some("missing FunctionFacts decompile route".to_string()),
-            semantic_kernel_render: None,
             warnings: vec![
                 "decompile request reached render without engine-stamped route facts".to_string(),
             ],
@@ -5075,7 +5011,6 @@ fn decompile_diagnostics_from_function_facts(function_facts: &FunctionFacts) -> 
     EngineDiagnostics {
         plan: Some(engine_plan_from_decompile_route_kind(route.kind)),
         route_reason: route.reason.clone(),
-        semantic_kernel_render: None,
         warnings: Vec::new(),
         refusal: route.fallback_comment.clone(),
     }
@@ -5095,7 +5030,6 @@ fn engine_plan_from_decompile_route_kind(kind: r2types::DecompileRouteKind) -> E
 #[derive(Debug)]
 struct EngineRenderedDecompile {
     output: String,
-    semantic_kernel_render: Option<EngineSemanticKernelRender>,
     semantic_kernel_warnings: Vec<String>,
     structuring_executed: bool,
 }
@@ -5115,23 +5049,6 @@ enum EngineSemanticKernelProbe {
     Switch,
     Loop,
     Terminal,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum EnginePrivateFrameProbeDisposition {
-    NotApplicable,
-    Refused,
-}
-
-fn classify_private_frame_probe_error(
-    error: &r2dec::PrivateFrameConditionalJoinFunctionError,
-) -> EnginePrivateFrameProbeDisposition {
-    match error {
-        r2dec::PrivateFrameConditionalJoinFunctionError::MissingExactJoin => {
-            EnginePrivateFrameProbeDisposition::NotApplicable
-        }
-        _ => EnginePrivateFrameProbeDisposition::Refused,
-    }
 }
 
 impl EngineSemanticKernelProbe {
@@ -5348,328 +5265,10 @@ fn prepared_artifact_has_source_aggregate_pointer(artifact: &SsaArtifact) -> boo
     })
 }
 
-#[derive(Debug)]
-enum EngineSemanticKernelAttempt {
-    NotApplicable(Vec<String>),
-    Rendered(EngineRenderedDecompile),
-}
-
-fn complete_engine_semantic_kernel_attempt<C: r2ssa::SsaWorkControl + ?Sized>(
-    control: &C,
-    attempt: EngineSemanticKernelAttempt,
-) -> Result<EngineSemanticKernelAttempt, EngineRenderExecutionStop> {
-    match &attempt {
-        EngineSemanticKernelAttempt::Rendered(rendered) => {
-            poll_engine_render_control_with_completion(
-                control,
-                EnginePhase::Rendering,
-                true,
-                rendered.structuring_executed,
-            )?;
-        }
-        EngineSemanticKernelAttempt::NotApplicable(_) => {
-            poll_engine_render_control(control, EnginePhase::Rendering)?;
-        }
-    }
-    Ok(attempt)
-}
-
-fn resolve_engine_semantic_kernel_attempt(
-    attempt: EngineSemanticKernelAttempt,
-) -> Result<(Option<EngineRenderedDecompile>, Vec<String>), EngineRenderExecutionStop> {
-    match attempt {
-        EngineSemanticKernelAttempt::NotApplicable(warnings) => Ok((None, warnings)),
-        EngineSemanticKernelAttempt::Rendered(rendered) => Ok((Some(rendered), Vec::new())),
-    }
-}
-
-fn render_semantic_kernel_function<C: r2ssa::SsaWorkControl + ?Sized>(
-    request: &EngineDecompileRequest,
-    control: &C,
-) -> Result<EngineSemanticKernelAttempt, EngineRenderExecutionStop> {
-    poll_engine_render_control(control, EnginePhase::Rendering)?;
-    let Some(trusted) = request.trusted_ssa.as_deref() else {
-        return complete_engine_semantic_kernel_attempt(
-            control,
-            EngineSemanticKernelAttempt::NotApplicable(Vec::new()),
-        );
-    };
-    let mut trace = EngineSemanticKernelTrace::default();
-    match r2dec::CertifiedPrivateFrameConditionalJoinFunction::from_artifact(trusted) {
-        Ok(function) => {
-            let output = function.render_certified_c().map_err(|error| {
-                engine_semantic_kernel_refusal(
-                    format!(
-                        "private-frame conditional-join rendering refused after exact certification: {error}"
-                    ),
-                    EnginePhase::Rendering,
-                    true,
-                    true,
-                )
-            })?;
-            return complete_engine_semantic_kernel_attempt(
-                control,
-                EngineSemanticKernelAttempt::Rendered(EngineRenderedDecompile {
-                    output,
-                    structuring_executed: true,
-                    semantic_kernel_render: Some(EngineSemanticKernelRender {
-                        region: EngineSemanticKernelRegion::PrivateFrameConditionalJoinFunction,
-                        region_schema_version: function.schema_version(),
-                        exact_obligation_closure: true,
-                    }),
-                    semantic_kernel_warnings: trace.into_warnings(),
-                }),
-            );
-        }
-        // A probe that cannot certify has said this route does not apply to
-        // this function. It has not said the function cannot be decompiled, and
-        // returning an error here made it say exactly that: the standard
-        // renderer was never reached, so a shape the kernel half-recognised
-        // cost the whole function. Every other probe in this sequence already
-        // records its refusal and carries on; this one is now consistent with
-        // them, and the distinction between a shape that did not match and a
-        // proof that did not close is kept in the trace where it belongs.
-        Err(error) => match classify_private_frame_probe_error(&error) {
-            EnginePrivateFrameProbeDisposition::NotApplicable => {
-                trace.not_applicable(EngineSemanticKernelProbe::PrivateFrame, &error.to_string())
-            }
-            EnginePrivateFrameProbeDisposition::Refused => {
-                trace.refused(EngineSemanticKernelProbe::PrivateFrame, &error.to_string())
-            }
-        },
-    }
-    poll_engine_render_control(control, EnginePhase::Rendering)?;
-    match r2dec::CertifiedAggregateMemberSemanticCFunction::from_artifact(trusted) {
-        Ok(function) => match function.render_certified_c() {
-            Ok(output) => {
-                return complete_engine_semantic_kernel_attempt(
-                    control,
-                    EngineSemanticKernelAttempt::Rendered(EngineRenderedDecompile {
-                        output,
-                        structuring_executed: true,
-                        semantic_kernel_render: Some(EngineSemanticKernelRender {
-                            region:
-                                EngineSemanticKernelRegion::AggregateMemberTerminalReturnFunction,
-                            region_schema_version: function.schema_version(),
-                            exact_obligation_closure: true,
-                        }),
-                        semantic_kernel_warnings: trace.into_warnings(),
-                    }),
-                );
-            }
-            Err(error) => trace.refused(EngineSemanticKernelProbe::Aggregate, &error.to_string()),
-        },
-        Err(error) => {
-            trace.not_applicable(EngineSemanticKernelProbe::Aggregate, &error.to_string())
-        }
-    }
-    poll_engine_render_control(control, EnginePhase::Rendering)?;
-    if prepared_artifact_has_source_aggregate_pointer(trusted.artifact()) {
-        trace.not_applicable(
-            EngineSemanticKernelProbe::Memory,
-            "source aggregate pointer requires aggregate-member renderer",
-        );
-    } else {
-        match r2dec::CertifiedMemorySemanticCFunction::from_artifact(trusted) {
-            Ok(function) => match function.render_certified_c() {
-                Ok(output) => {
-                    return complete_engine_semantic_kernel_attempt(
-                        control,
-                        EngineSemanticKernelAttempt::Rendered(EngineRenderedDecompile {
-                            output,
-                            structuring_executed: true,
-                            semantic_kernel_render: Some(EngineSemanticKernelRender {
-                                region:
-                                    EngineSemanticKernelRegion::PlainRamMemoryTerminalReturnFunction,
-                                region_schema_version: function.schema_version(),
-                                exact_obligation_closure: true,
-                            }),
-                            semantic_kernel_warnings: trace.into_warnings(),
-                        }),
-                    );
-                }
-                Err(error) => trace.refused(EngineSemanticKernelProbe::Memory, &error.to_string()),
-            },
-            Err(error) => {
-                trace.not_applicable(EngineSemanticKernelProbe::Memory, &error.to_string())
-            }
-        }
-    }
-    poll_engine_render_control(control, EnginePhase::Rendering)?;
-    match r2dec::CertifiedDirectCallReturnFunction::from_artifact(trusted) {
-        Ok(function) => match function.render_certified_c() {
-            Ok(output) => {
-                return complete_engine_semantic_kernel_attempt(
-                    control,
-                    EngineSemanticKernelAttempt::Rendered(EngineRenderedDecompile {
-                        output,
-                        structuring_executed: true,
-                        semantic_kernel_render: Some(EngineSemanticKernelRender {
-                            region: EngineSemanticKernelRegion::DirectCallTerminalReturnFunction,
-                            region_schema_version: function.schema_version(),
-                            exact_obligation_closure: true,
-                        }),
-                        semantic_kernel_warnings: trace.into_warnings(),
-                    }),
-                );
-            }
-            Err(error) => trace.refused(EngineSemanticKernelProbe::DirectCall, &error.to_string()),
-        },
-        Err(error) => {
-            trace.not_applicable(EngineSemanticKernelProbe::DirectCall, &error.to_string())
-        }
-    }
-    poll_engine_render_control(control, EnginePhase::Rendering)?;
-    match r2dec::CertifiedConditionalReturnFunction::from_artifact(trusted) {
-        Ok(function) => match function.render_certified_c() {
-            Ok(output) => {
-                return complete_engine_semantic_kernel_attempt(
-                    control,
-                    EngineSemanticKernelAttempt::Rendered(EngineRenderedDecompile {
-                        output,
-                        structuring_executed: true,
-                        semantic_kernel_render: Some(EngineSemanticKernelRender {
-                            region: EngineSemanticKernelRegion::ConditionalTerminalReturnFunction,
-                            region_schema_version: function.schema_version(),
-                            exact_obligation_closure: true,
-                        }),
-                        semantic_kernel_warnings: trace.into_warnings(),
-                    }),
-                );
-            }
-            Err(error) => trace.refused(EngineSemanticKernelProbe::Conditional, &error.to_string()),
-        },
-        Err(error) => {
-            trace.not_applicable(EngineSemanticKernelProbe::Conditional, &error.to_string())
-        }
-    }
-    poll_engine_render_control(control, EnginePhase::Rendering)?;
-    match r2dec::CertifiedGuardedReturnFunction::from_artifact(trusted) {
-        Ok(function) => match function.render_certified_c() {
-            Ok(output) => {
-                return complete_engine_semantic_kernel_attempt(
-                    control,
-                    EngineSemanticKernelAttempt::Rendered(EngineRenderedDecompile {
-                        output,
-                        structuring_executed: true,
-                        semantic_kernel_render: Some(EngineSemanticKernelRender {
-                            region: EngineSemanticKernelRegion::GuardedTerminalReturnFunction,
-                            region_schema_version: function.schema_version(),
-                            exact_obligation_closure: true,
-                        }),
-                        semantic_kernel_warnings: trace.into_warnings(),
-                    }),
-                );
-            }
-            Err(error) => trace.refused(EngineSemanticKernelProbe::Guard, &error.to_string()),
-        },
-        Err(error) => trace.not_applicable(EngineSemanticKernelProbe::Guard, &error.to_string()),
-    }
-    poll_engine_render_control(control, EnginePhase::Rendering)?;
-    match r2dec::CertifiedSwitchReturnFunction::from_artifact(trusted) {
-        Ok(function) => match function.render_certified_c() {
-            Ok(output) => {
-                return complete_engine_semantic_kernel_attempt(
-                    control,
-                    EngineSemanticKernelAttempt::Rendered(EngineRenderedDecompile {
-                        output,
-                        structuring_executed: true,
-                        semantic_kernel_render: Some(EngineSemanticKernelRender {
-                            region: EngineSemanticKernelRegion::SwitchTerminalReturnFunction,
-                            region_schema_version: function.schema_version(),
-                            exact_obligation_closure: true,
-                        }),
-                        semantic_kernel_warnings: trace.into_warnings(),
-                    }),
-                );
-            }
-            Err(error) => trace.refused(EngineSemanticKernelProbe::Switch, &error.to_string()),
-        },
-        Err(error) => trace.not_applicable(EngineSemanticKernelProbe::Switch, &error.to_string()),
-    }
-    poll_engine_render_control(control, EnginePhase::Rendering)?;
-    match r2dec::CertifiedLoopReturnFunction::from_artifact(trusted) {
-        Ok(function) => match function.render_certified_c() {
-            Ok(output) => {
-                return complete_engine_semantic_kernel_attempt(
-                    control,
-                    EngineSemanticKernelAttempt::Rendered(EngineRenderedDecompile {
-                        output,
-                        structuring_executed: true,
-                        semantic_kernel_render: Some(EngineSemanticKernelRender {
-                            region:
-                                EngineSemanticKernelRegion::CarrierFreeLoopTerminalReturnFunction,
-                            region_schema_version: function.schema_version(),
-                            exact_obligation_closure: true,
-                        }),
-                        semantic_kernel_warnings: trace.into_warnings(),
-                    }),
-                );
-            }
-            Err(error) => trace.refused(EngineSemanticKernelProbe::Loop, &error.to_string()),
-        },
-        Err(error) => trace.not_applicable(EngineSemanticKernelProbe::Loop, &error.to_string()),
-    }
-    poll_engine_render_control(control, EnginePhase::Rendering)?;
-    match r2dec::CertifiedSemanticCFunction::from_artifact(trusted) {
-        Ok(function) => match function.render_certified_c() {
-            Ok(output) => {
-                return complete_engine_semantic_kernel_attempt(
-                    control,
-                    EngineSemanticKernelAttempt::Rendered(EngineRenderedDecompile {
-                        output,
-                        structuring_executed: true,
-                        semantic_kernel_render: Some(EngineSemanticKernelRender {
-                            region: EngineSemanticKernelRegion::TerminalReturnBlock,
-                            region_schema_version: function.schema_version(),
-                            exact_obligation_closure: true,
-                        }),
-                        semantic_kernel_warnings: trace.into_warnings(),
-                    }),
-                );
-            }
-            Err(error) => trace.refused(EngineSemanticKernelProbe::Terminal, &error.to_string()),
-        },
-        Err(error) => trace.not_applicable(EngineSemanticKernelProbe::Terminal, &error.to_string()),
-    }
-    complete_engine_semantic_kernel_attempt(
-        control,
-        EngineSemanticKernelAttempt::NotApplicable(trace.into_warnings()),
-    )
-}
-
 fn render_engine_decompile_request<C: r2ssa::SsaWorkControl>(
     request: &EngineDecompileRequest,
     control: &C,
-    try_semantic_kernel: bool,
 ) -> Result<EngineRenderedDecompile, EngineRenderExecutionStop> {
-    // The kernel decides whether an exact obligation closes. It does not decide
-    // what the reader sees. Its own C is written to be checkable against the
-    // SSA -- widths made explicit, every value bound, arithmetic spelled through
-    // helper functions -- and returning it as the answer replaced a readable
-    // rendering of the same function with a transcription of the proof. A
-    // function as simple as `if (x == 0xDEAD) return 1; return 0;` came back as
-    // a single nested ternary over `r2s_wrap_sub`.
-    //
-    // So the certification is kept and the rendering is not. The standard
-    // renderer produces the output either way, and the closed obligation is
-    // carried alongside it: it is a claim about the function, and the function
-    // is still spelled the way a person reads it.
-    let (kernel_certification, semantic_kernel_warnings) = if try_semantic_kernel {
-        let (rendered, warnings) = resolve_engine_semantic_kernel_attempt(
-            render_semantic_kernel_function(request, control)?,
-        )?;
-        match rendered {
-            Some(rendered) => (
-                rendered.semantic_kernel_render,
-                rendered.semantic_kernel_warnings,
-            ),
-            None => (None, warnings),
-        }
-    } else {
-        poll_engine_render_control(control, EnginePhase::Rendering)?;
-        (None, Vec::new())
-    };
     poll_engine_render_control(control, EnginePhase::Rendering)?;
     if let Some(output) = render_semantic_route(
         &request.function_name,
@@ -5679,22 +5278,19 @@ fn render_engine_decompile_request<C: r2ssa::SsaWorkControl>(
         poll_engine_render_control(control, EnginePhase::Rendering)?;
         return Ok(EngineRenderedDecompile {
             output,
-            semantic_kernel_render: kernel_certification,
-            semantic_kernel_warnings,
+            semantic_kernel_warnings: Vec::new(),
             structuring_executed: false,
         });
     }
 
-    let input = decompiler_input_for_engine_request(request)
-        .with_kernel_certification(kernel_certification.is_some());
+    let input = decompiler_input_for_engine_request(request);
     let output = r2dec::Decompiler::new(request.render_target.to_decompiler_config())
         .decompile_input_with_control(&input, control)
         .map_err(engine_render_stop_from_decompiler)?;
     if !output.trim().is_empty() {
         return Ok(EngineRenderedDecompile {
             output,
-            semantic_kernel_render: kernel_certification,
-            semantic_kernel_warnings,
+            semantic_kernel_warnings: Vec::new(),
             structuring_executed: true,
         });
     }
@@ -5705,8 +5301,7 @@ fn render_engine_decompile_request<C: r2ssa::SsaWorkControl>(
             request.function_facts(),
         )
         .unwrap_or_default(),
-        semantic_kernel_render: kernel_certification,
-        semantic_kernel_warnings,
+        semantic_kernel_warnings: Vec::new(),
         structuring_executed: false,
     })
 }
@@ -6776,143 +6371,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn typed_external_context_owner_ignores_raw_fallback_and_preserves_typed_inputs() {
-        let parsed = parse_typed_external_context(
-            EngineExternalContextInput {
-                schema_version: 2,
-                dirty_epoch: 11,
-                context_hash: 0xfeed,
-                type_dirty_epoch: 13,
-                signature: EngineExternalSignatureInput {
-                    name: Some("target".to_string()),
-                    ret_type: Some("int".to_string()),
-                    callconv: Some("amd64".to_string()),
-                    noreturn: false,
-                    params: vec![EngineExternalSignatureParamInput {
-                        name: Some("argc".to_string()),
-                        ty: Some("int".to_string()),
-                        cc_reg: Some("rdi".to_string()),
-                    }],
-                },
-                vars: vec![EngineExternalVarInput {
-                    kind: ENGINE_EXTERNAL_VAR_REGISTER,
-                    name: Some("argc".to_string()),
-                    ty: Some("int".to_string()),
-                    reg: Some("rdi".to_string()),
-                    is_arg: true,
-                    ..EngineExternalVarInput::default()
-                }],
-                base_types: Vec::new(),
-                callees: vec![EngineExternalCalleeInput {
-                    call_addr: 0x401000,
-                    addr: 0x402000,
-                    name: Some("setlocale".to_string()),
-                    linkage: ENGINE_EXTERNAL_LINKAGE_IMPORTED,
-                    signature: EngineExternalSignatureInput {
-                        name: Some("setlocale".to_string()),
-                        ret_type: Some("char *".to_string()),
-                        params: vec![EngineExternalSignatureParamInput {
-                            name: Some("category".to_string()),
-                            ty: Some("int".to_string()),
-                            cc_reg: None,
-                        }],
-                        ..EngineExternalSignatureInput::default()
-                    },
-                }],
-                assumptions_json: Some(
-                    r#"{"assumptions":[{"subject":{"register":{"name":"rdi"}},"value":{"constant":{"value":4660}}}]}"#
-                        .to_string(),
-                ),
-            },
-            64,
-        );
-
-        assert_eq!(parsed.context_schema_version, Some(2));
-        assert_eq!(parsed.type_dirty_epoch, Some(13));
-        assert_eq!(parsed.callconv.as_deref(), Some("amd64"));
-        assert_eq!(parsed.register_params[0].reg, "rdi");
-        assert!(
-            parsed.external_type_db.structs.is_empty(),
-            "typed context parsing must not import raw fallback base types"
-        );
-
-        assert!(!parsed.callee_facts.contains_key(&4198400));
-        let callee = parsed.callee_facts.get(&0x402000).expect("typed callee");
-        assert_eq!(callee.name.as_deref(), Some("setlocale"));
-        assert!(callee.linkage.authorizes_import_policy());
-        assert_eq!(
-            callee
-                .signature
-                .as_ref()
-                .map(|signature| signature.params.len()),
-            Some(1)
-        );
-
-        assert!(
-            parsed
-                .assumptions
-                .items
-                .iter()
-                .any(|assumption| assumption.subject
-                    == r2ssa::AssumptionSubject::Register {
-                        name: "rdi".to_string()
-                    })
-        );
-    }
-
-    #[test]
-    fn typed_external_context_empty_input_stays_empty_without_legacy_raw_context() {
-        let parsed = parse_typed_external_context(EngineExternalContextInput::default(), 64);
-
-        assert_eq!(parsed.context_schema_version, None);
-        assert_eq!(parsed.context_hash, None);
-        assert_eq!(parsed.current_signature, None);
-        assert!(parsed.stack_slots.is_empty());
-        assert!(parsed.external_type_db.structs.is_empty());
-        assert!(parsed.external_type_db.unions.is_empty());
-        assert!(parsed.external_type_db.enums.is_empty());
-        assert!(parsed.callee_facts.is_empty());
-    }
-
-    #[test]
-    fn typed_external_context_partial_input_does_not_fill_missing_groups_from_raw_json() {
-        let parsed = parse_typed_external_context(
-            EngineExternalContextInput {
-                schema_version: 3,
-                dirty_epoch: 0,
-                context_hash: 0,
-                type_dirty_epoch: 0,
-                signature: EngineExternalSignatureInput::default(),
-                vars: Vec::new(),
-                base_types: Vec::new(),
-                callees: Vec::new(),
-                assumptions_json: None,
-            },
-            64,
-        );
-
-        assert_eq!(parsed.context_schema_version, Some(3));
-        assert_eq!(parsed.callconv, None);
-        assert_eq!(parsed.current_signature, None);
-        assert!(
-            parsed.stack_slots.is_empty(),
-            "empty typed vars must stay empty instead of importing raw fallback vars"
-        );
-    }
-
-    #[test]
-    fn engine_arch_target_uses_effective_pointer_width_fallbacks() {
-        let mut arch = r2il::ArchSpec::new("x86-64");
-        arch.addr_size = 0;
-        arch.add_register(r2il::RegisterDef::new("rip", 0, 8));
-
-        let (arch_name, ptr_bits) = engine_arch_target(Some(&arch));
-
-        assert_eq!(arch_name, "x86-64");
-        assert_eq!(ptr_bits, 64);
-    }
-
     fn const_return_blocks(addr: u64, value: u64) -> Vec<R2ILBlock> {
         let mut block = R2ILBlock::new(addr, 4);
         block.push(r2il::R2ILOp::Return {
@@ -7541,395 +6999,6 @@ mod tests {
             r2ssa::SsaArtifactProvenanceKind::TrustedSource,
             "caller-authored blocks and interfaces must remain analysis-only"
         );
-    }
-
-    fn assert_handmade_engine_refusal(
-        function_name: &str,
-        function_addr: u64,
-        blocks: Vec<R2ILBlock>,
-        arch: r2il::ArchSpec,
-        source_snapshot: Arc<EngineSourceSnapshot>,
-        forbidden_output: &str,
-    ) {
-        let artifact = r2ssa::SsaArtifact::for_decompile_with_interfaces(
-            &blocks,
-            Some(&arch),
-            source_snapshot.function_interface().cloned(),
-            source_snapshot.call_site_interfaces().to_vec(),
-        )
-        .expect("handmade fixture remains analyzable");
-        assert_handmade_analysis_only(&artifact);
-
-        let response = EngineSession::new().decompile_function_from_input(
-            EngineFunctionDecompileRequestInput::single_function(
-                EngineFunctionInput {
-                    function_name: function_name.to_string(),
-                    function_addr,
-                    blocks,
-                    arch: Some(arch),
-                    source_snapshot: Some(source_snapshot),
-                    semantic_metadata_enabled: true,
-                },
-                Some(64),
-                r2types::ParsedExternalContext::default(),
-            ),
-        );
-        assert!(response.diagnostics.semantic_kernel_render.is_none());
-        assert!(
-            response.output.contains("r2dec residual:")
-                || response.output.contains("r2dec fallback:")
-        );
-        assert!(!response.output.contains(forbidden_output));
-    }
-
-    #[test]
-    fn handmade_terminal_fixture_refuses_certified_c() {
-        let (blocks, arch, source_snapshot) = source_snapshot_terminal_function();
-        assert_handmade_engine_refusal(
-            "sym.production_terminal",
-            0x7200,
-            blocks,
-            arch,
-            source_snapshot,
-            "certified_sub_7200",
-        );
-    }
-
-    #[test]
-    fn handmade_memory_terminal_fixture_refuses_certified_c() {
-        let (blocks, arch, source_snapshot) = source_snapshot_memory_terminal_function();
-        assert_handmade_engine_refusal(
-            "sym.production_memory_terminal",
-            0x7280,
-            blocks,
-            arch,
-            source_snapshot,
-            "certified_mem_sub_7280",
-        );
-    }
-
-    #[test]
-    fn handmade_aggregate_member_fixtures_refuse_certified_c() {
-        let (load_blocks, load_arch, load_snapshot) =
-            source_snapshot_aggregate_member_load_return_function();
-        let prepared_load = r2ssa::SsaArtifact::for_decompile_with_interface(
-            &load_blocks,
-            Some(&load_arch),
-            load_snapshot
-                .function_interface()
-                .cloned()
-                .expect("aggregate load interface"),
-        )
-        .expect("prepared aggregate load");
-        assert_handmade_analysis_only(&prepared_load);
-
-        let load = EngineSession::new().decompile_function_from_input(
-            EngineFunctionDecompileRequestInput::single_function(
-                EngineFunctionInput {
-                    function_name: "sym.production_aggregate_member_load".to_string(),
-                    function_addr: 0x7700,
-                    blocks: load_blocks.clone(),
-                    arch: Some(load_arch.clone()),
-                    source_snapshot: Some(Arc::clone(&load_snapshot)),
-                    semantic_metadata_enabled: true,
-                },
-                Some(64),
-                r2types::ParsedExternalContext::default(),
-            ),
-        );
-        assert!(load.diagnostics.semantic_kernel_render.is_none());
-        assert!(!load.output.contains("certified_aggregate_sub_7700"));
-
-        let (store_blocks, store_arch, store_snapshot) =
-            source_snapshot_aggregate_member_store_function();
-        let store = EngineSession::new().decompile_function_from_input(
-            EngineFunctionDecompileRequestInput::single_function(
-                EngineFunctionInput {
-                    function_name: "sym.production_aggregate_member_store".to_string(),
-                    function_addr: 0x7710,
-                    blocks: store_blocks,
-                    arch: Some(store_arch),
-                    source_snapshot: Some(store_snapshot),
-                    semantic_metadata_enabled: true,
-                },
-                Some(64),
-                r2types::ParsedExternalContext::default(),
-            ),
-        );
-        assert!(store.diagnostics.semantic_kernel_render.is_none());
-        assert!(!store.output.contains("certified_aggregate_sub_7710"));
-
-        let mut indirect_address = load_blocks;
-        indirect_address[0].ops.insert(
-            1,
-            r2il::R2ILOp::Copy {
-                dst: r2il::Varnode::unique(0x11, 8),
-                src: r2il::Varnode::unique(0x10, 8),
-            },
-        );
-        let r2il::R2ILOp::Load { addr, .. } = &mut indirect_address[0].ops[2] else {
-            panic!("aggregate near-miss load");
-        };
-        *addr = r2il::Varnode::unique(0x11, 8);
-        let prepared_near_miss = r2ssa::SsaArtifact::for_decompile_with_interface(
-            &indirect_address,
-            Some(&load_arch),
-            load_snapshot
-                .function_interface()
-                .cloned()
-                .expect("aggregate near-miss interface"),
-        )
-        .expect("prepared aggregate near miss");
-        assert_handmade_analysis_only(&prepared_near_miss);
-        let refused = EngineSession::new().decompile_function_from_input(
-            EngineFunctionDecompileRequestInput::single_function(
-                EngineFunctionInput {
-                    function_name: "sym.production_aggregate_member_near_miss".to_string(),
-                    function_addr: 0x7700,
-                    blocks: indirect_address,
-                    arch: Some(load_arch),
-                    source_snapshot: Some(load_snapshot),
-                    semantic_metadata_enabled: true,
-                },
-                Some(64),
-                r2types::ParsedExternalContext::default(),
-            ),
-        );
-        // The function is rendered now rather than refused wholesale, so the
-        // claim under test is that the output never presents itself as
-        // certified: it carries a proof marker and none of the certified
-        // aggregate or memory names.
-        assert!(
-            (refused.output.contains("r2dec residual:")
-                || refused.output.contains("r2dec fallback:")
-                || refused
-                    .output
-                    .contains("r2dec proof: rendered without kernel certification"))
-                && !refused.output.contains("certified_aggregate_sub_7700")
-                && !refused.output.contains("certified_mem_sub_7700"),
-            "non-direct aggregate address must not downgrade to generic memory C:\n{}",
-            refused.output
-        );
-        assert!(refused.diagnostics.semantic_kernel_render.is_none());
-    }
-
-    #[test]
-    fn handmade_direct_call_return_fixture_refuses_certified_c() {
-        let (blocks, arch, source_snapshot) = source_snapshot_direct_call_return_function();
-        let response = EngineSession::new().decompile_function_from_input(
-            EngineFunctionDecompileRequestInput::single_function(
-                EngineFunctionInput {
-                    function_name: "sym.production_direct_call_return".to_string(),
-                    function_addr: 0x7500,
-                    blocks: blocks.clone(),
-                    arch: Some(arch.clone()),
-                    source_snapshot: Some(Arc::clone(&source_snapshot)),
-                    semantic_metadata_enabled: true,
-                },
-                Some(64),
-                r2types::ParsedExternalContext::default(),
-            ),
-        );
-        assert!(response.diagnostics.semantic_kernel_render.is_none());
-        assert!(!response.output.contains("certified_call_sub_7500"));
-
-        let missing_callsite = Arc::new(
-            EngineSourceSnapshot::new(
-                source_snapshot.revision_identity().to_vec(),
-                source_snapshot.function_interface().cloned(),
-                Vec::new(),
-            )
-            .expect("snapshot without exact callsite interface"),
-        );
-        let refused = EngineSession::new().decompile_function_from_input(
-            EngineFunctionDecompileRequestInput::single_function(
-                EngineFunctionInput {
-                    function_name: "sym.production_direct_call_return".to_string(),
-                    function_addr: 0x7500,
-                    blocks,
-                    arch: Some(arch),
-                    source_snapshot: Some(missing_callsite),
-                    semantic_metadata_enabled: true,
-                },
-                Some(64),
-                r2types::ParsedExternalContext::default(),
-            ),
-        );
-        assert!(
-            (refused.output.contains("r2dec residual:")
-                || refused.output.contains("r2dec fallback:"))
-                && !refused.output.contains("certified_call_sub_7500"),
-            "missing callsite authority must fail closed:\n{}",
-            refused.output
-        );
-        assert!(refused.diagnostics.semantic_kernel_render.is_none());
-    }
-
-    #[test]
-    fn handmade_conditional_return_fixture_refuses_certified_c() {
-        let (blocks, arch, source_snapshot) = source_snapshot_conditional_return_function();
-        assert_handmade_engine_refusal(
-            "sym.production_conditional_return",
-            0x7300,
-            blocks,
-            arch,
-            source_snapshot,
-            "certified_sub_7300",
-        );
-    }
-
-    #[test]
-    fn handmade_switch_return_fixture_refuses_certified_c() {
-        let (blocks, arch, source_snapshot) = source_snapshot_switch_return_function();
-        let response = EngineSession::new().decompile_function_from_input(
-            EngineFunctionDecompileRequestInput::single_function(
-                EngineFunctionInput {
-                    function_name: "sym.production_switch_return".to_string(),
-                    function_addr: 0x7380,
-                    blocks: blocks.clone(),
-                    arch: Some(arch.clone()),
-                    source_snapshot: Some(Arc::clone(&source_snapshot)),
-                    semantic_metadata_enabled: true,
-                },
-                Some(64),
-                r2types::ParsedExternalContext::default(),
-            ),
-        );
-        assert!(response.diagnostics.semantic_kernel_render.is_none());
-        assert!(!response.output.contains("certified_sub_7380"));
-
-        let register = |offset| r2ssa::CanonicalStorageId {
-            space: r2ssa::CanonicalStorageSpace::Register,
-            offset,
-            size: 8,
-        };
-        let wrong_interface = r2ssa::SourceFunctionInterface::new(
-            source_snapshot.revision_identity().to_vec(),
-            "test-register-abi",
-            [r2ssa::SourceAbiParameterSpec::new(0, register(24))],
-            r2ssa::SourceFunctionReturn::Register {
-                storage: register(0),
-            },
-            Vec::<r2ssa::SourceStackSlotSpec>::new(),
-        )
-        .expect("wrong selector interface");
-        let wrong_storage = Arc::new(
-            EngineSourceSnapshot::new(
-                source_snapshot.revision_identity().to_vec(),
-                Some(wrong_interface),
-                Vec::new(),
-            )
-            .expect("wrong selector snapshot"),
-        );
-        let missing_interface = Arc::new(
-            EngineSourceSnapshot::new(
-                source_snapshot.revision_identity().to_vec(),
-                None,
-                Vec::new(),
-            )
-            .expect("snapshot without function interface"),
-        );
-        for source_snapshot in [missing_interface, wrong_storage] {
-            let refused = EngineSession::new().decompile_function_from_input(
-                EngineFunctionDecompileRequestInput::single_function(
-                    EngineFunctionInput {
-                        function_name: "sym.production_switch_return".to_string(),
-                        function_addr: 0x7380,
-                        blocks: blocks.clone(),
-                        arch: Some(arch.clone()),
-                        source_snapshot: Some(source_snapshot),
-                        semantic_metadata_enabled: true,
-                    },
-                    Some(64),
-                    r2types::ParsedExternalContext::default(),
-                ),
-            );
-            assert!(
-                (refused.output.contains("r2dec residual:")
-                    || refused.output.contains("r2dec fallback:"))
-                    && !refused.output.contains("certified_sub_7380"),
-                "missing or wrong selector authority must fail closed:\n{}",
-                refused.output
-            );
-            assert!(refused.diagnostics.semantic_kernel_render.is_none());
-        }
-    }
-
-    #[test]
-    fn handmade_carrier_free_loop_return_fixture_refuses_certified_c() {
-        let (blocks, arch, source_snapshot) = source_snapshot_carrier_free_loop_return_function();
-        let response = EngineSession::new().decompile_function_from_input(
-            EngineFunctionDecompileRequestInput::single_function(
-                EngineFunctionInput {
-                    function_name: "sym.production_carrier_free_loop_return".to_string(),
-                    function_addr: 0x7400,
-                    blocks: blocks.clone(),
-                    arch: Some(arch.clone()),
-                    source_snapshot: Some(Arc::clone(&source_snapshot)),
-                    semantic_metadata_enabled: true,
-                },
-                Some(64),
-                r2types::ParsedExternalContext::default(),
-            ),
-        );
-        assert!(response.diagnostics.semantic_kernel_render.is_none());
-        assert!(!response.output.contains("certified_sub_7400"));
-
-        let register = |offset, size| r2ssa::CanonicalStorageId {
-            space: r2ssa::CanonicalStorageSpace::Register,
-            offset,
-            size,
-        };
-        let wrong_interface = r2ssa::SourceFunctionInterface::new(
-            source_snapshot.revision_identity().to_vec(),
-            "test-register-abi",
-            [r2ssa::SourceAbiParameterSpec::new(0, register(24, 1))],
-            r2ssa::SourceFunctionReturn::Register {
-                storage: register(0, 8),
-            },
-            Vec::<r2ssa::SourceStackSlotSpec>::new(),
-        )
-        .expect("wrong loop condition interface");
-        let wrong_storage = Arc::new(
-            EngineSourceSnapshot::new(
-                source_snapshot.revision_identity().to_vec(),
-                Some(wrong_interface),
-                Vec::new(),
-            )
-            .expect("wrong loop condition snapshot"),
-        );
-        let missing_interface = Arc::new(
-            EngineSourceSnapshot::new(
-                source_snapshot.revision_identity().to_vec(),
-                None,
-                Vec::new(),
-            )
-            .expect("snapshot without loop function interface"),
-        );
-        for source_snapshot in [missing_interface, wrong_storage] {
-            let refused = EngineSession::new().decompile_function_from_input(
-                EngineFunctionDecompileRequestInput::single_function(
-                    EngineFunctionInput {
-                        function_name: "sym.production_carrier_free_loop_return".to_string(),
-                        function_addr: 0x7400,
-                        blocks: blocks.clone(),
-                        arch: Some(arch.clone()),
-                        source_snapshot: Some(source_snapshot),
-                        semantic_metadata_enabled: true,
-                    },
-                    Some(64),
-                    r2types::ParsedExternalContext::default(),
-                ),
-            );
-            assert!(
-                (refused.output.contains("r2dec residual:")
-                    || refused.output.contains("r2dec fallback:"))
-                    && !refused.output.contains("certified_sub_7400"),
-                "missing or wrong loop condition authority must fail closed:\n{}",
-                refused.output
-            );
-            assert!(refused.diagnostics.semantic_kernel_render.is_none());
-        }
     }
 
     #[test]
@@ -9526,11 +8595,7 @@ mod tests {
         let legacy_output = r2dec::Decompiler::new(request.render_target.to_decompiler_config())
             .decompile_input(&decompiler_input);
         let counting = CountingRenderControl::default();
-        let controlled = session.decompile_with_r2dec_control_and_kernel_policy(
-            request.clone(),
-            &counting,
-            false,
-        );
+        let controlled = session.decompile_with_r2dec_control(request.clone(), &counting);
         assert_eq!(controlled.output, legacy_output);
         let total_polls = counting.polls.get();
         assert!(total_polls > 3, "r2dec pipeline must expose inner polls");
@@ -9538,11 +8603,7 @@ mod tests {
         let mut observed = HashMap::new();
         for stop_at in 1..=total_polls {
             let stop = StopRenderAtPoll::new(stop_at, r2ssa::SsaExecutionStopReason::Cancelled);
-            let response = session.decompile_with_r2dec_control_and_kernel_policy(
-                request.clone(),
-                &stop,
-                false,
-            );
+            let response = session.decompile_with_r2dec_control(request.clone(), &stop);
             let phase = [EnginePhase::Normalization, EnginePhase::Rendering]
                 .into_iter()
                 .find(|phase| {
@@ -9572,11 +8633,7 @@ mod tests {
                 r2ssa::SsaExecutionStopReason::Cancelled
             };
             let stop = StopRenderAtPoll::new(stop_at, reason);
-            let response = session.decompile_with_r2dec_control_and_kernel_policy(
-                request.clone(),
-                &stop,
-                false,
-            );
+            let response = session.decompile_with_r2dec_control(request.clone(), &stop);
             let expected_reason = match reason {
                 r2ssa::SsaExecutionStopReason::Cancelled => {
                     format!("engine request cancelled during {} phase", phase.as_str())
@@ -9729,27 +8786,6 @@ mod tests {
     }
 
     #[test]
-    fn private_frame_probe_continues_only_when_no_exact_join_exists() {
-        use r2dec::PrivateFrameConditionalJoinFunctionError as Error;
-
-        assert_eq!(
-            classify_private_frame_probe_error(&Error::MissingExactJoin),
-            EnginePrivateFrameProbeDisposition::NotApplicable
-        );
-        for error in [
-            Error::MachineProjection(r2ssa::MachineBuildError::UntrustedArtifactProvenance),
-            Error::MultipleExactJoins,
-            Error::NonEntryExactJoin,
-        ] {
-            assert_eq!(
-                classify_private_frame_probe_error(&error),
-                EnginePrivateFrameProbeDisposition::Refused,
-                "{error} must stop before any lower semantic or legacy route"
-            );
-        }
-    }
-
-    #[test]
     fn semantic_kernel_trace_bounds_entries_and_reason_characters() {
         let probes = [
             EngineSemanticKernelProbe::PrivateFrame,
@@ -9784,55 +8820,6 @@ mod tests {
             reason.chars().count(),
             ENGINE_SEMANTIC_KERNEL_REASON_CHAR_LIMIT
         );
-    }
-
-    #[test]
-    fn semantic_kernel_region_schema_table_tracks_exact_r2dec_contracts() {
-        for (region, contract, expected_wire) in [
-            (
-                EngineSemanticKernelRegion::TerminalReturnBlock,
-                r2dec::CERTIFIED_SEMANTIC_C_FUNCTION_SCHEMA_VERSION,
-                4,
-            ),
-            (
-                EngineSemanticKernelRegion::AggregateMemberTerminalReturnFunction,
-                r2dec::CERTIFIED_AGGREGATE_MEMBER_SEMANTIC_C_FUNCTION_SCHEMA_VERSION,
-                6,
-            ),
-            (
-                EngineSemanticKernelRegion::PlainRamMemoryTerminalReturnFunction,
-                r2dec::CERTIFIED_MEMORY_SEMANTIC_C_FUNCTION_SCHEMA_VERSION,
-                4,
-            ),
-            (
-                EngineSemanticKernelRegion::DirectCallTerminalReturnFunction,
-                r2dec::CERTIFIED_DIRECT_CALL_RETURN_FUNCTION_SCHEMA_VERSION,
-                3,
-            ),
-            (
-                EngineSemanticKernelRegion::PrivateFrameConditionalJoinFunction,
-                r2dec::CERTIFIED_PRIVATE_FRAME_CONDITIONAL_JOIN_FUNCTION_SCHEMA_VERSION,
-                1,
-            ),
-            (
-                EngineSemanticKernelRegion::ConditionalTerminalReturnFunction,
-                r2dec::CERTIFIED_CONDITIONAL_RETURN_FUNCTION_SCHEMA_VERSION,
-                3,
-            ),
-            (
-                EngineSemanticKernelRegion::SwitchTerminalReturnFunction,
-                r2dec::CERTIFIED_SWITCH_RETURN_FUNCTION_SCHEMA_VERSION,
-                3,
-            ),
-            (
-                EngineSemanticKernelRegion::CarrierFreeLoopTerminalReturnFunction,
-                r2dec::CERTIFIED_LOOP_RETURN_FUNCTION_SCHEMA_VERSION,
-                3,
-            ),
-        ] {
-            assert_eq!(contract, expected_wire);
-            assert_eq!(region.current_schema_version(), expected_wire);
-        }
     }
 
     fn analyze_with_injected_ssa_control<C: r2ssa::SsaWorkControl + ?Sized>(

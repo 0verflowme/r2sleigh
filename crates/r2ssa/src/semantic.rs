@@ -2461,8 +2461,7 @@ fn collect_source_boundary_facts(
                     return_address = exact_return_address_fact(graph, inst, storage);
                     complete &= return_address.is_some();
                 }
-                machine_state_complete =
-                    return_address.is_some() && exit_stack_pointer.is_some();
+                machine_state_complete = return_address.is_some() && exit_stack_pointer.is_some();
             }
             facts.returns.insert(
                 inst.id,

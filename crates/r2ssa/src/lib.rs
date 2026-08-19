@@ -35,10 +35,10 @@ pub mod machine;
 pub mod machine_context;
 mod naming;
 pub mod obligation;
-pub mod recover_interface;
 pub mod op;
 pub mod optimize;
 pub mod phi;
+pub mod recover_interface;
 pub mod rename;
 pub mod semantic;
 pub mod taint;
@@ -130,7 +130,6 @@ pub use r2source::{OwnedFunctionSnapshot, RADARE_FUNCTION_SNAPSHOT_SCHEMA_VERSIO
 pub use semantic::{
     BlockAssumption, CallArgumentCertificate, CallArgumentLocation, CallBoundarySlot,
     CallBoundaryValueFact, CallMemoryEffect, CallResultCertificate, CallResultValueRelation,
-    SourceCallArgumentFact, SourceCallArgumentValue,
     CallSiteFact, CallSiteFacts, CallSiteId, CallsiteCertificate, CompareKind, CompareProvenance,
     ControlDomain, ControlDomainFacts, ControlDomainId, ControlGuard, GlobalObjectKey,
     IfRegionCertificate, LoopCarrierEdgeValue, LoopCarrierFact, LoopCarrierUpdateFact,
@@ -141,12 +140,13 @@ pub use semantic::{
     PreparedFunctionCertificates, PreparedFunctionFacts, PreparedProofFailure, ProofNodeId,
     RelativeMemoryAddress, ReturnCarrier, ReturnValueCertificate,
     SOURCE_RETURN_REGISTER_COMPOSITION_SCHEMA_VERSION, SemanticId, SourceBoundaryFacts,
-    SourceCallBoundaryFact, SourceFormalParameterFact, SourceReturnAddressFact,
-    SourceReturnBoundaryFact, SourceReturnRegisterCompositionFact,
-    SourceReturnRegisterDefinitionFact, SourceReturnRegisterOverlayFact,
-    SourceReturnStackPointerFact, StackObjectKey, StackSlotCertificate, StructuredAccessId,
-    StructuredDataflowFacts, StructuredLoopFact, StructuredLoopKind, StructuredMemoryAccessFact,
-    StructuredRecursiveCallFact, SwitchCertificate, SwitchPredicateFact, ValueOwner,
+    SourceCallArgumentFact, SourceCallArgumentValue, SourceCallBoundaryFact,
+    SourceFormalParameterFact, SourceReturnAddressFact, SourceReturnBoundaryFact,
+    SourceReturnRegisterCompositionFact, SourceReturnRegisterDefinitionFact,
+    SourceReturnRegisterOverlayFact, SourceReturnStackPointerFact, StackObjectKey,
+    StackSlotCertificate, StructuredAccessId, StructuredDataflowFacts, StructuredLoopFact,
+    StructuredLoopKind, StructuredMemoryAccessFact, StructuredRecursiveCallFact, SwitchCertificate,
+    SwitchPredicateFact, ValueOwner,
 };
 pub use taint::{DefaultTaintPolicy, TaintAnalysis, TaintLabel, TaintPolicy, TaintResult};
 pub use var::{CanonicalStorageId, CanonicalStorageSpace, SSAVar, SSAVarNameKind};

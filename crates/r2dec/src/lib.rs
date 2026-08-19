@@ -30,18 +30,6 @@
 pub(crate) mod address;
 pub(crate) mod analysis;
 pub mod ast;
-pub mod certified_call;
-pub mod certified_control;
-pub mod certified_if_guard;
-pub mod certified_if_return;
-pub mod certified_loop;
-pub mod certified_loop_return;
-pub mod certified_private_frame_join;
-pub mod certified_region;
-pub mod certified_return;
-pub mod certified_structure;
-pub mod certified_switch;
-pub mod certified_switch_return;
 pub(crate) mod codegen;
 #[cfg(test)]
 pub(crate) mod consumer_linear;
@@ -56,139 +44,16 @@ pub(crate) mod planner;
 pub(crate) mod post_rename;
 pub mod region;
 pub(crate) mod registers;
-pub mod semantic_aggregate_function;
-pub mod semantic_c;
-pub mod semantic_call_return;
-pub mod semantic_differential;
-pub mod semantic_function;
-pub mod semantic_memory_function;
-pub mod semantic_stmt;
 pub(crate) mod single_evaluation;
 pub mod structure;
 pub mod variable;
 
 pub use ast::{BinaryOp, CExpr, CFunction, CStmt, CType, UnaryOp};
-pub use certified_call::{
-    CERTIFIED_DIRECT_CALL_REGION_SCHEMA_VERSION, CertifiedDirectCallBlockRegion,
-    DirectCallRegionAuditReport, DirectCallRegionError, DirectCallRegionScope,
-};
-pub use certified_control::{
-    CERTIFIED_CONDITIONAL_TRANSFER_REGION_SCHEMA_VERSION,
-    CERTIFIED_DIRECT_TRANSFER_REGION_SCHEMA_VERSION,
-    CERTIFIED_FALLTHROUGH_TRANSFER_REGION_SCHEMA_VERSION, CertifiedConditionalTransferBlockRegion,
-    CertifiedDirectTransferBlockRegion, CertifiedFallthroughTransferBlockRegion,
-    ConditionalTransferRegionAuditReport, ConditionalTransferRegionError,
-    ConditionalTransferRegionScope, DirectTransferRegionAuditReport, DirectTransferRegionError,
-    DirectTransferRegionScope, FallthroughTransferRegionAuditReport,
-    FallthroughTransferRegionError, FallthroughTransferRegionScope,
-};
-pub use certified_if_guard::{
-    CERTIFIED_GUARDED_RETURN_FUNCTION_SCHEMA_VERSION, CertifiedGuardedReturnFunction,
-    GuardPolarity, GuardedReturnFunctionAuditReport, GuardedReturnFunctionError,
-    GuardedReturnFunctionScope,
-};
-pub use certified_if_return::{
-    CERTIFIED_CONDITIONAL_RETURN_FUNCTION_SCHEMA_VERSION, CertifiedConditionalReturnArm,
-    CertifiedConditionalReturnFunction, ConditionalReturnFunctionAuditReport,
-    ConditionalReturnFunctionError, ConditionalReturnFunctionScope,
-};
-pub use certified_loop::{
-    CERTIFIED_HEADER_TESTED_LOOP_SCHEMA_VERSION, CertifiedHeaderTestedLoopFragment,
-    HeaderTestedLoopAuditReport, HeaderTestedLoopError, HeaderTestedLoopScope, LoopContinuationArm,
-};
-pub use certified_loop_return::{
-    CERTIFIED_LOOP_RETURN_FUNCTION_SCHEMA_VERSION, CertifiedLoopReturnExit,
-    CertifiedLoopReturnFunction, LoopExecutionOutcome, LoopReturnDifferentialCase,
-    LoopReturnDifferentialReport, LoopReturnFunctionAuditReport, LoopReturnFunctionError,
-    LoopReturnFunctionScope, LoopReturnValue, check_loop_return_differential,
-};
-pub use certified_private_frame_join::{
-    CERTIFIED_PRIVATE_FRAME_CONDITIONAL_JOIN_FUNCTION_SCHEMA_VERSION,
-    CERTIFIED_PRIVATE_FRAME_JOIN_REWRITE_SCHEMA_VERSION,
-    CertifiedPrivateFrameConditionalJoinFunction,
-    CertifiedPrivateFrameConditionalJoinFunctionScope, CertifiedPrivateFrameConditionalJoinRewrite,
-    CertifiedPrivateFrameConditionalJoinRewriteScope, CertifiedPrivateFrameDirectSubstitution,
-    CertifiedPrivateFrameJoinValue, CertifiedPrivateFrameJoinValueOrigin,
-    CertifiedPrivateFrameJoinedSelect, PrivateFrameConditionalJoinFunctionAuditReport,
-    PrivateFrameConditionalJoinFunctionError, PrivateFrameConditionalJoinRewriteError,
-};
-pub use certified_region::{
-    CERTIFIED_REGION_SCHEMA_VERSION, CertifiedRegionInstruction, CertifiedSingleBlockAccounting,
-    PrivateFrameConditionalJoinOwnerRole, RegionAuditReport, RegionBuildError,
-    RegionObligationDisposition, RegionObligationMapping, RegionResidualReason, RegionTypedOwner,
-    SingleBlockAccountingScope,
-};
-pub use certified_return::{
-    CERTIFIED_TERMINAL_RETURN_REGION_SCHEMA_VERSION, CertifiedTerminalReturnBlockRegion,
-    TerminalReturnRegionAuditReport, TerminalReturnRegionError, TerminalReturnRegionScope,
-};
-pub use certified_structure::{
-    CERTIFIED_IF_ELSE_DIAMOND_SCHEMA_VERSION, CertifiedDiamondArm, CertifiedIfElseDiamondFragment,
-    IfElseDiamondAuditReport, IfElseDiamondError, IfElseDiamondScope,
-};
-pub use certified_switch::{
-    CERTIFIED_SWITCH_TOPOLOGY_FRAGMENT_SCHEMA_VERSION, CertifiedSwitchTopologyFragment,
-    SwitchTopologyAuditReport, SwitchTopologyFragmentError, SwitchTopologyFragmentScope,
-};
-pub use certified_switch_return::{
-    CERTIFIED_SWITCH_RETURN_FUNCTION_SCHEMA_VERSION, CertifiedSwitchReturnArm,
-    CertifiedSwitchReturnCase, CertifiedSwitchReturnFunction, SwitchReturnDifferentialCase,
-    SwitchReturnDifferentialReport, SwitchReturnFunctionAuditReport, SwitchReturnFunctionError,
-    SwitchReturnFunctionScope, SwitchReturnOutcome, check_switch_return_differential,
-};
 pub use codegen::CodeGenConfig;
 pub use control::{DecompileExecutionStop, DecompileWorkControl, DecompileWorkPhase};
 pub use fold::lower_ssa_ops_to_stmts;
 pub use highlight::highlight_c_ansi;
 pub use region::{Region, RegionAnalyzer};
-pub use semantic_aggregate_function::{
-    CERTIFIED_AGGREGATE_MEMBER_SEMANTIC_C_FUNCTION_SCHEMA_VERSION,
-    CertifiedAggregateMemberRenderAccess, CertifiedAggregateMemberRenderDirection,
-    CertifiedAggregateMemberSemanticCFunction,
-    CertifiedAggregateMemberSemanticCFunctionAuditReport,
-    CertifiedAggregateMemberSemanticCFunctionError, CertifiedAggregateMemberSemanticCFunctionScope,
-    CertifiedAggregateScalarSignedness, CertifiedAggregateSemanticCParameter,
-    CertifiedAggregateSemanticCParameterKind, CertifiedAggregateSemanticCReturn,
-    CertifiedAggregateStructLayoutManifest, CertifiedAggregateStructMemberManifest,
-};
-pub use semantic_c::{
-    SemanticCCallArgument, SemanticCCallArgumentValue, SemanticCDirectCall, SemanticCError,
-    SemanticCExpressionLayer, SemanticCFunctionInterface, SemanticCFunctionReturn,
-    SemanticCIdentityScope, SemanticCInputOrigin, SemanticCParameter, SemanticCParameterProjection,
-    SemanticCReturn, SemanticCReturnValue, SemanticCScope, SemanticCStackSlot,
-};
-pub use semantic_call_return::{
-    CERTIFIED_DIRECT_CALL_RETURN_FUNCTION_SCHEMA_VERSION, CertifiedDirectCallReturnBlock,
-    CertifiedDirectCallReturnFunction, DirectCallArgumentManifest,
-    DirectCallReturnFunctionAuditReport, DirectCallReturnFunctionError,
-    DirectCallReturnFunctionScope,
-};
-pub use semantic_differential::{
-    DifferentialArtifactIdentity, DifferentialBitVector, DifferentialBoundaryOutcome,
-    DifferentialCallArgument, DifferentialCandidateAdmission, DifferentialCandidateIdentity,
-    DifferentialCandidateKind, DifferentialCaseDisposition, DifferentialConclusion,
-    DifferentialLimits, DifferentialMemoryEvent, DifferentialMemoryEventKind,
-    DifferentialMemoryLocation, DifferentialMismatch, DifferentialMismatchKind,
-    DifferentialObservedByte, DifferentialObservedRun, DifferentialObservedTrace,
-    DifferentialObservedValue, DifferentialReport, DifferentialSide, DifferentialState,
-    SEMANTIC_DIFFERENTIAL_EVALUATOR_CONTRACT_VERSION, SEMANTIC_DIFFERENTIAL_SCHEMA_VERSION,
-    check_block_differential, check_conditional_return_differential,
-    check_direct_call_differential, check_memory_terminal_return_differential,
-    check_private_frame_conditional_join_differential, check_terminal_return_differential,
-};
-pub use semantic_function::{
-    CERTIFIED_SEMANTIC_C_FUNCTION_SCHEMA_VERSION, CertifiedSemanticCFunction,
-    CertifiedSemanticCFunctionError, CertifiedSemanticCFunctionScope,
-};
-pub use semantic_memory_function::{
-    CERTIFIED_MEMORY_SEMANTIC_C_FUNCTION_SCHEMA_VERSION, CertifiedMemorySemanticCFunction,
-    CertifiedMemorySemanticCFunctionAuditReport, CertifiedMemorySemanticCFunctionError,
-    CertifiedMemorySemanticCFunctionScope,
-};
-pub use semantic_stmt::{
-    SemanticCBlockStepLayer, SemanticCEntityRef, SemanticCMemoryStatementRef, SemanticCSourceStep,
-    SemanticCStatementError, SemanticCStatementScope, SemanticCStepAuditReport,
-};
 pub(crate) use structure::ControlFlowStructurer;
 pub use variable::VariableRecovery;
 
@@ -1532,18 +1397,16 @@ fn count_residual_markers(stmts: &[CStmt]) -> usize {
 /// structurer marks the individual constructs it could not prove, and this
 /// records whether the kernel certified the function at all.
 ///
-/// The note is emitted for an uncertified route even when no individual
-/// construct was marked, because "nothing was marked" and "everything was
-/// proven" are different claims and only the second one earns silence.
-fn note_unproven_constructs(func: &mut CFunction, kernel_certified: bool) {
-    // An empty body claims the function has no observable effects, which is a
-    // different statement from "rendering produced nothing". Only the second is
-    // true here, so the note says that rather than leaving the braces bare.
+/// State what the rendering did and did not show.
+///
+/// "Nothing was marked" and "everything was shown to be right" are different
+/// claims, and only the second earns silence. Nothing here makes the second,
+/// so the note is always emitted: it reports how many constructs carry a
+/// residual marker, and says so plainly when the rendering produced no
+/// statements at all, which is not the same as a function with no effects.
+fn note_unproven_constructs(func: &mut CFunction) {
     let rendered_nothing = func.body.is_empty();
     let residuals = count_residual_markers(&func.body);
-    if kernel_certified && residuals == 0 && !rendered_nothing {
-        return;
-    }
     let detail = if rendered_nothing {
         "rendering produced no statements".to_string()
     } else {
@@ -1553,13 +1416,10 @@ fn note_unproven_constructs(func: &mut CFunction, kernel_certified: bool) {
             n => format!("{n} constructs are marked below"),
         }
     };
-    let note = if kernel_certified {
-        format!("r2dec proof: certified route, {detail}")
-    } else {
-        format!("r2dec proof: rendered without kernel certification, {detail}")
-    };
-    func.body
-        .insert(0, CStmt::comment(sanitize_comment_text(&note)));
+    func.body.insert(
+        0,
+        CStmt::comment(sanitize_comment_text(&format!("r2dec proof: {detail}"))),
+    );
 }
 
 fn residual_function_for_render_boundary(func_name: &str, reason: &str) -> CFunction {
@@ -2166,8 +2026,6 @@ struct DecompilerContext {
     pub symbols: std::collections::HashMap<u64, String>,
     /// Canonical combined type and semantic facts.
     function_facts: FunctionFacts,
-    /// Whether the certification kernel closed an exact obligation here.
-    kernel_certified: bool,
 }
 
 impl DecompilerContext {
@@ -2190,7 +2048,6 @@ impl DecompilerContext {
             #[cfg(test)]
             symbols: std::collections::HashMap::new(),
             function_facts: function_facts.report().clone(),
-            kernel_certified: false,
         }
     }
 
@@ -2212,28 +2069,11 @@ impl DecompilerContext {
 #[derive(Debug, Clone)]
 pub struct DecompilerInput {
     source_owned_facts: r2types::function_facts::SourceOwnedFunctionFacts,
-    kernel_certified: bool,
 }
 
 impl DecompilerInput {
     pub fn new(source_owned_facts: r2types::function_facts::SourceOwnedFunctionFacts) -> Self {
-        Self {
-            source_owned_facts,
-            kernel_certified: false,
-        }
-    }
-
-    /// Record that the certification kernel closed an exact obligation for this
-    /// function. The claim belongs to the kernel; this only carries it to the
-    /// rendering so the proof line can state what was established rather than
-    /// inferring it from which route ran.
-    pub fn with_kernel_certification(mut self, certified: bool) -> Self {
-        self.kernel_certified = certified;
-        self
-    }
-
-    pub const fn kernel_certified(&self) -> bool {
-        self.kernel_certified
+        Self { source_owned_facts }
     }
 
     pub fn source_owned_facts(&self) -> &r2types::function_facts::SourceOwnedFunctionFacts {
@@ -2249,9 +2089,7 @@ impl DecompilerInput {
     }
 
     fn context_projection(&self) -> DecompilerContext {
-        let mut context = DecompilerContext::from_source_owned(&self.source_owned_facts);
-        context.kernel_certified = self.kernel_certified;
-        context
+        DecompilerContext::from_source_owned(&self.source_owned_facts)
     }
 }
 
@@ -3170,7 +3008,7 @@ impl Decompiler {
         prune_unreferenced_local_declarations(&mut c_function);
         normalize_redundant_return_carrier_casts(&mut c_function);
         normalize_declared_assignment_literals(&mut c_function);
-        note_unproven_constructs(&mut c_function, self.context.kernel_certified);
+        note_unproven_constructs(&mut c_function);
         work.with_phase(DecompileWorkPhase::Rendering).poll()?;
         Ok(c_function)
     }
@@ -6013,17 +5851,6 @@ mod tests {
 
     /// Nothing in this function is unproven, so it carries no proof note. A
     /// note on clean output would be noise readers learn to ignore.
-    #[test]
-    fn a_fully_proven_function_carries_no_proof_note() {
-        let mut func = CFunction::new("proven".to_string(), CType::Unknown);
-        func.body = vec![CStmt::Return(Some(CExpr::IntLit(0)))];
-        note_unproven_constructs(&mut func, true);
-        assert!(
-            !format!("{:?}", func.body).contains("r2dec proof:"),
-            "{:?}",
-            func.body
-        );
-    }
 
     /// The marks the structurer leaves are counted wherever they sit, including
     /// inside a loop or a switch arm, and the function says how many it carries.
@@ -6042,12 +5869,12 @@ mod tests {
         ];
         assert_eq!(count_residual_markers(&func.body), 2);
 
-        note_unproven_constructs(&mut func, true);
+        note_unproven_constructs(&mut func);
         let note = match func.body.first() {
             Some(CStmt::Comment(text)) => text.clone(),
             other => panic!("expected a leading proof note, got {other:?}"),
         };
-        assert!(note.contains("r2dec proof: certified route"), "{note}");
+        assert!(note.contains("r2dec proof:"), "{note}");
         assert!(note.contains("2 constructs are marked below"), "{note}");
         assert!(
             func.body
@@ -6063,18 +5890,15 @@ mod tests {
     /// proven". Without this the near-miss aggregate fixture rendered a bare
     /// `return` with no indication the kernel never claimed it.
     #[test]
-    fn an_uncertified_route_says_so_even_with_nothing_marked() {
+    fn a_rendering_says_so_even_with_nothing_marked() {
         let mut func = CFunction::new("unclaimed".to_string(), CType::Unknown);
         func.body = vec![CStmt::Return(Some(CExpr::IntLit(0)))];
-        note_unproven_constructs(&mut func, false);
+        note_unproven_constructs(&mut func);
         let note = match func.body.first() {
             Some(CStmt::Comment(text)) => text.clone(),
             other => panic!("expected a leading proof note, got {other:?}"),
         };
-        assert!(
-            note.contains("rendered without kernel certification"),
-            "{note}"
-        );
+        assert!(note.contains("r2dec proof:"), "{note}");
         assert!(note.contains("no individual construct is marked"), "{note}");
     }
 
@@ -6085,12 +5909,10 @@ mod tests {
     fn a_body_that_rendered_nothing_says_so_rather_than_reading_as_empty() {
         let mut func = CFunction::new("nothing_rendered".to_string(), CType::Unknown);
         func.body = Vec::new();
-        note_unproven_constructs(&mut func, false);
+        note_unproven_constructs(&mut func);
         let text = format!("{:?}", func.body);
         assert!(
-            text.contains(
-                "r2dec proof: rendered without kernel certification, rendering produced no statements"
-            ),
+            text.contains("r2dec proof: rendering produced no statements"),
             "{text}"
         );
         assert_eq!(func.body.len(), 1, "one statement says it, not two: {text}");

@@ -20,9 +20,8 @@ pub use r2source::{
     SourceCallSiteInterfaceError, SourceCarrierKind, SourceCarrierProjection,
     SourceFunctionInterface, SourceFunctionInterfaceError, SourceFunctionReturn,
     SourceLogicalValue, SourceMachineRoles, SourceStackAllocationContract, SourceStackGrowth,
-    SourceStackSlotRole,
-    SourceStackSlotSpec, SourceType, SourceTypeGraph, SourceTypeGraphError, SourceTypeKind,
-    StackAddressBase,
+    SourceStackSlotRole, SourceStackSlotSpec, SourceType, SourceTypeGraph, SourceTypeGraphError,
+    SourceTypeKind, StackAddressBase,
 };
 
 pub const MACHINE_CONTEXT_SCHEMA_VERSION: u32 = 16;
@@ -783,7 +782,13 @@ fn write_call_site_interface(
 
 impl SourceMachineContext {
     pub(crate) fn from_blocks(blocks: &[R2ILBlock], arch: Option<&ArchSpec>) -> Self {
-        Self::from_blocks_with_interfaces(blocks, arch, None, SourceMachineRoles::default(), Vec::new())
+        Self::from_blocks_with_interfaces(
+            blocks,
+            arch,
+            None,
+            SourceMachineRoles::default(),
+            Vec::new(),
+        )
     }
 
     pub(crate) fn from_blocks_with_interfaces(

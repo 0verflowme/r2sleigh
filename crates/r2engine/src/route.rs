@@ -112,63 +112,6 @@ pub enum EnginePlan {
     RefuseWithEvidence,
 }
 
-/// The exact typed-output-sealed semantic-kernel region selected for
-/// production rendering. This is intentionally separate from the legacy
-/// `r2sym` render permission carried by route facts.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum EngineSemanticKernelRegion {
-    TerminalReturnBlock,
-    AggregateMemberTerminalReturnFunction,
-    PlainRamMemoryTerminalReturnFunction,
-    DirectCallTerminalReturnFunction,
-    PrivateFrameConditionalJoinFunction,
-    ConditionalTerminalReturnFunction,
-    GuardedTerminalReturnFunction,
-    SwitchTerminalReturnFunction,
-    CarrierFreeLoopTerminalReturnFunction,
-}
-
-impl EngineSemanticKernelRegion {
-    /// Current proof/render contract for this exact semantic-kernel region.
-    /// Transport layers use this table instead of assuming every region is v1.
-    pub const fn current_schema_version(self) -> u32 {
-        match self {
-            Self::TerminalReturnBlock => r2dec::CERTIFIED_SEMANTIC_C_FUNCTION_SCHEMA_VERSION,
-            Self::AggregateMemberTerminalReturnFunction => {
-                r2dec::CERTIFIED_AGGREGATE_MEMBER_SEMANTIC_C_FUNCTION_SCHEMA_VERSION
-            }
-            Self::PlainRamMemoryTerminalReturnFunction => {
-                r2dec::CERTIFIED_MEMORY_SEMANTIC_C_FUNCTION_SCHEMA_VERSION
-            }
-            Self::DirectCallTerminalReturnFunction => {
-                r2dec::CERTIFIED_DIRECT_CALL_RETURN_FUNCTION_SCHEMA_VERSION
-            }
-            Self::PrivateFrameConditionalJoinFunction => {
-                r2dec::CERTIFIED_PRIVATE_FRAME_CONDITIONAL_JOIN_FUNCTION_SCHEMA_VERSION
-            }
-            Self::ConditionalTerminalReturnFunction => {
-                r2dec::CERTIFIED_CONDITIONAL_RETURN_FUNCTION_SCHEMA_VERSION
-            }
-            Self::GuardedTerminalReturnFunction => {
-                r2dec::CERTIFIED_GUARDED_RETURN_FUNCTION_SCHEMA_VERSION
-            }
-            Self::SwitchTerminalReturnFunction => {
-                r2dec::CERTIFIED_SWITCH_RETURN_FUNCTION_SCHEMA_VERSION
-            }
-            Self::CarrierFreeLoopTerminalReturnFunction => {
-                r2dec::CERTIFIED_LOOP_RETURN_FUNCTION_SCHEMA_VERSION
-            }
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct EngineSemanticKernelRender {
-    pub region: EngineSemanticKernelRegion,
-    pub region_schema_version: u32,
-    pub exact_obligation_closure: bool,
-}
-
 fn provisional_decompile_route(
     kind: r2types::DecompileRouteKind,
     reason: Option<String>,
@@ -187,7 +130,6 @@ fn provisional_decompile_route(
 pub struct EngineDiagnostics {
     pub plan: Option<EnginePlan>,
     pub route_reason: Option<String>,
-    pub semantic_kernel_render: Option<EngineSemanticKernelRender>,
     pub warnings: Vec<String>,
     pub refusal: Option<String>,
 }
@@ -289,7 +231,6 @@ impl EngineTypedRouteDecision {
         EngineDiagnostics {
             plan: Some(self.plan()),
             route_reason: self.reason(),
-            semantic_kernel_render: None,
             refusal: self.refusal(),
             warnings: Vec::new(),
         }
