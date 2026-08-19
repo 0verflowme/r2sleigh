@@ -1620,6 +1620,17 @@ pub fn read_interface(
 /// This is the producer side of the transport: radare2 writes exactly this and
 /// nothing else crosses the boundary.
 pub fn encode_snapshot(snapshot: &OwnedFunctionSnapshot) -> Result<Vec<u8>, SnapshotWireError> {
+    encode_snapshot_set(snapshot, &[])
+}
+
+/// Encode one snapshot together with the snapshots of what it calls.
+///
+/// Each callee is a whole buffer of its own, so it decodes by the same reader
+/// and nothing about it depends on where it sits in this one.
+pub fn encode_snapshot_set(
+    snapshot: &OwnedFunctionSnapshot,
+    callees: &[OwnedFunctionSnapshot],
+) -> Result<Vec<u8>, SnapshotWireError> {
     let mut writer = SnapshotWireWriter::new();
     write_machine_profile(&mut writer, snapshot.machine())?;
     write_function_identity(&mut writer, snapshot.function());
@@ -1643,6 +1654,12 @@ pub fn encode_snapshot(snapshot: &OwnedFunctionSnapshot) -> Result<Vec<u8>, Snap
     write_convention_slots(&mut writer, snapshot.convention_slots())?;
     write_captured_fields(&mut writer, snapshot.captured_fields());
     write_diagnostic_identity(&mut writer, snapshot.diagnostic_identity());
+    let count = u32::try_from(callees.len()).map_err(|_| SnapshotWireError::ValueTooWide)?;
+    writer.u32(count);
+    for callee in callees {
+        let nested = encode_snapshot(callee)?;
+        writer.bytes(&nested)?;
+    }
     writer.finish()
 }
 
@@ -1676,7 +1693,24 @@ impl From<SnapshotWireError> for SnapshotDecodeError {
 /// The parts go through `from_captured_parts`, the same private mint the
 /// accessor walk uses, so a buffer cannot assemble source authority the
 /// in-crate constructor would refuse.
+/// Decode one snapshot and the snapshots of the functions it calls.
+///
+/// The callees ride inside the same buffer, each as a whole snapshot with its
+/// own string table, so they decode by this same reader and carry no callees of
+/// their own.
+pub fn decode_snapshot_set(
+    buffer: &[u8],
+) -> Result<(OwnedFunctionSnapshot, Vec<OwnedFunctionSnapshot>), SnapshotDecodeError> {
+    decode_snapshot_inner(buffer)
+}
+
 pub fn decode_snapshot(buffer: &[u8]) -> Result<OwnedFunctionSnapshot, SnapshotDecodeError> {
+    decode_snapshot_inner(buffer).map(|(snapshot, _)| snapshot)
+}
+
+fn decode_snapshot_inner(
+    buffer: &[u8],
+) -> Result<(OwnedFunctionSnapshot, Vec<OwnedFunctionSnapshot>), SnapshotDecodeError> {
     let mut reader = SnapshotWireReader::new(buffer)?;
     let machine = read_machine_profile(&mut reader)?;
     let function = read_function_identity(&mut reader)?;
@@ -1697,8 +1731,24 @@ pub fn decode_snapshot(buffer: &[u8]) -> Result<OwnedFunctionSnapshot, SnapshotD
     let convention_slots = read_convention_slots(&mut reader)?;
     let captured_fields = read_captured_fields(&mut reader)?;
     let diagnostics = read_diagnostic_identity(&mut reader)?;
+    let callee_count = reader.u32()? as usize;
+    let mut callees = Vec::with_capacity(callee_count.min(64));
+    for _ in 0..callee_count {
+        let nested = reader.bytes()?;
+        let (callee, nested_callees) = decode_snapshot_inner(nested)?;
+        // One level. A callee that carried callees of its own would make the
+        // set's shape depend on the program rather than on what was asked for.
+        if !nested_callees.is_empty() {
+            return Err(SnapshotDecodeError::Wire(
+                SnapshotWireError::RejectedContract {
+                    contract: "callee snapshot set depth",
+                },
+            ));
+        }
+        callees.push(callee);
+    }
     reader.finish()?;
-    OwnedFunctionSnapshot::from_captured_parts(
+    let snapshot = OwnedFunctionSnapshot::from_captured_parts(
         machine,
         function,
         presentation,
@@ -1711,12 +1761,29 @@ pub fn decode_snapshot(buffer: &[u8]) -> Result<OwnedFunctionSnapshot, SnapshotD
         captured_fields,
         diagnostics,
     )
-    .map_err(SnapshotDecodeError::Validation)
+    .map_err(SnapshotDecodeError::Validation)?;
+    Ok((snapshot, callees))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_callee_snapshot_rides_inside_its_caller_and_decodes_alone() {
+        let root = sample_snapshot(None);
+        let callee = sample_snapshot(None);
+        let buffer = encode_snapshot_set(&root, std::slice::from_ref(&callee)).expect("encode set");
+        let (decoded_root, decoded_callees) = decode_snapshot_set(&buffer).expect("decode set");
+        assert_eq!(decoded_root.function().address(), root.function().address());
+        assert_eq!(decoded_callees.len(), 1);
+        assert_eq!(
+            decoded_callees[0].function().address(),
+            callee.function().address()
+        );
+        // The plain decoder still reads the same buffer and simply drops them.
+        assert!(decode_snapshot(&buffer).is_ok());
+    }
 
     #[test]
     fn a_slot_name_round_trips_keyed_by_where_the_slot_sits() {
