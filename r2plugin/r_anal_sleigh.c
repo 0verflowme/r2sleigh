@@ -695,6 +695,7 @@ static size_t sleigh_profile_cap = 0;
 #define SLEIGH_CALLER_PROP_SAMPLE_MAX 5
 #define SLEIGH_TAINT_LABEL_MAX 6
 #define SLEIGH_COMMENT_PREFIX_SEMANTIC "sla:"
+#define SLEIGH_COMMENT_PREFIX_PROOF "sla.proof:"
 #define SLEIGH_COMMENT_PREFIX_TAINT "sla.taint:"
 #define SLEIGH_COMMENT_PREFIX_TAINT_RISK "sla.taint.risk:"
 
@@ -4655,6 +4656,132 @@ static void sleigh_taint_plan_stats_fini(SleighTaintPlanStats *stats) {
 	memset (stats, 0, sizeof (*stats));
 }
 
+/* Every fact the engine proved about one function, as JSON.
+ *
+ * The snapshot has to be serialized inside the borrow: the pointer tables the
+ * proof needs are read from memory during the capture, and the snapshot stops
+ * being valid the moment the callback returns. */
+typedef struct {
+	uint8_t *buffer;
+	size_t len;
+} SleighSnapshotWire;
+
+static bool sleigh_snapshot_wire_cb(const RAnalFunctionSnapshot *snapshot, void *user) {
+	SleighSnapshotWire *out = user;
+	R2SleighWireWriter *writer = r2sleigh_wire_writer_new ();
+	if (!writer) {
+		return false;
+	}
+	if (r2sleigh_wire_write_snapshot (writer, snapshot)) {
+		out->buffer = r2sleigh_wire_writer_finish (writer, &out->len);
+	}
+	r2sleigh_wire_writer_free (writer);
+	return out->buffer != NULL;
+}
+
+static char *sleigh_proven_facts_json(RCore *core, ut64 function_addr) {
+	SleighSnapshotWire wire = {0};
+	if (!r_core_function_snapshot_at (core, function_addr,
+			sleigh_snapshot_wire_cb, &wire, NULL) || !wire.buffer) {
+		free (wire.buffer);
+		return NULL;
+	}
+	const R2SleighEngineRequestPayloadV2 payload = {
+		.abi_version = R2SLEIGH_ABI_V2,
+		.struct_size = sizeof (payload),
+		.timeout_us = 0,
+		.snapshot_buffer = wire.buffer,
+		.snapshot_buffer_len = wire.len,
+	};
+	char *json = sleigh_engine_execute_v2 (R2SLEIGH_REQUEST_PROVEN_FACTS_V2,
+		R2SLEIGH_CAP_OPAQUE_RADARE_SNAPSHOT_V2, &payload);
+	free (wire.buffer);
+	return json;
+}
+
+/* Turn the proofs into the xrefs and comments radare2 stores.
+ *
+ * A resolved dispatch becomes one call xref per entry the index can select,
+ * which is what makes the callees reachable to every later pass. The comment
+ * next to it names the table and the count so a reader can check the claim
+ * instead of taking it. */
+static bool collect_proof_artifacts_for_function(SleighArtifactPlan *plan,
+		RCore *core, RAnalFunction *fcn, size_t *out_xrefs, size_t *out_dead) {
+	char *json = sleigh_proven_facts_json (core, fcn->addr);
+	if (!json) {
+		return false;
+	}
+	R_LOG_DEBUG ("r2sleigh: proofs at 0x%08"PFMT64x": %s", fcn->addr, json);
+	RJson *facts = r_json_parse (json);
+	if (!facts) {
+		free (json);
+		return false;
+	}
+	bool ok = true;
+	const RJson *calls = r_json_get (facts, "indirect_calls");
+	if (calls && calls->type == R_JSON_ARRAY) {
+		const RJson *call;
+		for (call = calls->children.first; call && ok; call = call->next) {
+			const RJson *block = r_json_get (call, "block");
+			const RJson *table = r_json_get (call, "table");
+			const RJson *targets = r_json_get (call, "targets");
+			if (!block || !table || !targets || targets->type != R_JSON_ARRAY) {
+				continue;
+			}
+			size_t count = 0;
+			const RJson *target;
+			for (target = targets->children.first; target; target = target->next) {
+				if (!sleigh_artifact_plan_add_xref (plan, block->num.u_value,
+						target->num.u_value, R_ANAL_REF_TYPE_CALL)) {
+					ok = false;
+					break;
+				}
+				count++;
+			}
+			if (!ok || !count) {
+				continue;
+			}
+			char *note = r_str_newf (
+				SLEIGH_COMMENT_PREFIX_PROOF
+				" dispatch through table 0x%08"PFMT64x
+				" reaches exactly %zu of its entries",
+				table->num.u_value, count);
+			if (!note || !sleigh_artifact_plan_add_comment (plan,
+					block->num.u_value, SLEIGH_COMMENT_PREFIX_PROOF, note)) {
+				ok = false;
+			}
+			free (note);
+			if (out_xrefs) {
+				*out_xrefs += count;
+			}
+		}
+	}
+	const RJson *dead = r_json_get (facts, "unreachable_blocks");
+	if (ok && dead && dead->type == R_JSON_ARRAY) {
+		const RJson *entry;
+		for (entry = dead->children.first; entry && ok; entry = entry->next) {
+			const RJson *addr = r_json_get (entry, "addr");
+			const RJson *reason = r_json_get (entry, "reason");
+			if (!addr || !reason || reason->type != R_JSON_STRING) {
+				continue;
+			}
+			char *note = r_str_newf (SLEIGH_COMMENT_PREFIX_PROOF
+				" unreachable, %s", reason->str_value);
+			if (!note || !sleigh_artifact_plan_add_comment (plan,
+					addr->num.u_value, SLEIGH_COMMENT_PREFIX_PROOF, note)) {
+				ok = false;
+			}
+			free (note);
+			if (out_dead) {
+				*out_dead += 1;
+			}
+		}
+	}
+	r_json_free (facts);
+	free (json);
+	return ok;
+}
+
 static bool collect_taint_artifacts_for_function(SleighArtifactPlan *plan,
 		RAnal *anal, const R2ILContext *ctx, const BlockArray *blocks,
 		SleighTaintPlanStats *stats) {
@@ -4928,6 +5055,9 @@ static bool sleigh_post_analysis(RAnal *anal) {
 	size_t taint_comments = 0;
 	size_t taint_flags = 0;
 	size_t taint_xrefs = 0;
+	size_t proof_xrefs = 0;
+	size_t proof_dead_blocks = 0;
+	int proof_fcns = 0;
 	int taint_parse_failures = 0;
 	int taint_fcns_eligible = 0;
 	int taint_fcns_skipped = 0;
@@ -4984,6 +5114,19 @@ static bool sleigh_post_analysis(RAnal *anal) {
 		}
 		if (!fcn) {
 			continue;
+		}
+		/* Proofs run for every function, not just the ones taint looks at.
+		 * They are what the analysis pass is here to contribute, and the work
+		 * is the engine's rather than ours. */
+		SleighArtifactPlan proof_plan;
+		if (sleigh_artifact_plan_init (&proof_plan, anal, fcn, "proof")) {
+			if (collect_proof_artifacts_for_function (&proof_plan, core, fcn,
+					&proof_xrefs, &proof_dead_blocks)) {
+				if (sleigh_artifact_plan_submit (&proof_plan)) {
+					proof_fcns++;
+				}
+			}
+			sleigh_artifact_plan_fini (&proof_plan);
 		}
 		int bb_count = fcn->bbs? r_list_length (fcn->bbs): 0;
 		bool auto_callback_allowed = !taint_enabled || auto_callback_allows_function (
@@ -5076,6 +5219,8 @@ static bool sleigh_post_analysis(RAnal *anal) {
 	R_LOG_INFO ("r2sleigh: post-analysis taint enabled=%d eligible=%d skipped=%d comments=%zu flags=%zu xrefs=%zu sink_hits=%zu parse_failures=%d",
 		taint_enabled? 1: 0, taint_fcns_eligible, taint_fcns_skipped, taint_comments, taint_flags, taint_xrefs,
 		taint_sink_hits, taint_parse_failures);
+	R_LOG_INFO ("r2sleigh: post-analysis proofs fcns=%d call_targets=%zu unreachable_blocks=%zu",
+		proof_fcns, proof_xrefs, proof_dead_blocks);
 	R_LOG_INFO ("r2sleigh: post-analysis risk summary: critical=%d high=%d medium=%d low=%d",
 		taint_risk_critical, taint_risk_high, taint_risk_medium, taint_risk_low);
 	R_LOG_INFO ("r2sleigh: post-analysis summary fcns=%d budget_exhausted=%d",

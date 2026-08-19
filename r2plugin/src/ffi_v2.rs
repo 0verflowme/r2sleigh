@@ -51,6 +51,7 @@ pub const R2SLEIGH_STATUS_PANIC_V2: u32 = 6;
 
 pub const R2SLEIGH_REQUEST_DECOMPILE_V2: u32 = 1;
 pub const R2SLEIGH_REQUEST_TYPE_FUNCTION_V2: u32 = 2;
+pub const R2SLEIGH_REQUEST_PROVEN_FACTS_V2: u32 = 3;
 pub const R2SLEIGH_RESPONSE_INFO_SCHEMA_V2: u32 = 2;
 pub const R2SLEIGH_OUTCOME_COMPLETED_V2: u32 = 0;
 pub const R2SLEIGH_OUTCOME_REFUSED_V2: u32 = 1;
@@ -1259,7 +1260,9 @@ unsafe fn execute_request(
     }
     if !matches!(
         request.kind,
-        R2SLEIGH_REQUEST_DECOMPILE_V2 | R2SLEIGH_REQUEST_TYPE_FUNCTION_V2
+        R2SLEIGH_REQUEST_DECOMPILE_V2
+            | R2SLEIGH_REQUEST_TYPE_FUNCTION_V2
+            | R2SLEIGH_REQUEST_PROVEN_FACTS_V2
     ) {
         return Err(BoundaryError::unsupported("unsupported request kind"));
     }
@@ -1279,6 +1282,10 @@ unsafe fn execute_request(
         R2SLEIGH_REQUEST_TYPE_FUNCTION_V2 => {
             super::r2sleigh_engine_type_function_trusted_output(payload, trusted, execution)
                 .ok_or_else(|| BoundaryError::engine("type engine refused the request"))?
+        }
+        R2SLEIGH_REQUEST_PROVEN_FACTS_V2 => {
+            super::r2sleigh_engine_proven_facts_trusted_output(payload, trusted, execution)
+                .ok_or_else(|| BoundaryError::engine("proof engine refused the request"))?
         }
         _ => unreachable!("request kind validated above"),
     };

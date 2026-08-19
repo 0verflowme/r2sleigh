@@ -2725,6 +2725,45 @@ fn r2sleigh_engine_type_function_trusted_output(
     })
 }
 
+/// The facts the function proves, projected for radare2's analysis stores.
+///
+/// Nothing here is a suggestion. Every entry survived a proof that fails closed,
+/// so radare2 can write it into its own stores next to what its own analysis
+/// found without a reader having to know which came from where.
+fn r2sleigh_engine_proven_facts_trusted_output(
+    _input: &R2SleighEngineRequestPayloadV2,
+    ingress: crate::ffi_v2::TrustedIngress,
+    _execution: r2engine::EngineExecutionControl,
+) -> Option<EngineV2Output> {
+    let crate::ffi_v2::TrustedIngress { root: trusted, .. } = ingress;
+    let facts = trusted.proven_facts();
+    let output = serde_json::json!({
+        "function": trusted.source().function().address(),
+        "indirect_calls": facts
+            .indirect_calls
+            .iter()
+            .map(|call| serde_json::json!({
+                "block": call.block_addr,
+                "table": call.table_address,
+                "targets": call.targets,
+            }))
+            .collect::<Vec<_>>(),
+        "unreachable_blocks": facts
+            .unreachable_blocks
+            .iter()
+            .map(|block| serde_json::json!({
+                "addr": block.addr,
+                "reason": block.reason,
+            }))
+            .collect::<Vec<_>>(),
+    });
+    Some(EngineV2Output {
+        output: output.to_string(),
+        metrics: r2engine::EngineMetrics::default(),
+        diagnostics: r2engine::EngineDiagnostics::default(),
+    })
+}
+
 // ============================================================================
 // radare2 Deep Integration FFI - Type Evidence and Data Refs
 // ============================================================================

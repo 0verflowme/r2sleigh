@@ -31,6 +31,7 @@ pub mod fingerprint;
 pub mod function;
 pub mod graph;
 pub mod indirect;
+pub mod proven;
 pub mod interproc;
 pub mod machine;
 pub mod machine_context;

@@ -1073,21 +1073,14 @@ impl TrustedSsaArtifact {
         &self.arch
     }
 
-    /// Every indirect call whose reachable target set this function proves.
+    /// Everything this function proves about itself.
     ///
-    /// The tables come from the source, which can read memory; the range of
-    /// each index comes from the branches that had to be taken to reach the
-    /// call. Both are needed, and only here are both in hand.
-    pub fn resolved_indirect_calls(&self) -> Vec<crate::indirect::ResolvedIndirectCall> {
-        let blocks = self
-            .artifact
-            .function()
-            .blocks()
-            .cloned()
-            .collect::<Vec<_>>();
-        crate::indirect::resolve_indirect_calls(
-            blocks.as_slice(),
-            self.artifact.function().domtree(),
+    /// The pointer tables come from the source, which can read memory; the
+    /// range of each index comes from the branches that had to be taken to
+    /// reach the call. Both are needed, and only here are both in hand.
+    pub fn proven_facts(&self) -> crate::proven::ProvenFacts {
+        crate::proven::prove(
+            self.artifact.function(),
             self.source().image().code_pointer_tables(),
         )
     }
