@@ -2,6 +2,7 @@ pub mod callee;
 pub mod constraint;
 pub mod context;
 pub mod convert;
+pub mod evidence;
 pub mod external;
 pub mod facts;
 pub mod function_facts;
@@ -31,7 +32,7 @@ pub use callee::{
     callee_name_is_runtime_copy, callee_name_is_windows_runtime_registration,
     normalize_callee_name,
 };
-pub use constraint::{Constraint, ConstraintSource, MemoryCapability};
+pub use constraint::{Constraint, ConstraintSource, MemoryCapability, SolverNode};
 pub use context::{
     ExternalAssumptionPayloadParseError, ExternalBaseTypeJson, ExternalBaseTypeKind,
     ExternalBaseTypeMemberJson, ExternalCalleeJson, ExternalCalleeLinkageJson, ExternalContextJson,
@@ -44,6 +45,7 @@ pub use context::{
     parse_external_assumption_payload_json, parse_external_context, parse_external_context_json,
 };
 pub use convert::{CTypeLike, render_c_type_like, to_c_type_like};
+pub use evidence::{EvidenceNode, EvidenceTypes, solve_evidence_types};
 pub use external::{
     ExternalAggregateKind, ExternalEnum, ExternalField, ExternalStruct, ExternalTypeDb,
     ExternalTypedef, ExternalUnion, normalize_external_type_name,

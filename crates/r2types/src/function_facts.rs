@@ -1698,12 +1698,12 @@ impl SourceOwnedFunctionFacts {
         if let Some(param_slots) = param_slots.as_ref() {
             enriched.populate_array_access_render_facts_from_scalar_candidates(source, param_slots);
         }
-        let applied_constraints = enriched.apply_certified_call_argument_type_constraints(
-            source
-                .machine_context()
-                .memory_model()
-                .default_address_bits(),
-        );
+        let ptr_bits = source
+            .machine_context()
+            .memory_model()
+            .default_address_bits();
+        let applied_constraints = enriched.apply_certified_call_argument_type_constraints(ptr_bits);
+        enriched.apply_recovered_evidence_types(source, ptr_bits);
         *report = enriched;
         applied_constraints
     }
@@ -2882,6 +2882,130 @@ impl FunctionFacts {
         applied.len()
     }
 
+    /// The prototype each call site reaches, keyed the way the solver needs it.
+    fn callsite_signatures(&self) -> BTreeMap<r2ssa::CallSiteId, crate::FunctionType> {
+        let mut signatures = BTreeMap::new();
+        for (callsite, arguments) in &self.callsites.by_callsite {
+            let Some(signature) = self
+                .callee_resolution
+                .identity_for_callsite(*callsite)
+                .and_then(crate::CalleeIdentity::known_signature)
+            else {
+                continue;
+            };
+            signatures.insert(arguments.call_site_id, signature.clone());
+        }
+        signatures
+    }
+
+    /// Type what the code proves, for a function that carries no declared types.
+    ///
+    /// The solver is given every callee prototype, every certified access width
+    /// and every SSA identity at once and run to a fixpoint; what comes back is
+    /// only written where the fact it would replace is storage width rather than
+    /// evidence, so a recovered type never overwrites a declared one and a value
+    /// the solver did not reach keeps whatever it had.
+    pub fn apply_recovered_evidence_types(&mut self, source: &r2ssa::SsaArtifact, ptr_bits: u32) {
+        let signatures = self.callsite_signatures();
+        if signatures.is_empty() {
+            return;
+        }
+        let recovered = crate::evidence::solve_evidence_types(source, &signatures, ptr_bits);
+        if recovered.is_empty() {
+            return;
+        }
+        self.apply_recovered_return_type(source, &recovered, ptr_bits);
+        self.apply_recovered_stack_slot_types(&recovered, ptr_bits);
+    }
+
+    /// The type of the value the function hands back.
+    ///
+    /// Only a return that is already claimed to carry a value is retyped: a
+    /// function proven to return nothing keeps returning nothing, whatever a
+    /// leftover register happens to hold.
+    fn apply_recovered_return_type(
+        &mut self,
+        source: &r2ssa::SsaArtifact,
+        recovered: &crate::EvidenceTypes,
+        ptr_bits: u32,
+    ) {
+        let Some(signature) = self.types.merged_signature.as_ref() else {
+            return;
+        };
+        let Some(existing) = signature.ret_type.clone() else {
+            return;
+        };
+        if !crate::facts::is_weak_storage_scalar_type(&existing, ptr_bits) {
+            return;
+        }
+
+        let mut candidate: Option<CTypeLike> = None;
+        for certificate in &source.certificates().returns {
+            let Some(ty) = recovered.value_type(certificate.value) else {
+                return;
+            };
+            match &candidate {
+                None => candidate = Some(ty.clone()),
+                Some(existing) if existing == ty => {}
+                // Two returns that disagree have not agreed on a type.
+                Some(_) => return,
+            }
+        }
+        let Some(candidate) = candidate else {
+            return;
+        };
+        if !recovered_type_outranks(&existing, &candidate, ptr_bits) {
+            return;
+        }
+        if let Some(signature) = self.types.merged_signature.as_mut() {
+            signature.ret_type = Some(candidate);
+        }
+        self.types
+            .certify_current_signature_with_source(SignatureCertificateSource::CalleeSignature);
+    }
+
+    /// The type of each stack home the solver reached.
+    fn apply_recovered_stack_slot_types(
+        &mut self,
+        recovered: &crate::EvidenceTypes,
+        ptr_bits: u32,
+    ) {
+        let mut retyped: Vec<(String, CTypeLike)> = Vec::new();
+        for (key, ty) in recovered.stack_slot_types() {
+            let Some(slot) = self.types.stack_slots.get_mut(key) else {
+                continue;
+            };
+            let replace = match slot.ty.as_ref() {
+                None => true,
+                Some(existing) => recovered_type_outranks(existing, ty, ptr_bits),
+            };
+            if !replace {
+                continue;
+            }
+            slot.ty = Some(ty.clone());
+            retyped.push((slot.name.clone(), ty.clone()));
+        }
+        if retyped.is_empty() {
+            return;
+        }
+        for (name, ty) in retyped {
+            for binding in self
+                .types
+                .visible_bindings
+                .iter_mut()
+                .filter(|binding| binding.name == name)
+            {
+                let replace = match binding.ty.as_ref() {
+                    None => true,
+                    Some(existing) => recovered_type_outranks(existing, &ty, ptr_bits),
+                };
+                if replace {
+                    binding.ty = Some(ty.clone());
+                }
+            }
+        }
+    }
+
     pub fn interproc_summary_set(&self) -> Option<&r2ssa::InterprocSummarySet> {
         self.interproc_summary
             .as_ref()
@@ -3000,6 +3124,39 @@ fn parameter_entry_value_has_live_use(prepared: &r2ssa::SsaArtifact, root: r2ssa
         }
     }
     false
+}
+
+/// Whether a recovered type is better evidence than what is already recorded.
+///
+/// A width is not a type. A slot that nothing is known about is given the width
+/// of the register that spilled it, and any structured type outranks that; a
+/// type that is already structured is never demoted, so a recovered type cannot
+/// overwrite a declared one.
+fn recovered_type_outranks(existing: &CTypeLike, recovered: &CTypeLike, ptr_bits: u32) -> bool {
+    if crate::signature_infer::render_signature_type(existing, ptr_bits)
+        == crate::signature_infer::render_signature_type(recovered, ptr_bits)
+    {
+        return false;
+    }
+    if crate::facts::signature_hint_can_replace_existing(existing, Some(recovered), ptr_bits) {
+        return true;
+    }
+    crate::facts::is_weak_storage_scalar_type(existing, ptr_bits)
+        && recovered_type_is_evidence(recovered, ptr_bits)
+}
+
+/// Whether a type says more than the width of the storage that held it.
+fn recovered_type_is_evidence(ty: &CTypeLike, ptr_bits: u32) -> bool {
+    match ty {
+        CTypeLike::Pointer(inner) => !matches!(inner.as_ref(), CTypeLike::Unknown),
+        CTypeLike::Float(_)
+        | CTypeLike::Bool
+        | CTypeLike::Struct(_)
+        | CTypeLike::Union(_)
+        | CTypeLike::Enum(_) => true,
+        CTypeLike::Typedef(name) => !crate::facts::is_weak_storage_scalar_typedef(name, ptr_bits),
+        _ => false,
+    }
 }
 
 fn struct_name_from_pointer_type(ty: Option<&CTypeLike>) -> Option<&str> {
@@ -4652,6 +4809,57 @@ mod tests {
             Some((0, value, "rdi")),
             "register argument location proof must travel through FunctionFacts"
         );
+    }
+
+    #[test]
+    fn a_recovered_pointer_replaces_a_storage_width_scalar() {
+        let existing = CTypeLike::Int {
+            bits: 32,
+            signedness: crate::Signedness::Signed,
+        };
+        let recovered = CTypeLike::Pointer(Box::new(CTypeLike::Void));
+        assert!(recovered_type_outranks(&existing, &recovered, 64));
+    }
+
+    #[test]
+    fn a_recovered_type_never_demotes_a_structured_one() {
+        let existing = CTypeLike::Pointer(Box::new(CTypeLike::Struct("Node".to_string())));
+        for recovered in [
+            CTypeLike::Int {
+                bits: 64,
+                signedness: crate::Signedness::Signed,
+            },
+            CTypeLike::Pointer(Box::new(CTypeLike::Void)),
+            CTypeLike::Typedef("int64_t".to_string()),
+        ] {
+            assert!(
+                !recovered_type_outranks(&existing, &recovered, 64),
+                "{recovered:?} must not replace a struct pointer"
+            );
+        }
+    }
+
+    #[test]
+    fn a_recovered_type_that_renders_the_same_is_not_a_replacement() {
+        let existing = CTypeLike::Typedef("int32_t".to_string());
+        let recovered = CTypeLike::Int {
+            bits: 32,
+            signedness: crate::Signedness::Signed,
+        };
+        assert!(!recovered_type_outranks(&existing, &recovered, 64));
+    }
+
+    #[test]
+    fn a_storage_width_scalar_is_not_evidence_for_replacing_another_one() {
+        let existing = CTypeLike::Int {
+            bits: 64,
+            signedness: crate::Signedness::Signed,
+        };
+        let recovered = CTypeLike::Int {
+            bits: 32,
+            signedness: crate::Signedness::Unsigned,
+        };
+        assert!(!recovered_type_outranks(&existing, &recovered, 64));
     }
 
     #[test]
