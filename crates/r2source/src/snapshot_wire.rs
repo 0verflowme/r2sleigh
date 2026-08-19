@@ -47,6 +47,10 @@ pub enum SnapshotWireError {
     TrailingPayload(usize),
     /// A value did not fit the width the record declares for it.
     ValueTooWide,
+    /// A tag names a case this schema does not define; `record` says which record it came from.
+    UnknownDiscriminant { record: &'static str, tag: u64 },
+    /// The bytes decoded but the contract refused them; `contract` names the constructor that said no.
+    RejectedContract { contract: &'static str },
 }
 
 impl std::fmt::Display for SnapshotWireError {
@@ -373,7 +377,12 @@ pub fn read_machine_profile(
         ENDIAN_BIG => SourceEndianness::Big,
         // An unrecognized discriminant is refused rather than defaulted: a
         // guessed byte order would silently reinterpret every value.
-        _ => return Err(SnapshotWireError::ValueTooWide),
+        tag => {
+            return Err(SnapshotWireError::UnknownDiscriminant {
+                record: "machine endianness",
+                tag: u64::from(tag),
+            });
+        }
     };
     Ok(MachineProfile {
         arch_id: arch_id.into(),
@@ -440,7 +449,12 @@ pub fn read_storage(
         SPACE_UNKNOWN => CanonicalStorageSpace::Unknown,
         // An unknown space is refused: mapping it onto a known one would move a
         // value into an address space it never lived in.
-        _ => return Err(SnapshotWireError::ValueTooWide),
+        tag => {
+            return Err(SnapshotWireError::UnknownDiscriminant {
+                record: "storage space",
+                tag: u64::from(tag),
+            });
+        }
     };
     Ok(CanonicalStorageId {
         space,
@@ -552,7 +566,10 @@ pub fn read_captured_fields(
     // cannot represent, so the snapshot is refused rather than silently
     // downgraded to the fields it does understand.
     if mask & !CAPTURED_KNOWN_BITS != 0 {
-        return Err(SnapshotWireError::ValueTooWide);
+        return Err(SnapshotWireError::UnknownDiscriminant {
+            record: "captured fields",
+            tag: u64::from(mask & !CAPTURED_KNOWN_BITS),
+        });
     }
     Ok(CapturedSourceFields {
         bounded_function_image: mask & CAPTURED_BOUNDED_IMAGE != 0,
@@ -579,8 +596,11 @@ pub fn read_machine_roles(
     let stack_pointer_storage = read_optional_storage(reader)?;
     // new() revalidates the register constraint, so a buffer cannot mint roles
     // the in-crate constructor would have rejected.
-    SourceMachineRoles::new(return_address_storage, stack_pointer_storage)
-        .map_err(|_| SnapshotWireError::ValueTooWide)
+    SourceMachineRoles::new(return_address_storage, stack_pointer_storage).map_err(|_| {
+        SnapshotWireError::RejectedContract {
+            contract: "SourceMachineRoles::new",
+        }
+    })
 }
 
 pub fn write_convention_slots(
@@ -610,8 +630,11 @@ pub fn read_convention_slots(
     let result_slot = read_optional_storage(reader)?;
     // new() revalidates, so a buffer cannot mint candidate slots the in-crate
     // constructor would have rejected.
-    SourceConventionSlots::new(calling_convention, argument_slots, result_slot)
-        .map_err(|_| SnapshotWireError::ValueTooWide)
+    SourceConventionSlots::new(calling_convention, argument_slots, result_slot).map_err(|_| {
+        SnapshotWireError::RejectedContract {
+            contract: "SourceConventionSlots::new",
+        }
+    })
 }
 
 const SUCCESSOR_DIRECT: u8 = 0;
@@ -647,7 +670,12 @@ pub fn read_successor(
         SUCCESSOR_SWITCH_DEFAULT => AdvisorySuccessorKind::SwitchDefault,
         // Edge kind decides control flow, so an unknown one is refused rather
         // than folded into a direct edge.
-        _ => return Err(SnapshotWireError::ValueTooWide),
+        tag => {
+            return Err(SnapshotWireError::UnknownDiscriminant {
+                record: "successor kind",
+                tag: u64::from(tag),
+            });
+        }
     };
     let target = reader.u64()?;
     let case_value = if reader.bool()? {
@@ -793,7 +821,10 @@ pub fn read_call_result(
         }),
         // Void and a register result are not interchangeable, so an unknown tag
         // is refused rather than treated as void.
-        _ => Err(SnapshotWireError::ValueTooWide),
+        tag => Err(SnapshotWireError::UnknownDiscriminant {
+            record: "call result",
+            tag: u64::from(tag),
+        }),
     }
 }
 
@@ -896,7 +927,12 @@ pub fn read_carrier(
         CARRIER_LOW_BITS => SourceCarrierKind::LowBits,
         // The kind decides whether a value is the whole carrier or a truncation
         // of it, so an unknown one is refused rather than widened.
-        _ => return Err(SnapshotWireError::ValueTooWide),
+        tag => {
+            return Err(SnapshotWireError::UnknownDiscriminant {
+                record: "carrier kind",
+                tag: u64::from(tag),
+            });
+        }
     };
     let offset_bits = reader.u64()?;
     let size_bits = reader.u64()?;
@@ -947,7 +983,10 @@ pub fn read_function_return(
         RESULT_REGISTER => Ok(SourceFunctionReturn::Register {
             storage: read_storage(reader)?,
         }),
-        _ => Err(SnapshotWireError::ValueTooWide),
+        tag => Err(SnapshotWireError::UnknownDiscriminant {
+            record: "function return",
+            tag: u64::from(tag),
+        }),
     }
 }
 
@@ -987,7 +1026,12 @@ pub fn read_type(reader: &mut SnapshotWireReader<'_>) -> Result<SourceType, Snap
         },
         // Signedness and indirection are not recoverable from anything else in
         // the record, so an unknown kind is refused.
-        _ => return Err(SnapshotWireError::ValueTooWide),
+        tag => {
+            return Err(SnapshotWireError::UnknownDiscriminant {
+                record: "type kind",
+                tag: u64::from(tag),
+            });
+        }
     };
     let size_bits = reader.u64()?;
     let align_bits = reader.u64()?;
@@ -1093,7 +1137,9 @@ pub fn read_type_graph(
     // mint a graph the in-crate constructor would have rejected. Every
     // downstream projection resolves type identities against this graph, so it
     // is the last place that may accept something unchecked.
-    SourceTypeGraph::new(types, aggregates).map_err(|_| SnapshotWireError::ValueTooWide)
+    SourceTypeGraph::new(types, aggregates).map_err(|_| SnapshotWireError::RejectedContract {
+        contract: "SourceTypeGraph::new",
+    })
 }
 
 const GROWTH_LOWER: u8 = 0;
@@ -1118,7 +1164,12 @@ pub fn read_stack_allocation(
         GROWTH_HIGHER => SourceStackGrowth::HigherAddresses,
         // Growth direction decides which side of the entry SP the callee owns,
         // so a guess would hand out the wrong interval.
-        _ => return Err(SnapshotWireError::ValueTooWide),
+        tag => {
+            return Err(SnapshotWireError::UnknownDiscriminant {
+                record: "stack growth",
+                tag: u64::from(tag),
+            });
+        }
     };
     let implicit = reader.u32()?;
     Ok(SourceStackAllocationContract::with_implicit_active_sp_bytes(growth, implicit))
@@ -1153,7 +1204,10 @@ pub fn read_return_mechanism(
             stack_pointer_delta_bytes: reader.u32()?,
             address_size_bytes: reader.u32()?,
         }),
-        _ => Err(SnapshotWireError::ValueTooWide),
+        tag => Err(SnapshotWireError::UnknownDiscriminant {
+            record: "return mechanism",
+            tag: u64::from(tag),
+        }),
     }
 }
 
@@ -1191,7 +1245,12 @@ pub fn read_stack_slot(
     let base = match reader.u8()? {
         BASE_FRAME_POINTER => StackAddressBase::FramePointer,
         BASE_STACK_POINTER => StackAddressBase::StackPointer,
-        _ => return Err(SnapshotWireError::ValueTooWide),
+        tag => {
+            return Err(SnapshotWireError::UnknownDiscriminant {
+                record: "stack slot base",
+                tag: u64::from(tag),
+            });
+        }
     };
     let base_storage = read_storage(reader)?;
     let offset = reader.i64()?;
@@ -1213,7 +1272,12 @@ pub fn read_stack_slot(
                 home_storage,
             )
         }
-        _ => return Err(SnapshotWireError::ValueTooWide),
+        tag => {
+            return Err(SnapshotWireError::UnknownDiscriminant {
+                record: "stack slot role",
+                tag: u64::from(tag),
+            });
+        }
     })
 }
 
@@ -1388,26 +1452,39 @@ pub fn read_interface(
             return_kind,
             stack_slots,
         ),
-        _ => return Err(SnapshotWireError::ValueTooWide),
+        tag => {
+            return Err(SnapshotWireError::UnknownDiscriminant {
+                record: "interface shape",
+                tag: u64::from(tag),
+            });
+        }
     }
-    .map_err(|_| SnapshotWireError::ValueTooWide)?;
+    .map_err(|_| SnapshotWireError::RejectedContract {
+        contract: "SourceFunctionInterface::new",
+    })?;
 
     interface =
         interface.with_preserved_call_carriers(stack_pointer_preserved, frame_pointer_preserved);
     if let Some(storage) = return_address_storage {
         interface = interface
             .with_return_address_storage(storage)
-            .map_err(|_| SnapshotWireError::ValueTooWide)?;
+            .map_err(|_| SnapshotWireError::RejectedContract {
+                contract: "SourceFunctionInterface::with_return_address_storage",
+            })?;
     }
     if let Some(storage) = stack_pointer_storage {
-        interface = interface
-            .with_stack_pointer_storage(storage)
-            .map_err(|_| SnapshotWireError::ValueTooWide)?;
+        interface = interface.with_stack_pointer_storage(storage).map_err(|_| {
+            SnapshotWireError::RejectedContract {
+                contract: "SourceFunctionInterface::with_stack_pointer_storage",
+            }
+        })?;
     }
     if let Some(storage) = frame_pointer_storage {
-        interface = interface
-            .with_frame_pointer_storage(storage)
-            .map_err(|_| SnapshotWireError::ValueTooWide)?;
+        interface = interface.with_frame_pointer_storage(storage).map_err(|_| {
+            SnapshotWireError::RejectedContract {
+                contract: "SourceFunctionInterface::with_frame_pointer_storage",
+            }
+        })?;
     }
     if let Some(SourceReturnMechanism::Stacked {
         stack_offset,
@@ -1423,12 +1500,16 @@ pub fn read_interface(
                 stack_pointer_delta_bytes,
                 address_size_bytes,
             )
-            .map_err(|_| SnapshotWireError::ValueTooWide)?;
+            .map_err(|_| SnapshotWireError::RejectedContract {
+                contract: "SourceFunctionInterface::with_exact_stacked_return",
+            })?;
     }
     if let Some(contract) = stack_allocation {
         interface = interface
             .with_stack_allocation_contract(contract)
-            .map_err(|_| SnapshotWireError::ValueTooWide)?;
+            .map_err(|_| SnapshotWireError::RejectedContract {
+                contract: "SourceFunctionInterface::with_stack_allocation_contract",
+            })?;
     }
     Ok(interface)
 }
@@ -1535,6 +1616,44 @@ pub fn decode_snapshot(buffer: &[u8]) -> Result<OwnedFunctionSnapshot, SnapshotD
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_unknown_discriminant_names_the_record_it_was_read_from() {
+        let mut writer = SnapshotWireWriter::new();
+        writer.string("x86").expect("arch");
+        writer.string("x86-64").expect("cpu");
+        writer.u32(64);
+        writer.u8(0x5a);
+        let buffer = writer.finish().expect("finish");
+        let mut reader = SnapshotWireReader::new(&buffer).expect("header");
+        assert_eq!(
+            read_machine_profile(&mut reader),
+            Err(SnapshotWireError::UnknownDiscriminant {
+                record: "machine endianness",
+                tag: 0x5a,
+            })
+        );
+    }
+
+    #[test]
+    fn a_contract_that_refuses_a_decoded_record_names_itself() {
+        let mut writer = SnapshotWireWriter::new();
+        writer.u32(1);
+        writer.u32(0);
+        writer.u8(TYPE_POINTER);
+        writer.u32(7);
+        writer.u64(64);
+        writer.u64(64);
+        writer.u32(0);
+        let buffer = writer.finish().expect("finish");
+        let mut reader = SnapshotWireReader::new(&buffer).expect("header");
+        assert_eq!(
+            read_type_graph(&mut reader),
+            Err(SnapshotWireError::RejectedContract {
+                contract: "SourceTypeGraph::new",
+            })
+        );
+    }
 
     #[test]
     fn primitives_round_trip_in_written_order() {
