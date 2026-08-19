@@ -2989,14 +2989,19 @@ impl Decompiler {
             }
             post_rename::rewrite_function_identifiers(&mut c_function, &known_function_names);
         }
-        fold_constant_arithmetic_in_function(
-            &mut c_function,
-            self.context.function_facts.display_names().strings(),
-        );
-        single_evaluation::bind_each_call_site_once(
-            &mut c_function,
-            fold_ctx.call_result_exprs_map(),
-        );
+        let strings = self.context.function_facts.display_names().strings();
+        fold_constant_arithmetic_in_function(&mut c_function, strings);
+        // Binding a repeated call to one name means finding the call site in
+        // the body, and that match is by expression. The body has just been
+        // folded -- an adrp/add pair is one address and that address is a
+        // string -- while the recorded site is still the unfolded form, so
+        // `strcmp(password, "secret123")` matched nothing and was printed once
+        // per use. The sites fold the same way before they are matched.
+        let mut folded_call_sites = fold_ctx.call_result_exprs_map().clone();
+        for expr in folded_call_sites.values_mut() {
+            fold_constant_arithmetic_in_expr(expr, strings);
+        }
+        single_evaluation::bind_each_call_site_once(&mut c_function, &folded_call_sites);
         propagate_single_use_register_carriers(&mut c_function, &fold_ctx);
         rewrite_stack_synonym_uses_to_declared_locals(&mut c_function, &fold_ctx);
         prune_dead_temp_assignments_in_function_body(&mut c_function, &fold_ctx);
