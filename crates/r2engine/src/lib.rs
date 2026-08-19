@@ -3067,6 +3067,8 @@ pub struct EngineAnalyzeRequest {
     pub arch: Option<r2il::ArchSpec>,
     pub source_snapshot: Option<Arc<EngineSourceSnapshot>>,
     trusted_ssa: Option<Arc<r2ssa::TrustedSsaArtifact>>,
+    /// Bodies of the functions the root calls, captured in the same transaction.
+    trusted_callees: Vec<Arc<r2ssa::SsaArtifact>>,
     pub ptr_bits: u32,
     pub semantic_metadata_enabled: bool,
     pub reg_type_hints: HashMap<String, r2types::TypeHint>,
@@ -3483,6 +3485,7 @@ impl EngineAnalyzeRequest {
             arch: parts.arch,
             source_snapshot: parts.source_snapshot,
             trusted_ssa: None,
+            trusted_callees: Vec::new(),
             ptr_bits: parts.ptr_bits,
             semantic_metadata_enabled: parts.semantic_metadata_enabled,
             reg_type_hints: parts.reg_type_hints,
@@ -3533,6 +3536,21 @@ impl EngineAnalyzeRequest {
         self.symbolic_scope = None;
         self.semantic_mode = EngineSemanticMode::Full;
         self.trusted_ssa = Some(trusted);
+        self
+    }
+
+    /// Attach the bodies of the functions the root calls, captured with it.
+    ///
+    /// Without them the solver has no callee to look at and must assume every
+    /// direct call does anything to anything it was handed.
+    pub fn with_trusted_callees(
+        mut self,
+        callees: impl IntoIterator<Item = Arc<r2ssa::TrustedSsaArtifact>>,
+    ) -> Self {
+        self.trusted_callees = callees
+            .into_iter()
+            .map(|callee| callee.shared_artifact())
+            .collect();
         self
     }
 
@@ -3649,6 +3667,7 @@ pub struct EngineFunctionDecompileRequestInput {
     input_quality: EngineFunctionInputQuality,
     execution: EngineExecutionControl,
     trusted_ssa: Option<Arc<r2ssa::TrustedSsaArtifact>>,
+    trusted_callees: Vec<Arc<r2ssa::TrustedSsaArtifact>>,
 }
 
 impl EngineFunctionDecompileRequestInput {
@@ -3667,6 +3686,7 @@ impl EngineFunctionDecompileRequestInput {
             input_quality: EngineFunctionInputQuality::complete(function_block_count),
             execution: EngineExecutionControl::default(),
             trusted_ssa: None,
+            trusted_callees: Vec::new(),
         }
     }
 
@@ -3682,6 +3702,15 @@ impl EngineFunctionDecompileRequestInput {
 
     pub fn with_trusted_ssa(mut self, trusted: Arc<r2ssa::TrustedSsaArtifact>) -> Self {
         self.trusted_ssa = Some(trusted);
+        self
+    }
+
+    /// Attach the bodies of the functions the root calls, captured with it.
+    pub fn with_trusted_callees(
+        mut self,
+        callees: impl IntoIterator<Item = Arc<r2ssa::TrustedSsaArtifact>>,
+    ) -> Self {
+        self.trusted_callees = callees.into_iter().collect();
         self
     }
 
@@ -3718,6 +3747,7 @@ impl EngineFunctionDecompileRequestInput {
 impl EngineFunctionDecompileRequest {
     pub(crate) fn full_semantics_for_function(input: EngineFunctionDecompileRequestInput) -> Self {
         let trusted_ssa = input.trusted_ssa;
+        let trusted_callees = input.trusted_callees;
         Self {
             input_quality: Some(input.input_quality),
             analysis: EngineAnalyzeRequest::full_semantics_for_function(
@@ -3732,7 +3762,8 @@ impl EngineFunctionDecompileRequest {
                 },
             )
             .with_execution_control(input.execution)
-            .with_optional_trusted_ssa(trusted_ssa),
+            .with_optional_trusted_ssa(trusted_ssa)
+            .with_trusted_callees(trusted_callees),
         }
     }
 }
@@ -5501,6 +5532,10 @@ struct InterprocSummaryBuildInput<'a> {
     pub analysis: &'a EngineAnalysis,
     pub max_iterations: usize,
     pub symbolic_scope: Option<&'a r2sym::PreparedFunctionScope>,
+    /// Bodies of the functions the root calls, captured with it. Without these
+    /// every direct call is an unresolved callee, and the solver has to mark
+    /// every pointer argument read, written and escaped.
+    pub trusted_callees: &'a [Arc<r2ssa::SsaArtifact>],
 }
 
 fn build_prepared_interproc_summary_set(
@@ -5531,6 +5566,17 @@ fn build_prepared_interproc_summary_set(
                 prepared: &function.prepared,
             });
         }
+    }
+    for callee in input.trusted_callees {
+        let id = r2ssa::InterprocFunctionId(callee.function().entry);
+        if id == root || functions.iter().any(|function| function.id == id) {
+            continue;
+        }
+        functions.push(r2ssa::PreparedInterprocFunctionInput {
+            id,
+            name: callee.function().name.clone(),
+            prepared: callee,
+        });
     }
     r2ssa::solve_prepared_interproc_summary_set(
         Arc::clone(&input.analysis.ssa_func),
@@ -5570,6 +5616,7 @@ fn build_engine_analysis_artifact(
             analysis: &semantic_analysis,
             max_iterations: request.interproc_max_iterations,
             symbolic_scope: request.symbolic_scope.as_ref(),
+            trusted_callees: &request.trusted_callees,
         }) {
             Ok(summary) => Some(summary),
             Err(
@@ -6791,6 +6838,7 @@ mod tests {
                 arch: Some(arch),
                 source_snapshot: Some(exact_rdi_test_source_snapshot("sym.assumed/rev1")),
                 trusted_ssa: None,
+                trusted_callees: Vec::new(),
                 ptr_bits: 64,
                 semantic_metadata_enabled: false,
                 reg_type_hints: HashMap::new(),
@@ -7521,6 +7569,7 @@ mod tests {
                 analysis: &analysis,
                 max_iterations: 1,
                 symbolic_scope,
+                trusted_callees: &[],
             })
         };
 
@@ -7978,6 +8027,7 @@ mod tests {
             arch: Some(x86_64_result_arch()),
             source_snapshot: Some(exact_empty_test_source_snapshot("sym.zero/analyze/rev1")),
             trusted_ssa: None,
+            trusted_callees: Vec::new(),
             ptr_bits: 64,
             semantic_metadata_enabled: false,
             reg_type_hints: HashMap::new(),
@@ -9763,6 +9813,7 @@ mod tests {
                 arch: None,
                 source_snapshot: Some(test_source_snapshot("dbg.main/type/rev1")),
                 trusted_ssa: None,
+                trusted_callees: Vec::new(),
                 ptr_bits: 64,
                 semantic_metadata_enabled: false,
                 reg_type_hints: HashMap::new(),
@@ -9799,6 +9850,7 @@ mod tests {
                 arch: None,
                 source_snapshot: Some(test_source_snapshot("dbg.main/report/rev1")),
                 trusted_ssa: None,
+                trusted_callees: Vec::new(),
                 ptr_bits: 64,
                 semantic_metadata_enabled: false,
                 reg_type_hints: HashMap::new(),
@@ -9906,6 +9958,7 @@ mod tests {
                 arch: None,
                 source_snapshot: Some(test_source_snapshot("dbg.init_node/rev1")),
                 trusted_ssa: None,
+                trusted_callees: Vec::new(),
                 ptr_bits: 64,
                 semantic_metadata_enabled: false,
                 reg_type_hints: HashMap::new(),
@@ -9955,6 +10008,7 @@ mod tests {
             },
             execution: EngineExecutionControl::default(),
             trusted_ssa: None,
+            trusted_callees: Vec::new(),
         });
 
         assert!(
@@ -10017,6 +10071,7 @@ mod tests {
             input_quality: EngineFunctionInputQuality::complete(2),
             execution: EngineExecutionControl::default(),
             trusted_ssa: None,
+            trusted_callees: Vec::new(),
         });
 
         assert!(
@@ -10077,6 +10132,7 @@ mod tests {
             },
             execution: EngineExecutionControl::default(),
             trusted_ssa: None,
+            trusted_callees: Vec::new(),
         });
 
         assert!(
@@ -10129,6 +10185,7 @@ mod tests {
             input_quality: EngineFunctionInputQuality::complete(0),
             execution: EngineExecutionControl::default(),
             trusted_ssa: None,
+            trusted_callees: Vec::new(),
         });
 
         assert!(
@@ -10181,6 +10238,7 @@ mod tests {
             input_quality: EngineFunctionInputQuality::complete(1),
             execution: EngineExecutionControl::default(),
             trusted_ssa: None,
+            trusted_callees: Vec::new(),
         });
 
         let quality = response
@@ -10216,6 +10274,7 @@ mod tests {
                 arch: None,
                 source_snapshot: Some(test_source_snapshot("sym.direct_partial/rev1")),
                 trusted_ssa: None,
+                trusted_callees: Vec::new(),
                 ptr_bits: 64,
                 semantic_metadata_enabled: false,
                 reg_type_hints: HashMap::new(),
@@ -10264,6 +10323,7 @@ mod tests {
                 arch: None,
                 source_snapshot: Some(test_source_snapshot("dbg.raw_name/rev1")),
                 trusted_ssa: None,
+                trusted_callees: Vec::new(),
                 ptr_bits: 64,
                 semantic_metadata_enabled: false,
                 reg_type_hints: HashMap::new(),
@@ -10308,6 +10368,7 @@ mod tests {
                 arch: None,
                 source_snapshot: Some(test_source_snapshot("sym.caller/rev1")),
                 trusted_ssa: None,
+                trusted_callees: Vec::new(),
                 ptr_bits: 64,
                 semantic_metadata_enabled: false,
                 reg_type_hints: HashMap::new(),
@@ -10350,6 +10411,7 @@ mod tests {
                 arch: None,
                 source_snapshot: Some(test_source_snapshot("sym.string_const/rev1")),
                 trusted_ssa: None,
+                trusted_callees: Vec::new(),
                 ptr_bits: 64,
                 semantic_metadata_enabled: false,
                 reg_type_hints: HashMap::new(),
@@ -10388,6 +10450,7 @@ mod tests {
                 input_quality: EngineFunctionInputQuality::complete(0),
                 execution: EngineExecutionControl::default(),
                 trusted_ssa: None,
+                trusted_callees: Vec::new(),
             },
         );
 

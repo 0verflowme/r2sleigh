@@ -1161,16 +1161,32 @@ fn elapsed_us(started: Instant) -> u64 {
 unsafe fn capture_trusted_ssa_from_buffer(
     payload: &R2SleighEngineRequestPayloadV2,
     execution: &r2engine::EngineExecutionControl,
-) -> Result<Arc<r2ssa::TrustedSsaArtifact>, BoundaryError> {
+) -> Result<TrustedIngress, BoundaryError> {
     let ssa_control = execution.ssa_execution_control();
     r2ssa::SsaWorkControl::poll(&ssa_control)
         .map_err(|error| BoundaryError::engine(format!("trusted ingress stopped: {error}")))?;
     // SAFETY: the caller guarantees the buffer extent.
     let bytes =
         unsafe { std::slice::from_raw_parts(payload.snapshot_buffer, payload.snapshot_buffer_len) };
-    let source = r2source::snapshot_wire::decode_snapshot(bytes)
+    let (source, callees) = r2source::snapshot_wire::decode_snapshot_set(bytes)
         .map_err(|error| BoundaryError::invalid(format!("snapshot buffer rejected: {error}")))?;
-    trusted_from_source(source, execution)
+    let root = trusted_from_source(source, execution)?;
+    // A callee that will not lift costs the caller nothing: the solver falls
+    // back to knowing nothing about that call, which is where it started.
+    let lifted_callees = callees
+        .into_iter()
+        .filter_map(|callee| trusted_from_source(callee, execution).ok())
+        .collect();
+    Ok(TrustedIngress {
+        root,
+        callees: lifted_callees,
+    })
+}
+
+/// One trusted root and the bodies of what it calls, from one capture.
+pub(crate) struct TrustedIngress {
+    pub(crate) root: Arc<r2ssa::TrustedSsaArtifact>,
+    pub(crate) callees: Vec<Arc<r2ssa::TrustedSsaArtifact>>,
 }
 
 /// Lift and prepare one owned snapshot, whichever transport produced it. Both
