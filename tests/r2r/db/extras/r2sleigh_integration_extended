@@ -675,3 +675,31 @@ af
 afij | jq -c '.[0].calltype == "ms"'
 EOF_CMDS
 RUN
+
+NAME=dec_process_string_uses_source_type_spellings
+FILE=bins/vuln_test
+ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
+EXPECT=<<EOF_EXPECT
+true
+EOF_EXPECT
+CMDS=<<EOF_CMDS
+a:sla > /dev/null
+aaa
+s `afl~process_string$[0]` > /dev/null
+pdd | jq -Rs 'test("\\(char ?\\* ?s\\)") and test("size_t len") and (contains("int8_t")|not) and (contains("uint64_t len")|not)'
+EOF_CMDS
+RUN
+
+NAME=dec_alloc_and_copy_uses_callee_result_type
+FILE=bins/vuln_test
+ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
+EXPECT=<<EOF_EXPECT
+true
+EOF_EXPECT
+CMDS=<<EOF_CMDS
+a:sla > /dev/null
+aaa
+s `afl~alloc_and_copy$[0]` > /dev/null
+pdd | jq -Rs 'test("char ?\\* ?buf = sym\\.imp\\.malloc") and test("size_t len") and (contains("sym.imp.__memcpy_chk(buf, src, len")) '
+EOF_CMDS
+RUN
