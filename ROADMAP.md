@@ -2223,13 +2223,26 @@ model, not at any one call site.
 `process_string(int32_t arg0)` while `authenticate(char *password)` -- an
 identical prototype in the same binary -- recovers its name. radare2 withholds
 the whole function interface, and with it the presentation names, when
-`stack_resources_complete` is false, which happens when two *local* frame slots
-overlap. Removing that conjunct does deliver the names, and it also reveals why
-it is there: radare2 then emits parameter-home slots that are zero-sized or
-unbacked, which `SourceFunctionInterface::new` rejects. Relaxing the Rust
-contract to match trades a missing name for a corrupted interface. The fix
-belongs in radare2's stack-slot collection, which should either describe a
-parameter home or omit the inventory, not emit a malformed one.
+`stack_resources_complete` is false.
+
+Traced twice, and the first account was wrong: the slot that fails is not a
+parameter home but an untyped *local*, carrying size zero because radare2 knows
+a variable lives there and not how big it is. Treating such a slot as outside
+the described inventory -- on both sides of the wire -- does deliver the names,
+and `process_string(void *s)` and `alloc_and_copy(void *src, ...)` render with
+them.
+
+It then uncovers a second, unrelated defect underneath. With the interface
+allowed through, x86 `entry0` carries a type graph that
+`SourceTypeGraph::new` rejects as `InvalidType`, so that function stops
+rendering altogether. The type is malformed independently of anything about
+slots; it was simply never reached before, because the interface gate had
+already refused the snapshot.
+
+So the work is two changes, not one, and shipping the first alone trades a
+recovered name for a function that no longer decompiles. The second is where
+to start: find why the graph carries a type whose size or alignment does not
+describe anything, and fix that before relaxing the gate.
 
 The common seam is the second lowering implementation. `analysis/lower.rs` and
 `fold/op_lower` both derive what a name denotes, and they disagree; the frame
