@@ -851,10 +851,6 @@ impl<'a> FoldingContext<'a> {
         ))
     }
 
-    pub(crate) fn requires_certified_rendering(&self) -> bool {
-        false
-    }
-
     pub(crate) fn stable_stack_value_for_offset(
         &self,
         offset: i64,
@@ -1827,7 +1823,7 @@ impl<'a> FoldingContext<'a> {
                 param_register_aliases: self.inputs.param_register_aliases,
                 function_facts: self.inputs.function_facts,
                 #[cfg(test)]
-                certified_rendering_required: self.requires_certified_rendering(),
+                certified_rendering_required: false,
             })
         });
         self.prepared_semantic_view_building.set(false);
@@ -2886,7 +2882,7 @@ impl<'a> FoldingContext<'a> {
                     param_register_aliases: self.inputs.param_register_aliases,
                     function_facts: self.inputs.function_facts,
                     #[cfg(test)]
-                    certified_rendering_required: self.requires_certified_rendering(),
+                    certified_rendering_required: false,
                 })
             });
             self.state.analysis_ctx = analysis::build_prepared_runtime_facts_with_control(
@@ -10732,10 +10728,6 @@ impl<'a> FoldingContext<'a> {
                             candidate
                         }
                     })
-                    .filter(|candidate| {
-                        !self.requires_certified_rendering()
-                            || !Self::expr_contains_structured_memory_syntax(candidate)
-                    })
                     && (self.prefers_visible_expr(expr, &semantic)
                         || (self.is_low_signal_visible_name(name)
                             && matches!(
@@ -10763,10 +10755,6 @@ impl<'a> FoldingContext<'a> {
                             } else {
                                 candidate
                             }
-                        })
-                        .filter(|candidate| {
-                            !self.requires_certified_rendering()
-                                || !Self::expr_contains_structured_memory_syntax(candidate)
                         })
                         && (self.prefers_visible_expr(expr, &semantic)
                             || (self.is_low_signal_visible_name(name)
@@ -12607,10 +12595,8 @@ impl<'a> FoldingContext<'a> {
         self.sanitize_public_expr(expr, PublicExprSanitizeMode::CallArg)
     }
 
-    fn proven_source_for_public_call_arg_call(&self, expr: &CExpr) -> Option<(u64, usize)> {
-        self.requires_certified_rendering()
-            .then(|| self.certified_source_for_rendered_call_expr(expr, None))
-            .flatten()
+    fn proven_source_for_public_call_arg_call(&self, _expr: &CExpr) -> Option<(u64, usize)> {
+        None
     }
 
     fn sanitize_public_call_arg_call_expr(&self, expr: CExpr) -> CExpr {
@@ -13148,24 +13134,7 @@ impl<'a> FoldingContext<'a> {
                     break;
                 }
                 let return_op_idx = if self.is_control_return_target(target) {
-                    match last_ret_value_op_idx {
-                        Some(op_idx) => op_idx,
-                        None if self.requires_certified_rendering()
-                            && self
-                                .certified_return_expr_for_op(block.addr, op_idx)
-                                .is_some() =>
-                        {
-                            op_idx
-                        }
-                        None if self.requires_certified_rendering() => {
-                            stmts.push(self.certified_residual_comment(format!(
-                                "missing certified value return for control-only exit at 0x{:x}:{}",
-                                block.addr, op_idx
-                            )));
-                            break;
-                        }
-                        None => op_idx,
-                    }
+                    last_ret_value_op_idx.unwrap_or(op_idx)
                 } else {
                     op_idx
                 };
@@ -13562,10 +13531,7 @@ impl<'a> FoldingContext<'a> {
                     return None;
                 }
                 let lhs = self.assignment_lhs_expr(dst);
-                let certified_rhs = self
-                    .requires_certified_rendering()
-                    .then(|| self.render_certified_value_expr_for_var(src))
-                    .flatten();
+                let certified_rhs: Option<CExpr> = None;
                 let rhs_base = if let Some(certified) = certified_rhs {
                     certified
                 } else if dst.is_memory() {
@@ -13643,7 +13609,6 @@ impl<'a> FoldingContext<'a> {
                     .unwrap_or_else(|| type_from_size(dst.size));
                 let rhs = self.render_canonical_load_expr(dst, addr, elem_ty.clone());
                 let rhs = if let CExpr::Var(lhs_name) = &lhs
-                    && !self.requires_certified_rendering()
                     && let Some(source_call) = self
                         .call_result_source_for_ssa_name(&dst.display_name())
                         .or_else(|| self.local_post_call_source_for_ssa_name(&dst.display_name()))
@@ -14010,11 +13975,7 @@ impl<'a> FoldingContext<'a> {
             }
             SSAOp::Subpiece { dst, src, offset } => {
                 let lhs = self.assignment_lhs_expr(dst);
-                let src_expr = self
-                    .requires_certified_rendering()
-                    .then(|| self.render_certified_value_expr_for_var(src))
-                    .flatten()
-                    .unwrap_or_else(|| self.get_expr(src));
+                let src_expr = self.get_expr(src);
                 let rhs = if *offset == 0 && dst.size == src.size {
                     src_expr
                 } else if *offset == 0
@@ -14175,11 +14136,7 @@ impl<'a> FoldingContext<'a> {
                 if_false,
             } => {
                 let lhs = self.assignment_lhs_expr(dst);
-                let certified = |var: &SSAVar| {
-                    self.requires_certified_rendering()
-                        .then(|| self.certified_expr_for_prepared_var(var, 0, &mut BTreeSet::new()))
-                        .flatten()
-                };
+                let certified = |_var: &SSAVar| -> Option<CExpr> { None };
                 let rhs = CExpr::Ternary {
                     cond: Box::new(certified(cond).unwrap_or_else(|| self.get_expr(cond))),
                     then_expr: Box::new(
