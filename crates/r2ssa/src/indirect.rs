@@ -16,8 +16,8 @@
 //! Failing closed is the point. An unproven target set would be a guess about
 //! control flow, and a wrong edge is worse than a missing one.
 
-use crate::block::SSABlock;
 use crate::domtree::DomTree;
+use crate::function::SSABlock;
 use crate::{SSAOp, SSAVar};
 use std::collections::HashMap;
 
@@ -61,6 +61,16 @@ impl Interval {
 pub trait PointerTable {
     fn address(&self) -> u64;
     fn targets(&self) -> &[u64];
+}
+
+impl PointerTable for r2source::SourceCodePointerTable {
+    fn address(&self) -> u64 {
+        Self::address(self)
+    }
+
+    fn targets(&self) -> &[u64] {
+        Self::targets(self)
+    }
 }
 
 /// The exact value a constant carries.
@@ -274,7 +284,6 @@ pub fn resolve_indirect_calls<T: PointerTable>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::block::SSABlock;
 
     struct Table {
         address: u64,
@@ -330,6 +339,7 @@ mod tests {
         let blocks = vec![
             SSABlock {
                 addr: 0,
+                phis: Vec::new(),
                 size: 0x10,
                 ops: vec![
                     SSAOp::IntLess {
@@ -345,11 +355,13 @@ mod tests {
             },
             SSABlock {
                 addr: 0x10,
+                phis: Vec::new(),
                 size: 0x10,
                 ops: vec![SSAOp::Return { target: var("ret") }],
             },
             SSABlock {
                 addr: 0x20,
+                phis: Vec::new(),
                 size: 0x10,
                 ops: vec![
                     SSAOp::IntMult {
@@ -410,6 +422,7 @@ mod tests {
         let callee = var("callee");
         let blocks = vec![SSABlock {
             addr: 0,
+            phis: Vec::new(),
             size: 0x10,
             ops: vec![
                 SSAOp::IntMult {

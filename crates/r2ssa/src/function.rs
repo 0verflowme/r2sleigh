@@ -506,14 +506,14 @@ impl SsaArtifact {
         let native_spans = genuine_native_instruction_spans(lifted);
         let arch = lifted.arch_spec();
         let machine_context = SourceMachineContext::from_blocks_with_interfaces(
-            &blocks,
+            blocks.as_slice(),
             Some(arch),
             Some(function_interface),
             SourceMachineRoles::default(),
             call_site_interfaces,
         );
         let function = SSAFunction::from_blocks_for_decompile_with_interface_and_control(
-            &blocks,
+            blocks.as_slice(),
             Some(arch),
             coherent_function_interface(&machine_context),
             control,
@@ -987,14 +987,14 @@ impl TrustedSsaArtifact {
                 }),
         };
         let machine_context = SourceMachineContext::from_blocks_with_interfaces(
-            &blocks,
+            blocks.as_slice(),
             Some(&arch),
             function_interface,
             *source.machine_roles(),
             call_site_interfaces,
         );
         let mut function = SSAFunction::from_blocks_for_decompile_with_interface_and_control(
-            &blocks,
+            blocks.as_slice(),
             Some(&arch),
             coherent_function_interface(&machine_context),
             control,
@@ -1071,6 +1071,25 @@ impl TrustedSsaArtifact {
     /// Architecture extracted from the same embedded trusted Sleigh profile.
     pub const fn arch_spec(&self) -> &ArchSpec {
         &self.arch
+    }
+
+    /// Every indirect call whose reachable target set this function proves.
+    ///
+    /// The tables come from the source, which can read memory; the range of
+    /// each index comes from the branches that had to be taken to reach the
+    /// call. Both are needed, and only here are both in hand.
+    pub fn resolved_indirect_calls(&self) -> Vec<crate::indirect::ResolvedIndirectCall> {
+        let blocks = self
+            .artifact
+            .function()
+            .blocks()
+            .cloned()
+            .collect::<Vec<_>>();
+        crate::indirect::resolve_indirect_calls(
+            blocks.as_slice(),
+            self.artifact.function().domtree(),
+            self.source().image().code_pointer_tables(),
+        )
     }
 
     pub fn source(&self) -> &OwnedFunctionSnapshot {
@@ -4840,7 +4859,7 @@ mod tests {
         let blocks = controlled_prep_blocks();
         let unchecked = SsaArtifact::for_decompile(&blocks, None).expect("unchecked artifact");
         let controlled = SsaArtifact::for_decompile_with_control(
-            &blocks,
+            blocks.as_slice(),
             None,
             &crate::SsaExecutionControl::default(),
         )
