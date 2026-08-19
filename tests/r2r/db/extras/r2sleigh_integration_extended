@@ -703,3 +703,59 @@ s `afl~alloc_and_copy$[0]` > /dev/null
 pdd | jq -Rs 'test("char ?\\* ?buf = sym\\.imp\\.malloc") and test("size_t len") and (contains("sym.imp.__memcpy_chk(buf, src, len")) '
 EOF_CMDS
 RUN
+
+NAME=dec_authenticate_evaluates_the_call_once
+FILE=bins/vuln_test_x86
+ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
+EXPECT=<<EOF_EXPECT
+true
+EOF_EXPECT
+CMDS=<<EOF_CMDS
+a:sla > /dev/null
+aaa
+s `afl~authenticate$[0]` > /dev/null
+pdd | jq -Rs '([match("sym\\.imp\\.strcmp\\("; "g")] | length) == 1'
+EOF_CMDS
+RUN
+
+NAME=dec_alloc_and_copy_returns_the_slot_not_the_frame_base
+FILE=bins/vuln_test
+ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
+EXPECT=<<EOF_EXPECT
+true
+EOF_EXPECT
+CMDS=<<EOF_CMDS
+a:sla > /dev/null
+aaa
+s `afl~alloc_and_copy$[0]` > /dev/null
+pdd | jq -Rs 'test("return buf;") and (test("buf \\+ 32")|not)'
+EOF_CMDS
+RUN
+
+NAME=dec_authenticate_binds_one_strcmp
+FILE=bins/vuln_test_x86
+ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
+EXPECT=<<EOF_EXPECT
+true
+EOF_EXPECT
+CMDS=<<EOF_CMDS
+a:sla > /dev/null
+aaa
+s `afl~authenticate$[0]` > /dev/null
+pdd | jq -Rs '((split("sym.imp.strcmp(") | length) == 2) and test("= sym\\.imp\\.strcmp\\(")'
+EOF_CMDS
+RUN
+
+NAME=dec_alloc_and_copy_returns_the_buffer_it_allocated
+FILE=bins/vuln_test
+ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
+EXPECT=<<EOF_EXPECT
+true
+EOF_EXPECT
+CMDS=<<EOF_CMDS
+a:sla > /dev/null
+aaa
+s `afl~alloc_and_copy$[0]` > /dev/null
+pdd | jq -Rs 'contains("return buf;") and (contains("- 0x8")|not) and (test("\\*\\(buf \\+")|not)'
+EOF_CMDS
+RUN
