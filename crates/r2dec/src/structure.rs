@@ -2850,6 +2850,16 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                 self.fold_ctx
                     .merged_return_candidate_for_block_slot(pred_addr, summary.slot_offset)
             })?;
+        // What reaches the merged slot is recorded as the SSA carrier that
+        // wrote it, `x8_8`, which is a version of a machine register and not a
+        // name the function declares. Whether that reads as a program name has
+        // been decided elsewhere: while the carrier was also emitted as its own
+        // statement, `x8_8 = len;`, the later single-use fold replaced the
+        // return with the value; once the carrier is inlined instead, the
+        // statement is gone and the return is left naming nothing. Resolving
+        // here says the value in both cases, which is what the assignment
+        // prepended just below has always done with the same expression.
+        let expr = self.fold_ctx.resolve_return_candidate(&expr);
         let stmt = self.prepend_named_merged_slot_assignment_if_needed(stmt, summary, &expr);
         if let Some(rewritten) = self.rewrite_trailing_return_with_merged_expr(&stmt, &expr) {
             return Some(rewritten);

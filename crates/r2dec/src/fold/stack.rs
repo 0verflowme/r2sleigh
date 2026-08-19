@@ -74,7 +74,7 @@ impl<'a> FoldingContext<'a> {
         )
     }
 
-    fn stack_synthetic_name(offset: i64) -> String {
+    pub(super) fn stack_synthetic_name(offset: i64) -> String {
         if offset < 0 {
             format!("local_{:x}", (-offset) as u64)
         } else {

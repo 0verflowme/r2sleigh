@@ -365,6 +365,52 @@ impl<'a> FoldingContext<'a> {
         self.indexed_pointer_add_expr(expr, &CType::u8())
     }
 
+    /// Whether a type says the expression is a pointer, when it says either.
+    ///
+    /// `None` means the type answers nothing -- it is missing, or opaque, or a
+    /// shape that is neither addressable nor countable -- and the caller must
+    /// look elsewhere.
+    fn expr_type_answers_pointer(&self, expr: &CExpr) -> Option<bool> {
+        match self.expr_type_hint(expr)? {
+            CType::Pointer(_) | CType::Array(_, _) => Some(true),
+            CType::Int(_) | CType::UInt(_) | CType::Bool | CType::Enum(_) | CType::Typedef(_) => {
+                Some(false)
+            }
+            _ => None,
+        }
+    }
+
+    fn subscript_expr_for_base_and_index(
+        &self,
+        base: CExpr,
+        index: &CExpr,
+        elem_ty: &CType,
+    ) -> Option<CExpr> {
+        let base_source_ty = self.expr_type_hint(&base);
+        // The pointee names the element only when it is a type an element can
+        // have. `void *` says nothing about what one step is, so the width the
+        // access itself asks for stands.
+        let elem_ty = match &base_source_ty {
+            Some(CType::Pointer(inner)) | Some(CType::Array(inner, _))
+                if !matches!(inner.as_ref(), CType::Void | CType::Unknown) =>
+            {
+                inner.as_ref().clone()
+            }
+            _ => elem_ty.clone(),
+        };
+        let elem_size = elem_ty
+            .bits()
+            .map(|bits| bits.div_ceil(8).max(1))
+            .unwrap_or(1);
+        let index = self.scaled_index_expr(index, elem_size)?;
+        let index = self.normalize_index_expr(&index, 0).unwrap_or(index);
+        let base = self.cast_expr_if_needed(base, CType::ptr(elem_ty), base_source_ty.as_ref());
+        Some(CExpr::Subscript {
+            base: Box::new(base),
+            index: Box::new(index),
+        })
+    }
+
     pub(super) fn indexed_pointer_add_expr(&self, expr: &CExpr, elem_ty: &CType) -> Option<CExpr> {
         let CExpr::Binary {
             op: BinaryOp::Add,
@@ -375,10 +421,31 @@ impl<'a> FoldingContext<'a> {
             return None;
         };
 
-        for (base, index) in [
+        let orientations = [
             (left.as_ref(), right.as_ref()),
             (right.as_ref(), left.as_ref()),
-        ] {
+        ];
+
+        // Which operand is the pointer is a question the types answer whenever
+        // both are typed, and then there is nothing to weigh. `looks_like_pointer`
+        // otherwise falls back to the shape of the name, and on a binary with no
+        // symbols every name is invented in a shape it accepts: `buf + len` read
+        // as two pointers, the first orientation that got past the checks below
+        // decided it, and `buf[len] = 0` came out as `len[buf] = 0` -- a write
+        // through a length. So the typed reading is settled first, and the
+        // name-shaped one only answers what the types leave open.
+        for (base, index) in orientations {
+            let normalized_base = self.normalize_pointer_base_expr(base, 0);
+            if self.expr_type_answers_pointer(&normalized_base) == Some(true)
+                && self.expr_type_answers_pointer(index) == Some(false)
+                && let Some(indexed) =
+                    self.subscript_expr_for_base_and_index(normalized_base, index, elem_ty)
+            {
+                return Some(indexed);
+            }
+        }
+
+        for (base, index) in orientations {
             let normalized_base = self.normalize_pointer_base_expr(base, 0);
             if !(self.looks_like_pointer(&normalized_base)
                 || self.is_non_index_pointer_expr(&normalized_base))
@@ -388,28 +455,12 @@ impl<'a> FoldingContext<'a> {
             if self.looks_like_pointer(index) || self.is_non_index_pointer_expr(index) {
                 continue;
             }
-            let elem_ty = match self.expr_type_hint(&normalized_base) {
-                Some(CType::Pointer(inner)) | Some(CType::Array(inner, _)) => *inner,
-                _ => elem_ty.clone(),
-            };
-            let elem_size = elem_ty
-                .bits()
-                .map(|bits| bits.div_ceil(8).max(1))
-                .unwrap_or(1);
-            let Some(index) = self.scaled_index_expr(index, elem_size) else {
+            let Some(indexed) =
+                self.subscript_expr_for_base_and_index(normalized_base, index, elem_ty)
+            else {
                 continue;
             };
-            let index = self.normalize_index_expr(&index, 0).unwrap_or(index);
-            let base_source_ty = self.expr_type_hint(&normalized_base);
-            let normalized_base = self.cast_expr_if_needed(
-                normalized_base,
-                CType::ptr(elem_ty),
-                base_source_ty.as_ref(),
-            );
-            return Some(CExpr::Subscript {
-                base: Box::new(normalized_base),
-                index: Box::new(index),
-            });
+            return Some(indexed);
         }
 
         None

@@ -2820,19 +2820,26 @@ impl<'a> FoldingContext<'a> {
             let dynamic_owner = self
                 .derive_stable_owned_call_result_name_for_source(aliases.iter())
                 .filter(|name| !self.call_result_owner_candidate_is_stack_storage(name));
-            let owner = prepared_owner.or(dynamic_owner).map(|visible_name| {
-                let kind = self.classify_call_owner_kind(&visible_name);
-                facts
-                    .visible_owner_sources
-                    .insert(visible_name.clone(), source_id);
-                facts
-                    .visible_owner_sources
-                    .insert(visible_name.to_ascii_lowercase(), source_id);
-                facts
-                    .visible_owned_names
-                    .insert(visible_name.to_ascii_lowercase());
-                analysis::CallOwner { visible_name, kind }
-            });
+            // The certified owner is not subject to the invented-name refusal
+            // above. That refusal picks between candidates the fold guessed at;
+            // this one was proven upstream, and only its spelling is invented.
+            let certified_owner = self.certified_stack_owner_visible_name_for_source(source_call);
+            let owner = prepared_owner
+                .or(certified_owner)
+                .or(dynamic_owner)
+                .map(|visible_name| {
+                    let kind = self.classify_call_owner_kind(&visible_name);
+                    facts
+                        .visible_owner_sources
+                        .insert(visible_name.clone(), source_id);
+                    facts
+                        .visible_owner_sources
+                        .insert(visible_name.to_ascii_lowercase(), source_id);
+                    facts
+                        .visible_owned_names
+                        .insert(visible_name.to_ascii_lowercase());
+                    analysis::CallOwner { visible_name, kind }
+                });
 
             facts.call_ownership.insert(
                 source_id,
@@ -7411,13 +7418,53 @@ impl<'a> FoldingContext<'a> {
         self.inputs.call_result_facts()?.owner_for_site(callsite)
     }
 
+    /// The name this function gives the slot a certified fact names as the
+    /// owner of a call's result.
+    ///
+    /// `certified_stack_var_name_for_object_offset` answers only with a
+    /// spelling `r2types` authorized, and authorizing one asks for a slot some
+    /// external source described. A stripped binary offers no such source: the
+    /// slot is real and `owner_for_site` certifies it owns the result -- one
+    /// identity-relation store, no competing candidate -- but every spelling
+    /// available for it is one this crate invented, and those are declined.
+    ///
+    /// Declining the spelling is right. Dropping the owner along with it is
+    /// not. With no owner the call is never bound to a name, so the store that
+    /// fills the slot renders as `local_30 = x0`: `x0` is the machine register
+    /// that carried the result, and no C function declares it. The slot is
+    /// already spelled somewhere in this rendering -- every other access to it
+    /// reads that spelling, and the function declares a local for it -- so the
+    /// owner takes the same name rather than none.
+    fn certified_stack_owner_visible_name_for_source(
+        &self,
+        source_call: (u64, usize),
+    ) -> Option<String> {
+        let r2ssa::ValueOwner::StackSlot { object, offset } =
+            self.certified_call_result_owner_for_source(source_call)?
+        else {
+            return None;
+        };
+        if let Some(authorized) = self.certified_stack_var_name_for_object_offset(*object, *offset)
+        {
+            return Some(authorized);
+        }
+        let recovered = self
+            .resolve_stack_var(*offset)
+            .unwrap_or_else(|| Self::stack_synthetic_name(*offset));
+        (!recovered.is_empty()
+            && !self.is_reserved_param_alias_name(&recovered)
+            && !self.is_transient_visible_name(&recovered)
+            && !self.is_low_signal_visible_name(&recovered))
+        .then_some(recovered)
+    }
+
     fn certified_call_result_owner_expr_for_source(
         &self,
         source_call: (u64, usize),
     ) -> Option<CExpr> {
         match self.certified_call_result_owner_for_source(source_call)? {
-            r2ssa::ValueOwner::StackSlot { object, offset } => self
-                .certified_stack_var_name_for_object_offset(*object, *offset)
+            r2ssa::ValueOwner::StackSlot { .. } => self
+                .certified_stack_owner_visible_name_for_source(source_call)
                 .map(CExpr::Var),
             r2ssa::ValueOwner::Value(value) => {
                 let prepared = self.inputs.prepared_ssa?;
@@ -8541,13 +8588,56 @@ impl<'a> FoldingContext<'a> {
             || lower.ends_with("_home")
     }
 
+    /// The type a name takes from the call whose result it owns.
+    ///
+    /// A local that owns a call result holds what the callee returned, so the
+    /// callee's prototype types it. Often that is the only thing that types it
+    /// at all: on a binary with no symbols nothing else in the function says
+    /// what `malloc` handed back, and the slot then reads as a plain integer,
+    /// which is enough to lose which side of `buf + len` is the pointer.
+    fn owned_call_result_return_type_for_visible_name(&self, name: &str) -> Option<CType> {
+        let source = self.ownership().source_for_visible_owner_name(name)?;
+        let signature = self.known_signature_for_site(source.block_addr, source.op_idx)?;
+        let ty = crate::variable::type_like_to_ctype(&signature.return_type);
+        (!matches!(ty, CType::Unknown | CType::Void)).then_some(ty)
+    }
+
+    /// The type each stack slot takes from the call whose result it owns.
+    ///
+    /// A slot the program fills with a call's result is declared with what the
+    /// callee returns. Without this the slot holding `malloc`'s answer is
+    /// declared `int64_t` and then subscripted, which is not C anyone can
+    /// compile, and the two lines disagree about the same value.
+    pub(crate) fn owned_call_result_types_by_stack_offset(&self) -> HashMap<i64, CType> {
+        let mut types = HashMap::new();
+        for fact in self.ownership().call_ownership.values() {
+            let Some(owner) = fact.owner.as_ref() else {
+                continue;
+            };
+            let Some(offset) = self.stack_offset_for_visible_storage_name(&owner.visible_name)
+            else {
+                continue;
+            };
+            let Some(ty) = self.owned_call_result_return_type_for_visible_name(&owner.visible_name)
+            else {
+                continue;
+            };
+            types.insert(offset, ty);
+        }
+        types
+    }
+
     fn expr_type_hint(&self, expr: &CExpr) -> Option<CType> {
         match expr {
-            CExpr::Var(name) => self.lookup_type_hint(name).cloned().or_else(|| {
-                self.find_ssa_name_for_rendered_alias(name)
-                    .and_then(|ssa_name| self.guess_ssa_var_from_name(&ssa_name))
-                    .and_then(|var| self.type_hint_for_var(&var))
-            }),
+            CExpr::Var(name) => self
+                .lookup_type_hint(name)
+                .cloned()
+                .or_else(|| {
+                    self.find_ssa_name_for_rendered_alias(name)
+                        .and_then(|ssa_name| self.guess_ssa_var_from_name(&ssa_name))
+                        .and_then(|var| self.type_hint_for_var(&var))
+                })
+                .or_else(|| self.owned_call_result_return_type_for_visible_name(name)),
             CExpr::Call { func, .. } => self
                 .known_signature_for_callee_expr(func)
                 .map(|sig| crate::variable::type_like_to_ctype(&sig.return_type)),

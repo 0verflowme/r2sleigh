@@ -3391,11 +3391,13 @@ impl<'a> FoldingContext<'a> {
             return true;
         }
         if let Some(rest) = name.strip_prefix('t') {
-            return rest
-                .chars()
-                .next()
-                .map(|c| c.is_ascii_digit())
-                .unwrap_or(false);
+            // A lifter temporary is spelled `t` followed by whatever the
+            // lifter called it, which is an offset into the unique space,
+            // `t11f80`, or a register-alias slot, `tregalias:100000704:2:0`.
+            // Only the first was recognised here, so a dead assignment to the
+            // second survived this prune and reached the page under a name no
+            // C function declares.
+            return rest.starts_with(|ch: char| ch.is_ascii_digit()) || rest.contains(':');
         }
         false
     }

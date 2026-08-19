@@ -2962,6 +2962,21 @@ impl Decompiler {
             });
             selected
         };
+        // A slot that owns a call result is declared with what the callee
+        // returns; nothing else may know its type on a binary without symbols.
+        let owned_call_result_local_types = fold_ctx.owned_call_result_types_by_stack_offset();
+        let locals = locals
+            .into_iter()
+            .map(|local| {
+                let hint = local
+                    .stack_offset
+                    .and_then(|offset| owned_call_result_local_types.get(&offset));
+                ast::CLocal {
+                    ty: choose_more_specific_runtime_type(local.ty, hint),
+                    ..local
+                }
+            })
+            .collect::<Vec<_>>();
         let mut c_function = CFunction {
             name: func_name,
             ret_type: render_signature
