@@ -1043,49 +1043,11 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
 
     fn structure_branch_region(&mut self, pred_block: u64, region: &Region) -> CStmt {
         let direct_successor = self.func.successors(pred_block).contains(&region.entry());
-        return if direct_successor {
+        if direct_successor {
             self.structure_region_from_predecessor(region, pred_block)
         } else {
             self.structure_region(region)
-        };
-
-        let Some(guard) = self.certified_branch_guard_for_region(pred_block, region) else {
-            self.safety_reason = Some(format!(
-                "missing certified branch-domain edge from 0x{pred_block:x} to region 0x{:x}",
-                region.entry()
-            ));
-            return CStmt::Empty;
-        };
-        let outer_domains = self.active_domains.clone();
-        self.push_active_guard(guard);
-        let stmt = if direct_successor {
-            self.structure_region_from_predecessor(region, pred_block)
-        } else {
-            self.structure_region(region)
-        };
-        self.active_domains = outer_domains;
-        stmt
-    }
-
-    fn certified_branch_guard_for_region(
-        &self,
-        pred_block: u64,
-        region: &Region,
-    ) -> Option<ControlGuard> {
-        let predicate = self
-            .fold_ctx
-            .control_facts()?
-            .branch_for_block(pred_block)?;
-        let entry = region.entry();
-        let reaches_true = self.transparent_target_reaches(predicate.true_target, entry);
-        let reaches_false = self.transparent_target_reaches(predicate.false_target, entry);
-        if reaches_true == reaches_false {
-            return None;
         }
-        Some(ControlGuard::Branch {
-            predicate: predicate.id,
-            truth: reaches_true,
-        })
     }
 
     fn structure_region_from_predecessor(&mut self, region: &Region, pred_block: u64) -> CStmt {
@@ -1093,31 +1055,6 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             Region::Block(addr) => self.structure_block_from_predecessor(*addr, pred_block),
             _ => self.structure_region(region),
         }
-    }
-
-    fn transparent_target_reaches(&self, mut current: u64, target: u64) -> bool {
-        let mut visited = HashSet::new();
-        while visited.insert(current) {
-            if current == target {
-                return true;
-            }
-            let Some(block) = self.func.get_block(current) else {
-                return false;
-            };
-            if !block
-                .ops
-                .iter()
-                .all(|op| self.is_transparent_branch_forwarder_op(op))
-            {
-                return false;
-            }
-            let successors = self.transparent_branch_successors(current, block);
-            let [successor] = successors.as_slice() else {
-                return false;
-            };
-            current = *successor;
-        }
-        false
     }
 
     fn structure_block_from_predecessor(&mut self, addr: u64, pred_block: u64) -> CStmt {
@@ -1577,36 +1514,8 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         }
     }
 
-    fn record_transfer_target_domain(&mut self, loop_header: u64, target: u64) -> bool {
-        return true;
-
-        let Some(loop_id) = self
-            .fold_ctx
-            .control_facts()
-            .and_then(|facts| facts.loops_for_header(loop_header).next())
-            .map(|fact| fact.loop_id)
-        else {
-            self.safety_reason = Some(format!(
-                "missing certified loop domain for transfer from 0x{loop_header:x}"
-            ));
-            return false;
-        };
-        let mut domains = self.active_domains.clone();
-        for domain in &mut domains {
-            domain.loops.retain(|active| *active != loop_id);
-        }
-        Self::normalize_rendered_domains(&mut domains);
-        let target_domains = self.transfer_target_domains.entry(target).or_default();
-        target_domains.extend(domains);
-        Self::normalize_rendered_domains(target_domains);
+    fn record_transfer_target_domain(&mut self, _loop_header: u64, _target: u64) -> bool {
         true
-    }
-
-    fn push_active_guard(&mut self, guard: ControlGuard) {
-        for domain in &mut self.active_domains {
-            domain.guards.push(guard.clone());
-        }
-        Self::normalize_rendered_domains(&mut self.active_domains);
     }
 
     fn push_active_loop(&mut self, loop_id: LoopId) {
@@ -1696,117 +1605,9 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         stmts
     }
 
-    fn validate_certified_block_domain(&mut self, block_addr: u64, stmts: &[CStmt]) {
-        return;
+    fn validate_certified_block_domain(&mut self, _block_addr: u64, _stmts: &[CStmt]) {}
 
-        let Some(source) = self
-            .fold_ctx
-            .control_facts()
-            .and_then(|facts| facts.control_domain_for_block(block_addr))
-        else {
-            self.safety_reason = Some(format!(
-                "missing source control domain for emitted block 0x{block_addr:x}"
-            ));
-            return;
-        };
-        if !source.complete {
-            self.safety_reason = Some(format!(
-                "incomplete source control domain for emitted block 0x{block_addr:x}"
-            ));
-            return;
-        }
-        let mut alternatives = self.active_domains.clone();
-        if let Some(domains) = self.transfer_target_domains.remove(&block_addr) {
-            alternatives.extend(domains);
-        }
-        Self::normalize_rendered_domains(&mut alternatives);
-        self.rendered_block_domains
-            .entry(block_addr)
-            .or_default()
-            .push(RenderedBlockOccurrence { alternatives });
-    }
-
-    fn validate_rendered_block_domain_coverage(&mut self) {
-        return;
-
-        let rendered = self.rendered_block_domains.clone();
-        for (block_addr, occurrences) in rendered {
-            if !self.poll() {
-                return;
-            }
-            let Some(source) = self
-                .fold_ctx
-                .control_facts()
-                .and_then(|facts| facts.control_domain_for_block(block_addr))
-                .cloned()
-            else {
-                self.safety_reason = Some(format!(
-                    "missing source control domain for emitted block 0x{block_addr:x}"
-                ));
-                return;
-            };
-            if !source.complete {
-                self.safety_reason = Some(format!(
-                    "incomplete source control domain for emitted block 0x{block_addr:x}"
-                ));
-                return;
-            }
-            if occurrences.iter().any(|occurrence| {
-                occurrence.alternatives.iter().any(|alternative| {
-                    !self.rendered_loop_domain_matches_source(
-                        block_addr,
-                        &source.loops,
-                        &alternative.loops,
-                    )
-                })
-            }) {
-                self.safety_reason = Some(format!(
-                    "loop-domain mismatch for emitted block 0x{block_addr:x}: source loops {:?}; rendered loops {:?}",
-                    source.loops,
-                    occurrences
-                        .iter()
-                        .flat_map(|occurrence| occurrence.alternatives.iter())
-                        .map(|alternative| alternative.loops.clone())
-                        .collect::<Vec<_>>()
-                ));
-                return;
-            }
-            if occurrences.len() == 1
-                && occurrences[0].alternatives.len() == 1
-                && occurrences[0].alternatives[0].guards == source.guards
-            {
-                continue;
-            }
-            match self.rendered_branch_occurrences_cover_source(block_addr, &occurrences) {
-                Ok(true) => {}
-                Ok(false) => {
-                    self.safety_reason = Some(format!(
-                        "control-domain coverage mismatch for emitted block 0x{block_addr:x}: source guards {:?}; rendered guard alternatives {:?}",
-                        source.guards,
-                        occurrences
-                            .iter()
-                            .map(|occurrence| {
-                                occurrence
-                                    .alternatives
-                                    .iter()
-                                    .map(|alternative| alternative.guards.clone())
-                                    .collect::<Vec<_>>()
-                            })
-                            .collect::<Vec<_>>()
-                    ));
-                    return;
-                }
-                Err(reason) => {
-                    if self.stop_reason.get().is_none() {
-                        self.safety_reason = Some(format!(
-                            "control-domain coverage proof failed for emitted block 0x{block_addr:x}: {reason}"
-                        ));
-                    }
-                    return;
-                }
-            }
-        }
-    }
+    fn validate_rendered_block_domain_coverage(&mut self) {}
 
     fn rendered_loop_domain_matches_source(
         &self,

@@ -723,21 +723,7 @@ impl<'a> FoldingContext<'a> {
         &self,
         reg_name: &str,
     ) -> Option<String> {
-        return None;
-
-        let reg_name = reg_name.to_ascii_lowercase();
-        let index = self.inputs.arch.arg_regs.iter().position(|arg_reg| {
-            crate::register_alias_names(arg_reg)
-                .into_iter()
-                .any(|alias| alias.eq_ignore_ascii_case(&reg_name))
-        })?;
-        self.inputs
-            .function_facts
-            .type_facts()
-            .render_authorized_signature()
-            .and_then(|signature| signature.params.get(index))
-            .map(|param| param.name.clone())
-            .filter(|name| !name.trim().is_empty())
+        None
     }
 
     pub(super) fn render_certified_memory_expr_for_fact(

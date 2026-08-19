@@ -344,30 +344,6 @@ impl<'a> FoldingContext<'a> {
         }
     }
 
-    pub(crate) fn record_call_effect_render_proof(
-        &self,
-        block_addr: u64,
-        op_idx: usize,
-        target: Option<ValueId>,
-        values: Vec<ValueId>,
-        disposition: r2types::CallsiteRenderDisposition,
-    ) {
-        self.effect_render_proofs
-            .borrow_mut()
-            .push(EffectRenderProof {
-                kind: EffectRenderProofKind::Call,
-                block_addr,
-                op_idx,
-                call_disposition: Some(disposition),
-                target,
-                space: None,
-                address: None,
-                value: None,
-                values,
-                phi_edge: None,
-            });
-    }
-
     /// Internal/test convenience constructor. It deliberately has no
     /// source-owned authority and therefore cannot be a public render entry.
     #[cfg(test)]

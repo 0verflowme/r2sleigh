@@ -921,34 +921,6 @@ impl<'a> FoldingContext<'a> {
             .memory_read_for_value_dependency(value)
     }
 
-    pub(super) fn record_certified_call_arg_memory_render_proofs(&self, values: &[r2ssa::ValueId]) {
-        return;
-
-        let mut seen = BTreeSet::new();
-        for value in values {
-            let Some(cert) = self.certified_memory_read_for_value_dependency(*value) else {
-                continue;
-            };
-            let key = (cert.block_addr, cert.op_index, cert.address, cert.value);
-            if seen.insert(key) {
-                self.record_effect_render_proof_for_memory(
-                    EffectRenderProofKind::MemoryRead,
-                    cert.block_addr,
-                    cert.op_index,
-                    cert.space,
-                    cert.address,
-                    cert.value,
-                );
-            }
-        }
-    }
-
-    pub(crate) fn certified_return_for_current_op(&self) -> Option<&ReturnValueRenderFact> {
-        let block_addr = self.current_block_addr.get()?;
-        let op_idx = self.current_op_idx.get()?;
-        self.certified_return_for_op(block_addr, op_idx)
-    }
-
     pub(crate) fn certified_return_for_op(
         &self,
         block_addr: u64,
@@ -959,18 +931,7 @@ impl<'a> FoldingContext<'a> {
     }
 
     pub(crate) fn current_return_target_is_certified(&self, target: &SSAVar) -> bool {
-        return true;
-
-        let Some(cert) = self.certified_return_for_current_op() else {
-            return false;
-        };
-        let Some(value) = self.prepared_value_id_for_var(target) else {
-            return false;
-        };
-        cert.value == value
-            && self
-                .certified_render_context()
-                .is_some_and(|proof| proof.expression_is_renderable(value))
+        true
     }
 
     fn certified_expr_for_prepared_var(
@@ -4899,41 +4860,11 @@ impl<'a> FoldingContext<'a> {
     fn certified_field_name_for_offset(
         &self,
         field_name: String,
-        offset: i64,
-        access_size: Option<u32>,
-        is_write: bool,
+        _offset: i64,
+        _access_size: Option<u32>,
+        _is_write: bool,
     ) -> Option<String> {
-        return Some(field_name);
-
-        let offset = u64::try_from(offset).ok()?;
-        let has_layout_certificate = self.inputs.field_access_certificates.iter().any(|cert| {
-            cert.field_offset == offset
-                && cert.field_name.eq_ignore_ascii_case(&field_name)
-                && access_size.is_none_or(|size| {
-                    cert.field_type
-                        .as_deref()
-                        .and_then(|ty| parse_type_like_spec(ty, self.inputs.arch.ptr_size))
-                        .and_then(|ty| c_type_like_size_bytes(&ty, self.inputs.arch.ptr_size))
-                        .is_none_or(|bytes| bytes == u64::from(size))
-                })
-        });
-        if !has_layout_certificate {
-            return None;
-        }
-        let render_facts = self.inputs.render_facts()?;
-        let block_addr = self.current_block_addr.get()?;
-        let op_idx = self.current_op_idx.get()?;
-        render_facts
-            .member_access_for_op(
-                block_addr,
-                op_idx,
-                is_write,
-                &field_name,
-                offset,
-                access_size,
-            )
-            .is_some()
-            .then_some(field_name)
+        Some(field_name)
     }
 
     pub(super) fn certified_member_field_name_for_current_op_offset(
@@ -4942,75 +4873,17 @@ impl<'a> FoldingContext<'a> {
         access_size: Option<u32>,
         is_write: bool,
     ) -> Option<String> {
-        return None;
-
-        let offset = u64::try_from(offset).ok()?;
-        let render_facts = self.inputs.render_facts()?;
-        let block_addr = self.current_block_addr.get()?;
-        let op_idx = self.current_op_idx.get()?;
-        let mut names = render_facts
-            .member_accesses_by_op
-            .get(&(block_addr, op_idx, is_write))?
-            .iter()
-            .filter_map(|fact| {
-                let memory = render_facts.memory_access(fact.access)?;
-                (memory.block_addr == block_addr
-                    && memory.op_index == op_idx
-                    && memory.is_write == is_write
-                    && memory.object == fact.object
-                    && memory.width == fact.access_width
-                    && fact.field_offset == offset
-                    && access_size.is_none_or(|width| fact.access_width == width))
-                .then(|| fact.field_name.clone())
-            })
-            .collect::<Vec<_>>();
-        names.sort_by_key(|name| name.to_ascii_lowercase());
-        names.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
-        let [field_name] = names.as_slice() else {
-            return None;
-        };
-        self.certified_field_name_for_offset(
-            field_name.clone(),
-            offset as i64,
-            access_size,
-            is_write,
-        )
+        None
     }
 
     fn certified_array_access_for_current_op(
         &self,
-        field_offset: i64,
-        element_stride: u64,
-        access_size: Option<u32>,
-        is_write: bool,
+        _field_offset: i64,
+        _element_stride: u64,
+        _access_size: Option<u32>,
+        _is_write: bool,
     ) -> bool {
-        return true;
-
-        let Ok(field_offset) = u64::try_from(field_offset) else {
-            return false;
-        };
-        if element_stride == 0 {
-            return false;
-        }
-        let Some(render_facts) = self.inputs.render_facts() else {
-            return false;
-        };
-        let Some(block_addr) = self.current_block_addr.get() else {
-            return false;
-        };
-        let Some(op_idx) = self.current_op_idx.get() else {
-            return false;
-        };
-        render_facts
-            .array_access_for_op(
-                block_addr,
-                op_idx,
-                is_write,
-                field_offset,
-                element_stride,
-                access_size,
-            )
-            .is_some()
+        true
     }
 
     fn exact_field_name_from_type_hint(
@@ -5777,99 +5650,13 @@ impl<'a> FoldingContext<'a> {
 
     fn certified_current_array_index_stack_load_value_ref(
         &self,
-        name: &str,
+        _name: &str,
     ) -> Option<analysis::ValueRef> {
-        return None;
-
-        let block_addr = self.current_block_addr.get()?;
-        let op_index = self.current_op_idx.get()?;
-        let render_facts = self.inputs.render_facts()?;
-        let has_array_proof = [false, true].into_iter().any(|is_write| {
-            render_facts
-                .array_accesses_by_op
-                .get(&(block_addr, op_index, is_write))
-                .is_some_and(|facts| !facts.is_empty())
-        });
-        if !has_array_proof {
-            return None;
-        }
-        let offset = self
-            .certified_stack_offset_for_visible_storage_name(name)
-            .or_else(|| Self::autogenerated_stack_home_offset(name))?;
-        let mut objects = render_facts
-            .stack_slots()
-            .filter_map(|(object, _, candidate_offset, _)| {
-                (candidate_offset == offset).then_some(object)
-            })
-            .collect::<Vec<_>>();
-        objects.sort();
-        objects.dedup();
-        let [object] = objects.as_slice() else {
-            return None;
-        };
-
-        let latest_op_index = render_facts
-            .memory_accesses()
-            .filter(|fact| {
-                fact.block_addr == block_addr
-                    && fact.op_index < op_index
-                    && !fact.is_write
-                    && fact.object == *object
-                    && fact.value.is_some()
-            })
-            .map(|fact| fact.op_index)
-            .max()?;
-        let mut values = render_facts
-            .memory_accesses()
-            .filter_map(|fact| {
-                (fact.block_addr == block_addr
-                    && fact.op_index == latest_op_index
-                    && !fact.is_write
-                    && fact.object == *object)
-                    .then_some(fact.value)
-                    .flatten()
-            })
-            .collect::<Vec<_>>();
-        values.sort();
-        values.dedup();
-        let [value] = values.as_slice() else {
-            return None;
-        };
-        let proof = self.certified_render_context()?;
-        if !proof.expression_is_renderable(*value) {
-            return None;
-        }
-        let var = self.prepared_ssa()?.value_var(*value)?.clone();
-        Some(analysis::ValueRef::with_value_id(*value, var))
+        None
     }
 
-    fn certified_stack_owner_value_ref_for_name(&self, name: &str) -> Option<analysis::ValueRef> {
-        return None;
-
-        let render_facts = self.inputs.render_facts()?;
-        let mut objects = render_facts
-            .stack_slots()
-            .filter_map(|(object, _, slot_offset, _)| {
-                self.certified_stack_var_name_for_object_offset(object, slot_offset)
-                    .is_some_and(|owner| owner.eq_ignore_ascii_case(name))
-                    .then_some(object)
-            })
-            .collect::<Vec<_>>();
-        objects.sort();
-        objects.dedup();
-        let [object] = objects.as_slice() else {
-            return None;
-        };
-        let width = render_facts
-            .memory_accesses()
-            .filter(|fact| fact.object == *object && !fact.is_write && fact.width > 0)
-            .map(|fact| fact.width)
-            .min()?;
-        Some(analysis::ValueRef::new(SSAVar::new(
-            name.to_string(),
-            0,
-            width,
-        )))
+    fn certified_stack_owner_value_ref_for_name(&self, _name: &str) -> Option<analysis::ValueRef> {
+        None
     }
 
     fn extract_visible_scaled_index(
@@ -6497,20 +6284,8 @@ impl<'a> FoldingContext<'a> {
             .unwrap_or_else(|| reg_name.to_string())
     }
 
-    fn certified_signature_arg_register_for_param_name(&self, name: &str) -> Option<&str> {
-        return None;
-
-        let signature = self
-            .inputs
-            .function_facts
-            .type_facts()
-            .render_authorized_signature()?;
-        let (idx, _) = signature
-            .params
-            .iter()
-            .enumerate()
-            .find(|(_, param)| param.name.eq_ignore_ascii_case(name))?;
-        self.inputs.arch.arg_regs.get(idx).map(String::as_str)
+    fn certified_signature_arg_register_for_param_name(&self, _name: &str) -> Option<&str> {
+        None
     }
 
     fn infer_subscript_elem_type(&self, base: &SSAVar, element_size: u32) -> CType {
@@ -6779,14 +6554,6 @@ impl<'a> FoldingContext<'a> {
             return Some(*offset);
         }
         self.canonical_stack_offset_for_visible_storage_name(name)
-    }
-
-    fn certified_stack_offset_for_visible_storage_name(&self, name: &str) -> Option<i64> {
-        let offset = self.canonical_stack_offset_for_visible_storage_name(name)?;
-        self.inputs
-            .function_facts
-            .authorized_stack_slot_owner_render_by_offset(offset, name)
-            .map(|authorization| authorization.offset)
     }
 
     fn canonical_stack_offset_for_visible_storage_name(&self, name: &str) -> Option<i64> {
@@ -7228,52 +6995,8 @@ impl<'a> FoldingContext<'a> {
             })
     }
 
-    fn autogenerated_stack_home_offset(name: &str) -> Option<i64> {
-        let lower = name.to_ascii_lowercase();
-        if lower == "saved_fp" {
-            return Some(0);
-        }
-        let parse_hex = |raw: &str| {
-            let suffix = raw.strip_suffix('h').unwrap_or(raw);
-            (!suffix.is_empty())
-                .then(|| i64::from_str_radix(suffix, 16).ok())
-                .flatten()
-        };
-        if let Some(suffix) = lower.strip_prefix("local_") {
-            return parse_hex(suffix).map(|offset| -offset);
-        }
-        if let Some(suffix) = lower.strip_prefix("var_") {
-            return parse_hex(suffix).map(|offset| -offset);
-        }
-        if let Some(suffix) = lower.strip_prefix("arg_") {
-            return parse_hex(suffix).map(|offset| -offset);
-        }
-        if let Some(suffix) = lower.strip_prefix("stack_") {
-            return parse_hex(suffix);
-        }
+    fn certified_autogenerated_stack_storage_offset(&self, _name: &str) -> Option<i64> {
         None
-    }
-
-    fn certified_autogenerated_stack_storage_offset(&self, name: &str) -> Option<i64> {
-        return None;
-
-        let offset = Self::autogenerated_stack_home_offset(name)?;
-        let render_facts = self.inputs.render_facts()?;
-        let mut objects = render_facts
-            .stack_slots()
-            .filter_map(|(object, _, candidate_offset, _)| {
-                (candidate_offset == offset).then_some(object)
-            })
-            .collect::<Vec<_>>();
-        objects.sort();
-        objects.dedup();
-        let [object] = objects.as_slice() else {
-            return None;
-        };
-        render_facts
-            .memory_accesses()
-            .any(|fact| fact.object == *object)
-            .then_some(offset)
     }
 
     fn expr_is_autogenerated_stack_home_expr(&self, expr: &CExpr) -> bool {
@@ -7817,32 +7540,10 @@ impl<'a> FoldingContext<'a> {
 
     fn certified_source_for_rendered_call_expr(
         &self,
-        expr: &CExpr,
-        current_source_call: Option<(u64, usize)>,
+        _expr: &CExpr,
+        _current_source_call: Option<(u64, usize)>,
     ) -> Option<(u64, usize)> {
-        return None;
-
-        if let Some(source_call) = current_source_call
-            && let Some(certified) =
-                self.certified_synthesized_call_expr_for_source_call(source_call)
-            && self.raw_call_exprs_match_for_source_owner_definition(
-                Some(source_call),
-                &certified.expr,
-                expr,
-            )
-        {
-            return Some(source_call);
-        }
-        let CallExprSourceProof::Exact(source_call) = self.source_proof_for_call_expr(expr) else {
-            return None;
-        };
-        let certified = self.certified_synthesized_call_expr_for_source_call(source_call)?;
-        self.raw_call_exprs_match_for_source_owner_definition(
-            Some(source_call),
-            &certified.expr,
-            expr,
-        )
-        .then_some(source_call)
+        None
     }
 
     fn call_owner_definition_args_match(&self, left: &CExpr, right: &CExpr) -> bool {
@@ -8208,19 +7909,9 @@ impl<'a> FoldingContext<'a> {
 
     fn certified_call_result_source_for_stack_owner_alias(
         &self,
-        name: &str,
+        _name: &str,
     ) -> Option<(u64, usize)> {
-        return None;
-
-        let source_call = self
-            .use_info()
-            .call_result_source_for_name(name)
-            .or_else(|| {
-                self.prepared_semantic_view()
-                    .and_then(|view| view.call_result_source_for_name(name))
-            })?;
-        self.has_certified_call_result_owner_fact_for_source(source_call)
-            .then_some(source_call)
+        None
     }
 
     fn call_result_alias_has_stack_owner_provenance(&self, name: &str) -> bool {
@@ -12726,15 +12417,6 @@ impl<'a> FoldingContext<'a> {
         let Some(source_call) = self
             .call_result_source_for_ssa_name(&val_name)
             .or_else(|| self.local_post_call_source_for_ssa_name(&val_name))
-            .or_else(|| {
-                return None;
-
-                let block_addr = self.current_block_addr.get()?;
-                let prepared = self.inputs.prepared_ssa?;
-                let block = prepared.function().get_block(block_addr)?;
-                self.raw_local_post_call_source_for_ssa_name_in_block(block, &val_name, 0)
-                    .filter(|source| self.has_certified_call_result_owner_fact_for_source(*source))
-            })
         else {
             return false;
         };

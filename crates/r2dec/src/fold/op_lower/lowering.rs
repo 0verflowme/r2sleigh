@@ -35,7 +35,7 @@ impl<'a> FoldingContext<'a> {
         block_addr: u64,
         op_idx: usize,
         call: CExpr,
-        certified_args: CertifiedCallArgs,
+        _certified_args: CertifiedCallArgs,
     ) -> LoweredOp {
         if let Some(owner) =
             self.materializable_call_result_expr_for_call_expr((block_addr, op_idx), &call)
@@ -45,77 +45,7 @@ impl<'a> FoldingContext<'a> {
                 rhs: call,
             };
         }
-        return LoweredOp::Expr(call);
-
-        let Some(callsite) = self.certified_callsite_for_op(block_addr, op_idx) else {
-            return LoweredOp::Comment(format!(
-                "r2sleigh residual: missing FunctionFacts callsite for rendered call at 0x{block_addr:x}:{op_idx}"
-            ));
-        };
-        let Some(render_fact) = self.certified_call_render_fact_for_op(block_addr, op_idx) else {
-            return LoweredOp::Comment(format!(
-                "r2sleigh residual: missing FunctionFacts call-render disposition at 0x{block_addr:x}:{op_idx}"
-            ));
-        };
-        if render_fact.target != Some(callsite.target) {
-            return LoweredOp::Comment(format!(
-                "r2sleigh residual: FunctionFacts call-render target mismatch at 0x{block_addr:x}:{op_idx}"
-            ));
-        }
-        let mut render_proof_values = render_fact.proof_values.clone();
-        if let Some(max_arity) = self.non_variadic_call_arity_for_site_with_direct_target(
-            block_addr,
-            op_idx,
-            callsite.direct_target,
-        ) {
-            render_proof_values.truncate(max_arity);
-        }
-        if render_proof_values != certified_args.values {
-            return LoweredOp::Comment(format!(
-                "r2sleigh residual: FunctionFacts call-render argument proof mismatch at 0x{block_addr:x}:{op_idx}"
-            ));
-        }
-
-        match render_fact.disposition {
-            r2types::CallsiteRenderDisposition::AssignedResult => {
-                let Some(owner) =
-                    self.materializable_call_result_expr_for_call_expr((block_addr, op_idx), &call)
-                else {
-                    return LoweredOp::Comment(format!(
-                        "r2sleigh residual: FunctionFacts assigned call lacks materializable call-result owner at 0x{block_addr:x}:{op_idx}"
-                    ));
-                };
-                self.record_call_effect_render_proof(
-                    block_addr,
-                    op_idx,
-                    render_fact.target,
-                    certified_args.values.clone(),
-                    render_fact.disposition,
-                );
-                self.record_certified_call_arg_memory_render_proofs(&certified_args.values);
-                LoweredOp::Assign {
-                    lhs: owner,
-                    rhs: call,
-                }
-            }
-            r2types::CallsiteRenderDisposition::SideEffectStatement => {
-                self.record_call_effect_render_proof(
-                    block_addr,
-                    op_idx,
-                    render_fact.target,
-                    certified_args.values.clone(),
-                    render_fact.disposition,
-                );
-                self.record_certified_call_arg_memory_render_proofs(&certified_args.values);
-                LoweredOp::Expr(call)
-            }
-            r2types::CallsiteRenderDisposition::NestedExpression
-            | r2types::CallsiteRenderDisposition::Suppressed
-            | r2types::CallsiteRenderDisposition::Residualized => LoweredOp::Comment(format!(
-                "r2sleigh residual: FunctionFacts call-render disposition {:?} is not a statement call at 0x{block_addr:x}:{op_idx}",
-                render_fact.disposition
-            )),
-        }
+        LoweredOp::Expr(call)
     }
 
     pub(super) fn lower_op(&self, op: &SSAOp, frame: &mut LowerFrame) -> LoweredOp {

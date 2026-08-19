@@ -410,14 +410,6 @@ impl<'a> FoldingContext<'a> {
         .or_else(|| {
             self.lookup_definition_raw(&val.display_name())
                 .and_then(|expr| self.arg_alias_for_expr(&expr))
-        })
-        .or_else(|| {
-            return None;
-
-            let src = self.prepared_transparent_source_var(val)?;
-            (src.version == 0)
-                .then(|| self.arg_alias_for_register_name(&src.name))
-                .flatten()
         });
         if entry_arg_alias.is_none() {
             return false;
