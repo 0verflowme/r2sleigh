@@ -420,13 +420,7 @@ impl CFG {
             cfg.add_block(bb);
         }
 
-        // Second pass: add edges based on terminators
-        let mut addrs: Vec<u64> = cfg.addr_to_node.keys().copied().collect();
-        addrs.sort_unstable();
-        for addr in addrs {
-            cfg.add_edges_for_block(addr);
-        }
-
+        cfg.rebuild_edges();
         Some(cfg)
     }
 
@@ -436,6 +430,19 @@ impl CFG {
         let idx = self.graph.add_node(block);
         self.addr_to_node.insert(addr, idx);
         idx
+    }
+
+    /// Recompute every edge from the terminators the blocks currently carry.
+    ///
+    /// Edges are a function of the terminators, so a caller that assembles
+    /// blocks itself gets the same graph the block reader builds rather than a
+    /// second way of connecting them.
+    pub fn rebuild_edges(&mut self) {
+        let mut addrs: Vec<u64> = self.addr_to_node.keys().copied().collect();
+        addrs.sort_unstable();
+        for addr in addrs {
+            self.add_edges_for_block(addr);
+        }
     }
 
     /// Add edges for a block based on its terminator.
