@@ -326,14 +326,13 @@ impl SourceTypeGraph {
                     }
                 }
                 SourceTypeKind::Pointer { target_type_id } => {
+                    // `char **argv` is ordinary C, and reachability already walks targets through a visited set
                     if !matches!(source_type.size_bits, 32 | 64)
                         || source_type.align_bits != source_type.size_bits
                         || usize::try_from(target_type_id)
                             .ok()
                             .and_then(|id| types.get(id))
-                            .is_none_or(|target| {
-                                matches!(target.kind, SourceTypeKind::Pointer { .. })
-                            })
+                            .is_none()
                     {
                         return Err(SourceTypeGraphError::InvalidType);
                     }

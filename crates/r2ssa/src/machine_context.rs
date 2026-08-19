@@ -2245,14 +2245,33 @@ mod tests {
     }
 
     #[test]
-    fn source_type_graph_rejects_pointer_to_pointer() {
+    fn source_type_graph_accepts_pointer_to_pointer() {
+        let graph = SourceTypeGraph::new(
+            [
+                SourceType::new(0, SourceTypeKind::SignedInteger, 8, 8),
+                SourceType::new(1, SourceTypeKind::Pointer { target_type_id: 0 }, 64, 64),
+                SourceType::new(2, SourceTypeKind::Pointer { target_type_id: 1 }, 64, 64),
+            ],
+            [],
+        )
+        .expect("char ** is a well formed source type");
+        assert_eq!(
+            graph.types()[2].kind(),
+            SourceTypeKind::Pointer { target_type_id: 1 }
+        );
+        assert!(graph.validates_pointer_width(64));
+    }
+
+    #[test]
+    fn source_type_graph_rejects_pointer_to_absent_target() {
         assert_eq!(
             SourceTypeGraph::new(
-                [
-                    SourceType::new(0, SourceTypeKind::UnsignedInteger, 8, 8),
-                    SourceType::new(1, SourceTypeKind::Pointer { target_type_id: 0 }, 64, 64,),
-                    SourceType::new(2, SourceTypeKind::Pointer { target_type_id: 1 }, 64, 64,),
-                ],
+                [SourceType::new(
+                    0,
+                    SourceTypeKind::Pointer { target_type_id: 1 },
+                    64,
+                    64,
+                )],
                 [],
             ),
             Err(SourceTypeGraphError::InvalidType)
