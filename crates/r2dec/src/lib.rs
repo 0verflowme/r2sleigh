@@ -3275,14 +3275,32 @@ fn collect_visible_stack_offsets(
 /// Propagation is refused when anything between the assignment and the read
 /// writes what the expression reads, because moving a computation past a write
 /// to its own inputs changes what it computes.
+/// Fold a value bound to a name that is read once into the place it is read.
+///
+/// A name assigned once and read once is not a variable of the program, it is
+/// the value itself with a label attached. That is true of the versioned
+/// register carriers this started with, and equally of the temporaries the
+/// lifter leaves behind: `t3e580 = a - b; *p = t3e580;` says no more than
+/// `*p = a - b;` and says it with a name the function never declares.
 fn propagate_single_use_register_carriers(func: &mut CFunction, fold_ctx: &FoldingContext<'_>) {
-    fn visit_block(stmts: &mut Vec<CStmt>, fold_ctx: &FoldingContext<'_>) {
+    let declared = func
+        .params
+        .iter()
+        .map(|param| param.name.clone())
+        .chain(func.locals.iter().map(|local| local.name.clone()))
+        .collect::<std::collections::HashSet<_>>();
+
+    fn visit_block(
+        stmts: &mut Vec<CStmt>,
+        fold_ctx: &FoldingContext<'_>,
+        declared: &std::collections::HashSet<String>,
+    ) {
         for stmt in stmts.iter_mut() {
-            visit_nested(stmt, fold_ctx);
+            visit_nested(stmt, fold_ctx, declared);
         }
         let mut index = 0;
         while index < stmts.len() {
-            let Some((name, value)) = carrier_assignment(&stmts[index], fold_ctx) else {
+            let Some((name, value)) = carrier_assignment(&stmts[index], fold_ctx, declared) else {
                 index += 1;
                 continue;
             };
@@ -3313,46 +3331,53 @@ fn propagate_single_use_register_carriers(func: &mut CFunction, fold_ctx: &Foldi
         }
     }
 
-    fn visit_nested(stmt: &mut CStmt, fold_ctx: &FoldingContext<'_>) {
+    fn visit_nested(
+        stmt: &mut CStmt,
+        fold_ctx: &FoldingContext<'_>,
+        declared: &std::collections::HashSet<String>,
+    ) {
         match stmt {
-            CStmt::Block(stmts) => visit_block(stmts, fold_ctx),
+            CStmt::Block(stmts) => visit_block(stmts, fold_ctx, declared),
             CStmt::If {
                 then_body,
                 else_body,
                 ..
             } => {
-                visit_nested(then_body, fold_ctx);
+                visit_nested(then_body, fold_ctx, declared);
                 if let Some(else_body) = else_body {
-                    visit_nested(else_body, fold_ctx);
+                    visit_nested(else_body, fold_ctx, declared);
                 }
             }
-            CStmt::While { body, .. } | CStmt::DoWhile { body, .. } => visit_nested(body, fold_ctx),
+            CStmt::While { body, .. } | CStmt::DoWhile { body, .. } => {
+                visit_nested(body, fold_ctx, declared)
+            }
             CStmt::For { init, body, .. } => {
                 if let Some(init) = init {
-                    visit_nested(init, fold_ctx);
+                    visit_nested(init, fold_ctx, declared);
                 }
-                visit_nested(body, fold_ctx);
+                visit_nested(body, fold_ctx, declared);
             }
             CStmt::Switch { cases, default, .. } => {
                 for case in cases {
-                    visit_block(&mut case.body, fold_ctx);
+                    visit_block(&mut case.body, fold_ctx, declared);
                 }
                 if let Some(default) = default {
-                    visit_block(default, fold_ctx);
+                    visit_block(default, fold_ctx, declared);
                 }
             }
             _ => {}
         }
     }
 
-    visit_block(&mut func.body, fold_ctx);
+    visit_block(&mut func.body, fold_ctx, &declared);
 }
 
 /// The carrier assigned by this statement, when it is one worth propagating.
-fn carrier_assignment(stmt: &CStmt, fold_ctx: &FoldingContext<'_>) -> Option<(String, CExpr)> {
-    if !fold_ctx.stmt_is_side_effect_free_versioned_register_carrier_for_render(stmt) {
-        return None;
-    }
+fn carrier_assignment(
+    stmt: &CStmt,
+    fold_ctx: &FoldingContext<'_>,
+    declared: &std::collections::HashSet<String>,
+) -> Option<(String, CExpr)> {
     let CStmt::Expr(CExpr::Binary {
         op: BinaryOp::Assign,
         left,
@@ -3364,6 +3389,17 @@ fn carrier_assignment(stmt: &CStmt, fold_ctx: &FoldingContext<'_>) -> Option<(St
     let CExpr::Var(name) = left.as_ref() else {
         return None;
     };
+    // Either a register carrier, which this pass has always folded, or a name
+    // the function never declares -- a temporary the lifter left behind. The
+    // second only qualifies when evaluating it does nothing, since moving a
+    // value to its reader moves whatever computing it does along with it.
+    let is_register_carrier =
+        fold_ctx.stmt_is_side_effect_free_versioned_register_carrier_for_render(stmt);
+    let is_undeclared_temporary =
+        !declared.contains(name) && expr_is_pure_for_dead_local_prune(right);
+    if !is_register_carrier && !is_undeclared_temporary {
+        return None;
+    }
     Some((name.clone(), right.as_ref().clone()))
 }
 
