@@ -3721,7 +3721,17 @@ impl<'a> FoldingContext<'a> {
     }
 
     fn assign_stmt(&self, lhs: CExpr, rhs: CExpr) -> Option<CStmt> {
-        let lhs = self.rewrite_stack_expr(lhs);
+        // Rewriting the target changes which storage the statement writes. The
+        // stack rewriter is right in a value position -- an expression that
+        // computes a frame address may be spelled as the variable living there
+        // -- and wrong here: a temporary that *holds* the address of `x` is not
+        // `x`, and rewriting it produced `x = local_10 + 8`, a statement
+        // assigning a parameter the address of its own home slot. Left as the
+        // temporary it is, the dead address computation is pruned instead.
+        let lhs = match &lhs {
+            CExpr::Var(name) if self.is_prunable_dead_binding_target(name) => lhs,
+            _ => self.rewrite_stack_expr(lhs),
+        };
         let rhs = self.identity_simplify_expr(rhs);
         let rhs = {
             let mut semantic_visited = HashSet::new();
