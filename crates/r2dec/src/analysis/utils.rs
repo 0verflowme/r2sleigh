@@ -562,8 +562,12 @@ pub(crate) fn param_register_alias_for_ssa_name(
 ) -> Option<String> {
     let lower = ssa_name.to_ascii_lowercase();
     param_register_aliases.get(&lower).cloned().or_else(|| {
+        // Only the entry value of the carrier is the parameter. A later version
+        // of the same register is whatever was computed into it since, and
+        // reading the alias off the base name called a call result an argument.
         lower
             .rsplit_once('_')
+            .filter(|(_, version)| *version == "0")
             .and_then(|(base, _)| param_register_aliases.get(base).cloned())
     })
 }
@@ -670,6 +674,16 @@ mod tests {
         assert_eq!(parse_const_offset(&plain), Some(0x100));
         let explicit_dec = SSAVar::new("const:0d100", 0, 8);
         assert_eq!(parse_const_offset(&explicit_dec), Some(100));
+    }
+
+    #[test]
+    fn param_register_alias_only_answers_for_the_entry_value() {
+        let aliases = HashMap::from([("x0".to_string(), "s".to_string())]);
+        assert_eq!(
+            param_register_alias_for_ssa_name("X0_0", &aliases),
+            Some("s".to_string())
+        );
+        assert_eq!(param_register_alias_for_ssa_name("X0_2", &aliases), None);
     }
 
     #[test]
