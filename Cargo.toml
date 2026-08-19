@@ -9,7 +9,6 @@ members = [
     "crates/r2ssa",
     "crates/r2sym",
     "crates/r2types",
-    "crates/r2cert",
     "crates/r2engine",
     "crates/r2dec",
     "r2plugin",

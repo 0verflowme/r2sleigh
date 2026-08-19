@@ -840,21 +840,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "69cdb34c158ceb288df11e18b4bd39de994f6657d83847bdffdbd7f346754b0f"
 
 [[package]]
-name = "r2cert"
-version = "0.1.0"
-dependencies = [
- "r2il",
- "r2ssa",
- "serde",
- "serde_json",
-]
-
-[[package]]
 name = "r2dec"
 version = "0.1.0"
 dependencies = [
  "postcard",
- "r2cert",
  "r2il",
  "r2sleigh-lift",
  "r2source",
