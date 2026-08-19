@@ -298,7 +298,44 @@ pub struct OwnedFunctionImage {
     /// Display data: it tells a renderer what to print where a constant points
     /// at text, and carries no claim about behaviour.
     string_literals: Box<[(u64, String)]>,
+    /// Tables of function pointers the function indexes, with the addresses
+    /// each table holds.
+    ///
+    /// A fact about memory, not about behaviour: it says what the table
+    /// contains, never which entry a given call reaches. That follows from the
+    /// range a caller can prove for the index.
+    code_pointer_tables: Box<[SourceCodePointerTable]>,
     total_source_bytes: usize,
+}
+
+/// One table of function pointers, read where the function points at it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceCodePointerTable {
+    address: u64,
+    entry_size: u32,
+    targets: Box<[u64]>,
+}
+
+impl SourceCodePointerTable {
+    pub fn new(address: u64, entry_size: u32, targets: impl Into<Box<[u64]>>) -> Self {
+        Self {
+            address,
+            entry_size,
+            targets: targets.into(),
+        }
+    }
+
+    pub const fn address(&self) -> u64 {
+        self.address
+    }
+
+    pub const fn entry_size(&self) -> u32 {
+        self.entry_size
+    }
+
+    pub fn targets(&self) -> &[u64] {
+        &self.targets
+    }
 }
 
 impl OwnedFunctionImage {
@@ -308,6 +345,10 @@ impl OwnedFunctionImage {
 
     pub fn string_literals(&self) -> &[(u64, String)] {
         &self.string_literals
+    }
+
+    pub fn code_pointer_tables(&self) -> &[SourceCodePointerTable] {
+        &self.code_pointer_tables
     }
 
     pub const fn blocks(&self) -> &[OwnedFunctionBlock] {
@@ -823,6 +864,7 @@ mod tests {
             },
             OwnedFunctionImage {
                 string_literals: Box::new([]),
+                code_pointer_tables: Box::new([]),
                 entry_address: 0x1000,
                 blocks: vec![OwnedFunctionBlock {
                     address: 0x1000,

@@ -1593,6 +1593,8 @@ unsafe fn capture_image(
         external_exits.push(target);
     }
     Ok(OwnedFunctionImage {
+        // The accessor transport does not read pointer tables; the wire does.
+        code_pointer_tables: Box::new([]),
         // The legacy accessor transport predates the string table; the flat
         // snapshot buffer is the path that carries it.
         string_literals: Box::new([]),

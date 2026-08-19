@@ -346,7 +346,7 @@ use crate::{
     AdvisoryCallPrototype, AdvisoryCallSite, AdvisorySuccessor, AdvisorySuccessorKind,
     CapturedSourceFields, DiagnosticIdentity, FunctionIdentity, FunctionPresentation,
     MachineProfile, OwnedFunctionBlock, OwnedFunctionImage, OwnedFunctionSnapshot,
-    SnapshotValidationError, SourceEndianness, SourceSignatureParameter,
+    SnapshotValidationError, SourceCodePointerTable, SourceEndianness, SourceSignatureParameter,
     SourceSignaturePresentation, SourceStackSlotName,
 };
 
@@ -862,6 +862,19 @@ pub fn write_image(
         writer.u64(*addr);
         writer.string(text)?;
     }
+    let tables = u32::try_from(image.code_pointer_tables().len())
+        .map_err(|_| SnapshotWireError::ValueTooWide)?;
+    writer.u32(tables);
+    for table in image.code_pointer_tables() {
+        writer.u64(table.address());
+        writer.u32(table.entry_size());
+        let targets =
+            u32::try_from(table.targets().len()).map_err(|_| SnapshotWireError::ValueTooWide)?;
+        writer.u32(targets);
+        for target in table.targets() {
+            writer.u64(*target);
+        }
+    }
     let total =
         u64::try_from(image.total_source_bytes()).map_err(|_| SnapshotWireError::ValueTooWide)?;
     writer.u64(total);
@@ -888,6 +901,18 @@ pub fn read_image(
         let addr = reader.u64()?;
         string_literals.push((addr, reader.string()?.to_string()));
     }
+    let table_count = reader.u32()? as usize;
+    let mut code_pointer_tables = Vec::with_capacity(table_count.min(64));
+    for _ in 0..table_count {
+        let address = reader.u64()?;
+        let entry_size = reader.u32()?;
+        let target_count = reader.u32()? as usize;
+        let mut targets = Vec::with_capacity(target_count.min(1024));
+        for _ in 0..target_count {
+            targets.push(reader.u64()?);
+        }
+        code_pointer_tables.push(SourceCodePointerTable::new(address, entry_size, targets));
+    }
     let total_source_bytes =
         usize::try_from(reader.u64()?).map_err(|_| SnapshotWireError::ValueTooWide)?;
     Ok(OwnedFunctionImage {
@@ -895,6 +920,7 @@ pub fn read_image(
         blocks: blocks.into_boxed_slice(),
         external_exits: external_exits.into_boxed_slice(),
         string_literals: string_literals.into_boxed_slice(),
+        code_pointer_tables: code_pointer_tables.into_boxed_slice(),
         total_source_bytes,
     })
 }
@@ -1770,6 +1796,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_pointer_table_round_trips_with_every_target() {
+        let mut writer = SnapshotWireWriter::new();
+        let image = OwnedFunctionImage {
+            entry_address: 0x1000,
+            blocks: Box::new([]),
+            external_exits: Box::new([]),
+            string_literals: Box::new([]),
+            code_pointer_tables: Box::new([SourceCodePointerTable::new(
+                0xc000,
+                8,
+                vec![0x6c8, 0x6e8, 0x708],
+            )]),
+            total_source_bytes: 0,
+        };
+        write_image(&mut writer, &image).expect("write");
+        let buffer = writer.finish().expect("finish");
+        let mut reader = SnapshotWireReader::new(&buffer).expect("header");
+        let decoded = read_image(&mut reader).expect("read");
+        assert_eq!(decoded.code_pointer_tables(), image.code_pointer_tables());
+    }
+
+    #[test]
     fn a_callee_snapshot_rides_inside_its_caller_and_decodes_alone() {
         let root = sample_snapshot(None);
         let callee = sample_snapshot(None);
@@ -2212,6 +2260,7 @@ mod tests {
     fn a_whole_function_image_round_trips() {
         let image = OwnedFunctionImage {
             string_literals: Box::new([(0x1000_2bbc, "secret123".to_string())]),
+            code_pointer_tables: Box::new([]),
             entry_address: 0x1000_07c0,
             blocks: vec![
                 OwnedFunctionBlock {
@@ -2247,6 +2296,7 @@ mod tests {
     fn an_image_truncated_mid_block_is_refused() {
         let image = OwnedFunctionImage {
             string_literals: Box::new([(0x1000_2bbc, "secret123".to_string())]),
+            code_pointer_tables: Box::new([]),
             entry_address: 0x40,
             blocks: vec![OwnedFunctionBlock {
                 address: 0x40,
@@ -2718,6 +2768,7 @@ mod tests {
             },
             OwnedFunctionImage {
                 string_literals: Box::new([]),
+                code_pointer_tables: Box::new([]),
                 entry_address: 0x1000_07c0,
                 blocks: vec![OwnedFunctionBlock {
                     address: 0x1000_07c0,
