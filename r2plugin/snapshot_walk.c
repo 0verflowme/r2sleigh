@@ -204,6 +204,27 @@ static bool walk_image(R2SleighWireWriter *writer, const RAnalFunctionSnapshot *
 	return true;
 }
 
+#define WALK_BASE_FRAME_POINTER 0
+#define WALK_BASE_STACK_POINTER 1
+
+// a named base has no wire counterpart, so a slot measured from one is skipped
+static bool walk_stack_slot_base_tag(int base, uint8_t *out) {
+	switch (base) {
+	case R_ANAL_FCN_BASE_BP:
+		if (out) {
+			*out = WALK_BASE_FRAME_POINTER;
+		}
+		return true;
+	case R_ANAL_FCN_BASE_SP:
+		if (out) {
+			*out = WALK_BASE_STACK_POINTER;
+		}
+		return true;
+	default:
+		return false;
+	}
+}
+
 static bool walk_presentation(R2SleighWireWriter *writer,
 		const RAnalFunctionSnapshot *snapshot) {
 	if (!walk_string (writer, r_anal_function_snapshot_function_name, snapshot)) {
@@ -217,6 +238,7 @@ static bool walk_presentation(R2SleighWireWriter *writer,
 		|| (top.capabilities & R_ANAL_FUNCTION_SNAPSHOT_CAP_EXACT_FUNCTION_INTERFACE) == 0
 		|| !r_anal_function_snapshot_interface_view (snapshot, &interface)) {
 		r2sleigh_wire_u32 (writer, 0);
+		r2sleigh_wire_u32 (writer, 0);
 		return true;
 	}
 	if (interface.num_parameters > UINT32_MAX) {
@@ -228,6 +250,48 @@ static bool walk_presentation(R2SleighWireWriter *writer,
 		if (!r_anal_function_snapshot_parameter_name (snapshot, i, name, sizeof (name))) {
 			return false;
 		}
+		r2sleigh_wire_string (writer, name);
+	}
+	/* A slot the source named is keyed by where it sits, because the interface
+	 * sorts its inventory and a position here would name the wrong slot. */
+	size_t named = 0;
+	for (size_t i = 0; i < top.num_stack_slots; i++) {
+		RAnalSnapshotStackSlotView slot = {0};
+		char name[WALK_NAME_MAX];
+		if (!r_anal_function_snapshot_stack_slot_view (snapshot, i, &slot)) {
+			return false;
+		}
+		if (!slot.offset_valid || !walk_stack_slot_base_tag (slot.base, NULL)) {
+			continue;
+		}
+		if (!r_anal_function_snapshot_stack_slot_string (snapshot, i,
+				R_ANAL_SNAPSHOT_STACK_SLOT_STRING_NAME, name, sizeof (name))
+			|| !*name) {
+			continue;
+		}
+		named++;
+	}
+	if (named > UINT32_MAX) {
+		return false;
+	}
+	r2sleigh_wire_u32 (writer, (uint32_t)named);
+	for (size_t i = 0; i < top.num_stack_slots; i++) {
+		RAnalSnapshotStackSlotView slot = {0};
+		char name[WALK_NAME_MAX];
+		uint8_t base_tag = 0;
+		if (!r_anal_function_snapshot_stack_slot_view (snapshot, i, &slot)) {
+			return false;
+		}
+		if (!slot.offset_valid || !walk_stack_slot_base_tag (slot.base, &base_tag)) {
+			continue;
+		}
+		if (!r_anal_function_snapshot_stack_slot_string (snapshot, i,
+				R_ANAL_SNAPSHOT_STACK_SLOT_STRING_NAME, name, sizeof (name))
+			|| !*name) {
+			continue;
+		}
+		r2sleigh_wire_u8 (writer, base_tag);
+		r2sleigh_wire_i64 (writer, slot.offset);
 		r2sleigh_wire_string (writer, name);
 	}
 	return true;
@@ -265,8 +329,6 @@ bool r2sleigh_wire_write_snapshot_prefix(R2SleighWireWriter *writer, const void 
 #define WALK_TYPE_UNSIGNED 1
 #define WALK_TYPE_POINTER 2
 #define WALK_TYPE_STRUCT 3
-#define WALK_BASE_FRAME_POINTER 0
-#define WALK_BASE_STACK_POINTER 1
 #define WALK_ROLE_UNCLASSIFIED 0
 #define WALK_ROLE_LOCAL 1
 #define WALK_ROLE_PARAMETER_HOME 2
@@ -394,18 +456,11 @@ static bool walk_stack_slot(R2SleighWireWriter *writer, const RAnalFunctionSnaps
 	if (!r_anal_function_snapshot_stack_slot_view (snapshot, index, &view)) {
 		return false;
 	}
-	switch (view.base) {
-	case R_ANAL_FCN_BASE_BP:
-		r2sleigh_wire_u8 (writer, WALK_BASE_FRAME_POINTER);
-		break;
-	case R_ANAL_FCN_BASE_SP:
-		r2sleigh_wire_u8 (writer, WALK_BASE_STACK_POINTER);
-		break;
-	default:
-		/* A named base has no wire counterpart, and coercing it to SP would
-		 * place the slot against a register it is not measured from. */
+	uint8_t base_tag = 0;
+	if (!walk_stack_slot_base_tag (view.base, &base_tag)) {
 		return false;
 	}
+	r2sleigh_wire_u8 (writer, base_tag);
 	RAnalSnapshotRegisterStorageView base_storage = {
 		.name_length = view.base_name_length,
 		.offset = view.base_offset,

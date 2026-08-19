@@ -3225,6 +3225,56 @@ pub struct EngineAnalyzeFunctionRequestInput {
     pub include_interproc_summary_set: bool,
 }
 
+/// Names the source gave its stack slots, keyed the way the renderer looks them up.
+///
+/// These are presentation only: the role comes from the interface so a home or a
+/// saved carrier is not offered as a local, and a name that matches no slot is
+/// not carried at all.
+fn trusted_stack_slot_names(
+    trusted: &r2ssa::TrustedSsaArtifact,
+) -> std::collections::BTreeMap<r2types::StackSlotKey, r2types::ExternalStackSlotSpec> {
+    let snapshot = trusted.source();
+    let Some(interface) = snapshot.function_interface() else {
+        return Default::default();
+    };
+    let mut slots = std::collections::BTreeMap::new();
+    for slot_name in snapshot.presentation().stack_slot_names() {
+        let Some(slot) = interface
+            .stack_slots()
+            .iter()
+            .find(|slot| slot.base() == slot_name.base() && slot.offset() == slot_name.offset())
+        else {
+            continue;
+        };
+        let base = match slot_name.base() {
+            r2ssa::StackAddressBase::FramePointer => r2types::ExternalStackBase::FramePointer,
+            r2ssa::StackAddressBase::StackPointer => r2types::ExternalStackBase::StackPointer,
+        };
+        // A home is the parameter it spills and is named through the parameter
+        // list, so only a slot that stands for itself is named here.
+        let role = match slot.role() {
+            r2ssa::SourceStackSlotRole::Local => r2types::ExternalStackSlotRole::Local,
+            r2ssa::SourceStackSlotRole::UnclassifiedResource => {
+                r2types::ExternalStackSlotRole::Unknown
+            }
+            r2ssa::SourceStackSlotRole::ParameterHome { .. } => continue,
+        };
+        slots.insert(
+            r2types::StackSlotKey {
+                base: base.clone(),
+                offset: slot_name.offset(),
+            },
+            r2types::ExternalStackSlotSpec {
+                name: slot_name.name().to_string(),
+                base,
+                role,
+                ..r2types::ExternalStackSlotSpec::default()
+            },
+        );
+    }
+    slots
+}
+
 impl EngineAnalyzeRequest {
     pub fn full_semantics_from_input(input: EngineAnalyzeRequestInput) -> Self {
         Self::full_semantics(engine_analyze_request_parts_from_input(input))
@@ -3319,7 +3369,10 @@ impl EngineAnalyzeRequest {
         self.source_snapshot = None;
         self.semantic_metadata_enabled = true;
         self.reg_type_hints.clear();
-        self.parsed_context = r2types::ParsedExternalContext::default();
+        self.parsed_context = r2types::ParsedExternalContext {
+            stack_slots: trusted_stack_slot_names(&trusted),
+            ..r2types::ParsedExternalContext::default()
+        };
         self.interproc_max_iterations = self.interproc_max_iterations.max(1);
         self.symbolic_scope = None;
         self.semantic_mode = EngineSemanticMode::Full;

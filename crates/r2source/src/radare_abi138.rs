@@ -876,7 +876,7 @@ unsafe fn capture_stack_slots(
     top: &RadareAbi138SnapshotView,
     exact_roles: bool,
     budget: &mut CaptureBudget,
-) -> Result<Vec<SourceStackSlotSpec>, RadareAbi138CaptureError> {
+) -> Result<(Vec<SourceStackSlotSpec>, Vec<SourceStackSlotName>), RadareAbi138CaptureError> {
     let view_fn = required(accessors.stack_slot_view, "stack_slot_view")?;
     let string_fn = required(accessors.stack_slot_string, "stack_slot_string")?;
     budget.charge(
@@ -885,6 +885,7 @@ unsafe fn capture_stack_slots(
             .ok_or(RadareAbi138CaptureError::BudgetExceeded)?,
     )?;
     let mut slots = Vec::with_capacity(top.num_stack_slots);
+    let mut names = Vec::new();
     for index in 0..top.num_stack_slots {
         let mut view = RadareAbi138StackSlotView::default();
         // SAFETY: index is bounded by the stable top-level view.
@@ -896,8 +897,9 @@ unsafe fn capture_stack_slots(
         if !wire_bool(view.offset_valid)? || (exact_roles && view.size == 0) {
             return Err(RadareAbi138CaptureError::InvalidInterface);
         }
-        // Validate every owned string even though presentation-only fields are
-        // intentionally absent from the semantic stack-slot contract.
+        // Every owned string is validated; the name is kept because presentation
+        // carries it, and the rest have no place in the semantic slot contract.
+        let mut slot_name = String::new();
         for (kind, length) in [
             (0, view.name_length),
             (1, view.type_length),
@@ -906,15 +908,21 @@ unsafe fn capture_stack_slots(
             (4, view.home_reg_length),
         ] {
             // SAFETY: string kind is from the closed schema-12 vocabulary.
-            let _ = unsafe {
+            let string = unsafe {
                 copy_stack_slot_string(snapshot, string_fn, index, kind, length, budget)
             }?;
+            if kind == 0 {
+                slot_name = string;
+            }
         }
         let base = match view.base {
             0 => StackAddressBase::FramePointer,
             1 => StackAddressBase::StackPointer,
             _ => return Err(RadareAbi138CaptureError::InvalidEnum),
         };
+        if !slot_name.is_empty() {
+            names.push(SourceStackSlotName::new(base, view.offset, slot_name));
+        }
         let base_storage = storage(RadareAbi138RegisterStorageView {
             name_length: view.base_name_length,
             offset: view.base_offset,
@@ -970,7 +978,7 @@ unsafe fn capture_stack_slots(
         };
         slots.push(slot);
     }
-    Ok(slots)
+    Ok((slots, names))
 }
 
 unsafe fn capture_return_mechanism(
@@ -1099,7 +1107,11 @@ unsafe fn capture_stack_allocation_contract(
         .map_err(|_| RadareAbi138CaptureError::InvalidInterface)
 }
 
-type CapturedInterface = (SourceFunctionInterface, Box<[Box<str>]>);
+type CapturedInterface = (
+    SourceFunctionInterface,
+    Box<[Box<str>]>,
+    Box<[SourceStackSlotName]>,
+);
 
 /// Read the machine carriers radare2 resolved from its register profile.
 ///
@@ -1310,10 +1322,10 @@ unsafe fn capture_interface(
     };
 
     // SAFETY: slot accessors are required only when exact slot payload is active.
-    let stack_slots = if top.num_stack_slots != 0 {
+    let (stack_slots, stack_slot_names) = if top.num_stack_slots != 0 {
         unsafe { capture_stack_slots(snapshot, accessors, top, exact_slots, budget) }?
     } else {
-        Vec::new()
+        (Vec::new(), Vec::new())
     };
     // SAFETY: type accessors are required only when exact type payload is active.
     let type_graph = if exact_types {
@@ -1442,7 +1454,11 @@ unsafe fn capture_interface(
             budget,
         )
     }?;
-    Ok((interface, parameter_names.into_boxed_slice()))
+    Ok((
+        interface,
+        parameter_names.into_boxed_slice(),
+        stack_slot_names.into_boxed_slice(),
+    ))
 }
 
 unsafe fn capture_image(
@@ -1850,9 +1866,9 @@ pub unsafe fn capture_radare_abi138(
     let machine_roles = unsafe { capture_machine_roles(input.snapshot, &accessors, &first) }?;
     let function_interface = captured_interface
         .as_ref()
-        .map(|(interface, _)| interface.clone());
-    let parameter_names = captured_interface
-        .map(|(_, parameter_names)| parameter_names)
+        .map(|(interface, _, _)| interface.clone());
+    let (parameter_names, stack_slot_names) = captured_interface
+        .map(|(_, parameter_names, slot_names)| (parameter_names, slot_names))
         .unwrap_or_default();
 
     // Repeat the source-owned top view after every deep copy. Minting authority
@@ -1888,6 +1904,7 @@ pub unsafe fn capture_radare_abi138(
         FunctionPresentation {
             display_name: function_name.into_boxed_str(),
             parameter_names,
+            stack_slot_names,
         },
         image,
         advisory_calls,

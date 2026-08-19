@@ -346,7 +346,7 @@ use crate::{
     AdvisoryCallPrototype, AdvisoryCallSite, AdvisorySuccessor, AdvisorySuccessorKind,
     CapturedSourceFields, DiagnosticIdentity, FunctionIdentity, FunctionPresentation,
     MachineProfile, OwnedFunctionBlock, OwnedFunctionImage, OwnedFunctionSnapshot,
-    SnapshotValidationError, SourceEndianness,
+    SnapshotValidationError, SourceEndianness, SourceStackSlotName,
 };
 
 const ENDIAN_LITTLE: u8 = 0;
@@ -497,6 +497,17 @@ pub fn write_presentation(
     for name in presentation.parameter_names() {
         writer.string(name)?;
     }
+    let slots = u32::try_from(presentation.stack_slot_names().len())
+        .map_err(|_| SnapshotWireError::ValueTooWide)?;
+    writer.u32(slots);
+    for slot_name in presentation.stack_slot_names() {
+        writer.u8(match slot_name.base() {
+            StackAddressBase::FramePointer => BASE_FRAME_POINTER,
+            StackAddressBase::StackPointer => BASE_STACK_POINTER,
+        });
+        writer.i64(slot_name.offset());
+        writer.string(slot_name.name())?;
+    }
     Ok(())
 }
 
@@ -509,9 +520,26 @@ pub fn read_presentation(
     for _ in 0..count {
         parameter_names.push(Box::<str>::from(reader.string()?));
     }
+    let slot_count = reader.u32()? as usize;
+    let mut stack_slot_names = Vec::with_capacity(slot_count.min(4096));
+    for _ in 0..slot_count {
+        let base = match reader.u8()? {
+            BASE_FRAME_POINTER => StackAddressBase::FramePointer,
+            BASE_STACK_POINTER => StackAddressBase::StackPointer,
+            tag => {
+                return Err(SnapshotWireError::UnknownDiscriminant {
+                    record: "stack slot name base",
+                    tag: u64::from(tag),
+                });
+            }
+        };
+        let offset = reader.i64()?;
+        stack_slot_names.push(SourceStackSlotName::new(base, offset, reader.string()?));
+    }
     Ok(FunctionPresentation {
         display_name: display_name.into(),
         parameter_names: parameter_names.into_boxed_slice(),
+        stack_slot_names: stack_slot_names.into_boxed_slice(),
     })
 }
 
@@ -1618,6 +1646,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_slot_name_round_trips_keyed_by_where_the_slot_sits() {
+        let mut writer = SnapshotWireWriter::new();
+        let presentation = FunctionPresentation {
+            display_name: "process_string".into(),
+            parameter_names: Box::new([]),
+            stack_slot_names: Box::new([SourceStackSlotName::new(
+                StackAddressBase::StackPointer,
+                -40,
+                "len",
+            )]),
+        };
+        write_presentation(&mut writer, &presentation).expect("write");
+        let buffer = writer.finish().expect("finish");
+        let mut reader = SnapshotWireReader::new(&buffer).expect("header");
+        assert_eq!(read_presentation(&mut reader).expect("read"), presentation);
+    }
+
+    #[test]
     fn an_unknown_discriminant_names_the_record_it_was_read_from() {
         let mut writer = SnapshotWireWriter::new();
         writer.string("x86").expect("arch");
@@ -1881,6 +1927,7 @@ mod tests {
         for names in [Vec::new(), vec!["arr", "idx", "len"]] {
             let presentation = FunctionPresentation {
                 display_name: "safe_array_access".into(),
+                stack_slot_names: Box::new([]),
                 parameter_names: names
                     .iter()
                     .map(|name| Box::<str>::from(*name))
@@ -2508,6 +2555,7 @@ mod tests {
                 display_name: "safe_array_access".into(),
                 // presentation names must match the interface's parameter count,
                 // and must be absent entirely when there is no interface
+                stack_slot_names: Box::new([]),
                 parameter_names: match function_interface.as_ref() {
                     Some(interface) => (0..interface.parameters().len())
                         .map(|index| Box::<str>::from(format!("arg{index}").as_str()))

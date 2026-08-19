@@ -76,6 +76,7 @@ impl FunctionIdentity {
 pub struct FunctionPresentation {
     display_name: Box<str>,
     parameter_names: Box<[Box<str>]>,
+    stack_slot_names: Box<[SourceStackSlotName]>,
 }
 
 impl FunctionPresentation {
@@ -85,6 +86,43 @@ impl FunctionPresentation {
 
     pub fn parameter_names(&self) -> &[Box<str>] {
         &self.parameter_names
+    }
+
+    pub fn stack_slot_names(&self) -> &[SourceStackSlotName] {
+        &self.stack_slot_names
+    }
+}
+
+/// One name the source gave a stack slot, keyed by where the slot sits.
+///
+/// The key is the identity because the interface sorts its inventory, so a
+/// position in this list means nothing on its own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceStackSlotName {
+    base: StackAddressBase,
+    offset: i64,
+    name: Box<str>,
+}
+
+impl SourceStackSlotName {
+    pub fn new(base: StackAddressBase, offset: i64, name: impl Into<Box<str>>) -> Self {
+        Self {
+            base,
+            offset,
+            name: name.into(),
+        }
+    }
+
+    pub const fn base(&self) -> StackAddressBase {
+        self.base
+    }
+
+    pub const fn offset(&self) -> i64 {
+        self.offset
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
     }
 }
 
@@ -489,6 +527,21 @@ impl OwnedFunctionSnapshot {
         {
             return Err(SnapshotValidationError::InvalidPresentation);
         }
+        // A slot name has to name a slot this interface carries, and one slot
+        // cannot answer to two names.
+        let mut named_slots = BTreeSet::new();
+        if presentation.stack_slot_names.iter().any(|slot_name| {
+            slot_name.name().is_empty()
+                || slot_name.name().contains('\0')
+                || !named_slots.insert((slot_name.base(), slot_name.offset()))
+                || function_interface.as_ref().is_none_or(|interface| {
+                    !interface.stack_slots().iter().any(|slot| {
+                        slot.base() == slot_name.base() && slot.offset() == slot_name.offset()
+                    })
+                })
+        }) {
+            return Err(SnapshotValidationError::InvalidPresentation);
+        }
         if source_revision_identity.is_empty() {
             return Err(SnapshotValidationError::EmptyRevisionIdentity);
         }
@@ -668,6 +721,7 @@ mod tests {
             FunctionPresentation {
                 display_name: "fixture".into(),
                 parameter_names: Box::new([]),
+                stack_slot_names: Box::new([]),
             },
             OwnedFunctionImage {
                 string_literals: Box::new([]),
