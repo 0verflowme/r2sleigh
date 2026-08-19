@@ -33,11 +33,7 @@ impl<'a> FoldingContext<'a> {
         let expr = self.normalize_local_branch_expr(expr);
         let expr = self.rewrite_stack_expr(expr);
         let expr = self.rewrite_condition_stack_aliases(expr);
-        let expr = if self.requires_certified_rendering() {
-            expr
-        } else {
-            self.expand_generic_scalar_predicate_aliases(expr, 0)
-        };
+        let expr = self.expand_generic_scalar_predicate_aliases(expr, 0);
         let expr = self.rewrite_call_result_predicate_owners(expr, 0);
         let expr = self.simplify_condition_expr(expr);
         let expr = self.rewrite_call_result_predicate_owners(expr, 0);

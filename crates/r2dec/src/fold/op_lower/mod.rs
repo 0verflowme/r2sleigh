@@ -4219,9 +4219,7 @@ impl<'a> FoldingContext<'a> {
     fn assign_stmt(&self, lhs: CExpr, rhs: CExpr) -> Option<CStmt> {
         let lhs = self.rewrite_stack_expr(lhs);
         let rhs = self.identity_simplify_expr(rhs);
-        let rhs = if self.requires_certified_rendering() {
-            rhs
-        } else {
+        let rhs = {
             let mut semantic_visited = HashSet::new();
             self.semanticize_visible_expr(&rhs, 0, &mut semantic_visited)
         };
@@ -13171,20 +13169,7 @@ impl<'a> FoldingContext<'a> {
                 } else {
                     op_idx
                 };
-                let certified_return_expr = if self.requires_certified_rendering() {
-                    match self.certified_return_expr_for_op(block.addr, return_op_idx) {
-                        Some(certified) => Some(certified),
-                        None => {
-                            stmts.push(self.certified_residual_comment(format!(
-                                "uncertified return expression at 0x{:x}:{}",
-                                block.addr, return_op_idx
-                            )));
-                            break;
-                        }
-                    }
-                } else {
-                    None
-                };
+                let certified_return_expr = None;
 
                 if !self.current_return_target_is_certified(target) {
                     stmts.push(self.certified_residual_comment(format!(
@@ -13234,9 +13219,7 @@ impl<'a> FoldingContext<'a> {
                         .map(|cert| cert.value);
                     (expr, value)
                 };
-                let final_expr = if self.requires_certified_rendering() {
-                    expr
-                } else {
+                let final_expr = {
                     let normalized = self.normalize_final_return_candidate(expr.clone());
                     self.sanitize_final_return_expr(normalized, expr)
                 };
@@ -13308,19 +13291,10 @@ impl<'a> FoldingContext<'a> {
             && !stmts.iter().any(|stmt| matches!(stmt, CStmt::Return(_)))
             && let Some(expr) = last_ret_value
         {
-            let return_expr = if self.requires_certified_rendering() {
-                last_ret_value_op_idx.and_then(|op_idx| {
-                    self.certified_return_expr_for_op(block.addr, op_idx)
-                        .map(|(certified_expr, value)| (certified_expr, Some(value)))
-                })
-            } else {
-                Some((expr, None))
-            };
+            let return_expr = Some((expr, None));
 
             if let Some((expr, certified_value)) = return_expr {
-                let final_expr = if self.requires_certified_rendering() {
-                    expr
-                } else {
+                let final_expr = {
                     let normalized = self.normalize_final_return_candidate(expr.clone());
                     self.sanitize_final_return_expr(normalized, expr)
                 };
@@ -13667,50 +13641,7 @@ impl<'a> FoldingContext<'a> {
                 let elem_ty = self
                     .type_hint_for_var(dst)
                     .unwrap_or_else(|| type_from_size(dst.size));
-                let rhs = if self.requires_certified_rendering() {
-                    let Some(fact) = self.certified_memory_access_for_current_op(false) else {
-                        let refusal = self.certified_memory_render_refusal_for_current_op(false);
-                        return Some(self.certified_residual_comment(format!(
-                            "uncertified memory load at 0x{:x}:{} ({})",
-                            self.current_block_addr.get().unwrap_or_default(),
-                            self.current_op_idx.get().unwrap_or_default(),
-                            refusal
-                        )));
-                    };
-                    let elem_ty = self
-                        .inputs
-                        .render_facts()
-                        .and_then(|render| render.memory_value_type(fact.access))
-                        .map(crate::type_like_to_ctype)
-                        .unwrap_or(elem_ty);
-                    let Some(rhs) =
-                        self.render_certified_memory_expr_for_fact(fact, elem_ty.clone())
-                    else {
-                        let refusal = self.certified_memory_render_refusal_for_current_op(false);
-                        return Some(self.certified_residual_comment(format!(
-                            "uncertified memory load at 0x{:x}:{} ({})",
-                            self.current_block_addr.get().unwrap_or_default(),
-                            self.current_op_idx.get().unwrap_or_default(),
-                            refusal
-                        )));
-                    };
-                    self.record_effect_render_proof_for_memory(
-                        EffectRenderProofKind::MemoryRead,
-                        fact.block_addr,
-                        fact.op_index,
-                        fact.space,
-                        fact.address,
-                        fact.value,
-                    );
-                    if let Some(value) = self.prepared_value_id_for_var(dst) {
-                        self.load_expr_memo
-                            .borrow_mut()
-                            .insert((value, elem_ty.to_string()), rhs.clone());
-                    }
-                    rhs
-                } else {
-                    self.render_canonical_load_expr(dst, addr, elem_ty.clone())
-                };
+                let rhs = self.render_canonical_load_expr(dst, addr, elem_ty.clone());
                 let rhs = if let CExpr::Var(lhs_name) = &lhs
                     && !self.requires_certified_rendering()
                     && let Some(source_call) = self
@@ -13757,54 +13688,8 @@ impl<'a> FoldingContext<'a> {
                     .type_hint_for_var(val)
                     .unwrap_or_else(|| type_from_size(val.size));
                 let mut certified_store_fact = None;
-                let lhs = if self.requires_certified_rendering() {
-                    let Some(fact) = self.certified_memory_access_for_current_op(true) else {
-                        let refusal = self.certified_memory_render_refusal_for_current_op(true);
-                        return Some(self.certified_residual_comment(format!(
-                            "uncertified memory store at 0x{:x}:{} ({})",
-                            self.current_block_addr.get().unwrap_or_default(),
-                            self.current_op_idx.get().unwrap_or_default(),
-                            refusal
-                        )));
-                    };
-                    let elem_ty = self
-                        .inputs
-                        .render_facts()
-                        .and_then(|render| render.memory_value_type(fact.access))
-                        .map(crate::type_like_to_ctype)
-                        .unwrap_or(elem_ty);
-                    let Some(lhs) =
-                        self.render_certified_memory_expr_for_fact(fact, elem_ty.clone())
-                    else {
-                        let refusal = self.certified_memory_render_refusal_for_current_op(true);
-                        return Some(self.certified_residual_comment(format!(
-                            "uncertified memory store at 0x{:x}:{} ({})",
-                            self.current_block_addr.get().unwrap_or_default(),
-                            self.current_op_idx.get().unwrap_or_default(),
-                            refusal
-                        )));
-                    };
-                    certified_store_fact = Some((
-                        fact.block_addr,
-                        fact.op_index,
-                        fact.space,
-                        fact.address,
-                        fact.value,
-                    ));
-                    lhs
-                } else {
-                    self.render_canonical_store_target_expr(addr, val.size, elem_ty.clone())
-                };
-                let mut rhs = if self.requires_certified_rendering() {
-                    let Some(rhs) = self.render_certified_value_expr_for_var(val) else {
-                        return Some(self.certified_residual_comment(format!(
-                            "uncertified memory store value at 0x{:x}:{}",
-                            self.current_block_addr.get().unwrap_or_default(),
-                            self.current_op_idx.get().unwrap_or_default()
-                        )));
-                    };
-                    rhs
-                } else if let CExpr::Var(lhs_name) = &lhs
+                let lhs = self.render_canonical_store_target_expr(addr, val.size, elem_ty.clone());
+                let mut rhs = if let CExpr::Var(lhs_name) = &lhs
                     && let Some(source_call) = self
                         .call_result_source_for_ssa_name(&val.display_name())
                         .or_else(|| self.local_post_call_source_for_ssa_name(&val.display_name()))
@@ -13820,8 +13705,7 @@ impl<'a> FoldingContext<'a> {
                                 offset < 0
                                     && !self.is_autogenerated_stack_home_name(lhs_name)
                                     && !lhs_name.ends_with("_home")
-                            }))
-                {
+                            })) {
                     self.call_result_exprs_map()
                         .get(&source_call)
                         .cloned()

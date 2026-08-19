@@ -982,20 +982,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                 }
                 self.record_loop_render_proof(*header, predicate, condition_value, body);
 
-                let loop_id = if self.fold_ctx.requires_certified_rendering() {
-                    self.fold_ctx
-                        .control_facts()
-                        .and_then(|facts| facts.loops_for_header(*header).next())
-                        .map(|fact| fact.loop_id)
-                } else {
-                    None
-                };
-
-                let body_guard = if self.fold_ctx.requires_certified_rendering() {
-                    self.certified_branch_guard_for_region(*header, body)
-                } else {
-                    None
-                };
+                let loop_id = None;
 
                 let outer_domains = self.active_domains.clone();
                 if let Some(loop_id) = loop_id {
@@ -1012,9 +999,6 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                         return CStmt::Empty;
                     }
                 };
-                if let Some(guard) = &body_guard {
-                    self.push_active_guard(guard.clone());
-                }
                 let body_stmt = Self::strip_trailing_continue(self.structure_loop_body(body));
                 self.active_domains = outer_domains;
                 CStmt::while_loop(cond, body_stmt)
@@ -1033,14 +1017,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                 let anchor = body.entry();
                 self.record_loop_render_proof(anchor, predicate, condition_value, body);
 
-                let loop_id = if self.fold_ctx.requires_certified_rendering() {
-                    self.fold_ctx
-                        .control_facts()
-                        .and_then(|facts| facts.loops_for_header(anchor).next())
-                        .map(|fact| fact.loop_id)
-                } else {
-                    None
-                };
+                let loop_id = None;
 
                 let outer_domains = self.active_domains.clone();
                 if let Some(loop_id) = loop_id {
@@ -1391,27 +1368,9 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                 continue;
             };
             let value_expr = CExpr::IntLit(*case_value as i64);
-            let guard = if self.fold_ctx.requires_certified_rendering() {
-                self.certified_switch_guard_for_region(
-                    switch_block,
-                    case_region,
-                    Some(*case_value),
-                    false,
-                )
-            } else {
-                None
-            };
-
-            if let Some(guard) = &guard {
-                self.push_active_guard(guard.clone());
-            }
             let case_stmt = self.structure_region(case_region);
             self.active_domains = outer_domains;
-            let body = if self.fold_ctx.requires_certified_rendering() {
-                vec![case_stmt]
-            } else {
-                vec![case_stmt, CStmt::Break]
-            };
+            let body = vec![case_stmt, CStmt::Break];
             switch_cases.push(crate::ast::SwitchCase {
                 value: value_expr,
                 body,
@@ -1420,15 +1379,6 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
 
         let default_body = if let Some(region) = default {
             let outer_domains = self.active_domains.clone();
-            let guard = if self.fold_ctx.requires_certified_rendering() {
-                self.certified_switch_guard_for_region(switch_block, region, None, true)
-            } else {
-                None
-            };
-
-            if let Some(guard) = &guard {
-                self.push_active_guard(guard.clone());
-            }
             let stmt = self.structure_region(region);
             self.active_domains = outer_domains;
             Some(vec![stmt])
@@ -2928,23 +2878,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             then_pred.is_some_and(|pred| self.has_merged_register_return_expr(merge_block, pred));
         let mut else_can_rewrite =
             else_pred.is_some_and(|pred| self.has_merged_register_return_expr(merge_block, pred));
-        let certified_branch = if self.fold_ctx.requires_certified_rendering() {
-            if !then_can_rewrite || !else_can_rewrite {
-                return None;
-            }
-            let (cond, predicate, condition_value) =
-                self.get_branch_condition_with_predicate(cond_block);
-            let cond = cond?;
-            let proof =
-                self.certified_branch_render_proof(cond_block, predicate, condition_value)?;
-            Some((cond, proof))
-        } else {
-            None
-        };
         let control_proof_checkpoint = self.control_render_proofs.len();
-        if let Some((_, proof)) = &certified_branch {
-            self.control_render_proofs.push(proof.clone());
-        }
 
         let mut then_stmt = self.structure_region(then_region);
         let mut else_stmt = self.structure_region(else_region);
@@ -2986,11 +2920,8 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             return None;
         }
 
-        let (cond, predicate, condition_value) = if let Some((cond, _)) = certified_branch {
-            (Some(cond), None, None)
-        } else {
-            self.get_branch_condition_with_predicate(cond_block)
-        };
+        let (cond, predicate, condition_value) =
+            self.get_branch_condition_with_predicate(cond_block);
         let cond = cond?;
         let if_stmt = CStmt::If {
             cond,
