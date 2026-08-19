@@ -892,7 +892,8 @@ unsafe fn capture_stack_slots(
             unsafe { view_fn(snapshot, index, &mut view) },
             "stack_slot_view",
         )?;
-        if !wire_bool(view.offset_valid)? || view.size == 0 {
+        // only an exact role inventory needs each slot's reach, so keep the rest
+        if !wire_bool(view.offset_valid)? || (exact_roles && view.size == 0) {
             return Err(RadareAbi138CaptureError::InvalidInterface);
         }
         // Validate every owned string even though presentation-only fields are

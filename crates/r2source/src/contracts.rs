@@ -951,9 +951,10 @@ impl SourceFunctionInterface {
             return Err(SourceFunctionInterfaceError::OverlappingRegisterStorages);
         }
         let mut stack_slots = stack_slots.into_iter().collect::<Vec<_>>();
+        // size zero means the extent was never established, which only an exact role claim may refuse
         if stack_slots.iter().any(|slot| {
             !valid_register_storage(slot.base_storage)
-                || slot.size_bytes == 0
+                || (require_exact_stack_slot_roles && slot.size_bytes == 0)
                 || slot
                     .offset
                     .checked_add(i64::from(slot.size_bytes))
@@ -1678,6 +1679,45 @@ mod tests {
         .and_then(|interface| interface.with_return_address_storage(register_storage(80, 8)))
         .and_then(|interface| interface.with_stack_pointer_storage(register_storage(72, 8)))
         .expect("exact return carriers")
+    }
+
+    #[test]
+    fn slot_of_unestablished_extent_is_kept_without_an_exact_role_claim() {
+        let stack_pointer = register_storage(72, 8);
+        let slots = [
+            SourceStackSlotSpec::new(StackAddressBase::StackPointer, stack_pointer, -40, 0),
+            SourceStackSlotSpec::new(StackAddressBase::StackPointer, stack_pointer, -16, 8),
+        ];
+        let interface = SourceFunctionInterface::new(
+            b"revision".to_vec(),
+            "amd64",
+            [],
+            SourceFunctionReturn::Void,
+            slots,
+        )
+        .expect("a located slot of unknown extent is still a fact");
+        assert_eq!(interface.stack_slots().len(), 2);
+        assert!(!interface.stack_slot_roles_complete());
+    }
+
+    #[test]
+    fn exact_role_claim_refuses_a_slot_of_unestablished_extent() {
+        let stack_pointer = register_storage(72, 8);
+        assert_eq!(
+            SourceFunctionInterface::new_exact(
+                b"revision".to_vec(),
+                "amd64",
+                [],
+                SourceFunctionReturn::Void,
+                [SourceStackSlotSpec::new_local(
+                    StackAddressBase::StackPointer,
+                    stack_pointer,
+                    -40,
+                    0,
+                )],
+            ),
+            Err(SourceFunctionInterfaceError::InvalidStackSlot)
+        );
     }
 
     #[test]
