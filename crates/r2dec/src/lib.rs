@@ -1397,6 +1397,13 @@ fn count_residual_markers(stmts: &[CStmt]) -> usize {
 /// structurer marks the individual constructs it could not prove, and this
 /// records whether the kernel certified the function at all.
 ///
+/// A shared empty name table for fixtures that carry no recovered names.
+#[cfg(test)]
+pub(crate) fn empty_display_names() -> &'static r2types::DisplayNames {
+    static EMPTY: std::sync::OnceLock<r2types::DisplayNames> = std::sync::OnceLock::new();
+    EMPTY.get_or_init(r2types::DisplayNames::default)
+}
+
 /// State what the rendering did and did not show.
 ///
 /// "Nothing was marked" and "everything was shown to be right" are different
@@ -2615,18 +2622,6 @@ impl Decompiler {
         }
     }
 
-    #[cfg(test)]
-    fn build_function_internal(
-        &self,
-        input: &DecompilerInput,
-        semantic_route: &DecompileRouteFacts,
-    ) -> CFunction {
-        let control = r2ssa::SsaExecutionControl::default();
-        let work = DecompileWorkControl::new(&control, DecompileWorkPhase::Normalization);
-        self.build_function_internal_with_control(input, semantic_route, work)
-            .expect("default decompiler control never stops")
-    }
-
     fn build_function_internal_with_control<'a>(
         &self,
         input: &'a DecompilerInput,
@@ -3551,12 +3546,6 @@ fn fold_constant_arithmetic_in_expr(
     {
         *expr = CExpr::StringLit(text.clone());
     }
-}
-
-/// No spellings, for the fixtures that render without a source snapshot.
-pub(crate) fn empty_display_names() -> &'static r2types::DisplayNames {
-    static EMPTY: std::sync::OnceLock<r2types::DisplayNames> = std::sync::OnceLock::new();
-    EMPTY.get_or_init(r2types::DisplayNames::default)
 }
 
 /// How many times `name` is read across these statements.

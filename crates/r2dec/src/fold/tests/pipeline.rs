@@ -584,21 +584,6 @@ mod tests {
         prepared_x86_with_stack_slot(&[entry], &arch, base, offset, 8).with_name(name)
     }
 
-    fn prepared_zero_arg_helper_return(name: &str) -> SourceOwnedPreparedFixture {
-        let arch = make_test_arch_x86_64();
-        let mut entry = R2ILBlock::new(0x1000, 4);
-        entry.push(R2ILOp::Copy {
-            dst: Varnode::unique(1, 8),
-            src: Varnode::constant(0x401050, 8),
-        });
-        entry.push(R2ILOp::Call {
-            target: Varnode::unique(1, 8),
-        });
-        entry.push(R2ILOp::Return {
-            target: Varnode::register(0x00, 8),
-        });
-        prepared_from_r2il_blocks(&[entry], &arch).with_name(name)
-    }
 
     fn result_call_arg(
         expr: CExpr,
@@ -1054,9 +1039,6 @@ mod tests {
         mutate_function_facts(ctx, |function_facts| function_facts.set_call_results(facts));
     }
 
-    fn remove_function_call_result_facts(ctx: &mut FoldingContext<'_>) {
-        install_function_call_result_facts(ctx, r2types::FunctionCallResultFacts::default());
-    }
 
     fn install_function_call_render_facts(
         ctx: &mut FoldingContext<'_>,
@@ -1065,9 +1047,6 @@ mod tests {
         mutate_function_facts(ctx, |function_facts| function_facts.set_call_render(facts));
     }
 
-    fn remove_function_call_render_facts(ctx: &mut FoldingContext<'_>) {
-        install_function_call_render_facts(ctx, r2types::FunctionCallRenderFacts::default());
-    }
 
     fn install_function_control_facts(
         ctx: &mut FoldingContext<'_>,
@@ -5363,16 +5342,6 @@ mod tests {
         assert!(!ctx.stmt_is_side_effect_free_versioned_register_carrier(&local));
     }
 
-    #[test]
-    fn generated_carrier_name_uses_colon_rule_for_raw_storage_names() {
-        assert!(is_generated_carrier_name("tmp:raw_1"));
-        assert!(is_generated_carrier_name("unique:raw_1"));
-        assert!(is_generated_carrier_name("space1:20"));
-        assert!(is_generated_carrier_name("value_3"));
-        assert!(is_generated_carrier_name("t19"));
-        assert!(!is_generated_carrier_name("tmp_loop"));
-        assert!(!is_generated_carrier_name("rax_1"));
-    }
 
     #[test]
     fn switch_selector_simplification_uses_typed_static_table_base_names() {
@@ -19443,209 +19412,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn certified_return_requires_function_render_facts_not_prepared_certificate_only() {
-        let arch = make_test_arch_x86_64();
-        let mut entry = R2ILBlock::new(0x1000, 4);
-        entry.push(R2ILOp::Copy {
-            dst: Varnode::register(0x00, 8),
-            src: Varnode::constant(7, 8),
-        });
-        entry.push(R2ILOp::Return {
-            target: Varnode::register(0x00, 8),
-        });
 
-        let prepared = prepared_from_r2il_blocks(&[entry], &arch)
-            .with_name("certified_return_without_function_render_facts");
-        let return_cert = prepared
-            .return_certificate_for_op(0x1000, 1)
-            .expect("fixture must still carry prepared SSA return certificate");
-        let mut ctx = make_x86_64_ctx_with_prepared(&prepared);
-        install_certified_function_facts(&mut ctx);
-        remove_function_render_facts(&mut ctx);
 
-        assert_eq!(
-            ctx.certified_return_expr_for_op(return_cert.block_addr, return_cert.op_index),
-            None,
-            "prepared SSA return/expression certificates alone must not authorize certified executable return rendering"
-        );
-    }
 
-    #[test]
-    fn certified_return_drops_only_root_abi_widening_carrier() {
-        let arch = make_test_arch_x86_64();
-        let mut entry = R2ILBlock::new(0x1000, 4);
-        entry.push(R2ILOp::Copy {
-            dst: Varnode::register(0x00, 4),
-            src: Varnode::constant(7, 4),
-        });
-        entry.push(R2ILOp::IntZExt {
-            dst: Varnode::register(0x00, 8),
-            src: Varnode::register(0x00, 4),
-        });
-        entry.push(R2ILOp::Return {
-            target: Varnode::register(0x00, 8),
-        });
-        let prepared = prepared_from_r2il_blocks(&[entry], &arch).with_name("abi_return_carrier");
-        let mut ctx = make_x86_64_ctx_with_prepared(&prepared);
-        install_certified_function_facts(&mut ctx);
-        ctx.inputs.function_return_type = Some(Box::leak(Box::new(CType::Int(32))));
-        let return_cert = prepared
-            .return_certificate_for_op(0x1000, 2)
-            .expect("return certificate");
 
-        let (expr, _) = ctx
-            .certified_return_expr_for_op(return_cert.block_addr, return_cert.op_index)
-            .expect("certified return expression");
-
-        assert!(
-            matches!(expr, CExpr::IntLit(7) | CExpr::UIntLit(7)),
-            "top-level 32-to-64 ABI carrier should not leak into an int32 return: {expr:?}"
-        );
-    }
-
-    #[test]
-    fn certified_return_preserves_nested_semantic_widening() {
-        let arch = make_test_arch_x86_64();
-        let mut entry = R2ILBlock::new(0x1000, 4);
-        entry.push(R2ILOp::Copy {
-            dst: Varnode::register(0x00, 4),
-            src: Varnode::constant(7, 4),
-        });
-        entry.push(R2ILOp::IntZExt {
-            dst: Varnode::unique(0x100, 8),
-            src: Varnode::register(0x00, 4),
-        });
-        entry.push(R2ILOp::IntDiv {
-            dst: Varnode::unique(0x108, 8),
-            a: Varnode::unique(0x100, 8),
-            b: Varnode::constant(2, 8),
-        });
-        entry.push(R2ILOp::Trunc {
-            dst: Varnode::register(0x00, 4),
-            src: Varnode::unique(0x108, 8),
-        });
-        entry.push(R2ILOp::IntZExt {
-            dst: Varnode::register(0x00, 8),
-            src: Varnode::register(0x00, 4),
-        });
-        entry.push(R2ILOp::Return {
-            target: Varnode::register(0x00, 8),
-        });
-        let prepared =
-            prepared_from_r2il_blocks(&[entry], &arch).with_name("semantic_widening_return");
-        let mut ctx = make_x86_64_ctx_with_prepared(&prepared);
-        install_certified_function_facts(&mut ctx);
-        ctx.inputs.function_return_type = Some(Box::leak(Box::new(CType::Int(32))));
-        let return_cert = prepared
-            .return_certificate_for_op(0x1000, 5)
-            .expect("return certificate");
-
-        let (expr, _) = ctx
-            .certified_return_expr_for_op(return_cert.block_addr, return_cert.op_index)
-            .expect("certified return expression");
-        let mut has_nested_i64_cast = false;
-        expr.visit(&mut |node| {
-            if matches!(
-                node,
-                CExpr::Cast {
-                    ty: CType::Int(64),
-                    ..
-                }
-            ) {
-                has_nested_i64_cast = true;
-            }
-        });
-
-        assert!(
-            has_nested_i64_cast,
-            "widening used by 64-bit return arithmetic is semantic, not an ABI carrier: {expr:?}"
-        );
-    }
-
-    #[test]
-    fn certified_return_call_requires_function_call_result_fact() {
-        let prepared = prepared_zero_arg_helper_return("certified_return_call_result");
-        let mut ctx = make_x86_64_ctx_with_prepared(&prepared);
-        assert!(
-            ctx.inputs.function_facts.call_results().is_some(),
-            "source-owned finalization must retain the exact call-result evidence"
-        );
-        install_certified_function_facts(&mut ctx);
-        let source_call = (0x1000, 1);
-        ctx.set_function_names(HashMap::from([(0x401050, "sym.helper".to_string())]));
-        install_callsite_resolution(&mut ctx, source_call, 0x401050, "sym.helper", None);
-
-        let return_cert = prepared
-            .certificates()
-            .returns
-            .first()
-            .expect("return certificate");
-        let prepared_result = prepared
-            .call_result_certificate_for_value(return_cert.value)
-            .expect("fixture must return the certified call-result value");
-        assert!(
-            prepared_result.relation.is_identity(),
-            "fixture must return the certified call-result value"
-        );
-        let function_result = ctx
-            .certified_call_result_fact_for_value(return_cert.value)
-            .expect("FunctionFacts must retain the exact call-result value");
-        assert_eq!(function_result.relation, prepared_result.relation);
-        assert!(
-            ctx.inputs
-                .function_facts
-                .render_facts()
-                .certified_expr_for_value(return_cert.value)
-                .is_some_and(|cert| cert
-                    .bindings
-                    .contains(&r2ssa::SemanticId::call(prepared_result.call_site))),
-            "the result expression must remain bound to its stable call identity"
-        );
-
-        assert_eq!(
-            ctx.certified_return_expr_for_op(return_cert.block_addr, return_cert.op_index),
-            Some((
-                CExpr::call(CExpr::Var("sym.helper".to_string()), Vec::new()),
-                return_cert.value,
-            )),
-            "FunctionFacts call-result evidence should authorize returning the synthesized helper call"
-        );
-    }
-
-    #[test]
-    fn certified_return_call_rejects_prepared_certificate_without_function_fact() {
-        let prepared = prepared_zero_arg_helper_return("certified_return_call_result_without_fact");
-        let mut ctx = make_x86_64_ctx_with_prepared(&prepared);
-        install_certified_function_facts(&mut ctx);
-        remove_function_call_result_facts(&mut ctx);
-        let source_call = (0x1000, 1);
-        ctx.set_function_names(HashMap::from([(0x401050, "sym.helper".to_string())]));
-        install_callsite_resolution(&mut ctx, source_call, 0x401050, "sym.helper", None);
-
-        let return_cert = prepared
-            .certificates()
-            .returns
-            .first()
-            .expect("return certificate");
-        assert!(
-            prepared
-                .call_result_certificate_for_value(return_cert.value)
-                .is_some(),
-            "fixture must still have the prepared SSA call-result certificate"
-        );
-        assert_eq!(
-            ctx.certified_call_result_fact_for_value(return_cert.value),
-            None,
-            "negative fixture must remove canonical FunctionFacts call-result evidence"
-        );
-
-        assert_eq!(
-            ctx.certified_return_expr_for_op(return_cert.block_addr, return_cert.op_index),
-            None,
-            "prepared SSA call-result certificates alone must not authorize executable return-call rendering"
-        );
-    }
 
     fn install_hash_field_layout(ctx: &mut FoldingContext<'_>) {
         ctx.inputs.param_register_aliases = Box::leak(Box::new(HashMap::from([

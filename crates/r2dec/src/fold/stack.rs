@@ -234,33 +234,6 @@ impl<'a> FoldingContext<'a> {
             })
     }
 
-    fn certified_stack_var_name_for_offset(&self, offset: i64) -> Option<String> {
-        let function_facts = self.inputs.function_facts;
-        let mut matching_objects = function_facts
-            .render_facts()
-            .stack_slots()
-            .filter_map(|(object, _, slot_offset, _)| (slot_offset == offset).then_some(object));
-        if let Some(object) = matching_objects.next()
-            && matching_objects.next().is_none()
-            && let Some(authorization) =
-                function_facts.authorized_stack_param_owner_render(object, offset)
-        {
-            return Some(authorization.name);
-        }
-        self.certified_stack_owner_candidate_names(offset)
-            .into_iter()
-            .filter(|name| {
-                !name.is_empty()
-                    && !self.is_reserved_param_alias_name(name)
-                    && !super::op_lower::is_generic_stack_placeholder_alias(name)
-            })
-            .find(|name| {
-                function_facts
-                    .authorized_stack_slot_owner_render_by_offset(offset, name)
-                    .is_some()
-            })
-    }
-
     pub(super) fn is_reserved_param_alias_name(&self, name: &str) -> bool {
         let lower = name.to_ascii_lowercase();
         self.inputs

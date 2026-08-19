@@ -2774,24 +2774,6 @@ mod tests {
         }
     }
 
-    fn planner_request(kind: u32) -> R2SleighPlannerQueryRequestV2 {
-        R2SleighPlannerQueryRequestV2 {
-            abi_version: R2SLEIGH_ABI_V2,
-            struct_size: u32_size::<R2SleighPlannerQueryRequestV2>(),
-            schema_version: R2SLEIGH_PLANNER_QUERY_SCHEMA_V2,
-            kind,
-            ..R2SleighPlannerQueryRequestV2::default()
-        }
-    }
-
-    fn planner_query_for(
-        request: &R2SleighPlannerQueryRequestV2,
-    ) -> (u32, R2SleighPlannerQueryResponseV2) {
-        let mut response = R2SleighPlannerQueryResponseV2::default();
-        let status = (API_V2.planner_query)(request, &mut response);
-        (status, response)
-    }
-
     #[test]
     fn wrong_session_version_is_rejected_without_allocating() {
         let mut config = config();

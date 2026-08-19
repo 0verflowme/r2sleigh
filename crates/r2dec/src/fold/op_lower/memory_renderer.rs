@@ -798,41 +798,6 @@ impl<'a> FoldingContext<'a> {
         Some(CExpr::Var(name))
     }
 
-    pub(super) fn certified_memory_render_refusal_for_current_op(&self, is_write: bool) -> String {
-        let Some(block_addr) = self.current_block_addr.get() else {
-            return "missing current block".to_string();
-        };
-        let Some(op_idx) = self.current_op_idx.get() else {
-            return "missing current op".to_string();
-        };
-        let Some(fact) = self.certified_memory_access_for_current_op(is_write) else {
-            return format!("missing FunctionRenderFacts memory fact at 0x{block_addr:x}:{op_idx}");
-        };
-        if fact.space != r2il::SpaceId::Ram {
-            return format!("unsupported exact memory space {}", fact.space);
-        }
-        let (array_fact_count, member_fact_count) = self
-            .inputs
-            .render_facts()
-            .map(|render| {
-                (
-                    render
-                        .array_accesses_by_op
-                        .get(&(block_addr, op_idx, is_write))
-                        .map_or(0, Vec::len),
-                    render
-                        .member_accesses_by_op
-                        .get(&(block_addr, op_idx, is_write))
-                        .map_or(0, Vec::len),
-                )
-            })
-            .unwrap_or((0, 0));
-        format!(
-            "memory access lacks exact typed stack owner or array/member render proof; array_facts {} member_facts {}",
-            array_fact_count, member_fact_count
-        )
-    }
-
     fn certified_const_value_for_address_var(&self, var: &SSAVar, depth: u32) -> Option<u64> {
         if depth > 4 {
             return None;

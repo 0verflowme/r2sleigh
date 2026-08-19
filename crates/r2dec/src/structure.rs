@@ -529,29 +529,6 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             ));
     }
 
-    fn branch_render_proof(
-        &self,
-        anchor: u64,
-        condition: Option<PredicateId>,
-        condition_value: Option<ValueId>,
-    ) -> ControlRenderProof {
-        ControlRenderProof::branch_proof(anchor, condition, condition_value)
-    }
-
-    fn certified_branch_render_proof(
-        &self,
-        anchor: u64,
-        condition: Option<PredicateId>,
-        condition_value: Option<ValueId>,
-    ) -> Option<ControlRenderProof> {
-        let proof = self.branch_render_proof(anchor, condition, condition_value);
-        let predicate = self.fold_ctx.control_facts()?.branch_for_block(anchor)?;
-        (predicate.comparison.is_some()
-            && Some(predicate.id) == proof.branch_condition
-            && Some(predicate.condition) == proof.branch_condition_value)
-            .then_some(proof)
-    }
-
     fn record_loop_render_proof(
         &mut self,
         anchor: u64,
@@ -580,43 +557,6 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             loop_latches,
             loop_exits,
         )
-    }
-
-    fn certified_loop_render_proof(
-        &self,
-        anchor: u64,
-        condition: Option<PredicateId>,
-        condition_value: Option<ValueId>,
-        body: &Region,
-    ) -> Option<ControlRenderProof> {
-        let facts = self.fold_ctx.control_facts()?;
-        // Prefer canonical LoopCertificate body/latches/exits when available.
-        // Match on header only: loop header uniquely identifies the natural loop.
-        // condition/condition_value use different ID spaces (r2il vs SSA) and may differ.
-        if let Some(cert) = facts.loops.values().find(|fact| fact.header == anchor) {
-            return Some(ControlRenderProof::loop_proof(
-                anchor,
-                condition,
-                condition_value,
-                cert.body.clone(),
-                cert.latches.clone(),
-                cert.exits.clone(),
-            ));
-        }
-        // Fallback: compute from structurer and require exact match
-        let proof = self.loop_render_proof(anchor, condition, condition_value, body);
-        facts
-            .loops
-            .values()
-            .any(|fact| {
-                fact.header == proof.anchor
-                    && fact.condition == proof.loop_condition
-                    && fact.condition_value == proof.loop_condition_value
-                    && fact.body == proof.loop_body_blocks
-                    && fact.latches == proof.loop_latches
-                    && fact.exits == proof.loop_exits
-            })
-            .then_some(proof)
     }
 
     fn canonical_loop_body_blocks(&self, anchor: u64, body: &Region) -> Vec<u64> {
@@ -657,25 +597,6 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         switch_cases.sort_unstable();
         let switch_default = default.map(Region::entry);
         ControlRenderProof::switch_proof(anchor, selector, switch_cases, switch_default)
-    }
-
-    fn certified_switch_render_proof(
-        &self,
-        anchor: u64,
-        selector: Option<ValueId>,
-        cases: &[(Option<u64>, Box<Region>)],
-        default: Option<&Region>,
-    ) -> Option<ControlRenderProof> {
-        let proof = self.switch_render_proof(anchor, selector, cases, default);
-        let facts = self.fold_ctx.control_facts()?;
-        facts.switches.get(&anchor).and_then(|fact| {
-            let mut fact_cases = fact.cases.clone();
-            fact_cases.sort_unstable();
-            (fact.selector == proof.switch_selector
-                && fact_cases == proof.switch_cases
-                && fact.default == proof.switch_default)
-                .then_some(proof)
-        })
     }
 
     fn sorted_region_blocks_with_anchor(anchor: u64, region: &Region) -> Vec<u64> {
@@ -2044,37 +1965,6 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         Ok(source_formula == rendered_formula)
     }
 
-    fn certified_switch_guard_for_region(
-        &self,
-        switch_block: u64,
-        region: &Region,
-        case_value: Option<u64>,
-        is_default: bool,
-    ) -> Option<ControlGuard> {
-        let domain = self
-            .fold_ctx
-            .control_facts()?
-            .control_domain_for_block(region.entry())?;
-        domain.guards.iter().find_map(|guard| {
-            let ControlGuard::SwitchArm {
-                block_addr,
-                case_values,
-                includes_default,
-            } = guard
-            else {
-                return None;
-            };
-            let matches = block_addr == &switch_block
-                && if is_default {
-                    *includes_default && case_values.is_empty()
-                } else {
-                    !includes_default
-                        && case_value.is_some_and(|value| case_values.contains(&value))
-                };
-            matches.then(|| guard.clone())
-        })
-    }
-
     /// Get the branch condition from a block.
     fn get_branch_condition(&mut self, addr: u64) -> Option<CExpr> {
         self.get_branch_condition_with_predicate(addr).0
@@ -3136,33 +3026,6 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                 .fold_ctx
                 .merged_return_candidate_for_block_slot(pred_addr, summary.slot_offset)
                 .is_some()
-    }
-
-    fn certified_region_terminates_with_slot_merge(
-        &self,
-        region: &Region,
-        summary: &crate::analysis::FrameSlotMergeSummary,
-    ) -> bool {
-        let predecessor = self.unique_region_predecessor_to_merge(region, summary.merge_block_addr);
-        if let Some(pred) = predecessor
-            && self.has_merged_slot_return_expr(region, pred, summary)
-        {
-            return true;
-        }
-        match region {
-            Region::Sequence(regions) => regions.last().is_some_and(|tail| {
-                self.certified_region_terminates_with_slot_merge(tail, summary)
-            }),
-            Region::IfThenElse {
-                then_region,
-                else_region: Some(else_region),
-                ..
-            } => {
-                self.certified_region_terminates_with_slot_merge(then_region, summary)
-                    && self.certified_region_terminates_with_slot_merge(else_region, summary)
-            }
-            _ => false,
-        }
     }
 
     fn append_merged_register_return_if_needed(
@@ -4778,16 +4641,6 @@ mod tests {
         );
     }
 
-    fn install_function_facts(ctx: &mut FoldingContext<'_>, facts: r2types::FunctionFacts) {
-        ctx.inputs.function_facts = Box::leak(Box::new(facts));
-        ctx.inputs.certified_rendering_required = false;
-    }
-
-    fn install_typed_function_facts(ctx: &mut FoldingContext<'_>, facts: r2types::FunctionFacts) {
-        install_function_facts(ctx, facts);
-        ctx.inputs.certified_rendering_required = true;
-    }
-
     fn test_arch() -> ArchSpec {
         let mut arch = ArchSpec::new("x86-64");
         arch.add_register(RegisterDef::new("RAX", 0x00, 8));
@@ -4796,62 +4649,6 @@ mod tests {
         arch.add_register(RegisterDef::new("RSP", 0x28, 8));
         arch.add_register(RegisterDef::new("RIP", 0x30, 8));
         arch
-    }
-
-    fn exact_test_interface(revision: &[u8]) -> r2ssa::SourceFunctionInterface {
-        let storage = |offset| r2ssa::CanonicalStorageId {
-            space: r2ssa::CanonicalStorageSpace::Register,
-            offset,
-            size: 8,
-        };
-        r2ssa::SourceFunctionInterface::new_exact(
-            revision.to_vec(),
-            "sysv64",
-            [r2ssa::SourceAbiParameterSpec::new(0, storage(0x10))],
-            r2ssa::SourceFunctionReturn::Register {
-                storage: storage(0),
-            },
-            [],
-        )
-        .and_then(|interface| interface.with_return_address_storage(storage(0x30)))
-        .and_then(|interface| interface.with_stack_pointer_storage(storage(0x28)))
-        .expect("exact test source interface")
-    }
-
-    fn prepared_with_exact_interface(
-        blocks: &[R2ILBlock],
-        revision: &[u8],
-        name: &str,
-    ) -> SsaArtifact {
-        SsaArtifact::for_decompile_with_interface(
-            blocks,
-            Some(&test_arch()),
-            exact_test_interface(revision),
-        )
-        .expect("prepared source-owned artifact")
-        .with_name(name)
-    }
-
-    fn source_owned_test_facts(
-        prepared: SsaArtifact,
-        reason: &str,
-    ) -> (Arc<SsaArtifact>, r2types::SourceOwnedFunctionFacts) {
-        let source = Arc::new(prepared);
-        let request = r2types::TypeWritebackAnalysisRequest::new(
-            Arc::clone(&source),
-            r2types::ParsedExternalContext::default(),
-        )
-        .expect("matching source assumptions");
-        let owner = r2types::build_source_owned_type_writeback_analysis(request)
-            .expect("source-owned type analysis")
-            .finalize_for_decompile(r2types::DecompileFinalization {
-                kind: r2types::DecompileRouteKind::Standard,
-                reason: reason.to_string(),
-                fallback_comment: None,
-            })
-            .expect("source-owned decompile facts");
-        assert!(owner.shares_source(&source));
-        (source, owner)
     }
 
     fn function_with_switch_block_and_unrelated_sub() -> SSAFunction {
@@ -4904,106 +4701,6 @@ mod tests {
         )
         .expect("ssa function")
         .with_name("switch_unrelated_sub_demo")
-    }
-
-    fn prepared_with_switch_block_and_cases() -> SsaArtifact {
-        let mut switch_block = R2ILBlock::new(0x1000, 4);
-        switch_block.push(R2ILOp::BranchInd {
-            target: Varnode::register(0x10, 8),
-        });
-        switch_block.set_switch_info(r2il::SwitchInfo {
-            switch_addr: 0x1000,
-            min_val: 0,
-            max_val: 1,
-            default_target: None,
-            cases: vec![
-                r2il::SwitchCase {
-                    value: 0,
-                    target: 0x1010,
-                },
-                r2il::SwitchCase {
-                    value: 1,
-                    target: 0x1020,
-                },
-            ],
-        });
-
-        let mut case_zero = R2ILBlock::new(0x1010, 4);
-        case_zero.push(R2ILOp::Return {
-            target: Varnode::constant(0, 8),
-        });
-        let mut case_one = R2ILBlock::new(0x1020, 4);
-        case_one.push(R2ILOp::Return {
-            target: Varnode::constant(1, 8),
-        });
-
-        prepared_with_exact_interface(
-            &[switch_block, case_zero, case_one],
-            b"certified-switch-structuring",
-            "certified_switch_structuring",
-        )
-    }
-
-    fn prepared_with_conditional_return_blocks(
-        cond_block: u64,
-        true_target: u64,
-        false_target: u64,
-    ) -> SsaArtifact {
-        let mut cond = R2ILBlock::new(cond_block, 4);
-        cond.push(R2ILOp::IntEqual {
-            dst: Varnode::register(0x80, 1),
-            a: Varnode::register(0x10, 8),
-            b: Varnode::constant(0, 8),
-        });
-        cond.push(R2ILOp::CBranch {
-            target: Varnode::constant(true_target, 8),
-            cond: Varnode::register(0x80, 1),
-        });
-
-        let mut false_block = R2ILBlock::new(false_target, 4);
-        false_block.push(R2ILOp::Return {
-            target: Varnode::constant(0, 8),
-        });
-
-        let mut true_block = R2ILBlock::new(true_target, 4);
-        true_block.push(R2ILOp::Return {
-            target: Varnode::constant(1, 8),
-        });
-
-        prepared_with_exact_interface(
-            &[cond, false_block, true_block],
-            b"certified-branch-structuring",
-            "certified_branch_structuring",
-        )
-    }
-
-    fn prepared_with_guarded_while_loop() -> SsaArtifact {
-        let mut header = R2ILBlock::new(0x1000, 4);
-        header.push(R2ILOp::IntEqual {
-            dst: Varnode::register(0x80, 1),
-            a: Varnode::register(0x10, 8),
-            b: Varnode::constant(0, 8),
-        });
-        header.push(R2ILOp::CBranch {
-            target: Varnode::constant(0x1008, 8),
-            cond: Varnode::register(0x80, 1),
-        });
-
-        let mut body = R2ILBlock::new(0x1004, 4);
-        body.push(R2ILOp::Branch {
-            target: Varnode::constant(0x1000, 8),
-        });
-
-        let mut exit = R2ILBlock::new(0x1008, 4);
-        exit.push(R2ILOp::Return {
-            target: Varnode::constant(0, 8),
-        });
-
-        prepared_with_exact_interface(
-            &[header, body, exit],
-            b"certified-loop-structuring",
-            "certified_loop_structuring",
-        )
     }
 
     fn function_with_transparent_branch_to_merge() -> SSAFunction {
@@ -5169,85 +4866,6 @@ mod tests {
                     || default
                         .as_ref()
                         .is_some_and(|body| body.iter().any(stmt_contains_loop))
-            }
-            _ => false,
-        }
-    }
-
-    fn stmt_contains_if(stmt: &CStmt) -> bool {
-        match stmt {
-            CStmt::If { .. } => true,
-            CStmt::Block(stmts) => stmts.iter().any(stmt_contains_if),
-            CStmt::While { body, .. } | CStmt::For { body, .. } | CStmt::DoWhile { body, .. } => {
-                stmt_contains_if(body)
-            }
-            CStmt::Switch { cases, default, .. } => {
-                cases
-                    .iter()
-                    .any(|case| case.body.iter().any(stmt_contains_if))
-                    || default
-                        .as_ref()
-                        .is_some_and(|body| body.iter().any(stmt_contains_if))
-            }
-            _ => false,
-        }
-    }
-
-    fn stmt_contains_comment(stmt: &CStmt, needle: &str) -> bool {
-        match stmt {
-            CStmt::Comment(text) => text.contains(needle),
-            CStmt::Block(stmts) => stmts.iter().any(|stmt| stmt_contains_comment(stmt, needle)),
-            CStmt::If {
-                then_body,
-                else_body,
-                ..
-            } => {
-                stmt_contains_comment(then_body, needle)
-                    || else_body
-                        .as_deref()
-                        .is_some_and(|stmt| stmt_contains_comment(stmt, needle))
-            }
-            CStmt::While { body, .. } | CStmt::For { body, .. } | CStmt::DoWhile { body, .. } => {
-                stmt_contains_comment(body, needle)
-            }
-            CStmt::Switch { cases, default, .. } => {
-                cases.iter().any(|case| {
-                    case.body
-                        .iter()
-                        .any(|stmt| stmt_contains_comment(stmt, needle))
-                }) || default
-                    .as_ref()
-                    .is_some_and(|body| body.iter().any(|stmt| stmt_contains_comment(stmt, needle)))
-            }
-            _ => false,
-        }
-    }
-
-    fn stmt_contains_unproved_control_transfer(stmt: &CStmt) -> bool {
-        match stmt {
-            CStmt::Break | CStmt::Continue | CStmt::Goto(_) => true,
-            CStmt::Block(stmts) => stmts.iter().any(stmt_contains_unproved_control_transfer),
-            CStmt::If {
-                then_body,
-                else_body,
-                ..
-            } => {
-                stmt_contains_unproved_control_transfer(then_body)
-                    || else_body
-                        .as_deref()
-                        .is_some_and(stmt_contains_unproved_control_transfer)
-            }
-            CStmt::While { body, .. } | CStmt::DoWhile { body, .. } | CStmt::For { body, .. } => {
-                stmt_contains_unproved_control_transfer(body)
-            }
-            CStmt::Switch { cases, default, .. } => {
-                cases.iter().any(|case| {
-                    case.body
-                        .iter()
-                        .any(stmt_contains_unproved_control_transfer)
-                }) || default
-                    .as_ref()
-                    .is_some_and(|body| body.iter().any(stmt_contains_unproved_control_transfer))
             }
             _ => false,
         }

@@ -724,41 +724,6 @@ impl<'a> FoldingContext<'a> {
         self.compare_provenance_expr_from_operands(prov, lhs, rhs)
     }
 
-    fn certified_compare_provenance_expr(
-        &self,
-        prov: &PredicateComparisonFact,
-        block_addr: Option<u64>,
-    ) -> Option<CExpr> {
-        let lhs_var = self.prepared_var_for_value_id(prov.lhs)?;
-        let rhs_var = self.prepared_var_for_value_id(prov.rhs)?;
-        let compare_width = lhs_var.size.max(rhs_var.size);
-        let lhs = self.certified_predicate_operand_expr(lhs_var, compare_width, block_addr)?;
-        let rhs = self.certified_predicate_operand_expr(rhs_var, compare_width, block_addr)?;
-        self.compare_provenance_expr_from_operands(prov, lhs, rhs)
-    }
-
-    fn certified_predicate_operand_expr(
-        &self,
-        var: &SSAVar,
-        compare_width: u32,
-        block_addr: Option<u64>,
-    ) -> Option<CExpr> {
-        if var.is_const() {
-            return Some(utils::compare_const_to_expr_with_width(
-                var,
-                compare_width.max(var.size),
-            ));
-        }
-        if let Some(name) = block_addr.and_then(|block_addr| {
-            self.prepared_value_id_for_var(var).and_then(|value| {
-                self.certified_loop_carrier_update_name_for_value_at_latch(value, block_addr)
-            })
-        }) {
-            return Some(CExpr::Var(name));
-        }
-        self.render_certified_value_expr_for_var(var)
-    }
-
     fn compare_provenance_expr_from_operands(
         &self,
         prov: &PredicateComparisonFact,

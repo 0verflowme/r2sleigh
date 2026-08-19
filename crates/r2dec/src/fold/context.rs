@@ -272,16 +272,6 @@ impl<'a> FoldingContext<'a> {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn clear_effect_render_proofs(&self) {
-        self.effect_render_proofs.borrow_mut().clear();
-    }
-
-    #[cfg(test)]
-    pub(crate) fn effect_render_proofs(&self) -> Vec<EffectRenderProof> {
-        self.effect_render_proofs.borrow().clone()
-    }
-
     pub(crate) fn effect_render_proofs_since(&self, checkpoint: usize) -> Vec<EffectRenderProof> {
         self.effect_render_proofs
             .borrow()
@@ -324,29 +314,6 @@ impl<'a> FoldingContext<'a> {
                 value,
                 values: Vec::new(),
                 phi_edge: None,
-            });
-    }
-
-    pub(crate) fn record_effect_render_proof_for_phi_edge(
-        &self,
-        block_addr: u64,
-        op_idx: usize,
-        value: Option<ValueId>,
-        phi_edge: PhiEdgeRenderProof,
-    ) {
-        self.effect_render_proofs
-            .borrow_mut()
-            .push(EffectRenderProof {
-                kind: EffectRenderProofKind::Expression,
-                block_addr,
-                op_idx,
-                call_disposition: None,
-                target: None,
-                space: None,
-                address: None,
-                value,
-                values: Vec::new(),
-                phi_edge: Some(phi_edge),
             });
     }
 

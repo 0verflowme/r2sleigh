@@ -320,27 +320,6 @@ fn expr_contains_call(expr: &CExpr) -> bool {
     found
 }
 
-fn assignment_rhs_requires_expression_render_proof(expr: &CExpr) -> bool {
-    let CExpr::Binary {
-        op: BinaryOp::Assign,
-        left,
-        right,
-    } = expr
-    else {
-        return false;
-    };
-    matches!(left.as_ref(), CExpr::Var(_))
-        && !expr_contains_memory_like_access(right)
-        && !expr_contains_call(right)
-}
-
-fn stmt_requires_expression_render_proof(stmt: &CStmt) -> bool {
-    match stmt {
-        CStmt::Expr(expr) => assignment_rhs_requires_expression_render_proof(expr),
-        _ => false,
-    }
-}
-
 fn expr_is_side_effect_free_for_carrier_gate(expr: &CExpr) -> bool {
     match expr {
         CExpr::IntLit(_)
@@ -399,13 +378,6 @@ fn expr_is_side_effect_free_for_carrier_gate(expr: &CExpr) -> bool {
     }
 }
 
-fn is_generated_carrier_name(name: &str) -> bool {
-    let lower = name.to_ascii_lowercase();
-    lower.starts_with("value_")
-        || lower.contains(':')
-        || (lower.starts_with('t') && lower[1..].chars().all(|ch| ch.is_ascii_digit()))
-}
-
 fn is_static_jump_table_base_name(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     if matches!(
@@ -439,10 +411,6 @@ fn side_effect_free_assignment_name(stmt: &CStmt) -> Option<&str> {
         _ => return None,
     };
     expr_is_side_effect_free_for_carrier_gate(rhs).then_some(name)
-}
-
-fn stmt_is_side_effect_free_generated_carrier(stmt: &CStmt) -> bool {
-    side_effect_free_assignment_name(stmt).is_some_and(is_generated_carrier_name)
 }
 
 fn stmt_contains_memory_like_access(stmt: &CStmt) -> bool {
@@ -858,115 +826,6 @@ impl<'a> FoldingContext<'a> {
         self.use_info().stable_stack_values.get(&offset)
     }
 
-    pub(super) fn certified_phi_edge_render_proof(
-        &self,
-        op: &SSAOp,
-        stmt: &CStmt,
-        predecessor: u64,
-    ) -> Option<PhiEdgeRenderProof> {
-        let (dst, src, guarded) = match op {
-            SSAOp::Copy { dst, src } => (dst, src, None),
-            SSAOp::Select {
-                dst,
-                cond,
-                if_true,
-                if_false,
-            } if if_false == dst && if_true != dst => (dst, if_true, Some((cond, true))),
-            SSAOp::Select {
-                dst,
-                cond,
-                if_true,
-                if_false,
-            } if if_true == dst && if_false != dst => (dst, if_false, Some((cond, false))),
-            _ => return None,
-        };
-        let (target, _) = Self::assignment_target_and_rhs(stmt)?;
-        if !target.eq_ignore_ascii_case(&self.var_name(dst))
-            && !target.eq_ignore_ascii_case(&dst.display_name())
-            && !self
-                .prepared_value_id_for_var(dst)
-                .and_then(|value| self.certified_loop_carrier_name_for_value(value))
-                .is_some_and(|name| target.eq_ignore_ascii_case(&name))
-        {
-            return None;
-        }
-        let prepared = self.prepared_ssa()?;
-        let dst_id = prepared.graph().value_id_for_var(dst)?;
-        let src_id = prepared.graph().value_id_for_var(src)?;
-        let def_inst = prepared.graph().def_inst(dst_id)?;
-        let inst = prepared.graph().inst(def_inst)?;
-        let r2ssa::InstPayload::Phi { predecessors } = &inst.payload else {
-            return None;
-        };
-        let exact_phi_edge = predecessors.iter().zip(&inst.inputs).any(|(pred, input)| {
-            *input == src_id
-                && prepared
-                    .graph()
-                    .block(*pred)
-                    .is_some_and(|block| block.addr == predecessor)
-        });
-        if !inst.inputs.contains(&src_id) {
-            return None;
-        }
-        let phi_block = prepared.graph().block(inst.block)?.addr;
-        let kind = match guarded {
-            None if exact_phi_edge
-                && prepared.successors(predecessor).as_slice() == [phi_block] =>
-            {
-                PhiEdgeRenderKind::Direct
-            }
-            None if exact_phi_edge
-                && prepared.successors(predecessor).contains(&phi_block)
-                && prepared.function().dominates(phi_block, predecessor) =>
-            {
-                PhiEdgeRenderKind::UnconditionalDeadOnOtherEdges
-            }
-            None if matches!(
-                self.certified_render_context()
-                    .and_then(|render| render.render_facts.loop_carrier_for_value(dst_id)),
-                Some(r2types::CertifiedEntity::LoopCarrier {
-                    dominating_initializers,
-                    ..
-                }) if dominating_initializers.iter().any(|initializer| {
-                    initializer.predecessor == predecessor
-                        && initializer.value == src_id
-                })
-            ) =>
-            {
-                PhiEdgeRenderKind::Direct
-            }
-            None => return None,
-            Some((cond, truth)) => {
-                if !exact_phi_edge {
-                    return None;
-                }
-                let condition = prepared.graph().value_id_for_var(cond)?;
-                let edge_truth = match prepared.function().edge_type(predecessor, phi_block) {
-                    Some(r2ssa::CFGEdge::True) => true,
-                    Some(r2ssa::CFGEdge::False) => false,
-                    _ => return None,
-                };
-                if !prepared.function().dominates(phi_block, predecessor)
-                    || edge_truth != truth
-                    || !prepared
-                        .get_block(predecessor)
-                        .and_then(|block| block.ops.last())
-                        .is_some_and(|op| {
-                            matches!(op, SSAOp::CBranch { cond, .. }
-                                if prepared.graph().value_id_for_var(cond) == Some(condition))
-                        })
-                {
-                    return None;
-                }
-                PhiEdgeRenderKind::Guarded { condition, truth }
-            }
-        };
-        Some(PhiEdgeRenderProof {
-            source: src_id,
-            kind,
-        })
-    }
-
     fn is_certified_loop_carrier_phi_copy(&self, dst: &SSAVar, src: &SSAVar) -> bool {
         let Some(dst_id) = self.prepared_value_id_for_var(dst) else {
             return false;
@@ -1016,21 +875,6 @@ impl<'a> FoldingContext<'a> {
             .certified_render_context()?
             .exact_memory_read_for_value(value)?;
         Some(crate::certified_memory_result_name(fact.access))
-    }
-
-    pub(crate) fn certified_loop_carrier_update_name_for_value_at_latch(
-        &self,
-        value: r2ssa::ValueId,
-        latch: u64,
-    ) -> Option<String> {
-        let r2types::CertifiedEntity::LoopCarrier { phi, .. } = self
-            .certified_render_context()?
-            .render_facts
-            .loop_carrier_update_for_value_at_latch(value, latch)?
-        else {
-            return None;
-        };
-        Some(crate::certified_loop_carrier_name(*phi))
     }
 
     pub(crate) fn certified_callsite_for_op(
@@ -1127,30 +971,6 @@ impl<'a> FoldingContext<'a> {
             && self
                 .certified_render_context()
                 .is_some_and(|proof| proof.expression_is_renderable(value))
-    }
-
-    fn certified_return_expr_for_value(&self, value: r2ssa::ValueId) -> Option<CExpr> {
-        let prepared = self.prepared_ssa()?;
-        if prepared
-            .call_result_certificate_for_value(value)
-            .is_some_and(|result| result.relation.is_identity())
-        {
-            return self.certified_call_result_expr_for_value(value);
-        }
-
-        if let Some(expr) = self.certified_structural_expr_for_value(value, 0, &mut BTreeSet::new())
-        {
-            return Some(expr);
-        }
-        if prepared.graph().def_inst(value).is_some() {
-            return None;
-        }
-
-        let var = prepared.value_var(value)?;
-        if var.is_const() {
-            return self.certified_const_expr(var);
-        }
-        self.render_certified_value_expr_for_var(var)
     }
 
     fn certified_expr_for_prepared_var(
@@ -1699,26 +1519,6 @@ impl<'a> FoldingContext<'a> {
             self.certified_expr_for_prepared_var(a, depth + 1, visited)?,
             self.certified_expr_for_prepared_var(b, depth + 1, visited)?,
         ))
-    }
-
-    pub(crate) fn certified_return_expr_for_op(
-        &self,
-        block_addr: u64,
-        op_idx: usize,
-    ) -> Option<(CExpr, r2ssa::ValueId)> {
-        let cert = self.certified_return_for_op(block_addr, op_idx)?;
-        let expr = self.rewrite_typed_return_literal_expr(
-            self.certified_return_expr_for_value(cert.value)?,
-            self.current_return_context(),
-        );
-        if self.certified_return_expr_contains_raw_storage_name(&expr)
-            && self
-                .control_facts()
-                .is_none_or(|facts| facts.loops.is_empty() && facts.switches.is_empty())
-        {
-            return None;
-        }
-        Some((expr, cert.value))
     }
 
     fn certified_call_result_fact_for_value(
@@ -3229,275 +3029,6 @@ impl<'a> FoldingContext<'a> {
         })
     }
 
-    pub(crate) fn record_certified_call_render_proofs_for_stmt(&self, stmt: &CStmt) -> Option<()> {
-        self.record_certified_call_render_proofs_for_stmt_with_current(stmt, None)
-    }
-
-    pub(super) fn record_certified_call_render_proofs_for_stmt_with_current(
-        &self,
-        stmt: &CStmt,
-        current_source_call: Option<(u64, usize)>,
-    ) -> Option<()> {
-        return Some(());
-
-        let mut sources = BTreeSet::new();
-        self.collect_certified_rendered_call_sources_for_stmt(
-            stmt,
-            current_source_call,
-            &mut sources,
-        )?;
-        let proofs = sources
-            .into_iter()
-            .map(|source_call| {
-                self.certified_synthesized_call_expr_for_source_call(source_call)
-                    .map(|call| (source_call, call.target, call.values))
-            })
-            .collect::<Option<Vec<_>>>()?;
-
-        for ((block_addr, op_idx), target, values) in proofs {
-            self.record_call_effect_render_proof(
-                block_addr,
-                op_idx,
-                Some(target),
-                values.clone(),
-                r2types::CallsiteRenderDisposition::NestedExpression,
-            );
-            self.record_certified_call_arg_memory_render_proofs(&values);
-        }
-        Some(())
-    }
-
-    #[cfg(test)]
-    pub(super) fn record_certified_call_render_proof_for_source_call(
-        &self,
-        source_call: (u64, usize),
-    ) -> Option<()> {
-        return Some(());
-
-        let call = self.certified_synthesized_call_expr_for_source_call(source_call)?;
-        self.record_call_effect_render_proof(
-            source_call.0,
-            source_call.1,
-            Some(call.target),
-            call.values.clone(),
-            r2types::CallsiteRenderDisposition::NestedExpression,
-        );
-        self.record_certified_call_arg_memory_render_proofs(&call.values);
-        Some(())
-    }
-
-    fn collect_certified_rendered_call_sources_for_stmt(
-        &self,
-        stmt: &CStmt,
-        current_source_call: Option<(u64, usize)>,
-        out: &mut BTreeSet<(u64, usize)>,
-    ) -> Option<()> {
-        match stmt {
-            CStmt::Expr(expr) | CStmt::Return(Some(expr)) => self
-                .collect_certified_rendered_call_sources_for_expr(expr, current_source_call, out),
-            CStmt::While { cond, body } => {
-                self.collect_certified_rendered_call_sources_for_expr(
-                    cond,
-                    current_source_call,
-                    out,
-                )?;
-                self.collect_certified_rendered_call_sources_for_stmt(
-                    body,
-                    current_source_call,
-                    out,
-                )
-            }
-            CStmt::DoWhile { body, cond } => {
-                self.collect_certified_rendered_call_sources_for_stmt(
-                    body,
-                    current_source_call,
-                    out,
-                )?;
-                self.collect_certified_rendered_call_sources_for_expr(
-                    cond,
-                    current_source_call,
-                    out,
-                )
-            }
-            CStmt::Block(stmts) => {
-                for stmt in stmts {
-                    self.collect_certified_rendered_call_sources_for_stmt(
-                        stmt,
-                        current_source_call,
-                        out,
-                    )?;
-                }
-                Some(())
-            }
-            CStmt::Decl {
-                init: Some(expr), ..
-            } => self.collect_certified_rendered_call_sources_for_expr(
-                expr,
-                current_source_call,
-                out,
-            ),
-            CStmt::If {
-                cond,
-                then_body,
-                else_body,
-            } => {
-                self.collect_certified_rendered_call_sources_for_expr(
-                    cond,
-                    current_source_call,
-                    out,
-                )?;
-                self.collect_certified_rendered_call_sources_for_stmt(
-                    then_body,
-                    current_source_call,
-                    out,
-                )?;
-                if let Some(else_body) = else_body {
-                    self.collect_certified_rendered_call_sources_for_stmt(
-                        else_body,
-                        current_source_call,
-                        out,
-                    )?;
-                }
-                Some(())
-            }
-            CStmt::For {
-                cond: Some(expr),
-                update: Some(update),
-                body,
-                ..
-            } => {
-                self.collect_certified_rendered_call_sources_for_expr(
-                    expr,
-                    current_source_call,
-                    out,
-                )?;
-                self.collect_certified_rendered_call_sources_for_expr(
-                    update,
-                    current_source_call,
-                    out,
-                )?;
-                self.collect_certified_rendered_call_sources_for_stmt(
-                    body,
-                    current_source_call,
-                    out,
-                )
-            }
-            CStmt::For {
-                cond: Some(expr),
-                body,
-                update: None,
-                ..
-            } => {
-                self.collect_certified_rendered_call_sources_for_expr(
-                    expr,
-                    current_source_call,
-                    out,
-                )?;
-                self.collect_certified_rendered_call_sources_for_stmt(
-                    body,
-                    current_source_call,
-                    out,
-                )
-            }
-            CStmt::For {
-                cond: None,
-                update: Some(expr),
-                body,
-                ..
-            } => {
-                self.collect_certified_rendered_call_sources_for_expr(
-                    expr,
-                    current_source_call,
-                    out,
-                )?;
-                self.collect_certified_rendered_call_sources_for_stmt(
-                    body,
-                    current_source_call,
-                    out,
-                )
-            }
-            CStmt::For {
-                cond: None,
-                update: None,
-                body,
-                ..
-            } => self.collect_certified_rendered_call_sources_for_stmt(
-                body,
-                current_source_call,
-                out,
-            ),
-            CStmt::Switch {
-                expr,
-                cases,
-                default,
-            } => {
-                self.collect_certified_rendered_call_sources_for_expr(
-                    expr,
-                    current_source_call,
-                    out,
-                )?;
-                for case in cases {
-                    self.collect_certified_rendered_call_sources_for_expr(
-                        &case.value,
-                        current_source_call,
-                        out,
-                    )?;
-                    for stmt in &case.body {
-                        self.collect_certified_rendered_call_sources_for_stmt(
-                            stmt,
-                            current_source_call,
-                            out,
-                        )?;
-                    }
-                }
-                if let Some(default) = default {
-                    for stmt in default {
-                        self.collect_certified_rendered_call_sources_for_stmt(
-                            stmt,
-                            current_source_call,
-                            out,
-                        )?;
-                    }
-                }
-                Some(())
-            }
-            CStmt::Return(None)
-            | CStmt::Decl { init: None, .. }
-            | CStmt::Break
-            | CStmt::Continue
-            | CStmt::Goto(_)
-            | CStmt::Label(_)
-            | CStmt::Comment(_)
-            | CStmt::Empty => Some(()),
-        }
-    }
-
-    fn collect_certified_rendered_call_sources_for_expr(
-        &self,
-        expr: &CExpr,
-        current_source_call: Option<(u64, usize)>,
-        out: &mut BTreeSet<(u64, usize)>,
-    ) -> Option<()> {
-        if matches!(expr, CExpr::Call { .. }) {
-            let source_call =
-                self.certified_source_for_rendered_call_expr(expr, current_source_call)?;
-            out.insert(source_call);
-        }
-        let mut certified = true;
-        expr.visit(&mut |node| {
-            if let CExpr::Call { .. } = node {
-                if let Some(source_call) =
-                    self.certified_source_for_rendered_call_expr(node, current_source_call)
-                {
-                    out.insert(source_call);
-                } else {
-                    certified = false;
-                }
-            }
-        });
-        certified.then_some(())
-    }
-
     fn should_inline(&self, var: &SSAVar) -> bool {
         let var_name = var.display_name();
         let use_count = self.use_counts_map().get(&var_name).copied().unwrap_or(0);
@@ -3797,47 +3328,6 @@ impl<'a> FoldingContext<'a> {
 
         // Otherwise return a variable reference
         fallback
-    }
-
-    fn certified_expr_depends_on_semantic_array(
-        &self,
-        value: r2ssa::ValueId,
-        visited: &mut BTreeSet<r2ssa::ValueId>,
-    ) -> bool {
-        if !visited.insert(value) {
-            return false;
-        }
-        let Some(render) = self.inputs.render_facts() else {
-            return false;
-        };
-        let has_exact_array_load = render
-            .memory_accesses()
-            .filter(|memory| !memory.is_write && memory.value == Some(value))
-            .any(|memory| {
-                render
-                    .array_accesses_by_op
-                    .get(&(memory.block_addr, memory.op_index, false))
-                    .into_iter()
-                    .flatten()
-                    .any(|array| {
-                        array.access == memory.access
-                            && array.object == memory.object
-                            && array.access_width == memory.width
-                            && array.base.is_some()
-                            && array.index.is_some()
-                    })
-            });
-        if has_exact_array_load {
-            return true;
-        }
-        render.certified_expr_for_value(value).is_some_and(|expr| {
-            expr.inputs.iter().any(|input| match input {
-                r2ssa::SemanticId::Expression(input) => {
-                    self.certified_expr_depends_on_semantic_array(*input, visited)
-                }
-                _ => false,
-            })
-        })
     }
 
     fn op_to_expr_impl(&self, op: &SSAOp) -> CExpr {
@@ -8187,37 +7677,6 @@ impl<'a> FoldingContext<'a> {
             .then(|| self.certified_call_result_owner_expr_for_source(source_call))?
     }
 
-    fn certified_call_result_owner_name_for_source(
-        &self,
-        source_call: (u64, usize),
-    ) -> Option<String> {
-        match self.certified_call_result_owner_expr_for_source(source_call)? {
-            CExpr::Var(name)
-                if !is_generic_arg_name(&name)
-                    && !self.inputs.arch.is_return_register_name(&name) =>
-            {
-                Some(name)
-            }
-            _ => None,
-        }
-    }
-
-    fn prepared_source_call_for_visible_owner_name(
-        &self,
-        visible_name: &str,
-    ) -> Option<(u64, usize)> {
-        self.prepared_semantic_view()?
-            .call_view_by_site
-            .iter()
-            .find_map(|(source_call, view)| {
-                view.result_owner
-                    .as_ref()
-                    .and_then(Self::prepared_owned_result_name)
-                    .is_some_and(|owner| owner.eq_ignore_ascii_case(visible_name))
-                    .then_some(*source_call)
-            })
-    }
-
     pub(super) fn stable_owned_call_result_expr_for_source(
         &self,
         source_call: (u64, usize),
@@ -8557,27 +8016,6 @@ impl<'a> FoldingContext<'a> {
             })
     }
 
-    fn certified_materialized_call_result_source_for_visible_name(
-        &self,
-        name: &str,
-    ) -> Option<(u64, usize)> {
-        let resolved_name = self
-            .find_ssa_name_for_rendered_alias(name)
-            .unwrap_or_else(|| name.to_string());
-        let facts = self.inputs.call_result_facts()?;
-        facts.by_callsite.keys().find_map(|callsite| {
-            let source_call = (callsite.block_addr, callsite.op_index);
-            let owner_name =
-                match self.certified_assigned_call_result_owner_expr_for_source(source_call)? {
-                    CExpr::Var(owner) => owner,
-                    _ => return None,
-                };
-            (owner_name.eq_ignore_ascii_case(name)
-                || owner_name.eq_ignore_ascii_case(&resolved_name))
-            .then_some(source_call)
-        })
-    }
-
     pub(crate) fn call_result_source_for_ssa_name(&self, ssa_name: &str) -> Option<(u64, usize)> {
         let source_call = self
             .ownership()
@@ -8594,11 +8032,6 @@ impl<'a> FoldingContext<'a> {
                     .and_then(|resolved| self.call_result_source_for_ssa_name(&resolved))
             })?;
         Some(source_call)
-    }
-
-    fn certified_call_result_source_for_ssa_name(&self, ssa_name: &str) -> Option<(u64, usize)> {
-        let fact = self.certified_call_result_fact_for_name(ssa_name)?;
-        Some((fact.callsite.block_addr, fact.callsite.op_index))
     }
 
     pub(super) fn local_post_call_source_for_ssa_name(
@@ -8743,42 +8176,6 @@ impl<'a> FoldingContext<'a> {
             return None;
         }
         Some(owner)
-    }
-
-    fn certified_stable_owned_call_result_expr_for_name(
-        &self,
-        name: &str,
-        include_direct_aliases: bool,
-    ) -> Option<CExpr> {
-        if !include_direct_aliases {
-            return None;
-        }
-        let fact = self.certified_call_result_fact_for_name(name)?;
-        let source_call = (fact.callsite.block_addr, fact.callsite.op_index);
-        let owner = self.certified_call_result_owner_expr_for_source(source_call)?;
-        let owner_name = match &owner {
-            CExpr::Var(owner_name) => owner_name,
-            _ => return Some(owner),
-        };
-        if owner_name.eq_ignore_ascii_case(name) {
-            return None;
-        }
-        Some(owner)
-    }
-
-    fn certified_call_result_fact_for_name(
-        &self,
-        ssa_name: &str,
-    ) -> Option<&r2types::CallResultFact> {
-        let prepared = self.inputs.prepared_ssa?;
-        let var = prepared
-            .function()
-            .blocks()
-            .flat_map(|block| block.ops.iter())
-            .filter_map(SSAOp::dst)
-            .find(|dst| dst.display_name().eq_ignore_ascii_case(ssa_name))?;
-        let value = prepared.graph().value_id_for_var(var)?;
-        self.certified_call_result_fact_for_value(value)
     }
 
     fn certified_call_result_source_for_stack_owner_alias(
@@ -10940,144 +10337,6 @@ impl<'a> FoldingContext<'a> {
             | CExpr::CharLit(_)
             | CExpr::SizeofType(_) => expr.clone(),
         }
-    }
-
-    fn certified_semanticize_visible_expr(
-        &self,
-        expr: &CExpr,
-        depth: u32,
-        visited: &mut HashSet<String>,
-    ) -> CExpr {
-        if depth > Self::MAX_SEMANTIC_RENDER_DEPTH {
-            return expr.clone();
-        }
-
-        match expr {
-            CExpr::Var(name) => self
-                .certified_semanticized_var_expr(name, depth, visited)
-                .unwrap_or_else(|| expr.clone()),
-            CExpr::Deref(inner) => CExpr::Deref(Box::new(self.certified_semanticize_visible_expr(
-                inner,
-                depth + 1,
-                visited,
-            ))),
-            CExpr::Cast { ty, expr: inner } => CExpr::cast(
-                ty.clone(),
-                self.certified_semanticize_visible_expr(inner, depth + 1, visited),
-            ),
-            CExpr::Paren(inner) => CExpr::Paren(Box::new(self.certified_semanticize_visible_expr(
-                inner,
-                depth + 1,
-                visited,
-            ))),
-            CExpr::Unary { op, operand } => CExpr::unary(
-                *op,
-                self.certified_semanticize_visible_expr(operand, depth + 1, visited),
-            ),
-            CExpr::Binary { op, left, right } => CExpr::binary(
-                *op,
-                self.certified_semanticize_visible_expr(left, depth + 1, visited),
-                self.certified_semanticize_visible_expr(right, depth + 1, visited),
-            ),
-            CExpr::Ternary {
-                cond,
-                then_expr,
-                else_expr,
-            } => CExpr::Ternary {
-                cond: Box::new(self.certified_semanticize_visible_expr(cond, depth + 1, visited)),
-                then_expr: Box::new(self.certified_semanticize_visible_expr(
-                    then_expr,
-                    depth + 1,
-                    visited,
-                )),
-                else_expr: Box::new(self.certified_semanticize_visible_expr(
-                    else_expr,
-                    depth + 1,
-                    visited,
-                )),
-            },
-            CExpr::Call { func, args } => CExpr::Call {
-                func: Box::new(self.certified_semanticize_visible_expr(func, depth + 1, visited)),
-                args: args
-                    .iter()
-                    .map(|arg| self.certified_semanticize_visible_expr(arg, depth + 1, visited))
-                    .collect(),
-            },
-            CExpr::Subscript { base, index } => CExpr::Subscript {
-                base: Box::new(self.certified_semanticize_visible_expr(base, depth + 1, visited)),
-                index: Box::new(self.certified_semanticize_visible_expr(index, depth + 1, visited)),
-            },
-            CExpr::Member { base, member } => CExpr::Member {
-                base: Box::new(self.certified_semanticize_visible_expr(base, depth + 1, visited)),
-                member: member.clone(),
-            },
-            CExpr::PtrMember { base, member } => CExpr::PtrMember {
-                base: Box::new(self.certified_semanticize_visible_expr(base, depth + 1, visited)),
-                member: member.clone(),
-            },
-            CExpr::Sizeof(inner) => CExpr::Sizeof(Box::new(
-                self.certified_semanticize_visible_expr(inner, depth + 1, visited),
-            )),
-            CExpr::AddrOf(inner) => CExpr::AddrOf(Box::new(
-                self.certified_semanticize_visible_expr(inner, depth + 1, visited),
-            )),
-            CExpr::Comma(items) => CExpr::Comma(
-                items
-                    .iter()
-                    .map(|item| self.certified_semanticize_visible_expr(item, depth + 1, visited))
-                    .collect(),
-            ),
-            CExpr::IntLit(_)
-            | CExpr::UIntLit(_)
-            | CExpr::FloatLit(_)
-            | CExpr::StringLit(_)
-            | CExpr::CharLit(_)
-            | CExpr::SizeofType(_) => expr.clone(),
-        }
-    }
-
-    fn certified_semanticized_var_expr(
-        &self,
-        name: &str,
-        depth: u32,
-        visited: &mut HashSet<String>,
-    ) -> Option<CExpr> {
-        if depth > Self::MAX_SEMANTIC_RENDER_DEPTH {
-            return None;
-        }
-        if self.should_preserve_address_like_visible_name(name)
-            || self.should_preserve_owned_call_result_visible_name(name)
-        {
-            return None;
-        }
-        if let Some(owner) = self.stable_owned_call_result_expr_for_name(name, true)
-            && !matches!(&owner, CExpr::Var(owner_name) if owner_name.eq_ignore_ascii_case(name))
-        {
-            return Some(owner);
-        }
-
-        let visit_key = format!("cert-sem:{name}");
-        if !visited.insert(visit_key.clone()) {
-            return None;
-        }
-        let rendered = self
-            .certified_prepared_var_for_visible_name(name)
-            .and_then(|var| self.render_certified_value_expr_for_var(var))
-            .filter(|candidate| {
-                self.prefers_visible_expr(&CExpr::Var(name.to_string()), candidate)
-            });
-        visited.remove(&visit_key);
-        rendered
-    }
-
-    fn certified_prepared_var_for_visible_name(&self, name: &str) -> Option<&SSAVar> {
-        let prepared = self.inputs.prepared_ssa?;
-        prepared
-            .function()
-            .blocks()
-            .flat_map(|block| block.ops.iter())
-            .filter_map(SSAOp::dst)
-            .find(|var| var.display_name().eq_ignore_ascii_case(name))
     }
 
     fn canonicalize_visible_address_expr(&self, expr: &CExpr, depth: u32) -> CExpr {
@@ -13363,24 +12622,6 @@ impl<'a> FoldingContext<'a> {
         false
     }
 
-    fn certified_call_result_flows_to_return(&self, source_call: (u64, usize)) -> bool {
-        let callsite = r2types::CallsiteKey {
-            block_addr: source_call.0,
-            op_index: source_call.1,
-        };
-        let Some(call_result_facts) = self.inputs.call_result_facts() else {
-            return false;
-        };
-        let Some(render_facts) = self.inputs.render_facts() else {
-            return false;
-        };
-        render_facts.return_effects().any(|return_fact| {
-            call_result_facts
-                .result_for_value(return_fact.value)
-                .is_some_and(|result| result.callsite == callsite)
-        })
-    }
-
     fn is_consumed_immediate_call_home_store(
         &self,
         block: &SSABlock,
@@ -13470,55 +12711,6 @@ impl<'a> FoldingContext<'a> {
             owner_name.eq_ignore_ascii_case(&slot_name)
                 || self.visible_names_share_stack_slot(&owner_name, &slot_name)
         })
-    }
-
-    fn is_certified_materialized_call_result_stack_home_store(
-        &self,
-        addr: &SSAVar,
-        val: &SSAVar,
-    ) -> bool {
-        let Some(offset) = self
-            .stack_slot_offset_for_var(addr)
-            .or_else(|| self.extract_stack_offset_from_var(addr))
-        else {
-            return false;
-        };
-        if offset >= 0 {
-            return false;
-        }
-
-        let Some(value) = self.prepared_value_id_for_var(val) else {
-            return false;
-        };
-        let Some(fact) = self.certified_call_result_fact_for_value(value) else {
-            return false;
-        };
-        let Some(call_result_facts) = self.inputs.call_result_facts() else {
-            return false;
-        };
-        let Some(r2ssa::ValueOwner::StackSlot {
-            offset: owner_offset,
-            ..
-        }) = call_result_facts.owner_for_value(value)
-        else {
-            return false;
-        };
-        if *owner_offset != offset {
-            return false;
-        }
-
-        let source_call = (fact.callsite.block_addr, fact.callsite.op_index);
-        let Some(CExpr::Var(owner_name)) =
-            self.certified_assigned_call_result_owner_expr_for_source(source_call)
-        else {
-            return false;
-        };
-        self.stack_offset_for_visible_storage_name(&owner_name)
-            .is_some_and(|materialized_offset| materialized_offset == offset)
-            || self.resolve_stack_var(offset).is_some_and(|slot_name| {
-                owner_name.eq_ignore_ascii_case(&slot_name)
-                    || self.visible_names_share_stack_slot(&owner_name, &slot_name)
-            })
     }
 
     fn op_to_stmt_impl(&self, op: &SSAOp) -> Option<CStmt> {
@@ -14164,84 +13356,6 @@ impl<'a> FoldingContext<'a> {
             SSAOp::Unimplemented => Some(CStmt::comment("Unimplemented operation")),
             _ => None,
         }
-    }
-
-    fn prepared_stack_address_is_expression_plumbing(&self, value: &SSAVar) -> bool {
-        let Some(prepared) = self.inputs.prepared_ssa else {
-            return false;
-        };
-        let Some(stack_roots) = prepared.function().decompile_prep_facts() else {
-            return false;
-        };
-        if stack_roots.stack_address_root_of(value).is_none() {
-            return false;
-        }
-        let Some(value_id) = prepared.graph().value_id_for_var(value) else {
-            return false;
-        };
-        self.prepared_value_is_stack_address_plumbing(prepared, value_id, &mut HashSet::new())
-    }
-
-    fn prepared_value_is_stack_address_plumbing(
-        &self,
-        prepared: &SsaArtifact,
-        value: ValueId,
-        visited: &mut HashSet<ValueId>,
-    ) -> bool {
-        if !visited.insert(value) {
-            return true;
-        }
-        let Some(value_var) = prepared.value_var(value) else {
-            return false;
-        };
-        for use_site in prepared.graph().use_sites(value) {
-            let Some(inst) = prepared.graph().inst(use_site.inst) else {
-                return false;
-            };
-            match &inst.payload {
-                r2ssa::InstPayload::Phi { .. } => {
-                    let Some(output) = inst.output else {
-                        return false;
-                    };
-                    if !self.prepared_value_is_stack_address_plumbing(prepared, output, visited) {
-                        return false;
-                    }
-                }
-                r2ssa::InstPayload::Op(op) => {
-                    let used_as_memory_address = matches!(
-                        op,
-                        SSAOp::Load { addr, .. }
-                            | SSAOp::Store { addr, .. }
-                            | SSAOp::LoadLinked { addr, .. }
-                            | SSAOp::StoreConditional { addr, .. }
-                            | SSAOp::AtomicCAS { addr, .. }
-                            | SSAOp::LoadGuarded { addr, .. }
-                            | SSAOp::StoreGuarded { addr, .. }
-                            if addr == value_var
-                    );
-                    if used_as_memory_address {
-                        continue;
-                    }
-                    let address_derivation = matches!(
-                        op,
-                        SSAOp::Copy { .. }
-                            | SSAOp::Cast { .. }
-                            | SSAOp::New { .. }
-                            | SSAOp::IntAdd { .. }
-                            | SSAOp::IntSub { .. }
-                            | SSAOp::PtrAdd { .. }
-                            | SSAOp::PtrSub { .. }
-                    );
-                    let Some(output) = address_derivation.then_some(inst.output).flatten() else {
-                        return false;
-                    };
-                    if !self.prepared_value_is_stack_address_plumbing(prepared, output, visited) {
-                        return false;
-                    }
-                }
-            }
-        }
-        true
     }
 
     /// Create a binary operation statement.
