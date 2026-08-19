@@ -207,6 +207,43 @@ static bool walk_image(R2SleighWireWriter *writer, const RAnalFunctionSnapshot *
 #define WALK_BASE_FRAME_POINTER 0
 #define WALK_BASE_STACK_POINTER 1
 
+// The prototype radare2 recovered, which is the only place a spelling like
+// size_t survives; the interface carries where values live, not what they are.
+static bool walk_signature(R2SleighWireWriter *writer,
+		const RAnalFunctionSnapshot *snapshot) {
+	RAnalSnapshotSignatureView view = {0};
+	if (!r_anal_function_snapshot_signature_view (snapshot, &view)) {
+		r2sleigh_wire_bool (writer, false);
+		return true;
+	}
+	if (view.num_parameters > UINT32_MAX) {
+		return false;
+	}
+	char text[WALK_NAME_MAX];
+	r2sleigh_wire_bool (writer, true);
+	r2sleigh_wire_optional_string (writer,
+		r_anal_function_snapshot_signature_string (snapshot,
+			R_ANAL_SNAPSHOT_SIGNATURE_STRING_RETURN_TYPE, 0, text, sizeof (text))
+			? text: NULL);
+	r2sleigh_wire_optional_string (writer,
+		r_anal_function_snapshot_signature_string (snapshot,
+			R_ANAL_SNAPSHOT_SIGNATURE_STRING_CALLING_CONVENTION, 0, text, sizeof (text))
+			? text: NULL);
+	r2sleigh_wire_bool (writer, view.noreturn);
+	r2sleigh_wire_u32 (writer, (uint32_t)view.num_parameters);
+	for (size_t i = 0; i < view.num_parameters; i++) {
+		r2sleigh_wire_optional_string (writer,
+			r_anal_function_snapshot_signature_string (snapshot,
+				R_ANAL_SNAPSHOT_SIGNATURE_STRING_PARAMETER_NAME, i, text, sizeof (text))
+				? text: NULL);
+		r2sleigh_wire_optional_string (writer,
+			r_anal_function_snapshot_signature_string (snapshot,
+				R_ANAL_SNAPSHOT_SIGNATURE_STRING_PARAMETER_TYPE, i, text, sizeof (text))
+				? text: NULL);
+	}
+	return true;
+}
+
 // a named base has no wire counterpart, so a slot measured from one is skipped
 static bool walk_stack_slot_base_tag(int base, uint8_t *out) {
 	switch (base) {
@@ -239,7 +276,7 @@ static bool walk_presentation(R2SleighWireWriter *writer,
 		|| !r_anal_function_snapshot_interface_view (snapshot, &interface)) {
 		r2sleigh_wire_u32 (writer, 0);
 		r2sleigh_wire_u32 (writer, 0);
-		return true;
+		return walk_signature (writer, snapshot);
 	}
 	if (interface.num_parameters > UINT32_MAX) {
 		return false;
@@ -290,11 +327,15 @@ static bool walk_presentation(R2SleighWireWriter *writer,
 			|| !*name) {
 			continue;
 		}
+		char type[WALK_NAME_MAX];
+		const bool typed = r_anal_function_snapshot_stack_slot_string (snapshot, i,
+			R_ANAL_SNAPSHOT_STACK_SLOT_STRING_TYPE, type, sizeof (type)) && *type;
 		r2sleigh_wire_u8 (writer, base_tag);
 		r2sleigh_wire_i64 (writer, slot.offset);
 		r2sleigh_wire_string (writer, name);
+		r2sleigh_wire_optional_string (writer, typed? type: NULL);
 	}
-	return true;
+	return walk_signature (writer, snapshot);
 }
 
 bool r2sleigh_wire_write_snapshot_prefix(R2SleighWireWriter *writer, const void *snapshot) {

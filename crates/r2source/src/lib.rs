@@ -77,6 +77,7 @@ pub struct FunctionPresentation {
     display_name: Box<str>,
     parameter_names: Box<[Box<str>]>,
     stack_slot_names: Box<[SourceStackSlotName]>,
+    signature: Option<SourceSignaturePresentation>,
 }
 
 impl FunctionPresentation {
@@ -91,6 +92,83 @@ impl FunctionPresentation {
     pub fn stack_slot_names(&self) -> &[SourceStackSlotName] {
         &self.stack_slot_names
     }
+
+    pub const fn signature(&self) -> Option<&SourceSignaturePresentation> {
+        self.signature.as_ref()
+    }
+}
+
+/// The prototype the source recovered, spelled the way the source spells it.
+///
+/// The interface says where each value lives; this says what it is called and
+/// what it is called *as*, which is the only place a spelling like `size_t`
+/// survives. It is presentation: nothing here may decide semantics, and its
+/// arity is the source's own, independent of the ABI interface.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceSignaturePresentation {
+    return_type: Option<Box<str>>,
+    calling_convention: Option<Box<str>>,
+    noreturn: bool,
+    parameters: Box<[SourceSignatureParameter]>,
+}
+
+impl SourceSignaturePresentation {
+    pub fn new(
+        return_type: Option<impl Into<Box<str>>>,
+        calling_convention: Option<impl Into<Box<str>>>,
+        noreturn: bool,
+        parameters: impl IntoIterator<Item = SourceSignatureParameter>,
+    ) -> Self {
+        Self {
+            return_type: return_type.map(Into::into),
+            calling_convention: calling_convention.map(Into::into),
+            noreturn,
+            parameters: parameters.into_iter().collect(),
+        }
+    }
+
+    pub fn return_type(&self) -> Option<&str> {
+        self.return_type.as_deref()
+    }
+
+    pub fn calling_convention(&self) -> Option<&str> {
+        self.calling_convention.as_deref()
+    }
+
+    pub const fn noreturn(&self) -> bool {
+        self.noreturn
+    }
+
+    pub fn parameters(&self) -> &[SourceSignatureParameter] {
+        &self.parameters
+    }
+}
+
+/// One parameter of a recovered prototype: what it is called and its spelling.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceSignatureParameter {
+    name: Option<Box<str>>,
+    type_spelling: Option<Box<str>>,
+}
+
+impl SourceSignatureParameter {
+    pub fn new(
+        name: Option<impl Into<Box<str>>>,
+        type_spelling: Option<impl Into<Box<str>>>,
+    ) -> Self {
+        Self {
+            name: name.map(Into::into),
+            type_spelling: type_spelling.map(Into::into),
+        }
+    }
+
+    pub fn name(&self) -> Option<&str> {
+        self.name.as_deref()
+    }
+
+    pub fn type_spelling(&self) -> Option<&str> {
+        self.type_spelling.as_deref()
+    }
 }
 
 /// One name the source gave a stack slot, keyed by where the slot sits.
@@ -102,6 +180,7 @@ pub struct SourceStackSlotName {
     base: StackAddressBase,
     offset: i64,
     name: Box<str>,
+    type_spelling: Option<Box<str>>,
 }
 
 impl SourceStackSlotName {
@@ -110,7 +189,17 @@ impl SourceStackSlotName {
             base,
             offset,
             name: name.into(),
+            type_spelling: None,
         }
+    }
+
+    pub fn with_type_spelling(mut self, type_spelling: Option<impl Into<Box<str>>>) -> Self {
+        self.type_spelling = type_spelling.map(Into::into);
+        self
+    }
+
+    pub fn type_spelling(&self) -> Option<&str> {
+        self.type_spelling.as_deref()
     }
 
     pub const fn base(&self) -> StackAddressBase {
@@ -722,6 +811,7 @@ mod tests {
                 display_name: "fixture".into(),
                 parameter_names: Box::new([]),
                 stack_slot_names: Box::new([]),
+                signature: None,
             },
             OwnedFunctionImage {
                 string_literals: Box::new([]),

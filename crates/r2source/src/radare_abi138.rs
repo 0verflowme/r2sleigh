@@ -1905,6 +1905,9 @@ pub unsafe fn capture_radare_abi138(
             display_name: function_name.into_boxed_str(),
             parameter_names,
             stack_slot_names,
+            // The direct capture does not read the recovered prototype; the
+            // wire transport is the path that carries it.
+            signature: None,
         },
         image,
         advisory_calls,

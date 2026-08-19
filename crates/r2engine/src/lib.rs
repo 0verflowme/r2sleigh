@@ -3230,8 +3230,105 @@ pub struct EngineAnalyzeFunctionRequestInput {
 /// These are presentation only: the role comes from the interface so a home or a
 /// saved carrier is not offered as a local, and a name that matches no slot is
 /// not carried at all.
+/// A source type rendered as the source spells it.
+///
+/// The shared parser canonicalises a spelling to structure, which is right for
+/// analysis and wrong for a name: it turns `char` into an eight-bit integer and
+/// `size_t` into an unsigned word, so the rendered C says `int8_t *` where the
+/// source said `char *`. Structure is already carried by the type graph, so the
+/// spelling is what this has to preserve.
+fn source_spelled_type(spelling: &str, ptr_bits: u32) -> Option<r2types::CTypeLike> {
+    let mut rest = spelling.trim();
+    if rest.is_empty() {
+        return None;
+    }
+    let mut array_len = None;
+    if let Some(start) = rest.rfind('[')
+        && rest.ends_with(']')
+    {
+        let len = &rest[start + 1..rest.len() - 1];
+        array_len = Some(len.trim().parse::<usize>().ok());
+        rest = rest[..start].trim_end();
+    }
+    let mut pointers = 0usize;
+    while let Some(stripped) = rest.strip_suffix('*') {
+        pointers += 1;
+        rest = stripped.trim_end();
+    }
+    let base_words = rest
+        .split_whitespace()
+        .filter(|word| {
+            !matches!(
+                word.to_ascii_lowercase().as_str(),
+                "const" | "volatile" | "restrict" | "__restrict" | "__restrict__"
+            )
+        })
+        .collect::<Vec<_>>();
+    let base_spelling = base_words.join(" ");
+    if base_spelling.is_empty() {
+        return None;
+    }
+    // A structural spelling stays structural so width-aware analysis keeps
+    // working; a named one is carried by name so it renders as itself.
+    let mut ty = match r2types::parse_type_like_spec(&base_spelling, ptr_bits) {
+        Some(r2types::CTypeLike::Void) => r2types::CTypeLike::Void,
+        Some(
+            structural @ (r2types::CTypeLike::Struct(_)
+            | r2types::CTypeLike::Union(_)
+            | r2types::CTypeLike::Enum(_)),
+        ) => structural,
+        Some(_) => r2types::CTypeLike::Typedef(base_spelling),
+        None => return None,
+    };
+    for _ in 0..pointers {
+        ty = r2types::CTypeLike::Pointer(Box::new(ty));
+    }
+    if let Some(len) = array_len {
+        ty = r2types::CTypeLike::Array(Box::new(ty), len);
+    }
+    Some(ty)
+}
+
+/// The prototype the source recovered, spelled as the source spells it.
+///
+/// The type graph carries structure and the interface carries storage; only
+/// this says `size_t` rather than `uint64_t`, or `char *` rather than a pointer
+/// to an eight-bit integer.
+fn trusted_source_signature(
+    trusted: &r2ssa::TrustedSsaArtifact,
+    ptr_bits: u32,
+) -> Option<(r2types::FunctionSignatureSpec, Option<String>, bool)> {
+    let signature = trusted.source().presentation().signature()?;
+    let params = signature
+        .parameters()
+        .iter()
+        .enumerate()
+        .map(|(index, parameter)| r2types::FunctionParamSpec {
+            name: parameter
+                .name()
+                .filter(|name| !name.is_empty())
+                .map_or_else(|| format!("arg{index}"), str::to_string),
+            ty: parameter
+                .type_spelling()
+                .and_then(|spelling| source_spelled_type(spelling, ptr_bits)),
+        })
+        .collect();
+    let spec = r2types::FunctionSignatureSpec {
+        ret_type: signature
+            .return_type()
+            .and_then(|spelling| source_spelled_type(spelling, ptr_bits)),
+        params,
+    };
+    let callconv = signature
+        .calling_convention()
+        .filter(|convention| !convention.is_empty())
+        .map(str::to_string);
+    Some((spec, callconv, signature.noreturn()))
+}
+
 fn trusted_stack_slot_names(
     trusted: &r2ssa::TrustedSsaArtifact,
+    ptr_bits: u32,
 ) -> std::collections::BTreeMap<r2types::StackSlotKey, r2types::ExternalStackSlotSpec> {
     let snapshot = trusted.source();
     let Some(interface) = snapshot.function_interface() else {
@@ -3266,6 +3363,9 @@ fn trusted_stack_slot_names(
             },
             r2types::ExternalStackSlotSpec {
                 name: slot_name.name().to_string(),
+                ty: slot_name
+                    .type_spelling()
+                    .and_then(|spelling| source_spelled_type(spelling, ptr_bits)),
                 base,
                 role,
                 ..r2types::ExternalStackSlotSpec::default()
@@ -3369,8 +3469,15 @@ impl EngineAnalyzeRequest {
         self.source_snapshot = None;
         self.semantic_metadata_enabled = true;
         self.reg_type_hints.clear();
+        let signature = trusted_source_signature(&trusted, self.ptr_bits);
         self.parsed_context = r2types::ParsedExternalContext {
-            stack_slots: trusted_stack_slot_names(&trusted),
+            stack_slots: trusted_stack_slot_names(&trusted, self.ptr_bits),
+            callconv: signature
+                .as_ref()
+                .and_then(|(_, callconv, _)| callconv.clone()),
+            noreturn: signature.as_ref().is_some_and(|(_, _, noreturn)| *noreturn),
+            current_signature: signature.as_ref().map(|(spec, _, _)| spec.clone()),
+            merged_signature: signature.map(|(spec, _, _)| spec),
             ..r2types::ParsedExternalContext::default()
         };
         self.interproc_max_iterations = self.interproc_max_iterations.max(1);

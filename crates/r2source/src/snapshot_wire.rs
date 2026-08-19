@@ -346,7 +346,8 @@ use crate::{
     AdvisoryCallPrototype, AdvisoryCallSite, AdvisorySuccessor, AdvisorySuccessorKind,
     CapturedSourceFields, DiagnosticIdentity, FunctionIdentity, FunctionPresentation,
     MachineProfile, OwnedFunctionBlock, OwnedFunctionImage, OwnedFunctionSnapshot,
-    SnapshotValidationError, SourceEndianness, SourceStackSlotName,
+    SnapshotValidationError, SourceEndianness, SourceSignatureParameter,
+    SourceSignaturePresentation, SourceStackSlotName,
 };
 
 const ENDIAN_LITTLE: u8 = 0;
@@ -507,6 +508,23 @@ pub fn write_presentation(
         });
         writer.i64(slot_name.offset());
         writer.string(slot_name.name())?;
+        writer.optional_string(slot_name.type_spelling())?;
+    }
+    match presentation.signature() {
+        Some(signature) => {
+            writer.bool(true);
+            writer.optional_string(signature.return_type())?;
+            writer.optional_string(signature.calling_convention())?;
+            writer.bool(signature.noreturn());
+            let count = u32::try_from(signature.parameters().len())
+                .map_err(|_| SnapshotWireError::ValueTooWide)?;
+            writer.u32(count);
+            for parameter in signature.parameters() {
+                writer.optional_string(parameter.name())?;
+                writer.optional_string(parameter.type_spelling())?;
+            }
+        }
+        None => writer.bool(false),
     }
     Ok(())
 }
@@ -534,12 +552,36 @@ pub fn read_presentation(
             }
         };
         let offset = reader.i64()?;
-        stack_slot_names.push(SourceStackSlotName::new(base, offset, reader.string()?));
+        let name = reader.string()?.to_string();
+        let type_spelling = reader.optional_string()?.map(str::to_string);
+        stack_slot_names
+            .push(SourceStackSlotName::new(base, offset, name).with_type_spelling(type_spelling));
     }
+    let signature = if reader.bool()? {
+        let return_type = reader.optional_string()?.map(str::to_string);
+        let calling_convention = reader.optional_string()?.map(str::to_string);
+        let noreturn = reader.bool()?;
+        let count = reader.u32()? as usize;
+        let mut parameters = Vec::with_capacity(count.min(1024));
+        for _ in 0..count {
+            let name = reader.optional_string()?.map(str::to_string);
+            let type_spelling = reader.optional_string()?.map(str::to_string);
+            parameters.push(SourceSignatureParameter::new(name, type_spelling));
+        }
+        Some(SourceSignaturePresentation::new(
+            return_type,
+            calling_convention,
+            noreturn,
+            parameters,
+        ))
+    } else {
+        None
+    };
     Ok(FunctionPresentation {
         display_name: display_name.into(),
         parameter_names: parameter_names.into_boxed_slice(),
         stack_slot_names: stack_slot_names.into_boxed_slice(),
+        signature,
     })
 }
 
@@ -1651,11 +1693,18 @@ mod tests {
         let presentation = FunctionPresentation {
             display_name: "process_string".into(),
             parameter_names: Box::new([]),
+            signature: Some(SourceSignaturePresentation::new(
+                Some("int"),
+                Some("apcs"),
+                false,
+                [SourceSignatureParameter::new(Some("s"), Some("char *"))],
+            )),
             stack_slot_names: Box::new([SourceStackSlotName::new(
                 StackAddressBase::StackPointer,
                 -40,
                 "len",
-            )]),
+            )
+            .with_type_spelling(Some("size_t"))]),
         };
         write_presentation(&mut writer, &presentation).expect("write");
         let buffer = writer.finish().expect("finish");
@@ -1928,6 +1977,7 @@ mod tests {
             let presentation = FunctionPresentation {
                 display_name: "safe_array_access".into(),
                 stack_slot_names: Box::new([]),
+                signature: None,
                 parameter_names: names
                     .iter()
                     .map(|name| Box::<str>::from(*name))
@@ -2556,6 +2606,7 @@ mod tests {
                 // presentation names must match the interface's parameter count,
                 // and must be absent entirely when there is no interface
                 stack_slot_names: Box::new([]),
+                signature: None,
                 parameter_names: match function_interface.as_ref() {
                     Some(interface) => (0..interface.parameters().len())
                         .map(|index| Box::<str>::from(format!("arg{index}").as_str()))
