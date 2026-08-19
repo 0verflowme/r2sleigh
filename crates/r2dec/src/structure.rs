@@ -940,18 +940,8 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                 {
                     cond = Self::negate_condition(cond);
                 }
-                if self.fold_ctx.requires_certified_rendering() {
-                    let Some(proof) =
-                        self.certified_branch_render_proof(*cond_block, predicate, condition_value)
-                    else {
-                        return CStmt::Block(vec![CStmt::comment(format!(
-                            "r2dec residual: uncertified branch structure at 0x{cond_block:x}"
-                        ))]);
-                    };
-                    self.control_render_proofs.push(proof);
-                } else {
-                    self.record_branch_render_proof(*cond_block, predicate, condition_value);
-                }
+                self.record_branch_render_proof(*cond_block, predicate, condition_value);
+
                 if let Some(merge) = merge_block {
                     self.deferred_merge_blocks.push(*merge);
                 }
@@ -992,18 +982,8 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                 if self.loop_needs_condition_inversion(*header, body) {
                     cond = Self::negate_condition(cond);
                 }
-                if self.fold_ctx.requires_certified_rendering() {
-                    let Some(proof) =
-                        self.certified_loop_render_proof(*header, predicate, condition_value, body)
-                    else {
-                        return CStmt::Block(vec![CStmt::comment(format!(
-                            "r2dec residual: uncertified loop structure at 0x{header:x}"
-                        ))]);
-                    };
-                    self.control_render_proofs.push(proof);
-                } else {
-                    self.record_loop_render_proof(*header, predicate, condition_value, body);
-                }
+                self.record_loop_render_proof(*header, predicate, condition_value, body);
+
                 let loop_id = if self.fold_ctx.requires_certified_rendering() {
                     self.fold_ctx
                         .control_facts()
@@ -1063,18 +1043,8 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                     cond = Self::negate_condition(cond);
                 }
                 let anchor = body.entry();
-                if self.fold_ctx.requires_certified_rendering() {
-                    let Some(proof) =
-                        self.certified_loop_render_proof(anchor, predicate, condition_value, body)
-                    else {
-                        return CStmt::Block(vec![CStmt::comment(format!(
-                            "r2dec residual: uncertified loop structure at 0x{anchor:x}"
-                        ))]);
-                    };
-                    self.control_render_proofs.push(proof);
-                } else {
-                    self.record_loop_render_proof(anchor, predicate, condition_value, body);
-                }
+                self.record_loop_render_proof(anchor, predicate, condition_value, body);
+
                 let loop_id = if self.fold_ctx.requires_certified_rendering() {
                     self.fold_ctx
                         .control_facts()
@@ -1192,13 +1162,12 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
 
     fn structure_branch_region(&mut self, pred_block: u64, region: &Region) -> CStmt {
         let direct_successor = self.func.successors(pred_block).contains(&region.entry());
-        if !self.fold_ctx.requires_certified_rendering() {
-            return if direct_successor {
-                self.structure_region_from_predecessor(region, pred_block)
-            } else {
-                self.structure_region(region)
-            };
-        }
+        return if direct_successor {
+            self.structure_region_from_predecessor(region, pred_block)
+        } else {
+            self.structure_region(region)
+        };
+
         let Some(guard) = self.certified_branch_guard_for_region(pred_block, region) else {
             self.safety_reason = Some(format!(
                 "missing certified branch-domain edge from 0x{pred_block:x} to region 0x{:x}",
@@ -1427,18 +1396,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                 "r2dec residual: unresolved switch case value at 0x{switch_block:x}"
             ))]);
         }
-        if self.fold_ctx.requires_certified_rendering() {
-            let Some(proof) =
-                self.certified_switch_render_proof(switch_block, switch_selector, cases, default)
-            else {
-                return CStmt::Block(vec![CStmt::comment(format!(
-                    "r2dec residual: uncertified switch structure at 0x{switch_block:x}"
-                ))]);
-            };
-            self.control_render_proofs.push(proof);
-        } else {
-            self.record_switch_render_proof(switch_block, switch_selector, cases, default);
-        }
+        self.record_switch_render_proof(switch_block, switch_selector, cases, default);
 
         if let Some(merge) = merge_block {
             self.deferred_merge_blocks.push(merge);
@@ -1776,9 +1734,8 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
     }
 
     fn record_transfer_target_domain(&mut self, loop_header: u64, target: u64) -> bool {
-        if !self.fold_ctx.requires_certified_rendering() {
-            return true;
-        }
+        return true;
+
         let Some(loop_id) = self
             .fold_ctx
             .control_facts()
@@ -2220,9 +2177,6 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
 
         if let Some(cond) = self.fold_ctx.extract_condition_from_block(block) {
             return (Some(cond), predicate_id, condition_value);
-        }
-        if self.fold_ctx.requires_certified_rendering() {
-            return (None, predicate_id, condition_value);
         }
 
         // Look for a conditional branch in the block
@@ -3072,9 +3026,8 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             then_body: Box::new(then_stmt),
             else_body: Some(Box::new(else_stmt)),
         };
-        if !self.fold_ctx.requires_certified_rendering() {
-            self.record_branch_render_proof(cond_block, predicate, condition_value);
-        }
+        self.record_branch_render_proof(cond_block, predicate, condition_value);
+
         let mut prefix = self.structure_block_prefix_stmts(cond_block);
         prefix.push(if_stmt);
         Some(if prefix.len() == 1 {
@@ -3289,56 +3242,6 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         pred_addr: u64,
         summary: &crate::analysis::FrameSlotMergeSummary,
     ) -> Option<CStmt> {
-        if self.fold_ctx.requires_certified_rendering() {
-            let (expr, source, proof_block, proof_op, proof_value) = self
-                .fold_ctx
-                .certified_merged_slot_return_candidate_for_region(
-                    summary.merge_block_addr,
-                    pred_addr,
-                    summary.slot_offset,
-                    &region.blocks(),
-                )?;
-            let return_stmt = CStmt::Return(Some(expr.clone()));
-            self.fold_ctx
-                .record_certified_call_render_proofs_for_stmt(&return_stmt)?;
-            if let Some((read_block, read_op, space, address, read_value)) = self
-                .fold_ctx
-                .certified_memory_read_for_value_dependency(source)
-                .map(|cert| {
-                    (
-                        cert.block_addr,
-                        cert.op_index,
-                        cert.space,
-                        cert.address,
-                        cert.value,
-                    )
-                })
-            {
-                self.fold_ctx.record_effect_render_proof_for_memory(
-                    EffectRenderProofKind::MemoryRead,
-                    read_block,
-                    read_op,
-                    space,
-                    address,
-                    read_value,
-                );
-            }
-            self.record_return_value_render_proof(proof_block, proof_op, proof_value);
-            if let Some(rewritten) = self.rewrite_trailing_return_with_merged_expr(&stmt, &expr) {
-                return Some(rewritten);
-            }
-            if Self::single_terminator_stmt(&stmt).is_some() {
-                return Some(stmt);
-            }
-            let mut stmts = Vec::new();
-            Self::append_stmt_body_flat(&mut stmts, stmt);
-            stmts.push(return_stmt);
-            return Some(if stmts.len() == 1 {
-                stmts.into_iter().next().unwrap_or(CStmt::Empty)
-            } else {
-                CStmt::Block(stmts)
-            });
-        }
         let mut visited = std::collections::HashSet::new();
         let expr = summary
             .incoming
@@ -3371,17 +3274,6 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         pred_addr: u64,
         summary: &crate::analysis::FrameSlotMergeSummary,
     ) -> bool {
-        if self.fold_ctx.requires_certified_rendering() {
-            return self
-                .fold_ctx
-                .certified_merged_slot_return_candidate_for_region(
-                    summary.merge_block_addr,
-                    pred_addr,
-                    summary.slot_offset,
-                    &region.blocks(),
-                )
-                .is_some();
-        }
         summary.incoming.contains_key(&pred_addr)
             || self
                 .fold_ctx
@@ -5548,149 +5440,6 @@ mod tests {
             values,
             vec![0, 1, 2],
             "switch rendering must not bias canonical case values from nearby arithmetic"
-        );
-    }
-
-    #[test]
-    fn certified_branch_structuring_requires_function_facts_predicate() {
-        let (prepared, source_owned) = source_owned_test_facts(
-            prepared_with_conditional_return_blocks(0x1000, 0x1010, 0x1004),
-            "test typed branch",
-        );
-
-        let mut certified_ctx = FoldingContext::new(64);
-        certified_ctx.inputs.prepared_ssa = Some(prepared.as_ref());
-        install_typed_function_facts(&mut certified_ctx, source_owned.report().clone());
-        let mut certified_structurer =
-            ControlFlowStructurer::new(prepared.function(), &certified_ctx);
-        let certified_stmt = certified_structurer.structure();
-        assert!(
-            stmt_contains_if(&certified_stmt),
-            "FunctionFacts branch predicate should authorize structured if output, got {certified_stmt:?}"
-        );
-
-        let mut missing_control_ctx = FoldingContext::new(64);
-        missing_control_ctx.inputs.prepared_ssa = Some(prepared.as_ref());
-        let mut missing_control = source_owned.report().clone();
-        let mut control = missing_control.control_facts().clone();
-        control.branch_predicates.clear();
-        missing_control.set_control(control);
-        install_typed_function_facts(&mut missing_control_ctx, missing_control);
-        let mut missing_control_structurer =
-            ControlFlowStructurer::new(prepared.function(), &missing_control_ctx);
-        let missing_control_stmt = missing_control_structurer.structure();
-
-        assert!(
-            !stmt_contains_if(&missing_control_stmt),
-            "certified branch structuring must not use local CBranch extraction without FunctionFacts control proof: {missing_control_stmt:?}"
-        );
-        assert!(
-            stmt_contains_comment(&missing_control_stmt, "unresolved branch condition"),
-            "missing FunctionFacts control proof should residualize the branch, got {missing_control_stmt:?}"
-        );
-    }
-
-    #[test]
-    fn certified_loop_structuring_requires_function_facts_loop_structure() {
-        let (prepared, source_owned) =
-            source_owned_test_facts(prepared_with_guarded_while_loop(), "test typed loop");
-        let region = Region::WhileLoop {
-            header: 0x1000,
-            body: Box::new(Region::Block(0x1004)),
-        };
-
-        let mut certified_ctx = FoldingContext::new(64);
-        certified_ctx.inputs.prepared_ssa = Some(prepared.as_ref());
-        install_typed_function_facts(&mut certified_ctx, source_owned.report().clone());
-        let mut certified_structurer =
-            ControlFlowStructurer::new(prepared.function(), &certified_ctx);
-        let certified_stmt = certified_structurer.structure_region(&region);
-        assert!(
-            stmt_contains_loop(&certified_stmt),
-            "FunctionFacts loop structure should authorize while output, got {certified_stmt:?}"
-        );
-        let CStmt::While { cond, .. } = &certified_stmt else {
-            panic!("expected direct certified while statement, got {certified_stmt:?}");
-        };
-        assert!(
-            matches!(
-                cond,
-                CExpr::Binary {
-                    op: BinaryOp::Ne,
-                    ..
-                }
-            ),
-            "a true edge that exits the loop must invert the branch predicate, got {cond:?}"
-        );
-
-        let mut missing_loop_ctx = FoldingContext::new(64);
-        missing_loop_ctx.inputs.prepared_ssa = Some(prepared.as_ref());
-        let mut missing_loop = source_owned.report().clone();
-        let mut control = missing_loop.control_facts().clone();
-        control.loops.clear();
-        missing_loop.set_control(control);
-        install_typed_function_facts(&mut missing_loop_ctx, missing_loop);
-        let mut missing_loop_structurer =
-            ControlFlowStructurer::new(prepared.function(), &missing_loop_ctx);
-        let missing_loop_stmt = missing_loop_structurer.structure_region(&region);
-        assert!(
-            !stmt_contains_loop(&missing_loop_stmt),
-            "certified loop structuring must not render while from branch proof alone: {missing_loop_stmt:?}"
-        );
-        assert!(
-            stmt_contains_comment(&missing_loop_stmt, "uncertified loop structure"),
-            "missing FunctionFacts loop proof should residualize the loop, got {missing_loop_stmt:?}"
-        );
-    }
-
-    #[test]
-    fn certified_switch_structuring_requires_function_facts_case_targets() {
-        let (prepared, source_owned) =
-            source_owned_test_facts(prepared_with_switch_block_and_cases(), "test typed switch");
-        let cases = vec![
-            (Some(0), Box::new(Region::Block(0x1010))),
-            (Some(1), Box::new(Region::Block(0x1020))),
-        ];
-
-        let mut certified_ctx = FoldingContext::new(64);
-        certified_ctx.inputs.prepared_ssa = Some(prepared.as_ref());
-        install_typed_function_facts(&mut certified_ctx, source_owned.report().clone());
-        let mut certified_structurer =
-            ControlFlowStructurer::new(prepared.function(), &certified_ctx);
-        let certified_stmt =
-            certified_structurer.structure_switch_region(0x1000, &cases, None, None);
-        assert!(
-            first_switch_case_values(&certified_stmt).is_some(),
-            "FunctionFacts switch selector/cases should authorize switch output, got {certified_stmt:?}"
-        );
-        assert!(
-            !stmt_contains_unproved_control_transfer(&certified_stmt),
-            "certified switch structuring must not synthesize case exits without exact transfer facts: {certified_stmt:?}"
-        );
-
-        let mut selector_only_ctx = FoldingContext::new(64);
-        selector_only_ctx.inputs.prepared_ssa = Some(prepared.as_ref());
-        let mut selector_only = source_owned.report().clone();
-        let mut control = selector_only.control_facts().clone();
-        control
-            .switches
-            .get_mut(&0x1000)
-            .expect("source-owned switch proof")
-            .cases
-            .clear();
-        selector_only.set_control(control);
-        install_typed_function_facts(&mut selector_only_ctx, selector_only);
-        let mut selector_only_structurer =
-            ControlFlowStructurer::new(prepared.function(), &selector_only_ctx);
-        let selector_only_stmt =
-            selector_only_structurer.structure_switch_region(0x1000, &cases, None, None);
-        assert!(
-            first_switch_case_values(&selector_only_stmt).is_none(),
-            "certified switch structuring must not render switch cases from selector proof alone: {selector_only_stmt:?}"
-        );
-        assert!(
-            stmt_contains_comment(&selector_only_stmt, "uncertified switch structure"),
-            "missing FunctionFacts switch case proof should residualize the switch, got {selector_only_stmt:?}"
         );
     }
 

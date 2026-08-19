@@ -720,9 +720,6 @@ impl<'a> FoldingContext<'a> {
         prov: &PredicateComparisonFact,
         block_addr: Option<u64>,
     ) -> Option<CExpr> {
-        if self.requires_certified_rendering() {
-            return self.certified_compare_provenance_expr(prov, block_addr);
-        }
         let lhs_var = self.prepared_var_for_value_id(prov.lhs)?;
         let rhs_var = self.prepared_var_for_value_id(prov.rhs)?;
         let compare_width = lhs_var.size.max(rhs_var.size);
@@ -1136,9 +1133,6 @@ impl<'a> FoldingContext<'a> {
             && self.inputs.arch.is_return_register_name(&lower_name)
             && self.local_return_register_chain_is_call_result(block, before_idx, var, 0)
         {
-            if self.requires_certified_rendering() {
-                return None;
-            }
             if let Some(call_expr) = self
                 .lookup_definition(&var.display_name())
                 .filter(|expr| matches!(expr, CExpr::Call { .. }))

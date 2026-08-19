@@ -37,17 +37,15 @@ impl<'a> FoldingContext<'a> {
         call: CExpr,
         certified_args: CertifiedCallArgs,
     ) -> LoweredOp {
-        if !self.requires_certified_rendering() {
-            if let Some(owner) =
-                self.materializable_call_result_expr_for_call_expr((block_addr, op_idx), &call)
-            {
-                return LoweredOp::Assign {
-                    lhs: owner,
-                    rhs: call,
-                };
-            }
-            return LoweredOp::Expr(call);
+        if let Some(owner) =
+            self.materializable_call_result_expr_for_call_expr((block_addr, op_idx), &call)
+        {
+            return LoweredOp::Assign {
+                lhs: owner,
+                rhs: call,
+            };
         }
+        return LoweredOp::Expr(call);
 
         let Some(callsite) = self.certified_callsite_for_op(block_addr, op_idx) else {
             return LoweredOp::Comment(format!(

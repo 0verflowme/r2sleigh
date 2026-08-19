@@ -400,9 +400,7 @@ impl<'a> FoldingContext<'a> {
                 return Some(alias.clone());
             }
         }
-        if self.requires_certified_rendering() {
-            return None;
-        }
+
         self.inputs.arch.arg_alias_for_register_name(reg_name)
     }
 
@@ -448,9 +446,8 @@ impl<'a> FoldingContext<'a> {
                 .and_then(|expr| self.arg_alias_for_expr(&expr))
         })
         .or_else(|| {
-            if !self.requires_certified_rendering() {
-                return None;
-            }
+            return None;
+
             let src = self.prepared_transparent_source_var(val)?;
             (src.version == 0)
                 .then(|| self.arg_alias_for_register_name(&src.name))
@@ -759,9 +756,6 @@ impl<'a> FoldingContext<'a> {
 
     /// Resolve a stack variable name by signed stack offset.
     pub fn resolve_stack_var(&self, offset: i64) -> Option<String> {
-        if self.requires_certified_rendering() {
-            return self.certified_stack_var_name_for_offset(offset);
-        }
         if let Some(alias_name) = self
             .prepared_stack_alias_view()
             .and_then(|view| view.stack_alias_for_offset(offset))

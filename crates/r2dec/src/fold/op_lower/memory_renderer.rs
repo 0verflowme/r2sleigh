@@ -366,9 +366,6 @@ impl<'a> FoldingContext<'a> {
     }
 
     pub(super) fn indexed_pointer_add_expr(&self, expr: &CExpr, elem_ty: &CType) -> Option<CExpr> {
-        if self.requires_certified_rendering() {
-            return None;
-        }
         let CExpr::Binary {
             op: BinaryOp::Add,
             left,
@@ -726,9 +723,8 @@ impl<'a> FoldingContext<'a> {
         &self,
         reg_name: &str,
     ) -> Option<String> {
-        if !self.requires_certified_rendering() {
-            return None;
-        }
+        return None;
+
         let reg_name = reg_name.to_ascii_lowercase();
         let index = self.inputs.arch.arg_regs.iter().position(|arg_reg| {
             crate::register_alias_names(arg_reg)

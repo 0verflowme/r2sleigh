@@ -852,23 +852,13 @@ impl<'a> FoldingContext<'a> {
     }
 
     pub(crate) fn requires_certified_rendering(&self) -> bool {
-        #[cfg(test)]
-        {
-            self.inputs.certified_rendering_required
-        }
-        #[cfg(not(test))]
-        {
-            false
-        }
+        false
     }
 
     pub(crate) fn stable_stack_value_for_offset(
         &self,
         offset: i64,
     ) -> Option<&analysis::SemanticValue> {
-        if self.requires_certified_rendering() {
-            return None;
-        }
         self.use_info().stable_stack_values.get(&offset)
     }
 
@@ -1092,9 +1082,8 @@ impl<'a> FoldingContext<'a> {
     }
 
     pub(super) fn record_certified_call_arg_memory_render_proofs(&self, values: &[r2ssa::ValueId]) {
-        if !self.requires_certified_rendering() {
-            return;
-        }
+        return;
+
         let mut seen = BTreeSet::new();
         for value in values {
             let Some(cert) = self.certified_memory_read_for_value_dependency(*value) else {
@@ -1130,9 +1119,8 @@ impl<'a> FoldingContext<'a> {
     }
 
     pub(crate) fn current_return_target_is_certified(&self, target: &SSAVar) -> bool {
-        if !self.requires_certified_rendering() {
-            return true;
-        }
+        return true;
+
         let Some(cert) = self.certified_return_for_current_op() else {
             return false;
         };
@@ -3131,9 +3119,6 @@ impl<'a> FoldingContext<'a> {
         visible_name: &str,
     ) -> Option<CExpr> {
         let source_call = self.source_call_for_visible_owner_name(visible_name)?;
-        if self.requires_certified_rendering() {
-            return self.synthesized_call_expr_for_source_call(source_call);
-        }
 
         self.call_result_exprs_map()
             .get(&source_call)
@@ -3167,13 +3152,6 @@ impl<'a> FoldingContext<'a> {
     }
 
     fn source_call_for_visible_owner_name(&self, visible_name: &str) -> Option<(u64, usize)> {
-        if self.requires_certified_rendering() {
-            let source_call = self.prepared_source_call_for_visible_owner_name(visible_name)?;
-            return self
-                .stable_owned_call_result_name_for_source(source_call)
-                .is_some_and(|owner| owner.eq_ignore_ascii_case(visible_name))
-                .then_some(source_call);
-        }
         self.ownership()
             .source_for_visible_owner_name(visible_name)
             .map(Into::into)
@@ -3264,9 +3242,7 @@ impl<'a> FoldingContext<'a> {
         stmt: &CStmt,
         current_source_call: Option<(u64, usize)>,
     ) -> Option<()> {
-        if !self.requires_certified_rendering() {
-            return Some(());
-        }
+        return Some(());
 
         let mut sources = BTreeSet::new();
         self.collect_certified_rendered_call_sources_for_stmt(
@@ -3300,9 +3276,8 @@ impl<'a> FoldingContext<'a> {
         &self,
         source_call: (u64, usize),
     ) -> Option<()> {
-        if !self.requires_certified_rendering() {
-            return Some(());
-        }
+        return Some(());
+
         let call = self.certified_synthesized_call_expr_for_source_call(source_call)?;
         self.record_call_effect_render_proof(
             source_call.0,
@@ -4568,9 +4543,7 @@ impl<'a> FoldingContext<'a> {
         if let Some(selector) = self.resolve_switch_expr_from_control_facts(block_addr) {
             return Some(selector);
         }
-        if self.requires_certified_rendering() {
-            return None;
-        }
+
         if let Some(expr) = self
             .prepared_semantic_view()
             .and_then(|view| view.switch_selector_expr_for_block(block_addr).cloned())
@@ -4601,11 +4574,6 @@ impl<'a> FoldingContext<'a> {
                     .map(|var| (selector, var))
             })
         {
-            if self.requires_certified_rendering() {
-                return self
-                    .render_certified_value_expr_for_var(selector)
-                    .map(|expr| (expr, Some(selector_id)));
-            }
             let rooted = self
                 .prepared_canonical_value_root(selector)
                 .unwrap_or_else(|| selector.clone());
@@ -5489,9 +5457,8 @@ impl<'a> FoldingContext<'a> {
         access_size: Option<u32>,
         is_write: bool,
     ) -> Option<String> {
-        if !self.requires_certified_rendering() {
-            return Some(field_name);
-        }
+        return Some(field_name);
+
         let offset = u64::try_from(offset).ok()?;
         let has_layout_certificate = self.inputs.field_access_certificates.iter().any(|cert| {
             cert.field_offset == offset
@@ -5529,9 +5496,8 @@ impl<'a> FoldingContext<'a> {
         access_size: Option<u32>,
         is_write: bool,
     ) -> Option<String> {
-        if !self.requires_certified_rendering() {
-            return None;
-        }
+        return None;
+
         let offset = u64::try_from(offset).ok()?;
         let render_facts = self.inputs.render_facts()?;
         let block_addr = self.current_block_addr.get()?;
@@ -5572,9 +5538,8 @@ impl<'a> FoldingContext<'a> {
         access_size: Option<u32>,
         is_write: bool,
     ) -> bool {
-        if !self.requires_certified_rendering() {
-            return true;
-        }
+        return true;
+
         let Ok(field_offset) = u64::try_from(field_offset) else {
             return false;
         };
@@ -7115,9 +7080,8 @@ impl<'a> FoldingContext<'a> {
     }
 
     fn certified_signature_arg_register_for_param_name(&self, name: &str) -> Option<&str> {
-        if !self.requires_certified_rendering() {
-            return None;
-        }
+        return None;
+
         let signature = self
             .inputs
             .function_facts
@@ -7367,9 +7331,6 @@ impl<'a> FoldingContext<'a> {
     }
 
     pub(crate) fn stack_offset_for_visible_storage_name(&self, name: &str) -> Option<i64> {
-        if self.requires_certified_rendering() {
-            return self.certified_stack_offset_for_visible_storage_name(name);
-        }
         let lower = name.to_ascii_lowercase();
         if lower == "stack" {
             return Some(0);
@@ -7444,9 +7405,7 @@ impl<'a> FoldingContext<'a> {
         if let Some(offset) = self.stack_offset_for_visible_storage_name(name) {
             offsets.push(offset);
         }
-        if self.requires_certified_rendering() {
-            return offsets;
-        }
+
         if let Some(offset) = self.canonical_stack_offset_for_visible_storage_name(name)
             && !offsets.contains(&offset)
         {
@@ -7737,12 +7696,7 @@ impl<'a> FoldingContext<'a> {
                 self.find_ssa_name_for_rendered_alias(name)
                     .and_then(|ssa_name| self.use_info().render_stack_slot_for_name(&ssa_name))
             })?;
-        if self.requires_certified_rendering() {
-            return self
-                .certified_stack_offset_for_visible_storage_name(name)
-                .filter(|offset| *offset == provenance.offset)
-                .map(|_| provenance);
-        }
+
         Some(provenance)
     }
 
@@ -7883,9 +7837,8 @@ impl<'a> FoldingContext<'a> {
     }
 
     fn certified_autogenerated_stack_storage_offset(&self, name: &str) -> Option<i64> {
-        if !self.requires_certified_rendering() {
-            return None;
-        }
+        return None;
+
         let offset = Self::autogenerated_stack_home_offset(name)?;
         let render_facts = self.inputs.render_facts()?;
         let mut objects = render_facts
@@ -8028,9 +7981,6 @@ impl<'a> FoldingContext<'a> {
         &self,
         aliases: impl IntoIterator<Item = &'b String>,
     ) -> Option<String> {
-        if self.requires_certified_rendering() {
-            return None;
-        }
         let mut best_name: Option<String> = None;
         let mut best_expr: Option<CExpr> = None;
 
@@ -8058,9 +8008,6 @@ impl<'a> FoldingContext<'a> {
         &self,
         source_call: (u64, usize),
     ) -> Option<CExpr> {
-        if self.requires_certified_rendering() {
-            return self.certified_assigned_call_result_owner_expr_for_source(source_call);
-        }
         let owner_name = self.stable_owned_call_result_name_for_source(source_call)?;
         if self.should_skip_unused_transient_call_result_owner(source_call, &owner_name) {
             return None;
@@ -8248,9 +8195,6 @@ impl<'a> FoldingContext<'a> {
         &self,
         source_call: (u64, usize),
     ) -> Option<String> {
-        if self.requires_certified_rendering() {
-            return self.certified_call_result_owner_name_for_source(source_call);
-        }
         let prepared_name = self
             .prepared_result_owner_name_for_source(source_call)
             .filter(|name| {
@@ -8362,19 +8306,6 @@ impl<'a> FoldingContext<'a> {
         &self,
         visible_name: &str,
     ) -> Option<(u64, usize)> {
-        if self.requires_certified_rendering() {
-            let facts = self.inputs.call_result_facts()?;
-            for callsite in facts.by_callsite.keys() {
-                let source_call = (callsite.block_addr, callsite.op_index);
-                if self
-                    .certified_call_result_owner_name_for_source(source_call)
-                    .is_some_and(|owner| owner.eq_ignore_ascii_case(visible_name))
-                {
-                    return Some(source_call);
-                }
-            }
-            return None;
-        }
         self.prepared_semantic_view()?
             .call_view_by_site
             .iter()
@@ -8391,10 +8322,6 @@ impl<'a> FoldingContext<'a> {
         &self,
         source_call: (u64, usize),
     ) -> Option<CExpr> {
-        if self.requires_certified_rendering() {
-            return self.certified_call_result_owner_expr_for_source(source_call);
-        }
-
         let prepared_owner = self
             .prepared_semantic_view()
             .and_then(|view| view.call_view_for_site(source_call))
@@ -8645,9 +8572,6 @@ impl<'a> FoldingContext<'a> {
                 let owner = self.stable_owned_call_result_expr_for_source(source_call)?;
                 match owner {
                     CExpr::Var(owner_name) if owner_name.eq_ignore_ascii_case(lhs_name) => {
-                        if self.requires_certified_rendering() {
-                            return self.synthesized_call_expr_for_source_call(source_call);
-                        }
                         return Some(self.normalize_call_expr_for_source_call(
                             source_call,
                             original_rhs.clone(),
@@ -8663,10 +8587,6 @@ impl<'a> FoldingContext<'a> {
         let owner_name = self.stable_owned_call_result_name_for_source(source_call)?;
         if !owner_name.eq_ignore_ascii_case(lhs_name) {
             return None;
-        }
-
-        if self.requires_certified_rendering() {
-            return self.synthesized_call_expr_for_source_call(source_call);
         }
 
         if let Some(expr) = self.call_result_exprs_map().get(&source_call) {
@@ -8698,18 +8618,6 @@ impl<'a> FoldingContext<'a> {
     }
 
     pub(super) fn should_preserve_owned_call_result_visible_name(&self, name: &str) -> bool {
-        if self.requires_certified_rendering() {
-            let rendered_name = self.rendered_visible_name_for_ssa_name(name);
-            return self
-                .call_result_source_for_ssa_name(name)
-                .or_else(|| self.local_post_call_source_for_ssa_name(name))
-                .or_else(|| self.source_call_for_visible_owner_name(name))
-                .or_else(|| self.source_call_for_visible_owner_name(&rendered_name))
-                .and_then(|source| self.stable_owned_call_result_name_for_source(source))
-                .is_some_and(|owner| {
-                    owner.eq_ignore_ascii_case(name) || owner.eq_ignore_ascii_case(&rendered_name)
-                });
-        }
         self.ownership().has_visible_owner_name(name)
             || self
                 .call_result_source_for_ssa_name(name)
@@ -8726,9 +8634,6 @@ impl<'a> FoldingContext<'a> {
         &self,
         name: &str,
     ) -> Option<(u64, usize)> {
-        if self.requires_certified_rendering() {
-            return self.certified_materialized_call_result_source_for_visible_name(name);
-        }
         let resolved_name = self
             .find_ssa_name_for_rendered_alias(name)
             .unwrap_or_else(|| name.to_string());
@@ -8775,10 +8680,6 @@ impl<'a> FoldingContext<'a> {
     }
 
     pub(crate) fn call_result_source_for_ssa_name(&self, ssa_name: &str) -> Option<(u64, usize)> {
-        if self.requires_certified_rendering() {
-            return self.certified_call_result_source_for_ssa_name(ssa_name);
-        }
-
         let source_call = self
             .ownership()
             .source_for_alias(ssa_name)
@@ -8805,9 +8706,6 @@ impl<'a> FoldingContext<'a> {
         &self,
         ssa_name: &str,
     ) -> Option<(u64, usize)> {
-        if self.requires_certified_rendering() {
-            return None;
-        }
         let block_addr = self.current_block_addr.get()?;
         let func = self
             .inputs
@@ -8823,9 +8721,6 @@ impl<'a> FoldingContext<'a> {
         ssa_name: &str,
         depth: u32,
     ) -> Option<(u64, usize)> {
-        if self.requires_certified_rendering() {
-            return None;
-        }
         self.raw_local_post_call_source_for_ssa_name_in_block(block, ssa_name, depth)
     }
 
@@ -8906,10 +8801,6 @@ impl<'a> FoldingContext<'a> {
         name: &str,
         include_direct_aliases: bool,
     ) -> Option<CExpr> {
-        if self.requires_certified_rendering() {
-            return self
-                .certified_stable_owned_call_result_expr_for_name(name, include_direct_aliases);
-        }
         let resolved_name = self
             .find_ssa_name_for_rendered_alias(name)
             .unwrap_or_else(|| name.to_string());
@@ -9012,10 +8903,6 @@ impl<'a> FoldingContext<'a> {
     }
 
     fn call_result_alias_has_stack_owner_provenance(&self, name: &str) -> bool {
-        if self.requires_certified_rendering() {
-            return self.stack_slot_provenance_for_name(name).is_some()
-                || self.stack_offset_for_visible_storage_name(name).is_some();
-        }
         self.stack_slot_provenance_for_name(name).is_some()
             || self.semantic_stack_owner_name_for_alias(name).is_some()
             || self
@@ -10915,9 +10802,6 @@ impl<'a> FoldingContext<'a> {
         depth: u32,
         visited: &mut HashSet<String>,
     ) -> CExpr {
-        if self.requires_certified_rendering() {
-            return self.certified_semanticize_visible_expr(expr, depth, visited);
-        }
         if depth > Self::MAX_SEMANTIC_RENDER_DEPTH {
             return expr.clone();
         }
@@ -11750,9 +11634,6 @@ impl<'a> FoldingContext<'a> {
     }
 
     fn promote_constant_indexed_call_arg(&self, addr_expr: &CExpr) -> Option<CExpr> {
-        if self.requires_certified_rendering() {
-            return None;
-        }
         let canonical = self.canonicalize_visible_address_expr(addr_expr, 0);
         let addr = self.normalized_addr_from_visible_expr(&canonical, 0)?;
         if addr.index.is_some() || addr.offset_bytes == 0 {
@@ -13732,10 +13613,6 @@ impl<'a> FoldingContext<'a> {
     }
 
     fn is_materialized_call_result_stack_home_store(&self, addr: &SSAVar, val: &SSAVar) -> bool {
-        if self.requires_certified_rendering() {
-            return self.is_certified_materialized_call_result_stack_home_store(addr, val);
-        }
-
         let Some(offset) = self
             .stack_slot_offset_for_var(addr)
             .or_else(|| self.extract_stack_offset_from_var(addr))
@@ -13750,9 +13627,8 @@ impl<'a> FoldingContext<'a> {
             .call_result_source_for_ssa_name(&val_name)
             .or_else(|| self.local_post_call_source_for_ssa_name(&val_name))
             .or_else(|| {
-                if !self.requires_certified_rendering() {
-                    return None;
-                }
+                return None;
+
                 let block_addr = self.current_block_addr.get()?;
                 let prepared = self.inputs.prepared_ssa?;
                 let block = prepared.function().get_block(block_addr)?;
@@ -14140,18 +14016,17 @@ impl<'a> FoldingContext<'a> {
                     &lhs,
                     CExpr::Var(name) if matches!(self.lookup_type_hint(name), Some(CType::Pointer(_)))
                 );
-                if !self.requires_certified_rendering() {
-                    if let Some(rmw_rhs) = self.stack_read_modify_write_rhs(&lhs, addr, val) {
-                        rhs = rmw_rhs;
-                    } else {
-                        if !self.is_pointer_typed_var(val) || !lhs_is_pointer_typed {
-                            rhs = self.collapse_scalar_stack_addr_artifact(rhs);
-                        }
-                        if !lhs_is_pointer_typed {
-                            rhs = self.rewrite_scalar_stack_placeholder_rhs(&lhs, rhs);
-                        }
+                if let Some(rmw_rhs) = self.stack_read_modify_write_rhs(&lhs, addr, val) {
+                    rhs = rmw_rhs;
+                } else {
+                    if !self.is_pointer_typed_var(val) || !lhs_is_pointer_typed {
+                        rhs = self.collapse_scalar_stack_addr_artifact(rhs);
+                    }
+                    if !lhs_is_pointer_typed {
+                        rhs = self.rewrite_scalar_stack_placeholder_rhs(&lhs, rhs);
                     }
                 }
+
                 if let Some(val_ty) = self.type_hint_for_var(val)
                     && matches!(val_ty, CType::Pointer(_))
                     && !self.looks_like_pointer(&rhs)
@@ -14466,16 +14341,7 @@ impl<'a> FoldingContext<'a> {
             }
             SSAOp::Call { target } => {
                 // Note: Call arguments are handled by op_to_stmt_with_args().
-                if self.requires_certified_rendering() {
-                    let (block_addr, op_idx) =
-                        match (self.current_block_addr.get(), self.current_op_idx.get()) {
-                            (Some(block_addr), Some(op_idx)) => (block_addr, op_idx),
-                            _ => (0, 0),
-                        };
-                    return Some(self.certified_residual_comment(format!(
-                        "direct call lowering requires FunctionFacts callsite evidence at 0x{block_addr:x}:{op_idx}"
-                    )));
-                }
+
                 let func_expr = match (self.current_block_addr.get(), self.current_op_idx.get()) {
                     (Some(block_addr), Some(op_idx)) => {
                         self.resolve_call_target_for_site(block_addr, op_idx, target)
@@ -14487,16 +14353,7 @@ impl<'a> FoldingContext<'a> {
             }
             SSAOp::CallInd { target } => {
                 // Note: Call arguments are handled by op_to_stmt_with_args().
-                if self.requires_certified_rendering() {
-                    let (block_addr, op_idx) =
-                        match (self.current_block_addr.get(), self.current_op_idx.get()) {
-                            (Some(block_addr), Some(op_idx)) => (block_addr, op_idx),
-                            _ => (0, 0),
-                        };
-                    return Some(self.certified_residual_comment(format!(
-                        "direct indirect-call lowering requires FunctionFacts callsite evidence at 0x{block_addr:x}:{op_idx}"
-                    )));
-                }
+
                 let func_expr = match (self.current_block_addr.get(), self.current_op_idx.get()) {
                     (Some(block_addr), Some(op_idx)) => self
                         .resolved_callee_identity_expr_for_site(block_addr, op_idx)
