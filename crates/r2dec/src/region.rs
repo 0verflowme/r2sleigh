@@ -2168,14 +2168,6 @@ impl WorkingGraph {
             return Err(());
         }
 
-        let absorbed_terminal_exit_nodes =
-            self.terminal_return_exit_nodes(analyzer, &internal_nodes);
-        let absorbed_terminal_exit_blocks = absorbed_terminal_exit_nodes
-            .iter()
-            .flat_map(|node_id| self.node_blocks(*node_id))
-            .collect::<HashSet<_>>();
-        internal_nodes.extend(absorbed_terminal_exit_nodes);
-
         let mut external_preds = HashSet::new();
         let mut all_external_succs = HashSet::new();
 
@@ -2246,7 +2238,6 @@ impl WorkingGraph {
             analyzer,
             loop_info,
             &internal_nodes,
-            &absorbed_terminal_exit_blocks,
         );
         let mut collapsed_blocks = BTreeSet::new();
         for node_id in &internal_nodes {
@@ -2326,98 +2317,15 @@ impl WorkingGraph {
         Ok(())
     }
 
-    fn terminal_return_exit_nodes(
-        &self,
-        analyzer: &RegionAnalyzer<'_>,
-        internal_nodes: &HashSet<usize>,
-    ) -> HashSet<usize> {
-        let mut out = HashSet::new();
-        for node in internal_nodes {
-            if !analyzer.poll() {
-                return out;
-            }
-            for succ in self.sorted_succs(*node) {
-                if !analyzer.poll() {
-                    return out;
-                }
-                if internal_nodes.contains(&succ) || out.contains(&succ) {
-                    continue;
-                }
-                if let Some(chain) = self.terminal_return_exit_chain(analyzer, succ, internal_nodes)
-                {
-                    out.extend(chain);
-                }
-            }
-        }
-        out
-    }
-
-    fn terminal_return_exit_chain(
-        &self,
-        analyzer: &RegionAnalyzer<'_>,
-        start: usize,
-        internal_nodes: &HashSet<usize>,
-    ) -> Option<HashSet<usize>> {
-        let mut chain = HashSet::new();
-        let mut current = start;
-
-        loop {
-            if !analyzer.poll() {
-                return None;
-            }
-            if internal_nodes.contains(&current) || !self.nodes.contains_key(&current) {
-                return None;
-            }
-            if !self.preds.get(&current).is_some_and(|preds| {
-                preds
-                    .iter()
-                    .all(|pred| internal_nodes.contains(pred) || chain.contains(pred))
-            }) {
-                return None;
-            }
-            if !chain.insert(current) {
-                return None;
-            }
-            if self.node_is_terminal_return(analyzer, current) {
-                return Some(chain);
-            }
-
-            let succs = self.sorted_succs(current);
-            if succs.len() != 1 {
-                return None;
-            }
-            current = succs[0];
-        }
-    }
-
-    fn node_is_terminal_return(&self, analyzer: &RegionAnalyzer<'_>, node: usize) -> bool {
-        let Some(node_data) = self.nodes.get(&node) else {
-            return false;
-        };
-        if !self.sorted_succs(node).is_empty() || node_data.blocks.len() != 1 {
-            return false;
-        }
-        let Some(block) = node_data.blocks.iter().next().copied() else {
-            return false;
-        };
-        analyzer
-            .func
-            .cfg()
-            .get_block(block)
-            .is_some_and(|cfg_block| matches!(cfg_block.terminator, BlockTerminator::Return))
-    }
-
     fn make_loop_region(
         &self,
         analyzer: &mut RegionAnalyzer<'_>,
         loop_info: &LoopInfo,
         internal_nodes: &HashSet<usize>,
-        absorbed_terminal_exit_blocks: &HashSet<u64>,
     ) -> Region {
         let header = loop_info.header;
         let body = &loop_info.body;
-        let mut region_body = body.clone();
-        region_body.extend(absorbed_terminal_exit_blocks.iter().copied());
+        let region_body = body.clone();
         if let Some(body_entry) = analyzer.pretest_loop_body_entry(header, body) {
             let mut body_blocks = region_body.clone();
             body_blocks.remove(&header);
