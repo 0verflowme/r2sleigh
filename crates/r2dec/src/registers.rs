@@ -1,3 +1,45 @@
+/// The width in bits of the register a rendered carrier name spells, ignoring any
+/// SSA version suffix. A carrier declared narrower or wider than its own storage
+/// would state a width the machine never wrote.
+pub(crate) fn register_bit_width(name: &str) -> Option<u32> {
+    let lower = name.to_ascii_lowercase();
+    let base = lower
+        .rsplit_once('_')
+        .filter(|(_, version)| version.chars().all(|ch| ch.is_ascii_digit()))
+        .map(|(base, _)| base)
+        .unwrap_or(&lower);
+    match base {
+        "rax" | "rbx" | "rcx" | "rdx" | "rsi" | "rdi" | "rbp" | "rsp" | "rip" => return Some(64),
+        "eax" | "ebx" | "ecx" | "edx" | "esi" | "edi" | "ebp" | "esp" | "eip" => return Some(32),
+        "ax" | "bx" | "cx" | "dx" | "si" | "di" | "bp" | "sp" => return Some(16),
+        "al" | "bl" | "cl" | "dl" | "ah" | "bh" | "ch" | "dh" | "sil" | "dil" => return Some(8),
+        _ => {}
+    }
+    if let Some(rest) = base.strip_prefix('r')
+        && let Some(digits) = rest
+            .strip_suffix('d')
+            .or_else(|| rest.strip_suffix('w'))
+            .or_else(|| rest.strip_suffix('b'))
+        && !digits.is_empty()
+        && digits.chars().all(|ch| ch.is_ascii_digit())
+    {
+        return Some(match rest.as_bytes()[rest.len() - 1] {
+            b'd' => 32,
+            b'w' => 16,
+            _ => 8,
+        });
+    }
+    let (prefix, rest) = base.split_at(base.char_indices().nth(1)?.0);
+    if !rest.is_empty() && rest.chars().all(|ch| ch.is_ascii_digit()) {
+        return match prefix {
+            "r" | "x" => Some(64),
+            "w" => Some(32),
+            _ => None,
+        };
+    }
+    None
+}
+
 pub(crate) fn register_family_name(name: &str) -> Option<String> {
     let lower = name.to_ascii_lowercase();
     let base = lower

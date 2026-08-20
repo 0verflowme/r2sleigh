@@ -3032,10 +3032,12 @@ impl Decompiler {
             fold_constant_arithmetic_in_expr(expr, strings);
         }
         single_evaluation::bind_each_call_site_once(&mut c_function, &folded_call_sites);
+        simplify_identities_in_function(&mut c_function, &fold_ctx);
         propagate_single_use_register_carriers(&mut c_function, &fold_ctx);
         rewrite_stack_synonym_uses_to_declared_locals(&mut c_function, &fold_ctx);
         prune_dead_temp_assignments_in_function_body(&mut c_function, &fold_ctx);
         prune_unused_pure_locals(&mut c_function);
+        resolve_undeclared_carriers(&mut c_function, &fold_ctx);
         prune_unreferenced_local_declarations(&mut c_function);
         normalize_redundant_return_carrier_casts(&mut c_function);
         normalize_declared_assignment_literals(&mut c_function);
@@ -3313,6 +3315,157 @@ fn collect_visible_stack_offsets(
 /// to its own inputs changes what it computes.
 /// Fold a value bound to a name that is read once into the place it is read.
 ///
+/// Apply the identity rules to every expression the function renders.
+///
+/// The rules used to reach only the value side of an assignment, so `x ^ x` folded
+/// where it was stored and stayed where it was tested: a loop kept running
+/// `while (len != (i ^ i) + 1)`. A condition is an expression like any other and
+/// the same rules decide it.
+fn simplify_identities_in_function(func: &mut CFunction, fold_ctx: &FoldingContext<'_>) {
+    fn visit(stmt: &mut CStmt, fold_ctx: &FoldingContext<'_>) {
+        single_evaluation::for_each_expr_mut(stmt, &mut |expr| {
+            let taken = std::mem::replace(expr, CExpr::IntLit(0));
+            *expr = fold_ctx.simplify_identities(taken);
+        });
+        if let CStmt::For { init: Some(init), .. } = stmt {
+            visit(init, fold_ctx);
+        }
+        single_evaluation::for_each_child_block_mut(stmt, &mut |body, _| {
+            for stmt in body.iter_mut() {
+                visit(stmt, fold_ctx);
+            }
+        });
+    }
+
+    for stmt in &mut func.body {
+        visit(stmt, fold_ctx);
+    }
+}
+
+/// Give a carrier the body writes but the function never declares exactly one
+/// disposition: dropped when nothing reads it, declared when something does.
+///
+/// Propagation runs first and takes the values a single reader consumes. What is
+/// left is a value the function genuinely keeps, and printing it as a bare name
+/// says the program has a variable it never declared. Naming a value obliges the
+/// function to declare it, so the two arms here are what that obligation costs.
+fn resolve_undeclared_carriers(func: &mut CFunction, fold_ctx: &FoldingContext<'_>) {
+    let declared = func
+        .params
+        .iter()
+        .map(|param| param.name.to_ascii_lowercase())
+        .chain(func.locals.iter().map(|local| local.name.to_ascii_lowercase()))
+        .collect::<HashSet<_>>();
+
+    // Dropping one dead carrier can leave the value it read with no reader, so
+    // the pass repeats until a sweep removes nothing.
+    // The caller reads the return register, so a carrier that names it is never
+    // dead here however the body reads it. Dropping one would delete the value
+    // the function answers with and leave nothing saying it was ever computed.
+    let returns_value = !matches!(func.ret_type, CType::Void);
+
+    loop {
+        let reads = collect_function_local_reads(func);
+        let mut removed = false;
+        drop_dead_undeclared_carriers(
+            &mut func.body,
+            &declared,
+            &reads,
+            fold_ctx,
+            returns_value,
+            &mut removed,
+        );
+        if !removed {
+            break;
+        }
+    }
+
+    let mut carriers = Vec::new();
+    collect_undeclared_carrier_targets(&mut func.body, &declared, &mut carriers);
+    let mut seen = HashSet::new();
+    for (name, value) in carriers {
+        if !seen.insert(name.to_ascii_lowercase()) {
+            continue;
+        }
+        let ty = fold_ctx.declared_type_for_carrier(&name, &value);
+        func.locals.push(ast::CLocal {
+            ty,
+            name,
+            stack_offset: None,
+        });
+    }
+}
+
+/// Remove every assignment to an undeclared name that nothing reads, provided
+/// evaluating its value does nothing on its own.
+fn drop_dead_undeclared_carriers(
+    stmts: &mut Vec<CStmt>,
+    declared: &HashSet<String>,
+    reads: &HashSet<String>,
+    fold_ctx: &FoldingContext<'_>,
+    returns_value: bool,
+    removed: &mut bool,
+) {
+    for stmt in stmts.iter_mut() {
+        single_evaluation::for_each_child_block_mut(stmt, &mut |body, _| {
+            drop_dead_undeclared_carriers(
+                body,
+                declared,
+                reads,
+                fold_ctx,
+                returns_value,
+                removed,
+            );
+        });
+        let CStmt::Expr(CExpr::Binary {
+            op: BinaryOp::Assign,
+            left,
+            right,
+        }) = stmt
+        else {
+            continue;
+        };
+        let CExpr::Var(name) = left.as_ref() else {
+            continue;
+        };
+        let lower = name.to_ascii_lowercase();
+        if declared.contains(&lower)
+            || reads.contains(&lower)
+            || !expr_is_pure_for_dead_local_prune(right)
+            || (returns_value && fold_ctx.carrier_names_return_register(name))
+        {
+            continue;
+        }
+        *stmt = CStmt::Empty;
+        *removed = true;
+    }
+    stmts.retain(|stmt| !matches!(stmt, CStmt::Empty));
+}
+
+/// Every undeclared name the body assigns, paired with the value first stored in
+/// it so the declaration can be typed from what it holds.
+fn collect_undeclared_carrier_targets(
+    stmts: &mut Vec<CStmt>,
+    declared: &HashSet<String>,
+    out: &mut Vec<(String, CExpr)>,
+) {
+    for stmt in stmts.iter_mut() {
+        if let CStmt::Expr(CExpr::Binary {
+            op: BinaryOp::Assign,
+            left,
+            right,
+        }) = stmt
+            && let CExpr::Var(name) = left.as_ref()
+            && !declared.contains(&name.to_ascii_lowercase())
+        {
+            out.push((name.clone(), right.as_ref().clone()));
+        }
+        single_evaluation::for_each_child_block_mut(stmt, &mut |body, _| {
+            collect_undeclared_carrier_targets(body, declared, out);
+        });
+    }
+}
+
 /// A name assigned once and read once is not a variable of the program, it is
 /// the value itself with a label attached. That is true of the versioned
 /// register carriers this started with, and equally of the temporaries the

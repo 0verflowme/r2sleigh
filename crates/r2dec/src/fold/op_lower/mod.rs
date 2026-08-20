@@ -3679,7 +3679,19 @@ impl<'a> FoldingContext<'a> {
             })
     }
 
-    fn identity_simplify_expr(&self, expr: CExpr) -> CExpr {
+    /// The identity rules, for a caller outside the fold that renders expressions
+    /// the fold never routed through a stored value.
+    pub(crate) fn simplify_identities(&self, expr: CExpr) -> CExpr {
+        self.identity_simplify_expr(expr)
+    }
+
+    /// Apply the identity rules bottom-up, so a rule reaches an identity that sits
+    /// under a cast or inside a larger term rather than only at the top.
+    fn identity_simplify_expr(&self, mut expr: CExpr) -> CExpr {
+        for child in crate::single_evaluation::children_mut(&mut expr) {
+            let taken = std::mem::replace(child, CExpr::IntLit(0));
+            *child = self.identity_simplify_expr(taken);
+        }
         match expr {
             CExpr::Binary { op, left, right } => {
                 self.identity_simplify_binary(op, *left, *right, None)
@@ -6160,6 +6172,34 @@ impl<'a> FoldingContext<'a> {
                 uint_type_from_size(element_size)
             }
         }
+    }
+
+    /// Whether a rendered name spells the register the ABI returns a value in.
+    pub(crate) fn carrier_names_return_register(&self, name: &str) -> bool {
+        let Some(family) = crate::registers::register_family_name(name) else {
+            return false;
+        };
+        crate::registers::register_family_name(&self.inputs.arch.ret_reg_name)
+            .is_some_and(|ret| ret == family)
+    }
+
+    /// The type to declare a rendered carrier with, taking the width from the SSA
+    /// variable behind the name when no type was recorded for it.
+    pub(crate) fn declared_type_for_carrier(&self, name: &str, value: &CExpr) -> CType {
+        if let Some(ty) = self.lookup_type_hint(name) {
+            return ty.clone();
+        }
+        if let Some(var) = self.ssa_var_for_visible_name(name) {
+            if let Some(ty) = self.type_hint_for_var(&var) {
+                return ty;
+            }
+            return uint_type_from_size(var.size);
+        }
+        if let Some(bits) = crate::registers::register_bit_width(name) {
+            return CType::UInt(bits);
+        }
+        self.expr_type_hint(value)
+            .unwrap_or(CType::UInt(self.inputs.arch.ptr_size))
     }
 
     fn guess_ssa_var_from_name(&self, name: &str) -> Option<SSAVar> {
