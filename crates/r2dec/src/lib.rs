@@ -1766,6 +1766,20 @@ fn register_alias_names(reg_name: &str) -> Vec<String> {
         }
     }
 
+    // A scalar float or double passed in a vector register lives in the low lane,
+    // which Sleigh names separately from the register holding it. Only the low
+    // lanes are the parameter: the rest of the register is other storage.
+    if let Some(rest) = lower.strip_prefix("xmm")
+        && let Some(index) = rest.split('_').next()
+        && !index.is_empty()
+        && index.chars().all(|c| c.is_ascii_digit())
+    {
+        return vec![
+            format!("xmm{index}"),
+            format!("xmm{index}_da"),
+            format!("xmm{index}_qa"),
+        ];
+    }
     if let Some(rest) = lower.strip_prefix('x')
         && rest.chars().all(|c| c.is_ascii_digit())
     {
