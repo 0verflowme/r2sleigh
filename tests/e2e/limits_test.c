@@ -268,6 +268,13 @@ int types_array_extent(const int32_t *a) {
     return m;
 }
 
+// Array member of a struct parameter: a constant offset inside the member
+// indexes an element, so naming it needs the member's own element size rather
+// than the width of the access that reads it.
+int types_struct_array_member(const VmState *st) {
+    return st->r[2] + st->r[5] + st->flag;
+}
+
 // ---------------------------------------------------------------- call graph
 
 static int helper_even(int n);
@@ -318,7 +325,7 @@ int main(int argc, char **argv) {
         + lo + mid + (int)hi + (int)pr.lo + (int)pr.hi
         + (int)abi_variadic_sum(3, argc, argc, argc) + types_array_extent(arr)
         + calls_mutual_recursion(argc) + calls_indirect_table(argc, argc, argc + 1)
-        + calls_tail(argc, 0);
+        + calls_tail(argc, 0) + types_struct_array_member(&st);
     printf("%ld\n", total);
     return 0;
 }

@@ -3053,6 +3053,10 @@ fn trusted_external_type_db(trusted: &r2ssa::TrustedSsaArtifact) -> r2types::Ext
     else {
         return db;
     };
+    if std::env::var("R2DBG").is_ok() {
+        eprintln!("DBGRAW aggregates={} names={:?}", graph.aggregates().len(),
+            graph.aggregates().iter().map(|a| (a.name().to_string(), a.members().len())).collect::<Vec<_>>());
+    }
     for aggregate in graph.aggregates() {
         let name = aggregate.name();
         if name.is_empty() {
@@ -3060,6 +3064,9 @@ fn trusted_external_type_db(trusted: &r2ssa::TrustedSsaArtifact) -> r2types::Ext
         }
         let mut fields = std::collections::BTreeMap::new();
         collect_external_struct_fields(graph, aggregate, 0, "", &mut fields, 0);
+        if std::env::var("R2DBG").is_ok() {
+            eprintln!("DBGAGG {name}: {:?}", fields.iter().map(|(o,f)| (*o, f.name.clone(), f.ty.clone())).collect::<Vec<_>>());
+        }
         if fields.is_empty() {
             continue;
         }
@@ -3144,13 +3151,41 @@ fn source_member_type_spelling(
         .ok()
         .and_then(|id| graph.types().get(id))?;
     let bits = source_type.size_bits();
-    match source_type.kind() {
-        r2ssa::SourceTypeKind::SignedInteger => Some(format!("int{bits}_t")),
-        r2ssa::SourceTypeKind::UnsignedInteger => Some(format!("uint{bits}_t")),
-        r2ssa::SourceTypeKind::Pointer { .. } => Some("void *".to_string()),
+    let element = match source_type.kind() {
+        r2ssa::SourceTypeKind::SignedInteger => format!("int{bits}_t"),
+        r2ssa::SourceTypeKind::UnsignedInteger => format!("uint{bits}_t"),
+        r2ssa::SourceTypeKind::Pointer { .. } => "void *".to_string(),
         // An inline struct member has no scalar width to check an access against.
-        r2ssa::SourceTypeKind::Struct { .. } => None,
+        r2ssa::SourceTypeKind::Struct { .. } => return None,
+    };
+    // A member wider than one element repeats it. The capture states the repeat
+    // count, but the Rust contract for a member does not carry it, so the
+    // member's own width against the element width recovers the length. Without
+    // the length only the first element could be named, and every later one fell
+    // back to an offset placeholder: `st->r[2]` rendered as `st->f_8`.
+    let count = source_member_element_count(member, bits)?;
+    Some(if count > 1 {
+        format!("{element}[{count}]")
+    } else {
+        element
+    })
+}
+
+/// How many elements a captured member holds, from its own width against the
+/// width of one element. `None` when the two do not divide evenly, because a
+/// member that is not a whole number of elements is not an array of them.
+fn source_member_element_count(
+    member: &r2ssa::SourceAggregateMember,
+    element_bits: u64,
+) -> Option<u64> {
+    if element_bits == 0 {
+        return None;
     }
+    let total_bits = member.size_bits();
+    if total_bits == 0 || total_bits == element_bits {
+        return Some(1);
+    }
+    (total_bits % element_bits == 0).then(|| total_bits / element_bits)
 }
 
 /// The prototype the source recovered, spelled as the source spells it.

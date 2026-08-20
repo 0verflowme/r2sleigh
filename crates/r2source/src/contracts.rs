@@ -377,8 +377,15 @@ impl SourceTypeGraph {
                 // has to hold of a member is where it sits, not what it is:
                 // admitting only integers refused `struct state *next`, and
                 // with it every function that mentions an ordinary C struct.
+                // A member holds a whole number of its element type: one for a
+                // plain member, more for an array. Demanding exactly one refused
+                // every struct with an array in it, and refusing the struct lost
+                // the layout of its other members too, so a `VmState` holding
+                // `int32_t r[8]` reached the consumer with no layout at all.
                 if u32::try_from(member_position) != Ok(member.member_id)
-                    || member.size_bits != member_type.size_bits
+                    || member.size_bits == 0
+                    || member_type.size_bits == 0
+                    || !member.size_bits.is_multiple_of(member_type.size_bits)
                     || !member.offset_bits.is_multiple_of(8)
                     || source_align_up(cursor, member_type.align_bits) != Some(member.offset_bits)
                 {
