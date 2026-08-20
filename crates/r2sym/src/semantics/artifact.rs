@@ -768,7 +768,9 @@ impl SemanticArtifactReport {
     pub fn native_body(&self) -> Option<&NativeArtifactBody> {
         match &self.body {
             SemanticArtifactBody::Native(body) => Some(body),
-            SemanticArtifactBody::Vm(_) => None,
+            // A VM function's native regions are the same regions any other function
+            // would have, so a consumer asking for them gets them.
+            SemanticArtifactBody::Vm(body) => body.native.as_deref(),
         }
     }
 

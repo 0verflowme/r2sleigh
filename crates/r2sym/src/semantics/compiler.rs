@@ -539,10 +539,27 @@ fn build_semantic_artifact_report(input: BuildSemanticArtifactInput) -> Semantic
         None
     };
     let body = match execution {
+        // The same native analysis ran either way, and recognising a dispatch loop
+        // says what the function does rather than that its regions are unusable.
+        // Discarding them left a VM function with nothing to structure from and no
+        // route but a block of comments.
         ExecutionModel::Vm => SemanticArtifactBody::Vm(Box::new(super::region::VmArtifactBody {
             interpreter,
             step_summary: vm_step,
             transfer_summary: vm_transfer,
+            native: Some(Box::new(NativeArtifactBody {
+                summary: NativeFunctionSummary {
+                    slice_class,
+                    role_identity,
+                    closure_functions,
+                    helper_functions,
+                    derived_summaries,
+                    derived_diagnostics: derived_diagnostics.clone(),
+                    region_summaries: collected.region_summaries,
+                    worker_summaries: collected.worker_summaries,
+                },
+                regions: collected.regions,
+            })),
         })),
         ExecutionModel::Native => SemanticArtifactBody::Native(NativeArtifactBody {
             summary: NativeFunctionSummary {

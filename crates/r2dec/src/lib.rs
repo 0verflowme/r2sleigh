@@ -7400,6 +7400,7 @@ mod tests {
                 interpreter: None,
                 step_summary: Some(vm_step),
                 transfer_summary: None,
+                native: None,
             })),
             diagnostics: r2sym::SemanticArtifactDiagnostics {
                 branches_evaluated: 0,

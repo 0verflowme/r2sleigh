@@ -4119,6 +4119,7 @@ mod tests {
                 interpreter: None,
                 step_summary: Some(make_vm_step_summary_with_transfers(Vec::new())),
                 transfer_summary: None,
+                native: None,
             })),
             diagnostics: default_diagnostics(),
         });

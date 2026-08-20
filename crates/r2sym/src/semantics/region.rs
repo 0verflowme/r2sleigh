@@ -1694,6 +1694,10 @@ pub struct VmArtifactBody {
     pub step_summary: Option<VmStepSummary>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub transfer_summary: Option<VmStepSummary>,
+    /// What the same function's native analysis found, which recognising a
+    /// dispatch loop does not invalidate.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub native: Option<Box<NativeArtifactBody>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

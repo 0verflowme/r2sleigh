@@ -216,15 +216,16 @@ pub fn derive_decompile_plan(
     has_summary_islands: bool,
     supports_guarded_structuring: bool,
 ) -> DecompilePlan {
-    if matches!(execution, ExecutionModel::Vm) {
-        DecompilePlan::VmSummaryOnly {
-            reason: "vm artifacts currently support summary rendering only".to_string(),
-        }
-    } else if matches!(execution, ExecutionModel::Native)
-        && has_native_semantics
-        && supports_guarded_structuring
-    {
+    // Recognising a dispatch loop describes what a function does; it does not make
+    // the function's control flow unprovable. So the native facts decide first, and
+    // a summary is what a VM function falls back to rather than what it is limited
+    // to. One whose control could not be certified still summarises.
+    if has_native_semantics && supports_guarded_structuring {
         DecompilePlan::NativeStructured
+    } else if matches!(execution, ExecutionModel::Vm) {
+        DecompilePlan::VmSummaryOnly {
+            reason: "vm dispatch without certified native control".to_string(),
+        }
     } else if matches!(execution, ExecutionModel::Native)
         && diagnostics.skipped_large_cfg
         && has_native_semantics
