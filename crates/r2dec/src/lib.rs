@@ -3067,6 +3067,7 @@ impl Decompiler {
             }
             post_rename::rewrite_function_identifiers(&mut c_function, &known_function_names);
         }
+        reconstruct_flag_conditions_in_function(&mut c_function, &fold_ctx);
         prune_dead_temp_assignments_in_function_body(&mut c_function, &fold_ctx);
         prune_unused_pure_locals(&mut c_function);
         resolve_undeclared_carriers(&mut c_function, &fold_ctx);
@@ -3395,6 +3396,39 @@ fn simplify_identities_in_function(func: &mut CFunction, fold_ctx: &FoldingConte
 /// left is a value the function genuinely keeps, and printing it as a bare name
 /// says the program has a variable it never declared. Naming a value obliges the
 /// function to declare it, so the two arms here are what that obligation costs.
+/// Fold machine flag arithmetic into the comparison it spells, wherever it
+/// appears.
+///
+/// Branch conditions are reconstructed as they are built, so an `if` shows
+/// `a > b`. A comparison that ends up somewhere else keeps the flags showing:
+/// a ternary condition in a return read `n - 1 < 0 != tmpOV`, which is the
+/// signed `n < 1` written as "the sign of the difference disagrees with the
+/// overflow flag", and named an overflow temporary the function never
+/// declares. The reconstruction does not care where the expression sits, so
+/// run it over the finished body rather than only at the places that build
+/// conditions.
+fn reconstruct_flag_conditions_in_function(func: &mut CFunction, fold_ctx: &FoldingContext<'_>) {
+    fn rewrite(expr: CExpr, ctx: &FoldingContext<'_>) -> CExpr {
+        let mut recurse = |child: CExpr| rewrite(child, ctx);
+        let expr = expr.map_children(&mut recurse);
+        ctx.try_reconstruct_condition(&expr).unwrap_or(expr)
+    }
+
+    fn walk(stmts: &mut Vec<CStmt>, ctx: &FoldingContext<'_>) {
+        for stmt in stmts.iter_mut() {
+            single_evaluation::for_each_expr_mut(stmt, &mut |expr| {
+                let taken = std::mem::replace(expr, CExpr::IntLit(0));
+                *expr = rewrite(taken, ctx);
+            });
+            single_evaluation::for_each_child_block_mut(stmt, &mut |body, _| {
+                walk(body, ctx);
+            });
+        }
+    }
+
+    walk(&mut func.body, fold_ctx);
+}
+
 fn resolve_undeclared_carriers(func: &mut CFunction, fold_ctx: &FoldingContext<'_>) {
     let declared = func
         .params
