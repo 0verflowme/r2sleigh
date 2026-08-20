@@ -82,7 +82,7 @@ pub use function_facts::{
     StackCallArgumentLocationFact, StackSlotOwnerRenderAuthorization, SummaryEffectRollup,
     SummaryHelperView, SummaryOutParamFact, SwitchSelectorFact,
 };
-pub use inference::{CombinedTypeOracle, TypeInference};
+pub use inference::{CombinedTypeOracle, TypeInference, register_alias_names};
 pub use model::{Signedness, StructField, StructShape, Type, TypeArena, TypeId};
 pub use oracle::{LayoutOracle, TypeOracle};
 pub use prepare::{

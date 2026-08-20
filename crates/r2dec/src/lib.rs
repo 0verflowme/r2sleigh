@@ -67,7 +67,7 @@ use r2ssa::cfg::BlockTerminator;
 use r2types::{
     CTypeLike, DecompileRouteFacts, DecompileRouteKind, ExternalRegisterParamSpec, FunctionFacts,
     FunctionSignatureSpec, FunctionTypeFacts, StackSlotKey, TypeInference, TypeOracle,
-    VisibleBinding, VisibleBindingKind,
+    VisibleBinding, VisibleBindingKind, register_alias_names,
 };
 #[cfg(test)]
 use r2types::{ExternalTypeDb, FunctionType};
@@ -1715,83 +1715,6 @@ fn merge_params_with_external_signature(
             param
         })
         .collect()
-}
-
-fn register_alias_names(reg_name: &str) -> Vec<String> {
-    let lower = reg_name.trim().to_ascii_lowercase();
-    if lower.is_empty() {
-        return Vec::new();
-    }
-
-    match lower.as_str() {
-        "rdi" | "edi" | "di" | "dil" => {
-            return vec!["rdi", "edi", "di", "dil"]
-                .into_iter()
-                .map(str::to_string)
-                .collect();
-        }
-        "rsi" | "esi" | "si" | "sil" => {
-            return vec!["rsi", "esi", "si", "sil"]
-                .into_iter()
-                .map(str::to_string)
-                .collect();
-        }
-        "rdx" | "edx" | "dx" | "dl" => {
-            return vec!["rdx", "edx", "dx", "dl"]
-                .into_iter()
-                .map(str::to_string)
-                .collect();
-        }
-        "rcx" | "ecx" | "cx" | "cl" => {
-            return vec!["rcx", "ecx", "cx", "cl"]
-                .into_iter()
-                .map(str::to_string)
-                .collect();
-        }
-        _ => {}
-    }
-
-    for base in ["r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15"] {
-        if lower == base
-            || lower == format!("{base}d")
-            || lower == format!("{base}w")
-            || lower == format!("{base}b")
-        {
-            return vec![
-                base.to_string(),
-                format!("{base}d"),
-                format!("{base}w"),
-                format!("{base}b"),
-            ];
-        }
-    }
-
-    // A scalar float or double passed in a vector register lives in the low lane,
-    // which Sleigh names separately from the register holding it. Only the low
-    // lanes are the parameter: the rest of the register is other storage.
-    if let Some(rest) = lower.strip_prefix("xmm")
-        && let Some(index) = rest.split('_').next()
-        && !index.is_empty()
-        && index.chars().all(|c| c.is_ascii_digit())
-    {
-        return vec![
-            format!("xmm{index}"),
-            format!("xmm{index}_da"),
-            format!("xmm{index}_qa"),
-        ];
-    }
-    if let Some(rest) = lower.strip_prefix('x')
-        && rest.chars().all(|c| c.is_ascii_digit())
-    {
-        return vec![lower.clone(), format!("w{rest}")];
-    }
-    if let Some(rest) = lower.strip_prefix('w')
-        && rest.chars().all(|c| c.is_ascii_digit())
-    {
-        return vec![format!("x{rest}"), lower];
-    }
-
-    vec![lower]
 }
 
 pub fn normalize_sig_arch_name(arch: Option<&r2il::ArchSpec>) -> Option<String> {

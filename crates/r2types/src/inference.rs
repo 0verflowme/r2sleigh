@@ -1529,22 +1529,68 @@ fn parse_const_offset(var: &SSAVar) -> Option<i64> {
     }
 }
 
-fn register_alias_names(reg_name: &str) -> Vec<String> {
-    let lower = reg_name.to_ascii_lowercase();
+/// Every name the machine has for the storage a register names, widest form first.
+pub fn register_alias_names(reg_name: &str) -> Vec<String> {
+    let lower = reg_name.trim().to_ascii_lowercase();
+    if lower.is_empty() {
+        return Vec::new();
+    }
+
     let aliases = match lower.as_str() {
-        "rax" | "eax" | "ax" | "al" | "ah" => &["rax", "eax", "ax", "al", "ah"][..],
-        "rbx" | "ebx" | "bx" | "bl" | "bh" => &["rbx", "ebx", "bx", "bl", "bh"][..],
-        "rcx" | "ecx" | "cx" | "cl" | "ch" => &["rcx", "ecx", "cx", "cl", "ch"][..],
-        "rdx" | "edx" | "dx" | "dl" | "dh" => &["rdx", "edx", "dx", "dl", "dh"][..],
-        "rsi" | "esi" | "si" | "sil" => &["rsi", "esi", "si", "sil"][..],
-        "rdi" | "edi" | "di" | "dil" => &["rdi", "edi", "di", "dil"][..],
-        "rbp" | "ebp" | "bp" | "bpl" => &["rbp", "ebp", "bp", "bpl"][..],
-        "rsp" | "esp" | "sp" | "spl" => &["rsp", "esp", "sp", "spl"][..],
-        "r8" | "r8d" | "r8w" | "r8b" => &["r8", "r8d", "r8w", "r8b"][..],
-        "r9" | "r9d" | "r9w" | "r9b" => &["r9", "r9d", "r9w", "r9b"][..],
-        _ => return vec![lower],
+        "rax" | "eax" | "ax" | "al" | "ah" => Some(&["rax", "eax", "ax", "al", "ah"][..]),
+        "rbx" | "ebx" | "bx" | "bl" | "bh" => Some(&["rbx", "ebx", "bx", "bl", "bh"][..]),
+        "rcx" | "ecx" | "cx" | "cl" | "ch" => Some(&["rcx", "ecx", "cx", "cl", "ch"][..]),
+        "rdx" | "edx" | "dx" | "dl" | "dh" => Some(&["rdx", "edx", "dx", "dl", "dh"][..]),
+        "rsi" | "esi" | "si" | "sil" => Some(&["rsi", "esi", "si", "sil"][..]),
+        "rdi" | "edi" | "di" | "dil" => Some(&["rdi", "edi", "di", "dil"][..]),
+        "rbp" | "ebp" | "bp" | "bpl" => Some(&["rbp", "ebp", "bp", "bpl"][..]),
+        "rsp" | "esp" | "sp" | "spl" => Some(&["rsp", "esp", "sp", "spl"][..]),
+        _ => None,
     };
-    aliases.iter().map(|alias| (*alias).to_string()).collect()
+    if let Some(aliases) = aliases {
+        return aliases.iter().map(|alias| (*alias).to_string()).collect();
+    }
+
+    for base in ["r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15"] {
+        if lower == base
+            || lower == format!("{base}d")
+            || lower == format!("{base}w")
+            || lower == format!("{base}b")
+        {
+            return vec![
+                base.to_string(),
+                format!("{base}d"),
+                format!("{base}w"),
+                format!("{base}b"),
+            ];
+        }
+    }
+
+    // A scalar float or double in a vector register sits in the low lane, which Sleigh names apart.
+    if let Some(rest) = lower.strip_prefix("xmm")
+        && let Some(index) = rest.split('_').next()
+        && !index.is_empty()
+        && index.chars().all(|c| c.is_ascii_digit())
+    {
+        return vec![
+            format!("xmm{index}"),
+            format!("xmm{index}_da"),
+            format!("xmm{index}_qa"),
+        ];
+    }
+
+    if let Some(rest) = lower.strip_prefix('x')
+        && rest.chars().all(|c| c.is_ascii_digit())
+    {
+        return vec![lower.clone(), format!("w{rest}")];
+    }
+    if let Some(rest) = lower.strip_prefix('w')
+        && rest.chars().all(|c| c.is_ascii_digit())
+    {
+        return vec![format!("x{rest}"), lower];
+    }
+
+    vec![lower]
 }
 
 fn signed_int(bits: u32) -> CTypeLike {
