@@ -100,7 +100,7 @@ impl PointerTable for r2source::SourceCodePointerTable {
 const MAX_DEFINITION_DEPTH: usize = 32;
 
 /// Map every defined name to the operation that defines it.
-fn definitions(blocks: &[SSABlock]) -> HashMap<String, (&SSAOp, u64)> {
+pub(crate) fn definitions(blocks: &[SSABlock]) -> HashMap<String, (&SSAOp, u64)> {
     let mut defs = HashMap::new();
     for block in blocks {
         for op in &block.ops {
@@ -110,6 +110,15 @@ fn definitions(blocks: &[SSABlock]) -> HashMap<String, (&SSAOp, u64)> {
         }
     }
     defs
+}
+
+/// Read a folded value as signed at the width it was computed at.
+fn signed(value: u64, size: u32) -> i128 {
+    let bits = size * 8;
+    if bits == 0 || bits >= 64 {
+        return i128::from(value as i64);
+    }
+    i128::from((value as i64) << (64 - bits) >> (64 - bits))
 }
 
 /// Keep a folded value inside the width it was computed at.
@@ -127,7 +136,11 @@ fn truncate(value: u64, size: u32) -> u64 {
 /// temporaries before it is used. Each step folded here is exact -- a copy, a
 /// widening, or arithmetic on values already pinned -- so what comes back is
 /// the value, not an estimate of it.
-fn resolve_constant(defs: &HashMap<String, (&SSAOp, u64)>, var: &SSAVar, depth: usize) -> Option<u64> {
+pub(crate) fn resolve_constant(
+    defs: &HashMap<String, (&SSAOp, u64)>,
+    var: &SSAVar,
+    depth: usize,
+) -> Option<u64> {
     if let Some(value) = var.constant_bits() {
         return Some(value);
     }
@@ -160,6 +173,20 @@ fn resolve_constant(defs: &HashMap<String, (&SSAOp, u64)>, var: &SSAVar, depth: 
         }
         SSAOp::IntOr { a, b, .. } => fold(a)? | fold(b)?,
         SSAOp::IntAnd { a, b, .. } => fold(a)? & fold(b)?,
+        // A condition is decided when the comparison behind it is, which is
+        // what makes a branch on it not a branch at all.
+        SSAOp::IntEqual { a, b, .. } => u64::from(fold(a)? == fold(b)?),
+        SSAOp::IntNotEqual { a, b, .. } => u64::from(fold(a)? != fold(b)?),
+        SSAOp::IntLess { a, b, .. } => u64::from(fold(a)? < fold(b)?),
+        SSAOp::IntLessEqual { a, b, .. } => u64::from(fold(a)? <= fold(b)?),
+        SSAOp::IntSLess { a, b, .. } => u64::from(signed(fold(a)?, a.size) < signed(fold(b)?, b.size)),
+        SSAOp::IntSLessEqual { a, b, .. } => {
+            u64::from(signed(fold(a)?, a.size) <= signed(fold(b)?, b.size))
+        }
+        SSAOp::BoolNot { src, .. } => u64::from(fold(src)? == 0),
+        SSAOp::BoolAnd { a, b, .. } => u64::from(fold(a)? != 0 && fold(b)? != 0),
+        SSAOp::BoolOr { a, b, .. } => u64::from(fold(a)? != 0 || fold(b)? != 0),
+        SSAOp::BoolXor { a, b, .. } => u64::from((fold(a)? != 0) != (fold(b)? != 0)),
         _ => return None,
     };
     Some(truncate(folded, var.size))

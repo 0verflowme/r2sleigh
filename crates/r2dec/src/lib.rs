@@ -1894,10 +1894,25 @@ impl DecompilerConfig {
             ("riscv64", _) | ("rv64", _) | ("rv64gc", _) => Self::riscv64(),
             ("riscv", _) if ptr_bits == 32 => Self::riscv32(),
             ("riscv", _) => Self::riscv64(),
-            _ => Self {
-                ptr_size: ptr_bits,
-                ..Self::default()
-            },
+            _ => Self::unrecognized(ptr_bits),
+        }
+    }
+
+    /// A target whose registers this renderer does not know.
+    ///
+    /// Falling back to the defaults meant falling back to x86-64: an
+    /// unrecognized target was rendered with rsp, rbp and the SysV argument
+    /// registers, naming registers it does not have. Naming none of them is
+    /// the honest answer, and it leaves the residual machinery to say so.
+    fn unrecognized(ptr_bits: u32) -> Self {
+        Self {
+            ptr_size: ptr_bits,
+            sp_name: String::new(),
+            fp_name: String::new(),
+            arg_regs: Vec::new(),
+            ret_regs: Vec::new(),
+            caller_saved_regs: Default::default(),
+            ..Self::default()
         }
     }
 
