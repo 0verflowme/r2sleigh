@@ -128,10 +128,23 @@ fn statement_exprs(stmt: &CStmt) -> Vec<&CExpr> {
 }
 
 fn collect_undeclared(expr: &CExpr, declared: &BTreeSet<String>, out: &mut BTreeSet<String>) {
+    // A name in call position is what is being called, not a carrier the
+    // function reads. No C function declares the functions it calls, so
+    // `isnan(x)` was reported as mentioning an undeclared `isnan` and the
+    // statement was marked for naming the callee it invokes.
+    let mut called = BTreeSet::new();
+    expr.visit(&mut |node| {
+        if let CExpr::Call { func, .. } = node
+            && let CExpr::Var(name) = func.as_ref()
+        {
+            called.insert(name.clone());
+        }
+    });
     expr.visit(&mut |node| {
         if let CExpr::Var(name) = node
             && !declared.contains(name)
             && !names_something_outside_the_function(name)
+            && !called.contains(name)
         {
             out.insert(name.clone());
         }
