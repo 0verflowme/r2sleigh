@@ -1044,7 +1044,23 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                             }
                             return CStmt::Goto(label);
                         }
-                        Err(reason) => Some(reason),
+                        Err(reason) => {
+                            // An exit reaching a block with no successors leaves
+                            // the function there. Rendering that block where the
+                            // exit happens says what the exit does, `return -1`,
+                            // rather than refusing for want of a label to jump
+                            // to. Nothing follows such a block, and only this
+                            // edge reaches it, so rendering it here cannot
+                            // duplicate or reorder anything.
+                            if !self.structured_region_blocks.contains(target)
+                                && self.func.successors(*target).is_empty()
+                                && self.func.predecessors(*target).len() == 1
+                            {
+                                self.structured_region_blocks.insert(*target);
+                                return self.structure_block(*target);
+                            }
+                            Some(reason)
+                        }
                     }
                 } else {
                     None
