@@ -2947,15 +2947,6 @@ impl Decompiler {
             self.context.function_facts.semantic_report(),
         );
 
-        // Apply post-structuring suffix cleanup for folded/unfolded paths.
-        // Linear fallback intentionally keeps its raw expression-builder output.
-        if !is_linear_fallback {
-            let mut known_function_names = HashSet::new();
-            for name in self.context.type_facts().known_function_signatures.keys() {
-                known_function_names.insert(name.to_ascii_lowercase());
-            }
-            post_rename::rewrite_function_identifiers(&mut c_function, &known_function_names);
-        }
         let strings = self.context.function_facts.display_names().strings();
         fold_constant_arithmetic_in_function(&mut c_function, strings);
         // Binding a repeated call to one name means finding the call site in
@@ -2972,6 +2963,16 @@ impl Decompiler {
         simplify_identities_in_function(&mut c_function, &fold_ctx);
         propagate_single_use_register_carriers(&mut c_function, &fold_ctx);
         rewrite_stack_synonym_uses_to_declared_locals(&mut c_function, &fold_ctx);
+        // Dropping a version suffix loses which value a name meant, so anything
+        // that resolves a name to the storage behind it has to run before this.
+        // Linear fallback intentionally keeps its raw expression-builder output.
+        if !is_linear_fallback {
+            let mut known_function_names = HashSet::new();
+            for name in self.context.type_facts().known_function_signatures.keys() {
+                known_function_names.insert(name.to_ascii_lowercase());
+            }
+            post_rename::rewrite_function_identifiers(&mut c_function, &known_function_names);
+        }
         prune_dead_temp_assignments_in_function_body(&mut c_function, &fold_ctx);
         prune_unused_pure_locals(&mut c_function);
         resolve_undeclared_carriers(&mut c_function, &fold_ctx);
@@ -4204,6 +4205,8 @@ fn rewrite_stack_synonym_uses_to_declared_locals(
             continue;
         }
         let target = if let Some(offset) = fold_ctx.stack_offset_for_visible_storage_name(&name) {
+            local_by_offset.get(&offset).cloned()
+        } else if let Some(offset) = fold_ctx.loaded_stack_offset_for_visible_name(&name) {
             local_by_offset.get(&offset).cloned()
         } else if name.eq_ignore_ascii_case("slot") {
             unique_pointer_local.clone()

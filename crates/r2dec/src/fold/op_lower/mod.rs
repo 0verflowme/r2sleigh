@@ -1564,6 +1564,12 @@ impl<'a> FoldingContext<'a> {
         self.inputs.summary_view()
     }
 
+    /// The frame slot a rendered name holds the contents of, rather than addresses.
+    pub(crate) fn loaded_stack_offset_for_visible_name(&self, name: &str) -> Option<i64> {
+        self.prepared_semantic_view()
+            .and_then(|view| view.loaded_stack_offset_by_name.get(name).copied())
+    }
+
     pub(crate) fn prepared_semantic_view(&self) -> Option<&analysis::PreparedSemanticView> {
         if let Some(view) = self.inputs.prepared_semantic_view {
             return Some(view);

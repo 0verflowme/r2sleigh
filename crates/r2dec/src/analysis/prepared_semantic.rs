@@ -64,6 +64,8 @@ pub(crate) struct PreparedSemanticView {
     pub(crate) authorized_stack_owner_names_by_object:
         BTreeMap<(r2ssa::ObjectId, i64), BTreeSet<String>>,
     pub(crate) certified_loop_carrier_values: BTreeSet<ValueId>,
+    /// Frame offset a rendered load result holds the contents of, by rendered name.
+    pub(crate) loaded_stack_offset_by_name: HashMap<String, i64>,
 }
 
 pub(crate) struct PreparedSemanticViewInputs<'a> {
@@ -1224,6 +1226,16 @@ fn refine_load_owner_exprs(
             else {
                 continue;
             };
+            // The value a load produces is the contents of that slot, and that is
+            // what names it when the snapshot declared no variable there. The
+            // recovery names such a slot itself, so the two spell one variable.
+            if let Some(offset) = prepared_direct_stack_load_offset(prepared, view, addr)
+                && prepared_stack_alias_name_for_offset(view, offset).is_none()
+            {
+                let base = super::utils::ssa_render_base_name(dst);
+                view.loaded_stack_offset_by_name
+                    .insert(format!("{base}_{}", dst.version), offset);
+            }
             let candidate = prepared_direct_stack_load_offset(prepared, view, addr)
                 .and_then(|offset| {
                     local_store_owner_expr_for_offset(view, prepared, block, op_idx, offset)
