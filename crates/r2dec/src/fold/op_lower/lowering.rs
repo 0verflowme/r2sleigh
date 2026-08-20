@@ -190,7 +190,7 @@ impl<'a> FoldingContext<'a> {
                             block_addr,
                             op_idx,
                             space,
-                            address,
+                            Some(address),
                             value,
                         );
                     }
@@ -205,7 +205,7 @@ impl<'a> FoldingContext<'a> {
                             block_addr,
                             op_idx,
                             space,
-                            address,
+                            Some(address),
                             value,
                         );
                     }

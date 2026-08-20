@@ -3025,7 +3025,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                 read_block,
                 read_op,
                 space,
-                address,
+                Some(address),
                 read_value,
             );
         }

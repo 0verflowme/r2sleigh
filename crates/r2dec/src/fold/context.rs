@@ -323,7 +323,7 @@ impl<'a> FoldingContext<'a> {
         block_addr: u64,
         op_idx: usize,
         space: r2il::SpaceId,
-        address: ValueId,
+        address: Option<ValueId>,
         value: Option<ValueId>,
     ) {
         let proof = EffectRenderProof {
@@ -333,7 +333,7 @@ impl<'a> FoldingContext<'a> {
             call_disposition: None,
             target: None,
             space: Some(space),
-            address: Some(address),
+            address,
             value,
             values: Vec::new(),
             phi_edge: None,

@@ -1166,7 +1166,7 @@ impl<'a> FoldingContext<'a> {
                             block_addr,
                             op_idx,
                             fact.space,
-                            fact.address,
+                            Some(fact.address),
                             fact.value,
                         );
                         Some(rendered)
@@ -1568,6 +1568,13 @@ impl<'a> FoldingContext<'a> {
     pub(crate) fn loaded_stack_offset_for_visible_name(&self, name: &str) -> Option<i64> {
         self.prepared_semantic_view()
             .and_then(|view| view.loaded_stack_offset_by_name.get(name).copied())
+    }
+
+    /// The canonical value behind a variable, for recording what a render owns.
+    fn value_id_for_rendered_op(&self, var: &SSAVar) -> Option<ValueId> {
+        self.inputs
+            .prepared_ssa
+            .and_then(|prepared| prepared.graph().value_id_for_var(var))
     }
 
     pub(crate) fn prepared_semantic_view(&self) -> Option<&analysis::PreparedSemanticView> {
@@ -12098,11 +12105,32 @@ impl<'a> FoldingContext<'a> {
                 continue;
             }
 
+            // An op that renders inside an expression rather than as a statement is
+            // still rendered, and the expression that consumed it owns it. Recording
+            // the site here is what says so; without it the only ops on record are
+            // the ones that happened to become statements, and an accounting of what
+            // the output owes reads every inlined effect as missing.
             if self.is_inlined_single_use_call_result(block, op_idx, op) {
+                self.record_effect_render_proof_for_value(
+                    EffectRenderProofKind::Expression,
+                    block.addr,
+                    op_idx,
+                    op.dst().and_then(|dst| self.value_id_for_rendered_op(dst)),
+                );
                 continue;
             }
 
             if self.is_consumed_immediate_call_home_store(block, op_idx, op) {
+                if let SSAOp::Store { space, addr, val } = op {
+                    self.record_effect_render_proof_for_memory(
+                        EffectRenderProofKind::MemoryWrite,
+                        block.addr,
+                        op_idx,
+                        *space,
+                        self.value_id_for_rendered_op(addr),
+                        self.value_id_for_rendered_op(val),
+                    );
+                }
                 continue;
             }
 
@@ -12161,6 +12189,16 @@ impl<'a> FoldingContext<'a> {
                 && let Some(offset) = self.stack_slot_offset_for_var(addr)
                 && self.state.return_stack_slots.contains(&offset)
             {
+                if let SSAOp::Load { dst, space, addr } = op {
+                    self.record_effect_render_proof_for_memory(
+                        EffectRenderProofKind::MemoryRead,
+                        block.addr,
+                        op_idx,
+                        *space,
+                        self.value_id_for_rendered_op(addr),
+                        self.value_id_for_rendered_op(dst),
+                    );
+                }
                 continue;
             }
 
