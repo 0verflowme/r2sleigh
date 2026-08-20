@@ -128,7 +128,6 @@ fn should_skip_expensive_branch_compilation(
         || branch_count > 48
         || cfg_summary.back_edge_count > 4
         || cfg_summary.switch_block_count > 4
-        || branch_count >= 8
 }
 
 fn has_named_worker_family(summaries: &[NativeWorkerSummary]) -> bool {
@@ -1274,16 +1273,27 @@ mod tests {
             max_switch_cases: 0,
         };
 
-        assert!(should_skip_expensive_branch_compilation(&looped, 8));
-        assert!(should_skip_expensive_branch_compilation(&straight, 8));
-        assert!(!should_skip_expensive_branch_compilation(&straight, 7));
-        assert!(!should_skip_expensive_branch_compilation(&looped, 7));
+        // Branch fanout alone no longer forces the bounded path: it dropped the
+        // effects the source needs, and a function of this size compiles fully.
+        assert!(!should_skip_expensive_branch_compilation(&straight, 8));
+        assert!(!should_skip_expensive_branch_compilation(&looped, 8));
+        // Size and loop complexity still do
+        assert!(should_skip_expensive_branch_compilation(&straight, 49));
+        assert!(should_skip_expensive_branch_compilation(
+            &CFGRiskSummary {
+                back_edge_count: 5,
+                ..looped
+            },
+            8
+        ));
     }
 
     #[test]
     fn bounded_large_cfg_branch_fanout_uses_solver_free_budget() {
         let mut blocks = Vec::new();
-        for idx in 0..8u64 {
+        // Enough branches to exceed the fanout bound, which is what puts a function
+        // on the bounded path now that fanout alone no longer does
+        for idx in 0..50u64 {
             blocks.push(R2ILBlock {
                 addr: 0x3000 + idx * 8,
                 size: 4,
