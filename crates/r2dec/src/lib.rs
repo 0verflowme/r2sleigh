@@ -3074,6 +3074,7 @@ impl Decompiler {
         normalize_redundant_return_carrier_casts(&mut c_function);
         normalize_declared_assignment_literals(&mut c_function);
         normalize_comparison_operand_order(&mut c_function);
+        unrendered::drop_values_from_void_returns(&mut c_function);
         unrendered::mark_undeclared_names(&mut c_function);
         // Executable C is admitted only when the source obligation inventory is
         // complete. The inventory is what says which effects the source has, so a

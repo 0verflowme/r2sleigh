@@ -25,7 +25,77 @@
 
 use std::collections::BTreeSet;
 
-use crate::ast::{CExpr, CFunction, CStmt, SwitchCase};
+use crate::ast::{CExpr, CFunction, CStmt, CType, SwitchCase};
+
+/// Drop the value from every `return` in a function that returns nothing.
+///
+/// A `void` function has no value to give back, but the renderer resolved a
+/// return carrier anyway and printed it, so `void list_free(Node *head)` ended
+/// `return rip;`: a function that returns nothing handing back the program
+/// counter. The carrier is not program text and the statement is not C, and
+/// the marker beside it reported the symptom rather than the statement being
+/// wrong to emit at all.
+pub(crate) fn drop_values_from_void_returns(func: &mut CFunction) {
+    if !matches!(func.ret_type, CType::Void) {
+        return;
+    }
+    let body = std::mem::take(&mut func.body);
+    func.body = body.into_iter().map(drop_void_return_value).collect();
+}
+
+fn drop_void_return_value(stmt: CStmt) -> CStmt {
+    match stmt {
+        CStmt::Return(Some(_)) => CStmt::Return(None),
+        CStmt::Block(body) => {
+            CStmt::Block(body.into_iter().map(drop_void_return_value).collect())
+        }
+        CStmt::If {
+            cond,
+            then_body,
+            else_body,
+        } => CStmt::If {
+            cond,
+            then_body: Box::new(drop_void_return_value(*then_body)),
+            else_body: else_body.map(|body| Box::new(drop_void_return_value(*body))),
+        },
+        CStmt::While { cond, body } => CStmt::While {
+            cond,
+            body: Box::new(drop_void_return_value(*body)),
+        },
+        CStmt::DoWhile { body, cond } => CStmt::DoWhile {
+            body: Box::new(drop_void_return_value(*body)),
+            cond,
+        },
+        CStmt::For {
+            init,
+            cond,
+            update,
+            body,
+        } => CStmt::For {
+            init,
+            cond,
+            update,
+            body: Box::new(drop_void_return_value(*body)),
+        },
+        CStmt::Switch {
+            expr,
+            cases,
+            default,
+        } => CStmt::Switch {
+            expr,
+            cases: cases
+                .into_iter()
+                .map(|case| SwitchCase {
+                    body: case.body.into_iter().map(drop_void_return_value).collect(),
+                    ..case
+                })
+                .collect(),
+            default: default
+                .map(|body| body.into_iter().map(drop_void_return_value).collect()),
+        },
+        other => other,
+    }
+}
 
 /// Mark every construct that mentions a name this function does not declare.
 pub(crate) fn mark_undeclared_names(func: &mut CFunction) {
