@@ -145,6 +145,8 @@ pub(crate) struct ControlFlowStructurer<'a, 'o> {
     rendered_block_domains: BTreeMap<u64, Vec<RenderedBlockOccurrence>>,
     /// Basic blocks owned by the current structured region tree.
     structured_region_blocks: BTreeSet<u64>,
+    /// Blocks the proof shows nothing can reach, computed once for this function.
+    proven_dead_blocks: std::cell::OnceCell<BTreeSet<u64>>,
     /// Exact side-entry domains that reach a labeled block through a certified
     /// noncanonical loop exit.
     transfer_target_domains: BTreeMap<u64, Vec<RenderedBlockDomain>>,
@@ -414,6 +416,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             active_domains: vec![RenderedBlockDomain::default()],
             rendered_block_domains: BTreeMap::new(),
             structured_region_blocks: BTreeSet::new(),
+            proven_dead_blocks: std::cell::OnceCell::new(),
             transfer_target_domains: BTreeMap::new(),
         }
     }
@@ -446,6 +449,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             active_domains: vec![RenderedBlockDomain::default()],
             rendered_block_domains: BTreeMap::new(),
             structured_region_blocks: BTreeSet::new(),
+            proven_dead_blocks: std::cell::OnceCell::new(),
             transfer_target_domains: BTreeMap::new(),
         })
     }
@@ -1620,6 +1624,22 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
     /// the body rather than blocks in the source. Structuring that lost a block is
     /// not safe structuring, so it says so here rather than rendering the rest as
     /// though the function were complete.
+    /// Whether the proof shows nothing can reach this block.
+    ///
+    /// A branch whose arm cannot be entered is not a branch the program takes, and
+    /// rendering it says the program chooses between two things when it does not.
+    fn block_is_proven_dead(&self, addr: u64) -> bool {
+        self.proven_dead_blocks
+            .get_or_init(|| {
+                let blocks = self.func.blocks().cloned().collect::<Vec<_>>();
+                r2ssa::proven::unreachable_blocks(&blocks, self.func.cfg())
+                    .into_iter()
+                    .map(|block| block.addr)
+                    .collect()
+            })
+            .contains(&addr)
+    }
+
     fn validate_rendered_block_domain_coverage(&mut self) {
         if self.safety_reason.is_some() {
             return;
@@ -1627,16 +1647,11 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         let source = self.func.block_addrs();
         // A block the proof shows nothing can reach owes the output nothing, so
         // not rendering it is the right answer rather than a gap in coverage.
-        let blocks = self.func.blocks().cloned().collect::<Vec<_>>();
-        let proven_dead = r2ssa::proven::unreachable_blocks(&blocks, self.func.cfg())
-            .into_iter()
-            .map(|block| block.addr)
-            .collect::<BTreeSet<_>>();
         let missing = source
             .iter()
             .copied()
             .filter(|addr| {
-                !self.structured_region_blocks.contains(addr) && !proven_dead.contains(addr)
+                !self.structured_region_blocks.contains(addr) && !self.block_is_proven_dead(*addr)
             })
             .collect::<Vec<_>>();
         let Some(first) = missing.first().copied() else {
