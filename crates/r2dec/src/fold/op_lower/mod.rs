@@ -6254,7 +6254,9 @@ impl<'a> FoldingContext<'a> {
             .and_then(|ty| ty.bits())
             .map(|bits| bits.div_ceil(8))
             .filter(|bytes| *bytes > 0)
-            .unwrap_or(self.inputs.arch.ptr_size);
+            // `SSAVar::size` is a byte count, and `ptr_size` is a bit count, so
+            // a name with no type hint used to claim eight times its own width.
+            .unwrap_or_else(|| self.inputs.arch.ptr_size.div_ceil(8).max(1));
         Some(SSAVar::new(base, version, size))
     }
 
@@ -6449,7 +6451,7 @@ impl<'a> FoldingContext<'a> {
                 .iter()
                 .find(|(_, alias)| alias.eq_ignore_ascii_case(base_name))
         {
-            let base_var = SSAVar::new(reg_name, 0, self.inputs.arch.ptr_size);
+            let base_var = SSAVar::new(reg_name, 0, self.inputs.arch.ptr_size.div_ceil(8).max(1));
             if let Some(name) = self
                 .inputs
                 .type_oracle
@@ -6527,7 +6529,8 @@ impl<'a> FoldingContext<'a> {
                     .iter()
                     .find(|(_, alias)| alias.eq_ignore_ascii_case(name))
                 {
-                    let base_var = SSAVar::new(reg_name, 0, self.inputs.arch.ptr_size);
+                    let base_var =
+                        SSAVar::new(reg_name, 0, self.inputs.arch.ptr_size.div_ceil(8).max(1));
                     if let Some(field) =
                         self.field_name_from_type_hint_for_var(&base_var, offset, access_size)
                     {
