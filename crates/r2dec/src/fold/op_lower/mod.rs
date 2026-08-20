@@ -2466,7 +2466,7 @@ impl<'a> FoldingContext<'a> {
         saw_use
     }
 
-    fn stack_slot_offset_for_var(&self, var: &SSAVar) -> Option<i64> {
+    pub(crate) fn stack_slot_offset_for_var(&self, var: &SSAVar) -> Option<i64> {
         self.stack_slot_provenance_for_var(var)
             .map(|slot| slot.offset)
             .or_else(|| self.prepared_stack_offset_for_var(var))

@@ -713,6 +713,19 @@ impl<'a> FoldingContext<'a> {
     }
 
     /// Resolve a stack variable name by signed stack offset.
+    /// Whether an address a frame operation loads from or stores to is a stack
+    /// slot.
+    ///
+    /// A prologue push and an epilogue pop reach the stack through a temporary,
+    /// so a temporary had to be accepted here. Accepting every temporary meant
+    /// accepting `ldr x19, [x19, 0x38]` -- a field load into a callee-saved
+    /// register -- as an epilogue restore, and deleting it while its uses
+    /// stayed. What makes an address part of the frame is where it points, so
+    /// that is what is asked.
+    pub(super) fn addr_is_stack_slot(&self, addr: &SSAVar) -> bool {
+        utils::is_temporary_name(&addr.name) && self.stack_slot_offset_for_var(addr).is_some()
+    }
+
     pub fn resolve_stack_var(&self, offset: i64) -> Option<String> {
         if let Some(alias_name) = self
             .prepared_stack_alias_view()
@@ -853,7 +866,7 @@ impl<'a> FoldingContext<'a> {
                     return true;
                 }
                 // Store constant to RSP-derived address (pre-call return address push)
-                if val.is_const() && (addr_is_sp || addr_name.contains("tmp:")) {
+                if val.is_const() && (addr_is_sp || self.addr_is_stack_slot(addr)) {
                     // Check if this constant was consumed by call-arg analysis
                     let val_key = val.display_name();
                     if self.consumed_by_call_set().contains(&val_key) {
@@ -863,7 +876,7 @@ impl<'a> FoldingContext<'a> {
                 // Store callee-saved register to stack (prologue push)
                 // The P-code often uses temps: Copy tmp:X = RBX; Store [RSP], tmp:X
                 // So we need to check both direct and indirect through temps.
-                if (addr_is_sp || addr_name.contains("tmp:")) && !val.is_const() {
+                if (addr_is_sp || self.addr_is_stack_slot(addr)) && !val.is_const() {
                     // Direct: val is a callee-saved register
                     if self.inputs.arch.is_callee_saved_name(&val_name) {
                         return true;
@@ -950,7 +963,7 @@ impl<'a> FoldingContext<'a> {
                 let addr_is_sp = self.inputs.arch.is_stack_pointer_name(&addr_name);
                 // Load fp from stack (pop fp)
                 if self.inputs.arch.is_frame_pointer_name(&dst_name)
-                    && (addr_is_sp || addr_name.contains("tmp:"))
+                    && (addr_is_sp || self.addr_is_stack_slot(addr))
                 {
                     return true;
                 }
@@ -959,7 +972,7 @@ impl<'a> FoldingContext<'a> {
                     return true;
                 }
                 // Load callee-saved register from stack (epilogue pop)
-                if (addr_is_sp || addr_name.contains("tmp:"))
+                if (addr_is_sp || self.addr_is_stack_slot(addr))
                     && self.inputs.arch.is_callee_saved_name(&dst_name)
                 {
                     return true;

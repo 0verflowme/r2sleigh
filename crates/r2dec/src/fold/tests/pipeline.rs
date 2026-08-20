@@ -10364,6 +10364,12 @@ mod tests {
         let mut ctx = FoldingContext::new(64);
         let addr = make_var("tmp:stack", 1, 8);
         let saved = make_var("TMP:saved", 1, 8);
+        // The temp has to point into the frame. Accepting any temp is what let
+        // a field load into a callee-saved register pass as an epilogue pop.
+        ctx.state.analysis_ctx.use_info.definitions.insert(
+            addr.display_name(),
+            CExpr::binary(BinaryOp::Sub, CExpr::Var("rsp".to_string()), CExpr::IntLit(0x20)),
+        );
         ctx.state
             .analysis_ctx
             .use_info
@@ -10389,6 +10395,18 @@ mod tests {
             dst: make_var("RBP", 2, 8),
             space: r2il::SpaceId::Custom(7),
             addr: make_var("RSP", 1, 8),
+        }));
+        // A field load into a callee-saved register through a temp that does
+        // not point into the frame is program text, not an epilogue restore.
+        let field = make_var("tmp:field", 1, 8);
+        ctx.state.analysis_ctx.use_info.definitions.insert(
+            field.display_name(),
+            CExpr::binary(BinaryOp::Add, CExpr::Var("RBX_1".to_string()), CExpr::IntLit(0x38)),
+        );
+        assert!(!ctx.is_stack_frame_op(&SSAOp::Load {
+            dst: make_var("RBX", 2, 8),
+            space: r2il::SpaceId::Ram,
+            addr: field,
         }));
     }
 
