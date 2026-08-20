@@ -1624,10 +1624,19 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             return;
         }
         let source = self.func.block_addrs();
+        // A block the proof shows nothing can reach owes the output nothing, so
+        // not rendering it is the right answer rather than a gap in coverage.
+        let blocks = self.func.blocks().cloned().collect::<Vec<_>>();
+        let proven_dead = r2ssa::proven::unreachable_blocks(&blocks, self.func.cfg())
+            .into_iter()
+            .map(|block| block.addr)
+            .collect::<BTreeSet<_>>();
         let missing = source
             .iter()
             .copied()
-            .filter(|addr| !self.structured_region_blocks.contains(addr))
+            .filter(|addr| {
+                !self.structured_region_blocks.contains(addr) && !proven_dead.contains(addr)
+            })
             .collect::<Vec<_>>();
         let Some(first) = missing.first().copied() else {
             return;
