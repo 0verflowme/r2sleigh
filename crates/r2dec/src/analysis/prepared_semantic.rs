@@ -59,6 +59,10 @@ pub(crate) struct PreparedSemanticView {
     pub(crate) call_result_source_by_name: HashMap<String, (u64, usize)>,
     pub(crate) switch_selector_value_by_block: BTreeMap<u64, ValueId>,
     pub(crate) switch_selector_expr_by_block: BTreeMap<u64, CExpr>,
+    /// Byte offset and width of every access the capture projects onto a struct
+    /// member rather than an array element. An index must not be invented for
+    /// these: the offset reaches a field, and its stride is not an element size.
+    pub(crate) member_projected_accesses: HashSet<(u64, u32)>,
     pub(crate) certified_rendering_required: bool,
     pub(crate) authorized_stack_owner_names: BTreeMap<i64, BTreeSet<String>>,
     pub(crate) authorized_stack_owner_names_by_object:
@@ -110,6 +114,24 @@ impl PreparedSemanticView {
         let mut view = Self {
             param_alias_by_reg: inputs.param_register_aliases.clone(),
             certified_rendering_required,
+            member_projected_accesses: inputs
+                .prepared
+                .machine_context()
+                .function_interface()
+                .and_then(|interface| {
+                    inputs
+                        .prepared
+                        .aggregate_accesses()
+                        .projections_for_revision(interface.revision_identity())
+                })
+                .map(|projections| {
+                    projections
+                        .values()
+                        .filter(|projection| projection.element_index.is_none())
+                        .map(|projection| (projection.byte_offset, projection.byte_width))
+                        .collect()
+                })
+                .unwrap_or_default(),
             certified_loop_carrier_values: inputs
                 .function_facts
                 .render()
@@ -1358,10 +1380,18 @@ fn prepared_load_access_expr_for_addr(
     let addr_expr = authoritative_scalar_expr_for_value(block, view, addr, 0)
         .or_else(|| scalar_owner_expr_for_value(view, addr, addr.size))
         .or_else(|| view.owner_expr_for_var(addr).cloned())?;
-    prepared_load_access_expr_from_visible_addr(addr_expr, elem_size)
+    prepared_load_access_expr_from_visible_addr(
+        addr_expr,
+        elem_size,
+        &view.member_projected_accesses,
+    )
 }
 
-fn prepared_load_access_expr_from_visible_addr(expr: CExpr, elem_size: u32) -> Option<CExpr> {
+fn prepared_load_access_expr_from_visible_addr(
+    expr: CExpr,
+    elem_size: u32,
+    member_projected: &HashSet<(u64, u32)>,
+) -> Option<CExpr> {
     let elem_size = i64::from(elem_size.max(1));
 
     fn literal_i64(expr: &CExpr) -> Option<i64> {
@@ -1376,10 +1406,10 @@ fn prepared_load_access_expr_from_visible_addr(expr: CExpr, elem_size: u32) -> O
     match expr {
         CExpr::AddrOf(inner) => Some(*inner),
         CExpr::Paren(inner) => {
-            prepared_load_access_expr_from_visible_addr(*inner, elem_size as u32)
+            prepared_load_access_expr_from_visible_addr(*inner, elem_size as u32, member_projected)
         }
         CExpr::Cast { expr: inner, .. } => {
-            prepared_load_access_expr_from_visible_addr(*inner, elem_size as u32)
+            prepared_load_access_expr_from_visible_addr(*inner, elem_size as u32, member_projected)
         }
         CExpr::Binary {
             op: BinaryOp::Add,
@@ -1392,6 +1422,15 @@ fn prepared_load_access_expr_from_visible_addr(expr: CExpr, elem_size: u32) -> O
                 let index = offset / elem_size;
                 return Some(if index == 0 {
                     CExpr::deref(*left)
+                } else if offset >= 0
+                    && member_projected.contains(&(offset as u64, elem_size as u32))
+                {
+                    // The capture projects this access onto a struct member, not
+                    // an array element, so the offset reaches a field and its
+                    // stride is not an element size. Leaving the address alone
+                    // lets the layer holding the layout name it; inventing an
+                    // index decided it first and `cur->next` rendered as `cur[1]`.
+                    CExpr::deref(CExpr::binary(BinaryOp::Add, *left, *right))
                 } else {
                     CExpr::subscript(*left, CExpr::IntLit(index))
                 });
