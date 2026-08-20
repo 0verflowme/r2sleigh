@@ -5121,10 +5121,9 @@ static bool sleigh_post_analysis(RAnal *anal) {
 		SleighArtifactPlan proof_plan;
 		if (sleigh_artifact_plan_init (&proof_plan, anal, fcn, "proof")) {
 			if (collect_proof_artifacts_for_function (&proof_plan, core, fcn,
-					&proof_xrefs, &proof_dead_blocks)) {
-				if (sleigh_artifact_plan_submit (&proof_plan)) {
-					proof_fcns++;
-				}
+					&proof_xrefs, &proof_dead_blocks)
+					&& sleigh_artifact_plan_submit (&proof_plan)) {
+				proof_fcns++;
 			}
 			sleigh_artifact_plan_fini (&proof_plan);
 		}

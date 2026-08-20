@@ -27,7 +27,7 @@ pub const SNAPSHOT_WIRE_FORMAT_VERSION: u32 = 1;
 /// Bytes of fixed header preceding the string table.
 pub const SNAPSHOT_WIRE_HEADER_BYTES: usize = 24;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SnapshotWireError {
     /// The buffer is shorter than the fixed header.
     HeaderTruncated,
@@ -49,8 +49,8 @@ pub enum SnapshotWireError {
     ValueTooWide,
     /// A tag names a case this schema does not define; `record` says which record it came from.
     UnknownDiscriminant { record: &'static str, tag: u64 },
-    /// The bytes decoded but the contract refused them; `contract` names the constructor that said no.
-    RejectedContract { contract: &'static str },
+    /// The bytes decoded but the contract refused them; `contract` names the constructor that said no and `reason` says what it objected to.
+    RejectedContract { contract: &'static str, reason: String },
 }
 
 impl std::fmt::Display for SnapshotWireError {
@@ -603,6 +603,7 @@ pub fn read_presentation(
         let Some(signature) = read_signature_presentation(reader)? else {
             return Err(SnapshotWireError::RejectedContract {
                 contract: "SourceSignaturePresentation",
+                reason: "the record carried no signature".to_string(),
             });
         };
         callee_signatures.push((name, signature));
@@ -697,9 +698,10 @@ pub fn read_machine_roles(
     let stack_pointer_storage = read_optional_storage(reader)?;
     // new() revalidates the register constraint, so a buffer cannot mint roles
     // the in-crate constructor would have rejected.
-    SourceMachineRoles::new(return_address_storage, stack_pointer_storage).map_err(|_| {
+    SourceMachineRoles::new(return_address_storage, stack_pointer_storage).map_err(|error| {
         SnapshotWireError::RejectedContract {
             contract: "SourceMachineRoles::new",
+            reason: format!("{error:?}"),
         }
     })
 }
@@ -731,9 +733,10 @@ pub fn read_convention_slots(
     let result_slot = read_optional_storage(reader)?;
     // new() revalidates, so a buffer cannot mint candidate slots the in-crate
     // constructor would have rejected.
-    SourceConventionSlots::new(calling_convention, argument_slots, result_slot).map_err(|_| {
+    SourceConventionSlots::new(calling_convention, argument_slots, result_slot).map_err(|error| {
         SnapshotWireError::RejectedContract {
             contract: "SourceConventionSlots::new",
+            reason: format!("{error:?}"),
         }
     })
 }
@@ -1264,8 +1267,9 @@ pub fn read_type_graph(
     // mint a graph the in-crate constructor would have rejected. Every
     // downstream projection resolves type identities against this graph, so it
     // is the last place that may accept something unchecked.
-    SourceTypeGraph::new(types, aggregates).map_err(|_| SnapshotWireError::RejectedContract {
+    SourceTypeGraph::new(types, aggregates).map_err(|error| SnapshotWireError::RejectedContract {
         contract: "SourceTypeGraph::new",
+        reason: format!("{error:?}"),
     })
 }
 
@@ -1586,8 +1590,9 @@ pub fn read_interface(
             });
         }
     }
-    .map_err(|_| SnapshotWireError::RejectedContract {
+    .map_err(|error| SnapshotWireError::RejectedContract {
         contract: "SourceFunctionInterface::new",
+        reason: format!("{error:?}"),
     })?;
 
     interface =
@@ -1595,21 +1600,24 @@ pub fn read_interface(
     if let Some(storage) = return_address_storage {
         interface = interface
             .with_return_address_storage(storage)
-            .map_err(|_| SnapshotWireError::RejectedContract {
+            .map_err(|error| SnapshotWireError::RejectedContract {
                 contract: "SourceFunctionInterface::with_return_address_storage",
+                reason: format!("{error:?}"),
             })?;
     }
     if let Some(storage) = stack_pointer_storage {
-        interface = interface.with_stack_pointer_storage(storage).map_err(|_| {
+        interface = interface.with_stack_pointer_storage(storage).map_err(|error| {
             SnapshotWireError::RejectedContract {
                 contract: "SourceFunctionInterface::with_stack_pointer_storage",
+                reason: format!("{error:?}"),
             }
         })?;
     }
     if let Some(storage) = frame_pointer_storage {
-        interface = interface.with_frame_pointer_storage(storage).map_err(|_| {
+        interface = interface.with_frame_pointer_storage(storage).map_err(|error| {
             SnapshotWireError::RejectedContract {
                 contract: "SourceFunctionInterface::with_frame_pointer_storage",
+                reason: format!("{error:?}"),
             }
         })?;
     }
@@ -1627,15 +1635,17 @@ pub fn read_interface(
                 stack_pointer_delta_bytes,
                 address_size_bytes,
             )
-            .map_err(|_| SnapshotWireError::RejectedContract {
+            .map_err(|error| SnapshotWireError::RejectedContract {
                 contract: "SourceFunctionInterface::with_exact_stacked_return",
+                reason: format!("{error:?}"),
             })?;
     }
     if let Some(contract) = stack_allocation {
         interface = interface
             .with_stack_allocation_contract(contract)
-            .map_err(|_| SnapshotWireError::RejectedContract {
+            .map_err(|error| SnapshotWireError::RejectedContract {
                 contract: "SourceFunctionInterface::with_stack_allocation_contract",
+                reason: format!("{error:?}"),
             })?;
     }
     Ok(interface)
@@ -1689,7 +1699,7 @@ pub fn encode_snapshot_set(
     writer.finish()
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SnapshotDecodeError {
     Wire(SnapshotWireError),
     /// The decoded parts did not satisfy the snapshot's own validation, so no
@@ -1768,6 +1778,7 @@ fn decode_snapshot_inner(
             return Err(SnapshotDecodeError::Wire(
                 SnapshotWireError::RejectedContract {
                     contract: "callee snapshot set depth",
+                    reason: "a callee carried callees of its own".to_string(),
                 },
             ));
         }
@@ -1889,12 +1900,15 @@ mod tests {
         writer.u32(0);
         let buffer = writer.finish().expect("finish");
         let mut reader = SnapshotWireReader::new(&buffer).expect("header");
-        assert_eq!(
-            read_type_graph(&mut reader),
-            Err(SnapshotWireError::RejectedContract {
-                contract: "SourceTypeGraph::new",
-            })
-        );
+        // The reason travels with the refusal, so match the contract and read
+        // the reason rather than pinning its wording.
+        let Err(SnapshotWireError::RejectedContract { contract, reason }) =
+            read_type_graph(&mut reader)
+        else {
+            panic!("a type graph the constructor refuses must be refused here too");
+        };
+        assert_eq!(contract, "SourceTypeGraph::new");
+        assert!(!reason.is_empty(), "a refusal has to say what it objected to");
     }
 
     #[test]
