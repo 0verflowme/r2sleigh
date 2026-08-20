@@ -2748,13 +2748,6 @@ impl Decompiler {
             .clone()
             .unwrap_or_else(|| format!("sub_{:x}", func.entry));
         let render_signature = self.context.type_facts().render_authorized_signature();
-        if std::env::var("R2DBG").is_ok() {
-            let tf = self.context.type_facts();
-            eprintln!("DBGSIG render={:?} cert={:?} merged_ret={:?}",
-                render_signature.map(|s| format!("{:?}", s.ret_type)),
-                tf.signature_certificate.as_ref().map(|c| (c.confidence, c.sources.clone(), c.signature.ret_type.clone())),
-                tf.merged_signature.as_ref().map(|s| s.ret_type.clone()));
-        }
         // Recover variables
         let mut var_recovery = VariableRecovery::new_with_abi(
             &self.config.sp_name,

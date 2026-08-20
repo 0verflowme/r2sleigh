@@ -3053,10 +3053,6 @@ fn trusted_external_type_db(trusted: &r2ssa::TrustedSsaArtifact) -> r2types::Ext
     else {
         return db;
     };
-    if std::env::var("R2DBG").is_ok() {
-        eprintln!("DBGRAW aggregates={} names={:?}", graph.aggregates().len(),
-            graph.aggregates().iter().map(|a| (a.name().to_string(), a.members().len())).collect::<Vec<_>>());
-    }
     for aggregate in graph.aggregates() {
         let name = aggregate.name();
         if name.is_empty() {
@@ -3064,9 +3060,6 @@ fn trusted_external_type_db(trusted: &r2ssa::TrustedSsaArtifact) -> r2types::Ext
         }
         let mut fields = std::collections::BTreeMap::new();
         collect_external_struct_fields(graph, aggregate, 0, "", &mut fields, 0);
-        if std::env::var("R2DBG").is_ok() {
-            eprintln!("DBGAGG {name}: {:?}", fields.iter().map(|(o,f)| (*o, f.name.clone(), f.ty.clone())).collect::<Vec<_>>());
-        }
         if fields.is_empty() {
             continue;
         }
