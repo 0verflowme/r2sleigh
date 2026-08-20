@@ -3389,11 +3389,15 @@ mod tests {
         let mut analyzer = RegionAnalyzer::new(&func);
 
         let region = analyzer.analyze();
-        let Region::DoWhileLoop { cond_block, .. } = region else {
-            panic!("expected latch-conditioned loop, got {region:?}");
+        // the block that returns after the loop is the loop's successor, not its body
+        let Region::Sequence(parts) = &region else {
+            panic!("expected the loop followed by its exit, got {region:?}");
+        };
+        let Some(Region::DoWhileLoop { cond_block, .. }) = parts.first() else {
+            panic!("expected latch-conditioned loop first, got {region:?}");
         };
 
-        assert_eq!(cond_block, 0x1020);
+        assert_eq!(*cond_block, 0x1020);
     }
 
     #[test]
@@ -3533,8 +3537,12 @@ mod tests {
             "predicate-less fixture must not mint loop render proofs, got {proof_anchors:x?}"
         );
         assert!(
-            stmt_contains_comment(&rendered, "r2dec residual: unresolved"),
-            "predicate-less fixture should residualize unresolved control, got {rendered:?}"
+            stmt_contains_comment(&rendered, "r2dec residual:"),
+            "predicate-less fixture should residualize, got {rendered:?}"
+        );
+        assert!(
+            stmt_contains_comment(&rendered, "unrendered"),
+            "the refusal should name the blocks it could not cover, got {rendered:?}"
         );
     }
 

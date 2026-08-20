@@ -631,8 +631,12 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
     /// Structure the function's control flow.
     pub(crate) fn structure(&mut self) -> CStmt {
         let stmt = self.structure_preserving_render_proof_identity();
-        if self.safety_reason.is_some() {
-            return CStmt::Empty;
+        // A refusal that does not say what it refused reads as a function with no body
+        if let Some(reason) = self.safety_reason.clone() {
+            return CStmt::comment(format!(
+                "r2dec residual: {}",
+                crate::sanitize_comment_text(&reason)
+            ));
         }
         // Post-process: flatten, simplify loops, remove redundant control flow.
         Self::cleanup(stmt)
@@ -1607,7 +1611,34 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
 
     fn validate_certified_block_domain(&mut self, _block_addr: u64, _stmts: &[CStmt]) {}
 
-    fn validate_rendered_block_domain_coverage(&mut self) {}
+    /// Every block the source has must be covered by the region that was structured.
+    ///
+    /// A block no region covers is never folded, so whatever it did is absent from
+    /// the output with nothing saying so. That is how a loop's trailing return used
+    /// to disappear, and it stayed quiet because the proof note counts markers in
+    /// the body rather than blocks in the source. Structuring that lost a block is
+    /// not safe structuring, so it says so here rather than rendering the rest as
+    /// though the function were complete.
+    fn validate_rendered_block_domain_coverage(&mut self) {
+        if self.safety_reason.is_some() {
+            return;
+        }
+        let source = self.func.block_addrs();
+        let missing = source
+            .iter()
+            .copied()
+            .filter(|addr| !self.structured_region_blocks.contains(addr))
+            .collect::<Vec<_>>();
+        let Some(first) = missing.first().copied() else {
+            return;
+        };
+        self.safety_reason = Some(format!(
+            "structuring covered {} of {} source blocks, leaving 0x{first:x} and {} others unrendered",
+            self.structured_region_blocks.len(),
+            source.len(),
+            missing.len().saturating_sub(1)
+        ));
+    }
 
     fn rendered_loop_domain_matches_source(
         &self,
