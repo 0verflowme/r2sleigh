@@ -1588,6 +1588,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
     }
 
     fn folded_block_stmts(&mut self, block: &r2ssa::FunctionSSABlock, addr: u64) -> Vec<CStmt> {
+        self.fold_ctx.folded_blocks.borrow_mut().insert(addr);
         let stmts = if let Some(folded) = self.folded_block_cache.get(&addr) {
             self.fold_ctx
                 .append_effect_render_proofs(&folded.effect_proofs);

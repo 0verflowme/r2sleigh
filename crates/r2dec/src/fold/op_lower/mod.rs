@@ -12089,6 +12089,7 @@ impl<'a> FoldingContext<'a> {
     pub(crate) fn fold_block(&self, block: &SSABlock, current_block_addr: u64) -> Vec<CStmt> {
         self.current_block_addr.set(Some(current_block_addr));
         self.current_op_idx.set(None);
+        self.folded_blocks.borrow_mut().insert(block.addr);
         let mut stmts = Vec::new();
         let mut last_ret_value: Option<CExpr> = None;
         let mut last_ret_value_op_idx: Option<usize> = None;

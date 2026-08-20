@@ -1456,6 +1456,7 @@ pub(crate) struct ObligationClosure {
 fn obligation_closure(
     prepared: &r2ssa::SsaArtifact,
     proofs: &[crate::fold::context::EffectRenderProof],
+    folded_blocks: &std::collections::BTreeSet<u64>,
 ) -> ObligationClosure {
     use r2ssa::SemanticObligationKind as Kind;
     let obligations = prepared.obligations();
@@ -1467,6 +1468,11 @@ fn obligation_closure(
                 .inst_id_for_op_site(proof.block_addr, proof.op_idx)
         })
         .collect::<std::collections::BTreeSet<_>>();
+    // A merge sits at the head of its block rather than at any operation, so no
+    // operation site can name it. What expresses a merge is the block it heads:
+    // if that block rendered, the values arriving there are the ones the output
+    // reads, and the merge is what it read them through.
+    let rendered_blocks = folded_blocks;
     let mut closure = ObligationClosure::default();
     for id in obligations.obligations().keys() {
         if matches!(id.kind, Kind::VolatileOrUnknownEffect | Kind::Trap) {
@@ -1474,11 +1480,16 @@ fn obligation_closure(
             continue;
         }
         closure.total += 1;
-        let owned = obligations
-            .instructions()
-            .get(&id.instruction)
-            .and_then(|disposition| disposition.source.graph_inst())
-            .is_some_and(|inst| rendered.contains(&inst));
+        let owned = match id.instruction.site {
+            r2ssa::CanonicalInstructionSite::Phi(_) => {
+                rendered_blocks.contains(&id.instruction.block_addr)
+            }
+            _ => obligations
+                .instructions()
+                .get(&id.instruction)
+                .and_then(|disposition| disposition.source.graph_inst())
+                .is_some_and(|inst| rendered.contains(&inst)),
+        };
         if owned {
             closure.owned += 1;
         }
@@ -3058,7 +3069,11 @@ impl Decompiler {
         if let Some(reason) = incomplete_source_obligations_reason(prepared) {
             return Ok(residual_function_for_render_boundary(&c_function.name, &reason));
         }
-        let closure = obligation_closure(prepared, &fold_ctx.effect_render_proofs_since(0));
+        let closure = obligation_closure(
+            prepared,
+            &fold_ctx.effect_render_proofs_since(0),
+            &fold_ctx.folded_block_addrs(),
+        );
         note_unproven_constructs(&mut c_function, Some(closure));
         work.with_phase(DecompileWorkPhase::Rendering).poll()?;
         Ok(c_function)

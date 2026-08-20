@@ -189,6 +189,8 @@ pub(crate) struct FoldingContext<'a> {
     pub(crate) definition_raw_in_progress: std::cell::RefCell<HashSet<String>>,
     pub(crate) resolution_guard: std::cell::RefCell<HashSet<ResolutionGuardKey>>,
     pub(crate) effect_render_proofs: std::cell::RefCell<Vec<EffectRenderProof>>,
+    /// Blocks the fold walked, which is what expresses a merge standing at their head.
+    pub(crate) folded_blocks: std::cell::RefCell<std::collections::BTreeSet<u64>>,
 }
 
 impl FoldArchConfig {
@@ -269,7 +271,12 @@ impl<'a> FoldingContext<'a> {
             definition_raw_in_progress: std::cell::RefCell::new(HashSet::new()),
             resolution_guard: std::cell::RefCell::new(HashSet::new()),
             effect_render_proofs: std::cell::RefCell::new(Vec::new()),
+            folded_blocks: std::cell::RefCell::new(std::collections::BTreeSet::new()),
         }
+    }
+
+    pub(crate) fn folded_block_addrs(&self) -> std::collections::BTreeSet<u64> {
+        self.folded_blocks.borrow().clone()
     }
 
     pub(crate) fn effect_render_proofs_since(&self, checkpoint: usize) -> Vec<EffectRenderProof> {
