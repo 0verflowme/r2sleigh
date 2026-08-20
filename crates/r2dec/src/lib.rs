@@ -1823,6 +1823,39 @@ pub fn normalize_sig_arch_name(arch: Option<&r2il::ArchSpec>) -> Option<String> 
     Some(arch.name.clone())
 }
 
+/// The float-argument registers that advance alongside an integer sequence.
+///
+/// SysV and AAPCS both keep two argument sequences and advance them
+/// independently, so walking one positional list assigns the wrong register to
+/// every parameter after the first float: in
+/// `abi_mixed_params(int a, double b, int c, ...)` a positional walk put `b` in
+/// `rsi`, which actually carries `c`, and left the register really holding `b`
+/// with no name at all.
+fn float_arg_regs_for(abi_arg_regs: &[String]) -> &'static [&'static str] {
+    match abi_arg_regs
+        .first()
+        .map(|reg| reg.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("rdi") => &["xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7"],
+        Some("x0") => &["d0", "d1", "d2", "d3", "d4", "d5", "d6", "d7"],
+        _ => &[],
+    }
+}
+
+fn param_takes_float_register(ty: &CType) -> bool {
+    match ty {
+        CType::Float(_) => true,
+        // A recovered prototype spells its types, so a double arrives as the
+        // name `double` rather than as a width.
+        CType::Typedef(name) => matches!(
+            name.trim().to_ascii_lowercase().as_str(),
+            "float" | "double" | "long double" | "__float128" | "_float16"
+        ),
+        _ => false,
+    }
+}
+
 fn build_param_register_aliases(
     params: &[ast::CParam],
     recovered_params: &[(r2ssa::SSAVar, ast::CParam)],
@@ -1833,11 +1866,23 @@ fn build_param_register_aliases(
     let mut aliases = std::collections::HashMap::new();
 
     if allow_positional_aliases {
-        for (idx, reg_name) in abi_arg_regs.iter().enumerate() {
-            let Some(param) = params.get(idx) else {
+        let float_regs = float_arg_regs_for(abi_arg_regs);
+        let mut integer_index = 0usize;
+        let mut float_index = 0usize;
+        for param in params {
+            let reg_name = if param_takes_float_register(&param.ty) && !float_regs.is_empty() {
+                let reg = float_regs.get(float_index).map(|reg| (*reg).to_string());
+                float_index += 1;
+                reg
+            } else {
+                let reg = abi_arg_regs.get(integer_index).cloned();
+                integer_index += 1;
+                reg
+            };
+            let Some(reg_name) = reg_name else {
                 continue;
             };
-            for alias in register_alias_names(reg_name) {
+            for alias in register_alias_names(&reg_name) {
                 aliases.insert(alias, param.name.clone());
             }
         }
