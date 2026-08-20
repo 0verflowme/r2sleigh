@@ -4709,6 +4709,8 @@ static bool collect_proof_artifacts_for_function(SleighArtifactPlan *plan,
 		RCore *core, RAnalFunction *fcn, size_t *out_xrefs, size_t *out_dead) {
 	char *json = sleigh_proven_facts_json (core, fcn->addr);
 	if (!json) {
+		// Refusing is the fail-closed path, so say which function and move on.
+		R_LOG_DEBUG ("r2sleigh: no proofs for 0x%08"PFMT64x, fcn->addr);
 		return false;
 	}
 	R_LOG_DEBUG ("r2sleigh: proofs at 0x%08"PFMT64x": %s", fcn->addr, json);
@@ -5058,6 +5060,7 @@ static bool sleigh_post_analysis(RAnal *anal) {
 	size_t proof_xrefs = 0;
 	size_t proof_dead_blocks = 0;
 	int proof_fcns = 0;
+	int proof_refused = 0;
 	int taint_parse_failures = 0;
 	int taint_fcns_eligible = 0;
 	int taint_fcns_skipped = 0;
@@ -5124,6 +5127,8 @@ static bool sleigh_post_analysis(RAnal *anal) {
 					&proof_xrefs, &proof_dead_blocks)
 					&& sleigh_artifact_plan_submit (&proof_plan)) {
 				proof_fcns++;
+			} else {
+				proof_refused++;
 			}
 			sleigh_artifact_plan_fini (&proof_plan);
 		}
@@ -5218,8 +5223,8 @@ static bool sleigh_post_analysis(RAnal *anal) {
 	R_LOG_INFO ("r2sleigh: post-analysis taint enabled=%d eligible=%d skipped=%d comments=%zu flags=%zu xrefs=%zu sink_hits=%zu parse_failures=%d",
 		taint_enabled? 1: 0, taint_fcns_eligible, taint_fcns_skipped, taint_comments, taint_flags, taint_xrefs,
 		taint_sink_hits, taint_parse_failures);
-	R_LOG_INFO ("r2sleigh: post-analysis proofs fcns=%d call_targets=%zu unreachable_blocks=%zu",
-		proof_fcns, proof_xrefs, proof_dead_blocks);
+	R_LOG_INFO ("r2sleigh: post-analysis proofs fcns=%d refused=%d call_targets=%zu unreachable_blocks=%zu",
+		proof_fcns, proof_refused, proof_xrefs, proof_dead_blocks);
 	R_LOG_INFO ("r2sleigh: post-analysis risk summary: critical=%d high=%d medium=%d low=%d",
 		taint_risk_critical, taint_risk_high, taint_risk_medium, taint_risk_low);
 	R_LOG_INFO ("r2sleigh: post-analysis summary fcns=%d budget_exhausted=%d",
