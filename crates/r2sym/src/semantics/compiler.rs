@@ -764,20 +764,20 @@ fn compile_function_semantics_from_current_inputs(
             should_skip_expensive_branch_compilation(&cfg_summary, branch_count);
 
         if skip_expensive_branch_compilation {
-            if !vm_step_ready {
-                let bounded_scope = bounded_large_cfg_scope(func, scope);
-                collected = collect_large_cfg_canonical_semantic_regions_with_limit(
-                    ctx,
-                    func,
-                    bounded_scope.as_ref(),
-                    arch,
-                    &symbol_map,
-                    summary_profile,
-                    bounded_large_cfg_branch_limit(func),
-                );
-            } else {
-                collected.diagnostics.skipped_large_cfg = true;
-            }
+            // The bounded collection is bounded whatever the function turns out to
+            // be, so a dispatch loop has no more reason to skip it than anything
+            // else expensive does. Skipping it left a VM function with no regions
+            // at all, which is why nothing downstream could structure one.
+            let bounded_scope = bounded_large_cfg_scope(func, scope);
+            collected = collect_large_cfg_canonical_semantic_regions_with_limit(
+                ctx,
+                func,
+                bounded_scope.as_ref(),
+                arch,
+                &symbol_map,
+                summary_profile,
+                bounded_large_cfg_branch_limit(func),
+            );
 
             let execution = if vm_step_ready {
                 ExecutionModel::Vm
