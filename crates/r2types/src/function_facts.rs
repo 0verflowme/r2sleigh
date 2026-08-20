@@ -965,7 +965,7 @@ fn indexed_param_home_name<'a>(
     .then_some(name)
 }
 
-fn type_like_size_bytes(ty: &CTypeLike, ptr_bits: u32) -> Option<u64> {
+pub(crate) fn type_like_size_bytes(ty: &CTypeLike, ptr_bits: u32) -> Option<u64> {
     match ty {
         CTypeLike::Void | CTypeLike::Unknown | CTypeLike::Function => None,
         CTypeLike::Bool => Some(1),

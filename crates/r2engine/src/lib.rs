@@ -3031,6 +3031,124 @@ fn source_spelled_type(spelling: &str, ptr_bits: u32) -> Option<r2types::CTypeLi
     Some(ty)
 }
 
+/// The struct layouts radare2 captured alongside the function, as the external
+/// type database the field-naming path reads.
+///
+/// The snapshot already carries an aggregate layout for every struct its
+/// signature mentions, but nothing turned those layouts into the database, so
+/// it stayed empty in every real decompile. Field certificates are only kept
+/// when the database confirms a field, so every struct access fell back to
+/// pointer arithmetic however completely radare2 knew the type: `list_sum`
+/// rendered `cur[1]` for `cur->next`.
+fn trusted_external_type_db(trusted: &r2ssa::TrustedSsaArtifact) -> r2types::ExternalTypeDb {
+    let mut db = r2types::ExternalTypeDb::default();
+    let Some(graph) = trusted
+        .source()
+        .function_interface()
+        .and_then(r2ssa::SourceFunctionInterface::type_graph)
+    else {
+        return db;
+    };
+    for aggregate in graph.aggregates() {
+        let name = aggregate.name();
+        if name.is_empty() {
+            continue;
+        }
+        let mut fields = std::collections::BTreeMap::new();
+        collect_external_struct_fields(graph, aggregate, 0, "", &mut fields, 0);
+        if fields.is_empty() {
+            continue;
+        }
+        db.structs.insert(
+            r2types::normalize_external_type_name(name).to_ascii_lowercase(),
+            r2types::ExternalStruct {
+                name: name.to_string(),
+                fields,
+            },
+        );
+    }
+    db
+}
+
+/// The scalar members of an aggregate, keyed by byte offset, with a nested
+/// aggregate flattened into the dotted path that reaches its members.
+///
+/// Code reads the scalars, never the aggregate that contains them, so naming a
+/// four-byte read after the eight-byte `Point` sharing its offset would claim a
+/// member the access is not. Flattening gives that read the name it deserves:
+/// `r->top_left.x` rather than an unnamed subscript.
+fn collect_external_struct_fields(
+    graph: &r2ssa::SourceTypeGraph,
+    aggregate: &r2ssa::SourceAggregateLayout,
+    base_offset: u64,
+    prefix: &str,
+    fields: &mut std::collections::BTreeMap<u64, r2types::ExternalField>,
+    depth: u32,
+) {
+    // A type graph is acyclic, but a bound keeps a malformed capture from
+    // walking forever.
+    if depth > 4 {
+        return;
+    }
+    for member in aggregate.members() {
+        // A member the capture could not name, or one that does not start on a
+        // byte, cannot be spelled as a field access.
+        if member.name().is_empty() || member.offset_bits() % 8 != 0 {
+            continue;
+        }
+        let Some(offset) = base_offset.checked_add(member.offset_bits() / 8) else {
+            continue;
+        };
+        let path = if prefix.is_empty() {
+            member.name().to_string()
+        } else {
+            format!("{prefix}.{}", member.name())
+        };
+        let member_type = usize::try_from(member.type_id())
+            .ok()
+            .and_then(|id| graph.types().get(id));
+        if let Some(source_type) = member_type
+            && let r2ssa::SourceTypeKind::Struct { aggregate_id } = source_type.kind()
+        {
+            if let Some(nested) = graph
+                .aggregates()
+                .iter()
+                .find(|candidate| candidate.id() == aggregate_id)
+            {
+                collect_external_struct_fields(graph, nested, offset, &path, fields, depth + 1);
+            }
+            continue;
+        }
+        fields.insert(
+            offset,
+            r2types::ExternalField {
+                name: path,
+                offset,
+                ty: source_member_type_spelling(graph, member),
+            },
+        );
+    }
+}
+
+/// How a captured aggregate member's type spells in C, so the width check that
+/// gates a field certificate has something exact to measure against.
+fn source_member_type_spelling(
+    graph: &r2ssa::SourceTypeGraph,
+    member: &r2ssa::SourceAggregateMember,
+) -> Option<String> {
+    let source_type = usize::try_from(member.type_id())
+        .ok()
+        .and_then(|id| graph.types().get(id))?;
+    let bits = source_type.size_bits();
+    match source_type.kind() {
+        r2ssa::SourceTypeKind::SignedInteger => Some(format!("int{bits}_t")),
+        r2ssa::SourceTypeKind::UnsignedInteger => Some(format!("uint{bits}_t")),
+        r2ssa::SourceTypeKind::Pointer { .. } => Some("void *".to_string()),
+        // An inline struct member has no scalar width to check an access against.
+        r2ssa::SourceTypeKind::Struct { .. } => None,
+    }
+}
+
 /// The prototype the source recovered, spelled as the source spells it.
 ///
 /// The type graph carries structure and the interface carries storage; only
@@ -3270,6 +3388,7 @@ impl EngineAnalyzeRequest {
             noreturn: signature.as_ref().is_some_and(|(_, _, noreturn)| *noreturn),
             current_signature: signature.as_ref().map(|(spec, _, _)| spec.clone()),
             merged_signature: signature.map(|(spec, _, _)| spec),
+            external_type_db: trusted_external_type_db(&trusted),
             ..r2types::ParsedExternalContext::default()
         };
         self.interproc_max_iterations = self.interproc_max_iterations.max(1);

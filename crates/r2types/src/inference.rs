@@ -346,7 +346,7 @@ impl TypeInference {
 
                         if let Some((base, offset, stride)) = self.detect_addr_pattern(addr, defs) {
                             let field_name =
-                                self.lookup_field_name(offset, struct_hints.get(&base));
+                                self.lookup_field_name(offset, dst.size, struct_hints.get(&base));
                             constraints.push(Constraint::FieldAccess {
                                 base_ptr: base.clone(),
                                 offset,
@@ -382,7 +382,7 @@ impl TypeInference {
 
                         if let Some((base, offset, stride)) = self.detect_addr_pattern(addr, defs) {
                             let field_name =
-                                self.lookup_field_name(offset, struct_hints.get(&base));
+                                self.lookup_field_name(offset, val.size, struct_hints.get(&base));
                             constraints.push(Constraint::FieldAccess {
                                 base_ptr: base.clone(),
                                 offset,
@@ -823,7 +823,7 @@ impl TypeInference {
         });
 
         if offset != 0 {
-            let field_name = self.lookup_field_name(offset, struct_hints.get(&base));
+            let field_name = self.lookup_field_name(offset, elem_size, struct_hints.get(&base));
             constraints.push(Constraint::FieldAccess {
                 base_ptr: base.clone(),
                 offset,
@@ -1029,7 +1029,34 @@ impl TypeInference {
         None
     }
 
-    fn lookup_field_name(&self, offset: u64, struct_name_hint: Option<&String>) -> Option<String> {
+    /// Whether a declared field is exactly as wide as the access that reached
+    /// it. An offset alone does not identify a field: an eight-byte pointer
+    /// load at offset zero otherwise took the name of a four-byte member
+    /// sharing that offset, and `return head` rendered as `return head->value`.
+    /// A field whose type carries no scalar width is left to the offset match,
+    /// which is the rule the field certificates already use.
+    fn external_field_width_matches(
+        &self,
+        field: &crate::ExternalField,
+        access_width: u32,
+    ) -> bool {
+        if access_width == 0 {
+            return true;
+        }
+        field
+            .ty
+            .as_deref()
+            .and_then(|spec| crate::facts::parse_type_like_spec(spec, self.ptr_size))
+            .and_then(|ty| crate::function_facts::type_like_size_bytes(&ty, self.ptr_size))
+            .is_none_or(|width| width == u64::from(access_width))
+    }
+
+    fn lookup_field_name(
+        &self,
+        offset: u64,
+        access_width: u32,
+        struct_name_hint: Option<&String>,
+    ) -> Option<String> {
         // What the source called it beats anything reconstructed from offsets.
         if let Some(name) = self.source_field_names.get(&offset) {
             return Some(name.clone());
@@ -1039,18 +1066,24 @@ impl TypeInference {
             if let Some(st) = self.external_type_db.structs.get(&key)
                 && let Some(field) = st.fields.get(&offset)
             {
-                return Some(field.name.clone());
+                return self
+                    .external_field_width_matches(field, access_width)
+                    .then(|| field.name.clone());
             }
             if let Some(un) = self.external_type_db.unions.get(&key)
                 && let Some(field) = un.fields.get(&offset)
             {
-                return Some(field.name.clone());
+                return self
+                    .external_field_width_matches(field, access_width)
+                    .then(|| field.name.clone());
             }
         }
 
         let mut found: Option<String> = None;
         for st in self.external_type_db.structs.values() {
-            if let Some(field) = st.fields.get(&offset) {
+            if let Some(field) = st.fields.get(&offset)
+                && self.external_field_width_matches(field, access_width)
+            {
                 if let Some(existing) = &found {
                     if existing != &field.name {
                         return None;
@@ -1061,7 +1094,9 @@ impl TypeInference {
             }
         }
         for un in self.external_type_db.unions.values() {
-            if let Some(field) = un.fields.get(&offset) {
+            if let Some(field) = un.fields.get(&offset)
+                && self.external_field_width_matches(field, access_width)
+            {
                 if let Some(existing) = &found {
                     if existing != &field.name {
                         return None;

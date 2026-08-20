@@ -3743,7 +3743,6 @@ impl<'a> FoldingContext<'a> {
             // `list_sum` returned zero from a loop with an empty body.
             && !self.expr_mentions_rendered_name(&rhs, lhs_name)
         {
-
             self.scalar_context_root_candidate_for_name(
                 lhs_name,
                 VisibleExprContext::ScalarPredicate,
@@ -5195,7 +5194,9 @@ impl<'a> FoldingContext<'a> {
                 && addr.index.is_none()
                 && let Some(field) = self
                     .oracle_field_name_for_addr(addr, Some(elem_size))
-                    .or_else(|| self.oracle_member_name(None, &exact, addr.offset_bytes))
+                    .or_else(|| {
+                        self.oracle_member_name(None, &exact, addr.offset_bytes, Some(elem_size))
+                    })
                     .and_then(|field| {
                         self.certified_field_name_for_offset(
                             field,
@@ -5346,7 +5347,14 @@ impl<'a> FoldingContext<'a> {
                         is_write,
                     )
                 })
-                .or_else(|| self.oracle_member_name(None, &base_expr, effective_addr.offset_bytes))
+                .or_else(|| {
+                    self.oracle_member_name(
+                        None,
+                        &base_expr,
+                        effective_addr.offset_bytes,
+                        Some(elem_size),
+                    )
+                })
                 .and_then(|field| {
                     self.certified_field_name_for_offset(
                         field,
@@ -5458,6 +5466,18 @@ impl<'a> FoldingContext<'a> {
         }
 
         None
+    }
+
+    /// Whether an expression reads memory, so it can stand in for a dereference.
+    fn expr_reads_memory(expr: &CExpr) -> bool {
+        match expr {
+            CExpr::Deref(_)
+            | CExpr::Subscript { .. }
+            | CExpr::Member { .. }
+            | CExpr::PtrMember { .. } => true,
+            CExpr::Paren(inner) | CExpr::Cast { expr: inner, .. } => Self::expr_reads_memory(inner),
+            _ => false,
+        }
     }
 
     fn expr_is_simple_constant_offset_base(expr: &CExpr) -> bool {
@@ -6370,18 +6390,26 @@ impl<'a> FoldingContext<'a> {
         uint_type_from_size(element_size)
     }
 
+    /// The member an address names, given how wide the access through it is.
+    ///
+    /// An offset alone does not identify a member. Without the access width an
+    /// eight-byte pointer load at offset zero took the name of the four-byte
+    /// member sharing that offset, so `return head` rendered as
+    /// `return head->value`, a dereference the machine never performed.
     fn oracle_member_name(
         &self,
         addr: Option<&SSAVar>,
         base_expr: &CExpr,
         offset: i64,
+        access_size: Option<u32>,
     ) -> Option<String> {
         if offset < 0 {
             return None;
         }
         let offset = offset as u64;
 
-        if let Some(name) = self.visible_pointer_root_field_name(base_expr, offset, None, 0) {
+        if let Some(name) = self.visible_pointer_root_field_name(base_expr, offset, access_size, 0)
+        {
             return Some(name);
         }
 
@@ -6396,7 +6424,7 @@ impl<'a> FoldingContext<'a> {
                     return Some(name.to_string());
                 }
             }
-            if let Some(name) = self.field_name_from_type_hint_for_var(base, offset, None) {
+            if let Some(name) = self.field_name_from_type_hint_for_var(base, offset, access_size) {
                 return Some(name);
             }
         }
@@ -12027,6 +12055,10 @@ impl<'a> FoldingContext<'a> {
                 if let Some(addr) = self.normalized_addr_from_visible_expr(&inner, 0)
                     && let Some(access) =
                         self.render_access_expr_from_addr(&addr, 0, false, 0, &mut HashSet::new())
+                    // Whatever replaces this dereference has to read memory too.
+                    // A bare name means the renderer could only spell the pointer,
+                    // and taking it dropped the read: `*s` became `s`.
+                    && Self::expr_reads_memory(&access)
                 {
                     return access;
                 }
