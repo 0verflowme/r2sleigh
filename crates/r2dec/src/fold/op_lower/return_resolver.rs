@@ -341,7 +341,7 @@ impl<'a> FoldingContext<'a> {
                         && !self.expr_is_address_artifact_in_scalar_context(&candidate)
                 } else {
                     false
-                };
+                } && !self.member_read_contradicts_return_type(&candidate);
                 if should_promote
                     && self.prefers_visible_expr_in_context(&best, &candidate, context)
                 {

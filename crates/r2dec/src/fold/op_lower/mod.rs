@@ -8718,6 +8718,61 @@ impl<'a> FoldingContext<'a> {
         types
     }
 
+    /// The aggregate a type names, through any pointer or array wrapping it.
+    fn struct_name_of_type(ty: &CType) -> Option<&str> {
+        match ty {
+            CType::Pointer(inner) | CType::Array(inner, _) => Self::struct_name_of_type(inner),
+            CType::Struct(name) | CType::Union(name) | CType::Typedef(name) => Some(name),
+            _ => None,
+        }
+    }
+
+    /// The declared type of the member a member read names.
+    pub(super) fn member_read_type(&self, expr: &CExpr) -> Option<CType> {
+        match expr {
+            CExpr::Paren(inner) | CExpr::Cast { expr: inner, .. } => self.member_read_type(inner),
+            CExpr::PtrMember { base, member } | CExpr::Member { base, member } => {
+                let base_ty = self.expr_type_hint(base)?;
+                let key = Self::struct_name_of_type(&base_ty)?
+                    .trim()
+                    .to_ascii_lowercase();
+                let spec = self
+                    .inputs
+                    .external_type_db
+                    .structs
+                    .get(&key)?
+                    .fields
+                    .values()
+                    .find(|field| field.name == *member)?
+                    .ty
+                    .as_deref()?;
+                parse_type_like_spec(spec, self.inputs.arch.ptr_size)
+                    .map(|ty| crate::variable::type_like_to_ctype(&ty))
+            }
+            _ => None,
+        }
+    }
+
+    /// Whether reading this member would hand back a value the function's own
+    /// prototype says it does not return.
+    ///
+    /// A visible name can stand for a pointer or for the value at that pointer,
+    /// and the definition of such a name is the name itself, so nothing at the
+    /// point of resolution can tell the two apart: `*cur` really is what
+    /// `sum += cur->value` reads, while `head` in `return head` is the pointer
+    /// itself. The prototype settles it. `list_create` returns `Node *`, so a
+    /// four-byte `int` member is not what it returns, and `return head` had been
+    /// rendering as `return head->value`.
+    pub(super) fn member_read_contradicts_return_type(&self, candidate: &CExpr) -> bool {
+        let Some(expected) = self.inputs.function_return_type.as_ref() else {
+            return false;
+        };
+        let Some(actual) = self.member_read_type(candidate) else {
+            return false;
+        };
+        matches!(expected, CType::Pointer(_)) != matches!(&actual, CType::Pointer(_))
+    }
+
     fn expr_type_hint(&self, expr: &CExpr) -> Option<CType> {
         match expr {
             CExpr::Var(name) => self
