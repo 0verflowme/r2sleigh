@@ -1412,7 +1412,7 @@ pub(crate) fn empty_display_names() -> &'static r2types::DisplayNames {
 /// so the note is always emitted: it reports how many constructs carry a
 /// residual marker, and says so plainly when the rendering produced no
 /// statements at all, which is not the same as a function with no effects.
-fn note_unproven_constructs(func: &mut CFunction) {
+fn note_unproven_constructs(func: &mut CFunction, closure: Option<ObligationClosure>) {
     let rendered_nothing = func.body.is_empty();
     let residuals = count_residual_markers(&func.body);
     let detail = if rendered_nothing {
@@ -1424,10 +1424,66 @@ fn note_unproven_constructs(func: &mut CFunction) {
             n => format!("{n} constructs are marked below"),
         }
     };
+    // Counting markers reads the body; counting obligations reads what the source
+    // said the body owes. Only the second can tell that an effect went missing,
+    // so it is reported beside the first rather than in place of it.
+    let detail = match closure {
+        Some(closure) if closure.total > 0 => format!(
+            "{detail}; {} of {} source obligations owned, {} unsupported",
+            closure.owned, closure.total, closure.unsupported
+        ),
+        _ => detail,
+    };
     func.body.insert(
         0,
         CStmt::comment(sanitize_comment_text(&format!("r2dec proof: {detail}"))),
     );
+}
+
+/// How much of what the source obliges is owned by something the output rendered.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct ObligationClosure {
+    pub(crate) owned: usize,
+    pub(crate) total: usize,
+    pub(crate) unsupported: usize,
+}
+
+/// Which source obligations a rendered site accounts for.
+///
+/// An op is owned by the statement it became or by the expression that reads it,
+/// and either way the site it sits at names it. An unsupported effect is counted
+/// apart, because the admission rule asks it to residualize rather than be owned.
+fn obligation_closure(
+    prepared: &r2ssa::SsaArtifact,
+    proofs: &[crate::fold::context::EffectRenderProof],
+) -> ObligationClosure {
+    use r2ssa::SemanticObligationKind as Kind;
+    let obligations = prepared.obligations();
+    let rendered = proofs
+        .iter()
+        .filter_map(|proof| {
+            prepared
+                .graph()
+                .inst_id_for_op_site(proof.block_addr, proof.op_idx)
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut closure = ObligationClosure::default();
+    for id in obligations.obligations().keys() {
+        if matches!(id.kind, Kind::VolatileOrUnknownEffect | Kind::Trap) {
+            closure.unsupported += 1;
+            continue;
+        }
+        closure.total += 1;
+        let owned = obligations
+            .instructions()
+            .get(&id.instruction)
+            .and_then(|disposition| disposition.source.graph_inst())
+            .is_some_and(|inst| rendered.contains(&inst));
+        if owned {
+            closure.owned += 1;
+        }
+    }
+    closure
 }
 
 /// Why the source obligation inventory cannot account for this function, if it cannot.
@@ -3002,7 +3058,8 @@ impl Decompiler {
         if let Some(reason) = incomplete_source_obligations_reason(prepared) {
             return Ok(residual_function_for_render_boundary(&c_function.name, &reason));
         }
-        note_unproven_constructs(&mut c_function);
+        let closure = obligation_closure(prepared, &fold_ctx.effect_render_proofs_since(0));
+        note_unproven_constructs(&mut c_function, Some(closure));
         work.with_phase(DecompileWorkPhase::Rendering).poll()?;
         Ok(c_function)
     }
@@ -6275,7 +6332,7 @@ mod tests {
         ];
         assert_eq!(count_residual_markers(&func.body), 2);
 
-        note_unproven_constructs(&mut func);
+        note_unproven_constructs(&mut func, None);
         let note = match func.body.first() {
             Some(CStmt::Comment(text)) => text.clone(),
             other => panic!("expected a leading proof note, got {other:?}"),
@@ -6299,7 +6356,7 @@ mod tests {
     fn a_rendering_says_so_even_with_nothing_marked() {
         let mut func = CFunction::new("unclaimed".to_string(), CType::Unknown);
         func.body = vec![CStmt::Return(Some(CExpr::IntLit(0)))];
-        note_unproven_constructs(&mut func);
+        note_unproven_constructs(&mut func, None);
         let note = match func.body.first() {
             Some(CStmt::Comment(text)) => text.clone(),
             other => panic!("expected a leading proof note, got {other:?}"),
@@ -6315,7 +6372,7 @@ mod tests {
     fn a_body_that_rendered_nothing_says_so_rather_than_reading_as_empty() {
         let mut func = CFunction::new("nothing_rendered".to_string(), CType::Unknown);
         func.body = Vec::new();
-        note_unproven_constructs(&mut func);
+        note_unproven_constructs(&mut func, None);
         let text = format!("{:?}", func.body);
         assert!(
             text.contains("r2dec proof: rendering produced no statements"),
