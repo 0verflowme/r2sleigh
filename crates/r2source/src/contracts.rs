@@ -373,11 +373,11 @@ impl SourceTypeGraph {
                 else {
                     return Err(SourceTypeGraphError::InvalidMember);
                 };
+                // Any type this graph already validated may be a member. What
+                // has to hold of a member is where it sits, not what it is:
+                // admitting only integers refused `struct state *next`, and
+                // with it every function that mentions an ordinary C struct.
                 if u32::try_from(member_position) != Ok(member.member_id)
-                    || !matches!(
-                        member_type.kind,
-                        SourceTypeKind::SignedInteger | SourceTypeKind::UnsignedInteger
-                    )
                     || member.size_bits != member_type.size_bits
                     || !member.offset_bits.is_multiple_of(8)
                     || source_align_up(cursor, member_type.align_bits) != Some(member.offset_bits)

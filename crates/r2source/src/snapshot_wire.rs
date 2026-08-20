@@ -2472,6 +2472,35 @@ mod tests {
     }
 
     #[test]
+    fn a_struct_may_hold_a_pointer_to_its_own_kind() {
+        // `struct state { int a; int b; long c; struct state *next; }` is
+        // ordinary C. Refusing it refused every function that mentions it.
+        let graph = SourceTypeGraph::new(
+            vec![
+                SourceType::new(0, SourceTypeKind::SignedInteger, 32, 32),
+                SourceType::new(1, SourceTypeKind::SignedInteger, 64, 64),
+                SourceType::new(2, SourceTypeKind::Struct { aggregate_id: 0 }, 192, 64),
+                SourceType::new(3, SourceTypeKind::Pointer { target_type_id: 2 }, 64, 64),
+            ],
+            vec![SourceAggregateLayout::new(
+                0,
+                2,
+                192,
+                64,
+                "state".to_string(),
+                vec![
+                    SourceAggregateMember::new(0, 0, 0, 32, "a".to_string()),
+                    SourceAggregateMember::new(1, 0, 32, 32, "b".to_string()),
+                    SourceAggregateMember::new(2, 1, 64, 64, "c".to_string()),
+                    SourceAggregateMember::new(3, 3, 128, 64, "next".to_string()),
+                ],
+            )],
+        )
+        .expect("a struct with a pointer member is a valid type graph");
+        assert_eq!(graph.aggregates()[0].members().len(), 4);
+    }
+
+    #[test]
     fn a_type_graph_with_aggregates_round_trips() {
         let graph = sample_graph();
         let mut writer = SnapshotWireWriter::new();
