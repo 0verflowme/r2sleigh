@@ -3714,6 +3714,9 @@ impl<'a> FoldingContext<'a> {
     }
 
     fn assign_stmt(&self, lhs: CExpr, rhs: CExpr) -> Option<CStmt> {
+        // What the statement reads, before any rewrite below can rename it.
+        let source_rhs = rhs.clone();
+
         // Rewriting the target changes which storage the statement writes. The
         // stack rewriter is right in a value position -- an expression that
         // computes a frame address may be spelled as the variable living there
@@ -3782,6 +3785,26 @@ impl<'a> FoldingContext<'a> {
         {
             rhs = recovered;
         }
+        // A rewrite may resolve a name by the value behind it, and after this
+        // statement the destination holds that value too, so the value has two
+        // names and the rewrite could answer with either. Answering with the
+        // destination is never right when the statement did not read it: it
+        // does not hold the value until this statement completes. `prev = cur`
+        // became `prev = prev` and was dropped as a self-assignment, in about
+        // one run in ten, because which name came back was not fixed.
+        //
+        // A statement that did read the destination is left alone, so an
+        // identity that reduces to it, `x = x - 0`, is still suppressed.
+        let rhs = match (&lhs, &rhs) {
+            (CExpr::Var(lhs_name), CExpr::Var(rhs_name))
+                if lhs_name == rhs_name
+                    && source_rhs != rhs
+                    && !self.expr_mentions_rendered_name(&source_rhs, lhs_name) =>
+            {
+                source_rhs
+            }
+            _ => rhs,
+        };
         if lhs == rhs {
             return None;
         }
