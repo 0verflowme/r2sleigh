@@ -3736,7 +3736,14 @@ impl<'a> FoldingContext<'a> {
                 .stack_offset_for_visible_storage_name(lhs_name)
                 .is_some()
             && self.expr_is_address_artifact_in_scalar_context(&rhs)
+            // An accumulation reads its own destination: `sum = sum + x` mentions
+            // `sum` as a value, which is the opposite of a slot's address reaching
+            // a scalar. Replacing the whole term with the slot's root turned it
+            // into `sum = sum`, which the self-assignment check then dropped, and
+            // `list_sum` returned zero from a loop with an empty body.
+            && !self.expr_mentions_rendered_name(&rhs, lhs_name)
         {
+
             self.scalar_context_root_candidate_for_name(
                 lhs_name,
                 VisibleExprContext::ScalarPredicate,
