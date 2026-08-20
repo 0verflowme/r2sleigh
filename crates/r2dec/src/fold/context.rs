@@ -191,8 +191,6 @@ pub(crate) struct FoldingContext<'a> {
     pub(crate) effect_render_proofs: std::cell::RefCell<Vec<EffectRenderProof>>,
     /// Blocks the fold walked, which is what expresses a merge standing at their head.
     pub(crate) folded_blocks: std::cell::RefCell<std::collections::BTreeSet<u64>>,
-    /// Sites the fold dropped as dead, to be checked against what the source needs.
-    pub(crate) dropped_dead_sites: std::cell::RefCell<std::collections::BTreeSet<(u64, usize)>>,
 }
 
 impl FoldArchConfig {
@@ -274,16 +272,11 @@ impl<'a> FoldingContext<'a> {
             resolution_guard: std::cell::RefCell::new(HashSet::new()),
             effect_render_proofs: std::cell::RefCell::new(Vec::new()),
             folded_blocks: std::cell::RefCell::new(std::collections::BTreeSet::new()),
-            dropped_dead_sites: std::cell::RefCell::new(std::collections::BTreeSet::new()),
         }
     }
 
     pub(crate) fn folded_block_addrs(&self) -> std::collections::BTreeSet<u64> {
         self.folded_blocks.borrow().clone()
-    }
-
-    pub(crate) fn dropped_dead_site_list(&self) -> std::collections::BTreeSet<(u64, usize)> {
-        self.dropped_dead_sites.borrow().clone()
     }
 
     pub(crate) fn effect_render_proofs_since(&self, checkpoint: usize) -> Vec<EffectRenderProof> {

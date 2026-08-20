@@ -1438,17 +1438,10 @@ fn note_unproven_constructs(func: &mut CFunction, closure: Option<ObligationClos
         .iter()
         .any(|stmt| !matches!(stmt, CStmt::Comment(_) | CStmt::Empty));
     let detail = match closure {
-        Some(closure) if closure.total > 0 && rendered_any_statement => {
-            let dropped = match closure.dropped_live {
-                0 => String::new(),
-                1 => ", 1 effect dropped that the source needs".to_string(),
-                n => format!(", {n} effects dropped that the source needs"),
-            };
-            format!(
-                "{detail}; {} of {} source obligations owned, {} unsupported{dropped}",
-                closure.owned, closure.total, closure.unsupported
-            )
-        }
+        Some(closure) if closure.total > 0 && rendered_any_statement => format!(
+            "{detail}; {} of {} source obligations owned, {} unsupported",
+            closure.owned, closure.total, closure.unsupported
+        ),
         Some(closure) if closure.total > 0 => format!(
             "{detail}; none of {} source obligations owned",
             closure.total
@@ -1467,8 +1460,6 @@ pub(crate) struct ObligationClosure {
     pub(crate) owned: usize,
     pub(crate) total: usize,
     pub(crate) unsupported: usize,
-    /// Effects the fold dropped as dead that the source still requires.
-    pub(crate) dropped_live: usize,
 }
 
 /// Which source obligations a rendered site accounts for.
@@ -1480,7 +1471,6 @@ fn obligation_closure(
     prepared: &r2ssa::SsaArtifact,
     proofs: &[crate::fold::context::EffectRenderProof],
     folded_blocks: &std::collections::BTreeSet<u64>,
-    dropped_dead: &std::collections::BTreeSet<(u64, usize)>,
 ) -> ObligationClosure {
     use r2ssa::SemanticObligationKind as Kind;
     let obligations = prepared.obligations();
@@ -1497,28 +1487,7 @@ fn obligation_closure(
     // if that block rendered, the values arriving there are the ones the output
     // reads, and the merge is what it read them through.
     let rendered_blocks = folded_blocks;
-    // Two answers about the same value: the fold decided nothing reads it, and the
-    // source obligation inventory says something needs it. They cannot both hold,
-    // and the disagreement is how a dropped effect shows itself -- `list_reverse`
-    // loses the assignment that advances its list and reverses nothing.
-    let dropped_live = dropped_dead
-        .iter()
-        .filter_map(|(block_addr, op_idx)| {
-            prepared.graph().inst_id_for_op_site(*block_addr, *op_idx)
-        })
-        .filter(|inst| {
-            obligations.instruction_for_inst(*inst).is_some_and(|disposition| {
-                matches!(
-                    disposition.state,
-                    r2ssa::SemanticInstructionState::LiveObligation
-                )
-            })
-        })
-        .count();
-    let mut closure = ObligationClosure {
-        dropped_live,
-        ..ObligationClosure::default()
-    };
+    let mut closure = ObligationClosure::default();
     for id in obligations.obligations().keys() {
         if matches!(id.kind, Kind::VolatileOrUnknownEffect | Kind::Trap) {
             closure.unsupported += 1;
@@ -3118,7 +3087,6 @@ impl Decompiler {
             prepared,
             &fold_ctx.effect_render_proofs_since(0),
             &fold_ctx.folded_block_addrs(),
-            &fold_ctx.dropped_dead_site_list(),
         );
         note_unproven_constructs(&mut c_function, Some(closure));
         work.with_phase(DecompileWorkPhase::Rendering).poll()?;

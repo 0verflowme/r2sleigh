@@ -12411,11 +12411,6 @@ impl<'a> FoldingContext<'a> {
             // Skip operations that produce dead values
             if let Some(dst) = op.dst() {
                 if self.is_dead(dst) {
-                    // The source may still need what the fold decided nothing reads,
-                    // and the two answers disagreeing is the thing worth reporting
-                    self.dropped_dead_sites
-                        .borrow_mut()
-                        .insert((block.addr, op_idx));
                     continue;
                 }
 
