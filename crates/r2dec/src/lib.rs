@@ -1430,6 +1430,19 @@ fn note_unproven_constructs(func: &mut CFunction) {
     );
 }
 
+/// Why the source obligation inventory cannot account for this function, if it cannot.
+fn incomplete_source_obligations_reason(prepared: &r2ssa::SsaArtifact) -> Option<String> {
+    let obligations = prepared.obligations();
+    if obligations.is_complete() {
+        return None;
+    }
+    let failures = obligations.construction_failures().len();
+    let cycles = obligations.unstructured_cycle_blocks().len();
+    Some(format!(
+        "r2dec residual: the source obligation inventory did not close, so what this function owes was never enumerated ({failures} construction failures, {cycles} unstructured cycle blocks)"
+    ))
+}
+
 fn residual_function_for_render_boundary(func_name: &str, reason: &str) -> CFunction {
     let mut func = CFunction::new(func_name.to_string(), CType::Unknown).with_unknown_params();
     func.body = vec![CStmt::comment(sanitize_comment_text(reason))];
@@ -2981,6 +2994,14 @@ impl Decompiler {
         normalize_declared_assignment_literals(&mut c_function);
         normalize_comparison_operand_order(&mut c_function);
         unrendered::mark_undeclared_names(&mut c_function);
+        // Executable C is admitted only when the source obligation inventory is
+        // complete. The inventory is what says which effects the source has, so a
+        // function whose inventory did not close has no account of what the output
+        // owes, and rendering it says the effects were all handled when nothing
+        // ever enumerated them.
+        if let Some(reason) = incomplete_source_obligations_reason(prepared) {
+            return Ok(residual_function_for_render_boundary(&c_function.name, &reason));
+        }
         note_unproven_constructs(&mut c_function);
         work.with_phase(DecompileWorkPhase::Rendering).poll()?;
         Ok(c_function)
