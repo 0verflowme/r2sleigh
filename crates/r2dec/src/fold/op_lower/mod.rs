@@ -12103,6 +12103,14 @@ impl<'a> FoldingContext<'a> {
             self.current_op_idx.set(Some(op_idx));
             // Skip stack frame setup/teardown if enabled
             if self.is_stack_frame_op(op) {
+                // Frame setup and teardown is what the function's locals stand on, so
+                // the frame the output declares is what renders it
+                self.record_effect_render_proof_for_value(
+                    EffectRenderProofKind::Expression,
+                    block.addr,
+                    op_idx,
+                    op.dst().and_then(|dst| self.value_id_for_rendered_op(dst)),
+                );
                 continue;
             }
 
@@ -12454,6 +12462,18 @@ impl<'a> FoldingContext<'a> {
                 if is_return {
                     break;
                 }
+            } else if matches!(
+                op,
+                SSAOp::Branch { .. } | SSAOp::CBranch { .. } | SSAOp::BranchInd { .. }
+            ) {
+                // A transfer is not a statement of its own: the structuring is what
+                // renders it, as the shape the statements around it are arranged in.
+                self.record_effect_render_proof_for_value(
+                    EffectRenderProofKind::Expression,
+                    block.addr,
+                    op_idx,
+                    None,
+                );
             } else if let Some(dst) = op.dst()
                 && self
                     .use_counts_map()
