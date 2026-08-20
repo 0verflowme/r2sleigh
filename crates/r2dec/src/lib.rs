@@ -3421,6 +3421,16 @@ fn drop_dead_undeclared_carriers(
     removed: &mut bool,
 ) {
     for stmt in stmts.iter_mut() {
+        single_evaluation::for_each_expr_mut(stmt, &mut |expr| {
+            drop_dead_undeclared_comma_carriers(
+                expr,
+                declared,
+                reads,
+                fold_ctx,
+                returns_value,
+                removed,
+            );
+        });
         single_evaluation::for_each_child_block_mut(stmt, &mut |body, _| {
             drop_dead_undeclared_carriers(
                 body,
@@ -3454,6 +3464,76 @@ fn drop_dead_undeclared_carriers(
         *removed = true;
     }
     stmts.retain(|stmt| !matches!(stmt, CStmt::Empty));
+}
+
+/// The same rule inside a comma expression, where the lifter parks a store that
+/// a condition then evaluates: `while (t3f680 = n, i < n)` tests `i < n` and
+/// names storage nobody reads to say so.
+fn drop_dead_undeclared_comma_carriers(
+    expr: &mut CExpr,
+    declared: &HashSet<String>,
+    reads: &HashSet<String>,
+    fold_ctx: &FoldingContext<'_>,
+    returns_value: bool,
+    removed: &mut bool,
+) {
+    for child in single_evaluation::children_mut(expr) {
+        drop_dead_undeclared_comma_carriers(child, declared, reads, fold_ctx, returns_value, removed);
+    }
+    let CExpr::Comma(items) = expr else {
+        return;
+    };
+    // The last item is the value of the comma expression, so it is never a store
+    // nothing reads however the name is spelled.
+    let last = items.len().saturating_sub(1);
+    let mut index = 0;
+    items.retain(|item| {
+        let keep = index == last
+            || !dead_undeclared_carrier_assignment(
+                item,
+                declared,
+                reads,
+                fold_ctx,
+                returns_value,
+            );
+        if !keep {
+            *removed = true;
+        }
+        index += 1;
+        keep
+    });
+    if items.len() == 1
+        && let Some(only) = items.pop()
+    {
+        *expr = only;
+    }
+}
+
+/// Whether this expression stores to a name the function never declares and
+/// nothing reads, with a value that does nothing on its own.
+fn dead_undeclared_carrier_assignment(
+    expr: &CExpr,
+    declared: &HashSet<String>,
+    reads: &HashSet<String>,
+    fold_ctx: &FoldingContext<'_>,
+    returns_value: bool,
+) -> bool {
+    let CExpr::Binary {
+        op: BinaryOp::Assign,
+        left,
+        right,
+    } = expr
+    else {
+        return false;
+    };
+    let CExpr::Var(name) = left.as_ref() else {
+        return false;
+    };
+    let lower = name.to_ascii_lowercase();
+    !declared.contains(&lower)
+        && !reads.contains(&lower)
+        && expr_is_pure_for_dead_local_prune(right)
+        && !(returns_value && fold_ctx.carrier_names_return_register(name))
 }
 
 /// Every undeclared name the body assigns, paired with the value first stored in
@@ -4748,6 +4828,16 @@ fn collect_expr_local_reads(expr: &CExpr, reads: &mut HashSet<String>) {
         | CExpr::Cast { expr: inner, .. }
         | CExpr::Unary { operand: inner, .. }
         | CExpr::Sizeof(inner) => collect_expr_local_reads(inner, reads),
+        // A plain name on the left of an assignment is written, not read, wherever
+        // the assignment sits. The statement form already said so; a comma inside
+        // a condition holds the same store and has to answer the same way.
+        CExpr::Binary {
+            op: BinaryOp::Assign,
+            left,
+            right,
+        } if matches!(left.as_ref(), CExpr::Var(_)) => {
+            collect_expr_local_reads(right, reads);
+        }
         CExpr::Binary { left, right, .. } => {
             collect_expr_local_reads(left, reads);
             collect_expr_local_reads(right, reads);
