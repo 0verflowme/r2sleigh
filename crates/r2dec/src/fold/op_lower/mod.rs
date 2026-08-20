@@ -12431,6 +12431,23 @@ impl<'a> FoldingContext<'a> {
                 if is_return {
                     break;
                 }
+            } else if let Some(dst) = op.dst()
+                && self
+                    .use_counts_map()
+                    .get(&dst.display_name())
+                    .is_some_and(|count| *count > 0)
+            {
+                // No statement means the value renders inside an expression rather
+                // than on its own line, and the expression that reads it owns it.
+                // A value nothing reads is a different case and stays unrecorded,
+                // because that is exactly what an accounting of the output has to
+                // be able to see.
+                self.record_effect_render_proof_for_value(
+                    EffectRenderProofKind::Expression,
+                    block.addr,
+                    op_idx,
+                    self.value_id_for_rendered_op(dst),
+                );
             }
         }
 
