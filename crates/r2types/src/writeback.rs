@@ -3544,6 +3544,19 @@ fn apply_interproc_summary_to_signature(
         return;
     }
 
+    // A declared `void` is a fact about the interface, not an absent one. A
+    // summary watches what the machine leaves in the return register, which a
+    // function returning nothing still writes, so letting that stand against the
+    // declaration turned `void list_free(Node *head)` into `void *` and left the
+    // body returning the program counter.
+    let declared_void_return = merged_signature
+        .as_ref()
+        .and_then(|signature| signature.ret_type.as_ref())
+        .is_some_and(|ty| matches!(ty, CTypeLike::Void));
+    if declared_void_return && !matches!(ret_ty, CTypeLike::Void) {
+        return;
+    }
+
     if merged_signature.is_none() {
         *merged_signature = inferred_signature_to_spec(inferred_signature, ptr_bits);
     }
@@ -8699,7 +8712,19 @@ fn merge_local_signature_into_merged_signature(
         (Some(mut external), Some(local)) => {
             let external_param_count_is_authoritative =
                 signature_param_count_is_authoritative(&external);
-            if local_signature_should_override_external(
+            // A declared `void` return says the function returns nothing. That
+            // is an answer, not a missing one, and it is the only return type a
+            // local reading of the machine cannot contradict: a function that
+            // returns nothing still leaves something in the return register.
+            // Treating it as unknown let inference replace it with `int64_t`,
+            // which is weak enough that recovered evidence then replaced it with
+            // `void *`, so `void list_free(Node *head)` rendered as returning a
+            // pointer and its body ended `return rip;`.
+            let external_returns_void =
+                matches!(external.ret_type.as_ref(), Some(CTypeLike::Void));
+            if external_returns_void {
+                // Keep it.
+            } else if local_signature_should_override_external(
                 local.ret_type.as_ref(),
                 external.ret_type.as_ref(),
             ) || (!external_param_count_is_authoritative
