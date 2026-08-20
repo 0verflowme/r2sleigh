@@ -12427,6 +12427,15 @@ impl<'a> FoldingContext<'a> {
             }
 
             if let Some(stmt) = self.op_to_stmt_with_args(op, block.addr, op_idx) {
+                // An op that became a statement is owned by that statement. Only the
+                // memory ones were on record, so arithmetic, copies and everything
+                // else that reached the page read as unaccounted for.
+                self.record_effect_render_proof_for_value(
+                    EffectRenderProofKind::Expression,
+                    block.addr,
+                    op_idx,
+                    op.dst().and_then(|dst| self.value_id_for_rendered_op(dst)),
+                );
                 let is_return = matches!(stmt, CStmt::Return(_));
                 stmts.push(stmt);
                 if is_return {
