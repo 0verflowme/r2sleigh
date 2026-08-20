@@ -541,6 +541,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         body: &Region,
     ) {
         let proof = self.loop_render_proof(anchor, condition, condition_value, body);
+        self.record_control_ownership(anchor);
         self.control_render_proofs.push(proof);
     }
 
@@ -576,6 +577,28 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         Self::sorted_region_blocks_with_anchor(anchor, body)
     }
 
+    /// Record that the structuring rendered the control this block transfers on.
+    ///
+    /// A transfer is not a statement of its own -- the shape the statements are
+    /// arranged in is what renders it -- so nothing recorded that the output owns
+    /// it, and an accounting of what the function owes read every branch, loop and
+    /// switch as unaccounted for. Recorded here rather than while folding, because
+    /// only the structuring knows whether it rendered the control or refused it.
+    fn record_control_ownership(&self, anchor: u64) {
+        let Some(block) = self.func.blocks().find(|block| block.addr == anchor) else {
+            return;
+        };
+        let Some(op_idx) = block.ops.len().checked_sub(1) else {
+            return;
+        };
+        self.fold_ctx.record_effect_render_proof_for_value(
+            crate::fold::context::EffectRenderProofKind::Expression,
+            anchor,
+            op_idx,
+            None,
+        );
+    }
+
     fn record_switch_render_proof(
         &mut self,
         anchor: u64,
@@ -584,6 +607,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         default: Option<&Region>,
     ) {
         let proof = self.switch_render_proof(anchor, selector, cases, default);
+        self.record_control_ownership(anchor);
         self.control_render_proofs.push(proof);
     }
 
@@ -883,6 +907,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                     Self::stmt_guarantees_termination(&then_stmt)
                         && Self::stmt_guarantees_termination(else_stmt)
                 });
+                self.record_control_ownership(*cond_block);
                 let if_stmt = CStmt::if_stmt(cond, then_stmt, else_stmt);
                 let mut prefix = self.structure_block_prefix_stmts(*cond_block);
                 prefix.push(if_stmt);
