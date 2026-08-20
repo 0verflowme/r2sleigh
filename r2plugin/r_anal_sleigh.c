@@ -4656,6 +4656,35 @@ static void sleigh_taint_plan_stats_fini(SleighTaintPlanStats *stats) {
 	memset (stats, 0, sizeof (*stats));
 }
 
+/* Whether a function has anything for the prover to work on.
+ *
+ * Proving costs a snapshot capture and an engine round trip per function, and
+ * on a statically linked binary that is hundreds of them. What the prover
+ * contributes is targets for transfers radare2 could not follow and blocks
+ * nothing reaches, so a function whose every transfer already has a known
+ * target has nothing here to find. The deep pass takes them all regardless. */
+static bool sleigh_function_may_prove(RAnalFunction *fcn) {
+	if (!fcn || !fcn->bbs) {
+		return false;
+	}
+	RListIter *iter;
+	RAnalBlock *bb;
+	r_list_foreach (fcn->bbs, iter, bb) {
+		if (!bb) {
+			continue;
+		}
+		if (bb->switch_op) {
+			return true;
+		}
+		/* A block ending with no known successor ended in a transfer radare2
+		 * could not resolve, which is what the prover reads. */
+		if (bb->jump == UT64_MAX && bb->fail == UT64_MAX) {
+			return true;
+		}
+	}
+	return false;
+}
+
 /* Every fact the engine proved about one function, as JSON.
  *
  * The snapshot has to be serialized inside the borrow: the pointer tables the
@@ -5061,6 +5090,7 @@ static bool sleigh_post_analysis(RAnal *anal) {
 	size_t proof_dead_blocks = 0;
 	int proof_fcns = 0;
 	int proof_refused = 0;
+	int proof_skipped = 0;
 	int taint_parse_failures = 0;
 	int taint_fcns_eligible = 0;
 	int taint_fcns_skipped = 0;
@@ -5122,7 +5152,9 @@ static bool sleigh_post_analysis(RAnal *anal) {
 		 * They are what the analysis pass is here to contribute, and the work
 		 * is the engine's rather than ours. */
 		SleighArtifactPlan proof_plan;
-		if (sleigh_artifact_plan_init (&proof_plan, anal, fcn, "proof")) {
+		const bool proof_eligible = post_mode >= SLEIGH_MODE_FULL
+			|| sleigh_function_may_prove (fcn);
+		if (proof_eligible && sleigh_artifact_plan_init (&proof_plan, anal, fcn, "proof")) {
 			if (collect_proof_artifacts_for_function (&proof_plan, core, fcn,
 					&proof_xrefs, &proof_dead_blocks)
 					&& sleigh_artifact_plan_submit (&proof_plan)) {
@@ -5131,6 +5163,8 @@ static bool sleigh_post_analysis(RAnal *anal) {
 				proof_refused++;
 			}
 			sleigh_artifact_plan_fini (&proof_plan);
+		} else if (!proof_eligible) {
+			proof_skipped++;
 		}
 		int bb_count = fcn->bbs? r_list_length (fcn->bbs): 0;
 		bool auto_callback_allowed = !taint_enabled || auto_callback_allows_function (
@@ -5223,8 +5257,8 @@ static bool sleigh_post_analysis(RAnal *anal) {
 	R_LOG_INFO ("r2sleigh: post-analysis taint enabled=%d eligible=%d skipped=%d comments=%zu flags=%zu xrefs=%zu sink_hits=%zu parse_failures=%d",
 		taint_enabled? 1: 0, taint_fcns_eligible, taint_fcns_skipped, taint_comments, taint_flags, taint_xrefs,
 		taint_sink_hits, taint_parse_failures);
-	R_LOG_INFO ("r2sleigh: post-analysis proofs fcns=%d refused=%d call_targets=%zu unreachable_blocks=%zu",
-		proof_fcns, proof_refused, proof_xrefs, proof_dead_blocks);
+	R_LOG_INFO ("r2sleigh: post-analysis proofs fcns=%d skipped=%d refused=%d call_targets=%zu unreachable_blocks=%zu",
+		proof_fcns, proof_skipped, proof_refused, proof_xrefs, proof_dead_blocks);
 	R_LOG_INFO ("r2sleigh: post-analysis risk summary: critical=%d high=%d medium=%d low=%d",
 		taint_risk_critical, taint_risk_high, taint_risk_medium, taint_risk_low);
 	R_LOG_INFO ("r2sleigh: post-analysis summary fcns=%d budget_exhausted=%d",

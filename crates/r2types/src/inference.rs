@@ -146,7 +146,7 @@ impl TypeInference {
 
     /// Set SSA -> stack-slot bindings from the canonical prepared SSA artifact.
     pub fn set_prepared_ssa(&mut self, prepared: &SsaArtifact) {
-        self.source_field_names = Self::source_field_names(prepared);
+        self.source_field_names = crate::prepare::source_field_names(prepared);
         self.ssa_stack_slots.clear();
 
         for (key, object) in &prepared.objects().value_objects {
@@ -1027,49 +1027,6 @@ impl TypeInference {
         }
 
         None
-    }
-
-    /// What the source calls the member at each offset of this function's
-    /// aggregates.
-    ///
-    /// A binary that carried debug info already said what its struct fields are
-    /// called, and the access projections keep that beside the access that
-    /// reached them. Without it a field is named after its offset, so something
-    /// the source calls `next` prints as `f_10`.
-    ///
-    /// The projections are read only under the identity they were sealed with,
-    /// and an offset two aggregates disagree about is dropped rather than
-    /// guessed.
-    fn source_field_names(prepared: &SsaArtifact) -> HashMap<u64, String> {
-        let Some(interface) = prepared.machine_context().function_interface() else {
-            return HashMap::new();
-        };
-        let Some(projections) = prepared
-            .aggregate_accesses()
-            .projections_for_revision(interface.revision_identity())
-        else {
-            return HashMap::new();
-        };
-        let mut names: HashMap<u64, String> = HashMap::new();
-        let mut disputed = HashSet::new();
-        for projection in projections.values() {
-            if projection.member_name.is_empty() {
-                continue;
-            }
-            match names.get(&projection.byte_offset) {
-                Some(existing) if existing.as_str() != &*projection.member_name => {
-                    disputed.insert(projection.byte_offset);
-                }
-                Some(_) => {}
-                None => {
-                    names.insert(projection.byte_offset, projection.member_name.to_string());
-                }
-            }
-        }
-        for offset in disputed {
-            names.remove(&offset);
-        }
-        names
     }
 
     fn lookup_field_name(&self, offset: u64, struct_name_hint: Option<&String>) -> Option<String> {

@@ -179,7 +179,6 @@ impl PreparedSemanticView {
         self.value_id_for_var(var)
             .and_then(|value_id| self.owner_expr_by_value.get(&value_id))
             .or_else(|| self.owner_expr_by_name.get(&var.display_name()))
-            .or_else(|| self.owner_expr_by_name.get(&var.name))
     }
 
     #[cfg(test)]
@@ -2792,7 +2791,17 @@ fn prepared_fallback_visible_expr(var: &SSAVar) -> Option<CExpr> {
         return None;
     }
 
-    Some(CExpr::Var(var.name.clone()))
+    // The version is part of which value this is, and the definition side spells
+    // it that way. Naming the storage alone made a use of `x19_3` print as
+    // `x19`, which no longer matched the definition of `x19_3` -- so a
+    // definition with eleven readers looked unread and was deleted, leaving the
+    // readers naming nothing. Version zero stays bare, as it does everywhere:
+    // that is the value the function was entered with.
+    Some(CExpr::Var(if var.version > 0 {
+        format!("{}_{}", var.name, var.version)
+    } else {
+        var.name.clone()
+    }))
 }
 
 fn local_store_owner_expr_for_offset(

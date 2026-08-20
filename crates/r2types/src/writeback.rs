@@ -4407,7 +4407,10 @@ pub fn build_source_owned_type_writeback_analysis(
         ptr_bits,
         &mut diagnostics,
     );
-    let local_field_accesses = local_field_accesses_from_struct_artifacts(&local_structs);
+    let local_field_accesses = local_field_accesses_named(
+        &local_structs,
+        &crate::prepare::source_field_names(source.as_ref()),
+    );
     let interproc_report = interproc_summary
         .as_ref()
         .map(|summary| summary.report().clone());
@@ -6261,13 +6264,29 @@ fn infer_local_struct_artifacts_from_blocks(
 pub fn local_field_accesses_from_struct_artifacts(
     local_structs: &LocalStructArtifacts,
 ) -> Vec<LocalFieldAccessFact> {
+    local_field_accesses_named(local_structs, &HashMap::new())
+}
+
+/// The same observations, naming each field what the source called it when the
+/// source said.
+///
+/// Naming a field after its offset is what you do when nothing told you its
+/// name. When debug info did tell you, using the offset anyway throws the
+/// answer away.
+pub fn local_field_accesses_named(
+    local_structs: &LocalStructArtifacts,
+    source_field_names: &HashMap<u64, String>,
+) -> Vec<LocalFieldAccessFact> {
     let mut accesses = Vec::new();
     for (slot, fields) in &local_structs.slot_field_profiles {
         for (field_offset, field_type) in fields {
             accesses.push(LocalFieldAccessFact {
                 slot: *slot,
                 field_offset: *field_offset,
-                field_name: format!("f_{field_offset:x}"),
+                field_name: source_field_names
+                    .get(field_offset)
+                    .cloned()
+                    .unwrap_or_else(|| format!("f_{field_offset:x}")),
                 field_type: Some(field_type.clone()),
             });
         }
