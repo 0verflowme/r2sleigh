@@ -505,7 +505,6 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
     }
 
     /// Returns the reason why structuring short-circuited, if any.
-    #[cfg(test)]
     pub(crate) fn safety_reason(&self) -> Option<&str> {
         self.safety_reason.as_deref()
     }
