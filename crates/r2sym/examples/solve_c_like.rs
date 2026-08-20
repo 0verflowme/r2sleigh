@@ -29,7 +29,7 @@ fn main() {
     let config = ExploreConfig {
         max_states: 16,
         max_depth: 32,
-        timeout: None,
+        max_steps: None,
         ..Default::default()
     };
 

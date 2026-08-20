@@ -683,7 +683,11 @@ fn symbolic_condition_hint(summary: Option<&BackwardConditionSummary>) -> Option
         .filter(|text| !text.is_empty() && text != "true")
 }
 
-const SYMBOLIC_FACT_TIMEOUT_MS: u64 = 250;
+/// Worklist steps a symbolic fact extraction may take.
+///
+/// This was 250 wall-clock milliseconds, which made the set of facts a
+/// function proved depend on how busy the machine was.
+const SYMBOLIC_FACT_MAX_STEPS: u64 = 2_500;
 
 fn symbolic_fact_explorer<'ctx>(ctx: &'ctx Context) -> PathExplorer<'ctx> {
     let mut explorer = PathExplorer::with_config(
@@ -693,7 +697,7 @@ fn symbolic_fact_explorer<'ctx>(ctx: &'ctx Context) -> PathExplorer<'ctx> {
             max_states: 256,
             max_depth: 96,
             max_completed_paths: Some(8),
-            timeout: Some(Duration::from_millis(SYMBOLIC_FACT_TIMEOUT_MS)),
+            max_steps: Some(SYMBOLIC_FACT_MAX_STEPS),
             merge_states: false,
             ..ExploreConfig::default()
         },

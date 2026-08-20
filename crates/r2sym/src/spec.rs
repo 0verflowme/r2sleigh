@@ -130,7 +130,9 @@ pub struct BudgetSpec {
     #[serde(default)]
     pub max_finds: Option<usize>,
     #[serde(default)]
-    pub timeout_ms: Option<u64>,
+    /// Worklist steps this run may take. Named for work rather than time so a
+    /// spec reproduces the same exploration on any machine.
+    pub max_steps: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -244,8 +246,8 @@ impl ExplorationSpec {
         if let Some(max_depth) = self.budget.max_depth {
             config.max_depth = max_depth;
         }
-        if let Some(timeout_ms) = self.budget.timeout_ms {
-            config.timeout = Some(std::time::Duration::from_millis(timeout_ms));
+        if let Some(max_steps) = self.budget.max_steps {
+            config.max_steps = Some(max_steps);
         }
         config.strategy = match self.strategy {
             StrategySpec::Dfs => ExploreStrategy::Dfs,

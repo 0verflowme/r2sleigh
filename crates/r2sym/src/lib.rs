@@ -102,8 +102,8 @@ pub use query::{
     SymQueryConfig, SymbolicConditionSet, SymbolicFunctionSummary, SymbolicHookInstallContext,
     apply_query_execution_policy, install_symbolic_hooks_for_query_policy,
     recommended_query_max_depth, recommended_query_max_depth_for_route,
-    recommended_query_max_states_for_route, recommended_query_timeout,
-    recommended_query_timeout_for_route, route_skips_eager_scope_summaries,
+    recommended_query_max_states_for_route, recommended_query_steps,
+    recommended_query_steps_for_route, route_skips_eager_scope_summaries,
     selected_target_query_route_in_scope,
 };
 pub use r2api::{R2Api, R2Error};

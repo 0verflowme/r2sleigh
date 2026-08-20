@@ -1612,7 +1612,7 @@ fn derive_symbolic_summary_for_function<'ctx>(
         max_states: DEFAULT_DERIVED_SUMMARY_MAX_STATES,
         max_completed_paths: Some(DEFAULT_DERIVED_SUMMARY_MAX_PATHS),
         max_depth: DEFAULT_DERIVED_SUMMARY_MAX_DEPTH,
-        timeout: None,
+        max_steps: None,
         prune_infeasible: true,
         merge_states: true,
         subsumption_states: true,

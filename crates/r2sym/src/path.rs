@@ -161,8 +161,14 @@ pub struct ExploreConfig {
     pub max_completed_paths: Option<usize>,
     /// Maximum execution depth per path.
     pub max_depth: usize,
-    /// Timeout for the entire exploration.
-    pub timeout: Option<Duration>,
+    /// Worklist steps the exploration may take before it stops.
+    ///
+    /// This replaced a wall-clock timeout. Elapsed time is not a property of
+    /// the program being analysed, so the same binary explored a different
+    /// amount on a loaded machine and rendered different C between runs.
+    pub max_steps: Option<u64>,
+    /// Deterministic solver resource limit handed to each query.
+    pub solver_rlimit: Option<u32>,
     /// Exploration strategy.
     pub strategy: ExploreStrategy,
     /// Whether to prune infeasible paths early.
@@ -179,7 +185,8 @@ impl Default for ExploreConfig {
             max_states: 1000,
             max_completed_paths: None,
             max_depth: 100,
-            timeout: Some(Duration::from_secs(60)),
+            max_steps: Some(200_000),
+            solver_rlimit: Some(8_000_000),
             strategy: ExploreStrategy::Dfs,
             prune_infeasible: true,
             merge_states: false,
@@ -1772,8 +1779,8 @@ impl<'ctx> PathExplorer<'ctx> {
         config: ExploreConfig,
         execution: SymExecutionControl,
     ) -> Self {
-        let solver = if let Some(timeout) = config.timeout {
-            SymSolver::with_timeout_and_control(ctx, timeout, execution.clone())
+        let solver = if let Some(rlimit) = config.solver_rlimit {
+            SymSolver::with_rlimit_and_control(ctx, rlimit, execution.clone())
         } else {
             SymSolver::with_execution_control(ctx, execution.clone())
         };
@@ -2185,6 +2192,7 @@ impl<'ctx> PathExplorer<'ctx> {
         mode: &mut DriverMode<'ctx>,
     ) {
         let start_time = Instant::now();
+        let mut steps_taken: u64 = 0;
         let mut worklist = StateWorklist::new(self.config.strategy);
         worklist.push(initial_state);
 
@@ -2200,8 +2208,9 @@ impl<'ctx> PathExplorer<'ctx> {
                     .expect("worklist returned a merge-compatible state");
             }
 
-            if let Some(timeout) = self.config.timeout
-                && start_time.elapsed() > timeout
+            steps_taken += 1;
+            if let Some(max_steps) = self.config.max_steps
+                && steps_taken > max_steps
                 && mode.on_timeout()
             {
                 self.stats.timed_out = true;
@@ -2244,8 +2253,8 @@ impl<'ctx> PathExplorer<'ctx> {
                 if !self.poll_execution(mode) {
                     break 'worklist;
                 }
-                if let Some(timeout) = self.config.timeout
-                    && start_time.elapsed() > timeout
+                if let Some(max_steps) = self.config.max_steps
+                    && steps_taken > max_steps
                     && mode.on_timeout()
                 {
                     self.stats.timed_out = true;
@@ -2536,6 +2545,7 @@ impl<'ctx> PathExplorer<'ctx> {
         allow_cross_function_states: bool,
     ) {
         let start_time = Instant::now();
+        let mut steps_taken: u64 = 0;
         let mut worklist = StateWorklist::new(self.config.strategy);
         let mut target_heap: BinaryHeap<Reverse<TargetGuidedQueueEntry>> = BinaryHeap::new();
         let guidance = self.target_guidance_context(func, target_addr, allow_cross_function_states);
@@ -2568,8 +2578,9 @@ impl<'ctx> PathExplorer<'ctx> {
                     .expect("worklist returned a merge-compatible state");
             }
 
-            if let Some(timeout) = self.config.timeout
-                && start_time.elapsed() > timeout
+            steps_taken += 1;
+            if let Some(max_steps) = self.config.max_steps
+                && steps_taken > max_steps
                 && mode.on_timeout()
             {
                 self.stats.timed_out = true;
@@ -2628,8 +2639,8 @@ impl<'ctx> PathExplorer<'ctx> {
                     break 'worklist;
                 }
                 let mut had_runtime_dispatch = false;
-                if let Some(timeout) = self.config.timeout
-                    && start_time.elapsed() > timeout
+                if let Some(max_steps) = self.config.max_steps
+                    && steps_taken > max_steps
                     && mode.on_timeout()
                 {
                     self.stats.timed_out = true;

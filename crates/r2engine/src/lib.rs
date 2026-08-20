@@ -40,7 +40,11 @@ pub const SYMBOLIC_PATHS_CALL_FREE_MAX_STATES: usize = 16;
 pub const SYMBOLIC_PATHS_CALL_FREE_MAX_DEPTH: usize = 64;
 pub const SYMBOLIC_PATHS_CALL_HEAVY_MAX_STATES: usize = 8;
 pub const SYMBOLIC_PATHS_CALL_HEAVY_MAX_DEPTH: usize = 32;
-pub const SYMBOLIC_PATHS_TIMEOUT_MS: u64 = 500;
+/// Worklist steps a path listing may take.
+///
+/// This was 500 wall-clock milliseconds, which made the set of paths a
+/// function listed depend on how busy the machine was.
+pub const SYMBOLIC_PATHS_MAX_STEPS: u64 = 5_000;
 pub const SYMBOLIC_PATHS_SOLUTION_LIMIT: usize = 4;
 pub const RADARE2_ANALYSIS_DEPTH_BASIC: u32 = 1;
 pub const RADARE2_ANALYSIS_DEPTH_AGGRESSIVE: u32 = 3;
@@ -4901,7 +4905,7 @@ pub fn default_symbolic_query_config(merge_states: bool) -> r2sym::SymQueryConfi
             max_states: 200,
             max_depth: 800,
             merge_states,
-            timeout: Some(Duration::from_secs(20)),
+            max_steps: Some(200_000),
             ..Default::default()
         },
         mode: r2sym::QueryMode::TargetGuided,
@@ -4922,7 +4926,7 @@ pub fn path_listing_query_config(
         config.explore.max_states = SYMBOLIC_PATHS_CALL_HEAVY_MAX_STATES;
         config.explore.max_depth = SYMBOLIC_PATHS_CALL_HEAVY_MAX_DEPTH;
     }
-    config.explore.timeout = Some(Duration::from_millis(SYMBOLIC_PATHS_TIMEOUT_MS));
+    config.explore.max_steps = Some(SYMBOLIC_PATHS_MAX_STEPS);
     config.explore.max_completed_paths = Some(SYMBOLIC_PATHS_LIMIT);
     config.summary_profile = r2sym::SummaryProfile::PathListing;
     config

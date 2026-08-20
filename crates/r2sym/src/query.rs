@@ -408,28 +408,32 @@ pub fn recommended_query_max_depth(func: &SsaArtifact, initial_state: &SymState<
     }
 }
 
-/// Recommend a query timeout budget for the current function shape.
+/// Recommend a query step budget for the current function shape.
 ///
 /// Large bounded copy loops often materialize runtime code byte-by-byte before any
-/// symbolic branching happens. Those routes need more wall-clock time even when the
-/// actual search frontier stays small.
-pub fn recommended_query_timeout(func: &SsaArtifact) -> Duration {
+/// symbolic branching happens. Those routes need more work even when the actual
+/// search frontier stays small.
+///
+/// The budget counts worklist steps rather than elapsed time. The tiers are the
+/// shape of the function, which does not change between runs; wall-clock did,
+/// so the same binary proved a different set of facts on a loaded machine.
+pub fn recommended_query_steps(func: &SsaArtifact) -> u64 {
     let cfg_risk = func.function().cfg_risk_summary();
     let bounded_copy_loop_work = estimated_bounded_copy_loop_work(func);
     if bounded_copy_loop_work >= 32 * 1024 {
-        Duration::from_secs(180)
+        1_800_000
     } else if bounded_copy_loop_work >= 8 * 1024 {
-        Duration::from_secs(120)
+        1_200_000
     } else if cfg_risk.block_count >= 64 || cfg_risk.back_edge_count > 0 {
-        Duration::from_secs(60)
+        600_000
     } else {
-        Duration::from_secs(20)
+        200_000
     }
 }
 
 const CONTINUATION_QUERY_MAX_DEPTH_CAP: usize = 8_192;
 const CONTINUATION_QUERY_MAX_STATES_CAP: usize = 256;
-const CONTINUATION_QUERY_TIMEOUT_CAP: Duration = Duration::from_secs(10);
+const CONTINUATION_QUERY_STEP_CAP: u64 = 100_000;
 const CONTINUATION_SEEDED_STATE_CAP: usize = 1;
 
 #[derive(Debug, Clone)]
@@ -439,7 +443,7 @@ pub struct QueryExecutionPolicy {
     pub verification_requirement: VerificationRequirement,
     pub max_states: usize,
     pub max_depth: usize,
-    pub timeout: Option<Duration>,
+    pub max_steps: Option<u64>,
     pub install_scope_summaries: bool,
     pub install_runtime_hooks: bool,
 }
@@ -461,15 +465,12 @@ impl QueryExecutionPolicy {
                 initial_state,
                 Some(&route),
             ));
-        let current_timeout = config
-            .explore
-            .timeout
-            .unwrap_or_else(|| Duration::from_secs(20));
-        let recommended_timeout = recommended_query_timeout_for_route(func, Some(&route));
-        let timeout = if route_is_continuation_seeded(Some(&route)) {
-            current_timeout.min(recommended_timeout)
+        let current_steps = config.explore.max_steps.unwrap_or(200_000);
+        let recommended_steps = recommended_query_steps_for_route(func, Some(&route));
+        let max_steps = if route_is_continuation_seeded(Some(&route)) {
+            current_steps.min(recommended_steps)
         } else {
-            current_timeout.max(recommended_timeout)
+            current_steps.max(recommended_steps)
         };
         let route_only_stats = ExploreStats::default();
         let evidence_summary =
@@ -484,7 +485,7 @@ impl QueryExecutionPolicy {
             route,
             max_states,
             max_depth,
-            timeout: Some(timeout),
+            max_steps: Some(max_steps),
         }
     }
 }
@@ -492,7 +493,7 @@ impl QueryExecutionPolicy {
 pub fn apply_query_execution_policy(config: &mut SymQueryConfig, policy: &QueryExecutionPolicy) {
     config.explore.max_states = policy.max_states;
     config.explore.max_depth = policy.max_depth;
-    config.explore.timeout = policy.timeout;
+    config.explore.max_steps = policy.max_steps;
 }
 
 pub fn route_skips_eager_scope_summaries(route: &crate::TargetQueryRoutePlan) -> bool {
@@ -603,15 +604,15 @@ pub fn recommended_query_max_states_for_route(
     }
 }
 
-pub fn recommended_query_timeout_for_route(
+pub fn recommended_query_steps_for_route(
     func: &SsaArtifact,
     route: Option<&crate::TargetQueryRoutePlan>,
-) -> Duration {
-    let timeout = recommended_query_timeout(func);
+) -> u64 {
+    let steps = recommended_query_steps(func);
     if route_is_continuation_seeded(route) {
-        timeout.min(CONTINUATION_QUERY_TIMEOUT_CAP)
+        steps.min(CONTINUATION_QUERY_STEP_CAP)
     } else {
-        timeout
+        steps
     }
 }
 
@@ -3053,13 +3054,13 @@ mod tests {
     }
 
     #[test]
-    fn bounded_copy_loops_raise_recommended_query_timeout() {
+    fn bounded_copy_loops_raise_recommended_query_steps() {
         let blocks = make_bounded_copy_loop_blocks();
         let func = SsaArtifact::for_symbolic(&blocks, None).expect("ssa");
 
         assert!(
-            super::recommended_query_timeout(&func) >= std::time::Duration::from_secs(120),
-            "bounded copy loop timeout should exceed default budget"
+            super::recommended_query_steps(&func) >= 1_200_000,
+            "bounded copy loop budget should exceed default budget"
         );
     }
 
@@ -3127,11 +3128,11 @@ mod tests {
             },
         };
 
-        let timeout = super::recommended_query_timeout_for_route(&func, Some(&route));
+        let steps = super::recommended_query_steps_for_route(&func, Some(&route));
 
         assert!(
-            timeout <= std::time::Duration::from_secs(30),
-            "continuation-seeded route should cap inflated timeout, got {timeout:?}"
+            steps <= super::CONTINUATION_QUERY_STEP_CAP,
+            "continuation-seeded route should cap an inflated budget, got {steps}"
         );
     }
 

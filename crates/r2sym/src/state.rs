@@ -223,7 +223,7 @@ pub struct SymState<'ctx> {
     /// The Z3 context.
     ctx: &'ctx Context,
     /// Register values (register name -> value).
-    registers: Rc<HashMap<String, SymValue<'ctx>>>,
+    registers: Rc<BTreeMap<String, SymValue<'ctx>>>,
     /// Memory state.
     pub memory: SymMemory<'ctx>,
     /// Path constraints (conditions that must be true for this path).
@@ -248,7 +248,7 @@ pub struct SymState<'ctx> {
     /// Execution depth (number of steps taken).
     pub depth: usize,
     /// Named symbolic inputs (registers or buffers).
-    symbolic_inputs: Rc<HashMap<String, SymValue<'ctx>>>,
+    symbolic_inputs: Rc<BTreeMap<String, SymValue<'ctx>>>,
     /// Tracked symbolic memory regions.
     symbolic_memory: Rc<Vec<SymbolicMemoryRegion<'ctx>>>,
     /// Symbolic external input streams keyed by file descriptor.
@@ -311,7 +311,7 @@ impl<'ctx> SymState<'ctx> {
     pub fn new(ctx: &'ctx Context, entry_pc: u64) -> Self {
         Self {
             ctx,
-            registers: Rc::new(HashMap::new()),
+            registers: Rc::new(BTreeMap::new()),
             memory: SymMemory::new(ctx),
             constraints: ConstraintCursor::default(),
             materialized_constraints: OnceCell::new(),
@@ -324,7 +324,7 @@ impl<'ctx> SymState<'ctx> {
             active: true,
             exit_status: None,
             depth: 0,
-            symbolic_inputs: Rc::new(HashMap::new()),
+            symbolic_inputs: Rc::new(BTreeMap::new()),
             symbolic_memory: Rc::new(Vec::new()),
             symbolic_fd_inputs: Rc::new(HashMap::new()),
             runtime: RuntimeState::default(),
@@ -335,7 +335,7 @@ impl<'ctx> SymState<'ctx> {
     pub fn new_symbolic(ctx: &'ctx Context, entry_pc: u64) -> Self {
         Self {
             ctx,
-            registers: Rc::new(HashMap::new()),
+            registers: Rc::new(BTreeMap::new()),
             memory: SymMemory::new_symbolic(ctx),
             constraints: ConstraintCursor::default(),
             materialized_constraints: OnceCell::new(),
@@ -348,7 +348,7 @@ impl<'ctx> SymState<'ctx> {
             active: true,
             exit_status: None,
             depth: 0,
-            symbolic_inputs: Rc::new(HashMap::new()),
+            symbolic_inputs: Rc::new(BTreeMap::new()),
             symbolic_memory: Rc::new(Vec::new()),
             symbolic_fd_inputs: Rc::new(HashMap::new()),
             runtime: RuntimeState::default(),
@@ -546,12 +546,12 @@ impl<'ctx> SymState<'ctx> {
     }
 
     /// Get all registers.
-    pub fn registers(&self) -> &HashMap<String, SymValue<'ctx>> {
+    pub fn registers(&self) -> &BTreeMap<String, SymValue<'ctx>> {
         self.registers.as_ref()
     }
 
     /// Get tracked symbolic inputs.
-    pub fn symbolic_inputs(&self) -> &HashMap<String, SymValue<'ctx>> {
+    pub fn symbolic_inputs(&self) -> &BTreeMap<String, SymValue<'ctx>> {
         self.symbolic_inputs.as_ref()
     }
 
@@ -1091,11 +1091,15 @@ impl<'ctx> SymState<'ctx> {
                 .collect(),
         );
 
-        let mut keys = HashSet::new();
+        // Ordered: merging builds a solver term per key, so a hashed iteration
+        // order handed Z3 the same merge in a different order on every run, and
+        // the model it chose for an under-constrained value moved with it. One
+        // statement in `list_reverse` appeared in roughly one run in ten.
+        let mut keys = BTreeSet::new();
         keys.extend(self.registers.keys().cloned());
         keys.extend(other.registers.keys().cloned());
 
-        let mut registers = HashMap::with_capacity(keys.len());
+        let mut registers = BTreeMap::new();
         for key in keys {
             let val_self = self
                 .registers
