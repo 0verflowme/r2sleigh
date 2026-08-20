@@ -12,7 +12,7 @@ use crate::cfg::{BlockTerminator, CFG};
 use crate::indirect::{
     PointerTable, ResolvedIndirectCall, definitions, resolve_constant, resolve_indirect_calls,
 };
-use crate::{SSAOp, SSAVar};
+use crate::SSAOp;
 use std::collections::HashMap;
 
 /// A block no execution can enter.
@@ -120,6 +120,7 @@ pub fn prove<T: PointerTable>(function: &SSAFunction, tables: &[T]) -> ProvenFac
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::SSAVar;
     use crate::cfg::BasicBlock;
 
     fn var(name: &str) -> SSAVar {
