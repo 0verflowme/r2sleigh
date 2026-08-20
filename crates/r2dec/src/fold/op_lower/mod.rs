@@ -12417,11 +12417,24 @@ impl<'a> FoldingContext<'a> {
                 // Skip if this will be inlined
                 let key = dst.display_name();
                 if self.should_inline(dst) {
+                    // Inlined is rendered, and the expression reading it owns it
+                    self.record_effect_render_proof_for_value(
+                        EffectRenderProofKind::Expression,
+                        block.addr,
+                        op_idx,
+                        self.value_id_for_rendered_op(dst),
+                    );
                     continue;
                 }
 
                 // Skip if this op's destination was consumed by call argument collection
                 if self.consumed_by_call_set().contains(&key) {
+                    self.record_effect_render_proof_for_value(
+                        EffectRenderProofKind::Expression,
+                        block.addr,
+                        op_idx,
+                        self.value_id_for_rendered_op(dst),
+                    );
                     continue;
                 }
             }
