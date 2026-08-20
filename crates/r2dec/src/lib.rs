@@ -1427,10 +1427,24 @@ fn note_unproven_constructs(func: &mut CFunction, closure: Option<ObligationClos
     // Counting markers reads the body; counting obligations reads what the source
     // said the body owes. Only the second can tell that an effect went missing,
     // so it is reported beside the first rather than in place of it.
+    //
+    // A body with no statements owns nothing whatever the fold recorded on the way
+    // there: the proofs are taken while folding, and a structuring that then
+    // refuses emits none of it. Reporting the folded count for such a function
+    // claims ownership for a function that rendered nothing.
+    // A comment is not a statement, so a body holding only refusals rendered nothing
+    let rendered_any_statement = func
+        .body
+        .iter()
+        .any(|stmt| !matches!(stmt, CStmt::Comment(_) | CStmt::Empty));
     let detail = match closure {
-        Some(closure) if closure.total > 0 => format!(
+        Some(closure) if closure.total > 0 && rendered_any_statement => format!(
             "{detail}; {} of {} source obligations owned, {} unsupported",
             closure.owned, closure.total, closure.unsupported
+        ),
+        Some(closure) if closure.total > 0 => format!(
+            "{detail}; none of {} source obligations owned",
+            closure.total
         ),
         _ => detail,
     };
