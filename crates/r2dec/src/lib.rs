@@ -3346,6 +3346,7 @@ impl Decompiler {
         // A value with more than one reader is supposed to become a typed
         // local. A name the body mentions and the function never declares says
         // that did not happen, and a reader has no way to learn what it is.
+        unrendered::declare_for_init_targets(&mut c_function);
         let undeclared = unrendered::names_mentioned_without_a_declaration(&c_function);
         if !undeclared.is_empty() {
             let table = c_function.symbols.borrow();

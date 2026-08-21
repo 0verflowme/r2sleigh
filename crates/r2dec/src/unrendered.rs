@@ -443,3 +443,62 @@ pub(crate) fn names_mentioned_without_a_declaration(
     undeclared.sort_unstable();
     undeclared
 }
+
+/// Declare an induction variable a `for` assigns and nothing else declares.
+///
+/// Structuring turns a while into a for after the pass that declares carriers
+/// has run, so the name the init assigns is introduced when nothing is left to
+/// notice it. C requires it declared, and the slot may be read after the loop,
+/// so the declaration is hoisted ahead of the statement rather than folded into
+/// the init.
+pub(crate) fn declare_for_init_targets(func: &mut CFunction) {
+    let declared = func
+        .params
+        .iter()
+        .map(|param| param.name)
+        .chain(func.locals.iter().map(|local| local.name))
+        .chain(crate::declarations_in_stmts(&func.body))
+        .collect::<std::collections::HashSet<_>>();
+    let mut hoisted = Vec::new();
+    hoist_in_block(&mut func.body, &declared, &mut hoisted);
+    for (name, ty) in hoisted {
+        func.locals.push(crate::ast::CLocal {
+            ty,
+            name,
+            stack_offset: None,
+        });
+    }
+}
+
+fn hoist_in_block(
+    stmts: &mut Vec<CStmt>,
+    declared: &std::collections::HashSet<crate::symbol::SymbolId>,
+    hoisted: &mut Vec<(crate::symbol::SymbolId, crate::ast::CType)>,
+) {
+    for stmt in stmts.iter_mut() {
+        if let CStmt::For { init: Some(init), .. } = stmt
+            && let CStmt::Expr(CExpr::Binary {
+                op: crate::ast::BinaryOp::Assign,
+                left,
+                right,
+            }) = init.as_ref()
+            && let CExpr::Var(name) = left.as_ref()
+            && !declared.contains(name)
+            && !hoisted.iter().any(|(seen, _)| seen == name)
+        {
+            hoisted.push((*name, width_of_initial_value(right)));
+        }
+        crate::single_evaluation::for_each_child_block_mut(stmt, &mut |body, _| {
+            hoist_in_block(body, declared, hoisted);
+        });
+    }
+}
+
+/// The type to declare an induction variable with, taken from what it starts as.
+fn width_of_initial_value(value: &CExpr) -> crate::ast::CType {
+    match value {
+        CExpr::Cast { ty, .. } => ty.clone(),
+        CExpr::UIntLit(_) => crate::ast::CType::UInt(64),
+        _ => crate::ast::CType::Int(64),
+    }
+}
