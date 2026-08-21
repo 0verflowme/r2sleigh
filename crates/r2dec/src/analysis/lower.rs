@@ -1450,6 +1450,7 @@ mod tests {
 
     #[allow(clippy::too_many_arguments)]
     fn make_ctx<'a>(
+        symbols: &'a std::cell::RefCell<crate::symbol::SymbolTable>,
         definitions: &'a HashMap<String, CExpr>,
         use_counts: &'a HashMap<String, usize>,
         condition_vars: &'a HashSet<String>,
@@ -1462,8 +1463,6 @@ mod tests {
         #[cfg(test)] _strings: &'a HashMap<u64, String>,
         #[cfg(test)] _symbols: &'a HashMap<u64, String>,
     ) -> LowerCtx<'a> {
-        // The table outlives the context it is handed to, as it does in a run.
-        let symbols = Box::leak(Box::new(test_table()));
         let type_hints = Box::leak(Box::new(HashMap::new()));
         let semantic_values = Box::leak(Box::new(HashMap::new()));
         let param_register_aliases = Box::leak(Box::new(HashMap::new()));
@@ -1488,6 +1487,7 @@ mod tests {
 
     #[test]
     fn resolve_addr_literal_ignores_raw_function_string_symbol_maps() {
+        let symbols = test_table();
         let mut fn_map = HashMap::new();
         let mut str_map = HashMap::new();
         let mut sym_map = HashMap::new();
@@ -1509,6 +1509,7 @@ mod tests {
         let stack_slots = HashMap::new();
         let forwarded_values = HashMap::new();
         let ctx = make_ctx(
+            &symbols,
             &definitions,
             &use_counts,
             &condition_vars,
@@ -1533,6 +1534,7 @@ mod tests {
 
     #[test]
     fn resolve_addr_literal_skips_small_and_unknown_values() {
+        let symbols = test_table();
         let fn_map = HashMap::new();
         let str_map = HashMap::new();
         let sym_map = HashMap::new();
@@ -1545,6 +1547,7 @@ mod tests {
         let stack_slots = HashMap::new();
         let forwarded_values = HashMap::new();
         let ctx = make_ctx(
+            &symbols,
             &definitions,
             &use_counts,
             &condition_vars,
@@ -1577,6 +1580,7 @@ mod tests {
         let stack_slots = HashMap::new();
         let forwarded_values = HashMap::new();
         let ctx = make_ctx(
+            &symbols,
             &definitions,
             &use_counts,
             &condition_vars,
@@ -1630,6 +1634,7 @@ mod tests {
         let stack_slots = HashMap::new();
         let forwarded_values = HashMap::new();
         let ctx = make_ctx(
+            &symbols,
             &definitions,
             &use_counts,
             &condition_vars,
@@ -1674,6 +1679,7 @@ mod tests {
         let stack_slots = HashMap::new();
         let forwarded_values = HashMap::new();
         let ctx = make_ctx(
+            &symbols,
             &definitions,
             &use_counts,
             &condition_vars,
@@ -1693,6 +1699,7 @@ mod tests {
 
     #[test]
     fn load_generic_deref_casts_non_pointer_like_address() {
+        let symbols = test_table();
         let fn_map = HashMap::new();
         let str_map = HashMap::new();
         let sym_map = HashMap::new();
@@ -1705,6 +1712,7 @@ mod tests {
         let stack_slots = HashMap::new();
         let forwarded_values = HashMap::new();
         let ctx = make_ctx(
+            &symbols,
             &definitions,
             &use_counts,
             &condition_vars,
@@ -1753,6 +1761,7 @@ mod tests {
         let stack_slots = HashMap::new();
         let forwarded_values = HashMap::new();
         let ctx = make_ctx(
+            &symbols,
             &definitions,
             &use_counts,
             &condition_vars,
@@ -1797,6 +1806,7 @@ mod tests {
         let strings = HashMap::new();
         let binary_symbols = HashMap::new();
         let ctx = make_ctx(
+            &symbols,
             &definitions,
             &use_counts,
             &condition_vars,
@@ -1841,6 +1851,7 @@ mod tests {
 
     #[test]
     fn load_generic_deref_avoids_cast_for_pointer_like_address() {
+        let symbols = test_table();
         let fn_map = HashMap::new();
         let str_map = HashMap::new();
         let sym_map = HashMap::new();
@@ -1853,6 +1864,7 @@ mod tests {
         let stack_slots = HashMap::new();
         let forwarded_values = HashMap::new();
         let ctx = make_ctx(
+            &symbols,
             &definitions,
             &use_counts,
             &condition_vars,
@@ -1915,6 +1927,7 @@ mod tests {
             ),
         )]);
         let ctx = make_ctx(
+            &symbols,
             &definitions,
             &use_counts,
             &condition_vars,
@@ -1966,6 +1979,7 @@ mod tests {
         )]);
         let forwarded_values = HashMap::new();
         let ctx = make_ctx(
+            &symbols,
             &definitions,
             &use_counts,
             &condition_vars,
@@ -2016,6 +2030,7 @@ mod tests {
             ),
         )]);
         let ctx = make_ctx(
+            &symbols,
             &definitions,
             &use_counts,
             &condition_vars,
@@ -2070,6 +2085,7 @@ mod tests {
             ),
         ]);
         let ctx = make_ctx(
+            &symbols,
             &definitions,
             &use_counts,
             &condition_vars,
@@ -2120,6 +2136,7 @@ mod tests {
             ),
         ]);
         let ctx = make_ctx(
+            &symbols,
             &definitions,
             &use_counts,
             &condition_vars,
@@ -2190,6 +2207,7 @@ mod tests {
             ),
         ]);
         let ctx = make_ctx(
+            &symbols,
             &definitions,
             &use_counts,
             &condition_vars,
