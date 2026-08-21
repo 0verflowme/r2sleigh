@@ -267,44 +267,32 @@ Counts across the two corpora: 23 functions and 55 distinct names down to 18 and
 renderer replaces machine tokens with prose and would otherwise print the
 substitution rather than the name.
 
-### Two more spelling tables, and the one thing missing to remove them
+### The spelling tables are gone
 
-`is_return_value_register` and `is_control_return_target` in `r2ssa::semantic`
-are the same hack as the phi picker's: `rax | eax | ax | al | xmm0 | st0 | x0 |
-w0 | r0 | v0` for one, `pc | lr | ra | x30 | rip | eip` for the other. Six call
-sites, all in the return analysis.
+All three are removed. The phi picker asks the convention which location returns
+a value; `is_return_value_register` and `is_control_return_target` ask the
+machine rather than matching `rax | eax | ax | al | xmm0 | st0 | x0 | w0 | r0 |
+v0` and `pc | lr | ra | x30 | rip | eip`.
 
-I have now built the replacement twice and reverted it twice. It works -- the
-corpus is unchanged at 47 of 60 functions and `sym._fnv1a64` renders
-identically -- and the diagnosis is complete. Two things were learned, both of
-which cost a revert:
+Two things were learned removing them, each at the cost of a revert, and both
+are now encoded rather than remembered.
 
-**One predicate was answering two questions.** `collect_return_value_certificates`
-and `process_reaching_return_block` ask "does this function return a value
-here", which must respect a declared `Void`. `kill_return_register_flow_values`
-and `return_carrier_for_value` ask "did a *call* leave its result here", which
-does not -- a void function still reads the results of the calls it makes. The
-spelling table served both because it never consulted a contract. Splitting them
-into `is_return_value_register` and `is_call_result_register` is right and the
-r2dec suite passes with it.
+**One predicate was answering two questions.** Whether *this function* returns a
+value here must respect a declared `Void`; whether a *call* left its result here
+must not, because a void function still reads the results of the calls it makes.
+The table served both because it never consulted a contract. They are
+`is_return_value_register` and `is_call_result_register` now.
 
-**The table is supplying a default nothing else provides.** Ask the interface
-via `return_kind()` and a `Void` function correctly answers "no return
-register". Ask the convention via `result_slot()` and a source that recovered
-one answers correctly. But `MachineAbiModel::return_registers` is *derived from
-the interface*, not from the architecture, so a function built through
-`SsaArtifact::for_decompile` with no interface has no machine statement about
-return registers at all. Seven `r2ssa::function` tests exercise exactly that
-path and depend on the spelling table to answer.
+**The table was supplying a default nothing else provided.** The recovered
+interface answers, and the recovered convention answers, but a function built
+with neither had no machine statement at all -- which is why seven tests
+depended on the spelling list. `ArchSpec` carries `return_registers` now, serde
+defaulted so existing `.r2il` files read unchanged, and the chain is interface
+-> convention -> architecture with no hand-written link in it.
 
-So the missing piece is: **`ArchSpec` should carry its ABI's return registers**,
-the way it already carries register definitions. Then `result_slot()` falls back
-source -> convention -> architecture, no step of which is a hand-written list,
-and the two tables delete. Without that, removing them silently drops return
-detection for any analysis with no recovered ABI, which is worse than the hack.
-
-`SsaArtifact::for_decompile_with_convention` is written and works if the fixture
-route is preferred, but it only patches the fixtures rather than fixing the gap.
+Four fixtures asserted which phi a control return binds while providing no
+machine that could name a return register. They state one now. A test asking
+that question needs the premise; it was only ever answered by the hack.
 
 ### The SIMD lane defect, located
 
