@@ -2082,7 +2082,7 @@ mod tests {
 
     #[test]
     fn final_call_normalization_uses_typed_printf_identity_not_rendered_name() {
-        let symbols = test_table();
+
         let mut imported_ctx = FoldingContext::new(64);
         let imported_source = (0x1000, 0);
         install_callsite_resolution(
@@ -2097,11 +2097,11 @@ mod tests {
             }),
         );
         let rendered_local_logger = CExpr::call(
-            crate::symbol::var_ref(&symbols, "sym.local_logger"),
+            imported_ctx.name_ref("sym.local_logger"),
             vec![
                 CExpr::StringLit("x=%d".to_string()),
-                crate::symbol::var_ref(&symbols, "x"),
-                crate::symbol::var_ref(&symbols, "garbage"),
+                imported_ctx.name_ref("x"),
+                imported_ctx.name_ref("garbage"),
             ],
         );
 
@@ -2112,11 +2112,11 @@ mod tests {
                 FinalExprNormalizeContext::DefinitionRoot,
             ),
             CExpr::call(
-                crate::symbol::var_ref(&symbols, "sym.imp.printf"),
+                imported_ctx.name_ref("sym.imp.printf"),
                 vec![
                     CExpr::StringLit("x=%d".to_string()),
-                    crate::symbol::var_ref(&symbols, "x"),
-                    crate::symbol::var_ref(&symbols, "garbage"),
+                    imported_ctx.name_ref("x"),
+                    imported_ctx.name_ref("garbage"),
                 ],
             ),
             "typed variadic printf callsite identity must preserve certified args; format strings are not arity proof",
@@ -2136,11 +2136,11 @@ mod tests {
             }),
         );
         let poisoned_printf = CExpr::call(
-            crate::symbol::var_ref(&symbols, "sym.imp.printf"),
+            imported_ctx.name_ref("sym.imp.printf"),
             vec![
                 CExpr::StringLit("x=%d".to_string()),
-                crate::symbol::var_ref(&symbols, "x"),
-                crate::symbol::var_ref(&symbols, "garbage"),
+                imported_ctx.name_ref("x"),
+                imported_ctx.name_ref("garbage"),
             ],
         );
 
@@ -2151,11 +2151,11 @@ mod tests {
                 FinalExprNormalizeContext::DefinitionRoot,
             ),
             CExpr::call(
-                crate::symbol::var_ref(&symbols, "sym.local_logger"),
+                imported_ctx.name_ref("sym.local_logger"),
                 vec![
                     CExpr::StringLit("x=%d".to_string()),
-                    crate::symbol::var_ref(&symbols, "x"),
-                    crate::symbol::var_ref(&symbols, "garbage"),
+                    imported_ctx.name_ref("x"),
+                    imported_ctx.name_ref("garbage"),
                 ],
             ),
             "rendered printf names must not clamp args for typed internal callsites",
@@ -11445,7 +11445,7 @@ mod tests {
     #[test]
     fn call_source_proof_raw_owner_recovery_rejects_alias_owner_without_function_facts() {
         fn seed_owner(ctx: &mut FoldingContext<'_>, source_call: (u64, usize), alias: &str) {
-            let symbols = test_table();
+
             ctx.state
                 .analysis_ctx
                 .use_info
@@ -18035,6 +18035,7 @@ mod tests {
     #[test]
     fn certified_call_result_owner_alias_requires_certified_stack_identity() {
         let symbols = test_table();
+
         let arch = make_test_arch_x86_64();
         let mut entry = R2ILBlock::new(0x1000, 4);
         entry.push(R2ILOp::Copy {
@@ -18088,6 +18089,8 @@ mod tests {
         install_function_call_result_facts(&mut uncertified_alias_ctx, call_results);
         uncertified_alias_ctx.inputs.prepared_semantic_view =
             Some(Box::leak(Box::new(prepared_view())));
+        // The view was built before this context, so it adopts the view's table.
+        uncertified_alias_ctx.symbols = std::cell::RefCell::new(symbols.borrow().clone());
         uncertified_alias_ctx
             .state
             .analysis_ctx
@@ -18126,6 +18129,7 @@ mod tests {
         );
         certified_alias_ctx.inputs.prepared_semantic_view =
             Some(Box::leak(Box::new(prepared_view())));
+        certified_alias_ctx.symbols = std::cell::RefCell::new(symbols.borrow().clone());
         certified_alias_ctx.inputs.visible_bindings =
             Box::leak(Box::new(vec![visible_stack_binding(
                 "alias",
