@@ -100,8 +100,16 @@ invisible until the types finally differed. Expect more of these.
 ## Where the tree stands
 
 `cargo build --workspace` is clean. `cargo test -p r2dec --lib` runs:
-**704 pass, 2 fail**, down from 83 failures when the suite first compiled.
-Thirty-eight commits from `763b28d`, net negative line count.
+**the whole workspace is green** -- `cargo test --workspace` has no failing test
+in any crate, r2dec at 706 and r2ssa at 401, down from 1323 compile errors and
+83 failures when the suite first built. Forty-eight commits from `763b28d`, net
+negative line count.
+
+On the corpus, `pdd` renders 47 of 60 functions across x86-64 and arm64 at `-O0`
+and `-O2`, and both flag binaries render completely. The thirteen that do not
+fail at the lift, not the renderer: `Unable to resolve constructor`, `genuine
+basic block contains instructions after a control terminator`, `machine-derived
+CFG contradicts the owned advisory source CFG`. Those predate this work.
 
 ### An identifier now says which table issued it
 
@@ -132,30 +140,14 @@ reach output or disturb determinism — check that again before adding a field.
 - `make_ctx` in the `lower` tests leaked a table of its own while the fixtures
   declared into another.
 
-### The 2 that remain
-
-`fold::op_lower::tests::call_source_proof_raw_owner_recovery_rejects_alias_owner_without_function_facts`
-and `final_call_normalization_uses_typed_printf_identity_not_rendered_name`.
-
-Both build one fixture and read it from several `FoldingContext`s. A context
-owns its table by value, so making two contexts agree means cloning one into the
-other, and a clone is a **snapshot**: any name declared after it is missing, and
-the panic becomes `index out of bounds: the len is 2 but the index is 2` rather
-than a table mismatch. Chasing the clone to a later line only moves which name
-is missing.
-
-The fix is structural, not another clone. Either a `FoldingContext` should
-borrow its table rather than own it, so several contexts can share one; or these
-tests should build every fixture name before any context exists and hand the
-same table to each. The first matches production, where
-`build_function_internal_with_control` creates one table and passes it to
-everything that renders the function. It is the last piece of the table-identity
-work and worth doing properly rather than patching around.
-
-### How the other 81 were fixed
+### How the 83 failures were fixed
 
 Every one was a real defect that the branding exposed, not churn:
 
+- Two contexts reading one fixture each held their own table. The fold context
+  owns its table behind an `Rc` now, so they share one. Cloning was the trap: a
+  copy taken before the last name is declared is missing it, and the panic moves
+  from a table mismatch to an index past the end.
 - `structure`'s `v()` helper built a table **per call**, so every reference
   indexed a table already dropped (31).
 - `single_evaluation`'s `call`, `assign` and `function` helpers did the same, so
