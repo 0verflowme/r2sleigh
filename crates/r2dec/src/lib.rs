@@ -3288,6 +3288,10 @@ impl Decompiler {
         // Whatever carriers are still on the page after every pass that could
         // resolve one, the body reads and writes, so it declares them.
         unrendered::declare_rendered_carriers(&mut c_function, &type_hints);
+        // After every name exists and before anything reads the body as text,
+        // because a name that C cannot read is not output whatever else is true
+        // of it.
+        unrendered::spell_every_name_as_c(&mut c_function);
         unrendered::mark_undeclared_names(&mut c_function);
         // Executable C is admitted only when the source obligation inventory is
         // complete. The inventory is what says which effects the source has, so a

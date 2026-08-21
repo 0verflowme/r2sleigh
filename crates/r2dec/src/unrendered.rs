@@ -238,6 +238,107 @@ fn collect_block_names(stmts: &[CStmt]) -> BTreeSet<String> {
     names
 }
 
+/// Spell every name in the rendered function the way C spells an identifier.
+///
+/// `declare_rendered_carriers` spells the names it declares, but only those: a
+/// name a statement declares for itself was already accounted for and so was
+/// never asked whether C could read it. Lane projections arrive that way and
+/// reach the page as `tregalias:1000007c0:2d:0`, which is not an identifier and
+/// not compilable.
+///
+/// Whether a name is declared and whether it can be written down are different
+/// questions, so this asks the second one about every name in the function.
+pub(crate) fn spell_every_name_as_c(func: &mut CFunction) {
+    let mut names = collect_block_names(&func.body);
+    collect_block_declared(&func.body, &mut names);
+    for param in &func.params {
+        names.insert(param.name.clone());
+    }
+    for local in &func.locals {
+        names.insert(local.name.clone());
+    }
+    let unspellable = names
+        .iter()
+        .filter(|name| !is_c_identifier(name) && !names_something_outside_the_function(name))
+        .cloned()
+        .collect::<Vec<_>>();
+    if unspellable.is_empty() {
+        return;
+    }
+    // Everything already readable keeps its spelling and its claim on it, so
+    // spelling one name can never collide with another.
+    let mut taken = names
+        .iter()
+        .filter(|name| is_c_identifier(name))
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let mut renames = std::collections::HashMap::new();
+    for name in unspellable {
+        let spelled = spell_as_identifier(&name, &mut taken);
+        renames.insert(name, spelled);
+    }
+    for local in &mut func.locals {
+        if let Some(spelled) = renames.get(&local.name) {
+            local.name = spelled.clone();
+        }
+    }
+    for param in &mut func.params {
+        if let Some(spelled) = renames.get(&param.name) {
+            param.name = spelled.clone();
+        }
+    }
+    crate::post_rename::rewrite_function_names(func, &renames);
+}
+
+/// Whether C could read this name as an identifier.
+fn is_c_identifier(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|ch| ch.is_ascii_alphabetic() || ch == '_')
+        && chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+}
+
+/// Names a statement declares for itself, which nothing else records.
+fn collect_block_declared(stmts: &[CStmt], names: &mut BTreeSet<String>) {
+    for stmt in stmts {
+        match stmt {
+            CStmt::Decl { name, .. } => {
+                names.insert(name.clone());
+            }
+            CStmt::Block(body) => collect_block_declared(body, names),
+            CStmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                collect_block_declared(std::slice::from_ref(then_body), names);
+                if let Some(body) = else_body {
+                    collect_block_declared(std::slice::from_ref(body), names);
+                }
+            }
+            CStmt::While { body, .. } | CStmt::DoWhile { body, .. } => {
+                collect_block_declared(std::slice::from_ref(body), names);
+            }
+            CStmt::For { init, body, .. } => {
+                if let Some(init) = init {
+                    collect_block_declared(std::slice::from_ref(init), names);
+                }
+                collect_block_declared(std::slice::from_ref(body), names);
+            }
+            CStmt::Switch { cases, default, .. } => {
+                for case in cases {
+                    collect_block_declared(&case.body, names);
+                }
+                if let Some(body) = default {
+                    collect_block_declared(body, names);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Mark every construct that mentions a name this function does not declare.
 pub(crate) fn mark_undeclared_names(func: &mut CFunction) {
     let mut declared = BTreeSet::new();
@@ -421,6 +522,63 @@ mod tests {
         let mut out = Vec::new();
         walk(&func.body, &mut out);
         out
+    }
+
+    #[test]
+    fn a_name_a_statement_declares_for_itself_is_still_spelled_as_c() {
+        // A lane projection declares itself in the body, so nothing else had
+        // reason to ask whether C could read the name it chose.
+        let mut func = function(
+            Vec::new(),
+            Vec::new(),
+            vec![
+                CStmt::Decl {
+                    ty: CType::UInt(32),
+                    name: "tmp:regalias:7c0:2d:0".to_string(),
+                    init: Some(CExpr::IntLit(0)),
+                },
+                CStmt::Return(Some(CExpr::Var("tmp:regalias:7c0:2d:0".to_string()))),
+            ],
+        );
+
+        spell_every_name_as_c(&mut func);
+
+        let names = collect_block_names(&func.body);
+        assert!(
+            names.iter().all(|name| is_c_identifier(name)),
+            "no name may reach the page that C cannot read: {names:?}"
+        );
+        let mut declared = BTreeSet::new();
+        collect_block_declared(&func.body, &mut declared);
+        assert!(declared.iter().all(|name| is_c_identifier(name)));
+        // The reference and the declaration must still be the same name.
+        assert_eq!(declared, names);
+    }
+
+    #[test]
+    fn a_readable_name_keeps_its_spelling_and_its_claim_on_it() {
+        let mut func = function(
+            vec!["total"],
+            Vec::new(),
+            vec![
+                CStmt::Decl {
+                    ty: CType::UInt(32),
+                    name: "tmp:total".to_string(),
+                    init: Some(CExpr::IntLit(0)),
+                },
+                CStmt::Return(Some(CExpr::Var("total".to_string()))),
+            ],
+        );
+
+        spell_every_name_as_c(&mut func);
+
+        assert_eq!(func.params[0].name, "total", "a readable name is untouched");
+        let mut declared = BTreeSet::new();
+        collect_block_declared(&func.body, &mut declared);
+        assert!(
+            !declared.contains("total"),
+            "spelling one name must not collide with another: {declared:?}"
+        );
     }
 
     #[test]
