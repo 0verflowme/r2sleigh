@@ -5300,6 +5300,7 @@ fn infer_local_struct_field_accesses(
     }
 
     let env = analysis::PassEnv {
+        carrier_aliases: crate::analysis::no_carrier_aliases(),
         string_literals: crate::analysis::lower::no_string_literals(),
         ptr_size: config.ptr_size,
         sp_name: &config.sp_name,
@@ -7015,6 +7016,7 @@ mod tests {
             }
         }
         let env = analysis::PassEnv {
+            carrier_aliases: crate::analysis::no_carrier_aliases(),
             string_literals: crate::analysis::lower::no_string_literals(),
             ptr_size: config.ptr_size,
             sp_name: &config.sp_name,
@@ -7182,6 +7184,7 @@ mod tests {
             }
         }
         let env = analysis::PassEnv {
+            carrier_aliases: crate::analysis::no_carrier_aliases(),
             string_literals: crate::analysis::lower::no_string_literals(),
             ptr_size: config.ptr_size,
             sp_name: &config.sp_name,
@@ -7404,6 +7407,7 @@ mod tests {
             }
         }
         let env = analysis::PassEnv {
+            carrier_aliases: crate::analysis::no_carrier_aliases(),
             string_literals: crate::analysis::lower::no_string_literals(),
             ptr_size: config.ptr_size,
             sp_name: &config.sp_name,

@@ -11663,6 +11663,7 @@ mod tests {
             "r9".to_string(),
         ]));
         let env = PassEnv {
+            carrier_aliases: crate::analysis::no_carrier_aliases(),
             string_literals: crate::analysis::lower::no_string_literals(),
             ptr_size: 8,
             sp_name: "rsp",

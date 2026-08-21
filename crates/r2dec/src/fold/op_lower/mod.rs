@@ -1859,6 +1859,7 @@ impl<'a> FoldingContext<'a> {
             summary_view: self.inputs.summary_view(),
             arg_regs: &self.inputs.arch.arg_regs,
             param_register_aliases: self.inputs.param_register_aliases,
+            carrier_aliases: &self.carrier_aliases,
             caller_saved_regs: &self.inputs.arch.caller_saved_regs,
             type_hints: &self.use_info().type_hints,
             type_oracle: self.inputs.type_oracle,
@@ -2075,6 +2076,7 @@ impl<'a> FoldingContext<'a> {
         }
         let type_hints = self.state.analysis_ctx.semantic().type_hints.clone();
         let env = analysis::PassEnv {
+            carrier_aliases: crate::analysis::no_carrier_aliases(),
             string_literals: self.inputs.display_names.strings(),
             ptr_size: self.inputs.arch.ptr_size,
             sp_name: &self.inputs.arch.sp_name,

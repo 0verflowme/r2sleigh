@@ -961,3 +961,79 @@ mod tests {
         SSAFunction::from_blocks_raw_no_arch(&[entry, header, latch, exit]).expect("loop fixture")
     }
 }
+
+/// One name for every value a certified loop carrier passes through.
+///
+/// A carrier is one mutable variable the machine spells differently on each
+/// edge: an entry value, a phi, a latch update and a post-loop merge are four
+/// SSA values and one C local. Naming is per-version, so the same variable
+/// reached the page as `rax_1`, `rax_2` and `rax_3`, with the loop assigning two
+/// of them and the return reading a fourth that still held the entry value.
+///
+/// Two kinds of carrier are left alone, and both were found by rendering rather
+/// than reasoning. One the loop reloads from a frame slot is a copy of that
+/// slot, so naming it puts a second variable on the page for one value. One
+/// whose values are not all the same storage holding one value is a register the
+/// machine reused, and naming it would say two different values are one.
+///
+/// Constants are skipped. An entry edge arriving as a literal is the
+/// initializer, not another spelling of the variable.
+pub(crate) fn carrier_name_aliases(
+    prepared: &r2ssa::SsaArtifact,
+    render_facts: &r2types::FunctionRenderFacts,
+) -> HashMap<String, String> {
+    use r2types::CertifiedEntity;
+
+    let graph = prepared.graph();
+    let mirrored = prepared.memory_mirrored_carriers();
+    let reused = prepared.carriers_spanning_a_reuse();
+    let mut aliases = HashMap::new();
+    let mut taken = HashSet::new();
+    for carrier in render_facts.loop_carriers() {
+        let CertifiedEntity::LoopCarrier {
+            id,
+            header,
+            phi,
+            identity_values,
+            entries,
+            updates,
+            ..
+        } = carrier
+        else {
+            continue;
+        };
+        if mirrored.contains(id) || reused.contains(id) {
+            continue;
+        }
+        let Some(base) = graph
+            .value(*phi)
+            .map(|value| crate::analysis::utils::ssa_render_base_name(&value.var))
+        else {
+            continue;
+        };
+        // Two loops carrying the same register are two variables, so the second
+        // is told apart by the header it belongs to rather than merged into the first.
+        let name = if taken.insert(base.clone()) {
+            base
+        } else {
+            format!("{base}_{header:x}")
+        };
+        let members = identity_values
+            .iter()
+            .copied()
+            .chain(entries.iter().map(|edge| edge.value))
+            .chain(updates.iter().flat_map(|update| {
+                std::iter::once(update.value).chain(update.identity_values.iter().copied())
+            }));
+        for member in members {
+            let Some(var) = graph.value(member).map(|value| &value.var) else {
+                continue;
+            };
+            if var.is_const() {
+                continue;
+            }
+            aliases.insert(var.display_name(), name.clone());
+        }
+    }
+    aliases
+}

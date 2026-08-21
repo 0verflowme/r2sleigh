@@ -393,13 +393,30 @@ register is not a variable. Naming all its versions one C local does not merely
 add a dead declaration; it says two different values are one, which is worse than
 what it was fixing.
 
-No guard on naming can repair that, because the fault is upstream of naming: the
-carrier is real and the register is genuinely preserved. What is missing is the
-thing this whole decision is about. A location has to be the span over which a
-storage holds one value, not the storage itself, and until carriers are cut at
-the points where a register changes what it means, one name per carrier is
-unsound. Carrier naming therefore waits on the location model rather than on any
-further condition attached to itself.
+No guard on naming could repair that, because the fault was upstream of naming:
+the carrier is real and the register is genuinely preserved. What was missing is
+the thing this whole decision is about. A location has to be the span over which
+a storage holds one value, not the storage itself.
+
+That is now built. `StorageSpans` cuts each storage where it stops holding one
+value, by the rule the dataflow already carries: a definition reading the storage
+it writes continues what that storage held, and one reading none of its own
+values begins something new. `carriers_spanning_a_reuse` names the carriers that
+reach across such a cut, and naming skips them.
+
+With both guards in place the conflation is gone and the duplication it was
+built to remove goes with it. On arm64 `-O2` three assignments to `x0_2`, `x0_3`
+and `x0_4` become one `x0`; on x86-64 `-O2` the same happens to `rax_2` and
+`rax_3`; rendered output is thirteen lines shorter across the corpus and
+identical across repeated runs.
+
+One residual is recorded rather than hidden. At `-O0` a register that mirrors a
+frame slot still acquires a name in one function, because the mirror test asks
+whether a carrier's own values are loaded from a slot, and what is loaded is what
+the member is computed *from* rather than the member itself. The same shape
+defeated the first version of that test from the store side. It wants a short
+reachability walk instead of set membership, and it is a dead declaration rather
+than a wrong one.
 
 The renderer should shrink substantially once it stops re-deriving storage
 identity and liveness, though whether it does so on its own or needs deliberate

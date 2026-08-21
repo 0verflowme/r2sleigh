@@ -82,8 +82,15 @@ impl DecompilerFacts {
     }
 }
 
+/// No carrier is named for a caller that never had render facts to ask.
+pub(crate) fn no_carrier_aliases() -> &'static HashMap<String, String> {
+    static EMPTY: std::sync::OnceLock<HashMap<String, String>> = std::sync::OnceLock::new();
+    EMPTY.get_or_init(HashMap::new)
+}
+
 #[allow(dead_code)]
 #[derive(Clone)]
+
 pub(crate) struct PassEnv<'a> {
     pub(crate) ptr_size: u32,
     pub(crate) sp_name: &'a str,
@@ -103,6 +110,8 @@ pub(crate) struct PassEnv<'a> {
     pub(crate) summary_view: Option<&'a InterprocSummaryView>,
     pub(crate) arg_regs: &'a [String],
     pub(crate) param_register_aliases: &'a HashMap<String, String>,
+    /// One name per certified loop carrier, shared by every version it passes through.
+    pub(crate) carrier_aliases: &'a HashMap<String, String>,
     pub(crate) caller_saved_regs: &'a HashSet<String>,
     pub(crate) type_hints: &'a HashMap<String, CType>,
     pub(crate) type_oracle: Option<&'a dyn TypeOracle>,

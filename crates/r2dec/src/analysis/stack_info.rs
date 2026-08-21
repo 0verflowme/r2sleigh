@@ -640,6 +640,7 @@ mod tests {
         let strings = HashMap::new();
         let symbols = HashMap::new();
         let env = PassEnv {
+            carrier_aliases: crate::analysis::no_carrier_aliases(),
             string_literals: crate::analysis::lower::no_string_literals(),
             ptr_size: arch.ptr_size,
             sp_name: &arch.sp_name,
@@ -678,6 +679,7 @@ mod tests {
         let strings = HashMap::new();
         let symbols = HashMap::new();
         let env = PassEnv {
+            carrier_aliases: crate::analysis::no_carrier_aliases(),
             string_literals: crate::analysis::lower::no_string_literals(),
             ptr_size: arch.ptr_size,
             sp_name: &arch.sp_name,

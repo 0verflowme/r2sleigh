@@ -394,6 +394,15 @@ pub(crate) fn build_prepared_runtime_facts_with_control(
     let mut stack_info = StackInfo::default();
 
     seed_prepared_param_aliases(&mut use_info, blocks, env);
+    // Carriers name what nothing else has named. A value already answering to a
+    // parameter or a frame slot keeps that spelling, because the register it
+    // passes through is the least informative thing a reader could be told.
+    for (version, name) in env.carrier_aliases {
+        use_info
+            .var_aliases
+            .entry(version.clone())
+            .or_insert_with(|| name.clone());
+    }
     seed_prepared_stack_facts(&mut use_info, &mut stack_info, prepared, view);
     collect_prepared_runtime_facts(&mut use_info, &mut flag_info, blocks, env, prepared, view);
     pin_prepared_loop_carried_phi_values(&mut use_info, prepared, view);
@@ -4988,6 +4997,7 @@ mod tests {
         let caller_saved_regs = HashSet::new();
         let type_hints = HashMap::from([("result".to_string(), crate::ast::CType::u64())]);
         let env = PassEnv {
+            carrier_aliases: crate::analysis::no_carrier_aliases(),
             string_literals: crate::analysis::lower::no_string_literals(),
             ptr_size: 8,
             sp_name: "rsp",
@@ -5021,6 +5031,7 @@ mod tests {
         let caller_saved_regs = HashSet::from(["RCX".to_string()]);
         let type_hints: HashMap<String, crate::ast::CType> = HashMap::new();
         let env = PassEnv {
+            carrier_aliases: crate::analysis::no_carrier_aliases(),
             string_literals: crate::analysis::lower::no_string_literals(),
             ptr_size: 8,
             sp_name: "RSP",

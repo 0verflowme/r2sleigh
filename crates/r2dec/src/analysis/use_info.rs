@@ -139,6 +139,13 @@ fn analyze_with_definition_overrides_mode(
     scratch.info.type_hints = env.type_hints.clone();
     seed_local_value_ids(&mut scratch, blocks);
     seed_entry_param_aliases(&mut scratch, blocks, env);
+    for (version, name) in env.carrier_aliases {
+        scratch
+            .info
+            .var_aliases
+            .entry(version.clone())
+            .or_insert_with(|| name.clone());
+    }
 
     for block in blocks {
         control.poll()?;
@@ -8824,6 +8831,7 @@ mod tests {
 
         fn env(&self) -> PassEnv<'_> {
             PassEnv {
+                carrier_aliases: crate::analysis::no_carrier_aliases(),
                 string_literals: crate::analysis::lower::no_string_literals(),
                 ptr_size: 64,
                 sp_name: &self.sp_name,

@@ -191,6 +191,8 @@ pub(crate) struct FoldingContext<'a> {
     pub(crate) effect_render_proofs: std::cell::RefCell<Vec<EffectRenderProof>>,
     /// Blocks the fold walked, which is what expresses a merge standing at their head.
     pub(crate) folded_blocks: std::cell::RefCell<std::collections::BTreeSet<u64>>,
+    /// One name per certified loop carrier, derived once because it is settled once.
+    pub(crate) carrier_aliases: HashMap<String, String>,
     /// Op sites the fold dropped without recording that anything rendered them,
     /// keyed by why. An accounting of what the output owes reads these as debts
     /// it never paid, so knowing which are deliberate is what separates a
@@ -256,7 +258,14 @@ impl FoldArchConfig {
 
 impl<'a> FoldingContext<'a> {
     pub(crate) fn from_inputs(inputs: FoldInputs<'a>) -> Self {
+        let carrier_aliases = match (inputs.prepared_ssa, inputs.function_facts.render()) {
+            (Some(prepared), Some(render)) => {
+                crate::normalize::carrier_name_aliases(prepared, render)
+            }
+            _ => HashMap::new(),
+        };
         Self {
+            carrier_aliases,
             inputs,
             state: FoldState::default(),
             current_block_addr: Cell::new(None),
