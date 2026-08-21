@@ -677,7 +677,7 @@ impl<'a> FoldingContext<'a> {
                     && (!preserve_named_stack_owners || !target_is_named_stack_owner)
                     && (self.expr_is_pure(rhs) || dead_sleigh_memory_artifact);
                 let dead_flag_artifact =
-                    is_cpu_flag(&target_lower) && !target_has_live_use && self.expr_is_pure(rhs);
+                    self.inputs.arch.is_flag_name(&target_lower) && !target_has_live_use && self.expr_is_pure(rhs);
 
                 // A call is an event, so a statement carrying one can lose its
                 // target when nothing reads the result, but it can never be

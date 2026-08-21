@@ -3079,6 +3079,11 @@ impl Decompiler {
                 .unwrap_or_else(|| "rax".to_string()),
             arg_regs: self.config.arg_regs.clone(),
             caller_saved_regs: self.config.caller_saved_regs.clone(),
+            flag_regs: prepared
+                .machine_context()
+                .flag_register_names()
+                .into_iter()
+                .collect(),
         };
         let use_prepared_semantic_view = self.context.use_prepared_semantic_view(prepared);
         let prepared_semantic_view = use_prepared_semantic_view.then(|| {
@@ -5481,6 +5486,10 @@ mod tests {
 
     fn empty_fold_context_for_linearization<'a>() -> FoldingContext<'a> {
         let arch = Box::leak(Box::new(FoldArchConfig {
+            flag_regs: crate::fold::arch::X86_FLAG_REGISTERS
+                .iter()
+                .map(|name| (*name).to_string())
+                .collect(),
             ptr_size: 8,
             sp_name: "rsp".to_string(),
             fp_name: "rbp".to_string(),

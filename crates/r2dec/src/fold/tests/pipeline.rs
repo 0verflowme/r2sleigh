@@ -787,6 +787,10 @@ mod tests {
 
     fn make_aarch64_ctx<'a>() -> FoldingContext<'a> {
         let arch = Box::leak(Box::new(FoldArchConfig {
+            flag_regs: crate::fold::arch::X86_FLAG_REGISTERS
+                .iter()
+                .map(|name| (*name).to_string())
+                .collect(),
             ptr_size: 8,
             sp_name: "sp".to_string(),
             fp_name: "x29".to_string(),
@@ -835,6 +839,10 @@ mod tests {
 
     fn make_x86_64_ctx<'a>() -> FoldingContext<'a> {
         let arch = Box::leak(Box::new(FoldArchConfig {
+            flag_regs: crate::fold::arch::X86_FLAG_REGISTERS
+                .iter()
+                .map(|name| (*name).to_string())
+                .collect(),
             ptr_size: 8,
             sp_name: "rsp".to_string(),
             fp_name: "rbp".to_string(),
@@ -9740,14 +9748,18 @@ mod tests {
 
     #[test]
     fn test_prune_dead_temp_assignments_removes_dead_flag_artifacts() {
+        // The context is x86-64, so the flags are spelled the way that target
+        // spells them. This read tmpng and tmpzr, which are arm64 condition
+        // codes, and passed only because the flag test accepted every
+        // architecture's spellings at once.
         let ctx = FoldingContext::new(64);
         let stmts = vec![
             CStmt::Expr(CExpr::assign(
-                ctx.name_ref("tmpng_1"),
+                ctx.name_ref("sf_1"),
                 CExpr::binary(BinaryOp::Lt, ctx.name_ref("sp"), CExpr::IntLit(0)),
             )),
             CStmt::Expr(CExpr::assign(
-                ctx.name_ref("tmpzr_1"),
+                ctx.name_ref("zf_1"),
                 CExpr::binary(BinaryOp::Eq, ctx.name_ref("sp"), CExpr::IntLit(0)),
             )),
             CStmt::Return(Some(CExpr::Subscript {

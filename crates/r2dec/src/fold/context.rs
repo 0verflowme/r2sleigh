@@ -75,6 +75,8 @@ pub(crate) struct FoldArchConfig {
     pub(crate) ret_reg_name: String,
     pub(crate) arg_regs: Vec<String>,
     pub(crate) caller_saved_regs: HashSet<String>,
+    /// Registers that are condition codes, as the target's register file defines them.
+    pub(crate) flag_regs: HashSet<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -258,6 +260,10 @@ impl FoldArchConfig {
 
         Self {
             ptr_size,
+            flag_regs: crate::fold::arch::X86_FLAG_REGISTERS
+                .iter()
+                .map(|name| (*name).to_string())
+                .collect(),
             sp_name,
             fp_name,
             ret_reg_name,

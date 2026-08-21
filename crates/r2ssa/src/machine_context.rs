@@ -1085,6 +1085,30 @@ impl SourceMachineContext {
             .collect()
     }
 
+    /// The registers that are condition codes rather than storage.
+    ///
+    /// A flag is a one-byte register no wider register contains: nothing can be
+    /// written through it and nothing read out of it at another width. That is a
+    /// fact about the register file, so it holds for any architecture, unlike
+    /// the list of spellings this replaces.
+    pub fn flag_register_names(&self) -> Vec<String> {
+        self.register_storages_by_name
+            .iter()
+            .filter(|(_, storage)| {
+                storage.space == CanonicalStorageSpace::Register && storage.size == 1
+            })
+            .filter(|(_, storage)| {
+                !self.register_storages_by_name.values().any(|other| {
+                    other.space == CanonicalStorageSpace::Register
+                        && other.size > 1
+                        && other.offset <= storage.offset
+                        && storage.offset < other.offset + u64::from(other.size)
+                })
+            })
+            .map(|(name, _)| name.clone())
+            .collect()
+    }
+
     /// The name the architecture gives this storage, when it names it exactly.
     pub fn register_name(&self, storage: CanonicalStorageId) -> Option<String> {
         self.register_storages_by_name

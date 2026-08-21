@@ -3168,7 +3168,7 @@ impl<'a> FoldingContext<'a> {
             return true;
         }
 
-        if is_cpu_flag(&var_name.to_lowercase()) {
+        if self.inputs.arch.is_flag_name(var_name) {
             return true;
         }
 
@@ -3193,7 +3193,7 @@ impl<'a> FoldingContext<'a> {
             | CExpr::StringLit(_)
             | CExpr::CharLit(_) => true,
             CExpr::Var(name) => {
-                if is_cpu_flag(&self.spelling(*name).to_lowercase()) {
+                if self.inputs.arch.is_flag_name(&self.spelling(*name)) {
                     return true;
                 }
                 self.definition_for_symbol(*name)
@@ -3226,7 +3226,7 @@ impl<'a> FoldingContext<'a> {
     pub(crate) fn dead_value_reason(&self, var: &SSAVar) -> &'static str {
         let key = var.display_name();
         let lower = var.name.to_lowercase();
-        if is_cpu_flag(&lower) {
+        if self.inputs.arch.is_flag_name(&lower) {
             return "dead-cpu-flag";
         }
         if self.flag_only_values_set().contains(&key) {
@@ -3257,7 +3257,7 @@ impl<'a> FoldingContext<'a> {
         let lower = var.name.to_lowercase();
 
         // Flag registers are rendering artifacts; keep them out of emitted code.
-        if is_cpu_flag(&lower) {
+        if self.inputs.arch.is_flag_name(&lower) {
             return true;
         }
 
@@ -8870,7 +8870,7 @@ impl<'a> FoldingContext<'a> {
         }
 
         let lower = name.to_ascii_lowercase();
-        if is_cpu_flag(&lower) {
+        if self.inputs.arch.is_flag_name(&lower) {
             return true;
         }
 
