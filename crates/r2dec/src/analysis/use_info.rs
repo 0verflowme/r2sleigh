@@ -10874,7 +10874,7 @@ mod tests {
         ));
         assert!(matches!(
             semantic_or_scalar_source_value(&symbols, &info, "value_0"),
-            Some(SemanticValue::Scalar(ScalarValue::Expr(CExpr::Var(name)))) if name == symbols.borrow_mut().declare_or_reuse("value")
+            Some(SemanticValue::Scalar(ScalarValue::Expr(CExpr::Var(name)))) if name == crate::symbol::declare(&symbols, "value")
         ));
         assert!(matches!(
             semantic_or_scalar_source_value(&symbols, &info, "const:1_0"),

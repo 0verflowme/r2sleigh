@@ -5166,7 +5166,7 @@ mod tests {
         ));
         assert!(is_self_render_definition(&symbols, 
             &dst,
-            &CExpr::Var(symbols.borrow_mut().declare_or_reuse(&dst.display_name()))
+            &CExpr::Var(crate::symbol::declare(&symbols, &dst.display_name()))
         ));
         assert!(!is_self_render_definition(&symbols, 
             &dst,

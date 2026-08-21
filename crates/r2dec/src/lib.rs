@@ -1960,7 +1960,7 @@ fn merge_params_with_external_signature(symbols: &std::cell::RefCell<crate::symb
             let fallback_name = format!("arg{idx}");
             let mut param = recovered_params.get(idx).cloned().unwrap_or(ast::CParam {
                 ty: CType::Int(32),
-                name: symbols.borrow_mut().declare_or_reuse(&fallback_name),
+                name: crate::symbol::declare(&symbols, &fallback_name),
             });
 
             if let Some(ext) = signature.params.get(idx) {
@@ -3017,7 +3017,7 @@ impl Decompiler {
                                 type_like_to_ctype(&type_inference.get_type(&v.ssa_var))
                             })
                             .unwrap_or_else(|| v.ty.clone()),
-                        name: symbols.borrow_mut().declare_or_reuse(&v.name),
+                        name: crate::symbol::declare(&symbols, &v.name),
                     },
                 )
             })
@@ -3207,7 +3207,7 @@ impl Decompiler {
                             .unwrap_or_else(|| v.ty.clone()),
                         runtime_type_hint_for_name(&type_hints, &v.name),
                     ),
-                    name: symbols.borrow_mut().declare_or_reuse(&v.name),
+                    name: crate::symbol::declare(&symbols, &v.name),
                     stack_offset: v.stack_offset,
                 })
                 .collect()
@@ -3237,7 +3237,7 @@ impl Decompiler {
                             .unwrap_or_else(|| v.ty.clone()),
                         runtime_type_hint_for_name(&type_hints, &v.name),
                     ),
-                    name: symbols.borrow_mut().declare_or_reuse(&v.name),
+                    name: crate::symbol::declare(&symbols, &v.name),
                     stack_offset: v.stack_offset,
                 })
                 .collect::<Vec<_>>();
@@ -3718,7 +3718,7 @@ fn resolve_undeclared_carriers(symbols: &std::cell::RefCell<crate::symbol::Symbo
             continue;
         }
         let ty = fold_ctx.declared_type_for_carrier(&name, &value);
-        let name = symbols.borrow_mut().declare_or_reuse(&name);
+        let name = crate::symbol::declare(&symbols, &name);
         func.locals.push(ast::CLocal {
             ty,
             name,
@@ -5349,7 +5349,7 @@ mod tests {
             crate::symbol::var_ref(&symbols, "local_4"),
             crate::symbol::var_ref(&symbols, "local_4"),
         ));
-        substitute_var_in_stmt(&mut stmt, symbols.borrow_mut().declare_or_reuse("local_4"), &CExpr::IntLit(1));
+        substitute_var_in_stmt(&mut stmt, crate::symbol::declare(&symbols, "local_4"), &CExpr::IntLit(1));
         assert_eq!(
             stmt,
             CStmt::Expr(CExpr::assign(
@@ -5367,7 +5367,7 @@ mod tests {
             crate::symbol::var_ref(&symbols, "local_4"),
             crate::symbol::var_ref(&symbols, "local_4"),
         ));
-        substitute_var_in_stmt(&mut stmt, symbols.borrow_mut().declare_or_reuse("local_4"), &CExpr::IntLit(1));
+        substitute_var_in_stmt(&mut stmt, crate::symbol::declare(&symbols, "local_4"), &CExpr::IntLit(1));
         assert_eq!(
             stmt,
             CStmt::Expr(CExpr::binary(
@@ -5652,11 +5652,11 @@ mod tests {
         let params = vec![
             ast::CParam {
                 ty: CType::Pointer(Box::new(CType::Int(32))),
-                name: symbols.borrow_mut().declare_or_reuse("arr"),
+                name: crate::symbol::declare(&symbols, "arr"),
             },
             ast::CParam {
                 ty: CType::Int(32),
-                name: symbols.borrow_mut().declare_or_reuse("len"),
+                name: crate::symbol::declare(&symbols, "len"),
             },
         ];
         let register_params = vec![
@@ -5856,15 +5856,15 @@ mod tests {
         let recovered = vec![
             ast::CParam {
                 ty: CType::Int(32),
-                name: symbols.borrow_mut().declare_or_reuse("arg1"),
+                name: crate::symbol::declare(&symbols, "arg1"),
             },
             ast::CParam {
                 ty: CType::Int(32),
-                name: symbols.borrow_mut().declare_or_reuse("arg2"),
+                name: crate::symbol::declare(&symbols, "arg2"),
             },
             ast::CParam {
                 ty: CType::Int(32),
-                name: symbols.borrow_mut().declare_or_reuse("arg3"),
+                name: crate::symbol::declare(&symbols, "arg3"),
             },
         ];
         let signature = signature_spec(
@@ -5881,8 +5881,8 @@ mod tests {
             2,
             "typed/named external signature should be authoritative for the visible header"
         );
-        assert_eq!(params[0].name, symbols.borrow_mut().declare_or_reuse("src"));
-        assert_eq!(params[1].name, symbols.borrow_mut().declare_or_reuse("len"));
+        assert_eq!(params[0].name, crate::symbol::declare(&symbols, "src"));
+        assert_eq!(params[1].name, crate::symbol::declare(&symbols, "len"));
         assert!(matches!(params[1].ty, CType::UInt(64)));
     }
 
@@ -5892,15 +5892,15 @@ mod tests {
         let recovered = vec![
             ast::CParam {
                 ty: CType::Int(32),
-                name: symbols.borrow_mut().declare_or_reuse("arg1"),
+                name: crate::symbol::declare(&symbols, "arg1"),
             },
             ast::CParam {
                 ty: CType::Int(32),
-                name: symbols.borrow_mut().declare_or_reuse("arg2"),
+                name: crate::symbol::declare(&symbols, "arg2"),
             },
             ast::CParam {
                 ty: CType::Int(32),
-                name: symbols.borrow_mut().declare_or_reuse("arg3"),
+                name: crate::symbol::declare(&symbols, "arg3"),
             },
         ];
         let signature = signature_spec(None, vec![("arg1", None), ("arg2", None)]);
@@ -5912,7 +5912,7 @@ mod tests {
             "certified signature arity must be the visible header authority even when generic"
         );
         assert!(
-            params.iter().all(|param| param.name != symbols.borrow_mut().declare_or_reuse("arg3")),
+            params.iter().all(|param| param.name != crate::symbol::declare(&symbols, "arg3")),
             "local recovery must not append surplus header params beyond FunctionFacts signature"
         );
     }
@@ -5930,8 +5930,8 @@ mod tests {
 
         let params = merge_params_with_external_signature(&symbols, Vec::new(), Some(&signature));
         assert_eq!(params.len(), 2);
-        assert_eq!(params[0].name, symbols.borrow_mut().declare_or_reuse("buf"));
-        assert_eq!(params[1].name, symbols.borrow_mut().declare_or_reuse("count"));
+        assert_eq!(params[0].name, crate::symbol::declare(&symbols, "buf"));
+        assert_eq!(params[1].name, crate::symbol::declare(&symbols, "count"));
     }
 
     #[test]
@@ -5939,12 +5939,12 @@ mod tests {
         let symbols = test_table();
         let mut func = CFunction::new("carrier", CType::Int(32)).with_body(vec![CStmt::if_stmt(
             CExpr::IntLit(1),
-            CStmt::Return(Some(CExpr::cast(CType::Int(64), CExpr::var(symbols.borrow_mut().declare_or_reuse("result"))))),
+            CStmt::Return(Some(CExpr::cast(CType::Int(64), CExpr::var(crate::symbol::declare(&symbols, "result"))))),
             None,
         )]);
         func.locals.push(ast::CLocal {
             ty: CType::Int(32),
-            name: symbols.borrow_mut().declare_or_reuse("result"),
+            name: crate::symbol::declare(&symbols, "result"),
             stack_offset: None,
         });
 
@@ -5963,29 +5963,29 @@ mod tests {
         let mut func = CFunction::new("typed_assignments", CType::Int(32)).with_body(vec![
             CStmt::Expr(CExpr::binary(
                 BinaryOp::Assign,
-                CExpr::var(symbols.borrow_mut().declare_or_reuse("signed_value")),
+                CExpr::var(crate::symbol::declare(&symbols, "signed_value")),
                 CExpr::UIntLit(0xffff_ffff),
             )),
             CStmt::Expr(CExpr::binary(
                 BinaryOp::Assign,
-                CExpr::var(symbols.borrow_mut().declare_or_reuse("unsigned_value")),
+                CExpr::var(crate::symbol::declare(&symbols, "unsigned_value")),
                 CExpr::UIntLit(0xffff_ffff),
             )),
             CStmt::Expr(CExpr::binary(
                 BinaryOp::Assign,
-                CExpr::var(symbols.borrow_mut().declare_or_reuse("signed_value")),
+                CExpr::var(crate::symbol::declare(&symbols, "signed_value")),
                 CExpr::binary(BinaryOp::Add, CExpr::UIntLit(0xffff_ffff), CExpr::IntLit(1)),
             )),
         ]);
         func.locals = vec![
             ast::CLocal {
                 ty: CType::Int(32),
-                name: symbols.borrow_mut().declare_or_reuse("signed_value"),
+                name: crate::symbol::declare(&symbols, "signed_value"),
                 stack_offset: Some(-4),
             },
             ast::CLocal {
                 ty: CType::UInt(32),
-                name: symbols.borrow_mut().declare_or_reuse("unsigned_value"),
+                name: crate::symbol::declare(&symbols, "unsigned_value"),
                 stack_offset: Some(-8),
             },
         ];
@@ -6016,16 +6016,16 @@ mod tests {
     fn unreferenced_local_declaration_is_removed_without_touching_live_locals() {
         let symbols = test_table();
         let mut func = CFunction::new("locals", CType::Int(32))
-            .with_body(vec![CStmt::Return(Some(CExpr::var(symbols.borrow_mut().declare_or_reuse("live"))))]);
+            .with_body(vec![CStmt::Return(Some(CExpr::var(crate::symbol::declare(&symbols, "live"))))]);
         func.locals = vec![
             ast::CLocal {
                 ty: CType::Int(32),
-                name: symbols.borrow_mut().declare_or_reuse("dead_return_slot"),
+                name: crate::symbol::declare(&symbols, "dead_return_slot"),
                 stack_offset: Some(-4),
             },
             ast::CLocal {
                 ty: CType::Int(32),
-                name: symbols.borrow_mut().declare_or_reuse("live"),
+                name: crate::symbol::declare(&symbols, "live"),
                 stack_offset: Some(-8),
             },
         ];
@@ -9998,7 +9998,7 @@ mod tests {
             params_known: true,
             locals: Vec::new(),
             body: vec![CStmt::Expr(CExpr::call(
-                CExpr::var(symbols.borrow_mut().declare_or_reuse("sym.rpl_mbrtoc32")),
+                CExpr::var(crate::symbol::declare(&symbols, "sym.rpl_mbrtoc32")),
                 Vec::new(),
             ))],
         };
@@ -10050,7 +10050,7 @@ mod tests {
             params_known: true,
             locals: Vec::new(),
             body: vec![CStmt::Expr(CExpr::call(
-                CExpr::var(symbols.borrow_mut().declare_or_reuse("summary_worker")),
+                CExpr::var(crate::symbol::declare(&symbols, "summary_worker")),
                 Vec::new(),
             ))],
         };

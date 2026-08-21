@@ -515,7 +515,7 @@ mod tests {
     fn call(name: &str) -> CExpr {
         let symbols = test_table();
         CExpr::Call {
-            func: Box::new(CExpr::Var(symbols.borrow_mut().declare_or_reuse(&name.to_string()))),
+            func: Box::new(CExpr::Var(crate::symbol::declare(&symbols, &name.to_string()))),
             args: vec![CExpr::IntLit(16)],
         }
     }
@@ -524,7 +524,7 @@ mod tests {
         let symbols = test_table();
         CStmt::Expr(CExpr::Binary {
             op: BinaryOp::Assign,
-            left: Box::new(CExpr::Var(symbols.borrow_mut().declare_or_reuse(&target.to_string()))),
+            left: Box::new(CExpr::Var(crate::symbol::declare(&symbols, &target.to_string()))),
             right: Box::new(value),
         })
     }
@@ -632,7 +632,7 @@ mod tests {
             ]
         );
         assert_eq!(func.locals.len(), 1);
-        assert_eq!(func.locals[0].name, symbols.borrow_mut().declare_or_reuse("fcn_1000_result"));
+        assert_eq!(func.locals[0].name, crate::symbol::declare(&symbols, "fcn_1000_result"));
     }
 
     #[test]
@@ -641,7 +641,7 @@ mod tests {
         let arm = |target: &str| {
             Box::new(CStmt::Block(vec![
                 assign(target, call("fcn.1000")),
-                CStmt::Return(Some(CExpr::Var(symbols.borrow_mut().declare_or_reuse(&target.to_string())))),
+                CStmt::Return(Some(CExpr::Var(crate::symbol::declare(&symbols, &target.to_string())))),
             ]))
         };
         let mut func = function(vec![CStmt::If {

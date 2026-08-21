@@ -1174,18 +1174,18 @@ mod tests {
             params: vec![
                 CParam {
                     ty: CType::i32(),
-                    name: symbols.borrow_mut().declare_or_reuse("a"),
+                    name: crate::symbol::declare(&symbols, "a"),
                 },
                 CParam {
                     ty: CType::i32(),
-                    name: symbols.borrow_mut().declare_or_reuse("b"),
+                    name: crate::symbol::declare(&symbols, "b"),
                 },
             ],
             locals: vec![],
             body: vec![CStmt::Return(Some(CExpr::binary(
                 BinaryOp::Add,
-                CExpr::var(symbols.borrow_mut().declare_or_reuse("a")),
-                CExpr::var(symbols.borrow_mut().declare_or_reuse("b")),
+                CExpr::var(crate::symbol::declare(&symbols, "a")),
+                CExpr::var(crate::symbol::declare(&symbols, "b")),
             )))],
             params_known: true,
         };
@@ -1199,7 +1199,7 @@ mod tests {
     fn test_generate_if_else() {
         let symbols = test_table();
         let stmt = CStmt::if_stmt(
-            CExpr::binary(BinaryOp::Gt, CExpr::var(symbols.borrow_mut().declare_or_reuse("x")), CExpr::int(0)),
+            CExpr::binary(BinaryOp::Gt, CExpr::var(crate::symbol::declare(&symbols, "x")), CExpr::int(0)),
             CStmt::ret(Some(CExpr::int(1))),
             Some(CStmt::ret(Some(CExpr::int(0)))),
         );
@@ -1217,10 +1217,10 @@ mod tests {
     fn test_generate_while_loop() {
         let symbols = test_table();
         let stmt = CStmt::while_loop(
-            CExpr::binary(BinaryOp::Lt, CExpr::var(symbols.borrow_mut().declare_or_reuse("i")), CExpr::int(10)),
+            CExpr::binary(BinaryOp::Lt, CExpr::var(crate::symbol::declare(&symbols, "i")), CExpr::int(10)),
             CStmt::expr(CExpr::binary(
                 BinaryOp::AddAssign,
-                CExpr::var(symbols.borrow_mut().declare_or_reuse("i")),
+                CExpr::var(crate::symbol::declare(&symbols, "i")),
                 CExpr::int(1),
             )),
         );
@@ -1239,7 +1239,7 @@ mod tests {
         assert_eq!(
             codegen.generate_expr(&CExpr::binary(
                 BinaryOp::AddAssign,
-                CExpr::var(symbols.borrow_mut().declare_or_reuse("i")),
+                CExpr::var(crate::symbol::declare(&symbols, "i")),
                 CExpr::int(1),
             )),
             "i += 1"
@@ -1248,7 +1248,7 @@ mod tests {
             codegen
                 .generate_stmt(&CStmt::expr(CExpr::binary(
                     BinaryOp::AddAssign,
-                    CExpr::var(symbols.borrow_mut().declare_or_reuse("i")),
+                    CExpr::var(crate::symbol::declare(&symbols, "i")),
                     CExpr::int(1),
                 )))
                 .contains("i++;")
@@ -1280,8 +1280,8 @@ mod tests {
         // a + b * c should not need parens around b * c
         let expr = CExpr::binary(
             BinaryOp::Add,
-            CExpr::var(symbols.borrow_mut().declare_or_reuse("a")),
-            CExpr::binary(BinaryOp::Mul, CExpr::var(symbols.borrow_mut().declare_or_reuse("b")), CExpr::var(symbols.borrow_mut().declare_or_reuse("c"))),
+            CExpr::var(crate::symbol::declare(&symbols, "a")),
+            CExpr::binary(BinaryOp::Mul, CExpr::var(crate::symbol::declare(&symbols, "b")), CExpr::var(crate::symbol::declare(&symbols, "c"))),
         );
         let code = codegen.generate_expr(&expr);
         assert_eq!(code, "a + b * c");
@@ -1290,8 +1290,8 @@ mod tests {
         codegen.output.clear();
         let expr = CExpr::binary(
             BinaryOp::Mul,
-            CExpr::binary(BinaryOp::Add, CExpr::var(symbols.borrow_mut().declare_or_reuse("a")), CExpr::var(symbols.borrow_mut().declare_or_reuse("b"))),
-            CExpr::var(symbols.borrow_mut().declare_or_reuse("c")),
+            CExpr::binary(BinaryOp::Add, CExpr::var(crate::symbol::declare(&symbols, "a")), CExpr::var(crate::symbol::declare(&symbols, "b"))),
+            CExpr::var(crate::symbol::declare(&symbols, "c")),
         );
         let code = codegen.generate_expr(&expr);
         assert_eq!(code, "(a + b) * c");
@@ -1302,12 +1302,12 @@ mod tests {
         let symbols = test_table();
         let mut codegen = CodeGenerator::new(CodeGenConfig::default());
 
-        let expr = CExpr::binary(BinaryOp::Add, CExpr::var(symbols.borrow_mut().declare_or_reuse("stack_8")), CExpr::int(-8));
+        let expr = CExpr::binary(BinaryOp::Add, CExpr::var(crate::symbol::declare(&symbols, "stack_8")), CExpr::int(-8));
         assert_eq!(codegen.generate_expr(&expr), "stack_8 - 8");
 
         let expr = CExpr::binary(
             BinaryOp::Sub,
-            CExpr::var(symbols.borrow_mut().declare_or_reuse("rsp")),
+            CExpr::var(crate::symbol::declare(&symbols, "rsp")),
             CExpr::uint(0xffffffffffffffb8),
         );
         assert_eq!(codegen.generate_expr(&expr), "rsp + 0x48");
@@ -1320,15 +1320,15 @@ mod tests {
 
         let expr = CExpr::binary(
             BinaryOp::Add,
-            CExpr::var(symbols.borrow_mut().declare_or_reuse("a")),
-            CExpr::binary(BinaryOp::Mul, CExpr::var(symbols.borrow_mut().declare_or_reuse("b")), CExpr::int(-1)),
+            CExpr::var(crate::symbol::declare(&symbols, "a")),
+            CExpr::binary(BinaryOp::Mul, CExpr::var(crate::symbol::declare(&symbols, "b")), CExpr::int(-1)),
         );
         assert_eq!(codegen.generate_expr(&expr), "a - b");
 
         let expr = CExpr::binary(
             BinaryOp::Add,
-            CExpr::var(symbols.borrow_mut().declare_or_reuse("a")),
-            CExpr::binary(BinaryOp::Mul, CExpr::var(symbols.borrow_mut().declare_or_reuse("b")), CExpr::int(-4)),
+            CExpr::var(crate::symbol::declare(&symbols, "a")),
+            CExpr::binary(BinaryOp::Mul, CExpr::var(crate::symbol::declare(&symbols, "b")), CExpr::int(-4)),
         );
         assert_eq!(codegen.generate_expr(&expr), "a - b * 4");
     }
@@ -1361,12 +1361,12 @@ mod tests {
             locals: vec![
                 CLocal {
                     ty: CType::i32(),
-                    name: symbols.borrow_mut().declare_or_reuse("x"),
+                    name: crate::symbol::declare(&symbols, "x"),
                     stack_offset: Some(-8),
                 },
                 CLocal {
                     ty: CType::ptr(CType::i8()),
-                    name: symbols.borrow_mut().declare_or_reuse("p"),
+                    name: crate::symbol::declare(&symbols, "p"),
                     stack_offset: Some(-16),
                 },
             ],
@@ -1384,16 +1384,16 @@ mod tests {
         let symbols = test_table();
         let func = CFunction::new("updates", CType::Void).with_body(vec![
             CStmt::expr(CExpr::assign(
-                CExpr::var(symbols.borrow_mut().declare_or_reuse("acc")),
-                CExpr::binary(BinaryOp::Add, CExpr::var(symbols.borrow_mut().declare_or_reuse("acc")), CExpr::int(3)),
+                CExpr::var(crate::symbol::declare(&symbols, "acc")),
+                CExpr::binary(BinaryOp::Add, CExpr::var(crate::symbol::declare(&symbols, "acc")), CExpr::int(3)),
             )),
             CStmt::expr(CExpr::assign(
-                CExpr::var(symbols.borrow_mut().declare_or_reuse("acc")),
-                CExpr::binary(BinaryOp::Add, CExpr::int(4), CExpr::var(symbols.borrow_mut().declare_or_reuse("acc"))),
+                CExpr::var(crate::symbol::declare(&symbols, "acc")),
+                CExpr::binary(BinaryOp::Add, CExpr::int(4), CExpr::var(crate::symbol::declare(&symbols, "acc"))),
             )),
             CStmt::expr(CExpr::assign(
-                CExpr::var(symbols.borrow_mut().declare_or_reuse("acc")),
-                CExpr::binary(BinaryOp::Sub, CExpr::var(symbols.borrow_mut().declare_or_reuse("acc")), CExpr::int(2)),
+                CExpr::var(crate::symbol::declare(&symbols, "acc")),
+                CExpr::binary(BinaryOp::Sub, CExpr::var(crate::symbol::declare(&symbols, "acc")), CExpr::int(2)),
             )),
             CStmt::Return(None),
         ]);
@@ -1412,17 +1412,17 @@ mod tests {
         let symbols = test_table();
         let func = CFunction::new("updates", CType::Void).with_body(vec![
             CStmt::expr(CExpr::assign(
-                CExpr::var(symbols.borrow_mut().declare_or_reuse("acc")),
-                CExpr::binary(BinaryOp::Add, CExpr::var(symbols.borrow_mut().declare_or_reuse("acc")), CExpr::int(1)),
+                CExpr::var(crate::symbol::declare(&symbols, "acc")),
+                CExpr::binary(BinaryOp::Add, CExpr::var(crate::symbol::declare(&symbols, "acc")), CExpr::int(1)),
             )),
-            CStmt::expr(CExpr::call(CExpr::var(symbols.borrow_mut().declare_or_reuse("observe")), vec![CExpr::var(symbols.borrow_mut().declare_or_reuse("acc"))])),
+            CStmt::expr(CExpr::call(CExpr::var(crate::symbol::declare(&symbols, "observe")), vec![CExpr::var(crate::symbol::declare(&symbols, "acc"))])),
             CStmt::expr(CExpr::assign(
-                CExpr::var(symbols.borrow_mut().declare_or_reuse("acc")),
-                CExpr::binary(BinaryOp::Add, CExpr::var(symbols.borrow_mut().declare_or_reuse("acc")), CExpr::int(2)),
+                CExpr::var(crate::symbol::declare(&symbols, "acc")),
+                CExpr::binary(BinaryOp::Add, CExpr::var(crate::symbol::declare(&symbols, "acc")), CExpr::int(2)),
             )),
             CStmt::expr(CExpr::assign(
-                CExpr::var(symbols.borrow_mut().declare_or_reuse("acc")),
-                CExpr::binary(BinaryOp::Add, CExpr::var(symbols.borrow_mut().declare_or_reuse("acc")), CExpr::int(3)),
+                CExpr::var(crate::symbol::declare(&symbols, "acc")),
+                CExpr::binary(BinaryOp::Add, CExpr::var(crate::symbol::declare(&symbols, "acc")), CExpr::int(3)),
             )),
         ]);
 

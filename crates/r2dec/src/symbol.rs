@@ -427,7 +427,16 @@ mod reuse_tests {
 /// them, so it mints here rather than handing spellings forward for a later
 /// layer to declare. A candidate that is dropped costs one unused table entry.
 pub fn var_ref(symbols: &RefCell<SymbolTable>, name: impl AsRef<str>) -> CExpr {
-    CExpr::Var(symbols.borrow_mut().declare_or_reuse(name.as_ref()))
+    CExpr::Var(crate::symbol::declare(&symbols, name.as_ref()))
+}
+
+/// Declare this spelling, or return the identifier it already has.
+///
+/// The borrow ends when this returns, so two declarations may appear in one
+/// statement. Writing `borrow_mut()` inline holds the guard to the end of the
+/// statement instead, and a second declaration there deadlocks.
+pub fn declare(symbols: &RefCell<SymbolTable>, name: impl AsRef<str>) -> SymbolId {
+    symbols.borrow_mut().declare_or_reuse(name.as_ref())
 }
 
 /// How a reference is spelled, for code that holds the table rather than a self.

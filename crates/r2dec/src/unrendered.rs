@@ -186,14 +186,14 @@ mod tests {
                 .into_iter()
                 .map(|name| CParam {
                     ty: CType::Int(32),
-                    name: symbols.borrow_mut().declare_or_reuse(&name.to_string()),
+                    name: crate::symbol::declare(&symbols, &name.to_string()),
                 })
                 .collect(),
             locals: locals
                 .into_iter()
                 .map(|name| CLocal {
                     ty: CType::Int(32),
-                    name: symbols.borrow_mut().declare_or_reuse(&name.to_string()),
+                    name: crate::symbol::declare(&symbols, &name.to_string()),
                     stack_offset: None,
                 })
                 .collect(),
@@ -238,7 +238,7 @@ mod tests {
             vec![
                 CStmt::Decl {
                     ty: CType::UInt(32),
-                    name: symbols.borrow_mut().declare_or_reuse("tmp:regalias:7c0:2d:0"),
+                    name: crate::symbol::declare(&symbols, "tmp:regalias:7c0:2d:0"),
                     init: Some(CExpr::IntLit(0)),
                 },
                 CStmt::Return(Some(crate::symbol::var_ref(&symbols, "tmp:regalias:7c0:2d:0"))),
@@ -270,7 +270,7 @@ mod tests {
             vec![
                 CStmt::Decl {
                     ty: CType::UInt(32),
-                    name: symbols.borrow_mut().declare_or_reuse("tmp:total"),
+                    name: crate::symbol::declare(&symbols, "tmp:total"),
                     init: Some(CExpr::IntLit(0)),
                 },
                 CStmt::Return(Some(crate::symbol::var_ref(&symbols, "total"))),

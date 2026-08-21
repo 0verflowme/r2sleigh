@@ -717,19 +717,19 @@ mod tests {
             String::from("tmp:11f80_2"),
             CExpr::binary(
                 BinaryOp::Add,
-                CExpr::Var(symbols.borrow_mut().declare_or_reuse("sp_2")),
+                CExpr::Var(crate::symbol::declare(&symbols, "sp_2")),
                 CExpr::IntLit(0x3e0),
             ),
         );
         definitions.insert(
             String::from("x8_1"),
-            CExpr::Var(symbols.borrow_mut().declare_or_reuse("tmp:11f80_2")),
+            CExpr::Var(crate::symbol::declare(&symbols, "tmp:11f80_2")),
         );
         definitions.insert(
             String::from("tmp:6500_2"),
             CExpr::binary(
                 BinaryOp::Add,
-                CExpr::Var(symbols.borrow_mut().declare_or_reuse("x8_1")),
+                CExpr::Var(crate::symbol::declare(&symbols, "x8_1")),
                 CExpr::IntLit(0x160),
             ),
         );

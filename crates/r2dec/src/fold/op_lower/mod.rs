@@ -1848,7 +1848,7 @@ impl<'a> FoldingContext<'a> {
     ///
     /// One statement, so the borrow never spans a nested build.
     pub(crate) fn sym(&self, name: &str) -> crate::symbol::SymbolId {
-        self.symbols.borrow_mut().declare_or_reuse(name)
+        crate::symbol::declare(&self.symbols, name)
     }
 
     /// A reference to the name this value renders as.

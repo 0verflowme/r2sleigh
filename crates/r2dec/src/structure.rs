@@ -6105,7 +6105,7 @@ mod tests {
                         operand: Box::new(v(&symbols, "i")),
                     }),
                     CStmt::Decl {
-                        name: symbols.borrow_mut().declare_or_reuse("tmp:11f00_4"),
+                        name: crate::symbol::declare(&symbols, "tmp:11f00_4"),
                         ty: CType::i32(),
                         init: Some(CExpr::Deref(Box::new(CExpr::binary(
                             BinaryOp::Add,
