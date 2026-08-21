@@ -5779,7 +5779,8 @@ mod tests {
 
     #[test]
     fn test_final_function_body_prune_removes_late_dead_sleigh_temps() {
-        let symbols = test_table();
+        let ctx = FoldingContext::new(64);
+        let symbols = &ctx.symbols;
         let mut func = CFunction {
             name: "late_prune".to_string(),
             ret_type: CType::i64(),
@@ -5825,9 +5826,8 @@ mod tests {
                 )),
                 CStmt::Return(Some(crate::symbol::var_ref(&symbols, "x0_5"))),
             ],
-            symbols,
+            symbols: std::cell::RefCell::new(symbols.borrow().clone()),
         };
-        let ctx = FoldingContext::new(64);
 
         prune_dead_temp_assignments_in_function_body(&mut func, &ctx);
 
@@ -5990,6 +5990,7 @@ mod tests {
                 stack_offset: Some(-8),
             },
         ];
+        func.symbols = symbols;
 
         normalize_declared_assignment_literals(&mut func);
 
