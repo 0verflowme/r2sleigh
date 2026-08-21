@@ -522,3 +522,60 @@ rendered spelling. A backtrace from inside the lookup, gated on the name not
 being a key of `definitions`, will name it in one run. Then the identity-keyed
 lookup above can be re-landed with a case that proves it.
 
+### Both causes traced, one fixed
+
+A backtrace from inside the lookup named the caller that asks with a rendered
+spelling:
+
+    3: definition_for_name
+    4: is_simple_expr        mod.rs:3181
+    6: should_inline         mod.rs:3116
+    7: emitted_var_names     mod.rs:2000
+
+`is_simple_expr` was already one of the nine converted sites. It stayed broken
+because the identifier reaching it was never minted through `var_ref`:
+`assignment_lhs_expr` builds the rendered spelling by hand and mints through
+`name_ref`, which drops the SSA identity. The earlier "inert" reading was an
+instrumentation artefact -- the probe only printed where an SSA name had been
+recorded, so every site that recorded nothing was silent.
+
+With every mint site carrying the value it renders, the lookup resolves, and
+`is_simple_expr` stops treating an unresolvable name as simple. That alone made
+`sym._xor_lanes` worse on the page, 27 undefined names to 36, because reads that
+were always dangling stopped being hidden inside inlined expressions.
+
+Cause two was then fixed at its origin. `RegisterFamilyInfo::member_for` looked
+membership up **by name**, in a `HashMap<String, RegisterFamilyMember>`, while
+the families themselves are built by union-find over overlapping storage ranges.
+A varnode the architecture does not name -- spelled `reg:5084` from its offset --
+therefore had no family, the alias repair pass skipped it, and its reads had no
+reaching definition. Membership is a fact about storage, so it now falls back to
+a sorted range index. `sym._xor_lanes` on arm64 went from 36 undefined names to
+none, and the expressions built from them went with them.
+
+### Composing tiled definitions was tried and reverted
+
+What remains on x86 is a read wider than any single definition but covered by
+several: `XMM0_Da` through `XMM0_Dd` are each defined, a 16-byte read of `XMM1`
+is covered by all four, and `family_root_slice_for_range` requires one
+containing definition. Its comment states the reason -- combining fragments
+would invent a wide value without an explicit `Piece`.
+
+Building that `Piece` chain (`family_root_tiles_for_range` plus a composer
+emitting `Subpiece` per tile and folding them little-endian) compiles and is
+architecturally the right shape, but it regressed every measurement:
+
+    x86  sym._xor_lanes   3 -> 21 undefined,   78 -> 222 obligations
+    arm64 sym._xor_lanes  0 -> 47 undefined,  105 -> 681 obligations
+
+It fires on every read the slice resolver previously declined, not only on the
+lane-wise case, and each synthesized temporary brings dangling reads of its own.
+The missing constraint is that the tiles must be the lane-wise writes of one
+generation of the same register. Reverted rather than left in.
+
+### Fixture note
+
+The original corpus lived in `/tmp` and is gone. `sym._xor_lanes` in
+`/tmp/xmmfix/hashes.c` at `-O2` reproduces the whole family of defects on both
+arm64 and x86-64, and is small enough to read.
+
