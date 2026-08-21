@@ -500,3 +500,131 @@ mod tests {
         assert!(markers[0].contains("local_10"), "{markers:?}");
     }
 }
+
+
+/// Drop a label nothing jumps to.
+///
+/// A label can only be attached to a block while it is being written, so a
+/// block that turns out to need one after the fact can never be given it. The
+/// answer is to spell one for every block and take back the ones no jump
+/// names, which leaves the same labels a body would have had and lets any
+/// block be a destination.
+pub(crate) fn prune_unreferenced_labels(func: &mut CFunction) {
+    let mut targeted = std::collections::BTreeSet::new();
+    for stmt in &func.body {
+        collect_goto_targets(stmt, &mut targeted);
+    }
+    let body = std::mem::take(&mut func.body);
+    func.body = body
+        .into_iter()
+        .filter_map(|stmt| drop_labels_outside(stmt, &targeted))
+        .collect();
+}
+
+fn collect_goto_targets(stmt: &CStmt, out: &mut std::collections::BTreeSet<String>) {
+    match stmt {
+        CStmt::Goto(label) => {
+            out.insert(label.clone());
+        }
+        CStmt::Block(body) => {
+            for inner in body {
+                collect_goto_targets(inner, out);
+            }
+        }
+        CStmt::If {
+            then_body,
+            else_body,
+            ..
+        } => {
+            collect_goto_targets(then_body, out);
+            if let Some(body) = else_body {
+                collect_goto_targets(body, out);
+            }
+        }
+        CStmt::While { body, .. }
+        | CStmt::DoWhile { body, .. }
+        | CStmt::For { body, .. } => collect_goto_targets(body, out),
+        CStmt::Switch { cases, default, .. } => {
+            for case in cases {
+                for inner in &case.body {
+                    collect_goto_targets(inner, out);
+                }
+            }
+            if let Some(body) = default {
+                for inner in body {
+                    collect_goto_targets(inner, out);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn drop_labels_outside(
+    stmt: CStmt,
+    targeted: &std::collections::BTreeSet<String>,
+) -> Option<CStmt> {
+    match stmt {
+        CStmt::Label(name) if !targeted.contains(&name) => None,
+        CStmt::Block(body) => Some(CStmt::Block(
+            body.into_iter()
+                .filter_map(|inner| drop_labels_outside(inner, targeted))
+                .collect(),
+        )),
+        CStmt::If {
+            cond,
+            then_body,
+            else_body,
+        } => Some(CStmt::If {
+            cond,
+            then_body: Box::new(
+                drop_labels_outside(*then_body, targeted).unwrap_or(CStmt::Empty),
+            ),
+            else_body: else_body
+                .map(|body| Box::new(drop_labels_outside(*body, targeted).unwrap_or(CStmt::Empty))),
+        }),
+        CStmt::While { cond, body } => Some(CStmt::While {
+            cond,
+            body: Box::new(drop_labels_outside(*body, targeted).unwrap_or(CStmt::Empty)),
+        }),
+        CStmt::DoWhile { body, cond } => Some(CStmt::DoWhile {
+            body: Box::new(drop_labels_outside(*body, targeted).unwrap_or(CStmt::Empty)),
+            cond,
+        }),
+        CStmt::For {
+            init,
+            cond,
+            update,
+            body,
+        } => Some(CStmt::For {
+            init,
+            cond,
+            update,
+            body: Box::new(drop_labels_outside(*body, targeted).unwrap_or(CStmt::Empty)),
+        }),
+        CStmt::Switch {
+            expr,
+            cases,
+            default,
+        } => Some(CStmt::Switch {
+            expr,
+            cases: cases
+                .into_iter()
+                .map(|case| SwitchCase {
+                    body: case
+                        .body
+                        .into_iter()
+                        .filter_map(|inner| drop_labels_outside(inner, targeted))
+                        .collect(),
+                    ..case
+                })
+                .collect(),
+            default: default.map(|body| {
+                body.into_iter()
+                    .filter_map(|inner| drop_labels_outside(inner, targeted))
+                    .collect()
+            }),
+        }),
+        other => Some(other),
+    }
+}
