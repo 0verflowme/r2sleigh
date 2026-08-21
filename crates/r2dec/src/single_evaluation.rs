@@ -540,7 +540,7 @@ mod tests {
             locals: Vec::<CLocal>::new(),
             body,
             params_known: true,
-            symbols: std::cell::RefCell::new(symbols.borrow().clone()),
+            symbols: std::rc::Rc::new(std::cell::RefCell::new(symbols.borrow().clone())),
         }
     }
 

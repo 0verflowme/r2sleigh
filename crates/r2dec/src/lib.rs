@@ -2892,8 +2892,9 @@ impl Decompiler {
         work: DecompileWorkControl<'a>,
     ) -> Result<CFunction, DecompileExecutionStop> {
         // The names this rendering declares, from the first pass that mints one.
-        let symbol_table = std::cell::RefCell::new(crate::symbol::SymbolTable::new());
-        let symbols = &symbol_table;
+        let symbol_table =
+            std::rc::Rc::new(std::cell::RefCell::new(crate::symbol::SymbolTable::new()));
+        let symbols = &*symbol_table;
 
         work.poll()?;
         let prepared = input.prepared_ssa();
@@ -3120,6 +3121,9 @@ impl Decompiler {
             prepared_memory: Some(prepared.memory()),
         };
         let mut fold_ctx = FoldingContext::from_inputs(fold_inputs);
+        // One rendered function has one table, and this is the one the passes
+        // before now declared into.
+        fold_ctx.symbols = std::rc::Rc::clone(&symbol_table);
         let fold_blocks: Vec<_> = func.blocks().cloned().collect();
         let structuring_work = work.with_phase(DecompileWorkPhase::Structuring);
         fold_ctx.analyze_blocks_with_control(&fold_blocks, structuring_work)?;
@@ -3264,7 +3268,7 @@ impl Decompiler {
             })
             .collect::<Vec<_>>();
         let mut c_function = CFunction {
-            symbols: std::cell::RefCell::new(std::mem::take(&mut *symbols.borrow_mut())),
+            symbols: std::rc::Rc::clone(&symbol_table),
             name: func_name,
             ret_type: render_signature
                 .and_then(|sig| sig.ret_type.as_ref().map(type_like_to_ctype))
@@ -5177,6 +5181,7 @@ fn expr_is_pure_for_dead_local_prune(expr: &CExpr) -> bool {
 
 #[cfg(test)]
 fn infer_local_struct_field_accesses(
+    symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
     func: &SSAFunction,
     config: &DecompilerConfig,
 ) -> Vec<LocalStructFieldAccess> {
@@ -5203,8 +5208,6 @@ fn infer_local_struct_field_accesses(
         }
     }
 
-    let fixture_symbols = std::cell::RefCell::new(crate::symbol::SymbolTable::new());
-
     let binary_symbols: std::collections::HashMap<u64, String> = HashMap::new();
 
     let env = analysis::PassEnv {
@@ -5220,7 +5223,7 @@ fn infer_local_struct_field_accesses(
         strings: &strings,
         #[cfg(test)]
         binary_symbols: &binary_symbols,
-        symbols: &fixture_symbols,
+        symbols,
         callee_facts: analysis::empty_callee_facts(),
         callee_resolution: None,
         summary_view: None,
@@ -5234,7 +5237,7 @@ fn infer_local_struct_field_accesses(
     let blocks: Vec<_> = func.blocks().cloned().collect();
     let use_info = analysis::UseInfo::analyze_for_local_struct_accesses(&blocks, &env);
     analysis::use_info::collect_local_struct_field_access_profiles(
-        &fixture_symbols,
+        symbols,
         &use_info,
         func,
         &env,
@@ -5826,7 +5829,7 @@ mod tests {
                 )),
                 CStmt::Return(Some(crate::symbol::var_ref(&symbols, "x0_5"))),
             ],
-            symbols: std::cell::RefCell::new(symbols.borrow().clone()),
+            symbols: std::rc::Rc::new(std::cell::RefCell::new(symbols.borrow().clone())),
         };
 
         prune_dead_temp_assignments_in_function_body(&mut func, &ctx);
@@ -5947,7 +5950,7 @@ mod tests {
             name: crate::symbol::declare(&symbols, "result"),
             stack_offset: None,
         });
-        func.symbols = symbols;
+        func.symbols = std::rc::Rc::new(symbols);
 
         normalize_redundant_return_carrier_casts(&mut func);
 
@@ -5990,7 +5993,7 @@ mod tests {
                 stack_offset: Some(-8),
             },
         ];
-        func.symbols = symbols;
+        func.symbols = std::rc::Rc::new(symbols);
 
         normalize_declared_assignment_literals(&mut func);
 
@@ -6031,7 +6034,7 @@ mod tests {
                 stack_offset: Some(-8),
             },
         ];
-        func.symbols = symbols;
+        func.symbols = std::rc::Rc::new(symbols);
 
         prune_unreferenced_local_declarations(&func.symbols.clone(), &mut func);
 
@@ -6974,7 +6977,7 @@ mod tests {
             &env,
             &arg_slot_map,
         );
-        let accesses = infer_local_struct_field_accesses(&func, &config);
+        let accesses = infer_local_struct_field_accesses(&fixture_symbols, &func, &config);
         assert!(
             accesses.iter().any(|access| access.arg_index == 0
                 && access.field_offset == 0x8
@@ -7145,7 +7148,7 @@ mod tests {
             &env,
             &arg_slot_map,
         );
-        let accesses = infer_local_struct_field_accesses(&func, &config);
+        let accesses = infer_local_struct_field_accesses(&fixture_symbols, &func, &config);
         assert!(
             accesses.iter().any(|access| access.arg_index == 0
                 && access.field_offset == 0
@@ -7371,7 +7374,7 @@ mod tests {
             &env,
             &arg_slot_map,
         );
-        let accesses = infer_local_struct_field_accesses(&func, &config);
+        let accesses = infer_local_struct_field_accesses(&fixture_symbols, &func, &config);
         assert!(
             accesses.iter().any(|access| access.arg_index == 0
                 && access.field_offset == 0x8
@@ -7433,7 +7436,7 @@ mod tests {
         }
 
         let func = SSAFunction::from_blocks_raw_no_arch(&blocks).expect("ssa function");
-        let accesses = infer_local_struct_field_accesses(&func, &DecompilerConfig::x86_64());
+        let accesses = infer_local_struct_field_accesses(&test_table(), &func, &DecompilerConfig::x86_64());
         assert!(
             accesses.is_empty(),
             "large dense switch CFGs should skip semantic local-struct inference, got {accesses:?}"
@@ -10003,7 +10006,7 @@ mod tests {
                 CExpr::var(crate::symbol::declare(&symbols, "sym.rpl_mbrtoc32")),
                 Vec::new(),
             ))],
-            symbols,
+            symbols: std::rc::Rc::new(symbols),
         };
 
         append_semantic_summary_return_to_function_if_needed(
@@ -10055,7 +10058,7 @@ mod tests {
                 CExpr::var(crate::symbol::declare(&symbols, "summary_worker")),
                 Vec::new(),
             ))],
-            symbols,
+            symbols: std::rc::Rc::new(symbols),
         };
 
         append_semantic_summary_return_to_function_if_needed(
@@ -10108,7 +10111,7 @@ mod tests {
             params_known: true,
             locals: Vec::new(),
             body,
-            symbols,
+            symbols: std::rc::Rc::new(symbols),
         };
 
         append_semantic_summary_return_comment_to_function_if_needed(

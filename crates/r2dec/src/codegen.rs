@@ -1187,7 +1187,7 @@ mod tests {
                 CExpr::var(crate::symbol::declare(&symbols, "b")),
             )))],
             params_known: true,
-            symbols,
+            symbols: std::rc::Rc::new(symbols),
         };
 
         let code = generate(&func);
@@ -1394,7 +1394,7 @@ mod tests {
             ],
             body: vec![CStmt::Return(None)],
             params_known: true,
-            symbols,
+            symbols: std::rc::Rc::new(symbols),
         };
 
         let code = generate(&func);
@@ -1420,7 +1420,7 @@ mod tests {
             )),
             CStmt::Return(None),
         ]);
-        func.symbols = symbols;
+        func.symbols = std::rc::Rc::new(symbols);
 
         let code = generate(&func);
 
@@ -1449,7 +1449,7 @@ mod tests {
                 CExpr::binary(BinaryOp::Add, CExpr::var(crate::symbol::declare(&symbols, "acc")), CExpr::int(3)),
             )),
         ]);
-        func.symbols = symbols;
+        func.symbols = std::rc::Rc::new(symbols);
 
         let code = generate(&func);
 

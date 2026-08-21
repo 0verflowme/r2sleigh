@@ -198,7 +198,7 @@ mod tests {
                 .collect(),
             body,
             params_known: true,
-            symbols,
+            symbols: std::rc::Rc::new(symbols),
         }
     }
 

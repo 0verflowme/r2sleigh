@@ -147,7 +147,7 @@ mod tests {
 
     fn mk_func(symbols: RefCell<SymbolTable>, body: Vec<CStmt>) -> CFunction {
         CFunction {
-            symbols,
+            symbols: std::rc::Rc::new(symbols),
             name: "demo".to_string(),
             ret_type: CType::Int(32),
             params: Vec::new(),

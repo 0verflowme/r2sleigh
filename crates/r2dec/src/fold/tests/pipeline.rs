@@ -18090,7 +18090,7 @@ mod tests {
         uncertified_alias_ctx.inputs.prepared_semantic_view =
             Some(Box::leak(Box::new(prepared_view())));
         // The view was built before this context, so it adopts the view's table.
-        uncertified_alias_ctx.symbols = std::cell::RefCell::new(symbols.borrow().clone());
+        uncertified_alias_ctx.symbols = std::rc::Rc::new(std::cell::RefCell::new(symbols.borrow().clone()));
         uncertified_alias_ctx
             .state
             .analysis_ctx
@@ -18129,7 +18129,7 @@ mod tests {
         );
         certified_alias_ctx.inputs.prepared_semantic_view =
             Some(Box::leak(Box::new(prepared_view())));
-        certified_alias_ctx.symbols = std::cell::RefCell::new(symbols.borrow().clone());
+        certified_alias_ctx.symbols = std::rc::Rc::new(std::cell::RefCell::new(symbols.borrow().clone()));
         certified_alias_ctx.inputs.visible_bindings =
             Box::leak(Box::new(vec![visible_stack_binding(
                 "alias",

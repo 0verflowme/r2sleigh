@@ -709,7 +709,10 @@ pub struct CFunction {
     ///
     /// Owned here because every pass that runs after folding already takes
     /// `&mut CFunction`, so none of them needs the table threaded to it.
-    pub symbols: std::cell::RefCell<crate::symbol::SymbolTable>,
+    /// The names this function declares, shared with everything that renders
+    /// it. Handing a copy over instead would give the renderer identifiers the
+    /// copy never issued.
+    pub symbols: std::rc::Rc<std::cell::RefCell<crate::symbol::SymbolTable>>,
     /// Function name.
     pub name: String,
     /// Return type.
@@ -751,7 +754,7 @@ impl CFunction {
     /// Create a new function.
     pub fn new(name: impl Into<String>, ret_type: CType) -> Self {
         Self {
-            symbols: std::cell::RefCell::new(crate::symbol::SymbolTable::new()),
+            symbols: std::rc::Rc::new(std::cell::RefCell::new(crate::symbol::SymbolTable::new())),
             name: name.into(),
             ret_type,
             params: Vec::new(),

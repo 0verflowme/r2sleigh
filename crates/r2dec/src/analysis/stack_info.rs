@@ -281,7 +281,7 @@ fn stack_var_for_addr_var(symbols: &std::cell::RefCell<crate::symbol::SymbolTabl
     let empty_ptrs: HashMap<String, PtrArith> = HashMap::new();
     let empty_semantic_values: HashMap<String, crate::analysis::SemanticValue> = HashMap::new();
     let lower = LowerCtx {
-        symbols: crate::analysis::lower::no_symbols(),
+        symbols,
         string_literals: crate::analysis::lower::no_string_literals(),
         use_info: None,
         definitions: inputs.definitions,

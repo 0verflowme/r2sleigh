@@ -200,7 +200,10 @@ pub(crate) struct FoldingContext<'a> {
     /// A cell because the builders take `&self`. Minting has to borrow, insert
     /// and drop inside one statement: a borrow held across a nested build would
     /// panic, and nested builds are the ordinary case here.
-    pub(crate) symbols: std::cell::RefCell<crate::symbol::SymbolTable>,
+    /// The names this rendering declares, shared with whatever else renders
+    /// the same function. An identifier only means something in the table that
+    /// issued it, so the passes cannot each hold a copy.
+    pub(crate) symbols: std::rc::Rc<std::cell::RefCell<crate::symbol::SymbolTable>>,
     /// Op sites the fold dropped without recording that anything rendered them,
     /// keyed by why. An accounting of what the output owes reads these as debts
     /// it never paid, so knowing which are deliberate is what separates a
@@ -274,7 +277,7 @@ impl<'a> FoldingContext<'a> {
         };
         Self {
             carrier_aliases,
-            symbols: std::cell::RefCell::new(crate::symbol::SymbolTable::new()),
+            symbols: std::rc::Rc::new(std::cell::RefCell::new(crate::symbol::SymbolTable::new())),
             inputs,
             state: FoldState::default(),
             current_block_addr: Cell::new(None),
