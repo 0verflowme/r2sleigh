@@ -112,6 +112,18 @@ pub struct ArchSpec {
 
     /// Register definitions
     pub registers: Vec<RegisterDef>,
+
+    /// Registers this architecture's calling convention returns a value in, in
+    /// preference order.
+    ///
+    /// A consumer asking which register holds a returned value has three
+    /// sources: the recovered function interface, the recovered convention, and
+    /// failing both, the architecture itself. Without this last one there is no
+    /// answer at all for a binary whose ABI was never recovered, and the only
+    /// remaining option is a hand-written list of register spellings that knows
+    /// the architectures somebody thought of.
+    #[serde(default)]
+    pub return_registers: Vec<RegisterDef>,
 }
 
 impl ArchSpec {
@@ -126,7 +138,17 @@ impl ArchSpec {
             alignment: 1,
             spaces: Vec::new(),
             registers: Vec::new(),
+            return_registers: Vec::new(),
         }
+    }
+
+    /// State which registers this architecture returns a value in.
+    pub fn with_return_registers(
+        mut self,
+        registers: impl IntoIterator<Item = RegisterDef>,
+    ) -> Self {
+        self.return_registers = registers.into_iter().collect();
+        self
     }
 
     /// Set instruction endianness.

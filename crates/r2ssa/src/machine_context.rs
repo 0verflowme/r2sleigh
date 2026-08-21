@@ -494,6 +494,8 @@ pub struct SourceMachineContext {
     /// slot is what makes "is this the return register" answerable without a
     /// list of register spellings.
     convention_slots: Option<SourceConventionSlots>,
+    /// Where this architecture returns a value, when it says.
+    architecture_result_slot: Option<CanonicalStorageId>,
     abi_model: MachineAbiModel,
     register_storages_by_name: BTreeMap<String, CanonicalStorageId>,
     raw_call_sites_by_id: BTreeMap<CallSiteId, SourceCallSiteIdentity>,
@@ -805,6 +807,15 @@ impl SourceMachineContext {
         convention_slots: Option<SourceConventionSlots>,
         call_site_interfaces: Vec<SourceCallSiteInterface>,
     ) -> Self {
+        // The architecture says where it returns a value, for a function whose
+        // ABI was never recovered.
+        let architecture_result_slot = arch.and_then(|arch| {
+            arch.return_registers.first().map(|reg| CanonicalStorageId {
+                space: CanonicalStorageSpace::Register,
+                offset: reg.offset,
+                size: reg.size,
+            })
+        });
         let register_storages_by_name: BTreeMap<String, CanonicalStorageId> = arch
             .into_iter()
             .flat_map(|arch| &arch.registers)
@@ -959,6 +970,7 @@ impl SourceMachineContext {
             function_interface,
             machine_roles,
             convention_slots,
+            architecture_result_slot,
             abi_model,
             register_storages_by_name,
             raw_call_sites_by_id,
@@ -993,9 +1005,17 @@ impl SourceMachineContext {
         &self.machine_roles
     }
 
-    /// The location this convention leaves a result in, when the source said.
+    /// The location a call leaves its result in.
+    ///
+    /// The recovered convention states this when there was one. Failing that
+    /// the architecture states it, which is still the machine speaking rather
+    /// than a list of register spellings that knows the architectures somebody
+    /// thought of.
     pub fn result_slot(&self) -> Option<CanonicalStorageId> {
-        self.convention_slots.as_ref()?.result_slot()
+        self.convention_slots
+            .as_ref()
+            .and_then(|slots| slots.result_slot())
+            .or(self.architecture_result_slot)
     }
 
     /// The location this function returns a value in, and whether it returns
