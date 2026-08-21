@@ -299,8 +299,28 @@ thing.
 
 That was attempted with a script over the thirty matches and reverted, because
 the arms are not uniform: some open a block, some carry a guard, and the script
-produced malformed patterns in five files. It is half an hour of hand editing
-rather than a pass, and it should be done that way. Those are the expression builder and the flag machinery, and
+produced malformed patterns in five files. Done by hand it took thirty
+decisions, two of which the compiler caught landing on the wrong match because
+the two matches returned different types. It is worth recording that the arms
+had to be decided rather than filled in: renaming skips an external name because
+renaming moves names the function owns, the placeholder tests answer false
+because they ask about names the renderer minted, and constant folding leaves it
+alone because an intrinsic never spells a constant.
+
+The split paid for itself immediately and not where expected. x86-64 `-O2`
+renders 226 lines where it rendered 302, because the lane extractions that were
+reaching the page as `tregalias` locals fold into named SSE values once the
+passes treating `callother` as a variable stop doing so. Those leaks were being
+held in place by the expression layer misclassifying the intrinsic they fed, not
+only by the pass that created them.
+
+It did not shrink the migration it was meant to open. Measured again afterwards,
+replacing `Var(String)` with a symbol reference is 952 errors rather than 970,
+and 579 of them are still in `fold/op_lower/mod.rs` and `fold/flags.rs`. The
+change remains atomic over roughly 750 sites, each needing a decision of the
+kind the thirty arms needed, so it is not something to begin without the room to
+finish it. Demoting flags first would remove the 210 in `flags.rs`, which is the
+only decomposition of it left that is worth anything. Those are the expression builder and the flag machinery, and
 step 7 rewrites the first and deletes most of the second, so migrating them
 first is migrating them twice. The symbol table lands in step 1 regardless, so
 every step after it writes against a declared name rather than adding to the
