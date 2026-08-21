@@ -295,15 +295,24 @@ function returns in. So with the change:
   do, because a call result then belongs to the result location rather than the
   stack slot a later store puts it in.
 
-Both cannot hold. That is real information rather than a merge conflict: once a
-return is defined by a stated location, the question of who owns a call result
--- the result register, or the slot the value is stored to afterwards -- has to
-be answered deliberately. Guessing it from which fixture happens to be green is
-how a rendering starts saying something nobody decided.
+I first read that as the two tests being logically incompatible. **That claim is
+not proven and is probably wrong.** The likelier explanation is that threading
+the machine context changed behaviour somewhere in the call-result path -- once
+`is_return_value_register` answers true for the result location, something in
+the return analysis may consume the call result before the stack-owner
+derivation sees it. That would be a defect in the change, not a contradiction
+between the tests.
 
-Whoever picks this up should answer that first, then make the change; it is
-otherwise ready, and adding `SsaArtifact::for_decompile_with_convention` is the
-mechanical part.
+`post_call_stack_store_does_not_fabricate_call_result_owner` reads as: without
+an exact source interface, do not invent a stack owner for a call result; with
+one, derive it. That is consistent with wanting returns to be detectable. So the
+two probably can hold together.
+
+What is needed is to find where the call result stops reaching the stack-owner
+derivation once returns are detected by location, rather than to pick whichever
+fixture arrangement is green. Adding `SsaArtifact::for_decompile_with_convention`
+so fixtures can state what they return in is the mechanical part and works; the
+diagnosis above is the part that was not finished.
 
 ### The SIMD lane defect, located
 
