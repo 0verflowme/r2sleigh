@@ -765,7 +765,6 @@ mod tests {
             function_names: empty_u64,
             strings: empty_u64,
             binary_symbols: empty_u64,
-            symbols: &fixture_symbols,
             function_facts: empty_function_facts(),
             certified_rendering_required: false,
             stack_slots: empty_stack_slots,
@@ -812,7 +811,6 @@ mod tests {
             function_names: empty_u64,
             strings: empty_u64,
             binary_symbols: empty_u64,
-            symbols: &fixture_symbols,
             function_facts: empty_function_facts(),
             certified_rendering_required: false,
             stack_slots: empty_stack_slots,
@@ -1376,7 +1374,7 @@ mod tests {
             CExpr::Member { base, .. } => expr_contains_flag_artifact(ctx, base),
             CExpr::PtrMember { base, .. } => expr_contains_flag_artifact(ctx, base),
             CExpr::Call { func, args } => {
-                expr_contains_flag_artifact(ctx, func) || args.iter().any(expr_contains_flag_artifact)
+                expr_contains_flag_artifact(ctx, func) || args.iter().any(|a| expr_contains_flag_artifact(ctx, a))
             }
             _ => false,
         }
@@ -4792,7 +4790,7 @@ mod tests {
         let byte_expr_is_temporary = matches!(
             byte_expr,
             CExpr::Var(ref name)
-                if r2ssa::SSAVarNameKind::classify(&name.to_ascii_lowercase()).is_temporary()
+                if r2ssa::SSAVarNameKind::classify(&ctx.spelling(*name).to_ascii_lowercase()).is_temporary()
         );
         assert!(
             !byte_expr_is_temporary,
@@ -9866,7 +9864,7 @@ mod tests {
             "Predicate copy helper should preserve high-level comparison form"
         );
         assert!(
-            !expr_contains_flag_artifact(ctx, &rhs),
+            !expr_contains_flag_artifact(&ctx, &rhs),
             "Predicate copy helper output should not contain raw flag temporaries"
         );
         assert!(
@@ -9933,7 +9931,7 @@ mod tests {
             "Negated predicate assignment must not collapse to a literal"
         );
         assert!(
-            !expr_contains_flag_artifact(ctx, negated_rhs),
+            !expr_contains_flag_artifact(&ctx, negated_rhs),
             "BoolNot assignment should not reintroduce raw flag artifacts"
         );
     }
@@ -10301,7 +10299,7 @@ mod tests {
             )
         );
         assert!(
-            !expr_contains_flag_artifact(ctx, &rhs),
+            !expr_contains_flag_artifact(&ctx, &rhs),
             "predicate copy chain should collapse to the recovered comparison"
         );
         assert!(
@@ -10574,7 +10572,7 @@ mod tests {
             branch_cond,
             CExpr::binary(
                 BinaryOp::Eq,
-                CExpr::Var({ let CExpr::Var(id) = ctx.name_ref(&first_owner.display_name()) else { unreachable!() }; id }.to_ascii_lowercase()),
+                ctx.name_ref(&first_owner.display_name().to_ascii_lowercase()),
                 CExpr::IntLit(0),
             ),
             "second-call null check must not collapse to the first call owner"
@@ -10583,7 +10581,7 @@ mod tests {
             branch_cond
                 == CExpr::binary(
                     BinaryOp::Eq,
-                    CExpr::Var({ let CExpr::Var(id) = ctx.name_ref(&second_owner.display_name()) else { unreachable!() }; id }.to_ascii_lowercase()),
+                    ctx.name_ref(&second_owner.display_name().to_ascii_lowercase()),
                     CExpr::IntLit(0),
                 )
                 || matches!(
@@ -11718,7 +11716,6 @@ mod tests {
             "r8".to_string(),
             "r9".to_string(),
         ]));
-        let fixture_symbols = test_table();
         let env = PassEnv {
             carrier_aliases: crate::analysis::no_carrier_aliases(),
             string_literals: crate::analysis::lower::no_string_literals(),
@@ -11729,7 +11726,6 @@ mod tests {
             function_names: empty_u64,
             strings: empty_u64,
             binary_symbols: empty_u64,
-            symbols: &fixture_symbols,
             callee_facts: crate::analysis::empty_callee_facts(),
             callee_resolution: None,
             summary_view: None,
@@ -13206,7 +13202,7 @@ mod tests {
             panic!("Expected trailing return statement");
         };
         assert!(
-            matches!(expr, CExpr::Var(name) if ctx.spelling(*name).eq_ignore_ascii_case("rax_0") || name.eq_ignore_ascii_case("rax")),
+            matches!(expr, CExpr::Var(name) if ctx.spelling(*name).eq_ignore_ascii_case("rax_0") || ctx.spelling(*name).eq_ignore_ascii_case("rax")),
             "Return register should remain unresolved when no better return value can be derived"
         );
     }
@@ -17622,7 +17618,7 @@ mod tests {
             )],
             &r2types::CalleeIdentityContext {
                 function_names: &function_names,
-                symbols: ctx.inputs.symbols,
+                binary_symbols: ctx.inputs.binary_symbols,
                 callee_facts: &callee_facts,
                 known_function_signatures: &known_signatures,
             },

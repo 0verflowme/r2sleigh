@@ -5204,6 +5204,8 @@ fn infer_local_struct_field_accesses(
         }
     }
 
+    let fixture_symbols = test_table();
+
     let env = analysis::PassEnv {
         carrier_aliases: crate::analysis::no_carrier_aliases(),
         string_literals: crate::analysis::lower::no_string_literals(),
@@ -5230,7 +5232,7 @@ fn infer_local_struct_field_accesses(
 
     let blocks: Vec<_> = func.blocks().cloned().collect();
     let use_info = analysis::UseInfo::analyze_for_local_struct_accesses(&blocks, &env);
-    analysis::use_info::collect_local_struct_field_access_profiles(
+    analysis::use_info::collect_local_struct_field_access_profiles(&symbols, 
         &use_info,
         func,
         &env,
@@ -5652,8 +5654,8 @@ mod tests {
             },
             ast::CParam {
                 ty: CType::Int(32),
-                name: "len".to_string(),
-            },symbols.borrow_mut().declare_or_reuse("len")
+                name: symbols.borrow_mut().declare_or_reuse("len"),
+            },
         ];
         let register_params = vec![
             ExternalRegisterParamSpec {
@@ -5860,8 +5862,8 @@ mod tests {
             },
             ast::CParam {
                 ty: CType::Int(32),
-                name: "arg3".to_string(),
-            },symbols.borrow_mut().declare_or_reuse("arg3")
+                name: symbols.borrow_mut().declare_or_reuse("arg3"),
+            },
         ];
         let signature = signature_spec(
             Some(CType::Pointer(Box::new(CType::Int(8)))),
@@ -6937,6 +6939,7 @@ mod tests {
                 arg_slot_map.insert(lower, idx);
             }
         }
+        let fixture_symbols = test_table();
         let env = analysis::PassEnv {
             carrier_aliases: crate::analysis::no_carrier_aliases(),
             string_literals: crate::analysis::lower::no_string_literals(),
@@ -6947,7 +6950,7 @@ mod tests {
             function_names: &function_names,
             strings: &strings,
             binary_symbols: &binary_symbols,
-            symbols: &test_table(),
+            symbols: &fixture_symbols,
             callee_facts: analysis::empty_callee_facts(),
             callee_resolution: None,
             summary_view: None,
@@ -6959,7 +6962,7 @@ mod tests {
         };
         let blocks: Vec<_> = func.blocks().cloned().collect();
         let use_info = analysis::UseInfo::analyze(&symbols, &blocks, &env);
-        let profiles = analysis::use_info::collect_local_struct_field_access_profiles(
+        let profiles = analysis::use_info::collect_local_struct_field_access_profiles(&symbols, 
             &use_info,
             &func,
             &env,
@@ -7106,6 +7109,7 @@ mod tests {
                 arg_slot_map.insert(lower, idx);
             }
         }
+        let fixture_symbols = test_table();
         let env = analysis::PassEnv {
             carrier_aliases: crate::analysis::no_carrier_aliases(),
             string_literals: crate::analysis::lower::no_string_literals(),
@@ -7116,7 +7120,7 @@ mod tests {
             function_names: &function_names,
             strings: &strings,
             binary_symbols: &binary_symbols,
-            symbols: &test_table(),
+            symbols: &fixture_symbols,
             callee_facts: analysis::empty_callee_facts(),
             callee_resolution: None,
             summary_view: None,
@@ -7128,7 +7132,7 @@ mod tests {
         };
         let blocks: Vec<_> = func.blocks().cloned().collect();
         let use_info = analysis::UseInfo::analyze_for_local_struct_accesses(&blocks, &env);
-        let profiles = analysis::use_info::collect_local_struct_field_access_profiles(
+        let profiles = analysis::use_info::collect_local_struct_field_access_profiles(&symbols, 
             &use_info,
             &func,
             &env,
@@ -7330,6 +7334,7 @@ mod tests {
                 arg_slot_map.insert(lower, idx);
             }
         }
+        let fixture_symbols = test_table();
         let env = analysis::PassEnv {
             carrier_aliases: crate::analysis::no_carrier_aliases(),
             string_literals: crate::analysis::lower::no_string_literals(),
@@ -7340,7 +7345,7 @@ mod tests {
             function_names: &function_names,
             strings: &strings,
             binary_symbols: &binary_symbols,
-            symbols: &test_table(),
+            symbols: &fixture_symbols,
             callee_facts: analysis::empty_callee_facts(),
             callee_resolution: None,
             summary_view: None,
@@ -7352,7 +7357,7 @@ mod tests {
         };
         let blocks: Vec<_> = func.blocks().cloned().collect();
         let use_info = analysis::UseInfo::analyze_for_local_struct_accesses(&blocks, &env);
-        let profiles = analysis::use_info::collect_local_struct_field_access_profiles(
+        let profiles = analysis::use_info::collect_local_struct_field_access_profiles(&symbols, 
             &use_info,
             &func,
             &env,
@@ -9988,7 +9993,7 @@ mod tests {
             params_known: true,
             locals: Vec::new(),
             body: vec![CStmt::Expr(CExpr::call(
-                CExpr::var("sym.rpl_mbrtoc32"),
+                CExpr::var(symbols.borrow_mut().declare_or_reuse("sym.rpl_mbrtoc32")),
                 Vec::new(),symbols.borrow_mut().declare_or_reuse("sym.rpl_mbrtoc32")
             ))],
         };

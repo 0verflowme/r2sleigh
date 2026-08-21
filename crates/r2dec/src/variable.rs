@@ -1154,6 +1154,7 @@ mod tests {
 
     #[test]
     fn visible_binding_type_and_name_drive_stack_local_recovery() {
+        let symbols = test_table();
         let mut block = R2ILBlock::new(0x1000, 1);
         block.push(R2ILOp::Return {
             target: Varnode::constant(0, 8),
@@ -1181,7 +1182,7 @@ mod tests {
             ..FunctionTypeFacts::default()
         });
 
-        vr.recover(&func);
+        vr.recover(&func, &symbols);
 
         let local = vr
             .locals()
@@ -1194,6 +1195,7 @@ mod tests {
 
     #[test]
     fn canonical_stack_slot_type_drives_stack_local_recovery() {
+        let symbols = test_table();
         let mut block = R2ILBlock::new(0x1000, 1);
         block.push(R2ILOp::Return {
             target: Varnode::constant(0, 8),
@@ -1227,7 +1229,7 @@ mod tests {
             ..FunctionTypeFacts::default()
         });
 
-        vr.recover(&func);
+        vr.recover(&func, &symbols);
 
         let local = vr
             .locals()
@@ -1270,6 +1272,7 @@ mod tests {
 
     #[test]
     fn test_recover_finds_stack_local_through_temp_frame_address() {
+        let symbols = test_table();
         let mut block = R2ILBlock::new(0x1000, 1);
         block.push(R2ILOp::Return {
             target: Varnode::constant(0, 8),
@@ -1300,7 +1303,7 @@ mod tests {
             ..FunctionTypeFacts::default()
         });
 
-        vr.recover(&func);
+        vr.recover(&func, &symbols);
 
         let local_names: Vec<_> = vr
             .locals()
@@ -1320,6 +1323,7 @@ mod tests {
 
     #[test]
     fn only_ram_accesses_recover_stack_locals() {
+        let symbols = test_table();
         let function_for_space = |space| {
             let mut block = R2ILBlock::new(0x1000, 1);
             block.push(R2ILOp::Return {
@@ -1352,7 +1356,7 @@ mod tests {
         };
         let stack_offsets_for_space = |space| {
             let mut recovery = VariableRecovery::new("rsp", "rbp", 64);
-            recovery.recover(&function_for_space(space));
+            recovery.recover(&function_for_space(space), &symbols);
             recovery
                 .locals()
                 .into_iter()

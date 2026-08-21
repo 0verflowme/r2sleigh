@@ -79,7 +79,8 @@ pub(crate) fn analyze_with_control(symbols: &std::cell::RefCell<crate::symbol::S
 }
 
 #[cfg(test)]
-pub(crate) fn analyze_for_local_struct_accesses(blocks: &[SSABlock], env: &PassEnv<'_>) -> UseInfo {
+pub(crate) fn analyze_for_local_struct_accesses(
+    symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,blocks: &[SSABlock], env: &PassEnv<'_>) -> UseInfo {
     let execution = SsaExecutionControl::default();
     let control = DecompileWorkControl::new(&execution, DecompileWorkPhase::Structuring);
     analyze_for_local_struct_accesses_with_control(&symbols, blocks, env, control)
@@ -2088,6 +2089,7 @@ fn switch_selector_candidate_score(symbols: &std::cell::RefCell<crate::symbol::S
 
 #[cfg(test)]
 pub(crate) fn collect_local_struct_field_access_profiles(
+    symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
     info: &UseInfo,
     func: &SSAFunction,
     env: &PassEnv<'_>,
@@ -2244,7 +2246,7 @@ fn arg_slot_for_value_ref(
     }
 
     if let Some(alias) = env.param_register_aliases.get(&key)
-        && let Some(slot) = crate::symbol::spelling(symbols, *alias)
+        && let Some(slot) = alias
             .strip_prefix("arg")
             .and_then(|suffix| suffix.parse::<usize>().ok())
             .and_then(|idx| idx.checked_sub(1))
@@ -9988,7 +9990,7 @@ mod tests {
             match expr {
                 CExpr::External { .. } => false,
                 CExpr::Var(name) => {
-                    let lower = name.to_ascii_lowercase();
+                    let lower = crate::symbol::spelling(&symbols, *name).to_ascii_lowercase();
                     lower == "stack" || lower == "saved_fp" || lower.starts_with("stack_")
                 }
                 CExpr::Paren(inner)
@@ -11419,6 +11421,7 @@ mod tests {
 
     #[test]
     fn semantic_values_keep_indexed_load_shape_through_stack_reload_and_return_copy_chain() {
+        let symbols = test_table();
         let rbp = mk("RBP", 1, 8);
         let arr = mk("RDI", 0, 8);
         let idx = mk("ESI", 0, 4);
@@ -11509,7 +11512,7 @@ mod tests {
         assert!(
             match idx_semantic {
                 Some(SemanticValue::Scalar(ScalarValue::Expr(CExpr::Var(name)))) => {
-                    name != "stack" && name != "saved_fp" && !name.starts_with("local_")
+                    name != "stack" && name != "saved_fp" && !crate::symbol::spelling(&symbols, *name).starts_with("local_")
                 }
                 Some(SemanticValue::Scalar(ScalarValue::Root(value_ref))) => {
                     !value_ref.var.name_kind().is_temporary()

@@ -1988,7 +1988,7 @@ mod tests {
             panic!("expected conservative dereference expression");
         };
         assert!(
-            !matches!(inner.as_ref(), CExpr::Var(name) if name.starts_with("local_") || &*crate::symbol::spelling(&symbols, *name) == "stack"),
+            !matches!(inner.as_ref(), CExpr::Var(name) if ctx.spelling(*name).starts_with("local_") || &*crate::symbol::spelling(&symbols, *name) == "stack"),
             "analysis lowering should not fabricate visible stack aliases"
         );
     }

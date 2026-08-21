@@ -1809,7 +1809,7 @@ impl<'a> FoldingContext<'a> {
     #[cfg(test)]
     pub(crate) fn direct_target_addr_from_callee_expr(&self, expr: &CExpr) -> Option<u64> {
         match expr {
-            CExpr::Var(name) => parse_address_from_var_name(name),
+            CExpr::Var(name) => parse_address_from_var_name(&*self.spelling(*name)),
             CExpr::Paren(inner) | CExpr::AddrOf(inner) | CExpr::Deref(inner) => {
                 self.direct_target_addr_from_callee_expr(inner)
             }

@@ -69,19 +69,23 @@ mod tests {
         std::cell::RefCell::new(crate::symbol::SymbolTable::new())
     }
 
-    struct ChainedPredicateView;
+    /// A view over the same table the fixture declared into, because an
+    /// identifier only means something in the table that issued it.
+    struct ChainedPredicateView<'a> {
+        symbols: &'a std::cell::RefCell<crate::symbol::SymbolTable>,
+    }
 
-    impl PredicateAnalysisView for ChainedPredicateView {
+    impl PredicateAnalysisView for ChainedPredicateView<'_> {
         fn expand_predicate_vars(
             &self,
             expr: &CExpr,
             _depth: u32,
             _visited: &mut HashSet<String>,
         ) -> CExpr {
-            let symbols = test_table();
+            let symbols = self.symbols;
             match expr {
-                CExpr::Var(name) if &*crate::symbol::spelling(&symbols, *name) == "stage0" => crate::symbol::var_ref(&&self.symbols, "stage1"),
-                CExpr::Var(name) if &*crate::symbol::spelling(&symbols, *name) == "stage1" => crate::symbol::var_ref(&&self.symbols, "done"),
+                CExpr::Var(name) if &*crate::symbol::spelling(symbols, *name) == "stage0" => crate::symbol::var_ref(&&self.symbols, "stage1"),
+                CExpr::Var(name) if &*crate::symbol::spelling(symbols, *name) == "stage1" => crate::symbol::var_ref(&&self.symbols, "done"),
                 other => other.clone(),
             }
         }
@@ -118,7 +122,7 @@ mod tests {
     #[test]
     fn simplify_condition_expr_requires_multiple_passes_to_fixed_point() {
         let symbols = test_table();
-        let view = ChainedPredicateView;
+        let view = ChainedPredicateView { symbols: &symbols };
         let simplifier = PredicateSimplifier::new(&view);
 
         let simplified = simplifier.simplify_condition_expr(crate::symbol::var_ref(&symbols, "stage0"));
