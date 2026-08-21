@@ -736,7 +736,7 @@ mod tests {
 
         let addr = SSAVar::new("tmp:6500", 2, 8);
         assert_eq!(
-            extract_stack_offset_from_var(&addr, &definitions, "fp", "sp"),
+            extract_stack_offset_from_var(&symbols, &addr, &definitions, "fp", "sp"),
             Some(0x540)
         );
     }

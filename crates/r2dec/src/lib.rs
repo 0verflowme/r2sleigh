@@ -5668,7 +5668,7 @@ mod tests {
                 reg: "rdi".to_string(),
             },
         ];
-        let aliases = build_param_register_aliases(
+        let aliases = build_param_register_aliases(&symbols, 
             &params,
             &[],
             &register_params,
@@ -5869,7 +5869,7 @@ mod tests {
             ],
         );
 
-        let params = merge_params_with_external_signature(recovered, Some(&signature));
+        let params = merge_params_with_external_signature(&symbols, recovered, Some(&signature));
         assert_eq!(
             params.len(),
             2,
@@ -5899,7 +5899,7 @@ mod tests {
         ];
         let signature = signature_spec(None, vec![("arg1", None), ("arg2", None)]);
 
-        let params = merge_params_with_external_signature(recovered, Some(&signature));
+        let params = merge_params_with_external_signature(&symbols, recovered, Some(&signature));
         assert_eq!(
             params.len(),
             2,
@@ -5922,7 +5922,7 @@ mod tests {
             ],
         );
 
-        let params = merge_params_with_external_signature(Vec::new(), Some(&signature));
+        let params = merge_params_with_external_signature(&symbols, Vec::new(), Some(&signature));
         assert_eq!(params.len(), 2);
         assert_eq!(params[0].name, symbols.borrow_mut().declare_or_reuse("buf"));
         assert_eq!(params[1].name, symbols.borrow_mut().declare_or_reuse("count"));
@@ -6024,7 +6024,7 @@ mod tests {
             },
         ];
 
-        prune_unreferenced_local_declarations(&mut func);
+        prune_unreferenced_local_declarations(&symbols, &mut func);
 
         assert_eq!(func.locals.len(), 1);
         assert_eq!(func.symbols.borrow().name(func.locals[0].name), "live");
@@ -6955,7 +6955,7 @@ mod tests {
             type_oracle: None,
         };
         let blocks: Vec<_> = func.blocks().cloned().collect();
-        let use_info = analysis::UseInfo::analyze(&blocks, &env);
+        let use_info = analysis::UseInfo::analyze(&symbols, &blocks, &env);
         let profiles = analysis::use_info::collect_local_struct_field_access_profiles(
             &use_info,
             &func,

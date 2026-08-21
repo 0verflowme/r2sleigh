@@ -309,6 +309,7 @@ mod tests {
         ctx: &mut FoldingContext<'_>,
         args: &[crate::analysis::CallArgBinding],
     ) {
+        let symbols = test_table();
         let mut view = ctx
             .inputs
             .prepared_semantic_view
@@ -317,7 +318,7 @@ mod tests {
         for binding in args {
             if let Some(name) = &binding.source_var_name {
                 view.owner_expr_by_name
-                    .insert(name.clone(), fixture_owner_expr_for_arg(binding));
+                    .insert(name.clone(), fixture_owner_expr_for_arg(&symbols, binding));
             }
         }
         ctx.inputs.prepared_semantic_view = Some(Box::leak(Box::new(view)));
@@ -2114,6 +2115,7 @@ mod tests {
 
     #[test]
     fn source_call_identity_residualizes_replayed_imported_result_call_arg() {
+        let symbols = test_table();
         let mut ctx = FoldingContext::new(64);
         let source_call = (0x1000, 0);
         install_callsite_resolution(
@@ -2144,13 +2146,14 @@ mod tests {
                 &poisoned_func,
                 vec![binding],
             ),
-            vec![FoldingContext::unresolved_call_arg_expr()],
+            vec![FoldingContext::unresolved_call_arg_expr(&symbols)],
             "source-call replay must not render an uncertified nested call argument",
         );
     }
 
     #[test]
     fn source_call_identity_residualizes_replayed_result_call_with_transient_arg() {
+        let symbols = test_table();
         let mut ctx = FoldingContext::new(64);
         let source_call = (0x1000, 0);
         install_callsite_resolution(
@@ -2189,13 +2192,14 @@ mod tests {
                 &poisoned_func,
                 vec![binding],
             ),
-            vec![FoldingContext::unresolved_call_arg_expr()],
+            vec![FoldingContext::unresolved_call_arg_expr(&symbols)],
             "transient replayed args must refuse uncertified nested call arguments",
         );
     }
 
     #[test]
     fn source_call_identity_refuses_uncertified_nested_call_arg_with_typed_policy() {
+        let symbols = test_table();
         let mut ctx = FoldingContext::new(64);
         let outer_call = (0x1000, 0);
         let nested_call_site = (0x2000, 0);
@@ -2257,13 +2261,14 @@ mod tests {
                 &poisoned_outer_func,
                 vec![binding],
             ),
-            vec![FoldingContext::unresolved_call_arg_expr()],
+            vec![FoldingContext::unresolved_call_arg_expr(&symbols)],
             "source-proven text without certified call-argument proof must not render as executable nested C",
         );
     }
 
     #[test]
     fn source_call_identity_residualizes_when_nested_rendered_import_contradicts_typed_source() {
+        let symbols = test_table();
         let mut ctx = FoldingContext::new(64);
         let outer_call = (0x1000, 0);
         let nested_call_site = (0x2000, 0);
@@ -2326,13 +2331,14 @@ mod tests {
                 &poisoned_outer_func,
                 vec![binding],
             ),
-            vec![FoldingContext::unresolved_call_arg_expr()],
+            vec![FoldingContext::unresolved_call_arg_expr(&symbols)],
             "typed/rendered disagreement for a nested source call must refuse executable call-arg C",
         );
     }
 
     #[test]
     fn source_call_identity_residualizes_when_nested_source_match_is_ambiguous() {
+        let symbols = test_table();
         let mut ctx = FoldingContext::new(64);
         let outer_call = (0x1000, 0);
         let first_nested_call_site = (0x2000, 0);
@@ -2386,7 +2392,7 @@ mod tests {
                 &poisoned_outer_func,
                 vec![binding],
             ),
-            vec![FoldingContext::unresolved_call_arg_expr()],
+            vec![FoldingContext::unresolved_call_arg_expr(&symbols)],
             "ambiguous nested source-call matches must refuse instead of picking a source",
         );
     }
@@ -2480,6 +2486,7 @@ mod tests {
 
     #[test]
     fn imported_arg_nested_call_without_source_residualizes_instead_of_truncating() {
+        let symbols = test_table();
         let mut ctx = FoldingContext::new(64);
         install_known_one_arg_signature(&mut ctx);
         let call = CExpr::call(
@@ -2489,7 +2496,7 @@ mod tests {
 
         assert_eq!(
             ctx.normalize_imported_call_arg_expr(call.clone(), false, false, true),
-            FoldingContext::unresolved_call_arg_expr(),
+            FoldingContext::unresolved_call_arg_expr(&symbols),
             "source-less nested call arguments must refuse instead of being truncated or rendered"
         );
     }
@@ -3303,6 +3310,7 @@ mod tests {
 
     #[test]
     fn imported_result_binding_residualizes_when_named_owner_is_not_stable() {
+        let symbols = test_table();
         let mut ctx = make_x86_64_ctx();
         let owner = make_var("tmp:buf", 1, 8);
         let shadow = make_var("tmp:3ea80", 1, 8);
@@ -3345,7 +3353,7 @@ mod tests {
 
         assert_eq!(
             rendered,
-            FoldingContext::unresolved_call_arg_expr(),
+            FoldingContext::unresolved_call_arg_expr(&symbols),
             "unstable owner candidates must not fall back to replayed malloc call"
         );
     }
@@ -11383,6 +11391,14 @@ mod tests {
     fn call_source_proof_raw_owner_recovery_rejects_alias_owner_without_function_facts() {
         fn seed_owner(ctx: &mut FoldingContext<'_>, source_call: (u64, usize), alias: &str) {
             let symbols = test_table();
+            let symbols = test_table();
+            let symbols = test_table();
+            let symbols = test_table();
+            let symbols = test_table();
+            let symbols = test_table();
+            let symbols = test_table();
+            let symbols = test_table();
+            let symbols = test_table();
             ctx.state
                 .analysis_ctx
                 .use_info
@@ -11468,6 +11484,7 @@ mod tests {
 
     #[test]
     fn test_use_info_deterministic() {
+        let symbols = test_table();
         let eax_0 = make_var("EAX", 0, 4);
         let tmp = make_var("tmp:8200", 1, 4);
         let block = make_block(vec![
@@ -11489,13 +11506,14 @@ mod tests {
 
         let cfg_a = ctx_a.to_pass_env();
         let cfg_b = ctx_b.to_pass_env();
-        let info_a = analysis::UseInfo::analyze(&blocks, &cfg_a);
-        let info_b = analysis::UseInfo::analyze(&blocks, &cfg_b);
+        let info_a = analysis::UseInfo::analyze(&symbols, &blocks, &cfg_a);
+        let info_b = analysis::UseInfo::analyze(&symbols, &blocks, &cfg_b);
         assert_eq!(info_a, info_b, "UseInfo analysis should be deterministic");
     }
 
     #[test]
     fn test_flag_info_transitive_marking_and_guard() {
+        let symbols = test_table();
         let edi_0 = make_var("EDI", 0, 4);
         let tmp = make_var("tmp:8300", 1, 4);
         let zf_1 = make_var("ZF", 1, 1);
@@ -11526,8 +11544,8 @@ mod tests {
         let ctx = FoldingContext::new(64);
         let blocks = vec![flag_only_block];
         let cfg = ctx.to_pass_env();
-        let use_info = analysis::UseInfo::analyze(&blocks, &cfg);
-        let flag_info = analysis::FlagInfo::analyze(&blocks, &use_info, &cfg);
+        let use_info = analysis::UseInfo::analyze(&symbols, &blocks, &cfg);
+        let flag_info = analysis::FlagInfo::analyze(&symbols, &blocks, &use_info, &cfg);
         assert!(flag_info.flag_only_values.contains(&tmp.display_name()));
 
         let tmp2 = make_var("tmp:8400", 1, 4);
@@ -11562,13 +11580,14 @@ mod tests {
         let ctx = FoldingContext::new(64);
         let blocks = vec![guarded_block];
         let cfg = ctx.to_pass_env();
-        let use_info = analysis::UseInfo::analyze(&blocks, &cfg);
-        let flag_info = analysis::FlagInfo::analyze(&blocks, &use_info, &cfg);
+        let use_info = analysis::UseInfo::analyze(&symbols, &blocks, &cfg);
+        let flag_info = analysis::FlagInfo::analyze(&symbols, &blocks, &use_info, &cfg);
         assert!(!flag_info.flag_only_values.contains(&tmp2.display_name()));
     }
 
     #[test]
     fn test_stack_info_arg_alias_requires_version_zero() {
+        let symbols = test_table();
         let rbp_1 = make_var("RBP", 1, 8);
         let eax_1 = make_var("EAX", 1, 4);
         let addr = make_var("tmp:8500", 1, 8);
@@ -11589,8 +11608,8 @@ mod tests {
         let ctx = FoldingContext::new(64);
         let blocks = vec![block];
         let cfg = ctx.to_pass_env();
-        let use_info = analysis::UseInfo::analyze(&blocks, &cfg);
-        let stack_info = analysis::StackInfo::analyze(&blocks, &use_info, &cfg);
+        let use_info = analysis::UseInfo::analyze(&symbols, &blocks, &cfg);
+        let stack_info = analysis::StackInfo::analyze(&symbols, &blocks, &use_info, &cfg);
 
         assert!(
             !stack_info.stack_arg_aliases.values().any(|v| v == "arg1"),
@@ -11614,6 +11633,7 @@ mod tests {
 
     #[test]
     fn annotate_stack_slot_semantics_keeps_scalar_return_kind_across_multiple_return_exits() {
+        let symbols = test_table();
         use r2il::R2ILBlock;
         use r2ssa::SSAFunction;
 
@@ -11718,8 +11738,8 @@ mod tests {
         };
 
         let fold_blocks: Vec<_> = func.blocks().cloned().collect();
-        let mut info = analysis::UseInfo::analyze(&fold_blocks, &env);
-        analysis::use_info::annotate_stack_slot_semantics(
+        let mut info = analysis::UseInfo::analyze(&symbols, &fold_blocks, &env);
+        analysis::use_info::annotate_stack_slot_semantics(&symbols, 
             &mut info,
             &func,
             &HashSet::from([-4]),
@@ -18312,6 +18332,7 @@ mod tests {
 
     #[test]
     fn certified_call_arg_uses_function_facts_value_over_unknown_semantic_binding() {
+        let symbols = test_table();
         let arch = make_test_arch_x86_64();
         let mut entry = R2ILBlock::new(0x1000, 4);
         entry.push(R2ILOp::Copy {
@@ -18373,7 +18394,7 @@ mod tests {
         );
         assert_eq!(
             rendered_args,
-            vec![FoldingContext::unresolved_call_arg_expr()],
+            vec![FoldingContext::unresolved_call_arg_expr(&symbols)],
             "unknown semantic args must stay visibly unresolved before certification"
         );
 
@@ -18897,7 +18918,7 @@ mod tests {
         let render = render_facts(true);
         let view = prepared_view(arg_value, crate::symbol::var_ref(&symbols, "n"));
         let function_facts = r2types::FunctionFacts::default();
-        let adapter = CertifiedRenderPlan::new(
+        let adapter = CertifiedRenderPlan::new(&symbols, 
             &function_facts,
             &view,
             CertifiedRenderContext::new(&prepared, &render),
@@ -18908,7 +18929,7 @@ mod tests {
         );
 
         let unrenderable = render_facts(false);
-        let adapter = CertifiedRenderPlan::new(
+        let adapter = CertifiedRenderPlan::new(&symbols, 
             &function_facts,
             &view,
             CertifiedRenderContext::new(&prepared, &unrenderable),
@@ -18919,7 +18940,7 @@ mod tests {
         );
 
         let wrong_value_view = prepared_view(r2ssa::ValueId(9999), crate::symbol::var_ref(&symbols, "n"));
-        let adapter = CertifiedRenderPlan::new(
+        let adapter = CertifiedRenderPlan::new(&symbols, 
             &function_facts,
             &wrong_value_view,
             CertifiedRenderContext::new(&prepared, &render),
@@ -18930,7 +18951,7 @@ mod tests {
         );
 
         let raw_storage_view = prepared_view(arg_value, crate::symbol::var_ref(&symbols, "tmp:raw_1"));
-        let adapter = CertifiedRenderPlan::new(
+        let adapter = CertifiedRenderPlan::new(&symbols, 
             &function_facts,
             &raw_storage_view,
             CertifiedRenderContext::new(&prepared, &render),

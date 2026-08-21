@@ -100,8 +100,10 @@ pub(crate) struct PassEnv<'a> {
     pub(crate) function_names: &'a HashMap<u64, String>,
     #[cfg(test)]
     pub(crate) strings: &'a HashMap<u64, String>,
+    /// What the binary calls the thing at an address, which is not a name this
+    /// rendering declares.
     #[cfg(test)]
-    pub(crate) symbols: &'a HashMap<u64, String>,
+    pub(crate) binary_symbols: &'a HashMap<u64, String>,
     /// String literals the source recorded, for rendering a constant that
     /// points at text as the text it points at.
     pub(crate) string_literals: &'a BTreeMap<u64, String>,

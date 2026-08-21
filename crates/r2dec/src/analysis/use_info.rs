@@ -82,7 +82,7 @@ pub(crate) fn analyze_with_control(symbols: &std::cell::RefCell<crate::symbol::S
 pub(crate) fn analyze_for_local_struct_accesses(blocks: &[SSABlock], env: &PassEnv<'_>) -> UseInfo {
     let execution = SsaExecutionControl::default();
     let control = DecompileWorkControl::new(&execution, DecompileWorkPhase::Structuring);
-    analyze_for_local_struct_accesses_with_control(blocks, env, control)
+    analyze_for_local_struct_accesses_with_control(&symbols, blocks, env, control)
         .expect("default decompiler work control cannot stop")
 }
 
@@ -161,7 +161,7 @@ fn analyze_with_definition_overrides_mode(symbols: &std::cell::RefCell<crate::sy
     populate_frame_object_field_roots(symbols, &mut scratch, blocks, env);
     populate_stable_memory_values(symbols, &mut scratch, blocks, env);
     refresh_semantic_values(symbols, &mut scratch, blocks, env);
-    rebuild_definitions(&mut scratch, blocks, env, definition_overrides);
+    rebuild_definitions(symbols, &mut scratch, blocks, env, definition_overrides);
 
     analyze_call_args(symbols, &mut scratch, blocks, env);
     bind_single_use_call_result_definitions(symbols, &mut scratch, blocks, env);
@@ -2155,7 +2155,8 @@ fn struct_field_access_profile_for_addr(
     env: &PassEnv<'_>,
     arg_slot_map: &HashMap<String, usize>,
 ) -> Option<LocalStructFieldAccessProfile> {
-    let shape = semantic_addr_for_var(info, addr, env)?;
+    let symbols = test_table();
+    let shape = semantic_addr_for_var(&symbols, info, addr, env)?;
     if shape.offset_bytes < 0 {
         return None;
     }
@@ -2184,6 +2185,7 @@ fn arg_slot_for_value_ref(
     arg_slot_map: &HashMap<String, usize>,
     depth: u32,
 ) -> Option<usize> {
+    let symbols = test_table();
     if depth > 8 {
         return None;
     }
@@ -2633,7 +2635,7 @@ fn collect_definitions(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
             } else {
                 let expr = {
                     let lower = LowerCtx {
-                        symbols: env.symbols,
+                        symbols,
                         string_literals: env.string_literals,
                         use_info: None,
                         definitions: &scratch.info.definitions,
@@ -2692,6 +2694,7 @@ fn collect_definitions(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
 }
 
 fn rebuild_definitions(
+    symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
     scratch: &mut UseScratch,
     blocks: &[SSABlock],
     env: &PassEnv<'_>,
@@ -2709,7 +2712,7 @@ fn rebuild_definitions(
                 expr
             } else {
                 let lower = LowerCtx {
-                    symbols: env.symbols,
+                    symbols,
                     string_literals: env.string_literals,
                     use_info: None,
                     definitions: &rebuilt,
@@ -5347,7 +5350,7 @@ fn analyze_call_args(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, s
                 .filter_map(|(idx, op)| op.dst().map(|dst| (dst.display_name(), idx)))
                 .collect::<HashMap<_, _>>();
             let lower = LowerCtx {
-                symbols: env.symbols,
+                symbols,
                 string_literals: env.string_literals,
                 use_info: None,
                 definitions: &scratch.info.definitions,
@@ -5587,7 +5590,7 @@ fn analyze_call_args(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, s
 
             if let Some(ret_family) = ret_family.as_deref() {
                 let lower = LowerCtx {
-                    symbols: env.symbols,
+                    symbols,
                     string_literals: env.string_literals,
                     use_info: None,
                     definitions: &scratch.info.definitions,
@@ -5679,7 +5682,7 @@ fn bind_single_use_call_result_definitions(symbols: &std::cell::RefCell<crate::s
             .collect::<HashMap<_, _>>();
         for (op_idx, op) in block.ops.iter().enumerate() {
             let lower = LowerCtx {
-                symbols: env.symbols,
+                symbols,
                 string_literals: env.string_literals,
                 use_info: None,
                 definitions: &scratch.info.definitions,
@@ -5788,7 +5791,7 @@ fn bind_call_result_alias_definitions(symbols: &std::cell::RefCell<crate::symbol
             let src_key = src.display_name();
             let uses_current_call_result = {
                 let lower = LowerCtx {
-                    symbols: env.symbols,
+                    symbols,
                     string_literals: env.string_literals,
                     use_info: None,
                     definitions: &info.definitions,
@@ -8900,13 +8903,15 @@ mod tests {
     }
 
     fn aliases_for(blocks: Vec<SSABlock>) -> HashMap<String, String> {
+        let symbols = test_table();
         let fixture = TestEnvFixture::new();
-        analyze(&blocks, &fixture.env()).var_aliases
+        analyze(&symbols, &blocks, &fixture.env()).var_aliases
     }
 
     fn analyze_info(blocks: Vec<SSABlock>) -> UseInfo {
+        let symbols = test_table();
         let fixture = TestEnvFixture::new();
-        analyze(&blocks, &fixture.env())
+        analyze(&symbols, &blocks, &fixture.env())
     }
 
     #[test]
@@ -8915,11 +8920,11 @@ mod tests {
         let fixture = TestEnvFixture::new();
         let env = fixture.env();
 
-        assert!(!expr_preserves_pointer_identity_for_call_arg(
+        assert!(!expr_preserves_pointer_identity_for_call_arg(&symbols, 
             &crate::symbol::var_ref(&symbols, "var_20h"),
             &env
         ));
-        assert!(expr_preserves_pointer_identity_for_call_arg(
+        assert!(expr_preserves_pointer_identity_for_call_arg(&symbols, 
             &crate::symbol::var_ref(&symbols, "buf"),
             &env
         ));
@@ -8932,8 +8937,8 @@ mod tests {
         let env = fixture.env();
 
         assert!(
-            call_arg_expr_score(&crate::symbol::var_ref(&symbols, "len"), &env)
-                > call_arg_expr_score(&crate::symbol::var_ref(&symbols, "var_20h"), &env)
+            call_arg_expr_score(&symbols, &crate::symbol::var_ref(&symbols, "len"), &env)
+                > call_arg_expr_score(&symbols, &crate::symbol::var_ref(&symbols, "var_20h"), &env)
         );
     }
 
@@ -9528,13 +9533,14 @@ mod tests {
         )));
 
         assert!(
-            call_arg_expr_score(&literalish, &env) > call_arg_expr_score(&stacky, &env),
+            call_arg_expr_score(&symbols, &literalish, &env) > call_arg_expr_score(&symbols, &stacky, &env),
             "literal-capable const-add should outrank stack placeholder chain"
         );
     }
 
     #[test]
     fn call_arg_collection_includes_immediate_stack_call_args() {
+        let symbols = test_table();
         let fixture = TestEnvFixture {
             sp_name: "sp".to_string(),
             fp_name: "x29".to_string(),
@@ -9580,7 +9586,7 @@ mod tests {
             },
         ]);
 
-        let info = analyze(&[block], &fixture.env());
+        let info = analyze(&symbols, &[block], &fixture.env());
         let args = info.call_args.get(&(0x1000, 6)).expect("call args");
         assert_eq!(
             args.len(),
@@ -9595,6 +9601,7 @@ mod tests {
 
     #[test]
     fn custom_space_stack_stores_are_not_call_arguments() {
+        let symbols = test_table();
         let fixture = TestEnvFixture {
             sp_name: "sp".to_string(),
             fp_name: "x29".to_string(),
@@ -9624,7 +9631,7 @@ mod tests {
             },
         ]);
 
-        let info = analyze(&[block], &fixture.env());
+        let info = analyze(&symbols, &[block], &fixture.env());
         assert_eq!(
             info.call_args.get(&(0x1000, 3)).map(Vec::len),
             Some(1),
@@ -9634,6 +9641,7 @@ mod tests {
 
     #[test]
     fn call_arg_collection_tracks_immediate_stack_args_through_copied_stack_base() {
+        let symbols = test_table();
         let fixture = TestEnvFixture {
             sp_name: "sp".to_string(),
             fp_name: "x29".to_string(),
@@ -9684,7 +9692,7 @@ mod tests {
             },
         ]);
 
-        let info = analyze(&[block], &fixture.env());
+        let info = analyze(&symbols, &[block], &fixture.env());
         let args = info.call_args.get(&(0x1000, 7)).expect("call args");
         assert_eq!(
             args.len(),
@@ -9695,6 +9703,7 @@ mod tests {
 
     #[test]
     fn call_arg_collection_tracks_immediate_stack_args_through_synthetic_call_home_base() {
+        let symbols = test_table();
         let fixture = TestEnvFixture {
             sp_name: "sp".to_string(),
             fp_name: "x29".to_string(),
@@ -9740,7 +9749,7 @@ mod tests {
             },
         ]);
 
-        let info = analyze(&[block], &fixture.env());
+        let info = analyze(&symbols, &[block], &fixture.env());
         let args = info.call_args.get(&(0x1000, 6)).expect("call args");
         assert_eq!(
             args.len(),
@@ -9751,6 +9760,7 @@ mod tests {
 
     #[test]
     fn non_imported_arm64_helper_call_prefers_stack_home_args_over_missing_registers() {
+        let symbols = test_table();
         let fixture = TestEnvFixture {
             sp_name: "sp".to_string(),
             fp_name: "x29".to_string(),
@@ -9876,7 +9886,7 @@ mod tests {
             },
         ]);
 
-        let info = analyze(&[block], &fixture.env());
+        let info = analyze(&symbols, &[block], &fixture.env());
         let args = info.call_args.get(&(0x1000, 19)).expect("call args");
         assert_eq!(
             args.len(),
@@ -9885,7 +9895,7 @@ mod tests {
         );
         assert!(
             !args.iter().any(|binding| {
-                semantic_call_arg_is_generic_register_root(&binding.arg, &fixture.env())
+                semantic_call_arg_is_generic_register_root(&symbols, &binding.arg, &fixture.env())
             }),
             "helper call args should not fall back to generic register roots, got {args:?}"
         );
@@ -9910,7 +9920,7 @@ mod tests {
         let home_slot = mk("tmp:home", 1, 8);
         let reloaded_home = mk("X8", 87, 8);
 
-        let info = analyze(
+        let info = analyze(&symbols, 
             &[single_block(vec![
                 SSAOp::IntAdd {
                     dst: local_slot.clone(),
@@ -9970,6 +9980,7 @@ mod tests {
     #[test]
     fn imported_printf_after_helper_call_keeps_forwarded_local_arg_out_of_positive_stack_home() {
         fn fallback_contains_stack_placeholder(expr: &CExpr) -> bool {
+            let symbols = test_table();
             match expr {
                 CExpr::External { .. } => false,
                 CExpr::Var(name) => {
@@ -10104,7 +10115,7 @@ mod tests {
             },
         ]);
 
-        let info = analyze(std::slice::from_ref(&block), &env);
+        let info = analyze(&symbols, std::slice::from_ref(&block), &env);
         let lower = LowerCtx {
             string_literals: env.string_literals,
             use_info: Some(&info),
@@ -10136,7 +10147,7 @@ mod tests {
             lower: &lower,
             env: &env,
         };
-        let preserved = preserved_input_binding_from_stack_home(
+        let preserved = preserved_input_binding_from_stack_home(&symbols, 
             &stack_home_query,
             &reloaded_home,
             reloaded_home_idx,
@@ -10268,7 +10279,7 @@ mod tests {
             },
         ]);
 
-        let info = analyze(&[block], &env);
+        let info = analyze(&symbols, &[block], &env);
         assert!(
             matches!(
                 info.definitions.get("tmp:3a680_7"),
@@ -10281,6 +10292,7 @@ mod tests {
 
     #[test]
     fn direct_x0_reuse_shape_can_synthesize_helper_call_result_expr() {
+        let symbols = test_table();
         let mut fixture = TestEnvFixture {
             sp_name: "sp".to_string(),
             fp_name: "x29".to_string(),
@@ -10464,7 +10476,7 @@ mod tests {
             },
         ]);
 
-        let info = analyze(std::slice::from_ref(&block), &env);
+        let info = analyze(&symbols, std::slice::from_ref(&block), &env);
         let lower = LowerCtx {
             string_literals: env.string_literals,
             use_info: None,
@@ -10486,7 +10498,7 @@ mod tests {
             .iter()
             .position(|op| matches!(op, SSAOp::Call { target } if target.display_name() == "ram:1000005d4_0"))
             .expect("helper call idx");
-        let expr = call_result_expr_for_call_at(
+        let expr = call_result_expr_for_call_at(&symbols, 
             &info,
             &lower,
             block.addr,
@@ -10505,6 +10517,7 @@ mod tests {
 
     #[test]
     fn forwards_positive_stack_home_across_a_single_call_boundary() {
+        let symbols = test_table();
         let fixture = TestEnvFixture {
             sp_name: "sp".to_string(),
             fp_name: "x29".to_string(),
@@ -10517,7 +10530,7 @@ mod tests {
         let stored = mk("X8", 30, 8);
         let loaded = mk("X11", 2, 8);
 
-        let info = analyze(
+        let info = analyze(&symbols, 
             &[single_block(vec![
                 SSAOp::IntAdd {
                     dst: home.clone(),
@@ -10554,6 +10567,7 @@ mod tests {
 
     #[test]
     fn does_not_forward_positive_stack_home_across_multiple_call_boundaries() {
+        let symbols = test_table();
         let fixture = TestEnvFixture {
             sp_name: "sp".to_string(),
             fp_name: "x29".to_string(),
@@ -10565,7 +10579,7 @@ mod tests {
         let home = mk("tmp:home", 1, 8);
         let loaded = mk("X11", 2, 8);
 
-        let info = analyze(
+        let info = analyze(&symbols, 
             &[single_block(vec![
                 SSAOp::IntAdd {
                     dst: home.clone(),
@@ -10727,6 +10741,7 @@ mod tests {
 
     #[test]
     fn semantic_name_filters_use_typed_ssa_storage_and_register_kinds() {
+        let symbols = test_table();
         for name in [
             "tmp:1",
             "TMP:1",
@@ -10736,7 +10751,7 @@ mod tests {
             "space1:20",
         ] {
             assert!(
-                is_low_signal_name(name),
+                is_low_signal_name(&symbols, name),
                 "{name} should be low-signal raw SSA storage/register"
             );
             assert!(
@@ -10745,17 +10760,18 @@ mod tests {
             );
         }
 
-        assert!(is_low_signal_name("t42"));
+        assert!(is_low_signal_name(&symbols, "t42"));
         assert!(!is_semantic_binding_base("t42"));
         assert!(is_semantic_binding_base("local_4"));
         assert!(is_semantic_binding_base("arg1"));
         assert!(is_semantic_binding_base("sym.helper"));
-        assert!(!is_low_signal_name("value"));
+        assert!(!is_low_signal_name(&symbols, "value"));
         assert!(!is_semantic_binding_base("value"));
     }
 
     #[test]
     fn call_arg_name_filters_use_typed_ssa_storage_kinds() {
+        let symbols = test_table();
         let fixture = TestEnvFixture::new();
         let env = fixture.env();
 
@@ -10776,38 +10792,38 @@ mod tests {
             "RAM:401000",
         ] {
             assert!(
-                is_call_arg_transient_name(name),
+                is_call_arg_transient_name(&symbols, name),
                 "{name} should be a transient call-argument carrier"
             );
         }
 
-        assert!(is_call_arg_transient_name("rax_1"));
-        assert!(is_call_arg_transient_name("x8_0"));
-        assert!(!is_call_arg_transient_name("space1:20"));
-        assert!(!is_call_arg_transient_name("value"));
+        assert!(is_call_arg_transient_name(&symbols, "rax_1"));
+        assert!(is_call_arg_transient_name(&symbols, "x8_0"));
+        assert!(!is_call_arg_transient_name(&symbols, "space1:20"));
+        assert!(!is_call_arg_transient_name(&symbols, "value"));
     }
 
     #[test]
     fn call_arg_preservation_score_uses_typed_symbol_and_object_names() {
         let symbols = test_table();
         assert_eq!(
-            call_arg_expr_preservation_score(&crate::symbol::var_ref(&symbols, "tmp:1"), 0),
+            call_arg_expr_preservation_score(&symbols, &crate::symbol::var_ref(&symbols, "tmp:1"), 0),
             -60
         );
         assert_eq!(
-            call_arg_expr_preservation_score(&crate::symbol::var_ref(&symbols, "sym.helper"), 0),
+            call_arg_expr_preservation_score(&symbols, &crate::symbol::var_ref(&symbols, "sym.helper"), 0),
             180
         );
         assert_eq!(
-            call_arg_expr_preservation_score(&crate::symbol::var_ref(&symbols, "obj.global"), 0),
+            call_arg_expr_preservation_score(&symbols, &crate::symbol::var_ref(&symbols, "obj.global"), 0),
             180
         );
         assert_eq!(
-            call_arg_expr_preservation_score(&crate::symbol::var_ref(&symbols, "data.global"), 0),
+            call_arg_expr_preservation_score(&symbols, &crate::symbol::var_ref(&symbols, "data.global"), 0),
             70
         );
         assert_eq!(
-            call_arg_expr_preservation_score(&crate::symbol::var_ref(&symbols, "got.slot"), 0),
+            call_arg_expr_preservation_score(&symbols, &crate::symbol::var_ref(&symbols, "got.slot"), 0),
             70
         );
     }
@@ -10826,13 +10842,13 @@ mod tests {
             mk("stack_10", 0, 8),
         ] {
             assert_eq!(
-                semantic_source_value_for_var(&info, &var),
+                semantic_source_value_for_var(&symbols, &info, &var),
                 None,
                 "{} should not become a semantic root",
                 var.display_name()
             );
             assert_eq!(
-                semantic_or_scalar_source_value(&info, &var.display_name()),
+                semantic_or_scalar_source_value(&symbols, &info, &var.display_name()),
                 None,
                 "{} should not become a fallback scalar expression",
                 var.display_name()
@@ -10841,15 +10857,15 @@ mod tests {
 
         let ordinary = mk("value", 0, 8);
         assert!(matches!(
-            semantic_source_value_for_var(&info, &ordinary),
+            semantic_source_value_for_var(&symbols, &info, &ordinary),
             Some(SemanticValue::Scalar(ScalarValue::Root(root))) if root.var == ordinary
         ));
         assert!(matches!(
-            semantic_or_scalar_source_value(&info, "value_0"),
+            semantic_or_scalar_source_value(&symbols, &info, "value_0"),
             Some(SemanticValue::Scalar(ScalarValue::Expr(CExpr::Var(name)))) if name == symbols.borrow_mut().declare_or_reuse("value")
         ));
         assert!(matches!(
-            semantic_or_scalar_source_value(&info, "const:1_0"),
+            semantic_or_scalar_source_value(&symbols, &info, "const:1_0"),
             Some(SemanticValue::Scalar(ScalarValue::Expr(CExpr::IntLit(1))))
         ));
     }
@@ -10882,7 +10898,7 @@ mod tests {
             .insert(alias_slot.display_name(), "source_1".to_string());
 
         assert_eq!(
-            semantic_addr_for_var_with_depth(&info, &temp_slot, &env, 0),
+            semantic_addr_for_var_with_depth(&symbols, &info, &temp_slot, &env, 0),
             Some(NormalizedAddr {
                 base: BaseRef::StackSlot(0x20),
                 index: None,
@@ -10891,7 +10907,7 @@ mod tests {
             })
         );
         assert_eq!(
-            semantic_addr_for_var_with_depth(&info, &alias_slot, &env, 0),
+            semantic_addr_for_var_with_depth(&symbols, &info, &alias_slot, &env, 0),
             Some(NormalizedAddr {
                 base: BaseRef::StackSlot(0x28),
                 index: None,
@@ -10905,7 +10921,7 @@ mod tests {
             SemanticValue::Scalar(ScalarValue::Expr(crate::symbol::var_ref(&symbols, "semantic"))),
         );
         assert!(matches!(
-            semantic_addr_for_var_with_depth(&info, &temp_slot, &env, 0),
+            semantic_addr_for_var_with_depth(&symbols, &info, &temp_slot, &env, 0),
             Some(NormalizedAddr {
                 base: BaseRef::Raw(_),
                 index: None,
@@ -11081,6 +11097,7 @@ mod tests {
 
     #[test]
     fn generic_memory_forwarding_is_keyed_by_exact_space() {
+        let symbols = test_table();
         let mut fixture = TestEnvFixture::new();
         fixture
             .param_register_aliases
@@ -11093,7 +11110,7 @@ mod tests {
         let ram_loaded = mk("tmp:ram_load", 1, 4);
         let custom_loaded = mk("tmp:custom_load", 1, 4);
 
-        let ram_only = analyze(
+        let ram_only = analyze(&symbols, 
             &[single_block(vec![
                 SSAOp::IntAdd {
                     dst: addr.clone(),
@@ -11136,7 +11153,7 @@ mod tests {
             ))))
         ));
 
-        let custom_only = analyze(
+        let custom_only = analyze(&symbols, 
             &[single_block(vec![
                 SSAOp::IntAdd {
                     dst: addr.clone(),
@@ -11194,7 +11211,7 @@ mod tests {
             },
         );
 
-        build_formatted_defs(&mut scratch, &fixture.env());
+        build_formatted_defs(&symbols, &mut scratch, &fixture.env());
 
         assert!(
             matches!(
@@ -11539,6 +11556,7 @@ mod tests {
 
     #[test]
     fn semantic_addr_prefers_forwarded_pointer_source_over_stack_slot_identity() {
+        let symbols = test_table();
         let mut fixture = TestEnvFixture::new();
         fixture
             .param_register_aliases
@@ -11564,7 +11582,7 @@ mod tests {
         );
 
         assert!(matches!(
-            semantic_addr_for_var(&info, &loaded, &env),
+            semantic_addr_for_var(&symbols, &info, &loaded, &env),
             Some(NormalizedAddr {
                 base: BaseRef::Value(value_ref),
                 index: None,
@@ -11576,6 +11594,7 @@ mod tests {
 
     #[test]
     fn semantic_values_keep_live_arm64_struct_array_base_root_through_stack_reload() {
+        let symbols = test_table();
         let mut fixture = TestEnvFixture {
             sp_name: "sp".to_string(),
             fp_name: "fp".to_string(),
@@ -11689,7 +11708,7 @@ mod tests {
             },
         ]);
 
-        let info = analyze(&[block], &env);
+        let info = analyze(&symbols, &[block], &env);
 
         assert!(
             matches!(
@@ -11723,6 +11742,7 @@ mod tests {
 
     #[test]
     fn stable_entry_stack_values_preserve_masked_x86_struct_array_index_root() {
+        let symbols = test_table();
         let mut fixture = TestEnvFixture::new();
         fixture
             .param_register_aliases
@@ -11850,7 +11870,7 @@ mod tests {
             },
         ]);
 
-        let info = analyze(&[block], &env);
+        let info = analyze(&symbols, &[block], &env);
 
         assert!(
             matches!(
@@ -11869,6 +11889,7 @@ mod tests {
 
     #[test]
     fn stable_entry_stack_values_preserve_live_arm64_main_atoi_root_across_blocks() {
+        let symbols = test_table();
         let mut fixture = TestEnvFixture {
             sp_name: "sp".to_string(),
             fp_name: "fp".to_string(),
@@ -11970,7 +11991,7 @@ mod tests {
             ],
         };
 
-        let info = analyze(&[entry, reload], &env);
+        let info = analyze(&symbols, &[entry, reload], &env);
 
         let argv_semantic = info.semantic_values.get(&argv_root.display_name());
         assert!(
@@ -12004,6 +12025,7 @@ mod tests {
 
     #[test]
     fn frame_object_field_roots_survive_flat_stack_slot_conflicts() {
+        let symbols = test_table();
         let mut fixture = TestEnvFixture {
             sp_name: "sp".to_string(),
             fp_name: "fp".to_string(),
@@ -12124,7 +12146,7 @@ mod tests {
             ],
         };
 
-        let info = analyze(&[entry, conflict, reload], &env);
+        let info = analyze(&symbols, &[entry, conflict, reload], &env);
 
         assert!(
             !info.stable_stack_values.contains_key(&0x480),
@@ -12183,6 +12205,7 @@ mod tests {
 
     #[test]
     fn frame_object_field_roots_survive_semantically_equivalent_restores() {
+        let symbols = test_table();
         let mut fixture = TestEnvFixture {
             sp_name: "sp".to_string(),
             fp_name: "fp".to_string(),
@@ -12283,7 +12306,7 @@ mod tests {
             ],
         };
 
-        let info = analyze(&[entry, restorer], &env);
+        let info = analyze(&symbols, &[entry, restorer], &env);
 
         let root_key = FrameObjectFieldKey {
             base_slot_offset: 0x3e0,
@@ -12319,6 +12342,7 @@ mod tests {
 
     #[test]
     fn semantic_values_capture_observed_live_arm64_struct_array_loads() {
+        let symbols = test_table();
         let mut fixture = TestEnvFixture {
             sp_name: "sp".to_string(),
             fp_name: "fp".to_string(),
@@ -12600,7 +12624,7 @@ mod tests {
             },
         ]);
 
-        let info = analyze(&[block], &env);
+        let info = analyze(&symbols, &[block], &env);
 
         assert!(
             matches!(
@@ -12646,6 +12670,7 @@ mod tests {
 
     #[test]
     fn frame_slot_merges_capture_if_else_return_slot_values() {
+        let symbols = test_table();
         use r2il::{R2ILBlock, R2ILOp, Varnode};
         use r2ssa::SSAFunction;
 
@@ -12744,8 +12769,8 @@ mod tests {
         ];
 
         let blocks = func.blocks().cloned().collect::<Vec<_>>();
-        let mut info = analyze(&blocks, &env);
-        populate_frame_slot_merges(&mut info, &func, &env, None);
+        let mut info = analyze(&symbols, &blocks, &env);
+        populate_frame_slot_merges(&symbols, &mut info, &func, &env, None);
 
         let summary = info
             .frame_slot_merges
@@ -12795,6 +12820,7 @@ mod tests {
 
     #[test]
     fn frame_slot_merges_prefer_same_family_register_value_through_temp_copy() {
+        let symbols = test_table();
         use r2il::{R2ILBlock, R2ILOp, Varnode};
         use r2ssa::SSAFunction;
 
@@ -12901,8 +12927,8 @@ mod tests {
         ];
 
         let blocks = func.blocks().cloned().collect::<Vec<_>>();
-        let mut info = analyze(&blocks, &env);
-        populate_frame_slot_merges(&mut info, &func, &env, None);
+        let mut info = analyze(&symbols, &blocks, &env);
+        populate_frame_slot_merges(&symbols, &mut info, &func, &env, None);
 
         let summary = info
             .frame_slot_merges
@@ -12928,6 +12954,7 @@ mod tests {
 
     #[test]
     fn frame_slot_merges_keep_most_recent_same_family_constant_over_older_root_history() {
+        let symbols = test_table();
         use r2il::{R2ILBlock, R2ILOp, Varnode};
         use r2ssa::SSAFunction;
 
@@ -13021,8 +13048,8 @@ mod tests {
         ];
 
         let blocks = func.blocks().cloned().collect::<Vec<_>>();
-        let mut info = analyze(&blocks, &env);
-        populate_frame_slot_merges(&mut info, &func, &env, None);
+        let mut info = analyze(&symbols, &blocks, &env);
+        populate_frame_slot_merges(&symbols, &mut info, &func, &env, None);
 
         let summary = info
             .frame_slot_merges

@@ -475,7 +475,7 @@ fn populate_prepared_render_definitions(symbols: &std::cell::RefCell<crate::symb
             }
             let expr = {
                 let lower = LowerCtx {
-                    symbols: env.symbols,
+                    symbols,
                     string_literals: crate::analysis::lower::no_string_literals(),
                     use_info: Some(use_info),
                     definitions: &use_info.definitions,
@@ -4321,7 +4321,7 @@ mod tests {
             ..PreparedCallView::default()
         };
         assert!(
-            prepared_call_expr_from_view(&unproved).is_none(),
+            prepared_call_expr_from_view(&symbols, &unproved).is_none(),
             "prepared call expressions must not carry rendered args without ValueId proof"
         );
 
@@ -4332,7 +4332,7 @@ mod tests {
             ..PreparedCallView::default()
         };
         assert!(
-            prepared_call_expr_from_view(&missing_render_fact).is_none(),
+            prepared_call_expr_from_view(&symbols, &missing_render_fact).is_none(),
             "prepared call expressions require FunctionFacts call-render authorization"
         );
 
@@ -4353,7 +4353,7 @@ mod tests {
             ..PreparedCallView::default()
         };
         assert_eq!(
-            prepared_call_expr_from_view(&proved),
+            prepared_call_expr_from_view(&symbols, &proved),
             Some(CExpr::Call {
                 func: Box::new(crate::symbol::var_ref(&symbols, "sym.helper")),
                 args: vec![CExpr::IntLit(7)],
@@ -4403,7 +4403,7 @@ mod tests {
             ..PreparedSemanticView::default()
         };
 
-        let expr = prepared_simplify_binary_expr(
+        let expr = prepared_simplify_binary_expr(&symbols, 
             &view,
             BinaryOp::BitXor,
             crate::symbol::var_ref(&symbols, "b"),
@@ -4427,7 +4427,7 @@ mod tests {
             param_rank_by_alias: HashMap::from([("a".to_string(), 1)]),
             ..PreparedSemanticView::default()
         };
-        let expr = prepared_simplify_binary_expr(
+        let expr = prepared_simplify_binary_expr(&symbols, 
             &view,
             BinaryOp::Add,
             crate::symbol::var_ref(&symbols, "a"),
@@ -4447,7 +4447,7 @@ mod tests {
             param_rank_by_alias: HashMap::from([("a".to_string(), 1), ("b".to_string(), 2)]),
             ..PreparedSemanticView::default()
         };
-        let expr = prepared_simplify_binary_expr(
+        let expr = prepared_simplify_binary_expr(&symbols, 
             &view,
             BinaryOp::Add,
             crate::symbol::var_ref(&symbols, "b"),
@@ -4474,6 +4474,7 @@ mod tests {
 
     #[test]
     fn prepared_view_build_preserves_param_alias_contract() {
+        let symbols = test_table();
         let prepared = test_prepared_artifact();
         let abi_arg_regs = vec!["rdi".to_string(), "rsi".to_string()];
         let stack_slots = BTreeMap::new();
@@ -4483,7 +4484,7 @@ mod tests {
             ("rsi".to_string(), "argv".to_string()),
         ]);
 
-        let view = PreparedSemanticView::build(PreparedSemanticViewInputs {
+        let view = PreparedSemanticView::build(&symbols, PreparedSemanticViewInputs {
             prepared: &prepared,
             abi_arg_regs: &abi_arg_regs,
             stack_slots: &stack_slots,
@@ -4528,7 +4529,7 @@ mod tests {
         let function_facts =
             FunctionFacts::default().with_callee_resolution(callee_resolution.clone());
 
-        let view = PreparedSemanticView::build(PreparedSemanticViewInputs {
+        let view = PreparedSemanticView::build(&symbols, PreparedSemanticViewInputs {
             prepared: &prepared,
             abi_arg_regs: &abi_arg_regs,
             stack_slots: &stack_slots,
@@ -4568,6 +4569,7 @@ mod tests {
 
     #[test]
     fn prepared_view_uses_typed_direct_addr_identity_through_callsite_facts() {
+        let symbols = test_table();
         let prepared = test_prepared_call_artifact();
         let abi_arg_regs = vec!["rdi".to_string(), "rsi".to_string()];
         let key = r2types::CalleeIdentityKey::DirectAddress(0x401000);
@@ -4587,7 +4589,7 @@ mod tests {
             .with_callee_resolution(callee_resolution.clone())
             .with_callsites(callsite_facts.clone());
 
-        let view = PreparedSemanticView::build(PreparedSemanticViewInputs {
+        let view = PreparedSemanticView::build(&symbols, PreparedSemanticViewInputs {
             prepared: &prepared,
             abi_arg_regs: &abi_arg_regs,
             stack_slots: &stack_slots,
@@ -4627,6 +4629,7 @@ mod tests {
 
     #[test]
     fn prepared_view_requires_callsite_facts_for_direct_addr_identity() {
+        let symbols = test_table();
         let prepared = test_prepared_call_artifact();
         let abi_arg_regs = vec!["rdi".to_string(), "rsi".to_string()];
         let key = r2types::CalleeIdentityKey::DirectAddress(0x401000);
@@ -4643,7 +4646,7 @@ mod tests {
         let function_facts =
             FunctionFacts::default().with_callee_resolution(callee_resolution.clone());
 
-        let view = PreparedSemanticView::build(PreparedSemanticViewInputs {
+        let view = PreparedSemanticView::build(&symbols, PreparedSemanticViewInputs {
             prepared: &prepared,
             abi_arg_regs: &abi_arg_regs,
             stack_slots: &stack_slots,
@@ -4668,13 +4671,14 @@ mod tests {
 
     #[test]
     fn prepared_view_refuses_raw_callee_identity_without_typed_resolution() {
+        let symbols = test_table();
         let prepared = test_prepared_call_artifact();
         let abi_arg_regs = vec!["rdi".to_string(), "rsi".to_string()];
         let stack_slots = BTreeMap::new();
         let visible_bindings = Vec::new();
         let param_register_aliases = HashMap::new();
 
-        let view = PreparedSemanticView::build(PreparedSemanticViewInputs {
+        let view = PreparedSemanticView::build(&symbols, PreparedSemanticViewInputs {
             prepared: &prepared,
             abi_arg_regs: &abi_arg_regs,
             stack_slots: &stack_slots,
@@ -4692,13 +4696,14 @@ mod tests {
             "prepared semantic view must not certify raw callee names without typed resolution"
         );
         assert!(
-            prepared_call_expr_from_view(call_view).is_none(),
+            prepared_call_expr_from_view(&symbols, call_view).is_none(),
             "prepared calls must not fall back to fabricated sub_<addr> expressions"
         );
     }
 
     #[test]
     fn prepared_view_refuses_recursive_name_identity_without_typed_resolution() {
+        let symbols = test_table();
         let prepared = test_prepared_recursive_call_artifact();
         assert_eq!(
             prepared.structured().recursive_calls.len(),
@@ -4710,7 +4715,7 @@ mod tests {
         let visible_bindings = Vec::new();
         let param_register_aliases = HashMap::new();
 
-        let view = PreparedSemanticView::build(PreparedSemanticViewInputs {
+        let view = PreparedSemanticView::build(&symbols, PreparedSemanticViewInputs {
             prepared: &prepared,
             abi_arg_regs: &abi_arg_regs,
             stack_slots: &stack_slots,
@@ -4777,7 +4782,7 @@ mod tests {
             .with_callee_resolution(callee_resolution.clone())
             .with_callsites(callsite_facts.clone());
 
-        let view = PreparedSemanticView::build(PreparedSemanticViewInputs {
+        let view = PreparedSemanticView::build(&symbols, PreparedSemanticViewInputs {
             prepared: &prepared,
             abi_arg_regs: &abi_arg_regs,
             stack_slots: &stack_slots,
@@ -4802,6 +4807,7 @@ mod tests {
 
     #[test]
     fn prepared_call_args_require_function_facts_callsite_contract() {
+        let symbols = test_table();
         let prepared = test_prepared_two_arg_call_artifact();
         let abi_arg_regs = vec!["rdi".to_string(), "rsi".to_string()];
         let mut summaries = InterprocSummarySet::default();
@@ -4814,7 +4820,7 @@ mod tests {
         let visible_bindings = Vec::new();
         let param_register_aliases = HashMap::new();
 
-        let view = PreparedSemanticView::build(PreparedSemanticViewInputs {
+        let view = PreparedSemanticView::build(&symbols, PreparedSemanticViewInputs {
             prepared: &prepared,
             abi_arg_regs: &abi_arg_regs,
             stack_slots: &stack_slots,
@@ -4836,6 +4842,7 @@ mod tests {
 
     #[test]
     fn prepared_call_args_require_function_facts_location_contract() {
+        let symbols = test_table();
         let prepared = test_prepared_two_arg_call_artifact();
         let abi_arg_regs = vec!["rdi".to_string(), "rsi".to_string()];
         let mut callsite_facts = test_callsite_facts(&prepared);
@@ -4853,7 +4860,7 @@ mod tests {
         let param_register_aliases = HashMap::new();
         let function_facts = FunctionFacts::default().with_callsites(callsite_facts.clone());
 
-        let view = PreparedSemanticView::build(PreparedSemanticViewInputs {
+        let view = PreparedSemanticView::build(&symbols, PreparedSemanticViewInputs {
             prepared: &prepared,
             abi_arg_regs: &abi_arg_regs,
             stack_slots: &stack_slots,
@@ -4875,6 +4882,7 @@ mod tests {
 
     #[test]
     fn prepared_call_args_use_function_facts_callsite_contract() {
+        let symbols = test_table();
         let prepared = test_prepared_two_arg_call_artifact();
         let abi_arg_regs = vec!["rdi".to_string(), "rsi".to_string()];
         let callsite_facts = test_callsite_facts(&prepared);
@@ -4883,7 +4891,7 @@ mod tests {
         let param_register_aliases = HashMap::new();
         let function_facts = FunctionFacts::default().with_callsites(callsite_facts.clone());
 
-        let view = PreparedSemanticView::build(PreparedSemanticViewInputs {
+        let view = PreparedSemanticView::build(&symbols, PreparedSemanticViewInputs {
             prepared: &prepared,
             abi_arg_regs: &abi_arg_regs,
             stack_slots: &stack_slots,
@@ -4904,6 +4912,7 @@ mod tests {
 
     #[test]
     fn prepared_call_result_owner_requires_function_facts_contract() {
+        let symbols = test_table();
         let prepared = test_prepared_stack_owned_call_result_artifact();
         let abi_arg_regs = Vec::new();
         let stack_slots = BTreeMap::from([(
@@ -4920,7 +4929,7 @@ mod tests {
         let visible_bindings = Vec::new();
         let param_register_aliases = HashMap::new();
 
-        let view = PreparedSemanticView::build(PreparedSemanticViewInputs {
+        let view = PreparedSemanticView::build(&symbols, PreparedSemanticViewInputs {
             prepared: &prepared,
             abi_arg_regs: &abi_arg_regs,
             stack_slots: &stack_slots,
@@ -4945,6 +4954,7 @@ mod tests {
 
     #[test]
     fn prepared_branch_predicates_require_function_facts_control_contract() {
+        let symbols = test_table();
         let prepared = test_prepared_branch_artifact();
         assert!(
             !prepared.predicates().predicates.is_empty(),
@@ -4955,7 +4965,7 @@ mod tests {
         let visible_bindings = Vec::new();
         let param_register_aliases = HashMap::new();
 
-        let view = PreparedSemanticView::build(PreparedSemanticViewInputs {
+        let view = PreparedSemanticView::build(&symbols, PreparedSemanticViewInputs {
             prepared: &prepared,
             abi_arg_regs: &abi_arg_regs,
             stack_slots: &stack_slots,
@@ -4973,6 +4983,7 @@ mod tests {
 
     #[test]
     fn prepared_branch_predicates_use_function_facts_control_contract() {
+        let symbols = test_table();
         let prepared = test_prepared_branch_artifact();
         let control_facts = test_control_facts(&prepared);
         let abi_arg_regs = Vec::new();
@@ -4981,7 +4992,7 @@ mod tests {
         let param_register_aliases = HashMap::new();
         let function_facts = FunctionFacts::default().with_control(control_facts.clone());
 
-        let view = PreparedSemanticView::build(PreparedSemanticViewInputs {
+        let view = PreparedSemanticView::build(&symbols, PreparedSemanticViewInputs {
             prepared: &prepared,
             abi_arg_regs: &abi_arg_regs,
             stack_slots: &stack_slots,
@@ -5034,7 +5045,7 @@ mod tests {
             type_oracle: None,
         };
 
-        let facts = build_prepared_runtime_facts(&blocks, &env, &prepared, &view);
+        let facts = build_prepared_runtime_facts(&symbols, &blocks, &env, &prepared, &view);
 
         assert_eq!(facts.use_info.type_hints, type_hints);
     }
@@ -5068,43 +5079,43 @@ mod tests {
             type_oracle: None,
         };
 
-        assert!(!prepared_render_definition_is_safe(
+        assert!(!prepared_render_definition_is_safe(&symbols, 
             &crate::symbol::var_ref(&symbols, "tmp:1"),
             &env
         ));
-        assert!(!prepared_render_definition_is_safe(
+        assert!(!prepared_render_definition_is_safe(&symbols, 
             &crate::symbol::var_ref(&symbols, "ram:401000"),
             &env
         ));
-        assert!(!prepared_render_definition_is_safe(
+        assert!(!prepared_render_definition_is_safe(&symbols, 
             &crate::symbol::var_ref(&symbols, "unique:1"),
             &env
         ));
-        assert!(!prepared_render_definition_is_safe(
+        assert!(!prepared_render_definition_is_safe(&symbols, 
             &crate::symbol::var_ref(&symbols, "RDI"),
             &env
         ));
-        assert!(!prepared_render_definition_is_safe(
+        assert!(!prepared_render_definition_is_safe(&symbols, 
             &crate::symbol::var_ref(&symbols, "RBP"),
             &env
         ));
-        assert!(!prepared_render_definition_is_safe(
+        assert!(!prepared_render_definition_is_safe(&symbols, 
             &crate::symbol::var_ref(&symbols, "RAX"),
             &env
         ));
-        assert!(!prepared_render_definition_is_safe(
+        assert!(!prepared_render_definition_is_safe(&symbols, 
             &crate::symbol::var_ref(&symbols, "RCX"),
             &env
         ));
-        assert!(prepared_render_definition_is_safe(
+        assert!(prepared_render_definition_is_safe(&symbols, 
             &crate::symbol::var_ref(&symbols, "const:1"),
             &env
         ));
-        assert!(prepared_render_definition_is_safe(
+        assert!(prepared_render_definition_is_safe(&symbols, 
             &crate::symbol::var_ref(&symbols, "space1:20"),
             &env
         ));
-        assert!(prepared_render_definition_is_safe(
+        assert!(prepared_render_definition_is_safe(&symbols, 
             &crate::symbol::var_ref(&symbols, "value"),
             &env
         ));
@@ -5114,27 +5125,27 @@ mod tests {
     fn prepared_fallback_visible_expr_rejects_only_unrenderable_storage_names() {
         let symbols = test_table();
         assert_eq!(
-            prepared_fallback_visible_expr(&SSAVar::constant(1, 8)),
+            prepared_fallback_visible_expr(&symbols, &SSAVar::constant(1, 8)),
             None
         );
         assert_eq!(
-            prepared_fallback_visible_expr(&test_var("tmp:1", 0, 8)),
+            prepared_fallback_visible_expr(&symbols, &test_var("tmp:1", 0, 8)),
             None
         );
         assert_eq!(
-            prepared_fallback_visible_expr(&test_var("ram:401000", 0, 8)),
+            prepared_fallback_visible_expr(&symbols, &test_var("ram:401000", 0, 8)),
             None
         );
         assert_eq!(
-            prepared_fallback_visible_expr(&test_var("unique:1", 0, 8)),
+            prepared_fallback_visible_expr(&symbols, &test_var("unique:1", 0, 8)),
             None
         );
         assert_eq!(
-            prepared_fallback_visible_expr(&test_var("space1:20", 0, 8)),
+            prepared_fallback_visible_expr(&symbols, &test_var("space1:20", 0, 8)),
             Some(crate::symbol::var_ref(&symbols, "space1:20"))
         );
         assert_eq!(
-            prepared_fallback_visible_expr(&test_var("rax", 0, 8)),
+            prepared_fallback_visible_expr(&symbols, &test_var("rax", 0, 8)),
             Some(crate::symbol::var_ref(&symbols, "rax"))
         );
     }
@@ -5143,45 +5154,45 @@ mod tests {
     fn self_render_definition_uses_typed_temporary_render_name() {
         let symbols = test_table();
         let dst = test_var("tmp:11f80", 2, 8);
-        assert!(is_self_render_definition(
+        assert!(is_self_render_definition(&symbols, 
             &dst,
             &crate::symbol::var_ref(&symbols, "t11f80_2")
         ));
-        assert!(is_self_render_definition(
+        assert!(is_self_render_definition(&symbols, 
             &dst,
             &CExpr::Var(symbols.borrow_mut().declare_or_reuse(&dst.display_name()))
         ));
-        assert!(!is_self_render_definition(
+        assert!(!is_self_render_definition(&symbols, 
             &dst,
             &crate::symbol::var_ref(&symbols, "t11f80_3")
         ));
 
         let version_zero_temp = test_var("tmp:11f80", 0, 8);
-        assert!(is_self_render_definition(
+        assert!(is_self_render_definition(&symbols, 
             &version_zero_temp,
             &crate::symbol::var_ref(&symbols, "t11f80")
         ));
-        assert!(!is_self_render_definition(
+        assert!(!is_self_render_definition(&symbols, 
             &version_zero_temp,
             &crate::symbol::var_ref(&symbols, "t11f80_0")
         ));
 
         let versioned_reg = test_var("rax", 2, 8);
-        assert!(is_self_render_definition(
+        assert!(is_self_render_definition(&symbols, 
             &versioned_reg,
             &crate::symbol::var_ref(&symbols, "rax_2")
         ));
-        assert!(!is_self_render_definition(
+        assert!(!is_self_render_definition(&symbols, 
             &versioned_reg,
             &crate::symbol::var_ref(&symbols, "rax")
         ));
 
         let version_zero_reg = test_var("rbx", 0, 8);
-        assert!(is_self_render_definition(
+        assert!(is_self_render_definition(&symbols, 
             &version_zero_reg,
             &crate::symbol::var_ref(&symbols, "rbx")
         ));
-        assert!(!is_self_render_definition(
+        assert!(!is_self_render_definition(&symbols, 
             &version_zero_reg,
             &crate::symbol::var_ref(&symbols, "rbx_0")
         ));
@@ -5241,7 +5252,7 @@ mod tests {
         };
 
         assert_eq!(
-            prepared_signed_dividend_expr(&view, &producers, &dividend),
+            prepared_signed_dividend_expr(&symbols, &view, &producers, &dividend),
             Some(crate::symbol::var_ref(&symbols, "a"))
         );
     }
@@ -5293,7 +5304,7 @@ mod tests {
         };
 
         assert_eq!(
-            prepared_signed_dividend_expr(&view, &producers, &dividend),
+            prepared_signed_dividend_expr(&symbols, &view, &producers, &dividend),
             Some(crate::symbol::var_ref(&symbols, "a"))
         );
     }

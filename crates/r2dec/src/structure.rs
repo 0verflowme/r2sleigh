@@ -5361,6 +5361,7 @@ mod tests {
 
     #[test]
     fn cleanup_rewrites_pure_if_else_returns_to_ternary_return() {
+        let symbols = test_table();
         let input = CStmt::If {
             cond: CExpr::binary(BinaryOp::Eq, v("b"), CExpr::IntLit(0)),
             then_body: Box::new(CStmt::Return(Some(CExpr::IntLit(-1)))),
@@ -5371,7 +5372,7 @@ mod tests {
             ))))),
         };
 
-        let cleaned = ControlFlowStructurer::cleanup(input);
+        let cleaned = ControlFlowStructurer::cleanup(&symbols, input);
         assert_eq!(
             cleaned,
             CStmt::Return(Some(CExpr::Ternary {
@@ -5563,6 +5564,7 @@ mod tests {
 
     #[test]
     fn rewrites_canonical_while_to_for() {
+        let symbols = test_table();
         let input = CStmt::Block(vec![
             assign("i", CExpr::IntLit(0)),
             CStmt::while_loop(
@@ -5574,7 +5576,7 @@ mod tests {
             ),
         ]);
 
-        let cleaned = ControlFlowStructurer::cleanup(input);
+        let cleaned = ControlFlowStructurer::cleanup(&symbols, input);
         let CStmt::For {
             init,
             cond,
@@ -5598,6 +5600,7 @@ mod tests {
 
     #[test]
     fn rewrites_continue_tail_update_to_shared_for_latch() {
+        let symbols = test_table();
         let input = CStmt::Block(vec![
             CStmt::Block(vec![
                 assign("count", CExpr::IntLit(0)),
@@ -5637,7 +5640,7 @@ mod tests {
             ),
         ]);
 
-        let cleaned = ControlFlowStructurer::cleanup(input);
+        let cleaned = ControlFlowStructurer::cleanup(&symbols, input);
         let CStmt::Block(stmts) = cleaned else {
             panic!("Expected count init plus for-loop block, got {cleaned:?}");
         };
@@ -5683,6 +5686,7 @@ mod tests {
 
     #[test]
     fn rewrites_nested_else_duplicate_effect_to_or_condition() {
+        let symbols = test_table();
         let increment = expr_stmt(CExpr::Unary {
             op: UnaryOp::PostInc,
             operand: Box::new(v("count")),
@@ -5697,7 +5701,7 @@ mod tests {
             Some(increment.clone()),
         );
 
-        let cleaned = ControlFlowStructurer::cleanup(input);
+        let cleaned = ControlFlowStructurer::cleanup(&symbols, input);
         assert_eq!(
             cleaned,
             CStmt::if_stmt(
@@ -5714,6 +5718,7 @@ mod tests {
 
     #[test]
     fn rewrites_continue_tail_with_common_suffix_before_shared_latch() {
+        let symbols = test_table();
         let hash_xor = assign("hash", CExpr::binary(BinaryOp::BitXor, v("c"), v("hash")));
         let hash_mul = assign(
             "hash",
@@ -5761,7 +5766,7 @@ mod tests {
             ),
         ]);
 
-        let cleaned = ControlFlowStructurer::cleanup(input);
+        let cleaned = ControlFlowStructurer::cleanup(&symbols, input);
         let CStmt::Block(stmts) = cleaned else {
             panic!("Expected hash init plus for-loop block, got {cleaned:?}");
         };
@@ -5820,6 +5825,7 @@ mod tests {
 
     #[test]
     fn removes_duplicate_body_update_owned_by_for_latch() {
+        let symbols = test_table();
         let i_update_expr = CExpr::binary(
             BinaryOp::Assign,
             v("i"),
@@ -5836,7 +5842,7 @@ mod tests {
             ])),
         };
 
-        let cleaned = ControlFlowStructurer::cleanup(input);
+        let cleaned = ControlFlowStructurer::cleanup(&symbols, input);
         let CStmt::For { body, .. } = cleaned else {
             panic!("Expected for-loop, got {cleaned:?}");
         };
@@ -5849,6 +5855,7 @@ mod tests {
 
     #[test]
     fn rewrites_side_effect_free_assignments_to_compound_assignments() {
+        let symbols = test_table();
         let input = CStmt::Block(vec![
             assign("hash", CExpr::binary(BinaryOp::BitXor, v("c"), v("hash"))),
             assign(
@@ -5868,7 +5875,7 @@ mod tests {
             ),
         ]);
 
-        let cleaned = ControlFlowStructurer::cleanup(input);
+        let cleaned = ControlFlowStructurer::cleanup(&symbols, input);
         let CStmt::Block(stmts) = cleaned else {
             panic!("Expected block, got {cleaned:?}");
         };
@@ -5898,6 +5905,7 @@ mod tests {
 
     #[test]
     fn removes_dead_trailing_returns_inside_switch_cases() {
+        let symbols = test_table();
         let input = CStmt::Switch {
             expr: v("op"),
             cases: vec![crate::ast::SwitchCase {
@@ -5913,7 +5921,7 @@ mod tests {
             ]),
         };
 
-        let cleaned = ControlFlowStructurer::cleanup(input);
+        let cleaned = ControlFlowStructurer::cleanup(&symbols, input);
         let CStmt::Switch { cases, default, .. } = cleaned else {
             panic!("Expected switch, got {cleaned:?}");
         };
@@ -5923,6 +5931,7 @@ mod tests {
 
     #[test]
     fn rewrites_guard_break_while1_to_for() {
+        let symbols = test_table();
         let input = CStmt::Block(vec![
             assign("i", CExpr::IntLit(0)),
             CStmt::while_loop(
@@ -5942,7 +5951,7 @@ mod tests {
             ),
         ]);
 
-        let cleaned = ControlFlowStructurer::cleanup(input);
+        let cleaned = ControlFlowStructurer::cleanup(&symbols, input);
         let CStmt::For {
             cond: Some(cond),
             update: Some(update),
@@ -5975,6 +5984,7 @@ mod tests {
 
     #[test]
     fn does_not_rewrite_without_tail_update() {
+        let symbols = test_table();
         let input = CStmt::Block(vec![
             assign("i", CExpr::IntLit(0)),
             CStmt::while_loop(
@@ -5986,7 +5996,7 @@ mod tests {
             ),
         ]);
 
-        let cleaned = ControlFlowStructurer::cleanup(input);
+        let cleaned = ControlFlowStructurer::cleanup(&symbols, input);
         let CStmt::Block(stmts) = cleaned else {
             panic!("Expected unmatched loop to remain a block");
         };
@@ -5998,6 +6008,7 @@ mod tests {
 
     #[test]
     fn does_not_rewrite_when_cond_var_mismatch() {
+        let symbols = test_table();
         let input = CStmt::Block(vec![
             assign("i", CExpr::IntLit(0)),
             CStmt::while_loop(
@@ -6009,7 +6020,7 @@ mod tests {
             ),
         ]);
 
-        let cleaned = ControlFlowStructurer::cleanup(input);
+        let cleaned = ControlFlowStructurer::cleanup(&symbols, input);
         let CStmt::Block(stmts) = cleaned else {
             panic!("Expected unmatched condition var to remain a block");
         };
@@ -6021,6 +6032,7 @@ mod tests {
 
     #[test]
     fn accepts_self_assign_update_forms() {
+        let symbols = test_table();
         let updates = vec![
             CExpr::binary(
                 BinaryOp::Assign,
@@ -6047,7 +6059,7 @@ mod tests {
                 ),
             ]);
 
-            let cleaned = ControlFlowStructurer::cleanup(input);
+            let cleaned = ControlFlowStructurer::cleanup(&symbols, input);
             let CStmt::For {
                 update: Some(update),
                 ..
@@ -6056,7 +6068,7 @@ mod tests {
                 panic!("Expected loop rewrite for accepted self-assign update form");
             };
             assert!(
-                ControlFlowStructurer::expr_matches_for_update(&update, &update_expr),
+                ControlFlowStructurer::expr_matches_for_update(&symbols, &update, &update_expr),
                 "Expected canonical loop update {update:?} to match source update {update_expr:?}"
             );
         }
@@ -6098,7 +6110,7 @@ mod tests {
             ),
         ]);
 
-        let cleaned = ControlFlowStructurer::cleanup(input);
+        let cleaned = ControlFlowStructurer::cleanup(&symbols, input);
         let CStmt::Block(stmts) = cleaned else {
             panic!("Expected block with sum init and for-loop, got {cleaned:?}");
         };
@@ -6136,13 +6148,14 @@ mod tests {
 
     #[test]
     fn rewrites_nested_if_without_else_to_short_circuit_and() {
+        let symbols = test_table();
         let input = CStmt::if_stmt(
             v("a"),
             CStmt::if_stmt(v("b"), CStmt::ret(Some(CExpr::IntLit(1))), None),
             None,
         );
 
-        let cleaned = ControlFlowStructurer::cleanup(input);
+        let cleaned = ControlFlowStructurer::cleanup(&symbols, input);
         assert_eq!(
             cleaned,
             CStmt::if_stmt(
@@ -6155,6 +6168,7 @@ mod tests {
 
     #[test]
     fn rewrites_if_else_if_same_body_to_short_circuit_or() {
+        let symbols = test_table();
         let body = assign("x", CExpr::IntLit(1));
         let input = CStmt::if_stmt(
             v("a"),
@@ -6162,7 +6176,7 @@ mod tests {
             Some(CStmt::if_stmt(v("b"), body.clone(), None)),
         );
 
-        let cleaned = ControlFlowStructurer::cleanup(input);
+        let cleaned = ControlFlowStructurer::cleanup(&symbols, input);
         assert_eq!(
             cleaned,
             CStmt::if_stmt(CExpr::binary(BinaryOp::Or, v("a"), v("b")), body, None)
@@ -6171,6 +6185,7 @@ mod tests {
 
     #[test]
     fn rewrites_shared_else_nested_if_to_short_circuit_and() {
+        let symbols = test_table();
         let then_stmt = assign("x", CExpr::IntLit(1));
         let else_stmt = assign("x", CExpr::IntLit(2));
         let input = CStmt::if_stmt(
@@ -6179,7 +6194,7 @@ mod tests {
             Some(else_stmt.clone()),
         );
 
-        let cleaned = ControlFlowStructurer::cleanup(input);
+        let cleaned = ControlFlowStructurer::cleanup(&symbols, input);
         assert_eq!(
             cleaned,
             CStmt::if_stmt(
@@ -6204,6 +6219,7 @@ mod tests {
 
     #[test]
     fn inverts_if_else_terminator_and_flattens_then_block() {
+        let symbols = test_table();
         let input = CStmt::if_stmt(
             CExpr::binary(BinaryOp::Lt, v("x"), v("limit")),
             CStmt::Block(vec![
@@ -6213,7 +6229,7 @@ mod tests {
             Some(CStmt::ret(Some(CExpr::IntLit(0)))),
         );
 
-        let cleaned = ControlFlowStructurer::cleanup(input);
+        let cleaned = ControlFlowStructurer::cleanup(&symbols, input);
         assert_eq!(
             cleaned,
             CStmt::Block(vec![
@@ -6230,6 +6246,7 @@ mod tests {
 
     #[test]
     fn inverts_if_then_terminator_and_flattens_else_block() {
+        let symbols = test_table();
         let input = CStmt::if_stmt(
             v("is_error"),
             CStmt::ret(Some(CExpr::IntLit(-1))),
@@ -6239,7 +6256,7 @@ mod tests {
             ])),
         );
 
-        let cleaned = ControlFlowStructurer::cleanup(input);
+        let cleaned = ControlFlowStructurer::cleanup(&symbols, input);
         assert_eq!(
             cleaned,
             CStmt::Block(vec![
@@ -6252,6 +6269,7 @@ mod tests {
 
     #[test]
     fn rewrites_trailing_return_guard_and_flattens_then_block() {
+        let symbols = test_table();
         let input = CStmt::Block(vec![
             CStmt::if_stmt(
                 v("ready"),
@@ -6264,7 +6282,7 @@ mod tests {
             CStmt::ret(Some(CExpr::IntLit(0))),
         ]);
 
-        let cleaned = ControlFlowStructurer::cleanup(input);
+        let cleaned = ControlFlowStructurer::cleanup(&symbols, input);
         assert_eq!(
             cleaned,
             CStmt::Block(vec![
@@ -6282,45 +6300,49 @@ mod tests {
 
     #[test]
     fn does_not_rewrite_trailing_guard_when_following_stmt_is_not_terminator() {
+        let symbols = test_table();
         let input = CStmt::Block(vec![
             CStmt::if_stmt(v("ready"), assign("x", CExpr::IntLit(1)), None),
             assign("y", CExpr::IntLit(2)),
         ]);
-        let cleaned = ControlFlowStructurer::cleanup(input.clone());
+        let cleaned = ControlFlowStructurer::cleanup(&symbols, input.clone());
         assert_eq!(cleaned, input);
     }
 
     #[test]
     fn does_not_invert_if_when_both_branches_are_terminators() {
+        let symbols = test_table();
         let input = CStmt::if_stmt(
             v("a"),
             CStmt::ret(Some(CExpr::IntLit(1))),
             Some(CStmt::ret(Some(CExpr::IntLit(0)))),
         );
-        let cleaned = ControlFlowStructurer::cleanup(input.clone());
+        let cleaned = ControlFlowStructurer::cleanup(&symbols, input.clone());
         assert_eq!(cleaned, input);
     }
 
     #[test]
     fn does_not_invert_if_when_else_is_not_terminator() {
+        let symbols = test_table();
         let input = CStmt::if_stmt(
             v("a"),
             assign("x", CExpr::IntLit(1)),
             Some(assign("x", v("b"))),
         );
-        let cleaned = ControlFlowStructurer::cleanup(input.clone());
+        let cleaned = ControlFlowStructurer::cleanup(&symbols, input.clone());
         assert_eq!(cleaned, input);
     }
 
     #[test]
     fn inverts_if_when_else_is_single_terminator() {
+        let symbols = test_table();
         let input = CStmt::if_stmt(
             CExpr::binary(BinaryOp::Lt, v("x"), v("limit")),
             assign("sum", CExpr::binary(BinaryOp::Add, v("sum"), v("x"))),
             Some(CStmt::ret(Some(CExpr::IntLit(0)))),
         );
 
-        let cleaned = ControlFlowStructurer::cleanup(input);
+        let cleaned = ControlFlowStructurer::cleanup(&symbols, input);
         let CStmt::Block(stmts) = cleaned else {
             panic!("Expected condition inversion to emit block sequence");
         };
@@ -6336,8 +6358,9 @@ mod tests {
 
     #[test]
     fn removes_empty_else_branch() {
+        let symbols = test_table();
         let input = CStmt::if_stmt(v("a"), assign("x", CExpr::IntLit(1)), Some(CStmt::Empty));
-        let cleaned = ControlFlowStructurer::cleanup(input);
+        let cleaned = ControlFlowStructurer::cleanup(&symbols, input);
         assert_eq!(
             cleaned,
             CStmt::if_stmt(v("a"), assign("x", CExpr::IntLit(1)), None)
@@ -6346,31 +6369,35 @@ mod tests {
 
     #[test]
     fn removes_empty_if_without_else() {
+        let symbols = test_table();
         let input = CStmt::if_stmt(v("a"), CStmt::Empty, None);
-        let cleaned = ControlFlowStructurer::cleanup(input);
+        let cleaned = ControlFlowStructurer::cleanup(&symbols, input);
         assert_eq!(cleaned, CStmt::Empty);
     }
 
     #[test]
     fn constant_true_if_collapses_to_then_body() {
+        let symbols = test_table();
         let input = CStmt::if_stmt(CExpr::IntLit(1), assign("x", CExpr::IntLit(7)), None);
-        let cleaned = ControlFlowStructurer::cleanup(input);
+        let cleaned = ControlFlowStructurer::cleanup(&symbols, input);
         assert_eq!(cleaned, assign("x", CExpr::IntLit(7)));
     }
 
     #[test]
     fn constant_false_if_collapses_to_else_body() {
+        let symbols = test_table();
         let input = CStmt::if_stmt(
             CExpr::IntLit(0),
             assign("x", CExpr::IntLit(7)),
             Some(assign("x", CExpr::IntLit(9))),
         );
-        let cleaned = ControlFlowStructurer::cleanup(input);
+        let cleaned = ControlFlowStructurer::cleanup(&symbols, input);
         assert_eq!(cleaned, assign("x", CExpr::IntLit(9)));
     }
 
     #[test]
     fn guarded_switch_with_trailing_return_becomes_switch_default() {
+        let symbols = test_table();
         let input = CStmt::Block(vec![CStmt::if_stmt(
             v("guard"),
             CStmt::Block(vec![
@@ -6393,7 +6420,7 @@ mod tests {
             ])),
         )]);
 
-        let cleaned = ControlFlowStructurer::cleanup(input);
+        let cleaned = ControlFlowStructurer::cleanup(&symbols, input);
         assert_eq!(
             cleaned,
             CStmt::Block(vec![
@@ -6434,6 +6461,7 @@ mod tests {
 
     #[test]
     fn rewrites_while_to_for_when_condition_uses_addrof_induction_var() {
+        let symbols = test_table();
         let input = CStmt::Block(vec![
             assign("i", CExpr::IntLit(0)),
             CStmt::while_loop(
@@ -6445,7 +6473,7 @@ mod tests {
             ),
         ]);
 
-        let cleaned = ControlFlowStructurer::cleanup(input);
+        let cleaned = ControlFlowStructurer::cleanup(&symbols, input);
         assert!(
             matches!(cleaned, CStmt::For { .. }),
             "Address-wrapped induction variable should still allow for-loop rewrite"
@@ -6454,6 +6482,7 @@ mod tests {
 
     #[test]
     fn normalizes_addrof_var_artifact_in_while_condition_without_rewrite() {
+        let symbols = test_table();
         let input = CStmt::Block(vec![
             assign("i", CExpr::IntLit(0)),
             CStmt::while_loop(
@@ -6465,7 +6494,7 @@ mod tests {
             ),
         ]);
 
-        let cleaned = ControlFlowStructurer::cleanup(input);
+        let cleaned = ControlFlowStructurer::cleanup(&symbols, input);
         let CStmt::Block(stmts) = cleaned else {
             panic!("Expected unmatched loop to remain a block");
         };
@@ -6488,6 +6517,7 @@ mod tests {
 
     #[test]
     fn rewrites_while_to_for_with_two_step_alias_update_chain() {
+        let symbols = test_table();
         let input = CStmt::Block(vec![
             assign("i", CExpr::IntLit(0)),
             CStmt::while_loop(
@@ -6503,7 +6533,7 @@ mod tests {
             ),
         ]);
 
-        let cleaned = ControlFlowStructurer::cleanup(input);
+        let cleaned = ControlFlowStructurer::cleanup(&symbols, input);
         assert!(
             matches!(cleaned, CStmt::For { .. }),
             "Two-step alias chain should be enough to connect update with loop condition"
@@ -6512,6 +6542,7 @@ mod tests {
 
     #[test]
     fn does_not_rewrite_while_to_for_when_alias_chain_is_too_long() {
+        let symbols = test_table();
         let input = CStmt::Block(vec![
             assign("i", CExpr::IntLit(0)),
             CStmt::while_loop(
@@ -6528,7 +6559,7 @@ mod tests {
             ),
         ]);
 
-        let cleaned = ControlFlowStructurer::cleanup(input);
+        let cleaned = ControlFlowStructurer::cleanup(&symbols, input);
         let CStmt::Block(stmts) = cleaned else {
             panic!("Expected long alias-chain loop to remain a block");
         };
@@ -6540,6 +6571,7 @@ mod tests {
 
     #[test]
     fn rewrites_while_to_for_when_condition_uses_suffix_equivalent_var_name() {
+        let symbols = test_table();
         let input = CStmt::Block(vec![
             assign("local_4", CExpr::IntLit(0)),
             CStmt::while_loop(
@@ -6551,7 +6583,7 @@ mod tests {
             ),
         ]);
 
-        let cleaned = ControlFlowStructurer::cleanup(input);
+        let cleaned = ControlFlowStructurer::cleanup(&symbols, input);
         assert!(
             matches!(cleaned, CStmt::For { .. }),
             "Suffix-equivalent loop vars (local/local_4) should be treated as matching"

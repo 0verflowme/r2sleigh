@@ -131,7 +131,7 @@ fn analyze_stack_vars(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
                         &use_info.forwarded_values,
                         env,
                     );
-                    if let Some(expr) = forwarded_expr_for_value(
+                    if let Some(expr) = forwarded_expr_for_value(symbols, 
                         dst.display_name().as_str(),
                         &merged_defs,
                         use_info,
@@ -464,6 +464,7 @@ fn parse_generic_stack_name_offset(name: &str) -> Option<i64> {
 }
 
 fn forwarded_expr_for_value(
+    symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
     value_key: &str,
     definitions: &HashMap<String, CExpr>,
     use_info: &UseInfo,
@@ -474,7 +475,7 @@ fn forwarded_expr_for_value(
     let empty_names: HashSet<String> = HashSet::new();
     let empty_ptrs: HashMap<String, PtrArith> = HashMap::new();
     let lower = LowerCtx {
-        symbols: env.symbols,
+        symbols,
         string_literals: crate::analysis::lower::no_string_literals(),
         use_info: Some(use_info),
         definitions,
@@ -612,7 +613,7 @@ mod tests {
         let expr = CExpr::AddrOf(Box::new(crate::symbol::var_ref(&symbols, "a")));
 
         assert_eq!(
-            normalize_scalar_stack_load_expr(expr, Some("a"), Some(slot)),
+            normalize_scalar_stack_load_expr(&symbols, expr, Some("a"), Some(slot)),
             crate::symbol::var_ref(&symbols, "a")
         );
     }
@@ -628,7 +629,7 @@ mod tests {
         };
 
         assert_eq!(
-            normalize_scalar_stack_load_expr(CExpr::IntLit(1), Some("local_2c"), Some(slot)),
+            normalize_scalar_stack_load_expr(&symbols, CExpr::IntLit(1), Some("local_2c"), Some(slot)),
             crate::symbol::var_ref(&symbols, "local_2c")
         );
     }
@@ -716,8 +717,8 @@ mod tests {
             phis: Vec::new(),
         };
 
-        let ram = analyze(&[load_block(r2il::SpaceId::Ram)], &UseInfo::default(), &env);
-        let custom = analyze(
+        let ram = analyze(&symbols, &[load_block(r2il::SpaceId::Ram)], &UseInfo::default(), &env);
+        let custom = analyze(&symbols, 
             &[load_block(r2il::SpaceId::Custom(7))],
             &UseInfo::default(),
             &env,

@@ -14,7 +14,7 @@ pub(crate) struct FlagScratch {
 pub(crate) fn analyze(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, blocks: &[SSABlock], use_info: &UseInfo, env: &PassEnv<'_>) -> FlagInfo {
     let mut scratch = FlagScratch::default();
     let lower = LowerCtx {
-        symbols: env.symbols,
+        symbols,
         string_literals: crate::analysis::lower::no_string_literals(),
         use_info: Some(use_info),
         definitions: &use_info.definitions,
