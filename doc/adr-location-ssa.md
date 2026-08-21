@@ -107,6 +107,53 @@ gates rendering lives upstream of the renderer. The eight facts structs collapse
 into one model with sections, because eight lookup surfaces are eight
 opportunities to consult the wrong one.
 
+### The FFI boundary is one typed contract
+
+Linkage is already right: the plugin exports two symbols, `r2sleigh_api_v2` and
+`r2sleigh_snapshot_wire_decode_v2`, and radare2's own added surface is three
+`R_API` functions over one opaque snapshot and one view struct. What sits behind
+those two symbols is not right.
+
+Version numbers stop gating anything. `crates/r2source/src/radare_abi138.rs`
+currently refuses a snapshot when `schema_version`, `abi_version` or
+`accessor_schema_version` differs from a pinned constant, and three further
+equalities are asserted at compile time in `r2plugin/src/ffi_v2.rs`. The
+capability bitmask that follows those checks is itself an exact match, rejecting
+any snapshot that advertises a capability the plugin does not know, so a new bit
+in radare2 breaks the plugin as surely as a bumped number does. The header on the
+radare2 side already argues against precisely this, and the C guard was corrected
+to match while the Rust side was not.
+
+Under this design the plugin negotiates: unknown capability bits are ignored
+rather than rejected, struct growth is absorbed through `struct_size` together
+with per-field capability bits, and no code path compares a schema number for
+equality. The ABI number leaves the filename and the type names, because the
+whole premise is that the number moves for reasons the plugin does not care
+about.
+
+The vtable stops mirroring internal structure. Sixteen of its thirty-seven
+entries are field accessors — `lift_block_addr`, `lift_block_size`,
+`lift_block_jump`, `lift_context_arch_name` and the rest — which is a call and a
+maintained declaration per field on both sides. They collapse into view calls
+returning `repr(C)` structs, which is the pattern radare2's own
+`r_anal_function_snapshot_view` already uses across the same boundary.
+
+One transport replaces three. Typed views carry structure. The serialized wire
+format stays for the snapshot, and its C reader is generated from the Rust
+definition so the existing byte-for-byte conformance test guards a build step
+rather than two hand-maintained implementations. The JSON channel —
+`diagnostics_json` and the analysis JSON constants, behind roughly two hundred
+JSON-handling lines in the C wrapper — is removed, because facts crossing this
+boundary should be typed contracts.
+
+The C wrapper becomes registration and dispatch. `r_anal_sleigh.c` is presently
+5,301 lines across 137 functions, one of which is 796 lines of command dispatch,
+against only 22 distinct radare2 API calls in the whole file; that is the
+project's own logic living in its least safe language on the far side of the
+boundary. It moves into Rust. How much of the command dispatch is genuine
+radare2 command-surface obligation has not yet been established, so no line
+target is set here.
+
 ### Accountability is structural
 
 Every obligation in the source inventory ends in exactly one terminal state,
@@ -148,17 +195,24 @@ precisely the change that cannot be scored by reading output, so accountability
 has to work before it lands.
 
 1. Ledger, closure invariant, and typed identifiers in code generation.
-2. Location model and use index in `r2ssa`, covering registers and stack objects,
+2. FFI boundary: stop gating on version numbers, collapse the accessor vtable
+   into view calls, remove the JSON channel, generate the C wire reader, and move
+   the C wrapper's logic into Rust.
+3. Location model and use index in `r2ssa`, covering registers and stack objects,
    with symbolic execution consulted for stack promotion.
-3. Delete the register-family repair pass. If it is not dead, step 2 is
-   incomplete; this is the falsification test for step 2 rather than a cleanup.
-4. Move the observable-reachability filter out of `r2types`.
-5. Collapse the facts structs into one model and enforce the renderer's read-only
+4. Delete the register-family repair pass. If it is not dead, step 3 is
+   incomplete; this is the falsification test for step 3 rather than a cleanup.
+5. Move the observable-reachability filter out of `r2types`.
+6. Collapse the facts structs into one model and enforce the renderer's read-only
    contract.
-6. Demote flags and temporaries, extract the target model, and convert the
+7. Demote flags and temporaries, extract the target model, and convert the
    complexity ceiling into budget refusals.
 
-Steps 1 and 3 through 6 are expected to be net-negative on line count.
+The FFI comes before the location model because the snapshot enters the system
+through that boundary and the location model consumes exactly what crosses it;
+building locations first means building against a contract about to change shape.
+
+Every step except 3 is expected to be net-negative on line count.
 
 ## Consequences
 
@@ -168,6 +222,10 @@ splitting is not yet known.
 
 `writeback.rs`, at roughly 22,000 lines the largest file in the project, has not
 been traced and its role under this design is unresolved.
+
+Removing the JSON channel and the accessor vtable changes what radare2 sees, so
+the plugin and the fork move together for step 2 and the wire conformance test is
+the gate on that step rather than an afterthought.
 
 The branch is long-lived against a tree other sessions edit concurrently, so
 rebases will be frequent and staging must be by explicit path.
