@@ -112,6 +112,8 @@ pub(crate) struct PassEnv<'a> {
     pub(crate) param_register_aliases: &'a HashMap<String, String>,
     /// One name per certified loop carrier, shared by every version it passes through.
     pub(crate) carrier_aliases: &'a HashMap<String, String>,
+    /// Where a rendered name is written down, so building a reference can mint one.
+    pub(crate) symbols: &'a std::cell::RefCell<crate::symbol::SymbolTable>,
     pub(crate) caller_saved_regs: &'a HashSet<String>,
     pub(crate) type_hints: &'a HashMap<String, CType>,
     pub(crate) type_oracle: Option<&'a dyn TypeOracle>,
@@ -522,16 +524,16 @@ fn call_arg_references_any(arg: &CallArgBinding, ids: &BTreeSet<ValueId>) -> boo
 
 impl UseInfo {
     #[allow(dead_code)]
-    pub(crate) fn analyze(blocks: &[SSABlock], env: &PassEnv<'_>) -> Self {
-        use_info::analyze(blocks, env)
+    pub(crate) fn analyze(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, blocks: &[SSABlock], env: &PassEnv<'_>) -> Self {
+        use_info::analyze(symbols, blocks, env)
     }
 
-    pub(crate) fn analyze_with_control(
+    pub(crate) fn analyze_with_control(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
         blocks: &[SSABlock],
         env: &PassEnv<'_>,
         control: crate::DecompileWorkControl<'_>,
     ) -> Result<Self, crate::DecompileExecutionStop> {
-        use_info::analyze_with_control(blocks, env, control)
+        use_info::analyze_with_control(symbols, blocks, env, control)
     }
 
     #[cfg(test)]
@@ -542,30 +544,30 @@ impl UseInfo {
         use_info::analyze_for_local_struct_accesses(blocks, env)
     }
 
-    pub(crate) fn analyze_for_local_struct_accesses_with_control(
+    pub(crate) fn analyze_for_local_struct_accesses_with_control(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
         blocks: &[SSABlock],
         env: &PassEnv<'_>,
         control: crate::DecompileWorkControl<'_>,
     ) -> Result<Self, crate::DecompileExecutionStop> {
-        use_info::analyze_for_local_struct_accesses_with_control(blocks, env, control)
+        use_info::analyze_for_local_struct_accesses_with_control(symbols, blocks, env, control)
     }
 
     #[allow(dead_code)]
-    pub(crate) fn analyze_with_definition_overrides(
+    pub(crate) fn analyze_with_definition_overrides(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
         blocks: &[SSABlock],
         env: &PassEnv<'_>,
         definition_overrides: &HashMap<String, CExpr>,
     ) -> Self {
-        use_info::analyze_with_definition_overrides(blocks, env, definition_overrides)
+        use_info::analyze_with_definition_overrides(symbols, blocks, env, definition_overrides)
     }
 
-    pub(crate) fn analyze_with_definition_overrides_with_control(
+    pub(crate) fn analyze_with_definition_overrides_with_control(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
         blocks: &[SSABlock],
         env: &PassEnv<'_>,
         definition_overrides: &HashMap<String, CExpr>,
         control: crate::DecompileWorkControl<'_>,
     ) -> Result<Self, crate::DecompileExecutionStop> {
-        use_info::analyze_with_definition_overrides_with_control(
+        use_info::analyze_with_definition_overrides_with_control(symbols, 
             blocks,
             env,
             definition_overrides,
@@ -573,8 +575,12 @@ impl UseInfo {
         )
     }
 
-    pub(crate) fn preserve_authoritative_facts_from(&mut self, baseline: &UseInfo) {
-        use_info::preserve_authoritative_facts(self, baseline);
+    pub(crate) fn preserve_authoritative_facts_from(
+        &mut self,
+        symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
+        baseline: &UseInfo,
+    ) {
+        use_info::preserve_authoritative_facts(symbols, self, baseline);
     }
 
     pub(crate) fn bind_value_id(&mut self, var: &SSAVar, value_id: ValueId) -> Option<ValueId> {
@@ -810,6 +816,7 @@ impl UseInfo {
     }
 
     pub(crate) fn value_id_for_name(&self, name: &str) -> Option<ValueId> {
+
         if self.ambiguous_value_names.contains(name) {
             return None;
         }
@@ -863,6 +870,7 @@ impl UseInfo {
     }
 
     pub(crate) fn definition_for_name(&self, name: &str) -> Option<&CExpr> {
+
         if self.ambiguous_value_names.contains(name) {
             return None;
         }
@@ -1034,6 +1042,7 @@ impl UseInfo {
     }
 
     pub(crate) fn call_result_source_for_name(&self, name: &str) -> Option<(u64, usize)> {
+
         if self.ambiguous_value_names.contains(name) {
             return None;
         }
@@ -1047,13 +1056,13 @@ impl UseInfo {
 }
 
 impl FlagInfo {
-    pub(crate) fn analyze(blocks: &[SSABlock], use_info: &UseInfo, env: &PassEnv<'_>) -> Self {
-        flag_info::analyze(blocks, use_info, env)
+    pub(crate) fn analyze(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, blocks: &[SSABlock], use_info: &UseInfo, env: &PassEnv<'_>) -> Self {
+        flag_info::analyze(symbols, blocks, use_info, env)
     }
 }
 
 impl StackInfo {
-    pub(crate) fn analyze(blocks: &[SSABlock], use_info: &UseInfo, env: &PassEnv<'_>) -> Self {
-        stack_info::analyze(blocks, use_info, env)
+    pub(crate) fn analyze(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, blocks: &[SSABlock], use_info: &UseInfo, env: &PassEnv<'_>) -> Self {
+        stack_info::analyze(symbols, blocks, use_info, env)
     }
 }

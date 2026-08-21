@@ -77,6 +77,7 @@ impl<'a> FoldingContext<'a> {
     }
 
     fn refine_low_signal_semantic_candidate(&self, name: &str, candidate: CExpr) -> CExpr {
+
         if self.is_low_signal_visible_name(name)
             && matches!(candidate, CExpr::Var(_))
             && let Some(deref) = self.semantic_deref_candidate_for_name(name)
@@ -92,6 +93,7 @@ impl<'a> FoldingContext<'a> {
         name: &str,
         context: VisibleExprContext,
     ) -> Option<CExpr> {
+
         let raw = self.lookup_definition_raw(name)?;
         let mut semantic_visited = HashSet::new();
         let semanticized = self.semanticize_visible_expr(&raw, 0, &mut semantic_visited);
@@ -130,6 +132,7 @@ impl<'a> FoldingContext<'a> {
     }
 
     fn return_context_for_name(&self, name: &str) -> VisibleExprContext {
+
         if self
             .stack_slot_provenance_for_name(name)
             .is_some_and(|slot| slot.is_scalar_return_carrier())
@@ -147,7 +150,7 @@ impl<'a> FoldingContext<'a> {
 
     fn return_context_for_expr(&self, expr: &CExpr) -> VisibleExprContext {
         match expr {
-            CExpr::Var(name) => self.return_context_for_name(name),
+            CExpr::Var(name) => self.return_context_for_name(&self.spelling(*name)),
             CExpr::Paren(inner) | CExpr::Cast { expr: inner, .. } => {
                 self.return_context_for_expr(inner)
             }
@@ -185,7 +188,7 @@ impl<'a> FoldingContext<'a> {
 
     pub(crate) fn expr_contains_generic_stack_alias(&self, expr: &CExpr) -> bool {
         match expr {
-            CExpr::Var(name) => is_generic_stack_placeholder_alias(name),
+            CExpr::Var(name) => is_generic_stack_placeholder_alias(&self.spelling(*name)),
             CExpr::Paren(inner) => self.expr_contains_generic_stack_alias(inner),
             CExpr::Cast { expr: inner, .. } => self.expr_contains_generic_stack_alias(inner),
             CExpr::Unary { operand, .. } => self.expr_contains_generic_stack_alias(operand),
@@ -225,18 +228,18 @@ impl<'a> FoldingContext<'a> {
 
         match expr {
             CExpr::Var(name) => {
-                if self.is_transient_visible_name(name) || self.is_low_signal_visible_name(name) {
+                if self.is_transient_visible_name(&self.spelling(*name)) || self.is_low_signal_visible_name(&self.spelling(*name)) {
                     return None;
                 }
-                if !visited.insert(name.clone()) {
+                if !visited.insert(self.spelling(*name).to_string()) {
                     return None;
                 }
 
                 let candidate = self
-                    .lookup_predicate_expr(name)
+                    .lookup_predicate_expr(&self.spelling(*name))
                     .map(|pred| self.simplify_condition_expr(pred))
                     .or_else(|| {
-                        self.lookup_definition_raw(name).and_then(|def| {
+                        self.lookup_definition_raw(&self.spelling(*name)).and_then(|def| {
                             self.predicate_return_candidate(&def, depth + 1, visited)
                                 .or_else(|| {
                                     self.is_assignment_predicate_expr(&def)
@@ -245,7 +248,7 @@ impl<'a> FoldingContext<'a> {
                         })
                     });
 
-                visited.remove(name);
+                visited.remove(&*self.spelling(*name));
                 candidate
             }
             CExpr::Paren(inner) => self
@@ -327,12 +330,12 @@ impl<'a> FoldingContext<'a> {
         let mut has_semantic_root = false;
         if let CExpr::Var(name) = expr {
             if self
-                .materialized_call_result_source_for_visible_name(name)
+                .materialized_call_result_source_for_visible_name(*name)
                 .is_some()
             {
                 return expr.clone();
             }
-            if let Some(candidate) = self.semantic_deref_candidate_for_name(name) {
+            if let Some(candidate) = self.semantic_deref_candidate_for_name(&self.spelling(*name)) {
                 let should_promote = if matches!(context, VisibleExprContext::Generic) {
                     Self::expr_is_structured_memory_candidate(&candidate)
                         && !Self::expr_is_structured_memory_candidate(&best)
@@ -349,20 +352,20 @@ impl<'a> FoldingContext<'a> {
                 }
             }
             if let Some(candidate) = self
-                .scalar_context_root_candidate_for_name(name, VisibleExprContext::ScalarReturn)
-                .or_else(|| self.scalar_context_root_candidate_for_name(name, context))
+                .scalar_context_root_candidate_for_name(&self.spelling(*name), VisibleExprContext::ScalarReturn)
+                .or_else(|| self.scalar_context_root_candidate_for_name(&self.spelling(*name), context))
                 && self.prefers_visible_expr_in_context(&best, &candidate, context)
             {
                 best = candidate;
             }
-            if let Some(semantic) = self.semantic_return_candidate_for_name(name) {
+            if let Some(semantic) = self.semantic_return_candidate_for_name(&self.spelling(*name)) {
                 has_semantic_root = true;
                 if self.prefers_visible_expr_in_context(&best, &semantic, context) {
                     best = semantic;
                 }
             }
             if let Some(candidate) =
-                self.semanticized_raw_definition_candidate_in_context(name, context)
+                self.semanticized_raw_definition_candidate_in_context(&self.spelling(*name), context)
                 && self.prefers_visible_expr_in_context(&best, &candidate, context)
             {
                 best = candidate;
@@ -384,14 +387,14 @@ impl<'a> FoldingContext<'a> {
             }
 
             if let CExpr::Var(name) = expr
-                && let Some(def) = self.lookup_definition(name)
+                && let Some(def) = self.lookup_definition(&self.spelling(*name))
                 && self.prefers_visible_expr_in_context(&best, &def, context)
             {
                 best = def;
             }
 
             if let CExpr::Var(name) = expr
-                && let Some(def) = self.best_visible_definition_in_context(name, context)
+                && let Some(def) = self.best_visible_definition_in_context(&self.spelling(*name), context)
                 && self.prefers_visible_expr_in_context(&best, &def, context)
             {
                 best = def;
@@ -676,7 +679,7 @@ impl<'a> FoldingContext<'a> {
     pub(super) fn expr_is_transient_return_artifact(&self, expr: &CExpr) -> bool {
         match expr {
             CExpr::Var(name) => {
-                self.is_transient_visible_name(name) || self.is_low_signal_visible_name(name)
+                self.is_transient_visible_name(&self.spelling(*name)) || self.is_low_signal_visible_name(&self.spelling(*name))
             }
             CExpr::Paren(inner) | CExpr::Cast { expr: inner, .. } => {
                 self.expr_is_transient_return_artifact(inner)
@@ -686,12 +689,13 @@ impl<'a> FoldingContext<'a> {
     }
 
     pub(super) fn semantic_deref_candidate_for_name(&self, name: &str) -> Option<CExpr> {
+
         let mut visited = HashSet::new();
         self.render_authoritative_memory_access_by_name(name, 0, 0, &mut visited)
             .or_else(|| {
                 self.find_ssa_name_for_rendered_alias(name)
                     .and_then(|ssa_name| {
-                        (ssa_name != name).then(|| {
+                        (ssa_name.as_str() != name).then(|| {
                             let mut alias_visited = HashSet::new();
                             self.render_authoritative_memory_access_by_name(
                                 &ssa_name,
@@ -704,14 +708,17 @@ impl<'a> FoldingContext<'a> {
             })
     }
 
-    fn should_inline_in_return(&self, var_name: &str, depth: u32) -> bool {
+    fn should_inline_in_return(&self, var_name: crate::symbol::SymbolId, depth: u32) -> bool {
+        let var_name_id = var_name;
+        let var_name = &self.spelling(var_name_id);
+
         if depth > MAX_RETURN_INLINE_DEPTH {
             return false;
         }
 
         let ssa_name = self
-            .find_ssa_name_for_rendered_alias(var_name)
-            .filter(|ssa_name| ssa_name != var_name);
+            .find_ssa_name_for_rendered_alias(&self.spelling(var_name_id))
+            .filter(|ssa_name| ssa_name.as_str() != &**var_name);
         let semantic_name = ssa_name.as_deref().unwrap_or(var_name);
         if is_temporary_or_constant_name(var_name) || is_temporary_or_constant_name(semantic_name) {
             return true;
@@ -726,7 +733,7 @@ impl<'a> FoldingContext<'a> {
             return true;
         }
 
-        let is_pinned = self.pinned_set().contains(var_name)
+        let is_pinned = self.pinned_set().contains(&**var_name)
             || self.pinned_set().contains(&lower)
             || self.pinned_set().contains(semantic_name)
             || self.pinned_set().contains(&semantic_lower)
@@ -746,7 +753,7 @@ impl<'a> FoldingContext<'a> {
 
         let use_count = self
             .use_counts_map()
-            .get(var_name)
+            .get(&**var_name)
             .copied()
             .or_else(|| self.use_counts_map().get(&lower).copied())
             .or_else(|| {
@@ -854,37 +861,37 @@ impl<'a> FoldingContext<'a> {
 
         match expr {
             CExpr::Var(name) => {
-                if let Some(val) = parse_const_value(name) {
+                if let Some(val) = parse_const_value(&self.spelling(*name)) {
                     return self.typed_integer_literal_expr_in_context(val, context);
                 }
                 // A name defined by a read of memory is that read. Expanding it
                 // again here reached a different answer for the same memory.
-                if let Some(memory) = self.memory_read_expr_for_name(name) {
+                if let Some(memory) = self.memory_read_expr_for_name(&self.spelling(*name)) {
                     return memory;
                 }
-                if let Some(alias) = self.arg_alias_for_rendered_name(name) {
-                    return CExpr::Var(alias);
+                if let Some(alias) = self.arg_alias_for_rendered_name(&self.spelling(*name)) {
+                    return self.name_ref(&alias);
                 }
-                if self.lookup_predicate_expr(name).is_some() {
+                if self.lookup_predicate_expr(&self.spelling(*name)).is_some() {
                     return self.simplify_condition_expr(CExpr::Var(name.clone()));
                 }
                 if let Some(source_call) = self
-                    .call_result_source_for_ssa_name(name)
-                    .or_else(|| self.local_post_call_source_for_ssa_name(name))
+                    .call_result_source_for_ssa_name(&self.spelling(*name))
+                    .or_else(|| self.local_post_call_source_for_ssa_name(&self.spelling(*name)))
                     && let Some(candidate) = self.synthesized_call_expr_for_source_call(source_call)
                 {
                     return candidate;
                 }
                 if let Some(candidate) = self
-                    .scalar_context_root_candidate_for_name(name, VisibleExprContext::ScalarReturn)
-                    .or_else(|| self.scalar_context_root_candidate_for_name(name, context))
+                    .scalar_context_root_candidate_for_name(&self.spelling(*name), VisibleExprContext::ScalarReturn)
+                    .or_else(|| self.scalar_context_root_candidate_for_name(&self.spelling(*name), context))
                 {
-                    if !visited.insert(name.clone()) {
+                    if !visited.insert(self.spelling(*name).to_string()) {
                         return candidate;
                     }
                     let resolved =
                         self.expand_return_expr_in_context(&candidate, depth + 1, visited, context);
-                    visited.remove(name);
+                    visited.remove(&*self.spelling(*name));
                     return if self.is_predicate_like_expr(&resolved) {
                         self.simplify_condition_expr(resolved)
                     } else {
@@ -894,13 +901,13 @@ impl<'a> FoldingContext<'a> {
 
                 let mut semantic_visited = HashSet::new();
                 if let Some(semantic) = self
-                    .render_semantic_value_by_name(name, 0, &mut semantic_visited)
-                    .map(|candidate| self.refine_low_signal_semantic_candidate(name, candidate))
+                    .render_semantic_value_by_name(&self.spelling(*name), 0, &mut semantic_visited)
+                    .map(|candidate| self.refine_low_signal_semantic_candidate(&self.spelling(*name), candidate))
                     && (self.prefers_visible_expr_in_context(
                         &CExpr::Var(name.clone()),
                         &semantic,
                         context,
-                    ) || (self.is_low_signal_visible_name(name)
+                    ) || (self.is_low_signal_visible_name(&self.spelling(*name))
                         && matches!(
                             semantic,
                             CExpr::Subscript { .. }
@@ -909,12 +916,12 @@ impl<'a> FoldingContext<'a> {
                                 | CExpr::Deref(_)
                         )))
                 {
-                    if !visited.insert(name.clone()) {
+                    if !visited.insert(self.spelling(*name).to_string()) {
                         return semantic;
                     }
                     let resolved =
                         self.expand_return_expr_in_context(&semantic, depth + 1, visited, context);
-                    visited.remove(name);
+                    visited.remove(&*self.spelling(*name));
                     return if self.is_predicate_like_expr(&resolved) {
                         self.simplify_condition_expr(resolved)
                     } else {
@@ -922,20 +929,20 @@ impl<'a> FoldingContext<'a> {
                     };
                 }
 
-                if self.is_low_signal_visible_name(name)
-                    && let Some(candidate) = self.semantic_deref_candidate_for_name(name)
+                if self.is_low_signal_visible_name(&self.spelling(*name))
+                    && let Some(candidate) = self.semantic_deref_candidate_for_name(&self.spelling(*name))
                     && self.prefers_visible_expr_in_context(
                         &CExpr::Var(name.clone()),
                         &candidate,
                         context,
                     )
                 {
-                    if !visited.insert(name.clone()) {
+                    if !visited.insert(self.spelling(*name).to_string()) {
                         return candidate;
                     }
                     let resolved =
                         self.expand_return_expr_in_context(&candidate, depth + 1, visited, context);
-                    visited.remove(name);
+                    visited.remove(&*self.spelling(*name));
                     return if self.is_predicate_like_expr(&resolved) {
                         self.simplify_condition_expr(resolved)
                     } else {
@@ -944,19 +951,19 @@ impl<'a> FoldingContext<'a> {
                 }
 
                 if let Some(candidate) =
-                    self.semanticized_raw_definition_candidate_in_context(name, context)
+                    self.semanticized_raw_definition_candidate_in_context(&self.spelling(*name), context)
                     && self.prefers_visible_expr_in_context(
                         &CExpr::Var(name.clone()),
                         &candidate,
                         context,
                     )
                 {
-                    if !visited.insert(name.clone()) {
+                    if !visited.insert(self.spelling(*name).to_string()) {
                         return candidate;
                     }
                     let resolved =
                         self.expand_return_expr_in_context(&candidate, depth + 1, visited, context);
-                    visited.remove(name);
+                    visited.remove(&*self.spelling(*name));
                     return if self.is_predicate_like_expr(&resolved) {
                         self.simplify_condition_expr(resolved)
                     } else {
@@ -964,16 +971,16 @@ impl<'a> FoldingContext<'a> {
                     };
                 }
 
-                if !self.should_inline_in_return(name, depth) || !visited.insert(name.clone()) {
+                if !self.should_inline_in_return(*name, depth) || !visited.insert(self.spelling(*name).to_string()) {
                     return CExpr::Var(name.clone());
                 }
 
                 let resolved = self
                     .choose_preferred_visible_expr_in_context(
-                        self.lookup_definition(name),
+                        self.lookup_definition(&self.spelling(*name)),
                         self.choose_preferred_visible_expr_in_context(
-                            self.semanticized_raw_definition_candidate_in_context(name, context),
-                            self.best_visible_definition_in_context(name, context),
+                            self.semanticized_raw_definition_candidate_in_context(&self.spelling(*name), context),
+                            self.best_visible_definition_in_context(&self.spelling(*name), context),
                             context,
                         ),
                         context,
@@ -983,7 +990,7 @@ impl<'a> FoldingContext<'a> {
                     })
                     .unwrap_or_else(|| CExpr::Var(name.clone()));
 
-                visited.remove(name);
+                visited.remove(&*self.spelling(*name));
                 if self.is_predicate_like_expr(&resolved) {
                     self.simplify_condition_expr(resolved)
                 } else {
@@ -992,7 +999,7 @@ impl<'a> FoldingContext<'a> {
             }
             CExpr::Deref(inner) => {
                 if let CExpr::Var(name) = inner.as_ref()
-                    && let Some(candidate) = self.semantic_deref_candidate_for_name(name)
+                    && let Some(candidate) = self.semantic_deref_candidate_for_name(&self.spelling(*name))
                     && (!matches!(context, VisibleExprContext::ScalarReturn)
                         || !self.expr_is_address_artifact_in_scalar_context(&candidate))
                 {
@@ -1002,7 +1009,7 @@ impl<'a> FoldingContext<'a> {
                     .resolve_stack_alias_from_addr_expr(inner, 0)
                     .filter(|alias| !is_generic_stack_placeholder_alias(alias))
                 {
-                    CExpr::Var(stack_var)
+                    self.name_ref(&stack_var)
                 } else {
                     let expanded_inner =
                         self.expand_return_expr_in_context(inner, depth + 1, visited, context);
@@ -1064,7 +1071,7 @@ impl<'a> FoldingContext<'a> {
         let mut visited = HashSet::new();
         let root_name = var.display_name();
         let context = self.return_context_for_name(&root_name);
-        let unresolved = CExpr::Var(self.var_name(var));
+        let unresolved = self.name_ref(&self.var_name(var));
         let raw_definition =
             self.semanticized_raw_definition_candidate_in_context(&root_name, context);
         let semantic_root = match (

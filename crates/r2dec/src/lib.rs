@@ -78,6 +78,7 @@ use std::fmt::Write as _;
 use std::sync::Arc;
 
 fn is_generic_arg_name(name: &str) -> bool {
+
     let lower = name.trim().to_ascii_lowercase();
     lower
         .strip_prefix("arg")
@@ -1931,18 +1932,18 @@ fn is_summary_ident_byte(byte: u8) -> bool {
 /// travelled with the snapshot all along. It is applied only where a real name
 /// exists, and never over one an external signature already supplied, because
 /// a parsed signature is the more specific statement.
-fn apply_source_parameter_names(params: &mut [ast::CParam], display_names: &r2types::DisplayNames) {
+fn apply_source_parameter_names(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, params: &mut [ast::CParam], display_names: &r2types::DisplayNames) {
     for (index, param) in params.iter_mut().enumerate() {
-        if !is_generic_arg_name(&param.name) {
+        if !is_generic_arg_name(&crate::symbol::spelling(symbols, param.name)) {
             continue;
         }
         if let Some(name) = display_names.parameter(index) {
-            param.name = name.to_string();
+            symbols.borrow_mut().rename(param.name, name);
         }
     }
 }
 
-fn merge_params_with_external_signature(
+fn merge_params_with_external_signature(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
     recovered_params: Vec<ast::CParam>,
     signature: Option<&FunctionSignatureSpec>,
 ) -> Vec<ast::CParam> {
@@ -1959,12 +1960,12 @@ fn merge_params_with_external_signature(
             let fallback_name = format!("arg{idx}");
             let mut param = recovered_params.get(idx).cloned().unwrap_or(ast::CParam {
                 ty: CType::Int(32),
-                name: fallback_name,
+                name: symbols.borrow_mut().declare_or_reuse(&fallback_name),
             });
 
             if let Some(ext) = signature.params.get(idx) {
                 if !is_generic_arg_name(&ext.name) {
-                    param.name = ext.name.clone();
+                    symbols.borrow_mut().rename(param.name, ext.name.clone());
                 }
                 if let Some(ext_ty) = &ext.ty {
                     param.ty = type_like_to_ctype(ext_ty);
@@ -2021,7 +2022,7 @@ fn param_takes_float_register(ty: &CType) -> bool {
     }
 }
 
-fn build_param_register_aliases(
+fn build_param_register_aliases(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
     params: &[ast::CParam],
     recovered_params: &[(r2ssa::SSAVar, ast::CParam)],
     register_params: &[ExternalRegisterParamSpec],
@@ -2048,13 +2049,16 @@ fn build_param_register_aliases(
                 continue;
             };
             for alias in register_alias_names(&reg_name) {
-                aliases.insert(alias, param.name.clone());
+                aliases.insert(alias, symbols.borrow().name(param.name).to_string());
             }
         }
 
         for (idx, (ssa_var, _)) in recovered_params.iter().enumerate() {
             if let Some(param) = params.get(idx) {
-                aliases.insert(ssa_var.name.to_ascii_lowercase(), param.name.clone());
+                aliases.insert(
+                    ssa_var.name.to_ascii_lowercase(),
+                    symbols.borrow().name(param.name).to_string(),
+                );
             }
         }
     }
@@ -2064,7 +2068,9 @@ fn build_param_register_aliases(
             continue;
         };
         for alias in register_alias_names(&reg_param.reg) {
-            aliases.entry(alias).or_insert_with(|| param.name.clone());
+            aliases
+                .entry(alias)
+                .or_insert_with(|| symbols.borrow().name(param.name).to_string());
         }
     }
 
@@ -2885,6 +2891,10 @@ impl Decompiler {
         semantic_route: &DecompileRouteFacts,
         work: DecompileWorkControl<'a>,
     ) -> Result<CFunction, DecompileExecutionStop> {
+        // The names this rendering declares, from the first pass that mints one.
+        let symbol_table = std::cell::RefCell::new(crate::symbol::SymbolTable::new());
+        let symbols = &symbol_table;
+
         work.poll()?;
         let prepared = input.prepared_ssa();
         let func = prepared.function();
@@ -2935,7 +2945,7 @@ impl Decompiler {
             self.config.arg_regs.clone(),
             self.config.ret_regs.clone(),
         );
-        var_recovery.recover_input(input);
+        var_recovery.recover_input(input, symbols);
         let skip_runtime_type_inference = self.context.skip_runtime_type_inference(prepared);
         let type_inference = (!skip_runtime_type_inference).then(|| {
             let mut type_inference = TypeInference::new_with_abi(
@@ -3007,20 +3017,20 @@ impl Decompiler {
                                 type_like_to_ctype(&type_inference.get_type(&v.ssa_var))
                             })
                             .unwrap_or_else(|| v.ty.clone()),
-                        name: v.name.clone(),
+                        name: symbols.borrow_mut().declare_or_reuse(&v.name),
                     },
                 )
             })
             .collect();
-        let mut params = merge_params_with_external_signature(
+        let mut params = merge_params_with_external_signature(symbols, 
             recovered_param_infos
                 .iter()
                 .map(|(_, param)| param.clone())
                 .collect(),
             render_signature,
         );
-        apply_source_parameter_names(&mut params, self.context.function_facts.display_names());
-        let param_register_aliases = build_param_register_aliases(
+        apply_source_parameter_names(symbols, &mut params, self.context.function_facts.display_names());
+        let param_register_aliases = build_param_register_aliases(symbols, 
             &params,
             &recovered_param_infos,
             &self.context.type_facts().register_params,
@@ -3032,11 +3042,11 @@ impl Decompiler {
                 continue;
             };
             let param_ty = param.ty.clone();
-            type_hints.insert(param.name.clone(), param_ty.clone());
-            type_hints.insert(param.name.to_ascii_lowercase(), param_ty);
+            type_hints.insert(crate::symbol::spelling(symbols, param.name).to_string(), param_ty.clone());
+            type_hints.insert(crate::symbol::spelling(symbols, param.name).to_ascii_lowercase(), param_ty);
         }
         for (reg_alias, param_name) in &param_register_aliases {
-            let Some(param) = params.iter().find(|param| param.name == *param_name) else {
+            let Some(param) = params.iter().find(|param| &*crate::symbol::spelling(symbols, param.name) == param_name.as_str()) else {
                 continue;
             };
             type_hints
@@ -3071,7 +3081,7 @@ impl Decompiler {
         };
         let use_prepared_semantic_view = self.context.use_prepared_semantic_view(prepared);
         let prepared_semantic_view = use_prepared_semantic_view.then(|| {
-            analysis::PreparedSemanticView::build(analysis::PreparedSemanticViewInputs {
+            analysis::PreparedSemanticView::build(symbols, analysis::PreparedSemanticViewInputs {
                 prepared,
                 abi_arg_regs: &self.config.arg_regs,
                 stack_slots: &self.context.type_facts().stack_slots,
@@ -3145,7 +3155,7 @@ impl Decompiler {
         let body_visible_names = collect_stmt_var_names(&body);
         let param_name_set = params
             .iter()
-            .map(|param| param.name.to_ascii_lowercase())
+            .map(|param| crate::symbol::spelling(symbols, param.name).to_ascii_lowercase())
             .collect::<HashSet<_>>();
         let param_home_offsets = fold_ctx
             .stack_arg_aliases_map()
@@ -3167,8 +3177,12 @@ impl Decompiler {
                     }),
             )
             .collect::<HashSet<_>>();
+        let body_visible_spellings = body_visible_names
+            .iter()
+            .map(|id| crate::symbol::spelling(symbols, *id).to_string())
+            .collect::<HashSet<_>>();
         let body_visible_stack_offsets = collect_visible_stack_offsets(
-            &body_visible_names,
+            &body_visible_spellings,
             &self.context.type_facts().visible_bindings,
             &self.context.type_facts().stack_slots,
             &param_name_set,
@@ -3193,7 +3207,7 @@ impl Decompiler {
                             .unwrap_or_else(|| v.ty.clone()),
                         runtime_type_hint_for_name(&type_hints, &v.name),
                     ),
-                    name: v.name.clone(),
+                    name: symbols.borrow_mut().declare_or_reuse(&v.name),
                     stack_offset: v.stack_offset,
                 })
                 .collect()
@@ -3207,7 +3221,9 @@ impl Decompiler {
                         .is_some_and(|offset| param_home_offsets.contains(&offset));
                     not_param_home
                         && (emitted_vars.contains(&v.name)
-                            || body_visible_names.contains(&v.name)
+                            || body_visible_names
+                                .iter()
+                                .any(|id| *crate::symbol::spelling(symbols, *id) == *v.name)
                             || v.stack_offset
                                 .is_some_and(|offset| body_visible_stack_offsets.contains(&offset)))
                 })
@@ -3221,7 +3237,7 @@ impl Decompiler {
                             .unwrap_or_else(|| v.ty.clone()),
                         runtime_type_hint_for_name(&type_hints, &v.name),
                     ),
-                    name: v.name.clone(),
+                    name: symbols.borrow_mut().declare_or_reuse(&v.name),
                     stack_offset: v.stack_offset,
                 })
                 .collect::<Vec<_>>();
@@ -3248,7 +3264,7 @@ impl Decompiler {
             })
             .collect::<Vec<_>>();
         let mut c_function = CFunction {
-            symbols: crate::symbol::SymbolTable::new(),
+            symbols: std::cell::RefCell::new(std::mem::take(&mut *symbols.borrow_mut())),
             name: func_name,
             ret_type: render_signature
                 .and_then(|sig| sig.ret_type.as_ref().map(type_like_to_ctype))
@@ -3281,7 +3297,7 @@ impl Decompiler {
         single_evaluation::bind_each_call_site_once(&mut c_function, &folded_call_sites);
         simplify_identities_in_function(&mut c_function, &fold_ctx);
         propagate_single_use_register_carriers(&mut c_function, &fold_ctx);
-        rewrite_stack_synonym_uses_to_declared_locals(&mut c_function, &fold_ctx);
+        rewrite_stack_synonym_uses_to_declared_locals(symbols, &mut c_function, &fold_ctx);
         // Dropping a version suffix loses which value a name meant, so anything
         // that resolves a name to the storage behind it has to run before this.
         // Linear fallback intentionally keeps its raw expression-builder output.
@@ -3294,22 +3310,19 @@ impl Decompiler {
         }
         reconstruct_flag_conditions_in_function(&mut c_function, &fold_ctx);
         prune_dead_temp_assignments_in_function_body(&mut c_function, &fold_ctx);
-        prune_unused_pure_locals(&mut c_function);
-        resolve_undeclared_carriers(&mut c_function, &fold_ctx);
-        prune_unreferenced_local_declarations(&mut c_function);
+        prune_unused_pure_locals(symbols, &mut c_function);
+        resolve_undeclared_carriers(symbols, &mut c_function, &fold_ctx);
+        prune_unreferenced_local_declarations(symbols, &mut c_function);
         normalize_redundant_return_carrier_casts(&mut c_function);
         normalize_declared_assignment_literals(&mut c_function);
         normalize_comparison_operand_order(&mut c_function);
         unrendered::prune_unreferenced_labels(&mut c_function);
         unrendered::drop_values_from_void_returns(&mut c_function);
-        // Whatever carriers are still on the page after every pass that could
-        // resolve one, the body reads and writes, so it declares them.
-        unrendered::declare_rendered_carriers(&mut c_function, &type_hints);
-        // After every name exists and before anything reads the body as text,
-        // because a name that C cannot read is not output whatever else is true
-        // of it.
+        // Declaring a carrier after the fact, and marking the ones nothing
+        // declared, were two halves of a problem a reference does not have: a
+        // name cannot be mentioned unless the table already holds it. What is
+        // left to ask is whether C can read it.
         unrendered::spell_every_name_as_c(&mut c_function);
-        unrendered::mark_undeclared_names(&mut c_function);
         // Executable C is admitted only when the source obligation inventory is
         // complete. The inventory is what says which effects the source has, so a
         // function whose inventory did not close has no account of what the output
@@ -3388,10 +3401,10 @@ impl Decompiler {
     }
 }
 
-fn collect_expr_var_names(expr: &CExpr, out: &mut HashSet<String>) {
+fn collect_expr_var_names(expr: &CExpr, out: &mut HashSet<crate::symbol::SymbolId>) {
     match expr {
         CExpr::Var(name) => {
-            out.insert(name.clone());
+            out.insert(*name);
         }
         // Not a name this function declares, so not one it has to.
         CExpr::External { .. } => {}
@@ -3441,8 +3454,8 @@ fn collect_expr_var_names(expr: &CExpr, out: &mut HashSet<String>) {
     }
 }
 
-fn collect_stmt_var_names(stmts: &[CStmt]) -> HashSet<String> {
-    fn visit_stmt(stmt: &CStmt, out: &mut HashSet<String>) {
+fn collect_stmt_var_names(stmts: &[CStmt]) -> HashSet<crate::symbol::SymbolId> {
+    fn visit_stmt(stmt: &CStmt, out: &mut HashSet<crate::symbol::SymbolId>) {
         match stmt {
             CStmt::Empty
             | CStmt::Break
@@ -3666,12 +3679,12 @@ fn reconstruct_flag_conditions_in_function(func: &mut CFunction, fold_ctx: &Fold
     walk(&mut func.body, fold_ctx);
 }
 
-fn resolve_undeclared_carriers(func: &mut CFunction, fold_ctx: &FoldingContext<'_>) {
+fn resolve_undeclared_carriers(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, func: &mut CFunction, fold_ctx: &FoldingContext<'_>) {
     let declared = func
         .params
         .iter()
-        .map(|param| param.name.to_ascii_lowercase())
-        .chain(func.locals.iter().map(|local| local.name.to_ascii_lowercase()))
+        .map(|param| crate::symbol::spelling(symbols, param.name).to_ascii_lowercase())
+        .chain(func.locals.iter().map(|local| crate::symbol::spelling(symbols, local.name).to_ascii_lowercase()))
         .collect::<HashSet<_>>();
 
     // Dropping one dead carrier can leave the value it read with no reader, so
@@ -3682,9 +3695,9 @@ fn resolve_undeclared_carriers(func: &mut CFunction, fold_ctx: &FoldingContext<'
     let returns_value = !matches!(func.ret_type, CType::Void);
 
     loop {
-        let reads = collect_function_local_reads(func);
+        let reads = collect_function_local_reads(symbols, func);
         let mut removed = false;
-        drop_dead_undeclared_carriers(
+        drop_dead_undeclared_carriers(symbols, 
             &mut func.body,
             &declared,
             &reads,
@@ -3698,13 +3711,14 @@ fn resolve_undeclared_carriers(func: &mut CFunction, fold_ctx: &FoldingContext<'
     }
 
     let mut carriers = Vec::new();
-    collect_undeclared_carrier_targets(&mut func.body, &declared, &mut carriers);
+    collect_undeclared_carrier_targets(symbols, &mut func.body, &declared, &mut carriers);
     let mut seen = HashSet::new();
     for (name, value) in carriers {
         if !seen.insert(name.to_ascii_lowercase()) {
             continue;
         }
         let ty = fold_ctx.declared_type_for_carrier(&name, &value);
+        let name = symbols.borrow_mut().declare_or_reuse(&name);
         func.locals.push(ast::CLocal {
             ty,
             name,
@@ -3715,7 +3729,7 @@ fn resolve_undeclared_carriers(func: &mut CFunction, fold_ctx: &FoldingContext<'
 
 /// Remove every assignment to an undeclared name that nothing reads, provided
 /// evaluating its value does nothing on its own.
-fn drop_dead_undeclared_carriers(
+fn drop_dead_undeclared_carriers(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
     stmts: &mut Vec<CStmt>,
     declared: &HashSet<String>,
     reads: &HashSet<String>,
@@ -3725,7 +3739,7 @@ fn drop_dead_undeclared_carriers(
 ) {
     for stmt in stmts.iter_mut() {
         single_evaluation::for_each_expr_mut(stmt, &mut |expr| {
-            drop_dead_undeclared_comma_carriers(
+            drop_dead_undeclared_comma_carriers(symbols, 
                 expr,
                 declared,
                 reads,
@@ -3735,7 +3749,7 @@ fn drop_dead_undeclared_carriers(
             );
         });
         single_evaluation::for_each_child_block_mut(stmt, &mut |body, _| {
-            drop_dead_undeclared_carriers(
+            drop_dead_undeclared_carriers(symbols, 
                 body,
                 declared,
                 reads,
@@ -3755,11 +3769,11 @@ fn drop_dead_undeclared_carriers(
         let CExpr::Var(name) = left.as_ref() else {
             continue;
         };
-        let lower = name.to_ascii_lowercase();
+        let lower = crate::symbol::spelling(symbols, *name).to_ascii_lowercase();
         if declared.contains(&lower)
             || reads.contains(&lower)
             || !expr_is_pure_for_dead_local_prune(right)
-            || (returns_value && fold_ctx.carrier_names_return_register(name))
+            || (returns_value && fold_ctx.carrier_names_return_register(*name))
         {
             continue;
         }
@@ -3772,7 +3786,7 @@ fn drop_dead_undeclared_carriers(
 /// The same rule inside a comma expression, where the lifter parks a store that
 /// a condition then evaluates: `while (t3f680 = n, i < n)` tests `i < n` and
 /// names storage nobody reads to say so.
-fn drop_dead_undeclared_comma_carriers(
+fn drop_dead_undeclared_comma_carriers(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
     expr: &mut CExpr,
     declared: &HashSet<String>,
     reads: &HashSet<String>,
@@ -3781,7 +3795,7 @@ fn drop_dead_undeclared_comma_carriers(
     removed: &mut bool,
 ) {
     for child in single_evaluation::children_mut(expr) {
-        drop_dead_undeclared_comma_carriers(child, declared, reads, fold_ctx, returns_value, removed);
+        drop_dead_undeclared_comma_carriers(symbols, child, declared, reads, fold_ctx, returns_value, removed);
     }
     let CExpr::Comma(items) = expr else {
         return;
@@ -3792,7 +3806,7 @@ fn drop_dead_undeclared_comma_carriers(
     let mut index = 0;
     items.retain(|item| {
         let keep = index == last
-            || !dead_undeclared_carrier_assignment(
+            || !dead_undeclared_carrier_assignment(symbols, 
                 item,
                 declared,
                 reads,
@@ -3814,7 +3828,7 @@ fn drop_dead_undeclared_comma_carriers(
 
 /// Whether this expression stores to a name the function never declares and
 /// nothing reads, with a value that does nothing on its own.
-fn dead_undeclared_carrier_assignment(
+fn dead_undeclared_carrier_assignment(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
     expr: &CExpr,
     declared: &HashSet<String>,
     reads: &HashSet<String>,
@@ -3832,16 +3846,16 @@ fn dead_undeclared_carrier_assignment(
     let CExpr::Var(name) = left.as_ref() else {
         return false;
     };
-    let lower = name.to_ascii_lowercase();
+    let lower = crate::symbol::spelling(symbols, *name).to_ascii_lowercase();
     !declared.contains(&lower)
         && !reads.contains(&lower)
         && expr_is_pure_for_dead_local_prune(right)
-        && !(returns_value && fold_ctx.carrier_names_return_register(name))
+        && !(returns_value && fold_ctx.carrier_names_return_register(*name))
 }
 
 /// Every undeclared name the body assigns, paired with the value first stored in
 /// it so the declaration can be typed from what it holds.
-fn collect_undeclared_carrier_targets(
+fn collect_undeclared_carrier_targets(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
     stmts: &mut Vec<CStmt>,
     declared: &HashSet<String>,
     out: &mut Vec<(String, CExpr)>,
@@ -3853,12 +3867,12 @@ fn collect_undeclared_carrier_targets(
             right,
         }) = stmt
             && let CExpr::Var(name) = left.as_ref()
-            && !declared.contains(&name.to_ascii_lowercase())
+            && !declared.contains(&crate::symbol::spelling(symbols, *name).to_ascii_lowercase())
         {
-            out.push((name.clone(), right.as_ref().clone()));
+            out.push((crate::symbol::spelling(symbols, *name).to_string(), right.as_ref().clone()));
         }
         single_evaluation::for_each_child_block_mut(stmt, &mut |body, _| {
-            collect_undeclared_carrier_targets(body, declared, out);
+            collect_undeclared_carrier_targets(symbols, body, declared, out);
         });
     }
 }
@@ -3869,6 +3883,7 @@ fn collect_undeclared_carrier_targets(
 /// lifter leaves behind: `t3e580 = a - b; *p = t3e580;` says no more than
 /// `*p = a - b;` and says it with a name the function never declares.
 fn propagate_single_use_register_carriers(func: &mut CFunction, fold_ctx: &FoldingContext<'_>) {
+    let symbols = &func.symbols;
     let declared = func
         .params
         .iter()
@@ -3876,28 +3891,34 @@ fn propagate_single_use_register_carriers(func: &mut CFunction, fold_ctx: &Foldi
         .chain(func.locals.iter().map(|local| local.name.clone()))
         .collect::<std::collections::HashSet<_>>();
 
-    fn visit_block(
+    fn visit_block(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
         stmts: &mut Vec<CStmt>,
         fold_ctx: &FoldingContext<'_>,
-        declared: &std::collections::HashSet<String>,
+        declared: &std::collections::HashSet<crate::symbol::SymbolId>,
     ) {
         for stmt in stmts.iter_mut() {
-            visit_nested(stmt, fold_ctx, declared);
+            visit_nested(symbols, stmt, fold_ctx, declared);
         }
         let mut index = 0;
         while index < stmts.len() {
-            let Some((name, value)) = carrier_assignment(&stmts[index], fold_ctx, declared) else {
+            let Some((name, value)) = carrier_assignment(symbols, &stmts[index], fold_ctx, declared) else {
                 index += 1;
                 continue;
             };
             let rest = &stmts[index + 1..];
-            if count_var_reads_in_stmts(rest, &name) != 1 {
+            if count_var_reads_in_stmts(symbols, rest, &crate::symbol::spelling(symbols, name)) != 1 {
                 index += 1;
                 continue;
             }
             let Some(offset) = rest
                 .iter()
-                .position(|stmt| count_var_reads_in_stmts(std::slice::from_ref(stmt), &name) == 1)
+                .position(|stmt| {
+                    count_var_reads_in_stmts(
+                        symbols,
+                        std::slice::from_ref(stmt),
+                        &crate::symbol::spelling(symbols, name),
+                    ) == 1
+                })
             else {
                 index += 1;
                 continue;
@@ -3905,65 +3926,66 @@ fn propagate_single_use_register_carriers(func: &mut CFunction, fold_ctx: &Foldi
             let reads = expr_var_names(&value);
             let blocked = rest[..offset].iter().any(|between| {
                 let (_, def) = fold_ctx.stmt_reads_and_def_for_render(between);
-                def.is_some_and(|def| reads.iter().any(|read| read.eq_ignore_ascii_case(&def)))
+                def.is_some_and(|def| reads.contains(&def))
             });
             if blocked {
                 index += 1;
                 continue;
             }
             let target = index + 1 + offset;
-            substitute_var_in_stmt(&mut stmts[target], &name, &value);
+            substitute_var_in_stmt(&mut stmts[target], name, &value);
             stmts.remove(index);
         }
     }
 
-    fn visit_nested(
+    fn visit_nested(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
         stmt: &mut CStmt,
         fold_ctx: &FoldingContext<'_>,
-        declared: &std::collections::HashSet<String>,
+        declared: &std::collections::HashSet<crate::symbol::SymbolId>,
     ) {
         match stmt {
-            CStmt::Block(stmts) => visit_block(stmts, fold_ctx, declared),
+            CStmt::Block(stmts) => visit_block(symbols, stmts, fold_ctx, declared),
             CStmt::If {
                 then_body,
                 else_body,
                 ..
             } => {
-                visit_nested(then_body, fold_ctx, declared);
+                visit_nested(symbols, then_body, fold_ctx, declared);
                 if let Some(else_body) = else_body {
-                    visit_nested(else_body, fold_ctx, declared);
+                    visit_nested(symbols, else_body, fold_ctx, declared);
                 }
             }
             CStmt::While { body, .. } | CStmt::DoWhile { body, .. } => {
-                visit_nested(body, fold_ctx, declared)
+                visit_nested(symbols, body, fold_ctx, declared)
             }
             CStmt::For { init, body, .. } => {
                 if let Some(init) = init {
-                    visit_nested(init, fold_ctx, declared);
+                    visit_nested(symbols, init, fold_ctx, declared);
                 }
-                visit_nested(body, fold_ctx, declared);
+                visit_nested(symbols, body, fold_ctx, declared);
             }
             CStmt::Switch { cases, default, .. } => {
                 for case in cases {
-                    visit_block(&mut case.body, fold_ctx, declared);
+                    visit_block(symbols, &mut case.body, fold_ctx, declared);
                 }
                 if let Some(default) = default {
-                    visit_block(default, fold_ctx, declared);
+                    visit_block(symbols, default, fold_ctx, declared);
                 }
             }
             _ => {}
         }
     }
 
-    visit_block(&mut func.body, fold_ctx, &declared);
+    visit_block(symbols, &mut func.body, fold_ctx, &declared);
 }
 
 /// The carrier assigned by this statement, when it is one worth propagating.
 fn carrier_assignment(
+    symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
     stmt: &CStmt,
     fold_ctx: &FoldingContext<'_>,
-    declared: &std::collections::HashSet<String>,
-) -> Option<(String, CExpr)> {
+    declared: &std::collections::HashSet<crate::symbol::SymbolId>,
+) -> Option<(crate::symbol::SymbolId, CExpr)> {
     let CStmt::Expr(CExpr::Binary {
         op: BinaryOp::Assign,
         left,
@@ -3986,15 +4008,15 @@ fn carrier_assignment(
     if !is_register_carrier && !is_undeclared_temporary {
         return None;
     }
-    Some((name.clone(), right.as_ref().clone()))
+    Some((*name, right.as_ref().clone()))
 }
 
 /// Every variable an expression reads.
-fn expr_var_names(expr: &CExpr) -> Vec<String> {
+fn expr_var_names(expr: &CExpr) -> Vec<crate::symbol::SymbolId> {
     let mut names = Vec::new();
     expr.visit(&mut |node| {
         if let CExpr::Var(name) = node {
-            names.push(name.clone());
+            names.push(*name);
         }
     });
     names
@@ -4173,18 +4195,18 @@ fn fold_constant_arithmetic_in_expr(
 }
 
 /// How many times `name` is read across these statements.
-fn count_var_reads_in_stmts(stmts: &[CStmt], name: &str) -> usize {
+fn count_var_reads_in_stmts(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, stmts: &[CStmt], name: &str) -> usize {
     let mut reads = 0;
     for stmt in stmts {
-        count_var_reads_in_stmt(stmt, name, &mut reads);
+        count_var_reads_in_stmt(symbols, stmt, name, &mut reads);
     }
     reads
 }
 
-fn count_var_reads_in_stmt(stmt: &CStmt, name: &str, reads: &mut usize) {
+fn count_var_reads_in_stmt(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, stmt: &CStmt, name: &str, reads: &mut usize) {
     let mut count_expr = |expr: &CExpr, reads: &mut usize| {
         expr.visit(&mut |node| {
-            if matches!(node, CExpr::Var(found) if found.eq_ignore_ascii_case(name)) {
+            if matches!(node, CExpr::Var(found) if crate::symbol::spelling(symbols, *found).eq_ignore_ascii_case(name)) {
                 *reads += 1;
             }
         });
@@ -4209,7 +4231,7 @@ fn count_var_reads_in_stmt(stmt: &CStmt, name: &str, reads: &mut usize) {
         }
         CStmt::Block(stmts) => {
             for stmt in stmts {
-                count_var_reads_in_stmt(stmt, name, reads);
+                count_var_reads_in_stmt(symbols, stmt, name, reads);
             }
         }
         CStmt::If {
@@ -4218,14 +4240,14 @@ fn count_var_reads_in_stmt(stmt: &CStmt, name: &str, reads: &mut usize) {
             else_body,
         } => {
             count_expr(cond, reads);
-            count_var_reads_in_stmt(then_body, name, reads);
+            count_var_reads_in_stmt(symbols, then_body, name, reads);
             if let Some(else_body) = else_body {
-                count_var_reads_in_stmt(else_body, name, reads);
+                count_var_reads_in_stmt(symbols, else_body, name, reads);
             }
         }
         CStmt::While { cond, body } | CStmt::DoWhile { body, cond } => {
             count_expr(cond, reads);
-            count_var_reads_in_stmt(body, name, reads);
+            count_var_reads_in_stmt(symbols, body, name, reads);
         }
         CStmt::For {
             init,
@@ -4234,7 +4256,7 @@ fn count_var_reads_in_stmt(stmt: &CStmt, name: &str, reads: &mut usize) {
             body,
         } => {
             if let Some(init) = init {
-                count_var_reads_in_stmt(init, name, reads);
+                count_var_reads_in_stmt(symbols, init, name, reads);
             }
             if let Some(cond) = cond {
                 count_expr(cond, reads);
@@ -4242,7 +4264,7 @@ fn count_var_reads_in_stmt(stmt: &CStmt, name: &str, reads: &mut usize) {
             if let Some(update) = update {
                 count_expr(update, reads);
             }
-            count_var_reads_in_stmt(body, name, reads);
+            count_var_reads_in_stmt(symbols, body, name, reads);
         }
         CStmt::Switch {
             expr,
@@ -4252,12 +4274,12 @@ fn count_var_reads_in_stmt(stmt: &CStmt, name: &str, reads: &mut usize) {
             count_expr(expr, reads);
             for case in cases {
                 for stmt in &case.body {
-                    count_var_reads_in_stmt(stmt, name, reads);
+                    count_var_reads_in_stmt(symbols, stmt, name, reads);
                 }
             }
             if let Some(default) = default {
                 for stmt in default {
-                    count_var_reads_in_stmt(stmt, name, reads);
+                    count_var_reads_in_stmt(symbols, stmt, name, reads);
                 }
             }
         }
@@ -4265,7 +4287,7 @@ fn count_var_reads_in_stmt(stmt: &CStmt, name: &str, reads: &mut usize) {
 }
 
 /// Put `value` wherever `name` is read in this statement.
-fn substitute_var_in_stmt(stmt: &mut CStmt, name: &str, value: &CExpr) {
+fn substitute_var_in_stmt(stmt: &mut CStmt, name: crate::symbol::SymbolId, value: &CExpr) {
     match stmt {
         CStmt::Empty
         | CStmt::Break
@@ -4341,8 +4363,8 @@ fn substitute_var_in_stmt(stmt: &mut CStmt, name: &str, value: &CExpr) {
     }
 }
 
-fn substitute_var_in_expr(expr: &mut CExpr, name: &str, value: &CExpr) {
-    if matches!(expr, CExpr::Var(found) if found.eq_ignore_ascii_case(name)) {
+fn substitute_var_in_expr(expr: &mut CExpr, name: crate::symbol::SymbolId, value: &CExpr) {
+    if matches!(expr, CExpr::Var(found) if *found == name) {
         *expr = value.clone();
         return;
     }
@@ -4394,168 +4416,20 @@ fn substitute_var_in_expr(expr: &mut CExpr, name: &str, value: &CExpr) {
     }
 }
 
-fn rewrite_stmt_var_aliases(
-    stmt: &mut CStmt,
-    rename_map: &std::collections::HashMap<String, String>,
-) {
-    match stmt {
-        CStmt::Empty
-        | CStmt::Break
-        | CStmt::Continue
-        | CStmt::Goto(_)
-        | CStmt::Label(_)
-        | CStmt::Comment(_) => {}
-        CStmt::Expr(expr) => rewrite_expr_var_aliases(expr, rename_map, true),
-        CStmt::Decl { init, .. } => {
-            if let Some(init) = init {
-                rewrite_expr_var_aliases(init, rename_map, true);
-            }
-        }
-        CStmt::Block(stmts) => {
-            for stmt in stmts {
-                rewrite_stmt_var_aliases(stmt, rename_map);
-            }
-        }
-        CStmt::If {
-            cond,
-            then_body,
-            else_body,
-        } => {
-            rewrite_expr_var_aliases(cond, rename_map, true);
-            rewrite_stmt_var_aliases(then_body, rename_map);
-            if let Some(else_body) = else_body {
-                rewrite_stmt_var_aliases(else_body, rename_map);
-            }
-        }
-        CStmt::While { cond, body } => {
-            rewrite_expr_var_aliases(cond, rename_map, true);
-            rewrite_stmt_var_aliases(body, rename_map);
-        }
-        CStmt::DoWhile { body, cond } => {
-            rewrite_stmt_var_aliases(body, rename_map);
-            rewrite_expr_var_aliases(cond, rename_map, true);
-        }
-        CStmt::For {
-            init,
-            cond,
-            update,
-            body,
-        } => {
-            if let Some(init) = init {
-                rewrite_stmt_var_aliases(init, rename_map);
-            }
-            if let Some(cond) = cond {
-                rewrite_expr_var_aliases(cond, rename_map, true);
-            }
-            if let Some(update) = update {
-                rewrite_expr_var_aliases(update, rename_map, true);
-            }
-            rewrite_stmt_var_aliases(body, rename_map);
-        }
-        CStmt::Switch {
-            expr,
-            cases,
-            default,
-        } => {
-            rewrite_expr_var_aliases(expr, rename_map, true);
-            for case in cases {
-                rewrite_expr_var_aliases(&mut case.value, rename_map, true);
-                for stmt in &mut case.body {
-                    rewrite_stmt_var_aliases(stmt, rename_map);
-                }
-            }
-            if let Some(default) = default {
-                for stmt in default {
-                    rewrite_stmt_var_aliases(stmt, rename_map);
-                }
-            }
-        }
-        CStmt::Return(expr) => {
-            if let Some(expr) = expr {
-                rewrite_expr_var_aliases(expr, rename_map, true);
-            }
-        }
-    }
-}
 
-fn rewrite_expr_var_aliases(
-    expr: &mut CExpr,
-    rename_map: &std::collections::HashMap<String, String>,
-    allow_plain_var_rewrite: bool,
-) {
-    match expr {
-        CExpr::Var(name) if allow_plain_var_rewrite => {
-            if let Some(target) = rename_map.get(&name.to_ascii_lowercase()) {
-                *name = target.clone();
-            }
-        }
-        // Renaming moves the names this function owns; an external one is not.
-        CExpr::External { .. } => {}
-        CExpr::Unary { operand, .. }
-        | CExpr::Cast { expr: operand, .. }
-        | CExpr::Paren(operand)
-        | CExpr::Sizeof(operand) => {
-            rewrite_expr_var_aliases(operand, rename_map, allow_plain_var_rewrite);
-        }
-        CExpr::AddrOf(operand) => {
-            rewrite_expr_var_aliases(operand, rename_map, false);
-        }
-        CExpr::Deref(operand) => {
-            rewrite_expr_var_aliases(operand, rename_map, false);
-        }
-        CExpr::Binary { left, right, .. } => {
-            rewrite_expr_var_aliases(left, rename_map, allow_plain_var_rewrite);
-            rewrite_expr_var_aliases(right, rename_map, allow_plain_var_rewrite);
-        }
-        CExpr::Ternary {
-            cond,
-            then_expr,
-            else_expr,
-        } => {
-            rewrite_expr_var_aliases(cond, rename_map, allow_plain_var_rewrite);
-            rewrite_expr_var_aliases(then_expr, rename_map, allow_plain_var_rewrite);
-            rewrite_expr_var_aliases(else_expr, rename_map, allow_plain_var_rewrite);
-        }
-        CExpr::Call { func, args } => {
-            rewrite_expr_var_aliases(func, rename_map, allow_plain_var_rewrite);
-            for arg in args {
-                rewrite_expr_var_aliases(arg, rename_map, allow_plain_var_rewrite);
-            }
-        }
-        CExpr::Subscript { base, index } => {
-            rewrite_expr_var_aliases(base, rename_map, allow_plain_var_rewrite);
-            rewrite_expr_var_aliases(index, rename_map, allow_plain_var_rewrite);
-        }
-        CExpr::Member { base, .. } | CExpr::PtrMember { base, .. } => {
-            rewrite_expr_var_aliases(base, rename_map, allow_plain_var_rewrite);
-        }
-        CExpr::Comma(items) => {
-            for item in items {
-                rewrite_expr_var_aliases(item, rename_map, allow_plain_var_rewrite);
-            }
-        }
-        CExpr::IntLit(_)
-        | CExpr::UIntLit(_)
-        | CExpr::FloatLit(_)
-        | CExpr::StringLit(_)
-        | CExpr::CharLit(_)
-        | CExpr::SizeofType(_)
-        | CExpr::Var(_) => {}
-    }
-}
 
-fn rewrite_stack_synonym_uses_to_declared_locals(
+fn rewrite_stack_synonym_uses_to_declared_locals(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
     func: &mut CFunction,
     fold_ctx: &FoldingContext<'_>,
 ) {
     let declared_names = func
         .params
         .iter()
-        .map(|param| param.name.to_ascii_lowercase())
+        .map(|param| crate::symbol::spelling(symbols, param.name).to_ascii_lowercase())
         .chain(
             func.locals
                 .iter()
-                .map(|local| local.name.to_ascii_lowercase()),
+                .map(|local| crate::symbol::spelling(symbols, local.name).to_ascii_lowercase()),
         )
         .collect::<HashSet<_>>();
     let local_by_offset = func
@@ -4574,14 +4448,15 @@ fn rewrite_stack_synonym_uses_to_declared_locals(
         .map(|local| local.name.clone())
         .collect::<Vec<_>>();
     pointer_locals.sort();
-    pointer_locals.dedup_by(|lhs, rhs| lhs.eq_ignore_ascii_case(rhs));
+    pointer_locals.dedup();
     let unique_pointer_local = (pointer_locals.len() == 1).then(|| pointer_locals[0].clone());
     if local_by_offset.is_empty() && unique_pointer_local.is_none() {
         return;
     }
 
     let mut rename_map = std::collections::HashMap::new();
-    for name in collect_stmt_var_names(&func.body) {
+    for id in collect_stmt_var_names(&func.body) {
+        let name = crate::symbol::spelling(symbols, id);
         if declared_names.contains(&name.to_ascii_lowercase()) {
             continue;
         }
@@ -4597,17 +4472,16 @@ fn rewrite_stack_synonym_uses_to_declared_locals(
         let Some(target) = target else {
             continue;
         };
+        let target = crate::symbol::spelling(symbols, target);
         if !target.eq_ignore_ascii_case(&name) {
-            rename_map.insert(name.to_ascii_lowercase(), target);
+            rename_map.insert(name.to_ascii_lowercase(), target.to_string());
         }
     }
     if rename_map.is_empty() {
         return;
     }
 
-    for stmt in &mut func.body {
-        rewrite_stmt_var_aliases(stmt, &rename_map);
-    }
+    func.symbols.borrow_mut().follow_renames(&rename_map);
 }
 
 fn prune_dead_temp_assignments_in_function_body(
@@ -4623,7 +4497,8 @@ fn prune_dead_temp_assignments_in_function_body(
 }
 
 fn normalize_redundant_return_carrier_casts(func: &mut CFunction) {
-    fn visit(stmt: &mut CStmt, ret_type: &CType, declared_types: &HashMap<String, CType>) {
+    let symbols = &func.symbols;
+    fn visit(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, stmt: &mut CStmt, ret_type: &CType, declared_types: &HashMap<String, CType>) {
         match stmt {
             CStmt::Return(Some(expr)) => {
                 let CExpr::Cast { expr: inner, .. } = expr else {
@@ -4633,7 +4508,7 @@ fn normalize_redundant_return_carrier_casts(func: &mut CFunction) {
                     return;
                 };
                 if declared_types
-                    .get(&name.to_ascii_lowercase())
+                    .get(&crate::symbol::spelling(symbols, *name).to_ascii_lowercase())
                     .is_some_and(|ty| ty == ret_type)
                 {
                     *expr = *inner.clone();
@@ -4641,7 +4516,7 @@ fn normalize_redundant_return_carrier_casts(func: &mut CFunction) {
             }
             CStmt::Block(stmts) => {
                 for stmt in stmts {
-                    visit(stmt, ret_type, declared_types);
+                    visit(symbols, stmt, ret_type, declared_types);
                 }
             }
             CStmt::If {
@@ -4649,29 +4524,29 @@ fn normalize_redundant_return_carrier_casts(func: &mut CFunction) {
                 else_body,
                 ..
             } => {
-                visit(then_body, ret_type, declared_types);
+                visit(symbols, then_body, ret_type, declared_types);
                 if let Some(else_body) = else_body {
-                    visit(else_body, ret_type, declared_types);
+                    visit(symbols, else_body, ret_type, declared_types);
                 }
             }
             CStmt::While { body, .. } | CStmt::DoWhile { body, .. } => {
-                visit(body, ret_type, declared_types);
+                visit(symbols, body, ret_type, declared_types);
             }
             CStmt::For { init, body, .. } => {
                 if let Some(init) = init {
-                    visit(init, ret_type, declared_types);
+                    visit(symbols, init, ret_type, declared_types);
                 }
-                visit(body, ret_type, declared_types);
+                visit(symbols, body, ret_type, declared_types);
             }
             CStmt::Switch { cases, default, .. } => {
                 for case in cases {
                     for stmt in &mut case.body {
-                        visit(stmt, ret_type, declared_types);
+                        visit(symbols, stmt, ret_type, declared_types);
                     }
                 }
                 if let Some(default) = default {
                     for stmt in default {
-                        visit(stmt, ret_type, declared_types);
+                        visit(symbols, stmt, ret_type, declared_types);
                     }
                 }
             }
@@ -4690,15 +4565,15 @@ fn normalize_redundant_return_carrier_casts(func: &mut CFunction) {
     let declared_types = func
         .params
         .iter()
-        .map(|param| (param.name.to_ascii_lowercase(), param.ty.clone()))
+        .map(|param| (crate::symbol::spelling(symbols, param.name).to_ascii_lowercase(), param.ty.clone()))
         .chain(
             func.locals
                 .iter()
-                .map(|local| (local.name.to_ascii_lowercase(), local.ty.clone())),
+                .map(|local| (crate::symbol::spelling(symbols, local.name).to_ascii_lowercase(), local.ty.clone())),
         )
         .collect::<HashMap<_, _>>();
     for stmt in &mut func.body {
-        visit(stmt, &func.ret_type, &declared_types);
+        visit(symbols, stmt, &func.ret_type, &declared_types);
     }
 }
 
@@ -4837,43 +4712,44 @@ fn normalize_comparison_operand_order(func: &mut CFunction) {
 const RETURN_TYPE_KEY: &str = "\u{0}return";
 
 fn normalize_declared_assignment_literals(func: &mut CFunction) {
-    fn visit_expr(expr: &mut CExpr, declared_types: &HashMap<String, CType>) {
+    let symbols = &func.symbols;
+    fn visit_expr(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, expr: &mut CExpr, declared_types: &HashMap<String, CType>) {
         match expr {
             CExpr::Unary { operand, .. }
             | CExpr::Cast { expr: operand, .. }
             | CExpr::Sizeof(operand)
             | CExpr::AddrOf(operand)
             | CExpr::Deref(operand)
-            | CExpr::Paren(operand) => visit_expr(operand, declared_types),
+            | CExpr::Paren(operand) => visit_expr(symbols, operand, declared_types),
             CExpr::Binary { left, right, .. } => {
-                visit_expr(left, declared_types);
-                visit_expr(right, declared_types);
+                visit_expr(symbols, left, declared_types);
+                visit_expr(symbols, right, declared_types);
             }
             CExpr::Ternary {
                 cond,
                 then_expr,
                 else_expr,
             } => {
-                visit_expr(cond, declared_types);
-                visit_expr(then_expr, declared_types);
-                visit_expr(else_expr, declared_types);
+                visit_expr(symbols, cond, declared_types);
+                visit_expr(symbols, then_expr, declared_types);
+                visit_expr(symbols, else_expr, declared_types);
             }
             CExpr::Call { func, args } => {
-                visit_expr(func, declared_types);
+                visit_expr(symbols, func, declared_types);
                 for arg in args {
-                    visit_expr(arg, declared_types);
+                    visit_expr(symbols, arg, declared_types);
                 }
             }
             CExpr::Subscript { base, index } => {
-                visit_expr(base, declared_types);
-                visit_expr(index, declared_types);
+                visit_expr(symbols, base, declared_types);
+                visit_expr(symbols, index, declared_types);
             }
             CExpr::Member { base, .. } | CExpr::PtrMember { base, .. } => {
-                visit_expr(base, declared_types);
+                visit_expr(symbols, base, declared_types);
             }
             CExpr::Comma(exprs) => {
                 for expr in exprs {
-                    visit_expr(expr, declared_types);
+                    visit_expr(symbols, expr, declared_types);
                 }
             }
             CExpr::IntLit(_)
@@ -4897,23 +4773,23 @@ fn normalize_declared_assignment_literals(func: &mut CFunction) {
         let CExpr::Var(name) = left.as_ref() else {
             return;
         };
-        if let Some(ty) = declared_types.get(&name.to_ascii_lowercase()) {
+        if let Some(ty) = declared_types.get(&crate::symbol::spelling(symbols, *name).to_ascii_lowercase()) {
             normalize_literal_for_declared_type(right, ty);
         }
     }
 
-    fn visit_stmt(stmt: &mut CStmt, declared_types: &HashMap<String, CType>) {
+    fn visit_stmt(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, stmt: &mut CStmt, declared_types: &HashMap<String, CType>) {
         match stmt {
-            CStmt::Expr(expr) => visit_expr(expr, declared_types),
+            CStmt::Expr(expr) => visit_expr(symbols, expr, declared_types),
             CStmt::Decl { ty, init, .. } => {
                 if let Some(init) = init {
-                    visit_expr(init, declared_types);
+                    visit_expr(symbols, init, declared_types);
                     normalize_literal_for_declared_type(init, ty);
                 }
             }
             CStmt::Block(stmts) => {
                 for stmt in stmts {
-                    visit_stmt(stmt, declared_types);
+                    visit_stmt(symbols, stmt, declared_types);
                 }
             }
             CStmt::If {
@@ -4921,15 +4797,15 @@ fn normalize_declared_assignment_literals(func: &mut CFunction) {
                 then_body,
                 else_body,
             } => {
-                visit_expr(cond, declared_types);
-                visit_stmt(then_body, declared_types);
+                visit_expr(symbols, cond, declared_types);
+                visit_stmt(symbols, then_body, declared_types);
                 if let Some(else_body) = else_body {
-                    visit_stmt(else_body, declared_types);
+                    visit_stmt(symbols, else_body, declared_types);
                 }
             }
             CStmt::While { cond, body } | CStmt::DoWhile { body, cond } => {
-                visit_expr(cond, declared_types);
-                visit_stmt(body, declared_types);
+                visit_expr(symbols, cond, declared_types);
+                visit_stmt(symbols, body, declared_types);
             }
             CStmt::For {
                 init,
@@ -4938,36 +4814,36 @@ fn normalize_declared_assignment_literals(func: &mut CFunction) {
                 body,
             } => {
                 if let Some(init) = init {
-                    visit_stmt(init, declared_types);
+                    visit_stmt(symbols, init, declared_types);
                 }
                 if let Some(cond) = cond {
-                    visit_expr(cond, declared_types);
+                    visit_expr(symbols, cond, declared_types);
                 }
                 if let Some(update) = update {
-                    visit_expr(update, declared_types);
+                    visit_expr(symbols, update, declared_types);
                 }
-                visit_stmt(body, declared_types);
+                visit_stmt(symbols, body, declared_types);
             }
             CStmt::Switch {
                 expr,
                 cases,
                 default,
             } => {
-                visit_expr(expr, declared_types);
+                visit_expr(symbols, expr, declared_types);
                 for case in cases {
-                    visit_expr(&mut case.value, declared_types);
+                    visit_expr(symbols, &mut case.value, declared_types);
                     for stmt in &mut case.body {
-                        visit_stmt(stmt, declared_types);
+                        visit_stmt(symbols, stmt, declared_types);
                     }
                 }
                 if let Some(default) = default {
                     for stmt in default {
-                        visit_stmt(stmt, declared_types);
+                        visit_stmt(symbols, stmt, declared_types);
                     }
                 }
             }
             CStmt::Return(Some(expr)) => {
-                visit_expr(expr, declared_types);
+                visit_expr(symbols, expr, declared_types);
                 // A returned literal is read as the return type, so an all-ones
                 // word coming back from an `int` function is -1, not 0xffffffff.
                 if let Some(ty) = declared_types.get(RETURN_TYPE_KEY) {
@@ -4987,26 +4863,26 @@ fn normalize_declared_assignment_literals(func: &mut CFunction) {
     let mut declared_types = func
         .params
         .iter()
-        .map(|param| (param.name.to_ascii_lowercase(), param.ty.clone()))
+        .map(|param| (crate::symbol::spelling(symbols, param.name).to_ascii_lowercase(), param.ty.clone()))
         .chain(
             func.locals
                 .iter()
-                .map(|local| (local.name.to_ascii_lowercase(), local.ty.clone())),
+                .map(|local| (crate::symbol::spelling(symbols, local.name).to_ascii_lowercase(), local.ty.clone())),
         )
         .collect::<HashMap<_, _>>();
     declared_types.insert(RETURN_TYPE_KEY.to_string(), func.ret_type.clone());
     for stmt in &mut func.body {
-        visit_stmt(stmt, &declared_types);
+        visit_stmt(symbols, stmt, &declared_types);
     }
 }
 
-fn prune_unused_pure_locals(func: &mut CFunction) {
+fn prune_unused_pure_locals(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, func: &mut CFunction) {
     loop {
-        let live_reads = collect_function_local_reads(func);
+        let live_reads = collect_function_local_reads(symbols, func);
         let dead_locals = func
             .locals
             .iter()
-            .map(|local| local.name.to_ascii_lowercase())
+            .map(|local| crate::symbol::spelling(symbols, local.name).to_ascii_lowercase())
             .filter(|name| !live_reads.contains(name))
             .collect::<HashSet<_>>();
 
@@ -5015,29 +4891,29 @@ fn prune_unused_pure_locals(func: &mut CFunction) {
         }
 
         func.locals
-            .retain(|local| !dead_locals.contains(&local.name.to_ascii_lowercase()));
-        prune_unused_pure_local_stmts(&mut func.body, &dead_locals);
+            .retain(|local| !dead_locals.contains(&crate::symbol::spelling(symbols, local.name).to_ascii_lowercase()));
+        prune_unused_pure_local_stmts(symbols, &mut func.body, &dead_locals);
     }
 }
 
-fn prune_unreferenced_local_declarations(func: &mut CFunction) {
+fn prune_unreferenced_local_declarations(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, func: &mut CFunction) {
     let referenced = collect_stmt_var_names(&func.body)
         .into_iter()
-        .map(|name| name.to_ascii_lowercase())
+        .map(|name| crate::symbol::spelling(symbols, name).to_ascii_lowercase())
         .collect::<HashSet<_>>();
     func.locals
-        .retain(|local| referenced.contains(&local.name.to_ascii_lowercase()));
+        .retain(|local| referenced.contains(&crate::symbol::spelling(symbols, local.name).to_ascii_lowercase()));
 }
 
-fn collect_function_local_reads(func: &CFunction) -> HashSet<String> {
+fn collect_function_local_reads(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, func: &CFunction) -> HashSet<String> {
     let mut reads = HashSet::new();
     for stmt in &func.body {
-        collect_stmt_local_reads(stmt, &mut reads);
+        collect_stmt_local_reads(symbols, stmt, &mut reads);
     }
     reads
 }
 
-fn collect_stmt_local_reads(stmt: &CStmt, reads: &mut HashSet<String>) {
+fn collect_stmt_local_reads(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, stmt: &CStmt, reads: &mut HashSet<String>) {
     match stmt {
         CStmt::Empty
         | CStmt::Break
@@ -5051,19 +4927,19 @@ fn collect_stmt_local_reads(stmt: &CStmt, reads: &mut HashSet<String>) {
             right,
         }) => {
             if !matches!(left.as_ref(), CExpr::Var(_)) {
-                collect_expr_local_reads(left, reads);
+                collect_expr_local_reads(symbols, left, reads);
             }
-            collect_expr_local_reads(right, reads);
+            collect_expr_local_reads(symbols, right, reads);
         }
-        CStmt::Expr(expr) => collect_expr_local_reads(expr, reads),
+        CStmt::Expr(expr) => collect_expr_local_reads(symbols, expr, reads),
         CStmt::Decl { init, .. } => {
             if let Some(init) = init {
-                collect_expr_local_reads(init, reads);
+                collect_expr_local_reads(symbols, init, reads);
             }
         }
         CStmt::Block(stmts) => {
             for stmt in stmts {
-                collect_stmt_local_reads(stmt, reads);
+                collect_stmt_local_reads(symbols, stmt, reads);
             }
         }
         CStmt::If {
@@ -5071,19 +4947,19 @@ fn collect_stmt_local_reads(stmt: &CStmt, reads: &mut HashSet<String>) {
             then_body,
             else_body,
         } => {
-            collect_expr_local_reads(cond, reads);
-            collect_stmt_local_reads(then_body, reads);
+            collect_expr_local_reads(symbols, cond, reads);
+            collect_stmt_local_reads(symbols, then_body, reads);
             if let Some(else_body) = else_body {
-                collect_stmt_local_reads(else_body, reads);
+                collect_stmt_local_reads(symbols, else_body, reads);
             }
         }
         CStmt::While { cond, body } => {
-            collect_expr_local_reads(cond, reads);
-            collect_stmt_local_reads(body, reads);
+            collect_expr_local_reads(symbols, cond, reads);
+            collect_stmt_local_reads(symbols, body, reads);
         }
         CStmt::DoWhile { body, cond } => {
-            collect_stmt_local_reads(body, reads);
-            collect_expr_local_reads(cond, reads);
+            collect_stmt_local_reads(symbols, body, reads);
+            collect_expr_local_reads(symbols, cond, reads);
         }
         CStmt::For {
             init,
@@ -5092,43 +4968,43 @@ fn collect_stmt_local_reads(stmt: &CStmt, reads: &mut HashSet<String>) {
             body,
         } => {
             if let Some(init) = init {
-                collect_stmt_local_reads(init, reads);
+                collect_stmt_local_reads(symbols, init, reads);
             }
             if let Some(cond) = cond {
-                collect_expr_local_reads(cond, reads);
+                collect_expr_local_reads(symbols, cond, reads);
             }
             if let Some(update) = update {
-                collect_expr_local_reads(update, reads);
+                collect_expr_local_reads(symbols, update, reads);
             }
-            collect_stmt_local_reads(body, reads);
+            collect_stmt_local_reads(symbols, body, reads);
         }
         CStmt::Switch {
             expr,
             cases,
             default,
         } => {
-            collect_expr_local_reads(expr, reads);
+            collect_expr_local_reads(symbols, expr, reads);
             for case in cases {
-                collect_expr_local_reads(&case.value, reads);
+                collect_expr_local_reads(symbols, &case.value, reads);
                 for stmt in &case.body {
-                    collect_stmt_local_reads(stmt, reads);
+                    collect_stmt_local_reads(symbols, stmt, reads);
                 }
             }
             if let Some(default) = default {
                 for stmt in default {
-                    collect_stmt_local_reads(stmt, reads);
+                    collect_stmt_local_reads(symbols, stmt, reads);
                 }
             }
         }
-        CStmt::Return(Some(expr)) => collect_expr_local_reads(expr, reads),
+        CStmt::Return(Some(expr)) => collect_expr_local_reads(symbols, expr, reads),
         CStmt::Return(None) => {}
     }
 }
 
-fn collect_expr_local_reads(expr: &CExpr, reads: &mut HashSet<String>) {
+fn collect_expr_local_reads(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, expr: &CExpr, reads: &mut HashSet<String>) {
     match expr {
         CExpr::Var(name) => {
-            reads.insert(name.to_ascii_lowercase());
+            reads.insert(crate::symbol::spelling(symbols, *name).to_ascii_lowercase());
         }
         // Reading an intrinsic is not reading a local.
         CExpr::External { .. } => {}
@@ -5137,7 +5013,7 @@ fn collect_expr_local_reads(expr: &CExpr, reads: &mut HashSet<String>) {
         | CExpr::Deref(inner)
         | CExpr::Cast { expr: inner, .. }
         | CExpr::Unary { operand: inner, .. }
-        | CExpr::Sizeof(inner) => collect_expr_local_reads(inner, reads),
+        | CExpr::Sizeof(inner) => collect_expr_local_reads(symbols, inner, reads),
         // A plain name on the left of an assignment is written, not read, wherever
         // the assignment sits. The statement form already said so; a comma inside
         // a condition holds the same store and has to answer the same way.
@@ -5146,23 +5022,23 @@ fn collect_expr_local_reads(expr: &CExpr, reads: &mut HashSet<String>) {
             left,
             right,
         } if matches!(left.as_ref(), CExpr::Var(_)) => {
-            collect_expr_local_reads(right, reads);
+            collect_expr_local_reads(symbols, right, reads);
         }
         CExpr::Binary { left, right, .. } => {
-            collect_expr_local_reads(left, reads);
-            collect_expr_local_reads(right, reads);
+            collect_expr_local_reads(symbols, left, reads);
+            collect_expr_local_reads(symbols, right, reads);
         }
         CExpr::Subscript { base, index } => {
-            collect_expr_local_reads(base, reads);
-            collect_expr_local_reads(index, reads);
+            collect_expr_local_reads(symbols, base, reads);
+            collect_expr_local_reads(symbols, index, reads);
         }
         CExpr::Member { base, .. } | CExpr::PtrMember { base, .. } => {
-            collect_expr_local_reads(base, reads);
+            collect_expr_local_reads(symbols, base, reads);
         }
         CExpr::Call { func, args } => {
-            collect_expr_local_reads(func, reads);
+            collect_expr_local_reads(symbols, func, reads);
             for arg in args {
-                collect_expr_local_reads(arg, reads);
+                collect_expr_local_reads(symbols, arg, reads);
             }
         }
         CExpr::Ternary {
@@ -5170,13 +5046,13 @@ fn collect_expr_local_reads(expr: &CExpr, reads: &mut HashSet<String>) {
             then_expr,
             else_expr,
         } => {
-            collect_expr_local_reads(cond, reads);
-            collect_expr_local_reads(then_expr, reads);
-            collect_expr_local_reads(else_expr, reads);
+            collect_expr_local_reads(symbols, cond, reads);
+            collect_expr_local_reads(symbols, then_expr, reads);
+            collect_expr_local_reads(symbols, else_expr, reads);
         }
         CExpr::Comma(items) => {
             for item in items {
-                collect_expr_local_reads(item, reads);
+                collect_expr_local_reads(symbols, item, reads);
             }
         }
         CExpr::IntLit(_)
@@ -5188,14 +5064,14 @@ fn collect_expr_local_reads(expr: &CExpr, reads: &mut HashSet<String>) {
     }
 }
 
-fn prune_unused_pure_local_stmts(stmts: &mut Vec<CStmt>, dead_locals: &HashSet<String>) {
+fn prune_unused_pure_local_stmts(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, stmts: &mut Vec<CStmt>, dead_locals: &HashSet<String>) {
     for stmt in stmts.iter_mut() {
-        prune_unused_pure_local_stmt(stmt, dead_locals);
+        prune_unused_pure_local_stmt(symbols, stmt, dead_locals);
     }
     stmts.retain(|stmt| !matches!(stmt, CStmt::Empty));
 }
 
-fn prune_unused_pure_local_stmt(stmt: &mut CStmt, dead_locals: &HashSet<String>) {
+fn prune_unused_pure_local_stmt(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, stmt: &mut CStmt, dead_locals: &HashSet<String>) {
     match stmt {
         CStmt::Expr(CExpr::Binary {
             op: BinaryOp::Assign,
@@ -5203,14 +5079,14 @@ fn prune_unused_pure_local_stmt(stmt: &mut CStmt, dead_locals: &HashSet<String>)
             right,
         }) => {
             if let CExpr::Var(name) = left.as_ref()
-                && dead_locals.contains(&name.to_ascii_lowercase())
+                && dead_locals.contains(&crate::symbol::spelling(symbols, *name).to_ascii_lowercase())
                 && expr_is_pure_for_dead_local_prune(right)
             {
                 *stmt = CStmt::Empty;
             }
         }
         CStmt::Decl { name, init, .. } => {
-            if dead_locals.contains(&name.to_ascii_lowercase()) {
+            if dead_locals.contains(&crate::symbol::spelling(symbols, *name).to_ascii_lowercase()) {
                 match init.take() {
                     Some(expr) if !expr_is_pure_for_dead_local_prune(&expr) => {
                         *stmt = CStmt::Expr(expr);
@@ -5221,32 +5097,32 @@ fn prune_unused_pure_local_stmt(stmt: &mut CStmt, dead_locals: &HashSet<String>)
                 }
             }
         }
-        CStmt::Block(stmts) => prune_unused_pure_local_stmts(stmts, dead_locals),
+        CStmt::Block(stmts) => prune_unused_pure_local_stmts(symbols, stmts, dead_locals),
         CStmt::If {
             then_body,
             else_body,
             ..
         } => {
-            prune_unused_pure_local_stmt(then_body, dead_locals);
+            prune_unused_pure_local_stmt(symbols, then_body, dead_locals);
             if let Some(else_body) = else_body {
-                prune_unused_pure_local_stmt(else_body, dead_locals);
+                prune_unused_pure_local_stmt(symbols, else_body, dead_locals);
             }
         }
         CStmt::While { body, .. } | CStmt::DoWhile { body, .. } => {
-            prune_unused_pure_local_stmt(body, dead_locals);
+            prune_unused_pure_local_stmt(symbols, body, dead_locals);
         }
         CStmt::For { init, body, .. } => {
             if let Some(init) = init {
-                prune_unused_pure_local_stmt(init, dead_locals);
+                prune_unused_pure_local_stmt(symbols, init, dead_locals);
             }
-            prune_unused_pure_local_stmt(body, dead_locals);
+            prune_unused_pure_local_stmt(symbols, body, dead_locals);
         }
         CStmt::Switch { cases, default, .. } => {
             for case in cases {
-                prune_unused_pure_local_stmts(&mut case.body, dead_locals);
+                prune_unused_pure_local_stmts(symbols, &mut case.body, dead_locals);
             }
             if let Some(default) = default {
-                prune_unused_pure_local_stmts(default, dead_locals);
+                prune_unused_pure_local_stmts(symbols, default, dead_locals);
             }
         }
         CStmt::Empty

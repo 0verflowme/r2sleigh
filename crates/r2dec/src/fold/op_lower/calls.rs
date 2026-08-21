@@ -9,45 +9,45 @@ pub(super) struct CertifiedCallArgs {
 impl<'a> FoldingContext<'a> {
     const UNRESOLVED_CALL_ARG_EXPR_NAME: &'static str = "__r2dec_unresolved_call_arg";
 
-    pub(super) fn unresolved_call_arg_expr() -> CExpr {
-        CExpr::Var(Self::UNRESOLVED_CALL_ARG_EXPR_NAME.to_string())
+    pub(super) fn unresolved_call_arg_expr(&self) -> CExpr {
+        self.name_ref(Self::UNRESOLVED_CALL_ARG_EXPR_NAME)
     }
 
-    pub(super) fn call_arg_expr_is_unresolved_fallback(expr: &CExpr) -> bool {
+    pub(super) fn call_arg_expr_is_unresolved_fallback(&self, expr: &CExpr) -> bool {
         match expr {
-            CExpr::Var(name) => name == Self::UNRESOLVED_CALL_ARG_EXPR_NAME,
+            CExpr::Var(name) => &*self.spelling(*name) == Self::UNRESOLVED_CALL_ARG_EXPR_NAME,
             CExpr::External { .. } => false,
             CExpr::Unary { operand, .. }
             | CExpr::Cast { expr: operand, .. }
             | CExpr::Deref(operand)
             | CExpr::AddrOf(operand)
             | CExpr::Sizeof(operand)
-            | CExpr::Paren(operand) => Self::call_arg_expr_is_unresolved_fallback(operand),
+            | CExpr::Paren(operand) => self.call_arg_expr_is_unresolved_fallback(operand),
             CExpr::Binary { left, right, .. } => {
-                Self::call_arg_expr_is_unresolved_fallback(left)
-                    || Self::call_arg_expr_is_unresolved_fallback(right)
+                self.call_arg_expr_is_unresolved_fallback(left)
+                    || self.call_arg_expr_is_unresolved_fallback(right)
             }
             CExpr::Ternary {
                 cond,
                 then_expr,
                 else_expr,
             } => {
-                Self::call_arg_expr_is_unresolved_fallback(cond)
-                    || Self::call_arg_expr_is_unresolved_fallback(then_expr)
-                    || Self::call_arg_expr_is_unresolved_fallback(else_expr)
+                self.call_arg_expr_is_unresolved_fallback(cond)
+                    || self.call_arg_expr_is_unresolved_fallback(then_expr)
+                    || self.call_arg_expr_is_unresolved_fallback(else_expr)
             }
             CExpr::Call { func, args } => {
-                Self::call_arg_expr_is_unresolved_fallback(func)
-                    || args.iter().any(Self::call_arg_expr_is_unresolved_fallback)
+                self.call_arg_expr_is_unresolved_fallback(func)
+                    || args.iter().any(|a| self.call_arg_expr_is_unresolved_fallback(a))
             }
             CExpr::Subscript { base, index } => {
-                Self::call_arg_expr_is_unresolved_fallback(base)
-                    || Self::call_arg_expr_is_unresolved_fallback(index)
+                self.call_arg_expr_is_unresolved_fallback(base)
+                    || self.call_arg_expr_is_unresolved_fallback(index)
             }
             CExpr::Member { base, .. } | CExpr::PtrMember { base, .. } => {
-                Self::call_arg_expr_is_unresolved_fallback(base)
+                self.call_arg_expr_is_unresolved_fallback(base)
             }
-            CExpr::Comma(items) => items.iter().any(Self::call_arg_expr_is_unresolved_fallback),
+            CExpr::Comma(items) => items.iter().any(|a| self.call_arg_expr_is_unresolved_fallback(a)),
             CExpr::IntLit(_)
             | CExpr::UIntLit(_)
             | CExpr::FloatLit(_)
@@ -71,12 +71,12 @@ impl<'a> FoldingContext<'a> {
             .direct_target
     }
 
-    fn callee_identity_expr(identity: &CalleeIdentity) -> CExpr {
+    fn callee_identity_expr(&self, identity: &CalleeIdentity) -> CExpr {
         identity
             .display_name
             .clone()
-            .map(CExpr::Var)
-            .unwrap_or_else(|| CExpr::Var(identity.primary_key()))
+            .map(|n| self.name_ref(&n))
+            .unwrap_or_else(|| self.name_ref(&identity.primary_key()))
     }
 
     fn resolved_callee_target(
@@ -156,8 +156,10 @@ impl<'a> FoldingContext<'a> {
         block_addr: u64,
         op_idx: usize,
     ) -> Option<CExpr> {
+        let symbols = &self.symbols;
+
         self.resolved_callee_target_for_site(block_addr, op_idx)
-            .map(|target| Self::callee_identity_expr(&target.identity))
+            .map(|target| self.callee_identity_expr(&target.identity))
     }
 
     pub(super) fn resolve_call_target_for_site(
@@ -341,7 +343,7 @@ impl<'a> FoldingContext<'a> {
                 )
             })
             .collect::<Option<Vec<_>>>()?;
-        if args.iter().any(Self::call_arg_expr_is_unresolved_fallback) {
+        if args.iter().any(|a| self.call_arg_expr_is_unresolved_fallback(a)) {
             return None;
         }
 
@@ -501,7 +503,7 @@ impl<'a> FoldingContext<'a> {
         if let Some(addr) = parse_address_from_var_name(&target.name)
             && let Some(name) = self.callee_identity_for_direct_target(addr).display_name
         {
-            return CExpr::Var(name);
+            return self.name_ref(&name);
         }
         self.get_expr(target)
     }
@@ -708,7 +710,7 @@ impl<'a> FoldingContext<'a> {
         else {
             return Vec::new();
         };
-        if args.iter().any(Self::call_arg_expr_is_unresolved_fallback) {
+        if args.iter().any(|a| self.call_arg_expr_is_unresolved_fallback(a)) {
             return Vec::new();
         }
         args.into_iter()
@@ -939,6 +941,8 @@ impl<'a> FoldingContext<'a> {
         &self,
         value: &analysis::SemanticValue,
     ) -> CExpr {
+        let symbols = &self.symbols;
+
         match value {
             analysis::SemanticValue::Scalar(analysis::ScalarValue::Expr(expr)) => expr.clone(),
             analysis::SemanticValue::Scalar(analysis::ScalarValue::Root(value_ref)) => {
@@ -947,15 +951,15 @@ impl<'a> FoldingContext<'a> {
                 } else {
                     let rendered = self.var_name(&value_ref.var);
                     self.arg_alias_for_rendered_name(&rendered)
-                        .map(CExpr::Var)
-                        .unwrap_or_else(|| CExpr::Var(rendered))
+                        .map(|n| crate::symbol::var_ref(symbols, n))
+                        .unwrap_or_else(|| self.name_ref(&rendered))
                 }
             }
             analysis::SemanticValue::Address(addr) => {
                 let mut visited = HashSet::new();
                 self.render_address_expr_from_addr(addr, 0, &mut visited)
                     .or_else(|| self.render_base_ref_expr(&addr.base, true, 0, &mut visited))
-                    .unwrap_or_else(Self::unresolved_call_arg_expr)
+                    .unwrap_or_else(|| self.unresolved_call_arg_expr())
             }
             analysis::SemanticValue::Load { space, addr, size } => {
                 let mut visited = HashSet::new();
@@ -966,9 +970,9 @@ impl<'a> FoldingContext<'a> {
                             self.render_address_expr_from_addr(addr, 0, &mut visited)?;
                         Some(CExpr::Deref(Box::new(addr_expr)))
                     })
-                    .unwrap_or_else(Self::unresolved_call_arg_expr)
+                    .unwrap_or_else(|| self.unresolved_call_arg_expr())
             }
-            analysis::SemanticValue::Unknown => Self::unresolved_call_arg_expr(),
+            analysis::SemanticValue::Unknown => self.unresolved_call_arg_expr(),
         }
     }
 
@@ -1230,7 +1234,7 @@ impl<'a> FoldingContext<'a> {
         offsets
             .into_iter()
             .find_map(|offset| self.param_home_alias_for_stack_offset(offset))
-            .map(CExpr::Var)
+            .map(|n| crate::symbol::var_ref(symbols, n))
     }
 
     #[cfg(test)]
@@ -1391,18 +1395,20 @@ impl<'a> FoldingContext<'a> {
         depth: u32,
         visited: &mut HashSet<String>,
     ) -> CExpr {
+        let symbols = &self.symbols;
+
         if depth > Self::MAX_SEMANTIC_RENDER_DEPTH {
             return expr;
         }
 
         match expr {
             CExpr::Var(name) => {
-                if !visited.insert(name.clone()) {
+                if !visited.insert(self.spelling(name).to_string()) {
                     return CExpr::Var(name);
                 }
                 let resolved = self
                     .prepared_semantic_view()
-                    .and_then(|prepared| prepared.owner_expr_for_name(&name))
+                    .and_then(|prepared| prepared.owner_expr_for_name(&self.spelling(name)))
                     .cloned()
                     .filter(|inner| {
                         inner != &CExpr::Var(name.clone()) && !matches!(inner, CExpr::AddrOf(_))
@@ -1415,13 +1421,13 @@ impl<'a> FoldingContext<'a> {
                         )
                     })
                     .or_else(|| {
-                        self.stack_offset_for_visible_storage_name(&name)
+                        self.stack_offset_for_visible_storage_name(&self.spelling(name))
                             .and_then(|offset| self.resolve_stack_var(offset))
-                            .filter(|alias| !alias.eq_ignore_ascii_case(&name))
-                            .map(CExpr::Var)
+                            .filter(|alias| !alias.eq_ignore_ascii_case(&self.spelling(name)))
+                            .map(|n| crate::symbol::var_ref(&symbols, n))
                     })
                     .unwrap_or_else(|| CExpr::Var(name.clone()));
-                visited.remove(&name);
+                visited.remove(&*self.spelling(name));
                 resolved
             }
             other => other.map_children(&mut |child| {
@@ -1515,13 +1521,13 @@ impl<'a> FoldingContext<'a> {
             preferred
                 .or_else(|| {
                     let rendered = self.var_name(var);
-                    self.arg_alias_for_rendered_name(&rendered).map(CExpr::Var)
+                    self.arg_alias_for_rendered_name(&rendered).map(|n| crate::symbol::var_ref(symbols, n))
                 })
                 .or_else(|| {
                     prepared
                         .stack_offset_for_var(var)
                         .and_then(|offset| self.resolve_stack_var(offset))
-                        .map(CExpr::Var)
+                        .map(|n| crate::symbol::var_ref(symbols, n))
                 })
         };
 
@@ -1570,7 +1576,7 @@ impl<'a> FoldingContext<'a> {
                 analysis::BaseRef::StackSlot(offset)
                     if addr.index.is_none() && addr.offset_bytes == 0 && addr.scale_bytes == 0 =>
                 {
-                    self.resolve_stack_var(*offset).map(CExpr::Var).map(|expr| {
+                    self.resolve_stack_var(*offset).map(|n| crate::symbol::var_ref(symbols, n)).map(|expr| {
                         if preserve_pointer_identity {
                             CExpr::AddrOf(Box::new(expr))
                         } else {
@@ -1589,7 +1595,7 @@ impl<'a> FoldingContext<'a> {
                 analysis::BaseRef::StackSlot(offset)
                     if addr.index.is_none() && addr.offset_bytes == 0 && addr.scale_bytes == 0 =>
                 {
-                    self.resolve_stack_var(*offset).map(CExpr::Var)
+                    self.resolve_stack_var(*offset).map(|n| crate::symbol::var_ref(symbols, n))
                 }
                 _ => None,
             },

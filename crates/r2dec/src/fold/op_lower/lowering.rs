@@ -163,7 +163,7 @@ impl<'a> FoldingContext<'a> {
                 },
             LoweredOp::Comment(_) | LoweredOp::None => {
                 if let Some(dst) = op.dst() {
-                    CExpr::Var(self.var_name(dst))
+                    self.name_ref(&self.var_name(dst))
                 } else {
                     CExpr::External {
                             name: "__unhandled_op__".to_string(),

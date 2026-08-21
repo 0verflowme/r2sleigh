@@ -33,7 +33,7 @@ impl<'a> FoldingContext<'a> {
             .render_authorized_signature()
             .is_some_and(|signature| {
                 signature.params.iter().any(|param| {
-                    param.name.eq_ignore_ascii_case(name)
+                    param.name.eq_ignore_ascii_case(&self.spelling(*name))
                         && param.ty.as_ref().is_some_and(|ty| {
                             matches!(
                                 crate::type_like_to_ctype(ty),
@@ -50,7 +50,7 @@ impl<'a> FoldingContext<'a> {
                 let r2types::CertifiedEntity::LoopCarrier { phi, ty, .. } = entity else {
                     return false;
                 };
-                crate::certified_loop_carrier_name(*phi).eq_ignore_ascii_case(name)
+                crate::certified_loop_carrier_name(*phi).eq_ignore_ascii_case(&self.spelling(*name))
                     && ty.as_ref().is_some_and(|ty| {
                         matches!(
                             crate::type_like_to_ctype(ty),
@@ -335,7 +335,7 @@ impl<'a> FoldingContext<'a> {
         let index_var = self.prepared_ssa()?.value_var(index)?;
         let index = self.render_certified_value_expr_for_var(index_var)?;
         let indexed = CExpr::Subscript {
-            base: Box::new(CExpr::Var(base.to_string())),
+            base: Box::new(self.name_ref(&base.to_string())),
             index: Box::new(index),
         };
         match self.certified_member_fact_for_memory(memory) {
@@ -508,6 +508,8 @@ impl<'a> FoldingContext<'a> {
     }
 
     pub(crate) fn render_certified_value_expr_for_var(&self, var: &SSAVar) -> Option<CExpr> {
+        let symbols = &self.symbols;
+
         if var.is_const() {
             let value = parse_const_value(&var.name)?;
             return Some(if value > 0x7fff_ffff {
@@ -519,10 +521,10 @@ impl<'a> FoldingContext<'a> {
 
         let value = self.prepared_value_id_for_var(var)?;
         if let Some(name) = self.certified_loop_carrier_name_for_value(value) {
-            return Some(CExpr::Var(name));
+            return Some(self.name_ref(&name));
         }
         if let Some(name) = self.certified_memory_result_name_for_value(value) {
-            return Some(CExpr::Var(name));
+            return Some(self.name_ref(&name));
         }
         if self.prepared_ssa().is_some_and(|prepared| {
             prepared
@@ -555,8 +557,8 @@ impl<'a> FoldingContext<'a> {
         let rendered = self.var_name(var);
         Some(
             self.arg_alias_for_rendered_name(&rendered)
-                .map(CExpr::Var)
-                .unwrap_or_else(|| CExpr::Var(rendered)),
+                .map(|n| crate::symbol::var_ref(&symbols, n))
+                .unwrap_or_else(|| self.name_ref(&rendered)),
         )
     }
 
@@ -635,6 +637,8 @@ impl<'a> FoldingContext<'a> {
         depth: u32,
         visited: &mut HashSet<r2ssa::ValueId>,
     ) -> Option<CExpr> {
+        let symbols = &self.symbols;
+
         if depth > Self::MAX_SEMANTIC_RENDER_DEPTH {
             return None;
         }
@@ -644,7 +648,7 @@ impl<'a> FoldingContext<'a> {
         let prepared = self.prepared_ssa()?;
         let value = self.prepared_value_id_for_var(var)?;
         if let Some(name) = self.certified_loop_carrier_name_for_value(value) {
-            return Some(CExpr::Var(name));
+            return Some(self.name_ref(&name));
         }
         if var.version == 0 && var.is_register() {
             if let Some(expr) = self.certified_parameter_expr_for_value(value) {
@@ -657,8 +661,8 @@ impl<'a> FoldingContext<'a> {
             return Some(
                 self.arg_alias_for_rendered_name(&rendered)
                     .or_else(|| self.certified_signature_arg_alias_for_register(&rendered))
-                    .map(CExpr::Var)
-                    .unwrap_or_else(|| CExpr::Var(rendered)),
+                    .map(|n| crate::symbol::var_ref(&symbols, n))
+                    .unwrap_or_else(|| self.name_ref(&rendered)),
             );
         }
 
@@ -832,7 +836,7 @@ impl<'a> FoldingContext<'a> {
                     }
                 )
             });
-        Some(CExpr::Var(name))
+        Some(self.name_ref(&name))
     }
 
     fn certified_const_value_for_address_var(&self, var: &SSAVar, depth: u32) -> Option<u64> {
@@ -985,7 +989,7 @@ impl<'a> FoldingContext<'a> {
         if dst.size >= addr.size
             && let Some(stack_var) = self.stack_var_for_addr_var(addr)
         {
-            return CExpr::Var(stack_var);
+            return self.name_ref(&stack_var);
         }
 
         if addr.is_const() {
@@ -1045,7 +1049,7 @@ impl<'a> FoldingContext<'a> {
         }
 
         if let Some(stack_var) = self.stack_var_for_addr_var(addr) {
-            return CExpr::Var(stack_var);
+            return self.name_ref(&stack_var);
         }
 
         if addr.is_const() {

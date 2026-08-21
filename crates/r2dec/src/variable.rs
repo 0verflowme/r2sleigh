@@ -290,19 +290,29 @@ impl VariableRecovery {
     }
 
     /// Recover variables from an SSA function.
-    pub fn recover(&mut self, func: &SSAFunction) {
+    pub fn recover(
+        &mut self,
+        func: &SSAFunction,
+        symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
+    ) {
+
         // First pass: identify stack variables
-        self.find_stack_variables(func, None);
+        self.find_stack_variables(func, None, symbols);
 
         self.recover_non_stack_variables(func);
     }
 
     /// Recover variables from one source-owned decompiler input.
-    pub(crate) fn recover_input(&mut self, input: &DecompilerInput) {
+    pub(crate) fn recover_input(
+        &mut self,
+        input: &DecompilerInput,
+        symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
+    ) {
+
         self.type_facts = input.function_facts().type_facts().clone();
         let prepared = input.prepared_ssa();
         let func = prepared.function();
-        self.find_stack_variables(func, Some(prepared));
+        self.find_stack_variables(func, Some(prepared), symbols);
         self.recover_non_stack_variables(func);
     }
 
@@ -440,8 +450,14 @@ impl VariableRecovery {
     }
 
     /// Find stack variables (loads/stores relative to SP/FP).
-    fn find_stack_variables(&mut self, func: &SSAFunction, prepared: Option<&SsaArtifact>) {
-        let definitions = self.collect_definitions(func);
+    fn find_stack_variables(
+        &mut self,
+        func: &SSAFunction,
+        prepared: Option<&SsaArtifact>,
+        symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
+    ) {
+
+        let definitions = self.collect_definitions(func, symbols);
         for block in func.blocks() {
             for op in &block.ops {
                 match op {
@@ -451,7 +467,7 @@ impl VariableRecovery {
                         addr,
                     } => {
                         if let Some(offset) =
-                            self.get_stack_offset(func, prepared, addr, &definitions)
+                            self.get_stack_offset(func, prepared, addr, &definitions, symbols)
                         {
                             self.ensure_stack_local(offset, dst.size);
                         }
@@ -462,7 +478,7 @@ impl VariableRecovery {
                         val,
                     } => {
                         if let Some(offset) =
-                            self.get_stack_offset(func, prepared, addr, &definitions)
+                            self.get_stack_offset(func, prepared, addr, &definitions, symbols)
                         {
                             self.ensure_stack_local(offset, val.size);
                         }
@@ -493,7 +509,9 @@ impl VariableRecovery {
         prepared: Option<&SsaArtifact>,
         addr: &SSAVar,
         definitions: &HashMap<String, CExpr>,
+        symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
     ) -> Option<i64> {
+
         if let Some(offset) = prepared
             .and_then(|artifact| artifact.object_for_var(addr, r2il::SpaceId::Ram))
             .and_then(|object| prepared?.objects().object(object))
@@ -513,24 +531,29 @@ impl VariableRecovery {
         {
             return Some(offset);
         }
-        utils::extract_stack_offset_from_var(addr, definitions, &self.fp_name, &self.sp_name)
+        utils::extract_stack_offset_from_var(symbols, addr, definitions, &self.fp_name, &self.sp_name)
     }
 
-    fn collect_definitions(&self, func: &SSAFunction) -> HashMap<String, CExpr> {
+    fn collect_definitions(
+        &self,
+        func: &SSAFunction,
+        symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
+    ) -> HashMap<String, CExpr> {
+
         let mut definitions = HashMap::new();
         for block in func.blocks() {
             for op in &block.ops {
                 match op {
                     SSAOp::Copy { dst, src } => {
-                        definitions.insert(dst.display_name(), self.expr_for_ssa_var(src));
+                        definitions.insert(dst.display_name(), self.expr_for_ssa_var(src, symbols));
                     }
                     SSAOp::IntAdd { dst, a, b } => {
                         definitions.insert(
                             dst.display_name(),
                             CExpr::binary(
                                 BinaryOp::Add,
-                                self.expr_for_ssa_var(a),
-                                self.expr_for_ssa_var(b),
+                                self.expr_for_ssa_var(a, symbols),
+                                self.expr_for_ssa_var(b, symbols),
                             ),
                         );
                     }
@@ -539,8 +562,8 @@ impl VariableRecovery {
                             dst.display_name(),
                             CExpr::binary(
                                 BinaryOp::Sub,
-                                self.expr_for_ssa_var(a),
-                                self.expr_for_ssa_var(b),
+                                self.expr_for_ssa_var(a, symbols),
+                                self.expr_for_ssa_var(b, symbols),
                             ),
                         );
                     }
@@ -551,14 +574,19 @@ impl VariableRecovery {
         definitions
     }
 
-    fn expr_for_ssa_var(&self, var: &SSAVar) -> CExpr {
+    fn expr_for_ssa_var(
+        &self,
+        var: &SSAVar,
+        symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
+    ) -> CExpr {
+
         if let Some(val) = parse_const_value(&var.name) {
             if let Ok(signed) = i64::try_from(val) {
                 return CExpr::IntLit(signed);
             }
             return CExpr::UIntLit(val);
         }
-        CExpr::Var(var.display_name())
+        crate::symbol::var_ref(symbols, var.display_name())
     }
 
     /// Generate a name for a stack variable.
@@ -866,6 +894,7 @@ impl VariableRecovery {
 }
 
 fn is_generic_arg_name(name: &str) -> bool {
+
     let lower = name.trim().to_ascii_lowercase();
     lower
         .strip_prefix("arg")

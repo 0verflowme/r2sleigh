@@ -15,6 +15,15 @@ use crate::address::parse_address_from_var_name;
 use crate::ast::{BinaryOp, CExpr, CType, UnaryOp};
 
 /// No string table, for the analysis passes that never render a literal.
+/// A table for a caller that only needs to read, never to mint.
+pub(crate) fn no_symbols() -> &'static std::cell::RefCell<crate::symbol::SymbolTable> {
+    thread_local! {
+        static EMPTY: &'static std::cell::RefCell<crate::symbol::SymbolTable> =
+            Box::leak(Box::new(std::cell::RefCell::new(crate::symbol::SymbolTable::new())));
+    }
+    EMPTY.with(|table| *table)
+}
+
 pub(crate) fn no_string_literals() -> &'static std::collections::BTreeMap<u64, String> {
     static EMPTY: std::sync::OnceLock<std::collections::BTreeMap<u64, String>> =
         std::sync::OnceLock::new();
@@ -35,13 +44,21 @@ pub(crate) struct LowerCtx<'a> {
     pub(crate) stack_slots: &'a HashMap<String, StackSlotProvenance>,
     pub(crate) forwarded_values: &'a HashMap<String, ValueProvenance>,
     pub(crate) type_oracle: Option<&'a dyn TypeOracle>,
+    /// Where a rendered name is written down, so building a reference can mint one.
+    pub(crate) symbols: &'a std::cell::RefCell<crate::symbol::SymbolTable>,
     /// String literals the source recorded, for rendering a constant that
     /// points at text as the text.
     pub(crate) string_literals: &'a std::collections::BTreeMap<u64, String>,
 }
 
 impl<'a> LowerCtx<'a> {
+    /// How a reference is spelled, as a handle that outlives the table borrow.
+    pub(crate) fn spelling(&self, id: crate::symbol::SymbolId) -> std::rc::Rc<str> {
+        crate::symbol::spelling(self.symbols, id)
+    }
+
     fn lookup_type_hint(&self, name: &str) -> Option<&CType> {
+
         self.use_info
             .map(|info| &info.type_hints)
             .unwrap_or(self.type_hints)
@@ -55,6 +72,7 @@ impl<'a> LowerCtx<'a> {
     }
 
     fn definition_for_name(&self, name: &str) -> Option<&CExpr> {
+
         self.definitions.get(name).or_else(|| {
             self.use_info.and_then(|info| {
                 info.value_id_for_name(name)
@@ -201,10 +219,11 @@ impl<'a> LowerCtx<'a> {
             return expr.clone();
         }
 
-        CExpr::Var(self.var_name(var))
+        crate::symbol::var_ref(self.symbols, self.var_name(var))
     }
 
     pub(crate) fn expr_for_ssa_name(&self, name: &str) -> CExpr {
+
         self.expr_for_ssa_name_with_depth(name, 0, &mut HashSet::new())
     }
 
@@ -219,7 +238,7 @@ impl<'a> LowerCtx<'a> {
         visited: &mut HashSet<String>,
     ) -> CExpr {
         if depth > 8 {
-            return CExpr::Var(format_traced_name(name, self.var_aliases));
+            return crate::symbol::var_ref(self.symbols, format_traced_name(name, self.var_aliases));
         }
 
         if let Some(val) = parse_const_value(name) {
@@ -256,17 +275,17 @@ impl<'a> LowerCtx<'a> {
         }
 
         if let Some(alias) = self.var_alias_for_name(name) {
-            return CExpr::Var(alias.clone());
+            return crate::symbol::var_ref(self.symbols, alias.clone());
         }
 
-        CExpr::Var(format_traced_name(name, self.var_aliases))
+        crate::symbol::var_ref(self.symbols, format_traced_name(name, self.var_aliases))
     }
 
     pub(crate) fn op_to_expr(&self, op: &SSAOp) -> CExpr {
         match op {
             SSAOp::Copy { src, .. } => self.get_expr(src),
             SSAOp::Load { dst, addr, space } if *space != r2il::SpaceId::Ram => CExpr::call(
-                CExpr::Var("r2s_unsupported_space_load".to_string()),
+                crate::symbol::var_ref(self.symbols, "r2s_unsupported_space_load".to_string()),
                 vec![
                     CExpr::StringLit(space.to_string()),
                     self.get_expr(addr),
@@ -383,22 +402,22 @@ impl<'a> LowerCtx<'a> {
             SSAOp::FloatDiv { a, b, .. } => self.binary_expr(BinaryOp::Div, a, b),
             SSAOp::FloatNeg { src, .. } => CExpr::unary(UnaryOp::Neg, self.get_expr(src)),
             SSAOp::FloatAbs { src, .. } => {
-                CExpr::call(CExpr::Var("fabs".to_string()), vec![self.get_expr(src)])
+                CExpr::call(crate::symbol::var_ref(self.symbols, "fabs".to_string()), vec![self.get_expr(src)])
             }
             SSAOp::FloatSqrt { src, .. } => {
-                CExpr::call(CExpr::Var("sqrt".to_string()), vec![self.get_expr(src)])
+                CExpr::call(crate::symbol::var_ref(self.symbols, "sqrt".to_string()), vec![self.get_expr(src)])
             }
             SSAOp::FloatCeil { src, .. } => {
-                CExpr::call(CExpr::Var("ceil".to_string()), vec![self.get_expr(src)])
+                CExpr::call(crate::symbol::var_ref(self.symbols, "ceil".to_string()), vec![self.get_expr(src)])
             }
             SSAOp::FloatFloor { src, .. } => {
-                CExpr::call(CExpr::Var("floor".to_string()), vec![self.get_expr(src)])
+                CExpr::call(crate::symbol::var_ref(self.symbols, "floor".to_string()), vec![self.get_expr(src)])
             }
             SSAOp::FloatRound { src, .. } => {
-                CExpr::call(CExpr::Var("round".to_string()), vec![self.get_expr(src)])
+                CExpr::call(crate::symbol::var_ref(self.symbols, "round".to_string()), vec![self.get_expr(src)])
             }
             SSAOp::FloatNaN { src, .. } => {
-                CExpr::call(CExpr::Var("isnan".to_string()), vec![self.get_expr(src)])
+                CExpr::call(crate::symbol::var_ref(self.symbols, "isnan".to_string()), vec![self.get_expr(src)])
             }
             SSAOp::FloatLess { a, b, .. } => self.binary_expr(BinaryOp::Lt, a, b),
             SSAOp::FloatLessEqual { a, b, .. } => self.binary_expr(BinaryOp::Le, a, b),
@@ -469,7 +488,7 @@ impl<'a> LowerCtx<'a> {
                 .unwrap_or_else(|| self.ptr_arith_expr(base, index, *element_size, true)),
             _ => {
                 if let Some(dst) = op.dst() {
-                    CExpr::Var(self.var_name(dst))
+                    crate::symbol::var_ref(self.symbols, self.var_name(dst))
                 } else {
                     CExpr::External {
                         name: "__unhandled_op__".to_string(),
@@ -486,6 +505,7 @@ impl<'a> LowerCtx<'a> {
         depth: u32,
         visited: &mut HashSet<String>,
     ) -> Option<CExpr> {
+
         if depth > 8 || !visited.insert(format!("sem:{name}")) {
             return None;
         }
@@ -553,7 +573,7 @@ impl<'a> LowerCtx<'a> {
             ) || (elem_size < self.ptr_bytes()
                 && self.stack_slot_has_pointer_backed_source(offset, elem_size)))
         {
-            return Some(CExpr::Deref(Box::new(CExpr::Var(name))));
+            return Some(CExpr::Deref(Box::new(crate::symbol::var_ref(self.symbols, name))));
         }
 
         if let Some(index) = &shape.index {
@@ -584,9 +604,9 @@ impl<'a> LowerCtx<'a> {
     ) -> CExpr {
         let addr = self
             .render_addr_shape(addr, depth + 1, visited)
-            .unwrap_or_else(|| CExpr::Var("r2s_unresolved_memory_address".to_string()));
+            .unwrap_or_else(|| crate::symbol::var_ref(self.symbols, "r2s_unresolved_memory_address".to_string()));
         CExpr::call(
-            CExpr::Var("r2s_unsupported_space_load".to_string()),
+            crate::symbol::var_ref(self.symbols, "r2s_unsupported_space_load".to_string()),
             vec![
                 CExpr::StringLit(space.to_string()),
                 addr,
@@ -783,7 +803,7 @@ impl<'a> LowerCtx<'a> {
     fn binary_operand_expr(&self, var: &SSAVar) -> CExpr {
         let key = var.display_name();
         if self.should_keep_low_signal_address_temp_visible(&key) {
-            return CExpr::Var(self.var_name(var));
+            return crate::symbol::var_ref(self.symbols, self.var_name(var));
         }
         self.get_expr(var)
     }
@@ -876,12 +896,12 @@ impl<'a> LowerCtx<'a> {
             | CExpr::Member { .. }
             | CExpr::PtrMember { .. } => true,
             CExpr::Var(name) => {
-                let lower = name.to_ascii_lowercase();
+                let lower = self.spelling(*name).to_ascii_lowercase();
                 lower.starts_with("arg")
                     || lower.contains("ptr")
                     || lower.contains("addr")
                     || self
-                        .lookup_type_hint(name)
+                        .lookup_type_hint(&self.spelling(*name))
                         .map(|ty| matches!(ty, CType::Pointer(_) | CType::Struct(_)))
                         .unwrap_or(false)
             }
@@ -960,10 +980,10 @@ impl<'a> LowerCtx<'a> {
             }
             CExpr::Var(name) => self
                 .definitions
-                .get(name)
+                .get(&*self.spelling(*name))
                 .and_then(|inner| self.extract_base_index_scale(inner))
                 .or_else(|| {
-                    let resolved = self.expr_for_ssa_name(name);
+                    let resolved = self.expr_for_ssa_name(&self.spelling(*name));
                     (resolved != expr.clone())
                         .then(|| self.extract_base_index_scale(&resolved))
                         .flatten()
@@ -999,10 +1019,10 @@ impl<'a> LowerCtx<'a> {
             }
             CExpr::Var(name) => self
                 .definitions
-                .get(name)
+                .get(&*self.spelling(*name))
                 .and_then(|def| self.extract_base_const_offset(def))
                 .or_else(|| {
-                    let resolved = self.expr_for_ssa_name(name);
+                    let resolved = self.expr_for_ssa_name(&self.spelling(*name));
                     (resolved != expr.clone())
                         .then(|| self.extract_base_const_offset(&resolved))
                         .flatten()
@@ -1118,8 +1138,8 @@ impl<'a> LowerCtx<'a> {
                 self.extract_mul_const(inner, depth + 1)
             }
             CExpr::Var(name) => {
-                let lower = name.to_ascii_lowercase();
-                let semantic_visible_name = !is_low_signal_ssa_storage_name(name)
+                let lower = self.spelling(*name).to_ascii_lowercase();
+                let semantic_visible_name = !is_low_signal_ssa_storage_name(&self.spelling(*name))
                     && !lower.starts_with("local_")
                     && !lower.starts_with('t')
                     && !lower.starts_with('v');
@@ -1129,7 +1149,7 @@ impl<'a> LowerCtx<'a> {
                 {
                     return Some((expr.clone(), 1));
                 }
-                if let Some(inner) = self.definition_for_name(name) {
+                if let Some(inner) = self.definition_for_name(&self.spelling(*name)) {
                     self.extract_mul_const(inner, depth + 1)
                 } else if !self.is_non_index_pointer_expr(expr) && self.is_semantic_index_expr(expr)
                 {
@@ -1154,15 +1174,15 @@ impl<'a> LowerCtx<'a> {
         match expr {
             CExpr::Var(name) => self
                 .definitions
-                .get(name)
+                .get(&*self.spelling(*name))
                 .map(|inner| self.is_semantic_index_expr(inner))
                 .unwrap_or_else(|| {
-                    let lower = name.to_ascii_lowercase();
+                    let lower = self.spelling(*name).to_ascii_lowercase();
                     let stack_placeholder =
                         lower == "stack" || lower == "saved_fp" || lower.starts_with("stack_");
-                    !is_constant_or_memory_name(name)
+                    !is_constant_or_memory_name(&self.spelling(*name))
                         && (!stack_placeholder
-                            && (!self.stack_slot_name_map().contains_key(name)
+                            && (!self.stack_slot_name_map().contains_key(&*self.spelling(*name))
                                 || lower.starts_with("local_")
                                 || lower.starts_with("arg")))
                 }),
@@ -1212,10 +1232,10 @@ impl<'a> LowerCtx<'a> {
 
         match expr {
             CExpr::Var(name) => {
-                if let Some(inner) = self.definition_for_name(name) {
+                if let Some(inner) = self.definition_for_name(&self.spelling(*name)) {
                     return self.normalize_pointer_base_expr(inner, depth + 1);
                 }
-                let resolved = self.expr_for_ssa_name(name);
+                let resolved = self.expr_for_ssa_name(&self.spelling(*name));
                 if resolved != expr.clone() && self.looks_like_pointer_expr(&resolved) {
                     return self.normalize_pointer_base_expr(&resolved, depth + 1);
                 }
@@ -1239,8 +1259,8 @@ impl<'a> LowerCtx<'a> {
 
         match expr {
             CExpr::Var(name) => {
-                let lower = name.to_ascii_lowercase();
-                let semantic_visible_name = !is_low_signal_ssa_storage_name(name)
+                let lower = self.spelling(*name).to_ascii_lowercase();
+                let semantic_visible_name = !is_low_signal_ssa_storage_name(&self.spelling(*name))
                     && !lower.starts_with("local_")
                     && !lower.starts_with('t')
                     && !lower.starts_with('v');
@@ -1250,20 +1270,20 @@ impl<'a> LowerCtx<'a> {
                 {
                     return Some(expr.clone());
                 }
-                if let Some(inner) = self.definition_for_name(name)
+                if let Some(inner) = self.definition_for_name(&self.spelling(*name))
                     && let Some(normalized) = self.normalize_index_expr(inner, depth + 1)
                     && !self.is_non_index_pointer_expr(&normalized)
                 {
                     return Some(normalized);
                 }
-                let resolved = self.expr_for_ssa_name(name);
+                let resolved = self.expr_for_ssa_name(&self.spelling(*name));
                 if resolved != expr.clone()
                     && let Some(normalized) = self.normalize_index_expr(&resolved, depth + 1)
                     && !self.is_non_index_pointer_expr(&normalized)
                 {
                     return Some(normalized);
                 }
-                if self.definition_for_name(name).is_some() {
+                if self.definition_for_name(&self.spelling(*name)).is_some() {
                     return None;
                 }
                 if self.is_non_index_pointer_expr(expr) {
@@ -1290,12 +1310,12 @@ impl<'a> LowerCtx<'a> {
             CExpr::Cast { ty, .. } => matches!(ty, CType::Pointer(_)),
             CExpr::Deref(_) | CExpr::Subscript { .. } | CExpr::PtrMember { .. } => true,
             CExpr::Var(name) => {
-                let lower = name.to_ascii_lowercase();
+                let lower = self.spelling(*name).to_ascii_lowercase();
                 lower.contains("ptr")
                     || lower.contains("addr")
-                    || self.stack_slot_name_map().contains_key(name)
+                    || self.stack_slot_name_map().contains_key(&*self.spelling(*name))
                     || self
-                        .lookup_type_hint(name)
+                        .lookup_type_hint(&self.spelling(*name))
                         .map(|ty| matches!(ty, CType::Pointer(_) | CType::Struct(_)))
                         .unwrap_or(false)
             }
@@ -1308,8 +1328,8 @@ impl<'a> LowerCtx<'a> {
     fn is_semantic_member_base(&self, expr: &CExpr) -> bool {
         match expr {
             CExpr::Var(name) => {
-                let lower = name.to_ascii_lowercase();
-                !is_temporary_name(name)
+                let lower = self.spelling(*name).to_ascii_lowercase();
+                !is_temporary_name(&self.spelling(*name))
                     && !lower.starts_with('r')
                     && !lower.starts_with('e')
                     && !matches!(lower.as_str(), "stack" | "saved_fp")
@@ -1331,7 +1351,7 @@ impl<'a> LowerCtx<'a> {
         }
 
         if let CExpr::Var(name) = expr
-            && let Some(candidate) = self.definition_for_name(name)
+            && let Some(candidate) = self.definition_for_name(&self.spelling(*name))
         {
             let normalized = self.normalize_pointer_base_expr(candidate, 0);
             if self.is_semantic_member_base(&normalized) {

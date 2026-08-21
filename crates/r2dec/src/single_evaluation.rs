@@ -88,14 +88,15 @@ pub(crate) fn bind_each_call_site_once(func: &mut CFunction, call_exprs: &BTreeM
     // A site that is already assigned to a variable somewhere in the body has
     // a name the rest of the function already uses; binding to that same name
     // keeps the two consistent instead of introducing a synonym.
-    let mut preferred: BTreeMap<Source, String> = BTreeMap::new();
+    let mut preferred: BTreeMap<Source, crate::symbol::SymbolId> = BTreeMap::new();
     for stmt in &func.body {
         collect_assignment_names(stmt, &index, &repeated, &mut preferred);
     }
 
-    let mut introduced: Vec<String> = Vec::new();
-    let mut bound: BTreeMap<Source, String> = BTreeMap::new();
+    let mut introduced: Vec<crate::symbol::SymbolId> = Vec::new();
+    let mut bound: BTreeMap<Source, crate::symbol::SymbolId> = BTreeMap::new();
     let body = std::mem::take(&mut func.body);
+    let mut symbols = func.symbols.borrow_mut();
     func.body = rewrite_block(
         body,
         &index,
@@ -103,7 +104,9 @@ pub(crate) fn bind_each_call_site_once(func: &mut CFunction, call_exprs: &BTreeM
         &preferred,
         &mut bound,
         &mut introduced,
+        &mut symbols,
     );
+    drop(symbols);
 
     for name in introduced {
         if !func.locals.iter().any(|local| local.name == name)
@@ -139,7 +142,7 @@ fn collect_assignment_names(
     stmt: &CStmt,
     index: &CallIndex<'_>,
     repeated: &[Source],
-    out: &mut BTreeMap<Source, String>,
+    out: &mut BTreeMap<Source, crate::symbol::SymbolId>,
 ) {
     if let CStmt::Expr(CExpr::Binary {
         op: BinaryOp::Assign,
@@ -150,7 +153,7 @@ fn collect_assignment_names(
         && let Some(source) = index.source_of(right)
         && repeated.contains(&source)
     {
-        out.entry(source).or_insert_with(|| name.clone());
+        out.entry(source).or_insert(*name);
     }
     for_each_child_block(stmt, &mut |stmts| {
         for inner in stmts {
@@ -163,9 +166,10 @@ fn rewrite_block(
     stmts: Vec<CStmt>,
     index: &CallIndex<'_>,
     repeated: &[Source],
-    preferred: &BTreeMap<Source, String>,
-    bound: &mut BTreeMap<Source, String>,
-    introduced: &mut Vec<String>,
+    preferred: &BTreeMap<Source, crate::symbol::SymbolId>,
+    bound: &mut BTreeMap<Source, crate::symbol::SymbolId>,
+    introduced: &mut Vec<crate::symbol::SymbolId>,
+    symbols: &mut crate::symbol::SymbolTable,
 ) -> Vec<CStmt> {
     let mut out: Vec<CStmt> = Vec::with_capacity(stmts.len());
     for mut stmt in stmts {
@@ -183,7 +187,7 @@ fn rewrite_block(
             && repeated.contains(&source)
             && !bound.contains_key(&source)
         {
-            bound.insert(source, name.clone());
+            bound.insert(source, *name);
             out.push(stmt);
             continue;
         }
@@ -206,6 +210,7 @@ fn rewrite_block(
                 preferred,
                 bound,
                 introduced,
+                symbols,
                 &mut hoists,
             )
         });
@@ -223,10 +228,11 @@ fn rewrite_block(
         for_each_child_block_mut(&mut stmt, &mut |stmts, shares_scope| {
             let taken = std::mem::take(stmts);
             if shares_scope {
-                *stmts = rewrite_block(taken, index, repeated, preferred, bound, introduced);
+                *stmts = rewrite_block(taken, index, repeated, preferred, bound, introduced, symbols);
             } else {
                 let mut nested = bound.clone();
-                *stmts = rewrite_block(taken, index, repeated, preferred, &mut nested, introduced);
+                *stmts =
+                    rewrite_block(taken, index, repeated, preferred, &mut nested, introduced, symbols);
             }
         });
 
@@ -254,16 +260,17 @@ fn rewrite_expr(
     expr: &mut CExpr,
     index: &CallIndex<'_>,
     repeated: &[Source],
-    preferred: &BTreeMap<Source, String>,
-    bound: &mut BTreeMap<Source, String>,
-    introduced: &mut Vec<String>,
+    preferred: &BTreeMap<Source, crate::symbol::SymbolId>,
+    bound: &mut BTreeMap<Source, crate::symbol::SymbolId>,
+    introduced: &mut Vec<crate::symbol::SymbolId>,
+    symbols: &mut crate::symbol::SymbolTable,
     hoists: &mut Vec<CStmt>,
 ) {
     // Children first: a call nested in another call's arguments is evaluated
     // before the call that consumes it, and hoisting in that order keeps the
     // statements in the order the program runs them.
     for child in children_mut(expr) {
-        rewrite_expr(child, index, repeated, preferred, bound, introduced, hoists);
+        rewrite_expr(child, index, repeated, preferred, bound, introduced, symbols, hoists);
     }
 
     let Some(source) = index.source_of(expr) else {
@@ -278,9 +285,10 @@ fn rewrite_expr(
         return;
     }
 
-    let name = preferred.get(&source).cloned().unwrap_or_else(|| {
-        let name = introduced_name_for(expr, introduced);
-        introduced.push(name.clone());
+    let name = preferred.get(&source).copied().unwrap_or_else(|| {
+        let spelling = introduced_name_for(expr, introduced, symbols);
+        let name = symbols.declare_or_reuse(&spelling);
+        introduced.push(name);
         name
     });
     let call = std::mem::replace(expr, CExpr::Var(name.clone()));
@@ -294,10 +302,15 @@ fn rewrite_expr(
 
 /// A name for a site the body never assigned anywhere, derived from the callee
 /// so the binding still says what it holds.
-fn introduced_name_for(expr: &CExpr, introduced: &[String]) -> String {
+fn introduced_name_for(
+    expr: &CExpr,
+    introduced: &[crate::symbol::SymbolId],
+    symbols: &crate::symbol::SymbolTable,
+) -> String {
     let callee = match expr {
         CExpr::Call { func, .. } => match func.as_ref() {
-            CExpr::Var(name) => {
+            CExpr::Var(id) => {
+                let name = symbols.name(*id);
                 let tail = name.rsplit('.').next().unwrap_or(name);
                 if tail.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_') {
                     tail.to_string()
@@ -309,14 +322,21 @@ fn introduced_name_for(expr: &CExpr, introduced: &[String]) -> String {
         },
         _ => "call".to_string(),
     };
+    // The table settles collisions when the name is declared, so this only has
+    // to avoid re-proposing one this pass has already introduced.
     let base = format!("{callee}_result");
-    if !introduced.iter().any(|name| *name == base) {
+    let taken = |candidate: &str| {
+        introduced
+            .iter()
+            .any(|name| symbols.name(*name) == candidate)
+    };
+    if !taken(&base) {
         return base;
     }
     let mut suffix = 2;
     loop {
         let candidate = format!("{base}_{suffix}");
-        if !introduced.iter().any(|name| *name == candidate) {
+        if !taken(&candidate) {
             return candidate;
         }
         suffix += 1;

@@ -13,11 +13,13 @@
 //! kind of outside thing it is, so calling something external is a claim a
 //! reader can check rather than a string that arrived from somewhere.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::rc::Rc;
 
 use serde::{Deserialize, Serialize};
 
-use crate::ast::CType;
+use crate::ast::{CExpr, CType};
 
 /// A name the function declares. Minted only by declaring one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -51,7 +53,7 @@ pub struct SymbolOrigin {
 /// One declared name.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Symbol {
-    pub name: String,
+    pub name: Rc<str>,
     pub ty: CType,
     pub role: SymbolRole,
     pub origin: SymbolOrigin,
@@ -114,9 +116,9 @@ impl SymbolTable {
         origin: SymbolOrigin,
     ) -> SymbolId {
         let requested = name.into();
-        let name = self.unique_name(requested);
+        let name: Rc<str> = Rc::from(self.unique_name(requested));
         let id = SymbolId(self.symbols.len() as u32);
-        self.by_name.insert(name.clone(), id);
+        self.by_name.insert(name.to_string(), id);
         if let Some(value) = origin.value {
             self.by_value.entry(value).or_insert(id);
         }
@@ -163,12 +165,36 @@ impl SymbolTable {
         let id = SymbolId(self.symbols.len() as u32);
         self.by_name.insert(name.to_string(), id);
         self.symbols.push(Symbol {
-            name: name.to_string(),
+            name: Rc::from(name),
             ty: CType::Unknown,
             role: SymbolRole::Carrier,
             origin: SymbolOrigin::default(),
         });
         id
+    }
+
+    /// Apply a rename the caller worked out, keeping every reference intact.
+    ///
+    /// A reference is an identifier, so moving a spelling moves every mention of
+    /// it at once. Nothing walks the body to keep declarations and uses in step,
+    /// because they were never separately spelled.
+    pub fn follow_renames(&mut self, renames: &HashMap<String, String>) {
+        if renames.is_empty() {
+            return;
+        }
+        for index in 0..self.symbols.len() {
+            let Some(target) = renames.get(&*self.symbols[index].name) else {
+                continue;
+            };
+            if self.by_name.contains_key(target) {
+                // Two names cannot become one, or two variables would.
+                continue;
+            }
+            let previous =
+                std::mem::replace(&mut self.symbols[index].name, Rc::from(target.as_str()));
+            self.by_name.remove(&*previous);
+            self.by_name.insert(target.clone(), SymbolId(index as u32));
+        }
     }
 
     /// An identifier that no declaration has taken yet.
@@ -192,6 +218,15 @@ impl SymbolTable {
         &self.symbols[id.index()]
     }
 
+    /// The spelling as a shared handle, so a caller can drop the table borrow.
+    ///
+    /// Reading a spelling and then building an expression is the common shape,
+    /// and building mints, so a caller holding a borrow across it would panic.
+    /// Cloning the handle is a refcount bump, not a copy of the text.
+    pub fn spelling(&self, id: SymbolId) -> Rc<str> {
+        Rc::clone(&self.get(id).name)
+    }
+
     pub fn name(&self, id: SymbolId) -> &str {
         &self.symbols[id.index()].name
     }
@@ -207,12 +242,13 @@ impl SymbolTable {
     /// an identifier rather than a spelling, so there is nothing to keep in step.
     pub fn rename(&mut self, id: SymbolId, name: impl Into<String>) {
         let requested = name.into();
-        if self.symbols[id.index()].name == requested {
+        if *self.symbols[id.index()].name == *requested {
             return;
         }
         let name = self.unique_name(requested);
-        let previous = std::mem::replace(&mut self.symbols[id.index()].name, name.clone());
-        self.by_name.remove(&previous);
+        let previous =
+            std::mem::replace(&mut self.symbols[id.index()].name, Rc::from(name.as_str()));
+        self.by_name.remove(&*previous);
         self.by_name.insert(name, id);
     }
 
@@ -383,4 +419,18 @@ mod reuse_tests {
         assert_eq!(symbols.declare_or_reuse("total"), declared);
         assert_eq!(symbols.len(), 1);
     }
+}
+
+/// A reference to this spelling, declaring it if nothing has yet.
+///
+/// Analysis builds candidate expressions before anything decides to render
+/// them, so it mints here rather than handing spellings forward for a later
+/// layer to declare. A candidate that is dropped costs one unused table entry.
+pub fn var_ref(symbols: &RefCell<SymbolTable>, name: impl AsRef<str>) -> CExpr {
+    CExpr::Var(symbols.borrow_mut().declare_or_reuse(name.as_ref()))
+}
+
+/// How a reference is spelled, for code that holds the table rather than a self.
+pub fn spelling(symbols: &RefCell<SymbolTable>, id: SymbolId) -> Rc<str> {
+    symbols.borrow().spelling(id)
 }

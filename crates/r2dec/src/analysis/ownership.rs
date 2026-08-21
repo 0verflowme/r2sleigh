@@ -60,6 +60,7 @@ impl SemanticOwnershipFacts {
     }
 
     pub(crate) fn source_for_visible_owner_name(&self, name: &str) -> Option<CallSiteId> {
+
         self.visible_owner_sources.get(name).copied().or_else(|| {
             self.visible_owner_sources
                 .get(&name.to_ascii_lowercase())

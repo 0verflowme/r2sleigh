@@ -80,6 +80,7 @@ pub(crate) fn parse_const_value(name: &str) -> Option<u64> {
 }
 
 pub(crate) fn is_generic_stack_placeholder_alias(existing: &str) -> bool {
+
     let normalized = existing.trim_start_matches('&');
     normalized == "stack"
         || normalized.starts_with("stack_")
@@ -208,6 +209,7 @@ pub(crate) fn ssa_name_kind(name: &str) -> SSAVarNameKind {
 }
 
 pub(crate) fn is_temporary_name(name: &str) -> bool {
+
     ssa_name_kind(name).is_temporary()
 }
 
@@ -219,6 +221,7 @@ pub(crate) fn is_temporary_or_constant_name(name: &str) -> bool {
 }
 
 pub(crate) fn is_temporary_or_memory_name(name: &str) -> bool {
+
     matches!(
         ssa_name_kind(name),
         SSAVarNameKind::Temporary | SSAVarNameKind::Memory
@@ -233,6 +236,7 @@ pub(crate) fn is_temporary_constant_or_memory_name(name: &str) -> bool {
 }
 
 pub(crate) fn is_constant_or_memory_name(name: &str) -> bool {
+
     matches!(
         ssa_name_kind(name),
         SSAVarNameKind::Constant | SSAVarNameKind::Memory | SSAVarNameKind::AddressSpace
@@ -240,6 +244,7 @@ pub(crate) fn is_constant_or_memory_name(name: &str) -> bool {
 }
 
 pub(crate) fn is_low_signal_ssa_storage_name(name: &str) -> bool {
+
     matches!(
         ssa_name_kind(name),
         SSAVarNameKind::Temporary
@@ -308,24 +313,24 @@ pub(crate) fn expr_to_offset(expr: &CExpr) -> Option<i64> {
     }
 }
 
-pub(crate) fn extract_offset_from_expr(expr: &CExpr, fp_name: &str, sp_name: &str) -> Option<i64> {
+pub(crate) fn extract_offset_from_expr(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, expr: &CExpr, fp_name: &str, sp_name: &str) -> Option<i64> {
     match expr {
-        CExpr::Paren(inner) => extract_offset_from_expr(inner, fp_name, sp_name),
-        CExpr::Cast { expr: inner, .. } => extract_offset_from_expr(inner, fp_name, sp_name),
-        CExpr::AddrOf(inner) => extract_offset_from_expr(inner, fp_name, sp_name),
+        CExpr::Paren(inner) => extract_offset_from_expr(symbols, inner, fp_name, sp_name),
+        CExpr::Cast { expr: inner, .. } => extract_offset_from_expr(symbols, inner, fp_name, sp_name),
+        CExpr::AddrOf(inner) => extract_offset_from_expr(symbols, inner, fp_name, sp_name),
         CExpr::Binary {
             op: BinaryOp::Add,
             left,
             right,
         } => {
             if let CExpr::Var(name) = left.as_ref() {
-                let name_lower = name.to_lowercase();
+                let name_lower = crate::symbol::spelling(symbols, *name).to_lowercase();
                 if name_lower.contains(fp_name) || name_lower.contains(sp_name) {
                     return expr_to_offset(right);
                 }
             }
             if let CExpr::Var(name) = right.as_ref() {
-                let name_lower = name.to_lowercase();
+                let name_lower = crate::symbol::spelling(symbols, *name).to_lowercase();
                 if name_lower.contains(fp_name) || name_lower.contains(sp_name) {
                     return expr_to_offset(left);
                 }
@@ -338,7 +343,7 @@ pub(crate) fn extract_offset_from_expr(expr: &CExpr, fp_name: &str, sp_name: &st
             right,
         } => {
             if let CExpr::Var(name) = left.as_ref() {
-                let name_lower = name.to_lowercase();
+                let name_lower = crate::symbol::spelling(symbols, *name).to_lowercase();
                 if name_lower.contains(fp_name) || name_lower.contains(sp_name) {
                     return expr_to_offset(right).map(|off| -off);
                 }
@@ -346,7 +351,7 @@ pub(crate) fn extract_offset_from_expr(expr: &CExpr, fp_name: &str, sp_name: &st
             None
         }
         CExpr::Var(name) => {
-            let name_lower = name.to_lowercase();
+            let name_lower = crate::symbol::spelling(symbols, *name).to_lowercase();
             if name_lower.contains(fp_name) || name_lower.contains(sp_name) {
                 return Some(0);
             }
@@ -370,7 +375,7 @@ fn parse_canonical_stack_name_offset(name: &str) -> Option<i64> {
     None
 }
 
-pub(crate) fn extract_stack_offset_from_var(
+pub(crate) fn extract_stack_offset_from_var(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
     var: &SSAVar,
     definitions: &HashMap<String, CExpr>,
     fp_name: &str,
@@ -384,11 +389,11 @@ pub(crate) fn extract_stack_offset_from_var(
     let key = var.display_name();
     let mut visited = HashSet::new();
     definitions.get(&key).and_then(|expr| {
-        extract_offset_from_expr_with_defs(expr, definitions, fp_name, sp_name, 0, &mut visited)
+        extract_offset_from_expr_with_defs(symbols, expr, definitions, fp_name, sp_name, 0, &mut visited)
     })
 }
 
-fn extract_offset_from_expr_with_defs(
+fn extract_offset_from_expr_with_defs(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
     expr: &CExpr,
     definitions: &HashMap<String, CExpr>,
     fp_name: &str,
@@ -400,7 +405,7 @@ fn extract_offset_from_expr_with_defs(
         return None;
     }
 
-    if let Some(offset) = extract_offset_from_expr(expr, fp_name, sp_name) {
+    if let Some(offset) = extract_offset_from_expr(symbols, expr, fp_name, sp_name) {
         return Some(offset);
     }
 
@@ -411,7 +416,7 @@ fn extract_offset_from_expr_with_defs(
             right,
         } => {
             if let Some(offset) = expr_to_offset(left)
-                && let Some(base) = extract_offset_from_expr_with_defs(
+                && let Some(base) = extract_offset_from_expr_with_defs(symbols, 
                     right,
                     definitions,
                     fp_name,
@@ -423,7 +428,7 @@ fn extract_offset_from_expr_with_defs(
                 return Some(base.saturating_add(offset));
             }
             if let Some(offset) = expr_to_offset(right)
-                && let Some(base) = extract_offset_from_expr_with_defs(
+                && let Some(base) = extract_offset_from_expr_with_defs(symbols, 
                     left,
                     definitions,
                     fp_name,
@@ -442,7 +447,7 @@ fn extract_offset_from_expr_with_defs(
             right,
         } => {
             if let Some(offset) = expr_to_offset(right)
-                && let Some(base) = extract_offset_from_expr_with_defs(
+                && let Some(base) = extract_offset_from_expr_with_defs(symbols, 
                     left,
                     definitions,
                     fp_name,
@@ -456,11 +461,11 @@ fn extract_offset_from_expr_with_defs(
             None
         }
         CExpr::Var(name) => {
-            if !visited.insert(name.clone()) {
+            if !visited.insert(crate::symbol::spelling(symbols, *name).to_string()) {
                 return None;
             }
-            definitions.get(name).and_then(|inner| {
-                extract_offset_from_expr_with_defs(
+            definitions.get(&*crate::symbol::spelling(symbols, *name)).and_then(|inner| {
+                extract_offset_from_expr_with_defs(symbols, 
                     inner,
                     definitions,
                     fp_name,
@@ -473,7 +478,7 @@ fn extract_offset_from_expr_with_defs(
         CExpr::Paren(inner)
         | CExpr::Cast { expr: inner, .. }
         | CExpr::Deref(inner)
-        | CExpr::Unary { operand: inner, .. } => extract_offset_from_expr_with_defs(
+        | CExpr::Unary { operand: inner, .. } => extract_offset_from_expr_with_defs(symbols, 
             inner,
             definitions,
             fp_name,
@@ -486,7 +491,7 @@ fn extract_offset_from_expr_with_defs(
 }
 
 #[allow(dead_code)]
-pub(crate) fn normalize_stack_address(
+pub(crate) fn normalize_stack_address(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
     addr: &SSAVar,
     definitions: &HashMap<String, CExpr>,
     fp_name: &str,
@@ -494,34 +499,34 @@ pub(crate) fn normalize_stack_address(
 ) -> String {
     let addr_key = addr.display_name();
     if let Some(expr) = definitions.get(&addr_key)
-        && let Some(offset) = extract_offset_from_expr(expr, fp_name, sp_name)
+        && let Some(offset) = extract_offset_from_expr(symbols, expr, fp_name, sp_name)
     {
         return format!("stack:{}", offset);
     }
     addr_key
 }
 
-pub(crate) fn simplify_stack_access(
+pub(crate) fn simplify_stack_access(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
     addr_expr: &CExpr,
     stack_vars: &HashMap<i64, String>,
     fp_name: &str,
     sp_name: &str,
 ) -> Option<String> {
     match addr_expr {
-        CExpr::Paren(inner) => return simplify_stack_access(inner, stack_vars, fp_name, sp_name),
+        CExpr::Paren(inner) => return simplify_stack_access(symbols, inner, stack_vars, fp_name, sp_name),
         CExpr::Cast { expr: inner, .. } => {
-            return simplify_stack_access(inner, stack_vars, fp_name, sp_name);
+            return simplify_stack_access(symbols, inner, stack_vars, fp_name, sp_name);
         }
-        CExpr::AddrOf(inner) => return simplify_stack_access(inner, stack_vars, fp_name, sp_name),
+        CExpr::AddrOf(inner) => return simplify_stack_access(symbols, inner, stack_vars, fp_name, sp_name),
         CExpr::Var(name) => {
-            if let Some(stripped) = name.strip_prefix('&') {
+            if let Some(stripped) = crate::symbol::spelling(symbols, *name).strip_prefix('&') {
                 return Some(stripped.to_string());
             }
         }
         _ => {}
     }
 
-    extract_offset_from_expr(addr_expr, fp_name, sp_name)
+    extract_offset_from_expr(symbols, addr_expr, fp_name, sp_name)
         .and_then(|offset| stack_vars.get(&offset).cloned())
 }
 

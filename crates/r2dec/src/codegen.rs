@@ -57,6 +57,8 @@ pub(crate) struct CodeGenerator {
     config: CodeGenConfig,
     output: String,
     indent_level: usize,
+    /// The names of the function being written, so a reference can be spelled.
+    symbols: crate::symbol::SymbolTable,
 }
 
 impl CodeGenerator {
@@ -66,11 +68,13 @@ impl CodeGenerator {
             config,
             output: String::new(),
             indent_level: 0,
+            symbols: crate::symbol::SymbolTable::new(),
         }
     }
 
     /// Generate code for a function.
     pub(crate) fn generate_function(&mut self, func: &CFunction) -> String {
+        self.symbols = func.symbols.borrow().clone();
         self.output.clear();
         let (locals, body) = inline_local_declaration_initializers(func);
 
@@ -86,7 +90,7 @@ impl CodeGenerator {
             }
             self.emit_type(&param.ty);
             self.output.push(' ');
-            self.output.push_str(&param.name);
+            self.output.push_str(self.symbols.name(param.name));
         }
 
         if func.params.is_empty() {
@@ -106,7 +110,7 @@ impl CodeGenerator {
             self.emit_indent();
             self.emit_type(&local.ty);
             self.output.push(' ');
-            self.output.push_str(&local.name);
+            self.output.push_str(self.symbols.name(local.name));
             self.output.push_str(";\n");
         }
 
@@ -155,7 +159,7 @@ impl CodeGenerator {
                 self.emit_indent();
                 self.emit_type(ty);
                 self.output.push(' ');
-                self.output.push_str(name);
+                self.output.push_str(self.symbols.name(*name));
                 if let Some(init_expr) = init {
                     self.output.push_str(" = ");
                     self.emit_expr(init_expr, 0);
@@ -359,7 +363,7 @@ impl CodeGenerator {
             CStmt::Decl { ty, name, init } => {
                 self.emit_type(ty);
                 self.output.push(' ');
-                self.output.push_str(name);
+                self.output.push_str(self.symbols.name(*name));
                 if let Some(init_expr) = init {
                     self.output.push_str(" = ");
                     self.emit_expr(init_expr, 0);
@@ -446,8 +450,8 @@ impl CodeGenerator {
                 }
                 self.output.push('\'');
             }
-            CExpr::Var(name) => {
-                self.output.push_str(name);
+            CExpr::Var(id) => {
+                self.output.push_str(self.symbols.name(*id));
             }
             // The kind is what makes the name allowed, not how it prints.
             CExpr::External { name, .. } => {
@@ -623,7 +627,7 @@ fn inline_local_declaration_initializers(func: &CFunction) -> (Vec<CLocal>, Vec<
     let local_types = func
         .locals
         .iter()
-        .map(|local| (local.name.clone(), local.ty.clone()))
+        .map(|local| (local.name, local.ty.clone()))
         .collect::<HashMap<_, _>>();
     if local_types.is_empty() {
         return (func.locals.clone(), func.body.clone());
@@ -643,9 +647,9 @@ fn inline_local_declaration_initializers(func: &CFunction) -> (Vec<CLocal>, Vec<
 
 fn inline_decls_in_stmt_list(
     stmts: &[CStmt],
-    local_types: &HashMap<String, CType>,
-    global_counts: &HashMap<String, usize>,
-    declared: &mut HashSet<String>,
+    local_types: &HashMap<crate::symbol::SymbolId, CType>,
+    global_counts: &HashMap<crate::symbol::SymbolId, usize>,
+    declared: &mut HashSet<crate::symbol::SymbolId>,
 ) -> Vec<CStmt> {
     let block_counts = count_vars_in_stmts(stmts, local_types);
     stmts
@@ -661,10 +665,10 @@ fn inline_decls_in_stmt_list(
                     declared,
                 )
             {
-                declared.insert(name.to_string());
+                declared.insert(name);
                 return CStmt::Decl {
-                    ty: local_types[name].clone(),
-                    name: name.to_string(),
+                    ty: local_types[&name].clone(),
+                    name,
                     init: Some(init.clone()),
                 };
             }
@@ -675,9 +679,9 @@ fn inline_decls_in_stmt_list(
 
 fn inline_decls_in_stmt(
     stmt: &CStmt,
-    local_types: &HashMap<String, CType>,
-    global_counts: &HashMap<String, usize>,
-    declared: &mut HashSet<String>,
+    local_types: &HashMap<crate::symbol::SymbolId, CType>,
+    global_counts: &HashMap<crate::symbol::SymbolId, usize>,
+    declared: &mut HashSet<crate::symbol::SymbolId>,
 ) -> CStmt {
     match stmt {
         CStmt::Block(stmts) => CStmt::Block(inline_decls_in_stmt_list(
@@ -743,10 +747,10 @@ fn inline_decls_in_stmt(
                         declared,
                     )
                 {
-                    declared.insert(name.to_string());
+                    declared.insert(name);
                     Box::new(CStmt::Decl {
-                        ty: local_types[name].clone(),
-                        name: name.to_string(),
+                        ty: local_types[&name].clone(),
+                        name,
                         init: Some(init_expr.clone()),
                     })
                 } else {
@@ -797,21 +801,21 @@ fn inline_decls_in_stmt(
 }
 
 fn can_inline_decl(
-    name: &str,
+    name: crate::symbol::SymbolId,
     init: &CExpr,
-    local_types: &HashMap<String, CType>,
-    global_counts: &HashMap<String, usize>,
-    scope_counts: &HashMap<String, usize>,
-    declared: &HashSet<String>,
+    local_types: &HashMap<crate::symbol::SymbolId, CType>,
+    global_counts: &HashMap<crate::symbol::SymbolId, usize>,
+    scope_counts: &HashMap<crate::symbol::SymbolId, usize>,
+    declared: &HashSet<crate::symbol::SymbolId>,
 ) -> bool {
-    local_types.contains_key(name)
-        && !declared.contains(name)
+    local_types.contains_key(&name)
+        && !declared.contains(&name)
         && !expr_reads_var(init, name)
-        && global_counts.get(name).copied().unwrap_or(0)
-            == scope_counts.get(name).copied().unwrap_or(0)
+        && global_counts.get(&name).copied().unwrap_or(0)
+            == scope_counts.get(&name).copied().unwrap_or(0)
 }
 
-fn assignment_decl_candidate(stmt: &CStmt) -> Option<(&str, &CExpr)> {
+fn assignment_decl_candidate(stmt: &CStmt) -> Option<(crate::symbol::SymbolId, &CExpr)> {
     let CStmt::Expr(CExpr::Binary {
         op: BinaryOp::Assign,
         left,
@@ -823,13 +827,13 @@ fn assignment_decl_candidate(stmt: &CStmt) -> Option<(&str, &CExpr)> {
     let CExpr::Var(name) = left.as_ref() else {
         return None;
     };
-    Some((name.as_str(), right.as_ref()))
+    Some((*name, right.as_ref()))
 }
 
-fn expr_reads_var(expr: &CExpr, name: &str) -> bool {
+fn expr_reads_var(expr: &CExpr, name: crate::symbol::SymbolId) -> bool {
     let mut found = false;
     expr.visit(&mut |node| {
-        if matches!(node, CExpr::Var(candidate) if candidate == name) {
+        if matches!(node, CExpr::Var(candidate) if *candidate == name) {
             found = true;
         }
     });
@@ -838,8 +842,8 @@ fn expr_reads_var(expr: &CExpr, name: &str) -> bool {
 
 fn count_vars_in_stmts(
     stmts: &[CStmt],
-    local_types: &HashMap<String, CType>,
-) -> HashMap<String, usize> {
+    local_types: &HashMap<crate::symbol::SymbolId, CType>,
+) -> HashMap<crate::symbol::SymbolId, usize> {
     let mut counts = HashMap::new();
     for stmt in stmts {
         count_vars_in_stmt_into(stmt, local_types, &mut counts);
@@ -849,8 +853,8 @@ fn count_vars_in_stmts(
 
 fn count_vars_in_stmt(
     stmt: &CStmt,
-    local_types: &HashMap<String, CType>,
-) -> HashMap<String, usize> {
+    local_types: &HashMap<crate::symbol::SymbolId, CType>,
+) -> HashMap<crate::symbol::SymbolId, usize> {
     let mut counts = HashMap::new();
     count_vars_in_stmt_into(stmt, local_types, &mut counts);
     counts
@@ -858,8 +862,8 @@ fn count_vars_in_stmt(
 
 fn count_vars_in_stmt_into(
     stmt: &CStmt,
-    local_types: &HashMap<String, CType>,
-    counts: &mut HashMap<String, usize>,
+    local_types: &HashMap<crate::symbol::SymbolId, CType>,
+    counts: &mut HashMap<crate::symbol::SymbolId, usize>,
 ) {
     match stmt {
         CStmt::Expr(expr) | CStmt::Return(Some(expr)) => {
@@ -940,14 +944,14 @@ fn count_vars_in_stmt_into(
 
 fn count_vars_in_expr_into(
     expr: &CExpr,
-    local_types: &HashMap<String, CType>,
-    counts: &mut HashMap<String, usize>,
+    local_types: &HashMap<crate::symbol::SymbolId, CType>,
+    counts: &mut HashMap<crate::symbol::SymbolId, usize>,
 ) {
     expr.visit(&mut |node| {
         if let CExpr::Var(name) = node
             && local_types.contains_key(name)
         {
-            *counts.entry(name.clone()).or_insert(0) += 1;
+            *counts.entry(*name).or_insert(0) += 1;
         }
     });
 }
@@ -975,7 +979,7 @@ fn coalesced_scalar_update_run(stmts: &[CStmt]) -> Option<(usize, CStmt)> {
     Some((run_len, scalar_update_stmt(name, total)?))
 }
 
-fn scalar_update_stmt(name: &str, delta: i64) -> Option<CStmt> {
+fn scalar_update_stmt(name: crate::symbol::SymbolId, delta: i64) -> Option<CStmt> {
     if delta == 0 {
         return Some(CStmt::Empty);
     }
@@ -986,7 +990,7 @@ fn scalar_update_stmt(name: &str, delta: i64) -> Option<CStmt> {
     };
     Some(CStmt::Expr(CExpr::binary(
         op,
-        CExpr::Var(name.to_string()),
+        CExpr::Var(name),
         CExpr::IntLit(amount),
     )))
 }
@@ -996,11 +1000,11 @@ fn scalar_update_expr(expr: &CExpr) -> Option<CExpr> {
     match delta {
         1 => Some(CExpr::Unary {
             op: UnaryOp::PostInc,
-            operand: Box::new(CExpr::Var(name.to_string())),
+            operand: Box::new(CExpr::Var(name)),
         }),
         -1 => Some(CExpr::Unary {
             op: UnaryOp::PostDec,
-            operand: Box::new(CExpr::Var(name.to_string())),
+            operand: Box::new(CExpr::Var(name)),
         }),
         0 => None,
         _ => match scalar_update_stmt(name, delta)? {
@@ -1010,14 +1014,14 @@ fn scalar_update_expr(expr: &CExpr) -> Option<CExpr> {
     }
 }
 
-fn scalar_self_update_delta(stmt: &CStmt) -> Option<(&str, i64)> {
+fn scalar_self_update_delta(stmt: &CStmt) -> Option<(crate::symbol::SymbolId, i64)> {
     let CStmt::Expr(expr) = stmt else {
         return None;
     };
     scalar_self_update_delta_expr(expr)
 }
 
-fn scalar_self_update_delta_expr(expr: &CExpr) -> Option<(&str, i64)> {
+fn scalar_self_update_delta_expr(expr: &CExpr) -> Option<(crate::symbol::SymbolId, i64)> {
     let CExpr::Binary { op, left, right } = expr else {
         return None;
     };
@@ -1025,16 +1029,19 @@ fn scalar_self_update_delta_expr(expr: &CExpr) -> Option<(&str, i64)> {
         return None;
     };
     match op {
-        BinaryOp::Assign => update_delta_for_rhs(lhs_name, right),
-        BinaryOp::AddAssign => literal_i64(right).map(|delta| (lhs_name.as_str(), delta)),
+        BinaryOp::Assign => update_delta_for_rhs(*lhs_name, right),
+        BinaryOp::AddAssign => literal_i64(right).map(|delta| (*lhs_name, delta)),
         BinaryOp::SubAssign => {
-            literal_i64(right).and_then(|delta| delta.checked_neg().map(|v| (lhs_name.as_str(), v)))
+            literal_i64(right).and_then(|delta| delta.checked_neg().map(|v| (*lhs_name, v)))
         }
         _ => None,
     }
 }
 
-fn update_delta_for_rhs<'a>(lhs_name: &'a str, rhs: &CExpr) -> Option<(&'a str, i64)> {
+fn update_delta_for_rhs(
+    lhs_name: crate::symbol::SymbolId,
+    rhs: &CExpr,
+) -> Option<(crate::symbol::SymbolId, i64)> {
     let CExpr::Binary { op, left, right } = rhs else {
         return None;
     };
@@ -1056,8 +1063,8 @@ fn update_delta_for_rhs<'a>(lhs_name: &'a str, rhs: &CExpr) -> Option<(&'a str, 
     }
 }
 
-fn expr_is_var(expr: &CExpr, name: &str) -> bool {
-    matches!(expr, CExpr::Var(candidate) if candidate == name)
+fn expr_is_var(expr: &CExpr, name: crate::symbol::SymbolId) -> bool {
+    matches!(expr, CExpr::Var(candidate) if *candidate == name)
 }
 
 fn literal_i64(expr: &CExpr) -> Option<i64> {

@@ -25,7 +25,7 @@
 
 use std::collections::BTreeSet;
 
-use crate::ast::{CExpr, CFunction, CLocal, CStmt, CType, SwitchCase};
+use crate::ast::{CExpr, CFunction, CStmt, CType, SwitchCase};
 
 /// Drop the value from every `return` in a function that returns nothing.
 ///
@@ -96,67 +96,6 @@ fn drop_void_return_value(stmt: CStmt) -> CStmt {
         other => other,
     }
 }
-
-/// Give the carriers the body renders a declaration and a name C can spell.
-///
-/// A body that names something it never declares does not compile, and some of
-/// what it names -- `tmp:11f80` -- is not an identifier at all. Both are the
-/// same omission: the rendering put a carrier on the page and said nothing
-/// about it. Say it. The value is real, it is read where it is written, and a
-/// declaration is what lets a reader follow it from one to the other.
-///
-/// This does not make a carrier mean anything it did not already mean. What it
-/// removes is a body that cannot be compiled or quoted, and a note on every
-/// line saying so.
-pub(crate) fn declare_rendered_carriers(
-    func: &mut CFunction,
-    type_hints: &std::collections::HashMap<String, CType>,
-) {
-    let mut declared = BTreeSet::new();
-    for param in &func.params {
-        declared.insert(param.name.clone());
-    }
-    for local in &func.locals {
-        declared.insert(local.name.clone());
-    }
-    let mut undeclared = BTreeSet::new();
-    collect_block_undeclared(&func.body, &declared, &mut undeclared);
-    if undeclared.is_empty() {
-        return;
-    }
-    // A spelled name has to stay distinct from the other names in the body, or
-    // two carriers would become one. A name already spellable keeps itself.
-    let mut taken = declared.clone();
-    taken.extend(collect_block_names(&func.body));
-    let mut renames = std::collections::HashMap::new();
-    let mut declarations = Vec::new();
-    for name in undeclared {
-        taken.remove(&name);
-        let spelled = spell_as_identifier(&name, &mut taken);
-        let ty = type_hints
-            .get(&name)
-            .or_else(|| type_hints.get(&spelled))
-            .cloned()
-            .filter(|ty| !matches!(ty, CType::Unknown))
-            // Nothing said what it holds, and a declaration has to say
-            // something. Its width is what the machine gave it, and unsigned is
-            // what a carrier is until something reads it as a number.
-            .unwrap_or(CType::UInt(64));
-        if spelled != name {
-            renames.insert(name, spelled.clone());
-        }
-        declarations.push(CLocal {
-            ty,
-            name: spelled,
-            stack_offset: None,
-        });
-    }
-    if !renames.is_empty() {
-        crate::post_rename::rewrite_function_names(func, &renames);
-    }
-    func.locals.extend(declarations);
-}
-
 /// Spell a carrier's name the way C spells an identifier.
 ///
 /// SLEIGH names its scratch by space and offset, `tmp:11f80`, which is exact
@@ -181,113 +120,41 @@ fn spell_as_identifier(name: &str, taken: &mut BTreeSet<String>) -> String {
     spelled
 }
 
-fn walk_stmts(stmts: &[CStmt], visit: &mut impl FnMut(&CExpr)) {
-    for stmt in stmts {
-        walk_stmt(stmt, visit);
-    }
-}
-
-fn walk_stmt(stmt: &CStmt, visit: &mut impl FnMut(&CExpr)) {
-    for expr in statement_exprs(stmt) {
-        visit(expr);
-    }
-    match stmt {
-        CStmt::Block(body) => walk_stmts(body, visit),
-        CStmt::If {
-            then_body,
-            else_body,
-            ..
-        } => {
-            walk_stmt(then_body, visit);
-            if let Some(else_body) = else_body {
-                walk_stmt(else_body, visit);
-            }
-        }
-        CStmt::While { body, .. }
-        | CStmt::DoWhile { body, .. }
-        | CStmt::For { body, .. } => walk_stmt(body, visit),
-        CStmt::Switch { cases, default, .. } => {
-            for case in cases {
-                walk_stmts(&case.body, visit);
-            }
-            if let Some(default) = default {
-                walk_stmts(default, visit);
-            }
-        }
-        _ => {}
-    }
-}
-
-fn collect_block_undeclared(
-    stmts: &[CStmt],
-    declared: &BTreeSet<String>,
-    out: &mut BTreeSet<String>,
-) {
-    walk_stmts(stmts, &mut |expr| collect_undeclared(expr, declared, out));
-}
-
-fn collect_block_names(stmts: &[CStmt]) -> BTreeSet<String> {
-    let mut names = BTreeSet::new();
-    walk_stmts(stmts, &mut |expr| {
-        expr.visit(&mut |node| {
-            if let CExpr::Var(name) = node {
-                names.insert(name.clone());
-            }
-        });
-    });
-    names
-}
-
-/// Spell every name in the rendered function the way C spells an identifier.
+/// Spell every name this function declares the way C spells an identifier.
 ///
-/// `declare_rendered_carriers` spells the names it declares, but only those: a
-/// name a statement declares for itself was already accounted for and so was
-/// never asked whether C could read it. Lane projections arrive that way and
-/// reach the page as `tregalias:1000007c0:2d:0`, which is not an identifier and
-/// not compilable.
+/// Lane projections and lifted temporaries are named by the machine, and those
+/// names are not identifiers: `tregalias:1000007c0:2d:0` does not compile. The
+/// question is not whether a name is declared -- every name is, now that a
+/// reference is one -- but whether it can be written down.
 ///
-/// Whether a name is declared and whether it can be written down are different
-/// questions, so this asks the second one about every name in the function.
+/// It asks the table rather than the body, because the table is where names
+/// live and a reference follows whatever the table says.
 pub(crate) fn spell_every_name_as_c(func: &mut CFunction) {
-    let mut names = collect_block_names(&func.body);
-    collect_block_declared(&func.body, &mut names);
-    for param in &func.params {
-        names.insert(param.name.clone());
-    }
-    for local in &func.locals {
-        names.insert(local.name.clone());
-    }
-    let unspellable = names
+    let unspellable = func
+        .symbols
+        .borrow()
         .iter()
-        .filter(|name| !is_c_identifier(name) && !names_something_outside_the_function(name))
-        .cloned()
+        .filter(|(_, symbol)| !is_c_identifier(&symbol.name))
+        .map(|(_, symbol)| symbol.name.to_string())
         .collect::<Vec<_>>();
     if unspellable.is_empty() {
         return;
     }
-    // Everything already readable keeps its spelling and its claim on it, so
-    // spelling one name can never collide with another.
-    let mut taken = names
+    // A readable name keeps its spelling and its claim on it, so spelling one
+    // can never collide with another.
+    let mut taken = func
+        .symbols
+        .borrow()
         .iter()
-        .filter(|name| is_c_identifier(name))
-        .cloned()
+        .filter(|(_, symbol)| is_c_identifier(&symbol.name))
+        .map(|(_, symbol)| symbol.name.to_string())
         .collect::<BTreeSet<_>>();
     let mut renames = std::collections::HashMap::new();
     for name in unspellable {
         let spelled = spell_as_identifier(&name, &mut taken);
         renames.insert(name, spelled);
     }
-    for local in &mut func.locals {
-        if let Some(spelled) = renames.get(&local.name) {
-            local.name = spelled.clone();
-        }
-    }
-    for param in &mut func.params {
-        if let Some(spelled) = renames.get(&param.name) {
-            param.name = spelled.clone();
-        }
-    }
-    crate::post_rename::rewrite_function_names(func, &renames);
+    func.symbols.borrow_mut().follow_renames(&renames);
 }
 
 /// Whether C could read this name as an identifier.
@@ -297,177 +164,6 @@ fn is_c_identifier(name: &str) -> bool {
         .next()
         .is_some_and(|ch| ch.is_ascii_alphabetic() || ch == '_')
         && chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
-}
-
-/// Names a statement declares for itself, which nothing else records.
-fn collect_block_declared(stmts: &[CStmt], names: &mut BTreeSet<String>) {
-    for stmt in stmts {
-        match stmt {
-            CStmt::Decl { name, .. } => {
-                names.insert(name.clone());
-            }
-            CStmt::Block(body) => collect_block_declared(body, names),
-            CStmt::If {
-                then_body,
-                else_body,
-                ..
-            } => {
-                collect_block_declared(std::slice::from_ref(then_body), names);
-                if let Some(body) = else_body {
-                    collect_block_declared(std::slice::from_ref(body), names);
-                }
-            }
-            CStmt::While { body, .. } | CStmt::DoWhile { body, .. } => {
-                collect_block_declared(std::slice::from_ref(body), names);
-            }
-            CStmt::For { init, body, .. } => {
-                if let Some(init) = init {
-                    collect_block_declared(std::slice::from_ref(init), names);
-                }
-                collect_block_declared(std::slice::from_ref(body), names);
-            }
-            CStmt::Switch { cases, default, .. } => {
-                for case in cases {
-                    collect_block_declared(&case.body, names);
-                }
-                if let Some(body) = default {
-                    collect_block_declared(body, names);
-                }
-            }
-            _ => {}
-        }
-    }
-}
-
-/// Mark every construct that mentions a name this function does not declare.
-pub(crate) fn mark_undeclared_names(func: &mut CFunction) {
-    let mut declared = BTreeSet::new();
-    for param in &func.params {
-        declared.insert(param.name.clone());
-    }
-    for local in &func.locals {
-        declared.insert(local.name.clone());
-    }
-    let body = std::mem::take(&mut func.body);
-    func.body = mark_block(body, &declared);
-}
-
-fn mark_block(stmts: Vec<CStmt>, declared: &BTreeSet<String>) -> Vec<CStmt> {
-    let mut out = Vec::with_capacity(stmts.len());
-    for stmt in stmts {
-        let stmt = mark_nested(stmt, declared);
-        let mut undeclared = BTreeSet::new();
-        for expr in statement_exprs(&stmt) {
-            collect_undeclared(expr, declared, &mut undeclared);
-        }
-        if !undeclared.is_empty() {
-            let names = undeclared.into_iter().collect::<Vec<_>>().join(", ");
-            out.push(CStmt::comment(format!(
-                "r2dec residual: mentions {names}, which this function does not declare"
-            )));
-        }
-        out.push(stmt);
-    }
-    out
-}
-
-fn mark_nested(stmt: CStmt, declared: &BTreeSet<String>) -> CStmt {
-    match stmt {
-        CStmt::Block(body) => CStmt::Block(mark_block(body, declared)),
-        CStmt::If {
-            cond,
-            then_body,
-            else_body,
-        } => CStmt::If {
-            cond,
-            then_body: Box::new(mark_nested(*then_body, declared)),
-            else_body: else_body.map(|body| Box::new(mark_nested(*body, declared))),
-        },
-        CStmt::While { cond, body } => CStmt::While {
-            cond,
-            body: Box::new(mark_nested(*body, declared)),
-        },
-        CStmt::DoWhile { body, cond } => CStmt::DoWhile {
-            body: Box::new(mark_nested(*body, declared)),
-            cond,
-        },
-        CStmt::For {
-            init,
-            cond,
-            update,
-            body,
-        } => CStmt::For {
-            init,
-            cond,
-            update,
-            body: Box::new(mark_nested(*body, declared)),
-        },
-        CStmt::Switch {
-            expr,
-            cases,
-            default,
-        } => CStmt::Switch {
-            expr,
-            cases: cases
-                .into_iter()
-                .map(|case| SwitchCase {
-                    body: mark_block(case.body, declared),
-                    ..case
-                })
-                .collect(),
-            default: default.map(|body| mark_block(body, declared)),
-        },
-        other => other,
-    }
-}
-
-/// The expressions a statement evaluates in its own right. Nested bodies are
-/// visited separately so a marker lands beside the statement that carries the
-/// name rather than at the top of the construct enclosing it.
-fn statement_exprs(stmt: &CStmt) -> Vec<&CExpr> {
-    match stmt {
-        CStmt::Expr(expr) | CStmt::Return(Some(expr)) => vec![expr],
-        CStmt::Decl {
-            init: Some(expr), ..
-        } => vec![expr],
-        CStmt::If { cond, .. }
-        | CStmt::While { cond, .. }
-        | CStmt::DoWhile { cond, .. }
-        | CStmt::Switch { expr: cond, .. } => vec![cond],
-        CStmt::For { cond, update, .. } => cond.iter().chain(update.iter()).collect(),
-        _ => Vec::new(),
-    }
-}
-
-fn collect_undeclared(expr: &CExpr, declared: &BTreeSet<String>, out: &mut BTreeSet<String>) {
-    // A name in call position is what is being called, not a carrier the
-    // function reads. No C function declares the functions it calls, so
-    // `isnan(x)` was reported as mentioning an undeclared `isnan` and the
-    // statement was marked for naming the callee it invokes.
-    let mut called = BTreeSet::new();
-    expr.visit(&mut |node| {
-        if let CExpr::Call { func, .. } = node
-            && let CExpr::Var(name) = func.as_ref()
-        {
-            called.insert(name.clone());
-        }
-    });
-    expr.visit(&mut |node| {
-        if let CExpr::Var(name) = node
-            && !declared.contains(name)
-            && !names_something_outside_the_function(name)
-            && !called.contains(name)
-        {
-            out.insert(name.clone());
-        }
-    });
-}
-
-/// Whether the name refers to something the function does not own: a symbol,
-/// an import, another function, or a literal address radare2 spells with a
-/// namespace. Those are references, not undeclared variables.
-fn names_something_outside_the_function(name: &str) -> bool {
-    name.contains('.') || name.parse::<i64>().is_ok() || name.starts_with("0x")
 }
 
 #[cfg(test)]

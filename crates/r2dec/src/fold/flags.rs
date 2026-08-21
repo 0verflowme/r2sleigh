@@ -47,14 +47,14 @@ impl<'a> FoldingContext<'a> {
 
         match expr {
             CExpr::Var(name) => self
-                .call_result_source_for_ssa_name(&name)
-                .or_else(|| self.local_post_call_source_for_ssa_name(&name))
+                .call_result_source_for_ssa_name(&self.spelling(name))
+                .or_else(|| self.local_post_call_source_for_ssa_name(&self.spelling(name)))
                 .and_then(|source| self.predicate_owned_call_result_expr_for_source(source))
                 .unwrap_or(CExpr::Var(name)),
             CExpr::Deref(inner)
                 if matches!(
                     inner.as_ref(),
-                    CExpr::Var(name) if self.should_preserve_owned_call_result_visible_name(name)
+                    CExpr::Var(name) if self.should_preserve_owned_call_result_visible_name(*name)
                 ) =>
             {
                 *inner
@@ -133,7 +133,7 @@ impl<'a> FoldingContext<'a> {
 
         let is_semantic_operand = |expr: &CExpr| match strips_wrappers(expr) {
             CExpr::Var(name) => {
-                !self.is_low_signal_visible_name(name) && !self.is_transient_visible_name(name)
+                !self.is_low_signal_visible_name(&self.spelling(*name)) && !self.is_transient_visible_name(&self.spelling(*name))
             }
             CExpr::Binary { .. }
             | CExpr::Member { .. }
@@ -208,13 +208,13 @@ impl<'a> FoldingContext<'a> {
                     CExpr::Unary { operand, .. } => recurse(ctx, operand),
                     CExpr::Binary { left, right, .. } => recurse(ctx, left) && recurse(ctx, right),
                     CExpr::Var(name) => {
-                        ctx.is_generic_stack_local_owner_name(name)
-                            || is_generic_arg_name(name)
-                            || ctx.inputs.arch.is_return_register_name(name)
-                            || name.starts_with("local_")
-                            || name.starts_with("var_")
-                            || name.starts_with("stack_")
-                            || name.starts_with("arg_")
+                        ctx.is_generic_stack_local_owner_name(&ctx.spelling(*name))
+                            || is_generic_arg_name(&ctx.spelling(*name))
+                            || ctx.inputs.arch.is_return_register_name(&ctx.spelling(*name))
+                            || ctx.spelling(*name).starts_with("local_")
+                            || ctx.spelling(*name).starts_with("var_")
+                            || ctx.spelling(*name).starts_with("stack_")
+                            || ctx.spelling(*name).starts_with("arg_")
                     }
                     CExpr::IntLit(_)
                     | CExpr::UIntLit(_)
@@ -238,14 +238,14 @@ impl<'a> FoldingContext<'a> {
 
         match expr {
             CExpr::Var(name)
-                if self.is_generic_stack_local_owner_name(&name)
-                    || name.starts_with("local_")
-                    || name.starts_with("var_")
-                    || name.starts_with("stack_") =>
+                if self.is_generic_stack_local_owner_name(&self.spelling(name))
+                    || self.spelling(name).starts_with("local_")
+                    || self.spelling(name).starts_with("var_")
+                    || self.spelling(name).starts_with("stack_") =>
             {
                 let resolved = self
-                    .lookup_definition(&name)
-                    .or_else(|| self.formatted_defs_map().get(&name).cloned());
+                    .lookup_definition(&self.spelling(name))
+                    .or_else(|| self.formatted_defs_map().get(&*self.spelling(name)).cloned());
                 if let Some(inner) = resolved
                     && (self.is_predicate_like_expr(&inner)
                         || matches!(
@@ -541,6 +541,7 @@ impl<'a> FoldingContext<'a> {
     }
 
     pub(super) fn lookup_predicate_expr(&self, name: &str) -> Option<CExpr> {
+
         if let Some(expr) = self.predicate_exprs_map().get(name) {
             return Some(expr.clone());
         }
@@ -752,6 +753,8 @@ impl<'a> FoldingContext<'a> {
         var: &SSAVar,
         compare_width: u32,
     ) -> CExpr {
+        let symbols = &self.symbols;
+
         let rooted = self
             .prepared_canonical_value_root(var)
             .unwrap_or_else(|| var.clone());
@@ -777,13 +780,13 @@ impl<'a> FoldingContext<'a> {
                             && !matches!(
                                 expr,
                                 CExpr::Var(name)
-                                    if self.is_low_signal_visible_name(name)
-                                        || self.is_transient_visible_name(name)
-                                        || name.ends_with("_home")
-                                        || name.starts_with("var_")
-                                        || name.starts_with("local_")
-                                        || name.starts_with("stack_")
-                                        || name.starts_with("arg_")
+                                    if self.is_low_signal_visible_name(&self.spelling(*name))
+                                        || self.is_transient_visible_name(&self.spelling(*name))
+                                        || self.spelling(*name).ends_with("_home")
+                                        || self.spelling(*name).starts_with("var_")
+                                        || self.spelling(*name).starts_with("local_")
+                                        || self.spelling(*name).starts_with("stack_")
+                                        || self.spelling(*name).starts_with("arg_")
                             )
                     }),
             );
@@ -797,7 +800,7 @@ impl<'a> FoldingContext<'a> {
                         && !self.is_transient_visible_name(alias)
                 })
             {
-                best = self.choose_preferred_scalar_predicate_expr(best, Some(CExpr::Var(alias)));
+                best = self.choose_preferred_scalar_predicate_expr(best, Some(self.name_ref(&alias)));
             }
             if let Some(call_result_candidate) =
                 self.predicate_owned_call_result_expr_for_name(&candidate_name)
@@ -821,10 +824,10 @@ impl<'a> FoldingContext<'a> {
                             && !name.starts_with("stack_")
                             && !name.starts_with("arg_")
                     })
-                    .map(CExpr::Var),
+                    .map(|n| crate::symbol::var_ref(&symbols, n)),
             );
             if let Some(alias) = self.arg_alias_for_rendered_name(&candidate_name) {
-                best = self.choose_preferred_scalar_predicate_expr(best, Some(CExpr::Var(alias)));
+                best = self.choose_preferred_scalar_predicate_expr(best, Some(self.name_ref(&alias)));
             }
             let visible_name = self.var_name(candidate);
             if !self.is_low_signal_visible_name(&visible_name)
@@ -832,7 +835,7 @@ impl<'a> FoldingContext<'a> {
                 && !visible_name.eq_ignore_ascii_case(&candidate_name)
             {
                 best = self
-                    .choose_preferred_scalar_predicate_expr(best, Some(CExpr::Var(visible_name)));
+                    .choose_preferred_scalar_predicate_expr(best, Some(self.name_ref(&visible_name)));
             }
             best = self.choose_preferred_scalar_predicate_expr(
                 best,
@@ -883,9 +886,9 @@ impl<'a> FoldingContext<'a> {
                 self.prepared_predicate_operand_is_generic_entry_or_return(inner)
             }
             CExpr::Var(name) => {
-                is_generic_arg_name(name)
-                    || name.starts_with("arg_")
-                    || self.inputs.arch.is_return_register_name(name)
+                is_generic_arg_name(&self.spelling(*name))
+                    || self.spelling(*name).starts_with("arg_")
+                    || self.inputs.arch.is_return_register_name(&self.spelling(*name))
             }
             _ => false,
         }
@@ -909,10 +912,10 @@ impl<'a> FoldingContext<'a> {
     pub(super) fn is_assignment_predicate_expr(&self, expr: &CExpr) -> bool {
         match expr {
             CExpr::Var(name) => {
-                is_cpu_flag(&name.to_lowercase())
-                    || self.flag_only_values_set().contains(name)
-                    || self.condition_vars_set().contains(name)
-                    || self.lookup_predicate_expr(name).is_some()
+                is_cpu_flag(&self.spelling(*name).to_lowercase())
+                    || self.flag_only_values_set().contains(&*self.spelling(*name))
+                    || self.condition_vars_set().contains(&*self.spelling(*name))
+                    || self.lookup_predicate_expr(&self.spelling(*name)).is_some()
             }
             CExpr::Unary {
                 op: UnaryOp::Not, ..
@@ -1030,7 +1033,7 @@ impl<'a> FoldingContext<'a> {
         }
 
         self.predicate_candidate_for_var(cond)
-            .or_else(|| Some(CExpr::Var(self.var_name(cond))))
+            .or_else(|| Some(self.name_ref(&self.var_name(cond))))
     }
 
     fn local_compare_expr(
@@ -1077,7 +1080,7 @@ impl<'a> FoldingContext<'a> {
         if self.inputs.arch.is_stack_base_name(&lower_name)
             || self.inputs.arch.is_frame_pointer_name(&lower_name)
         {
-            return Some(CExpr::Var(lower_name));
+            return Some(self.name_ref(&lower_name));
         }
 
         if var.version != 0 {
@@ -1100,11 +1103,11 @@ impl<'a> FoldingContext<'a> {
             {
                 return Some(call_expr);
             }
-            return Some(CExpr::Var(self.var_name(var)));
+            return Some(self.name_ref(&self.var_name(var)));
         }
 
         if depth > MAX_PREDICATE_OPERAND_DEPTH {
-            return Some(CExpr::Var(self.var_name(var)));
+            return Some(self.name_ref(&self.var_name(var)));
         }
 
         for (idx, op) in block.ops[..before_idx].iter().enumerate().rev() {
@@ -1197,7 +1200,7 @@ impl<'a> FoldingContext<'a> {
             return Some(expr);
         }
 
-        Some(CExpr::Var(self.var_name(var)))
+        Some(self.name_ref(&self.var_name(var)))
     }
 
     fn local_return_register_chain_is_call_result(
@@ -1371,6 +1374,8 @@ impl<'a> FoldingContext<'a> {
         addr: &SSAVar,
         depth: u32,
     ) -> Option<CExpr> {
+        let symbols = &self.symbols;
+
         let slot = self.stack_slot_provenance_for_var(addr);
         for (store_idx, op) in block.ops[..op_idx].iter().enumerate().rev() {
             if let SSAOp::Store {
@@ -1392,7 +1397,7 @@ impl<'a> FoldingContext<'a> {
                                 .filter(|name| {
                                     !super::op_lower::is_generic_stack_placeholder_alias(name)
                                 })
-                                .map(CExpr::Var)
+                                .map(|n| crate::symbol::var_ref(&symbols, n))
                         });
                     if alias.is_some() {
                         return alias;
@@ -1410,7 +1415,7 @@ impl<'a> FoldingContext<'a> {
         if let Some(alias) = self.simplify_stack_access(&addr_expr)
             && !super::op_lower::is_generic_stack_placeholder_alias(&alias)
         {
-            return Some(CExpr::Var(alias));
+            return Some(self.name_ref(&alias));
         }
 
         if slot.is_some_and(|slot| slot.is_scalar_predicate_carrier()) {
@@ -1466,7 +1471,7 @@ impl<'a> FoldingContext<'a> {
 
         let expr = self
             .predicate_candidate_for_var(var)
-            .unwrap_or_else(|| CExpr::Var(self.var_name(var)));
+            .unwrap_or_else(|| self.name_ref(&self.var_name(var)));
         let expr = self.rewrite_stack_expr(expr);
         let expr = self.rewrite_condition_stack_aliases(expr);
         let expr = self.simplify_condition_expr(expr);
@@ -1490,7 +1495,7 @@ impl<'a> FoldingContext<'a> {
         }
 
         match expr {
-            CExpr::Var(name) => self.rewrite_condition_stack_var(name, depth, visited),
+            CExpr::Var(name) => self.rewrite_condition_stack_var(self.spelling(name).to_string(), depth, visited),
             other => other.map_children(&mut |child| {
                 self.rewrite_condition_stack_aliases_inner(child, depth + 1, visited)
             }),
@@ -1504,7 +1509,7 @@ impl<'a> FoldingContext<'a> {
         visited: &mut HashSet<String>,
     ) -> CExpr {
         if depth > MAX_COND_STACK_ALIAS_DEPTH {
-            return CExpr::Var(name);
+            return self.name_ref(&name);
         }
 
         if self
@@ -1512,7 +1517,7 @@ impl<'a> FoldingContext<'a> {
             .values()
             .any(|candidate| candidate.eq_ignore_ascii_case(&name))
         {
-            return CExpr::Var(name);
+            return self.name_ref(&name);
         }
 
         if let Some(alias) = self
@@ -1521,17 +1526,17 @@ impl<'a> FoldingContext<'a> {
             .and_then(|offset| self.resolve_stack_var(offset))
             .filter(|alias| !alias.eq_ignore_ascii_case(&name))
         {
-            return CExpr::Var(alias);
+            return self.name_ref(&alias);
         }
 
-        if let Some(alias) = self.resolve_stack_alias_from_addr_expr(&CExpr::Var(name.clone()), 0)
+        if let Some(alias) = self.resolve_stack_alias_from_addr_expr(&self.name_ref(&name.clone()), 0)
             && !alias.eq_ignore_ascii_case(&name)
         {
-            return CExpr::Var(alias);
+            return self.name_ref(&alias);
         }
 
         if !visited.insert(name.clone()) {
-            return CExpr::Var(name);
+            return self.name_ref(&name);
         }
 
         let resolved = self
@@ -1542,12 +1547,12 @@ impl<'a> FoldingContext<'a> {
         let rewritten = if let Some(expr) = resolved {
             let expr = self.rewrite_condition_stack_aliases_inner(expr, depth + 1, visited);
             if let Some(alias) = self.resolve_stack_alias_from_addr_expr(&expr, 0) {
-                CExpr::Var(alias)
+                self.name_ref(&alias)
             } else {
-                CExpr::Var(name.clone())
+                self.name_ref(&name.clone())
             }
         } else {
-            CExpr::Var(name.clone())
+            self.name_ref(&name.clone())
         };
 
         visited.remove(&name);
@@ -1689,7 +1694,7 @@ impl<'a> FoldingContext<'a> {
                 CExpr::binary(BinaryOp::Lt, *left, *right)
             }
             CExpr::Var(name) => {
-                if let Some(val) = parse_const_value(&name) {
+                if let Some(val) = parse_const_value(&self.spelling(name)) {
                     if val > 0x7fffffff {
                         CExpr::UIntLit(val)
                     } else {
@@ -1809,14 +1814,15 @@ impl<'a> FoldingContext<'a> {
                 expr: Box::new(self.normalize_predicate_match_operand(inner)),
             },
             CExpr::Var(name) => self
-                .normalize_compare_style_const_name(name)
+                .normalize_compare_style_const_name(*name)
                 .unwrap_or_else(|| CExpr::Var(name.clone())),
             other => other.clone(),
         }
     }
 
-    fn normalize_compare_style_const_name(&self, name: &str) -> Option<CExpr> {
-        if let Some(expr) = self.compare_const_expr_from_name(name) {
+    fn normalize_compare_style_const_name(&self, name: crate::symbol::SymbolId) -> Option<CExpr> {
+
+        if let Some(expr) = self.compare_const_expr_from_name(&self.spelling(name)) {
             return Some(expr);
         }
 
@@ -1828,26 +1834,28 @@ impl<'a> FoldingContext<'a> {
             }
         }
 
-        if let Some(value) = parse_const_value(name) {
+        if let Some(value) = parse_const_value(&self.spelling(name)) {
             return Some(lit_for_u64(value));
         }
 
-        if let Some(dec) = name.strip_prefix("0d").or_else(|| name.strip_prefix("0D")) {
+        let spelled = self.spelling(name);
+        if let Some(dec) = spelled.strip_prefix("0d").or_else(|| spelled.strip_prefix("0D")) {
             return dec.parse::<u64>().ok().map(lit_for_u64);
         }
 
-        if let Some(hex) = name.strip_prefix("0x").or_else(|| name.strip_prefix("0X")) {
+        if let Some(hex) = spelled.strip_prefix("0x").or_else(|| spelled.strip_prefix("0X")) {
             return u64::from_str_radix(hex, 16).ok().map(lit_for_u64);
         }
 
-        if name.len() > 1 && name.chars().all(|c| c.is_ascii_hexdigit()) {
-            return u64::from_str_radix(name, 16).ok().map(lit_for_u64);
+        if spelled.len() > 1 && spelled.chars().all(|c| c.is_ascii_hexdigit()) {
+            return u64::from_str_radix(&spelled, 16).ok().map(lit_for_u64);
         }
 
-        name.parse::<i64>().ok().map(CExpr::IntLit)
+        self.spelling(name).parse::<i64>().ok().map(CExpr::IntLit)
     }
 
     fn compare_const_expr_from_name(&self, name: &str) -> Option<CExpr> {
+
         let raw = name.strip_prefix("const:")?;
         let raw = raw.split('_').next().unwrap_or(raw);
 
@@ -2071,10 +2079,10 @@ impl<'a> FoldingContext<'a> {
     pub(super) fn is_boolean_value_expr(&self, expr: &CExpr) -> bool {
         match expr {
             CExpr::Var(name) => {
-                is_cpu_flag(&name.to_lowercase())
-                    || self.flag_only_values_set().contains(name)
-                    || self.condition_vars_set().contains(name)
-                    || self.lookup_predicate_expr(name).is_some()
+                is_cpu_flag(&self.spelling(*name).to_lowercase())
+                    || self.flag_only_values_set().contains(&*self.spelling(*name))
+                    || self.condition_vars_set().contains(&*self.spelling(*name))
+                    || self.lookup_predicate_expr(&self.spelling(*name)).is_some()
             }
             CExpr::Unary {
                 op: UnaryOp::Not, ..
@@ -2105,7 +2113,7 @@ impl<'a> FoldingContext<'a> {
             CExpr::Paren(inner) => self.is_predicate_one_expr(inner),
             CExpr::Cast { expr: inner, .. } => self.is_predicate_one_expr(inner),
             CExpr::IntLit(1) | CExpr::UIntLit(1) => true,
-            CExpr::Var(name) => name == "1",
+            CExpr::Var(name) => &*self.spelling(*name) == "1",
             _ => false,
         }
     }
@@ -2119,15 +2127,16 @@ impl<'a> FoldingContext<'a> {
             CExpr::IntLit(_) | CExpr::UIntLit(_) => Some(expr.clone()),
             CExpr::Paren(inner) => self.const_expr_for_comparison(inner),
             CExpr::Cast { expr: inner, .. } => self.const_expr_for_comparison(inner),
-            CExpr::Var(name) => self.compare_const_expr_from_name(name).or_else(|| {
-                if let Some(val) = parse_const_value(name) {
+            CExpr::Var(name) => self.compare_const_expr_from_name(&self.spelling(*name)).or_else(|| {
+                let spelled = self.spelling(*name);
+                if let Some(val) = parse_const_value(&spelled) {
                     Some(if val > 0x7fffffff {
                         CExpr::UIntLit(val)
                     } else {
                         CExpr::IntLit(val as i64)
                     })
                 } else if let Some(hex) =
-                    name.strip_prefix("0x").or_else(|| name.strip_prefix("0X"))
+                    spelled.strip_prefix("0x").or_else(|| spelled.strip_prefix("0X"))
                 {
                     u64::from_str_radix(hex, 16).ok().map(|val| {
                         if val > 0x7fffffff {
@@ -2175,14 +2184,14 @@ impl<'a> FoldingContext<'a> {
             CExpr::Paren(inner) => self.strip_sub_const_inner(inner, visited),
             CExpr::Cast { expr: inner, .. } => self.strip_sub_const_inner(inner, visited),
             CExpr::Var(name) => {
-                if !visited.insert(name.clone()) {
+                if !visited.insert(self.spelling(*name).to_string()) {
                     return None;
                 }
                 let inner = self
-                    .lookup_definition(name)
-                    .or_else(|| self.formatted_defs_map().get(name).cloned());
+                    .lookup_definition(&self.spelling(*name))
+                    .or_else(|| self.formatted_defs_map().get(&*self.spelling(*name)).cloned());
                 let result = inner.and_then(|inner| self.strip_sub_const_inner(&inner, visited));
-                visited.remove(name);
+                visited.remove(&*self.spelling(*name));
                 result
             }
             _ => None,
@@ -2199,14 +2208,14 @@ impl<'a> FoldingContext<'a> {
             CExpr::Paren(inner) => self.strip_sub_zero_inner(inner, visited),
             CExpr::Cast { expr: inner, .. } => self.strip_sub_zero_inner(inner, visited),
             CExpr::Var(name) => {
-                if !visited.insert(name.clone()) {
+                if !visited.insert(self.spelling(*name).to_string()) {
                     return None;
                 }
                 let inner = self
-                    .lookup_definition(name)
-                    .or_else(|| self.formatted_defs_map().get(name).cloned());
+                    .lookup_definition(&self.spelling(*name))
+                    .or_else(|| self.formatted_defs_map().get(&*self.spelling(*name)).cloned());
                 let result = inner.and_then(|inner| self.strip_sub_zero_inner(&inner, visited));
-                visited.remove(name);
+                visited.remove(&*self.spelling(*name));
                 result
             }
             _ => None,
@@ -2223,14 +2232,14 @@ impl<'a> FoldingContext<'a> {
             CExpr::Paren(inner) => self.strip_test_self_inner(inner, visited),
             CExpr::Cast { expr: inner, .. } => self.strip_test_self_inner(inner, visited),
             CExpr::Var(name) => {
-                if !visited.insert(name.clone()) {
+                if !visited.insert(self.spelling(*name).to_string()) {
                     return None;
                 }
                 let inner = self
-                    .lookup_definition(name)
-                    .or_else(|| self.formatted_defs_map().get(name).cloned());
+                    .lookup_definition(&self.spelling(*name))
+                    .or_else(|| self.formatted_defs_map().get(&*self.spelling(*name)).cloned());
                 let result = inner.and_then(|inner| self.strip_test_self_inner(&inner, visited));
-                visited.remove(name);
+                visited.remove(&*self.spelling(*name));
                 result
             }
             _ => None,
@@ -2242,7 +2251,7 @@ impl<'a> FoldingContext<'a> {
             CExpr::Paren(inner) => self.is_zero_expr(inner),
             CExpr::Cast { expr: inner, .. } => self.is_zero_expr(inner),
             CExpr::IntLit(0) | CExpr::UIntLit(0) => true,
-            CExpr::Var(name) => name == "0" || name == "elf_header",
+            CExpr::Var(name) => &*self.spelling(*name) == "0" || &*self.spelling(*name) == "elf_header",
             _ => false,
         }
     }
@@ -2250,10 +2259,10 @@ impl<'a> FoldingContext<'a> {
     pub(super) fn is_predicate_like_expr(&self, expr: &CExpr) -> bool {
         match expr {
             CExpr::Var(name) => {
-                is_cpu_flag(&name.to_lowercase())
-                    || self.flag_only_values_set().contains(name)
-                    || self.condition_vars_set().contains(name)
-                    || self.lookup_predicate_expr(name).is_some()
+                is_cpu_flag(&self.spelling(*name).to_lowercase())
+                    || self.flag_only_values_set().contains(&*self.spelling(*name))
+                    || self.condition_vars_set().contains(&*self.spelling(*name))
+                    || self.lookup_predicate_expr(&self.spelling(*name)).is_some()
             }
             CExpr::Unary {
                 op: UnaryOp::Not, ..
@@ -2278,18 +2287,21 @@ impl<'a> FoldingContext<'a> {
         }
     }
 
-    pub(super) fn should_expand_predicate_var(&self, name: &str) -> bool {
+    pub(super) fn should_expand_predicate_var(&self, name: crate::symbol::SymbolId) -> bool {
+        let name_id = name;
+        let name = &self.spelling(name_id);
+
         if is_cpu_flag(&name.to_lowercase())
-            || self.condition_vars_set().contains(name)
-            || self.flag_only_values_set().contains(name)
+            || self.condition_vars_set().contains(&**name)
+            || self.flag_only_values_set().contains(&**name)
             || self.lookup_predicate_expr(name).is_some()
         {
             return true;
         }
 
-        self.lookup_predicate_expr(name)
-            .or_else(|| self.lookup_definition(name))
-            .or_else(|| self.formatted_defs_map().get(name).cloned())
+        self.lookup_predicate_expr(&self.spelling(name_id))
+            .or_else(|| self.lookup_definition(&self.spelling(name_id)))
+            .or_else(|| self.formatted_defs_map().get(&**name).cloned())
             .map(|expr| self.is_predicate_like_expr(&expr))
             .unwrap_or(false)
     }
@@ -2306,62 +2318,62 @@ impl<'a> FoldingContext<'a> {
 
         match expr {
             CExpr::Var(name) => {
-                if let Some(alias) = self.arg_alias_for_rendered_name(name) {
-                    return CExpr::Var(alias);
+                if let Some(alias) = self.arg_alias_for_rendered_name(&self.spelling(*name)) {
+                    return self.name_ref(&alias);
                 }
-                if let Some(owner) = self.predicate_owned_call_result_expr_for_name(name) {
+                if let Some(owner) = self.predicate_owned_call_result_expr_for_name(&self.spelling(*name)) {
                     return owner;
                 }
                 if self
-                    .call_result_source_for_ssa_name(name)
-                    .or_else(|| self.local_post_call_source_for_ssa_name(name))
+                    .call_result_source_for_ssa_name(&self.spelling(*name))
+                    .or_else(|| self.local_post_call_source_for_ssa_name(&self.spelling(*name)))
                     .is_some()
                 {
                     return CExpr::Var(name.clone());
                 }
-                if let Some(inner) = self.lookup_predicate_expr(name)
+                if let Some(inner) = self.lookup_predicate_expr(&self.spelling(*name))
                     && inner != CExpr::Var(name.clone())
                 {
                     if let CExpr::Var(inner_name) = &inner {
-                        if inner_name.starts_with("arg") {
+                        if self.spelling(*inner_name).starts_with("arg") {
                             return CExpr::Var(inner_name.clone());
                         }
-                        if let Some(alias) = self.arg_alias_for_rendered_name(inner_name) {
-                            return CExpr::Var(alias);
+                        if let Some(alias) = self.arg_alias_for_rendered_name(&self.spelling(*inner_name)) {
+                            return self.name_ref(&alias);
                         }
                     }
-                    if !self.should_expand_predicate_var(name) || !visited.insert(name.clone()) {
+                    if !self.should_expand_predicate_var(*name) || !visited.insert(self.spelling(*name).to_string()) {
                         return CExpr::Var(name.clone());
                     }
                     let expanded = self.expand_predicate_vars(&inner, depth + 1, visited);
-                    visited.remove(name);
+                    visited.remove(&*self.spelling(*name));
                     return expanded;
                 }
                 if let Some(inner) = self
-                    .lookup_definition(name)
-                    .or_else(|| self.formatted_defs_map().get(name).cloned())
+                    .lookup_definition(&self.spelling(*name))
+                    .or_else(|| self.formatted_defs_map().get(&*self.spelling(*name)).cloned())
                     && let CExpr::Var(inner_name) = inner
                 {
-                    if inner_name.starts_with("arg") {
+                    if self.spelling(inner_name).starts_with("arg") {
                         return CExpr::Var(inner_name);
                     }
-                    if let Some(alias) = self.arg_alias_for_rendered_name(&inner_name) {
-                        return CExpr::Var(alias);
+                    if let Some(alias) = self.arg_alias_for_rendered_name(&self.spelling(inner_name)) {
+                        return self.name_ref(&alias);
                     }
                 }
-                if !self.should_expand_predicate_var(name) || !visited.insert(name.clone()) {
+                if !self.should_expand_predicate_var(*name) || !visited.insert(self.spelling(*name).to_string()) {
                     return CExpr::Var(name.clone());
                 }
 
                 let expanded = self
-                    .lookup_predicate_expr(name)
-                    .or_else(|| self.lookup_definition(name))
-                    .or_else(|| self.formatted_defs_map().get(name).cloned())
+                    .lookup_predicate_expr(&self.spelling(*name))
+                    .or_else(|| self.lookup_definition(&self.spelling(*name)))
+                    .or_else(|| self.formatted_defs_map().get(&*self.spelling(*name)).cloned())
                     .filter(|inner| self.is_predicate_like_expr(inner))
                     .map(|inner| self.expand_predicate_vars(&inner, depth + 1, visited))
                     .unwrap_or_else(|| CExpr::Var(name.clone()));
 
-                visited.remove(name);
+                visited.remove(&*self.spelling(*name));
                 expanded
             }
             CExpr::Unary { op, operand } => {
@@ -2416,13 +2428,13 @@ impl<'a> FoldingContext<'a> {
                 if let (Some(zf_name), true) = (self.extract_not_zf(left), self.is_of_eq_sf(right))
                     && let Some((a, b)) = self.lookup_flag_origin(&zf_name)
                 {
-                    return Some(CExpr::binary(BinaryOp::Gt, CExpr::Var(a), CExpr::Var(b)));
+                    return Some(CExpr::binary(BinaryOp::Gt, self.name_ref(&a), self.name_ref(&b)));
                 }
                 // Try reversed: (OF == SF) && !ZF
                 if let (Some(zf_name), true) = (self.extract_not_zf(right), self.is_of_eq_sf(left))
                     && let Some((a, b)) = self.lookup_flag_origin(&zf_name)
                 {
-                    return Some(CExpr::binary(BinaryOp::Gt, CExpr::Var(a), CExpr::Var(b)));
+                    return Some(CExpr::binary(BinaryOp::Gt, self.name_ref(&a), self.name_ref(&b)));
                 }
 
                 // Try !CF && !ZF -> a > b (unsigned, JA)
@@ -2430,10 +2442,10 @@ impl<'a> FoldingContext<'a> {
                     (self.extract_not_cf(left), self.extract_not_zf(right))
                 {
                     if let Some((a, b)) = self.lookup_flag_origin(&cf_name) {
-                        return Some(CExpr::binary(BinaryOp::Gt, CExpr::Var(a), CExpr::Var(b)));
+                        return Some(CExpr::binary(BinaryOp::Gt, self.name_ref(&a), self.name_ref(&b)));
                     }
                     if let Some((a, b)) = self.lookup_flag_origin(&zf_name) {
-                        return Some(CExpr::binary(BinaryOp::Gt, CExpr::Var(a), CExpr::Var(b)));
+                        return Some(CExpr::binary(BinaryOp::Gt, self.name_ref(&a), self.name_ref(&b)));
                     }
                 }
                 // Try reversed
@@ -2441,10 +2453,10 @@ impl<'a> FoldingContext<'a> {
                     (self.extract_not_cf(right), self.extract_not_zf(left))
                 {
                     if let Some((a, b)) = self.lookup_flag_origin(&cf_name) {
-                        return Some(CExpr::binary(BinaryOp::Gt, CExpr::Var(a), CExpr::Var(b)));
+                        return Some(CExpr::binary(BinaryOp::Gt, self.name_ref(&a), self.name_ref(&b)));
                     }
                     if let Some((a, b)) = self.lookup_flag_origin(&zf_name) {
-                        return Some(CExpr::binary(BinaryOp::Gt, CExpr::Var(a), CExpr::Var(b)));
+                        return Some(CExpr::binary(BinaryOp::Gt, self.name_ref(&a), self.name_ref(&b)));
                     }
                 }
 
@@ -2469,10 +2481,10 @@ impl<'a> FoldingContext<'a> {
                     (self.extract_cf(left), self.extract_zf(right))
                 {
                     if let Some((a, b)) = self.lookup_flag_origin(&cf_name) {
-                        return Some(CExpr::binary(BinaryOp::Le, CExpr::Var(a), CExpr::Var(b)));
+                        return Some(CExpr::binary(BinaryOp::Le, self.name_ref(&a), self.name_ref(&b)));
                     }
                     if let Some((a, b)) = self.lookup_flag_origin(&zf_name) {
-                        return Some(CExpr::binary(BinaryOp::Le, CExpr::Var(a), CExpr::Var(b)));
+                        return Some(CExpr::binary(BinaryOp::Le, self.name_ref(&a), self.name_ref(&b)));
                     }
                 }
                 // Try reversed
@@ -2480,10 +2492,10 @@ impl<'a> FoldingContext<'a> {
                     (self.extract_cf(right), self.extract_zf(left))
                 {
                     if let Some((a, b)) = self.lookup_flag_origin(&cf_name) {
-                        return Some(CExpr::binary(BinaryOp::Le, CExpr::Var(a), CExpr::Var(b)));
+                        return Some(CExpr::binary(BinaryOp::Le, self.name_ref(&a), self.name_ref(&b)));
                     }
                     if let Some((a, b)) = self.lookup_flag_origin(&zf_name) {
-                        return Some(CExpr::binary(BinaryOp::Le, CExpr::Var(a), CExpr::Var(b)));
+                        return Some(CExpr::binary(BinaryOp::Le, self.name_ref(&a), self.name_ref(&b)));
                     }
                 }
 
@@ -2491,13 +2503,13 @@ impl<'a> FoldingContext<'a> {
                 if let (Some(zf_name), true) = (self.extract_zf(left), self.is_of_ne_sf(right))
                     && let Some((a, b)) = self.lookup_flag_origin(&zf_name)
                 {
-                    return Some(CExpr::binary(BinaryOp::Le, CExpr::Var(a), CExpr::Var(b)));
+                    return Some(CExpr::binary(BinaryOp::Le, self.name_ref(&a), self.name_ref(&b)));
                 }
                 // Try reversed
                 if let (Some(zf_name), true) = (self.extract_zf(right), self.is_of_ne_sf(left))
                     && let Some((a, b)) = self.lookup_flag_origin(&zf_name)
                 {
-                    return Some(CExpr::binary(BinaryOp::Le, CExpr::Var(a), CExpr::Var(b)));
+                    return Some(CExpr::binary(BinaryOp::Le, self.name_ref(&a), self.name_ref(&b)));
                 }
 
                 None
@@ -2519,10 +2531,10 @@ impl<'a> FoldingContext<'a> {
                     (self.extract_of(left), self.extract_sf(right))
                 {
                     if let Some((a, b)) = self.lookup_flag_origin(&of_name) {
-                        return Some(CExpr::binary(BinaryOp::Ge, CExpr::Var(a), CExpr::Var(b)));
+                        return Some(CExpr::binary(BinaryOp::Ge, self.name_ref(&a), self.name_ref(&b)));
                     }
                     if let Some((a, b)) = self.lookup_flag_origin(&sf_name) {
-                        return Some(CExpr::binary(BinaryOp::Ge, CExpr::Var(a), CExpr::Var(b)));
+                        return Some(CExpr::binary(BinaryOp::Ge, self.name_ref(&a), self.name_ref(&b)));
                     }
                 }
                 // Try reversed
@@ -2530,10 +2542,10 @@ impl<'a> FoldingContext<'a> {
                     (self.extract_of(right), self.extract_sf(left))
                 {
                     if let Some((a, b)) = self.lookup_flag_origin(&of_name) {
-                        return Some(CExpr::binary(BinaryOp::Ge, CExpr::Var(a), CExpr::Var(b)));
+                        return Some(CExpr::binary(BinaryOp::Ge, self.name_ref(&a), self.name_ref(&b)));
                     }
                     if let Some((a, b)) = self.lookup_flag_origin(&sf_name) {
-                        return Some(CExpr::binary(BinaryOp::Ge, CExpr::Var(a), CExpr::Var(b)));
+                        return Some(CExpr::binary(BinaryOp::Ge, self.name_ref(&a), self.name_ref(&b)));
                     }
                 }
                 // Fallback: temp == 0 where temp is from TEST/CMP
@@ -2563,10 +2575,10 @@ impl<'a> FoldingContext<'a> {
                     (self.extract_of(left), self.extract_sf(right))
                 {
                     if let Some((a, b)) = self.lookup_flag_origin(&of_name) {
-                        return Some(CExpr::binary(BinaryOp::Lt, CExpr::Var(a), CExpr::Var(b)));
+                        return Some(CExpr::binary(BinaryOp::Lt, self.name_ref(&a), self.name_ref(&b)));
                     }
                     if let Some((a, b)) = self.lookup_flag_origin(&sf_name) {
-                        return Some(CExpr::binary(BinaryOp::Lt, CExpr::Var(a), CExpr::Var(b)));
+                        return Some(CExpr::binary(BinaryOp::Lt, self.name_ref(&a), self.name_ref(&b)));
                     }
                 }
                 // Try reversed
@@ -2574,10 +2586,10 @@ impl<'a> FoldingContext<'a> {
                     (self.extract_of(right), self.extract_sf(left))
                 {
                     if let Some((a, b)) = self.lookup_flag_origin(&of_name) {
-                        return Some(CExpr::binary(BinaryOp::Lt, CExpr::Var(a), CExpr::Var(b)));
+                        return Some(CExpr::binary(BinaryOp::Lt, self.name_ref(&a), self.name_ref(&b)));
                     }
                     if let Some((a, b)) = self.lookup_flag_origin(&sf_name) {
-                        return Some(CExpr::binary(BinaryOp::Lt, CExpr::Var(a), CExpr::Var(b)));
+                        return Some(CExpr::binary(BinaryOp::Lt, self.name_ref(&a), self.name_ref(&b)));
                     }
                 }
                 // Fallback: temp != 0 where temp is from TEST/CMP
@@ -2606,31 +2618,31 @@ impl<'a> FoldingContext<'a> {
                 operand,
             } => {
                 if let CExpr::Var(flag_name) = operand.as_ref() {
-                    if let Some(prov) = self.lookup_flag_compare_provenance(flag_name)
+                    if let Some(prov) = self.lookup_flag_compare_provenance(&self.spelling(*flag_name))
                         && let Some(expr) = self.compare_provenance_expr(&prov)
                     {
                         return Some(self.negate_condition_expr(expr));
                     }
 
-                    let flag_lower = flag_name.to_lowercase();
+                    let flag_lower = self.spelling(*flag_name).to_lowercase();
                     if flag_lower.contains("zf") {
                         // !ZF means a != b
-                        if let Some((left, right)) = self.lookup_flag_origin(flag_name) {
+                        if let Some((left, right)) = self.lookup_flag_origin(&self.spelling(*flag_name)) {
                             return Some(CExpr::binary(
                                 BinaryOp::Ne,
-                                CExpr::Var(left),
-                                CExpr::Var(right),
+                                self.name_ref(&left),
+                                self.name_ref(&right),
                             ));
                         }
                     }
                     // !CF means a >= b (unsigned, JAE)
                     if flag_lower.contains("cf")
-                        && let Some((left, right)) = self.lookup_flag_origin(flag_name)
+                        && let Some((left, right)) = self.lookup_flag_origin(&self.spelling(*flag_name))
                     {
                         return Some(CExpr::binary(
                             BinaryOp::Ge,
-                            CExpr::Var(left),
-                            CExpr::Var(right),
+                            self.name_ref(&left),
+                            self.name_ref(&right),
                         ));
                     }
                 }
@@ -2646,14 +2658,14 @@ impl<'a> FoldingContext<'a> {
                         (self.extract_cf(or_left), self.extract_zf(or_right))
                         && let Some((a, b)) = self.lookup_flag_origin(&cf_name)
                     {
-                        return Some(CExpr::binary(BinaryOp::Gt, CExpr::Var(a), CExpr::Var(b)));
+                        return Some(CExpr::binary(BinaryOp::Gt, self.name_ref(&a), self.name_ref(&b)));
                     }
                     // Try reversed
                     if let (Some(cf_name), Some(_zf_name)) =
                         (self.extract_cf(or_right), self.extract_zf(or_left))
                         && let Some((a, b)) = self.lookup_flag_origin(&cf_name)
                     {
-                        return Some(CExpr::binary(BinaryOp::Gt, CExpr::Var(a), CExpr::Var(b)));
+                        return Some(CExpr::binary(BinaryOp::Gt, self.name_ref(&a), self.name_ref(&b)));
                     }
                 }
 
@@ -2723,30 +2735,30 @@ impl<'a> FoldingContext<'a> {
 
             // Pattern: ZF directly means "equal"
             CExpr::Var(flag_name) => {
-                if let Some(prov) = self.lookup_flag_compare_provenance(flag_name)
+                if let Some(prov) = self.lookup_flag_compare_provenance(&self.spelling(*flag_name))
                     && let Some(expr) = self.compare_provenance_expr(&prov)
                 {
                     return Some(expr);
                 }
 
-                let flag_lower = flag_name.to_lowercase();
+                let flag_lower = self.spelling(*flag_name).to_lowercase();
                 if flag_lower.contains("zf")
-                    && let Some((left, right)) = self.lookup_flag_origin(flag_name)
+                    && let Some((left, right)) = self.lookup_flag_origin(&self.spelling(*flag_name))
                 {
                     return Some(CExpr::binary(
                         BinaryOp::Eq,
-                        CExpr::Var(left),
-                        CExpr::Var(right),
+                        self.name_ref(&left),
+                        self.name_ref(&right),
                     ));
                 }
                 // CF directly means a < b (unsigned, JB)
                 if flag_lower.contains("cf")
-                    && let Some((left, right)) = self.lookup_flag_origin(flag_name)
+                    && let Some((left, right)) = self.lookup_flag_origin(&self.spelling(*flag_name))
                 {
                     return Some(CExpr::binary(
                         BinaryOp::Lt,
-                        CExpr::Var(left),
-                        CExpr::Var(right),
+                        self.name_ref(&left),
+                        self.name_ref(&right),
                     ));
                 }
                 None
@@ -2772,7 +2784,7 @@ impl<'a> FoldingContext<'a> {
         // zero_side must be 0
         let is_zero = match zero_side {
             CExpr::IntLit(0) => true,
-            CExpr::Var(name) if name == "elf_header" || name == "0" => true,
+            CExpr::Var(name) if &*self.spelling(*name) == "elf_header" || &*self.spelling(*name) == "0" => true,
             _ => false,
         };
         if !is_zero {
@@ -2787,8 +2799,8 @@ impl<'a> FoldingContext<'a> {
 
         // Look up the definition of this variable (try SSA key first, then formatted name)
         let def = self
-            .definition_for_name(var_name)
-            .or_else(|| self.formatted_defs_map().get(var_name))?;
+            .definition_for_name(&self.spelling(*var_name))
+            .or_else(|| self.formatted_defs_map().get(&*self.spelling(*var_name)))?;
 
         match def {
             // TEST reg, reg pattern: IntAnd(a, b) where a == b
@@ -2825,16 +2837,16 @@ impl<'a> FoldingContext<'a> {
 
     pub(super) fn extract_flag_name(&self, expr: &CExpr, flag: &str) -> Option<String> {
         if let CExpr::Var(name) = expr {
-            if is_specific_flag_name(name, flag) {
-                return Some(name.clone());
+            if is_specific_flag_name(&self.spelling(*name), flag) {
+                return Some(self.spelling(*name).to_string());
             }
 
             if let Some(CExpr::Var(inner)) = self
-                .lookup_definition(name)
-                .or_else(|| self.formatted_defs_map().get(name).cloned())
-                && is_specific_flag_name(&inner, flag)
+                .lookup_definition(&self.spelling(*name))
+                .or_else(|| self.formatted_defs_map().get(&*self.spelling(*name)).cloned())
+                && is_specific_flag_name(&self.spelling(inner), flag)
             {
-                return Some(inner);
+                return Some(self.spelling(inner).to_string());
             }
         }
         None
@@ -3083,15 +3095,15 @@ impl<'a> FoldingContext<'a> {
             }
             CExpr::Var(name) => {
                 let visit_key = self
-                    .value_id_for_name(name)
+                    .value_id_for_name(&self.spelling(*name))
                     .map(|value_id| format!("sub:value:{}", value_id.0))
-                    .unwrap_or_else(|| format!("sub:name:{name}"));
+                    .unwrap_or_else(|| format!("sub:name:{}", self.spelling(*name)));
                 if !seen.insert(visit_key.clone()) {
                     return None;
                 }
                 if let Some(def) = self
-                    .lookup_definition(name)
-                    .or_else(|| self.formatted_defs_map().get(name).cloned())
+                    .lookup_definition(&self.spelling(*name))
+                    .or_else(|| self.formatted_defs_map().get(&*self.spelling(*name)).cloned())
                 {
                     let result = self.extract_sub_operands_with_seen(&def, depth + 1, seen);
                     seen.remove(&visit_key);
@@ -3173,7 +3185,7 @@ impl<'a> FoldingContext<'a> {
         if let Some(parsed) = self.parse_expr_from_name(name) {
             return parsed;
         }
-        CExpr::Var(name.to_string())
+        self.name_ref(name)
     }
 
     pub(super) fn parse_expr_from_name(&self, name: &str) -> Option<CExpr> {
@@ -3245,16 +3257,16 @@ impl<'a> FoldingContext<'a> {
             }
             CExpr::Deref(inner) => {
                 if let Some(stack_var) = self.simplify_stack_access(inner) {
-                    CExpr::Var(stack_var)
+                    self.name_ref(&stack_var)
                 } else {
                     expr.clone()
                 }
             }
             CExpr::Var(name) => {
-                if let Some(parsed) = self.parse_expr_from_name(name) {
+                if let Some(parsed) = self.parse_expr_from_name(&self.spelling(*name)) {
                     return parsed;
                 }
-                if !visited.insert(name.clone()) {
+                if !visited.insert(self.spelling(*name).to_string()) {
                     return CExpr::Var(name.clone());
                 }
                 let allow_stack_alias_fallback = |alias: &str| {
@@ -3266,60 +3278,60 @@ impl<'a> FoldingContext<'a> {
                         && !alias.starts_with("arg_")
                 };
                 let stack_alias_fallback = self
-                    .stack_slot_provenance_for_name(name)
+                    .stack_slot_provenance_for_name(&self.spelling(*name))
                     .filter(|slot| slot.offset < 0)
                     .and_then(|slot| {
                         self.resolve_stack_var(slot.offset).map(|stack_name| {
-                            (slot.is_scalar_predicate_carrier(), CExpr::Var(stack_name))
+                            (slot.is_scalar_predicate_carrier(), self.name_ref(&stack_name))
                         })
                     });
                 if let Some((false, CExpr::Var(alias))) = stack_alias_fallback.as_ref()
-                    && allow_stack_alias_fallback(alias)
+                    && allow_stack_alias_fallback(&self.spelling(*alias))
                 {
                     return CExpr::Var(alias.clone());
                 }
-                if let Some(owner) = self.predicate_owned_call_result_expr_for_name(name) {
+                if let Some(owner) = self.predicate_owned_call_result_expr_for_name(&self.spelling(*name)) {
                     return owner;
                 }
                 if self
-                    .call_result_source_for_ssa_name(name)
-                    .or_else(|| self.local_post_call_source_for_ssa_name(name))
+                    .call_result_source_for_ssa_name(&self.spelling(*name))
+                    .or_else(|| self.local_post_call_source_for_ssa_name(&self.spelling(*name)))
                     .is_some()
                 {
                     return CExpr::Var(name.clone());
                 }
-                if let Some(alias) = self.arg_alias_for_rendered_name(name) {
-                    return CExpr::Var(alias);
+                if let Some(alias) = self.arg_alias_for_rendered_name(&self.spelling(*name)) {
+                    return self.name_ref(&alias);
                 }
                 if let Some(prepared) = self.prepared_predicate_view() {
                     if let Some(inner) = prepared
-                        .predicate_expr_for_name(name)
+                        .predicate_expr_for_name(&self.spelling(*name))
                         .cloned()
                         .filter(|inner| inner != &CExpr::Var(name.clone()))
                     {
                         return self.resolve_predicate_expr_tree_with_visited(&inner, visited);
                     }
                     if let Some(inner) =
-                        prepared.owner_expr_for_name(name).cloned().filter(|inner| {
+                        prepared.owner_expr_for_name(&self.spelling(*name)).cloned().filter(|inner| {
                             inner != &CExpr::Var(name.clone()) && !matches!(inner, CExpr::AddrOf(_))
                         })
                     {
                         return self.resolve_predicate_expr_tree_with_visited(&inner, visited);
                     }
                 }
-                if let Some(inner) = self.lookup_predicate_expr(name)
+                if let Some(inner) = self.lookup_predicate_expr(&self.spelling(*name))
                     && inner != CExpr::Var(name.clone())
                 {
                     return self.resolve_predicate_operand(&inner, depth + 1, visited);
                 }
 
                 let resolved = self
-                    .lookup_predicate_expr(name)
-                    .or_else(|| self.lookup_definition(name))
-                    .or_else(|| self.formatted_defs_map().get(name).cloned())
+                    .lookup_predicate_expr(&self.spelling(*name))
+                    .or_else(|| self.lookup_definition(&self.spelling(*name)))
+                    .or_else(|| self.formatted_defs_map().get(&*self.spelling(*name)).cloned())
                     .map(|inner| {
                         if let Some(stack_var) = self.stack_alias_from_deref_expr(&inner) {
-                            CExpr::Var(stack_var)
+                            self.name_ref(&stack_var)
                         } else if matches!(inner, CExpr::Call { .. }) {
                             inner
                         } else if (self.is_predicate_like_expr(&inner)
@@ -3353,9 +3365,9 @@ impl<'a> FoldingContext<'a> {
                     })
                     .unwrap_or_else(|| CExpr::Var(name.clone()));
 
-                visited.remove(name);
+                visited.remove(&*self.spelling(*name));
                 if let Some((_, ref alias @ CExpr::Var(ref alias_name))) = stack_alias_fallback {
-                    if !allow_stack_alias_fallback(alias_name) {
+                    if !allow_stack_alias_fallback(&self.spelling(*alias_name)) {
                         return resolved;
                     }
                     if self.structured_predicate_candidate_should_win(alias, &resolved) {
@@ -3408,6 +3420,7 @@ impl<'a> FoldingContext<'a> {
     }
 
     pub(super) fn is_semantic_binding_name(name: &str) -> bool {
+
         let lower = name.to_ascii_lowercase();
         lower.starts_with("local_")
             || lower.starts_with("arg")
@@ -3449,7 +3462,7 @@ impl<'a> FoldingContext<'a> {
         let mut found = false;
         expr.visit(&mut |node| {
             if let CExpr::Var(name) = node
-                && self.is_opaque_temp_name(name)
+                && self.is_opaque_temp_name(&self.spelling(*name))
             {
                 found = true;
             }
@@ -3497,15 +3510,15 @@ impl<'a> FoldingContext<'a> {
                 self.is_sf_surrogate_inner(inner, visited, depth + 1)
             }
             CExpr::Var(name) => {
-                if !visited.insert(name.clone()) {
+                if !visited.insert(self.spelling(*name).to_string()) {
                     return false;
                 }
                 let resolved = self
-                    .lookup_definition(name)
-                    .or_else(|| self.formatted_defs_map().get(name).cloned())
+                    .lookup_definition(&self.spelling(*name))
+                    .or_else(|| self.formatted_defs_map().get(&*self.spelling(*name)).cloned())
                     .map(|inner| self.is_sf_surrogate_inner(&inner, visited, depth + 1))
                     .unwrap_or(false);
-                visited.remove(name);
+                visited.remove(&*self.spelling(*name));
                 resolved
             }
             _ => false,
@@ -3530,15 +3543,15 @@ impl<'a> FoldingContext<'a> {
                 self.is_sub_like_expr_inner(inner, visited, depth + 1)
             }
             CExpr::Var(name) => {
-                if !visited.insert(name.clone()) {
+                if !visited.insert(self.spelling(*name).to_string()) {
                     return false;
                 }
                 let resolved = self
-                    .lookup_definition(name)
-                    .or_else(|| self.formatted_defs_map().get(name).cloned())
+                    .lookup_definition(&self.spelling(*name))
+                    .or_else(|| self.formatted_defs_map().get(&*self.spelling(*name)).cloned())
                     .map(|inner| self.is_sub_like_expr_inner(&inner, visited, depth + 1))
                     .unwrap_or(false);
-                visited.remove(name);
+                visited.remove(&*self.spelling(*name));
                 resolved
             }
             _ => false,
@@ -3556,6 +3569,7 @@ impl<'a> FoldingContext<'a> {
 
     /// Look up the original comparison operands for a flag variable.
     pub(super) fn lookup_flag_origin(&self, flag_name: &str) -> Option<(String, String)> {
+
         if let Some(prov) = self.lookup_flag_compare_provenance(flag_name) {
             return Some((prov.lhs, prov.rhs));
         }
@@ -3582,6 +3596,7 @@ impl<'a> FoldingContext<'a> {
         &self,
         flag_name: &str,
     ) -> Option<FlagCompareProvenance> {
+
         let (flag_base, flag_version) = parse_flag_name(flag_name)?;
 
         let exact_matches =
@@ -3774,6 +3789,7 @@ fn parse_flag_name(name: &str) -> Option<(String, Option<String>)> {
 }
 
 fn is_specific_flag_name(name: &str, flag: &str) -> bool {
+
     let lower = name.to_ascii_lowercase();
     if flag_name_matches(&lower, flag) {
         return true;

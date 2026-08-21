@@ -58,18 +58,18 @@ pub(crate) struct LocalStructFieldAccessProfile {
 }
 
 #[allow(dead_code)]
-pub(crate) fn analyze(blocks: &[SSABlock], env: &PassEnv<'_>) -> UseInfo {
+pub(crate) fn analyze(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, blocks: &[SSABlock], env: &PassEnv<'_>) -> UseInfo {
     let execution = SsaExecutionControl::default();
     let control = DecompileWorkControl::new(&execution, DecompileWorkPhase::Structuring);
-    analyze_with_control(blocks, env, control).expect("default decompiler work control cannot stop")
+    analyze_with_control(symbols, blocks, env, control).expect("default decompiler work control cannot stop")
 }
 
-pub(crate) fn analyze_with_control(
+pub(crate) fn analyze_with_control(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
     blocks: &[SSABlock],
     env: &PassEnv<'_>,
     control: DecompileWorkControl<'_>,
 ) -> Result<UseInfo, DecompileExecutionStop> {
-    analyze_with_definition_overrides_mode(
+    analyze_with_definition_overrides_mode(symbols, 
         blocks,
         env,
         &HashMap::new(),
@@ -86,12 +86,12 @@ pub(crate) fn analyze_for_local_struct_accesses(blocks: &[SSABlock], env: &PassE
         .expect("default decompiler work control cannot stop")
 }
 
-pub(crate) fn analyze_for_local_struct_accesses_with_control(
+pub(crate) fn analyze_for_local_struct_accesses_with_control(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
     blocks: &[SSABlock],
     env: &PassEnv<'_>,
     control: DecompileWorkControl<'_>,
 ) -> Result<UseInfo, DecompileExecutionStop> {
-    analyze_with_definition_overrides_mode(
+    analyze_with_definition_overrides_mode(symbols, 
         blocks,
         env,
         &HashMap::new(),
@@ -101,24 +101,24 @@ pub(crate) fn analyze_for_local_struct_accesses_with_control(
 }
 
 #[allow(dead_code)]
-pub(crate) fn analyze_with_definition_overrides(
+pub(crate) fn analyze_with_definition_overrides(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
     blocks: &[SSABlock],
     env: &PassEnv<'_>,
     definition_overrides: &HashMap<String, CExpr>,
 ) -> UseInfo {
     let execution = SsaExecutionControl::default();
     let control = DecompileWorkControl::new(&execution, DecompileWorkPhase::Structuring);
-    analyze_with_definition_overrides_with_control(blocks, env, definition_overrides, control)
+    analyze_with_definition_overrides_with_control(symbols, blocks, env, definition_overrides, control)
         .expect("default decompiler work control cannot stop")
 }
 
-pub(crate) fn analyze_with_definition_overrides_with_control(
+pub(crate) fn analyze_with_definition_overrides_with_control(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
     blocks: &[SSABlock],
     env: &PassEnv<'_>,
     definition_overrides: &HashMap<String, CExpr>,
     control: DecompileWorkControl<'_>,
 ) -> Result<UseInfo, DecompileExecutionStop> {
-    analyze_with_definition_overrides_mode(
+    analyze_with_definition_overrides_mode(symbols, 
         blocks,
         env,
         definition_overrides,
@@ -127,7 +127,7 @@ pub(crate) fn analyze_with_definition_overrides_with_control(
     )
 }
 
-fn analyze_with_definition_overrides_mode(
+fn analyze_with_definition_overrides_mode(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
     blocks: &[SSABlock],
     env: &PassEnv<'_>,
     definition_overrides: &HashMap<String, CExpr>,
@@ -154,23 +154,23 @@ fn analyze_with_definition_overrides_mode(
     pin_loop_carried_phi_values(&mut scratch, blocks);
     for block in blocks {
         control.poll()?;
-        collect_definitions(&mut scratch, block, env, definition_overrides);
+        collect_definitions(symbols, &mut scratch, block, env, definition_overrides);
     }
-    refresh_semantic_values(&mut scratch, blocks, env);
-    populate_stable_stack_values(&mut scratch, blocks, env);
-    populate_frame_object_field_roots(&mut scratch, blocks, env);
-    populate_stable_memory_values(&mut scratch, blocks, env);
-    refresh_semantic_values(&mut scratch, blocks, env);
+    refresh_semantic_values(symbols, &mut scratch, blocks, env);
+    populate_stable_stack_values(symbols, &mut scratch, blocks, env);
+    populate_frame_object_field_roots(symbols, &mut scratch, blocks, env);
+    populate_stable_memory_values(symbols, &mut scratch, blocks, env);
+    refresh_semantic_values(symbols, &mut scratch, blocks, env);
     rebuild_definitions(&mut scratch, blocks, env, definition_overrides);
 
-    analyze_call_args(&mut scratch, blocks, env);
-    bind_single_use_call_result_definitions(&mut scratch, blocks, env);
-    propagate_call_result_aliases(&mut scratch.info, control)?;
-    rerun_semantic_call_analysis_after_result_binding(&mut scratch, blocks, env, control)?;
+    analyze_call_args(symbols, &mut scratch, blocks, env);
+    bind_single_use_call_result_definitions(symbols, &mut scratch, blocks, env);
+    propagate_call_result_aliases(symbols, &mut scratch.info, control)?;
+    rerun_semantic_call_analysis_after_result_binding(symbols, &mut scratch, blocks, env, control)?;
     if matches!(mode, UseInfoAnalysisMode::Full) {
         coalesce_variables(&mut scratch, blocks, env, control)?;
         pin_aliases_for_pinned_values(&mut scratch.info);
-        build_formatted_defs(&mut scratch, env);
+        build_formatted_defs(symbols, &mut scratch, env);
     }
     rebuild_id_mirrors_from_name_maps(&mut scratch.info);
     scratch.info.producers = scratch.producers.clone();
@@ -288,7 +288,7 @@ fn rebuild_id_mirrors_from_name_maps(info: &mut UseInfo) {
     }
 }
 
-fn rerun_semantic_call_analysis_after_result_binding(
+fn rerun_semantic_call_analysis_after_result_binding(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
     scratch: &mut UseScratch,
     blocks: &[SSABlock],
     env: &PassEnv<'_>,
@@ -297,13 +297,13 @@ fn rerun_semantic_call_analysis_after_result_binding(
     control.poll()?;
     scratch.info.call_args.clear();
     scratch.info.consumed_by_call.clear();
-    populate_stable_stack_values(scratch, blocks, env);
-    populate_frame_object_field_roots(scratch, blocks, env);
-    populate_stable_memory_values(scratch, blocks, env);
-    refresh_semantic_values(scratch, blocks, env);
-    analyze_call_args(scratch, blocks, env);
-    bind_single_use_call_result_definitions(scratch, blocks, env);
-    propagate_call_result_aliases(&mut scratch.info, control)?;
+    populate_stable_stack_values(symbols, scratch, blocks, env);
+    populate_frame_object_field_roots(symbols, scratch, blocks, env);
+    populate_stable_memory_values(symbols, scratch, blocks, env);
+    refresh_semantic_values(symbols, scratch, blocks, env);
+    analyze_call_args(symbols, scratch, blocks, env);
+    bind_single_use_call_result_definitions(symbols, scratch, blocks, env);
+    propagate_call_result_aliases(symbols, &mut scratch.info, control)?;
     Ok(())
 }
 
@@ -378,6 +378,7 @@ fn push_unique_casefold(names: &mut Vec<String>, name: String) {
 }
 
 fn lookup_type_hint<'a>(info: &'a UseInfo, env: &'a PassEnv<'_>, name: &str) -> Option<&'a CType> {
+
     let lower = name.to_ascii_lowercase();
     info.type_hints
         .get(name)
@@ -386,14 +387,14 @@ fn lookup_type_hint<'a>(info: &'a UseInfo, env: &'a PassEnv<'_>, name: &str) -> 
         .or_else(|| env.type_hints.get(&lower))
 }
 
-pub(crate) fn preserve_authoritative_facts(info: &mut UseInfo, baseline: &UseInfo) {
-    preserve_semantic_fact_map(&mut info.semantic_values, &baseline.semantic_values);
-    preserve_semantic_fact_map(
+pub(crate) fn preserve_authoritative_facts(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, info: &mut UseInfo, baseline: &UseInfo) {
+    preserve_semantic_fact_map(symbols, &mut info.semantic_values, &baseline.semantic_values);
+    preserve_semantic_fact_map(symbols, 
         &mut info.frame_object_field_roots,
         &baseline.frame_object_field_roots,
     );
-    preserve_semantic_fact_map(&mut info.stable_stack_values, &baseline.stable_stack_values);
-    preserve_semantic_fact_map(
+    preserve_semantic_fact_map(symbols, &mut info.stable_stack_values, &baseline.stable_stack_values);
+    preserve_semantic_fact_map(symbols, 
         &mut info.stable_memory_values,
         &baseline.stable_memory_values,
     );
@@ -401,8 +402,8 @@ pub(crate) fn preserve_authoritative_facts(info: &mut UseInfo, baseline: &UseInf
         let should_replace = match info.switch_selector_roots.get(key) {
             None => true,
             Some(existing) => {
-                switch_selector_candidate_score(info, value)
-                    > switch_selector_candidate_score(info, existing)
+                switch_selector_candidate_score(symbols, info, value)
+                    > switch_selector_candidate_score(symbols, info, existing)
             }
         };
         if should_replace {
@@ -414,8 +415,8 @@ pub(crate) fn preserve_authoritative_facts(info: &mut UseInfo, baseline: &UseInf
         let should_replace = match info.frame_slot_merges.get(key) {
             None => true,
             Some(current) => {
-                frame_slot_merge_preservation_score(summary)
-                    > frame_slot_merge_preservation_score(current)
+                frame_slot_merge_preservation_score(symbols, summary)
+                    > frame_slot_merge_preservation_score(symbols, current)
             }
         };
         if should_replace {
@@ -441,9 +442,9 @@ pub(crate) fn preserve_authoritative_facts(info: &mut UseInfo, baseline: &UseInf
         let should_replace = match info.call_args.get(key) {
             None => true,
             Some(current) => {
-                call_arg_vector_needs_authoritative_preservation(current)
-                    && call_arg_vector_preservation_score(args)
-                        > call_arg_vector_preservation_score(current)
+                call_arg_vector_needs_authoritative_preservation(symbols, current)
+                    && call_arg_vector_preservation_score(symbols, args)
+                        > call_arg_vector_preservation_score(symbols, current)
             }
         };
         if should_replace {
@@ -590,7 +591,7 @@ fn record_call_result_expr(info: &mut UseInfo, source_call: (u64, usize), expr: 
         .or_insert_with(|| expr.clone());
 }
 
-fn preserve_semantic_fact_map<K>(
+fn preserve_semantic_fact_map<K>(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
     current: &mut HashMap<K, SemanticValue>,
     baseline: &HashMap<K, SemanticValue>,
 ) where
@@ -606,8 +607,8 @@ fn preserve_semantic_fact_map<K>(
                 true
             }
             Some(existing) => {
-                semantic_value_preservation_score(value)
-                    > semantic_value_preservation_score(existing)
+                semantic_value_preservation_score(symbols, value)
+                    > semantic_value_preservation_score(symbols, existing)
             }
         };
         if should_replace {
@@ -616,24 +617,24 @@ fn preserve_semantic_fact_map<K>(
     }
 }
 
-fn frame_slot_merge_preservation_score(summary: &FrameSlotMergeSummary) -> i32 {
+fn frame_slot_merge_preservation_score(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, summary: &FrameSlotMergeSummary) -> i32 {
     40 + summary
         .incoming
         .values()
-        .map(semantic_value_preservation_score)
+        .map(|x| semantic_value_preservation_score(symbols, x))
         .sum::<i32>()
 }
 
-fn call_arg_vector_preservation_score(args: &[CallArgBinding]) -> i32 {
+fn call_arg_vector_preservation_score(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, args: &[CallArgBinding]) -> i32 {
     (args.len() as i32) * 20
         + args
             .iter()
             .enumerate()
-            .map(|(idx, arg)| call_arg_binding_preservation_score(arg) + (idx as i32 * 3))
+            .map(|(idx, arg)| call_arg_binding_preservation_score(symbols, arg) + (idx as i32 * 3))
             .sum::<i32>()
 }
 
-fn call_arg_vector_needs_authoritative_preservation(args: &[CallArgBinding]) -> bool {
+fn call_arg_vector_needs_authoritative_preservation(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, args: &[CallArgBinding]) -> bool {
     let imported_result_slot = matches!(
         args.first(),
         Some(CallArgBinding {
@@ -650,13 +651,13 @@ fn call_arg_vector_needs_authoritative_preservation(args: &[CallArgBinding]) -> 
             return true;
         }
 
-        if call_arg_binding_is_low_signal(binding) {
+        if call_arg_binding_is_low_signal(symbols, binding) {
             return true;
         }
 
         if !binding.is_result()
             && let Some(offset) =
-                call_arg_semantic_source_offset_for_binding(binding, 0, &mut HashSet::new())
+                call_arg_semantic_source_offset_for_binding(symbols, binding, 0, &mut HashSet::new())
             && offset < 0
             && !seen_negative_input_offsets.insert(offset)
         {
@@ -667,7 +668,7 @@ fn call_arg_vector_needs_authoritative_preservation(args: &[CallArgBinding]) -> 
     false
 }
 
-fn call_arg_binding_preservation_score(binding: &CallArgBinding) -> i32 {
+fn call_arg_binding_preservation_score(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, binding: &CallArgBinding) -> i32 {
     let role_score = match binding.role {
         CallArgRole::Input => 0,
         CallArgRole::Result => 120,
@@ -676,10 +677,10 @@ fn call_arg_binding_preservation_score(binding: &CallArgBinding) -> i32 {
         .stack_offset
         .map(|offset| if offset >= 0 { -20 } else { 20 })
         .unwrap_or(0);
-    let source_score = call_arg_semantic_source_offset_for_binding(binding, 0, &mut HashSet::new())
+    let source_score = call_arg_semantic_source_offset_for_binding(symbols, binding, 0, &mut HashSet::new())
         .map(|offset| if offset >= 0 { -60 } else { 140 })
         .unwrap_or(0);
-    let low_signal_penalty = if call_arg_binding_is_low_signal(binding) {
+    let low_signal_penalty = if call_arg_binding_is_low_signal(symbols, binding) {
         -180
     } else {
         0
@@ -688,60 +689,60 @@ fn call_arg_binding_preservation_score(binding: &CallArgBinding) -> i32 {
         + stack_score
         + source_score
         + low_signal_penalty
-        + semantic_call_arg_preservation_score(&binding.arg)
+        + semantic_call_arg_preservation_score(symbols, &binding.arg)
 }
 
-fn semantic_call_arg_preservation_score(arg: &SemanticCallArg) -> i32 {
+fn semantic_call_arg_preservation_score(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, arg: &SemanticCallArg) -> i32 {
     match arg {
         SemanticCallArg::StringAddr(_) => 450,
-        SemanticCallArg::Semantic(value) => 200 + semantic_value_preservation_score(value),
-        SemanticCallArg::FallbackExpr(expr) => call_arg_expr_preservation_score(expr, 0),
+        SemanticCallArg::Semantic(value) => 200 + semantic_value_preservation_score(symbols, value),
+        SemanticCallArg::FallbackExpr(expr) => call_arg_expr_preservation_score(symbols, expr, 0),
     }
 }
 
-fn call_arg_binding_is_low_signal(binding: &CallArgBinding) -> bool {
+fn call_arg_binding_is_low_signal(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, binding: &CallArgBinding) -> bool {
     match &binding.arg {
         SemanticCallArg::StringAddr(_) => false,
-        SemanticCallArg::Semantic(value) => semantic_value_is_low_signal(value),
-        SemanticCallArg::FallbackExpr(expr) => call_arg_expr_is_low_signal(expr, 0),
+        SemanticCallArg::Semantic(value) => semantic_value_is_low_signal(symbols, value),
+        SemanticCallArg::FallbackExpr(expr) => call_arg_expr_is_low_signal(symbols, expr, 0),
     }
 }
 
-fn semantic_value_is_low_signal(value: &SemanticValue) -> bool {
+fn semantic_value_is_low_signal(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, value: &SemanticValue) -> bool {
     match value {
         SemanticValue::Unknown => true,
-        SemanticValue::Scalar(ScalarValue::Expr(expr)) => call_arg_expr_is_low_signal(expr, 0),
+        SemanticValue::Scalar(ScalarValue::Expr(expr)) => call_arg_expr_is_low_signal(symbols, expr, 0),
         SemanticValue::Scalar(ScalarValue::Root(root)) => {
             let name = root.display_name();
             is_call_arg_placeholder_name(&name)
-                || is_call_arg_transient_name(&name)
+                || is_call_arg_transient_name(symbols, &name)
                 || is_generic_entry_arg_name(&name)
         }
         SemanticValue::Address(addr) | SemanticValue::Load { addr, .. } => {
-            normalized_addr_is_low_signal(addr)
+            normalized_addr_is_low_signal(symbols, addr)
         }
     }
 }
 
-fn normalized_addr_is_low_signal(addr: &NormalizedAddr) -> bool {
+fn normalized_addr_is_low_signal(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, addr: &NormalizedAddr) -> bool {
     let low_signal_name = |name: &str| {
         let lower = name.to_ascii_lowercase();
         is_call_arg_placeholder_name(&lower)
-            || is_call_arg_transient_name(&lower)
+            || is_call_arg_transient_name(symbols, &lower)
             || is_generic_entry_arg_name(&lower)
     };
 
     match &addr.base {
         BaseRef::Value(value) => low_signal_name(&value.display_name()),
-        BaseRef::Raw(CExpr::Var(name)) => low_signal_name(name),
+        BaseRef::Raw(CExpr::Var(name)) => low_signal_name(&crate::symbol::spelling(symbols, *name)),
         BaseRef::Raw(CExpr::Paren(inner)) | BaseRef::Raw(CExpr::Cast { expr: inner, .. }) => {
-            matches!(inner.as_ref(), CExpr::Var(name) if low_signal_name(name))
+            matches!(inner.as_ref(), CExpr::Var(name) if low_signal_name(&crate::symbol::spelling(symbols, *name)))
         }
         _ => false,
     }
 }
 
-fn call_arg_expr_is_low_signal(expr: &CExpr, depth: u32) -> bool {
+fn call_arg_expr_is_low_signal(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, expr: &CExpr, depth: u32) -> bool {
     if depth > 8 {
         return false;
     }
@@ -750,45 +751,45 @@ fn call_arg_expr_is_low_signal(expr: &CExpr, depth: u32) -> bool {
         // The names these tests look for are ones the renderer minted for a local.
         CExpr::External { .. } => false,
         CExpr::Var(name) => {
-            is_call_arg_placeholder_name(name)
-                || is_call_arg_transient_name(name)
-                || is_generic_entry_arg_name(name)
+            is_call_arg_placeholder_name(&crate::symbol::spelling(symbols, *name))
+                || is_call_arg_transient_name(symbols, &crate::symbol::spelling(symbols, *name))
+                || is_generic_entry_arg_name(&crate::symbol::spelling(symbols, *name))
         }
         CExpr::Paren(inner)
         | CExpr::Cast { expr: inner, .. }
         | CExpr::AddrOf(inner)
         | CExpr::Deref(inner)
-        | CExpr::Sizeof(inner) => call_arg_expr_is_low_signal(inner, depth + 1),
-        CExpr::Unary { operand, .. } => call_arg_expr_is_low_signal(operand, depth + 1),
+        | CExpr::Sizeof(inner) => call_arg_expr_is_low_signal(symbols, inner, depth + 1),
+        CExpr::Unary { operand, .. } => call_arg_expr_is_low_signal(symbols, operand, depth + 1),
         CExpr::Binary { left, right, .. } => {
-            call_arg_expr_is_low_signal(left, depth + 1)
-                || call_arg_expr_is_low_signal(right, depth + 1)
+            call_arg_expr_is_low_signal(symbols, left, depth + 1)
+                || call_arg_expr_is_low_signal(symbols, right, depth + 1)
         }
         CExpr::Subscript { base, index } => {
-            call_arg_expr_is_low_signal(base, depth + 1)
-                || call_arg_expr_is_low_signal(index, depth + 1)
+            call_arg_expr_is_low_signal(symbols, base, depth + 1)
+                || call_arg_expr_is_low_signal(symbols, index, depth + 1)
         }
         CExpr::Member { base, .. } | CExpr::PtrMember { base, .. } => {
-            call_arg_expr_is_low_signal(base, depth + 1)
+            call_arg_expr_is_low_signal(symbols, base, depth + 1)
         }
         CExpr::Call { func, args } => {
-            call_arg_expr_is_low_signal(func, depth + 1)
+            call_arg_expr_is_low_signal(symbols, func, depth + 1)
                 || args
                     .iter()
-                    .any(|arg| call_arg_expr_is_low_signal(arg, depth + 1))
+                    .any(|arg| call_arg_expr_is_low_signal(symbols, arg, depth + 1))
         }
         CExpr::Ternary {
             cond,
             then_expr,
             else_expr,
         } => {
-            call_arg_expr_is_low_signal(cond, depth + 1)
-                || call_arg_expr_is_low_signal(then_expr, depth + 1)
-                || call_arg_expr_is_low_signal(else_expr, depth + 1)
+            call_arg_expr_is_low_signal(symbols, cond, depth + 1)
+                || call_arg_expr_is_low_signal(symbols, then_expr, depth + 1)
+                || call_arg_expr_is_low_signal(symbols, else_expr, depth + 1)
         }
         CExpr::Comma(items) => items
             .iter()
-            .any(|item| call_arg_expr_is_low_signal(item, depth + 1)),
+            .any(|item| call_arg_expr_is_low_signal(symbols, item, depth + 1)),
         CExpr::IntLit(_)
         | CExpr::UIntLit(_)
         | CExpr::FloatLit(_)
@@ -799,6 +800,7 @@ fn call_arg_expr_is_low_signal(expr: &CExpr, depth: u32) -> bool {
 }
 
 fn is_generic_entry_arg_name(name: &str) -> bool {
+
     name.eq_ignore_ascii_case("argc")
         || name.eq_ignore_ascii_case("argv")
         || name.eq_ignore_ascii_case("envp")
@@ -807,7 +809,7 @@ fn is_generic_entry_arg_name(name: &str) -> bool {
         })
 }
 
-fn call_arg_semantic_source_offset_for_binding(
+fn call_arg_semantic_source_offset_for_binding(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
     binding: &CallArgBinding,
     depth: u32,
     visited: &mut HashSet<String>,
@@ -826,25 +828,25 @@ fn call_arg_semantic_source_offset_for_binding(
             normalized_stack_slot_offset(addr)
         }
         SemanticCallArg::Semantic(SemanticValue::Scalar(ScalarValue::Root(root))) => {
-            call_arg_semantic_source_offset_for_binding(
-                &CallArgBinding::input(SemanticCallArg::FallbackExpr(CExpr::Var(
-                    root.display_name(),
-                ))),
+            call_arg_semantic_source_offset_for_binding(symbols, 
+                &CallArgBinding::input(SemanticCallArg::FallbackExpr(
+                    crate::symbol::var_ref(symbols, root.display_name()),
+                )),
                 depth + 1,
                 visited,
             )
         }
         SemanticCallArg::FallbackExpr(CExpr::Var(name)) => {
-            if !visited.insert(name.clone()) {
+            if !visited.insert(crate::symbol::spelling(symbols, *name).to_string()) {
                 return None;
             }
-            let offset = parse_negative_local_name(name);
-            visited.remove(name);
+            let offset = parse_negative_local_name(&crate::symbol::spelling(symbols, *name));
+            visited.remove(&*crate::symbol::spelling(symbols, *name));
             offset
         }
         SemanticCallArg::FallbackExpr(CExpr::Paren(inner))
         | SemanticCallArg::FallbackExpr(CExpr::Cast { expr: inner, .. }) => {
-            call_arg_semantic_source_offset_for_binding(
+            call_arg_semantic_source_offset_for_binding(symbols, 
                 &CallArgBinding::input(SemanticCallArg::FallbackExpr((**inner).clone())),
                 depth + 1,
                 visited,
@@ -855,30 +857,31 @@ fn call_arg_semantic_source_offset_for_binding(
 }
 
 fn parse_negative_local_name(name: &str) -> Option<i64> {
+
     name.strip_prefix("local_")
         .and_then(|suffix| i64::from_str_radix(suffix, 16).ok())
         .map(|offset| -offset)
 }
 
-fn semantic_value_preservation_score(value: &SemanticValue) -> i32 {
+fn semantic_value_preservation_score(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, value: &SemanticValue) -> i32 {
     match value {
         SemanticValue::Unknown => 0,
         SemanticValue::Scalar(ScalarValue::Expr(expr)) => {
-            40 + call_arg_expr_preservation_score(expr, 0)
+            40 + call_arg_expr_preservation_score(symbols, expr, 0)
         }
         SemanticValue::Scalar(ScalarValue::Root(root)) => {
             let mut score = 80;
             if root.var.version == 0 {
                 score += 40;
             }
-            score + call_arg_expr_preservation_score(&CExpr::Var(root.display_name()), 0)
+            score + call_arg_expr_preservation_score(symbols, &crate::symbol::var_ref(symbols, root.display_name()), 0)
         }
         SemanticValue::Address(addr) => 220 + normalized_addr_rank(addr),
         SemanticValue::Load { addr, .. } => 260 + normalized_addr_rank(addr),
     }
 }
 
-fn call_arg_expr_preservation_score(expr: &CExpr, depth: u32) -> i32 {
+fn call_arg_expr_preservation_score(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, expr: &CExpr, depth: u32) -> i32 {
     if depth > 8 {
         return 0;
     }
@@ -888,15 +891,15 @@ fn call_arg_expr_preservation_score(expr: &CExpr, depth: u32) -> i32 {
         CExpr::IntLit(_) | CExpr::UIntLit(_) | CExpr::FloatLit(_) | CExpr::CharLit(_) => 80,
         CExpr::External { .. } => 80,
         CExpr::Var(name) => {
-            if is_call_arg_placeholder_name(name) {
+            if is_call_arg_placeholder_name(&crate::symbol::spelling(symbols, *name)) {
                 -120
-            } else if is_call_arg_transient_name(name) {
+            } else if is_call_arg_transient_name(symbols, &crate::symbol::spelling(symbols, *name)) {
                 -60
-            } else if is_symbol_or_object_name(name)
-                || name.eq_ignore_ascii_case("argc")
-                || name.eq_ignore_ascii_case("argv")
-                || name.eq_ignore_ascii_case("envp")
-                || name.starts_with("arg")
+            } else if is_symbol_or_object_name(&crate::symbol::spelling(symbols, *name))
+                || crate::symbol::spelling(symbols, *name).eq_ignore_ascii_case("argc")
+                || crate::symbol::spelling(symbols, *name).eq_ignore_ascii_case("argv")
+                || crate::symbol::spelling(symbols, *name).eq_ignore_ascii_case("envp")
+                || crate::symbol::spelling(symbols, *name).starts_with("arg")
             {
                 180
             } else {
@@ -904,27 +907,27 @@ fn call_arg_expr_preservation_score(expr: &CExpr, depth: u32) -> i32 {
             }
         }
         CExpr::Subscript { base, index } => {
-            220 + call_arg_expr_preservation_score(base, depth + 1)
-                + call_arg_expr_preservation_score(index, depth + 1)
+            220 + call_arg_expr_preservation_score(symbols, base, depth + 1)
+                + call_arg_expr_preservation_score(symbols, index, depth + 1)
         }
         CExpr::Member { base, .. } | CExpr::PtrMember { base, .. } => {
-            200 + call_arg_expr_preservation_score(base, depth + 1)
+            200 + call_arg_expr_preservation_score(symbols, base, depth + 1)
         }
-        CExpr::Deref(inner) => 120 + call_arg_expr_preservation_score(inner, depth + 1),
-        CExpr::AddrOf(inner) => 100 + call_arg_expr_preservation_score(inner, depth + 1),
+        CExpr::Deref(inner) => 120 + call_arg_expr_preservation_score(symbols, inner, depth + 1),
+        CExpr::AddrOf(inner) => 100 + call_arg_expr_preservation_score(symbols, inner, depth + 1),
         CExpr::Paren(inner) | CExpr::Cast { expr: inner, .. } | CExpr::Sizeof(inner) => {
-            call_arg_expr_preservation_score(inner, depth + 1)
+            call_arg_expr_preservation_score(symbols, inner, depth + 1)
         }
-        CExpr::Unary { operand, .. } => 50 + call_arg_expr_preservation_score(operand, depth + 1),
+        CExpr::Unary { operand, .. } => 50 + call_arg_expr_preservation_score(symbols, operand, depth + 1),
         CExpr::Binary { left, right, .. } => {
-            90 + call_arg_expr_preservation_score(left, depth + 1)
-                + call_arg_expr_preservation_score(right, depth + 1)
+            90 + call_arg_expr_preservation_score(symbols, left, depth + 1)
+                + call_arg_expr_preservation_score(symbols, right, depth + 1)
         }
         CExpr::Call { func, args } => {
-            30 + call_arg_expr_preservation_score(func, depth + 1)
+            30 + call_arg_expr_preservation_score(symbols, func, depth + 1)
                 + args
                     .iter()
-                    .map(|arg| call_arg_expr_preservation_score(arg, depth + 1))
+                    .map(|arg| call_arg_expr_preservation_score(symbols, arg, depth + 1))
                     .sum::<i32>()
         }
         CExpr::Ternary {
@@ -932,19 +935,19 @@ fn call_arg_expr_preservation_score(expr: &CExpr, depth: u32) -> i32 {
             then_expr,
             else_expr,
         } => {
-            20 + call_arg_expr_preservation_score(cond, depth + 1)
-                + call_arg_expr_preservation_score(then_expr, depth + 1)
-                + call_arg_expr_preservation_score(else_expr, depth + 1)
+            20 + call_arg_expr_preservation_score(symbols, cond, depth + 1)
+                + call_arg_expr_preservation_score(symbols, then_expr, depth + 1)
+                + call_arg_expr_preservation_score(symbols, else_expr, depth + 1)
         }
         CExpr::Comma(items) => items
             .iter()
-            .map(|item| call_arg_expr_preservation_score(item, depth + 1))
+            .map(|item| call_arg_expr_preservation_score(symbols, item, depth + 1))
             .sum(),
         CExpr::SizeofType(_) => 0,
     }
 }
 
-fn populate_stable_stack_values(scratch: &mut UseScratch, blocks: &[SSABlock], env: &PassEnv<'_>) {
+fn populate_stable_stack_values(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, scratch: &mut UseScratch, blocks: &[SSABlock], env: &PassEnv<'_>) {
     scratch.info.stable_stack_values.clear();
     let Some(entry) = blocks.first() else {
         return;
@@ -962,13 +965,13 @@ fn populate_stable_stack_values(scratch: &mut UseScratch, blocks: &[SSABlock], e
         else {
             continue;
         };
-        let Some(offset) = stack_slot_offset_for_addr(&scratch.info, addr, env).or_else(|| {
-            semantic_addr_for_var(&scratch.info, addr, env)
+        let Some(offset) = stack_slot_offset_for_addr(symbols, &scratch.info, addr, env).or_else(|| {
+            semantic_addr_for_var(symbols, &scratch.info, addr, env)
                 .and_then(|shape| normalized_stack_slot_offset(&shape))
         }) else {
             continue;
         };
-        let Some(value) = semantic_stack_store_value(&scratch.info, val, env) else {
+        let Some(value) = semantic_stack_store_value(symbols, &scratch.info, val, env) else {
             conflicts.insert(offset);
             candidates.remove(&offset);
             continue;
@@ -999,8 +1002,8 @@ fn populate_stable_stack_values(scratch: &mut UseScratch, blocks: &[SSABlock], e
             else {
                 continue;
             };
-            let Some(offset) = stack_slot_offset_for_addr(&scratch.info, addr, env).or_else(|| {
-                semantic_addr_for_var(&scratch.info, addr, env)
+            let Some(offset) = stack_slot_offset_for_addr(symbols, &scratch.info, addr, env).or_else(|| {
+                semantic_addr_for_var(symbols, &scratch.info, addr, env)
                     .and_then(|shape| normalized_stack_slot_offset(&shape))
             }) else {
                 continue;
@@ -1008,7 +1011,7 @@ fn populate_stable_stack_values(scratch: &mut UseScratch, blocks: &[SSABlock], e
             let Some(expected) = candidates.get(&offset).cloned() else {
                 continue;
             };
-            let actual = semantic_stack_store_value(&scratch.info, val, env);
+            let actual = semantic_stack_store_value(symbols, &scratch.info, val, env);
             if actual.as_ref() != Some(&expected) {
                 conflicts.insert(offset);
             }
@@ -1021,7 +1024,7 @@ fn populate_stable_stack_values(scratch: &mut UseScratch, blocks: &[SSABlock], e
         .collect();
 }
 
-fn populate_frame_object_field_roots(
+fn populate_frame_object_field_roots(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
     scratch: &mut UseScratch,
     blocks: &[SSABlock],
     env: &PassEnv<'_>,
@@ -1043,13 +1046,13 @@ fn populate_frame_object_field_roots(
         else {
             continue;
         };
-        let Some(shape) = semantic_addr_for_var(&scratch.info, addr, env) else {
+        let Some(shape) = semantic_addr_for_var(symbols, &scratch.info, addr, env) else {
             continue;
         };
-        let Some(key) = frame_object_field_key(&scratch.info, &shape, env, 0) else {
+        let Some(key) = frame_object_field_key(symbols, &scratch.info, &shape, env, 0) else {
             continue;
         };
-        let Some(value) = semantic_stack_store_value(&scratch.info, val, env) else {
+        let Some(value) = semantic_stack_store_value(symbols, &scratch.info, val, env) else {
             conflicts.insert(key);
             candidates.remove(&key);
             continue;
@@ -1074,7 +1077,7 @@ fn populate_frame_object_field_roots(
     // through the frame object can canonicalize back to the same semantic root
     // instead of looking like unrelated temporaries and conflicting.
     scratch.info.frame_object_field_roots = candidates.clone();
-    refresh_semantic_values(scratch, blocks, env);
+    refresh_semantic_values(symbols, scratch, blocks, env);
 
     for block in blocks {
         for op in &block.ops {
@@ -1086,16 +1089,16 @@ fn populate_frame_object_field_roots(
             else {
                 continue;
             };
-            let Some(shape) = semantic_addr_for_var(&scratch.info, addr, env) else {
+            let Some(shape) = semantic_addr_for_var(symbols, &scratch.info, addr, env) else {
                 continue;
             };
-            let Some(key) = frame_object_field_key(&scratch.info, &shape, env, 0) else {
+            let Some(key) = frame_object_field_key(symbols, &scratch.info, &shape, env, 0) else {
                 continue;
             };
             let Some(expected) = candidates.get(&key).cloned() else {
                 continue;
             };
-            let actual = semantic_stack_store_value(&scratch.info, val, env);
+            let actual = semantic_stack_store_value(symbols, &scratch.info, val, env);
             if actual.as_ref() != Some(&expected) {
                 conflicts.insert(key);
             }
@@ -1106,7 +1109,7 @@ fn populate_frame_object_field_roots(
         .into_iter()
         .filter(|(key, _)| !conflicts.contains(key))
         .collect();
-    refresh_semantic_values(scratch, blocks, env);
+    refresh_semantic_values(symbols, scratch, blocks, env);
 }
 
 fn canonical_value_ref_key(
@@ -1192,7 +1195,7 @@ fn stable_memory_map_key(key: &MemoryStateKey) -> String {
     format!("{space}|{}", key.normalized_addr)
 }
 
-fn frame_object_field_key(
+fn frame_object_field_key(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
     info: &UseInfo,
     addr: &NormalizedAddr,
     env: &PassEnv<'_>,
@@ -1210,8 +1213,8 @@ fn frame_object_field_key(
             })
         }
         BaseRef::Value(value_ref) => {
-            let base_addr = semantic_addr_for_var(info, &value_ref.var, env)?;
-            let mut key = frame_object_field_key(info, &base_addr, env, depth + 1)?;
+            let base_addr = semantic_addr_for_var(symbols, info, &value_ref.var, env)?;
+            let mut key = frame_object_field_key(symbols, info, &base_addr, env, depth + 1)?;
             key.field_offset += addr.offset_bytes;
             Some(key)
         }
@@ -1220,7 +1223,7 @@ fn frame_object_field_key(
     }
 }
 
-fn populate_stable_memory_values(scratch: &mut UseScratch, blocks: &[SSABlock], env: &PassEnv<'_>) {
+fn populate_stable_memory_values(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, scratch: &mut UseScratch, blocks: &[SSABlock], env: &PassEnv<'_>) {
     scratch.info.stable_memory_values.clear();
     let Some(entry) = blocks.first() else {
         return;
@@ -1233,7 +1236,7 @@ fn populate_stable_memory_values(scratch: &mut UseScratch, blocks: &[SSABlock], 
         let SSAOp::Store { space, addr, val } = op else {
             continue;
         };
-        let Some(shape) = semantic_addr_for_var(&scratch.info, addr, env) else {
+        let Some(shape) = semantic_addr_for_var(symbols, &scratch.info, addr, env) else {
             continue;
         };
         if normalized_stack_slot_offset(&shape).is_some() || !is_authoritative_addr(&shape) {
@@ -1242,7 +1245,7 @@ fn populate_stable_memory_values(scratch: &mut UseScratch, blocks: &[SSABlock], 
         let Some(key) = normalized_memory_key(&scratch.info, *space, &shape, env) else {
             continue;
         };
-        let Some(value) = semantic_stack_store_value(&scratch.info, val, env) else {
+        let Some(value) = semantic_stack_store_value(symbols, &scratch.info, val, env) else {
             conflicts.insert(key.clone());
             candidates.remove(&key);
             continue;
@@ -1268,7 +1271,7 @@ fn populate_stable_memory_values(scratch: &mut UseScratch, blocks: &[SSABlock], 
             let SSAOp::Store { space, addr, val } = op else {
                 continue;
             };
-            let Some(shape) = semantic_addr_for_var(&scratch.info, addr, env) else {
+            let Some(shape) = semantic_addr_for_var(symbols, &scratch.info, addr, env) else {
                 continue;
             };
             if normalized_stack_slot_offset(&shape).is_some() {
@@ -1280,7 +1283,7 @@ fn populate_stable_memory_values(scratch: &mut UseScratch, blocks: &[SSABlock], 
             let Some(expected) = candidates.get(&key).cloned() else {
                 continue;
             };
-            let actual = semantic_stack_store_value(&scratch.info, val, env);
+            let actual = semantic_stack_store_value(symbols, &scratch.info, val, env);
             if actual.as_ref() != Some(&expected) {
                 conflicts.insert(key);
             }
@@ -1294,11 +1297,11 @@ fn populate_stable_memory_values(scratch: &mut UseScratch, blocks: &[SSABlock], 
         .collect();
 }
 
-fn refresh_semantic_values(scratch: &mut UseScratch, blocks: &[SSABlock], env: &PassEnv<'_>) {
+fn refresh_semantic_values(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, scratch: &mut UseScratch, blocks: &[SSABlock], env: &PassEnv<'_>) {
     let mut cache = SemanticTypeHintCache::from_info(&scratch.info);
     for block in blocks {
         for phi in &block.phis {
-            collect_semantic_values_with_cache(
+            collect_semantic_values_with_cache(symbols, 
                 scratch,
                 &SSAOp::Phi {
                     dst: phi.dst.clone(),
@@ -1309,12 +1312,12 @@ fn refresh_semantic_values(scratch: &mut UseScratch, blocks: &[SSABlock], env: &
             );
         }
         for op in &block.ops {
-            collect_semantic_values_with_cache(scratch, op, env, &mut cache);
+            collect_semantic_values_with_cache(symbols, scratch, op, env, &mut cache);
         }
     }
 }
 
-pub(crate) fn populate_frame_slot_merges(
+pub(crate) fn populate_frame_slot_merges(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
     info: &mut UseInfo,
     func: &SSAFunction,
     env: &PassEnv<'_>,
@@ -1340,7 +1343,7 @@ pub(crate) fn populate_frame_slot_merges(
             let prepared_offset =
                 prepared.and_then(|prepared| prepared_stack_offset_for_var(prepared, addr));
             let Some(slot_offset) = prepared_offset.or_else(|| {
-                utils::extract_stack_offset_from_var(
+                utils::extract_stack_offset_from_var(symbols, 
                     addr,
                     &info.definitions,
                     env.fp_name,
@@ -1358,7 +1361,7 @@ pub(crate) fn populate_frame_slot_merges(
                     break;
                 };
                 let Some(value) =
-                    merged_slot_store_value_for_pred(info, pred_block, slot_offset, env, prepared)
+                    merged_slot_store_value_for_pred(symbols, info, pred_block, slot_offset, env, prepared)
                 else {
                     complete = false;
                     break;
@@ -1394,7 +1397,7 @@ fn prepared_stack_offset_for_var(prepared: &SsaArtifact, var: &SSAVar) -> Option
     }
 }
 
-pub(crate) fn annotate_stack_slot_semantics(
+pub(crate) fn annotate_stack_slot_semantics(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
     info: &mut UseInfo,
     func: &SSAFunction,
     return_slots: &HashSet<i64>,
@@ -1421,7 +1424,7 @@ pub(crate) fn annotate_stack_slot_semantics(
                 offset: *slot_offset,
                 predicate_carrier: false,
                 return_carrier: true,
-                value_kind: stack_slot_value_kind_from_return_slot_stores(
+                value_kind: stack_slot_value_kind_from_return_slot_stores(symbols, 
                     info,
                     func,
                     *slot_offset,
@@ -1449,7 +1452,7 @@ pub(crate) fn annotate_stack_slot_semantics(
                 continue;
             };
             let Some(predicate_slot) =
-                predicate_carrier_slot_for_branch(info, block, idx, cond, env, 0)
+                predicate_carrier_slot_for_branch(symbols, info, block, idx, cond, env, 0)
             else {
                 continue;
             };
@@ -1473,7 +1476,7 @@ pub(crate) fn annotate_stack_slot_semantics(
     }
 }
 
-pub(crate) fn populate_switch_selector_roots(
+pub(crate) fn populate_switch_selector_roots(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
     info: &mut UseInfo,
     func: &SSAFunction,
     env: &PassEnv<'_>,
@@ -1484,14 +1487,14 @@ pub(crate) fn populate_switch_selector_roots(
         if func.successors(block.addr).len() < 3 {
             continue;
         }
-        let Some(candidate) = switch_selector_value_for_block(info, func, block, env) else {
+        let Some(candidate) = switch_selector_value_for_block(symbols, info, func, block, env) else {
             continue;
         };
         info.switch_selector_roots.insert(block.addr, candidate);
     }
 }
 
-fn switch_selector_value_for_block(
+fn switch_selector_value_for_block(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
     info: &UseInfo,
     func: &SSAFunction,
     block: &SSABlock,
@@ -1512,17 +1515,17 @@ fn switch_selector_value_for_block(
                 dst,
                 space: SpaceId::Ram,
                 addr,
-            } => switch_selector_value_for_load(info, &load_ctx, idx, dst, addr),
+            } => switch_selector_value_for_load(symbols, info, &load_ctx, idx, dst, addr),
             SSAOp::Copy { dst, src }
             | SSAOp::IntZExt { dst, src }
             | SSAOp::IntSExt { dst, src }
             | SSAOp::Trunc { dst, src }
             | SSAOp::Cast { dst, src }
-            | SSAOp::Subpiece { dst, src, .. } => switch_selector_value_for_var(info, dst, env)
-                .or_else(|| switch_selector_value_for_var(info, src, env)),
+            | SSAOp::Subpiece { dst, src, .. } => switch_selector_value_for_var(symbols, info, dst, env)
+                .or_else(|| switch_selector_value_for_var(symbols, info, src, env)),
             _ => None,
         };
-        best = preferred_switch_selector_value(info, best, candidate);
+        best = preferred_switch_selector_value(symbols, info, best, candidate);
     }
 
     best
@@ -1584,7 +1587,7 @@ fn stack_slot_value_kind_from_semantic_value(value: &SemanticValue) -> StackSlot
     }
 }
 
-fn predicate_carrier_slot_for_branch(
+fn predicate_carrier_slot_for_branch(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
     info: &UseInfo,
     block: &SSABlock,
     branch_idx: usize,
@@ -1606,11 +1609,11 @@ fn predicate_carrier_slot_for_branch(
             | SSAOp::IntSExt { src, .. }
             | SSAOp::Subpiece { src, .. }
             | SSAOp::BoolNot { src, .. } => {
-                predicate_carrier_slot_for_branch(info, block, idx, src, env, depth + 1)
+                predicate_carrier_slot_for_branch(symbols, info, block, idx, src, env, depth + 1)
             }
             SSAOp::IntSub { a, b, .. } if var_is_zero_constant(a) || var_is_zero_constant(b) => {
                 let passthrough = if var_is_zero_constant(a) { b } else { a };
-                predicate_carrier_slot_for_branch(info, block, idx, passthrough, env, depth + 1)
+                predicate_carrier_slot_for_branch(symbols, info, block, idx, passthrough, env, depth + 1)
             }
             SSAOp::IntEqual { a, b, .. }
             | SSAOp::IntNotEqual { a, b, .. }
@@ -1618,7 +1621,7 @@ fn predicate_carrier_slot_for_branch(
             | SSAOp::IntSLess { a, b, .. }
             | SSAOp::IntLessEqual { a, b, .. }
             | SSAOp::IntSLessEqual { a, b, .. } => {
-                compare_zero_predicate_carrier_slot_for_operands(
+                compare_zero_predicate_carrier_slot_for_operands(symbols, 
                     info,
                     block,
                     idx,
@@ -1632,7 +1635,7 @@ fn predicate_carrier_slot_for_branch(
                 dst,
                 space: SpaceId::Ram,
                 addr,
-            } => predicate_carrier_slot_for_load(info, block, idx, dst, addr, env, depth + 1),
+            } => predicate_carrier_slot_for_load(symbols, info, block, idx, dst, addr, env, depth + 1),
             _ => None,
         };
     }
@@ -1640,7 +1643,7 @@ fn predicate_carrier_slot_for_branch(
     None
 }
 
-fn compare_zero_predicate_carrier_slot_for_operands(
+fn compare_zero_predicate_carrier_slot_for_operands(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
     info: &UseInfo,
     block: &SSABlock,
     before_idx: usize,
@@ -1656,10 +1659,10 @@ fn compare_zero_predicate_carrier_slot_for_operands(
     }
 
     let candidate = if a_zero { b } else { a };
-    predicate_carrier_slot_for_branch(info, block, before_idx, candidate, env, depth + 1)
+    predicate_carrier_slot_for_branch(symbols, info, block, before_idx, candidate, env, depth + 1)
 }
 
-fn predicate_carrier_slot_for_load(
+fn predicate_carrier_slot_for_load(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
     info: &UseInfo,
     block: &SSABlock,
     load_idx: usize,
@@ -1672,7 +1675,7 @@ fn predicate_carrier_slot_for_load(
         return None;
     }
 
-    let offset = stack_slot_offset_for_addr(info, addr, env)?;
+    let offset = stack_slot_offset_for_addr(symbols, info, addr, env)?;
     for (store_idx, op) in block.ops[..load_idx].iter().enumerate().rev() {
         let SSAOp::Store {
             space: SpaceId::Ram,
@@ -1682,13 +1685,13 @@ fn predicate_carrier_slot_for_load(
         else {
             continue;
         };
-        let Some(store_offset) = stack_slot_offset_for_addr(info, store_addr, env) else {
+        let Some(store_offset) = stack_slot_offset_for_addr(symbols, info, store_addr, env) else {
             continue;
         };
         if store_offset != offset {
             continue;
         }
-        if block_value_is_scalar_or_predicate(info, block, store_idx, val, env, depth + 1) {
+        if block_value_is_scalar_or_predicate(symbols, info, block, store_idx, val, env, depth + 1) {
             return Some(PredicateCarrierSlotMatch {
                 offset,
                 load_name: dst.display_name(),
@@ -1699,7 +1702,7 @@ fn predicate_carrier_slot_for_load(
     None
 }
 
-fn block_value_is_scalar_or_predicate(
+fn block_value_is_scalar_or_predicate(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
     info: &UseInfo,
     block: &SSABlock,
     before_idx: usize,
@@ -1715,7 +1718,7 @@ fn block_value_is_scalar_or_predicate(
         return true;
     }
 
-    if semantic_source_value_for_var(info, var).is_some_and(|value| {
+    if semantic_source_value_for_var(symbols, info, var).is_some_and(|value| {
         stack_slot_value_kind_from_semantic_value(&value) == StackSlotValueKind::Scalar
     }) {
         return true;
@@ -1735,7 +1738,7 @@ fn block_value_is_scalar_or_predicate(
             | SSAOp::IntSExt { src, .. }
             | SSAOp::Subpiece { src, .. }
             | SSAOp::BoolNot { src, .. } => {
-                block_value_is_scalar_or_predicate(info, block, idx, src, env, depth + 1)
+                block_value_is_scalar_or_predicate(symbols, info, block, idx, src, env, depth + 1)
             }
             SSAOp::IntEqual { .. }
             | SSAOp::IntNotEqual { .. }
@@ -1745,21 +1748,21 @@ fn block_value_is_scalar_or_predicate(
             | SSAOp::IntSLessEqual { .. } => true,
             SSAOp::IntSub { a, b, .. } if var_is_zero_constant(a) || var_is_zero_constant(b) => {
                 let passthrough = if var_is_zero_constant(a) { b } else { a };
-                block_value_is_scalar_or_predicate(info, block, idx, passthrough, env, depth + 1)
+                block_value_is_scalar_or_predicate(symbols, info, block, idx, passthrough, env, depth + 1)
             }
             SSAOp::IntAnd { a, b, .. }
             | SSAOp::IntOr { a, b, .. }
             | SSAOp::IntXor { a, b, .. }
             | SSAOp::BoolAnd { a, b, .. }
             | SSAOp::BoolOr { a, b, .. } => {
-                block_value_is_scalar_or_predicate(info, block, idx, a, env, depth + 1)
-                    && block_value_is_scalar_or_predicate(info, block, idx, b, env, depth + 1)
+                block_value_is_scalar_or_predicate(symbols, info, block, idx, a, env, depth + 1)
+                    && block_value_is_scalar_or_predicate(symbols, info, block, idx, b, env, depth + 1)
             }
             SSAOp::Load {
                 dst,
                 space: SpaceId::Ram,
                 addr,
-            } => predicate_carrier_slot_for_load(info, block, idx, dst, addr, env, depth + 1)
+            } => predicate_carrier_slot_for_load(symbols, info, block, idx, dst, addr, env, depth + 1)
                 .is_some(),
             _ => false,
         };
@@ -1772,7 +1775,7 @@ fn var_is_zero_constant(var: &SSAVar) -> bool {
     utils::parse_const_value(&var.name).is_some_and(|value| value == 0)
 }
 
-fn stack_slot_value_kind_from_return_slot_stores(
+fn stack_slot_value_kind_from_return_slot_stores(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
     info: &UseInfo,
     func: &SSAFunction,
     slot_offset: i64,
@@ -1786,7 +1789,7 @@ fn stack_slot_value_kind_from_return_slot_stores(
             .any(|op| matches!(op, SSAOp::Return { .. }))
     }) {
         if let Some(kind) =
-            stack_slot_value_kind_from_return_exit(info, func, exit_block, slot_offset, env)
+            stack_slot_value_kind_from_return_exit(symbols, info, func, exit_block, slot_offset, env)
         {
             kinds.push(kind);
         }
@@ -1805,7 +1808,7 @@ fn stack_slot_value_kind_from_return_slot_stores(
     }
 }
 
-fn stack_slot_value_kind_from_return_exit(
+fn stack_slot_value_kind_from_return_exit(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
     info: &UseInfo,
     func: &SSAFunction,
     exit_block: &SSABlock,
@@ -1814,7 +1817,7 @@ fn stack_slot_value_kind_from_return_exit(
 ) -> Option<StackSlotValueKind> {
     let mut kinds = Vec::new();
 
-    if let Some(kind) = stack_slot_value_kind_from_block_store_to_exit(
+    if let Some(kind) = stack_slot_value_kind_from_block_store_to_exit(symbols, 
         info,
         exit_block,
         exit_block.addr,
@@ -1826,7 +1829,7 @@ fn stack_slot_value_kind_from_return_exit(
 
     for pred_addr in func.predecessors(exit_block.addr) {
         let pred_block = func.get_block(pred_addr)?;
-        if let Some(kind) = stack_slot_value_kind_from_block_store_to_exit(
+        if let Some(kind) = stack_slot_value_kind_from_block_store_to_exit(symbols, 
             info,
             pred_block,
             exit_block.addr,
@@ -1848,7 +1851,7 @@ fn stack_slot_value_kind_from_return_exit(
     }
 }
 
-fn stack_slot_value_kind_from_block_store_to_exit(
+fn stack_slot_value_kind_from_block_store_to_exit(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
     info: &UseInfo,
     block: &SSABlock,
     exit_addr: u64,
@@ -1870,13 +1873,13 @@ fn stack_slot_value_kind_from_block_store_to_exit(
                 addr,
                 val,
             } if exiting => {
-                let Some(offset) = stack_slot_offset_for_addr(info, addr, env) else {
+                let Some(offset) = stack_slot_offset_for_addr(symbols, info, addr, env) else {
                     continue;
                 };
                 if offset != slot_offset {
                     continue;
                 }
-                return Some(value_kind_for_block_var(info, block, idx, val, env, 0));
+                return Some(value_kind_for_block_var(symbols, info, block, idx, val, env, 0));
             }
             _ => {}
         }
@@ -1885,7 +1888,7 @@ fn stack_slot_value_kind_from_block_store_to_exit(
     None
 }
 
-fn value_kind_for_block_var(
+fn value_kind_for_block_var(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
     info: &UseInfo,
     block: &SSABlock,
     before_idx: usize,
@@ -1916,14 +1919,14 @@ fn value_kind_for_block_var(
         return StackSlotValueKind::Scalar;
     }
 
-    let semantic_kind = semantic_source_value_for_var(info, var)
+    let semantic_kind = semantic_source_value_for_var(symbols, info, var)
         .map(|value| stack_slot_value_kind_from_semantic_value(&value))
         .unwrap_or(StackSlotValueKind::Unknown);
     if semantic_kind == StackSlotValueKind::Scalar {
         return StackSlotValueKind::Scalar;
     }
 
-    if block_value_is_scalar_or_predicate(info, block, before_idx, var, env, depth + 1) {
+    if block_value_is_scalar_or_predicate(symbols, info, block, before_idx, var, env, depth + 1) {
         return StackSlotValueKind::Scalar;
     }
 
@@ -1945,15 +1948,15 @@ struct SwitchSelectorLoadCtx<'a, 'b> {
     env: &'a PassEnv<'a>,
 }
 
-fn switch_selector_value_for_load(
+fn switch_selector_value_for_load(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
     info: &UseInfo,
     ctx: &SwitchSelectorLoadCtx<'_, '_>,
     op_idx: usize,
     dst: &SSAVar,
     addr: &SSAVar,
 ) -> Option<SemanticValue> {
-    let slot_offset = stack_slot_offset_for_addr(info, addr, ctx.env).or_else(|| {
-        utils::extract_stack_offset_from_var(
+    let slot_offset = stack_slot_offset_for_addr(symbols, info, addr, ctx.env).or_else(|| {
+        utils::extract_stack_offset_from_var(symbols, 
             addr,
             &info.definitions,
             ctx.env.fp_name,
@@ -1966,22 +1969,22 @@ fn switch_selector_value_for_load(
         for pred_addr in ctx.preds {
             let pred_block = ctx.func.get_block(*pred_addr)?;
             let candidate =
-                merged_slot_store_value_for_pred(info, pred_block, offset, ctx.env, None);
-            best = preferred_switch_selector_value(info, best, candidate);
+                merged_slot_store_value_for_pred(symbols, info, pred_block, offset, ctx.env, None);
+            best = preferred_switch_selector_value(symbols, info, best, candidate);
         }
         best
     });
 
     let from_same_family =
-        same_register_family_semantic_value_before(info, &ctx.block.ops, op_idx, dst, ctx.env);
+        same_register_family_semantic_value_before(symbols, info, &ctx.block.ops, op_idx, dst, ctx.env);
 
-    preferred_switch_selector_value(
+    preferred_switch_selector_value(symbols, 
         info,
-        preferred_switch_selector_value(info, from_preds, from_same_family),
-        switch_selector_value_for_var(info, dst, ctx.env),
+        preferred_switch_selector_value(symbols, info, from_preds, from_same_family),
+        switch_selector_value_for_var(symbols, info, dst, ctx.env),
     )
     .or_else(|| slot_offset.and_then(|offset| info.stable_stack_values.get(&offset).cloned()))
-    .filter(|candidate| switch_selector_candidate_score(info, candidate) > 0)
+    .filter(|candidate| switch_selector_candidate_score(symbols, info, candidate) > 0)
     .map(|candidate| {
         if let SemanticValue::Scalar(ScalarValue::Root(root)) = &candidate
             && root.var == *dst
@@ -2005,7 +2008,7 @@ fn switch_selector_value_for_load(
     })
 }
 
-fn switch_selector_value_for_var(
+fn switch_selector_value_for_var(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
     info: &UseInfo,
     var: &SSAVar,
     env: &PassEnv<'_>,
@@ -2017,7 +2020,7 @@ fn switch_selector_value_for_var(
         .and_then(|prov| prov.source_var.as_ref())
         .map(|source_var| SemanticValue::Scalar(ScalarValue::Root(ValueRef::from(source_var))));
 
-    preferred_switch_selector_value(info, direct, forwarded).filter(|candidate| {
+    preferred_switch_selector_value(symbols, info, direct, forwarded).filter(|candidate| {
         !matches!(candidate, SemanticValue::Unknown)
             && !matches!(
                 candidate,
@@ -2030,7 +2033,7 @@ fn switch_selector_value_for_var(
     })
 }
 
-fn preferred_switch_selector_value(
+fn preferred_switch_selector_value(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
     info: &UseInfo,
     current: Option<SemanticValue>,
     candidate: Option<SemanticValue>,
@@ -2039,8 +2042,8 @@ fn preferred_switch_selector_value(
         (None, other) => other,
         (some @ Some(_), None) => some,
         (Some(current), Some(candidate)) => {
-            let current_score = switch_selector_candidate_score(info, &current);
-            let candidate_score = switch_selector_candidate_score(info, &candidate);
+            let current_score = switch_selector_candidate_score(symbols, info, &current);
+            let candidate_score = switch_selector_candidate_score(symbols, info, &candidate);
             if candidate_score > current_score {
                 Some(candidate)
             } else {
@@ -2050,8 +2053,8 @@ fn preferred_switch_selector_value(
     }
 }
 
-fn switch_selector_candidate_score(info: &UseInfo, value: &SemanticValue) -> i32 {
-    let mut score = semantic_value_preservation_score(value);
+fn switch_selector_candidate_score(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, info: &UseInfo, value: &SemanticValue) -> i32 {
+    let mut score = semantic_value_preservation_score(symbols, value);
     match value {
         SemanticValue::Scalar(ScalarValue::Root(root)) => {
             if root.var.version == 0 {
@@ -2073,7 +2076,7 @@ fn switch_selector_candidate_score(info: &UseInfo, value: &SemanticValue) -> i32
             }
         }
         SemanticValue::Scalar(ScalarValue::Expr(expr)) => {
-            score += call_arg_expr_preservation_score(expr, 0);
+            score += call_arg_expr_preservation_score(symbols, expr, 0);
         }
         SemanticValue::Address(_) | SemanticValue::Load { .. } => {
             score -= 40;
@@ -2239,7 +2242,7 @@ fn arg_slot_for_value_ref(
     }
 
     if let Some(alias) = env.param_register_aliases.get(&key)
-        && let Some(slot) = alias
+        && let Some(slot) = crate::symbol::spelling(symbols, *alias)
             .strip_prefix("arg")
             .and_then(|suffix| suffix.parse::<usize>().ok())
             .and_then(|idx| idx.checked_sub(1))
@@ -2435,7 +2438,7 @@ fn strongly_connected_components(successors: &BTreeMap<u64, Vec<u64>>) -> HashMa
     components
 }
 
-fn collect_definitions(
+fn collect_definitions(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
     scratch: &mut UseScratch,
     block: &SSABlock,
     env: &PassEnv<'_>,
@@ -2452,7 +2455,7 @@ fn collect_definitions(
             dst_key.clone(),
             phi.sources.iter().map(|(_, src)| src.clone()).collect(),
         );
-        collect_semantic_values(
+        collect_semantic_values(symbols, 
             scratch,
             &SSAOp::Phi {
                 dst: phi.dst.clone(),
@@ -2476,7 +2479,7 @@ fn collect_definitions(
             val,
         } = op
         {
-            let offset = stack_slot_offset_for_addr(&scratch.info, addr, env);
+            let offset = stack_slot_offset_for_addr(symbols, &scratch.info, addr, env);
             if let Some(offset) = offset {
                 preserved_positive_stack_values.remove(&offset);
                 preserved_positive_stack_semantic_values.remove(&offset);
@@ -2489,7 +2492,7 @@ fn collect_definitions(
                     .info
                     .insert_stack_slot_for_var(addr, StackSlotProvenance::new(offset));
                 block_stack_values.insert(offset, val.clone());
-                if let Some(value) = semantic_stack_store_value(&scratch.info, val, env) {
+                if let Some(value) = semantic_stack_store_value(symbols, &scratch.info, val, env) {
                     block_stack_semantic_values.insert(offset, value);
                 } else {
                     block_stack_semantic_values.remove(&offset);
@@ -2507,9 +2510,9 @@ fn collect_definitions(
             space: SpaceId::Ram,
             addr,
         } = op
-            && let Some(offset) = stack_slot_offset_for_addr(&scratch.info, addr, env)
+            && let Some(offset) = stack_slot_offset_for_addr(symbols, &scratch.info, addr, env)
         {
-            let addr_shape = semantic_addr_for_var(&scratch.info, addr, env);
+            let addr_shape = semantic_addr_for_var(symbols, &scratch.info, addr, env);
             let forwarded_semantic =
                 block_stack_semantic_values
                     .get(&offset)
@@ -2519,7 +2522,7 @@ fn collect_definitions(
                             .get(&offset)
                             .cloned()
                     });
-            let should_tag_loaded_value_as_stack_slot = should_tag_loaded_value_as_stack_slot(
+            let should_tag_loaded_value_as_stack_slot = should_tag_loaded_value_as_stack_slot(symbols, 
                 &scratch.info,
                 &addr_shape,
                 forwarded_semantic.as_ref(),
@@ -2630,6 +2633,7 @@ fn collect_definitions(
             } else {
                 let expr = {
                     let lower = LowerCtx {
+                        symbols: env.symbols,
                         string_literals: env.string_literals,
                         use_info: None,
                         definitions: &scratch.info.definitions,
@@ -2655,12 +2659,12 @@ fn collect_definitions(
             }
         }
 
-        collect_semantic_values(scratch, op, env);
+        collect_semantic_values(symbols, scratch, op, env);
         if let Some(dst) = op.dst() {
             scratch.producers.insert(dst.display_name(), op.clone());
         }
 
-        if invalidates_block_stack_values(op, &scratch.info.definitions, env) {
+        if invalidates_block_stack_values(symbols, op, &scratch.info.definitions, env) {
             if is_call_like_stack_boundary_op(op) {
                 preserved_positive_stack_values = block_stack_values
                     .iter()
@@ -2705,6 +2709,7 @@ fn rebuild_definitions(
                 expr
             } else {
                 let lower = LowerCtx {
+                    symbols: env.symbols,
                     string_literals: env.string_literals,
                     use_info: None,
                     definitions: &rebuilt,
@@ -2733,17 +2738,17 @@ fn rebuild_definitions(
     scratch.info.definitions = rebuilt;
 }
 
-fn semantic_stack_store_value(
+fn semantic_stack_store_value(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
     info: &UseInfo,
     var: &SSAVar,
     env: &PassEnv<'_>,
 ) -> Option<SemanticValue> {
     if !semantic_var_is_pointer_like(info, var, env)
-        && let Some(value) = scalar_semantic_source_value_for_var(info, var)
+        && let Some(value) = scalar_semantic_source_value_for_var(symbols, info, var)
     {
         return Some(value);
     }
-    if let Some(addr) = semantic_addr_for_var(info, var, env)
+    if let Some(addr) = semantic_addr_for_var(symbols, info, var, env)
         && semantic_addr_has_meaningful_base(&addr)
     {
         return Some(SemanticValue::Address(addr));
@@ -2754,10 +2759,10 @@ fn semantic_stack_store_value(
             return Some(SemanticValue::Address(addr));
         }
     }
-    semantic_source_value_for_var(info, var)
+    semantic_source_value_for_var(symbols, info, var)
 }
 
-fn should_tag_loaded_value_as_stack_slot(
+fn should_tag_loaded_value_as_stack_slot(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
     info: &UseInfo,
     addr_shape: &Option<NormalizedAddr>,
     forwarded_semantic: Option<&SemanticValue>,
@@ -2766,7 +2771,7 @@ fn should_tag_loaded_value_as_stack_slot(
     env: &PassEnv<'_>,
 ) -> bool {
     if let Some(shape) = addr_shape
-        && frame_object_field_key(info, shape, env, 0).is_some()
+        && frame_object_field_key(symbols, info, shape, env, 0).is_some()
     {
         return false;
     }
@@ -2786,7 +2791,7 @@ fn should_tag_loaded_value_as_stack_slot(
     )
 }
 
-fn merged_slot_store_value_for_pred(
+fn merged_slot_store_value_for_pred(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
     info: &UseInfo,
     block: &SSABlock,
     slot_offset: i64,
@@ -2802,7 +2807,7 @@ fn merged_slot_store_value_for_pred(
             && prepared
                 .and_then(|prepared| prepared_stack_offset_for_var(prepared, addr))
                 .or_else(|| {
-                    utils::extract_stack_offset_from_var(
+                    utils::extract_stack_offset_from_var(symbols, 
                         addr,
                         &info.definitions,
                         env.fp_name,
@@ -2811,10 +2816,10 @@ fn merged_slot_store_value_for_pred(
                 })
                 == Some(slot_offset)
         {
-            let base = semantic_stack_store_value(info, val, env);
+            let base = semantic_stack_store_value(symbols, info, val, env);
             let family = (slot_offset >= 0)
                 .then(|| {
-                    same_register_family_semantic_value_before(info, &block.ops, idx, val, env)
+                    same_register_family_semantic_value_before(symbols, info, &block.ops, idx, val, env)
                 })
                 .flatten();
             return match (base, family) {
@@ -2831,7 +2836,7 @@ fn merged_slot_store_value_for_pred(
     None
 }
 
-fn same_register_family_semantic_value_before(
+fn same_register_family_semantic_value_before(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
     info: &UseInfo,
     ops: &[SSAOp],
     store_idx: usize,
@@ -2851,7 +2856,7 @@ fn same_register_family_semantic_value_before(
         if dst_family != family {
             continue;
         }
-        let Some(candidate) = semantic_stack_store_value(info, dst, env) else {
+        let Some(candidate) = semantic_stack_store_value(symbols, info, dst, env) else {
             continue;
         };
         best = match best {
@@ -2896,12 +2901,12 @@ fn preserve_temp_copy_root_identity(
     }
 }
 
-fn collect_semantic_values(scratch: &mut UseScratch, op: &SSAOp, env: &PassEnv<'_>) {
+fn collect_semantic_values(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, scratch: &mut UseScratch, op: &SSAOp, env: &PassEnv<'_>) {
     let mut cache = SemanticTypeHintCache::default();
-    collect_semantic_values_with_cache(scratch, op, env, &mut cache);
+    collect_semantic_values_with_cache(symbols, scratch, op, env, &mut cache);
 }
 
-fn collect_semantic_values_with_cache(
+fn collect_semantic_values_with_cache(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
     scratch: &mut UseScratch,
     op: &SSAOp,
     env: &PassEnv<'_>,
@@ -2912,7 +2917,7 @@ fn collect_semantic_values_with_cache(
             let src_is_pointer_like =
                 semantic_var_is_pointer_like_cached(&scratch.info, src, env, cache);
             if !src_is_pointer_like
-                && let Some(value) = scalar_semantic_source_value_for_var(&scratch.info, src)
+                && let Some(value) = scalar_semantic_source_value_for_var(symbols, &scratch.info, src)
             {
                 insert_semantic_value(
                     &mut scratch.info,
@@ -2922,7 +2927,7 @@ fn collect_semantic_values_with_cache(
                 return;
             }
             if src_is_pointer_like
-                && let Some(addr) = semantic_addr_for_var(&scratch.info, src, env)
+                && let Some(addr) = semantic_addr_for_var(symbols, &scratch.info, src, env)
                 && is_authoritative_addr(&addr)
             {
                 insert_semantic_value(
@@ -2932,7 +2937,7 @@ fn collect_semantic_values_with_cache(
                 );
                 return;
             }
-            if let Some(value) = semantic_source_value_for_var(&scratch.info, src) {
+            if let Some(value) = semantic_source_value_for_var(symbols, &scratch.info, src) {
                 insert_semantic_value(
                     &mut scratch.info,
                     dst.display_name(),
@@ -2948,13 +2953,13 @@ fn collect_semantic_values_with_cache(
             let src_is_pointer_like =
                 semantic_var_is_pointer_like_cached(&scratch.info, src, env, cache);
             if !src_is_pointer_like
-                && let Some(value) = scalar_semantic_source_value_for_var(&scratch.info, src)
+                && let Some(value) = scalar_semantic_source_value_for_var(symbols, &scratch.info, src)
             {
                 insert_semantic_value(&mut scratch.info, dst.display_name(), value);
                 return;
             }
             if src_is_pointer_like
-                && let Some(addr) = semantic_addr_for_var(&scratch.info, src, env)
+                && let Some(addr) = semantic_addr_for_var(symbols, &scratch.info, src, env)
                 && is_authoritative_addr(&addr)
             {
                 insert_semantic_value(
@@ -2964,14 +2969,14 @@ fn collect_semantic_values_with_cache(
                 );
                 return;
             }
-            if let Some(value) = semantic_source_value_for_var(&scratch.info, src) {
+            if let Some(value) = semantic_source_value_for_var(symbols, &scratch.info, src) {
                 insert_semantic_value(&mut scratch.info, dst.display_name(), value);
             }
         }
         SSAOp::Phi { dst, sources } => {
             let mut selected: Option<SemanticValue> = None;
             for src in sources {
-                let Some(value) = semantic_source_value_for_var(&scratch.info, src) else {
+                let Some(value) = semantic_source_value_for_var(symbols, &scratch.info, src) else {
                     selected = None;
                     break;
                 };
@@ -2994,7 +2999,7 @@ fn collect_semantic_values_with_cache(
             index,
             element_size,
         } => {
-            let mut addr = semantic_addr_for_var(&scratch.info, base, env)
+            let mut addr = semantic_addr_for_var(symbols, &scratch.info, base, env)
                 .unwrap_or_else(|| normalized_addr_from_base_var(base));
             if addr.index.is_none()
                 || addr
@@ -3017,7 +3022,7 @@ fn collect_semantic_values_with_cache(
             index,
             element_size,
         } => {
-            let mut addr = semantic_addr_for_var(&scratch.info, base, env)
+            let mut addr = semantic_addr_for_var(symbols, &scratch.info, base, env)
                 .unwrap_or_else(|| normalized_addr_from_base_var(base));
             if addr.index.is_none()
                 || addr
@@ -3042,8 +3047,8 @@ fn collect_semantic_values_with_cache(
                 )
             };
             if *space == SpaceId::Ram
-                && let Some(shape) = semantic_addr_for_var(&scratch.info, addr, env)
-                && let Some(key) = frame_object_field_key(&scratch.info, &shape, env, 0)
+                && let Some(shape) = semantic_addr_for_var(symbols, &scratch.info, addr, env)
+                && let Some(key) = frame_object_field_key(symbols, &scratch.info, &shape, env, 0)
                 && let Some(value) = scratch.info.frame_object_field_roots.get(&key).cloned()
             {
                 replace_semantic_value(&mut scratch.info, dst.display_name(), value);
@@ -3074,7 +3079,7 @@ fn collect_semantic_values_with_cache(
                 return;
             }
             if *space == SpaceId::Ram
-                && let Some(shape) = semantic_addr_for_var(&scratch.info, addr, env)
+                && let Some(shape) = semantic_addr_for_var(symbols, &scratch.info, addr, env)
                 && let Some(offset) = normalized_stack_slot_offset(&shape)
                 && let Some(value) = scratch.info.stable_stack_values.get(&offset).cloned()
                 && !should_preserve_rooted_indirect_load_shape(&value)
@@ -3087,7 +3092,7 @@ fn collect_semantic_values_with_cache(
                 );
                 return;
             }
-            if let Some(shape) = semantic_addr_for_var(&scratch.info, addr, env)
+            if let Some(shape) = semantic_addr_for_var(symbols, &scratch.info, addr, env)
                 && let Some(key) = normalized_memory_key(&scratch.info, *space, &shape, env)
                 && let Some(value) = scratch
                     .info
@@ -3121,12 +3126,12 @@ fn collect_semantic_values_with_cache(
                 return;
             }
             if let Some(prov) = scratch.info.forwarded_values.get(&dst.display_name())
-                && let Some(value) = semantic_source_value_from_provenance(&scratch.info, prov, env)
+                && let Some(value) = semantic_source_value_from_provenance(symbols, &scratch.info, prov, env)
             {
                 insert_semantic_value(&mut scratch.info, dst.display_name(), value);
                 return;
             }
-            if let Some(shape) = semantic_addr_for_var(&scratch.info, addr, env) {
+            if let Some(shape) = semantic_addr_for_var(symbols, &scratch.info, addr, env) {
                 let addr_key = addr.display_name();
                 insert_semantic_value(
                     &mut scratch.info,
@@ -3146,14 +3151,14 @@ fn collect_semantic_values_with_cache(
         }
         SSAOp::IntAdd { dst, a, b } => {
             if let Some(addr) =
-                semantic_addr_from_add_sub(&scratch.info, &scratch.producers, a, b, false, env)
+                semantic_addr_from_add_sub(symbols, &scratch.info, &scratch.producers, a, b, false, env)
             {
                 insert_semantic_value(
                     &mut scratch.info,
                     dst.display_name(),
                     SemanticValue::Address(addr),
                 );
-            } else if let Some(addr) = semantic_addr_for_var(&scratch.info, dst, env)
+            } else if let Some(addr) = semantic_addr_for_var(symbols, &scratch.info, dst, env)
                 && is_authoritative_addr(&addr)
             {
                 insert_semantic_value(
@@ -3165,14 +3170,14 @@ fn collect_semantic_values_with_cache(
         }
         SSAOp::IntSub { dst, a, b } => {
             if let Some(addr) =
-                semantic_addr_from_add_sub(&scratch.info, &scratch.producers, a, b, true, env)
+                semantic_addr_from_add_sub(symbols, &scratch.info, &scratch.producers, a, b, true, env)
             {
                 insert_semantic_value(
                     &mut scratch.info,
                     dst.display_name(),
                     SemanticValue::Address(addr),
                 );
-            } else if let Some(addr) = semantic_addr_for_var(&scratch.info, dst, env)
+            } else if let Some(addr) = semantic_addr_for_var(symbols, &scratch.info, dst, env)
                 && is_authoritative_addr(&addr)
             {
                 insert_semantic_value(
@@ -3183,7 +3188,7 @@ fn collect_semantic_values_with_cache(
             }
         }
         SSAOp::Store { addr, .. } => {
-            if let Some(shape) = semantic_addr_for_var(&scratch.info, addr, env) {
+            if let Some(shape) = semantic_addr_for_var(symbols, &scratch.info, addr, env) {
                 insert_semantic_value(
                     &mut scratch.info,
                     addr.display_name(),
@@ -3195,7 +3200,7 @@ fn collect_semantic_values_with_cache(
     }
 }
 
-fn semantic_addr_from_add_sub(
+fn semantic_addr_from_add_sub(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
     info: &UseInfo,
     producers: &HashMap<String, SSAOp>,
     a: &SSAVar,
@@ -3213,35 +3218,35 @@ fn semantic_addr_from_add_sub(
     }
 
     if let Some(offset) = utils::parse_const_offset(b)
-        && let Some(base) = semantic_addr_for_var(info, a, env)
+        && let Some(base) = semantic_addr_for_var(symbols, info, a, env)
     {
         return add_addr_offset(base, if is_sub { -offset } else { offset });
     }
     if !is_sub
         && let Some(offset) = utils::parse_const_offset(a)
-        && let Some(base) = semantic_addr_for_var(info, b, env)
+        && let Some(base) = semantic_addr_for_var(symbols, info, b, env)
     {
         return add_addr_offset(base, offset);
     }
 
-    if let Some((index, scale)) = recover_scaled_index_from_var(info, producers, b, env, 0) {
+    if let Some((index, scale)) = recover_scaled_index_from_var(symbols, info, producers, b, env, 0) {
         let signed_scale = if is_sub { scale.checked_neg()? } else { scale };
-        let base = indexed_addr_base_for_var(info, a, env)?;
+        let base = indexed_addr_base_for_var(symbols, info, a, env)?;
         return compose_indexed_addr(base, index, signed_scale);
     }
 
     if !is_sub
-        && let Some((index, scale)) = recover_scaled_index_from_var(info, producers, a, env, 0)
+        && let Some((index, scale)) = recover_scaled_index_from_var(symbols, info, producers, a, env, 0)
     {
-        let base = indexed_addr_base_for_var(info, b, env)?;
+        let base = indexed_addr_base_for_var(symbols, info, b, env)?;
         return compose_indexed_addr(base, index, scale);
     }
 
     None
 }
 
-fn stack_slot_offset_for_addr(info: &UseInfo, addr: &SSAVar, env: &PassEnv<'_>) -> Option<i64> {
-    if let Some(shape) = semantic_addr_for_var(info, addr, env) {
+fn stack_slot_offset_for_addr(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, info: &UseInfo, addr: &SSAVar, env: &PassEnv<'_>) -> Option<i64> {
+    if let Some(shape) = semantic_addr_for_var(symbols, info, addr, env) {
         if let Some(offset) = normalized_stack_slot_offset(&shape) {
             return Some(offset);
         }
@@ -3260,7 +3265,7 @@ fn stack_slot_offset_for_addr(info: &UseInfo, addr: &SSAVar, env: &PassEnv<'_>) 
         return None;
     }
 
-    utils::extract_stack_offset_from_var(addr, &info.definitions, env.fp_name, env.sp_name)
+    utils::extract_stack_offset_from_var(symbols, addr, &info.definitions, env.fp_name, env.sp_name)
 }
 
 fn stack_slot_offset_from_add_sub(
@@ -3285,7 +3290,7 @@ fn stack_slot_offset_from_add_sub(
     None
 }
 
-fn recover_scaled_index_from_var(
+fn recover_scaled_index_from_var(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
     info: &UseInfo,
     producers: &HashMap<String, SSAOp>,
     var: &SSAVar,
@@ -3309,36 +3314,36 @@ fn recover_scaled_index_from_var(
         | Some(SSAOp::Trunc { src, .. })
         | Some(SSAOp::Cast { src, .. })
         | Some(SSAOp::Subpiece { src, .. }) => {
-            recover_scaled_index_from_var(info, producers, src, env, depth + 1)
+            recover_scaled_index_from_var(symbols, info, producers, src, env, depth + 1)
         }
         Some(SSAOp::IntMult { a, b, .. }) => {
-            if let Some(scale) = recover_const_offset_from_var(info, producers, a, depth + 1) {
+            if let Some(scale) = recover_const_offset_from_var(symbols, info, producers, a, depth + 1) {
                 let (inner, inner_scale) =
-                    recover_scaled_index_from_var(info, producers, b, env, depth + 1)?;
+                    recover_scaled_index_from_var(symbols, info, producers, b, env, depth + 1)?;
                 return inner_scale.checked_mul(scale).map(|s| (inner, s));
             }
-            if let Some(scale) = recover_const_offset_from_var(info, producers, b, depth + 1) {
+            if let Some(scale) = recover_const_offset_from_var(symbols, info, producers, b, depth + 1) {
                 let (inner, inner_scale) =
-                    recover_scaled_index_from_var(info, producers, a, env, depth + 1)?;
+                    recover_scaled_index_from_var(symbols, info, producers, a, env, depth + 1)?;
                 return inner_scale.checked_mul(scale).map(|s| (inner, s));
             }
             None
         }
         Some(SSAOp::IntLeft { a, b, .. }) => {
-            let shift = recover_const_offset_from_var(info, producers, b, depth + 1)?;
+            let shift = recover_const_offset_from_var(symbols, info, producers, b, depth + 1)?;
             if !(0..=62).contains(&shift) {
                 return None;
             }
             let scale = 1_i64.checked_shl(shift as u32)?;
             let (inner, inner_scale) =
-                recover_scaled_index_from_var(info, producers, a, env, depth + 1)?;
+                recover_scaled_index_from_var(symbols, info, producers, a, env, depth + 1)?;
             inner_scale.checked_mul(scale).map(|s| (inner, s))
         }
         Some(SSAOp::IntAdd { a, b, .. }) => {
             let (left, left_scale) =
-                recover_scaled_index_from_var(info, producers, a, env, depth + 1)?;
+                recover_scaled_index_from_var(symbols, info, producers, a, env, depth + 1)?;
             let (right, right_scale) =
-                recover_scaled_index_from_var(info, producers, b, env, depth + 1)?;
+                recover_scaled_index_from_var(symbols, info, producers, b, env, depth + 1)?;
             (left == right).then_some(()).and_then(|_| {
                 left_scale
                     .checked_add(right_scale)
@@ -3346,18 +3351,18 @@ fn recover_scaled_index_from_var(
             })
         }
         Some(SSAOp::IntSub { a, b, .. }) => {
-            if semantic_var_resolves_to_zero(info, producers, a, depth + 1) {
+            if semantic_var_resolves_to_zero(symbols, info, producers, a, depth + 1) {
                 let (inner, inner_scale) =
-                    recover_scaled_index_from_var(info, producers, b, env, depth + 1)?;
+                    recover_scaled_index_from_var(symbols, info, producers, b, env, depth + 1)?;
                 return inner_scale.checked_neg().map(|scale| (inner, scale));
             }
-            if semantic_var_resolves_to_zero(info, producers, b, depth + 1) {
-                return recover_scaled_index_from_var(info, producers, a, env, depth + 1);
+            if semantic_var_resolves_to_zero(symbols, info, producers, b, depth + 1) {
+                return recover_scaled_index_from_var(symbols, info, producers, a, env, depth + 1);
             }
             let (left, left_scale) =
-                recover_scaled_index_from_var(info, producers, a, env, depth + 1)?;
+                recover_scaled_index_from_var(symbols, info, producers, a, env, depth + 1)?;
             let (right, right_scale) =
-                recover_scaled_index_from_var(info, producers, b, env, depth + 1)?;
+                recover_scaled_index_from_var(symbols, info, producers, b, env, depth + 1)?;
             (left == right).then_some(()).and_then(|_| {
                 left_scale
                     .checked_sub(right_scale)
@@ -3365,14 +3370,14 @@ fn recover_scaled_index_from_var(
             })
         }
         Some(SSAOp::IntNegate { src, .. }) => {
-            recover_scaled_index_from_var(info, producers, src, env, depth + 1)
+            recover_scaled_index_from_var(symbols, info, producers, src, env, depth + 1)
                 .and_then(|(inner, scale)| scale.checked_neg().map(|neg| (inner, neg)))
         }
         _ => Some((var.clone(), 1)),
     }
 }
 
-fn recover_const_offset_from_var(
+fn recover_const_offset_from_var(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
     info: &UseInfo,
     producers: &HashMap<String, SSAOp>,
     var: &SSAVar,
@@ -3394,24 +3399,24 @@ fn recover_const_offset_from_var(
         | Some(SSAOp::Trunc { src, .. })
         | Some(SSAOp::Cast { src, .. })
         | Some(SSAOp::Subpiece { src, .. }) => {
-            recover_const_offset_from_var(info, producers, src, depth + 1)
+            recover_const_offset_from_var(symbols, info, producers, src, depth + 1)
         }
         Some(SSAOp::IntAnd { a, b, .. }) => {
-            let left = recover_const_offset_from_var(info, producers, a, depth + 1)?;
-            let right = recover_const_offset_from_var(info, producers, b, depth + 1)?;
+            let left = recover_const_offset_from_var(symbols, info, producers, a, depth + 1)?;
+            let right = recover_const_offset_from_var(symbols, info, producers, b, depth + 1)?;
             Some(left & right)
         }
         Some(SSAOp::IntOr { a, b, .. }) => {
-            let left = recover_const_offset_from_var(info, producers, a, depth + 1)?;
-            let right = recover_const_offset_from_var(info, producers, b, depth + 1)?;
+            let left = recover_const_offset_from_var(symbols, info, producers, a, depth + 1)?;
+            let right = recover_const_offset_from_var(symbols, info, producers, b, depth + 1)?;
             Some(left | right)
         }
         Some(SSAOp::IntXor { a, b, .. }) => {
-            let left = recover_const_offset_from_var(info, producers, a, depth + 1)?;
-            let right = recover_const_offset_from_var(info, producers, b, depth + 1)?;
+            let left = recover_const_offset_from_var(symbols, info, producers, a, depth + 1)?;
+            let right = recover_const_offset_from_var(symbols, info, producers, b, depth + 1)?;
             Some(left ^ right)
         }
-        _ => match semantic_source_value_for_var(info, var) {
+        _ => match semantic_source_value_for_var(symbols, info, var) {
             Some(SemanticValue::Scalar(ScalarValue::Expr(CExpr::IntLit(value)))) => Some(value),
             Some(SemanticValue::Scalar(ScalarValue::Expr(CExpr::UIntLit(value)))) => {
                 i64::try_from(value).ok()
@@ -3515,7 +3520,7 @@ fn semantic_var_resolves_to_ptr_sized_entry_arg_root(
     resolve_ptr_sized_entry_arg_root_var(info, var, env, depth).is_some()
 }
 
-fn semantic_var_resolves_to_zero(
+fn semantic_var_resolves_to_zero(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
     info: &UseInfo,
     producers: &HashMap<String, SSAOp>,
     var: &SSAVar,
@@ -3529,12 +3534,12 @@ fn semantic_var_resolves_to_zero(
         return true;
     }
 
-    match semantic_source_value_for_var(info, var) {
+    match semantic_source_value_for_var(symbols, info, var) {
         Some(SemanticValue::Scalar(ScalarValue::Expr(CExpr::IntLit(0) | CExpr::UIntLit(0)))) => {
             return true;
         }
         Some(SemanticValue::Scalar(ScalarValue::Root(root))) if root.var != *var => {
-            return semantic_var_resolves_to_zero(info, producers, &root.var, depth + 1);
+            return semantic_var_resolves_to_zero(symbols, info, producers, &root.var, depth + 1);
         }
         _ => {}
     }
@@ -3547,7 +3552,7 @@ fn semantic_var_resolves_to_zero(
         | Some(SSAOp::Trunc { src, .. })
         | Some(SSAOp::Cast { src, .. })
         | Some(SSAOp::Subpiece { src, .. }) => {
-            semantic_var_resolves_to_zero(info, producers, src, depth + 1)
+            semantic_var_resolves_to_zero(symbols, info, producers, src, depth + 1)
         }
         Some(SSAOp::IntXor { a, b, .. }) if a == b => true,
         _ => false,
@@ -3855,12 +3860,12 @@ fn normalized_addr_from_base_var(var: &SSAVar) -> NormalizedAddr {
     }
 }
 
-fn indexed_addr_base_for_var(
+fn indexed_addr_base_for_var(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
     info: &UseInfo,
     var: &SSAVar,
     env: &PassEnv<'_>,
 ) -> Option<NormalizedAddr> {
-    if let Some(addr) = semantic_addr_for_var(info, var, env)
+    if let Some(addr) = semantic_addr_for_var(symbols, info, var, env)
         && !matches!(addr.base, BaseRef::Raw(_))
     {
         return Some(addr);
@@ -3903,15 +3908,15 @@ fn compose_indexed_addr(
     }
 }
 
-fn semantic_addr_for_var(
+fn semantic_addr_for_var(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
     info: &UseInfo,
     var: &SSAVar,
     env: &PassEnv<'_>,
 ) -> Option<NormalizedAddr> {
-    semantic_addr_for_var_with_depth(info, var, env, 0)
+    semantic_addr_for_var_with_depth(symbols, info, var, env, 0)
 }
 
-fn semantic_addr_for_var_with_depth(
+fn semantic_addr_for_var_with_depth(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
     info: &UseInfo,
     var: &SSAVar,
     env: &PassEnv<'_>,
@@ -3942,13 +3947,13 @@ fn semantic_addr_for_var_with_depth(
     {
         let root_base = resolve_ptr_sized_entry_arg_root_var(info, &root.var, env, depth + 1)
             .unwrap_or_else(|| root.var.clone());
-        return semantic_addr_for_var_with_depth(info, &root_base, env, depth + 1)
+        return semantic_addr_for_var_with_depth(symbols, info, &root_base, env, depth + 1)
             .or_else(|| Some(normalized_addr_from_base_var(&root_base)));
     }
     if let Some(SemanticValue::Scalar(ScalarValue::Expr(CExpr::Var(alias)))) =
         info.semantic_values.get(&key)
         && var.size == ptr_bytes
-        && let Some(slot) = alias
+        && let Some(slot) = crate::symbol::spelling(symbols, *alias)
             .strip_prefix("arg")
             .and_then(|suffix| suffix.parse::<usize>().ok())
             .and_then(|idx| idx.checked_sub(1))
@@ -3968,7 +3973,7 @@ fn semantic_addr_for_var_with_depth(
         let base_var = entry_root.as_ref().unwrap_or(source_var);
         let is_ptr_sized_entry_arg_root = entry_root.is_some();
         if semantic_var_is_pointer_like(info, source_var, env) || is_ptr_sized_entry_arg_root {
-            return semantic_addr_for_var_with_depth(info, base_var, env, depth + 1)
+            return semantic_addr_for_var_with_depth(symbols, info, base_var, env, depth + 1)
                 .or_else(|| Some(normalized_addr_from_base_var(base_var)));
         }
     }
@@ -3987,7 +3992,7 @@ fn semantic_addr_for_var_with_depth(
     if copy_root != key
         && let Some(root_var) = ssa_var_from_display_name(&copy_root, var.size)
         && root_var != *var
-        && let Some(addr) = semantic_addr_for_var_with_depth(info, &root_var, env, depth + 1)
+        && let Some(addr) = semantic_addr_for_var_with_depth(symbols, info, &root_var, env, depth + 1)
     {
         return Some(addr);
     }
@@ -4002,7 +4007,7 @@ fn semantic_addr_for_var_with_depth(
     }
 
     if let Some(ptr) = info.ptr_arith.get(&key) {
-        let base = semantic_addr_for_var_with_depth(info, &ptr.base, env, depth + 1)
+        let base = semantic_addr_for_var_with_depth(symbols, info, &ptr.base, env, depth + 1)
             .unwrap_or_else(|| normalized_addr_from_base_var(&ptr.base));
         return compose_indexed_addr(
             base,
@@ -4016,7 +4021,7 @@ fn semantic_addr_for_var_with_depth(
     }
 
     if let Some((base, offset)) = info.ptr_members.get(&key) {
-        let base = semantic_addr_for_var_with_depth(info, base, env, depth + 1)
+        let base = semantic_addr_for_var_with_depth(symbols, info, base, env, depth + 1)
             .unwrap_or_else(|| normalized_addr_from_base_var(base));
         return add_addr_offset(base, *offset);
     }
@@ -4028,7 +4033,7 @@ fn semantic_addr_for_var_with_depth(
     if !has_non_address_semantic
         && (copy_root != key || utils::is_temporary_name(&key))
         && let Some(offset) =
-            utils::extract_stack_offset_from_var(var, &info.definitions, env.fp_name, env.sp_name)
+            utils::extract_stack_offset_from_var(symbols, var, &info.definitions, env.fp_name, env.sp_name)
     {
         return Some(NormalizedAddr {
             base: BaseRef::StackSlot(offset),
@@ -4216,7 +4221,7 @@ fn resolve_stable_stack_load_semantic_value(
     }
 }
 
-fn semantic_source_value_for_var(info: &UseInfo, var: &SSAVar) -> Option<SemanticValue> {
+fn semantic_source_value_for_var(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, info: &UseInfo, var: &SSAVar) -> Option<SemanticValue> {
     if let Some(value) = info
         .semantic_values
         .get(&var.display_name())
@@ -4235,7 +4240,7 @@ fn semantic_source_value_for_var(info: &UseInfo, var: &SSAVar) -> Option<Semanti
     }
     let root = resolve_copy_root_name(info, &var.display_name());
     if root != var.display_name()
-        && let Some(value) = semantic_or_scalar_source_value(info, &root)
+        && let Some(value) = semantic_or_scalar_source_value(symbols, info, &root)
     {
         return Some(value);
     }
@@ -4252,41 +4257,42 @@ fn semantic_source_value_for_var(info: &UseInfo, var: &SSAVar) -> Option<Semanti
     ))))
 }
 
-fn scalar_semantic_source_value_for_var(info: &UseInfo, var: &SSAVar) -> Option<SemanticValue> {
-    semantic_source_value_for_var(info, var)
+fn scalar_semantic_source_value_for_var(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, info: &UseInfo, var: &SSAVar) -> Option<SemanticValue> {
+    semantic_source_value_for_var(symbols, info, var)
         .filter(|value| matches!(value, SemanticValue::Scalar(_)))
 }
 
 fn ssa_var_from_display_name(display_name: &str, default_size: u32) -> Option<SSAVar> {
+
     let (base, version) = ssa_key_parts(display_name)?;
     Some(SSAVar::new(base, version, default_size))
 }
 
-fn semantic_source_value_from_provenance(
+fn semantic_source_value_from_provenance(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
     info: &UseInfo,
     provenance: &ValueProvenance,
     env: &PassEnv<'_>,
 ) -> Option<SemanticValue> {
     if let Some(source_var) = &provenance.source_var {
         if !semantic_var_is_pointer_like(info, source_var, env)
-            && let Some(value) = scalar_semantic_source_value_for_var(info, source_var)
+            && let Some(value) = scalar_semantic_source_value_for_var(symbols, info, source_var)
         {
             return Some(value);
         }
         if semantic_var_is_pointer_like(info, source_var, env) {
             return Some(SemanticValue::Address(
-                semantic_addr_for_var(info, source_var, env)
+                semantic_addr_for_var(symbols, info, source_var, env)
                     .unwrap_or_else(|| normalized_addr_from_base_var(source_var)),
             ));
         }
-        if let Some(value) = semantic_source_value_for_var(info, source_var) {
+        if let Some(value) = semantic_source_value_for_var(symbols, info, source_var) {
             return Some(value);
         }
     }
-    semantic_or_scalar_source_value(info, &provenance.source)
+    semantic_or_scalar_source_value(symbols, info, &provenance.source)
 }
 
-fn semantic_or_scalar_source_value(info: &UseInfo, source_name: &str) -> Option<SemanticValue> {
+fn semantic_or_scalar_source_value(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, info: &UseInfo, source_name: &str) -> Option<SemanticValue> {
     if let Some(value) = info
         .semantic_values
         .get(source_name)
@@ -4323,8 +4329,8 @@ fn semantic_or_scalar_source_value(info: &UseInfo, source_name: &str) -> Option<
         return None;
     }
 
-    Some(SemanticValue::Scalar(ScalarValue::Expr(CExpr::Var(
-        rendered,
+    Some(SemanticValue::Scalar(ScalarValue::Expr(crate::symbol::var_ref(
+        symbols, rendered,
     ))))
 }
 
@@ -4340,7 +4346,7 @@ fn resolve_copy_root_name(info: &UseInfo, name: &str) -> String {
     current
 }
 
-fn invalidates_block_stack_values(
+fn invalidates_block_stack_values(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
     op: &SSAOp,
     definitions: &HashMap<String, CExpr>,
     env: &PassEnv<'_>,
@@ -4350,7 +4356,7 @@ fn invalidates_block_stack_values(
             space: SpaceId::Ram,
             addr,
             ..
-        } => utils::extract_stack_offset_from_var(addr, definitions, env.fp_name, env.sp_name)
+        } => utils::extract_stack_offset_from_var(symbols, addr, definitions, env.fp_name, env.sp_name)
             .is_none(),
         SSAOp::Call { .. } | SSAOp::CallInd { .. } | SSAOp::CallOther { .. } => true,
         SSAOp::StoreConditional {
@@ -4411,7 +4417,7 @@ fn invalidates_semantic_stack_values(op: &SSAOp) -> bool {
     )
 }
 
-fn build_formatted_defs(scratch: &mut UseScratch, env: &PassEnv<'_>) {
+fn build_formatted_defs(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, scratch: &mut UseScratch, env: &PassEnv<'_>) {
     scratch.info.formatted_defs.clear();
     let mut defs: Vec<_> = scratch
         .info
@@ -4426,7 +4432,7 @@ fn build_formatted_defs(scratch: &mut UseScratch, env: &PassEnv<'_>) {
         let formatted = utils::format_traced_name(&ssa_key, &scratch.info.var_aliases);
         match selected.get_mut(&formatted) {
             Some((winner_key, winner_expr))
-                if is_preferred_formatted_def_candidate(
+                if is_preferred_formatted_def_candidate(symbols, 
                     &ssa_key,
                     &expr,
                     winner_key.as_str(),
@@ -4451,15 +4457,15 @@ fn build_formatted_defs(scratch: &mut UseScratch, env: &PassEnv<'_>) {
     }
 }
 
-fn is_preferred_formatted_def_candidate(
+fn is_preferred_formatted_def_candidate(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
     candidate: &str,
     candidate_expr: &CExpr,
     incumbent: &str,
     incumbent_expr: &CExpr,
     env: &PassEnv<'_>,
 ) -> bool {
-    let candidate_quality = formatted_def_expr_quality(candidate_expr, env);
-    let incumbent_quality = formatted_def_expr_quality(incumbent_expr, env);
+    let candidate_quality = formatted_def_expr_quality(symbols, candidate_expr, env);
+    let incumbent_quality = formatted_def_expr_quality(symbols, incumbent_expr, env);
     if candidate_quality != incumbent_quality {
         return candidate_quality > incumbent_quality;
     }
@@ -4477,13 +4483,13 @@ fn is_preferred_formatted_def(candidate: &str, incumbent: &str) -> bool {
         || (candidate_version == incumbent_version && candidate < incumbent)
 }
 
-fn formatted_def_expr_quality(expr: &CExpr, env: &PassEnv<'_>) -> (i32, i32, i32, i32, i32, i32) {
+fn formatted_def_expr_quality(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, expr: &CExpr, env: &PassEnv<'_>) -> (i32, i32, i32, i32, i32, i32) {
     let mut quality = (0, 0, 0, 0, 0, 0);
-    accumulate_formatted_def_expr_quality(expr, env, &mut quality);
+    accumulate_formatted_def_expr_quality(symbols, expr, env, &mut quality);
     quality
 }
 
-fn accumulate_formatted_def_expr_quality(
+fn accumulate_formatted_def_expr_quality(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
     expr: &CExpr,
     env: &PassEnv<'_>,
     quality: &mut (i32, i32, i32, i32, i32, i32),
@@ -4492,11 +4498,11 @@ fn accumulate_formatted_def_expr_quality(
         // No penalty applies: none of these ask about a name the renderer chose.
         CExpr::External { .. } => {}
         CExpr::Var(name) => {
-            if is_generic_stack_alias_name(name) {
+            if is_generic_stack_alias_name(&crate::symbol::spelling(symbols, *name)) {
                 quality.3 -= 8;
-            } else if is_low_signal_name(name) {
+            } else if is_low_signal_name(symbols, *name) {
                 quality.5 -= 4;
-            } else if is_register_candidate_base(name, env) {
+            } else if is_register_candidate_base(&crate::symbol::spelling(symbols, *name), env) {
                 quality.4 -= 6;
             } else {
                 quality.1 += 3;
@@ -4505,49 +4511,49 @@ fn accumulate_formatted_def_expr_quality(
         CExpr::Subscript { base, index } => {
             quality.0 += 6;
             quality.2 += 2;
-            accumulate_formatted_def_expr_quality(base, env, quality);
-            accumulate_formatted_def_expr_quality(index, env, quality);
+            accumulate_formatted_def_expr_quality(symbols, base, env, quality);
+            accumulate_formatted_def_expr_quality(symbols, index, env, quality);
         }
         CExpr::Member { base, .. } | CExpr::PtrMember { base, .. } => {
             quality.0 += 7;
             quality.2 += 2;
-            accumulate_formatted_def_expr_quality(base, env, quality);
+            accumulate_formatted_def_expr_quality(symbols, base, env, quality);
         }
         CExpr::Deref(inner) | CExpr::AddrOf(inner) => {
             quality.2 += 1;
-            accumulate_formatted_def_expr_quality(inner, env, quality);
+            accumulate_formatted_def_expr_quality(symbols, inner, env, quality);
         }
         CExpr::Cast { expr: inner, .. }
         | CExpr::Paren(inner)
         | CExpr::Unary { operand: inner, .. }
-        | CExpr::Sizeof(inner) => accumulate_formatted_def_expr_quality(inner, env, quality),
+        | CExpr::Sizeof(inner) => accumulate_formatted_def_expr_quality(symbols, inner, env, quality),
         CExpr::Binary { op, left, right } => {
             if matches!(op, crate::ast::BinaryOp::Add | crate::ast::BinaryOp::Sub)
                 && (literal_zero(left) || literal_zero(right))
             {
                 quality.5 -= 10;
             }
-            accumulate_formatted_def_expr_quality(left, env, quality);
-            accumulate_formatted_def_expr_quality(right, env, quality);
+            accumulate_formatted_def_expr_quality(symbols, left, env, quality);
+            accumulate_formatted_def_expr_quality(symbols, right, env, quality);
         }
         CExpr::Ternary {
             cond,
             then_expr,
             else_expr,
         } => {
-            accumulate_formatted_def_expr_quality(cond, env, quality);
-            accumulate_formatted_def_expr_quality(then_expr, env, quality);
-            accumulate_formatted_def_expr_quality(else_expr, env, quality);
+            accumulate_formatted_def_expr_quality(symbols, cond, env, quality);
+            accumulate_formatted_def_expr_quality(symbols, then_expr, env, quality);
+            accumulate_formatted_def_expr_quality(symbols, else_expr, env, quality);
         }
         CExpr::Call { func, args } => {
-            accumulate_formatted_def_expr_quality(func, env, quality);
+            accumulate_formatted_def_expr_quality(symbols, func, env, quality);
             for arg in args {
-                accumulate_formatted_def_expr_quality(arg, env, quality);
+                accumulate_formatted_def_expr_quality(symbols, arg, env, quality);
             }
         }
         CExpr::Comma(exprs) => {
             for inner in exprs {
-                accumulate_formatted_def_expr_quality(inner, env, quality);
+                accumulate_formatted_def_expr_quality(symbols, inner, env, quality);
             }
         }
         CExpr::IntLit(_)
@@ -4564,6 +4570,7 @@ fn literal_zero(expr: &CExpr) -> bool {
 }
 
 fn is_generic_stack_alias_name(name: &str) -> bool {
+
     name == "stack"
         || name.starts_with("local_")
         || name.starts_with("stack_")
@@ -4589,13 +4596,17 @@ fn is_raw_temporary_or_memory_like_name(name: &str) -> bool {
 }
 
 fn is_symbol_or_object_name(name: &str) -> bool {
+
     matches!(
         SSAVarNameKind::classify(name),
         SSAVarNameKind::Symbol | SSAVarNameKind::Object
     )
 }
 
-fn is_low_signal_name(name: &str) -> bool {
+fn is_low_signal_name(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, name: crate::symbol::SymbolId) -> bool {
+    let name_id = name;
+    let name = &crate::symbol::spelling(symbols, name_id);
+
     let lower = name.to_ascii_lowercase();
     is_raw_ssa_storage_or_register_name(name)
         || lower.starts_with('t')
@@ -4755,6 +4766,7 @@ fn is_riscv_like_register_base(name: &str) -> bool {
 }
 
 fn is_register_candidate_base(base: &str, env: &PassEnv<'_>) -> bool {
+
     if is_semantic_binding_base(base) {
         return false;
     }
@@ -5310,7 +5322,7 @@ fn coalesce_variables(
     Ok(())
 }
 
-fn analyze_call_args(scratch: &mut UseScratch, blocks: &[SSABlock], env: &PassEnv<'_>) {
+fn analyze_call_args(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, scratch: &mut UseScratch, blocks: &[SSABlock], env: &PassEnv<'_>) {
     if env.arg_regs.is_empty() {
         return;
     }
@@ -5335,6 +5347,7 @@ fn analyze_call_args(scratch: &mut UseScratch, blocks: &[SSABlock], env: &PassEn
                 .filter_map(|(idx, op)| op.dst().map(|dst| (dst.display_name(), idx)))
                 .collect::<HashMap<_, _>>();
             let lower = LowerCtx {
+                symbols: env.symbols,
                 string_literals: env.string_literals,
                 use_info: None,
                 definitions: &scratch.info.definitions,
@@ -5388,12 +5401,12 @@ fn analyze_call_args(scratch: &mut UseScratch, blocks: &[SSABlock], env: &PassEn
                             _ => (dst, expr.clone()),
                         };
                         let result_candidate =
-                            call_result_expr_for_post_call_source(&post_call_query, i, dst)
+                            call_result_expr_for_post_call_source(symbols, &post_call_query, i, dst)
                                 .or_else(|| {
-                                    lowered_var_alias_from_expr(&expr, dst.size)
+                                    lowered_var_alias_from_expr(symbols, &expr, dst.size)
                                         .filter(|alias| alias.display_name() != dst_key)
                                         .and_then(|alias| {
-                                            call_result_expr_for_post_call_source(
+                                            call_result_expr_for_post_call_source(symbols, 
                                                 &post_call_query,
                                                 i,
                                                 &alias,
@@ -5406,7 +5419,7 @@ fn analyze_call_args(scratch: &mut UseScratch, blocks: &[SSABlock], env: &PassEn
                                     .with_source_call(block.addr, result_call_idx)
                             })
                             .unwrap_or_else(|| {
-                                let binding = CallArgBinding::input(semantic_call_arg_for_var(
+                                let binding = CallArgBinding::input(semantic_call_arg_for_var(symbols, 
                                     &scratch.info,
                                     input_var,
                                     input_expr.clone(),
@@ -5415,7 +5428,7 @@ fn analyze_call_args(scratch: &mut UseScratch, blocks: &[SSABlock], env: &PassEn
                                 bind_call_arg_source_var(&scratch.info, binding, input_var)
                             });
                         let binding_has_stable_negative_source =
-                            canonicalize_call_arg_binding_to_negative_stack_load(
+                            canonicalize_call_arg_binding_to_negative_stack_load(symbols, 
                                 &scratch.info,
                                 &mut binding,
                                 Some(input_var),
@@ -5425,7 +5438,7 @@ fn analyze_call_args(scratch: &mut UseScratch, blocks: &[SSABlock], env: &PassEn
                         if !binding.is_result()
                             && !binding_has_stable_negative_source
                             && same_register_family_call_arg_source(input_var, dst)
-                            && let Some(family_value) = same_register_family_semantic_value_before(
+                            && let Some(family_value) = same_register_family_semantic_value_before(symbols, 
                                 &scratch.info,
                                 ops,
                                 i,
@@ -5435,18 +5448,18 @@ fn analyze_call_args(scratch: &mut UseScratch, blocks: &[SSABlock], env: &PassEn
                         {
                             let family_arg = SemanticCallArg::semantic(family_value);
                             let should_replace =
-                                (semantic_call_arg_is_generic_entry_root(&binding.arg, env)
+                                (semantic_call_arg_is_generic_entry_root(symbols, &binding.arg, env)
                                     && same_family_call_arg_is_more_specific(
                                         &binding.arg,
                                         &family_arg,
                                     ))
-                                    || semantic_call_arg_score(
+                                    || semantic_call_arg_score(symbols, 
                                         &scratch.info,
                                         input_var,
                                         &family_arg,
                                         &input_expr,
                                         env,
-                                    ) > semantic_call_arg_score(
+                                    ) > semantic_call_arg_score(symbols, 
                                         &scratch.info,
                                         input_var,
                                         &binding.arg,
@@ -5458,7 +5471,7 @@ fn analyze_call_args(scratch: &mut UseScratch, blocks: &[SSABlock], env: &PassEn
                             }
                         }
                         if !binding.is_result() && !binding_has_stable_negative_source {
-                            improve_call_arg_binding_from_copy_root(
+                            improve_call_arg_binding_from_copy_root(symbols, 
                                 &scratch.info,
                                 &mut binding,
                                 input_var,
@@ -5467,7 +5480,7 @@ fn analyze_call_args(scratch: &mut UseScratch, blocks: &[SSABlock], env: &PassEn
                                 env,
                             );
                         }
-                        let score = semantic_call_arg_score(
+                        let score = semantic_call_arg_score(symbols, 
                             &scratch.info,
                             input_var,
                             &binding.arg,
@@ -5540,7 +5553,7 @@ fn analyze_call_args(scratch: &mut UseScratch, blocks: &[SSABlock], env: &PassEn
                     break;
                 }
             }
-            let stack_args = collect_immediate_stack_call_args(
+            let stack_args = collect_immediate_stack_call_args(symbols, 
                 block.addr,
                 ops,
                 call_idx,
@@ -5550,7 +5563,7 @@ fn analyze_call_args(scratch: &mut UseScratch, blocks: &[SSABlock], env: &PassEn
                 env,
             );
             if imported_like_call_target
-                || should_append_unknown_stack_args(&scratch.info, &args, &stack_args, env)
+                || should_append_unknown_stack_args(symbols, &scratch.info, &args, &stack_args, env)
             {
                 for (_, arg, value_key, addr_key) in &stack_args {
                     args.push(arg.clone());
@@ -5558,7 +5571,7 @@ fn analyze_call_args(scratch: &mut UseScratch, blocks: &[SSABlock], env: &PassEn
                     consumed_keys.push(addr_key.clone());
                 }
             } else if !stack_args.is_empty() {
-                merge_arm64_stack_home_call_args(&mut args, &stack_args, env);
+                merge_arm64_stack_home_call_args(symbols, &mut args, &stack_args, env);
                 for (_, _, value_key, addr_key) in &stack_args {
                     consumed_keys.push(value_key.clone());
                     consumed_keys.push(addr_key.clone());
@@ -5574,6 +5587,7 @@ fn analyze_call_args(scratch: &mut UseScratch, blocks: &[SSABlock], env: &PassEn
 
             if let Some(ret_family) = ret_family.as_deref() {
                 let lower = LowerCtx {
+                    symbols: env.symbols,
                     string_literals: env.string_literals,
                     use_info: None,
                     definitions: &scratch.info.definitions,
@@ -5589,7 +5603,7 @@ fn analyze_call_args(scratch: &mut UseScratch, blocks: &[SSABlock], env: &PassEn
                     forwarded_values: &scratch.info.forwarded_values,
                     type_oracle: env.type_oracle,
                 };
-                let call_expr = call_result_expr_for_call_at(
+                let call_expr = call_result_expr_for_call_at(symbols, 
                     &scratch.info,
                     &lower,
                     block.addr,
@@ -5599,7 +5613,7 @@ fn analyze_call_args(scratch: &mut UseScratch, blocks: &[SSABlock], env: &PassEn
                 );
                 if let Some(call_expr) = call_expr {
                     record_call_result_expr(&mut scratch.info, (block.addr, call_idx), &call_expr);
-                    bind_call_result_alias_definitions(
+                    bind_call_result_alias_definitions(symbols, 
                         &mut scratch.info,
                         block,
                         call_idx,
@@ -5646,7 +5660,7 @@ fn analyze_call_args(scratch: &mut UseScratch, blocks: &[SSABlock], env: &PassEn
     }
 }
 
-fn bind_single_use_call_result_definitions(
+fn bind_single_use_call_result_definitions(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
     scratch: &mut UseScratch,
     blocks: &[SSABlock],
     env: &PassEnv<'_>,
@@ -5665,6 +5679,7 @@ fn bind_single_use_call_result_definitions(
             .collect::<HashMap<_, _>>();
         for (op_idx, op) in block.ops.iter().enumerate() {
             let lower = LowerCtx {
+                symbols: env.symbols,
                 string_literals: env.string_literals,
                 use_info: None,
                 definitions: &scratch.info.definitions,
@@ -5681,13 +5696,13 @@ fn bind_single_use_call_result_definitions(
                 type_oracle: env.type_oracle,
             };
             let call_expr =
-                call_result_expr_for_call_at(&scratch.info, &lower, block.addr, op_idx, op, env);
+                call_result_expr_for_call_at(symbols, &scratch.info, &lower, block.addr, op_idx, op, env);
             let Some(call_expr) = call_expr else {
                 continue;
             };
 
             record_call_result_expr(&mut scratch.info, (block.addr, op_idx), &call_expr);
-            bind_call_result_alias_definitions(
+            bind_call_result_alias_definitions(symbols, 
                 &mut scratch.info,
                 block,
                 op_idx,
@@ -5706,7 +5721,7 @@ fn bind_single_use_call_result_definitions(
 
     for args in scratch.info.call_args.values_mut() {
         for binding in args {
-            if let Some(rewritten) = rewrite_call_result_binding(binding, &call_result_defs) {
+            if let Some(rewritten) = rewrite_call_result_binding(symbols, binding, &call_result_defs) {
                 *binding = rewritten;
             }
         }
@@ -5714,7 +5729,7 @@ fn bind_single_use_call_result_definitions(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn bind_call_result_alias_definitions(
+fn bind_call_result_alias_definitions(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
     info: &mut UseInfo,
     block: &SSABlock,
     call_idx: usize,
@@ -5742,7 +5757,7 @@ fn bind_call_result_alias_definitions(
                     producers: producer_map,
                     env,
                 };
-                is_post_call_result_alias_for_call(
+                is_post_call_result_alias_for_call(symbols, 
                     &alias_query,
                     call_idx,
                     next_idx,
@@ -5773,6 +5788,7 @@ fn bind_call_result_alias_definitions(
             let src_key = src.display_name();
             let uses_current_call_result = {
                 let lower = LowerCtx {
+                    symbols: env.symbols,
                     string_literals: env.string_literals,
                     use_info: None,
                     definitions: &info.definitions,
@@ -5796,7 +5812,7 @@ fn bind_call_result_alias_definitions(
                     producers: producer_map,
                     env,
                 };
-                call_result_expr_for_post_call_source(&query, next_idx, src)
+                call_result_expr_for_post_call_source(symbols, &query, next_idx, src)
                     .is_some_and(|(result_call_idx, _)| result_call_idx == call_idx)
             };
             if !uses_current_call_result || info.use_counts.get(&src_key).copied().unwrap_or(0) == 0
@@ -5832,7 +5848,7 @@ fn call_result_source_for_alias(info: &UseInfo, alias: &str) -> Option<(u64, usi
     })
 }
 
-fn propagate_call_result_aliases(
+fn propagate_call_result_aliases(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
     info: &mut UseInfo,
     control: DecompileWorkControl<'_>,
 ) -> Result<(), DecompileExecutionStop> {
@@ -5873,7 +5889,7 @@ fn propagate_call_result_aliases(
             let source_alias = match value {
                 SemanticValue::Scalar(ScalarValue::Root(root)) => Some(root.display_name()),
                 SemanticValue::Scalar(ScalarValue::Expr(expr)) => {
-                    lowered_var_alias_from_expr(&expr, 0).map(|alias| alias.display_name())
+                    lowered_var_alias_from_expr(symbols, &expr, 0).map(|alias| alias.display_name())
                 }
                 SemanticValue::Address(NormalizedAddr {
                     base: BaseRef::Value(root),
@@ -5898,7 +5914,7 @@ fn propagate_call_result_aliases(
     Ok(())
 }
 
-fn call_result_expr_for_call_at(
+fn call_result_expr_for_call_at(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
     info: &UseInfo,
     lower: &LowerCtx<'_>,
     block_addr: u64,
@@ -5913,12 +5929,12 @@ fn call_result_expr_for_call_at(
         .unwrap_or_default();
     let mut args = Vec::with_capacity(bindings.len());
     for binding in bindings {
-        let rendered = call_arg_expr_for_definition(info, lower, binding.clone());
+        let rendered = call_arg_expr_for_definition(symbols, info, lower, binding.clone());
         let rendered = rendered?;
         args.push(rendered);
     }
 
-    let func = if let Some(identity) = resolved_callee_expr_for_site(block_addr, op_idx, env) {
+    let func = if let Some(identity) = resolved_callee_expr_for_site(symbols, block_addr, op_idx, env) {
         identity
     } else {
         match op {
@@ -5937,7 +5953,7 @@ fn call_result_expr_for_call_at(
     Some(CExpr::call(func, args))
 }
 
-fn resolved_callee_expr_for_site(
+fn resolved_callee_expr_for_site(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
     block_addr: u64,
     op_idx: usize,
     env: &PassEnv<'_>,
@@ -5955,7 +5971,8 @@ fn resolved_callee_expr_for_site(
         },
         callee_facts: env.callee_facts,
     })?;
-    Some(CExpr::Var(
+    Some(crate::symbol::var_ref(
+        symbols,
         resolved
             .identity
             .display_name
@@ -5964,13 +5981,13 @@ fn resolved_callee_expr_for_site(
     ))
 }
 
-fn call_arg_expr_for_definition(
+fn call_arg_expr_for_definition(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
     info: &UseInfo,
     lower: &LowerCtx<'_>,
     binding: CallArgBinding,
 ) -> Option<CExpr> {
     let expr = match binding.arg {
-        SemanticCallArg::Semantic(value) => render_call_arg_semantic_value_for_definition(
+        SemanticCallArg::Semantic(value) => render_call_arg_semantic_value_for_definition(symbols, 
             info,
             lower,
             &value,
@@ -5982,11 +5999,11 @@ fn call_arg_expr_for_definition(
     }?;
 
     let normalized =
-        normalize_call_arg_expr_for_definition(info, lower, expr, 0, &mut HashSet::new())?;
-    expr_is_valid_for_synthesized_call_arg(&normalized).then_some(normalized)
+        normalize_call_arg_expr_for_definition(symbols, info, lower, expr, 0, &mut HashSet::new())?;
+    expr_is_valid_for_synthesized_call_arg(symbols, &normalized).then_some(normalized)
 }
 
-fn render_call_arg_semantic_value_for_definition(
+fn render_call_arg_semantic_value_for_definition(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
     info: &UseInfo,
     lower: &LowerCtx<'_>,
     value: &SemanticValue,
@@ -6014,9 +6031,9 @@ fn render_call_arg_semantic_value_for_definition(
             Some(rendered)
         }
         SemanticValue::Address(addr) => {
-            render_call_arg_addr_for_definition(info, lower, addr, depth + 1, visited)
+            render_call_arg_addr_for_definition(symbols, info, lower, addr, depth + 1, visited)
         }
-        SemanticValue::Load { space, addr, size } => render_call_arg_load_for_definition(
+        SemanticValue::Load { space, addr, size } => render_call_arg_load_for_definition(symbols, 
             info,
             lower,
             *space,
@@ -6029,7 +6046,7 @@ fn render_call_arg_semantic_value_for_definition(
     }
 }
 
-fn render_call_arg_addr_for_definition(
+fn render_call_arg_addr_for_definition(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
     info: &UseInfo,
     lower: &LowerCtx<'_>,
     addr: &NormalizedAddr,
@@ -6041,7 +6058,7 @@ fn render_call_arg_addr_for_definition(
             if *offset >= 0 {
                 return None;
             }
-            render_visible_stack_slot_expr_for_definition(info, lower, *offset, depth + 1, visited)
+            render_visible_stack_slot_expr_for_definition(symbols, info, lower, *offset, depth + 1, visited)
                 .and_then(take_address_of_definition_expr)
         }
         _ => {
@@ -6051,7 +6068,7 @@ fn render_call_arg_addr_for_definition(
     }
 }
 
-fn render_call_arg_load_for_definition(
+fn render_call_arg_load_for_definition(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
     info: &UseInfo,
     lower: &LowerCtx<'_>,
     space: SpaceId,
@@ -6069,7 +6086,7 @@ fn render_call_arg_load_for_definition(
     }
     match &addr.base {
         BaseRef::StackSlot(offset) => {
-            render_visible_stack_slot_expr_for_definition(info, lower, *offset, depth + 1, visited)
+            render_visible_stack_slot_expr_for_definition(symbols, info, lower, *offset, depth + 1, visited)
         }
         _ => {
             let rendered = lower.expr_for_semantic_value(&SemanticValue::Load {
@@ -6082,7 +6099,7 @@ fn render_call_arg_load_for_definition(
     }
 }
 
-fn render_visible_stack_slot_expr_for_definition(
+fn render_visible_stack_slot_expr_for_definition(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
     info: &UseInfo,
     lower: &LowerCtx<'_>,
     offset: i64,
@@ -6103,12 +6120,12 @@ fn render_visible_stack_slot_expr_for_definition(
         stack_slot_names
             .pop_first()
             .map(|name| lower.expr_for_ssa_name(&name))
-            .filter(expr_is_valid_for_synthesized_call_arg)
-            .or_else(|| (offset < 0).then(|| CExpr::Var(format!("local_{:x}", (-offset) as u64))))
+            .filter(|x| expr_is_valid_for_synthesized_call_arg(symbols, x))
+            .or_else(|| (offset < 0).then(|| crate::symbol::var_ref(symbols, format!("local_{:x}", (-offset) as u64))))
     };
 
     let stable_value = info.stable_stack_values.get(&offset).and_then(|value| {
-        render_call_arg_semantic_value_for_definition(info, lower, value, depth + 1, visited)
+        render_call_arg_semantic_value_for_definition(symbols, info, lower, value, depth + 1, visited)
     });
 
     let rendered = if offset < 0 {
@@ -6121,7 +6138,7 @@ fn render_visible_stack_slot_expr_for_definition(
     rendered
 }
 
-fn normalize_call_arg_expr_for_definition(
+fn normalize_call_arg_expr_for_definition(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
     info: &UseInfo,
     lower: &LowerCtx<'_>,
     expr: CExpr,
@@ -6136,47 +6153,54 @@ fn normalize_call_arg_expr_for_definition(
         // An external name has no definition in this function to normalise to.
         external @ CExpr::External { .. } => Some(external),
         CExpr::Var(name) => {
-            normalize_call_arg_var_for_definition(info, lower, name, depth, visited)
+            normalize_call_arg_var_for_definition(
+                symbols,
+                info,
+                lower,
+                crate::symbol::spelling(symbols, name).to_string(),
+                depth,
+                visited,
+            )
         }
         CExpr::Paren(inner) => {
-            normalize_call_arg_expr_for_definition(info, lower, *inner, depth + 1, visited)
+            normalize_call_arg_expr_for_definition(symbols, info, lower, *inner, depth + 1, visited)
                 .map(|expr| CExpr::Paren(Box::new(expr)))
         }
         CExpr::Cast { ty, expr: inner } => {
-            normalize_call_arg_expr_for_definition(info, lower, *inner, depth + 1, visited)
+            normalize_call_arg_expr_for_definition(symbols, info, lower, *inner, depth + 1, visited)
                 .map(|expr| CExpr::cast(ty, expr))
         }
         CExpr::AddrOf(inner) => {
-            normalize_call_arg_expr_for_definition(info, lower, *inner, depth + 1, visited)
+            normalize_call_arg_expr_for_definition(symbols, info, lower, *inner, depth + 1, visited)
                 .and_then(take_address_of_definition_expr)
         }
         CExpr::Deref(inner) => {
-            normalize_call_arg_expr_for_definition(info, lower, *inner, depth + 1, visited)
+            normalize_call_arg_expr_for_definition(symbols, info, lower, *inner, depth + 1, visited)
                 .map(|expr| CExpr::Deref(Box::new(expr)))
         }
         CExpr::Unary { op, operand } => {
-            normalize_call_arg_expr_for_definition(info, lower, *operand, depth + 1, visited)
+            normalize_call_arg_expr_for_definition(symbols, info, lower, *operand, depth + 1, visited)
                 .map(|operand| CExpr::unary(op, operand))
         }
         CExpr::Binary { op, left, right } => {
             let left =
-                normalize_call_arg_expr_for_definition(info, lower, *left, depth + 1, visited)?;
+                normalize_call_arg_expr_for_definition(symbols, info, lower, *left, depth + 1, visited)?;
             let right =
-                normalize_call_arg_expr_for_definition(info, lower, *right, depth + 1, visited)?;
+                normalize_call_arg_expr_for_definition(symbols, info, lower, *right, depth + 1, visited)?;
             Some(CExpr::binary(op, left, right))
         }
         CExpr::Subscript { base, index } => {
             let base =
-                normalize_call_arg_expr_for_definition(info, lower, *base, depth + 1, visited)?;
+                normalize_call_arg_expr_for_definition(symbols, info, lower, *base, depth + 1, visited)?;
             let index =
-                normalize_call_arg_expr_for_definition(info, lower, *index, depth + 1, visited)?;
+                normalize_call_arg_expr_for_definition(symbols, info, lower, *index, depth + 1, visited)?;
             Some(CExpr::Subscript {
                 base: Box::new(base),
                 index: Box::new(index),
             })
         }
         CExpr::Member { base, member } => {
-            normalize_call_arg_expr_for_definition(info, lower, *base, depth + 1, visited).map(
+            normalize_call_arg_expr_for_definition(symbols, info, lower, *base, depth + 1, visited).map(
                 |base| CExpr::Member {
                     base: Box::new(base),
                     member,
@@ -6184,7 +6208,7 @@ fn normalize_call_arg_expr_for_definition(
             )
         }
         CExpr::PtrMember { base, member } => {
-            normalize_call_arg_expr_for_definition(info, lower, *base, depth + 1, visited).map(
+            normalize_call_arg_expr_for_definition(symbols, info, lower, *base, depth + 1, visited).map(
                 |base| CExpr::PtrMember {
                     base: Box::new(base),
                     member,
@@ -6193,11 +6217,11 @@ fn normalize_call_arg_expr_for_definition(
         }
         CExpr::Call { func, args } => {
             let func =
-                normalize_call_arg_expr_for_definition(info, lower, *func, depth + 1, visited)?;
+                normalize_call_arg_expr_for_definition(symbols, info, lower, *func, depth + 1, visited)?;
             let args = args
                 .into_iter()
                 .map(|arg| {
-                    normalize_call_arg_expr_for_definition(info, lower, arg, depth + 1, visited)
+                    normalize_call_arg_expr_for_definition(symbols, info, lower, arg, depth + 1, visited)
                 })
                 .collect::<Option<Vec<_>>>()?;
             Some(CExpr::call(func, args))
@@ -6208,15 +6232,15 @@ fn normalize_call_arg_expr_for_definition(
             else_expr,
         } => {
             let cond =
-                normalize_call_arg_expr_for_definition(info, lower, *cond, depth + 1, visited)?;
-            let then_expr = normalize_call_arg_expr_for_definition(
+                normalize_call_arg_expr_for_definition(symbols, info, lower, *cond, depth + 1, visited)?;
+            let then_expr = normalize_call_arg_expr_for_definition(symbols, 
                 info,
                 lower,
                 *then_expr,
                 depth + 1,
                 visited,
             )?;
-            let else_expr = normalize_call_arg_expr_for_definition(
+            let else_expr = normalize_call_arg_expr_for_definition(symbols, 
                 info,
                 lower,
                 *else_expr,
@@ -6232,12 +6256,12 @@ fn normalize_call_arg_expr_for_definition(
         CExpr::Comma(items) => items
             .into_iter()
             .map(|item| {
-                normalize_call_arg_expr_for_definition(info, lower, item, depth + 1, visited)
+                normalize_call_arg_expr_for_definition(symbols, info, lower, item, depth + 1, visited)
             })
             .collect::<Option<Vec<_>>>()
             .map(CExpr::Comma),
         CExpr::Sizeof(inner) => {
-            normalize_call_arg_expr_for_definition(info, lower, *inner, depth + 1, visited)
+            normalize_call_arg_expr_for_definition(symbols, info, lower, *inner, depth + 1, visited)
                 .map(|expr| CExpr::Sizeof(Box::new(expr)))
         }
         CExpr::IntLit(_)
@@ -6249,7 +6273,7 @@ fn normalize_call_arg_expr_for_definition(
     }
 }
 
-fn normalize_call_arg_var_for_definition(
+fn normalize_call_arg_var_for_definition(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
     info: &UseInfo,
     lower: &LowerCtx<'_>,
     name: String,
@@ -6258,7 +6282,7 @@ fn normalize_call_arg_var_for_definition(
 ) -> Option<CExpr> {
     let visit_key = format!("call-def-var:{name}");
     if !visited.insert(visit_key.clone()) {
-        return Some(CExpr::Var(name));
+        return Some(crate::symbol::var_ref(symbols, name));
     }
 
     let rendered = if utils::parse_const_value(&name).is_some()
@@ -6266,26 +6290,26 @@ fn normalize_call_arg_var_for_definition(
     {
         Some(lower.expr_for_ssa_name(&name))
     } else if let Some(prov) = lower.forwarded_values.get(&name) {
-        normalize_call_arg_var_for_definition(info, lower, prov.source.clone(), depth + 1, visited)
+        normalize_call_arg_var_for_definition(symbols, info, lower, prov.source.clone(), depth + 1, visited)
     } else if let Some(value) = info.semantic_values.get(&name) {
-        render_call_arg_semantic_value_for_definition(info, lower, value, depth + 1, visited)
+        render_call_arg_semantic_value_for_definition(symbols, info, lower, value, depth + 1, visited)
             .and_then(|expr| {
-                normalize_call_arg_expr_for_definition(info, lower, expr, depth + 1, visited)
+                normalize_call_arg_expr_for_definition(symbols, info, lower, expr, depth + 1, visited)
             })
     } else if let Some(def) = lower.definitions.get(&name) {
-        normalize_call_arg_expr_for_definition(info, lower, def.clone(), depth + 1, visited)
+        normalize_call_arg_expr_for_definition(symbols, info, lower, def.clone(), depth + 1, visited)
     } else if let Some(alias) = lower.var_aliases.get(&name) {
-        Some(CExpr::Var(alias.clone()))
+        Some(crate::symbol::var_ref(symbols, alias.clone()))
     } else {
         let lowered = lower.expr_for_ssa_name(&name);
         match lowered {
-            CExpr::Var(ref lowered_name) if lowered_name == &name => Some(CExpr::Var(name.clone())),
-            other => normalize_call_arg_expr_for_definition(info, lower, other, depth + 1, visited),
+            CExpr::Var(ref lowered_name) if &*crate::symbol::spelling(symbols, *lowered_name) == &name => Some(crate::symbol::var_ref(symbols, name.clone())),
+            other => normalize_call_arg_expr_for_definition(symbols, info, lower, other, depth + 1, visited),
         }
     };
 
     visited.remove(&visit_key);
-    rendered.or(Some(CExpr::Var(name)))
+    rendered.or(Some(crate::symbol::var_ref(symbols, name)))
 }
 
 fn take_address_of_definition_expr(expr: CExpr) -> Option<CExpr> {
@@ -6305,24 +6329,24 @@ fn take_address_of_definition_expr(expr: CExpr) -> Option<CExpr> {
     }
 }
 
-fn expr_is_valid_for_synthesized_call_arg(expr: &CExpr) -> bool {
-    !call_arg_expr_contains_stack_placeholder(expr, 0)
-        && !call_arg_expr_contains_transient_name(expr, 0)
+fn expr_is_valid_for_synthesized_call_arg(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, expr: &CExpr) -> bool {
+    !call_arg_expr_contains_stack_placeholder(symbols, expr, 0)
+        && !call_arg_expr_contains_transient_name(symbols, expr, 0)
 }
 
-fn rewrite_call_result_binding(
+fn rewrite_call_result_binding(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
     binding: &CallArgBinding,
     call_result_defs: &HashMap<String, CExpr>,
 ) -> Option<CallArgBinding> {
     let arg = match &binding.arg {
         SemanticCallArg::FallbackExpr(CExpr::Var(name)) => call_result_defs
-            .get(name)
+            .get(&*crate::symbol::spelling(symbols, *name))
             .cloned()
             .map(SemanticCallArg::FallbackExpr),
         SemanticCallArg::FallbackExpr(CExpr::Paren(inner))
         | SemanticCallArg::FallbackExpr(CExpr::Cast { expr: inner, .. }) => {
             let inner_arg = SemanticCallArg::FallbackExpr((**inner).clone());
-            rewrite_call_result_binding(&CallArgBinding::from(inner_arg), call_result_defs)
+            rewrite_call_result_binding(symbols, &CallArgBinding::from(inner_arg), call_result_defs)
                 .map(|binding| binding.arg)
         }
         SemanticCallArg::Semantic(SemanticValue::Scalar(ScalarValue::Root(root))) => {
@@ -6389,7 +6413,7 @@ fn call_target_policy_decision(
     .map(|resolved| resolved.policy)
 }
 
-fn should_append_unknown_stack_args(
+fn should_append_unknown_stack_args(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
     info: &UseInfo,
     args: &[CallArgBinding],
     stack_args: &[(i64, CallArgBinding, String, String)],
@@ -6402,13 +6426,13 @@ fn should_append_unknown_stack_args(
         return true;
     };
     !(first_current.arg == first_stack.arg
-        || call_args_share_semantic_source(info, &first_current.arg, &first_stack.arg)
-        || semantic_call_arg_is_generic_entry_root(&first_current.arg, env)
-        || semantic_call_arg_is_generic_register_root(&first_current.arg, env)
-        || should_prefer_stack_home_call_arg(first_current, first_stack, env))
+        || call_args_share_semantic_source(symbols, info, &first_current.arg, &first_stack.arg)
+        || semantic_call_arg_is_generic_entry_root(symbols, &first_current.arg, env)
+        || semantic_call_arg_is_generic_register_root(symbols, &first_current.arg, env)
+        || should_prefer_stack_home_call_arg(symbols, first_current, first_stack, env))
 }
 
-fn collect_immediate_stack_call_args(
+fn collect_immediate_stack_call_args(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
     block_addr: u64,
     ops: &[SSAOp],
     call_idx: usize,
@@ -6453,7 +6477,7 @@ fn collect_immediate_stack_call_args(
                 addr,
                 val,
             } => {
-                let Some(offset) = call_stack_arg_offset(ops, producers, info, addr, env, 0)
+                let Some(offset) = call_stack_arg_offset(symbols, ops, producers, info, addr, env, 0)
                     .or_else(|| {
                         synthetic_call_home_offset(
                             ops,
@@ -6473,14 +6497,14 @@ fn collect_immediate_stack_call_args(
                 };
                 if seen_offsets.insert(offset) {
                     let key = val.display_name();
-                    let expr = visible_call_arg_seed_expr(lower, val);
+                    let expr = visible_call_arg_seed_expr(symbols, lower, val);
                     let raw_result_candidate =
-                        call_result_expr_for_post_call_source(&post_call_query, i, val)
+                        call_result_expr_for_post_call_source(symbols, &post_call_query, i, val)
                             .or_else(|| {
-                                lowered_var_alias_from_expr(&expr, val.size)
+                                lowered_var_alias_from_expr(symbols, &expr, val.size)
                                     .filter(|alias| alias.display_name() != key)
                                     .and_then(|alias| {
-                                        call_result_expr_for_post_call_source(
+                                        call_result_expr_for_post_call_source(symbols, 
                                             &post_call_query,
                                             i,
                                             &alias,
@@ -6490,12 +6514,12 @@ fn collect_immediate_stack_call_args(
                             .or_else(|| {
                                 let ret_family =
                                     register_family_name(post_call_query.env.ret_reg_name)?;
-                                lowered_var_alias_from_expr(&expr, val.size)
+                                lowered_var_alias_from_expr(symbols, &expr, val.size)
                                     .filter(|alias| {
                                         register_family_name(&alias.name).as_deref()
                                             == Some(ret_family.as_str())
                                     })
-                                    .and_then(|_| latest_preceding_call_expr(&post_call_query, i))
+                                    .and_then(|_| latest_preceding_call_expr(symbols, &post_call_query, i))
                             });
                     let (call_result_candidate, duplicate_result_binding) =
                         if let Some((result_call_idx, expr)) = raw_result_candidate {
@@ -6511,7 +6535,7 @@ fn collect_immediate_stack_call_args(
                             } else {
                                 (
                                     None,
-                                    duplicate_result_input_binding_from_preserved_stack_home(
+                                    duplicate_result_input_binding_from_preserved_stack_home(symbols, 
                                         &stack_home_query,
                                         val,
                                         result_call_idx,
@@ -6532,14 +6556,14 @@ fn collect_immediate_stack_call_args(
                                 })
                                 .unwrap_or_else(|| {
                                     let binding = CallArgBinding::input(
-                                        preferred_stack_input_call_arg(info, val, &expr, env),
+                                        preferred_stack_input_call_arg(symbols, info, val, &expr, env),
                                     );
                                     bind_call_arg_source_var(info, binding, val)
                                 })
                         })
                         .with_stack_offset(offset);
                     let binding_has_stable_negative_source =
-                        canonicalize_call_arg_binding_to_negative_stack_load(
+                        canonicalize_call_arg_binding_to_negative_stack_load(symbols, 
                             info,
                             &mut binding,
                             Some(val),
@@ -6549,23 +6573,23 @@ fn collect_immediate_stack_call_args(
                     if !binding.is_result()
                         && !binding_has_stable_negative_source
                         && let Some(family_value) =
-                            same_register_family_semantic_value_before(info, ops, i, val, env)
+                            same_register_family_semantic_value_before(symbols, info, ops, i, val, env)
                     {
                         let family_arg = SemanticCallArg::semantic(family_value);
                         let should_replace =
-                            (semantic_call_arg_is_generic_entry_root(&binding.arg, env)
+                            (semantic_call_arg_is_generic_entry_root(symbols, &binding.arg, env)
                                 && same_family_call_arg_is_more_specific(
                                     &binding.arg,
                                     &family_arg,
                                 ))
-                                || semantic_call_arg_score(info, val, &family_arg, &expr, env)
-                                    > semantic_call_arg_score(info, val, &binding.arg, &expr, env);
+                                || semantic_call_arg_score(symbols, info, val, &family_arg, &expr, env)
+                                    > semantic_call_arg_score(symbols, info, val, &binding.arg, &expr, env);
                         if should_replace {
                             binding.arg = family_arg;
                         }
                     }
                     if !binding.is_result() && !binding_has_stable_negative_source {
-                        improve_call_arg_binding_from_copy_root(
+                        improve_call_arg_binding_from_copy_root(symbols, 
                             info,
                             &mut binding,
                             val,
@@ -6603,7 +6627,7 @@ fn collect_immediate_stack_call_args(
     args
 }
 
-fn preserved_input_binding_from_stack_home(
+fn preserved_input_binding_from_stack_home(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
     query: &StackHomeQuery<'_, '_>,
     val: &SSAVar,
     search_limit_idx: usize,
@@ -6619,7 +6643,7 @@ fn preserved_input_binding_from_stack_home(
         return None;
     };
     let home_offset =
-        call_stack_arg_offset(query.ops, query.producers, query.info, addr, query.env, 0)
+        call_stack_arg_offset(symbols, query.ops, query.producers, query.info, addr, query.env, 0)
             .filter(|offset| *offset >= 0)?;
     let preserved_input = query
         .ops
@@ -6632,7 +6656,7 @@ fn preserved_input_binding_from_stack_home(
                 space: SpaceId::Ram,
                 addr,
                 val,
-            } if call_stack_arg_offset(
+            } if call_stack_arg_offset(symbols, 
                 query.ops,
                 query.producers,
                 query.info,
@@ -6646,8 +6670,8 @@ fn preserved_input_binding_from_stack_home(
             _ => None,
         })?;
     let preserved_input_value = exact_call_arg_source_value_id(query.info, &preserved_input)?;
-    let expr = visible_call_arg_seed_expr(query.lower, &preserved_input);
-    let mut binding = CallArgBinding::input(preferred_stack_input_call_arg(
+    let expr = visible_call_arg_seed_expr(symbols, query.lower, &preserved_input);
+    let mut binding = CallArgBinding::input(preferred_stack_input_call_arg(symbols, 
         query.info,
         &preserved_input,
         &expr,
@@ -6656,7 +6680,7 @@ fn preserved_input_binding_from_stack_home(
     .with_source_var(&preserved_input)
     .with_source_value_id(preserved_input_value)
     .with_stack_offset(printf_stack_offset);
-    canonicalize_call_arg_binding_to_negative_stack_load(
+    canonicalize_call_arg_binding_to_negative_stack_load(symbols, 
         query.info,
         &mut binding,
         Some(&preserved_input),
@@ -6665,16 +6689,16 @@ fn preserved_input_binding_from_stack_home(
     Some(binding)
 }
 
-fn duplicate_result_input_binding_from_preserved_stack_home(
+fn duplicate_result_input_binding_from_preserved_stack_home(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
     query: &StackHomeQuery<'_, '_>,
     val: &SSAVar,
     result_call_idx: usize,
     printf_stack_offset: i64,
 ) -> Option<CallArgBinding> {
-    preserved_input_binding_from_stack_home(query, val, result_call_idx, printf_stack_offset)
+    preserved_input_binding_from_stack_home(symbols, query, val, result_call_idx, printf_stack_offset)
 }
 
-fn preferred_stack_input_call_arg(
+fn preferred_stack_input_call_arg(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
     info: &UseInfo,
     var: &SSAVar,
     expr: &CExpr,
@@ -6696,26 +6720,26 @@ fn preferred_stack_input_call_arg(
         })
         .cloned()
         .map(SemanticCallArg::semantic)
-        .unwrap_or_else(|| semantic_call_arg_for_var(info, var, expr.clone(), env));
+        .unwrap_or_else(|| semantic_call_arg_for_var(symbols, info, var, expr.clone(), env));
     let mut binding = CallArgBinding::input(arg).with_source_var(var);
-    canonicalize_call_arg_binding_to_negative_stack_load(info, &mut binding, Some(var), var.size);
+    canonicalize_call_arg_binding_to_negative_stack_load(symbols, info, &mut binding, Some(var), var.size);
     binding.arg
 }
 
-fn semantic_call_arg_is_transient_register_fallback(
+fn semantic_call_arg_is_transient_register_fallback(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
     arg: &SemanticCallArg,
     env: &PassEnv<'_>,
 ) -> bool {
     match arg {
         SemanticCallArg::FallbackExpr(CExpr::Var(name)) => {
-            let lower = name.to_ascii_lowercase();
+            let lower = crate::symbol::spelling(symbols, *name).to_ascii_lowercase();
             is_call_arg_placeholder_name(&lower)
-                || is_call_arg_transient_name(&lower)
+                || is_call_arg_transient_name(symbols, &lower)
                 || env.param_register_aliases.contains_key(&lower)
         }
         SemanticCallArg::FallbackExpr(CExpr::Paren(inner))
         | SemanticCallArg::FallbackExpr(CExpr::Cast { expr: inner, .. }) => {
-            semantic_call_arg_is_transient_register_fallback(
+            semantic_call_arg_is_transient_register_fallback(symbols, 
                 &SemanticCallArg::FallbackExpr((**inner).clone()),
                 env,
             )
@@ -6724,7 +6748,7 @@ fn semantic_call_arg_is_transient_register_fallback(
     }
 }
 
-fn improve_call_arg_binding_from_copy_root(
+fn improve_call_arg_binding_from_copy_root(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
     info: &UseInfo,
     binding: &mut CallArgBinding,
     var: &SSAVar,
@@ -6749,25 +6773,25 @@ fn improve_call_arg_binding_from_copy_root(
         return;
     }
 
-    let root_expr = visible_call_arg_seed_expr(lower, &root_var);
-    let root_binding = CallArgBinding::input(semantic_call_arg_for_var(
+    let root_expr = visible_call_arg_seed_expr(symbols, lower, &root_var);
+    let root_binding = CallArgBinding::input(semantic_call_arg_for_var(symbols, 
         info,
         &root_var,
         root_expr.clone(),
         env,
     ));
     let mut root_binding = bind_call_arg_source_var(info, root_binding, &root_var);
-    let root_has_stable_negative_source = canonicalize_call_arg_binding_to_negative_stack_load(
+    let root_has_stable_negative_source = canonicalize_call_arg_binding_to_negative_stack_load(symbols, 
         info,
         &mut root_binding,
         Some(&root_var),
         root_var.size,
     )
     .is_some();
-    let current_score = semantic_call_arg_score(info, var, &binding.arg, expr, env);
-    let root_score = semantic_call_arg_score(info, &root_var, &root_binding.arg, &root_expr, env);
-    let current_is_transient = semantic_call_arg_is_transient_register_fallback(&binding.arg, env)
-        || semantic_call_arg_is_generic_entry_root(&binding.arg, env);
+    let current_score = semantic_call_arg_score(symbols, info, var, &binding.arg, expr, env);
+    let root_score = semantic_call_arg_score(symbols, info, &root_var, &root_binding.arg, &root_expr, env);
+    let current_is_transient = semantic_call_arg_is_transient_register_fallback(symbols, &binding.arg, env)
+        || semantic_call_arg_is_generic_entry_root(symbols, &binding.arg, env);
 
     if root_has_stable_negative_source
         || (current_is_transient && root_score >= current_score)
@@ -6777,21 +6801,21 @@ fn improve_call_arg_binding_from_copy_root(
     }
 }
 
-fn visible_call_arg_seed_expr(lower: &LowerCtx<'_>, var: &SSAVar) -> CExpr {
+fn visible_call_arg_seed_expr(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, lower: &LowerCtx<'_>, var: &SSAVar) -> CExpr {
     if var.is_const() {
         return lower.get_expr(var);
     }
 
-    CExpr::Var(lower.var_name(var))
+    crate::symbol::var_ref(symbols, lower.var_name(var))
 }
 
-fn call_result_expr_for_post_call_source(
+fn call_result_expr_for_post_call_source(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
     query: &PostCallResultQuery<'_, '_>,
     use_idx: usize,
     var: &SSAVar,
 ) -> Option<(usize, CExpr)> {
     let ret_family = register_family_name(query.env.ret_reg_name)?;
-    let source_var = resolve_post_call_result_source_var_with_facts(
+    let source_var = resolve_post_call_result_source_var_with_facts(symbols, 
         query.info,
         query.ops,
         query.producers,
@@ -6800,7 +6824,7 @@ fn call_result_expr_for_post_call_source(
         0,
     )
     .or_else(|| {
-        lowered_post_call_result_source_var(
+        lowered_post_call_result_source_var(symbols, 
             query.info,
             query.lower,
             query.ops,
@@ -6842,7 +6866,7 @@ fn call_result_expr_for_post_call_source(
         return None;
     }
     if !producer_is_call_define {
-        let allowed_keys = post_call_result_alias_chain_keys_with_facts(
+        let allowed_keys = post_call_result_alias_chain_keys_with_facts(symbols, 
             query.info,
             query.ops,
             query.producers,
@@ -6862,7 +6886,7 @@ fn call_result_expr_for_post_call_source(
     }
 
     let call_op = query.ops.get(call_idx)?;
-    call_result_expr_for_call_at(
+    call_result_expr_for_call_at(symbols, 
         query.info,
         query.lower,
         query.block_addr,
@@ -6873,14 +6897,14 @@ fn call_result_expr_for_post_call_source(
     .map(|expr| (call_idx, expr))
 }
 
-fn is_post_call_result_alias_for_call(
+fn is_post_call_result_alias_for_call(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
     query: &PostCallAliasQuery<'_, '_>,
     call_idx: usize,
     use_idx: usize,
     var: &SSAVar,
     ret_family: &str,
 ) -> bool {
-    let Some(source_var) = resolve_post_call_result_source_var_with_facts(
+    let Some(source_var) = resolve_post_call_result_source_var_with_facts(symbols, 
         query.info,
         &query.block.ops,
         query.producers,
@@ -6918,7 +6942,7 @@ fn is_post_call_result_alias_for_call(
     if source_is_call_define {
         true
     } else {
-        let allowed_keys = post_call_result_alias_chain_keys_with_facts(
+        let allowed_keys = post_call_result_alias_chain_keys_with_facts(symbols, 
             query.info,
             &query.block.ops,
             query.producers,
@@ -6966,7 +6990,7 @@ fn resolve_post_call_result_source_var(
     (register_family_name(&var.name).as_deref() == Some(ret_family.as_str())).then_some(var.clone())
 }
 
-fn semantic_post_call_result_alias_var(info: &UseInfo, var: &SSAVar, depth: u32) -> Option<SSAVar> {
+fn semantic_post_call_result_alias_var(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, info: &UseInfo, var: &SSAVar, depth: u32) -> Option<SSAVar> {
     if depth > 8 {
         return None;
     }
@@ -6978,27 +7002,27 @@ fn semantic_post_call_result_alias_var(info: &UseInfo, var: &SSAVar, depth: u32)
         .and_then(|prov| prov.source_var.clone())
         .filter(|source_var| source_var != var)
     {
-        return semantic_post_call_result_alias_var(info, &source_var, depth + 1)
+        return semantic_post_call_result_alias_var(symbols, info, &source_var, depth + 1)
             .or(Some(source_var));
     }
 
     match info.semantic_values.get(&key) {
         Some(SemanticValue::Scalar(ScalarValue::Root(root))) if root.var != *var => {
-            semantic_post_call_result_alias_var(info, &root.var, depth + 1)
+            semantic_post_call_result_alias_var(symbols, info, &root.var, depth + 1)
                 .or(Some(root.var.clone()))
         }
         Some(SemanticValue::Scalar(ScalarValue::Expr(expr))) => {
-            lowered_var_alias_from_expr(expr, var.size)
+            lowered_var_alias_from_expr(symbols, expr, var.size)
                 .filter(|alias| alias != var)
                 .and_then(|alias| {
-                    semantic_post_call_result_alias_var(info, &alias, depth + 1).or(Some(alias))
+                    semantic_post_call_result_alias_var(symbols, info, &alias, depth + 1).or(Some(alias))
                 })
         }
         _ => None,
     }
 }
 
-fn resolve_post_call_result_source_var_with_facts(
+fn resolve_post_call_result_source_var_with_facts(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
     info: &UseInfo,
     ops: &[SSAOp],
     producers: &HashMap<String, usize>,
@@ -7015,10 +7039,10 @@ fn resolve_post_call_result_source_var_with_facts(
             semantic_value_source_offset_by_name(info, &var.display_name(), 0, &mut HashSet::new())
                 .is_some_and(|offset| offset < 0);
         (!has_stable_negative_source)
-            .then(|| semantic_post_call_result_alias_var(info, var, depth + 1))
+            .then(|| semantic_post_call_result_alias_var(symbols, info, var, depth + 1))
             .flatten()
             .and_then(|alias| {
-                resolve_post_call_result_source_var_with_facts(
+                resolve_post_call_result_source_var_with_facts(symbols, 
                     info,
                     ops,
                     producers,
@@ -7073,7 +7097,7 @@ fn post_call_result_alias_chain_keys(
     }
 }
 
-fn post_call_result_alias_chain_keys_with_facts(
+fn post_call_result_alias_chain_keys_with_facts(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
     info: &UseInfo,
     ops: &[SSAOp],
     producers: &HashMap<String, usize>,
@@ -7086,11 +7110,11 @@ fn post_call_result_alias_chain_keys_with_facts(
         return keys;
     }
 
-    if let Some(alias) = semantic_post_call_result_alias_var(info, var, depth + 1)
+    if let Some(alias) = semantic_post_call_result_alias_var(symbols, info, var, depth + 1)
         && alias.display_name() != var.display_name()
     {
         keys.insert(alias.display_name());
-        keys.extend(post_call_result_alias_chain_keys_with_facts(
+        keys.extend(post_call_result_alias_chain_keys_with_facts(symbols, 
             info,
             ops,
             producers,
@@ -7142,7 +7166,7 @@ fn producer_entry_for_var(
     })
 }
 
-fn lowered_post_call_result_source_var(
+fn lowered_post_call_result_source_var(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
     info: &UseInfo,
     lower: &LowerCtx<'_>,
     ops: &[SSAOp],
@@ -7150,25 +7174,25 @@ fn lowered_post_call_result_source_var(
     var: &SSAVar,
     env: &PassEnv<'_>,
 ) -> Option<SSAVar> {
-    lowered_var_alias_from_expr(&lower.expr_for_ssa_name(&var.display_name()), var.size).and_then(
+    lowered_var_alias_from_expr(symbols, &lower.expr_for_ssa_name(&var.display_name()), var.size).and_then(
         |alias| {
-            resolve_post_call_result_source_var_with_facts(info, ops, producers, &alias, env, 0)
+            resolve_post_call_result_source_var_with_facts(symbols, info, ops, producers, &alias, env, 0)
                 .or(Some(alias))
         },
     )
 }
 
-fn lowered_var_alias_from_expr(expr: &CExpr, default_size: u32) -> Option<SSAVar> {
+fn lowered_var_alias_from_expr(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, expr: &CExpr, default_size: u32) -> Option<SSAVar> {
     match expr {
-        CExpr::Var(name) => ssa_var_from_display_name(name, default_size),
+        CExpr::Var(name) => ssa_var_from_display_name(&crate::symbol::spelling(symbols, *name), default_size),
         CExpr::Paren(inner) | CExpr::Cast { expr: inner, .. } => {
-            lowered_var_alias_from_expr(inner, default_size)
+            lowered_var_alias_from_expr(symbols, inner, default_size)
         }
         _ => None,
     }
 }
 
-fn latest_preceding_call_expr(
+fn latest_preceding_call_expr(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
     query: &PostCallResultQuery<'_, '_>,
     use_idx: usize,
 ) -> Option<(usize, CExpr)> {
@@ -7179,7 +7203,7 @@ fn latest_preceding_call_expr(
         .take(use_idx)
         .rev()
         .find(|(_, op)| matches!(op, SSAOp::Call { .. } | SSAOp::CallInd { .. }))?;
-    call_result_expr_for_call_at(
+    call_result_expr_for_call_at(symbols, 
         query.info,
         query.lower,
         query.block_addr,
@@ -7190,7 +7214,7 @@ fn latest_preceding_call_expr(
     .map(|expr| (call_idx, expr))
 }
 
-fn merge_arm64_stack_home_call_args(
+fn merge_arm64_stack_home_call_args(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
     args: &mut Vec<CallArgBinding>,
     stack_args: &[(i64, CallArgBinding, String, String)],
     env: &PassEnv<'_>,
@@ -7201,9 +7225,9 @@ fn merge_arm64_stack_home_call_args(
                 args[idx] = stack_arg.clone();
             }
             Some(current)
-                if semantic_call_arg_is_generic_entry_root(&current.arg, env)
-                    || semantic_call_arg_is_generic_register_root(&current.arg, env)
-                    || should_prefer_stack_home_call_arg(&current, stack_arg, env) =>
+                if semantic_call_arg_is_generic_entry_root(symbols, &current.arg, env)
+                    || semantic_call_arg_is_generic_register_root(symbols, &current.arg, env)
+                    || should_prefer_stack_home_call_arg(symbols, &current, stack_arg, env) =>
             {
                 args[idx] = stack_arg.clone();
             }
@@ -7220,9 +7244,9 @@ fn merge_arm64_stack_home_call_args(
             .iter()
             .any(|(_, stack_arg, _, _)| stack_arg == last);
         if is_duplicate_stack_home
-            || semantic_call_arg_is_generic_entry_root(&last.arg, env)
-            || semantic_call_arg_is_generic_register_root(&last.arg, env)
-            || semantic_call_arg_is_transient_fallback(&last.arg)
+            || semantic_call_arg_is_generic_entry_root(symbols, &last.arg, env)
+            || semantic_call_arg_is_generic_register_root(symbols, &last.arg, env)
+            || semantic_call_arg_is_transient_fallback(symbols, &last.arg)
         {
             args.pop();
             continue;
@@ -7231,21 +7255,21 @@ fn merge_arm64_stack_home_call_args(
     }
 }
 
-fn call_args_share_semantic_source(
+fn call_args_share_semantic_source(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
     info: &UseInfo,
     a: &SemanticCallArg,
     b: &SemanticCallArg,
 ) -> bool {
-    let Some(a_offset) = call_arg_semantic_source_offset(info, a, 0, &mut HashSet::new()) else {
+    let Some(a_offset) = call_arg_semantic_source_offset(symbols, info, a, 0, &mut HashSet::new()) else {
         return false;
     };
-    let Some(b_offset) = call_arg_semantic_source_offset(info, b, 0, &mut HashSet::new()) else {
+    let Some(b_offset) = call_arg_semantic_source_offset(symbols, info, b, 0, &mut HashSet::new()) else {
         return false;
     };
     a_offset == b_offset
 }
 
-fn call_arg_semantic_source_offset(
+fn call_arg_semantic_source_offset(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
     info: &UseInfo,
     arg: &SemanticCallArg,
     depth: u32,
@@ -7260,11 +7284,11 @@ fn call_arg_semantic_source_offset(
             semantic_value_source_offset(info, value, depth + 1, visited)
         }
         SemanticCallArg::FallbackExpr(CExpr::Var(name)) => {
-            semantic_value_source_offset_by_name(info, name, depth + 1, visited)
+            semantic_value_source_offset_by_name(info, &crate::symbol::spelling(symbols, *name), depth + 1, visited)
         }
         SemanticCallArg::FallbackExpr(CExpr::Paren(inner))
         | SemanticCallArg::FallbackExpr(CExpr::Cast { expr: inner, .. }) => {
-            call_arg_semantic_source_offset(
+            call_arg_semantic_source_offset(symbols, 
                 info,
                 &SemanticCallArg::FallbackExpr((**inner).clone()),
                 depth + 1,
@@ -7329,6 +7353,7 @@ fn semantic_value_source_offset_by_name(
     depth: u32,
     visited: &mut HashSet<String>,
 ) -> Option<i64> {
+
     if depth > 8 || !visited.insert(name.to_string()) {
         return None;
     }
@@ -7372,7 +7397,7 @@ fn unique_negative_stack_slot_for_stored_value(info: &UseInfo, name: &str) -> Op
     (matches.len() == 1).then(|| matches.pop_first()).flatten()
 }
 
-fn should_prefer_stack_home_call_arg(
+fn should_prefer_stack_home_call_arg(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
     current: &CallArgBinding,
     stack_arg: &CallArgBinding,
     env: &PassEnv<'_>,
@@ -7380,20 +7405,20 @@ fn should_prefer_stack_home_call_arg(
     stack_arg.is_result()
         || (is_plain_scalar_call_arg_candidate(&current.arg)
             && is_structured_call_arg_candidate(&stack_arg.arg))
-        || (semantic_call_arg_is_generic_register_root(&current.arg, env)
-            && !semantic_call_arg_is_generic_register_root(&stack_arg.arg, env))
-        || (semantic_call_arg_is_transient_fallback(&current.arg)
-            && !semantic_call_arg_is_transient_fallback(&stack_arg.arg))
+        || (semantic_call_arg_is_generic_register_root(symbols, &current.arg, env)
+            && !semantic_call_arg_is_generic_register_root(symbols, &stack_arg.arg, env))
+        || (semantic_call_arg_is_transient_fallback(symbols, &current.arg)
+            && !semantic_call_arg_is_transient_fallback(symbols, &stack_arg.arg))
 }
 
-fn semantic_call_arg_is_transient_fallback(arg: &SemanticCallArg) -> bool {
+fn semantic_call_arg_is_transient_fallback(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, arg: &SemanticCallArg) -> bool {
     match arg {
         SemanticCallArg::FallbackExpr(CExpr::Var(name)) => {
-            is_call_arg_transient_name(name) || is_call_arg_placeholder_name(name)
+            is_call_arg_transient_name(symbols, &crate::symbol::spelling(symbols, *name)) || is_call_arg_placeholder_name(&crate::symbol::spelling(symbols, *name))
         }
         SemanticCallArg::FallbackExpr(CExpr::Paren(inner))
         | SemanticCallArg::FallbackExpr(CExpr::Cast { expr: inner, .. }) => {
-            semantic_call_arg_is_transient_fallback(&SemanticCallArg::FallbackExpr(
+            semantic_call_arg_is_transient_fallback(symbols, &SemanticCallArg::FallbackExpr(
                 (**inner).clone(),
             ))
         }
@@ -7401,13 +7426,13 @@ fn semantic_call_arg_is_transient_fallback(arg: &SemanticCallArg) -> bool {
     }
 }
 
-fn semantic_call_arg_is_generic_register_root(arg: &SemanticCallArg, env: &PassEnv<'_>) -> bool {
+fn semantic_call_arg_is_generic_register_root(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, arg: &SemanticCallArg, env: &PassEnv<'_>) -> bool {
     match arg {
         SemanticCallArg::Semantic(SemanticValue::Scalar(ScalarValue::Root(root))) => env
             .arg_regs
             .iter()
             .any(|reg| root.var.name.eq_ignore_ascii_case(reg)),
-        SemanticCallArg::FallbackExpr(CExpr::Var(name)) => ssa_key_parts(name)
+        SemanticCallArg::FallbackExpr(CExpr::Var(name)) => ssa_key_parts(&crate::symbol::spelling(symbols, *name))
             .map(|(base, _)| {
                 env.arg_regs
                     .iter()
@@ -7416,7 +7441,7 @@ fn semantic_call_arg_is_generic_register_root(arg: &SemanticCallArg, env: &PassE
             .unwrap_or(false),
         SemanticCallArg::FallbackExpr(CExpr::Paren(inner))
         | SemanticCallArg::FallbackExpr(CExpr::Cast { expr: inner, .. }) => {
-            semantic_call_arg_is_generic_register_root(
+            semantic_call_arg_is_generic_register_root(symbols, 
                 &SemanticCallArg::FallbackExpr((**inner).clone()),
                 env,
             )
@@ -7516,23 +7541,23 @@ fn is_plausible_call_home_base(name: &str, env: &PassEnv<'_>) -> bool {
         || name.starts_with('r')
 }
 
-fn semantic_call_arg_for_var(
+fn semantic_call_arg_for_var(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
     info: &UseInfo,
     var: &SSAVar,
     expr: CExpr,
     env: &PassEnv<'_>,
 ) -> SemanticCallArg {
-    let string_addr = semantic_call_arg_string_addr(info, var, &expr, env, 0);
+    let string_addr = semantic_call_arg_string_addr(symbols, info, var, &expr, env, 0);
     let preserve_visible_expr_for_string_addr =
-        string_addr.is_some() && expr_preserves_pointer_identity_for_call_arg(&expr, env);
-    if let Some(value) = preferred_semantic_call_arg_value(info, var, &expr, env) {
+        string_addr.is_some() && expr_preserves_pointer_identity_for_call_arg(symbols, &expr, env);
+    if let Some(value) = preferred_semantic_call_arg_value(symbols, info, var, &expr, env) {
         if let Some(addr) = string_addr
             && semantic_call_arg_prefers_string_addr(&value)
             && !preserve_visible_expr_for_string_addr
         {
             return SemanticCallArg::StringAddr(addr);
         }
-        if semantic_call_arg_prefers_expr_over_stack_reload(&value, &expr, env) {
+        if semantic_call_arg_prefers_expr_over_stack_reload(symbols, &value, &expr, env) {
             return SemanticCallArg::FallbackExpr(expr);
         }
         return SemanticCallArg::semantic(value);
@@ -7548,16 +7573,16 @@ fn semantic_call_arg_for_var(
     SemanticCallArg::FallbackExpr(expr)
 }
 
-fn expr_preserves_pointer_identity_for_call_arg(expr: &CExpr, env: &PassEnv<'_>) -> bool {
+fn expr_preserves_pointer_identity_for_call_arg(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, expr: &CExpr, env: &PassEnv<'_>) -> bool {
     match expr {
         CExpr::Var(name) => {
-            !is_call_arg_placeholder_name(name)
-                && !is_call_arg_transient_name(name)
-                && !is_call_arg_low_quality_name(name)
-                && !is_generic_entry_arg_name(name)
+            !is_call_arg_placeholder_name(&crate::symbol::spelling(symbols, *name))
+                && !is_call_arg_transient_name(symbols, &crate::symbol::spelling(symbols, *name))
+                && !is_call_arg_low_quality_name(&crate::symbol::spelling(symbols, *name))
+                && !is_generic_entry_arg_name(&crate::symbol::spelling(symbols, *name))
                 && !env
                     .param_register_aliases
-                    .contains_key(&name.to_ascii_lowercase())
+                    .contains_key(&crate::symbol::spelling(symbols, *name).to_ascii_lowercase())
         }
         CExpr::Subscript { .. }
         | CExpr::Member { .. }
@@ -7565,7 +7590,7 @@ fn expr_preserves_pointer_identity_for_call_arg(expr: &CExpr, env: &PassEnv<'_>)
         | CExpr::Deref(_)
         | CExpr::AddrOf(_) => true,
         CExpr::Paren(inner) | CExpr::Cast { expr: inner, .. } => {
-            expr_preserves_pointer_identity_for_call_arg(inner, env)
+            expr_preserves_pointer_identity_for_call_arg(symbols, inner, env)
         }
         _ => false,
     }
@@ -7575,27 +7600,27 @@ fn semantic_call_arg_prefers_string_addr(value: &SemanticValue) -> bool {
     matches!(value, SemanticValue::Unknown | SemanticValue::Scalar(_))
 }
 
-fn preferred_semantic_call_arg_value(
+fn preferred_semantic_call_arg_value(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
     info: &UseInfo,
     var: &SSAVar,
     expr: &CExpr,
     env: &PassEnv<'_>,
 ) -> Option<SemanticValue> {
-    let mut best = canonical_frame_object_call_arg_value(info, var, expr, env);
+    let mut best = canonical_frame_object_call_arg_value(symbols, info, var, expr, env);
     if let Some(value) = info.semantic_values.get(&var.display_name()).cloned() {
-        best = preferred_semantic_call_arg_value_candidate(info, var, expr, env, best, value);
+        best = preferred_semantic_call_arg_value_candidate(symbols, info, var, expr, env, best, value);
     }
     if let Some(value) = info
         .forwarded_values
         .get(&var.display_name())
-        .and_then(|prov| semantic_source_value_from_provenance(info, prov, env))
+        .and_then(|prov| semantic_source_value_from_provenance(symbols, info, prov, env))
     {
-        best = preferred_semantic_call_arg_value_candidate(info, var, expr, env, best, value);
+        best = preferred_semantic_call_arg_value_candidate(symbols, info, var, expr, env, best, value);
     }
     best
 }
 
-fn preferred_semantic_call_arg_value_candidate(
+fn preferred_semantic_call_arg_value_candidate(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
     info: &UseInfo,
     var: &SSAVar,
     expr: &CExpr,
@@ -7603,21 +7628,21 @@ fn preferred_semantic_call_arg_value_candidate(
     current: Option<SemanticValue>,
     candidate: SemanticValue,
 ) -> Option<SemanticValue> {
-    if !should_use_semantic_call_arg_value(info, var, &candidate, expr, env) {
+    if !should_use_semantic_call_arg_value(symbols, info, var, &candidate, expr, env) {
         return current;
     }
 
     match current {
         None => Some(candidate),
         Some(existing) => {
-            let current_score = semantic_call_arg_score(
+            let current_score = semantic_call_arg_score(symbols, 
                 info,
                 var,
                 &SemanticCallArg::semantic(existing.clone()),
                 expr,
                 env,
             );
-            let candidate_score = semantic_call_arg_score(
+            let candidate_score = semantic_call_arg_score(symbols, 
                 info,
                 var,
                 &SemanticCallArg::semantic(candidate.clone()),
@@ -7633,7 +7658,7 @@ fn preferred_semantic_call_arg_value_candidate(
     }
 }
 
-fn semantic_call_arg_prefers_expr_over_stack_reload(
+fn semantic_call_arg_prefers_expr_over_stack_reload(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
     value: &SemanticValue,
     expr: &CExpr,
     env: &PassEnv<'_>,
@@ -7651,21 +7676,21 @@ fn semantic_call_arg_prefers_expr_over_stack_reload(
     };
 
     normalized_stack_slot_offset(addr).is_some()
-        && !call_arg_expr_contains_stack_placeholder(expr, 0)
-        && !call_arg_expr_contains_transient_name(expr, 0)
-        && expr_is_meaningful_stack_reload_fallback(expr, env)
-        && call_arg_expr_score(expr, env) > 0
+        && !call_arg_expr_contains_stack_placeholder(symbols, expr, 0)
+        && !call_arg_expr_contains_transient_name(symbols, expr, 0)
+        && expr_is_meaningful_stack_reload_fallback(symbols, expr, env)
+        && call_arg_expr_score(symbols, expr, env) > 0
 }
 
-fn expr_is_meaningful_stack_reload_fallback(expr: &CExpr, env: &PassEnv<'_>) -> bool {
+fn expr_is_meaningful_stack_reload_fallback(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, expr: &CExpr, env: &PassEnv<'_>) -> bool {
     match expr {
         CExpr::Var(name) => {
-            let lower = name.to_ascii_lowercase();
-            !name.eq_ignore_ascii_case("argc")
-                && !name.eq_ignore_ascii_case("argv")
-                && !name.eq_ignore_ascii_case("envp")
+            let lower = crate::symbol::spelling(symbols, *name).to_ascii_lowercase();
+            !crate::symbol::spelling(symbols, *name).eq_ignore_ascii_case("argc")
+                && !crate::symbol::spelling(symbols, *name).eq_ignore_ascii_case("argv")
+                && !crate::symbol::spelling(symbols, *name).eq_ignore_ascii_case("envp")
                 && !is_call_arg_placeholder_name(&lower)
-                && !is_call_arg_transient_name(&lower)
+                && !is_call_arg_transient_name(symbols, &lower)
                 && !is_call_arg_low_quality_name(&lower)
                 && !is_generic_entry_arg_name(&lower)
                 && !env.param_register_aliases.contains_key(&lower)
@@ -7675,10 +7700,10 @@ fn expr_is_meaningful_stack_reload_fallback(expr: &CExpr, env: &PassEnv<'_>) -> 
         | CExpr::PtrMember { .. }
         | CExpr::StringLit(_)
         | CExpr::Call { .. } => true,
-        CExpr::Unary { operand, .. } => expr_is_meaningful_stack_reload_fallback(operand, env),
+        CExpr::Unary { operand, .. } => expr_is_meaningful_stack_reload_fallback(symbols, operand, env),
         CExpr::Binary { left, right, .. } => {
-            let left_meaningful = expr_is_meaningful_stack_reload_fallback(left, env);
-            let right_meaningful = expr_is_meaningful_stack_reload_fallback(right, env);
+            let left_meaningful = expr_is_meaningful_stack_reload_fallback(symbols, left, env);
+            let right_meaningful = expr_is_meaningful_stack_reload_fallback(symbols, right, env);
             let left_constish = matches!(
                 left.as_ref(),
                 CExpr::IntLit(_)
@@ -7699,20 +7724,20 @@ fn expr_is_meaningful_stack_reload_fallback(expr: &CExpr, env: &PassEnv<'_>) -> 
                 || (right_meaningful && left_constish)
         }
         CExpr::Paren(inner) | CExpr::Cast { expr: inner, .. } => {
-            expr_is_meaningful_stack_reload_fallback(inner, env)
+            expr_is_meaningful_stack_reload_fallback(symbols, inner, env)
         }
         _ => false,
     }
 }
 
-fn canonical_frame_object_call_arg_value(
+fn canonical_frame_object_call_arg_value(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
     info: &UseInfo,
     var: &SSAVar,
     expr: &CExpr,
     env: &PassEnv<'_>,
 ) -> Option<SemanticValue> {
-    let direct = semantic_addr_for_var(info, var, env)
-        .and_then(|addr| frame_object_field_key(info, &addr, env, 0))
+    let direct = semantic_addr_for_var(symbols, info, var, env)
+        .and_then(|addr| frame_object_field_key(symbols, info, &addr, env, 0))
         .and_then(|key| info.frame_object_field_roots.get(&key).cloned());
     let semantic = info
         .semantic_values
@@ -7723,11 +7748,11 @@ fn canonical_frame_object_call_arg_value(
                 space: SpaceId::Ram,
                 addr,
                 ..
-            } => frame_object_field_key(info, addr, env, 0)
+            } => frame_object_field_key(symbols, info, addr, env, 0)
                 .and_then(|key| info.frame_object_field_roots.get(&key).cloned()),
             SemanticValue::Scalar(ScalarValue::Root(root))
                 if root.var != *var
-                    && should_use_semantic_call_arg_value(
+                    && should_use_semantic_call_arg_value(symbols, 
                         info,
                         var,
                         &SemanticValue::Scalar(ScalarValue::Root(root.clone())),
@@ -7743,10 +7768,10 @@ fn canonical_frame_object_call_arg_value(
     direct
         .into_iter()
         .chain(semantic)
-        .find(|value| should_use_semantic_call_arg_value(info, var, value, expr, env))
+        .find(|value| should_use_semantic_call_arg_value(symbols, info, var, value, expr, env))
 }
 
-fn should_use_semantic_call_arg_value(
+fn should_use_semantic_call_arg_value(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
     info: &UseInfo,
     var: &SSAVar,
     value: &SemanticValue,
@@ -7756,7 +7781,7 @@ fn should_use_semantic_call_arg_value(
     match value {
         SemanticValue::Address(_) | SemanticValue::Load { .. } => true,
         SemanticValue::Scalar(ScalarValue::Expr(semantic_expr)) => {
-            call_arg_expr_score(semantic_expr, env) >= call_arg_expr_score(expr, env)
+            call_arg_expr_score(symbols, semantic_expr, env) >= call_arg_expr_score(symbols, expr, env)
         }
         SemanticValue::Scalar(ScalarValue::Root(root)) => {
             let has_stable_negative_stack_source = semantic_value_source_offset_by_name(
@@ -7774,14 +7799,14 @@ fn should_use_semantic_call_arg_value(
                     || semantic_var_is_pointer_like(info, &root.var, env)
                     || has_stable_negative_stack_source)
                 && !is_call_arg_placeholder_name(&root.var.display_name())
-                && (!is_call_arg_transient_name(&root.var.display_name())
+                && (!is_call_arg_transient_name(symbols, &root.var.display_name())
                     || has_stable_negative_stack_source)
         }
         SemanticValue::Unknown => false,
     }
 }
 
-fn stable_negative_stack_load_size(arg: &SemanticCallArg, default_size: u32) -> u32 {
+fn stable_negative_stack_load_size(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, arg: &SemanticCallArg, default_size: u32) -> u32 {
     match arg {
         SemanticCallArg::Semantic(SemanticValue::Load { size, .. }) if *size > 0 => *size,
         SemanticCallArg::Semantic(SemanticValue::Scalar(ScalarValue::Root(root))) => {
@@ -7789,13 +7814,13 @@ fn stable_negative_stack_load_size(arg: &SemanticCallArg, default_size: u32) -> 
         }
         SemanticCallArg::FallbackExpr(CExpr::Paren(inner))
         | SemanticCallArg::FallbackExpr(CExpr::Cast { expr: inner, .. }) => {
-            stable_negative_stack_load_size(
+            stable_negative_stack_load_size(symbols, 
                 &SemanticCallArg::FallbackExpr((**inner).clone()),
                 default_size,
             )
         }
         SemanticCallArg::FallbackExpr(CExpr::Var(name)) => {
-            ssa_var_from_display_name(name, default_size)
+            ssa_var_from_display_name(&crate::symbol::spelling(symbols, *name), default_size)
                 .map(|var| var.size.max(1))
                 .unwrap_or(default_size.max(1))
         }
@@ -7842,6 +7867,7 @@ fn exact_negative_stack_offset_by_name(
     depth: u32,
     visited: &mut HashSet<String>,
 ) -> Option<i64> {
+
     if depth > 8 || !visited.insert(name.to_string()) {
         return None;
     }
@@ -7871,7 +7897,7 @@ fn exact_negative_stack_offset_by_name(
     offset
 }
 
-fn exact_negative_stack_offset_for_call_arg(
+fn exact_negative_stack_offset_for_call_arg(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
     info: &UseInfo,
     arg: &SemanticCallArg,
     depth: u32,
@@ -7886,11 +7912,11 @@ fn exact_negative_stack_offset_for_call_arg(
             exact_negative_stack_offset_for_value(info, value, depth + 1, visited)
         }
         SemanticCallArg::FallbackExpr(CExpr::Var(name)) => {
-            exact_negative_stack_offset_by_name(info, name, depth + 1, visited)
+            exact_negative_stack_offset_by_name(info, &crate::symbol::spelling(symbols, *name), depth + 1, visited)
         }
         SemanticCallArg::FallbackExpr(CExpr::Paren(inner))
         | SemanticCallArg::FallbackExpr(CExpr::Cast { expr: inner, .. }) => {
-            exact_negative_stack_offset_for_call_arg(
+            exact_negative_stack_offset_for_call_arg(symbols, 
                 info,
                 &SemanticCallArg::FallbackExpr((**inner).clone()),
                 depth + 1,
@@ -7901,7 +7927,7 @@ fn exact_negative_stack_offset_for_call_arg(
     }
 }
 
-fn canonicalize_call_arg_binding_to_negative_stack_load(
+fn canonicalize_call_arg_binding_to_negative_stack_load(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
     info: &UseInfo,
     binding: &mut CallArgBinding,
     source_var: Option<&SSAVar>,
@@ -7912,7 +7938,7 @@ fn canonicalize_call_arg_binding_to_negative_stack_load(
     }
 
     let offset =
-        exact_negative_stack_offset_for_call_arg(info, &binding.arg, 0, &mut HashSet::new())
+        exact_negative_stack_offset_for_call_arg(symbols, info, &binding.arg, 0, &mut HashSet::new())
             .filter(|offset| *offset < 0)
             .or_else(|| {
                 source_var.and_then(|var| {
@@ -7927,7 +7953,7 @@ fn canonicalize_call_arg_binding_to_negative_stack_load(
             })?;
     let size = source_var
         .map(|var| var.size.max(1))
-        .unwrap_or_else(|| stable_negative_stack_load_size(&binding.arg, default_size));
+        .unwrap_or_else(|| stable_negative_stack_load_size(symbols, &binding.arg, default_size));
     binding.arg = SemanticCallArg::semantic(SemanticValue::Load {
         space: SpaceId::Ram,
         addr: NormalizedAddr {
@@ -7941,7 +7967,7 @@ fn canonicalize_call_arg_binding_to_negative_stack_load(
     Some(offset)
 }
 
-fn semantic_call_arg_string_addr(
+fn semantic_call_arg_string_addr(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
     info: &UseInfo,
     var: &SSAVar,
     expr: &CExpr,
@@ -7949,10 +7975,10 @@ fn semantic_call_arg_string_addr(
     depth: u32,
 ) -> Option<u64> {
     let mut visited = BTreeSet::new();
-    semantic_call_arg_string_addr_inner(info, var, expr, env, depth, &mut visited)
+    semantic_call_arg_string_addr_inner(symbols, info, var, expr, env, depth, &mut visited)
 }
 
-fn semantic_call_arg_string_addr_inner(
+fn semantic_call_arg_string_addr_inner(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
     info: &UseInfo,
     var: &SSAVar,
     expr: &CExpr,
@@ -7979,13 +8005,13 @@ fn semantic_call_arg_string_addr_inner(
 
     let resolved = match info.semantic_values.get(&key) {
         Some(SemanticValue::Scalar(ScalarValue::Expr(inner))) => {
-            semantic_call_arg_addr_from_expr(info, inner, env, depth + 1, visited)
+            semantic_call_arg_addr_from_expr(symbols, info, inner, env, depth + 1, visited)
         }
         Some(SemanticValue::Scalar(ScalarValue::Root(root))) if root.var != *var => {
             let root_key = root.var.display_name();
             let root_expr =
-                lookup_call_arg_definition_expr(info, &root_key).unwrap_or_else(|| expr.clone());
-            semantic_call_arg_string_addr_inner(
+                lookup_call_arg_definition_expr(symbols, info, &root_key).unwrap_or_else(|| expr.clone());
+            semantic_call_arg_string_addr_inner(symbols, 
                 info,
                 &root.var,
                 &root_expr,
@@ -7999,15 +8025,15 @@ fn semantic_call_arg_string_addr_inner(
             index: None,
             scale_bytes: 0,
             offset_bytes: 0,
-        })) => semantic_call_arg_addr_from_expr(info, inner, env, depth + 1, visited),
+        })) => semantic_call_arg_addr_from_expr(symbols, info, inner, env, depth + 1, visited),
         _ => None,
     }
     .or_else(|| {
         info.forwarded_values.get(&key).and_then(|prov| {
             prov.source_var.as_ref().and_then(|source_var| {
-                let source_expr = lookup_call_arg_definition_expr(info, &source_var.display_name())
+                let source_expr = lookup_call_arg_definition_expr(symbols, info, &source_var.display_name())
                     .unwrap_or_else(|| expr.clone());
-                semantic_call_arg_string_addr_inner(
+                semantic_call_arg_string_addr_inner(symbols, 
                     info,
                     source_var,
                     &source_expr,
@@ -8019,8 +8045,8 @@ fn semantic_call_arg_string_addr_inner(
         })
     })
     .or_else(|| {
-        lookup_call_arg_definition_expr(info, &key).and_then(|inner| {
-            semantic_call_arg_addr_from_expr(info, &inner, env, depth + 1, visited)
+        lookup_call_arg_definition_expr(symbols, info, &key).and_then(|inner| {
+            semantic_call_arg_addr_from_expr(symbols, info, &inner, env, depth + 1, visited)
         })
     });
 
@@ -8028,7 +8054,7 @@ fn semantic_call_arg_string_addr_inner(
     resolved
 }
 
-fn semantic_call_arg_addr_from_expr(
+fn semantic_call_arg_addr_from_expr(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
     info: &UseInfo,
     expr: &CExpr,
     env: &PassEnv<'_>,
@@ -8049,24 +8075,24 @@ fn semantic_call_arg_addr_from_expr(
 
     match expr {
         CExpr::Var(name) => {
-            if !visited.insert(name.clone()) {
+            if !visited.insert(crate::symbol::spelling(symbols, *name).to_string()) {
                 return None;
             }
 
-            let resolved = lookup_call_arg_definition_expr(info, name)
+            let resolved = lookup_call_arg_definition_expr(symbols, info, &crate::symbol::spelling(symbols, *name))
                 .and_then(|inner| {
-                    semantic_call_arg_addr_from_expr(info, &inner, env, depth + 1, visited)
+                    semantic_call_arg_addr_from_expr(symbols, info, &inner, env, depth + 1, visited)
                 })
                 .or_else(|| {
-                    lookup_call_arg_semantic_value(info, name).and_then(|value| match value {
+                    lookup_call_arg_semantic_value(info, &crate::symbol::spelling(symbols, *name)).and_then(|value| match value {
                         SemanticValue::Scalar(ScalarValue::Expr(inner)) => {
-                            semantic_call_arg_addr_from_expr(info, inner, env, depth + 1, visited)
+                            semantic_call_arg_addr_from_expr(symbols, info, inner, env, depth + 1, visited)
                         }
                         SemanticValue::Scalar(ScalarValue::Root(root)) => {
                             let root_expr =
-                                lookup_call_arg_definition_expr(info, &root.display_name())
-                                    .unwrap_or_else(|| CExpr::Var(root.display_name()));
-                            semantic_call_arg_string_addr_inner(
+                                lookup_call_arg_definition_expr(symbols, info, &root.display_name())
+                                    .unwrap_or_else(|| crate::symbol::var_ref(symbols, root.display_name()));
+                            semantic_call_arg_string_addr_inner(symbols, 
                                 info,
                                 &root.var,
                                 &root_expr,
@@ -8081,18 +8107,18 @@ fn semantic_call_arg_addr_from_expr(
                             scale_bytes: 0,
                             offset_bytes: 0,
                         }) => {
-                            semantic_call_arg_addr_from_expr(info, inner, env, depth + 1, visited)
+                            semantic_call_arg_addr_from_expr(symbols, info, inner, env, depth + 1, visited)
                         }
                         _ => None,
                     })
                 })
                 .or_else(|| {
-                    info.forwarded_values.get(name).and_then(|prov| {
+                    info.forwarded_values.get(&*crate::symbol::spelling(symbols, *name)).and_then(|prov| {
                         prov.source_var.as_ref().and_then(|source_var| {
                             let source_expr =
-                                lookup_call_arg_definition_expr(info, &source_var.display_name())
-                                    .unwrap_or_else(|| CExpr::Var(source_var.display_name()));
-                            semantic_call_arg_string_addr_inner(
+                                lookup_call_arg_definition_expr(symbols, info, &source_var.display_name())
+                                    .unwrap_or_else(|| crate::symbol::var_ref(symbols, source_var.display_name()));
+                            semantic_call_arg_string_addr_inner(symbols, 
                                 info,
                                 source_var,
                                 &source_expr,
@@ -8104,14 +8130,14 @@ fn semantic_call_arg_addr_from_expr(
                     })
                 });
 
-            visited.remove(name);
+            visited.remove(&*crate::symbol::spelling(symbols, *name));
             resolved
         }
         CExpr::Paren(inner) | CExpr::AddrOf(inner) => {
-            semantic_call_arg_addr_from_expr(info, inner, env, depth + 1, visited)
+            semantic_call_arg_addr_from_expr(symbols, info, inner, env, depth + 1, visited)
         }
         CExpr::Cast { expr: inner, .. } => {
-            semantic_call_arg_addr_from_expr(info, inner, env, depth + 1, visited)
+            semantic_call_arg_addr_from_expr(symbols, info, inner, env, depth + 1, visited)
         }
         CExpr::Binary {
             op: BinaryOp::Add | BinaryOp::Sub,
@@ -8122,6 +8148,7 @@ fn semantic_call_arg_addr_from_expr(
 }
 
 fn lookup_call_arg_semantic_value<'a>(info: &'a UseInfo, name: &str) -> Option<&'a SemanticValue> {
+
     info.semantic_values
         .get(name)
         .or_else(|| info.semantic_values.get(&name.to_ascii_lowercase()))
@@ -8140,7 +8167,8 @@ fn lookup_call_arg_semantic_value<'a>(info: &'a UseInfo, name: &str) -> Option<&
         })
 }
 
-fn lookup_call_arg_definition_expr(info: &UseInfo, name: &str) -> Option<CExpr> {
+fn lookup_call_arg_definition_expr(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, info: &UseInfo, name: &str) -> Option<CExpr> {
+
     info.definitions
         .get(name)
         .cloned()
@@ -8226,9 +8254,9 @@ fn reinterpret_decimal_digits_as_hex(value: u64) -> Option<u64> {
     u64::from_str_radix(&digits, 16).ok()
 }
 
-fn call_arg_candidate_score(info: &UseInfo, var: &SSAVar, expr: &CExpr, env: &PassEnv<'_>) -> i32 {
-    let mut score = call_arg_expr_score(expr, env);
-    if semantic_call_arg_string_addr(info, var, expr, env, 0).is_some() {
+fn call_arg_candidate_score(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, info: &UseInfo, var: &SSAVar, expr: &CExpr, env: &PassEnv<'_>) -> i32 {
+    let mut score = call_arg_expr_score(symbols, expr, env);
+    if semantic_call_arg_string_addr(symbols, info, var, expr, env, 0).is_some() {
         score += 200;
     }
     match info.semantic_values.get(&var.display_name()) {
@@ -8239,7 +8267,7 @@ fn call_arg_candidate_score(info: &UseInfo, var: &SSAVar, expr: &CExpr, env: &Pa
     score
 }
 
-fn semantic_call_arg_score(
+fn semantic_call_arg_score(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
     info: &UseInfo,
     var: &SSAVar,
     arg: &SemanticCallArg,
@@ -8247,10 +8275,10 @@ fn semantic_call_arg_score(
     env: &PassEnv<'_>,
 ) -> i32 {
     match arg {
-        SemanticCallArg::StringAddr(_) => 300 + call_arg_expr_score(expr, env),
+        SemanticCallArg::StringAddr(_) => 300 + call_arg_expr_score(symbols, expr, env),
         SemanticCallArg::Semantic(SemanticValue::Load { addr, .. })
         | SemanticCallArg::Semantic(SemanticValue::Address(addr)) => {
-            let mut score = 220 + call_arg_expr_score(expr, env);
+            let mut score = 220 + call_arg_expr_score(symbols, expr, env);
             if let Some(offset) = normalized_stack_slot_offset(addr) {
                 if offset >= 0 {
                     score -= 80;
@@ -8261,8 +8289,8 @@ fn semantic_call_arg_score(
             score
         }
         SemanticCallArg::Semantic(SemanticValue::Scalar(ScalarValue::Root(root))) => {
-            let mut score = 180 + call_arg_expr_score(expr, env);
-            if canonical_frame_object_call_arg_value(info, var, expr, env).is_some() {
+            let mut score = 180 + call_arg_expr_score(symbols, expr, env);
+            if canonical_frame_object_call_arg_value(symbols, info, var, expr, env).is_some() {
                 score += 80;
             }
             if root.var.version == 0
@@ -8277,13 +8305,13 @@ fn semantic_call_arg_score(
             score
         }
         SemanticCallArg::Semantic(SemanticValue::Scalar(ScalarValue::Expr(_))) => {
-            140 + call_arg_expr_score(expr, env)
+            140 + call_arg_expr_score(symbols, expr, env)
         }
         SemanticCallArg::Semantic(SemanticValue::Unknown) => {
-            call_arg_candidate_score(info, var, expr, env)
+            call_arg_candidate_score(symbols, info, var, expr, env)
         }
         SemanticCallArg::FallbackExpr(actual_expr) => {
-            let mut score = call_arg_candidate_score(info, var, actual_expr, env);
+            let mut score = call_arg_candidate_score(symbols, info, var, actual_expr, env);
             if matches!(actual_expr, CExpr::Call { .. }) {
                 score += 220;
             }
@@ -8292,7 +8320,7 @@ fn semantic_call_arg_score(
     }
 }
 
-fn semantic_call_arg_is_generic_entry_root(arg: &SemanticCallArg, env: &PassEnv<'_>) -> bool {
+fn semantic_call_arg_is_generic_entry_root(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, arg: &SemanticCallArg, env: &PassEnv<'_>) -> bool {
     match arg {
         SemanticCallArg::Semantic(SemanticValue::Scalar(ScalarValue::Root(root))) => {
             root.var.version == 0
@@ -8301,16 +8329,16 @@ fn semantic_call_arg_is_generic_entry_root(arg: &SemanticCallArg, env: &PassEnv<
                     .contains_key(&root.var.name.to_ascii_lowercase())
         }
         SemanticCallArg::FallbackExpr(CExpr::Var(name)) => {
-            name.eq_ignore_ascii_case("argc")
-                || name.eq_ignore_ascii_case("argv")
-                || name.eq_ignore_ascii_case("envp")
-                || name.strip_prefix("arg").is_some_and(|suffix| {
+            crate::symbol::spelling(symbols, *name).eq_ignore_ascii_case("argc")
+                || crate::symbol::spelling(symbols, *name).eq_ignore_ascii_case("argv")
+                || crate::symbol::spelling(symbols, *name).eq_ignore_ascii_case("envp")
+                || crate::symbol::spelling(symbols, *name).strip_prefix("arg").is_some_and(|suffix| {
                     !suffix.is_empty() && suffix.chars().all(|ch| ch.is_ascii_digit())
                 })
         }
         SemanticCallArg::FallbackExpr(CExpr::Paren(inner))
         | SemanticCallArg::FallbackExpr(CExpr::Cast { expr: inner, .. }) => {
-            semantic_call_arg_is_generic_entry_root(
+            semantic_call_arg_is_generic_entry_root(symbols, 
                 &SemanticCallArg::FallbackExpr((**inner).clone()),
                 env,
             )
@@ -8379,7 +8407,7 @@ fn is_structured_call_arg_candidate(arg: &SemanticCallArg) -> bool {
     }
 }
 
-fn call_stack_arg_offset(
+fn call_stack_arg_offset(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
     ops: &[SSAOp],
     producers: &HashMap<String, usize>,
     info: &UseInfo,
@@ -8396,12 +8424,12 @@ fn call_stack_arg_offset(
         return Some(0);
     }
 
-    if let Some(offset) = stack_slot_offset_for_addr(info, addr, env) {
+    if let Some(offset) = stack_slot_offset_for_addr(symbols, info, addr, env) {
         return Some(offset);
     }
 
     if let Some(offset) =
-        utils::extract_stack_offset_from_var(addr, &info.definitions, env.fp_name, env.sp_name)
+        utils::extract_stack_offset_from_var(symbols, addr, &info.definitions, env.fp_name, env.sp_name)
     {
         return Some(offset);
     }
@@ -8416,31 +8444,31 @@ fn call_stack_arg_offset(
         | SSAOp::Trunc { src, .. }
         | SSAOp::Cast { src, .. }
         | SSAOp::Subpiece { src, .. } => {
-            call_stack_arg_offset(ops, producers, info, src, env, depth + 1)
+            call_stack_arg_offset(symbols, ops, producers, info, src, env, depth + 1)
         }
         _ => None,
     }
 }
 
-fn call_arg_expr_score(expr: &CExpr, env: &PassEnv<'_>) -> i32 {
+fn call_arg_expr_score(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, expr: &CExpr, env: &PassEnv<'_>) -> i32 {
     let mut score = 0;
     if call_arg_expr_resolves_to_literal(expr, env, 0) {
         score += 100;
     }
-    score += call_arg_expr_semantic_weight(expr, 0);
-    if call_arg_expr_contains_stack_placeholder(expr, 0) {
+    score += call_arg_expr_semantic_weight(symbols, expr, 0);
+    if call_arg_expr_contains_stack_placeholder(symbols, expr, 0) {
         score -= 80;
     }
-    if call_arg_expr_contains_transient_name(expr, 0) {
+    if call_arg_expr_contains_transient_name(symbols, expr, 0) {
         score -= 20;
     }
-    if call_arg_expr_contains_low_quality_name(expr, 0) {
+    if call_arg_expr_contains_low_quality_name(symbols, expr, 0) {
         score -= 30;
     }
     score
 }
 
-fn call_arg_expr_semantic_weight(expr: &CExpr, depth: u32) -> i32 {
+fn call_arg_expr_semantic_weight(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, expr: &CExpr, depth: u32) -> i32 {
     if depth > 8 {
         return 0;
     }
@@ -8448,39 +8476,39 @@ fn call_arg_expr_semantic_weight(expr: &CExpr, depth: u32) -> i32 {
         CExpr::StringLit(_) => 80,
         CExpr::External { .. } => 40,
         CExpr::Subscript { base, index } => {
-            40 + call_arg_expr_semantic_weight(base, depth + 1)
-                + call_arg_expr_semantic_weight(index, depth + 1)
+            40 + call_arg_expr_semantic_weight(symbols, base, depth + 1)
+                + call_arg_expr_semantic_weight(symbols, index, depth + 1)
         }
         CExpr::Member { base, .. } | CExpr::PtrMember { base, .. } => {
-            45 + call_arg_expr_semantic_weight(base, depth + 1)
+            45 + call_arg_expr_semantic_weight(symbols, base, depth + 1)
         }
         CExpr::Deref(inner) | CExpr::AddrOf(inner) => {
-            20 + call_arg_expr_semantic_weight(inner, depth + 1)
+            20 + call_arg_expr_semantic_weight(symbols, inner, depth + 1)
         }
         CExpr::Cast { expr: inner, .. } | CExpr::Paren(inner) => {
-            call_arg_expr_semantic_weight(inner, depth + 1)
+            call_arg_expr_semantic_weight(symbols, inner, depth + 1)
         }
-        CExpr::Unary { operand, .. } => call_arg_expr_semantic_weight(operand, depth + 1),
+        CExpr::Unary { operand, .. } => call_arg_expr_semantic_weight(symbols, operand, depth + 1),
         CExpr::Binary { left, right, .. } => {
-            10 + call_arg_expr_semantic_weight(left, depth + 1)
-                + call_arg_expr_semantic_weight(right, depth + 1)
+            10 + call_arg_expr_semantic_weight(symbols, left, depth + 1)
+                + call_arg_expr_semantic_weight(symbols, right, depth + 1)
         }
         CExpr::Var(name) => {
-            if is_call_arg_placeholder_name(name) {
+            if is_call_arg_placeholder_name(&crate::symbol::spelling(symbols, *name)) {
                 -20
-            } else if is_call_arg_low_quality_name(name) {
+            } else if is_call_arg_low_quality_name(&crate::symbol::spelling(symbols, *name)) {
                 -15
-            } else if is_call_arg_transient_name(name) {
+            } else if is_call_arg_transient_name(symbols, &crate::symbol::spelling(symbols, *name)) {
                 -10
             } else {
                 25
             }
         }
         CExpr::Call { func, args } => {
-            call_arg_expr_semantic_weight(func, depth + 1)
+            call_arg_expr_semantic_weight(symbols, func, depth + 1)
                 + args
                     .iter()
-                    .map(|arg| call_arg_expr_semantic_weight(arg, depth + 1))
+                    .map(|arg| call_arg_expr_semantic_weight(symbols, arg, depth + 1))
                     .sum::<i32>()
         }
         CExpr::Ternary {
@@ -8488,61 +8516,61 @@ fn call_arg_expr_semantic_weight(expr: &CExpr, depth: u32) -> i32 {
             then_expr,
             else_expr,
         } => {
-            call_arg_expr_semantic_weight(cond, depth + 1)
-                + call_arg_expr_semantic_weight(then_expr, depth + 1)
-                + call_arg_expr_semantic_weight(else_expr, depth + 1)
+            call_arg_expr_semantic_weight(symbols, cond, depth + 1)
+                + call_arg_expr_semantic_weight(symbols, then_expr, depth + 1)
+                + call_arg_expr_semantic_weight(symbols, else_expr, depth + 1)
         }
         CExpr::Comma(items) => items
             .iter()
-            .map(|item| call_arg_expr_semantic_weight(item, depth + 1))
+            .map(|item| call_arg_expr_semantic_weight(symbols, item, depth + 1))
             .sum(),
         CExpr::IntLit(_) | CExpr::UIntLit(_) | CExpr::FloatLit(_) | CExpr::CharLit(_) => 5,
         CExpr::Sizeof(_) | CExpr::SizeofType(_) => 0,
     }
 }
 
-fn call_arg_expr_contains_stack_placeholder(expr: &CExpr, depth: u32) -> bool {
+fn call_arg_expr_contains_stack_placeholder(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, expr: &CExpr, depth: u32) -> bool {
     if depth > 8 {
         return false;
     }
     match expr {
         CExpr::External { .. } => false,
-        CExpr::Var(name) => is_call_arg_placeholder_name(name),
+        CExpr::Var(name) => is_call_arg_placeholder_name(&crate::symbol::spelling(symbols, *name)),
         CExpr::Deref(inner)
         | CExpr::AddrOf(inner)
         | CExpr::Paren(inner)
         | CExpr::Cast { expr: inner, .. }
         | CExpr::Unary { operand: inner, .. }
-        | CExpr::Sizeof(inner) => call_arg_expr_contains_stack_placeholder(inner, depth + 1),
+        | CExpr::Sizeof(inner) => call_arg_expr_contains_stack_placeholder(symbols, inner, depth + 1),
         CExpr::Binary { left, right, .. } => {
-            call_arg_expr_contains_stack_placeholder(left, depth + 1)
-                || call_arg_expr_contains_stack_placeholder(right, depth + 1)
+            call_arg_expr_contains_stack_placeholder(symbols, left, depth + 1)
+                || call_arg_expr_contains_stack_placeholder(symbols, right, depth + 1)
         }
         CExpr::Subscript { base, index } => {
-            call_arg_expr_contains_stack_placeholder(base, depth + 1)
-                || call_arg_expr_contains_stack_placeholder(index, depth + 1)
+            call_arg_expr_contains_stack_placeholder(symbols, base, depth + 1)
+                || call_arg_expr_contains_stack_placeholder(symbols, index, depth + 1)
         }
         CExpr::Member { base, .. } | CExpr::PtrMember { base, .. } => {
-            call_arg_expr_contains_stack_placeholder(base, depth + 1)
+            call_arg_expr_contains_stack_placeholder(symbols, base, depth + 1)
         }
         CExpr::Call { func, args } => {
-            call_arg_expr_contains_stack_placeholder(func, depth + 1)
+            call_arg_expr_contains_stack_placeholder(symbols, func, depth + 1)
                 || args
                     .iter()
-                    .any(|arg| call_arg_expr_contains_stack_placeholder(arg, depth + 1))
+                    .any(|arg| call_arg_expr_contains_stack_placeholder(symbols, arg, depth + 1))
         }
         CExpr::Ternary {
             cond,
             then_expr,
             else_expr,
         } => {
-            call_arg_expr_contains_stack_placeholder(cond, depth + 1)
-                || call_arg_expr_contains_stack_placeholder(then_expr, depth + 1)
-                || call_arg_expr_contains_stack_placeholder(else_expr, depth + 1)
+            call_arg_expr_contains_stack_placeholder(symbols, cond, depth + 1)
+                || call_arg_expr_contains_stack_placeholder(symbols, then_expr, depth + 1)
+                || call_arg_expr_contains_stack_placeholder(symbols, else_expr, depth + 1)
         }
         CExpr::Comma(items) => items
             .iter()
-            .any(|item| call_arg_expr_contains_stack_placeholder(item, depth + 1)),
+            .any(|item| call_arg_expr_contains_stack_placeholder(symbols, item, depth + 1)),
         CExpr::IntLit(_)
         | CExpr::UIntLit(_)
         | CExpr::FloatLit(_)
@@ -8552,48 +8580,48 @@ fn call_arg_expr_contains_stack_placeholder(expr: &CExpr, depth: u32) -> bool {
     }
 }
 
-fn call_arg_expr_contains_transient_name(expr: &CExpr, depth: u32) -> bool {
+fn call_arg_expr_contains_transient_name(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, expr: &CExpr, depth: u32) -> bool {
     if depth > 8 {
         return false;
     }
     match expr {
         CExpr::External { .. } => false,
-        CExpr::Var(name) => is_call_arg_transient_name(name),
+        CExpr::Var(name) => is_call_arg_transient_name(symbols, &crate::symbol::spelling(symbols, *name)),
         CExpr::Deref(inner)
         | CExpr::AddrOf(inner)
         | CExpr::Paren(inner)
         | CExpr::Cast { expr: inner, .. }
         | CExpr::Unary { operand: inner, .. }
-        | CExpr::Sizeof(inner) => call_arg_expr_contains_transient_name(inner, depth + 1),
+        | CExpr::Sizeof(inner) => call_arg_expr_contains_transient_name(symbols, inner, depth + 1),
         CExpr::Binary { left, right, .. } => {
-            call_arg_expr_contains_transient_name(left, depth + 1)
-                || call_arg_expr_contains_transient_name(right, depth + 1)
+            call_arg_expr_contains_transient_name(symbols, left, depth + 1)
+                || call_arg_expr_contains_transient_name(symbols, right, depth + 1)
         }
         CExpr::Subscript { base, index } => {
-            call_arg_expr_contains_transient_name(base, depth + 1)
-                || call_arg_expr_contains_transient_name(index, depth + 1)
+            call_arg_expr_contains_transient_name(symbols, base, depth + 1)
+                || call_arg_expr_contains_transient_name(symbols, index, depth + 1)
         }
         CExpr::Member { base, .. } | CExpr::PtrMember { base, .. } => {
-            call_arg_expr_contains_transient_name(base, depth + 1)
+            call_arg_expr_contains_transient_name(symbols, base, depth + 1)
         }
         CExpr::Call { func, args } => {
-            call_arg_expr_contains_transient_name(func, depth + 1)
+            call_arg_expr_contains_transient_name(symbols, func, depth + 1)
                 || args
                     .iter()
-                    .any(|arg| call_arg_expr_contains_transient_name(arg, depth + 1))
+                    .any(|arg| call_arg_expr_contains_transient_name(symbols, arg, depth + 1))
         }
         CExpr::Ternary {
             cond,
             then_expr,
             else_expr,
         } => {
-            call_arg_expr_contains_transient_name(cond, depth + 1)
-                || call_arg_expr_contains_transient_name(then_expr, depth + 1)
-                || call_arg_expr_contains_transient_name(else_expr, depth + 1)
+            call_arg_expr_contains_transient_name(symbols, cond, depth + 1)
+                || call_arg_expr_contains_transient_name(symbols, then_expr, depth + 1)
+                || call_arg_expr_contains_transient_name(symbols, else_expr, depth + 1)
         }
         CExpr::Comma(items) => items
             .iter()
-            .any(|item| call_arg_expr_contains_transient_name(item, depth + 1)),
+            .any(|item| call_arg_expr_contains_transient_name(symbols, item, depth + 1)),
         CExpr::IntLit(_)
         | CExpr::UIntLit(_)
         | CExpr::FloatLit(_)
@@ -8603,48 +8631,48 @@ fn call_arg_expr_contains_transient_name(expr: &CExpr, depth: u32) -> bool {
     }
 }
 
-fn call_arg_expr_contains_low_quality_name(expr: &CExpr, depth: u32) -> bool {
+fn call_arg_expr_contains_low_quality_name(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, expr: &CExpr, depth: u32) -> bool {
     if depth > 8 {
         return false;
     }
     match expr {
         CExpr::External { .. } => false,
-        CExpr::Var(name) => is_call_arg_low_quality_name(name),
+        CExpr::Var(name) => is_call_arg_low_quality_name(&crate::symbol::spelling(symbols, *name)),
         CExpr::Deref(inner)
         | CExpr::AddrOf(inner)
         | CExpr::Paren(inner)
         | CExpr::Cast { expr: inner, .. }
         | CExpr::Unary { operand: inner, .. }
-        | CExpr::Sizeof(inner) => call_arg_expr_contains_low_quality_name(inner, depth + 1),
+        | CExpr::Sizeof(inner) => call_arg_expr_contains_low_quality_name(symbols, inner, depth + 1),
         CExpr::Binary { left, right, .. } => {
-            call_arg_expr_contains_low_quality_name(left, depth + 1)
-                || call_arg_expr_contains_low_quality_name(right, depth + 1)
+            call_arg_expr_contains_low_quality_name(symbols, left, depth + 1)
+                || call_arg_expr_contains_low_quality_name(symbols, right, depth + 1)
         }
         CExpr::Subscript { base, index } => {
-            call_arg_expr_contains_low_quality_name(base, depth + 1)
-                || call_arg_expr_contains_low_quality_name(index, depth + 1)
+            call_arg_expr_contains_low_quality_name(symbols, base, depth + 1)
+                || call_arg_expr_contains_low_quality_name(symbols, index, depth + 1)
         }
         CExpr::Member { base, .. } | CExpr::PtrMember { base, .. } => {
-            call_arg_expr_contains_low_quality_name(base, depth + 1)
+            call_arg_expr_contains_low_quality_name(symbols, base, depth + 1)
         }
         CExpr::Call { func, args } => {
-            call_arg_expr_contains_low_quality_name(func, depth + 1)
+            call_arg_expr_contains_low_quality_name(symbols, func, depth + 1)
                 || args
                     .iter()
-                    .any(|arg| call_arg_expr_contains_low_quality_name(arg, depth + 1))
+                    .any(|arg| call_arg_expr_contains_low_quality_name(symbols, arg, depth + 1))
         }
         CExpr::Ternary {
             cond,
             then_expr,
             else_expr,
         } => {
-            call_arg_expr_contains_low_quality_name(cond, depth + 1)
-                || call_arg_expr_contains_low_quality_name(then_expr, depth + 1)
-                || call_arg_expr_contains_low_quality_name(else_expr, depth + 1)
+            call_arg_expr_contains_low_quality_name(symbols, cond, depth + 1)
+                || call_arg_expr_contains_low_quality_name(symbols, then_expr, depth + 1)
+                || call_arg_expr_contains_low_quality_name(symbols, else_expr, depth + 1)
         }
         CExpr::Comma(items) => items
             .iter()
-            .any(|item| call_arg_expr_contains_low_quality_name(item, depth + 1)),
+            .any(|item| call_arg_expr_contains_low_quality_name(symbols, item, depth + 1)),
         CExpr::IntLit(_)
         | CExpr::UIntLit(_)
         | CExpr::FloatLit(_)
@@ -8723,11 +8751,13 @@ fn call_arg_expr_literal_value(expr: &CExpr, depth: u32) -> Option<u64> {
 }
 
 fn is_call_arg_placeholder_name(name: &str) -> bool {
+
     let lower = name.to_ascii_lowercase();
     lower == "stack" || lower == "saved_fp" || lower.starts_with("stack_")
 }
 
 fn is_call_arg_low_quality_name(name: &str) -> bool {
+
     let lower = name.to_ascii_lowercase();
     lower.starts_with("var_")
         || lower == "saved_fp"
@@ -8735,7 +8765,8 @@ fn is_call_arg_low_quality_name(name: &str) -> bool {
         || is_generic_entry_arg_name(&lower)
 }
 
-fn is_call_arg_transient_name(name: &str) -> bool {
+fn is_call_arg_transient_name(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, name: &str) -> bool {
+
     let lower = name.to_ascii_lowercase();
     utils::is_temporary_constant_or_memory_name(name)
         || utils::is_cpu_flag(&lower)

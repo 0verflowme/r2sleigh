@@ -41,6 +41,7 @@ pub(crate) fn register_bit_width(name: &str) -> Option<u32> {
 }
 
 pub(crate) fn register_family_name(name: &str) -> Option<String> {
+
     let lower = name.to_ascii_lowercase();
     let base = lower
         .rsplit_once('_')

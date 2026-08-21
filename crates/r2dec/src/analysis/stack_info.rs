@@ -10,15 +10,15 @@ pub(crate) struct StackScratch {
     pub(crate) info: StackInfo,
 }
 
-pub(crate) fn analyze(blocks: &[SSABlock], use_info: &UseInfo, env: &PassEnv<'_>) -> StackInfo {
+pub(crate) fn analyze(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, blocks: &[SSABlock], use_info: &UseInfo, env: &PassEnv<'_>) -> StackInfo {
     let mut scratch = StackScratch::default();
 
-    analyze_stack_vars(&mut scratch, blocks, use_info, env);
+    analyze_stack_vars(symbols, &mut scratch, blocks, use_info, env);
 
     scratch.info
 }
 
-fn analyze_stack_vars(
+fn analyze_stack_vars(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
     scratch: &mut StackScratch,
     blocks: &[SSABlock],
     use_info: &UseInfo,
@@ -32,7 +32,7 @@ fn analyze_stack_vars(
                     addr,
                     ..
                 } => {
-                    if let Some(offset) = utils::extract_stack_offset_from_var(
+                    if let Some(offset) = utils::extract_stack_offset_from_var(symbols, 
                         addr,
                         &use_info.definitions,
                         env.fp_name,
@@ -46,7 +46,7 @@ fn analyze_stack_vars(
                     addr,
                     val,
                 } => {
-                    if let Some(offset) = utils::extract_stack_offset_from_var(
+                    if let Some(offset) = utils::extract_stack_offset_from_var(symbols, 
                         addr,
                         &use_info.definitions,
                         env.fp_name,
@@ -89,7 +89,7 @@ fn analyze_stack_vars(
                     if let Some(offset) = utils::parse_const_offset(b)
                         && let Some(stack_var_name) = scratch.info.stack_vars.get(&offset).cloned()
                     {
-                        let expr = CExpr::Var(format!("&{}", stack_var_name));
+                        let expr = crate::symbol::var_ref(symbols, format!("&{}", stack_var_name));
                         scratch
                             .info
                             .definition_overrides
@@ -110,7 +110,7 @@ fn analyze_stack_vars(
                     if preserve_indirect_load_shape {
                         continue;
                     }
-                    let stack_var_name = stack_var_for_addr_var(
+                    let stack_var_name = stack_var_for_addr_var(symbols, 
                         addr,
                         StackVarLookupInputs {
                             definitions: &merged_defs,
@@ -123,7 +123,7 @@ fn analyze_stack_vars(
                             env,
                         },
                     );
-                    let stack_slot = stack_slot_for_addr_var(
+                    let stack_slot = stack_slot_for_addr_var(symbols, 
                         addr,
                         &merged_defs,
                         &use_info.stack_slots,
@@ -137,7 +137,7 @@ fn analyze_stack_vars(
                         use_info,
                         env,
                     ) {
-                        let expr = normalize_scalar_stack_load_expr(
+                        let expr = normalize_scalar_stack_load_expr(symbols, 
                             expr,
                             stack_var_name.as_deref(),
                             stack_slot,
@@ -148,7 +148,7 @@ fn analyze_stack_vars(
                             .insert(dst.display_name(), expr.clone());
                         merged_defs.insert(dst.display_name(), expr);
                     } else if let Some(stack_var_name) = stack_var_name {
-                        let expr = CExpr::Var(stack_var_name);
+                        let expr = crate::symbol::var_ref(symbols, stack_var_name);
                         scratch
                             .info
                             .definition_overrides
@@ -231,7 +231,7 @@ struct StackVarLookupInputs<'a, 'b> {
     env: &'a PassEnv<'b>,
 }
 
-fn stack_var_for_addr_var(
+fn stack_var_for_addr_var(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
     addr: &r2ssa::SSAVar,
     inputs: StackVarLookupInputs<'_, '_>,
 ) -> Option<String> {
@@ -244,7 +244,7 @@ fn stack_var_for_addr_var(
         .get(&addr_key)
         .map(|slot| slot.offset)
         .or_else(|| {
-            utils::extract_stack_offset_from_var(
+            utils::extract_stack_offset_from_var(symbols, 
                 addr,
                 inputs.definitions,
                 inputs.env.fp_name,
@@ -260,8 +260,8 @@ fn stack_var_for_addr_var(
                 .unwrap_or_else(|| generic_stack_var_name(offset));
             (offset, preferred)
         });
-    if let Some(alias) = resolve_stack_alias_from_addr_expr(
-        &CExpr::Var(addr_key.clone()),
+    if let Some(alias) = resolve_stack_alias_from_addr_expr(symbols, 
+        &crate::symbol::var_ref(symbols, addr_key.clone()),
         inputs.definitions,
         inputs.stack_vars,
         inputs.env,
@@ -281,6 +281,7 @@ fn stack_var_for_addr_var(
     let empty_ptrs: HashMap<String, PtrArith> = HashMap::new();
     let empty_semantic_values: HashMap<String, crate::analysis::SemanticValue> = HashMap::new();
     let lower = LowerCtx {
+        symbols: crate::analysis::lower::no_symbols(),
         string_literals: crate::analysis::lower::no_string_literals(),
         use_info: None,
         definitions: inputs.definitions,
@@ -297,8 +298,8 @@ fn stack_var_for_addr_var(
         type_oracle: inputs.env.type_oracle,
     };
     let rendered = lower.var_name(addr);
-    if let Some(alias) = resolve_stack_alias_from_addr_expr(
-        &CExpr::Var(rendered),
+    if let Some(alias) = resolve_stack_alias_from_addr_expr(symbols, 
+        &crate::symbol::var_ref(symbols, rendered),
         inputs.definitions,
         inputs.stack_vars,
         inputs.env,
@@ -316,7 +317,7 @@ fn stack_var_for_addr_var(
     offset_backed.map(|(_, name)| name)
 }
 
-fn stack_slot_for_addr_var(
+fn stack_slot_for_addr_var(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
     addr: &r2ssa::SSAVar,
     definitions: &HashMap<String, CExpr>,
     stack_slots: &HashMap<String, super::StackSlotProvenance>,
@@ -328,7 +329,7 @@ fn stack_slot_for_addr_var(
         return None;
     }
     stack_slots.get(&addr.display_name()).copied().or_else(|| {
-        utils::extract_stack_offset_from_var(addr, definitions, env.fp_name, env.sp_name).and_then(
+        utils::extract_stack_offset_from_var(symbols, addr, definitions, env.fp_name, env.sp_name).and_then(
             |offset| {
                 stack_slots
                     .values()
@@ -365,7 +366,7 @@ fn is_generic_stack_name(name: &str) -> bool {
     name.starts_with("local_") || name.starts_with("stack_") || name == "saved_fp"
 }
 
-fn normalize_scalar_stack_load_expr(
+fn normalize_scalar_stack_load_expr(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
     expr: CExpr,
     stack_var_name: Option<&str>,
     stack_slot: Option<super::StackSlotProvenance>,
@@ -374,10 +375,10 @@ fn normalize_scalar_stack_load_expr(
         return expr;
     };
     if !is_generic_stack_name(stack_var_name) && expr_is_addr_of_expr(&expr) {
-        return CExpr::Var(stack_var_name.to_string());
+        return crate::symbol::var_ref(symbols, stack_var_name.to_string());
     }
-    if expr_is_addr_of_named_var(&expr, stack_var_name) {
-        return CExpr::Var(stack_var_name.to_string());
+    if expr_is_addr_of_named_var(symbols, &expr, stack_var_name) {
+        return crate::symbol::var_ref(symbols, stack_var_name.to_string());
     }
 
     let Some(stack_slot) = stack_slot else {
@@ -387,7 +388,7 @@ fn normalize_scalar_stack_load_expr(
         return expr;
     }
     if expr_is_literalish(&expr) {
-        return CExpr::Var(stack_var_name.to_string());
+        return crate::symbol::var_ref(symbols, stack_var_name.to_string());
     }
 
     expr
@@ -401,11 +402,11 @@ fn expr_is_literalish(expr: &CExpr) -> bool {
     }
 }
 
-fn expr_is_addr_of_named_var(expr: &CExpr, name: &str) -> bool {
+fn expr_is_addr_of_named_var(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, expr: &CExpr, name: &str) -> bool {
     match expr {
-        CExpr::AddrOf(inner) => expr_is_named_var(inner, name),
+        CExpr::AddrOf(inner) => expr_is_named_var(symbols, inner, name),
         CExpr::Paren(inner) | CExpr::Cast { expr: inner, .. } => {
-            expr_is_addr_of_named_var(inner, name)
+            expr_is_addr_of_named_var(symbols, inner, name)
         }
         _ => false,
     }
@@ -419,10 +420,10 @@ fn expr_is_addr_of_expr(expr: &CExpr) -> bool {
     }
 }
 
-fn expr_is_named_var(expr: &CExpr, name: &str) -> bool {
+fn expr_is_named_var(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, expr: &CExpr, name: &str) -> bool {
     match expr {
-        CExpr::Var(inner) => inner.eq_ignore_ascii_case(name),
-        CExpr::Paren(inner) | CExpr::Cast { expr: inner, .. } => expr_is_named_var(inner, name),
+        CExpr::Var(inner) => crate::symbol::spelling(symbols, *inner).eq_ignore_ascii_case(name),
+        CExpr::Paren(inner) | CExpr::Cast { expr: inner, .. } => expr_is_named_var(symbols, inner, name),
         _ => false,
     }
 }
@@ -473,6 +474,7 @@ fn forwarded_expr_for_value(
     let empty_names: HashSet<String> = HashSet::new();
     let empty_ptrs: HashMap<String, PtrArith> = HashMap::new();
     let lower = LowerCtx {
+        symbols: env.symbols,
         string_literals: crate::analysis::lower::no_string_literals(),
         use_info: Some(use_info),
         definitions,
@@ -491,7 +493,7 @@ fn forwarded_expr_for_value(
     Some(lower.expr_for_ssa_name(&prov.source))
 }
 
-fn resolve_stack_alias_from_addr_expr(
+fn resolve_stack_alias_from_addr_expr(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
     expr: &CExpr,
     definitions: &HashMap<String, CExpr>,
     stack_vars: &HashMap<i64, String>,
@@ -503,20 +505,20 @@ fn resolve_stack_alias_from_addr_expr(
         return None;
     }
 
-    if let Some(alias) = utils::simplify_stack_access(expr, stack_vars, env.fp_name, env.sp_name) {
+    if let Some(alias) = utils::simplify_stack_access(symbols, expr, stack_vars, env.fp_name, env.sp_name) {
         return Some(alias);
     }
 
     match expr {
         CExpr::Var(name) => {
-            if let Some(stripped) = name.strip_prefix('&') {
+            if let Some(stripped) = crate::symbol::spelling(symbols, *name).strip_prefix('&') {
                 return Some(stripped.to_string());
             }
-            if !visited.insert(name.clone()) {
+            if !visited.insert(crate::symbol::spelling(symbols, *name).to_string()) {
                 return None;
             }
-            definitions.get(name).and_then(|inner| {
-                resolve_stack_alias_from_addr_expr(
+            definitions.get(&*crate::symbol::spelling(symbols, *name)).and_then(|inner| {
+                resolve_stack_alias_from_addr_expr(symbols, 
                     inner,
                     definitions,
                     stack_vars,
@@ -526,7 +528,7 @@ fn resolve_stack_alias_from_addr_expr(
                 )
             })
         }
-        CExpr::Paren(inner) => resolve_stack_alias_from_addr_expr(
+        CExpr::Paren(inner) => resolve_stack_alias_from_addr_expr(symbols, 
             inner,
             definitions,
             stack_vars,
@@ -534,7 +536,7 @@ fn resolve_stack_alias_from_addr_expr(
             depth + 1,
             visited,
         ),
-        CExpr::Cast { expr: inner, .. } => resolve_stack_alias_from_addr_expr(
+        CExpr::Cast { expr: inner, .. } => resolve_stack_alias_from_addr_expr(symbols, 
             inner,
             definitions,
             stack_vars,
@@ -542,7 +544,7 @@ fn resolve_stack_alias_from_addr_expr(
             depth + 1,
             visited,
         ),
-        CExpr::AddrOf(inner) => resolve_stack_alias_from_addr_expr(
+        CExpr::AddrOf(inner) => resolve_stack_alias_from_addr_expr(symbols, 
             inner,
             definitions,
             stack_vars,
@@ -550,7 +552,7 @@ fn resolve_stack_alias_from_addr_expr(
             depth + 1,
             visited,
         ),
-        CExpr::Deref(inner) => resolve_stack_alias_from_addr_expr(
+        CExpr::Deref(inner) => resolve_stack_alias_from_addr_expr(symbols, 
             inner,
             definitions,
             stack_vars,

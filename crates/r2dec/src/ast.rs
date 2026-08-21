@@ -165,8 +165,8 @@ pub enum CExpr {
     StringLit(String),
     /// Character literal.
     CharLit(char),
-    /// Variable reference.
-    Var(String),
+    /// Reference to a name this function declares.
+    Var(crate::symbol::SymbolId),
     /// A name for something the function does not own, and what kind of thing it is.
     ///
     /// `Var` is for values this function has. An intrinsic the target defines, or
@@ -288,9 +288,9 @@ impl CExpr {
         Self::UIntLit(value)
     }
 
-    /// Create a variable reference.
-    pub fn var(name: impl Into<String>) -> Self {
-        Self::Var(name.into())
+    /// Create a variable reference to an already declared name.
+    pub fn var(name: crate::symbol::SymbolId) -> Self {
+        Self::Var(name)
     }
 
     /// Create a binary operation.
@@ -607,7 +607,7 @@ pub enum CStmt {
     /// Variable declaration.
     Decl {
         ty: CType,
-        name: String,
+        name: crate::symbol::SymbolId,
         init: Option<CExpr>,
     },
     /// Block of statements.
@@ -692,12 +692,8 @@ impl CStmt {
     }
 
     /// Create a declaration.
-    pub fn decl(ty: CType, name: impl Into<String>, init: Option<CExpr>) -> Self {
-        Self::Decl {
-            ty,
-            name: name.into(),
-            init,
-        }
+    pub fn decl(ty: CType, name: crate::symbol::SymbolId, init: Option<CExpr>) -> Self {
+        Self::Decl { ty, name, init }
     }
 
     /// Create a comment.
@@ -713,7 +709,7 @@ pub struct CFunction {
     ///
     /// Owned here because every pass that runs after folding already takes
     /// `&mut CFunction`, so none of them needs the table threaded to it.
-    pub symbols: crate::symbol::SymbolTable,
+    pub symbols: std::cell::RefCell<crate::symbol::SymbolTable>,
     /// Function name.
     pub name: String,
     /// Return type.
@@ -737,7 +733,7 @@ pub struct CParam {
     /// Parameter type.
     pub ty: CType,
     /// Parameter name.
-    pub name: String,
+    pub name: crate::symbol::SymbolId,
 }
 
 /// A local variable.
@@ -746,7 +742,7 @@ pub struct CLocal {
     /// Variable type.
     pub ty: CType,
     /// Variable name.
-    pub name: String,
+    pub name: crate::symbol::SymbolId,
     /// Stack offset (if known).
     pub stack_offset: Option<i64>,
 }
@@ -755,7 +751,7 @@ impl CFunction {
     /// Create a new function.
     pub fn new(name: impl Into<String>, ret_type: CType) -> Self {
         Self {
-            symbols: crate::symbol::SymbolTable::new(),
+            symbols: std::cell::RefCell::new(crate::symbol::SymbolTable::new()),
             name: name.into(),
             ret_type,
             params: Vec::new(),
@@ -773,11 +769,8 @@ impl CFunction {
     }
 
     /// Add a parameter.
-    pub fn with_param(mut self, ty: CType, name: impl Into<String>) -> Self {
-        self.params.push(CParam {
-            ty,
-            name: name.into(),
-        });
+    pub fn with_param(mut self, ty: CType, name: crate::symbol::SymbolId) -> Self {
+        self.params.push(CParam { ty, name });
         self
     }
 

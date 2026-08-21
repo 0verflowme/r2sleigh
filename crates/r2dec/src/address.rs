@@ -7,6 +7,7 @@
 /// - `ram:403000`
 /// - `ram:403000_0`
 pub(crate) fn parse_address_from_var_name(name: &str) -> Option<u64> {
+
     if let Some(rest) = name.strip_prefix("ram:") {
         let addr_str = rest.split('_').next().unwrap_or(rest);
         let addr_hex = addr_str
