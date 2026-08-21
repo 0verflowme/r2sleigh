@@ -5681,8 +5681,7 @@ mod tests {
 
     #[test]
     fn assignment_lhs_uses_typed_ssa_kind_for_versioned_arg_carriers() {
-        let ctx = FoldingContext::new(64);
-        fn lowered_lhs_for(dst: SSAVar) -> CExpr {
+        fn lowered_lhs_for(dst: SSAVar) -> String {
             let mut ctx = FoldingContext::new(64);
             ctx.state
                 .analysis_ctx
@@ -5705,32 +5704,35 @@ mod tests {
             else {
                 panic!("expected assignment expression");
             };
-            *left
+            let CExpr::Var(name) = *left else {
+                panic!("expected a reference on the left");
+            };
+            ctx.spelling(name).to_string()
         }
 
         assert_eq!(
             lowered_lhs_for(make_var("reg:10", 2, 8)),
-            ctx.name_ref("r10_2")
+            "r10_2"
         );
         assert_eq!(
             lowered_lhs_for(make_var("reg:zf", 2, 1)),
-            ctx.name_ref("zf_2")
+            "zf_2"
         );
         assert_eq!(
             lowered_lhs_for(make_var("tmp:11f80", 2, 8)),
-            ctx.name_ref("t2")
+            "t2"
         );
         assert_eq!(
             lowered_lhs_for(make_var("unique:11f80", 2, 8)),
-            ctx.name_ref("t2")
+            "t2"
         );
         assert_eq!(
             lowered_lhs_for(make_var("TMP:11f80", 2, 8)),
-            ctx.name_ref("tmp_11f80_2")
+            "tmp_11f80_2"
         );
         assert_eq!(
             lowered_lhs_for(make_var("reg:10", 0, 8)),
-            ctx.name_ref("arg1")
+            "arg1"
         );
     }
 
