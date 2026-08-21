@@ -21,6 +21,14 @@ pub(crate) fn rewrite_function_identifiers(
     rewrite_function(func, &rename_map);
 }
 
+/// Rewrite an explicit set of names, for a caller that already knows the map.
+pub(crate) fn rewrite_function_names(func: &mut CFunction, rename_map: &HashMap<String, String>) {
+    if rename_map.is_empty() {
+        return;
+    }
+    rewrite_function(func, rename_map);
+}
+
 struct NameCollector<'a> {
     known_function_names: &'a HashSet<String>,
     unsuffixed_bases: HashSet<String>,

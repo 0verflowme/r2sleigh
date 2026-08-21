@@ -3218,6 +3218,9 @@ impl Decompiler {
         normalize_declared_assignment_literals(&mut c_function);
         normalize_comparison_operand_order(&mut c_function);
         unrendered::drop_values_from_void_returns(&mut c_function);
+        // Whatever carriers are still on the page after every pass that could
+        // resolve one, the body reads and writes, so it declares them.
+        unrendered::declare_rendered_carriers(&mut c_function, &type_hints);
         unrendered::mark_undeclared_names(&mut c_function);
         // Executable C is admitted only when the source obligation inventory is
         // complete. The inventory is what says which effects the source has, so a
