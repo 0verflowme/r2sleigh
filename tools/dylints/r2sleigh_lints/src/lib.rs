@@ -3151,6 +3151,43 @@ rustc_session::declare_lint!(
     "FunctionFacts owner fields must be mutated through r2types methods"
 );
 
+rustc_session::declare_lint!(
+    /// ### What it does
+    ///
+    /// Warns when a facts type answers a rendering decision rather than a fact.
+    ///
+    /// ### Why is this bad?
+    ///
+    /// A facts type says what is true about a function. A renderer decides what
+    /// to do about it. A method named `should_inline`, `prefers_...` or
+    /// `emit_...` moves that decision into the facts, and once it is there every
+    /// consumer inherits one renderer's taste as though it were evidence, with
+    /// no way to disagree and nothing to check the answer against.
+    ///
+    /// The names are the tell, so the names are what this checks. A fact is
+    /// stated -- `is_`, `has_`, `for_`, `count_of_` -- and reads the same to
+    /// every caller. A decision is imperative and reads as advice.
+    ///
+    /// ### Example
+    ///
+    /// ```rust
+    /// impl FunctionRenderFacts {
+    ///     pub fn should_inline_carrier(&self, value: ValueId) -> bool { .. }
+    /// }
+    /// ```
+    ///
+    /// Use instead:
+    ///
+    /// ```rust
+    /// impl FunctionRenderFacts {
+    ///     pub fn reader_count_for_carrier(&self, value: ValueId) -> usize { .. }
+    /// }
+    /// ```
+    pub FACTS_METHOD_SHAPED_LIKE_A_RENDERING_DECISION,
+    Warn,
+    "a facts type states what is true; deciding what to render belongs to a renderer"
+);
+
 rustc_session::declare_lint_pass!(R2sleighLintPass => [
     DISPLAY_NAMES_OUTSIDE_RENDERING,
     STRING_PREFIX_SEMANTIC_CLASSIFICATION,
@@ -3267,7 +3304,8 @@ rustc_session::declare_lint_pass!(R2sleighLintPass => [
     R2ENGINE_R2DEC_VARIABLE_RECOVERY_OWNERSHIP,
     R2ENGINE_R2DEC_FALLBACK_COMMENT_OWNERSHIP,
     R2TYPES_ROLE_NAME_SIGNATURE_HINT_OWNERSHIP,
-    R2TYPES_FUNCTION_FACTS_FIELD_OWNERSHIP
+    R2TYPES_FUNCTION_FACTS_FIELD_OWNERSHIP,
+    FACTS_METHOD_SHAPED_LIKE_A_RENDERING_DECISION
 ]);
 
 #[unsafe(no_mangle)]
@@ -3391,12 +3429,24 @@ pub fn register_lints(sess: &rustc_session::Session, lint_store: &mut rustc_lint
         R2ENGINE_R2DEC_FALLBACK_COMMENT_OWNERSHIP,
         R2TYPES_ROLE_NAME_SIGNATURE_HINT_OWNERSHIP,
         R2TYPES_FUNCTION_FACTS_FIELD_OWNERSHIP,
+        FACTS_METHOD_SHAPED_LIKE_A_RENDERING_DECISION,
     ]);
     lint_store.register_late_pass(|_| Box::new(R2sleighLintPass));
 }
 
 impl<'tcx> LateLintPass<'tcx> for R2sleighLintPass {
     fn check_item(&mut self, cx: &LateContext<'tcx>, item: &'tcx Item<'tcx>) {
+        if facts_impl_self_name(item).is_some() && !item_is_test_only(cx, item) {
+            for span in rendering_decision_method_names(cx, item) {
+                span_lint(
+                    cx,
+                    FACTS_METHOD_SHAPED_LIKE_A_RENDERING_DECISION,
+                    span,
+                    "a facts type states what is true; name this for the fact it reports, not for what a renderer should do with it",
+                );
+            }
+        }
+
         if is_r2plugin_type_hint_policy_span(cx, item.span)
             && plugin_metadata_type_hint_policy_item(cx, item)
         {
@@ -8209,6 +8259,56 @@ fn is_r2engine_span(cx: &LateContext<'_>, span: rustc_span::Span) -> bool {
 fn is_r2engine_lib_span(cx: &LateContext<'_>, span: rustc_span::Span) -> bool {
     let filename = cx.sess().source_map().span_to_filename(span);
     format!("{filename:?}").contains("crates/r2engine/src/lib.rs")
+}
+
+/// Verb forms that ask what to do rather than state what is so.
+const RENDERING_DECISION_PREFIXES: [&str; 8] = [
+    "should_",
+    "prefers_",
+    "prefer_",
+    "wants_",
+    "emit_",
+    "suppress_",
+    "elide_",
+    "inline_",
+];
+
+/// Whether this item declares methods on a type whose job is stating facts.
+fn facts_impl_self_name(item: &Item<'_>) -> Option<String> {
+    let rustc_hir::ItemKind::Impl(impl_item) = item.kind else {
+        return None;
+    };
+    if impl_item.of_trait.is_some() {
+        return None;
+    }
+    let rustc_hir::TyKind::Path(rustc_hir::QPath::Resolved(_, path)) = impl_item.self_ty.kind
+    else {
+        return None;
+    };
+    let name = path.segments.last()?.ident.name.to_string();
+    name.ends_with("Facts").then_some(name)
+}
+
+/// Method names on a facts type that read as advice to a renderer.
+fn rendering_decision_method_names(
+    cx: &LateContext<'_>,
+    item: &Item<'_>,
+) -> Vec<rustc_span::Span> {
+    let rustc_hir::ItemKind::Impl(impl_item) = item.kind else {
+        return Vec::new();
+    };
+    impl_item
+        .items
+        .iter()
+        .filter_map(|entry| {
+            let def_id = entry.owner_id.to_def_id();
+            let name = cx.tcx.item_name(def_id).to_string();
+            RENDERING_DECISION_PREFIXES
+                .iter()
+                .any(|prefix| name.starts_with(prefix))
+                .then(|| cx.tcx.def_span(def_id))
+        })
+        .collect()
 }
 
 fn is_r2types_span(cx: &LateContext<'_>, span: rustc_span::Span) -> bool {
