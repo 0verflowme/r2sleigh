@@ -1226,6 +1226,8 @@ mod tests {
         );
 
         let mut codegen = CodeGenerator::new(CodeGenConfig::default());
+        // The generator renders from the table the fixture declared into.
+        codegen.symbols = symbols.borrow().clone();
         let code = codegen.generate_stmt(&stmt);
 
         assert!(code.contains("while (i < 10)"));
@@ -1236,6 +1238,8 @@ mod tests {
     fn test_generate_compound_unit_updates_as_inc_dec() {
         let symbols = test_table();
         let mut codegen = CodeGenerator::new(CodeGenConfig::default());
+        // The generator renders from the table the fixture declared into.
+        codegen.symbols = symbols.borrow().clone();
         assert_eq!(
             codegen.generate_expr(&CExpr::binary(
                 BinaryOp::AddAssign,
@@ -1276,6 +1280,8 @@ mod tests {
     fn test_expression_precedence() {
         let symbols = test_table();
         let mut codegen = CodeGenerator::new(CodeGenConfig::default());
+        // The generator renders from the table the fixture declared into.
+        codegen.symbols = symbols.borrow().clone();
 
         // a + b * c should not need parens around b * c
         let expr = CExpr::binary(
@@ -1301,6 +1307,8 @@ mod tests {
     fn test_additive_negative_literals_render_without_stack_placeholder_noise() {
         let symbols = test_table();
         let mut codegen = CodeGenerator::new(CodeGenConfig::default());
+        // The generator renders from the table the fixture declared into.
+        codegen.symbols = symbols.borrow().clone();
 
         let expr = CExpr::binary(BinaryOp::Add, CExpr::var(crate::symbol::declare(&symbols, "stack_8")), CExpr::int(-8));
         assert_eq!(codegen.generate_expr(&expr), "stack_8 - 8");
@@ -1317,6 +1325,8 @@ mod tests {
     fn test_additive_negative_linear_terms_render_as_subtraction() {
         let symbols = test_table();
         let mut codegen = CodeGenerator::new(CodeGenConfig::default());
+        // The generator renders from the table the fixture declared into.
+        codegen.symbols = symbols.borrow().clone();
 
         let expr = CExpr::binary(
             BinaryOp::Add,
