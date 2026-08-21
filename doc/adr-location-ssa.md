@@ -154,10 +154,19 @@ returning `repr(C)` structs, which is the pattern radare2's own
 One transport replaces three. Typed views carry structure. The serialized wire
 format stays for the snapshot, and its C reader is generated from the Rust
 definition so the existing byte-for-byte conformance test guards a build step
-rather than two hand-maintained implementations. The JSON channel —
-`diagnostics_json` and the analysis JSON constants, behind roughly two hundred
-JSON-handling lines in the C wrapper — is removed, because facts crossing this
-boundary should be typed contracts.
+rather than two hand-maintained implementations.
+
+The JSON claim in the first draft of this decision was too broad and is
+corrected here. `R2SLEIGH_ANALYSIS_BLOCK_OP_JSON_V2` and its neighbours feed
+`r_cons_printf`: they are the JSON a user asked for, not facts being shipped
+between layers, and removing them would delete a feature rather than a
+transport. What is genuinely wrong is narrower and still worth fixing. The C
+wrapper parses JSON that Rust has already produced, with `r_json_parsedup`, to
+merge two documents into one and print the result. That is reparsing on a
+boundary where the structured values were available on the other side, so the
+merged document should be produced once, in Rust, and the roughly two hundred
+JSON-handling lines in the C wrapper go with it. No user-visible output changes;
+the same bytes are printed by whichever side is holding the values.
 
 The C wrapper becomes registration and dispatch. `r_anal_sleigh.c` is presently
 5,301 lines across 137 functions, one of which is 796 lines of command dispatch,
@@ -210,8 +219,9 @@ has to work before it lands.
 1. Ledger and closure invariant, with the symbol table that typed identifiers
    will be built on.
 2. FFI boundary: stop gating on version numbers, collapse the accessor vtable
-   into view calls, remove the JSON channel, generate the C wire reader, and move
-   the C wrapper's logic into Rust.
+   into view calls, produce the merged diagnostics document in Rust instead of
+   reparsing it in C, generate the C wire reader, and move the C wrapper's logic
+   into Rust.
 3. Location model and use index in `r2ssa`, covering registers and stack objects,
    with symbolic execution consulted for stack promotion.
 4. Delete the register-family repair pass. If it is not dead, step 3 is
@@ -369,7 +379,7 @@ splitting is not yet known.
 `writeback.rs`, at roughly 22,000 lines the largest file in the project, has not
 been traced and its role under this design is unresolved.
 
-Removing the JSON channel and the accessor vtable changes what radare2 sees, so
+Replacing the accessor vtable changes what radare2 sees, so
 the plugin and the fork move together for step 2 and the wire conformance test is
 the gate on that step rather than an afterthought.
 
