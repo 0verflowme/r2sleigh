@@ -286,7 +286,21 @@ building locations first means building against a contract about to change shape
 Replacing `CExpr::Var(String)` with a symbol reference is bound to step 7 rather
 than done in step 1, because it was measured rather than guessed: the change
 produces 970 compile errors, of which 586 are in `fold/op_lower/mod.rs` and
-`fold/flags.rs`. Those are the expression builder and the flag machinery, and
+`fold/flags.rs`. There are 767 construction sites in code and the change is
+atomic, so there is no green tree part of the way through it.
+
+Separating the two meanings `Var` carries is a smaller move and can be made on
+its own. Of those 767 sites, nineteen name something the function does not own --
+an intrinsic the target defines, a marker the lowering emits where it has nothing
+to say -- and those are not values a declaration could ever give. Adding an
+`External` variant for them costs only the thirty exhaustive matches that have to
+gain an arm, which compiles green and leaves the remaining sites all meaning one
+thing.
+
+That was attempted with a script over the thirty matches and reverted, because
+the arms are not uniform: some open a block, some carry a guard, and the script
+produced malformed patterns in five files. It is half an hour of hand editing
+rather than a pass, and it should be done that way. Those are the expression builder and the flag machinery, and
 step 7 rewrites the first and deletes most of the second, so migrating them
 first is migrating them twice. The symbol table lands in step 1 regardless, so
 every step after it writes against a declared name rather than adding to the
