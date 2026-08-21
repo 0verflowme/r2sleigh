@@ -765,7 +765,7 @@ mod tests {
             function_names: empty_u64,
             strings: empty_u64,
             binary_symbols: empty_u64,
-            symbols: &test_table(),
+            symbols: &fixture_symbols,
             function_facts: empty_function_facts(),
             certified_rendering_required: false,
             stack_slots: empty_stack_slots,
@@ -812,7 +812,7 @@ mod tests {
             function_names: empty_u64,
             strings: empty_u64,
             binary_symbols: empty_u64,
-            symbols: &test_table(),
+            symbols: &fixture_symbols,
             function_facts: empty_function_facts(),
             certified_rendering_required: false,
             stack_slots: empty_stack_slots,
@@ -6699,7 +6699,7 @@ mod tests {
         let addr = make_var("ram:404000", 0, 8);
         let dst = make_var("tmp:load", 1, 8);
         let mut ctx = FoldingContext::new(64);
-        ctx.inputs.symbols = Box::leak(Box::new(HashMap::from([(
+        ctx.inputs.binary_symbols = Box::leak(Box::new(HashMap::from([(
             0x404000,
             "obj.global_value".to_string(),
         )])));
@@ -6720,7 +6720,7 @@ mod tests {
     fn raw_ram_address_store_target_ignores_symbol_map_without_typed_fact() {
         let addr = make_var("ram:404000", 0, 8);
         let mut ctx = FoldingContext::new(64);
-        ctx.inputs.symbols = Box::leak(Box::new(HashMap::from([(
+        ctx.inputs.binary_symbols = Box::leak(Box::new(HashMap::from([(
             0x404000,
             "obj.global_value".to_string(),
         )])));
@@ -11718,6 +11718,7 @@ mod tests {
             "r8".to_string(),
             "r9".to_string(),
         ]));
+        let fixture_symbols = test_table();
         let env = PassEnv {
             carrier_aliases: crate::analysis::no_carrier_aliases(),
             string_literals: crate::analysis::lower::no_string_literals(),
@@ -11728,7 +11729,7 @@ mod tests {
             function_names: empty_u64,
             strings: empty_u64,
             binary_symbols: empty_u64,
-            symbols: &test_table(),
+            symbols: &fixture_symbols,
             callee_facts: crate::analysis::empty_callee_facts(),
             callee_resolution: None,
             summary_view: None,
@@ -17687,7 +17688,7 @@ mod tests {
             },
         );
         ctx.inputs.function_names = Box::leak(Box::new(function_names));
-        ctx.inputs.symbols = Box::leak(Box::new(symbols));
+        ctx.inputs.binary_symbols = Box::leak(Box::new(symbols));
         install_function_callee_facts(&mut ctx, callee_facts);
         mutate_function_facts(&mut ctx, |function_facts| {
             function_facts.set_callee_resolution(callee_resolution);
@@ -19466,7 +19467,7 @@ mod tests {
 
         let prepared = prepared_from_r2il_blocks(&[entry], &arch).with_name("prepared_global_load");
         let mut ctx = make_x86_64_ctx_with_prepared(&prepared);
-        ctx.inputs.symbols = Box::leak(Box::new(HashMap::from([(
+        ctx.inputs.binary_symbols = Box::leak(Box::new(HashMap::from([(
             0x404000,
             "obj.global_value".to_string(),
         )])));

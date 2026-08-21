@@ -85,7 +85,9 @@ pub(crate) struct FoldInputs<'a> {
     #[cfg(test)]
     pub(crate) strings: &'a HashMap<u64, String>,
     #[cfg(test)]
-    pub(crate) symbols: &'a HashMap<u64, String>,
+    /// What the binary calls the thing at an address, not a name this
+    /// rendering declares.
+    pub(crate) binary_symbols: &'a HashMap<u64, String>,
     pub(crate) function_facts: &'a FunctionFacts,
     /// Spellings for addresses this function touches, for rendering only.
     pub(crate) display_names: &'a r2types::DisplayNames,
@@ -423,7 +425,7 @@ impl<'a> FoldingContext<'a> {
             #[cfg(test)]
             strings: EMPTY_U64_STRING.get_or_init(HashMap::new),
             #[cfg(test)]
-            symbols: EMPTY_U64_STRING.get_or_init(HashMap::new),
+            binary_symbols: EMPTY_U64_STRING.get_or_init(HashMap::new),
             function_facts: empty_function_facts(),
             #[cfg(test)]
             certified_rendering_required: false,

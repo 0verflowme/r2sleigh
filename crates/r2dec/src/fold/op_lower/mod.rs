@@ -1901,7 +1901,7 @@ impl<'a> FoldingContext<'a> {
             #[cfg(test)]
             strings: self.inputs.strings,
             #[cfg(test)]
-            symbols: self.inputs.symbols,
+            binary_symbols: self.inputs.binary_symbols,
             callee_facts: self.inputs.callee_facts(),
             callee_resolution: self.inputs.callee_resolution(),
             summary_view: self.inputs.summary_view(),
@@ -1932,7 +1932,8 @@ impl<'a> FoldingContext<'a> {
             #[cfg(test)]
             function_names: self.inputs.function_names,
             #[cfg(test)]
-            symbols: self.inputs.symbols,
+            binary_symbols: self.inputs.binary_symbols,
+            symbols: &self.symbols,
             callee_facts: self.inputs.callee_facts(),
             known_function_signatures: &normalized,
         };
@@ -2136,7 +2137,7 @@ impl<'a> FoldingContext<'a> {
             #[cfg(test)]
             strings: self.inputs.strings,
             #[cfg(test)]
-            symbols: self.inputs.symbols,
+            binary_symbols: self.inputs.binary_symbols,
             callee_facts: self.inputs.callee_facts(),
             callee_resolution: self.inputs.callee_resolution(),
             summary_view: self.inputs.summary_view(),
