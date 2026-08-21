@@ -46,7 +46,6 @@ pub const RADARE_CAP_EXACT_RETURN_MECHANISM: u64 = 1 << 15;
 pub const RADARE_CAP_EXACT_FRAME_POINTER_STORAGE: u64 = 1 << 16;
 pub const RADARE_CAP_EXACT_STACK_ALLOCATION_CONTRACT: u64 = 1 << 17;
 
-const KNOWN_CAPABILITIES: u64 = (1 << 18) - 1;
 const INVALID_U64: u64 = u64::MAX;
 const INVALID_TYPE_ID: u32 = u32::MAX;
 
@@ -622,13 +621,19 @@ unsafe fn read_view(
 }
 
 fn validate_top(view: &RadareAbi138SnapshotView) -> Result<(), RadareAbi138CaptureError> {
-    if view.schema_version != RADARE_FUNCTION_SNAPSHOT_SCHEMA_VERSION
-        || view.struct_size != exact_size::<RadareAbi138SnapshotView>()?
-    {
+    // The struct is written by radare2 into storage this side allocated, so its
+    // size still has to match exactly or the write runs past the allocation. That
+    // is a memory-safety bound rather than a version test, and it stays until the
+    // view is negotiated with a caller-declared size.
+    if view.struct_size != exact_size::<RadareAbi138SnapshotView>()? {
         return Err(RadareAbi138CaptureError::UnsupportedVersion);
     }
-    if view.capabilities & !KNOWN_CAPABILITIES != 0
-        || view.capabilities & RADARE_CAP_REVISION == 0
+    // A capability this side has never heard of describes something it was never
+    // going to read. Refusing the whole snapshot over one is how a plugin breaks
+    // the next time radare2 gains a field, which is the failure a capability set
+    // exists to prevent rather than to reproduce, so unknown bits are ignored and
+    // only the bits actually required are insisted on.
+    if view.capabilities & RADARE_CAP_REVISION == 0
         || view.capabilities & RADARE_CAP_OWNED_BOUNDED_FUNCTION_IMAGE == 0
         || view.revision_identity == 0
     {
@@ -1777,12 +1782,6 @@ pub unsafe fn capture_radare_abi138(
     if input.struct_size != exact_size::<RadareAbi138SnapshotInput>()? {
         return Err(RadareAbi138CaptureError::InvalidInputSize);
     }
-    if input.abi_version != RADARE_SNAPSHOT_CONTRACT_VERSION
-        || input.snapshot_schema_version != RADARE_FUNCTION_SNAPSHOT_SCHEMA_VERSION
-        || input.accessor_schema_version != RADARE_SNAPSHOT_ACCESSOR_SCHEMA_VERSION
-    {
-        return Err(RadareAbi138CaptureError::UnsupportedVersion);
-    }
     if input.snapshot.is_null() || input.accessors.is_null() {
         return Err(RadareAbi138CaptureError::NullInput);
     }
@@ -1790,11 +1789,11 @@ pub unsafe fn capture_radare_abi138(
     // are part of this function's explicit unsafe contract. The foreign table
     // pointer is never dereferenced again.
     let accessors = unsafe { input.accessors.read() };
-    if accessors.struct_size != exact_size::<RadareAbi138Accessors>()?
-        || accessors.abi_version != RADARE_SNAPSHOT_CONTRACT_VERSION
-        || accessors.snapshot_schema_version != RADARE_FUNCTION_SNAPSHOT_SCHEMA_VERSION
-        || accessors.accessor_schema_version != RADARE_SNAPSHOT_ACCESSOR_SCHEMA_VERSION
-    {
+    // The size still has to match, because a table of function pointers read at
+    // the wrong layout calls the wrong function. What each entry means is settled
+    // by the contract that fields are only ever appended, so the numbers beside
+    // the size decide nothing that the size and the capability set do not.
+    if accessors.struct_size != exact_size::<RadareAbi138Accessors>()? {
         return Err(RadareAbi138CaptureError::InvalidAccessorSize);
     }
     let snapshot_view_fn = required(accessors.snapshot_view, "snapshot_view")?;
@@ -2142,7 +2141,7 @@ mod tests {
     }
 
     #[test]
-    fn malformed_header_is_rejected_before_foreign_access() {
+    fn a_malformed_size_is_rejected_before_foreign_access() {
         let mut input = null_input();
         input.struct_size = 0;
         // SAFETY: malformed size is rejected before either null pointer is read.
@@ -2152,20 +2151,41 @@ mod tests {
         );
 
         let mut input = null_input();
-        input.snapshot_schema_version = 10;
-        // SAFETY: malformed version is rejected before either null pointer is read.
+        input.struct_size = exact_size::<RadareAbi138SnapshotInput>().expect("input size") + 8;
+        // SAFETY: a size that disagrees is rejected before either pointer is read.
         assert_eq!(
             unsafe { capture_radare_abi138(&input) },
-            Err(RadareAbi138CaptureError::UnsupportedVersion)
+            Err(RadareAbi138CaptureError::InvalidInputSize)
         );
+    }
 
-        let mut input = null_input();
-        input.accessor_schema_version = 1;
-        // SAFETY: malformed version is rejected before either null pointer is read.
-        assert_eq!(
-            unsafe { capture_radare_abi138(&input) },
-            Err(RadareAbi138CaptureError::UnsupportedVersion)
-        );
+    #[test]
+    fn a_version_number_on_the_input_does_not_decide_admission() {
+        // Size is what bounds the read, so once it agrees the numbers beside it
+        // stop the capture no earlier than a null handle already does.
+        for input in [
+            {
+                let mut input = null_input();
+                input.snapshot_schema_version = 10;
+                input
+            },
+            {
+                let mut input = null_input();
+                input.accessor_schema_version = 1;
+                input
+            },
+            {
+                let mut input = null_input();
+                input.abi_version = 99;
+                input
+            },
+        ] {
+            // SAFETY: null handles are rejected before dereference.
+            assert_eq!(
+                unsafe { capture_radare_abi138(&input) },
+                Err(RadareAbi138CaptureError::NullInput)
+            );
+        }
     }
 
     #[test]
@@ -2310,17 +2330,25 @@ mod tests {
     }
 
     #[test]
-    fn previous_stack_allocation_snapshot_schema_is_rejected() {
+    fn a_schema_number_decides_nothing_the_capability_set_does_not() {
         let capabilities = RADARE_CAP_REVISION
             | RADARE_CAP_OWNED_BOUNDED_FUNCTION_IMAGE
             | RADARE_CAP_EXACT_FUNCTION_INTERFACE
             | RADARE_CAP_STACK_POINTER_STORAGE
             | RADARE_CAP_EXACT_STACK_ALLOCATION_CONTRACT;
-        let mut top = valid_top(capabilities);
-        top.schema_version = 10;
+        // The number moves for reasons this side does not read, so an older or
+        // newer one on an otherwise well-formed snapshot decides nothing.
+        for schema_version in [0, 10, RADARE_FUNCTION_SNAPSHOT_SCHEMA_VERSION, 4096] {
+            let mut top = valid_top(capabilities);
+            top.schema_version = schema_version;
+            assert_eq!(validate_top(&top), Ok(()), "schema {schema_version}");
+        }
+        // What the snapshot advertises is still what decides.
+        let mut missing = valid_top(capabilities & !RADARE_CAP_STACK_POINTER_STORAGE);
+        missing.schema_version = RADARE_FUNCTION_SNAPSHOT_SCHEMA_VERSION;
         assert_eq!(
-            validate_top(&top),
-            Err(RadareAbi138CaptureError::UnsupportedVersion)
+            validate_top(&missing),
+            Err(RadareAbi138CaptureError::InvalidCapabilities)
         );
     }
 
@@ -2659,8 +2687,15 @@ mod tests {
                 Err(RadareAbi138CaptureError::InvalidCapabilities)
             );
         }
+        // A bit this side has never heard of describes something it never reads,
+        // and radare2 already sets bit 18 for snapshots that carry callee bodies.
+        assert_eq!(validate_top(&valid_top(dependencies | (1 << 18))), Ok(()));
+        assert_eq!(validate_top(&valid_top(dependencies | (1 << 63))), Ok(()));
+        // Ignoring what it does not know does not loosen what it does.
         assert_eq!(
-            validate_top(&valid_top(dependencies | (1 << 18))),
+            validate_top(&valid_top(
+                (dependencies & !RADARE_CAP_STACK_SLOTS) | (1 << 18)
+            )),
             Err(RadareAbi138CaptureError::InvalidCapabilities)
         );
     }
