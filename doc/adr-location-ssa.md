@@ -116,9 +116,25 @@ re-derive liveness or storage identity.
 This is enforced by the shape of the interface rather than by review. The
 renderer receives a read-only model whose API answers what something is and has
 no method shaped like whether something should be rendered. Any predicate that
-gates rendering lives upstream of the renderer. The eight facts structs collapse
-into one model with sections, because eight lookup surfaces are eight
-opportunities to consult the wrong one.
+gates rendering lives upstream of the renderer.
+
+The first draft said eight facts structs should collapse into one model, on the
+grounds that eight lookup surfaces are eight chances to consult the wrong one.
+That was a miscount. `FunctionFacts` is already that one model: the eight
+`Function*Facts` types are its private fields, reached through methods, and one
+value of it crosses the boundary rather than eight.
+
+The read-only half of the contract also already holds, and holds structurally
+rather than by convention. The renderer is handed `&'a FunctionFacts`, every
+field is private, and the mutating methods take `&mut self`, so no borrow the
+renderer has can reach them. The one place the renderer clones facts, edits the
+copy and leaks it is a `#[cfg(test)]` helper, and the two other leaks in the tree
+are inside test modules as well; none is on a production path.
+
+What is left of this step is a guard against a future violation rather than a
+repair of a present one: no method on the model should be shaped like "should I
+render this", so a rendering decision cannot migrate back into the layer that
+owns facts.
 
 ### The FFI boundary is one typed contract
 
