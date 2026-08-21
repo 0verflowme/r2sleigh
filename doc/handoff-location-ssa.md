@@ -308,6 +308,11 @@ an exact source interface, do not invent a stack owner for a call result; with
 one, derive it. That is consistent with wanting returns to be detectable. So the
 two probably can hold together.
 
+One hypothesis is already eliminated: the fixture arch does define `RIP` at
+`0x30` and the interface does declare it as the return-address storage, so
+`is_control_return_target` still resolves and the `else if` branch that pushes a
+pending return value is not silently dead. Whatever changed is elsewhere.
+
 What is needed is to find where the call result stops reaching the stack-owner
 derivation once returns are detected by location, rather than to pick whichever
 fixture arrangement is green. Adding `SsaArtifact::for_decompile_with_convention`
