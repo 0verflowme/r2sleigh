@@ -241,18 +241,48 @@ defects:
 `arg_c = arg_c` no longer reproduces anywhere in the corpus -- zero
 self-assignments across every rendered function.
 
-### A defect worth chasing next
+### Where the undeclared-name work ended up
 
-`sym._sum_carry` in `flag_x64.dylib` renders `rax = (int64_t)eax_1;` where
-`eax_1` is never declared. The table makes an undeclared name unconstructible,
-so `eax_1` *is* in the table -- it is simply never emitted as a local. That is
-the rule from the working agreement: a value with more than one reader is
-declared as a typed local, and one with a single reader propagates into it.
+Three fixes landed and the defect is now fully characterised.
 
-This is now cheap to check exactly, which it was not before: walk the rendered
-body, collect every `SymbolId`, and assert each appears in `params` or `locals`.
-That check used to require scanning text for words that resolve to nothing, and
-could be satisfied by declaring the word. It should be a test.
+An induction variable a `for` introduces is declared, and so is a name assigned
+in a `for`'s condition. Structuring rewrites loops *after* the pass that
+declares carriers, so those names appear when nothing is left to notice them.
+Extending the old collector to reach a `for`'s init changed nothing, and that is
+what identified the cause as ordering rather than coverage.
+
+**Only names the body assigns are declared.** A name that is only ever read has
+no definition, and declaring it would turn a dangling reference into valid C
+that reads uninitialised memory: the defect would compile and stop being
+reported. Driving the count to zero that way was available and is wrong.
+
+So every remaining report is a dangling read, by construction rather than by
+observation. `sym._combined` refuses 117 of its 187 obligations and then reads
+`local_28` and `t6080`, which no surviving statement writes. The comment names
+that -- `N name(s) read with no definition` -- so it points at the dropped
+definition rather than at the declaration that would have hidden it.
+
+Counts across the two corpora: 23 functions and 55 distinct names down to 18 and
+46. The names go to stderr under `R2SLEIGH_NAME_DEFECTS`, because the comment
+renderer replaces machine tokens with prose and would otherwise print the
+substitution rather than the name.
+
+### The SIMD lane defect, located
+
+`sym._crc32_table` in `hashes_x64_O2.o` is the clearest case of the leaked lane
+projections, one of the four original defects. It reads `xmm6_5`, `xmm6_7`,
+`xmm6_9`, `xmm6_11` and `xmm6_13` with no definition, around eighteen calls to
+`callother("userop_193", ...)` -- an unmodelled Sleigh userop standing in for
+the SIMD instruction. Several of those calls appear twice, once as the
+right-hand side of an assignment and again as a bare statement, so the same
+effect is rendered more than once.
+
+This is the piece the location model is for. A lane is a sub-range of a
+register's location, and today `CanonicalStorageId` makes each lane width a
+separate storage, so a write to one lane and a read of another look unrelated.
+`CanonicalLocation` exists for this; what remains is for `SSAVar` to carry a
+location and an extent rather than a name and a size, which is the substrate
+change the rest of step 3 rests on.
 
 **Steps 3 through 7 are untouched:**
 
