@@ -1045,21 +1045,17 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                             return CStmt::Goto(label);
                         }
                         Err(reason) => {
-                            // An exit reaching a block with no successors leaves
-                            // the function there. Rendering that block where the
-                            // exit happens says what the exit does, `return -1`,
-                            // rather than refusing for want of a label to jump
-                            // to. Nothing follows such a block, and only this
-                            // edge reaches it, so rendering it here cannot
-                            // duplicate or reorder anything.
-                            if !self.structured_region_blocks.contains(target)
-                                && self.func.successors(*target).is_empty()
-                                && self.func.predecessors(*target).len() == 1
-                            {
-                                self.structured_region_blocks.insert(*target);
-                                return self.structure_block(*target);
+                            // An exit that runs into blocks no region claimed has
+                            // nowhere to jump to, but it does have somewhere to
+                            // go: the blocks themselves. Rendering them where the
+                            // exit happens says what the exit does rather than
+                            // refusing the whole function for want of a label,
+                            // and the walk takes only blocks this edge alone
+                            // reaches, so nothing is duplicated or reordered.
+                            match self.exit_continuation_stmt(*target) {
+                                Some(stmt) => return stmt,
+                                None => Some(reason),
                             }
-                            Some(reason)
                         }
                     }
                 } else {
@@ -1515,6 +1511,64 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
     fn take_block_label(&mut self, addr: u64) -> Option<String> {
         let label = self.labels.get(&addr)?.clone();
         self.emitted_labels.insert(addr).then_some(label)
+    }
+
+    /// Render the blocks an unlabelled loop exit runs into, in order.
+    ///
+    /// The exit needs a label to jump to and the structuring never gave these
+    /// blocks one, because no region claimed them. They are still reached only
+    /// through this edge, so where they run is where the exit goes, and putting
+    /// them here loses nothing and invents nothing. The walk stops as soon as
+    /// that stops holding: a block another edge also reaches, or one that merges
+    /// values, or one that branches, could not be placed here without saying
+    /// something the function does not do.
+    fn exit_continuation_stmt(&mut self, target: u64) -> Option<CStmt> {
+        let chain = self.exit_continuation_chain(target)?;
+        for addr in &chain {
+            self.structured_region_blocks.insert(*addr);
+        }
+        let mut stmts = Vec::new();
+        for addr in &chain {
+            let stmt = self.structure_block(*addr);
+            if !matches!(stmt, CStmt::Empty) {
+                stmts.push(stmt);
+            }
+        }
+        Some(match stmts.len() {
+            0 => CStmt::Empty,
+            1 => stmts.remove(0),
+            _ => CStmt::Block(stmts),
+        })
+    }
+
+    /// The blocks an unlabelled exit runs through, or nothing if placing them
+    /// at the exit would not say what the function does.
+    fn exit_continuation_chain(&self, target: u64) -> Option<Vec<u64>> {
+        let mut chain = Vec::new();
+        let mut seen = BTreeSet::new();
+        let mut current = target;
+        loop {
+            if !self.poll() {
+                return None;
+            }
+            if self.structured_region_blocks.contains(&current) || !seen.insert(current) {
+                return None;
+            }
+            let block = self.func.get_block(current)?;
+            // A merge, or a block another edge reaches, is not this exit's to place.
+            if !block.phis.is_empty() || self.func.predecessors(current).len() != 1 {
+                return None;
+            }
+            chain.push(current);
+            match self.func.successors(current).as_slice() {
+                // Nothing follows, so the exit ends here and the chain is whole.
+                [] => return Some(chain),
+                [next] => current = *next,
+                // A branch is a region of its own and needs the structuring to
+                // say which way it goes, which this walk cannot.
+                _ => return None,
+            }
+        }
     }
 
     fn transparent_transfer_path(&self, start: u64) -> Result<Vec<u64>, String> {
