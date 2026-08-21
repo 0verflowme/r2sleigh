@@ -3343,9 +3343,11 @@ impl Decompiler {
         );
         reconcile_ledger_with_body(&mut ledger, &c_function);
         note_unproven_constructs(&mut c_function, Some(&ledger));
-        // A value with more than one reader is supposed to become a typed
-        // local. A name the body mentions and the function never declares says
-        // that did not happen, and a reader has no way to learn what it is.
+        // Every name the body assigns has a declaration by now, so a name
+        // still without one is never assigned: it is read, and nothing in the
+        // function ever produced it. That is a definition the pipeline dropped
+        // or refused, not a declaration it forgot, and declaring it would turn
+        // the dangling read into valid C that reads uninitialised memory.
         unrendered::declare_assigned_names_without_a_declaration(&mut c_function);
         let undeclared = unrendered::names_mentioned_without_a_declaration(&c_function);
         if !undeclared.is_empty() {
@@ -3362,7 +3364,7 @@ impl Decompiler {
             c_function.body.insert(
                 0,
                 CStmt::Comment(format!(
-                    "r2dec defect: {} name(s) mentioned without a declaration",
+                    "r2dec defect: {} name(s) read with no definition",
                     undeclared.len()
                 )),
             );
