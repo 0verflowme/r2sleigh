@@ -3847,21 +3847,53 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         let mut rewritten = Vec::with_capacity(stmts.len());
         let mut terminated = false;
         for stmt in stmts {
-            match stmt {
-                CStmt::Label(_) => {
-                    terminated = false;
-                    rewritten.push(stmt);
-                }
-                other => {
-                    if terminated {
-                        continue;
-                    }
-                    terminated = Self::stmt_guarantees_termination(&other);
-                    rewritten.push(other);
-                }
+            // Control does not only arrive here by falling in. A label is
+            // somewhere a jump goes, so nothing before it can make it dead --
+            // and a label carried inside a statement is still a label, which
+            // dropping the statement around it would leave jumps pointing at
+            // nothing.
+            if Self::stmt_carries_label(&stmt) {
+                terminated = false;
+                rewritten.push(stmt);
+                continue;
             }
+            if terminated {
+                continue;
+            }
+            terminated = Self::stmt_guarantees_termination(&stmt);
+            rewritten.push(stmt);
         }
         rewritten
+    }
+
+    /// Whether anything can jump into this statement.
+    fn stmt_carries_label(stmt: &CStmt) -> bool {
+        match stmt {
+            CStmt::Label(_) => true,
+            CStmt::Block(stmts) => stmts.iter().any(Self::stmt_carries_label),
+            CStmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                Self::stmt_carries_label(then_body)
+                    || else_body
+                        .as_ref()
+                        .is_some_and(|body| Self::stmt_carries_label(body))
+            }
+            CStmt::While { body, .. }
+            | CStmt::DoWhile { body, .. }
+            | CStmt::For { body, .. } => Self::stmt_carries_label(body),
+            CStmt::Switch { cases, default, .. } => {
+                cases
+                    .iter()
+                    .any(|case| case.body.iter().any(Self::stmt_carries_label))
+                    || default
+                        .as_ref()
+                        .is_some_and(|body| body.iter().any(Self::stmt_carries_label))
+            }
+            _ => false,
+        }
     }
 
     fn stmt_guarantees_termination(stmt: &CStmt) -> bool {
