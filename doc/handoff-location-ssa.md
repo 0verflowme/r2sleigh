@@ -99,38 +99,48 @@ invisible until the types finally differed. Expect more of these.
 
 ## Where the tree stands
 
-`cargo build --workspace` is clean. `cargo test -p r2dec --lib` compiles and
-runs: **623 pass, 83 fail.** Thirteen commits from `763b28d` to `1dad007`, net
-negative line count.
+`cargo build --workspace` is clean. `cargo test -p r2dec --lib` runs:
+**685 pass, 21 fail**, down from 83 failures when the suite first compiled.
+Twenty-five commits from `763b28d`, net negative line count.
 
-The 83 failures are not noise and not merely test bugs:
+### An identifier now says which table issued it
 
-- **53 are `index out of bounds: the len is 0 but the index is 0`** in
-  `SymbolTable::get`. A `SymbolId` from one table is being looked up in a
-  different, empty table. Concentrated in `structure::tests` (31),
-  `analysis::predicate` (6), `analysis::lower` (6).
-- **16 are `RefCell already borrowed`** — the hazard named above, fired from
-  fixtures that write `symbols.borrow_mut().declare_or_reuse(..)` inline inside
-  a struct literal that also declares elsewhere in the same statement. The
-  guard lives to the end of the statement.
-- **about five are real assertion failures**, including one where a semantic
-  member access should stay rooted at `argN` and does not.
+The open question in the first draft of this document — that a `SymbolId` means
+nothing outside its own table and nothing said so — is closed. `SymbolId`
+carries a `TableId`, and reading one from another table refuses by name.
 
-**The 53 are the important ones, and they expose a genuine gap in the design.**
-A `SymbolId` is only meaningful in the table that issued it, and nothing in the
-type system says which table that is. Fixtures make per-test tables, the
-pipeline makes its own, ids cross between them, and the index lands in the
-wrong `Vec`. Decide this before touching anything else. The options are roughly:
+This was not bookkeeping. Turning the check on took failures from 36 to 42:
+**six tests had been passing while resolving identifiers against the wrong
+table.** Two tables of similar size resolve each other's identifiers to real but
+wrong names, so a rendering says something it does not mean and never faults.
+That class was live. The cost is four bytes per identifier and one integer
+compare per lookup. Nothing in `r2dec` serialises the AST, so the brand cannot
+reach output or disturb determinism — check that again before adding a field.
 
-- brand the table (`SymbolId<'t>`, or a table id inside `SymbolId`) so a
-  cross-table lookup does not compile, or at minimum panics saying what
-  happened;
-- make `get` return `Option` and force callers to say what an unknown id means;
-- accept one table per rendered function as an invariant and make the tests
-  share the pipeline's table rather than building their own.
+### Four root causes fixed, each a real defect
 
-The first matches the spirit of the rest of this work — make the wrong thing
-unconstructible rather than detectable — and is also the most churn.
+- The `structure` tests' `v()` helper built a table **per call**, so every
+  reference it returned indexed a table already dropped. 31 failures.
+- Writing `symbols.borrow_mut().declare_or_reuse(..)` inline holds the guard to
+  the end of the statement, so a second declaration in the same statement
+  deadlocks. `symbol::declare()` is a call, so the borrow drops at return —
+  which is why `var_ref` was always safe. This makes the safe form the easy
+  form and killed all 16 `RefCell` panics.
+- Fixtures declared into a local table and then handed `CFunction` a fresh empty
+  one. `generate_function` copies `func.symbols`, so codegen read an empty
+  table.
+- `make_ctx` in the `lower` tests leaked a table of its own while the fixtures
+  declared into another.
+
+### The 21 that remain
+
+- **7 cross-table reads**, each now naming both tables in its panic, in
+  `fold::op_lower::tests` and the `lib.rs` test module. Same shape as the four
+  above: find which table the code under test reads, and declare into it.
+- **about 14 real assertion failures.** These are the interesting ones. At least
+  three concern semantic member access failing to stay rooted at `argN`, which
+  may be a genuine regression rather than a fixture problem. Diagnose before
+  assuming they are migration debris.
 
 ## What is left
 
