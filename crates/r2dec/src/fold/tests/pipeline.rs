@@ -1789,7 +1789,10 @@ mod tests {
         );
 
         let poisoned = CExpr::call(
-            ctx.name_ref("sym.local_two_arg"),
+            CExpr::External {
+                name: "sym.local_two_arg".to_string(),
+                kind: crate::symbol::ExternalKind::Function,
+            },
             vec![CExpr::IntLit(7), CExpr::IntLit(9)],
         );
         let normalized = ctx.normalize_call_expr_for_source_call(
@@ -1801,7 +1804,10 @@ mod tests {
         assert_eq!(
             normalized,
             CExpr::call(
-                ctx.name_ref("sym.imp.one_arg"),
+                CExpr::External {
+                    name: "sym.imp.one_arg".to_string(),
+                    kind: crate::symbol::ExternalKind::Import,
+                },
                 vec![CExpr::IntLit(7)]
             ),
             "final normalization must keep source-call identity for typed callee arity",
@@ -1828,7 +1834,10 @@ mod tests {
         let normalized = ctx.normalize_call_expr_for_source_call(
             (0x1000, 0),
             CExpr::call(
-                ctx.name_ref("sym.poisoned"),
+                CExpr::External {
+                    name: "sym.poisoned".to_string(),
+                    kind: crate::symbol::ExternalKind::Function,
+                },
                 vec![CExpr::IntLit(7)],
             ),
             FinalExprNormalizeContext::DefinitionRoot,
@@ -1837,7 +1846,10 @@ mod tests {
         assert_eq!(
             normalized,
             CExpr::call(
-                ctx.name_ref("sym.poisoned"),
+                CExpr::External {
+                    name: "sym.poisoned".to_string(),
+                    kind: crate::symbol::ExternalKind::Function,
+                },
                 vec![CExpr::IntLit(7)]
             ),
             "prepared direct targets must not repair rendered call targets without typed callsite resolution"
@@ -1859,7 +1871,10 @@ mod tests {
         let normalized = ctx.normalize_call_expr_for_source_call(
             (0x1000, 0),
             CExpr::call(
-                ctx.name_ref("sym.poisoned"),
+                CExpr::External {
+                    name: "sym.poisoned".to_string(),
+                    kind: crate::symbol::ExternalKind::Function,
+                },
                 vec![CExpr::IntLit(7)],
             ),
             FinalExprNormalizeContext::DefinitionRoot,
@@ -1867,7 +1882,7 @@ mod tests {
 
         assert_eq!(
             normalized,
-            CExpr::call(ctx.name_ref("sym.helper"), vec![CExpr::IntLit(7)]),
+            CExpr::call(CExpr::External { name: "sym.helper".to_string(), kind: crate::symbol::ExternalKind::Function }, vec![CExpr::IntLit(7)]),
             "typed callsite resolution must outrank rendered callee text"
         );
     }
@@ -1898,7 +1913,10 @@ mod tests {
             .insert("tmp_result".to_string(), owner_id);
 
         let poisoned = CExpr::call(
-            ctx.name_ref("sym.imp.printf"),
+            CExpr::External {
+                name: "sym.imp.printf".to_string(),
+                kind: crate::symbol::ExternalKind::Import,
+            },
             vec![ctx.name_ref("tmp_result")],
         );
         let normalized = ctx.normalize_call_expr_for_source_call(
@@ -1910,7 +1928,10 @@ mod tests {
         assert_eq!(
             normalized,
             CExpr::call(
-                ctx.name_ref("sym.local.helper"),
+                CExpr::External {
+                    name: "sym.local.helper".to_string(),
+                    kind: crate::symbol::ExternalKind::Function,
+                },
                 vec![ctx.name_ref("tmp_result")],
             ),
             "poisoned rendered import names must not trigger imported-arg repair for typed internal callsites",
@@ -2097,7 +2118,10 @@ mod tests {
             }),
         );
         let rendered_local_logger = CExpr::call(
-            imported_ctx.name_ref("sym.local_logger"),
+            CExpr::External {
+                name: "sym.local_logger".to_string(),
+                kind: crate::symbol::ExternalKind::Function,
+            },
             vec![
                 CExpr::StringLit("x=%d".to_string()),
                 imported_ctx.name_ref("x"),
@@ -2112,7 +2136,10 @@ mod tests {
                 FinalExprNormalizeContext::DefinitionRoot,
             ),
             CExpr::call(
-                imported_ctx.name_ref("sym.imp.printf"),
+                CExpr::External {
+                    name: "sym.imp.printf".to_string(),
+                    kind: crate::symbol::ExternalKind::Import,
+                },
                 vec![
                     CExpr::StringLit("x=%d".to_string()),
                     imported_ctx.name_ref("x"),
@@ -2138,7 +2165,10 @@ mod tests {
             }),
         );
         let poisoned_printf = CExpr::call(
-            imported_ctx.name_ref("sym.imp.printf"),
+            CExpr::External {
+                name: "sym.imp.printf".to_string(),
+                kind: crate::symbol::ExternalKind::Import,
+            },
             vec![
                 CExpr::StringLit("x=%d".to_string()),
                 imported_ctx.name_ref("x"),
@@ -2153,7 +2183,10 @@ mod tests {
                 FinalExprNormalizeContext::DefinitionRoot,
             ),
             CExpr::call(
-                imported_ctx.name_ref("sym.local_logger"),
+                CExpr::External {
+                    name: "sym.local_logger".to_string(),
+                    kind: crate::symbol::ExternalKind::Function,
+                },
                 vec![
                     CExpr::StringLit("x=%d".to_string()),
                     imported_ctx.name_ref("x"),
@@ -2229,7 +2262,10 @@ mod tests {
             crate::analysis::SemanticCallArg::FallbackExpr(CExpr::call(
                 poisoned_func.clone(),
                 vec![CExpr::call(
-                    ctx.name_ref("sym.local_nested"),
+                    CExpr::External {
+                        name: "sym.local_nested".to_string(),
+                        kind: crate::symbol::ExternalKind::Function,
+                    },
                     vec![],
                 )],
             )),
@@ -2282,7 +2318,10 @@ mod tests {
             .insert(outer_call, vec![call_arg(CExpr::IntLit(99))]);
 
         let nested = CExpr::call(
-            ctx.name_ref("sym.imp.nested_one_arg"),
+            CExpr::External {
+                name: "sym.imp.nested_one_arg".to_string(),
+                kind: crate::symbol::ExternalKind::Import,
+            },
             vec![CExpr::IntLit(7), CExpr::IntLit(9)],
         );
         ctx.state
@@ -2352,7 +2391,10 @@ mod tests {
             .insert(outer_call, vec![call_arg(CExpr::IntLit(99))]);
 
         let nested = CExpr::call(
-            ctx.name_ref("sym.imp.nested_one_arg"),
+            CExpr::External {
+                name: "sym.imp.nested_one_arg".to_string(),
+                kind: crate::symbol::ExternalKind::Import,
+            },
             vec![CExpr::IntLit(7)],
         );
         ctx.state
@@ -2413,7 +2455,10 @@ mod tests {
             .insert(outer_call, vec![call_arg(CExpr::IntLit(99))]);
 
         let nested = CExpr::call(
-            ctx.name_ref("sym.imp.nested_one_arg"),
+            CExpr::External {
+                name: "sym.imp.nested_one_arg".to_string(),
+                kind: crate::symbol::ExternalKind::Import,
+            },
             vec![CExpr::IntLit(7)],
         );
         ctx.state
@@ -2466,13 +2511,19 @@ mod tests {
         ctx.state.analysis_ctx.use_info.call_result_exprs.insert(
             source_call,
             CExpr::call(
-                ctx.name_ref("sym.local_two_arg"),
+                CExpr::External {
+                    name: "sym.local_two_arg".to_string(),
+                    kind: crate::symbol::ExternalKind::Function,
+                },
                 vec![CExpr::IntLit(7)],
             ),
         );
 
         let poisoned = CExpr::call(
-            ctx.name_ref("sym.local_two_arg"),
+            CExpr::External {
+                name: "sym.local_two_arg".to_string(),
+                kind: crate::symbol::ExternalKind::Function,
+            },
             vec![CExpr::IntLit(7), CExpr::IntLit(9)],
         );
         assert_eq!(
@@ -2482,7 +2533,10 @@ mod tests {
                 FinalExprNormalizeContext::DefinitionRoot,
             ),
             CExpr::call(
-                ctx.name_ref("sym.imp.one_arg"),
+                CExpr::External {
+                    name: "sym.imp.one_arg".to_string(),
+                    kind: crate::symbol::ExternalKind::Import,
+                },
                 vec![CExpr::IntLit(7)],
             ),
             "source-keyed normalization must render the typed callsite callee and arity",
@@ -2515,13 +2569,19 @@ mod tests {
         ctx.state.analysis_ctx.use_info.call_result_exprs.insert(
             source_call,
             CExpr::call(
-                ctx.name_ref("sym.local_two_arg"),
+                CExpr::External {
+                    name: "sym.local_two_arg".to_string(),
+                    kind: crate::symbol::ExternalKind::Function,
+                },
                 vec![CExpr::IntLit(7)],
             ),
         );
 
         let rendered = CExpr::call(
-            ctx.name_ref("sym.imp.one_arg"),
+            CExpr::External {
+                name: "sym.imp.one_arg".to_string(),
+                kind: crate::symbol::ExternalKind::Import,
+            },
             vec![CExpr::IntLit(7), CExpr::IntLit(9)],
         );
 
@@ -2541,7 +2601,10 @@ mod tests {
         let mut ctx = FoldingContext::new(64);
         install_known_one_arg_signature(&mut ctx);
         let call = CExpr::call(
-            ctx.name_ref("sym.imp.one_arg"),
+            CExpr::External {
+                name: "sym.imp.one_arg".to_string(),
+                kind: crate::symbol::ExternalKind::Import,
+            },
             vec![CExpr::IntLit(7), CExpr::IntLit(9)],
         );
 
@@ -2570,7 +2633,10 @@ mod tests {
         let wrapped = CExpr::cast(
             CType::Int(64),
             CExpr::call(
-                ctx.name_ref("sym.local_two_arg"),
+                CExpr::External {
+                    name: "sym.local_two_arg".to_string(),
+                    kind: crate::symbol::ExternalKind::Function,
+                },
                 vec![CExpr::IntLit(7), CExpr::IntLit(9)],
             ),
         );
@@ -2584,7 +2650,10 @@ mod tests {
             CExpr::cast(
                 CType::Int(64),
                 CExpr::call(
-                    ctx.name_ref("sym.imp.one_arg"),
+                    CExpr::External {
+                        name: "sym.imp.one_arg".to_string(),
+                        kind: crate::symbol::ExternalKind::Import,
+                    },
                     vec![CExpr::IntLit(7)]
                 ),
             ),
@@ -2604,7 +2673,10 @@ mod tests {
         ctx.state.analysis_ctx.use_info.definitions.insert(
             "X20_1".to_string(),
             CExpr::call(
-                ctx.name_ref("sym.imp.one_arg"),
+                CExpr::External {
+                    name: "sym.imp.one_arg".to_string(),
+                    kind: crate::symbol::ExternalKind::Import,
+                },
                 vec![CExpr::IntLit(7)],
             ),
         );
@@ -2615,7 +2687,10 @@ mod tests {
             .insert("x20_1".to_string(), 1);
 
         let rendered = CExpr::call(
-            ctx.name_ref("sym.imp.one_arg"),
+            CExpr::External {
+                name: "sym.imp.one_arg".to_string(),
+                kind: crate::symbol::ExternalKind::Import,
+            },
             vec![CExpr::IntLit(7)],
         );
         assert_eq!(
@@ -2660,7 +2735,10 @@ mod tests {
         ctx.state.analysis_ctx.use_info.call_result_exprs.insert(
             source_call,
             CExpr::call(
-                ctx.name_ref("sym.local_two_arg"),
+                CExpr::External {
+                    name: "sym.local_two_arg".to_string(),
+                    kind: crate::symbol::ExternalKind::Function,
+                },
                 vec![CExpr::IntLit(7), CExpr::IntLit(9)],
             ),
         );
@@ -2668,7 +2746,10 @@ mod tests {
         assert_eq!(
             ctx.recovered_owned_call_result_definition_rhs_for_visible_name({ let CExpr::Var(id) = ctx.name_ref("owned_result") else { unreachable!() }; id }),
             Some(CExpr::call(
-                ctx.name_ref("sym.imp.one_arg"),
+                CExpr::External {
+                    name: "sym.imp.one_arg".to_string(),
+                    kind: crate::symbol::ExternalKind::Import,
+                },
                 vec![CExpr::IntLit(7)]
             )),
             "source-keyed recovered RHS must canonicalize the call target before generic normalization",
@@ -2700,7 +2781,10 @@ mod tests {
         ctx.state.analysis_ctx.use_info.call_result_exprs.insert(
             source_call,
             CExpr::call(
-                ctx.name_ref("sym.local.poisoned"),
+                CExpr::External {
+                    name: "sym.local.poisoned".to_string(),
+                    kind: crate::symbol::ExternalKind::Function,
+                },
                 vec![CExpr::IntLit(7)],
             ),
         );
@@ -2728,7 +2812,10 @@ mod tests {
             }),
         );
         let poisoned = CExpr::call(
-            ctx.name_ref("sym.local_two_arg"),
+            CExpr::External {
+                name: "sym.local_two_arg".to_string(),
+                kind: crate::symbol::ExternalKind::Function,
+            },
             vec![CExpr::IntLit(7), CExpr::IntLit(9)],
         );
 
@@ -2781,7 +2868,10 @@ mod tests {
             },
         );
         let source_expr = CExpr::call(
-            ctx.name_ref("sym.local_two_arg"),
+            CExpr::External {
+                name: "sym.local_two_arg".to_string(),
+                kind: crate::symbol::ExternalKind::Function,
+            },
             vec![CExpr::IntLit(7), CExpr::IntLit(9)],
         );
         ctx.state
@@ -2793,7 +2883,10 @@ mod tests {
         assert_eq!(
             ctx.recovered_owned_call_result_definition_rhs("owned_result", &source_expr),
             Some(CExpr::call(
-                ctx.name_ref("sym.imp.one_arg"),
+                CExpr::External {
+                    name: "sym.imp.one_arg".to_string(),
+                    kind: crate::symbol::ExternalKind::Import,
+                },
                 vec![CExpr::IntLit(7)]
             )),
             "exact source-call RHS recovery must canonicalize through typed callsite identity",
@@ -2809,7 +2902,10 @@ mod tests {
                 &CExpr::Paren(Box::new(source_expr)),
             ),
             Some(CExpr::call(
-                ctx.name_ref("sym.imp.one_arg"),
+                CExpr::External {
+                    name: "sym.imp.one_arg".to_string(),
+                    kind: crate::symbol::ExternalKind::Import,
+                },
                 vec![CExpr::IntLit(7)]
             )),
             "paren/cast wrappers must recurse into exact source-call RHS recovery",
@@ -2852,7 +2948,10 @@ mod tests {
         ctx.state.analysis_ctx.use_info.call_result_exprs.insert(
             source_call,
             CExpr::call(
-                ctx.name_ref("sym.local_two_arg"),
+                CExpr::External {
+                    name: "sym.local_two_arg".to_string(),
+                    kind: crate::symbol::ExternalKind::Function,
+                },
                 vec![CExpr::IntLit(7), CExpr::IntLit(9)],
             ),
         );
@@ -2863,7 +2962,10 @@ mod tests {
                 &ctx.name_ref("tmp_result"),
             ),
             Some(CExpr::call(
-                ctx.name_ref("sym.imp.one_arg"),
+                CExpr::External {
+                    name: "sym.imp.one_arg".to_string(),
+                    kind: crate::symbol::ExternalKind::Import,
+                },
                 vec![CExpr::IntLit(7)]
             )),
             "alias-source RHS recovery must canonicalize through typed callsite identity",
@@ -3000,7 +3102,10 @@ mod tests {
         assert_eq!(
             stmt,
             CStmt::Expr(CExpr::call(
-                ctx.name_ref("sym.imp.printf"),
+                CExpr::External {
+                    name: "sym.imp.printf".to_string(),
+                    kind: crate::symbol::ExternalKind::Import,
+                },
                 vec![]
             )),
             "fallback indirect call lowering must use typed callsite identity instead of rendering the target register",
@@ -3110,12 +3215,18 @@ mod tests {
                 stack_load_call_arg(-52, 4).with_stack_offset(16),
                 result_call_arg(
                     CExpr::call(
-                        ctx.name_ref("sym._unlock"),
+                        CExpr::External {
+                            name: "sym._unlock".to_string(),
+                            kind: crate::symbol::ExternalKind::Function,
+                        },
                         vec![
                             ctx.name_ref("argc"),
                             ctx.name_ref("argc"),
                             CExpr::call(
-                                ctx.name_ref("sym.imp.atoi"),
+                                CExpr::External {
+                                    name: "sym.imp.atoi".to_string(),
+                                    kind: crate::symbol::ExternalKind::Import,
+                                },
                                 vec![CExpr::Deref(Box::new(CExpr::binary(
                                     BinaryOp::Add,
                                     ctx.name_ref("argv"),
@@ -3197,7 +3308,10 @@ mod tests {
             __fixture_args.1,
         );;
         let helper_call = CExpr::call(
-            ctx.name_ref("sym._unlock"),
+            CExpr::External {
+                name: "sym._unlock".to_string(),
+                kind: crate::symbol::ExternalKind::Function,
+            },
             vec![
                 ctx.name_ref("a"),
                 ctx.name_ref("b"),
@@ -3260,7 +3374,10 @@ mod tests {
                 stack_load_call_arg(-92, 4).with_stack_offset(0),
                 result_call_arg(
                     CExpr::call(
-                        ctx.name_ref("sym._solve_equation"),
+                        CExpr::External {
+                            name: "sym._solve_equation".to_string(),
+                            kind: crate::symbol::ExternalKind::Function,
+                        },
                         vec![ctx.name_ref("argc")],
                     ),
                     (0x2000, 0),
@@ -3318,11 +3435,17 @@ mod tests {
                 stack_load_call_arg(-100, 4).with_stack_offset(8),
                 result_call_arg(
                     CExpr::call(
-                        ctx.name_ref("sym._complex_check"),
+                        CExpr::External {
+                            name: "sym._complex_check".to_string(),
+                            kind: crate::symbol::ExternalKind::Function,
+                        },
                         vec![
                             ctx.name_ref("argc"),
                             CExpr::call(
-                                ctx.name_ref("sym.imp.atoi"),
+                                CExpr::External {
+                                    name: "sym.imp.atoi".to_string(),
+                                    kind: crate::symbol::ExternalKind::Import,
+                                },
                                 vec![CExpr::Deref(Box::new(CExpr::binary(
                                     BinaryOp::Add,
                                     ctx.name_ref("argv"),
@@ -3396,7 +3519,10 @@ mod tests {
             &ctx.name_ref("sym.imp.printf"),
             result_call_arg(
                 CExpr::call(
-                    ctx.name_ref("sym.imp.malloc"),
+                    CExpr::External {
+                        name: "sym.imp.malloc".to_string(),
+                        kind: crate::symbol::ExternalKind::Import,
+                    },
                     vec![CExpr::IntLit(16)],
                 ),
                 (0x1000, 0),
@@ -3438,7 +3564,10 @@ mod tests {
         ctx.state.analysis_ctx.use_info.definitions.insert(
             shadow.display_name(),
             CExpr::call(
-                ctx.name_ref("sym.imp.malloc"),
+                CExpr::External {
+                    name: "sym.imp.malloc".to_string(),
+                    kind: crate::symbol::ExternalKind::Import,
+                },
                 vec![CExpr::IntLit(16)],
             ),
         );
@@ -4440,7 +4569,10 @@ mod tests {
 
         ctx.analyze_blocks(std::slice::from_ref(&block));
         let strlen_call = CExpr::call(
-            ctx.name_ref("sym.imp.strlen"),
+            CExpr::External {
+                name: "sym.imp.strlen".to_string(),
+                kind: crate::symbol::ExternalKind::Import,
+            },
             vec![ctx.name_ref("s")],
         );
         assert_eq!(
@@ -5206,7 +5338,7 @@ mod tests {
             },
         )]));
 
-        let callee = ctx.name_ref("sym.helper");
+        let callee = CExpr::External { name: "sym.helper".to_string(), kind: crate::symbol::ExternalKind::Function };
         assert_eq!(ctx.non_variadic_call_arity(&callee), Some(1));
         assert!(
             ctx.known_signature_for_callee_expr(&callee).is_some(),
@@ -5290,7 +5422,10 @@ mod tests {
         );
 
         let poisoned_rendered_call = CExpr::call(
-            ctx.name_ref("sym.imp.free"),
+            CExpr::External {
+                name: "sym.imp.free".to_string(),
+                kind: crate::symbol::ExternalKind::Import,
+            },
             vec![ctx.name_ref("ptr")],
         );
 
@@ -5320,7 +5455,10 @@ mod tests {
         );
 
         let rendered_unknown_call = CExpr::call(
-            ctx.name_ref("sym.local.rendered_name"),
+            CExpr::External {
+                name: "sym.local.rendered_name".to_string(),
+                kind: crate::symbol::ExternalKind::Function,
+            },
             vec![ctx.name_ref("ptr")],
         );
 
@@ -5354,7 +5492,10 @@ mod tests {
         );
 
         let poisoned_rendered_call = CExpr::call(
-            ctx.name_ref("sym.local.poison"),
+            CExpr::External {
+                name: "sym.local.poison".to_string(),
+                kind: crate::symbol::ExternalKind::Function,
+            },
             vec![CExpr::UIntLit(16)],
         );
         ctx.state
@@ -8780,7 +8921,10 @@ mod tests {
             },
         )]));
         let call = CExpr::call(
-            ctx.name_ref("sym._IORWLockUnlock"),
+            CExpr::External {
+                name: "sym._IORWLockUnlock".to_string(),
+                kind: crate::symbol::ExternalKind::Function,
+            },
             vec![CExpr::Subscript {
                 base: Box::new(CExpr::UIntLit(0xfffffe0007d21000)),
                 index: Box::new(CExpr::IntLit(367)),
@@ -8836,7 +8980,10 @@ mod tests {
         );
 
         let call = CExpr::call(
-            ctx.name_ref("sym.imp.free"),
+            CExpr::External {
+                name: "sym.imp.free".to_string(),
+                kind: crate::symbol::ExternalKind::Import,
+            },
             vec![ctx.name_ref("ptr")],
         );
         ctx.state
@@ -8910,7 +9057,10 @@ mod tests {
         );
 
         let call = CExpr::call(
-            ctx.name_ref("sym.imp.free"),
+            CExpr::External {
+                name: "sym.imp.free".to_string(),
+                kind: crate::symbol::ExternalKind::Import,
+            },
             vec![ctx.name_ref("ptr")],
         );
         ctx.state
@@ -8939,7 +9089,10 @@ mod tests {
             pruned,
             vec![
                 CStmt::Expr(CExpr::call(
-                    ctx.name_ref("sym.imp.free"),
+                    CExpr::External {
+                        name: "sym.imp.free".to_string(),
+                        kind: crate::symbol::ExternalKind::Import,
+                    },
                     vec![ctx.name_ref("ptr")],
                 )),
                 CStmt::Return(Some(CExpr::IntLit(0))),
@@ -8964,7 +9117,10 @@ mod tests {
         );
 
         let call = CExpr::call(
-            ctx.name_ref("sym.local.rendered_name"),
+            CExpr::External {
+                name: "sym.local.rendered_name".to_string(),
+                kind: crate::symbol::ExternalKind::Function,
+            },
             vec![ctx.name_ref("ptr")],
         );
         ctx.state
@@ -9334,7 +9490,10 @@ mod tests {
         let mut ctx = make_x86_64_ctx();
         let source_call = (0x3000, 0);
         let call = CExpr::call(
-            ctx.name_ref("sym.imp.alloc"),
+            CExpr::External {
+                name: "sym.imp.alloc".to_string(),
+                kind: crate::symbol::ExternalKind::Import,
+            },
             vec![CExpr::IntLit(32)],
         );
         ctx.state
@@ -9376,7 +9535,10 @@ mod tests {
         let mut ctx = make_x86_64_ctx();
         let source_call = (0x3000, 1);
         let call = CExpr::call(
-            ctx.name_ref("sym.imp.alloc"),
+            CExpr::External {
+                name: "sym.imp.alloc".to_string(),
+                kind: crate::symbol::ExternalKind::Import,
+            },
             vec![CExpr::IntLit(32)],
         );
         ctx.state
@@ -9417,7 +9579,10 @@ mod tests {
         let mut ctx = make_x86_64_ctx();
         let source_call = (0x3000, 2);
         let call = CExpr::call(
-            ctx.name_ref("sym.imp.alloc"),
+            CExpr::External {
+                name: "sym.imp.alloc".to_string(),
+                kind: crate::symbol::ExternalKind::Import,
+            },
             vec![CExpr::IntLit(32)],
         );
         ctx.state
@@ -9453,7 +9618,10 @@ mod tests {
         let mut ctx = make_x86_64_ctx();
         let source_call = (0x3000, 3);
         let call = CExpr::call(
-            ctx.name_ref("sym.imp.alloc"),
+            CExpr::External {
+                name: "sym.imp.alloc".to_string(),
+                kind: crate::symbol::ExternalKind::Import,
+            },
             vec![CExpr::IntLit(32)],
         );
         ctx.state.analysis_ctx.use_info.call_result_aliases.insert(
@@ -9493,7 +9661,10 @@ mod tests {
         let source_call = (0x3000, 4);
         let source_id = CallSiteId::from(source_call);
         let call = CExpr::call(
-            ctx.name_ref("sym.imp.alloc"),
+            CExpr::External {
+                name: "sym.imp.alloc".to_string(),
+                kind: crate::symbol::ExternalKind::Import,
+            },
             vec![CExpr::IntLit(64)],
         );
         ctx.state.analysis_ctx.ownership.call_ownership.insert(
@@ -10751,7 +10922,10 @@ mod tests {
             }),
         );
         let poisoned_call = CExpr::call(
-            ctx.name_ref("sym.local_two_arg"),
+            CExpr::External {
+                name: "sym.local_two_arg".to_string(),
+                kind: crate::symbol::ExternalKind::Function,
+            },
             vec![CExpr::IntLit(16)],
         );
         ctx.state
@@ -11015,7 +11189,7 @@ mod tests {
         )]));
         ctx.state.analysis_ctx.use_info.call_result_exprs.insert(
             source_call,
-            CExpr::call(ctx.name_ref("sym.helper"), vec![]),
+            CExpr::call(CExpr::External { name: "sym.helper".to_string(), kind: crate::symbol::ExternalKind::Function }, vec![]),
         );
 
         assert!(
@@ -11332,7 +11506,7 @@ mod tests {
         let mut ctx = make_aarch64_ctx();
         assert!(!ctx.is_imported_call_target(&ctx.name_ref("sym.imp.printf")));
         assert!(!ctx.is_imported_call_target(&ctx.name_ref("imp.printf")));
-        assert!(!ctx.is_imported_call_target(&ctx.name_ref("sym.helper")));
+        assert!(!ctx.is_imported_call_target(&CExpr::External { name: "sym.helper".to_string(), kind: crate::symbol::ExternalKind::Function }));
         assert!(!ctx.is_imported_call_target(&ctx.name_ref("fcn.401000")));
 
         ctx.set_known_function_signatures(HashMap::from([(
@@ -11468,7 +11642,10 @@ mod tests {
 
         let mut exact_ctx = make_aarch64_ctx();
         let helper_call = CExpr::call(
-            exact_ctx.name_ref("sym.imp.helper"),
+            CExpr::External {
+                name: "sym.imp.helper".to_string(),
+                kind: crate::symbol::ExternalKind::Import,
+            },
             vec![exact_ctx.name_ref("arg1")],
         );
         let exact_call = (0x1000, 0);
@@ -17768,7 +17945,7 @@ mod tests {
 
         assert_eq!(
             ctx.resolve_call_target_for_site(block.addr, 1, target),
-            ctx.name_ref("sym.imp.fact_helper")
+            CExpr::External { name: "sym.imp.fact_helper".to_string(), kind: crate::symbol::ExternalKind::Import }
         );
         assert_eq!(
             ctx.call_target_identity(&ctx.name_ref("const:401050")),
@@ -17873,7 +18050,13 @@ mod tests {
         let CStmt::Expr(CExpr::Call { func, args }) = stmt else {
             panic!("expected certified call expression, got {stmt:?}");
         };
-        assert_eq!(*func, ctx.name_ref("sym.helper"));
+        assert_eq!(
+            *func,
+            CExpr::External {
+                name: "sym.helper".to_string(),
+                kind: crate::symbol::ExternalKind::Function,
+            }
+        );
         assert_eq!(args, vec![CExpr::IntLit(7)]);
     }
 
@@ -17975,7 +18158,13 @@ mod tests {
         let CStmt::Expr(CExpr::Call { func, args }) = stmt else {
             panic!("expected certified call expression, got {stmt:?}");
         };
-        assert_eq!(*func, ctx.name_ref("sym.helper"));
+        assert_eq!(
+            *func,
+            CExpr::External {
+                name: "sym.helper".to_string(),
+                kind: crate::symbol::ExternalKind::Function,
+            }
+        );
         assert_eq!(
             args,
             vec![CExpr::IntLit(7)],
@@ -18030,7 +18219,10 @@ mod tests {
         assert_eq!(
             ctx.synthesized_call_expr_for_source_call((0x1000, 2)),
             Some(CExpr::call(
-                ctx.name_ref("sym.helper"),
+                CExpr::External {
+                    name: "sym.helper".to_string(),
+                    kind: crate::symbol::ExternalKind::Function,
+                },
                 vec![CExpr::IntLit(7)]
             )),
             "synthesized source-call expressions must use FunctionFacts argument values, not prepared arg ids"
@@ -18191,7 +18383,13 @@ mod tests {
         let CStmt::Expr(CExpr::Call { func, args }) = stmt else {
             panic!("expected certified zero-arg call, got {stmt:?}");
         };
-        assert_eq!(*func, ctx.name_ref("sym.helper"));
+        assert_eq!(
+            *func,
+            CExpr::External {
+                name: "sym.helper".to_string(),
+                kind: crate::symbol::ExternalKind::Function,
+            }
+        );
         assert!(
             args.is_empty(),
             "prepared fake args must not override a zero-arg FunctionFacts callsite"
@@ -18444,7 +18642,7 @@ mod tests {
         let rendered_args = ctx.render_call_args_for_site_with_direct_target(
             block.addr,
             2,
-            &ctx.name_ref("sym.helper"),
+            &CExpr::External { name: "sym.helper".to_string(), kind: crate::symbol::ExternalKind::Function },
             Some(0x401050),
             ctx.call_args_map()
                 .get(&(0x1000, 2))

@@ -13960,6 +13960,10 @@ fn call_arg_callee_name(
 ) -> Option<std::rc::Rc<str>> {
     match expr {
         CExpr::Var(name) => Some(crate::symbol::spelling(symbols, *name)),
+        // A call names something outside the function, so the callee is an
+        // external. Matching only variables here lost the signature for every
+        // call the moment callees started saying what they are.
+        CExpr::External { name, .. } => Some(std::rc::Rc::from(name.as_str())),
         CExpr::Deref(inner) | CExpr::Paren(inner) | CExpr::AddrOf(inner) => {
             call_arg_callee_name(symbols, inner)
         }

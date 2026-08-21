@@ -71,12 +71,21 @@ impl<'a> FoldingContext<'a> {
             .direct_target
     }
 
+    /// A reference to the function being called.
+    ///
+    /// This names something outside the function, so it is an external rather
+    /// than a variable. Spelling it as a variable is what let a machine name
+    /// look exactly like a local, and it leaves the reader a name no
+    /// declaration accounts for.
     fn callee_identity_expr(&self, identity: &CalleeIdentity) -> CExpr {
-        identity
+        let name = identity
             .display_name
             .clone()
-            .map(|n| self.name_ref(&n))
-            .unwrap_or_else(|| self.name_ref(&identity.primary_key()))
+            .unwrap_or_else(|| identity.primary_key());
+        CExpr::External {
+            name,
+            kind: external_kind_for_callee(identity.class),
+        }
     }
 
     fn resolved_callee_target(
@@ -433,6 +442,8 @@ impl<'a> FoldingContext<'a> {
     pub(super) fn extract_callee_name(&self, expr: &CExpr) -> Option<std::rc::Rc<str>> {
         match expr {
             CExpr::Var(name) => Some(self.spelling(*name)),
+            // A callee is an external, and it still names something.
+            CExpr::External { name, .. } => Some(std::rc::Rc::from(name.as_str())),
             CExpr::Deref(inner) | CExpr::Paren(inner) | CExpr::AddrOf(inner) => {
                 self.extract_callee_name(inner)
             }
@@ -1753,5 +1764,17 @@ fn stack_slot_synthetic_name(offset: i64) -> String {
         format!("local_{:x}", (-offset) as u64)
     } else {
         format!("stack_{:x}", offset as u64)
+    }
+}
+
+/// What kind of outside thing a call names.
+///
+/// The identity already classified it, so the rendering says what the analysis
+/// concluded rather than guessing from how the name is spelled.
+fn external_kind_for_callee(class: r2types::CalleeClass) -> crate::symbol::ExternalKind {
+    match class {
+        r2types::CalleeClass::Imported => crate::symbol::ExternalKind::Import,
+        r2types::CalleeClass::ExternalSymbol => crate::symbol::ExternalKind::Global,
+        _ => crate::symbol::ExternalKind::Function,
     }
 }
