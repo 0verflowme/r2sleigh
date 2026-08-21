@@ -152,9 +152,23 @@ returning `repr(C)` structs, which is the pattern radare2's own
 `r_anal_function_snapshot_view` already uses across the same boundary.
 
 One transport replaces three. Typed views carry structure. The serialized wire
-format stays for the snapshot, and its C reader is generated from the Rust
-definition so the existing byte-for-byte conformance test guards a build step
-rather than two hand-maintained implementations.
+format stays for the snapshot.
+
+The first draft said its C reader should be generated from the Rust definition.
+There is no C reader. `snapshot_wire.c` is a writer, and 239 lines of it are
+primitive encoders and buffer growth, which no schema generator would produce
+anything better than. What could drift is the field order in `snapshot_walk.c`,
+where 120 encoder calls describe a radare2 snapshot, and generating that from
+Rust would require the Rust side to model radare2's structures rather than
+merely read them.
+
+It is already guarded, twice. `snapshot_wire_conformance.c` asserts the C writer
+emits exactly the bytes r2source's writer does, and the same vector is asserted
+from the Rust side, so drift on either fails a test rather than yielding a buffer
+the other misreads. That is a weaker guarantee than generation and a much smaller
+machine, and until the field order starts moving it is the better trade. The API
+header is generated because it is a pure projection of Rust declarations; this is
+not.
 
 The JSON claim in the first draft of this decision was too broad and is
 corrected here. `R2SLEIGH_ANALYSIS_BLOCK_OP_JSON_V2` and its neighbours feed
@@ -220,8 +234,7 @@ has to work before it lands.
    will be built on.
 2. FFI boundary: stop gating on version numbers, collapse the accessor vtable
    into view calls, produce the merged diagnostics document in Rust instead of
-   reparsing it in C, generate the C wire reader, and move the C wrapper's logic
-   into Rust.
+   reparsing it in C, and move the C wrapper's logic into Rust.
 3. Location model and use index in `r2ssa`, covering registers and stack objects,
    with symbolic execution consulted for stack promotion.
 4. Delete the register-family repair pass. If it is not dead, step 3 is
