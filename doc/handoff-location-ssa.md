@@ -267,32 +267,48 @@ Counts across the two corpora: 23 functions and 55 distinct names down to 18 and
 renderer replaces machine tokens with prose and would otherwise print the
 substitution rather than the name.
 
-### The spelling tables are gone
+### One spelling table is gone; two came back
 
-All three are removed. The phi picker asks the convention which location returns
-a value; `is_return_value_register` and `is_control_return_target` ask the
-machine rather than matching `rax | eax | ax | al | xmm0 | st0 | x0 | w0 | r0 |
-v0` and `pc | lr | ra | x30 | rip | eip`.
+The phi picker asks the convention which location returns a value, and that
+holds. `is_return_value_register` and `is_control_return_target` still match
+`rax | eax | ax | al | xmm0 | st0 | x0 | w0 | r0 | v0` and `pc | lr | ra | x30 |
+rip | eip`. I removed them, believed it verified, and had to put them back.
 
-Two things were learned removing them, each at the cost of a revert, and both
-are now encoded rather than remembered.
+**Read this before trying again.** The removal was reported green by a check
+that could not tell "nothing failed" from "nothing ran": the commit added a test
+helper missing an `AddressSpace` import, so the r2ssa test binary never built,
+and `grep -c 'test result: FAILED'` answered zero. Check compilation separately
+with `cargo test --workspace --no-run` and read the `test result:` line, never a
+bare FAILED count.
+
+With the helper fixed, four control-return tests fail:
+`prepared_function_certifies_unique_return_phi_at_control_return`,
+`prepared_function_does_not_render_memory_backed_return_phi_at_control_return`,
+`prepared_function_refuses_display_named_stack_reload_at_control_return` and
+`prepared_return_register_subpiece_zext_chain_is_renderable`. They get past the
+certificate lookup and fail on whether the expression is renderable, so it is a
+real behaviour change rather than a fixture missing a premise. An instrumented
+run shows `unique_return_value_phi_for_block` is never reached for them, so
+whatever changes their result is on another path -- I did not find it.
+
+Two pieces of the work were kept because they are independently right:
+`ArchSpec::return_registers` lets an architecture state where it returns a
+value, serde-defaulted so existing `.r2il` files read unchanged, and the fixture
+arches state it. That was the missing third source; with it the chain can be
+interface -> convention -> architecture with no hand-written link.
+
+Two things learned while removing them, both still true and both worth keeping
+whoever redoes it:
 
 **One predicate was answering two questions.** Whether *this function* returns a
 value here must respect a declared `Void`; whether a *call* left its result here
 must not, because a void function still reads the results of the calls it makes.
-The table served both because it never consulted a contract. They are
-`is_return_value_register` and `is_call_result_register` now.
+The table serves both because it never consults a contract.
 
-**The table was supplying a default nothing else provided.** The recovered
-interface answers, and the recovered convention answers, but a function built
-with neither had no machine statement at all -- which is why seven tests
-depended on the spelling list. `ArchSpec` carries `return_registers` now, serde
-defaulted so existing `.r2il` files read unchanged, and the chain is interface
--> convention -> architecture with no hand-written link in it.
-
-Four fixtures asserted which phi a control return binds while providing no
-machine that could name a return register. They state one now. A test asking
-that question needs the premise; it was only ever answered by the hack.
+**`SourceFunctionInterface::return_kind()` is the right source**, not the
+convention's `result_slot`: it is `Void` or `Register { storage }`, so it states
+both whether there is a return value and where. The convention says only where a
+caller *would* leave one.
 
 ### The SIMD lane defect, traced to the instructions
 
