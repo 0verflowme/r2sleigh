@@ -3464,6 +3464,13 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 
 	RCore *core = anal->coreb.core;
 	RCons *cons = core ? core->cons : NULL;
+	/* Every print below goes through cons. Without one a command answers with
+	 * an empty string, which reads as "nothing to report" rather than "could
+	 * not report". Say which. */
+	if (!cons) {
+		R_LOG_ERROR ("r2sleigh: no console bound; '%s' cannot print", cmd);
+		return strdup ("");
+	}
 
 	if (r_str_startswith (cmd, "sla.debug.")) {
 		int n = snprintf (debug_cmd, sizeof (debug_cmd), "sla.%s", cmd + strlen ("sla.debug."));
