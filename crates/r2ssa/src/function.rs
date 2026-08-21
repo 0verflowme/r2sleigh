@@ -649,7 +649,13 @@ impl SsaArtifact {
         for loop_fact in structured.loops.values() {
             for carrier in &loop_fact.carriers {
                 let members = crate::mirror::carrier_members(carrier);
-                if crate::mirror::carrier_mirrors_memory(structured, objects, loop_fact, &members) {
+                if crate::mirror::carrier_mirrors_memory(
+                    structured,
+                    objects,
+                    &self.graph,
+                    loop_fact,
+                    &members,
+                ) {
                     mirrored.insert(carrier.id);
                 }
             }

@@ -15,21 +15,21 @@
 
 use std::collections::BTreeSet;
 
-use crate::graph::ValueId;
+use crate::graph::{SsaGraph, ValueId};
 use crate::semantic::{ObjectKind, ObjectModel, StructuredDataflowFacts, StructuredLoopFact};
 
 /// Whether this loop moves the carrier through memory that already holds it.
 ///
-/// The test is the reload. If a value the carrier passes through was read from a
-/// frame slot inside the loop, then the register did not carry it across the back
-/// edge -- the slot did, and the register was handed a copy on the way past.
-///
-/// Asking instead whether the carrier is written to a slot does not work, and was
-/// tried: what gets stored is derived from the carrier rather than one of its own
-/// values, so the store never names anything the carrier owns.
+/// The test is the reload, and it has to be asked about what the carrier is made
+/// of rather than about the carrier's own values. Neither end of the spill names
+/// a member directly: what the loop stores is computed *from* a member, and what
+/// a member is computed from is what the loop loaded. So the question is whether
+/// a frame-slot read inside the loop reaches a value the carrier passes through.
+/// If it does, the slot carried the value and the register was handed a copy.
 pub fn carrier_mirrors_memory(
     structured: &StructuredDataflowFacts,
     objects: &ObjectModel,
+    graph: &SsaGraph,
     loop_fact: &StructuredLoopFact,
     carrier_members: &BTreeSet<ValueId>,
 ) -> bool {
@@ -41,19 +41,43 @@ pub fn carrier_mirrors_memory(
         .copied()
         .collect::<BTreeSet<_>>();
 
-    structured.memory_accesses.values().any(|access| {
-        !access.is_write
-            && access.provenance_complete
-            && in_loop.contains(&access.block_addr)
-            && access
-                .value
-                .is_some_and(|value| carrier_members.contains(&value))
-            // A frame slot only. Reading somewhere the caller can see is an effect
-            // of the program, not a place a local was being kept.
-            && objects
-                .object(access.object)
-                .is_some_and(|object| matches!(object.kind, ObjectKind::StackSlot { .. }))
-    })
+    // Frame slots only. Reading somewhere the caller can see is an effect of the
+    // program, not a place a local was being kept.
+    let reloaded = structured
+        .memory_accesses
+        .values()
+        .filter(|access| {
+            !access.is_write
+                && access.provenance_complete
+                && in_loop.contains(&access.block_addr)
+                && objects
+                    .object(access.object)
+                    .is_some_and(|object| matches!(object.kind, ObjectKind::StackSlot { .. }))
+        })
+        .filter_map(|access| access.value)
+        .collect::<BTreeSet<_>>();
+    if reloaded.is_empty() {
+        return false;
+    }
+
+    // Walk back from what the carrier holds. Each value is visited once, so the
+    // search costs one pass over the edges it can reach and no more.
+    let mut seen = carrier_members.clone();
+    let mut pending = carrier_members.iter().copied().collect::<Vec<_>>();
+    while let Some(value) = pending.pop() {
+        if reloaded.contains(&value) {
+            return true;
+        }
+        let Some(inst) = graph.def_inst(value).and_then(|inst| graph.inst(inst)) else {
+            continue;
+        };
+        for input in &inst.inputs {
+            if seen.insert(*input) {
+                pending.push(*input);
+            }
+        }
+    }
+    false
 }
 
 /// Every value one carrier passes through, which is what a spill has to name.

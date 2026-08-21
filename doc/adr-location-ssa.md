@@ -410,13 +410,19 @@ and `x0_4` become one `x0`; on x86-64 `-O2` the same happens to `rax_2` and
 `rax_3`; rendered output is thirteen lines shorter across the corpus and
 identical across repeated runs.
 
-One residual is recorded rather than hidden. At `-O0` a register that mirrors a
-frame slot still acquires a name in one function, because the mirror test asks
-whether a carrier's own values are loaded from a slot, and what is loaded is what
-the member is computed *from* rather than the member itself. The same shape
-defeated the first version of that test from the store side. It wants a short
-reachability walk instead of set membership, and it is a dead declaration rather
-than a wrong one.
+The mirror test had to be asked the right way round twice before it worked, and
+both wrong versions failed for one reason. Neither end of a spill names a carrier
+value directly: what the loop stores is computed *from* a member, and a member is
+computed *from* what the loop loaded. Testing set membership at either end
+therefore sees nothing. Walking back from what the carrier holds until a
+frame-slot read is reached sees it, and each value is visited once.
+
+With that, `-O0` output is byte-identical to what it was before carriers were
+named at all, which is the correct answer rather than a compromise: at that
+optimisation level essentially every variable lives in its frame slot and only
+passes through a register, so there is no register carrier there worth a name.
+The `-O2` gains are untouched -- x86-64 falls from 308 rendered lines to 302 and
+arm64 from 175 to 161 -- and repeated runs hash identically.
 
 The renderer should shrink substantially once it stops re-deriving storage
 identity and liveness, though whether it does so on its own or needs deliberate
