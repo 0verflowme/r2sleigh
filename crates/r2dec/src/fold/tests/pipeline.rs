@@ -19168,15 +19168,13 @@ mod tests {
 
     #[test]
     fn recovered_call_arg_rejects_low_signal_sources_without_better_proof() {
-        let ctx = make_x86_64_ctx();
-        let cases = [
-            ("src_transient", ctx.name_ref("rax_7")),
-            ("src_stack_placeholder", ctx.name_ref("stack")),
-            ("src_low_quality", ctx.name_ref("value_bad")),
-        ];
+        // Each case renders in its own context, so its names are declared there.
+        let cases = ["src_transient", "src_stack_placeholder", "src_low_quality"];
+        let spellings = ["rax_7", "stack", "value_bad"];
 
-        for (source_name, bad_expr) in cases {
+        for (source_name, spelling) in cases.into_iter().zip(spellings) {
             let mut ctx = make_x86_64_ctx();
+            let bad_expr = ctx.name_ref(spelling);
             let source = make_var(source_name, 1, 8);
             ctx.state
                 .analysis_ctx
@@ -19199,15 +19197,13 @@ mod tests {
 
     #[test]
     fn recovered_call_arg_contract_rejects_low_signal_sources_directly() {
-        let ctx = make_x86_64_ctx();
-        let cases = [
-            ("src_transient", ctx.name_ref("rax_7")),
-            ("src_stack_placeholder", ctx.name_ref("stack")),
-            ("src_low_quality", ctx.name_ref("value_bad")),
-        ];
+        // Each case renders in its own context, so its names are declared there.
+        let cases = ["src_transient", "src_stack_placeholder", "src_low_quality"];
+        let spellings = ["rax_7", "stack", "value_bad"];
 
-        for (source_name, bad_expr) in cases {
+        for (source_name, spelling) in cases.into_iter().zip(spellings) {
             let mut ctx = make_x86_64_ctx();
+            let bad_expr = ctx.name_ref(spelling);
             let source = make_var(source_name, 1, 8);
             ctx.state
                 .analysis_ctx
