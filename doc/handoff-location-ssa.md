@@ -100,8 +100,8 @@ invisible until the types finally differed. Expect more of these.
 ## Where the tree stands
 
 `cargo build --workspace` is clean. `cargo test -p r2dec --lib` runs:
-**689 pass, 17 fail**, down from 83 failures when the suite first compiled.
-Thirty commits from `763b28d`, net negative line count.
+**704 pass, 2 fail**, down from 83 failures when the suite first compiled.
+Thirty-eight commits from `763b28d`, net negative line count.
 
 ### An identifier now says which table issued it
 
@@ -132,29 +132,50 @@ reach output or disturb determinism — check that again before adding a field.
 - `make_ctx` in the `lower` tests leaked a table of its own while the fixtures
   declared into another.
 
-### The 17 that remain
+### The 2 that remain
 
-- **3 cross-table reads** in `fold::op_lower::tests`:
-  `call_source_proof_raw_owner_recovery_rejects_alias_owner_without_function_facts`,
-  `certified_call_result_owner_alias_requires_certified_stack_identity`, and
-  `final_call_normalization_uses_typed_printf_identity_not_rendered_name`. Each
-  panic names both tables. These three are harder than the ones already fixed:
-  the fixture builds a `PreparedSemanticView` *before* the context that will
-  read it exists, so the context cannot adopt the fixture's table and the
-  fixture cannot declare into the context's. Threading the table into
-  `make_*_ctx_with_prepared` was tried and does not resolve it, because the
-  reader is a later context still. The honest fix is probably for the fixture
-  builders to take a table and for one table to span the whole test, matching
-  what `build_function_internal_with_control` does in a real run.
+`fold::op_lower::tests::call_source_proof_raw_owner_recovery_rejects_alias_owner_without_function_facts`
+and `final_call_normalization_uses_typed_printf_identity_not_rendered_name`.
 
-- **4 in `single_evaluation::tests`** and **10 in `fold::op_lower::tests`** that
-  are real assertion failures, not panics. Several concern semantic member
-  access and indexed-member recovery — `test_semanticize_raw_subscript_recovers_exact_indexed_field_from_layout`,
-  `test_observed_x86_positive_index_folded_return_promotes_to_subscript`, and
-  neighbours. **Diagnose these before assuming they are migration debris.** A
-  member access failing to stay rooted at `argN` is the shape of a genuine
-  regression, and the branding work above proved that assumptions about this
-  migration being cosmetic have been wrong before.
+Both build one fixture and read it from several `FoldingContext`s. A context
+owns its table by value, so making two contexts agree means cloning one into the
+other, and a clone is a **snapshot**: any name declared after it is missing, and
+the panic becomes `index out of bounds: the len is 2 but the index is 2` rather
+than a table mismatch. Chasing the clone to a later line only moves which name
+is missing.
+
+The fix is structural, not another clone. Either a `FoldingContext` should
+borrow its table rather than own it, so several contexts can share one; or these
+tests should build every fixture name before any context exists and hand the
+same table to each. The first matches production, where
+`build_function_internal_with_control` creates one table and passes it to
+everything that renders the function. It is the last piece of the table-identity
+work and worth doing properly rather than patching around.
+
+### How the other 81 were fixed
+
+Every one was a real defect that the branding exposed, not churn:
+
+- `structure`'s `v()` helper built a table **per call**, so every reference
+  indexed a table already dropped (31).
+- `single_evaluation`'s `call`, `assign` and `function` helpers did the same, so
+  two references to one spelling were different identifiers and the structural
+  comparisons could never hold (4).
+- `symbols.borrow_mut().declare_or_reuse(..)` written inline holds the guard to
+  the end of the statement, so a second declaration in the same statement
+  deadlocks. `symbol::declare()` is a call, so the borrow drops at return —
+  which is why `var_ref` was always safe. This makes the safe form the easy form
+  (16).
+- Fixtures declared into a local table then handed `CFunction` a fresh empty
+  one; `generate_function` copies `func.symbols`, so codegen read nothing.
+- `make_ctx` in the `lower` tests leaked a table of its own.
+- Assertions grepped `format!("{expr:?}")` for a name. A reference carries an
+  identifier, so the debug rendering no longer contains a spelling. The
+  `spelled()` helper in `pipeline.rs` reads them back out of the table; that is
+  what those assertions always meant.
+- `test_use_info_deterministic` compared two runs under two contexts, so it was
+  asking whether two tables have the same identity rather than whether the
+  analysis is deterministic. One function has one table.
 
 ## What is left
 
