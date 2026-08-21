@@ -5056,23 +5056,29 @@ mod tests {
         );
     }
 
-    fn v(name: &str) -> CExpr {
-        let symbols = test_table();
-        crate::symbol::var_ref(&symbols, name)
+    /// A reference declared in the table the code under test reads, because an
+    /// identifier only means something in the table that issued it.
+    fn v(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, name: &str) -> CExpr {
+        crate::symbol::var_ref(symbols, name)
     }
 
     fn expr_stmt(expr: CExpr) -> CStmt {
         CStmt::Expr(expr)
     }
 
-    fn assign(lhs: &str, rhs: CExpr) -> CStmt {
-        expr_stmt(CExpr::assign(v(lhs), rhs))
+    fn assign(
+        symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
+        lhs: &str,
+        rhs: CExpr,
+    ) -> CStmt {
+        expr_stmt(CExpr::assign(v(symbols, lhs), rhs))
     }
 
     #[test]
     fn loop_condition_prefix_preserves_sequential_effects() {
-        let load = CExpr::assign(v("byte"), CExpr::Deref(Box::new(v("cursor"))));
-        let condition = CExpr::binary(BinaryOp::Ne, v("byte"), CExpr::IntLit(0));
+        let symbols = test_table();
+        let load = CExpr::assign(v(&symbols, "byte"), CExpr::Deref(Box::new(v(&symbols, "cursor"))));
+        let condition = CExpr::binary(BinaryOp::Ne, v(&symbols, "byte"), CExpr::IntLit(0));
 
         assert_eq!(
             ControlFlowStructurer::combine_loop_condition_prefix(
@@ -5363,12 +5369,12 @@ mod tests {
     fn cleanup_rewrites_pure_if_else_returns_to_ternary_return() {
         let symbols = test_table();
         let input = CStmt::If {
-            cond: CExpr::binary(BinaryOp::Eq, v("b"), CExpr::IntLit(0)),
+            cond: CExpr::binary(BinaryOp::Eq, v(&symbols, "b"), CExpr::IntLit(0)),
             then_body: Box::new(CStmt::Return(Some(CExpr::IntLit(-1)))),
             else_body: Some(Box::new(CStmt::Return(Some(CExpr::binary(
                 BinaryOp::Div,
-                v("a"),
-                v("b"),
+                v(&symbols, "a"),
+                v(&symbols, "b"),
             ))))),
         };
 
@@ -5376,9 +5382,9 @@ mod tests {
         assert_eq!(
             cleaned,
             CStmt::Return(Some(CExpr::Ternary {
-                cond: Box::new(CExpr::binary(BinaryOp::Eq, v("b"), CExpr::IntLit(0))),
+                cond: Box::new(CExpr::binary(BinaryOp::Eq, v(&symbols, "b"), CExpr::IntLit(0))),
                 then_expr: Box::new(CExpr::IntLit(-1)),
-                else_expr: Box::new(CExpr::binary(BinaryOp::Div, v("a"), v("b"))),
+                else_expr: Box::new(CExpr::binary(BinaryOp::Div, v(&symbols, "a"), v(&symbols, "b"))),
             }))
         );
     }
@@ -5520,11 +5526,12 @@ mod tests {
 
     #[test]
     fn post_test_loop_removes_implicit_latch_break() {
-        let body = CStmt::Block(vec![assign("hash", v("next_hash")), CStmt::Break]);
+        let symbols = test_table();
+        let body = CStmt::Block(vec![assign(&symbols, "hash", v(&symbols, "next_hash")), CStmt::Break]);
 
         let stripped = ControlFlowStructurer::strip_trailing_latch_marker(body);
 
-        assert_eq!(stripped, assign("hash", v("next_hash")));
+        assert_eq!(stripped, assign(&symbols, "hash", v(&symbols, "next_hash")));
     }
 
     #[test]
@@ -5566,12 +5573,12 @@ mod tests {
     fn rewrites_canonical_while_to_for() {
         let symbols = test_table();
         let input = CStmt::Block(vec![
-            assign("i", CExpr::IntLit(0)),
+            assign(&symbols, "i", CExpr::IntLit(0)),
             CStmt::while_loop(
-                CExpr::binary(BinaryOp::Lt, v("i"), CExpr::IntLit(10)),
+                CExpr::binary(BinaryOp::Lt, v(&symbols, "i"), CExpr::IntLit(10)),
                 CStmt::Block(vec![
-                    assign("sum", CExpr::binary(BinaryOp::Add, v("sum"), v("i"))),
-                    assign("i", CExpr::binary(BinaryOp::Add, v("i"), CExpr::IntLit(1))),
+                    assign(&symbols, "sum", CExpr::binary(BinaryOp::Add, v(&symbols, "sum"), v(&symbols, "i"))),
+                    assign(&symbols, "i", CExpr::binary(BinaryOp::Add, v(&symbols, "i"), CExpr::IntLit(1))),
                 ]),
             ),
         ]);
@@ -5603,38 +5610,38 @@ mod tests {
         let symbols = test_table();
         let input = CStmt::Block(vec![
             CStmt::Block(vec![
-                assign("count", CExpr::IntLit(0)),
-                assign("i", CExpr::IntLit(0)),
+                assign(&symbols, "count", CExpr::IntLit(0)),
+                assign(&symbols, "i", CExpr::IntLit(0)),
             ]),
             CStmt::while_loop(
-                CExpr::binary(BinaryOp::Lt, v("i"), v("n")),
+                CExpr::binary(BinaryOp::Lt, v(&symbols, "i"), v(&symbols, "n")),
                 CStmt::Block(vec![
-                    assign(
+                    assign(&symbols, 
                         "c",
                         CExpr::Subscript {
-                            base: Box::new(v("buf")),
-                            index: Box::new(v("i")),
+                            base: Box::new(v(&symbols, "buf")),
+                            index: Box::new(v(&symbols, "i")),
                         },
                     ),
                     CStmt::if_stmt(
-                        CExpr::binary(BinaryOp::Ne, v("c"), v("a")),
+                        CExpr::binary(BinaryOp::Ne, v(&symbols, "c"), v(&symbols, "a")),
                         CStmt::Block(vec![
                             CStmt::if_stmt(
-                                CExpr::binary(BinaryOp::Eq, v("c"), v("b")),
-                                assign(
+                                CExpr::binary(BinaryOp::Eq, v(&symbols, "c"), v(&symbols, "b")),
+                                assign(&symbols, 
                                     "count",
-                                    CExpr::binary(BinaryOp::Add, v("count"), CExpr::IntLit(1)),
+                                    CExpr::binary(BinaryOp::Add, v(&symbols, "count"), CExpr::IntLit(1)),
                                 ),
                                 None,
                             ),
-                            assign("i", CExpr::binary(BinaryOp::Add, v("i"), CExpr::IntLit(1))),
+                            assign(&symbols, "i", CExpr::binary(BinaryOp::Add, v(&symbols, "i"), CExpr::IntLit(1))),
                             CStmt::Continue,
                         ]),
                         None,
                     ),
-                    assign(
+                    assign(&symbols, 
                         "count",
-                        CExpr::binary(BinaryOp::Add, v("count"), CExpr::IntLit(1)),
+                        CExpr::binary(BinaryOp::Add, v(&symbols, "count"), CExpr::IntLit(1)),
                     ),
                 ]),
             ),
@@ -5654,7 +5661,7 @@ mod tests {
         };
         assert_eq!(
             update,
-            &CExpr::binary(BinaryOp::AddAssign, v("i"), CExpr::IntLit(1))
+            &CExpr::binary(BinaryOp::AddAssign, v(&symbols, "i"), CExpr::IntLit(1))
         );
         let CStmt::Block(body_stmts) = body.as_ref() else {
             panic!("Expected for body block, got {body:?}");
@@ -5670,12 +5677,12 @@ mod tests {
             Some(&CStmt::if_stmt(
                 CExpr::binary(
                     BinaryOp::Or,
-                    CExpr::binary(BinaryOp::Eq, v("c"), v("a")),
-                    CExpr::binary(BinaryOp::Eq, v("c"), v("b"))
+                    CExpr::binary(BinaryOp::Eq, v(&symbols, "c"), v(&symbols, "a")),
+                    CExpr::binary(BinaryOp::Eq, v(&symbols, "c"), v(&symbols, "b"))
                 ),
                 CStmt::Expr(CExpr::binary(
                     BinaryOp::AddAssign,
-                    v("count"),
+                    v(&symbols, "count"),
                     CExpr::IntLit(1),
                 )),
                 None
@@ -5689,12 +5696,12 @@ mod tests {
         let symbols = test_table();
         let increment = expr_stmt(CExpr::Unary {
             op: UnaryOp::PostInc,
-            operand: Box::new(v("count")),
+            operand: Box::new(v(&symbols, "count")),
         });
         let input = CStmt::if_stmt(
-            CExpr::binary(BinaryOp::Ne, v("c"), v("a")),
+            CExpr::binary(BinaryOp::Ne, v(&symbols, "c"), v(&symbols, "a")),
             CStmt::if_stmt(
-                CExpr::binary(BinaryOp::Eq, v("c"), v("b")),
+                CExpr::binary(BinaryOp::Eq, v(&symbols, "c"), v(&symbols, "b")),
                 increment.clone(),
                 None,
             ),
@@ -5707,8 +5714,8 @@ mod tests {
             CStmt::if_stmt(
                 CExpr::binary(
                     BinaryOp::Or,
-                    CExpr::binary(BinaryOp::Eq, v("c"), v("a")),
-                    CExpr::binary(BinaryOp::Eq, v("c"), v("b"))
+                    CExpr::binary(BinaryOp::Eq, v(&symbols, "c"), v(&symbols, "a")),
+                    CExpr::binary(BinaryOp::Eq, v(&symbols, "c"), v(&symbols, "b"))
                 ),
                 increment,
                 None
@@ -5719,43 +5726,43 @@ mod tests {
     #[test]
     fn rewrites_continue_tail_with_common_suffix_before_shared_latch() {
         let symbols = test_table();
-        let hash_xor = assign("hash", CExpr::binary(BinaryOp::BitXor, v("c"), v("hash")));
-        let hash_mul = assign(
+        let hash_xor = assign(&symbols, "hash", CExpr::binary(BinaryOp::BitXor, v(&symbols, "c"), v(&symbols, "hash")));
+        let hash_mul = assign(&symbols, 
             "hash",
-            CExpr::binary(BinaryOp::Mul, v("hash"), CExpr::UIntLit(0x100000001b3)),
+            CExpr::binary(BinaryOp::Mul, v(&symbols, "hash"), CExpr::UIntLit(0x100000001b3)),
         );
-        let i_update = assign("i", CExpr::binary(BinaryOp::Add, v("i"), CExpr::IntLit(1)));
+        let i_update = assign(&symbols, "i", CExpr::binary(BinaryOp::Add, v(&symbols, "i"), CExpr::IntLit(1)));
         let lowercase_update = CStmt::Expr(CExpr::binary(
             BinaryOp::AddAssign,
-            v("c"),
+            v(&symbols, "c"),
             CExpr::IntLit(32),
         ));
 
         let input = CStmt::Block(vec![
-            assign("hash", CExpr::UIntLit(0x14650fb0739d0383)),
-            assign("i", CExpr::IntLit(0)),
+            assign(&symbols, "hash", CExpr::UIntLit(0x14650fb0739d0383)),
+            assign(&symbols, "i", CExpr::IntLit(0)),
             CStmt::while_loop(
-                CExpr::binary(BinaryOp::Lt, v("i"), v("n")),
+                CExpr::binary(BinaryOp::Lt, v(&symbols, "i"), v(&symbols, "n")),
                 CStmt::Block(vec![
-                    assign(
+                    assign(&symbols, 
                         "c",
                         CExpr::Subscript {
-                            base: Box::new(v("buf")),
-                            index: Box::new(v("i")),
+                            base: Box::new(v(&symbols, "buf")),
+                            index: Box::new(v(&symbols, "i")),
                         },
                     ),
                     CStmt::if_stmt(
-                        CExpr::binary(BinaryOp::Gt, v("c"), CExpr::IntLit(64)),
+                        CExpr::binary(BinaryOp::Gt, v(&symbols, "c"), CExpr::IntLit(64)),
                         CStmt::Block(vec![
                             CStmt::if_stmt(
-                                CExpr::binary(BinaryOp::Le, v("c"), CExpr::IntLit(90)),
+                                CExpr::binary(BinaryOp::Le, v(&symbols, "c"), CExpr::IntLit(90)),
                                 lowercase_update.clone(),
                                 None,
                             ),
                             hash_xor.clone(),
                             hash_mul.clone(),
                             i_update.clone(),
-                            assign("value_1", v("c")),
+                            assign(&symbols, "value_1", v(&symbols, "c")),
                             CStmt::Continue,
                         ]),
                         None,
@@ -5780,7 +5787,7 @@ mod tests {
         };
         assert_eq!(
             update,
-            &CExpr::binary(BinaryOp::AddAssign, v("i"), CExpr::IntLit(1))
+            &CExpr::binary(BinaryOp::AddAssign, v(&symbols, "i"), CExpr::IntLit(1))
         );
 
         let CStmt::Block(body_stmts) = body.as_ref() else {
@@ -5797,8 +5804,8 @@ mod tests {
             Some(&CStmt::if_stmt(
                 CExpr::binary(
                     BinaryOp::And,
-                    CExpr::binary(BinaryOp::Gt, v("c"), CExpr::IntLit(64)),
-                    CExpr::binary(BinaryOp::Le, v("c"), CExpr::IntLit(90)),
+                    CExpr::binary(BinaryOp::Gt, v(&symbols, "c"), CExpr::IntLit(64)),
+                    CExpr::binary(BinaryOp::Le, v(&symbols, "c"), CExpr::IntLit(90)),
                 ),
                 lowercase_update,
                 None
@@ -5809,15 +5816,15 @@ mod tests {
             body_stmts.get(2),
             Some(&CStmt::Expr(CExpr::binary(
                 BinaryOp::BitXorAssign,
-                v("hash"),
-                v("c")
+                v(&symbols, "hash"),
+                v(&symbols, "c")
             )))
         );
         assert_eq!(
             body_stmts.get(3),
             Some(&CStmt::Expr(CExpr::binary(
                 BinaryOp::MulAssign,
-                v("hash"),
+                v(&symbols, "hash"),
                 CExpr::UIntLit(0x100000001b3)
             )))
         );
@@ -5828,13 +5835,13 @@ mod tests {
         let symbols = test_table();
         let i_update_expr = CExpr::binary(
             BinaryOp::Assign,
-            v("i"),
-            CExpr::binary(BinaryOp::Add, v("i"), CExpr::IntLit(1)),
+            v(&symbols, "i"),
+            CExpr::binary(BinaryOp::Add, v(&symbols, "i"), CExpr::IntLit(1)),
         );
-        let hash_update = assign("hash", CExpr::binary(BinaryOp::BitXor, v("c"), v("hash")));
+        let hash_update = assign(&symbols, "hash", CExpr::binary(BinaryOp::BitXor, v(&symbols, "c"), v(&symbols, "hash")));
         let input = CStmt::For {
-            init: Some(Box::new(assign("i", CExpr::IntLit(0)))),
-            cond: Some(CExpr::binary(BinaryOp::Lt, v("i"), v("n"))),
+            init: Some(Box::new(assign(&symbols, "i", CExpr::IntLit(0)))),
+            cond: Some(CExpr::binary(BinaryOp::Lt, v(&symbols, "i"), v(&symbols, "n"))),
             update: Some(i_update_expr.clone()),
             body: Box::new(CStmt::Block(vec![
                 hash_update.clone(),
@@ -5848,7 +5855,7 @@ mod tests {
         };
         assert_eq!(
             body.as_ref(),
-            &CStmt::Expr(CExpr::binary(BinaryOp::BitXorAssign, v("hash"), v("c"))),
+            &CStmt::Expr(CExpr::binary(BinaryOp::BitXorAssign, v(&symbols, "hash"), v(&symbols, "c"))),
             "for latch update should own the duplicated trailing body update"
         );
     }
@@ -5857,20 +5864,20 @@ mod tests {
     fn rewrites_side_effect_free_assignments_to_compound_assignments() {
         let symbols = test_table();
         let input = CStmt::Block(vec![
-            assign("hash", CExpr::binary(BinaryOp::BitXor, v("c"), v("hash"))),
-            assign(
+            assign(&symbols, "hash", CExpr::binary(BinaryOp::BitXor, v(&symbols, "c"), v(&symbols, "hash"))),
+            assign(&symbols, 
                 "hash",
-                CExpr::binary(BinaryOp::Mul, v("hash"), CExpr::UIntLit(0x100000001b3)),
+                CExpr::binary(BinaryOp::Mul, v(&symbols, "hash"), CExpr::UIntLit(0x100000001b3)),
             ),
-            assign(
+            assign(&symbols, 
                 "hash",
                 CExpr::binary(
                     BinaryOp::Add,
                     CExpr::Call {
-                        func: Box::new(v("next")),
+                        func: Box::new(v(&symbols, "next")),
                         args: Vec::new(),
                     },
-                    v("hash"),
+                    v(&symbols, "hash"),
                 ),
             ),
         ]);
@@ -5881,13 +5888,13 @@ mod tests {
         };
         assert_eq!(
             stmts[0],
-            CStmt::Expr(CExpr::binary(BinaryOp::BitXorAssign, v("hash"), v("c")))
+            CStmt::Expr(CExpr::binary(BinaryOp::BitXorAssign, v(&symbols, "hash"), v(&symbols, "c")))
         );
         assert_eq!(
             stmts[1],
             CStmt::Expr(CExpr::binary(
                 BinaryOp::MulAssign,
-                v("hash"),
+                v(&symbols, "hash"),
                 CExpr::UIntLit(0x100000001b3)
             ))
         );
@@ -5907,7 +5914,7 @@ mod tests {
     fn removes_dead_trailing_returns_inside_switch_cases() {
         let symbols = test_table();
         let input = CStmt::Switch {
-            expr: v("op"),
+            expr: v(&symbols, "op"),
             cases: vec![crate::ast::SwitchCase {
                 value: CExpr::IntLit(0),
                 body: vec![
@@ -5933,19 +5940,19 @@ mod tests {
     fn rewrites_guard_break_while1_to_for() {
         let symbols = test_table();
         let input = CStmt::Block(vec![
-            assign("i", CExpr::IntLit(0)),
+            assign(&symbols, "i", CExpr::IntLit(0)),
             CStmt::while_loop(
                 CExpr::IntLit(1),
                 CStmt::Block(vec![
                     CStmt::if_stmt(
-                        CExpr::binary(BinaryOp::Ge, v("i"), v("n")),
+                        CExpr::binary(BinaryOp::Ge, v(&symbols, "i"), v(&symbols, "n")),
                         CStmt::Break,
                         None,
                     ),
-                    assign("sum", CExpr::binary(BinaryOp::Add, v("sum"), v("i"))),
+                    assign(&symbols, "sum", CExpr::binary(BinaryOp::Add, v(&symbols, "sum"), v(&symbols, "i"))),
                     expr_stmt(CExpr::Unary {
                         op: UnaryOp::PostInc,
-                        operand: Box::new(v("i")),
+                        operand: Box::new(v(&symbols, "i")),
                     }),
                 ]),
             ),
@@ -5986,12 +5993,12 @@ mod tests {
     fn does_not_rewrite_without_tail_update() {
         let symbols = test_table();
         let input = CStmt::Block(vec![
-            assign("i", CExpr::IntLit(0)),
+            assign(&symbols, "i", CExpr::IntLit(0)),
             CStmt::while_loop(
-                CExpr::binary(BinaryOp::Lt, v("i"), CExpr::IntLit(10)),
-                CStmt::Block(vec![assign(
+                CExpr::binary(BinaryOp::Lt, v(&symbols, "i"), CExpr::IntLit(10)),
+                CStmt::Block(vec![assign(&symbols, 
                     "sum",
-                    CExpr::binary(BinaryOp::Add, v("sum"), CExpr::IntLit(1)),
+                    CExpr::binary(BinaryOp::Add, v(&symbols, "sum"), CExpr::IntLit(1)),
                 )]),
             ),
         ]);
@@ -6010,12 +6017,12 @@ mod tests {
     fn does_not_rewrite_when_cond_var_mismatch() {
         let symbols = test_table();
         let input = CStmt::Block(vec![
-            assign("i", CExpr::IntLit(0)),
+            assign(&symbols, "i", CExpr::IntLit(0)),
             CStmt::while_loop(
-                CExpr::binary(BinaryOp::Lt, v("j"), CExpr::IntLit(10)),
-                CStmt::Block(vec![assign(
+                CExpr::binary(BinaryOp::Lt, v(&symbols, "j"), CExpr::IntLit(10)),
+                CStmt::Block(vec![assign(&symbols, 
                     "i",
-                    CExpr::binary(BinaryOp::Add, v("i"), CExpr::IntLit(1)),
+                    CExpr::binary(BinaryOp::Add, v(&symbols, "i"), CExpr::IntLit(1)),
                 )]),
             ),
         ]);
@@ -6036,24 +6043,24 @@ mod tests {
         let updates = vec![
             CExpr::binary(
                 BinaryOp::Assign,
-                v("i"),
-                CExpr::binary(BinaryOp::Add, v("i"), CExpr::IntLit(2)),
+                v(&symbols, "i"),
+                CExpr::binary(BinaryOp::Add, v(&symbols, "i"), CExpr::IntLit(2)),
             ),
-            CExpr::binary(BinaryOp::AddAssign, v("i"), CExpr::IntLit(2)),
+            CExpr::binary(BinaryOp::AddAssign, v(&symbols, "i"), CExpr::IntLit(2)),
             CExpr::binary(
                 BinaryOp::Assign,
-                v("i"),
-                CExpr::call(v("next_i"), vec![v("i"), v("x")]),
+                v(&symbols, "i"),
+                CExpr::call(v(&symbols, "next_i"), vec![v(&symbols, "i"), v(&symbols, "x")]),
             ),
         ];
 
         for update_expr in updates {
             let input = CStmt::Block(vec![
-                assign("i", CExpr::IntLit(0)),
+                assign(&symbols, "i", CExpr::IntLit(0)),
                 CStmt::while_loop(
-                    CExpr::binary(BinaryOp::Lt, v("i"), v("n")),
+                    CExpr::binary(BinaryOp::Lt, v(&symbols, "i"), v(&symbols, "n")),
                     CStmt::Block(vec![
-                        assign("sum", CExpr::binary(BinaryOp::Add, v("sum"), v("i"))),
+                        assign(&symbols, "sum", CExpr::binary(BinaryOp::Add, v(&symbols, "sum"), v(&symbols, "i"))),
                         expr_stmt(update_expr.clone()),
                     ]),
                 ),
@@ -6079,31 +6086,31 @@ mod tests {
         let symbols = test_table();
         let input = CStmt::Block(vec![
             CStmt::Block(vec![
-                assign("sum", CExpr::IntLit(0)),
-                assign("i", CExpr::IntLit(0)),
+                assign(&symbols, "sum", CExpr::IntLit(0)),
+                assign(&symbols, "i", CExpr::IntLit(0)),
             ]),
             CStmt::while_loop(
-                CExpr::binary(BinaryOp::Lt, v("i"), v("len")),
+                CExpr::binary(BinaryOp::Lt, v(&symbols, "i"), v(&symbols, "len")),
                 CStmt::Block(vec![
                     CStmt::Expr(CExpr::binary(
                         BinaryOp::AddAssign,
-                        v("sum"),
+                        v(&symbols, "sum"),
                         CExpr::Subscript {
-                            base: Box::new(v("arr")),
-                            index: Box::new(v("i")),
+                            base: Box::new(v(&symbols, "arr")),
+                            index: Box::new(v(&symbols, "i")),
                         },
                     )),
                     CStmt::Expr(CExpr::Unary {
                         op: UnaryOp::PostInc,
-                        operand: Box::new(v("i")),
+                        operand: Box::new(v(&symbols, "i")),
                     }),
                     CStmt::Decl {
                         name: symbols.borrow_mut().declare_or_reuse("tmp:11f00_4"),
                         ty: CType::i32(),
                         init: Some(CExpr::Deref(Box::new(CExpr::binary(
                             BinaryOp::Add,
-                            v("arr"),
-                            CExpr::binary(BinaryOp::Mul, v("i"), CExpr::IntLit(4)),
+                            v(&symbols, "arr"),
+                            CExpr::binary(BinaryOp::Mul, v(&symbols, "i"), CExpr::IntLit(4)),
                         )))),
                     },
                 ]),
@@ -6150,8 +6157,8 @@ mod tests {
     fn rewrites_nested_if_without_else_to_short_circuit_and() {
         let symbols = test_table();
         let input = CStmt::if_stmt(
-            v("a"),
-            CStmt::if_stmt(v("b"), CStmt::ret(Some(CExpr::IntLit(1))), None),
+            v(&symbols, "a"),
+            CStmt::if_stmt(v(&symbols, "b"), CStmt::ret(Some(CExpr::IntLit(1))), None),
             None,
         );
 
@@ -6159,7 +6166,7 @@ mod tests {
         assert_eq!(
             cleaned,
             CStmt::if_stmt(
-                CExpr::binary(BinaryOp::And, v("a"), v("b")),
+                CExpr::binary(BinaryOp::And, v(&symbols, "a"), v(&symbols, "b")),
                 CStmt::ret(Some(CExpr::IntLit(1))),
                 None
             )
@@ -6169,28 +6176,28 @@ mod tests {
     #[test]
     fn rewrites_if_else_if_same_body_to_short_circuit_or() {
         let symbols = test_table();
-        let body = assign("x", CExpr::IntLit(1));
+        let body = assign(&symbols, "x", CExpr::IntLit(1));
         let input = CStmt::if_stmt(
-            v("a"),
+            v(&symbols, "a"),
             body.clone(),
-            Some(CStmt::if_stmt(v("b"), body.clone(), None)),
+            Some(CStmt::if_stmt(v(&symbols, "b"), body.clone(), None)),
         );
 
         let cleaned = ControlFlowStructurer::cleanup(&symbols, input);
         assert_eq!(
             cleaned,
-            CStmt::if_stmt(CExpr::binary(BinaryOp::Or, v("a"), v("b")), body, None)
+            CStmt::if_stmt(CExpr::binary(BinaryOp::Or, v(&symbols, "a"), v(&symbols, "b")), body, None)
         );
     }
 
     #[test]
     fn rewrites_shared_else_nested_if_to_short_circuit_and() {
         let symbols = test_table();
-        let then_stmt = assign("x", CExpr::IntLit(1));
-        let else_stmt = assign("x", CExpr::IntLit(2));
+        let then_stmt = assign(&symbols, "x", CExpr::IntLit(1));
+        let else_stmt = assign(&symbols, "x", CExpr::IntLit(2));
         let input = CStmt::if_stmt(
-            v("a"),
-            CStmt::if_stmt(v("b"), then_stmt.clone(), Some(else_stmt.clone())),
+            v(&symbols, "a"),
+            CStmt::if_stmt(v(&symbols, "b"), then_stmt.clone(), Some(else_stmt.clone())),
             Some(else_stmt.clone()),
         );
 
@@ -6198,7 +6205,7 @@ mod tests {
         assert_eq!(
             cleaned,
             CStmt::if_stmt(
-                CExpr::binary(BinaryOp::And, v("a"), v("b")),
+                CExpr::binary(BinaryOp::And, v(&symbols, "a"), v(&symbols, "b")),
                 then_stmt,
                 Some(else_stmt)
             )
@@ -6207,13 +6214,14 @@ mod tests {
 
     #[test]
     fn negates_less_equal_with_canonical_less_than_orientation() {
+        let symbols = test_table();
         assert_eq!(
             ControlFlowStructurer::negate_condition(CExpr::binary(
                 BinaryOp::Le,
-                v("limit"),
-                v("index"),
+                v(&symbols, "limit"),
+                v(&symbols, "index"),
             )),
-            CExpr::binary(BinaryOp::Lt, v("index"), v("limit"))
+            CExpr::binary(BinaryOp::Lt, v(&symbols, "index"), v(&symbols, "limit"))
         );
     }
 
@@ -6221,10 +6229,10 @@ mod tests {
     fn inverts_if_else_terminator_and_flattens_then_block() {
         let symbols = test_table();
         let input = CStmt::if_stmt(
-            CExpr::binary(BinaryOp::Lt, v("x"), v("limit")),
+            CExpr::binary(BinaryOp::Lt, v(&symbols, "x"), v(&symbols, "limit")),
             CStmt::Block(vec![
-                CStmt::Expr(CExpr::binary(BinaryOp::AddAssign, v("sum"), v("x"))),
-                CStmt::Expr(CExpr::binary(BinaryOp::AddAssign, v("x"), CExpr::IntLit(1))),
+                CStmt::Expr(CExpr::binary(BinaryOp::AddAssign, v(&symbols, "sum"), v(&symbols, "x"))),
+                CStmt::Expr(CExpr::binary(BinaryOp::AddAssign, v(&symbols, "x"), CExpr::IntLit(1))),
             ]),
             Some(CStmt::ret(Some(CExpr::IntLit(0)))),
         );
@@ -6234,12 +6242,12 @@ mod tests {
             cleaned,
             CStmt::Block(vec![
                 CStmt::if_stmt(
-                    CExpr::binary(BinaryOp::Ge, v("x"), v("limit")),
+                    CExpr::binary(BinaryOp::Ge, v(&symbols, "x"), v(&symbols, "limit")),
                     CStmt::ret(Some(CExpr::IntLit(0))),
                     None
                 ),
-                CStmt::Expr(CExpr::binary(BinaryOp::AddAssign, v("sum"), v("x"))),
-                CStmt::Expr(CExpr::binary(BinaryOp::AddAssign, v("x"), CExpr::IntLit(1),)),
+                CStmt::Expr(CExpr::binary(BinaryOp::AddAssign, v(&symbols, "sum"), v(&symbols, "x"))),
+                CStmt::Expr(CExpr::binary(BinaryOp::AddAssign, v(&symbols, "x"), CExpr::IntLit(1),)),
             ])
         );
     }
@@ -6248,11 +6256,11 @@ mod tests {
     fn inverts_if_then_terminator_and_flattens_else_block() {
         let symbols = test_table();
         let input = CStmt::if_stmt(
-            v("is_error"),
+            v(&symbols, "is_error"),
             CStmt::ret(Some(CExpr::IntLit(-1))),
             Some(CStmt::Block(vec![
-                CStmt::Expr(CExpr::binary(BinaryOp::AddAssign, v("sum"), v("x"))),
-                CStmt::Expr(CExpr::binary(BinaryOp::AddAssign, v("x"), CExpr::IntLit(1))),
+                CStmt::Expr(CExpr::binary(BinaryOp::AddAssign, v(&symbols, "sum"), v(&symbols, "x"))),
+                CStmt::Expr(CExpr::binary(BinaryOp::AddAssign, v(&symbols, "x"), CExpr::IntLit(1))),
             ])),
         );
 
@@ -6260,9 +6268,9 @@ mod tests {
         assert_eq!(
             cleaned,
             CStmt::Block(vec![
-                CStmt::if_stmt(v("is_error"), CStmt::ret(Some(CExpr::IntLit(-1))), None),
-                CStmt::Expr(CExpr::binary(BinaryOp::AddAssign, v("sum"), v("x"))),
-                CStmt::Expr(CExpr::binary(BinaryOp::AddAssign, v("x"), CExpr::IntLit(1),)),
+                CStmt::if_stmt(v(&symbols, "is_error"), CStmt::ret(Some(CExpr::IntLit(-1))), None),
+                CStmt::Expr(CExpr::binary(BinaryOp::AddAssign, v(&symbols, "sum"), v(&symbols, "x"))),
+                CStmt::Expr(CExpr::binary(BinaryOp::AddAssign, v(&symbols, "x"), CExpr::IntLit(1),)),
             ])
         );
     }
@@ -6272,10 +6280,10 @@ mod tests {
         let symbols = test_table();
         let input = CStmt::Block(vec![
             CStmt::if_stmt(
-                v("ready"),
+                v(&symbols, "ready"),
                 CStmt::Block(vec![
-                    assign("x", CExpr::IntLit(1)),
-                    assign("y", CExpr::IntLit(2)),
+                    assign(&symbols, "x", CExpr::IntLit(1)),
+                    assign(&symbols, "y", CExpr::IntLit(2)),
                 ]),
                 None,
             ),
@@ -6287,12 +6295,12 @@ mod tests {
             cleaned,
             CStmt::Block(vec![
                 CStmt::if_stmt(
-                    CExpr::unary(UnaryOp::Not, v("ready")),
+                    CExpr::unary(UnaryOp::Not, v(&symbols, "ready")),
                     CStmt::ret(Some(CExpr::IntLit(0))),
                     None
                 ),
-                assign("x", CExpr::IntLit(1)),
-                assign("y", CExpr::IntLit(2)),
+                assign(&symbols, "x", CExpr::IntLit(1)),
+                assign(&symbols, "y", CExpr::IntLit(2)),
                 CStmt::ret(Some(CExpr::IntLit(0))),
             ])
         );
@@ -6302,8 +6310,8 @@ mod tests {
     fn does_not_rewrite_trailing_guard_when_following_stmt_is_not_terminator() {
         let symbols = test_table();
         let input = CStmt::Block(vec![
-            CStmt::if_stmt(v("ready"), assign("x", CExpr::IntLit(1)), None),
-            assign("y", CExpr::IntLit(2)),
+            CStmt::if_stmt(v(&symbols, "ready"), assign(&symbols, "x", CExpr::IntLit(1)), None),
+            assign(&symbols, "y", CExpr::IntLit(2)),
         ]);
         let cleaned = ControlFlowStructurer::cleanup(&symbols, input.clone());
         assert_eq!(cleaned, input);
@@ -6313,7 +6321,7 @@ mod tests {
     fn does_not_invert_if_when_both_branches_are_terminators() {
         let symbols = test_table();
         let input = CStmt::if_stmt(
-            v("a"),
+            v(&symbols, "a"),
             CStmt::ret(Some(CExpr::IntLit(1))),
             Some(CStmt::ret(Some(CExpr::IntLit(0)))),
         );
@@ -6325,9 +6333,9 @@ mod tests {
     fn does_not_invert_if_when_else_is_not_terminator() {
         let symbols = test_table();
         let input = CStmt::if_stmt(
-            v("a"),
-            assign("x", CExpr::IntLit(1)),
-            Some(assign("x", v("b"))),
+            v(&symbols, "a"),
+            assign(&symbols, "x", CExpr::IntLit(1)),
+            Some(assign(&symbols, "x", v(&symbols, "b"))),
         );
         let cleaned = ControlFlowStructurer::cleanup(&symbols, input.clone());
         assert_eq!(cleaned, input);
@@ -6337,8 +6345,8 @@ mod tests {
     fn inverts_if_when_else_is_single_terminator() {
         let symbols = test_table();
         let input = CStmt::if_stmt(
-            CExpr::binary(BinaryOp::Lt, v("x"), v("limit")),
-            assign("sum", CExpr::binary(BinaryOp::Add, v("sum"), v("x"))),
+            CExpr::binary(BinaryOp::Lt, v(&symbols, "x"), v(&symbols, "limit")),
+            assign(&symbols, "sum", CExpr::binary(BinaryOp::Add, v(&symbols, "sum"), v(&symbols, "x"))),
             Some(CStmt::ret(Some(CExpr::IntLit(0)))),
         );
 
@@ -6349,7 +6357,7 @@ mod tests {
         assert_eq!(
             stmts[0],
             CStmt::if_stmt(
-                CExpr::binary(BinaryOp::Ge, v("x"), v("limit")),
+                CExpr::binary(BinaryOp::Ge, v(&symbols, "x"), v(&symbols, "limit")),
                 CStmt::ret(Some(CExpr::IntLit(0))),
                 None
             )
@@ -6359,18 +6367,18 @@ mod tests {
     #[test]
     fn removes_empty_else_branch() {
         let symbols = test_table();
-        let input = CStmt::if_stmt(v("a"), assign("x", CExpr::IntLit(1)), Some(CStmt::Empty));
+        let input = CStmt::if_stmt(v(&symbols, "a"), assign(&symbols, "x", CExpr::IntLit(1)), Some(CStmt::Empty));
         let cleaned = ControlFlowStructurer::cleanup(&symbols, input);
         assert_eq!(
             cleaned,
-            CStmt::if_stmt(v("a"), assign("x", CExpr::IntLit(1)), None)
+            CStmt::if_stmt(v(&symbols, "a"), assign(&symbols, "x", CExpr::IntLit(1)), None)
         );
     }
 
     #[test]
     fn removes_empty_if_without_else() {
         let symbols = test_table();
-        let input = CStmt::if_stmt(v("a"), CStmt::Empty, None);
+        let input = CStmt::if_stmt(v(&symbols, "a"), CStmt::Empty, None);
         let cleaned = ControlFlowStructurer::cleanup(&symbols, input);
         assert_eq!(cleaned, CStmt::Empty);
     }
@@ -6378,9 +6386,9 @@ mod tests {
     #[test]
     fn constant_true_if_collapses_to_then_body() {
         let symbols = test_table();
-        let input = CStmt::if_stmt(CExpr::IntLit(1), assign("x", CExpr::IntLit(7)), None);
+        let input = CStmt::if_stmt(CExpr::IntLit(1), assign(&symbols, "x", CExpr::IntLit(7)), None);
         let cleaned = ControlFlowStructurer::cleanup(&symbols, input);
-        assert_eq!(cleaned, assign("x", CExpr::IntLit(7)));
+        assert_eq!(cleaned, assign(&symbols, "x", CExpr::IntLit(7)));
     }
 
     #[test]
@@ -6388,31 +6396,31 @@ mod tests {
         let symbols = test_table();
         let input = CStmt::if_stmt(
             CExpr::IntLit(0),
-            assign("x", CExpr::IntLit(7)),
-            Some(assign("x", CExpr::IntLit(9))),
+            assign(&symbols, "x", CExpr::IntLit(7)),
+            Some(assign(&symbols, "x", CExpr::IntLit(9))),
         );
         let cleaned = ControlFlowStructurer::cleanup(&symbols, input);
-        assert_eq!(cleaned, assign("x", CExpr::IntLit(9)));
+        assert_eq!(cleaned, assign(&symbols, "x", CExpr::IntLit(9)));
     }
 
     #[test]
     fn guarded_switch_with_trailing_return_becomes_switch_default() {
         let symbols = test_table();
         let input = CStmt::Block(vec![CStmt::if_stmt(
-            v("guard"),
+            v(&symbols, "guard"),
             CStmt::Block(vec![
                 expr_stmt(CExpr::call(
-                    v("sym.imp.printf"),
+                    v(&symbols, "sym.imp.printf"),
                     vec![CExpr::StringLit("bad".into())],
                 )),
                 CStmt::ret(Some(CExpr::IntLit(1))),
             ]),
             Some(CStmt::Block(vec![
                 CStmt::Switch {
-                    expr: v("selector"),
+                    expr: v(&symbols, "selector"),
                     cases: vec![crate::ast::SwitchCase {
                         value: CExpr::IntLit(1),
-                        body: vec![assign("x", CExpr::IntLit(1)), CStmt::Break],
+                        body: vec![assign(&symbols, "x", CExpr::IntLit(1)), CStmt::Break],
                     }],
                     default: None,
                 },
@@ -6425,14 +6433,14 @@ mod tests {
             cleaned,
             CStmt::Block(vec![
                 CStmt::Switch {
-                    expr: v("selector"),
+                    expr: v(&symbols, "selector"),
                     cases: vec![crate::ast::SwitchCase {
                         value: CExpr::IntLit(1),
-                        body: vec![assign("x", CExpr::IntLit(1)), CStmt::Break],
+                        body: vec![assign(&symbols, "x", CExpr::IntLit(1)), CStmt::Break],
                     }],
                     default: Some(vec![CStmt::Block(vec![
                         expr_stmt(CExpr::call(
-                            v("sym.imp.printf"),
+                            v(&symbols, "sym.imp.printf"),
                             vec![CExpr::StringLit("bad".into())],
                         )),
                         CStmt::ret(Some(CExpr::IntLit(1))),
@@ -6445,9 +6453,10 @@ mod tests {
 
     #[test]
     fn selector_expr_from_condition_extracts_non_constant_side() {
+        let symbols = test_table();
         let cond = CExpr::binary(
             BinaryOp::Eq,
-            CExpr::binary(BinaryOp::BitAnd, v("i"), CExpr::IntLit(7)),
+            CExpr::binary(BinaryOp::BitAnd, v(&symbols, "i"), CExpr::IntLit(7)),
             CExpr::IntLit(0),
         );
 
@@ -6455,7 +6464,7 @@ mod tests {
             .expect("selector expression");
         assert_eq!(
             selector,
-            CExpr::binary(BinaryOp::BitAnd, v("i"), CExpr::IntLit(7))
+            CExpr::binary(BinaryOp::BitAnd, v(&symbols, "i"), CExpr::IntLit(7))
         );
     }
 
@@ -6463,12 +6472,12 @@ mod tests {
     fn rewrites_while_to_for_when_condition_uses_addrof_induction_var() {
         let symbols = test_table();
         let input = CStmt::Block(vec![
-            assign("i", CExpr::IntLit(0)),
+            assign(&symbols, "i", CExpr::IntLit(0)),
             CStmt::while_loop(
-                CExpr::binary(BinaryOp::Lt, CExpr::AddrOf(Box::new(v("i"))), v("n")),
+                CExpr::binary(BinaryOp::Lt, CExpr::AddrOf(Box::new(v(&symbols, "i"))), v(&symbols, "n")),
                 CStmt::Block(vec![
-                    assign("sum", CExpr::binary(BinaryOp::Add, v("sum"), v("i"))),
-                    assign("i", CExpr::binary(BinaryOp::Add, v("i"), CExpr::IntLit(1))),
+                    assign(&symbols, "sum", CExpr::binary(BinaryOp::Add, v(&symbols, "sum"), v(&symbols, "i"))),
+                    assign(&symbols, "i", CExpr::binary(BinaryOp::Add, v(&symbols, "i"), CExpr::IntLit(1))),
                 ]),
             ),
         ]);
@@ -6484,12 +6493,12 @@ mod tests {
     fn normalizes_addrof_var_artifact_in_while_condition_without_rewrite() {
         let symbols = test_table();
         let input = CStmt::Block(vec![
-            assign("i", CExpr::IntLit(0)),
+            assign(&symbols, "i", CExpr::IntLit(0)),
             CStmt::while_loop(
-                CExpr::binary(BinaryOp::Lt, CExpr::AddrOf(Box::new(v("local"))), v("n")),
-                CStmt::Block(vec![assign(
+                CExpr::binary(BinaryOp::Lt, CExpr::AddrOf(Box::new(v(&symbols, "local"))), v(&symbols, "n")),
+                CStmt::Block(vec![assign(&symbols, 
                     "sum",
-                    CExpr::binary(BinaryOp::Add, v("sum"), CExpr::IntLit(1)),
+                    CExpr::binary(BinaryOp::Add, v(&symbols, "sum"), CExpr::IntLit(1)),
                 )]),
             ),
         ]);
@@ -6519,15 +6528,15 @@ mod tests {
     fn rewrites_while_to_for_with_two_step_alias_update_chain() {
         let symbols = test_table();
         let input = CStmt::Block(vec![
-            assign("i", CExpr::IntLit(0)),
+            assign(&symbols, "i", CExpr::IntLit(0)),
             CStmt::while_loop(
-                CExpr::binary(BinaryOp::Lt, v("i"), v("n")),
+                CExpr::binary(BinaryOp::Lt, v(&symbols, "i"), v(&symbols, "n")),
                 CStmt::Block(vec![
-                    assign("tmp1", v("i")),
-                    assign("tmp2", v("tmp1")),
-                    assign(
+                    assign(&symbols, "tmp1", v(&symbols, "i")),
+                    assign(&symbols, "tmp2", v(&symbols, "tmp1")),
+                    assign(&symbols, 
                         "i",
-                        CExpr::binary(BinaryOp::Add, v("tmp2"), CExpr::IntLit(1)),
+                        CExpr::binary(BinaryOp::Add, v(&symbols, "tmp2"), CExpr::IntLit(1)),
                     ),
                 ]),
             ),
@@ -6544,16 +6553,16 @@ mod tests {
     fn does_not_rewrite_while_to_for_when_alias_chain_is_too_long() {
         let symbols = test_table();
         let input = CStmt::Block(vec![
-            assign("i", CExpr::IntLit(0)),
+            assign(&symbols, "i", CExpr::IntLit(0)),
             CStmt::while_loop(
-                CExpr::binary(BinaryOp::Lt, v("i"), v("n")),
+                CExpr::binary(BinaryOp::Lt, v(&symbols, "i"), v(&symbols, "n")),
                 CStmt::Block(vec![
-                    assign("tmp1", v("i")),
-                    assign("tmp2", v("tmp1")),
-                    assign("tmp3", v("tmp2")),
-                    assign(
+                    assign(&symbols, "tmp1", v(&symbols, "i")),
+                    assign(&symbols, "tmp2", v(&symbols, "tmp1")),
+                    assign(&symbols, "tmp3", v(&symbols, "tmp2")),
+                    assign(&symbols, 
                         "i",
-                        CExpr::binary(BinaryOp::Add, v("tmp3"), CExpr::IntLit(1)),
+                        CExpr::binary(BinaryOp::Add, v(&symbols, "tmp3"), CExpr::IntLit(1)),
                     ),
                 ]),
             ),
@@ -6573,12 +6582,12 @@ mod tests {
     fn rewrites_while_to_for_when_condition_uses_suffix_equivalent_var_name() {
         let symbols = test_table();
         let input = CStmt::Block(vec![
-            assign("local_4", CExpr::IntLit(0)),
+            assign(&symbols, "local_4", CExpr::IntLit(0)),
             CStmt::while_loop(
-                CExpr::binary(BinaryOp::Lt, CExpr::AddrOf(Box::new(v("local"))), v("n")),
-                CStmt::Block(vec![assign(
+                CExpr::binary(BinaryOp::Lt, CExpr::AddrOf(Box::new(v(&symbols, "local"))), v(&symbols, "n")),
+                CStmt::Block(vec![assign(&symbols, 
                     "local_4",
-                    CExpr::binary(BinaryOp::Add, v("local_4"), CExpr::IntLit(1)),
+                    CExpr::binary(BinaryOp::Add, v(&symbols, "local_4"), CExpr::IntLit(1)),
                 )]),
             ),
         ]);
