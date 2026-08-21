@@ -627,6 +627,31 @@ sub-range of a register that a vector operation writes as a whole. Until locatio
 can express a sub-range, the projections are how that is said, and the fix is to
 render them rather than to leak them.
 
+## The ledger's remaining over-claim, and what fixing it needs
+
+Attribution still counts an obligation as rendered on the strength of a proof the
+fold took, and structuring afterwards deletes statements the fold had already
+claimed. The whole-function guard catches only the case where nothing survived at
+all, so a body of four statements goes on reporting thirty-four obligations
+rendered.
+
+Reading the finished body instead was tried and reverted. Asking whether the
+output names an obligation's value is the right question, and it fixes the
+measured case outright: the `-O1` function goes from thirty-four rendered to
+seventeen rendered and seventeen refused. But the name it asks about comes from
+`FoldingContext::var_name`, and that is not the name that reaches the page. A
+stack local is named by variable recovery, a carrier by the alias table, and both
+are renamed again before printing. So the test refuses almost everything: across
+the corpus rendered falls from 612 to 122 on x86-64 `-O0`, and the one function in
+it that renders correctly reports thirteen rendered against fifty-two refused.
+
+That is an over-refusal in place of an over-claim, which is no better and reads
+worse. What the question needs is a map from a value to the name the output
+actually gave it, surviving every renaming pass -- which is what a symbol table
+provides, and is another thing waiting on the same migration. Until then the
+whole-function guard stays, because it is weak and true rather than precise and
+wrong.
+
 ## Exit criteria
 
 The `-O1` FNV-1a 32 case renders its loop body and returns the accumulator. The
