@@ -310,47 +310,40 @@ convention's `result_slot`: it is `Void` or `Register { storage }`, so it states
 both whether there is a return value and where. The convention says only where a
 caller *would* leave one.
 
-### The SIMD lane defect, traced to the instructions
+### The xmm6 defect is not a lane-width problem
 
 `sym._crc32_table` in `hashes_x64_O2.o` reads `xmm6_5`, `xmm6_7`, `xmm6_9`,
-`xmm6_11` and `xmm6_13` and writes none of them. Around eighteen calls to
-`callother("userop_193", ...)` sit alongside, several appearing twice -- once as
-the right-hand side of an assignment and again as a bare statement, so the same
-effect renders more than once.
+`xmm6_11` and `xmm6_13` and writes none of them. I assumed this was the leaked
+lane projections -- a write lifted at one width and a read at another, which is
+what `CanonicalStorageId` including `size` would cause. **That is wrong**, and
+the lifted p-code says so plainly:
 
-**Confirmed from the machine code.** At `0x3e7` the function runs:
+    a:sla.debug.json at 0x3eb   (pxor %xmm4, %xmm6)
+    IntXor dst XMM6 offset 4992 size 16, a XMM6 ..., b XMM4 ...
 
-    movdqa  %xmm2, %xmm6      ; writes xmm6, 128-bit
-    pxor    %xmm4, %xmm6      ; writes xmm6, 128-bit
-    blendvps %xmm0, %xmm6, %xmm2   ; reads xmm6
+    a:sla.debug.json at 0x3f8   (blendvps %xmm0, %xmm6, %xmm2)
+    CallOther userop 193, inputs XMM2, XMM6 offset 4992 size 16, XMM0
 
-So `xmm6` is written twice and then read, and the rendering shows the read with
-no definition. `blendvps` is the unmodelled userop that becomes
-`callother("userop_193", ...)`.
+The write and the read are the same storage: offset 4992, size 16, both. Nothing
+is being split into lanes and nothing differs in width, so the sub-range model
+would not change this case.
 
-**Not yet confirmed: the mechanism.** The likely cause is the one the location
-model exists for -- `CanonicalStorageId` includes `size`, so a write to `xmm6`
-lifted as two 64-bit lane operations and a read of the full 128 bits are three
-different storages, and the read never sees the writes. That fits the shape, but
-I could not dump the lifted p-code for that address to prove it: `sla.opvals`,
-`sla.regs` and `sla.mem` all print nothing there, so the size of the lifted
-writes is unverified.
+What is actually happening is the dangling-read defect: the function refuses 9
+of 174 obligations and leaves 25 unaccounted, and the definitions of those xmm6
+values are among what did not survive. The read is rendered, its definition is
+not, and the name has nothing behind it. Chase the dropped definition, not the
+lane model.
 
-**The inspection commands print nothing, which blocks this and probably more.**
-`sla.json`, `sla.info`, `sla.opvals`, `sla.regs`, `sla.mem`, `sla.defuse`,
-`sla.defuse.func`, `sla.ssa.func` and `sla.slice` all produce empty output, with
-and without `aaa` first, at a function start and at a single instruction. They
-exit zero and say nothing -- the same silent-failure shape `sla.dec` has, where
-the command is registered and answers with an empty string rather than refusing.
+**How to look.** The inspection commands need the `a:` prefix and the debug
+namespace: `a:sla.debug.json`, `a:sla.debug.info`, `a:sla.debug.arch`. Bare
+`sla.json` never reaches the plugin and answers nothing, which I mistook for the
+commands being broken; the plugin does say `use a:sla.debug.arch` if you invoke
+`a:sla.arch`. This is the single most useful thing for questions like the above:
+it prints the lifted p-code for the instruction at the seek, with varnode
+offsets and sizes.
 
-That is worth fixing before the lane work, not after: without a way to see the
-lifted p-code there is no way to check what the SSA actually did, and every
-question like this one has to be answered by reading code instead of by looking.
-
-Verify the size question before building anything. If the writes and the read do differ in
-size, the fix is that a read is satisfied by writes overlapping its location
-range rather than matching its storage exactly, which is the sub-range model. If
-they do not, the cause is elsewhere and the lane model will not address it.
+Whether a genuine lane-width case exists elsewhere is still open. It is one of
+the four original defects, but this function is not an instance of it.
 
 **Steps 3 through 7 are untouched:**
 
