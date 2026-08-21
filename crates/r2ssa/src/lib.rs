@@ -39,6 +39,7 @@ pub mod liveout;
 pub mod machine;
 pub mod machine_context;
 mod naming;
+pub mod mirror;
 pub mod obligation;
 pub mod op;
 pub mod optimize;

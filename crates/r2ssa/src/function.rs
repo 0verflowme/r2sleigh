@@ -613,6 +613,26 @@ impl SsaArtifact {
         crate::abi::AbiProfile::from_machine_context(&self.machine_context)
     }
 
+    /// Carriers this function moves through memory that already holds them.
+    ///
+    /// A register the loop spills to a frame slot and reloads is not what
+    /// carried the value; the slot is. Published so a renderer can name one
+    /// variable where the machine used two.
+    pub fn memory_mirrored_carriers(&self) -> std::collections::BTreeSet<crate::SemanticId> {
+        let structured = &self.facts.structured;
+        let objects = &self.facts.objects;
+        let mut mirrored = std::collections::BTreeSet::new();
+        for loop_fact in structured.loops.values() {
+            for carrier in &loop_fact.carriers {
+                let members = crate::mirror::carrier_members(carrier);
+                if crate::mirror::carrier_mirrors_memory(structured, objects, loop_fact, &members) {
+                    mirrored.insert(carrier.id);
+                }
+            }
+        }
+        mirrored
+    }
+
     /// The merges no value observation depends on.
     ///
     /// Published rather than removed. Rules choosing among candidates should skip

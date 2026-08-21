@@ -370,7 +370,36 @@ place as that register for the span in which they mirror each other, and until
 one thing owns that span two models will each claim the variable and each emit
 its own version of the update.
 
-## Consequences
+## Why naming a carrier is not yet possible, whatever guards it
+
+Giving every version of a certified loop carrier one name was attempted twice.
+Both times it delivered clearly on optimised code -- on `-O1` the accumulator
+collapses from three dead locals into a single `rax` initialised once and
+assigned in the loop -- and both times it damaged `-O0`.
+
+The second attempt added the guard the first one lacked: a carrier the loop
+reloads from a frame slot is a copy, and the slot is the variable, so it is left
+unnamed. That guard is right and is kept as `crate::mirror`. It is not enough.
+
+What the `-O0` output showed is that one carrier had been given two program
+variables:
+
+    uint32_t rax = (int64_t)eax_3;   // the hash
+    rax = arg_2c + 1;                // the inner loop counter
+
+The machine reuses `RAX` for the accumulator and for an inner counter, and the
+carrier spans both, because a carrier is state a register preserves and a
+register is not a variable. Naming all its versions one C local does not merely
+add a dead declaration; it says two different values are one, which is worse than
+what it was fixing.
+
+No guard on naming can repair that, because the fault is upstream of naming: the
+carrier is real and the register is genuinely preserved. What is missing is the
+thing this whole decision is about. A location has to be the span over which a
+storage holds one value, not the storage itself, and until carriers are cut at
+the points where a register changes what it means, one name per carrier is
+unsound. Carrier naming therefore waits on the location model rather than on any
+further condition attached to itself.
 
 The renderer should shrink substantially once it stops re-deriving storage
 identity and liveness, though whether it does so on its own or needs deliberate
