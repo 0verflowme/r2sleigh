@@ -1126,6 +1126,10 @@ impl PreparedFunctionFacts {
         let predicates = collect_predicate_facts(function, graph);
         let boundaries =
             collect_source_boundary_facts(function, graph, &call_sites, machine_context);
+        let live_out = machine_context
+            .and_then(crate::abi::AbiProfile::from_machine_context)
+            .map(|abi| crate::liveout::FunctionLiveOut::compute(function, graph, &abi))
+            .unwrap_or_default();
         let structured = collect_structured_dataflow_facts(
             function,
             graph,
@@ -1134,6 +1138,7 @@ impl PreparedFunctionFacts {
                 memory: &memory,
                 predicates: &predicates,
                 call_sites: &call_sites,
+                live_out: &live_out,
             },
         );
         let control_domains = collect_control_domain_facts(function, &predicates, &structured);
@@ -2200,6 +2205,9 @@ struct StructuredCollectionInputs<'a> {
     memory: &'a MemorySSAFacts,
     predicates: &'a PredicateFacts,
     call_sites: &'a CallSiteFacts,
+    /// What the caller reads, so a value with no reader in this body is not
+    /// mistaken for one nothing reads at all.
+    live_out: &'a crate::liveout::FunctionLiveOut,
 }
 
 fn collect_structured_dataflow_facts(
@@ -2207,7 +2215,7 @@ fn collect_structured_dataflow_facts(
     graph: &SsaGraph,
     inputs: StructuredCollectionInputs<'_>,
 ) -> StructuredDataflowFacts {
-    let loops = collect_structured_loop_facts(function, graph, inputs.predicates);
+    let loops = collect_structured_loop_facts(function, graph, inputs.predicates, inputs.live_out);
     let memory_accesses =
         collect_structured_memory_access_facts(function, graph, inputs.objects, inputs.memory);
     StructuredDataflowFacts {
@@ -5015,6 +5023,7 @@ fn collect_structured_loop_facts(
     function: &SSAFunction,
     graph: &SsaGraph,
     predicates: &PredicateFacts,
+    live_out: &crate::liveout::FunctionLiveOut,
 ) -> BTreeMap<LoopId, StructuredLoopFact> {
     let mut latches_by_header = BTreeMap::<u64, BTreeSet<u64>>::new();
     for &block_addr in function.block_addrs() {
@@ -5035,7 +5044,7 @@ fn collect_structured_loop_facts(
         let body = body_set.iter().copied().collect::<Vec<_>>();
         let exits = loop_exits(function, &body_set);
         let condition = loop_condition(predicates, header, &body_set, &exits);
-        let carriers = loop_carrier_facts(function, graph, id, header, &latches);
+        let carriers = loop_carrier_facts(function, graph, id, header, &latches, live_out);
         let (induction_phi, induction_init, induction_update) =
             loop_induction_values(graph, predicates, condition, header, &latches, &body_set);
         let bound = loop_bound_value(
@@ -5108,6 +5117,7 @@ fn loop_carrier_facts(
     loop_id: LoopId,
     header: u64,
     latches: &BTreeSet<u64>,
+    live_out: &crate::liveout::FunctionLiveOut,
 ) -> Vec<LoopCarrierFact> {
     let Some(header_block) = function.get_block(header) else {
         return Vec::new();
@@ -5120,8 +5130,10 @@ fn loop_carrier_facts(
             // Pruned SSA is not guaranteed at this seam. A loop-local output
             // can induce a syntactic header phi whose value is never read;
             // such a dead merge carries no live state and must not acquire a
-            // preservation obligation.
-            if graph.use_sites(phi_value).is_empty() {
+            // preservation obligation. Being read includes being read by the
+            // caller, which the use list alone cannot see: a function's result
+            // has no reader anywhere inside it.
+            if !crate::liveout::is_read(graph, live_out, phi_value) {
                 return None;
             }
             let mut entries = Vec::new();
