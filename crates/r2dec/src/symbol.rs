@@ -75,10 +75,27 @@ pub struct SymbolOrigin {
     pub value: Option<r2ssa::ValueId>,
 }
 
+/// Which SSA value a rendered spelling stands for.
+///
+/// One spelling can be reused for two SSA values, and then it names neither, so
+/// the ambiguous case is recorded rather than resolved by guessing.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum SsaOrigin {
+    /// Nothing has said which SSA value this spelling renders.
+    #[default]
+    Unset,
+    /// This spelling renders exactly this SSA display name.
+    One(Rc<str>),
+    /// More than one SSA value renders as this spelling.
+    Ambiguous,
+}
+
 /// One declared name.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Symbol {
     pub name: Rc<str>,
+    /// The SSA display name this spelling renders, when it renders just one.
+    pub ssa: SsaOrigin,
     pub ty: CType,
     pub role: SymbolRole,
     pub origin: SymbolOrigin,
@@ -174,6 +191,7 @@ impl SymbolTable {
         }
         self.symbols.push(Symbol {
             name,
+            ssa: SsaOrigin::Unset,
             ty,
             role,
             origin,
@@ -208,6 +226,28 @@ impl SymbolTable {
     /// and every ask means the same variable. Minting a second identifier for the
     /// second ask would put two variables on the page for one value, so the
     /// spelling is what decides identity here.
+    /// The SSA display name this identifier renders, when it renders just one.
+    ///
+    /// A rendered spelling and an SSA display name are different strings for the
+    /// same value, so a side table keyed by the latter must be asked with this.
+    pub fn ssa_name(&self, id: SymbolId) -> Option<Rc<str>> {
+        match &self.get(id).ssa {
+            SsaOrigin::One(name) => Some(Rc::clone(name)),
+            SsaOrigin::Unset | SsaOrigin::Ambiguous => None,
+        }
+    }
+
+    /// Record which SSA value this identifier was minted to render.
+    pub fn note_ssa_name(&mut self, id: SymbolId, ssa_name: &str) {
+        let index = self.resolve(id);
+        let slot = &mut self.symbols[index].ssa;
+        *slot = match slot {
+            SsaOrigin::Unset => SsaOrigin::One(Rc::from(ssa_name)),
+            SsaOrigin::One(current) if &**current == ssa_name => return,
+            SsaOrigin::One(_) | SsaOrigin::Ambiguous => SsaOrigin::Ambiguous,
+        };
+    }
+
     pub fn declare_or_reuse(&mut self, name: &str) -> SymbolId {
         if let Some(existing) = self.by_name.get(name) {
             return *existing;
@@ -216,6 +256,7 @@ impl SymbolTable {
         self.by_name.insert(name.to_string(), id);
         self.symbols.push(Symbol {
             name: Rc::from(name),
+            ssa: SsaOrigin::Unset,
             ty: CType::Unknown,
             role: SymbolRole::Carrier,
             origin: SymbolOrigin::default(),

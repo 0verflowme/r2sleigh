@@ -2799,7 +2799,7 @@ impl<'a> FoldingContext<'a> {
 
         // Look up the definition of this variable (try SSA key first, then formatted name)
         let def = self
-            .definition_for_name(&self.spelling(*var_name))
+            .definition_for_symbol(*var_name)
             .or_else(|| self.formatted_defs_map().get(&*self.spelling(*var_name)))?;
 
         match def {

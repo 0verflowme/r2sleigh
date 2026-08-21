@@ -82,6 +82,17 @@ impl<'a> LowerCtx<'a> {
         })
     }
 
+    /// The definition of what this identifier renders.
+    ///
+    /// A rendered spelling is not the SSA display name the definitions are keyed
+    /// by, so asking with the spelling misses a definition that is present.
+    fn definition_for_symbol(&self, id: crate::symbol::SymbolId) -> Option<&CExpr> {
+        match self.symbols.borrow().ssa_name(id) {
+            Some(ssa_name) => self.definition_for_name(&ssa_name),
+            None => self.definition_for_name(&self.spelling(id)),
+        }
+    }
+
     fn definition_for_var(&self, var: &SSAVar) -> Option<&CExpr> {
         let key = var.display_name();
         self.definitions
@@ -1149,7 +1160,7 @@ impl<'a> LowerCtx<'a> {
                 {
                     return Some((expr.clone(), 1));
                 }
-                if let Some(inner) = self.definition_for_name(&self.spelling(*name)) {
+                if let Some(inner) = self.definition_for_symbol(*name) {
                     self.extract_mul_const(inner, depth + 1)
                 } else if !self.is_non_index_pointer_expr(expr) && self.is_semantic_index_expr(expr)
                 {
@@ -1232,7 +1243,7 @@ impl<'a> LowerCtx<'a> {
 
         match expr {
             CExpr::Var(name) => {
-                if let Some(inner) = self.definition_for_name(&self.spelling(*name)) {
+                if let Some(inner) = self.definition_for_symbol(*name) {
                     return self.normalize_pointer_base_expr(inner, depth + 1);
                 }
                 let resolved = self.expr_for_ssa_name(&self.spelling(*name));
@@ -1270,7 +1281,7 @@ impl<'a> LowerCtx<'a> {
                 {
                     return Some(expr.clone());
                 }
-                if let Some(inner) = self.definition_for_name(&self.spelling(*name))
+                if let Some(inner) = self.definition_for_symbol(*name)
                     && let Some(normalized) = self.normalize_index_expr(inner, depth + 1)
                     && !self.is_non_index_pointer_expr(&normalized)
                 {
@@ -1283,7 +1294,7 @@ impl<'a> LowerCtx<'a> {
                 {
                     return Some(normalized);
                 }
-                if self.definition_for_name(&self.spelling(*name)).is_some() {
+                if self.definition_for_symbol(*name).is_some() {
                     return None;
                 }
                 if self.is_non_index_pointer_expr(expr) {
@@ -1351,7 +1362,7 @@ impl<'a> LowerCtx<'a> {
         }
 
         if let CExpr::Var(name) = expr
-            && let Some(candidate) = self.definition_for_name(&self.spelling(*name))
+            && let Some(candidate) = self.definition_for_symbol(*name)
         {
             let normalized = self.normalize_pointer_base_expr(candidate, 0);
             if self.is_semantic_member_base(&normalized) {

@@ -1733,7 +1733,6 @@ impl<'a> FoldingContext<'a> {
         self.use_info().value_id_for_name(name)
     }
     pub(crate) fn definition_for_name(&self, name: &str) -> Option<&CExpr> {
-
         self.use_info().render_definition_for_name(name)
     }
     pub(crate) fn semantic_value_for_value_id(
@@ -1853,7 +1852,32 @@ impl<'a> FoldingContext<'a> {
 
     /// A reference to the name this value renders as.
     pub(crate) fn var_ref(&self, var: &SSAVar) -> CExpr {
-        CExpr::Var(self.sym(&self.var_name(var)))
+        CExpr::Var(self.sym_for_var(&self.var_name(var), var))
+    }
+
+    /// The identifier this spelling renders, remembering which value it renders.
+    pub(crate) fn sym_for_var(&self, name: &str, var: &SSAVar) -> crate::symbol::SymbolId {
+        let id = self.sym(name);
+        self.symbols
+            .borrow_mut()
+            .note_ssa_name(id, &var.display_name());
+        id
+    }
+
+    /// A reference to this spelling, which is known to render this value.
+    pub(crate) fn name_ref_for_var(&self, name: &str, var: &SSAVar) -> CExpr {
+        CExpr::Var(self.sym_for_var(name, var))
+    }
+
+    /// The definition of what this identifier renders.
+    ///
+    /// A rendered spelling is not the SSA display name the definitions are keyed
+    /// by, so asking with the spelling misses a definition that is present.
+    pub(crate) fn definition_for_symbol(&self, id: crate::symbol::SymbolId) -> Option<&CExpr> {
+        match self.symbols.borrow().ssa_name(id) {
+            Some(ssa_name) => self.definition_for_name(&ssa_name),
+            None => self.definition_for_name(&self.spelling(id)),
+        }
     }
 
     /// A reference to this spelling.
@@ -3172,7 +3196,7 @@ impl<'a> FoldingContext<'a> {
                 if is_cpu_flag(&self.spelling(*name).to_lowercase()) {
                     return true;
                 }
-                self.definition_for_name(&self.spelling(*name))
+                self.definition_for_symbol(*name)
                     .map(|inner| self.is_simple_expr(inner, depth + 1))
                     .unwrap_or(true)
             }
@@ -3921,10 +3945,11 @@ impl<'a> FoldingContext<'a> {
             if let Some(alias) = self.var_aliases_map().get(&dst.display_name())
                 && !is_generic_arg_name(alias)
             {
-                return self.name_ref(
+                return self.name_ref_for_var(
                     &self
                         .canonicalize_stack_name(alias)
                         .unwrap_or_else(|| alias.clone()),
+                    dst,
                 );
             }
 
@@ -3942,12 +3967,12 @@ impl<'a> FoldingContext<'a> {
             };
 
             return if base == "t" {
-                self.name_ref(&format!("t{}", dst.version))
+                self.name_ref_for_var(&format!("t{}", dst.version), dst)
             } else {
-                self.name_ref(&format!("{}_{}", base, dst.version))
+                self.name_ref_for_var(&format!("{}_{}", base, dst.version), dst)
             };
         }
-        self.name_ref(&rendered)
+        self.name_ref_for_var(&rendered, dst)
     }
 
     fn expr_mentions_rendered_name(&self, expr: &CExpr, name: crate::symbol::SymbolId) -> bool {
@@ -6120,7 +6145,7 @@ impl<'a> FoldingContext<'a> {
                 }
                 if let Some(def) = self
                     .lookup_definition(&self.spelling(*name))
-                    .or_else(|| self.definition_for_name(&self.spelling(*name)).cloned())
+                    .or_else(|| self.definition_for_symbol(*name).cloned())
                     && !matches!(&def, CExpr::Var(inner) if inner == name)
                     && let Some(addr) = self.normalized_addr_from_visible_expr(&def, depth + 1)
                 {
@@ -6712,7 +6737,7 @@ impl<'a> FoldingContext<'a> {
 
                 if let Some(def) = self
                     .lookup_definition(&self.spelling(*name))
-                    .or_else(|| self.definition_for_name(&self.spelling(*name)).cloned())
+                    .or_else(|| self.definition_for_symbol(*name).cloned())
                     .or_else(|| self.best_visible_definition(&self.spelling(*name)))
                     && !matches!(&def, CExpr::Var(inner) if self.spelling(*inner).eq_ignore_ascii_case(&self.spelling(*name)))
                     && let Some(field) =
