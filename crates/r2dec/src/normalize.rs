@@ -183,7 +183,12 @@ struct PhiMove {
 /// kept.
 fn widest_per_storage<'a>(phis: Vec<&'a r2ssa::PhiNode>) -> Vec<&'a r2ssa::PhiNode> {
     use r2ssa::CanonicalStorageSpace;
-    let mut widest_by_slot: HashMap<(CanonicalStorageSpace, u64), &r2ssa::PhiNode> = HashMap::new();
+    // Ordered, because what the fold emits has to be the same on every run and
+    // a hash map hands its values back in whatever order it likes.
+    let mut widest_by_slot: std::collections::BTreeMap<
+        (CanonicalStorageSpace, u64),
+        &r2ssa::PhiNode,
+    > = std::collections::BTreeMap::new();
     let mut kept = Vec::with_capacity(phis.len());
     for phi in phis {
         let Some(storage) = phi.canonical_storage else {
@@ -195,10 +200,10 @@ fn widest_per_storage<'a>(phis: Vec<&'a r2ssa::PhiNode>) -> Vec<&'a r2ssa::PhiNo
             continue;
         }
         match widest_by_slot.entry((storage.space, storage.offset)) {
-            std::collections::hash_map::Entry::Vacant(slot) => {
+            std::collections::btree_map::Entry::Vacant(slot) => {
                 slot.insert(phi);
             }
-            std::collections::hash_map::Entry::Occupied(mut slot) => {
+            std::collections::btree_map::Entry::Occupied(mut slot) => {
                 let held = slot.get().canonical_storage.map_or(0, |held| held.size);
                 if storage.size > held {
                     slot.insert(phi);

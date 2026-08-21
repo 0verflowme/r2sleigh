@@ -4922,75 +4922,40 @@ mod tests {
     }
 
     #[test]
-    fn c_plugin_decj_projects_v2_responses_and_refuses_without_borrowed_snapshot() {
+    fn c_plugin_refuses_decj_without_a_borrowed_snapshot() {
         let c_source = include_str!("../r_anal_sleigh.c");
-        let project_start = c_source
-            .find("static char *sleigh_engine_execute_v2_project(")
-            .expect("V2 response projector");
-        let project_end = c_source[project_start..]
+        // What this used to pin was a projector that assembled a decompile
+        // document in C by parsing diagnostics the engine had already produced
+        // as JSON. Nothing ever asked for it: its only caller passed the
+        // projection flag as false, because the commands that would have set it
+        // were withdrawn in favour of pdd. It is gone, and so is the reparsing.
+        assert!(
+            !c_source.contains("sleigh_engine_v2_response_json")
+                && !c_source.contains("r_json_parsedup (diagnostics_text)"),
+            "the C wrapper must not reassemble a document the engine already produced"
+        );
+        let execute = c_source
             .find("static char *sleigh_engine_execute_v2(")
-            .map(|offset| project_start + offset)
-            .expect("legacy V2 output wrapper");
-        let project = &c_source[project_start..project_end];
+            .expect("V2 executor");
+        let project = &c_source[execute..];
         let bytes = project
             .find("api->response_bytes (response, &bytes)")
             .expect("opaque response bytes inspection");
-        let json = project[bytes..]
-            .find("sleigh_engine_v2_response_json (&info, bytes)")
-            .map(|offset| bytes + offset)
-            .expect("structured JSON projection");
-        let free = project[json..]
+        let free = project[bytes..]
             .find("sleigh_engine_v2_release_or_preserve (api, &response, &session)")
-            .map(|offset| json + offset)
+            .map(|offset| bytes + offset)
             .expect("opaque response owner release");
         assert!(
-            bytes < json && json < free,
-            "all borrowed output, diagnostics, and timing views must be projected before response_free"
+            bytes < free,
+            "every borrowed view must be projected before response_free"
         );
         assert!(
             project.contains("api->response_info (response, &info)"),
-            "decj metadata must come from the V2 response inspection API"
-        );
-
-        let response_json_start = c_source
-            .find("static char *sleigh_engine_v2_response_json(")
-            .expect("decj response JSON builder");
-        let response_json_end = c_source[response_json_start..]
-            .find("static char *sleigh_engine_execute_v2_project(")
-            .map(|offset| response_json_start + offset)
-            .expect("V2 executor after JSON builder");
-        let response_json = &c_source[response_json_start..response_json_end];
-        for field in [
-            "schema_version",
-            "rendered_output",
-            "diagnostics",
-            "outcome",
-            "phase_timings",
-            "ffi_conversion_elapsed_us",
-            "refused",
-            "error",
-        ] {
-            assert!(
-                response_json.contains(field),
-                "decj schema must expose {field}"
-            );
-        }
-        assert!(
-            c_source.contains("sleigh_json_is_single_object (")
-                && response_json.contains("r_json_parsedup (diagnostics_text)")
-                && response_json.contains("diagnostics->type != R_JSON_OBJECT")
-                && response_json.contains("pj_rj (pj, diagnostics)"),
-            "diagnostics must be one complete object and emitted structurally, never as a double-encoded string"
+            "response metadata must come from the V2 inspection API"
         );
         assert!(
-            !response_json.contains("pj_raw")
-                && !response_json.contains("pj_ks (pj, \"diagnostics\""),
-            "unparsed diagnostics must never be injected into decj JSON"
-        );
-        assert!(
-            project.contains("!info.diagnostics_json.data || !info.diagnostics_json.len")
-                && project.contains("invalid output or diagnostics in V2 response"),
-            "missing or malformed diagnostics must fail closed"
+            c_source.contains("sleigh_json_is_single_object ("),
+            "kernel warnings must still require one complete diagnostics object"
         );
 
         let decj_route = c_source

@@ -762,49 +762,7 @@ static void sleigh_engine_v2_log_error(
 	R_LOG_ERROR ("r2sleigh: V2 engine request failed (%u)", status);
 }
 
-static const char *sleigh_engine_v2_phase_name(uint32_t phase) {
-	switch (phase) {
-	case R2SLEIGH_PHASE_SNAPSHOT_CONTEXT_V2:
-		return "snapshot_context";
-	case R2SLEIGH_PHASE_LIFT_NORMALIZE_V2:
-		return "lift_normalize";
-	case R2SLEIGH_PHASE_SSA_V2:
-		return "ssa";
-	case R2SLEIGH_PHASE_OBLIGATIONS_V2:
-		return "obligations";
-	case R2SLEIGH_PHASE_SYMBOLIC_V2:
-		return "symbolic";
-	case R2SLEIGH_PHASE_TYPES_V2:
-		return "types";
-	case R2SLEIGH_PHASE_CERTIFICATION_V2:
-		return "certification";
-	case R2SLEIGH_PHASE_STRUCTURING_V2:
-		return "structuring";
-	case R2SLEIGH_PHASE_NORMALIZATION_V2:
-		return "normalization";
-	case R2SLEIGH_PHASE_RENDERING_V2:
-		return "rendering";
-	case R2SLEIGH_PHASE_FFI_CONVERSION_V2:
-		return "ffi_conversion";
-	default:
-		return "unknown";
-	}
-}
 
-static const char *sleigh_engine_v2_phase_status_name(uint32_t status) {
-	switch (status) {
-	case R2SLEIGH_PHASE_STATUS_NOT_EXECUTED_V2:
-		return "not_executed";
-	case R2SLEIGH_PHASE_STATUS_EXECUTED_V2:
-		return "executed";
-	case R2SLEIGH_PHASE_STATUS_FOLDED_V2:
-		return "folded";
-	case R2SLEIGH_PHASE_STATUS_REFUSED_V2:
-		return "refused";
-	default:
-		return "unknown";
-	}
-}
 
 static bool sleigh_engine_v2_phase_status_is_valid(uint32_t status) {
 	switch (status) {
@@ -846,15 +804,6 @@ static char *sleigh_engine_v2_error_json(const char *state, uint32_t status, con
 	return pj_drain (pj);
 }
 
-static char *sleigh_engine_v2_session_error_copy(const R2SleighApiV2 *api, const R2SleighSessionV2 *session, uint32_t status) {
-	R2SleighByteViewV2 error = {0};
-	if (api && session && api->session_error
-		&& api->session_error (session, &error) == R2SLEIGH_STATUS_OK_V2
-		&& error.data && error.len) {
-		return sleigh_byte_view_v2_copy (error);
-	}
-	return r_str_newf ("V2 engine request failed (%u)", status);
-}
 
 static bool sleigh_json_is_single_object(const char *text, size_t len) {
 	if (!text || !len) {
@@ -958,67 +907,6 @@ static void sleigh_engine_v2_log_semantic_kernel_warnings(R2SleighByteViewV2 vie
 	free (text);
 }
 
-static char *sleigh_engine_v2_response_json(const R2SleighResponseInfoV2 *info, R2SleighByteViewV2 bytes) {
-	if (!info || !info->diagnostics_json.data || !info->diagnostics_json.len) {
-		return NULL;
-	}
-	if (!sleigh_json_is_single_object (
-		(const char *)info->diagnostics_json.data, info->diagnostics_json.len)) {
-		return NULL;
-	}
-	char *output = sleigh_byte_view_v2_copy (bytes);
-	char *diagnostics_text = sleigh_byte_view_v2_copy (info->diagnostics_json);
-	if (!output || !diagnostics_text) {
-		free (output);
-		free (diagnostics_text);
-		return NULL;
-	}
-	RJson *diagnostics = r_json_parsedup (diagnostics_text);
-	free (diagnostics_text);
-	if (!diagnostics || diagnostics->type != R_JSON_OBJECT) {
-		r_json_free (diagnostics);
-		free (output);
-		return NULL;
-	}
-	PJ *pj = pj_new ();
-	if (!pj) {
-		r_json_free (diagnostics);
-		free (output);
-		return NULL;
-	}
-	pj_o (pj);
-	pj_kn (pj, "schema_version", SLEIGH_DECJ_SCHEMA_VERSION);
-	pj_ks (pj, "request_kind", "decompile");
-	pj_kn (pj, "request_kind_code", info->request_kind);
-	pj_ks (pj, "outcome", info->outcome == R2SLEIGH_OUTCOME_REFUSED_V2
-		? "refused": "completed");
-	pj_kn (pj, "outcome_code", info->outcome);
-	pj_ks (pj, "rendered_output", output);
-	pj_k (pj, "diagnostics");
-	pj_rj (pj, diagnostics);
-	pj_ka (pj, "phase_timings");
-	size_t i = 0;
-	for (; i < info->num_phase_timings; i++) {
-		const R2SleighPhaseTimingV2 *timing = &info->phase_timings[i];
-		pj_o (pj);
-		pj_kn (pj, "phase", timing->phase);
-		pj_ks (pj, "name", sleigh_engine_v2_phase_name (timing->phase));
-		pj_kn (pj, "status", timing->status);
-		pj_ks (pj, "status_name", sleigh_engine_v2_phase_status_name (timing->status));
-		pj_kn (pj, "elapsed_us", timing->elapsed_us);
-		pj_end (pj);
-	}
-	pj_end (pj);
-	pj_kn (pj, "ffi_conversion_elapsed_us", info->ffi_conversion_elapsed_us);
-	pj_kb (pj, "refused", info->outcome == R2SLEIGH_OUTCOME_REFUSED_V2);
-	pj_knull (pj, "error");
-	pj_end (pj);
-	char *json = pj_drain (pj);
-	r_json_free (diagnostics);
-	free (output);
-	return json;
-}
-
 static uint32_t sleigh_engine_v2_release_handles(const R2SleighApiV2 *api,
 	R2SleighResponseV2 **response, R2SleighSessionV2 **session) {
 	if ((!response || !*response) && (!session || !*session)) {
@@ -1068,16 +956,9 @@ static uint32_t sleigh_engine_v2_retry_pending(const R2SleighApiV2 *api) {
 		&sleigh_pending_engine_response, &sleigh_pending_engine_session);
 }
 
-static char *sleigh_engine_v2_cleanup_error(bool json_projection, uint32_t status) {
-	return json_projection
-		? sleigh_engine_v2_error_json ("owner_cleanup", status,
-			"failed to release V2 engine ownership")
-		: NULL;
-}
-
 // Returns a malloc-owned NUL-terminated projection. Every borrowed response
 // view is consumed before response_free releases the opaque Rust owner.
-static char *sleigh_engine_execute_v2_project(uint32_t kind, uint64_t required_capability, const R2SleighEngineRequestPayloadV2 *payload, bool json_projection) {
+static char *sleigh_engine_execute_v2(uint32_t kind, uint64_t required_capability, const R2SleighEngineRequestPayloadV2 *payload) {
 	required_capability |= R2SLEIGH_CAP_OPAQUE_RADARE_SNAPSHOT_V2
 		| R2SLEIGH_CAP_RESPONSE_INFO_V2
 		| R2SLEIGH_CAP_EXECUTION_CONTROL_V2;
@@ -1097,24 +978,16 @@ static char *sleigh_engine_execute_v2_project(uint32_t kind, uint64_t required_c
 		|| !api->response_bytes || !api->response_info
 		|| !api->response_free || !api->session_error) {
 		R_LOG_ERROR ("r2sleigh: incompatible V2 engine API table");
-		return json_projection
-			? sleigh_engine_v2_error_json ("incompatible_api",
-				R2SLEIGH_STATUS_ABI_MISMATCH_V2,
-				"incompatible V2 engine API table")
-			: NULL;
+		return NULL;
 	}
 	uint32_t status = sleigh_engine_v2_retry_pending (api);
 	if (status != R2SLEIGH_STATUS_OK_V2) {
-		return sleigh_engine_v2_cleanup_error (json_projection, status);
+		return NULL;
 	}
 	if (!payload || payload->abi_version != R2SLEIGH_ABI_V2
 		|| payload->struct_size != sizeof (*payload)) {
 		R_LOG_ERROR ("r2sleigh: invalid native V2 request graph");
-		return json_projection
-			? sleigh_engine_v2_error_json ("invalid_request",
-				R2SLEIGH_STATUS_INVALID_ARGUMENT_V2,
-				"invalid native V2 request graph")
-			: NULL;
+		return NULL;
 	}
 
 	R2SleighSessionConfigV2 config = {
@@ -1128,12 +1001,9 @@ static char *sleigh_engine_execute_v2_project(uint32_t kind, uint64_t required_c
 		R_LOG_ERROR ("r2sleigh: failed to create V2 engine session (%u)", status);
 		uint32_t free_status = sleigh_engine_v2_release_or_preserve (api, NULL, &session);
 		if (free_status != R2SLEIGH_STATUS_OK_V2) {
-			return sleigh_engine_v2_cleanup_error (json_projection, free_status);
+			return NULL;
 		}
-		return json_projection
-			? sleigh_engine_v2_error_json ("session_create", status,
-				"failed to create V2 engine session")
-			: NULL;
+		return NULL;
 	}
 
 	R2SleighRequestV2 request = {
@@ -1147,19 +1017,8 @@ static char *sleigh_engine_execute_v2_project(uint32_t kind, uint64_t required_c
 	status = api->execute (session, &request, &response);
 	if (status != R2SLEIGH_STATUS_OK_V2 || !response) {
 		sleigh_engine_v2_log_error (api, session, status);
-		char *message = json_projection
-			? sleigh_engine_v2_session_error_copy (api, session, status)
-			: NULL;
 		uint32_t free_status = sleigh_engine_v2_release_or_preserve (api, &response, &session);
-		if (free_status != R2SLEIGH_STATUS_OK_V2) {
-			free (message);
-			return sleigh_engine_v2_cleanup_error (json_projection, free_status);
-		}
-		if (json_projection) {
-			char *json = sleigh_engine_v2_error_json ("execute", status, message);
-			free (message);
-			return json;
-		}
+		(void)free_status;
 		return NULL;
 	}
 	R2SleighResponseInfoV2 info = {0};
@@ -1176,13 +1035,9 @@ static char *sleigh_engine_execute_v2_project(uint32_t kind, uint64_t required_c
 		sleigh_engine_v2_log_error (api, session, status);
 		uint32_t free_status = sleigh_engine_v2_release_or_preserve (api, &response, &session);
 		if (free_status != R2SLEIGH_STATUS_OK_V2) {
-			return sleigh_engine_v2_cleanup_error (json_projection, free_status);
+			return NULL;
 		}
-		return json_projection
-			? sleigh_engine_v2_error_json ("response_info",
-				R2SLEIGH_STATUS_ENGINE_ERROR_V2,
-				"invalid or missing V2 response metadata")
-			: NULL;
+		return NULL;
 	}
 	size_t phase_index;
 	for (phase_index = 0; phase_index < info.num_phase_timings; phase_index++) {
@@ -1191,13 +1046,9 @@ static char *sleigh_engine_execute_v2_project(uint32_t kind, uint64_t required_c
 			R_LOG_ERROR ("r2sleigh: invalid V2 engine phase metadata");
 			uint32_t free_status = sleigh_engine_v2_release_or_preserve (api, &response, &session);
 			if (free_status != R2SLEIGH_STATUS_OK_V2) {
-				return sleigh_engine_v2_cleanup_error (json_projection, free_status);
+				return NULL;
 			}
-			return json_projection
-				? sleigh_engine_v2_error_json ("phase_metadata",
-					R2SLEIGH_STATUS_ENGINE_ERROR_V2,
-					"invalid V2 engine phase metadata")
-				: NULL;
+			return NULL;
 		}
 	}
 	if (info.phase_timings[R2SLEIGH_PHASE_FFI_CONVERSION_V2].status
@@ -1207,13 +1058,9 @@ static char *sleigh_engine_execute_v2_project(uint32_t kind, uint64_t required_c
 		R_LOG_ERROR ("r2sleigh: invalid V2 FFI conversion metadata");
 		uint32_t free_status = sleigh_engine_v2_release_or_preserve (api, &response, &session);
 		if (free_status != R2SLEIGH_STATUS_OK_V2) {
-			return sleigh_engine_v2_cleanup_error (json_projection, free_status);
+			return NULL;
 		}
-		return json_projection
-			? sleigh_engine_v2_error_json ("ffi_conversion_metadata",
-				R2SLEIGH_STATUS_ENGINE_ERROR_V2,
-				"invalid V2 FFI conversion metadata")
-			: NULL;
+		return NULL;
 	}
 
 	R2SleighByteViewV2 bytes = {0};
@@ -1221,31 +1068,17 @@ static char *sleigh_engine_execute_v2_project(uint32_t kind, uint64_t required_c
 	char *result = NULL;
 	if (status == R2SLEIGH_STATUS_OK_V2 && bytes.len < SIZE_MAX
 		&& (!bytes.len || bytes.data)) {
-		result = json_projection
-			? sleigh_engine_v2_response_json (&info, bytes)
-			: sleigh_byte_view_v2_copy (bytes);
+		result = sleigh_byte_view_v2_copy (bytes);
 	} else {
 		sleigh_engine_v2_log_error (api, session, status);
 	}
-	if (json_projection && !result) {
-		result = sleigh_engine_v2_error_json ("response_projection",
-			R2SLEIGH_STATUS_ENGINE_ERROR_V2,
-			"invalid output or diagnostics in V2 response");
-	}
-	if (!json_projection) {
-		sleigh_engine_v2_log_semantic_kernel_warnings (info.diagnostics_json);
-	}
+	sleigh_engine_v2_log_semantic_kernel_warnings (info.diagnostics_json);
 	uint32_t free_status = sleigh_engine_v2_release_or_preserve (api, &response, &session);
 	if (free_status != R2SLEIGH_STATUS_OK_V2) {
 		free (result);
-		return sleigh_engine_v2_cleanup_error (json_projection, free_status);
+		return NULL;
 	}
 	return result;
-}
-
-static char *sleigh_engine_execute_v2(uint32_t kind, uint64_t required_capability, const R2SleighEngineRequestPayloadV2 *payload) {
-	return sleigh_engine_execute_v2_project (
-		kind, required_capability, payload, false);
 }
 
 static void block_array_init(BlockArray *arr) {
