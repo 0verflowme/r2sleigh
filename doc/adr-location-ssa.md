@@ -687,6 +687,28 @@ the only decomposition left worth having. It is not a deletion:
 and fires on `tests/gold/flag_materialisation.c`, so it earns its keep on code
 the old corpus could not see.
 
+### Why the migration cannot be short-circuited
+
+The table's first use was going to be answering, without changing `CExpr`, the
+question all three blocked improvements need: what name did the output give this
+value. Two ways of doing that were built and both failed, and the second failure
+is the argument for doing the migration rather than a reason to keep trying.
+
+Recording the name where the fold decides it does not work, because the fold is
+not the last pass to decide one. Making the renaming passes carry the table along
+with them does not work either, because they are not the only other decider:
+variable recovery names a frame slot on its own, reaching neither the fold's
+naming nor any rename map. On the one function in the corpus that renders
+correctly, both attempts reported thirteen obligations rendered against fifty-two
+refused, where the body plainly renders nearly all of them.
+
+Names are assigned by several independent mechanisms and the AST is the only
+place they meet. So a value cannot be traced to its rendered name while the AST
+holds spellings rather than references -- not as a matter of tidiness, but because
+there is nowhere else the answer exists. That is what makes `Var(SymbolId)`
+necessary rather than preferable, and it is worth having established by
+construction rather than by argument.
+
 ### Where the table lives
 
 The ownership question is the part that needed deciding rather than typing, and
