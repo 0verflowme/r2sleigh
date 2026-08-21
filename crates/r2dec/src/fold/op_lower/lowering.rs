@@ -157,12 +157,18 @@ impl<'a> FoldingContext<'a> {
             LoweredOp::Expr(expr) => expr,
             LoweredOp::Assign { lhs, rhs } => CExpr::assign(lhs, rhs),
             LoweredOp::Return(Some(expr)) => expr,
-            LoweredOp::Return(None) => CExpr::Var("return".to_string()),
+            LoweredOp::Return(None) => CExpr::External {
+                    name: "return".to_string(),
+                    kind: crate::symbol::ExternalKind::Intrinsic,
+                },
             LoweredOp::Comment(_) | LoweredOp::None => {
                 if let Some(dst) = op.dst() {
                     CExpr::Var(self.var_name(dst))
                 } else {
-                    CExpr::Var("__unhandled_op__".to_string())
+                    CExpr::External {
+                            name: "__unhandled_op__".to_string(),
+                            kind: crate::symbol::ExternalKind::Intrinsic,
+                        }
                 }
             }
         }

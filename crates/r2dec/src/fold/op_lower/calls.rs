@@ -16,6 +16,7 @@ impl<'a> FoldingContext<'a> {
     pub(super) fn call_arg_expr_is_unresolved_fallback(expr: &CExpr) -> bool {
         match expr {
             CExpr::Var(name) => name == Self::UNRESOLVED_CALL_ARG_EXPR_NAME,
+            CExpr::External { .. } => false,
             CExpr::Unary { operand, .. }
             | CExpr::Cast { expr: operand, .. }
             | CExpr::Deref(operand)
@@ -1440,6 +1441,7 @@ impl<'a> FoldingContext<'a> {
         };
 
         match expr {
+            CExpr::External { .. } => false,
             CExpr::Var(name) => prepared.owner_expr_for_name(name).is_some(),
             CExpr::Deref(inner)
             | CExpr::AddrOf(inner)

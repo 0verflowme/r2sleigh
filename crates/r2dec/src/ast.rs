@@ -167,6 +167,16 @@ pub enum CExpr {
     CharLit(char),
     /// Variable reference.
     Var(String),
+    /// A name for something the function does not own, and what kind of thing it is.
+    ///
+    /// `Var` is for values this function has. An intrinsic the target defines, or
+    /// a marker the lowering emits where it has nothing to say, is neither a value
+    /// nor something a declaration could give it, and spelling it as a variable is
+    /// what let a machine name look exactly like a local.
+    External {
+        name: String,
+        kind: crate::symbol::ExternalKind,
+    },
     /// Unary operation.
     Unary { op: UnaryOp, operand: Box<CExpr> },
     /// Binary operation.
@@ -506,6 +516,7 @@ impl CExpr {
             | Self::StringLit(_)
             | Self::CharLit(_)
             | Self::Var(_)
+            | Self::External { .. }
             | Self::SizeofType(_) => {}
         }
     }

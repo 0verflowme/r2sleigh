@@ -140,6 +140,7 @@ impl<'a> NameCollector<'a> {
             | CExpr::FloatLit(_)
             | CExpr::StringLit(_)
             | CExpr::CharLit(_)
+            | CExpr::External { .. }
             | CExpr::SizeofType(_) => {}
             CExpr::Var(name) => self.collect_name(name),
             CExpr::Unary { operand, .. }
@@ -357,6 +358,7 @@ fn rewrite_expr(expr: &mut CExpr, rename_map: &HashMap<String, String>) {
         | CExpr::FloatLit(_)
         | CExpr::StringLit(_)
         | CExpr::CharLit(_)
+        | CExpr::External { .. }
         | CExpr::SizeofType(_) => {}
         CExpr::Var(name) => rewrite_name(name, rename_map),
         CExpr::Unary { operand, .. }

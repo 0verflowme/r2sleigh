@@ -2537,6 +2537,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             | CExpr::StringLit(_)
             | CExpr::CharLit(_)
             | CExpr::Var(_)
+            | CExpr::External { .. }
             | CExpr::SizeofType(_) => true,
             CExpr::Paren(inner)
             | CExpr::AddrOf(inner)
@@ -4744,6 +4745,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             CExpr::Var(name) => {
                 out.insert(name.trim_start_matches('&').to_string());
             }
+            CExpr::External { .. } => {}
             CExpr::AddrOf(inner) | CExpr::Deref(inner) => {
                 if let CExpr::Var(name) = Self::normalize_loop_expr_refs(inner) {
                     out.insert(name.trim_start_matches('&').to_string());

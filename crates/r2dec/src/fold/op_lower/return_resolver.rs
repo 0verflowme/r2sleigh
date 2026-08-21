@@ -1263,7 +1263,10 @@ impl<'a> FoldingContext<'a> {
             let expr = self.rewrite_typed_return_literal_expr(expr, context);
             self.strip_widening_cast_for_function_return(expr)
         })
-        .unwrap_or_else(|| CExpr::Var("return".to_string()))
+        .unwrap_or_else(|| CExpr::External {
+            name: "return".to_string(),
+            kind: crate::symbol::ExternalKind::Intrinsic,
+        })
     }
 
     fn strip_widening_cast_for_function_return(&self, expr: CExpr) -> CExpr {

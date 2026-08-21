@@ -747,6 +747,8 @@ fn call_arg_expr_is_low_signal(expr: &CExpr, depth: u32) -> bool {
     }
 
     match expr {
+        // The names these tests look for are ones the renderer minted for a local.
+        CExpr::External { .. } => false,
         CExpr::Var(name) => {
             is_call_arg_placeholder_name(name)
                 || is_call_arg_transient_name(name)
@@ -884,6 +886,7 @@ fn call_arg_expr_preservation_score(expr: &CExpr, depth: u32) -> i32 {
     match expr {
         CExpr::StringLit(_) => 320,
         CExpr::IntLit(_) | CExpr::UIntLit(_) | CExpr::FloatLit(_) | CExpr::CharLit(_) => 80,
+        CExpr::External { .. } => 80,
         CExpr::Var(name) => {
             if is_call_arg_placeholder_name(name) {
                 -120
@@ -4486,6 +4489,8 @@ fn accumulate_formatted_def_expr_quality(
     quality: &mut (i32, i32, i32, i32, i32, i32),
 ) {
     match expr {
+        // No penalty applies: none of these ask about a name the renderer chose.
+        CExpr::External { .. } => {}
         CExpr::Var(name) => {
             if is_generic_stack_alias_name(name) {
                 quality.3 -= 8;
@@ -6128,6 +6133,8 @@ fn normalize_call_arg_expr_for_definition(
     }
 
     match expr {
+        // An external name has no definition in this function to normalise to.
+        external @ CExpr::External { .. } => Some(external),
         CExpr::Var(name) => {
             normalize_call_arg_var_for_definition(info, lower, name, depth, visited)
         }
@@ -8439,6 +8446,7 @@ fn call_arg_expr_semantic_weight(expr: &CExpr, depth: u32) -> i32 {
     }
     match expr {
         CExpr::StringLit(_) => 80,
+        CExpr::External { .. } => 40,
         CExpr::Subscript { base, index } => {
             40 + call_arg_expr_semantic_weight(base, depth + 1)
                 + call_arg_expr_semantic_weight(index, depth + 1)
@@ -8498,6 +8506,7 @@ fn call_arg_expr_contains_stack_placeholder(expr: &CExpr, depth: u32) -> bool {
         return false;
     }
     match expr {
+        CExpr::External { .. } => false,
         CExpr::Var(name) => is_call_arg_placeholder_name(name),
         CExpr::Deref(inner)
         | CExpr::AddrOf(inner)
@@ -8548,6 +8557,7 @@ fn call_arg_expr_contains_transient_name(expr: &CExpr, depth: u32) -> bool {
         return false;
     }
     match expr {
+        CExpr::External { .. } => false,
         CExpr::Var(name) => is_call_arg_transient_name(name),
         CExpr::Deref(inner)
         | CExpr::AddrOf(inner)
@@ -8598,6 +8608,7 @@ fn call_arg_expr_contains_low_quality_name(expr: &CExpr, depth: u32) -> bool {
         return false;
     }
     match expr {
+        CExpr::External { .. } => false,
         CExpr::Var(name) => is_call_arg_low_quality_name(name),
         CExpr::Deref(inner)
         | CExpr::AddrOf(inner)
@@ -9920,6 +9931,7 @@ mod tests {
     fn imported_printf_after_helper_call_keeps_forwarded_local_arg_out_of_positive_stack_home() {
         fn fallback_contains_stack_placeholder(expr: &CExpr) -> bool {
             match expr {
+                CExpr::External { .. } => false,
                 CExpr::Var(name) => {
                     let lower = name.to_ascii_lowercase();
                     lower == "stack" || lower == "saved_fp" || lower.starts_with("stack_")

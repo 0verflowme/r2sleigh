@@ -449,6 +449,10 @@ impl CodeGenerator {
             CExpr::Var(name) => {
                 self.output.push_str(name);
             }
+            // The kind is what makes the name allowed, not how it prints.
+            CExpr::External { name, .. } => {
+                self.output.push_str(name);
+            }
             CExpr::Unary { op, operand } => {
                 if op.is_postfix() {
                     self.emit_expr(operand, my_prec);

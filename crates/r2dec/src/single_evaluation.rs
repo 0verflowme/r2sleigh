@@ -331,6 +331,7 @@ pub(crate) fn children_mut(expr: &mut CExpr) -> Vec<&mut CExpr> {
         | CExpr::StringLit(_)
         | CExpr::CharLit(_)
         | CExpr::Var(_)
+        | CExpr::External { .. }
         | CExpr::SizeofType(_) => Vec::new(),
         CExpr::Unary { operand, .. } => vec![operand.as_mut()],
         CExpr::Binary { left, right, .. } => vec![left.as_mut(), right.as_mut()],

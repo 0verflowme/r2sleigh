@@ -439,10 +439,16 @@ impl<'a> LowerCtx<'a> {
                 for input in inputs {
                     args.push(self.get_expr(input));
                 }
-                CExpr::call(CExpr::Var("callother".to_string()), args)
+                CExpr::call(CExpr::External {
+                    name: "callother".to_string(),
+                    kind: crate::symbol::ExternalKind::Intrinsic,
+                }, args)
             }
             SSAOp::CpuId { .. } => CExpr::call(
-                CExpr::Var("callother".to_string()),
+                CExpr::External {
+                    name: "callother".to_string(),
+                    kind: crate::symbol::ExternalKind::Intrinsic,
+                },
                 vec![CExpr::StringLit("cpuid".to_string())],
             ),
             SSAOp::PtrAdd {
@@ -465,7 +471,10 @@ impl<'a> LowerCtx<'a> {
                 if let Some(dst) = op.dst() {
                     CExpr::Var(self.var_name(dst))
                 } else {
-                    CExpr::Var("__unhandled_op__".to_string())
+                    CExpr::External {
+                        name: "__unhandled_op__".to_string(),
+                        kind: crate::symbol::ExternalKind::Intrinsic,
+                    }
                 }
             }
         }
@@ -1562,7 +1571,10 @@ mod tests {
             assert_eq!(
                 expr,
                 CExpr::call(
-                    CExpr::Var("callother".to_string()),
+                    CExpr::External {
+                    name: "callother".to_string(),
+                    kind: crate::symbol::ExternalKind::Intrinsic,
+                },
                     vec![
                         CExpr::StringLit(format!("userop_{userop}")),
                         CExpr::Var("x30".to_string()),

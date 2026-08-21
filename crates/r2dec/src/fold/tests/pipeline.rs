@@ -1373,6 +1373,7 @@ mod tests {
 
     fn expr_contains_var(expr: &CExpr, target: &str) -> bool {
         match expr {
+            CExpr::External { .. } => false,
             CExpr::Var(name) => name == target,
             CExpr::Unary { operand, .. }
             | CExpr::Paren(operand)
@@ -1415,6 +1416,7 @@ mod tests {
     fn expr_contains_addr_of(expr: &CExpr) -> bool {
         match expr {
             CExpr::AddrOf(_) => true,
+            CExpr::External { .. } => false,
             CExpr::Unary { operand, .. }
             | CExpr::Paren(operand)
             | CExpr::Deref(operand)

@@ -3392,6 +3392,8 @@ fn collect_expr_var_names(expr: &CExpr, out: &mut HashSet<String>) {
         CExpr::Var(name) => {
             out.insert(name.clone());
         }
+        // Not a name this function declares, so not one it has to.
+        CExpr::External { .. } => {}
         CExpr::Unary { operand, .. }
         | CExpr::Cast { expr: operand, .. }
         | CExpr::Paren(operand)
@@ -4486,6 +4488,8 @@ fn rewrite_expr_var_aliases(
                 *name = target.clone();
             }
         }
+        // Renaming moves the names this function owns; an external one is not.
+        CExpr::External { .. } => {}
         CExpr::Unary { operand, .. }
         | CExpr::Cast { expr: operand, .. }
         | CExpr::Paren(operand)
@@ -4877,6 +4881,7 @@ fn normalize_declared_assignment_literals(func: &mut CFunction) {
             | CExpr::StringLit(_)
             | CExpr::CharLit(_)
             | CExpr::Var(_)
+            | CExpr::External { .. }
             | CExpr::SizeofType(_) => {}
         }
 
@@ -5124,6 +5129,8 @@ fn collect_expr_local_reads(expr: &CExpr, reads: &mut HashSet<String>) {
         CExpr::Var(name) => {
             reads.insert(name.to_ascii_lowercase());
         }
+        // Reading an intrinsic is not reading a local.
+        CExpr::External { .. } => {}
         CExpr::Paren(inner)
         | CExpr::AddrOf(inner)
         | CExpr::Deref(inner)
@@ -5260,7 +5267,8 @@ fn expr_is_pure_for_dead_local_prune(expr: &CExpr) -> bool {
         | CExpr::StringLit(_)
         | CExpr::CharLit(_)
         | CExpr::SizeofType(_)
-        | CExpr::Var(_) => true,
+        | CExpr::Var(_)
+        | CExpr::External { .. } => true,
         CExpr::Paren(inner)
         | CExpr::AddrOf(inner)
         | CExpr::Deref(inner)

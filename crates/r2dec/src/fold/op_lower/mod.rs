@@ -328,6 +328,7 @@ fn expr_is_side_effect_free_for_carrier_gate(expr: &CExpr) -> bool {
         | CExpr::StringLit(_)
         | CExpr::CharLit(_)
         | CExpr::Var(_)
+        | CExpr::External { .. }
         | CExpr::SizeofType(_) => true,
         CExpr::Paren(inner)
         | CExpr::AddrOf(inner)
@@ -3370,12 +3371,18 @@ impl<'a> FoldingContext<'a> {
                 LoweredOp::Assign { rhs, .. } => rhs,
                 LoweredOp::Expr(expr) => expr,
                 LoweredOp::Return(Some(expr)) => expr,
-                LoweredOp::Return(None) => CExpr::Var("return".to_string()),
+                LoweredOp::Return(None) => CExpr::External {
+                    name: "return".to_string(),
+                    kind: crate::symbol::ExternalKind::Intrinsic,
+                },
                 LoweredOp::Comment(_) | LoweredOp::None => {
                     if let Some(dst) = op.dst() {
                         CExpr::Var(self.var_name(dst))
                     } else {
-                        CExpr::Var("__unhandled_op__".to_string())
+                        CExpr::External {
+                        name: "__unhandled_op__".to_string(),
+                        kind: crate::symbol::ExternalKind::Intrinsic,
+                    }
                     }
                 }
             };
@@ -3389,7 +3396,10 @@ impl<'a> FoldingContext<'a> {
                 if let Some(dst) = op.dst() {
                     CExpr::Var(self.var_name(dst))
                 } else {
-                    CExpr::Var("__unhandled_op__".to_string())
+                    CExpr::External {
+                        name: "__unhandled_op__".to_string(),
+                        kind: crate::symbol::ExternalKind::Intrinsic,
+                    }
                 }
             }
         }
@@ -4488,6 +4498,7 @@ impl<'a> FoldingContext<'a> {
 
     fn expr_contains_synthetic_stack_placeholder(&self, expr: &CExpr) -> bool {
         match expr {
+            CExpr::External { .. } => false,
             CExpr::Var(name) => {
                 let lower = name.to_ascii_lowercase();
                 lower == "stack" || lower == "saved_fp" || lower.starts_with("stack_")
@@ -8499,6 +8510,7 @@ impl<'a> FoldingContext<'a> {
 
         quality.node_penalty -= 1;
         match expr {
+            CExpr::External { .. } => {}
             CExpr::Var(name) => {
                 if is_generic_stack_placeholder_alias(name) {
                     quality.generic_stack_penalty -= 8;
@@ -10121,6 +10133,7 @@ impl<'a> FoldingContext<'a> {
         }
 
         match expr {
+            CExpr::External { .. } => return expr.clone(),
             CExpr::Var(name) => {
                 if self.should_preserve_address_like_visible_name(name) {
                     return expr.clone();
@@ -10518,6 +10531,7 @@ impl<'a> FoldingContext<'a> {
         match expr {
             CExpr::IntLit(value) => (*value >= 0).then_some(*value as u64),
             CExpr::UIntLit(value) => Some(*value),
+            CExpr::External { .. } => None,
             CExpr::Var(name) => {
                 if let Some(value) = parse_const_value(name) {
                     return Some(value);
@@ -10858,6 +10872,7 @@ impl<'a> FoldingContext<'a> {
         }
 
         match expr {
+            CExpr::External { .. } => expr.clone(),
             CExpr::Var(name) => {
                 if let Some(value) = parse_const_value(name) {
                     return if value > 0x7fffffff {
@@ -10994,6 +11009,7 @@ impl<'a> FoldingContext<'a> {
         }
 
         match expr {
+            CExpr::External { .. } => false,
             CExpr::Var(name) => is_generic_stack_placeholder_alias(name),
             CExpr::Deref(inner)
             | CExpr::AddrOf(inner)
@@ -11045,6 +11061,7 @@ impl<'a> FoldingContext<'a> {
         }
 
         match expr {
+            CExpr::External { .. } => false,
             CExpr::Var(name) => self.is_transient_visible_name(name),
             CExpr::Deref(inner)
             | CExpr::AddrOf(inner)
@@ -11096,6 +11113,7 @@ impl<'a> FoldingContext<'a> {
         }
 
         match expr {
+            CExpr::External { .. } => false,
             CExpr::Var(name) => Self::is_low_quality_imported_call_arg_name(name),
             CExpr::Deref(inner)
             | CExpr::AddrOf(inner)
@@ -11148,6 +11166,7 @@ impl<'a> FoldingContext<'a> {
 
         match expr {
             CExpr::Call { .. } => true,
+            CExpr::External { .. } => false,
             CExpr::Deref(inner)
             | CExpr::AddrOf(inner)
             | CExpr::Paren(inner)
@@ -11361,6 +11380,7 @@ impl<'a> FoldingContext<'a> {
         }
 
         let resolved = match expr {
+            CExpr::External { .. } => expr.clone(),
             CExpr::Var(name) => {
                 if let Some(source_call) = self
                     .prepared_semantic_view()
@@ -13380,7 +13400,10 @@ impl<'a> FoldingContext<'a> {
                 for input in inputs {
                     args.push(self.get_expr(input));
                 }
-                let call = CExpr::call(CExpr::Var("callother".to_string()), args);
+                let call = CExpr::call(CExpr::External {
+                    name: "callother".to_string(),
+                    kind: crate::symbol::ExternalKind::Intrinsic,
+                }, args);
                 if let Some(dst) = output {
                     let lhs = self.assignment_lhs_expr(dst);
                     Some(CStmt::Expr(CExpr::assign(lhs, call)))
@@ -13390,7 +13413,10 @@ impl<'a> FoldingContext<'a> {
             }
             SSAOp::CpuId { dst } => {
                 let call = CExpr::call(
-                    CExpr::Var("callother".to_string()),
+                    CExpr::External {
+                    name: "callother".to_string(),
+                    kind: crate::symbol::ExternalKind::Intrinsic,
+                },
                     vec![CExpr::StringLit("cpuid".to_string())],
                 );
                 let lhs = self.assignment_lhs_expr(dst);
@@ -13828,7 +13854,10 @@ fn callother_ids_share_effect_and_result_lowering() {
             Some(CStmt::Expr(CExpr::assign(
                 CExpr::Var("x30_1".to_string()),
                 CExpr::call(
-                    CExpr::Var("callother".to_string()),
+                    CExpr::External {
+                    name: "callother".to_string(),
+                    kind: crate::symbol::ExternalKind::Intrinsic,
+                },
                     vec![
                         CExpr::StringLit(format!("userop_{userop}")),
                         CExpr::Var("x30".to_string()),
@@ -13848,7 +13877,10 @@ fn callother_ids_share_effect_and_result_lowering() {
     assert_eq!(
         stmt,
         Some(CStmt::Expr(CExpr::call(
-            CExpr::Var("callother".to_string()),
+            CExpr::External {
+                    name: "callother".to_string(),
+                    kind: crate::symbol::ExternalKind::Intrinsic,
+                },
             vec![
                 CExpr::StringLit(format!("userop_{effect_userop}")),
                 CExpr::Var("x30".to_string()),
