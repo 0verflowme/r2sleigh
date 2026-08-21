@@ -45,12 +45,6 @@ pub(crate) struct PtrArith {
     pub(crate) is_sub: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum UseInfoAnalysisMode {
-    Full,
-    LocalStructAccesses,
-}
-
 #[allow(dead_code)]
 #[derive(Debug, Clone, Default)]
 pub(crate) struct DecompilerFacts {

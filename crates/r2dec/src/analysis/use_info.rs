@@ -14,7 +14,7 @@ use r2types::{
 use super::{
     BaseRef, CallArgBinding, CallArgRole, FrameObjectFieldKey, FrameSlotMergeSummary,
     NormalizedAddr, PassEnv, PtrArith, SSABlock, ScalarValue, SemanticCallArg, SemanticValue,
-    StackSlotProvenance, StackSlotValueKind, UseInfo, UseInfoAnalysisMode, ValueProvenance,
+    StackSlotProvenance, StackSlotValueKind, UseInfo, ValueProvenance,
     ValueRef, lower::LowerCtx, utils,
 };
 use crate::ast::{BinaryOp, CExpr, CType};
@@ -69,13 +69,7 @@ pub(crate) fn analyze_with_control(symbols: &std::cell::RefCell<crate::symbol::S
     env: &PassEnv<'_>,
     control: DecompileWorkControl<'_>,
 ) -> Result<UseInfo, DecompileExecutionStop> {
-    analyze_with_definition_overrides_mode(symbols, 
-        blocks,
-        env,
-        &HashMap::new(),
-        UseInfoAnalysisMode::Full,
-        control,
-    )
+    analyze_with_definition_overrides_with_control(symbols, blocks, env, &HashMap::new(), control)
 }
 
 #[cfg(test)]
@@ -92,13 +86,9 @@ pub(crate) fn analyze_for_local_struct_accesses_with_control(symbols: &std::cell
     env: &PassEnv<'_>,
     control: DecompileWorkControl<'_>,
 ) -> Result<UseInfo, DecompileExecutionStop> {
-    analyze_with_definition_overrides_mode(symbols, 
-        blocks,
-        env,
-        &HashMap::new(),
-        UseInfoAnalysisMode::LocalStructAccesses,
-        control,
-    )
+    let scratch =
+        analyze_value_facts(symbols, blocks, env, &HashMap::new(), control)?;
+    Ok(seal_value_facts(scratch))
 }
 
 #[allow(dead_code)]
@@ -119,22 +109,18 @@ pub(crate) fn analyze_with_definition_overrides_with_control(symbols: &std::cell
     definition_overrides: &HashMap<String, CExpr>,
     control: DecompileWorkControl<'_>,
 ) -> Result<UseInfo, DecompileExecutionStop> {
-    analyze_with_definition_overrides_mode(symbols, 
-        blocks,
-        env,
-        definition_overrides,
-        UseInfoAnalysisMode::Full,
-        control,
-    )
+    let mut scratch =
+        analyze_value_facts(symbols, blocks, env, definition_overrides, control)?;
+    name_values_for_rendering(symbols, &mut scratch, blocks, env, control)?;
+    Ok(seal_value_facts(scratch))
 }
 
-fn analyze_with_definition_overrides_mode(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
+fn analyze_value_facts(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
     blocks: &[SSABlock],
     env: &PassEnv<'_>,
     definition_overrides: &HashMap<String, CExpr>,
-    mode: UseInfoAnalysisMode,
     control: DecompileWorkControl<'_>,
-) -> Result<UseInfo, DecompileExecutionStop> {
+) -> Result<UseScratch, DecompileExecutionStop> {
     control.poll()?;
     let mut scratch = UseScratch::default();
     scratch.info.type_hints = env.type_hints.clone();
@@ -168,16 +154,32 @@ fn analyze_with_definition_overrides_mode(symbols: &std::cell::RefCell<crate::sy
     bind_single_use_call_result_definitions(symbols, &mut scratch, blocks, env);
     propagate_call_result_aliases(symbols, &mut scratch.info, control)?;
     rerun_semantic_call_analysis_after_result_binding(symbols, &mut scratch, blocks, env, control)?;
-    if matches!(mode, UseInfoAnalysisMode::Full) {
-        coalesce_variables(&mut scratch, blocks, env, control)?;
-        pin_aliases_for_pinned_values(&mut scratch.info);
-        build_formatted_defs(symbols, &mut scratch, env);
-    }
+    Ok(scratch)
+}
+
+/// The facts every consumer needs, ready to read.
+fn seal_value_facts(mut scratch: UseScratch) -> UseInfo {
     rebuild_id_mirrors_from_name_maps(&mut scratch.info);
     scratch.info.producers = scratch.producers.clone();
+    scratch.info
+}
 
-    control.poll()?;
-    Ok(scratch.info)
+/// The value facts plus the naming decisions a rendered body needs.
+///
+/// Coalescing and formatting choose how values are spelled, which only a
+/// renderer cares about, so an analysis that just reads structure stops short of
+/// them rather than switching them off.
+fn name_values_for_rendering(
+    symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
+    scratch: &mut UseScratch,
+    blocks: &[SSABlock],
+    env: &PassEnv<'_>,
+    control: DecompileWorkControl<'_>,
+) -> Result<(), DecompileExecutionStop> {
+    coalesce_variables(scratch, blocks, env, control)?;
+    pin_aliases_for_pinned_values(&mut scratch.info);
+    build_formatted_defs(symbols, scratch, env);
+    control.poll()
 }
 
 fn seed_local_value_ids(scratch: &mut UseScratch, blocks: &[SSABlock]) {
