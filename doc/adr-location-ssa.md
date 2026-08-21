@@ -240,6 +240,22 @@ knowledge — argument registers, return registers, caller-saved sets — lives 
 target model supplied by the lifter. Adding an architecture becomes a Sleigh
 specification and a target model, with no renderer change.
 
+The size of that job was overstated in the review this decision came from. The
+378 hardcoded register names it counted are 138 in code and 434 in test fixtures,
+and of the 138 a fifth are already inside `fold/arch.rs`, which is the target
+model in embryo. Three files hold most of the rest: `lib.rs`,
+`analysis/use_info.rs` and `variable.rs`. So this is a bounded change rather than
+a sweep, and the fixtures were noise in that count rather than architecture
+leaking into the renderer.
+
+Deciding what a condition code is belongs here too, and cannot be done before it.
+Both copies of that test asked a list of names, and the surviving one still does.
+Storage would answer it properly — a flag is a one-byte register whose family has
+no wider member, which is arch-neutral and already computable — but several
+callers hold only a name, not the value it names. Threading identity to them is
+the same work as replacing `CExpr::Var(String)`, on the same call chains, so the
+two are one job and not two.
+
 ## Sequence
 
 The ledger comes first. Unifying register and stack recovery in one change is
