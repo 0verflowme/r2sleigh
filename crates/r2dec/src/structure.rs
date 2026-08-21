@@ -135,6 +135,10 @@ pub(crate) struct ControlFlowStructurer<'a, 'o> {
     control_render_proofs: Vec<ControlRenderProof>,
     /// Merge blocks owned by enclosing regions and therefore emitted there.
     deferred_merge_blocks: Vec<u64>,
+    /// Exit targets more than one edge reaches, and the exits that jumped to
+    /// them. Such a block cannot sit at any one exit without saying it runs
+    /// once per edge, so it is written once after the body instead.
+    deferred_shared_exits: BTreeMap<u64, BTreeSet<u64>>,
     /// Exact lexical control-domain alternatives currently being emitted.
     /// A labeled side entry can join another certified alternative without
     /// weakening the domain checks for downstream blocks.
@@ -413,6 +417,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             safety_reason: None,
             control_render_proofs: Vec::new(),
             deferred_merge_blocks: Vec::new(),
+            deferred_shared_exits: BTreeMap::new(),
             active_domains: vec![RenderedBlockDomain::default()],
             rendered_block_domains: BTreeMap::new(),
             structured_region_blocks: BTreeSet::new(),
@@ -446,6 +451,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             safety_reason: None,
             control_render_proofs: Vec::new(),
             deferred_merge_blocks: Vec::new(),
+            deferred_shared_exits: BTreeMap::new(),
             active_domains: vec![RenderedBlockDomain::default()],
             rendered_block_domains: BTreeMap::new(),
             structured_region_blocks: BTreeSet::new(),
@@ -721,6 +727,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         };
         self.structured_region_blocks = region.blocks().into_iter().collect();
         let stmt = self.structure_region(&region);
+        let stmt = self.append_deferred_shared_exits(stmt);
         self.validate_rendered_block_domain_coverage();
         if self.safety_reason.is_some() {
             return CStmt::Empty;
@@ -1059,6 +1066,30 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                             // refusing the whole function for want of a label,
                             // and the walk takes only blocks this edge alone
                             // reaches, so nothing is duplicated or reordered.
+                            // The exit runs into a block several edges reach.
+                            // It cannot go here, but it can go once after the
+                            // body, with every exit saying what it brought and
+                            // jumping to it.
+                            if !self.structured_region_blocks.contains(target)
+                                && self.func.predecessors(*target).len() > 1
+                                && let Some(writes) =
+                                    self.shared_exit_merge_writes(*target, *source)
+                            {
+                                let label = self.ensure_label(*target);
+                                self.deferred_shared_exits
+                                    .entry(*target)
+                                    .or_default()
+                                    .insert(*source);
+                                if !self.record_transfer_target_domain(*loop_header, *target) {
+                                    return CStmt::Empty;
+                                }
+                                if writes.is_empty() {
+                                    return CStmt::Goto(label);
+                                }
+                                let mut stmts = writes;
+                                stmts.push(CStmt::Goto(label));
+                                return CStmt::Block(stmts);
+                            }
                             match self.exit_continuation_stmt(*target) {
                                 Ok(stmt) => return stmt,
                                 // Two walks refused this edge: the one looking
@@ -1364,6 +1395,125 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
     }
 
     /// Structure a single basic block.
+    /// Write the blocks that several exits share, once, after the body.
+    ///
+    /// A block more than one edge reaches cannot go at either of them: put it
+    /// at one and the other cannot reach it, put it at both and it runs twice.
+    /// Written once at the end with a label, every exit jumps to it and it runs
+    /// where all of them agree it does.
+    fn append_deferred_shared_exits(&mut self, stmt: CStmt) -> CStmt {
+        if self.deferred_shared_exits.is_empty() {
+            return stmt;
+        }
+        let deferred = std::mem::take(&mut self.deferred_shared_exits);
+        let mut stmts = Vec::new();
+        Self::append_stmt_body_flat(&mut stmts, stmt);
+        for (target, jumped_from) in deferred {
+            let predecessors = self
+                .func
+                .predecessors(target)
+                .into_iter()
+                .collect::<BTreeSet<_>>();
+            // Nothing may fall into it: an edge left as ordinary control flow
+            // expects the block where it already sits.
+            if !predecessors.is_subset(&jumped_from) {
+                self.safety_reason = Some(format!(
+                    "shared exit block 0x{target:x} is also reached by control this did not lower"
+                ));
+                return CStmt::Empty;
+            }
+            // The head is reached by several edges -- that is why it is here
+            // rather than at one of them -- so the walk starts past it.
+            let (chain, rejoin) = match self.shared_exit_chain(target) {
+                Ok(walked) => walked,
+                Err(reason) => {
+                    self.safety_reason = Some(reason.unwrap_or_else(|| {
+                        format!("shared exit block 0x{target:x} could not be placed")
+                    }));
+                    return CStmt::Empty;
+                }
+            };
+            for addr in &chain {
+                self.structured_region_blocks.insert(*addr);
+            }
+            for addr in &chain {
+                let block_stmt = self.structure_block(*addr);
+                if !matches!(block_stmt, CStmt::Empty) {
+                    stmts.push(block_stmt);
+                }
+            }
+            if let Some(rejoin) = rejoin {
+                let label = self.ensure_label(rejoin);
+                stmts.push(CStmt::Goto(label));
+            }
+        }
+        match stmts.len() {
+            0 => CStmt::Empty,
+            1 => stmts.remove(0),
+            _ => CStmt::Block(stmts),
+        }
+    }
+
+    /// The blocks a shared exit runs through, starting at the shared head.
+    ///
+    /// Everything after the head is the ordinary single-edge case, so only the
+    /// head is taken on trust, and only because several exits jumping to it is
+    /// what put it here.
+    fn shared_exit_chain(&self, target: u64) -> Result<(Vec<u64>, Option<u64>), Option<String>> {
+        if self.func.get_block(target).is_none() {
+            return Err(None);
+        }
+        let mut chain = vec![target];
+        match self.func.successors(target).as_slice() {
+            [] => Ok((chain, None)),
+            [next] => {
+                if self.structured_region_blocks.contains(next) {
+                    return Ok((chain, Some(*next)));
+                }
+                let (rest, rejoin) = self.exit_continuation_chain(*next)?;
+                chain.extend(rest);
+                Ok((chain, rejoin))
+            }
+            _ => Err(Some(format!(
+                "shared exit block 0x{target:x} branches where the exits join"
+            ))),
+        }
+    }
+
+    /// What one exit has to write before jumping to a block it shares.
+    ///
+    /// The block merges values, and which value arrives depends on which edge
+    /// came in. Moving the block out from under its edges loses that, unless
+    /// each edge says on its way out which value it brought. That is what the
+    /// merge meant, written where the edge is.
+    ///
+    /// Nothing is written if either side renders as a carrier rather than a
+    /// name the function declares, because an assignment between carriers says
+    /// nothing a reader can follow.
+    fn shared_exit_merge_writes(&self, target: u64, source: u64) -> Option<Vec<CStmt>> {
+        let block = self.func.get_block(target)?;
+        let mut writes = Vec::new();
+        for phi in &block.phis {
+            let value = phi
+                .sources
+                .iter()
+                .find_map(|(pred, value)| (*pred == source).then_some(value))?;
+            let target_name = self.fold_ctx.var_name(&phi.dst);
+            let value_name = self.fold_ctx.var_name(value);
+            if crate::analysis::utils::is_temporary_or_constant_name(&target_name) {
+                return None;
+            }
+            if target_name == value_name {
+                continue;
+            }
+            writes.push(CStmt::Expr(CExpr::assign(
+                CExpr::Var(target_name),
+                CExpr::Var(value_name),
+            )));
+        }
+        Some(writes)
+    }
+
     fn structure_block(&mut self, addr: u64) -> CStmt {
         if self.is_unresolved_indirect_dispatch_block(addr) {
             // Where this block goes was never recovered, so there is no shape
