@@ -46,6 +46,7 @@ pub mod region;
 pub(crate) mod registers;
 pub(crate) mod single_evaluation;
 pub mod structure;
+pub mod symbol;
 pub(crate) mod unrendered;
 pub mod variable;
 
