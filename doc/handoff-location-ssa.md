@@ -698,3 +698,56 @@ treats overlapping register names as independent variables. Fix that at
 construction and the pass narrows to genuine width repair -- and *then* it is
 conditional, on the property step 4 assumed it already had.
 
+### Step 6: two of three landed, and what budget-as-ledger actually costs
+
+**Target model extraction.** Signature inference chose its argument and result
+registers with `ptr_bits == 64`, which is System V AMD64 for every 64-bit target,
+so arm64 was told to look for parameters in `rdi`. The lifter already states the
+convention; `SourceMachineContext` now answers `argument_register_names()` and
+`register_name()`, and a probe confirms it holds `x0..x7` on arm64 and
+`rdi..r9` on x86-64. `VariableRecovery::new` carried the same table inferred the
+same way and had no production caller, so it is gone.
+
+**Flag demotion.** The ADR's rule -- a flag is a one-byte register no wider
+register contains -- is now computed from the register file rather than listed.
+Measured, the list it replaces was wrong in both directions: it missed
+`shift_carry` on arm64 and `c0`-`c3` on x86, and carried `nf` and `vf` that this
+arm64 specification does not use. It also held both architectures' spellings at
+once, and one test depended on exactly that, reading arm64 condition codes from
+an x86-64 context.
+
+One caller keeps the list. `is_call_arg_transient_name` tests for a flag beside
+`starts_with("eax")`, `"rax"`, `"ecx"` and a dozen more x86 spellings; threading
+the target into it opens a nine-function cascade, and converting the flag line
+alone would leave the predicate no more arch-neutral than it is. That whole
+predicate is one job.
+
+**Budget-as-ledger is not a bookkeeping change.** `RefusalReason::BudgetExhausted`
+exists in the ledger and is constructed nowhere -- a declared bucket nothing
+fills. The reason is structural: a phase that runs out of budget returns
+`DecompileExecutionStop`, `render_engine_decompile_request` returns
+`Result<Rendered, Stop>`, and the engine discards the output and refuses the
+whole function. There is no partial rendering to attribute obligations against,
+and no ledger at all, because the ledger is built during the render that was
+thrown away.
+
+The complexity ceiling is the same shape and is easy to measure. A
+straight-line function of 120 statements:
+
+    /* r2dec fallback: skipped decompilation for fcn_188
+       (decompile complexity limit exceeded: blocks=1/200 ops=1634/512) */
+
+One basic block, 1634 lifted ops, nothing rendered. This is the case the ADR
+means by "refuses ordinary code".
+
+Deleting the ceiling is not the fix on its own. Cost is otherwise bounded only by
+a deadline, and the deadline is optional -- `payload.timeout_us` may be zero, in
+which case nothing bounds the work. So the honest sequence is: make rendering
+able to stop and keep what it has, attribute the undischarged obligations as
+`Refused { layer, BudgetExhausted }`, and only then delete the ceiling. The first
+of those changes `render_engine_decompile_request`'s contract from
+`Result<Rendered, Stop>` to a rendering plus a stop, which reaches every caller.
+
+That is a design decision about the render boundary, not a mechanical change, and
+it is the next thing this work needs.
+
