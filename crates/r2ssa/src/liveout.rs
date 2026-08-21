@@ -41,9 +41,44 @@ impl FunctionLiveOut {
             if !returns {
                 continue;
             }
-            let mut found = false;
-            // The last write in the block wins, because that is what the caller
-            // sees; a merge at the head only reaches the exit if nothing overwrote it.
+            // A returning block often holds no write to the return register at
+            // all: the value was produced in the block before it, and a single
+            // edge needs no merge to carry it across. Looking only here is what
+            // made a function with an early-return arm report one live value and
+            // one unresolved block, and left the value the loop computed
+            // observed by nothing.
+            if !live.collect_reaching(func, graph, abi, block.addr) {
+                live.unresolved.insert(block.addr);
+            }
+        }
+        live
+    }
+
+    /// Find what reaches a returning block in the return registers, walking back
+    /// through predecessors until each path names a definition.
+    ///
+    /// The walk stops on a path as soon as that path defines the register, so a
+    /// join is answered by its merge rather than by whatever lies beyond it, and
+    /// a block already visited is not walked twice.
+    fn collect_reaching(
+        &mut self,
+        func: &SSAFunction,
+        graph: &SsaGraph,
+        abi: &AbiProfile,
+        from: u64,
+    ) -> bool {
+        let mut found = false;
+        let mut seen = BTreeSet::new();
+        let mut pending = std::collections::VecDeque::from([from]);
+        while let Some(addr) = pending.pop_front() {
+            if !seen.insert(addr) {
+                continue;
+            }
+            let Some(block) = func.get_block(addr) else {
+                continue;
+            };
+            let mut defined_here = false;
+            // The last write wins, because that is what the caller sees.
             for op in block.ops.iter().rev() {
                 let Some(dst) = op.dst() else {
                     continue;
@@ -52,7 +87,8 @@ impl FunctionLiveOut {
                     continue;
                 }
                 if let Some(value) = graph.value_id_for_var(dst) {
-                    found |= live.values.insert(value);
+                    defined_here = true;
+                    found |= self.values.insert(value);
                 }
             }
             for phi in &block.phis {
@@ -67,17 +103,18 @@ impl FunctionLiveOut {
                     continue;
                 }
                 if let Some(value) = graph.value_id_for_var(&phi.dst) {
-                    found |= live.values.insert(value);
+                    defined_here = true;
+                    found |= self.values.insert(value);
                 }
             }
-            // A returning block that neither defines nor merges a return register
-            // is answered by a predecessor, which this pass does not walk. Saying
-            // so is better than reporting an empty set as though it were an answer.
-            if !found {
-                live.unresolved.insert(block.addr);
+            if defined_here {
+                continue;
+            }
+            for predecessor in func.predecessors(addr) {
+                pending.push_back(predecessor);
             }
         }
-        live
+        found
     }
 
     /// Whether the caller reads this value once the function returns.

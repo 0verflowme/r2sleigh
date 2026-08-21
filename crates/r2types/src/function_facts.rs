@@ -4129,6 +4129,12 @@ fn prepared_render_facts(prepared: &r2ssa::SsaArtifact) -> FunctionRenderFacts {
             }
         }
     }
+    // Whether a carrier is part of the program is a question about the program,
+    // and r2ssa is what answers those. Asking instead whether the phi sits in a
+    // backward slice from the roots certified so far made publication depend on
+    // what else had been certified, so a carrier whose only consumer was the
+    // function's own result vanished whenever the return went uncertified.
+    let unobserved = prepared.unobserved_merges();
     let mut carrier_edge_roots = Vec::new();
     let mut carrier_identity_values = BTreeSet::new();
     for carrier in prepared
@@ -4136,7 +4142,7 @@ fn prepared_render_facts(prepared: &r2ssa::SsaArtifact) -> FunctionRenderFacts {
         .loops
         .values()
         .flat_map(|loop_fact| loop_fact.carriers.iter())
-        .filter(|carrier| observable_values.contains(&carrier.phi))
+        .filter(|carrier| !unobserved.contains(carrier.phi))
     {
         carrier_identity_values.extend(carrier.identity_values.iter().copied());
         carrier_edge_roots.extend(carrier.entries.iter().map(|entry| entry.value));
