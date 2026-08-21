@@ -320,7 +320,18 @@ I could not dump the lifted p-code for that address to prove it: `sla.opvals`,
 `sla.regs` and `sla.mem` all print nothing there, so the size of the lifted
 writes is unverified.
 
-Verify that before building anything. If the writes and the read do differ in
+**The inspection commands print nothing, which blocks this and probably more.**
+`sla.json`, `sla.info`, `sla.opvals`, `sla.regs`, `sla.mem`, `sla.defuse`,
+`sla.defuse.func`, `sla.ssa.func` and `sla.slice` all produce empty output, with
+and without `aaa` first, at a function start and at a single instruction. They
+exit zero and say nothing -- the same silent-failure shape `sla.dec` has, where
+the command is registered and answers with an empty string rather than refusing.
+
+That is worth fixing before the lane work, not after: without a way to see the
+lifted p-code there is no way to check what the SSA actually did, and every
+question like this one has to be answered by reading code instead of by looking.
+
+Verify the size question before building anything. If the writes and the read do differ in
 size, the fix is that a read is satisfied by writes overlapping its location
 range rather than matching its storage exactly, which is the sub-range model. If
 they do not, the cause is elsewhere and the lane model will not address it.
