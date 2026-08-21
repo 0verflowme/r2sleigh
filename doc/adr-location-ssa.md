@@ -687,6 +687,35 @@ the only decomposition left worth having. It is not a deletion:
 and fires on `tests/gold/flag_materialisation.c`, so it earns its keep on code
 the old corpus could not see.
 
+### Where the table lives
+
+The ownership question is the part that needed deciding rather than typing, and
+it decides cleanly once the passes are listed.
+
+Everything that runs after folding takes `&mut CFunction`: renaming, spelling
+names as C, declaring carriers, marking undeclared names, pruning labels, noting
+the proof. So `CFunction` owns the `SymbolTable` and all of them have it for
+free, with no threading at all.
+
+Only the fold-time half needs anything. `FoldingContext` builds expressions
+before a `CFunction` exists, so it holds the table during folding and hands it
+over when the function is constructed. Its builders take `&self`, so the field is
+a `RefCell`, and minting has to borrow, insert and drop inside one expression --
+a borrow held across a nested build would panic, and nested builds are the norm
+there. That is the one hazard in this design and it is avoidable by keeping
+`fn sym(&self, name) -> SymbolId` a single statement.
+
+Two other holders need a reference rather than ownership. `LowerCtx` already
+carries `var_aliases` as a borrowed map and gains the table beside it, covering
+the fifty sites in `analysis/lower.rs`. `PassEnv` already carries
+`carrier_aliases` the same way and covers the fifty-nine in
+`analysis/use_info.rs`. Both are borrowed views built per call, so neither needs
+a lifetime it does not already have.
+
+That accounts for every site: 315 reached through `FoldingContext`, 109 through
+those two borrowed views, and the remainder in files that already hold a
+`CFunction`.
+
 Run both corpora after any change here. The hash functions measure loop carriers
 and returns; the flag fixture measures condition codes, and neither sees what the
 other does. Compare rendered obligations as a share of the total and only when
