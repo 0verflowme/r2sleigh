@@ -100,8 +100,8 @@ invisible until the types finally differed. Expect more of these.
 ## Where the tree stands
 
 `cargo build --workspace` is clean. `cargo test -p r2dec --lib` runs:
-**685 pass, 21 fail**, down from 83 failures when the suite first compiled.
-Twenty-five commits from `763b28d`, net negative line count.
+**689 pass, 17 fail**, down from 83 failures when the suite first compiled.
+Thirty commits from `763b28d`, net negative line count.
 
 ### An identifier now says which table issued it
 
@@ -132,15 +132,29 @@ reach output or disturb determinism — check that again before adding a field.
 - `make_ctx` in the `lower` tests leaked a table of its own while the fixtures
   declared into another.
 
-### The 21 that remain
+### The 17 that remain
 
-- **7 cross-table reads**, each now naming both tables in its panic, in
-  `fold::op_lower::tests` and the `lib.rs` test module. Same shape as the four
-  above: find which table the code under test reads, and declare into it.
-- **about 14 real assertion failures.** These are the interesting ones. At least
-  three concern semantic member access failing to stay rooted at `argN`, which
-  may be a genuine regression rather than a fixture problem. Diagnose before
-  assuming they are migration debris.
+- **3 cross-table reads** in `fold::op_lower::tests`:
+  `call_source_proof_raw_owner_recovery_rejects_alias_owner_without_function_facts`,
+  `certified_call_result_owner_alias_requires_certified_stack_identity`, and
+  `final_call_normalization_uses_typed_printf_identity_not_rendered_name`. Each
+  panic names both tables. These three are harder than the ones already fixed:
+  the fixture builds a `PreparedSemanticView` *before* the context that will
+  read it exists, so the context cannot adopt the fixture's table and the
+  fixture cannot declare into the context's. Threading the table into
+  `make_*_ctx_with_prepared` was tried and does not resolve it, because the
+  reader is a later context still. The honest fix is probably for the fixture
+  builders to take a table and for one table to span the whole test, matching
+  what `build_function_internal_with_control` does in a real run.
+
+- **4 in `single_evaluation::tests`** and **10 in `fold::op_lower::tests`** that
+  are real assertion failures, not panics. Several concern semantic member
+  access and indexed-member recovery — `test_semanticize_raw_subscript_recovers_exact_indexed_field_from_layout`,
+  `test_observed_x86_positive_index_folded_return_promotes_to_subscript`, and
+  neighbours. **Diagnose these before assuming they are migration debris.** A
+  member access failing to stay rooted at `argN` is the shape of a genuine
+  regression, and the branding work above proved that assumptions about this
+  migration being cosmetic have been wrong before.
 
 ## What is left
 
