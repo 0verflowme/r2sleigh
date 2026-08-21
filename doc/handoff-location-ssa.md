@@ -328,11 +328,29 @@ The write and the read are the same storage: offset 4992, size 16, both. Nothing
 is being split into lanes and nothing differs in width, so the sub-range model
 would not change this case.
 
-What is actually happening is the dangling-read defect: the function refuses 9
-of 174 obligations and leaves 25 unaccounted, and the definitions of those xmm6
-values are among what did not survive. The read is rendered, its definition is
-not, and the name has nothing behind it. Chase the dropped definition, not the
-lane model.
+What is actually happening is an elided copy whose readers were not rewritten,
+and the p-code shows the whole chain:
+
+    0x3e7  movdqa %xmm2, %xmm6   ->  Copy   dst XMM6, src XMM2
+    0x3eb  pxor   %xmm4, %xmm6   ->  IntXor dst XMM6, a XMM6, b XMM4
+
+The `IntXor` renders: the body contains `xmm6_15 = xmm2_6 ^ *0xa70;`. The `Copy`
+does not, and its readers still name what it defined -- `callother("userop_193",
+xmm1_3, xmm6_5, xmm2_4)` reads `xmm6_5`, which the elided copy was going to
+produce. Every missing version is a copy destination; every rendered one is the
+result of real arithmetic.
+
+`use_info` records `dst -> src` for every `SSAOp::Copy` in `copy_sources`
+(around line 2473), and `resolve_copy_root_name_in_fold` walks that chain to the
+root. So the machinery to rewrite the reader exists. What to check is whether
+the `callother` argument lowering asks it: if a copy is dropped as redundant and
+its uses are not resolved to the copy root, the use is left naming a definition
+that no longer exists.
+
+That is the dangling-read defect, and it is worth more than the lane model,
+because it also explains the duplicated statements around it: the same
+`callother(...)` appears once as an assignment right-hand side and again as a
+bare statement, so the effect is rendered twice.
 
 **How to look.** The inspection commands need the `a:` prefix and the debug
 namespace: `a:sla.debug.json`, `a:sla.debug.info`, `a:sla.debug.arch`. Bare
