@@ -462,3 +462,63 @@ Three habits would have caught all of it:
 
 Commit continuously. Every restore in this session came from a commit, which is
 why nothing was lost.
+
+### The dangling reads are two spellings of one location
+
+The x86 fixture is gone, but the defect reproduces on ARM from a three-function
+C file compiled at `-O2`, in `sym._xor_lanes`, which renders lines like
+
+    r5204 = ((r5004_1 | (r5204 | r5084)) < reg_5084) * ~0;
+
+Note `r5084` and `reg_5084` in one expression: two spellings of the storage at
+register-space offset 0x5084.
+
+Instrumenting the definition lookup settles what is happening:
+
+    defprobe r5204_2:   hit=false  keys=["reg:5204_2"]
+    defprobe reg:5204_2: hit=true  keys=["reg:5204_2"]
+
+Same location, same SSA version, two strings. `UseInfo::definitions` is keyed by
+`SSAVar::display_name()`, which spells an unnamed register `reg:5204`. The
+renderer spells the same thing `r5204`, because `ssa_render_base_name` rewrites
+a hex register alias to an identifier C will accept. Asking the definition table
+with the rendered spelling therefore misses a definition that is sitting in it.
+
+This is the three-way name distinction the migration is named for, showing up as
+a defect: an SSA display name is a side-table key, a rendered spelling is what
+goes on the page, and the two must not be confused. Nine call sites did confuse
+them, in the form `definition_for_name(&self.spelling(*name))` -- take a
+`SymbolId`, read the string it renders as, use that string as an SSA key.
+
+**Do not conclude from this that the whole defect is explained.** Two separate
+things are true and only the first is proven:
+
+  * `reg:5204` **is** defined and the rendered spelling misses it.
+  * `reg:5084` is **not** defined at all -- no SSA op anywhere in the function
+    writes it. The definition keys for this function cover 0x5001-0x5010 and
+    0x5018 byte by byte for the first four register slots, and only the 8-byte
+    halves at +0x10 and +0x18 for slots four through seven. Nothing writes
+    0x5080-0x508f. That is an upstream gap in the lift or in SSA construction,
+    not a naming problem, and it is what the visible `r5084` reads come from.
+
+### An identity-keyed lookup was built and then reverted
+
+Recording the SSA display name on the `Symbol` at mint time and querying with it
+(`Symbol::ssa_name`, `sym_for_var`, `definition_for_symbol`) is the right shape,
+and it compiles and passes all 2417 tests. It was reverted because it is inert:
+instrumenting it shows it fires only for parameters at version 0, where both the
+spelling and the SSA name correctly have no definition.
+
+    symprobe arg3 vs X3_0: byspelling=false byssa=false
+
+The rendered-spelling lookup that actually misses (`r5204_2`) never reaches
+those nine call sites -- it arrives through a caller that passes a bare `&str`
+rather than a `SymbolId`, and that caller has not been found yet. Every raw-name
+site inspected so far (`should_inline`, `is_simple_inline_candidate`, the
+`lookup_definition` chain) correctly passes `var.display_name()`.
+
+**Next step:** find the caller that reaches `definition_for_name` holding a
+rendered spelling. A backtrace from inside the lookup, gated on the name not
+being a key of `definitions`, will name it in one run. Then the identity-keyed
+lookup above can be re-landed with a case that proves it.
+
