@@ -1205,6 +1205,8 @@ mod tests {
         );
 
         let mut codegen = CodeGenerator::new(CodeGenConfig::default());
+        // The generator renders from the table the fixture declared into.
+        codegen.symbols = symbols.borrow().clone();
         let code = codegen.generate_stmt(&stmt);
 
         assert!(code.contains("if (x > 0)"));
@@ -1392,7 +1394,7 @@ mod tests {
     #[test]
     fn test_coalesces_adjacent_scalar_self_updates() {
         let symbols = test_table();
-        let func = CFunction::new("updates", CType::Void).with_body(vec![
+        let mut func = CFunction::new("updates", CType::Void).with_body(vec![
             CStmt::expr(CExpr::assign(
                 CExpr::var(crate::symbol::declare(&symbols, "acc")),
                 CExpr::binary(BinaryOp::Add, CExpr::var(crate::symbol::declare(&symbols, "acc")), CExpr::int(3)),
@@ -1407,6 +1409,7 @@ mod tests {
             )),
             CStmt::Return(None),
         ]);
+        func.symbols = symbols;
 
         let code = generate(&func);
 
@@ -1420,7 +1423,7 @@ mod tests {
     #[test]
     fn test_scalar_self_update_coalesce_stops_at_observable_statement() {
         let symbols = test_table();
-        let func = CFunction::new("updates", CType::Void).with_body(vec![
+        let mut func = CFunction::new("updates", CType::Void).with_body(vec![
             CStmt::expr(CExpr::assign(
                 CExpr::var(crate::symbol::declare(&symbols, "acc")),
                 CExpr::binary(BinaryOp::Add, CExpr::var(crate::symbol::declare(&symbols, "acc")), CExpr::int(1)),
@@ -1435,6 +1438,7 @@ mod tests {
                 CExpr::binary(BinaryOp::Add, CExpr::var(crate::symbol::declare(&symbols, "acc")), CExpr::int(3)),
             )),
         ]);
+        func.symbols = symbols;
 
         let code = generate(&func);
 
