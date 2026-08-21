@@ -3830,59 +3830,12 @@ fn is_flag_base_name(name: &str) -> bool {
     )
 }
 
-/// Check if a name is a CPU flag that should be eliminated when unused.
-pub(crate) fn is_cpu_flag(name: &str) -> bool {
-    // Match exact flag names
-    if matches!(
-        name,
-        "cf" | "pf"
-            | "af"
-            | "zf"
-            | "sf"
-            | "of"
-            | "cy"
-            | "zr"
-            | "ng"
-            | "ov"
-            | "nf"
-            | "vf"
-            | "df"
-            | "tf"
-            | "if"
-            | "iopl"
-            | "nt"
-            | "rf"
-            | "vm"
-            | "ac"
-            | "vif"
-            | "vip"
-            | "id"
-            | "tmpcy"
-            | "tmpzr"
-            | "tmpng"
-            | "tmpov"
-    ) {
-        return true;
-    }
-
-    // Also match versioned flags (e.g., cf_1, zf_2)
-    name.starts_with("cf_")
-        || name.starts_with("pf_")
-        || name.starts_with("af_")
-        || name.starts_with("zf_")
-        || name.starts_with("sf_")
-        || name.starts_with("of_")
-        || name.starts_with("cy_")
-        || name.starts_with("zr_")
-        || name.starts_with("ng_")
-        || name.starts_with("ov_")
-        || name.starts_with("nf_")
-        || name.starts_with("vf_")
-        || name.starts_with("tmpcy_")
-        || name.starts_with("tmpzr_")
-        || name.starts_with("tmpng_")
-        || name.starts_with("tmpov_")
-}
+/// Whether this name is a condition code.
+///
+/// One list, in `analysis::utils`. This module carried a byte-identical copy of
+/// it, so the two could disagree about what a flag is while every rule here
+/// assumed they could not.
+pub(crate) use crate::analysis::utils::is_cpu_flag;
 
 #[cfg(test)]
 #[path = "tests/flags.rs"]
