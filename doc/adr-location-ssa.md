@@ -438,7 +438,7 @@ the gate on that step rather than an afterthought.
 The branch is long-lived against a tree other sessions edit concurrently, so
 rebases will be frequent and staging must be by explicit path.
 
-## Step four ran its falsification test, and the answer is not yet
+## Step four ran its falsification test, and the answer is no
 
 The sequence says to delete the register-family repair pass once locations
 exist, and that if it is not dead the location model is incomplete. The test was
@@ -456,19 +456,35 @@ source of every `tmp:regalias` identifier that reaches the page: forty-four of
 them in the `-O2` corpus, none without it. On arm64 it is load-bearing, worth six
 points of rendering.
 
-The asymmetry names the rule. A 32-bit register write zeroes the upper half, so
-`RAX = zext(EAX)` is already in the dataflow and the two are one place by a
-relation the SSA can see. The arm64 output shows the other case in the names it
-leaks: `d2` and `q2` are a SIMD lane and the register containing it, genuinely
-overlapping storage at a relation no zero-extension expresses. The pass does real
-work there and busywork everywhere else.
+The first reading of that asymmetry was that the pass is redundant wherever a
+zero-extension already relates the narrow and wide value, and busywork on x86-64
+for that reason. Looking at what it actually leaks says otherwise, and the
+correction matters more than the original claim.
 
-So it does not become deletable, it becomes conditional, on a question the
-location model can already answer. Where storage spans already join the narrow
-and the wide value, the projection restates what the dataflow says and should not
-be inserted. Where they do not, the overlap is real and the projection is what
-expresses it. That is arch-neutral, testable, and the next step rather than a
-deletion.
+Every one of the forty-four is a SIMD lane:
+
+    uint32_t tregalias:1000007c0:2d:0 = (uint32_t)callother("userop_193", xmm1, xmm6_5, xmm2);
+    uint32_t tregalias:1000007c0:2e:0 = (uint32_t)((uint128_t)callother(...) >> 32);
+
+Those extract 32-bit lanes from 128-bit `xmm` registers, which is exactly the
+`d2` and `q2` case on arm64 and nothing to do with sub-register writes. The
+zero-extension case is already handled, by `preserved_narrow_family_roots_for_widening`,
+which keeps the narrow roots alive across a widening write so reading `EAX` after
+`RAX = zext(EAX)` needs no projection at all.
+
+So the pass is doing real work on both architectures, for the one thing that
+genuinely needs it: storage that overlaps at a relation no extension expresses.
+It is not deletable and it is not conditional on spans either. What is wrong is
+narrower and is issue 51: a lane projection reaches the page as an identifier
+instead of rendering as the lane extraction it is. Two of those lines are not
+even valid C, because a name carrying colons reached output without passing the
+identifier sanitiser, which is its own defect.
+
+The location model still has to absorb this, but as lanes rather than as a pass
+to delete: a location is a span of one storage holding one value, and a lane is a
+sub-range of a register that a vector operation writes as a whole. Until locations
+can express a sub-range, the projections are how that is said, and the fix is to
+render them rather than to leak them.
 
 ## Exit criteria
 
