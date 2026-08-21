@@ -11505,14 +11505,14 @@ mod tests {
 
         let cfg_a = ctx_a.to_pass_env();
         let cfg_b = ctx_b.to_pass_env();
-        let info_a = analysis::UseInfo::analyze(&symbols, &blocks, &cfg_a);
-        let info_b = analysis::UseInfo::analyze(&symbols, &blocks, &cfg_b);
+        let info_a = analysis::UseInfo::analyze(&ctx_a.symbols, &blocks, &cfg_a);
+        let info_b = analysis::UseInfo::analyze(&ctx_b.symbols, &blocks, &cfg_b);
         assert_eq!(info_a, info_b, "UseInfo analysis should be deterministic");
     }
 
     #[test]
     fn test_flag_info_transitive_marking_and_guard() {
-        let symbols = test_table();
+
         let edi_0 = make_var("EDI", 0, 4);
         let tmp = make_var("tmp:8300", 1, 4);
         let zf_1 = make_var("ZF", 1, 1);
@@ -11543,8 +11543,8 @@ mod tests {
         let ctx = FoldingContext::new(64);
         let blocks = vec![flag_only_block];
         let cfg = ctx.to_pass_env();
-        let use_info = analysis::UseInfo::analyze(&symbols, &blocks, &cfg);
-        let flag_info = analysis::FlagInfo::analyze(&symbols, &blocks, &use_info, &cfg);
+        let use_info = analysis::UseInfo::analyze(&ctx.symbols, &blocks, &cfg);
+        let flag_info = analysis::FlagInfo::analyze(&ctx.symbols, &blocks, &use_info, &cfg);
         assert!(flag_info.flag_only_values.contains(&tmp.display_name()));
 
         let tmp2 = make_var("tmp:8400", 1, 4);
@@ -11579,14 +11579,14 @@ mod tests {
         let ctx = FoldingContext::new(64);
         let blocks = vec![guarded_block];
         let cfg = ctx.to_pass_env();
-        let use_info = analysis::UseInfo::analyze(&symbols, &blocks, &cfg);
-        let flag_info = analysis::FlagInfo::analyze(&symbols, &blocks, &use_info, &cfg);
+        let use_info = analysis::UseInfo::analyze(&ctx.symbols, &blocks, &cfg);
+        let flag_info = analysis::FlagInfo::analyze(&ctx.symbols, &blocks, &use_info, &cfg);
         assert!(!flag_info.flag_only_values.contains(&tmp2.display_name()));
     }
 
     #[test]
     fn test_stack_info_arg_alias_requires_version_zero() {
-        let symbols = test_table();
+
         let rbp_1 = make_var("RBP", 1, 8);
         let eax_1 = make_var("EAX", 1, 4);
         let addr = make_var("tmp:8500", 1, 8);
@@ -11607,8 +11607,8 @@ mod tests {
         let ctx = FoldingContext::new(64);
         let blocks = vec![block];
         let cfg = ctx.to_pass_env();
-        let use_info = analysis::UseInfo::analyze(&symbols, &blocks, &cfg);
-        let stack_info = analysis::StackInfo::analyze(&symbols, &blocks, &use_info, &cfg);
+        let use_info = analysis::UseInfo::analyze(&ctx.symbols, &blocks, &cfg);
+        let stack_info = analysis::StackInfo::analyze(&ctx.symbols, &blocks, &use_info, &cfg);
 
         assert!(
             !stack_info.stack_arg_aliases.values().any(|v| v == "arg1"),
@@ -11739,7 +11739,7 @@ mod tests {
         };
 
         let fold_blocks: Vec<_> = func.blocks().cloned().collect();
-        let mut info = analysis::UseInfo::analyze(&symbols, &fold_blocks, &env);
+        let mut info = analysis::UseInfo::analyze(&fixture_symbols, &fold_blocks, &env);
         analysis::use_info::annotate_stack_slot_semantics(&symbols, 
             &mut info,
             &func,
