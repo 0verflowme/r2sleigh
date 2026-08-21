@@ -320,7 +320,25 @@ and 579 of them are still in `fold/op_lower/mod.rs` and `fold/flags.rs`. The
 change remains atomic over roughly 750 sites, each needing a decision of the
 kind the thirty arms needed, so it is not something to begin without the room to
 finish it. Demoting flags first would remove the 210 in `flags.rs`, which is the
-only decomposition of it left that is worth anything. Those are the expression builder and the flag machinery, and
+only decomposition of it left that is worth anything.
+
+What demotion cannot be is a deletion, and that was nearly concluded from a
+corpus that could not see the difference. Instrumenting
+`try_reconstruct_condition` over the nine hash functions counts 287 calls and
+zero reconstructions, at either optimisation level on either architecture: it
+walks every expression in every function and never fires. On code written to
+materialise a flag -- a comparison stored as a boolean, a carry consumed by
+arithmetic, a carry propagated across a loop -- it fires, five times on x86-64
+and three on arm64, and is handed a flag expression eighteen times and eight.
+
+So the reconstruction earns its keep on code the corpus does not contain, and
+the corpus has a blind spot rather than the code having dead weight. The cases
+that exposed it are kept in `tests/gold/flag_materialisation.c` so the next
+measurement of this area starts with them.
+
+Demotion therefore means asking whether the predicate facts `r2ssa` already
+computes could deliver those conditions directly, so that nothing downstream has
+to rebuild them. That is the 3,836-line question, not a removal. Those are the expression builder and the flag machinery, and
 step 7 rewrites the first and deletes most of the second, so migrating them
 first is migrating them twice. The symbol table lands in step 1 regardless, so
 every step after it writes against a declared name rather than adding to the
