@@ -295,29 +295,32 @@ function returns in. So with the change:
   do, because a call result then belongs to the result location rather than the
   stack slot a later store puts it in.
 
-I first read that as the two tests being logically incompatible. **That claim is
-not proven and is probably wrong.** The likelier explanation is that threading
-the machine context changed behaviour somewhere in the call-result path -- once
-`is_return_value_register` answers true for the result location, something in
-the return analysis may consume the call result before the stack-owner
-derivation sees it. That would be a defect in the change, not a contradiction
-between the tests.
+**The cause is found, and it was a defect in the change.** The fixture that
+broke declares `SourceFunctionReturn::Void`, and the convention I gave every
+fixture said its result slot is RAX. A write to RAX in a function that returns
+nothing is not a return value, so the call result stopped being attributed to
+the stack slot a later store put it in.
 
-`post_call_stack_store_does_not_fabricate_call_result_owner` reads as: without
-an exact source interface, do not invent a stack owner for a call result; with
-one, derive it. That is consistent with wanting returns to be detectable. So the
-two probably can hold together.
+The two tests are not incompatible. I said they were before checking, and that
+was wrong.
 
-One hypothesis is already eliminated: the fixture arch does define `RIP` at
-`0x30` and the interface does declare it as the return-address storage, so
-`is_control_return_target` still resolves and the `else if` branch that pushes a
-pending return value is not silently dead. Whatever changed is elsewhere.
+It also points at a better source than the convention slot.
+`SourceFunctionInterface::return_kind()` returns `SourceFunctionReturn`, which is
+either `Void` or `Register { storage }` -- the interface states the return
+storage directly, and states its absence. So the predicate should be:
 
-What is needed is to find where the call result stops reaching the stack-owner
-derivation once returns are detected by location, rather than to pick whichever
-fixture arrangement is green. Adding `SsaArtifact::for_decompile_with_convention`
-so fixtures can state what they return in is the mechanical part and works; the
-diagnosis above is the part that was not finished.
+    match interface.return_kind() {
+        SourceFunctionReturn::Void => false,
+        SourceFunctionReturn::Register { storage } => storage.location() == value_location,
+    }
+
+falling back to the convention's `result_slot` only when no interface was
+recovered, the way `return_address_carrier` already falls back from the
+interface to the machine roles. That answers `Void` correctly, needs no
+fixture convention, and removes both spelling tables.
+
+`SsaArtifact::for_decompile_with_convention` was written and works, but on this
+reading it is not needed: the interface the fixtures already build says enough.
 
 ### The SIMD lane defect, located
 
