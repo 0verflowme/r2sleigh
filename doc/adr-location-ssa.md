@@ -657,3 +657,38 @@ wrong.
 The `-O1` FNV-1a 32 case renders its loop body and returns the accumulator. The
 thirty-six-rendering corpus is re-measured, and every rendering that is not
 correct is accounted for by a ledger entry naming the layer that refused it.
+
+## Where to start
+
+Everything still outstanding waits on one change, and three separate attempts
+this session each stopped at it from a different direction. Carrier naming needs
+to know a value's rendered name to tell two variables apart. Deciding what a
+condition code is needs storage where the callers hold only a string. Attributing
+an obligation to the body that rendered it needs the name the output gave a
+value, surviving every renaming pass. All three are the same missing thing.
+
+So the next work is replacing `CExpr::Var(String)` with a symbol reference. It has
+been measured three times and does not decompose: 952 compile errors over roughly
+750 construction sites, 579 of them in `fold/op_lower/mod.rs` and `fold/flags.rs`,
+and no state in between where the tree compiles. Separating `External` out of it
+was worth doing on its own and removed only eighteen of those errors.
+
+Two things learned about how to do it. The sites are not uniform enough to script
+-- a scripted pass produced malformed patterns in five files and was reverted,
+while thirty done by hand took thirty decisions and the compiler caught two of
+them landing on the wrong match. And each site is a decision rather than a
+substitution: renaming skips a name the function does not own, a placeholder test
+answers false for one the renderer never minted, constant folding leaves alone
+what never spelled a constant.
+
+Demoting flags first would remove the 210 sites in `fold/flags.rs`, and that is
+the only decomposition left worth having. It is not a deletion:
+`try_reconstruct_condition` reconstructs nothing across the nine hash functions
+and fires on `tests/gold/flag_materialisation.c`, so it earns its keep on code
+the old corpus could not see.
+
+Run both corpora after any change here. The hash functions measure loop carriers
+and returns; the flag fixture measures condition codes, and neither sees what the
+other does. Compare rendered obligations as a share of the total and only when
+the totals match, because passes that insert operations inflate both sides -- that
+mistake was made twice, once in each direction.
