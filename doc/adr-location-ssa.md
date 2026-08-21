@@ -296,24 +296,43 @@ Live-out therefore comes first within step 7: seed it from the target model's
 return and callee-saved registers, let the existing backward pass carry it, and
 have readership, carrier naming and merge-set reduction all read the one answer.
 
-## What replacing the observable filter showed
+## Moving the observable filter, and what the failures were really about
 
 Step 5 says the observable-reachability filter in `r2types` is a liveness
-decision taken in the wrong layer, and it is. Replacing it with the observation
-set from `r2ssa` was tried and had to come out, because the two are not ordered
-the way the argument assumes: the filter admits carriers the observation set
-does not, and swapping them lost the loop body of a rendered function.
+decision taken in the wrong layer. Replacing it with the observation set from
+`r2ssa` failed twice before it worked, and both failures were the new code
+finding an older defect rather than causing one.
 
-Two things were learned rather than argued. The observation set had been
-treating a load as pure, which is wrong by this project's own accounting -- the
-source obligation inventory carries `ObservableMemoryRead` as something a
-rendering owes, so a load is an event whatever becomes of its result. That is
-fixed. And even corrected, the set is still not a superset of what backward
-reachability from certified roots admits.
+The first was in this design's own accounting: the observation set treated a
+load as pure. The source obligation inventory carries `ObservableMemoryRead` as
+something a rendering owes, so a load is an event whatever becomes of its
+result, and a loop carrying a pointer through a chain of loads was classified as
+observing nothing.
 
-So the filter moves only once the observation set is demonstrably wider than it,
-measured on rendered output rather than reasoned about. Until then the wrong
-layer holding a correct answer beats the right layer holding a narrower one.
+The second was in the live-out pass. A function with an early-return arm
+reported one live value and one returning block it could not resolve. The
+resolved arm wrote its result in the block that returned; the other produced it
+in the block before, and a single edge needs no merge to carry it across. The
+pass looked only at the returning block, said it could not answer rather than
+answering none, and was believed. Walking back through predecessors until each
+path names a definition took that function from one live value to seven and left
+nothing unresolved. Across the corpus the two sets then agreed on every carrier,
+and the filter moved.
+
+Moving it renders three more obligations and leaves one fewer unaccounted. It
+also cost one loop its `for` shape, and tracing that led to a third defect that
+is not this design's: a materialised back-edge copy is emitted even when the
+update it carries was already rendered in place, so a body reads `arg_c =
+arg_c;` and then `arg_c++`. Self-assignments of that form were in the output
+before any of this work, and deleting them at the end would hide the question of
+whether two values wrongly share one name. The copy should not be produced, and
+that belongs to the fold rewrite.
+
+The general lesson is recorded because it cost three reverts to learn: when a
+change that is architecturally right makes something worse, the first move is to
+trace what the failing path actually reads. Twice here the answer was that the
+new code was incomplete, and once it was that something older had been wrong all
+along and nothing had been precise enough to show it.
 
 ## Consequences
 
