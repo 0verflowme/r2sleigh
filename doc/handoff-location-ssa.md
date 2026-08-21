@@ -606,3 +606,24 @@ worse, so the composer stays out of the tree.
 its definition inlined at the mention or has an assignment statement. Then
 re-land the constrained composer, which is already written and measured.
 
+### The phi materialization gate is not the blocker either
+
+`xmm1_3` on x86 is a phi destination, and `collect_definitions` records a
+definition for every op with a `dst` but never for a phi, so a phi that is
+referenced and not materialized is a dangling read by construction. That made
+the third liveness gate in `normalize.rs` the obvious suspect: a phi becomes
+mutable C state only if `render_facts.loop_carrier_for_value` certifies it.
+
+Loosening it to materialize every non-degenerate merge -- every phi whose edges
+do not all carry the same value, which is the honest definition of mutable state
+-- was tried and measured. Defect counts did not move, and rendered obligations
+fell everywhere:
+
+    x86  sym._fnv1a64   111 -> 107 rendered
+    x86  sym._xor_lanes  63 -> 61
+    arm64 sym._fnv1a64    34 -> 32
+    arm64 sym._xor_lanes  72 -> 70
+
+Materializing more merges renders less, so the gate is not what is holding these
+values back. Reverted.
+
