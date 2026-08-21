@@ -2123,6 +2123,8 @@ mod tests {
         );
 
         let mut internal_ctx = FoldingContext::new(64);
+        // Both contexts read one fixture, so one table between them.
+        internal_ctx.symbols = std::rc::Rc::clone(&imported_ctx.symbols);
         let internal_source = (0x1000, 1);
         install_callsite_resolution(
             &mut internal_ctx,
@@ -11483,7 +11485,9 @@ mod tests {
             "one exact source proof still cannot recover a stable owner without FunctionFacts call-result ownership"
         );
 
+        // One fixture read by three contexts, so one table between them.
         let mut ambiguous_ctx = make_aarch64_ctx();
+        ambiguous_ctx.symbols = std::rc::Rc::clone(&exact_ctx.symbols);
         let first_call = (0x1000, 0);
         let second_call = (0x1008, 0);
         ambiguous_ctx
@@ -11515,6 +11519,7 @@ mod tests {
             vec![CExpr::IntLit(1)],
         );
         let mut unresolved_ctx = make_aarch64_ctx();
+        unresolved_ctx.symbols = std::rc::Rc::clone(&exact_ctx.symbols);
         unresolved_ctx
             .state
             .analysis_ctx
