@@ -336,6 +336,18 @@ the corpus has a blind spot rather than the code having dead weight. The cases
 that exposed it are kept in `tests/gold/flag_materialisation.c` so the next
 measurement of this area starts with them.
 
+Running that fixture once found more than it was written to find. A branch is
+dropped: `classify` has four arms in the source and three in the output, with the
+`x > 100` arm absent. A carry flag reaches the page declared and never assigned,
+where the source value is a comparison the reconstruction did not resolve.
+Beside those, a self-and left from `test eax, eax`, a return of `-1` printed as
+`0xffffffff`, and a loop index that does not advance. All of it is issue 63.
+
+The consequence for the rest of this work is that a corpus of nine hash
+functions cannot exercise a condition code, so anything concluded from it about
+flag handling is a statement about the corpus. The verdict on the register-family
+repair pass was taken that way, and should be re-taken here.
+
 Demotion therefore means asking whether the predicate facts `r2ssa` already
 computes could deliver those conditions directly, so that nothing downstream has
 to rebuild them. That is the 3,836-line question, not a removal. Those are the expression builder and the flag machinery, and
