@@ -8837,7 +8837,8 @@ mod tests {
     struct TestEnvFixture {
         function_names: HashMap<u64, String>,
         strings: HashMap<u64, String>,
-        symbols: HashMap<u64, String>,
+        binary_symbols: HashMap<u64, String>,
+        symbols: std::cell::RefCell<crate::symbol::SymbolTable>,
         callee_facts: BTreeMap<u64, r2types::CalleeFact>,
         summary_view: Option<r2types::InterprocSummaryView>,
         arg_regs: Vec<String>,
@@ -8853,7 +8854,8 @@ mod tests {
             Self {
                 function_names: HashMap::new(),
                 strings: HashMap::new(),
-                symbols: HashMap::new(),
+                binary_symbols: HashMap::new(),
+                symbols: std::cell::RefCell::new(crate::symbol::SymbolTable::new()),
                 callee_facts: BTreeMap::new(),
                 summary_view: None,
                 arg_regs: Vec::new(),
@@ -8891,6 +8893,7 @@ mod tests {
                 ret_reg_name: "rax",
                 function_names: &self.function_names,
                 strings: &self.strings,
+                binary_symbols: &self.binary_symbols,
                 symbols: &self.symbols,
                 callee_facts: &self.callee_facts,
                 callee_resolution: None,
@@ -9171,7 +9174,7 @@ mod tests {
         }
         let mut fixture = TestEnvFixture::default();
         fixture
-            .symbols
+            .binary_symbols
             .insert(0x401000, "sym.imp.printf".to_string());
         let env = fixture.env();
         assert!(
@@ -9204,7 +9207,7 @@ mod tests {
 
         let mut fixture = TestEnvFixture::default();
         fixture
-            .symbols
+            .binary_symbols
             .insert(0x401000, "sym.imp.printf".to_string());
         let base_env = fixture.env();
         let env = PassEnv {
@@ -9967,10 +9970,11 @@ mod tests {
         );
 
         let arg = semantic_call_arg_for_var(
+            &fixture.symbols,
             &info,
             &reloaded_home,
-            CExpr::Var(reloaded_home.display_name()),
-            &env,symbols.borrow_mut().declare_or_reuse(&reloaded_home.display_name())
+            crate::symbol::var_ref(&fixture.symbols, reloaded_home.display_name()),
+            &env,
         );
         assert!(
             !matches!(
@@ -9985,46 +9989,48 @@ mod tests {
 
     #[test]
     fn imported_printf_after_helper_call_keeps_forwarded_local_arg_out_of_positive_stack_home() {
-        fn fallback_contains_stack_placeholder(expr: &CExpr) -> bool {
-            let symbols = test_table();
+        fn fallback_contains_stack_placeholder(
+            symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
+            expr: &CExpr,
+        ) -> bool {
             match expr {
                 CExpr::External { .. } => false,
                 CExpr::Var(name) => {
-                    let lower = crate::symbol::spelling(&symbols, *name).to_ascii_lowercase();
+                    let lower = crate::symbol::spelling(symbols, *name).to_ascii_lowercase();
                     lower == "stack" || lower == "saved_fp" || lower.starts_with("stack_")
                 }
                 CExpr::Paren(inner)
                 | CExpr::AddrOf(inner)
                 | CExpr::Deref(inner)
-                | CExpr::Sizeof(inner) => fallback_contains_stack_placeholder(inner),
+                | CExpr::Sizeof(inner) => fallback_contains_stack_placeholder(symbols, inner),
                 CExpr::Cast { expr: inner, .. } | CExpr::Unary { operand: inner, .. } => {
-                    fallback_contains_stack_placeholder(inner)
+                    fallback_contains_stack_placeholder(symbols, inner)
                 }
                 CExpr::Binary { left, right, .. } => {
-                    fallback_contains_stack_placeholder(left)
-                        || fallback_contains_stack_placeholder(right)
+                    fallback_contains_stack_placeholder(symbols, left)
+                        || fallback_contains_stack_placeholder(symbols, right)
                 }
                 CExpr::Subscript { base, index } => {
-                    fallback_contains_stack_placeholder(base)
-                        || fallback_contains_stack_placeholder(index)
+                    fallback_contains_stack_placeholder(symbols, base)
+                        || fallback_contains_stack_placeholder(symbols, index)
                 }
                 CExpr::Member { base, .. } | CExpr::PtrMember { base, .. } => {
-                    fallback_contains_stack_placeholder(base)
+                    fallback_contains_stack_placeholder(symbols, base)
                 }
                 CExpr::Call { func, args } => {
-                    fallback_contains_stack_placeholder(func)
-                        || args.iter().any(fallback_contains_stack_placeholder)
+                    fallback_contains_stack_placeholder(symbols, func)
+                        || args.iter().any(|e| fallback_contains_stack_placeholder(symbols, e))
                 }
                 CExpr::Ternary {
                     cond,
                     then_expr,
                     else_expr,
                 } => {
-                    fallback_contains_stack_placeholder(cond)
-                        || fallback_contains_stack_placeholder(then_expr)
-                        || fallback_contains_stack_placeholder(else_expr)
+                    fallback_contains_stack_placeholder(symbols, cond)
+                        || fallback_contains_stack_placeholder(symbols, then_expr)
+                        || fallback_contains_stack_placeholder(symbols, else_expr)
                 }
-                CExpr::Comma(items) => items.iter().any(fallback_contains_stack_placeholder),
+                CExpr::Comma(items) => items.iter().any(|e| fallback_contains_stack_placeholder(symbols, e)),
                 CExpr::IntLit(_)
                 | CExpr::UIntLit(_)
                 | CExpr::FloatLit(_)
@@ -10121,9 +10127,9 @@ mod tests {
             },
         ]);
 
-        let info = analyze(&symbols, std::slice::from_ref(&block), &env);
+        let info = analyze(&fixture.symbols, std::slice::from_ref(&block), &env);
         let lower = LowerCtx {
-            symbols: &symbols,
+            symbols: &fixture.symbols,
             string_literals: env.string_literals,
             use_info: Some(&info),
             definitions: &info.definitions,
@@ -10154,7 +10160,7 @@ mod tests {
             lower: &lower,
             env: &env,
         };
-        let preserved = preserved_input_binding_from_stack_home(&symbols, 
+        let preserved = preserved_input_binding_from_stack_home(&fixture.symbols, 
             &stack_home_query,
             &reloaded_home,
             reloaded_home_idx,
@@ -10192,7 +10198,7 @@ mod tests {
                     arg: SemanticCallArg::FallbackExpr(expr),
                     ..
                 })
-                    if fallback_contains_stack_placeholder(expr)
+                    if fallback_contains_stack_placeholder(&fixture.symbols, expr)
             ),
             "first post-helper printf arg should not regress to a stack placeholder fallback, got {args:?}"
         );
@@ -11512,7 +11518,7 @@ mod tests {
         assert!(
             match idx_semantic {
                 Some(SemanticValue::Scalar(ScalarValue::Expr(CExpr::Var(name)))) => {
-                    name != "stack" && name != "saved_fp" && !crate::symbol::spelling(&symbols, *name).starts_with("local_")
+                    name != "stack" && name != "saved_fp" && !crate::symbol::spelling(symbols, *name).starts_with("local_")
                 }
                 Some(SemanticValue::Scalar(ScalarValue::Root(value_ref))) => {
                     !value_ref.var.name_kind().is_temporary()

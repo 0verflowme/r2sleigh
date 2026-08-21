@@ -17618,7 +17618,7 @@ mod tests {
             )],
             &r2types::CalleeIdentityContext {
                 function_names: &function_names,
-                binary_symbols: ctx.inputs.binary_symbols,
+                symbols: ctx.inputs.binary_symbols,
                 callee_facts: &callee_facts,
                 known_function_signatures: &known_signatures,
             },

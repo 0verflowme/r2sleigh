@@ -1932,8 +1932,7 @@ impl<'a> FoldingContext<'a> {
             #[cfg(test)]
             function_names: self.inputs.function_names,
             #[cfg(test)]
-            binary_symbols: self.inputs.binary_symbols,
-            symbols: &self.symbols,
+            symbols: self.inputs.binary_symbols,
             callee_facts: self.inputs.callee_facts(),
             known_function_signatures: &normalized,
         };

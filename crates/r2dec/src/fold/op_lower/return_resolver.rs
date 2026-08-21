@@ -1168,7 +1168,7 @@ impl<'a> FoldingContext<'a> {
         let mut visited = HashSet::new();
         let root_name = var.display_name();
         let context = self.return_context_for_name(&root_name);
-        let unresolved = CExpr::Var({ let CExpr::Var(id) = context.name_ref(&self.var_name) else { unreachable!() }; id }(var));
+        let unresolved = self.name_ref(&self.var_name(var));
         let semantic_root = self.semantic_return_candidate_for_name(&root_name);
         let base_root = if let Some(semantic_root) = semantic_root.clone() {
             let best = self
