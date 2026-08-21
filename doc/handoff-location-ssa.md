@@ -247,22 +247,23 @@ could be satisfied by declaring the word. It should be a test.
    what the location model is for, and the machine context reaches the phi
    picker in two hops, which I threaded successfully.
 
-   It does not finish, because **the source contract never captures which
-   location holds a return value.** There is `return_address_storage`,
-   `stack_pointer_storage` and `frame_pointer_storage`, but no
-   return-value storage anywhere in `SourceMachineRoles` or the function
-   interface. Without it the picker cannot ask "is this the return register",
-   and grouping every register phi by location instead changes what the rule
-   means: today a block with `rbx` and `rax` phis answers `rax` because `rbx`
-   is not in the family table, and a location-only rule would see two locations
-   and refuse.
+   It does not finish, because the phi picker cannot reach the location that
+   holds a return value. **The contract already models it**:
+   `SourceConventionSlots::result_slot` is exactly the location the convention
+   leaves a result in, alongside `argument_slots`. What is missing is plumbing --
+   `SourceMachineContext` does not carry the convention slots, so nothing inside
+   `r2ssa::semantic` can ask for them.
 
-   So the first piece of step 3 is a contract change: the source should state
-   the location that carries a return value, the same way it states the one
-   that carries a return address. Then the family table deletes, and it deletes
-   for every architecture rather than eight. Do not paper over the missing
-   contract by loosening the picker -- that trades a hack you can see for one
-   you cannot.
+   Do not work around that by grouping every register phi by location and
+   dropping the return-register test. It changes what the rule means: today a
+   block with `rbx` and `rax` phis answers `rax` because `rbx` is not in the
+   family table, and a location-only rule would see two locations and refuse.
+   That trades a hack you can see for one you cannot.
+
+   So step 3 begins by carrying the convention slots on the machine context.
+   Then the picker asks whether a phi's location is the result slot's location,
+   the family table deletes, and it deletes for every architecture rather than
+   the eight somebody listed.
 4. **Make the repair pass conditional.** Not deletable — it does real work for
    SIMD lanes — but it should not run unconditionally.
 5. Guard that no facts method is shaped like a rendering decision.
