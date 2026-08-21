@@ -139,6 +139,10 @@ pub(crate) struct ControlFlowStructurer<'a, 'o> {
     /// them. Such a block cannot sit at any one exit without saying it runs
     /// once per edge, so it is written once after the body instead.
     deferred_shared_exits: BTreeMap<u64, BTreeSet<u64>>,
+    /// Blocks many branches converge on that no region holds. A region says
+    /// if/else with a merge every path runs through; a block some path steps
+    /// around is neither, so the shape has nowhere to put it.
+    shared_joins: BTreeSet<u64>,
     /// Exact lexical control-domain alternatives currently being emitted.
     /// A labeled side entry can join another certified alternative without
     /// weakening the domain checks for downstream blocks.
@@ -418,6 +422,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             control_render_proofs: Vec::new(),
             deferred_merge_blocks: Vec::new(),
             deferred_shared_exits: BTreeMap::new(),
+            shared_joins: BTreeSet::new(),
             active_domains: vec![RenderedBlockDomain::default()],
             rendered_block_domains: BTreeMap::new(),
             structured_region_blocks: BTreeSet::new(),
@@ -452,6 +457,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             control_render_proofs: Vec::new(),
             deferred_merge_blocks: Vec::new(),
             deferred_shared_exits: BTreeMap::new(),
+            shared_joins: BTreeSet::new(),
             active_domains: vec![RenderedBlockDomain::default()],
             rendered_block_domains: BTreeMap::new(),
             structured_region_blocks: BTreeSet::new(),
@@ -726,7 +732,15 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             }
         };
         self.structured_region_blocks = region.blocks().into_iter().collect();
+        self.shared_joins = self.collect_shared_joins();
+        // The jumps into a shared join need its label, and the jump back out
+        // needs its successor's. Both have to exist before anything is written,
+        // because a block already written can no longer be given one.
+        for join in self.shared_joins.clone() {
+            self.ensure_label(join);
+        }
         let stmt = self.structure_region(&region);
+        let stmt = self.append_shared_joins(stmt);
         let stmt = self.append_deferred_shared_exits(stmt);
         self.validate_rendered_block_domain_coverage();
         if self.safety_reason.is_some() {
@@ -1514,6 +1528,73 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         Some(writes)
     }
 
+    /// The blocks several branches converge on that no region claimed.
+    ///
+    /// A region tree says if/else with a merge every path runs through. A block
+    /// many branches reach but some path steps around is not that, so the tree
+    /// has nowhere to put it and it goes unwritten. It is still part of the
+    /// function, and every edge reaching it agrees where it runs, so it can be
+    /// written once behind a label like any other shared arrival.
+    fn collect_shared_joins(&self) -> BTreeSet<u64> {
+        let mut joins = BTreeSet::new();
+        for addr in self.func.block_addrs().to_vec() {
+            if self.structured_region_blocks.contains(&addr) || self.block_is_proven_dead(addr) {
+                continue;
+            }
+            let predecessors = self.func.predecessors(addr);
+            if predecessors.len() < 2 {
+                continue;
+            }
+            // A jump can only be written where the block doing the jumping is.
+            if !predecessors
+                .iter()
+                .all(|pred| self.structured_region_blocks.contains(pred))
+            {
+                continue;
+            }
+            // The join has to end where it is. A join that carries on needs a
+            // label on whatever it carries on to, and a block the structuring
+            // already wrote cannot be given one afterwards, so the jump out
+            // would name something the function never spells.
+            if !self.func.successors(addr).is_empty() {
+                continue;
+            }
+            // A join merges whatever each edge brought, so every edge has to be
+            // able to say which value that was on its way in.
+            if !predecessors
+                .iter()
+                .all(|pred| self.shared_exit_merge_writes(addr, *pred).is_some())
+            {
+                continue;
+            }
+            joins.insert(addr);
+        }
+        joins
+    }
+
+    /// Write the shared joins after the body, each behind its label.
+    fn append_shared_joins(&mut self, stmt: CStmt) -> CStmt {
+        if self.shared_joins.is_empty() {
+            return stmt;
+        }
+        let joins = std::mem::take(&mut self.shared_joins);
+        let mut stmts = Vec::new();
+        Self::append_stmt_body_flat(&mut stmts, stmt);
+        for addr in joins {
+            self.structured_region_blocks.insert(addr);
+            let mut block_stmts = vec![CStmt::Label(self.ensure_label(addr))];
+            if let Some(block) = self.func.get_block(addr) {
+                block_stmts.extend(self.folded_block_stmts(block, addr));
+            }
+            stmts.push(CStmt::Block(block_stmts));
+        }
+        match stmts.len() {
+            0 => CStmt::Empty,
+            1 => stmts.remove(0),
+            _ => CStmt::Block(stmts),
+        }
+    }
+
     fn structure_block(&mut self, addr: u64) -> CStmt {
         if self.is_unresolved_indirect_dispatch_block(addr) {
             // Where this block goes was never recovered, so there is no shape
@@ -1550,6 +1631,18 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
 
         // Convert operations to statements
         stmts.extend(self.folded_block_stmts(block, addr));
+
+        // Control leaving here for a shared join has no structure to carry it,
+        // so it says what it brought and where it goes.
+        if let [next] = self.func.successors(addr).as_slice()
+            && self.shared_joins.contains(next)
+        {
+            if let Some(writes) = self.shared_exit_merge_writes(*next, addr) {
+                stmts.extend(writes);
+            }
+            let label = self.ensure_label(*next);
+            stmts.push(CStmt::Goto(label));
+        }
 
         if stmts.is_empty() {
             CStmt::Empty
