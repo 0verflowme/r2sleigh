@@ -1471,6 +1471,7 @@ fn obligation_closure(
     prepared: &r2ssa::SsaArtifact,
     proofs: &[crate::fold::context::EffectRenderProof],
     folded_blocks: &std::collections::BTreeSet<u64>,
+    elided_op_sites: &std::collections::BTreeMap<(u64, usize), &'static str>,
 ) -> ObligationClosure {
     use r2ssa::SemanticObligationKind as Kind;
     let obligations = prepared.obligations();
@@ -1487,7 +1488,21 @@ fn obligation_closure(
     // if that block rendered, the values arriving there are the ones the output
     // reads, and the merge is what it read them through.
     let rendered_blocks = folded_blocks;
+    // Same mapping the proofs use, so an elided site and a rendered site are
+    // named the same way and can be compared.
+    let elided_by_reason = elided_op_sites
+        .iter()
+        .filter_map(|((block_addr, op_idx), reason)| {
+            prepared
+                .graph()
+                .inst_id_for_op_site(*block_addr, *op_idx)
+                .map(|inst| (inst, *reason))
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let mut unowned_elided = std::collections::BTreeMap::new();
     let mut closure = ObligationClosure::default();
+    let mut unowned_by_kind = std::collections::BTreeMap::new();
+    let mut unowned_in_rendered_blocks = 0usize;
     for id in obligations.obligations().keys() {
         if matches!(id.kind, Kind::VolatileOrUnknownEffect | Kind::Trap) {
             closure.unsupported += 1;
@@ -1506,9 +1521,91 @@ fn obligation_closure(
         };
         if owned {
             closure.owned += 1;
+        } else {
+            unowned_by_kind
+                .entry(id.kind)
+                .and_modify(|count| *count += 1)
+                .or_insert(1usize);
+            // An obligation in a block that never rendered is missing because
+            // the body is, which is a structuring debt. One in a block that did
+            // render was elided by the fold itself, which is a different debt
+            // and the one worth separating out.
+            if rendered_blocks.contains(&id.instruction.block_addr) {
+                unowned_in_rendered_blocks += 1;
+            }
+            if let Some(reason) = obligations
+                .instructions()
+                .get(&id.instruction)
+                .and_then(|disposition| disposition.source.graph_inst())
+                .and_then(|inst| elided_by_reason.get(&inst))
+            {
+                *unowned_elided.entry(*reason).or_insert(0usize) += 1;
+            }
         }
     }
+    debug_log_unowned_obligations(
+        prepared,
+        &unowned_by_kind,
+        unowned_in_rendered_blocks,
+        &unowned_elided,
+    );
     closure
+}
+
+/// Whether a run was asked to report what the rendering left unaccounted for.
+pub(crate) fn unowned_report_requested() -> bool {
+    static REQUESTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *REQUESTED.get_or_init(|| std::env::var_os("R2SLEIGH_DEBUG_UNOWNED").is_some())
+}
+
+/// Report what a function still owes, grouped by the kind of effect it is.
+///
+/// The closure counts how many obligations went unowned but not what they were,
+/// which says a function is 27% short without saying short of what. Naming the
+/// kinds turns that number into somewhere to look, so it is written out on
+/// request rather than folded into the rendered note, which speaks about the
+/// body rather than about the work left to do on the decompiler.
+fn debug_log_unowned_obligations(
+    prepared: &r2ssa::SsaArtifact,
+    unowned_by_kind: &std::collections::BTreeMap<r2ssa::SemanticObligationKind, usize>,
+    unowned_in_rendered_blocks: usize,
+    unowned_elided: &std::collections::BTreeMap<&'static str, usize>,
+) {
+    if !unowned_report_requested() {
+        return;
+    }
+    let mut counts = unowned_by_kind.iter().collect::<Vec<_>>();
+    // Largest first, and by name where two kinds owe the same amount, so the
+    // report reads the same way twice over the same binary.
+    counts.sort_by(|(left_kind, left), (right_kind, right)| {
+        right
+            .cmp(left)
+            .then_with(|| left_kind.to_string().cmp(&right_kind.to_string()))
+    });
+    let summary = counts
+        .iter()
+        .map(|(kind, count)| format!("{kind}={count}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let elided = unowned_elided
+        .iter()
+        .map(|(reason, count)| format!("unowned-elided-{reason}={count}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let message = format!(
+        "UNOWNED fn={:#x} in-rendered-blocks={unowned_in_rendered_blocks} {elided} {summary}",
+        prepared.function().entry
+    );
+    let path = std::env::var("R2SLEIGH_DEBUG_UNOWNED_LOG")
+        .unwrap_or_else(|_| "/tmp/r2sleigh_unowned.log".to_string());
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        use std::io::Write;
+        let _ = writeln!(file, "{message}");
+    }
 }
 
 /// Why the source obligation inventory cannot account for this function, if it cannot.
@@ -3134,6 +3231,7 @@ impl Decompiler {
             prepared,
             &fold_ctx.effect_render_proofs_since(0),
             &fold_ctx.folded_block_addrs(),
+            &fold_ctx.elided_op_sites(),
         );
         note_unproven_constructs(&mut c_function, Some(closure));
         work.with_phase(DecompileWorkPhase::Rendering).poll()?;

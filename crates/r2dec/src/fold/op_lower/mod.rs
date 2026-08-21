@@ -12223,6 +12223,7 @@ impl<'a> FoldingContext<'a> {
             self.current_op_idx.set(Some(op_idx));
             // Skip stack frame setup/teardown if enabled
             if self.is_stack_frame_op(op) {
+                self.note_elided_op_site(block.addr, op_idx, "stack-frame");
                 continue;
             }
 
@@ -12531,6 +12532,7 @@ impl<'a> FoldingContext<'a> {
             // Skip operations that produce dead values
             if let Some(dst) = op.dst() {
                 if self.is_dead(dst) {
+                    self.note_elided_op_site(block.addr, op_idx, "dead-value");
                     continue;
                 }
 

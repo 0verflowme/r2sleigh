@@ -191,6 +191,12 @@ pub(crate) struct FoldingContext<'a> {
     pub(crate) effect_render_proofs: std::cell::RefCell<Vec<EffectRenderProof>>,
     /// Blocks the fold walked, which is what expresses a merge standing at their head.
     pub(crate) folded_blocks: std::cell::RefCell<std::collections::BTreeSet<u64>>,
+    /// Op sites the fold dropped without recording that anything rendered them,
+    /// keyed by why. An accounting of what the output owes reads these as debts
+    /// it never paid, so knowing which are deliberate is what separates a
+    /// rendering gap from a bookkeeping one.
+    pub(crate) elided_op_sites:
+        std::cell::RefCell<std::collections::BTreeMap<(u64, usize), &'static str>>,
 }
 
 impl FoldArchConfig {
@@ -272,11 +278,29 @@ impl<'a> FoldingContext<'a> {
             resolution_guard: std::cell::RefCell::new(HashSet::new()),
             effect_render_proofs: std::cell::RefCell::new(Vec::new()),
             folded_blocks: std::cell::RefCell::new(std::collections::BTreeSet::new()),
+            elided_op_sites: std::cell::RefCell::new(std::collections::BTreeMap::new()),
         }
     }
 
     pub(crate) fn folded_block_addrs(&self) -> std::collections::BTreeSet<u64> {
         self.folded_blocks.borrow().clone()
+    }
+
+    pub(crate) fn note_elided_op_site(&self, block_addr: u64, op_idx: usize, reason: &'static str) {
+        // Only an explicit request pays for this: every folded op that renders
+        // nothing reaches here, and the map is read by nothing else.
+        if !crate::unowned_report_requested() {
+            return;
+        }
+        self.elided_op_sites
+            .borrow_mut()
+            .insert((block_addr, op_idx), reason);
+    }
+
+    pub(crate) fn elided_op_sites(
+        &self,
+    ) -> std::collections::BTreeMap<(u64, usize), &'static str> {
+        self.elided_op_sites.borrow().clone()
     }
 
     pub(crate) fn effect_render_proofs_since(&self, checkpoint: usize) -> Vec<EffectRenderProof> {
