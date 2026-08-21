@@ -334,6 +334,32 @@ trace what the failing path actually reads. Twice here the answer was that the
 new code was incomplete, and once it was that something older had been wrong all
 along and nothing had been precise enough to show it.
 
+## The last trace: one variable, two owners
+
+Materialising one merge per register removed the self-assignment it was
+producing, and left one loop rendering as a `while` where it had rendered as a
+`for`. Tracing that named the next piece of the location model exactly.
+
+The surviving carrier is `RAX_1 = phi(RAX_0, RAX_18)`, a loop counter that also
+lives in a frame slot. At `-O0` the value cycles register, store, memory, load,
+register, so the merge is a genuine SSA merge for the register and the register
+really is read -- by the store. Nothing about it is spurious. But the program's
+variable is the frame slot, and the register is a copy of it that is dead at the
+loop header, because the first thing the body does is reload.
+
+So the criterion that separates a carrier worth materialising from one that is
+not is liveness at a program point: is this value read before it is overwritten,
+here. Whole-function readership cannot express it, and neither can anything
+currently in the tree. That is a real gap, and it is the same gap behind the
+earlier attempt at naming carriers, which put a variable on the page at `-O0`
+that was written twice and never read.
+
+It also states what the location model has to be. A location is not only a
+register family; a frame slot the compiler spills a register to is the same
+place as that register for the span in which they mirror each other, and until
+one thing owns that span two models will each claim the variable and each emit
+its own version of the update.
+
 ## Consequences
 
 The renderer should shrink substantially once it stops re-deriving storage
