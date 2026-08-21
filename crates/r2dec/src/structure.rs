@@ -1359,7 +1359,25 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
     /// Structure a single basic block.
     fn structure_block(&mut self, addr: u64) -> CStmt {
         if self.is_unresolved_indirect_dispatch_block(addr) {
-            return CStmt::Empty;
+            // Where this block goes was never recovered, so there is no shape
+            // to give it. Saying that is still saying something, and rendering
+            // nothing at all leaves the block silently out of a body that
+            // otherwise claims to cover the function.
+            self.fold_ctx.folded_blocks.borrow_mut().insert(addr);
+            let mut stmts = Vec::new();
+            if let Some(label) = self.take_block_label(addr) {
+                stmts.push(CStmt::Label(label));
+            }
+            if let Some(block) = self.func.get_block(addr) {
+                stmts.extend(self.folded_block_stmts(block, addr));
+            }
+            stmts.push(CStmt::comment(
+                "indirect branch target unresolved".to_string(),
+            ));
+            return match stmts.len() {
+                1 => stmts.remove(0),
+                _ => CStmt::Block(stmts),
+            };
         }
         let block = match self.func.get_block(addr) {
             Some(b) => b,
