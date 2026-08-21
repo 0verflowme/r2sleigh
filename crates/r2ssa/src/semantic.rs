@@ -4258,9 +4258,16 @@ fn unique_return_value_phi_for_block<'b>(
     let mut candidates = block
         .phis
         .iter()
-        .filter(|phi| phi.dst.is_register())
         .filter_map(|phi| {
-            let storage = machine_context.register_storage(&phi.dst.name)?;
+            // The lifter recorded which varnode produced this phi, so the
+            // location comes from provenance rather than from looking the
+            // rendered name back up in a register table.
+            let storage = phi.canonical_storage.or_else(|| {
+                phi.dst
+                    .is_register()
+                    .then(|| machine_context.register_storage(&phi.dst.name))
+                    .flatten()
+            })?;
             (storage.location() == result_location).then_some(&phi.dst)
         })
         .collect::<Vec<_>>();
