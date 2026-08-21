@@ -296,6 +296,25 @@ Live-out therefore comes first within step 7: seed it from the target model's
 return and callee-saved registers, let the existing backward pass carry it, and
 have readership, carrier naming and merge-set reduction all read the one answer.
 
+## What replacing the observable filter showed
+
+Step 5 says the observable-reachability filter in `r2types` is a liveness
+decision taken in the wrong layer, and it is. Replacing it with the observation
+set from `r2ssa` was tried and had to come out, because the two are not ordered
+the way the argument assumes: the filter admits carriers the observation set
+does not, and swapping them lost the loop body of a rendered function.
+
+Two things were learned rather than argued. The observation set had been
+treating a load as pure, which is wrong by this project's own accounting -- the
+source obligation inventory carries `ObservableMemoryRead` as something a
+rendering owes, so a load is an event whatever becomes of its result. That is
+fixed. And even corrected, the set is still not a superset of what backward
+reachability from certified roots admits.
+
+So the filter moves only once the observation set is demonstrably wider than it,
+measured on rendered output rather than reasoned about. Until then the wrong
+layer holding a correct answer beats the right layer holding a narrower one.
+
 ## Consequences
 
 The renderer should shrink substantially once it stops re-deriving storage

@@ -33,11 +33,18 @@ use crate::op::SSAOp;
 /// Whether an operation is observed for reasons beyond the value it produces.
 ///
 /// Stores change memory, transfers change where execution goes, and calls do
-/// whatever the callee does. Everything else is observed only through its result.
+/// whatever the callee does. Reads of memory count too, and not as a
+/// concession: the source obligation inventory carries `ObservableMemoryRead`
+/// as an obligation a rendering owes, so a load is an event this project
+/// already says the output must account for, whatever becomes of its result.
+/// Everything else is observed only through what it produces.
 fn has_effect(op: &SSAOp) -> bool {
     matches!(
         op,
-        SSAOp::Store { .. }
+        SSAOp::Load { .. }
+            | SSAOp::LoadGuarded { .. }
+            | SSAOp::LoadLinked { .. }
+            | SSAOp::Store { .. }
             | SSAOp::StoreConditional { .. }
             | SSAOp::StoreGuarded { .. }
             | SSAOp::AtomicCAS { .. }
