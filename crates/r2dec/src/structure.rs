@@ -1685,21 +1685,25 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             return;
         }
         let source = self.func.block_addrs();
+        // Ask what the rendering wrote, not what the regions laid claim to. A
+        // region tree covering every block says the shape was found, not that
+        // the shape reached the page, and a lowering that returns early leaves
+        // a claimed block unwritten with nothing to show it went missing. A
+        // block folded into its predecessors counts as written, because it is.
+        let rendered = self.fold_ctx.folded_blocks.borrow().clone();
         // A block the proof shows nothing can reach owes the output nothing, so
         // not rendering it is the right answer rather than a gap in coverage.
         let missing = source
             .iter()
             .copied()
-            .filter(|addr| {
-                !self.structured_region_blocks.contains(addr) && !self.block_is_proven_dead(*addr)
-            })
+            .filter(|addr| !rendered.contains(addr) && !self.block_is_proven_dead(*addr))
             .collect::<Vec<_>>();
         let Some(first) = missing.first().copied() else {
             return;
         };
         self.safety_reason = Some(format!(
             "structuring covered {} of {} source blocks, leaving 0x{first:x} and {} others unrendered",
-            self.structured_region_blocks.len(),
+            rendered.len(),
             source.len(),
             missing.len().saturating_sub(1)
         ));
@@ -2595,6 +2599,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             then_body: Box::new(then_stmt),
             else_body: Some(Box::new(else_stmt)),
         };
+        self.note_merge_block_rendered_by_duplication(merge_block);
         self.record_branch_render_proof(cond_block, predicate, condition_value);
         let mut prefix = self.structure_block_prefix_stmts(cond_block);
         prefix.push(if_stmt);
@@ -2670,6 +2675,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             then_body: Box::new(then_stmt),
             else_body: Some(Box::new(else_stmt)),
         };
+        self.note_merge_block_rendered_by_duplication(merge_block);
         self.record_branch_render_proof(cond_block, predicate, condition_value);
 
         let mut prefix = self.structure_block_prefix_stmts(cond_block);
@@ -3054,6 +3060,20 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
     fn has_merged_register_return_expr(&self, merge_addr: u64, pred_addr: u64) -> bool {
         self.return_register_candidate_for_merge_predecessor(merge_addr, pred_addr)
             .is_some()
+    }
+
+    /// Record that a merge block reached the output through its predecessors.
+    ///
+    /// Rewriting an if/else so both arms end in the merge block's return says
+    /// what that block says, once per arm, and then never emits the block. The
+    /// record of which blocks were folded is what everything downstream reads
+    /// to decide whether the output covers the function, and by that record the
+    /// block went missing. It did not: it is on the page twice.
+    fn note_merge_block_rendered_by_duplication(&self, merge_block: u64) {
+        self.fold_ctx
+            .folded_blocks
+            .borrow_mut()
+            .insert(merge_block);
     }
 
     fn record_return_value_render_proof(&self, block_addr: u64, op_idx: usize, value: ValueId) {
