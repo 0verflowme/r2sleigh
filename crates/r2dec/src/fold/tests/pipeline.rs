@@ -7039,7 +7039,7 @@ mod tests {
             matches!(rendered, CExpr::Member { .. } | CExpr::PtrMember { .. }),
             "semantic store lhs should render as member access, got {rendered:?}"
         );
-        let rendered_text = format!("{rendered:?}");
+        let rendered_text = spelled(&ctx, &rendered);
         assert!(
             rendered_text.contains("arg1") && !rendered_text.contains("stack_8"),
             "semantic member access should stay rooted at arg1, got {rendered:?}"
@@ -7117,7 +7117,7 @@ mod tests {
         let rendered = ctx
             .render_memory_access_by_name(&addr.display_name(), 4, 0, &mut visited)
             .expect("indexed member with external layout hint should render");
-        let rendered_text = format!("{rendered:?}");
+        let rendered_text = spelled(&ctx, &rendered);
         assert!(
             matches!(rendered, CExpr::Member { .. } | CExpr::PtrMember { .. }),
             "expected indexed-member render, got {rendered:?}"
@@ -7290,7 +7290,7 @@ mod tests {
 
         let mut visited = HashSet::new();
         let rendered = ctx.semanticize_visible_expr(&CExpr::Deref(Box::new(addr)), 0, &mut visited);
-        let rendered_text = format!("{rendered:?}");
+        let rendered_text = spelled(&ctx, &rendered);
         assert!(
             matches!(rendered, CExpr::Member { .. } | CExpr::PtrMember { .. }),
             "expected indexed-member render, got {rendered:?}"
@@ -7494,7 +7494,7 @@ mod tests {
         let rendered = ctx
             .debug_render_memory_access_from_visible_expr(&addr, 4)
             .expect("masked x86 raw pointer math should render as member access");
-        let rendered_text = format!("{rendered:?}");
+        let rendered_text = spelled(&ctx, &rendered);
         assert!(
             matches!(rendered, CExpr::Member { .. } | CExpr::PtrMember { .. }),
             "expected indexed-member render, got {rendered:?}"
@@ -7589,7 +7589,7 @@ mod tests {
         let rendered = ctx
             .debug_render_memory_access_from_visible_expr(&addr, 4)
             .expect("resolved pointer definition should render as member access");
-        let rendered_text = format!("{rendered:?}");
+        let rendered_text = spelled(&ctx, &rendered);
         assert!(
             matches!(rendered, CExpr::Member { .. } | CExpr::PtrMember { .. }),
             "expected member render, got {rendered:?}"
@@ -7661,7 +7661,7 @@ mod tests {
             matches!(rendered, CExpr::Subscript { .. }),
             "expected plain subscript, got {rendered:?}"
         );
-        let rendered_text = format!("{rendered:?}");
+        let rendered_text = spelled(&ctx, &rendered);
         assert!(
             !rendered_text.contains("p0"),
             "field_name_any fallback must not manufacture placeholder member access, got {rendered:?}"
