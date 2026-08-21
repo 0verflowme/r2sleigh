@@ -194,7 +194,8 @@ The ledger comes first. Unifying register and stack recovery in one change is
 precisely the change that cannot be scored by reading output, so accountability
 has to work before it lands.
 
-1. Ledger, closure invariant, and typed identifiers in code generation.
+1. Ledger and closure invariant, with the symbol table that typed identifiers
+   will be built on.
 2. FFI boundary: stop gating on version numbers, collapse the accessor vtable
    into view calls, remove the JSON channel, generate the C wire reader, and move
    the C wrapper's logic into Rust.
@@ -205,12 +206,31 @@ has to work before it lands.
 5. Move the observable-reachability filter out of `r2types`.
 6. Collapse the facts structs into one model and enforce the renderer's read-only
    contract.
-7. Demote flags and temporaries, extract the target model, and convert the
-   complexity ceiling into budget refusals.
+7. Rewrite the fold: demote flags and temporaries, migrate expressions onto the
+   symbol table, extract the target model, and convert the complexity ceiling
+   into budget refusals.
 
 The FFI comes before the location model because the snapshot enters the system
 through that boundary and the location model consumes exactly what crosses it;
 building locations first means building against a contract about to change shape.
+
+Replacing `CExpr::Var(String)` with a symbol reference is bound to step 7 rather
+than done in step 1, because it was measured rather than guessed: the change
+produces 970 compile errors, of which 586 are in `fold/op_lower/mod.rs` and
+`fold/flags.rs`. Those are the expression builder and the flag machinery, and
+step 7 rewrites the first and deletes most of the second, so migrating them
+first is migrating them twice. The symbol table lands in step 1 regardless, so
+every step after it writes against a declared name rather than adding to the
+debt, and `CExpr::Var(String)` stays the single implementation until it is
+replaced rather than sitting beside a second one.
+
+That measurement also produced the sharpest single finding of the attempt: much
+of the renderer decides things by inspecting how an identifier is spelled.
+`parse_address_from_var_name` recovers an address from a variable's name and
+`linear_var_is_integer_scalar` recovers a type from one, which is the same
+mistake as deciding a stack address by testing whether a register name contains
+"sp". Symbols must therefore carry what those spellings were being used to
+encode, or the migration will only move the string inspection somewhere else.
 
 Every step except 3 is expected to be net-negative on line count.
 
