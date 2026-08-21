@@ -4396,7 +4396,7 @@ mod tests {
         let mut arch = ArchSpec::new("return-register-test");
         arch.addr_size = 8;
         arch.alignment = 1;
-        arch.add_space(AddressSpace::ram(8));
+        arch.add_space(r2il::AddressSpace::ram(8));
         arch.add_register(RegisterDef::new("RAX", 0x00, 8));
         arch.add_register(RegisterDef::new("EAX", 0x00, 4));
         arch.add_register(RegisterDef::new("RIP", 0x30, 8));
