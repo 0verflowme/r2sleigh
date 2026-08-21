@@ -1198,8 +1198,9 @@ mod tests {
     #[test]
     fn test_generate_if_else() {
         let symbols = test_table();
+        let sym_x = crate::symbol::declare(&symbols, "x");
         let stmt = CStmt::if_stmt(
-            CExpr::binary(BinaryOp::Gt, CExpr::var(crate::symbol::declare(&symbols, "x")), CExpr::int(0)),
+            CExpr::binary(BinaryOp::Gt, CExpr::var(sym_x), CExpr::int(0)),
             CStmt::ret(Some(CExpr::int(1))),
             Some(CStmt::ret(Some(CExpr::int(0)))),
         );
@@ -1218,11 +1219,12 @@ mod tests {
     #[test]
     fn test_generate_while_loop() {
         let symbols = test_table();
+        let sym_i = crate::symbol::declare(&symbols, "i");
         let stmt = CStmt::while_loop(
-            CExpr::binary(BinaryOp::Lt, CExpr::var(crate::symbol::declare(&symbols, "i")), CExpr::int(10)),
+            CExpr::binary(BinaryOp::Lt, CExpr::var(sym_i), CExpr::int(10)),
             CStmt::expr(CExpr::binary(
                 BinaryOp::AddAssign,
-                CExpr::var(crate::symbol::declare(&symbols, "i")),
+                CExpr::var(sym_i),
                 CExpr::int(1),
             )),
         );
@@ -1239,13 +1241,15 @@ mod tests {
     #[test]
     fn test_generate_compound_unit_updates_as_inc_dec() {
         let symbols = test_table();
+        let sym_i = crate::symbol::declare(&symbols, "i");
+        let i = sym_i;
         let mut codegen = CodeGenerator::new(CodeGenConfig::default());
         // The generator renders from the table the fixture declared into.
         codegen.symbols = symbols.borrow().clone();
         assert_eq!(
             codegen.generate_expr(&CExpr::binary(
                 BinaryOp::AddAssign,
-                CExpr::var(crate::symbol::declare(&symbols, "i")),
+                CExpr::var(i),
                 CExpr::int(1),
             )),
             "i += 1"
@@ -1254,7 +1258,7 @@ mod tests {
             codegen
                 .generate_stmt(&CStmt::expr(CExpr::binary(
                     BinaryOp::AddAssign,
-                    CExpr::var(crate::symbol::declare(&symbols, "i")),
+                    CExpr::var(i),
                     CExpr::int(1),
                 )))
                 .contains("i++;")
@@ -1281,6 +1285,9 @@ mod tests {
     #[test]
     fn test_expression_precedence() {
         let symbols = test_table();
+        let sym_a = crate::symbol::declare(&symbols, "a");
+        let sym_b = crate::symbol::declare(&symbols, "b");
+        let sym_c = crate::symbol::declare(&symbols, "c");
         let mut codegen = CodeGenerator::new(CodeGenConfig::default());
         // The generator renders from the table the fixture declared into.
         codegen.symbols = symbols.borrow().clone();
@@ -1288,8 +1295,8 @@ mod tests {
         // a + b * c should not need parens around b * c
         let expr = CExpr::binary(
             BinaryOp::Add,
-            CExpr::var(crate::symbol::declare(&symbols, "a")),
-            CExpr::binary(BinaryOp::Mul, CExpr::var(crate::symbol::declare(&symbols, "b")), CExpr::var(crate::symbol::declare(&symbols, "c"))),
+            CExpr::var(sym_a),
+            CExpr::binary(BinaryOp::Mul, CExpr::var(sym_b), CExpr::var(sym_c)),
         );
         let code = codegen.generate_expr(&expr);
         assert_eq!(code, "a + b * c");
@@ -1298,8 +1305,8 @@ mod tests {
         codegen.output.clear();
         let expr = CExpr::binary(
             BinaryOp::Mul,
-            CExpr::binary(BinaryOp::Add, CExpr::var(crate::symbol::declare(&symbols, "a")), CExpr::var(crate::symbol::declare(&symbols, "b"))),
-            CExpr::var(crate::symbol::declare(&symbols, "c")),
+            CExpr::binary(BinaryOp::Add, CExpr::var(sym_a), CExpr::var(sym_b)),
+            CExpr::var(sym_c),
         );
         let code = codegen.generate_expr(&expr);
         assert_eq!(code, "(a + b) * c");
@@ -1308,16 +1315,18 @@ mod tests {
     #[test]
     fn test_additive_negative_literals_render_without_stack_placeholder_noise() {
         let symbols = test_table();
+        let sym_stack_8 = crate::symbol::declare(&symbols, "stack_8");
+        let sym_rsp = crate::symbol::declare(&symbols, "rsp");
         let mut codegen = CodeGenerator::new(CodeGenConfig::default());
         // The generator renders from the table the fixture declared into.
         codegen.symbols = symbols.borrow().clone();
 
-        let expr = CExpr::binary(BinaryOp::Add, CExpr::var(crate::symbol::declare(&symbols, "stack_8")), CExpr::int(-8));
+        let expr = CExpr::binary(BinaryOp::Add, CExpr::var(sym_stack_8), CExpr::int(-8));
         assert_eq!(codegen.generate_expr(&expr), "stack_8 - 8");
 
         let expr = CExpr::binary(
             BinaryOp::Sub,
-            CExpr::var(crate::symbol::declare(&symbols, "rsp")),
+            CExpr::var(sym_rsp),
             CExpr::uint(0xffffffffffffffb8),
         );
         assert_eq!(codegen.generate_expr(&expr), "rsp + 0x48");
@@ -1326,21 +1335,23 @@ mod tests {
     #[test]
     fn test_additive_negative_linear_terms_render_as_subtraction() {
         let symbols = test_table();
+        let sym_a = crate::symbol::declare(&symbols, "a");
+        let sym_b = crate::symbol::declare(&symbols, "b");
         let mut codegen = CodeGenerator::new(CodeGenConfig::default());
         // The generator renders from the table the fixture declared into.
         codegen.symbols = symbols.borrow().clone();
 
         let expr = CExpr::binary(
             BinaryOp::Add,
-            CExpr::var(crate::symbol::declare(&symbols, "a")),
-            CExpr::binary(BinaryOp::Mul, CExpr::var(crate::symbol::declare(&symbols, "b")), CExpr::int(-1)),
+            CExpr::var(sym_a),
+            CExpr::binary(BinaryOp::Mul, CExpr::var(sym_b), CExpr::int(-1)),
         );
         assert_eq!(codegen.generate_expr(&expr), "a - b");
 
         let expr = CExpr::binary(
             BinaryOp::Add,
-            CExpr::var(crate::symbol::declare(&symbols, "a")),
-            CExpr::binary(BinaryOp::Mul, CExpr::var(crate::symbol::declare(&symbols, "b")), CExpr::int(-4)),
+            CExpr::var(sym_a),
+            CExpr::binary(BinaryOp::Mul, CExpr::var(sym_b), CExpr::int(-4)),
         );
         assert_eq!(codegen.generate_expr(&expr), "a - b * 4");
     }
