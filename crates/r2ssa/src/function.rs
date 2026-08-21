@@ -605,6 +605,24 @@ impl SsaArtifact {
         &self.function
     }
 
+    /// What the calling convention says this function's caller may read.
+    ///
+    /// Derived from the machine context the snapshot carried, so it is the
+    /// source's account of the ABI rather than a guess made from a name.
+    pub fn abi(&self) -> Option<crate::abi::AbiProfile> {
+        crate::abi::AbiProfile::from_machine_context(&self.machine_context)
+    }
+
+    /// The values this function hands back, which have no reader inside it.
+    pub fn live_out(&self) -> crate::liveout::FunctionLiveOut {
+        match self.abi() {
+            Some(abi) => {
+                crate::liveout::FunctionLiveOut::compute(&self.function, &self.graph, &abi)
+            }
+            None => crate::liveout::FunctionLiveOut::default(),
+        }
+    }
+
     pub fn graph(&self) -> &SsaGraph {
         &self.graph
     }

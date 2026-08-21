@@ -2872,6 +2872,20 @@ impl Decompiler {
         work.poll()?;
         let prepared = input.prepared_ssa();
         let func = prepared.function();
+        if std::env::var_os("R2SLEIGH_DEBUG_MERGES").is_some() {
+            let graph = prepared.graph();
+            let live = prepared.live_out();
+            let dead = r2ssa::deadphi::DeadPhis::find(func, graph, &live);
+            let total: usize = func.blocks().map(|b| b.phis.len()).sum();
+            eprintln!(
+                "MERGES fn={:#x} phis={} unobserved={} live_out={} unresolved={}",
+                func.entry,
+                total,
+                dead.len(),
+                live.len(),
+                live.unresolved_blocks().count()
+            );
+        }
         let mut normalized_func = if let Some(render_facts) = self.context.function_facts.render() {
             normalize::materialize_certified_loop_carriers_with_control(
                 func,
