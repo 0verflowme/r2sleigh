@@ -346,7 +346,21 @@ Beside those, a self-and left from `test eax, eax`, a return of `-1` printed as
 The consequence for the rest of this work is that a corpus of nine hash
 functions cannot exercise a condition code, so anything concluded from it about
 flag handling is a statement about the corpus. The verdict on the register-family
-repair pass was taken that way, and should be re-taken here.
+repair pass was taken that way, so it was re-taken here.
+
+It holds, and the re-taking nearly inverted it for the same reason the first one
+nearly went wrong. On this fixture the rendered share *rises* when the pass is
+disabled, from 64.8% to 69.4% on arm64, which reads as the pass costing four
+points. It is not. Disabling it collapses `classify` from a four-armed
+conditional into `return cond ? w8 : w9;` with two undeclared reads, and the
+share rises only because the body shrank and took the denominator with it, from
+34 obligations to 11. The pass creates obligations for the operations it
+inserts, so shares are comparable only when totals are, and the honest reading is
+what the body says rather than what the ratio does.
+
+Re-measuring also sharpened the defect it was meant to check. arm64 renders that
+four-armed chain correctly; x86-64 drops an arm from the same source. So this is
+not a general failure to structure a comparison chain, and issue 63 says so.
 
 Demotion therefore means asking whether the predicate facts `r2ssa` already
 computes could deliver those conditions directly, so that nothing downstream has
