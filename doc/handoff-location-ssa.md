@@ -660,3 +660,41 @@ however good the family and location machinery gets.
 fixes the class. Special-casing the all-ones idiom fixes this binary and leaves
 the class open; it is the kind of thing that should not go in.
 
+### Steps 5 and 7 are done; step 4's premise does not hold
+
+**Step 7, the `UseInfo` split, is collapsed.** `UseInfoAnalysisMode` selected
+which passes ran inside one function, so the two consumers read as one analysis
+with parts switched off. They are not the same analysis: coalescing and
+formatted definitions decide how a value is *spelled*, which only a renderer
+needs. `analyze_value_facts` now yields the scratch, `name_values_for_rendering`
+adds the naming decisions, `seal_value_facts` closes either one, and the enum is
+gone. Rendering is byte-identical on both fixtures.
+
+**Step 5, the facts guard, is in the dylint crate** as
+`FACTS_METHOD_SHAPED_LIKE_A_RENDERING_DECISION`. It warns when a `*Facts` type
+declares a method whose name starts with `should_`, `prefers_`, `wants_`,
+`emit_`, `suppress_`, `elide_` or `inline_`. The tree is clean today -- the
+survey found no violations -- so the lint is preventative, and it was verified by
+planting `should_probe_the_guard` on `FunctionControlFacts` and watching it fire.
+
+**Step 4 is not what it says.** "Make the repair pass conditional" assumes the
+repair exists for width mismatches, so a function that never touches a register
+family at two storage shapes could skip both the repair and the dataflow fixpoint
+that feeds it. That precondition was written, and one test refuses it:
+
+    register_alias_maximal_copy_retains_the_written_ssa_definition
+
+It writes `RAX` at version 2 and then reads `RAX` at version 0 -- one family, one
+shape, no width mismatch anywhere -- and expects the pass to rewrite the read to
+the reaching definition. The pass reconciles *versions* as well as widths.
+
+So the condition cannot be a syntactic property of the storage shapes; it is a
+statement about reaching definitions, which is exactly the dataflow the skip was
+meant to avoid. Any cheap sound condition strong enough to keep that test
+passing is also weak enough to almost never fire. Reverted.
+
+The useful reframing: the version reconciliation is there because SSA renaming
+treats overlapping register names as independent variables. Fix that at
+construction and the pass narrows to genuine width repair -- and *then* it is
+conditional, on the property step 4 assumed it already had.
+
