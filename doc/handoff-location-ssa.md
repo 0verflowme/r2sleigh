@@ -751,3 +751,45 @@ of those changes `render_engine_decompile_request`'s contract from
 That is a design decision about the render boundary, not a mechanical change, and
 it is the next thing this work needs.
 
+### The loop-carrier defect has moved, and the three gates no longer explain it
+
+The symptom is unchanged. `sym._fnv1a64` at `-O2` on arm64 still renders
+
+    do {
+        int64_t x0 = (int64_t)(((uint32_t)t2b380 ^ (uint32_t)*arg0) * 0x1b3);
+    } while (arg1 != 1);
+    return 0x739d0383;
+
+with a dead body, a pointer that never advances, and a return of `0x739d0383` --
+the low half of the FNV offset basis, which is the accumulator's value *entering*
+the loop.
+
+The standing diagnosis blamed three liveness gates, the first being
+`loop_carrier_facts` discarding header phis with no recorded readers. Instrumenting
+all three says that is no longer true. The header carries nineteen phis:
+
+    carrier header=f4 phi=CY_1        uses=0  liveout=false
+    carrier header=f4 phi=tmp:2b380_1 uses=0  liveout=false
+    ... fourteen flags and Sleigh temporaries, all uses=0 ...
+    carrier header=f4 phi=X0_3        uses=1  liveout=false
+    carrier header=f4 phi=X1_1        uses=3  liveout=false
+    carrier header=f4 phi=X8_2        uses=2  liveout=false
+
+The fourteen flag and temporary merges die at the first gate for having no
+readers, which is what should happen to them, and the accumulator survives. It
+survives the other two as well:
+
+    gate phi=X0_3 value=Some(ValueId(62)) certified=true
+    gate phi=X1_1 value=Some(ValueId(64)) certified=true
+    gate phi=X8_2 value=Some(ValueId(69)) certified=true
+
+So the carriers are certified and materialised into edge assignments, and the
+twenty-four-phi header the earlier work measured is now nineteen with five live.
+Liveness is not what is losing the loop.
+
+**Where to look instead.** The returned constant is the entry value of the
+accumulator, so something at the render boundary resolves the merged value to
+the value entering the loop rather than to the merge. That is the same shape as
+the return-value picker worked on earlier in this branch, and it is downstream of
+everything the three gates control. Instrument the return operand's resolution
+before touching liveness again.
