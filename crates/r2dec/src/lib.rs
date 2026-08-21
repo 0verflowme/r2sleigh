@@ -5947,13 +5947,14 @@ mod tests {
             name: crate::symbol::declare(&symbols, "result"),
             stack_offset: None,
         });
+        func.symbols = symbols;
 
         normalize_redundant_return_carrier_casts(&mut func);
 
         assert!(matches!(
             &func.body[0],
             CStmt::If { then_body, .. }
-                if matches!(then_body.as_ref(), CStmt::Return(Some(CExpr::Var(name))) if &*crate::symbol::spelling(&symbols, *name) == "result")
+                if matches!(then_body.as_ref(), CStmt::Return(Some(CExpr::Var(name))) if &*crate::symbol::spelling(&func.symbols, *name) == "result")
         ));
     }
 
@@ -6029,8 +6030,9 @@ mod tests {
                 stack_offset: Some(-8),
             },
         ];
+        func.symbols = symbols;
 
-        prune_unreferenced_local_declarations(&symbols, &mut func);
+        prune_unreferenced_local_declarations(&func.symbols.clone(), &mut func);
 
         assert_eq!(func.locals.len(), 1);
         assert_eq!(func.symbols.borrow().name(func.locals[0].name), "live");
