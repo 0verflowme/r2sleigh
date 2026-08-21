@@ -4216,14 +4216,51 @@ fn canonical_graph_value_root(graph: &SsaGraph, value: ValueId) -> ValueId {
     current
 }
 
+/// The widest register a return value can arrive in, for one that can arrive in several.
+///
+/// `rax` and `eax` are not two places a value might be; they are one register
+/// read at two widths. A lifter that keeps them as separate storage gives an
+/// exit block one merge for each, and a rule that wanted a single candidate
+/// found two and concluded there was no return value at all.
+fn return_value_register_family(value: &SSAVar) -> Option<&'static str> {
+    if !value.is_register() {
+        return None;
+    }
+    let name = value
+        .name
+        .trim()
+        .trim_start_matches('$')
+        .to_ascii_lowercase();
+    Some(match name.as_str() {
+        "rax" | "eax" | "ax" | "al" => "rax",
+        "x0" | "w0" => "x0",
+        "r0" => "r0",
+        "a0" => "a0",
+        "r3" => "r3",
+        "xmm0" => "xmm0",
+        "st0" => "st0",
+        "v0" => "v0",
+        _ => return None,
+    })
+}
+
 fn unique_return_value_phi_for_block(block: &crate::function::SSABlock) -> Option<&SSAVar> {
-    let mut matches = block
+    let mut candidates = block
         .phis
         .iter()
-        .filter(|phi| is_return_value_register(&phi.dst))
-        .map(|phi| &phi.dst);
-    let first = matches.next()?;
-    matches.next().is_none().then_some(first)
+        .filter_map(|phi| {
+            return_value_register_family(&phi.dst).map(|family| (family, &phi.dst))
+        })
+        .collect::<Vec<_>>();
+    let (family, _) = *candidates.first()?;
+    // Slices of one register are one place, so the widest of them carries the
+    // others and there is still exactly one candidate. Two different registers
+    // are two answers, and this rule has no basis for choosing between them.
+    if candidates.iter().any(|(other, _)| *other != family) {
+        return None;
+    }
+    candidates.sort_by_key(|(_, var)| std::cmp::Reverse(var.size));
+    candidates.first().map(|(_, var)| *var)
 }
 
 fn ram_memory_access_matches_source(
@@ -6928,6 +6965,7 @@ fn const_value(var: &SSAVar) -> Option<u64> {
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
 
+    use super::unique_return_value_phi_for_block;
     use super::{
         ControlGuard, GlobalObjectKey, MemoryDefFact, MemoryLocation, MemorySSAFacts,
         MemoryUseFact, MemoryVersion, ObjectFact, ObjectId, ObjectKind, ObjectModel,
@@ -8951,4 +8989,53 @@ mod tests {
         assert!(merge.complete);
         assert!(merge.guards.is_empty());
     }
+    fn phi_of(name: &str, size: u32) -> crate::function::PhiNode {
+        crate::function::PhiNode {
+            dst: SSAVar::new(name, 1, size),
+            sources: Vec::new(),
+            canonical_storage: None,
+        }
+    }
+
+    fn block_with_phis(phis: Vec<crate::function::PhiNode>) -> crate::function::SSABlock {
+        crate::function::SSABlock {
+            addr: 0x1000,
+            size: 0,
+            ops: Vec::new(),
+            phis,
+        }
+    }
+
+    #[test]
+    fn two_widths_of_one_return_register_are_one_candidate() {
+        // An exit block merges both RAX and EAX because the lifter keeps them as
+        // separate storage. They are one register, so the widest carries the value.
+        let block = block_with_phis(vec![phi_of("EAX", 4), phi_of("RAX", 8)]);
+        let chosen = unique_return_value_phi_for_block(&block).expect("one candidate");
+        assert_eq!(chosen.name, "RAX");
+        assert_eq!(chosen.size, 8);
+    }
+
+    #[test]
+    fn one_return_register_on_its_own_is_still_chosen() {
+        let block = block_with_phis(vec![phi_of("EAX", 4)]);
+        assert_eq!(
+            unique_return_value_phi_for_block(&block).map(|var| var.name.as_str()),
+            Some("EAX")
+        );
+    }
+
+    #[test]
+    fn two_different_return_registers_are_two_answers_and_neither_is_taken() {
+        // xmm0 and rax are different places, and nothing here can choose between them.
+        let block = block_with_phis(vec![phi_of("RAX", 8), phi_of("XMM0", 16)]);
+        assert_eq!(unique_return_value_phi_for_block(&block), None);
+    }
+
+    #[test]
+    fn a_block_merging_no_return_register_offers_nothing() {
+        let block = block_with_phis(vec![phi_of("RCX", 8), phi_of("RDX", 8)]);
+        assert_eq!(unique_return_value_phi_for_block(&block), None);
+    }
+
 }
