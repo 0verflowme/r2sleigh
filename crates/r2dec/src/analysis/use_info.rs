@@ -4505,7 +4505,7 @@ fn accumulate_formatted_def_expr_quality(symbols: &std::cell::RefCell<crate::sym
         CExpr::Var(name) => {
             if is_generic_stack_alias_name(&crate::symbol::spelling(symbols, *name)) {
                 quality.3 -= 8;
-            } else if is_low_signal_name(symbols, *name) {
+            } else if is_low_signal_name(&crate::symbol::spelling(symbols, *name)) {
                 quality.5 -= 4;
             } else if is_register_candidate_base(&crate::symbol::spelling(symbols, *name), env) {
                 quality.4 -= 6;
@@ -4608,10 +4608,7 @@ fn is_symbol_or_object_name(name: &str) -> bool {
     )
 }
 
-fn is_low_signal_name(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, name: crate::symbol::SymbolId) -> bool {
-    let name_id = name;
-    let name = &crate::symbol::spelling(symbols, name_id);
-
+fn is_low_signal_name(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     is_raw_ssa_storage_or_register_name(name)
         || lower.starts_with('t')
@@ -10766,7 +10763,7 @@ mod tests {
             "space1:20",
         ] {
             assert!(
-                is_low_signal_name(&symbols, name),
+                is_low_signal_name(name),
                 "{name} should be low-signal raw SSA storage/register"
             );
             assert!(
@@ -10775,12 +10772,12 @@ mod tests {
             );
         }
 
-        assert!(is_low_signal_name(&symbols, "t42"));
+        assert!(is_low_signal_name("t42"));
         assert!(!is_semantic_binding_base("t42"));
         assert!(is_semantic_binding_base("local_4"));
         assert!(is_semantic_binding_base("arg1"));
         assert!(is_semantic_binding_base("sym.helper"));
-        assert!(!is_low_signal_name(&symbols, "value"));
+        assert!(!is_low_signal_name("value"));
         assert!(!is_semantic_binding_base("value"));
     }
 
@@ -11518,7 +11515,9 @@ mod tests {
         assert!(
             match idx_semantic {
                 Some(SemanticValue::Scalar(ScalarValue::Expr(CExpr::Var(name)))) => {
-                    name != "stack" && name != "saved_fp" && !crate::symbol::spelling(symbols, *name).starts_with("local_")
+                    &*crate::symbol::spelling(&symbols, *name) != "stack"
+                        && &*crate::symbol::spelling(&symbols, *name) != "saved_fp"
+                        && !crate::symbol::spelling(&symbols, *name).starts_with("local_")
                 }
                 Some(SemanticValue::Scalar(ScalarValue::Root(value_ref))) => {
                     !value_ref.var.name_kind().is_temporary()

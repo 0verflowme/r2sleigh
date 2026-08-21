@@ -281,7 +281,7 @@ impl<'a> FoldingContext<'a> {
     #[cfg(test)]
     fn normalize_prepared_call_arg_expr(&self, arg: CExpr) -> CExpr {
         let original_param_home = match &arg {
-            CExpr::Var(name) if self.is_static_param_home_alias_name(name) => Some(name.clone()),
+            CExpr::Var(name) if self.is_static_param_home_alias_name(&self.spelling(*name)) => Some(name.clone()),
             _ => None,
         };
         let rewritten = self.rewrite_imported_call_arg_expr_with_prepared_owners(
@@ -430,13 +430,13 @@ impl<'a> FoldingContext<'a> {
     }
 
     #[cfg(test)]
-    pub(super) fn extract_callee_name(expr: &CExpr) -> Option<&str> {
+    pub(super) fn extract_callee_name(&self, expr: &CExpr) -> Option<std::rc::Rc<str>> {
         match expr {
-            CExpr::Var(name) => Some(name.as_str()),
+            CExpr::Var(name) => Some(self.spelling(*name)),
             CExpr::Deref(inner) | CExpr::Paren(inner) | CExpr::AddrOf(inner) => {
-                Self::extract_callee_name(inner)
+                self.extract_callee_name(inner)
             }
-            CExpr::Cast { expr: inner, .. } => Self::extract_callee_name(inner),
+            CExpr::Cast { expr: inner, .. } => self.extract_callee_name(inner),
             _ => None,
         }
     }
