@@ -267,60 +267,44 @@ Counts across the two corpora: 23 functions and 55 distinct names down to 18 and
 renderer replaces machine tokens with prose and would otherwise print the
 substitution rather than the name.
 
-### Two more spelling tables, and why replacing them stalled
+### Two more spelling tables, and the one thing missing to remove them
 
 `is_return_value_register` and `is_control_return_target` in `r2ssa::semantic`
-are the same hack as the phi picker's: a list of register spellings, `rax | eax
-| ax | al | xmm0 | st0 | x0 | w0 | r0 | v0` for one and `pc | lr | ra | x30 |
-rip | eip` for the other. They answer for the architectures somebody wrote down
-and say no to everything else. Six call sites between them, all in the return
-analysis.
+are the same hack as the phi picker's: `rax | eax | ax | al | xmm0 | st0 | x0 |
+w0 | r0 | v0` for one, `pc | lr | ra | x30 | rip | eip` for the other. Six call
+sites, all in the return analysis.
 
-Replacing both with a location test works and the machine context threads to
-every caller -- I did it, and the corpus was unchanged: `sym._fnv1a64` rendered
-identically and coverage stayed at 47 of 60 functions. **I reverted it anyway**,
-because it cannot be finished without answering a question the tests disagree
-about.
+I have now built the replacement twice and reverted it twice. It works -- the
+corpus is unchanged at 47 of 60 functions and `sym._fnv1a64` renders
+identically -- and the diagnosis is complete. Two things were learned, both of
+which cost a revert:
 
-The predicates need a stated convention. Production has one:
-`build_function_internal_with_control` passes `source.convention_slots()`
-through. The r2dec fixtures do not -- they build SSA through
-`SsaArtifact::for_decompile_with_interface`, which has no way to say what a
-function returns in. So with the change:
+**One predicate was answering two questions.** `collect_return_value_certificates`
+and `process_reaching_return_block` ask "does this function return a value
+here", which must respect a declared `Void`. `kill_return_register_flow_values`
+and `return_carrier_for_value` ask "did a *call* leave its result here", which
+does not -- a void function still reads the results of the calls it makes. The
+spelling table served both because it never consulted a contract. Splitting them
+into `is_return_value_register` and `is_call_result_register` is right and the
+r2dec suite passes with it.
 
-- `certified_call_result_owner_alias_requires_certified_stack_identity` fails
-  unless the fixtures state a convention, because without one nothing is a
-  return.
-- `post_call_stack_store_does_not_fabricate_call_result_owner` fails when they
-  do, because a call result then belongs to the result location rather than the
-  stack slot a later store puts it in.
+**The table is supplying a default nothing else provides.** Ask the interface
+via `return_kind()` and a `Void` function correctly answers "no return
+register". Ask the convention via `result_slot()` and a source that recovered
+one answers correctly. But `MachineAbiModel::return_registers` is *derived from
+the interface*, not from the architecture, so a function built through
+`SsaArtifact::for_decompile` with no interface has no machine statement about
+return registers at all. Seven `r2ssa::function` tests exercise exactly that
+path and depend on the spelling table to answer.
 
-**The cause is found, and it was a defect in the change.** The fixture that
-broke declares `SourceFunctionReturn::Void`, and the convention I gave every
-fixture said its result slot is RAX. A write to RAX in a function that returns
-nothing is not a return value, so the call result stopped being attributed to
-the stack slot a later store put it in.
+So the missing piece is: **`ArchSpec` should carry its ABI's return registers**,
+the way it already carries register definitions. Then `result_slot()` falls back
+source -> convention -> architecture, no step of which is a hand-written list,
+and the two tables delete. Without that, removing them silently drops return
+detection for any analysis with no recovered ABI, which is worse than the hack.
 
-The two tests are not incompatible. I said they were before checking, and that
-was wrong.
-
-It also points at a better source than the convention slot.
-`SourceFunctionInterface::return_kind()` returns `SourceFunctionReturn`, which is
-either `Void` or `Register { storage }` -- the interface states the return
-storage directly, and states its absence. So the predicate should be:
-
-    match interface.return_kind() {
-        SourceFunctionReturn::Void => false,
-        SourceFunctionReturn::Register { storage } => storage.location() == value_location,
-    }
-
-falling back to the convention's `result_slot` only when no interface was
-recovered, the way `return_address_carrier` already falls back from the
-interface to the machine roles. That answers `Void` correctly, needs no
-fixture convention, and removes both spelling tables.
-
-`SsaArtifact::for_decompile_with_convention` was written and works, but on this
-reading it is not needed: the interface the fixtures already build says enough.
+`SsaArtifact::for_decompile_with_convention` is written and works if the fixture
+route is preferred, but it only patches the fixtures rather than fixing the gap.
 
 ### The SIMD lane defect, located
 
