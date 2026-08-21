@@ -4254,7 +4254,7 @@ fn unique_return_value_phi_for_block<'b>(
     // Without a machine there is no result location, and guessing one from a
     // register spelling is what this replaced.
     let machine_context = machine_context?;
-    let result_location = machine_context.result_slot()?.location();
+    let result_location = machine_context.return_value_carrier()?.location();
     let mut candidates = block
         .phis
         .iter()

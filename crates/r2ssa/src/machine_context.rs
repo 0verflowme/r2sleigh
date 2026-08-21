@@ -998,6 +998,22 @@ impl SourceMachineContext {
         self.convention_slots.as_ref()?.result_slot()
     }
 
+    /// The location this function returns a value in, and whether it returns
+    /// one at all.
+    ///
+    /// The interface states both, so a function declared to return nothing
+    /// answers `None` rather than the location a result would have gone in.
+    /// The convention answers only where a caller *would* leave a value, which
+    /// is not the same claim, so it is the fallback for a function whose
+    /// interface was never recovered.
+    pub fn return_value_carrier(&self) -> Option<CanonicalStorageId> {
+        match self.function_interface.as_ref().map(|i| i.return_kind()) {
+            Some(r2source::SourceFunctionReturn::Void) => None,
+            Some(r2source::SourceFunctionReturn::Register { storage }) => Some(storage),
+            None => self.result_slot(),
+        }
+    }
+
     /// The carrier holding the return address, preferring the ABI's own
     /// declaration and falling back to the machine's.
     ///
