@@ -3327,6 +3327,25 @@ impl Decompiler {
         // name cannot be mentioned unless the table already holds it. What is
         // left to ask is whether C can read it.
         unrendered::spell_every_name_as_c(&mut c_function);
+        // A value with more than one reader is supposed to become a typed
+        // local. A name the body mentions and the function never declares says
+        // that did not happen, and a reader has no way to learn what it is.
+        let undeclared = unrendered::names_mentioned_without_a_declaration(&c_function);
+        if !undeclared.is_empty() {
+            let table = c_function.symbols.borrow();
+            let names = undeclared
+                .iter()
+                .map(|name| table.name(*name).to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            drop(table);
+            c_function.body.insert(
+                0,
+                CStmt::Comment(format!(
+                    "r2dec defect: mentioned without a declaration: {names}"
+                )),
+            );
+        }
         // Executable C is admitted only when the source obligation inventory is
         // complete. The inventory is what says which effects the source has, so a
         // function whose inventory did not close has no account of what the output
@@ -3458,7 +3477,48 @@ fn collect_expr_var_names(expr: &CExpr, out: &mut HashSet<crate::symbol::SymbolI
     }
 }
 
-fn collect_stmt_var_names(stmts: &[CStmt]) -> HashSet<crate::symbol::SymbolId> {
+/// Names a statement introduces, wherever it sits in the body.
+pub(crate) fn declarations_in_stmts(stmts: &[CStmt]) -> Vec<crate::symbol::SymbolId> {
+    fn visit(stmt: &CStmt, out: &mut Vec<crate::symbol::SymbolId>) {
+        match stmt {
+            CStmt::Decl { name, .. } => out.push(*name),
+            CStmt::Block(body) => body.iter().for_each(|s| visit(s, out)),
+            CStmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                visit(then_body, out);
+                if let Some(body) = else_body {
+                    visit(body, out);
+                }
+            }
+            CStmt::While { body, .. } | CStmt::DoWhile { body, .. } => visit(body, out),
+            CStmt::For { init, body, .. } => {
+                if let Some(init) = init {
+                    visit(init, out);
+                }
+                visit(body, out);
+            }
+            CStmt::Switch { cases, default, .. } => {
+                for case in cases {
+                    case.body.iter().for_each(|s| visit(s, out));
+                }
+                if let Some(body) = default {
+                    body.iter().for_each(|s| visit(s, out));
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    for stmt in stmts {
+        visit(stmt, &mut out);
+    }
+    out
+}
+
+pub(crate) fn collect_stmt_var_names(stmts: &[CStmt]) -> HashSet<crate::symbol::SymbolId> {
     fn visit_stmt(stmt: &CStmt, out: &mut HashSet<crate::symbol::SymbolId>) {
         match stmt {
             CStmt::Empty

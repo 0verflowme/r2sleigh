@@ -418,3 +418,28 @@ fn drop_labels_outside(
         other => Some(other),
     }
 }
+
+/// Every name the body mentions that the function never declares.
+///
+/// A reference carries an identifier the table issued, so this cannot find a
+/// word that resolves to nothing -- that was the old failure and the table
+/// removed it. What it finds is a name the reader has no declaration for: the
+/// table knows it, the C does not. A value with more than one reader is
+/// supposed to become a typed local, and this is the check that it did.
+pub(crate) fn names_mentioned_without_a_declaration(
+    func: &CFunction,
+) -> Vec<crate::symbol::SymbolId> {
+    let mut declared = func
+        .params
+        .iter()
+        .map(|param| param.name)
+        .chain(func.locals.iter().map(|local| local.name))
+        .collect::<std::collections::HashSet<_>>();
+    declared.extend(crate::declarations_in_stmts(&func.body));
+    let mut undeclared = crate::collect_stmt_var_names(&func.body)
+        .into_iter()
+        .filter(|name| !declared.contains(name))
+        .collect::<Vec<_>>();
+    undeclared.sort_unstable();
+    undeclared
+}
