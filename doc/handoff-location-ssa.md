@@ -627,3 +627,36 @@ fell everywhere:
 Materializing more merges renders less, so the gate is not what is holding these
 values back. Reverted.
 
+### What the x86 case really needs: a value wider than 64 bits
+
+Reading the machine code settles what the three remaining x86 names are. Before
+the loop:
+
+    pcmpeqd xmm0, xmm0        ; every lane all-ones
+
+and inside it, `pmaxud`/`pcmpeqd` to build an `a >= b` mask and a chain of
+`pxor` that the renderer already collapses correctly into
+
+    *arg0 = xmm1_3 ^ xmm0 ^ arg1[0];
+
+`xmm0` is a 16-byte read covered by the four lane definitions `XMM0_Da` through
+`XMM0_Dd`, and each lane folds to a constant: `optimize.rs` already reduces
+`IntEqual` with identical operands to a constant, so `pcmpeqd xmm0, xmm0` is
+constant-folded per lane.
+
+So the composer is the right instrument for this read -- and it cannot finish
+the job, because a composed 16-byte constant has nowhere to live. `const_value`
+returns `Option<u64>` and `make_const` takes a `u64`; the whole constant model
+is 64 bits wide. Four folded lanes cannot be joined into the value the machine
+actually has.
+
+This is a real ceiling on what the location model can do for SIMD, and it is
+worth stating plainly rather than working around: a register file with 16-byte
+registers needs a value model that can hold 16 bytes. Until then, whole-register
+reads of vector registers will resolve to a name with no expression behind it,
+however good the family and location machinery gets.
+
+**Two ways forward, and they are not equivalent.** Widening the constant model
+fixes the class. Special-casing the all-ones idiom fixes this binary and leaves
+the class open; it is the kind of thing that should not go in.
+
