@@ -45,6 +45,52 @@ mod tests {
         }
     }
 
+    /// A debug rendering with each identifier replaced by what it spells.
+    ///
+    /// Assertions here ask whether an expression mentions a name. A reference
+    /// carries an identifier rather than a spelling, so the spelling has to be
+    /// read back out of the table that issued it.
+    fn spelled(ctx: &FoldingContext<'_>, expr: &CExpr) -> String {
+        let raw = format!("{expr:?}");
+        let pattern = regex_lite_symbol_ids(&raw);
+        let mut out = raw.clone();
+        for (whole, index) in pattern {
+            let id_expr = ctx
+                .symbols
+                .borrow()
+                .iter()
+                .find(|(id, _)| id.index() == index)
+                .map(|(_, symbol)| symbol.name.to_string());
+            if let Some(name) = id_expr {
+                out = out.replace(&whole, &name);
+            }
+        }
+        out
+    }
+
+    /// Every `SymbolId { .. }` in a debug rendering, with its position.
+    fn regex_lite_symbol_ids(text: &str) -> Vec<(String, usize)> {
+        let mut found = Vec::new();
+        let mut rest = text;
+        while let Some(start) = rest.find("SymbolId { table: TableId(") {
+            let Some(end) = rest[start..].find(" }") else {
+                break;
+            };
+            let whole = &rest[start..start + end + 2];
+            if let Some(idx) = whole.rfind("index: ") {
+                let digits: String = whole[idx + 7..]
+                    .chars()
+                    .take_while(|c| c.is_ascii_digit())
+                    .collect();
+                if let Ok(index) = digits.parse::<usize>() {
+                    found.push((whole.to_string(), index));
+                }
+            }
+            rest = &rest[start + end + 2..];
+        }
+        found
+    }
+
     fn make_var(name: &str, version: u32, size: u32) -> SSAVar {
         SSAVar::new(name, version, size)
     }
@@ -7347,7 +7393,7 @@ mod tests {
         };
 
         let semantic = ctx.debug_semanticize_visible_expr(&raw);
-        let rendered = format!("{semantic:?}");
+        let rendered = spelled(&ctx, &semantic);
         assert!(
             matches!(semantic, CExpr::Member { .. } | CExpr::PtrMember { .. }),
             "raw subscript should promote only through exact layout proof, got {semantic:?}"
@@ -10678,7 +10724,7 @@ mod tests {
         let condition = ctx
             .extract_condition_from_block(entry)
             .expect("tbz branch condition");
-        let rendered = format!("{condition:?}");
+        let rendered = spelled(&ctx, &condition);
         assert!(
             !rendered.contains("w10_1") && !rendered.contains("sym._first_helper"),
             "tbz on loaded w8 must not reuse the prior call owner: {condition:?}",
@@ -13560,7 +13606,7 @@ mod tests {
         let Some(CStmt::Return(Some(expr))) = stmts.last() else {
             panic!("expected trailing return statement, got {stmts:?}");
         };
-        let rendered = format!("{expr:?}");
+        let rendered = spelled(&ctx, &expr);
         assert!(
             matches!(expr, CExpr::Subscript { .. }),
             "expected observed x86 positive-index return to render as subscript, got {expr:?}; stmts={stmts:?}"
@@ -13669,7 +13715,7 @@ mod tests {
         );
 
         let expr = ctx.get_return_expr(&ret);
-        let rendered = format!("{expr:?}");
+        let rendered = spelled(&ctx, &expr);
         assert!(
             rendered.contains("third") && rendered.contains("fourteenth"),
             "expected both semantic member loads in return sum, got {expr:?}"
@@ -13789,7 +13835,7 @@ mod tests {
         let Some(CStmt::Return(Some(expr))) = stmts.last() else {
             panic!("expected return statement, got {stmts:?}");
         };
-        let rendered = format!("{expr:?}");
+        let rendered = spelled(&ctx, &expr);
         assert!(
             rendered.contains("third") && rendered.contains("fourteenth"),
             "expected semantic member loads to survive tracked return emission, got {expr:?}"
@@ -14088,7 +14134,7 @@ mod tests {
         );
 
         let expr = ctx.get_return_expr(&ret);
-        let rendered = format!("{expr:?}");
+        let rendered = spelled(&ctx, &expr);
         assert!(
             rendered.contains("Subscript"),
             "expected negative indexed load to stay a subscript, got {expr:?}"
@@ -14277,7 +14323,7 @@ mod tests {
         let arg4_ssa = ctx.debug_ssa_var_for_visible_name("arg4");
         let stages = ctx.debug_return_expr_stages(&ret);
         let expr = ctx.get_return_expr(&ret);
-        let rendered = format!("{expr:?}");
+        let rendered = spelled(&ctx, &expr);
         assert!(
             matches!(expr, CExpr::Subscript { .. }),
             "expected observed x86 negative-index load to render as subscript, got {expr:?}, stages={stages:?}, canonical={canonical:?}, extracted={extracted:?}, normalized={normalized:?}, inner_access={inner_access:?}, base_norm={base_norm:?}, idx_norm={idx_norm:?}, arg1_ssa={arg1_ssa:?}, arg2_ssa={arg2_ssa:?}, arg4_ssa={arg4_ssa:?}"
@@ -14392,7 +14438,7 @@ mod tests {
             matches!(expr, CExpr::Subscript { .. }),
             "expected observed x86 positive-index load to render as subscript, got {expr:?}"
         );
-        let rendered = format!("{expr:?}");
+        let rendered = spelled(&ctx, &expr);
         assert!(
             rendered.contains("arg2"),
             "expected semantic positive index in observed x86 shape, got {expr:?}"
@@ -14671,7 +14717,7 @@ mod tests {
 
         ctx.analyze_blocks(std::slice::from_ref(&block));
         let expr = ctx.get_return_expr(&ret);
-        let rendered = format!("{expr:?}");
+        let rendered = spelled(&ctx, &expr);
         assert!(
             rendered.contains("f_30") && rendered.contains("f_0"),
             "expected observed x86 struct return to use both fields, got {expr:?}"
