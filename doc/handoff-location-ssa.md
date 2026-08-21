@@ -579,3 +579,30 @@ The original corpus lived in `/tmp` and is gone. `sym._xor_lanes` in
 `/tmp/xmmfix/hashes.c` at `-O2` reproduces the whole family of defects on both
 arm64 and x86-64, and is small enough to read.
 
+### Constraining the composer fixed arm64 and left x86 unchanged
+
+Requiring every tile to be storage the architecture declares (`declares_slot`,
+checking `family_slots` for a slot of exactly that shape) removed the arm64
+regression: `sym._xor_lanes` stayed at zero undefined names and 105 obligations,
+so the composer no longer fires on accidental runs of adjacent definitions.
+
+x86 did not move: still 21 undefined names and 222 obligations against 3 and 78
+without the composer. Naming them says why:
+
+    r2dec undeclared: xmm0_db_1, xmm0_da_1, xmm0_dc_1, xmm0_dd_1,
+                      t80_2, t200_2, ... xmm1_3, xmm2_3, tregalias_2c0_68_1
+
+`XMM0_DA_1` and its three siblings **do** have definitions -- the probe found
+them in `UseInfo::definitions`. They are undefined *on the page*: the composer
+makes the body reference them, and no assignment statement is ever emitted for
+them, so C reads a name nothing wrote.
+
+That is the standing rule that naming a value obliges declaring it, unmet. The
+composer is not the defect; the emitter is. Until a value that is referenced and
+not inlined gets an assignment, composing more references makes the rendering
+worse, so the composer stays out of the tree.
+
+**Next:** make emission total -- every name a rendered body mentions either has
+its definition inlined at the mention or has an assignment statement. Then
+re-land the constrained composer, which is already written and measured.
+
