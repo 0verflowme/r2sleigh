@@ -27,7 +27,27 @@ pub struct CanonicalStorageId {
     pub size: u32,
 }
 
+/// Where a storage lives, without saying how much of it a write touched.
+///
+/// A `CanonicalStorageId` records a slice: `EAX` and `RAX` differ in it because
+/// they differ in size, which makes two writes to one register look like writes
+/// to two places. A location is the register, and the slice is what a
+/// particular access took of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct CanonicalLocation {
+    pub space: CanonicalStorageSpace,
+    pub offset: u64,
+}
+
 impl CanonicalStorageId {
+    /// The place this slice is a slice of.
+    pub const fn location(self) -> CanonicalLocation {
+        CanonicalLocation {
+            space: self.space,
+            offset: self.offset,
+        }
+    }
+
     pub const fn from_varnode(varnode: &r2il::Varnode) -> Self {
         let space = match varnode.space {
             r2il::SpaceId::Ram => CanonicalStorageSpace::Ram,
