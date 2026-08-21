@@ -19007,15 +19007,15 @@ mod tests {
 
         assert_eq!(
             unmapped.expand_return_expr(
-                &crate::symbol::var_ref(&symbols, "value_3e480"),
+                &unmapped.name_ref("value_3e480"),
                 0,
                 &mut HashSet::new()
             ),
-            crate::symbol::var_ref(&symbols, "value_3e480")
+            unmapped.name_ref("value_3e480")
         );
         assert_eq!(
-            unmapped.expand_return_expr(&crate::symbol::var_ref(&symbols, "t42_1"), 0, &mut HashSet::new()),
-            crate::symbol::var_ref(&symbols, "t42_1")
+            unmapped.expand_return_expr(&unmapped.name_ref("t42_1"), 0, &mut HashSet::new()),
+            unmapped.name_ref("t42_1")
         );
         unmapped
             .state
@@ -19025,11 +19025,11 @@ mod tests {
             .insert("ordinary_alias".to_string(), CExpr::IntLit(9));
         assert_eq!(
             unmapped.expand_return_expr(
-                &crate::symbol::var_ref(&symbols, "ordinary_alias"),
+                &unmapped.name_ref("ordinary_alias"),
                 0,
                 &mut HashSet::new()
             ),
-            crate::symbol::var_ref(&symbols, "ordinary_alias")
+            unmapped.name_ref("ordinary_alias")
         );
 
         let mut mapped = make_x86_64_ctx();
@@ -19048,7 +19048,7 @@ mod tests {
 
         assert_eq!(
             mapped.expand_return_expr(
-                &crate::symbol::var_ref(&symbols, "value_3e480"),
+                &mapped.name_ref("value_3e480"),
                 0,
                 &mut HashSet::new()
             ),
