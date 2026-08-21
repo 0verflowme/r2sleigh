@@ -1547,6 +1547,29 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         if let Some(rejoin) = rejoin {
             let label = self.ensure_label(rejoin);
             stmts.push(CStmt::Goto(label));
+        } else if let Some(branch) = chain.last().copied()
+            && let BlockTerminator::ConditionalBranch {
+                true_target,
+                false_target,
+            } = self.branch_targets(branch)
+        {
+            // The last block asks a question, so the exit goes two ways from
+            // here and each way is an exit continuation in its own right.
+            let then_stmt = self.exit_continuation_stmt(true_target)?;
+            let else_stmt = self.exit_continuation_stmt(false_target)?;
+            let (cond, predicate, condition_value) =
+                self.get_branch_condition_with_predicate(branch);
+            let Some(cond) = cond else {
+                return Err(Some(format!(
+                    "exit continuation block 0x{branch:x} branches on nothing this can read"
+                )));
+            };
+            self.record_branch_render_proof(branch, predicate, condition_value);
+            stmts.push(CStmt::If {
+                cond,
+                then_body: Box::new(then_stmt),
+                else_body: Some(Box::new(else_stmt)),
+            });
         }
         Ok(match stmts.len() {
             0 => CStmt::Empty,
@@ -1557,6 +1580,15 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
 
     /// The blocks an unlabelled exit runs through, or nothing if placing them
     /// at the exit would not say what the function does.
+    /// How a block leaves, when the structuring never claimed it.
+    fn branch_targets(&self, addr: u64) -> BlockTerminator {
+        self.func
+            .cfg()
+            .get_block(addr)
+            .map(|block| block.terminator.clone())
+            .unwrap_or(BlockTerminator::IndirectBranch)
+    }
+
     fn exit_continuation_chain(
         &self,
         target: u64,
@@ -1582,18 +1614,18 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             let Some(block) = self.func.get_block(current) else {
                 return Err(None);
             };
-            // A merge, or a block another edge reaches, is not this exit's to
-            // place: putting it here would say it runs once per edge.
-            if !block.phis.is_empty() {
-                return Err(Some(format!(
-                    "exit continuation block 0x{current:x} owns {} phi node(s)",
-                    block.phis.len()
-                )));
-            }
+            // A block another edge also reaches is not this exit's to place:
+            // putting it here would say it runs once per edge.
             let predecessors = self.func.predecessors(current).len();
             if predecessors != 1 {
                 return Err(Some(format!(
                     "exit continuation block 0x{current:x} is reached by {predecessors} edges"
+                )));
+            }
+            if !block.phis.is_empty() {
+                return Err(Some(format!(
+                    "exit continuation block 0x{current:x} owns {} phi node(s) behind one edge",
+                    block.phis.len()
                 )));
             }
             chain.push(current);
@@ -1601,14 +1633,10 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                 // Nothing follows, so the exit ends here and the chain is whole.
                 [] => return Ok((chain, None)),
                 [next] => current = *next,
-                // A branch is a region of its own and needs the structuring to
-                // say which way it goes, which this walk cannot.
-                successors => {
-                    return Err(Some(format!(
-                        "exit continuation block 0x{current:x} branches {} ways",
-                        successors.len()
-                    )));
-                }
+                // A branch splits the exit in two, and each way is an exit
+                // continuation of its own. The block itself is rendered by the
+                // caller, which knows the condition it branches on.
+                _ => return Ok((chain, None)),
             }
         }
     }
