@@ -358,9 +358,27 @@ share rises only because the body shrank and took the denominator with it, from
 inserts, so shares are comparable only when totals are, and the honest reading is
 what the body says rather than what the ratio does.
 
-Re-measuring also sharpened the defect it was meant to check. arm64 renders that
-four-armed chain correctly; x86-64 drops an arm from the same source. So this is
-not a general failure to structure a comparison chain, and issue 63 says so.
+Re-measuring also sharpened the defect it was meant to check, twice, and the
+second sharpening is the useful one. arm64 renders that four-armed chain
+correctly and x86-64 does not, which read as a dropped branch. There is no
+branch: clang compiled that arm branchlessly on both targets. What x86-64 emits
+is
+
+    xor eax, eax        ; zero the 32-bit register
+    cmp edi, 0x65
+    setge al            ; write the low byte
+    inc eax             ; read all four
+
+and the rendering returns the constant, having lost the `setcc`. arm64 does the
+same thing with `cinc` and `csel` and is rendered correctly, so this is not about
+branchless selection either. It is that `al` and `eax` share an offset and differ
+in width and are not connected.
+
+That is this decision's own subject, reached from a direction that has nothing to
+do with loop carriers, return registers or SIMD lanes: a value written at one
+width and read at another is lost, because storage identity records a slice
+rather than a location. Four independent defects now share that root, and the
+last one was found by a fixture written to ask a different question entirely.
 
 Demotion therefore means asking whether the predicate facts `r2ssa` already
 computes could deliver those conditions directly, so that nothing downstream has
