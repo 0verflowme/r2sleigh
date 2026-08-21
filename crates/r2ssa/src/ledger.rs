@@ -61,6 +61,8 @@ pub enum ElisionReason {
     DeadCallArgument,
     /// A write to the stack base that frame handling accounts for instead.
     DeadStackBase,
+    /// A merge no observation depends on, so nothing reads what it decides.
+    UnobservedMerge,
     /// Proven dead, with no rule yet naming which kind of dead it is.
     DeadUnclassified,
 }
@@ -75,6 +77,7 @@ impl std::fmt::Display for ElisionReason {
             Self::DeadCallerSaved => "dead-caller-saved",
             Self::DeadCallArgument => "dead-call-arg",
             Self::DeadStackBase => "dead-stack-base",
+            Self::UnobservedMerge => "unobserved-merge",
             Self::DeadUnclassified => "dead-unclassified",
         })
     }

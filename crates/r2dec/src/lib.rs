@@ -1500,10 +1500,11 @@ fn build_obligation_ledger(
     elided_op_sites: &std::collections::BTreeMap<(u64, usize), &'static str>,
 ) -> r2ssa::ledger::ObligationLedger {
     use r2ssa::SemanticObligationKind as Kind;
-    use r2ssa::ledger::{LedgerLayer, ObligationLedger, Outcome, RefusalReason};
+    use r2ssa::ledger::{ElisionReason, LedgerLayer, ObligationLedger, Outcome, RefusalReason};
 
     let obligations = prepared.obligations();
     let graph = prepared.graph();
+    let unobserved = prepared.unobserved_merges();
     let mut ledger = ObligationLedger::open(obligations);
 
     // InstId is a dense index, so membership is a direct probe rather than a tree
@@ -1537,6 +1538,21 @@ fn build_obligation_ledger(
                     reason: RefusalReason::UnsupportedEffect,
                 },
             );
+            continue;
+        }
+        // A merge no observation depends on decides nothing a reader could see, so
+        // it owes no output. Leaving it unaccounted said the rendering had lost
+        // something, when what it had was an effect the program does not have.
+        if let r2ssa::CanonicalInstructionSite::Phi(_) = id.instruction.site
+            && obligations
+                .instructions()
+                .get(&id.instruction)
+                .and_then(|disposition| disposition.source.graph_inst())
+                .and_then(|inst| graph.inst(inst))
+                .and_then(|inst| inst.output)
+                .is_some_and(|value| unobserved.contains(value))
+        {
+            ledger.record(*id, Outcome::Elided(ElisionReason::UnobservedMerge));
             continue;
         }
         let block_rendered = folded_blocks.contains(&id.instruction.block_addr);
