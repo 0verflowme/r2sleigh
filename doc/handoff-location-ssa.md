@@ -234,6 +234,35 @@ could be satisfied by declaring the word. It should be a test.
 3. **Location model substrate.** Locations replace varnodes; lanes become
    sub-ranges. This is the fix for all four original defects and the point of
    the exercise. Everything so far is the substrate it needs.
+
+   `CanonicalLocation` exists now (`r2source::contracts`) and
+   `CanonicalStorageId::location()` returns it. Nothing reads it yet. I tried to
+   spend it immediately on the obvious target and backed out; the reason is
+   worth knowing before you try the same thing.
+
+   `return_value_register_family` in `r2ssa::semantic` is a hardcoded table
+   mapping `rax|eax|ax|al` to one family, `x0|w0` to another, and so on. It is
+   spelling knowledge standing in for a location, and it only works on the
+   architectures somebody listed. Replacing it with "same location" is exactly
+   what the location model is for, and the machine context reaches the phi
+   picker in two hops, which I threaded successfully.
+
+   It does not finish, because **the source contract never captures which
+   location holds a return value.** There is `return_address_storage`,
+   `stack_pointer_storage` and `frame_pointer_storage`, but no
+   return-value storage anywhere in `SourceMachineRoles` or the function
+   interface. Without it the picker cannot ask "is this the return register",
+   and grouping every register phi by location instead changes what the rule
+   means: today a block with `rbx` and `rax` phis answers `rax` because `rbx`
+   is not in the family table, and a location-only rule would see two locations
+   and refuse.
+
+   So the first piece of step 3 is a contract change: the source should state
+   the location that carries a return value, the same way it states the one
+   that carries a return address. Then the family table deletes, and it deletes
+   for every architecture rather than eight. Do not paper over the missing
+   contract by loosening the picker -- that trades a hack you can see for one
+   you cannot.
 4. **Make the repair pass conditional.** Not deletable — it does real work for
    SIMD lanes — but it should not run unconditionally.
 5. Guard that no facts method is shaped like a rendering decision.
