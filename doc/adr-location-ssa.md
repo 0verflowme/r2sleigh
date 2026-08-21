@@ -31,13 +31,26 @@ but by nothing that decides liveness.
 Aliasing is instead repaired after SSA construction by splicing `Subpiece`
 projections into predecessor blocks under synthesized names of the form
 `tmp:regalias:phi:{block}:{phi}:{source}`. Those names are what reach rendered C.
-The workaround and the symptom are the same object.
 
-Because storage identity is wrong, three separate liveness decisions in three
-crates each reject the accumulator for a different reason, and a value must
-survive all of them. Of twenty-four phis at one loop header, exactly one passes,
-and it passes only because it happens to be both a memory-address operand and a
-loop-predicate operand.
+That repair pass turned out to do its dataflow job correctly. Dumping the SSA
+showed it rewrites the loop body's read of `EAX` onto `RAX`, which leaves the
+narrow phi genuinely dead and the wide one a complete single-value carrier. The
+first published account of this defect blamed the resulting empty use list and
+was wrong; that emptiness is right.
+
+What per-slice identity actually breaks is every rule that has to decide whether
+two values are the same place. The exit block merges a phi for `EAX` and a phi
+for `RAX`, and the rule choosing the returned value wanted exactly one candidate,
+found two, and certified that the function returned nothing. With no return among
+the observable roots the accumulator's carrier was reachable from nothing, so it
+acquired no binding, so nothing materialised it, so every operation feeding it
+was dead and the loop body was eliminated. The rendered `void` signature had the
+same cause. The loop index survived only because it is both a memory-address
+operand and a loop-predicate operand, so the backward slice reached it twice.
+
+The lesson for this design is that the defect is not in one liveness check. It is
+that storage identity records a slice, and rules across three crates ask identity
+questions of it that only a location can answer.
 
 Separately, obligations are counted during the fold, structuring then deletes the
 statements, and the rendered proof line prints how many obligations are owned and
