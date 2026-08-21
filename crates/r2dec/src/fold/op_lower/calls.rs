@@ -281,7 +281,7 @@ impl<'a> FoldingContext<'a> {
     #[cfg(test)]
     fn normalize_prepared_call_arg_expr(&self, arg: CExpr) -> CExpr {
         let original_param_home = match &arg {
-            CExpr::Var(name) if self.is_static_param_home_alias_name(&self.spelling(*name)) => Some(name.clone()),
+            CExpr::Var(name) if self.is_static_param_home_alias_name(*name) => Some(name.clone()),
             _ => None,
         };
         let rewritten = self.rewrite_imported_call_arg_expr_with_prepared_owners(
@@ -291,7 +291,7 @@ impl<'a> FoldingContext<'a> {
         );
         let normalized = self.sanitize_public_call_arg_expr(self.rewrite_stack_expr(rewritten));
         if let Some(name) = original_param_home
-            && matches!(&normalized, CExpr::Deref(inner) if matches!(inner.as_ref(), CExpr::Var(inner_name) if self.spelling(*inner_name).eq_ignore_ascii_case(&*self.spelling(*name))))
+            && matches!(&normalized, CExpr::Deref(inner) if matches!(inner.as_ref(), CExpr::Var(inner_name) if self.spelling(*inner_name).eq_ignore_ascii_case(&*self.spelling(name))))
         {
             return arg;
         }

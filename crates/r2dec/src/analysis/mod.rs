@@ -543,7 +543,7 @@ impl UseInfo {
         blocks: &[SSABlock],
         env: &PassEnv<'_>,
     ) -> Self {
-        use_info::analyze_for_local_struct_accesses(&symbols, blocks, env)
+        use_info::analyze_for_local_struct_accesses(env.symbols, blocks, env)
     }
 
     pub(crate) fn analyze_for_local_struct_accesses_with_control(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 

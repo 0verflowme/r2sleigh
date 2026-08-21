@@ -11716,7 +11716,9 @@ mod tests {
             "r8".to_string(),
             "r9".to_string(),
         ]));
+        let fixture_symbols = test_table();
         let env = PassEnv {
+            symbols: &fixture_symbols,
             carrier_aliases: crate::analysis::no_carrier_aliases(),
             string_literals: crate::analysis::lower::no_string_literals(),
             ptr_size: 8,

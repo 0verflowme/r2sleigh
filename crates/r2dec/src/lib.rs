@@ -5191,7 +5191,6 @@ fn infer_local_struct_field_accesses(
     let type_hints = std::collections::HashMap::new();
     let function_names = std::collections::HashMap::new();
     let strings = std::collections::HashMap::new();
-    let symbols = std::collections::HashMap::new();
     let mut param_register_aliases = std::collections::HashMap::new();
     let mut arg_slot_map = std::collections::HashMap::new();
 
@@ -5221,7 +5220,7 @@ fn infer_local_struct_field_accesses(
         strings: &strings,
         #[cfg(test)]
         binary_symbols: &binary_symbols,
-        symbols: &test_table(),
+        symbols: &fixture_symbols,
         callee_facts: analysis::empty_callee_facts(),
         callee_resolution: None,
         summary_view: None,
@@ -5234,7 +5233,8 @@ fn infer_local_struct_field_accesses(
 
     let blocks: Vec<_> = func.blocks().cloned().collect();
     let use_info = analysis::UseInfo::analyze_for_local_struct_accesses(&blocks, &env);
-    analysis::use_info::collect_local_struct_field_access_profiles(&symbols, 
+    analysis::use_info::collect_local_struct_field_access_profiles(
+        &fixture_symbols,
         &use_info,
         func,
         &env,
@@ -6929,8 +6929,7 @@ mod tests {
         let config = DecompilerConfig::aarch64();
         let function_names = std::collections::HashMap::new();
         let strings = std::collections::HashMap::new();
-        let symbols = std::collections::HashMap::new();
-        let type_hints = std::collections::HashMap::new();
+            let type_hints = std::collections::HashMap::new();
         let mut param_register_aliases = std::collections::HashMap::new();
         let mut arg_slot_map = std::collections::HashMap::new();
         for (idx, reg_name) in config.arg_regs.iter().enumerate() {
@@ -6964,8 +6963,9 @@ mod tests {
             type_oracle: None,
         };
         let blocks: Vec<_> = func.blocks().cloned().collect();
-        let use_info = analysis::UseInfo::analyze(&symbols, &blocks, &env);
-        let profiles = analysis::use_info::collect_local_struct_field_access_profiles(&symbols, 
+        let use_info = analysis::UseInfo::analyze(&fixture_symbols, &blocks, &env);
+        let profiles = analysis::use_info::collect_local_struct_field_access_profiles(
+        &fixture_symbols,
             &use_info,
             &func,
             &env,
@@ -7100,8 +7100,7 @@ mod tests {
         let config = DecompilerConfig::x86_64();
         let function_names = std::collections::HashMap::new();
         let strings = std::collections::HashMap::new();
-        let symbols = std::collections::HashMap::new();
-        let type_hints = std::collections::HashMap::new();
+            let type_hints = std::collections::HashMap::new();
         let mut param_register_aliases = std::collections::HashMap::new();
         let mut arg_slot_map = std::collections::HashMap::new();
         for (idx, reg_name) in config.arg_regs.iter().enumerate() {
@@ -7136,7 +7135,8 @@ mod tests {
         };
         let blocks: Vec<_> = func.blocks().cloned().collect();
         let use_info = analysis::UseInfo::analyze_for_local_struct_accesses(&blocks, &env);
-        let profiles = analysis::use_info::collect_local_struct_field_access_profiles(&symbols, 
+        let profiles = analysis::use_info::collect_local_struct_field_access_profiles(
+        &fixture_symbols,
             &use_info,
             &func,
             &env,
@@ -7326,8 +7326,7 @@ mod tests {
         let config = DecompilerConfig::x86_64();
         let function_names = std::collections::HashMap::new();
         let strings = std::collections::HashMap::new();
-        let symbols = std::collections::HashMap::new();
-        let type_hints = std::collections::HashMap::new();
+            let type_hints = std::collections::HashMap::new();
         let mut param_register_aliases = std::collections::HashMap::new();
         let mut arg_slot_map = std::collections::HashMap::new();
         for (idx, reg_name) in config.arg_regs.iter().enumerate() {
@@ -7362,7 +7361,8 @@ mod tests {
         };
         let blocks: Vec<_> = func.blocks().cloned().collect();
         let use_info = analysis::UseInfo::analyze_for_local_struct_accesses(&blocks, &env);
-        let profiles = analysis::use_info::collect_local_struct_field_access_profiles(&symbols, 
+        let profiles = analysis::use_info::collect_local_struct_field_access_profiles(
+        &fixture_symbols,
             &use_info,
             &func,
             &env,
@@ -9999,7 +9999,7 @@ mod tests {
             locals: Vec::new(),
             body: vec![CStmt::Expr(CExpr::call(
                 CExpr::var(symbols.borrow_mut().declare_or_reuse("sym.rpl_mbrtoc32")),
-                Vec::new(),symbols.borrow_mut().declare_or_reuse("sym.rpl_mbrtoc32")
+                Vec::new(),
             ))],
         };
 
