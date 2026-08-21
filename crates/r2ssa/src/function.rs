@@ -613,6 +613,15 @@ impl SsaArtifact {
         crate::abi::AbiProfile::from_machine_context(&self.machine_context)
     }
 
+    /// The merges no value observation depends on.
+    ///
+    /// Published rather than removed. Rules choosing among candidates should skip
+    /// these; rules simulating machine state still need them, because a merge can
+    /// be the only statement of what a register holds at a loop head.
+    pub fn unobserved_merges(&self) -> crate::deadphi::DeadPhis {
+        crate::deadphi::DeadPhis::find(&self.function, &self.graph, &self.live_out())
+    }
+
     /// The values this function hands back, which have no reader inside it.
     pub fn live_out(&self) -> crate::liveout::FunctionLiveOut {
         match self.abi() {

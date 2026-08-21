@@ -14,8 +14,14 @@
 //! answer applies -- a value is observed if something with an effect depends on
 //! it, and a merge no observation depends on is not part of the program.
 //!
-//! This reports what it found rather than editing the function, so a caller can
-//! act on it, count it, or disagree with it.
+//! This reports what it found rather than editing the function, and that is not
+//! caution: the symbolic executor propagates machine state through merges, so a
+//! merge no value observation depends on can still be the only thing telling the
+//! executor what a register holds at a loop head. Removing them outright loses a
+//! VM dispatch summary that depended on exactly such a merge. Two consumers hold
+//! different and both-correct views of the same function, so the set is published
+//! for the rules that reason about candidates and the function is left alone for
+//! the rules that simulate it.
 
 use std::collections::{BTreeSet, VecDeque};
 
