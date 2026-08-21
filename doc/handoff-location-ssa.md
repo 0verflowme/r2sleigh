@@ -182,9 +182,33 @@ Every one was a real defect that the branding exposed, not churn:
 **Step 2 is not finished.** 83 failing tests, and the cross-table question above
 is unanswered.
 
-**Not yet validated against either corpus.** Nothing here has been checked
-against `/tmp/r2stest` (the crc32 and FNV hash functions) or
-`tests/gold/flag_materialisation.c`. Zero compiler errors was never the
+**Not validated against either corpus, and there is a trap here.** Read this
+before trying.
+
+`pdc` is radare2's own pseudo-decompiler, not r2sleigh's renderer. It answers
+happily and prints raw register arithmetic (`al &= byte [rsp + riz*8 + ...]`).
+Comparing `pdc` output across two builds of this plugin proves nothing about the
+renderer, and I made exactly that mistake before catching it — the outputs were
+byte-identical because neither of them came from r2sleigh at all.
+
+r2sleigh's command is `sla.dec`, and it needs the engine activated with `a:sla`
+and the fork's own radare2 binary with `DYLD_LIBRARY_PATH` set across
+`libr/*` — see `/tmp/dump_all.sh` for the invocation that produced the recorded
+renderings in `/tmp/r2stest/at_*.txt`.
+
+**`sla.dec` currently prints nothing for `sym._fnv1a64` in `hashes_x64_O2.o`,
+and it prints nothing on the pre-rewrite tree too.** I installed the baseline
+plugin from the untouched checkout and confirmed this, so it is not a regression
+from the migration — but it does mean no corpus comparison was possible. There
+is a known failure mode where `sla.dec` prints nothing instead of refusing;
+whoever picks this up should find out whether that is what is happening before
+reading anything into a silent render. The analysis log shows one function
+refused for an unrelated lift error (`r0x00000def: Unable to resolve
+constructor`), which may or may not be connected.
+
+The recorded renderings in `/tmp/r2stest/at_*.txt` show what good output looks
+like, including the obligation ledger line, so the renderer does work when
+correctly driven. Zero compiler errors was never the
 milestone; rendering those two corpora correctly is. When comparing obligation
 counts, compare rendered-as-a-share-of-total **only when the totals match** — the
 repair pass creates obligations for its own inserted ops, and I got this
