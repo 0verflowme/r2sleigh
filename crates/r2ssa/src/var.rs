@@ -184,6 +184,15 @@ impl SSAVar {
     }
 
     /// Check if this is a temporary SSA value.
+    /// The register-space offset this name stands for, when it names one.
+    ///
+    /// A varnode the architecture does not name is spelled from its offset, so
+    /// that offset is recoverable and is the only thing identifying the storage.
+    pub fn register_offset(&self) -> Option<u64> {
+        let rest = self.name.strip_prefix("reg:")?;
+        u64::from_str_radix(rest, 16).ok()
+    }
+
     pub fn is_temp(&self) -> bool {
         self.name_kind().is_temporary()
     }

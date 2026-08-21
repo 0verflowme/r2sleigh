@@ -3329,6 +3329,8 @@ struct RegisterFamilyMember {
 #[derive(Debug, Clone, Default)]
 struct RegisterFamilyInfo {
     name_to_member: HashMap<String, RegisterFamilyMember>,
+    /// Which family covers a register-space range, for storage the arch does not name.
+    family_ranges: Vec<(u64, u64, usize)>,
     family_widths_by_offset: HashMap<(usize, u64), Vec<u32>>,
     family_slots: HashMap<usize, Vec<RegisterFamilySlot>>,
 }
@@ -3501,8 +3503,24 @@ impl RegisterFamilyInfo {
             slots.dedup();
         }
 
+        let mut family_ranges: Vec<(u64, u64, usize)> = Vec::new();
+        for (idx, reg) in regs.iter().enumerate() {
+            let family_id = root_to_family[&find(&mut parents, idx)];
+            family_ranges.push((reg.offset, range_end(reg), family_id));
+        }
+        family_ranges.sort_unstable();
+        family_ranges.dedup();
+        let mut merged: Vec<(u64, u64, usize)> = Vec::with_capacity(family_ranges.len());
+        for (start, end, family_id) in family_ranges {
+            match merged.last_mut() {
+                Some(last) if last.2 == family_id && start <= last.1 => last.1 = last.1.max(end),
+                _ => merged.push((start, end, family_id)),
+            }
+        }
+
         Self {
             name_to_member,
+            family_ranges: merged,
             family_widths_by_offset,
             family_slots,
         }
@@ -3512,13 +3530,34 @@ impl RegisterFamilyInfo {
         if let Some(member) = self.name_to_member.get(var.name.as_str()) {
             return Some(*member);
         }
-        if var.name.bytes().any(|byte| byte.is_ascii_uppercase()) {
-            return self
+        if var.name.bytes().any(|byte| byte.is_ascii_uppercase())
+            && let Some(member) = self
                 .name_to_member
                 .get(var.name.to_ascii_lowercase().as_str())
-                .copied();
+        {
+            return Some(*member);
         }
-        None
+        self.member_at_offset(var.register_offset()?, var.size)
+    }
+
+    /// Which family a storage range belongs to, for a varnode the arch does not name.
+    ///
+    /// Family membership is a fact about storage, so an unnamed sub-range of a
+    /// register belongs to the same family as the register that contains it.
+    fn member_at_offset(&self, offset: u64, size: u32) -> Option<RegisterFamilyMember> {
+        let end = offset.checked_add(size as u64)?;
+        let idx = self
+            .family_ranges
+            .partition_point(|(start, _, _)| *start <= offset);
+        let (start, family_end, family_id) = *self.family_ranges[..idx].iter().rev().next()?;
+        if offset < start || end > family_end {
+            return None;
+        }
+        Some(RegisterFamilyMember {
+            family_id,
+            offset,
+            width: size,
+        })
     }
 }
 
