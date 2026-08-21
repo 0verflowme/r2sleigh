@@ -2103,7 +2103,7 @@ pub(crate) fn collect_local_struct_field_access_profiles(
                     space: SpaceId::Ram,
                     addr,
                 } => {
-                    if let Some(profile) = struct_field_access_profile_for_addr(
+                    if let Some(profile) = struct_field_access_profile_for_addr(&symbols, 
                         info,
                         addr,
                         dst.size,
@@ -2119,7 +2119,7 @@ pub(crate) fn collect_local_struct_field_access_profiles(
                     addr,
                     val,
                 } => {
-                    if let Some(profile) = struct_field_access_profile_for_addr(
+                    if let Some(profile) = struct_field_access_profile_for_addr(&symbols, 
                         info,
                         addr,
                         val.size,
@@ -2148,6 +2148,7 @@ pub(crate) fn collect_local_struct_field_access_profiles(
 
 #[cfg(test)]
 fn struct_field_access_profile_for_addr(
+    symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
     info: &UseInfo,
     addr: &SSAVar,
     access_size: u32,
@@ -2166,7 +2167,7 @@ fn struct_field_access_profile_for_addr(
     let BaseRef::Value(base_ref) = &shape.base else {
         return None;
     };
-    let arg_index = arg_slot_for_value_ref(info, base_ref, env, arg_slot_map, 0)?;
+    let arg_index = arg_slot_for_value_ref(&symbols, info, base_ref, env, arg_slot_map, 0)?;
 
     Some(LocalStructFieldAccessProfile {
         arg_index,
@@ -2178,6 +2179,7 @@ fn struct_field_access_profile_for_addr(
 
 #[cfg(test)]
 fn arg_slot_for_value_ref(
+    symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
     info: &UseInfo,
     value_ref: &ValueRef,
     env: &PassEnv<'_>,
@@ -2200,7 +2202,7 @@ fn arg_slot_for_value_ref(
         match value {
             SemanticValue::Scalar(ScalarValue::Root(root)) => {
                 if root.var != value_ref.var {
-                    return arg_slot_for_value_ref(info, root, env, arg_slot_map, depth + 1);
+                    return arg_slot_for_value_ref(&symbols, info, root, env, arg_slot_map, depth + 1);
                 }
             }
             SemanticValue::Address(NormalizedAddr {
@@ -2208,7 +2210,7 @@ fn arg_slot_for_value_ref(
                 ..
             }) => {
                 if root.var != value_ref.var {
-                    return arg_slot_for_value_ref(info, root, env, arg_slot_map, depth + 1);
+                    return arg_slot_for_value_ref(&symbols, info, root, env, arg_slot_map, depth + 1);
                 }
             }
             SemanticValue::Load {
@@ -2221,7 +2223,7 @@ fn arg_slot_for_value_ref(
                 ..
             } => {
                 if root.var != value_ref.var {
-                    return arg_slot_for_value_ref(info, root, env, arg_slot_map, depth + 1);
+                    return arg_slot_for_value_ref(&symbols, info, root, env, arg_slot_map, depth + 1);
                 }
             }
             _ => {}
@@ -2232,7 +2234,7 @@ fn arg_slot_for_value_ref(
         && let Some(source_var) = &prov.source_var
         && *source_var != value_ref.var
     {
-        return arg_slot_for_value_ref(
+        return arg_slot_for_value_ref(&symbols, 
             info,
             &ValueRef::from(source_var),
             env,

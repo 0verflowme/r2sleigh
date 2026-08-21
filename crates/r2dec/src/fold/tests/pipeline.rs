@@ -1308,7 +1308,7 @@ mod tests {
         );
 
         assert!(
-            expr_contains_var(&sum_rhs, "sum") && !expr_contains_addr_of(&sum_rhs),
+            expr_contains_var(&ctx, &sum_rhs, "sum") && !expr_contains_addr_of(&sum_rhs),
             "scalar sum update should not expose address aliases: {sum_rhs:?}"
         );
         assert_eq!(
@@ -1354,7 +1354,7 @@ mod tests {
         }
     }
 
-    fn expr_contains_flag_artifact(expr: &CExpr) -> bool {
+    fn expr_contains_flag_artifact(ctx: &FoldingContext<'_>, expr: &CExpr) -> bool {
         match expr {
             CExpr::Var(name) => {
                 let lower = ctx.spelling(*name).to_lowercase();
@@ -1364,25 +1364,25 @@ mod tests {
                     || lower.starts_with("cf_")
             }
             CExpr::Binary { left, right, .. } => {
-                expr_contains_flag_artifact(left) || expr_contains_flag_artifact(right)
+                expr_contains_flag_artifact(ctx, left) || expr_contains_flag_artifact(ctx, right)
             }
-            CExpr::Unary { operand, .. } => expr_contains_flag_artifact(operand),
-            CExpr::Paren(inner) => expr_contains_flag_artifact(inner),
-            CExpr::Cast { expr: inner, .. } => expr_contains_flag_artifact(inner),
-            CExpr::Deref(inner) => expr_contains_flag_artifact(inner),
+            CExpr::Unary { operand, .. } => expr_contains_flag_artifact(ctx, operand),
+            CExpr::Paren(inner) => expr_contains_flag_artifact(ctx, inner),
+            CExpr::Cast { expr: inner, .. } => expr_contains_flag_artifact(ctx, inner),
+            CExpr::Deref(inner) => expr_contains_flag_artifact(ctx, inner),
             CExpr::Subscript { base, index } => {
-                expr_contains_flag_artifact(base) || expr_contains_flag_artifact(index)
+                expr_contains_flag_artifact(ctx, base) || expr_contains_flag_artifact(ctx, index)
             }
-            CExpr::Member { base, .. } => expr_contains_flag_artifact(base),
-            CExpr::PtrMember { base, .. } => expr_contains_flag_artifact(base),
+            CExpr::Member { base, .. } => expr_contains_flag_artifact(ctx, base),
+            CExpr::PtrMember { base, .. } => expr_contains_flag_artifact(ctx, base),
             CExpr::Call { func, args } => {
-                expr_contains_flag_artifact(func) || args.iter().any(expr_contains_flag_artifact)
+                expr_contains_flag_artifact(ctx, func) || args.iter().any(expr_contains_flag_artifact)
             }
             _ => false,
         }
     }
 
-    fn expr_contains_var(expr: &CExpr, target: &str) -> bool {
+    fn expr_contains_var(ctx: &FoldingContext<'_>, expr: &CExpr, target: &str) -> bool {
         match expr {
             CExpr::External { .. } => false,
             CExpr::Var(name) => &*ctx.spelling(*name) == target,
@@ -1391,30 +1391,30 @@ mod tests {
             | CExpr::Deref(operand)
             | CExpr::AddrOf(operand)
             | CExpr::Sizeof(operand)
-            | CExpr::Cast { expr: operand, .. } => expr_contains_var(operand, target),
+            | CExpr::Cast { expr: operand, .. } => expr_contains_var(ctx, operand, target),
             CExpr::Binary { left, right, .. } => {
-                expr_contains_var(left, target) || expr_contains_var(right, target)
+                expr_contains_var(ctx, left, target) || expr_contains_var(ctx, right, target)
             }
             CExpr::Subscript { base, index } => {
-                expr_contains_var(base, target) || expr_contains_var(index, target)
+                expr_contains_var(ctx, base, target) || expr_contains_var(ctx, index, target)
             }
             CExpr::Member { base, .. } | CExpr::PtrMember { base, .. } => {
-                expr_contains_var(base, target)
+                expr_contains_var(ctx, base, target)
             }
             CExpr::Call { func, args } => {
-                expr_contains_var(func, target)
-                    || args.iter().any(|arg| expr_contains_var(arg, target))
+                expr_contains_var(ctx, func, target)
+                    || args.iter().any(|arg| expr_contains_var(&ctx, arg, target))
             }
             CExpr::Ternary {
                 cond,
                 then_expr,
                 else_expr,
             } => {
-                expr_contains_var(cond, target)
-                    || expr_contains_var(then_expr, target)
-                    || expr_contains_var(else_expr, target)
+                expr_contains_var(ctx, cond, target)
+                    || expr_contains_var(ctx, then_expr, target)
+                    || expr_contains_var(ctx, else_expr, target)
             }
-            CExpr::Comma(items) => items.iter().any(|item| expr_contains_var(item, target)),
+            CExpr::Comma(items) => items.iter().any(|item| expr_contains_var(&ctx, item, target)),
             CExpr::IntLit(_)
             | CExpr::UIntLit(_)
             | CExpr::FloatLit(_)
@@ -9866,7 +9866,7 @@ mod tests {
             "Predicate copy helper should preserve high-level comparison form"
         );
         assert!(
-            !expr_contains_flag_artifact(&rhs),
+            !expr_contains_flag_artifact(ctx, &rhs),
             "Predicate copy helper output should not contain raw flag temporaries"
         );
         assert!(
@@ -9933,7 +9933,7 @@ mod tests {
             "Negated predicate assignment must not collapse to a literal"
         );
         assert!(
-            !expr_contains_flag_artifact(negated_rhs),
+            !expr_contains_flag_artifact(ctx, negated_rhs),
             "BoolNot assignment should not reintroduce raw flag artifacts"
         );
     }
@@ -10301,7 +10301,7 @@ mod tests {
             )
         );
         assert!(
-            !expr_contains_flag_artifact(&rhs),
+            !expr_contains_flag_artifact(ctx, &rhs),
             "predicate copy chain should collapse to the recovered comparison"
         );
         assert!(
@@ -11400,14 +11400,6 @@ mod tests {
     fn call_source_proof_raw_owner_recovery_rejects_alias_owner_without_function_facts() {
         fn seed_owner(ctx: &mut FoldingContext<'_>, source_call: (u64, usize), alias: &str) {
             let symbols = test_table();
-            let symbols = test_table();
-            let symbols = test_table();
-            let symbols = test_table();
-            let symbols = test_table();
-            let symbols = test_table();
-            let symbols = test_table();
-            let symbols = test_table();
-            let symbols = test_table();
             ctx.state
                 .analysis_ctx
                 .use_info
@@ -11425,12 +11417,12 @@ mod tests {
                 .insert(alias.to_ascii_lowercase(), 1);
         }
 
-        let helper_call = CExpr::call(
-            ctx.name_ref("sym.imp.helper"),
-            vec![ctx.name_ref("arg1")],
-        );
 
         let mut exact_ctx = make_aarch64_ctx();
+        let helper_call = CExpr::call(
+            exact_ctx.name_ref("sym.imp.helper"),
+            vec![exact_ctx.name_ref("arg1")],
+        );
         let exact_call = (0x1000, 0);
         exact_ctx
             .state
@@ -11469,11 +11461,11 @@ mod tests {
         );
 
         let unresolved_candidate = CExpr::call(
-            CExpr::deref(ctx.name_ref("fp_a")),
+            CExpr::deref(ambiguous_ctx.name_ref("fp_a")),
             vec![CExpr::IntLit(1)],
         );
         let unresolved_observed = CExpr::call(
-            CExpr::deref(ctx.name_ref("fp_b")),
+            CExpr::deref(ambiguous_ctx.name_ref("fp_b")),
             vec![CExpr::IntLit(1)],
         );
         let mut unresolved_ctx = make_aarch64_ctx();
@@ -19177,6 +19169,7 @@ mod tests {
 
     #[test]
     fn recovered_call_arg_rejects_low_signal_sources_without_better_proof() {
+        let ctx = make_x86_64_ctx();
         let cases = [
             ("src_transient", ctx.name_ref("rax_7")),
             ("src_stack_placeholder", ctx.name_ref("stack")),
@@ -19207,6 +19200,7 @@ mod tests {
 
     #[test]
     fn recovered_call_arg_contract_rejects_low_signal_sources_directly() {
+        let ctx = make_x86_64_ctx();
         let cases = [
             ("src_transient", ctx.name_ref("rax_7")),
             ("src_stack_placeholder", ctx.name_ref("stack")),
