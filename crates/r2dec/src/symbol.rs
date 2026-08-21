@@ -22,14 +22,39 @@ use serde::{Deserialize, Serialize};
 use crate::ast::{CExpr, CType};
 
 /// A name the function declares. Minted only by declaring one.
+///
+/// Carries which table issued it. An identifier means nothing in any other
+/// table, and two tables of similar size would otherwise resolve each other's
+/// identifiers to real but wrong names, which is a rendering that says
+/// something it does not mean.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub struct SymbolId(u32);
+pub struct SymbolId {
+    table: TableId,
+    index: u32,
+}
 
 impl SymbolId {
     /// Position in the table that issued it, for callers that index alongside.
     pub fn index(self) -> usize {
-        self.0 as usize
+        self.index as usize
     }
+}
+
+/// Which table issued an identifier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct TableId(u32);
+
+impl Default for TableId {
+    fn default() -> Self {
+        next_table_id()
+    }
+}
+
+/// Tables are numbered as they are made, so no two share a number in one run.
+fn next_table_id() -> TableId {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static NEXT: AtomicU32 = AtomicU32::new(1);
+    TableId(NEXT.fetch_add(1, Ordering::Relaxed))
 }
 
 /// What a declared name stands for.
@@ -91,6 +116,8 @@ impl std::fmt::Display for ExternalKind {
 /// Every name one rendered function declares.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SymbolTable {
+    /// Which table this is, so an identifier can say where it came from.
+    id: TableId,
     symbols: Vec<Symbol>,
     /// Which identifiers are taken, so a second declaration cannot shadow a first.
     by_name: HashMap<String, SymbolId>,
@@ -100,7 +127,30 @@ pub struct SymbolTable {
 
 impl SymbolTable {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            id: next_table_id(),
+            ..Default::default()
+        }
+    }
+
+    /// Mint an identifier for a position in this table.
+    fn id_at(&self, index: usize) -> SymbolId {
+        SymbolId {
+            table: self.id,
+            index: index as u32,
+        }
+    }
+
+    /// Resolve an identifier this table issued, refusing one it did not.
+    fn resolve(&self, id: SymbolId) -> usize {
+        assert!(
+            id.table == self.id,
+            "identifier from table {:?} read in table {:?}: an identifier only \
+             names something in the table that issued it",
+            id.table,
+            self.id
+        );
+        id.index()
     }
 
     /// Declare a name, returning the identifier that refers to it.
@@ -117,7 +167,7 @@ impl SymbolTable {
     ) -> SymbolId {
         let requested = name.into();
         let name: Rc<str> = Rc::from(self.unique_name(requested));
-        let id = SymbolId(self.symbols.len() as u32);
+        let id = self.id_at(self.symbols.len());
         self.by_name.insert(name.to_string(), id);
         if let Some(value) = origin.value {
             self.by_value.entry(value).or_insert(id);
@@ -162,7 +212,7 @@ impl SymbolTable {
         if let Some(existing) = self.by_name.get(name) {
             return *existing;
         }
-        let id = SymbolId(self.symbols.len() as u32);
+        let id = self.id_at(self.symbols.len());
         self.by_name.insert(name.to_string(), id);
         self.symbols.push(Symbol {
             name: Rc::from(name),
@@ -193,7 +243,7 @@ impl SymbolTable {
             let previous =
                 std::mem::replace(&mut self.symbols[index].name, Rc::from(target.as_str()));
             self.by_name.remove(&*previous);
-            self.by_name.insert(target.clone(), SymbolId(index as u32));
+            self.by_name.insert(target.clone(), self.id_at(index));
         }
     }
 
@@ -215,7 +265,7 @@ impl SymbolTable {
     }
 
     pub fn get(&self, id: SymbolId) -> &Symbol {
-        &self.symbols[id.index()]
+        &self.symbols[self.resolve(id)]
     }
 
     /// The spelling as a shared handle, so a caller can drop the table borrow.
@@ -228,11 +278,11 @@ impl SymbolTable {
     }
 
     pub fn name(&self, id: SymbolId) -> &str {
-        &self.symbols[id.index()].name
+        &self.symbols[self.resolve(id)].name
     }
 
     pub fn ty(&self, id: SymbolId) -> &CType {
-        &self.symbols[id.index()].ty
+        &self.symbols[self.resolve(id)].ty
     }
 
     /// Change what a name reads as, keeping every reference to it intact.
@@ -242,18 +292,20 @@ impl SymbolTable {
     /// an identifier rather than a spelling, so there is nothing to keep in step.
     pub fn rename(&mut self, id: SymbolId, name: impl Into<String>) {
         let requested = name.into();
-        if *self.symbols[id.index()].name == *requested {
+        let index = self.resolve(id);
+        if *self.symbols[index].name == *requested {
             return;
         }
         let name = self.unique_name(requested);
         let previous =
-            std::mem::replace(&mut self.symbols[id.index()].name, Rc::from(name.as_str()));
+            std::mem::replace(&mut self.symbols[index].name, Rc::from(name.as_str()));
         self.by_name.remove(&*previous);
         self.by_name.insert(name, id);
     }
 
     pub fn set_type(&mut self, id: SymbolId, ty: CType) {
-        self.symbols[id.index()].ty = ty;
+        let index = self.resolve(id);
+        self.symbols[index].ty = ty;
     }
 
     /// The identifier standing for a canonical value, if one was declared for it.
@@ -270,7 +322,7 @@ impl SymbolTable {
         self.symbols
             .iter()
             .enumerate()
-            .map(|(index, symbol)| (SymbolId(index as u32), symbol))
+            .map(|(index, symbol)| (self.id_at(index), symbol))
     }
 
     pub fn len(&self) -> usize {
