@@ -294,22 +294,36 @@ Four fixtures asserted which phi a control return binds while providing no
 machine that could name a return register. They state one now. A test asking
 that question needs the premise; it was only ever answered by the hack.
 
-### The SIMD lane defect, located
+### The SIMD lane defect, traced to the instructions
 
-`sym._crc32_table` in `hashes_x64_O2.o` is the clearest case of the leaked lane
-projections, one of the four original defects. It reads `xmm6_5`, `xmm6_7`,
-`xmm6_9`, `xmm6_11` and `xmm6_13` with no definition, around eighteen calls to
-`callother("userop_193", ...)` -- an unmodelled Sleigh userop standing in for
-the SIMD instruction. Several of those calls appear twice, once as the
-right-hand side of an assignment and again as a bare statement, so the same
-effect is rendered more than once.
+`sym._crc32_table` in `hashes_x64_O2.o` reads `xmm6_5`, `xmm6_7`, `xmm6_9`,
+`xmm6_11` and `xmm6_13` and writes none of them. Around eighteen calls to
+`callother("userop_193", ...)` sit alongside, several appearing twice -- once as
+the right-hand side of an assignment and again as a bare statement, so the same
+effect renders more than once.
 
-This is the piece the location model is for. A lane is a sub-range of a
-register's location, and today `CanonicalStorageId` makes each lane width a
-separate storage, so a write to one lane and a read of another look unrelated.
-`CanonicalLocation` exists for this; what remains is for `SSAVar` to carry a
-location and an extent rather than a name and a size, which is the substrate
-change the rest of step 3 rests on.
+**Confirmed from the machine code.** At `0x3e7` the function runs:
+
+    movdqa  %xmm2, %xmm6      ; writes xmm6, 128-bit
+    pxor    %xmm4, %xmm6      ; writes xmm6, 128-bit
+    blendvps %xmm0, %xmm6, %xmm2   ; reads xmm6
+
+So `xmm6` is written twice and then read, and the rendering shows the read with
+no definition. `blendvps` is the unmodelled userop that becomes
+`callother("userop_193", ...)`.
+
+**Not yet confirmed: the mechanism.** The likely cause is the one the location
+model exists for -- `CanonicalStorageId` includes `size`, so a write to `xmm6`
+lifted as two 64-bit lane operations and a read of the full 128 bits are three
+different storages, and the read never sees the writes. That fits the shape, but
+I could not dump the lifted p-code for that address to prove it: `sla.opvals`,
+`sla.regs` and `sla.mem` all print nothing there, so the size of the lifted
+writes is unverified.
+
+Verify that before building anything. If the writes and the read do differ in
+size, the fix is that a read is satisfied by writes overlapping its location
+range rather than matching its storage exactly, which is the sub-range model. If
+they do not, the cause is elsewhere and the lane model will not address it.
 
 **Steps 3 through 7 are untouched:**
 
