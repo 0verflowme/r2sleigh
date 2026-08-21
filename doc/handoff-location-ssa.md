@@ -835,3 +835,41 @@ carriers of the same storage.
 resolve to the carrier's variable. Neither refusing the inline nor blocking the
 overwrite helps until it does, which is why both were reverted rather than left
 in as partial fixes.
+
+### Two reasons the exit merge cannot reach the carrier
+
+Connecting the exit merge to the materialised carrier was tried, on the argument
+that materialising the header phi assigns the carrier on the entry edge as well
+as the back edge, so the carrier holds the right value however control arrived
+and is therefore exactly what the exit merge means. The argument is sound. It
+does not apply, for two separate reasons, and instrumenting says both.
+
+**The exit merge does not mention the carrier.**
+
+    phiprobe name=X0_5 sources=["X0_2", "X0_4"]
+
+The materialised carrier is `X0_3`. The exit phi merges `X0_2` and `X0_4`, so no
+source of it names the carrier and no rule phrased over sources can find it. The
+relation between them is that all four are the same storage, which is the
+location model's job and not something the name graph can answer.
+
+**A fact added to `UseInfo` does not reach the fold.** The same probe prints
+
+    multi={}
+
+while the analysis that computed it printed
+
+    multiprobe ["X0_3", "X1_1", "X8_2"]
+
+The fold reads `state.analysis_ctx.semantic()`, and that `UseInfo` is not the one
+`analyze_value_facts` returned: `prepared_semantic.rs` builds a second analysis
+and copies selected fields across, field by field. Any fact added to `UseInfo`
+that nobody adds to that merge is silently absent downstream, which is how a set
+that was correct where it was computed reads as empty where it is used.
+
+This is the same shape as the symbol-table defect this branch already fixed,
+where three passes each held their own table and `mem::take` left the fold
+reading a fourth. One table, shared by `Rc`, fixed that. `UseInfo` still has the
+older shape, and **it should be the same fix**: one instance per rendered
+function, shared, rather than several merged by hand. Until then, adding a fact
+to `UseInfo` and reading it in the fold does not work, and fails quietly.
