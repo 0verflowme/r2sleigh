@@ -174,6 +174,13 @@ pub(crate) struct FoldingContext<'a> {
     pub(crate) inputs: FoldInputs<'a>,
     pub(crate) state: FoldState,
     pub(crate) current_block_addr: Cell<Option<u64>>,
+    /// Where each name is defined in the block being walked.
+    ///
+    /// Finding a definition by scanning the block costs one pass per question,
+    /// so a block with many definitions costs the square of its size. One pass
+    /// answers every question about that block, and it is rebuilt when the walk
+    /// moves on.
+    pub(crate) block_producer_sites: std::cell::RefCell<Option<(u64, HashMap<String, usize>)>>,
     pub(crate) current_op_idx: Cell<Option<usize>>,
     pub(crate) hide_stack_frame: bool,
     pub(crate) signature_registry: SignatureRegistry,
@@ -287,6 +294,7 @@ impl<'a> FoldingContext<'a> {
             inputs,
             state: FoldState::default(),
             current_block_addr: Cell::new(None),
+            block_producer_sites: std::cell::RefCell::new(None),
             current_op_idx: Cell::new(None),
             hide_stack_frame: true,
             signature_registry: SignatureRegistry::from_embedded_json(),

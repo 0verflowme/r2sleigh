@@ -8146,6 +8146,25 @@ impl<'a> FoldingContext<'a> {
         self.raw_local_post_call_source_for_ssa_name_in_block(block, ssa_name, depth)
     }
 
+    /// Where this name is last defined in this block, if it is defined here.
+    ///
+    /// Names are compared without case here as they were when this scanned, so
+    /// the index is keyed by the lowered spelling and the match stays exact.
+    fn producer_site_in_block(&self, block: &SSABlock, ssa_name: &str) -> Option<usize> {
+        let mut sites = self.block_producer_sites.borrow_mut();
+        if sites.as_ref().is_none_or(|(addr, _)| *addr != block.addr) {
+            let mut built: HashMap<String, usize> = HashMap::new();
+            for (idx, op) in block.ops.iter().enumerate() {
+                if let Some(dst) = op.dst() {
+                    built.insert(dst.display_name().to_ascii_lowercase(), idx);
+                }
+            }
+            *sites = Some((block.addr, built));
+        }
+        let (_, built) = sites.as_ref()?;
+        built.get(&ssa_name.to_ascii_lowercase()).copied()
+    }
+
     fn raw_local_post_call_source_for_ssa_name_in_block(
         &self,
         block: &SSABlock,
@@ -8156,10 +8175,8 @@ impl<'a> FoldingContext<'a> {
             return None;
         }
 
-        let (producer_idx, producer_op) = block.ops.iter().enumerate().rev().find(|(_, op)| {
-            op.dst()
-                .is_some_and(|dst| dst.display_name().eq_ignore_ascii_case(ssa_name))
-        })?;
+        let producer_idx = self.producer_site_in_block(block, ssa_name)?;
+        let producer_op = block.ops.get(producer_idx)?;
 
         match producer_op {
             SSAOp::Copy { src, .. }
