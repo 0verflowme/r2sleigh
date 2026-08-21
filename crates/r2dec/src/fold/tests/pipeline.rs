@@ -379,8 +379,9 @@ mod tests {
         target_name: &str,
         signature: Option<FunctionType>,
     ) {
+        let symbols = test_table();
         let typed_names = HashMap::from([(target_addr, target_name.to_string())]);
-        let symbols = HashMap::new();
+        let binary_symbols = HashMap::new();
         let callee_facts = if r2types::callee_name_is_import_like(target_name) {
             BTreeMap::from([(
                 target_addr,
@@ -407,7 +408,7 @@ mod tests {
             )],
             &r2types::CalleeIdentityContext {
                 function_names: &typed_names,
-                symbols: &symbols,
+                symbols: &binary_symbols,
                 callee_facts: &callee_facts,
                 known_function_signatures: &known_signatures,
             },
@@ -1515,9 +1516,10 @@ mod tests {
 
     #[test]
     fn callsite_identity_controls_policy_when_rendered_callee_is_poisoned() {
+        let symbols = test_table();
         let mut ctx = FoldingContext::new(64);
         let typed_names = HashMap::from([(0x401000, "sym.imp.one_arg".to_string())]);
-        let symbols = HashMap::new();
+        let binary_symbols = HashMap::new();
         let callee_facts = BTreeMap::from([(
             0x401000,
             minimal_import_callee_fact(0x401000, "sym.imp.one_arg"),
@@ -1541,7 +1543,7 @@ mod tests {
             )],
             &r2types::CalleeIdentityContext {
                 function_names: &typed_names,
-                symbols: &symbols,
+                symbols: &binary_symbols,
                 callee_facts: &callee_facts,
                 known_function_signatures: &known_signatures,
             },
@@ -1659,10 +1661,11 @@ mod tests {
 
     #[test]
     fn callsite_identity_uses_modeled_policy_for_site_args() {
+        let symbols = test_table();
         let mut ctx = FoldingContext::new(64);
         let source_call = (0x1000, 0);
         let typed_names = HashMap::from([(0x401000, "sym.local.modeled".to_string())]);
-        let symbols = HashMap::new();
+        let binary_symbols = HashMap::new();
         let callee_facts = BTreeMap::from([(
             0x401000,
             minimal_modeled_callee_fact(0x401000, "sym.local.modeled"),
@@ -1678,7 +1681,7 @@ mod tests {
             )],
             &r2types::CalleeIdentityContext {
                 function_names: &typed_names,
-                symbols: &symbols,
+                symbols: &binary_symbols,
                 callee_facts: &callee_facts,
                 known_function_signatures: &known_signatures,
             },
@@ -2829,9 +2832,10 @@ mod tests {
 
     #[test]
     fn callsite_identity_does_not_printf_clamp_when_rendered_callee_is_poisoned() {
+        let symbols = test_table();
         let mut ctx = FoldingContext::new(64);
         let typed_names = HashMap::from([(0x401000, "sym.imp.printf".to_string())]);
-        let symbols = HashMap::new();
+        let binary_symbols = HashMap::new();
         let callee_facts = BTreeMap::from([(
             0x401000,
             minimal_import_callee_fact(0x401000, "sym.imp.printf"),
@@ -2855,7 +2859,7 @@ mod tests {
             )],
             &r2types::CalleeIdentityContext {
                 function_names: &typed_names,
-                symbols: &symbols,
+                symbols: &binary_symbols,
                 callee_facts: &callee_facts,
                 known_function_signatures: &known_signatures,
             },
@@ -2887,9 +2891,10 @@ mod tests {
 
     #[test]
     fn modeled_call_target_uses_typed_resolution_without_fact_scan() {
+        let symbols = test_table();
         let mut ctx = FoldingContext::new(64);
         let typed_names = HashMap::from([(0x401000, "sym.local.memcpy_model".to_string())]);
-        let symbols = HashMap::new();
+        let binary_symbols = HashMap::new();
         let callee_facts = BTreeMap::from([(
             0x401000,
             minimal_modeled_callee_fact(0x401000, "sym.local.memcpy_model"),
@@ -2905,7 +2910,7 @@ mod tests {
             )],
             &r2types::CalleeIdentityContext {
                 function_names: &typed_names,
-                symbols: &symbols,
+                symbols: &binary_symbols,
                 callee_facts: &callee_facts,
                 known_function_signatures: &known_signatures,
             },
@@ -3540,7 +3545,7 @@ mod tests {
                     op: BinaryOp::Ne,
                     ref left,
                     ref right,
-                } if matches!(left.as_ref(), CExpr::Var(name) if name == "buf")
+                } if matches!(left.as_ref(), CExpr::Var(name) if &*ctx.spelling(*name) == "buf")
                     && matches!(right.as_ref(), CExpr::IntLit(0))
             ),
             "expected null-check predicate to use the named buf owner, got {rhs:?}; call_sources={:?}",
@@ -3623,7 +3628,7 @@ mod tests {
                     op: BinaryOp::Ne,
                     ref left,
                     ref right,
-                } if matches!(left.as_ref(), CExpr::Var(name) if name == "loc")
+                } if matches!(left.as_ref(), CExpr::Var(name) if &*ctx.spelling(*name) == "loc")
                     && matches!(right.as_ref(), CExpr::IntLit(0))
             ),
             "expected direct call-result null-check to use the named owner alias, got {rhs:?}; call_sources={:?}; aliases={:?}",
@@ -3964,22 +3969,22 @@ mod tests {
         assert!(
             matches!(
                 &byte_expr,
-                CExpr::Deref(inner) if matches!(inner.as_ref(), CExpr::Var(name) if name == "loc")
+                CExpr::Deref(inner) if matches!(inner.as_ref(), CExpr::Var(name) if &*ctx.spelling(*name) == "loc")
             ) || matches!(
                 &byte_expr,
                 CExpr::Subscript { base, index }
-                    if matches!(base.as_ref(), CExpr::Var(name) if name == "loc")
+                    if matches!(base.as_ref(), CExpr::Var(name) if &*ctx.spelling(*name) == "loc")
                         && matches!(index.as_ref(), CExpr::IntLit(0))
             ) || matches!(
                 &byte_expr,
-                CExpr::Deref(inner) if matches!(inner.as_ref(), CExpr::Var(name) if name == "rax_2")
+                CExpr::Deref(inner) if matches!(inner.as_ref(), CExpr::Var(name) if &*ctx.spelling(*name) == "rax_2")
             ) || matches!(
                 &byte_expr,
                 CExpr::Deref(inner)
                     if matches!(
                         inner.as_ref(),
                         CExpr::Cast { expr, .. }
-                            if matches!(expr.as_ref(), CExpr::Var(name) if name == "rax_2" || name == "loc")
+                            if matches!(expr.as_ref(), CExpr::Var(name) if &*ctx.spelling(*name) == "rax_2" || &*ctx.spelling(*name) == "loc")
                     )
             ),
             "expected byte load from the owned pointer result to stay a scalar memory expression, got {byte_expr:?}; aliases={:?}; defs={:?}; semantic={:?}",
@@ -3997,7 +4002,7 @@ mod tests {
         );
         let resolved_byte_expr = ctx.resolve_return_candidate(&byte_expr);
         assert!(
-            !matches!(resolved_byte_expr, CExpr::Var(ref name) if name == "loc"),
+            !matches!(resolved_byte_expr, CExpr::Var(ref name) if &*ctx.spelling(*name) == "loc"),
             "resolved byte-load expression should not collapse to the pointer owner, got {resolved_byte_expr:?}; aliases={:?}; defs={:?}; semantic={:?}",
             ctx.state.analysis_ctx.use_info.call_result_source_by_alias,
             ctx.state
@@ -4013,7 +4018,7 @@ mod tests {
         );
         let widened_expr = ctx.get_expr(&eax_2);
         assert!(
-            !matches!(widened_expr, CExpr::Var(ref name) if name == "loc"),
+            !matches!(widened_expr, CExpr::Var(ref name) if &*ctx.spelling(*name) == "loc"),
             "widened byte load should not collapse to the pointer owner, got {widened_expr:?}; aliases={:?}; defs={:?}; semantic={:?}",
             ctx.state.analysis_ctx.use_info.call_result_source_by_alias,
             ctx.state
@@ -4029,7 +4034,7 @@ mod tests {
         );
         let byte_return_expr = ctx.get_return_expr(&byte_load);
         assert!(
-            !matches!(byte_return_expr, CExpr::Var(ref name) if name == "loc"),
+            !matches!(byte_return_expr, CExpr::Var(ref name) if &*ctx.spelling(*name) == "loc"),
             "byte-load return expression should not collapse to the pointer owner, got {byte_return_expr:?}; aliases={:?}; defs={:?}; semantic={:?}",
             ctx.state.analysis_ctx.use_info.call_result_source_by_alias,
             ctx.state
@@ -4045,7 +4050,7 @@ mod tests {
         );
         let final_ret_expr = ctx.resolve_return_candidate(&ctx.get_expr(&rax_6));
         assert!(
-            !matches!(final_ret_expr, CExpr::Var(ref name) if name == "loc"),
+            !matches!(final_ret_expr, CExpr::Var(ref name) if &*ctx.spelling(*name) == "loc"),
             "final widened return candidate should not collapse to the pointer owner, got {final_ret_expr:?}; aliases={:?}; defs={:?}; semantic={:?}",
             ctx.state.analysis_ctx.use_info.call_result_source_by_alias,
             ctx.state
@@ -4805,7 +4810,7 @@ mod tests {
         assert!(
             matches!(true_expr, CExpr::Subscript { .. })
                 || matches!(true_expr, CExpr::Deref(_))
-                || matches!(true_expr, CExpr::Cast { expr, .. } if matches!(expr.as_ref(), CExpr::Var(name) if name == "loc"))
+                || matches!(true_expr, CExpr::Cast { expr, .. } if matches!(expr.as_ref(), CExpr::Var(name) if &*ctx.spelling(*name) == "loc"))
                 || matches!(true_expr, CExpr::Cast { expr, .. } if matches!(expr.as_ref(), CExpr::Var(_)))
                 || matches!(true_expr, CExpr::Cast { expr, .. } if matches!(expr.as_ref(), CExpr::Subscript { .. } | CExpr::Deref(_))),
             "expected true arm to keep the loaded byte return shape, got {true_expr:?}"
@@ -5495,7 +5500,7 @@ mod tests {
 
         assert_eq!(proof_selector, Some(selector));
         assert!(
-            matches!(expr, CExpr::Var(ref name) if name.eq_ignore_ascii_case("rdi") || name == "arg0"),
+            matches!(expr, CExpr::Var(ref name) if name.eq_ignore_ascii_case("rdi") || &*ctx.spelling(*name) == "arg0"),
             "expected selector from canonical FunctionFacts control evidence, got {expr:?}"
         );
     }
@@ -5619,11 +5624,11 @@ mod tests {
             panic!("expected assignment expression");
         };
         assert!(
-            matches!(left.as_ref(), CExpr::Var(name) if name == "ram:401000_1"),
+            matches!(left.as_ref(), CExpr::Var(name) if &*ctx.spelling(*name) == "ram:401000_1"),
             "{left:?}"
         );
         assert!(
-            matches!(right.as_ref(), CExpr::Var(name) if name == "value_2"),
+            matches!(right.as_ref(), CExpr::Var(name) if &*ctx.spelling(*name) == "value_2"),
             "{right:?}"
         );
     }
@@ -6249,7 +6254,7 @@ mod tests {
             panic!("expected subscript expression, got {expr:?}");
         };
         assert!(
-            matches!(index.as_ref(), CExpr::Var(name) if name == "local_c"),
+            matches!(index.as_ref(), CExpr::Var(name) if &*ctx.spelling(*name) == "local_c"),
             "typed pointer locals must not survive as subscript indices, got {expr:?}"
         );
     }
@@ -6367,11 +6372,11 @@ mod tests {
             panic!("expected subscript expression, got {expr:?}");
         };
         assert!(
-            matches!(base.as_ref(), CExpr::Var(name) if name == "buf"),
+            matches!(base.as_ref(), CExpr::Var(name) if &*ctx.spelling(*name) == "buf"),
             "address-like stack slot must be the subscript base, got base={base:?} index={index:?}"
         );
         assert!(
-            matches!(index.as_ref(), CExpr::Var(name) if name == "len"),
+            matches!(index.as_ref(), CExpr::Var(name) if &*ctx.spelling(*name) == "len"),
             "scalar stack slot must remain the subscript index, got base={base:?} index={index:?}"
         );
     }
@@ -6528,7 +6533,7 @@ mod tests {
             panic!("expected subscript expression, got {expr:?}");
         };
         assert!(
-            matches!(index.as_ref(), CExpr::Var(name) if name == "arg2"),
+            matches!(index.as_ref(), CExpr::Var(name) if &*ctx.spelling(*name) == "arg2"),
             "shift-scaled index must preserve the semantic scalar index"
         );
     }
@@ -6574,11 +6579,11 @@ mod tests {
             panic!("expected commuted pointer addition to render as subscript, got {expr:?}");
         };
         assert!(
-            matches!(base.as_ref(), CExpr::Var(name) if name == "buf"),
+            matches!(base.as_ref(), CExpr::Var(name) if &*ctx.spelling(*name) == "buf"),
             "typed pointer operand must be the subscript base, got base={base:?} index={index:?}"
         );
         assert!(
-            matches!(index.as_ref(), CExpr::Var(name) if name == "i"),
+            matches!(index.as_ref(), CExpr::Var(name) if &*ctx.spelling(*name) == "i"),
             "scalar operand must be the subscript index, got base={base:?} index={index:?}"
         );
     }
@@ -6975,7 +6980,7 @@ mod tests {
                     index: Some(_),
                     scale_bytes: 56,
                     offset_bytes: 8,
-                })) if name == "arg1"
+                })) if &*ctx.spelling(*name) == "arg1"
             ),
             "actual semantic value: {semantic:?}"
         );
@@ -9788,7 +9793,7 @@ mod tests {
                     left,
                     right: _,
                     op: BinaryOp::Add,
-                } if matches!(left.as_ref(), CExpr::Cast { expr, .. } if matches!(expr.as_ref(), CExpr::Var(name) if name == "arg1"))
+                } if matches!(left.as_ref(), CExpr::Cast { expr, .. } if matches!(expr.as_ref(), CExpr::Var(name) if &*ctx.spelling(*name) == "arg1"))
             ),
             "Cast(Var(...)) should be propagated as a cheap copy RHS"
         );
@@ -9819,7 +9824,7 @@ mod tests {
             matches!(
                 rhs,
                 CExpr::PtrMember { base, .. }
-                    if matches!(base.as_ref(), CExpr::Var(name) if name == "tmp:base_1")
+                    if matches!(base.as_ref(), CExpr::Var(name) if &*ctx.spelling(*name) == "tmp:base_1")
             ),
             "copy propagation must not rewrite semantic member bases back into transient registers"
         );
@@ -11313,16 +11318,17 @@ mod tests {
 
     #[test]
     fn typed_callee_resolution_resolves_normalized_alias_without_import_policy() {
+        let symbols = test_table();
         let mut ctx = make_aarch64_ctx();
         let callee_facts =
             BTreeMap::from([(0x401000, minimal_callee_fact(0x401000, "sym.imp.printf"))]);
         let function_names = HashMap::new();
-        let symbols = HashMap::new();
+        let binary_symbols = HashMap::new();
         let known_signatures = HashMap::new();
         let resolution =
             r2types::CalleeResolutionFacts::from_context(&r2types::CalleeIdentityContext {
                 function_names: &function_names,
-                symbols: &symbols,
+                symbols: &binary_symbols,
                 callee_facts: &callee_facts,
                 known_function_signatures: &known_signatures,
             });
@@ -11343,18 +11349,19 @@ mod tests {
 
     #[test]
     fn typed_callee_resolution_authorizes_import_policy_with_explicit_linkage() {
+        let symbols = test_table();
         let mut ctx = make_aarch64_ctx();
         let callee_facts = BTreeMap::from([(
             0x401000,
             minimal_import_callee_fact(0x401000, "sym.imp.printf"),
         )]);
         let function_names = HashMap::new();
-        let symbols = HashMap::new();
+        let binary_symbols = HashMap::new();
         let known_signatures = HashMap::new();
         let resolution =
             r2types::CalleeResolutionFacts::from_context(&r2types::CalleeIdentityContext {
                 function_names: &function_names,
-                symbols: &symbols,
+                symbols: &binary_symbols,
                 callee_facts: &callee_facts,
                 known_function_signatures: &known_signatures,
             });
@@ -13231,7 +13238,7 @@ mod tests {
             panic!("Expected trailing return statement");
         };
         assert!(
-            !matches!(expr, CExpr::Var(name) if name == "stack_0" || name == "saved_fp"),
+            !matches!(expr, CExpr::Var(name) if &*ctx.spelling(*name) == "stack_0" || &*ctx.spelling(*name) == "saved_fp"),
             "Generic stack placeholders must not leak into visible return expressions"
         );
     }
@@ -13256,7 +13263,7 @@ mod tests {
             panic!("Expected trailing return statement");
         };
         assert!(
-            !matches!(expr, CExpr::Var(name) if name == "stack"),
+            !matches!(expr, CExpr::Var(name) if &*ctx.spelling(*name) == "stack"),
             "plain stack placeholder must not survive in final return expressions"
         );
     }
@@ -16274,9 +16281,9 @@ mod tests {
                     op: BinaryOp::Eq | BinaryOp::Ne,
                     left,
                     right,
-                } if (matches!(left.as_ref(), CExpr::Var(name) if name == "arg0")
+                } if (matches!(left.as_ref(), CExpr::Var(name) if &*ctx.spelling(*name) == "arg0")
                     && matches!(right.as_ref(), CExpr::IntLit(100)))
-                    || (matches!(right.as_ref(), CExpr::Var(name) if name == "arg0")
+                    || (matches!(right.as_ref(), CExpr::Var(name) if &*ctx.spelling(*name) == "arg0")
                         && matches!(left.as_ref(), CExpr::IntLit(100)))
             ),
             "expected recovered arg0/100 predicate, got {cond:?}"

@@ -5216,7 +5216,8 @@ fn infer_local_struct_field_accesses(
         #[cfg(test)]
         strings: &strings,
         #[cfg(test)]
-        symbols: &symbols,
+        binary_symbols: &binary_symbols,
+        symbols: &test_table(),
         callee_facts: analysis::empty_callee_facts(),
         callee_resolution: None,
         summary_view: None,
@@ -5774,6 +5775,7 @@ mod tests {
 
     #[test]
     fn test_final_function_body_prune_removes_late_dead_sleigh_temps() {
+        let symbols = test_table();
         let mut func = CFunction {
             symbols: crate::symbol::SymbolTable::new(),
             name: "late_prune".to_string(),
@@ -5783,42 +5785,42 @@ mod tests {
             locals: Vec::new(),
             body: vec![
                 CStmt::Expr(CExpr::assign(
-                    ctx.name_ref("tmp_ldwn_1"),
+                    crate::symbol::var_ref(&symbols, "tmp_ldwn_1"),
                     CExpr::deref(CExpr::binary(
                         BinaryOp::Add,
-                        ctx.name_ref("base"),
+                        crate::symbol::var_ref(&symbols, "base"),
                         CExpr::IntLit(50),
                     )),
                 )),
                 CStmt::Expr(CExpr::assign(
-                    ctx.name_ref("tmp_stwn_1"),
+                    crate::symbol::var_ref(&symbols, "tmp_stwn_1"),
                     CExpr::binary(
                         BinaryOp::Add,
                         CExpr::deref(CExpr::binary(
                             BinaryOp::Add,
-                            ctx.name_ref("base"),
+                            crate::symbol::var_ref(&symbols, "base"),
                             CExpr::IntLit(50),
                         )),
-                        ctx.name_ref("arg1"),
+                        crate::symbol::var_ref(&symbols, "arg1"),
                     ),
                 )),
                 CStmt::Expr(CExpr::assign(
                     CExpr::deref(CExpr::binary(
                         BinaryOp::Add,
-                        ctx.name_ref("x0_5"),
+                        crate::symbol::var_ref(&symbols, "x0_5"),
                         CExpr::IntLit(50),
                     )),
                     CExpr::binary(
                         BinaryOp::Add,
-                        ctx.name_ref("arg1"),
+                        crate::symbol::var_ref(&symbols, "arg1"),
                         CExpr::deref(CExpr::binary(
                             BinaryOp::Add,
-                            ctx.name_ref("base"),
+                            crate::symbol::var_ref(&symbols, "base"),
                             CExpr::IntLit(50),
                         )),
                     ),
                 )),
-                CStmt::Return(Some(ctx.name_ref("x0_5"))),
+                CStmt::Return(Some(crate::symbol::var_ref(&symbols, "x0_5"))),
             ],
         };
         let ctx = FoldingContext::new(64);
@@ -5840,7 +5842,7 @@ mod tests {
         ));
         assert_eq!(
             func.body[1],
-            CStmt::Return(Some(ctx.name_ref("x0_5")))
+            CStmt::Return(Some(crate::symbol::var_ref(&symbols, "x0_5")))
         );
     }
 
@@ -5947,7 +5949,7 @@ mod tests {
         assert!(matches!(
             &func.body[0],
             CStmt::If { then_body, .. }
-                if matches!(then_body.as_ref(), CStmt::Return(Some(CExpr::Var(name))) if name == "result")
+                if matches!(then_body.as_ref(), CStmt::Return(Some(CExpr::Var(name))) if &*crate::symbol::spelling(&symbols, *name) == "result")
         ));
     }
 
@@ -6944,7 +6946,8 @@ mod tests {
             ret_reg_name: config.ret_regs.first().map(String::as_str).unwrap_or("x0"),
             function_names: &function_names,
             strings: &strings,
-            symbols: &symbols,
+            binary_symbols: &binary_symbols,
+            symbols: &test_table(),
             callee_facts: analysis::empty_callee_facts(),
             callee_resolution: None,
             summary_view: None,
@@ -7112,7 +7115,8 @@ mod tests {
             ret_reg_name: config.ret_regs.first().map(String::as_str).unwrap_or("rax"),
             function_names: &function_names,
             strings: &strings,
-            symbols: &symbols,
+            binary_symbols: &binary_symbols,
+            symbols: &test_table(),
             callee_facts: analysis::empty_callee_facts(),
             callee_resolution: None,
             summary_view: None,
@@ -7335,7 +7339,8 @@ mod tests {
             ret_reg_name: config.ret_regs.first().map(String::as_str).unwrap_or("rax"),
             function_names: &function_names,
             strings: &strings,
-            symbols: &symbols,
+            binary_symbols: &binary_symbols,
+            symbols: &test_table(),
             callee_facts: analysis::empty_callee_facts(),
             callee_resolution: None,
             summary_view: None,

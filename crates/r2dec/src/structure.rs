@@ -6504,7 +6504,7 @@ mod tests {
         match cond {
             CExpr::Binary { left, .. } => {
                 assert!(
-                    matches!(left.as_ref(), CExpr::Var(name) if name == "local"),
+                    matches!(left.as_ref(), CExpr::Var(name) if &*crate::symbol::spelling(&symbols, *name) == "local"),
                     "Address-of local artifact should normalize to plain variable in condition"
                 );
             }

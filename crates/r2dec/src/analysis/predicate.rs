@@ -78,9 +78,10 @@ mod tests {
             _depth: u32,
             _visited: &mut HashSet<String>,
         ) -> CExpr {
+            let symbols = test_table();
             match expr {
-                CExpr::Var(name) if name == "stage0" => crate::symbol::var_ref(&&self.symbols, "stage1"),
-                CExpr::Var(name) if name == "stage1" => crate::symbol::var_ref(&&self.symbols, "done"),
+                CExpr::Var(name) if &*crate::symbol::spelling(&symbols, *name) == "stage0" => crate::symbol::var_ref(&&self.symbols, "stage1"),
+                CExpr::Var(name) if &*crate::symbol::spelling(&symbols, *name) == "stage1" => crate::symbol::var_ref(&&self.symbols, "done"),
                 other => other.clone(),
             }
         }
@@ -96,19 +97,20 @@ mod tests {
 
     #[test]
     fn simplify_condition_expr_reaches_stable_fixed_point() {
+        let symbols = test_table();
         let ctx = FoldingContext::new(64);
         let simplifier = PredicateSimplifier::new(&ctx);
 
         let expr = CExpr::unary(
             UnaryOp::Not,
-            CExpr::binary(BinaryOp::Eq, ctx.name_ref("x"), CExpr::IntLit(0)),
+            CExpr::binary(BinaryOp::Eq, crate::symbol::var_ref(&symbols, "x"), CExpr::IntLit(0)),
         );
 
         let once = simplifier.simplify_condition_expr(expr);
         let twice = simplifier.simplify_condition_expr(once.clone());
         assert_eq!(
             once,
-            CExpr::binary(BinaryOp::Ne, ctx.name_ref("x"), CExpr::IntLit(0))
+            CExpr::binary(BinaryOp::Ne, crate::symbol::var_ref(&symbols, "x"), CExpr::IntLit(0))
         );
         assert_eq!(once, twice);
     }
@@ -125,19 +127,20 @@ mod tests {
 
     #[test]
     fn simplify_condition_expr_reconstructs_nested_signed_predicate_scaffold() {
+        let symbols = test_table();
         let ctx = FoldingContext::new(64);
         let simplifier = PredicateSimplifier::new(&ctx);
 
         let expr = CExpr::binary(
             BinaryOp::BitXor,
-            CExpr::binary(BinaryOp::Ne, ctx.name_ref("x"), CExpr::IntLit(0)),
+            CExpr::binary(BinaryOp::Ne, crate::symbol::var_ref(&symbols, "x"), CExpr::IntLit(0)),
             CExpr::binary(
                 BinaryOp::And,
-                CExpr::binary(BinaryOp::Ne, ctx.name_ref("a"), CExpr::IntLit(0)),
+                CExpr::binary(BinaryOp::Ne, crate::symbol::var_ref(&symbols, "a"), CExpr::IntLit(0)),
                 CExpr::binary(
                     BinaryOp::Eq,
-                    ctx.name_ref("of_1"),
-                    CExpr::binary(BinaryOp::Lt, ctx.name_ref("a"), CExpr::IntLit(0)),
+                    crate::symbol::var_ref(&symbols, "of_1"),
+                    CExpr::binary(BinaryOp::Lt, crate::symbol::var_ref(&symbols, "a"), CExpr::IntLit(0)),
                 ),
             ),
         );
@@ -145,29 +148,30 @@ mod tests {
         let simplified = simplifier.simplify_condition_expr(expr);
         let expected = CExpr::binary(
             BinaryOp::BitXor,
-            CExpr::binary(BinaryOp::Ne, ctx.name_ref("x"), CExpr::IntLit(0)),
-            CExpr::binary(BinaryOp::Gt, ctx.name_ref("a"), CExpr::IntLit(0)),
+            CExpr::binary(BinaryOp::Ne, crate::symbol::var_ref(&symbols, "x"), CExpr::IntLit(0)),
+            CExpr::binary(BinaryOp::Gt, crate::symbol::var_ref(&symbols, "a"), CExpr::IntLit(0)),
         );
         assert_eq!(simplified, expected);
     }
 
     #[test]
     fn simplify_condition_expr_reconstructs_nested_cast_paren_signed_predicate_scaffold() {
+        let symbols = test_table();
         let ctx = FoldingContext::new(64);
         let simplifier = PredicateSimplifier::new(&ctx);
 
         let expr = CExpr::binary(
             BinaryOp::BitXor,
-            CExpr::binary(BinaryOp::Ne, ctx.name_ref("x"), CExpr::IntLit(0)),
+            CExpr::binary(BinaryOp::Ne, crate::symbol::var_ref(&symbols, "x"), CExpr::IntLit(0)),
             CExpr::Paren(Box::new(CExpr::binary(
                 BinaryOp::And,
-                CExpr::binary(BinaryOp::Ne, ctx.name_ref("a"), CExpr::IntLit(0)),
+                CExpr::binary(BinaryOp::Ne, crate::symbol::var_ref(&symbols, "a"), CExpr::IntLit(0)),
                 CExpr::binary(
                     BinaryOp::Eq,
-                    ctx.name_ref("of_1"),
+                    crate::symbol::var_ref(&symbols, "of_1"),
                     CExpr::Paren(Box::new(CExpr::binary(
                         BinaryOp::Lt,
-                        CExpr::cast(CType::Int(32), ctx.name_ref("a")),
+                        CExpr::cast(CType::Int(32), crate::symbol::var_ref(&symbols, "a")),
                         CExpr::cast(CType::Int(32), CExpr::IntLit(0)),
                     ))),
                 ),
@@ -177,10 +181,10 @@ mod tests {
         let simplified = simplifier.simplify_condition_expr(expr);
         let expected = CExpr::binary(
             BinaryOp::BitXor,
-            CExpr::binary(BinaryOp::Ne, ctx.name_ref("x"), CExpr::IntLit(0)),
+            CExpr::binary(BinaryOp::Ne, crate::symbol::var_ref(&symbols, "x"), CExpr::IntLit(0)),
             CExpr::Paren(Box::new(CExpr::binary(
                 BinaryOp::Gt,
-                ctx.name_ref("a"),
+                crate::symbol::var_ref(&symbols, "a"),
                 CExpr::IntLit(0),
             ))),
         );
@@ -189,6 +193,7 @@ mod tests {
 
     #[test]
     fn simplify_condition_expr_collapses_nested_unsigned_truthy_scaffold() {
+        let symbols = test_table();
         let ctx = FoldingContext::new(64);
         let simplifier = PredicateSimplifier::new(&ctx);
 
@@ -204,7 +209,7 @@ mod tests {
                         CExpr::binary(
                             BinaryOp::Le,
                             CExpr::cast(CType::u64(), CExpr::IntLit(1)),
-                            CExpr::cast(CType::u64(), ctx.name_ref("t1")),
+                            CExpr::cast(CType::u64(), crate::symbol::var_ref(&symbols, "t1")),
                         ),
                     ),
                 ),
@@ -214,30 +219,32 @@ mod tests {
         let simplified = simplifier.simplify_condition_expr(expr);
         assert_eq!(
             simplified,
-            CExpr::binary(BinaryOp::Ne, ctx.name_ref("t1"), CExpr::IntLit(0))
+            CExpr::binary(BinaryOp::Ne, crate::symbol::var_ref(&symbols, "t1"), CExpr::IntLit(0))
         );
     }
 
     #[test]
     fn simplify_condition_expr_collapses_boolean_zero_comparison() {
+        let symbols = test_table();
         let ctx = FoldingContext::new(64);
         let simplifier = PredicateSimplifier::new(&ctx);
 
         let expr = CExpr::binary(
             BinaryOp::Eq,
-            CExpr::binary(BinaryOp::Ne, ctx.name_ref("t1"), CExpr::IntLit(0)),
+            CExpr::binary(BinaryOp::Ne, crate::symbol::var_ref(&symbols, "t1"), CExpr::IntLit(0)),
             CExpr::IntLit(0),
         );
 
         let simplified = simplifier.simplify_condition_expr(expr);
         assert_eq!(
             simplified,
-            CExpr::binary(BinaryOp::Eq, ctx.name_ref("t1"), CExpr::IntLit(0))
+            CExpr::binary(BinaryOp::Eq, crate::symbol::var_ref(&symbols, "t1"), CExpr::IntLit(0))
         );
     }
 
     #[test]
     fn simplify_condition_expr_collapses_boolean_one_comparison_and_shift_zero() {
+        let symbols = test_table();
         let ctx = FoldingContext::new(64);
         let simplifier = PredicateSimplifier::new(&ctx);
 
@@ -249,7 +256,7 @@ mod tests {
                     BinaryOp::BitAnd,
                     CExpr::binary(
                         BinaryOp::Shr,
-                        ctx.name_ref("x0_3"),
+                        crate::symbol::var_ref(&symbols, "x0_3"),
                         CExpr::IntLit(0),
                     ),
                     CExpr::IntLit(1),
@@ -266,7 +273,7 @@ mod tests {
                 BinaryOp::Eq,
                 CExpr::binary(
                     BinaryOp::BitAnd,
-                    ctx.name_ref("x0_3"),
+                    crate::symbol::var_ref(&symbols, "x0_3"),
                     CExpr::IntLit(1),
                 ),
                 CExpr::IntLit(0),

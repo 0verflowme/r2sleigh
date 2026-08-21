@@ -2155,7 +2155,6 @@ fn struct_field_access_profile_for_addr(
     env: &PassEnv<'_>,
     arg_slot_map: &HashMap<String, usize>,
 ) -> Option<LocalStructFieldAccessProfile> {
-    let symbols = test_table();
     let shape = semantic_addr_for_var(&symbols, info, addr, env)?;
     if shape.offset_bytes < 0 {
         return None;
@@ -2185,7 +2184,6 @@ fn arg_slot_for_value_ref(
     arg_slot_map: &HashMap<String, usize>,
     depth: u32,
 ) -> Option<usize> {
-    let symbols = test_table();
     if depth > 8 {
         return None;
     }
@@ -9153,6 +9151,7 @@ mod tests {
 
     #[test]
     fn call_target_import_policy_uses_typed_callee_identity() {
+        let symbols = test_table();
         let op = SSAOp::Call {
             target: mk("ram:401000", 0, 8),
         };
@@ -9216,7 +9215,7 @@ mod tests {
 
         let fallback_function_names = HashMap::from([(0x401000, "sym.helper".to_string())]);
         let typed_function_names = HashMap::from([(0x401000, "sym.imp.printf".to_string())]);
-        let symbols = HashMap::new();
+        let binary_symbols = HashMap::new();
         let callee_facts = BTreeMap::new();
         let known_function_signatures = HashMap::new();
         let resolution = r2types::CalleeResolutionFacts::from_direct_call_targets(
@@ -9229,7 +9228,7 @@ mod tests {
             )],
             &r2types::CalleeIdentityContext {
                 function_names: &typed_function_names,
-                symbols: &symbols,
+                symbols: &binary_symbols,
                 callee_facts: &callee_facts,
                 known_function_signatures: &known_function_signatures,
             },
@@ -9265,7 +9264,7 @@ mod tests {
             )],
             &r2types::CalleeIdentityContext {
                 function_names: &typed_function_names,
-                symbols: &symbols,
+                symbols: &binary_symbols,
                 callee_facts: &callee_facts,
                 known_function_signatures: &known_function_signatures,
             },
@@ -9304,7 +9303,7 @@ mod tests {
             )],
             &r2types::CalleeIdentityContext {
                 function_names: &typed_function_names,
-                symbols: &symbols,
+                symbols: &binary_symbols,
                 callee_facts: &callee_facts,
                 known_function_signatures: &known_function_signatures,
             },
@@ -9343,7 +9342,7 @@ mod tests {
             )],
             &r2types::CalleeIdentityContext {
                 function_names: &typed_function_names,
-                symbols: &symbols,
+                symbols: &binary_symbols,
                 callee_facts: &callee_facts,
                 known_function_signatures: &known_function_signatures,
             },
@@ -9364,18 +9363,19 @@ mod tests {
 
     #[test]
     fn call_target_import_policy_requires_callsite_resolution_not_raw_direct_address() {
+        let symbols = test_table();
         let op = SSAOp::Call {
             target: mk("ram:402000", 0, 8),
         };
         let function_names = HashMap::new();
-        let symbols = HashMap::new();
+        let binary_symbols = HashMap::new();
         let callee_facts =
             BTreeMap::from([(0x402000, imported_callee_fact(0x402000, "sym.imp.printf"))]);
         let known_function_signatures = HashMap::new();
         let resolution =
             r2types::CalleeResolutionFacts::from_context(&r2types::CalleeIdentityContext {
                 function_names: &function_names,
-                symbols: &symbols,
+                symbols: &binary_symbols,
                 callee_facts: &callee_facts,
                 known_function_signatures: &known_function_signatures,
             });
@@ -9400,6 +9400,7 @@ mod tests {
 
     #[test]
     fn call_target_import_policy_uses_callsite_resolution_over_raw_import_address() {
+        let symbols = test_table();
         let op = SSAOp::Call {
             target: mk("ram:402000", 0, 8),
         };
@@ -9408,7 +9409,7 @@ mod tests {
             op_index: 0,
         };
         let function_names = HashMap::from([(0x401000, "sym.local_helper".to_string())]);
-        let symbols = HashMap::new();
+        let binary_symbols = HashMap::new();
         let callee_facts =
             BTreeMap::from([(0x402000, imported_callee_fact(0x402000, "sym.imp.printf"))]);
         let known_function_signatures = HashMap::new();
@@ -9416,7 +9417,7 @@ mod tests {
             [(callsite, 0x401000)],
             &r2types::CalleeIdentityContext {
                 function_names: &function_names,
-                symbols: &symbols,
+                symbols: &binary_symbols,
                 callee_facts: &callee_facts,
                 known_function_signatures: &known_function_signatures,
             },
@@ -9442,6 +9443,7 @@ mod tests {
 
     #[test]
     fn call_target_import_policy_uses_callsite_resolution_over_raw_local_address() {
+        let symbols = test_table();
         let op = SSAOp::Call {
             target: mk("ram:402000", 0, 8),
         };
@@ -9450,7 +9452,7 @@ mod tests {
             op_index: 0,
         };
         let function_names = HashMap::from([(0x402000, "sym.local_raw_target".to_string())]);
-        let symbols = HashMap::new();
+        let binary_symbols = HashMap::new();
         let callee_facts =
             BTreeMap::from([(0x401000, imported_callee_fact(0x401000, "sym.imp.printf"))]);
         let known_function_signatures = HashMap::new();
@@ -9458,7 +9460,7 @@ mod tests {
             [(callsite, 0x401000)],
             &r2types::CalleeIdentityContext {
                 function_names: &function_names,
-                symbols: &symbols,
+                symbols: &binary_symbols,
                 callee_facts: &callee_facts,
                 known_function_signatures: &known_function_signatures,
             },
@@ -10206,6 +10208,7 @@ mod tests {
 
     #[test]
     fn no_calldefine_arm64_copy_from_w0_binds_to_prior_imported_call_expr() {
+        let symbols = test_table();
         let mut fixture = TestEnvFixture {
             sp_name: "sp".to_string(),
             fp_name: "x29".to_string(),
@@ -10229,13 +10232,13 @@ mod tests {
             0x1000025d8,
             imported_callee_fact(0x1000025d8, "sym.imp.atoi"),
         )]);
-        let symbols = HashMap::new();
+        let binary_symbols = HashMap::new();
         let known_function_signatures = HashMap::new();
         let resolution = r2types::CalleeResolutionFacts::from_direct_call_targets(
             [(callsite, 0x1000025d8)],
             &r2types::CalleeIdentityContext {
                 function_names: &fixture.function_names,
-                symbols: &symbols,
+                symbols: &binary_symbols,
                 callee_facts: &callee_facts,
                 known_function_signatures: &known_function_signatures,
             },

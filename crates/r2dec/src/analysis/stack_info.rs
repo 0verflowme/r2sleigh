@@ -647,7 +647,7 @@ mod tests {
         ]);
         let function_names = HashMap::new();
         let strings = HashMap::new();
-        let symbols = HashMap::new();
+        let binary_symbols = HashMap::new();
         let env = PassEnv {
             carrier_aliases: crate::analysis::no_carrier_aliases(),
             string_literals: crate::analysis::lower::no_string_literals(),
@@ -657,7 +657,8 @@ mod tests {
             ret_reg_name: arch.ret_regs.first().map(String::as_str).unwrap_or("rax"),
             function_names: &function_names,
             strings: &strings,
-            symbols: &symbols,
+            binary_symbols: &binary_symbols,
+            symbols: &test_table(),
             callee_facts: crate::analysis::empty_callee_facts(),
             callee_resolution: None,
             summary_view: None,
@@ -681,12 +682,13 @@ mod tests {
 
     #[test]
     fn stack_analysis_requires_ram_memory_space() {
+        let symbols = test_table();
         let arch = DecompilerConfig::x86_64();
         let param_aliases = HashMap::new();
         let type_hints = HashMap::new();
         let function_names = HashMap::new();
         let strings = HashMap::new();
-        let symbols = HashMap::new();
+        let binary_symbols = HashMap::new();
         let env = PassEnv {
             carrier_aliases: crate::analysis::no_carrier_aliases(),
             string_literals: crate::analysis::lower::no_string_literals(),
@@ -696,7 +698,8 @@ mod tests {
             ret_reg_name: arch.ret_regs.first().map(String::as_str).unwrap_or("rax"),
             function_names: &function_names,
             strings: &strings,
-            symbols: &symbols,
+            binary_symbols: &binary_symbols,
+            symbols: &test_table(),
             callee_facts: crate::analysis::empty_callee_facts(),
             callee_resolution: None,
             summary_view: None,

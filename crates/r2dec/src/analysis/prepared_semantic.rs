@@ -4501,15 +4501,16 @@ mod tests {
 
     #[test]
     fn prepared_view_prefers_typed_callee_resolution_over_raw_name_maps() {
+        let symbols = test_table();
         let prepared = test_prepared_call_artifact();
         let abi_arg_regs = vec!["rdi".to_string(), "rsi".to_string()];
         let resolution_function_names = HashMap::from([(0x401000, "sym.imp.printf".to_string())]);
-        let symbols = HashMap::new();
+        let binary_symbols = HashMap::new();
         let callee_facts = BTreeMap::new();
         let known_function_signatures = HashMap::new();
         let resolution_ctx = r2types::CalleeIdentityContext {
             function_names: &resolution_function_names,
-            symbols: &symbols,
+            symbols: &binary_symbols,
             callee_facts: &callee_facts,
             known_function_signatures: &known_function_signatures,
         };
@@ -4736,10 +4737,11 @@ mod tests {
 
     #[test]
     fn prepared_call_arity_prefers_typed_callee_signature_over_summary_hint() {
+        let symbols = test_table();
         let prepared = test_prepared_two_arg_call_artifact();
         let abi_arg_regs = vec!["rdi".to_string(), "rsi".to_string()];
         let typed_function_names = HashMap::from([(0x401000, "sym.imp.one_arg".to_string())]);
-        let symbols = HashMap::new();
+        let binary_symbols = HashMap::new();
         let callee_facts = BTreeMap::new();
         let known_function_signatures = HashMap::from([(
             "sym.imp.one_arg".to_string(),
@@ -4754,7 +4756,7 @@ mod tests {
         )]);
         let resolution_ctx = r2types::CalleeIdentityContext {
             function_names: &typed_function_names,
-            symbols: &symbols,
+            symbols: &binary_symbols,
             callee_facts: &callee_facts,
             known_function_signatures: &known_function_signatures,
         };
@@ -5015,12 +5017,13 @@ mod tests {
 
     #[test]
     fn prepared_runtime_facts_preserve_env_type_hints() {
+        let symbols = test_table();
         let prepared = test_prepared_artifact();
         let view = PreparedSemanticView::default();
         let blocks: Vec<SSABlock> = Vec::new();
         let function_names = HashMap::new();
         let strings = HashMap::new();
-        let symbols = HashMap::new();
+        let binary_symbols = HashMap::new();
         let arg_regs = Vec::new();
         let param_register_aliases = HashMap::new();
         let caller_saved_regs = HashSet::new();
@@ -5034,7 +5037,8 @@ mod tests {
             ret_reg_name: "rax",
             function_names: &function_names,
             strings: &strings,
-            symbols: &symbols,
+            binary_symbols: &binary_symbols,
+            symbols: &test_table(),
             callee_facts: crate::analysis::empty_callee_facts(),
             callee_resolution: None,
             summary_view: None,
@@ -5052,9 +5056,10 @@ mod tests {
 
     #[test]
     fn prepared_definition_safety_uses_typed_storage_classification() {
+        let symbols = test_table();
         let function_names = HashMap::new();
         let strings = HashMap::new();
-        let symbols = HashMap::new();
+        let binary_symbols = HashMap::new();
         let arg_regs = vec!["RDI".to_string()];
         let param_register_aliases = HashMap::new();
         let caller_saved_regs = HashSet::from(["RCX".to_string()]);
@@ -5068,7 +5073,8 @@ mod tests {
             ret_reg_name: "RAX",
             function_names: &function_names,
             strings: &strings,
-            symbols: &symbols,
+            binary_symbols: &binary_symbols,
+            symbols: &test_table(),
             callee_facts: crate::analysis::empty_callee_facts(),
             callee_resolution: None,
             summary_view: None,

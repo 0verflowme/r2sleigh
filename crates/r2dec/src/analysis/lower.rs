@@ -1561,6 +1561,7 @@ mod tests {
 
     #[test]
     fn callother_ids_share_explicit_lowering() {
+        let symbols = test_table();
         let fn_map = HashMap::new();
         let str_map = HashMap::new();
         let sym_map = HashMap::new();
@@ -1602,8 +1603,8 @@ mod tests {
                 },
                     vec![
                         CExpr::StringLit(format!("userop_{userop}")),
-                        ctx.name_ref("x30"),
-                        ctx.name_ref("sp"),
+                        crate::symbol::var_ref(&symbols, "x30"),
+                        crate::symbol::var_ref(&symbols, "sp"),
                     ],
                 ),
                 "numeric userop must remain an explicit CallOther"
@@ -1613,9 +1614,10 @@ mod tests {
 
     #[test]
     fn op_to_expr_preserves_select_value_semantics() {
+        let symbols = test_table();
         let function_names = HashMap::new();
         let strings = HashMap::new();
-        let symbols = HashMap::new();
+        let binary_symbols = HashMap::new();
         let definitions = HashMap::new();
         let use_counts = HashMap::new();
         let condition_vars = HashSet::new();
@@ -1635,7 +1637,7 @@ mod tests {
             &forwarded_values,
             &function_names,
             &strings,
-            &symbols,
+            &binary_symbols,
         );
 
         assert_eq!(
@@ -1646,15 +1648,16 @@ mod tests {
                 if_false: SSAVar::new("when_false", 0, 4),
             }),
             CExpr::Ternary {
-                cond: Box::new(ctx.name_ref("cond")),
-                then_expr: Box::new(ctx.name_ref("when_true")),
-                else_expr: Box::new(ctx.name_ref("when_false")),
+                cond: Box::new(crate::symbol::var_ref(&symbols, "cond")),
+                then_expr: Box::new(crate::symbol::var_ref(&symbols, "when_true")),
+                else_expr: Box::new(crate::symbol::var_ref(&symbols, "when_false")),
             }
         );
     }
 
     #[test]
     fn get_expr_keeps_ram_addresses_numeric_without_typed_string_fact() {
+        let symbols = test_table();
         let fn_map = HashMap::new();
         let mut str_map = HashMap::new();
         let sym_map = HashMap::new();
@@ -1682,7 +1685,7 @@ mod tests {
         );
 
         let var = SSAVar::new("ram:403048", 0, 8);
-        assert_eq!(ctx.get_expr(&var), ctx.name_ref("ram:403048"));
+        assert_eq!(ctx.get_expr(&var), crate::symbol::var_ref(&symbols, "ram:403048"));
     }
 
     #[test]
@@ -1734,9 +1737,10 @@ mod tests {
 
     #[test]
     fn custom_space_load_never_becomes_an_ordinary_c_dereference() {
+        let symbols = test_table();
         let function_names = HashMap::new();
         let strings = HashMap::new();
-        let symbols = HashMap::new();
+        let binary_symbols = HashMap::new();
         let definitions = HashMap::new();
         let use_counts = HashMap::new();
         let condition_vars = HashSet::new();
@@ -1756,7 +1760,7 @@ mod tests {
             &forwarded_values,
             &function_names,
             &strings,
-            &symbols,
+            &binary_symbols,
         );
         let expr = ctx.op_to_expr(&SSAOp::Load {
             dst: SSAVar::new("tmp:custom_result", 1, 4),
@@ -1768,7 +1772,7 @@ mod tests {
             matches!(
                 expr,
                 CExpr::Call { ref func, ref args }
-                    if **func == ctx.name_ref("r2s_unsupported_space_load")
+                    if **func == crate::symbol::var_ref(&symbols, "r2s_unsupported_space_load")
                         && args.first() == Some(&CExpr::StringLit("space7".to_string()))
             ),
             "custom-space memory must stay explicit and unsupported: {expr:?}"
@@ -1777,6 +1781,7 @@ mod tests {
 
     #[test]
     fn semantic_load_rendering_preserves_exact_memory_space() {
+        let symbols = test_table();
         let definitions = HashMap::new();
         let use_counts = HashMap::new();
         let condition_vars = HashSet::new();
@@ -1787,7 +1792,7 @@ mod tests {
         let forwarded_values = HashMap::new();
         let function_names = HashMap::new();
         let strings = HashMap::new();
-        let symbols = HashMap::new();
+        let binary_symbols = HashMap::new();
         let ctx = make_ctx(
             &definitions,
             &use_counts,
@@ -1799,7 +1804,7 @@ mod tests {
             &forwarded_values,
             &function_names,
             &strings,
-            &symbols,
+            &binary_symbols,
         );
         let addr = NormalizedAddr {
             base: BaseRef::Value(ValueRef::from(SSAVar::new("tmp:addr", 1, 8))),
@@ -1826,7 +1831,7 @@ mod tests {
         assert!(matches!(
             custom,
             CExpr::Call { ref func, ref args }
-                if **func == ctx.name_ref("r2s_unsupported_space_load")
+                if **func == crate::symbol::var_ref(&symbols, "r2s_unsupported_space_load")
                     && args.first() == Some(&CExpr::StringLit("space7".to_string()))
         ));
     }
@@ -1880,6 +1885,7 @@ mod tests {
 
     #[test]
     fn load_preserves_negative_index_subscript_shape() {
+        let symbols = test_table();
         let fn_map = HashMap::new();
         let str_map = HashMap::new();
         let sym_map = HashMap::new();
@@ -1894,12 +1900,12 @@ mod tests {
             "tmp:addr_1".to_string(),
             CExpr::binary(
                 BinaryOp::Add,
-                ctx.name_ref("arg1"),
+                crate::symbol::var_ref(&symbols, "arg1"),
                 CExpr::binary(
                     BinaryOp::Mul,
                     CExpr::Cast {
                         ty: CType::Int(64),
-                        expr: Box::new(CExpr::unary(UnaryOp::Neg, ctx.name_ref("arg2"))),
+                        expr: Box::new(CExpr::unary(UnaryOp::Neg, crate::symbol::var_ref(&symbols, "arg2"))),
                     },
                     CExpr::IntLit(4),
                 ),
@@ -1941,6 +1947,7 @@ mod tests {
 
     #[test]
     fn load_does_not_fabricate_stack_slot_aliases() {
+        let symbols = test_table();
         let fn_map = HashMap::new();
         let str_map = HashMap::new();
         let sym_map = HashMap::new();
@@ -1979,13 +1986,14 @@ mod tests {
             panic!("expected conservative dereference expression");
         };
         assert!(
-            !matches!(inner.as_ref(), CExpr::Var(name) if name.starts_with("local_") || name == "stack"),
+            !matches!(inner.as_ref(), CExpr::Var(name) if name.starts_with("local_") || &*crate::symbol::spelling(&symbols, *name) == "stack"),
             "analysis lowering should not fabricate visible stack aliases"
         );
     }
 
     #[test]
     fn load_base_plus_const_does_not_become_fake_subscript() {
+        let symbols = test_table();
         let fn_map = HashMap::new();
         let str_map = HashMap::new();
         let sym_map = HashMap::new();
@@ -2000,7 +2008,7 @@ mod tests {
             "tmp:addr_1".to_string(),
             CExpr::binary(
                 BinaryOp::Add,
-                ctx.name_ref("arg1"),
+                crate::symbol::var_ref(&symbols, "arg1"),
                 CExpr::IntLit(8),
             ),
         )]);
@@ -2032,6 +2040,7 @@ mod tests {
 
     #[test]
     fn load_alias_expanded_const_index_does_not_become_fake_subscript() {
+        let symbols = test_table();
         let fn_map = HashMap::new();
         let str_map = HashMap::new();
         let sym_map = HashMap::new();
@@ -2048,10 +2057,10 @@ mod tests {
                 "tmp:addr_1".to_string(),
                 CExpr::binary(
                     BinaryOp::Add,
-                    ctx.name_ref("arg1"),
+                    crate::symbol::var_ref(&symbols, "arg1"),
                     CExpr::binary(
                         BinaryOp::Mul,
-                        ctx.name_ref("tmp:index_1"),
+                        crate::symbol::var_ref(&symbols, "tmp:index_1"),
                         CExpr::IntLit(4),
                     ),
                 ),
@@ -2085,6 +2094,7 @@ mod tests {
 
     #[test]
     fn load_unstable_alias_expanded_base_does_not_become_member_access() {
+        let symbols = test_table();
         let fn_map = HashMap::new();
         let str_map = HashMap::new();
         let sym_map = HashMap::new();
@@ -2096,12 +2106,12 @@ mod tests {
         let stack_slots = HashMap::new();
         let forwarded_values = HashMap::new();
         let definitions = HashMap::from([
-            ("tmp:base_1".to_string(), ctx.name_ref("rdx_1")),
+            ("tmp:base_1".to_string(), crate::symbol::var_ref(&symbols, "rdx_1")),
             (
                 "tmp:addr_1".to_string(),
                 CExpr::binary(
                     BinaryOp::Add,
-                    ctx.name_ref("tmp:base_1"),
+                    crate::symbol::var_ref(&symbols, "tmp:base_1"),
                     CExpr::IntLit(8),
                 ),
             ),
@@ -2134,6 +2144,7 @@ mod tests {
 
     #[test]
     fn ptr_arith_prefers_expression_recovered_real_index_over_pointer_local() {
+        let symbols = test_table();
         let fn_map = HashMap::new();
         let str_map = HashMap::new();
         let sym_map = HashMap::new();
@@ -2158,18 +2169,18 @@ mod tests {
         let definitions = HashMap::from([
             (
                 "tmp:arr_local_1".to_string(),
-                ctx.name_ref("local_8"),
+                crate::symbol::var_ref(&symbols, "local_8"),
             ),
-            ("local_8".to_string(), ctx.name_ref("arg1")),
-            ("local_c".to_string(), ctx.name_ref("arg2")),
+            ("local_8".to_string(), crate::symbol::var_ref(&symbols, "arg1")),
+            ("local_c".to_string(), crate::symbol::var_ref(&symbols, "arg2")),
             (
                 addr.display_name(),
                 CExpr::binary(
                     BinaryOp::Add,
-                    ctx.name_ref("local_8"),
+                    crate::symbol::var_ref(&symbols, "local_8"),
                     CExpr::binary(
                         BinaryOp::Mul,
-                        ctx.name_ref("local_c"),
+                        crate::symbol::var_ref(&symbols, "local_c"),
                         CExpr::IntLit(4),
                     ),
                 ),
@@ -2199,11 +2210,11 @@ mod tests {
             panic!("expected subscript expression");
         };
         assert!(
-            matches!(base.as_ref(), CExpr::Cast { expr, .. } if matches!(expr.as_ref(), CExpr::Var(name) if name == "arg1")),
+            matches!(base.as_ref(), CExpr::Cast { expr, .. } if matches!(expr.as_ref(), CExpr::Var(name) if &*crate::symbol::spelling(&symbols, *name) == "arg1")),
             "subscript base should normalize back to the semantic pointer source"
         );
         assert!(
-            matches!(index.as_ref(), CExpr::Var(name) if name == "arg2"),
+            matches!(index.as_ref(), CExpr::Var(name) if &*crate::symbol::spelling(&symbols, *name) == "arg2"),
             "subscript index should use the semantic index source, not the pointer local alias: {index:?}"
         );
     }
