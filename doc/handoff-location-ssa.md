@@ -353,9 +353,32 @@ them again:
   copies and rewrites uses, and `CallOther` inputs are mapped along with every
   other operand, so a propagated copy does not leave its readers behind.
 
-The next thing to find is which path does build those argument expressions,
-since it is not the one every other operand goes through. Instrument
-`assignment_lhs_expr` and `var_ref` rather than `get_expr`.
+Instrumenting `var_ref` instead answers where they come from, and rules out the
+copy story entirely:
+
+    var_ref xmm6_3:  producer=Some("IntXor") def=true
+    var_ref xmm6_5:  producer=Some("IntXor") def=false
+    var_ref xmm6_7:  producer=Some("IntXor") def=false
+    var_ref xmm6_11: producer=Some("IntXor") def=false
+    var_ref xmm6_13: producer=Some("IntXor") def=false
+
+Every one is produced by an `IntXor` -- the `pxor`, not the `movdqa`. So these
+are not copy destinations at all, and the `Copy` from `movdqa` is beside the
+point. The first version has a definition and the later ones do not, though the
+producer is known for all of them.
+
+`use_info` records a definition for **every** op with a `dst`, unconditionally
+(`insert_definition_for_var`, around line 2662), so `info.definitions` should
+hold all of them. What returns false above is the fold's `definition_for_name`,
+which is a different lookup: it goes through `lookup_definition`, which takes a
+resolution guard and refuses on a cycle. A `pxor` is `xmm6 = xmm6 ^ xmm4`, so
+the definition of `xmm6_5` mentions `xmm6_3`, and a chain of them is exactly the
+shape a cycle guard would cut.
+
+**Start there:** find why `lookup_definition` declines for the later versions
+while accepting the first. If it is the resolution guard, the question is
+whether a self-referential register update should count as a cycle at all --
+each version is a distinct value, so the chain terminates.
 
 That is the dangling-read defect, and it is worth more than the lane model,
 because it also explains the duplicated statements around it: the same
