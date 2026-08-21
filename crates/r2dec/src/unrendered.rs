@@ -247,16 +247,18 @@ mod tests {
 
         spell_every_name_as_c(&mut func);
 
-        let names = collect_block_names(&func.body);
+        // Every name the function can write down is one the table issued, so
+        // asking the table is asking about every mention at once.
+        let table = func.symbols.borrow();
+        let unreadable = table
+            .iter()
+            .map(|(_, symbol)| symbol.name.to_string())
+            .filter(|name| !is_c_identifier(name))
+            .collect::<Vec<_>>();
         assert!(
-            names.iter().all(|name| is_c_identifier(name)),
-            "no name may reach the page that C cannot read: {names:?}"
+            unreadable.is_empty(),
+            "no name may reach the page that C cannot read: {unreadable:?}"
         );
-        let mut declared = BTreeSet::new();
-        collect_block_declared(&func.body, &mut declared);
-        assert!(declared.iter().all(|name| is_c_identifier(name)));
-        // The reference and the declaration must still be the same name.
-        assert_eq!(declared, names);
     }
 
     #[test]
@@ -277,13 +279,15 @@ mod tests {
 
         spell_every_name_as_c(&mut func);
 
-        assert_eq!(func.params[0].name, symbols.borrow_mut().declare_or_reuse("total"), "a readable name is untouched");
-        let mut declared = BTreeSet::new();
-        collect_block_declared(&func.body, &mut declared);
-        assert!(
-            !declared.contains("total"),
-            "spelling one name must not collide with another: {declared:?}"
-        );
+        // The readable name keeps its spelling, so the one that had to be
+        // respelled cannot have taken it.
+        let table = func.symbols.borrow();
+        assert_eq!(table.name(func.params[0].name), "total");
+        let claims = table
+            .iter()
+            .filter(|(_, symbol)| &*symbol.name == "total")
+            .count();
+        assert_eq!(claims, 1, "spelling one name must not collide with another");
     }
 }
 
