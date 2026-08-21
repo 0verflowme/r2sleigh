@@ -1038,6 +1038,13 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                             let lowered_target = *path
                                 .last()
                                 .expect("transparent transfer paths are never empty");
+                            // The blocks walked over do nothing but pass control
+                            // along, and the jump written here is what they do.
+                            // Nothing else will emit them, so without saying so
+                            // they read as blocks the body left out.
+                            for addr in &path {
+                                self.fold_ctx.folded_blocks.borrow_mut().insert(*addr);
+                            }
                             let label = self.ensure_label(lowered_target);
                             if !self.record_transfer_target_domain(*loop_header, lowered_target) {
                                 return CStmt::Empty;
