@@ -143,9 +143,7 @@ static const R2SleighApiV2 *sleigh_lift_api_v2(void) {
 		|| !api->lift_context_set_semantic_metadata || !api->lift_block_free
 		|| !api->lift_block_validate || !api->lift_block_set_switch_info
 		|| !api->lift_block_op_count || !api->lift_block_direct_call_identity
-		|| !api->lift_block_size || !api->lift_block_addr
-		|| !api->lift_block_mnemonic || !api->lift_block_type
-		|| !api->lift_block_jump || !api->lift_block_fail
+		|| !api->lift_block_view || !api->lift_block_mnemonic
 		|| !api->owned_bytes_view || !api->owned_bytes_free
 		|| !api->analysis_render
 		|| !api->analysis_query || !api->analysis_result_view
@@ -466,12 +464,12 @@ static uint32_t sleigh_v2_block_op_count(const R2ILBlock *block, size_t *count) 
 		: R2SLEIGH_STATUS_INVALID_ARGUMENT_V2;
 }
 
-static uint32_t sleigh_v2_block_size(const R2ILBlock *block, uint32_t *value) {
+static uint32_t sleigh_v2_block_view(const R2ILBlock *block, R2SleighBlockViewV2 *view) {
 	const R2SleighApiV2 *api = sleigh_lift_api_v2 ();
-	if (value) {
-		*value = 0;
+	if (!api || !api->lift_block_view) {
+		return R2SLEIGH_STATUS_ABI_MISMATCH_V2;
 	}
-	return api && block && value? api->lift_block_size (block, value)
+	return api && block && view? api->lift_block_view (block, view)
 		: R2SLEIGH_STATUS_INVALID_ARGUMENT_V2;
 }
 
@@ -503,32 +501,8 @@ static uint32_t sleigh_v2_block_mnemonic(const R2ILContext *context, const unsig
 	return sleigh_lift_owned_bytes_copy (api, mnemonic, text);
 }
 
-static uint32_t sleigh_v2_block_type(const R2ILBlock *block, uint32_t *value) {
-	const R2SleighApiV2 *api = sleigh_lift_api_v2 ();
-	if (value) {
-		*value = 0;
-	}
-	return api && block && value? api->lift_block_type (block, value)
-		: R2SLEIGH_STATUS_INVALID_ARGUMENT_V2;
-}
 
-static uint32_t sleigh_v2_block_jump(const R2ILBlock *block, uint64_t *value) {
-	const R2SleighApiV2 *api = sleigh_lift_api_v2 ();
-	if (value) {
-		*value = 0;
-	}
-	return api && block && value? api->lift_block_jump (block, value)
-		: R2SLEIGH_STATUS_INVALID_ARGUMENT_V2;
-}
 
-static uint32_t sleigh_v2_block_fail(const R2ILBlock *block, uint64_t *value) {
-	const R2SleighApiV2 *api = sleigh_lift_api_v2 ();
-	if (value) {
-		*value = 0;
-	}
-	return api && block && value? api->lift_block_fail (block, value)
-		: R2SLEIGH_STATUS_INVALID_ARGUMENT_V2;
-}
 
 static uint32_t sleigh_v2_analysis_render(uint32_t kind, const R2ILContext *context,
 	const R2ILBlock *const *blocks, size_t num_blocks, size_t op_index,
@@ -3295,24 +3269,19 @@ int sleigh_op(RAnal *anal, RAnalOp *op, ut64 addr, const ut8 *data, int len, RAn
 	}
 
 	op->addr = addr;
-	uint32_t block_size = 0;
-	uint32_t block_type = 0;
-	if (sleigh_v2_block_size (block, &block_size) != R2SLEIGH_STATUS_OK_V2
-		|| sleigh_v2_block_type (block, &block_type) != R2SLEIGH_STATUS_OK_V2) {
+	R2SleighBlockViewV2 view = {0};
+	if (sleigh_v2_block_view (block, &view) != R2SLEIGH_STATUS_OK_V2
+		|| view.struct_size != sizeof (view)) {
 		(void)sleigh_v2_block_release (&block);
 		return -1;
 	}
-	op->size = block_size;
-	op->type = block_type;
-	ut64 jump_addr = 0;
-	(void)sleigh_v2_block_jump (block, &jump_addr);
-	if (jump_addr != 0) {
-		op->jump = jump_addr;
+	op->size = view.size;
+	op->type = view.block_type;
+	if (view.jump != 0) {
+		op->jump = view.jump;
 	}
-	ut64 fail_addr = 0;
-	(void)sleigh_v2_block_fail (block, &fail_addr);
-	if (fail_addr != 0) {
-		op->fail = fail_addr;
+	if (view.fail != 0) {
+		op->fail = view.fail;
 	}
 
 	if (mask & R_ARCH_OP_MASK_DISASM) {

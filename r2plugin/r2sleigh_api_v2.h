@@ -304,9 +304,6 @@ typedef struct R2SleighResponseInfoV2 {
   struct R2SleighByteViewV2 diagnostics_json;
 } R2SleighResponseInfoV2;
 
-/**
- * Length-tagged UTF-8 source string.
- */
 typedef struct R2SleighStringViewV2 {
   const uint8_t *data;
   size_t len;
@@ -330,6 +327,25 @@ typedef struct R2SleighDirectCallIdentityV2 {
   uint64_t target_offset;
   uint32_t target_size;
 } R2SleighDirectCallIdentityV2;
+
+/**
+ * Length-tagged UTF-8 source string.
+ * Everything a caller needs to know about one lifted block.
+ *
+ * Six accessors used to answer this, and each one locked the lift registry and
+ * looked the handle up again to read a single field. Six lock acquisitions to
+ * describe one block is the cost; the maintenance is that both sides carry a
+ * declaration per field. One view answers under one lock.
+ */
+typedef struct R2SleighBlockViewV2 {
+  uint32_t struct_size;
+  uint32_t block_type;
+  uint32_t size;
+  uint64_t addr;
+  uint64_t jump;
+  uint64_t fail;
+  size_t op_count;
+} R2SleighBlockViewV2;
 
 /**
  * One bounded text-analysis request over registry-owned lift handles.
@@ -504,15 +520,11 @@ typedef struct R2SleighApiV2 {
                                               uint64_t,
                                               uint32_t*,
                                               struct R2SleighDirectCallIdentityV2*);
-  uint32_t (*lift_block_size)(const R2ILBlock*, uint32_t*);
-  uint32_t (*lift_block_addr)(const R2ILBlock*, uint64_t*);
+  uint32_t (*lift_block_view)(const R2ILBlock*, struct R2SleighBlockViewV2*);
   uint32_t (*lift_block_mnemonic)(const R2ILContext*,
                                   struct R2SleighByteViewV2,
                                   uint64_t,
                                   struct R2SleighOwnedBytesV2**);
-  uint32_t (*lift_block_type)(const R2ILBlock*, uint32_t*);
-  uint32_t (*lift_block_jump)(const R2ILBlock*, uint64_t*);
-  uint32_t (*lift_block_fail)(const R2ILBlock*, uint64_t*);
   uint32_t (*owned_bytes_view)(const struct R2SleighOwnedBytesV2*, struct R2SleighByteViewV2*);
   uint32_t (*owned_bytes_free)(struct R2SleighOwnedBytesV2*);
   uint32_t (*analysis_render)(const struct R2SleighAnalysisRenderRequestV2*,

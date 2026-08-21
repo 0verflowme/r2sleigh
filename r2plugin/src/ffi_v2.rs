@@ -167,6 +167,24 @@ pub struct R2SleighRequestV2 {
 }
 
 /// Length-tagged UTF-8 source string.
+/// Everything a caller needs to know about one lifted block.
+///
+/// Six accessors used to answer this, and each one locked the lift registry and
+/// looked the handle up again to read a single field. Six lock acquisitions to
+/// describe one block is the cost; the maintenance is that both sides carry a
+/// declaration per field. One view answers under one lock.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct R2SleighBlockViewV2 {
+    pub struct_size: u32,
+    pub block_type: u32,
+    pub size: u32,
+    pub addr: u64,
+    pub jump: u64,
+    pub fail: u64,
+    pub op_count: usize,
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct R2SleighStringViewV2 {
@@ -525,17 +543,13 @@ pub struct R2SleighApiV2 {
         *mut u32,
         *mut R2SleighDirectCallIdentityV2,
     ) -> u32,
-    pub lift_block_size: extern "C" fn(*const R2ILBlock, *mut u32) -> u32,
-    pub lift_block_addr: extern "C" fn(*const R2ILBlock, *mut u64) -> u32,
+    pub lift_block_view: extern "C" fn(*const R2ILBlock, *mut R2SleighBlockViewV2) -> u32,
     pub lift_block_mnemonic: extern "C" fn(
         *const R2ILContext,
         R2SleighByteViewV2,
         u64,
         *mut *mut R2SleighOwnedBytesV2,
     ) -> u32,
-    pub lift_block_type: extern "C" fn(*const R2ILBlock, *mut u32) -> u32,
-    pub lift_block_jump: extern "C" fn(*const R2ILBlock, *mut u64) -> u32,
-    pub lift_block_fail: extern "C" fn(*const R2ILBlock, *mut u64) -> u32,
     pub owned_bytes_view:
         extern "C" fn(*const R2SleighOwnedBytesV2, *mut R2SleighByteViewV2) -> u32,
     pub owned_bytes_free: extern "C" fn(*mut R2SleighOwnedBytesV2) -> u32,
@@ -2007,26 +2021,27 @@ extern "C" fn lift_block_direct_call_identity(
     })
 }
 
-extern "C" fn lift_block_size(block: *const R2ILBlock, output: *mut u32) -> u32 {
+extern "C" fn lift_block_view(
+    block: *const R2ILBlock,
+    output: *mut R2SleighBlockViewV2,
+) -> u32 {
     lift_boundary_for(block, || {
-        valid_output_ptr(output, "block size output")?;
-        unsafe { *output = 0 };
+        valid_output_ptr(output, "block view output")?;
+        unsafe { *output = R2SleighBlockViewV2::default() };
         let key = lift_handle_key(block, "lifted block")?;
         let registry = lock_lift_registry();
         let payload = registry.payload::<R2ILBlock>(key, LiftHandleKind::Block, "lifted block")?;
-        unsafe { *output = super::r2il_block_size(payload) };
-        Ok(())
-    })
-}
-
-extern "C" fn lift_block_addr(block: *const R2ILBlock, output: *mut u64) -> u32 {
-    lift_boundary_for(block, || {
-        valid_output_ptr(output, "block address output")?;
-        unsafe { *output = 0 };
-        let key = lift_handle_key(block, "lifted block")?;
-        let registry = lock_lift_registry();
-        let payload = registry.payload::<R2ILBlock>(key, LiftHandleKind::Block, "lifted block")?;
-        unsafe { *output = super::r2il_block_addr(payload) };
+        unsafe {
+            *output = R2SleighBlockViewV2 {
+                struct_size: size_of::<R2SleighBlockViewV2>() as u32,
+                block_type: super::r2il_block_type(payload),
+                size: super::r2il_block_size(payload),
+                addr: super::r2il_block_addr(payload),
+                jump: super::r2il_block_jump(payload),
+                fail: super::r2il_block_fail(payload),
+                op_count: super::r2il_block_op_count(payload),
+            };
+        }
         Ok(())
     })
 }
@@ -2763,12 +2778,8 @@ static API_V2: R2SleighApiV2 = R2SleighApiV2 {
     lift_block_set_switch_info,
     lift_block_op_count,
     lift_block_direct_call_identity,
-    lift_block_size,
-    lift_block_addr,
+    lift_block_view,
     lift_block_mnemonic,
-    lift_block_type,
-    lift_block_jump,
-    lift_block_fail,
     owned_bytes_view,
     owned_bytes_free,
     analysis_render,
