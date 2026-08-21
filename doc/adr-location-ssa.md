@@ -220,8 +220,8 @@ has to work before it lands.
 6. Collapse the facts structs into one model and enforce the renderer's read-only
    contract.
 7. Rewrite the fold: demote flags and temporaries, migrate expressions onto the
-   symbol table, extract the target model, and convert the complexity ceiling
-   into budget refusals.
+   symbol table, give each certified carrier one name, extract the target model,
+   and convert the complexity ceiling into budget refusals.
 
 The FFI comes before the location model because the snapshot enters the system
 through that boundary and the location model consumes exactly what crosses it;
@@ -246,6 +246,28 @@ mistake as deciding a stack address by testing whether a register name contains
 encode, or the migration will only move the string inspection somewhere else.
 
 Every step except 3 is expected to be net-negative on line count.
+
+## Why carrier naming waits for the fold rewrite
+
+A certified loop carrier is one mutable variable that the machine spells
+differently on every edge, so an entry value, a phi, a latch update and a
+post-loop merge are four SSA values and one C local. Giving them one name was
+built and measured: on x86-64 `-O1` it turns three dead locals into a single
+`rax` that is initialised once and assigned in the loop, and the duplicate
+assignments beside it disappear.
+
+It was withdrawn because it also names carriers that should not exist. At `-O0`
+the value the source carries lives in a frame slot and the register beside it is
+a copy nothing consults, so naming that register puts a variable on the page that
+is written twice and never read.
+
+The rule that separates them is the one this project already states: a value with
+a single reader is propagated into that reader, and only a value with more than
+one reader is declared. Applying it here needs to know which readers survive, and
+at present a carrier's readers are mostly condition-code computations that are
+themselves elided. A readership test cannot be written honestly until flags stop
+being values that merge, which is step 7. Naming carriers therefore belongs to
+step 7 and not before it.
 
 ## Consequences
 
