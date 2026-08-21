@@ -208,6 +208,39 @@ constructor`, `genuine basic block contains instructions after a control
 terminator`, `machine-derived CFG contradicts the owned advisory source CFG`.
 Those are engine limits and predate this work.
 
+### The undeclared-mention check, and what it found
+
+`unrendered::names_mentioned_without_a_declaration` is a set difference: every
+identifier the body mentions, less every one the function declares. It runs
+after the last pass that can rename anything, and what it finds is written into
+the rendering as a `r2dec defect:` comment rather than left for a reader to
+notice.
+
+This question could not be asked cheaply before. A reference was a `String`, so
+the only way to ask was to scan finished text for words that resolve to nothing,
+and **that scan could be satisfied by declaring the word** -- which is what the
+pipeline had started doing. Two passes existed for it and both are deleted.
+
+Twenty-three functions across the hash and flag corpora mention a name they
+never declare. The names fall into three kinds, and they are three different
+defects:
+
+- **Raw machine registers**: `al`, `rax`, `rsi`, `cf_1`, `d2`, `q2`,
+  `xmm6_5`. A register that escaped the fold. This is the original problem the
+  symbol table was built to make visible.
+- **Call targets rendered as variables**: `sub_2c4`, `sub_504`. The AST has
+  `CExpr::External` carrying an `ExternalKind`, precisely so that calling
+  something outside the function is a claim a reader can check. These are
+  `CExpr::Var` instead, which bypasses it. `ExternalKind` is defined and, apart
+  from two intrinsic sites in `analysis/lower.rs`, unused.
+- **Placeholder text used as a name**: `register`, `stack slot`. `stack slot`
+  contains a space and is not a C identifier at all. It does not reach the
+  printed C, so something downstream drops or replaces it, but it is in the
+  finished AST.
+
+`arg_c = arg_c` no longer reproduces anywhere in the corpus -- zero
+self-assignments across every rendered function.
+
 ### A defect worth chasing next
 
 `sym._sum_carry` in `flag_x64.dylib` renders `rax = (int64_t)eax_1;` where
