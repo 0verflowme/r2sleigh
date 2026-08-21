@@ -182,37 +182,52 @@ Every one was a real defect that the branding exposed, not churn:
 **Step 2 is not finished.** 83 failing tests, and the cross-table question above
 is unanswered.
 
-**Not validated against either corpus, and there is a trap here.** Read this
-before trying.
+**Corpus validation now runs, and it found a production bug.** Read the trap
+first: `pdc` is radare2's own pseudo-decompiler, not r2sleigh's renderer. It
+answers happily with raw register arithmetic. Comparing `pdc` across two builds
+of this plugin proves nothing, and I made exactly that mistake before catching
+it. The command is `pdd`, driven as `r2 -qc "a:sla; aaa; s <fn>; pdd" <binary>`.
 
-`pdc` is radare2's own pseudo-decompiler, not r2sleigh's renderer. It answers
-happily and prints raw register arithmetic (`al &= byte [rsp + riz*8 + ...]`).
-Comparing `pdc` output across two builds of this plugin proves nothing about the
-renderer, and I made exactly that mistake before catching it — the outputs were
-byte-identical because neither of them came from r2sleigh at all.
+Driven correctly, the rewritten tree rendered **nothing** where the baseline
+rendered thirty lines, and the reason was the table brand firing in production:
 
-r2sleigh's command is `sla.dec`, and it needs the engine activated with `a:sla`
-and the fork's own radare2 binary with `DYLD_LIBRARY_PATH` set across
-`libr/*` — see `/tmp/dump_all.sh` for the invocation that produced the recorded
-renderings in `/tmp/r2stest/at_*.txt`.
+    identifier from table TableId(1) read in table TableId(5)
 
-**`sla.dec` currently prints nothing for `sym._fnv1a64` in `hashes_x64_O2.o`,
-and it prints nothing on the pre-rewrite tree too.** I installed the baseline
-plugin from the untouched checkout and confirmed this, so it is not a regression
-from the migration — but it does mean no corpus comparison was possible. There
-is a known failure mode where `sla.dec` prints nothing instead of refusing;
-whoever picks this up should find out whether that is what is happening before
-reading anything into a silent render. The analysis log shows one function
-refused for an unrelated lift error (`r0x00000def: Unable to resolve
-constructor`), which may or may not be connected.
+Every pass held its own symbol table. Analysis minted into one, the fold context
+into a second, and handing `CFunction` its table with `mem::take` left the fold
+context holding a third that the take had just emptied. The renderer was reading
+identifiers no table it held had issued. Before branding this did not crash --
+it resolved to a real but wrong name, and the rendering went out saying
+something it did not mean.
 
-The recorded renderings in `/tmp/r2stest/at_*.txt` show what good output looks
-like, including the obligation ledger line, so the renderer does work when
-correctly driven. Zero compiler errors was never the
-milestone; rendering those two corpora correctly is. When comparing obligation
-counts, compare rendered-as-a-share-of-total **only when the totals match** — the
-repair pass creates obligations for its own inserted ops, and I got this
-comparison wrong twice, in both directions.
+There is now exactly one table per rendered function, an `Rc`, shared by every
+pass that declares or reads a name. Sharing is a refcount bump; the copies it
+replaced were the bug.
+
+`sym._fnv1a64` at `-O2` renders its hash chain again -- the function whose empty
+body and `void` signature began this work. Its ledger reads `122 source
+obligations: 100 rendered, 0 elided, 2 refused, 20 unaccounted` against the
+previous `100 of 120 owned, 2 unsupported`, and the junk locals `ESI`, `RSI_4`
+and `tregalias_phi_156_1_0` are gone.
+
+Across the corpus most functions render on x86-64 and arm64 at `-O0` and `-O2`.
+The remaining empty ones fail at the lift, not the table: `Unable to resolve
+constructor`, `genuine basic block contains instructions after a control
+terminator`, `machine-derived CFG contradicts the owned advisory source CFG`.
+Those are engine limits and predate this work.
+
+### A defect worth chasing next
+
+`sym._sum_carry` in `flag_x64.dylib` renders `rax = (int64_t)eax_1;` where
+`eax_1` is never declared. The table makes an undeclared name unconstructible,
+so `eax_1` *is* in the table -- it is simply never emitted as a local. That is
+the rule from the working agreement: a value with more than one reader is
+declared as a typed local, and one with a single reader propagates into it.
+
+This is now cheap to check exactly, which it was not before: walk the rendered
+body, collect every `SymbolId`, and assert each appears in `params` or `locals`.
+That check used to require scanning text for words that resolve to nothing, and
+could be satisfied by declaring the word. It should be a test.
 
 **Steps 3 through 7 are untouched:**
 
