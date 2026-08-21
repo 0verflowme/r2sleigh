@@ -998,12 +998,22 @@ impl UseInfo {
     }
 
     pub(crate) fn known_named_values(&self) -> Vec<String> {
-        let mut names = BTreeSet::new();
-        names.extend(self.definitions.keys().cloned());
-        names.extend(self.semantic_values.keys().cloned());
-        names.extend(self.copy_sources.keys().cloned());
-        names.extend(self.var_aliases.keys().cloned());
-        names.into_iter().collect()
+        let mut names: BTreeSet<&str> = BTreeSet::new();
+        names.extend(self.named_values());
+        names.into_iter().map(str::to_string).collect()
+    }
+
+    /// Every name any pass has something to say about, borrowed.
+    ///
+    /// A caller that filters these does not need them copied first, and copying
+    /// them costs one allocation per name on every question asked.
+    pub(crate) fn named_values(&self) -> impl Iterator<Item = &str> {
+        self.definitions
+            .keys()
+            .chain(self.semantic_values.keys())
+            .chain(self.copy_sources.keys())
+            .chain(self.var_aliases.keys())
+            .map(String::as_str)
     }
 
     pub(crate) fn stack_slot_for_name(&self, name: &str) -> Option<StackSlotProvenance> {

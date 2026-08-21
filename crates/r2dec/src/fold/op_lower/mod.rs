@@ -10195,9 +10195,9 @@ impl<'a> FoldingContext<'a> {
             return Vec::new();
         };
 
-        let mut matches = self
-            .known_named_values()
-            .into_iter()
+        let mut matches: Vec<String> = self
+            .use_info()
+            .named_values()
             .filter(|ssa_name| {
                 let (base, ssa_version) = Self::ssa_name_parts(ssa_name);
                 let base_matches = if is_temp_alias {
@@ -10220,6 +10220,7 @@ impl<'a> FoldingContext<'a> {
                     name.starts_with('v')
                 }
             })
+            .map(str::to_string)
             .collect::<Vec<_>>();
         matches.sort();
         matches.dedup();
