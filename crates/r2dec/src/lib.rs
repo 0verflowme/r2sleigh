@@ -5777,7 +5777,7 @@ mod tests {
     fn test_final_function_body_prune_removes_late_dead_sleigh_temps() {
         let symbols = test_table();
         let mut func = CFunction {
-            symbols: crate::symbol::SymbolTable::new(),
+            symbols: std::cell::RefCell::new(crate::symbol::SymbolTable::new()),
             name: "late_prune".to_string(),
             ret_type: CType::i64(),
             params: Vec::new(),
@@ -9981,7 +9981,7 @@ mod tests {
             None,
         );
         let mut func = CFunction {
-            symbols: crate::symbol::SymbolTable::new(),
+            symbols: std::cell::RefCell::new(crate::symbol::SymbolTable::new()),
             name: "dbg.gettext_quote".to_string(),
             ret_type: CType::ptr(CType::Int(8)),
             params: Vec::new(),
@@ -10033,7 +10033,7 @@ mod tests {
             None,
         );
         let mut func = CFunction {
-            symbols: crate::symbol::SymbolTable::new(),
+            symbols: std::cell::RefCell::new(crate::symbol::SymbolTable::new()),
             name: "dbg.return_arg_summary".to_string(),
             ret_type: CType::ptr(CType::Int(8)),
             params: Vec::new(),

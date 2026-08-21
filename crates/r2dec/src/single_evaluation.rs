@@ -531,7 +531,7 @@ mod tests {
 
     fn function(body: Vec<CStmt>) -> CFunction {
         CFunction {
-            symbols: crate::symbol::SymbolTable::new(),
+            symbols: std::cell::RefCell::new(crate::symbol::SymbolTable::new()),
             name: "f".to_string(),
             ret_type: CType::Int(32),
             params: Vec::<CParam>::new(),

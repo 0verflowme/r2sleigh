@@ -850,9 +850,9 @@ mod tests {
                 vars.push(name.clone());
             }
         });
-        assert!(vars.contains(&"a".to_string()));
-        assert!(vars.contains(&"f".to_string()));
-        assert!(vars.contains(&"b".to_string()));
+        assert!(vars.iter().any(|v| &*symbols.borrow().name(*v) == "a"));
+        assert!(vars.iter().any(|v| &*symbols.borrow().name(*v) == "f"));
+        assert!(vars.iter().any(|v| &*symbols.borrow().name(*v) == "b"));
     }
 
     #[test]

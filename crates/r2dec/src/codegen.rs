@@ -1168,7 +1168,7 @@ mod tests {
     fn test_generate_simple_function() {
         let symbols = test_table();
         let func = CFunction {
-            symbols: crate::symbol::SymbolTable::new(),
+            symbols: std::cell::RefCell::new(crate::symbol::SymbolTable::new()),
             name: "add".to_string(),
             ret_type: CType::i32(),
             params: vec![
@@ -1354,7 +1354,7 @@ mod tests {
     fn test_function_with_locals() {
         let symbols = test_table();
         let func = CFunction {
-            symbols: crate::symbol::SymbolTable::new(),
+            symbols: std::cell::RefCell::new(crate::symbol::SymbolTable::new()),
             name: "test".to_string(),
             ret_type: CType::Void,
             params: vec![],
@@ -1423,7 +1423,7 @@ mod tests {
             CStmt::expr(CExpr::assign(
                 CExpr::var(symbols.borrow_mut().declare_or_reuse("acc")),
                 CExpr::binary(BinaryOp::Add, CExpr::var(symbols.borrow_mut().declare_or_reuse("acc")), CExpr::int(3)),
-            )),symbols.borrow_mut().declare_or_reuse("acc")
+            )),
         ]);
 
         let code = generate(&func);

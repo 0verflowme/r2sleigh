@@ -10119,6 +10119,7 @@ mod tests {
 
         let info = analyze(&symbols, std::slice::from_ref(&block), &env);
         let lower = LowerCtx {
+            symbols: &symbols,
             string_literals: env.string_literals,
             use_info: Some(&info),
             definitions: &info.definitions,
@@ -10481,6 +10482,7 @@ mod tests {
 
         let info = analyze(&symbols, std::slice::from_ref(&block), &env);
         let lower = LowerCtx {
+            symbols: &symbols,
             string_literals: env.string_literals,
             use_info: None,
             definitions: &info.definitions,

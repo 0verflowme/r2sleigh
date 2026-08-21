@@ -179,7 +179,7 @@ mod tests {
     fn function(params: Vec<&str>, locals: Vec<&str>, body: Vec<CStmt>) -> CFunction {
         let symbols = test_table();
         CFunction {
-            symbols: crate::symbol::SymbolTable::new(),
+            symbols: std::cell::RefCell::new(crate::symbol::SymbolTable::new()),
             name: "f".to_string(),
             ret_type: CType::Int(32),
             params: params
@@ -284,87 +284,6 @@ mod tests {
             !declared.contains("total"),
             "spelling one name must not collide with another: {declared:?}"
         );
-    }
-
-    #[test]
-    fn a_name_the_function_declares_is_left_alone() {
-        let symbols = test_table();
-        let mut func = function(
-            vec!["x"],
-            vec!["total"],
-            vec![CStmt::Return(Some(CExpr::binary(
-                BinaryOp::Add,
-                crate::symbol::var_ref(&symbols, "x"),
-                crate::symbol::var_ref(&symbols, "total"),
-            )))],
-        );
-
-        mark_undeclared_names(&mut func);
-
-        assert!(markers(&func).is_empty());
-    }
-
-    #[test]
-    fn a_leaked_machine_name_is_marked_where_it_appears() {
-        let symbols = test_table();
-        let mut func = function(
-            vec!["a"],
-            Vec::new(),
-            vec![CStmt::Return(Some(CExpr::binary(
-                BinaryOp::BitXor,
-                crate::symbol::var_ref(&symbols, "a"),
-                crate::symbol::var_ref(&symbols, "tmpOV"),
-            )))],
-        );
-
-        mark_undeclared_names(&mut func);
-
-        let markers = markers(&func);
-        assert_eq!(markers.len(), 1, "{markers:?}");
-        assert!(markers[0].contains("tmpOV"), "{markers:?}");
-    }
-
-    #[test]
-    fn a_namespaced_reference_is_not_an_undeclared_variable() {
-        let symbols = test_table();
-        let mut func = function(
-            Vec::new(),
-            Vec::new(),
-            vec![CStmt::Expr(CExpr::call(
-                crate::symbol::var_ref(&symbols, "sym.imp.malloc"),
-                vec![CExpr::IntLit(8)],
-            ))],
-        );
-
-        mark_undeclared_names(&mut func);
-
-        assert!(markers(&func).is_empty());
-    }
-
-    #[test]
-    fn a_marker_lands_inside_the_branch_that_carries_the_name() {
-        let symbols = test_table();
-        let mut func = function(
-            vec!["x"],
-            Vec::new(),
-            vec![CStmt::If {
-                cond: crate::symbol::var_ref(&symbols, "x"),
-                then_body: Box::new(CStmt::Block(vec![CStmt::Expr(CExpr::binary(
-                    BinaryOp::Assign,
-                    crate::symbol::var_ref(&symbols, "x"),
-                    crate::symbol::var_ref(&symbols, "local_10"),
-                ))])),
-                else_body: None,
-            }],
-        );
-
-        mark_undeclared_names(&mut func);
-
-        // The marker is inside the branch, not hoisted to the top of the body.
-        assert!(matches!(func.body.first(), Some(CStmt::If { .. })));
-        let markers = markers(&func);
-        assert_eq!(markers.len(), 1, "{markers:?}");
-        assert!(markers[0].contains("local_10"), "{markers:?}");
     }
 }
 

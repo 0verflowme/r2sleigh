@@ -1462,10 +1462,12 @@ mod tests {
         #[cfg(test)] _strings: &'a HashMap<u64, String>,
         #[cfg(test)] _symbols: &'a HashMap<u64, String>,
     ) -> LowerCtx<'a> {
+        let symbols = test_table();
         let type_hints = Box::leak(Box::new(HashMap::new()));
         let semantic_values = Box::leak(Box::new(HashMap::new()));
         let param_register_aliases = Box::leak(Box::new(HashMap::new()));
         LowerCtx {
+            symbols: &symbols,
             string_literals: crate::analysis::lower::no_string_literals(),
             use_info: None,
             definitions,

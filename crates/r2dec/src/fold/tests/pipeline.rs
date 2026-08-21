@@ -318,7 +318,7 @@ mod tests {
         for binding in args {
             if let Some(name) = &binding.source_var_name {
                 view.owner_expr_by_name
-                    .insert(name.clone(), fixture_owner_expr_for_arg(&symbols, binding));
+                    .insert(name.clone(), fixture_owner_expr_for_arg(ctx, binding));
             }
         }
         ctx.inputs.prepared_semantic_view = Some(Box::leak(Box::new(view)));
@@ -764,7 +764,8 @@ mod tests {
             arch,
             function_names: empty_u64,
             strings: empty_u64,
-            symbols: empty_u64,
+            binary_symbols: empty_u64,
+            symbols: &test_table(),
             function_facts: empty_function_facts(),
             certified_rendering_required: false,
             stack_slots: empty_stack_slots,
@@ -810,7 +811,8 @@ mod tests {
             arch,
             function_names: empty_u64,
             strings: empty_u64,
-            symbols: empty_u64,
+            binary_symbols: empty_u64,
+            symbols: &test_table(),
             function_facts: empty_function_facts(),
             certified_rendering_required: false,
             stack_slots: empty_stack_slots,
@@ -1355,7 +1357,7 @@ mod tests {
     fn expr_contains_flag_artifact(expr: &CExpr) -> bool {
         match expr {
             CExpr::Var(name) => {
-                let lower = name.to_lowercase();
+                let lower = ctx.spelling(*name).to_lowercase();
                 lower.starts_with("of_")
                     || lower.starts_with("zf_")
                     || lower.starts_with("sf_")
@@ -1383,7 +1385,7 @@ mod tests {
     fn expr_contains_var(expr: &CExpr, target: &str) -> bool {
         match expr {
             CExpr::External { .. } => false,
-            CExpr::Var(name) => name == target,
+            CExpr::Var(name) => &*ctx.spelling(*name) == target,
             CExpr::Unary { operand, .. }
             | CExpr::Paren(operand)
             | CExpr::Deref(operand)
@@ -2149,7 +2151,7 @@ mod tests {
                 &poisoned_func,
                 vec![binding],
             ),
-            vec![FoldingContext::unresolved_call_arg_expr(&symbols)],
+            vec![ctx.unresolved_call_arg_expr()],
             "source-call replay must not render an uncertified nested call argument",
         );
     }
@@ -2195,7 +2197,7 @@ mod tests {
                 &poisoned_func,
                 vec![binding],
             ),
-            vec![FoldingContext::unresolved_call_arg_expr(&symbols)],
+            vec![ctx.unresolved_call_arg_expr()],
             "transient replayed args must refuse uncertified nested call arguments",
         );
     }
@@ -2264,7 +2266,7 @@ mod tests {
                 &poisoned_outer_func,
                 vec![binding],
             ),
-            vec![FoldingContext::unresolved_call_arg_expr(&symbols)],
+            vec![ctx.unresolved_call_arg_expr()],
             "source-proven text without certified call-argument proof must not render as executable nested C",
         );
     }
@@ -2334,7 +2336,7 @@ mod tests {
                 &poisoned_outer_func,
                 vec![binding],
             ),
-            vec![FoldingContext::unresolved_call_arg_expr(&symbols)],
+            vec![ctx.unresolved_call_arg_expr()],
             "typed/rendered disagreement for a nested source call must refuse executable call-arg C",
         );
     }
@@ -2395,7 +2397,7 @@ mod tests {
                 &poisoned_outer_func,
                 vec![binding],
             ),
-            vec![FoldingContext::unresolved_call_arg_expr(&symbols)],
+            vec![ctx.unresolved_call_arg_expr()],
             "ambiguous nested source-call matches must refuse instead of picking a source",
         );
     }
@@ -2499,7 +2501,7 @@ mod tests {
 
         assert_eq!(
             ctx.normalize_imported_call_arg_expr(call.clone(), false, false, true),
-            FoldingContext::unresolved_call_arg_expr(&symbols),
+            ctx.unresolved_call_arg_expr(),
             "source-less nested call arguments must refuse instead of being truncated or rendered"
         );
     }
@@ -3358,7 +3360,7 @@ mod tests {
 
         assert_eq!(
             rendered,
-            FoldingContext::unresolved_call_arg_expr(&symbols),
+            ctx.unresolved_call_arg_expr(),
             "unstable owner candidates must not fall back to replayed malloc call"
         );
     }
@@ -5391,7 +5393,7 @@ mod tests {
         let ctx = FoldingContext::new(64);
         for base in ["sym.jump_table", "obj.jump_table", "0x401000"] {
             let expr = CExpr::Subscript {
-                base: Box::new(CExpr::Var({ let CExpr::Var(id) = ctx.name_ref(&base.to_string()) else { unreachable!() }; id })),
+                base: Box::new(ctx.name_ref(&base.to_string())),
                 index: Box::new(ctx.name_ref("selector")),
             };
             assert_eq!(
@@ -5418,7 +5420,7 @@ mod tests {
 
         for base in ["table", "tmp:1000_0", "arg1"] {
             let expr = CExpr::Subscript {
-                base: Box::new(CExpr::Var({ let CExpr::Var(id) = ctx.name_ref(&base.to_string()) else { unreachable!() }; id })),
+                base: Box::new(ctx.name_ref(&base.to_string())),
                 index: Box::new(ctx.name_ref("selector")),
             };
             assert_eq!(
@@ -5500,7 +5502,7 @@ mod tests {
 
         assert_eq!(proof_selector, Some(selector));
         assert!(
-            matches!(expr, CExpr::Var(ref name) if name.eq_ignore_ascii_case("rdi") || &*ctx.spelling(*name) == "arg0"),
+            matches!(expr, CExpr::Var(ref name) if ctx.spelling(*name).eq_ignore_ascii_case("rdi") || &*ctx.spelling(*name) == "arg0"),
             "expected selector from canonical FunctionFacts control evidence, got {expr:?}"
         );
     }
@@ -6070,10 +6072,10 @@ mod tests {
                 BinaryOp::Add,
                 CExpr::Deref(Box::new(CExpr::binary(
                     BinaryOp::Add,
-                    CExpr::Var({ let CExpr::Var(id) = ctx.name_ref(&base.display_name()) else { unreachable!() }; id }),
+                    ctx.name_ref(&base.display_name()),
                     CExpr::IntLit(0x30),
                 ))),
-                CExpr::Deref(Box::new(CExpr::Var({ let CExpr::Var(id) = ctx.name_ref(&base.display_name()) else { unreachable!() }; id }))),
+                CExpr::Deref(Box::new(ctx.name_ref(&base.display_name()))),
             ),
         );
 
@@ -10399,7 +10401,7 @@ mod tests {
 
         let mut visited = HashSet::new();
         let resolved =
-            ctx.resolve_predicate_operand(&CExpr::Var({ let CExpr::Var(id) = ctx.name_ref(&loaded.display_name()) else { unreachable!() }; id }), 0, &mut visited);
+            ctx.resolve_predicate_operand(&ctx.name_ref(&loaded.display_name()), 0, &mut visited);
         assert_eq!(resolved, ctx.name_ref("arg0"));
     }
 
@@ -10943,7 +10945,7 @@ mod tests {
             let source_call = (0x1000 + idx as u64, 0);
             ctx.state.analysis_ctx.use_info.call_result_exprs.insert(
                 source_call,
-                CExpr::call(CExpr::Var({ let CExpr::Var(id) = ctx.name_ref(&callee.to_string()) else { unreachable!() }; id }), vec![]),
+                CExpr::call(ctx.name_ref(&callee.to_string()), vec![]),
             );
 
             assert_eq!(
@@ -11424,8 +11426,8 @@ mod tests {
         }
 
         let helper_call = CExpr::call(
-            CExpr::Var(symbols.borrow_mut().declare_or_reuse("sym.imp.helper")),
-            vec![CExpr::Var(symbols.borrow_mut().declare_or_reuse("arg1"))],
+            ctx.name_ref("sym.imp.helper"),
+            vec![ctx.name_ref("arg1")],
         );
 
         let mut exact_ctx = make_aarch64_ctx();
@@ -11467,11 +11469,11 @@ mod tests {
         );
 
         let unresolved_candidate = CExpr::call(
-            CExpr::deref(CExpr::Var(symbols.borrow_mut().declare_or_reuse("fp_a"))),
+            CExpr::deref(ctx.name_ref("fp_a")),
             vec![CExpr::IntLit(1)],
         );
         let unresolved_observed = CExpr::call(
-            CExpr::deref(CExpr::Var(symbols.borrow_mut().declare_or_reuse("fp_b"))),
+            CExpr::deref(ctx.name_ref("fp_b")),
             vec![CExpr::IntLit(1)],
         );
         let mut unresolved_ctx = make_aarch64_ctx();
@@ -11733,7 +11735,8 @@ mod tests {
             ret_reg_name: "rax",
             function_names: empty_u64,
             strings: empty_u64,
-            symbols: empty_u64,
+            binary_symbols: empty_u64,
+            symbols: &test_table(),
             callee_facts: crate::analysis::empty_callee_facts(),
             callee_resolution: None,
             summary_view: None,
@@ -13161,7 +13164,7 @@ mod tests {
             panic!("Expected trailing return statement");
         };
         assert!(
-            !matches!(expr, CExpr::Var(name) if name.eq_ignore_ascii_case("rax_0")),
+            !matches!(expr, CExpr::Var(name) if ctx.spelling(*name).eq_ignore_ascii_case("rax_0")),
             "Return should not keep unresolved RAX_0 artifact in non-return blocks"
         );
     }
@@ -13191,7 +13194,7 @@ mod tests {
             panic!("Expected trailing return statement");
         };
         assert!(
-            !matches!(expr, CExpr::Var(name) if name.eq_ignore_ascii_case("eax_0")),
+            !matches!(expr, CExpr::Var(name) if ctx.spelling(*name).eq_ignore_ascii_case("eax_0")),
             "Return should not keep unresolved EAX_0 artifact in non-return blocks"
         );
     }
@@ -13210,7 +13213,7 @@ mod tests {
             panic!("Expected trailing return statement");
         };
         assert!(
-            matches!(expr, CExpr::Var(name) if name.eq_ignore_ascii_case("rax_0") || name.eq_ignore_ascii_case("rax")),
+            matches!(expr, CExpr::Var(name) if ctx.spelling(*name).eq_ignore_ascii_case("rax_0") || name.eq_ignore_ascii_case("rax")),
             "Return register should remain unresolved when no better return value can be derived"
         );
     }
@@ -13669,8 +13672,8 @@ mod tests {
             ret.display_name(),
             CExpr::binary(
                 BinaryOp::Add,
-                CExpr::Var({ let CExpr::Var(id) = ctx.name_ref(&load_first.display_name()) else { unreachable!() }; id }),
-                CExpr::Var({ let CExpr::Var(id) = ctx.name_ref(&load_second.display_name()) else { unreachable!() }; id }),
+                ctx.name_ref(&load_first.display_name()),
+                ctx.name_ref(&load_second.display_name()),
             ),
         );
 
@@ -16166,7 +16169,7 @@ mod tests {
                     op: BinaryOp::Assign,
                     left,
                     right,
-                }) if matches!(left.as_ref(), CExpr::Var(name) if name.eq_ignore_ascii_case("x0_2"))
+                }) if matches!(left.as_ref(), CExpr::Var(name) if ctx.spelling(*name).eq_ignore_ascii_case("x0_2"))
                     && matches!(right.as_ref(), CExpr::Call { .. })
             )),
             "unused helper result must not materialize a transient assignment, got {stmts:?}"
@@ -18401,7 +18404,7 @@ mod tests {
         );
         assert_eq!(
             rendered_args,
-            vec![FoldingContext::unresolved_call_arg_expr(&symbols)],
+            vec![ctx.unresolved_call_arg_expr()],
             "unknown semantic args must stay visibly unresolved before certification"
         );
 

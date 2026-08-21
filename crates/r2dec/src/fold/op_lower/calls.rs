@@ -1253,7 +1253,7 @@ impl<'a> FoldingContext<'a> {
                 if let analysis::BaseRef::StackSlot(offset) = addr.base
                     && let Some(name) = self.resolve_stack_var(offset)
                 {
-                    let expr = CExpr::Var(&self.symbols.borrow_mut().declare_or_reuse(&name));
+                    let expr = self.name_ref(&name);
                     return self.is_preserved_imported_input_expr(&expr)
                         && !self.is_direct_constish_visible_expr(&expr, 0);
                 }
@@ -1284,7 +1284,7 @@ impl<'a> FoldingContext<'a> {
         preserve_pointer_identity: bool,
     ) -> Option<CExpr> {
         if let Some(alias) = self.entry_arg_alias_for_pointer_identity_value(value) {
-            return Some(CExpr::Var(&self.symbols.borrow_mut().declare_or_reuse(&alias)));
+            return Some(self.name_ref(&alias));
         }
 
         if let analysis::SemanticValue::Load { addr, .. } = value
