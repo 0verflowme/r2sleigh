@@ -3100,7 +3100,7 @@ impl Decompiler {
             #[cfg(test)]
             strings: &self.context.strings,
             #[cfg(test)]
-            symbols: &self.context.symbols,
+            binary_symbols: &self.context.symbols,
             function_facts: &self.context.function_facts,
             #[cfg(test)]
             certified_rendering_required: false,
@@ -5204,7 +5204,9 @@ fn infer_local_struct_field_accesses(
         }
     }
 
-    let fixture_symbols = test_table();
+    let fixture_symbols = std::cell::RefCell::new(crate::symbol::SymbolTable::new());
+
+    let binary_symbols: std::collections::HashMap<u64, String> = HashMap::new();
 
     let env = analysis::PassEnv {
         carrier_aliases: crate::analysis::no_carrier_aliases(),
@@ -5424,7 +5426,7 @@ mod tests {
             arch,
             function_names: Box::leak(Box::new(HashMap::new())),
             strings: Box::leak(Box::new(HashMap::new())),
-            symbols: Box::leak(Box::new(HashMap::new())),
+            binary_symbols: Box::leak(Box::new(HashMap::new())),
             function_facts: crate::fold::context::empty_function_facts(),
             #[cfg(test)]
             certified_rendering_required: false,
@@ -6939,7 +6941,8 @@ mod tests {
                 arg_slot_map.insert(lower, idx);
             }
         }
-        let fixture_symbols = test_table();
+        let fixture_symbols = std::cell::RefCell::new(crate::symbol::SymbolTable::new());
+        let binary_symbols: std::collections::HashMap<u64, String> = HashMap::new();
         let env = analysis::PassEnv {
             carrier_aliases: crate::analysis::no_carrier_aliases(),
             string_literals: crate::analysis::lower::no_string_literals(),
@@ -7109,7 +7112,8 @@ mod tests {
                 arg_slot_map.insert(lower, idx);
             }
         }
-        let fixture_symbols = test_table();
+        let fixture_symbols = std::cell::RefCell::new(crate::symbol::SymbolTable::new());
+        let binary_symbols: std::collections::HashMap<u64, String> = HashMap::new();
         let env = analysis::PassEnv {
             carrier_aliases: crate::analysis::no_carrier_aliases(),
             string_literals: crate::analysis::lower::no_string_literals(),
@@ -7334,7 +7338,8 @@ mod tests {
                 arg_slot_map.insert(lower, idx);
             }
         }
-        let fixture_symbols = test_table();
+        let fixture_symbols = std::cell::RefCell::new(crate::symbol::SymbolTable::new());
+        let binary_symbols: std::collections::HashMap<u64, String> = HashMap::new();
         let env = analysis::PassEnv {
             carrier_aliases: crate::analysis::no_carrier_aliases(),
             string_literals: crate::analysis::lower::no_string_literals(),
