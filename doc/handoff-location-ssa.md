@@ -873,3 +873,67 @@ reading a fourth. One table, shared by `Rc`, fixed that. `UseInfo` still has the
 older shape, and **it should be the same fix**: one instance per rendered
 function, shared, rather than several merged by hand. Until then, adding a fact
 to `UseInfo` and reading it in the fold does not work, and fails quietly.
+
+## There are two UseInfo builders, and production reads the smaller one
+
+Chasing why a fact added to `UseInfo` never reached the fold found the reason,
+and it is bigger than the fact.
+
+`FoldingContext::analyze_blocks_with_control` contains two complete analyses
+separated by an early return:
+
+    if let Some(prepared) = self.inputs.prepared_ssa {
+        ...
+        self.state.analysis_ctx = analysis::build_prepared_runtime_facts_with_control(...)?;
+        return Ok(());
+    }
+
+    // Explicit pass order:
+    // 1) UseInfo
+    // 2) FlagInfo + StackInfo
+    let mut use_info = analysis::UseInfo::analyze_with_control(...)?;
+
+Both branches produce a `DecompilerFacts`. They share no code. `prepared_semantic.rs`
+builds one with `seed_prepared_*`, `collect_prepared_runtime_facts`,
+`populate_prepared_*` and `populate_prepared_render_definitions`; `use_info.rs`
+builds the other with `count_uses_and_conditions`, `collect_definitions`,
+`refresh_semantic_values`, `rebuild_definitions`, `coalesce_variables` and
+`build_formatted_defs`.
+
+**Production always takes the first branch.** Every `prepared_ssa: None` in the
+tree is inside `#[cfg(test)]`, so the second pass order runs only under test.
+
+    prepared_semantic.rs   5329 lines   what production reads
+    use_info.rs           13089 lines   what the tests read
+
+`use_info.rs` is not dead: `overlay_local_struct_semantics` calls it from inside
+the prepared path, so in production the whole thirteen-thousand-line analysis
+runs and then two of its fields, `semantic_values` and `ptr_members`, are copied
+out and the rest is dropped. That is why adding `multiply_assigned` to
+`rebuild_definitions` computed the right answer -- `multiprobe ["X0_3", "X1_1",
+"X8_2"]` -- and the fold still read an empty set.
+
+### Why this matters more than the defects above it
+
+This is the parallel pipeline the working agreement forbids, at the largest
+scale in the codebase, and it has three consequences that explain much of this
+branch:
+
+  * A change to `use_info.rs` can be correct, tested, and invisible in `pdd`.
+    Several measurements in this document read as "inert" and may instead have
+    been landing in the branch production does not read.
+  * The test suite exercises a pass order that does not ship. Step 7 named this
+    at the `UseInfoAnalysisMode` seam and fixed it there; the same defect exists
+    one level up and is much larger.
+  * Any fact the renderer needs must be added twice, and nothing checks that it
+    was.
+
+**The fix is the one this branch already proved.** The symbol table had the same
+shape -- passes each holding their own copy, the fold reading one nothing had
+written -- and one shared table fixed it. `UseInfo` needs one builder, not two,
+and the prepared path is the one to keep because it is the one that ships. That
+makes the work: move whatever `use_info.rs` computes that production needs into
+the prepared builder, repoint the tests, and delete the rest.
+
+That is a large deletion rather than a large addition, which is the right shape,
+but it is not a change to start without agreeing the direction first.
