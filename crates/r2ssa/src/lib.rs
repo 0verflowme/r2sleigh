@@ -34,6 +34,7 @@ pub mod indirect;
 pub mod proven;
 pub mod interproc;
 pub mod ledger;
+pub mod liveout;
 pub mod machine;
 pub mod machine_context;
 mod naming;
