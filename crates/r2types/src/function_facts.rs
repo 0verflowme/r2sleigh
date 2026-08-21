@@ -4187,17 +4187,24 @@ fn prepared_render_facts(prepared: &r2ssa::SsaArtifact) -> FunctionRenderFacts {
         if certificates.stack_slots.contains_key(&fact.object) {
             continue;
         }
+        // One settled table per value asked about: what a root sees below it is
+        // the same answer whichever root reached it.
+        let mut settled = BTreeMap::new();
         let dependency_occurrences = consumer_roots.iter().copied().fold(0_u8, |count, root| {
             if count > 1 {
                 return count;
             }
-            count.saturating_add(expression_dependency_path_count(
-                prepared.graph(),
-                root,
-                value,
-                &carrier_identity_values,
-                &mut BTreeSet::new(),
-            ))
+            count.saturating_add(
+                expression_dependency_occurrences(
+                    prepared.graph(),
+                    root,
+                    value,
+                    &carrier_identity_values,
+                    &mut BTreeSet::new(),
+                    &mut settled,
+                )
+                .0,
+            )
         });
         fact.materialize_result = dependency_occurrences > 1;
     }
@@ -4253,40 +4260,64 @@ fn prepared_render_consumer_occurrences(
     roots
 }
 
-fn expression_dependency_path_count(
+/// How often `target` occurs in the expression rooted at `current`, saturated at two.
+///
+/// Rendering inlines an expression, so a value reachable by two distinct
+/// dependency paths is printed twice, and the caller only needs to know whether
+/// that happens at all.
+///
+/// Enumerating the paths costs one visit per path, which is exponential wherever
+/// a subexpression is shared. The same recurrence evaluated once per value is
+/// linear in the edges, because how many times `target` occurs below a value
+/// does not depend on how the walk arrived at that value. A value is settled
+/// only when nothing below it read a value still being computed, since that
+/// answer assumed the unfinished value contributes nothing and is true only on
+/// the path that made the assumption.
+fn expression_dependency_occurrences(
     graph: &r2ssa::SsaGraph,
     current: r2ssa::ValueId,
     target: r2ssa::ValueId,
     carrier_identities: &BTreeSet<r2ssa::ValueId>,
     visiting: &mut BTreeSet<r2ssa::ValueId>,
-) -> u8 {
+    settled: &mut BTreeMap<r2ssa::ValueId, u8>,
+) -> (u8, bool) {
     if current == target {
-        return 1;
+        return (1, false);
     }
-    if carrier_identities.contains(&current) || !visiting.insert(current) {
-        return 0;
+    if carrier_identities.contains(&current) {
+        return (0, false);
     }
-    let count = graph
-        .def_inst(current)
-        .and_then(|inst| graph.inst(inst))
-        .map(|inst| {
-            inst.inputs.iter().fold(0_u8, |count, input| {
-                if count > 1 {
-                    count
-                } else {
-                    count.saturating_add(expression_dependency_path_count(
-                        graph,
-                        *input,
-                        target,
-                        carrier_identities,
-                        visiting,
-                    ))
-                }
-            })
-        })
-        .unwrap_or_default();
+    if let Some(known) = settled.get(&current) {
+        return (*known, false);
+    }
+    if !visiting.insert(current) {
+        return (0, true);
+    }
+    let mut count = 0_u8;
+    let mut saw_unfinished = false;
+    if let Some(inst) = graph.def_inst(current).and_then(|inst| graph.inst(inst)) {
+        for input in &inst.inputs {
+            if count > 1 {
+                break;
+            }
+            let (below, unfinished) = expression_dependency_occurrences(
+                graph,
+                *input,
+                target,
+                carrier_identities,
+                visiting,
+                settled,
+            );
+            count = count.saturating_add(below);
+            saw_unfinished |= unfinished;
+        }
+    }
     visiting.remove(&current);
-    count.min(2)
+    let count = count.min(2);
+    if !saw_unfinished {
+        settled.insert(current, count);
+    }
+    (count, saw_unfinished)
 }
 
 fn prepared_control_facts(prepared: &r2ssa::SsaArtifact) -> FunctionControlFacts {

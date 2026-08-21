@@ -55,7 +55,7 @@ pub const TAINT_GLOBAL_MAX_FUNCTIONS: usize = 128;
 pub const SIGNATURE_WRITEBACK_GLOBAL_MAX_FUNCTIONS: usize = 128;
 pub const TYPE_WRITEBACK_GLOBAL_MAX_FUNCTIONS: usize = 128;
 pub const ENGINE_DECOMPILE_MAX_BLOCKS: usize = 200;
-pub const ENGINE_DECOMPILE_MAX_OPS: usize = 512;
+pub const ENGINE_DECOMPILE_MAX_OPS: usize = 4096;
 pub const AUTO_CALLBACK_MAX_BLOCKS: u32 = 96;
 pub const AUTO_CALLBACK_MAX_COST: u32 = 512;
 pub const AUTO_CALLBACK_MAX_LINEAR_SIZE: u64 = 256 * 1024;
@@ -8638,7 +8638,7 @@ mod tests {
     #[test]
     fn decompile_probe_decision_does_not_prefer_full_diagnostic_name_without_evidence() {
         let mut blocks = const_return_blocks(0x4bc0, 0);
-        for idx in 0..600 {
+        for idx in 0..ENGINE_DECOMPILE_MAX_OPS as u64 + 1 {
             blocks[0].push(r2il::R2ILOp::Copy {
                 dst: r2il::Varnode::unique(0x200 + idx, 8),
                 src: r2il::Varnode::constant(idx, 8),
@@ -8675,13 +8675,13 @@ mod tests {
     fn decompile_probe_decision_uses_strict_op_count_guard_boundary() {
         let mut exactly_limit = R2ILBlock::new(0x9000, 1);
         let mut over_limit = R2ILBlock::new(0xa000, 1);
-        for idx in 0..512 {
+        for idx in 0..ENGINE_DECOMPILE_MAX_OPS as u64 {
             exactly_limit.push(r2il::R2ILOp::Copy {
-                dst: r2il::Varnode::unique(0x300 + idx, 8),
+                dst: r2il::Varnode::unique(0x10000 + idx, 8),
                 src: r2il::Varnode::constant(idx, 8),
             });
             over_limit.push(r2il::R2ILOp::Copy {
-                dst: r2il::Varnode::unique(0x600 + idx, 8),
+                dst: r2il::Varnode::unique(0x30000 + idx, 8),
                 src: r2il::Varnode::constant(idx, 8),
             });
         }
