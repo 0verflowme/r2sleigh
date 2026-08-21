@@ -1168,7 +1168,6 @@ mod tests {
     fn test_generate_simple_function() {
         let symbols = test_table();
         let func = CFunction {
-            symbols: std::cell::RefCell::new(crate::symbol::SymbolTable::new()),
             name: "add".to_string(),
             ret_type: CType::i32(),
             params: vec![
@@ -1188,6 +1187,7 @@ mod tests {
                 CExpr::var(crate::symbol::declare(&symbols, "b")),
             )))],
             params_known: true,
+            symbols,
         };
 
         let code = generate(&func);
@@ -1354,7 +1354,6 @@ mod tests {
     fn test_function_with_locals() {
         let symbols = test_table();
         let func = CFunction {
-            symbols: std::cell::RefCell::new(crate::symbol::SymbolTable::new()),
             name: "test".to_string(),
             ret_type: CType::Void,
             params: vec![],
@@ -1372,6 +1371,7 @@ mod tests {
             ],
             body: vec![CStmt::Return(None)],
             params_known: true,
+            symbols,
         };
 
         let code = generate(&func);

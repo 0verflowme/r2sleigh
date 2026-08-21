@@ -530,14 +530,15 @@ mod tests {
     }
 
     fn function(body: Vec<CStmt>) -> CFunction {
+        let symbols = test_table();
         CFunction {
-            symbols: std::cell::RefCell::new(crate::symbol::SymbolTable::new()),
             name: "f".to_string(),
             ret_type: CType::Int(32),
             params: Vec::<CParam>::new(),
             locals: Vec::<CLocal>::new(),
             body,
             params_known: true,
+            symbols,
         }
     }
 

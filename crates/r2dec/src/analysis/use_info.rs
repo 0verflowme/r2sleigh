@@ -8848,11 +8848,12 @@ mod tests {
 
     impl Default for TestEnvFixture {
         fn default() -> Self {
+            let symbols = test_table();
             Self {
                 function_names: HashMap::new(),
                 strings: HashMap::new(),
                 binary_symbols: HashMap::new(),
-                symbols: std::cell::RefCell::new(crate::symbol::SymbolTable::new()),
+                symbols,
                 callee_facts: BTreeMap::new(),
                 summary_view: None,
                 arg_regs: Vec::new(),

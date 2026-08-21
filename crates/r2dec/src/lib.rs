@@ -5781,7 +5781,6 @@ mod tests {
     fn test_final_function_body_prune_removes_late_dead_sleigh_temps() {
         let symbols = test_table();
         let mut func = CFunction {
-            symbols: std::cell::RefCell::new(crate::symbol::SymbolTable::new()),
             name: "late_prune".to_string(),
             ret_type: CType::i64(),
             params: Vec::new(),
@@ -5826,6 +5825,7 @@ mod tests {
                 )),
                 CStmt::Return(Some(crate::symbol::var_ref(&symbols, "x0_5"))),
             ],
+            symbols,
         };
         let ctx = FoldingContext::new(64);
 
@@ -5846,7 +5846,7 @@ mod tests {
         ));
         assert_eq!(
             func.body[1],
-            CStmt::Return(Some(crate::symbol::var_ref(&symbols, "x0_5")))
+            CStmt::Return(Some(crate::symbol::var_ref(&func.symbols, "x0_5")))
         );
     }
 
@@ -9991,7 +9991,6 @@ mod tests {
             None,
         );
         let mut func = CFunction {
-            symbols: std::cell::RefCell::new(crate::symbol::SymbolTable::new()),
             name: "dbg.gettext_quote".to_string(),
             ret_type: CType::ptr(CType::Int(8)),
             params: Vec::new(),
@@ -10001,6 +10000,7 @@ mod tests {
                 CExpr::var(crate::symbol::declare(&symbols, "sym.rpl_mbrtoc32")),
                 Vec::new(),
             ))],
+            symbols,
         };
 
         append_semantic_summary_return_to_function_if_needed(
@@ -10043,7 +10043,6 @@ mod tests {
             None,
         );
         let mut func = CFunction {
-            symbols: std::cell::RefCell::new(crate::symbol::SymbolTable::new()),
             name: "dbg.return_arg_summary".to_string(),
             ret_type: CType::ptr(CType::Int(8)),
             params: Vec::new(),
@@ -10053,6 +10052,7 @@ mod tests {
                 CExpr::var(crate::symbol::declare(&symbols, "summary_worker")),
                 Vec::new(),
             ))],
+            symbols,
         };
 
         append_semantic_summary_return_to_function_if_needed(
@@ -10099,13 +10099,13 @@ mod tests {
             vec![crate::symbol::var_ref(&symbols, "n")],
         ))];
         let mut func = CFunction {
-            symbols,
             name: "dbg.alloc_wrapper2".to_string(),
             ret_type: CType::ptr(CType::Int(8)),
             params: Vec::new(),
             params_known: true,
             locals: Vec::new(),
             body,
+            symbols,
         };
 
         append_semantic_summary_return_comment_to_function_if_needed(
