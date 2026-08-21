@@ -785,6 +785,11 @@ impl CFunction {
 mod tests {
     use super::*;
 
+    /// The names a fixture in this module declares.
+    fn test_table() -> std::cell::RefCell<crate::symbol::SymbolTable> {
+        std::cell::RefCell::new(crate::symbol::SymbolTable::new())
+    }
+
     #[test]
     fn test_type_display() {
         assert_eq!(CType::Void.to_string(), "void");
@@ -795,14 +800,15 @@ mod tests {
 
     #[test]
     fn test_expr_creation() {
-        let a = CExpr::var("a");
-        let b = CExpr::var("b");
+        let symbols = test_table();
+        let a = CExpr::var(symbols.borrow_mut().declare_or_reuse("a"));
+        let b = CExpr::var(symbols.borrow_mut().declare_or_reuse("b"));
         let sum = CExpr::binary(BinaryOp::Add, a, b);
 
         if let CExpr::Binary { op, left, right } = sum {
             assert_eq!(op, BinaryOp::Add);
-            assert_eq!(*left, CExpr::var("a"));
-            assert_eq!(*right, CExpr::var("b"));
+            assert_eq!(*left, CExpr::var(symbols.borrow_mut().declare_or_reuse("a")));
+            assert_eq!(*right, CExpr::var(symbols.borrow_mut().declare_or_reuse("b")));
         } else {
             panic!("Expected Binary expression");
         }
@@ -810,8 +816,9 @@ mod tests {
 
     #[test]
     fn test_stmt_creation() {
+        let symbols = test_table();
         let stmt = CStmt::if_stmt(
-            CExpr::var("x"),
+            CExpr::var(symbols.borrow_mut().declare_or_reuse("x")),
             CStmt::ret(Some(CExpr::int(1))),
             Some(CStmt::ret(Some(CExpr::int(0)))),
         );
@@ -822,7 +829,7 @@ mod tests {
             else_body,
         } = stmt
         {
-            assert_eq!(cond, CExpr::var("x"));
+            assert_eq!(cond, CExpr::var(symbols.borrow_mut().declare_or_reuse("x")));
             assert!(else_body.is_some());
         } else {
             panic!("Expected If statement");
@@ -831,10 +838,11 @@ mod tests {
 
     #[test]
     fn test_expr_visit_traverses_all_nodes() {
+        let symbols = test_table();
         let expr = CExpr::binary(
             BinaryOp::Add,
-            CExpr::var("a"),
-            CExpr::call(CExpr::var("f"), vec![CExpr::int(1), CExpr::var("b")]),
+            CExpr::var(symbols.borrow_mut().declare_or_reuse("a")),
+            CExpr::call(CExpr::var(symbols.borrow_mut().declare_or_reuse("f")), vec![CExpr::int(1), CExpr::var(symbols.borrow_mut().declare_or_reuse("b"))]),
         );
         let mut vars = Vec::new();
         expr.visit(&mut |node| {
@@ -849,15 +857,16 @@ mod tests {
 
     #[test]
     fn test_expr_map_children_updates_direct_children() {
-        let expr = CExpr::binary(BinaryOp::Add, CExpr::var("a"), CExpr::int(1));
+        let symbols = test_table();
+        let expr = CExpr::binary(BinaryOp::Add, CExpr::var(symbols.borrow_mut().declare_or_reuse("a")), CExpr::int(1));
         let mut mapper = |child: CExpr| match child {
-            CExpr::Var(name) if name == "a" => CExpr::var("x"),
+            CExpr::Var(name) if name == symbols.borrow_mut().declare_or_reuse("a") => CExpr::var(symbols.borrow_mut().declare_or_reuse("x")),
             other => other,
         };
         let rewritten = expr.map_children(&mut mapper);
         let CExpr::Binary { left, .. } = rewritten else {
             panic!("expected binary expression");
         };
-        assert_eq!(*left, CExpr::var("x"));
+        assert_eq!(*left, CExpr::var(symbols.borrow_mut().declare_or_reuse("x")));
     }
 }

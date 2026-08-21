@@ -6,14 +6,14 @@ fn collect_expr_reads_visits_nested_children() {
     let ctx = FoldingContext::new(64);
     let expr = CExpr::binary(
         BinaryOp::Add,
-        CExpr::Var("a_1".to_string()),
+        ctx.name_ref("a_1"),
         CExpr::call(
-            CExpr::Var("callee_0".to_string()),
+            ctx.name_ref("callee_0"),
             vec![
-                CExpr::Deref(Box::new(CExpr::Var("b_2".to_string()))),
+                CExpr::Deref(Box::new(ctx.name_ref("b_2"))),
                 CExpr::Paren(Box::new(CExpr::cast(
                     CType::Int(32),
-                    CExpr::Var("c_3".to_string()),
+                    ctx.name_ref("c_3"),
                 ))),
             ],
         ),
@@ -33,17 +33,17 @@ fn expr_is_pure_detects_side_effect_nodes() {
     let ctx = FoldingContext::new(64);
     let pure_expr = CExpr::binary(
         BinaryOp::Mul,
-        CExpr::Var("x_1".to_string()),
+        ctx.name_ref("x_1"),
         CExpr::IntLit(4),
     );
     assert!(ctx.expr_is_pure(&pure_expr));
 
     let call_expr = CExpr::call(
-        CExpr::Var("foo".to_string()),
-        vec![CExpr::Var("x_1".to_string())],
+        ctx.name_ref("foo"),
+        vec![ctx.name_ref("x_1")],
     );
     assert!(!ctx.expr_is_pure(&call_expr));
 
-    let assign_expr = CExpr::assign(CExpr::Var("x_1".to_string()), CExpr::IntLit(7));
+    let assign_expr = CExpr::assign(ctx.name_ref("x_1"), CExpr::IntLit(7));
     assert!(!ctx.expr_is_pure(&assign_expr));
 }

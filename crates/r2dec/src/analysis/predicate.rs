@@ -64,6 +64,11 @@ mod tests {
     use crate::fold::FoldingContext;
     use std::collections::HashSet;
 
+    /// The names a fixture in this module declares.
+    fn test_table() -> std::cell::RefCell<crate::symbol::SymbolTable> {
+        std::cell::RefCell::new(crate::symbol::SymbolTable::new())
+    }
+
     struct ChainedPredicateView;
 
     impl PredicateAnalysisView for ChainedPredicateView {
@@ -74,8 +79,8 @@ mod tests {
             _visited: &mut HashSet<String>,
         ) -> CExpr {
             match expr {
-                CExpr::Var(name) if name == "stage0" => CExpr::Var("stage1".to_string()),
-                CExpr::Var(name) if name == "stage1" => CExpr::Var("done".to_string()),
+                CExpr::Var(name) if name == "stage0" => crate::symbol::var_ref(&&self.symbols, "stage1"),
+                CExpr::Var(name) if name == "stage1" => crate::symbol::var_ref(&&self.symbols, "done"),
                 other => other.clone(),
             }
         }
@@ -96,25 +101,26 @@ mod tests {
 
         let expr = CExpr::unary(
             UnaryOp::Not,
-            CExpr::binary(BinaryOp::Eq, CExpr::Var("x".to_string()), CExpr::IntLit(0)),
+            CExpr::binary(BinaryOp::Eq, ctx.name_ref("x"), CExpr::IntLit(0)),
         );
 
         let once = simplifier.simplify_condition_expr(expr);
         let twice = simplifier.simplify_condition_expr(once.clone());
         assert_eq!(
             once,
-            CExpr::binary(BinaryOp::Ne, CExpr::Var("x".to_string()), CExpr::IntLit(0))
+            CExpr::binary(BinaryOp::Ne, ctx.name_ref("x"), CExpr::IntLit(0))
         );
         assert_eq!(once, twice);
     }
 
     #[test]
     fn simplify_condition_expr_requires_multiple_passes_to_fixed_point() {
+        let symbols = test_table();
         let view = ChainedPredicateView;
         let simplifier = PredicateSimplifier::new(&view);
 
-        let simplified = simplifier.simplify_condition_expr(CExpr::Var("stage0".to_string()));
-        assert_eq!(simplified, CExpr::Var("done".to_string()));
+        let simplified = simplifier.simplify_condition_expr(crate::symbol::var_ref(&symbols, "stage0"));
+        assert_eq!(simplified, crate::symbol::var_ref(&symbols, "done"));
     }
 
     #[test]
@@ -124,14 +130,14 @@ mod tests {
 
         let expr = CExpr::binary(
             BinaryOp::BitXor,
-            CExpr::binary(BinaryOp::Ne, CExpr::Var("x".to_string()), CExpr::IntLit(0)),
+            CExpr::binary(BinaryOp::Ne, ctx.name_ref("x"), CExpr::IntLit(0)),
             CExpr::binary(
                 BinaryOp::And,
-                CExpr::binary(BinaryOp::Ne, CExpr::Var("a".to_string()), CExpr::IntLit(0)),
+                CExpr::binary(BinaryOp::Ne, ctx.name_ref("a"), CExpr::IntLit(0)),
                 CExpr::binary(
                     BinaryOp::Eq,
-                    CExpr::Var("of_1".to_string()),
-                    CExpr::binary(BinaryOp::Lt, CExpr::Var("a".to_string()), CExpr::IntLit(0)),
+                    ctx.name_ref("of_1"),
+                    CExpr::binary(BinaryOp::Lt, ctx.name_ref("a"), CExpr::IntLit(0)),
                 ),
             ),
         );
@@ -139,8 +145,8 @@ mod tests {
         let simplified = simplifier.simplify_condition_expr(expr);
         let expected = CExpr::binary(
             BinaryOp::BitXor,
-            CExpr::binary(BinaryOp::Ne, CExpr::Var("x".to_string()), CExpr::IntLit(0)),
-            CExpr::binary(BinaryOp::Gt, CExpr::Var("a".to_string()), CExpr::IntLit(0)),
+            CExpr::binary(BinaryOp::Ne, ctx.name_ref("x"), CExpr::IntLit(0)),
+            CExpr::binary(BinaryOp::Gt, ctx.name_ref("a"), CExpr::IntLit(0)),
         );
         assert_eq!(simplified, expected);
     }
@@ -152,16 +158,16 @@ mod tests {
 
         let expr = CExpr::binary(
             BinaryOp::BitXor,
-            CExpr::binary(BinaryOp::Ne, CExpr::Var("x".to_string()), CExpr::IntLit(0)),
+            CExpr::binary(BinaryOp::Ne, ctx.name_ref("x"), CExpr::IntLit(0)),
             CExpr::Paren(Box::new(CExpr::binary(
                 BinaryOp::And,
-                CExpr::binary(BinaryOp::Ne, CExpr::Var("a".to_string()), CExpr::IntLit(0)),
+                CExpr::binary(BinaryOp::Ne, ctx.name_ref("a"), CExpr::IntLit(0)),
                 CExpr::binary(
                     BinaryOp::Eq,
-                    CExpr::Var("of_1".to_string()),
+                    ctx.name_ref("of_1"),
                     CExpr::Paren(Box::new(CExpr::binary(
                         BinaryOp::Lt,
-                        CExpr::cast(CType::Int(32), CExpr::Var("a".to_string())),
+                        CExpr::cast(CType::Int(32), ctx.name_ref("a")),
                         CExpr::cast(CType::Int(32), CExpr::IntLit(0)),
                     ))),
                 ),
@@ -171,10 +177,10 @@ mod tests {
         let simplified = simplifier.simplify_condition_expr(expr);
         let expected = CExpr::binary(
             BinaryOp::BitXor,
-            CExpr::binary(BinaryOp::Ne, CExpr::Var("x".to_string()), CExpr::IntLit(0)),
+            CExpr::binary(BinaryOp::Ne, ctx.name_ref("x"), CExpr::IntLit(0)),
             CExpr::Paren(Box::new(CExpr::binary(
                 BinaryOp::Gt,
-                CExpr::Var("a".to_string()),
+                ctx.name_ref("a"),
                 CExpr::IntLit(0),
             ))),
         );
@@ -198,7 +204,7 @@ mod tests {
                         CExpr::binary(
                             BinaryOp::Le,
                             CExpr::cast(CType::u64(), CExpr::IntLit(1)),
-                            CExpr::cast(CType::u64(), CExpr::Var("t1".to_string())),
+                            CExpr::cast(CType::u64(), ctx.name_ref("t1")),
                         ),
                     ),
                 ),
@@ -208,7 +214,7 @@ mod tests {
         let simplified = simplifier.simplify_condition_expr(expr);
         assert_eq!(
             simplified,
-            CExpr::binary(BinaryOp::Ne, CExpr::Var("t1".to_string()), CExpr::IntLit(0))
+            CExpr::binary(BinaryOp::Ne, ctx.name_ref("t1"), CExpr::IntLit(0))
         );
     }
 
@@ -219,14 +225,14 @@ mod tests {
 
         let expr = CExpr::binary(
             BinaryOp::Eq,
-            CExpr::binary(BinaryOp::Ne, CExpr::Var("t1".to_string()), CExpr::IntLit(0)),
+            CExpr::binary(BinaryOp::Ne, ctx.name_ref("t1"), CExpr::IntLit(0)),
             CExpr::IntLit(0),
         );
 
         let simplified = simplifier.simplify_condition_expr(expr);
         assert_eq!(
             simplified,
-            CExpr::binary(BinaryOp::Eq, CExpr::Var("t1".to_string()), CExpr::IntLit(0))
+            CExpr::binary(BinaryOp::Eq, ctx.name_ref("t1"), CExpr::IntLit(0))
         );
     }
 
@@ -243,7 +249,7 @@ mod tests {
                     BinaryOp::BitAnd,
                     CExpr::binary(
                         BinaryOp::Shr,
-                        CExpr::Var("x0_3".to_string()),
+                        ctx.name_ref("x0_3"),
                         CExpr::IntLit(0),
                     ),
                     CExpr::IntLit(1),
@@ -260,7 +266,7 @@ mod tests {
                 BinaryOp::Eq,
                 CExpr::binary(
                     BinaryOp::BitAnd,
-                    CExpr::Var("x0_3".to_string()),
+                    ctx.name_ref("x0_3"),
                     CExpr::IntLit(1),
                 ),
                 CExpr::IntLit(0),

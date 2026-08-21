@@ -171,7 +171,13 @@ mod tests {
     use super::*;
     use crate::ast::{BinaryOp, CLocal, CParam, CType};
 
+    /// The names a fixture in this module declares.
+    fn test_table() -> std::cell::RefCell<crate::symbol::SymbolTable> {
+        std::cell::RefCell::new(crate::symbol::SymbolTable::new())
+    }
+
     fn function(params: Vec<&str>, locals: Vec<&str>, body: Vec<CStmt>) -> CFunction {
+        let symbols = test_table();
         CFunction {
             symbols: crate::symbol::SymbolTable::new(),
             name: "f".to_string(),
@@ -180,14 +186,14 @@ mod tests {
                 .into_iter()
                 .map(|name| CParam {
                     ty: CType::Int(32),
-                    name: name.to_string(),
+                    name: symbols.borrow_mut().declare_or_reuse(&name.to_string()),
                 })
                 .collect(),
             locals: locals
                 .into_iter()
                 .map(|name| CLocal {
                     ty: CType::Int(32),
-                    name: name.to_string(),
+                    name: symbols.borrow_mut().declare_or_reuse(&name.to_string()),
                     stack_offset: None,
                 })
                 .collect(),
@@ -223,6 +229,7 @@ mod tests {
 
     #[test]
     fn a_name_a_statement_declares_for_itself_is_still_spelled_as_c() {
+        let symbols = test_table();
         // A lane projection declares itself in the body, so nothing else had
         // reason to ask whether C could read the name it chose.
         let mut func = function(
@@ -231,10 +238,10 @@ mod tests {
             vec![
                 CStmt::Decl {
                     ty: CType::UInt(32),
-                    name: "tmp:regalias:7c0:2d:0".to_string(),
+                    name: symbols.borrow_mut().declare_or_reuse("tmp:regalias:7c0:2d:0"),
                     init: Some(CExpr::IntLit(0)),
                 },
-                CStmt::Return(Some(CExpr::Var("tmp:regalias:7c0:2d:0".to_string()))),
+                CStmt::Return(Some(crate::symbol::var_ref(&symbols, "tmp:regalias:7c0:2d:0"))),
             ],
         );
 
@@ -254,22 +261,23 @@ mod tests {
 
     #[test]
     fn a_readable_name_keeps_its_spelling_and_its_claim_on_it() {
+        let symbols = test_table();
         let mut func = function(
             vec!["total"],
             Vec::new(),
             vec![
                 CStmt::Decl {
                     ty: CType::UInt(32),
-                    name: "tmp:total".to_string(),
+                    name: symbols.borrow_mut().declare_or_reuse("tmp:total"),
                     init: Some(CExpr::IntLit(0)),
                 },
-                CStmt::Return(Some(CExpr::Var("total".to_string()))),
+                CStmt::Return(Some(crate::symbol::var_ref(&symbols, "total"))),
             ],
         );
 
         spell_every_name_as_c(&mut func);
 
-        assert_eq!(func.params[0].name, "total", "a readable name is untouched");
+        assert_eq!(func.params[0].name, symbols.borrow_mut().declare_or_reuse("total"), "a readable name is untouched");
         let mut declared = BTreeSet::new();
         collect_block_declared(&func.body, &mut declared);
         assert!(
@@ -280,13 +288,14 @@ mod tests {
 
     #[test]
     fn a_name_the_function_declares_is_left_alone() {
+        let symbols = test_table();
         let mut func = function(
             vec!["x"],
             vec!["total"],
             vec![CStmt::Return(Some(CExpr::binary(
                 BinaryOp::Add,
-                CExpr::Var("x".to_string()),
-                CExpr::Var("total".to_string()),
+                crate::symbol::var_ref(&symbols, "x"),
+                crate::symbol::var_ref(&symbols, "total"),
             )))],
         );
 
@@ -297,13 +306,14 @@ mod tests {
 
     #[test]
     fn a_leaked_machine_name_is_marked_where_it_appears() {
+        let symbols = test_table();
         let mut func = function(
             vec!["a"],
             Vec::new(),
             vec![CStmt::Return(Some(CExpr::binary(
                 BinaryOp::BitXor,
-                CExpr::Var("a".to_string()),
-                CExpr::Var("tmpOV".to_string()),
+                crate::symbol::var_ref(&symbols, "a"),
+                crate::symbol::var_ref(&symbols, "tmpOV"),
             )))],
         );
 
@@ -316,11 +326,12 @@ mod tests {
 
     #[test]
     fn a_namespaced_reference_is_not_an_undeclared_variable() {
+        let symbols = test_table();
         let mut func = function(
             Vec::new(),
             Vec::new(),
             vec![CStmt::Expr(CExpr::call(
-                CExpr::Var("sym.imp.malloc".to_string()),
+                crate::symbol::var_ref(&symbols, "sym.imp.malloc"),
                 vec![CExpr::IntLit(8)],
             ))],
         );
@@ -332,15 +343,16 @@ mod tests {
 
     #[test]
     fn a_marker_lands_inside_the_branch_that_carries_the_name() {
+        let symbols = test_table();
         let mut func = function(
             vec!["x"],
             Vec::new(),
             vec![CStmt::If {
-                cond: CExpr::Var("x".to_string()),
+                cond: crate::symbol::var_ref(&symbols, "x"),
                 then_body: Box::new(CStmt::Block(vec![CStmt::Expr(CExpr::binary(
                     BinaryOp::Assign,
-                    CExpr::Var("x".to_string()),
-                    CExpr::Var("local_10".to_string()),
+                    crate::symbol::var_ref(&symbols, "x"),
+                    crate::symbol::var_ref(&symbols, "local_10"),
                 ))])),
                 else_body: None,
             }],

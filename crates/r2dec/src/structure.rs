@@ -5020,6 +5020,11 @@ mod tests {
     use std::collections::{BTreeSet, HashMap};
     use std::sync::Arc;
 
+    /// The names a fixture in this module declares.
+    fn test_table() -> std::cell::RefCell<crate::symbol::SymbolTable> {
+        std::cell::RefCell::new(crate::symbol::SymbolTable::new())
+    }
+
     #[test]
     fn control_bdd_proves_disjoint_duplicated_path_coverage() {
         let mut bdd = ControlBdd::new(64);
@@ -5052,7 +5057,8 @@ mod tests {
     }
 
     fn v(name: &str) -> CExpr {
-        CExpr::Var(name.to_string())
+        let symbols = test_table();
+        crate::symbol::var_ref(&symbols, name)
     }
 
     fn expr_stmt(expr: CExpr) -> CStmt {
@@ -6058,6 +6064,7 @@ mod tests {
 
     #[test]
     fn rewrites_for_loop_past_generated_trailing_value_carrier() {
+        let symbols = test_table();
         let input = CStmt::Block(vec![
             CStmt::Block(vec![
                 assign("sum", CExpr::IntLit(0)),
@@ -6080,7 +6087,7 @@ mod tests {
                     }),
                     CStmt::Decl {
                         name: "tmp:11f00_4".to_string(),
-                        ty: CType::i32(),
+                        ty: CTsymbols.borrow_mut().declare_or_reuse("tmp:11f00_4")
                         init: Some(CExpr::Deref(Box::new(CExpr::binary(
                             BinaryOp::Add,
                             v("arr"),

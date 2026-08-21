@@ -618,6 +618,11 @@ mod tests {
     use super::*;
     use r2ssa::SSAVar;
 
+    /// The names a fixture in this module declares.
+    fn test_table() -> std::cell::RefCell<crate::symbol::SymbolTable> {
+        std::cell::RefCell::new(crate::symbol::SymbolTable::new())
+    }
+
     #[test]
     fn parse_const_value_uses_ssa_hex_payload_by_default() {
         assert_eq!(parse_const_value("const:100"), Some(0x100));
@@ -706,24 +711,25 @@ mod tests {
 
     #[test]
     fn extract_stack_offset_from_var_handles_nested_temp_plus_const() {
+        let symbols = test_table();
         let mut definitions = HashMap::new();
         definitions.insert(
             String::from("tmp:11f80_2"),
             CExpr::binary(
                 BinaryOp::Add,
-                CExpr::Var(String::from("sp_2")),
+                CExpr::Var(symbols.borrow_mut().declare_or_reuse("sp_2")),
                 CExpr::IntLit(0x3e0),
             ),
         );
         definitions.insert(
             String::from("x8_1"),
-            CExpr::Var(String::from("tmp:11f80_2")),
+            CExpr::Var(symbols.borrow_mut().declare_or_reuse("tmp:11f80_2")),
         );
         definitions.insert(
             String::from("tmp:6500_2"),
             CExpr::binary(
                 BinaryOp::Add,
-                CExpr::Var(String::from("x8_1")),
+                CExpr::Var(symbols.borrow_mut().declare_or_reuse("x8_1")),
                 CExpr::IntLit(0x160),
             ),
         );

@@ -14023,7 +14023,7 @@ fn callother_ids_share_effect_and_result_lowering() {
         assert_eq!(
             stmt,
             Some(CStmt::Expr(CExpr::assign(
-                CExpr::Var("x30_1".to_string()),
+                ctx.name_ref("x30_1"),
                 CExpr::call(
                     CExpr::External {
                     name: "callother".to_string(),
@@ -14031,7 +14031,7 @@ fn callother_ids_share_effect_and_result_lowering() {
                 },
                     vec![
                         CExpr::StringLit(format!("userop_{userop}")),
-                        CExpr::Var("x30".to_string()),
+                        ctx.name_ref("x30"),
                     ],
                 ),
             ))),
@@ -14054,7 +14054,7 @@ fn callother_ids_share_effect_and_result_lowering() {
                 },
             vec![
                 CExpr::StringLit(format!("userop_{effect_userop}")),
-                CExpr::Var("x30".to_string()),
+                ctx.name_ref("x30"),
             ],
         ))),
         "outputless CallOther must retain its explicit effect"

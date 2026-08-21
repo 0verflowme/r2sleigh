@@ -8819,6 +8819,11 @@ mod tests {
     use crate::ast::CType;
     use r2ssa::{PhiNode, SSAVar};
 
+    /// The names a fixture in this module declares.
+    fn test_table() -> std::cell::RefCell<crate::symbol::SymbolTable> {
+        std::cell::RefCell::new(crate::symbol::SymbolTable::new())
+    }
+
     fn mk(name: &str, version: u32, size: u32) -> SSAVar {
         SSAVar::new(name, version, size)
     }
@@ -8906,27 +8911,29 @@ mod tests {
 
     #[test]
     fn low_quality_stack_spill_names_do_not_preserve_call_arg_pointer_identity() {
+        let symbols = test_table();
         let fixture = TestEnvFixture::new();
         let env = fixture.env();
 
         assert!(!expr_preserves_pointer_identity_for_call_arg(
-            &CExpr::Var("var_20h".to_string()),
+            &crate::symbol::var_ref(&symbols, "var_20h"),
             &env
         ));
         assert!(expr_preserves_pointer_identity_for_call_arg(
-            &CExpr::Var("buf".to_string()),
+            &crate::symbol::var_ref(&symbols, "buf"),
             &env
         ));
     }
 
     #[test]
     fn call_arg_expr_score_penalizes_low_quality_stack_spills() {
+        let symbols = test_table();
         let fixture = TestEnvFixture::new();
         let env = fixture.env();
 
         assert!(
-            call_arg_expr_score(&CExpr::Var("len".to_string()), &env)
-                > call_arg_expr_score(&CExpr::Var("var_20h".to_string()), &env)
+            call_arg_expr_score(&crate::symbol::var_ref(&symbols, "len"), &env)
+                > call_arg_expr_score(&crate::symbol::var_ref(&symbols, "var_20h"), &env)
         );
     }
 
@@ -9503,6 +9510,7 @@ mod tests {
 
     #[test]
     fn call_arg_ranking_prefers_literalish_expression_over_stack_placeholder() {
+        let symbols = test_table();
         let mut fixture = TestEnvFixture::default();
         fixture
             .strings
@@ -9515,7 +9523,7 @@ mod tests {
         );
         let stacky = CExpr::Deref(Box::new(CExpr::binary(
             BinaryOp::Add,
-            CExpr::Var("stack_178".to_string()),
+            crate::symbol::var_ref(&symbols, "stack_178"),
             CExpr::IntLit(160),
         )));
 
@@ -9885,6 +9893,7 @@ mod tests {
 
     #[test]
     fn imported_call_arg_prefers_forwarded_local_source_over_positive_stack_home_reload() {
+        let symbols = test_table();
         let fixture = TestEnvFixture {
             sp_name: "sp".to_string(),
             fp_name: "x29".to_string(),
@@ -9945,7 +9954,7 @@ mod tests {
             &info,
             &reloaded_home,
             CExpr::Var(reloaded_home.display_name()),
-            &env,
+            &env,symbols.borrow_mut().declare_or_reuse(&reloaded_home.display_name())
         );
         assert!(
             !matches!(
@@ -10263,7 +10272,7 @@ mod tests {
         assert!(
             matches!(
                 info.definitions.get("tmp:3a680_7"),
-                Some(CExpr::Call { func, .. }) if **func == CExpr::Var("sym.imp.atoi".to_string())
+                Some(CExpr::Call { func, .. }) if **func == crate::symbol::var_ref(&symbols, "sym.imp.atoi")
             ),
             "expected copied W0 temp to bind to the imported call expression, got {:?}",
             info.definitions.get("tmp:3a680_7")
@@ -10780,30 +10789,32 @@ mod tests {
 
     #[test]
     fn call_arg_preservation_score_uses_typed_symbol_and_object_names() {
+        let symbols = test_table();
         assert_eq!(
-            call_arg_expr_preservation_score(&CExpr::Var("tmp:1".to_string()), 0),
+            call_arg_expr_preservation_score(&crate::symbol::var_ref(&symbols, "tmp:1"), 0),
             -60
         );
         assert_eq!(
-            call_arg_expr_preservation_score(&CExpr::Var("sym.helper".to_string()), 0),
+            call_arg_expr_preservation_score(&crate::symbol::var_ref(&symbols, "sym.helper"), 0),
             180
         );
         assert_eq!(
-            call_arg_expr_preservation_score(&CExpr::Var("obj.global".to_string()), 0),
+            call_arg_expr_preservation_score(&crate::symbol::var_ref(&symbols, "obj.global"), 0),
             180
         );
         assert_eq!(
-            call_arg_expr_preservation_score(&CExpr::Var("data.global".to_string()), 0),
+            call_arg_expr_preservation_score(&crate::symbol::var_ref(&symbols, "data.global"), 0),
             70
         );
         assert_eq!(
-            call_arg_expr_preservation_score(&CExpr::Var("got.slot".to_string()), 0),
+            call_arg_expr_preservation_score(&crate::symbol::var_ref(&symbols, "got.slot"), 0),
             70
         );
     }
 
     #[test]
     fn semantic_source_values_reject_raw_temporary_and_memory_storage_names() {
+        let symbols = test_table();
         let info = UseInfo::default();
 
         for var in [
@@ -10835,7 +10846,7 @@ mod tests {
         ));
         assert!(matches!(
             semantic_or_scalar_source_value(&info, "value_0"),
-            Some(SemanticValue::Scalar(ScalarValue::Expr(CExpr::Var(name)))) if name == "value"
+            Some(SemanticValue::Scalar(ScalarValue::Expr(CExpr::Var(name)))) if name == symbols.borrow_mut().declare_or_reuse("value")
         ));
         assert!(matches!(
             semantic_or_scalar_source_value(&info, "const:1_0"),
@@ -10845,6 +10856,7 @@ mod tests {
 
     #[test]
     fn semantic_source_addresses_recover_stack_slots_without_overriding_scalar_semantics() {
+        let symbols = test_table();
         let fixture = TestEnvFixture::new();
         let env = fixture.env();
         let temp_slot = mk("tmp:slot", 1, 8);
@@ -10854,7 +10866,7 @@ mod tests {
             temp_slot.display_name(),
             CExpr::binary(
                 BinaryOp::Add,
-                CExpr::Var("rsp_0".to_string()),
+                crate::symbol::var_ref(&symbols, "rsp_0"),
                 CExpr::IntLit(0x20),
             ),
         );
@@ -10862,7 +10874,7 @@ mod tests {
             alias_slot.display_name(),
             CExpr::binary(
                 BinaryOp::Add,
-                CExpr::Var("rsp_0".to_string()),
+                crate::symbol::var_ref(&symbols, "rsp_0"),
                 CExpr::IntLit(0x28),
             ),
         );
@@ -10890,7 +10902,7 @@ mod tests {
 
         info.semantic_values.insert(
             temp_slot.display_name(),
-            SemanticValue::Scalar(ScalarValue::Expr(CExpr::Var("semantic".to_string()))),
+            SemanticValue::Scalar(ScalarValue::Expr(crate::symbol::var_ref(&symbols, "semantic"))),
         );
         assert!(matches!(
             semantic_addr_for_var_with_depth(&info, &temp_slot, &env, 0),
@@ -11156,6 +11168,7 @@ mod tests {
 
     #[test]
     fn formatted_defs_prefer_semantic_expr_over_register_artifact() {
+        let symbols = test_table();
         let fixture = TestEnvFixture::new();
         let mut scratch = UseScratch::default();
         scratch
@@ -11169,15 +11182,15 @@ mod tests {
         scratch
             .info
             .definitions
-            .insert("tmp:pick_1".to_string(), CExpr::Var("rdx_2".to_string()));
+            .insert("tmp:pick_1".to_string(), crate::symbol::var_ref(&symbols, "rdx_2"));
         scratch.info.definitions.insert(
             "tmp:pick_2".to_string(),
             CExpr::Subscript {
                 base: Box::new(CExpr::cast(
                     CType::ptr(CType::u32()),
-                    CExpr::Var("arr".to_string()),
+                    crate::symbol::var_ref(&symbols, "arr"),
                 )),
-                index: Box::new(CExpr::Var("idx".to_string())),
+                index: Box::new(crate::symbol::var_ref(&symbols, "idx")),
             },
         );
 

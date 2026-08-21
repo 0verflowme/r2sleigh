@@ -5332,17 +5332,23 @@ mod tests {
     };
     use std::collections::{BTreeMap, BTreeSet, HashMap};
 
+    /// The names a fixture in this module declares.
+    fn test_table() -> std::cell::RefCell<crate::symbol::SymbolTable> {
+        std::cell::RefCell::new(crate::symbol::SymbolTable::new())
+    }
+
     #[test]
     fn substitution_leaves_an_assignment_target_alone() {
+        let symbols = test_table();
         let mut stmt = CStmt::Expr(CExpr::assign(
-            CExpr::Var("local_4".to_string()),
-            CExpr::Var("local_4".to_string()),
+            crate::symbol::var_ref(&symbols, "local_4"),
+            crate::symbol::var_ref(&symbols, "local_4"),
         ));
-        substitute_var_in_stmt(&mut stmt, "local_4", &CExpr::IntLit(1));
+        substitute_var_in_stmt(&mut stmt, symbols.borrow_mut().declare_or_reuse("local_4"), &CExpr::IntLit(1));
         assert_eq!(
             stmt,
             CStmt::Expr(CExpr::assign(
-                CExpr::Var("local_4".to_string()),
+                crate::symbol::var_ref(&symbols, "local_4"),
                 CExpr::IntLit(1),
             ))
         );
@@ -5350,17 +5356,18 @@ mod tests {
 
     #[test]
     fn substitution_leaves_a_compound_assignment_target_alone() {
+        let symbols = test_table();
         let mut stmt = CStmt::Expr(CExpr::binary(
             BinaryOp::AddAssign,
-            CExpr::Var("local_4".to_string()),
-            CExpr::Var("local_4".to_string()),
+            crate::symbol::var_ref(&symbols, "local_4"),
+            crate::symbol::var_ref(&symbols, "local_4"),
         ));
-        substitute_var_in_stmt(&mut stmt, "local_4", &CExpr::IntLit(1));
+        substitute_var_in_stmt(&mut stmt, symbols.borrow_mut().declare_or_reuse("local_4"), &CExpr::IntLit(1));
         assert_eq!(
             stmt,
             CStmt::Expr(CExpr::binary(
                 BinaryOp::AddAssign,
-                CExpr::Var("local_4".to_string()),
+                crate::symbol::var_ref(&symbols, "local_4"),
                 CExpr::IntLit(1),
             ))
         );
@@ -5636,15 +5643,16 @@ mod tests {
 
     #[test]
     fn param_register_aliases_keep_abi_order_over_misaligned_external_regs() {
+        let symbols = test_table();
         let params = vec![
             ast::CParam {
                 ty: CType::Pointer(Box::new(CType::Int(32))),
-                name: "arr".to_string(),
+                name: symbols.borrow_mut().declare_or_reuse("arr"),
             },
             ast::CParam {
                 ty: CType::Int(32),
                 name: "len".to_string(),
-            },
+            },symbols.borrow_mut().declare_or_reuse("len")
         ];
         let register_params = vec![
             ExternalRegisterParamSpec {
@@ -5775,42 +5783,42 @@ mod tests {
             locals: Vec::new(),
             body: vec![
                 CStmt::Expr(CExpr::assign(
-                    CExpr::Var("tmp_ldwn_1".to_string()),
+                    ctx.name_ref("tmp_ldwn_1"),
                     CExpr::deref(CExpr::binary(
                         BinaryOp::Add,
-                        CExpr::Var("base".to_string()),
+                        ctx.name_ref("base"),
                         CExpr::IntLit(50),
                     )),
                 )),
                 CStmt::Expr(CExpr::assign(
-                    CExpr::Var("tmp_stwn_1".to_string()),
+                    ctx.name_ref("tmp_stwn_1"),
                     CExpr::binary(
                         BinaryOp::Add,
                         CExpr::deref(CExpr::binary(
                             BinaryOp::Add,
-                            CExpr::Var("base".to_string()),
+                            ctx.name_ref("base"),
                             CExpr::IntLit(50),
                         )),
-                        CExpr::Var("arg1".to_string()),
+                        ctx.name_ref("arg1"),
                     ),
                 )),
                 CStmt::Expr(CExpr::assign(
                     CExpr::deref(CExpr::binary(
                         BinaryOp::Add,
-                        CExpr::Var("x0_5".to_string()),
+                        ctx.name_ref("x0_5"),
                         CExpr::IntLit(50),
                     )),
                     CExpr::binary(
                         BinaryOp::Add,
-                        CExpr::Var("arg1".to_string()),
+                        ctx.name_ref("arg1"),
                         CExpr::deref(CExpr::binary(
                             BinaryOp::Add,
-                            CExpr::Var("base".to_string()),
+                            ctx.name_ref("base"),
                             CExpr::IntLit(50),
                         )),
                     ),
                 )),
-                CStmt::Return(Some(CExpr::Var("x0_5".to_string()))),
+                CStmt::Return(Some(ctx.name_ref("x0_5"))),
             ],
         };
         let ctx = FoldingContext::new(64);
@@ -5832,25 +5840,26 @@ mod tests {
         ));
         assert_eq!(
             func.body[1],
-            CStmt::Return(Some(CExpr::Var("x0_5".to_string())))
+            CStmt::Return(Some(ctx.name_ref("x0_5")))
         );
     }
 
     #[test]
     fn authoritative_external_signature_can_shrink_recovered_header_params() {
+        let symbols = test_table();
         let recovered = vec![
             ast::CParam {
                 ty: CType::Int(32),
-                name: "arg1".to_string(),
+                name: symbols.borrow_mut().declare_or_reuse("arg1"),
             },
             ast::CParam {
                 ty: CType::Int(32),
-                name: "arg2".to_string(),
+                name: symbols.borrow_mut().declare_or_reuse("arg2"),
             },
             ast::CParam {
                 ty: CType::Int(32),
                 name: "arg3".to_string(),
-            },
+            },symbols.borrow_mut().declare_or_reuse("arg3")
         ];
         let signature = signature_spec(
             Some(CType::Pointer(Box::new(CType::Int(8)))),
@@ -5866,25 +5875,26 @@ mod tests {
             2,
             "typed/named external signature should be authoritative for the visible header"
         );
-        assert_eq!(params[0].name, "src");
-        assert_eq!(params[1].name, "len");
+        assert_eq!(params[0].name, symbols.borrow_mut().declare_or_reuse("src"));
+        assert_eq!(params[1].name, symbols.borrow_mut().declare_or_reuse("len"));
         assert!(matches!(params[1].ty, CType::UInt(64)));
     }
 
     #[test]
     fn generic_external_signature_still_owns_header_arity() {
+        let symbols = test_table();
         let recovered = vec![
             ast::CParam {
                 ty: CType::Int(32),
-                name: "arg1".to_string(),
+                name: symbols.borrow_mut().declare_or_reuse("arg1"),
             },
             ast::CParam {
                 ty: CType::Int(32),
-                name: "arg2".to_string(),
+                name: symbols.borrow_mut().declare_or_reuse("arg2"),
             },
             ast::CParam {
                 ty: CType::Int(32),
-                name: "arg3".to_string(),
+                name: symbols.borrow_mut().declare_or_reuse("arg3"),
             },
         ];
         let signature = signature_spec(None, vec![("arg1", None), ("arg2", None)]);
@@ -5896,13 +5906,14 @@ mod tests {
             "certified signature arity must be the visible header authority even when generic"
         );
         assert!(
-            params.iter().all(|param| param.name != "arg3"),
+            params.iter().all(|param| param.name != symbols.borrow_mut().declare_or_reuse("arg3")),
             "local recovery must not append surplus header params beyond FunctionFacts signature"
         );
     }
 
     #[test]
     fn external_signature_can_extend_empty_recovered_header_params() {
+        let symbols = test_table();
         let signature = signature_spec(
             None,
             vec![
@@ -5913,21 +5924,22 @@ mod tests {
 
         let params = merge_params_with_external_signature(Vec::new(), Some(&signature));
         assert_eq!(params.len(), 2);
-        assert_eq!(params[0].name, "buf");
-        assert_eq!(params[1].name, "count");
+        assert_eq!(params[0].name, symbols.borrow_mut().declare_or_reuse("buf"));
+        assert_eq!(params[1].name, symbols.borrow_mut().declare_or_reuse("count"));
     }
 
     #[test]
     fn redundant_return_carrier_cast_yields_to_declared_c_type() {
+        let symbols = test_table();
         let mut func = CFunction::new("carrier", CType::Int(32)).with_body(vec![CStmt::if_stmt(
             CExpr::IntLit(1),
-            CStmt::Return(Some(CExpr::cast(CType::Int(64), CExpr::var("result")))),
+            CStmt::Return(Some(CExpr::cast(CType::Int(64), CExpr::var(symbols.borrow_mut().declare_or_reuse("result"))))),
             None,
         )]);
         func.locals.push(ast::CLocal {
             ty: CType::Int(32),
-            name: "result".to_string(),
-            stack_offset: Some(-4),
+            name: symbols.borrow_mut().declare_or_reuse("result"),
+            stack_offset: None,
         });
 
         normalize_redundant_return_carrier_casts(&mut func);
@@ -5941,32 +5953,33 @@ mod tests {
 
     #[test]
     fn declared_assignment_type_normalizes_only_root_integer_literals() {
+        let symbols = test_table();
         let mut func = CFunction::new("typed_assignments", CType::Int(32)).with_body(vec![
             CStmt::Expr(CExpr::binary(
                 BinaryOp::Assign,
-                CExpr::var("signed_value"),
+                CExpr::var(symbols.borrow_mut().declare_or_reuse("signed_value")),
                 CExpr::UIntLit(0xffff_ffff),
             )),
             CStmt::Expr(CExpr::binary(
                 BinaryOp::Assign,
-                CExpr::var("unsigned_value"),
+                CExpr::var(symbols.borrow_mut().declare_or_reuse("unsigned_value")),
                 CExpr::UIntLit(0xffff_ffff),
             )),
             CStmt::Expr(CExpr::binary(
                 BinaryOp::Assign,
-                CExpr::var("signed_value"),
+                CExpr::var(symbols.borrow_mut().declare_or_reuse("signed_value")),
                 CExpr::binary(BinaryOp::Add, CExpr::UIntLit(0xffff_ffff), CExpr::IntLit(1)),
             )),
         ]);
         func.locals = vec![
             ast::CLocal {
                 ty: CType::Int(32),
-                name: "signed_value".to_string(),
+                name: symbols.borrow_mut().declare_or_reuse("signed_value"),
                 stack_offset: Some(-4),
             },
             ast::CLocal {
                 ty: CType::UInt(32),
-                name: "unsigned_value".to_string(),
+                name: symbols.borrow_mut().declare_or_reuse("unsigned_value"),
                 stack_offset: Some(-8),
             },
         ];
@@ -5995,17 +6008,18 @@ mod tests {
 
     #[test]
     fn unreferenced_local_declaration_is_removed_without_touching_live_locals() {
+        let symbols = test_table();
         let mut func = CFunction::new("locals", CType::Int(32))
-            .with_body(vec![CStmt::Return(Some(CExpr::var("live")))]);
+            .with_body(vec![CStmt::Return(Some(CExpr::var(symbols.borrow_mut().declare_or_reuse("live"))))]);
         func.locals = vec![
             ast::CLocal {
                 ty: CType::Int(32),
-                name: "dead_return_slot".to_string(),
+                name: symbols.borrow_mut().declare_or_reuse("dead_return_slot"),
                 stack_offset: Some(-4),
             },
             ast::CLocal {
                 ty: CType::Int(32),
-                name: "live".to_string(),
+                name: symbols.borrow_mut().declare_or_reuse("live"),
                 stack_offset: Some(-8),
             },
         ];
@@ -6013,7 +6027,7 @@ mod tests {
         prune_unreferenced_local_declarations(&mut func);
 
         assert_eq!(func.locals.len(), 1);
-        assert_eq!(func.locals[0].name, "live");
+        assert_eq!(func.symbols.borrow().name(func.locals[0].name), "live");
     }
 
     #[test]
@@ -9918,6 +9932,7 @@ mod tests {
 
     #[test]
     fn semantic_summary_return_guard_fills_nonvoid_body_without_return() {
+        let symbols = test_table();
         let mut semantic_artifact = test_native_semantic_report(
             r2sym::RefinementStage::Compiled,
             r2sym::ArtifactGranularity::Regioned,
@@ -9969,7 +9984,7 @@ mod tests {
             locals: Vec::new(),
             body: vec![CStmt::Expr(CExpr::call(
                 CExpr::var("sym.rpl_mbrtoc32"),
-                Vec::new(),
+                Vec::new(),symbols.borrow_mut().declare_or_reuse("sym.rpl_mbrtoc32")
             ))],
         };
 
@@ -9993,6 +10008,7 @@ mod tests {
 
     #[test]
     fn raw_summary_report_does_not_invent_executable_return() {
+        let symbols = test_table();
         let semantic_artifact = test_native_semantic_report(
             r2sym::RefinementStage::Compiled,
             r2sym::ArtifactGranularity::WholeFunction,
@@ -10019,7 +10035,7 @@ mod tests {
             params_known: true,
             locals: Vec::new(),
             body: vec![CStmt::Expr(CExpr::call(
-                CExpr::var("summary_worker"),
+                CExpr::var(symbols.borrow_mut().declare_or_reuse("summary_worker")),
                 Vec::new(),
             ))],
         };
@@ -10044,6 +10060,7 @@ mod tests {
 
     #[test]
     fn certified_standard_summary_return_guard_does_not_invent_executable_return() {
+        let symbols = test_table();
         let semantic_artifact = test_native_semantic_report(
             r2sym::RefinementStage::Compiled,
             r2sym::ArtifactGranularity::WholeFunction,
@@ -10062,17 +10079,18 @@ mod tests {
             },
             None,
         );
+        let body = vec![CStmt::Expr(CExpr::call(
+            crate::symbol::var_ref(&symbols, "sym.imp.malloc"),
+            vec![crate::symbol::var_ref(&symbols, "n")],
+        ))];
         let mut func = CFunction {
-            symbols: crate::symbol::SymbolTable::new(),
+            symbols,
             name: "dbg.alloc_wrapper2".to_string(),
             ret_type: CType::ptr(CType::Int(8)),
             params: Vec::new(),
             params_known: true,
             locals: Vec::new(),
-            body: vec![CStmt::Expr(CExpr::call(
-                CExpr::var("sym.imp.malloc"),
-                vec![CExpr::var("n")],
-            ))],
+            body,
         };
 
         append_semantic_summary_return_comment_to_function_if_needed(

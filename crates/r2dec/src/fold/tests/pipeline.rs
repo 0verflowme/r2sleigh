@@ -17,6 +17,10 @@ mod tests {
         },
     };
     use r2il::{ArchSpec, R2ILBlock, R2ILOp, RegisterDef, SpaceId, Varnode};
+    /// The names a fixture in this module declares.
+    fn test_table() -> std::cell::RefCell<crate::symbol::SymbolTable> {
+        std::cell::RefCell::new(crate::symbol::SymbolTable::new())
+    }
     use r2types::{
         CalleeArgEffect, CalleeFact, CalleeReturnRelation, ExternalField, ExternalStackBase,
         ExternalStackVarSpec, ExternalStruct, ExternalTypeDb, Signedness, SolvedTypes,
@@ -286,15 +290,18 @@ mod tests {
         name
     }
 
-    fn fixture_owner_expr_for_arg(binding: &crate::analysis::CallArgBinding) -> CExpr {
+    fn fixture_owner_expr_for_arg(
+        ctx: &FoldingContext<'_>,
+        binding: &crate::analysis::CallArgBinding,
+    ) -> CExpr {
         match &binding.arg {
             crate::analysis::SemanticCallArg::FallbackExpr(expr) => expr.clone(),
             crate::analysis::SemanticCallArg::StringAddr(addr) => CExpr::UIntLit(*addr),
             crate::analysis::SemanticCallArg::Semantic(_) => binding
                 .source_var_name
                 .as_ref()
-                .map(|name| CExpr::Var(name.clone()))
-                .unwrap_or_else(FoldingContext::unresolved_call_arg_expr),
+                .map(|name| ctx.name_ref(name))
+                .unwrap_or_else(|| ctx.unresolved_call_arg_expr()),
         }
     }
 
@@ -1281,19 +1288,19 @@ mod tests {
 
         let sum_rhs = ctx.collapse_scalar_stack_addr_artifact(CExpr::binary(
             BinaryOp::Add,
-            CExpr::AddrOf(Box::new(CExpr::Var("sum".to_string()))),
+            CExpr::AddrOf(Box::new(ctx.name_ref("sum"))),
             CExpr::Subscript {
-                base: Box::new(CExpr::Var("arr".to_string())),
-                index: Box::new(CExpr::Var("i".to_string())),
+                base: Box::new(ctx.name_ref("arr")),
+                index: Box::new(ctx.name_ref("i")),
             },
         ));
         let i_rhs = ctx.rewrite_scalar_stack_placeholder_rhs(
-            &CExpr::Var("i".to_string()),
-            CExpr::Var("local_3".to_string()),
+            &ctx.name_ref("i"),
+            ctx.name_ref("local_3"),
         );
         let cross_slot_rhs = ctx.rewrite_scalar_stack_placeholder_rhs(
-            &CExpr::Var("sum".to_string()),
-            CExpr::Var("local_17".to_string()),
+            &ctx.name_ref("sum"),
+            ctx.name_ref("local_17"),
         );
 
         assert!(
@@ -1302,12 +1309,12 @@ mod tests {
         );
         assert_eq!(
             i_rhs,
-            CExpr::Var("local_3".to_string()),
+            ctx.name_ref("local_3"),
             "adjacent stack placeholders must not become source-shaped scalar arithmetic without value proof"
         );
         assert_eq!(
             cross_slot_rhs,
-            CExpr::Var("local_17".to_string()),
+            ctx.name_ref("local_17"),
             "large cross-slot placeholder deltas must not be rewritten as scalar arithmetic"
         );
     }
@@ -1321,7 +1328,7 @@ mod tests {
         )]));
         ctx.state.analysis_ctx.stack_info.stack_vars = HashMap::from([(-8, "count".to_string())]);
 
-        let offsets = ctx.stack_offsets_for_visible_storage_name("count");
+        let offsets = ctx.stack_offsets_for_visible_storage_name({ let CExpr::Var(id) = ctx.name_ref("count") else { unreachable!() }; id });
         assert!(offsets.contains(&-8), "keeps derived offset: {offsets:?}");
         assert!(
             offsets.contains(&8),
@@ -1543,7 +1550,7 @@ mod tests {
             function_facts.set_callee_resolution(resolution);
         });
 
-        let poisoned_callee = CExpr::Var("sym.local_two_arg".to_string());
+        let poisoned_callee = ctx.name_ref("sym.local_two_arg");
         assert!(
             !ctx.is_imported_call_target(&poisoned_callee),
             "expression-only fallback should not classify the poisoned local name as imported"
@@ -1572,7 +1579,7 @@ mod tests {
     #[test]
     fn prepared_call_args_do_not_expand_stale_downstream_definitions() {
         let mut ctx = FoldingContext::new(64);
-        let rendered_callee = CExpr::Var("sym.local_helper".to_string());
+        let rendered_callee = ctx.name_ref("sym.local_helper");
 
         ctx.state
             .analysis_ctx
@@ -1582,7 +1589,7 @@ mod tests {
 
         assert_eq!(
             ctx.normalize_call_arg_expr_with_import_policy(
-                CExpr::Var("tmp:1_0".to_string()),
+                ctx.name_ref("tmp:1_0"),
                 false
             ),
             CExpr::IntLit(42),
@@ -1593,9 +1600,9 @@ mod tests {
                 0x1000,
                 0,
                 &rendered_callee,
-                vec![CExpr::Var("tmp:1_0".to_string())],
+                vec![ctx.name_ref("tmp:1_0")],
             ),
-            vec![CExpr::Var("value_1_0".to_string())],
+            vec![ctx.name_ref("value_1_0")],
             "prepared arguments are certificate-owned and must not be repaired from local definitions"
         );
     }
@@ -1624,16 +1631,16 @@ mod tests {
             .alias_sources
             .insert("tmp_result".to_string(), source_id);
 
-        let poisoned_import = CExpr::Var("sym.imp.printf".to_string());
-        let real_internal = CExpr::Var("sym.local.helper".to_string());
+        let poisoned_import = ctx.name_ref("sym.imp.printf");
+        let real_internal = ctx.name_ref("sym.local.helper");
         let binding = crate::analysis::CallArgBinding::result(
-            crate::analysis::SemanticCallArg::FallbackExpr(CExpr::Var("tmp_result".to_string())),
+            crate::analysis::SemanticCallArg::FallbackExpr(ctx.name_ref("tmp_result")),
         )
         .with_source_call(source_call.0, source_call.1);
         let expected = ctx.render_call_arg_for_callee(&real_internal, binding.clone());
         assert_ne!(
             expected,
-            CExpr::Var("owned_result".to_string()),
+            ctx.name_ref("owned_result"),
             "test setup must distinguish internal rendering from imported result repair"
         );
 
@@ -1699,7 +1706,7 @@ mod tests {
             .insert("tmp_result".to_string(), source_id);
 
         let binding = crate::analysis::CallArgBinding::result(
-            crate::analysis::SemanticCallArg::FallbackExpr(CExpr::Var("tmp_result".to_string())),
+            crate::analysis::SemanticCallArg::FallbackExpr(ctx.name_ref("tmp_result")),
         )
         .with_source_call(source_call.0, source_call.1);
 
@@ -1707,10 +1714,10 @@ mod tests {
             ctx.render_call_args_for_site(
                 source_call.0,
                 source_call.1,
-                &CExpr::Var("sym.local.modeled".to_string()),
+                &ctx.name_ref("sym.local.modeled"),
                 vec![binding],
             ),
-            vec![CExpr::Var("owned_result".to_string())],
+            vec![ctx.name_ref("owned_result")],
             "typed modeled callsite identity must use imported/modelled argument policy even without an import name",
         );
     }
@@ -1732,7 +1739,7 @@ mod tests {
         );
 
         let poisoned = CExpr::call(
-            CExpr::Var("sym.local_two_arg".to_string()),
+            ctx.name_ref("sym.local_two_arg"),
             vec![CExpr::IntLit(7), CExpr::IntLit(9)],
         );
         let normalized = ctx.normalize_call_expr_for_source_call(
@@ -1744,7 +1751,7 @@ mod tests {
         assert_eq!(
             normalized,
             CExpr::call(
-                CExpr::Var("sym.imp.one_arg".to_string()),
+                ctx.name_ref("sym.imp.one_arg"),
                 vec![CExpr::IntLit(7)]
             ),
             "final normalization must keep source-call identity for typed callee arity",
@@ -1771,7 +1778,7 @@ mod tests {
         let normalized = ctx.normalize_call_expr_for_source_call(
             (0x1000, 0),
             CExpr::call(
-                CExpr::Var("sym.poisoned".to_string()),
+                ctx.name_ref("sym.poisoned"),
                 vec![CExpr::IntLit(7)],
             ),
             FinalExprNormalizeContext::DefinitionRoot,
@@ -1780,7 +1787,7 @@ mod tests {
         assert_eq!(
             normalized,
             CExpr::call(
-                CExpr::Var("sym.poisoned".to_string()),
+                ctx.name_ref("sym.poisoned"),
                 vec![CExpr::IntLit(7)]
             ),
             "prepared direct targets must not repair rendered call targets without typed callsite resolution"
@@ -1802,7 +1809,7 @@ mod tests {
         let normalized = ctx.normalize_call_expr_for_source_call(
             (0x1000, 0),
             CExpr::call(
-                CExpr::Var("sym.poisoned".to_string()),
+                ctx.name_ref("sym.poisoned"),
                 vec![CExpr::IntLit(7)],
             ),
             FinalExprNormalizeContext::DefinitionRoot,
@@ -1810,7 +1817,7 @@ mod tests {
 
         assert_eq!(
             normalized,
-            CExpr::call(CExpr::Var("sym.helper".to_string()), vec![CExpr::IntLit(7)]),
+            CExpr::call(ctx.name_ref("sym.helper"), vec![CExpr::IntLit(7)]),
             "typed callsite resolution must outrank rendered callee text"
         );
     }
@@ -1841,8 +1848,8 @@ mod tests {
             .insert("tmp_result".to_string(), owner_id);
 
         let poisoned = CExpr::call(
-            CExpr::Var("sym.imp.printf".to_string()),
-            vec![CExpr::Var("tmp_result".to_string())],
+            ctx.name_ref("sym.imp.printf"),
+            vec![ctx.name_ref("tmp_result")],
         );
         let normalized = ctx.normalize_call_expr_for_source_call(
             source_call,
@@ -1853,8 +1860,8 @@ mod tests {
         assert_eq!(
             normalized,
             CExpr::call(
-                CExpr::Var("sym.local.helper".to_string()),
-                vec![CExpr::Var("tmp_result".to_string())],
+                ctx.name_ref("sym.local.helper"),
+                vec![ctx.name_ref("tmp_result")],
             ),
             "poisoned rendered import names must not trigger imported-arg repair for typed internal callsites",
         );
@@ -1891,7 +1898,7 @@ mod tests {
             },
         )]));
 
-        let raw_rendered_target = CExpr::Var("const:401000".to_string());
+        let raw_rendered_target = ctx.name_ref("const:401000");
         assert!(
             ctx.is_imported_call_target(&raw_rendered_target),
             "source-less direct target queries may still use typed direct-address context"
@@ -1938,7 +1945,7 @@ mod tests {
             },
         )]));
 
-        let rendered_import = CExpr::Var("sym.imp.one_arg".to_string());
+        let rendered_import = ctx.name_ref("sym.imp.one_arg");
         let rendered_call = CExpr::call(
             rendered_import.clone(),
             vec![CExpr::IntLit(7), CExpr::IntLit(9)],
@@ -2001,7 +2008,7 @@ mod tests {
             });
         let ctx = make_x86_64_ctx_with_prepared(&prepared);
 
-        let poisoned_rendered_callee = CExpr::Var("sym.local_poison".to_string());
+        let poisoned_rendered_callee = ctx.name_ref("sym.local_poison");
         assert!(
             ctx.is_imported_call_target_for_site(0x1000, 0),
             "prepared call identity should authorize imported policy without trusting rendered callee text"
@@ -2025,6 +2032,7 @@ mod tests {
 
     #[test]
     fn final_call_normalization_uses_typed_printf_identity_not_rendered_name() {
+        let symbols = test_table();
         let mut imported_ctx = FoldingContext::new(64);
         let imported_source = (0x1000, 0);
         install_callsite_resolution(
@@ -2039,11 +2047,11 @@ mod tests {
             }),
         );
         let rendered_local_logger = CExpr::call(
-            CExpr::Var("sym.local_logger".to_string()),
+            crate::symbol::var_ref(&symbols, "sym.local_logger"),
             vec![
                 CExpr::StringLit("x=%d".to_string()),
-                CExpr::Var("x".to_string()),
-                CExpr::Var("garbage".to_string()),
+                crate::symbol::var_ref(&symbols, "x"),
+                crate::symbol::var_ref(&symbols, "garbage"),
             ],
         );
 
@@ -2054,11 +2062,11 @@ mod tests {
                 FinalExprNormalizeContext::DefinitionRoot,
             ),
             CExpr::call(
-                CExpr::Var("sym.imp.printf".to_string()),
+                crate::symbol::var_ref(&symbols, "sym.imp.printf"),
                 vec![
                     CExpr::StringLit("x=%d".to_string()),
-                    CExpr::Var("x".to_string()),
-                    CExpr::Var("garbage".to_string()),
+                    crate::symbol::var_ref(&symbols, "x"),
+                    crate::symbol::var_ref(&symbols, "garbage"),
                 ],
             ),
             "typed variadic printf callsite identity must preserve certified args; format strings are not arity proof",
@@ -2078,11 +2086,11 @@ mod tests {
             }),
         );
         let poisoned_printf = CExpr::call(
-            CExpr::Var("sym.imp.printf".to_string()),
+            crate::symbol::var_ref(&symbols, "sym.imp.printf"),
             vec![
                 CExpr::StringLit("x=%d".to_string()),
-                CExpr::Var("x".to_string()),
-                CExpr::Var("garbage".to_string()),
+                crate::symbol::var_ref(&symbols, "x"),
+                crate::symbol::var_ref(&symbols, "garbage"),
             ],
         );
 
@@ -2093,11 +2101,11 @@ mod tests {
                 FinalExprNormalizeContext::DefinitionRoot,
             ),
             CExpr::call(
-                CExpr::Var("sym.local_logger".to_string()),
+                crate::symbol::var_ref(&symbols, "sym.local_logger"),
                 vec![
                     CExpr::StringLit("x=%d".to_string()),
-                    CExpr::Var("x".to_string()),
-                    CExpr::Var("garbage".to_string()),
+                    crate::symbol::var_ref(&symbols, "x"),
+                    crate::symbol::var_ref(&symbols, "garbage"),
                 ],
             ),
             "rendered printf names must not clamp args for typed internal callsites",
@@ -2120,7 +2128,7 @@ mod tests {
             }),
         );
 
-        let poisoned_func = CExpr::Var("sym.local_two_arg".to_string());
+        let poisoned_func = ctx.name_ref("sym.local_two_arg");
         let binding = crate::analysis::CallArgBinding::result(
             crate::analysis::SemanticCallArg::FallbackExpr(CExpr::call(
                 poisoned_func.clone(),
@@ -2162,12 +2170,12 @@ mod tests {
             .call_args
             .insert(source_call, vec![call_arg(CExpr::IntLit(7))]);
 
-        let poisoned_func = CExpr::Var("sym.local_two_arg".to_string());
+        let poisoned_func = ctx.name_ref("sym.local_two_arg");
         let binding = crate::analysis::CallArgBinding::result(
             crate::analysis::SemanticCallArg::FallbackExpr(CExpr::call(
                 poisoned_func.clone(),
                 vec![CExpr::call(
-                    CExpr::Var("sym.local_nested".to_string()),
+                    ctx.name_ref("sym.local_nested"),
                     vec![],
                 )],
             )),
@@ -2219,7 +2227,7 @@ mod tests {
             .insert(outer_call, vec![call_arg(CExpr::IntLit(99))]);
 
         let nested = CExpr::call(
-            CExpr::Var("sym.imp.nested_one_arg".to_string()),
+            ctx.name_ref("sym.imp.nested_one_arg"),
             vec![CExpr::IntLit(7), CExpr::IntLit(9)],
         );
         ctx.state
@@ -2229,11 +2237,11 @@ mod tests {
             .insert(nested_call_site, nested.clone());
 
         assert!(
-            !ctx.is_imported_call_target(&CExpr::Var("sym.imp.nested_one_arg".to_string())),
+            !ctx.is_imported_call_target(&ctx.name_ref("sym.imp.nested_one_arg")),
             "test setup requires rendered nested callee text to be insufficient by itself"
         );
 
-        let poisoned_outer_func = CExpr::Var("sym.local_outer".to_string());
+        let poisoned_outer_func = ctx.name_ref("sym.local_outer");
         let binding = crate::analysis::CallArgBinding::result(
             crate::analysis::SemanticCallArg::FallbackExpr(CExpr::call(
                 poisoned_outer_func.clone(),
@@ -2288,7 +2296,7 @@ mod tests {
             .insert(outer_call, vec![call_arg(CExpr::IntLit(99))]);
 
         let nested = CExpr::call(
-            CExpr::Var("sym.imp.nested_one_arg".to_string()),
+            ctx.name_ref("sym.imp.nested_one_arg"),
             vec![CExpr::IntLit(7)],
         );
         ctx.state
@@ -2298,11 +2306,11 @@ mod tests {
             .insert(nested_call_site, nested.clone());
 
         assert!(
-            !ctx.is_imported_call_target(&CExpr::Var("sym.imp.nested_one_arg".to_string())),
+            !ctx.is_imported_call_target(&ctx.name_ref("sym.imp.nested_one_arg")),
             "rendered callee text is display-only and must not authorize import policy"
         );
 
-        let poisoned_outer_func = CExpr::Var("sym.local_outer".to_string());
+        let poisoned_outer_func = ctx.name_ref("sym.local_outer");
         let binding = crate::analysis::CallArgBinding::result(
             crate::analysis::SemanticCallArg::FallbackExpr(CExpr::call(
                 poisoned_outer_func.clone(),
@@ -2348,7 +2356,7 @@ mod tests {
             .insert(outer_call, vec![call_arg(CExpr::IntLit(99))]);
 
         let nested = CExpr::call(
-            CExpr::Var("sym.imp.nested_one_arg".to_string()),
+            ctx.name_ref("sym.imp.nested_one_arg"),
             vec![CExpr::IntLit(7)],
         );
         ctx.state
@@ -2362,7 +2370,7 @@ mod tests {
             .call_result_exprs
             .insert(second_nested_call_site, nested.clone());
 
-        let poisoned_outer_func = CExpr::Var("sym.local_outer".to_string());
+        let poisoned_outer_func = ctx.name_ref("sym.local_outer");
         let binding = crate::analysis::CallArgBinding::result(
             crate::analysis::SemanticCallArg::FallbackExpr(CExpr::call(
                 poisoned_outer_func.clone(),
@@ -2401,13 +2409,13 @@ mod tests {
         ctx.state.analysis_ctx.use_info.call_result_exprs.insert(
             source_call,
             CExpr::call(
-                CExpr::Var("sym.local_two_arg".to_string()),
+                ctx.name_ref("sym.local_two_arg"),
                 vec![CExpr::IntLit(7)],
             ),
         );
 
         let poisoned = CExpr::call(
-            CExpr::Var("sym.local_two_arg".to_string()),
+            ctx.name_ref("sym.local_two_arg"),
             vec![CExpr::IntLit(7), CExpr::IntLit(9)],
         );
         assert_eq!(
@@ -2417,7 +2425,7 @@ mod tests {
                 FinalExprNormalizeContext::DefinitionRoot,
             ),
             CExpr::call(
-                CExpr::Var("sym.imp.one_arg".to_string()),
+                ctx.name_ref("sym.imp.one_arg"),
                 vec![CExpr::IntLit(7)],
             ),
             "source-keyed normalization must render the typed callsite callee and arity",
@@ -2450,13 +2458,13 @@ mod tests {
         ctx.state.analysis_ctx.use_info.call_result_exprs.insert(
             source_call,
             CExpr::call(
-                CExpr::Var("sym.local_two_arg".to_string()),
+                ctx.name_ref("sym.local_two_arg"),
                 vec![CExpr::IntLit(7)],
             ),
         );
 
         let rendered = CExpr::call(
-            CExpr::Var("sym.imp.one_arg".to_string()),
+            ctx.name_ref("sym.imp.one_arg"),
             vec![CExpr::IntLit(7), CExpr::IntLit(9)],
         );
 
@@ -2475,7 +2483,7 @@ mod tests {
         let mut ctx = FoldingContext::new(64);
         install_known_one_arg_signature(&mut ctx);
         let call = CExpr::call(
-            CExpr::Var("sym.imp.one_arg".to_string()),
+            ctx.name_ref("sym.imp.one_arg"),
             vec![CExpr::IntLit(7), CExpr::IntLit(9)],
         );
 
@@ -2504,7 +2512,7 @@ mod tests {
         let wrapped = CExpr::cast(
             CType::Int(64),
             CExpr::call(
-                CExpr::Var("sym.local_two_arg".to_string()),
+                ctx.name_ref("sym.local_two_arg"),
                 vec![CExpr::IntLit(7), CExpr::IntLit(9)],
             ),
         );
@@ -2518,7 +2526,7 @@ mod tests {
             CExpr::cast(
                 CType::Int(64),
                 CExpr::call(
-                    CExpr::Var("sym.imp.one_arg".to_string()),
+                    ctx.name_ref("sym.imp.one_arg"),
                     vec![CExpr::IntLit(7)]
                 ),
             ),
@@ -2534,11 +2542,11 @@ mod tests {
             .analysis_ctx
             .use_info
             .call_result_exprs
-            .insert(source_call, CExpr::Var("not_a_call".to_string()));
+            .insert(source_call, ctx.name_ref("not_a_call"));
         ctx.state.analysis_ctx.use_info.definitions.insert(
             "X20_1".to_string(),
             CExpr::call(
-                CExpr::Var("sym.imp.one_arg".to_string()),
+                ctx.name_ref("sym.imp.one_arg"),
                 vec![CExpr::IntLit(7)],
             ),
         );
@@ -2549,7 +2557,7 @@ mod tests {
             .insert("x20_1".to_string(), 1);
 
         let rendered = CExpr::call(
-            CExpr::Var("sym.imp.one_arg".to_string()),
+            ctx.name_ref("sym.imp.one_arg"),
             vec![CExpr::IntLit(7)],
         );
         assert_eq!(
@@ -2594,15 +2602,15 @@ mod tests {
         ctx.state.analysis_ctx.use_info.call_result_exprs.insert(
             source_call,
             CExpr::call(
-                CExpr::Var("sym.local_two_arg".to_string()),
+                ctx.name_ref("sym.local_two_arg"),
                 vec![CExpr::IntLit(7), CExpr::IntLit(9)],
             ),
         );
 
         assert_eq!(
-            ctx.recovered_owned_call_result_definition_rhs_for_visible_name("owned_result"),
+            ctx.recovered_owned_call_result_definition_rhs_for_visible_name({ let CExpr::Var(id) = ctx.name_ref("owned_result") else { unreachable!() }; id }),
             Some(CExpr::call(
-                CExpr::Var("sym.imp.one_arg".to_string()),
+                ctx.name_ref("sym.imp.one_arg"),
                 vec![CExpr::IntLit(7)]
             )),
             "source-keyed recovered RHS must canonicalize the call target before generic normalization",
@@ -2625,7 +2633,7 @@ mod tests {
             call_view_by_site: BTreeMap::from([(
                 source_call,
                 crate::analysis::PreparedCallView {
-                    result_owner: Some(CExpr::Var("owned_result".to_string())),
+                    result_owner: Some(ctx.name_ref("owned_result")),
                     ..crate::analysis::PreparedCallView::default()
                 },
             )]),
@@ -2634,13 +2642,13 @@ mod tests {
         ctx.state.analysis_ctx.use_info.call_result_exprs.insert(
             source_call,
             CExpr::call(
-                CExpr::Var("sym.local.poisoned".to_string()),
+                ctx.name_ref("sym.local.poisoned"),
                 vec![CExpr::IntLit(7)],
             ),
         );
 
         assert_eq!(
-            ctx.recovered_owned_call_result_definition_rhs_for_visible_name("owned_result"),
+            ctx.recovered_owned_call_result_definition_rhs_for_visible_name({ let CExpr::Var(id) = ctx.name_ref("owned_result") else { unreachable!() }; id }),
             None,
             "certified replay must not synthesize a visible owner call without FunctionFacts owner proof"
         );
@@ -2662,7 +2670,7 @@ mod tests {
             }),
         );
         let poisoned = CExpr::call(
-            CExpr::Var("sym.local_two_arg".to_string()),
+            ctx.name_ref("sym.local_two_arg"),
             vec![CExpr::IntLit(7), CExpr::IntLit(9)],
         );
 
@@ -2715,7 +2723,7 @@ mod tests {
             },
         );
         let source_expr = CExpr::call(
-            CExpr::Var("sym.local_two_arg".to_string()),
+            ctx.name_ref("sym.local_two_arg"),
             vec![CExpr::IntLit(7), CExpr::IntLit(9)],
         );
         ctx.state
@@ -2727,7 +2735,7 @@ mod tests {
         assert_eq!(
             ctx.recovered_owned_call_result_definition_rhs("owned_result", &source_expr),
             Some(CExpr::call(
-                CExpr::Var("sym.imp.one_arg".to_string()),
+                ctx.name_ref("sym.imp.one_arg"),
                 vec![CExpr::IntLit(7)]
             )),
             "exact source-call RHS recovery must canonicalize through typed callsite identity",
@@ -2743,7 +2751,7 @@ mod tests {
                 &CExpr::Paren(Box::new(source_expr)),
             ),
             Some(CExpr::call(
-                CExpr::Var("sym.imp.one_arg".to_string()),
+                ctx.name_ref("sym.imp.one_arg"),
                 vec![CExpr::IntLit(7)]
             )),
             "paren/cast wrappers must recurse into exact source-call RHS recovery",
@@ -2786,7 +2794,7 @@ mod tests {
         ctx.state.analysis_ctx.use_info.call_result_exprs.insert(
             source_call,
             CExpr::call(
-                CExpr::Var("sym.local_two_arg".to_string()),
+                ctx.name_ref("sym.local_two_arg"),
                 vec![CExpr::IntLit(7), CExpr::IntLit(9)],
             ),
         );
@@ -2794,10 +2802,10 @@ mod tests {
         assert_eq!(
             ctx.recovered_owned_call_result_definition_rhs(
                 "owned_result",
-                &CExpr::Var("tmp_result".to_string()),
+                &ctx.name_ref("tmp_result"),
             ),
             Some(CExpr::call(
-                CExpr::Var("sym.imp.one_arg".to_string()),
+                ctx.name_ref("sym.imp.one_arg"),
                 vec![CExpr::IntLit(7)]
             )),
             "alias-source RHS recovery must canonicalize through typed callsite identity",
@@ -2805,7 +2813,7 @@ mod tests {
         assert_eq!(
             ctx.recovered_owned_call_result_definition_rhs(
                 "wrong_owner",
-                &CExpr::Var("tmp_result".to_string()),
+                &ctx.name_ref("tmp_result"),
             ),
             None,
             "alias-source RHS recovery must reject mismatched assignment owners",
@@ -2850,7 +2858,7 @@ mod tests {
             function_facts.set_callee_resolution(resolution);
         });
 
-        let poisoned_callee = CExpr::Var("sym.local_logger".to_string());
+        let poisoned_callee = ctx.name_ref("sym.local_logger");
         assert_eq!(
             ctx.normalize_prepared_call_args_for_site(
                 0x1000,
@@ -2858,14 +2866,14 @@ mod tests {
                 &poisoned_callee,
                 vec![
                     CExpr::StringLit("value=%d\n".to_string()),
-                    CExpr::Var("x".to_string()),
-                    CExpr::Var("garbage".to_string()),
+                    ctx.name_ref("x"),
+                    ctx.name_ref("garbage"),
                 ],
             ),
             vec![
                 CExpr::StringLit("value=%d\n".to_string()),
-                CExpr::Var("x".to_string()),
-                CExpr::Var("garbage".to_string()),
+                ctx.name_ref("x"),
+                ctx.name_ref("garbage"),
             ]
         );
     }
@@ -2900,7 +2908,7 @@ mod tests {
             function_facts.set_callee_resolution(resolution);
         });
 
-        let poisoned_callee = CExpr::Var("sym.local_copy".to_string());
+        let poisoned_callee = ctx.name_ref("sym.local_copy");
         assert!(
             !ctx.is_modeled_call_target(&poisoned_callee),
             "expression-only fallback should not classify the poisoned local name as modeled"
@@ -2932,7 +2940,7 @@ mod tests {
         assert_eq!(
             stmt,
             CStmt::Expr(CExpr::call(
-                CExpr::Var("sym.imp.printf".to_string()),
+                ctx.name_ref("sym.imp.printf"),
                 vec![]
             )),
             "fallback indirect call lowering must use typed callsite identity instead of rendering the target register",
@@ -2989,7 +2997,7 @@ mod tests {
         ctx.state.analysis_ctx.use_info.call_args.insert(
             (0x1000, 0),
             vec![crate::analysis::CallArgBinding::input(
-                crate::analysis::SemanticCallArg::FallbackExpr(CExpr::Var("arg0".to_string())),
+                crate::analysis::SemanticCallArg::FallbackExpr(ctx.name_ref("arg0")),
             )],
         );
 
@@ -3033,8 +3041,7 @@ mod tests {
                 stack_load_call_arg(-52, 4),
             ],
         );
-        insert_authorized_call_args(
-            &mut ctx,
+        let __fixture_args = (
             (0x1000, 1),
             vec![
                 string_addr_call_arg(0x10000266f),
@@ -3043,15 +3050,15 @@ mod tests {
                 stack_load_call_arg(-52, 4).with_stack_offset(16),
                 result_call_arg(
                     CExpr::call(
-                        CExpr::Var("sym._unlock".to_string()),
+                        ctx.name_ref("sym._unlock"),
                         vec![
-                            CExpr::Var("argc".to_string()),
-                            CExpr::Var("argc".to_string()),
+                            ctx.name_ref("argc"),
+                            ctx.name_ref("argc"),
                             CExpr::call(
-                                CExpr::Var("sym.imp.atoi".to_string()),
+                                ctx.name_ref("sym.imp.atoi"),
                                 vec![CExpr::Deref(Box::new(CExpr::binary(
                                     BinaryOp::Add,
-                                    CExpr::Var("argv".to_string()),
+                                    ctx.name_ref("argv"),
                                     CExpr::IntLit(32),
                                 )))],
                             ),
@@ -3062,6 +3069,11 @@ mod tests {
                 ),
             ],
         );
+        insert_authorized_call_args(
+            &mut ctx,
+            __fixture_args.0,
+            __fixture_args.1,
+        );;
 
         let stmt = ctx
             .op_to_stmt_with_args(
@@ -3111,34 +3123,42 @@ mod tests {
                 },
             ),
         ]));
-        insert_authorized_call_args(
-            &mut ctx,
+        let __fixture_args = (
             (0x1000, 0),
             vec![
-                call_arg(CExpr::Var("a".to_string())),
-                call_arg(CExpr::Var("b".to_string())),
-                call_arg(CExpr::Var("c".to_string())),
-            ],
-        );
-        let helper_call = CExpr::call(
-            CExpr::Var("sym._unlock".to_string()),
-            vec![
-                CExpr::Var("a".to_string()),
-                CExpr::Var("b".to_string()),
-                CExpr::Var("c".to_string()),
+                call_arg(ctx.name_ref("a")),
+                call_arg(ctx.name_ref("b")),
+                call_arg(ctx.name_ref("c")),
             ],
         );
         insert_authorized_call_args(
             &mut ctx,
+            __fixture_args.0,
+            __fixture_args.1,
+        );;
+        let helper_call = CExpr::call(
+            ctx.name_ref("sym._unlock"),
+            vec![
+                ctx.name_ref("a"),
+                ctx.name_ref("b"),
+                ctx.name_ref("c"),
+            ],
+        );
+        let __fixture_args = (
             (0x1000, 1),
             vec![
                 string_addr_call_arg(0x40229e),
                 call_arg(helper_call.clone()),
-                call_arg(CExpr::Var("b".to_string())),
-                call_arg(CExpr::Var("c".to_string())),
+                call_arg(ctx.name_ref("b")),
+                call_arg(ctx.name_ref("c")),
                 result_call_arg(helper_call.clone(), (0x1000, 0), 24),
             ],
         );
+        insert_authorized_call_args(
+            &mut ctx,
+            __fixture_args.0,
+            __fixture_args.1,
+        );;
 
         let stmt = ctx
             .op_to_stmt_with_args(
@@ -3173,22 +3193,26 @@ mod tests {
             &[(-92, "local_5c")],
         );
         insert_authorized_call_args(&mut ctx, (0x2000, 0), vec![stack_load_call_arg(-92, 4)]);
-        insert_authorized_call_args(
-            &mut ctx,
+        let __fixture_args = (
             (0x2000, 1),
             vec![
                 string_addr_call_arg(0x1000026c9),
                 stack_load_call_arg(-92, 4).with_stack_offset(0),
                 result_call_arg(
                     CExpr::call(
-                        CExpr::Var("sym._solve_equation".to_string()),
-                        vec![CExpr::Var("argc".to_string())],
+                        ctx.name_ref("sym._solve_equation"),
+                        vec![ctx.name_ref("argc")],
                     ),
                     (0x2000, 0),
                     8,
                 ),
             ],
         );
+        insert_authorized_call_args(
+            &mut ctx,
+            __fixture_args.0,
+            __fixture_args.1,
+        );;
 
         let stmt = ctx
             .op_to_stmt_with_args(
@@ -3226,8 +3250,7 @@ mod tests {
             (0x3000, 0),
             vec![stack_load_call_arg(-96, 4), stack_load_call_arg(-100, 4)],
         );
-        insert_authorized_call_args(
-            &mut ctx,
+        let __fixture_args = (
             (0x3000, 1),
             vec![
                 string_addr_call_arg(0x100002701),
@@ -3235,14 +3258,14 @@ mod tests {
                 stack_load_call_arg(-100, 4).with_stack_offset(8),
                 result_call_arg(
                     CExpr::call(
-                        CExpr::Var("sym._complex_check".to_string()),
+                        ctx.name_ref("sym._complex_check"),
                         vec![
-                            CExpr::Var("argc".to_string()),
+                            ctx.name_ref("argc"),
                             CExpr::call(
-                                CExpr::Var("sym.imp.atoi".to_string()),
+                                ctx.name_ref("sym.imp.atoi"),
                                 vec![CExpr::Deref(Box::new(CExpr::binary(
                                     BinaryOp::Add,
-                                    CExpr::Var("argv".to_string()),
+                                    ctx.name_ref("argv"),
                                     CExpr::IntLit(24),
                                 )))],
                             ),
@@ -3253,6 +3276,11 @@ mod tests {
                 ),
             ],
         );
+        insert_authorized_call_args(
+            &mut ctx,
+            __fixture_args.0,
+            __fixture_args.1,
+        );;
 
         let stmt = ctx
             .op_to_stmt_with_args(
@@ -3301,13 +3329,13 @@ mod tests {
             .analysis_ctx
             .use_info
             .call_args
-            .insert((0x1000, 0), vec![call_arg(CExpr::Var("src".to_string()))]);
+            .insert((0x1000, 0), vec![call_arg(ctx.name_ref("src"))]);
 
         let rendered = ctx.render_call_arg_for_callee(
-            &CExpr::Var("sym.imp.printf".to_string()),
+            &ctx.name_ref("sym.imp.printf"),
             result_call_arg(
                 CExpr::call(
-                    CExpr::Var("sym.imp.malloc".to_string()),
+                    ctx.name_ref("sym.imp.malloc"),
                     vec![CExpr::IntLit(16)],
                 ),
                 (0x1000, 0),
@@ -3349,7 +3377,7 @@ mod tests {
         ctx.state.analysis_ctx.use_info.definitions.insert(
             shadow.display_name(),
             CExpr::call(
-                CExpr::Var("sym.imp.malloc".to_string()),
+                ctx.name_ref("sym.imp.malloc"),
                 vec![CExpr::IntLit(16)],
             ),
         );
@@ -3488,7 +3516,7 @@ mod tests {
             call_view_by_site: BTreeMap::from([(
                 (block.addr, 6),
                 crate::analysis::PreparedCallView {
-                    result_owner: Some(CExpr::Var("buf".to_string())),
+                    result_owner: Some(ctx.name_ref("buf")),
                     ..crate::analysis::PreparedCallView::default()
                 },
             )]),
@@ -3603,7 +3631,7 @@ mod tests {
 
         let predicate = CExpr::binary(
             BinaryOp::Eq,
-            CExpr::Var("rax_1".to_string()),
+            ctx.name_ref("rax_1"),
             CExpr::IntLit(0),
         );
 
@@ -3621,7 +3649,7 @@ mod tests {
 
         let predicate = CExpr::binary(
             BinaryOp::Eq,
-            CExpr::Var("rax_1".to_string()),
+            ctx.name_ref("rax_1"),
             CExpr::IntLit(0),
         );
 
@@ -3629,7 +3657,7 @@ mod tests {
             ctx.normalize_assignment_predicate_rhs(predicate),
             CExpr::binary(
                 BinaryOp::Eq,
-                CExpr::Var("loc".to_string()),
+                ctx.name_ref("loc"),
                 CExpr::IntLit(0)
             ),
             "source-backed aliases should rewrite to the stable predicate owner"
@@ -3644,8 +3672,8 @@ mod tests {
         let predicate = CExpr::binary(
             BinaryOp::Eq,
             CExpr::call(
-                CExpr::Var("helper".to_string()),
-                vec![CExpr::Var("rax_1".to_string())],
+                ctx.name_ref("helper"),
+                vec![ctx.name_ref("rax_1")],
             ),
             CExpr::IntLit(0),
         );
@@ -3655,8 +3683,8 @@ mod tests {
             CExpr::binary(
                 BinaryOp::Eq,
                 CExpr::call(
-                    CExpr::Var("helper".to_string()),
-                    vec![CExpr::Var("loc".to_string())],
+                    ctx.name_ref("helper"),
+                    vec![ctx.name_ref("loc")],
                 ),
                 CExpr::IntLit(0),
             ),
@@ -3671,7 +3699,7 @@ mod tests {
 
         let predicate = CExpr::binary(
             BinaryOp::Ne,
-            CExpr::Var("rax_1".to_string()),
+            ctx.name_ref("rax_1"),
             CExpr::IntLit(0),
         );
 
@@ -3689,7 +3717,7 @@ mod tests {
 
         let predicate = CExpr::binary(
             BinaryOp::Eq,
-            CExpr::Var("rax_1".to_string()),
+            ctx.name_ref("rax_1"),
             CExpr::IntLit(0),
         );
 
@@ -3708,7 +3736,7 @@ mod tests {
 
             let predicate = CExpr::binary(
                 BinaryOp::Eq,
-                CExpr::Var("rax_1".to_string()),
+                ctx.name_ref("rax_1"),
                 CExpr::IntLit(0),
             );
 
@@ -3727,7 +3755,7 @@ mod tests {
 
         let predicate = CExpr::binary(
             BinaryOp::Ne,
-            CExpr::Deref(Box::new(CExpr::Var("loc".to_string()))),
+            CExpr::Deref(Box::new(ctx.name_ref("loc"))),
             CExpr::IntLit(0),
         );
 
@@ -3735,7 +3763,7 @@ mod tests {
             ctx.normalize_assignment_predicate_rhs(predicate),
             CExpr::binary(
                 BinaryOp::Ne,
-                CExpr::Var("loc".to_string()),
+                ctx.name_ref("loc"),
                 CExpr::IntLit(0)
             ),
             "a visible call-result owner behind a deref should remain the canonical owner"
@@ -3747,7 +3775,7 @@ mod tests {
         let ctx = make_x86_64_ctx();
         let predicate = CExpr::binary(
             BinaryOp::Ne,
-            CExpr::Deref(Box::new(CExpr::Var("loc".to_string()))),
+            CExpr::Deref(Box::new(ctx.name_ref("loc"))),
             CExpr::IntLit(0),
         );
 
@@ -3773,7 +3801,7 @@ mod tests {
 
         let predicate = CExpr::binary(
             BinaryOp::Eq,
-            wrap_predicate_test_parens(CExpr::Var("rax_1".to_string()), wrapper_count),
+            wrap_predicate_test_parens(ctx.name_ref("rax_1"), wrapper_count),
             CExpr::IntLit(0),
         );
 
@@ -3781,7 +3809,7 @@ mod tests {
             ctx.normalize_assignment_predicate_rhs(predicate),
             CExpr::binary(
                 BinaryOp::Eq,
-                wrap_predicate_test_parens(CExpr::Var("loc".to_string()), wrapper_count),
+                wrap_predicate_test_parens(ctx.name_ref("loc"), wrapper_count),
                 CExpr::IntLit(0),
             ),
             "owner aliases at exactly the maximum predicate depth must still rewrite"
@@ -3796,7 +3824,7 @@ mod tests {
 
         let predicate = CExpr::binary(
             BinaryOp::Eq,
-            wrap_predicate_test_parens(CExpr::Var("rax_1".to_string()), wrapper_count),
+            wrap_predicate_test_parens(ctx.name_ref("rax_1"), wrapper_count),
             CExpr::IntLit(0),
         );
 
@@ -3816,9 +3844,9 @@ mod tests {
         let predicate = CExpr::binary(
             BinaryOp::Eq,
             CExpr::call(
-                CExpr::Var("helper".to_string()),
+                ctx.name_ref("helper"),
                 vec![wrap_predicate_test_parens(
-                    CExpr::Var("rax_1".to_string()),
+                    ctx.name_ref("rax_1"),
                     wrapper_count,
                 )],
             ),
@@ -4171,7 +4199,7 @@ mod tests {
             call_view_by_site: BTreeMap::from([(
                 (block.addr, 11),
                 crate::analysis::PreparedCallView {
-                    result_owner: Some(CExpr::Var("dup".to_string())),
+                    result_owner: Some(ctx.name_ref("dup")),
                     ..crate::analysis::PreparedCallView::default()
                 },
             )]),
@@ -4201,21 +4229,21 @@ mod tests {
             if ctx.get_expr(&make_var("rax", 4, 8))
                 == CExpr::binary(
                     BinaryOp::Add,
-                    CExpr::Var("len".to_string()),
+                    ctx.name_ref("len"),
                     CExpr::IntLit(1),
                 )
             {
                 CExpr::binary(
                     BinaryOp::Add,
-                    CExpr::Var("len".to_string()),
+                    ctx.name_ref("len"),
                     CExpr::IntLit(1),
                 )
             } else {
                 CExpr::binary(
                     BinaryOp::Add,
                     CExpr::call(
-                        CExpr::Var("ram:401140".to_string()),
-                        vec![CExpr::Var("s".to_string())],
+                        ctx.name_ref("ram:401140"),
+                        vec![ctx.name_ref("s")],
                     ),
                     CExpr::IntLit(1),
                 )
@@ -4226,16 +4254,16 @@ mod tests {
             ctx.state.analysis_ctx.use_info.definitions.get("RAX_4"),
             ctx.state.analysis_ctx.use_info.semantic_values.get("RAX_4"),
             ctx.lookup_definition("len"),
-            ctx.debug_normalized_addr_from_visible_expr(&CExpr::Var("len".to_string())),
+            ctx.debug_normalized_addr_from_visible_expr(&ctx.name_ref("len")),
             ctx.debug_normalized_addr_from_visible_expr(&CExpr::binary(
                 BinaryOp::Add,
-                CExpr::Var("len".to_string()),
+                ctx.name_ref("len"),
                 CExpr::IntLit(1),
             ))
         );
         assert_ne!(
             ctx.get_expr(&final_ret),
-            CExpr::Var("len".to_string()),
+            ctx.name_ref("len"),
             "final return register copy must not reuse the earlier len result when dup ownership is unproven, got {:?}; aliases={:?}; defs={:?}; semantic={:?}",
             ctx.get_expr(&final_ret),
             ctx.state.analysis_ctx.use_info.call_result_source_by_alias,
@@ -4342,7 +4370,7 @@ mod tests {
             call_view_by_site: BTreeMap::from([(
                 (block.addr, 4),
                 crate::analysis::PreparedCallView {
-                    result_owner: Some(CExpr::Var("len".to_string())),
+                    result_owner: Some(ctx.name_ref("len")),
                     ..crate::analysis::PreparedCallView::default()
                 },
             )]),
@@ -4351,8 +4379,8 @@ mod tests {
 
         ctx.analyze_blocks(std::slice::from_ref(&block));
         let strlen_call = CExpr::call(
-            CExpr::Var("sym.imp.strlen".to_string()),
-            vec![CExpr::Var("s".to_string())],
+            ctx.name_ref("sym.imp.strlen"),
+            vec![ctx.name_ref("s")],
         );
         assert_eq!(
             ctx.normalize_final_call_expr(strlen_call.clone()),
@@ -4365,7 +4393,7 @@ mod tests {
                 strlen_call,
                 FinalExprNormalizeContext::Generic,
             ),
-            CExpr::Var("len".to_string()),
+            ctx.name_ref("len"),
             "source-keyed owned strlen call expression should rewrite to len; call_sources={:?}; aliases={:?}",
             ctx.state.analysis_ctx.use_info.call_result_source_by_alias,
             ctx.state.analysis_ctx.use_info.call_result_aliases
@@ -4572,7 +4600,7 @@ mod tests {
         ctx.analyze_blocks(std::slice::from_ref(&block));
         assert_eq!(
             ctx.get_expr(&final_ret),
-            CExpr::Var("dup".to_string()),
+            ctx.name_ref("dup"),
             "expected final return owner to stay bound to dup across the intervening memcpy call, got {:?}; aliases={:?}; defs={:?}; semantic={:?}",
             ctx.get_expr(&final_ret),
             ctx.state.analysis_ctx.use_info.call_result_source_by_alias,
@@ -4723,7 +4751,7 @@ mod tests {
             call_view_by_site: BTreeMap::from([(
                 (0x1000, 1),
                 crate::analysis::PreparedCallView {
-                    result_owner: Some(CExpr::Var("loc".to_string())),
+                    result_owner: Some(ctx.name_ref("loc")),
                     ..crate::analysis::PreparedCallView::default()
                 },
             )]),
@@ -4838,7 +4866,7 @@ mod tests {
         assert!(
             rhs == CExpr::binary(
                 BinaryOp::Ne,
-                CExpr::Var("loc".to_string()),
+                ctx.name_ref("loc"),
                 CExpr::IntLit(0)
             ) || matches!(
                 rhs,
@@ -4937,7 +4965,7 @@ mod tests {
             cond_expr,
             CExpr::binary(
                 BinaryOp::Ne,
-                CExpr::Var("rax_2".to_string()),
+                ctx.name_ref("rax_2"),
                 CExpr::IntLit(0),
             ),
             "calldefine imported-result branch condition must keep the source carrier instead of replaying a rendered call; call_sources={:?}; defs={:?}",
@@ -4960,7 +4988,7 @@ mod tests {
 
         let expr = CExpr::binary(
             BinaryOp::Add,
-            CExpr::Var("argv".to_string()),
+            ctx.name_ref("argv"),
             CExpr::IntLit(8),
         );
         let rendered = ctx
@@ -4969,7 +4997,7 @@ mod tests {
 
         match rendered {
             CExpr::Subscript { base, index } => {
-                assert_eq!(*base, CExpr::Var("argv".to_string()));
+                assert_eq!(*base, ctx.name_ref("argv"));
                 assert_eq!(*index, CExpr::IntLit(1));
             }
             other => panic!("expected constant-index subscript, got: {other:?}"),
@@ -4986,14 +5014,14 @@ mod tests {
 
         let expr = ctx.identity_simplify_binary(
             BinaryOp::Add,
-            CExpr::Var("b".to_string()),
+            ctx.name_ref("b"),
             CExpr::binary(
                 BinaryOp::Add,
-                CExpr::Var("a".to_string()),
+                ctx.name_ref("a"),
                 CExpr::binary(
                     BinaryOp::Add,
-                    CExpr::Var("a".to_string()),
-                    CExpr::Var("a".to_string()),
+                    ctx.name_ref("a"),
+                    ctx.name_ref("a"),
                 ),
             ),
             Some(4),
@@ -5003,8 +5031,8 @@ mod tests {
             expr,
             CExpr::binary(
                 BinaryOp::Add,
-                CExpr::binary(BinaryOp::Mul, CExpr::Var("a".to_string()), CExpr::IntLit(3)),
-                CExpr::Var("b".to_string())
+                CExpr::binary(BinaryOp::Mul, ctx.name_ref("a"), CExpr::IntLit(3)),
+                ctx.name_ref("b")
             )
         );
     }
@@ -5019,11 +5047,11 @@ mod tests {
 
         let expr = ctx.identity_simplify_binary(
             BinaryOp::Add,
-            CExpr::Var("buf".to_string()),
+            ctx.name_ref("buf"),
             CExpr::binary(
                 BinaryOp::Add,
-                CExpr::Var("i".to_string()),
-                CExpr::Var("i".to_string()),
+                ctx.name_ref("i"),
+                ctx.name_ref("i"),
             ),
             Some(8),
         );
@@ -5032,11 +5060,11 @@ mod tests {
             expr,
             CExpr::binary(
                 BinaryOp::Add,
-                CExpr::Var("buf".to_string()),
+                ctx.name_ref("buf"),
                 CExpr::binary(
                     BinaryOp::Add,
-                    CExpr::Var("i".to_string()),
-                    CExpr::Var("i".to_string())
+                    ctx.name_ref("i"),
+                    ctx.name_ref("i")
                 )
             ),
             "pointer arithmetic must not be reordered or collapsed by scalar linear normalization"
@@ -5047,11 +5075,11 @@ mod tests {
     fn test_registry_arity_resolution_does_not_authorize_name_only_arity() {
         let ctx = FoldingContext::new(64);
         assert_eq!(
-            ctx.non_variadic_call_arity(&CExpr::Var("sym.imp.strcmp".to_string())),
+            ctx.non_variadic_call_arity(&ctx.name_ref("sym.imp.strcmp")),
             None
         );
         assert_eq!(
-            ctx.non_variadic_call_arity(&CExpr::Var("sym.imp.strcmp_0".to_string())),
+            ctx.non_variadic_call_arity(&ctx.name_ref("sym.imp.strcmp_0")),
             None
         );
     }
@@ -5071,7 +5099,7 @@ mod tests {
         ctx.set_known_function_signatures(sigs);
 
         assert_eq!(
-            ctx.non_variadic_call_arity(&CExpr::Var("sym.imp.strcmp".to_string())),
+            ctx.non_variadic_call_arity(&ctx.name_ref("sym.imp.strcmp")),
             Some(3),
             "typed signature arity is canonical; registry evidence must not cap it"
         );
@@ -5093,7 +5121,7 @@ mod tests {
             },
         )]));
 
-        let callee = CExpr::Var("const:401050".to_string());
+        let callee = ctx.name_ref("const:401050");
         assert_eq!(ctx.non_variadic_call_arity(&callee), Some(3));
         assert!(
             ctx.known_signature_for_callee_expr(&callee).is_some(),
@@ -5117,7 +5145,7 @@ mod tests {
             },
         )]));
 
-        let callee = CExpr::Var("sym.helper".to_string());
+        let callee = ctx.name_ref("sym.helper");
         assert_eq!(ctx.non_variadic_call_arity(&callee), Some(1));
         assert!(
             ctx.known_signature_for_callee_expr(&callee).is_some(),
@@ -5156,12 +5184,12 @@ mod tests {
         ]));
 
         assert!(ctx.call_expr_returns_void(&CExpr::call(
-            CExpr::Var("const:401080".to_string()),
-            vec![CExpr::Var("ptr".to_string())],
+            ctx.name_ref("const:401080"),
+            vec![ctx.name_ref("ptr")],
         )));
         assert!(
             !ctx.call_expr_returns_void(&CExpr::call(
-                CExpr::Var("const:401090".to_string()),
+                ctx.name_ref("const:401090"),
                 vec![],
             ))
         );
@@ -5201,8 +5229,8 @@ mod tests {
         );
 
         let poisoned_rendered_call = CExpr::call(
-            CExpr::Var("sym.imp.free".to_string()),
-            vec![CExpr::Var("ptr".to_string())],
+            ctx.name_ref("sym.imp.free"),
+            vec![ctx.name_ref("ptr")],
         );
 
         assert!(
@@ -5231,8 +5259,8 @@ mod tests {
         );
 
         let rendered_unknown_call = CExpr::call(
-            CExpr::Var("sym.local.rendered_name".to_string()),
-            vec![CExpr::Var("ptr".to_string())],
+            ctx.name_ref("sym.local.rendered_name"),
+            vec![ctx.name_ref("ptr")],
         );
 
         assert!(
@@ -5265,7 +5293,7 @@ mod tests {
         );
 
         let poisoned_rendered_call = CExpr::call(
-            CExpr::Var("sym.local.poison".to_string()),
+            ctx.name_ref("sym.local.poison"),
             vec![CExpr::UIntLit(16)],
         );
         ctx.state
@@ -5275,7 +5303,7 @@ mod tests {
             .insert(source_call, poisoned_rendered_call.clone());
 
         assert_eq!(
-            ctx.known_signature_for_callee_expr(&CExpr::Var("sym.local.poison".to_string()))
+            ctx.known_signature_for_callee_expr(&ctx.name_ref("sym.local.poison"))
                 .map(|sig| crate::variable::type_like_to_ctype(&sig.return_type)),
             Some(CType::Int(32)),
             "expression-only lookup still sees the poisoned rendered callee"
@@ -5300,12 +5328,12 @@ mod tests {
         assert_eq!(
             ctx.expr_type_hint(&CExpr::cast(
                 CType::Int(16),
-                CExpr::Var("value".to_string())
+                ctx.name_ref("value")
             )),
             Some(CType::Int(16))
         );
         assert_eq!(
-            ctx.expr_type_hint(&CExpr::Paren(Box::new(CExpr::Var("value".to_string())))),
+            ctx.expr_type_hint(&CExpr::Paren(Box::new(ctx.name_ref("value")))),
             Some(CType::UInt(64))
         );
     }
@@ -5332,13 +5360,13 @@ mod tests {
         assert!(ctx.inputs.arch.is_register_like_base_name("x30"));
 
         let carrier = CStmt::Expr(CExpr::assign(
-            CExpr::Var("x8_9".to_string()),
+            ctx.name_ref("x8_9"),
             CExpr::IntLit(1),
         ));
         assert!(ctx.stmt_is_side_effect_free_versioned_register_carrier(&carrier));
 
         let local = CStmt::Expr(CExpr::assign(
-            CExpr::Var("var_8h".to_string()),
+            ctx.name_ref("var_8h"),
             CExpr::IntLit(1),
         ));
         assert!(!ctx.stmt_is_side_effect_free_versioned_register_carrier(&local));
@@ -5350,12 +5378,12 @@ mod tests {
         let ctx = FoldingContext::new(64);
         for base in ["sym.jump_table", "obj.jump_table", "0x401000"] {
             let expr = CExpr::Subscript {
-                base: Box::new(CExpr::Var(base.to_string())),
-                index: Box::new(CExpr::Var("selector".to_string())),
+                base: Box::new(CExpr::Var({ let CExpr::Var(id) = ctx.name_ref(&base.to_string()) else { unreachable!() }; id })),
+                index: Box::new(ctx.name_ref("selector")),
             };
             assert_eq!(
                 ctx.simplify_switch_selector_expr(expr),
-                CExpr::Var("selector".to_string()),
+                ctx.name_ref("selector"),
                 "{base}",
             );
         }
@@ -5367,18 +5395,18 @@ mod tests {
         ] {
             let expr = CExpr::Subscript {
                 base: Box::new(base),
-                index: Box::new(CExpr::Var("selector".to_string())),
+                index: Box::new(ctx.name_ref("selector")),
             };
             assert_eq!(
                 ctx.simplify_switch_selector_expr(expr),
-                CExpr::Var("selector".to_string()),
+                ctx.name_ref("selector"),
             );
         }
 
         for base in ["table", "tmp:1000_0", "arg1"] {
             let expr = CExpr::Subscript {
-                base: Box::new(CExpr::Var(base.to_string())),
-                index: Box::new(CExpr::Var("selector".to_string())),
+                base: Box::new(CExpr::Var({ let CExpr::Var(id) = ctx.name_ref(&base.to_string()) else { unreachable!() }; id })),
+                index: Box::new(ctx.name_ref("selector")),
             };
             assert_eq!(
                 ctx.simplify_switch_selector_expr(expr.clone()),
@@ -5388,8 +5416,8 @@ mod tests {
         }
 
         let low_signal_index = CExpr::Subscript {
-            base: Box::new(CExpr::Var("sym.jump_table".to_string())),
-            index: Box::new(CExpr::Var("tmp:idx_0".to_string())),
+            base: Box::new(ctx.name_ref("sym.jump_table")),
+            index: Box::new(ctx.name_ref("tmp:idx_0")),
         };
         assert_eq!(
             ctx.simplify_switch_selector_expr(low_signal_index.clone()),
@@ -5397,8 +5425,8 @@ mod tests {
         );
 
         let non_old_global_kind = CExpr::Subscript {
-            base: Box::new(CExpr::Var("data.jump_table".to_string())),
-            index: Box::new(CExpr::Var("selector".to_string())),
+            base: Box::new(ctx.name_ref("data.jump_table")),
+            index: Box::new(ctx.name_ref("selector")),
         };
         assert_eq!(
             ctx.simplify_switch_selector_expr(non_old_global_kind.clone()),
@@ -5406,8 +5434,8 @@ mod tests {
         );
 
         let invalid_hex = CExpr::Subscript {
-            base: Box::new(CExpr::Var("0xnot_hex".to_string())),
-            index: Box::new(CExpr::Var("selector".to_string())),
+            base: Box::new(ctx.name_ref("0xnot_hex")),
+            index: Box::new(ctx.name_ref("selector")),
         };
         assert_eq!(
             ctx.simplify_switch_selector_expr(invalid_hex.clone()),
@@ -5556,7 +5584,7 @@ mod tests {
 
         assert_eq!(
             ctx.get_expr(&make_var("ram:401000", 0, 8)),
-            CExpr::Var("ram:401000".to_string())
+            ctx.name_ref("ram:401000")
         );
         assert_eq!(
             ctx.get_expr(&make_var("const:402000", 0, 8)),
@@ -5594,6 +5622,7 @@ mod tests {
 
     #[test]
     fn assignment_lhs_uses_typed_ssa_kind_for_versioned_arg_carriers() {
+        let ctx = FoldingContext::new(64);
         fn lowered_lhs_for(dst: SSAVar) -> CExpr {
             let mut ctx = FoldingContext::new(64);
             ctx.state
@@ -5622,27 +5651,27 @@ mod tests {
 
         assert_eq!(
             lowered_lhs_for(make_var("reg:10", 2, 8)),
-            CExpr::Var("r10_2".to_string())
+            ctx.name_ref("r10_2")
         );
         assert_eq!(
             lowered_lhs_for(make_var("reg:zf", 2, 1)),
-            CExpr::Var("zf_2".to_string())
+            ctx.name_ref("zf_2")
         );
         assert_eq!(
             lowered_lhs_for(make_var("tmp:11f80", 2, 8)),
-            CExpr::Var("t2".to_string())
+            ctx.name_ref("t2")
         );
         assert_eq!(
             lowered_lhs_for(make_var("unique:11f80", 2, 8)),
-            CExpr::Var("t2".to_string())
+            ctx.name_ref("t2")
         );
         assert_eq!(
             lowered_lhs_for(make_var("TMP:11f80", 2, 8)),
-            CExpr::Var("tmp_11f80_2".to_string())
+            ctx.name_ref("tmp_11f80_2")
         );
         assert_eq!(
             lowered_lhs_for(make_var("reg:10", 0, 8)),
-            CExpr::Var("arg1".to_string())
+            ctx.name_ref("arg1")
         );
     }
 
@@ -6028,10 +6057,10 @@ mod tests {
                 BinaryOp::Add,
                 CExpr::Deref(Box::new(CExpr::binary(
                     BinaryOp::Add,
-                    CExpr::Var(base.display_name()),
+                    CExpr::Var({ let CExpr::Var(id) = ctx.name_ref(&base.display_name()) else { unreachable!() }; id }),
                     CExpr::IntLit(0x30),
                 ))),
-                CExpr::Deref(Box::new(CExpr::Var(base.display_name()))),
+                CExpr::Deref(Box::new(CExpr::Var({ let CExpr::Var(id) = ctx.name_ref(&base.display_name()) else { unreachable!() }; id }))),
             ),
         );
 
@@ -6103,10 +6132,10 @@ mod tests {
                 BinaryOp::Add,
                 CExpr::Deref(Box::new(CExpr::binary(
                     BinaryOp::Add,
-                    CExpr::Var("arg1".to_string()),
+                    ctx.name_ref("arg1"),
                     CExpr::IntLit(0x30),
                 ))),
-                CExpr::Deref(Box::new(CExpr::Var("arg1".to_string()))),
+                CExpr::Deref(Box::new(ctx.name_ref("arg1"))),
             ),
         );
 
@@ -6144,16 +6173,16 @@ mod tests {
         );
         ctx.state.analysis_ctx.use_info.definitions.insert(
             bogus_index.display_name(),
-            CExpr::Var("local_8".to_string()),
+            ctx.name_ref("local_8"),
         );
         ctx.state.analysis_ctx.use_info.definitions.insert(
             addr.display_name(),
             CExpr::binary(
                 BinaryOp::Add,
-                CExpr::Var("arg1".to_string()),
+                ctx.name_ref("arg1"),
                 CExpr::binary(
                     BinaryOp::Mul,
-                    CExpr::Var("local_c".to_string()),
+                    ctx.name_ref("local_c"),
                     CExpr::IntLit(4),
                 ),
             ),
@@ -6172,11 +6201,11 @@ mod tests {
             .analysis_ctx
             .use_info
             .definitions
-            .insert(real_index.display_name(), CExpr::Var("local_c".to_string()));
+            .insert(real_index.display_name(), ctx.name_ref("local_c"));
         ctx.state.analysis_ctx.use_info.semantic_values.insert(
             real_index.display_name(),
             crate::analysis::SemanticValue::Scalar(crate::analysis::ScalarValue::Expr(CExpr::Var(
-                "local_c".to_string(),
+                { let CExpr::Var(id) = ctx.name_ref("local_c") else { unreachable!() }; id },
             ))),
         );
         ctx.state.analysis_ctx.use_info.semantic_values.insert(
@@ -6245,7 +6274,7 @@ mod tests {
         assert!(matches!(
             render(SpaceId::Custom(7)),
             CExpr::Call { ref func, ref args }
-                if **func == CExpr::Var("r2s_unsupported_space_load".to_string())
+                if **func == ctx.name_ref("r2s_unsupported_space_load")
                     && args.first() == Some(&CExpr::StringLit("space7".to_string()))
         ));
     }
@@ -6288,13 +6317,13 @@ mod tests {
         ctx.state.analysis_ctx.use_info.semantic_values.insert(
             len_value.display_name(),
             crate::analysis::SemanticValue::Scalar(crate::analysis::ScalarValue::Expr(CExpr::Var(
-                "len".to_string(),
+                { let CExpr::Var(id) = ctx.name_ref("len") else { unreachable!() }; id },
             ))),
         );
         ctx.state.analysis_ctx.use_info.semantic_values.insert(
             buf_value.display_name(),
             crate::analysis::SemanticValue::Scalar(crate::analysis::ScalarValue::Expr(CExpr::Var(
-                "buf".to_string(),
+                { let CExpr::Var(id) = ctx.name_ref("buf") else { unreachable!() }; id },
             ))),
         );
         ctx.state.analysis_ctx.use_info.semantic_values.insert(
@@ -6343,13 +6372,13 @@ mod tests {
     fn semantic_index_storage_filter_uses_typed_ssa_name_kind_without_lowering() {
         let ctx = FoldingContext::new(64);
 
-        assert!(!ctx.is_semantic_index_expr(&CExpr::Var("const:4_0".to_string())));
-        assert!(!ctx.is_semantic_index_expr(&CExpr::Var("ram:401000_0".to_string())));
-        assert!(ctx.is_semantic_index_expr(&CExpr::Var("CONST:4_0".to_string())));
-        assert!(ctx.is_semantic_index_expr(&CExpr::Var("idx_1".to_string())));
-        assert!(!ctx.is_semantic_index_expr(&CExpr::Var("stack".to_string())));
-        assert!(!ctx.is_semantic_index_expr(&CExpr::Var("saved_fp".to_string())));
-        assert!(!ctx.is_semantic_index_expr(&CExpr::Var("stack_8".to_string())));
+        assert!(!ctx.is_semantic_index_expr(&ctx.name_ref("const:4_0")));
+        assert!(!ctx.is_semantic_index_expr(&ctx.name_ref("ram:401000_0")));
+        assert!(ctx.is_semantic_index_expr(&ctx.name_ref("CONST:4_0")));
+        assert!(ctx.is_semantic_index_expr(&ctx.name_ref("idx_1")));
+        assert!(!ctx.is_semantic_index_expr(&ctx.name_ref("stack")));
+        assert!(!ctx.is_semantic_index_expr(&ctx.name_ref("saved_fp")));
+        assert!(!ctx.is_semantic_index_expr(&ctx.name_ref("stack_8")));
     }
 
     #[test]
@@ -6383,10 +6412,10 @@ mod tests {
             base.display_name(),
             CExpr::binary(
                 BinaryOp::Add,
-                CExpr::Var("arg1".to_string()),
+                ctx.name_ref("arg1"),
                 CExpr::binary(
                     BinaryOp::Mul,
-                    CExpr::Var("arg2".to_string()),
+                    ctx.name_ref("arg2"),
                     CExpr::IntLit(56),
                 ),
             ),
@@ -6450,10 +6479,10 @@ mod tests {
             addr.display_name(),
             CExpr::binary(
                 BinaryOp::Add,
-                CExpr::Var("arg1".to_string()),
+                ctx.name_ref("arg1"),
                 CExpr::binary(
                     BinaryOp::Shl,
-                    CExpr::Var("arg2".to_string()),
+                    ctx.name_ref("arg2"),
                     CExpr::IntLit(2),
                 ),
             ),
@@ -6515,8 +6544,8 @@ mod tests {
             addr.display_name(),
             CExpr::binary(
                 BinaryOp::Add,
-                CExpr::Var("i".to_string()),
-                CExpr::Var("buf".to_string()),
+                ctx.name_ref("i"),
+                ctx.name_ref("buf"),
             ),
         );
 
@@ -6524,8 +6553,8 @@ mod tests {
             .indexed_pointer_add_expr(
                 &CExpr::binary(
                     BinaryOp::Add,
-                    CExpr::Var("i".to_string()),
-                    CExpr::Var("buf".to_string()),
+                    ctx.name_ref("i"),
+                    ctx.name_ref("buf"),
                 ),
                 &CType::u8(),
             )
@@ -6645,7 +6674,7 @@ mod tests {
         let expr = ctx.render_canonical_load_expr(&loads[0].1, &loads[0].2, CType::i32());
         assert_eq!(
             expr,
-            CExpr::Var("first_slot".to_string()),
+            ctx.name_ref("first_slot"),
             "nested rendering must use the load definition's memory fact, not the ambient consumer op"
         );
     }
@@ -6708,17 +6737,17 @@ mod tests {
             base.display_name(),
             CExpr::binary(
                 BinaryOp::Add,
-                CExpr::Var("arr".to_string()),
+                ctx.name_ref("arr"),
                 CExpr::binary(
                     BinaryOp::Shl,
                     CExpr::binary(
                         BinaryOp::Sub,
                         CExpr::binary(
                             BinaryOp::Shl,
-                            CExpr::Var("idx".to_string()),
+                            ctx.name_ref("idx"),
                             CExpr::IntLit(3),
                         ),
-                        CExpr::Var("idx".to_string()),
+                        ctx.name_ref("idx"),
                     ),
                     CExpr::IntLit(3),
                 ),
@@ -7142,10 +7171,10 @@ mod tests {
             BinaryOp::Add,
             CExpr::binary(
                 BinaryOp::Add,
-                CExpr::Var("arg1".to_string()),
+                ctx.name_ref("arg1"),
                 CExpr::binary(
                     BinaryOp::Mul,
-                    CExpr::Var("arg2".to_string()),
+                    ctx.name_ref("arg2"),
                     CExpr::IntLit(56),
                 ),
             ),
@@ -7294,10 +7323,10 @@ mod tests {
         let raw = CExpr::Subscript {
             base: Box::new(CExpr::binary(
                 BinaryOp::Add,
-                CExpr::Var("items".to_string()),
+                ctx.name_ref("items"),
                 CExpr::binary(
                     BinaryOp::Mul,
-                    CExpr::Var("idx".to_string()),
+                    ctx.name_ref("idx"),
                     CExpr::IntLit(40),
                 ),
             )),
@@ -7381,16 +7410,16 @@ mod tests {
                 BinaryOp::Sub,
                 CExpr::binary(
                     BinaryOp::Shl,
-                    CExpr::Var("idx".to_string()),
+                    ctx.name_ref("idx"),
                     shift_mask.clone(),
                 ),
-                CExpr::Var("idx".to_string()),
+                ctx.name_ref("idx"),
             ),
             shift_mask,
         );
         let addr = CExpr::binary(
             BinaryOp::Add,
-            CExpr::binary(BinaryOp::Add, CExpr::Var("arr".to_string()), scaled_index),
+            CExpr::binary(BinaryOp::Add, ctx.name_ref("arr"), scaled_index),
             CExpr::IntLit(0x34),
         );
 
@@ -7475,10 +7504,10 @@ mod tests {
             "local_c".to_string(),
             CExpr::binary(
                 BinaryOp::Add,
-                CExpr::Var("arr".to_string()),
+                ctx.name_ref("arr"),
                 CExpr::binary(
                     BinaryOp::Mul,
-                    CExpr::Var("idx".to_string()),
+                    ctx.name_ref("idx"),
                     CExpr::IntLit(56),
                 ),
             ),
@@ -7486,7 +7515,7 @@ mod tests {
 
         let addr = CExpr::binary(
             BinaryOp::Add,
-            CExpr::Var("local_c".to_string()),
+            ctx.name_ref("local_c"),
             CExpr::IntLit(0x34),
         );
         let shape = ctx
@@ -7556,10 +7585,10 @@ mod tests {
 
         let addr = CExpr::binary(
             BinaryOp::Add,
-            CExpr::Var("arg1".to_string()),
+            ctx.name_ref("arg1"),
             CExpr::binary(
                 BinaryOp::Mul,
-                CExpr::Var("arg2".to_string()),
+                ctx.name_ref("arg2"),
                 CExpr::IntLit(4),
             ),
         );
@@ -7844,14 +7873,14 @@ mod tests {
             UnaryOp::Not,
             CExpr::binary(
                 BinaryOp::Eq,
-                CExpr::binary(BinaryOp::Sub, CExpr::Var("x".to_string()), CExpr::IntLit(0)),
+                CExpr::binary(BinaryOp::Sub, ctx.name_ref("x"), CExpr::IntLit(0)),
                 CExpr::IntLit(0),
             ),
         );
         let simplified = ctx.simplify_condition_expr(expr);
         assert_eq!(
             simplified,
-            CExpr::binary(BinaryOp::Ne, CExpr::Var("x".to_string()), CExpr::IntLit(0))
+            CExpr::binary(BinaryOp::Ne, ctx.name_ref("x"), CExpr::IntLit(0))
         );
     }
 
@@ -7862,7 +7891,7 @@ mod tests {
             BinaryOp::Eq,
             CExpr::binary(
                 BinaryOp::Sub,
-                CExpr::Var("x".to_string()),
+                ctx.name_ref("x"),
                 CExpr::IntLit(0xdead),
             ),
             CExpr::IntLit(0),
@@ -7872,7 +7901,7 @@ mod tests {
             simplified,
             CExpr::binary(
                 BinaryOp::Eq,
-                CExpr::Var("x".to_string()),
+                ctx.name_ref("x"),
                 CExpr::IntLit(0xdead)
             )
         );
@@ -7885,8 +7914,8 @@ mod tests {
             BinaryOp::Ne,
             CExpr::binary(
                 BinaryOp::Sub,
-                CExpr::Var("x".to_string()),
-                CExpr::Var("y".to_string()),
+                ctx.name_ref("x"),
+                ctx.name_ref("y"),
             ),
             CExpr::IntLit(0),
         );
@@ -7895,8 +7924,8 @@ mod tests {
             simplified,
             CExpr::binary(
                 BinaryOp::Ne,
-                CExpr::Var("x".to_string()),
-                CExpr::Var("y".to_string())
+                ctx.name_ref("x"),
+                ctx.name_ref("y")
             )
         );
     }
@@ -7908,7 +7937,7 @@ mod tests {
             BinaryOp::Eq,
             CExpr::binary(
                 BinaryOp::Sub,
-                CExpr::Var("x".to_string()),
+                ctx.name_ref("x"),
                 CExpr::UIntLit(0xffff_ffff),
             ),
             CExpr::IntLit(0),
@@ -7918,7 +7947,7 @@ mod tests {
             simplified,
             CExpr::binary(
                 BinaryOp::Eq,
-                CExpr::Var("x".to_string()),
+                ctx.name_ref("x"),
                 CExpr::UIntLit(0xffff_ffff)
             )
         );
@@ -7957,13 +7986,13 @@ mod tests {
         let ctx = FoldingContext::new(64);
         let expr = CExpr::binary(
             BinaryOp::And,
-            CExpr::binary(BinaryOp::Ne, CExpr::Var("x".to_string()), CExpr::IntLit(0)),
-            CExpr::binary(BinaryOp::Ge, CExpr::Var("x".to_string()), CExpr::IntLit(0)),
+            CExpr::binary(BinaryOp::Ne, ctx.name_ref("x"), CExpr::IntLit(0)),
+            CExpr::binary(BinaryOp::Ge, ctx.name_ref("x"), CExpr::IntLit(0)),
         );
         let simplified = ctx.simplify_condition_expr(expr);
         assert_eq!(
             simplified,
-            CExpr::binary(BinaryOp::Gt, CExpr::Var("x".to_string()), CExpr::IntLit(0))
+            CExpr::binary(BinaryOp::Gt, ctx.name_ref("x"), CExpr::IntLit(0))
         );
     }
 
@@ -7976,12 +8005,12 @@ mod tests {
                 BinaryOp::Or,
                 CExpr::binary(
                     BinaryOp::Lt,
-                    CExpr::cast(CType::UInt(64), CExpr::Var("len".to_string())),
-                    CExpr::cast(CType::UInt(64), CExpr::Var("64".to_string())),
+                    CExpr::cast(CType::UInt(64), ctx.name_ref("len")),
+                    CExpr::cast(CType::UInt(64), ctx.name_ref("64")),
                 ),
                 CExpr::binary(
                     BinaryOp::Eq,
-                    CExpr::Var("len".to_string()),
+                    ctx.name_ref("len"),
                     CExpr::IntLit(100),
                 ),
             ),
@@ -7991,7 +8020,7 @@ mod tests {
             simplified,
             CExpr::binary(
                 BinaryOp::Gt,
-                CExpr::Var("len".to_string()),
+                ctx.name_ref("len"),
                 CExpr::IntLit(100)
             )
         );
@@ -8002,11 +8031,11 @@ mod tests {
         let ctx = FoldingContext::new(64);
         let simplified = ctx.identity_simplify_binary(
             BinaryOp::Sub,
-            CExpr::Var("x".to_string()),
+            ctx.name_ref("x"),
             CExpr::IntLit(0),
             Some(4),
         );
-        assert_eq!(simplified, CExpr::Var("x".to_string()));
+        assert_eq!(simplified, ctx.name_ref("x"));
     }
 
     #[test]
@@ -8014,11 +8043,11 @@ mod tests {
         let ctx = FoldingContext::new(64);
         let simplified = ctx.identity_simplify_binary(
             BinaryOp::Add,
-            CExpr::Var("x".to_string()),
+            ctx.name_ref("x"),
             CExpr::IntLit(0),
             Some(4),
         );
-        assert_eq!(simplified, CExpr::Var("x".to_string()));
+        assert_eq!(simplified, ctx.name_ref("x"));
     }
 
     #[test]
@@ -8027,13 +8056,13 @@ mod tests {
         ctx.set_type_hints(HashMap::from([("x".to_string(), CType::Int(32))]));
         let simplified = ctx.identity_simplify_binary(
             BinaryOp::Add,
-            CExpr::Var("x".to_string()),
-            CExpr::binary(BinaryOp::Mul, CExpr::Var("x".to_string()), CExpr::IntLit(2)),
+            ctx.name_ref("x"),
+            CExpr::binary(BinaryOp::Mul, ctx.name_ref("x"), CExpr::IntLit(2)),
             Some(4),
         );
         assert_eq!(
             simplified,
-            CExpr::binary(BinaryOp::Mul, CExpr::Var("x".to_string()), CExpr::IntLit(3))
+            CExpr::binary(BinaryOp::Mul, ctx.name_ref("x"), CExpr::IntLit(3))
         );
     }
 
@@ -8042,11 +8071,11 @@ mod tests {
         let ctx = FoldingContext::new(64);
         let simplified = ctx.identity_simplify_binary(
             BinaryOp::BitOr,
-            CExpr::Var("x".to_string()),
+            ctx.name_ref("x"),
             CExpr::IntLit(0),
             Some(4),
         );
-        assert_eq!(simplified, CExpr::Var("x".to_string()));
+        assert_eq!(simplified, ctx.name_ref("x"));
     }
 
     #[test]
@@ -8054,11 +8083,11 @@ mod tests {
         let ctx = FoldingContext::new(64);
         let simplified = ctx.identity_simplify_binary(
             BinaryOp::BitXor,
-            CExpr::Var("x".to_string()),
+            ctx.name_ref("x"),
             CExpr::IntLit(0),
             Some(4),
         );
-        assert_eq!(simplified, CExpr::Var("x".to_string()));
+        assert_eq!(simplified, ctx.name_ref("x"));
     }
 
     #[test]
@@ -8066,8 +8095,8 @@ mod tests {
         let ctx = FoldingContext::new(64);
         let simplified = ctx.identity_simplify_binary(
             BinaryOp::BitXor,
-            CExpr::Var("x".to_string()),
-            CExpr::Var("x".to_string()),
+            ctx.name_ref("x"),
+            ctx.name_ref("x"),
             Some(4),
         );
         assert_eq!(simplified, CExpr::IntLit(0));
@@ -8078,11 +8107,11 @@ mod tests {
         let ctx = FoldingContext::new(64);
         let simplified = ctx.identity_simplify_binary(
             BinaryOp::Mul,
-            CExpr::Var("x".to_string()),
+            ctx.name_ref("x"),
             CExpr::IntLit(1),
             Some(4),
         );
-        assert_eq!(simplified, CExpr::Var("x".to_string()));
+        assert_eq!(simplified, ctx.name_ref("x"));
     }
 
     #[test]
@@ -8090,11 +8119,11 @@ mod tests {
         let ctx = FoldingContext::new(64);
         let simplified = ctx.identity_simplify_binary(
             BinaryOp::Div,
-            CExpr::Var("x".to_string()),
+            ctx.name_ref("x"),
             CExpr::IntLit(1),
             Some(4),
         );
-        assert_eq!(simplified, CExpr::Var("x".to_string()));
+        assert_eq!(simplified, ctx.name_ref("x"));
     }
 
     #[test]
@@ -8102,11 +8131,11 @@ mod tests {
         let ctx = FoldingContext::new(64);
         let simplified = ctx.identity_simplify_binary(
             BinaryOp::BitAnd,
-            CExpr::Var("x".to_string()),
+            ctx.name_ref("x"),
             CExpr::UIntLit(0xffff_ffff),
             Some(4),
         );
-        assert_eq!(simplified, CExpr::Var("x".to_string()));
+        assert_eq!(simplified, ctx.name_ref("x"));
     }
 
     #[test]
@@ -8114,29 +8143,29 @@ mod tests {
         let ctx = FoldingContext::new(64);
         let sub = ctx.identity_simplify_binary(
             BinaryOp::Sub,
-            CExpr::Var("x".to_string()),
+            ctx.name_ref("x"),
             CExpr::IntLit(1),
             Some(4),
         );
         assert_eq!(
             sub,
-            CExpr::binary(BinaryOp::Sub, CExpr::Var("x".to_string()), CExpr::IntLit(1))
+            CExpr::binary(BinaryOp::Sub, ctx.name_ref("x"), CExpr::IntLit(1))
         );
 
         let add = ctx.identity_simplify_binary(
             BinaryOp::Add,
-            CExpr::Var("x".to_string()),
+            ctx.name_ref("x"),
             CExpr::IntLit(2),
             Some(4),
         );
         assert_eq!(
             add,
-            CExpr::binary(BinaryOp::Add, CExpr::Var("x".to_string()), CExpr::IntLit(2))
+            CExpr::binary(BinaryOp::Add, ctx.name_ref("x"), CExpr::IntLit(2))
         );
 
         let or = ctx.identity_simplify_binary(
             BinaryOp::BitOr,
-            CExpr::Var("x".to_string()),
+            ctx.name_ref("x"),
             CExpr::IntLit(1),
             Some(4),
         );
@@ -8144,7 +8173,7 @@ mod tests {
             or,
             CExpr::binary(
                 BinaryOp::BitOr,
-                CExpr::Var("x".to_string()),
+                ctx.name_ref("x"),
                 CExpr::IntLit(1)
             )
         );
@@ -8153,8 +8182,8 @@ mod tests {
     #[test]
     fn test_noop_assignment_is_suppressed() {
         let ctx = FoldingContext::new(64);
-        let lhs = CExpr::Var("x".to_string());
-        let rhs = CExpr::binary(BinaryOp::Sub, CExpr::Var("x".to_string()), CExpr::IntLit(0));
+        let lhs = ctx.name_ref("x");
+        let rhs = CExpr::binary(BinaryOp::Sub, ctx.name_ref("x"), CExpr::IntLit(0));
         let stmt = ctx.assign_stmt(lhs, rhs);
         assert!(stmt.is_none(), "x = x - 0 should be suppressed as a no-op");
     }
@@ -8176,11 +8205,11 @@ mod tests {
 
         let expr = CExpr::Deref(Box::new(CExpr::binary(
             BinaryOp::Add,
-            CExpr::Var("rbp_1".to_string()),
+            ctx.name_ref("rbp_1"),
             CExpr::IntLit(-0x40),
         )));
 
-        assert_eq!(ctx.rewrite_stack_expr(expr), CExpr::Var("buf".to_string()));
+        assert_eq!(ctx.rewrite_stack_expr(expr), ctx.name_ref("buf"));
     }
 
     #[test]
@@ -8193,10 +8222,10 @@ mod tests {
 
         let expr = CExpr::binary(
             BinaryOp::Add,
-            CExpr::Var("rbp_1".to_string()),
+            ctx.name_ref("rbp_1"),
             CExpr::IntLit(-0x40),
         );
-        assert_eq!(ctx.rewrite_stack_expr(expr), CExpr::Var("buf".to_string()));
+        assert_eq!(ctx.rewrite_stack_expr(expr), ctx.name_ref("buf"));
     }
 
     #[test]
@@ -8214,14 +8243,14 @@ mod tests {
             ty: CType::ptr(CType::Int(8)),
             expr: Box::new(CExpr::Paren(Box::new(CExpr::binary(
                 BinaryOp::Add,
-                CExpr::Var("rbp_1".to_string()),
+                ctx.name_ref("rbp_1"),
                 CExpr::IntLit(-0x48),
             )))),
         }));
 
         assert_eq!(
             ctx.rewrite_stack_expr(expr),
-            CExpr::Var("user_input".to_string())
+            ctx.name_ref("user_input")
         );
     }
 
@@ -8235,7 +8264,7 @@ mod tests {
 
         let expr = CExpr::binary(
             BinaryOp::Add,
-            CExpr::Var("rbp_1".to_string()),
+            ctx.name_ref("rbp_1"),
             CExpr::IntLit(-0x20),
         );
         assert_eq!(ctx.rewrite_stack_expr(expr.clone()), expr);
@@ -8251,8 +8280,8 @@ mod tests {
         ctx.analyze_blocks(&[]);
 
         assert_eq!(
-            ctx.rewrite_stack_expr(CExpr::Var("var_ch".to_string())),
-            CExpr::Var("var_ch".to_string())
+            ctx.rewrite_stack_expr(ctx.name_ref("var_ch")),
+            ctx.name_ref("var_ch")
         );
     }
 
@@ -8349,7 +8378,7 @@ mod tests {
             "tmp:cond_1".to_string(),
             CExpr::binary(
                 BinaryOp::Eq,
-                CExpr::Var("result".to_string()),
+                ctx.name_ref("result"),
                 CExpr::IntLit(25),
             ),
         );
@@ -8357,7 +8386,7 @@ mod tests {
             "result".to_string(),
             CExpr::Deref(Box::new(CExpr::binary(
                 BinaryOp::Add,
-                CExpr::Var("rbp_1".to_string()),
+                ctx.name_ref("rbp_1"),
                 CExpr::IntLit(-4),
             ))),
         );
@@ -8387,7 +8416,7 @@ mod tests {
             "tmp:cond_1".to_string(),
             CExpr::binary(
                 BinaryOp::Eq,
-                CExpr::Var("result".to_string()),
+                ctx.name_ref("result"),
                 CExpr::IntLit(19),
             ),
         );
@@ -8398,7 +8427,7 @@ mod tests {
                 expr: Box::new(CExpr::Deref(Box::new(CExpr::Paren(Box::new(
                     CExpr::binary(
                         BinaryOp::Add,
-                        CExpr::Var("rbp_1".to_string()),
+                        ctx.name_ref("rbp_1"),
                         CExpr::IntLit(-4),
                     ),
                 ))))),
@@ -8421,7 +8450,7 @@ mod tests {
             "tmp:cond_1".to_string(),
             CExpr::binary(
                 BinaryOp::Eq,
-                CExpr::Var("result".to_string()),
+                ctx.name_ref("result"),
                 CExpr::IntLit(19),
             ),
         );
@@ -8429,7 +8458,7 @@ mod tests {
             "result".to_string(),
             CExpr::binary(
                 BinaryOp::Add,
-                CExpr::Var("arg1".to_string()),
+                ctx.name_ref("arg1"),
                 CExpr::IntLit(1),
             ),
         );
@@ -8450,7 +8479,7 @@ mod tests {
             .analysis_ctx
             .use_info
             .definitions
-            .insert("tmp:foo_2".to_string(), CExpr::Var("local_4".to_string()));
+            .insert("tmp:foo_2".to_string(), ctx.name_ref("local_4"));
         ctx.state
             .analysis_ctx
             .use_info
@@ -8458,7 +8487,7 @@ mod tests {
             .insert("tmp:foo_2".to_string(), "t2".to_string());
 
         let resolved = ctx.lookup_definition("t2");
-        assert_eq!(resolved, Some(CExpr::Var("local_4".to_string())));
+        assert_eq!(resolved, Some(ctx.name_ref("local_4")));
     }
 
     #[test]
@@ -8535,12 +8564,12 @@ mod tests {
             .analysis_ctx
             .use_info
             .definitions
-            .insert("tmp:ret_1".to_string(), CExpr::Var("rax_2".to_string()));
+            .insert("tmp:ret_1".to_string(), ctx.name_ref("rax_2"));
         ctx.state
             .analysis_ctx
             .use_info
             .definitions
-            .insert("src_1".to_string(), CExpr::Var("arg1".to_string()));
+            .insert("src_1".to_string(), ctx.name_ref("arg1"));
         ctx.state.analysis_ctx.use_info.forwarded_values.insert(
             "tmp:ret_1".to_string(),
             crate::analysis::ValueProvenance {
@@ -8552,7 +8581,7 @@ mod tests {
         );
 
         let resolved = ctx.lookup_definition("tmp:ret_1");
-        assert_eq!(resolved, Some(CExpr::Var("arg1".to_string())));
+        assert_eq!(resolved, Some(ctx.name_ref("arg1")));
     }
 
     #[test]
@@ -8562,15 +8591,15 @@ mod tests {
             .analysis_ctx
             .use_info
             .definitions
-            .insert("sf_1".to_string(), CExpr::Var("sf_2".to_string()));
+            .insert("sf_1".to_string(), ctx.name_ref("sf_2"));
         ctx.state
             .analysis_ctx
             .use_info
             .definitions
-            .insert("sf_2".to_string(), CExpr::Var("sf_1".to_string()));
+            .insert("sf_2".to_string(), ctx.name_ref("sf_1"));
 
         assert!(
-            !ctx.is_sf_surrogate(&CExpr::Var("sf_1".to_string())),
+            !ctx.is_sf_surrogate(&ctx.name_ref("sf_1")),
             "Cyclic surrogate definitions must short-circuit without recursion overflow"
         );
     }
@@ -8580,14 +8609,14 @@ mod tests {
         let ctx = FoldingContext::new(64);
         let stmts = vec![
             CStmt::Expr(CExpr::assign(
-                CExpr::Var("t1_1".to_string()),
-                CExpr::Var("arg1".to_string()),
+                ctx.name_ref("t1_1"),
+                ctx.name_ref("arg1"),
             )),
             CStmt::Expr(CExpr::assign(
-                CExpr::Var("t2_2".to_string()),
-                CExpr::Var("arg2".to_string()),
+                ctx.name_ref("t2_2"),
+                ctx.name_ref("arg2"),
             )),
-            CStmt::Return(Some(CExpr::Var("t2_2".to_string()))),
+            CStmt::Return(Some(ctx.name_ref("t2_2"))),
         ];
 
         let pruned = ctx.prune_dead_temp_assignments(stmts.clone());
@@ -8599,7 +8628,7 @@ mod tests {
                     op: BinaryOp::Assign,
                     left,
                     right: _,
-                })) if left.as_ref() == &CExpr::Var("t1_1".to_string())
+                })) if left.as_ref() == &ctx.name_ref("t1_1")
             ),
             "t1_1 copy should be pruned"
         );
@@ -8610,25 +8639,25 @@ mod tests {
         let ctx = FoldingContext::new(64);
         let stmts = vec![
             CStmt::Expr(CExpr::assign(
-                CExpr::Var("tmp_ldxn_1".to_string()),
-                CExpr::Var("sym._debug_iomalloc_size".to_string()),
+                ctx.name_ref("tmp_ldxn_1"),
+                ctx.name_ref("sym._debug_iomalloc_size"),
             )),
             CStmt::Expr(CExpr::assign(
-                CExpr::Var("tmp_stxn_1".to_string()),
+                ctx.name_ref("tmp_stxn_1"),
                 CExpr::binary(
                     BinaryOp::Add,
-                    CExpr::Var("sym._debug_iomalloc_size".to_string()),
-                    CExpr::Var("arg1".to_string()),
+                    ctx.name_ref("sym._debug_iomalloc_size"),
+                    ctx.name_ref("arg1"),
                 ),
             )),
-            CStmt::Return(Some(CExpr::Var("arg1".to_string()))),
+            CStmt::Return(Some(ctx.name_ref("arg1"))),
         ];
 
         let pruned = ctx.prune_dead_temp_assignments(stmts.clone());
 
         assert_eq!(
             pruned,
-            vec![CStmt::Return(Some(CExpr::Var("arg1".to_string())))]
+            vec![CStmt::Return(Some(ctx.name_ref("arg1")))]
         );
     }
 
@@ -8638,33 +8667,33 @@ mod tests {
         let call_based_addr = CExpr::binary(
             BinaryOp::Add,
             CExpr::call(
-                CExpr::Var("fcn.1000".to_string()),
-                vec![CExpr::Var("ctx".to_string())],
+                ctx.name_ref("fcn.1000"),
+                vec![ctx.name_ref("ctx")],
             ),
             CExpr::IntLit(50),
         );
         let stmts = vec![
             CStmt::Expr(CExpr::assign(
-                CExpr::Var("tmp_ldwn_1".to_string()),
+                ctx.name_ref("tmp_ldwn_1"),
                 CExpr::deref(call_based_addr.clone()),
             )),
             CStmt::Expr(CExpr::assign(
-                CExpr::Var("tmp_stwn_1".to_string()),
+                ctx.name_ref("tmp_stwn_1"),
                 CExpr::binary(
                     BinaryOp::Add,
                     CExpr::deref(call_based_addr),
-                    CExpr::Var("arg1".to_string()),
+                    ctx.name_ref("arg1"),
                 ),
             )),
             CStmt::Expr(CExpr::assign(
                 CExpr::deref(CExpr::binary(
                     BinaryOp::Add,
-                    CExpr::Var("x0_5".to_string()),
+                    ctx.name_ref("x0_5"),
                     CExpr::IntLit(50),
                 )),
-                CExpr::Var("arg1".to_string()),
+                ctx.name_ref("arg1"),
             )),
-            CStmt::Return(Some(CExpr::Var("x0_5".to_string()))),
+            CStmt::Return(Some(ctx.name_ref("x0_5"))),
         ];
 
         let pruned = ctx.prune_dead_temp_assignments(stmts);
@@ -8688,15 +8717,15 @@ mod tests {
             },
         )]));
         let call = CExpr::call(
-            CExpr::Var("sym._IORWLockUnlock".to_string()),
+            ctx.name_ref("sym._IORWLockUnlock"),
             vec![CExpr::Subscript {
                 base: Box::new(CExpr::UIntLit(0xfffffe0007d21000)),
                 index: Box::new(CExpr::IntLit(367)),
             }],
         );
         let stmts = vec![
-            CStmt::Expr(CExpr::assign(CExpr::Var("x0_8".to_string()), call.clone())),
-            CStmt::Return(Some(CExpr::Var("x0_3".to_string()))),
+            CStmt::Expr(CExpr::assign(ctx.name_ref("x0_8"), call.clone())),
+            CStmt::Return(Some(ctx.name_ref("x0_3"))),
         ];
 
         let pruned = ctx.prune_dead_temp_assignments(stmts);
@@ -8705,7 +8734,7 @@ mod tests {
             pruned,
             vec![
                 CStmt::Expr(call),
-                CStmt::Return(Some(CExpr::Var("x0_3".to_string()))),
+                CStmt::Return(Some(ctx.name_ref("x0_3"))),
             ]
         );
     }
@@ -8744,8 +8773,8 @@ mod tests {
         );
 
         let call = CExpr::call(
-            CExpr::Var("sym.imp.free".to_string()),
-            vec![CExpr::Var("ptr".to_string())],
+            ctx.name_ref("sym.imp.free"),
+            vec![ctx.name_ref("ptr")],
         );
         ctx.state
             .analysis_ctx
@@ -8769,7 +8798,7 @@ mod tests {
             .insert("value_1".to_string(), 1);
         let stmts = vec![
             CStmt::Expr(CExpr::assign(
-                CExpr::Var("value_1".to_string()),
+                ctx.name_ref("value_1"),
                 call.clone(),
             )),
             CStmt::Return(Some(CExpr::IntLit(0))),
@@ -8818,8 +8847,8 @@ mod tests {
         );
 
         let call = CExpr::call(
-            CExpr::Var("sym.imp.free".to_string()),
-            vec![CExpr::Var("ptr".to_string())],
+            ctx.name_ref("sym.imp.free"),
+            vec![ctx.name_ref("ptr")],
         );
         ctx.state
             .analysis_ctx
@@ -8837,7 +8866,7 @@ mod tests {
             .use_counts
             .insert("value_1".to_string(), 1);
         let stmts = vec![
-            CStmt::Expr(CExpr::assign(CExpr::Var("value_1".to_string()), call)),
+            CStmt::Expr(CExpr::assign(ctx.name_ref("value_1"), call)),
             CStmt::Return(Some(CExpr::IntLit(0))),
         ];
 
@@ -8847,8 +8876,8 @@ mod tests {
             pruned,
             vec![
                 CStmt::Expr(CExpr::call(
-                    CExpr::Var("sym.imp.free".to_string()),
-                    vec![CExpr::Var("ptr".to_string())],
+                    ctx.name_ref("sym.imp.free"),
+                    vec![ctx.name_ref("ptr")],
                 )),
                 CStmt::Return(Some(CExpr::IntLit(0))),
             ],
@@ -8872,8 +8901,8 @@ mod tests {
         );
 
         let call = CExpr::call(
-            CExpr::Var("sym.local.rendered_name".to_string()),
-            vec![CExpr::Var("ptr".to_string())],
+            ctx.name_ref("sym.local.rendered_name"),
+            vec![ctx.name_ref("ptr")],
         );
         ctx.state
             .analysis_ctx
@@ -8897,7 +8926,7 @@ mod tests {
             .insert("value_1".to_string(), 1);
         let stmts = vec![
             CStmt::Expr(CExpr::assign(
-                CExpr::Var("value_1".to_string()),
+                ctx.name_ref("value_1"),
                 call.clone(),
             )),
             CStmt::Return(Some(CExpr::IntLit(0))),
@@ -8926,17 +8955,17 @@ mod tests {
             .use_info
             .call_result_source_by_alias
             .insert("x0_3".to_string(), source_call);
-        let call = CExpr::call(CExpr::Var("fcn.1000".to_string()), vec![CExpr::IntLit(16)]);
+        let call = CExpr::call(ctx.name_ref("fcn.1000"), vec![CExpr::IntLit(16)]);
         ctx.state
             .analysis_ctx
             .use_info
             .call_result_exprs
             .insert(source_call, call.clone());
         let stmts = vec![
-            CStmt::Expr(CExpr::assign(CExpr::Var("x0_3".to_string()), call.clone())),
+            CStmt::Expr(CExpr::assign(ctx.name_ref("x0_3"), call.clone())),
             CStmt::Expr(call.clone()),
             CStmt::Expr(call),
-            CStmt::Return(Some(CExpr::Var("x0_3".to_string()))),
+            CStmt::Return(Some(ctx.name_ref("x0_3"))),
         ];
 
         let pruned = ctx.prune_dead_temp_assignments(stmts);
@@ -8945,18 +8974,18 @@ mod tests {
             pruned,
             vec![
                 CStmt::Expr(CExpr::assign(
-                    CExpr::Var("x0_3".to_string()),
-                    CExpr::call(CExpr::Var("fcn.1000".to_string()), vec![CExpr::IntLit(16)]),
+                    ctx.name_ref("x0_3"),
+                    CExpr::call(ctx.name_ref("fcn.1000"), vec![CExpr::IntLit(16)]),
                 )),
                 CStmt::Expr(CExpr::call(
-                    CExpr::Var("fcn.1000".to_string()),
+                    ctx.name_ref("fcn.1000"),
                     vec![CExpr::IntLit(16)]
                 )),
                 CStmt::Expr(CExpr::call(
-                    CExpr::Var("fcn.1000".to_string()),
+                    ctx.name_ref("fcn.1000"),
                     vec![CExpr::IntLit(16)]
                 )),
-                CStmt::Return(Some(CExpr::Var("x0_3".to_string()))),
+                CStmt::Return(Some(ctx.name_ref("x0_3"))),
             ],
             "bare rendered calls do not carry source provenance for deduplication"
         );
@@ -8966,7 +8995,7 @@ mod tests {
     fn test_prune_dead_temp_assignments_drops_low_signal_replayed_call_assignment() {
         let mut ctx = FoldingContext::new(64);
         let source_call = (0x1000, 1);
-        let call = CExpr::call(CExpr::Var("fcn.1000".to_string()), vec![CExpr::IntLit(16)]);
+        let call = CExpr::call(ctx.name_ref("fcn.1000"), vec![CExpr::IntLit(16)]);
         assert!(ctx.is_low_signal_visible_name("v3ea00"));
         assert!(!ctx.is_prunable_dead_binding_target("v3ea00"));
         ctx.state
@@ -8991,7 +9020,7 @@ mod tests {
             .insert("v3ea00".to_string(), 1);
         let stmts = vec![
             CStmt::Expr(CExpr::assign(
-                CExpr::Var("v3ea00".to_string()),
+                ctx.name_ref("v3ea00"),
                 call.clone(),
             )),
             CStmt::Expr(call.clone()),
@@ -9004,7 +9033,7 @@ mod tests {
             pruned,
             vec![
                 CStmt::Expr(CExpr::assign(
-                    CExpr::Var("v3ea00".to_string()),
+                    ctx.name_ref("v3ea00"),
                     call.clone()
                 )),
                 CStmt::Expr(call),
@@ -9017,22 +9046,22 @@ mod tests {
     #[test]
     fn opaque_public_call_arg_sanitizer_hides_raw_tmp_names() {
         let ctx = make_aarch64_ctx();
-        let callee = CExpr::Var("fcn.1000".to_string());
+        let callee = ctx.name_ref("fcn.1000");
 
         let normalized =
-            ctx.normalize_call_arg_expr_for_callee(&callee, CExpr::Var("tmp:2a000".to_string()));
+            ctx.normalize_call_arg_expr_for_callee(&callee, ctx.name_ref("tmp:2a000"));
 
-        assert_eq!(normalized, CExpr::Var("value_2a000".to_string()));
-
-        let normalized =
-            ctx.normalize_call_arg_expr_for_callee(&callee, CExpr::Var("TMP:2A000".to_string()));
-
-        assert_eq!(normalized, CExpr::Var("value_2a000".to_string()));
+        assert_eq!(normalized, ctx.name_ref("value_2a000"));
 
         let normalized =
-            ctx.normalize_call_arg_expr_for_callee(&callee, CExpr::Var("visible_arg".to_string()));
+            ctx.normalize_call_arg_expr_for_callee(&callee, ctx.name_ref("TMP:2A000"));
 
-        assert_eq!(normalized, CExpr::Var("visible_arg".to_string()));
+        assert_eq!(normalized, ctx.name_ref("value_2a000"));
+
+        let normalized =
+            ctx.normalize_call_arg_expr_for_callee(&callee, ctx.name_ref("visible_arg"));
+
+        assert_eq!(normalized, ctx.name_ref("visible_arg"));
     }
 
     #[test]
@@ -9040,18 +9069,18 @@ mod tests {
         let ctx = FoldingContext::new(64);
         let stmts = vec![
             CStmt::Expr(CExpr::assign(
-                CExpr::Var("local_10".to_string()),
-                CExpr::Var("v".to_string()),
+                ctx.name_ref("local_10"),
+                ctx.name_ref("v"),
             )),
             CStmt::Expr(CExpr::assign(
                 CExpr::Member {
                     base: Box::new(CExpr::Subscript {
-                        base: Box::new(CExpr::Var("arr".to_string())),
-                        index: Box::new(CExpr::Var("idx".to_string())),
+                        base: Box::new(ctx.name_ref("arr")),
+                        index: Box::new(ctx.name_ref("idx")),
                     }),
                     member: "f_8".to_string(),
                 },
-                CExpr::Var("local_10".to_string()),
+                ctx.name_ref("local_10"),
             )),
         ];
 
@@ -9066,7 +9095,7 @@ mod tests {
         };
         assert_eq!(
             right.as_ref(),
-            &CExpr::Var("v".to_string()),
+            &ctx.name_ref("v"),
             "autogenerated stack-home param copy should inline into the member store"
         );
 
@@ -9083,11 +9112,11 @@ mod tests {
         let ctx = FoldingContext::new(64);
         let stmts = vec![
             CStmt::Expr(CExpr::assign(
-                CExpr::Var("tmp:1".to_string()),
-                CExpr::Var("global_value".to_string()),
+                ctx.name_ref("tmp:1"),
+                ctx.name_ref("global_value"),
             )),
-            CStmt::Expr(CExpr::call(CExpr::Var("mutate_global".to_string()), vec![])),
-            CStmt::Return(Some(CExpr::Var("tmp:1".to_string()))),
+            CStmt::Expr(CExpr::call(ctx.name_ref("mutate_global"), vec![])),
+            CStmt::Return(Some(ctx.name_ref("tmp:1"))),
         ];
 
         let propagated = ctx.propagate_ephemeral_copies(stmts);
@@ -9096,11 +9125,11 @@ mod tests {
             propagated,
             vec![
                 CStmt::Expr(CExpr::assign(
-                    CExpr::Var("tmp:1".to_string()),
-                    CExpr::Var("global_value".to_string()),
+                    ctx.name_ref("tmp:1"),
+                    ctx.name_ref("global_value"),
                 )),
-                CStmt::Expr(CExpr::call(CExpr::Var("mutate_global".to_string()), vec![])),
-                CStmt::Return(Some(CExpr::Var("tmp:1".to_string()))),
+                CStmt::Expr(CExpr::call(ctx.name_ref("mutate_global"), vec![])),
+                CStmt::Return(Some(ctx.name_ref("tmp:1"))),
             ],
             "copy aliases must not be reused across side-effecting calls"
         );
@@ -9111,8 +9140,8 @@ mod tests {
         let ctx = FoldingContext::new(64);
         let stmts = vec![
             CStmt::Expr(CExpr::assign(
-                CExpr::Var("t1_1".to_string()),
-                CExpr::call(CExpr::Var("foo".to_string()), vec![]),
+                ctx.name_ref("t1_1"),
+                CExpr::call(ctx.name_ref("foo"), vec![]),
             )),
             CStmt::Return(Some(CExpr::IntLit(0))),
         ];
@@ -9130,17 +9159,17 @@ mod tests {
         let ctx = FoldingContext::new(64);
         let stmt = CStmt::Block(vec![
             CStmt::Expr(CExpr::assign(
-                CExpr::Var("t3ea00".to_string()),
+                ctx.name_ref("t3ea00"),
                 CExpr::binary(
                     BinaryOp::Sub,
-                    CExpr::Var("len".to_string()),
+                    ctx.name_ref("len"),
                     CExpr::IntLit(64),
                 ),
             )),
             CStmt::If {
                 cond: CExpr::binary(
                     BinaryOp::Gt,
-                    CExpr::Var("len".to_string()),
+                    ctx.name_ref("len"),
                     CExpr::IntLit(100),
                 ),
                 then_body: Box::new(CStmt::Return(Some(CExpr::IntLit(-1)))),
@@ -9171,13 +9200,13 @@ mod tests {
             stack_var_spec("var_10h", Some(CType::Int(32)), Some("rbp")),
         )]));
         let assignment = CStmt::Expr(CExpr::assign(
-            CExpr::Var("var_10h".to_string()),
+            ctx.name_ref("var_10h"),
             CExpr::binary(
                 BinaryOp::Add,
-                CExpr::Var("var_10h".to_string()),
+                ctx.name_ref("var_10h"),
                 CExpr::Subscript {
-                    base: Box::new(CExpr::Var("arr".to_string())),
-                    index: Box::new(CExpr::Var("i".to_string())),
+                    base: Box::new(ctx.name_ref("arr")),
+                    index: Box::new(ctx.name_ref("i")),
                 },
             ),
         ));
@@ -9196,10 +9225,10 @@ mod tests {
         let ctx = FoldingContext::new(64);
         let stmts = vec![
             CStmt::Expr(CExpr::assign(
-                CExpr::Var("rax_6".to_string()),
+                ctx.name_ref("rax_6"),
                 CExpr::binary(
                     BinaryOp::Add,
-                    CExpr::Var("rax_3".to_string()),
+                    ctx.name_ref("rax_3"),
                     CExpr::IntLit(1),
                 ),
             )),
@@ -9223,8 +9252,8 @@ mod tests {
         let ctx = FoldingContext::new(64);
         let stmts = vec![
             CStmt::Expr(CExpr::assign(
-                CExpr::Var("rax_6".to_string()),
-                CExpr::call(CExpr::Var("foo".to_string()), vec![]),
+                ctx.name_ref("rax_6"),
+                CExpr::call(ctx.name_ref("foo"), vec![]),
             )),
             CStmt::Return(Some(CExpr::IntLit(0))),
         ];
@@ -9242,7 +9271,7 @@ mod tests {
         let mut ctx = make_x86_64_ctx();
         let source_call = (0x3000, 0);
         let call = CExpr::call(
-            CExpr::Var("sym.imp.alloc".to_string()),
+            ctx.name_ref("sym.imp.alloc"),
             vec![CExpr::IntLit(32)],
         );
         ctx.state
@@ -9266,7 +9295,7 @@ mod tests {
             .use_counts
             .insert("RAX_6".to_string(), 1);
         let stmts = vec![
-            CStmt::Expr(CExpr::assign(CExpr::Var("RAX_6".to_string()), call.clone())),
+            CStmt::Expr(CExpr::assign(ctx.name_ref("RAX_6"), call.clone())),
             CStmt::Return(Some(CExpr::IntLit(0))),
         ];
 
@@ -9284,7 +9313,7 @@ mod tests {
         let mut ctx = make_x86_64_ctx();
         let source_call = (0x3000, 1);
         let call = CExpr::call(
-            CExpr::Var("sym.imp.alloc".to_string()),
+            ctx.name_ref("sym.imp.alloc"),
             vec![CExpr::IntLit(32)],
         );
         ctx.state
@@ -9308,7 +9337,7 @@ mod tests {
             .pinned
             .insert("rax_6".to_string());
         let stmts = vec![
-            CStmt::Expr(CExpr::assign(CExpr::Var("RAX_6".to_string()), call.clone())),
+            CStmt::Expr(CExpr::assign(ctx.name_ref("RAX_6"), call.clone())),
             CStmt::Return(Some(CExpr::IntLit(0))),
         ];
 
@@ -9325,7 +9354,7 @@ mod tests {
         let mut ctx = make_x86_64_ctx();
         let source_call = (0x3000, 2);
         let call = CExpr::call(
-            CExpr::Var("sym.imp.alloc".to_string()),
+            ctx.name_ref("sym.imp.alloc"),
             vec![CExpr::IntLit(32)],
         );
         ctx.state
@@ -9344,8 +9373,8 @@ mod tests {
             .call_result_exprs
             .insert(source_call, call.clone());
         let stmts = vec![
-            CStmt::Expr(CExpr::assign(CExpr::Var("RAX_6".to_string()), call.clone())),
-            CStmt::Return(Some(CExpr::Var("rax_6".to_string()))),
+            CStmt::Expr(CExpr::assign(ctx.name_ref("RAX_6"), call.clone())),
+            CStmt::Return(Some(ctx.name_ref("rax_6"))),
         ];
 
         let pruned = ctx.prune_dead_temp_assignments(stmts.clone());
@@ -9361,7 +9390,7 @@ mod tests {
         let mut ctx = make_x86_64_ctx();
         let source_call = (0x3000, 3);
         let call = CExpr::call(
-            CExpr::Var("sym.imp.alloc".to_string()),
+            ctx.name_ref("sym.imp.alloc"),
             vec![CExpr::IntLit(32)],
         );
         ctx.state.analysis_ctx.use_info.call_result_aliases.insert(
@@ -9380,7 +9409,7 @@ mod tests {
             .insert(source_call, call.clone());
         let stmts = vec![
             CStmt::Expr(CExpr::assign(
-                CExpr::Var("value_1".to_string()),
+                ctx.name_ref("value_1"),
                 call.clone(),
             )),
             CStmt::Return(Some(CExpr::IntLit(0))),
@@ -9401,7 +9430,7 @@ mod tests {
         let source_call = (0x3000, 4);
         let source_id = CallSiteId::from(source_call);
         let call = CExpr::call(
-            CExpr::Var("sym.imp.alloc".to_string()),
+            ctx.name_ref("sym.imp.alloc"),
             vec![CExpr::IntLit(64)],
         );
         ctx.state.analysis_ctx.ownership.call_ownership.insert(
@@ -9433,7 +9462,7 @@ mod tests {
             .insert(source_call, call.clone());
         let stmts = vec![
             CStmt::Expr(CExpr::assign(
-                CExpr::Var("value_1".to_string()),
+                ctx.name_ref("value_1"),
                 call.clone(),
             )),
             CStmt::Return(Some(CExpr::IntLit(0))),
@@ -9452,12 +9481,12 @@ mod tests {
         let ctx = FoldingContext::new(64);
         let rhs = CExpr::binary(
             BinaryOp::Add,
-            CExpr::call(CExpr::Var("foo".to_string()), vec![]),
+            CExpr::call(ctx.name_ref("foo"), vec![]),
             CExpr::IntLit(1),
         );
         let stmts = vec![
             CStmt::Expr(CExpr::assign(
-                CExpr::Var("tmp_ldwn_1".to_string()),
+                ctx.name_ref("tmp_ldwn_1"),
                 rhs.clone(),
             )),
             CStmt::Return(Some(CExpr::IntLit(0))),
@@ -9476,19 +9505,19 @@ mod tests {
         let ctx = FoldingContext::new(64);
         let stmts = vec![
             CStmt::Expr(CExpr::assign(
-                CExpr::Var("tmpng_1".to_string()),
-                CExpr::binary(BinaryOp::Lt, CExpr::Var("sp".to_string()), CExpr::IntLit(0)),
+                ctx.name_ref("tmpng_1"),
+                CExpr::binary(BinaryOp::Lt, ctx.name_ref("sp"), CExpr::IntLit(0)),
             )),
             CStmt::Expr(CExpr::assign(
-                CExpr::Var("tmpzr_1".to_string()),
-                CExpr::binary(BinaryOp::Eq, CExpr::Var("sp".to_string()), CExpr::IntLit(0)),
+                ctx.name_ref("tmpzr_1"),
+                CExpr::binary(BinaryOp::Eq, ctx.name_ref("sp"), CExpr::IntLit(0)),
             )),
             CStmt::Return(Some(CExpr::Subscript {
                 base: Box::new(CExpr::cast(
                     CType::ptr(CType::UInt(32)),
-                    CExpr::Var("arg1".to_string()),
+                    ctx.name_ref("arg1"),
                 )),
-                index: Box::new(CExpr::Var("arg2".to_string())),
+                index: Box::new(ctx.name_ref("arg2")),
             })),
         ];
 
@@ -9509,27 +9538,27 @@ mod tests {
         let ctx = FoldingContext::new(64);
         let stmts = vec![
             CStmt::Expr(CExpr::assign(
-                CExpr::Var("local_c".to_string()),
-                CExpr::Var("arg2".to_string()),
+                ctx.name_ref("local_c"),
+                ctx.name_ref("arg2"),
             )),
             CStmt::Expr(CExpr::assign(
-                CExpr::Var("local_10".to_string()),
-                CExpr::Var("arg3".to_string()),
+                ctx.name_ref("local_10"),
+                ctx.name_ref("arg3"),
             )),
             CStmt::Expr(CExpr::assign(
-                CExpr::Var("stack_8".to_string()),
-                CExpr::Var("arg1".to_string()),
+                ctx.name_ref("stack_8"),
+                ctx.name_ref("arg1"),
             )),
             CStmt::Expr(CExpr::assign(
-                CExpr::Var("stack".to_string()),
-                CExpr::Var("arg2".to_string()),
+                ctx.name_ref("stack"),
+                ctx.name_ref("arg2"),
             )),
             CStmt::Return(Some(CExpr::Subscript {
                 base: Box::new(CExpr::cast(
                     CType::ptr(CType::UInt(32)),
-                    CExpr::Var("arg1".to_string()),
+                    ctx.name_ref("arg1"),
                 )),
-                index: Box::new(CExpr::Var("arg2".to_string())),
+                index: Box::new(ctx.name_ref("arg2")),
             })),
         ];
 
@@ -9547,20 +9576,20 @@ mod tests {
         let ctx = FoldingContext::new(64);
         let stmts = vec![
             CStmt::Expr(CExpr::assign(
-                CExpr::Var("x8".to_string()),
+                ctx.name_ref("x8"),
                 CExpr::Member {
-                    base: Box::new(CExpr::Var("arg1".to_string())),
+                    base: Box::new(ctx.name_ref("arg1")),
                     member: "f_30".to_string(),
                 },
             )),
             CStmt::Return(Some(CExpr::binary(
                 BinaryOp::Add,
                 CExpr::Member {
-                    base: Box::new(CExpr::Var("arg1".to_string())),
+                    base: Box::new(ctx.name_ref("arg1")),
                     member: "f_30".to_string(),
                 },
                 CExpr::Member {
-                    base: Box::new(CExpr::Var("arg1".to_string())),
+                    base: Box::new(ctx.name_ref("arg1")),
                     member: "f_0".to_string(),
                 },
             ))),
@@ -9580,7 +9609,7 @@ mod tests {
         let ctx = FoldingContext::new(64);
         let stmts = vec![
             CStmt::Expr(CExpr::assign(
-                CExpr::Var("obj.global_counter".to_string()),
+                ctx.name_ref("obj.global_counter"),
                 CExpr::IntLit(1),
             )),
             CStmt::Return(Some(CExpr::IntLit(0))),
@@ -9599,8 +9628,8 @@ mod tests {
         let ctx = FoldingContext::new(64);
         let stmts = vec![
             CStmt::Expr(CExpr::assign(
-                CExpr::Var("obj.global_counter".to_string()),
-                CExpr::call(CExpr::Var("foo".to_string()), vec![]),
+                ctx.name_ref("obj.global_counter"),
+                CExpr::call(ctx.name_ref("foo"), vec![]),
             )),
             CStmt::Return(Some(CExpr::IntLit(0))),
         ];
@@ -9618,18 +9647,18 @@ mod tests {
         let ctx = FoldingContext::new(64);
         let stmts = vec![
             CStmt::Expr(CExpr::assign(
-                CExpr::Var("eax_2".to_string()),
-                CExpr::Var("arg1".to_string()),
+                ctx.name_ref("eax_2"),
+                ctx.name_ref("arg1"),
             )),
             CStmt::Expr(CExpr::assign(
-                CExpr::Var("eax_3".to_string()),
+                ctx.name_ref("eax_3"),
                 CExpr::binary(
                     BinaryOp::Add,
-                    CExpr::Var("eax_2".to_string()),
-                    CExpr::Var("eax_2".to_string()),
+                    ctx.name_ref("eax_2"),
+                    ctx.name_ref("eax_2"),
                 ),
             )),
-            CStmt::Return(Some(CExpr::Var("eax_3".to_string()))),
+            CStmt::Return(Some(ctx.name_ref("eax_3"))),
         ];
 
         let propagated = ctx.propagate_ephemeral_copies(stmts);
@@ -9648,7 +9677,7 @@ mod tests {
             !pruned.iter().any(|stmt| {
                 matches!(
                     FoldingContext::assignment_target_and_rhs(stmt),
-                    Some((target, _)) if target == "eax_2"
+                    Some((target, _)) if target == { let CExpr::Var(id) = ctx.name_ref("eax_2") else { unreachable!() }; id }
                 )
             }),
             "Dead phi-copy assignment should be removed after propagation"
@@ -9660,14 +9689,14 @@ mod tests {
         let ctx = FoldingContext::new(64);
         let stmts = vec![
             CStmt::Expr(CExpr::assign(
-                CExpr::Var("eax_2".to_string()),
-                CExpr::call(CExpr::Var("foo".to_string()), vec![]),
+                ctx.name_ref("eax_2"),
+                CExpr::call(ctx.name_ref("foo"), vec![]),
             )),
             CStmt::Expr(CExpr::assign(
-                CExpr::Var("eax_3".to_string()),
+                ctx.name_ref("eax_3"),
                 CExpr::binary(
                     BinaryOp::Add,
-                    CExpr::Var("eax_2".to_string()),
+                    ctx.name_ref("eax_2"),
                     CExpr::IntLit(1),
                 ),
             )),
@@ -9690,18 +9719,18 @@ mod tests {
         let ctx = FoldingContext::new(64);
         let stmts = vec![
             CStmt::Expr(CExpr::assign(
-                CExpr::Var("eax_2".to_string()),
-                CExpr::Var("rdi_1".to_string()),
+                ctx.name_ref("eax_2"),
+                ctx.name_ref("rdi_1"),
             )),
             CStmt::Expr(CExpr::assign(
-                CExpr::Var("rdi_1".to_string()),
+                ctx.name_ref("rdi_1"),
                 CExpr::IntLit(42),
             )),
             CStmt::Expr(CExpr::assign(
-                CExpr::Var("eax_3".to_string()),
+                ctx.name_ref("eax_3"),
                 CExpr::binary(
                     BinaryOp::Add,
-                    CExpr::Var("eax_2".to_string()),
+                    ctx.name_ref("eax_2"),
                     CExpr::IntLit(1),
                 ),
             )),
@@ -9724,17 +9753,17 @@ mod tests {
         let ctx = FoldingContext::new(64);
         let stmts = vec![
             CStmt::Expr(CExpr::assign(
-                CExpr::Var("eax_2".to_string()),
+                ctx.name_ref("eax_2"),
                 CExpr::Cast {
                     ty: CType::Int(64),
-                    expr: Box::new(CExpr::Var("arg1".to_string())),
+                    expr: Box::new(ctx.name_ref("arg1")),
                 },
             )),
             CStmt::Expr(CExpr::assign(
-                CExpr::Var("eax_3".to_string()),
+                ctx.name_ref("eax_3"),
                 CExpr::binary(
                     BinaryOp::Add,
-                    CExpr::Var("eax_2".to_string()),
+                    ctx.name_ref("eax_2"),
                     CExpr::IntLit(1),
                 ),
             )),
@@ -9762,13 +9791,13 @@ mod tests {
         let ctx = FoldingContext::new(64);
         let stmts = vec![
             CStmt::Expr(CExpr::assign(
-                CExpr::Var("tmp:base_1".to_string()),
-                CExpr::Var("rdx_2".to_string()),
+                ctx.name_ref("tmp:base_1"),
+                ctx.name_ref("rdx_2"),
             )),
             CStmt::Expr(CExpr::assign(
-                CExpr::Var("eax_3".to_string()),
+                ctx.name_ref("eax_3"),
                 CExpr::PtrMember {
-                    base: Box::new(CExpr::Var("tmp:base_1".to_string())),
+                    base: Box::new(ctx.name_ref("tmp:base_1")),
                     member: "third".to_string(),
                 },
             )),
@@ -9933,8 +9962,8 @@ mod tests {
     fn test_assign_stmt_suppresses_entry_arg_alias_assignment() {
         let ctx = FoldingContext::new(64);
         let stmt = ctx.assign_stmt(
-            CExpr::Var("arg0".to_string()),
-            CExpr::Var("edi".to_string()),
+            ctx.name_ref("arg0"),
+            ctx.name_ref("edi"),
         );
         assert!(
             stmt.is_none(),
@@ -9952,18 +9981,18 @@ mod tests {
 
         let expr = CExpr::binary(
             BinaryOp::And,
-            CExpr::binary(BinaryOp::Ne, CExpr::Var("a".to_string()), CExpr::IntLit(0)),
+            CExpr::binary(BinaryOp::Ne, ctx.name_ref("a"), CExpr::IntLit(0)),
             CExpr::binary(
                 BinaryOp::Eq,
-                CExpr::Var("of_1".to_string()),
-                CExpr::binary(BinaryOp::Lt, CExpr::Var("a".to_string()), CExpr::IntLit(0)),
+                ctx.name_ref("of_1"),
+                CExpr::binary(BinaryOp::Lt, ctx.name_ref("a"), CExpr::IntLit(0)),
             ),
         );
 
         let simplified = ctx.simplify_condition_expr(expr);
         assert_eq!(
             simplified,
-            CExpr::binary(BinaryOp::Gt, CExpr::Var("a".to_string()), CExpr::IntLit(0))
+            CExpr::binary(BinaryOp::Gt, ctx.name_ref("a"), CExpr::IntLit(0))
         );
     }
 
@@ -9977,13 +10006,13 @@ mod tests {
 
         let expr = CExpr::binary(
             BinaryOp::And,
-            CExpr::binary(BinaryOp::Ne, CExpr::Var("a".to_string()), CExpr::IntLit(0)),
+            CExpr::binary(BinaryOp::Ne, ctx.name_ref("a"), CExpr::IntLit(0)),
             CExpr::binary(
                 BinaryOp::Eq,
-                CExpr::Var("of_1".to_string()),
+                ctx.name_ref("of_1"),
                 CExpr::binary(
                     BinaryOp::Lt,
-                    CExpr::cast(CType::Int(32), CExpr::Var("a".to_string())),
+                    CExpr::cast(CType::Int(32), ctx.name_ref("a")),
                     CExpr::cast(CType::Int(32), CExpr::IntLit(0)),
                 ),
             ),
@@ -9992,7 +10021,7 @@ mod tests {
         let simplified = ctx.simplify_condition_expr(expr);
         assert_eq!(
             simplified,
-            CExpr::binary(BinaryOp::Gt, CExpr::Var("a".to_string()), CExpr::IntLit(0))
+            CExpr::binary(BinaryOp::Gt, ctx.name_ref("a"), CExpr::IntLit(0))
         );
     }
 
@@ -10000,11 +10029,11 @@ mod tests {
     fn test_extract_flag_name_requires_strict_token_match() {
         let ctx = FoldingContext::new(64);
         assert_eq!(
-            ctx.extract_of(&CExpr::Var("of_12".to_string())),
+            ctx.extract_of(&ctx.name_ref("of_12")),
             Some("of_12".to_string())
         );
-        assert_eq!(ctx.extract_of(&CExpr::Var("offset_1".to_string())), None);
-        assert_eq!(ctx.extract_of(&CExpr::Var("proof".to_string())), None);
+        assert_eq!(ctx.extract_of(&ctx.name_ref("offset_1")), None);
+        assert_eq!(ctx.extract_of(&ctx.name_ref("proof")), None);
     }
 
     #[test]
@@ -10018,13 +10047,13 @@ mod tests {
 
         let expr = CExpr::binary(
             BinaryOp::Eq,
-            CExpr::Var("of_2".to_string()),
+            ctx.name_ref("of_2"),
             CExpr::binary(
                 BinaryOp::Lt,
                 CExpr::binary(
                     BinaryOp::Sub,
-                    CExpr::Var("a".to_string()),
-                    CExpr::Var("b".to_string()),
+                    ctx.name_ref("a"),
+                    ctx.name_ref("b"),
                 ),
                 CExpr::IntLit(0),
             ),
@@ -10035,8 +10064,8 @@ mod tests {
             simplified,
             CExpr::binary(
                 BinaryOp::Ge,
-                CExpr::Var("a".to_string()),
-                CExpr::Var("b".to_string())
+                ctx.name_ref("a"),
+                ctx.name_ref("b")
             )
         );
     }
@@ -10052,13 +10081,13 @@ mod tests {
 
         let expr = CExpr::binary(
             BinaryOp::Ne,
-            CExpr::Var("of_3".to_string()),
+            ctx.name_ref("of_3"),
             CExpr::binary(
                 BinaryOp::Lt,
                 CExpr::binary(
                     BinaryOp::Sub,
-                    CExpr::Var("a".to_string()),
-                    CExpr::Var("b".to_string()),
+                    ctx.name_ref("a"),
+                    ctx.name_ref("b"),
                 ),
                 CExpr::IntLit(0),
             ),
@@ -10069,8 +10098,8 @@ mod tests {
             simplified,
             CExpr::binary(
                 BinaryOp::Lt,
-                CExpr::Var("a".to_string()),
-                CExpr::Var("b".to_string())
+                ctx.name_ref("a"),
+                ctx.name_ref("b")
             )
         );
     }
@@ -10087,15 +10116,15 @@ mod tests {
             },
         );
 
-        let eq = ctx.simplify_condition_expr(CExpr::Var("zf_7".to_string()));
+        let eq = ctx.simplify_condition_expr(ctx.name_ref("zf_7"));
         let ne =
-            ctx.simplify_condition_expr(CExpr::unary(UnaryOp::Not, CExpr::Var("zf_7".to_string())));
+            ctx.simplify_condition_expr(CExpr::unary(UnaryOp::Not, ctx.name_ref("zf_7")));
 
         assert_eq!(
             eq,
             CExpr::binary(
                 BinaryOp::Eq,
-                CExpr::Var("result".to_string()),
+                ctx.name_ref("result"),
                 CExpr::IntLit(25)
             )
         );
@@ -10103,7 +10132,7 @@ mod tests {
             ne,
             CExpr::binary(
                 BinaryOp::Ne,
-                CExpr::Var("result".to_string()),
+                ctx.name_ref("result"),
                 CExpr::IntLit(25)
             )
         );
@@ -10129,35 +10158,35 @@ mod tests {
             },
         );
 
-        let lt = ctx.simplify_condition_expr(CExpr::Var("cf_1".to_string()));
+        let lt = ctx.simplify_condition_expr(ctx.name_ref("cf_1"));
         let ge =
-            ctx.simplify_condition_expr(CExpr::unary(UnaryOp::Not, CExpr::Var("cf_1".to_string())));
+            ctx.simplify_condition_expr(CExpr::unary(UnaryOp::Not, ctx.name_ref("cf_1")));
         let le = ctx.simplify_condition_expr(CExpr::binary(
             BinaryOp::Or,
-            CExpr::Var("cf_1".to_string()),
-            CExpr::Var("zf_1".to_string()),
+            ctx.name_ref("cf_1"),
+            ctx.name_ref("zf_1"),
         ));
         let gt = ctx.simplify_condition_expr(CExpr::binary(
             BinaryOp::And,
-            CExpr::unary(UnaryOp::Not, CExpr::Var("cf_1".to_string())),
-            CExpr::unary(UnaryOp::Not, CExpr::Var("zf_1".to_string())),
+            CExpr::unary(UnaryOp::Not, ctx.name_ref("cf_1")),
+            CExpr::unary(UnaryOp::Not, ctx.name_ref("zf_1")),
         ));
 
         assert_eq!(
             lt,
-            CExpr::binary(BinaryOp::Lt, CExpr::Var("x".to_string()), CExpr::IntLit(10))
+            CExpr::binary(BinaryOp::Lt, ctx.name_ref("x"), CExpr::IntLit(10))
         );
         assert_eq!(
             ge,
-            CExpr::binary(BinaryOp::Ge, CExpr::Var("x".to_string()), CExpr::IntLit(10))
+            CExpr::binary(BinaryOp::Ge, ctx.name_ref("x"), CExpr::IntLit(10))
         );
         assert_eq!(
             le,
-            CExpr::binary(BinaryOp::Le, CExpr::Var("x".to_string()), CExpr::IntLit(10))
+            CExpr::binary(BinaryOp::Le, ctx.name_ref("x"), CExpr::IntLit(10))
         );
         assert_eq!(
             gt,
-            CExpr::binary(BinaryOp::Gt, CExpr::Var("x".to_string()), CExpr::IntLit(10))
+            CExpr::binary(BinaryOp::Gt, ctx.name_ref("x"), CExpr::IntLit(10))
         );
     }
 
@@ -10183,15 +10212,15 @@ mod tests {
 
         let le = ctx.simplify_condition_expr(CExpr::binary(
             BinaryOp::Or,
-            CExpr::Var("cf_1".to_string()),
-            CExpr::Var("zf_1".to_string()),
+            ctx.name_ref("cf_1"),
+            ctx.name_ref("zf_1"),
         ));
         let gt = ctx.simplify_condition_expr(CExpr::unary(
             UnaryOp::Not,
             CExpr::binary(
                 BinaryOp::Or,
-                CExpr::Var("cf_1".to_string()),
-                CExpr::Var("zf_1".to_string()),
+                ctx.name_ref("cf_1"),
+                ctx.name_ref("zf_1"),
             ),
         ));
 
@@ -10199,7 +10228,7 @@ mod tests {
             le,
             CExpr::binary(
                 BinaryOp::Le,
-                CExpr::Var("len".to_string()),
+                ctx.name_ref("len"),
                 CExpr::IntLit(100)
             )
         );
@@ -10207,7 +10236,7 @@ mod tests {
             gt,
             CExpr::binary(
                 BinaryOp::Gt,
-                CExpr::Var("len".to_string()),
+                ctx.name_ref("len"),
                 CExpr::IntLit(100)
             )
         );
@@ -10252,7 +10281,7 @@ mod tests {
             rhs,
             CExpr::binary(
                 BinaryOp::Ne,
-                CExpr::Var("arg0".to_string()),
+                ctx.name_ref("arg0"),
                 CExpr::IntLit(37)
             )
         );
@@ -10277,11 +10306,11 @@ mod tests {
 
         let expr = CExpr::binary(
             BinaryOp::And,
-            CExpr::binary(BinaryOp::Ne, CExpr::Var("x".to_string()), CExpr::IntLit(0)),
+            CExpr::binary(BinaryOp::Ne, ctx.name_ref("x"), CExpr::IntLit(0)),
             CExpr::binary(
                 BinaryOp::Eq,
-                CExpr::Var("of_4".to_string()),
-                CExpr::binary(BinaryOp::Lt, CExpr::Var("y".to_string()), CExpr::IntLit(0)),
+                ctx.name_ref("of_4"),
+                CExpr::binary(BinaryOp::Lt, ctx.name_ref("y"), CExpr::IntLit(0)),
             ),
         );
 
@@ -10357,8 +10386,8 @@ mod tests {
 
         let mut visited = HashSet::new();
         let resolved =
-            ctx.resolve_predicate_operand(&CExpr::Var(loaded.display_name()), 0, &mut visited);
-        assert_eq!(resolved, CExpr::Var("arg0".to_string()));
+            ctx.resolve_predicate_operand(&CExpr::Var({ let CExpr::Var(id) = ctx.name_ref(&loaded.display_name()) else { unreachable!() }; id }), 0, &mut visited);
+        assert_eq!(resolved, ctx.name_ref("arg0"));
     }
 
     #[test]
@@ -10370,7 +10399,7 @@ mod tests {
         // a field load into a callee-saved register pass as an epilogue pop.
         ctx.state.analysis_ctx.use_info.definitions.insert(
             addr.display_name(),
-            CExpr::binary(BinaryOp::Sub, CExpr::Var("rsp".to_string()), CExpr::IntLit(0x20)),
+            CExpr::binary(BinaryOp::Sub, ctx.name_ref("rsp"), CExpr::IntLit(0x20)),
         );
         ctx.state
             .analysis_ctx
@@ -10403,7 +10432,7 @@ mod tests {
         let field = make_var("tmp:field", 1, 8);
         ctx.state.analysis_ctx.use_info.definitions.insert(
             field.display_name(),
-            CExpr::binary(BinaryOp::Add, CExpr::Var("RBX_1".to_string()), CExpr::IntLit(0x38)),
+            CExpr::binary(BinaryOp::Add, ctx.name_ref("RBX_1"), CExpr::IntLit(0x38)),
         );
         assert!(!ctx.is_stack_frame_op(&SSAOp::Load {
             dst: make_var("RBX", 2, 8),
@@ -10445,7 +10474,7 @@ mod tests {
         assert!(
             cond == CExpr::binary(
                 BinaryOp::Ne,
-                CExpr::Var("rax_1".to_string()),
+                ctx.name_ref("rax_1"),
                 CExpr::IntLit(0),
             ) || matches!(
                 cond,
@@ -10530,7 +10559,7 @@ mod tests {
             branch_cond,
             CExpr::binary(
                 BinaryOp::Eq,
-                CExpr::Var(first_owner.display_name().to_ascii_lowercase()),
+                CExpr::Var({ let CExpr::Var(id) = ctx.name_ref(&first_owner.display_name()) else { unreachable!() }; id }.to_ascii_lowercase()),
                 CExpr::IntLit(0),
             ),
             "second-call null check must not collapse to the first call owner"
@@ -10539,7 +10568,7 @@ mod tests {
             branch_cond
                 == CExpr::binary(
                     BinaryOp::Eq,
-                    CExpr::Var(second_owner.display_name().to_ascii_lowercase()),
+                    CExpr::Var({ let CExpr::Var(id) = ctx.name_ref(&second_owner.display_name()) else { unreachable!() }; id }.to_ascii_lowercase()),
                     CExpr::IntLit(0),
                 )
                 || matches!(
@@ -10563,7 +10592,7 @@ mod tests {
         );
         assert_ne!(
             ctx.get_expr(&second_owner),
-            CExpr::Var("arg1".to_string()),
+            ctx.name_ref("arg1"),
             "second call owner expression must not resolve to entry arg; expr={:?}; cond_expr={:?}; defs={:?}; formatted={:?}; semantic={:?}; aliases={:?}; copy_sources={:?}",
             ctx.get_expr(&second_owner),
             ctx.get_expr(&cond),
@@ -10659,7 +10688,7 @@ mod tests {
             }),
         );
         let poisoned_call = CExpr::call(
-            CExpr::Var("sym.local_two_arg".to_string()),
+            ctx.name_ref("sym.local_two_arg"),
             vec![CExpr::IntLit(16)],
         );
         ctx.state
@@ -10696,8 +10725,8 @@ mod tests {
     ) -> Option<CExpr> {
         let mut ctx = make_aarch64_ctx();
         let source_call = (0x1000, 0);
-        let source_expr = CExpr::call(CExpr::Var("fcn.1000".to_string()), vec![source_arg]);
-        let definition_expr = CExpr::call(CExpr::Var("fcn.1000".to_string()), vec![definition_arg]);
+        let source_expr = CExpr::call(ctx.name_ref("fcn.1000"), vec![source_arg]);
+        let definition_expr = CExpr::call(ctx.name_ref("fcn.1000"), vec![definition_arg]);
         ctx.state
             .analysis_ctx
             .use_info
@@ -10734,11 +10763,11 @@ mod tests {
         let mut ctx = make_aarch64_ctx();
         let source_call = (0x1000, 0);
         let source_expr = CExpr::call(
-            CExpr::Var("fcn.1000".to_string()),
+            ctx.name_ref("fcn.1000"),
             vec![CExpr::IntLit(1), CExpr::IntLit(2)],
         );
         let definition_expr =
-            CExpr::call(CExpr::Var("fcn.1000".to_string()), vec![CExpr::IntLit(1)]);
+            CExpr::call(ctx.name_ref("fcn.1000"), vec![CExpr::IntLit(1)]);
         ctx.state
             .analysis_ctx
             .use_info
@@ -10764,10 +10793,11 @@ mod tests {
 
     #[test]
     fn call_owner_lookup_rejects_temporary_public_value_alias_args_without_certificate() {
+        let symbols = test_table();
         assert_eq!(
             source_backed_matching_definition_without_certificate(
-                CExpr::Var("value_2a000".to_string()),
-                CExpr::Var("tmp:2a000".to_string()),
+                crate::symbol::var_ref(&symbols, "value_2a000"),
+                crate::symbol::var_ref(&symbols, "tmp:2a000"),
             ),
             None,
             "temporary SSA/public value equivalence is not call-result owner evidence"
@@ -10776,14 +10806,15 @@ mod tests {
 
     #[test]
     fn call_owner_lookup_rejects_binary_arg_matching_without_certificate() {
+        let symbols = test_table();
         let source_arg = CExpr::binary(
             BinaryOp::Add,
-            CExpr::Var("value_2a000".to_string()),
+            crate::symbol::var_ref(&symbols, "value_2a000"),
             CExpr::IntLit(1),
         );
         let matching_arg = CExpr::binary(
             BinaryOp::Add,
-            CExpr::Var("tmp:2a000".to_string()),
+            crate::symbol::var_ref(&symbols, "tmp:2a000"),
             CExpr::IntLit(1),
         );
         assert_eq!(
@@ -10794,7 +10825,7 @@ mod tests {
 
         let wrong_operator = CExpr::binary(
             BinaryOp::Sub,
-            CExpr::Var("tmp:2a000".to_string()),
+            crate::symbol::var_ref(&symbols, "tmp:2a000"),
             CExpr::IntLit(1),
         );
         assert_eq!(
@@ -10808,7 +10839,7 @@ mod tests {
 
         let wrong_left = CExpr::binary(
             BinaryOp::Add,
-            CExpr::Var("other".to_string()),
+            crate::symbol::var_ref(&symbols, "other"),
             CExpr::IntLit(1),
         );
         assert_eq!(
@@ -10819,7 +10850,7 @@ mod tests {
 
         let wrong_right = CExpr::binary(
             BinaryOp::Add,
-            CExpr::Var("tmp:2a000".to_string()),
+            crate::symbol::var_ref(&symbols, "tmp:2a000"),
             CExpr::IntLit(2),
         );
         assert_eq!(
@@ -10831,18 +10862,19 @@ mod tests {
 
     #[test]
     fn call_owner_lookup_rejects_cast_and_paren_call_args_without_certificate() {
+        let symbols = test_table();
         assert_eq!(
             source_backed_matching_definition_without_certificate(
-                CExpr::Var("value_2a000".to_string()),
-                CExpr::cast(CType::Int(64), CExpr::Var("tmp:2a000".to_string())),
+                crate::symbol::var_ref(&symbols, "value_2a000"),
+                CExpr::cast(CType::Int(64), crate::symbol::var_ref(&symbols, "tmp:2a000")),
             ),
             None,
             "casts around matching call args are not ownership evidence"
         );
         assert_eq!(
             source_backed_matching_definition_without_certificate(
-                CExpr::Var("value_2a000".to_string()),
-                CExpr::Paren(Box::new(CExpr::Var("tmp:2a000".to_string()))),
+                crate::symbol::var_ref(&symbols, "value_2a000"),
+                CExpr::Paren(Box::new(crate::symbol::var_ref(&symbols, "tmp:2a000"))),
             ),
             None,
             "parens around matching call args are not ownership evidence"
@@ -10853,7 +10885,7 @@ mod tests {
     fn call_owner_lookup_rejects_source_backed_matching_register_definition_without_certificate() {
         let mut ctx = make_aarch64_ctx();
         let source_call = (0x1000, 0);
-        let helper_call = CExpr::call(CExpr::Var("fcn.1000".to_string()), vec![CExpr::IntLit(16)]);
+        let helper_call = CExpr::call(ctx.name_ref("fcn.1000"), vec![CExpr::IntLit(16)]);
         ctx.state
             .analysis_ctx
             .use_info
@@ -10898,7 +10930,7 @@ mod tests {
             let source_call = (0x1000 + idx as u64, 0);
             ctx.state.analysis_ctx.use_info.call_result_exprs.insert(
                 source_call,
-                CExpr::call(CExpr::Var(callee.to_string()), vec![]),
+                CExpr::call(CExpr::Var({ let CExpr::Var(id) = ctx.name_ref(&callee.to_string()) else { unreachable!() }; id }), vec![]),
             );
 
             assert_eq!(
@@ -10920,7 +10952,7 @@ mod tests {
         )]));
         ctx.state.analysis_ctx.use_info.call_result_exprs.insert(
             source_call,
-            CExpr::call(CExpr::Var("sym.helper".to_string()), vec![]),
+            CExpr::call(ctx.name_ref("sym.helper"), vec![]),
         );
 
         assert!(
@@ -10933,7 +10965,7 @@ mod tests {
         install_callsite_resolution(&mut ctx, source_call, 0x401000, "sym.imp.helper", None);
         ctx.state.analysis_ctx.use_info.call_result_exprs.insert(
             source_call,
-            CExpr::call(CExpr::Var("sym.local_wrapper".to_string()), vec![]),
+            CExpr::call(ctx.name_ref("sym.local_wrapper"), vec![]),
         );
 
         assert!(
@@ -10949,7 +10981,7 @@ mod tests {
         install_callsite_resolution(&mut ctx, source_call, 0x401000, "sym.local.internal", None);
         ctx.state.analysis_ctx.use_info.call_result_exprs.insert(
             source_call,
-            CExpr::call(CExpr::Var("sym.local.internal".to_string()), Vec::new()),
+            CExpr::call(ctx.name_ref("sym.local.internal"), Vec::new()),
         );
         ctx.state
             .analysis_ctx
@@ -10988,7 +11020,7 @@ mod tests {
         install_callsite_resolution(&mut ctx, source_call, 0x401050, "sym.local.internal", None);
         ctx.state.analysis_ctx.use_info.call_result_exprs.insert(
             source_call,
-            CExpr::call(CExpr::Var("sym.local.internal".to_string()), Vec::new()),
+            CExpr::call(ctx.name_ref("sym.local.internal"), Vec::new()),
         );
         ctx.state
             .analysis_ctx
@@ -11018,7 +11050,7 @@ mod tests {
         assert_eq!(
             ctx.materializable_call_result_expr_for_call_expr(
                 source_call,
-                &CExpr::call(CExpr::Var("sym.local.internal".to_string()), Vec::new()),
+                &CExpr::call(ctx.name_ref("sym.local.internal"), Vec::new()),
             ),
             None
         );
@@ -11111,7 +11143,7 @@ mod tests {
             call_view_by_site: BTreeMap::from([(
                 source_call,
                 crate::analysis::PreparedCallView {
-                    result_owner: Some(CExpr::Var("helper_result".to_string())),
+                    result_owner: Some(ctx.name_ref("helper_result")),
                     ..crate::analysis::PreparedCallView::default()
                 },
             )]),
@@ -11186,7 +11218,7 @@ mod tests {
             addr.display_name(),
             CExpr::binary(
                 BinaryOp::Add,
-                CExpr::Var("rbp".to_string()),
+                ctx.name_ref("rbp"),
                 CExpr::IntLit(-8),
             ),
         );
@@ -11208,7 +11240,7 @@ mod tests {
             call_view_by_site: BTreeMap::from([(
                 source_call,
                 crate::analysis::PreparedCallView {
-                    result_owner: Some(CExpr::Var("RAX_1".to_string())),
+                    result_owner: Some(ctx.name_ref("RAX_1")),
                     ..crate::analysis::PreparedCallView::default()
                 },
             )]),
@@ -11226,7 +11258,7 @@ mod tests {
             "rejected prepared owner names must not authorize visible source-call lookup"
         );
         assert_eq!(
-            ctx.recovered_owned_call_result_definition_rhs_for_visible_name("RAX_1"),
+            ctx.recovered_owned_call_result_definition_rhs_for_visible_name({ let CExpr::Var(id) = ctx.name_ref("RAX_1") else { unreachable!() }; id }),
             None,
             "rejected return-register owner names must not synthesize executable call replay"
         );
@@ -11235,10 +11267,10 @@ mod tests {
     #[test]
     fn raw_import_name_hints_do_not_authorize_imported_call_policy() {
         let mut ctx = make_aarch64_ctx();
-        assert!(!ctx.is_imported_call_target(&CExpr::Var("sym.imp.printf".to_string())));
-        assert!(!ctx.is_imported_call_target(&CExpr::Var("imp.printf".to_string())));
-        assert!(!ctx.is_imported_call_target(&CExpr::Var("sym.helper".to_string())));
-        assert!(!ctx.is_imported_call_target(&CExpr::Var("fcn.401000".to_string())));
+        assert!(!ctx.is_imported_call_target(&ctx.name_ref("sym.imp.printf")));
+        assert!(!ctx.is_imported_call_target(&ctx.name_ref("imp.printf")));
+        assert!(!ctx.is_imported_call_target(&ctx.name_ref("sym.helper")));
+        assert!(!ctx.is_imported_call_target(&ctx.name_ref("fcn.401000")));
 
         ctx.set_known_function_signatures(HashMap::from([(
             "plain_helper".to_string(),
@@ -11249,8 +11281,8 @@ mod tests {
             },
         )]));
 
-        assert!(!ctx.is_imported_call_target(&CExpr::Var("plain_helper".to_string())));
-        assert!(!ctx.is_imported_call_target(&CExpr::Var("other_helper".to_string())));
+        assert!(!ctx.is_imported_call_target(&ctx.name_ref("plain_helper")));
+        assert!(!ctx.is_imported_call_target(&ctx.name_ref("other_helper")));
     }
 
     #[test]
@@ -11350,6 +11382,7 @@ mod tests {
     #[test]
     fn call_source_proof_raw_owner_recovery_rejects_alias_owner_without_function_facts() {
         fn seed_owner(ctx: &mut FoldingContext<'_>, source_call: (u64, usize), alias: &str) {
+            let symbols = test_table();
             ctx.state
                 .analysis_ctx
                 .use_info
@@ -11368,8 +11401,8 @@ mod tests {
         }
 
         let helper_call = CExpr::call(
-            CExpr::Var("sym.imp.helper".to_string()),
-            vec![CExpr::Var("arg1".to_string())],
+            CExpr::Var(symbols.borrow_mut().declare_or_reuse("sym.imp.helper")),
+            vec![CExpr::Var(symbols.borrow_mut().declare_or_reuse("arg1"))],
         );
 
         let mut exact_ctx = make_aarch64_ctx();
@@ -11411,11 +11444,11 @@ mod tests {
         );
 
         let unresolved_candidate = CExpr::call(
-            CExpr::deref(CExpr::Var("fp_a".to_string())),
+            CExpr::deref(CExpr::Var(symbols.borrow_mut().declare_or_reuse("fp_a"))),
             vec![CExpr::IntLit(1)],
         );
         let unresolved_observed = CExpr::call(
-            CExpr::deref(CExpr::Var("fp_b".to_string())),
+            CExpr::deref(CExpr::Var(symbols.borrow_mut().declare_or_reuse("fp_b"))),
             vec![CExpr::IntLit(1)],
         );
         let mut unresolved_ctx = make_aarch64_ctx();
@@ -12949,8 +12982,8 @@ mod tests {
             expr,
             &CExpr::binary(
                 BinaryOp::Div,
-                CExpr::Var("a".to_string()),
-                CExpr::Var("b".to_string())
+                ctx.name_ref("a"),
+                ctx.name_ref("b")
             )
         );
         assert!(
@@ -13040,8 +13073,8 @@ mod tests {
             expr,
             &CExpr::binary(
                 BinaryOp::Div,
-                CExpr::Var("a".to_string()),
-                CExpr::Var("b".to_string())
+                ctx.name_ref("a"),
+                ctx.name_ref("b")
             )
         );
     }
@@ -13167,7 +13200,7 @@ mod tests {
             ret.display_name(),
             CExpr::Deref(Box::new(CExpr::binary(
                 BinaryOp::Add,
-                CExpr::Var("rbp".to_string()),
+                ctx.name_ref("rbp"),
                 CExpr::IntLit(0),
             ))),
         );
@@ -13195,7 +13228,7 @@ mod tests {
             .analysis_ctx
             .use_info
             .definitions
-            .insert(ret.display_name(), CExpr::Var("stack".to_string()));
+            .insert(ret.display_name(), ctx.name_ref("stack"));
         ctx.analyze_block(&block);
         let stmts = ctx.fold_block(&block, block.addr);
 
@@ -13221,12 +13254,12 @@ mod tests {
             .analysis_ctx
             .use_info
             .definitions
-            .insert(ret.display_name(), CExpr::Var("rax_0".to_string()));
+            .insert(ret.display_name(), ctx.name_ref("rax_0"));
         ctx.state
             .analysis_ctx
             .use_info
             .definitions
-            .insert("resolved_1".to_string(), CExpr::Var("arg1".to_string()));
+            .insert("resolved_1".to_string(), ctx.name_ref("arg1"));
         ctx.state.analysis_ctx.use_info.forwarded_values.insert(
             ret.display_name(),
             crate::analysis::ValueProvenance {
@@ -13243,7 +13276,7 @@ mod tests {
         };
         assert_eq!(
             expr,
-            &CExpr::Var("arg1".to_string()),
+            &ctx.name_ref("arg1"),
             "return selection should prefer the semantic forwarded value over the unresolved return register"
         );
     }
@@ -13609,8 +13642,8 @@ mod tests {
             ret.display_name(),
             CExpr::binary(
                 BinaryOp::Add,
-                CExpr::Var(load_first.display_name()),
-                CExpr::Var(load_second.display_name()),
+                CExpr::Var({ let CExpr::Var(id) = ctx.name_ref(&load_first.display_name()) else { unreachable!() }; id }),
+                CExpr::Var({ let CExpr::Var(id) = ctx.name_ref(&load_second.display_name()) else { unreachable!() }; id }),
             ),
         );
 
@@ -14155,17 +14188,17 @@ mod tests {
         let inner_access = ctx.debug_render_memory_access_from_visible_expr(
             &CExpr::binary(
                 BinaryOp::Add,
-                CExpr::Var("arg1".to_string()),
+                ctx.name_ref("arg1"),
                 CExpr::binary(
                     BinaryOp::Mul,
                     CExpr::binary(
                         BinaryOp::Sub,
                         CExpr::binary(
                             BinaryOp::BitXor,
-                            CExpr::Var("arg4".to_string()),
-                            CExpr::Var("arg4".to_string()),
+                            ctx.name_ref("arg4"),
+                            ctx.name_ref("arg4"),
                         ),
-                        CExpr::Var("arg2".to_string()),
+                        ctx.name_ref("arg2"),
                     ),
                     CExpr::IntLit(4),
                 ),
@@ -14174,34 +14207,34 @@ mod tests {
         );
         let normalized = ctx.debug_normalized_addr_from_visible_expr(&CExpr::binary(
             BinaryOp::Add,
-            CExpr::Var("arg1".to_string()),
+            ctx.name_ref("arg1"),
             CExpr::binary(
                 BinaryOp::Mul,
                 CExpr::binary(
                     BinaryOp::Sub,
                     CExpr::binary(
                         BinaryOp::BitXor,
-                        CExpr::Var("arg4".to_string()),
-                        CExpr::Var("arg4".to_string()),
+                        ctx.name_ref("arg4"),
+                        ctx.name_ref("arg4"),
                     ),
-                    CExpr::Var("arg2".to_string()),
+                    ctx.name_ref("arg2"),
                 ),
                 CExpr::IntLit(4),
             ),
         ));
         let canonical = ctx.debug_canonicalize_visible_address_expr(&CExpr::binary(
             BinaryOp::Add,
-            CExpr::Var("arg1".to_string()),
+            ctx.name_ref("arg1"),
             CExpr::binary(
                 BinaryOp::Mul,
                 CExpr::binary(
                     BinaryOp::Sub,
                     CExpr::binary(
                         BinaryOp::BitXor,
-                        CExpr::Var("arg4".to_string()),
-                        CExpr::Var("arg4".to_string()),
+                        ctx.name_ref("arg4"),
+                        ctx.name_ref("arg4"),
                     ),
-                    CExpr::Var("arg2".to_string()),
+                    ctx.name_ref("arg2"),
                 ),
                 CExpr::IntLit(4),
             ),
@@ -14211,13 +14244,13 @@ mod tests {
             CExpr::binary(
                 BinaryOp::Sub,
                 CExpr::IntLit(0),
-                CExpr::Var("arg2".to_string()),
+                ctx.name_ref("arg2"),
             ),
             CExpr::IntLit(4),
         ));
         let base_norm =
-            ctx.debug_normalized_addr_from_visible_expr(&CExpr::Var("arg1".to_string()));
-        let idx_norm = ctx.debug_normalized_addr_from_visible_expr(&CExpr::Var("arg2".to_string()));
+            ctx.debug_normalized_addr_from_visible_expr(&ctx.name_ref("arg1"));
+        let idx_norm = ctx.debug_normalized_addr_from_visible_expr(&ctx.name_ref("arg2"));
         let arg1_ssa = ctx.debug_ssa_var_for_visible_name("arg1");
         let arg2_ssa = ctx.debug_ssa_var_for_visible_name("arg2");
         let arg4_ssa = ctx.debug_ssa_var_for_visible_name("arg4");
@@ -14379,24 +14412,24 @@ mod tests {
             "ecx".to_string(),
             CExpr::binary(
                 BinaryOp::BitXor,
-                CExpr::Var("ecx".to_string()),
-                CExpr::Var("ecx".to_string()),
+                ctx.name_ref("ecx"),
+                ctx.name_ref("ecx"),
             ),
         );
 
         let expr = CExpr::binary(
             BinaryOp::Add,
-            CExpr::Var("arg1".to_string()),
+            ctx.name_ref("arg1"),
             CExpr::binary(
                 BinaryOp::Mul,
                 CExpr::binary(
                     BinaryOp::Sub,
                     CExpr::binary(
                         BinaryOp::BitXor,
-                        CExpr::Var("ecx".to_string()),
-                        CExpr::Var("ecx".to_string()),
+                        ctx.name_ref("ecx"),
+                        ctx.name_ref("ecx"),
                     ),
-                    CExpr::Var("arg2".to_string()),
+                    ctx.name_ref("arg2"),
                 ),
                 CExpr::IntLit(4),
             ),
@@ -14439,13 +14472,13 @@ mod tests {
         );
         let raw = CExpr::Deref(Box::new(CExpr::binary(
             BinaryOp::Add,
-            CExpr::Var("arg1".to_string()),
+            ctx.name_ref("arg1"),
             CExpr::binary(
                 BinaryOp::Mul,
                 CExpr::binary(
                     BinaryOp::Sub,
                     CExpr::IntLit(0),
-                    CExpr::Var("arg2".to_string()),
+                    ctx.name_ref("arg2"),
                 ),
                 CExpr::IntLit(4),
             ),
@@ -14681,7 +14714,7 @@ mod tests {
 
         let raw = CExpr::Deref(Box::new(CExpr::binary(
             BinaryOp::Add,
-            CExpr::Var("arg1".to_string()),
+            ctx.name_ref("arg1"),
             CExpr::IntLit(0x30),
         )));
         let semantic = ctx.debug_semanticize_visible_expr(&raw);
@@ -16041,8 +16074,8 @@ mod tests {
             Some(&CExpr::IntLit(1)),
             "usage path constant-one source should survive analysis"
         );
-        assert_eq!(return_expr, &CExpr::Var("tretcopy_1".to_string()));
-        assert_ne!(return_expr, &CExpr::Var("argc".to_string()));
+        assert_eq!(return_expr, &ctx.name_ref("tretcopy_1"));
+        assert_ne!(return_expr, &ctx.name_ref("argc"));
     }
 
     #[test]
@@ -16611,7 +16644,7 @@ mod tests {
                 BinaryOp::Add,
                 CExpr::binary(
                     BinaryOp::Shl,
-                    CExpr::Var("arg0".to_string()),
+                    ctx.name_ref("arg0"),
                     CExpr::IntLit(1),
                 ),
                 CExpr::IntLit(5),
@@ -16620,7 +16653,7 @@ mod tests {
         );
         let expected_named_local = CExpr::binary(
             BinaryOp::Ne,
-            CExpr::Var("local_c".to_string()),
+            ctx.name_ref("local_c"),
             CExpr::IntLit(25),
         );
         assert!(
@@ -16868,8 +16901,8 @@ mod tests {
             cond,
             CExpr::binary(
                 BinaryOp::Ne,
-                CExpr::Var("arg0".to_string()),
-                CExpr::Var("arg1".to_string()),
+                ctx.name_ref("arg0"),
+                ctx.name_ref("arg1"),
             )
         );
 
@@ -16881,8 +16914,8 @@ mod tests {
         let Some(CStmt::Return(Some(else_expr))) = else_stmts.last() else {
             panic!("else block should fold to a scalar return, got {else_stmts:?}");
         };
-        assert_eq!(then_expr, &CExpr::Var("arg0".to_string()));
-        assert_eq!(else_expr, &CExpr::Var("arg1".to_string()));
+        assert_eq!(then_expr, &ctx.name_ref("arg0"));
+        assert_eq!(else_expr, &ctx.name_ref("arg1"));
     }
 
     #[test]
@@ -17388,19 +17421,19 @@ mod tests {
             cond,
             CExpr::binary(
                 BinaryOp::Ne,
-                CExpr::Var("arg0".to_string()),
-                CExpr::Var("arg1".to_string()),
+                ctx.name_ref("arg0"),
+                ctx.name_ref("arg1"),
             )
         );
         let then_stmts = ctx.fold_block(func.get_block(0x100001082).expect("then"), 0x100001082);
         let else_stmts = ctx.fold_block(func.get_block(0x10000107a).expect("else"), 0x10000107a);
         assert_eq!(
             then_stmts,
-            vec![CStmt::Return(Some(CExpr::Var("arg0".to_string())))]
+            vec![CStmt::Return(Some(ctx.name_ref("arg0")))]
         );
         assert_eq!(
             else_stmts,
-            vec![CStmt::Return(Some(CExpr::Var("arg1".to_string())))]
+            vec![CStmt::Return(Some(ctx.name_ref("arg1")))]
         );
     }
 
@@ -17428,15 +17461,15 @@ mod tests {
 
         let raw_stack_load = CExpr::Deref(Box::new(CExpr::binary(
             BinaryOp::Add,
-            CExpr::Var("rbp".to_string()),
+            ctx.name_ref("rbp"),
             CExpr::IntLit(-8),
         )));
         let raw_return_stack_load = CExpr::Deref(Box::new(CExpr::binary(
             BinaryOp::Add,
-            CExpr::Var("rbp".to_string()),
+            ctx.name_ref("rbp"),
             CExpr::IntLit(-12),
         )));
-        let scalar_arg1 = CExpr::Var("arg1".to_string());
+        let scalar_arg1 = ctx.name_ref("arg1");
         assert_eq!(
             ctx.debug_choose_scalar_predicate_expr(
                 Some(raw_stack_load.clone()),
@@ -17446,16 +17479,16 @@ mod tests {
         );
         assert_eq!(
             ctx.debug_choose_scalar_predicate_expr(
-                Some(CExpr::AddrOf(Box::new(CExpr::Var("var_8h".to_string())))),
+                Some(CExpr::AddrOf(Box::new(ctx.name_ref("var_8h")))),
                 Some(scalar_arg1.clone()),
             ),
             Some(scalar_arg1.clone())
         );
 
-        let scalar_arg2 = CExpr::Var("arg2".to_string());
+        let scalar_arg2 = ctx.name_ref("arg2");
         assert_eq!(
             ctx.debug_choose_scalar_return_expr(
-                Some(CExpr::AddrOf(Box::new(CExpr::Var("var_ch".to_string())))),
+                Some(CExpr::AddrOf(Box::new(ctx.name_ref("var_ch")))),
                 Some(scalar_arg2.clone()),
             ),
             Some(scalar_arg2.clone())
@@ -17470,10 +17503,10 @@ mod tests {
 
         assert_eq!(
             ctx.debug_choose_generic_visible_expr(
-                Some(CExpr::Var("arg1".to_string())),
-                Some(CExpr::AddrOf(Box::new(CExpr::Var("var_8h".to_string())))),
+                Some(ctx.name_ref("arg1")),
+                Some(CExpr::AddrOf(Box::new(ctx.name_ref("var_8h")))),
             ),
-            Some(CExpr::AddrOf(Box::new(CExpr::Var("var_8h".to_string()))))
+            Some(CExpr::AddrOf(Box::new(ctx.name_ref("var_8h"))))
         );
     }
 
@@ -17496,7 +17529,7 @@ mod tests {
 
         assert_eq!(
             ctx.debug_resolve_prepared_predicate_operand(&make_var("tmp:11f00", 1, 4)),
-            CExpr::Var("var_4h".to_string())
+            ctx.name_ref("var_4h")
         );
     }
 
@@ -17580,9 +17613,9 @@ mod tests {
         let rendered = ctx.render_call_args_for_site(
             source_call.0,
             source_call.1,
-            &CExpr::Var("helper.alloc_wrapper".to_string()),
+            &ctx.name_ref("helper.alloc_wrapper"),
             vec![result_call_arg(
-                CExpr::Var("tmp:buf".to_string()),
+                ctx.name_ref("tmp:buf"),
                 source_call,
                 0,
             )],
@@ -17590,7 +17623,7 @@ mod tests {
 
         assert_eq!(
             rendered,
-            vec![CExpr::Var("buf".to_string())],
+            vec![ctx.name_ref("buf")],
             "expected summary-modeled internal wrapper to preserve owned call result like an imported call, got {rendered:?}"
         );
     }
@@ -17660,18 +17693,18 @@ mod tests {
 
         assert_eq!(
             ctx.resolve_call_target_for_site(block.addr, 1, target),
-            CExpr::Var("sym.imp.fact_helper".to_string())
+            ctx.name_ref("sym.imp.fact_helper")
         );
         assert_eq!(
-            ctx.call_target_identity(&CExpr::Var("const:401050".to_string())),
+            ctx.call_target_identity(&ctx.name_ref("const:401050")),
             Some("fact_helper".to_string())
         );
         assert!(
-            ctx.is_imported_call_target(&CExpr::Var("const:401050".to_string())),
+            ctx.is_imported_call_target(&ctx.name_ref("const:401050")),
             "direct target identity should classify imported callee-fact names"
         );
         assert!(
-            !ctx.is_modeled_call_target(&CExpr::Var("const:402000".to_string())),
+            !ctx.is_modeled_call_target(&ctx.name_ref("const:402000")),
             "unrelated direct targets must not inherit modeled status from existing callee facts"
         );
     }
@@ -17765,7 +17798,7 @@ mod tests {
         let CStmt::Expr(CExpr::Call { func, args }) = stmt else {
             panic!("expected certified call expression, got {stmt:?}");
         };
-        assert_eq!(*func, CExpr::Var("sym.helper".to_string()));
+        assert_eq!(*func, ctx.name_ref("sym.helper"));
         assert_eq!(args, vec![CExpr::IntLit(7)]);
     }
 
@@ -17867,7 +17900,7 @@ mod tests {
         let CStmt::Expr(CExpr::Call { func, args }) = stmt else {
             panic!("expected certified call expression, got {stmt:?}");
         };
-        assert_eq!(*func, CExpr::Var("sym.helper".to_string()));
+        assert_eq!(*func, ctx.name_ref("sym.helper"));
         assert_eq!(
             args,
             vec![CExpr::IntLit(7)],
@@ -17922,7 +17955,7 @@ mod tests {
         assert_eq!(
             ctx.synthesized_call_expr_for_source_call((0x1000, 2)),
             Some(CExpr::call(
-                CExpr::Var("sym.helper".to_string()),
+                ctx.name_ref("sym.helper"),
                 vec![CExpr::IntLit(7)]
             )),
             "synthesized source-call expressions must use FunctionFacts argument values, not prepared arg ids"
@@ -17931,6 +17964,7 @@ mod tests {
 
     #[test]
     fn certified_call_result_owner_alias_requires_certified_stack_identity() {
+        let symbols = test_table();
         let arch = make_test_arch_x86_64();
         let mut entry = R2ILBlock::new(0x1000, 4);
         entry.push(R2ILOp::Copy {
@@ -17973,7 +18007,7 @@ mod tests {
                     callee_identity: Some(r2types::CalleeIdentity::from_name("sym.helper")),
                     authoritative_args: Vec::new(),
                     authoritative_arg_values: Vec::new(),
-                    result_owner: Some(CExpr::Var("buf".to_string())),
+                    result_owner: Some(crate::symbol::var_ref(&symbols, "buf")),
                     render_fact: None,
                 },
             )]),
@@ -18042,7 +18076,7 @@ mod tests {
 
         assert_eq!(
             certified_alias_ctx.stable_owned_call_result_expr_for_name("alias", true),
-            Some(CExpr::Var("buf".to_string())),
+            Some(crate::symbol::var_ref(&symbols, "buf")),
             "exact typed/render stack alias evidence should allow the prepared call-result owner"
         );
     }
@@ -18063,7 +18097,7 @@ mod tests {
             call_view_by_site: BTreeMap::from([(
                 (0x1000, 0),
                 crate::analysis::PreparedCallView {
-                    authoritative_args: vec![CExpr::Var("fake_arg".to_string())],
+                    authoritative_args: vec![ctx.name_ref("fake_arg")],
                     ..crate::analysis::PreparedCallView::default()
                 },
             )]),
@@ -18078,7 +18112,7 @@ mod tests {
         let CStmt::Expr(CExpr::Call { func, args }) = stmt else {
             panic!("expected certified zero-arg call, got {stmt:?}");
         };
-        assert_eq!(*func, CExpr::Var("sym.helper".to_string()));
+        assert_eq!(*func, ctx.name_ref("sym.helper"));
         assert!(
             args.is_empty(),
             "prepared fake args must not override a zero-arg FunctionFacts callsite"
@@ -18092,7 +18126,7 @@ mod tests {
         ctx.state.analysis_ctx.use_info.call_args.insert(
             (0x1000, 0),
             vec![crate::analysis::CallArgBinding::input(
-                crate::analysis::SemanticCallArg::FallbackExpr(CExpr::Var("fake_arg".to_string())),
+                crate::analysis::SemanticCallArg::FallbackExpr(ctx.name_ref("fake_arg")),
             )],
         );
 
@@ -18120,7 +18154,7 @@ mod tests {
         let mut ctx = make_x86_64_ctx();
         ctx.set_function_names(HashMap::from([(0x401050, "sym.helper".to_string())]));
         let mut fake_binding = crate::analysis::CallArgBinding::input(
-            crate::analysis::SemanticCallArg::FallbackExpr(CExpr::Var("fake_arg".to_string())),
+            crate::analysis::SemanticCallArg::FallbackExpr(ctx.name_ref("fake_arg")),
         );
         fake_binding.source_var_name = Some("__test_source".to_string());
         ctx.state
@@ -18157,7 +18191,7 @@ mod tests {
             vec![
                 crate::analysis::CallArgBinding::input(
                     crate::analysis::SemanticCallArg::FallbackExpr(CExpr::Var(
-                        "fake_arg".to_string(),
+                        { let CExpr::Var(id) = ctx.name_ref("fake_arg") else { unreachable!() }; id },
                     )),
                 )
                 .with_source_call(0x1000, 0),
@@ -18330,7 +18364,7 @@ mod tests {
         let rendered_args = ctx.render_call_args_for_site_with_direct_target(
             block.addr,
             2,
-            &CExpr::Var("sym.helper".to_string()),
+            &ctx.name_ref("sym.helper"),
             Some(0x401050),
             ctx.call_args_map()
                 .get(&(0x1000, 2))
@@ -18621,7 +18655,7 @@ mod tests {
             ctx.extract_condition_from_block(entry),
             Some(CExpr::binary(
                 BinaryOp::Ne,
-                CExpr::Var("arg0".to_string()),
+                ctx.name_ref("arg0"),
                 CExpr::IntLit(0),
             ))
         );
@@ -18629,7 +18663,7 @@ mod tests {
             ctx.predicate_candidate_for_var(cond),
             Some(CExpr::binary(
                 BinaryOp::Ne,
-                CExpr::Var("arg0".to_string()),
+                ctx.name_ref("arg0"),
                 CExpr::IntLit(0),
             ))
         );
@@ -18642,11 +18676,11 @@ mod tests {
             owner_expr_by_name: HashMap::from([
                 (
                     "tmp:pred.1".to_string(),
-                    CExpr::Var("tmp:pred.2".to_string()),
+                    ctx.name_ref("tmp:pred.2"),
                 ),
                 (
                     "tmp:pred.2".to_string(),
-                    CExpr::Var("tmp:pred.1".to_string()),
+                    ctx.name_ref("tmp:pred.1"),
                 ),
             ]),
             ..PreparedSemanticView::default()
@@ -18654,9 +18688,9 @@ mod tests {
 
         let mut visited = HashSet::new();
         let resolved =
-            ctx.resolve_predicate_operand(&CExpr::Var("tmp:pred.1".to_string()), 0, &mut visited);
+            ctx.resolve_predicate_operand(&ctx.name_ref("tmp:pred.1"), 0, &mut visited);
 
-        assert_eq!(resolved, CExpr::Var("tmp:pred.1".to_string()));
+        assert_eq!(resolved, ctx.name_ref("tmp:pred.1"));
     }
 
     #[test]
@@ -18675,7 +18709,7 @@ mod tests {
         ctx.state.analysis_ctx.use_info.call_args.insert(
             (0x1000, 1),
             vec![crate::analysis::CallArgBinding::input(
-                crate::analysis::SemanticCallArg::FallbackExpr(CExpr::Var("len".to_string())),
+                crate::analysis::SemanticCallArg::FallbackExpr(ctx.name_ref("len")),
             )],
         );
 
@@ -18796,6 +18830,7 @@ mod tests {
 
     #[test]
     fn certified_render_plan_requires_renderable_exact_nonraw_call_arg() {
+        let symbols = test_table();
         let arch = make_test_arch_x86_64();
         let mut entry = R2ILBlock::new(0x1000, 4);
         entry.push(R2ILOp::Copy {
@@ -18860,7 +18895,7 @@ mod tests {
         };
 
         let render = render_facts(true);
-        let view = prepared_view(arg_value, CExpr::Var("n".to_string()));
+        let view = prepared_view(arg_value, crate::symbol::var_ref(&symbols, "n"));
         let function_facts = r2types::FunctionFacts::default();
         let adapter = CertifiedRenderPlan::new(
             &function_facts,
@@ -18869,7 +18904,7 @@ mod tests {
         );
         assert_eq!(
             adapter.call_arg_expr((0x1000, 2), arg_value, |_| false),
-            Some(CExpr::Var("n".to_string()))
+            Some(crate::symbol::var_ref(&symbols, "n"))
         );
 
         let unrenderable = render_facts(false);
@@ -18883,7 +18918,7 @@ mod tests {
             None
         );
 
-        let wrong_value_view = prepared_view(r2ssa::ValueId(9999), CExpr::Var("n".to_string()));
+        let wrong_value_view = prepared_view(r2ssa::ValueId(9999), crate::symbol::var_ref(&symbols, "n"));
         let adapter = CertifiedRenderPlan::new(
             &function_facts,
             &wrong_value_view,
@@ -18894,7 +18929,7 @@ mod tests {
             None
         );
 
-        let raw_storage_view = prepared_view(arg_value, CExpr::Var("tmp:raw_1".to_string()));
+        let raw_storage_view = prepared_view(arg_value, crate::symbol::var_ref(&symbols, "tmp:raw_1"));
         let adapter = CertifiedRenderPlan::new(
             &function_facts,
             &raw_storage_view,
@@ -18913,7 +18948,7 @@ mod tests {
             "tmp:ret_1".to_string(),
             CExpr::binary(
                 BinaryOp::BitXor,
-                CExpr::Var("value".to_string()),
+                ctx.name_ref("value"),
                 CExpr::IntLit(1),
             ),
         );
@@ -18924,21 +18959,22 @@ mod tests {
             .insert("const:1_0".to_string(), CExpr::IntLit(1));
 
         assert_eq!(
-            ctx.resolve_return_candidate(&CExpr::Var("tmp:ret_1".to_string())),
+            ctx.resolve_return_candidate(&ctx.name_ref("tmp:ret_1")),
             CExpr::binary(
                 BinaryOp::BitXor,
-                CExpr::Var("value".to_string()),
+                ctx.name_ref("value"),
                 CExpr::IntLit(1)
             )
         );
         assert_eq!(
-            ctx.resolve_return_candidate(&CExpr::Var("const:1_0".to_string())),
+            ctx.resolve_return_candidate(&ctx.name_ref("const:1_0")),
             CExpr::IntLit(1)
         );
     }
 
     #[test]
     fn return_inline_ssa_storage_carriers_require_raw_or_mapped_alias() {
+        let symbols = test_table();
         let mut unmapped = make_x86_64_ctx();
         unmapped
             .state
@@ -18949,15 +18985,15 @@ mod tests {
 
         assert_eq!(
             unmapped.expand_return_expr(
-                &CExpr::Var("value_3e480".to_string()),
+                &crate::symbol::var_ref(&symbols, "value_3e480"),
                 0,
                 &mut HashSet::new()
             ),
-            CExpr::Var("value_3e480".to_string())
+            crate::symbol::var_ref(&symbols, "value_3e480")
         );
         assert_eq!(
-            unmapped.expand_return_expr(&CExpr::Var("t42_1".to_string()), 0, &mut HashSet::new()),
-            CExpr::Var("t42_1".to_string())
+            unmapped.expand_return_expr(&crate::symbol::var_ref(&symbols, "t42_1"), 0, &mut HashSet::new()),
+            crate::symbol::var_ref(&symbols, "t42_1")
         );
         unmapped
             .state
@@ -18967,11 +19003,11 @@ mod tests {
             .insert("ordinary_alias".to_string(), CExpr::IntLit(9));
         assert_eq!(
             unmapped.expand_return_expr(
-                &CExpr::Var("ordinary_alias".to_string()),
+                &crate::symbol::var_ref(&symbols, "ordinary_alias"),
                 0,
                 &mut HashSet::new()
             ),
-            CExpr::Var("ordinary_alias".to_string())
+            crate::symbol::var_ref(&symbols, "ordinary_alias")
         );
 
         let mut mapped = make_x86_64_ctx();
@@ -18990,7 +19026,7 @@ mod tests {
 
         assert_eq!(
             mapped.expand_return_expr(
-                &CExpr::Var("value_3e480".to_string()),
+                &crate::symbol::var_ref(&symbols, "value_3e480"),
                 0,
                 &mut HashSet::new()
             ),
@@ -19024,12 +19060,12 @@ mod tests {
 
         assert_eq!(
             ctx.normalize_imported_call_arg_expr(
-                CExpr::Var("s_home".to_string()),
+                ctx.name_ref("s_home"),
                 true,
                 false,
                 false,
             ),
-            CExpr::Var("s".to_string())
+            ctx.name_ref("s")
         );
     }
 
@@ -19047,10 +19083,10 @@ mod tests {
             install_call_owner(&mut ctx, (0x1000, 0), owner, "rax_1");
 
             let rendered = ctx.render_call_arg_for_callee(
-                &CExpr::Var("sym.imp.printf".to_string()),
+                &ctx.name_ref("sym.imp.printf"),
                 crate::analysis::CallArgBinding::result(
                     crate::analysis::SemanticCallArg::FallbackExpr(CExpr::Var(
-                        "fallback".to_string(),
+                        { let CExpr::Var(id) = ctx.name_ref("fallback") else { unreachable!() }; id },
                     )),
                 )
                 .with_source_call(0x1000, 0),
@@ -19058,7 +19094,7 @@ mod tests {
 
             assert_eq!(
                 rendered,
-                CExpr::Var("fallback".to_string()),
+                ctx.name_ref("fallback"),
                 "{owner} must not bypass the result-call-argument owner filter"
             );
         }
@@ -19070,14 +19106,14 @@ mod tests {
         install_call_owner(&mut ctx, (0x1000, 0), "owned_result", "rax_1");
 
         let rendered = ctx.render_call_arg_for_callee(
-            &CExpr::Var("sym.imp.printf".to_string()),
+            &ctx.name_ref("sym.imp.printf"),
             crate::analysis::CallArgBinding::input(crate::analysis::SemanticCallArg::FallbackExpr(
-                CExpr::Var("input_arg".to_string()),
+                ctx.name_ref("input_arg"),
             ))
             .with_source_call(0x1000, 0),
         );
 
-        assert_eq!(rendered, CExpr::Var("input_arg".to_string()));
+        assert_eq!(rendered, ctx.name_ref("input_arg"));
     }
 
     #[test]
@@ -19088,17 +19124,17 @@ mod tests {
             .analysis_ctx
             .use_info
             .definitions
-            .insert(source.display_name(), CExpr::Var("stack_slot".to_string()));
+            .insert(source.display_name(), ctx.name_ref("stack_slot"));
 
         let binding = crate::analysis::CallArgBinding::input(
-            crate::analysis::SemanticCallArg::FallbackExpr(CExpr::Var("fallback".to_string())),
+            crate::analysis::SemanticCallArg::FallbackExpr(ctx.name_ref("fallback")),
         )
         .with_source_var(&source);
 
         let rendered =
-            ctx.render_call_arg_for_callee(&CExpr::Var("sym.imp.printf".to_string()), binding);
+            ctx.render_call_arg_for_callee(&ctx.name_ref("sym.imp.printf"), binding);
 
-        assert_eq!(rendered, CExpr::Var("fallback".to_string()));
+        assert_eq!(rendered, ctx.name_ref("fallback"));
     }
 
     fn install_prepared_owner_for_name(ctx: &mut FoldingContext<'_>, name: &str, owner: CExpr) {
@@ -19111,9 +19147,9 @@ mod tests {
     #[test]
     fn recovered_call_arg_rejects_low_signal_sources_without_better_proof() {
         let cases = [
-            ("src_transient", CExpr::Var("rax_7".to_string())),
-            ("src_stack_placeholder", CExpr::Var("stack".to_string())),
-            ("src_low_quality", CExpr::Var("value_bad".to_string())),
+            ("src_transient", ctx.name_ref("rax_7")),
+            ("src_stack_placeholder", ctx.name_ref("stack")),
+            ("src_low_quality", ctx.name_ref("value_bad")),
         ];
 
         for (source_name, bad_expr) in cases {
@@ -19126,13 +19162,13 @@ mod tests {
                 .insert(source.display_name(), bad_expr);
 
             let binding = crate::analysis::CallArgBinding::input(
-                crate::analysis::SemanticCallArg::FallbackExpr(CExpr::Var("fallback".to_string())),
+                crate::analysis::SemanticCallArg::FallbackExpr(ctx.name_ref("fallback")),
             )
             .with_source_var(&source);
 
             assert_eq!(
-                ctx.render_call_arg_for_callee(&CExpr::Var("sym.imp.printf".to_string()), binding),
-                CExpr::Var("fallback".to_string()),
+                ctx.render_call_arg_for_callee(&ctx.name_ref("sym.imp.printf"), binding),
+                ctx.name_ref("fallback"),
                 "{source_name} should not be accepted as recovered imported call arg proof"
             );
         }
@@ -19141,9 +19177,9 @@ mod tests {
     #[test]
     fn recovered_call_arg_contract_rejects_low_signal_sources_directly() {
         let cases = [
-            ("src_transient", CExpr::Var("rax_7".to_string())),
-            ("src_stack_placeholder", CExpr::Var("stack".to_string())),
-            ("src_low_quality", CExpr::Var("value_bad".to_string())),
+            ("src_transient", ctx.name_ref("rax_7")),
+            ("src_stack_placeholder", ctx.name_ref("stack")),
+            ("src_low_quality", ctx.name_ref("value_bad")),
         ];
 
         for (source_name, bad_expr) in cases {
@@ -19155,7 +19191,7 @@ mod tests {
                 .definitions
                 .insert(source.display_name(), bad_expr);
             let binding = crate::analysis::CallArgBinding::input(
-                crate::analysis::SemanticCallArg::FallbackExpr(CExpr::Var("fallback".to_string())),
+                crate::analysis::SemanticCallArg::FallbackExpr(ctx.name_ref("fallback")),
             )
             .with_source_var(&source);
 
@@ -19175,21 +19211,25 @@ mod tests {
             .analysis_ctx
             .use_info
             .definitions
-            .insert(source.display_name(), CExpr::Var("rax_7".to_string()));
+            .insert(source.display_name(), ctx.name_ref("rax_7"));
+        let __fixture_args = (
+            &source.display_name(),
+            CExpr::AddrOf(Box::new(ctx.name_ref("buf"))),
+        );
         install_prepared_owner_for_name(
             &mut ctx,
-            &source.display_name(),
-            CExpr::AddrOf(Box::new(CExpr::Var("buf".to_string()))),
-        );
+            __fixture_args.0,
+            __fixture_args.1,
+        );;
 
         let binding = crate::analysis::CallArgBinding::input(
-            crate::analysis::SemanticCallArg::FallbackExpr(CExpr::Var("fallback".to_string())),
+            crate::analysis::SemanticCallArg::FallbackExpr(ctx.name_ref("fallback")),
         )
         .with_source_var(&source);
 
         assert_eq!(
-            ctx.render_call_arg_for_callee(&CExpr::Var("sym.imp.printf".to_string()), binding),
-            CExpr::Var("fallback".to_string()),
+            ctx.render_call_arg_for_callee(&ctx.name_ref("sym.imp.printf"), binding),
+            ctx.name_ref("fallback"),
             "prepared address owners describe storage identity, not imported argument values"
         );
     }
@@ -19202,19 +19242,19 @@ mod tests {
             .analysis_ctx
             .use_info
             .definitions
-            .insert(source.display_name(), CExpr::Var("buf".to_string()));
+            .insert(source.display_name(), ctx.name_ref("buf"));
         ctx.state.analysis_ctx.use_info.formatted_defs.insert(
             source.display_name(),
-            CExpr::call(CExpr::Var("sym.imp.helper".to_string()), vec![]),
+            CExpr::call(ctx.name_ref("sym.imp.helper"), vec![]),
         );
 
         let input_binding = crate::analysis::CallArgBinding::input(
-            crate::analysis::SemanticCallArg::FallbackExpr(CExpr::Var("fallback".to_string())),
+            crate::analysis::SemanticCallArg::FallbackExpr(ctx.name_ref("fallback")),
         )
         .with_source_var(&source);
         assert_eq!(
             ctx.recover_call_arg_expr_from_source_var(&input_binding),
-            Some(CExpr::Var("buf".to_string())),
+            Some(ctx.name_ref("buf")),
             "input-role recovery must preserve stable source expressions over call candidates"
         );
     }
@@ -19223,7 +19263,7 @@ mod tests {
     fn recovered_input_arg_contract_preserves_wrapped_stable_source_over_entry_alias() {
         let mut ctx = make_x86_64_ctx();
         let source = make_var("src_wrapped_input", 1, 8);
-        let stable_source = CExpr::Paren(Box::new(CExpr::Var("buf".to_string())));
+        let stable_source = CExpr::Paren(Box::new(ctx.name_ref("buf")));
         ctx.state
             .analysis_ctx
             .use_info
@@ -19233,10 +19273,10 @@ mod tests {
             .analysis_ctx
             .use_info
             .formatted_defs
-            .insert(source.display_name(), CExpr::Var("arg1".to_string()));
+            .insert(source.display_name(), ctx.name_ref("arg1"));
 
         let input_binding = crate::analysis::CallArgBinding::input(
-            crate::analysis::SemanticCallArg::FallbackExpr(CExpr::Var("fallback".to_string())),
+            crate::analysis::SemanticCallArg::FallbackExpr(ctx.name_ref("fallback")),
         )
         .with_source_var(&source);
         assert_eq!(
@@ -19256,18 +19296,18 @@ mod tests {
         let rendered = ctx.render_call_args_for_site(
             source_call.0,
             source_call.1,
-            &CExpr::Var("const:401030".to_string()),
+            &ctx.name_ref("const:401030"),
             vec![
                 crate::analysis::CallArgBinding::result(
                     crate::analysis::SemanticCallArg::FallbackExpr(CExpr::Var(
-                        "fallback".to_string(),
+                        { let CExpr::Var(id) = ctx.name_ref("fallback") else { unreachable!() }; id },
                     )),
                 )
                 .with_source_call(source_call.0, source_call.1),
             ],
         );
 
-        assert_eq!(rendered, vec![CExpr::Var("owned_result".to_string())]);
+        assert_eq!(rendered, vec![ctx.name_ref("owned_result")]);
     }
 
     #[test]
@@ -19276,7 +19316,7 @@ mod tests {
         ctx.inputs.prepared_semantic_view = Some(Box::leak(Box::new(PreparedSemanticView {
             owner_expr_by_name: HashMap::from([(
                 "tmp:size_1".to_string(),
-                CExpr::Var("len".to_string()),
+                ctx.name_ref("len"),
             )]),
             ..PreparedSemanticView::default()
         })));
@@ -19285,14 +19325,14 @@ mod tests {
             ctx.prepared_imported_semantic_arg_expr(
                 &crate::analysis::SemanticValue::Scalar(ScalarValue::Expr(CExpr::binary(
                     BinaryOp::Add,
-                    CExpr::Var("tmp:size_1".to_string()),
+                    ctx.name_ref("tmp:size_1"),
                     CExpr::IntLit(1),
                 ))),
                 false,
             ),
             Some(CExpr::binary(
                 BinaryOp::Add,
-                CExpr::Var("len".to_string()),
+                ctx.name_ref("len"),
                 CExpr::IntLit(1),
             ))
         );
@@ -19306,7 +19346,7 @@ mod tests {
                 0x1000,
                 CExpr::binary(
                     BinaryOp::Ne,
-                    CExpr::Var("var_8h".to_string()),
+                    ctx.name_ref("var_8h"),
                     CExpr::IntLit(0),
                 ),
             )]),
@@ -19329,8 +19369,8 @@ mod tests {
             ctx.extract_condition_from_block(&block),
             Some(CExpr::binary(
                 BinaryOp::Ne,
-                CExpr::Var("arg1".to_string()),
-                CExpr::Var("arg2".to_string()),
+                ctx.name_ref("arg1"),
+                ctx.name_ref("arg2"),
             ))
         );
     }
@@ -19345,8 +19385,8 @@ mod tests {
                     BinaryOp::Ne,
                     CExpr::binary(
                         BinaryOp::Add,
-                        CExpr::Var("var_8h".to_string()),
-                        CExpr::Var("var_8h".to_string()),
+                        ctx.name_ref("var_8h"),
+                        ctx.name_ref("var_8h"),
                     ),
                     CExpr::IntLit(100),
                 ),
@@ -19377,8 +19417,8 @@ mod tests {
                 BinaryOp::Ne,
                 CExpr::binary(
                     BinaryOp::Add,
-                    CExpr::Var("arg1".to_string()),
-                    CExpr::Var("arg1".to_string()),
+                    ctx.name_ref("arg1"),
+                    ctx.name_ref("arg1"),
                 ),
                 CExpr::IntLit(100),
             ))
@@ -19624,7 +19664,7 @@ mod tests {
             ctx.extract_condition_from_block(entry),
             Some(CExpr::binary(
                 BinaryOp::Ne,
-                CExpr::Var("arg0".to_string()),
+                ctx.name_ref("arg0"),
                 CExpr::IntLit(0),
             ))
         );
@@ -20001,7 +20041,7 @@ mod tests {
             slot.display_name(),
             CExpr::binary(
                 BinaryOp::Add,
-                CExpr::Var("rbp".to_string()),
+                ctx.name_ref("rbp"),
                 CExpr::IntLit(-8),
             ),
         );
@@ -20049,7 +20089,7 @@ mod tests {
             slot.display_name(),
             CExpr::binary(
                 BinaryOp::Add,
-                CExpr::Var("rbp".to_string()),
+                ctx.name_ref("rbp"),
                 CExpr::IntLit(-8),
             ),
         );
@@ -20094,7 +20134,7 @@ mod tests {
             stored_slot.display_name(),
             CExpr::binary(
                 BinaryOp::Add,
-                CExpr::Var("rbp".to_string()),
+                ctx.name_ref("rbp"),
                 CExpr::IntLit(-8),
             ),
         );
@@ -20102,7 +20142,7 @@ mod tests {
             loaded_slot.display_name(),
             CExpr::binary(
                 BinaryOp::Add,
-                CExpr::Var("rbp".to_string()),
+                ctx.name_ref("rbp"),
                 CExpr::IntLit(-16),
             ),
         );
@@ -20140,7 +20180,7 @@ mod tests {
             slot.display_name(),
             CExpr::binary(
                 BinaryOp::Add,
-                CExpr::Var("rbp".to_string()),
+                ctx.name_ref("rbp"),
                 CExpr::IntLit(-8),
             ),
         );
@@ -20282,7 +20322,7 @@ mod tests {
             addr.display_name(),
             CExpr::binary(
                 BinaryOp::Add,
-                CExpr::Var("rbp".to_string()),
+                ctx.name_ref("rbp"),
                 CExpr::IntLit(-8),
             ),
         );
@@ -20328,7 +20368,7 @@ mod tests {
             addr.display_name(),
             CExpr::binary(
                 BinaryOp::Add,
-                CExpr::Var("rbp".to_string()),
+                ctx.name_ref("rbp"),
                 CExpr::IntLit(0),
             ),
         );

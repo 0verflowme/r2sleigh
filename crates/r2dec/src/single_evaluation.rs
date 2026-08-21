@@ -507,17 +507,24 @@ mod tests {
     use super::*;
     use crate::ast::{CLocal, CParam, CType};
 
+    /// The names a fixture in this module declares.
+    fn test_table() -> std::cell::RefCell<crate::symbol::SymbolTable> {
+        std::cell::RefCell::new(crate::symbol::SymbolTable::new())
+    }
+
     fn call(name: &str) -> CExpr {
+        let symbols = test_table();
         CExpr::Call {
-            func: Box::new(CExpr::Var(name.to_string())),
+            func: Box::new(CExpr::Var(symbols.borrow_mut().declare_or_reuse(&name.to_string()))),
             args: vec![CExpr::IntLit(16)],
         }
     }
 
     fn assign(target: &str, value: CExpr) -> CStmt {
+        let symbols = test_table();
         CStmt::Expr(CExpr::Binary {
             op: BinaryOp::Assign,
-            left: Box::new(CExpr::Var(target.to_string())),
+            left: Box::new(CExpr::Var(symbols.borrow_mut().declare_or_reuse(&target.to_string()))),
             right: Box::new(value),
         })
     }
@@ -540,10 +547,11 @@ mod tests {
 
     #[test]
     fn a_second_assignment_of_the_same_site_becomes_a_copy() {
+        let symbols = test_table();
         let mut func = function(vec![
             assign("x0_3", call("fcn.1000")),
             assign("x0_4", call("fcn.1000")),
-            CStmt::Return(Some(CExpr::Var("x0_3".to_string()))),
+            CStmt::Return(Some(crate::symbol::var_ref(&symbols, "x0_3"))),
         ]);
 
         bind_each_call_site_once(&mut func, &one_site());
@@ -552,18 +560,19 @@ mod tests {
             func.body,
             vec![
                 assign("x0_3", call("fcn.1000")),
-                assign("x0_4", CExpr::Var("x0_3".to_string())),
-                CStmt::Return(Some(CExpr::Var("x0_3".to_string()))),
+                assign("x0_4", crate::symbol::var_ref(&symbols, "x0_3")),
+                CStmt::Return(Some(crate::symbol::var_ref(&symbols, "x0_3"))),
             ]
         );
     }
 
     #[test]
     fn reassigning_the_same_target_leaves_nothing_to_say() {
+        let symbols = test_table();
         let mut func = function(vec![
             assign("owned", call("fcn.1000")),
             assign("owned", call("fcn.1000")),
-            CStmt::Return(Some(CExpr::Var("owned".to_string()))),
+            CStmt::Return(Some(crate::symbol::var_ref(&symbols, "owned"))),
         ]);
 
         bind_each_call_site_once(&mut func, &one_site());
@@ -572,21 +581,22 @@ mod tests {
             func.body,
             vec![
                 assign("owned", call("fcn.1000")),
-                CStmt::Return(Some(CExpr::Var("owned".to_string()))),
+                CStmt::Return(Some(crate::symbol::var_ref(&symbols, "owned"))),
             ]
         );
     }
 
     #[test]
     fn a_site_nested_in_an_argument_is_bound_before_the_statement() {
+        let symbols = test_table();
         let outer = CExpr::Call {
-            func: Box::new(CExpr::Var("use".to_string())),
+            func: Box::new(crate::symbol::var_ref(&symbols, "use")),
             args: vec![call("fcn.1000")],
         };
         let mut func = function(vec![
             CStmt::Expr(outer),
             assign("owned", call("fcn.1000")),
-            CStmt::Return(Some(CExpr::Var("owned".to_string()))),
+            CStmt::Return(Some(crate::symbol::var_ref(&symbols, "owned"))),
         ]);
 
         bind_each_call_site_once(&mut func, &one_site());
@@ -596,16 +606,17 @@ mod tests {
             vec![
                 assign("owned", call("fcn.1000")),
                 CStmt::Expr(CExpr::Call {
-                    func: Box::new(CExpr::Var("use".to_string())),
-                    args: vec![CExpr::Var("owned".to_string())],
+                    func: Box::new(crate::symbol::var_ref(&symbols, "use")),
+                    args: vec![crate::symbol::var_ref(&symbols, "owned")],
                 }),
-                CStmt::Return(Some(CExpr::Var("owned".to_string()))),
+                CStmt::Return(Some(crate::symbol::var_ref(&symbols, "owned"))),
             ]
         );
     }
 
     #[test]
     fn a_site_the_body_never_names_gets_a_declared_binding() {
+        let symbols = test_table();
         let mut func = function(vec![
             CStmt::Expr(call("fcn.1000")),
             CStmt::Return(Some(call("fcn.1000"))),
@@ -617,23 +628,24 @@ mod tests {
             func.body,
             vec![
                 assign("fcn_1000_result", call("fcn.1000")),
-                CStmt::Return(Some(CExpr::Var("fcn_1000_result".to_string()))),
+                CStmt::Return(Some(crate::symbol::var_ref(&symbols, "fcn_1000_result"))),
             ]
         );
         assert_eq!(func.locals.len(), 1);
-        assert_eq!(func.locals[0].name, "fcn_1000_result");
+        assert_eq!(func.locals[0].name, symbols.borrow_mut().declare_or_reuse("fcn_1000_result"));
     }
 
     #[test]
     fn sibling_branches_do_not_share_a_binding() {
+        let symbols = test_table();
         let arm = |target: &str| {
             Box::new(CStmt::Block(vec![
                 assign(target, call("fcn.1000")),
-                CStmt::Return(Some(CExpr::Var(target.to_string()))),
+                CStmt::Return(Some(CExpr::Var(symbols.borrow_mut().declare_or_reuse(&target.to_string())))),
             ]))
         };
         let mut func = function(vec![CStmt::If {
-            cond: CExpr::Var("c".to_string()),
+            cond: crate::symbol::var_ref(&symbols, "c"),
             then_body: arm("a"),
             else_body: Some(arm("b")),
         }]);
@@ -646,6 +658,7 @@ mod tests {
 
     #[test]
     fn two_sites_that_render_alike_are_left_alone() {
+        let symbols = test_table();
         let sites = BTreeMap::from([
             ((0x1000, 0), call("fcn.1000")),
             ((0x2000, 0), call("fcn.1000")),
@@ -653,7 +666,7 @@ mod tests {
         let mut func = function(vec![
             assign("a", call("fcn.1000")),
             assign("b", call("fcn.1000")),
-            CStmt::Return(Some(CExpr::Var("b".to_string()))),
+            CStmt::Return(Some(crate::symbol::var_ref(&symbols, "b"))),
         ]);
         let before = func.body.clone();
 
@@ -664,9 +677,10 @@ mod tests {
 
     #[test]
     fn a_site_rendered_once_is_untouched() {
+        let symbols = test_table();
         let mut func = function(vec![
             assign("a", call("fcn.1000")),
-            CStmt::Return(Some(CExpr::Var("a".to_string()))),
+            CStmt::Return(Some(crate::symbol::var_ref(&symbols, "a"))),
         ]);
         let before = func.body.clone();
 

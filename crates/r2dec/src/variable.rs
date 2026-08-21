@@ -907,6 +907,10 @@ mod tests {
     use super::*;
     use r2il::{R2ILBlock, R2ILOp, Varnode};
     use r2ssa::SSAFunction;
+    /// The names a fixture in this module declares.
+    fn test_table() -> std::cell::RefCell<crate::symbol::SymbolTable> {
+        std::cell::RefCell::new(crate::symbol::SymbolTable::new())
+    }
     use r2types::{
         ExternalStackBase, ExternalStackSlotRole, ExternalStackVarSpec, FunctionParamSpec,
         FunctionSignatureSpec, FunctionTypeFacts, StackSlotKey, VisibleBinding, VisibleBindingKind,

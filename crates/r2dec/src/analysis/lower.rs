@@ -1443,6 +1443,11 @@ fn is_low_signal_lowering_name(name: &str) -> bool {
 mod tests {
     use super::*;
 
+    /// The names a fixture in this module declares.
+    fn test_table() -> std::cell::RefCell<crate::symbol::SymbolTable> {
+        std::cell::RefCell::new(crate::symbol::SymbolTable::new())
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn make_ctx<'a>(
         definitions: &'a HashMap<String, CExpr>,
@@ -1597,8 +1602,8 @@ mod tests {
                 },
                     vec![
                         CExpr::StringLit(format!("userop_{userop}")),
-                        CExpr::Var("x30".to_string()),
-                        CExpr::Var("sp".to_string()),
+                        ctx.name_ref("x30"),
+                        ctx.name_ref("sp"),
                     ],
                 ),
                 "numeric userop must remain an explicit CallOther"
@@ -1641,9 +1646,9 @@ mod tests {
                 if_false: SSAVar::new("when_false", 0, 4),
             }),
             CExpr::Ternary {
-                cond: Box::new(CExpr::Var("cond".to_string())),
-                then_expr: Box::new(CExpr::Var("when_true".to_string())),
-                else_expr: Box::new(CExpr::Var("when_false".to_string())),
+                cond: Box::new(ctx.name_ref("cond")),
+                then_expr: Box::new(ctx.name_ref("when_true")),
+                else_expr: Box::new(ctx.name_ref("when_false")),
             }
         );
     }
@@ -1677,7 +1682,7 @@ mod tests {
         );
 
         let var = SSAVar::new("ram:403048", 0, 8);
-        assert_eq!(ctx.get_expr(&var), CExpr::Var("ram:403048".to_string()));
+        assert_eq!(ctx.get_expr(&var), ctx.name_ref("ram:403048"));
     }
 
     #[test]
@@ -1763,7 +1768,7 @@ mod tests {
             matches!(
                 expr,
                 CExpr::Call { ref func, ref args }
-                    if **func == CExpr::Var("r2s_unsupported_space_load".to_string())
+                    if **func == ctx.name_ref("r2s_unsupported_space_load")
                         && args.first() == Some(&CExpr::StringLit("space7".to_string()))
             ),
             "custom-space memory must stay explicit and unsupported: {expr:?}"
@@ -1821,7 +1826,7 @@ mod tests {
         assert!(matches!(
             custom,
             CExpr::Call { ref func, ref args }
-                if **func == CExpr::Var("r2s_unsupported_space_load".to_string())
+                if **func == ctx.name_ref("r2s_unsupported_space_load")
                     && args.first() == Some(&CExpr::StringLit("space7".to_string()))
         ));
     }
@@ -1889,12 +1894,12 @@ mod tests {
             "tmp:addr_1".to_string(),
             CExpr::binary(
                 BinaryOp::Add,
-                CExpr::Var("arg1".to_string()),
+                ctx.name_ref("arg1"),
                 CExpr::binary(
                     BinaryOp::Mul,
                     CExpr::Cast {
                         ty: CType::Int(64),
-                        expr: Box::new(CExpr::unary(UnaryOp::Neg, CExpr::Var("arg2".to_string()))),
+                        expr: Box::new(CExpr::unary(UnaryOp::Neg, ctx.name_ref("arg2"))),
                     },
                     CExpr::IntLit(4),
                 ),
@@ -1995,7 +2000,7 @@ mod tests {
             "tmp:addr_1".to_string(),
             CExpr::binary(
                 BinaryOp::Add,
-                CExpr::Var("arg1".to_string()),
+                ctx.name_ref("arg1"),
                 CExpr::IntLit(8),
             ),
         )]);
@@ -2043,10 +2048,10 @@ mod tests {
                 "tmp:addr_1".to_string(),
                 CExpr::binary(
                     BinaryOp::Add,
-                    CExpr::Var("arg1".to_string()),
+                    ctx.name_ref("arg1"),
                     CExpr::binary(
                         BinaryOp::Mul,
-                        CExpr::Var("tmp:index_1".to_string()),
+                        ctx.name_ref("tmp:index_1"),
                         CExpr::IntLit(4),
                     ),
                 ),
@@ -2091,12 +2096,12 @@ mod tests {
         let stack_slots = HashMap::new();
         let forwarded_values = HashMap::new();
         let definitions = HashMap::from([
-            ("tmp:base_1".to_string(), CExpr::Var("rdx_1".to_string())),
+            ("tmp:base_1".to_string(), ctx.name_ref("rdx_1")),
             (
                 "tmp:addr_1".to_string(),
                 CExpr::binary(
                     BinaryOp::Add,
-                    CExpr::Var("tmp:base_1".to_string()),
+                    ctx.name_ref("tmp:base_1"),
                     CExpr::IntLit(8),
                 ),
             ),
@@ -2153,18 +2158,18 @@ mod tests {
         let definitions = HashMap::from([
             (
                 "tmp:arr_local_1".to_string(),
-                CExpr::Var("local_8".to_string()),
+                ctx.name_ref("local_8"),
             ),
-            ("local_8".to_string(), CExpr::Var("arg1".to_string())),
-            ("local_c".to_string(), CExpr::Var("arg2".to_string())),
+            ("local_8".to_string(), ctx.name_ref("arg1")),
+            ("local_c".to_string(), ctx.name_ref("arg2")),
             (
                 addr.display_name(),
                 CExpr::binary(
                     BinaryOp::Add,
-                    CExpr::Var("local_8".to_string()),
+                    ctx.name_ref("local_8"),
                     CExpr::binary(
                         BinaryOp::Mul,
-                        CExpr::Var("local_c".to_string()),
+                        ctx.name_ref("local_c"),
                         CExpr::IntLit(4),
                     ),
                 ),

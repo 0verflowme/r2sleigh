@@ -663,6 +663,7 @@ impl<'a> FoldingContext<'a> {
 
     #[cfg(test)]
     fn call_arg_requires_result_rebuild(&self, expr: &CExpr) -> bool {
+        let symbols = test_table();
         let CExpr::Call { args, .. } = expr else {
             return false;
         };
@@ -752,7 +753,7 @@ impl<'a> FoldingContext<'a> {
             && let analysis::BaseRef::StackSlot(offset) = addr.base
             && let Some(alias) = self.resolve_stack_var(offset)
         {
-            return Some(CExpr::Var(alias));
+            return Some(self.name_ref(&alias));
         }
         let prefer = |current: Option<CExpr>, candidate: Option<CExpr>| {
             self.choose_preferred_imported_call_arg_expr(
@@ -1234,7 +1235,7 @@ impl<'a> FoldingContext<'a> {
         offsets
             .into_iter()
             .find_map(|offset| self.param_home_alias_for_stack_offset(offset))
-            .map(|n| crate::symbol::var_ref(symbols, n))
+            .map(|n| crate::symbol::var_ref(&self.symbols, n))
     }
 
     #[cfg(test)]
@@ -1252,7 +1253,7 @@ impl<'a> FoldingContext<'a> {
                 if let analysis::BaseRef::StackSlot(offset) = addr.base
                     && let Some(name) = self.resolve_stack_var(offset)
                 {
-                    let expr = CExpr::Var(name);
+                    let expr = CExpr::Var(&self.symbols.borrow_mut().declare_or_reuse(&name));
                     return self.is_preserved_imported_input_expr(&expr)
                         && !self.is_direct_constish_visible_expr(&expr, 0);
                 }
@@ -1283,7 +1284,7 @@ impl<'a> FoldingContext<'a> {
         preserve_pointer_identity: bool,
     ) -> Option<CExpr> {
         if let Some(alias) = self.entry_arg_alias_for_pointer_identity_value(value) {
-            return Some(CExpr::Var(alias));
+            return Some(CExpr::Var(&self.symbols.borrow_mut().declare_or_reuse(&alias)));
         }
 
         if let analysis::SemanticValue::Load { addr, .. } = value
@@ -1293,7 +1294,7 @@ impl<'a> FoldingContext<'a> {
             && let analysis::BaseRef::StackSlot(offset) = addr.base
             && let Some(alias) = self.param_home_alias_for_stack_offset(offset)
         {
-            return Some(CExpr::Var(alias));
+            return Some(self.name_ref(&alias));
         }
 
         if let Some(expr) =
@@ -1438,6 +1439,7 @@ impl<'a> FoldingContext<'a> {
 
     #[cfg(test)]
     fn expr_contains_prepared_owner_alias(&self, expr: &CExpr, depth: u32) -> bool {
+        let symbols = test_table();
         if depth > Self::MAX_SEMANTIC_RENDER_DEPTH {
             return false;
         }
@@ -1521,13 +1523,13 @@ impl<'a> FoldingContext<'a> {
             preferred
                 .or_else(|| {
                     let rendered = self.var_name(var);
-                    self.arg_alias_for_rendered_name(&rendered).map(|n| crate::symbol::var_ref(symbols, n))
+                    self.arg_alias_for_rendered_name(&rendered).map(|n| crate::symbol::var_ref(&self.symbols, n))
                 })
                 .or_else(|| {
                     prepared
                         .stack_offset_for_var(var)
                         .and_then(|offset| self.resolve_stack_var(offset))
-                        .map(|n| crate::symbol::var_ref(symbols, n))
+                        .map(|n| crate::symbol::var_ref(&self.symbols, n))
                 })
         };
 
@@ -1576,7 +1578,7 @@ impl<'a> FoldingContext<'a> {
                 analysis::BaseRef::StackSlot(offset)
                     if addr.index.is_none() && addr.offset_bytes == 0 && addr.scale_bytes == 0 =>
                 {
-                    self.resolve_stack_var(*offset).map(|n| crate::symbol::var_ref(symbols, n)).map(|expr| {
+                    self.resolve_stack_var(*offset).map(|n| crate::symbol::var_ref(&self.symbols, n)).map(|expr| {
                         if preserve_pointer_identity {
                             CExpr::AddrOf(Box::new(expr))
                         } else {
@@ -1595,7 +1597,7 @@ impl<'a> FoldingContext<'a> {
                 analysis::BaseRef::StackSlot(offset)
                     if addr.index.is_none() && addr.offset_bytes == 0 && addr.scale_bytes == 0 =>
                 {
-                    self.resolve_stack_var(*offset).map(|n| crate::symbol::var_ref(symbols, n))
+                    self.resolve_stack_var(*offset).map(|n| crate::symbol::var_ref(&self.symbols, n))
                 }
                 _ => None,
             },
@@ -1661,8 +1663,7 @@ impl<'a> FoldingContext<'a> {
         let base_name = self
             .resolve_stack_var(base_offset)
             .unwrap_or_else(|| stack_slot_synthetic_name(base_offset));
-        let mut expr = CExpr::AddrOf(Box::new(CExpr::Var(base_name)));
-
+        let mut expr = CExpr::AddrOf(Box::new(self.name_ref(&base_name)));
         if let Some(index) = &addr.index {
             let mut visited = HashSet::new();
             let index_expr = self.render_value_ref(index, depth + 1, &mut visited)?;

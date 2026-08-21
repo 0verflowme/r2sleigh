@@ -3887,6 +3887,11 @@ mod tests {
     use r2il::{ArchSpec, R2ILBlock, R2ILOp, RegisterDef, SpaceId, Varnode};
     use r2ssa::InterprocSummarySet;
 
+    /// The names a fixture in this module declares.
+    fn test_table() -> std::cell::RefCell<crate::symbol::SymbolTable> {
+        std::cell::RefCell::new(crate::symbol::SymbolTable::new())
+    }
+
     #[test]
     fn prepared_copy_binding_rejects_shared_value_id_before_fact_seeding() {
         let dst = SSAVar::new("dst", 1, 8);
@@ -4308,6 +4313,7 @@ mod tests {
 
     #[test]
     fn prepared_call_expr_requires_argument_value_bijection() {
+        let symbols = test_table();
         let unproved = PreparedCallView {
             callee_identity: Some(CalleeIdentity::from_name("sym.helper")),
             authoritative_args: vec![CExpr::IntLit(7)],
@@ -4349,7 +4355,7 @@ mod tests {
         assert_eq!(
             prepared_call_expr_from_view(&proved),
             Some(CExpr::Call {
-                func: Box::new(CExpr::Var("sym.helper".to_string())),
+                func: Box::new(crate::symbol::var_ref(&symbols, "sym.helper")),
                 args: vec![CExpr::IntLit(7)],
             })
         );
@@ -4357,12 +4363,13 @@ mod tests {
 
     #[test]
     fn prepared_view_resolves_authoritative_call_arg_by_value() {
+        let symbols = test_table();
         let site = (0x1000, 2);
         let view = PreparedSemanticView {
             call_view_by_site: BTreeMap::from([(
                 site,
                 PreparedCallView {
-                    authoritative_args: vec![CExpr::Var("n".to_string()), CExpr::IntLit(7)],
+                    authoritative_args: vec![crate::symbol::var_ref(&symbols, "n"), CExpr::IntLit(7)],
                     authoritative_arg_values: vec![ValueId(26), ValueId(27)],
                     ..PreparedCallView::default()
                 },
@@ -4372,7 +4379,7 @@ mod tests {
 
         assert_eq!(
             view.authoritative_call_arg_expr_for_value(site, ValueId(26)),
-            Some(CExpr::Var("n".to_string()))
+            Some(crate::symbol::var_ref(&symbols, "n"))
         );
         assert_eq!(
             view.authoritative_call_arg_expr_for_value(site, ValueId(99)),
@@ -4386,6 +4393,7 @@ mod tests {
 
     #[test]
     fn prepared_scalar_expr_orders_commutative_params_by_abi_rank() {
+        let symbols = test_table();
         let view = PreparedSemanticView {
             param_rank_by_alias: HashMap::from([
                 ("op".to_string(), 0),
@@ -4398,22 +4406,23 @@ mod tests {
         let expr = prepared_simplify_binary_expr(
             &view,
             BinaryOp::BitXor,
-            CExpr::Var("b".to_string()),
-            CExpr::Var("a".to_string()),
+            crate::symbol::var_ref(&symbols, "b"),
+            crate::symbol::var_ref(&symbols, "a"),
         );
 
         assert_eq!(
             expr,
             CExpr::binary(
                 BinaryOp::BitXor,
-                CExpr::Var("a".to_string()),
-                CExpr::Var("b".to_string())
+                crate::symbol::var_ref(&symbols, "a"),
+                crate::symbol::var_ref(&symbols, "b")
             )
         );
     }
 
     #[test]
     fn prepared_scalar_expr_simplifies_repeated_scaled_add() {
+        let symbols = test_table();
         let view = PreparedSemanticView {
             param_rank_by_alias: HashMap::from([("a".to_string(), 1)]),
             ..PreparedSemanticView::default()
@@ -4421,18 +4430,19 @@ mod tests {
         let expr = prepared_simplify_binary_expr(
             &view,
             BinaryOp::Add,
-            CExpr::Var("a".to_string()),
-            CExpr::binary(BinaryOp::Mul, CExpr::Var("a".to_string()), CExpr::IntLit(2)),
+            crate::symbol::var_ref(&symbols, "a"),
+            CExpr::binary(BinaryOp::Mul, crate::symbol::var_ref(&symbols, "a"), CExpr::IntLit(2)),
         );
 
         assert_eq!(
             expr,
-            CExpr::binary(BinaryOp::Mul, CExpr::Var("a".to_string()), CExpr::IntLit(3))
+            CExpr::binary(BinaryOp::Mul, crate::symbol::var_ref(&symbols, "a"), CExpr::IntLit(3))
         );
     }
 
     #[test]
     fn prepared_scalar_expr_collects_nested_linear_adds_by_param_rank() {
+        let symbols = test_table();
         let view = PreparedSemanticView {
             param_rank_by_alias: HashMap::from([("a".to_string(), 1), ("b".to_string(), 2)]),
             ..PreparedSemanticView::default()
@@ -4440,14 +4450,14 @@ mod tests {
         let expr = prepared_simplify_binary_expr(
             &view,
             BinaryOp::Add,
-            CExpr::Var("b".to_string()),
+            crate::symbol::var_ref(&symbols, "b"),
             CExpr::binary(
                 BinaryOp::Add,
-                CExpr::Var("a".to_string()),
+                crate::symbol::var_ref(&symbols, "a"),
                 CExpr::binary(
                     BinaryOp::Add,
-                    CExpr::Var("a".to_string()),
-                    CExpr::Var("a".to_string()),
+                    crate::symbol::var_ref(&symbols, "a"),
+                    crate::symbol::var_ref(&symbols, "a"),
                 ),
             ),
         );
@@ -4456,8 +4466,8 @@ mod tests {
             expr,
             CExpr::binary(
                 BinaryOp::Add,
-                CExpr::binary(BinaryOp::Mul, CExpr::Var("a".to_string()), CExpr::IntLit(3)),
-                CExpr::Var("b".to_string())
+                CExpr::binary(BinaryOp::Mul, crate::symbol::var_ref(&symbols, "a"), CExpr::IntLit(3)),
+                crate::symbol::var_ref(&symbols, "b")
             )
         );
     }
@@ -5059,49 +5069,50 @@ mod tests {
         };
 
         assert!(!prepared_render_definition_is_safe(
-            &CExpr::Var("tmp:1".to_string()),
+            &crate::symbol::var_ref(&symbols, "tmp:1"),
             &env
         ));
         assert!(!prepared_render_definition_is_safe(
-            &CExpr::Var("ram:401000".to_string()),
+            &crate::symbol::var_ref(&symbols, "ram:401000"),
             &env
         ));
         assert!(!prepared_render_definition_is_safe(
-            &CExpr::Var("unique:1".to_string()),
+            &crate::symbol::var_ref(&symbols, "unique:1"),
             &env
         ));
         assert!(!prepared_render_definition_is_safe(
-            &CExpr::Var("RDI".to_string()),
+            &crate::symbol::var_ref(&symbols, "RDI"),
             &env
         ));
         assert!(!prepared_render_definition_is_safe(
-            &CExpr::Var("RBP".to_string()),
+            &crate::symbol::var_ref(&symbols, "RBP"),
             &env
         ));
         assert!(!prepared_render_definition_is_safe(
-            &CExpr::Var("RAX".to_string()),
+            &crate::symbol::var_ref(&symbols, "RAX"),
             &env
         ));
         assert!(!prepared_render_definition_is_safe(
-            &CExpr::Var("RCX".to_string()),
+            &crate::symbol::var_ref(&symbols, "RCX"),
             &env
         ));
         assert!(prepared_render_definition_is_safe(
-            &CExpr::Var("const:1".to_string()),
+            &crate::symbol::var_ref(&symbols, "const:1"),
             &env
         ));
         assert!(prepared_render_definition_is_safe(
-            &CExpr::Var("space1:20".to_string()),
+            &crate::symbol::var_ref(&symbols, "space1:20"),
             &env
         ));
         assert!(prepared_render_definition_is_safe(
-            &CExpr::Var("value".to_string()),
+            &crate::symbol::var_ref(&symbols, "value"),
             &env
         ));
     }
 
     #[test]
     fn prepared_fallback_visible_expr_rejects_only_unrenderable_storage_names() {
+        let symbols = test_table();
         assert_eq!(
             prepared_fallback_visible_expr(&SSAVar::constant(1, 8)),
             None
@@ -5120,63 +5131,65 @@ mod tests {
         );
         assert_eq!(
             prepared_fallback_visible_expr(&test_var("space1:20", 0, 8)),
-            Some(CExpr::Var("space1:20".to_string()))
+            Some(crate::symbol::var_ref(&symbols, "space1:20"))
         );
         assert_eq!(
             prepared_fallback_visible_expr(&test_var("rax", 0, 8)),
-            Some(CExpr::Var("rax".to_string()))
+            Some(crate::symbol::var_ref(&symbols, "rax"))
         );
     }
 
     #[test]
     fn self_render_definition_uses_typed_temporary_render_name() {
+        let symbols = test_table();
         let dst = test_var("tmp:11f80", 2, 8);
         assert!(is_self_render_definition(
             &dst,
-            &CExpr::Var("t11f80_2".to_string())
+            &crate::symbol::var_ref(&symbols, "t11f80_2")
         ));
         assert!(is_self_render_definition(
             &dst,
-            &CExpr::Var(dst.display_name())
+            &CExpr::Var(symbols.borrow_mut().declare_or_reuse(&dst.display_name()))
         ));
         assert!(!is_self_render_definition(
             &dst,
-            &CExpr::Var("t11f80_3".to_string())
+            &crate::symbol::var_ref(&symbols, "t11f80_3")
         ));
 
         let version_zero_temp = test_var("tmp:11f80", 0, 8);
         assert!(is_self_render_definition(
             &version_zero_temp,
-            &CExpr::Var("t11f80".to_string())
+            &crate::symbol::var_ref(&symbols, "t11f80")
         ));
         assert!(!is_self_render_definition(
             &version_zero_temp,
-            &CExpr::Var("t11f80_0".to_string())
+            &crate::symbol::var_ref(&symbols, "t11f80_0")
         ));
 
         let versioned_reg = test_var("rax", 2, 8);
         assert!(is_self_render_definition(
             &versioned_reg,
-            &CExpr::Var("rax_2".to_string())
+            &crate::symbol::var_ref(&symbols, "rax_2")
         ));
         assert!(!is_self_render_definition(
             &versioned_reg,
-            &CExpr::Var("rax".to_string())
+            &crate::symbol::var_ref(&symbols, "rax")
         ));
 
         let version_zero_reg = test_var("rbx", 0, 8);
         assert!(is_self_render_definition(
             &version_zero_reg,
-            &CExpr::Var("rbx".to_string())
+            &crate::symbol::var_ref(&symbols, "rbx")
         ));
         assert!(!is_self_render_definition(
             &version_zero_reg,
-            &CExpr::Var("rbx_0".to_string())
+            &crate::symbol::var_ref(&symbols, "rbx_0")
         ));
     }
 
     #[test]
     fn prepared_signed_dividend_expr_collapses_cdq_pair_to_low_root() {
+        let symbols = test_table();
         let eax = test_var("EAX", 1, 4);
         let edx = test_var("EDX", 1, 4);
         let sext = test_var("tmp:sext", 1, 8);
@@ -5223,18 +5236,19 @@ mod tests {
             (dividend.clone(), &dividend_op),
         ]);
         let view = PreparedSemanticView {
-            owner_expr_by_name: HashMap::from([(eax.display_name(), CExpr::Var("a".to_string()))]),
+            owner_expr_by_name: HashMap::from([(eax.display_name(), crate::symbol::var_ref(&symbols, "a"))]),
             ..PreparedSemanticView::default()
         };
 
         assert_eq!(
             prepared_signed_dividend_expr(&view, &producers, &dividend),
-            Some(CExpr::Var("a".to_string()))
+            Some(crate::symbol::var_ref(&symbols, "a"))
         );
     }
 
     #[test]
     fn prepared_signed_dividend_expr_accepts_direct_sign_extended_high_limb() {
+        let symbols = test_table();
         let eax = test_var("EAX", 1, 4);
         let sext = test_var("tmp:sext", 1, 8);
         let high_zext = test_var("tmp:high_zext", 1, 8);
@@ -5274,13 +5288,13 @@ mod tests {
             (dividend.clone(), &dividend_op),
         ]);
         let view = PreparedSemanticView {
-            owner_expr_by_name: HashMap::from([(eax.display_name(), CExpr::Var("a".to_string()))]),
+            owner_expr_by_name: HashMap::from([(eax.display_name(), crate::symbol::var_ref(&symbols, "a"))]),
             ..PreparedSemanticView::default()
         };
 
         assert_eq!(
             prepared_signed_dividend_expr(&view, &producers, &dividend),
-            Some(CExpr::Var("a".to_string()))
+            Some(crate::symbol::var_ref(&symbols, "a"))
         );
     }
 

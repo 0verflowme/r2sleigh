@@ -577,6 +577,10 @@ mod tests {
     use crate::ast::CType;
     use r2ssa::SSAOp;
     use std::collections::HashMap;
+    /// The names a fixture in this module declares.
+    fn test_table() -> std::cell::RefCell<crate::symbol::SymbolTable> {
+        std::cell::RefCell::new(crate::symbol::SymbolTable::new())
+    }
 
     #[test]
     fn preferred_stack_alias_requires_offset_match_for_non_generic_override() {
@@ -598,22 +602,24 @@ mod tests {
 
     #[test]
     fn normalize_scalar_stack_load_expr_keeps_named_slot_over_address_alias() {
+        let symbols = test_table();
         let slot = StackSlotProvenance {
             offset: -0x14,
             predicate_carrier: false,
             return_carrier: false,
             value_kind: StackSlotValueKind::Scalar,
         };
-        let expr = CExpr::AddrOf(Box::new(CExpr::Var("a".to_string())));
+        let expr = CExpr::AddrOf(Box::new(crate::symbol::var_ref(&symbols, "a")));
 
         assert_eq!(
             normalize_scalar_stack_load_expr(expr, Some("a"), Some(slot)),
-            CExpr::Var("a".to_string())
+            crate::symbol::var_ref(&symbols, "a")
         );
     }
 
     #[test]
     fn normalize_scalar_stack_load_expr_keeps_named_slot_over_literal_seed() {
+        let symbols = test_table();
         let slot = StackSlotProvenance {
             offset: -0x2c,
             predicate_carrier: false,
@@ -623,7 +629,7 @@ mod tests {
 
         assert_eq!(
             normalize_scalar_stack_load_expr(CExpr::IntLit(1), Some("local_2c"), Some(slot)),
-            CExpr::Var("local_2c".to_string())
+            crate::symbol::var_ref(&symbols, "local_2c")
         );
     }
 
