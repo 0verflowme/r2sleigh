@@ -658,6 +658,24 @@ The `-O1` FNV-1a 32 case renders its loop body and returns the accumulator. The
 thirty-six-rendering corpus is re-measured, and every rendering that is not
 correct is accounted for by a ledger entry naming the layer that refused it.
 
+## One more parallel pipeline, found late
+
+There are two builders for `UseInfo`. `build_prepared_runtime_facts_with_control`
+runs when a prepared SSA artifact is present and returns early;
+`analyze_with_definition_overrides_mode` runs when one is not, with a
+re-analysis loop over stack definition overrides.
+
+Production never takes the second. The only construction of `FoldInputs` outside
+test code passes `prepared_ssa: Some(prepared)`, and both `None` sites are test
+helpers. So one of the two implementations exists to serve tests that did not
+want to build an artifact, and the fold seeds aliases into both because a change
+that seeded only one silently did nothing -- which is how this was noticed.
+
+That is the same fault this decision is about, in a place it did not look:
+one job, two implementations, and the one production uses is not the one most
+tests exercise. Collapsing it means giving those tests a prepared artifact, which
+is worth doing and is not small.
+
 ## Where to start
 
 Everything still outstanding waits on one change, and three separate attempts
