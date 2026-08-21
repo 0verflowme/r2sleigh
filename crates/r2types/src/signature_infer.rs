@@ -65,6 +65,25 @@ pub struct RecoveredSignatureParam {
     pub initial_ty: CTypeLike,
 }
 
+/// Type inference told which registers this target's convention actually uses.
+///
+/// The lifter states the convention; a pointer width does not. Inferring the ABI
+/// from `ptr_bits == 64` answers System V AMD64 for arm64 as well, which is how
+/// an arm64 function came to have its parameters looked for in `rdi`.
+fn convention_type_inference(prepared: &SsaArtifact, ptr_bits: u32) -> TypeInference {
+    let context = prepared.machine_context();
+    let arg_regs = context.argument_register_names();
+    if arg_regs.is_empty() {
+        return TypeInference::new(ptr_bits);
+    }
+    let ret_regs = context
+        .result_slot()
+        .and_then(|slot| context.register_name(slot))
+        .into_iter()
+        .collect();
+    TypeInference::new_with_abi(ptr_bits, arg_regs, ret_regs)
+}
+
 pub fn infer_signature_from_prepared_ssa(prepared: &SsaArtifact) -> InferredSignature {
     let function_name = prepared
         .function()
@@ -79,7 +98,7 @@ pub fn infer_signature_from_prepared_ssa(prepared: &SsaArtifact) -> InferredSign
     let recovered_params = recover_signature_params_from_prepared_ssa(prepared, ptr_bits);
     let arch_name = prepared_arch_name(prepared).unwrap_or("");
     let evidence_ctx = crate::prepare::collect_signature_type_evidence_context(&ssa_blocks);
-    let mut type_inference = TypeInference::new(ptr_bits);
+    let mut type_inference = convention_type_inference(prepared, ptr_bits);
     type_inference.set_prepared_ssa(prepared);
     type_inference.infer_function(prepared);
     let certified_parameter_widths = certified_parameter_memory_widths(prepared);

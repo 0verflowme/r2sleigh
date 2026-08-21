@@ -1069,6 +1069,30 @@ impl SourceMachineContext {
             .copied()
     }
 
+    /// The registers the calling convention would place arguments in, in order.
+    ///
+    /// The convention is stated by the lifter that knows the target. Deriving it
+    /// from a pointer width instead answers the same ABI for every 64-bit
+    /// architecture, which is how arm64 came to be told it uses `rdi`.
+    pub fn argument_register_names(&self) -> Vec<String> {
+        let Some(slots) = self.convention_slots.as_ref() else {
+            return Vec::new();
+        };
+        slots
+            .argument_slots()
+            .iter()
+            .filter_map(|storage| self.register_name(*storage))
+            .collect()
+    }
+
+    /// The name the architecture gives this storage, when it names it exactly.
+    pub fn register_name(&self, storage: CanonicalStorageId) -> Option<String> {
+        self.register_storages_by_name
+            .iter()
+            .find(|(_, candidate)| **candidate == storage)
+            .map(|(name, _)| name.clone())
+    }
+
     pub const fn register_storages_by_name(&self) -> &BTreeMap<String, CanonicalStorageId> {
         &self.register_storages_by_name
     }
@@ -1343,6 +1367,48 @@ mod tests {
         arch.add_register(RegisterDef::new("target", 16, 8));
         arch.add_register(RegisterDef::new("arg", 24, 8));
         arch
+    }
+
+    #[test]
+    fn argument_registers_come_from_the_convention_not_the_pointer_width() {
+        let mut arch = ArchSpec::new("AARCH64:LE:64:v8A");
+        arch.addr_size = 8;
+        arch.add_space(AddressSpace::ram(8));
+        for (index, name) in ["x0", "x1", "x2"].into_iter().enumerate() {
+            arch.add_register(RegisterDef::new(name, index as u64 * 8, 8));
+        }
+        let slots = SourceConventionSlots::new(
+            "aapcs64",
+            [
+                register_storage(0, 8),
+                register_storage(8, 8),
+                register_storage(16, 8),
+            ],
+            Some(register_storage(0, 8)),
+        )
+        .expect("register slots are well formed");
+
+        let context = SourceMachineContext::from_blocks_with_interfaces(
+            &[],
+            Some(&arch),
+            None,
+            SourceMachineRoles::default(),
+            Some(slots),
+            Vec::new(),
+        );
+
+        assert_eq!(context.argument_register_names(), vec!["x0", "x1", "x2"]);
+        assert_eq!(
+            context.register_name(register_storage(8, 8)).as_deref(),
+            Some("x1")
+        );
+    }
+
+    #[test]
+    fn argument_registers_are_absent_when_no_convention_was_supplied() {
+        let arch = ArchSpec::new("AARCH64:LE:64:v8A");
+        let context = SourceMachineContext::from_blocks(&[], Some(&arch));
+        assert!(context.argument_register_names().is_empty());
     }
 
     #[test]

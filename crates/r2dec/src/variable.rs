@@ -123,26 +123,6 @@ pub struct VariableRecovery {
 }
 
 impl VariableRecovery {
-    /// Create a new variable recovery context.
-    pub fn new(sp_name: &str, fp_name: &str, ptr_size: u32) -> Self {
-        let (arg_regs, ret_regs) = if ptr_size == 64 {
-            (
-                vec![
-                    "rdi".to_string(),
-                    "rsi".to_string(),
-                    "rdx".to_string(),
-                    "rcx".to_string(),
-                    "r8".to_string(),
-                    "r9".to_string(),
-                ],
-                vec!["rax".to_string(), "eax".to_string()],
-            )
-        } else {
-            (vec![], vec!["eax".to_string()])
-        };
-        Self::new_with_abi(sp_name, fp_name, ptr_size, arg_regs, ret_regs)
-    }
-
     /// Create a new variable recovery context with explicit ABI registers.
     pub fn new_with_abi(
         sp_name: &str,
@@ -904,6 +884,24 @@ fn is_generic_arg_name(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// The System V AMD64 registers these tests were written against.
+    ///
+    /// Naming the target here keeps the one ABI table in the decompiler with
+    /// the lifter that supplies it. Inferring an ABI from a pointer width, as
+    /// this used to, answers x86-64 for arm64 as well.
+    fn sysv_amd64_recovery() -> VariableRecovery {
+        VariableRecovery::new_with_abi(
+            "rsp",
+            "rbp",
+            64,
+            ["rdi", "rsi", "rdx", "rcx", "r8", "r9"]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            ["rax", "eax"].into_iter().map(str::to_string).collect(),
+        )
+    }
+
     use super::*;
     use r2il::{R2ILBlock, R2ILOp, Varnode};
     use r2ssa::SSAFunction;
@@ -998,7 +996,7 @@ mod tests {
 
     #[test]
     fn test_gen_param_name() {
-        let mut vr = VariableRecovery::new("rsp", "rbp", 64);
+        let mut vr = sysv_amd64_recovery();
 
         let var_rdi = SSAVar::new("reg:rdi", 0, 64);
         assert_eq!(vr.gen_param_name(&var_rdi), "arg0");
@@ -1009,7 +1007,7 @@ mod tests {
 
     #[test]
     fn test_gen_var_name() {
-        let mut vr = VariableRecovery::new("rsp", "rbp", 64);
+        let mut vr = sysv_amd64_recovery();
 
         let var1 = SSAVar::new("reg:0", 1, 64);
         let name1 = vr.gen_var_name(&var1);
@@ -1028,7 +1026,7 @@ mod tests {
 
     #[test]
     fn test_stack_var_name() {
-        let mut vr = VariableRecovery::new("rsp", "rbp", 64);
+        let mut vr = sysv_amd64_recovery();
 
         let name = vr.gen_stack_var_name(8);
         assert_eq!(name, "local_8");
@@ -1039,7 +1037,7 @@ mod tests {
 
     #[test]
     fn same_stack_slot_reuses_one_c_identity() {
-        let mut vr = VariableRecovery::new("rsp", "rbp", 64);
+        let mut vr = sysv_amd64_recovery();
 
         assert_eq!(vr.gen_stack_var_name(-8), "arg_8");
         assert_eq!(vr.gen_stack_var_name(-8), "arg_8");
@@ -1047,7 +1045,7 @@ mod tests {
 
     #[test]
     fn test_external_stack_var_name_preferred() {
-        let mut vr = VariableRecovery::new("rsp", "rbp", 64);
+        let mut vr = sysv_amd64_recovery();
         vr.set_type_facts(FunctionTypeFacts {
             visible_bindings: vec![visible_stack_binding(
                 "user_input",
@@ -1067,7 +1065,7 @@ mod tests {
 
     #[test]
     fn test_external_stack_var_name_fallback_when_missing() {
-        let mut vr = VariableRecovery::new("rsp", "rbp", 64);
+        let mut vr = sysv_amd64_recovery();
         vr.set_type_facts(FunctionTypeFacts {
             external_stack_vars: HashMap::from([(
                 -0x10,
@@ -1082,7 +1080,7 @@ mod tests {
 
     #[test]
     fn test_external_stack_var_name_collision_still_unique() {
-        let mut vr = VariableRecovery::new("rsp", "rbp", 64);
+        let mut vr = sysv_amd64_recovery();
         vr.set_type_facts(FunctionTypeFacts {
             external_stack_vars: HashMap::from([
                 (8, stack_var_spec_from_ctype("buf", None, Some("RBP"))),
@@ -1099,7 +1097,7 @@ mod tests {
 
     #[test]
     fn test_external_stack_var_name_prefers_mirrored_rbp_offset() {
-        let mut vr = VariableRecovery::new("rsp", "rbp", 64);
+        let mut vr = sysv_amd64_recovery();
         vr.set_type_facts(FunctionTypeFacts {
             external_stack_vars: HashMap::from([(
                 -4,
@@ -1114,7 +1112,7 @@ mod tests {
 
     #[test]
     fn test_external_stack_var_name_matching_param_alias_falls_back_to_generic_local() {
-        let mut vr = VariableRecovery::new("rsp", "rbp", 64);
+        let mut vr = sysv_amd64_recovery();
         let mut type_facts = type_facts_with_external_signature(signature_spec(vec![
             ("a", Some(CType::Int(32))),
             ("b", Some(CType::Int(32))),
@@ -1131,7 +1129,7 @@ mod tests {
 
     #[test]
     fn test_external_signature_overrides_meaningful_param_name_and_type() {
-        let mut vr = VariableRecovery::new("rsp", "rbp", 64);
+        let mut vr = sysv_amd64_recovery();
         let mut type_facts = type_facts_with_external_signature(signature_spec(vec![(
             "user_input",
             Some(CType::ptr(CType::Int(8))),
@@ -1176,7 +1174,7 @@ mod tests {
             },
         ];
 
-        let mut vr = VariableRecovery::new("rsp", "rbp", 64);
+        let mut vr = sysv_amd64_recovery();
         vr.set_type_facts(FunctionTypeFacts {
             visible_bindings: vec![visible_stack_binding("len", Some(CType::UInt(64)), -8)],
             ..FunctionTypeFacts::default()
@@ -1217,7 +1215,7 @@ mod tests {
             },
         ];
 
-        let mut vr = VariableRecovery::new("rsp", "rbp", 64);
+        let mut vr = sysv_amd64_recovery();
         vr.set_type_facts(FunctionTypeFacts {
             stack_slots: std::collections::BTreeMap::from([(
                 StackSlotKey {
@@ -1241,7 +1239,7 @@ mod tests {
 
     #[test]
     fn test_external_signature_generic_param_name_is_ignored() {
-        let mut vr = VariableRecovery::new("rsp", "rbp", 64);
+        let mut vr = sysv_amd64_recovery();
         vr.set_type_facts(type_facts_with_external_signature(signature_spec(vec![(
             "arg0",
             Some(CType::Int(32)),
@@ -1257,7 +1255,7 @@ mod tests {
 
     #[test]
     fn test_external_signature_type_override_only_when_available() {
-        let mut vr = VariableRecovery::new("rsp", "rbp", 64);
+        let mut vr = sysv_amd64_recovery();
         vr.set_type_facts(type_facts_with_external_signature(signature_spec(vec![(
             "count", None,
         )])));
@@ -1294,7 +1292,7 @@ mod tests {
             },
         ];
 
-        let mut vr = VariableRecovery::new("rsp", "rbp", 64);
+        let mut vr = sysv_amd64_recovery();
         vr.set_type_facts(FunctionTypeFacts {
             external_stack_vars: HashMap::from([(
                 -4,
@@ -1355,7 +1353,7 @@ mod tests {
             func
         };
         let stack_offsets_for_space = |space| {
-            let mut recovery = VariableRecovery::new("rsp", "rbp", 64);
+            let mut recovery = sysv_amd64_recovery();
             recovery.recover(&function_for_space(space), &symbols);
             recovery
                 .locals()
@@ -1370,7 +1368,7 @@ mod tests {
 
     #[test]
     fn parameters_are_sorted_by_abi_ordinal_before_rendered_name() {
-        let mut vr = VariableRecovery::new("rsp", "rbp", 64);
+        let mut vr = sysv_amd64_recovery();
         let first = SSAVar::new("reg:rdi", 0, 64);
         let second = SSAVar::new("reg:rsi", 0, 64);
 
@@ -1397,7 +1395,7 @@ mod tests {
 
     #[test]
     fn locals_are_sorted_by_stack_offset_then_name_then_ssa_name() {
-        let mut vr = VariableRecovery::new("rsp", "rbp", 64);
+        let mut vr = sysv_amd64_recovery();
         let local_c = SSAVar::new("tmp:c", 1, 32);
         let local_a = SSAVar::new("tmp:a", 1, 32);
         let local_b = SSAVar::new("tmp:b", 1, 32);
