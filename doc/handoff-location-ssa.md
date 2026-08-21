@@ -793,3 +793,45 @@ the value entering the loop rather than to the merge. That is the same shape as
 the return-value picker worked on earlier in this branch, and it is downstream of
 everything the three gates control. Instrument the return operand's resolution
 before touching liveness again.
+
+### The loop carrier is lost at the exit merge, not at any liveness gate
+
+Instrumenting the return operand says what is actually rendered:
+
+    retval block=108 idx=1
+      raw=(IntLit(899) & IntLit(65535)) | IntLit(1939668992)
+      certified=Some(ValueId(91))
+
+`(899 & 0xffff) | 0x739d0000` is `0x739d0383`, the low half of the FNV offset
+basis, assembled from the `movz`/`movk` pair that initialises the hash **before**
+the loop. So the certified return value is `ValueId(91)`, the exit phi `X0_5`,
+and the expression rendered for it is that phi's entry-edge source.
+
+Two fixes were built for this and both are out of the tree.
+
+**Refusing to inline a definition of a multiply-assigned name.** Materialisation
+gives a carrier two edge assignments under one name, so `rebuild_definitions`
+records one and silently overwrites the other. Recording which names were
+assigned twice works and finds exactly the right ones:
+
+    multiprobe ["X0_3", "X1_1", "X8_2"]
+
+Those are the three certified carriers. It changed no output, because the return
+resolves `X0_5`, a different phi, and not through that path.
+
+**Refusing to resolve a non-degenerate phi to one of its sources.** A merge of
+two different values is not either of them, and answering with a source is
+exactly how the entry value reaches the return. Refusing it removes the wrong
+constant and puts nothing in its place:
+
+    return 0x739d0383;   ->   return pc;
+
+with the undefined-name count going from one to two. So the wrong answer was the
+only answer: nothing connects the exit phi `X0_5` to `x0`, the variable that
+materialising the header phi `X0_3` created, even though both are certified
+carriers of the same storage.
+
+**That connection is the defect.** The exit merge of a materialised carrier must
+resolve to the carrier's variable. Neither refusing the inline nor blocking the
+overwrite helps until it does, which is why both were reverted rather than left
+in as partial fixes.
