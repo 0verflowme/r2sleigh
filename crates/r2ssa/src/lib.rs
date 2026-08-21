@@ -47,6 +47,7 @@ pub mod phi;
 pub mod recover_interface;
 pub mod rename;
 pub mod semantic;
+pub mod span;
 pub mod taint;
 pub mod var;
 

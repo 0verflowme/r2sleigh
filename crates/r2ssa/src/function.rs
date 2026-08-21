@@ -613,6 +613,30 @@ impl SsaArtifact {
         crate::abi::AbiProfile::from_machine_context(&self.machine_context)
     }
 
+    /// Where each storage stops holding one value and starts holding another.
+    pub fn storage_spans(&self) -> crate::span::StorageSpans {
+        crate::span::StorageSpans::compute(&self.function, &self.graph)
+    }
+
+    /// Carriers whose values are not all one storage holding one value.
+    ///
+    /// A carrier is state a register preserves, and a register is reused, so a
+    /// carrier can reach across the point where its storage changed meaning.
+    /// Anything that wants to call a carrier one variable has to ask this first.
+    pub fn carriers_spanning_a_reuse(&self) -> std::collections::BTreeSet<crate::SemanticId> {
+        let spans = self.storage_spans();
+        let mut spanning = std::collections::BTreeSet::new();
+        for loop_fact in self.facts.structured.loops.values() {
+            for carrier in &loop_fact.carriers {
+                let members = crate::mirror::carrier_members(carrier);
+                if !spans.all_one_span(members.iter().copied()) {
+                    spanning.insert(carrier.id);
+                }
+            }
+        }
+        spanning
+    }
+
     /// Carriers this function moves through memory that already holds them.
     ///
     /// A register the loop spills to a frame slot and reloads is not what
