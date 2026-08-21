@@ -340,12 +340,22 @@ xmm1_3, xmm6_5, xmm2_4)` reads `xmm6_5`, which the elided copy was going to
 produce. Every missing version is a copy destination; every rendered one is the
 result of real arithmetic.
 
-`use_info` records `dst -> src` for every `SSAOp::Copy` in `copy_sources`
-(around line 2473), and `resolve_copy_root_name_in_fold` walks that chain to the
-root. So the machinery to rewrite the reader exists. What to check is whether
-the `callother` argument lowering asks it: if a copy is dropped as redundant and
-its uses are not resolved to the copy root, the use is left naming a definition
-that no longer exists.
+Two explanations were tried and both are eliminated, so do not spend time on
+them again:
+
+- **Not a missing copy-root resolution in `get_expr`.** `use_info` records
+  `dst -> src` for every `SSAOp::Copy`, and `resolve_copy_root_name_in_fold`
+  walks the chain, so the machinery exists. Adding a fallback there changes
+  nothing, and an instrumented build shows why: **`get_expr` is never called for
+  these names at all.** Whatever renders `xmm6_5` into the `callother` argument
+  list reaches it by another route.
+- **Not a gap in SSA copy propagation.** `optimize::copy_propagation` removes
+  copies and rewrites uses, and `CallOther` inputs are mapped along with every
+  other operand, so a propagated copy does not leave its readers behind.
+
+The next thing to find is which path does build those argument expressions,
+since it is not the one every other operand goes through. Instrument
+`assignment_lhs_expr` and `var_ref` rather than `get_expr`.
 
 That is the dangling-read defect, and it is worth more than the lane model,
 because it also explains the duplicated statements around it: the same
