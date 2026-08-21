@@ -444,14 +444,19 @@ pub(crate) fn names_mentioned_without_a_declaration(
     undeclared
 }
 
-/// Declare an induction variable a `for` assigns and nothing else declares.
+/// Declare a name the body assigns and nothing else declares.
 ///
-/// Structuring turns a while into a for after the pass that declares carriers
-/// has run, so the name the init assigns is introduced when nothing is left to
-/// notice it. C requires it declared, and the slot may be read after the loop,
-/// so the declaration is hoisted ahead of the statement rather than folded into
-/// the init.
-pub(crate) fn declare_for_init_targets(func: &mut CFunction) {
+/// Structuring rewrites loops after the pass that declares carriers has run, so
+/// an assignment it introduces -- a for's init, or one folded into its
+/// condition -- names something when nothing is left to notice. C requires a
+/// declaration, and the slot may be read after the loop, so it is hoisted to
+/// the function rather than folded into the statement.
+///
+/// Only names the body *assigns* are declared. A name that is only ever read
+/// has no definition, and declaring it would turn a dangling reference into
+/// valid C that reads uninitialised memory, hiding the defect instead of
+/// reporting it.
+pub(crate) fn declare_assigned_names_without_a_declaration(func: &mut CFunction) {
     let declared = func
         .params
         .iter()
@@ -459,8 +464,8 @@ pub(crate) fn declare_for_init_targets(func: &mut CFunction) {
         .chain(func.locals.iter().map(|local| local.name))
         .chain(crate::declarations_in_stmts(&func.body))
         .collect::<std::collections::HashSet<_>>();
-    let mut hoisted = Vec::new();
-    hoist_in_block(&mut func.body, &declared, &mut hoisted);
+    let mut hoisted: Vec<(crate::symbol::SymbolId, crate::ast::CType)> = Vec::new();
+    collect_assigned_undeclared(&func.body, &declared, &mut hoisted);
     for (name, ty) in hoisted {
         func.locals.push(crate::ast::CLocal {
             ty,
@@ -470,29 +475,55 @@ pub(crate) fn declare_for_init_targets(func: &mut CFunction) {
     }
 }
 
-fn hoist_in_block(
-    stmts: &mut Vec<CStmt>,
+/// Every undeclared name an assignment anywhere in these statements writes to.
+fn collect_assigned_undeclared(
+    stmts: &[CStmt],
     declared: &std::collections::HashSet<crate::symbol::SymbolId>,
-    hoisted: &mut Vec<(crate::symbol::SymbolId, crate::ast::CType)>,
+    out: &mut Vec<(crate::symbol::SymbolId, crate::ast::CType)>,
 ) {
-    for stmt in stmts.iter_mut() {
-        if let CStmt::For { init: Some(init), .. } = stmt
-            && let CStmt::Expr(CExpr::Binary {
-                op: crate::ast::BinaryOp::Assign,
-                left,
-                right,
-            }) = init.as_ref()
-            && let CExpr::Var(name) = left.as_ref()
-            && !declared.contains(name)
-            && !hoisted.iter().any(|(seen, _)| seen == name)
-        {
-            hoisted.push((*name, width_of_initial_value(right)));
+    for stmt in stmts {
+        let mut inspect = |expr: &CExpr| {
+            expr.visit(&mut |node| {
+                if let CExpr::Binary {
+                    op: crate::ast::BinaryOp::Assign,
+                    left,
+                    right,
+                } = node
+                    && let CExpr::Var(name) = left.as_ref()
+                    && !declared.contains(name)
+                    && !out.iter().any(|(seen, _)| seen == name)
+                {
+                    out.push((*name, width_of_initial_value(right)));
+                }
+            });
+        };
+        match stmt {
+            CStmt::Expr(expr) | CStmt::Return(Some(expr)) => inspect(expr),
+            CStmt::If { cond, .. } | CStmt::While { cond, .. } | CStmt::DoWhile { cond, .. } => {
+                inspect(cond)
+            }
+            CStmt::For {
+                init, cond, update, ..
+            } => {
+                if let Some(CStmt::Expr(expr)) = init.as_deref() {
+                    inspect(expr);
+                }
+                if let Some(cond) = cond {
+                    inspect(cond);
+                }
+                if let Some(update) = update {
+                    inspect(update);
+                }
+            }
+            CStmt::Switch { expr, .. } => inspect(expr),
+            _ => {}
         }
-        crate::single_evaluation::for_each_child_block_mut(stmt, &mut |body, _| {
-            hoist_in_block(body, declared, hoisted);
+        crate::single_evaluation::for_each_child_block(stmt, &mut |body| {
+            collect_assigned_undeclared(body, declared, out);
         });
     }
 }
+
 
 /// The type to declare an induction variable with, taken from what it starts as.
 fn width_of_initial_value(value: &CExpr) -> crate::ast::CType {

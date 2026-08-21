@@ -417,7 +417,7 @@ pub(crate) fn for_each_expr_mut(stmt: &mut CStmt, f: &mut impl FnMut(&mut CExpr)
     }
 }
 
-fn for_each_child_block(stmt: &CStmt, f: &mut impl FnMut(&[CStmt])) {
+pub(crate) fn for_each_child_block(stmt: &CStmt, f: &mut impl FnMut(&[CStmt])) {
     match stmt {
         CStmt::Block(stmts) => f(stmts),
         CStmt::If {
