@@ -1824,6 +1824,13 @@ impl<'a> FoldingContext<'a> {
     pub(crate) fn consumed_by_call_set(&self) -> &HashSet<String> {
         &self.use_info().consumed_by_call
     }
+    /// Declare a name and return the identifier that refers to it.
+    ///
+    /// One statement, so the borrow never spans a nested build.
+    pub(crate) fn sym(&self, name: &str) -> crate::symbol::SymbolId {
+        self.symbols.borrow_mut().declare_or_reuse(name)
+    }
+
     pub(crate) fn var_aliases_map(&self) -> &HashMap<String, String> {
         &self.use_info().var_aliases
     }

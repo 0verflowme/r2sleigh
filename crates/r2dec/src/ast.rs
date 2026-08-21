@@ -709,6 +709,11 @@ impl CStmt {
 /// A C function definition.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CFunction {
+    /// Every name this function declares.
+    ///
+    /// Owned here because every pass that runs after folding already takes
+    /// `&mut CFunction`, so none of them needs the table threaded to it.
+    pub symbols: crate::symbol::SymbolTable,
     /// Function name.
     pub name: String,
     /// Return type.
@@ -750,6 +755,7 @@ impl CFunction {
     /// Create a new function.
     pub fn new(name: impl Into<String>, ret_type: CType) -> Self {
         Self {
+            symbols: crate::symbol::SymbolTable::new(),
             name: name.into(),
             ret_type,
             params: Vec::new(),

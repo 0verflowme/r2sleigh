@@ -3248,6 +3248,7 @@ impl Decompiler {
             })
             .collect::<Vec<_>>();
         let mut c_function = CFunction {
+            symbols: crate::symbol::SymbolTable::new(),
             name: func_name,
             ret_type: render_signature
                 .and_then(|sig| sig.ret_type.as_ref().map(type_like_to_ctype))
@@ -5890,6 +5891,7 @@ mod tests {
     #[test]
     fn test_final_function_body_prune_removes_late_dead_sleigh_temps() {
         let mut func = CFunction {
+            symbols: crate::symbol::SymbolTable::new(),
             name: "late_prune".to_string(),
             ret_type: CType::i64(),
             params: Vec::new(),
@@ -10083,6 +10085,7 @@ mod tests {
             None,
         );
         let mut func = CFunction {
+            symbols: crate::symbol::SymbolTable::new(),
             name: "dbg.gettext_quote".to_string(),
             ret_type: CType::ptr(CType::Int(8)),
             params: Vec::new(),
@@ -10133,6 +10136,7 @@ mod tests {
             None,
         );
         let mut func = CFunction {
+            symbols: crate::symbol::SymbolTable::new(),
             name: "dbg.return_arg_summary".to_string(),
             ret_type: CType::ptr(CType::Int(8)),
             params: Vec::new(),
@@ -10183,6 +10187,7 @@ mod tests {
             None,
         );
         let mut func = CFunction {
+            symbols: crate::symbol::SymbolTable::new(),
             name: "dbg.alloc_wrapper2".to_string(),
             ret_type: CType::ptr(CType::Int(8)),
             params: Vec::new(),

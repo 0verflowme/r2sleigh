@@ -193,6 +193,12 @@ pub(crate) struct FoldingContext<'a> {
     pub(crate) folded_blocks: std::cell::RefCell<std::collections::BTreeSet<u64>>,
     /// One name per certified loop carrier, derived once because it is settled once.
     pub(crate) carrier_aliases: HashMap<String, String>,
+    /// Names minted while folding, handed to the function when it is built.
+    ///
+    /// A cell because the builders take `&self`. Minting has to borrow, insert
+    /// and drop inside one statement: a borrow held across a nested build would
+    /// panic, and nested builds are the ordinary case here.
+    pub(crate) symbols: std::cell::RefCell<crate::symbol::SymbolTable>,
     /// Op sites the fold dropped without recording that anything rendered them,
     /// keyed by why. An accounting of what the output owes reads these as debts
     /// it never paid, so knowing which are deliberate is what separates a
@@ -266,6 +272,7 @@ impl<'a> FoldingContext<'a> {
         };
         Self {
             carrier_aliases,
+            symbols: std::cell::RefCell::new(crate::symbol::SymbolTable::new()),
             inputs,
             state: FoldState::default(),
             current_block_addr: Cell::new(None),

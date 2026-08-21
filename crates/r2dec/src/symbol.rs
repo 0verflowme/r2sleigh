@@ -150,6 +150,27 @@ impl SymbolTable {
         )
     }
 
+    /// The identifier for this spelling, declaring it if nothing has yet.
+    ///
+    /// Expression building asks for a name many times over as it walks a value,
+    /// and every ask means the same variable. Minting a second identifier for the
+    /// second ask would put two variables on the page for one value, so the
+    /// spelling is what decides identity here.
+    pub fn declare_or_reuse(&mut self, name: &str) -> SymbolId {
+        if let Some(existing) = self.by_name.get(name) {
+            return *existing;
+        }
+        let id = SymbolId(self.symbols.len() as u32);
+        self.by_name.insert(name.to_string(), id);
+        self.symbols.push(Symbol {
+            name: name.to_string(),
+            ty: CType::Unknown,
+            role: SymbolRole::Carrier,
+            origin: SymbolOrigin::default(),
+        });
+        id
+    }
+
     /// An identifier that no declaration has taken yet.
     fn unique_name(&self, requested: String) -> String {
         if !self.by_name.contains_key(&requested) {
@@ -320,5 +341,46 @@ mod tests {
         assert_eq!(symbols.name(taken), "hash");
         assert_eq!(symbols.name(other), "hash_2");
         assert_eq!(symbols.by_name("hash"), Some(taken));
+    }
+}
+
+#[cfg(test)]
+mod reuse_tests {
+    use super::*;
+
+    #[test]
+    fn asking_twice_for_one_spelling_yields_one_variable() {
+        let mut symbols = SymbolTable::new();
+        let first = symbols.declare_or_reuse("rax");
+        let again = symbols.declare_or_reuse("rax");
+
+        assert_eq!(first, again, "one spelling is one variable while folding");
+        assert_eq!(symbols.len(), 1);
+    }
+
+    #[test]
+    fn two_spellings_stay_two_variables() {
+        let mut symbols = SymbolTable::new();
+        let rax = symbols.declare_or_reuse("rax");
+        let rcx = symbols.declare_or_reuse("rcx");
+
+        assert_ne!(rax, rcx);
+        assert_eq!(symbols.name(rax), "rax");
+        assert_eq!(symbols.name(rcx), "rcx");
+    }
+
+    #[test]
+    fn a_declared_name_is_not_reissued_by_reuse() {
+        // declare() is what mints a distinct variable; reuse must respect it.
+        let mut symbols = SymbolTable::new();
+        let declared = symbols.declare(
+            "total",
+            CType::Int(32),
+            SymbolRole::Carrier,
+            SymbolOrigin::default(),
+        );
+
+        assert_eq!(symbols.declare_or_reuse("total"), declared);
+        assert_eq!(symbols.len(), 1);
     }
 }

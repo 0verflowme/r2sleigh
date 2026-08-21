@@ -418,6 +418,7 @@ mod tests {
 
     fn mk_func(body: Vec<CStmt>) -> CFunction {
         CFunction {
+            symbols: crate::symbol::SymbolTable::new(),
             name: "demo".to_string(),
             ret_type: CType::Int(32),
             params: Vec::new(),

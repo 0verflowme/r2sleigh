@@ -477,6 +477,7 @@ mod tests {
 
     fn function(params: Vec<&str>, locals: Vec<&str>, body: Vec<CStmt>) -> CFunction {
         CFunction {
+            symbols: crate::symbol::SymbolTable::new(),
             name: "f".to_string(),
             ret_type: CType::Int(32),
             params: params
