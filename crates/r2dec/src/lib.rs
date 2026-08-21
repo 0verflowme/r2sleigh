@@ -3355,12 +3355,19 @@ impl Decompiler {
                 .collect::<Vec<_>>()
                 .join(", ");
             drop(table);
+            // Reported as a count, not a list: the comment renderer replaces
+            // machine tokens with prose, so naming them here would print the
+            // substitution rather than the name and read as a different defect.
             c_function.body.insert(
                 0,
                 CStmt::Comment(format!(
-                    "r2dec defect: mentioned without a declaration: {names}"
+                    "r2dec defect: {} name(s) mentioned without a declaration",
+                    undeclared.len()
                 )),
             );
+            if std::env::var_os("R2SLEIGH_NAME_DEFECTS").is_some() {
+                eprintln!("r2dec undeclared: {names}");
+            }
         }
 
         work.with_phase(DecompileWorkPhase::Rendering).poll()?;
