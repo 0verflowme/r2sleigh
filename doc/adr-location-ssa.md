@@ -438,6 +438,38 @@ the gate on that step rather than an afterthought.
 The branch is long-lived against a tree other sessions edit concurrently, so
 rebases will be frequent and staging must be by explicit path.
 
+## Step four ran its falsification test, and the answer is not yet
+
+The sequence says to delete the register-family repair pass once locations
+exist, and that if it is not dead the location model is incomplete. The test was
+run, by disabling the pass and re-rendering the corpus. It is not dead, and what
+it showed is more useful than that.
+
+Measured as the share of source obligations a rendering accounts for:
+
+    x86-64 -O0    67.0% with the pass    67.3% without
+    x86-64 -O2    80.6% with the pass    80.6% without
+    arm64  -O2    51.2% with the pass    45.4% without
+
+On x86-64 the pass buys nothing. It costs 107 rendered lines and it is the sole
+source of every `tmp:regalias` identifier that reaches the page: forty-four of
+them in the `-O2` corpus, none without it. On arm64 it is load-bearing, worth six
+points of rendering.
+
+The asymmetry names the rule. A 32-bit register write zeroes the upper half, so
+`RAX = zext(EAX)` is already in the dataflow and the two are one place by a
+relation the SSA can see. The arm64 output shows the other case in the names it
+leaks: `d2` and `q2` are a SIMD lane and the register containing it, genuinely
+overlapping storage at a relation no zero-extension expresses. The pass does real
+work there and busywork everywhere else.
+
+So it does not become deletable, it becomes conditional, on a question the
+location model can already answer. Where storage spans already join the narrow
+and the wide value, the projection restates what the dataflow says and should not
+be inserted. Where they do not, the overlap is real and the projection is what
+expresses it. That is arch-neutral, testable, and the next step rather than a
+deletion.
+
 ## Exit criteria
 
 The `-O1` FNV-1a 32 case renders its loop body and returns the accumulator. The
