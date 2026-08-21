@@ -3135,6 +3135,35 @@ impl<'a> FoldingContext<'a> {
     }
 
     /// Check if a variable is dead (never used).
+    /// Which rule in `is_dead` answered for this value, for the unowned report.
+    pub(crate) fn dead_value_reason(&self, var: &SSAVar) -> &'static str {
+        let key = var.display_name();
+        let lower = var.name.to_lowercase();
+        if is_cpu_flag(&lower) {
+            return "dead-cpu-flag";
+        }
+        if self.flag_only_values_set().contains(&key) {
+            return "dead-flag-only";
+        }
+        if self.use_counts_map().get(&key).copied().unwrap_or(0) > 0 {
+            return "dead-used";
+        }
+        if var.is_temp() || var.is_const() || matches!(var.name_kind(), SSAVarNameKind::RegisterAlias)
+        {
+            return "dead-unused-temp";
+        }
+        if self.inputs.arch.is_caller_saved_name(&lower) {
+            return "dead-caller-saved";
+        }
+        if self.consumed_by_call_set().contains(&key) {
+            return "dead-call-arg";
+        }
+        if self.inputs.arch.is_stack_base_name(&lower) {
+            return "dead-stack-base";
+        }
+        "dead-other"
+    }
+
     pub fn is_dead(&self, var: &SSAVar) -> bool {
         let key = var.display_name();
         let use_count = self.use_counts_map().get(&key).copied().unwrap_or(0);
@@ -12532,7 +12561,7 @@ impl<'a> FoldingContext<'a> {
             // Skip operations that produce dead values
             if let Some(dst) = op.dst() {
                 if self.is_dead(dst) {
-                    self.note_elided_op_site(block.addr, op_idx, "dead-value");
+                    self.note_elided_op_site(block.addr, op_idx, self.dead_value_reason(dst));
                     continue;
                 }
 
