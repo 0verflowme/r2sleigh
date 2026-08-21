@@ -25,6 +25,7 @@ pub mod cfg;
 pub mod control;
 pub mod data_ref;
 pub mod defuse;
+pub mod deadphi;
 pub mod domtree;
 pub mod execution;
 pub mod fingerprint;
