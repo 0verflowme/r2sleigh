@@ -11972,6 +11972,7 @@ mod tests {
             sp_name: "rsp",
             fp_name: "rbp",
             ret_reg_name: "rax",
+            flag_regs: &crate::analysis::no_flag_registers(),
             function_names: empty_u64,
             strings: empty_u64,
             binary_symbols: empty_u64,

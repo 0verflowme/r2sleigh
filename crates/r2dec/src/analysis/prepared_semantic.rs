@@ -438,7 +438,7 @@ fn pin_prepared_loop_carried_phi_values(
 }
 
 fn pin_prepared_phi_materialized_var(use_info: &mut UseInfo, var: &SSAVar) {
-    if var.is_const() || var.is_temp() || is_cpu_flag(&var.name.to_ascii_lowercase()) {
+    if var.is_const() || var.is_temp() || use_info.names_a_flag(&var.name) {
         return;
     }
     let display = var.display_name();
@@ -5035,6 +5035,7 @@ mod tests {
             sp_name: "rsp",
             fp_name: "rbp",
             ret_reg_name: "rax",
+            flag_regs: &crate::analysis::no_flag_registers(),
             function_names: &function_names,
             strings: &strings,
             binary_symbols: &binary_symbols,
@@ -5071,6 +5072,7 @@ mod tests {
             sp_name: "RSP",
             fp_name: "RBP",
             ret_reg_name: "RAX",
+            flag_regs: &crate::analysis::no_flag_registers(),
             function_names: &function_names,
             strings: &strings,
             binary_symbols: &binary_symbols,

@@ -77,6 +77,13 @@ impl DecompilerFacts {
 }
 
 /// No carrier is named for a caller that never had render facts to ask.
+/// No condition codes, for a pass whose caller has no target to state.
+pub(crate) fn no_flag_registers() -> &'static std::collections::HashSet<String> {
+    static EMPTY: std::sync::OnceLock<std::collections::HashSet<String>> =
+        std::sync::OnceLock::new();
+    EMPTY.get_or_init(std::collections::HashSet::new)
+}
+
 pub(crate) fn no_carrier_aliases() -> &'static HashMap<String, String> {
     static EMPTY: std::sync::OnceLock<HashMap<String, String>> = std::sync::OnceLock::new();
     EMPTY.get_or_init(HashMap::new)
@@ -90,6 +97,8 @@ pub(crate) struct PassEnv<'a> {
     pub(crate) sp_name: &'a str,
     pub(crate) fp_name: &'a str,
     pub(crate) ret_reg_name: &'a str,
+    /// Registers that are condition codes, as this target's register file defines them.
+    pub(crate) flag_regs: &'a std::collections::HashSet<String>,
     #[cfg(test)]
     pub(crate) function_names: &'a HashMap<u64, String>,
     #[cfg(test)]
@@ -126,6 +135,8 @@ pub(crate) struct UseInfo {
     pub(crate) vars_by_value_id: BTreeMap<ValueId, SSAVar>,
     pub(crate) use_counts: HashMap<String, usize>,
     pub(crate) use_counts_by_value: BTreeMap<ValueId, usize>,
+    /// Condition codes as this target's register file defines them.
+    pub(crate) flag_regs: std::collections::HashSet<String>,
     pub(crate) definitions: HashMap<String, CExpr>,
     pub(crate) definitions_by_value: BTreeMap<ValueId, CExpr>,
     pub(crate) producers: HashMap<String, r2ssa::SSAOp>,
@@ -873,6 +884,12 @@ impl UseInfo {
         self.value_id_for_name(name)
             .and_then(|value_id| self.definitions_by_value.get(&value_id))
             .or_else(|| self.definitions.get(name))
+    }
+
+    /// Whether this name spells a condition code on this target.
+    pub(crate) fn names_a_flag(&self, name: &str) -> bool {
+        self.flag_regs
+            .contains(&crate::analysis::utils::flag_base_name(name))
     }
 
     pub(crate) fn render_definition_for_name(&self, name: &str) -> Option<&CExpr> {

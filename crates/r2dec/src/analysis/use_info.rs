@@ -124,6 +124,7 @@ fn analyze_value_facts(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
     control.poll()?;
     let mut scratch = UseScratch::default();
     scratch.info.type_hints = env.type_hints.clone();
+    scratch.info.flag_regs = env.flag_regs.clone();
     seed_local_value_ids(&mut scratch, blocks);
     seed_entry_param_aliases(&mut scratch, blocks, env);
     for (version, name) in env.carrier_aliases {
@@ -2353,7 +2354,7 @@ fn pin_loop_carried_phi_values(scratch: &mut UseScratch, blocks: &[SSABlock]) {
 }
 
 fn pin_phi_materialized_var(info: &mut UseInfo, var: &SSAVar) {
-    if var.is_const() || var.is_temp() || utils::is_cpu_flag(&var.name.to_ascii_lowercase()) {
+    if var.is_const() || var.is_temp() || info.names_a_flag(&var.name) {
         return;
     }
     let display = var.display_name();
@@ -8891,6 +8892,7 @@ mod tests {
                 sp_name: &self.sp_name,
                 fp_name: &self.fp_name,
                 ret_reg_name: "rax",
+                flag_regs: &crate::analysis::no_flag_registers(),
                 function_names: &self.function_names,
                 strings: &self.strings,
                 binary_symbols: &self.binary_symbols,
@@ -10258,6 +10260,7 @@ mod tests {
         let env = PassEnv {
             string_literals: crate::analysis::lower::no_string_literals(),
             ret_reg_name: "x0",
+            flag_regs: &crate::analysis::no_flag_registers(),
             callee_facts: &callee_facts,
             callee_resolution: Some(&resolution),
             ..base_env
@@ -10334,6 +10337,7 @@ mod tests {
         let env = PassEnv {
             string_literals: crate::analysis::lower::no_string_literals(),
             ret_reg_name: "x0",
+            flag_regs: &crate::analysis::no_flag_registers(),
             ..base_env
         };
 

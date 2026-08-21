@@ -7,6 +7,18 @@ use crate::ast::{BinaryOp, CExpr};
 /// Threshold for detecting 64-bit negative values stored as unsigned.
 const LIKELY_NEGATIVE_THRESHOLD: u64 = 0xffffffffffff0000;
 
+/// The spelling under which a flag is recorded, with prefix and version removed.
+pub(crate) fn flag_base_name(name: &str) -> String {
+    let lower = name.to_ascii_lowercase();
+    let base = lower.strip_prefix("reg:").unwrap_or(&lower);
+    match base.rsplit_once('_') {
+        Some((head, tail)) if !tail.is_empty() && tail.bytes().all(|b| b.is_ascii_digit()) => {
+            head.to_string()
+        }
+        _ => base.to_string(),
+    }
+}
+
 pub(crate) fn is_cpu_flag(name: &str) -> bool {
     if matches!(
         name,

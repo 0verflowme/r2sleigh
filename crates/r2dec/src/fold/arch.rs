@@ -30,18 +30,6 @@ pub(crate) const X86_FLAG_REGISTERS: &[&str] = &[
     "sf", "tf", "vif", "vip", "vm", "zf",
 ];
 
-/// The spelling under which a flag is recorded, with prefix and version removed.
-pub(crate) fn flag_base_name(name: &str) -> String {
-    let lower = name.to_ascii_lowercase();
-    let base = lower.strip_prefix("reg:").unwrap_or(&lower);
-    match base.rsplit_once('_') {
-        Some((head, tail)) if !tail.is_empty() && tail.bytes().all(|b| b.is_ascii_digit()) => {
-            head.to_string()
-        }
-        _ => base.to_string(),
-    }
-}
-
 fn normalized_base_name(name: &str) -> String {
     let lower = name.to_ascii_lowercase();
     let no_reg = lower.strip_prefix("reg:").unwrap_or(lower.as_str());
@@ -82,7 +70,7 @@ fn canonical_x86_arg_reg(base: &str) -> &str {
 impl FoldArchConfig {
     /// Whether this name spells a condition code on this target.
     pub(crate) fn is_flag_name(&self, name: &str) -> bool {
-        self.flag_regs.contains(&flag_base_name(name))
+        self.flag_regs.contains(&crate::analysis::utils::flag_base_name(name))
     }
 
     pub(crate) fn is_stack_pointer_name(&self, name: &str) -> bool {

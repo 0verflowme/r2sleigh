@@ -5293,6 +5293,7 @@ fn infer_local_struct_field_accesses(
         sp_name: &config.sp_name,
         fp_name: &config.fp_name,
         ret_reg_name: config.ret_regs.first().map(String::as_str).unwrap_or("rax"),
+        flag_regs: &crate::analysis::no_flag_registers(),
         #[cfg(test)]
         function_names: &function_names,
         #[cfg(test)]
@@ -7035,6 +7036,7 @@ mod tests {
             sp_name: &config.sp_name,
             fp_name: &config.fp_name,
             ret_reg_name: config.ret_regs.first().map(String::as_str).unwrap_or("x0"),
+            flag_regs: &crate::analysis::no_flag_registers(),
             function_names: &function_names,
             strings: &strings,
             binary_symbols: &binary_symbols,
@@ -7206,6 +7208,7 @@ mod tests {
             sp_name: &config.sp_name,
             fp_name: &config.fp_name,
             ret_reg_name: config.ret_regs.first().map(String::as_str).unwrap_or("rax"),
+            flag_regs: &crate::analysis::no_flag_registers(),
             function_names: &function_names,
             strings: &strings,
             binary_symbols: &binary_symbols,
@@ -7432,6 +7435,7 @@ mod tests {
             sp_name: &config.sp_name,
             fp_name: &config.fp_name,
             ret_reg_name: config.ret_regs.first().map(String::as_str).unwrap_or("rax"),
+            flag_regs: &crate::analysis::no_flag_registers(),
             function_names: &function_names,
             strings: &strings,
             binary_symbols: &binary_symbols,

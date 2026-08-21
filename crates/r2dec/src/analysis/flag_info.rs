@@ -9,10 +9,22 @@ use crate::ast::{BinaryOp, CExpr, UnaryOp};
 #[derive(Debug, Default)]
 pub(crate) struct FlagScratch {
     pub(crate) info: FlagInfo,
+    /// Condition codes as this target's register file defines them.
+    pub(crate) flag_regs: HashSet<String>,
+}
+
+impl FlagScratch {
+    fn names_a_flag(&self, name: &str) -> bool {
+        self.flag_regs
+            .contains(&crate::analysis::utils::flag_base_name(name))
+    }
 }
 
 pub(crate) fn analyze(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, blocks: &[SSABlock], use_info: &UseInfo, env: &PassEnv<'_>) -> FlagInfo {
-    let mut scratch = FlagScratch::default();
+    let mut scratch = FlagScratch {
+        flag_regs: env.flag_regs.clone(),
+        ..FlagScratch::default()
+    };
     let lower = LowerCtx {
         symbols,
         string_literals: crate::analysis::lower::no_string_literals(),
@@ -205,7 +217,7 @@ fn predicate_passthrough_expr(symbols: &std::cell::RefCell<crate::symbol::Symbol
     if src.is_const() {
         return const_expr_from_var(src);
     }
-    if utils::is_cpu_flag(&src.name.to_lowercase()) {
+    if scratch.names_a_flag(&src.name) {
         return Some(crate::symbol::var_ref(symbols, src.display_name()));
     }
     None
@@ -324,14 +336,18 @@ fn op_can_be_flag_glue(op: &SSAOp) -> bool {
     )
 }
 
-fn consumer_is_flag_context(op: &SSAOp, flag_context_dsts: &HashSet<String>) -> bool {
+fn consumer_is_flag_context(
+    scratch: &FlagScratch,
+    op: &SSAOp,
+    flag_context_dsts: &HashSet<String>,
+) -> bool {
     if matches!(op, SSAOp::CBranch { .. }) {
         return true;
     }
 
     if let Some(dst) = op.dst() {
         let dst_key = dst.display_name();
-        return utils::is_cpu_flag(&dst.name.to_lowercase())
+        return scratch.names_a_flag(&dst.name)
             || flag_context_dsts.contains(&dst_key);
     }
 
@@ -360,7 +376,7 @@ fn recompute_flag_only_values(scratch: &mut FlagScratch, blocks: &[SSABlock]) {
 
     let mut flag_context_dsts: HashSet<String> = defs
         .keys()
-        .filter(|name| utils::is_cpu_flag(&name.to_lowercase()))
+        .filter(|name| scratch.names_a_flag(name))
         .cloned()
         .collect();
 
@@ -383,7 +399,7 @@ fn recompute_flag_only_values(scratch: &mut FlagScratch, blocks: &[SSABlock]) {
 
             if !srcs.iter().all(|src| {
                 src.is_const()
-                    || utils::is_cpu_flag(&src.name.to_lowercase())
+                    || scratch.names_a_flag(&src.name)
                     || flag_context_dsts.contains(&src.display_name())
             }) {
                 continue;
@@ -398,6 +414,7 @@ fn recompute_flag_only_values(scratch: &mut FlagScratch, blocks: &[SSABlock]) {
 
             if op_consumers.iter().all(|(consumer_block, consumer_op)| {
                 consumer_is_flag_context(
+                    scratch,
                     &blocks[*consumer_block].ops[*consumer_op],
                     &flag_context_dsts,
                 )
@@ -413,12 +430,13 @@ fn recompute_flag_only_values(scratch: &mut FlagScratch, blocks: &[SSABlock]) {
     }
 
     for (src_key, src_consumers) in consumers {
-        if src_consumers.is_empty() || utils::is_cpu_flag(&src_key.to_lowercase()) {
+        if src_consumers.is_empty() || scratch.names_a_flag(&src_key) {
             continue;
         }
 
         if src_consumers.iter().all(|(consumer_block, consumer_op)| {
             consumer_is_flag_context(
+                scratch,
                 &blocks[*consumer_block].ops[*consumer_op],
                 &flag_context_dsts,
             )

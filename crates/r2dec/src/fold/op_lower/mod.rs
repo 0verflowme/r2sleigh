@@ -1920,6 +1920,7 @@ impl<'a> FoldingContext<'a> {
             sp_name: &self.inputs.arch.sp_name,
             fp_name: &self.inputs.arch.fp_name,
             ret_reg_name: &self.inputs.arch.ret_reg_name,
+            flag_regs: &self.inputs.arch.flag_regs,
             #[cfg(test)]
             function_names: self.inputs.function_names,
             #[cfg(test)]
@@ -2155,6 +2156,7 @@ impl<'a> FoldingContext<'a> {
             sp_name: &self.inputs.arch.sp_name,
             fp_name: &self.inputs.arch.fp_name,
             ret_reg_name: &self.inputs.arch.ret_reg_name,
+            flag_regs: &self.inputs.arch.flag_regs,
             #[cfg(test)]
             function_names: self.inputs.function_names,
             #[cfg(test)]
