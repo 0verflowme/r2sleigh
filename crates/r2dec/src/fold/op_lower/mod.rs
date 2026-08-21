@@ -2756,6 +2756,39 @@ impl<'a> FoldingContext<'a> {
             return Ok(());
         }
 
+        self.analyze_blocks_without_a_prepared_artifact(blocks, control)
+    }
+
+    /// A shipped build never arrives here, because a shipped decompile always
+    /// carries the prepared artifact the branch above consumes.
+    #[cfg(not(test))]
+    fn analyze_blocks_without_a_prepared_artifact(
+        &mut self,
+        _blocks: &[SSABlock],
+        control: crate::DecompileWorkControl<'_>,
+    ) -> Result<(), crate::DecompileExecutionStop> {
+        debug_assert!(
+            false,
+            "analysis without a prepared artifact is a fixture-only pass order"
+        );
+        control.poll()
+    }
+
+    /// Analyse blocks that arrived without the prepared artifact.
+    ///
+    /// Every path that ships builds the facts from the prepared artifact and
+    /// returns above. Only a fixture that assembles blocks by hand reaches here,
+    /// so this pass order is compiled for tests and nothing else. Keeping the
+    /// two apart in the build is what makes the second one deletable: while both
+    /// compiled into the same binary, a fact added to one and read from the
+    /// other looked like it worked.
+    #[cfg(test)]
+    fn analyze_blocks_without_a_prepared_artifact(
+        &mut self,
+        blocks: &[SSABlock],
+        control: crate::DecompileWorkControl<'_>,
+    ) -> Result<(), crate::DecompileExecutionStop> {
+        let symbols = &self.symbols;
         // Explicit pass order:
         // 1) UseInfo
         // 2) FlagInfo + StackInfo
