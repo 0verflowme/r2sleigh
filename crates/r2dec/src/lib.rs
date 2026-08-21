@@ -3327,6 +3327,22 @@ impl Decompiler {
         // name cannot be mentioned unless the table already holds it. What is
         // left to ask is whether C can read it.
         unrendered::spell_every_name_as_c(&mut c_function);
+        // Executable C is admitted only when the source obligation inventory is
+        // complete. The inventory is what says which effects the source has, so a
+        // function whose inventory did not close has no account of what the output
+        // owes, and rendering it says the effects were all handled when nothing
+        // ever enumerated them.
+        if let Some(reason) = incomplete_source_obligations_reason(prepared) {
+            return Ok(residual_function_for_render_boundary(&c_function.name, &reason));
+        }
+        let mut ledger = build_obligation_ledger(
+            prepared,
+            &fold_ctx.effect_render_proofs_since(0),
+            &fold_ctx.folded_block_addrs(),
+            &fold_ctx.elided_op_sites(),
+        );
+        reconcile_ledger_with_body(&mut ledger, &c_function);
+        note_unproven_constructs(&mut c_function, Some(&ledger));
         // A value with more than one reader is supposed to become a typed
         // local. A name the body mentions and the function never declares says
         // that did not happen, and a reader has no way to learn what it is.
@@ -3346,22 +3362,7 @@ impl Decompiler {
                 )),
             );
         }
-        // Executable C is admitted only when the source obligation inventory is
-        // complete. The inventory is what says which effects the source has, so a
-        // function whose inventory did not close has no account of what the output
-        // owes, and rendering it says the effects were all handled when nothing
-        // ever enumerated them.
-        if let Some(reason) = incomplete_source_obligations_reason(prepared) {
-            return Ok(residual_function_for_render_boundary(&c_function.name, &reason));
-        }
-        let mut ledger = build_obligation_ledger(
-            prepared,
-            &fold_ctx.effect_render_proofs_since(0),
-            &fold_ctx.folded_block_addrs(),
-            &fold_ctx.elided_op_sites(),
-        );
-        reconcile_ledger_with_body(&mut ledger, &c_function);
-        note_unproven_constructs(&mut c_function, Some(&ledger));
+
         work.with_phase(DecompileWorkPhase::Rendering).poll()?;
         Ok(c_function)
     }
