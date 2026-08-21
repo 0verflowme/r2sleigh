@@ -1144,6 +1144,7 @@ impl PreparedFunctionFacts {
         let control_domains = collect_control_domain_facts(function, &predicates, &structured);
         let obligations = SemanticObligationInventory::collect(graph, &structured, &boundaries);
         let certificates = collect_prepared_function_certificates(
+            machine_context,
             function,
             graph,
             &objects,
@@ -3164,6 +3165,7 @@ fn call_result_value_after_call(
 }
 
 fn collect_prepared_function_certificates(
+    machine_context: Option<&SourceMachineContext>,
     function: &SSAFunction,
     graph: &SsaGraph,
     objects: &ObjectModel,
@@ -3344,6 +3346,7 @@ fn collect_prepared_function_certificates(
     let stack_reloads =
         collect_stack_reload_source_certificates(function, graph, objects, memory, structured);
     let (returns, returns_by_inst) = collect_return_value_certificates(
+        machine_context,
         function,
         graph,
         predicates,
@@ -3763,6 +3766,7 @@ fn expression_op_is_pure(op: &SSAOp) -> bool {
 }
 
 fn collect_return_value_certificates(
+    machine_context: Option<&SourceMachineContext>,
     function: &SSAFunction,
     graph: &SsaGraph,
     predicates: &PredicateFacts,
@@ -3843,7 +3847,9 @@ fn collect_return_value_certificates(
                             op_idx,
                             value,
                         );
-                    } else if let Some(return_phi) = unique_return_value_phi_for_block(block) {
+                    } else if let Some(return_phi) =
+                        unique_return_value_phi_for_block(machine_context, block)
+                    {
                         push_return_value_certificate(
                             graph,
                             &mut returns,
@@ -4230,47 +4236,40 @@ fn canonical_graph_value_root(graph: &SsaGraph, value: ValueId) -> ValueId {
 /// read at two widths. A lifter that keeps them as separate storage gives an
 /// exit block one merge for each, and a rule that wanted a single candidate
 /// found two and concluded there was no return value at all.
-fn return_value_register_family(value: &SSAVar) -> Option<&'static str> {
-    if !value.is_register() {
-        return None;
-    }
-    let name = value
-        .name
-        .trim()
-        .trim_start_matches('$')
-        .to_ascii_lowercase();
-    Some(match name.as_str() {
-        "rax" | "eax" | "ax" | "al" => "rax",
-        "x0" | "w0" => "x0",
-        "r0" => "r0",
-        "a0" => "a0",
-        "r3" => "r3",
-        "xmm0" => "xmm0",
-        "st0" => "st0",
-        "v0" => "v0",
-        _ => return None,
-    })
-}
-
-fn unique_return_value_phi_for_block(block: &crate::function::SSABlock) -> Option<&SSAVar> {
+/// The one value a block leaves in the result register, if there is one.
+///
+/// Slices of one register are one place: a write to `EAX` and a write to `RAX`
+/// land in the same location and differ only in how much of it they took, so
+/// the widest of them carries the others and there is still one candidate. Two
+/// writes of equal width to that location are two answers, and this rule has no
+/// basis for choosing between them.
+///
+/// The convention states which location carries a result, so this holds on any
+/// architecture rather than the ones somebody wrote into a table of register
+/// spellings.
+fn unique_return_value_phi_for_block<'b>(
+    machine_context: Option<&SourceMachineContext>,
+    block: &'b crate::function::SSABlock,
+) -> Option<&'b SSAVar> {
+    // Without a machine there is no result location, and guessing one from a
+    // register spelling is what this replaced.
+    let machine_context = machine_context?;
+    let result_location = machine_context.result_slot()?.location();
     let mut candidates = block
         .phis
         .iter()
+        .filter(|phi| phi.dst.is_register())
         .filter_map(|phi| {
-            return_value_register_family(&phi.dst).map(|family| (family, &phi.dst))
+            let storage = machine_context.register_storage(&phi.dst.name)?;
+            (storage.location() == result_location).then_some(&phi.dst)
         })
         .collect::<Vec<_>>();
-    let (family, _) = *candidates.first()?;
-    // Slices of one register are one place, so the widest of them carries the
-    // others and there is still exactly one candidate. Two different registers
-    // are two answers, and this rule has no basis for choosing between them.
-    if candidates.iter().any(|(other, _)| *other != family) {
+    candidates.sort_by_key(|var| std::cmp::Reverse(var.size));
+    if candidates.len() > 1 && candidates[0].size == candidates[1].size {
         return None;
     }
-    candidates.sort_by_key(|(_, var)| std::cmp::Reverse(var.size));
-    candidates.first().map(|(_, var)| *var)
+    candidates.first().copied()
 }
-
 fn ram_memory_access_matches_source(
     function: &SSAFunction,
     graph: &SsaGraph,
@@ -7284,6 +7283,7 @@ mod tests {
         );
         let facts = artifact.facts();
         let certificates = super::collect_prepared_function_certificates(
+            None,
             artifact.function(),
             artifact.graph(),
             &objects,
@@ -7326,6 +7326,7 @@ mod tests {
             &access,
         ));
         let certificates = super::collect_prepared_function_certificates(
+            None,
             artifact.function(),
             artifact.graph(),
             &mismatched_objects,
@@ -9001,6 +9002,36 @@ mod tests {
         assert!(merge.complete);
         assert!(merge.guards.is_empty());
     }
+    /// A machine whose convention leaves its result in RAX, so a phi picker can
+    /// ask which location that is instead of matching a register spelling.
+    fn machine_returning_in_rax() -> crate::machine_context::SourceMachineContext {
+        use r2il::{AddressSpace, ArchSpec, RegisterDef};
+        let mut arch = ArchSpec::new("return-location-test");
+        arch.addr_size = 8;
+        arch.alignment = 1;
+        arch.add_space(AddressSpace::ram(8));
+        arch.add_register(RegisterDef::new("RAX", 0, 8));
+        arch.add_register(RegisterDef::new("EAX", 0, 4));
+        arch.add_register(RegisterDef::new("RCX", 8, 8));
+        arch.add_register(RegisterDef::new("RDX", 16, 8));
+        arch.add_register(RegisterDef::new("XMM0", 24, 16));
+        let rax = r2source::CanonicalStorageId {
+            space: r2source::CanonicalStorageSpace::Register,
+            offset: 0,
+            size: 8,
+        };
+        let slots = r2source::SourceConventionSlots::new("test", [], Some(rax))
+            .expect("result slot");
+        crate::machine_context::SourceMachineContext::from_blocks_with_interfaces(
+            &[],
+            Some(&arch),
+            None,
+            r2source::SourceMachineRoles::default(),
+            Some(slots),
+            Vec::new(),
+        )
+    }
+
     fn phi_of(name: &str, size: u32) -> crate::function::PhiNode {
         crate::function::PhiNode {
             dst: SSAVar::new(name, 1, size),
@@ -9020,34 +9051,53 @@ mod tests {
 
     #[test]
     fn two_widths_of_one_return_register_are_one_candidate() {
+        let machine = machine_returning_in_rax();
         // An exit block merges both RAX and EAX because the lifter keeps them as
         // separate storage. They are one register, so the widest carries the value.
         let block = block_with_phis(vec![phi_of("EAX", 4), phi_of("RAX", 8)]);
-        let chosen = unique_return_value_phi_for_block(&block).expect("one candidate");
+        let chosen = unique_return_value_phi_for_block(Some(&machine), &block).expect("one candidate");
         assert_eq!(chosen.name, "RAX");
         assert_eq!(chosen.size, 8);
     }
 
     #[test]
     fn one_return_register_on_its_own_is_still_chosen() {
+        let machine = machine_returning_in_rax();
         let block = block_with_phis(vec![phi_of("EAX", 4)]);
         assert_eq!(
-            unique_return_value_phi_for_block(&block).map(|var| var.name.as_str()),
+            unique_return_value_phi_for_block(Some(&machine), &block).map(|var| var.name.as_str()),
             Some("EAX")
         );
     }
 
     #[test]
-    fn two_different_return_registers_are_two_answers_and_neither_is_taken() {
-        // xmm0 and rax are different places, and nothing here can choose between them.
+    fn a_register_the_convention_does_not_return_in_is_not_a_candidate() {
+        let machine = machine_returning_in_rax();
+        // The old rule had a table of return-register spellings and refused
+        // when two of them merged, because it had no way to say which one the
+        // convention returns in. The convention says, so XMM0 is simply not a
+        // candidate here.
         let block = block_with_phis(vec![phi_of("RAX", 8), phi_of("XMM0", 16)]);
-        assert_eq!(unique_return_value_phi_for_block(&block), None);
+        assert_eq!(
+            unique_return_value_phi_for_block(Some(&machine), &block).map(|var| var.name.as_str()),
+            Some("RAX")
+        );
+    }
+
+    #[test]
+    fn two_equal_width_writes_to_the_result_location_are_two_answers() {
+        let machine = machine_returning_in_rax();
+        // One location, two writes of the same width: nothing here can say
+        // which of them the function answers with.
+        let block = block_with_phis(vec![phi_of("RAX", 8), phi_of("RAX", 8)]);
+        assert_eq!(unique_return_value_phi_for_block(Some(&machine), &block), None);
     }
 
     #[test]
     fn a_block_merging_no_return_register_offers_nothing() {
+        let machine = machine_returning_in_rax();
         let block = block_with_phis(vec![phi_of("RCX", 8), phi_of("RDX", 8)]);
-        assert_eq!(unique_return_value_phi_for_block(&block), None);
+        assert_eq!(unique_return_value_phi_for_block(Some(&machine), &block), None);
     }
 
 }

@@ -19,7 +19,8 @@ pub use r2source::{
     SourceCallResult, SourceCallSiteIdentity, SourceCallSiteInterface,
     SourceCallSiteInterfaceError, SourceCarrierKind, SourceCarrierProjection,
     SourceFunctionInterface, SourceFunctionInterfaceError, SourceFunctionReturn,
-    SourceLogicalValue, SourceMachineRoles, SourceStackAllocationContract, SourceStackGrowth,
+    SourceLogicalValue, SourceMachineRoles,
+    SourceConventionSlots, SourceStackAllocationContract, SourceStackGrowth,
     SourceStackSlotRole, SourceStackSlotSpec, SourceType, SourceTypeGraph, SourceTypeGraphError,
     SourceTypeKind, StackAddressBase,
 };
@@ -489,6 +490,10 @@ pub struct SourceMachineContext {
     memory_model: MachineMemoryModel,
     function_interface: Option<SourceFunctionInterface>,
     machine_roles: SourceMachineRoles,
+    /// Where this convention would leave arguments and a result. The result
+    /// slot is what makes "is this the return register" answerable without a
+    /// list of register spellings.
+    convention_slots: Option<SourceConventionSlots>,
     abi_model: MachineAbiModel,
     register_storages_by_name: BTreeMap<String, CanonicalStorageId>,
     raw_call_sites_by_id: BTreeMap<CallSiteId, SourceCallSiteIdentity>,
@@ -787,6 +792,7 @@ impl SourceMachineContext {
             arch,
             None,
             SourceMachineRoles::default(),
+            None,
             Vec::new(),
         )
     }
@@ -796,6 +802,7 @@ impl SourceMachineContext {
         arch: Option<&ArchSpec>,
         function_interface: Option<SourceFunctionInterface>,
         machine_roles: SourceMachineRoles,
+        convention_slots: Option<SourceConventionSlots>,
         call_site_interfaces: Vec<SourceCallSiteInterface>,
     ) -> Self {
         let register_storages_by_name: BTreeMap<String, CanonicalStorageId> = arch
@@ -951,6 +958,7 @@ impl SourceMachineContext {
             memory_model,
             function_interface,
             machine_roles,
+            convention_slots,
             abi_model,
             register_storages_by_name,
             raw_call_sites_by_id,
@@ -983,6 +991,11 @@ impl SourceMachineContext {
     /// profile. These are available whether or not an ABI was recovered.
     pub const fn machine_roles(&self) -> &SourceMachineRoles {
         &self.machine_roles
+    }
+
+    /// The location this convention leaves a result in, when the source said.
+    pub fn result_slot(&self) -> Option<CanonicalStorageId> {
+        self.convention_slots.as_ref()?.result_slot()
     }
 
     /// The carrier holding the return address, preferring the ABI's own
@@ -1348,6 +1361,7 @@ mod tests {
             Some(&little),
             Some(base_interface),
             SourceMachineRoles::default(),
+            None,
             Vec::new(),
         );
         let stacked = SourceMachineContext::from_blocks_with_interfaces(
@@ -1355,6 +1369,7 @@ mod tests {
             Some(&little),
             Some(stacked_interface),
             SourceMachineRoles::default(),
+            None,
             Vec::new(),
         );
         assert_ne!(
@@ -1385,6 +1400,7 @@ mod tests {
             Some(&little),
             None,
             SourceMachineRoles::default(),
+            None,
             vec![call_interface(false)],
         );
         let complete = SourceMachineContext::from_blocks_with_interfaces(
@@ -1392,6 +1408,7 @@ mod tests {
             Some(&little),
             None,
             SourceMachineRoles::default(),
+            None,
             vec![call_interface(true)],
         );
         assert_ne!(
@@ -1616,6 +1633,7 @@ mod tests {
             Some(&arch),
             Some(make()),
             SourceMachineRoles::default(),
+            None,
             Vec::new(),
         );
         assert!(!without_roles.abi_model().is_coherent());
@@ -1629,6 +1647,7 @@ mod tests {
                     .expect("return-address role"),
             ),
             SourceMachineRoles::default(),
+            None,
             Vec::new(),
         );
         assert!(!return_only.abi_model().is_coherent());
@@ -1643,6 +1662,7 @@ mod tests {
                     .expect("exact machine roles"),
             ),
             SourceMachineRoles::default(),
+            None,
             Vec::new(),
         );
         assert!(complete.abi_model().is_coherent());
@@ -1663,6 +1683,7 @@ mod tests {
                 .expect("compatibility interface remains representable for refusal diagnostics"),
             ),
             SourceMachineRoles::default(),
+            None,
             Vec::new(),
         );
         assert!(
@@ -1684,6 +1705,7 @@ mod tests {
                     .expect("standalone binding is architecture-independent"),
             ),
             SourceMachineRoles::default(),
+            None,
             Vec::new(),
         );
         assert!(!narrow.abi_model().is_coherent());
@@ -1702,6 +1724,7 @@ mod tests {
                     .expect("standalone binding cannot inspect ArchSpec parentage"),
             ),
             SourceMachineRoles::default(),
+            None,
             Vec::new(),
         );
         assert!(!subregister_sp.abi_model().is_coherent());
@@ -1718,6 +1741,7 @@ mod tests {
                     .expect("standalone binding cannot inspect ArchSpec parentage"),
             ),
             SourceMachineRoles::default(),
+            None,
             Vec::new(),
         );
         assert!(!subregister_ra.abi_model().is_coherent());
@@ -1753,6 +1777,7 @@ mod tests {
             Some(&arch),
             Some(exact.clone()),
             SourceMachineRoles::default(),
+            None,
             Vec::new(),
         );
         assert!(coherent.abi_model().is_coherent());
@@ -1763,6 +1788,7 @@ mod tests {
             Some(&arch),
             Some(make()),
             SourceMachineRoles::default(),
+            None,
             Vec::new(),
         );
         assert!(absent.abi_model().is_coherent());
@@ -1782,6 +1808,7 @@ mod tests {
             Some(&subregister),
             Some(exact.clone()),
             SourceMachineRoles::default(),
+            None,
             Vec::new(),
         );
         assert!(!context.abi_model().is_coherent());
@@ -1795,6 +1822,7 @@ mod tests {
             Some(&wrong_machine_width),
             Some(exact.clone()),
             SourceMachineRoles::default(),
+            None,
             Vec::new(),
         );
         assert!(!context.abi_model().is_coherent());
@@ -1806,6 +1834,7 @@ mod tests {
             Some(&word_addressed),
             Some(exact.clone()),
             SourceMachineRoles::default(),
+            None,
             Vec::new(),
         );
         assert!(!context.abi_model().is_coherent());
@@ -1817,6 +1846,7 @@ mod tests {
             Some(&wrong_ram_width),
             Some(exact),
             SourceMachineRoles::default(),
+            None,
             Vec::new(),
         );
         assert!(!context.abi_model().is_coherent());
@@ -1868,6 +1898,7 @@ mod tests {
             Some(&arch),
             Some(make_explicit(frame_pointer)),
             SourceMachineRoles::default(),
+            None,
             Vec::new(),
         );
         assert!(coherent.abi_model().is_coherent());
@@ -1885,6 +1916,7 @@ mod tests {
                 return_address,
             )),
             SourceMachineRoles::default(),
+            None,
             Vec::new(),
         );
         assert!(slot_derived.abi_model().is_coherent());
@@ -1908,6 +1940,7 @@ mod tests {
             Some(&arch),
             Some(absent),
             SourceMachineRoles::default(),
+            None,
             Vec::new(),
         );
         assert!(absent.abi_model().is_coherent());
@@ -1951,6 +1984,7 @@ mod tests {
             Some(&arch),
             Some(narrow_interface),
             SourceMachineRoles::default(),
+            None,
             Vec::new(),
         );
         assert!(!narrow.abi_model().is_coherent());
@@ -1971,6 +2005,7 @@ mod tests {
                 return_address,
             )),
             SourceMachineRoles::default(),
+            None,
             Vec::new(),
         );
         assert!(!subregister.abi_model().is_coherent());
@@ -2005,6 +2040,7 @@ mod tests {
             Some(&arch),
             Some(overlapping),
             SourceMachineRoles::default(),
+            None,
             Vec::new(),
         );
         assert!(!overlapping.abi_model().is_coherent());
@@ -2457,6 +2493,7 @@ mod tests {
             None,
             Some(interface),
             SourceMachineRoles::default(),
+            None,
             Vec::new(),
         );
         assert!(context.abi_model().is_available());
@@ -2486,6 +2523,7 @@ mod tests {
             Some(&arch),
             Some(interface),
             SourceMachineRoles::default(),
+            None,
             Vec::new(),
         );
 

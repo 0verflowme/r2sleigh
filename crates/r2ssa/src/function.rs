@@ -378,6 +378,7 @@ impl SsaArtifact {
                 arch,
                 function_interface,
                 SourceMachineRoles::default(),
+                None,
                 call_site_interfaces,
             ),
         ))
@@ -434,6 +435,7 @@ impl SsaArtifact {
             arch,
             function_interface,
             SourceMachineRoles::default(),
+            None,
             call_site_interfaces,
         );
         Some(Self::new_with_context(
@@ -460,6 +462,7 @@ impl SsaArtifact {
             arch,
             function_interface,
             SourceMachineRoles::default(),
+            None,
             call_site_interfaces,
         );
         let function = SSAFunction::from_blocks_for_decompile_with_interface_and_control(
@@ -510,6 +513,7 @@ impl SsaArtifact {
             Some(arch),
             Some(function_interface),
             SourceMachineRoles::default(),
+            None,
             call_site_interfaces,
         );
         let function = SSAFunction::from_blocks_for_decompile_with_interface_and_control(
@@ -1068,6 +1072,7 @@ impl TrustedSsaArtifact {
             Some(&arch),
             function_interface,
             *source.machine_roles(),
+            Some(source.convention_slots().clone()),
             call_site_interfaces,
         );
         let mut function = SSAFunction::from_blocks_for_decompile_with_interface_and_control(
