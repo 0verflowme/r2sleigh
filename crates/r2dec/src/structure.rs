@@ -1053,8 +1053,16 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                             // and the walk takes only blocks this edge alone
                             // reaches, so nothing is duplicated or reordered.
                             match self.exit_continuation_stmt(*target) {
-                                Some(stmt) => return stmt,
-                                None => Some(reason),
+                                Ok(stmt) => return stmt,
+                                // Two walks refused this edge: the one looking
+                                // for a label and the one trying to render the
+                                // blocks instead. The second went further, so
+                                // it is the one with something to say about why
+                                // the exit could not be lowered.
+                                Err(chain_reason) => Some(match chain_reason {
+                                    Some(chain_reason) => chain_reason,
+                                    None => reason,
+                                }),
                             }
                         }
                     }
@@ -1522,8 +1530,8 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
     /// that stops holding: a block another edge also reaches, or one that merges
     /// values, or one that branches, could not be placed here without saying
     /// something the function does not do.
-    fn exit_continuation_stmt(&mut self, target: u64) -> Option<CStmt> {
-        let chain = self.exit_continuation_chain(target)?;
+    fn exit_continuation_stmt(&mut self, target: u64) -> Result<CStmt, Option<String>> {
+        let (chain, rejoin) = self.exit_continuation_chain(target)?;
         for addr in &chain {
             self.structured_region_blocks.insert(*addr);
         }
@@ -1534,7 +1542,13 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                 stmts.push(stmt);
             }
         }
-        Some(match stmts.len() {
+        // The walk ran back into ground the structuring already covers, so the
+        // exit does what these blocks do and then carries on there.
+        if let Some(rejoin) = rejoin {
+            let label = self.ensure_label(rejoin);
+            stmts.push(CStmt::Goto(label));
+        }
+        Ok(match stmts.len() {
             0 => CStmt::Empty,
             1 => stmts.remove(0),
             _ => CStmt::Block(stmts),
@@ -1543,30 +1557,58 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
 
     /// The blocks an unlabelled exit runs through, or nothing if placing them
     /// at the exit would not say what the function does.
-    fn exit_continuation_chain(&self, target: u64) -> Option<Vec<u64>> {
+    fn exit_continuation_chain(
+        &self,
+        target: u64,
+    ) -> Result<(Vec<u64>, Option<u64>), Option<String>> {
         let mut chain = Vec::new();
         let mut seen = BTreeSet::new();
         let mut current = target;
         loop {
             if !self.poll() {
-                return None;
+                return Err(None);
             }
-            if self.structured_region_blocks.contains(&current) || !seen.insert(current) {
-                return None;
+            // Reaching ground the structuring covers ends the walk with
+            // somewhere to jump to, which is what the exit needed all along.
+            if self.structured_region_blocks.contains(&current) {
+                return match chain.is_empty() {
+                    true => Err(None),
+                    false => Ok((chain, Some(current))),
+                };
             }
-            let block = self.func.get_block(current)?;
-            // A merge, or a block another edge reaches, is not this exit's to place.
-            if !block.phis.is_empty() || self.func.predecessors(current).len() != 1 {
-                return None;
+            if !seen.insert(current) {
+                return Err(None);
+            }
+            let Some(block) = self.func.get_block(current) else {
+                return Err(None);
+            };
+            // A merge, or a block another edge reaches, is not this exit's to
+            // place: putting it here would say it runs once per edge.
+            if !block.phis.is_empty() {
+                return Err(Some(format!(
+                    "exit continuation block 0x{current:x} owns {} phi node(s)",
+                    block.phis.len()
+                )));
+            }
+            let predecessors = self.func.predecessors(current).len();
+            if predecessors != 1 {
+                return Err(Some(format!(
+                    "exit continuation block 0x{current:x} is reached by {predecessors} edges"
+                )));
             }
             chain.push(current);
             match self.func.successors(current).as_slice() {
                 // Nothing follows, so the exit ends here and the chain is whole.
-                [] => return Some(chain),
+                [] => return Ok((chain, None)),
                 [next] => current = *next,
                 // A branch is a region of its own and needs the structuring to
                 // say which way it goes, which this walk cannot.
-                _ => return None,
+                successors => {
+                    return Err(Some(format!(
+                        "exit continuation block 0x{current:x} branches {} ways",
+                        successors.len()
+                    )));
+                }
             }
         }
     }
