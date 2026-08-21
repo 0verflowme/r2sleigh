@@ -4387,6 +4387,30 @@ mod tests {
         }
     }
 
+
+    /// A machine that says it returns a value in RAX, so a test asking which
+    /// phi a control return binds has a premise for the question. Without one,
+    /// nothing can name the return register and the answer used to come from a
+    /// list of register spellings.
+    fn machine_returning_in_rax() -> SourceMachineContext {
+        let mut arch = ArchSpec::new("return-register-test");
+        arch.addr_size = 8;
+        arch.alignment = 1;
+        arch.add_space(AddressSpace::ram(8));
+        arch.add_register(RegisterDef::new("RAX", 0x00, 8));
+        arch.add_register(RegisterDef::new("EAX", 0x00, 4));
+        arch.add_register(RegisterDef::new("RIP", 0x30, 8));
+        arch.return_registers = vec![RegisterDef::new("RAX", 0x00, 8)];
+        SourceMachineContext::from_blocks_with_interfaces(
+            &[],
+            Some(&arch),
+            None,
+            SourceMachineRoles::default(),
+            None,
+            Vec::new(),
+        )
+    }
+
     fn make_arm64_alias_arch() -> ArchSpec {
         let mut arch = ArchSpec::new("aarch64");
         arch.add_register(RegisterDef::new("x0", 0x00, 8));
@@ -4395,6 +4419,9 @@ mod tests {
         arch.add_register(RegisterDef::new("w8", 0x80, 4));
         arch.add_register(RegisterDef::new("x9", 0x88, 8));
         arch.add_register(RegisterDef::new("w9", 0x88, 4));
+        // The architecture says where it returns a value, so a call result is
+        // distinguishable without a list of register spellings.
+        arch.return_registers = vec![RegisterDef::new("x0", 0x00, 8)];
         arch
     }
 
@@ -4405,6 +4432,7 @@ mod tests {
         arch.add_register(RegisterDef::new("rbx", 8, 8));
         arch.add_register(RegisterDef::new("rsp", 16, 8));
         arch.add_register(RegisterDef::new("rbp", 24, 8));
+        arch.return_registers = vec![RegisterDef::new("rax", 0, 8)];
         arch
     }
 
@@ -5398,7 +5426,7 @@ mod tests {
             target: SSAVar::new("RIP", 1, 8),
         }];
 
-        let prepared = SsaArtifact::new(function, FunctionPrepareMode::Raw);
+        let prepared = SsaArtifact::new_with_context(function, FunctionPrepareMode::Raw, machine_returning_in_rax());
         let cert = prepared
             .return_certificate_for_op(0x1114, 0)
             .expect("control return should certify unique return phi");
@@ -5454,7 +5482,7 @@ mod tests {
             },
         ];
 
-        let prepared = SsaArtifact::new(function, FunctionPrepareMode::Raw);
+        let prepared = SsaArtifact::new_with_context(function, FunctionPrepareMode::Raw, machine_returning_in_rax());
         let cert = prepared
             .return_certificate_for_op(0x1214, 1)
             .expect("control return should identify the unique return phi");
@@ -6835,7 +6863,7 @@ mod tests {
                 canonical_storage: None,
             }];
             block.ops = vec![SSAOp::Return { target: phi_dst }];
-            SsaArtifact::new(function, FunctionPrepareMode::Raw)
+            SsaArtifact::new_with_context(function, FunctionPrepareMode::Raw, machine_returning_in_rax())
         }
 
         let same_source = SSAVar::constant(7, 8);
@@ -6937,7 +6965,7 @@ mod tests {
             target: phi.clone(),
         }];
 
-        let prepared = SsaArtifact::new(function, FunctionPrepareMode::Raw);
+        let prepared = SsaArtifact::new_with_context(function, FunctionPrepareMode::Raw, machine_returning_in_rax());
         let carrier = prepared
             .structured()
             .loops
@@ -7024,7 +7052,7 @@ mod tests {
             },
         ];
 
-        let prepared = SsaArtifact::new(function, FunctionPrepareMode::Raw);
+        let prepared = SsaArtifact::new_with_context(function, FunctionPrepareMode::Raw, machine_returning_in_rax());
         let predicate = prepared
             .predicates()
             .predicates
@@ -7126,7 +7154,7 @@ mod tests {
             },
         ];
 
-        let prepared = SsaArtifact::new(function, FunctionPrepareMode::Raw);
+        let prepared = SsaArtifact::new_with_context(function, FunctionPrepareMode::Raw, machine_returning_in_rax());
         let comparison = prepared
             .predicates()
             .predicates
@@ -7225,7 +7253,7 @@ mod tests {
             target: result.clone(),
         }];
 
-        let prepared = SsaArtifact::new(function, FunctionPrepareMode::Raw);
+        let prepared = SsaArtifact::new_with_context(function, FunctionPrepareMode::Raw, machine_returning_in_rax());
         let phi_value = prepared.graph().value_id_for_var(&phi).unwrap();
         let init_value = prepared.graph().value_id_for_var(&init).unwrap();
         let result_value = prepared.graph().value_id_for_var(&result).unwrap();

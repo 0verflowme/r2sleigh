@@ -119,6 +119,9 @@ mod tests {
         arch.add_register(RegisterDef::new("RBP", 0x20, 8));
         arch.add_register(RegisterDef::new("RSP", 0x28, 8));
         arch.add_register(RegisterDef::new("RIP", 0x30, 8));
+        // The architecture says where it returns a value, so a call result is
+        // distinguishable without a list of register spellings.
+        arch.return_registers = vec![RegisterDef::new("RAX", 0x00, 8)];
         arch
     }
 
@@ -126,6 +129,7 @@ mod tests {
         let mut arch = ArchSpec::new("aarch64");
         arch.add_register(RegisterDef::new("x0", 0x4000, 8));
         arch.add_register(RegisterDef::sub("w0", 0x4000, 4, "x0"));
+        arch.return_registers = vec![RegisterDef::new("x0", 0x4000, 8)];
         for index in 1..8 {
             let offset = 0x4000 + index * 8;
             arch.add_register(RegisterDef::new(format!("x{index}"), offset, 8));

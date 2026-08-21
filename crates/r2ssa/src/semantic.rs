@@ -3342,7 +3342,7 @@ fn collect_prepared_function_certificates(
         .collect();
 
     let (call_results, call_results_by_inst, call_results_by_callsite) =
-        collect_call_result_certificates(function, graph, objects, call_sites, structured);
+        collect_call_result_certificates(machine_context, function, graph, objects, call_sites, structured);
     let stack_reloads =
         collect_stack_reload_source_certificates(function, graph, objects, memory, structured);
     let (returns, returns_by_inst) = collect_return_value_certificates(
@@ -3804,6 +3804,7 @@ fn collect_return_value_certificates(
     }
 
     let reaching_control_returns = collect_reaching_control_return_values(
+        machine_context,
         function,
         graph,
         predicates,
@@ -3817,8 +3818,9 @@ fn collect_return_value_certificates(
         for (op_idx, op) in block.ops.iter().enumerate() {
             if let SSAOp::Return { target } = op {
                 has_explicit_return = true;
-                if is_return_value_register(target) {
+                if is_return_value_register(machine_context, target) {
                     push_return_value_certificate(
+                        machine_context,
                         graph,
                         &mut returns,
                         &mut returns_by_inst,
@@ -3826,9 +3828,10 @@ fn collect_return_value_certificates(
                         op_idx,
                         target,
                     );
-                } else if is_control_return_target(target) {
+                } else if is_control_return_target(machine_context, target) {
                     if let Some((_, value)) = last_return_value_write {
                         push_return_value_certificate(
+                            machine_context,
                             graph,
                             &mut returns,
                             &mut returns_by_inst,
@@ -3840,6 +3843,7 @@ fn collect_return_value_certificates(
                         reaching_control_returns.get(&(block.addr, op_idx)).copied()
                     {
                         push_return_value_certificate_for_value(
+                            machine_context,
                             graph,
                             &mut returns,
                             &mut returns_by_inst,
@@ -3851,6 +3855,7 @@ fn collect_return_value_certificates(
                         unique_return_value_phi_for_block(machine_context, block)
                     {
                         push_return_value_certificate(
+                            machine_context,
                             graph,
                             &mut returns,
                             &mut returns_by_inst,
@@ -3861,6 +3866,7 @@ fn collect_return_value_certificates(
                     }
                 } else {
                     push_return_value_certificate(
+                        machine_context,
                         graph,
                         &mut returns,
                         &mut returns_by_inst,
@@ -3874,7 +3880,7 @@ fn collect_return_value_certificates(
 
             if return_context_blocks.contains(&block.addr)
                 && let Some(dst) = op.dst()
-                && is_return_value_register(dst)
+                && is_return_value_register(machine_context, dst)
             {
                 let preserve_wider_call_alias = matches!(op, SSAOp::CallDefine { .. })
                     && last_return_value_write.is_some_and(|(_, current)| {
@@ -3892,6 +3898,7 @@ fn collect_return_value_certificates(
             && let Some((op_idx, dst)) = last_return_value_write
         {
             push_return_value_certificate(
+                machine_context,
                 graph,
                 &mut returns,
                 &mut returns_by_inst,
@@ -3920,6 +3927,7 @@ enum ReturnSemanticIdentity {
 }
 
 fn collect_reaching_control_return_values(
+    machine_context: Option<&SourceMachineContext>,
     function: &SSAFunction,
     graph: &SsaGraph,
     predicates: &PredicateFacts,
@@ -3956,7 +3964,14 @@ fn collect_reaching_control_return_values(
             continue;
         };
         let (output, block_returns) =
-            process_reaching_return_block(graph, call_results, stack_reloads, block, input);
+            process_reaching_return_block(
+                machine_context,
+                graph,
+                call_results,
+                stack_reloads,
+                block,
+                input,
+            );
         for (site, value) in block_returns {
             returns_by_op.insert(site, value);
         }
@@ -4037,6 +4052,7 @@ fn merge_reaching_return_predecessors(
 }
 
 fn process_reaching_return_block(
+    machine_context: Option<&SourceMachineContext>,
     graph: &SsaGraph,
     call_results: &BTreeMap<ValueId, CallResultCertificate>,
     stack_reloads: &BTreeMap<ValueId, StackReloadSourceCertificate>,
@@ -4047,7 +4063,7 @@ fn process_reaching_return_block(
     let return_phis = block
         .phis
         .iter()
-        .filter(|phi| is_return_value_register(&phi.dst))
+        .filter(|phi| is_return_value_register(machine_context, &phi.dst))
         .filter_map(|phi| {
             reaching_return_value_for_var(graph, call_results, stack_reloads, &phi.dst)
         })
@@ -4059,7 +4075,7 @@ fn process_reaching_return_block(
     }
     for (op_idx, op) in block.ops.iter().enumerate() {
         if let SSAOp::Return { target } = op
-            && is_control_return_target(target)
+            && is_control_return_target(machine_context, target)
             && let Some(state) = state
         {
             returns_by_op.insert((block.addr, op_idx), state.value);
@@ -4068,7 +4084,7 @@ fn process_reaching_return_block(
             state = None;
         }
         if let Some(dst) = op.dst()
-            && is_return_value_register(dst)
+            && is_return_value_register(machine_context, dst)
         {
             let candidate = reaching_return_value_for_var(graph, call_results, stack_reloads, dst);
             let preserve_wider_call_alias = matches!(op, SSAOp::CallDefine { .. })
@@ -4549,6 +4565,7 @@ type CallResultCertificateIndexes = (
 );
 
 fn collect_call_result_certificates(
+    machine_context: Option<&SourceMachineContext>,
     function: &SSAFunction,
     graph: &SsaGraph,
     objects: &ObjectModel,
@@ -4580,6 +4597,7 @@ fn collect_call_result_certificates(
         };
         let input = merge_call_result_flow_predecessors(function, &out_states, block_addr);
         let output = process_call_result_flow_block(
+            machine_context,
             function,
             block,
             graph,
@@ -4641,6 +4659,7 @@ fn merge_call_result_flow_predecessors(
 
 #[allow(clippy::too_many_arguments)]
 fn process_call_result_flow_block(
+    machine_context: Option<&SourceMachineContext>,
     function: &SSAFunction,
     block: &crate::FunctionSSABlock,
     graph: &SsaGraph,
@@ -4657,7 +4676,7 @@ fn process_call_result_flow_block(
     for (op_index, op) in block.ops.iter().enumerate() {
         match op {
             SSAOp::Call { .. } | SSAOp::CallInd { .. } => {
-                kill_return_register_flow_values(&mut state, graph);
+                kill_return_register_flow_values(machine_context, &mut state, graph);
                 active_call = callsites_by_op.get(&(block.addr, op_index)).copied();
             }
             SSAOp::CallDefine { dst } => {
@@ -4667,7 +4686,7 @@ fn process_call_result_flow_block(
                 let Some(call_site) = call_sites.by_id.get(&call_site_id) else {
                     continue;
                 };
-                let Some(carrier) = return_carrier_for_value(dst) else {
+                let Some(carrier) = return_carrier_for_value(machine_context, dst) else {
                     continue;
                 };
                 let Some(value) = graph.value_id_for_var(dst) else {
@@ -4872,11 +4891,15 @@ fn process_call_result_flow_block(
     state
 }
 
-fn kill_return_register_flow_values(state: &mut CallResultFlowState, graph: &SsaGraph) {
+fn kill_return_register_flow_values(
+    machine_context: Option<&SourceMachineContext>,
+    state: &mut CallResultFlowState,
+    graph: &SsaGraph,
+) {
     state.tracked.retain(|value, _| {
         graph
             .value(*value)
-            .is_none_or(|value| !is_return_value_register(&value.var))
+            .is_none_or(|value| !is_call_result_register(machine_context, &value.var))
     });
 }
 
@@ -4934,6 +4957,7 @@ fn stack_memory_access_at(
 }
 
 fn push_return_value_certificate(
+    machine_context: Option<&SourceMachineContext>,
     graph: &SsaGraph,
     returns: &mut Vec<ReturnValueCertificate>,
     returns_by_inst: &mut BTreeMap<InstId, usize>,
@@ -4957,11 +4981,12 @@ fn push_return_value_certificate(
         op_index: op_idx,
         value,
         width: value_var.size,
-        carrier: return_carrier_for_value(value_var),
+        carrier: return_carrier_for_value(machine_context, value_var),
     });
 }
 
 fn push_return_value_certificate_for_value(
+    machine_context: Option<&SourceMachineContext>,
     graph: &SsaGraph,
     returns: &mut Vec<ReturnValueCertificate>,
     returns_by_inst: &mut BTreeMap<InstId, usize>,
@@ -4985,12 +5010,15 @@ fn push_return_value_certificate_for_value(
         op_index: op_idx,
         value,
         width: value_var.size,
-        carrier: return_carrier_for_value(value_var),
+        carrier: return_carrier_for_value(machine_context, value_var),
     });
 }
 
-fn return_carrier_for_value(value: &SSAVar) -> Option<ReturnCarrier> {
-    if is_return_value_register(value) {
+fn return_carrier_for_value(
+    machine_context: Option<&SourceMachineContext>,
+    value: &SSAVar,
+) -> Option<ReturnCarrier> {
+    if is_call_result_register(machine_context, value) {
         return Some(ReturnCarrier::Register {
             name: value.name.clone(),
         });
@@ -4998,31 +5026,55 @@ fn return_carrier_for_value(value: &SSAVar) -> Option<ReturnCarrier> {
     None
 }
 
-fn is_return_value_register(value: &SSAVar) -> bool {
-    if !value.is_register() {
-        return false;
-    }
-    let name = value
-        .name
-        .trim()
-        .trim_start_matches('$')
-        .to_ascii_lowercase();
-    matches!(
-        name.as_str(),
-        "rax" | "eax" | "ax" | "al" | "xmm0" | "st0" | "x0" | "w0" | "r0" | "v0" | "a0" | "r3"
-    )
+/// Whether this value sits in the location this function returns a value in.
+///
+/// The interface says whether there is one and where, so a function declared to
+/// return nothing answers false for every register. This was a list of register
+/// spellings, which answered for the architectures somebody wrote down.
+fn is_return_value_register(
+    machine_context: Option<&SourceMachineContext>,
+    value: &SSAVar,
+) -> bool {
+    storage_location_of(machine_context, value)
+        .zip(machine_context.and_then(SourceMachineContext::return_value_carrier))
+        .is_some_and(|(location, carrier)| location == carrier.location())
 }
 
-fn is_control_return_target(value: &SSAVar) -> bool {
-    if !value.is_register() {
-        return false;
-    }
-    let name = value
-        .name
-        .trim()
-        .trim_start_matches('$')
-        .to_ascii_lowercase();
-    matches!(name.as_str(), "pc" | "lr" | "ra" | "x30" | "rip" | "eip")
+/// Whether this value sits in the location a *call* leaves its result in.
+///
+/// This asks where a callee put a value, which does not depend on whether the
+/// function being analysed returns anything: a void function still reads the
+/// results of the calls it makes.
+fn is_call_result_register(
+    machine_context: Option<&SourceMachineContext>,
+    value: &SSAVar,
+) -> bool {
+    storage_location_of(machine_context, value)
+        .zip(machine_context.and_then(SourceMachineContext::result_slot))
+        .is_some_and(|(location, slot)| location == slot.location())
+}
+
+/// Whether this value sits in the location that carries a return address.
+fn is_control_return_target(
+    machine_context: Option<&SourceMachineContext>,
+    value: &SSAVar,
+) -> bool {
+    storage_location_of(machine_context, value)
+        .zip(machine_context.and_then(SourceMachineContext::return_address_carrier))
+        .is_some_and(|(location, carrier)| location == carrier.location())
+}
+
+/// The location a value occupies, when the machine can say.
+fn storage_location_of(
+    machine_context: Option<&SourceMachineContext>,
+    value: &SSAVar,
+) -> Option<r2source::CanonicalLocation> {
+    let machine = machine_context?;
+    value
+        .is_register()
+        .then(|| machine.register_storage(&value.name))
+        .flatten()
+        .map(|storage| storage.location())
 }
 
 fn collect_structured_loop_facts(
