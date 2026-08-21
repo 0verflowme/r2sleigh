@@ -74,11 +74,13 @@ fn materialize_phis_where_with_control(
         control.poll()?;
         let mut moves_by_pred = HashMap::<u64, Vec<PhiMove>>::new();
         let mut complete = true;
-        let selected = block
-            .phis
-            .iter()
-            .filter(|phi| eligible(phi))
-            .collect::<Vec<_>>();
+        let selected = widest_per_storage(
+            block
+                .phis
+                .iter()
+                .filter(|phi| eligible(phi))
+                .collect::<Vec<_>>(),
+        );
         if selected.is_empty() {
             continue;
         }
@@ -169,6 +171,43 @@ struct PhiMove {
     dst: r2ssa::SSAVar,
     src: r2ssa::SSAVar,
     op: SSAOp,
+}
+
+/// Keep one merge per register, not one per width the machine wrote it at.
+///
+/// A header that merges both `RAX` and `EAX` is merging one register twice, and
+/// materialising both gives the rendering two mutable variables for one value.
+/// They then share a name and the body reads `x = x` beside the update that
+/// already wrote it. The widest slice contains the others, so it is the one that
+/// carries the value; anything at a different offset is a different place and is
+/// kept.
+fn widest_per_storage<'a>(phis: Vec<&'a r2ssa::PhiNode>) -> Vec<&'a r2ssa::PhiNode> {
+    use r2ssa::CanonicalStorageSpace;
+    let mut widest_by_slot: HashMap<(CanonicalStorageSpace, u64), &r2ssa::PhiNode> = HashMap::new();
+    let mut kept = Vec::with_capacity(phis.len());
+    for phi in phis {
+        let Some(storage) = phi.canonical_storage else {
+            kept.push(phi);
+            continue;
+        };
+        if !matches!(storage.space, CanonicalStorageSpace::Register) {
+            kept.push(phi);
+            continue;
+        }
+        match widest_by_slot.entry((storage.space, storage.offset)) {
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(phi);
+            }
+            std::collections::hash_map::Entry::Occupied(mut slot) => {
+                let held = slot.get().canonical_storage.map_or(0, |held| held.size);
+                if storage.size > held {
+                    slot.insert(phi);
+                }
+            }
+        }
+    }
+    kept.extend(widest_by_slot.into_values());
+    kept
 }
 
 fn materialized_phi_edge_op(
