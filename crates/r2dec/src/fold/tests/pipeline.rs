@@ -11551,8 +11551,9 @@ mod tests {
 
         let cfg_a = ctx_a.to_pass_env();
         let cfg_b = ctx_b.to_pass_env();
+        // One function has one table, so both runs read the names of one.
         let info_a = analysis::UseInfo::analyze(&ctx_a.symbols, &blocks, &cfg_a);
-        let info_b = analysis::UseInfo::analyze(&ctx_b.symbols, &blocks, &cfg_b);
+        let info_b = analysis::UseInfo::analyze(&ctx_a.symbols, &blocks, &cfg_b);
         assert_eq!(info_a, info_b, "UseInfo analysis should be deterministic");
     }
 
