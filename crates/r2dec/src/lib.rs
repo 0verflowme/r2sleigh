@@ -1408,11 +1408,16 @@ pub(crate) fn empty_display_names() -> &'static r2types::DisplayNames {
 /// State what the rendering did and did not show.
 ///
 /// "Nothing was marked" and "everything was shown to be right" are different
-/// claims, and only the second earns silence. Nothing here makes the second,
-/// so the note is always emitted: it reports how many constructs carry a
-/// residual marker, and says so plainly when the rendering produced no
-/// statements at all, which is not the same as a function with no effects.
-fn note_unproven_constructs(func: &mut CFunction, closure: Option<ObligationClosure>) {
+/// claims, and only the second earns silence. Nothing here makes the second, so
+/// the note is always emitted: it reports how many constructs carry a residual
+/// marker, and then reports the ledger, which says what became of every effect
+/// the source obliges.
+///
+/// The ledger's columns sum to its total, so an effect that went missing is a
+/// number in the line rather than an absence from it. An unaccounted count is
+/// never zero because nothing went wrong; it is zero only when every obligation
+/// was reached by a rule that named its fate.
+fn note_unproven_constructs(func: &mut CFunction, ledger: Option<&r2ssa::ledger::ObligationLedger>) {
     let rendered_nothing = func.body.is_empty();
     let residuals = count_residual_markers(&func.body);
     let detail = if rendered_nothing {
@@ -1424,28 +1429,22 @@ fn note_unproven_constructs(func: &mut CFunction, closure: Option<ObligationClos
             n => format!("{n} constructs are marked below"),
         }
     };
-    // Counting markers reads the body; counting obligations reads what the source
-    // said the body owes. Only the second can tell that an effect went missing,
-    // so it is reported beside the first rather than in place of it.
-    //
-    // A body with no statements owns nothing whatever the fold recorded on the way
-    // there: the proofs are taken while folding, and a structuring that then
-    // refuses emits none of it. Reporting the folded count for such a function
-    // claims ownership for a function that rendered nothing.
-    // A comment is not a statement, so a body holding only refusals rendered nothing
-    let rendered_any_statement = func
-        .body
-        .iter()
-        .any(|stmt| !matches!(stmt, CStmt::Comment(_) | CStmt::Empty));
-    let detail = match closure {
-        Some(closure) if closure.total > 0 && rendered_any_statement => format!(
-            "{detail}; {} of {} source obligations owned, {} unsupported",
-            closure.owned, closure.total, closure.unsupported
-        ),
-        Some(closure) if closure.total > 0 => format!(
-            "{detail}; none of {} source obligations owned",
-            closure.total
-        ),
+    let detail = match ledger.map(r2ssa::ledger::ObligationLedger::close) {
+        Some(closure) if closure.total > 0 => {
+            let mut line = format!(
+                "{detail}; {} source obligations: {} rendered, {} elided, {} refused",
+                closure.total, closure.rendered, closure.elided, closure.refused
+            );
+            // The column that used to have no name. Saying nothing here is what let a
+            // gutted body report as clean, so it is spelled out whenever it is not zero.
+            if closure.unattributed > 0 {
+                let _ = write!(&mut line, ", {} unaccounted", closure.unattributed);
+            }
+            if closure.conflicts > 0 {
+                let _ = write!(&mut line, ", {} conflicting", closure.conflicts);
+            }
+            line
+        }
         _ => detail,
     };
     func.body.insert(
@@ -1454,102 +1453,146 @@ fn note_unproven_constructs(func: &mut CFunction, closure: Option<ObligationClos
     );
 }
 
-/// How much of what the source obliges is owned by something the output rendered.
-#[derive(Debug, Clone, Copy, Default)]
-pub(crate) struct ObligationClosure {
-    pub(crate) owned: usize,
-    pub(crate) total: usize,
-    pub(crate) unsupported: usize,
+/// Take back every rendering claim when the body that would carry them is empty.
+///
+/// Proofs are taken while folding, and a structuring that then emits nothing has
+/// discharged none of them. Claiming otherwise is how a function with no output
+/// reported most of its obligations owned. This works at whole-function
+/// granularity because that is what can be proven without statement provenance;
+/// a statement that survives structuring cannot yet name the obligations it carries.
+fn reconcile_ledger_with_body(ledger: &mut r2ssa::ledger::ObligationLedger, func: &CFunction) {
+    use r2ssa::ledger::{LedgerLayer, Outcome, RefusalReason};
+    let rendered_any_statement = func
+        .body
+        .iter()
+        .any(|stmt| !matches!(stmt, CStmt::Comment(_) | CStmt::Empty));
+    if rendered_any_statement {
+        return;
+    }
+    let claimed = ledger
+        .entries()
+        .filter(|(_, outcome)| matches!(outcome, Outcome::Rendered { .. }))
+        .map(|(id, _)| *id)
+        .collect::<Vec<_>>();
+    for id in claimed {
+        ledger.overwrite(
+            id,
+            Outcome::Refused {
+                layer: LedgerLayer::Structure,
+                reason: RefusalReason::BlockNotRendered,
+            },
+        );
+    }
 }
 
-/// Which source obligations a rendered site accounts for.
+/// What became of every obligation this function's source inventory recorded.
 ///
-/// An op is owned by the statement it became or by the expression that reads it,
-/// and either way the site it sits at names it. An unsupported effect is counted
-/// apart, because the admission rule asks it to residualize rather than be owned.
-fn obligation_closure(
+/// Ownership used to be inferred at the end by asking whether anything had been
+/// proven about each entry, and an entry nothing had an opinion about fell out of
+/// every total. Attribution now writes into a ledger that already holds each
+/// obligation, so an entry no rule reaches stays visible as undecided instead of
+/// disappearing, and the counts sum to the inventory by construction.
+fn build_obligation_ledger(
     prepared: &r2ssa::SsaArtifact,
     proofs: &[crate::fold::context::EffectRenderProof],
     folded_blocks: &std::collections::BTreeSet<u64>,
     elided_op_sites: &std::collections::BTreeMap<(u64, usize), &'static str>,
-) -> ObligationClosure {
+) -> r2ssa::ledger::ObligationLedger {
     use r2ssa::SemanticObligationKind as Kind;
+    use r2ssa::ledger::{LedgerLayer, ObligationLedger, Outcome, RefusalReason};
+
     let obligations = prepared.obligations();
-    let rendered = proofs
-        .iter()
-        .filter_map(|proof| {
-            prepared
-                .graph()
-                .inst_id_for_op_site(proof.block_addr, proof.op_idx)
-        })
-        .collect::<std::collections::BTreeSet<_>>();
-    // A merge sits at the head of its block rather than at any operation, so no
-    // operation site can name it. What expresses a merge is the block it heads:
-    // if that block rendered, the values arriving there are the ones the output
-    // reads, and the merge is what it read them through.
-    let rendered_blocks = folded_blocks;
-    // Same mapping the proofs use, so an elided site and a rendered site are
-    // named the same way and can be compared.
-    let elided_by_reason = elided_op_sites
-        .iter()
-        .filter_map(|((block_addr, op_idx), reason)| {
-            prepared
-                .graph()
-                .inst_id_for_op_site(*block_addr, *op_idx)
-                .map(|inst| (inst, *reason))
-        })
-        .collect::<std::collections::BTreeMap<_, _>>();
-    let mut unowned_elided = std::collections::BTreeMap::new();
-    let mut closure = ObligationClosure::default();
-    let mut unowned_by_kind = std::collections::BTreeMap::new();
-    let mut unowned_in_rendered_blocks = 0usize;
-    for id in obligations.obligations().keys() {
-        if matches!(id.kind, Kind::VolatileOrUnknownEffect | Kind::Trap) {
-            closure.unsupported += 1;
-            continue;
-        }
-        closure.total += 1;
-        let owned = match id.instruction.site {
-            r2ssa::CanonicalInstructionSite::Phi(_) => {
-                rendered_blocks.contains(&id.instruction.block_addr)
-            }
-            _ => obligations
-                .instructions()
-                .get(&id.instruction)
-                .and_then(|disposition| disposition.source.graph_inst())
-                .is_some_and(|inst| rendered.contains(&inst)),
-        };
-        if owned {
-            closure.owned += 1;
-        } else {
-            unowned_by_kind
-                .entry(id.kind)
-                .and_modify(|count| *count += 1)
-                .or_insert(1usize);
-            // An obligation in a block that never rendered is missing because
-            // the body is, which is a structuring debt. One in a block that did
-            // render was elided by the fold itself, which is a different debt
-            // and the one worth separating out.
-            if rendered_blocks.contains(&id.instruction.block_addr) {
-                unowned_in_rendered_blocks += 1;
-            }
-            if let Some(reason) = obligations
-                .instructions()
-                .get(&id.instruction)
-                .and_then(|disposition| disposition.source.graph_inst())
-                .and_then(|inst| elided_by_reason.get(&inst))
-            {
-                *unowned_elided.entry(*reason).or_insert(0usize) += 1;
-            }
+    let graph = prepared.graph();
+    let mut ledger = ObligationLedger::open(obligations);
+
+    // InstId is a dense index, so membership is a direct probe rather than a tree
+    // walk, and the site an obligation rendered at is read back from the same table.
+    let inst_count = graph.insts.len();
+    let mut rendered_site = vec![None::<(u64, usize)>; inst_count];
+    for proof in proofs {
+        if let Some(inst) = graph.inst_id_for_op_site(proof.block_addr, proof.op_idx)
+            && let Some(slot) = rendered_site.get_mut(inst.0 as usize)
+        {
+            *slot = Some((proof.block_addr, proof.op_idx));
         }
     }
-    debug_log_unowned_obligations(
-        prepared,
-        &unowned_by_kind,
-        unowned_in_rendered_blocks,
-        &unowned_elided,
-    );
-    closure
+    let mut elided_reason = vec![None::<&'static str>; inst_count];
+    for ((block_addr, op_idx), reason) in elided_op_sites {
+        if let Some(inst) = graph.inst_id_for_op_site(*block_addr, *op_idx)
+            && let Some(slot) = elided_reason.get_mut(inst.0 as usize)
+        {
+            *slot = Some(*reason);
+        }
+    }
+
+    for id in obligations.obligations().keys() {
+        // The admission rule asks these to residualize rather than be owned, which
+        // is a refusal with a reason and not an absence.
+        if matches!(id.kind, Kind::VolatileOrUnknownEffect | Kind::Trap) {
+            ledger.record(
+                *id,
+                Outcome::Refused {
+                    layer: LedgerLayer::Ssa,
+                    reason: RefusalReason::UnsupportedEffect,
+                },
+            );
+            continue;
+        }
+        let block_rendered = folded_blocks.contains(&id.instruction.block_addr);
+        // A merge sits at the head of its block rather than at any operation, so no
+        // operation site can name it; the block it heads is what expresses it.
+        let outcome = match id.instruction.site {
+            r2ssa::CanonicalInstructionSite::Phi(_) if block_rendered => Outcome::Rendered {
+                block_addr: id.instruction.block_addr,
+                op_idx: 0,
+            },
+            r2ssa::CanonicalInstructionSite::Phi(_) => Outcome::Refused {
+                layer: LedgerLayer::Structure,
+                reason: RefusalReason::BlockNotRendered,
+            },
+            _ => {
+                let inst = obligations
+                    .instructions()
+                    .get(&id.instruction)
+                    .and_then(|disposition| disposition.source.graph_inst());
+                let index = inst.map(|inst| inst.0 as usize);
+                let site = index.and_then(|index| rendered_site.get(index).copied().flatten());
+                match site {
+                    Some((block_addr, op_idx)) => Outcome::Rendered { block_addr, op_idx },
+                    None => {
+                        match index.and_then(|index| elided_reason.get(index).copied().flatten()) {
+                            Some(reason) => Outcome::Elided(elision_reason(reason)),
+                            None if !block_rendered => Outcome::Refused {
+                                layer: LedgerLayer::Structure,
+                                reason: RefusalReason::BlockNotRendered,
+                            },
+                            // The block rendered and no rule reached this obligation.
+                            None => Outcome::Unattributed,
+                        }
+                    }
+                }
+            }
+        };
+        ledger.record(*id, outcome);
+    }
+
+    debug_log_ledger(prepared, &ledger);
+    ledger
+}
+
+/// Read the fold's elision label as the reason it names.
+fn elision_reason(reason: &str) -> r2ssa::ledger::ElisionReason {
+    use r2ssa::ledger::ElisionReason;
+    match reason {
+        "stack-frame" => ElisionReason::StackFrame,
+        "dead-cpu-flag" => ElisionReason::DeadCpuFlag,
+        "dead-flag-only" => ElisionReason::DeadFlagOnly,
+        "dead-unused-temp" => ElisionReason::DeadUnusedTemporary,
+        "dead-caller-saved" => ElisionReason::DeadCallerSaved,
+        "dead-call-arg" => ElisionReason::DeadCallArgument,
+        "dead-stack-base" => ElisionReason::DeadStackBase,
+        _ => ElisionReason::DeadUnclassified,
+    }
 }
 
 /// Whether a run was asked to report what the rendering left unaccounted for.
@@ -1558,43 +1601,51 @@ pub(crate) fn unowned_report_requested() -> bool {
     *REQUESTED.get_or_init(|| std::env::var_os("R2SLEIGH_DEBUG_UNOWNED").is_some())
 }
 
-/// Report what a function still owes, grouped by the kind of effect it is.
+/// Write the whole ledger out on request, so a count has somewhere to look.
 ///
-/// The closure counts how many obligations went unowned but not what they were,
-/// which says a function is 27% short without saying short of what. Naming the
-/// kinds turns that number into somewhere to look, so it is written out on
-/// request rather than folded into the rendered note, which speaks about the
-/// body rather than about the work left to do on the decompiler.
-fn debug_log_unowned_obligations(
-    prepared: &r2ssa::SsaArtifact,
-    unowned_by_kind: &std::collections::BTreeMap<r2ssa::SemanticObligationKind, usize>,
-    unowned_in_rendered_blocks: usize,
-    unowned_elided: &std::collections::BTreeMap<&'static str, usize>,
-) {
+/// The rendered note says how many obligations landed in each column, which tells
+/// a reader that a function is short without saying short of what. This names the
+/// kinds left undecided, the reasons given for eliding, and the layer behind every
+/// refusal, which is what turns those numbers into a place to start.
+fn debug_log_ledger(prepared: &r2ssa::SsaArtifact, ledger: &r2ssa::ledger::ObligationLedger) {
     if !unowned_report_requested() {
         return;
     }
-    let mut counts = unowned_by_kind.iter().collect::<Vec<_>>();
-    // Largest first, and by name where two kinds owe the same amount, so the
-    // report reads the same way twice over the same binary.
-    counts.sort_by(|(left_kind, left), (right_kind, right)| {
-        right
-            .cmp(left)
-            .then_with(|| left_kind.to_string().cmp(&right_kind.to_string()))
-    });
-    let summary = counts
-        .iter()
-        .map(|(kind, count)| format!("{kind}={count}"))
-        .collect::<Vec<_>>()
-        .join(" ");
-    let elided = unowned_elided
-        .iter()
-        .map(|(reason, count)| format!("unowned-elided-{reason}={count}"))
-        .collect::<Vec<_>>()
-        .join(" ");
+    let closure = ledger.close();
+    // Largest first, and by name where two entries tie, so the report reads the
+    // same way twice over the same binary.
+    fn ranked<K: std::fmt::Display>(counts: std::collections::BTreeMap<K, usize>) -> String {
+        let mut entries = counts.into_iter().collect::<Vec<_>>();
+        entries.sort_by(|(left_key, left), (right_key, right)| {
+            right
+                .cmp(left)
+                .then_with(|| left_key.to_string().cmp(&right_key.to_string()))
+        });
+        entries
+            .into_iter()
+            .map(|(key, count)| format!("{key}={count}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+    let refusals = ranked(
+        ledger
+            .refusals_by_layer()
+            .into_iter()
+            .map(|((layer, reason), count)| (format!("{layer}/{reason}"), count))
+            .collect(),
+    );
     let message = format!(
-        "UNOWNED fn={:#x} in-rendered-blocks={unowned_in_rendered_blocks} {elided} {summary}",
-        prepared.function().entry
+        "LEDGER fn={:#x} total={} rendered={} elided={} refused={} unaccounted={} conflicts={} | unaccounted-kinds: {} | elided: {} | refused: {}",
+        prepared.function().entry,
+        closure.total,
+        closure.rendered,
+        closure.elided,
+        closure.refused,
+        closure.unattributed,
+        closure.conflicts,
+        ranked(ledger.unattributed_by_kind()),
+        ranked(ledger.elisions_by_reason()),
+        refusals,
     );
     let path = std::env::var("R2SLEIGH_DEBUG_UNOWNED_LOG")
         .unwrap_or_else(|_| "/tmp/r2sleigh_unowned.log".to_string());
@@ -3231,13 +3282,14 @@ impl Decompiler {
         if let Some(reason) = incomplete_source_obligations_reason(prepared) {
             return Ok(residual_function_for_render_boundary(&c_function.name, &reason));
         }
-        let closure = obligation_closure(
+        let mut ledger = build_obligation_ledger(
             prepared,
             &fold_ctx.effect_render_proofs_since(0),
             &fold_ctx.folded_block_addrs(),
             &fold_ctx.elided_op_sites(),
         );
-        note_unproven_constructs(&mut c_function, Some(closure));
+        reconcile_ledger_with_body(&mut ledger, &c_function);
+        note_unproven_constructs(&mut c_function, Some(&ledger));
         work.with_phase(DecompileWorkPhase::Rendering).poll()?;
         Ok(c_function)
     }
