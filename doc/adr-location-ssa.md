@@ -219,8 +219,9 @@ has to work before it lands.
 5. Move the observable-reachability filter out of `r2types`.
 6. Collapse the facts structs into one model and enforce the renderer's read-only
    contract.
-7. Rewrite the fold: demote flags and temporaries, migrate expressions onto the
-   symbol table, give each certified carrier one name, extract the target model,
+7. Rewrite the fold, in this order: model function live-out from the target ABI,
+   then demote flags and temporaries, then give each certified carrier one name,
+   then migrate expressions onto the symbol table, then extract the target model
    and convert the complexity ceiling into budget refusals.
 
 The FFI comes before the location model because the snapshot enters the system
@@ -268,6 +269,32 @@ at present a carrier's readers are mostly condition-code computations that are
 themselves elided. A readership test cannot be written honestly until flags stop
 being values that merge, which is step 7. Naming carriers therefore belongs to
 step 7 and not before it.
+
+## What the exit block showed, and what it changes
+
+Removing merges nothing reads looked like the obvious way to shrink the merge
+set, and it is wrong as stated. In the measured function every phi in the exit
+block reports zero uses, including the one that carries the returned value. They
+are not dead. They are live out through the calling convention, and the SSA has
+no way to say so: the `Return` op targets the instruction pointer, and the fact
+that a register carries the answer is an ABI property no operation records.
+
+That is the same absence behind three separate failures already traced. A carrier
+is not observable because no return is certified. A readership test cannot tell a
+value that matters from one that does not. A phi that must survive is
+indistinguishable from one that could go.
+
+So step 7 needs function live-out modelled before any of its parts can be
+written honestly, and the machinery for it is already here.
+`collect_preserved_projection_defs` in `crates/r2ssa/src/optimize.rs` runs a
+backward dataflow over register byte ranges, seeded at return blocks, merging
+ranges as it goes. It exists to preserve width aliases and answers exactly the
+question the readership test needs to ask. Nothing consults it about whether a
+merge is read.
+
+Live-out therefore comes first within step 7: seed it from the target model's
+return and callee-saved registers, let the existing backward pass carry it, and
+have readership, carrier naming and merge-set reduction all read the one answer.
 
 ## Consequences
 
