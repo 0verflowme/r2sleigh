@@ -727,6 +727,26 @@ there is nowhere else the answer exists. That is what makes `Var(SymbolId)`
 necessary rather than preferable, and it is worth having established by
 construction rather than by argument.
 
+### The migration is wider than `CExpr::Var`
+
+Starting it found that the 952 figure understates the change, and by enough to
+matter. `codegen.rs` was carried to the point where its own errors were gone, and
+what stopped it was not an expression at all: `CLocal.name` and `CStmt::Decl.name`
+are `String`, so a map keyed by symbol cannot be built from a function's locals,
+and a declaration cannot be emitted from a symbol. Keeping them as spellings
+leaves a string boundary inside the AST, which is the thing being removed.
+
+So the change is the whole AST's name representation, not one variant of one
+enum. Beside the roughly 750 `Var` sites there are 46 uses of `local.name`, 83 of
+`param.name`, 39 constructions of `CStmt::Decl` and 32 of `CLocal` and `CParam`
+together, each cascading into the maps and sets that key on them -- and re-keying
+one map in `codegen.rs` alone pulled in six more signatures.
+
+What that changes is the estimate, not the direction. Everything already
+established still holds: the necessity is proven, the table's ownership is
+decided and in place, and the hazard is named. This is a day's work done in one
+sitting by someone who can hold the whole AST in their head, not an evening's.
+
 ### Where the table lives
 
 The ownership question is the part that needed deciding rather than typing, and
