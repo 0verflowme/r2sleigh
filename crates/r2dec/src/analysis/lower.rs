@@ -14,16 +14,6 @@ use super::{
 use crate::address::parse_address_from_var_name;
 use crate::ast::{BinaryOp, CExpr, CType, UnaryOp};
 
-/// No string table, for the analysis passes that never render a literal.
-/// A table for a caller that only needs to read, never to mint.
-pub(crate) fn no_symbols() -> &'static std::cell::RefCell<crate::symbol::SymbolTable> {
-    thread_local! {
-        static EMPTY: &'static std::cell::RefCell<crate::symbol::SymbolTable> =
-            Box::leak(Box::new(std::cell::RefCell::new(crate::symbol::SymbolTable::new())));
-    }
-    EMPTY.with(|table| *table)
-}
-
 pub(crate) fn no_string_literals() -> &'static std::collections::BTreeMap<u64, String> {
     static EMPTY: std::sync::OnceLock<std::collections::BTreeMap<u64, String>> =
         std::sync::OnceLock::new();

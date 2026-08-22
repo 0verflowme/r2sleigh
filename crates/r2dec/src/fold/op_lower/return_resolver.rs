@@ -1,16 +1,6 @@
 use super::*;
 use crate::analysis::utils::{is_temporary_or_constant_name, ssa_render_base_name};
 
-struct CertifiedMergedSlotReturnEvidence {
-    expr: CExpr,
-    source: ValueId,
-    return_block: u64,
-    return_op: usize,
-    return_value: ValueId,
-    store_inst: r2ssa::InstId,
-    store_address: ValueId,
-}
-
 impl<'a> FoldingContext<'a> {
     fn typed_integer_literal_expr_in_context(
         &self,

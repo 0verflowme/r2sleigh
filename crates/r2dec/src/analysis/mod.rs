@@ -11,12 +11,10 @@ pub(crate) type SSABlock = FunctionSSABlock;
 
 // Pass dependency invariant:
 // UseInfo -> (FlagInfo, StackInfo) -> PredicateSimplifier -> statement emit.
-pub(crate) mod flag_info;
 pub(crate) mod lower;
 pub(crate) mod ownership;
 pub(crate) mod predicate;
 pub(crate) mod prepared_semantic;
-pub(crate) mod stack_info;
 pub(crate) mod use_info;
 pub(crate) mod utils;
 
@@ -76,8 +74,8 @@ impl DecompilerFacts {
     }
 }
 
-/// No carrier is named for a caller that never had render facts to ask.
-/// No condition codes, for a pass whose caller has no target to state.
+/// No condition codes, for a fixture whose target states none.
+#[cfg(test)]
 pub(crate) fn no_flag_registers() -> &'static std::collections::HashSet<String> {
     static EMPTY: std::sync::OnceLock<std::collections::HashSet<String>> =
         std::sync::OnceLock::new();
@@ -530,19 +528,6 @@ fn call_arg_references_any(arg: &CallArgBinding, ids: &BTreeSet<ValueId>) -> boo
 }
 
 impl UseInfo {
-    #[allow(dead_code)]
-    pub(crate) fn analyze(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, blocks: &[SSABlock], env: &PassEnv<'_>) -> Self {
-        use_info::analyze(symbols, blocks, env)
-    }
-
-    pub(crate) fn analyze_with_control(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
-        blocks: &[SSABlock],
-        env: &PassEnv<'_>,
-        control: crate::DecompileWorkControl<'_>,
-    ) -> Result<Self, crate::DecompileExecutionStop> {
-        use_info::analyze_with_control(symbols, blocks, env, control)
-    }
-
     #[cfg(test)]
     pub(crate) fn analyze_for_local_struct_accesses(
         blocks: &[SSABlock],
@@ -566,28 +551,6 @@ impl UseInfo {
         definition_overrides: &HashMap<String, CExpr>,
     ) -> Self {
         use_info::analyze_with_definition_overrides(symbols, blocks, env, definition_overrides)
-    }
-
-    pub(crate) fn analyze_with_definition_overrides_with_control(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
-        blocks: &[SSABlock],
-        env: &PassEnv<'_>,
-        definition_overrides: &HashMap<String, CExpr>,
-        control: crate::DecompileWorkControl<'_>,
-    ) -> Result<Self, crate::DecompileExecutionStop> {
-        use_info::analyze_with_definition_overrides_with_control(symbols, 
-            blocks,
-            env,
-            definition_overrides,
-            control,
-        )
-    }
-
-    pub(crate) fn preserve_authoritative_facts_from(
-        &mut self,
-        symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
-        baseline: &UseInfo,
-    ) {
-        use_info::preserve_authoritative_facts(symbols, self, baseline);
     }
 
     pub(crate) fn bind_value_id(&mut self, var: &SSAVar, value_id: ValueId) -> Option<ValueId> {
@@ -997,12 +960,6 @@ impl UseInfo {
             })
     }
 
-    pub(crate) fn known_named_values(&self) -> Vec<String> {
-        let mut names: BTreeSet<&str> = BTreeSet::new();
-        names.extend(self.named_values());
-        names.into_iter().map(str::to_string).collect()
-    }
-
     /// Every name any pass has something to say about, borrowed.
     ///
     /// A caller that filters these does not need them copied first, and copying
@@ -1029,18 +986,6 @@ impl UseInfo {
 
     pub(crate) fn render_stack_slot_for_name(&self, name: &str) -> Option<StackSlotProvenance> {
         self.stack_slot_for_name(name)
-    }
-
-    pub(crate) fn stack_slot_for_var(&self, var: &SSAVar) -> Option<StackSlotProvenance> {
-        if self.ambiguous_value_vars.contains(var)
-            || self.ambiguous_value_names.contains(&var.display_name())
-        {
-            return None;
-        }
-        self.stack_slot_for_name(&var.display_name()).or_else(|| {
-            self.value_id_for_var(var)
-                .and_then(|value_id| self.stack_slots_by_value.get(&value_id).copied())
-        })
     }
 
     pub(crate) fn ptr_arith_for_var(&self, var: &SSAVar) -> Option<&PtrArith> {
@@ -1079,13 +1024,7 @@ impl UseInfo {
 }
 
 impl FlagInfo {
-    pub(crate) fn analyze(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, blocks: &[SSABlock], use_info: &UseInfo, env: &PassEnv<'_>) -> Self {
-        flag_info::analyze(symbols, blocks, use_info, env)
-    }
 }
 
 impl StackInfo {
-    pub(crate) fn analyze(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, blocks: &[SSABlock], use_info: &UseInfo, env: &PassEnv<'_>) -> Self {
-        stack_info::analyze(symbols, blocks, use_info, env)
-    }
 }

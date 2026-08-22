@@ -109,15 +109,6 @@ fn certified_compare_truth_relation_handles_complement_and_swapped_equality() {
     );
 }
 
-fn is_visible_external_stack_name_role(role: ExternalStackSlotRole) -> bool {
-    matches!(
-        role,
-        ExternalStackSlotRole::Local
-            | ExternalStackSlotRole::StackArg
-            | ExternalStackSlotRole::Unknown
-    )
-}
-
 fn external_struct_field_name_for_offset(
     st: &ExternalStruct,
     offset: u64,
@@ -1762,9 +1753,6 @@ impl<'a> FoldingContext<'a> {
     }
     pub(crate) fn has_renderable_named_fact(&self, name: &str) -> bool {
         self.use_info().has_renderable_named_fact(name)
-    }
-    pub(crate) fn known_named_values(&self) -> Vec<String> {
-        self.use_info().known_named_values()
     }
     pub(crate) fn stack_slots(&self) -> impl Iterator<Item = analysis::StackSlotProvenance> + '_ {
         self.use_info().stack_slots()
@@ -13843,46 +13831,6 @@ pub(crate) fn should_replace_preserved_stack_alias(existing: &str) -> bool {
 pub(crate) fn is_generic_stack_placeholder_alias(existing: &str) -> bool {
 
     analysis::utils::is_generic_stack_placeholder_alias(existing)
-}
-
-fn should_replace_preserved_stack_expr(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, existing: &CExpr, preserved: &CExpr) -> bool {
-    match (existing, preserved) {
-        (CExpr::Var(existing_name), CExpr::Var(preserved_name)) => {
-            should_replace_preserved_stack_alias(&crate::symbol::spelling(symbols, *existing_name))
-                && !should_replace_preserved_stack_alias(&crate::symbol::spelling(symbols, *preserved_name))
-        }
-        _ => false,
-    }
-}
-
-fn normalize_stack_definition_overrides(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, stack_info: &mut analysis::StackInfo) {
-    let replacements: Vec<(String, CExpr)> = stack_info
-        .definition_overrides
-        .iter()
-        .filter_map(|(key, expr)| {
-            let CExpr::Var(name) = expr else {
-                return None;
-            };
-            let offset = if let Some(rest) = crate::symbol::spelling(symbols, *name).strip_prefix("local_") {
-                i64::from_str_radix(rest, 16).ok().map(|v| -v)
-            } else if let Some(rest) = crate::symbol::spelling(symbols, *name).strip_prefix("stack_") {
-                i64::from_str_radix(rest, 16).ok()
-            } else {
-                None
-            }?;
-            let preferred = stack_info.stack_vars.get(&offset)?;
-            if should_replace_preserved_stack_alias(&crate::symbol::spelling(symbols, *name))
-                && !should_replace_preserved_stack_alias(preferred)
-            {
-                Some((key.clone(), crate::symbol::var_ref(symbols, preferred.clone())))
-            } else {
-                None
-            }
-        })
-        .collect();
-    for (key, expr) in replacements {
-        stack_info.definition_overrides.insert(key, expr);
-    }
 }
 
 fn call_arg_callee_name(

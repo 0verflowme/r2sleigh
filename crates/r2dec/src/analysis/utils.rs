@@ -518,30 +518,6 @@ pub(crate) fn normalize_stack_address(symbols: &std::cell::RefCell<crate::symbol
     addr_key
 }
 
-pub(crate) fn simplify_stack_access(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
-    addr_expr: &CExpr,
-    stack_vars: &HashMap<i64, String>,
-    fp_name: &str,
-    sp_name: &str,
-) -> Option<String> {
-    match addr_expr {
-        CExpr::Paren(inner) => return simplify_stack_access(symbols, inner, stack_vars, fp_name, sp_name),
-        CExpr::Cast { expr: inner, .. } => {
-            return simplify_stack_access(symbols, inner, stack_vars, fp_name, sp_name);
-        }
-        CExpr::AddrOf(inner) => return simplify_stack_access(symbols, inner, stack_vars, fp_name, sp_name),
-        CExpr::Var(name) => {
-            if let Some(stripped) = crate::symbol::spelling(symbols, *name).strip_prefix('&') {
-                return Some(stripped.to_string());
-            }
-        }
-        _ => {}
-    }
-
-    extract_offset_from_expr(symbols, addr_expr, fp_name, sp_name)
-        .and_then(|offset| stack_vars.get(&offset).cloned())
-}
-
 pub(crate) fn arg_alias_for_register_name(reg_name: &str) -> Option<String> {
     let reg = reg_name.to_lowercase();
     if reg.contains("rdi") || reg.contains("edi") {
