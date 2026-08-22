@@ -1216,3 +1216,35 @@ expressions rather than names or facts.
 
 All guards from this exercise were reverted. Eight attempts, and the eighth is
 the one that says the seven before it were the wrong shape.
+
+### The size of the single authority
+
+Counting what currently answers "what does this value render as":
+
+    get_expr                       4 definitions   103 calls
+    var_ref                        2               226
+    render_value_ref               2                20
+    expr_for_ssa_name              2                17
+    get_return_expr                1                15
+    tracked_return_source_expr     1                 4
+    render_semantic_value_by_name  2                26
+    lookup_definition              4                47
+    best_visible_definition        4                21
+    resolve_expr_from_phi_sources  1                 8
+
+`var_ref` answers a different question -- what a value is *called* -- and is not
+part of this. The rest are nine resolvers with nineteen definitions and about two
+hundred and sixty call sites, all answering the same question with their own
+precedence, which is why closing one hands the question to the next.
+
+Collapsing all of them is the same shape as the two collapses this branch has
+already done, and roughly the same size as the `UseInfo` one.
+
+**A smaller slice does what the loop carrier needs.** The four return-value
+resolvers -- `get_return_expr`, `tracked_return_source_expr`,
+`merged_return_register_candidate_for_block` and the `last_ret_value` sites --
+are about forty call sites, and they are the only ones the carrier defect
+reaches. Routing those four through one function that states the carrier rule
+once would fix `sum32` without touching the other two hundred, and it would be a
+step toward the full collapse rather than a special case, because the one
+function is where the rest would move later.
