@@ -1642,3 +1642,33 @@ spellings -- `sym._work` and `sym__work` -- and `t12280_3` is declared and then
 not used by the return, which repeats its expression instead. 85 of 144
 obligations are refused. **Use a linked binary for call work, never an object
 file**, and this is the fixture.
+
+### Two renderings of one call, and where the second comes from
+
+The duplicate emission has a single line behind it:
+
+    // crates/r2dec/src/analysis/lower.rs:448
+    SSAOp::Call { target } => CExpr::call(self.get_expr(target), vec![]),
+
+The analysis layer lowers a call to a callee expression obtained from
+`get_expr(target)` -- which for a symbol target is a **`CExpr::Var`** named after
+the symbol -- with an empty argument list. The fold's certified path builds a
+different thing for the same call: a **`CExpr::External`** with the arguments the
+callsite certificate proves.
+
+Both reach the page. The certified one becomes a statement, the definition-table
+one is inlined into whatever reads the call's result, and the two spellings in
+the output are the two representations:
+
+    sym._work(...)     External, from the certified path
+    sym__work(...)     Var, from lower.rs:448, lowercased and dotted by
+                       assignment_lhs_expr into a legal identifier
+
+**This is the same defect the branch has collapsed twice already** -- two
+implementations of one job, disagreeing -- at the level of call expressions. The
+certified path is the one to keep: it has the arguments and the callee identity.
+`lower.rs:448` needs to stop building a second one, and the question to settle
+first is who consumes it, because the definition table is read from many places.
+
+The measure to watch is the ledger on `/tmp/xmmfix/callsmain`: 144 obligations,
+47 rendered, **85 refused** today.
