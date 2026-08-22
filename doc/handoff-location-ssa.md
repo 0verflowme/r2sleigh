@@ -2268,3 +2268,33 @@ behind it, any of which a resolver may prefer, and the fix has to be about what 
 resolver is allowed to walk through rather than about what a value is. That is a
 different piece of work than the one that just landed, and the four resolver
 guards plus this removal are the evidence for it.
+
+### A contradiction in the sum32 evidence, which is where to start
+
+Stopping `lookup_definition_with_depth` from walking through a carrier -- one
+place rather than the nine that consume it -- is also inert. That is six.
+
+More useful than the sixth failure is a contradiction across the measurements
+that has been sitting in this document unremarked:
+
+  * bisecting `get_expr` shows it answering `IntLit(0)` for `X8_4`, first at
+    site 9 and then at site 12 once site 9 was closed;
+  * closing both makes `get_expr` stop being called for `X8_4` at all;
+  * and the rendered output is `return 0` in every one of those states.
+
+If the returned expression came from `get_expr(X8_4)`, the third observation is
+impossible. So it does not: the `0` on the page is produced by something that was
+never on the path being guarded, and every carrier fix attempted so far has been
+aimed at a path that does not produce it.
+
+The retval probe agrees and was misread at the time: it reports `raw=IntLit(0)`
+already, meaning the return statement is built from a constant rather than from
+anything resolvable, so whatever made that constant ran earlier still.
+
+**Start by enumerating the output**, the method that solved the call defect after
+six seam attempts had failed there too. Walk the body immediately after it is
+built and print the return statement's expression; then walk it again before and
+after `fold_constant_arithmetic_in_expr` and the other whole-function passes in
+`lib.rs`. One of those transitions turns a carrier reference into `0`, and that
+transition is the defect. Do not guard another resolver until that print says
+which one.
