@@ -996,3 +996,54 @@ merge fix lands the arm64 accumulator loops and `sym._fnv1a64`, and the x86 ones
 need it **and** the register-width layer before they render. An earlier claim in
 this document that the fix covers "every hash function at -O1 and above" is too
 strong and should be read as the arm64 half.
+
+### The exit-merge fix was built three ways and none of them landed
+
+The scope above is right about what the merge means and wrong about what it
+takes to render. Three attempts, each of which got further and exposed the next
+layer.
+
+**Rewriting the SSA.** A pass in `normalize.rs` that drops the exit merge and
+inserts `Copy { dst: merge, src: carrier }` at the top of the block. It fires
+exactly as intended:
+
+    merge block=108 X0_5 -> carrier X0_3
+    merge block=108 X1_3 -> carrier X1_1
+    merge block=108 X8_4 -> carrier X8_2
+
+and it breaks the certificates. Inserting an op shifts every op index in that
+block, and the certified return is keyed by `(block_addr, op_idx)`, so the
+lookup that read `Some(ValueId(91))` now reads `None`. Materialisation gets away
+with inserting because it inserts into *predecessor* blocks, never into the block
+holding the return. Any fix that edits a block containing a certified site has
+to renumber the certificates, which is a much larger change than it looks.
+
+**Aliasing the merge to the carrier.** `carrier_name_aliases` already maps every
+member of a carrier to one name, so the exit merge can simply join that map:
+
+    alias merge X0_5 -> x0
+    alias merge X8_4 -> x8
+
+No SSA edit, no index shift, and the mechanism is the one already there. It
+changes nothing, because the return never *names* the value: it resolves it, and
+resolution does not consult the alias map.
+
+**Declining to resolve an aliased carrier.** If a phi carries a carrier alias it
+is mutable state and must be read by name, so resolution should decline and let
+the caller reference it. That produces
+
+    return pc;
+
+which is the third layer: when resolution declines, the return path falls back
+to the branch target rather than to the value's name. The return resolver can
+say "the answer is this expression" or fall back, and has no way to say "the
+answer is this variable".
+
+**So the blocker is the return resolver, not the merge.** The merge is correctly
+understood and the alias mechanism reaches it; what is missing is a return path
+that can answer with a name. That is where the next attempt should start, and it
+should start by reading `get_return_expr` and `resolve_return_target_expr`
+rather than by touching normalisation again.
+
+All three attempts were reverted. Two were inert and one was worse, and the
+measurements above are the whole value of the exercise.
