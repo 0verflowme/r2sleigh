@@ -2371,3 +2371,37 @@ One `eprintln!` in each arm answers it.
 Ten guards and rewrites have now been tried on this defect across the session and
 every one measured inert. Every measurement, by contrast, has narrowed it. The
 next person should take the print above before writing any code at all.
+
+### sum32, narrowed to one function
+
+Instrumenting both guards together confirms they work and that the answer is
+correct where it is built:
+
+    guard1 fired for X8_4 -> Var(carrier) recognised=true
+    guard2 fired for Var(carrier)
+    arm control_target=true last_ret=Some(Var(carrier))
+    arm=control last=Var(carrier)
+
+So `expr` is the carrier reference at the point the return statement is
+constructed. And the body's return statement is `IntLit(0)` before the first
+whole-function pass runs. Between those two facts there are exactly two calls:
+
+    let normalized = self.normalize_final_return_candidate(expr.clone());
+    self.sanitize_final_return_expr(normalized, expr)
+
+Guarding the first so a carrier reference passes through unchanged does not
+change the rendering. **So it is `sanitize_final_return_expr`**, and that is the
+last unguarded step on a path that is now instrumented end to end.
+
+Everything on this path was reverted; the tree is unchanged. What the next
+session inherits is a defect narrowed from "nine resolvers disagree" to one named
+function, with four other resolution points proven not to be responsible and the
+guards that prove it written out above.
+
+**On method, and this is the honest part.** Ten guards were tried across the
+session and every one measured inert, while every measurement narrowed the
+defect. The measurements that mattered were: bisecting `get_expr`'s fourteen
+return points, timing the whole-function passes, printing `last_ret_value`
+beside `expr`, and printing which arm builds the return. None took more than one
+build. Several of the guards were written after a measurement had already made
+them unnecessary, which is the mistake to avoid repeating.
