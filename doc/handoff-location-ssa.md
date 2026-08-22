@@ -1697,3 +1697,37 @@ variable named after the symbol. **Find it by marking rather than reading**: giv
 `CExpr::call` sites in the fold a distinguishing callee and see which marker
 reaches the page, exactly as above. That took one build to eliminate a candidate
 and will take one more to find the real one.
+
+### Thirty-eight places build a call expression
+
+Marking eliminated four candidates in three builds -- `analysis/lower.rs:448`,
+`analysis/use_info.rs:5357`, `use_info.rs:5631` and both sites in
+`fold/op_lower/calls.rs` -- and none of their markers reached the page. Counting
+properly says why that was never going to converge:
+
+    21  crates/r2dec/src/fold/op_lower/mod.rs
+    13  crates/r2dec/src/analysis/lower.rs
+     3  crates/r2dec/src/structure.rs
+     3  crates/r2dec/src/lib.rs
+     2  crates/r2dec/src/fold/op_lower/lowering.rs
+     2  crates/r2dec/src/fold/op_lower/calls.rs
+
+Thirty-eight production sites construct a call expression. The twenty-one in
+`op_lower/mod.rs` were never examined, because an earlier grep of that directory
+was truncated at twelve results and I read the absence as evidence.
+
+**That count is the defect, not a step toward finding it.** A call rendering
+twice under two spellings is what thirty-eight independent constructions of the
+same thing look like, and it is the same shape as the two collapses this branch
+has already done and the resolver contract it has already scoped: no single
+place owns the answer, so several answer, and they disagree.
+
+The work is to make one of them own it -- the certified path, which has the
+callee identity and the proven arguments -- and route the rest through it. That
+is a larger job than the duplicate suggests, and the ledger measures it:
+`/tmp/xmmfix/callsmain` renders 47 of 144 obligations with 85 refused.
+
+**Method note.** Marking works and reading does not: four candidates eliminated
+in three builds, against four wrong mechanisms reasoned from the rendering. But
+mark from a complete list. Three of those builds were spent because the list was
+truncated and I did not check it.
