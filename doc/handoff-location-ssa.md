@@ -2512,3 +2512,25 @@ materialisation assigns on more than one edge. The set is exactly
 `carrier_aliases`, which the fold already has and the analysis can be given, and
 the trace above is the check -- `X8_2` should have no definition, and then the
 add keeps its operand.
+
+### Suppressing the carrier's definition in the shipping builder is also inert
+
+The guard the previous entry called for was applied where the trace said it
+belonged -- `populate_prepared_render_definitions`, with `env.carrier_aliases` in
+scope -- so that a materialised carrier records no render definition. `sum32` is
+unchanged and `sym._fnv1a64` is unaffected. Reverted.
+
+So the add's operand does not resolve through `definitions[X8_2]` either. The
+remaining candidate is that the operand is not the carrier but a value derived
+from it -- the 32-bit add reads a truncation, and that truncation has its own
+definition recorded from the same initialiser.
+
+**The trace to take next is one step further down the same path**: print what
+`tmp:12280_2`'s definition is built from, in the same place `deftrace` printed
+`X8_1`, `X8_2` and `X8_3`. Filter on `tmp:12280` rather than `X8`. That names the
+operand exactly, and it is the last unexamined link between the carrier and the
+rendered assignment.
+
+Twelve interventions have now been measured on this defect and every one was
+inert; every trace has narrowed it by one step. The next person should take the
+trace and not write a guard until it prints.
