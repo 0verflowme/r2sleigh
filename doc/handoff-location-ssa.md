@@ -2057,3 +2057,34 @@ constructor hunt could not.
 the constructors are few. Enumerating the finished output is bounded by the size
 of the output rather than by the size of the code, and it is the better first
 move whenever a value can be rewritten after it is built.
+
+### Both call forms exist before any post-pass runs
+
+Enumerating the body rather than the constructors -- the method the previous
+entry argued for -- answers it in one build. Probing immediately after the
+`CFunction` is assembled and again near the end of the pipeline:
+
+    early  External(sym._work) x2   Var(sym._work) x4
+           External(sym._other) x1  Var(sym._other) x2
+    late   External(sym._work) x2   Var(sym__work) x1
+           External(sym._other) x1  Var(sym__other) x2
+
+So **both representations are already present when the body is first built**.
+The post-passes are not creating the second form; they are reducing it, four
+occurrences to one. The `sym._work` to `sym__work` change between the two probes
+is only identifier sanitisation, not a different expression.
+
+That relocates the defect decisively: it originates in the fold, before anything
+downstream touches the body, and `single_evaluation` and the renaming passes are
+downstream of it. It also sharpens the puzzle, because `#[track_caller]` on
+`CExpr::call` reports only two construction sites in the whole run and both build
+`External` callees. A call with a `Var` callee is therefore in the body without
+having been constructed by the only constructor, which leaves one explanation:
+it is cloned from an expression built elsewhere -- an analysis `definitions` or
+`semantic_values` entry -- and inlined by the fold.
+
+**Next:** probe the same way at the analysis boundary. Print every `CExpr::Call`
+in `use_info().definitions` and `semantic_values` before folding begins. If the
+`Var`-callee form is already there, the analysis layer built it and the fold
+merely inlined it, which makes this the same defect as the three call
+expressions and not a fourth thing.
