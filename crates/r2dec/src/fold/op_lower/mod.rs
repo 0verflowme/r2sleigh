@@ -2167,20 +2167,14 @@ impl<'a> FoldingContext<'a> {
             &env,
             self.inputs.prepared_ssa,
         );
-        if self.inputs.prepared_ssa.is_none() {
-            analysis::use_info::populate_switch_selector_roots(
-            &self.symbols,
-                self.state.analysis_ctx.semantic_mut(),
-                func,
-                &env,
-            );
-        } else {
-            self.state
-                .analysis_ctx
-                .semantic_mut()
-                .switch_selector_roots
-                .clear();
-        }
+        // Switch selectors come from the prepared artifact, which every
+        // decompile carries; recovering them from the blocks was the other
+        // builder's job.
+        self.state
+            .analysis_ctx
+            .semantic_mut()
+            .switch_selector_roots
+            .clear();
         analysis::use_info::annotate_stack_slot_semantics(
             &self.symbols,
             self.state.analysis_ctx.semantic_mut(),
