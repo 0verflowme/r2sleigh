@@ -1446,7 +1446,34 @@ Each of those is one run. Reach for them before a sampler, which answers where
 the code is rather than where the time is, and is actively misleading for a
 predicate whose calls are rare on the stack and enormous individually.
 
-### A call-heavy arm64 function renders almost nothing, and the x86 predicate is not why
+### Withdrawn: arm64 call rendering is not empty
+
+The entry below recorded a defect that does not exist, and it is left here
+because the mistake is instructive. `radare2` split the test function in two --
+`fcn.00000000` is thirty-six bytes ending at `eor w2, w19, w20`, before either
+`bl` -- so decompiling address zero renders a prologue, correctly, and I read the
+short output as calls being dropped. Always check the function boundary before
+believing a short rendering.
+
+Decompiling the half that holds the calls shows them rendering:
+
+    uint64_t sub_24_result = sub_24();
+    uint64_t t12280_3 = sub_24_result + w19
+        + sub_30(sub_24_result + w20, W1, W2, W3, W4, W5, W6, W7);
+
+**There is a real defect here, and it is a different one.** `sub_30` is handed
+eight arguments where the call passes one, and they are exactly `W1` through
+`W7`: the AAPCS64 argument registers, emitted as a list rather than intersected
+against what the function actually sets. `SourceConventionSlots` says in its own
+documentation that this is what its consumers must do -- "a consumer recovering
+parameters from machine code intersects this candidate list against what the
+function reads before writing" -- and the callsite path does not. The ledger
+agrees that something is wrong: 81 obligations, 25 rendered, **50 refused**, and
+a residual saying `uncertified callsite arguments at 0x24:49`.
+
+That is the thread worth pulling, and it is much narrower than "call rendering".
+
+### The withdrawn entry, kept for the method
 
 Three calls and three arguments each:
 
