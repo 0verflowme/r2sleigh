@@ -1277,3 +1277,33 @@ produced by the last resolver in its chain rather than the first.
 
 Ten attempts on this defect are recorded above. The useful residue is this
 paragraph and the bisection method that produced it; every guard was reverted.
+
+### The remaining cost is diffuse, and that is the finding
+
+Three cost defects were removed by profiling: the exponential path count, the
+per-name block rescan, and the per-question copying of every known name. After
+them the profile of an 18614-op function has no peak:
+
+    11 ssa_name_parts        8 should_inline       7 is_dead
+     5 find_ssa_name_for_rendered_alias            5 emitted_var_names
+     9 r2types::register_alias_names               5 SSAVar::display_name
+
+Fifty samples spread across a dozen functions, none of which dominates. The
+superlinearity that remains -- doubling the function still costs about 2.6x --
+is not one wrong data structure but the accumulated cost of building a `String`
+for a map key on nearly every query, in functions each of which is individually
+cheap.
+
+One clear algorithmic waste was fixed and reverted for honesty:
+`find_ssa_name_for_rendered_alias` sorts its candidates and then takes only the
+first, and the comparator recomputes both operands' preference keys on every
+comparison, where each key renders a semantic value. Selecting instead of
+sorting is one key per candidate rather than one per comparison, and it measures
+7.6s to 7.1s and 19.9s to 19.5s, which is noise. It is strictly less work and it
+is not the bottleneck, so it is not in the tree.
+
+**So the next cost work is not another hotspot hunt.** It is `display_name()`:
+it allocates, it is the key of most of these maps, and it is called from every
+predicate in the profile above. Removing that allocation -- interning the name,
+or keying the maps by `ValueId`, which the graph already assigns -- is the change
+the profile points to, and it is wide rather than deep.
