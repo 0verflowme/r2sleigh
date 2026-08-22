@@ -1445,3 +1445,39 @@ reverted on that advice. What worked was cheaper and duller:
 Each of those is one run. Reach for them before a sampler, which answers where
 the code is rather than where the time is, and is actively misleading for a
 predicate whose calls are rare on the stack and enormous individually.
+
+### A call-heavy arm64 function renders almost nothing, and the x86 predicate is not why
+
+Three calls and three arguments each:
+
+    int driver(int n, int m) {
+        int a = work(n + 1, m * 2, n ^ m);
+        int b = other(a + n);
+        return a + b + m;
+    }
+
+renders on arm64 as
+
+    void sub_0(int64_t arg0, int64_t arg1) {
+        t7b80_2[1] = x30;
+    }
+
+with 12 of 18 obligations rendered and 6 unaccounted. Both calls, all four
+arguments and the return are gone.
+
+`is_call_arg_transient_name` was the suspect, because it decides whether a call
+argument's expression is low signal and it ends with
+
+        || lower.starts_with('x')
+        || lower.starts_with('w')
+
+which on arm64 matches **every** register. Removing those two clauses changes the
+rendering not at all, so it is not the cause here. The predicate is still wrong
+-- it is a list of x86 caller-saved spellings with an arm64 catch-all bolted on,
+and the target model already knows which registers are caller-saved -- but fixing
+it is a tidiness change rather than this defect's fix.
+
+**This is a new thread and it is a large one:** call rendering on arm64, measured
+on the smallest function that shows it. It is not the loop carrier, not the
+resolver contract and not the cost work; it should be measured from scratch, and
+`calls.c` above is the fixture to do it with.
