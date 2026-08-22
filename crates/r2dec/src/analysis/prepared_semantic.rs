@@ -412,7 +412,6 @@ pub(crate) fn build_prepared_runtime_facts_with_control(
     pin_prepared_loop_carried_phi_values(&mut use_info, prepared, view);
     pin_aliases_for_prepared_pinned_values(&mut use_info);
     populate_prepared_call_runtime_facts(symbols, &mut use_info, blocks, env, prepared, view);
-    overlay_local_struct_semantics(symbols, &mut use_info, blocks, env, control)?;
     overlay_prepared_switch_roots(&mut use_info, prepared, view);
     populate_prepared_render_definitions(symbols, &mut use_info, blocks, env);
 
@@ -642,38 +641,6 @@ fn is_self_render_definition(symbols: &std::cell::RefCell<crate::symbol::SymbolT
         dst.name.to_ascii_lowercase()
     };
     matches!(expr, CExpr::Var(name) if &*crate::symbol::spelling(symbols, *name) == &dst_display || crate::symbol::spelling(symbols, *name).eq_ignore_ascii_case(&dst_rendered))
-}
-
-fn overlay_local_struct_semantics(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
-    use_info: &mut UseInfo,
-    blocks: &[SSABlock],
-    env: &PassEnv<'_>,
-    control: crate::DecompileWorkControl<'_>,
-) -> Result<(), crate::DecompileExecutionStop> {
-    let semantic = UseInfo::analyze_for_local_struct_accesses_with_control(symbols, blocks, env, control)?;
-    for (name, value) in semantic.semantic_values {
-        control.poll()?;
-        // Prepared ValueId-bound facts are canonical; local struct inference is heuristic.
-        if use_info.value_ids_by_name.contains_key(&name) {
-            continue;
-        }
-        let should_replace = match use_info.semantic_values.get(&name) {
-            None => true,
-            Some(SemanticValue::Address(_) | SemanticValue::Load { .. }) => false,
-            Some(_) => matches!(
-                value,
-                SemanticValue::Address(_) | SemanticValue::Load { .. }
-            ),
-        };
-        if should_replace {
-            use_info.semantic_values.insert(name, value);
-        }
-    }
-    for (name, fact) in semantic.ptr_members {
-        control.poll()?;
-        use_info.ptr_members.entry(name).or_insert(fact);
-    }
-    Ok(())
 }
 
 fn populate_stack_aliases(
@@ -3111,6 +3078,34 @@ fn collect_prepared_runtime_facts(symbols: &std::cell::RefCell<crate::symbol::Sy
                 if let Some(value_id) = bind_prepared_value_id(use_info, view, src) {
                     *use_info.use_counts_by_value.entry(value_id).or_insert(0) += 1;
                 }
+            }
+            // A value defined by adding or subtracting a constant is that
+            // operand at an offset. This was the only fact the local-struct
+            // overlay contributed here: measured over both fixtures it offered
+            // 18, 252, 121 and 100 semantic values and none were taken, because
+            // a prepared value already answered for every name, while every
+            // pointer member it offered was taken because nothing else computes
+            // them. So the rule moves here and the overlay goes.
+            match op {
+                SSAOp::IntAdd { dst, a, b } => {
+                    if let Some(offset) = crate::analysis::utils::parse_const_offset(a) {
+                        use_info
+                            .ptr_members
+                            .insert(dst.display_name(), (b.clone(), offset));
+                    } else if let Some(offset) = crate::analysis::utils::parse_const_offset(b) {
+                        use_info
+                            .ptr_members
+                            .insert(dst.display_name(), (a.clone(), offset));
+                    }
+                }
+                SSAOp::IntSub { dst, a, b } => {
+                    if let Some(offset) = crate::analysis::utils::parse_const_offset(b) {
+                        use_info
+                            .ptr_members
+                            .insert(dst.display_name(), (a.clone(), -offset));
+                    }
+                }
+                _ => {}
             }
             if let SSAOp::CBranch { cond, .. } = op {
                 use_info.condition_vars.insert(cond.display_name());
