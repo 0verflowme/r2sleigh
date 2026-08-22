@@ -2696,3 +2696,45 @@ fixes the dropping pass, and the two together should render the accumulation.
 A caution worth leaving behind: `cargo fmt` in this worktree reformats far more
 than the file being edited, and the resulting diff buries real changes among
 hundreds of formatting hunks. Do not run it while a fix is in progress.
+
+### The carrier defect is closed, and what it cost to find
+
+The previous entry put the drop "between `op_lower` and the substitution". That
+was one call too coarse: `binary_stmt_typed` prints its result *before* calling
+`assign_stmt`, and the loss is inside `assign_stmt`. Instrumenting its three
+steps named the step exactly:
+
+    asgtrace in    Var(x8)
+    asgtrace ident Var(x8)
+    asgtrace seman IntLit(0)
+
+`semanticize_visible_expr` replaces a name with the semantic value recorded for
+it, and for a carrier that value is what the loop was entered with. Together with
+the forwarding record described above, that is **two tables speaking for the
+carrier's name**, and either one alone is enough to erase the accumulation --
+which is why suppressing only the forwarding measured inert and was reverted.
+
+Both are now suppressed for a carrier, and the results are visible:
+
+    sum32     x8 = (int64_t)*x0          ->  x8 = (int64_t)(*x0 + x8)
+    fnv1a64   empty loop body            ->  x0 = (x0 ^ *(int8_t*)x8) * 0x1b3
+
+Preserving the names exposed a second, smaller defect: an initialization that a
+later store overwrites before anything reads it now printed twice. That is a
+genuine dead store, so `drop_overwritten_assignments` removes one where the
+statements between neither read nor branch. The two identical `expr_is_side_effect_free`
+predicates it needed -- one in `structure.rs`, one in `op_lower` -- were collapsed
+into one, the sixth instance of "one job, many implementations" found in this
+rewrite.
+
+2334 tests pass. The remaining defects on `fnv1a64` are separate and already
+named elsewhere in this document: the pointer increments twice (`x8++` and
+`x8 = x8_2 + 1`, with `x8_2` read undefined), and the FNV basis prints as
+`0x739d0383`, its low half, which is the 64-bit constant model.
+
+**The method that worked, stated once.** Seven traces, each narrowing by one step,
+and no guard written until a probe printed. Every intervention attempted ahead of
+a trace during this defect measured inert. The trap specific to this codebase is
+that a value has several tables that can answer for it, so a fix to one is
+indistinguishable from a wrong fix while another still answers -- count the tables
+first, and change them together.
