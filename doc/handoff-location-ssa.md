@@ -1071,3 +1071,35 @@ So the rule is: this fix completes the carrier return **for carriers that are
 full width throughout**. A carrier written at a narrower width than its phi needs
 the width layer first, and that is the location model rather than anything in the
 return resolver.
+
+### sum32 is a missing statement, not a wrong return
+
+The width theory for `sum32` is wrong. Its carrier is certified at full width:
+
+    member phi=X8_2 entries=["X8_1"] updates=["X8_3"]
+
+so the accumulator is tracked, entry and update both. And the return is already a
+constant before the return path sees it:
+
+    retval block=90 raw=IntLit(0)
+
+Four resolution paths were guarded against answering with a carrier's initialiser
+-- `get_return_expr`, `merged_return_register_candidate_for_block`, the inline
+gate in `should_inline`, and the top of `get_expr_with_depth` -- and none of them
+changed the answer, so none of them is where the `0` comes from. All four were
+reverted.
+
+Reading the rendered body says why:
+
+    do { x0 += 4; } while (arg1 != 1);
+
+`x0` is the pointer. The accumulator's update, `add w8, w9, w8`, is not emitted at
+all. So `return 0` is not a resolver preferring the entry value; it is the honest
+answer for a body in which nothing ever writes the accumulator. **The defect is a
+dropped statement, and the return is downstream of it.**
+
+The next measurement is therefore why the op defining `X8_3` produces no
+statement -- `is_dead`, `should_inline`, or the consumed-by-call set in
+`emitted_var_names` -- and not anything in the return path. `sym._fnv1a64`
+differs because its update *is* emitted, which is why fixing its return was
+enough there.
