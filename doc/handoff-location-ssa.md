@@ -2241,3 +2241,30 @@ it a site field, so every existing predicate keeps working and only the
 constructors and the reconciliation change. That trades the guarantee -- two
 expressions for one site become representable again -- for a much smaller blast
 radius, and it may be the right first step even though it is not the end state.
+
+### Removing a carrier's expressions does not help either
+
+The lesson from the call fix -- make the wrong answer unrepresentable rather than
+declining it at each site -- was applied to the carrier: after materialisation,
+remove every carrier member from `definitions`, `formatted_defs`,
+`semantic_values` and `phi_sources`, so a carrier has only its name.
+
+It is inert. `sum32` still answers `0`, its ledger is unchanged at 34
+obligations with 5 unaccounted, `sym._fnv1a64` is unaffected and all 2334 tests
+pass. Reverted.
+
+**That is the fifth carrier approach to measure as inert**, after guarding
+`get_return_expr`, `merged_return_register_candidate_for_block`, `should_inline`
+and phi-source resolution. The bisection explains why: the answer comes from
+`lookup_definition_with_depth`, which walks a *chain*. Removing the carrier's own
+entry only makes the walk take one more step to the same constant, because what
+is being resolved is not the carrier but the path from the exit merge back to the
+initialiser.
+
+**So the resolver instance is not the call instance in disguise.** The call
+defect was two objects that could not be recognised as one; giving them an
+identity fixed it in four lines. This is one object with a chain of derivations
+behind it, any of which a resolver may prefer, and the fix has to be about what a
+resolver is allowed to walk through rather than about what a value is. That is a
+different piece of work than the one that just landed, and the four resolver
+guards plus this removal are the evidence for it.
