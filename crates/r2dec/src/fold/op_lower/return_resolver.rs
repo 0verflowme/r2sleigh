@@ -311,6 +311,9 @@ impl<'a> FoldingContext<'a> {
         expr: &CExpr,
         context: VisibleExprContext,
     ) -> CExpr {
+        if self.expr_is_carrier_reference(expr) {
+            return expr.clone();
+        }
         let mut best = expr.clone();
         let mut semantic_visited = HashSet::new();
         let semanticized = self.semanticize_visible_expr(expr, 0, &mut semantic_visited);
@@ -1249,6 +1252,9 @@ impl<'a> FoldingContext<'a> {
     }
 
     pub(super) fn sanitize_final_return_expr(&self, expr: CExpr, fallback: CExpr) -> CExpr {
+        if self.expr_is_carrier_reference(&expr) {
+            return expr;
+        }
         if self.is_certified_rendered_call_expr(&expr) {
             return self
                 .stable_owner_for_certified_rendered_call_expr(&expr)

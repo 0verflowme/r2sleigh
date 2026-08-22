@@ -9079,7 +9079,25 @@ impl<'a> FoldingContext<'a> {
         }
     }
 
+    /// Whether this expression already names a loop carrier.
+    ///
+    /// A carrier is mutable state, so it is the answer wherever it appears: the
+    /// expressions reachable from it are the values it held on individual paths
+    /// through the loop, and preferring any of them says it always held that one.
+    pub(super) fn expr_is_carrier_reference(&self, expr: &CExpr) -> bool {
+        let CExpr::Var(name) = expr else {
+            return false;
+        };
+        let spelled = self.spelling(*name);
+        self.carrier_aliases
+            .values()
+            .any(|carrier| carrier.as_str() == &*spelled)
+    }
+
     fn tracked_return_source_expr(&self, src: &SSAVar) -> CExpr {
+        if self.carrier_aliases.contains_key(&src.display_name()) {
+            return self.name_ref(&self.var_name(src));
+        }
         let direct = self.get_expr(src);
         if Self::expr_is_scalar_memory_candidate(&direct)
             && !self.expr_is_address_artifact_in_scalar_context(&direct)
@@ -9593,6 +9611,9 @@ impl<'a> FoldingContext<'a> {
         target_expr: CExpr,
         last_ret_value: Option<CExpr>,
     ) -> CExpr {
+        if self.expr_is_carrier_reference(&target_expr) {
+            return target_expr;
+        }
         let mut best = Some(target_expr.clone());
         let mut visited = HashSet::new();
         if let Some(resolved) = self.resolve_return_expr_from_defs(&target_expr, 0, &mut visited)
@@ -9610,6 +9631,9 @@ impl<'a> FoldingContext<'a> {
     }
 
     fn normalize_final_return_candidate(&self, expr: CExpr) -> CExpr {
+        if self.expr_is_carrier_reference(&expr) {
+            return expr;
+        }
         if self.is_certified_rendered_call_expr(&expr) {
             return self
                 .stable_owner_for_certified_rendered_call_expr(&expr)
