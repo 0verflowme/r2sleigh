@@ -180,6 +180,13 @@ pub(crate) struct FoldingContext<'a> {
     /// answers every question about that block, and it is rebuilt when the walk
     /// moves on.
     pub(crate) block_producer_sites: std::cell::RefCell<Option<(u64, HashMap<String, usize>)>>,
+    /// Known names grouped by SSA version.
+    ///
+    /// Resolving a rendered alias needs the names sharing one version, and
+    /// finding them by filtering every known name costs a pass per question. The
+    /// names do not change once the analysis is built, so one pass answers all
+    /// of them.
+    pub(crate) names_by_version: OnceCell<BTreeMap<u32, Vec<String>>>,
     pub(crate) current_op_idx: Cell<Option<usize>>,
     pub(crate) hide_stack_frame: bool,
     pub(crate) signature_registry: SignatureRegistry,
@@ -294,6 +301,7 @@ impl<'a> FoldingContext<'a> {
             state: FoldState::default(),
             current_block_addr: Cell::new(None),
             block_producer_sites: std::cell::RefCell::new(None),
+            names_by_version: OnceCell::new(),
             current_op_idx: Cell::new(None),
             hide_stack_frame: true,
             signature_registry: SignatureRegistry::from_embedded_json(),

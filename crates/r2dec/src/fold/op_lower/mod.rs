@@ -10063,9 +10063,24 @@ impl<'a> FoldingContext<'a> {
             return Vec::new();
         };
 
-        let mut matches: Vec<String> = self
-            .use_info()
-            .named_values()
+        // Only names carrying this version can match, and they are a handful of
+        // the thousands a large function declares.
+        let by_version = self.names_by_version.get_or_init(|| {
+            let mut grouped: std::collections::BTreeMap<u32, Vec<String>> =
+                std::collections::BTreeMap::new();
+            for ssa_name in self.use_info().named_values() {
+                let (_, version) = Self::ssa_name_parts(ssa_name);
+                grouped.entry(version).or_default().push(ssa_name.to_string());
+            }
+            grouped
+        });
+        let candidates = by_version
+            .get(&alias_version)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let mut matches: Vec<String> = candidates
+            .iter()
+            .map(String::as_str)
             .filter(|ssa_name| {
                 let (base, ssa_version) = Self::ssa_name_parts(ssa_name);
                 let base_matches = if is_temp_alias {
