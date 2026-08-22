@@ -2006,3 +2006,27 @@ three constructions have to become one, and that is the work item, not a seam
 adjustment. It also shows the seam is capable of doing its job the moment it is
 handed the right expression, which is worth knowing: `single_evaluation` is not
 itself defective.
+
+### Where the third representation comes from, as far as measured
+
+Codegen prints an `External` verbatim, so `sym._work` on the page is an
+`External` and `sym__work` is not: it is a `CExpr::Var` whose SSA name is
+`sym._work`, lowercased with its dot replaced by the `_ =>` arm of
+`assignment_lhs_expr`. So the third form is a **call whose callee is a
+variable named after the callee**, and there is an SSA value carrying that name.
+
+`#[track_caller]` on `CExpr::call` reports only the two fold sites, both
+`External`, so this third call is not built through that constructor. The
+remaining constructors are the `CExpr::Call { .. }` struct literals, of which the
+production ones are in `single_evaluation.rs`; that pass rewrites expressions and
+is the strongest remaining candidate.
+
+**Next measurement**, and it is the same one that has worked every time: put
+`#[track_caller]` on a small helper wrapping `CExpr::Call { .. }` construction,
+or print the callee at each of `single_evaluation.rs`'s three struct literals,
+and see which one produces a `Var` callee. One build.
+
+What is established: three representations, the seam works when given the right
+one, aligning any two relocates the defect, and the third is a call through a
+variable named for the callee rather than an external. What is not: which line
+builds it.
