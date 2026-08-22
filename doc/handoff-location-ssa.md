@@ -1904,3 +1904,38 @@ Five mechanisms were reasoned out on this defect and all were wrong; three
 measurements found it: `#[track_caller]` gave the two constructors, the owner
 probe gave the reason the statement is bare, and one grep for the name shape gave
 the third pass.
+
+### Why the duplicate cannot be removed at the seam yet
+
+Two changes were built for the seam and both are inert, and together they say
+what actually blocks it.
+
+**Dropping a bare statement for a bound site.** `bind_each_call_site_once`
+records what it bound, so a bare `CStmt::Expr` for a bound site is a second
+evaluation. Retaining against that map changes nothing, because the statement's
+call is never recognised as the bound site:
+
+    fn source_of(&self, expr: &CExpr) -> Option<Source> {
+        for (candidate, source) in &self.entries {
+            if *candidate == expr { .. }
+
+The index matches call sites **by expression equality**. The statement form and
+the indexed form spell the callee differently, so one call is two expressions and
+no site lookup can connect them.
+
+**Making both spell the callee the same way** does not fix that either, and the
+direction is the opposite of what it looks like: the indexed call carries a
+`CExpr::Var` callee -- which is why `introduced_name_for` derives `work_result`
+from it -- while the bare statement renders `sym._work`, an `External`. So
+`resolved_callee_identity_expr_for_site` is not what produced the `External`
+spelling, and where it comes from is still unmeasured.
+
+**This is open item 1, not a separate defect.** Nothing owns what a value renders
+as, so one call has two expressions; a pass that identifies sites by expression
+equality then cannot see that they are one; and the duplicate survives every fix
+attempted at the seam. Fixing the representation fixes this without touching
+`single_evaluation` at all, and fixing `single_evaluation` first would only teach
+it to work around the representation.
+
+Both changes reverted. The bare-statement drop is worth keeping in mind for after
+item 1 lands: it is four lines and it will work then.
