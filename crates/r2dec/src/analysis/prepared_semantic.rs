@@ -499,6 +499,11 @@ fn populate_prepared_render_definitions(symbols: &std::cell::RefCell<crate::symb
                 continue;
             }
             let key = dst.display_name();
+            // A carrier and the values that read it are mutable state; the only
+            // definition available for one is the value it held on some path.
+            if env.carrier_aliases.contains_key(&key) {
+                continue;
+            }
             use_info
                 .definitions
                 .entry(key.clone())

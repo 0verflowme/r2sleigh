@@ -2039,6 +2039,40 @@ impl<'a> FoldingContext<'a> {
 
     /// Analyze function structure to detect return patterns.
     /// This finds the exit block and blocks that branch to it.
+    /// Let a carrier's narrow reads answer to the carrier's name.
+    ///
+    /// A 64-bit carrier read at 32 bits does not read the carrier: the register
+    /// alias repair inserts `tmp:regalias = SUBPIECE(carrier, 0)` and the read
+    /// goes through that. Those temporaries exist only in the function being
+    /// walked, and the alias map was built from the prepared artifact, so the
+    /// map is computed against one function and consumed against another.
+    fn extend_carrier_aliases_over(&mut self, blocks: &[SSABlock]) {
+        if self.carrier_aliases.is_empty() {
+            return;
+        }
+        let mut grew = true;
+        while grew {
+            grew = false;
+            for block in blocks {
+                for op in &block.ops {
+                    let (dst, src) = match op {
+                        SSAOp::Subpiece { dst, src, .. } | SSAOp::Copy { dst, src } => (dst, src),
+                        _ => continue,
+                    };
+                    let key = dst.display_name();
+                    if self.carrier_aliases.contains_key(&key) {
+                        continue;
+                    }
+                    let Some(name) = self.carrier_aliases.get(&src.display_name()).cloned() else {
+                        continue;
+                    };
+                    self.carrier_aliases.insert(key, name);
+                    grew = true;
+                }
+            }
+        }
+    }
+
     pub(crate) fn analyze_function_structure(&mut self, func: &SSAFunction) {
         self.state.return_blocks.clear();
         self.state.return_stack_slots.clear();
@@ -2708,9 +2742,12 @@ impl<'a> FoldingContext<'a> {
         blocks: &[SSABlock],
         control: crate::DecompileWorkControl<'_>,
     ) -> Result<(), crate::DecompileExecutionStop> {
+        control.poll()?;
+        if self.inputs.prepared_ssa.is_some() {
+            self.extend_carrier_aliases_over(blocks);
+        }
         let symbols = &self.symbols;
 
-        control.poll()?;
         if let Some(prepared) = self.inputs.prepared_ssa {
             self.state.analysis_ctx.semantic_mut().type_hints = self.inputs.type_hints.clone();
             let env = self.to_pass_env();
