@@ -1345,3 +1345,30 @@ twins; the fold reads the twins.
 
 Measure it the same way afterwards: the call counts should stay linear and the
 wall clock should follow them.
+
+### Correction: keying by `ValueId` as described would not help
+
+The recommendation in the previous entry was tested before being handed on, and
+it is wrong. Asking `is_dead` for its use count by identifier instead of by
+spelling measures 7.6s to 7.4s and 19.9s to 19.9s, which is noise, and reading
+`exact_value_id_for_var` says why:
+
+    if self.ambiguous_value_vars.contains(var) { ... }   hashes the whole SSAVar
+    let value_id = self.value_ids_by_var.get(var)         hashes it again
+    ...filter(|stored| *stored == var)                    and compares the string
+
+Obtaining the identifier costs two `SSAVar` hashes and a string comparison, so it
+is strictly more work than the one string lookup it replaces. The identifiers are
+only cheap to *use*; they are not cheap to *obtain* from a var.
+
+So the change worth making is not "key the tables by `ValueId`" but "carry the
+identifier on the value", so that no lookup is needed to find it. That is a
+change to `SSAVar` or to how the fold walks ops, not to the tables, and it is a
+different and larger piece of work than the previous entry claimed.
+
+Five local cost changes have now been measured and rejected: the alias sort, the
+uppercase test in `display_name`, the flag base string, the borrowed flag base,
+and this one. The call counts stay linear across all of them. Whatever makes each
+call slower has not been found, and the next attempt should measure a single
+predicate's cost directly -- time `is_dead` alone across the two sizes -- rather
+than infer it from a sample or from a structural argument.
