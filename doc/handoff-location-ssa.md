@@ -1541,3 +1541,40 @@ values arrive through `stack_argument_locations`, which
 The second is the more likely of the two on reading, and it is a one-line check
 to settle. The ledger is the measure to watch: 81 obligations with 50 refused
 today.
+
+### The eight arguments are the previous call's clobber
+
+Instrumenting `canonical_argument_values` settles which half supplies them:
+
+    args registers=8 stack=0 total=8
+
+So it is the register path, not `stack_argument_locations`, and the guess in the
+previous entry was the wrong one of the two.
+
+`call_argument_value_for_op` decides what an argument write is:
+
+    let index = canonical_abi_arg_index(&dst.name)?;
+    let source = match op { Copy | ZExt | SExt | Trunc | Cast | Subpiece => .., _ => None }
+        .or_else(|| graph.value_id_for_var(dst))?;
+
+Any operation whose destination is named like an argument register counts, and
+when the operation is not one of the transfer forms the fallback takes the
+destination's own value. `collect_call_argument_slots` walks the operations
+before a call and stops at the previous call -- but a call's lifted
+caller-saved clobber is emitted **after** that call, so walking back from the
+second call reaches the first call's clobber writes before it reaches the first
+call itself. Those writes are named `x1` through `x7`, so each becomes an
+argument, and each renders as the version-zero entry value it is:
+
+    sub_30(sub_24_result + w20, W1, W2, W3, W4, W5, W6, W7)
+
+**The rule that is missing is that a clobber is not an argument.** A register the
+callee is permitted to destroy is written by the call, not for the next one, and
+the walk cannot tell the difference because it looks only at the destination's
+name. Two ways to tell it: stop the walk at the clobber rather than at the call
+op, or require an argument's source to be a value the function defines rather
+than an entry value.
+
+`canonical_abi_arg_index` is also a hardcoded list of x86 and arm64 spellings and
+belongs with the other target-model work, but that is tidiness; the clobber rule
+is the defect.
