@@ -1416,3 +1416,32 @@ Also worth knowing: `emitted_var_names` runs once but asks `should_inline` of
 every operation, and the fold then asks the same question again while lowering.
 Whatever the fix to the predicate, the answer being computed twice is a second
 thing to look at.
+
+### What the cost work ended at
+
+Four cost defects were found and fixed, each by measurement rather than by
+reading:
+
+  * the exponential path count in `expression_dependency_path_count`
+  * the per-name block rescan in `raw_local_post_call_source_for_ssa_name_in_block`
+  * the per-question copy of every known name in `known_named_values`
+  * the per-question **scan** of every known name behind
+    `call_result_source_for_ssa_name`, which was 64 per cent of a large decompile
+
+The op ceiling moved with the measurements each time, 512 to 4096 to 8192 to
+16384, and never ahead of them. At the last size measured, 37000 ops renders
+30968 of its 30969 obligations in 17.3s, and 18614 ops renders 15368 of 15369 in
+about 6s, so the ceiling now refuses only what is genuinely slow rather than what
+was slow before the defects were removed.
+
+**On method, which cost more than the fixes.** Sampling profiles named `is_dead`
+three times; it is 21ms of a twenty second run. Five changes were built and
+reverted on that advice. What worked was cheaper and duller:
+
+  1. count the calls, to separate "more work" from "slower work"
+  2. time named phases, to find the phase
+  3. time the steps inside it, to find the line
+
+Each of those is one run. Reach for them before a sampler, which answers where
+the code is rather than where the time is, and is actively misleading for a
+predicate whose calls are rare on the stack and enormous individually.
