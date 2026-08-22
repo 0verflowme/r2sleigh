@@ -2564,3 +2564,40 @@ initialiser, and the trace to take is the one above filtered on `12180`.
 
 Twelve interventions inert, five traces each narrowing by a step, and the target
 is now one named SSA value rather than a layer. That is where this ends today.
+
+## sum32, traced to the end
+
+The last trace names the operand:
+
+    tmp:12180_2 = COPY tmp:regalias:80:4:0_1     expr = IntLit(0)
+
+`tmp:regalias:...` is the **register-alias repair pass's** synthesised temporary:
+the subpiece it inserts so a 64-bit register can be read at 32 bits. So the width
+layer is involved after all, and the withdrawal two entries above was wrong in an
+instructive way -- there are no narrow *canonical storage* values in this graph,
+but there is a repair temporary doing the narrowing, and no carrier rule reaches
+it.
+
+Extending carrier membership transitively through `Copy` and `Subpiece` from a
+carrier member was built to reach it, and is inert. The reason is structural and
+is the finding:
+
+> `carrier_name_aliases` is computed from `prepared.function()`, and the
+> `tmp:regalias` temporaries do not exist there. They are inserted by
+> `normalize_register_alias_sources` into the **normalised** function that the
+> fold walks. The alias map is built from one function and consumed against
+> another.
+
+That is the same defect this branch has now found five times in different
+clothes: two things that should be one, and nothing saying which is which. The
+symbol table had four copies, the `UseInfo` had two builders, a call had three
+expressions, and here a function has two versions and the facts are computed
+against the wrong one.
+
+**The fix is to compute the carrier aliases from the function the fold walks**,
+after normalisation has inserted its repair temporaries, rather than from the
+artifact. Then the closure above reaches `tmp:regalias:80:4:0_1`, the narrow read
+renders as the carrier, and `x8 = x8 + *arg0` follows.
+
+Thirteen interventions were measured on this defect and every one was inert; six
+traces each narrowed it by one step and the sixth reached the cause. Take traces.
