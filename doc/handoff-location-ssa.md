@@ -1103,3 +1103,43 @@ statement -- `is_dead`, `should_inline`, or the consumed-by-call set in
 `emitted_var_names` -- and not anything in the return path. `sym._fnv1a64`
 differs because its update *is* emitted, which is why fixing its return was
 enough there.
+
+### sum32, traced to one line, still unfixed
+
+The missing update is a consequence, not the cause. Instrumenting statement
+emission shows every accumulator op does produce a statement:
+
+    emit X8_1 stmt=true dead=false uses=Some(3)
+    emit X8_2 stmt=true dead=false uses=Some(1)
+    emit X8_3 stmt=true dead=false uses=Some(2)
+
+They disappear afterwards in `prune_unused_pure_locals`, which drops a local
+nothing reads -- and nothing reads `x8` precisely because the return already says
+`0`. So the return is the cause and the empty body is the effect, which is the
+opposite of what the previous entry concluded.
+
+The producer is one line. `last_ret_value` is set at exactly one site for this
+function, the `Copy` for `mov x0, x8`, and because the *source* is not a return
+register it takes `tracked_return_source_expr`, whose first act is `get_expr`:
+
+    src X8_4 direct=IntLit(0) semantic=false definition=None alias=Some("x8")
+
+That is the whole defect in one line. `X8_4` has **no** name-keyed semantic value
+and **no** name-keyed definition, and it does carry the carrier alias `x8`, and
+`get_expr` still answers `IntLit(0)`. So the zero arrives through a *value*-keyed
+path -- `definitions_by_value` or `semantic_values_by_value` -- which every guard
+tried so far, all name-keyed, cannot see.
+
+**Six attempts, all reverted**, and their value is in ruling paths out:
+`get_return_expr`, `merged_return_register_candidate_for_block`, `should_inline`,
+the top of `get_expr_with_depth` keyed on multiply-assignment, and the same
+keyed on the alias map. The last one is instructive: it fires, and it makes
+`sym._fnv1a64` worse by leaking `tregalias_f4_4_0` into the loop body, because
+returning the name for *every* aliased value is too strong -- the alias map holds
+stack and parameter aliases too.
+
+**Next probe, and it is one line of instrumentation:** print
+`definitions_by_value` and `semantic_values_by_value` for `X8_4`'s value id at
+the same site. One of the two holds the zero, and that is where the carrier guard
+belongs -- keyed by value, and restricted to carrier aliases rather than the
+whole alias map.
