@@ -178,7 +178,10 @@ impl<'a> LowerCtx<'a> {
         }
 
         let key = var.display_name();
-        if let Some(prov) = self.forwarded_value_for_var(var)
+        // A version-zero register is the value the function was entered with, so
+        // nothing forwarded it here and provenance cannot speak for it.
+        if var.version > 0
+            && let Some(prov) = self.forwarded_value_for_var(var)
             && depth < 8
             && visited.insert(format!("prov:{key}"))
         {

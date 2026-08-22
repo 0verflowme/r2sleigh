@@ -13957,7 +13957,9 @@ fn uint_type_from_size(size: u32) -> CType {
         2 => CType::UInt(16),
         4 => CType::UInt(32),
         8 => CType::UInt(64),
-        _ => CType::UInt(size.saturating_mul(8)),
+        // A width C cannot spell is held in the next one it can, which is what
+        // the value already is: the bits above it are zero.
+        _ => CType::UInt(size.next_power_of_two().max(1).saturating_mul(8)),
     }
 }
 

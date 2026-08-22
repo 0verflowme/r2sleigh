@@ -3780,6 +3780,17 @@ fn materialize_register_alias_sources(
             width: source.size,
         };
         let Some(root) = family_root_slice_for_range(state, requested) else {
+            if let Some(pieced) = piece_family_tiles(
+                state,
+                requested,
+                source,
+                block_addr,
+                op_index,
+                source_index,
+                &mut materialized,
+            ) {
+                replacements.insert(source.clone(), pieced);
+            }
             continue;
         };
         if let Some(direct) = direct_family_root_value(&root, source.size) {
@@ -3811,6 +3822,78 @@ fn materialize_register_alias_sources(
             .unwrap_or_else(|| source.clone())
     });
     (materialized, rewritten)
+}
+
+/// Build the wide value a read asks for out of the parts that define it.
+fn piece_family_tiles(
+    state: &FamilyRootState,
+    requested: RegisterFamilySlot,
+    source: &SSAVar,
+    block_addr: u64,
+    op_index: usize,
+    source_index: usize,
+    materialized: &mut Vec<SSAOp>,
+) -> Option<SSAVar> {
+    let tiles = family_root_tiles_for_range(state, requested)?;
+    let mut part = 0usize;
+    let mut name = |part: &mut usize| {
+        let named = SSAVar::new(
+            format!("tmp:regpiece:{block_addr:x}:{op_index:x}:{source_index:x}:{part:x}"),
+            1,
+            source.size,
+        );
+        *part += 1;
+        named
+    };
+
+    let mut parts: Vec<(SSAVar, u32)> = Vec::new();
+    for (root, width) in tiles {
+        // The part as its own value, extracted when the definition holds more.
+        let piece = if root.offset == 0 && root.value.size == width {
+            root.value
+        } else {
+            let extracted = SSAVar::new(
+                format!("tmp:regpiece:{block_addr:x}:{op_index:x}:{source_index:x}:s{part:x}"),
+                1,
+                width,
+            );
+            part += 1;
+            materialized.push(SSAOp::Subpiece {
+                dst: extracted.clone(),
+                src: root.value,
+                offset: root.offset,
+            });
+            extracted
+        };
+        parts.push((piece, width));
+    }
+
+    // Combined in adjacent pairs rather than one running total, so a value built
+    // from four lanes passes through 8 and 16 bytes rather than 12, and every
+    // width on the way is one C can spell.
+    while parts.len() > 1 {
+        let mut merged: Vec<(SSAVar, u32)> = Vec::with_capacity(parts.len().div_ceil(2));
+        let mut pairs = parts.into_iter();
+        while let Some((low, low_width)) = pairs.next() {
+            let Some((high, high_width)) = pairs.next() else {
+                merged.push((low, low_width));
+                break;
+            };
+            let mut dst = name(&mut part);
+            dst.size = low_width.checked_add(high_width)?;
+            let width = dst.size;
+            materialized.push(SSAOp::Piece {
+                dst: dst.clone(),
+                hi: high,
+                lo: low,
+            });
+            merged.push((dst, width));
+        }
+        parts = merged;
+    }
+
+    let (value, width) = parts.pop()?;
+    (width == source.size).then_some(value)
 }
 
 fn rewrite_decompile_family_subpiece(
@@ -3845,12 +3928,44 @@ fn rewrite_decompile_family_subpiece(
     })
 }
 
+/// The definitions that exactly tile a requested range, low offset first.
+///
+/// A wide read of a register whose lanes were written separately has no single
+/// containing definition, so `family_root_slice_for_range` refuses it. The parts
+/// are still there, and concatenating them is what the machine did, so this
+/// reports the tiling and the caller writes the `Piece` that says so.
+fn family_root_tiles_for_range(
+    state: &FamilyRootState,
+    requested: RegisterFamilySlot,
+) -> Option<Vec<(RegisterFamilyRoot, u32)>> {
+    let end = requested.offset.checked_add(u64::from(requested.width))?;
+    let mut tiles = Vec::new();
+    let mut cursor = requested.offset;
+    while cursor < end {
+        let remaining = u32::try_from(end - cursor).ok()?;
+        // The widest part starting here that stays inside the request, so a
+        // range covered at two granularities is spelled with the fewer pieces.
+        let (width, root) = state
+            .iter()
+            .filter(|(slot, _)| {
+                slot.family_id == requested.family_id
+                    && slot.offset == cursor
+                    && slot.width <= remaining
+            })
+            .max_by_key(|(slot, _)| slot.width)
+            .map(|(slot, root)| (slot.width, root.clone()))?;
+        tiles.push((root, width));
+        cursor = cursor.checked_add(u64::from(width))?;
+    }
+    (tiles.len() > 1).then_some(tiles)
+}
+
 fn family_root_slice_for_range(
     state: &FamilyRootState,
     requested: RegisterFamilySlot,
 ) -> Option<RegisterFamilyRoot> {
-    // A request must have one containing definition. Combining adjacent
-    // fragments here would invent a wide value without an explicit Piece.
+    // A request must have one containing definition. A range spread over several
+    // is answered by `family_root_tiles_for_range` and an explicit Piece.
     state
         .iter()
         .filter(|(slot, _)| family_slot_contains(**slot, requested))
@@ -8194,7 +8309,7 @@ mod tests {
     }
 
     #[test]
-    fn vector_alias_overlapping_write_invalidates_only_affected_ranges() {
+    fn vector_alias_overlapping_write_composes_a_read_from_its_parts() {
         let ops = normalize_manual_vector_alias_ops(vec![
             SSAOp::Copy {
                 dst: SSAVar::new("XMM0", 1, 16),
@@ -8230,17 +8345,44 @@ mod tests {
             op,
             SSAOp::Subpiece { src, offset: 12, .. } if src.name == "tmp:wide"
         )));
-        let unresolved_overlap = ops.iter().find_map(|op| match op {
-            SSAOp::Copy { dst, src } if dst.name == "tmp:affected_low_half" => Some(src),
-            _ => None,
-        });
-        assert_eq!(unresolved_overlap, Some(&SSAVar::new("XMM0_LO", 0, 8)));
-        let unresolved_whole = ops.iter().find_map(|op| match op {
-            SSAOp::Copy { dst, src } if dst.name == "tmp:unresolved_whole" => Some(src),
-            _ => None,
-        });
-        assert_eq!(unresolved_whole, Some(&SSAVar::new("XMM0", 0, 16)));
-        assert!(!ops.iter().any(|op| matches!(op, SSAOp::Piece { .. })));
+        let piece_of = |name: &str| {
+            ops.iter().find_map(|op| match op {
+                SSAOp::Piece { dst, hi, lo } if dst.name == name => Some((hi.clone(), lo.clone())),
+                _ => None,
+            })
+        };
+        let source_of = |name: &str| {
+            ops.iter().find_map(|op| match op {
+                SSAOp::Copy { dst, src } if dst.name == name => Some(src.clone()),
+                _ => None,
+            })
+        };
+        let subpiece_of = |name: &str| {
+            ops.iter().find_map(|op| match op {
+                SSAOp::Subpiece { dst, src, offset } if dst.name == name => {
+                    Some((src.clone(), *offset))
+                }
+                _ => None,
+            })
+        };
+
+        // The low half spans the old wide value and the new middle write, so it
+        // is what the machine holds there: the two parts, concatenated.
+        let low_half = source_of("tmp:affected_low_half").expect("low half source");
+        let (hi, lo) = piece_of(&low_half.name).expect("low half is pieced");
+        assert_eq!(subpiece_of(&hi.name), Some((SSAVar::new("tmp:new_mid", 1, 8), 0)));
+        assert_eq!(subpiece_of(&lo.name), Some((SSAVar::new("tmp:wide", 1, 16), 0)));
+
+        // The whole register is the same story across three parts.
+        let whole = source_of("tmp:unresolved_whole").expect("whole source");
+        let (whole_hi, whole_lo) = piece_of(&whole.name).expect("whole is pieced");
+        assert_eq!(
+            subpiece_of(&whole_hi.name),
+            Some((SSAVar::new("tmp:wide", 1, 16), 12))
+        );
+        let (mid, low) = piece_of(&whole_lo.name).expect("whole low is pieced");
+        assert_eq!(mid, SSAVar::new("tmp:new_mid", 1, 8));
+        assert_eq!(subpiece_of(&low.name), Some((SSAVar::new("tmp:wide", 1, 16), 0)));
     }
 
     #[test]

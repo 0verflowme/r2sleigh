@@ -1715,7 +1715,7 @@ fn predicate_expr_for_operand_with_depth(
         if let Some(expr) = compare_def_expr_for_flag_operand(symbols, view, inputs, var, depth + 1) {
             return Some(expr);
         }
-        return Some(crate::symbol::var_ref(symbols, var.display_name()));
+        return Some(crate::symbol::var_ref(symbols, crate::naming::spell_var(var, view)));
     }
     let expr = expr_for_compare_operand(symbols, inputs, var.clone(), view);
     (!matches!(expr, CExpr::Var(ref name) if &*crate::symbol::spelling(symbols, *name) == &var.display_name())).then_some(expr)
@@ -1953,7 +1953,7 @@ fn authoritative_expr_for_prepared_value(symbols: &std::cell::RefCell<crate::sym
     authoritative_scalar_expr_for_value(symbols, block, view, var, 0)
         .or_else(|| scalar_owner_expr_for_value(symbols, view, var, var.size))
         .or_else(|| view.owner_expr_for_var(var).cloned())
-        .or_else(|| Some(crate::symbol::var_ref(symbols, var.display_name())))
+        .or_else(|| Some(crate::symbol::var_ref(symbols, crate::naming::spell_var(var, view))))
 }
 
 fn prepared_call_max_arity(
@@ -2096,7 +2096,7 @@ fn certified_call_result_owner_expr(symbols: &std::cell::RefCell<crate::symbol::
         }
         Some(ValueOwner::Value(value)) if *value != cert.value => {
             let var = prepared.value_var(*value)?;
-            (!var.is_register()).then(|| crate::symbol::var_ref(symbols, var.display_name()))
+            (!var.is_register()).then(|| crate::symbol::var_ref(symbols, crate::naming::spell_var(var, view)))
         }
         Some(ValueOwner::StackSlot { .. }) | Some(ValueOwner::Value(_)) | None => None,
     }
@@ -2310,7 +2310,7 @@ fn expr_for_compare_operand_with_width(symbols: &std::cell::RefCell<crate::symbo
         return expr;
     }
 
-    crate::symbol::var_ref(symbols, var.display_name())
+    crate::symbol::var_ref(symbols, crate::naming::spell_var(&var, view))
 }
 
 fn compare_style_operand_expr(var: &SSAVar, compare_width: u32) -> Option<CExpr> {

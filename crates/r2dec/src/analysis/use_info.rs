@@ -2055,11 +2055,9 @@ fn collect_definitions(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
                         forwarded_values: &scratch.info.forwarded_values,
                         type_oracle: env.type_oracle,
                     };
-                    if let Some(prov) = scratch.info.forwarded_values.get(&key) {
-                        lower.expr_for_ssa_name(&prov.source)
-                    } else {
-                        lower.op_to_expr(op)
-                    }
+                    // Forwarding is one step of the resolver's precedence, not a
+                    // rule that precedes it, so the resolver applies it.
+                    lower.op_to_expr(op)
                 };
                 scratch.info.insert_definition_for_var(dst, expr);
             }
@@ -2132,11 +2130,9 @@ fn rebuild_definitions(
                     forwarded_values: &scratch.info.forwarded_values,
                     type_oracle: env.type_oracle,
                 };
-                if let Some(prov) = scratch.info.forwarded_values.get(&key) {
-                    lower.expr_for_ssa_name(&prov.source)
-                } else {
-                    lower.op_to_expr(op)
-                }
+                // Forwarding is one step of the resolver's precedence, not a
+                // rule that precedes it, so the resolver applies it.
+                lower.op_to_expr(op)
             };
             rebuilt.insert(key, expr);
         }
