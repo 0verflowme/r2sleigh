@@ -2330,3 +2330,44 @@ have completely different fixes.
 Seven attempts on this defect in one session, and the last three were hypotheses
 where the rule -- measure, do not guess -- called for a probe. The probe above is
 four lines.
+
+### sum32: the candidate is right and the answer is still wrong
+
+The probe that had never been taken settles the first half. At the moment the
+return statement is built, with `tracked_return_source_expr` returning the
+carrier:
+
+    siteB src=X8_4 is_ret_reg=false expr=Var(carrier)
+    cand  expr=IntLit(0) last_ret_value=Some(Var(carrier))
+
+**`last_ret_value` is the carrier and the return expression is the constant.** So
+the constant does not arrive as the candidate after all -- the earlier reading of
+this probe, before the guard was in place, was of a run where the candidate was
+itself already `0`. With the candidate correct, something between it and `expr`
+still produces the constant.
+
+Three resolution points were then guarded so that a carrier reference passes
+through unchanged: `tracked_return_source_expr`, `resolve_return_target_expr` and
+`resolve_return_candidate_in_context`. All three together leave `sum32`
+unchanged. Reverted.
+
+**The unexamined step is the branch that chooses `expr`:**
+
+    let expr = if self.is_control_return_target(target) {
+        let control_return_value = last_ret_value.clone().or_else(..);
+        if let Some(last) = control_return_value { self.resolve_return_target_expr(last, None) }
+        else { self.resolve_return_target_expr(target_expr, None) }
+    } else {
+        self.resolve_return_target_expr(target_expr, last_ret_value.clone())
+    };
+
+Print which arm is taken for `sum32` and what each hands to
+`resolve_return_target_expr`. If it is the `else` arm then `target_expr` is the
+branch target and the carrier arrives only as `last_ret_value`, which
+`preferred_return_candidate` then weighs against a resolution of the target --
+and *that* comparison is the fourth place, and the only one not yet looked at.
+One `eprintln!` in each arm answers it.
+
+Ten guards and rewrites have now been tried on this defect across the session and
+every one measured inert. Every measurement, by contrast, has narrowed it. The
+next person should take the print above before writing any code at all.
