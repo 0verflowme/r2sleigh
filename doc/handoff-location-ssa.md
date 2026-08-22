@@ -45,13 +45,23 @@ disagrees with this section is superseded.
 
 ### Open, each scoped by measurement
 
-  1. **Nothing owns "what does this value render as".** Nine resolvers, about 260
-     call sites, each with its own precedence; closing one hands the question to
-     the next. This blocks `sum32`, which still returns the value its accumulator
-     started with. The contract to state is that *a rendered expression is an
-     answer, not a candidate*.
-  2. **Thirty-eight places build a call expression**, which is why one call
-     renders twice under two spellings. The certified path should own it.
+  1. **The same value is constructed more than once, by different layers, and
+     nothing says which construction is the value.** Measured twice over:
+
+       * a call site has **three** expressions -- `fold/op_lower/lowering.rs:94`
+         for the statement, `fold/op_lower/mod.rs:2962` for the expression, and
+         `use_info().call_result_exprs` in the analysis layer -- and
+         `single_evaluation` matches sites by expression equality against the
+         third, so it binds one and leaves the others. That is the duplicate
+         call, and every fix attempted at that seam failed for this reason.
+       * a value has nine resolvers that will each answer for it with their own
+         precedence, so closing one hands the question to the next. That is
+         `sum32`, which still returns what its accumulator held before the loop.
+
+     The contract to state is that **a rendered expression is an answer, not a
+     candidate**, and the work is to make one construction own each value. Item 2
+     below was previously listed separately and is the same defect.
+  2. *(folded into 1)* One call renders twice under two spellings.
   3. **The width layer.** A carrier written narrower than its phi -- `w8` into an
      `x8` carrier, `EAX` into `RAX` -- is not reconciled, which is what blocks
      the x86 accumulator loops and step 4's repair-pass work.
@@ -63,9 +73,12 @@ disagrees with this section is superseded.
      rendering, so `RefusalReason::BudgetExhausted` is never constructed.
      `render_engine_decompile_request` must return a rendering *and* a stop.
 
-Items 1, 2 and 3 are the same defect at three levels: several implementations of
-one job, disagreeing. So were the symbol table and the `UseInfo` builders, and
-both were fixed by making one of them own the answer. Look for that shape first.
+**This is the shape of nearly everything left.** Five instances have been found:
+symbol tables and `UseInfo` builders, both fixed by making one own the answer;
+and expression resolvers, callee construction and call expressions, all three
+scoped above. Each surfaced as a rendering bug that looked unrelated until it was
+counted. Look for that shape first, and count before theorising -- five mechanisms
+were reasoned out on the call duplicate alone and all five were wrong.
 
 ### How to measure here, which cost more than any single fix
 
