@@ -1841,3 +1841,27 @@ is item 1 on the open list wearing a different hat.
 of "mark, do not read": it needs no list, no distinguishing markers and no edits
 to the sites, and it answered in one build what three builds of hand-placed
 markers had not.
+
+### The two callee resolvers disagreeing is not why the statement is bare
+
+`lower_certified_statement_call` emits a bare statement only when
+`materializable_call_result_expr_for_call_expr` finds no owner for the call, and
+it is handed a call whose callee came from `resolve_call_target_for_site` while
+the expression form used `resolved_callee_identity_expr_for_site`. Making both
+use the certified identity changes nothing: the rendering and the ledger are
+identical, still 47 of 144 with 85 refused.
+
+So the owner lookup fails for some other reason, and the two spellings are a
+symptom of the split rather than its cause.
+
+**Eliminated on this defect so far:** `analysis/lower.rs:448`,
+`analysis/use_info.rs:5357` and `:5631`, both sites in `fold/op_lower/calls.rs`,
+and the callee-resolver mismatch. **Established:** exactly two sites build this
+call, `lowering.rs:94` for the statement and `mod.rs:2962` for the expression,
+and both are certified.
+
+**The next measurement is `materializable_call_result_expr_for_call_expr`
+itself** -- why it answers `None` for a call whose result is plainly consumed two
+lines later. Time it or print its inputs; do not reason about it. Five mechanisms
+have been reasoned out and all five were wrong, while every measurement has
+answered in one build.
