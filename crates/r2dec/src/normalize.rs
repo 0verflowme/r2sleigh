@@ -1030,6 +1030,8 @@ pub(crate) fn carrier_name_aliases(
             .chain(updates.iter().flat_map(|update| {
                 std::iter::once(update.value).chain(update.identity_values.iter().copied())
             }));
+        let entry_values: HashSet<_> = entries.iter().map(|edge| edge.value).collect();
+        let update_values: HashSet<_> = updates.iter().map(|update| update.value).collect();
         for member in members {
             let Some(var) = graph.value(member).map(|value| &value.var) else {
                 continue;
@@ -1039,6 +1041,60 @@ pub(crate) fn carrier_name_aliases(
             }
             aliases.insert(var.display_name(), name.clone());
         }
+        for merge in exit_merges_for_carrier(prepared, *phi, &entry_values, &update_values) {
+            aliases.insert(merge, name.clone());
+        }
     }
     aliases
+}
+
+/// Merges that join a carrier's entry value with its update value.
+///
+/// A loop with a bypass has a second merge after it, joining "the loop never
+/// ran", which carries the entry value, with "the loop ran", which carries the
+/// update. That merge is the carrier: materialising places the carrier's
+/// initialiser where it dominates both edges, so the variable already holds the
+/// right value whichever way control arrived.
+///
+/// The carrier is a third name rather than either source, so this cannot be
+/// found by looking at the merge's sources; the certified entries and updates
+/// are what identify it.
+fn exit_merges_for_carrier(
+    prepared: &r2ssa::SsaArtifact,
+    phi: r2ssa::ValueId,
+    entry_values: &HashSet<r2ssa::ValueId>,
+    update_values: &HashSet<r2ssa::ValueId>,
+) -> Vec<String> {
+    let graph = prepared.graph();
+    let Some(carrier) = graph.value(phi).map(|value| value.var.clone()) else {
+        return Vec::new();
+    };
+    let mut merges = Vec::new();
+    for block in prepared.function().blocks() {
+        for merge in &block.phis {
+            if merge.dst == carrier || merge.dst.size != carrier.size {
+                continue;
+            }
+            let Some(values) = merge
+                .sources
+                .iter()
+                .map(|(_, src)| graph.value_id_for_var(src))
+                .collect::<Option<Vec<_>>>()
+            else {
+                continue;
+            };
+            // Every edge must carry a value this carrier holds, and both sides
+            // must be present: a merge of two entry values is a different merge
+            // that happens to be over the same storage.
+            if values
+                .iter()
+                .all(|value| entry_values.contains(value) || update_values.contains(value))
+                && values.iter().any(|value| entry_values.contains(value))
+                && values.iter().any(|value| update_values.contains(value))
+            {
+                merges.push(merge.dst.display_name());
+            }
+        }
+    }
+    merges
 }

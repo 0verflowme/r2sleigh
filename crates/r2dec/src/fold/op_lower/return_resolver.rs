@@ -490,6 +490,15 @@ impl<'a> FoldingContext<'a> {
             }
 
             let phi_name = phi.dst.display_name();
+            // A merge that carries a loop carrier is mutable state, so the
+            // answer is the variable. Every expression reachable from its
+            // sources is a value the carrier held on one path, and the one a
+            // resolver reaches first is the value it held entering the loop.
+            if self.var_aliases_map().contains_key(&phi_name) {
+                let carrier = self.name_ref(&self.var_name(&phi.dst));
+                best = self.preferred_return_candidate(best, Some(carrier));
+                continue;
+            }
             let mut visited = HashSet::new();
             let candidate = self
                 .resolve_expr_from_phi_sources(&phi_name, 0, &mut visited, false)
