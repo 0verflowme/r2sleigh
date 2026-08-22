@@ -1984,3 +1984,25 @@ resolvers disagree about precedence" but: the same call is constructed three
 times, by three layers, and nothing says which one is the call. Every attempt at
 the seam fails for that reason, and no amount of work inside `single_evaluation`
 can succeed while it is given a different expression than the body contains.
+
+### Aligning two of the three representations makes it worse, which confirms the count
+
+Giving `single_evaluation` the expression the fold actually emitted, instead of
+the analysis layer's, was built. It works, in the narrow sense: the pass binds
+the fold's form and the bare statement disappears.
+
+    uint64_t call_result = sym._work(arg0 + 1, arg1 << 1, (uint32_t)arg1 ^ (uint32_t)arg0);
+    sym._other(call_result + (uint32_t)arg0);
+    uint64_t t12280_3 = sym__work(..) + arg1 + sym__other(sym__work(..) + arg0);
+    return sym__work(..) + arg1 + sym__other(sym__work(..) + arg0);
+
+And the third representation is then unbound, so `sym__work` goes from appearing
+once to appearing four times. The ledger does not move -- 47 of 144, 85 refused --
+and the output is plainly worse, so the change is reverted.
+
+**That is the confirmation the count needed.** Two representations can be
+aligned and the defect simply moves to the third. There is no pairwise fix; the
+three constructions have to become one, and that is the work item, not a seam
+adjustment. It also shows the seam is capable of doing its job the moment it is
+handed the right expression, which is worth knowing: `single_evaluation` is not
+itself defective.
