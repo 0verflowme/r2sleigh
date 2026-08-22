@@ -2622,3 +2622,29 @@ why `return x8` renders at all), the operand `tmp:12180_2`, the repair temporary
 behind it, and the observation that the alias map is computed against a different
 function than the fold walks. The cause is understood; what is not is why the
 obvious repair does not take, and that gap is exactly one print wide.
+
+### sum32's last operand, and the table that still answers
+
+With the carrier's narrow reads named and their definitions suppressed, the add
+still records
+
+    tmp:12280_2 = tmp:24e00_2 + tmp:12180_2
+        expr = Binary { op: Add, left: Var(..), right: IntLit(0) }
+
+`tmp:12180_2` is a carrier alias by then and has no render definition, and
+`to_pass_env` does pass the extended map, so the suppression is reached. It still
+lowers to `0`.
+
+`LowerCtx::get_expr_with_depth` tries, in order: constant, address literal,
+**forwarded value**, semantic value, definition, and finally the name. Definitions
+and semantic values are suppressed for carrier members, so the remaining route is
+`forwarded_values`, and that is the table to check next -- the same
+all-parts-together lesson this defect has now taught twice, and the four-point
+return chain taught before it.
+
+**The pattern is worth stating once more because it has held every time here.**
+A value has several tables that can answer for it, and suppressing a subset
+leaves the rest answering, which is indistinguishable from the fix being wrong.
+The return needed four points guarded; the carrier's narrow read needed the alias
+map extended *and* the definition suppressed; this needs those *and* whatever
+`forwarded_values` holds. Count the tables before changing any of them.
