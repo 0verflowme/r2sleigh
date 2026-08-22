@@ -2481,3 +2481,34 @@ answer applies: **trace the whole path before guarding any of it.**
 
 The three symptoms said to converge on the width layer are therefore two: the x86
 accumulator loops and the SIMD whole-register reads. `sum32` is not one of them.
+
+### The carrier's entry edge becomes a definition, and that is the defect
+
+Tracing what `populate_prepared_render_definitions` records for the carrier:
+
+    X8_1 = COPY const:0_0     -> IntLit(0)
+    X8_2 = COPY X8_1          -> IntLit(0)
+    X8_3 = ZEXT(tmp:12280_2)  -> Cast { .. }
+
+`X8_2` is the copy that **materialising the carrier inserted on the edge into the
+loop**. It is recorded as a definition whose expression is the initialiser, so
+every read of the carrier that consults the definitions resolves to `0`. The
+update is `ZEXT` of a temporary holding the 32-bit add, and that add's carrier
+operand resolves the same way, which is how `x8 = x8 + *arg0` renders as
+`x8 = *arg0`.
+
+**This is the `multiply_assigned` idea from much earlier in this document, and it
+now has the evidence it lacked.** A materialised carrier is assigned on the entry
+edge and again on the back edge; the first assignment is recorded as its
+definition and the second is not, so the definition says the carrier always holds
+its initial value. Suppressing the definition was tried before this trace existed
+and measured inert, because it was applied where the recorder is not -- the
+recorder is `populate_prepared_render_definitions` in `prepared_semantic.rs`, the
+builder that ships, and the earlier attempt guarded `rebuild_definitions` in
+`use_info.rs`, the builder that does not.
+
+**Next, and it is small:** record no render definition for a name that
+materialisation assigns on more than one edge. The set is exactly
+`carrier_aliases`, which the fold already has and the analysis can be given, and
+the trace above is the check -- `X8_2` should have no definition, and then the
+add keeps its operand.
