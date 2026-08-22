@@ -8,6 +8,82 @@ the primary checkout stays on its own branch so a bad day here costs nothing.
 Read `doc/adr-location-ssa.md` first for the original design. This document
 records what changed once the design met the code.
 
+## Where this stands now
+
+This document is chronological and contains claims that later entries withdraw.
+Read this section for the current state; read the rest for the evidence, and note
+that several entries are corrections of the ones above them. Anything below that
+disagrees with this section is superseded.
+
+### Done
+
+  * **One symbol table per rendered function.** Passes each held their own and
+    the fold read a fourth that `mem::take` had emptied; identifiers now carry
+    the table that issued them and resolving across tables is an assertion.
+  * **Expressions name identifiers, not strings.** `CExpr::Var(SymbolId)`.
+  * **One `UseInfo` builder.** There were two complete analyses separated by an
+    early return, and production only ever ran one. The other, its two analysis
+    modules and the 76 fixtures that drove it are deleted -- about 11,800 lines.
+  * **A guard that a facts type never answers a rendering decision**, as a lint,
+    verified by planting a violation.
+  * **Flag demotion.** A flag is a one-byte register no wider register contains,
+    computed from the register file rather than listed. The list it replaced was
+    wrong in both directions on both targets.
+  * **Target model extraction, partly.** Signature inference chose its ABI from
+    the pointer width, so arm64 looked for parameters in `rdi`. It now asks the
+    convention the lifter supplies.
+  * **Four cost defects**, each measured: an exponential path count, a per-name
+    block rescan, a per-question copy of every known name, and a per-question
+    scan of every known name that was 64 per cent of a large decompile. A
+    function that refused to decompile now renders 1328 of its 1329 obligations,
+    and 9314 ops went from 48s to about 5s. The op ceiling moved with the
+    measurements, 512 to 16384, never ahead of them.
+  * **A loop carrier reaches its return.** `sym._fnv1a64` renders `return x0`
+    rather than the value the accumulator held before the loop.
+  * **A call's own definitions are not the next call's arguments.** A
+    one-argument call rendered with eight.
+
+### Open, each scoped by measurement
+
+  1. **Nothing owns "what does this value render as".** Nine resolvers, about 260
+     call sites, each with its own precedence; closing one hands the question to
+     the next. This blocks `sum32`, which still returns the value its accumulator
+     started with. The contract to state is that *a rendered expression is an
+     answer, not a candidate*.
+  2. **Thirty-eight places build a call expression**, which is why one call
+     renders twice under two spellings. The certified path should own it.
+  3. **The width layer.** A carrier written narrower than its phi -- `w8` into an
+     `x8` carrier, `EAX` into `RAX` -- is not reconciled, which is what blocks
+     the x86 accumulator loops and step 4's repair-pass work.
+  4. **The 64-bit constant model.** A folded 16-byte constant has nowhere to
+     live, which caps whole-register vector reads. The chosen shape is a wide
+     literal in the AST; it is downstream of the tile composer, which is
+     downstream of emission.
+  5. **Budget as ledger.** A phase that runs out of budget discards its partial
+     rendering, so `RefusalReason::BudgetExhausted` is never constructed.
+     `render_engine_decompile_request` must return a rendering *and* a stop.
+
+Items 1, 2 and 3 are the same defect at three levels: several implementations of
+one job, disagreeing. So were the symbol table and the `UseInfo` builders, and
+both were fixed by making one of them own the answer. Look for that shape first.
+
+### How to measure here, which cost more than any single fix
+
+  * **Sampling profiles mislead.** They name the functions most often on the
+    stack, which are the small predicates called from everywhere. `is_dead` came
+    top three times and is 21ms of a twenty second run. Count calls to separate
+    "more work" from "slower work", then time named phases, then time the steps
+    inside the phase. One run each.
+  * **Mark, do not read.** Four candidate code paths were eliminated in three
+    builds by giving each a distinguishing marker and seeing which reached the
+    page. Four mechanisms reasoned from the rendering were all wrong.
+  * **Mark from a complete list.** Three of those builds were wasted because a
+    truncated grep made a file look empty.
+  * **Use a linked binary, never an object file.** `radare2` splits a Mach-O
+    object at an unresolved `bl`, and two false diagnoses came from decompiling
+    half a function.
+  * **Check the function boundary before believing a short rendering.**
+
 ## What was actually broken
 
 Four rendering defects turned out to share a single cause. SSA is built over
@@ -169,7 +245,7 @@ Every one was a real defect that the branding exposed, not churn:
   asking whether two tables have the same identity rather than whether the
   analysis is deterministic. One function has one table.
 
-## What is left
+## What is left (superseded -- see "Where this stands now")
 
 **Step 2 is not finished.** 83 failing tests, and the cross-table question above
 is unanswered.
