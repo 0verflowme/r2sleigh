@@ -46,7 +46,15 @@ disagrees with this section is superseded.
 ### Open, each scoped by measurement
 
   1. **The same value is constructed more than once, by different layers, and
-     nothing says which construction is the value.** Measured twice over:
+     nothing says which construction is the value.** The **call** instance of
+     this is now **fixed**: `CExpr::Call` carries the site that makes it,
+     `single_evaluation` asks which site an expression is rather than comparing
+     shapes, and a bare statement for a site it has bound is dropped. A
+     three-call function renders each call once, correctly, where it previously
+     rendered each twice under two spellings.
+
+     The **resolver** instance below is still open, and the worked example above
+     does not transfer directly -- see the note after this list. Measured:
 
        * a call site has **three** expressions -- `fold/op_lower/lowering.rs:94`
          for the statement, `fold/op_lower/mod.rs:2962` for the expression, and
@@ -72,6 +80,21 @@ disagrees with this section is superseded.
   5. **Budget as ledger.** A phase that runs out of budget discards its partial
      rendering, so `RefusalReason::BudgetExhausted` is never constructed.
      `render_engine_decompile_request` must return a rendering *and* a stop.
+
+**Does the call fix transfer to the resolvers?** Only partly, and the difference
+is worth stating. The call defect was a *recognition* failure: two expressions
+were the same call and nothing could tell, so giving a call an identity made the
+sameness visible and a four-line fix followed. The resolver defect is a
+*precedence* failure: nine resolvers can each answer for one value and they
+disagree about which answer is better, and every one of them is looking at the
+same value already. An identity does not settle a disagreement.
+
+What does transfer is the method: do not guard each site. Four carrier guards
+were built at four resolvers and each moved the answer to the next one, exactly
+as the six call-seam fixes did. The equivalent move for the resolvers is to make
+the wrong answer unrepresentable -- a value that is mutable state should not have
+a resolvable expression at all, rather than having one that every resolver is
+asked to decline.
 
 **This is the shape of nearly everything left.** Five instances have been found:
 symbol tables and `UseInfo` builders, both fixed by making one own the answer;
