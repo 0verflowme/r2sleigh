@@ -2186,3 +2186,35 @@ table and the `UseInfo` collapse both did for their own defects.
 
 This is the design decision that gates open item 1, and it is now stated in terms
 of what has been measured rather than what was assumed.
+
+### The cost of giving a call an identity
+
+The requirement above -- a rendered value needs an identity that is not its shape
+-- has an obvious implementation: a `CExpr::CallSite { block_addr, op_idx }` that
+the analysis layer stores in its tables and the fold resolves when it renders.
+The tables then hold the site, the fold holds the expression, and there is
+nothing to reconcile because there is only one expression.
+
+Adding that variant and building tells the type-level cost exactly:
+
+    28 non-exhaustive match errors
+
+That is small, and it is not the cost. Every pass that asks a question *about* a
+call -- what its callee is, how many arguments it has, whether an expression is a
+call at all -- would have to resolve a site before it could answer, and those
+sites are not enumerated by the compiler because they match on `CExpr::Call`
+and would simply stop matching. `is_certified_rendered_call_expr`,
+`call_arg_expr_is_low_signal`, `expr_is_scalar_memory_candidate` and the flag and
+call-argument predicates are all of that kind.
+
+So the honest scope is: 28 arms the compiler names, plus an unenumerated set of
+predicates that would silently stop seeing calls. **The second half is what makes
+this a redesign rather than a refactor**, and it is why it should be started
+deliberately rather than at the end of a long session. The variant was added,
+measured and reverted; the tree is unchanged.
+
+A cheaper variant worth considering first: leave `CExpr::Call` as it is and give
+it a site field, so every existing predicate keeps working and only the
+constructors and the reconciliation change. That trades the guarantee -- two
+expressions for one site become representable again -- for a much smaller blast
+radius, and it may be the right first step even though it is not the end state.
