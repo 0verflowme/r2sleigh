@@ -2457,3 +2457,27 @@ does not know they are one.**
 
 Every approach that treats the carrier as the unit fails here. The unit has to be
 the storage.
+
+### Withdrawn: sum32's remainder is not the width layer
+
+The previous entry attributed `x8 = (int64_t)*arg0` to a `W8` value that the
+carrier machinery could not reach. That is wrong, and the measurement is
+unambiguous. Scanning the graph for values whose canonical storage falls strictly
+inside the carrier's finds none:
+
+    narrow carrier=CanonicalStorageId { space: Register, offset: 16448, size: 8 } found=[]
+
+There are no narrow halves. The SSA has already widened them, so `add w8, w9, w8`
+is entirely `X8` operations by the time anything renders, and there is no
+two-values-one-storage problem in this function at all.
+
+So the remaining defect is the carrier resolution after all: the add's operand is
+`X8_1`, a carrier member, and it resolves to `IntLit(0)`, its initialiser, so
+`w9 + 0` folds to `w9`. Reading a carrier by name in `LowerCtx` was built for
+exactly that and measured inert, which means the operand is resolved somewhere
+that is neither `LowerCtx::get_expr` nor `FoldingContext::get_expr` -- the same
+shape of question the return path took eleven attempts to answer, and the same
+answer applies: **trace the whole path before guarding any of it.**
+
+The three symptoms said to converge on the width layer are therefore two: the x86
+accumulator loops and the SIMD whole-register reads. `sum32` is not one of them.
