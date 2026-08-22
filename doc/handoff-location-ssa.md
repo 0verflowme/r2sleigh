@@ -1143,3 +1143,35 @@ stack and parameter aliases too.
 the same site. One of the two holds the zero, and that is where the carrier guard
 belongs -- keyed by value, and restricted to carrier aliases rather than the
 whole alias map.
+
+### Correction: there are two `get_expr`, and the fold calls the other one
+
+Several attempts above guarded `LowerCtx::get_expr` in `analysis/lower.rs:185`.
+The fold does not call it. `FoldingContext::get_expr` is a different function of
+about 130 lines at `fold/op_lower/mod.rs:3206`, with roughly a dozen return
+paths of its own. Any reasoning about "where `get_expr` answers" in the entries
+above refers to the wrong function.
+
+What the probes establish about `sum32`, all confirmed:
+
+  * `X8_4` is the **exit merge**, the same shape as `X0_5` in `sym._fnv1a64`.
+  * It is in `carrier_aliases`, so the carrier machinery does reach it.
+  * It is not a constant, has no name-keyed or value-keyed definition, no
+    name-keyed or value-keyed semantic value, and no forwarded value:
+
+        val X8_4 const=false bits=None direct=IntLit(0)
+            def_by_value=None sem_by_value=false forwarded=false
+
+  * Guarding phi-source resolution on `carrier_aliases` -- the narrow map, not
+    the general one -- leaves `sym._fnv1a64` correct and does not change
+    `sum32`, so that is not its path either.
+
+So the `IntLit(0)` is produced by one of the other return paths in
+`FoldingContext::get_expr`, and every map it could plausibly read has been shown
+empty for this value. **The next step is to bisect that one function**: print a
+marker at each of its return points and run `sum32`. That names the branch in a
+single run, which is what should have been done before any of the seven attempts.
+
+`prune_unused_pure_locals` then removes the accumulator's statements because the
+constant return leaves nothing reading `x8`, so the empty loop body follows from
+this and is not a separate defect.
