@@ -528,22 +528,6 @@ fn call_arg_references_any(arg: &CallArgBinding, ids: &BTreeSet<ValueId>) -> boo
 }
 
 impl UseInfo {
-    #[cfg(test)]
-    pub(crate) fn analyze_for_local_struct_accesses(
-        blocks: &[SSABlock],
-        env: &PassEnv<'_>,
-    ) -> Self {
-        use_info::analyze_for_local_struct_accesses(env.symbols, blocks, env)
-    }
-
-    pub(crate) fn analyze_for_local_struct_accesses_with_control(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
-        blocks: &[SSABlock],
-        env: &PassEnv<'_>,
-        control: crate::DecompileWorkControl<'_>,
-    ) -> Result<Self, crate::DecompileExecutionStop> {
-        use_info::analyze_for_local_struct_accesses_with_control(symbols, blocks, env, control)
-    }
-
     #[allow(dead_code)]
     pub(crate) fn analyze_with_definition_overrides(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
         blocks: &[SSABlock],

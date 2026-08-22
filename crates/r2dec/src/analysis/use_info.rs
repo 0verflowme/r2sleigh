@@ -72,25 +72,6 @@ pub(crate) fn analyze_with_control(symbols: &std::cell::RefCell<crate::symbol::S
     analyze_with_definition_overrides_with_control(symbols, blocks, env, &HashMap::new(), control)
 }
 
-#[cfg(test)]
-pub(crate) fn analyze_for_local_struct_accesses(
-    symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,blocks: &[SSABlock], env: &PassEnv<'_>) -> UseInfo {
-    let execution = SsaExecutionControl::default();
-    let control = DecompileWorkControl::new(&execution, DecompileWorkPhase::Structuring);
-    analyze_for_local_struct_accesses_with_control(&symbols, blocks, env, control)
-        .expect("default decompiler work control cannot stop")
-}
-
-pub(crate) fn analyze_for_local_struct_accesses_with_control(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
-    blocks: &[SSABlock],
-    env: &PassEnv<'_>,
-    control: DecompileWorkControl<'_>,
-) -> Result<UseInfo, DecompileExecutionStop> {
-    let scratch =
-        analyze_value_facts(symbols, blocks, env, &HashMap::new(), control)?;
-    Ok(seal_value_facts(scratch))
-}
-
 #[allow(dead_code)]
 pub(crate) fn analyze_with_definition_overrides(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
     blocks: &[SSABlock],
