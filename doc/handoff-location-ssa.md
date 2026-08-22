@@ -1865,3 +1865,42 @@ itself** -- why it answers `None` for a call whose result is plainly consumed tw
 lines later. Time it or print its inputs; do not reason about it. Five mechanisms
 have been reasoned out and all five were wrong, while every measurement has
 answered in one build.
+
+### The duplicate call is a third pass, and the measurement found it
+
+Probing the owner lookup says it fails at its first step, for both sites:
+
+    owner (100000460, 29) -> no stable owner name
+    owner (100000460, 5a) -> no stable owner name
+
+`stable_owned_call_result_name_for_source` has no name for either call result, so
+`lower_certified_statement_call` falls through to `LoweredOp::Expr(call)` and the
+call renders as a bare statement. That is correct behaviour for a call whose
+result nothing is known to own.
+
+But something does name the result, and it is neither of the two constructors:
+
+    // crates/r2dec/src/single_evaluation.rs:327
+    let base = format!("{callee}_result");
+
+`single_evaluation::bind_each_call_site_once`, run from `lib.rs:3305` **after**
+the fold, hoists each call site into a temporary named after its callee. That is
+where `_work_result` comes from, and it is the third rendering of the same call.
+
+So the sequence is: the fold emits a bare statement because no owner is known,
+the fold separately builds an expression form, and single-evaluation then binds
+that expression to a new name -- leaving the bare statement behind, with a callee
+spelled as a variable because `introduced_name_for` reads
+`CExpr::Var(id)` and the statement form spelled it `External`.
+
+**The fix is at the seam, and it is small:** `bind_each_call_site_once` knows
+which call sites it bound; a bare statement for a site it bound is a duplicate
+and should go. Alternatively the fold should not emit the bare statement for a
+site whose expression form is used, which needs the fold to know what
+single-evaluation will do -- so binding it in the pass that already has the
+answer is the better of the two.
+
+Five mechanisms were reasoned out on this defect and all were wrong; three
+measurements found it: `#[track_caller]` gave the two constructors, the owner
+probe gave the reason the statement is bare, and one grep for the name shape gave
+the third pass.
