@@ -91,7 +91,8 @@ impl<'a> FoldingContext<'a> {
                                 args.truncate(max_arity);
                                 certified_args.values.truncate(max_arity);
                             }
-                            let call = CExpr::call(func_expr, args);
+                            let call =
+                                CExpr::call_at((frame.block_addr, frame.op_idx), func_expr, args);
                             return self.lower_certified_statement_call(
                                 frame.block_addr,
                                 frame.op_idx,

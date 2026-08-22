@@ -10429,7 +10429,7 @@ mod tests {
 
         assert_eq!(
             ctx.synthesized_call_expr_for_source_call((0x1000, 2)),
-            Some(CExpr::call(
+            Some(CExpr::call_at((0x1000, 2), 
                 CExpr::External {
                     name: "sym.helper".to_string(),
                     kind: crate::symbol::ExternalKind::Function,

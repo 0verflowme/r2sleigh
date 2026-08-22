@@ -49,6 +49,12 @@ impl<'a> CallIndex<'a> {
     }
 
     fn source_of(&self, expr: &CExpr) -> Option<Source> {
+        // A call that knows its site says which site it is. Comparing shapes
+        // only works while every layer builds the same expression for a call,
+        // and they do not: the analysis layer and the fold each build their own.
+        if let CExpr::Call { site: Some(site), .. } = expr {
+            return Some(*site);
+        }
         if !matches!(expr, CExpr::Call { .. }) {
             return None;
         }
@@ -108,6 +114,11 @@ pub(crate) fn bind_each_call_site_once(func: &mut CFunction, call_exprs: &BTreeM
     );
     drop(symbols);
 
+    // Binding a site evaluates it at the binding, so a bare statement for the
+    // same site evaluates it twice. The fold emits one because at that point
+    // nothing owned the result, which is what this pass has just changed.
+    drop_bare_statements_for_bound_sites(&mut func.body, &index, &bound);
+
     for name in introduced {
         if !func.locals.iter().any(|local| local.name == name)
             && !func.params.iter().any(|param| param.name == name)
@@ -118,6 +129,25 @@ pub(crate) fn bind_each_call_site_once(func: &mut CFunction, call_exprs: &BTreeM
                 stack_offset: None,
             });
         }
+    }
+}
+
+/// Remove a bare evaluation of a call site this pass has bound to a name.
+fn drop_bare_statements_for_bound_sites(
+    body: &mut Vec<CStmt>,
+    index: &CallIndex<'_>,
+    bound: &BTreeMap<Source, crate::symbol::SymbolId>,
+) {
+    body.retain(|stmt| match stmt {
+        CStmt::Expr(expr) => index
+            .source_of(expr)
+            .is_none_or(|source| !bound.contains_key(&source)),
+        _ => true,
+    });
+    for stmt in body.iter_mut() {
+        for_each_child_block_mut(stmt, &mut |inner, _| {
+            drop_bare_statements_for_bound_sites(inner, index, bound);
+        });
     }
 }
 

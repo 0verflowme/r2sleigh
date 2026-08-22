@@ -2959,7 +2959,7 @@ impl<'a> FoldingContext<'a> {
         let func = self
             .resolved_callee_identity_expr_for_site(block_addr, op_idx)
             .unwrap_or(func);
-        let expr = CExpr::call(func, certified_args.args);
+        let expr = CExpr::call_at(source_call, func, certified_args.args);
         Some(CertifiedCallExpr {
             expr,
             target: cert.target,
