@@ -1601,3 +1601,44 @@ measurement is to print what the eight actually are** -- the operation, its
 destination version and its source -- at the point `collect_call_argument_slots`
 records them. That is one run, and it should have been the first thing done
 rather than the third guess.
+
+### The callsite defect was real, and the fixture was hiding a second one
+
+Instrumenting what `collect_call_argument_slots` records found it in one run,
+after two discriminators built by reading had failed:
+
+    slot idx=1 op=W1_1 = CALLDEF  dst=W1_1  value_var=W1_1
+    slot idx=0 op=X0_2 = ZEXT(tmp:12280_1)
+
+`SSAOp::CallDefine` is how a call says the callee may destroy a register. Those
+definitions are emitted after the call, so the backward walk from the next call
+reaches them first, and their destinations are argument registers. Rejecting them
+takes a one-argument call from eight arguments to one.
+
+**The fixture was also lying, twice.** `radare2` splits a Mach-O object at an
+unresolved `bl`, so `_driver` became `fcn.00000000` and `fcn.00000024` and the
+first call's argument setup sat in the other half -- which is why that call
+collected no arguments at all and looked like a second defect. Linking a real
+binary instead of decompiling an object file fixes both: `/tmp/xmmfix/callsmain`
+holds `driver3`, whole, and the arguments recover correctly.
+
+    slots at 100000460:41 -> ["0=tmp:11b80_1", "1=tmp:28300_1", "2=tmp:20380_1"]
+    slots at 100000460:90 -> ["0=tmp:12280_1"]
+
+    sym._work(arg0 + 1, arg1 << 1, (uint32_t)arg1 ^ (uint32_t)arg0);
+
+which is `work(n + 1, m * 2, n ^ m)` exactly.
+
+**What that fixture does show is a real defect: every call is emitted twice.**
+
+    sym._work(arg0 + 1, arg1 << 1, (uint32_t)arg1 ^ (uint32_t)arg0);
+    sym._other(sym._work(...) + (uint32_t)arg0);
+    uint64_t _work_result = sym__work(arg0 + 1, arg1 << 1, arg0 ^ arg1);
+    uint64_t t12280_3 = _work_result + arg1 + sym__other(_work_result + arg0);
+    return _work_result + arg1 + sym__other(_work_result + arg0);
+
+Each call appears as a bare statement and again inside an assignment, under two
+spellings -- `sym._work` and `sym__work` -- and `t12280_3` is declared and then
+not used by the return, which repeats its expression instead. 85 of 144
+obligations are refused. **Use a linked binary for call work, never an object
+file**, and this is the fixture.
