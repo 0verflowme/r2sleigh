@@ -1372,3 +1372,47 @@ and this one. The call counts stay linear across all of them. Whatever makes eac
 call slower has not been found, and the next attempt should measure a single
 predicate's cost directly -- time `is_dead` alone across the two sizes -- rather
 than infer it from a sample or from a structural argument.
+
+## The remaining cost is one predicate, and sampling never showed it
+
+Timing the phases rather than sampling the stacks finds it immediately. On the
+18614-op function, wall clock about 19.9s:
+
+    phase normalize                   12ms
+    phase recover                     12ms
+    phase analyze_blocks             159ms
+    phase analyze_function_structure   2ms
+    phase emitted_var_names        12856ms
+    phase primary_body              2408ms
+    phase prune_locals                 0ms
+    phase codegen                      1ms
+
+and inside that one phase:
+
+    should_inline calls=14184 total_ms=12714
+
+Fourteen thousand calls costing nine hundred microseconds each, which is
+sixty-four per cent of the whole decompile. `is_dead`, which the sampling profile
+put at the top three times, is 21ms.
+
+**Sampling was misleading throughout.** It reported the functions on the stack
+most often, which were the small predicates called from everywhere, and never
+surfaced the one whose individual calls are enormous. Five local changes were
+measured and rejected on its advice -- the alias sort, two `display_name`
+allocations, the flag base string, and keying a lookup by `ValueId` -- and none
+of them touched anything that mattered. Two measurements found it: counting calls
+separated "more work" from "slower work", and timing named phases found the
+phase.
+
+`should_inline` returns early when a value has no uses or more than three, so
+the expensive path is only taken for values with one to three readers, and it
+runs `call_result_source_for_ssa_name`, then `local_post_call_source_for_ssa_name`,
+then `source_call_for_visible_owner_name`, then
+`stable_owned_call_result_name_for_source`. **The next measurement is which of
+those four costs the nine hundred microseconds**, timed the same way, and it
+should be done before anything is changed.
+
+Also worth knowing: `emitted_var_names` runs once but asks `should_inline` of
+every operation, and the fold then asks the same question again while lowering.
+Whatever the fix to the predicate, the answer being computed twice is a second
+thing to look at.
