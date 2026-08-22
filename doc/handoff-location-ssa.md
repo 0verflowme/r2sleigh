@@ -1248,3 +1248,32 @@ reaches. Routing those four through one function that states the carrier rule
 once would fix `sum32` without touching the other two hundred, and it would be a
 step toward the full collapse rather than a special case, because the one
 function is where the rest would move later.
+
+### The slice was the same mistake in miniature
+
+Routing the four return resolvers through one function was built. The authority
+is reached and it answers correctly:
+
+    auth X8_4 carrier=true
+
+`tracked_return_source_expr` returns the carrier reference, and the rendered
+return is still `0`, because `resolve_return_target_expr` takes that reference
+and resolves it again, and `preferred_return_candidate` resolves whatever
+survives that. Guarding those in turn is the same walk as guarding
+`get_expr`'s fourteen return points, with fewer steps.
+
+**So the shape of the fix is not "one place that answers" bolted beside the
+existing resolvers.** It is that resolution must be final: an expression a
+resolver has already chosen is not re-opened by the next one. Today every
+resolver treats its input as a starting point and looks for something it prefers,
+so an answer only survives if no later resolver has an opinion -- and for a
+carrier, every one of them does, because a carrier genuinely has several values.
+
+That is a contract, not a special case: **a rendered expression is an answer, not
+a candidate.** Stating it means the return resolvers stop taking each other's
+output as raw material, which is a change to how they compose rather than a rule
+about carriers. `sym._fnv1a64` works today only because its answer happens to be
+produced by the last resolver in its chain rather than the first.
+
+Ten attempts on this defect are recorded above. The useful residue is this
+paragraph and the bisection method that produced it; every guard was reverted.
