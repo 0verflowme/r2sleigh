@@ -2434,3 +2434,26 @@ piece of work: a carrier written at a narrower width than its phi is not
 reconciled, and the same gap blocks the x86 accumulator loops. The return defect
 and the width defect were one symptom and are two causes; the first is fixed and
 the second is where it belongs.
+
+### The width layer resists the carrier-by-name rule
+
+Giving `LowerCtx` the carrier set and reading a carrier by name there, as the
+fold now does, is inert: `sum32` still renders `x8 = (int64_t)*arg0` and nothing
+else moves. Reverted.
+
+The probe that motivated it says why it was worth trying and why it was not
+enough. Only `X8_1` is ever asked of the fold's `get_expr`, and it answers
+`IntLit(0)`, the initialiser -- so the carrier-by-name rule is the right shape for
+that query. But the assignment being rendered is not built from that query: the
+add's operand is a `W8` value, the 32-bit half, which is not a carrier member and
+never reaches either `get_expr`.
+
+So the carrier machinery cannot fix this, because the value in the expression is
+not the carrier -- it is the narrow half of the carrier, and nothing relates them.
+That is the width layer stated as precisely as this defect can state it, and it
+is the same statement the x86 accumulator loops and the SIMD reads produce:
+**a value written at one width and read at another is two values, and the graph
+does not know they are one.**
+
+Every approach that treats the carrier as the unit fails here. The unit has to be
+the storage.
