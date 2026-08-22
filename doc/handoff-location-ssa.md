@@ -1578,3 +1578,26 @@ than an entry value.
 `canonical_abi_arg_index` is also a hardcoded list of x86 and arm64 spellings and
 belongs with the other target-model work, but that is tidiness; the clobber rule
 is the defect.
+
+### Correction: the eight arguments are not entry values
+
+The entry above inferred from the uppercase spelling of `W1` through `W7` that
+they are version-zero values, and built a discriminator on it: reject an argument
+whose value the function never produced. Two forms of that were tried -- rejecting
+only non-transfer operations, then rejecting any version-zero source -- and
+neither changes the rendering or the ledger, which stays at 81 obligations with
+50 refused. So the sources are not version zero, and the uppercase spelling means
+something else.
+
+What survives from that entry is the part that was measured rather than inferred:
+
+  * the eight come from the register path, `registers=8 stack=0`
+  * `call_argument_value_for_op` accepts any operation whose destination is named
+    like an argument register
+  * `collect_call_argument_slots` stops its backward walk at the previous call
+
+What does not survive is the claim about clobbers and entry values. **The next
+measurement is to print what the eight actually are** -- the operation, its
+destination version and its source -- at the point `collect_call_argument_slots`
+records them. That is one run, and it should have been the first thing done
+rather than the third guess.
