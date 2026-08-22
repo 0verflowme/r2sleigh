@@ -2298,3 +2298,35 @@ after `fold_constant_arithmetic_in_expr` and the other whole-function passes in
 `lib.rs`. One of those transitions turns a carrier reference into `0`, and that
 transition is the defect. Do not guard another resolver until that print says
 which one.
+
+### The return is already a constant before any whole-function pass
+
+Tracing the return statement's expression through every pass in `lib.rs`:
+
+    ret before-fold_constant_arithmetic_in_function   IntLit(0)
+    ret before-simplify_identities_in_function        IntLit(0)
+    ret before-propagate_single_use_register_carriers IntLit(0)
+    ...
+    ret late                                          IntLit(0)
+
+It is `IntLit(0)` before the first of them, so no post-pass creates it and the
+constant is there when the body is assembled. That eliminates the whole second
+half of the pipeline, which four of the attempts above were implicitly aimed at.
+
+Preferring `last_ret_value` over the target-derived value when it names a carrier
+is also inert, which is the seventh. Taken with the earlier result that
+`tracked_return_source_expr` returns the carrier name when guarded and the output
+still shows `0`, the conclusion is narrow and firm: **something between
+`last_ret_value` being set and the return statement being built replaces it, and
+it is not `resolve_return_target_expr`.**
+
+**The one measurement that has not been taken**, and it should be the next thing
+anyone does here: print `last_ret_value` at the moment the return statement is
+constructed, in the same place the `retval` probe already prints `expr`. The
+`retval` probe reports `raw=IntLit(0)`; printing `last_ret_value` beside it says
+whether the constant arrived as the candidate or replaced it, and those two cases
+have completely different fixes.
+
+Seven attempts on this defect in one session, and the last three were hypotheses
+where the rule -- measure, do not guess -- called for a probe. The probe above is
+four lines.
