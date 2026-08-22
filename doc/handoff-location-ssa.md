@@ -1508,3 +1508,36 @@ it is a tidiness change rather than this defect's fix.
 on the smallest function that shows it. It is not the loop carrier, not the
 resolver contract and not the cost work; it should be measured from scratch, and
 `calls.c` above is the fixture to do it with.
+
+### Where the eight arguments come from, and where they do not
+
+`certified_call_args_for_site` renders `cert.canonical_argument_values()`,
+truncated by the call's arity when that is known. `sub_30` is an extern with no
+prototype, so nothing truncates and every candidate renders.
+
+The obvious suspect is that the candidates are the convention's whole slot list,
+and that is **not** what is happening. `collect_call_argument_slots` in
+`r2ssa/src/semantic.rs` already intersects: it walks the operations before the
+call in its own block, stops at the previous call, and records an index only for
+an operation that writes an argument register. That is exactly the intersection
+`SourceConventionSlots` asks its consumers for.
+
+So the question is why it yields eight. The rendering answers half of it:
+
+    sub_30(sub_24_result + w20, W1, W2, W3, W4, W5, W6, W7)
+
+The first argument is real and lowercase, a rendered expression. `W1` through
+`W7` are **uppercase**, which in this renderer means a version-zero entry value:
+a register the function never writes. So the collector is recording entry values
+as arguments, for registers nothing in the block assigns.
+
+Two candidates, and one run of instrumentation on `call_argument_value_for_op`
+distinguishes them: either it matches the `bl` instruction's own lifted
+clobbering of caller-saved registers as though those were argument writes, or the
+values arrive through `stack_argument_locations`, which
+`canonical_argument_values` merges in without the same intersection --
+`by_index.entry(argument.index).or_insert(argument.value)`.
+
+The second is the more likely of the two on reading, and it is a one-line check
+to settle. The ledger is the measure to watch: 81 obligations with 50 refused
+today.
