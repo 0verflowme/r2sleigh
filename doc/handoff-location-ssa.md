@@ -2088,3 +2088,38 @@ in `use_info().definitions` and `semantic_values` before folding begins. If the
 `Var`-callee form is already there, the analysis layer built it and the fold
 merely inlined it, which makes this the same defect as the three call
 expressions and not a fourth thing.
+
+## The call duplicate, complete
+
+Probing the analysis facts before folding finishes the diagnosis:
+
+    factcall definition       callee=Var(sym._work)   x9
+    factcall definition       callee=Var(sym._other)  x5
+    factcall call_result_expr callee=Var(sym._work)   x2
+    factcall call_result_expr callee=Var(sym._other)  x1
+
+Every call the analysis layer holds carries a **`Var`** callee. Every call the
+fold constructs carries an **`External`** one -- `#[track_caller]` reports exactly
+two construction sites and both are external. The body then contains both,
+because the fold emits its own form *and* inlines the analysis definitions.
+
+So the sequence is complete and every step of it is measured:
+
+  1. the analysis layer builds a call expression per site, callee as a variable,
+     and stores it in `definitions` and `call_result_exprs`
+  2. the fold builds its own, callee as an external, at `lowering.rs:94` for the
+     statement and `mod.rs:2962` for the expression
+  3. the body receives both, the fold's directly and the analysis one by inlining
+  4. `single_evaluation` is handed the analysis form, matches call sites by
+     expression equality, and so binds that one and leaves the fold's
+
+Every fix attempted at step 4 failed because the defect is at steps 1 and 2, and
+aligning any two of the three forms relocates it rather than removing it, which
+was measured directly.
+
+**This is the whole of open item 1, in one defect, with every link established.**
+The renderer must have one construction per value. The fold's external form is
+the one with the callee identity and the certified arguments; the analysis form
+exists because the analysis layer needs *a* expression for its tables, and the
+fix is that those tables should hold the same expression the body will contain
+rather than a second one built for the purpose.
