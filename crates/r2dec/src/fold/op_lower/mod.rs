@@ -311,7 +311,7 @@ fn expr_contains_call(expr: &CExpr) -> bool {
     found
 }
 
-fn expr_is_side_effect_free_for_carrier_gate(expr: &CExpr) -> bool {
+pub(crate) fn expr_is_side_effect_free(expr: &CExpr) -> bool {
     match expr {
         CExpr::IntLit(_)
         | CExpr::UIntLit(_)
@@ -325,12 +325,12 @@ fn expr_is_side_effect_free_for_carrier_gate(expr: &CExpr) -> bool {
         | CExpr::AddrOf(inner)
         | CExpr::Deref(inner)
         | CExpr::Cast { expr: inner, .. }
-        | CExpr::Sizeof(inner) => expr_is_side_effect_free_for_carrier_gate(inner),
+        | CExpr::Sizeof(inner) => expr_is_side_effect_free(inner),
         CExpr::Unary { op, operand } => {
             !matches!(
                 op,
                 UnaryOp::PreInc | UnaryOp::PostInc | UnaryOp::PreDec | UnaryOp::PostDec
-            ) && expr_is_side_effect_free_for_carrier_gate(operand)
+            ) && expr_is_side_effect_free(operand)
         }
         CExpr::Binary { op, left, right } => {
             !matches!(
@@ -346,26 +346,26 @@ fn expr_is_side_effect_free_for_carrier_gate(expr: &CExpr) -> bool {
                     | BinaryOp::BitXorAssign
                     | BinaryOp::ShlAssign
                     | BinaryOp::ShrAssign
-            ) && expr_is_side_effect_free_for_carrier_gate(left)
-                && expr_is_side_effect_free_for_carrier_gate(right)
+            ) && expr_is_side_effect_free(left)
+                && expr_is_side_effect_free(right)
         }
         CExpr::Ternary {
             cond,
             then_expr,
             else_expr,
         } => {
-            expr_is_side_effect_free_for_carrier_gate(cond)
-                && expr_is_side_effect_free_for_carrier_gate(then_expr)
-                && expr_is_side_effect_free_for_carrier_gate(else_expr)
+            expr_is_side_effect_free(cond)
+                && expr_is_side_effect_free(then_expr)
+                && expr_is_side_effect_free(else_expr)
         }
         CExpr::Subscript { base, index } => {
-            expr_is_side_effect_free_for_carrier_gate(base)
-                && expr_is_side_effect_free_for_carrier_gate(index)
+            expr_is_side_effect_free(base)
+                && expr_is_side_effect_free(index)
         }
         CExpr::Member { base, .. } | CExpr::PtrMember { base, .. } => {
-            expr_is_side_effect_free_for_carrier_gate(base)
+            expr_is_side_effect_free(base)
         }
-        CExpr::Comma(values) => values.iter().all(expr_is_side_effect_free_for_carrier_gate),
+        CExpr::Comma(values) => values.iter().all(expr_is_side_effect_free),
         CExpr::Call { .. } => false,
     }
 }
@@ -403,7 +403,7 @@ fn side_effect_free_assignment_name(stmt: &CStmt) -> Option<crate::symbol::Symbo
         } => (*name, init),
         _ => return None,
     };
-    expr_is_side_effect_free_for_carrier_gate(rhs).then_some(name)
+    expr_is_side_effect_free(rhs).then_some(name)
 }
 
 fn stmt_contains_memory_like_access(stmt: &CStmt) -> bool {
@@ -2071,6 +2071,10 @@ impl<'a> FoldingContext<'a> {
                 }
             }
         }
+    }
+
+    fn is_carrier_rendered_name(&self, name: &str) -> bool {
+        self.carrier_aliases.values().any(|carrier| carrier == name)
     }
 
     pub(crate) fn analyze_function_structure(&mut self, func: &SSAFunction) {
@@ -10270,6 +10274,10 @@ impl<'a> FoldingContext<'a> {
         match expr {
             CExpr::External { .. } => return expr.clone(),
             CExpr::Var(name) => {
+                // A carrier's name is mutable state, so no semantic value speaks for it.
+                if self.is_carrier_rendered_name(&self.spelling(*name)) {
+                    return expr.clone();
+                }
                 if self.should_preserve_address_like_visible_name(*name) {
                     return expr.clone();
                 }

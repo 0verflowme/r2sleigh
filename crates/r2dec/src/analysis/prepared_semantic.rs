@@ -3159,33 +3159,37 @@ fn collect_prepared_runtime_facts(symbols: &std::cell::RefCell<crate::symbol::Sy
                                     .stack_offset_for_var(src)
                                     .or_else(|| stack_offset_for_value(prepared, src)),
                             });
-                    use_info.forwarded_values.insert(
-                        dst_key.clone(),
-                        ValueProvenance {
-                            source: source_prov.source.clone(),
-                            source_value_id: source_prov.source_value_id.or(bound_src_id),
-                            source_var: source_prov
-                                .source_var
-                                .clone()
-                                .or_else(|| Some(src.clone())),
-                            stack_slot: source_prov
-                                .stack_slot
-                                .or_else(|| view.stack_offset_for_var(src))
-                                .or_else(|| stack_offset_for_value(prepared, src)),
-                        },
-                    );
-                    if let (Some(dst_id), Some(src_id)) = (bound_dst_id, bound_src_id) {
-                        use_info.forwarded_values_by_value.insert(
-                            dst_id,
-                            exact_prepared_copy_provenance(
-                                src,
-                                src_id,
-                                source_prov
+                    // Forwarding a carrier member past its merge would restore the value it entered with.
+                    let forwards = !env.carrier_aliases.contains_key(&dst_key);
+                    if forwards {
+                        use_info.forwarded_values.insert(
+                            dst_key.clone(),
+                            ValueProvenance {
+                                source: source_prov.source.clone(),
+                                source_value_id: source_prov.source_value_id.or(bound_src_id),
+                                source_var: source_prov
+                                    .source_var
+                                    .clone()
+                                    .or_else(|| Some(src.clone())),
+                                stack_slot: source_prov
                                     .stack_slot
                                     .or_else(|| view.stack_offset_for_var(src))
                                     .or_else(|| stack_offset_for_value(prepared, src)),
-                            ),
+                            },
                         );
+                        if let (Some(dst_id), Some(src_id)) = (bound_dst_id, bound_src_id) {
+                            use_info.forwarded_values_by_value.insert(
+                                dst_id,
+                                exact_prepared_copy_provenance(
+                                    src,
+                                    src_id,
+                                    source_prov
+                                        .stack_slot
+                                        .or_else(|| view.stack_offset_for_var(src))
+                                        .or_else(|| stack_offset_for_value(prepared, src)),
+                                ),
+                            );
+                        }
                     }
                     if dst.version == 0
                         && let Some(alias) = env

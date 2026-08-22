@@ -2501,14 +2501,14 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         let compound_op = Self::compound_assignment_op(*op)?;
 
         if Self::expr_is_var_named_of(symbols, left, target_name)
-            && Self::expr_is_side_effect_free(right)
+            && crate::fold::op_lower::expr_is_side_effect_free(right)
         {
             return Some((compound_op, right.as_ref().clone()));
         }
 
         if Self::binary_op_is_commutative_for_compound(*op)
             && Self::expr_is_var_named_of(symbols, right, target_name)
-            && Self::expr_is_side_effect_free(left)
+            && crate::fold::op_lower::expr_is_side_effect_free(left)
         {
             return Some((compound_op, left.as_ref().clone()));
         }
@@ -2545,52 +2545,6 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         target_name: &str,
     ) -> bool {
         matches!(expr, CExpr::Var(name) if &*crate::symbol::spelling(symbols, *name) == target_name)
-    }
-
-    fn expr_is_side_effect_free(expr: &CExpr) -> bool {
-        match expr {
-            CExpr::IntLit(_)
-            | CExpr::UIntLit(_)
-            | CExpr::FloatLit(_)
-            | CExpr::StringLit(_)
-            | CExpr::CharLit(_)
-            | CExpr::Var(_)
-            | CExpr::External { .. }
-            | CExpr::SizeofType(_) => true,
-            CExpr::Paren(inner)
-            | CExpr::AddrOf(inner)
-            | CExpr::Deref(inner)
-            | CExpr::Cast { expr: inner, .. }
-            | CExpr::Sizeof(inner) => Self::expr_is_side_effect_free(inner),
-            CExpr::Unary { op, operand } => {
-                !matches!(
-                    op,
-                    UnaryOp::PreInc | UnaryOp::PostInc | UnaryOp::PreDec | UnaryOp::PostDec
-                ) && Self::expr_is_side_effect_free(operand)
-            }
-            CExpr::Binary { op, left, right } => {
-                !Self::is_assignment_like_op(*op)
-                    && Self::expr_is_side_effect_free(left)
-                    && Self::expr_is_side_effect_free(right)
-            }
-            CExpr::Ternary {
-                cond,
-                then_expr,
-                else_expr,
-            } => {
-                Self::expr_is_side_effect_free(cond)
-                    && Self::expr_is_side_effect_free(then_expr)
-                    && Self::expr_is_side_effect_free(else_expr)
-            }
-            CExpr::Subscript { base, index } => {
-                Self::expr_is_side_effect_free(base) && Self::expr_is_side_effect_free(index)
-            }
-            CExpr::Member { base, .. } | CExpr::PtrMember { base, .. } => {
-                Self::expr_is_side_effect_free(base)
-            }
-            CExpr::Comma(items) => items.iter().all(Self::expr_is_side_effect_free),
-            CExpr::Call { .. } => false,
-        }
     }
 
     fn is_assignment_like_op(op: BinaryOp) -> bool {
@@ -4396,7 +4350,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         if Self::loop_var_equiv(name, var) || Self::set_contains_loop_var(cond_vars, name) {
             return false;
         }
-        Self::is_generated_artifact_name(name) && Self::expr_is_side_effect_free(rhs)
+        Self::is_generated_artifact_name(name) && crate::fold::op_lower::expr_is_side_effect_free(rhs)
     }
 
     fn is_generated_side_effect_free_assignment(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, stmt: &CStmt) -> bool {
@@ -4418,7 +4372,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             } => (&*crate::symbol::spelling(symbols, *name), rhs),
             _ => return false,
         };
-        Self::is_generated_artifact_name(name) && Self::expr_is_side_effect_free(rhs)
+        Self::is_generated_artifact_name(name) && crate::fold::op_lower::expr_is_side_effect_free(rhs)
     }
 
     fn is_generated_artifact_name(name: &str) -> bool {
@@ -4567,7 +4521,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                     crate::symbol::spelling(symbols, *def).to_string(),
                     Self::collect_expr_vars(symbols, right),
                     Self::is_generated_artifact_name(&crate::symbol::spelling(symbols, *def)),
-                    Self::expr_is_side_effect_free(right),
+                    crate::fold::op_lower::expr_is_side_effect_free(right),
                 ))
             }
             CStmt::Decl {
@@ -4578,7 +4532,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                 crate::symbol::spelling(symbols, *name).to_string(),
                 Self::collect_expr_vars(symbols, init),
                 Self::is_generated_artifact_name(&crate::symbol::spelling(symbols, *name)),
-                Self::expr_is_side_effect_free(init),
+                crate::fold::op_lower::expr_is_side_effect_free(init),
             )),
             _ => None,
         }

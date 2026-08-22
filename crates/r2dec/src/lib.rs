@@ -3305,6 +3305,7 @@ impl Decompiler {
         single_evaluation::bind_each_call_site_once(&mut c_function, &folded_call_sites);
         simplify_identities_in_function(&mut c_function, &fold_ctx);
         propagate_single_use_register_carriers(&mut c_function, &fold_ctx);
+        drop_overwritten_assignments(&mut c_function);
         rewrite_stack_synonym_uses_to_declared_locals(symbols, &mut c_function, &fold_ctx);
         // Dropping a version suffix loses which value a name meant, so anything
         // that resolves a name to the storage behind it has to run before this.
@@ -3697,6 +3698,76 @@ fn collect_visible_stack_offsets(
 /// where it was stored and stayed where it was tested: a loop kept running
 /// `while (len != (i ^ i) + 1)`. A condition is an expression like any other and
 /// the same rules decide it.
+/// Drop an assignment whose value is overwritten before anything reads it.
+fn drop_overwritten_assignments(func: &mut CFunction) {
+    fn assignment_target(stmt: &CStmt) -> Option<(crate::symbol::SymbolId, &CExpr)> {
+        let CStmt::Expr(CExpr::Binary {
+            op: BinaryOp::Assign,
+            left,
+            right,
+        }) = stmt
+        else {
+            return None;
+        };
+        let CExpr::Var(name) = left.as_ref() else {
+            return None;
+        };
+        Some((*name, right.as_ref()))
+    }
+
+    fn visit(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, stmts: &mut Vec<CStmt>) {
+        for stmt in stmts.iter_mut() {
+            single_evaluation::for_each_child_block_mut(stmt, &mut |body, _| visit(symbols, body));
+            if let CStmt::For { init: Some(init), .. } = stmt {
+                let mut one = vec![(**init).clone()];
+                visit(symbols, &mut one);
+                if let Some(first) = one.into_iter().next() {
+                    *init = Box::new(first);
+                }
+            }
+        }
+        let mut index = 0;
+        while index < stmts.len() {
+            let Some((name, value)) = assignment_target(&stmts[index]) else {
+                index += 1;
+                continue;
+            };
+            if !crate::fold::op_lower::expr_is_side_effect_free(value) {
+                index += 1;
+                continue;
+            }
+            let spelling = crate::symbol::spelling(symbols, name);
+            let mut overwritten = None;
+            for offset in index + 1..stmts.len() {
+                let stmt = &stmts[offset];
+                // The overwrite itself names the target, so it is tested before any read.
+                if let Some((target, rhs)) = assignment_target(stmt)
+                    && target == name
+                    && count_var_reads_in_stmts(symbols, std::slice::from_ref(&CStmt::Expr(rhs.clone())), &spelling) == 0
+                {
+                    overwritten = Some(offset);
+                    break;
+                }
+                if count_var_reads_in_stmts(symbols, std::slice::from_ref(stmt), &spelling) > 0 {
+                    break;
+                }
+                // Only straight-line statements are crossed; anything else may read it out of order.
+                if !matches!(stmt, CStmt::Expr(_) | CStmt::Decl { .. }) {
+                    break;
+                }
+            }
+            if overwritten.is_some() {
+                stmts.remove(index);
+                continue;
+            }
+            index += 1;
+        }
+    }
+
+    let symbols = std::rc::Rc::clone(&func.symbols);
+    visit(&symbols, &mut func.body);
+}
+
 fn simplify_identities_in_function(func: &mut CFunction, fold_ctx: &FoldingContext<'_>) {
     fn visit(stmt: &mut CStmt, fold_ctx: &FoldingContext<'_>) {
         single_evaluation::for_each_expr_mut(stmt, &mut |expr| {
