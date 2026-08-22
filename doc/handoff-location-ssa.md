@@ -1319,3 +1319,29 @@ across the map lookups themselves rather than sitting in any one of them, so the
 only change that will move it is keying those maps by `ValueId` instead of by a
 freshly built `String`. The graph already assigns the identifiers; what is
 missing is that the fold's tables do not use them.
+
+### The remaining cost is slower calls, not more of them
+
+Four local changes measured at noise, so the hypothesis that any one allocation
+mattered is wrong. Counting the calls instead of sampling the stacks says what is
+actually happening:
+
+    n=600    is_dead=18625   get_expr=2329
+    n=1200   is_dead=37825   get_expr=4729
+
+Both counts double exactly when the function doubles -- 2.03x -- while wall clock
+goes from 7.6s to 19.9s, which is 2.6x. **The calls are linear and each one gets
+slower.**
+
+That is the signature of a `String`-keyed map growing: hashing costs the length
+of the key, the tables grow with the function, and locality gets worse. It is not
+the `format!` in `display_name`, which is why removing an allocation from it and
+from the flag test changed nothing measurable.
+
+So keying the fold's tables by `ValueId` is not a micro-optimisation, it is the
+whole remaining superlinearity, and the graph already assigns the identifiers.
+`use_counts_by_value` and `definitions_by_value` exist beside their name-keyed
+twins; the fold reads the twins.
+
+Measure it the same way afterwards: the call counts should stay linear and the
+wall clock should follow them.
