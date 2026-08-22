@@ -1175,3 +1175,44 @@ single run, which is what should have been done before any of the seven attempts
 `prune_unused_pure_locals` then removes the accumulator's statements because the
 constant return leaves nothing reading `x8`, so the empty loop body follows from
 this and is not a separate defect.
+
+### Bisecting `get_expr` shows the defect is that nothing owns the answer
+
+Marking all fourteen return points of `FoldingContext::get_expr` and running
+`sum32` names the branch in one run, which is what the seven earlier attempts
+should have started with:
+
+    getexpr site 9  X8_4 -> IntLit(0)
+
+Site 9 replaces a name judged low signal with its definition, and a carrier's
+name is judged low signal because it is spelled like a register. Excluding
+carrier aliases there moves the answer rather than fixing it:
+
+    getexpr site 12 X8_4 -> IntLit(0)
+
+Site 12 prefers a semantic value, which `render_semantic_value_by_name` computes
+by resolving the merge through its sources. Guarding that too -- on
+`carrier_aliases`, the narrow map -- makes `get_expr` stop being called for
+`X8_4` at all, and `sum32` still returns `0`, because the value is now answered
+somewhere else again.
+
+**That is the finding.** At least three independent paths inside one function,
+and more outside it, will each answer for a value, and closing one hands the
+question to the next. There is no single authority for "what does this value
+render as", so a carrier -- which has several defensible answers, one per path it
+took -- gets whichever path is consulted first.
+
+`sym._fnv1a64` was fixable because its return went through
+`merged_return_register_candidate_for_block`, one specific site, and that site
+could be told to ask for the variable. `sum32` reaches the same question through
+`tracked_return_source_expr` -> `get_expr`, and there the question has no owner.
+
+**So the next step is not another guard.** It is to give the fold one place that
+answers "the rendering of this value", with the carrier rule stated once inside
+it, and to route the paths that currently answer independently through it. That
+is the same shape as the two defects this branch has already fixed -- one symbol
+table rather than four, one `UseInfo` builder rather than two -- at the level of
+expressions rather than names or facts.
+
+All guards from this exercise were reverted. Eight attempts, and the eighth is
+the one that says the seven before it were the wrong shape.
