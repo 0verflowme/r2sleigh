@@ -1807,3 +1807,37 @@ is a larger job than the duplicate suggests, and the ledger measures it:
 in three builds, against four wrong mechanisms reasoned from the rendering. But
 mark from a complete list. Three of those builds were spent because the list was
 truncated and I did not check it.
+
+### Correction: two sites build this call, not thirty-eight
+
+The count of thirty-eight was right as a count and wrong as a diagnosis. Putting
+`#[track_caller]` on `CExpr::call` and recording `Location::caller()` says which
+sites actually run, with no call-site edits and no list to get wrong:
+
+    callsite crates/r2dec/src/fold/op_lower/lowering.rs:94
+    callsite crates/r2dec/src/fold/op_lower/mod.rs:2962
+
+Two, and both are certified paths:
+
+  * `lowering.rs:94` builds the call and hands it to
+    `lower_certified_statement_call`, which is the **statement** form.
+  * `mod.rs:2962` builds `CertifiedCallExpr`, the **expression** form, which is
+    then inlined wherever the call's result is read.
+
+So the duplicate is not an uncertified path leaking. It is one call lowered twice
+on purpose, once as a statement and once as an expression, by two functions that
+disagree about the callee: `mod.rs` resolves it through
+`resolved_callee_identity_expr_for_site`, giving the `External` spelling
+`sym._work`, while `lowering.rs` uses `resolve_call_target_for_site`, whose
+result renders as the variable `sym__work`.
+
+**Two things to settle, in this order.** Whether a call should ever be lowered
+both ways for one site -- if the expression form is used, the statement is
+redundant, and the ledger's 85 refusals suggest the two forms are also being
+counted against each other. And why two resolvers of the callee disagree, which
+is item 1 on the open list wearing a different hat.
+
+**Method.** `#[track_caller]` on a constructor is the cheapest possible version
+of "mark, do not read": it needs no list, no distinguishing markers and no edits
+to the sites, and it answered in one build what three builds of hand-placed
+markers had not.
