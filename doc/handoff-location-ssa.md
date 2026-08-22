@@ -2151,3 +2151,38 @@ means the fold's construction has to happen before or during the analysis that
 populates those tables -- or the tables must be filled from the fold afterwards,
 before anything reads them. That ordering question is the actual design decision
 in open item 1, and it is the first thing to settle.
+
+## What the redesign actually requires
+
+Substituting the fold's call expression into the analysis tables was built --
+`call_result_exprs`, `definitions`, `semantic_values`, `semantic_values_by_value`
+and `formatted_defs`, all of them. It binds the fold's form, and the second form
+still proliferates:
+
+    uint64_t call_result = sym._work(arg0 + 1, arg1 << 1, (uint32_t)arg1 ^ (uint32_t)arg0);
+    sym._other(call_result + (uint32_t)arg0);
+    uint64_t t12280_3 = sym__work(..) + arg1 + sym__other(sym__work(..) + arg0);
+
+The substitution finds its targets by comparing expressions, because that is the
+only handle the tables offer: they are keyed by name and by value, not by call
+site. So a stored expression that differs in any detail from the one in
+`call_result_exprs` is not recognised and is not replaced.
+
+**That is the same failure as `single_evaluation`'s, and it is the point.** The
+duplicate exists because two layers build different expressions for one call, and
+every attempt to reconcile them afterwards has to identify "the same call", which
+by expression equality it cannot do. Two independent mechanisms have now failed
+for exactly this reason, which is as clear a statement of the requirement as
+measurement can give:
+
+> **A rendered value needs an identity that is not its shape.**
+
+Every remaining approach follows from that. The tables must key call expressions
+by call site, or a call expression must carry its site, or -- the version that
+matches the rest of this branch -- there must be one construction per site so
+that no reconciliation is needed at all. The first two make the duplicate
+findable; only the third makes it impossible, and the third is what the symbol
+table and the `UseInfo` collapse both did for their own defects.
+
+This is the design decision that gates open item 1, and it is now stated in terms
+of what has been measured rather than what was assumed.
