@@ -2648,3 +2648,51 @@ leaves the rest answering, which is indistinguishable from the fix being wrong.
 The return needed four points guarded; the carrier's narrow read needed the alias
 map extended *and* the definition suppressed; this needs those *and* whatever
 `forwarded_values` holds. Count the tables before changing any of them.
+
+### sum32: the add is built correctly and dropped afterwards
+
+The previous entry named `forwarded_values` as the remaining table answering for
+the carrier's narrow read. That was right, and instrumenting it settled the whole
+chain. In `collect_prepared_runtime_facts` the copy arm records
+
+    fwdtrace-ps tmp:12180_2 <- const:0_0
+
+so the narrow read of the carrier forwards to the constant the loop was entered
+with, exactly as the return did before it. Suppressing that record for a carrier
+member -- the same guard already used for definitions -- makes the read resolve
+to a name, and the add's recorded definition changes from
+
+    Binary { Add, left: Var(..), right: IntLit(0) }
+
+to two `Var` operands. The constant is gone.
+
+**It still renders `x8 = (int64_t)*x0`, and the reason is further downstream than
+any of the tables.** Tracing the statement build in `binary_stmt_typed` shows the
+assignment leaving `op_lower` intact:
+
+    bintrace tmp:12280_2 op=Add l=Deref(Var) r=Var
+    bintrace tmp:12280_2 raw_names=["x0", "x8"]
+    bintrace tmp:12280_2 final=Binary { Add, Deref(Var), Var }
+
+`identity_simplify_binary` does not fold it -- `is_literal_zero_expr` is purely
+syntactic and the operand is a `Var` -- and `assignment_rhs_with_type_policy`
+leaves it alone. By the time the single-use substitution in `lib.rs` sees the
+same value, the statement has become
+
+    subtrace t12280_2 = Deref(Var)
+
+So `+ x8` is dropped by a pass **between `op_lower` and that substitution**. That
+is the boundary to instrument next, and it is a narrow one: the statement is
+correct on the way out of one pass and wrong on the way into another, with the
+list of passes between them short enough to bisect by printing the statement at
+each.
+
+The forwarding suppression was reverted with the probes. It is a genuine defect
+and the guard is a one-line addition in the copy arm, but on its own it changes
+no rendered output, and the standing rule is that a partial fix which does not
+change behaviour does not stay in the tree. Re-apply it together with whatever
+fixes the dropping pass, and the two together should render the accumulation.
+
+A caution worth leaving behind: `cargo fmt` in this worktree reformats far more
+than the file being edited, and the resulting diff buries real changes among
+hundreds of formatting hunks. Do not run it while a fix is in progress.
