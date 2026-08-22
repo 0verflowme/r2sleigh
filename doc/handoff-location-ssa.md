@@ -2405,3 +2405,32 @@ return points, timing the whole-function passes, printing `last_ret_value`
 beside `expr`, and printing which arm builds the return. None took more than one
 build. Several of the guards were written after a measurement had already made
 them unnecessary, which is the mistake to avoid repeating.
+
+### What is left of sum32 is the width layer
+
+With the return fixed, `sum32` renders
+
+    do {
+        x0 += 4;
+        x8 = (int64_t)*arg0;
+    } while (arg1 != 1);
+    return x8;
+
+The carrier reaches the return and the body assigns it. The assignment is still
+wrong: the machine does `add w8, w9, w8`, so it should accumulate, and `x8 = *arg0`
+is that add with its own operand missing.
+
+Guarding `get_expr` so a carrier is read by name there too does not change it,
+and the reason names the remaining defect exactly. The carrier's members are
+
+    X0_0 X0_1 X0_2 X0_3   X8_1 X8_2 X8_3 X8_4
+
+all `X` registers. The update writes **`W8`**, the 32-bit half, so the operand in
+the add is not a carrier member, resolves on its own, reaches the initialiser and
+folds `w9 + 0` to `w9`.
+
+**So the remainder of `sum32` is the width layer**, which is already a scoped
+piece of work: a carrier written at a narrower width than its phi is not
+reconciled, and the same gap blocks the x86 accumulator loops. The return defect
+and the width defect were one symptom and are two causes; the first is fixed and
+the second is where it belongs.
