@@ -12719,6 +12719,9 @@ impl<'a> FoldingContext<'a> {
                         let control_return_value = last_ret_value.clone().or_else(|| {
                             self.current_block_addr.get().and_then(|block_addr| {
                                 self.merged_return_register_candidate_for_block(block_addr)
+                                    .or_else(|| {
+                                        self.reaching_return_register_candidate(block_addr)
+                                    })
                             })
                         });
                         if let Some(last) = control_return_value {

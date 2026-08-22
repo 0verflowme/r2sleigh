@@ -512,6 +512,47 @@ impl<'a> FoldingContext<'a> {
         best
     }
 
+    /// The definition of the return register that reaches this return.
+    ///
+    /// A function whose accumulator already sits in the return register emits no
+    /// move in its epilogue, so the returning block writes nothing and carries no
+    /// merge, and asking only that block answers with the return address. What
+    /// the machine returns is the last write on the way here, so this walks back
+    /// to it.
+    pub(crate) fn reaching_return_register_candidate(&self, block_addr: u64) -> Option<CExpr> {
+        let func = self
+            .inputs
+            .prepared_ssa
+            .map(|prepared| prepared.function())?;
+        let mut visited = HashSet::new();
+        let mut pending = vec![block_addr];
+        while let Some(addr) = pending.pop() {
+            if !visited.insert(addr) {
+                continue;
+            }
+            let Some(block) = func.get_block(addr) else {
+                continue;
+            };
+            let written = block
+                .ops
+                .iter()
+                .rev()
+                .filter_map(|op| op.dst())
+                .chain(block.phis.iter().map(|phi| &phi.dst))
+                .find(|dst| {
+                    self.inputs
+                        .arch
+                        .is_return_register_name(&dst.name.to_ascii_lowercase())
+                        && !self.is_control_return_target(dst)
+                });
+            if let Some(dst) = written {
+                return Some(self.tracked_return_source_expr(dst));
+            }
+            pending.extend(func.predecessors(addr));
+        }
+        None
+    }
+
     pub(crate) fn merged_return_register_candidate_for_block_predecessor_with_proof(
         &self,
         block_addr: u64,

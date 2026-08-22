@@ -2705,14 +2705,19 @@ impl SSAFunction {
                 {
                     facts.formal_parameter_bases.insert(dst.clone(), index);
                 }
-                op.for_each_source(&mut |source| {
-                    if let Some(index) = abi.formal_argument_index(source) {
-                        facts.formal_parameters.insert(source.clone(), index);
-                    }
-                    if let Some(index) = abi.formal_address_argument_index(source) {
-                        facts.formal_parameter_bases.insert(source.clone(), index);
-                    }
-                });
+                // A register cleared by cancelling itself is not read: the result
+                // does not depend on the operand, so `xor ecx, ecx` is a zeroing
+                // and not evidence that the function was passed anything in rcx.
+                if !op_cancels_its_own_operand(op) {
+                    op.for_each_source(&mut |source| {
+                        if let Some(index) = abi.formal_argument_index(source) {
+                            facts.formal_parameters.insert(source.clone(), index);
+                        }
+                        if let Some(index) = abi.formal_address_argument_index(source) {
+                            facts.formal_parameter_bases.insert(source.clone(), index);
+                        }
+                    });
+                }
             }
         }
 
@@ -3934,6 +3939,15 @@ fn rewrite_decompile_family_subpiece(
 /// containing definition, so `family_root_slice_for_range` refuses it. The parts
 /// are still there, and concatenating them is what the machine did, so this
 /// reports the tiling and the caller writes the `Piece` that says so.
+/// Whether this operation clears its destination by cancelling one value with
+/// itself, which reads the operand in name only.
+fn op_cancels_its_own_operand(op: &SSAOp) -> bool {
+    match op {
+        SSAOp::IntXor { a, b, .. } | SSAOp::IntSub { a, b, .. } => a == b,
+        _ => false,
+    }
+}
+
 fn family_root_tiles_for_range(
     state: &FamilyRootState,
     requested: RegisterFamilySlot,

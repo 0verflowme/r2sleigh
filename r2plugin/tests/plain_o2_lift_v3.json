@@ -32,7 +32,7 @@
       "bytes": "554889e585f67e0d89f183fe08730a31d231c0eb6b31c05dc389ca81e2f8ffff7f89c8c1e80325ffffff0f48c1e005660fefc031f6660fefc90f1f8000000000f30f6f1437660ffec2f30f6f543710660ffeca4883c6204839f075e4660ffec8660f70c1ee660ffec1660f70c855660ffec8660f7ec839ca7411660f1f44000003049748ffc24839d175f55dc3",
       "bytes_fnv1a64": "d093eafd65854e85",
       "r2il_fnv1a64": "d9fac0a75ea4fd0e",
-      "ssa_fnv1a64": "247ff59736b1e3ed",
+      "ssa_fnv1a64": "bc5b70b157ce0847",
       "required_native_opcodes": ["movdqu", "paddd", "pshufd"],
       "source_abi": {
         "calling_convention": "sysv_amd64",
