@@ -2772,3 +2772,31 @@ evidence". A release-build `Backtrace` carries no file paths, so grepping its
 output for `r2dec/src/...` discarded every frame and made a probe that had fired
 look silent. And a probe placed on one branch of `format_traced_name` says
 nothing about the branch a register name takes. Print first, filter second.
+
+### Measured state after the naming rewrite
+
+Rendering every function in the fixtures on hand, rather than the two that were
+being worked on:
+
+    arm64  fnv1a64    34 rendered, 0 refused,  4 unaccounted, 0 defects
+    arm64  sum32      29 rendered, 0 refused,  5 unaccounted, 0 defects
+    arm64  xor_lanes  72 rendered, 0 refused, 33 unaccounted, 1 defect
+    x86    fnv1a64   111 rendered, 1 refused, 20 unaccounted, 1 defect
+    x86    sum32      34 rendered, 1 refused, 15 unaccounted, 1 defect
+    x86    xor_lanes  63 rendered, 0 refused, 15 unaccounted, 1 defect
+
+**The x86 accumulator loops improved without being worked on.** This document
+said earlier that x86 rendered `rax = EAX_3` with an empty body. It now renders
+
+    do {
+        rax = (int64_t)(rax + arg0[arg3]);
+        rcx++;
+    } while (arg1 != arg3);
+
+so the accumulation and the indexed load are both there, and the width layer is
+a smaller problem than the entry above it describes. Two defects remain in that
+function: the return resolves to `rip_1` instead of `rax`, and `arg3` -- which
+stands where the counter belongs -- is read with no definition.
+
+The remaining SIMD gap is the largest single number here: `xor_lanes` leaves 33
+of 105 obligations unaccounted on arm64 and 15 of 78 on x86.
