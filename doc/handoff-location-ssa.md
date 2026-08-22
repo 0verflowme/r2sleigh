@@ -2030,3 +2030,30 @@ What is established: three representations, the seam works when given the right
 one, aligning any two relocates the defect, and the third is a call through a
 variable named for the callee rather than an external. What is not: which line
 builds it.
+
+### Search the page, not the constructors
+
+The hunt for what builds the third representation ran out of constructors.
+`#[track_caller]` on `CExpr::call` reports two sites, both `External`; every
+`CExpr::Call { .. }` struct literal in `single_evaluation.rs` is inside its test
+module; and no production code outside those builds a call. So the `Var`-callee
+call is an existing call whose callee was **rewritten**, and finding the rewrite
+by reading means auditing nineteen `CExpr::External` sites in one file plus
+sixteen elsewhere.
+
+That is the wrong side of the problem. The next measurement should enumerate what
+is actually on the page: walk the final `CFunction` body, print every
+`CExpr::Call` with the variant of its callee, and compare against the two
+constructed forms. Whatever is in the body and was not constructed is what a
+rewrite produced, and the same walk can print the expression so it can be matched
+back.
+
+That is one probe in `lib.rs` beside `note_unproven_constructs`, it needs no
+knowledge of which pass is responsible, and it answers the question the
+constructor hunt could not.
+
+**Recorded as a method note too, because it generalises:** when the question is
+"where did this rendering come from", instrumenting construction only works while
+the constructors are few. Enumerating the finished output is bounded by the size
+of the output rather than by the size of the code, and it is the better first
+move whenever a value can be rewritten after it is built.
