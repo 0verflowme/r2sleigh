@@ -382,6 +382,11 @@ impl<'a> FoldingContext<'a> {
     pub(super) fn arg_alias_for_rendered_name(&self, name: &str) -> Option<String> {
 
         let lower = name.to_lowercase();
+        // A carrier holds whatever the loop last put there, so it is never an
+        // argument, even though it is spelled bare like an entry value is.
+        if self.is_carrier_rendered_name(&lower) {
+            return None;
+        }
         if let Some((base, version)) = lower.rsplit_once('_') {
             if version != "0" {
                 return None;

@@ -2073,7 +2073,38 @@ impl<'a> FoldingContext<'a> {
         }
     }
 
-    fn is_carrier_rendered_name(&self, name: &str) -> bool {
+    /// Note every name a block other than its definition's reads.
+    ///
+    /// The prune that runs at the end of a block sees only that block's
+    /// statements, so a definition whose readers are elsewhere looks unread.
+    fn record_cross_block_reads(&self, blocks: &[SSABlock]) {
+        let mut defined_in = HashMap::new();
+        for block in blocks {
+            for op in &block.ops {
+                if let Some(dst) = op.dst() {
+                    defined_in.insert(dst.display_name(), block.addr);
+                }
+            }
+        }
+        let mut reads = self.cross_block_reads.borrow_mut();
+        for block in blocks {
+            for op in &block.ops {
+                for source in op.sources() {
+                    let key = source.display_name();
+                    if defined_in.get(&key).is_some_and(|addr| *addr != block.addr) {
+                        reads.insert(self.var_name(source));
+                    }
+                }
+            }
+            for phi in &block.phis {
+                for source in &phi.sources {
+                    reads.insert(self.var_name(&source.1));
+                }
+            }
+        }
+    }
+
+    pub(crate) fn is_carrier_rendered_name(&self, name: &str) -> bool {
         self.carrier_aliases.values().any(|carrier| carrier == name)
     }
 
@@ -2749,6 +2780,7 @@ impl<'a> FoldingContext<'a> {
         control.poll()?;
         if self.inputs.prepared_ssa.is_some() {
             self.extend_carrier_aliases_over(blocks);
+            self.record_cross_block_reads(blocks);
         }
         let symbols = &self.symbols;
 

@@ -210,6 +210,8 @@ pub(crate) struct FoldingContext<'a> {
     pub(crate) folded_blocks: std::cell::RefCell<std::collections::BTreeSet<u64>>,
     /// One name per certified loop carrier, derived once because it is settled once.
     pub(crate) carrier_aliases: HashMap<String, String>,
+    /// Names some other block reads, which a block-local prune must not delete.
+    pub(crate) cross_block_reads: std::cell::RefCell<HashSet<String>>,
     /// Names minted while folding, handed to the function when it is built.
     ///
     /// A cell because the builders take `&self`. Minting has to borrow, insert
@@ -296,6 +298,7 @@ impl<'a> FoldingContext<'a> {
         };
         Self {
             carrier_aliases,
+            cross_block_reads: std::cell::RefCell::new(HashSet::new()),
             symbols: std::rc::Rc::new(std::cell::RefCell::new(crate::symbol::SymbolTable::new())),
             inputs,
             state: FoldState::default(),
@@ -329,11 +332,8 @@ impl<'a> FoldingContext<'a> {
     }
 
     pub(crate) fn note_elided_op_site(&self, block_addr: u64, op_idx: usize, reason: &'static str) {
-        // Only an explicit request pays for this: every folded op that renders
-        // nothing reaches here, and the map is read by nothing else.
-        if !crate::unowned_report_requested() {
-            return;
-        }
+        // The obligation ledger reads this, so recording it only on request made
+        // every elision report as unaccounted in the output the reader sees.
         self.elided_op_sites
             .borrow_mut()
             .insert((block_addr, op_idx), reason);

@@ -674,6 +674,10 @@ impl<'a> FoldingContext<'a> {
                 let dead_ephemeral = self.is_prunable_dead_binding_target(&self.spelling(target))
                     && !target_is_pinned
                     && !target_has_live_use
+                    && !self
+                        .cross_block_reads
+                        .borrow()
+                        .contains(&*self.spelling(target))
                     && (!preserve_named_stack_owners || !target_is_named_stack_owner)
                     && (self.expr_is_pure(rhs) || dead_sleigh_memory_artifact);
                 let dead_flag_artifact =
