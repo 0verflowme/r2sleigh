@@ -937,3 +937,62 @@ the prepared builder, repoint the tests, and delete the rest.
 
 That is a large deletion rather than a large addition, which is the right shape,
 but it is not a change to start without agreeing the direction first.
+
+## The loop-carrier fix, scoped from measurement
+
+The exit merge and the carrier are two different phis over the same storage, and
+the carrier is already correct at the merge. Instrumented on `sym._fnv1a64`:
+
+    block=f4   X0_3 <- [f0:X0_2, f4:X0_4]     carrier, materialised
+    block=108  X0_5 <- [e0:X0_2, f4:X0_4]     exit merge
+    init carrier=X0_3 src=X0_2 into block=e0
+
+`X0_5` merges "the loop never ran", carrying the entry value `X0_2`, with "the
+loop ran", carrying the update `X0_4`. Its two sources are exactly the carrier's
+entry and update values. The carrier's initialiser is placed in `e0`, which
+dominates block `108`, so the carrier variable holds `X0_2` on the bypass path
+and the updated value on the loop path: it is correct on both predecessors of
+the merge. **`X0_5` is `X0_3` after the loop.**
+
+Today `X0_5` resolves through its own sources and takes the entry constant,
+which is where `return 0x739d0383` comes from -- the low half of the FNV offset
+basis.
+
+An earlier attempt failed for one reason worth writing down: it looked for the
+carrier *among the merge's sources*, and the carrier is a third name that is not
+either of them. Searching the sources cannot find it; the carrier fact must be
+consulted.
+
+**Scope.** One function in `crates/r2dec/src/normalize.rs`. After carriers are
+materialised, a phi whose source set is contained in a carrier's
+`entries` union `updates`, and which that carrier's initialiser dominates,
+resolves to the carrier's variable. `entries`, `updates` and the initialiser
+block are already on `CertifiedEntity::LoopCarrier`; nothing new is computed. No
+contract change and no other crate.
+
+The dominance test must be against the *merge's* block, not the loop's entries.
+Using the loop's own dominance fact is the subtly wrong version that passes this
+fixture and is wrong elsewhere.
+
+### It is necessary but not sufficient on x86
+
+`sum32`, the simplest accumulator loop there is, renders on arm64 exactly like
+`fnv1a64`:
+
+    do { x0 += 4; } while (arg1 != 1);
+    return 0;
+
+the pointer advances, the accumulator is absent, and `0` is the accumulator's
+value before the loop. Same shape, second function, so the fix applies.
+
+x86-64 is a layer worse:
+
+    do { rcx++; rax = EAX_3; } while (arg1 != arg3);
+    return rip_1;
+
+The accumulator survives as `rax = EAX_3`, which is the 32/64 sub-register
+split, and the return is the instruction pointer rather than a value. So the
+merge fix lands the arm64 accumulator loops and `sym._fnv1a64`, and the x86 ones
+need it **and** the register-width layer before they render. An earlier claim in
+this document that the fix covers "every hash function at -O1 and above" is too
+strong and should be read as the arm64 half.
