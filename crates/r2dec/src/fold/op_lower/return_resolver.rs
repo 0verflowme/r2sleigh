@@ -196,7 +196,7 @@ impl<'a> FoldingContext<'a> {
             CExpr::Member { base, .. } | CExpr::PtrMember { base, .. } => {
                 self.expr_contains_generic_stack_alias(base)
             }
-            CExpr::Call { func, args } => {
+            CExpr::Call { func, args, .. } => {
                 self.expr_contains_generic_stack_alias(func)
                     || args
                         .iter()

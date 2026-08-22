@@ -361,7 +361,7 @@ pub(crate) fn children_mut(expr: &mut CExpr) -> Vec<&mut CExpr> {
             else_expr,
         } => vec![cond.as_mut(), then_expr.as_mut(), else_expr.as_mut()],
         CExpr::Cast { expr, .. } => vec![expr.as_mut()],
-        CExpr::Call { func, args } => {
+        CExpr::Call { func, args, .. } => {
             let mut out = vec![func.as_mut()];
             out.extend(args.iter_mut());
             out
@@ -516,6 +516,7 @@ mod tests {
         CExpr::Call {
             func: Box::new(CExpr::Var(crate::symbol::declare(&symbols, &name.to_string()))),
             args: vec![CExpr::IntLit(16)],
+            site: None,
         }
     }
 
@@ -595,6 +596,7 @@ mod tests {
         let outer = CExpr::Call {
             func: Box::new(crate::symbol::var_ref(&symbols, "use")),
             args: vec![call(&symbols, "fcn.1000")],
+            site: None,
         };
         let mut func = function_from(&symbols, vec![
             CStmt::Expr(outer),
@@ -611,6 +613,7 @@ mod tests {
                 CStmt::Expr(CExpr::Call {
                     func: Box::new(crate::symbol::var_ref(&symbols, "use")),
                     args: vec![crate::symbol::var_ref(&symbols, "owned")],
+                    site: None,
                 }),
                 CStmt::Return(Some(crate::symbol::var_ref(&symbols, "owned"))),
             ]

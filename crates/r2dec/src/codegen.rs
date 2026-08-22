@@ -525,7 +525,7 @@ impl CodeGenerator {
                 self.output.push(')');
                 self.emit_expr(inner, my_prec);
             }
-            CExpr::Call { func, args } => {
+            CExpr::Call { func, args, .. } => {
                 self.emit_expr(func, my_prec);
                 self.output.push('(');
                 for (i, arg) in args.iter().enumerate() {

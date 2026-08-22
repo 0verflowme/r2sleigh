@@ -194,7 +194,17 @@ pub enum CExpr {
     /// Type cast: (type)expr.
     Cast { ty: CType, expr: Box<CExpr> },
     /// Function call.
-    Call { func: Box<CExpr>, args: Vec<CExpr> },
+    /// A call, and the site that makes it when one is known.
+    ///
+    /// Two layers build an expression for one call and nothing downstream could
+    /// tell they were the same call, because the only handle either offered was
+    /// the shape of the expression and the shapes differ. The site is an
+    /// identity that does not change when the rendering does.
+    Call {
+        func: Box<CExpr>,
+        args: Vec<CExpr>,
+        site: Option<(u64, usize)>,
+    },
     /// Array/pointer subscript: `arr[index]`.
     Subscript { base: Box<CExpr>, index: Box<CExpr> },
     /// Member access: obj.member.
@@ -315,6 +325,16 @@ impl CExpr {
         Self::Call {
             func: Box::new(func),
             args,
+            site: None,
+        }
+    }
+
+    /// A call that knows which site makes it.
+    pub fn call_at(site: (u64, usize), func: CExpr, args: Vec<CExpr>) -> Self {
+        Self::Call {
+            func: Box::new(func),
+            args,
+            site: Some(site),
         }
     }
 
@@ -446,9 +466,10 @@ impl CExpr {
                 ty,
                 expr: Box::new(f(*expr)),
             },
-            Self::Call { func, args } => Self::Call {
+            Self::Call { func, args, site } => Self::Call {
                 func: Box::new(f(*func)),
                 args: args.into_iter().map(f).collect(),
+                site,
             },
             Self::Subscript { base, index } => Self::Subscript {
                 base: Box::new(f(*base)),
@@ -494,7 +515,7 @@ impl CExpr {
                 then_expr.visit(f);
                 else_expr.visit(f);
             }
-            Self::Call { func, args } => {
+            Self::Call { func, args, .. } => {
                 func.visit(f);
                 for arg in args {
                     arg.visit(f);

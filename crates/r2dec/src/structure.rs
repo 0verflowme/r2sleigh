@@ -4720,7 +4720,8 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                 ty,
                 expr: Box::new(Self::normalize_condition_addr_artifacts(symbols, *expr)),
             },
-            CExpr::Call { func, args } => CExpr::Call {
+            CExpr::Call { func, args, site } => CExpr::Call {
+                site,
                 func: Box::new(Self::normalize_condition_addr_artifacts(symbols, *func)),
                 args: args
                     .into_iter()
@@ -4799,7 +4800,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             CExpr::Cast { expr, .. } | CExpr::Paren(expr) | CExpr::Sizeof(expr) => {
                 Self::collect_expr_vars_into(symbols, expr, out)
             }
-            CExpr::Call { func, args } => {
+            CExpr::Call { func, args, .. } => {
                 Self::collect_expr_vars_into(symbols, func, out);
                 for arg in args {
                     Self::collect_expr_vars_into(symbols, arg, out);
@@ -5876,6 +5877,7 @@ mod tests {
                     CExpr::Call {
                         func: Box::new(v(&symbols, "next")),
                         args: Vec::new(),
+                        site: None,
                     },
                     v(&symbols, "hash"),
                 ),

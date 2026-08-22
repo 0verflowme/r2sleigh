@@ -3301,7 +3301,7 @@ fn populate_prepared_call_runtime_facts(symbols: &std::cell::RefCell<crate::symb
                 use_info.call_args.insert(site, args);
             }
 
-            if let Some(call_expr) = prepared_call_expr(symbols, call_view, view, env) {
+            if let Some(call_expr) = prepared_call_expr(site, symbols, call_view, view, env) {
                 use_info.call_result_exprs.insert(site, call_expr.clone());
                 record_prepared_consumed_by_call(use_info, block, op_idx, env, prepared, view);
                 record_prepared_call_result_aliases(symbols, 
@@ -3463,7 +3463,7 @@ fn stack_value_kind_for_prepared_expr(expr: &CExpr) -> StackSlotValueKind {
     }
 }
 
-fn prepared_call_expr(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
+fn prepared_call_expr(site: (u64, usize), symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
     call_view: &PreparedCallView,
     view: &PreparedSemanticView,
     env: &PassEnv<'_>,
@@ -3480,10 +3480,7 @@ fn prepared_call_expr(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
         .iter()
         .map(|arg| normalize_prepared_inline_expr(symbols, arg.clone(), view, env, 0, &mut HashSet::new()))
         .collect();
-    Some(CExpr::Call {
-        func: Box::new(callee),
-        args,
-    })
+    Some(CExpr::call_at(site, callee, args))
 }
 
 fn prepared_call_callee_expr(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, call_view: &PreparedCallView) -> Option<CExpr> {
@@ -3508,10 +3505,7 @@ fn prepared_call_expr_from_view(symbols: &std::cell::RefCell<crate::symbol::Symb
         return None;
     }
     let callee = prepared_call_callee_expr(symbols, call_view)?;
-    Some(CExpr::Call {
-        func: Box::new(callee),
-        args: call_view.authoritative_args.clone(),
-    })
+    Some(CExpr::call(callee, call_view.authoritative_args.clone()))
 }
 
 fn prepared_call_args_have_value_bijection(call_view: &PreparedCallView) -> bool {
@@ -3813,7 +3807,8 @@ fn normalize_prepared_inline_expr(symbols: &std::cell::RefCell<crate::symbol::Sy
             )),
             member,
         },
-        CExpr::Call { func, args } => CExpr::Call {
+        CExpr::Call { func, args, site } => CExpr::Call {
+            site,
             func: Box::new(normalize_prepared_inline_expr(symbols, 
                 *func,
                 view,
@@ -4352,6 +4347,7 @@ mod tests {
             Some(CExpr::Call {
                 func: Box::new(crate::symbol::var_ref(&symbols, "sym.helper")),
                 args: vec![CExpr::IntLit(7)],
+                site: None,
             })
         );
     }

@@ -3469,7 +3469,7 @@ fn collect_expr_var_names(expr: &CExpr, out: &mut HashSet<crate::symbol::SymbolI
             collect_expr_var_names(then_expr, out);
             collect_expr_var_names(else_expr, out);
         }
-        CExpr::Call { func, args } => {
+        CExpr::Call { func, args, .. } => {
             collect_expr_var_names(func, out);
             for arg in args {
                 collect_expr_var_names(arg, out);
@@ -4245,7 +4245,7 @@ fn fold_constant_arithmetic_in_expr(
             fold_constant_arithmetic_in_expr(then_expr, strings);
             fold_constant_arithmetic_in_expr(else_expr, strings);
         }
-        CExpr::Call { func, args } => {
+        CExpr::Call { func, args, .. } => {
             fold_constant_arithmetic_in_expr(func, strings);
             for arg in args {
                 fold_constant_arithmetic_in_expr(arg, strings);
@@ -4473,7 +4473,7 @@ fn substitute_var_in_expr(expr: &mut CExpr, name: crate::symbol::SymbolId, value
             substitute_var_in_expr(then_expr, name, value);
             substitute_var_in_expr(else_expr, name, value);
         }
-        CExpr::Call { func, args } => {
+        CExpr::Call { func, args, .. } => {
             substitute_var_in_expr(func, name, value);
             for arg in args {
                 substitute_var_in_expr(arg, name, value);
@@ -4813,7 +4813,7 @@ fn normalize_declared_assignment_literals(func: &mut CFunction) {
                 visit_expr(symbols, then_expr, declared_types);
                 visit_expr(symbols, else_expr, declared_types);
             }
-            CExpr::Call { func, args } => {
+            CExpr::Call { func, args, .. } => {
                 visit_expr(symbols, func, declared_types);
                 for arg in args {
                     visit_expr(symbols, arg, declared_types);
@@ -5114,7 +5114,7 @@ fn collect_expr_local_reads(symbols: &std::cell::RefCell<crate::symbol::SymbolTa
         CExpr::Member { base, .. } | CExpr::PtrMember { base, .. } => {
             collect_expr_local_reads(symbols, base, reads);
         }
-        CExpr::Call { func, args } => {
+        CExpr::Call { func, args, .. } => {
             collect_expr_local_reads(symbols, func, reads);
             for arg in args {
                 collect_expr_local_reads(symbols, arg, reads);

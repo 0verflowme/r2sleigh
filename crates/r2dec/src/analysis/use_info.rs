@@ -466,7 +466,7 @@ fn call_arg_expr_preservation_score(symbols: &std::cell::RefCell<crate::symbol::
             90 + call_arg_expr_preservation_score(symbols, left, depth + 1)
                 + call_arg_expr_preservation_score(symbols, right, depth + 1)
         }
-        CExpr::Call { func, args } => {
+        CExpr::Call { func, args, .. } => {
             30 + call_arg_expr_preservation_score(symbols, func, depth + 1)
                 + args
                     .iter()
@@ -3952,7 +3952,7 @@ fn accumulate_formatted_def_expr_quality(symbols: &std::cell::RefCell<crate::sym
             accumulate_formatted_def_expr_quality(symbols, then_expr, env, quality);
             accumulate_formatted_def_expr_quality(symbols, else_expr, env, quality);
         }
-        CExpr::Call { func, args } => {
+        CExpr::Call { func, args, .. } => {
             accumulate_formatted_def_expr_quality(symbols, func, env, quality);
             for arg in args {
                 accumulate_formatted_def_expr_quality(symbols, arg, env, quality);
@@ -5619,7 +5619,7 @@ fn normalize_call_arg_expr_for_definition(symbols: &std::cell::RefCell<crate::sy
                 },
             )
         }
-        CExpr::Call { func, args } => {
+        CExpr::Call { func, args, .. } => {
             let func =
                 normalize_call_arg_expr_for_definition(symbols, info, lower, *func, depth + 1, visited)?;
             let args = args
@@ -7908,7 +7908,7 @@ fn call_arg_expr_semantic_weight(symbols: &std::cell::RefCell<crate::symbol::Sym
                 25
             }
         }
-        CExpr::Call { func, args } => {
+        CExpr::Call { func, args, .. } => {
             call_arg_expr_semantic_weight(symbols, func, depth + 1)
                 + args
                     .iter()
@@ -7957,7 +7957,7 @@ fn call_arg_expr_contains_stack_placeholder(symbols: &std::cell::RefCell<crate::
         CExpr::Member { base, .. } | CExpr::PtrMember { base, .. } => {
             call_arg_expr_contains_stack_placeholder(symbols, base, depth + 1)
         }
-        CExpr::Call { func, args } => {
+        CExpr::Call { func, args, .. } => {
             call_arg_expr_contains_stack_placeholder(symbols, func, depth + 1)
                 || args
                     .iter()
@@ -8008,7 +8008,7 @@ fn call_arg_expr_contains_transient_name(symbols: &std::cell::RefCell<crate::sym
         CExpr::Member { base, .. } | CExpr::PtrMember { base, .. } => {
             call_arg_expr_contains_transient_name(symbols, base, depth + 1)
         }
-        CExpr::Call { func, args } => {
+        CExpr::Call { func, args, .. } => {
             call_arg_expr_contains_transient_name(symbols, func, depth + 1)
                 || args
                     .iter()
@@ -8059,7 +8059,7 @@ fn call_arg_expr_contains_low_quality_name(symbols: &std::cell::RefCell<crate::s
         CExpr::Member { base, .. } | CExpr::PtrMember { base, .. } => {
             call_arg_expr_contains_low_quality_name(symbols, base, depth + 1)
         }
-        CExpr::Call { func, args } => {
+        CExpr::Call { func, args, .. } => {
             call_arg_expr_contains_low_quality_name(symbols, func, depth + 1)
                 || args
                     .iter()
@@ -9418,7 +9418,7 @@ mod tests {
                 CExpr::Member { base, .. } | CExpr::PtrMember { base, .. } => {
                     fallback_contains_stack_placeholder(symbols, base)
                 }
-                CExpr::Call { func, args } => {
+                CExpr::Call { func, args, .. } => {
                     fallback_contains_stack_placeholder(symbols, func)
                         || args.iter().any(|e| fallback_contains_stack_placeholder(symbols, e))
                 }

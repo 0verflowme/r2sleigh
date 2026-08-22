@@ -4489,7 +4489,7 @@ impl<'a> FoldingContext<'a> {
             CExpr::Member { base, .. } | CExpr::PtrMember { base, .. } => {
                 self.expr_contains_synthetic_stack_placeholder(base)
             }
-            CExpr::Call { func, args } => {
+            CExpr::Call { func, args, .. } => {
                 self.expr_contains_synthetic_stack_placeholder(func)
                     || args
                         .iter()
@@ -7689,8 +7689,9 @@ impl<'a> FoldingContext<'a> {
                 CExpr::Call {
                     func: candidate_func,
                     args: candidate_args,
+                    ..
                 },
-                CExpr::Call { func, args },
+                CExpr::Call { func, args, .. },
             ) => {
                 let candidate_identity = candidate_source_call
                     .and_then(|(block_addr, op_idx)| {
@@ -7828,7 +7829,7 @@ impl<'a> FoldingContext<'a> {
         source_call: (u64, usize),
         expr: CExpr,
     ) -> CExpr {
-        let CExpr::Call { func, args } = expr else {
+        let CExpr::Call { func, args, .. } = expr else {
             return expr;
         };
         let func = self
@@ -8317,7 +8318,7 @@ impl<'a> FoldingContext<'a> {
             CExpr::Member { base, .. } | CExpr::PtrMember { base, .. } => {
                 self.expr_contains_raw_stack_base_arithmetic(base)
             }
-            CExpr::Call { func, args } => {
+            CExpr::Call { func, args, .. } => {
                 self.expr_contains_raw_stack_base_arithmetic(func)
                     || args
                         .iter()
@@ -8371,7 +8372,7 @@ impl<'a> FoldingContext<'a> {
                     || self.expr_is_address_artifact_in_scalar_context(left)
                     || self.expr_is_address_artifact_in_scalar_context(right)
             }
-            CExpr::Call { func, args } => {
+            CExpr::Call { func, args, .. } => {
                 self.expr_is_address_artifact_in_scalar_context(func)
                     || args
                         .iter()
@@ -8696,7 +8697,7 @@ impl<'a> FoldingContext<'a> {
                 self.accumulate_visible_expr_quality(left, quality, depth + 1, context);
                 self.accumulate_visible_expr_quality(right, quality, depth + 1, context);
             }
-            CExpr::Call { func, args } => {
+            CExpr::Call { func, args, .. } => {
                 self.accumulate_visible_expr_quality(func, quality, depth + 1, context);
                 for arg in args {
                     self.accumulate_visible_expr_quality(arg, quality, depth + 1, context);
@@ -10380,7 +10381,8 @@ impl<'a> FoldingContext<'a> {
                 then_expr: Box::new(self.semanticize_visible_expr(then_expr, depth + 1, visited)),
                 else_expr: Box::new(self.semanticize_visible_expr(else_expr, depth + 1, visited)),
             },
-            CExpr::Call { func, args } => CExpr::Call {
+            CExpr::Call { func, args, site } => CExpr::Call {
+                site: *site,
                 func: Box::new(self.semanticize_visible_expr(func, depth + 1, visited)),
                 args: args
                     .iter()
@@ -11023,7 +11025,8 @@ impl<'a> FoldingContext<'a> {
                 then_expr: Box::new(self.expand_call_arg_expr(then_expr, depth + 1, visited)),
                 else_expr: Box::new(self.expand_call_arg_expr(else_expr, depth + 1, visited)),
             },
-            CExpr::Call { func, args } => CExpr::Call {
+            CExpr::Call { func, args, site } => CExpr::Call {
+                site: *site,
                 func: Box::new(self.expand_call_arg_expr(func, depth + 1, visited)),
                 args: args
                     .iter()
@@ -11104,7 +11107,7 @@ impl<'a> FoldingContext<'a> {
             CExpr::Member { base, .. } | CExpr::PtrMember { base, .. } => {
                 self.call_arg_contains_stack_placeholder(base, depth + 1)
             }
-            CExpr::Call { func, args } => {
+            CExpr::Call { func, args, .. } => {
                 self.call_arg_contains_stack_placeholder(func, depth + 1)
                     || args
                         .iter()
@@ -11156,7 +11159,7 @@ impl<'a> FoldingContext<'a> {
             CExpr::Member { base, .. } | CExpr::PtrMember { base, .. } => {
                 self.call_arg_contains_transient_name(base, depth + 1)
             }
-            CExpr::Call { func, args } => {
+            CExpr::Call { func, args, .. } => {
                 self.call_arg_contains_transient_name(func, depth + 1)
                     || args
                         .iter()
@@ -11210,7 +11213,7 @@ impl<'a> FoldingContext<'a> {
             CExpr::Member { base, .. } | CExpr::PtrMember { base, .. } => {
                 self.call_arg_contains_low_quality_name(base, depth + 1)
             }
-            CExpr::Call { func, args } => {
+            CExpr::Call { func, args, .. } => {
                 self.call_arg_contains_low_quality_name(func, depth + 1)
                     || args
                         .iter()
@@ -11606,7 +11609,7 @@ impl<'a> FoldingContext<'a> {
                     visited,
                 )),
             },
-            CExpr::Call { func, args } => {
+            CExpr::Call { func, args, site } => {
                 let resolved_func = self.resolve_imported_call_arg_expr(func, depth + 1, visited);
                 let resolved_args = args
                     .iter()
@@ -11615,6 +11618,7 @@ impl<'a> FoldingContext<'a> {
                 CExpr::Call {
                     func: Box::new(resolved_func),
                     args: resolved_args,
+                    site: *site,
                 }
             }
             CExpr::Subscript { base, index } => CExpr::Subscript {
@@ -11993,10 +11997,11 @@ impl<'a> FoldingContext<'a> {
             expr,
             FinalExprNormalizeContext::DefinitionRoot,
         );
-        let CExpr::Call { func, args } = normalized else {
+        let CExpr::Call { func, args, site } = normalized else {
             return self.sanitize_public_expr(normalized, PublicExprSanitizeMode::CallArg);
         };
         CExpr::Call {
+            site,
             func: Box::new(self.sanitize_public_expr(*func, PublicExprSanitizeMode::Generic)),
             args: args
                 .into_iter()
@@ -12061,10 +12066,11 @@ impl<'a> FoldingContext<'a> {
                 base: Box::new(self.sanitize_public_expr(*base, mode)),
                 member,
             },
-            CExpr::Call { func, args } if matches!(mode, PublicExprSanitizeMode::CallArg) => {
-                self.sanitize_public_call_arg_call_expr(CExpr::Call { func, args })
+            CExpr::Call { func, args, site } if matches!(mode, PublicExprSanitizeMode::CallArg) => {
+                self.sanitize_public_call_arg_call_expr(CExpr::Call { func, args, site })
             }
-            CExpr::Call { func, args } => CExpr::Call {
+            CExpr::Call { func, args, site } => CExpr::Call {
+                site,
                 func: Box::new(self.sanitize_public_expr(*func, PublicExprSanitizeMode::Generic)),
                 args: args
                     .into_iter()
@@ -12188,7 +12194,7 @@ impl<'a> FoldingContext<'a> {
                     self.normalize_final_call_expr_in_scope(right, right_scope),
                 )
             }
-            CExpr::Call { func, args } => {
+            CExpr::Call { func, args, .. } => {
                 let func = scope
                     .source_call
                     .and_then(|(block_addr, op_idx)| {
@@ -12259,6 +12265,7 @@ impl<'a> FoldingContext<'a> {
                 let call = CExpr::Call {
                     func: Box::new(func),
                     args,
+                    site: scope.source_call,
                 };
                 if !matches!(scope.context, FinalExprNormalizeContext::DefinitionRoot)
                     && let Some(owner) = scope.source_call.and_then(|source_call| {

@@ -36,7 +36,7 @@ impl<'a> FoldingContext<'a> {
                     || self.call_arg_expr_is_unresolved_fallback(then_expr)
                     || self.call_arg_expr_is_unresolved_fallback(else_expr)
             }
-            CExpr::Call { func, args } => {
+            CExpr::Call { func, args, .. } => {
                 self.call_arg_expr_is_unresolved_fallback(func)
                     || args.iter().any(|a| self.call_arg_expr_is_unresolved_fallback(a))
             }
@@ -592,6 +592,7 @@ impl<'a> FoldingContext<'a> {
             && let analysis::SemanticCallArg::FallbackExpr(CExpr::Call {
                 func,
                 args: original_args,
+                ..
             }) = binding.arg.clone()
         {
             let should_rebuild = original_args.iter().any(|arg| {
@@ -1479,7 +1480,7 @@ impl<'a> FoldingContext<'a> {
             CExpr::Member { base, .. } | CExpr::PtrMember { base, .. } => {
                 self.expr_contains_prepared_owner_alias(base, depth + 1)
             }
-            CExpr::Call { func, args } => {
+            CExpr::Call { func, args, .. } => {
                 self.expr_contains_prepared_owner_alias(func, depth + 1)
                     || args
                         .iter()

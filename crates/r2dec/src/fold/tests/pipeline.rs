@@ -1429,7 +1429,7 @@ mod tests {
             }
             CExpr::Member { base, .. } => expr_contains_flag_artifact(ctx, base),
             CExpr::PtrMember { base, .. } => expr_contains_flag_artifact(ctx, base),
-            CExpr::Call { func, args } => {
+            CExpr::Call { func, args, .. } => {
                 expr_contains_flag_artifact(ctx, func) || args.iter().any(|a| expr_contains_flag_artifact(ctx, a))
             }
             _ => false,
@@ -1455,7 +1455,7 @@ mod tests {
             CExpr::Member { base, .. } | CExpr::PtrMember { base, .. } => {
                 expr_contains_var(ctx, base, target)
             }
-            CExpr::Call { func, args } => {
+            CExpr::Call { func, args, .. } => {
                 expr_contains_var(ctx, func, target)
                     || args.iter().any(|arg| expr_contains_var(&ctx, arg, target))
             }
@@ -1496,7 +1496,7 @@ mod tests {
             CExpr::Member { base, .. } | CExpr::PtrMember { base, .. } => {
                 expr_contains_addr_of(base)
             }
-            CExpr::Call { func, args } => {
+            CExpr::Call { func, args, .. } => {
                 expr_contains_addr_of(func) || args.iter().any(expr_contains_addr_of)
             }
             CExpr::Ternary {
@@ -1553,7 +1553,7 @@ mod tests {
             }
             CExpr::Member { base, .. } => expr_contains_sub_zero_cmp_scaffold(base),
             CExpr::PtrMember { base, .. } => expr_contains_sub_zero_cmp_scaffold(base),
-            CExpr::Call { func, args } => {
+            CExpr::Call { func, args, .. } => {
                 expr_contains_sub_zero_cmp_scaffold(func)
                     || args.iter().any(expr_contains_sub_zero_cmp_scaffold)
             }
@@ -1813,7 +1813,7 @@ mod tests {
 
         assert_eq!(
             normalized,
-            CExpr::call(
+            CExpr::call_at(source_call, 
                 CExpr::External {
                     name: "sym.imp.one_arg".to_string(),
                     kind: crate::symbol::ExternalKind::Import,
@@ -1855,7 +1855,7 @@ mod tests {
 
         assert_eq!(
             normalized,
-            CExpr::call(
+            CExpr::call_at((0x1000, 0), 
                 CExpr::External {
                     name: "sym.poisoned".to_string(),
                     kind: crate::symbol::ExternalKind::Function,
@@ -1892,7 +1892,7 @@ mod tests {
 
         assert_eq!(
             normalized,
-            CExpr::call(CExpr::External { name: "sym.helper".to_string(), kind: crate::symbol::ExternalKind::Function }, vec![CExpr::IntLit(7)]),
+            CExpr::call_at((0x1000, 0), CExpr::External { name: "sym.helper".to_string(), kind: crate::symbol::ExternalKind::Function }, vec![CExpr::IntLit(7)]),
             "typed callsite resolution must outrank rendered callee text"
         );
     }
@@ -1937,7 +1937,7 @@ mod tests {
 
         assert_eq!(
             normalized,
-            CExpr::call(
+            CExpr::call_at(source_call, 
                 CExpr::External {
                     name: "sym.local.helper".to_string(),
                     kind: crate::symbol::ExternalKind::Function,
@@ -2145,7 +2145,7 @@ mod tests {
                 rendered_local_logger,
                 FinalExprNormalizeContext::DefinitionRoot,
             ),
-            CExpr::call(
+            CExpr::call_at(imported_source, 
                 CExpr::External {
                     name: "sym.imp.printf".to_string(),
                     kind: crate::symbol::ExternalKind::Import,
@@ -2192,7 +2192,7 @@ mod tests {
                 poisoned_printf,
                 FinalExprNormalizeContext::DefinitionRoot,
             ),
-            CExpr::call(
+            CExpr::call_at((0x1000, 1), 
                 CExpr::External {
                     name: "sym.local_logger".to_string(),
                     kind: crate::symbol::ExternalKind::Function,
@@ -2542,7 +2542,7 @@ mod tests {
                 poisoned.clone(),
                 FinalExprNormalizeContext::DefinitionRoot,
             ),
-            CExpr::call(
+            CExpr::call_at(source_call, 
                 CExpr::External {
                     name: "sym.imp.one_arg".to_string(),
                     kind: crate::symbol::ExternalKind::Import,
@@ -2659,7 +2659,7 @@ mod tests {
             ),
             CExpr::cast(
                 CType::Int(64),
-                CExpr::call(
+                CExpr::call_at(source_call, 
                     CExpr::External {
                         name: "sym.imp.one_arg".to_string(),
                         kind: crate::symbol::ExternalKind::Import,
@@ -2755,7 +2755,7 @@ mod tests {
 
         assert_eq!(
             ctx.recovered_owned_call_result_definition_rhs_for_visible_name({ let CExpr::Var(id) = ctx.name_ref("owned_result") else { unreachable!() }; id }),
-            Some(CExpr::call(
+            Some(CExpr::call_at(source_call, 
                 CExpr::External {
                     name: "sym.imp.one_arg".to_string(),
                     kind: crate::symbol::ExternalKind::Import,
@@ -2892,7 +2892,7 @@ mod tests {
 
         assert_eq!(
             ctx.recovered_owned_call_result_definition_rhs("owned_result", &source_expr),
-            Some(CExpr::call(
+            Some(CExpr::call_at(source_call, 
                 CExpr::External {
                     name: "sym.imp.one_arg".to_string(),
                     kind: crate::symbol::ExternalKind::Import,
@@ -2911,7 +2911,7 @@ mod tests {
                 "owned_result",
                 &CExpr::Paren(Box::new(source_expr)),
             ),
-            Some(CExpr::call(
+            Some(CExpr::call_at((0x1000, 0), 
                 CExpr::External {
                     name: "sym.imp.one_arg".to_string(),
                     kind: crate::symbol::ExternalKind::Import,
@@ -2971,7 +2971,7 @@ mod tests {
                 "owned_result",
                 &ctx.name_ref("tmp_result"),
             ),
-            Some(CExpr::call(
+            Some(CExpr::call_at((0x1000, 0), 
                 CExpr::External {
                     name: "sym.imp.one_arg".to_string(),
                     kind: crate::symbol::ExternalKind::Import,
@@ -4940,7 +4940,7 @@ mod tests {
         assert!(matches!(render(SpaceId::Ram), CExpr::Deref(_)));
         assert!(matches!(
             render(SpaceId::Custom(7)),
-            CExpr::Call { ref func, ref args }
+            CExpr::Call { ref func, ref args, .. }
                 if **func == ctx.name_ref("r2s_unsupported_space_load")
                     && args.first() == Some(&CExpr::StringLit("space7".to_string()))
         ));
@@ -10258,7 +10258,7 @@ mod tests {
             .op_to_stmt_with_args(&block.ops[2], block.addr, 2)
             .expect("call stmt");
 
-        let CStmt::Expr(CExpr::Call { func, args }) = stmt else {
+        let CStmt::Expr(CExpr::Call { func, args, .. }) = stmt else {
             panic!("expected certified call expression, got {stmt:?}");
         };
         assert_eq!(
@@ -10366,7 +10366,7 @@ mod tests {
             .op_to_stmt_with_args(&block.ops[2], block.addr, 2)
             .expect("certified call stmt");
 
-        let CStmt::Expr(CExpr::Call { func, args }) = stmt else {
+        let CStmt::Expr(CExpr::Call { func, args, .. }) = stmt else {
             panic!("expected certified call expression, got {stmt:?}");
         };
         assert_eq!(
@@ -10591,7 +10591,7 @@ mod tests {
             .op_to_stmt_with_args(&block.ops[0], block.addr, 0)
             .expect("certified call stmt");
 
-        let CStmt::Expr(CExpr::Call { func, args }) = stmt else {
+        let CStmt::Expr(CExpr::Call { func, args, .. }) = stmt else {
             panic!("expected certified zero-arg call, got {stmt:?}");
         };
         assert_eq!(

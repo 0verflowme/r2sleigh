@@ -1784,7 +1784,7 @@ mod tests {
         assert!(
             matches!(
                 expr,
-                CExpr::Call { ref func, ref args }
+                CExpr::Call { ref func, ref args, .. }
                     if **func == crate::symbol::var_ref(&symbols, "r2s_unsupported_space_load")
                         && args.first() == Some(&CExpr::StringLit("space7".to_string()))
             ),
@@ -1844,7 +1844,7 @@ mod tests {
         assert!(matches!(ram, CExpr::Deref(_)));
         assert!(matches!(
             custom,
-            CExpr::Call { ref func, ref args }
+            CExpr::Call { ref func, ref args, .. }
                 if **func == crate::symbol::var_ref(&symbols, "r2s_unsupported_space_load")
                     && args.first() == Some(&CExpr::StringLit("space7".to_string()))
         ));
