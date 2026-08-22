@@ -154,32 +154,7 @@ impl<'a> LowerCtx<'a> {
     }
 
     pub(crate) fn var_name(&self, var: &SSAVar) -> String {
-        if var.is_const() {
-            let val = parse_const_value(&var.name).unwrap_or(0);
-            return crate::codegen::format_unsigned_literal(val);
-        }
-
-        let display = var.display_name();
-        if let Some(alias) = self.var_alias_for_name(&display) {
-            return alias.clone();
-        }
-
-        if var.version == 0
-            && let Some(alias) = self
-                .param_register_aliases
-                .get(&var.name.to_ascii_lowercase())
-                .cloned()
-        {
-            return alias;
-        }
-
-        let base = ssa_render_base_name(var);
-
-        if var.version > 0 {
-            format!("{}_{}", base, var.version)
-        } else {
-            base
-        }
+        crate::naming::spell_var(var, self)
     }
 
     pub(crate) fn get_expr(&self, var: &SSAVar) -> CExpr {
@@ -2239,5 +2214,21 @@ mod tests {
             matches!(index.as_ref(), CExpr::Var(name) if &*crate::symbol::spelling(&symbols, *name) == "arg2"),
             "subscript index should use the semantic index source, not the pointer local alias: {index:?}"
         );
+    }
+}
+
+impl crate::naming::NameSource for LowerCtx<'_> {
+    fn carrier_alias(&self, _display: &str) -> Option<String> {
+        None
+    }
+
+    fn var_alias(&self, display: &str) -> Option<String> {
+        self.var_alias_for_name(display).cloned()
+    }
+
+    fn param_alias(&self, register: &str) -> Option<String> {
+        self.param_register_aliases
+            .get(&register.to_ascii_lowercase())
+            .cloned()
     }
 }

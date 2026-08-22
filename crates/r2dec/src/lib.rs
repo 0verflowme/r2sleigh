@@ -39,6 +39,7 @@ pub(crate) mod consumer_vm;
 pub mod control;
 pub(crate) mod fold;
 pub mod highlight;
+pub(crate) mod naming;
 pub(crate) mod normalize;
 pub(crate) mod planner;
 pub(crate) mod post_rename;

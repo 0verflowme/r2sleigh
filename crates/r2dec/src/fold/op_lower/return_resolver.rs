@@ -1300,37 +1300,7 @@ impl<'a> FoldingContext<'a> {
 
     /// Convert an SSA variable to a C variable name.
     pub fn var_name(&self, var: &SSAVar) -> String {
-        if var.is_const() {
-            // Return the constant value directly
-            let val = parse_const_value(&var.name).unwrap_or(0);
-            if val > 0xffff {
-                return format!("0x{:x}", val);
-            } else {
-                return format!("{}", val);
-            }
-        }
-
-        // Check if coalescing mapped this SSA name to a merged name
-        let display = var.display_name();
-        if let Some(alias) = self.var_aliases_map().get(&display) {
-            return self
-                .canonicalize_stack_name(alias)
-                .unwrap_or_else(|| alias.clone());
-        }
-
-        if var.version == 0
-            && let Some(alias) = self.arg_alias_for_register_name(&var.name)
-        {
-            return alias;
-        }
-
-        let base = ssa_render_base_name(var);
-
-        if var.version > 0 {
-            format!("{}_{}", base, var.version)
-        } else {
-            base
-        }
+        crate::naming::spell_var(var, self)
     }
 
     /// Convert a constant variable to a C expression.
@@ -1341,5 +1311,23 @@ impl<'a> FoldingContext<'a> {
         } else {
             CExpr::IntLit(val as i64)
         }
+    }
+}
+
+impl crate::naming::NameSource for FoldingContext<'_> {
+    fn carrier_alias(&self, display: &str) -> Option<String> {
+        self.carrier_aliases.get(display).cloned()
+    }
+
+    fn var_alias(&self, display: &str) -> Option<String> {
+        self.var_aliases_map().get(display).cloned()
+    }
+
+    fn param_alias(&self, register: &str) -> Option<String> {
+        self.arg_alias_for_register_name(register)
+    }
+
+    fn canonical_stack_name(&self, alias: &str) -> Option<String> {
+        self.canonicalize_stack_name(alias)
     }
 }

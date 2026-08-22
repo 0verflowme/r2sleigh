@@ -44,6 +44,7 @@ pub(crate) struct PreparedCallView {
 pub(crate) struct PreparedSemanticView {
     pub(crate) stack_aliases_by_offset: BTreeMap<i64, StackAliasView>,
     pub(crate) param_alias_by_reg: HashMap<String, String>,
+    pub(crate) carrier_alias_by_name: HashMap<String, String>,
     pub(crate) param_rank_by_alias: HashMap<String, usize>,
     pub(crate) value_id_by_var: HashMap<SSAVar, ValueId>,
     pub(crate) var_by_value_id: HashMap<ValueId, SSAVar>,
@@ -113,6 +114,10 @@ impl PreparedSemanticView {
         let certified_rendering_required = false;
         let mut view = Self {
             param_alias_by_reg: inputs.param_register_aliases.clone(),
+            carrier_alias_by_name: match inputs.function_facts.render() {
+                Some(render) => crate::normalize::carrier_name_aliases(inputs.prepared, render),
+                None => HashMap::new(),
+            },
             certified_rendering_required,
             member_projected_accesses: inputs
                 .prepared
@@ -2300,7 +2305,7 @@ fn expr_for_compare_operand_with_width(symbols: &std::cell::RefCell<crate::symbo
     }
 
     if let Some(expr) =
-        prepared_fallback_visible_expr(symbols, &root).or_else(|| prepared_fallback_visible_expr(symbols, &var))
+        prepared_fallback_visible_expr(symbols, view, &root).or_else(|| prepared_fallback_visible_expr(symbols, view, &var))
     {
         return expr;
     }
@@ -2760,7 +2765,7 @@ fn prepared_address_owner_expr_for_value(symbols: &std::cell::RefCell<crate::sym
     compare_width: u32,
 ) -> Option<CExpr> {
     scalar_owner_expr_for_value(symbols, view, var, compare_width).or_else(|| {
-        prepared_fallback_visible_expr(symbols, var).filter(|expr| {
+        prepared_fallback_visible_expr(symbols, view, var).filter(|expr| {
             matches!(
                 expr,
                 CExpr::Var(name) if crate::registers::register_family_name(&crate::symbol::spelling(symbols, *name)).is_some()
@@ -2776,7 +2781,7 @@ fn prepared_scaled_index_owner_expr(symbols: &std::cell::RefCell<crate::symbol::
 ) -> Option<CExpr> {
     scalar_owner_expr_for_value(symbols, view, var, compare_width)
         .or_else(|| generic_prepared_owner_expr(view, var))
-        .or_else(|| prepared_fallback_visible_expr(symbols, var))
+        .or_else(|| prepared_fallback_visible_expr(symbols, view, var))
 }
 
 fn is_prepared_stack_address_carrier(prepared: &SsaArtifact, value: &SSAVar) -> bool {
@@ -2820,7 +2825,7 @@ fn non_generic_prepared_predicate_expr(symbols: &std::cell::RefCell<crate::symbo
         .filter(|expr| !prepared_expr_is_generic_scalar_alias(symbols, expr))
 }
 
-fn prepared_fallback_visible_expr(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, var: &SSAVar) -> Option<CExpr> {
+fn prepared_fallback_visible_expr(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, view: &PreparedSemanticView, var: &SSAVar) -> Option<CExpr> {
     if var.is_const() {
         return None;
     }
@@ -2835,11 +2840,7 @@ fn prepared_fallback_visible_expr(symbols: &std::cell::RefCell<crate::symbol::Sy
     // definition with eleven readers looked unread and was deleted, leaving the
     // readers naming nothing. Version zero stays bare, as it does everywhere:
     // that is the value the function was entered with.
-    Some(crate::symbol::var_ref(symbols, if var.version > 0 {
-        format!("{}_{}", var.name, var.version)
-    } else {
-        var.name.clone()
-    }))
+    Some(crate::symbol::var_ref(symbols, crate::naming::spell_var(var, view)))
 }
 
 fn local_store_owner_expr_for_offset(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
@@ -5132,28 +5133,29 @@ mod tests {
     #[test]
     fn prepared_fallback_visible_expr_rejects_only_unrenderable_storage_names() {
         let symbols = test_table();
+        let view = PreparedSemanticView::default();
         assert_eq!(
-            prepared_fallback_visible_expr(&symbols, &SSAVar::constant(1, 8)),
+            prepared_fallback_visible_expr(&symbols, &view, &SSAVar::constant(1, 8)),
             None
         );
         assert_eq!(
-            prepared_fallback_visible_expr(&symbols, &test_var("tmp:1", 0, 8)),
+            prepared_fallback_visible_expr(&symbols, &view, &test_var("tmp:1", 0, 8)),
             None
         );
         assert_eq!(
-            prepared_fallback_visible_expr(&symbols, &test_var("ram:401000", 0, 8)),
+            prepared_fallback_visible_expr(&symbols, &view, &test_var("ram:401000", 0, 8)),
             None
         );
         assert_eq!(
-            prepared_fallback_visible_expr(&symbols, &test_var("unique:1", 0, 8)),
+            prepared_fallback_visible_expr(&symbols, &view, &test_var("unique:1", 0, 8)),
             None
         );
         assert_eq!(
-            prepared_fallback_visible_expr(&symbols, &test_var("space1:20", 0, 8)),
+            prepared_fallback_visible_expr(&symbols, &view, &test_var("space1:20", 0, 8)),
             Some(crate::symbol::var_ref(&symbols, "space1:20"))
         );
         assert_eq!(
-            prepared_fallback_visible_expr(&symbols, &test_var("rax", 0, 8)),
+            prepared_fallback_visible_expr(&symbols, &view, &test_var("rax", 0, 8)),
             Some(crate::symbol::var_ref(&symbols, "rax"))
         );
     }
@@ -5325,5 +5327,21 @@ mod tests {
             if_true: test_var("W0", 1, 4),
             if_false: test_var("W1", 1, 4),
         }));
+    }
+}
+
+impl crate::naming::NameSource for PreparedSemanticView {
+    fn carrier_alias(&self, display: &str) -> Option<String> {
+        self.carrier_alias_by_name.get(display).cloned()
+    }
+
+    fn var_alias(&self, _display: &str) -> Option<String> {
+        None
+    }
+
+    fn param_alias(&self, register: &str) -> Option<String> {
+        self.param_alias_by_reg
+            .get(&register.to_ascii_lowercase())
+            .cloned()
     }
 }
