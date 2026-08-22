@@ -1047,3 +1047,27 @@ rather than by touching normalisation again.
 
 All three attempts were reverted. Two were inert and one was worse, and the
 measurements above are the whole value of the exercise.
+
+### The carrier return is fixed for full-width carriers only
+
+`sym._fnv1a64` renders `return x0` and updates the carrier in the loop body. The
+fix is in two halves: `carrier_name_aliases` counts the post-loop merge as a
+member of the carrier, and `merged_return_register_candidate_for_block` asks for
+the variable rather than resolving the merge through its sources.
+
+`sum32` still answers `0`, and it is not the same defect. Its machine code says
+why:
+
+    mov  w8, 0          accumulator is w8, 32 bits
+    add  w8, w9, w8     the update writes W8
+    mov  x0, x8         the exit copies X8, 64 bits, into the return register
+
+The carrier phi is on `X8` while every update writes `W8`, so the update is not
+among the carrier's certified values and the loop body renders without it. That
+is the sub-register width layer, not the return path -- the same layer x86 needs,
+reached on arm64 whenever the accumulator is a `w` register.
+
+So the rule is: this fix completes the carrier return **for carriers that are
+full width throughout**. A carrier written at a narrower width than its phi needs
+the width layer first, and that is the location model rather than anything in the
+return resolver.
