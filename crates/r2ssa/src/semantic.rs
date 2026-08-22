@@ -6328,6 +6328,14 @@ fn stack_object_root(objects: &ObjectModel, object: ObjectId) -> Option<(StackAd
 }
 
 fn call_argument_value_for_op(op: &SSAOp, graph: &SsaGraph) -> Option<(usize, ValueId, String)> {
+    // A call defines every register the callee may destroy, and those
+    // definitions are emitted after it, so the walk back from the next call
+    // reaches them before it reaches the call that made them. Their
+    // destinations are argument registers, but they are what a call leaves
+    // behind rather than what the next one was given.
+    if matches!(op, SSAOp::CallDefine { .. }) {
+        return None;
+    }
     let dst = op.dst()?;
     let index = canonical_abi_arg_index(&dst.name)?;
     let source = match op {
