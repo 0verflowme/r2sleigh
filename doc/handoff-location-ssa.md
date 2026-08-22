@@ -1307,3 +1307,15 @@ it allocates, it is the key of most of these maps, and it is called from every
 predicate in the profile above. Removing that allocation -- interning the name,
 or keying the maps by `ValueId`, which the graph already assigns -- is the change
 the profile points to, and it is wide rather than deep.
+
+Two further local changes were measured on this thread and rejected. Selecting
+rather than sorting in `find_ssa_name_for_rendered_alias` is 7.6s to 7.1s and
+19.9s to 19.5s. Skipping `to_uppercase` in `display_name` when the name is
+already uppercase -- which is nearly always, and which allocates a second string
+only to discover it -- is 7.6s to 7.6s and 19.9s to 20.0s.
+
+Three local changes, three noise-level results. The cost is genuinely spread
+across the map lookups themselves rather than sitting in any one of them, so the
+only change that will move it is keying those maps by `ValueId` instead of by a
+freshly built `String`. The graph already assigns the identifiers; what is
+missing is that the fold's tables do not use them.
