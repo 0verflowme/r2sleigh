@@ -2123,3 +2123,31 @@ the one with the callee identity and the certified arguments; the analysis form
 exists because the analysis layer needs *a* expression for its tables, and the
 fix is that those tables should hold the same expression the body will contain
 rather than a second one built for the purpose.
+
+### Suppressing call expressions in the analysis definitions is not enough
+
+The obvious reading of the diagnosis was tested: stop `populate_prepared_render_definitions`
+from storing any definition whose expression contains a call, on the grounds that
+the fold renders calls and a second copy only gets inlined.
+
+It removes the `_work_result` binding, and it is net worse:
+
+    uint64_t t12280_3 = tregalias_100000460_81_0 + arg1
+        + sym__other(sym__work(..) + arg0);
+
+A `tmp:regalias` temporary leaks into the body where the definition used to
+stand, `sym__work` is still there, and undefined names go from two to three.
+Reverted.
+
+Two things it establishes. The `Var`-callee calls are not only in `definitions` --
+`semantic_values` holds them too, and suppressing one table leaves the other. And
+a definition carrying a call is doing real work: removing it without providing
+the fold's expression in its place leaves the consumer with nothing, which is
+where the leaked temporary comes from.
+
+**So the fix is a substitution, not a suppression.** The analysis tables must
+hold *the fold's* call expression rather than either their own or nothing, which
+means the fold's construction has to happen before or during the analysis that
+populates those tables -- or the tables must be filled from the fold afterwards,
+before anything reads them. That ordering question is the actual design decision
+in open item 1, and it is the first thing to settle.
