@@ -1672,3 +1672,28 @@ first is who consumes it, because the definition table is read from many places.
 
 The measure to watch is the ledger on `/tmp/xmmfix/callsmain`: 144 obligations,
 47 rendered, **85 refused** today.
+
+### Correction: `lower.rs:448` is not the second rendering
+
+The entry above named `SSAOp::Call { target } => CExpr::call(self.get_expr(target), vec![])`
+as the source of the duplicate. It is not. Replacing that line's callee with a
+marker external and rebuilding leaves the rendering identical -- no marker
+anywhere in the output -- so nothing that reaches the page comes through it.
+
+The elimination is worth keeping, and so is the reason the guess was wrong:
+`SSAOp::Call` carries only a target and has no destination, so
+`populate_prepared_render_definitions` never stores its expression, and the
+definition table cannot be the second renderer. That was checkable by reading the
+recorder's `let Some(dst) = op.dst() else { continue }` and I did not check it.
+
+What is still true and still unexplained: two spellings reach the output for one
+call.
+
+    sym._work(...)     an External callee
+    sym__work(...)     a Var callee, lowercased with its dot replaced
+
+The second is a `CExpr::Var`, so something builds a call whose callee is a
+variable named after the symbol. **Find it by marking rather than reading**: give
+`CExpr::call` sites in the fold a distinguishing callee and see which marker
+reaches the page, exactly as above. That took one build to eliminate a candidate
+and will take one more to find the real one.
