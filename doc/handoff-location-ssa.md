@@ -2534,3 +2534,33 @@ rendered assignment.
 Twelve interventions have now been measured on this defect and every one was
 inert; every trace has narrowed it by one step. The next person should take the
 trace and not write a guard until it prints.
+
+### The operand is `tmp:12180_2`, and the add survives to the body
+
+The trace one step further down:
+
+    tmp:12280_2 = tmp:24e00_2 + tmp:12180_2
+        expr = Binary { op: Add, left: Var(..), right: Var(..) }
+    X8_3 = ZEXT(tmp:12280_2)
+        expr = Cast { ty: Int(64), expr: Var(..) }
+
+**The add is intact when its definition is recorded** -- two `Var` operands, not a
+constant in sight. So nothing folds it there. One operand must *render* as zero
+later and then be simplified away by `x + 0 -> x`, and the operand in question is
+`tmp:12180_2`, the narrow read of the carrier.
+
+That completes the chain end to end:
+
+    X8_1 = 0                      the initialiser
+    X8_2 = COPY X8_1              the edge materialisation inserted, definition 0
+    tmp:12180_2                   a narrow read of the carrier
+    tmp:12280_2 = tmp:24e00_2 + tmp:12180_2
+    X8_3 = ZEXT(tmp:12280_2)      the update
+
+and identifies the single value to look at: **`tmp:12180_2` renders as `0` and
+should render as the carrier.** Suppressing `X8_2`'s definition did not achieve
+that, so `tmp:12180_2` has its own recorded expression derived from the same
+initialiser, and the trace to take is the one above filtered on `12180`.
+
+Twelve interventions inert, five traces each narrowing by a step, and the target
+is now one named SSA value rather than a layer. That is where this ends today.
