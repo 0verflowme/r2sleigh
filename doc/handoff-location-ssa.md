@@ -2601,3 +2601,24 @@ renders as the carrier, and `x8 = x8 + *arg0` follows.
 
 Thirteen interventions were measured on this defect and every one was inert; six
 traces each narrowed it by one step and the sixth reached the cause. Take traces.
+
+### Extending the alias map over the walked function is also inert
+
+Both orderings were built: extending `carrier_aliases` transitively through
+`Copy` and `Subpiece` over the blocks the fold walks, first after the facts are
+recorded and then before them. Neither changes `sum32`. Reverted.
+
+So the closure does not reach `tmp:regalias:80:4:0_1` even when it is run over
+the function that contains it, which means either the repair temporaries are not
+in those blocks by then, or their source is not a carrier member under the name
+the map uses. **One print settles which**: dump `carrier_aliases` and the ops of
+the loop block together, at the point `extend_carrier_aliases_over` runs. That is
+the fifteenth intervention's worth of information for the cost of a build, and it
+is the next thing to do.
+
+Fourteen interventions on this defect have now measured inert. Six traces each
+narrowed it and produced, in order: the four-point return chain (fixed, and it is
+why `return x8` renders at all), the operand `tmp:12180_2`, the repair temporary
+behind it, and the observation that the alias map is computed against a different
+function than the fold walks. The cause is understood; what is not is why the
+obvious repair does not take, and that gap is exactly one print wide.
