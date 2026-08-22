@@ -1939,3 +1939,35 @@ it to work around the representation.
 
 Both changes reverted. The bare-statement drop is worth keeping in mind for after
 item 1 lands: it is four lines and it will work then.
+
+### Three call expressions per site, and the index matches a fourth thing
+
+`#[track_caller]` on `CExpr::call`, filtered to external callees, shows both fold
+constructors building the **same** callee:
+
+    extcall fold/op_lower/lowering.rs:94  func=External { name: "sym._work" }
+    extcall fold/op_lower/mod.rs:2962     func=External { name: "sym._work" }
+
+So the earlier claim that they disagree about the callee is withdrawn; they
+agree. The `Var` spelling comes from neither, and the reason is that
+`single_evaluation` is not indexing either of them:
+
+    let mut folded_call_sites = fold_ctx.call_result_exprs_map().clone();
+    ...
+    single_evaluation::bind_each_call_site_once(&mut c_function, &folded_call_sites);
+
+`call_result_exprs_map` is `use_info().call_result_exprs`, built in the analysis
+layer. That is a **third** call expression for the same site, and it is the one
+`introduced_name_for` reads -- which is why the bound name derives from a
+`CExpr::Var` callee while both fold forms carry an `External`.
+
+So one call site has three expressions built in three places, and a pass that
+identifies sites by expression equality is handed the analysis one and asked to
+match the fold's. It cannot, so it binds one and leaves the other, and the two
+spellings on the page are two of the three representations.
+
+**This is the sharpest statement of open item 1 in this document.** Not "nine
+resolvers disagree about precedence" but: the same call is constructed three
+times, by three layers, and nothing says which one is the call. Every attempt at
+the seam fails for that reason, and no amount of work inside `single_evaluation`
+can succeed while it is given a different expression than the body contains.
