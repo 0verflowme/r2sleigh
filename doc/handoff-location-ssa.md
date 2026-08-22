@@ -2738,3 +2738,37 @@ a trace during this defect measured inert. The trap specific to this codebase is
 that a value has several tables that can answer for it, so a fix to one is
 indistinguishable from a wrong fix while another still answers -- count the tables
 first, and change them together.
+
+### fnv1a64's `x8_2`: two identifiers minted for one value
+
+The undefined `x8_2` in fnv1a64's loop is not an SSA name that escaped, and it is
+not a carrier member that missed the alias map. The fold's map is complete:
+
+    maptrace [("X0_2","x0") ... ("X8_1","x8"), ("X8_2","x8"), ("X8_3","x8"),
+              ("X8_4","x8"), ("tmp:7400_2","x8"), ("tmp:regalias:f4:4:0_1","x0")]
+
+Probing the symbol table shows what actually happens. `declare_or_reuse` is
+called twice for the same value, once with `X8_2` and once with `x8_2`, and
+`by_name` is case-sensitive, so **one value gets two identifiers**. Neither call
+went through a speller: several sites pass an SSA display name straight into the
+symbol table, among them `prepared_semantic.rs` lines 1713, 1951, 2094, 2308 and
+`variable.rs:569`.
+
+So this is the naming-layer instance of "one job, many implementations". There
+are at least three spellers -- `LowerCtx::var_name`, the `var_name` in
+`return_resolver.rs`, and `format_traced_name` -- plus a set of call sites that
+use none of them. Only the second consults the carrier map.
+
+**What was ruled out, so it is not retried.** Adding the carrier lookup to
+`LowerCtx::var_name` cannot fix it: instrumenting that function shows it never
+spells an `x8_N` name at all, and threading `carrier_aliases` through all ten
+`LowerCtx` constructions changed no output. Adding the same lookup to the
+`return_resolver` speller also changed nothing. Both were reverted. The fix has
+to be at the sites that bypass the spellers, which means giving them one speller
+to call rather than adding a fourth.
+
+Two measurement mistakes are worth recording because both read as "absence of
+evidence". A release-build `Backtrace` carries no file paths, so grepping its
+output for `r2dec/src/...` discarded every frame and made a probe that had fired
+look silent. And a probe placed on one branch of `format_traced_name` says
+nothing about the branch a register name takes. Print first, filter second.

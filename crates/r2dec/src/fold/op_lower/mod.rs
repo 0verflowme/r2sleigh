@@ -9129,10 +9129,7 @@ impl<'a> FoldingContext<'a> {
         let CExpr::Var(name) = expr else {
             return false;
         };
-        let spelled = self.spelling(*name);
-        self.carrier_aliases
-            .values()
-            .any(|carrier| carrier.as_str() == &*spelled)
+        self.is_carrier_rendered_name(&self.spelling(*name))
     }
 
     fn tracked_return_source_expr(&self, src: &SSAVar) -> CExpr {
