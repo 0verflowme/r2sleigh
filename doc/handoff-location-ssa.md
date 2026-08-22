@@ -2800,3 +2800,63 @@ stands where the counter belongs -- is read with no definition.
 
 The remaining SIMD gap is the largest single number here: `xor_lanes` leaves 33
 of 105 obligations unaccounted on arm64 and 15 of 78 on x86.
+
+### The ledger was not telling the truth, and three defects it was hiding
+
+Four fixes landed together, and the first one changes how every number in this
+document should be read.
+
+**Elisions were recorded only when a debug environment variable asked for them.**
+`note_elided_op_site` returned early unless `R2SLEIGH_DEBUG_UNOWNED` was set, and
+the comment there said the map was read by nothing else. The obligation ledger
+reads it. So every elision the fold performed was reported to the reader as
+*unaccounted*, and the counts quoted throughout this document are wrong in the
+same direction. With the gate gone, arm64 `fnv1a64` reports 34 rendered, 4 elided,
+0 refused and **nothing unaccounted**, where it used to claim four obligations it
+could not explain. They were flags it had deliberately elided all along.
+
+**A wide read of a register whose lanes were written separately resolved to the
+value the function was entered with.** No refusal, no marking, a clean ledger, and
+wrong C: `xor_lanes` rendered `dst[i] = a[i]` on both architectures with the xor
+silently gone. The parts are all present, so the family repair now emits the
+explicit `Piece` its own comment had asked for, combining parts in adjacent pairs
+so every intermediate width is one C can spell. The x86 loop now renders the xor
+and the compare masks it is built from.
+
+**The prune at the end of a block starts its live set empty**, so a definition
+whose readers are in another block looked unread and was deleted -- after its
+render proof had been recorded, which is how the ledger claimed those obligations
+were rendered while twenty-one names dangled. Names another block reads are noted
+before the walk, and the lane definitions render.
+
+**Return recovery was block-local.** A function whose accumulator already sits in
+the return register writes nothing in its epilogue, so x86 `sum32` returned
+`rip_1`. The resolver now walks back to the last write to the return register and
+returns `rax`. arm64 was never affected because its epilogue moves `x8` into `x0`.
+
+**`xor ecx, ecx` was read as evidence of a parameter.** RCX is the fourth integer
+argument register, so the operand of a zeroing idiom made the loop counter print
+as `arg3`, an argument the function never had. A register cleared by cancelling
+itself is not read.
+
+Measured now:
+
+    arm64  fnv1a64    34 rendered,  4 elided, 0 refused,  0 unaccounted, 0 defects
+    arm64  sum32      29 rendered,  4 elided, 0 refused,  1 unaccounted, 0 defects
+    x86    sum32      34 rendered, 13 elided, 1 refused,  2 unaccounted, 0 defects
+    x86    fnv1a64   111 rendered, 18 elided, 1 refused,  2 unaccounted, 1 defect
+    x86    xor_lanes 179 rendered, 39 elided, 0 refused,  4 unaccounted, 21 defects
+    arm64  xor_lanes 632 rendered, 38 elided, 0 refused, 11 unaccounted, 96 defects
+
+**Two things measured inert and were reverted, so they are not retried.** Refusing
+to compose when every part is an entry value does not reduce arm64 `xor_lanes`'s
+96 undefined names, so those lanes are not all entry values and that case needs
+its own trace. And making symbol identity case-insensitive is wrong outright:
+`CONST:4_0` and `const:4_0` are a register-shaped name and an SSA constant, and
+the classifier depends on telling them apart.
+
+Still open, in the order I would take them: the arm64 lane names; the doubled
+induction step (`rcx += 2` where the machine increments once, and the same shape
+as fnv1a64's two `x8++`); the definition skipped on an unverified promise that its
+single reader will inline it (`mod.rs:12755`, whose reader is depth-capped at 2);
+and the spurious third parameter in x86 `sum32`.
