@@ -97,7 +97,6 @@ pub(crate) struct FoldInputs<'a> {
     #[allow(dead_code)]
     pub(crate) certified_rendering_required: bool,
     pub(crate) stack_slots: &'a BTreeMap<StackSlotKey, ExternalStackSlotSpec>,
-    pub(crate) field_access_certificates: &'a [FieldAccessCertificate],
     #[cfg(test)]
     pub(crate) external_stack_vars: &'a HashMap<i64, ExternalStackVarSpec>,
     pub(crate) visible_bindings: &'a [VisibleBinding],
@@ -447,7 +446,6 @@ impl<'a> FoldingContext<'a> {
             #[cfg(test)]
             certified_rendering_required: false,
             stack_slots: EMPTY_STACK_SLOTS.get_or_init(BTreeMap::new),
-            field_access_certificates: EMPTY_FIELD_CERTS.get_or_init(Vec::new),
             #[cfg(test)]
             external_stack_vars: EMPTY_I64_STACK.get_or_init(HashMap::new),
             visible_bindings: EMPTY_VISIBLE_BINDINGS.get_or_init(Vec::new),

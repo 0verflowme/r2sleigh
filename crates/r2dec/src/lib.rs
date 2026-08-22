@@ -3111,7 +3111,6 @@ impl Decompiler {
             #[cfg(test)]
             certified_rendering_required: false,
             stack_slots: &self.context.type_facts().stack_slots,
-            field_access_certificates: &self.context.type_facts().field_access_certificates,
             #[cfg(test)]
             external_stack_vars: &self.context.type_facts().external_stack_vars,
             visible_bindings: &self.context.type_facts().visible_bindings,
@@ -5515,7 +5514,6 @@ mod tests {
             #[cfg(test)]
             certified_rendering_required: false,
             stack_slots: Box::leak(Box::new(BTreeMap::new())),
-            field_access_certificates: &[],
             external_stack_vars: Box::leak(Box::new(HashMap::new())),
             visible_bindings: Box::leak(Box::new(Vec::new())),
             external_type_db: Box::leak(Box::new(ExternalTypeDb::default())),

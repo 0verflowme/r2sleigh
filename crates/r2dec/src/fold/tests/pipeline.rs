@@ -822,7 +822,6 @@ mod tests {
             function_facts: empty_function_facts(),
             certified_rendering_required: false,
             stack_slots: empty_stack_slots,
-            field_access_certificates: &[],
             external_stack_vars: empty_stack,
             visible_bindings: empty_visible,
             external_type_db: Box::leak(Box::new(r2types::ExternalTypeDb::default())),
@@ -872,7 +871,6 @@ mod tests {
             function_facts: empty_function_facts(),
             certified_rendering_required: false,
             stack_slots: empty_stack_slots,
-            field_access_certificates: &[],
             external_stack_vars: empty_stack,
             visible_bindings: empty_visible,
             external_type_db: Box::leak(Box::new(r2types::ExternalTypeDb::default())),
@@ -12059,13 +12057,6 @@ mod tests {
             });
         let mut ctx = make_x86_64_ctx_with_prepared(&prepared);
         install_hash_field_layout(&mut ctx);
-        ctx.inputs.field_access_certificates = Box::leak(Box::new(
-            prepared
-                .function_facts()
-                .type_facts()
-                .field_access_certificates
-                .clone(),
-        ));
         ctx.current_block_addr.set(Some(0x1000));
         ctx.current_op_idx.set(Some(1));
 
