@@ -186,6 +186,29 @@ reconcile them, and x86-64's do not.
 So the corpus splits cleanly. Everything naming-shaped has been taken; what is
 left on x86-64 is the location model and nothing else will move it.
 
+**Two steps toward it, both landed and both inert.** A phi at the same header
+over the same *location* at a narrower width was added to the carrier alias map,
+and the probe confirms it lands:
+
+    FOLDALIAS member=EAX_1 name=rax
+
+The return resolver's carrier branch was then pointed at that map -- it checked
+`var_aliases` only, so a value that is a carrier never took it. Together these
+should make the return read `rax`, and the rendering does not change.
+
+What that leaves: `merged_return_register_candidate_for_block` keeps
+`EAX_1` (its guard does accept `eax` on a 64-bit target, contrary to a first
+reading), the carrier branch now fires, and `spell_var(EAX_1)` answers `rax` --
+yet `preferred_return_candidate` still prefers the constant already in `best`.
+**The preference function is the next thing to print**, and it is the fourth
+distinct component on this one return.
+
+Both changes reverted, being attempted fixes rather than consolidations. They
+are correct statements -- a narrow phi over a carrier's location *is* the
+carrier, and the return resolver *should* consult the carrier map -- and they
+should be re-applied together with whatever makes the preference choose the
+carrier over a constant.
+
 ### arm64 -O0's four remaining failures are one spelling island
 
 `fnv1a32`, `fnv1a64`, `sdbm` and `crc32_bitwise` at arm64 -O0 all fail on an
