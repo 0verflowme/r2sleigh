@@ -419,6 +419,22 @@ impl<'a> FoldingContext<'a> {
                 let current_expr = self.resolve_return_candidate_in_context(&current_expr, context);
                 let candidate_expr =
                     self.resolve_return_candidate_in_context(&candidate_expr, context);
+                // A carrier settles this before anything else looks at the two.
+                // A carrier is mutable state, so any expression for it that is
+                // not the carrier is a value it held on one path -- in practice
+                // the one it was entered with. The checks below rank a bare
+                // variable as a worse return candidate than a literal, which is
+                // right nearly everywhere and exactly wrong here: `fnv1a32` at
+                // x86-64 -O1 renders a correct loop and returns `0x811c9dc5`,
+                // its seed, because the literal was judged the better answer.
+                let current_carrier = self.expr_is_carrier_reference(&current_expr);
+                let candidate_carrier = self.expr_is_carrier_reference(&candidate_expr);
+                if candidate_carrier && !current_carrier {
+                    return Some(candidate_expr);
+                }
+                if current_carrier && !candidate_carrier {
+                    return Some(current_expr);
+                }
                 let current_bad =
                     self.expr_is_bad_return_candidate_in_context(&current_expr, context);
                 let candidate_bad =

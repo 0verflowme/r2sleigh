@@ -12822,14 +12822,28 @@ impl<'a> FoldingContext<'a> {
                         })
                         .unwrap_or(unresolved);
                     let expr = if self.is_control_return_target(target) {
-                        let control_return_value = last_ret_value.clone().or_else(|| {
-                            self.current_block_addr.get().and_then(|block_addr| {
-                                self.merged_return_register_candidate_for_block(block_addr)
-                                    .or_else(|| {
-                                        self.reaching_return_register_candidate(block_addr)
-                                    })
-                            })
+                        // The value of the last `Ret` op and the merge over the
+                        // return register are two answers to one question, and
+                        // taking the first that exists let a constant win over a
+                        // carrier. A carrier is mutable state: any other
+                        // expression for it is what it held on one path, in
+                        // practice the value it was entered with. `fnv1a32` at
+                        // x86-64 -O1 renders a correct loop and returns its seed
+                        // because `last_ret_value` short-circuits the merge that
+                        // knows better.
+                        let merged = self.current_block_addr.get().and_then(|block_addr| {
+                            self.merged_return_register_candidate_for_block(block_addr)
+                                .or_else(|| self.reaching_return_register_candidate(block_addr))
                         });
+                        let control_return_value = match (last_ret_value.clone(), merged) {
+                            (Some(last), Some(merged))
+                                if self.expr_is_carrier_reference(&merged)
+                                    && !self.expr_is_carrier_reference(&last) =>
+                            {
+                                Some(merged)
+                            }
+                            (last, merged) => last.or(merged),
+                        };
                         if let Some(last) = control_return_value {
                             self.resolve_return_target_expr(last, None)
                         } else {
