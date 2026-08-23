@@ -150,6 +150,45 @@ The corpus is the instrument in the meantime, and it is the better one: it
 measures rendered output against source directly rather than asking the
 decompiler to report on itself.
 
+### A carrier's one name cannot express a value read across its own update
+
+arm64 -O2 `fnv1a32` renders
+
+    do {
+        x8++;
+        x0 = (x0 ^ *(int8_t*)x8) * 0x1000193;
+        x1--;
+    } while (x1 != 0);
+
+which hashes `p[1..n]` where the program hashes `p[0..n-1]`. Every arm64
+accumulator loop is wrong by one byte for this reason, and the SSA is not:
+
+    Copy    tmp:7400_1 <- X8_0        save the address
+    IntAdd  X8_1 <- X8_0, const:1     post-index writeback
+    Load    tmp:25400_1 <- tmp:7400_1 load through the saved copy
+
+The load reads the *pre*-increment address and says so. What is lost is that
+`X8_0` and `X8_1` are both members of the carrier and both spell `x8`, so
+inlining the saved copy's definition into the load yields `*x8` -- and by then
+`x8` holds the incremented value. A single name cannot say "the value this had
+before the statement above".
+
+Keeping the copy was tried, by declining to treat a copy into a temporary as a
+redundant carrier self-copy. Inert: the copy is not dropped by that rule, it is
+inlined, and the inlining is what collapses the versions.
+
+So the constraint is on the naming, not on any one pass: **a carrier member
+whose value is read after a later member of the same carrier is defined cannot
+render as the carrier's name.** It needs a name of its own, which is exactly the
+temporary the lifter already made and the fold already has. `carrier_name_aliases`
+maps every member to the carrier name unconditionally and has no notion of a
+member being superseded before its use.
+
+That is an ordering property, and it is the same property the location model
+needs for a different reason: a value read at one width across a write at
+another. Both want the members of a storage to be distinguishable when the
+program distinguishes them, and identical when it does not.
+
 ### Why the spelling cannot be unified at the mint, and what that leaves
 
 Two attempts, both measured, both reverted.
