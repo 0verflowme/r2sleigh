@@ -1,0 +1,13 @@
+fnv1a32     03302b48
+fnv1a64     5263463794cf3e68
+djb2        31d585ac
+sdbm        86d9742f
+adler32     9dd21488
+fletcher32  1583b67e
+crc32_bit   13bfe8ed
+crc32_tab   13bfe8ed
+murmur3_32  7e4102af
+xxhash32    e7583aa4
+siphash24   c0091950920b250f
+pearson     0d
+combined    db61cdd425c69275
