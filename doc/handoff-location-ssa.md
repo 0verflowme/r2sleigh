@@ -334,16 +334,35 @@ the display name and nothing else, and `tmp:7400_2` is a real carrier member in
 be keyed on the function too; temporaries are numbered per lift and collide
 freely across functions.
 
-Three more sources of `var_aliases` were printed and **none of them runs for
-this function**: the seed from `env.carrier_aliases` at `use_info.rs:112` is
-empty, `seed_entry_param_aliases` only handles version zero, and
-`coalesce_variables` emits nothing. So `var_aliases` acquires
-`tmp:7400_2 -> x8` somewhere in `prepared_semantic.rs`, which writes
-`info.var_aliases` at two further points. That is the next print.
+Three more sources of `var_aliases` were printed and none of them runs for this
+function. The one that does is `prepared_semantic.rs:424`, seeding from
+`env.carrier_aliases`, and printing it per function found the extra entries:
 
-Four maps are named "carrier aliases" across two crates and at least five places
-write `var_aliases`. Counting them is the work; guessing which one answers has
-now cost six interventions and one misread.
+    PREPENV fn=0x100000548 entries=15
+    PREPENV fn=0x100000548 member=tmp:7400_2 name=x8
+
+Fifteen where the other three maps hold thirteen. `PassEnv` borrows the fold's
+map, and the fold grows it in `extend_carrier_aliases_over`, which walks
+`Copy` and `Subpiece` ops adding `dst -> carrier` for any source that is already
+a member. That closure is what gives the saved address the carrier's name.
+
+**Fixed there.** The closure now stops at a source the carrier has moved past --
+another member of the same storage at a higher version -- because such a copy is
+a snapshot and needs a name of its own. arm64 -O2 `fnv1a32` renders
+
+    uint64_t t7400 = x8;
+    x8++;
+    x0 = ((x0 ^ *(int8_t*)t7400) * 0x1000193);
+
+and the corpus goes from eight correct renderings to **fourteen**: arm64 -O1 and
+-O2 each go from none to three, and nothing regresses.
+
+The lesson is the one this document keeps recording. Eleven interventions were
+written for this defect before the probe that found it, including two misreads
+of probe output -- one that mistook two `NameSource` implementations for two
+branches of one call, and one that read another function's data because the
+filter was keyed on an SSA name and temporaries collide across functions. Key a
+probe on the function as well as the value.
 
 Six interventions, all inert, all reverted. The trace took seven steps and each
 one narrowed it: the memory renderer's branches, `get_expr`, the inline

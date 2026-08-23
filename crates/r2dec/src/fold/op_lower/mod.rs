@@ -2051,6 +2051,29 @@ impl<'a> FoldingContext<'a> {
     /// goes through that. Those temporaries exist only in the function being
     /// walked, and the alias map was built from the prepared artifact, so the
     /// map is computed against one function and consumed against another.
+    /// Whether a later member of this carrier supersedes the one being copied.
+    ///
+    /// The carrier's name means what it holds now. A member the carrier has
+    /// already moved past is a different value, and a copy of it needs a name of
+    /// its own.
+    fn carrier_member_is_superseded(
+        aliases: &HashMap<String, String>,
+        source_key: &str,
+        carrier: &str,
+    ) -> bool {
+        let (source_base, source_version) =
+            crate::analysis::utils::split_display_name(source_key);
+        aliases.iter().any(|(member, member_carrier)| {
+            if member_carrier != carrier {
+                return false;
+            }
+            let (base, version) = crate::analysis::utils::split_display_name(member);
+            // Only the same storage supersedes: a different register in the same
+            // carrier family is a separate chain of versions.
+            base.eq_ignore_ascii_case(source_base) && version > source_version
+        })
+    }
+
     fn extend_carrier_aliases_over(&mut self, blocks: &[SSABlock]) {
         if self.carrier_aliases.is_empty() {
             return;
@@ -2068,9 +2091,22 @@ impl<'a> FoldingContext<'a> {
                     if self.carrier_aliases.contains_key(&key) {
                         continue;
                     }
-                    let Some(name) = self.carrier_aliases.get(&src.display_name()).cloned() else {
+                    let source_key = src.display_name();
+                    let Some(name) = self.carrier_aliases.get(&source_key).cloned() else {
                         continue;
                     };
+                    // A copy of a carrier taken before the carrier changes is not
+                    // the carrier. It exists to hold what the carrier had, which
+                    // is the one thing the carrier's single name cannot say:
+                    // arm64's post-indexed load saves the address, increments the
+                    // register, then loads through the saved copy, and giving the
+                    // copy the carrier's name makes the load read the incremented
+                    // value. Every accumulator loop on that target hashed one byte
+                    // late.
+                    if Self::carrier_member_is_superseded(&self.carrier_aliases, &source_key, &name)
+                    {
+                        continue;
+                    }
                     self.carrier_aliases.insert(key, name);
                     grew = true;
                 }
