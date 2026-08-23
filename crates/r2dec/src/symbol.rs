@@ -175,6 +175,7 @@ impl SymbolTable {
     /// A requested name already in use is given a numbered suffix rather than
     /// being merged, because two distinct values sharing one identifier is how a
     /// rendering says something it does not mean.
+    #[track_caller]
     pub fn declare(
         &mut self,
         name: impl Into<String>,
@@ -183,6 +184,14 @@ impl SymbolTable {
         origin: SymbolOrigin,
     ) -> SymbolId {
         let requested = name.into();
+        if let Ok(want) = std::env::var("R2SLEIGH_TRACE_NAME")
+            && requested.eq_ignore_ascii_case(&want)
+        {
+            eprintln!(
+                "NAMEDECLARE {requested} via {}",
+                std::panic::Location::caller()
+            );
+        }
         let name: Rc<str> = Rc::from(self.unique_name(requested));
         let id = self.id_at(self.symbols.len());
         self.by_name.insert(name.to_string(), id);
@@ -310,6 +319,14 @@ impl SymbolTable {
                 // Two names cannot become one, or two variables would.
                 continue;
             }
+            if let Ok(want) = std::env::var("R2SLEIGH_TRACE_NAME")
+                && target.eq_ignore_ascii_case(&want)
+            {
+                eprintln!(
+                    "NAMEFOLLOW {} -> {target}",
+                    self.symbols[index].name
+                );
+            }
             let previous =
                 std::mem::replace(&mut self.symbols[index].name, Rc::from(target.as_str()));
             self.by_name.remove(&*previous);
@@ -360,8 +377,18 @@ impl SymbolTable {
     /// Renaming used to mean rewriting matching words across the whole rendered
     /// function and hoping declarations and uses stayed in step. A reference is
     /// an identifier rather than a spelling, so there is nothing to keep in step.
+    #[track_caller]
     pub fn rename(&mut self, id: SymbolId, name: impl Into<String>) {
         let requested = name.into();
+        if let Ok(want) = std::env::var("R2SLEIGH_TRACE_NAME")
+            && requested.eq_ignore_ascii_case(&want)
+        {
+            eprintln!(
+                "NAMERENAME {} -> {requested} via {}",
+                self.name(id),
+                std::panic::Location::caller()
+            );
+        }
         let index = self.resolve(id);
         if *self.symbols[index].name == *requested {
             return;

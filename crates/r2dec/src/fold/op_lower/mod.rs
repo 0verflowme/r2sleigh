@@ -10341,7 +10341,14 @@ impl<'a> FoldingContext<'a> {
         if let Some(alias) = self.var_aliases_map().get(ssa_name) {
             return self.name_ref(alias);
         }
-        self.name_ref(&ssa_name.to_string())
+        // The SSA display name is the key this was looked up by, not how the
+        // value is written down. Handing it straight to the table mints a second
+        // symbol for a value that already has one, spelled differently only in
+        // case, and only one of the two ends up with the definition.
+        self.name_ref(&crate::analysis::utils::format_traced_name(
+            ssa_name,
+            self.var_aliases_map(),
+        ))
     }
 
     fn semanticize_visible_expr(

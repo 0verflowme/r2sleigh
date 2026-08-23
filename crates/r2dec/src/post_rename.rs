@@ -83,9 +83,17 @@ impl<'a> NameCollector<'a> {
                 continue;
             }
 
+            // The group is keyed by the normalised base, so the target has to be
+            // that base and not each name's own. Two spellings of one value
+            // differing only in case sit in one group, and renaming each to its
+            // own base produced two different version-less names: `x10_2` became
+            // `x10` and `X10_2` became `X10`. The definition followed the first,
+            // so the second named nothing. `follow_renames` then declines the
+            // second rather than merging two symbols, which is what keeps its
+            // version and keeps it matched to whatever defines it.
             for full_name in names {
-                if let Some((base, _)) = split_ssa_suffix(&full_name) {
-                    rename_map.insert(full_name.clone(), base.to_string());
+                if split_ssa_suffix(&full_name).is_some() {
+                    rename_map.insert(full_name.clone(), base_norm.clone());
                 }
             }
         }
