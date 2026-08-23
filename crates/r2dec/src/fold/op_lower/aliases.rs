@@ -610,7 +610,32 @@ impl<'a> FoldingContext<'a> {
         demote_dead_return_register_calls: bool,
         preserve_named_stack_owners: bool,
     ) -> Vec<CStmt> {
-        let mut live = HashSet::new();
+        self.prune_dead_temp_assignments_with_options_and_live_out(
+            stmts,
+            demote_dead_return_register_calls,
+            preserve_named_stack_owners,
+            &HashSet::new(),
+        )
+    }
+
+    /// Which assignments in this statement list nothing goes on to read.
+    ///
+    /// Liveness is decided by walking the list backwards, so a name read only
+    /// *outside* the list has to be given here. It used to start empty for every
+    /// list, and a list is a block: the body of a loop was pruned knowing nothing
+    /// about the loop's condition, the statements after the loop, or its own next
+    /// iteration. `adler32` assigns `b = (b + a) % 65521` in its loop and reads
+    /// `b` in the `return`, so the assignment looked dead and the rendering
+    /// returned the value `b` was initialised with -- the right low half and a
+    /// zero high half, from C that a reader has no reason to doubt.
+    fn prune_dead_temp_assignments_with_options_and_live_out(
+        &self,
+        stmts: Vec<CStmt>,
+        demote_dead_return_register_calls: bool,
+        preserve_named_stack_owners: bool,
+        live_out: &HashSet<String>,
+    ) -> Vec<CStmt> {
+        let mut live: HashSet<String> = live_out.clone();
         let mut live_call_sources = BTreeSet::new();
         let mut live_call_assignment_sources = BTreeSet::new();
         let mut kept_rev = Vec::with_capacity(stmts.len());
@@ -720,57 +745,6 @@ impl<'a> FoldingContext<'a> {
         kept_rev
     }
 
-    pub(crate) fn prune_dead_temp_assignments_in_stmt(&self, stmt: CStmt) -> CStmt {
-        match stmt {
-            CStmt::Block(stmts) => CStmt::Block(self.prune_dead_temp_assignments_in_block(stmts)),
-            CStmt::If {
-                cond,
-                then_body,
-                else_body,
-            } => CStmt::If {
-                cond,
-                then_body: Box::new(self.prune_dead_temp_assignments_in_stmt(*then_body)),
-                else_body: else_body
-                    .map(|stmt| Box::new(self.prune_dead_temp_assignments_in_stmt(*stmt))),
-            },
-            CStmt::While { cond, body } => CStmt::While {
-                cond,
-                body: Box::new(self.prune_dead_temp_assignments_in_stmt(*body)),
-            },
-            CStmt::DoWhile { body, cond } => CStmt::DoWhile {
-                body: Box::new(self.prune_dead_temp_assignments_in_stmt(*body)),
-                cond,
-            },
-            CStmt::For {
-                init,
-                cond,
-                update,
-                body,
-            } => CStmt::For {
-                init: init.map(|stmt| Box::new(self.prune_dead_temp_assignments_in_stmt(*stmt))),
-                cond,
-                update,
-                body: Box::new(self.prune_dead_temp_assignments_in_stmt(*body)),
-            },
-            CStmt::Switch {
-                expr,
-                cases,
-                default,
-            } => CStmt::Switch {
-                expr,
-                cases: cases
-                    .into_iter()
-                    .map(|case| crate::ast::SwitchCase {
-                        value: case.value,
-                        body: self.prune_dead_temp_assignments_in_block(case.body),
-                    })
-                    .collect(),
-                default: default.map(|stmts| self.prune_dead_temp_assignments_in_block(stmts)),
-            },
-            other => other,
-        }
-    }
-
     pub(super) fn stmt_is_side_effect_free_versioned_register_carrier(&self, stmt: &CStmt) -> bool {
         let Some(name) = super::side_effect_free_assignment_name(stmt) else {
             return false;
@@ -784,12 +758,122 @@ impl<'a> FoldingContext<'a> {
             && self.inputs.arch.is_register_like_base_name(base)
     }
 
-    fn prune_dead_temp_assignments_in_block(&self, stmts: Vec<CStmt>) -> Vec<CStmt> {
+    pub(crate) fn prune_dead_temp_assignments_in_stmt(&self, stmt: CStmt) -> CStmt {
+        // Nothing outside a function reads its locals, so the body starts with
+        // nothing live. Every nested list gets what its surroundings read.
+        self.prune_dead_temp_assignments_in_stmt_live_out(stmt, &HashSet::new())
+    }
+
+    /// Every name this statement reads, spelled as the live set spells them.
+    fn names_read_in_stmt(&self, stmt: &CStmt) -> HashSet<String> {
+        crate::collect_stmt_var_names(std::slice::from_ref(stmt))
+            .into_iter()
+            .map(|id| self.spelling(id).to_string())
+            .collect()
+    }
+
+    fn prune_dead_temp_assignments_in_stmt_live_out(
+        &self,
+        stmt: CStmt,
+        live_out: &HashSet<String>,
+    ) -> CStmt {
+        match stmt {
+            CStmt::Block(stmts) => {
+                CStmt::Block(self.prune_dead_temp_assignments_in_block(stmts, live_out))
+            }
+            CStmt::If {
+                cond,
+                then_body,
+                else_body,
+            } => CStmt::If {
+                cond,
+                then_body: Box::new(
+                    self.prune_dead_temp_assignments_in_stmt_live_out(*then_body, live_out),
+                ),
+                else_body: else_body.map(|stmt| {
+                    Box::new(self.prune_dead_temp_assignments_in_stmt_live_out(*stmt, live_out))
+                }),
+            },
+            // A loop body runs again, so whatever the loop reads anywhere -- its
+            // condition, its update, or the body itself on the next iteration --
+            // is live at the end of one pass through it.
+            CStmt::While { cond, body } => {
+                let mut inner = live_out.clone();
+                inner.extend(self.names_read_in_stmt(&CStmt::Expr(cond.clone())));
+                inner.extend(self.names_read_in_stmt(&body));
+                CStmt::While {
+                    cond,
+                    body: Box::new(
+                        self.prune_dead_temp_assignments_in_stmt_live_out(*body, &inner),
+                    ),
+                }
+            }
+            CStmt::DoWhile { body, cond } => {
+                let mut inner = live_out.clone();
+                inner.extend(self.names_read_in_stmt(&CStmt::Expr(cond.clone())));
+                inner.extend(self.names_read_in_stmt(&body));
+                CStmt::DoWhile {
+                    body: Box::new(
+                        self.prune_dead_temp_assignments_in_stmt_live_out(*body, &inner),
+                    ),
+                    cond,
+                }
+            }
+            CStmt::For {
+                init,
+                cond,
+                update,
+                body,
+            } => {
+                let mut inner = live_out.clone();
+                if let Some(cond) = cond.as_ref() {
+                    inner.extend(self.names_read_in_stmt(&CStmt::Expr(cond.clone())));
+                }
+                if let Some(update) = update.as_ref() {
+                    inner.extend(self.names_read_in_stmt(&CStmt::Expr(update.clone())));
+                }
+                inner.extend(self.names_read_in_stmt(&body));
+                let body =
+                    Box::new(self.prune_dead_temp_assignments_in_stmt_live_out(*body, &inner));
+                CStmt::For {
+                    init: init.map(|stmt| {
+                        Box::new(self.prune_dead_temp_assignments_in_stmt_live_out(*stmt, &inner))
+                    }),
+                    cond,
+                    update,
+                    body,
+                }
+            }
+            CStmt::Switch {
+                expr,
+                cases,
+                default,
+            } => CStmt::Switch {
+                expr,
+                cases: cases
+                    .into_iter()
+                    .map(|case| crate::ast::SwitchCase {
+                        value: case.value,
+                        body: self.prune_dead_temp_assignments_in_block(case.body, live_out),
+                    })
+                    .collect(),
+                default: default
+                    .map(|stmts| self.prune_dead_temp_assignments_in_block(stmts, live_out)),
+            },
+            other => other,
+        }
+    }
+
+    fn prune_dead_temp_assignments_in_block(
+        &self,
+        stmts: Vec<CStmt>,
+        live_out: &HashSet<String>,
+    ) -> Vec<CStmt> {
         let rewritten = stmts
             .into_iter()
-            .map(|stmt| self.prune_dead_temp_assignments_in_stmt(stmt))
+            .map(|stmt| self.prune_dead_temp_assignments_in_stmt_live_out(stmt, live_out))
             .collect();
-        self.prune_dead_temp_assignments(rewritten)
+        self.prune_dead_temp_assignments_with_options_and_live_out(rewritten, true, false, live_out)
     }
 
     fn collect_call_sources_in_stmt(&self, stmt: &CStmt, out: &mut BTreeSet<(u64, usize)>) {

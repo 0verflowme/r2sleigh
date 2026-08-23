@@ -1719,6 +1719,22 @@ fn build_obligation_ledger(
         ledger.record(*id, outcome);
     }
 
+    if unowned_report_requested() {
+        // Which operation sites the fold proved it rendered, so a site with no
+        // proof and no elision can be named rather than counted.
+        let mut sites = proofs
+            .iter()
+            .map(|proof| (proof.block_addr, proof.op_idx))
+            .collect::<Vec<_>>();
+        sites.sort_unstable();
+        sites.dedup();
+        for (block_addr, op_idx) in sites {
+            eprintln!("PROOFSITE block={block_addr:#x} idx={op_idx}");
+        }
+        for ((block_addr, op_idx), reason) in elided_op_sites {
+            eprintln!("ELIDEDSITE block={block_addr:#x} idx={op_idx} reason={reason}");
+        }
+    }
     debug_log_ledger(prepared, &ledger);
     ledger
 }
@@ -3147,8 +3163,10 @@ impl Decompiler {
             for block in normalized_func.blocks() {
                 for (index, op) in block.ops.iter().enumerate() {
                     let op: &r2ssa::SSAOp = op;
+                    let kind = format!("{op:?}");
+                    let kind = kind.split(|c: char| c == ' ' || c == '{').next().unwrap_or("?");
                     eprintln!(
-                        "NORMOP block={:#x} idx={index} dst={:?} srcs={:?}",
+                        "NORMOP block={:#x} idx={index} kind={kind} dst={:?} srcs={:?}",
                         block.addr,
                         op.dst().map(|var| var.display_name()),
                         op.sources()
@@ -3532,8 +3550,11 @@ impl Decompiler {
         }
         single_evaluation::bind_each_call_site_once(&mut c_function, &folded_call_sites);
         simplify_identities_in_function(&mut c_function, &fold_ctx);
+        debug_assigned_locals(&c_function, "simplify_identities_in_function");
         propagate_single_use_register_carriers(&mut c_function, &fold_ctx);
+        debug_assigned_locals(&c_function, "propagate_single_use_register_carriers");
         drop_overwritten_assignments(&mut c_function);
+        debug_assigned_locals(&c_function, "drop_overwritten_assignments");
         rewrite_stack_synonym_uses_to_declared_locals(symbols, &mut c_function, &fold_ctx);
         // Dropping a version suffix loses which value a name meant, so anything
         // that resolves a name to the storage behind it has to run before this.
@@ -3546,13 +3567,19 @@ impl Decompiler {
             post_rename::rewrite_function_identifiers(&mut c_function, &known_function_names);
         }
         reconstruct_flag_conditions_in_function(&mut c_function, &fold_ctx);
+        debug_assigned_locals(&c_function, "reconstruct_flag_conditions_in_function");
         prune_dead_temp_assignments_in_function_body(&mut c_function, &fold_ctx);
+        debug_assigned_locals(&c_function, "prune_dead_temp_assignments_in_function_body");
         prune_unused_pure_locals(symbols, &mut c_function);
+        debug_assigned_locals(&c_function, "prune_unused_pure_locals");
         resolve_undeclared_carriers(symbols, &mut c_function, &fold_ctx);
+        debug_assigned_locals(&c_function, "resolve_undeclared_carriers");
         prune_unreferenced_local_declarations(symbols, &mut c_function);
+        debug_assigned_locals(&c_function, "prune_unreferenced_local_declarations");
         normalize_redundant_return_carrier_casts(&mut c_function);
         normalize_declared_assignment_literals(&mut c_function);
         normalize_comparison_operand_order(&mut c_function);
+        debug_assigned_locals(&c_function, "normalize_comparison_operand_order");
         unrendered::prune_unreferenced_labels(&mut c_function);
         unrendered::drop_values_from_void_returns(&mut c_function);
         // Declaring a carrier after the fact, and marking the ones nothing
@@ -3927,6 +3954,57 @@ fn collect_visible_stack_offsets(
 /// `while (len != (i ^ i) + 1)`. A condition is an expression like any other and
 /// the same rules decide it.
 /// Drop an assignment whose value is overwritten before anything reads it.
+
+/// Which locals the body still assigns, printed between passes.
+///
+/// A statement the fold built and the page does not show was removed by one of
+/// the passes that run after structuring, and there are a dozen of them. Naming
+/// the pass is a bisect, and a bisect needs one print per step rather than one
+/// build per step.
+fn debug_assigned_locals(func: &CFunction, after: &str) {
+    if std::env::var_os("R2SLEIGH_DEBUG_PASSES").is_none() {
+        return;
+    }
+    fn walk(stmts: &[CStmt], out: &mut Vec<crate::symbol::SymbolId>) {
+        for stmt in stmts {
+            if let CStmt::Expr(CExpr::Binary {
+                op: BinaryOp::Assign,
+                left,
+                ..
+            }) = stmt
+                && let CExpr::Var(id) = left.as_ref()
+            {
+                out.push(*id);
+            }
+            match stmt {
+                CStmt::Block(inner) => walk(inner, out),
+                CStmt::If { then_body, else_body, .. } => {
+                    walk(std::slice::from_ref(then_body), out);
+                    if let Some(body) = else_body {
+                        walk(std::slice::from_ref(body), out);
+                    }
+                }
+                CStmt::While { body, .. }
+                | CStmt::DoWhile { body, .. }
+                | CStmt::For { body, .. } => walk(std::slice::from_ref(body), out),
+                _ => {}
+            }
+        }
+    }
+    let mut ids = Vec::new();
+    walk(&func.body, &mut ids);
+    let table = func.symbols.borrow();
+    let mut counts: std::collections::BTreeMap<String, usize> = Default::default();
+    for id in ids {
+        *counts.entry(table.name(id).to_string()).or_default() += 1;
+    }
+    let names = counts
+        .into_iter()
+        .map(|(name, count)| format!("{name}x{count}"))
+        .collect::<Vec<_>>();
+    eprintln!("PASS after={after} assigns={names:?}");
+}
+
 fn drop_overwritten_assignments(func: &mut CFunction) {
     fn assignment_target(stmt: &CStmt) -> Option<(crate::symbol::SymbolId, &CExpr)> {
         let CStmt::Expr(CExpr::Binary {

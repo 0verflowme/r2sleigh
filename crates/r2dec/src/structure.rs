@@ -2050,6 +2050,35 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             stmts
         };
         self.validate_certified_block_domain(addr, &stmts);
+        if std::env::var_os("R2SLEIGH_DEBUG_MERGES").is_some() {
+            eprintln!("FOLDED block={addr:#x} stmts={}", stmts.len());
+            let table = self.fold_ctx.symbols.borrow();
+            for (index, stmt) in stmts.iter().enumerate() {
+                let mut ids = std::collections::HashSet::new();
+                crate::collect_stmt_var_names(std::slice::from_ref(stmt))
+                    .into_iter()
+                    .for_each(|id| {
+                        ids.insert(id);
+                    });
+                let target = match stmt {
+                    CStmt::Expr(CExpr::Binary {
+                        op: crate::ast::BinaryOp::Assign,
+                        left,
+                        ..
+                    }) => match left.as_ref() {
+                        CExpr::Var(id) => table.name(*id).to_string(),
+                        other => format!("{other:?}").chars().take(30).collect(),
+                    },
+                    other => format!("{other:?}").chars().take(30).collect(),
+                };
+                let mut names = ids
+                    .into_iter()
+                    .map(|id| table.name(id).to_string())
+                    .collect::<Vec<_>>();
+                names.sort();
+                eprintln!("  FSTMT {index} target={target} reads={names:?}");
+            }
+        }
         stmts
     }
 
