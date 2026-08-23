@@ -291,6 +291,21 @@ carrier is not an identity value past the next definition of that carrier. Until
 then no rendering change in `r2dec` can help, and this defect costs every arm64
 accumulator loop one byte.
 
+**One attempt at that, and what it rules out.** `exact_copy_identity_values`
+walks copy chains with no condition beyond equal width. Refusing a copy that
+crosses between a register and a lifter temporary looked like the discriminator
+and is not: `prepared_expression_certificates_render_loop_carried_recurrence_phi`
+builds `tmp:update_1 = RAX_2 + 1; RAX_3 = Copy(tmp:update_1)`, where the
+temporary holds what the carrier *becomes* and is a legitimate identity. Both
+cases cross the same boundary in the same direction, so the space is not what
+tells them apart. Reverted.
+
+What tells them apart is where the carrier is next written, which is a program
+point. The failing test says so in its own message -- "at the latch program
+point" -- so the codebase already knows this fact is position-sensitive and
+`identity_values` records it as though it were not. `StorageSpans` already
+computes where a storage stops holding one value and could answer it.
+
 Six interventions, all inert, all reverted. The trace took seven steps and each
 one narrowed it: the memory renderer's branches, `get_expr`, the inline
 decision, the fold's carrier map, `spell_var`'s branches, `carrier_alias_by_name`,
