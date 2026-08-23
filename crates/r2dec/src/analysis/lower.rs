@@ -198,6 +198,15 @@ impl<'a> LowerCtx<'a> {
             return expr.clone();
         }
 
+        if std::env::var_os("R2SLEIGH_DEBUG_MERGES").is_some() {
+            eprintln!(
+                "BARENAME key={key} name={} depth={depth} inline={} has_def={} visited={}",
+                self.var_name(var),
+                self.should_inline(&key),
+                self.definition_for_var(var).is_some(),
+                visited.contains(&key)
+            );
+        }
         crate::symbol::var_ref(self.symbols, self.var_name(var))
     }
 
