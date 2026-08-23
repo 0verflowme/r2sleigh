@@ -245,11 +245,34 @@ the semantic value, the fold's `get_expr`, the inline decision, and the memory
 renderer's own two entry points. Suppressing any subset is indistinguishable
 from a wrong fix while another answers.
 
-The next person should start at `render_canonical_load_expr_uncached` and print
-which of its branches produces the address, rather than reasoning about which
-resolver ought to. The probes for that are in the tree:
-`R2SLEIGH_TRACE_NAME` spells the mint site into the identifier, and the
-`GETEXPR` wrapper reports what the fold's resolver hands back.
+That probe was then taken, and it narrows the defect to one line while leaving
+one question open.
+
+    LOADEXPR addr=tmp:7400_2 by_dst_or_addr=false fallback_rendered=false
+             fallback_addr=Var(SymbolId { index: 13 })
+
+Both memory-renderer branches decline, so the load *does* use `get_expr(addr)`.
+Re-applying the snapshot guard with the probe running shows it firing and
+returning the same symbol:
+
+    SNAPSHOT key=tmp:7400_2 -> Var(SymbolId { index: 13 })
+
+So `self.var_ref(var)` on the snapshot yields the same identifier the unguarded
+path yielded. The name is decided by `spell_var`, before any resolver is
+consulted -- which is why five interventions downstream of it were inert, and it
+is the single most useful thing established about this defect.
+
+**What is not established** is which of `spell_var`'s sources supplies it.
+`carrier_alias` is ruled out: `CARRIERALIAS` lists `X8_1` through `X8_4` and no
+`tmp:7400`. `var_alias` from `coalesce_variables` is ruled out: that pass only
+considers `is_register_candidate_var`, and a temporary is not one. The
+`var_aliases` insertion in `prepared_semantic.rs:2958` is ruled out: it returns
+early unless `var.version == 0`.
+
+So the next step is a print inside `spell_var` naming which branch returns, for
+a traced display name. It is four lines and it ends this. Do not write another
+guard first: five have been written for this defect and all five were inert
+because the name was already decided before they ran.
 
 ### Why the spelling cannot be unified at the mint, and what that leaves
 
