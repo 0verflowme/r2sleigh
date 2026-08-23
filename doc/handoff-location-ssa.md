@@ -174,6 +174,24 @@ recorded earlier holds: a spelling site can only be fixed together with whatever
 defines the value it spells, and here the two are visible in adjacent
 statements. Worth four corpus cells.
 
+**Two attempts at it, both reverted.** Reading the forwarding backwards -- a
+value with no definition renders as whichever defined value was forwarded *from*
+it -- is the obvious move and it fails twice over. In the fold's `get_expr` it is
+inert, because `BARENAME` fires at `analysis/lower.rs:223` and the name is
+produced by the analysis resolver, not that one. Moved to the analysis resolver
+it takes x86-64 -O0 from six correct to three and leaves arm64 -O0 unchanged.
+
+So the reverse link is not the answer even where it is the right resolver. On
+x86-64 the same shape of pair exists and the *other* half is the one with the
+statement, so following the link the same way moves the name off its definition
+rather than onto it. Which of a forwarded pair carries the statement is not
+fixed, and nothing in the pair says which.
+
+That is the third time a change of this class has regressed rather than merely
+failed, and the standing rule from those is unchanged: measure the corpus around
+every single-site change here, never batch two, and expect the direction of a
+link to differ between targets.
+
 ### djb2's hang on arm64 is the repair pass, not a fourth carrier defect
 
 With the snapshot fix landed, arm64 -O2 `fnv1a32`, `fnv1a64` and `sdbm` are
