@@ -42,6 +42,15 @@ disagrees with this section is superseded.
     rather than the value the accumulator held before the loop.
   * **A call's own definitions are not the next call's arguments.** A
     one-argument call rendered with eight.
+  * **A carrier answers `value_has_something_to_render` by its own name.**
+    Suppressing its definition and its semantic value, which is what stopped two
+    tables erasing the accumulation, also made it fail the predicate that keeps a
+    statement from being dropped when nothing can produce its value. arm64 -O2
+    `djb2` folded back to its seed; it now keeps the recurrence.
+  * **The proof line says `built`, not `rendered`, and prints the statements the
+    body holds.** See the sequencing note below: the ledger cannot close before
+    the location model, and until it does the line states the gap instead of
+    implying there is none.
 
 ### Open, each scoped by measurement
 
@@ -102,6 +111,44 @@ and expression resolvers, callee construction and call expressions, all three
 scoped above. Each surfaced as a rendering bug that looked unrelated until it was
 counted. Look for that shape first, and count before theorising -- five mechanisms
 were reasoned out on the call duplicate alone and all five were wrong.
+
+### The ledger cannot close before the location model
+
+The ADR sequences the ledger first, on the argument that the location model
+cannot be scored without it. Measurement says that ordering does not hold, and
+the reason is worth stating because it moves work rather than adding it.
+
+`Outcome::Rendered` is recorded when the fold *builds* an expression for an
+operation site. Structuring and cleanup delete statements afterwards and nothing
+revisits the claim, so `sym._siphash24` at x86-64 -O0 reported 1693 of 1754
+obligations rendered with five lines on the page -- the highest claim in the
+corpus attached to its worst rendering.
+
+Witnessing a claim means asking whether the value a site produces is one the
+finished body still names. A probe for that now runs under
+`R2SLEIGH_DEBUG_UNOWNED` and reports `WITNESS fn=... claimed-rendered=N
+witnessed=M body-statements=S named-values=V`. Measuring it settled the design:
+`named-values=0` on every function measured, honest and hollow alike. There are
+**230 `var_ref` call sites and three `declare_value` ones**, and `origin.value`
+had no reader in the crate at all. `SymbolOrigin` was built for this and never
+wired.
+
+Wiring it is not the fix. A rendered name such as `x8` stands for a carrier that
+many `ValueId`s write, so one `origin.value` cannot say what the name means, and
+the one-to-many is one-to-many *precisely because* SSA is over varnodes rather
+than locations. A name stands for a location; once locations exist, name to
+location to the instructions writing it closes the ledger correctly. Before they
+exist there is nothing sound to witness against.
+
+**So the ledger's closure invariant is downstream of the location model, not
+upstream of it.** What is achievable now, and is done, is to stop the line
+claiming what it cannot show: the column reads `built`, and the statements the
+body holds are printed beside it. The remaining work is one assertion once
+locations land.
+
+The corpus is the instrument in the meantime, and it is the better one: it
+measures rendered output against source directly rather than asking the
+decompiler to report on itself.
 
 ### How to measure here, which cost more than any single fix
 
