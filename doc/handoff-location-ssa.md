@@ -150,6 +150,34 @@ The corpus is the instrument in the meantime, and it is the better one: it
 measures rendered output against source directly rather than asking the
 decompiler to report on itself.
 
+### The spelling boundary is not uniform, and fixing it site by site is unsafe
+
+Three sites handed an SSA display name to the symbol table as if it were a
+spelling, minting a second identifier for a value that already had one. Two of
+them -- `variable.rs:569` and `op_lower/mod.rs:10344` -- were changed to spell
+through `format_traced_name`, and the corpus went from four correct renderings
+to eight.
+
+The third, `origin_name_to_expr` in `fold/flags.rs`, looks identical and is not.
+Making the same change there took x86-64 -O0 from **six correct to zero**, every
+one failing on an undefined `t11f80_2`. Reverted.
+
+The reason is worth stating plainly, because the two outcomes look like the same
+edit. Some tables in this pipeline are keyed by the SSA display name and some by
+the rendered spelling, and which one a site should hand over depends on which
+table its consumer will read. `origin_name_to_expr` feeds consumers keyed by the
+raw name; spelling it correctly made the key stop matching.
+
+So the sites are not instances of one defect that can be fixed one at a time.
+They are symptoms of two key spaces that nothing reconciles, and a site is
+"right" only relative to its reader. **The tables have to agree on a key before
+any of these sites can be made consistent**, which is the same conclusion the
+resolver traces reached from the other side, now with a measurement showing that
+piecemeal work here is not merely inert but actively dangerous.
+
+The rule this leaves: in this area, measure the corpus before and after every
+single-site change, and do not batch two of them.
+
 ### pearson's undefined index, traced to three resolvers
 
 `sym._pearson` at x86-64 -O0 renders
