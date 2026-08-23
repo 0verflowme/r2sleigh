@@ -2885,12 +2885,29 @@ with, on every iteration. The composition then faithfully concatenates fifteen
 entry lanes with one live one, and the ninety-six names are the honest report of
 that.
 
-So this is the sub-register aliasing gap at the renaming layer, not at the repair
-layer where the wide-read fix landed. `crates/r2ssa/src/rename.rs` places phis
-from `PhiPlacement` and records `canonical_storage_by_var` (`rename.rs:154`,
-`:347`) but does not place phis for the storage a register family shares. Until
-it does, any value a loop carries in part of a register reads as its entry value.
+**That reading was wrong, and the correction matters more than the claim.** The
+phis are there: `reg:5001_1` is a phi at 0x194 and `reg:5001_3` is one at 0x1e4.
+The grep that found `reg:5001_0` "in the loop body" was matching the phi's own
+incoming edge, where the entry value belongs. No operation reads it directly.
+Renaming is doing its job.
 
-That is the next real piece of work, and it is the same defect this document
-opened with, one layer further in: the repair pass now composes correctly from
-whatever reaches it, and what reaches it is wrong.
+What the ops actually show is the vector operation lifted as a per-lane
+read-modify-write, and one lane treated differently from the other fifteen:
+
+    op 172  B0_2       = Subpiece(Q0_2) | reg:4800_2     <- lane 0, from the wide value
+    op 173  reg:5001_2 = reg:5001_1     | reg:4801_2     <- lane 1, from its own phi
+    op 174  reg:5002_2 = reg:5002_1     | reg:4802_2
+
+Every lane is OR-ed with what that lane held before, so all sixteen are
+loop-carried, and each carries its own phi whose entry edge is an undefined
+function-entry lane. Lane zero escapes because the family repair rewrote its
+source to a `Subpiece` of the wide `Q0_2`; lanes one to fifteen keep their narrow
+phis, because `family_root_slice_for_range` takes the *smallest* containing slot
+(`min_by_key(width, offset)`) and each lane has a width-1 slot of its own.
+
+So the ninety-six names are honest: those lanes really are read before they are
+written, under this modelling. The defect is that the modelling gives one machine
+register sixteen carriers. The fix is to present a loop-carried vector as one
+carrier over the whole storage rather than one per byte -- the same "one variable
+per storage" rule the naming and carrier work has been applying everywhere else,
+which is what makes it the right next piece rather than a special case for SIMD.
