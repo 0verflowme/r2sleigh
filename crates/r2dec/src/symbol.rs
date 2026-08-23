@@ -260,6 +260,17 @@ impl SymbolTable {
         {
             eprintln!("NAMEMINT {name} via {}", std::panic::Location::caller());
         }
+        // Mark, do not read. Six attempts reasoned about which resolver ought to
+        // have produced a name; spelling the mint site into the name says which
+        // one did, because only the spelling that reaches the page survives.
+        let marked;
+        let name = match std::env::var("R2SLEIGH_TRACE_NAME") {
+            Ok(want) if name.eq_ignore_ascii_case(&want) => {
+                marked = format!("{name}__L{}", std::panic::Location::caller().line());
+                marked.as_str()
+            }
+            _ => name,
+        };
         if let Some(existing) = self.by_name.get(name) {
             return *existing;
         }
@@ -537,6 +548,8 @@ mod reuse_tests {
 /// Analysis builds candidate expressions before anything decides to render
 /// them, so it mints here rather than handing spellings forward for a later
 /// layer to declare. A candidate that is dropped costs one unused table entry.
+#[track_caller]
+#[inline(always)]
 pub fn var_ref(symbols: &RefCell<SymbolTable>, name: impl AsRef<str>) -> CExpr {
     CExpr::Var(crate::symbol::declare(&symbols, name.as_ref()))
 }
@@ -547,6 +560,7 @@ pub fn var_ref(symbols: &RefCell<SymbolTable>, name: impl AsRef<str>) -> CExpr {
 /// statement. Writing `borrow_mut()` inline holds the guard to the end of the
 /// statement instead, and a second declaration there deadlocks.
 #[track_caller]
+#[inline(always)]
 pub fn declare(symbols: &RefCell<SymbolTable>, name: impl AsRef<str>) -> SymbolId {
     let name = name.as_ref();
     if let Ok(want) = std::env::var("R2SLEIGH_TRACE_NAME")

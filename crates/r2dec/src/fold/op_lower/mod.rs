@@ -1834,16 +1834,19 @@ impl<'a> FoldingContext<'a> {
     /// Declare a name and return the identifier that refers to it.
     ///
     /// One statement, so the borrow never spans a nested build.
+    #[track_caller]
     pub(crate) fn sym(&self, name: &str) -> crate::symbol::SymbolId {
         crate::symbol::declare(&self.symbols, name)
     }
 
     /// A reference to the name this value renders as.
+    #[track_caller]
     pub(crate) fn var_ref(&self, var: &SSAVar) -> CExpr {
         CExpr::Var(self.sym_for_var(&self.var_name(var), var))
     }
 
     /// The identifier this spelling renders, remembering which value it renders.
+    #[track_caller]
     pub(crate) fn sym_for_var(&self, name: &str, var: &SSAVar) -> crate::symbol::SymbolId {
         let id = self.sym(name);
         self.symbols
@@ -1853,6 +1856,7 @@ impl<'a> FoldingContext<'a> {
     }
 
     /// A reference to this spelling, which is known to render this value.
+    #[track_caller]
     pub(crate) fn name_ref_for_var(&self, name: &str, var: &SSAVar) -> CExpr {
         CExpr::Var(self.sym_for_var(name, var))
     }
@@ -1869,6 +1873,7 @@ impl<'a> FoldingContext<'a> {
     }
 
     /// A reference to this spelling.
+    #[track_caller]
     pub(crate) fn name_ref(&self, name: &str) -> CExpr {
         CExpr::Var(self.sym(name))
     }
@@ -3298,6 +3303,20 @@ impl<'a> FoldingContext<'a> {
     }
 
     pub fn get_expr(&self, var: &SSAVar) -> CExpr {
+        let answer = self.get_expr_inner(var);
+        // What this resolver actually hands back for a value, so a name reaching
+        // the page with nothing defining it can be told from a name the resolver
+        // never saw. `get_expr` mints its fallback reference on the way in, so
+        // watching the symbol table cannot tell those apart.
+        if let Ok(want) = std::env::var("R2SLEIGH_TRACE_NAME")
+            && var.display_name().eq_ignore_ascii_case(&want)
+        {
+            eprintln!("GETEXPR key={} answer={answer:?}", var.display_name());
+        }
+        answer
+    }
+
+    fn get_expr_inner(&self, var: &SSAVar) -> CExpr {
         let key = var.display_name();
 
         // Always inline constants

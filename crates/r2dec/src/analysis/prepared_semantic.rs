@@ -2834,12 +2834,28 @@ fn prepared_fallback_visible_expr(symbols: &std::cell::RefCell<crate::symbol::Sy
         return None;
     }
 
+    // Writing the value's name here is a promise that something will define it,
+    // and this pass is not in a position to make it: it runs over every block
+    // before the fold decides which statements exist, so a value whose statement
+    // the fold later leaves out keeps a name nothing writes. The name is then
+    // frozen inside whatever definition embedded it, and no later resolution can
+    // reach it -- `pearson` at x86-64 -O0 renders `local_19 = rcx_4[...]` that
+    // way, while asking the fold about `RCX_4` answers `(int64_t)eax_3`.
+    //
+    // Declining for a computed value leaves it to the fold, which knows what it
+    // emitted. Version zero is different and keeps its name: that is the value
+    // the function was entered with, it has no defining statement to leave out,
+    // and a parameter or an entry register is always spelled.
+    //
     // The version is part of which value this is, and the definition side spells
     // it that way. Naming the storage alone made a use of `x19_3` print as
     // `x19`, which no longer matched the definition of `x19_3` -- so a
     // definition with eleven readers looked unread and was deleted, leaving the
     // readers naming nothing. Version zero stays bare, as it does everywhere:
     // that is the value the function was entered with.
+    if var.version > 0 {
+        return None;
+    }
     Some(crate::symbol::var_ref(symbols, crate::naming::spell_var(var, view)))
 }
 
