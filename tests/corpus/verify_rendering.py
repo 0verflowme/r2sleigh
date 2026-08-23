@@ -30,6 +30,8 @@ SPEC = {
 }
 REFKEY = {'crc32_bitwise': 'crc32_bit'}
 
+BINARY = {'x64_O0':'h_x64_O0','x64_O1':'h_x64_O1','x64_O2':'h_x64_O2','arm64_O0':'h_arm64_O0','arm64_O1':'h_arm64_O1','arm64_O2':'h_arm64_O2'}
+
 def blocks(path):
     text = open(path).read()
     for chunk in re.split(r'════+ ', text)[1:]:
@@ -94,6 +96,7 @@ for name, src in blocks(f'out_{CFG}.txt'):
     if name not in SPEC:
         continue
     rtype, spec, arity, extra = SPEC[name]
+    binary = BINARY[CFG]
     fixed, n, assumed = repair(src, name)
     if n == 0:
         results[name] = ('nosig', '')
@@ -101,10 +104,48 @@ for name, src in blocks(f'out_{CFG}.txt'):
     args = ['(long)msg', 'n'] + [f'(long)({e})' for e in extra]
     args += ['0'] * max(0, n - len(args))
     call = ', '.join(args[:n])
+    # Absolute addresses the rendering reads are real data in the binary. The
+    # harness cannot map them, so the bytes are lifted out and the literal is
+    # pointed at a copy. Without this a correct rendering of a table lookup
+    # scores wrong on an empty result, which is a fault in the measurement.
+    blobs = []
+    # Only literals that are actually inside the image. FNV's prime is
+    # 0x100000001b3, which looks exactly like a mach-o address and is not one;
+    # substituting it broke a rendering that had been correct.
+    sections = subprocess.run(
+        ['r2', '-e', 'scr.color=0', '-q', '-c', 'iSq', binary],
+        capture_output=True, text=True).stdout
+    ranges = []
+    for line in sections.splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and parts[0].startswith('0x'):
+            try:
+                start = int(parts[0], 16)
+                size = int(parts[1], 16) if parts[1].startswith('0x') else int(parts[1])
+                ranges.append((start, start + size))
+            except ValueError:
+                continue
+    def mapped(value):
+        return any(start <= value < end for start, end in ranges)
+    addrs = sorted({int(a, 16) for a in re.findall(r'0x1[0-9a-fA-F]{8,}', fixed)
+                    if mapped(int(a, 16))})
+    for index, addr in enumerate(addrs):
+        dump = subprocess.run(
+            ['r2', '-e', 'scr.color=0', '-q', '-c', f's {addr}; p8 512', binary],
+            capture_output=True, text=True)
+        hexed = ''.join(ch for ch in dump.stdout if ch in '0123456789abcdef')
+        if len(hexed) < 1024:
+            continue
+        data = ','.join(str(int(hexed[i:i + 2], 16)) for i in range(0, 1024, 2))
+        blobs.append(f'static unsigned char blob{index}[512] = {{{data}}};')
+        fixed = re.sub(rf'0x0*{addr:x}[uU]?[lL]*', f'((long)blob{index})', fixed,
+                       flags=re.IGNORECASE)
+    blob_text = '\n'.join(blobs)
     prog = f'''#include <stdio.h>
 #include <stdint.h>
 #include <string.h>
 static const char msg[] = "{MSG}";
+{blob_text}
 {fixed}
 int main(void) {{
     long n = sizeof(msg) - 1;

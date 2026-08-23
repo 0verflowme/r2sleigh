@@ -41,14 +41,27 @@ dereference, because a rendering types an address-carrying value as an integer
 and then dereferences it. It does not change any operator or constant, so a
 rendering that computes the right value still computes it afterwards.
 
+## Data the rendering reads
+
+A rendering that reads a table reads it at the address the binary puts it at,
+and the harness process has nothing mapped there. `pearson` scored `wrong` on an
+empty result for that reason while its rendering was exactly right.
+
+So the bytes are lifted out of the binary with `r2` and the literal is pointed at
+a copy. Only literals inside a mapped section are substituted: FNV's prime is
+`0x100000001b3`, which looks precisely like a Mach-O address and is not one, and
+substituting it broke a rendering that had been correct.
+
 ## Baseline
 
-Nine hash functions, x86-64 and arm64, `-O0`/`-O1`/`-O2`, 54 renderings:
+Nine hash functions, x86-64 and arm64, `-O0`/`-O1`/`-O2`, 54 renderings.
 
-    CORRECT     4     all x86-64 -O0: fnv1a32, fnv1a64, djb2, sdbm
-    wrong      21
-    nocompile  26
-    hang        3
+    at the start of the work    4 correct
+    now                        26 correct
 
-Structural inspection scored 21 of these sound. Four of them run correctly.
-That difference is why this exists.
+    x86-64 -O0   6      arm64 -O0   6
+    x86-64 -O1   4      arm64 -O1   5
+    x86-64 -O2   0      arm64 -O2   5
+
+Structural inspection scored 21 of the original 54 sound when four of them ran
+correctly. That difference is why this exists.
