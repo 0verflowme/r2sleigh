@@ -858,10 +858,9 @@ impl UseInfo {
         {
             return None;
         }
-        self.semantic_values.get(&var.display_name()).or_else(|| {
-            self.value_id_for_var(var)
-                .and_then(|value_id| self.semantic_values_by_value.get(&value_id))
-        })
+        self.value_id_for_var(var)
+            .and_then(|value_id| self.semantic_values_by_value.get(&value_id))
+            .or_else(|| self.semantic_values.get(&var.display_name()))
     }
 
     pub(crate) fn semantic_value_for_value(&self, value_id: ValueId) -> Option<&SemanticValue> {
@@ -900,10 +899,13 @@ impl UseInfo {
         {
             return None;
         }
-        self.forwarded_values.get(&var.display_name()).or_else(|| {
-            self.value_id_for_var(var)
-                .and_then(|value_id| self.forwarded_values_by_value.get(&value_id))
-        })
+        // Value first, as the definition accessors do. A name can be ambiguous
+        // and the guard above says so; a value cannot. Where both stores hold an
+        // entry and they differ, the one keyed by identity is the one that is
+        // still about this value.
+        self.value_id_for_var(var)
+            .and_then(|value_id| self.forwarded_values_by_value.get(&value_id))
+            .or_else(|| self.forwarded_values.get(&var.display_name()))
     }
 
     pub(crate) fn forwarded_value_for_value(&self, value_id: ValueId) -> Option<&ValueProvenance> {
@@ -987,10 +989,9 @@ impl UseInfo {
         {
             return None;
         }
-        self.ptr_arith.get(&var.display_name()).or_else(|| {
-            self.value_id_for_var(var)
-                .and_then(|value_id| self.ptr_arith_by_value.get(&value_id))
-        })
+        self.value_id_for_var(var)
+            .and_then(|value_id| self.ptr_arith_by_value.get(&value_id))
+            .or_else(|| self.ptr_arith.get(&var.display_name()))
     }
 
     pub(crate) fn is_condition_name(&self, name: &str) -> bool {
@@ -1007,12 +1008,9 @@ impl UseInfo {
         if self.ambiguous_value_names.contains(name) {
             return None;
         }
-        lookup_name_key(&self.call_result_source_by_alias, name)
-            .copied()
-            .or_else(|| {
-                self.value_id_for_name(name)
-                    .and_then(|value_id| self.call_result_source_by_value.get(&value_id).copied())
-            })
+        self.value_id_for_name(name)
+            .and_then(|value_id| self.call_result_source_by_value.get(&value_id).copied())
+            .or_else(|| lookup_name_key(&self.call_result_source_by_alias, name).copied())
     }
 }
 
