@@ -3150,9 +3150,18 @@ impl<'a> FoldingContext<'a> {
             if self.inputs.arch.is_stack_base_name(&base_lower) {
                 return false;
             }
-            // Inline calling-convention argument registers (consumed by call args)
+            // Inline calling-convention argument registers (consumed by call
+            // args), but only when something can render the value where it is
+            // read. The branch below already asks; this one did not, and being
+            // caller-saved says a register may be clobbered across a call, not
+            // that its definition can be reproduced at its use.
+            //
+            // arm64 -O0 loses its loop counter to this: `x9` is caller-saved, so
+            // the load that fills it is skipped on the promise of inlining, and
+            // the reader prints `x9_3` with nothing defining it. Four functions
+            // fail to compile for that reason.
             if self.inputs.arch.is_caller_saved_name(&base_lower) {
-                return true;
+                return self.value_has_something_to_render(&var_name);
             }
             // Inline any register with a definition when it is single-use
             // or the definition is trivially small. A value with no definition
