@@ -150,6 +150,39 @@ The corpus is the instrument in the meantime, and it is the better one: it
 measures rendered output against source directly rather than asking the
 decompiler to report on itself.
 
+### Four renderings have no return at all, and the loop above it is correct
+
+The harness scored these as wrong values. They are not: a non-void function that
+falls off the end leaves whatever was in the return register, and two unrelated
+functions both produced `f7c33760` that way. The harness now reports `noreturn`
+as its own verdict, which is what made the class visible -- four renderings, one
+per configuration except x86-64 -O0 and -O2.
+
+`fnv1a64` at arm64 -O0 is the clearest. Its loop is **exactly right**:
+
+    local_18 = local_18 ^ arg0[i];
+    local_18 = local_18 * 0x100000001b3;
+
+and the function ends without returning it. The exit block folds to zero
+statements, and the accounting says why:
+
+    NORMOP block=0x100000648 idx=1  kind=Load   dst=X0_1   srcs=[tmp:6500_11]
+    NORMOP block=0x100000648 idx=10 kind=Return dst=None   srcs=[PC_1]
+
+    PROOFSITE idx=0,1,2,5,9      ELIDEDSITE idx=3,4,6,7,8
+
+**idx 10 has neither a proof nor an elision.** The `Return` op produces no
+statement and nothing accounts for it -- it is one of the eight unaccounted
+obligations the proof line reports for this function.
+
+Its target is `PC_1`, which is the link register: on arm64 -O0 the return
+address is what `ret` reads, and the return *value* is in `X0_1`, loaded two ops
+earlier. `is_control_return_target` exists for exactly this and the branch that
+uses it reaches for `merged_return_register_candidate_for_block`, so the
+question is why `op_to_stmt_impl` yields `None` here rather than a `Return`.
+
+Worth four cells, and the loops behind all four are already correct.
+
 ### x86-64's remaining failures are the narrow read, and arm64's were not
 
 This explains the asymmetry in the corpus. arm64 went from no correct renderings

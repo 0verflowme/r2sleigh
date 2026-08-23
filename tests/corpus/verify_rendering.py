@@ -153,6 +153,15 @@ int main(void) {{
     return 0;
 }}
 '''
+    # A non-void function with no `return` falls off the end, and what the
+    # harness then reads is whatever the return register happened to hold --
+    # `f7c33760` for two unrelated functions. That is a rendering defect with a
+    # name, not a wrong value, and scoring it as a wrong value hides that the
+    # loop above it may be exactly right.
+    body_after_sig = fixed[fixed.index(')') + 1:]
+    if not re.search(r'\breturn\b[^;]*;', body_after_sig):
+        results[name] = ('noreturn', 'non-void function falls off the end')
+        continue
     path = f'verify/{CFG}_{name}.c'
     open(path, 'w').write(prog)
     cc = subprocess.run(
