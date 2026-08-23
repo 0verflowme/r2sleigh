@@ -325,9 +325,25 @@ Printed side by side, all three maps agree and **none** contains `tmp:7400`:
     FOLDALIAS     FoldingContext::carrier_aliases, with the materialised-copy extension
 
 So `carrier_alias` declines and the spelling comes from the second branch,
-`var_alias`. `UseInfo::var_aliases` is seeded at `use_info.rs:112` by copying
-`env.carrier_aliases` wholesale -- **a fourth map of that name**, seeded
-separately by the fold. That is the one to print next, and it is one build.
+`var_alias`.
+
+**And the probe that produced the misread has a trap of its own.** It filtered on
+the display name and nothing else, and `tmp:7400_2` is a real carrier member in
+`djb2` -- a different function decompiled during the same run. The
+`branch=carrier` line was that function's. Any probe keyed on an SSA name has to
+be keyed on the function too; temporaries are numbered per lift and collide
+freely across functions.
+
+Three more sources of `var_aliases` were printed and **none of them runs for
+this function**: the seed from `env.carrier_aliases` at `use_info.rs:112` is
+empty, `seed_entry_param_aliases` only handles version zero, and
+`coalesce_variables` emits nothing. So `var_aliases` acquires
+`tmp:7400_2 -> x8` somewhere in `prepared_semantic.rs`, which writes
+`info.var_aliases` at two further points. That is the next print.
+
+Four maps are named "carrier aliases" across two crates and at least five places
+write `var_aliases`. Counting them is the work; guessing which one answers has
+now cost six interventions and one misread.
 
 Six interventions, all inert, all reverted. The trace took seven steps and each
 one narrowed it: the memory renderer's branches, `get_expr`, the inline
