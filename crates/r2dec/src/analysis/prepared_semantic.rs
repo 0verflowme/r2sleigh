@@ -115,7 +115,22 @@ impl PreparedSemanticView {
         let mut view = Self {
             param_alias_by_reg: inputs.param_register_aliases.clone(),
             carrier_alias_by_name: match inputs.function_facts.render() {
-                Some(render) => crate::normalize::carrier_name_aliases(inputs.prepared, render),
+                Some(render) => {
+                    let map = crate::normalize::carrier_name_aliases(inputs.prepared, render);
+                    // Printed where the map that decides spelling is built. A
+                    // recomputation elsewhere disagreed with it about whether a
+                    // lifter temporary is a carrier member, and a disagreement
+                    // between two computations of one map is the defect this
+                    // branch has found three times already.
+                    if std::env::var_os("R2SLEIGH_DEBUG_MERGES").is_some() {
+                        let mut entries = map.iter().collect::<Vec<_>>();
+                        entries.sort();
+                        for (member, name) in entries {
+                            eprintln!("VIEWALIAS member={member} name={name}");
+                        }
+                    }
+                    map
+                }
                 None => HashMap::new(),
             },
             certified_rendering_required,

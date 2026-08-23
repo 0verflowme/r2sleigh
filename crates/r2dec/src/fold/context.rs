@@ -325,6 +325,13 @@ impl<'a> FoldingContext<'a> {
                 carrier_aliases.entry(src_key).or_insert(name);
             }
         }
+        if std::env::var_os("R2SLEIGH_DEBUG_MERGES").is_some() {
+            let mut entries = carrier_aliases.iter().collect::<Vec<_>>();
+            entries.sort();
+            for (member, name) in entries {
+                eprintln!("FOLDALIAS member={member} name={name}");
+            }
+        }
         Self {
             carrier_aliases,
             cross_block_reads: std::cell::RefCell::new(HashSet::new()),
