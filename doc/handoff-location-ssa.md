@@ -150,6 +150,43 @@ The corpus is the instrument in the meantime, and it is the better one: it
 measures rendered output against source directly rather than asking the
 decompiler to report on itself.
 
+### Why the spelling cannot be unified at the mint, and what that leaves
+
+Two attempts, both measured, both reverted.
+
+**Spelling at the mint.** `symbol::declare` was made to run every incoming name
+through `format_traced_name`, on the reasoning that it is idempotent for names
+that are already spellings. x86-64 -O0 went from six correct renderings to zero,
+and the diff says exactly why:
+
+    -    for (int64_t local_28 = 0; local_28 < arg1; ...)
+    +    for (int64_t local_28 = 0; t11f80_2 < arg1; ...)
+
+`format_traced_name(name, var_aliases)` consults the alias map *first*, and the
+symbol table has no alias map to give it, so the call passed an empty one and a
+stack local reverted to the temporary it was lifted from. **The spelling of a
+value depends on context the table does not hold**, which is why it cannot be
+decided there. That is not a detail of this attempt; it is the reason the mint
+is the wrong layer for the question.
+
+**Fixing the sites after the read side was unified.** With every paired store
+answering value-first and the name-keyed fallbacks removed, the third
+display-name site (`origin_name_to_expr`) was retried. It still took six correct
+renderings to zero, on the same undefined `t11f80_2`.
+
+So the read-side consolidation was necessary and is not sufficient. The reason
+is sharper than "two key spaces": the raw spelling is **self-consistent**.
+Whatever defines a value spells it the same raw way the use does, so a use moved
+to the spelled form is moved away from its own definition. Each spelling is an
+island, and both islands work internally.
+
+**What that leaves as the rule.** A spelling site can only be fixed together
+with whatever defines the value it spells. `variable.rs:569` and
+`op_lower/mod.rs:10344` moved together and the corpus went from four correct to
+eight, because they were a matched pair. `origin_name_to_expr` alone is not,
+and no amount of consolidating the stores beneath it changes that -- its
+definition side has to move with it, and finding that side is the work.
+
 ### The spelling boundary is not uniform, and fixing it site by site is unsafe
 
 Three sites handed an SSA display name to the symbol table as if it were a
