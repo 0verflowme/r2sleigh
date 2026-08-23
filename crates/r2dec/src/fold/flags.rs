@@ -437,8 +437,30 @@ impl<'a> FoldingContext<'a> {
         if self.prepared_value_id_for_var(cond) != Some(predicate.condition) {
             return None;
         }
-        let expr = self
-            .prepared_predicate_comparison_at_block(predicate, block.addr)
+        let comparison = self.prepared_predicate_comparison_at_block(predicate, block.addr);
+        if std::env::var_os("R2SLEIGH_DEBUG_MERGES").is_some() {
+            let var_of = |value: r2ssa::ValueId| {
+                self.inputs
+                    .prepared_ssa
+                    .and_then(|prepared| prepared.graph().value(value))
+                    .map(|value| value.var.display_name())
+                    .unwrap_or_default()
+            };
+            if let Some(fact) = comparison {
+                eprintln!(
+                    "PREDCMP block={:#x} kind={:?} lhs={:?}({}) rhs={:?}({}) alias_lhs={:?} alias_rhs={:?}",
+                    block.addr,
+                    fact.kind,
+                    fact.lhs,
+                    var_of(fact.lhs),
+                    fact.rhs,
+                    var_of(fact.rhs),
+                    self.carrier_aliases.get(&var_of(fact.lhs)),
+                    self.carrier_aliases.get(&var_of(fact.rhs)),
+                );
+            }
+        }
+        let expr = comparison
             .and_then(|comparison| {
                 self.prepared_compare_provenance_expr(comparison, Some(block.addr))
             })?;
@@ -763,6 +785,25 @@ impl<'a> FoldingContext<'a> {
                 &rooted,
                 compare_width.max(rooted.size),
             );
+        }
+        // A carrier is spelled by its own name wherever it appears, and a
+        // predicate is not an exception. Resolving the operand through its
+        // provenance instead re-derives the value from what the loop held before
+        // the update, and the update has already been written to that same name:
+        // `subs x1, x1, 1` compared against zero became `x1 - 1 != 0`, which
+        // simplifies to `x1 != 1` and then reads the decremented variable. Every
+        // counted loop exited one iteration early on that. The statement path
+        // already declines the definition and the semantic value for a carrier
+        // member; this is the third table that answered for one.
+        //
+        // A version-0 operand is excepted, because that is the value the function
+        // was called with and the carrier does not hold it until its initialiser
+        // runs. The guard before a loop compares exactly that, and naming it after
+        // the carrier put `if (x1 == 0)` above the line that assigns `x1`.
+        if var.version != 0
+            && let Some(name) = self.carrier_aliases.get(&var.display_name())
+        {
+            return crate::symbol::var_ref(symbols, name);
         }
         let original_name = var.display_name();
         let rooted_name = rooted.display_name();

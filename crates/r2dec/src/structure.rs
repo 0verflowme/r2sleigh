@@ -2287,6 +2287,16 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         let condition_value = predicate.map(|(_, value)| value);
 
         if let Some(cond) = self.fold_ctx.extract_condition_from_block(block) {
+            if std::env::var_os("R2SLEIGH_DEBUG_MERGES").is_some() {
+                let table = self.fold_ctx.symbols.borrow();
+                let mut ids = std::collections::HashSet::new();
+                crate::collect_expr_var_names(&cond, &mut ids);
+                let names = ids
+                    .into_iter()
+                    .map(|id| format!("{id:?}={}", table.name(id)))
+                    .collect::<Vec<_>>();
+                eprintln!("BRANCHCOND block={addr:#x} cond={cond:?} names={names:?}");
+            }
             return (Some(cond), predicate_id, condition_value);
         }
 
