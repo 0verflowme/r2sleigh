@@ -203,11 +203,30 @@ yet `preferred_return_candidate` still prefers the constant already in `best`.
 **The preference function is the next thing to print**, and it is the fourth
 distinct component on this one return.
 
-Both changes reverted, being attempted fixes rather than consolidations. They
-are correct statements -- a narrow phi over a carrier's location *is* the
-carrier, and the return resolver *should* consult the carrier map -- and they
-should be re-applied together with whatever makes the preference choose the
-carrier over a constant.
+A third was then added: for a return, a carrier reference beats a constant,
+because a carrier is mutable state and any constant for it is a value it held on
+one path. With all three in place the probe shows the carrier reaching the
+preference and being recognised:
+
+    RETIN cur=[UIntLit(2166136261)] cand=[rax carrier=true]
+
+and the rendering still returns the seed, because a **later** call arrives with
+the constant on both sides:
+
+    RETIN cur=[UIntLit(2166136261)] cand=[UIntLit(2166136261)]
+
+So another producer supplies this return and wins without passing the carrier
+branch at all. That is the sixth component on one return --
+`merged_return_register_candidate_for_block`, the carrier branch inside it,
+`spell_var`, `resolve_return_candidate_in_context`, the preference, and now
+whatever else offers a candidate.
+
+All three reverted, being attempted fixes rather than consolidations. Each is a
+correct statement: a narrow phi over a carrier's location is the carrier, the
+return resolver should consult the carrier map, and a carrier beats a constant.
+They should be re-applied together with the producer that currently wins, which
+is what to find first -- print every call into `preferred_return_candidate` with
+its caller under `#[track_caller]`, rather than adding a seventh guard.
 
 ### arm64 -O0's four remaining failures are one spelling island
 
