@@ -189,6 +189,29 @@ needs for a different reason: a value read at one width across a write at
 another. Both want the members of a storage to be distinguishable when the
 program distinguishes them, and identical when it does not.
 
+**Narrowed once more, with two more inert attempts.** The saved address is not a
+carrier member -- `CARRIERALIAS` lists `X8_1` through `X8_4` and no `tmp:7400`
+-- so excluding snapshot copies from the alias map changes nothing, and neither
+does declining to treat a copy into a temporary as a redundant self-copy. Both
+reverted.
+
+The ops are
+
+    Copy    tmp:7400_2 <- X8_2
+    IntAdd  X8_3 <- X8_2, const:1
+    Load    <- tmp:7400_2
+
+and `tmp:7400_2` has exactly one use, so `should_inline` skips its statement and
+the load inlines it to `X8_2`, which spells `x8` -- the same name `X8_3` spells.
+Keeping that statement is the fix, and it renders
+
+    t7400_2 = x8; x8++; ... *t7400_2
+
+which is correct. So the rule wanted is an *inlining* constraint, not a naming
+one: **a value whose definition reads a carrier member must not be inlined
+across a redefinition of that carrier.** `should_inline` has the block address
+and operation index to answer that; it does not currently ask.
+
 ### Why the spelling cannot be unified at the mint, and what that leaves
 
 Two attempts, both measured, both reverted.
