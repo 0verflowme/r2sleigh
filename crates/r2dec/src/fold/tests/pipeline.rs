@@ -4659,7 +4659,19 @@ mod tests {
 
         let single_ordinary = make_var("ordinary_single", 1, 8);
         mark_use(&mut ctx, &single_ordinary, 1);
+        ctx.state
+            .analysis_ctx
+            .use_info
+            .definitions
+            .insert(single_ordinary.display_name(), CExpr::IntLit(7));
         assert!(ctx.should_inline(&single_ordinary));
+
+        // Leaving the statement out says the reader will inline the value, so a
+        // value nothing can render keeps its statement rather than its name
+        // being printed with nothing defining it.
+        let single_unrenderable = make_var("ordinary_single_unrenderable", 1, 8);
+        mark_use(&mut ctx, &single_unrenderable, 1);
+        assert!(!ctx.should_inline(&single_unrenderable));
 
         let stack_base = make_var("RSP", 1, 8);
         mark_use(&mut ctx, &stack_base, 1);
@@ -4667,6 +4679,11 @@ mod tests {
 
         let return_reg = make_var("RAX", 1, 8);
         mark_use(&mut ctx, &return_reg, 1);
+        ctx.state
+            .analysis_ctx
+            .use_info
+            .definitions
+            .insert(return_reg.display_name(), CExpr::IntLit(9));
         assert!(ctx.should_inline(&return_reg));
         ctx.state.return_blocks.insert(0x2000);
         ctx.current_block_addr.set(Some(0x2000));

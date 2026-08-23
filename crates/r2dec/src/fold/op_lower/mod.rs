@@ -3040,6 +3040,21 @@ impl<'a> FoldingContext<'a> {
         })
     }
 
+    /// Whether anything other than the value's own name can render it.
+    ///
+    /// Leaving a statement out says its reader will inline the value. If nothing
+    /// can produce it, the reader prints the name instead and the name has no
+    /// definition, so the promise has to be checked rather than assumed.
+    fn value_has_something_to_render(&self, var_name: &str) -> bool {
+        self.definition_for_name(var_name).is_some()
+            || self.call_result_source_for_ssa_name(var_name).is_some()
+            || self.local_post_call_source_for_ssa_name(var_name).is_some()
+            || self.semantic_value_for_name(var_name).is_some()
+            // A flag is rendered by the comparison it spells, not by a table.
+            || self.inputs.arch.is_flag_name(var_name)
+            || self.condition_vars_set().contains(var_name)
+    }
+
     fn should_inline(&self, var: &SSAVar) -> bool {
         let var_name = var.display_name();
         let use_count = self.use_counts_map().get(&var_name).copied().unwrap_or(0);
@@ -3097,8 +3112,12 @@ impl<'a> FoldingContext<'a> {
                 return true;
             }
             // Inline any register with a definition when it is single-use
-            // or the definition is trivially small.
-            if use_count == 1 || self.is_simple_inline_candidate(&var_name) {
+            // or the definition is trivially small. A value with no definition
+            // to inline is not inlined by being left out: the reader prints its
+            // name, and dropping the statement leaves that name undefined.
+            if (use_count == 1 && self.value_has_something_to_render(&var_name))
+                || self.is_simple_inline_candidate(&var_name)
+            {
                 return true;
             }
         }
