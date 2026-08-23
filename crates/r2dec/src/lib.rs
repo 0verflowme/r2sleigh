@@ -1434,8 +1434,16 @@ fn note_unproven_constructs(func: &mut CFunction, ledger: Option<&r2ssa::ledger:
     };
     let detail = match ledger.map(r2ssa::ledger::ObligationLedger::close) {
         Some(closure) if closure.total > 0 => {
+            // "built", not "rendered". The fold records the claim when it builds an
+            // expression for a site, and structuring deletes statements afterwards
+            // with nothing revisiting it, so the count is what was constructed and
+            // not what reached the page. Printing the statements the body actually
+            // holds beside it puts the difference in the line rather than leaving a
+            // reader to assume the two agree: a function claiming 1693 against 29
+            // statements says so on its face. Witnessing each claim needs a rendered
+            // name to say which value it stands for, which is the location model.
             let mut line = format!(
-                "{detail}; {} source obligations: {} rendered, {} elided, {} refused",
+                "{detail}; {} source obligations: {} built, {} elided, {} refused",
                 closure.total, closure.rendered, closure.elided, closure.refused
             );
             // The column that used to have no name. Saying nothing here is what let a
@@ -1446,6 +1454,11 @@ fn note_unproven_constructs(func: &mut CFunction, ledger: Option<&r2ssa::ledger:
             if closure.conflicts > 0 {
                 let _ = write!(&mut line, ", {} conflicting", closure.conflicts);
             }
+            let _ = write!(
+                &mut line,
+                "; {} statements rendered",
+                count_body_statements(&func.body)
+            );
             line
         }
         _ => detail,
@@ -1463,8 +1476,13 @@ fn note_unproven_constructs(func: &mut CFunction, ledger: Option<&r2ssa::ledger:
 /// reported most of its obligations owned. This works at whole-function
 /// granularity because that is what can be proven without statement provenance;
 /// a statement that survives structuring cannot yet name the obligations it carries.
-fn reconcile_ledger_with_body(ledger: &mut r2ssa::ledger::ObligationLedger, func: &CFunction) {
+fn reconcile_ledger_with_body(
+    ledger: &mut r2ssa::ledger::ObligationLedger,
+    func: &CFunction,
+    proofs: &[crate::fold::context::EffectRenderProof],
+) {
     use r2ssa::ledger::{LedgerLayer, Outcome, RefusalReason};
+    debug_log_render_witness(ledger, func, proofs);
     let rendered_any_statement = func
         .body
         .iter()
@@ -1486,6 +1504,112 @@ fn reconcile_ledger_with_body(ledger: &mut r2ssa::ledger::ObligationLedger, func
             },
         );
     }
+}
+
+/// How much of what the ledger calls rendered the finished body can be shown to carry.
+///
+/// `Rendered` is recorded when the fold *builds* an expression for a site, and
+/// building is not output: structuring and cleanup delete statements afterwards,
+/// and nothing revisits the claim. A function reported 1693 of 1754 obligations
+/// rendered with five lines on the page, and the line read as an account of a
+/// complete rendering.
+///
+/// A claim can be witnessed when the value the site produces is one the body
+/// still names, because a name is a reference the symbol table issued and the
+/// table records which value each name stands for. A value the fold inlined into
+/// a surviving expression has no name and so cannot be witnessed this way, which
+/// is why this measures rather than decides: the question is whether the witness
+/// separates an honest rendering from a hollow one before it is allowed to
+/// retract anything.
+fn debug_log_render_witness(
+    ledger: &r2ssa::ledger::ObligationLedger,
+    func: &CFunction,
+    proofs: &[crate::fold::context::EffectRenderProof],
+) {
+    if !unowned_report_requested() {
+        return;
+    }
+    use r2ssa::ledger::Outcome;
+    let named_values = {
+        let table = func.symbols.borrow();
+        collect_stmt_var_names(&func.body)
+            .into_iter()
+            .chain(func.params.iter().map(|param| param.name))
+            .chain(func.locals.iter().map(|local| local.name))
+            .filter_map(|id| table.get(id).origin.value)
+            .collect::<HashSet<_>>()
+    };
+    // A site names every value its proof touches, so one lookup answers for all
+    // of them rather than one per field.
+    let mut witnessed_sites = HashSet::new();
+    for proof in proofs {
+        let touches = proof
+            .target
+            .iter()
+            .chain(proof.value.iter())
+            .chain(proof.address.iter())
+            .chain(proof.values.iter())
+            .any(|value| named_values.contains(value));
+        if touches {
+            witnessed_sites.insert((proof.block_addr, proof.op_idx));
+        }
+    }
+    let (claimed, witnessed) = ledger.entries().fold((0usize, 0usize), |(all, seen), (_, outcome)| {
+        match outcome {
+            Outcome::Rendered { block_addr, op_idx } => (
+                all + 1,
+                seen + usize::from(witnessed_sites.contains(&(block_addr, op_idx))),
+            ),
+            _ => (all, seen),
+        }
+    });
+    let statements = count_body_statements(&func.body);
+    let message = format!(
+        "WITNESS fn={} claimed-rendered={claimed} witnessed={witnessed} body-statements={statements} named-values={}",
+        func.name,
+        named_values.len(),
+    );
+    let path = std::env::var("R2SLEIGH_DEBUG_UNOWNED_LOG")
+        .unwrap_or_else(|_| "/tmp/r2sleigh_unowned.log".to_string());
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        use std::io::Write;
+        let _ = writeln!(file, "{message}");
+    }
+}
+
+/// Statements the body holds, counting the ones nested inside control flow.
+fn count_body_statements(stmts: &[CStmt]) -> usize {
+    fn visit(stmt: &CStmt) -> usize {
+        match stmt {
+            CStmt::Comment(_) | CStmt::Empty => 0,
+            CStmt::Block(inner) => inner.iter().map(visit).sum(),
+            CStmt::If {
+                then_body,
+                else_body,
+                ..
+            } => 1 + visit(then_body) + else_body.as_deref().map(visit).unwrap_or(0),
+            CStmt::While { body, .. } | CStmt::DoWhile { body, .. } => 1 + visit(body),
+            CStmt::For { init, body, .. } => {
+                1 + init.as_deref().map(visit).unwrap_or(0) + visit(body)
+            }
+            CStmt::Switch { cases, default, .. } => {
+                1 + cases
+                    .iter()
+                    .map(|case| case.body.iter().map(visit).sum::<usize>())
+                    .sum::<usize>()
+                    + default
+                        .as_ref()
+                        .map(|body| body.iter().map(visit).sum::<usize>())
+                        .unwrap_or(0)
+            }
+            _ => 1,
+        }
+    }
+    stmts.iter().map(visit).sum()
 }
 
 /// What became of every obligation this function's source inventory recorded.
@@ -3347,7 +3471,7 @@ impl Decompiler {
             &fold_ctx.folded_block_addrs(),
             &fold_ctx.elided_op_sites(),
         );
-        reconcile_ledger_with_body(&mut ledger, &c_function);
+        reconcile_ledger_with_body(&mut ledger, &c_function, &fold_ctx.effect_render_proofs_since(0));
         note_unproven_constructs(&mut c_function, Some(&ledger));
         // Every name the body assigns has a declaration by now, so a name
         // still without one is never assigned: it is read, and nothing in the
