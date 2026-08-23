@@ -2860,3 +2860,37 @@ induction step (`rcx += 2` where the machine increments once, and the same shape
 as fnv1a64's two `x8++`); the definition skipped on an unverified promise that its
 single reader will inline it (`mod.rs:12755`, whose reader is depth-capped at 2);
 and the spurious third parameter in x86 `sum32`.
+
+### arm64's ninety-six names: lane storage has no merge
+
+The x86 fix does not apply here, and neither does refusing to compose entry
+values -- both were tried and measured inert. The trace says why.
+
+The undefined names are `reg:5001_0` through `reg:500f_0` and three more runs of
+fifteen, all **version zero**, while lane zero of each run is absent from the
+list. The lanes are not undefined in SSA: `reg:5001_1`, `_2` and `_3` all have
+definitions. And the entry read is in **the same block** as two of those
+definitions:
+
+    def        reg:5001_1   block 0x194
+    def        reg:5001_2   block 0x194
+    read-entry reg:5001_0   block 0x194
+    def        reg:5001_3   block 0x1e4
+    read-entry reg:5001_0   block 0x1e4
+
+Block 0x194 is the loop body. A read that precedes the writes in a loop body is
+reading what the *previous iteration* left there, which is a merge -- and there is
+no phi for lane storage, so renaming hands it the value the function was entered
+with, on every iteration. The composition then faithfully concatenates fifteen
+entry lanes with one live one, and the ninety-six names are the honest report of
+that.
+
+So this is the sub-register aliasing gap at the renaming layer, not at the repair
+layer where the wide-read fix landed. `crates/r2ssa/src/rename.rs` places phis
+from `PhiPlacement` and records `canonical_storage_by_var` (`rename.rs:154`,
+`:347`) but does not place phis for the storage a register family shares. Until
+it does, any value a loop carries in part of a register reads as its entry value.
+
+That is the next real piece of work, and it is the same defect this document
+opened with, one layer further in: the repair pass now composes correctly from
+whatever reaches it, and what reaches it is wrong.
