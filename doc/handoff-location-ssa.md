@@ -207,10 +207,37 @@ Keeping that statement is the fix, and it renders
 
     t7400_2 = x8; x8++; ... *t7400_2
 
-which is correct. So the rule wanted is an *inlining* constraint, not a naming
-one: **a value whose definition reads a carrier member must not be inlined
-across a redefinition of that carrier.** `should_inline` has the block address
-and operation index to answer that; it does not currently ask.
+which is correct. So the rule wanted looked like an *inlining* constraint. It was built --
+`should_inline` declining a value whose producer is a `Copy` from a carrier
+member that a later member supersedes -- and the probe confirms it fires:
+
+    CROSS key=tmp:7400_2 producer=Copy{..} src=X8_2 alias=Some("x8")
+    CROSS key=tmp:7400_2 source_version=2 answer=true
+
+The rendering did not change, because the decision is not taken there. The load
+resolves its address through `get_expr`, which answers before reaching the
+inline check:
+
+    GETEXPR key=tmp:7400_2 answer=Var(..)
+
+and the name it returns is the carrier's, not the temporary's own `t7400_2`.
+The branch that gets there first is the **semantic value**: the saved address is
+recorded as equalling `x8`, which is true at the copy and false after the
+increment.
+
+**Semantic values are timeless and a carrier's identity is not.** That is the
+third table to answer for a carrier this way -- the recorded definition and the
+forwarded value were the first two, and both already decline for a carrier
+member. The semantic value does not, and it is the one that decides here.
+
+The fix is the same shape as the two already in the tree: a semantic value that
+names a carrier must decline at a point where the carrier has moved on. Where
+`semanticize_visible_expr` and `render_semantic_value_by_name` already take a
+carrier into account, they consider membership and not ordering.
+
+Four interventions on this defect measured inert. Every one was written before
+the probe that would have ruled it out, which is the trap this document opens
+with.
 
 ### Why the spelling cannot be unified at the mint, and what that leaves
 
