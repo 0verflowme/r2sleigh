@@ -3406,6 +3406,14 @@ impl<'a> FoldingContext<'a> {
             return expr.clone();
         }
 
+        if std::env::var_os("R2SLEIGH_DEBUG_MERGES").is_some() {
+            eprintln!(
+                "FOLDBARE key={key} fwd={} ambiguous={} has_def={}",
+                self.forwarded_value_for_name(&key).is_some(),
+                self.use_info().ambiguous_value_names.contains(&key),
+                self.definition_for_name(&key).is_some()
+            );
+        }
         // Otherwise return a variable reference
         fallback
     }

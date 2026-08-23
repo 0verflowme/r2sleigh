@@ -928,10 +928,13 @@ impl<'a> FoldingContext<'a> {
             return named;
         }
         let pointee_load = dst.size < addr.size;
-        let fallback_addr_expr = self
-            .lookup_definition(&addr.display_name())
-            .or_else(|| self.definition_for_name(&addr.display_name()).cloned())
-            .unwrap_or_else(|| self.get_expr(addr));
+        // One resolver. `get_expr` already tries forwarding, then semantic
+        // values, then the recorded definition, then the name, and the two
+        // lookups that used to run ahead of it are the third and a variant of
+        // it -- so putting them first meant an address was resolved by a rule
+        // that had not been told what the value forwards to, while the decision
+        // to leave that value's statement out was taken by a rule that had.
+        let fallback_addr_expr = self.get_expr(addr);
         let mut semantic_visited = HashSet::new();
         let mut best = self.render_authoritative_memory_access_by_name(
             &dst.display_name(),
@@ -1012,10 +1015,13 @@ impl<'a> FoldingContext<'a> {
         value_size: u32,
         elem_ty: CType,
     ) -> CExpr {
-        let fallback_addr_expr = self
-            .lookup_definition(&addr.display_name())
-            .or_else(|| self.definition_for_name(&addr.display_name()).cloned())
-            .unwrap_or_else(|| self.get_expr(addr));
+        // One resolver. `get_expr` already tries forwarding, then semantic
+        // values, then the recorded definition, then the name, and the two
+        // lookups that used to run ahead of it are the third and a variant of
+        // it -- so putting them first meant an address was resolved by a rule
+        // that had not been told what the value forwards to, while the decision
+        // to leave that value's statement out was taken by a rule that had.
+        let fallback_addr_expr = self.get_expr(addr);
         let mut semantic_visited = HashSet::new();
         let mut best = self.render_authoritative_memory_access_by_name(
             &addr.display_name(),
