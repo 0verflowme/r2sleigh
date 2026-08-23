@@ -150,6 +150,38 @@ The corpus is the instrument in the meantime, and it is the better one: it
 measures rendered output against source directly rather than asking the
 decompiler to report on itself.
 
+### djb2's hang on arm64 is the repair pass, not a fourth carrier defect
+
+With the snapshot fix landed, arm64 -O2 `fnv1a32`, `fnv1a64` and `sdbm` are
+correct and `djb2` still does not terminate:
+
+    do {
+        int64_t x0 = arg0 + 1;
+        x8 = (uint32_t)0x1505 + ((uint32_t)0x1505 << 5) + *arg0;
+        x1 = arg1 - 1;
+    } while (x1 != 0);
+
+All three carriers read their entry values, so nothing converges. The fold's
+output for that block says why:
+
+    FSTMT 0 target=tregalias:1000005b8:0:0_1 reads=["tregalias:1000005b8:0:0_1"]
+    FSTMT 2 target=tregalias:1000005b8:4:0_1 reads=["tregalias:1000005b8:4:0_1"]
+
+Two of the twelve statements are the register-alias repair pass's synthesised
+temporaries assigning **themselves**. `djb2`'s loop opens with
+`add w8, w8, w8, lsl 5`, a shifted-register operand, which is what puts the
+repair pass on this path where `fnv1a32`'s loop does not.
+
+So this is not a fourth carrier-naming defect to chase. It is the pass the ADR
+schedules for deletion in step 4, whose synthesised names are the `tregalias`
+identifiers already recorded as leaking into output, reached from a new
+direction: they do not merely leak, they are self-referential, and a carrier
+whose update depends on one falls back to its entry value.
+
+That makes `djb2` at -O1 and -O2 a second falsification test for the location
+model, alongside deleting the pass: when narrow reads are expressed at
+construction, this loop should terminate.
+
 ### A carrier's one name cannot express a value read across its own update
 
 arm64 -O2 `fnv1a32` renders
