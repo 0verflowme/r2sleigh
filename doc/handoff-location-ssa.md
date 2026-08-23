@@ -303,8 +303,31 @@ tells them apart. Reverted.
 What tells them apart is where the carrier is next written, which is a program
 point. The failing test says so in its own message -- "at the latch program
 point" -- so the codebase already knows this fact is position-sensitive and
-`identity_values` records it as though it were not. `StorageSpans` already
-computes where a storage stops holding one value and could answer it.
+`identity_values` records it as though it were not.
+
+`StorageSpans` is **not** the piece that answers it: `join_with_same_storage`
+unions `X8_2` and `X8_3` into one run, so spans cannot tell two versions of one
+register apart, which is the whole question. `GraphInst` carries `block` and
+`ordinal`, so "is this storage defined again between the copy and its use" is
+answerable directly from the graph.
+
+### Correction: the snapshot is not a carrier alias, and three maps agree
+
+The entry above read `SPELL tmp:7400_2 branch=carrier -> x8` as proof that the
+carrier map holds the snapshot. That reading was wrong. Two `SPELL` lines were
+printed for one display name, which cannot be two branches of one call; they
+were two different `NameSource` implementations.
+
+Printed side by side, all three maps agree and **none** contains `tmp:7400`:
+
+    CARRIERALIAS  recomputed in the debug block
+    VIEWALIAS     PreparedSemanticView::carrier_alias_by_name, where spelling reads it
+    FOLDALIAS     FoldingContext::carrier_aliases, with the materialised-copy extension
+
+So `carrier_alias` declines and the spelling comes from the second branch,
+`var_alias`. `UseInfo::var_aliases` is seeded at `use_info.rs:112` by copying
+`env.carrier_aliases` wholesale -- **a fourth map of that name**, seeded
+separately by the fold. That is the one to print next, and it is one build.
 
 Six interventions, all inert, all reverted. The trace took seven steps and each
 one narrowed it: the memory renderer's branches, `get_expr`, the inline
