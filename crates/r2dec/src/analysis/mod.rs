@@ -792,7 +792,6 @@ impl UseInfo {
         }
         self.value_id_for_var(var)
             .and_then(|value_id| self.definitions_by_value.get(&value_id))
-            .or_else(|| self.definitions.get(&var.display_name()))
     }
 
     #[cfg(test)]
@@ -839,7 +838,6 @@ impl UseInfo {
         }
         self.value_id_for_name(name)
             .and_then(|value_id| self.definitions_by_value.get(&value_id))
-            .or_else(|| self.definitions.get(name))
     }
 
     /// Whether this name spells a condition code on this target.
@@ -860,7 +858,6 @@ impl UseInfo {
         }
         self.value_id_for_var(var)
             .and_then(|value_id| self.semantic_values_by_value.get(&value_id))
-            .or_else(|| self.semantic_values.get(&var.display_name()))
     }
 
     pub(crate) fn semantic_value_for_value(&self, value_id: ValueId) -> Option<&SemanticValue> {
@@ -905,7 +902,6 @@ impl UseInfo {
         // still about this value.
         self.value_id_for_var(var)
             .and_then(|value_id| self.forwarded_values_by_value.get(&value_id))
-            .or_else(|| self.forwarded_values.get(&var.display_name()))
     }
 
     pub(crate) fn forwarded_value_for_value(&self, value_id: ValueId) -> Option<&ValueProvenance> {
