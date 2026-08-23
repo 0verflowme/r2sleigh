@@ -13058,6 +13058,9 @@ impl<'a> FoldingContext<'a> {
     fn op_to_stmt_impl(&self, op: &SSAOp) -> Option<CStmt> {
         match op {
             SSAOp::Copy { dst, src } => {
+                if self.is_carrier_self_copy(dst, src) {
+                    return None;
+                }
                 if self.is_entry_arg_alias_copy(dst, src) {
                     return None;
                 }

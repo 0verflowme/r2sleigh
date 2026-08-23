@@ -43,6 +43,7 @@ pub(crate) fn materialize_certified_loop_carriers(
     let control = DecompileWorkControl::new(&execution, DecompileWorkPhase::Normalization);
     materialize_certified_loop_carriers_with_control(func, prepared, render_facts, control)
         .expect("default decompiler work control cannot stop")
+        .0
 }
 
 pub(crate) fn materialize_certified_loop_carriers_with_control(
@@ -50,7 +51,7 @@ pub(crate) fn materialize_certified_loop_carriers_with_control(
     prepared: &r2ssa::SsaArtifact,
     render_facts: &r2types::FunctionRenderFacts,
     control: DecompileWorkControl<'_>,
-) -> Result<SSAFunction, DecompileExecutionStop> {
+) -> Result<(SSAFunction, MaterializedEdgeCopies), DecompileExecutionStop> {
     materialize_phis_where_with_control(func, control, |phi| {
         prepared
             .graph()
@@ -59,12 +60,26 @@ pub(crate) fn materialize_certified_loop_carriers_with_control(
     })
 }
 
+/// A copy materialisation put on a control-flow edge, by the block holding it.
+///
+/// Named so a later pass can ask whether a statement is one of these rather than
+/// inferring it from a name table computed against a different function, which
+/// is what two earlier attempts did and why both measured inert.
+pub(crate) type MaterializedEdgeCopies = HashSet<(u64, r2ssa::SSAVar, r2ssa::SSAVar)>;
+
+/// A shared empty set, for a fold that ran no materialisation.
+pub(crate) fn no_materialized_edge_copies() -> &'static MaterializedEdgeCopies {
+    static EMPTY: std::sync::OnceLock<MaterializedEdgeCopies> = std::sync::OnceLock::new();
+    EMPTY.get_or_init(MaterializedEdgeCopies::new)
+}
+
 fn materialize_phis_where_with_control(
     func: &SSAFunction,
     control: DecompileWorkControl<'_>,
     mut eligible: impl FnMut(&r2ssa::PhiNode) -> bool,
-) -> Result<SSAFunction, DecompileExecutionStop> {
+) -> Result<(SSAFunction, MaterializedEdgeCopies), DecompileExecutionStop> {
     control.poll()?;
+    let mut inserted: MaterializedEdgeCopies = HashSet::new();
     let mut normalized = func.clone();
     let liveness = PhiEdgeLiveness::compute_with_control(func, control)?;
     let mut copies_by_pred: HashMap<u64, Vec<SSAOp>> = HashMap::new();
@@ -125,6 +140,11 @@ fn materialize_phis_where_with_control(
                 selected.iter().map(|phi| phi.dst.clone()).collect(),
             );
             for (pred, moves) in scheduled {
+                for planned in &moves {
+                    if let r2ssa::SSAOp::Copy { dst, src } = &planned.op {
+                        inserted.insert((pred, dst.clone(), src.clone()));
+                    }
+                }
                 copies_by_pred
                     .entry(pred)
                     .or_default()
@@ -156,7 +176,7 @@ fn materialize_phis_where_with_control(
     }
 
     control.poll()?;
-    Ok(normalized)
+    Ok((normalized, inserted))
 }
 
 #[cfg(test)]
@@ -165,6 +185,7 @@ fn materialize_all_phis(func: &SSAFunction) -> SSAFunction {
     let control = DecompileWorkControl::new(&execution, DecompileWorkPhase::Normalization);
     materialize_phis_where_with_control(func, control, |_| true)
         .expect("default decompiler work control cannot stop")
+        .0
 }
 
 struct PhiMove {

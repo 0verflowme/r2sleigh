@@ -814,6 +814,7 @@ mod tests {
         let empty_str = Box::leak(Box::new(HashMap::new()));
         let empty_ty = Box::leak(Box::new(HashMap::new()));
         FoldingContext::from_inputs(FoldInputs {
+            materialized_edge_copies: crate::normalize::no_materialized_edge_copies(),
             display_names: crate::empty_display_names(),
             arch,
             function_names: empty_u64,
@@ -863,6 +864,7 @@ mod tests {
         let empty_str = Box::leak(Box::new(HashMap::new()));
         let empty_ty = Box::leak(Box::new(HashMap::new()));
         FoldingContext::from_inputs(FoldInputs {
+            materialized_edge_copies: crate::normalize::no_materialized_edge_copies(),
             display_names: crate::empty_display_names(),
             arch,
             function_names: empty_u64,

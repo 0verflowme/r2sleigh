@@ -110,6 +110,12 @@ pub(crate) struct FoldInputs<'a> {
     pub(crate) prepared_objects: Option<&'a ObjectModel>,
     #[allow(dead_code)]
     pub(crate) prepared_memory: Option<&'a MemorySSAFacts>,
+    /// The copies materialisation put on control-flow edges.
+    ///
+    /// Reported by the pass that inserted them rather than recognised later, so
+    /// a carrier's back-edge copy is known to be one instead of being guessed at
+    /// from a name table built against the function before they existed.
+    pub(crate) materialized_edge_copies: &'a crate::normalize::MaterializedEdgeCopies,
 }
 
 impl<'a> FoldInputs<'a> {
@@ -290,12 +296,26 @@ impl FoldArchConfig {
 
 impl<'a> FoldingContext<'a> {
     pub(crate) fn from_inputs(inputs: FoldInputs<'a>) -> Self {
-        let carrier_aliases = match (inputs.prepared_ssa, inputs.function_facts.render()) {
+        let mut carrier_aliases = match (inputs.prepared_ssa, inputs.function_facts.render()) {
             (Some(prepared), Some(render)) => {
                 crate::normalize::carrier_name_aliases(prepared, render)
             }
             _ => HashMap::new(),
         };
+        // The aliases are computed over the function the artifact holds, and the
+        // fold walks the normalised one, so the versions materialisation
+        // introduced are absent and resolve through their definitions instead of
+        // through the carrier's name -- which is how one increment reached the
+        // page twice. Each inserted copy joins its destination to whichever side
+        // already has a name, so the map covers the function being walked.
+        for (_, dst, src) in inputs.materialized_edge_copies {
+            let (dst_key, src_key) = (dst.display_name(), src.display_name());
+            if let Some(name) = carrier_aliases.get(&src_key).cloned() {
+                carrier_aliases.entry(dst_key).or_insert(name);
+            } else if let Some(name) = carrier_aliases.get(&dst_key).cloned() {
+                carrier_aliases.entry(src_key).or_insert(name);
+            }
+        }
         Self {
             carrier_aliases,
             cross_block_reads: std::cell::RefCell::new(HashSet::new()),
@@ -442,6 +462,7 @@ impl<'a> FoldingContext<'a> {
         };
 
         let inputs = FoldInputs {
+            materialized_edge_copies: crate::normalize::no_materialized_edge_copies(),
             display_names: crate::empty_display_names(),
             arch,
             #[cfg(test)]

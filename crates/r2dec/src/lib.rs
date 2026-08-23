@@ -3121,16 +3121,17 @@ impl Decompiler {
                 }
             }
         }
-        let mut normalized_func = if let Some(render_facts) = self.context.function_facts.render() {
-            normalize::materialize_certified_loop_carriers_with_control(
-                func,
-                prepared,
-                render_facts,
-                work,
-            )?
-        } else {
-            func.clone()
-        };
+        let (mut normalized_func, materialized_edge_copies) =
+            if let Some(render_facts) = self.context.function_facts.render() {
+                normalize::materialize_certified_loop_carriers_with_control(
+                    func,
+                    prepared,
+                    render_facts,
+                    work,
+                )?
+            } else {
+                (func.clone(), normalize::MaterializedEdgeCopies::default())
+            };
         if let Some(render_facts) = self.context.function_facts.render() {
             normalize::materialize_certified_loop_carrier_initializers_with_control(
                 &mut normalized_func,
@@ -3140,6 +3141,24 @@ impl Decompiler {
             )?;
         }
         work.poll()?;
+        if std::env::var_os("R2SLEIGH_DEBUG_MERGES").is_some() {
+            // What materialisation left behind, so a carrier update that renders
+            // more than once shows which ops the fold was handed.
+            for block in normalized_func.blocks() {
+                for (index, op) in block.ops.iter().enumerate() {
+                    let op: &r2ssa::SSAOp = op;
+                    eprintln!(
+                        "NORMOP block={:#x} idx={index} dst={:?} srcs={:?}",
+                        block.addr,
+                        op.dst().map(|var| var.display_name()),
+                        op.sources()
+                            .iter()
+                            .map(|var| var.display_name())
+                            .collect::<Vec<_>>()
+                    );
+                }
+            }
+        }
         let func = &normalized_func;
         let func_name = func
             .name
@@ -3307,6 +3326,7 @@ impl Decompiler {
             })
         });
         let fold_inputs = FoldInputs {
+            materialized_edge_copies: &materialized_edge_copies,
             arch: &fold_arch,
             display_names: self.context.function_facts.display_names(),
             #[cfg(test)]
@@ -5709,6 +5729,7 @@ mod tests {
             caller_saved_regs: HashSet::new(),
         }));
         FoldingContext::from_inputs(FoldInputs {
+            materialized_edge_copies: crate::normalize::no_materialized_edge_copies(),
             display_names: crate::empty_display_names(),
             arch,
             function_names: Box::leak(Box::new(HashMap::new())),

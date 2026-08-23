@@ -396,6 +396,32 @@ impl<'a> FoldingContext<'a> {
         self.arg_alias_for_register_name(&lower)
     }
 
+    /// Whether a copy restates a carrier update the block has already rendered.
+    ///
+    /// Materialising a merge replaces it with a copy on every predecessor edge,
+    /// so a loop carries its update back to the header as `X8_2 = X8_3`. Once the
+    /// alias map covers what materialisation introduced, both sides are spelled
+    /// by the carrier's one name and the copy says `x8 = x8`, which the statement
+    /// that computed the update has already said.
+    ///
+    /// The edge into the loop is the same kind of copy and must be kept, because
+    /// nothing else introduces the carrier there. The two are told apart by
+    /// whether the source is an entry value: a version-0 source is the value the
+    /// function was called with and has no defining statement of its own, so the
+    /// copy is the only place the carrier is given it.
+    pub(super) fn is_carrier_self_copy(&self, dst: &SSAVar, src: &SSAVar) -> bool {
+        if src.version == 0 {
+            return false;
+        }
+        let (Some(dst_carrier), Some(src_carrier)) = (
+            self.carrier_aliases.get(&dst.display_name()),
+            self.carrier_aliases.get(&src.display_name()),
+        ) else {
+            return false;
+        };
+        dst_carrier == src_carrier
+    }
+
     pub(super) fn is_entry_arg_alias_copy(&self, dst: &SSAVar, src: &SSAVar) -> bool {
         if src.version != 0 {
             return false;
