@@ -817,10 +817,19 @@ impl UseInfo {
         self.definitions_by_value.get(&value_id)
     }
 
+    /// The definition of a value, asked for by the value.
+    ///
+    /// One precedence. `definition_for_name` and `definition_for_var` both ask
+    /// the value-keyed store first and fall back to the name-keyed one; this
+    /// asked in the opposite order, so the same question had two answers
+    /// depending on which accessor a caller happened to reach for. A value is
+    /// the identity here -- a name can be ambiguous and a value cannot -- so the
+    /// value-keyed store wins, as it does everywhere else.
     pub(crate) fn render_definition_for_value(&self, value_id: ValueId) -> Option<&CExpr> {
-        self.var_for_value_id(value_id)
-            .and_then(|var| lookup_name_key(&self.definitions, &var.display_name()))
-            .or_else(|| self.definition_for_value(value_id))
+        self.definition_for_value(value_id).or_else(|| {
+            self.var_for_value_id(value_id)
+                .and_then(|var| lookup_name_key(&self.definitions, &var.display_name()))
+        })
     }
 
     pub(crate) fn definition_for_name(&self, name: &str) -> Option<&CExpr> {
