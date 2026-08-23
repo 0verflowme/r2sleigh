@@ -3050,6 +3050,8 @@ impl<'a> FoldingContext<'a> {
             || self.call_result_source_for_ssa_name(var_name).is_some()
             || self.local_post_call_source_for_ssa_name(var_name).is_some()
             || self.semantic_value_for_name(var_name).is_some()
+            // A carrier is rendered by its own name, which it always has.
+            || self.carrier_aliases.contains_key(var_name)
             // A flag is rendered by the comparison it spells, not by a table.
             || self.inputs.arch.is_flag_name(var_name)
             || self.condition_vars_set().contains(var_name)
