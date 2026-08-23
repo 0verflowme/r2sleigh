@@ -2911,3 +2911,39 @@ register sixteen carriers. The fix is to present a loop-carried vector as one
 carrier over the whole storage rather than one per byte -- the same "one variable
 per storage" rule the naming and carrier work has been applying everywhere else,
 which is what makes it the right next piece rather than a special case for SIMD.
+
+### Why lane zero behaves and fifteen do not, and what blocks the fix
+
+The asymmetry has an exact mechanism. `ldp q0, q1, [x9, -0x20]` writes the whole
+sixteen bytes, and `seed_family_roots` records a root for that slot and for every
+*named* sub-slot inside it. `0x5000` is named -- it is `B0`, the byte view of `v0`
+-- so lane zero gets a root pointing at the wide value. `0x5001` through `0x500f`
+are unnamed varnodes, so they get none.
+
+Then `eor3 v0.16b, v0.16b, v16.16b, v4.16b` is lifted per lane, and the first
+lane write calls `kill_overlapping_family_roots`, which is
+
+    state.retain(|slot, _| !family_slots_overlap(*slot, written));
+
+so writing one byte throws away the whole-register root the load had just put
+there. The remaining fifteen lanes now have nothing to resolve through and keep
+their own phis, whose entry edges are undefined function-entry lanes. That is the
+sixty names, and the ledger reports them honestly.
+
+**Invalidating only the written range fixes most of it and cannot be kept yet.**
+Splitting each overlapping slot around the write -- retaining roots for the parts
+the write did not touch -- takes arm64 `xor_lanes` from 96 undefined names to 66
+and removes 120 synthetic obligations, with every other fixture unchanged. It also
+breaks `post_call_stack_store_does_not_fabricate_call_result_owner`, and that
+failure is correct: on x86-64 a 32-bit register write **zero-extends** into the
+full 64-bit register, so the upper half after `mov eax, ...` is zero, not what it
+held before. Preserving it is wrong, and the SSA cannot tell that case from a
+vector lane write because the p-code writes only the four bytes.
+
+So the prerequisite is modelling the zero-extension where it belongs -- a 32-bit
+x86 write defines the whole register -- after which range-precise invalidation is
+correct everywhere and can go back in. Splitting only for non-GPR families would
+buy the same numbers today and is the kind of arch-conditional the rest of this
+work has been removing, so it was not taken.
+
+The change is reverted; the mechanism above is what to build against.
