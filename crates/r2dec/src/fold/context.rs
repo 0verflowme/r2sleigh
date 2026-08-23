@@ -201,6 +201,15 @@ pub(crate) struct FoldingContext<'a> {
         std::cell::RefCell<HashMap<String, Option<String>>>,
     pub(crate) forwarded_source_cache: std::cell::RefCell<HashMap<String, Option<r2ssa::SSAVar>>>,
     pub(crate) load_expr_memo: std::cell::RefCell<HashMap<(ValueId, String), CExpr>>,
+    /// What a value renders as, for values whose statement was left out.
+    ///
+    /// Leaving a statement out is a promise that the reader will show the value
+    /// instead. The promise used to be made by one rule and kept by another, and
+    /// when they disagreed the reader printed the value's name and nothing
+    /// defined it. The expression the skipped statement would have carried is
+    /// recorded here as it is skipped, so the rule that decides and the rule that
+    /// renders are reading the same answer.
+    pub(crate) inlined_renderings: std::cell::RefCell<HashMap<String, CExpr>>,
     pub(crate) call_result_owner_name_cache:
         std::cell::RefCell<BTreeMap<(u64, usize), Option<String>>>,
     pub(crate) owned_call_visible_names_cache: std::cell::RefCell<Option<HashSet<String>>>,
@@ -332,6 +341,7 @@ impl<'a> FoldingContext<'a> {
             preferred_entry_arg_lookup_cache: std::cell::RefCell::new(HashMap::new()),
             forwarded_source_cache: std::cell::RefCell::new(HashMap::new()),
             load_expr_memo: std::cell::RefCell::new(HashMap::new()),
+            inlined_renderings: std::cell::RefCell::new(HashMap::new()),
             call_result_owner_name_cache: std::cell::RefCell::new(BTreeMap::new()),
             owned_call_visible_names_cache: std::cell::RefCell::new(None),
             prepared_semantic_view_cache: OnceCell::new(),

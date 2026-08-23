@@ -248,7 +248,18 @@ impl SymbolTable {
         };
     }
 
+    #[track_caller]
     pub fn declare_or_reuse(&mut self, name: &str) -> SymbolId {
+        // Which site puts a given spelling on the page. Every identifier is
+        // minted here, so a name reaching the output with nothing defining it
+        // was made by exactly one caller and this says which. Reading the
+        // resolvers found four that could have produced `rcx_4` and none that
+        // did, which is how long guessing takes.
+        if let Ok(want) = std::env::var("R2SLEIGH_TRACE_NAME")
+            && name.eq_ignore_ascii_case(&want)
+        {
+            eprintln!("NAMEMINT {name} via {}", std::panic::Location::caller());
+        }
         if let Some(existing) = self.by_name.get(name) {
             return *existing;
         }
@@ -535,8 +546,15 @@ pub fn var_ref(symbols: &RefCell<SymbolTable>, name: impl AsRef<str>) -> CExpr {
 /// The borrow ends when this returns, so two declarations may appear in one
 /// statement. Writing `borrow_mut()` inline holds the guard to the end of the
 /// statement instead, and a second declaration there deadlocks.
+#[track_caller]
 pub fn declare(symbols: &RefCell<SymbolTable>, name: impl AsRef<str>) -> SymbolId {
-    symbols.borrow_mut().declare_or_reuse(name.as_ref())
+    let name = name.as_ref();
+    if let Ok(want) = std::env::var("R2SLEIGH_TRACE_NAME")
+        && name.eq_ignore_ascii_case(&want)
+    {
+        eprintln!("NAMEDECL {name} via {}", std::panic::Location::caller());
+    }
+    symbols.borrow_mut().declare_or_reuse(name)
 }
 
 /// How a reference is spelled, for code that holds the table rather than a self.

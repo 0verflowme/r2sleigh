@@ -3305,6 +3305,12 @@ impl<'a> FoldingContext<'a> {
             return self.const_to_expr(var);
         }
 
+        // A statement that was left out on the promise of being inlined recorded
+        // what it would have shown. That is the answer, not a candidate.
+        if let Some(inlined) = self.inlined_renderings.borrow().get(&key) {
+            return inlined.clone();
+        }
+
         let fallback = self.var_ref(var);
         if let Some(expr) = self.signed_divrem_expr_for_value(var) {
             return expr;
@@ -12817,6 +12823,17 @@ impl<'a> FoldingContext<'a> {
                 // Skip if this will be inlined
                 let key = dst.display_name();
                 if self.should_inline(dst) {
+                    // Leaving the statement out promises the reader will show the
+                    // value. Record the expression this statement would have
+                    // carried, so the promise is kept from the same answer that
+                    // made it rather than reconstructed later by another rule.
+                    let inlined = self.op_to_expr(op);
+                    if !matches!(&inlined, CExpr::Var(id) if *self.spelling(*id) == *self.var_name(dst))
+                    {
+                        self.inlined_renderings
+                            .borrow_mut()
+                            .insert(key.clone(), inlined);
+                    }
                     // Inlined is rendered, and the expression reading it owns it
                     self.record_effect_render_proof_for_value(
                         EffectRenderProofKind::Expression,
