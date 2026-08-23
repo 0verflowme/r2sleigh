@@ -150,6 +150,45 @@ The corpus is the instrument in the meantime, and it is the better one: it
 measures rendered output against source directly rather than asking the
 decompiler to report on itself.
 
+### pearson's undefined index, traced to three resolvers
+
+`sym._pearson` at x86-64 -O0 renders
+
+    for (int64_t local_28 = 0; local_28 < arg1; local_28++) {
+        local_19 = rcx_4[0x1000019a0];
+    }
+
+with `rcx_4` defined nowhere. The chain, from probes rather than reasoning:
+
+  * `RCX_4 = IntSExt(EAX_3)` at idx 28, and `EAX_3 = IntXor(EAX_2, ECX_2)` at
+    idx 19, which is the table index `h ^ p[i]`. Both carry render proofs.
+  * The fold emits a statement for `eax_3` and none for `rcx_4`: `RCX_4` is
+    skipped at `fold_block` under "Skip if this will be inlined".
+  * With `rcx_4`'s statement gone, nothing reads `eax_3`, so its statement is
+    pruned as dead, and the reader prints a name with no definition.
+
+Two fixes were built for the skip and **both measured inert**:
+
+  * `should_inline` returns true for any caller-saved register without asking
+    whether anything can render it, while the branch below it does ask. Adding
+    the same guard changed nothing, because `value_has_something_to_render`
+    answers *true* for `RCX_4`.
+  * Replacing the prediction with the answer -- skip only when `get_expr` returns
+    something other than the value's own name -- also changed nothing, because
+    `get_expr` does resolve it, forwarding `RCX_4` to `EAX_3`.
+
+So the skip is decided by one resolver and the statement is built by another.
+The `Load` arm of `op_to_stmt_impl` builds its address through
+`render_canonical_load_expr`, which resolves by its own rules; `should_inline`
+consults `value_has_something_to_render`; `get_expr_with_depth` tries
+forwarding, then semantic values, then definitions, then the name. Three
+answers, and the one that decides whether to emit a statement is not the one
+that renders it.
+
+That is open item 1 -- a value has several constructions and nothing says which
+is the value -- on a case small enough to hold in one screen. It is not fixable
+at the skip site, which is what both attempts demonstrate. Both were reverted.
+
 ### Naming registers by location regresses the corpus, and why that orders the work
 
 The ADR puts the location model at step three and the fold rewrite at step
