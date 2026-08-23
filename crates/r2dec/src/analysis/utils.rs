@@ -178,41 +178,46 @@ pub(crate) fn uf_find(parent: &mut HashMap<String, String>, x: &str) -> String {
     root
 }
 
+/// How a value keyed only by its display name is spelled.
+///
+/// A rendered identifier is spelled by `spell_var`, which works from an
+/// `SSAVar`. Code that holds only the display name used to spell it separately,
+/// and the two disagreed: `spell_var` gave `tmp:25400_2` the name `t25400_2`
+/// while this gave the raw key back, so the statement defining the value and the
+/// expression using it were two different identifiers and the use read as
+/// undefined. Worse, every version-zero temporary was spelled `t0` whatever its
+/// name, so distinct values shared one identifier -- the collision the symbol
+/// table exists to make impossible, happening one layer above it.
+///
+/// So this reconstructs the variable and asks the same question `spell_var`
+/// asks. There is one spelling of a value, and this is not a second one.
 pub(crate) fn format_traced_name(key: &str, var_aliases: &HashMap<String, String>) -> String {
     if let Some(alias) = var_aliases.get(key) {
         return alias.clone();
     }
-
-    let kind = SSAVarNameKind::classify(key);
-    if !matches!(
-        kind,
-        SSAVarNameKind::Temporary | SSAVarNameKind::Constant | SSAVarNameKind::Memory
-    ) {
-        if let Some((base, version)) = key.rsplit_once('_') {
-            if version == "0" {
-                return base.to_lowercase();
-            }
-            return format!("{}_{}", base.to_lowercase(), version);
-        }
-        return key.to_lowercase();
+    let (base, version) = split_display_name(key);
+    // Size plays no part in how a name is spelled, so any value serves here.
+    let var = SSAVar::new(base, version, 0);
+    let rendered = ssa_render_base_name(&var);
+    if version > 0 {
+        format!("{rendered}_{version}")
+    } else {
+        rendered
     }
+}
 
-    if kind.is_temporary()
-        && let Some((base, version_str)) = SSAVarNameKind::strip_temporary_prefix(key)
-            .unwrap_or(key)
-            .rsplit_once('_')
-    {
-        if let Ok(ver) = version_str.parse::<u32>() {
-            return if ver > 0 {
-                format!("t{}_{}", base, ver)
-            } else {
-                "t0".to_string()
-            };
-        }
-        return format!("t{base}");
+/// A display name split back into the variable and version it was made from.
+///
+/// `display_name` joins them with an underscore, and a machine name may contain
+/// underscores of its own, so only a numeric tail is a version.
+pub(crate) fn split_display_name(key: &str) -> (&str, u32) {
+    match key.rsplit_once('_') {
+        Some((base, tail)) => match tail.parse::<u32>() {
+            Ok(version) => (base, version),
+            Err(_) => (key, 0),
+        },
+        None => (key, 0),
     }
-
-    key.to_string()
 }
 
 pub(crate) fn ssa_name_kind(name: &str) -> SSAVarNameKind {
@@ -731,7 +736,10 @@ mod tests {
 
     #[test]
     fn format_traced_name_keeps_temp_base_identity() {
-        assert_eq!(format_traced_name("tmp:11f80_0", &HashMap::new()), "t0");
+        // Version zero is still this temporary, not a name shared with every
+        // other version-zero temporary in the function.
+        assert_eq!(format_traced_name("tmp:11f80_0", &HashMap::new()), "t11f80");
+        assert_eq!(format_traced_name("tmp:25400_0", &HashMap::new()), "t25400");
         assert_eq!(
             format_traced_name("tmp:11f80_19", &HashMap::new()),
             "t11f80_19"
@@ -747,13 +755,14 @@ mod tests {
     fn format_traced_name_uses_typed_name_kinds_for_visibility() {
         assert_eq!(format_traced_name("RAX_0", &HashMap::new()), "rax");
         assert_eq!(format_traced_name("RAX_2", &HashMap::new()), "rax_2");
-        assert_eq!(
-            format_traced_name("const:2a_0", &HashMap::new()),
-            "const:2a_0"
-        );
+        // A constant and a memory cell are not variables, and neither spelling
+        // here is a legal C identifier. What this pins is that the answer matches
+        // `spell_var`'s, so a value has one spelling; that either of these reaches
+        // a name at all is a separate defect, recorded rather than papered over.
+        assert_eq!(format_traced_name("const:2a_0", &HashMap::new()), "const:2a");
         assert_eq!(
             format_traced_name("ram:401000_0", &HashMap::new()),
-            "ram:401000_0"
+            "ram:401000"
         );
 
         let aliases = HashMap::from([(String::from("tmp:11f80_19"), String::from("idx"))]);

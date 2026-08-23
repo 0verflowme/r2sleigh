@@ -178,6 +178,7 @@ impl<'a> LowerCtx<'a> {
         }
 
         let key = var.display_name();
+        let trace = std::env::var_os("R2SLEIGH_DEBUG_MERGES").is_some();
         // A version-zero register is the value the function was entered with, so
         // nothing forwarded it here and provenance cannot speak for it.
         if var.version > 0
@@ -185,10 +186,22 @@ impl<'a> LowerCtx<'a> {
             && depth < 8
             && visited.insert(format!("prov:{key}"))
         {
+            if trace {
+                eprintln!("RESOLVE key={key} via=forwarded source={}", prov.source);
+            }
             return self.expr_for_ssa_name_with_depth(&prov.source, depth + 1, visited);
         }
         if let Some(expr) = self.render_semantic_value_for_var(var, depth, visited) {
+            if trace {
+                eprintln!("RESOLVE key={key} via=semantic");
+            }
             return expr;
+        }
+        if trace && self.definition_for_var(var).is_some() {
+            eprintln!(
+                "RESOLVE key={key} via=definition inline={}",
+                self.should_inline(&key)
+            );
         }
         if depth < 8
             && self.should_inline(&key)

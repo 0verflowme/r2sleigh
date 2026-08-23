@@ -252,6 +252,13 @@ impl SymbolTable {
         if let Some(existing) = self.by_name.get(name) {
             return *existing;
         }
+        // A rendered identifier is spelled by `spell_var`, which never emits a
+        // raw SSA name. One that arrives here still wearing its space prefix came
+        // from somewhere that handed a machine name straight to the table, and
+        // that is how `tmp:25400` reaches the page as `tmp_25400`.
+        if std::env::var_os("R2SLEIGH_DEBUG_MERGES").is_some() && name.contains(':') {
+            eprintln!("RAWMINT name={name}");
+        }
         let id = self.id_at(self.symbols.len());
         self.by_name.insert(name.to_string(), id);
         self.symbols.push(Symbol {
