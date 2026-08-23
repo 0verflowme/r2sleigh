@@ -269,10 +269,32 @@ considers `is_register_candidate_var`, and a temporary is not one. The
 `var_aliases` insertion in `prepared_semantic.rs:2958` is ruled out: it returns
 early unless `var.version == 0`.
 
-So the next step is a print inside `spell_var` naming which branch returns, for
-a traced display name. It is four lines and it ends this. Do not write another
-guard first: five have been written for this defect and all five were inert
-because the name was already decided before they ran.
+That print was taken and it ends the trace:
+
+    SPELL tmp:7400_2 branch=carrier -> x8
+
+`spell_var` names the snapshot after the carrier on its *first* branch, before
+anything else is consulted. `carrier_alias` reads
+`PreparedSemanticView::carrier_alias_by_name`, which is built by
+`carrier_name_aliases`, whose members are the carrier fact's `identity_values`,
+`entries` and `updates`.
+
+**So the carrier fact itself claims the snapshot is part of the carrier's
+identity.** It is, at the moment the copy is taken, and it is not one
+instruction later. `LoopCarrierFact::identity_values` records values that equal
+the carrier without recording where they stop equalling it, and every layer
+downstream believes it -- which is why six interventions in `r2dec` were inert:
+each suppressed one consumer of a claim that was still true everywhere else.
+
+The fix belongs in `r2ssa`, where the fact is made: a value copied out of a
+carrier is not an identity value past the next definition of that carrier. Until
+then no rendering change in `r2dec` can help, and this defect costs every arm64
+accumulator loop one byte.
+
+Six interventions, all inert, all reverted. The trace took seven steps and each
+one narrowed it: the memory renderer's branches, `get_expr`, the inline
+decision, the fold's carrier map, `spell_var`'s branches, `carrier_alias_by_name`,
+and finally `identity_values`.
 
 ### Why the spelling cannot be unified at the mint, and what that leaves
 
