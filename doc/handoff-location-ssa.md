@@ -150,6 +150,45 @@ The corpus is the instrument in the meantime, and it is the better one: it
 measures rendered output against source directly rather than asking the
 decompiler to report on itself.
 
+### Naming registers by location regresses the corpus, and why that orders the work
+
+The ADR puts the location model at step three and the fold rewrite at step
+seven. Measurement says those are the wrong way round, and the experiment is
+cheap enough to repeat.
+
+`varnode_to_name` keys the register map by `(offset, size)`, so `x9` and `w9`
+are two names, and `RenameContext` keys its version stacks by name. That is the
+root of every symptom this branch has chased: a write through `w9` never reaches
+a read of `x9`, so the repair pass splices projections afterwards to reconcile
+them, and its synthesised temporaries are the `tregalias:` names leaking into
+the output.
+
+Naming a register varnode by its place -- the widest entry at that offset, with
+the varnode's own size saying how much was touched -- was built and measured.
+The workspace stayed green apart from four offline lift fixtures, which is what
+a naming change should move. Rendering did not:
+
+    x86-64 -O0     4 correct -> 1 correct
+    arm64  -O2     `fnv1a32` stopped compiling
+
+Reverted. The reason is that a name is not only an identity here, it is also a
+width: about seven hundred call sites key on `display_name()`, and they assume
+the name says how wide the value is. Naming by place without expressing narrow
+access explicitly at the same time leaves those sites reading a full-width name
+for a four-byte value. Half the model is worse than neither.
+
+**So the location model cannot land before the name-keyed stores are re-keyed,
+and that is the fold rewrite.** Step seven is a prerequisite for step three, not
+a sequel to it. The ADR's ordering has a cycle in it and this is where it shows.
+
+The fixture failure is worth keeping too: `check_secret source ABI parameter x
+in 0 must bind EDI` -- the source contract states parameter registers by
+spelling, so a parameter that lives in the `RDI` location read at four bytes no
+longer matches. That is the same contract gap already recorded for the
+return-value location, now for parameters, and it wants the same answer: the
+source should state the location, and bindings should be compared by location
+rather than by name.
+
 ### How to measure here, which cost more than any single fix
 
   * **Sampling profiles mislead.** They name the functions most often on the
