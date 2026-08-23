@@ -633,12 +633,51 @@ impl SsaArtifact {
         for loop_fact in self.facts.structured.loops.values() {
             for carrier in &loop_fact.carriers {
                 let members = crate::mirror::carrier_members(carrier);
-                if !spans.all_one_span(members.iter().copied()) {
+                let occupants = self.carrier_storage_occupants(carrier, &members);
+                if !spans.all_one_span(occupants.iter().copied()) {
                     spanning.insert(carrier.id);
                 }
             }
         }
         spanning
+    }
+
+    /// The members of a carrier that live in the storage the carrier is.
+    ///
+    /// A carrier's members include the value each update computes, and a lifter
+    /// is free to compute that anywhere: Sleigh routes a flag-setting subtract
+    /// through a unique-space temporary, so `subs x1, x1, 1` contributes a member
+    /// in `Unique` to a carrier that is a register. That temporary is the
+    /// arithmetic, not the storage, and asking whether it shares a run with the
+    /// register asks whether two different places are one place, which they never
+    /// are. Every counter on this target was answered "spans a reuse" on that
+    /// basis, dropped from the name aliases, and rendered as the value it held on
+    /// entry -- a loop whose condition never changes.
+    ///
+    /// Reuse is a question about one storage holding two meanings, so only the
+    /// members in that storage can answer it.
+    fn carrier_storage_occupants(
+        &self,
+        carrier: &crate::semantic::LoopCarrierFact,
+        members: &std::collections::BTreeSet<crate::ValueId>,
+    ) -> std::collections::BTreeSet<crate::ValueId> {
+        let storage_of = |value: crate::ValueId| {
+            self.graph
+                .value(value)
+                .and_then(|value| value.canonical_storage)
+                .filter(|storage| !storage.is_unknown())
+        };
+        let Some(carrier_storage) = storage_of(carrier.phi) else {
+            return members.clone();
+        };
+        members
+            .iter()
+            .copied()
+            .filter(|member| {
+                storage_of(*member)
+                    .is_some_and(|storage| crate::span::same_run(carrier_storage, storage))
+            })
+            .collect()
     }
 
     /// Carriers this function moves through memory that already holds them.

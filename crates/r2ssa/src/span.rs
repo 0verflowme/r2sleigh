@@ -151,7 +151,7 @@ impl StorageSpans {
 /// Sub-register writes land at the same offset in the same space, so the offset
 /// and space are what say "same place" and the size says only how much of it was
 /// touched.
-fn same_run(left: CanonicalStorageId, right: CanonicalStorageId) -> bool {
+pub fn same_run(left: CanonicalStorageId, right: CanonicalStorageId) -> bool {
     left.space == right.space && left.offset == right.offset
 }
 

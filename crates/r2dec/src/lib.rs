@@ -3037,6 +3037,89 @@ impl Decompiler {
                 live.len(),
                 live.unresolved_blocks().count()
             );
+            // Which merges the carrier gate admits, and which it turns away. The
+            // gate is one question asked per phi, so printing its answer beside the
+            // merge names the value that is lost rather than the layer that lost it.
+            let render_facts = self.context.function_facts.render();
+            for block in func.blocks() {
+                for phi in &block.phis {
+                    let value = graph.value_id_for_var(&phi.dst);
+                    let carrier = value.is_some_and(|value| {
+                        render_facts.is_some_and(|facts| {
+                            facts.loop_carrier_for_value(value).is_some()
+                        })
+                    });
+                    eprintln!(
+                        "MERGEPHI block={:#x} dst={} size={} value={:?} carrier={}",
+                        block.addr,
+                        phi.dst.display_name(),
+                        phi.dst.size,
+                        value,
+                        carrier
+                    );
+                }
+            }
+            // What each carrier member is spelled as, so a member that some other
+            // table also answers for shows up as a name the body never uses.
+            if let Some(facts) = render_facts {
+                // A carrier the alias map drops is spelled by whatever else answers
+                // for its name, so the two filters that drop one are printed by name.
+                let mirrored = prepared.memory_mirrored_carriers();
+                let reused = prepared.carriers_spanning_a_reuse();
+                let spans = prepared.storage_spans();
+                for carrier in facts.loop_carriers() {
+                    if let r2types::CertifiedEntity::LoopCarrier {
+                        id,
+                        phi,
+                        identity_values,
+                        entries,
+                        updates,
+                        ..
+                    } = carrier
+                    {
+                        eprintln!(
+                            "CARRIERFILTER id={:?} phi={:?} var={} mirrored={} reused={}",
+                            id,
+                            phi,
+                            graph
+                                .value(*phi)
+                                .map(|value| value.var.display_name())
+                                .unwrap_or_default(),
+                            mirrored.contains(id),
+                            reused.contains(id)
+                        );
+                        // A member in a second span is what makes a carrier span a
+                        // reuse, so each member prints with the span it landed in.
+                        let members = identity_values
+                            .iter()
+                            .copied()
+                            .chain(entries.iter().map(|edge| edge.value))
+                            .chain(updates.iter().flat_map(|update| {
+                                std::iter::once(update.value)
+                                    .chain(update.identity_values.iter().copied())
+                            }))
+                            .collect::<std::collections::BTreeSet<_>>();
+                        for member in members {
+                            eprintln!(
+                                "  MEMBER value={:?} var={} storage={:?} span={:?}",
+                                member,
+                                graph
+                                    .value(member)
+                                    .map(|value| value.var.display_name())
+                                    .unwrap_or_default(),
+                                graph.value(member).and_then(|value| value.canonical_storage),
+                                spans.span_of(member)
+                            );
+                        }
+                    }
+                }
+                let aliases = normalize::carrier_name_aliases(prepared, facts);
+                let mut entries = aliases.into_iter().collect::<Vec<_>>();
+                entries.sort();
+                for (member, name) in entries {
+                    eprintln!("CARRIERALIAS member={member} name={name}");
+                }
+            }
         }
         let mut normalized_func = if let Some(render_facts) = self.context.function_facts.render() {
             normalize::materialize_certified_loop_carriers_with_control(
