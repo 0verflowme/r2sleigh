@@ -224,9 +224,31 @@ whatever else offers a candidate.
 All three reverted, being attempted fixes rather than consolidations. Each is a
 correct statement: a narrow phi over a carrier's location is the carrier, the
 return resolver should consult the carrier map, and a carrier beats a constant.
-They should be re-applied together with the producer that currently wins, which
-is what to find first -- print every call into `preferred_return_candidate` with
-its caller under `#[track_caller]`, rather than adding a seventh guard.
+That print was taken. Two sites offer a candidate, both inside
+`merged_return_register_candidate_for_block`, and in this order:
+
+    RETCALL from=return_resolver.rs:526 cur=[-]        cand=[UIntLit(2166136261)]
+    RETCALL from=return_resolver.rs:519 cur=[UIntLit]  cand=[rax]
+
+The constant lands first and the carrier is offered against it, so the
+preference is decisive -- and applying only the carrier-beats-constant rule
+still renders the seed. `merged_return_register_candidate_for_block`'s answer is
+not what reaches the page: `op_lower/mod.rs:12825` takes `last_ret_value` first
+and, failing that, passes the merged answer through
+`resolve_return_target_expr`, which resolves again.
+
+**That is seven components deciding one return value**, each able to override
+the last: the two offering sites, the carrier branch, `spell_var`,
+`resolve_return_candidate_in_context`, the preference, `last_ret_value`, and
+`resolve_return_target_expr`. Every fix attempted at any one of them is correct
+and inert, because the next one along re-decides.
+
+This is the clearest case in the tree for the contract the ADR states as **a
+rendered expression is an answer, not a candidate**. It cannot be fixed by
+guarding a component; the seven have to become one, and that is the work. Four
+correct changes are reverted waiting on it: the narrow-phi alias, the return
+resolver consulting the carrier map, the carrier-beats-constant preference, and
+`refresh_stale_operands`.
 
 ### arm64 -O0's four remaining failures are one spelling island
 
