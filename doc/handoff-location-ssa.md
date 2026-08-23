@@ -150,6 +150,42 @@ The corpus is the instrument in the meantime, and it is the better one: it
 measures rendered output against source directly rather than asking the
 decompiler to report on itself.
 
+### x86-64's remaining failures are the narrow read, and arm64's were not
+
+This explains the asymmetry in the corpus. arm64 went from no correct renderings
+to eleven on naming fixes alone; x86-64 went from four to seven and has not moved
+since. The reason is visible in one probe.
+
+`fnv1a32` at x86-64 -O1 renders a **completely correct loop**:
+
+    rax = 0x811c9dc5;
+    do {
+        rax = (arg0[rcx] ^ rax) * 0x1000193;
+        rcx++;
+    } while (arg1 != rcx);
+    return 0x811c9dc5;
+
+and returns the seed. `fnv1a64` and `djb2` do the same with their own seeds --
+three of that configuration's failures are one defect. The loop header carries
+both phis:
+
+    MERGEPHI dst=EAX_1 size=4 carrier=false
+    MERGEPHI dst=RAX_2 size=8 carrier=true
+
+`EAX` and `RAX` are one location read at two widths, and only the wide one is
+certified as a carrier. The function returns thirty-two bits, so the return
+reads the narrow phi, which is not a carrier, and falls back to what it held on
+entry.
+
+That is the defect this branch was opened for, stated in the first paragraph of
+this document, now measured on a live corpus. **It is not reachable by naming
+fixes**, which is why x86-64 stopped improving while arm64 did not: arm64's
+narrow reads go through the repair pass, which is wrong in other ways but does
+reconcile them, and x86-64's do not.
+
+So the corpus splits cleanly. Everything naming-shaped has been taken; what is
+left on x86-64 is the location model and nothing else will move it.
+
 ### arm64 -O0's four remaining failures are one spelling island
 
 `fnv1a32`, `fnv1a64`, `sdbm` and `crc32_bitwise` at arm64 -O0 all fail on an
