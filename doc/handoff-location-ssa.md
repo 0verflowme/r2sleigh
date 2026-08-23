@@ -230,14 +230,26 @@ third table to answer for a carrier this way -- the recorded definition and the
 forwarded value were the first two, and both already decline for a carrier
 member. The semantic value does not, and it is the one that decides here.
 
-The fix is the same shape as the two already in the tree: a semantic value that
-names a carrier must decline at a point where the carrier has moved on. Where
-`semanticize_visible_expr` and `render_semantic_value_by_name` already take a
-carrier into account, they consider membership and not ordering.
+That was built too -- the snapshot declining to inline *and* `get_expr`
+returning it as itself, both together, because declining one table leaves the
+others answering. Still inert, and the reason is a sixth table:
+`render_canonical_load_expr_uncached` returns from
+`prepared_named_memory_expr_for_value` or `render_authoritative_memory_access_by_name`
+**before it ever uses the address expression**. The load never asks `get_expr`
+about its address on the path that wins.
 
-Four interventions on this defect measured inert. Every one was written before
-the probe that would have ruled it out, which is the trap this document opens
-with.
+**Five interventions on this defect, every one inert, every one written before
+the probe that would have ruled it out.** The tables that can answer for a
+carrier snapshot now number six: the recorded definition, the forwarded value,
+the semantic value, the fold's `get_expr`, the inline decision, and the memory
+renderer's own two entry points. Suppressing any subset is indistinguishable
+from a wrong fix while another answers.
+
+The next person should start at `render_canonical_load_expr_uncached` and print
+which of its branches produces the address, rather than reasoning about which
+resolver ought to. The probes for that are in the tree:
+`R2SLEIGH_TRACE_NAME` spells the mint site into the identifier, and the
+`GETEXPR` wrapper reports what the fold's resolver hands back.
 
 ### Why the spelling cannot be unified at the mint, and what that leaves
 
