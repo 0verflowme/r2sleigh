@@ -150,6 +150,30 @@ The corpus is the instrument in the meantime, and it is the better one: it
 measures rendered output against source directly rather than asking the
 decompiler to report on itself.
 
+### arm64 -O0's four remaining failures are one spelling island
+
+`fnv1a32`, `fnv1a64`, `sdbm` and `crc32_bitwise` at arm64 -O0 all fail on an
+undefined `x9_3`, which is the loop counter loaded from its frame slot. The fold
+emits the load and the use with **two different names for one value**:
+
+    FSTMT 2 target=t5a00_2 reads=["local_20", ...]     the load, under the temporary's name
+    FSTMT 3 target=t7100_2 reads=["x9_3", ...]         the use, under the register's name
+
+and the two are the same value:
+
+    RESOLVE key=tmp:5a00_2 via=forwarded source=X9_3
+
+The SSA is `X9_3 = Load(tmp:6800_4)`. Five sites mint `x9_3` and all five spell
+it identically, so this is not the display-name-as-spelling defect fixed earlier
+-- the spelling is right on both sides. What differs is *which* of the two names
+for one value each side chose: the definition took the forwarded temporary's,
+the use took the register's.
+
+That is the matched-pair problem stated as concretely as it has been. The rule
+recorded earlier holds: a spelling site can only be fixed together with whatever
+defines the value it spells, and here the two are visible in adjacent
+statements. Worth four corpus cells.
+
 ### djb2's hang on arm64 is the repair pass, not a fourth carrier defect
 
 With the snapshot fix landed, arm64 -O2 `fnv1a32`, `fnv1a64` and `sdbm` are
