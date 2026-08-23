@@ -4351,9 +4351,18 @@ fn propagate_single_use_register_carriers(func: &mut CFunction, fold_ctx: &Foldi
         stmts: &mut Vec<CStmt>,
         fold_ctx: &FoldingContext<'_>,
         declared: &std::collections::HashSet<crate::symbol::SymbolId>,
+        in_loop: bool,
     ) {
         for stmt in stmts.iter_mut() {
-            visit_nested(symbols, stmt, fold_ctx, declared);
+            visit_nested(symbols, stmt, fold_ctx, declared, in_loop);
+        }
+        // Inside a loop, "the rest of this list" is not all the readers: the
+        // carrier is read again on the next iteration and after the loop ends.
+        // Propagating it into its one apparent reader deletes the update, and
+        // `fnv1a64` at x86-64 -O1 then computes `rax_3 = arg0[i] ^ r8` and never
+        // writes it back, so the function returns the value it started with.
+        if in_loop {
+            return;
         }
         let mut index = 0;
         while index < stmts.len() {
@@ -4398,41 +4407,42 @@ fn propagate_single_use_register_carriers(func: &mut CFunction, fold_ctx: &Foldi
         stmt: &mut CStmt,
         fold_ctx: &FoldingContext<'_>,
         declared: &std::collections::HashSet<crate::symbol::SymbolId>,
+        in_loop: bool,
     ) {
         match stmt {
-            CStmt::Block(stmts) => visit_block(symbols, stmts, fold_ctx, declared),
+            CStmt::Block(stmts) => visit_block(symbols, stmts, fold_ctx, declared, in_loop),
             CStmt::If {
                 then_body,
                 else_body,
                 ..
             } => {
-                visit_nested(symbols, then_body, fold_ctx, declared);
+                visit_nested(symbols, then_body, fold_ctx, declared, in_loop);
                 if let Some(else_body) = else_body {
-                    visit_nested(symbols, else_body, fold_ctx, declared);
+                    visit_nested(symbols, else_body, fold_ctx, declared, in_loop);
                 }
             }
             CStmt::While { body, .. } | CStmt::DoWhile { body, .. } => {
-                visit_nested(symbols, body, fold_ctx, declared)
+                visit_nested(symbols, body, fold_ctx, declared, true)
             }
             CStmt::For { init, body, .. } => {
                 if let Some(init) = init {
-                    visit_nested(symbols, init, fold_ctx, declared);
+                    visit_nested(symbols, init, fold_ctx, declared, true);
                 }
-                visit_nested(symbols, body, fold_ctx, declared);
+                visit_nested(symbols, body, fold_ctx, declared, true);
             }
             CStmt::Switch { cases, default, .. } => {
                 for case in cases {
-                    visit_block(symbols, &mut case.body, fold_ctx, declared);
+                    visit_block(symbols, &mut case.body, fold_ctx, declared, in_loop);
                 }
                 if let Some(default) = default {
-                    visit_block(symbols, default, fold_ctx, declared);
+                    visit_block(symbols, default, fold_ctx, declared, in_loop);
                 }
             }
             _ => {}
         }
     }
 
-    visit_block(symbols, &mut func.body, fold_ctx, &declared);
+    visit_block(symbols, &mut func.body, fold_ctx, &declared, false);
 }
 
 /// The carrier assigned by this statement, when it is one worth propagating.
