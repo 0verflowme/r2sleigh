@@ -4328,22 +4328,24 @@ in `fold/tests/pipeline.rs`. So `lookup_flag_compare_provenance` always returns
 `collect_matching_flag_compare_provenance` and the `compare_provenance_expr`
 family, never run.
 
-Two measurements confirm it. Returning `None` from the lookup unconditionally
-leaves the corpus at 34 of 54, unchanged on every configuration. And the whole
-suite still passes -- 2334 tests, including
-`test_simplify_direct_zf_and_not_zf_from_compare_provenance` and the three others
-that populate the map by hand. **Those tests pass with the feature they name
-switched off.** They write the map, assert a simplification, and get it from
-somewhere else.
+The corpus confirms the first half: returning `None` from
+`lookup_flag_compare_provenance` unconditionally leaves 34 of 54 unchanged on
+every configuration, because on real input the map it consults is empty.
 
-That is worth more than the dead code. Four tests read as coverage of a
-comparison-provenance path and provide none, so anyone reasoning about that path
-from the test names is reasoning about nothing. The machinery can be deleted --
-the evidence for that is as strong as this corpus and suite can make it -- but
-the tests should not simply be deleted with it: what they assert is behaviour
-that does happen, by a route they do not name, and that route is what wants a
-test.
+**A stronger claim was made here and it was wrong.** The suite also passed under
+that stub, and this section previously read that as the four tests passing with
+the feature switched off. Deleting the map itself disproves it: those four tests
+fail immediately. Stubbing one reader is not turning the feature off --
+`simplify_condition_expr` reaches the provenance by another route, and that is
+what the tests were exercising all along. The stub measured one path, not the
+feature, and the conclusion drawn from it did not follow.
 
-This is the tenth instance this session of one question with two answering paths,
-and the first where the redundant path turned out to be answering nothing at
-all.
+What survives is narrower and still worth having. `FlagInfo::compare_provenance`
+has no production writer, so on any real function the map is empty and every
+reader of it returns nothing. The four tests that populate it by hand are the
+only things that make the path run at all. They are not vacuous -- they fail when
+the map goes -- but what they cover is a path production never takes.
+
+Removing it means removing every reader, not stubbing one, and re-pointing those
+tests at the behaviour they should be guarding. That was attempted and reverted
+here, because the attempt was built on the claim above.
