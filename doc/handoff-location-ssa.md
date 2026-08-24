@@ -4434,9 +4434,23 @@ isolation; what is missing is that a region structured twice has two different
 right answers and nothing decides between them.
 
 That is the same shape as everything else on this branch -- one question with two
-answering paths -- and here it is worth two renderings. The fix wants either a
-structured-region cache, so a region is structured once, or ownership that does
-not change between visits.
+answering paths -- and here it is worth two renderings.
+
+Where the second visit's ownership comes from is worth one more line, because it
+rules out the obvious reading. It is not a `Sequence` deferring the merge to its
+next element: a probe on `sequence_owned_merge` never fires for this block. The
+only region whose `merge_block` is `0x100000924` is the one at `0x1000008ec`
+itself, and the push that makes the second visit see `owned=true` is that
+region's *own* push, at the line before it structures its branches.
+
+So the region is re-entered while its own deferral is live. That is a
+self-nesting visit rather than an ancestor claiming a descendant's merge, and it
+means the two answers come from the same region seeing its own bookkeeping.
+
+The fix wants either a structured-region cache, so a region is structured once
+and the first answer stands, or a guard that a region is not re-entered while its
+own merge deferral is outstanding. The second is smaller and says what is
+actually wrong.
 
 The `PASS after=... returns=N` probe added for this is kept, because "when did
 the return disappear" turned out to be the question that made the search finite.
