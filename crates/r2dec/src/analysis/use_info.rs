@@ -199,79 +199,18 @@ fn seed_local_value_ids(scratch: &mut UseScratch, blocks: &[SSABlock]) {
     }
 }
 
-fn rebuild_id_mirrors_from_name_maps(info: &mut UseInfo) {
-    info.use_counts_by_value.clear();
-    for (name, count) in &info.use_counts {
-        if let Some(value_id) = info.value_id_for_name(name) {
-            info.use_counts_by_value.insert(value_id, *count);
-        }
-    }
-
-    info.semantic_values_by_value.clear();
-    for (value_id, var) in &info.vars_by_value_id {
-        let display = var.display_name();
-        if info.exact_value_id_for_var(var) == Some(*value_id)
-            && info.value_id_for_name(&display) == Some(*value_id)
-            && let Some(value) = info.semantic_values.get(&display)
-        {
-            info.semantic_values_by_value
-                .insert(*value_id, value.clone());
-        }
-    }
-
-    info.copy_sources_by_value.clear();
-    for (dst, src) in &info.copy_sources {
-        if let (Some(dst_id), Some(src_id)) =
-            (info.value_id_for_name(dst), info.value_id_for_name(src))
-        {
-            info.copy_sources_by_value.insert(dst_id, src_id);
-        }
-    }
-
-    info.ptr_arith_by_value.clear();
-    for (name, ptr) in &info.ptr_arith {
-        if let Some(value_id) = info.value_id_for_name(name) {
-            info.ptr_arith_by_value.insert(value_id, ptr.clone());
-        }
-    }
-
-    info.condition_values.clear();
-    for name in &info.condition_vars {
-        if let Some(value_id) = info.value_id_for_name(name) {
-            info.condition_values.insert(value_id);
-        }
-    }
-
-    info.stack_slots_by_value.clear();
-    for (name, slot) in &info.stack_slots {
-        if let Some(value_id) = info.value_id_for_name(name) {
-            info.stack_slots_by_value.insert(value_id, *slot);
-        }
-    }
-
-    info.stable_memory_values_by_value.clear();
-    for (name, value) in &info.stable_memory_values {
-        if let Some(value_id) = info.value_id_for_name(name) {
-            info.stable_memory_values_by_value
-                .insert(value_id, value.clone());
-        }
-    }
-
-    info.forwarded_values_by_value.clear();
-    for (name, provenance) in &info.forwarded_values {
-        if let Some(value_id) = info.value_id_for_name(name) {
-            info.forwarded_values_by_value
-                .insert(value_id, provenance.clone());
-        }
-    }
-
-    info.call_result_source_by_value.clear();
-    for (name, site) in &info.call_result_source_by_alias {
-        if let Some(value_id) = info.value_id_for_name(name) {
-            info.call_result_source_by_value.insert(value_id, *site);
-        }
-    }
-}
+/// Value-keyed facts, keyed where they are learned.
+///
+/// This used to clear nine value-keyed stores and rebuild every one of them from
+/// its string-keyed counterpart, which made the name maps the source of truth
+/// and the id maps mirrors of them. The read side asks the value key first, so
+/// it was asking a mirror, and anything a writer knew that a name lookup could
+/// not recover was discarded before a consumer saw it.
+///
+/// Each store now keys itself at the point the fact is learned. What remains
+/// here is nothing: the function is kept as the place to notice if a new store
+/// arrives wanting to be mirrored.
+fn rebuild_id_mirrors_from_name_maps(_info: &mut UseInfo) {}
 
 fn rerun_semantic_call_analysis_after_result_binding(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
     scratch: &mut UseScratch,
