@@ -4210,3 +4210,39 @@ latch writing `w0` in the returning block *is* the carrier; excluding carrier
 members restores arm64 and still leaves `adler32` unchanged, the answer arriving
 by a fifth path. Neither narrowing is carried, because neither has a case that
 wants it.
+
+## The undefined names are one mechanism, and it is `resolve_undeclared_carriers`
+
+`xxhash32`'s `tmp_4700_7` is the case to follow, because unlike `adler32` it has
+no register-location dependency: `tmp:4700_7` is a Unique-space temporary.
+
+It is defined -- `IntAdd RDI_3 + 4` -- and read four times, so no inlining rule
+applies and it needs a statement. The fold builds one: an `OPSTMT` probe reports
+`built=true`, and the value is neither dead nor inlined. Walking the post-fold
+passes shows exactly where it goes:
+
+    prune_dead_temp_assignments_in_function_body   present
+    prune_unused_pure_locals                       present
+    resolve_undeclared_carriers                    gone
+
+`drop_dead_undeclared_carriers` removes an assignment whose target is undeclared
+and absent from `collect_function_local_reads`. That read set does walk `if`,
+`while`, `do`, `for` and switch conditions, so the read is not being missed for
+want of a traversal. It is being missed because **the assignment and the read
+spell the same value differently**: the assignment names `t4700_7`, the project's
+rule; the read carries the raw SSA name, which `unrendered::spell_as_identifier`
+later turns into `tmp_4700_7` by replacing `:` with `_`. Neither spelling ever
+sees the other, so a live assignment looks dead and is dropped, and the read is
+left undeclared.
+
+That is the whole mechanism, and it is the same one behind `eax_8`, `eax_12` and
+the temporaries that break the location-model experiment.
+
+Making `spell_as_identifier` use `format_traced_name` first is the obvious repair
+and does not work: that function does not round-trip these names, and
+`tmp:4700_7` comes back as `tmp`, so the rendering gets worse rather than better.
+Reverted. The unification has to happen where the raw name is *emitted*, not
+where it is sanitised afterwards -- and the earlier attempt at
+`origin_name_to_expr`, which took x86-64 -O0 from six correct to none, is the
+same lesson from the other end. Something emits the raw SSA name into an
+expression, and that is the site to find.
