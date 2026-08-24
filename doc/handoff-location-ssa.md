@@ -3723,3 +3723,36 @@ Worth keeping in view: the rendering says so itself. `murmur3_32` prints
 `129 built, 9 elided, 0 refused, 7 unaccounted`. The obligation ledger catches
 this class rather than letting it pass as plausible code, which is why it is
 findable at all.
+
+## Phase 2's write side, measured rather than assumed
+
+The read side was settled by making every paired store ask the value-keyed half
+first and deleting the name-keyed fallbacks. What was left was recorded as "the
+write side", with the note that re-keying the string-keyed stores belongs with
+the location model and that doing it halfway is the conflation itself.
+
+Two things turn out to be true, and the second was not known.
+
+Every production write already goes through one helper per store --
+`insert_definition_for_var`, `note_use_for_var`, `insert_stack_slot_for_var` and
+their siblings -- each writing both halves from a single call. The only writes
+that touch one half alone are test fixtures. So the halves cannot drift by a
+missed call site, which is what "two stores" suggested.
+
+They can still drift where the helper cannot resolve a `ValueId`: it writes the
+name and skips the value key, and the entry then exists only in the string half.
+That was the reason to believe the string half could not yet be derived. It is
+now counted. `UseInfo::unkeyed_writes` tallies exactly those writes across seven
+paired stores, and over every function of all six hash binaries the total is
+**zero**. Not one write in the corpus fails to resolve a canonical identity.
+
+So the string-keyed half is derivable today, at least for everything this corpus
+exercises, and turning it from a stored map into a view is mechanical rather than
+blocked on the location model. The counter stays so the claim keeps being
+checked: if a future change reintroduces a value with no identity, the number
+stops being zero and says which store.
+
+What this does not establish is that the corpus exercises every path. It is
+fourteen hash functions across two architectures and three optimisation levels,
+and a binary with indirect calls, unions or varargs may well produce writes that
+resolve nothing. The number to watch is `UNKEYED total=`.

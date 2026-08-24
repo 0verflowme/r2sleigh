@@ -2822,6 +2822,11 @@ impl<'a> FoldingContext<'a> {
         if self.inputs.prepared_ssa.is_some() {
             self.extend_carrier_aliases_over(blocks);
             self.record_cross_block_reads(blocks);
+            if std::env::var_os("R2SLEIGH_DEBUG_UNKEYED").is_some() {
+                let unkeyed = &self.use_info().unkeyed_writes;
+                let total: usize = unkeyed.values().sum();
+                eprintln!("UNKEYED total={total} by_store={unkeyed:?}");
+            }
         }
         let symbols = &self.symbols;
 

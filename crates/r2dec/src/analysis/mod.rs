@@ -170,6 +170,16 @@ pub(crate) struct UseInfo {
     pub(crate) stable_memory_values_by_value: BTreeMap<ValueId, SemanticValue>,
     pub(crate) forwarded_values: HashMap<String, ValueProvenance>,
     pub(crate) forwarded_values_by_value: BTreeMap<ValueId, ValueProvenance>,
+    /// Writes that reached the string-keyed half and not the value-keyed one.
+    ///
+    /// Every paired store is written through one helper, so the two halves
+    /// cannot drift by a missed call site. They still drift when the value has
+    /// no canonical identity to key on: the helper writes the name and skips the
+    /// `ValueId`. Those entries are exactly what the location model has to
+    /// account for before the string-keyed half can be derived rather than
+    /// stored, so counting them measures what is left of that step instead of
+    /// asserting it.
+    pub(crate) unkeyed_writes: std::collections::BTreeMap<&'static str, usize>,
 }
 
 #[allow(dead_code)]
@@ -678,6 +688,8 @@ impl UseInfo {
         *self.use_counts.entry(display).or_insert(0) += 1;
         if let Some(value_id) = self.exact_value_id_for_var(var) {
             *self.use_counts_by_value.entry(value_id).or_insert(0) += 1;
+        } else {
+            *self.unkeyed_writes.entry("use_counts").or_default() += 1;
         }
     }
 
@@ -685,6 +697,8 @@ impl UseInfo {
         self.condition_vars.insert(var.display_name());
         if let Some(value_id) = self.exact_value_id_for_var(var) {
             self.condition_values.insert(value_id);
+        } else {
+            *self.unkeyed_writes.entry("condition_vars").or_default() += 1;
         }
     }
 
@@ -692,6 +706,8 @@ impl UseInfo {
         let display = var.display_name();
         if let Some(value_id) = self.value_id_for_var(var) {
             self.definitions_by_value.insert(value_id, expr.clone());
+        } else {
+            *self.unkeyed_writes.entry("definitions").or_default() += 1;
         }
         self.definitions.insert(display, expr);
     }
@@ -699,6 +715,8 @@ impl UseInfo {
     pub(crate) fn insert_stack_slot_for_var(&mut self, var: &SSAVar, slot: StackSlotProvenance) {
         if let Some(value_id) = self.exact_value_id_for_var(var) {
             self.stack_slots_by_value.insert(value_id, slot);
+        } else {
+            *self.unkeyed_writes.entry("stack_slots").or_default() += 1;
         }
         self.stack_slots.insert(var.display_name(), slot);
     }
@@ -714,6 +732,8 @@ impl UseInfo {
     pub(crate) fn insert_ptr_arith_for_var(&mut self, var: &SSAVar, ptr: PtrArith) {
         if let Some(value_id) = self.exact_value_id_for_var(var) {
             self.ptr_arith_by_value.insert(value_id, ptr.clone());
+        } else {
+            *self.unkeyed_writes.entry("ptr_arith").or_default() += 1;
         }
         self.ptr_arith.insert(var.display_name(), ptr);
     }
@@ -726,6 +746,8 @@ impl UseInfo {
         if let Some(value_id) = self.exact_value_id_for_var(var) {
             self.forwarded_values_by_value
                 .insert(value_id, provenance.clone());
+        } else {
+            *self.unkeyed_writes.entry("forwarded_values").or_default() += 1;
         }
         self.forwarded_values.insert(var.display_name(), provenance);
     }
@@ -734,6 +756,8 @@ impl UseInfo {
         if let Some(value_id) = self.value_id_for_name(name) {
             self.semantic_values_by_value
                 .insert(value_id, value.clone());
+        } else {
+            *self.unkeyed_writes.entry("semantic_values").or_default() += 1;
         }
         self.semantic_values.insert(name.to_string(), value);
     }
