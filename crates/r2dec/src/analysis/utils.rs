@@ -291,7 +291,7 @@ pub(crate) fn ssa_render_base_name(var: &SSAVar) -> String {
 
 pub(crate) fn trace_ssa_var_to_source(
     var: &SSAVar,
-    copy_sources: &HashMap<String, String>,
+    copy_source: &impl Fn(&str) -> Option<String>,
     var_aliases: &HashMap<String, String>,
 ) -> String {
     let mut current_key = var.display_name();
@@ -302,7 +302,7 @@ pub(crate) fn trace_ssa_var_to_source(
             break;
         }
 
-        if let Some(src_key) = copy_sources.get(&current_key) {
+        if let Some(src_key) = copy_source(&current_key) {
             if src_key.starts_with('*') {
                 return format!("var_{}", current_key.split('_').next_back().unwrap_or("0"));
             }
@@ -570,9 +570,14 @@ pub(crate) fn param_register_alias_for_ssa_name(
     })
 }
 
+/// Follow a copy chain back to an argument alias, if it reaches one.
+///
+/// `copy_source` answers "what was copied into this name". It used to be a
+/// name-to-name map handed in whole; it is now a lookup, because the copies are
+/// recorded between identities and the names are recovered from them.
 pub(crate) fn arg_alias_for_store_source(
     src: &SSAVar,
-    copy_sources: &HashMap<String, String>,
+    copy_source: impl Fn(&str) -> Option<String>,
     var_aliases: &HashMap<String, String>,
     param_register_aliases: &HashMap<String, String>,
 ) -> Option<String> {
@@ -589,13 +594,13 @@ pub(crate) fn arg_alias_for_store_source(
         if let Some(alias) = arg_alias_for_ssa_name(&key) {
             return Some(alias);
         }
-        let Some(next) = copy_sources.get(&key) else {
+        let Some(next) = copy_source(&key) else {
             break;
         };
         key = next.clone();
     }
 
-    let traced = trace_ssa_var_to_source(src, copy_sources, var_aliases);
+    let traced = trace_ssa_var_to_source(src, &copy_source, var_aliases);
     param_register_aliases
         .get(&traced.to_ascii_lowercase())
         .cloned()
@@ -692,12 +697,12 @@ mod tests {
     #[test]
     fn arg_alias_for_store_source_uses_arch_param_aliases() {
         let src = SSAVar::new("X1", 0, 8);
-        let copy_sources = HashMap::new();
+        let copy_sources: HashMap<String, String> = HashMap::new();
         let var_aliases = HashMap::new();
         let param_register_aliases = HashMap::from([(String::from("x1"), String::from("arg2"))]);
 
         assert_eq!(
-            arg_alias_for_store_source(&src, &copy_sources, &var_aliases, &param_register_aliases),
+            arg_alias_for_store_source(&src, |name| copy_sources.get(name).cloned(), &var_aliases, &param_register_aliases),
             Some(String::from("arg2"))
         );
     }

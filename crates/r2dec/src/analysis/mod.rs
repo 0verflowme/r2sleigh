@@ -144,7 +144,6 @@ pub(crate) struct UseInfo {
     pub(crate) frame_object_field_roots: HashMap<FrameObjectFieldKey, SemanticValue>,
     pub(crate) phi_sources: HashMap<String, Vec<SSAVar>>,
     pub(crate) formatted_defs: HashMap<String, CExpr>,
-    pub(crate) copy_sources: HashMap<String, String>,
     pub(crate) copy_sources_by_value: BTreeMap<ValueId, ValueId>,
     pub(crate) memory_stores: HashMap<String, String>,
     pub(crate) ptr_arith_by_value: BTreeMap<ValueId, PtrArith>,
@@ -720,6 +719,23 @@ impl UseInfo {
         self.stack_slots.insert(name.to_string(), slot);
     }
 
+    /// Record that one value was copied from another.
+    ///
+    /// Both ends need an identity: a copy between names could be written when
+    /// only one side was known, and the name-keyed half then held an edge the
+    /// value-keyed half did not, which is how the two disagreed.
+    pub(crate) fn insert_copy_source_for_vars(&mut self, dst: &SSAVar, src: &SSAVar) {
+        match (
+            self.exact_value_id_for_var(dst),
+            self.exact_value_id_for_var(src),
+        ) {
+            (Some(dst_id), Some(src_id)) => {
+                self.copy_sources_by_value.insert(dst_id, src_id);
+            }
+            _ => *self.unkeyed_writes.entry("copy_sources").or_default() += 1,
+        }
+    }
+
     pub(crate) fn insert_ptr_arith_for_var(&mut self, var: &SSAVar, ptr: PtrArith) {
         if let Some(value_id) = self.exact_value_id_for_var(var) {
             self.ptr_arith_by_value.insert(value_id, ptr.clone());
@@ -968,14 +984,23 @@ impl UseInfo {
         self.forwarded_value_for_name(name)
     }
 
+    /// What was copied into this name, as a name.
+    ///
+    /// The copy is recorded between identities. Spelling the answer back out
+    /// means resolving the name to a value, following the copy, and asking what
+    /// that value is called -- rather than keeping a second map of names to
+    /// names, which `lookup_name_key` matched case-insensitively and so could
+    /// answer for a different variable that happened to differ only in case.
     pub(crate) fn render_copy_source_for_name(&self, name: &str) -> Option<String> {
-        lookup_name_key(&self.copy_sources, name).cloned()
+        let value_id = self.value_id_for_name(name)?;
+        let source_id = self.copy_sources_by_value.get(&value_id)?;
+        self.var_for_value_id(*source_id)
+            .map(|var| var.display_name())
     }
 
     pub(crate) fn has_renderable_named_fact(&self, name: &str) -> bool {
         lookup_name_key(&self.definitions, name).is_some()
             || lookup_name_key(&self.semantic_values, name).is_some()
-            || lookup_name_key(&self.copy_sources, name).is_some()
             || lookup_name_key(&self.var_aliases, name).is_some()
             || self.value_id_for_name(name).is_some_and(|value_id| {
                 self.definitions_by_value.contains_key(&value_id)
@@ -992,7 +1017,6 @@ impl UseInfo {
         self.definitions
             .keys()
             .chain(self.semantic_values.keys())
-            .chain(self.copy_sources.keys())
             .chain(self.var_aliases.keys())
             .map(String::as_str)
     }

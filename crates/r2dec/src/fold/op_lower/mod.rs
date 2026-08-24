@@ -1710,8 +1710,12 @@ impl<'a> FoldingContext<'a> {
     pub(crate) fn formatted_defs_map(&self) -> &HashMap<String, CExpr> {
         &self.use_info().formatted_defs
     }
-    pub(crate) fn copy_sources_map(&self) -> &HashMap<String, String> {
-        &self.use_info().copy_sources
+    /// What was copied into a name, as a name.
+    ///
+    /// The map this replaced was keyed by name on both sides; copies are between
+    /// identities now and the spelling is recovered on the way out.
+    pub(crate) fn copy_source_of(&self, name: &str) -> Option<String> {
+        self.use_info().render_copy_source_for_name(name)
     }
     pub(crate) fn ptr_members_map(&self) -> &HashMap<String, (SSAVar, i64)> {
         &self.use_info().ptr_members

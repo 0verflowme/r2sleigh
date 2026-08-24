@@ -1812,10 +1812,7 @@ fn collect_definitions(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
 
     for op in &block.ops {
         if let SSAOp::Copy { dst, src } = op {
-            scratch
-                .info
-                .copy_sources
-                .insert(dst.display_name(), src.display_name());
+            scratch.info.insert_copy_source_for_vars(dst, src);
         }
 
         if let SSAOp::Store {
@@ -1892,8 +1889,7 @@ fn collect_definitions(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
                 {
                     scratch
                         .info
-                        .copy_sources
-                        .insert(dst.display_name(), stored_val.display_name());
+                        .insert_copy_source_for_vars(dst, &stored_val);
                     scratch.info.insert_forwarded_value_for_var(
                         dst,
                         ValueProvenance {
@@ -3677,7 +3673,7 @@ fn resolve_copy_root_name(info: &UseInfo, name: &str) -> String {
     let mut current = name.to_string();
     let mut seen = HashSet::new();
     while seen.insert(current.clone()) {
-        let Some(next) = info.copy_sources.get(&current).cloned() else {
+        let Some(next) = info.render_copy_source_for_name(&current) else {
             break;
         };
         current = next;
@@ -5181,7 +5177,17 @@ fn propagate_call_result_aliases(symbols: &std::cell::RefCell<crate::symbol::Sym
         control.poll()?;
         changed = false;
 
-        for (dst, src) in info.copy_sources.clone() {
+        let copies_by_name: Vec<(String, String)> = info
+            .copy_sources_by_value
+            .iter()
+            .filter_map(|(dst_id, src_id)| {
+                Some((
+                    info.var_for_value_id(*dst_id)?.display_name(),
+                    info.var_for_value_id(*src_id)?.display_name(),
+                ))
+            })
+            .collect();
+        for (dst, src) in copies_by_name {
             control.poll()?;
             let Some(source_call) = call_result_source_for_alias(info, &src) else {
                 continue;
@@ -6708,9 +6714,8 @@ fn semantic_value_source_offset_by_name(
                 .filter(|offset| *offset < 0)
         })
         .or_else(|| {
-            info.copy_sources
-                .get(name)
-                .and_then(|src| semantic_value_source_offset_by_name(info, src, depth + 1, visited))
+            info.render_copy_source_for_name(name)
+                .and_then(|src| semantic_value_source_offset_by_name(info, &src, depth + 1, visited))
         })
         .or_else(|| unique_negative_stack_slot_for_stored_value(info, name));
     visited.remove(name);
@@ -7220,9 +7225,8 @@ fn exact_negative_stack_offset_by_name(
                 .filter(|offset| *offset < 0)
         })
         .or_else(|| {
-            info.copy_sources
-                .get(name)
-                .and_then(|src| exact_negative_stack_offset_by_name(info, src, depth + 1, visited))
+            info.render_copy_source_for_name(name)
+                .and_then(|src| exact_negative_stack_offset_by_name(info, &src, depth + 1, visited))
         });
     visited.remove(name);
     offset
@@ -10233,8 +10237,13 @@ mod tests {
                 CExpr::IntLit(0x28),
             ),
         );
-        info.copy_sources
-            .insert(alias_slot.display_name(), "source_1".to_string());
+        let source_1 = mk("source", 1, 8);
+        assert_eq!(
+            info.bind_value_id(&alias_slot, ValueId(920)),
+            Some(ValueId(920))
+        );
+        assert_eq!(info.bind_value_id(&source_1, ValueId(921)), Some(ValueId(921)));
+        info.insert_copy_source_for_vars(&alias_slot, &source_1);
 
         assert_eq!(
             semantic_addr_for_var_with_depth(&symbols, &info, &temp_slot, &env, 0),

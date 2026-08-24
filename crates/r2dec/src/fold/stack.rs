@@ -437,7 +437,7 @@ impl<'a> FoldingContext<'a> {
     pub(super) fn is_entry_arg_alias_store(&self, addr: &SSAVar, val: &SSAVar) -> bool {
         let entry_arg_alias = utils::arg_alias_for_store_source(
             val,
-            self.copy_sources_map(),
+            |name| self.copy_source_of(name),
             self.var_aliases_map(),
             self.inputs.param_register_aliases,
         )

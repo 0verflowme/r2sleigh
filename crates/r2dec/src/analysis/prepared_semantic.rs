@@ -3164,9 +3164,6 @@ fn collect_prepared_runtime_facts(symbols: &std::cell::RefCell<crate::symbol::Sy
                 | SSAOp::Subpiece { dst, src, .. } => {
                     let dst_key = dst.display_name();
                     let src_key = src.display_name();
-                    use_info
-                        .copy_sources
-                        .insert(dst_key.clone(), src_key.clone());
                     let bound_copy = bind_prepared_copy_ids(use_info, view, dst, src);
                     let bound_dst_id = bound_copy.map(|(dst_id, _)| dst_id);
                     let bound_src_id = bound_copy.map(|(_, src_id)| src_id);

@@ -8390,11 +8390,11 @@ mod tests {
             addr.display_name(),
             CExpr::binary(BinaryOp::Sub, ctx.name_ref("rsp"), CExpr::IntLit(0x20)),
         );
-        ctx.state
-            .analysis_ctx
-            .use_info
-            .copy_sources
-            .insert(saved.display_name(), "RBX_1".to_string());
+        let rbx_1 = r2ssa::SSAVar::new("RBX", 1, 8);
+        let info = &mut ctx.state.analysis_ctx.use_info;
+        assert_eq!(info.bind_value_id(&saved, r2ssa::ValueId(930)), Some(r2ssa::ValueId(930)));
+        assert_eq!(info.bind_value_id(&rbx_1, r2ssa::ValueId(931)), Some(r2ssa::ValueId(931)));
+        info.insert_copy_source_for_vars(&saved, &rbx_1);
 
         assert!(ctx.is_stack_frame_op(&SSAOp::Store {
             space: r2il::SpaceId::Ram,
