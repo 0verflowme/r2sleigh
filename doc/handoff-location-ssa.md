@@ -3698,8 +3698,21 @@ It is not the pruner. `PRUNED` never names it, and disabling the pre-structuring
 prune outright takes x86-64 -O2 from three correct to none, so that pass is
 load-bearing and its per-block empty live-out is not the fault here.
 
-What decides is whoever assembles the return expression, which the handoff
-already records as seven components each able to override the last. Until one of
+Where it goes has been narrowed by elimination, and the answer is not any of the
+obvious candidates. The assignment *is* built -- a probe on the site that spells
+an assignment's left-hand side fires exactly once for `eax_8`, and the statement
+is returned. By the time the first post-fold pass runs
+(`simplify_identities_in_function`) it is already gone, so it is lost inside
+`fold_block`. It is not `propagate_ephemeral_copies`, which rewrites in-block
+uses but keeps the statement. It is not `prune_dead_temp_assignments`, whose
+`PRUNED` listing for this function names twenty-nine values and not this one. It
+is not `prune_redundant_return_slot_assignments`, which only touches stack slots.
+It is not the `lhs == rhs` self-assignment drop, which never fires here.
+
+So something between statement production and the assembled block list discards
+it, and whoever assembles the return expression -- the seven components this
+document already records, each able to override the last -- still spells the
+value by name. Until one of
 them owns the spelling, inlining a value in one operand and naming it in another
 will keep producing exactly this. That is the same lesson as the carrier work --
 a value is spelled by its own name wherever it appears -- and the return
