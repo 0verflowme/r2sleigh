@@ -3756,6 +3756,30 @@ the counter missed entirely. `UseInfo::unkeyed_writes` reports **zero** over
 every function of all six hash binaries. Not one paired write in the corpus fails
 to resolve a canonical identity.
 
+### The one store where the halves are not the same fact
+
+Four of the five inline pairings in `collect_prepared_runtime_facts` now go
+through a single helper each -- `note_use_for_var` twice, `note_condition_var`,
+and a new `insert_semantic_value_for_name_and_value_if_absent` that keeps the
+first-write-wins behaviour the call site relied on. The pairing rule for those
+stores is written once.
+
+`forwarded_values` is the exception, and it is not duplication at all. The two
+halves are given *different provenance*:
+
+- the name key gets `source_prov`, which is what following the forwarding chain
+  arrived at, falling back to `src` for the fields that chain did not fill;
+- the value key gets `exact_prepared_copy_provenance(src, src_id, ...)`, which is
+  the immediate copy source and nothing followed.
+
+So the string half answers "where did this value ultimately come from" and the
+value half answers "what was copied into it here". Deriving either from the other
+changes what is recorded, which is why this one cannot be folded and why the
+store cannot simply lose its string-keyed half. Whether both facts are wanted, or
+whether one of them is a bug that predates the split, is the question to settle
+before the derivation finishes -- and it is a question about the location model,
+which is where the handoff always said this belonged.
+
 So the string-keyed half is derivable today, at least for everything this corpus
 exercises, and turning it from a stored map into a view is mechanical rather than
 blocked on the location model. The counter stays so the claim keeps being

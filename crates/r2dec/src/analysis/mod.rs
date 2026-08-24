@@ -752,6 +752,31 @@ impl UseInfo {
         self.forwarded_values.insert(var.display_name(), provenance);
     }
 
+    /// Record a semantic value under both keys, keeping whichever arrived first.
+    ///
+    /// The value key is supplied rather than looked up, because the caller knows
+    /// which reload this fact belongs to and the name alone does not say. Both
+    /// halves get the same value: this pairing exists once, here, instead of
+    /// being spelled again at the call site.
+    pub(crate) fn insert_semantic_value_for_name_and_value_if_absent(
+        &mut self,
+        name: String,
+        value_id: Option<ValueId>,
+        value: SemanticValue,
+    ) {
+        self.semantic_values
+            .entry(name)
+            .or_insert_with(|| value.clone());
+        match value_id {
+            Some(value_id) => {
+                self.semantic_values_by_value
+                    .entry(value_id)
+                    .or_insert(value);
+            }
+            None => *self.unkeyed_writes.entry("semantic_values").or_default() += 1,
+        }
+    }
+
     pub(crate) fn insert_semantic_value_for_name(&mut self, name: &str, value: SemanticValue) {
         if let Some(value_id) = self.value_id_for_name(name) {
             self.semantic_values_by_value

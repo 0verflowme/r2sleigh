@@ -3101,24 +3101,19 @@ fn collect_prepared_runtime_facts(symbols: &std::cell::RefCell<crate::symbol::Sy
                 },
             );
             for (_, src) in &phi.sources {
-                *use_info.use_counts.entry(src.display_name()).or_insert(0) += 1;
-                if let Some(value_id) = bind_prepared_value_id(use_info, view, src) {
-                    *use_info.use_counts_by_value.entry(value_id).or_insert(0) += 1;
-                } else {
-                    *use_info.unkeyed_writes.entry("use_counts").or_default() += 1;
-                }
+                // Bind first, then let the one helper write both halves.
+                // Writing them here as well meant a second copy of the pairing
+                // rule living beside the first.
+                let _ = bind_prepared_value_id(use_info, view, src);
+                use_info.note_use_for_var(src);
             }
             seed_prepared_value_fact(symbols, use_info, &phi.dst, prepared, view);
         }
 
         for op in &block.ops {
             for src in op.sources() {
-                *use_info.use_counts.entry(src.display_name()).or_insert(0) += 1;
-                if let Some(value_id) = bind_prepared_value_id(use_info, view, src) {
-                    *use_info.use_counts_by_value.entry(value_id).or_insert(0) += 1;
-                } else {
-                    *use_info.unkeyed_writes.entry("use_counts").or_default() += 1;
-                }
+                let _ = bind_prepared_value_id(use_info, view, src);
+                use_info.note_use_for_var(src);
             }
             // A value defined by adding or subtracting a constant is that
             // operand at an offset. This was the only fact the local-struct
@@ -3149,12 +3144,8 @@ fn collect_prepared_runtime_facts(symbols: &std::cell::RefCell<crate::symbol::Sy
                 _ => {}
             }
             if let SSAOp::CBranch { cond, .. } = op {
-                use_info.condition_vars.insert(cond.display_name());
-                if let Some(value_id) = bind_prepared_value_id(use_info, view, cond) {
-                    use_info.condition_values.insert(value_id);
-                } else {
-                    *use_info.unkeyed_writes.entry("condition_vars").or_default() += 1;
-                }
+                let _ = bind_prepared_value_id(use_info, view, cond);
+                use_info.note_condition_var(cond);
             }
 
             if let Some(dst) = op.dst() {
@@ -3292,17 +3283,11 @@ fn collect_prepared_runtime_facts(symbols: &std::cell::RefCell<crate::symbol::Sy
                             .formatted_defs
                             .entry(key.clone())
                             .or_insert_with(|| expr.clone());
-                        use_info.semantic_values.entry(key).or_insert_with(|| {
-                            SemanticValue::Scalar(ScalarValue::Expr(expr.clone()))
-                        });
-                        if let Some(value_id) = reload_value {
-                            use_info
-                                .semantic_values_by_value
-                                .entry(value_id)
-                                .or_insert_with(|| {
-                                    SemanticValue::Scalar(ScalarValue::Expr(expr.clone()))
-                                });
-                        }
+                        use_info.insert_semantic_value_for_name_and_value_if_absent(
+                            key,
+                            reload_value,
+                            SemanticValue::Scalar(ScalarValue::Expr(expr.clone())),
+                        );
                         if offset < 0 {
                             use_info
                                 .stable_stack_values
