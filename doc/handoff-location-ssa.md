@@ -4396,6 +4396,23 @@ return is recorded as neither rendered nor refused. `RefusalReason::BlockNotRend
 exists for exactly this and is not reached, which is the second time this
 document has found a refusal reason that nothing constructs.
 
-That makes this a distinct, and probably tractable, defect: find why structuring
-does not place a block it has folded. It is worth two renderings directly, and
-the empty branch arms suggest more behind it.
+Narrowing it further gets close. `structure_block(0x100000924)` is entered
+exactly once -- a `#[track_caller]` probe puts the call at `structure.rs:945`,
+the merge-block arm of `Region::IfThenElse` -- and returns three statements: two
+assignments and `Return(Some(...))` carrying murmur3's whole finaliser, correctly
+built. `append_stmt_body_flat` then appends it into that region's prefix.
+
+And it never arrives. Counting `CStmt::Return` in the function body after each
+post-fold pass gives **zero at the first one**, so nothing downstream removed it:
+the statement was already gone before `simplify_identities_in_function` ran. A
+parent region discards the sub-region that contains it.
+
+So the defect is one region dropping another's result during structuring, not a
+pass deleting a return. The empty `{ }` arms in the rendering are the same thing
+seen from outside. `merge_owned_by_ancestor` and `deferred_merge_blocks` are the
+mechanisms by which an ancestor claims responsibility for a merge block, and an
+ancestor that claims one and never emits it would produce exactly this; that is
+the next thing to check, and it is one question.
+
+The `PASS after=... returns=N` probe added for this is kept, because "when did
+the return disappear" turned out to be the question that made the search finite.

@@ -4037,7 +4037,32 @@ fn debug_assigned_locals(func: &CFunction, after: &str) {
         .into_iter()
         .map(|(name, count)| format!("{name}x{count}"))
         .collect::<Vec<_>>();
-    eprintln!("PASS after={after} assigns={names:?}");
+    fn count_returns(stmts: &[CStmt]) -> usize {
+        let mut n = 0;
+        for stmt in stmts {
+            if matches!(stmt, CStmt::Return(_)) {
+                n += 1;
+            }
+            match stmt {
+                CStmt::Block(inner) => n += count_returns(inner),
+                CStmt::If { then_body, else_body, .. } => {
+                    n += count_returns(std::slice::from_ref(then_body));
+                    if let Some(body) = else_body {
+                        n += count_returns(std::slice::from_ref(body));
+                    }
+                }
+                CStmt::While { body, .. } | CStmt::DoWhile { body, .. } | CStmt::For { body, .. } => {
+                    n += count_returns(std::slice::from_ref(body))
+                }
+                _ => {}
+            }
+        }
+        n
+    }
+    eprintln!(
+        "PASS after={after} returns={} assigns={names:?}",
+        count_returns(&func.body)
+    );
 }
 
 fn drop_overwritten_assignments(func: &mut CFunction) {
