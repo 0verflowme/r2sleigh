@@ -3731,21 +3731,30 @@ first and deleting the name-keyed fallbacks. What was left was recorded as "the
 write side", with the note that re-keying the string-keyed stores belongs with
 the location model and that doing it halfway is the conflation itself.
 
-Two things turn out to be true, and the second was not known.
+Every production write writes both halves, but not all of them go through the
+helpers in `analysis/mod.rs`. `collect_prepared_runtime_facts` in
+`prepared_semantic.rs` writes `use_counts`, `condition_vars`, `forwarded_values`
+and `semantic_values` inline, pairing them through `bind_prepared_value_id`
+instead. That is duplicated logic rather than divergence -- both halves are
+written either way -- so the halves cannot drift by a missed call site, which is
+what "two stores" suggested. The duplication is still worth removing: a fifth
+store added to that function has to remember the pairing by hand.
 
-Every production write already goes through one helper per store --
-`insert_definition_for_var`, `note_use_for_var`, `insert_stack_slot_for_var` and
-their siblings -- each writing both halves from a single call. The only writes
-that touch one half alone are test fixtures. So the halves cannot drift by a
-missed call site, which is what "two stores" suggested.
+Getting there took two wrong turns worth recording. A `grep` written as
+`grep -r pattern path --include=*.rs` has zsh glob the `--include`, so it
+silently searches nothing and matches nothing; the first version of this section
+concluded "only test fixtures write one half" from a command that never ran.
+Re-running it correctly surfaced the inline sites and produced the opposite
+error -- they read as single-half until the surrounding lines are read and the
+value-keyed write is there all along.
 
-They can still drift where the helper cannot resolve a `ValueId`: it writes the
-name and skips the value key, and the entry then exists only in the string half.
-That was the reason to believe the string half could not yet be derived. It is
-now counted. `UseInfo::unkeyed_writes` tallies exactly those writes across seven
-paired stores, and over every function of all six hash binaries the total is
-**zero**. Not one write in the corpus fails to resolve a canonical identity.
-
+They can still drift where the write resolves no `ValueId`: it writes the name
+and skips the value key, and the entry then exists only in the string half. That
+was the reason to believe the string half could not yet be derived. It is now
+counted at the helpers *and* at the four inline sites, which the first version of
+the counter missed entirely. `UseInfo::unkeyed_writes` reports **zero** over
+every function of all six hash binaries. Not one paired write in the corpus fails
+to resolve a canonical identity.
 So the string-keyed half is derivable today, at least for everything this corpus
 exercises, and turning it from a stored map into a view is mechanical rather than
 blocked on the location model. The counter stays so the claim keeps being
