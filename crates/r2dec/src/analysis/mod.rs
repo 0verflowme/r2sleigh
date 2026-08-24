@@ -149,7 +149,6 @@ pub(crate) struct UseInfo {
     pub(crate) memory_stores: HashMap<String, String>,
     pub(crate) ptr_arith_by_value: BTreeMap<ValueId, PtrArith>,
     pub(crate) ptr_members: HashMap<String, (r2ssa::SSAVar, i64)>,
-    pub(crate) condition_vars: HashSet<String>,
     pub(crate) condition_values: BTreeSet<ValueId>,
     pub(crate) pinned: HashSet<String>,
     pub(crate) call_args: HashMap<(u64, usize), Vec<CallArgBinding>>,
@@ -687,7 +686,6 @@ impl UseInfo {
     }
 
     pub(crate) fn note_condition_var(&mut self, var: &SSAVar) {
-        self.condition_vars.insert(var.display_name());
         if let Some(value_id) = self.exact_value_id_for_var(var) {
             self.condition_values.insert(value_id);
         } else {
@@ -1030,7 +1028,6 @@ impl UseInfo {
         }
         self.value_id_for_name(name)
             .is_some_and(|value_id| self.condition_values.contains(&value_id))
-            || self.condition_vars.contains(name)
     }
 
     pub(crate) fn call_result_source_for_name(&self, name: &str) -> Option<(u64, usize)> {

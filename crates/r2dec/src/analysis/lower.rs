@@ -25,7 +25,6 @@ pub(crate) struct LowerCtx<'a> {
     pub(crate) definitions: &'a HashMap<String, CExpr>,
     pub(crate) semantic_values: &'a HashMap<String, SemanticValue>,
     pub(crate) use_counts: &'a HashMap<String, usize>,
-    pub(crate) condition_vars: &'a HashSet<String>,
     pub(crate) pinned: &'a HashSet<String>,
     pub(crate) var_aliases: &'a HashMap<String, String>,
     pub(crate) param_register_aliases: &'a HashMap<String, String>,
@@ -134,8 +133,7 @@ impl<'a> LowerCtx<'a> {
 
     fn is_condition_name(&self, name: &str) -> bool {
         self.use_info
-            .map(|info| info.is_condition_name(name))
-            .unwrap_or_else(|| self.condition_vars.contains(name))
+            .is_some_and(|info| info.is_condition_name(name))
     }
 
     fn var_alias_for_name(&self, name: &str) -> Option<&String> {
@@ -1449,7 +1447,7 @@ mod tests {
         symbols: &'a std::cell::RefCell<crate::symbol::SymbolTable>,
         definitions: &'a HashMap<String, CExpr>,
         use_counts: &'a HashMap<String, usize>,
-        condition_vars: &'a HashSet<String>,
+        _condition_vars: &'a HashSet<String>,
         pinned: &'a HashSet<String>,
         var_aliases: &'a HashMap<String, String>,
         _ptr_arith: &'a HashMap<String, PtrArith>,
@@ -1469,7 +1467,6 @@ mod tests {
             definitions,
             semantic_values,
             use_counts,
-            condition_vars,
             pinned,
             var_aliases,
             param_register_aliases,

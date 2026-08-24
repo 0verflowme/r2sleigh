@@ -4546,7 +4546,26 @@ mod tests {
 
     #[test]
     fn should_inline_ssavar_guard_matrix_preserves_refusal_order() {
-        fn mark_use(ctx: &mut FoldingContext<'_>, var: &SSAVar, count: usize) {
+        /// Record that a condition was decided by this value.
+    ///
+    /// Conditions are keyed by identity now, so a test has to give the value one
+    /// before it can say anything about it.
+    fn bind_and_mark_condition(
+        ctx: &mut FoldingContext<'_>,
+        var: &r2ssa::SSAVar,
+        value_id: u32,
+    ) {
+        assert_eq!(
+            ctx.state
+                .analysis_ctx
+                .use_info
+                .bind_value_id(var, r2ssa::ValueId(value_id)),
+            Some(r2ssa::ValueId(value_id))
+        );
+        ctx.state.analysis_ctx.use_info.note_condition_var(var);
+    }
+
+    fn mark_use(ctx: &mut FoldingContext<'_>, var: &SSAVar, count: usize) {
             ctx.state
                 .analysis_ctx
                 .use_info
@@ -4630,20 +4649,12 @@ mod tests {
 
         let condition_non_candidate = make_var("condition_value", 1, 8);
         mark_use(&mut ctx, &condition_non_candidate, 1);
-        ctx.state
-            .analysis_ctx
-            .use_info
-            .condition_vars
-            .insert(condition_non_candidate.display_name());
+        bind_and_mark_condition(&mut ctx, &condition_non_candidate, 910);
         assert!(!ctx.should_inline(&condition_non_candidate));
 
         let condition_flag = make_var("ZF", 1, 1);
         mark_use(&mut ctx, &condition_flag, 1);
-        ctx.state
-            .analysis_ctx
-            .use_info
-            .condition_vars
-            .insert(condition_flag.display_name());
+        bind_and_mark_condition(&mut ctx, &condition_flag, 911);
         assert!(ctx.should_inline(&condition_flag));
 
         let flag_only = make_var("flag_only", 1, 8);

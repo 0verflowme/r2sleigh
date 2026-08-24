@@ -1757,8 +1757,13 @@ impl<'a> FoldingContext<'a> {
     pub(crate) fn stack_slots(&self) -> impl Iterator<Item = analysis::StackSlotProvenance> + '_ {
         self.use_info().stack_slots()
     }
-    pub(crate) fn condition_vars_set(&self) -> &HashSet<String> {
-        &self.use_info().condition_vars
+    /// Whether a rendered name is one a condition was decided by.
+    ///
+    /// This handed back the name-keyed set so callers could ask it directly.
+    /// There is no name-keyed set now: the question goes to the value store, and
+    /// the name is resolved to an identity on the way in.
+    pub(crate) fn is_condition_name(&self, name: &str) -> bool {
+        self.use_info().is_condition_name(name)
     }
     pub(crate) fn pinned_set(&self) -> &HashSet<String> {
         &self.use_info().pinned
@@ -3100,7 +3105,7 @@ impl<'a> FoldingContext<'a> {
             || self.carrier_aliases.contains_key(var_name)
             // A flag is rendered by the comparison it spells, not by a table.
             || self.inputs.arch.is_flag_name(var_name)
-            || self.condition_vars_set().contains(var_name)
+            || self.is_condition_name(var_name)
     }
 
     fn should_inline(&self, var: &SSAVar) -> bool {
@@ -3125,7 +3130,7 @@ impl<'a> FoldingContext<'a> {
             return false;
         }
 
-        if self.condition_vars_set().contains(&var_name)
+        if self.is_condition_name(&var_name)
             && !self.is_condition_inline_candidate(&var_name)
         {
             return false;
@@ -8749,7 +8754,7 @@ impl<'a> FoldingContext<'a> {
                         quality.scalar_signal += 12;
                     }
                     if self.lookup_predicate_expr(&self.spelling(*name)).is_some()
-                        || self.condition_vars_set().contains(&*self.spelling(*name))
+                        || self.is_condition_name(&self.spelling(*name))
                     {
                         quality.predicate_signal += 8;
                         quality.scalar_signal += 4;

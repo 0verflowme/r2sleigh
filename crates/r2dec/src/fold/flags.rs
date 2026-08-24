@@ -955,7 +955,7 @@ impl<'a> FoldingContext<'a> {
             CExpr::Var(name) => {
                 self.inputs.arch.is_flag_name(&self.spelling(*name))
                     || self.flag_only_values_set().contains(&*self.spelling(*name))
-                    || self.condition_vars_set().contains(&*self.spelling(*name))
+                    || self.is_condition_name(&self.spelling(*name))
                     || self.lookup_predicate_expr(&self.spelling(*name)).is_some()
             }
             CExpr::Unary {
@@ -2122,7 +2122,7 @@ impl<'a> FoldingContext<'a> {
             CExpr::Var(name) => {
                 self.inputs.arch.is_flag_name(&self.spelling(*name))
                     || self.flag_only_values_set().contains(&*self.spelling(*name))
-                    || self.condition_vars_set().contains(&*self.spelling(*name))
+                    || self.is_condition_name(&self.spelling(*name))
                     || self.lookup_predicate_expr(&self.spelling(*name)).is_some()
             }
             CExpr::Unary {
@@ -2302,7 +2302,7 @@ impl<'a> FoldingContext<'a> {
             CExpr::Var(name) => {
                 self.inputs.arch.is_flag_name(&self.spelling(*name))
                     || self.flag_only_values_set().contains(&*self.spelling(*name))
-                    || self.condition_vars_set().contains(&*self.spelling(*name))
+                    || self.is_condition_name(&self.spelling(*name))
                     || self.lookup_predicate_expr(&self.spelling(*name)).is_some()
             }
             CExpr::Unary {
@@ -2333,7 +2333,7 @@ impl<'a> FoldingContext<'a> {
         let name = &self.spelling(name_id);
 
         if self.inputs.arch.is_flag_name(name)
-            || self.condition_vars_set().contains(&**name)
+            || self.is_condition_name(name)
             || self.flag_only_values_set().contains(&**name)
             || self.lookup_predicate_expr(name).is_some()
         {

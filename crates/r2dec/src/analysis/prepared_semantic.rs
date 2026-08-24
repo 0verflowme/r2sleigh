@@ -500,7 +500,6 @@ fn populate_prepared_render_definitions(symbols: &std::cell::RefCell<crate::symb
                     definitions: &use_info.definitions,
                     semantic_values: &use_info.semantic_values,
                     use_counts: &use_info.use_counts,
-                    condition_vars: &use_info.condition_vars,
                     pinned: &use_info.pinned,
                     var_aliases: &use_info.var_aliases,
                     param_register_aliases: env.param_register_aliases,
