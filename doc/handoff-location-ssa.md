@@ -177,9 +177,21 @@ obligations the proof line reports for this function.
 
 Its target is `PC_1`, which is the link register: on arm64 -O0 the return
 address is what `ret` reads, and the return *value* is in `X0_1`, loaded two ops
-earlier. `is_control_return_target` exists for exactly this and the branch that
-uses it reaches for `merged_return_register_candidate_for_block`, so the
-question is why `op_to_stmt_impl` yields `None` here rather than a `Return`.
+earlier.
+
+Two candidates are ruled out. `op_to_stmt_impl`'s `Return` arm is
+
+    SSAOp::Return { target } => Some(CStmt::Return(Some(...)))
+
+which never yields `None`, so the statement is not declined there. And
+`exit_block_is_control_only_epilogue` is false for this block, because its first
+op is `IntAdd dst=tmp:6500_11` and that arm requires the destination to be the
+stack pointer.
+
+So `fold_block` skips the op before `op_to_stmt_impl` sees it. `Return` has no
+destination, so neither the `is_dead` nor the `should_inline` skip applies --
+both are inside `if let Some(dst) = op.dst()`. **The next step is to print which
+branch of `fold_block` continues past idx 10**, and it is one build.
 
 Worth four cells, and the loops behind all four are already correct.
 
