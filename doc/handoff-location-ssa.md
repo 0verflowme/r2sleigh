@@ -3849,6 +3849,19 @@ tests -- they pin colliding display names, alias precedence, and rendered-name
 lookup, which is exactly what a second store was papering over.
 
 Making an identity answer to both its SSA and rendered spellings fixes one of the
-seven and is a real change to what a name means, not a step in a store collapse.
-It belongs with the location model and wants its own measurement. Reverted rather
-than bundled.
+seven. It was measured on its own, and it is wrong.
+
+Binding `t11f80_19` to the same identity as `tmp:11f80_19` puts a second, looser
+key back into the name map, and arm64 -O1 falls from seven correct to six: the
+`crc32_bitwise` hang returns. That hang is the one collapsing `copy_sources`
+removed, and it comes back for the same reason it existed -- a rendered spelling
+that two values can share is a name-shaped match, and following a chain through
+one steps between values that differ in ways the spelling does not show. Widening
+name resolution reintroduces the defect the collapse eliminated, one layer down.
+
+So the way to `definitions` is not a wider name map. A caller holding a rendered
+spelling has to reach the identity through the symbol table, which knows the SSA
+name that spelling came from -- `LowerCtx::definition_for_symbol` already does
+exactly this, and it is the shape the rest need. That is the location model's
+job, and this measurement says the shortcut around it costs a correct
+rendering.
