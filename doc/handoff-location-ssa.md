@@ -4473,12 +4473,31 @@ simply happen at different nesting depths, four and eight, and the second is
 nested inside the first's push window, which is why it sees the merge as already
 owned.
 
-The region is therefore structured recursively within itself, and the visit that
-appends the merge is the outer one whose result is discarded. What remains is to
-find the path from the region's own branches back to the region, which is the
-recursion that makes the second visit possible at all. Four hypotheses are now
-eliminated: a pass deleting the return, a sequence deferral, an ancestor claiming
-a descendant's merge, and the speculative rewrite.
+Printing every region entry with its depth and caller shows what actually
+happens, and it is not recursion into itself:
+
+    depth=2  entry=0x1000008f4  from structure.rs:3049
+    depth=4  entry=0x1000008ec  from structure.rs:3050
+    depth=6  entry=0x1000008f4  from structure.rs:1176
+    depth=8  entry=0x1000008ec  from structure.rs:1176
+
+`try_structure_if_else_with_register_merge_returns` structures an entire subtree
+speculatively, from lines 3049 and 3050, to decide whether its rewrite applies.
+When it declines, the ordinary path at 1176 structures **the same subtree again**
+from scratch. `0x1000008f4` and `0x1000008ec` are each structured twice, and the
+second structuring is what reaches the page.
+
+So the duplication is not a region nested in itself. It is a whole subtree
+structured once to answer a question and once to produce output, with nothing
+carrying the first answer to the second. That the two differ is the defect;
+`murmur3_32`'s return is in the first and not the second.
+
+The fix direction follows: the speculative attempt should either reuse what it
+structured, so the answer it computed is the answer that ships, or not structure
+at all -- deciding whether the rewrite applies without building the arms. The
+first is smaller. Five hypotheses are eliminated on the way here: a pass deleting
+the return, a sequence deferral, an ancestor claiming a descendant's merge, the
+speculative visit's ownership context, and any external deferral.
 
 The `PASS after=... returns=N` probe added for this is kept, because "when did
 the return disappear" turned out to be the question that made the search finite.
