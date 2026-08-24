@@ -4310,3 +4310,40 @@ recorded above, and it now has a second measurement on two configurations saying
 the same thing. **The boundary has to be made uniform before any single site on
 it can be corrected**, and the retry rules out "enough else has changed" as a
 reason to try again site-by-site.
+
+## The legacy comparison-provenance path is dead, and its tests do not notice
+
+Chasing `origin_name_to_expr`'s raw spellings led to `FlagCompareProvenance`,
+which holds `lhs` and `rhs` as **strings** while the prepared path beside it holds
+them as `ValueId`s. That is the paired-store shape again, in a store outside the
+nine.
+
+It is not merely a second path. It is a dead one.
+
+`FlagInfo::compare_provenance` has **no production writer**. Production builds
+`FlagInfo::default()` in `prepared_semantic.rs` and the only field it ever fills
+is `flag_only_values`; the map is written in four places and all four are tests
+in `fold/tests/pipeline.rs`. So `lookup_flag_compare_provenance` always returns
+`None` in production, and the nine call sites that guard on it, together with
+`collect_matching_flag_compare_provenance` and the `compare_provenance_expr`
+family, never run.
+
+Two measurements confirm it. Returning `None` from the lookup unconditionally
+leaves the corpus at 34 of 54, unchanged on every configuration. And the whole
+suite still passes -- 2334 tests, including
+`test_simplify_direct_zf_and_not_zf_from_compare_provenance` and the three others
+that populate the map by hand. **Those tests pass with the feature they name
+switched off.** They write the map, assert a simplification, and get it from
+somewhere else.
+
+That is worth more than the dead code. Four tests read as coverage of a
+comparison-provenance path and provide none, so anyone reasoning about that path
+from the test names is reasoning about nothing. The machinery can be deleted --
+the evidence for that is as strong as this corpus and suite can make it -- but
+the tests should not simply be deleted with it: what they assert is behaviour
+that does happen, by a route they do not name, and that route is what wants a
+test.
+
+This is the tenth instance this session of one question with two answering paths,
+and the first where the redundant path turned out to be answering nothing at
+all.
