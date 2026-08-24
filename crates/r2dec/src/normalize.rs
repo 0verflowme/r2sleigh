@@ -1015,6 +1015,8 @@ pub(crate) fn carrier_name_aliases(
     let reused = prepared.carriers_spanning_a_reuse();
     let mut aliases = HashMap::new();
     let mut taken = HashSet::new();
+    let spans = prepared.storage_spans();
+    let mut names_by_span: HashMap<r2ssa::span::SpanId, String> = HashMap::new();
     for carrier in render_facts.loop_carriers() {
         let CertifiedEntity::LoopCarrier {
             id,
@@ -1037,12 +1039,30 @@ pub(crate) fn carrier_name_aliases(
         else {
             continue;
         };
-        // Two loops carrying the same register are two variables, so the second
-        // is told apart by the header it belongs to rather than merged into the first.
-        let name = if taken.insert(base.clone()) {
-            base
-        } else {
-            format!("{base}_{header:x}")
+        // Two loops carrying the same register are two variables *unless the
+        // register holds one value across both*, which is what a storage span
+        // says. A four-way unrolled loop followed by a remainder loop carries one
+        // accumulator through both, and naming them apart left the remainder
+        // starting from nothing: `fnv1a32` at x86-64 -O2 ran its tail over
+        // `rax_1000005f0`, which no statement ever gave the value `rax` reached.
+        //
+        // `StorageSpans` computes where a storage stops holding one value, so it
+        // answers this directly and the header suffix is kept for the case it was
+        // written for: two carriers over one register in genuinely separate runs.
+        let span = spans.span_of(*phi);
+        let name = match span.and_then(|span| names_by_span.get(&span).cloned()) {
+            Some(existing) => existing,
+            None => {
+                let name = if taken.insert(base.clone()) {
+                    base
+                } else {
+                    format!("{base}_{header:x}")
+                };
+                if let Some(span) = span {
+                    names_by_span.insert(span, name.clone());
+                }
+                name
+            }
         };
         let members = identity_values
             .iter()
