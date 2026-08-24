@@ -173,9 +173,26 @@ does connect them: the exit merge of the first, the `updates` of the second, or
 neither, in which case the certification treats them as unrelated and that is
 where to look.
 
-The same rendering has a second defect worth separating: the unrolled loop's
-condition is `while ((arg1 & -0x4) != 0)`, which never changes, so the loop as
-written does not terminate.
+The same rendering had a second defect, since fixed: the unrolled loop's
+condition read `while ((arg1 & -0x4) != 0)`, because `expand_predicate_vars`
+resolved the counter through its definition. Both are now right, and what
+remains on that configuration is a third, smaller thing.
+
+`djb2` renders `31d5859a` against `31d585ac`, and `sdbm` `86d9741d` against
+`86d9742f` -- off by one byte's contribution. The tail loop's preheader is
+
+    rdi_1 = arg0;
+    rdx = 0;
+
+and the pointer has lost its offset: after the unrolled loop the remainder
+starts at `arg0 + (arg1 & -4)`, not at `arg0`. So the tail re-reads the first
+bytes of the buffer instead of the last few. The counter reset to zero is
+consistent with a re-based pointer and is not itself wrong.
+
+That is the entry value of the tail loop's pointer carrier, which is the same
+family as everything else fixed here, and the arithmetic connecting the two
+loops is what goes missing. Three renderings on that configuration are one
+addition away.
 
 ### Four renderings have no return at all, and the loop above it is correct
 
