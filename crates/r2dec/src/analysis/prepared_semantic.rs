@@ -3104,6 +3104,8 @@ fn collect_prepared_runtime_facts(symbols: &std::cell::RefCell<crate::symbol::Sy
                 *use_info.use_counts.entry(src.display_name()).or_insert(0) += 1;
                 if let Some(value_id) = bind_prepared_value_id(use_info, view, src) {
                     *use_info.use_counts_by_value.entry(value_id).or_insert(0) += 1;
+                } else {
+                    *use_info.unkeyed_writes.entry("use_counts").or_default() += 1;
                 }
             }
             seed_prepared_value_fact(symbols, use_info, &phi.dst, prepared, view);
@@ -3114,6 +3116,8 @@ fn collect_prepared_runtime_facts(symbols: &std::cell::RefCell<crate::symbol::Sy
                 *use_info.use_counts.entry(src.display_name()).or_insert(0) += 1;
                 if let Some(value_id) = bind_prepared_value_id(use_info, view, src) {
                     *use_info.use_counts_by_value.entry(value_id).or_insert(0) += 1;
+                } else {
+                    *use_info.unkeyed_writes.entry("use_counts").or_default() += 1;
                 }
             }
             // A value defined by adding or subtracting a constant is that
@@ -3148,6 +3152,8 @@ fn collect_prepared_runtime_facts(symbols: &std::cell::RefCell<crate::symbol::Sy
                 use_info.condition_vars.insert(cond.display_name());
                 if let Some(value_id) = bind_prepared_value_id(use_info, view, cond) {
                     use_info.condition_values.insert(value_id);
+                } else {
+                    *use_info.unkeyed_writes.entry("condition_vars").or_default() += 1;
                 }
             }
 
@@ -3221,6 +3227,11 @@ fn collect_prepared_runtime_facts(symbols: &std::cell::RefCell<crate::symbol::Sy
                                         .or_else(|| stack_offset_for_value(prepared, src)),
                                 ),
                             );
+                        } else {
+                            *use_info
+                                .unkeyed_writes
+                                .entry("forwarded_values")
+                                .or_default() += 1;
                         }
                     }
                     if dst.version == 0
