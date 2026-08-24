@@ -30,7 +30,6 @@ pub(crate) struct LowerCtx<'a> {
     pub(crate) var_aliases: &'a HashMap<String, String>,
     pub(crate) param_register_aliases: &'a HashMap<String, String>,
     pub(crate) type_hints: &'a HashMap<String, CType>,
-    pub(crate) ptr_arith: &'a HashMap<String, PtrArith>,
     pub(crate) stack_slots: &'a HashMap<String, StackSlotProvenance>,
     pub(crate) forwarded_values: &'a HashMap<String, ValueProvenance>,
     pub(crate) type_oracle: Option<&'a dyn TypeOracle>,
@@ -127,10 +126,11 @@ impl<'a> LowerCtx<'a> {
     }
 
     fn ptr_arith_for_var(&self, var: &SSAVar) -> Option<&PtrArith> {
-        let key = var.display_name();
-        self.ptr_arith
-            .get(&key)
-            .or_else(|| self.use_info.and_then(|info| info.ptr_arith_for_var(var)))
+        // One store answers for pointer arithmetic, keyed by identity. This used
+        // to consult a name-keyed copy first and fall back to the real one,
+        // which meant the answer depended on which of the two the caller had
+        // been handed.
+        self.use_info.and_then(|info| info.ptr_arith_for_var(var))
     }
 
     fn use_count_for_name(&self, name: &str) -> usize {
@@ -1457,7 +1457,7 @@ mod tests {
         condition_vars: &'a HashSet<String>,
         pinned: &'a HashSet<String>,
         var_aliases: &'a HashMap<String, String>,
-        ptr_arith: &'a HashMap<String, PtrArith>,
+        _ptr_arith: &'a HashMap<String, PtrArith>,
         stack_slots: &'a HashMap<String, StackSlotProvenance>,
         forwarded_values: &'a HashMap<String, ValueProvenance>,
         #[cfg(test)] _function_names: &'a HashMap<u64, String>,
@@ -1479,7 +1479,6 @@ mod tests {
             var_aliases,
             param_register_aliases,
             type_hints,
-            ptr_arith,
             stack_slots,
             forwarded_values,
             type_oracle: None,

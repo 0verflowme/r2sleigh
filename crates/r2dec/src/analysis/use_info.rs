@@ -1980,7 +1980,7 @@ fn collect_definitions(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
                     let lower = LowerCtx {
                         symbols,
                         string_literals: env.string_literals,
-                        use_info: None,
+                        use_info: Some(&scratch.info),
                         definitions: &scratch.info.definitions,
                         semantic_values: &scratch.info.semantic_values,
                         use_counts: &scratch.info.use_counts,
@@ -1989,7 +1989,6 @@ fn collect_definitions(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
                         var_aliases: &scratch.info.var_aliases,
                         param_register_aliases: env.param_register_aliases,
                         type_hints: &scratch.info.type_hints,
-                        ptr_arith: &scratch.info.ptr_arith,
                         stack_slots: &scratch.info.stack_slots,
                         forwarded_values: &scratch.info.forwarded_values,
                         type_oracle: env.type_oracle,
@@ -2055,7 +2054,7 @@ fn rebuild_definitions(
                 let lower = LowerCtx {
                     symbols,
                     string_literals: env.string_literals,
-                    use_info: None,
+                    use_info: Some(&scratch.info),
                     definitions: &rebuilt,
                     semantic_values: &scratch.info.semantic_values,
                     use_counts: &scratch.info.use_counts,
@@ -2064,7 +2063,6 @@ fn rebuild_definitions(
                     var_aliases: &scratch.info.var_aliases,
                     param_register_aliases: env.param_register_aliases,
                     type_hints: &scratch.info.type_hints,
-                    ptr_arith: &scratch.info.ptr_arith,
                     stack_slots: &scratch.info.stack_slots,
                     forwarded_values: &scratch.info.forwarded_values,
                     type_oracle: env.type_oracle,
@@ -2930,7 +2928,10 @@ fn semantic_var_is_pointer_like(info: &UseInfo, var: &SSAVar, env: &PassEnv<'_>)
     {
         return true;
     }
-    if info.ptr_arith.contains_key(&key) || info.ptr_members.contains_key(&key) {
+    let keyed_ptr_arith = info
+        .value_id_for_name(&key)
+        .is_some_and(|value_id| info.ptr_arith_by_value.contains_key(&value_id));
+    if keyed_ptr_arith || info.ptr_members.contains_key(&key) {
         return true;
     }
     let copy_root = resolve_copy_root_name(info, &key);
@@ -2993,7 +2994,10 @@ fn semantic_var_is_pointer_like_cached(
     {
         return true;
     }
-    if info.ptr_arith.contains_key(&key) || info.ptr_members.contains_key(&key) {
+    let keyed_ptr_arith = info
+        .value_id_for_name(&key)
+        .is_some_and(|value_id| info.ptr_arith_by_value.contains_key(&value_id));
+    if keyed_ptr_arith || info.ptr_members.contains_key(&key) {
         return true;
     }
     let copy_root = resolve_copy_root_name(info, &key);
@@ -3348,7 +3352,10 @@ fn semantic_addr_for_var_with_depth(symbols: &std::cell::RefCell<crate::symbol::
         });
     }
 
-    if let Some(ptr) = info.ptr_arith.get(&key) {
+    if let Some(ptr) = info
+        .value_id_for_name(&key)
+        .and_then(|value_id| info.ptr_arith_by_value.get(&value_id))
+    {
         let base = semantic_addr_for_var_with_depth(symbols, info, &ptr.base, env, depth + 1)
             .unwrap_or_else(|| normalized_addr_from_base_var(&ptr.base));
         return compose_indexed_addr(
@@ -4697,7 +4704,6 @@ fn analyze_call_args(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, s
                 var_aliases: &scratch.info.var_aliases,
                 param_register_aliases: env.param_register_aliases,
                 type_hints: &scratch.info.type_hints,
-                ptr_arith: &scratch.info.ptr_arith,
                 stack_slots: &scratch.info.stack_slots,
                 forwarded_values: &scratch.info.forwarded_values,
                 type_oracle: env.type_oracle,
@@ -4928,7 +4934,7 @@ fn analyze_call_args(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, s
                 let lower = LowerCtx {
                     symbols,
                     string_literals: env.string_literals,
-                    use_info: None,
+                    use_info: Some(&scratch.info),
                     definitions: &scratch.info.definitions,
                     semantic_values: &scratch.info.semantic_values,
                     use_counts: &scratch.info.use_counts,
@@ -4937,7 +4943,6 @@ fn analyze_call_args(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, s
                     var_aliases: &scratch.info.var_aliases,
                     param_register_aliases: env.param_register_aliases,
                     type_hints: &scratch.info.type_hints,
-                    ptr_arith: &scratch.info.ptr_arith,
                     stack_slots: &scratch.info.stack_slots,
                     forwarded_values: &scratch.info.forwarded_values,
                     type_oracle: env.type_oracle,
@@ -5029,7 +5034,6 @@ fn bind_single_use_call_result_definitions(symbols: &std::cell::RefCell<crate::s
                 var_aliases: &scratch.info.var_aliases,
                 param_register_aliases: env.param_register_aliases,
                 type_hints: &scratch.info.type_hints,
-                ptr_arith: &scratch.info.ptr_arith,
                 stack_slots: &scratch.info.stack_slots,
                 forwarded_values: &scratch.info.forwarded_values,
                 type_oracle: env.type_oracle,
@@ -5129,7 +5133,7 @@ fn bind_call_result_alias_definitions(symbols: &std::cell::RefCell<crate::symbol
                 let lower = LowerCtx {
                     symbols,
                     string_literals: env.string_literals,
-                    use_info: None,
+                    use_info: Some(info),
                     definitions: &info.definitions,
                     semantic_values: &info.semantic_values,
                     use_counts: &info.use_counts,
@@ -5138,7 +5142,6 @@ fn bind_call_result_alias_definitions(symbols: &std::cell::RefCell<crate::symbol
                     var_aliases: &info.var_aliases,
                     param_register_aliases: env.param_register_aliases,
                     type_hints: &info.type_hints,
-                    ptr_arith: &info.ptr_arith,
                     stack_slots: &info.stack_slots,
                     forwarded_values: &info.forwarded_values,
                     type_oracle: env.type_oracle,
@@ -9476,7 +9479,6 @@ mod tests {
             var_aliases: &info.var_aliases,
             param_register_aliases: env.param_register_aliases,
             type_hints: &info.type_hints,
-            ptr_arith: &info.ptr_arith,
             stack_slots: &info.stack_slots,
             forwarded_values: &info.forwarded_values,
             type_oracle: env.type_oracle,
@@ -9841,7 +9843,6 @@ mod tests {
             var_aliases: &info.var_aliases,
             param_register_aliases: env.param_register_aliases,
             type_hints: &info.type_hints,
-            ptr_arith: &info.ptr_arith,
             stack_slots: &info.stack_slots,
             forwarded_values: &info.forwarded_values,
             type_oracle: env.type_oracle,

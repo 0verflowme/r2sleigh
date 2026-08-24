@@ -505,7 +505,6 @@ fn populate_prepared_render_definitions(symbols: &std::cell::RefCell<crate::symb
                     var_aliases: &use_info.var_aliases,
                     param_register_aliases: env.param_register_aliases,
                     type_hints: &use_info.type_hints,
-                    ptr_arith: &use_info.ptr_arith,
                     stack_slots: &use_info.stack_slots,
                     forwarded_values: &use_info.forwarded_values,
                     type_oracle: env.type_oracle,

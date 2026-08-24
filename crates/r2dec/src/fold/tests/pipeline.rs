@@ -4848,8 +4848,8 @@ mod tests {
         let real_index = make_var("tmp:9303", 1, 4);
 
         let mut ctx = FoldingContext::new(64);
-        ctx.state.analysis_ctx.use_info.ptr_arith.insert(
-            addr.display_name(),
+        ctx.state.analysis_ctx.use_info.insert_ptr_arith_for_var(
+            &addr,
             PtrArith {
                 base: arr.clone(),
                 index: bogus_index.clone(),

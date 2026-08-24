@@ -147,7 +147,6 @@ pub(crate) struct UseInfo {
     pub(crate) copy_sources: HashMap<String, String>,
     pub(crate) copy_sources_by_value: BTreeMap<ValueId, ValueId>,
     pub(crate) memory_stores: HashMap<String, String>,
-    pub(crate) ptr_arith: HashMap<String, PtrArith>,
     pub(crate) ptr_arith_by_value: BTreeMap<ValueId, PtrArith>,
     pub(crate) ptr_members: HashMap<String, (r2ssa::SSAVar, i64)>,
     pub(crate) condition_vars: HashSet<String>,
@@ -735,7 +734,6 @@ impl UseInfo {
         } else {
             *self.unkeyed_writes.entry("ptr_arith").or_default() += 1;
         }
-        self.ptr_arith.insert(var.display_name(), ptr);
     }
 
     pub(crate) fn insert_forwarded_value_for_var(
@@ -1036,7 +1034,6 @@ impl UseInfo {
         }
         self.value_id_for_var(var)
             .and_then(|value_id| self.ptr_arith_by_value.get(&value_id))
-            .or_else(|| self.ptr_arith.get(&var.display_name()))
     }
 
     pub(crate) fn is_condition_name(&self, name: &str) -> bool {
