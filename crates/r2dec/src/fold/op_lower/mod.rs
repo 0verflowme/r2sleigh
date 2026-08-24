@@ -3457,9 +3457,16 @@ impl<'a> FoldingContext<'a> {
                 space: r2il::SpaceId::Ram,
                 addr,
             } if dst.size < addr.size => {
+                // A load is unsigned unless something sign-extends it, and
+                // Sleigh says so explicitly with `IntSExt` when it does. Giving
+                // a bare byte load a signed pointee makes C sign-extend where
+                // the machine does not: `pearson` reads its table with
+                // `mov al, byte [rax + rcx]`, and rendering that as `int8_t*`
+                // turns any entry at or above 0x80 negative, which then corrupts
+                // the next index.
                 let elem_ty = self
                     .type_hint_for_var(dst)
-                    .unwrap_or_else(|| type_from_size(dst.size));
+                    .unwrap_or_else(|| uint_type_from_size(dst.size));
                 let expr = self.render_canonical_load_expr(dst, addr, elem_ty);
                 (Self::expr_is_scalar_memory_candidate(&expr)
                     || Self::expr_is_structured_memory_candidate(&expr))

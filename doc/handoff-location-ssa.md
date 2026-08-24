@@ -23,14 +23,14 @@ verified by compiling each rendering and running it against the reference digest
 counts obligations, not correctness.
 
                      start    now
-    x86-64 -O0         4       6
+    x86-64 -O0         4       7
     x86-64 -O1         0       5
     x86-64 -O2         0       3
     arm64  -O0         0       7
     arm64  -O1         0       7
     arm64  -O2         0       6
                      ----    ----
-                       4      34   of 54
+                       4      35   of 54
 
 Measuring it requires `make -C r2plugin install` and a fresh `sweep.sh` for every
 configuration; see "How to measure" below, which cost four voided conclusions to
@@ -4349,3 +4349,27 @@ the map goes -- but what they cover is a path production never takes.
 Removing it means removing every reader, not stubbing one, and re-pointing those
 tests at the behaviour they should be guarding. That was attempted and reverted
 here, because the attempt was built on the claim above.
+
+## A narrow load is unsigned unless something says otherwise
+
+`pearson` returned `f8` for `0d` on x86-64 -O0 while rendering a loop that reads
+correctly:
+
+    local_19 = *(int8_t*)(0x1000019a0U + (local_19 ^ t11e00_3));
+
+The machine reads that table with `mov al, byte [rax + rcx]` -- a plain byte, no
+sign extension. Rendering the pointee as `int8_t` makes C sign-extend where the
+machine does not, so any table entry at or above `0x80` goes negative and
+corrupts the index of the next round.
+
+The default came from `type_from_size`, which is signed, while
+`analysis/lower.rs` reaches for `uint_type_from_size` at the same question. Two
+answers for one property again, and this time the machine settles it: Sleigh
+emits `IntSExt` explicitly when a load is sign-extended, so a bare `Load` is
+unsigned and the signed default was simply wrong.
+
+One line, and x86-64 -O0 goes from six correct to seven with no other
+configuration moving. It is worth noticing what made it findable: `pearson` was
+the only remaining failure whose rendering was *structurally* right, so the
+defect had nowhere to hide. The undefined-name cases have structure missing as
+well, which is why they resist this kind of reading.
