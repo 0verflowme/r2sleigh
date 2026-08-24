@@ -1693,8 +1693,12 @@ impl<'a> FoldingContext<'a> {
         Some(current)
     }
 
-    pub(crate) fn use_counts_map(&self) -> &HashMap<String, usize> {
-        &self.use_info().use_counts
+    /// How many times a value is read, asked by one of its names.
+    ///
+    /// The map this replaced was keyed by name, so callers open-coded a ladder
+    /// of case variants to find the entry. The count belongs to the value.
+    pub(crate) fn use_count_of(&self, name: &str) -> usize {
+        self.use_info().use_count_for_name(name)
     }
     pub(crate) fn definitions_map(&self) -> &HashMap<String, CExpr> {
         &self.use_info().definitions
@@ -3114,7 +3118,7 @@ impl<'a> FoldingContext<'a> {
 
     fn should_inline(&self, var: &SSAVar) -> bool {
         let var_name = var.display_name();
-        let use_count = self.use_counts_map().get(&var_name).copied().unwrap_or(0);
+        let use_count = self.use_count_of(&var_name);
 
         if use_count == 0 || use_count > 3 {
             return false;
@@ -3260,7 +3264,7 @@ impl<'a> FoldingContext<'a> {
         if self.flag_only_values_set().contains(&key) {
             return "dead-flag-only";
         }
-        if self.use_counts_map().get(&key).copied().unwrap_or(0) > 0 {
+        if self.use_count_of(&key) > 0 {
             return "dead-used";
         }
         if var.is_temp() || var.is_const() || matches!(var.name_kind(), SSAVarNameKind::RegisterAlias)
@@ -3281,7 +3285,7 @@ impl<'a> FoldingContext<'a> {
 
     pub fn is_dead(&self, var: &SSAVar) -> bool {
         let key = var.display_name();
-        let use_count = self.use_counts_map().get(&key).copied().unwrap_or(0);
+        let use_count = self.use_count_of(&key);
         let lower = var.name.to_lowercase();
 
         // Flag registers are rendering artifacts; keep them out of emitted code.
@@ -7597,7 +7601,7 @@ impl<'a> FoldingContext<'a> {
         let Some(prepared) = self.inputs.prepared_ssa else {
             return candidate_names
                 .iter()
-                .any(|name| self.use_counts_map().get(name).copied().unwrap_or(0) > 0);
+                .any(|name| self.use_count_of(name) > 0);
         };
 
         let graph = prepared.graph();
@@ -12994,10 +12998,7 @@ impl<'a> FoldingContext<'a> {
                     break;
                 }
             } else if let Some(dst) = op.dst()
-                && self
-                    .use_counts_map()
-                    .get(&dst.display_name())
-                    .is_some_and(|count| *count > 0)
+                && self.use_count_of(&dst.display_name()) > 0
             {
                 // No statement means the value renders inside an expression rather
                 // than on its own line, and the expression that reads it owns it.

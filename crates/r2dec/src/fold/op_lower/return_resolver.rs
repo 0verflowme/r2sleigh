@@ -810,26 +810,15 @@ impl<'a> FoldingContext<'a> {
             return false;
         }
 
-        let use_count = self
-            .use_counts_map()
-            .get(&**var_name)
-            .copied()
-            .or_else(|| self.use_counts_map().get(&lower).copied())
-            .or_else(|| {
-                var_name.rsplit_once('_').and_then(|(base, ver)| {
-                    self.use_counts_map()
-                        .get(&format!("{}_{}", base.to_lowercase(), ver))
-                        .copied()
-                        .or_else(|| {
-                            self.use_counts_map()
-                                .get(&format!("{}_{}", base.to_uppercase(), ver))
-                                .copied()
-                        })
-                })
-            })
-            .or_else(|| self.use_counts_map().get(semantic_name).copied())
-            .or_else(|| self.use_counts_map().get(&semantic_lower).copied())
-            .unwrap_or(0);
+        // Six lookups used to stand here -- the name, its lowercase, both case
+        // variants of `base_version`, then the same for the semantic name --
+        // because the counts were filed under whatever spelling the writer had.
+        // They are filed under identities now, so the name is resolved once and
+        // the variants have nothing left to disagree about.
+        let use_count = match self.use_count_of(var_name) {
+            0 => self.use_count_of(semantic_name),
+            count => count,
+        };
         if use_count == 0 || use_count > 3 {
             return false;
         }

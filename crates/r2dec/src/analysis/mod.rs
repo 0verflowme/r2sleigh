@@ -131,7 +131,6 @@ pub(crate) struct UseInfo {
     pub(crate) value_ids_by_name: HashMap<String, ValueId>,
     pub(crate) ambiguous_value_names: HashSet<String>,
     pub(crate) vars_by_value_id: BTreeMap<ValueId, SSAVar>,
-    pub(crate) use_counts: HashMap<String, usize>,
     pub(crate) use_counts_by_value: BTreeMap<ValueId, usize>,
     /// Condition codes as this target's register file defines them.
     pub(crate) flag_regs: std::collections::HashSet<String>,
@@ -675,8 +674,6 @@ impl UseInfo {
     }
 
     pub(crate) fn note_use_for_var(&mut self, var: &SSAVar) {
-        let display = var.display_name();
-        *self.use_counts.entry(display).or_insert(0) += 1;
         if let Some(value_id) = self.exact_value_id_for_var(var) {
             *self.use_counts_by_value.entry(value_id).or_insert(0) += 1;
         } else {
@@ -859,7 +856,6 @@ impl UseInfo {
         }
         self.value_id_for_name(name)
             .and_then(|value_id| self.use_counts_by_value.get(&value_id).copied())
-            .or_else(|| lookup_name_key(&self.use_counts, name).copied())
             .unwrap_or(0)
     }
 

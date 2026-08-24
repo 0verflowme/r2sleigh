@@ -8,6 +8,47 @@ mod tests {
     };
 
     use crate::analysis::PtrArith;
+
+    /// Say a value is read `count` times.
+    ///
+    /// Counts are kept against identities, so a test has to give the value one
+    /// before it can claim anything about how often it is read.
+    fn mark_use_counted(ctx: &mut FoldingContext<'_>, var: &SSAVar, count: usize) {
+        let info = &mut ctx.state.analysis_ctx.use_info;
+        if info.exact_value_id_for_var(var).is_none() {
+            let next = r2ssa::ValueId(9000 + info.value_ids_by_var.len() as u32);
+            assert_eq!(info.bind_value_id(var, next), Some(next));
+        }
+        for _ in 0..count {
+            info.note_use_for_var(var);
+        }
+    }
+
+    /// The same, for a test that only has the rendered spelling.
+    fn mark_use_by_name(ctx: &mut FoldingContext<'_>, name: &str, count: usize) {
+        let (base, version) = match name.rsplit_once('_') {
+            Some((base, tail)) => match tail.parse::<u32>() {
+                Ok(version) => (base, version),
+                Err(_) => (name, 0),
+            },
+            None => (name, 0),
+        };
+        let var = SSAVar::new(base, version, 8);
+        mark_use_counted(ctx, &var, count);
+    }
+
+    /// Record that a condition was decided by this value.
+    ///
+    /// It may already have an identity from `mark_use_counted`, so bind only
+    /// when there is nothing there.
+    fn bind_and_mark_condition(ctx: &mut FoldingContext<'_>, var: &SSAVar) {
+        let info = &mut ctx.state.analysis_ctx.use_info;
+        if info.exact_value_id_for_var(var).is_none() {
+            let next = r2ssa::ValueId(9000 + info.value_ids_by_var.len() as u32);
+            assert_eq!(info.bind_value_id(var, next), Some(next));
+        }
+        info.note_condition_var(var);
+    }
     use crate::fold::context::{EffectRenderProofKind, empty_function_facts};
     use crate::{
         FoldArchConfig, FoldInputs,
@@ -2692,11 +2733,7 @@ mod tests {
                 vec![CExpr::IntLit(7)],
             ),
         );
-        ctx.state
-            .analysis_ctx
-            .use_info
-            .use_counts
-            .insert("x20_1".to_string(), 1);
+        mark_use_by_name(&mut ctx, "x20_1", 1);
 
         let rendered = CExpr::call(
             CExpr::External {
@@ -4546,32 +4583,10 @@ mod tests {
 
     #[test]
     fn should_inline_ssavar_guard_matrix_preserves_refusal_order() {
-        /// Record that a condition was decided by this value.
-    ///
-    /// Conditions are keyed by identity now, so a test has to give the value one
-    /// before it can say anything about it.
-    fn bind_and_mark_condition(
-        ctx: &mut FoldingContext<'_>,
-        var: &r2ssa::SSAVar,
-        value_id: u32,
-    ) {
-        assert_eq!(
-            ctx.state
-                .analysis_ctx
-                .use_info
-                .bind_value_id(var, r2ssa::ValueId(value_id)),
-            Some(r2ssa::ValueId(value_id))
-        );
-        ctx.state.analysis_ctx.use_info.note_condition_var(var);
-    }
-
+    
     fn mark_use(ctx: &mut FoldingContext<'_>, var: &SSAVar, count: usize) {
-            ctx.state
-                .analysis_ctx
-                .use_info
-                .use_counts
-                .insert(var.display_name(), count);
-        }
+        mark_use_counted(ctx, var, count);
+    }
 
         fn mark_simple_def(ctx: &mut FoldingContext<'_>, var: &SSAVar) {
             ctx.state
@@ -4649,12 +4664,12 @@ mod tests {
 
         let condition_non_candidate = make_var("condition_value", 1, 8);
         mark_use(&mut ctx, &condition_non_candidate, 1);
-        bind_and_mark_condition(&mut ctx, &condition_non_candidate, 910);
+        bind_and_mark_condition(&mut ctx, &condition_non_candidate);
         assert!(!ctx.should_inline(&condition_non_candidate));
 
         let condition_flag = make_var("ZF", 1, 1);
         mark_use(&mut ctx, &condition_flag, 1);
-        bind_and_mark_condition(&mut ctx, &condition_flag, 911);
+        bind_and_mark_condition(&mut ctx, &condition_flag);
         assert!(ctx.should_inline(&condition_flag));
 
         let flag_only = make_var("flag_only", 1, 8);
@@ -6964,11 +6979,7 @@ mod tests {
             .use_info
             .call_result_exprs
             .insert(source_call, call.clone());
-        ctx.state
-            .analysis_ctx
-            .use_info
-            .use_counts
-            .insert("value_1".to_string(), 1);
+        mark_use_by_name(&mut ctx, "value_1", 1);
         let stmts = vec![
             CStmt::Expr(CExpr::assign(
                 ctx.name_ref("value_1"),
@@ -7036,11 +7047,7 @@ mod tests {
             .use_info
             .call_result_source_by_alias
             .insert("value_1".to_string(), source_call);
-        ctx.state
-            .analysis_ctx
-            .use_info
-            .use_counts
-            .insert("value_1".to_string(), 1);
+        mark_use_by_name(&mut ctx, "value_1", 1);
         let stmts = vec![
             CStmt::Expr(CExpr::assign(ctx.name_ref("value_1"), call)),
             CStmt::Return(Some(CExpr::IntLit(0))),
@@ -7101,11 +7108,7 @@ mod tests {
             .use_info
             .call_result_exprs
             .insert(source_call, call.clone());
-        ctx.state
-            .analysis_ctx
-            .use_info
-            .use_counts
-            .insert("value_1".to_string(), 1);
+        mark_use_by_name(&mut ctx, "value_1", 1);
         let stmts = vec![
             CStmt::Expr(CExpr::assign(
                 ctx.name_ref("value_1"),
@@ -7195,11 +7198,7 @@ mod tests {
             .use_info
             .call_result_exprs
             .insert(source_call, call.clone());
-        ctx.state
-            .analysis_ctx
-            .use_info
-            .use_counts
-            .insert("v3ea00".to_string(), 1);
+        mark_use_by_name(&mut ctx, "v3ea00", 1);
         let stmts = vec![
             CStmt::Expr(CExpr::assign(
                 ctx.name_ref("v3ea00"),
@@ -7474,11 +7473,7 @@ mod tests {
             .use_info
             .call_result_exprs
             .insert(source_call, call.clone());
-        ctx.state
-            .analysis_ctx
-            .use_info
-            .use_counts
-            .insert("RAX_6".to_string(), 1);
+        mark_use_by_name(&mut ctx, "RAX_6", 1);
         let stmts = vec![
             CStmt::Expr(CExpr::assign(ctx.name_ref("RAX_6"), call.clone())),
             CStmt::Return(Some(CExpr::IntLit(0))),
@@ -8530,11 +8525,7 @@ mod tests {
             .use_info
             .definitions
             .insert("X20_1".to_string(), poisoned_call.clone());
-        ctx.state
-            .analysis_ctx
-            .use_info
-            .use_counts
-            .insert("x20_1".to_string(), 1);
+        mark_use_by_name(&mut ctx, "x20_1", 1);
 
         assert_eq!(
             ctx.stable_owned_call_result_expr_for_source(source_call),
@@ -8566,11 +8557,7 @@ mod tests {
             .use_info
             .definitions
             .insert("X20_1".to_string(), definition_expr);
-        ctx.state
-            .analysis_ctx
-            .use_info
-            .use_counts
-            .insert("x20_1".to_string(), 1);
+        mark_use_by_name(&mut ctx, "x20_1", 1);
 
         ctx.materializable_call_result_expr_for_call_expr(source_call, &source_expr)
     }
@@ -8607,11 +8594,7 @@ mod tests {
             .use_info
             .definitions
             .insert("X20_1".to_string(), definition_expr);
-        ctx.state
-            .analysis_ctx
-            .use_info
-            .use_counts
-            .insert("x20_1".to_string(), 1);
+        mark_use_by_name(&mut ctx, "x20_1", 1);
 
         assert_eq!(
             ctx.materializable_call_result_expr_for_call_expr(source_call, &source_expr),
@@ -8725,11 +8708,7 @@ mod tests {
             .use_info
             .definitions
             .insert("X20_1".to_string(), helper_call.clone());
-        ctx.state
-            .analysis_ctx
-            .use_info
-            .use_counts
-            .insert("x20_1".to_string(), 1);
+        mark_use_by_name(&mut ctx, "x20_1", 1);
 
         assert_eq!(
             ctx.stable_owned_call_result_expr_for_source(source_call),
@@ -9224,11 +9203,7 @@ mod tests {
                 .use_info
                 .direct_call_result_aliases
                 .insert(alias.to_string());
-            ctx.state
-                .analysis_ctx
-                .use_info
-                .use_counts
-                .insert(alias.to_ascii_lowercase(), 1);
+            mark_use_by_name(ctx, &alias.to_ascii_lowercase(), 1);
         }
 
 

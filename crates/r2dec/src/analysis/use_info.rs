@@ -1979,7 +1979,6 @@ fn collect_definitions(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
                         use_info: Some(&scratch.info),
                         definitions: &scratch.info.definitions,
                         semantic_values: &scratch.info.semantic_values,
-                        use_counts: &scratch.info.use_counts,
                         pinned: &scratch.info.pinned,
                         var_aliases: &scratch.info.var_aliases,
                         param_register_aliases: env.param_register_aliases,
@@ -2051,7 +2050,6 @@ fn rebuild_definitions(
                     use_info: Some(&scratch.info),
                     definitions: &rebuilt,
                     semantic_values: &scratch.info.semantic_values,
-                    use_counts: &scratch.info.use_counts,
                     pinned: &scratch.info.pinned,
                     var_aliases: &scratch.info.var_aliases,
                     param_register_aliases: env.param_register_aliases,
@@ -4684,7 +4682,6 @@ fn analyze_call_args(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, s
                 use_info: None,
                 definitions: &scratch.info.definitions,
                 semantic_values: &scratch.info.semantic_values,
-                use_counts: &scratch.info.use_counts,
                 pinned: &scratch.info.pinned,
                 var_aliases: &scratch.info.var_aliases,
                 param_register_aliases: env.param_register_aliases,
@@ -4921,7 +4918,6 @@ fn analyze_call_args(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, s
                     use_info: Some(&scratch.info),
                     definitions: &scratch.info.definitions,
                     semantic_values: &scratch.info.semantic_values,
-                    use_counts: &scratch.info.use_counts,
                     pinned: &scratch.info.pinned,
                     var_aliases: &scratch.info.var_aliases,
                     param_register_aliases: env.param_register_aliases,
@@ -5010,7 +5006,6 @@ fn bind_single_use_call_result_definitions(symbols: &std::cell::RefCell<crate::s
                 use_info: None,
                 definitions: &scratch.info.definitions,
                 semantic_values: &scratch.info.semantic_values,
-                use_counts: &scratch.info.use_counts,
                 pinned: &scratch.info.pinned,
                 var_aliases: &scratch.info.var_aliases,
                 param_register_aliases: env.param_register_aliases,
@@ -5089,12 +5084,7 @@ fn bind_call_result_alias_definitions(symbols: &std::cell::RefCell<crate::symbol
                 )
             };
             if (is_direct_ret || is_post_call_alias)
-                && info
-                    .use_counts
-                    .get(&dst.display_name())
-                    .copied()
-                    .unwrap_or(0)
-                    > 0
+                && info.use_count_for_name(&dst.display_name()) > 0
             {
                 record_call_result_alias(info, (block.addr, call_idx), &dst.display_name());
                 record_direct_call_result_alias(info, &dst.display_name());
@@ -5116,7 +5106,6 @@ fn bind_call_result_alias_definitions(symbols: &std::cell::RefCell<crate::symbol
                     use_info: Some(info),
                     definitions: &info.definitions,
                     semantic_values: &info.semantic_values,
-                    use_counts: &info.use_counts,
                     pinned: &info.pinned,
                     var_aliases: &info.var_aliases,
                     param_register_aliases: env.param_register_aliases,
@@ -5135,7 +5124,7 @@ fn bind_call_result_alias_definitions(symbols: &std::cell::RefCell<crate::symbol
                 call_result_expr_for_post_call_source(symbols, &query, next_idx, src)
                     .is_some_and(|(result_call_idx, _)| result_call_idx == call_idx)
             };
-            if !uses_current_call_result || info.use_counts.get(&src_key).copied().unwrap_or(0) == 0
+            if !uses_current_call_result || info.use_count_for_name(&src_key) == 0
             {
                 continue;
             }
@@ -9466,7 +9455,6 @@ mod tests {
             use_info: Some(&info),
             definitions: &info.definitions,
             semantic_values: &info.semantic_values,
-            use_counts: &info.use_counts,
             pinned: &info.pinned,
             var_aliases: &info.var_aliases,
             param_register_aliases: env.param_register_aliases,
@@ -9828,7 +9816,6 @@ mod tests {
             use_info: None,
             definitions: &info.definitions,
             semantic_values: &info.semantic_values,
-            use_counts: &info.use_counts,
             pinned: &info.pinned,
             var_aliases: &info.var_aliases,
             param_register_aliases: env.param_register_aliases,
