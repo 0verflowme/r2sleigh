@@ -188,10 +188,25 @@ which never yields `None`, so the statement is not declined there. And
 op is `IntAdd dst=tmp:6500_11` and that arm requires the destination to be the
 stack pointer.
 
-So `fold_block` skips the op before `op_to_stmt_impl` sees it. `Return` has no
-destination, so neither the `is_dead` nor the `should_inline` skip applies --
-both are inside `if let Some(dst) = op.dst()`. **The next step is to print which
-branch of `fold_block` continues past idx 10**, and it is one build.
+`fold_block` does **not** skip it either. Tagging all twelve of that function's
+`continue` sites shows which ops leave early:
+
+    FOLDSKIP idx=1 at=5   idx=2 at=11   idx=3,4,6,7,8 at=10   idx=9 at=11
+
+and idx 10 is absent, as are idx 0 and idx 5. So three ops -- including the
+`Return` -- reach `op_to_stmt` and produce statements, while `folded_block_stmts`
+reports the block as empty.
+
+**That is the fork to take next**: `fold_block` returns statements and the
+structurer reads none. `folded_block_stmts` consults `folded_block_cache` before
+folding, so either a cached entry for this block was stored empty by an earlier
+pass, or two folding contexts are in play and the one that folded is not the one
+that was asked. This branch has already found a function existing in two
+versions and a map computed against the wrong one; a cache keyed per block is
+the same shape.
+
+Print `folded_block_cache`'s hit or miss for this address alongside the
+statement count, and whether the two contexts share an identity.
 
 Worth four cells, and the loops behind all four are already correct.
 
