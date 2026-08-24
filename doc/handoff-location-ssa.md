@@ -4148,9 +4148,27 @@ which is the same "one value, two answers" shape in a third place.
 
 So fixing one operand makes the compose *look* right and compute the wrong thing,
 because the other operand still resolves to whatever is at hand. **This defect
-cannot be fixed one register at a time.** Both halves want the same repair
-together, and a fix that lands on one of them alone will read as a regression --
-correctly, because it is one. Narrowing it to
+cannot be fixed one register at a time.**
+
+And the two halves do not want the same repair. They want opposite ones, which is
+the sharpest statement of why every single-sided guard has failed.
+
+`shl eax, 0x10` is computed *in the returning block*, so its result is the value
+the return wants, and answering with the `rax` carrier drops it. `or eax, ecx`
+reads whatever `ecx` holds after the preceding branch, which is the **carrier**
+`rcx` -- and the renderer answers with `ecx_9`, one branch's value, inlined at its
+single in-branch use and named at the return where it does not exist.
+
+One operand wants the block's computed value over the carrier; the other wants
+the carrier over a branch's value. A guard that prefers either one uniformly
+fixes one operand and breaks the other, and the corpus has now said so four
+times.
+
+What separates them is where the value is defined: `EAX_12` is defined in the
+returning block, `ECX_9` in a predecessor. A value the returning block computes
+is that block's answer; a value merged into it from elsewhere is spelled by its
+carrier. That is a checkable rule and it is the one to try next -- not another
+preference between carriers and values, which is the shape that keeps failing. Narrowing it to
 exclude a block that writes the return register itself was built and measured
 twice: the coarse form takes arm64 from thirteen correct to nine, because a loop
 latch writing `w0` in the returning block *is* the carrier; excluding carrier
