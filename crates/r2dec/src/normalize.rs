@@ -52,11 +52,39 @@ pub(crate) fn materialize_certified_loop_carriers_with_control(
     render_facts: &r2types::FunctionRenderFacts,
     control: DecompileWorkControl<'_>,
 ) -> Result<(SSAFunction, MaterializedEdgeCopies), DecompileExecutionStop> {
+    // A merge whose destination is read has to be placed, whether or not it is
+    // a certified loop carrier. Admitting carriers alone left every other merge
+    // with no definition anywhere in the rendered body, and the fold cannot
+    // spell a value nothing wrote: it drops the term and renders the rest, so
+    // the output compiles and runs and is quietly wrong.
+    //
+    // `DeadPhis` already says which merges nothing observes; those stay merges
+    // and cost nothing.
+    let graph = prepared.graph();
+    let live = prepared.live_out();
+    let dead = r2ssa::deadphi::DeadPhis::find(func, graph, &live);
     materialize_phis_where_with_control(func, control, |phi| {
-        prepared
-            .graph()
-            .value_id_for_var(&phi.dst)
-            .is_some_and(|value| render_facts.loop_carrier_for_value(value).is_some())
+        let Some(value) = graph.value_id_for_var(&phi.dst) else {
+            return false;
+        };
+        if render_facts.loop_carrier_for_value(value).is_some() {
+            return true;
+        }
+        // A merge nothing observes costs nothing to leave alone, and a merge at
+        // a plain join -- every predecessor leading only here -- the fold can
+        // render as an expression, which is what keeps ordinary merges
+        // immutable.
+        //
+        // A merge reached from a *branching* predecessor is different: its copy
+        // has to sit on one edge of a two-way branch, and the fold has no way to
+        // spell that. It rendered nothing at all, and the reader never saw that
+        // a value went missing -- `djb2` at x86-64 -O2 dropped the `+ rdx` its
+        // remainder loop starts from and returned a plausible wrong hash.
+        !dead.contains(value)
+            && phi
+                .sources
+                .iter()
+                .any(|(pred, _)| func.successors(*pred).len() > 1)
     })
 }
 
@@ -99,8 +127,22 @@ fn materialize_phis_where_with_control(
         if selected.is_empty() {
             continue;
         }
+        // One merge that cannot be placed used to abandon every merge in its
+        // block. They are independent -- each writes its own destination -- so
+        // the failure belongs to the one merge, and taking its block-mates down
+        // with it left them with no definition at all.
+        //
+        // `djb2` at x86-64 -O2 is where this showed: a Unique-space temp merge
+        // in the loop-exit block could not be placed, so the counter merge
+        // beside it was dropped too, and the remainder loop's `arg0 + rdx`
+        // became `arg0` -- re-reading the front of the buffer instead of the
+        // bytes the unrolled loop had not reached. It compiled, ran, and
+        // returned a plausible wrong hash.
+        let mut materialized_dsts = Vec::new();
         for phi in &selected {
             control.poll()?;
+            let mut staged = Vec::new();
+            let mut placed = true;
             for (pred, src) in &phi.sources {
                 control.poll()?;
                 if src == &phi.dst {
@@ -109,20 +151,35 @@ fn materialize_phis_where_with_control(
                 let Some(op) =
                     materialized_phi_edge_op(func, &liveness, *pred, block.addr, &phi.dst, src)
                 else {
-                    complete = false;
+                    if std::env::var_os("R2SLEIGH_TRACE_MAT").is_some() {
+                        eprintln!(
+                            "MATFAIL block={:#x} pred={pred:#x} dst={} src={}",
+                            block.addr,
+                            phi.dst.display_name(),
+                            src.display_name()
+                        );
+                    }
+                    placed = false;
                     break;
                 };
-                moves_by_pred.entry(*pred).or_default().push(PhiMove {
-                    dst: phi.dst.clone(),
-                    src: src.clone(),
-                    op,
-                });
+                staged.push((
+                    *pred,
+                    PhiMove {
+                        dst: phi.dst.clone(),
+                        src: src.clone(),
+                        op,
+                    },
+                ));
             }
-            if !complete {
-                break;
+            if !placed {
+                continue;
             }
+            for (pred, planned) in staged {
+                moves_by_pred.entry(pred).or_default().push(planned);
+            }
+            materialized_dsts.push(phi.dst.clone());
         }
-        if !complete {
+        if materialized_dsts.is_empty() {
             continue;
         }
         let mut scheduled = Vec::new();
@@ -135,10 +192,7 @@ fn materialize_phis_where_with_control(
             scheduled.push((pred, moves));
         }
         if complete {
-            materialized_by_block.insert(
-                block.addr,
-                selected.iter().map(|phi| phi.dst.clone()).collect(),
-            );
+            materialized_by_block.insert(block.addr, materialized_dsts.into_iter().collect());
             for (pred, moves) in scheduled {
                 for planned in &moves {
                     if let r2ssa::SSAOp::Copy { dst, src } = &planned.op {
@@ -251,7 +305,7 @@ fn materialized_phi_edge_op(
             src: src.clone(),
         });
     }
-    if can_materialize_unconditional_loop_backedge(func, liveness, pred, target, dst) {
+    if can_materialize_on_branch_edge(func, liveness, pred, target, dst) {
         return Some(SSAOp::Copy {
             dst: dst.clone(),
             src: src.clone(),
@@ -441,7 +495,19 @@ fn edge_live_in(
     live
 }
 
-fn can_materialize_unconditional_loop_backedge(
+/// Whether a merge's copy can sit at the end of a two-way predecessor.
+///
+/// The copy runs on every edge out of the block, not only the one the merge
+/// came in on, so it is sound exactly when nothing on the other edges can tell:
+/// the terminator must not read the destination, and the destination must not
+/// be live along any other successor.
+///
+/// This once also required the target to dominate the predecessor, which
+/// confined it to loop backedges. Soundness never depended on that, and the
+/// restriction refused every merge on a loop *exit* edge -- leaving those
+/// destinations with no definition at all, which is how `djb2` at x86-64 -O2
+/// lost the counter its remainder loop starts from.
+fn can_materialize_on_branch_edge(
     func: &SSAFunction,
     liveness: &PhiEdgeLiveness,
     pred: u64,
@@ -451,7 +517,6 @@ fn can_materialize_unconditional_loop_backedge(
     let successors = func.successors(pred);
     successors.len() > 1
         && successors.contains(&target)
-        && func.dominates(target, pred)
         && !func
             .get_block(pred)
             .and_then(|block| block.ops.last())
