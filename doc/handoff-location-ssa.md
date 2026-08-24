@@ -4373,3 +4373,29 @@ configuration moving. It is worth noticing what made it findable: `pearson` was
 the only remaining failure whose rendering was *structurally* right, so the
 defect had nowhere to hide. The undefined-name cases have structure missing as
 well, which is why they resist this kind of reading.
+
+## Both arm64 `noreturn` failures are one block that folds and is never emitted
+
+`murmur3_32` at arm64 -O1 and -O2 renders no `return` at all, so the harness
+reports `noreturn` and clang reports a non-void function falling off the end.
+
+The function's only `Return` op is present in the SSA -- `kind=Return
+srcs=["PC_1"]`, at block `0x100000924` on -O2 and `0x100000820` on -O1 -- and its
+block *is* folded: `FOLDPOST` reports seven statements built and three kept. None
+of the three reaches the output.
+
+So the block is folded and then not emitted. That is not the undefined-name
+family and not the switch gap: radare2 recovers no jump table for this function
+on arm64 (eleven blocks, no `switch_op`), and the tail compare-and-branch chain
+*is* rendered -- as nested `if`s with empty bodies, which is the same block
+disappearing at each arm.
+
+The ledger does not catch it. Both configurations print `116 built, 18 elided, 0
+refused, 2 unaccounted`, so a block carrying three statements and the function's
+return is recorded as neither rendered nor refused. `RefusalReason::BlockNotRendered`
+exists for exactly this and is not reached, which is the second time this
+document has found a refusal reason that nothing constructs.
+
+That makes this a distinct, and probably tractable, defect: find why structuring
+does not place a block it has folded. It is worth two renderings directly, and
+the empty branch arms suggest more behind it.
