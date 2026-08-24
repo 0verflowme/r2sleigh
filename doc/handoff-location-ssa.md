@@ -3657,3 +3657,23 @@ So a measurement is only worth reporting when `make -C r2plugin install` and a
 fresh sweep both ran between the edit and the score, and when it covers all six
 configurations -- a change that moves nothing on the one configuration that
 prompted it has moved something on another more than once.
+
+## Spelling an undefined name is not fixing it
+
+`origin_name_to_expr` in `fold/flags.rs` hands a condition the raw SSA name when
+it cannot parse the origin back into an expression, which is how `RDI_5` ended up
+in a `while` beside the `rdi_5` the body had declared. Routing it through
+`format_traced_name` -- the same rule the statement path spells by -- is the
+obvious repair and it is wrong. Measured properly, x86-64 -O0 goes from six
+correct to none.
+
+The reason is worth keeping. The names it emits have no declaration either way.
+Raw, `tmp:11f80_2` is not a C identifier and something downstream still resolves
+or replaces it; spelled, `t11f80_2` looks like an ordinary local and is simply
+undeclared, so every rendering on that configuration stops compiling. The change
+does not give the value a definition. It only makes the absence harder to see,
+which is the same failure as declaring undefined names to satisfy a detector.
+
+The condition referencing a value with no rendered definition is the defect, and
+it belongs with `RDX_5` above -- fixed where the definition is lost, not where
+the name is written.
