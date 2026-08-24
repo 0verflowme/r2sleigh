@@ -3634,3 +3634,26 @@ buy the same numbers today and is the kind of arch-conditional the rest of this
 work has been removing, so it was not taken.
 
 The change is reverted; the mechanism above is what to build against.
+
+## How to measure, and two ways it silently lies
+
+Both faults below produced *plausible* numbers, not obviously broken ones, and
+between them they made four consecutive experiments read as "changes nothing"
+when three of them had not been run at all.
+
+The plugin is not deployed by copying `libr2sleigh_plugin.dylib` into
+`~/.local/share/radare2/plugins/`. radare2 skips that file and loads
+`anal_sleigh.dylib` and `arch_sleigh.dylib`, which the Makefile links against the
+Rust cdylib in the `r2sleigh/` subdirectory and then re-signs. Use
+`make -C r2plugin install`. A hand copy leaves the signature invalid, and on this
+machine that surfaced as `sla: no architecture loaded` for arm64 while x86-64
+kept working -- half the corpus quietly disappearing rather than an error.
+
+`tests/corpus/verify_rendering.py` does not run `pdd`. It reads `out_<cfg>.txt`,
+which `sweep.sh` writes. Regenerate all six dumps after every build, or the score
+describes whatever the plugin was when the dumps were last written.
+
+So a measurement is only worth reporting when `make -C r2plugin install` and a
+fresh sweep both ran between the edit and the score, and when it covers all six
+configurations -- a change that moves nothing on the one configuration that
+prompted it has moved something on another more than once.
