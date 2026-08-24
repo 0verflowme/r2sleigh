@@ -4556,3 +4556,34 @@ speculative visit's ownership context, and any external deferral.
 
 The `PASS after=... returns=N` probe added for this is kept, because "when did
 the return disappear" turned out to be the question that made the search finite.
+
+## What murmur3 fails on now: a pointer parameter typed as an integer
+
+With the return restored, `murmur3_32` at arm64 -O2 fails to compile on
+
+    t3e80_4 = (uint32_t)(arg0 + (arg1 & -0x4))[1] << 8;
+
+`arg0` is declared `int64_t` in the rendered signature, so this subscripts an
+integer and C refuses it. The C source takes `const uint8_t *key`.
+
+The subscript itself is built correctly. `subscript_expr_for_base_and_index`
+casts its base through `cast_expr_if_needed` whenever the source type is not
+already a pointer, and `cast_needed` answers true for `(Pointer, Int)`. But this
+expression does not come from there -- it comes from one of the two *certified*
+subscript builders in `memory_renderer.rs`, which construct `CExpr::Subscript`
+directly from a certified array fact and a parameter name, on the reasonable
+assumption that a parameter certified as an array base is typed as one.
+
+Two things were measured and reverted on the way to that. Making `cast_needed`
+answer true for a pointer target with an unknown source is defensible on its own
+-- a cast to a pointer is what makes a subscript legal, so declining it because
+the source is unknown cannot be right -- and it changes nothing here, because the
+source is not unknown; it is `int64_t`. And `int_meta` returning `None` for
+pointers means the integer-comparison branch never swallows the pointer case, so
+that was not it either.
+
+So this is a signature-inference defect rather than a rendering one: the
+parameter is used as a pointer base and typed as an integer, and every layer
+downstream is being consistent with the type it was given. It is a different
+family from the undefined names, and it is what stands between `murmur3_32` and
+compiling on both optimised arm64 builds.
