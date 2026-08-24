@@ -4447,10 +4447,24 @@ So the region is re-entered while its own deferral is live. That is a
 self-nesting visit rather than an ancestor claiming a descendant's merge, and it
 means the two answers come from the same region seeing its own bookkeeping.
 
-The fix wants either a structured-region cache, so a region is structured once
-and the first answer stands, or a guard that a region is not re-entered while its
-own merge deferral is outstanding. The second is smaller and says what is
-actually wrong.
+Tracking the two callers pins them exactly. The first visit comes from
+`try_structure_if_else_with_register_merge_returns` at `structure.rs:3051`, a
+*speculative* rewrite that structures both arms to decide whether it applies. The
+second comes from `structure_region_from_predecessor` at `1177`, the ordinary
+path. The speculative visit runs in a different ownership context, appends the
+merge, and its work is discarded when the rewrite declines.
+
+Making the two contexts agree -- deferring the merge inside the speculative
+attempt as the ordinary path does -- was built and measured. The corpus is
+unchanged and the return is still absent, because now *neither* visit appends the
+merge rather than one appending it and being thrown away. Reverted.
+
+That eliminates the speculative visit as the cause. The ordinary path suppresses
+the merge because it sees it already deferred, and the deferral is not coming
+from the speculative visit, which balances its own push and pop. Something else
+holds `0x100000924` on the deferred stack when the ordinary path arrives, and
+finding what holds it is the remaining step -- one question again, and narrower
+than the last one.
 
 The `PASS after=... returns=N` probe added for this is kept, because "when did
 the return disappear" turned out to be the question that made the search finite.
