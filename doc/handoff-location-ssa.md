@@ -3780,11 +3780,39 @@ whether one of them is a bug that predates the split, is the question to settle
 before the derivation finishes -- and it is a question about the location model,
 which is where the handoff always said this belonged.
 
-So the string-keyed half is derivable today, at least for everything this corpus
-exercises, and turning it from a stored map into a view is mechanical rather than
-blocked on the location model. The counter stays so the claim keeps being
-checked: if a future change reintroduces a value with no identity, the number
-stops being zero and says which store.
+That reads like the string half is nearly derivable. It is not, and the reason
+was found only by trying it.
+
+### The dependency runs the other way
+
+`seal_value_facts` -- the last thing that touches `UseInfo` before any consumer
+sees it -- calls `rebuild_id_mirrors_from_name_maps`. That function clears and
+repopulates **nine** value-keyed stores from their string-keyed counterparts:
+`use_counts`, `semantic_values`, `copy_sources`, `ptr_arith`, `condition_values`,
+`stack_slots`, `stable_memory_values`, `forwarded_values` and
+`call_result_source`. Its name says exactly what it does. The value-keyed halves
+are mirrors.
+
+So the string-keyed half is the source of truth today and the value-keyed half is
+derived from it -- the reverse of the direction this step is written in. The read
+side asking "value first" is asking a mirror.
+
+This explains three things that were otherwise puzzling. Whatever
+`collect_prepared_runtime_facts` writes into a value half is discarded before
+anyone reads it, so an experiment giving `forwarded_values` the same provenance
+in both halves passes the whole suite and moves no rendering -- not because the
+two facts agree, but because the one that disagreed was already being clobbered.
+`exact_prepared_copy_provenance`'s result never reaches a consumer. And
+`unkeyed_writes` reading zero says less than it appeared to: those writes are
+overwritten regardless, so the count measures a path whose output is thrown away.
+
+The counter stays, because it will matter once the direction is reversed. But the
+claim it was supporting was wrong. Deriving the string half from the value half
+is not mechanical and is not unblocked; it requires deleting the mirror rebuild
+and making the value-keyed stores authoritative, which means every write that
+currently resolves a name has to resolve an identity instead. That is the
+location model, which is where the handoff said this belonged, and the reason is
+now concrete rather than a caution.
 
 What this does not establish is that the corpus exercises every path. It is
 fourteen hash functions across two architectures and three optimisation levels,
