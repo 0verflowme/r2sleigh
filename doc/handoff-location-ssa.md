@@ -4020,7 +4020,31 @@ compile: `eax_12` is inlined rather than assigned, and the return names it
 anyway. That is the same defect as `eax_8` in `murmur3_32` -- one value with two
 answers inside one expression -- so `adler32` has moved out of "returns a
 plausible wrong hash" and into an open defect that is already recorded and
-visible. Narrowing it to
+visible.
+
+### Where the bare name comes from, narrowed
+
+`get_expr` in the fold is not the source. It keeps `inlined_renderings` -- what a
+statement left out on the promise of being inlined would have shown -- and
+answers with that. A trace on `EAX_12` shows `get_expr` is **never called** for
+it, so the name never passes the resolver that knows.
+
+The name comes from `LowerCtx::get_expr_with_depth`, which inlines only when
+`should_inline(&key)` and `definition_for_var(var)` both hold and otherwise emits
+`var_ref`. Its `BARENAME` probe reports, for `EAX_12`:
+
+    inline=false has_def=false
+
+`has_def=false` is the one to chase. `definition_for_var` answers from the value
+store, and `unkeyed_writes` is zero across these functions, so the definition is
+not being dropped for want of an identity. Two `LowerCtx` sites in `use_info.rs`
+still passed `use_info: None` while borrowing `scratch.info` field by field;
+lending them the whole `UseInfo` is legal and was measured -- `has_def` is still
+false and the corpus is unchanged, so that was not it either. Reverted.
+
+What is left is ordering: the consumer is lowered while the producer's definition
+does not yet exist, in the pass that builds definitions. That is the next thing
+to check, and it is a property of the pass rather than of any table. Narrowing it to
 exclude a block that writes the return register itself was built and measured
 twice: the coarse form takes arm64 from thirteen correct to nine, because a loop
 latch writing `w0` in the returning block *is* the carrier; excluding carrier
