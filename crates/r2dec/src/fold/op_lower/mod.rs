@@ -12558,6 +12558,17 @@ impl<'a> FoldingContext<'a> {
     }
 
     /// Convert a block to folded C statements.
+    /// Whether this block puts a value in the register a return reads.
+    fn block_defines_return_value_register(&self, block: &SSABlock) -> bool {
+        block.ops.iter().any(|op| {
+            op.dst().is_some_and(|dst| {
+                self.inputs
+                    .arch
+                    .is_return_register_name(&dst.name.to_ascii_lowercase())
+            })
+        })
+    }
+
     pub(crate) fn fold_block(&self, block: &SSABlock, current_block_addr: u64) -> Vec<CStmt> {
         self.current_block_addr.set(Some(current_block_addr));
         self.current_op_idx.set(None);
@@ -12769,10 +12780,22 @@ impl<'a> FoldingContext<'a> {
             }
 
             if let SSAOp::Return { target } = op {
+                // Leaving without a return says the value is coming from a slot
+                // store this pass will render instead. That holds when the store
+                // is in this block, and `last_ret_value` is how it says so. When
+                // the store is in another block -- a loop body writing the
+                // accumulator every iteration -- there is nothing here to stand
+                // in for it, and the function ends with no return at all.
+                //
+                // This block loads the value into the return register before
+                // returning, so there is something to say. Four renderings on
+                // three configurations fall off the end of a non-void function
+                // for want of it, each with a correct loop above.
                 if block.addr == self.state.exit_block.unwrap_or(0)
                     && self.is_control_return_target(target)
                     && !self.state.return_stack_slots.is_empty()
                     && last_ret_value.is_none()
+                    && !self.block_defines_return_value_register(block)
                 {
                     break;
                 }
@@ -13014,10 +13037,22 @@ impl<'a> FoldingContext<'a> {
             }
         }
 
+        let trace = std::env::var_os("R2SLEIGH_DEBUG_MERGES").is_some();
+        if trace {
+            eprintln!("FOLDPOST block={:#x} built={}", block.addr, stmts.len());
+        }
         let stmts = self.propagate_ephemeral_copies(stmts);
-        let out = self.prune_redundant_return_slot_assignments(
-            self.prune_dead_temp_assignments_before_structuring(stmts),
-        );
+        if trace {
+            eprintln!("FOLDPOST block={:#x} after_ephemeral={}", block.addr, stmts.len());
+        }
+        let stmts = self.prune_dead_temp_assignments_before_structuring(stmts);
+        if trace {
+            eprintln!("FOLDPOST block={:#x} after_prune={}", block.addr, stmts.len());
+        }
+        let out = self.prune_redundant_return_slot_assignments(stmts);
+        if trace {
+            eprintln!("FOLDPOST block={:#x} after_slots={}", block.addr, out.len());
+        }
         self.current_block_addr.set(None);
         self.current_op_idx.set(None);
         out

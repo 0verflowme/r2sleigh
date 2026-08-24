@@ -2033,12 +2033,18 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
     fn folded_block_stmts(&mut self, block: &r2ssa::FunctionSSABlock, addr: u64) -> Vec<CStmt> {
         self.fold_ctx.folded_blocks.borrow_mut().insert(addr);
         let stmts = if let Some(folded) = self.folded_block_cache.get(&addr) {
+            if std::env::var_os("R2SLEIGH_DEBUG_MERGES").is_some() {
+                eprintln!("FOLDCACHE hit block={addr:#x} stmts={}", folded.stmts.len());
+            }
             self.fold_ctx
                 .append_effect_render_proofs(&folded.effect_proofs);
             folded.stmts.clone()
         } else {
             let proof_checkpoint = self.fold_ctx.effect_render_proof_checkpoint();
             let stmts = self.fold_ctx.fold_block(block, addr);
+            if std::env::var_os("R2SLEIGH_DEBUG_MERGES").is_some() {
+                eprintln!("FOLDCACHE miss block={addr:#x} stmts={}", stmts.len());
+            }
             let effect_proofs = self.fold_ctx.effect_render_proofs_since(proof_checkpoint);
             self.folded_block_cache.insert(
                 addr,
