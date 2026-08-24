@@ -782,6 +782,28 @@ for a four-byte value. Half the model is worse than neither.
 and that is the fold rewrite.** Step seven is a prerequisite for step three, not
 a sequel to it. The ADR's ordering has a cycle in it and this is where it shows.
 
+**That conclusion was half right, and the half that was wrong matters.** The
+name-keyed stores have since been re-keyed -- all nine paired stores are one
+store each, keyed by identity, and the mirror rebuild is gone. Repeating the
+experiment in that state is worse, not better:
+
+    before re-keying   4 correct -> 1 correct   (x86-64 -O0 only measured)
+    after re-keying   34 correct -> 13 correct  (all six configurations)
+
+So the stores were not what stood in the way. What stands in the way is the other
+half of the original diagnosis, the half that was never addressed: a name is a
+width as well as an identity, and roughly seven hundred sites key on
+`display_name()` expecting it to say how wide the value is. Re-keying the stores
+changed where facts are filed; it did not change what those sites read out of a
+name.
+
+The prerequisite for the location model is therefore expressing narrow access
+explicitly -- a read of four bytes at the `RDI` location has to say so in the
+value, not in the spelling -- and until that exists, naming by place leaves every
+one of those sites reading a full-width name for a narrow value. Half the model
+is still worse than neither, and now that is measured across all six
+configurations rather than one.
+
 The fixture failure is worth keeping too: `check_secret source ABI parameter x
 in 0 must bind EDI` -- the source contract states parameter registers by
 spelling, so a parameter that lives in the `RDI` location read at four bytes no
