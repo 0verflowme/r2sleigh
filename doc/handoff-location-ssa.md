@@ -4242,7 +4242,24 @@ Making `spell_as_identifier` use `format_traced_name` first is the obvious repai
 and does not work: that function does not round-trip these names, and
 `tmp:4700_7` comes back as `tmp`, so the rendering gets worse rather than better.
 Reverted. The unification has to happen where the raw name is *emitted*, not
-where it is sanitised afterwards -- and the earlier attempt at
-`origin_name_to_expr`, which took x86-64 -O0 from six correct to none, is the
-same lesson from the other end. Something emits the raw SSA name into an
-expression, and that is the site to find.
+where it is sanitised afterwards.
+
+`origin_name_to_expr` is that emitter, and spelling it there was retried in this
+much-changed tree -- after the nine stores were collapsed, the mirror rebuild
+removed and a dozen defects fixed -- on the theory that the original 6-to-0
+regression might have been downstream of something since repaired. It is not. The
+result reproduces: x86-64 -O0 and arm64 -O0 both fall to zero correct, and the
+error is `use of undeclared identifier 't11f80_2'` -- the *correctly* spelled
+name, undeclared.
+
+That is the finding. Both spellings have partial declaration support and neither
+has all of it: a raw name reaches a declaration by one route, a rendered name by
+another, and moving a read from one spelling to the other loses whichever support
+it had. Spelling the read correctly is not an improvement while the declaration
+of the correct spelling is missing.
+
+So this is not a site to fix; it is the non-uniform spelling boundary already
+recorded above, and it now has a second measurement on two configurations saying
+the same thing. **The boundary has to be made uniform before any single site on
+it can be corrected**, and the retry rules out "enough else has changed" as a
+reason to try again site-by-site.
