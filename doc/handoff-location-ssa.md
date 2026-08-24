@@ -15,8 +15,55 @@ Read this section for the current state; read the rest for the evidence, and not
 that several entries are corrections of the ones above them. Anything below that
 disagrees with this section is superseded.
 
+### Ground truth
+
+Fourteen hash functions built at three optimisation levels on two architectures,
+verified by compiling each rendering and running it against the reference digest
+(`tests/corpus/verify_rendering.py`). This is the number to quote; the proof line
+counts obligations, not correctness.
+
+                     start    now
+    x86-64 -O0         4       6
+    x86-64 -O1         0       5
+    x86-64 -O2         0       3
+    arm64  -O0         0       7
+    arm64  -O1         0       7
+    arm64  -O2         0       6
+                     ----    ----
+                       4      34   of 54
+
+Measuring it requires `make -C r2plugin install` and a fresh `sweep.sh` for every
+configuration; see "How to measure" below, which cost four voided conclusions to
+learn.
+
 ### Done
 
+  * **The nine paired fact stores are one store each, keyed by identity.**
+    `UseInfo` held every fact twice -- `definitions` beside `definitions_by_value`
+    and eight more like it -- and `rebuild_id_mirrors_from_name_maps` cleared the
+    value-keyed half and rebuilt it from the name-keyed one as the last thing
+    before any consumer looked, so a read side written to ask the value first was
+    asking a mirror. The rebuild is gone and each store keys itself where its
+    fact is learned. Collapsing `copy_sources` stopped `crc32_bitwise` hanging at
+    arm64 -O1: following a copy chain by name could step between two variables
+    differing only in case. Three case-variant lookup ladders went with them, and
+    `LowerCtx` lost eight duplicated borrows of maps `UseInfo` already owned.
+  * **radare2's resolved jump tables reach the renderer.** `pdd` goes through the
+    borrowed-snapshot provider, which serialises each block's switch cases;
+    `r2source` decoded them and nothing read them, so the lift built blocks from
+    image bytes alone and `murmur3_32` rendered four statements of thirty-five
+    with `/* indirect branch target unresolved */`. It renders its tail switch
+    with real case arms and a return now.
+  * **A budget that runs out keeps what it rendered.** The partial rendering was
+    discarded, so a function that ran out of time reported as one that produced
+    nothing and the ledger that would have said so went with it. The stop is
+    still recorded -- phase refused, route reason, refusal -- and the body
+    survives.
+  * **A merge reached from a branching predecessor is placed.** One unplaceable
+    merge abandoned every merge in its block, and the backedge test required the
+    target to dominate the predecessor, which refused every merge on a loop
+    *exit* edge. `djb2` at x86-64 -O2 lost the counter leaving its first loop and
+    with it the `+ rdx` that starts the remainder after the bytes already read.
   * **One symbol table per rendered function.** Passes each held their own and
     the fold read a fourth that `mem::take` had emptied; identifiers now carry
     the table that issued them and resolving across tables is an assertion.
