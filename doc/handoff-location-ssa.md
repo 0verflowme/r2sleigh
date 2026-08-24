@@ -4099,10 +4099,40 @@ statement for it: `FOLDPOST` reports four statements from that block, `eax_12` i
 not among them, and the pruner never reports removing it.
 
 So the question is no longer which resolver names it or which rule declines to
-inline it. It is: **why does the fold build no statement for an op whose
-destination is read seven times?** That is one question about one op, and the
-`BARENAME` probe now prints the use count that makes it obvious rather than
-leaving it to be re-derived. Narrowing it to
+inline it. It is: why does the fold build no statement for an op whose
+destination is read seven times?
+
+### Answered: the return register is skipped wholesale
+
+`fold_block` contains
+
+    if track_return_value
+        && let Some(dst) = op.dst()
+        && self.inputs.arch.is_return_register_name(&dst.name.to_lowercase())
+    { continue; }
+
+Every write to the return register is skipped, on the reasoning that the return
+statement represents it. That is right for the `mov eax, X` before a `ret` and
+wrong for an intermediate step: `adler32`'s `shl eax, 0x10` writes `eax`, is read
+seven times, and is skipped, so every one of those reads names a value no
+statement assigns.
+
+Narrowing the skip to writes nothing else reads -- `use_count <= 1` -- was built
+and measured, and the result is genuinely mixed. At x86-64 -O2 `adler32` becomes
+`return rax << 16 | (uint32_t)(int64_t)ecx_9`, with the shift present and
+correct, failing only on `ecx_9`, which is the same defect one register over. At
+-O1 it turns two visible failures into silently wrong hashes: `adler32` renders
+`9dd20001` and `murmur3_32` `ec1fbeef`, because there the missing operand
+resolves to something plausible instead of nothing.
+
+The corpus total is unchanged either way, so the trade is two loud failures for
+two quiet ones, and that is the wrong direction. Reverted.
+
+**The skip is the cause and `use_count` is not a sufficient condition for
+narrowing it.** What the condition wants to express is that the return statement
+is the value's *only* consumer, which is not the same as it being read once --
+the return itself is a read. That distinction is the next thing to get right, and
+it is now the only thing between this defect and a fix. Narrowing it to
 exclude a block that writes the return register itself was built and measured
 twice: the coarse form takes arm64 from thirteen correct to nine, because a loop
 latch writing `w0` in the returning block *is* the carrier; excluding carrier
