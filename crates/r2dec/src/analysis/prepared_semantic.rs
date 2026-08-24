@@ -505,6 +505,17 @@ fn populate_prepared_render_definitions(symbols: &std::cell::RefCell<crate::symb
                 };
                 lower.op_to_expr(op)
             };
+            if std::env::var("R2SLEIGH_TRACE_DEFFILTER").as_deref()
+                == Ok(&*dst.display_name())
+            {
+                eprintln!(
+                    "DEFFILTER {} self={} safe={} carrier={}",
+                    dst.display_name(),
+                    is_self_render_definition(symbols, dst, &expr),
+                    prepared_render_definition_is_safe(symbols, &expr, env),
+                    env.carrier_aliases.contains_key(&dst.display_name())
+                );
+            }
             if is_self_render_definition(symbols, dst, &expr) {
                 continue;
             }

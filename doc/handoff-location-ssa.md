@@ -4055,12 +4055,34 @@ closing regardless; they now count, and they read **zero** across `adler32`,
 `murmur3_32` and `xxhash32`. So the definition is not being dropped for want of
 an identity either.
 
-What is left is narrow and specific: **the op that defines `EAX_12` is never
-visited by the pass that files definitions**, though the fold visits it -- the
-block folds, `FOLDPOST` reports four statements built from it, and its `NORMOP`
-lines are all present. The analysis and the fold disagree about which ops exist,
-and that disagreement is the defect. That is where to look next, and it is one
-question rather than a search. Narrowing it to
+The op *is* visited. `populate_prepared_render_definitions` reaches it and then
+declines, and a `DEFFILTER` probe on the site says which test declines it:
+
+    DEFFILTER EAX_12 self=false safe=false carrier=false
+
+`prepared_render_definition_is_safe` refuses any expression mentioning the stack
+or frame pointer, an argument register, a caller-saved register, the **return**
+register, or a temporary. `EAX_12` is `eax << 16`, and its operand is a slice of
+`RAX_11` -- `rax` is the return register, so the definition is refused.
+
+Refusing it is defensible on its own terms: the expression reads mutable state
+and a definition for it would render what the register held on one path. What is
+not defensible is what follows. Nothing else defines the value, and it is still
+rendered *by name*, so `adler32` returns `eax_12 | ...` with no `eax_12`
+anywhere. **Refusing to define a value does not stop it being named**, and that
+gap is the defect -- the same shape as declaring undefined names to satisfy a
+detector, arrived at from the opposite direction.
+
+Pinning the value when the definition is refused, so that it must be assigned
+rather than inlined, was the obvious repair and is wrong twice over: `eax_12` is
+still not assigned, and `adler32`'s return degrades from
+`eax_12 | (uint32_t)(int64_t)ecx_9` to `eax_12 | 1`, so pinning perturbed a
+neighbouring value into a constant. Reverted.
+
+So the choice is real and neither side of it is free: either such a value gets a
+definition despite reading mutable state, or it must be unnameable. The second is
+what the working agreement asks for and there is no lever for it here yet --
+`pinned` is not that lever. Narrowing it to
 exclude a block that writes the return register itself was built and measured
 twice: the coarse form takes arm64 from thirteen correct to nine, because a loop
 latch writing `w0` in the returning block *is* the carrier; excluding carrier
