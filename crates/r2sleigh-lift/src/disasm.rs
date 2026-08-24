@@ -1352,11 +1352,52 @@ impl Disassembler {
                 LiftError::Parse("owned source block exceeds r2il size range".to_string())
             })?;
             ranges.push(GenuineFunctionBlockRange::new(block.address(), size));
-            blocks.push(disassembler.lift_genuine_block(
+            let mut lifted_block = disassembler.lift_genuine_block(
                 block.bytes(),
                 block.address(),
                 block.bytes().len(),
-            )?);
+            )?;
+            // radare2 resolves jump tables, and the snapshot carries what it
+            // found as switch-case successors. Lifting reads only the bytes, so
+            // without this the dispatch arrives as an indirect branch with no
+            // targets and the renderer says so and drops the rest of the
+            // function: `murmur3_32` rendered four statements of thirty-five and
+            // no return at all, because its tail switch on `len & 3` was thrown
+            // away between the snapshot and the lift.
+            if let Some(switch_addr) = block.switch_instruction() {
+                let cases: Vec<r2il::SwitchCase> = block
+                    .successors()
+                    .iter()
+                    .filter(|successor| {
+                        successor.kind() == r2source::AdvisorySuccessorKind::SwitchCase
+                    })
+                    .filter_map(|successor| {
+                        successor.case_value().map(|value| r2il::SwitchCase {
+                            value,
+                            target: successor.target(),
+                        })
+                    })
+                    .collect();
+                if !cases.is_empty() {
+                    let default_target = block
+                        .successors()
+                        .iter()
+                        .find(|successor| {
+                            successor.kind() == r2source::AdvisorySuccessorKind::SwitchDefault
+                        })
+                        .map(|successor| successor.target());
+                    let min_val = cases.iter().map(|case| case.value).min().unwrap_or(0);
+                    let max_val = cases.iter().map(|case| case.value).max().unwrap_or(0);
+                    lifted_block.block.switch_info = Some(r2il::SwitchInfo {
+                        switch_addr,
+                        min_val,
+                        max_val,
+                        default_target,
+                        cases,
+                    });
+                }
+            }
+            blocks.push(lifted_block);
         }
         validate_owned_snapshot_cfg(&source, &blocks)?;
         let layout = GenuineFunctionLayout::new(
