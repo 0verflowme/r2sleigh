@@ -2359,6 +2359,15 @@ impl<'a> FoldingContext<'a> {
 
         match expr {
             CExpr::Var(name) => {
+                // A carrier is mutable state and expanding it yields what it held
+                // on one path -- the value the loop was entered with, because that
+                // is what a resolver reaches first. `fnv1a32` at x86-64 -O2 has
+                // the right comparison certified, `RSI_1 != RDX_4` with `RDX_4`
+                // the loop counter, and expanding the counter turned it into
+                // `(arg1 & -4) != 0`: a condition that never changes.
+                if self.expr_is_carrier_reference(expr) {
+                    return expr.clone();
+                }
                 if let Some(alias) = self.arg_alias_for_rendered_name(&self.spelling(*name)) {
                     return self.name_ref(&alias);
                 }
