@@ -3691,9 +3691,7 @@ fn record_prepared_call_alias(
         .entry(site)
         .or_default()
         .insert(alias.to_string());
-    use_info
-        .call_result_source_by_alias
-        .insert(alias.to_string(), site);
+    use_info.insert_call_result_source_alias(alias, site);
     if direct {
         use_info
             .direct_call_result_aliases

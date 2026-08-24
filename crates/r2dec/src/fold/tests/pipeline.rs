@@ -16,8 +16,13 @@ mod tests {
     fn mark_use_counted(ctx: &mut FoldingContext<'_>, var: &SSAVar, count: usize) {
         let info = &mut ctx.state.analysis_ctx.use_info;
         if info.exact_value_id_for_var(var).is_none() {
-            let next = r2ssa::ValueId(9000 + info.value_ids_by_var.len() as u32);
-            assert_eq!(info.bind_value_id(var, next), Some(next));
+            // Reuse whatever identity the name already has. Minting a second one
+            // for the same spelling makes it ambiguous, and an ambiguous name
+            // answers nothing.
+            let next = info
+                .value_id_for_name_or_bind(&var.display_name())
+                .unwrap_or(r2ssa::ValueId(9000 + info.value_ids_by_var.len() as u32));
+            let _ = info.bind_value_id(var, next);
         }
         for _ in 0..count {
             info.note_use_for_var(var);
@@ -25,16 +30,16 @@ mod tests {
     }
 
     /// The same, for a test that only has the rendered spelling.
+    ///
+    /// The name is bound to an identity directly rather than through a
+    /// reconstructed `SSAVar`: `SSAVar::new("v3ea00", 0, 8).display_name()` is
+    /// `v3ea00_0`, so building a variable from a spelling files the count under
+    /// a different name than the one the test asks about.
     fn mark_use_by_name(ctx: &mut FoldingContext<'_>, name: &str, count: usize) {
-        let (base, version) = match name.rsplit_once('_') {
-            Some((base, tail)) => match tail.parse::<u32>() {
-                Ok(version) => (base, version),
-                Err(_) => (name, 0),
-            },
-            None => (name, 0),
-        };
-        let var = SSAVar::new(base, version, 8);
-        mark_use_counted(ctx, &var, count);
+        let info = &mut ctx.state.analysis_ctx.use_info;
+        if let Some(value_id) = info.value_id_for_name_or_bind(name) {
+            *info.use_counts_by_value.entry(value_id).or_insert(0) += count;
+        }
     }
 
     /// Record that a condition was decided by this value.
@@ -44,8 +49,10 @@ mod tests {
     fn bind_and_mark_condition(ctx: &mut FoldingContext<'_>, var: &SSAVar) {
         let info = &mut ctx.state.analysis_ctx.use_info;
         if info.exact_value_id_for_var(var).is_none() {
-            let next = r2ssa::ValueId(9000 + info.value_ids_by_var.len() as u32);
-            assert_eq!(info.bind_value_id(var, next), Some(next));
+            let next = info
+                .value_id_for_name_or_bind(&var.display_name())
+                .unwrap_or(r2ssa::ValueId(9000 + info.value_ids_by_var.len() as u32));
+            let _ = info.bind_value_id(var, next);
         }
         info.note_condition_var(var);
     }
@@ -633,11 +640,7 @@ mod tests {
             .ownership
             .visible_owned_names
             .insert(owner_name.to_ascii_lowercase());
-        ctx.state
-            .analysis_ctx
-            .use_info
-            .call_result_source_by_alias
-            .insert(alias.to_string(), source_call);
+        ctx.state.analysis_ctx.use_info.insert_call_result_source_alias(&alias.to_string(), source_call);
     }
 
     fn prepared_zero_arg_helper_call(name: &str) -> SourceOwnedPreparedFixture {
@@ -3546,13 +3549,11 @@ mod tests {
         ctx.state
             .analysis_ctx
             .use_info
-            .call_result_source_by_alias
-            .insert(owner.display_name(), (0x1000, 0));
+            .insert_call_result_source_alias(&owner.display_name(), (0x1000, 0));
         ctx.state
             .analysis_ctx
             .use_info
-            .call_result_source_by_alias
-            .insert(shadow.display_name(), (0x1000, 0));
+            .insert_call_result_source_alias(&shadow.display_name(), (0x1000, 0));
         ctx.state
             .analysis_ctx
             .use_info
@@ -3598,13 +3599,11 @@ mod tests {
         ctx.state
             .analysis_ctx
             .use_info
-            .call_result_source_by_alias
-            .insert(owner.display_name(), (0x1000, 0));
+            .insert_call_result_source_alias(&owner.display_name(), (0x1000, 0));
         ctx.state
             .analysis_ctx
             .use_info
-            .call_result_source_by_alias
-            .insert(shadow.display_name(), (0x1000, 0));
+            .insert_call_result_source_alias(&shadow.display_name(), (0x1000, 0));
         ctx.state
             .analysis_ctx
             .use_info
@@ -4630,8 +4629,7 @@ mod tests {
         ctx.state
             .analysis_ctx
             .use_info
-            .call_result_source_by_alias
-            .insert(direct_unowned.display_name(), (0x1000, 1));
+            .insert_call_result_source_alias(&direct_unowned.display_name(), (0x1000, 1));
         ctx.state
             .analysis_ctx
             .use_info
@@ -4651,8 +4649,7 @@ mod tests {
         ctx.state
             .analysis_ctx
             .use_info
-            .call_result_source_by_alias
-            .insert(direct_owned.display_name(), (0x1000, 2));
+            .insert_call_result_source_alias(&direct_owned.display_name(), (0x1000, 2));
         ctx.state
             .analysis_ctx
             .use_info
@@ -6969,11 +6966,7 @@ mod tests {
             .use_info
             .call_result_aliases
             .insert(source_call, BTreeSet::from(["value_1".to_string()]));
-        ctx.state
-            .analysis_ctx
-            .use_info
-            .call_result_source_by_alias
-            .insert("value_1".to_string(), source_call);
+        ctx.state.analysis_ctx.use_info.insert_call_result_source_alias(&"value_1".to_string(), source_call);
         ctx.state
             .analysis_ctx
             .use_info
@@ -7042,11 +7035,7 @@ mod tests {
             .use_info
             .call_result_aliases
             .insert(source_call, BTreeSet::from(["value_1".to_string()]));
-        ctx.state
-            .analysis_ctx
-            .use_info
-            .call_result_source_by_alias
-            .insert("value_1".to_string(), source_call);
+        ctx.state.analysis_ctx.use_info.insert_call_result_source_alias(&"value_1".to_string(), source_call);
         mark_use_by_name(&mut ctx, "value_1", 1);
         let stmts = vec![
             CStmt::Expr(CExpr::assign(ctx.name_ref("value_1"), call)),
@@ -7098,11 +7087,7 @@ mod tests {
             .use_info
             .call_result_aliases
             .insert(source_call, BTreeSet::from(["value_1".to_string()]));
-        ctx.state
-            .analysis_ctx
-            .use_info
-            .call_result_source_by_alias
-            .insert("value_1".to_string(), source_call);
+        ctx.state.analysis_ctx.use_info.insert_call_result_source_alias(&"value_1".to_string(), source_call);
         ctx.state
             .analysis_ctx
             .use_info
@@ -7135,11 +7120,7 @@ mod tests {
             .use_info
             .call_result_aliases
             .insert(source_call, BTreeSet::from(["x0_3".to_string()]));
-        ctx.state
-            .analysis_ctx
-            .use_info
-            .call_result_source_by_alias
-            .insert("x0_3".to_string(), source_call);
+        ctx.state.analysis_ctx.use_info.insert_call_result_source_alias(&"x0_3".to_string(), source_call);
         let call = CExpr::call(ctx.name_ref("fcn.1000"), vec![CExpr::IntLit(16)]);
         ctx.state
             .analysis_ctx
@@ -7188,11 +7169,7 @@ mod tests {
             .use_info
             .call_result_aliases
             .insert(source_call, BTreeSet::from(["v3ea00".to_string()]));
-        ctx.state
-            .analysis_ctx
-            .use_info
-            .call_result_source_by_alias
-            .insert("v3ea00".to_string(), source_call);
+        ctx.state.analysis_ctx.use_info.insert_call_result_source_alias(&"v3ea00".to_string(), source_call);
         ctx.state
             .analysis_ctx
             .use_info
@@ -7463,11 +7440,7 @@ mod tests {
             .use_info
             .call_result_aliases
             .insert(source_call, BTreeSet::from(["RAX_6".to_string()]));
-        ctx.state
-            .analysis_ctx
-            .use_info
-            .call_result_source_by_alias
-            .insert("RAX_6".to_string(), source_call);
+        ctx.state.analysis_ctx.use_info.insert_call_result_source_alias(&"RAX_6".to_string(), source_call);
         ctx.state
             .analysis_ctx
             .use_info
@@ -7504,11 +7477,7 @@ mod tests {
             .use_info
             .call_result_aliases
             .insert(source_call, BTreeSet::from(["RAX_6".to_string()]));
-        ctx.state
-            .analysis_ctx
-            .use_info
-            .call_result_source_by_alias
-            .insert("RAX_6".to_string(), source_call);
+        ctx.state.analysis_ctx.use_info.insert_call_result_source_alias(&"RAX_6".to_string(), source_call);
         ctx.state
             .analysis_ctx
             .use_info
@@ -7548,11 +7517,7 @@ mod tests {
             .use_info
             .call_result_aliases
             .insert(source_call, BTreeSet::from(["RAX_6".to_string()]));
-        ctx.state
-            .analysis_ctx
-            .use_info
-            .call_result_source_by_alias
-            .insert("RAX_6".to_string(), source_call);
+        ctx.state.analysis_ctx.use_info.insert_call_result_source_alias(&"RAX_6".to_string(), source_call);
         ctx.state
             .analysis_ctx
             .use_info
@@ -7586,11 +7551,7 @@ mod tests {
             source_call,
             BTreeSet::from(["value_1".to_string(), "value_2".to_string()]),
         );
-        ctx.state
-            .analysis_ctx
-            .use_info
-            .call_result_source_by_alias
-            .insert("value_1".to_string(), source_call);
+        ctx.state.analysis_ctx.use_info.insert_call_result_source_alias(&"value_1".to_string(), source_call);
         ctx.state
             .analysis_ctx
             .use_info
@@ -10516,11 +10477,7 @@ mod tests {
         // The view was built before this context, so it adopts the view's table.
         uncertified_alias_ctx.symbols = std::rc::Rc::new(std::cell::RefCell::new(symbols.borrow().clone()));
         uncertified_alias_ctx
-            .state
-            .analysis_ctx
-            .use_info
-            .call_result_source_by_alias
-            .insert("alias".to_string(), source_call);
+            .state.analysis_ctx.use_info.insert_call_result_source_alias(&"alias".to_string(), source_call);
         uncertified_alias_ctx
             .state
             .analysis_ctx
@@ -10561,11 +10518,7 @@ mod tests {
                 8,
             )]));
         certified_alias_ctx
-            .state
-            .analysis_ctx
-            .use_info
-            .call_result_source_by_alias
-            .insert("alias".to_string(), source_call);
+            .state.analysis_ctx.use_info.insert_call_result_source_alias(&"alias".to_string(), source_call);
         certified_alias_ctx
             .state
             .analysis_ctx
@@ -13071,11 +13024,7 @@ mod tests {
                 rbp_input.clone(),
                 false,
                 |ctx, store_val, source_call| {
-                    ctx.state
-                        .analysis_ctx
-                        .use_info
-                        .call_result_source_by_alias
-                        .insert(store_val.to_string(), source_call);
+                    ctx.state.analysis_ctx.use_info.insert_call_result_source_alias(&store_val.to_string(), source_call);
                     BTreeSet::new()
                 }
             ),
@@ -13088,11 +13037,7 @@ mod tests {
                 rbp_input.clone(),
                 false,
                 |ctx, store_val, source_call| {
-                    ctx.state
-                        .analysis_ctx
-                        .use_info
-                        .call_result_source_by_alias
-                        .insert(store_val.to_ascii_lowercase(), source_call);
+                    ctx.state.analysis_ctx.use_info.insert_call_result_source_alias(&store_val.to_ascii_lowercase(), source_call);
                     BTreeSet::new()
                 }
             ),
@@ -13118,8 +13063,7 @@ mod tests {
                     ctx.state
                         .analysis_ctx
                         .use_info
-                        .call_result_source_by_alias
-                        .insert(store_val.to_string(), (source_call.0, source_call.1 + 1));
+                        .insert_call_result_source_alias(&store_val.to_string(), (source_call.0, source_call.1 + 1));
                     BTreeSet::new()
                 }
             ),
@@ -13135,9 +13079,8 @@ mod tests {
                     ctx.state
                         .analysis_ctx
                         .use_info
-                        .call_result_source_by_alias
-                        .insert(
-                            store_val.to_ascii_lowercase(),
+                        .insert_call_result_source_alias(
+                            &store_val.to_ascii_lowercase(),
                             (source_call.0, source_call.1 + 1),
                         );
                     BTreeSet::new()
@@ -13200,11 +13143,7 @@ mod tests {
             })
             .expect("store val");
         let source_call = (block.addr, first_call_idx);
-        ctx.state
-            .analysis_ctx
-            .use_info
-            .call_result_source_by_alias
-            .insert(store_val.clone(), source_call);
+        ctx.state.analysis_ctx.use_info.insert_call_result_source_alias(&store_val.clone(), source_call);
 
         assert_eq!(
             {

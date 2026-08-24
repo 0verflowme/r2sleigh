@@ -26,11 +26,7 @@ fn install_call_owner(
         .ownership
         .alias_sources
         .insert(alias.to_string(), source_id);
-    ctx.state
-        .analysis_ctx
-        .use_info
-        .call_result_source_by_alias
-        .insert(alias.to_string(), source_call);
+    ctx.state.analysis_ctx.use_info.insert_call_result_source_alias(&alias.to_string(), source_call);
 }
 
 fn wrap_parens(mut expr: CExpr, count: usize) -> CExpr {

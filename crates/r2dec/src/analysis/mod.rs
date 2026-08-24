@@ -152,7 +152,6 @@ pub(crate) struct UseInfo {
     pub(crate) call_args: HashMap<(u64, usize), Vec<CallArgBinding>>,
     pub(crate) call_result_aliases: BTreeMap<(u64, usize), BTreeSet<String>>,
     pub(crate) call_result_exprs: BTreeMap<(u64, usize), CExpr>,
-    pub(crate) call_result_source_by_alias: HashMap<String, (u64, usize)>,
     pub(crate) call_result_source_by_value: BTreeMap<ValueId, (u64, usize)>,
     pub(crate) direct_call_result_aliases: HashSet<String>,
     pub(crate) switch_selector_roots: BTreeMap<u64, SemanticValue>,
@@ -789,16 +788,43 @@ impl UseInfo {
         self.semantic_values.insert(name.to_string(), value);
     }
 
+    /// Give a rendered spelling an identity, minting one if it has none.
+    ///
+    /// Facts are filed against values, so a caller holding only a name has to
+    /// resolve it before it can say anything. Production code reaches a value
+    /// through the SSA; a test that starts from a spelling uses this.
+    pub(crate) fn value_id_for_name_or_bind(&mut self, name: &str) -> Option<ValueId> {
+        if let Some(value_id) = self.value_id_for_name(name) {
+            return Some(value_id);
+        }
+        if self.ambiguous_value_names.contains(name) {
+            return None;
+        }
+        let value_id = ValueId(9500 + self.value_ids_by_name.len() as u32);
+        self.bind_value_name(name.to_string(), value_id);
+        self.value_id_for_name(name)
+    }
+
     pub(crate) fn insert_call_result_source_alias(
         &mut self,
         alias: &str,
         source_call: (u64, usize),
     ) {
-        self.call_result_source_by_alias
-            .insert(alias.to_string(), source_call);
-        if let Some(value_id) = self.value_id_for_name(alias) {
-            self.call_result_source_by_value
-                .insert(value_id, source_call);
+        // The alias names a value; the call it came from is filed against that
+        // value. There was a second map from the alias itself, read through
+        // `lookup_name_key`, so an alias differing only in case could answer for
+        // a call site that belonged to another value.
+        match self.value_id_for_name_or_bind(alias) {
+            Some(value_id) => {
+                self.call_result_source_by_value
+                    .insert(value_id, source_call);
+            }
+            None => {
+                *self
+                    .unkeyed_writes
+                    .entry("call_result_source")
+                    .or_default() += 1
+            }
         }
     }
 
@@ -1057,7 +1083,6 @@ impl UseInfo {
         }
         self.value_id_for_name(name)
             .and_then(|value_id| self.call_result_source_by_value.get(&value_id).copied())
-            .or_else(|| lookup_name_key(&self.call_result_source_by_alias, name).copied())
     }
 }
 
