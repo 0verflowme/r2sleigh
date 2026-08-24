@@ -13384,9 +13384,16 @@ impl<'a> FoldingContext<'a> {
                     )));
                 }
                 let lhs = self.assignment_lhs_expr(dst);
+                // A load is unsigned unless something sign-extends it, and
+                // Sleigh says so explicitly with `IntSExt` when it does. Giving
+                // a bare byte load a signed pointee makes C sign-extend where
+                // the machine does not: `pearson` reads its table with
+                // `mov al, byte [rax + rcx]`, and rendering that as `int8_t*`
+                // turns any entry at or above 0x80 negative, which then corrupts
+                // the next index.
                 let elem_ty = self
                     .type_hint_for_var(dst)
-                    .unwrap_or_else(|| type_from_size(dst.size));
+                    .unwrap_or_else(|| uint_type_from_size(dst.size));
                 let rhs = self.render_canonical_load_expr(dst, addr, elem_ty.clone());
                 let rhs = if let CExpr::Var(lhs_name) = &lhs
                     && let Some(source_call) = self
