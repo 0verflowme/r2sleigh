@@ -4507,11 +4507,33 @@ with the merge *not* deferred, so it carries the merge inside an arm, while the
 ordinary shape expects the merge appended after both arms. The two are not
 interchangeable.
 
-What is still open is narrow and specific: why the ordinary visit sees
-`0x100000924` as already deferred, when instrumenting every push and pop of that
-address shows only the region's own two, both balanced. Until that is answered,
-neither reusing the speculative result nor suppressing the second visit is safe,
-because both act on a mechanism that has not been identified. Five hypotheses are eliminated on the way here: a pass deleting
+That question is now answered, and it corrects a claim made twice above. Printing
+the deferred stack at the moment of the check gives:
+
+    OWNCHECK merge=0x100000924 owned=false stack=[8d4, 8d4, 904, 904]
+    OWNCHECK merge=0x100000924 owned=true  stack=[8d4, 8d4, 904, 904, 924, 90c, 904, 904]
+
+`0x100000924` is at index four of the second stack: pushed by the first visit and
+**still live**, with three further pushes on top of it. The push and pop are
+balanced, but the pop comes after the second visit, not before -- reading the
+push/pop trace as balanced-and-therefore-disjoint was the error, twice.
+
+So the second visit *is* nested inside the first's window. The region appears
+twice on one structuring path: the speculative attempt at `3049`/`3050`
+structures a subtree, and inside that subtree the ordinary path at `1176` reaches
+the same region again. Both readings recorded above are half right -- it is one
+subtree structured twice, and the second structuring is nested in the first.
+
+The consequence is what makes it fixable. The outer visit is the one that appends
+the merge, and it is doing so correctly; the inner visit skips it, also
+correctly, because from where it stands an enclosing region has claimed it. The
+enclosing region is *itself*, one level up, and that region's result is the one
+discarded when the speculative rewrite declines.
+
+So the defect is that a speculative attempt structures a subtree while holding
+deferrals that the real structuring of that same subtree will then observe. The
+speculative attempt has to leave no trace -- deferrals included -- or it has to
+be the structuring that ships. Five hypotheses are eliminated on the way here: a pass deleting
 the return, a sequence deferral, an ancestor claiming a descendant's merge, the
 speculative visit's ownership context, and any external deferral.
 
