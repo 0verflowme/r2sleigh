@@ -3861,7 +3861,24 @@ name resolution reintroduces the defect the collapse eliminated, one layer down.
 
 So the way to `definitions` is not a wider name map. A caller holding a rendered
 spelling has to reach the identity through the symbol table, which knows the SSA
-name that spelling came from -- `LowerCtx::definition_for_symbol` already does
-exactly this, and it is the shape the rest need. That is the location model's
-job, and this measurement says the shortcut around it costs a correct
-rendering.
+name that spelling came from and says `Ambiguous` when more than one value was
+minted to it -- refusing exactly where the map wrongly answered.
+
+Taking that route, `definitions` collapsed too, and all nine paired stores are
+now one store each. `ssa_name_for_spelling` on the fold context is the bridge;
+`names_by_value_id` lets a value bound only through a name still be spelled back
+out, which the passes that iterate definitions by name need, since a caller
+reaching a value by spelling never gives it a variable.
+
+Eight tests changed and each says something worth keeping. Two handed `LowerCtx`
+private maps with `use_info: None`, so `make_ctx` now seeds a `UseInfo` from
+them. Three hit the ordering hazard: filing a fact under a name mints an
+identity, so binding the variable afterwards collides and makes the name
+ambiguous -- bind first, then file. And
+`exact_value_id_binding_does_not_use_colliding_display_names` asserted that a
+display name two values share still answers through the name-keyed store; it now
+asserts that it answers nothing, which is what the test was written to want.
+
+`rebuild_id_mirrors_from_name_maps` is gone, and `lookup_name_key` -- the
+case-insensitive matcher these stores were read through -- has one caller left,
+for `var_aliases`, which is a name-to-name table rather than a paired store.

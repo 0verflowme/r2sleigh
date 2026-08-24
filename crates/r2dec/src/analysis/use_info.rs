@@ -141,7 +141,6 @@ fn analyze_value_facts(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
 
 /// The facts every consumer needs, ready to read.
 fn seal_value_facts(mut scratch: UseScratch) -> UseInfo {
-    rebuild_id_mirrors_from_name_maps(&mut scratch.info);
     scratch.info.producers = scratch.producers.clone();
     scratch.info
 }
@@ -199,18 +198,6 @@ fn seed_local_value_ids(scratch: &mut UseScratch, blocks: &[SSABlock]) {
     }
 }
 
-/// Value-keyed facts, keyed where they are learned.
-///
-/// This used to clear nine value-keyed stores and rebuild every one of them from
-/// its string-keyed counterpart, which made the name maps the source of truth
-/// and the id maps mirrors of them. The read side asks the value key first, so
-/// it was asking a mirror, and anything a writer knew that a name lookup could
-/// not recover was discarded before a consumer saw it.
-///
-/// Each store now keys itself at the point the fact is learned. What remains
-/// here is nothing: the function is kept as the place to notice if a new store
-/// arrives wanting to be mirrored.
-fn rebuild_id_mirrors_from_name_maps(_info: &mut UseInfo) {}
 
 fn rerun_semantic_call_analysis_after_result_binding(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
     scratch: &mut UseScratch,
