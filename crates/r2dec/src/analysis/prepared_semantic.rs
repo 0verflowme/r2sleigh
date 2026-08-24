@@ -522,6 +522,8 @@ fn populate_prepared_render_definitions(symbols: &std::cell::RefCell<crate::symb
                     .definitions_by_value
                     .entry(value_id)
                     .or_insert_with(|| expr.clone());
+            } else {
+                *use_info.unkeyed_writes.entry("definitions").or_default() += 1;
             }
             use_info.formatted_defs.entry(key).or_insert(expr);
         }
@@ -3251,6 +3253,8 @@ fn collect_prepared_runtime_facts(symbols: &std::cell::RefCell<crate::symbol::Sy
                                 .definitions_by_value
                                 .entry(value_id)
                                 .or_insert_with(|| expr.clone());
+                        } else {
+                            *use_info.unkeyed_writes.entry("definitions").or_default() += 1;
                         }
                         use_info
                             .formatted_defs
@@ -3377,6 +3381,8 @@ fn seed_prepared_value_fact(symbols: &std::cell::RefCell<crate::symbol::SymbolTa
                 .definitions_by_value
                 .entry(value_id)
                 .or_insert_with(|| expr.clone());
+        } else {
+            *use_info.unkeyed_writes.entry("definitions").or_default() += 1;
         }
         use_info
             .formatted_defs

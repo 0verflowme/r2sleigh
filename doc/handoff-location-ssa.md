@@ -4042,9 +4042,25 @@ still passed `use_info: None` while borrowing `scratch.info` field by field;
 lending them the whole `UseInfo` is legal and was measured -- `has_def` is still
 false and the corpus is unchanged, so that was not it either. Reverted.
 
-What is left is ordering: the consumer is lowered while the producer's definition
-does not yet exist, in the pass that builds definitions. That is the next thing
-to check, and it is a property of the pass rather than of any table. Narrowing it to
+Ordering was the next hypothesis and it is also wrong, in a way that narrows
+things further. `insert_definition_for_var` is never called for `EAX_12` at all,
+so nothing is racing: no definition is ever *attempted* for it.
+
+`rebuild_definitions` in `use_info.rs` would have built one, and it never runs on
+this path -- a probe in its loop prints nothing for any value in the function.
+The live path is `prepared_semantic.rs`, and the three places there that file a
+definition each write the value-keyed store under `if let Some(value_id)`. Those
+guards had no counter after the store collapse, which is a blind spot worth
+closing regardless; they now count, and they read **zero** across `adler32`,
+`murmur3_32` and `xxhash32`. So the definition is not being dropped for want of
+an identity either.
+
+What is left is narrow and specific: **the op that defines `EAX_12` is never
+visited by the pass that files definitions**, though the fold visits it -- the
+block folds, `FOLDPOST` reports four statements built from it, and its `NORMOP`
+lines are all present. The analysis and the fold disagree about which ops exist,
+and that disagreement is the defect. That is where to look next, and it is one
+question rather than a search. Narrowing it to
 exclude a block that writes the return register itself was built and measured
 twice: the coarse form takes arm64 from thirteen correct to nine, because a loop
 latch writing `w0` in the returning block *is* the carrier; excluding carrier
