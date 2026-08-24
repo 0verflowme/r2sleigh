@@ -4995,18 +4995,14 @@ mod tests {
         let store_addr = make_var("tmp:9402", 1, 8);
 
         let mut ctx = FoldingContext::new(64);
-        ctx.state.analysis_ctx.use_info.stack_slots.insert(
-            "len".to_string(),
-            StackSlotProvenance {
+        ctx.state.analysis_ctx.use_info.insert_stack_slot_for_name(&"len".to_string(), StackSlotProvenance {
                 offset: -0x20,
                 predicate_carrier: false,
                 return_carrier: false,
                 value_kind: StackSlotValueKind::Scalar,
             },
         );
-        ctx.state.analysis_ctx.use_info.stack_slots.insert(
-            "buf".to_string(),
-            StackSlotProvenance {
+        ctx.state.analysis_ctx.use_info.insert_stack_slot_for_name(&"buf".to_string(), StackSlotProvenance {
                 offset: -0x8,
                 predicate_carrier: false,
                 return_carrier: false,
@@ -7606,8 +7602,7 @@ mod tests {
         ctx.state
             .analysis_ctx
             .use_info
-            .stack_slots
-            .insert("value_1".to_string(), StackSlotProvenance::new(-8));
+            .insert_stack_slot_for_name("value_1", StackSlotProvenance::new(-8));
         ctx.state
             .analysis_ctx
             .use_info
@@ -9880,18 +9875,14 @@ mod tests {
     #[test]
     fn scalar_context_visible_expr_ranking_prefers_scalar_candidates_over_stack_artifacts() {
         let mut ctx = make_x86_64_ctx();
-        ctx.state.analysis_ctx.use_info.stack_slots.insert(
-            "var_8h".to_string(),
-            crate::analysis::StackSlotProvenance {
+        ctx.state.analysis_ctx.use_info.insert_stack_slot_for_name(&"var_8h".to_string(), crate::analysis::StackSlotProvenance {
                 offset: -8,
                 predicate_carrier: true,
                 return_carrier: false,
                 value_kind: crate::analysis::StackSlotValueKind::Scalar,
             },
         );
-        ctx.state.analysis_ctx.use_info.stack_slots.insert(
-            "var_ch".to_string(),
-            crate::analysis::StackSlotProvenance {
+        ctx.state.analysis_ctx.use_info.insert_stack_slot_for_name(&"var_ch".to_string(), crate::analysis::StackSlotProvenance {
                 offset: -12,
                 predicate_carrier: false,
                 return_carrier: true,
@@ -9957,9 +9948,7 @@ mod tests {
             -4,
             stack_var_spec("var_4h", Some(crate::CType::Int(32)), Some("RBP")),
         )]));
-        ctx.state.analysis_ctx.use_info.stack_slots.insert(
-            "tmp:11f00_1".to_string(),
-            crate::analysis::StackSlotProvenance {
+        ctx.state.analysis_ctx.use_info.insert_stack_slot_for_name(&"tmp:11f00_1".to_string(), crate::analysis::StackSlotProvenance {
                 offset: -4,
                 predicate_carrier: true,
                 return_carrier: false,

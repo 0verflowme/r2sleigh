@@ -28,7 +28,6 @@ pub(crate) struct LowerCtx<'a> {
     pub(crate) var_aliases: &'a HashMap<String, String>,
     pub(crate) param_register_aliases: &'a HashMap<String, String>,
     pub(crate) type_hints: &'a HashMap<String, CType>,
-    pub(crate) stack_slots: &'a HashMap<String, StackSlotProvenance>,
     pub(crate) type_oracle: Option<&'a dyn TypeOracle>,
     /// Where a rendered name is written down, so building a reference can mint one.
     pub(crate) symbols: &'a std::cell::RefCell<crate::symbol::SymbolTable>,
@@ -139,9 +138,7 @@ impl<'a> LowerCtx<'a> {
         self.var_aliases.get(name)
     }
 
-    fn stack_slot_name_map(&self) -> &HashMap<String, StackSlotProvenance> {
-        self.stack_slots
-    }
+
 
     pub(crate) fn var_name(&self, var: &SSAVar) -> String {
         crate::naming::spell_var(var, self)
@@ -666,10 +663,10 @@ impl<'a> LowerCtx<'a> {
     }
 
     fn stack_slot_name_for_offset(&self, offset: i64) -> Option<String> {
-        self.stack_slot_name_map()
-            .iter()
+        self.use_info?
+            .stack_slots_with_names()
             .filter(|(_, slot)| slot.offset == offset)
-            .map(|(name, _)| name.clone())
+            .map(|(name, _)| name)
             .min_by_key(|name| {
                 let generic = name.starts_with("local_") || name.starts_with("stack_");
                 let synthetic = is_temporary_name(name) || name.contains(':');
@@ -678,9 +675,10 @@ impl<'a> LowerCtx<'a> {
     }
 
     fn ptr_bytes(&self) -> u32 {
-        self.stack_slot_name_map()
-            .keys()
-            .find_map(|name| self.lookup_type_hint(name).and_then(|ty| ty.bits()))
+        self.use_info
+            .into_iter()
+            .flat_map(|info| info.stack_slots_with_names())
+            .find_map(|(name, _)| self.lookup_type_hint(&name).and_then(|ty| ty.bits()))
             .map(|bits| bits.div_ceil(8).max(1))
             .unwrap_or(8)
     }
@@ -1175,7 +1173,7 @@ impl<'a> LowerCtx<'a> {
                         lower == "stack" || lower == "saved_fp" || lower.starts_with("stack_");
                     !is_constant_or_memory_name(&self.spelling(*name))
                         && (!stack_placeholder
-                            && (!self.stack_slot_name_map().contains_key(&*self.spelling(*name))
+                            && (self.use_info.and_then(|info| info.stack_slot_for_name(&self.spelling(*name))).is_none()
                                 || lower.starts_with("local_")
                                 || lower.starts_with("arg")))
                 }),
@@ -1306,7 +1304,7 @@ impl<'a> LowerCtx<'a> {
                 let lower = self.spelling(*name).to_ascii_lowercase();
                 lower.contains("ptr")
                     || lower.contains("addr")
-                    || self.stack_slot_name_map().contains_key(&*self.spelling(*name))
+                    || self.use_info.and_then(|info| info.stack_slot_for_name(&self.spelling(*name))).is_some()
                     || self
                         .lookup_type_hint(&self.spelling(*name))
                         .map(|ty| matches!(ty, CType::Pointer(_) | CType::Struct(_)))
@@ -1450,7 +1448,7 @@ mod tests {
         pinned: &'a HashSet<String>,
         var_aliases: &'a HashMap<String, String>,
         _ptr_arith: &'a HashMap<String, PtrArith>,
-        stack_slots: &'a HashMap<String, StackSlotProvenance>,
+        _stack_slots: &'a HashMap<String, StackSlotProvenance>,
         _forwarded_values: &'a HashMap<String, ValueProvenance>,
         #[cfg(test)] _function_names: &'a HashMap<u64, String>,
         #[cfg(test)] _strings: &'a HashMap<u64, String>,
@@ -1469,7 +1467,6 @@ mod tests {
             var_aliases,
             param_register_aliases,
             type_hints,
-            stack_slots,
             type_oracle: None,
         }
     }

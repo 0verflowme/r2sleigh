@@ -503,7 +503,6 @@ fn populate_prepared_render_definitions(symbols: &std::cell::RefCell<crate::symb
                     var_aliases: &use_info.var_aliases,
                     param_register_aliases: env.param_register_aliases,
                     type_hints: &use_info.type_hints,
-                    stack_slots: &use_info.stack_slots,
                     type_oracle: env.type_oracle,
                 };
                 lower.op_to_expr(op)
@@ -3360,11 +3359,7 @@ fn merge_prepared_stack_slot(
     value_id: Option<ValueId>,
     provenance: StackSlotProvenance,
 ) {
-    use_info
-        .stack_slots
-        .entry(name.to_string())
-        .and_modify(|existing| *existing = existing.merge(provenance))
-        .or_insert(provenance);
+    use_info.merge_stack_slot_for_name(name, provenance);
     if let Some(value_id) = value_id {
         use_info
             .stack_slots_by_value

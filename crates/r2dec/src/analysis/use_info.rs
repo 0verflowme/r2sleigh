@@ -36,7 +36,7 @@ struct SemanticTypeHintCache {
 impl SemanticTypeHintCache {
     fn from_info(info: &UseInfo) -> Self {
         let mut stack_slot_names_by_offset: HashMap<i64, Vec<String>> = HashMap::new();
-        for (slot_name, slot) in &info.stack_slots {
+        for (slot_name, slot) in info.stack_slots_with_names() {
             let entry = stack_slot_names_by_offset.entry(slot.offset).or_default();
             push_unique_casefold(entry, slot_name.clone());
             push_unique_casefold(entry, slot_name.to_ascii_lowercase());
@@ -886,7 +886,7 @@ pub(crate) fn annotate_stack_slot_semantics(symbols: &std::cell::RefCell<crate::
     env: &PassEnv<'_>,
 ) {
     let mut offset_semantics: HashMap<i64, StackSlotProvenance> = HashMap::new();
-    for slot in info.stack_slots.values().copied() {
+    for slot in info.stack_slots() {
         merge_stack_slot_semantics(&mut offset_semantics, slot);
     }
 
@@ -951,7 +951,7 @@ pub(crate) fn annotate_stack_slot_semantics(symbols: &std::cell::RefCell<crate::
         }
     }
 
-    for slot in info.stack_slots.values_mut() {
+    for slot in info.stack_slots_mut() {
         if let Some(offset_fact) = offset_semantics.get(&slot.offset).copied() {
             *slot = slot.merge(offset_fact);
         }
@@ -982,10 +982,7 @@ fn merge_named_stack_slot_semantics(
     name: String,
     candidate: StackSlotProvenance,
 ) {
-    info.stack_slots
-        .entry(name)
-        .and_modify(|existing| *existing = existing.merge(candidate))
-        .or_insert(candidate);
+    info.merge_stack_slot_for_name(&name, candidate);
 }
 
 fn stack_slot_value_kind_from_merge_summary(summary: &FrameSlotMergeSummary) -> StackSlotValueKind {
@@ -1983,7 +1980,6 @@ fn collect_definitions(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
                         var_aliases: &scratch.info.var_aliases,
                         param_register_aliases: env.param_register_aliases,
                         type_hints: &scratch.info.type_hints,
-                        stack_slots: &scratch.info.stack_slots,
                         type_oracle: env.type_oracle,
                     };
                     // Forwarding is one step of the resolver's precedence, not a
@@ -2054,7 +2050,6 @@ fn rebuild_definitions(
                     var_aliases: &scratch.info.var_aliases,
                     param_register_aliases: env.param_register_aliases,
                     type_hints: &scratch.info.type_hints,
-                    stack_slots: &scratch.info.stack_slots,
                     type_oracle: env.type_oracle,
                 };
                 // Forwarding is one step of the resolver's precedence, not a
@@ -2392,14 +2387,12 @@ fn collect_semantic_values_with_cache(symbols: &std::cell::RefCell<crate::symbol
             if *space == SpaceId::Ram
                 && let Some(offset) = scratch
                     .info
-                    .stack_slots
-                    .get(&addr.display_name())
+                    .stack_slot_for_name(&addr.display_name())
                     .map(|slot| slot.offset)
                     .or_else(|| {
                         scratch
                             .info
-                            .stack_slots
-                            .get(&dst.display_name())
+                            .stack_slot_for_name(&dst.display_name())
                             .map(|slot| slot.offset)
                     })
                 && let Some(value) = scratch.info.stable_stack_values.get(&offset).cloned()
@@ -2896,8 +2889,7 @@ fn semantic_var_is_pointer_like(info: &UseInfo, var: &SSAVar, env: &PassEnv<'_>)
         return true;
     }
     if info
-        .stack_slots
-        .get(&key)
+        .stack_slot_for_name(&key)
         .is_some_and(|slot| slot.value_kind == StackSlotValueKind::AddressLike)
     {
         return true;
@@ -2962,8 +2954,7 @@ fn semantic_var_is_pointer_like_cached(
         return true;
     }
     if info
-        .stack_slots
-        .get(&key)
+        .stack_slot_for_name(&key)
         .is_some_and(|slot| slot.value_kind == StackSlotValueKind::AddressLike)
     {
         return true;
@@ -3017,9 +3008,9 @@ fn semantic_var_is_pointer_like_cached(
 }
 
 fn stack_slot_offset_has_pointer_type_hint(info: &UseInfo, offset: i64, env: &PassEnv<'_>) -> bool {
-    info.stack_slots.iter().any(|(name, slot)| {
+    info.stack_slots_with_names().any(|(name, slot)| {
         slot.offset == offset
-            && lookup_type_hint(info, env, name).is_some_and(|ty| {
+            && lookup_type_hint(info, env, &name).is_some_and(|ty| {
                 matches!(
                     ty,
                     CType::Pointer(_) | CType::Struct(_) | CType::Array(_, _)
@@ -3031,7 +3022,7 @@ fn stack_slot_offset_has_pointer_type_hint(info: &UseInfo, offset: i64, env: &Pa
 fn typed_pointer_stack_slot_for_name(info: &UseInfo, name: &str, env: &PassEnv<'_>) -> Option<i64> {
     info.forwarded_value_for_name(name)
         .and_then(|prov| prov.stack_slot)
-        .or_else(|| info.stack_slots.get(name).map(|slot| slot.offset))
+        .or_else(|| info.stack_slot_for_name(name).map(|slot| slot.offset))
         .filter(|offset| stack_slot_offset_has_pointer_type_hint(info, *offset, env))
 }
 
@@ -3043,7 +3034,7 @@ fn stack_reloaded_value_slot_for_name(info: &UseInfo, name: &str) -> Option<i64>
 fn semantic_type_hint_names(info: &UseInfo, var: &SSAVar, env: &PassEnv<'_>) -> Vec<String> {
     let mut names = Vec::new();
     let push_stack_slot_names = |names: &mut Vec<String>, offset: i64| {
-        for (slot_name, slot) in &info.stack_slots {
+        for (slot_name, slot) in info.stack_slots_with_names() {
             if slot.offset == offset {
                 push_unique_casefold(names, slot_name.clone());
                 push_unique_casefold(names, slot_name.to_ascii_lowercase());
@@ -3058,7 +3049,7 @@ fn semantic_type_hint_names(info: &UseInfo, var: &SSAVar, env: &PassEnv<'_>) -> 
     if let Some(offset) = info
         .forwarded_value_for_name(&key)
         .and_then(|prov| prov.stack_slot)
-        .or_else(|| info.stack_slots.get(&key).map(|slot| slot.offset))
+        .or_else(|| info.stack_slot_for_name(&key).map(|slot| slot.offset))
     {
         push_stack_slot_names(&mut names, offset);
     }
@@ -3083,7 +3074,7 @@ fn semantic_type_hint_names(info: &UseInfo, var: &SSAVar, env: &PassEnv<'_>) -> 
         if let Some(offset) = info
             .forwarded_value_for_name(&root)
             .and_then(|prov| prov.stack_slot)
-            .or_else(|| info.stack_slots.get(&root).map(|slot| slot.offset))
+            .or_else(|| info.stack_slot_for_name(&root).map(|slot| slot.offset))
         {
             push_stack_slot_names(&mut names, offset);
         }
@@ -3108,7 +3099,7 @@ fn semantic_type_hint_names_cached(
             .entry(offset)
             .or_insert_with(|| {
                 let mut slot_names = Vec::new();
-                for (slot_name, slot) in &info.stack_slots {
+                for (slot_name, slot) in info.stack_slots_with_names() {
                     if slot.offset == offset {
                         push_unique_casefold(&mut slot_names, slot_name.clone());
                         push_unique_casefold(&mut slot_names, slot_name.to_ascii_lowercase());
@@ -3130,7 +3121,7 @@ fn semantic_type_hint_names_cached(
     if let Some(offset) = info
         .forwarded_value_for_name(&key)
         .and_then(|prov| prov.stack_slot)
-        .or_else(|| info.stack_slots.get(&key).map(|slot| slot.offset))
+        .or_else(|| info.stack_slot_for_name(&key).map(|slot| slot.offset))
     {
         ensure_stack_slot_names(cache, offset);
         let Some(slot_names) = cache.stack_slot_names_by_offset.get(&offset) else {
@@ -3161,7 +3152,7 @@ fn semantic_type_hint_names_cached(
         if let Some(offset) = info
             .forwarded_value_for_name(&root)
             .and_then(|prov| prov.stack_slot)
-            .or_else(|| info.stack_slots.get(&root).map(|slot| slot.offset))
+            .or_else(|| info.stack_slot_for_name(&root).map(|slot| slot.offset))
         {
             ensure_stack_slot_names(cache, offset);
             let Some(slot_names) = cache.stack_slot_names_by_offset.get(&offset) else {
@@ -3327,7 +3318,7 @@ fn semantic_addr_for_var_with_depth(symbols: &std::cell::RefCell<crate::symbol::
         return Some(addr);
     }
 
-    if let Some(slot) = info.stack_slots.get(&key) {
+    if let Some(slot) = info.stack_slot_for_name(&key) {
         return Some(NormalizedAddr {
             base: BaseRef::StackSlot(slot.offset),
             index: None,
@@ -4686,7 +4677,6 @@ fn analyze_call_args(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, s
                 var_aliases: &scratch.info.var_aliases,
                 param_register_aliases: env.param_register_aliases,
                 type_hints: &scratch.info.type_hints,
-                stack_slots: &scratch.info.stack_slots,
                 type_oracle: env.type_oracle,
             };
             let post_call_query = PostCallResultQuery {
@@ -4922,7 +4912,6 @@ fn analyze_call_args(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, s
                     var_aliases: &scratch.info.var_aliases,
                     param_register_aliases: env.param_register_aliases,
                     type_hints: &scratch.info.type_hints,
-                    stack_slots: &scratch.info.stack_slots,
                     type_oracle: env.type_oracle,
                 };
                 let call_expr = call_result_expr_for_call_at(symbols, 
@@ -5010,7 +4999,6 @@ fn bind_single_use_call_result_definitions(symbols: &std::cell::RefCell<crate::s
                 var_aliases: &scratch.info.var_aliases,
                 param_register_aliases: env.param_register_aliases,
                 type_hints: &scratch.info.type_hints,
-                stack_slots: &scratch.info.stack_slots,
                 type_oracle: env.type_oracle,
             };
             let call_expr =
@@ -5110,7 +5098,6 @@ fn bind_call_result_alias_definitions(symbols: &std::cell::RefCell<crate::symbol
                     var_aliases: &info.var_aliases,
                     param_register_aliases: env.param_register_aliases,
                     type_hints: &info.type_hints,
-                    stack_slots: &info.stack_slots,
                     type_oracle: env.type_oracle,
                 };
                 let query = PostCallResultQuery {
@@ -5439,10 +5426,9 @@ fn render_visible_stack_slot_expr_for_definition(symbols: &std::cell::RefCell<cr
     }
 
     let visible_local = {
-        let mut stack_slot_names = lower
-            .stack_slots
-            .iter()
-            .filter_map(|(name, slot)| (slot.offset == offset).then_some(name.clone()))
+        let mut stack_slot_names = info
+            .stack_slots_with_names()
+            .filter_map(|(name, slot)| (slot.offset == offset).then_some(name))
             .collect::<BTreeSet<_>>();
         stack_slot_names
             .pop_first()
@@ -6697,8 +6683,7 @@ fn semantic_value_source_offset_by_name(
                 .filter(|offset| *offset < 0)
         })
         .or_else(|| {
-            info.stack_slots
-                .get(name)
+            info.stack_slot_for_name(name)
                 .map(|slot| slot.offset)
                 .filter(|offset| *offset < 0)
         })
@@ -7208,8 +7193,7 @@ fn exact_negative_stack_offset_by_name(
                 .filter(|offset| *offset < 0)
         })
         .or_else(|| {
-            info.stack_slots
-                .get(name)
+            info.stack_slot_for_name(name)
                 .map(|slot| slot.offset)
                 .filter(|offset| *offset < 0)
         })
@@ -9459,7 +9443,6 @@ mod tests {
             var_aliases: &info.var_aliases,
             param_register_aliases: env.param_register_aliases,
             type_hints: &info.type_hints,
-            stack_slots: &info.stack_slots,
             type_oracle: env.type_oracle,
         };
         let producers = block
@@ -9820,7 +9803,6 @@ mod tests {
             var_aliases: &info.var_aliases,
             param_register_aliases: env.param_register_aliases,
             type_hints: &info.type_hints,
-            stack_slots: &info.stack_slots,
             type_oracle: env.type_oracle,
         };
         let helper_idx = block
@@ -10905,9 +10887,10 @@ mod tests {
         let loaded = mk("X9", 1, 8);
         let src = mk("X0", 0, 8);
 
-        info.stack_slots
-            .insert(loaded.display_name(), StackSlotProvenance::new(8));
+        // Bind before either fact is filed: both are keyed by identity, and a
+        // second identity minted for the same spelling makes it ambiguous.
         assert_eq!(info.bind_value_id(&loaded, ValueId(901)), Some(ValueId(901)));
+        info.insert_stack_slot_for_name(&loaded.display_name(), StackSlotProvenance::new(8));
         info.insert_forwarded_value_for_var(
             &loaded,
             ValueProvenance {

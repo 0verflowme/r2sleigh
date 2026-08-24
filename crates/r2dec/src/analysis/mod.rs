@@ -158,7 +158,6 @@ pub(crate) struct UseInfo {
     pub(crate) consumed_by_call: HashSet<String>,
     pub(crate) var_aliases: HashMap<String, String>,
     pub(crate) type_hints: HashMap<String, CType>,
-    pub(crate) stack_slots: HashMap<String, StackSlotProvenance>,
     pub(crate) stack_slots_by_value: BTreeMap<ValueId, StackSlotProvenance>,
     pub(crate) stable_stack_values: HashMap<i64, SemanticValue>,
     pub(crate) stable_memory_values: HashMap<String, SemanticValue>,
@@ -704,15 +703,13 @@ impl UseInfo {
         } else {
             *self.unkeyed_writes.entry("stack_slots").or_default() += 1;
         }
-        self.stack_slots.insert(var.display_name(), slot);
     }
 
     #[cfg(test)]
     pub(crate) fn insert_stack_slot_for_name(&mut self, name: &str, slot: StackSlotProvenance) {
-        if let Some(value_id) = self.value_id_for_name(name) {
+        if let Some(value_id) = self.value_id_for_name_or_bind(name) {
             self.stack_slots_by_value.insert(value_id, slot);
         }
-        self.stack_slots.insert(name.to_string(), slot);
     }
 
     /// Record that one value was copied from another.
@@ -1043,15 +1040,54 @@ impl UseInfo {
             .map(String::as_str)
     }
 
+    /// Merge a stack-slot fact into whatever this value already had.
+    ///
+    /// Filed against the value: the name is resolved on the way in, and a name
+    /// with no identity is counted rather than given its own entry.
+    pub(crate) fn merge_stack_slot_for_name(
+        &mut self,
+        name: &str,
+        candidate: StackSlotProvenance,
+    ) {
+        match self.value_id_for_name_or_bind(name) {
+            Some(value_id) => {
+                self.stack_slots_by_value
+                    .entry(value_id)
+                    .and_modify(|existing| *existing = existing.merge(candidate))
+                    .or_insert(candidate);
+            }
+            None => *self.unkeyed_writes.entry("stack_slots").or_default() += 1,
+        }
+    }
+
+    pub(crate) fn stack_slots_mut(&mut self) -> impl Iterator<Item = &mut StackSlotProvenance> {
+        self.stack_slots_by_value.values_mut()
+    }
+
     pub(crate) fn stack_slot_for_name(&self, name: &str) -> Option<StackSlotProvenance> {
         if self.ambiguous_value_names.contains(name) {
             return None;
         }
-        lookup_name_key(&self.stack_slots, name).copied()
+        self.value_id_for_name(name)
+            .and_then(|value_id| self.stack_slots_by_value.get(&value_id).copied())
     }
 
     pub(crate) fn stack_slots(&self) -> impl Iterator<Item = StackSlotProvenance> + '_ {
-        self.stack_slots.values().copied()
+        self.stack_slots_by_value.values().copied()
+    }
+
+    /// Every stack slot with a name for the value that owns it.
+    ///
+    /// Slots are filed against values; a caller that needs to print one, or to
+    /// pick the most readable of several names for the same offset, recovers the
+    /// spelling here rather than from a second map keyed by name.
+    pub(crate) fn stack_slots_with_names(
+        &self,
+    ) -> impl Iterator<Item = (String, StackSlotProvenance)> + '_ {
+        self.stack_slots_by_value.iter().filter_map(|(value_id, slot)| {
+            self.var_for_value_id(*value_id)
+                .map(|var| (var.display_name(), *slot))
+        })
     }
 
     pub(crate) fn render_stack_slot_for_name(&self, name: &str) -> Option<StackSlotProvenance> {
