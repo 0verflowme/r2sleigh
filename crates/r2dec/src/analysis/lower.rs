@@ -31,7 +31,6 @@ pub(crate) struct LowerCtx<'a> {
     pub(crate) param_register_aliases: &'a HashMap<String, String>,
     pub(crate) type_hints: &'a HashMap<String, CType>,
     pub(crate) stack_slots: &'a HashMap<String, StackSlotProvenance>,
-    pub(crate) forwarded_values: &'a HashMap<String, ValueProvenance>,
     pub(crate) type_oracle: Option<&'a dyn TypeOracle>,
     /// Where a rendered name is written down, so building a reference can mint one.
     pub(crate) symbols: &'a std::cell::RefCell<crate::symbol::SymbolTable>,
@@ -108,21 +107,15 @@ impl<'a> LowerCtx<'a> {
     }
 
     fn forwarded_value_for_name(&self, name: &str) -> Option<&ValueProvenance> {
-        self.forwarded_values.get(name).or_else(|| {
-            self.use_info.and_then(|info| {
-                info.value_id_for_name(name)
-                    .and_then(|value_id| info.render_forwarded_value_for_value(value_id))
-                    .or_else(|| info.render_forwarded_value_for_name(name))
-            })
+        self.use_info.and_then(|info| {
+            info.value_id_for_name(name)
+                .and_then(|value_id| info.render_forwarded_value_for_value(value_id))
         })
     }
 
     fn forwarded_value_for_var(&self, var: &SSAVar) -> Option<&ValueProvenance> {
-        let key = var.display_name();
-        self.forwarded_values.get(&key).or_else(|| {
-            self.use_info
-                .and_then(|info| info.forwarded_value_for_var(var))
-        })
+        self.use_info
+            .and_then(|info| info.forwarded_value_for_var(var))
     }
 
     fn ptr_arith_for_var(&self, var: &SSAVar) -> Option<&PtrArith> {
@@ -696,12 +689,14 @@ impl<'a> LowerCtx<'a> {
     }
 
     fn stack_slot_has_pointer_backed_source(&self, offset: i64, elem_size: u32) -> bool {
-        self.forwarded_values.values().any(|prov| {
+        self.use_info.is_some_and(|info| {
+            info.forwarded_values_by_value.values().any(|prov| {
             prov.stack_slot == Some(offset)
                 && prov
                     .source_var
                     .as_ref()
                     .is_some_and(|var| var.size > elem_size && var.size >= self.ptr_bytes())
+            })
         })
     }
 
@@ -1459,7 +1454,7 @@ mod tests {
         var_aliases: &'a HashMap<String, String>,
         _ptr_arith: &'a HashMap<String, PtrArith>,
         stack_slots: &'a HashMap<String, StackSlotProvenance>,
-        forwarded_values: &'a HashMap<String, ValueProvenance>,
+        _forwarded_values: &'a HashMap<String, ValueProvenance>,
         #[cfg(test)] _function_names: &'a HashMap<u64, String>,
         #[cfg(test)] _strings: &'a HashMap<u64, String>,
         #[cfg(test)] _symbols: &'a HashMap<u64, String>,
@@ -1480,7 +1475,6 @@ mod tests {
             param_register_aliases,
             type_hints,
             stack_slots,
-            forwarded_values,
             type_oracle: None,
         }
     }

@@ -506,7 +506,6 @@ fn populate_prepared_render_definitions(symbols: &std::cell::RefCell<crate::symb
                     param_register_aliases: env.param_register_aliases,
                     type_hints: &use_info.type_hints,
                     stack_slots: &use_info.stack_slots,
-                    forwarded_values: &use_info.forwarded_values,
                     type_oracle: env.type_oracle,
                 };
                 lower.op_to_expr(op)
@@ -3190,21 +3189,12 @@ fn collect_prepared_runtime_facts(symbols: &std::cell::RefCell<crate::symbol::Sy
                     // Forwarding a carrier member past its merge would restore the value it entered with.
                     let forwards = !env.carrier_aliases.contains_key(&dst_key);
                     if forwards {
-                        use_info.forwarded_values.insert(
-                            dst_key.clone(),
-                            ValueProvenance {
-                                source: source_prov.source.clone(),
-                                source_value_id: source_prov.source_value_id.or(bound_src_id),
-                                source_var: source_prov
-                                    .source_var
-                                    .clone()
-                                    .or_else(|| Some(src.clone())),
-                                stack_slot: source_prov
-                                    .stack_slot
-                                    .or_else(|| view.stack_offset_for_var(src))
-                                    .or_else(|| stack_offset_for_value(prepared, src)),
-                            },
-                        );
+                        // One provenance, keyed by identity. There used to be
+                        // two: this site wrote the end of the forwarding chain
+                        // under the name and the immediate copy source under the
+                        // value, and which one a caller got depended on which
+                        // half it reached. The chained one is gone with the name
+                        // half.
                         if let (Some(dst_id), Some(src_id)) = (bound_dst_id, bound_src_id) {
                             use_info.forwarded_values_by_value.insert(
                                 dst_id,
@@ -3967,8 +3957,13 @@ mod tests {
 
         let mut info = UseInfo::default();
         assert_eq!(info.bind_value_id(&spoof, ValueId(3)), Some(ValueId(3)));
-        info.forwarded_values.insert(
-            src.display_name(),
+        // The spoof's forwarding fact is filed under the spoof's identity. There
+        // is no name-keyed half for it to be filed under any more, which is what
+        // makes the collision this test was written for impossible rather than
+        // merely avoided: `src` and `spoof` share a display name and differ as
+        // values, and a store keyed by value cannot confuse them.
+        info.forwarded_values_by_value.insert(
+            ValueId(3),
             ValueProvenance {
                 source: spoof.display_name(),
                 source_value_id: Some(ValueId(3)),

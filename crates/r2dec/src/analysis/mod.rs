@@ -167,7 +167,6 @@ pub(crate) struct UseInfo {
     pub(crate) stable_stack_values: HashMap<i64, SemanticValue>,
     pub(crate) stable_memory_values: HashMap<String, SemanticValue>,
     pub(crate) stable_memory_values_by_value: BTreeMap<ValueId, SemanticValue>,
-    pub(crate) forwarded_values: HashMap<String, ValueProvenance>,
     pub(crate) forwarded_values_by_value: BTreeMap<ValueId, ValueProvenance>,
     /// Writes that reached the string-keyed half and not the value-keyed one.
     ///
@@ -644,11 +643,6 @@ impl UseInfo {
             .retain(|_, value| !semantic_value_references_any(value, &values));
         self.stable_memory_values
             .retain(|_, value| !semantic_value_references_any(value, &values));
-        self.forwarded_values.retain(|_, provenance| {
-            provenance
-                .source_value_id
-                .is_none_or(|value_id| !values.contains(&value_id))
-        });
         self.call_args.retain(|_, args| {
             args.iter()
                 .all(|arg| !call_arg_references_any(arg, &values))
@@ -747,7 +741,6 @@ impl UseInfo {
         } else {
             *self.unkeyed_writes.entry("forwarded_values").or_default() += 1;
         }
-        self.forwarded_values.insert(var.display_name(), provenance);
     }
 
     /// Record a semantic value under both keys, keeping whichever arrived first.
@@ -962,24 +955,19 @@ impl UseInfo {
         &self,
         value_id: ValueId,
     ) -> Option<&ValueProvenance> {
-        self.var_for_value_id(value_id)
-            .and_then(|var| lookup_name_key(&self.forwarded_values, &var.display_name()))
-            .or_else(|| self.forwarded_value_for_value(value_id))
+        self.forwarded_value_for_value(value_id)
     }
 
     pub(crate) fn forwarded_value_for_name(&self, name: &str) -> Option<&ValueProvenance> {
         if self.ambiguous_value_names.contains(name) {
             return None;
         }
-        self.forwarded_values.get(name).or_else(|| {
-            self.value_id_for_name(name)
-                .and_then(|value_id| self.forwarded_values_by_value.get(&value_id))
-        })
+        self.value_id_for_name(name)
+            .and_then(|value_id| self.forwarded_values_by_value.get(&value_id))
     }
 
     pub(crate) fn render_forwarded_value_for_name(&self, name: &str) -> Option<&ValueProvenance> {
-        lookup_name_key(&self.forwarded_values, name)
-            .or_else(|| self.forwarded_value_for_name(name))
+        self.forwarded_value_for_name(name)
     }
 
     pub(crate) fn render_copy_source_for_name(&self, name: &str) -> Option<String> {

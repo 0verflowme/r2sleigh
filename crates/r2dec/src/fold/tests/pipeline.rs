@@ -6715,15 +6715,26 @@ mod tests {
             .use_info
             .definitions
             .insert("src_1".to_string(), ctx.name_ref("arg1"));
-        ctx.state.analysis_ctx.use_info.forwarded_values.insert(
-            "tmp:ret_1".to_string(),
-            crate::analysis::ValueProvenance {
-                source: "src_1".to_string(),
-                source_value_id: None,
-                source_var: None,
-                stack_slot: None,
-            },
+        let ret = r2ssa::SSAVar::new("tmp:ret", 1, 8);
+        assert_eq!(
+            ctx.state
+                .analysis_ctx
+                .use_info
+                .bind_value_id(&ret, r2ssa::ValueId(902)),
+            Some(r2ssa::ValueId(902))
         );
+        ctx.state
+            .analysis_ctx
+            .use_info
+            .insert_forwarded_value_for_var(
+                &ret,
+                crate::analysis::ValueProvenance {
+                    source: "src_1".to_string(),
+                    source_value_id: None,
+                    source_var: None,
+                    stack_slot: None,
+                },
+            );
 
         let resolved = ctx.lookup_definition("tmp:ret_1");
         assert_eq!(resolved, Some(ctx.name_ref("arg1")));

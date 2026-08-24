@@ -620,7 +620,7 @@ fn canonical_value_ref_key(
     {
         return canonical_value_ref_key(info, root, env, depth + 1);
     }
-    if let Some(prov) = info.forwarded_values.get(&key)
+    if let Some(prov) = info.forwarded_value_for_name(&key)
         && let Some(source_var) = &prov.source_var
         && *source_var != value.var
     {
@@ -1573,7 +1573,7 @@ fn arg_slot_for_value_ref(
         }
     }
 
-    if let Some(prov) = info.forwarded_values.get(&display)
+    if let Some(prov) = info.forwarded_value_for_name(&display)
         && let Some(source_var) = &prov.source_var
         && *source_var != value_ref.var
     {
@@ -1990,7 +1990,6 @@ fn collect_definitions(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
                         param_register_aliases: env.param_register_aliases,
                         type_hints: &scratch.info.type_hints,
                         stack_slots: &scratch.info.stack_slots,
-                        forwarded_values: &scratch.info.forwarded_values,
                         type_oracle: env.type_oracle,
                     };
                     // Forwarding is one step of the resolver's precedence, not a
@@ -2064,7 +2063,6 @@ fn rebuild_definitions(
                     param_register_aliases: env.param_register_aliases,
                     type_hints: &scratch.info.type_hints,
                     stack_slots: &scratch.info.stack_slots,
-                    forwarded_values: &scratch.info.forwarded_values,
                     type_oracle: env.type_oracle,
                 };
                 // Forwarding is one step of the resolver's precedence, not a
@@ -2465,7 +2463,7 @@ fn collect_semantic_values_with_cache(symbols: &std::cell::RefCell<crate::symbol
                 );
                 return;
             }
-            if let Some(prov) = scratch.info.forwarded_values.get(&dst.display_name())
+            if let Some(prov) = scratch.info.forwarded_value_for_name(&dst.display_name())
                 && let Some(value) = semantic_source_value_from_provenance(symbols, &scratch.info, prov, env)
             {
                 insert_semantic_value(&mut scratch.info, dst.display_name(), value);
@@ -2831,7 +2829,7 @@ fn resolve_ptr_sized_entry_arg_root_var(
         return Some(entry_root);
     }
 
-    if let Some(prov) = info.forwarded_values.get(&key)
+    if let Some(prov) = info.forwarded_value_for_name(&key)
         && let Some(source_var) = &prov.source_var
         && source_var != var
         && let Some(entry_root) =
@@ -2921,7 +2919,7 @@ fn semantic_var_is_pointer_like(info: &UseInfo, var: &SSAVar, env: &PassEnv<'_>)
             _ => {}
         }
     }
-    if let Some(prov) = info.forwarded_values.get(&key)
+    if let Some(prov) = info.forwarded_value_for_name(&key)
         && let Some(source_var) = &prov.source_var
         && source_var != var
         && semantic_var_is_pointer_like(info, source_var, env)
@@ -2987,7 +2985,7 @@ fn semantic_var_is_pointer_like_cached(
             _ => {}
         }
     }
-    if let Some(prov) = info.forwarded_values.get(&key)
+    if let Some(prov) = info.forwarded_value_for_name(&key)
         && let Some(source_var) = &prov.source_var
         && source_var != var
         && semantic_var_is_pointer_like_cached(info, source_var, env, cache)
@@ -3039,16 +3037,14 @@ fn stack_slot_offset_has_pointer_type_hint(info: &UseInfo, offset: i64, env: &Pa
 }
 
 fn typed_pointer_stack_slot_for_name(info: &UseInfo, name: &str, env: &PassEnv<'_>) -> Option<i64> {
-    info.forwarded_values
-        .get(name)
+    info.forwarded_value_for_name(name)
         .and_then(|prov| prov.stack_slot)
         .or_else(|| info.stack_slots.get(name).map(|slot| slot.offset))
         .filter(|offset| stack_slot_offset_has_pointer_type_hint(info, *offset, env))
 }
 
 fn stack_reloaded_value_slot_for_name(info: &UseInfo, name: &str) -> Option<i64> {
-    info.forwarded_values
-        .get(name)
+    info.forwarded_value_for_name(name)
         .and_then(|prov| prov.stack_slot)
 }
 
@@ -3068,8 +3064,7 @@ fn semantic_type_hint_names(info: &UseInfo, var: &SSAVar, env: &PassEnv<'_>) -> 
     push_unique_casefold(&mut names, key.to_ascii_lowercase());
 
     if let Some(offset) = info
-        .forwarded_values
-        .get(&key)
+        .forwarded_value_for_name(&key)
         .and_then(|prov| prov.stack_slot)
         .or_else(|| info.stack_slots.get(&key).map(|slot| slot.offset))
     {
@@ -3094,8 +3089,7 @@ fn semantic_type_hint_names(info: &UseInfo, var: &SSAVar, env: &PassEnv<'_>) -> 
         push_unique_casefold(&mut names, root.clone());
         push_unique_casefold(&mut names, root.to_ascii_lowercase());
         if let Some(offset) = info
-            .forwarded_values
-            .get(&root)
+            .forwarded_value_for_name(&root)
             .and_then(|prov| prov.stack_slot)
             .or_else(|| info.stack_slots.get(&root).map(|slot| slot.offset))
         {
@@ -3142,8 +3136,7 @@ fn semantic_type_hint_names_cached(
     push_unique_casefold(&mut names, key.to_ascii_lowercase());
 
     if let Some(offset) = info
-        .forwarded_values
-        .get(&key)
+        .forwarded_value_for_name(&key)
         .and_then(|prov| prov.stack_slot)
         .or_else(|| info.stack_slots.get(&key).map(|slot| slot.offset))
     {
@@ -3174,8 +3167,7 @@ fn semantic_type_hint_names_cached(
         push_unique_casefold(&mut names, root.clone());
         push_unique_casefold(&mut names, root.to_ascii_lowercase());
         if let Some(offset) = info
-            .forwarded_values
-            .get(&root)
+            .forwarded_value_for_name(&root)
             .and_then(|prov| prov.stack_slot)
             .or_else(|| info.stack_slots.get(&root).map(|slot| slot.offset))
         {
@@ -3310,7 +3302,7 @@ fn semantic_addr_for_var_with_depth(symbols: &std::cell::RefCell<crate::symbol::
         )));
     }
 
-    if let Some(prov) = info.forwarded_values.get(&key)
+    if let Some(prov) = info.forwarded_value_for_name(&key)
         && let Some(source_var) = &prov.source_var
     {
         let entry_root = (prov.stack_slot.is_some() && var.size == ptr_bytes)
@@ -4705,7 +4697,6 @@ fn analyze_call_args(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, s
                 param_register_aliases: env.param_register_aliases,
                 type_hints: &scratch.info.type_hints,
                 stack_slots: &scratch.info.stack_slots,
-                forwarded_values: &scratch.info.forwarded_values,
                 type_oracle: env.type_oracle,
             };
             let post_call_query = PostCallResultQuery {
@@ -4944,7 +4935,6 @@ fn analyze_call_args(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, s
                     param_register_aliases: env.param_register_aliases,
                     type_hints: &scratch.info.type_hints,
                     stack_slots: &scratch.info.stack_slots,
-                    forwarded_values: &scratch.info.forwarded_values,
                     type_oracle: env.type_oracle,
                 };
                 let call_expr = call_result_expr_for_call_at(symbols, 
@@ -5035,7 +5025,6 @@ fn bind_single_use_call_result_definitions(symbols: &std::cell::RefCell<crate::s
                 param_register_aliases: env.param_register_aliases,
                 type_hints: &scratch.info.type_hints,
                 stack_slots: &scratch.info.stack_slots,
-                forwarded_values: &scratch.info.forwarded_values,
                 type_oracle: env.type_oracle,
             };
             let call_expr =
@@ -5143,7 +5132,6 @@ fn bind_call_result_alias_definitions(symbols: &std::cell::RefCell<crate::symbol
                     param_register_aliases: env.param_register_aliases,
                     type_hints: &info.type_hints,
                     stack_slots: &info.stack_slots,
-                    forwarded_values: &info.forwarded_values,
                     type_oracle: env.type_oracle,
                 };
                 let query = PostCallResultQuery {
@@ -5210,7 +5198,15 @@ fn propagate_call_result_aliases(symbols: &std::cell::RefCell<crate::symbol::Sym
             }
         }
 
-        for (dst, prov) in info.forwarded_values.clone() {
+        let forwarded_by_name: Vec<(String, ValueProvenance)> = info
+            .forwarded_values_by_value
+            .iter()
+            .filter_map(|(value_id, prov)| {
+                info.var_for_value_id(*value_id)
+                    .map(|var| (var.display_name(), prov.clone()))
+            })
+            .collect();
+        for (dst, prov) in forwarded_by_name {
             control.poll()?;
             let source_call = call_result_source_for_alias(info, &prov.source).or_else(|| {
                 prov.source_var.as_ref().and_then(|source_var| {
@@ -5631,7 +5627,10 @@ fn normalize_call_arg_var_for_definition(symbols: &std::cell::RefCell<crate::sym
         || crate::address::parse_address_from_var_name(&name).is_some()
     {
         Some(lower.expr_for_ssa_name(&name))
-    } else if let Some(prov) = lower.forwarded_values.get(&name) {
+    } else if let Some(prov) = info
+        .value_id_for_name(&name)
+        .and_then(|value_id| info.render_forwarded_value_for_value(value_id))
+    {
         normalize_call_arg_var_for_definition(symbols, info, lower, prov.source.clone(), depth + 1, visited)
     } else if let Some(value) = info.semantic_values.get(&name) {
         render_call_arg_semantic_value_for_definition(symbols, info, lower, value, depth + 1, visited)
@@ -6339,8 +6338,7 @@ fn semantic_post_call_result_alias_var(symbols: &std::cell::RefCell<crate::symbo
 
     let key = var.display_name();
     if let Some(source_var) = info
-        .forwarded_values
-        .get(&key)
+        .forwarded_value_for_name(&key)
         .and_then(|prov| prov.source_var.clone())
         .filter(|source_var| source_var != var)
     {
@@ -6705,8 +6703,7 @@ fn semantic_value_source_offset_by_name(
         .get(name)
         .and_then(|value| semantic_value_source_offset(info, value, depth + 1, visited))
         .or_else(|| {
-            info.forwarded_values
-                .get(name)
+            info.forwarded_value_for_name(name)
                 .and_then(|prov| prov.stack_slot)
                 .filter(|offset| *offset < 0)
         })
@@ -6953,8 +6950,7 @@ fn preferred_semantic_call_arg_value(symbols: &std::cell::RefCell<crate::symbol:
         best = preferred_semantic_call_arg_value_candidate(symbols, info, var, expr, env, best, value);
     }
     if let Some(value) = info
-        .forwarded_values
-        .get(&var.display_name())
+        .forwarded_value_for_name(&var.display_name())
         .and_then(|prov| semantic_source_value_from_provenance(symbols, info, prov, env))
     {
         best = preferred_semantic_call_arg_value_candidate(symbols, info, var, expr, env, best, value);
@@ -7219,8 +7215,7 @@ fn exact_negative_stack_offset_by_name(
         .get(name)
         .and_then(|value| exact_negative_stack_offset_for_value(info, value, depth + 1, visited))
         .or_else(|| {
-            info.forwarded_values
-                .get(name)
+            info.forwarded_value_for_name(name)
                 .and_then(|prov| prov.stack_slot)
                 .filter(|offset| *offset < 0)
         })
@@ -7371,7 +7366,7 @@ fn semantic_call_arg_string_addr_inner(symbols: &std::cell::RefCell<crate::symbo
         _ => None,
     }
     .or_else(|| {
-        info.forwarded_values.get(&key).and_then(|prov| {
+        info.forwarded_value_for_name(&key).and_then(|prov| {
             prov.source_var.as_ref().and_then(|source_var| {
                 let source_expr = lookup_call_arg_definition_expr(symbols, info, &source_var.display_name())
                     .unwrap_or_else(|| expr.clone());
@@ -7455,7 +7450,7 @@ fn semantic_call_arg_addr_from_expr(symbols: &std::cell::RefCell<crate::symbol::
                     })
                 })
                 .or_else(|| {
-                    info.forwarded_values.get(&*crate::symbol::spelling(symbols, *name)).and_then(|prov| {
+                    info.forwarded_value_for_name(&crate::symbol::spelling(symbols, *name)).and_then(|prov| {
                         prov.source_var.as_ref().and_then(|source_var| {
                             let source_expr =
                                 lookup_call_arg_definition_expr(symbols, info, &source_var.display_name())
@@ -9480,7 +9475,6 @@ mod tests {
             param_register_aliases: env.param_register_aliases,
             type_hints: &info.type_hints,
             stack_slots: &info.stack_slots,
-            forwarded_values: &info.forwarded_values,
             type_oracle: env.type_oracle,
         };
         let producers = block
@@ -9844,7 +9838,6 @@ mod tests {
             param_register_aliases: env.param_register_aliases,
             type_hints: &info.type_hints,
             stack_slots: &info.stack_slots,
-            forwarded_values: &info.forwarded_values,
             type_oracle: env.type_oracle,
         };
         let helper_idx = block
@@ -9909,7 +9902,7 @@ mod tests {
         );
 
         assert_eq!(
-            info.forwarded_values.get(&loaded.display_name()),
+            info.forwarded_value_for_name(&loaded.display_name()),
             Some(&ValueProvenance {
                 source: stored.display_name(),
                 source_value_id: info.value_id_for_var(&stored),
@@ -9961,7 +9954,7 @@ mod tests {
         );
 
         assert!(
-            !info.forwarded_values.contains_key(&loaded.display_name()),
+            !info.forwarded_value_for_name(&loaded.display_name()).is_some(),
             "positive call-home forwarding should not survive an unrelated second call"
         );
     }
@@ -10393,7 +10386,7 @@ mod tests {
         ])]);
 
         assert_eq!(
-            info.forwarded_values.get(&loaded.display_name()),
+            info.forwarded_value_for_name(&loaded.display_name()),
             Some(&ValueProvenance {
                 source: stored.display_name(),
                 source_value_id: info.value_id_for_var(&stored),
@@ -10435,14 +10428,12 @@ mod tests {
         ])]);
 
         assert!(
-            !info
-                .forwarded_values
-                .contains_key(&custom_loaded.display_name()),
+            info.forwarded_value_for_name(&custom_loaded.display_name())
+                .is_none(),
             "Custom-space loads must not reuse Ram stack state"
         );
         assert_eq!(
-            info.forwarded_values
-                .get(&ram_loaded.display_name())
+            info.forwarded_value_for_name(&ram_loaded.display_name())
                 .and_then(|provenance| provenance.source_var.as_ref()),
             Some(&stored),
             "the exact Ram store/load pair should still forward"
@@ -10608,7 +10599,7 @@ mod tests {
         ])]);
 
         assert!(
-            !info.forwarded_values.contains_key(&loaded.display_name()),
+            !info.forwarded_value_for_name(&loaded.display_name()).is_some(),
             "unknown memory stores must invalidate same-slot forwarding"
         );
     }
@@ -10654,7 +10645,7 @@ mod tests {
         ]);
 
         assert!(
-            !info.forwarded_values.contains_key(&loaded.display_name()),
+            !info.forwarded_value_for_name(&loaded.display_name()).is_some(),
             "forwarding should stay block-local unless dominance is proven explicitly"
         );
     }
@@ -10928,8 +10919,9 @@ mod tests {
 
         info.stack_slots
             .insert(loaded.display_name(), StackSlotProvenance::new(8));
-        info.forwarded_values.insert(
-            loaded.display_name(),
+        assert_eq!(info.bind_value_id(&loaded, ValueId(901)), Some(ValueId(901)));
+        info.insert_forwarded_value_for_var(
+            &loaded,
             ValueProvenance {
                 source: src.display_name(),
                 source_value_id: None,
@@ -11079,7 +11071,7 @@ mod tests {
             ),
             "reloaded base semantic value = {:?}, forwarded = {:?}",
             info.semantic_values.get(&reloaded_base.display_name()),
-            info.forwarded_values.get(&reloaded_base.display_name())
+            info.forwarded_value_for_name(&reloaded_base.display_name())
         );
 
         assert!(
