@@ -59,6 +59,13 @@ learn.
     nothing and the ledger that would have said so went with it. The stop is
     still recorded -- phase refused, route reason, refusal -- and the body
     survives.
+  * **A speculative rewrite leaves no trace when it declines.** `Region::IfThenElse`
+    tries three rewrites before structuring normally, and each structures the
+    whole subtree to decide whether it applies. Their merge deferrals outlived
+    them, so a real structuring nested inside a declined attempt saw a merge as
+    already claimed and left it out -- `murmur3_32` lost its `return` entirely on
+    both optimised arm64 builds. The deferral stack is now truncated back after
+    the attempts.
   * **A merge reached from a branching predecessor is placed.** One unplaceable
     merge abandoned every merge in its block, and the backedge test required the
     target to dominate the predecessor, which refused every merge on a loop
@@ -4532,8 +4539,18 @@ discarded when the speculative rewrite declines.
 
 So the defect is that a speculative attempt structures a subtree while holding
 deferrals that the real structuring of that same subtree will then observe. The
-speculative attempt has to leave no trace -- deferrals included -- or it has to
-be the structuring that ships. Five hypotheses are eliminated on the way here: a pass deleting
+speculative attempt has to leave no trace -- deferrals included.
+
+**Fixed.** `Region::IfThenElse` now records the deferral depth before its three
+speculative rewrites and truncates back to it after they decline. `murmur3_32`
+renders its return at both arm64 -O1 and -O2, and the two `noreturn` verdicts are
+gone; both now fail later and differently, on a subscript type in the tail
+switch, which is an ordinary defect rather than a missing function body.
+
+The corpus total does not move -- 35 of 54 either way -- because the same two
+functions still do not compile. What changed is that a function which produced no
+return at all now produces one, and the ledger's account of it is honest for the
+first time. Five hypotheses are eliminated on the way here: a pass deleting
 the return, a sequence deferral, an ancestor claiming a descendant's merge, the
 speculative visit's ownership context, and any external deferral.
 

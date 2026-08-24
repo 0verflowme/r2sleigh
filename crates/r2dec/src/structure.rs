@@ -867,6 +867,12 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             } => {
                 let merge_owned_by_ancestor =
                     merge_block.is_some_and(|merge| self.deferred_merge_blocks.contains(&merge));
+                // A speculative attempt must leave no trace when it declines,
+                // deferrals included: it structures a subtree, and a real
+                // structuring of that same subtree nested inside it observes
+                // whatever it left on the stack. `murmur3_32` loses its return
+                // that way.
+                let deferred_before = self.deferred_merge_blocks.len();
                 if !merge_owned_by_ancestor
                     && let Some(rewritten) = self.try_structure_if_else_with_slot_merge_returns(
                         *cond_block,
@@ -895,6 +901,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                 ) {
                     return rewritten;
                 }
+                self.deferred_merge_blocks.truncate(deferred_before);
                 let (cond, predicate, condition_value) =
                     self.get_branch_condition_with_predicate(*cond_block);
                 let Some(mut cond) = cond else {
