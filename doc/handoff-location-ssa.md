@@ -3919,3 +3919,39 @@ asserts that it answers nothing, which is what the test was written to want.
 `rebuild_id_mirrors_from_name_maps` is gone, and `lookup_name_key` -- the
 case-insensitive matcher these stores were read through -- has one caller left,
 for `var_aliases`, which is a name-to-name table rather than a paired store.
+
+## adler32's missing compose is the return resolver, not the pruner
+
+`adler32` at x86-64 -O2 returns `00009dd2` where `9dd21488` is wanted: the low
+half holds what the high half should, and the other half is absent. The machine
+composes its result in the block it returns from --
+
+    shl eax, 0x10
+    or  eax, ecx
+    ret
+
+-- and the rendering ends `return rax`, with neither instruction anywhere in the
+body.
+
+The block is lifted correctly and folded: `NORMOP` shows
+`EAX_12 = IntLeft(subpiece(RAX_11), 16)` and the zero-extension after it, and
+`FOLDPOST` shows the block entering the pruner with four statements and leaving
+with one. So the ops exist, are understood, and are then discarded.
+
+The obvious reading is that the pruner is wrong, because it decides liveness by
+walking a block backwards and a value read only by the return has nothing in the
+block that reads it. Seeding it with `FunctionLiveOut` -- which computes exactly
+"what leaves through the return registers of every returning block" -- was built
+and measured, and changes nothing. Reverted.
+
+The reason it changes nothing is the finding. The statements are removed by the
+whole-function pruner, not the per-block one, and they are dead *there* because
+the rendered return does not read them: the return resolver has already answered
+`rax` on its own. Given that return, pruning the compose is correct. The compose
+is not missing because it was pruned; it was pruned because the return was
+already wrong.
+
+So this belongs to item 1 above -- a value with nine resolvers that each answer
+with their own precedence -- and not to the width layer or the pruner, which is
+where it looks like it belongs from the symptom. Worth recording because two
+plausible fixes sit closer to the symptom than the defect, and both are inert.
