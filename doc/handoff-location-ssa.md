@@ -3755,6 +3755,7 @@ counted at the helpers *and* at the four inline sites, which the first version o
 the counter missed entirely. `UseInfo::unkeyed_writes` reports **zero** over
 every function of all six hash binaries. Not one paired write in the corpus fails
 to resolve a canonical identity.
+
 So the string-keyed half is derivable today, at least for everything this corpus
 exercises, and turning it from a stored map into a view is mechanical rather than
 blocked on the location model. The counter stays so the claim keeps being
