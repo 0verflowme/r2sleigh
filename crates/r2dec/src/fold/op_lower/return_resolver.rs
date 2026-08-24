@@ -311,7 +311,7 @@ impl<'a> FoldingContext<'a> {
         expr: &CExpr,
         context: VisibleExprContext,
     ) -> CExpr {
-        if self.expr_is_carrier_reference(expr) {
+        if self.carrier_answers_the_return(expr) {
             return expr.clone();
         }
         let mut best = expr.clone();
@@ -1298,7 +1298,7 @@ impl<'a> FoldingContext<'a> {
     }
 
     pub(super) fn sanitize_final_return_expr(&self, expr: CExpr, fallback: CExpr) -> CExpr {
-        if self.expr_is_carrier_reference(&expr) {
+        if self.carrier_answers_the_return(&expr) {
             return expr;
         }
         if self.is_certified_rendered_call_expr(&expr) {

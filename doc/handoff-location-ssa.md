@@ -3983,3 +3983,18 @@ be doubted as never having engaged. This one engaged, the precedence moved, and
 the shape is to make the wrong answer unrepresentable -- a value that is mutable
 state should not have a resolvable expression at all. Nothing measured here
 contradicts that, and one more datum now supports it.
+
+There were **four** copies of the short-circuit, not one:
+`resolve_return_candidate_in_context`, `resolve_return_target_expr`,
+`normalize_final_return_candidate` and `sanitize_final_return_expr`. That is why
+guarding one moves the answer to the next, and it is the same duplication this
+document keeps finding -- one question with several places answering it.
+
+They now share `carrier_answers_the_return`, so the next attempt is one edit
+rather than four. The predicate is still just the carrier test. Narrowing it to
+exclude a block that writes the return register itself was built and measured
+twice: the coarse form takes arm64 from thirteen correct to nine, because a loop
+latch writing `w0` in the returning block *is* the carrier; excluding carrier
+members restores arm64 and still leaves `adler32` unchanged, the answer arriving
+by a fifth path. Neither narrowing is carried, because neither has a case that
+wants it.

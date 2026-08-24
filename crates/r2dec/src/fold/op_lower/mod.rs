@@ -2809,6 +2809,24 @@ impl<'a> FoldingContext<'a> {
     }
 
     /// Check if the current block is a return block.
+    /// Whether a carrier reference is the answer for the value being returned.
+    ///
+    /// Four places on the return path stopped resolving the moment they saw a
+    /// carrier -- `resolve_return_candidate_in_context`,
+    /// `resolve_return_target_expr`, `normalize_final_return_candidate` and
+    /// `sanitize_final_return_expr` -- each with its own copy of the rule. That
+    /// is why guarding one of them moves the answer to the next and changes
+    /// nothing, which has now been measured five times.
+    ///
+    /// This is the rule, once, so the next attempt is one edit rather than four.
+    /// It is deliberately still just the carrier test: narrowing it to exclude a
+    /// block that writes the return register itself was built and measured, and
+    /// `adler32` was unchanged -- the answer came back by a fifth path -- so the
+    /// narrowing is not carried here without a case that wants it.
+    pub(crate) fn carrier_answers_the_return(&self, expr: &CExpr) -> bool {
+        self.expr_is_carrier_reference(expr)
+    }
+
     fn is_current_return_block(&self) -> bool {
         if let Some(addr) = self.current_block_addr.get() {
             return self.state.return_blocks.contains(&addr);
@@ -9804,7 +9822,7 @@ impl<'a> FoldingContext<'a> {
         target_expr: CExpr,
         last_ret_value: Option<CExpr>,
     ) -> CExpr {
-        if self.expr_is_carrier_reference(&target_expr) {
+        if self.carrier_answers_the_return(&target_expr) {
             return target_expr;
         }
         let mut best = Some(target_expr.clone());
@@ -9824,7 +9842,7 @@ impl<'a> FoldingContext<'a> {
     }
 
     fn normalize_final_return_candidate(&self, expr: CExpr) -> CExpr {
-        if self.expr_is_carrier_reference(&expr) {
+        if self.carrier_answers_the_return(&expr) {
             return expr;
         }
         if self.is_certified_rendered_call_expr(&expr) {
