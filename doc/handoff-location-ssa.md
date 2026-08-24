@@ -4131,8 +4131,26 @@ two quiet ones, and that is the wrong direction. Reverted.
 **The skip is the cause and `use_count` is not a sufficient condition for
 narrowing it.** What the condition wants to express is that the return statement
 is the value's *only* consumer, which is not the same as it being read once --
-the return itself is a read. That distinction is the next thing to get right, and
-it is now the only thing between this defect and a fix. Narrowing it to
+the return itself is a read.
+
+That condition was then written properly: a cached set of every value some op
+other than a `Return` reads, and the skip applies only when the destination is
+absent from it. It is the right condition and it measures the same as the
+use-count proxy -- x86-64 -O1 still turns two visible failures into silently
+wrong hashes -- so it is reverted with it.
+
+The reason is the coupling, and it is the thing to know before trying again.
+`adler32`'s compose has two operands and each is undeclared for its own reason.
+`eax_12` is skipped because it writes the return register. `ecx_9` is not the
+return register at all: it has a definition, nine uses, is not inlined, and is
+still never assigned -- it is inlined into one consumer and named by another,
+which is the same "one value, two answers" shape in a third place.
+
+So fixing one operand makes the compose *look* right and compute the wrong thing,
+because the other operand still resolves to whatever is at hand. **This defect
+cannot be fixed one register at a time.** Both halves want the same repair
+together, and a fix that lands on one of them alone will read as a regression --
+correctly, because it is one. Narrowing it to
 exclude a block that writes the return register itself was built and measured
 twice: the coarse form takes arm64 from thirteen correct to nine, because a loop
 latch writing `w0` in the returning block *is* the carrier; excluding carrier
