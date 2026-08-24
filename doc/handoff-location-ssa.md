@@ -3818,3 +3818,37 @@ What this does not establish is that the corpus exercises every path. It is
 fourteen hash functions across two architectures and three optimisation levels,
 and a binary with indirect calls, unions or varargs may well produce writes that
 resolve nothing. The number to watch is `UNKEYED total=`.
+
+## Eight stores collapsed, and why `definitions` is the ninth
+
+Every value-keyed store used to be rebuilt from its name-keyed twin by
+`rebuild_id_mirrors_from_name_maps`, called from `seal_value_facts` as the last
+thing before any consumer saw `UseInfo`. That is gone, and with it the pretence
+that the read side asking "value first" was asking anything but a mirror.
+
+Eight of the nine paired stores are now one store each, keyed by identity:
+`ptr_arith`, `forwarded_values`, `condition_vars`, `copy_sources`, `use_counts`,
+`call_result_source`, `stack_slots`, `semantic_values`. Each was measured on its
+own -- the corpus and the full suite -- and `copy_sources` moved a rendering:
+`crc32_bitwise` at arm64 -O1 stopped hanging, because following a copy chain by
+name could step between two variables differing only in case and never
+terminate. The corpus is 34 of 54.
+
+Three case-variant ladders went with them: six lookups for a use count in
+`return_resolver.rs`, four for a semantic value, four for a definition. Each
+existed because the fact was filed under whichever spelling its writer held.
+`LowerCtx` shed eight duplicated borrows of maps `UseInfo` already owned and now
+reaches these facts through the `UseInfo` it holds.
+
+`definitions` was attempted and reverted. It is the store entangled with the
+boundary this document already warns about: a caller may hold a *rendered*
+spelling like `t11f80_19` where the fact was filed under the SSA display name
+`tmp:11f80_19`, and the name-keyed store answered both because `lookup_name_key`
+matched loosely. Collapsing it leaves seven tests failing, and they are the right
+tests -- they pin colliding display names, alias precedence, and rendered-name
+lookup, which is exactly what a second store was papering over.
+
+Making an identity answer to both its SSA and rendered spellings fixes one of the
+seven and is a real change to what a name means, not a step in a store collapse.
+It belongs with the location model and wants its own measurement. Reverted rather
+than bundled.
