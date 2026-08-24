@@ -184,8 +184,9 @@ impl<'a> LowerCtx<'a> {
 
         if std::env::var_os("R2SLEIGH_DEBUG_MERGES").is_some() {
             eprintln!(
-                "BARENAME key={key} name={} depth={depth} inline={} has_def={} visited={}",
+                "BARENAME key={key} name={} depth={depth} uses={} inline={} has_def={} visited={}",
                 self.var_name(var),
+                self.use_count_for_name(&key),
                 self.should_inline(&key),
                 self.definition_for_var(var).is_some(),
                 visited.contains(&key)

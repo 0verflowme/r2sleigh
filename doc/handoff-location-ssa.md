@@ -4079,10 +4079,30 @@ still not assigned, and `adler32`'s return degrades from
 `eax_12 | (uint32_t)(int64_t)ecx_9` to `eax_12 | 1`, so pinning perturbed a
 neighbouring value into a constant. Reverted.
 
-So the choice is real and neither side of it is free: either such a value gets a
-definition despite reading mutable state, or it must be unnameable. The second is
-what the working agreement asks for and there is no lever for it here yet --
-`pinned` is not that lever. Narrowing it to
+Two more levers were tried against it and both are inert on the corpus.
+
+Dropping the return register from the refusal list makes `safe=true` and the
+definition is filed -- `DEFFILTER` confirms it -- and the output is unchanged.
+Aligning `LowerCtx::should_inline` with the fold's rule, which inlines a value
+read up to three times where the analysis required exactly one for anything
+register-named, is also unchanged. Both reverted.
+
+The reason both miss is the number the probe now prints. `EAX_12` is read
+**seven** times:
+
+    BARENAME key=EAX_12 name=eax_12 depth=0 uses=7 inline=false has_def=false
+
+Seven is above every inline threshold in the codebase, so no inlining rule was
+ever going to apply, and neither the analysis nor the fold is wrong to decline.
+A value read seven times is one that must be **assigned**. The fold builds no
+statement for it: `FOLDPOST` reports four statements from that block, `eax_12` is
+not among them, and the pruner never reports removing it.
+
+So the question is no longer which resolver names it or which rule declines to
+inline it. It is: **why does the fold build no statement for an op whose
+destination is read seven times?** That is one question about one op, and the
+`BARENAME` probe now prints the use count that makes it obvious rather than
+leaving it to be re-derived. Narrowing it to
 exclude a block that writes the return register itself was built and measured
 twice: the coarse form takes arm64 from thirteen correct to nine, because a loop
 latch writing `w0` in the returning block *is* the carrier; excluding carrier
