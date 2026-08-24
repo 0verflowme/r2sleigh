@@ -3677,3 +3677,36 @@ which is the same failure as declaring undefined names to satisfy a detector.
 The condition referencing a value with no rendered definition is the defect, and
 it belongs with `RDX_5` above -- fixed where the definition is lost, not where
 the name is written.
+
+## The defect that now dominates: a value with two answers
+
+Seven of the eleven renderings that do not compile fail on one name apiece --
+`eax_8`, `t11f00_10`, `tmp_4700_7`, `tregalias_...`, `x30` -- and they are not
+all the same defect underneath. Two shapes have been separated.
+
+`RDX_5` in `djb2` was used and never defined anywhere, in the op stream or the
+rendering. That one is fixed: the merge carrying it out of its loop could not be
+placed, and now can be.
+
+`eax_8` in `murmur3_32` is the other shape and is still open. It *is* defined --
+`EAX_8 = ESI_1 >> 16` -- but no assignment is ever emitted for it, because the
+fold chose to inline it. Two of its three appearances in the return expression
+are the inlined `(uint32_t)esi_1 >> 16`; the third is the bare name `eax_8`,
+which nothing declares. The value has two answers inside a single expression.
+
+It is not the pruner. `PRUNED` never names it, and disabling the pre-structuring
+prune outright takes x86-64 -O2 from three correct to none, so that pass is
+load-bearing and its per-block empty live-out is not the fault here.
+
+What decides is whoever assembles the return expression, which the handoff
+already records as seven components each able to override the last. Until one of
+them owns the spelling, inlining a value in one operand and naming it in another
+will keep producing exactly this. That is the same lesson as the carrier work --
+a value is spelled by its own name wherever it appears -- and the return
+expression is where it has not yet been applied.
+
+Worth keeping in view: the rendering says so itself. `murmur3_32` prints
+`/* r2dec defect: 1 name(s) read with no definition */` above a ledger reading
+`129 built, 9 elided, 0 refused, 7 unaccounted`. The obligation ledger catches
+this class rather than letting it pass as plausible code, which is why it is
+findable at all.
