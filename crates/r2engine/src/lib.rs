@@ -4580,14 +4580,39 @@ impl EngineSession {
                 Duration::default(),
             );
         }
-        metrics.record_phase(
-            EnginePhase::Rendering,
-            EnginePhaseStatus::Executed,
-            render_time,
-        );
+        match &rendered.stopped {
+            // A rendering and a stop. The phases that finished are folded and the
+            // one that stopped is refused, exactly as a discarded rendering would
+            // have recorded -- the difference is that the body survives.
+            Some(stop) => {
+                if stop.certification_completed {
+                    metrics.record_folded_if_not_executed(EnginePhase::Certification);
+                }
+                if stop.normalization_completed {
+                    metrics.record_folded_if_not_executed(EnginePhase::Normalization);
+                }
+                if stop.structuring_completed {
+                    metrics.record_folded_if_not_executed(EnginePhase::Structuring);
+                }
+                metrics.record_phase(stop.phase, EnginePhaseStatus::Refused, render_time);
+            }
+            None => metrics.record_phase(
+                EnginePhase::Rendering,
+                EnginePhaseStatus::Executed,
+                render_time,
+            ),
+        }
         diagnostics
             .warnings
             .extend(rendered.semantic_kernel_warnings);
+        if let Some(stop) = &rendered.stopped {
+            // The reason the run gives for itself is the stop, not the route it
+            // was taking when the stop arrived. The refusal is recorded too: the
+            // body above is what was reached, and a reader is entitled to know
+            // it is not the whole function.
+            diagnostics.route_reason = Some(stop.reason.clone());
+            diagnostics.refusal = Some(stop.reason.clone());
+        }
         metrics.planning_time += planning_time;
         metrics.render_time = render_time;
         if let Err(refusal) =
@@ -5163,6 +5188,12 @@ struct EngineRenderedDecompile {
     output: String,
     semantic_kernel_warnings: Vec<String>,
     structuring_executed: bool,
+    /// Set when rendering stopped and the output above is what it had reached.
+    ///
+    /// A rendering and a stop, not one or the other: the body is kept so the
+    /// reader gets what was produced, and the phase is still recorded as refused
+    /// so the accounting says the run did not finish.
+    stopped: Option<EngineRenderExecutionStop>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -5275,18 +5306,38 @@ fn render_engine_decompile_request<C: r2ssa::SsaWorkControl>(
             output,
             semantic_kernel_warnings: Vec::new(),
             structuring_executed: false,
+            stopped: None,
         });
     }
 
     let input = decompiler_input_for_engine_request(request);
-    let output = r2dec::Decompiler::new(request.render_target.to_decompiler_config())
-        .decompile_input_with_control(&input, control)
-        .map_err(engine_render_stop_from_decompiler)?;
+    // Keep a rendering the decompiler reached before it stopped. Discarding it
+    // reports a function that ran out of budget as one that produced nothing,
+    // and takes the ledger that would have said so with it.
+    let output = match r2dec::Decompiler::new(request.render_target.to_decompiler_config())
+        .decompile_input_keeping_partial(&input, control)
+    {
+        Ok(output) => output,
+        Err((stop, Some(partial))) if !partial.trim().is_empty() => {
+            return Ok(EngineRenderedDecompile {
+                output: partial,
+                semantic_kernel_warnings: vec![format!(
+                    "rendering stopped in {:?}: {}; the body above is what was reached",
+                    stop.phase(),
+                    stop.reason()
+                )],
+                structuring_executed: true,
+                stopped: Some(engine_render_stop_from_decompiler(stop)),
+            });
+        }
+        Err((stop, _)) => return Err(engine_render_stop_from_decompiler(stop)),
+    };
     if !output.trim().is_empty() {
         return Ok(EngineRenderedDecompile {
             output,
             semantic_kernel_warnings: Vec::new(),
             structuring_executed: true,
+            stopped: None,
         });
     }
 
@@ -5298,6 +5349,7 @@ fn render_engine_decompile_request<C: r2ssa::SsaWorkControl>(
         .unwrap_or_default(),
         semantic_kernel_warnings: Vec::new(),
         structuring_executed: false,
+        stopped: None,
     })
 }
 
@@ -8111,7 +8163,7 @@ mod tests {
     }
 
     #[test]
-    fn r2dec_inner_stops_map_to_engine_refusals_without_native_output() {
+    fn r2dec_inner_stops_map_to_engine_refusals_and_keep_what_rendering_reached() {
         let session = EngineSession::new();
         let request = controlled_r2dec_render_request();
         let decompiler_input = decompiler_input_for_engine_request(&request);
@@ -8213,15 +8265,34 @@ mod tests {
                     .as_deref()
                     .is_some_and(|refusal| refusal.contains(&expected_reason))
             );
-            assert_eq!(
-                response
-                    .function_facts
-                    .decompile_route()
-                    .map(|route| route.kind),
-                Some(r2types::DecompileRouteKind::FallbackComment)
-            );
-            assert!(response.output.starts_with("/* r2dec fallback:"));
-            assert!(!response.output.contains("() {"));
+            // A stop while normalizing has no body to keep, so it still falls
+            // back to a comment. A stop while rendering does: the C function is
+            // built by then, and discarding it reported a run that ran out of
+            // budget as one that produced nothing. The stop is still fully
+            // recorded above -- phase refused, route reason, refusal -- so what
+            // changed is that the reader also gets what was reached.
+            if phase == EnginePhase::Rendering {
+                assert!(
+                    response.output.contains("sym.r2dec_controlled"),
+                    "a rendering-phase stop keeps the body it reached: {}",
+                    response.output
+                );
+                assert!(
+                    !response.output.starts_with("/* r2dec fallback:"),
+                    "and it is a body, not a fallback comment: {}",
+                    response.output
+                );
+            } else {
+                assert_eq!(
+                    response
+                        .function_facts
+                        .decompile_route()
+                        .map(|route| route.kind),
+                    Some(r2types::DecompileRouteKind::FallbackComment)
+                );
+                assert!(response.output.starts_with("/* r2dec fallback:"));
+                assert!(!response.output.contains("() {"));
+            }
         }
     }
 

@@ -2633,6 +2633,41 @@ impl Decompiler {
         Ok(output)
     }
 
+    /// Render, keeping whatever was produced when a phase stopped.
+    ///
+    /// `decompile_input_with_control` returns only the stop, so a caller has to
+    /// discard the rendering to report that a budget ran out. That is why
+    /// `RefusalReason::BudgetExhausted` has never been constructed: the ledger
+    /// that would record it lives in the rendering being thrown away, and a
+    /// function that ran out of time reports as one that produced nothing.
+    ///
+    /// A stop while building the C function has no partial to keep. A stop
+    /// during rendering does -- the function is built by then, and generating it
+    /// is what the caller wanted.
+    pub fn decompile_input_keeping_partial<'a>(
+        &self,
+        input: &'a DecompilerInput,
+        control: &'a dyn r2ssa::SsaWorkControl,
+    ) -> Result<String, (DecompileExecutionStop, Option<String>)> {
+        match self.decompile_input_with_control(input, control) {
+            Ok(output) => Ok(output),
+            Err(stop) if stop.phase() == DecompileWorkPhase::Rendering => {
+                // Rebuilt without a budget: the point is to keep what the run
+                // had reached, and re-imposing the exhausted budget would stop
+                // again at the same place.
+                let unchecked = r2ssa::SsaExecutionControl::default();
+                let partial = self
+                    .build_function_from_input_with_control(input, &unchecked)
+                    .ok()
+                    .map(|c_func| {
+                        CodeGenerator::new(self.config.codegen.clone()).generate_function(&c_func)
+                    });
+                Err((stop, partial))
+            }
+            Err(stop) => Err((stop, None)),
+        }
+    }
+
     /// Build a C function from a prepared function + typed context payload.
     pub fn build_function_from_input(&self, input: &DecompilerInput) -> CFunction {
         let control = r2ssa::SsaExecutionControl::default();

@@ -86,9 +86,24 @@ disagrees with this section is superseded.
      live, which caps whole-register vector reads. The chosen shape is a wide
      literal in the AST; it is downstream of the tile composer, which is
      downstream of emission.
-  5. **Budget as ledger.** A phase that runs out of budget discards its partial
-     rendering, so `RefusalReason::BudgetExhausted` is never constructed.
-     `render_engine_decompile_request` must return a rendering *and* a stop.
+  5. *(done)* **Budget as ledger.** A phase that ran out of budget discarded its
+     partial rendering, so a function that ran out of time reported as one that
+     produced nothing, and the ledger that would have said otherwise went out
+     with the rendering.
+
+     `Decompiler::decompile_input_keeping_partial` keeps what a rendering-phase
+     stop had reached -- the C function is built by then, so generating it is
+     what the caller wanted -- and `render_engine_decompile_request` returns it
+     together with the stop. A stop while normalizing still has no body to keep
+     and still falls back to a comment.
+
+     The stop is not softened by keeping the body. The phases that finished are
+     folded and the one that stopped is refused, exactly as the discarded path
+     recorded; the route reason and the refusal both state the stop; and a
+     warning says the body is what was reached. What changed is only that the
+     reader gets it. The obligation ledger now prints against a stopped run --
+     `2 source obligations: 1 built, 0 elided, 1 refused` -- which is the
+     accounting this item existed to make possible.
 
 **Does the call fix transfer to the resolvers?** Only partly, and the difference
 is worth stating. The call defect was a *recognition* failure: two expressions
