@@ -4409,10 +4409,34 @@ parent region discards the sub-region that contains it.
 
 So the defect is one region dropping another's result during structuring, not a
 pass deleting a return. The empty `{ }` arms in the rendering are the same thing
-seen from outside. `merge_owned_by_ancestor` and `deferred_merge_blocks` are the
-mechanisms by which an ancestor claims responsibility for a merge block, and an
-ancestor that claims one and never emits it would produce exactly this; that is
-the next thing to check, and it is one question.
+seen from outside.
+
+### The region is structured twice and the second answer wins
+
+Tracing every `Region::IfThenElse` as it is structured shows the region whose
+condition block is `0x1000008ec` and whose merge is `0x100000924` -- the block
+holding the return -- structured **twice**:
+
+    MERGEAPPEND merge=0x100000924 prefix_len=4 cond_block=0x1000008ec
+    IFREGION cond=0x1000008ec merge=Some(0x100000924) owned=false terminate=false
+    ...
+    IFREGION cond=0x1000008ec merge=Some(0x100000924) owned=true  terminate=false
+
+On the first visit `merge_owned_by_ancestor` is false, the merge is appended, and
+the prefix holds four statements including the return. On the second it is true,
+so the merge is suppressed -- correctly, because by then an ancestor has claimed
+it. The output keeps the second result.
+
+Nothing is dropping the region, then. The region is structured more than once and
+the visit that omits the merge is the one that survives, while the ancestor that
+claimed the merge does not emit it either. Both visits behave correctly in
+isolation; what is missing is that a region structured twice has two different
+right answers and nothing decides between them.
+
+That is the same shape as everything else on this branch -- one question with two
+answering paths -- and here it is worth two renderings. The fix wants either a
+structured-region cache, so a region is structured once, or ownership that does
+not change between visits.
 
 The `PASS after=... returns=N` probe added for this is kept, because "when did
 the return disappear" turned out to be the question that made the search finite.
