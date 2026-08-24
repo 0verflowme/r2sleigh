@@ -4492,10 +4492,26 @@ structured once to answer a question and once to produce output, with nothing
 carrying the first answer to the second. That the two differ is the defect;
 `murmur3_32`'s return is in the first and not the second.
 
-The fix direction follows: the speculative attempt should either reuse what it
-structured, so the answer it computed is the answer that ships, or not structure
-at all -- deciding whether the rewrite applies without building the arms. The
-first is smaller. Five hypotheses are eliminated on the way here: a pass deleting
+One refinement matters before acting on that. The `MERGEAPPEND` probe fires
+**once** for this block, during the speculative visit. The ordinary visit does not
+append the merge at all -- it finds `merge_owned_by_ancestor` true and skips it --
+so the two structurings do not merely differ in some detail: the only code path
+that ever emits this merge is the one whose result is thrown away.
+
+That also explains why deferring the merge inside the speculative attempt changed
+nothing. It removed the one append that existed rather than adding the missing
+one.
+
+So reusing the speculative result is not a drop-in either: its arms were built
+with the merge *not* deferred, so it carries the merge inside an arm, while the
+ordinary shape expects the merge appended after both arms. The two are not
+interchangeable.
+
+What is still open is narrow and specific: why the ordinary visit sees
+`0x100000924` as already deferred, when instrumenting every push and pop of that
+address shows only the region's own two, both balanced. Until that is answered,
+neither reusing the speculative result nor suppressing the second visit is safe,
+because both act on a mechanism that has not been identified. Five hypotheses are eliminated on the way here: a pass deleting
 the return, a sequence deferral, an ancestor claiming a descendant's merge, the
 speculative visit's ownership context, and any external deferral.
 
