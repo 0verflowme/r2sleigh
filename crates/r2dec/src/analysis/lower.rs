@@ -23,7 +23,6 @@ pub(crate) fn no_string_literals() -> &'static std::collections::BTreeMap<u64, S
 pub(crate) struct LowerCtx<'a> {
     pub(crate) use_info: Option<&'a UseInfo>,
     pub(crate) definitions: &'a HashMap<String, CExpr>,
-    pub(crate) semantic_values: &'a HashMap<String, SemanticValue>,
     pub(crate) pinned: &'a HashSet<String>,
     pub(crate) var_aliases: &'a HashMap<String, String>,
     pub(crate) param_register_aliases: &'a HashMap<String, String>,
@@ -86,21 +85,14 @@ impl<'a> LowerCtx<'a> {
     }
 
     fn semantic_value_for_name(&self, name: &str) -> Option<&SemanticValue> {
-        self.semantic_values.get(name).or_else(|| {
-            self.use_info.and_then(|info| {
-                info.value_id_for_name(name)
-                    .and_then(|value_id| info.render_semantic_value_for_value(value_id))
-                    .or_else(|| info.render_semantic_value_for_name(name))
-            })
+        self.use_info.and_then(|info| {
+            info.value_id_for_name(name)
+                .and_then(|value_id| info.render_semantic_value_for_value(value_id))
         })
     }
 
     fn semantic_value_for_var(&self, var: &SSAVar) -> Option<&SemanticValue> {
-        let key = var.display_name();
-        self.semantic_values.get(&key).or_else(|| {
-            self.use_info
-                .and_then(|info| info.semantic_value_for_var(var))
-        })
+        self.use_info.and_then(|info| info.semantic_value_for_var(var))
     }
 
     fn forwarded_value_for_name(&self, name: &str) -> Option<&ValueProvenance> {
@@ -1455,14 +1447,13 @@ mod tests {
         #[cfg(test)] _symbols: &'a HashMap<u64, String>,
     ) -> LowerCtx<'a> {
         let type_hints = Box::leak(Box::new(HashMap::new()));
-        let semantic_values = Box::leak(Box::new(HashMap::new()));
+        let semantic_values: &'static HashMap<String, SemanticValue> = Box::leak(Box::new(HashMap::new()));
         let param_register_aliases = Box::leak(Box::new(HashMap::new()));
         LowerCtx {
             symbols,
             string_literals: crate::analysis::lower::no_string_literals(),
             use_info: None,
             definitions,
-            semantic_values,
             pinned,
             var_aliases,
             param_register_aliases,

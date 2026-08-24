@@ -605,7 +605,7 @@ fn canonical_value_ref_key(
     }
 
     let key = value.display_name();
-    if let Some(SemanticValue::Scalar(ScalarValue::Root(root))) = info.semantic_values.get(&key)
+    if let Some(SemanticValue::Scalar(ScalarValue::Root(root))) = info.semantic_value_for_name(&key)
         && root.var != value.var
     {
         return canonical_value_ref_key(info, root, env, depth + 1);
@@ -615,7 +615,7 @@ fn canonical_value_ref_key(
         index: None,
         scale_bytes: 0,
         offset_bytes: 0,
-    })) = info.semantic_values.get(&key)
+    })) = info.semantic_value_for_name(&key)
         && root.var != value.var
     {
         return canonical_value_ref_key(info, root, env, depth + 1);
@@ -1324,9 +1324,7 @@ fn value_kind_for_block_var(symbols: &std::cell::RefCell<crate::symbol::SymbolTa
         return StackSlotValueKind::Unknown;
     }
 
-    let stable_scalar_load_kind = info
-        .semantic_values
-        .get(&var.display_name())
+    let stable_scalar_load_kind = info.semantic_value_for_name(&var.display_name())
         .and_then(|value| match value {
             SemanticValue::Load {
                 space: SpaceId::Ram,
@@ -1538,7 +1536,7 @@ fn arg_slot_for_value_ref(
     }
 
     let display = value_ref.var.display_name();
-    if let Some(value) = info.semantic_values.get(&display) {
+    if let Some(value) = info.semantic_value_for_name(&display) {
         match value {
             SemanticValue::Scalar(ScalarValue::Root(root)) => {
                 if root.var != value_ref.var {
@@ -1975,7 +1973,6 @@ fn collect_definitions(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
                         string_literals: env.string_literals,
                         use_info: Some(&scratch.info),
                         definitions: &scratch.info.definitions,
-                        semantic_values: &scratch.info.semantic_values,
                         pinned: &scratch.info.pinned,
                         var_aliases: &scratch.info.var_aliases,
                         param_register_aliases: env.param_register_aliases,
@@ -2045,7 +2042,6 @@ fn rebuild_definitions(
                     string_literals: env.string_literals,
                     use_info: Some(&scratch.info),
                     definitions: &rebuilt,
-                    semantic_values: &scratch.info.semantic_values,
                     pinned: &scratch.info.pinned,
                     var_aliases: &scratch.info.var_aliases,
                     param_register_aliases: env.param_register_aliases,
@@ -2806,7 +2802,7 @@ fn resolve_ptr_sized_entry_arg_root_var(
     }
 
     let key = var.display_name();
-    if let Some(SemanticValue::Scalar(ScalarValue::Root(root))) = info.semantic_values.get(&key)
+    if let Some(SemanticValue::Scalar(ScalarValue::Root(root))) = info.semantic_value_for_name(&key)
         && root.var != *var
         && let Some(entry_root) =
             resolve_ptr_sized_entry_arg_root_var(info, &root.var, env, depth + 1)
@@ -2894,7 +2890,7 @@ fn semantic_var_is_pointer_like(info: &UseInfo, var: &SSAVar, env: &PassEnv<'_>)
     {
         return true;
     }
-    if let Some(value) = info.semantic_values.get(&key) {
+    if let Some(value) = info.semantic_value_for_name(&key) {
         match value {
             SemanticValue::Address(_) => return true,
             SemanticValue::Scalar(ScalarValue::Root(root)) if root.var != *var => {
@@ -2959,7 +2955,7 @@ fn semantic_var_is_pointer_like_cached(
     {
         return true;
     }
-    if let Some(value) = info.semantic_values.get(&key) {
+    if let Some(value) = info.semantic_value_for_name(&key) {
         match value {
             SemanticValue::Address(_) => return true,
             SemanticValue::Scalar(ScalarValue::Root(root)) if root.var != *var => {
@@ -3258,11 +3254,11 @@ fn semantic_addr_for_var_with_depth(symbols: &std::cell::RefCell<crate::symbol::
             offset_bytes: 0,
         });
     }
-    if let Some(SemanticValue::Address(addr)) = info.semantic_values.get(&key) {
+    if let Some(SemanticValue::Address(addr)) = info.semantic_value_for_name(&key) {
         return Some(addr.clone());
     }
 
-    if let Some(SemanticValue::Scalar(ScalarValue::Root(root))) = info.semantic_values.get(&key)
+    if let Some(SemanticValue::Scalar(ScalarValue::Root(root))) = info.semantic_value_for_name(&key)
         && (semantic_var_is_pointer_like(info, &root.var, env)
             || resolve_ptr_sized_entry_arg_root_var(info, &root.var, env, depth + 1).is_some())
     {
@@ -3272,7 +3268,7 @@ fn semantic_addr_for_var_with_depth(symbols: &std::cell::RefCell<crate::symbol::
             .or_else(|| Some(normalized_addr_from_base_var(&root_base)));
     }
     if let Some(SemanticValue::Scalar(ScalarValue::Expr(CExpr::Var(alias)))) =
-        info.semantic_values.get(&key)
+        info.semantic_value_for_name(&key)
         && var.size == ptr_bytes
         && let Some(slot) = crate::symbol::spelling(symbols, *alias)
             .strip_prefix("arg")
@@ -3351,7 +3347,7 @@ fn semantic_addr_for_var_with_depth(symbols: &std::cell::RefCell<crate::symbol::
     }
 
     let has_non_address_semantic = matches!(
-        info.semantic_values.get(&key),
+        info.semantic_value_for_name(&key),
         Some(SemanticValue::Scalar(_)) | Some(SemanticValue::Load { .. })
     );
     if !has_non_address_semantic
@@ -3479,7 +3475,7 @@ fn should_preserve_rooted_structured_load_identity_for_stable_memory(
 }
 
 fn insert_semantic_value(info: &mut UseInfo, key: String, candidate: SemanticValue) {
-    match info.semantic_values.get(&key) {
+    match info.semantic_value_for_name(&key) {
         Some(current) if semantic_value_rank(current) > semantic_value_rank(&candidate) => {}
         _ => {
             if let Some(value_id) = info.value_id_for_name(&key) {
@@ -3529,9 +3525,7 @@ fn resolve_stable_stack_load_semantic_value(
                 .or_else(|| Some(value.clone()))
         }
         SemanticValue::Scalar(ScalarValue::Root(root)) => {
-            match info
-                .semantic_values
-                .get(&root.display_name())
+            match info.semantic_value_for_name(&root.display_name())
                 .and_then(|inner| resolve_stable_stack_load_semantic_value(info, inner, depth + 1))
             {
                 Some(inner @ SemanticValue::Scalar(_)) => Some(inner),
@@ -3546,9 +3540,7 @@ fn resolve_stable_stack_load_semantic_value(
 }
 
 fn semantic_source_value_for_var(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, info: &UseInfo, var: &SSAVar) -> Option<SemanticValue> {
-    if let Some(value) = info
-        .semantic_values
-        .get(&var.display_name())
+    if let Some(value) = info.semantic_value_for_name(&var.display_name())
         .and_then(|value| resolve_stable_stack_load_semantic_value(info, value, 0))
     {
         return Some(value);
@@ -3617,18 +3609,14 @@ fn semantic_source_value_from_provenance(symbols: &std::cell::RefCell<crate::sym
 }
 
 fn semantic_or_scalar_source_value(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, info: &UseInfo, source_name: &str) -> Option<SemanticValue> {
-    if let Some(value) = info
-        .semantic_values
-        .get(source_name)
+    if let Some(value) = info.semantic_value_for_name(source_name)
         .and_then(|value| resolve_stable_stack_load_semantic_value(info, value, 0))
     {
         return Some(value);
     }
 
     let root = resolve_copy_root_name(info, source_name);
-    if let Some(value) = info
-        .semantic_values
-        .get(&root)
+    if let Some(value) = info.semantic_value_for_name(&root)
         .and_then(|value| resolve_stable_stack_load_semantic_value(info, value, 0))
     {
         return Some(value);
@@ -4672,7 +4660,6 @@ fn analyze_call_args(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, s
                 string_literals: env.string_literals,
                 use_info: None,
                 definitions: &scratch.info.definitions,
-                semantic_values: &scratch.info.semantic_values,
                 pinned: &scratch.info.pinned,
                 var_aliases: &scratch.info.var_aliases,
                 param_register_aliases: env.param_register_aliases,
@@ -4907,7 +4894,6 @@ fn analyze_call_args(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, s
                     string_literals: env.string_literals,
                     use_info: Some(&scratch.info),
                     definitions: &scratch.info.definitions,
-                    semantic_values: &scratch.info.semantic_values,
                     pinned: &scratch.info.pinned,
                     var_aliases: &scratch.info.var_aliases,
                     param_register_aliases: env.param_register_aliases,
@@ -4994,7 +4980,6 @@ fn bind_single_use_call_result_definitions(symbols: &std::cell::RefCell<crate::s
                 string_literals: env.string_literals,
                 use_info: None,
                 definitions: &scratch.info.definitions,
-                semantic_values: &scratch.info.semantic_values,
                 pinned: &scratch.info.pinned,
                 var_aliases: &scratch.info.var_aliases,
                 param_register_aliases: env.param_register_aliases,
@@ -5093,7 +5078,6 @@ fn bind_call_result_alias_definitions(symbols: &std::cell::RefCell<crate::symbol
                     string_literals: env.string_literals,
                     use_info: Some(info),
                     definitions: &info.definitions,
-                    semantic_values: &info.semantic_values,
                     pinned: &info.pinned,
                     var_aliases: &info.var_aliases,
                     param_register_aliases: env.param_register_aliases,
@@ -5198,7 +5182,15 @@ fn propagate_call_result_aliases(symbols: &std::cell::RefCell<crate::symbol::Sym
             }
         }
 
-        for (name, value) in info.semantic_values.clone() {
+        let semantics_by_name: Vec<(String, SemanticValue)> = info
+            .semantic_values_by_value
+            .iter()
+            .filter_map(|(value_id, value)| {
+                info.var_for_value_id(*value_id)
+                    .map(|var| (var.display_name(), value.clone()))
+            })
+            .collect();
+        for (name, value) in semantics_by_name {
             control.poll()?;
             let source_alias = match value {
                 SemanticValue::Scalar(ScalarValue::Root(root)) => Some(root.display_name()),
@@ -5607,7 +5599,7 @@ fn normalize_call_arg_var_for_definition(symbols: &std::cell::RefCell<crate::sym
         .and_then(|value_id| info.render_forwarded_value_for_value(value_id))
     {
         normalize_call_arg_var_for_definition(symbols, info, lower, prov.source.clone(), depth + 1, visited)
-    } else if let Some(value) = info.semantic_values.get(&name) {
+    } else if let Some(value) = info.semantic_value_for_name(&name) {
         render_call_arg_semantic_value_for_definition(symbols, info, lower, value, depth + 1, visited)
             .and_then(|expr| {
                 normalize_call_arg_expr_for_definition(symbols, info, lower, expr, depth + 1, visited)
@@ -6020,9 +6012,7 @@ fn preferred_stack_input_call_arg(symbols: &std::cell::RefCell<crate::symbol::Sy
     expr: &CExpr,
     env: &PassEnv<'_>,
 ) -> SemanticCallArg {
-    let arg = info
-        .semantic_values
-        .get(&var.display_name())
+    let arg = info.semantic_value_for_name(&var.display_name())
         .filter(|value| match value {
             SemanticValue::Load {
                 space: SpaceId::Ram,
@@ -6321,7 +6311,7 @@ fn semantic_post_call_result_alias_var(symbols: &std::cell::RefCell<crate::symbo
             .or(Some(source_var));
     }
 
-    match info.semantic_values.get(&key) {
+    match info.semantic_value_for_name(&key) {
         Some(SemanticValue::Scalar(ScalarValue::Root(root))) if root.var != *var => {
             semantic_post_call_result_alias_var(symbols, info, &root.var, depth + 1)
                 .or(Some(root.var.clone()))
@@ -6673,9 +6663,7 @@ fn semantic_value_source_offset_by_name(
         return None;
     }
 
-    let offset = info
-        .semantic_values
-        .get(name)
+    let offset = info.semantic_value_for_name(name)
         .and_then(|value| semantic_value_source_offset(info, value, depth + 1, visited))
         .or_else(|| {
             info.forwarded_value_for_name(name)
@@ -6919,7 +6907,7 @@ fn preferred_semantic_call_arg_value(symbols: &std::cell::RefCell<crate::symbol:
     env: &PassEnv<'_>,
 ) -> Option<SemanticValue> {
     let mut best = canonical_frame_object_call_arg_value(symbols, info, var, expr, env);
-    if let Some(value) = info.semantic_values.get(&var.display_name()).cloned() {
+    if let Some(value) = info.semantic_value_for_name(&var.display_name()).cloned() {
         best = preferred_semantic_call_arg_value_candidate(symbols, info, var, expr, env, best, value);
     }
     if let Some(value) = info
@@ -7050,9 +7038,7 @@ fn canonical_frame_object_call_arg_value(symbols: &std::cell::RefCell<crate::sym
     let direct = semantic_addr_for_var(symbols, info, var, env)
         .and_then(|addr| frame_object_field_key(symbols, info, &addr, env, 0))
         .and_then(|key| info.frame_object_field_roots.get(&key).cloned());
-    let semantic = info
-        .semantic_values
-        .get(&var.display_name())
+    let semantic = info.semantic_value_for_name(&var.display_name())
         .and_then(|value| match value {
             SemanticValue::Address(addr)
             | SemanticValue::Load {
@@ -7183,9 +7169,7 @@ fn exact_negative_stack_offset_by_name(
         return None;
     }
 
-    let offset = info
-        .semantic_values
-        .get(name)
+    let offset = info.semantic_value_for_name(name)
         .and_then(|value| exact_negative_stack_offset_for_value(info, value, depth + 1, visited))
         .or_else(|| {
             info.forwarded_value_for_name(name)
@@ -7311,7 +7295,7 @@ fn semantic_call_arg_string_addr_inner(symbols: &std::cell::RefCell<crate::symbo
         return None;
     }
 
-    let resolved = match info.semantic_values.get(&key) {
+    let resolved = match info.semantic_value_for_name(&key) {
         Some(SemanticValue::Scalar(ScalarValue::Expr(inner))) => {
             semantic_call_arg_addr_from_expr(symbols, info, inner, env, depth + 1, visited)
         }
@@ -7457,22 +7441,11 @@ fn semantic_call_arg_addr_from_expr(symbols: &std::cell::RefCell<crate::symbol::
 
 fn lookup_call_arg_semantic_value<'a>(info: &'a UseInfo, name: &str) -> Option<&'a SemanticValue> {
 
-    info.semantic_values
-        .get(name)
-        .or_else(|| info.semantic_values.get(&name.to_ascii_lowercase()))
-        .or_else(|| {
-            name.rsplit_once('_').and_then(|(base, version)| {
-                info.semantic_values
-                    .get(&format!("{}_{}", base.to_ascii_lowercase(), version))
-                    .or_else(|| {
-                        info.semantic_values.get(&format!(
-                            "{}_{}",
-                            base.to_ascii_uppercase(),
-                            version
-                        ))
-                    })
-            })
-        })
+    // Four spellings used to be tried here -- the name, its lowercase, and both
+    // case variants of `base_version` -- because the fact was filed under
+    // whichever the writer held. It is filed against the value now, and the name
+    // resolves to one.
+    info.semantic_value_for_name(name)
 }
 
 fn lookup_call_arg_definition_expr(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, info: &UseInfo, name: &str) -> Option<CExpr> {
@@ -7567,7 +7540,7 @@ fn call_arg_candidate_score(symbols: &std::cell::RefCell<crate::symbol::SymbolTa
     if semantic_call_arg_string_addr(symbols, info, var, expr, env, 0).is_some() {
         score += 200;
     }
-    match info.semantic_values.get(&var.display_name()) {
+    match info.semantic_value_for_name(&var.display_name()) {
         Some(SemanticValue::Load { .. }) | Some(SemanticValue::Address(_)) => score += 80,
         Some(SemanticValue::Scalar(_)) => score += 40,
         Some(SemanticValue::Unknown) | None => {}
@@ -8321,8 +8294,7 @@ mod tests {
         assert_eq!(info.var_for_value_id(ValueId(1)), Some(&first));
         assert_eq!(info.var_for_value_id(ValueId(2)), Some(&second));
 
-        info.semantic_values
-            .insert(spoofed_display, SemanticValue::Unknown);
+        info.insert_semantic_value_for_name(&spoofed_display, SemanticValue::Unknown);
         rebuild_id_mirrors_from_name_maps(&mut info);
         assert_eq!(info.semantic_values_by_value.get(&ValueId(1)), None);
         assert_eq!(info.semantic_values_by_value.get(&ValueId(2)), None);
@@ -9438,7 +9410,6 @@ mod tests {
             string_literals: env.string_literals,
             use_info: Some(&info),
             definitions: &info.definitions,
-            semantic_values: &info.semantic_values,
             pinned: &info.pinned,
             var_aliases: &info.var_aliases,
             param_register_aliases: env.param_register_aliases,
@@ -9798,7 +9769,6 @@ mod tests {
             string_literals: env.string_literals,
             use_info: None,
             definitions: &info.definitions,
-            semantic_values: &info.semantic_values,
             pinned: &info.pinned,
             var_aliases: &info.var_aliases,
             param_register_aliases: env.param_register_aliases,
@@ -9822,8 +9792,8 @@ mod tests {
             expr.is_none(),
             "direct-X0 reuse shape must not synthesize helper call-result expressions without canonical call-result ownership proof, helper args={:?}, x8_32={:?}, load_10={:?}",
             info.call_args.get(&(block.addr, helper_idx)),
-            info.semantic_values.get("X8_32"),
-            info.semantic_values.get("tmp:24d00_10")
+            info.semantic_value_for_name("X8_32"),
+            info.semantic_value_for_name("tmp:24d00_10")
         );
     }
 
@@ -10233,9 +10203,7 @@ mod tests {
             })
         );
 
-        info.semantic_values.insert(
-            temp_slot.display_name(),
-            SemanticValue::Scalar(ScalarValue::Expr(crate::symbol::var_ref(&symbols, "semantic"))),
+        info.insert_semantic_value_for_name(&temp_slot.display_name(), SemanticValue::Scalar(ScalarValue::Expr(crate::symbol::var_ref(&symbols, "semantic"))),
         );
         assert!(matches!(
             semantic_addr_for_var_with_depth(&symbols, &info, &temp_slot, &env, 0),
@@ -10452,17 +10420,17 @@ mod tests {
         );
         assert!(
             matches!(
-                ram_only.semantic_values.get(&ram_loaded.display_name()),
+                ram_only.semantic_value_for_name(&ram_loaded.display_name()),
                 Some(SemanticValue::Scalar(ScalarValue::Expr(CExpr::IntLit(
                     0x11
                 ))))
             ),
             "Ram semantic={:?}, stable={:?}",
-            ram_only.semantic_values.get(&ram_loaded.display_name()),
+            ram_only.semantic_value_for_name(&ram_loaded.display_name()),
             ram_only.stable_memory_values
         );
         assert!(!matches!(
-            ram_only.semantic_values.get(&custom_loaded.display_name()),
+            ram_only.semantic_value_for_name(&custom_loaded.display_name()),
             Some(SemanticValue::Scalar(ScalarValue::Expr(CExpr::IntLit(
                 0x11
             ))))
@@ -10489,9 +10457,7 @@ mod tests {
             &fixture.env(),
         );
         assert!(matches!(
-            custom_only
-                .semantic_values
-                .get(&custom_loaded.display_name()),
+            custom_only.semantic_value_for_name(&custom_loaded.display_name()),
             Some(SemanticValue::Scalar(ScalarValue::Expr(CExpr::IntLit(
                 0x22
             ))))
@@ -10642,7 +10608,7 @@ mod tests {
         ])]);
 
         assert!(matches!(
-            info.semantic_values.get(&addr.display_name()),
+            info.semantic_value_for_name(&addr.display_name()),
             Some(SemanticValue::Address(NormalizedAddr {
                 index: Some(index),
                 scale_bytes: 4,
@@ -10651,7 +10617,7 @@ mod tests {
             })) if index.var == idx
         ));
         assert!(matches!(
-            info.semantic_values.get(&loaded.display_name()),
+            info.semantic_value_for_name(&loaded.display_name()),
             Some(SemanticValue::Load {
                 space: SpaceId::Ram,
                 addr: NormalizedAddr {
@@ -10683,7 +10649,7 @@ mod tests {
                     addr,
                 },
             ])]);
-            match info.semantic_values.get(&loaded.display_name()) {
+            match info.semantic_value_for_name(&loaded.display_name()) {
                 Some(SemanticValue::Load { space, .. }) => *space,
                 other => panic!("expected semantic load, got {other:?}"),
             }
@@ -10720,8 +10686,8 @@ mod tests {
         ])]);
 
         assert_eq!(
-            info.semantic_values.get(&copied.display_name()),
-            info.semantic_values.get(&loaded.display_name())
+            info.semantic_value_for_name(&copied.display_name()),
+            info.semantic_value_for_name(&loaded.display_name())
         );
     }
 
@@ -10814,7 +10780,7 @@ mod tests {
             },
         ])]);
 
-        let idx_semantic = info.semantic_values.get(&idx_loaded.display_name());
+        let idx_semantic = info.semantic_value_for_name(&idx_loaded.display_name());
         assert!(
             match idx_semantic {
                 Some(SemanticValue::Scalar(ScalarValue::Expr(CExpr::Var(name)))) => {
@@ -10833,7 +10799,7 @@ mod tests {
         );
         assert!(
             matches!(
-                info.semantic_values.get(&loaded.display_name()),
+                info.semantic_value_for_name(&loaded.display_name()),
                 Some(SemanticValue::Load {
                     space: SpaceId::Ram,
                     addr: NormalizedAddr {
@@ -10848,8 +10814,8 @@ mod tests {
             "final loaded value should keep indexed-load semantics through stack reloads"
         );
         assert_eq!(
-            info.semantic_values.get(&ret.display_name()),
-            info.semantic_values.get(&loaded.display_name()),
+            info.semantic_value_for_name(&ret.display_name()),
+            info.semantic_value_for_name(&loaded.display_name()),
             "return-register copy should preserve the indexed-load semantic value"
         );
     }
@@ -11032,7 +10998,7 @@ mod tests {
 
         assert!(
             matches!(
-                info.semantic_values.get(&reloaded_base.display_name()),
+                info.semantic_value_for_name(&reloaded_base.display_name()),
                 Some(SemanticValue::Address(NormalizedAddr {
                     base: BaseRef::Value(value_ref),
                     index: None,
@@ -11041,13 +11007,13 @@ mod tests {
                 })) if value_ref.var == x0
             ),
             "reloaded base semantic value = {:?}, forwarded = {:?}",
-            info.semantic_values.get(&reloaded_base.display_name()),
+            info.semantic_value_for_name(&reloaded_base.display_name()),
             info.forwarded_value_for_name(&reloaded_base.display_name())
         );
 
         assert!(
             matches!(
-                info.semantic_values.get(&field_addr.display_name()),
+                info.semantic_value_for_name(&field_addr.display_name()),
                 Some(SemanticValue::Address(NormalizedAddr {
                     base: BaseRef::Value(value_ref),
                     index: Some(_),
@@ -11056,7 +11022,7 @@ mod tests {
                 })) if value_ref.var == x0
             ),
             "field addr semantic value = {:?}",
-            info.semantic_values.get(&field_addr.display_name())
+            info.semantic_value_for_name(&field_addr.display_name())
         );
     }
 
@@ -11194,7 +11160,7 @@ mod tests {
 
         assert!(
             matches!(
-                info.semantic_values.get(&field_addr.display_name()),
+                info.semantic_value_for_name(&field_addr.display_name()),
                 Some(SemanticValue::Address(NormalizedAddr {
                     base: BaseRef::Value(value_ref),
                     index: Some(_),
@@ -11203,7 +11169,7 @@ mod tests {
                 })) if value_ref.var == rdi0
             ),
             "masked x86 struct-array field addr semantic value = {:?}",
-            info.semantic_values.get(&field_addr.display_name())
+            info.semantic_value_for_name(&field_addr.display_name())
         );
     }
 
@@ -11313,7 +11279,7 @@ mod tests {
 
         let info = analyze(&symbols, &[entry, reload], &env);
 
-        let argv_semantic = info.semantic_values.get(&argv_root.display_name());
+        let argv_semantic = info.semantic_value_for_name(&argv_root.display_name());
         assert!(
             matches!(
                 argv_semantic,
@@ -11326,7 +11292,7 @@ mod tests {
             ),
             "expected argv root to stay semantic across blocks, got {argv_semantic:?}"
         );
-        let loaded = info.semantic_values.get(&arg_value.display_name());
+        let loaded = info.semantic_value_for_name(&arg_value.display_name());
         assert!(
             matches!(
                 loaded,
@@ -11494,7 +11460,7 @@ mod tests {
 
         assert!(
             matches!(
-                info.semantic_values.get(&argv_root.display_name()),
+                info.semantic_value_for_name(&argv_root.display_name()),
                 Some(SemanticValue::Address(NormalizedAddr {
                     base: BaseRef::Value(value_ref),
                     index: None,
@@ -11503,12 +11469,12 @@ mod tests {
                 })) if value_ref.var == mk("X1", 0, 8)
             ),
             "reloaded frame field should still resolve to argv root, got {:?}",
-            info.semantic_values.get(&argv_root.display_name())
+            info.semantic_value_for_name(&argv_root.display_name())
         );
 
         assert!(
             matches!(
-                info.semantic_values.get(&arg_value.display_name()),
+                info.semantic_value_for_name(&arg_value.display_name()),
                 Some(SemanticValue::Load {
                     space: SpaceId::Ram,
                     addr: NormalizedAddr {
@@ -11519,7 +11485,7 @@ mod tests {
                 }) if value_ref.var == mk("X1", 0, 8)
             ),
             "final imported-call arg load should still use argv root, got {:?}",
-            info.semantic_values.get(&arg_value.display_name())
+            info.semantic_value_for_name(&arg_value.display_name())
         );
     }
 
@@ -11647,7 +11613,7 @@ mod tests {
         );
         assert!(
             matches!(
-                info.semantic_values.get(&argv_root.display_name()),
+                info.semantic_value_for_name(&argv_root.display_name()),
                 Some(SemanticValue::Address(NormalizedAddr {
                     base: BaseRef::Value(value_ref),
                     index: None,
@@ -11656,7 +11622,7 @@ mod tests {
                 })) if value_ref.var == mk("X1", 0, 8)
             ),
             "expected reloaded frame field to stay rooted at argv, got {:?}",
-            info.semantic_values.get(&argv_root.display_name())
+            info.semantic_value_for_name(&argv_root.display_name())
         );
     }
 
@@ -11948,11 +11914,11 @@ mod tests {
 
         assert!(
             matches!(
-                info.semantic_values.get(&load_8.display_name()),
+                info.semantic_value_for_name(&load_8.display_name()),
                 Some(SemanticValue::Scalar(ScalarValue::Root(root)))
                     if root.var == mk("W8", 0, 4)
             ) || matches!(
-                info.semantic_values.get(&load_8.display_name()),
+                info.semantic_value_for_name(&load_8.display_name()),
                 Some(SemanticValue::Load {
                     space: SpaceId::Ram,
                     addr: NormalizedAddr {
@@ -11966,11 +11932,11 @@ mod tests {
             ),
             "semantic load shape for {} = {:?}",
             load_8.display_name(),
-            info.semantic_values.get(&load_8.display_name())
+            info.semantic_value_for_name(&load_8.display_name())
         );
         assert!(
             matches!(
-                info.semantic_values.get(&load_34.display_name()),
+                info.semantic_value_for_name(&load_34.display_name()),
                 Some(SemanticValue::Load {
                     space: SpaceId::Ram,
                     addr: NormalizedAddr {
@@ -11984,7 +11950,7 @@ mod tests {
             ),
             "semantic load shape for {} = {:?}",
             load_34.display_name(),
-            info.semantic_values.get(&load_34.display_name())
+            info.semantic_value_for_name(&load_34.display_name())
         );
     }
 

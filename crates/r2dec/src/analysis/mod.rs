@@ -137,7 +137,6 @@ pub(crate) struct UseInfo {
     pub(crate) definitions: HashMap<String, CExpr>,
     pub(crate) definitions_by_value: BTreeMap<ValueId, CExpr>,
     pub(crate) producers: HashMap<String, r2ssa::SSAOp>,
-    pub(crate) semantic_values: HashMap<String, SemanticValue>,
     pub(crate) semantic_values_by_value: BTreeMap<ValueId, SemanticValue>,
     pub(crate) frame_slot_merges: HashMap<String, FrameSlotMergeSummary>,
     pub(crate) frame_object_field_roots: HashMap<FrameObjectFieldKey, SemanticValue>,
@@ -628,8 +627,6 @@ impl UseInfo {
                 .source_value_id
                 .is_none_or(|value_id| !values.contains(&value_id))
         });
-        self.semantic_values
-            .retain(|_, value| !semantic_value_references_any(value, &values));
         self.frame_object_field_roots
             .retain(|_, value| !semantic_value_references_any(value, &values));
         self.switch_selector_roots
@@ -758,13 +755,10 @@ impl UseInfo {
     /// being spelled again at the call site.
     pub(crate) fn insert_semantic_value_for_name_and_value_if_absent(
         &mut self,
-        name: String,
+        _name: String,
         value_id: Option<ValueId>,
         value: SemanticValue,
     ) {
-        self.semantic_values
-            .entry(name)
-            .or_insert_with(|| value.clone());
         match value_id {
             Some(value_id) => {
                 self.semantic_values_by_value
@@ -776,13 +770,11 @@ impl UseInfo {
     }
 
     pub(crate) fn insert_semantic_value_for_name(&mut self, name: &str, value: SemanticValue) {
-        if let Some(value_id) = self.value_id_for_name(name) {
-            self.semantic_values_by_value
-                .insert(value_id, value.clone());
+        if let Some(value_id) = self.value_id_for_name_or_bind(name) {
+            self.semantic_values_by_value.insert(value_id, value);
         } else {
             *self.unkeyed_writes.entry("semantic_values").or_default() += 1;
         }
-        self.semantic_values.insert(name.to_string(), value);
     }
 
     /// Give a rendered spelling an identity, minting one if it has none.
@@ -944,23 +936,19 @@ impl UseInfo {
         &self,
         value_id: ValueId,
     ) -> Option<&SemanticValue> {
-        self.var_for_value_id(value_id)
-            .and_then(|var| lookup_name_key(&self.semantic_values, &var.display_name()))
-            .or_else(|| self.semantic_value_for_value(value_id))
+        self.semantic_value_for_value(value_id)
     }
 
     pub(crate) fn semantic_value_for_name(&self, name: &str) -> Option<&SemanticValue> {
         if self.ambiguous_value_names.contains(name) {
             return None;
         }
-        self.semantic_values.get(name).or_else(|| {
-            self.value_id_for_name(name)
-                .and_then(|value_id| self.semantic_values_by_value.get(&value_id))
-        })
+        self.value_id_for_name(name)
+            .and_then(|value_id| self.semantic_values_by_value.get(&value_id))
     }
 
     pub(crate) fn render_semantic_value_for_name(&self, name: &str) -> Option<&SemanticValue> {
-        lookup_name_key(&self.semantic_values, name).or_else(|| self.semantic_value_for_name(name))
+        self.semantic_value_for_name(name)
     }
 
     pub(crate) fn forwarded_value_for_var(&self, var: &SSAVar) -> Option<&ValueProvenance> {
@@ -1019,7 +1007,6 @@ impl UseInfo {
 
     pub(crate) fn has_renderable_named_fact(&self, name: &str) -> bool {
         lookup_name_key(&self.definitions, name).is_some()
-            || lookup_name_key(&self.semantic_values, name).is_some()
             || lookup_name_key(&self.var_aliases, name).is_some()
             || self.value_id_for_name(name).is_some_and(|value_id| {
                 self.definitions_by_value.contains_key(&value_id)
@@ -1035,7 +1022,6 @@ impl UseInfo {
     pub(crate) fn named_values(&self) -> impl Iterator<Item = &str> {
         self.definitions
             .keys()
-            .chain(self.semantic_values.keys())
             .chain(self.var_aliases.keys())
             .map(String::as_str)
     }

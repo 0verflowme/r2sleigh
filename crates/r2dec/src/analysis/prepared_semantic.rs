@@ -498,7 +498,6 @@ fn populate_prepared_render_definitions(symbols: &std::cell::RefCell<crate::symb
                     string_literals: crate::analysis::lower::no_string_literals(),
                     use_info: Some(use_info),
                     definitions: &use_info.definitions,
-                    semantic_values: &use_info.semantic_values,
                     pinned: &use_info.pinned,
                     var_aliases: &use_info.var_aliases,
                     param_register_aliases: env.param_register_aliases,
@@ -3396,10 +3395,6 @@ fn seed_prepared_value_fact(symbols: &std::cell::RefCell<crate::symbol::SymbolTa
             .formatted_defs
             .entry(key.clone())
             .or_insert_with(|| expr.clone());
-        use_info
-            .semantic_values
-            .entry(key.clone())
-            .or_insert_with(|| semantic_value_for_prepared_expr(view, var, expr.clone()));
         if let Some(value_id) = bound_value_id {
             use_info
                 .semantic_values_by_value

@@ -4911,15 +4911,11 @@ mod tests {
             .use_info
             .definitions
             .insert(real_index.display_name(), ctx.name_ref("local_c"));
-        ctx.state.analysis_ctx.use_info.semantic_values.insert(
-            real_index.display_name(),
-            crate::analysis::SemanticValue::Scalar(crate::analysis::ScalarValue::Expr(CExpr::Var(
+        ctx.state.analysis_ctx.use_info.insert_semantic_value_for_name(&real_index.display_name(), crate::analysis::SemanticValue::Scalar(crate::analysis::ScalarValue::Expr(CExpr::Var(
                 { let CExpr::Var(id) = ctx.name_ref("local_c") else { unreachable!() }; id },
             ))),
         );
-        ctx.state.analysis_ctx.use_info.semantic_values.insert(
-            load.display_name(),
-            crate::analysis::SemanticValue::Load {
+        ctx.state.analysis_ctx.use_info.insert_semantic_value_for_name(&load.display_name(), crate::analysis::SemanticValue::Load {
                 space: r2il::SpaceId::Ram,
                 addr: crate::analysis::NormalizedAddr {
                     base: crate::analysis::BaseRef::Value(crate::analysis::ValueRef::from(
@@ -4939,8 +4935,7 @@ mod tests {
                 ctx.state
                     .analysis_ctx
                     .use_info
-                    .semantic_values
-                    .get(&load.display_name())
+                    .semantic_value_for_name(&load.display_name())
                     .expect("semantic load should exist"),
                 0,
                 &mut visited,
@@ -5019,21 +5014,15 @@ mod tests {
             .use_info
             .type_hints
             .insert("buf".to_string(), CType::ptr(CType::i8()));
-        ctx.state.analysis_ctx.use_info.semantic_values.insert(
-            len_value.display_name(),
-            crate::analysis::SemanticValue::Scalar(crate::analysis::ScalarValue::Expr(CExpr::Var(
+        ctx.state.analysis_ctx.use_info.insert_semantic_value_for_name(&len_value.display_name(), crate::analysis::SemanticValue::Scalar(crate::analysis::ScalarValue::Expr(CExpr::Var(
                 { let CExpr::Var(id) = ctx.name_ref("len") else { unreachable!() }; id },
             ))),
         );
-        ctx.state.analysis_ctx.use_info.semantic_values.insert(
-            buf_value.display_name(),
-            crate::analysis::SemanticValue::Scalar(crate::analysis::ScalarValue::Expr(CExpr::Var(
+        ctx.state.analysis_ctx.use_info.insert_semantic_value_for_name(&buf_value.display_name(), crate::analysis::SemanticValue::Scalar(crate::analysis::ScalarValue::Expr(CExpr::Var(
                 { let CExpr::Var(id) = ctx.name_ref("buf") else { unreachable!() }; id },
             ))),
         );
-        ctx.state.analysis_ctx.use_info.semantic_values.insert(
-            store_addr.display_name(),
-            crate::analysis::SemanticValue::Load {
+        ctx.state.analysis_ctx.use_info.insert_semantic_value_for_name(&store_addr.display_name(), crate::analysis::SemanticValue::Load {
                 space: r2il::SpaceId::Ram,
                 addr: crate::analysis::NormalizedAddr {
                     base: crate::analysis::BaseRef::Value(crate::analysis::ValueRef::from(
@@ -5053,8 +5042,7 @@ mod tests {
                 ctx.state
                     .analysis_ctx
                     .use_info
-                    .semantic_values
-                    .get(&store_addr.display_name())
+                    .semantic_value_for_name(&store_addr.display_name())
                     .expect("semantic load should exist"),
                 0,
                 &mut visited,
@@ -5129,9 +5117,7 @@ mod tests {
             base.display_name(),
             CType::ptr(CType::Struct("DemoStruct".to_string())),
         );
-        ctx.state.analysis_ctx.use_info.semantic_values.insert(
-            dst.display_name(),
-            crate::analysis::SemanticValue::Load {
+        ctx.state.analysis_ctx.use_info.insert_semantic_value_for_name(&dst.display_name(), crate::analysis::SemanticValue::Load {
                 space: r2il::SpaceId::Ram,
                 addr: crate::analysis::NormalizedAddr {
                     base: crate::analysis::BaseRef::Value(crate::analysis::ValueRef::from(
@@ -5151,8 +5137,7 @@ mod tests {
             .state
             .analysis_ctx
             .use_info
-            .semantic_values
-            .get(&dst.display_name())
+            .semantic_value_for_name(&dst.display_name())
             .expect("semantic member load should exist");
         let crate::analysis::SemanticValue::Load { addr, .. } = semantic else {
             panic!("expected semantic member load, got {semantic:?}");
@@ -5192,9 +5177,7 @@ mod tests {
                 ),
             ),
         );
-        ctx.state.analysis_ctx.use_info.semantic_values.insert(
-            dst.display_name(),
-            crate::analysis::SemanticValue::Load {
+        ctx.state.analysis_ctx.use_info.insert_semantic_value_for_name(&dst.display_name(), crate::analysis::SemanticValue::Load {
                 space: r2il::SpaceId::Ram,
                 addr: crate::analysis::NormalizedAddr {
                     base: crate::analysis::BaseRef::Value(crate::analysis::ValueRef::from(
@@ -5214,8 +5197,7 @@ mod tests {
                 ctx.state
                     .analysis_ctx
                     .use_info
-                    .semantic_values
-                    .get(&dst.display_name())
+                    .semantic_value_for_name(&dst.display_name())
                     .expect("semantic load should exist"),
                 0,
                 &mut visited,
@@ -5467,9 +5449,7 @@ mod tests {
             .use_info
             .type_hints
             .insert("idx".to_string(), CType::Int(32));
-        ctx.state.analysis_ctx.use_info.semantic_values.insert(
-            dst.display_name(),
-            crate::analysis::SemanticValue::Load {
+        ctx.state.analysis_ctx.use_info.insert_semantic_value_for_name(&dst.display_name(), crate::analysis::SemanticValue::Load {
                 space: r2il::SpaceId::Ram,
                 addr: crate::analysis::NormalizedAddr {
                     base: crate::analysis::BaseRef::Value(crate::analysis::ValueRef::from(
@@ -5489,8 +5469,7 @@ mod tests {
             .state
             .analysis_ctx
             .use_info
-            .semantic_values
-            .get(&dst.display_name())
+            .semantic_value_for_name(&dst.display_name())
             .expect("semantic member load should exist");
         let crate::analysis::SemanticValue::Load { addr, .. } = semantic else {
             panic!("expected semantic member load, got {semantic:?}");
@@ -5562,9 +5541,7 @@ mod tests {
             .collect(),
             ..Default::default()
         }));
-        ctx.state.analysis_ctx.use_info.semantic_values.insert(
-            addr.display_name(),
-            crate::analysis::SemanticValue::Address(crate::analysis::NormalizedAddr {
+        ctx.state.analysis_ctx.use_info.insert_semantic_value_for_name(&addr.display_name(), crate::analysis::SemanticValue::Address(crate::analysis::NormalizedAddr {
                 base: crate::analysis::BaseRef::Value(crate::analysis::ValueRef::from(base)),
                 index: Some(crate::analysis::ValueRef::from(index)),
                 scale_bytes: 56,
@@ -5606,9 +5583,7 @@ mod tests {
             .into_iter()
             .collect(),
         );
-        ctx.state.analysis_ctx.use_info.semantic_values.insert(
-            addr.display_name(),
-            crate::analysis::SemanticValue::Address(crate::analysis::NormalizedAddr {
+        ctx.state.analysis_ctx.use_info.insert_semantic_value_for_name(&addr.display_name(), crate::analysis::SemanticValue::Address(crate::analysis::NormalizedAddr {
                 base: crate::analysis::BaseRef::Value(crate::analysis::ValueRef::from(base)),
                 index: None,
                 scale_bytes: 0,
@@ -9485,9 +9460,7 @@ mod tests {
             .use_info
             .type_hints
             .insert(idx_src.display_name(), CType::Int(32));
-        ctx.state.analysis_ctx.use_info.semantic_values.insert(
-            eax.display_name(),
-            crate::analysis::SemanticValue::Load {
+        ctx.state.analysis_ctx.use_info.insert_semantic_value_for_name(&eax.display_name(), crate::analysis::SemanticValue::Load {
                 space: r2il::SpaceId::Ram,
                 addr: crate::analysis::NormalizedAddr {
                     base: crate::analysis::BaseRef::Value(crate::analysis::ValueRef::from(arr_src)),
@@ -9587,9 +9560,7 @@ mod tests {
             .collect(),
             ..Default::default()
         }));
-        ctx.state.analysis_ctx.use_info.semantic_values.insert(
-            load_first.display_name(),
-            crate::analysis::SemanticValue::Load {
+        ctx.state.analysis_ctx.use_info.insert_semantic_value_for_name(&load_first.display_name(), crate::analysis::SemanticValue::Load {
                 space: r2il::SpaceId::Ram,
                 addr: crate::analysis::NormalizedAddr {
                     base: crate::analysis::BaseRef::Value(crate::analysis::ValueRef::from(
@@ -9602,9 +9573,7 @@ mod tests {
                 size: 4,
             },
         );
-        ctx.state.analysis_ctx.use_info.semantic_values.insert(
-            load_second.display_name(),
-            crate::analysis::SemanticValue::Load {
+        ctx.state.analysis_ctx.use_info.insert_semantic_value_for_name(&load_second.display_name(), crate::analysis::SemanticValue::Load {
                 space: r2il::SpaceId::Ram,
                 addr: crate::analysis::NormalizedAddr {
                     base: crate::analysis::BaseRef::Value(crate::analysis::ValueRef::from(
@@ -9666,9 +9635,7 @@ mod tests {
             .into_iter()
             .collect(),
         );
-        ctx.state.analysis_ctx.use_info.semantic_values.insert(
-            ret.display_name(),
-            crate::analysis::SemanticValue::Load {
+        ctx.state.analysis_ctx.use_info.insert_semantic_value_for_name(&ret.display_name(), crate::analysis::SemanticValue::Load {
                 space: r2il::SpaceId::Ram,
                 addr: crate::analysis::NormalizedAddr {
                     base: crate::analysis::BaseRef::Value(crate::analysis::ValueRef::from(arr)),
