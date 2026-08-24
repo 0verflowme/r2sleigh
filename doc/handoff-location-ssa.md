@@ -3991,7 +3991,36 @@ guarding one moves the answer to the next, and it is the same duplication this
 document keeps finding -- one question with several places answering it.
 
 They now share `carrier_answers_the_return`, so the next attempt is one edit
-rather than four. The predicate is still just the carrier test. Narrowing it to
+rather than four. The predicate is still just the carrier test.
+
+### The fifth path was a deliberate preference, and it is now conditional
+
+None of the four was what answered `rax`. `fold_block` chooses between
+`last_ret_value` and the merge over the return register, and it prefers the merge
+*because* it is a carrier:
+
+    (Some(last), Some(merged))
+        if self.expr_is_carrier_reference(&merged)
+            && !self.expr_is_carrier_reference(&last) => Some(merged)
+
+That was written for `fnv1a32` at x86-64 -O1, which returns its seed when
+`last_ret_value` short-circuits the merge. `adler32` wants the opposite, and both
+are right about themselves: the difference is whether the returning block went on
+to compute the result *from* the carrier.
+
+`current_return_block_computes_result` decides it -- a write to the return
+register that no carrier claims. The coarse form of that test, any write at all,
+takes arm64 from thirteen correct to nine, because a loop latch writing `w0` in
+the returning block is the carrier; excluding carrier members is what makes it
+say the intended thing.
+
+`adler32` now renders `return eax_12 | (uint32_t)(int64_t)ecx_9`, which is the
+right shape, on both configurations where it was silently wrong. It does not
+compile: `eax_12` is inlined rather than assigned, and the return names it
+anyway. That is the same defect as `eax_8` in `murmur3_32` -- one value with two
+answers inside one expression -- so `adler32` has moved out of "returns a
+plausible wrong hash" and into an open defect that is already recorded and
+visible. Narrowing it to
 exclude a block that writes the return register itself was built and measured
 twice: the coarse form takes arm64 from thirteen correct to nine, because a loop
 latch writing `w0` in the returning block *is* the carrier; excluding carrier

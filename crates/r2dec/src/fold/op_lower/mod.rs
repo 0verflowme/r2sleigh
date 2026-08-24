@@ -2827,6 +2827,36 @@ impl<'a> FoldingContext<'a> {
         self.expr_is_carrier_reference(expr)
     }
 
+    /// Whether the block being folded returns and computes a return-register
+    /// value the carrier does not answer for.
+    ///
+    /// A loop latch writing `w0` in the block that returns *is* the carrier, so
+    /// the write alone says nothing -- testing it coarsely takes arm64 from
+    /// thirteen correct to nine. What counts is a write no carrier claims, which
+    /// is what `adler32`'s `shl eax, 0x10; or eax, ecx` is.
+    pub(crate) fn current_return_block_computes_result(&self) -> bool {
+        if !self.is_current_return_block() {
+            return false;
+        }
+        let Some(addr) = self.current_block_addr.get() else {
+            return false;
+        };
+        let Some(prepared) = self.inputs.prepared_ssa else {
+            return false;
+        };
+        let Some(block) = prepared.function().get_block(addr) else {
+            return false;
+        };
+        block.ops.iter().any(|op| {
+            op.dst().is_some_and(|dst| {
+                self.inputs
+                    .arch
+                    .is_return_register_name(&dst.name.to_ascii_lowercase())
+                    && !self.carrier_aliases.contains_key(&dst.display_name())
+            })
+        })
+    }
+
     fn is_current_return_block(&self) -> bool {
         if let Some(addr) = self.current_block_addr.get() {
             return self.state.return_blocks.contains(&addr);
@@ -12915,10 +12945,17 @@ impl<'a> FoldingContext<'a> {
                             self.merged_return_register_candidate_for_block(block_addr)
                                 .or_else(|| self.reaching_return_register_candidate(block_addr))
                         });
+                        // ...unless this block went on to compute the result
+                        // from the carrier. `adler32` carries its accumulator in
+                        // `rax` and then composes with `shl eax, 0x10; or eax,
+                        // ecx` here; preferring the carrier drops the compose,
+                        // and nothing reads it afterwards so the pruner removes
+                        // it and the reader sees `return rax`.
                         let control_return_value = match (last_ret_value.clone(), merged) {
                             (Some(last), Some(merged))
                                 if self.expr_is_carrier_reference(&merged)
-                                    && !self.expr_is_carrier_reference(&last) =>
+                                    && !self.expr_is_carrier_reference(&last)
+                                    && !self.current_return_block_computes_result() =>
                             {
                                 Some(merged)
                             }
