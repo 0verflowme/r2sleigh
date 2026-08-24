@@ -4459,12 +4459,26 @@ attempt as the ordinary path does -- was built and measured. The corpus is
 unchanged and the return is still absent, because now *neither* visit appends the
 merge rather than one appending it and being thrown away. Reverted.
 
-That eliminates the speculative visit as the cause. The ordinary path suppresses
-the merge because it sees it already deferred, and the deferral is not coming
-from the speculative visit, which balances its own push and pop. Something else
-holds `0x100000924` on the deferred stack when the ordinary path arrives, and
-finding what holds it is the remaining step -- one question again, and narrower
-than the last one.
+That eliminates the speculative visit as the cause. Instrumenting every push and
+pop of `0x100000924` narrows it once more:
+
+    DEFERPUSH 0x100000924 depth=4 from structure.rs:940
+    DEFERPOP  0x100000924 depth=5 from structure.rs:947
+    DEFERPUSH 0x100000924 depth=8 from structure.rs:940
+    DEFERPOP  0x100000924 depth=9 from structure.rs:947
+
+Both pushes are the region's *own*, both balanced, and nothing else ever defers
+this block. So no ancestor claims it and no sequence defers it -- the two visits
+simply happen at different nesting depths, four and eight, and the second is
+nested inside the first's push window, which is why it sees the merge as already
+owned.
+
+The region is therefore structured recursively within itself, and the visit that
+appends the merge is the outer one whose result is discarded. What remains is to
+find the path from the region's own branches back to the region, which is the
+recursion that makes the second visit possible at all. Four hypotheses are now
+eliminated: a pass deleting the return, a sequence deferral, an ancestor claiming
+a descendant's merge, and the speculative rewrite.
 
 The `PASS after=... returns=N` probe added for this is kept, because "when did
 the return disappear" turned out to be the question that made the search finite.
