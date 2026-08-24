@@ -805,12 +805,31 @@ experiment in that state is worse, not better:
     before re-keying   4 correct -> 1 correct   (x86-64 -O0 only measured)
     after re-keying   34 correct -> 13 correct  (all six configurations)
 
-So the stores were not what stood in the way. What stands in the way is the other
-half of the original diagnosis, the half that was never addressed: a name is a
-width as well as an identity, and roughly seven hundred sites key on
-`display_name()` expecting it to say how wide the value is. Re-keying the stores
-changed where facts are filed; it did not change what those sites read out of a
-name.
+So the stores were not what stood in the way. Nor, it turns out, is the width
+assumption, which is what the rest of this section used to claim.
+
+Two things were checked rather than assumed. `display_name()` appears at **386**
+production sites in `r2dec`, not seven hundred, and nearly all of them use it as
+a *key* into the fact stores -- which are keyed by identity now and do not care
+what the name says about width. The one helper that genuinely derives a width
+from a spelling, `registers::register_bit_width`, has a single caller outside its
+own file.
+
+And the failures the experiment produces are not width failures. Naming by place
+breaks `x86-64 -O0` with
+
+    error: use of undeclared identifier 't11f00_4'
+
+on `fnv1a32`, `djb2` and `sdbm` alike -- an undefined *temporary*, in the Unique
+space, which register naming does not touch. The location model does not fail
+because names stop carrying widths. It fails because merging values onto fewer
+names multiplies the undefined-name defect that this document traces everywhere
+else: a value inlined by one layer and named by another.
+
+**So the ordering is the other way round again.** The location model is blocked on
+the inline-versus-name disagreement, not on narrow-access expression, and that
+disagreement is the same defect as `eax_12`, `eax_8`, `ecx_9` and `tmp_4700_7`.
+It is one defect standing in front of the model, not a separate prerequisite.
 
 The prerequisite for the location model is therefore expressing narrow access
 explicitly -- a read of four bytes at the `RDI` location has to say so in the
