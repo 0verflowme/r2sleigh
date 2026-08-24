@@ -4167,8 +4167,24 @@ times.
 What separates them is where the value is defined: `EAX_12` is defined in the
 returning block, `ECX_9` in a predecessor. A value the returning block computes
 is that block's answer; a value merged into it from elsewhere is spelled by its
-carrier. That is a checkable rule and it is the one to try next -- not another
-preference between carriers and values, which is the shape that keeps failing. Narrowing it to
+carrier. That is a checkable rule, and checking it closes the loop rather than
+opening a fix.
+
+`ECX_9` cannot be spelled by its carrier, because it is not one of the carrier's
+members: the members are `RCX_2`, `RCX_3` and `RCX_14`, all sixty-four bits, and
+`ECX_9` is thirty-two. `varnode_to_name` keys the register map by
+`(offset, size)`, so `ecx` and `rcx` are two storages and nothing connects them.
+
+**So `adler32`'s remaining half is downstream of the location model.** The rule
+that would fix it needs one name per place with width carried separately, which
+is the model this branch is named for -- and that model's own prerequisite,
+narrow access expressed in the value rather than the spelling, is measured above
+at 34 correct falling to 13 without it.
+
+That is the honest end of this trace. `adler32` is understood from the machine
+instruction to the missing declaration, both causes are named, one of them cannot
+be repaired until the location model lands, and the other must not be repaired
+alone because doing so returns a plausible wrong hash. Narrowing it to
 exclude a block that writes the return register itself was built and measured
 twice: the coarse form takes arm64 from thirteen correct to nine, because a loop
 latch writing `w0` in the returning block *is* the carrier; excluding carrier
