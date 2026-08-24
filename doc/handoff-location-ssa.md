@@ -150,6 +150,33 @@ The corpus is the instrument in the meantime, and it is the better one: it
 measures rendered output against source directly rather than asking the
 decompiler to report on itself.
 
+### x86-64 -O2 renders an unrolled loop and its remainder as two variables
+
+`fnv1a32` at x86-64 -O2 is compiled as a four-way unrolled loop with a remainder
+loop after it. Both bodies render **correctly** -- the unrolled one chains
+`arg0[i]`, `(arg0+1)[i]`, `(arg0+2)[i]`, `(arg0+3)[i]` through the FNV multiply
+-- and they use two different accumulators:
+
+    do { ... rax = (int64_t)(uint32_t)t4c780_5; ... }        the unrolled loop
+    do { ... rax_1000005f0 = ...; }                          the remainder
+
+Nothing ever gives `rax_1000005f0` the value `rax` reached, so the remainder
+starts from nothing. `carrier_name_aliases` is what names them apart: two
+carriers over one register are two variables and the second takes a
+header-suffixed name. That is right when the loops are independent and wrong
+here, where one continues the other.
+
+Detecting the continuation through the second carrier's `entries` -- looking each
+entry value up in the aliases built so far -- was tried and is inert. The link
+between the two carriers is not through `entries`, so the next question is what
+does connect them: the exit merge of the first, the `updates` of the second, or
+neither, in which case the certification treats them as unrelated and that is
+where to look.
+
+The same rendering has a second defect worth separating: the unrolled loop's
+condition is `while ((arg1 & -0x4) != 0)`, which never changes, so the loop as
+written does not terminate.
+
 ### Four renderings have no return at all, and the loop above it is correct
 
 The harness scored these as wrong values. They are not: a non-void function that
