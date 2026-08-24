@@ -134,7 +134,6 @@ pub(crate) struct UseInfo {
     pub(crate) use_counts_by_value: BTreeMap<ValueId, usize>,
     /// Condition codes as this target's register file defines them.
     pub(crate) flag_regs: std::collections::HashSet<String>,
-    pub(crate) definitions: HashMap<String, CExpr>,
     pub(crate) definitions_by_value: BTreeMap<ValueId, CExpr>,
     pub(crate) producers: HashMap<String, r2ssa::SSAOp>,
     pub(crate) semantic_values_by_value: BTreeMap<ValueId, SemanticValue>,
@@ -685,13 +684,11 @@ impl UseInfo {
     }
 
     pub(crate) fn insert_definition_for_var(&mut self, var: &SSAVar, expr: CExpr) {
-        let display = var.display_name();
         if let Some(value_id) = self.value_id_for_var(var) {
-            self.definitions_by_value.insert(value_id, expr.clone());
+            self.definitions_by_value.insert(value_id, expr);
         } else {
             *self.unkeyed_writes.entry("definitions").or_default() += 1;
         }
-        self.definitions.insert(display, expr);
     }
 
     pub(crate) fn insert_stack_slot_for_var(&mut self, var: &SSAVar, slot: StackSlotProvenance) {
@@ -857,6 +854,7 @@ impl UseInfo {
             return None;
         }
         self.value_id_for_var(var)
+            .or_else(|| self.value_id_for_name(&var.display_name()))
             .and_then(|value_id| self.definitions_by_value.get(&value_id))
     }
 
@@ -890,10 +888,7 @@ impl UseInfo {
     /// the identity here -- a name can be ambiguous and a value cannot -- so the
     /// value-keyed store wins, as it does everywhere else.
     pub(crate) fn render_definition_for_value(&self, value_id: ValueId) -> Option<&CExpr> {
-        self.definition_for_value(value_id).or_else(|| {
-            self.var_for_value_id(value_id)
-                .and_then(|var| lookup_name_key(&self.definitions, &var.display_name()))
-        })
+        self.definition_for_value(value_id)
     }
 
     pub(crate) fn definition_for_name(&self, name: &str) -> Option<&CExpr> {
@@ -912,7 +907,7 @@ impl UseInfo {
     }
 
     pub(crate) fn render_definition_for_name(&self, name: &str) -> Option<&CExpr> {
-        lookup_name_key(&self.definitions, name).or_else(|| self.definition_for_name(name))
+        self.definition_for_name(name)
     }
 
     pub(crate) fn semantic_value_for_var(&self, var: &SSAVar) -> Option<&SemanticValue> {
@@ -1006,8 +1001,7 @@ impl UseInfo {
     }
 
     pub(crate) fn has_renderable_named_fact(&self, name: &str) -> bool {
-        lookup_name_key(&self.definitions, name).is_some()
-            || lookup_name_key(&self.var_aliases, name).is_some()
+        lookup_name_key(&self.var_aliases, name).is_some()
             || self.value_id_for_name(name).is_some_and(|value_id| {
                 self.definitions_by_value.contains_key(&value_id)
                     || self.semantic_values_by_value.contains_key(&value_id)
@@ -1019,11 +1013,48 @@ impl UseInfo {
     ///
     /// A caller that filters these does not need them copied first, and copying
     /// them costs one allocation per name on every question asked.
-    pub(crate) fn named_values(&self) -> impl Iterator<Item = &str> {
-        self.definitions
+    pub(crate) fn named_values(&self) -> impl Iterator<Item = String> + '_ {
+        let names = self.names_by_value_id();
+        self.definitions_by_value
             .keys()
-            .chain(self.var_aliases.keys())
-            .map(String::as_str)
+            .filter_map(move |value_id| names.get(value_id).cloned())
+            .chain(self.var_aliases.keys().cloned())
+    }
+
+    /// A spelling for each value, preferring the variable that owns it.
+    ///
+    /// A value bound only through a name -- which is how a caller holding a
+    /// spelling reaches one -- has no variable to recover the spelling from, so
+    /// the name binding answers instead.
+    fn names_by_value_id(&self) -> BTreeMap<ValueId, String> {
+        let mut names = BTreeMap::new();
+        for (name, value_id) in &self.value_ids_by_name {
+            names.entry(*value_id).or_insert_with(|| name.clone());
+        }
+        for (value_id, var) in &self.vars_by_value_id {
+            names.insert(*value_id, var.display_name());
+        }
+        names
+    }
+
+    /// Every definition with a name for the value it defines.
+    pub(crate) fn definitions_with_names(&self) -> impl Iterator<Item = (String, &CExpr)> + '_ {
+        let names = self.names_by_value_id();
+        self.definitions_by_value
+            .iter()
+            .filter_map(move |(value_id, expr)| {
+                names.get(value_id).cloned().map(|name| (name, expr))
+            })
+    }
+
+    /// File a definition against the value a spelling names, if it has none.
+    pub(crate) fn insert_definition_for_name_if_absent(&mut self, name: &str, expr: CExpr) {
+        match self.value_id_for_name_or_bind(name) {
+            Some(value_id) => {
+                self.definitions_by_value.entry(value_id).or_insert(expr);
+            }
+            None => *self.unkeyed_writes.entry("definitions").or_default() += 1,
+        }
     }
 
     /// Merge a stack-slot fact into whatever this value already had.

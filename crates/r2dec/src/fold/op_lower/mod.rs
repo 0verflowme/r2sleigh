@@ -1700,8 +1700,14 @@ impl<'a> FoldingContext<'a> {
     pub(crate) fn use_count_of(&self, name: &str) -> usize {
         self.use_info().use_count_for_name(name)
     }
-    pub(crate) fn definitions_map(&self) -> &HashMap<String, CExpr> {
-        &self.use_info().definitions
+    /// What defines a value, asked by one of its names.
+    pub(crate) fn definition_of(&self, name: &str) -> Option<CExpr> {
+        self.use_info().definition_for_name(name).cloned().or_else(|| {
+            // The caller may hold the rendered spelling; the symbol table knows
+            // which SSA name it was minted for, and refuses when more than one.
+            let ssa = self.ssa_name_for_spelling(name)?;
+            self.use_info().definition_for_name(&ssa).cloned()
+        })
     }
     pub(crate) fn frame_slot_merges_map(
         &self,
@@ -2673,7 +2679,7 @@ impl<'a> FoldingContext<'a> {
             .or_else(|| {
                 analysis::utils::extract_stack_offset_from_var(&symbols, 
                     var,
-                    self.definitions_map(),
+                    &|name: &str| self.definition_of(name),
                     &self.inputs.arch.fp_name,
                     &self.inputs.arch.sp_name,
                 )
@@ -9909,6 +9915,21 @@ impl<'a> FoldingContext<'a> {
             || lower.starts_with("eip_")
     }
 
+    /// The SSA display name a rendered spelling was minted for.
+    ///
+    /// Facts are filed under SSA names; a caller may hold the rendered form
+    /// instead. Binding both spellings into the name map answers this too and is
+    /// wrong -- a rendered spelling two values share then resolves to one of
+    /// them, which reintroduced a non-terminating copy chain at arm64 -O1. The
+    /// symbol table records which SSA value each identifier was minted for and
+    /// says `Ambiguous` when there was more than one, so it refuses exactly
+    /// where the map answered.
+    pub(crate) fn ssa_name_for_spelling(&self, spelling: &str) -> Option<std::rc::Rc<str>> {
+        let symbols = self.symbols.borrow();
+        let id = symbols.by_name(spelling)?;
+        symbols.ssa_name(id)
+    }
+
     pub(super) fn lookup_definition(&self, name: &str) -> Option<CExpr> {
 
         if !self.enter_resolution_guard(ResolutionPhase::Definition, name) {
@@ -10281,8 +10302,8 @@ impl<'a> FoldingContext<'a> {
             let mut grouped: std::collections::BTreeMap<u32, Vec<String>> =
                 std::collections::BTreeMap::new();
             for ssa_name in self.use_info().named_values() {
-                let (_, version) = Self::ssa_name_parts(ssa_name);
-                grouped.entry(version).or_default().push(ssa_name.to_string());
+                let (_, version) = Self::ssa_name_parts(&ssa_name);
+                grouped.entry(version).or_default().push(ssa_name);
             }
             grouped
         });

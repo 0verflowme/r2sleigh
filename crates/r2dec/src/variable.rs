@@ -511,7 +511,13 @@ impl VariableRecovery {
         {
             return Some(offset);
         }
-        utils::extract_stack_offset_from_var(symbols, addr, definitions, &self.fp_name, &self.sp_name)
+        utils::extract_stack_offset_from_var(
+            symbols,
+            addr,
+            &|name: &str| definitions.get(name).cloned(),
+            &self.fp_name,
+            &self.sp_name,
+        )
     }
 
     fn collect_definitions(

@@ -1689,8 +1689,7 @@ mod tests {
         ctx.state
             .analysis_ctx
             .use_info
-            .definitions
-            .insert("tmp:1_0".to_string(), CExpr::IntLit(42));
+            .insert_definition_for_name_if_absent("tmp:1_0", CExpr::IntLit(42));
 
         assert_eq!(
             ctx.normalize_call_arg_expr_with_import_policy(
@@ -2726,9 +2725,7 @@ mod tests {
             .use_info
             .call_result_exprs
             .insert(source_call, ctx.name_ref("not_a_call"));
-        ctx.state.analysis_ctx.use_info.definitions.insert(
-            "X20_1".to_string(),
-            CExpr::call(
+        ctx.state.analysis_ctx.use_info.insert_definition_for_name_if_absent("X20_1", CExpr::call(
                 CExpr::External {
                     name: "sym.imp.one_arg".to_string(),
                     kind: crate::symbol::ExternalKind::Import,
@@ -3609,9 +3606,7 @@ mod tests {
             .use_info
             .var_aliases
             .insert(owner.display_name(), "buf".to_string());
-        ctx.state.analysis_ctx.use_info.definitions.insert(
-            shadow.display_name(),
-            CExpr::call(
+        ctx.state.analysis_ctx.use_info.insert_definition_for_name_if_absent(&shadow.display_name(), CExpr::call(
                 CExpr::External {
                     name: "sym.imp.malloc".to_string(),
                     kind: crate::symbol::ExternalKind::Import,
@@ -4591,8 +4586,7 @@ mod tests {
             ctx.state
                 .analysis_ctx
                 .use_info
-                .definitions
-                .insert(var.display_name(), CExpr::IntLit(1));
+                .insert_definition_for_name_if_absent(&var.display_name(), CExpr::IntLit(1));
         }
 
         let mut ctx = FoldingContext::new(64);
@@ -4687,8 +4681,7 @@ mod tests {
         ctx.state
             .analysis_ctx
             .use_info
-            .definitions
-            .insert(single_ordinary.display_name(), CExpr::IntLit(7));
+            .insert_definition_for_name_if_absent(&single_ordinary.display_name(), CExpr::IntLit(7));
         assert!(ctx.should_inline(&single_ordinary));
 
         // Leaving the statement out says the reader will inline the value, so a
@@ -4707,8 +4700,7 @@ mod tests {
         ctx.state
             .analysis_ctx
             .use_info
-            .definitions
-            .insert(return_reg.display_name(), CExpr::IntLit(9));
+            .insert_definition_for_name_if_absent(&return_reg.display_name(), CExpr::IntLit(9));
         assert!(ctx.should_inline(&return_reg));
         ctx.state.return_blocks.insert(0x2000);
         ctx.current_block_addr.set(Some(0x2000));
@@ -4760,9 +4752,7 @@ mod tests {
             .collect(),
             ..Default::default()
         }));
-        ctx.state.analysis_ctx.use_info.definitions.insert(
-            ret.display_name(),
-            CExpr::binary(
+        ctx.state.analysis_ctx.use_info.insert_definition_for_name_if_absent(&ret.display_name(), CExpr::binary(
                 BinaryOp::Add,
                 CExpr::Deref(Box::new(CExpr::binary(
                     BinaryOp::Add,
@@ -4835,9 +4825,7 @@ mod tests {
             .collect(),
             ..Default::default()
         }));
-        ctx.state.analysis_ctx.use_info.definitions.insert(
-            ret.display_name(),
-            CExpr::binary(
+        ctx.state.analysis_ctx.use_info.insert_definition_for_name_if_absent(&ret.display_name(), CExpr::binary(
                 BinaryOp::Add,
                 CExpr::Deref(Box::new(CExpr::binary(
                     BinaryOp::Add,
@@ -4880,13 +4868,9 @@ mod tests {
                 is_sub: false,
             },
         );
-        ctx.state.analysis_ctx.use_info.definitions.insert(
-            bogus_index.display_name(),
-            ctx.name_ref("local_8"),
+        ctx.state.analysis_ctx.use_info.insert_definition_for_name_if_absent(&bogus_index.display_name(), ctx.name_ref("local_8"),
         );
-        ctx.state.analysis_ctx.use_info.definitions.insert(
-            addr.display_name(),
-            CExpr::binary(
+        ctx.state.analysis_ctx.use_info.insert_definition_for_name_if_absent(&addr.display_name(), CExpr::binary(
                 BinaryOp::Add,
                 ctx.name_ref("arg1"),
                 CExpr::binary(
@@ -4909,8 +4893,7 @@ mod tests {
         ctx.state
             .analysis_ctx
             .use_info
-            .definitions
-            .insert(real_index.display_name(), ctx.name_ref("local_c"));
+            .insert_definition_for_name_if_absent(&real_index.display_name(), ctx.name_ref("local_c"));
         ctx.state.analysis_ctx.use_info.insert_semantic_value_for_name(&real_index.display_name(), crate::analysis::SemanticValue::Scalar(crate::analysis::ScalarValue::Expr(CExpr::Var(
                 { let CExpr::Var(id) = ctx.name_ref("local_c") else { unreachable!() }; id },
             ))),
@@ -5101,9 +5084,7 @@ mod tests {
             .use_info
             .ptr_members
             .insert(addr.display_name(), (base.clone(), 8));
-        ctx.state.analysis_ctx.use_info.definitions.insert(
-            base.display_name(),
-            CExpr::binary(
+        ctx.state.analysis_ctx.use_info.insert_definition_for_name_if_absent(&base.display_name(), CExpr::binary(
                 BinaryOp::Add,
                 ctx.name_ref("arg1"),
                 CExpr::binary(
@@ -5165,9 +5146,7 @@ mod tests {
             .use_info
             .type_hints
             .insert("arg2".to_string(), CType::Int(32));
-        ctx.state.analysis_ctx.use_info.definitions.insert(
-            addr.display_name(),
-            CExpr::binary(
+        ctx.state.analysis_ctx.use_info.insert_definition_for_name_if_absent(&addr.display_name(), CExpr::binary(
                 BinaryOp::Add,
                 ctx.name_ref("arg1"),
                 CExpr::binary(
@@ -5227,9 +5206,7 @@ mod tests {
             .use_info
             .type_hints
             .insert("i".to_string(), CType::u64());
-        ctx.state.analysis_ctx.use_info.definitions.insert(
-            addr.display_name(),
-            CExpr::binary(
+        ctx.state.analysis_ctx.use_info.insert_definition_for_name_if_absent(&addr.display_name(), CExpr::binary(
                 BinaryOp::Add,
                 ctx.name_ref("i"),
                 ctx.name_ref("buf"),
@@ -5420,9 +5397,7 @@ mod tests {
             .use_info
             .ptr_members
             .insert(addr.display_name(), (base.clone(), 8));
-        ctx.state.analysis_ctx.use_info.definitions.insert(
-            base.display_name(),
-            CExpr::binary(
+        ctx.state.analysis_ctx.use_info.insert_definition_for_name_if_absent(&base.display_name(), CExpr::binary(
                 BinaryOp::Add,
                 ctx.name_ref("arr"),
                 CExpr::binary(
@@ -5993,9 +5968,7 @@ mod tests {
             .collect(),
             ..Default::default()
         }));
-        ctx.state.analysis_ctx.use_info.definitions.insert(
-            "local_c".to_string(),
-            CExpr::binary(
+        ctx.state.analysis_ctx.use_info.insert_definition_for_name_if_absent("local_c", CExpr::binary(
                 BinaryOp::Add,
                 ctx.name_ref("arr"),
                 CExpr::binary(
@@ -6513,17 +6486,13 @@ mod tests {
             .stack_info
             .stack_vars
             .insert(-4, "value".to_string());
-        ctx.state.analysis_ctx.use_info.definitions.insert(
-            "tmp:cond_1".to_string(),
-            CExpr::binary(
+        ctx.state.analysis_ctx.use_info.insert_definition_for_name_if_absent("tmp:cond_1", CExpr::binary(
                 BinaryOp::Eq,
                 ctx.name_ref("result"),
                 CExpr::IntLit(25),
             ),
         );
-        ctx.state.analysis_ctx.use_info.definitions.insert(
-            "result".to_string(),
-            CExpr::Deref(Box::new(CExpr::binary(
+        ctx.state.analysis_ctx.use_info.insert_definition_for_name_if_absent("result", CExpr::Deref(Box::new(CExpr::binary(
                 BinaryOp::Add,
                 ctx.name_ref("rbp_1"),
                 CExpr::IntLit(-4),
@@ -6551,17 +6520,13 @@ mod tests {
             .stack_info
             .stack_vars
             .insert(-4, "value".to_string());
-        ctx.state.analysis_ctx.use_info.definitions.insert(
-            "tmp:cond_1".to_string(),
-            CExpr::binary(
+        ctx.state.analysis_ctx.use_info.insert_definition_for_name_if_absent("tmp:cond_1", CExpr::binary(
                 BinaryOp::Eq,
                 ctx.name_ref("result"),
                 CExpr::IntLit(19),
             ),
         );
-        ctx.state.analysis_ctx.use_info.definitions.insert(
-            "result".to_string(),
-            CExpr::Paren(Box::new(CExpr::Cast {
+        ctx.state.analysis_ctx.use_info.insert_definition_for_name_if_absent("result", CExpr::Paren(Box::new(CExpr::Cast {
                 ty: CType::ptr(CType::Int(32)),
                 expr: Box::new(CExpr::Deref(Box::new(CExpr::Paren(Box::new(
                     CExpr::binary(
@@ -6585,17 +6550,13 @@ mod tests {
     #[test]
     fn test_condition_var_chain_non_stack_remains_unforced() {
         let mut ctx = FoldingContext::new(64);
-        ctx.state.analysis_ctx.use_info.definitions.insert(
-            "tmp:cond_1".to_string(),
-            CExpr::binary(
+        ctx.state.analysis_ctx.use_info.insert_definition_for_name_if_absent("tmp:cond_1", CExpr::binary(
                 BinaryOp::Eq,
                 ctx.name_ref("result"),
                 CExpr::IntLit(19),
             ),
         );
-        ctx.state.analysis_ctx.use_info.definitions.insert(
-            "result".to_string(),
-            CExpr::binary(
+        ctx.state.analysis_ctx.use_info.insert_definition_for_name_if_absent("result", CExpr::binary(
                 BinaryOp::Add,
                 ctx.name_ref("arg1"),
                 CExpr::IntLit(1),
@@ -6617,8 +6578,7 @@ mod tests {
         ctx.state
             .analysis_ctx
             .use_info
-            .definitions
-            .insert("tmp:foo_2".to_string(), ctx.name_ref("local_4"));
+            .insert_definition_for_name_if_absent("tmp:foo_2", ctx.name_ref("local_4"));
         ctx.state
             .analysis_ctx
             .use_info
@@ -6632,9 +6592,7 @@ mod tests {
     #[test]
     fn test_lookup_definition_resolves_hex_temp_alias_without_explicit_var_alias() {
         let mut ctx = FoldingContext::new(64);
-        ctx.state.analysis_ctx.use_info.definitions.insert(
-            "tmp:11f80_19".to_string(),
-            CExpr::binary(
+        ctx.state.analysis_ctx.use_info.insert_definition_for_name_if_absent("tmp:11f80_19", CExpr::binary(
                 BinaryOp::Add,
                 CExpr::UIntLit(0x100002000),
                 CExpr::IntLit(0x638),
@@ -6658,18 +6616,15 @@ mod tests {
         ctx.state
             .analysis_ctx
             .use_info
-            .definitions
-            .insert("tmp:raw_2".to_string(), CExpr::IntLit(1));
+            .insert_definition_for_name_if_absent("tmp:raw_2", CExpr::IntLit(1));
         ctx.state
             .analysis_ctx
             .use_info
-            .definitions
-            .insert("value_2".to_string(), CExpr::IntLit(2));
+            .insert_definition_for_name_if_absent("value_2", CExpr::IntLit(2));
         ctx.state
             .analysis_ctx
             .use_info
-            .definitions
-            .insert("TMP:raw_2".to_string(), CExpr::IntLit(3));
+            .insert_definition_for_name_if_absent("TMP:raw_2", CExpr::IntLit(3));
 
         let temp_matches = ctx.ssa_names_for_lowered_temp_alias("t2");
         assert!(
@@ -6702,13 +6657,10 @@ mod tests {
         ctx.state
             .analysis_ctx
             .use_info
-            .definitions
-            .insert("tmp:ret_1".to_string(), ctx.name_ref("rax_2"));
-        ctx.state
-            .analysis_ctx
-            .use_info
-            .definitions
-            .insert("src_1".to_string(), ctx.name_ref("arg1"));
+            .insert_definition_for_name_if_absent("src_1", ctx.name_ref("arg1"));
+        // Bind before filing anything about `tmp:ret_1`: filing under a name
+        // mints an identity, and a later bind of the same spelling would collide
+        // and make the name ambiguous.
         let ret = r2ssa::SSAVar::new("tmp:ret", 1, 8);
         assert_eq!(
             ctx.state
@@ -6717,6 +6669,11 @@ mod tests {
                 .bind_value_id(&ret, r2ssa::ValueId(902)),
             Some(r2ssa::ValueId(902))
         );
+        let rax_2 = ctx.name_ref("rax_2");
+        ctx.state
+            .analysis_ctx
+            .use_info
+            .insert_definition_for_name_if_absent("tmp:ret_1", rax_2);
         ctx.state
             .analysis_ctx
             .use_info
@@ -6740,13 +6697,11 @@ mod tests {
         ctx.state
             .analysis_ctx
             .use_info
-            .definitions
-            .insert("sf_1".to_string(), ctx.name_ref("sf_2"));
+            .insert_definition_for_name_if_absent("sf_1", ctx.name_ref("sf_2"));
         ctx.state
             .analysis_ctx
             .use_info
-            .definitions
-            .insert("sf_2".to_string(), ctx.name_ref("sf_1"));
+            .insert_definition_for_name_if_absent("sf_2", ctx.name_ref("sf_1"));
 
         assert!(
             !ctx.is_sf_surrogate(&ctx.name_ref("sf_1")),
@@ -8312,9 +8267,7 @@ mod tests {
         let saved = make_var("TMP:saved", 1, 8);
         // The temp has to point into the frame. Accepting any temp is what let
         // a field load into a callee-saved register pass as an epilogue pop.
-        ctx.state.analysis_ctx.use_info.definitions.insert(
-            addr.display_name(),
-            CExpr::binary(BinaryOp::Sub, ctx.name_ref("rsp"), CExpr::IntLit(0x20)),
+        ctx.state.analysis_ctx.use_info.insert_definition_for_name_if_absent(&addr.display_name(), CExpr::binary(BinaryOp::Sub, ctx.name_ref("rsp"), CExpr::IntLit(0x20)),
         );
         let rbx_1 = r2ssa::SSAVar::new("RBX", 1, 8);
         let info = &mut ctx.state.analysis_ctx.use_info;
@@ -8345,9 +8298,7 @@ mod tests {
         // A field load into a callee-saved register through a temp that does
         // not point into the frame is program text, not an epilogue restore.
         let field = make_var("tmp:field", 1, 8);
-        ctx.state.analysis_ctx.use_info.definitions.insert(
-            field.display_name(),
-            CExpr::binary(BinaryOp::Add, ctx.name_ref("RBX_1"), CExpr::IntLit(0x38)),
+        ctx.state.analysis_ctx.use_info.insert_definition_for_name_if_absent(&field.display_name(), CExpr::binary(BinaryOp::Add, ctx.name_ref("RBX_1"), CExpr::IntLit(0x38)),
         );
         assert!(!ctx.is_stack_frame_op(&SSAOp::Load {
             dst: make_var("RBX", 2, 8),
@@ -8454,8 +8405,7 @@ mod tests {
         ctx.state
             .analysis_ctx
             .use_info
-            .definitions
-            .insert("X20_1".to_string(), poisoned_call.clone());
+            .insert_definition_for_name_if_absent("X20_1", poisoned_call.clone());
         mark_use_by_name(&mut ctx, "x20_1", 1);
 
         assert_eq!(
@@ -8486,8 +8436,7 @@ mod tests {
         ctx.state
             .analysis_ctx
             .use_info
-            .definitions
-            .insert("X20_1".to_string(), definition_expr);
+            .insert_definition_for_name_if_absent("X20_1", definition_expr);
         mark_use_by_name(&mut ctx, "x20_1", 1);
 
         ctx.materializable_call_result_expr_for_call_expr(source_call, &source_expr)
@@ -8523,8 +8472,7 @@ mod tests {
         ctx.state
             .analysis_ctx
             .use_info
-            .definitions
-            .insert("X20_1".to_string(), definition_expr);
+            .insert_definition_for_name_if_absent("X20_1", definition_expr);
         mark_use_by_name(&mut ctx, "x20_1", 1);
 
         assert_eq!(
@@ -8637,8 +8585,7 @@ mod tests {
         ctx.state
             .analysis_ctx
             .use_info
-            .definitions
-            .insert("X20_1".to_string(), helper_call.clone());
+            .insert_definition_for_name_if_absent("X20_1", helper_call.clone());
         mark_use_by_name(&mut ctx, "x20_1", 1);
 
         assert_eq!(
@@ -8953,9 +8900,7 @@ mod tests {
             .value;
         let val = prepared.value_var(value).expect("call result var").clone();
         let addr = make_var("tmp:stack_home", 1, 8);
-        ctx.state.analysis_ctx.use_info.definitions.insert(
-            addr.display_name(),
-            CExpr::binary(
+        ctx.state.analysis_ctx.use_info.insert_definition_for_name_if_absent(&addr.display_name(), CExpr::binary(
                 BinaryOp::Add,
                 ctx.name_ref("rbp"),
                 CExpr::IntLit(-8),
@@ -9586,9 +9531,7 @@ mod tests {
                 size: 4,
             },
         );
-        ctx.state.analysis_ctx.use_info.definitions.insert(
-            ret.display_name(),
-            CExpr::binary(
+        ctx.state.analysis_ctx.use_info.insert_definition_for_name_if_absent(&ret.display_name(), CExpr::binary(
                 BinaryOp::Add,
                 ctx.name_ref(&load_first.display_name()),
                 ctx.name_ref(&load_second.display_name()),
@@ -9689,9 +9632,7 @@ mod tests {
             .use_info
             .var_aliases
             .insert("ECX_1".to_string(), "ecx".to_string());
-        ctx.state.analysis_ctx.use_info.definitions.insert(
-            "ecx".to_string(),
-            CExpr::binary(
+        ctx.state.analysis_ctx.use_info.insert_definition_for_name_if_absent("ecx", CExpr::binary(
                 BinaryOp::BitXor,
                 ctx.name_ref("ecx"),
                 ctx.name_ref("ecx"),
@@ -11358,9 +11299,7 @@ mod tests {
     #[test]
     fn return_inline_ssa_storage_carriers_inline_raw_tmp_and_const() {
         let mut ctx = make_x86_64_ctx();
-        ctx.state.analysis_ctx.use_info.definitions.insert(
-            "tmp:ret_1".to_string(),
-            CExpr::binary(
+        ctx.state.analysis_ctx.use_info.insert_definition_for_name_if_absent("tmp:ret_1", CExpr::binary(
                 BinaryOp::BitXor,
                 ctx.name_ref("value"),
                 CExpr::IntLit(1),
@@ -11369,8 +11308,7 @@ mod tests {
         ctx.state
             .analysis_ctx
             .use_info
-            .definitions
-            .insert("const:1_0".to_string(), CExpr::IntLit(1));
+            .insert_definition_for_name_if_absent("const:1_0", CExpr::IntLit(1));
 
         assert_eq!(
             ctx.resolve_return_candidate(&ctx.name_ref("tmp:ret_1")),
@@ -11394,8 +11332,7 @@ mod tests {
             .state
             .analysis_ctx
             .use_info
-            .definitions
-            .insert("tmp:3e480_1".to_string(), CExpr::IntLit(7));
+            .insert_definition_for_name_if_absent("tmp:3e480_1", CExpr::IntLit(7));
 
         assert_eq!(
             unmapped.expand_return_expr(
@@ -11413,8 +11350,7 @@ mod tests {
             .state
             .analysis_ctx
             .use_info
-            .definitions
-            .insert("ordinary_alias".to_string(), CExpr::IntLit(9));
+            .insert_definition_for_name_if_absent("ordinary_alias", CExpr::IntLit(9));
         assert_eq!(
             unmapped.expand_return_expr(
                 &unmapped.name_ref("ordinary_alias"),
@@ -11429,8 +11365,7 @@ mod tests {
             .state
             .analysis_ctx
             .use_info
-            .definitions
-            .insert("tmp:3e480_1".to_string(), CExpr::IntLit(7));
+            .insert_definition_for_name_if_absent("tmp:3e480_1", CExpr::IntLit(7));
         mapped
             .state
             .analysis_ctx
@@ -11537,8 +11472,7 @@ mod tests {
         ctx.state
             .analysis_ctx
             .use_info
-            .definitions
-            .insert(source.display_name(), ctx.name_ref("stack_slot"));
+            .insert_definition_for_name_if_absent(&source.display_name(), ctx.name_ref("stack_slot"));
 
         let binding = crate::analysis::CallArgBinding::input(
             crate::analysis::SemanticCallArg::FallbackExpr(ctx.name_ref("fallback")),
@@ -11571,8 +11505,7 @@ mod tests {
             ctx.state
                 .analysis_ctx
                 .use_info
-                .definitions
-                .insert(source.display_name(), bad_expr);
+                .insert_definition_for_name_if_absent(&source.display_name(), bad_expr);
 
             let binding = crate::analysis::CallArgBinding::input(
                 crate::analysis::SemanticCallArg::FallbackExpr(ctx.name_ref("fallback")),
@@ -11600,8 +11533,7 @@ mod tests {
             ctx.state
                 .analysis_ctx
                 .use_info
-                .definitions
-                .insert(source.display_name(), bad_expr);
+                .insert_definition_for_name_if_absent(&source.display_name(), bad_expr);
             let binding = crate::analysis::CallArgBinding::input(
                 crate::analysis::SemanticCallArg::FallbackExpr(ctx.name_ref("fallback")),
             )
@@ -11622,8 +11554,7 @@ mod tests {
         ctx.state
             .analysis_ctx
             .use_info
-            .definitions
-            .insert(source.display_name(), ctx.name_ref("rax_7"));
+            .insert_definition_for_name_if_absent(&source.display_name(), ctx.name_ref("rax_7"));
         let __fixture_args = (
             &source.display_name(),
             CExpr::AddrOf(Box::new(ctx.name_ref("buf"))),
@@ -11653,8 +11584,7 @@ mod tests {
         ctx.state
             .analysis_ctx
             .use_info
-            .definitions
-            .insert(source.display_name(), ctx.name_ref("buf"));
+            .insert_definition_for_name_if_absent(&source.display_name(), ctx.name_ref("buf"));
         ctx.state.analysis_ctx.use_info.formatted_defs.insert(
             source.display_name(),
             CExpr::call(ctx.name_ref("sym.imp.helper"), vec![]),
@@ -11679,8 +11609,7 @@ mod tests {
         ctx.state
             .analysis_ctx
             .use_info
-            .definitions
-            .insert(source.display_name(), stable_source.clone());
+            .insert_definition_for_name_if_absent(&source.display_name(), stable_source.clone());
         ctx.state
             .analysis_ctx
             .use_info
@@ -12442,9 +12371,7 @@ mod tests {
             .ownership
             .alias_sources
             .insert(rax.display_name(), CallSiteId::from(source_call));
-        ctx.state.analysis_ctx.use_info.definitions.insert(
-            slot.display_name(),
-            CExpr::binary(
+        ctx.state.analysis_ctx.use_info.insert_definition_for_name_if_absent(&slot.display_name(), CExpr::binary(
                 BinaryOp::Add,
                 ctx.name_ref("rbp"),
                 CExpr::IntLit(-8),
@@ -12490,9 +12417,7 @@ mod tests {
             .ownership
             .alias_sources
             .insert(rax.display_name(), CallSiteId::from(source_call));
-        ctx.state.analysis_ctx.use_info.definitions.insert(
-            slot.display_name(),
-            CExpr::binary(
+        ctx.state.analysis_ctx.use_info.insert_definition_for_name_if_absent(&slot.display_name(), CExpr::binary(
                 BinaryOp::Add,
                 ctx.name_ref("rbp"),
                 CExpr::IntLit(-8),
@@ -12535,17 +12460,13 @@ mod tests {
             .ownership
             .alias_sources
             .insert(rax.display_name(), CallSiteId::from(source_call));
-        ctx.state.analysis_ctx.use_info.definitions.insert(
-            stored_slot.display_name(),
-            CExpr::binary(
+        ctx.state.analysis_ctx.use_info.insert_definition_for_name_if_absent(&stored_slot.display_name(), CExpr::binary(
                 BinaryOp::Add,
                 ctx.name_ref("rbp"),
                 CExpr::IntLit(-8),
             ),
         );
-        ctx.state.analysis_ctx.use_info.definitions.insert(
-            loaded_slot.display_name(),
-            CExpr::binary(
+        ctx.state.analysis_ctx.use_info.insert_definition_for_name_if_absent(&loaded_slot.display_name(), CExpr::binary(
                 BinaryOp::Add,
                 ctx.name_ref("rbp"),
                 CExpr::IntLit(-16),
@@ -12581,9 +12502,7 @@ mod tests {
         let rax = make_var("rax", 1, 8);
         let slot = make_var("tmp:slot", 1, 8);
         let loaded = make_var("tmp:loaded", 1, 8);
-        ctx.state.analysis_ctx.use_info.definitions.insert(
-            slot.display_name(),
-            CExpr::binary(
+        ctx.state.analysis_ctx.use_info.insert_definition_for_name_if_absent(&slot.display_name(), CExpr::binary(
                 BinaryOp::Add,
                 ctx.name_ref("rbp"),
                 CExpr::IntLit(-8),
@@ -12723,9 +12642,7 @@ mod tests {
             "control-flow boundaries must block immediate call-home classification"
         );
 
-        ctx.state.analysis_ctx.use_info.definitions.insert(
-            addr.display_name(),
-            CExpr::binary(
+        ctx.state.analysis_ctx.use_info.insert_definition_for_name_if_absent(&addr.display_name(), CExpr::binary(
                 BinaryOp::Add,
                 ctx.name_ref("rbp"),
                 CExpr::IntLit(-8),
@@ -12769,9 +12686,7 @@ mod tests {
             .use_info
             .consumed_by_call
             .insert(addr.display_name());
-        ctx.state.analysis_ctx.use_info.definitions.insert(
-            addr.display_name(),
-            CExpr::binary(
+        ctx.state.analysis_ctx.use_info.insert_definition_for_name_if_absent(&addr.display_name(), CExpr::binary(
                 BinaryOp::Add,
                 ctx.name_ref("rbp"),
                 CExpr::IntLit(0),

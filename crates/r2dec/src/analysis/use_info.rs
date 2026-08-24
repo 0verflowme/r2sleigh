@@ -827,7 +827,7 @@ pub(crate) fn populate_frame_slot_merges(symbols: &std::cell::RefCell<crate::sym
             let Some(slot_offset) = prepared_offset.or_else(|| {
                 utils::extract_stack_offset_from_var(symbols, 
                     addr,
-                    &info.definitions,
+                    &|name: &str| info.definition_for_name(name).cloned(),
                     env.fp_name,
                     env.sp_name,
                 )
@@ -1972,7 +1972,6 @@ fn collect_definitions(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
                         symbols,
                         string_literals: env.string_literals,
                         use_info: Some(&scratch.info),
-                        definitions: &scratch.info.definitions,
                         pinned: &scratch.info.pinned,
                         var_aliases: &scratch.info.var_aliases,
                         param_register_aliases: env.param_register_aliases,
@@ -1992,7 +1991,7 @@ fn collect_definitions(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
             scratch.producers.insert(dst.display_name(), op.clone());
         }
 
-        if invalidates_block_stack_values(symbols, op, &scratch.info.definitions, env) {
+        if invalidates_block_stack_values(symbols, op, &scratch.info, env) {
             if is_call_like_stack_boundary_op(op) {
                 preserved_positive_stack_values = block_stack_values
                     .iter()
@@ -2026,8 +2025,6 @@ fn rebuild_definitions(
     env: &PassEnv<'_>,
     definition_overrides: &HashMap<String, CExpr>,
 ) {
-    let mut rebuilt = HashMap::new();
-
     for block in blocks {
         for op in &block.ops {
             let Some(dst) = op.dst() else {
@@ -2041,7 +2038,6 @@ fn rebuild_definitions(
                     symbols,
                     string_literals: env.string_literals,
                     use_info: Some(&scratch.info),
-                    definitions: &rebuilt,
                     pinned: &scratch.info.pinned,
                     var_aliases: &scratch.info.var_aliases,
                     param_register_aliases: env.param_register_aliases,
@@ -2052,11 +2048,14 @@ fn rebuild_definitions(
                 // rule that precedes it, so the resolver applies it.
                 lower.op_to_expr(op)
             };
-            rebuilt.insert(key, expr);
+            // Filed as it is built, so the next op in the block sees it. This
+            // accumulated into a local map that replaced the name-keyed store at
+            // the end; with one store, a definition the lowering wants has to be
+            // where the lowering looks.
+            let _ = key;
+            scratch.info.insert_definition_for_var(dst, expr);
         }
     }
-
-    scratch.info.definitions = rebuilt;
 }
 
 fn semantic_stack_store_value(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
@@ -2130,7 +2129,7 @@ fn merged_slot_store_value_for_pred(symbols: &std::cell::RefCell<crate::symbol::
                 .or_else(|| {
                     utils::extract_stack_offset_from_var(symbols, 
                         addr,
-                        &info.definitions,
+                        &|name: &str| info.definition_for_name(name).cloned(),
                         env.fp_name,
                         env.sp_name,
                     )
@@ -2584,7 +2583,7 @@ fn stack_slot_offset_for_addr(symbols: &std::cell::RefCell<crate::symbol::Symbol
         return None;
     }
 
-    utils::extract_stack_offset_from_var(symbols, addr, &info.definitions, env.fp_name, env.sp_name)
+    utils::extract_stack_offset_from_var(symbols, addr, &|name: &str| info.definition_for_name(name).cloned(), env.fp_name, env.sp_name)
 }
 
 fn stack_slot_offset_from_add_sub(
@@ -3353,7 +3352,7 @@ fn semantic_addr_for_var_with_depth(symbols: &std::cell::RefCell<crate::symbol::
     if !has_non_address_semantic
         && (copy_root != key || utils::is_temporary_name(&key))
         && let Some(offset) =
-            utils::extract_stack_offset_from_var(symbols, var, &info.definitions, env.fp_name, env.sp_name)
+            utils::extract_stack_offset_from_var(symbols, var, &|name: &str| info.definition_for_name(name).cloned(), env.fp_name, env.sp_name)
     {
         return Some(NormalizedAddr {
             base: BaseRef::StackSlot(offset),
@@ -3374,8 +3373,7 @@ fn semantic_addr_for_var_with_depth(symbols: &std::cell::RefCell<crate::symbol::
         });
     }
 
-    info.definitions
-        .get(&key)
+    info.definition_for_name(&key)
         .cloned()
         .map(|expr| NormalizedAddr {
             base: BaseRef::Raw(expr),
@@ -3660,7 +3658,7 @@ fn resolve_copy_root_name(info: &UseInfo, name: &str) -> String {
 
 fn invalidates_block_stack_values(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
     op: &SSAOp,
-    definitions: &HashMap<String, CExpr>,
+    info: &UseInfo,
     env: &PassEnv<'_>,
 ) -> bool {
     match op {
@@ -3668,7 +3666,7 @@ fn invalidates_block_stack_values(symbols: &std::cell::RefCell<crate::symbol::Sy
             space: SpaceId::Ram,
             addr,
             ..
-        } => utils::extract_stack_offset_from_var(symbols, addr, definitions, env.fp_name, env.sp_name)
+        } => utils::extract_stack_offset_from_var(symbols, addr, &|name: &str| info.definition_for_name(name).cloned(), env.fp_name, env.sp_name)
             .is_none(),
         SSAOp::Call { .. } | SSAOp::CallInd { .. } | SSAOp::CallOther { .. } => true,
         SSAOp::StoreConditional {
@@ -3731,11 +3729,10 @@ fn invalidates_semantic_stack_values(op: &SSAOp) -> bool {
 
 fn build_formatted_defs(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, scratch: &mut UseScratch, env: &PassEnv<'_>) {
     scratch.info.formatted_defs.clear();
-    let mut defs: Vec<_> = scratch
+    let mut defs: Vec<(String, CExpr)> = scratch
         .info
-        .definitions
-        .iter()
-        .map(|(ssa_key, expr)| (ssa_key.clone(), expr.clone()))
+        .definitions_with_names()
+        .map(|(ssa_key, expr)| (ssa_key, expr.clone()))
         .collect();
     defs.sort_by(|a, b| a.0.cmp(&b.0));
 
@@ -4659,7 +4656,6 @@ fn analyze_call_args(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, s
                 symbols,
                 string_literals: env.string_literals,
                 use_info: None,
-                definitions: &scratch.info.definitions,
                 pinned: &scratch.info.pinned,
                 var_aliases: &scratch.info.var_aliases,
                 param_register_aliases: env.param_register_aliases,
@@ -4893,7 +4889,6 @@ fn analyze_call_args(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, s
                     symbols,
                     string_literals: env.string_literals,
                     use_info: Some(&scratch.info),
-                    definitions: &scratch.info.definitions,
                     pinned: &scratch.info.pinned,
                     var_aliases: &scratch.info.var_aliases,
                     param_register_aliases: env.param_register_aliases,
@@ -4979,7 +4974,6 @@ fn bind_single_use_call_result_definitions(symbols: &std::cell::RefCell<crate::s
                 symbols,
                 string_literals: env.string_literals,
                 use_info: None,
-                definitions: &scratch.info.definitions,
                 pinned: &scratch.info.pinned,
                 var_aliases: &scratch.info.var_aliases,
                 param_register_aliases: env.param_register_aliases,
@@ -5077,7 +5071,6 @@ fn bind_call_result_alias_definitions(symbols: &std::cell::RefCell<crate::symbol
                     symbols,
                     string_literals: env.string_literals,
                     use_info: Some(info),
-                    definitions: &info.definitions,
                     pinned: &info.pinned,
                     var_aliases: &info.var_aliases,
                     param_register_aliases: env.param_register_aliases,
@@ -5604,7 +5597,7 @@ fn normalize_call_arg_var_for_definition(symbols: &std::cell::RefCell<crate::sym
             .and_then(|expr| {
                 normalize_call_arg_expr_for_definition(symbols, info, lower, expr, depth + 1, visited)
             })
-    } else if let Some(def) = lower.definitions.get(&name) {
+    } else if let Some(def) = info.definition_for_name(&name) {
         normalize_call_arg_expr_for_definition(symbols, info, lower, def.clone(), depth + 1, visited)
     } else if let Some(alias) = lower.var_aliases.get(&name) {
         Some(crate::symbol::var_ref(symbols, alias.clone()))
@@ -7450,22 +7443,7 @@ fn lookup_call_arg_semantic_value<'a>(info: &'a UseInfo, name: &str) -> Option<&
 
 fn lookup_call_arg_definition_expr(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, info: &UseInfo, name: &str) -> Option<CExpr> {
 
-    info.definitions
-        .get(name)
-        .cloned()
-        .or_else(|| info.definitions.get(&name.to_ascii_lowercase()).cloned())
-        .or_else(|| {
-            name.rsplit_once('_').and_then(|(base, version)| {
-                info.definitions
-                    .get(&format!("{}_{}", base.to_ascii_lowercase(), version))
-                    .cloned()
-                    .or_else(|| {
-                        info.definitions
-                            .get(&format!("{}_{}", base.to_ascii_uppercase(), version))
-                            .cloned()
-                    })
-            })
-        })
+    info.definition_for_name(name).cloned()
 }
 
 fn constish_call_arg_address(_expr: &CExpr, _env: &PassEnv<'_>) -> Option<u64> {
@@ -7710,7 +7688,7 @@ fn call_stack_arg_offset(symbols: &std::cell::RefCell<crate::symbol::SymbolTable
     }
 
     if let Some(offset) =
-        utils::extract_stack_offset_from_var(symbols, addr, &info.definitions, env.fp_name, env.sp_name)
+        utils::extract_stack_offset_from_var(symbols, addr, &|name: &str| info.definition_for_name(name).cloned(), env.fp_name, env.sp_name)
     {
         return Some(offset);
     }
@@ -8271,8 +8249,7 @@ mod tests {
         let spoofed_display = first.display_name();
 
         let mut info = UseInfo::default();
-        info.definitions
-            .insert(spoofed_display.clone(), CExpr::IntLit(99));
+        info.insert_definition_for_name_if_absent(&spoofed_display, CExpr::IntLit(99));
         assert_eq!(info.bind_value_id(&first, ValueId(1)), Some(ValueId(1)));
 
         assert_eq!(info.value_id_for_var(&second), None);
@@ -8285,17 +8262,18 @@ mod tests {
         assert_eq!(info.exact_value_id_for_var(&second), Some(ValueId(2)));
         assert_eq!(info.value_id_for_name(&spoofed_display), None);
         assert_eq!(info.definition_for_name(&spoofed_display), None);
-        assert_eq!(
-            info.render_definition_for_name(&spoofed_display),
-            Some(&CExpr::IntLit(88))
-        );
+        // The shared spelling answers nothing, by either route. There used to be
+        // a name-keyed store behind `render_definition_for_name` that answered
+        // with whichever of the two values wrote last, which is the confusion
+        // this test exists to catch; with one store keyed by identity there is
+        // nothing left to confuse.
+        assert_eq!(info.render_definition_for_name(&spoofed_display), None);
         assert_eq!(info.definitions_by_value.get(&ValueId(1)), None);
         assert_eq!(info.definitions_by_value.get(&ValueId(2)), None);
         assert_eq!(info.var_for_value_id(ValueId(1)), Some(&first));
         assert_eq!(info.var_for_value_id(ValueId(2)), Some(&second));
 
         info.insert_semantic_value_for_name(&spoofed_display, SemanticValue::Unknown);
-        rebuild_id_mirrors_from_name_maps(&mut info);
         assert_eq!(info.semantic_values_by_value.get(&ValueId(1)), None);
         assert_eq!(info.semantic_values_by_value.get(&ValueId(2)), None);
 
@@ -9409,7 +9387,6 @@ mod tests {
             symbols: &fixture.symbols,
             string_literals: env.string_literals,
             use_info: Some(&info),
-            definitions: &info.definitions,
             pinned: &info.pinned,
             var_aliases: &info.var_aliases,
             param_register_aliases: env.param_register_aliases,
@@ -9568,11 +9545,11 @@ mod tests {
         let info = analyze(&symbols, &[block], &env);
         assert!(
             matches!(
-                info.definitions.get("tmp:3a680_7"),
+                info.definition_for_name("tmp:3a680_7"),
                 Some(CExpr::Call { func, .. }) if **func == crate::symbol::var_ref(&symbols, "sym.imp.atoi")
             ),
             "expected copied W0 temp to bind to the imported call expression, got {:?}",
-            info.definitions.get("tmp:3a680_7")
+            info.definition_for_name("tmp:3a680_7")
         );
     }
 
@@ -9768,7 +9745,6 @@ mod tests {
             symbols: &symbols,
             string_literals: env.string_literals,
             use_info: None,
-            definitions: &info.definitions,
             pinned: &info.pinned,
             var_aliases: &info.var_aliases,
             param_register_aliases: env.param_register_aliases,
@@ -10160,26 +10136,24 @@ mod tests {
         let temp_slot = mk("tmp:slot", 1, 8);
         let alias_slot = mk("alias", 1, 8);
         let mut info = UseInfo::default();
-        info.definitions.insert(
-            temp_slot.display_name(),
-            CExpr::binary(
+        info.insert_definition_for_name_if_absent(&temp_slot.display_name(), CExpr::binary(
                 BinaryOp::Add,
                 crate::symbol::var_ref(&symbols, "rsp_0"),
                 CExpr::IntLit(0x20),
             ),
         );
-        info.definitions.insert(
-            alias_slot.display_name(),
-            CExpr::binary(
-                BinaryOp::Add,
-                crate::symbol::var_ref(&symbols, "rsp_0"),
-                CExpr::IntLit(0x28),
-            ),
-        );
+        // Bind before filing: a definition filed under a name mints an identity
+        // for that spelling, and binding the variable afterwards collides.
         let source_1 = mk("source", 1, 8);
         assert_eq!(
             info.bind_value_id(&alias_slot, ValueId(920)),
             Some(ValueId(920))
+        );
+        info.insert_definition_for_name_if_absent(&alias_slot.display_name(), CExpr::binary(
+                BinaryOp::Add,
+                crate::symbol::var_ref(&symbols, "rsp_0"),
+                CExpr::IntLit(0x28),
+            ),
         );
         assert_eq!(info.bind_value_id(&source_1, ValueId(921)), Some(ValueId(921)));
         info.insert_copy_source_for_vars(&alias_slot, &source_1);
@@ -10479,11 +10453,8 @@ mod tests {
             .insert("tmp:pick_2".to_string(), "picked".to_string());
         scratch
             .info
-            .definitions
-            .insert("tmp:pick_1".to_string(), crate::symbol::var_ref(&symbols, "rdx_2"));
-        scratch.info.definitions.insert(
-            "tmp:pick_2".to_string(),
-            CExpr::Subscript {
+            .insert_definition_for_name_if_absent("tmp:pick_1", crate::symbol::var_ref(&symbols, "rdx_2"));
+        scratch.info.insert_definition_for_name_if_absent("tmp:pick_2", CExpr::Subscript {
                 base: Box::new(CExpr::cast(
                     CType::ptr(CType::u32()),
                     crate::symbol::var_ref(&symbols, "arr"),

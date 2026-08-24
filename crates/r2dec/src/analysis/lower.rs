@@ -22,7 +22,6 @@ pub(crate) fn no_string_literals() -> &'static std::collections::BTreeMap<u64, S
 
 pub(crate) struct LowerCtx<'a> {
     pub(crate) use_info: Option<&'a UseInfo>,
-    pub(crate) definitions: &'a HashMap<String, CExpr>,
     pub(crate) pinned: &'a HashSet<String>,
     pub(crate) var_aliases: &'a HashMap<String, String>,
     pub(crate) param_register_aliases: &'a HashMap<String, String>,
@@ -56,13 +55,9 @@ impl<'a> LowerCtx<'a> {
     }
 
     fn definition_for_name(&self, name: &str) -> Option<&CExpr> {
-
-        self.definitions.get(name).or_else(|| {
-            self.use_info.and_then(|info| {
-                info.value_id_for_name(name)
-                    .and_then(|value_id| info.render_definition_for_value(value_id))
-                    .or_else(|| info.render_definition_for_name(name))
-            })
+        self.use_info.and_then(|info| {
+            info.value_id_for_name(name)
+                .and_then(|value_id| info.render_definition_for_value(value_id))
         })
     }
 
@@ -78,10 +73,7 @@ impl<'a> LowerCtx<'a> {
     }
 
     fn definition_for_var(&self, var: &SSAVar) -> Option<&CExpr> {
-        let key = var.display_name();
-        self.definitions
-            .get(&key)
-            .or_else(|| self.use_info.and_then(|info| info.definition_for_var(var)))
+        self.use_info.and_then(|info| info.definition_for_var(var))
     }
 
     fn semantic_value_for_name(&self, name: &str) -> Option<&SemanticValue> {
@@ -961,9 +953,7 @@ impl<'a> LowerCtx<'a> {
             CExpr::Cast { expr: inner, .. } | CExpr::Paren(inner) => {
                 self.extract_base_index_scale(inner)
             }
-            CExpr::Var(name) => self
-                .definitions
-                .get(&*self.spelling(*name))
+            CExpr::Var(name) => self.definition_for_name(&*self.spelling(*name))
                 .and_then(|inner| self.extract_base_index_scale(inner))
                 .or_else(|| {
                     let resolved = self.expr_for_ssa_name(&self.spelling(*name));
@@ -1000,9 +990,7 @@ impl<'a> LowerCtx<'a> {
             CExpr::Cast { expr: inner, .. } | CExpr::Paren(inner) => {
                 self.extract_base_const_offset(inner)
             }
-            CExpr::Var(name) => self
-                .definitions
-                .get(&*self.spelling(*name))
+            CExpr::Var(name) => self.definition_for_name(&*self.spelling(*name))
                 .and_then(|def| self.extract_base_const_offset(def))
                 .or_else(|| {
                     let resolved = self.expr_for_ssa_name(&self.spelling(*name));
@@ -1155,9 +1143,7 @@ impl<'a> LowerCtx<'a> {
 
     fn is_semantic_index_expr(&self, expr: &CExpr) -> bool {
         match expr {
-            CExpr::Var(name) => self
-                .definitions
-                .get(&*self.spelling(*name))
+            CExpr::Var(name) => self.definition_for_name(&*self.spelling(*name))
                 .map(|inner| self.is_semantic_index_expr(inner))
                 .unwrap_or_else(|| {
                     let lower = self.spelling(*name).to_ascii_lowercase();
@@ -1434,7 +1420,7 @@ mod tests {
     #[allow(clippy::too_many_arguments)]
     fn make_ctx<'a>(
         symbols: &'a std::cell::RefCell<crate::symbol::SymbolTable>,
-        definitions: &'a HashMap<String, CExpr>,
+        _definitions: &'a HashMap<String, CExpr>,
         _use_counts: &'a HashMap<String, usize>,
         _condition_vars: &'a HashSet<String>,
         pinned: &'a HashSet<String>,
@@ -1452,8 +1438,40 @@ mod tests {
         LowerCtx {
             symbols,
             string_literals: crate::analysis::lower::no_string_literals(),
-            use_info: None,
-            definitions,
+            // These facts live in one store keyed by identity, so the maps a
+            // test hands in are seeded into a `UseInfo` rather than being
+            // consulted as a second source. Leaked because the context borrows
+            // it and the tests build both inline.
+            use_info: Some(Box::leak(Box::new({
+                let mut info = crate::analysis::UseInfo::default();
+                for (name, expr) in _definitions {
+                    info.insert_definition_for_name_if_absent(name, expr.clone());
+                }
+                for (name, count) in _use_counts {
+                    if let Some(value_id) = info.value_id_for_name_or_bind(name) {
+                        info.use_counts_by_value.insert(value_id, *count);
+                    }
+                }
+                for name in _condition_vars {
+                    if let Some(value_id) = info.value_id_for_name_or_bind(name) {
+                        info.condition_values.insert(value_id);
+                    }
+                }
+                for (name, ptr) in _ptr_arith {
+                    if let Some(value_id) = info.value_id_for_name_or_bind(name) {
+                        info.ptr_arith_by_value.insert(value_id, ptr.clone());
+                    }
+                }
+                for (name, slot) in _stack_slots {
+                    info.insert_stack_slot_for_name(name, *slot);
+                }
+                for (name, provenance) in _forwarded_values {
+                    if let Some(value_id) = info.value_id_for_name_or_bind(name) {
+                        info.forwarded_values_by_value.insert(value_id, provenance.clone());
+                    }
+                }
+                info
+            }))),
             pinned,
             var_aliases,
             param_register_aliases,

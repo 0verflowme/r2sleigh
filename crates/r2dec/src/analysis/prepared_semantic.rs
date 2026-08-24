@@ -497,7 +497,6 @@ fn populate_prepared_render_definitions(symbols: &std::cell::RefCell<crate::symb
                     symbols,
                     string_literals: crate::analysis::lower::no_string_literals(),
                     use_info: Some(use_info),
-                    definitions: &use_info.definitions,
                     pinned: &use_info.pinned,
                     var_aliases: &use_info.var_aliases,
                     param_register_aliases: env.param_register_aliases,
@@ -518,10 +517,6 @@ fn populate_prepared_render_definitions(symbols: &std::cell::RefCell<crate::symb
             if env.carrier_aliases.contains_key(&key) {
                 continue;
             }
-            use_info
-                .definitions
-                .entry(key.clone())
-                .or_insert_with(|| expr.clone());
             if let Some(value_id) = use_info.value_id_for_var(dst) {
                 use_info
                     .definitions_by_value
@@ -3251,10 +3246,6 @@ fn collect_prepared_runtime_facts(symbols: &std::cell::RefCell<crate::symbol::Sy
                                 .entry(key.clone())
                                 .or_insert_with(|| crate::symbol::spelling(symbols, *alias).to_string());
                         }
-                        use_info
-                            .definitions
-                            .entry(key.clone())
-                            .or_insert_with(|| expr.clone());
                         if let Some(value_id) = reload_value {
                             use_info
                                 .definitions_by_value
@@ -3381,10 +3372,6 @@ fn seed_prepared_value_fact(symbols: &std::cell::RefCell<crate::symbol::SymbolTa
         .cloned()
         .or_else(|| view.owner_expr_for_var(var).cloned())
     {
-        use_info
-            .definitions
-            .entry(key.clone())
-            .or_insert_with(|| expr.clone());
         if let Some(value_id) = bound_value_id {
             use_info
                 .definitions_by_value
@@ -3625,10 +3612,7 @@ fn record_prepared_call_result_aliases(symbols: &std::cell::RefCell<crate::symbo
             record_prepared_call_alias(use_info, site, &visible_alias, false);
         }
         if direct {
-            use_info
-                .definitions
-                .entry(alias.clone())
-                .or_insert_with(|| call_expr.clone());
+            use_info.insert_definition_for_name_if_absent(&alias, call_expr.clone());
             use_info
                 .formatted_defs
                 .entry(alias)

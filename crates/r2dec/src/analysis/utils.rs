@@ -394,7 +394,7 @@ fn parse_canonical_stack_name_offset(name: &str) -> Option<i64> {
 
 pub(crate) fn extract_stack_offset_from_var(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
     var: &SSAVar,
-    definitions: &HashMap<String, CExpr>,
+    definition: &dyn Fn(&str) -> Option<CExpr>,
     fp_name: &str,
     sp_name: &str,
 ) -> Option<i64> {
@@ -405,14 +405,14 @@ pub(crate) fn extract_stack_offset_from_var(symbols: &std::cell::RefCell<crate::
 
     let key = var.display_name();
     let mut visited = HashSet::new();
-    definitions.get(&key).and_then(|expr| {
-        extract_offset_from_expr_with_defs(symbols, expr, definitions, fp_name, sp_name, 0, &mut visited)
+    definition(&key).and_then(|expr| {
+        extract_offset_from_expr_with_defs(symbols, &expr, definition, fp_name, sp_name, 0, &mut visited)
     })
 }
 
 fn extract_offset_from_expr_with_defs(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
     expr: &CExpr,
-    definitions: &HashMap<String, CExpr>,
+    definition: &dyn Fn(&str) -> Option<CExpr>,
     fp_name: &str,
     sp_name: &str,
     depth: u32,
@@ -433,9 +433,9 @@ fn extract_offset_from_expr_with_defs(symbols: &std::cell::RefCell<crate::symbol
             right,
         } => {
             if let Some(offset) = expr_to_offset(left)
-                && let Some(base) = extract_offset_from_expr_with_defs(symbols, 
+                && let Some(base) = extract_offset_from_expr_with_defs(symbols,
                     right,
-                    definitions,
+                    definition,
                     fp_name,
                     sp_name,
                     depth + 1,
@@ -445,9 +445,9 @@ fn extract_offset_from_expr_with_defs(symbols: &std::cell::RefCell<crate::symbol
                 return Some(base.saturating_add(offset));
             }
             if let Some(offset) = expr_to_offset(right)
-                && let Some(base) = extract_offset_from_expr_with_defs(symbols, 
+                && let Some(base) = extract_offset_from_expr_with_defs(symbols,
                     left,
-                    definitions,
+                    definition,
                     fp_name,
                     sp_name,
                     depth + 1,
@@ -464,9 +464,9 @@ fn extract_offset_from_expr_with_defs(symbols: &std::cell::RefCell<crate::symbol
             right,
         } => {
             if let Some(offset) = expr_to_offset(right)
-                && let Some(base) = extract_offset_from_expr_with_defs(symbols, 
+                && let Some(base) = extract_offset_from_expr_with_defs(symbols,
                     left,
-                    definitions,
+                    definition,
                     fp_name,
                     sp_name,
                     depth + 1,
@@ -481,10 +481,10 @@ fn extract_offset_from_expr_with_defs(symbols: &std::cell::RefCell<crate::symbol
             if !visited.insert(crate::symbol::spelling(symbols, *name).to_string()) {
                 return None;
             }
-            definitions.get(&*crate::symbol::spelling(symbols, *name)).and_then(|inner| {
+            definition(&crate::symbol::spelling(symbols, *name)).and_then(|inner| {
                 extract_offset_from_expr_with_defs(symbols, 
-                    inner,
-                    definitions,
+                    &inner,
+                    definition,
                     fp_name,
                     sp_name,
                     depth + 1,
@@ -495,9 +495,9 @@ fn extract_offset_from_expr_with_defs(symbols: &std::cell::RefCell<crate::symbol
         CExpr::Paren(inner)
         | CExpr::Cast { expr: inner, .. }
         | CExpr::Deref(inner)
-        | CExpr::Unary { operand: inner, .. } => extract_offset_from_expr_with_defs(symbols, 
+        | CExpr::Unary { operand: inner, .. } => extract_offset_from_expr_with_defs(symbols,
             inner,
-            definitions,
+            definition,
             fp_name,
             sp_name,
             depth + 1,
@@ -734,7 +734,7 @@ mod tests {
 
         let addr = SSAVar::new("tmp:6500", 2, 8);
         assert_eq!(
-            extract_stack_offset_from_var(&symbols, &addr, &definitions, "fp", "sp"),
+            extract_stack_offset_from_var(&symbols, &addr, &|name: &str| definitions.get(name).cloned(), "fp", "sp"),
             Some(0x540)
         );
     }
