@@ -3955,3 +3955,31 @@ So this belongs to item 1 above -- a value with nine resolvers that each answer
 with their own precedence -- and not to the width layer or the pruner, which is
 where it looks like it belongs from the symptom. Worth recording because two
 plausible fixes sit closer to the symptom than the defect, and both are inert.
+
+### The fifth carrier guard behaves like the first four
+
+`resolve_return_candidate_in_context` opens with
+
+    if self.expr_is_carrier_reference(expr) { return expr.clone(); }
+
+which short-circuits every other resolver. `rax` is `adler32`'s accumulator
+carrier, so the compose is never considered. The narrow correction is that a
+carrier is the value on *entry* to the returning block, and a block that writes
+the return register itself has produced a newer one -- so the short-circuit
+should not apply there.
+
+That was built, with `current_return_block_redefines_return_register` deciding.
+A probe confirms it does exactly what it was written to do: it fires once for
+`adler32`, reporting `return_block=true redefines=true`, and the short-circuit is
+bypassed. The rendering is byte-identical. Reverted.
+
+This is the fifth carrier guard built at a resolver and the fifth to move the
+answer rather than change it, and it is the first where the guard was
+instrumented and shown to fire. That distinction matters: the earlier four could
+be doubted as never having engaged. This one engaged, the precedence moved, and
+`rax` came back by another route.
+
+**Whatever the guards are for, one more of them is not it.** The list above says
+the shape is to make the wrong answer unrepresentable -- a value that is mutable
+state should not have a resolvable expression at all. Nothing measured here
+contradicts that, and one more datum now supports it.
