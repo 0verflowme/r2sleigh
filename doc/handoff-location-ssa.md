@@ -946,8 +946,7 @@ learn.
      measured there, one at 37 to 17, one that landed, and this check, and each
      addressed a different defect behind the same rendered lines.
 
-  0m. **pearson's return reads the loop's exit merge by its own name.** One
-     failure, x86-64 -O1, and the smallest remaining case of the carrier family.
+  0m. **[FIXED] pearson's return read the loop's exit merge by its own name.**
 
      ```c
      rcx = (int64_t)0;
@@ -973,12 +972,23 @@ learn.
      header phi rather than the phi's own entry source, so it is a different
      `ValueId` and fails the membership test.
 
-     Relaxing that test needs care: its comment explains that the carrier is a
-     third name rather than either source, and that the entry/update requirement
-     is what stops an unrelated merge over the same storage being claimed. Before
-     changing it, confirm what `RCX_6`'s non-update source actually is -- if it is
-     the initialiser the carrier already knows about, admitting
-     `dominating_initializers` alongside `entries` would be the narrow fix.
+     **[FIXED]** The check recorded here was run. `RCX_6` is
+     `phi(RCX_4 = ValueId(65), RCX_5 = ValueId(127))` where 65 is a certified
+     update and 127 is neither an entry (42) nor an update. Admitting
+     `dominating_initializers` alongside `entries` -- the narrow fix this item
+     proposed -- does not help: 127 is not one of those either.
+
+     What the bypass edge carries is simply "the loop never ran", and there is no
+     reason for that value to be one the carrier certified. The test now asks
+     only what identifies an exit merge: a phi over the carrier's storage with
+     one of its updates on one edge and something else on the other. Corpus
+     **37 to 38**, pearson at x86-64 -O1 returns `0d` and is correct, and no
+     configuration regresses.
+
+     This widened a gate whose comment warned against widening it. That warning
+     was about a different axis -- claiming merges in unrelated *storage*, which
+     the size and storage checks above still prevent -- and not about which
+     values the non-update edge may carry.
 
   0g. **murmur3's tail switch renders with empty bodies.** This is what arm64 -O0
      `murmur3_32` now fails on, and the undeclared `x8_30` is a symptom of it

@@ -1228,7 +1228,6 @@ pub(crate) fn carrier_name_aliases(
             .chain(updates.iter().flat_map(|update| {
                 std::iter::once(update.value).chain(update.identity_values.iter().copied())
             }));
-        let entry_values: HashSet<_> = entries.iter().map(|edge| edge.value).collect();
         let update_values: HashSet<_> = updates.iter().map(|update| update.value).collect();
         for member in members {
             let Some(var) = graph.value(member).map(|value| &value.var) else {
@@ -1239,7 +1238,7 @@ pub(crate) fn carrier_name_aliases(
             }
             aliases.insert(var.display_name(), name.clone());
         }
-        for merge in exit_merges_for_carrier(prepared, *phi, &entry_values, &update_values) {
+        for merge in exit_merges_for_carrier(prepared, *phi, &update_values) {
             aliases.insert(merge, name.clone());
         }
     }
@@ -1260,7 +1259,6 @@ pub(crate) fn carrier_name_aliases(
 fn exit_merges_for_carrier(
     prepared: &r2ssa::SsaArtifact,
     phi: r2ssa::ValueId,
-    entry_values: &HashSet<r2ssa::ValueId>,
     update_values: &HashSet<r2ssa::ValueId>,
 ) -> Vec<String> {
     let graph = prepared.graph();
@@ -1284,11 +1282,23 @@ fn exit_merges_for_carrier(
             // Every edge must carry a value this carrier holds, and both sides
             // must be present: a merge of two entry values is a different merge
             // that happens to be over the same storage.
-            if values
-                .iter()
-                .all(|value| entry_values.contains(value) || update_values.contains(value))
-                && values.iter().any(|value| entry_values.contains(value))
-                && values.iter().any(|value| update_values.contains(value))
+            // The bypass edge carries "the loop never ran", and that is not
+            // always the header phi's own entry value: in pearson the merge is
+            // `phi(RCX_4 = update, RCX_5)` where `RCX_5` is the value the
+            // carrier was initialised with before the loop, a different
+            // `ValueId` from the certified entry. Requiring a certified entry
+            // there left the exit merge unaliased and pearson returned `rcx_6`,
+            // a name nothing declares. The carrier's own dominating
+            // initialisers are the same variable by construction, so they
+            // count.
+            // A phi over this storage that takes one of the carrier's updates
+            // on one edge is the carrier leaving the loop, whatever the other
+            // edge carries: the bypass value is "the loop never ran", and it is
+            // not required to be a value the carrier certified. Requiring that
+            // left pearson's exit merge unaliased and its return printed
+            // `rcx_6`, a name nothing declares.
+            if values.iter().any(|value| update_values.contains(value))
+                && values.iter().any(|value| !update_values.contains(value))
             {
                 merges.push(merge.dst.display_name());
             }
