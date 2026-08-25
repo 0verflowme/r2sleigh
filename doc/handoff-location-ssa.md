@@ -171,8 +171,60 @@ learn.
      all. What remains there is that the prologue's frame save should not be
      rendered as a program statement.
 
-  0d. **arm64 -O0 renders frame accesses as pointer arithmetic where x86-64
-     renders named locals.** This is what both arm64 -O0 failures are now, after
+  0d. **[FIXED] arm64 -O0 rendered frame accesses as pointer arithmetic where
+     x86-64 rendered named locals.** Two causes, one behind the other.
+
+     The trace: `canonicalize_param_home_stack_slots` returns immediately when
+     `register_params` is empty, and on arm64 it was. That list comes from
+     `inferred_signature_abi_register_params`, which recognised only SysV
+     x86-64 -- radare2 reports `arch="aarch64"` with the calling-convention
+     field left *empty*, and the guard demanded a named convention. With no
+     register parameters there are no ParamHome slots, so no `HiddenHome`
+     bindings, so an empty stack alias map, so no names to render:
+     `bindings=3 slots=0 entries=0` on arm64 against `bindings=7 slots=3
+     entries=3` on x86-64 for the same function. Fixed by adding the AAPCS64
+     table and treating an unnamed convention on aarch64 as AAPCS64, which there
+     is only one of.
+
+     That alone changed nothing, because a second cause sat under it: the stores
+     the scan needs to see had no stack slot at all -- seventeen of them resolved
+     to `None`, all addressed off `x29`. `x29` had no stack-address root, and
+     neither did the temp it was copied from. The op is
+
+         IntAdd { dst: tmp:11f80_1, a: sp_1, b: tmp:11e80_1 }
+
+     where the displacement `b` is a *temp*, not a constant: AArch64 Sleigh
+     materialises `add x29, sp, 0x60` as `tmp:A = 0x60; x29 = sp + tmp:A`.
+     `signed_stack_delta` reads `constant_bits` off the operand and gave up, so
+     the frame pointer never got a root and nothing derived from it did either.
+     Fixed with `signed_stack_delta_through_roots`, which resolves the operand
+     through the canonical value roots before giving up.
+
+     Together these change the rendering completely. `murmur3_32` at arm64 -O0
+     went from
+
+     ```c
+     long t11f80_1 = local_70 + 96;
+     *(int64_t *)(long)(t11f80_1 - 0x8) = arg0;
+     *(int32_t *)(long)(t11f80_1 - 0x14) = arg2;
+     ```
+
+     to
+
+     ```c
+     long local_28 = arg2;
+     long local_38 = 4 == 0 ? 0 : arg1 / 4;
+     for (long local_40 = 0; local_40 < local_38; local_40 = t11f80_3) {
+     ```
+
+     The corpus stays at 36 of 54, because neither arm64 -O0 function crosses the
+     line yet: `xxhash32` now fails only on `sym__rotl32` being undeclared, which
+     is the harness building one function per file rather than a defect, so it is
+     at parity with x86-64 -O0; `murmur3_32` fails on an undeclared `x8_30`,
+     several layers further in than where it was. Count and quality moved apart
+     here, and the quality is the part that matters for what follows.
+
+  0e. **Superseded: arm64 -O0 renders frame accesses as pointer arithmetic.** This is what both arm64 -O0 failures are now, after
      the argument-register and frame-record fixes above, and it is bigger than
      either of them.
 

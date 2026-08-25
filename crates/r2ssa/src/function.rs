@@ -4504,7 +4504,7 @@ fn stack_address_root_from_add(
 ) -> Option<StackAddressRoot> {
     if let (Some(base), Some(delta)) = (
         stack_root_from_operand(a, roots, stack_roots, family_state, family_info),
-        signed_stack_delta(b),
+        signed_stack_delta_through_roots(b, roots, family_state, family_info),
     ) {
         return Some(StackAddressRoot {
             base: base.base,
@@ -4513,7 +4513,7 @@ fn stack_address_root_from_add(
     }
     if let (Some(base), Some(delta)) = (
         stack_root_from_operand(b, roots, stack_roots, family_state, family_info),
-        signed_stack_delta(a),
+        signed_stack_delta_through_roots(a, roots, family_state, family_info),
     ) {
         return Some(StackAddressRoot {
             base: base.base,
@@ -4532,7 +4532,7 @@ fn stack_address_root_from_sub(
     family_info: &RegisterFamilyInfo,
 ) -> Option<StackAddressRoot> {
     let base = stack_root_from_operand(a, roots, stack_roots, family_state, family_info)?;
-    let delta = signed_stack_delta(b)?;
+    let delta = signed_stack_delta_through_roots(b, roots, family_state, family_info)?;
     Some(StackAddressRoot {
         base: base.base,
         offset: base.offset.checked_sub(delta)?,
@@ -4555,6 +4555,27 @@ fn rebase_declared_frame_pointer(
         },
         Some(StackAddressBase::StackPointer) | None => inherited,
     }
+}
+
+/// The displacement an address computation adds, resolved through copies.
+///
+/// A displacement does not always arrive as a constant operand. AArch64 Sleigh
+/// materialises `add x29, sp, 0x60` as `tmp:A = 0x60; x29 = sp + tmp:A`, so the
+/// operand is a temp and the constant is one copy away. Reading only the operand
+/// left every frame pointer established that way without a stack root, and with
+/// it every address derived from the frame pointer -- which is most of a
+/// non-leaf function's locals.
+fn signed_stack_delta_through_roots(
+    var: &SSAVar,
+    roots: &BTreeMap<SSAVar, SSAVar>,
+    family_state: &FamilyRootState,
+    family_info: &RegisterFamilyInfo,
+) -> Option<i64> {
+    if let Some(delta) = signed_stack_delta(var) {
+        return Some(delta);
+    }
+    let root = resolve_value_root(var, roots, family_state, family_info);
+    (root != *var).then(|| signed_stack_delta(&root)).flatten()
 }
 
 fn signed_stack_delta(var: &SSAVar) -> Option<i64> {
@@ -4723,6 +4744,64 @@ impl SSABlock {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn stack_root_follows_a_displacement_materialised_into_a_temp() {
+        // AArch64 Sleigh writes `add x29, sp, 0x60` as
+        // `tmp:A = 0x60; x29 = sp + tmp:A`, so the displacement operand is a
+        // temp and the constant is one copy away. Reading only the operand left
+        // the frame pointer with no stack root, and with it every address
+        // derived from the frame pointer, which is most of a non-leaf
+        // function's locals.
+        use super::{StackAddressBase, StackAddressRoot, stack_address_root_from_add};
+        use std::collections::BTreeMap;
+
+        let sp = SSAVar::new("sp", 1, 8);
+        let displacement = SSAVar::new("tmp:11e80", 1, 8);
+        let literal = SSAVar::constant(0x60, 8);
+
+        let mut stack_roots = BTreeMap::new();
+        stack_roots.insert(
+            sp.clone(),
+            StackAddressRoot {
+                base: StackAddressBase::StackPointer,
+                offset: -0x70,
+            },
+        );
+        let family_state = super::FamilyRootState::new();
+        let family_info = super::RegisterFamilyInfo::default();
+
+        let mut roots = BTreeMap::new();
+        assert_eq!(
+            stack_address_root_from_add(
+                &sp,
+                &displacement,
+                &roots,
+                &stack_roots,
+                &family_state,
+                &family_info,
+            ),
+            None,
+            "with nothing linking the temp to the constant there is no delta to add"
+        );
+
+        roots.insert(displacement.clone(), literal);
+        assert_eq!(
+            stack_address_root_from_add(
+                &sp,
+                &displacement,
+                &roots,
+                &stack_roots,
+                &family_state,
+                &family_info,
+            ),
+            Some(StackAddressRoot {
+                base: StackAddressBase::StackPointer,
+                offset: -0x10,
+            }),
+            "the frame pointer sits 0x60 above a 0x70 frame, so 0x10 below entry"
+        );
+    }
     use super::*;
     use crate::semantic::{CallArgumentLocation, ReturnCarrier, SemanticId, ValueOwner};
     use crate::{SourceFunctionReturn, SourceStackSlotSpec};

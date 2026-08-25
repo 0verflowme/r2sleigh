@@ -8178,19 +8178,32 @@ fn inferred_signature_abi_register_params(
     let callconv = signature.callconv.trim().to_ascii_lowercase();
     let is_sysv64 = matches!(arch.as_str(), "x86-64" | "x86_64" | "x64" | "amd64")
         && matches!(callconv.as_str(), "amd64" | "sysv" | "sysv64" | "x86-64");
-    if !is_sysv64 {
-        return Vec::new();
-    }
+    // AArch64 has one standard convention for these registers, and radare2
+    // leaves the calling-convention field empty rather than naming it, so an
+    // unnamed convention on that architecture is AAPCS64 rather than unknown.
+    let is_aapcs64 = matches!(arch.as_str(), "aarch64" | "arm64")
+        && matches!(
+            callconv.as_str(),
+            "" | "aapcs" | "aapcs64" | "arm64" | "aarch64"
+        );
     const SYSV64_ARG_REGS: [&str; 6] = ["rdi", "rsi", "rdx", "rcx", "r8", "r9"];
+    const AAPCS64_ARG_REGS: [&str; 8] = ["x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7"];
+    let arg_regs: &[&str] = if is_sysv64 {
+        &SYSV64_ARG_REGS
+    } else if is_aapcs64 {
+        &AAPCS64_ARG_REGS
+    } else {
+        return Vec::new();
+    };
     signature
         .params
         .iter()
-        .take(SYSV64_ARG_REGS.len())
+        .take(arg_regs.len())
         .enumerate()
         .map(|(idx, param)| ExternalRegisterParamSpec {
             name: param.name.clone(),
             ty: parse_type_like_spec(&param.param_type, ptr_bits),
-            reg: SYSV64_ARG_REGS[idx].to_string(),
+            reg: arg_regs[idx].to_string(),
         })
         .collect()
 }
@@ -11281,6 +11294,53 @@ fn ssa_var_block_key(block_addr: u64, var: &SSAVar) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn abi_register_params_cover_aarch64_as_well_as_sysv64() {
+        // radare2 reports `arch="aarch64"` with the calling-convention field
+        // left empty. Requiring a named convention meant arm64 functions got no
+        // register parameters at all, which switched off the whole parameter
+        // home machinery: no ParamHome slots, so no hidden-home bindings, so an
+        // empty stack alias map, so frame accesses rendered as raw pointer
+        // arithmetic instead of named locals.
+        let signature = |arch: &str, callconv: &str| super::InferredSignature {
+            function_name: "f".to_string(),
+            signature: "int f(long a, long b, long c)".to_string(),
+            ret_type: "int".to_string(),
+            params: vec![
+                super::InferredSignatureParam {
+                    name: "a".to_string(),
+                    param_type: "int64_t".to_string(),
+                },
+                super::InferredSignatureParam {
+                    name: "b".to_string(),
+                    param_type: "int64_t".to_string(),
+                },
+                super::InferredSignatureParam {
+                    name: "c".to_string(),
+                    param_type: "int64_t".to_string(),
+                },
+            ],
+            callconv: callconv.to_string(),
+            arch: arch.to_string(),
+            confidence: 90,
+            callconv_confidence: 90,
+        };
+        let regs = |arch: &str, callconv: &str| {
+            super::inferred_signature_abi_register_params(&signature(arch, callconv), 64)
+                .into_iter()
+                .map(|param| param.reg)
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(regs("aarch64", ""), vec!["x0", "x1", "x2"]);
+        assert_eq!(regs("arm64", "aapcs"), vec!["x0", "x1", "x2"]);
+        assert_eq!(regs("x86-64", "amd64"), vec!["rdi", "rsi", "rdx"]);
+        assert!(
+            regs("mips", "").is_empty(),
+            "an architecture with no table here still yields nothing"
+        );
+    }
     use super::*;
     use std::collections::{BTreeMap, BTreeSet};
 
