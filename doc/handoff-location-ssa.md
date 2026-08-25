@@ -244,11 +244,40 @@ learn.
      nowhere. `ecx_9` in the -O2 line is the same value this document already
      recorded as adler32's blocker; it is not one function's problem but four.
 
-     This is the location model in its most concrete form: a register is a place,
-     and `eax`/`rax` or `w8`/`x8` are members of one place at different widths.
-     Until membership is modelled, the carrier cannot answer for the narrow read.
-     The measured cost of doing it incompletely is recorded above -- naming
-     registers by place regresses 34 correct to 13 -- so it has to land whole.
+     This is the location model in its most concrete form, and the substrate for
+     it is already built. `CanonicalStorageId` separates the place from the
+     width, and a dump over adler32 at x86-64 -O1 shows exactly that:
+
+     ```
+     EAX_1..EAX_6  CanonicalStorageId { space: Register, offset: 0, size: 4 }
+     RAX_1..RAX_7  CanonicalStorageId { space: Register, offset: 0, size: 8 }
+     ```
+
+     Same space, same offset, different size. The two are one place at two
+     widths, and the arch already carries the fact that makes that sound --
+     `RegisterFamilyInfo::narrow_write_clears_register`, true on both x86-64 and
+     arm64. What is missing is that *identity includes the size*, so carrier
+     membership never recognises the narrow member. `exit_merges_for_carrier`
+     spells the same assumption out: it skips any merge where
+     `merge.dst.size != carrier.size`.
+
+     The consequence is not only a name. In adler32 -O1 the loop carries `RAX_2`
+     and the tail is `EAX_5 = EAX_4 << 16`, `EAX_6 = EAX_5 | R8D_3` -- the
+     `(b << 16) | a` the source returns. `EAX_4` is defined inside the loop and
+     read after it, so with the narrow member outside the carrier those tail
+     statements are dropped and the return is left quoting a name nothing
+     defines.
+
+     **Why the earlier attempt regressed 34 correct to 13, and what landing it
+     whole means.** Aliasing the narrow member to the carrier's name is only half
+     of it: `eax_5` is not `rax`, it is `(uint32_t)rax`. An alias map maps a name
+     to a name, so it cannot express the truncation, and a change that only adds
+     the alias renders `rax | 1` where `(uint32_t)rax | 1` was meant -- correct
+     names, wrong values, which is what a corpus measured in checksums reports as
+     a collapse. The complete change is therefore two things at once: membership
+     by place, *and* resolving a narrow member to a cast of the carrier rather
+     than to a bare name. The second half cannot live in `spell_var`, which
+     returns a `String`; it belongs where expressions are produced.
 
      Not in this cluster despite looking like it: `r8d` in fnv1a64 -O2 appears
      inside a piece composition, `(hi << 32) | (uint64_t)r8d`, which is the width
