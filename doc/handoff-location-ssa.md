@@ -549,9 +549,19 @@ learn.
      * `codegen.rs` emits `Subscript` as `base[index]` verbatim, adding nothing.
 
      So the `(unsigned char *)(long)` cast is inserted by a pass *between* the
-     fold and codegen. Find that pass; it is choosing a default pointee rather
-     than the width of the access, and it is the only place left that can be
-     doing it.
+     fold and codegen. Two more candidates are now eliminated by measurement:
+     `render_canonical_load_expr`'s memo is keyed on
+     `(value_id, elem_ty.to_string())`, so a one-byte rendering cannot be reused
+     for a four-byte read; and `prepared_load_access_expr_for_addr`, whose
+     `as_pointer` helper builds exactly this `(T *)(long)` shape and whose
+     comment names murmur3, is never called for this address at all -- a probe
+     on `tmp:4a00_2` prints nothing.
+
+     What is left to check is the analysis-side definition: the statement may be
+     rendered from the recorded definition rather than from
+     `render_canonical_load_expr`, in which case the cast was chosen when that
+     definition was built. Probe `populate_prepared_render_definitions` and
+     `LowerCtx::op_to_expr` for this value next.
 
      Three fixes were tried at the load renderer and all three are inert,
      because that is the wrong end of the pipeline. Reverted, and recorded so
