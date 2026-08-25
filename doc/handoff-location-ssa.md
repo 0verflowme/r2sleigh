@@ -4744,5 +4744,23 @@ and unifying them moves values between routes that answer differently. Nothing
 here can be fixed by making one site agree with another; the routes have to agree
 first.
 
+Making them agree was tried, and it is not one route but three.
+`definition_for_symbol` was changed to ask the value name *and then* the
+spelling, instead of one or the other, so recording a link could never cost an
+identifier its old lookup. That change is safe on its own -- 35 of 54, unchanged
+-- and it is still not enough: noting the link at the analysis mint sites on top
+of it takes both -O0 configurations to zero exactly as before.
+
+The third consumer is `ssa_name_for_spelling`, which `definition_of` uses to
+resolve a rendered spelling back to its SSA name, and there is no fallback to add
+there -- resolving differently *is* its purpose. So the link is read by at least
+three places with three different meanings, and recording it changes all of them
+at once.
+
+Both changes are reverted. What this rules out is the incremental path: there is
+no order in which the mint sites can start recording what they render while the
+readers disagree about what the record means. The readers have to be reconciled
+first, and that is a larger piece of work than any single site.
+
 The corpus is 35 of 54 throughout -- this moves `xxhash32` from one undeclared
 name to another rather than to a rendering that compiles.
