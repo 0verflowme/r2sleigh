@@ -524,131 +524,52 @@ learn.
      xxhash32 -O1 returns nothing against `e7583aa4` -- so they are a different
      defect rather than this one.
 
-  0j. **A four-byte read of a byte array renders as one element.** This is what
-     murmur3_32 at x86-64 -O1 now fails on, having reached the value layer.
+  0j. **The `unsigned char` cast is the harness's, not the decompiler's.**
+     Correcting two turns of work that chased it.
 
-     The machine reads a dword:
+     `verify_rendering.py` line 76 rewrites every `X[Y]` in the dump into
+     `(((unsigned char *)(long)(X))[Y])`, because the decompiler emits a
+     subscript on an integer and C will not compile that. A byte is the harness's
+     only available guess. So the `((unsigned char *)arg0)[i]` that this item
+     previously called a decompiler defect is a harness patch, and murmur3's
+     one-byte read follows from the guess rather than from a width the decompiler
+     chose.
 
+     What the decompiler actually emits is
+
+     ```c
+     uint64_t t11f00_2 = arg0[t4900_2];
      ```
-     imul r8d, dword [rdi + rcx*4], 0xcc9e2d51
-     ```
 
-     and the rendering is `(((unsigned char *)(long)(arg0))[t4900_2])` -- one
-     byte, a quarter of the word the hash consumes. It returns `ec1fbeef` against
-     a wanted `7e4102af`.
+     -- a subscript on a `long`, with no pointee stated anywhere. That is the
+     real defect: the access knows it reads four bytes and says nothing, so
+     whoever consumes the output has to invent a width.
 
-     The width is right everywhere until the access is built, and the cast is
-     added by neither end of the pipeline. Measured:
+     **This invalidates the method, not the eliminations.** Ten sites were ruled
+     out by probes on the decompiler's own data structures and those results
+     stand: the `Load` arm computes `elem_ty` as `UInt(32)`;
+     `render_canonical_load_expr` returns a bare `Subscript` with `elem_ty`
+     unused; the recorded definition is rejected (`safe=false`); the semantic
+     value branch is never taken; the memo is keyed on width;
+     `prepared_load_access_expr_for_addr` is never called for this address; and
+     a per-pass dump shows the RHS remaining a bare `Subscript` through every
+     pass and every post-pipeline step. But the *thing* being hunted -- the cast
+     -- was never in the decompiler at all. Read `pdd` output directly when
+     asking what the decompiler renders; `verify/*.c` is a rewritten artefact.
 
-     * `LOAD dst=tmp:11f00_2 size=4 addr=tmp:4a00_2 hint=None` -- the SSA says
-       four bytes and no type hint argues with it, so `elem_ty` is `UInt(32)`.
-     * Inside `render_canonical_load_expr_uncached`, that correct `elem_ty` is
-       carried alongside a chosen expression of
-       `Subscript { base: Var(..), index: Var(..) }` -- **no cast at all**. The
-       renderer never applies the width it was given.
-     * `codegen.rs` emits `Subscript` as `base[index]` verbatim, adding nothing.
+     Two attempts at stating the pointee were then measured against the real
+     output and both left `arg0[t4900_2]` unchanged: applying `elem_ty` to the
+     subscript base in `render_canonical_load_expr_uncached`, and the same with
+     `looks_like_pointer` dropped from the guard so that only an explicit cast
+     counts. Something after that function re-derives the expression --
+     `assign_stmt` runs `semanticize_visible_expr` and `rewrite_stack_expr` over
+     the RHS -- so the next probe belongs there, on what those two return for
+     this access.
 
-     So the `(unsigned char *)(long)` cast is inserted by a pass *between* the
-     fold and codegen. Two more candidates are now eliminated by measurement:
-     `render_canonical_load_expr`'s memo is keyed on
-     `(value_id, elem_ty.to_string())`, so a one-byte rendering cannot be reused
-     for a four-byte read; and `prepared_load_access_expr_for_addr`, whose
-     `as_pointer` helper builds exactly this `(T *)(long)` shape and whose
-     comment names murmur3, is never called for this address at all -- a probe
-     on `tmp:4a00_2` prints nothing.
-
-     The analysis-side definition is ruled out too, and how it is ruled out is
-     itself a finding: `DEFFILTER tmp:11f00_2 self=false safe=false
-     carrier=false`. `prepared_render_definition_is_safe` rejects this load, so
-     **no definition is recorded for it at all** -- the statement cannot be
-     coming from one.
-
-     Which leaves the path actually taken, traced end to end: the `Load` arm of
-     `op_to_stmt_impl` computes `elem_ty` correctly as `UInt(32)`, hands it to
-     `render_canonical_load_expr`, and that function takes the `return expr`
-     branch -- returning `best`, the bare `Subscript`, without consulting
-     `elem_ty` at all. `elem_ty` is used only on the three branches *not* taken
-     here: `indexed_pointer_add_expr` for a `Deref`, `typed_deref_expr` for a
-     non-scalar candidate, and the `pointee_load` cast. A `Subscript` that is
-     already a "scalar memory candidate" is returned untyped.
-
-     **Found.** The width comes from a pointer-access *fact*, not from the load.
-     `LowerCtx::ptr_subscript_expr` builds the subscript with
-     `uint_type_from_size(ptr.element_size)` and `build_subscript_expr` casts the
-     base to `ptr(elem_ty)` -- and `ptr.element_size` describes the *address
-     arithmetic*, which for `arg0 + rcx * 4` is byte-based, so the element is one
-     byte and the index carries the scaling. That is a correct description of the
-     address and the wrong element type for a four-byte read through it.
-
-     The load never gets to say otherwise: `render_canonical_load_expr` takes its
-     `return expr` branch for an authoritative subscript and hands `best` back
-     untouched, with the correct `elem_ty` of `UInt(32)` unused. Confirmed by
-     probe -- `LOADSTMT dst=tmp:11f00_2 elem_ty=UInt(32) rhs=Subscript { base:
-     Var(47), index: Var(10) }` and `LOADBASE spelling=arg0 def=None`, so the
-     fold's own expression really is the bare `arg0[t4900_2]` and the cast is the
-     analysis-built subscript reaching the page by another route.
-
-     Correction, from measuring it: `ptr_subscript_expr` is *not* the path this
-     load takes. Declining the ptr-arith subscript whenever
-     `ptr.element_size != elem_size` changes nothing -- built, measured at 37,
-     reverted. And neither subscript branch could have produced a byte cast in
-     any case: `try_subscript_from_addr_expr` types the element with
-     `uint_type_from_size(elem_size)`, the *access* width, and discards the scale
-     it extracted, so its failure mode is the double-scaled
-     `((uint32_t *)arg0)[i * 4]` rather than a byte view.
-
-     `render_semantic_value_for_var` is ruled out too: a probe inside that branch,
-     keyed on `tmp:11f00_2`, prints nothing. So the whole of `LowerCtx::op_to_expr`
-     is off the path -- none of its three renderings produce this line.
-
-     Ten sites are now eliminated with evidence, and the shortest true statement
-     of what remains is this: the fold's own answer for this load is the bare
-     `arg0[t4900_2]` (measured), codegen emits a `Subscript` verbatim (read), and
-     the emitted line nevertheless reads
-     `(((unsigned char *)(long)(arg0))[t4900_2])`. Something rewrites the
-     subscript's base between `op_to_stmt_impl` returning the statement and
-     codegen consuming it, and it is not any of: `render_canonical_load_expr` and
-     its memo, `prepared_load_access_expr_for_addr`, the recorded definition
-     (rejected as unsafe), the recorded semantic value, `ptr_subscript_expr`,
-     `try_subscript_from_addr_expr`, or `cast_addr_expr_to_ptr_if_needed` (its
-     branch is not taken).
-
-     The next probe should stop searching by name and instead dump the statement
-     list for block `0x100000830` after each pass in `decompile_input`'s
-     pipeline, comparing the `t11f00_2` assignment each time. The rewrite happens
-     between two adjacent entries in that list, and the bisect that found the
-     return-register guard found it in one run after two wrong guesses.
-
-     So the fix has to reconcile two facts that are each right on their own: the
-     pointer fact owns the address shape, the load owns the width. A four-byte
-     read through a byte-scaled pointer is `((uint32_t *)arg0)[i]` once the index
-     is unscaled, or `*(uint32_t *)((uint8_t *)arg0 + i * 4)` when it cannot be.
-     Whichever is chosen, the element type must come from the access, not from
-     the addressing.
-
-     Three fixes were tried at the load renderer and all three are inert,
-     because that is the wrong end of the pipeline. Reverted, and recorded so
-     they are not tried again: casting the subscript base to `elem_ty*`;
-     rescaling the index by a literal element width; and resolving the index's
-     definition before rescaling, with a byte-offset deref as fallback.
-
-     One thing those attempts did establish, which the next fix must respect:
-     **the index counts bytes.** `t4900_2 = rcx * 4` is the address arithmetic
-     the lifter already did, so widening the pointee without unscaling reads
-     `((uint32_t *)data)[i * 4]`, which is `i * 16`. The correct renderings are
-     `((uint32_t *)data)[i]` after unscaling, or `*(uint32_t *)((uint8_t *)data + i * 4)`
-     when the scaling cannot be seen.
-
-     Ruled out on the way: constraining the type hint to the access width
-     (`filter(|ty| ty.size == dst.size)`) changes nothing, because there is no
-     hint here at all. Reverted.
-
-     Also visible in the same function and probably a second defect: the tail
-     renders `switch (arg1)` where `switch (arg1 & 3)` is meant, so a 61-byte
-     message matches none of `case 1/2/3` and the tail is skipped entirely.
-     Using the selector value rather than `prepared_canonical_value_root` of it
-     does *not* fix that -- measured, unchanged, reverted -- so the mask is
-     already absent from the selector the switch facts carry.
+     One constraint holds whatever the fix: the index counts bytes.
+     `t4900_2 = rcx * 4` is address arithmetic the lifter already did, so the
+     correct forms are `((uint32_t *)arg0)[rcx]` after unscaling or
+     `*(uint32_t *)((uint8_t *)arg0 + t4900_2)` when the scaling cannot be seen.
 
   0g. **murmur3's tail switch renders with empty bodies.** This is what arm64 -O0
      `murmur3_32` now fails on, and the undeclared `x8_30` is a symptom of it
