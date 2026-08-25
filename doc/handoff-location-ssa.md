@@ -485,6 +485,32 @@ learn.
      own and does not make the recording safe, because a third reader,
      `ssa_name_for_spelling`, exists precisely to resolve differently.
 
+     **Why `for_ssa_name` does not rescue it.** `origin_name_to_expr` already asks
+     the reverse index before minting, and the index is empty by the time it
+     asks -- because it erases itself. `SymbolTable::declare` *uniquifies* rather
+     than interning, so every request for a spelling mints a fresh `SymbolId`,
+     and `note_ssa_name` deletes the index entry as soon as a second id claims
+     the same SSA name. In xxhash32 at x86-64 -O1 the flag path mints an id for
+     `tmp:4700_7` first, and the five later sites that mint `t4700_7` for the
+     same value then remove the entry that would have connected them.
+
+     Two things were tried against this and both are ruled out by measurement,
+     not argument. Spelling the origin the way the renderer spells it cannot
+     work, because `name_ref` goes through `declare` and would mint a *second*
+     symbol spelled `t4700_7_1` rather than reaching the first. Making
+     `sym_for_var` reuse the existing identifier when the requested spelling
+     matches does stop duplicate-spelling mints from destroying the index, but
+     it changes nothing here and nothing in the corpus -- the two spellings
+     differ, so they were never going to collide on spelling. Written, measured
+     inert, reverted.
+
+     What that leaves is an interface requirement rather than a naming trick: the
+     flag path resolves origins by *display name*, and a display name cannot be
+     resolved back to a value once more than one identifier has claimed it. The
+     provenance would have to carry the `SSAVar` -- the value -- so the condition
+     asks for the same thing the statement asks for. Everything short of that is
+     trying to reconstruct an identity from a string that was never unique.
+
      What is known to work is narrower and already landed: `for_ssa_name` lets a
      caller holding a raw SSA name reach the identifier already minted for that
      value, and `post_rename` no longer renames a value name into a storage name.
