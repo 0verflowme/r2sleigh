@@ -46,6 +46,7 @@ pub(crate) mod planner;
 pub(crate) mod post_rename;
 pub mod region;
 pub(crate) mod registers;
+mod shadow_report;
 pub(crate) mod single_evaluation;
 pub mod structure;
 pub mod symbol;
@@ -2505,6 +2506,271 @@ impl DecompilerInput {
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "Stage 4 retains the typed audit for tests while production rendering ignores it"
+)]
+#[derive(Debug)]
+enum BindingShadowFailure {
+    Build(crate::binding_plan::BindingPlanBuildError),
+    Pairing(crate::binding_plan::BindingPlanSourceMismatch),
+    Report(crate::shadow_report::ShadowReportError),
+    NonQuality(crate::shadow_report::ShadowLedger),
+}
+
+#[allow(
+    dead_code,
+    reason = "Stage 4 retains the typed audit for tests while production rendering ignores it"
+)]
+#[derive(Debug)]
+struct BindingShadow {
+    plan: crate::binding_plan::BindingPlan,
+    report: crate::shadow_report::ShadowReport,
+    ledger: crate::shadow_report::ShadowLedger,
+}
+
+#[allow(
+    dead_code,
+    reason = "Stage 4 retains the typed audit for tests while production rendering ignores it"
+)]
+#[derive(Debug)]
+enum BindingShadowOutcome {
+    Complete(BindingShadow),
+    Failed(BindingShadowFailure),
+}
+
+impl BindingShadowOutcome {
+    fn build(
+        source: &r2types::function_facts::SourceOwnedFunctionFacts,
+        legacy: &crate::shadow_report::LegacyAnalysisSnapshot,
+    ) -> Self {
+        let plan = match crate::binding_plan::BindingPlan::build_shadow(source) {
+            Ok(plan) => plan,
+            Err(error) => return Self::Failed(BindingShadowFailure::Build(error)),
+        };
+        if let Err(error) = crate::fold::op_lower::PlannedLoweringInput::try_new(source, &plan) {
+            return Self::Failed(BindingShadowFailure::Pairing(error));
+        }
+        let report = match crate::shadow_report::ShadowReport::build(&plan, source, legacy) {
+            Ok(report) => report,
+            Err(error) => return Self::Failed(BindingShadowFailure::Report(error)),
+        };
+        if let Err(error) = report.validate_against(&plan, source, legacy) {
+            return Self::Failed(BindingShadowFailure::Report(error));
+        }
+        let ledger = report.ledger(source);
+        if !ledger.passes_quality() {
+            return Self::Failed(BindingShadowFailure::NonQuality(ledger));
+        }
+        Self::Complete(BindingShadow {
+            plan,
+            report,
+            ledger,
+        })
+    }
+}
+
+/// Public, renderer-independent counts for one binding-shadow domain.
+///
+/// These are audit results, not rendering inputs. Keeping the complete ledger
+/// visible prevents a refusal or an unclassified cell from being counted as a
+/// successful shadow run merely because no C was emitted for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BindingShadowDomainAudit {
+    pub total: usize,
+    pub observed: usize,
+    pub agree_correct: usize,
+    pub old_wrong: usize,
+    pub shadow_wrong: usize,
+    pub both_wrong_equal: usize,
+    pub both_wrong_different: usize,
+    pub unclassified: usize,
+    pub refused: usize,
+}
+
+impl BindingShadowDomainAudit {
+    pub const fn equations_hold(self) -> bool {
+        let Some(both_wrong) = self
+            .both_wrong_equal
+            .checked_add(self.both_wrong_different)
+        else {
+            return false;
+        };
+        let Some(classified) = self.agree_correct.checked_add(self.old_wrong) else {
+            return false;
+        };
+        let Some(classified) = classified.checked_add(self.shadow_wrong) else {
+            return false;
+        };
+        let Some(classified) = classified.checked_add(both_wrong) else {
+            return false;
+        };
+        let Some(accounted) = classified.checked_add(self.unclassified) else {
+            return false;
+        };
+        self.total == self.observed && self.observed == accounted
+    }
+
+    pub const fn passes_quality(self) -> bool {
+        self.equations_hold()
+            && self.shadow_wrong == 0
+            && self.both_wrong_equal == 0
+            && self.both_wrong_different == 0
+            && self.unclassified == 0
+            && self.refused == 0
+    }
+}
+
+impl From<crate::shadow_report::DomainLedger> for BindingShadowDomainAudit {
+    fn from(ledger: crate::shadow_report::DomainLedger) -> Self {
+        Self {
+            total: ledger.total,
+            observed: ledger.observed,
+            agree_correct: ledger.agree_correct,
+            old_wrong: ledger.old_wrong,
+            shadow_wrong: ledger.shadow_wrong,
+            both_wrong_equal: ledger.both_wrong_equal,
+            both_wrong_different: ledger.both_wrong_different,
+            unclassified: ledger.unclassified,
+            refused: ledger.refused,
+        }
+    }
+}
+
+/// Observable Stage 4 ledger, kept separate from all renderer inputs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BindingShadowAuditLedger {
+    pub values: BindingShadowDomainAudit,
+    pub uses: BindingShadowDomainAudit,
+    pub writes: BindingShadowDomainAudit,
+}
+
+impl BindingShadowAuditLedger {
+    pub const fn equations_hold(self) -> bool {
+        self.values.equations_hold()
+            && self.uses.equations_hold()
+            && self.writes.equations_hold()
+    }
+
+    pub const fn passes_quality(self) -> bool {
+        self.values.passes_quality()
+            && self.uses.passes_quality()
+            && self.writes.passes_quality()
+    }
+}
+
+impl From<crate::shadow_report::ShadowLedger> for BindingShadowAuditLedger {
+    fn from(ledger: crate::shadow_report::ShadowLedger) -> Self {
+        Self {
+            values: ledger.values.into(),
+            uses: ledger.uses.into(),
+            writes: ledger.writes.into(),
+        }
+    }
+}
+
+/// Typed reason a production binding-shadow audit did not complete cleanly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BindingShadowAuditFailure {
+    PlanBuild,
+    SourcePairing,
+    Report,
+    NonQuality { ledger: BindingShadowAuditLedger },
+}
+
+/// Non-consuming binding audit exposed to corpus and integration tooling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BindingShadowAuditOutcome {
+    Complete {
+        ledger: BindingShadowAuditLedger,
+    },
+    Failed(BindingShadowAuditFailure),
+    /// The selected route never entered the native Standard renderer.
+    NotRun,
+}
+
+impl BindingShadowAuditOutcome {
+    fn from_internal(outcome: &BindingShadowOutcome) -> Self {
+        match outcome {
+            BindingShadowOutcome::Complete(shadow) => Self::Complete {
+                ledger: shadow.ledger.into(),
+            },
+            BindingShadowOutcome::Failed(BindingShadowFailure::Build(_)) => {
+                Self::Failed(BindingShadowAuditFailure::PlanBuild)
+            }
+            BindingShadowOutcome::Failed(BindingShadowFailure::Pairing(_)) => {
+                Self::Failed(BindingShadowAuditFailure::SourcePairing)
+            }
+            BindingShadowOutcome::Failed(BindingShadowFailure::Report(_)) => {
+                Self::Failed(BindingShadowAuditFailure::Report)
+            }
+            BindingShadowOutcome::Failed(BindingShadowFailure::NonQuality(ledger)) => {
+                Self::Failed(BindingShadowAuditFailure::NonQuality {
+                    ledger: (*ledger).into(),
+                })
+            }
+        }
+    }
+}
+
+/// Rendered C paired with the non-consuming Stage 4 binding audit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecompileBindingAudit {
+    output: String,
+    binding_shadow: BindingShadowAuditOutcome,
+}
+
+impl DecompileBindingAudit {
+    fn not_run(output: String) -> Self {
+        Self {
+            output,
+            binding_shadow: BindingShadowAuditOutcome::NotRun,
+        }
+    }
+
+    pub fn output(&self) -> &str {
+        &self.output
+    }
+
+    pub fn into_output(self) -> String {
+        self.output
+    }
+
+    pub const fn binding_shadow(&self) -> BindingShadowAuditOutcome {
+        self.binding_shadow
+    }
+}
+
+fn capture_legacy_binding_analysis(
+    input: crate::analysis::use_info::UseAnalysisInput<'_>,
+) -> crate::shadow_report::LegacyAnalysisSnapshot {
+    let source = input.source();
+    let values = source
+        .source()
+        .graph()
+        .values
+        .iter()
+        .map(|value| {
+            let observation = if value.var.constant_bits().is_some() {
+                crate::shadow_report::LegacyValueObservation::InlineConstant
+            } else {
+                // The legacy renderer has no authority-sealed value-decision
+                // journal. A rendered spelling cannot prove object identity,
+                // so non-literals remain absent until Stage 5 records the real
+                // decision. Uses/writes likewise require original normalized
+                // sites and are populated as absent by the snapshot builder.
+                crate::shadow_report::LegacyValueObservation::LegacyAbsent
+            };
+            crate::shadow_report::LegacyValueCell {
+                value: value.id,
+                observation,
+            }
+        })
+        .collect::<Vec<_>>()
+        .into_boxed_slice();
+    crate::shadow_report::LegacyAnalysisSnapshot::with_absent_machine_observations(source, values)
+}
+
 /// The main decompiler.
 pub struct Decompiler {
     config: DecompilerConfig,
@@ -2585,6 +2851,30 @@ impl Decompiler {
         input: &'a DecompilerInput,
         control: &'a dyn r2ssa::SsaWorkControl,
     ) -> Result<String, DecompileExecutionStop> {
+        self.decompile_input_with_binding_audit_and_control(input, control)
+            .map(DecompileBindingAudit::into_output)
+    }
+
+    /// Decompile and expose the non-consuming binding-shadow audit.
+    ///
+    /// The audit is constructed only after the final production poll. Its
+    /// outcome therefore cannot change the C output or a cancellation/deadline
+    /// decision made by the rendering path.
+    pub fn decompile_input_with_binding_audit(
+        &self,
+        input: &DecompilerInput,
+    ) -> DecompileBindingAudit {
+        let control = r2ssa::SsaExecutionControl::default();
+        self.decompile_input_with_binding_audit_and_control(input, &control)
+            .expect("default decompiler control never stops")
+    }
+
+    /// Controlled form of [`Self::decompile_input_with_binding_audit`].
+    pub fn decompile_input_with_binding_audit_and_control<'a>(
+        &self,
+        input: &'a DecompilerInput,
+        control: &'a dyn r2ssa::SsaWorkControl,
+    ) -> Result<DecompileBindingAudit, DecompileExecutionStop> {
         let work = DecompileWorkControl::new(control, DecompileWorkPhase::Normalization);
         work.poll()?;
         let func = input.prepared_ssa().function();
@@ -2594,44 +2884,57 @@ impl Decompiler {
             .unwrap_or_else(|| format!("sub_{:x}", func.entry));
         let block_count = func.blocks().count();
         if block_count > self.config.max_blocks {
-            return Ok(block_guard_fallback_comment(
-                &func_name,
-                block_count,
-                self.config.max_blocks,
+            return Ok(DecompileBindingAudit::not_run(
+                block_guard_fallback_comment(&func_name, block_count, self.config.max_blocks),
             ));
         }
         let function_facts = input.function_facts();
         let Some(semantic_route) = function_facts.decompile_route() else {
-            return Ok(missing_decompile_route_residual_comment(&func_name));
+            return Ok(DecompileBindingAudit::not_run(
+                missing_decompile_route_residual_comment(&func_name),
+            ));
         };
         if let Some(reason) = route_fallback_reason(semantic_route) {
-            return Ok(artifact_guard_fallback_comment(&func_name, reason));
+            return Ok(DecompileBindingAudit::not_run(
+                artifact_guard_fallback_comment(&func_name, reason),
+            ));
         }
         if let Some(reason) = summary_only_semantics_standard_render_residual_reason(
             function_facts.decompile_route(),
             function_facts.semantic_report(),
         ) {
-            return Ok(artifact_guard_fallback_comment(&func_name, &reason));
+            return Ok(DecompileBindingAudit::not_run(
+                artifact_guard_fallback_comment(&func_name, &reason),
+            ));
         }
         if let Some(output) =
             self.vm_summary_output_for_route(&func_name, function_facts, semantic_route)
         {
-            return Ok(output);
+            return Ok(DecompileBindingAudit::not_run(output));
         }
         if let Some(output) = self.semantic_worker_summary_output_for_route(
             &func_name,
             function_facts,
             semantic_route,
         ) {
-            return Ok(output);
+            return Ok(DecompileBindingAudit::not_run(output));
         }
         let c_func = self.build_function_from_input_with_control(input, control)?;
         let render_work = work.with_phase(DecompileWorkPhase::Rendering);
         render_work.poll()?;
-        let mut codegen = CodeGenerator::new(self.config.codegen.clone());
-        let output = codegen.generate_function(&c_func);
+        let output = CodeGenerator::new(self.config.codegen.clone()).generate_function(&c_func);
+        // This is deliberately the last production work-control decision.
+        // Everything below is observational Stage 4 shadow work.
         render_work.poll()?;
-        Ok(output)
+        let legacy_binding_analysis = capture_legacy_binding_analysis(
+            crate::analysis::use_info::UseAnalysisInput::new(input.source_owned_facts()),
+        );
+        let binding_shadow =
+            BindingShadowOutcome::build(input.source_owned_facts(), &legacy_binding_analysis);
+        Ok(DecompileBindingAudit {
+            output,
+            binding_shadow: BindingShadowAuditOutcome::from_internal(&binding_shadow),
+        })
     }
 
     /// Render, keeping whatever was produced when a phase stopped.
@@ -3629,7 +3932,10 @@ impl Decompiler {
         // owes, and rendering it says the effects were all handled when nothing
         // ever enumerated them.
         if let Some(reason) = incomplete_source_obligations_reason(prepared) {
-            return Ok(residual_function_for_render_boundary(&c_function.name, &reason));
+            return Ok(residual_function_for_render_boundary(
+                &c_function.name,
+                &reason,
+            ));
         }
         let mut ledger = build_obligation_ledger(
             prepared,
@@ -7007,6 +7313,153 @@ mod tests {
 
         let output = decompiler.decompile_input(&input);
         assert!(output.contains("return"), "{output}");
+    }
+
+    #[test]
+    fn native_standard_path_builds_a_sound_non_consuming_binding_shadow() {
+        let arch = test_arch_for_decompile();
+        let prepared = prepared_from_ops(
+            vec![R2ILOp::Return {
+                target: Varnode::constant(0, 8),
+            }],
+            &arch,
+        );
+        let input = source_owned_decompiler_input(
+            prepared,
+            (
+                r2types::DecompileRouteKind::Standard,
+                "binding shadow production path",
+                None,
+            ),
+        );
+        let config = DecompilerConfig::x86_64();
+        let public_decompiler = Decompiler::new(config.clone());
+        let internal_decompiler =
+            Decompiler::new(config.clone()).with_context(input.context_projection());
+        let semantic_route = input
+            .function_facts()
+            .decompile_route()
+            .expect("sealed standard route");
+        let execution = r2ssa::SsaExecutionControl::default();
+        let work = DecompileWorkControl::new(&execution, DecompileWorkPhase::Normalization);
+        let built = internal_decompiler
+            .build_function_internal_with_control(&input, semantic_route, work)
+            .expect("native production build");
+
+        let internal_output = CodeGenerator::new(config.codegen).generate_function(&built);
+        let public_output = public_decompiler.decompile_input(&input);
+        assert_eq!(internal_output, public_output);
+        let audited = public_decompiler.decompile_input_with_binding_audit(&input);
+        assert_eq!(audited.output(), public_output);
+        let BindingShadowAuditOutcome::Complete { ledger } = audited.binding_shadow() else {
+            panic!("public native path did not expose its complete shadow audit");
+        };
+        assert!(ledger.equations_hold());
+        assert!(ledger.passes_quality());
+        let mut corrupted_public_ledger = ledger;
+        corrupted_public_ledger.values.observed =
+            corrupted_public_ledger.values.observed.saturating_sub(1);
+        assert!(!corrupted_public_ledger.equations_hold());
+        assert!(!corrupted_public_ledger.passes_quality());
+    }
+
+    #[test]
+    fn native_shadow_quality_refusal_is_observable_without_changing_output() {
+        let arch = test_arch_for_decompile();
+        let prepared = prepared_from_ops(
+            vec![R2ILOp::Return {
+                target: Varnode::register(0, 8),
+            }],
+            &arch,
+        );
+        let input = source_owned_decompiler_input(
+            prepared,
+            (
+                r2types::DecompileRouteKind::Standard,
+                "binding shadow refusal path",
+                None,
+            ),
+        );
+        let decompiler = Decompiler::new(DecompilerConfig::x86_64());
+
+        let output = decompiler.decompile_input(&input);
+        let audited = decompiler.decompile_input_with_binding_audit(&input);
+        assert_eq!(audited.output(), output);
+        let BindingShadowAuditOutcome::Failed(BindingShadowAuditFailure::NonQuality { ledger }) =
+            audited.binding_shadow()
+        else {
+            panic!(
+                "missing register geometry must remain an observable non-quality audit: {:?}",
+                audited.binding_shadow()
+            );
+        };
+        assert!(ledger.equations_hold());
+        assert!(!ledger.passes_quality());
+        assert!(ledger.values.refused + ledger.uses.refused + ledger.writes.refused > 0);
+    }
+
+    #[test]
+    fn binding_shadow_adds_no_post_render_work_control_decision() {
+        struct CountingControl {
+            polls: std::cell::Cell<usize>,
+            stop_at: Option<usize>,
+        }
+
+        impl r2ssa::SsaWorkControl for CountingControl {
+            fn poll(&self) -> Result<(), r2ssa::SsaExecutionStopReason> {
+                let poll = self.polls.get() + 1;
+                self.polls.set(poll);
+                if self.stop_at == Some(poll) {
+                    Err(r2ssa::SsaExecutionStopReason::Cancelled)
+                } else {
+                    Ok(())
+                }
+            }
+        }
+
+        let arch = test_arch_for_decompile();
+        let prepared = prepared_from_ops(
+            vec![R2ILOp::Return {
+                target: Varnode::constant(0, 8),
+            }],
+            &arch,
+        );
+        let input = source_owned_decompiler_input(
+            prepared,
+            (
+                r2types::DecompileRouteKind::Standard,
+                "binding shadow work-control path",
+                None,
+            ),
+        );
+        let decompiler = Decompiler::new(DecompilerConfig::x86_64());
+        let baseline = CountingControl {
+            polls: std::cell::Cell::new(0),
+            stop_at: None,
+        };
+        decompiler
+            .decompile_input_with_binding_audit_and_control(&input, &baseline)
+            .expect("unbounded audit");
+        let final_production_poll = baseline.polls.get();
+
+        let stop_at_final = CountingControl {
+            polls: std::cell::Cell::new(0),
+            stop_at: Some(final_production_poll),
+        };
+        let stop = decompiler
+            .decompile_input_with_binding_audit_and_control(&input, &stop_at_final)
+            .expect_err("the final production poll must remain observable");
+        assert_eq!(stop.phase(), DecompileWorkPhase::Rendering);
+        assert_eq!(stop.reason(), r2ssa::SsaExecutionStopReason::Cancelled);
+
+        let no_later_poll = CountingControl {
+            polls: std::cell::Cell::new(0),
+            stop_at: Some(final_production_poll + 1),
+        };
+        decompiler
+            .decompile_input_with_binding_audit_and_control(&input, &no_later_poll)
+            .expect("shadow capture and classification must not poll work control");
+        assert_eq!(no_later_poll.polls.get(), final_production_poll);
     }
 
     /// Nothing in this function is unproven, so it carries no proof note. A
