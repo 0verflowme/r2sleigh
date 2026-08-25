@@ -1,7 +1,11 @@
 # Architecture plan: dispositions, bindings, and projections
 
-Status as of 2026-08-25, branch `arch/location-ssa`, HEAD `ed7dfdc`.
-Corpus 38 of 54. 2340 tests pass. Tree clean.
+Execution status as of 2026-08-25 on `codex/binding-spine-rewrite`:
+stage 0 is committed at `e787934`. The pristine 54-cell raw baseline is
+complete; the strict raw gate reports 0 passing, 26 compile failures, 27
+signature mismatches, and 1 blocked renderer error. The old “38 of 54” number
+was produced only after the harness erased declared types and is not a quality
+measurement.
 
 Revision 2. Revision 1 proposed one `Binding` per `ValueId`. That model was
 wrong at the cardinality, rebuilt an upstream fact downstream, and was gated on
@@ -19,8 +23,9 @@ by a corpus pass count.
 1. **Every emitted identifier is declared once, in a scope that dominates every
    surviving read, and is assigned before that read on every path.** Proved by
    construction: the phase that decides a value is named is the phase that emits
-   its declaration, and placement is derived from the sealed region tree rather
-   than stored.
+   its declaration, and placement is derived from a sealed structured-region
+   artifact rather than stored. The current structurer consumes and discards
+   `Region`, so stage 7 must first retain that artifact.
 2. **Every use renders the exact slice it consumes.** Proved by an internal
    invariant — every `UseSite` carries a projection backed by an upstream
    canonical fact — and tripwired externally by compiling the untouched emitted
@@ -113,7 +118,7 @@ Five identities. **Four already exist in the tree.** Only `BindingId` is new.
 
 ```
 CanonicalLocation   the machine place       r2source/src/contracts.rs:30
-StorageSpanId       one uninterrupted run   r2ssa/src/span.rs:28
+SpanId              one uninterrupted run   r2ssa/src/span.rs:24
 ValueId             one SSA version         r2ssa/src/graph.rs:17
 UseSite             one consumption         r2ssa/src/graph.rs:20
 BindingId           one rendered C object   (new)
@@ -142,11 +147,11 @@ single-location case, which is not the general one.
 The correct shape:
 
 ```
-CanonicalLocation ──has temporal contents──▶ StorageSpanId
-StorageSpanId     ──contains──────────────▶ ValueId
-ValueId           ──is consumed at────────▶ UseSite
+CanonicalLocation ──has temporal contents──▶ SpanId
+SpanId              ──contains──────────────▶ ValueId
+ValueId              ──is consumed at────────▶ UseSite
 
-BindingId ──coalesces a certified set of──▶ ValueId / StorageSpanId
+BindingId ──coalesces a certified set of──▶ ValueId / SpanId
 ```
 
 `BindingId` is a **renderer projection across the SSA graph**, not a child of a
@@ -155,6 +160,13 @@ never stores a second origin claim of its own. That distinction is the whole
 correction: revision 1's `Origin { Carrier { id, width }, StackSlot(off), ... }`
 rebuilt `CanonicalLocation` inside the renderer, which is the same defect this
 plan exists to remove, committed by the plan itself.
+
+The certificate inside a sealed `Binding` is opaque outside the binding-plan
+module. A `SpanId` or `SemanticId` is only the identity of a candidate upstream
+fact, not proof by itself. Sealing must resolve that identity against the exact
+`SourceOwnedFunctionFacts` authority and prove that the values whose dispositions
+name the binding are exactly the certified member set. `Singleton` likewise means
+exactly one bound value after that check; it is not a freely constructible claim.
 
 ### Disposition, not a nullable name
 
@@ -165,7 +177,7 @@ legal states instead, so the invalid ones cannot be written:
 ```rust
 enum ValueDisposition {
     Bound   { binding: BindingId },
-    Inline  { expr: ExprId, proof: InlineProof },
+    Inline  { expr: MachineExprId, proof: InlineProof },
     Elided  { reason: ElisionReason, proof: DeadValueProof },
     Refused { reason: RefusalReason },
 }
@@ -206,7 +218,7 @@ predicate consulted at render time and becomes a fact recorded at the definition
 Declaration placement is a pure lowering phase immediately before AST emission:
 
 ```
-sealed region tree
+sealed structured-region artifact
   + binding definitions
   + surviving planned uses
   → declaration location | PlacementRefusal
@@ -268,9 +280,12 @@ The rule is not a container choice:
 > Every closure computes a unique least fixpoint using a monotone transfer over a
 > stable domain; scheduling uses a sorted worklist.
 
-`ValueId` allocation is already dense and stable — `graph.rs:135` interns
-`ValueId(values.len())` over a `BTreeMap`-keyed traversal — so indexed vectors
-give deterministic O(1) lookup and iteration, and a `BTreeMap` buys nothing there.
+`ValueId` allocation is already dense and stable for one exact prepared
+artifact: `graph.rs` interns `ValueId(values.len())` while walking canonical
+reverse-postorder blocks, then phi and op operands in their stored order. The
+`BTreeMap` is only the reverse interning index; it does not choose allocation
+order. Indexed vectors therefore give deterministic O(1) lookup and iteration
+without claiming that IDs survive a changed traversal.
 But the actual determinism bug on this branch was not map order; it was a single
 non-fixpoint pass. Dense storage does not address that class.
 
@@ -367,6 +382,12 @@ Land `ValueDisposition`, `BindingId`, `Binding`, `UseProjection`,
 construction, no consumption. Define the module APIs of `op_lower` and
 `use_info` in the same stage, because stage 3 splits along them.
 
+`analysis::use_info::UseAnalysisInput` owns the exact source-analysis seam.
+`fold::op_lower::PlannedLoweringInput::try_new` owns the source/plan seam and
+rejects an authority mismatch or a `MachineProjection` that does not validate
+against that exact source. Neither API is called by the render path in this
+stage, and there is still no production `BindingPlan` constructor.
+
 **Gate:** types compile and are unreferenced by the render path. Corpus
 byte-identical on all 54 raw outputs.
 
@@ -394,7 +415,10 @@ unchanged at 2340. A single differing byte means the split was not mechanical.
 ### Stage 4 — Shadow construction and divergence classification
 
 Build the disposition, binding and projection tables from the existing analysis
-without consuming them. At the analysis/render boundary, classify each divergence
+without consuming them. The checked seal proves exact source authority, machine
+projection validity, dense table completeness, certificate membership, and one
+disposition per obligation before producing a `BindingPlan`. At the
+analysis/render boundary, classify each divergence
 from the old tables **against canonical upstream evidence** — which of the two is
 right, and which upstream fact says so.
 
@@ -429,7 +453,10 @@ zero inferred. Both gates, not either.
 
 ### Stage 7 — Cut over placement, inlining, elision, and the effect ledger
 
-Placement becomes the pure lowering phase over the sealed region tree.
+Placement becomes the pure lowering phase over a sealed structured-region
+artifact. Because the current structurer discards `Region`, retaining and
+sealing that artifact is the first part of this stage, not a renderer-side
+placement cache.
 `InlineProof` and `DeadValueProof` become required. The effect ledger lands
 separately from the value ledger.
 
@@ -486,21 +513,30 @@ input classes.
 
 ---
 
-## 10. Open defects at HEAD
+## 10. Open defects at the stage-0 baseline
 
-**This inventory is incomplete.** 54 − 38 = 16 failures; the rows below account
-for 13. The missing 3 are not currently identified — the inventory was assembled
-from traces across a long session rather than from a fresh enumeration, and
-closing that gap is part of stage 0.
+The harness now accounts for every cell. Failure status and causal diagnosis
+remain separate: a cell is never omitted merely because its root cause has not
+yet been classified.
 
-| Cause | Entries | Cleared by |
-|---|---|---|
-| murmur3 region/ordering — `t20380_5`, `t11f00_10` read before the merge declares them | 2 | Stage 5, 7 |
-| murmur3 lost zero — `k1` renders as `arg3`, from parameter over-recovery | 2 | Stage 5 |
-| crc32_bitwise — undeclared `tregalias_`, `tregpiece_` temporaries | 2 | Stage 5 |
-| fnv1a64 — `r8d` piece composition | 1 | Stage 6 |
-| xxhash32 — 2 blocked on `sym__rotl32` linking, 2 wrong values, 1 `callother`, 1 struct type error | 6 | **Not this rewrite** — stage 0 for the linking, separate work for `callother` and struct typing |
-| unidentified | 3 | Stage 0 enumerates them |
+| Configuration | Generation | Raw | Diagnostic | Differential |
+|---|---:|---:|---:|---:|
+| x64 O0 | 9 present | 9 signature mismatch | 9 signature mismatch | 9 blocked |
+| x64 O1 | 9 present | 9 signature mismatch | 9 signature mismatch | 9 blocked |
+| x64 O2 | 8 present, 1 renderer error | 8 signature mismatch, 1 blocked | 8 signature mismatch, 1 blocked | 9 blocked |
+| arm64 O0 | 9 present | 9 compile failure | 7 pass, 2 failure | 7 diagnostic-backed pass, 2 blocked |
+| arm64 O1 | 9 present | 8 compile failure, 1 signature mismatch | 7 pass, 1 failure, 1 signature mismatch | 7 diagnostic-backed pass, 2 blocked |
+| arm64 O2 | 9 present | 9 compile failure | 6 pass, 3 failure | 6 diagnostic-backed pass, 3 blocked |
+
+Known causal examples remain useful for routing, not accounting:
+
+| Cause | Cleared by |
+|---|---|
+| x64 parameter/signature over-recovery | Stage 5 and upstream type projection |
+| murmur3 merge values read before declaration | Stages 5 and 7 |
+| crc32_bitwise undeclared register piece/alias values | Stage 5 |
+| fnv1a64 narrow/wide piece composition | Stage 6 |
+| xxhash32 unresolved rotate, `callother`, and struct typing | Separate upstream semantic/type work where the binding rewrite supplies no proof |
 
 ---
 

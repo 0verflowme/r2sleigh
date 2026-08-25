@@ -30,6 +30,7 @@
 pub(crate) mod address;
 pub(crate) mod analysis;
 pub mod ast;
+mod binding_plan;
 pub(crate) mod codegen;
 #[cfg(test)]
 pub(crate) mod consumer_linear;

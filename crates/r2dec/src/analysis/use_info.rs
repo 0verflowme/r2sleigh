@@ -9,6 +9,7 @@ use r2ssa::{
 use r2types::{
     CalleeCallArgPolicy, CalleeResolutionFacts, CalleeTargetIdentityRequest,
     CalleeTargetPolicyDecision, CalleeTargetResolutionRequest, CallsiteKey,
+    SourceOwnedFunctionFacts,
 };
 
 use super::{
@@ -25,6 +26,34 @@ use crate::registers::register_family_name;
 pub(crate) struct UseScratch {
     pub(crate) info: UseInfo,
     producers: HashMap<String, SSAOp>,
+}
+
+/// Stage-3 seam for value/use analysis. It carries the exact source-owned
+/// authority explicitly; the renderer may not reconstruct it from `PassEnv`.
+#[allow(
+    dead_code,
+    reason = "Stage 1 API seam; Stage 3 moves existing analysis behind it"
+)]
+pub(crate) struct UseAnalysisInput<'a> {
+    source: &'a SourceOwnedFunctionFacts,
+}
+
+#[allow(
+    dead_code,
+    reason = "Stage 1 API seam; Stage 3 moves existing analysis behind it"
+)]
+impl<'a> UseAnalysisInput<'a> {
+    pub(crate) const fn new(source: &'a SourceOwnedFunctionFacts) -> Self {
+        Self { source }
+    }
+
+    pub(crate) const fn source(&self) -> &'a SourceOwnedFunctionFacts {
+        self.source
+    }
+
+    pub(crate) fn blocks(&self) -> impl Iterator<Item = &'a SSABlock> {
+        self.source.source().function().blocks()
+    }
 }
 
 #[derive(Debug, Default)]

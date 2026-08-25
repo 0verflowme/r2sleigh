@@ -16,10 +16,53 @@ pub struct InstId(pub u32);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct ValueId(pub u32);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct UseSite {
     pub inst: InstId,
     pub input_idx: usize,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{InstId, UseSite};
+
+    #[test]
+    fn use_sites_have_stable_instruction_then_input_order() {
+        let mut sites = [
+            UseSite {
+                inst: InstId(3),
+                input_idx: 1,
+            },
+            UseSite {
+                inst: InstId(2),
+                input_idx: 4,
+            },
+            UseSite {
+                inst: InstId(3),
+                input_idx: 0,
+            },
+        ];
+
+        sites.sort();
+
+        assert_eq!(
+            sites,
+            [
+                UseSite {
+                    inst: InstId(2),
+                    input_idx: 4,
+                },
+                UseSite {
+                    inst: InstId(3),
+                    input_idx: 0,
+                },
+                UseSite {
+                    inst: InstId(3),
+                    input_idx: 1,
+                },
+            ]
+        );
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

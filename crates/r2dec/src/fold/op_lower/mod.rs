@@ -35,12 +35,13 @@ use r2types::normalize_callee_name;
 use r2types::{
     CTypeLike, CalleeIdentity, ExternalField, ExternalStackBase, ExternalStackSlotRole,
     ExternalStruct, ExternalUnion, FunctionRenderFacts, ReturnValueRenderFact,
-    normalize_external_type_name, parse_type_like_spec,
+    SourceOwnedFunctionFacts, normalize_external_type_name, parse_type_like_spec,
 };
 
 use crate::address::parse_address_from_var_name;
 use crate::analysis;
 use crate::ast::{BinaryOp, CExpr, CStmt, CType, UnaryOp};
+use crate::binding_plan::{BindingPlan, BindingPlanSourceMismatch};
 use crate::registers::register_family_name;
 
 use super::SSABlock;
@@ -53,6 +54,40 @@ use super::{
     MAX_ALIAS_REWRITE_DEPTH, MAX_PREDICATE_OPERAND_DEPTH, MAX_RETURN_EXPR_DEPTH,
     MAX_RETURN_INLINE_CANDIDATE_DEPTH, MAX_RETURN_INLINE_DEPTH, MAX_SIMPLE_EXPR_DEPTH,
 };
+
+/// Stage-3 lowering seam. Construction checks that the plan, its machine
+/// projection, and the source-owned report all refer to the exact same SSA
+/// artifact before a lowering path can observe the pair.
+#[allow(
+    dead_code,
+    reason = "Stage 1 API seam; Stage 3 moves existing lowering behind it"
+)]
+pub(crate) struct PlannedLoweringInput<'a> {
+    source: &'a SourceOwnedFunctionFacts,
+    plan: &'a BindingPlan,
+}
+
+#[allow(
+    dead_code,
+    reason = "Stage 1 API seam; Stage 3 moves existing lowering behind it"
+)]
+impl<'a> PlannedLoweringInput<'a> {
+    pub(crate) fn try_new(
+        source: &'a SourceOwnedFunctionFacts,
+        plan: &'a BindingPlan,
+    ) -> Result<Self, BindingPlanSourceMismatch> {
+        plan.validate_source(source.source())?;
+        Ok(Self { source, plan })
+    }
+
+    pub(crate) const fn source(&self) -> &'a SourceOwnedFunctionFacts {
+        self.source
+    }
+
+    pub(crate) const fn plan(&self) -> &'a BindingPlan {
+        self.plan
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CallExprSourceProof {
