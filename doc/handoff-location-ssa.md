@@ -304,28 +304,53 @@ learn.
      layer rather than carrier membership; and `x8_30` in arm64 -O0 murmur3_32 is
      not a naming defect at all -- see 0g.
 
-  0h. **Rendering one function changes how the next one renders.** This is
-     independent of everything above, it predates all of it, and it undermines
-     any measurement taken over a sweep.
+  0h. **The renderer is not deterministic.** Two `pdd` calls on the same
+     function, in the same process, with nothing in between, produce different C.
+     This is the most serious item in this document and it qualifies every
+     measurement in it.
 
      ```
-     r2 -c 'a:sla; aaa; s sym._adler32; pdd'                    -> no `rax` declaration
-     r2 -c 'a:sla; aaa; s sym._djb2; pdd; s sym._adler32; pdd'  ->    `rax` declared
+     r2 -c 'a:sla; aaa; s sym._adler32; pdd; pdd; pdd'   -> three different renderings
      ```
 
-     Rendering `djb2` first changes `adler32`'s declaration block. It is not
-     self-contamination -- rendering `adler32` twice gives the same answer both
-     times -- and not every predecessor does it: `fnv1a32` first leaves
-     `adler32` unchanged. Confirmed present on the build before the carrier-view
-     work as well, in the opposite direction, so it is not caused by it.
+     Three consecutive renders of `adler32` at x86-64 -O2 hashed to three
+     distinct outputs. It is not confined to failing functions: `fnv1a32`, which
+     is CORRECT everywhere, rendered identically in two of three sessions and
+     differently in the third.
 
-     Decompiling a function should be a pure function of that function's inputs.
-     Until it is, the corpus number depends on the order `sweep.sh` happens to
-     use, and a single-function reproduction may not show what the sweep saw --
-     which is worth knowing before trusting any trace taken one function at a
-     time. The obvious suspect is the type writeback, which mutates radare2's own
-     state as a side effect of rendering, but that is a guess and has not been
-     traced.
+     What it is not. It is not the SSA deadline -- the decompile path builds
+     `SsaExecutionControl::default()`, which carries no deadline at all. It is
+     not radare2's state: `afs` and `afv` for `adler32` are byte-identical before
+     and after, and the type database is empty in both. It is not the lift or the
+     facts: across two renderings that differ structurally, the proof line reports
+     the *same* 169 source obligations, 149 built, 16 elided, 0 refused, 4
+     unaccounted, while the statement count moves between 55, 56 and 57. The same
+     facts are being rendered differently.
+
+     Where it starts. Dumping per-pass state shows the two runs already differing
+     at the first pass, `simplify_identities_in_function`, so it is upstream of
+     every post-pass -- in analysis, folding or structuring. The differences are
+     structural, not cosmetic: one run emits
+     `if ((arg1 & 1) == 0) { return ...; }` followed by flat statements where the
+     other emits `{ if ((arg1 & 1) != 0) { ...block... } }`.
+
+     The hypothesis, which is *not* proven: something iterates a `HashMap` or
+     `HashSet` to reach a rendering decision. Rust seeds each map instance
+     separately, so iteration order over identical insertions differs between two
+     maps in one process, which matches within-process run-to-run variation
+     exactly. `structure.rs` holds no such loop, so the search should start in
+     analysis and folding. The fix is that no decision may depend on the order an
+     unordered container yields -- ordered containers where a decision is made,
+     or an explicit sort before deciding.
+
+     What it does *not* invalidate. The corpus verdict is stable even though the
+     text is not: three independent sweeps of x86-64 -O2 all scored 4. Aggregate
+     numbers in this document can be trusted; a single rendering quoted in it may
+     not reproduce, and a trace taken once may not either.
+
+     Supersedes an earlier claim here that rendering `djb2` before `adler32`
+     changed `adler32`'s output. That was one sample per condition, and what it
+     actually sampled was this.
 
   0g. **murmur3's tail switch renders with empty bodies.** This is what arm64 -O0
      `murmur3_32` now fails on, and the undeclared `x8_30` is a symptom of it
