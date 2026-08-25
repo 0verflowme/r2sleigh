@@ -628,12 +628,24 @@ learn.
      switch reads is dropped anyway.
 
      Adding `&& self.use_count_of(&key) == 0` is the obvious fix and measures
-     inert -- built, corpus unchanged at 37, the line unchanged, reverted. The
-     reason is worth more than the attempt: `use_count_of` asks by *name*, and
-     `ECX_3`'s count is zero because the switch reads that value under a
-     different name. The guard needs a value-keyed use count, not a name-keyed
-     one. That is the same name-versus-value split this document records
-     elsewhere, showing up in a fifth place.
+     inert -- built, corpus unchanged at 37, the line unchanged, reverted.
+
+     And the explanation offered for that is wrong, so do not act on it:
+     `use_count_for_name` is *already* value-keyed -- it maps the name to a
+     `ValueId` and reads `use_counts_by_value` -- and `count_uses_and_conditions`
+     counts phi sources as well as op sources. There is no name-versus-value gap
+     here.
+
+     What the inert result actually means is that the zeroing rule is not what
+     drops this statement. Had it been, requiring a zero use count would have
+     kept the statement and changed the line. Look instead at what `rcx =
+     (uint32_t)arg3;` *is*: it reads as a carrier initialiser rather than an
+     elided xor, so the next thing to check is whether `rcx` is a certified
+     carrier in this function and what
+     `materialize_certified_loop_carrier_initializers_with_control` places for
+     it. If the initialiser is being sourced from the register's entry value
+     instead of from the `xor`'s zero, that is the defect, and it is a different
+     one from the rule whose comment first drew attention here.
 
      Also still recorded: using the selector value instead of
      `prepared_canonical_value_root` of it changes nothing, because there was no
