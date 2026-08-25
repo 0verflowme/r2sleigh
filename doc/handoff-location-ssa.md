@@ -829,11 +829,23 @@ learn.
      long t20380_5 = ...;
      ```
 
-     so `t20380_5` is read before it is declared. The else path flows *through*
-     the merge and then returns, and structuring puts the return in the branch
-     while leaving the merge after the `if`. That ordering is the remaining
-     defect, and it was always there -- the duplicated copy sat in the *then*
-     branch, so it never helped the `else` path either.
+     so `t20380_5` is read before it is declared.
+
+     The likely shape, which the next attempt should confirm before acting on it:
+     the duplicate sat in the *then* branch and the guard emptied it there, so
+     only the then branch ever reached that block. If the `else` branch does not
+     reach it either, then the block is not a merge of both branches at all -- it
+     is part of the then branch that region building labelled a merge, and the
+     `else` reads its result only because the finaliser was folded into the
+     branch. Check the CFG: does the else region's exit reach the block the
+     `IfThenElse` calls its merge?
+
+     If it does not, the fix is in region building rather than in structuring --
+     a block only one branch reaches belongs to that branch, and emitting it
+     after the `if` puts it after a `return` that needs it. Do not reach for
+     another guard in `structure.rs`; two have been measured there already, one
+     at 37 to 17 and one that landed, and this is the third distinct defect
+     behind the same rendering.
 
   0g. **murmur3's tail switch renders with empty bodies.** This is what arm64 -O0
      `murmur3_32` now fails on, and the undeclared `x8_30` is a symptom of it
