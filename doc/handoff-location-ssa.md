@@ -4676,11 +4676,23 @@ Four probes now come back empty for it: `name_ref`, `SymbolTable::declare_or_reu
 for ordinary names like `rdi_5`. None of them ever sees `tmp:4700`, `tmp_4700`,
 `t4700` or `tmp:4700_0`.
 
-So the identifier on the page was not minted by any route this branch knows how
-to watch. That is the state: something puts a bare storage name where a value
-name belongs, and the four ways a name normally comes into being are all
-eliminated. Finding the fifth is the next step, and it wants a probe on the
-symbol table's construction rather than on its named entry points.
+Two further routes are eliminated. `SymbolTable::rename` carries the same
+`R2SLEIGH_TRACE_NAME` probe and never fires for it either. And
+`CExpr::External`, the variant that carries a raw `String` past the symbol table
+-- "a marker the lowering emits where it has nothing to say" -- is only ever
+built here with fixed strings (`return`, `__unhandled_op__`), never with a
+temporary's name.
+
+So six routes are ruled out: `name_ref`, `declare_or_reuse`, `declare`, `rename`,
+the `NAMEDECL`/`NAMEMINT` sites, and `External`. The identifier reaches the page
+without passing any of them.
+
+That is the honest state of this thread. The remaining possibilities are narrow
+-- a symbol created before those entry points are reachable, or a table merged in
+from elsewhere -- and distinguishing them wants a probe on `Symbol` construction
+itself rather than on any named API. It is the next step and it is a different
+kind of instrumentation from anything used so far, which is worth knowing before
+starting.
 
 The corpus is 35 of 54 throughout -- this moves `xxhash32` from one undeclared
 name to another rather than to a rendering that compiles.
