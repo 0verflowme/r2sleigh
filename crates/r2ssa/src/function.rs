@@ -3162,6 +3162,11 @@ impl SSAFunction {
             SSAOp::IntMult { a, b, .. } => {
                 self.infer_switch_selector_var_from_scaled(a, b, depth + 1)
             }
+            // A masked value *is* the selector, not a step towards one.
+            // `switch (len & 3)` compiles to a table indexed by the mask's
+            // result, and walking past it loses the mask: murmur3's tail
+            // rendered `switch (arg1)`, which a 61-byte message matches none of.
+            SSAOp::IntAnd { .. } => Some(var.clone()),
             _ => None,
         }
     }
@@ -3209,6 +3214,15 @@ impl SSAFunction {
         }
         self.infer_switch_selector_var_from_scaled(a, b, depth)
             .or_else(|| self.infer_switch_selector_var_from_scaled(b, a, depth))
+            // Neither side is a constant, which is the offset-table form: one
+            // register holds the table's address and the other the entry loaded
+            // from it, and the jump adds them. Following each in turn reaches
+            // the index that entry was loaded with; the base side dead-ends,
+            // because a table address is not a selector. Without this the walk
+            // never reaches the mask above, and x86-64 -O1 murmur3 inferred no
+            // selector at all.
+            .or_else(|| self.infer_switch_selector_var_from_value(a, depth + 1))
+            .or_else(|| self.infer_switch_selector_var_from_value(b, depth + 1))
     }
 
     fn infer_switch_selector_var_from_scaled(

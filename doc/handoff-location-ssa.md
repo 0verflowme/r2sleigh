@@ -561,7 +561,7 @@ learn.
      fewer width, and murmur3 still returns `ec1fbeef` against `7e4102af` --
      the remaining error is the tail below, not this.
 
-  0k. **murmur3's tail switch has no selector at all.** This is what murmur3_32
+  0k. **[FIXED] murmur3's tail switch had no selector at all.** This is what murmur3_32
      at x86-64 -O1 now fails on, and it is worth more than the `& 3` it looks
      like.
 
@@ -580,12 +580,28 @@ learn.
      one that is not the table base: `R9_1` is loaded from `[table + i * 4]`, and
      `i` is the masked length.
 
-     Two things measured and reverted, so they are not retried: using the
-     selector value instead of `prepared_canonical_value_root` of it changes
-     nothing (there is no selector to root), and adding `SSAOp::IntAnd` to the
-     selector walk as a stopping point is *necessary but not sufficient* -- the
-     walk never reaches the mask because it fails at the sum two steps earlier.
-     Fix the sum first, then the mask arm will matter.
+     Fixed by the two together, which is why each alone measured inert.
+     `infer_switch_selector_var_from_sum` now follows *both* operands when
+     neither is a constant, so the walk gets past the offset-table add and into
+     the loaded entry's index; and `SSAOp::IntAnd` becomes a stopping point in
+     the value walk, because a masked value is the selector rather than a step
+     towards one. Either change on its own does nothing: without the sum the
+     walk never reaches the mask, and without the mask arm it walks past it.
+
+     Measured: the selector is inferred -- `found=Some("R8D_9")` where it was
+     `None` -- and the tail renders `switch (arg1 & 3)`. The tail now executes,
+     which moves murmur3_32 at x86-64 -O1 from `ec1fbeef` to `16a1e234` against
+     a wanted `7e4102af`. Corpus holds at 37 of 54.
+
+     Still wrong, and the next thing is visible in the same rendering: murmur3's
+     tail is a *fallthrough* switch -- `case 3` falls into `case 2` falls into
+     `case 1` -- and each case is rendered with a `break`. The cases run, but only
+     one of them. Look at how case bodies are terminated before looking anywhere
+     else.
+
+     Also still recorded: using the selector value instead of
+     `prepared_canonical_value_root` of it changes nothing, because there was no
+     selector to root.
 
   0g. **murmur3's tail switch renders with empty bodies.** This is what arm64 -O0
      `murmur3_32` now fails on, and the undeclared `x8_30` is a symptom of it
