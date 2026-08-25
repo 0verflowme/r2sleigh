@@ -1010,6 +1010,15 @@ impl MachineProjection {
         if self.use_dispositions.len() != graph.insts.len() {
             return Err(MachineBuildError::TopologyMismatch);
         }
+        let constant_bindings = self
+            .machine
+            .arena
+            .iter()
+            .filter_map(|(_, expr)| match expr.kind() {
+                MachineExprKind::Constant { binding, .. } => Some(*binding),
+                _ => None,
+            })
+            .collect::<BTreeSet<_>>();
         for (inst_index, inst) in graph.insts.iter().enumerate() {
             if inst.id.0 as usize != inst_index {
                 return Err(MachineBuildError::TopologyMismatch);
@@ -1056,6 +1065,11 @@ impl MachineProjection {
                         .ok_or(MachineBuildError::UseDispositionMismatch(site))?,
                     ),
                     (None, None) if inst.output.is_none() => {
+                        if graph_value.var.constant_bits().is_some()
+                            && !constant_bindings.contains(&source)
+                        {
+                            return Err(MachineBuildError::UseDispositionMismatch(site));
+                        }
                         MachineUseDisposition::Exact(whole_machine_use(source))
                     }
                     (None, None) => {
@@ -2090,7 +2104,13 @@ impl MachineBuilder {
         graph: &SsaGraph,
         inst: &GraphInst,
     ) -> Result<(), MachineBuildError> {
-        for input_idx in 0..inst.inputs.len() {
+        for (input_idx, input) in inst.inputs.iter().copied().enumerate() {
+            let graph_value = graph
+                .value(input)
+                .ok_or(MachineBuildError::MissingGraphValue(input))?;
+            if graph_value.var.constant_bits().is_some() {
+                self.intern_value(graph_value)?;
+            }
             self.record_whole_use(graph, inst, input_idx)?;
         }
         Ok(())
@@ -3960,6 +3980,57 @@ mod tests {
                 panic!("expected exact write projection, got {reason:?}")
             }
         }
+    }
+
+    #[test]
+    fn outputless_constant_operand_has_exact_use_and_canonical_arena_leaf() {
+        let artifact = artifact_with_ops([R2ILOp::Return {
+            target: Varnode::constant(0xfeed, 8),
+        }]);
+        let inst = artifact
+            .graph()
+            .inst_id_for_op_site(0x1000, 0)
+            .expect("return instruction");
+        let graph_inst = artifact
+            .graph()
+            .inst(inst)
+            .expect("return graph instruction");
+        assert_eq!(graph_inst.output, None);
+        let [constant_value] = graph_inst.inputs.as_slice() else {
+            panic!("return must retain its single constant operand");
+        };
+        let site = UseSite { inst, input_idx: 0 };
+
+        let projection = MachineProjection::from_artifact(&artifact).expect("machine projection");
+        assert_eq!(
+            projection.use_disposition(site),
+            Some(&MachineUseDisposition::Exact(MachineUseSlice {
+                bit_offset: 0,
+                width_bits: 64,
+                carrier_width_bits: 64,
+                conversion: None,
+            }))
+        );
+        assert_eq!(projection.arena().len(), 1);
+        let (_, expression) = projection
+            .arena()
+            .iter()
+            .next()
+            .expect("constant arena leaf");
+        let MachineExprKind::Constant { binding, value } = expression.kind() else {
+            panic!("outputless literal must be a canonical constant node");
+        };
+        assert_eq!(binding.value(), *constant_value);
+        assert_eq!(binding.width_bits(), 64);
+        assert_eq!(value.width_bits(), 64);
+        assert_eq!(value.bits(), 0xfeed);
+
+        let mut missing_leaf = projection.clone();
+        missing_leaf.machine.arena.nodes = Vec::new().into_boxed_slice();
+        assert_eq!(
+            missing_leaf.validate_against(&artifact),
+            Err(MachineBuildError::UseDispositionMismatch(site))
+        );
     }
 
     #[test]
