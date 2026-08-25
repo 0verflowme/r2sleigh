@@ -1337,6 +1337,16 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         if let Some(merge) = merge_block {
             self.deferred_merge_blocks.push(merge);
         }
+        // A case that leaves into another case's entry falls through, and C says
+        // that by *omitting* the break. Ending every case with one turned
+        // murmur3's tail -- `case 3` into `case 2` into `case 1`, each adding a
+        // byte of the remainder -- into three alternatives, so only one byte of
+        // the tail was ever mixed in.
+        let case_entries: std::collections::HashSet<u64> = cases
+            .iter()
+            .filter(|(value, _)| value.is_some())
+            .map(|(_, region)| region.entry())
+            .collect();
         let mut switch_cases = Vec::new();
         for (case_value, case_region) in cases {
             let outer_domains = self.active_domains.clone();
@@ -1344,9 +1354,21 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                 continue;
             };
             let value_expr = CExpr::IntLit(*case_value as i64);
+            let region_blocks: std::collections::HashSet<u64> =
+                case_region.blocks().into_iter().collect();
+            let falls_through = region_blocks.iter().any(|block| {
+                self.func
+                    .successors(*block)
+                    .iter()
+                    .any(|succ| case_entries.contains(succ) && !region_blocks.contains(succ))
+            });
             let case_stmt = self.structure_region(case_region);
             self.active_domains = outer_domains;
-            let body = vec![case_stmt, CStmt::Break];
+            let body = if falls_through {
+                vec![case_stmt]
+            } else {
+                vec![case_stmt, CStmt::Break]
+            };
             switch_cases.push(crate::ast::SwitchCase {
                 value: value_expr,
                 body,

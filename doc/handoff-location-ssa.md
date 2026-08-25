@@ -593,11 +593,18 @@ learn.
      which moves murmur3_32 at x86-64 -O1 from `ec1fbeef` to `16a1e234` against
      a wanted `7e4102af`. Corpus holds at 37 of 54.
 
-     Still wrong, and the next thing is visible in the same rendering: murmur3's
-     tail is a *fallthrough* switch -- `case 3` falls into `case 2` falls into
-     `case 1` -- and each case is rendered with a `break`. The cases run, but only
-     one of them. Look at how case bodies are terminated before looking anywhere
-     else.
+     The fallthrough that was recorded here next is also fixed. `structure.rs`
+     ended every case with `CStmt::Break` unconditionally; a case whose region
+     leaves into another case's entry falls through, and C says that by omitting
+     the break. murmur3's tail now renders `case 3` and `case 2` without one and
+     `case 1` with, which is what the source does.
+
+     That fix changes no checksum here and is still worth having: the corpus
+     message is 61 bytes, so `len & 3` is 1 and only `case 1` ever runs. It is
+     wrong for every other length, which the corpus does not exercise.
+
+     murmur3_32 at x86-64 -O1 still returns `16a1e234` against `7e4102af`, so the
+     remaining error is in the loop or the finaliser rather than the tail.
 
      Also still recorded: using the selector value instead of
      `prepared_canonical_value_root` of it changes nothing, because there was no
