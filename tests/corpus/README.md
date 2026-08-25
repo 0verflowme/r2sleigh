@@ -1,67 +1,93 @@
 # Executable verification of rendered output
 
-`pdd` output that reads plausibly is not output that is right. Every earlier
-measurement in this branch scored a rendering by inspecting it -- does it declare
-what it mentions, does a loop have a body, does a non-void function return -- and
-each of those scores was wrong in the same direction, because a body can satisfy
-all of them and still compute something else.
+This corpus is a regression canary, not the semantic specification. It measures
+nine functions at `-O0`, `-O1`, and `-O2` on x86-64 and AArch64: 54 explicit
+cells. A missing, duplicate, or unparsable rendering remains a failed cell; it
+cannot disappear from the totals.
 
-This harness settles it the only way it can be settled. It takes each rendering,
-compiles it, runs it on the input the reference binary was run on, and compares
-the value. Nothing else counts as correct.
+## Run the complete matrix
 
-## Running it
+From the workspace root:
 
-    clang -O2 -o h_arm64_O2 hashes.c              # or any target and level
-    ./h_arm64_O2 > reference.txt                  # what the program computes
-    ./sweep.sh h_arm64_O2 > out_arm64_O2.txt      # what r2sleigh renders
-    python3 verify_rendering.py arm64_O2
+```bash
+# Optional: keep build artifacts outside this worktree.
+export CARGO_TARGET_DIR=/absolute/path/to/a/task-specific-target
 
-`sweep.sh` drives `pdd`, which is r2sleigh's renderer. `pdc` is radare2's own
-pseudo-decompiler and answers happily with raw register arithmetic; comparing
-`pdc` across two builds of this plugin proves nothing, and that mistake was made
-here once already.
+tests/corpus/run_matrix.sh --gate measurement
+```
 
-## What the verdicts mean
+The script always installs the plugin first and requires the install to print
+`Installed to ...`. It then builds all six binaries and source-backed oracle
+executables, captures marked `pdd` dumps, verifies all 54 cells, and writes:
 
-  * **CORRECT** -- compiled, ran, produced the reference value.
-  * **wrong** -- compiled and ran, produced something else. The rendering says
-    what the program does not do.
-  * **nocompile** -- the rendering is not C. Almost always `use of undeclared
-    identifier`, which is a name that reached the page with nothing defining it.
-  * **hang** -- the loop the rendering describes does not terminate.
+```text
+tests/corpus/artifacts/
+  bin/                 corpus and oracle executables
+  dumps/               full marked pdd sessions
+  raw/                 exact extracted renderer output
+  compile/<config>/    raw and diagnostic compile envelopes
+  results/<config>.json
+  results/matrix.json
+  plugin-install.log
+  provenance.txt
+```
 
-A `[N width(s) assumed]` note means the rendering dereferenced an address
-without saying how wide the load was, and the harness had to pick one. C that
-does not state a load width has not said what the program does, so the note is
-a defect report and not a caveat about the harness.
+Artifacts are ignored by Git. Results retain full compiler diagnostics and every
+differential input, seed, exit code, and output.
 
-The harness retypes parameters and locals as `long` and inserts casts at each
-dereference, because a rendering types an address-carrying value as an integer
-and then dereferences it. It does not change any operator or constant, so a
-rendering that computes the right value still computes it afterwards.
+## The three scores
 
-## Data the rendering reads
+Each of the 54 records always contains three independent measurements.
 
-A rendering that reads a table reads it at the address the binary puts it at,
-and the harness process has nothing mapped there. `pearson` scored `wrong` on an
-empty result for that reason while its rendering was exactly right.
+- **Raw:** Exact emitted declarations and body compiled with `-std=c11`, the
+  documented warning set, and `-Werror`. Only the invalid radare2 linkage name
+  and mapped image addresses are adapted by the compile envelope; both are
+  recorded. Local, parameter, and return declarations remain untouched.
+- **Diagnostic:** The historical compatibility transformation compiles and runs
+  the legacy input. Every retype, dereference-width assumption, subscript
+  rewrite, and mapped address is listed. A pass here is diagnostic evidence, not
+  proof that the emitted C is valid.
+- **Differential:** The raw executable when it compiles, otherwise the explicitly
+  labelled diagnostic executable, is compared with `oracle.c` over empty,
+  boundary-length, legacy, deterministic-random inputs, and multiple seeds for
+  MurmurHash3 and xxHash.
 
-So the bytes are lifted out of the binary with `r2` and the literal is pointed at
-a copy. Only literals inside a mapped section are substituted: FNV's prime is
-`0x100000001b3`, which looks precisely like a Mach-O address and is not one, and
-substituting it broke a rendering that had been correct.
+`oracle.c` includes `hashes.c` after renaming only its demonstration `main`, so
+`hashes.c` remains the single semantic implementation of the reference
+functions. `reference.txt` is retained as the old one-input record; it is no
+longer the differential oracle.
 
-## Baseline
+## Raw byte baseline
 
-Nine hash functions, x86-64 and arm64, `-O0`/`-O1`/`-O2`, 54 renderings.
+Stages that should not affect rendering compare the exact raw SHA-256 for every
+cell with `raw-baseline-sha256.json`. A missing or mismatched hash is printed in
+the `snapshot` score.
 
-    at the start of the work    4 correct
-    now                        26 correct
+Creating or intentionally updating the reviewed baseline is explicit:
 
-    x86-64 -O0   6      arm64 -O0   6
-    x86-64 -O1   4      arm64 -O1   5
-    x86-64 -O2   0      arm64 -O2   5
+```bash
+tests/corpus/run_matrix.sh --accept-baseline --gate measurement
+```
 
-Structural inspection scored 21 of the original 54 sound when four of them ran
-correctly. That difference is why this exists.
+The gate is always explicit. Use `--gate snapshot` for byte-preserving stages,
+`--gate raw` once all emitted C must compile under the strict type tripwire, and
+`--gate differential` only when every raw executable must also match the oracle.
+
+Before accepting, inspect the raw files and the matrix report. Never update the
+manifest merely to make a mechanical stage pass; a changed byte during such a
+stage means the change was not mechanical.
+
+## Accounting and interpretation
+
+Compiling and running output does not prove that its CFG, types, or control flow
+are justified. The renderer's internal invariants and obligation ledger remain
+the proof surface:
+
+```text
+rendered + justified_elision + refused = total obligations
+unaccounted = 0
+```
+
+`refused` is an explicit failure, not a successful result. Raw compilation is an
+external type tripwire; the internal requirement that every surviving `UseSite`
+has an upstream-backed exact projection is the width proof.
