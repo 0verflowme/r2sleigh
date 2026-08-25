@@ -304,7 +304,7 @@ learn.
      layer rather than carrier membership; and `x8_30` in arm64 -O0 murmur3_32 is
      not a naming defect at all -- see 0g.
 
-  0h. **The renderer is not deterministic.** Two `pdd` calls on the same
+  0h. **[FIXED] The renderer was not deterministic.** Two `pdd` calls on the same
      function, in the same process, with nothing in between, produce different C.
      This is the most serious item in this document and it qualifies every
      measurement in it.
@@ -334,19 +334,38 @@ learn.
      `if ((arg1 & 1) == 0) { return ...; }` followed by flat statements where the
      other emits `{ if ((arg1 & 1) != 0) { ...block... } }`.
 
-     The hypothesis, which is *not* proven: something iterates a `HashMap` or
-     `HashSet` to reach a rendering decision. Rust seeds each map instance
-     separately, so iteration order over identical insertions differs between two
-     maps in one process, which matches within-process run-to-run variation
-     exactly. `structure.rs` holds no such loop, so the search should start in
-     analysis and folding. The fix is that no decision may depend on the order an
-     unordered container yields -- ordered containers where a decision is made,
-     or an explicit sort before deciding.
+     **The cause.** `MaterializedEdgeCopies` is a `HashSet`, and the loop in
+     `FoldingContext::from_inputs` that gives each end of a materialised copy its
+     carrier's name was a *single pass* over it that read and wrote the same map.
+     A copy only carries a name when one of its ends already has one, so a chain
+     `rax -> a -> b -> c` resolved only as far as the visit order allowed, and a
+     `HashSet` yields its elements in whatever order its seed produced -- which
+     differs between two sets in one process. The same copies, closed to a
+     different depth.
 
-     What it does *not* invalidate. The corpus verdict is stable even though the
-     text is not: three independent sweeps of x86-64 -O2 all scored 4. Aggregate
-     numbers in this document can be trusted; a single rendering quoted in it may
-     not reproduce, and a trace taken once may not either.
+     Bisecting to it: the prepared SSA hashes identically across renders (9
+     blocks, 694 ops, 202 phis, same name digest), and so do the certified
+     carriers including every member list, and both gate sets are empty. Yet
+     `carrier_name_aliases` returned 9 aliases while the `PassEnv` that consumed
+     them held 20, 21 or 22 on different runs -- the gap is this loop.
+
+     Fixed by sorting the copies and repeating until nothing new is joined, so
+     the answer is the transitive closure however the set is ordered. It now
+     yields 24 every time, which is also *more* than any single pass reached: the
+     old loop was under-propagating as well as varying. `adler32` at x86-64 -O2
+     now renders identically across sessions and across repeated `pdd` calls in
+     one session, and so does `fnv1a32`. Corpus unchanged at 36 of 54.
+
+     Ruled out along the way, and left alone because neither changed anything:
+     `SSAFunction::blocks()` already iterates an explicit order rather than its
+     `HashMap`, and `FamilyRootState`'s `min_by_key` tie-break over a `HashMap`
+     was made ordered as an experiment, measured inert, and reverted.
+
+     What it did not invalidate. The corpus verdict was stable even while the
+     text was not: three independent sweeps of x86-64 -O2 all scored 4. Aggregate
+     numbers taken before this fix can be trusted; a single rendering quoted in
+     this document from before it may not reproduce, and neither may a trace
+     taken once.
 
      Supersedes an earlier claim here that rendering `djb2` before `adler32`
      changed `adler32`'s output. That was one sample per condition, and what it

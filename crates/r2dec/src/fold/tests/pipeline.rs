@@ -8261,6 +8261,44 @@ mod tests {
     }
 
     #[test]
+    fn carrier_names_close_over_a_chain_of_copies_whatever_order_it_arrives_in() {
+        // Materialisation hands its copies over as a `HashSet`, so the order is
+        // whatever the seed produced. A single pass only reaches the copies
+        // whose named end it happens to see first, which is why two renders of
+        // one function in one process disagreed about how many names existed:
+        // the same copies, closed to a different depth.
+        let edge = |addr: u64, dst: &str, src: &str| {
+            (
+                addr,
+                r2ssa::SSAVar::new(dst, 1, 8),
+                r2ssa::SSAVar::new(src, 1, 8),
+            )
+        };
+        // rax -> a -> b -> c, given in the order that defeats a single pass.
+        let copies: crate::normalize::MaterializedEdgeCopies = [
+            edge(0x30, "c", "b"),
+            edge(0x20, "b", "a"),
+            edge(0x10, "a", "rax"),
+        ]
+        .into_iter()
+        .collect();
+
+        let mut aliases = std::collections::HashMap::new();
+        // `display_name` uppercases a register spelling, so these are the keys
+        // the production map is built from.
+        aliases.insert("RAX_1".to_string(), "rax".to_string());
+        crate::fold::context::close_carrier_aliases_over_edge_copies(&mut aliases, &copies);
+
+        for name in ["A_1", "B_1", "C_1"] {
+            assert_eq!(
+                aliases.get(name).map(String::as_str),
+                Some("rax"),
+                "every end of the chain carries the name, not just the first link"
+            );
+        }
+    }
+
+    #[test]
     fn a_carrier_read_at_another_width_resolves_to_a_cast_of_the_carrier() {
         // The half of the location model an alias map cannot hold. `eax_5` is
         // not `rax`, it is `(uint32_t)rax`; answering with the carrier's name

@@ -305,6 +305,40 @@ impl FoldArchConfig {
     }
 }
 
+/// Give every end of a materialised copy the carrier name one of its ends has.
+///
+/// One pass over the copies is not enough, and the set they arrive in is
+/// unordered. A copy only carries a name when one of its ends already has one,
+/// so a chain reaching the carrier through two copies resolves only if the links
+/// are visited in order -- and a `HashSet` yields them in whatever order its
+/// seed produced, which differs between two sets in one process. That is why two
+/// renders of one function disagreed about how many names existed at all: the
+/// same copies, closed to a different depth. Sorting fixes the order and
+/// repeating fixes the depth, so the answer is the transitive closure either way.
+pub(crate) fn close_carrier_aliases_over_edge_copies(
+    carrier_aliases: &mut HashMap<String, String>,
+    edge_copies: &crate::normalize::MaterializedEdgeCopies,
+) {
+    let mut edges = edge_copies
+        .iter()
+        .map(|(addr, dst, src)| (*addr, dst.display_name(), src.display_name()))
+        .collect::<Vec<_>>();
+    edges.sort();
+    loop {
+        let mut joined = false;
+        for (_, dst_key, src_key) in &edges {
+            if let Some(name) = carrier_aliases.get(src_key).cloned() {
+                joined |= carrier_aliases.insert(dst_key.clone(), name).is_none();
+            } else if let Some(name) = carrier_aliases.get(dst_key).cloned() {
+                joined |= carrier_aliases.insert(src_key.clone(), name).is_none();
+            }
+        }
+        if !joined {
+            break;
+        }
+    }
+}
+
 impl<'a> FoldingContext<'a> {
     pub(crate) fn from_inputs(inputs: FoldInputs<'a>) -> Self {
         let mut carrier_aliases = match (inputs.prepared_ssa, inputs.function_facts.render()) {
@@ -319,14 +353,10 @@ impl<'a> FoldingContext<'a> {
         // through the carrier's name -- which is how one increment reached the
         // page twice. Each inserted copy joins its destination to whichever side
         // already has a name, so the map covers the function being walked.
-        for (_, dst, src) in inputs.materialized_edge_copies {
-            let (dst_key, src_key) = (dst.display_name(), src.display_name());
-            if let Some(name) = carrier_aliases.get(&src_key).cloned() {
-                carrier_aliases.entry(dst_key).or_insert(name);
-            } else if let Some(name) = carrier_aliases.get(&dst_key).cloned() {
-                carrier_aliases.entry(src_key).or_insert(name);
-            }
-        }
+        close_carrier_aliases_over_edge_copies(
+            &mut carrier_aliases,
+            inputs.materialized_edge_copies,
+        );
         let carrier_member_views = match (inputs.prepared_ssa, inputs.function_facts.render()) {
             (Some(prepared), Some(render)) => {
                 crate::normalize::carrier_member_views(prepared, render, &carrier_aliases)
