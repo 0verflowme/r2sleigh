@@ -446,15 +446,21 @@ impl MachineUseConversion {
     }
 }
 
-/// Exact source bits consumed at one dense [`UseSite`] table position.
+/// Exact canonical-carrier bits consumed at one dense [`UseSite`] table position.
 ///
+/// Register-backed values are expressed relative to the register geometry's
+/// canonical carrier, and `carrier_width_bits` is that carrier's full extent.
+/// Other values are expressed relative to their own width. Thus neither the
+/// carrier extent nor the coordinate space may be inferred from the selected
+/// slice alone.
 /// The site and source value are deliberately not repeated here: the table
 /// position is the canonical site, and the owning graph is the canonical
-/// `UseSite -> ValueId -> width` binding.
+/// `UseSite -> ValueId` binding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct MachineUseSlice {
     bit_offset: u32,
     width_bits: u32,
+    carrier_width_bits: u32,
     conversion: Option<MachineUseConversion>,
 }
 
@@ -467,6 +473,10 @@ impl MachineUseSlice {
         self.width_bits
     }
 
+    pub const fn carrier_width_bits(self) -> u32 {
+        self.carrier_width_bits
+    }
+
     pub const fn conversion(self) -> Option<MachineUseConversion> {
         self.conversion
     }
@@ -475,6 +485,10 @@ impl MachineUseSlice {
 /// Why one graph use has no honest machine slice projection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum MachineUseRefusal {
+    MissingRegisterGeometry,
+    MalformedRegisterGeometry,
+    RegisterGeometry(r2il::RegisterProjectionRefusal),
+    InvalidBitRange,
     /// The value-producing instruction is outside the machine vocabulary.
     UnsupportedOperation,
     /// Operand counts, widths, or slices were internally incoherent.
@@ -491,11 +505,19 @@ pub enum MachineUseDisposition {
 /// Exact effect one surviving definition has on its source-owned carrier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum MachineWriteProjection {
-    /// The definition replaces every bit of its carrier.
+    /// The definition replaces every bit of its carrier; the definition's
+    /// output width is the carrier width.
     Full,
-    /// The definition replaces one slice and preserves bits outside it.
-    Insert { bit_offset: u32, width_bits: u32 },
-    /// A full-carrier definition zero-extends an exact narrower input.
+    /// The definition replaces one carrier-relative slice and preserves bits
+    /// outside it. The carrier extent is explicit because offset plus width
+    /// does not identify the canonical carrier.
+    Insert {
+        bit_offset: u32,
+        width_bits: u32,
+        carrier_width_bits: u32,
+    },
+    /// A full-carrier definition zero-extends an exact narrower input;
+    /// `to_width_bits` is the carrier width.
     ZeroExtend {
         from_width_bits: u32,
         to_width_bits: u32,
@@ -873,6 +895,8 @@ impl MachineProjection {
             }
         }
 
+        let use_dispositions =
+            canonical_machine_use_dispositions(artifact, builder.use_dispositions)?;
         let projection = Self {
             machine: MachineFunction {
                 arena: MachineExprArena {
@@ -881,8 +905,7 @@ impl MachineProjection {
                 entities: entities.into_boxed_slice(),
             },
             failures: failures.into_boxed_slice(),
-            use_dispositions: builder
-                .use_dispositions
+            use_dispositions: use_dispositions
                 .into_iter()
                 .map(Vec::into_boxed_slice)
                 .collect::<Vec<_>>()
@@ -1018,32 +1041,34 @@ impl MachineProjection {
                     .value(input)
                     .ok_or(MachineBuildError::MissingGraphValue(input))?;
                 let source = binding_for_value(graph_value)?;
-                match (disposition, expected_refusal, root) {
-                    (MachineUseDisposition::Refused(actual), Some(expected), _)
-                        if *actual == expected => {}
-                    (MachineUseDisposition::Exact(actual), None, root) => {
-                        let expected = match root {
-                            Some(root) => machine_use_slice_for_input(
-                                &self.machine.arena,
-                                root,
-                                *root_children
-                                    .as_ref()
-                                    .and_then(|children| children.get(input_idx))
-                                    .ok_or(MachineBuildError::UseDispositionMismatch(site))?,
-                                source,
-                            )
-                            .ok_or(MachineBuildError::UseDispositionMismatch(site))?,
-                            None if inst.output.is_none() => whole_machine_use(source),
-                            None => return Err(MachineBuildError::UseDispositionMismatch(site)),
-                        };
-                        validate_machine_use_slice(*actual, source.width_bits)
-                            .map_err(|_| MachineBuildError::UseDispositionMismatch(site))?;
-                        if *actual != expected {
-                            return Err(MachineBuildError::UseDispositionMismatch(site));
-                        }
+                let operation_relative = match (expected_refusal, root) {
+                    (Some(expected), _) => MachineUseDisposition::Refused(expected),
+                    (None, Some(root)) => MachineUseDisposition::Exact(
+                        machine_use_slice_for_input(
+                            &self.machine.arena,
+                            root,
+                            *root_children
+                                .as_ref()
+                                .and_then(|children| children.get(input_idx))
+                                .ok_or(MachineBuildError::UseDispositionMismatch(site))?,
+                            source,
+                        )
+                        .ok_or(MachineBuildError::UseDispositionMismatch(site))?,
+                    ),
+                    (None, None) if inst.output.is_none() => {
+                        MachineUseDisposition::Exact(whole_machine_use(source))
                     }
-                    _ => return Err(MachineBuildError::UseDispositionMismatch(site)),
-                }
+                    (None, None) => {
+                        return Err(MachineBuildError::UseDispositionMismatch(site));
+                    }
+                };
+                validate_canonical_machine_use_disposition(
+                    artifact,
+                    site,
+                    input,
+                    operation_relative,
+                    *disposition,
+                )?;
             }
         }
         Ok(())
@@ -1122,9 +1147,197 @@ fn write_refusal_for_error(error: &MachineBuildError) -> MachineWriteRefusal {
     }
 }
 
+fn canonical_machine_use_dispositions(
+    artifact: &SsaArtifact,
+    operation_relative: Vec<Vec<MachineUseDisposition>>,
+) -> Result<Vec<Vec<MachineUseDisposition>>, MachineBuildError> {
+    let graph = artifact.graph();
+    if operation_relative.len() != graph.insts.len() {
+        return Err(MachineBuildError::TopologyMismatch);
+    }
+    let mut canonical = Vec::with_capacity(operation_relative.len());
+    for (inst_index, row) in operation_relative.into_iter().enumerate() {
+        let inst = graph
+            .insts
+            .get(inst_index)
+            .ok_or(MachineBuildError::TopologyMismatch)?;
+        if inst.id.0 as usize != inst_index || row.len() != inst.inputs.len() {
+            return Err(MachineBuildError::TopologyMismatch);
+        }
+        let mut canonical_row = Vec::with_capacity(row.len());
+        for (input_idx, disposition) in row.into_iter().enumerate() {
+            let site = UseSite {
+                inst: inst.id,
+                input_idx,
+            };
+            let input = *inst
+                .inputs
+                .get(input_idx)
+                .ok_or(MachineBuildError::MissingUseDisposition(site))?;
+            canonical_row.push(canonical_machine_use_disposition(
+                artifact,
+                site,
+                input,
+                disposition,
+            )?);
+        }
+        canonical.push(canonical_row);
+    }
+    Ok(canonical)
+}
+
+fn canonical_machine_use_disposition(
+    artifact: &SsaArtifact,
+    site: UseSite,
+    input: ValueId,
+    operation_relative: MachineUseDisposition,
+) -> Result<MachineUseDisposition, MachineBuildError> {
+    let MachineUseDisposition::Exact(slice) = operation_relative else {
+        return Ok(operation_relative);
+    };
+    let graph_value = artifact
+        .graph()
+        .value(input)
+        .ok_or(MachineBuildError::MissingGraphValue(input))?;
+    let source = binding_for_value(graph_value)?;
+    validate_machine_use_slice(slice, source.width_bits)
+        .map_err(|_| MachineBuildError::UseDispositionMismatch(site))?;
+
+    let Some(storage) = graph_value.canonical_storage else {
+        return Ok(MachineUseDisposition::Exact(slice));
+    };
+    if storage.space != CanonicalStorageSpace::Register {
+        return Ok(MachineUseDisposition::Exact(slice));
+    }
+    let geometry = match exact_register_geometry(artifact, storage) {
+        Ok(geometry) => geometry,
+        Err(reason) => {
+            return Ok(MachineUseDisposition::Refused(
+                use_refusal_for_register_geometry(reason),
+            ));
+        }
+    };
+    if geometry.width_bits != source.width_bits {
+        return Ok(MachineUseDisposition::Refused(
+            MachineUseRefusal::InvalidBitRange,
+        ));
+    }
+    let slice = match compose_machine_use_slice(slice, geometry.bit_offset, geometry.carrier_bits) {
+        Ok(slice) => slice,
+        Err(reason) => return Ok(MachineUseDisposition::Refused(reason)),
+    };
+    Ok(MachineUseDisposition::Exact(slice))
+}
+
+fn validate_canonical_machine_use_disposition(
+    artifact: &SsaArtifact,
+    site: UseSite,
+    input: ValueId,
+    operation_relative: MachineUseDisposition,
+    actual: MachineUseDisposition,
+) -> Result<(), MachineBuildError> {
+    let mismatch = || MachineBuildError::UseDispositionMismatch(site);
+    let MachineUseDisposition::Exact(operation_slice) = operation_relative else {
+        return (actual == operation_relative)
+            .then_some(())
+            .ok_or_else(mismatch);
+    };
+    let graph_value = artifact
+        .graph()
+        .value(input)
+        .ok_or(MachineBuildError::MissingGraphValue(input))?;
+    let source = binding_for_value(graph_value)?;
+    validate_machine_use_slice(operation_slice, source.width_bits).map_err(|_| mismatch())?;
+
+    let Some(storage) = graph_value.canonical_storage else {
+        return (actual == MachineUseDisposition::Exact(operation_slice))
+            .then_some(())
+            .ok_or_else(mismatch);
+    };
+    if storage.space != CanonicalStorageSpace::Register {
+        return (actual == MachineUseDisposition::Exact(operation_slice))
+            .then_some(())
+            .ok_or_else(mismatch);
+    }
+
+    let geometry = match exact_register_geometry(artifact, storage) {
+        Ok(geometry) if geometry.width_bits == source.width_bits => geometry,
+        Ok(_) => {
+            return (actual == MachineUseDisposition::Refused(MachineUseRefusal::InvalidBitRange))
+                .then_some(())
+                .ok_or_else(mismatch);
+        }
+        Err(reason) => {
+            let refusal = use_refusal_for_register_geometry(reason);
+            return (actual == MachineUseDisposition::Refused(refusal))
+                .then_some(())
+                .ok_or_else(mismatch);
+        }
+    };
+    let MachineUseDisposition::Exact(actual_slice) = actual else {
+        return Err(mismatch());
+    };
+    let exact = actual_slice.width_bits == operation_slice.width_bits
+        && actual_slice.carrier_width_bits == geometry.carrier_bits
+        && actual_slice.conversion == operation_slice.conversion
+        && actual_slice.bit_offset.checked_sub(geometry.bit_offset)
+            == Some(operation_slice.bit_offset)
+        && validate_machine_use_slice(actual_slice, geometry.carrier_bits).is_ok();
+    exact.then_some(()).ok_or_else(mismatch)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MachineRegisterGeometryRefusal {
+    Missing,
+    Malformed,
+    Upstream(r2il::RegisterProjectionRefusal),
+    InvalidBitRange,
+}
+
+fn use_refusal_for_register_geometry(reason: MachineRegisterGeometryRefusal) -> MachineUseRefusal {
+    match reason {
+        MachineRegisterGeometryRefusal::Missing => MachineUseRefusal::MissingRegisterGeometry,
+        MachineRegisterGeometryRefusal::Malformed => MachineUseRefusal::MalformedRegisterGeometry,
+        MachineRegisterGeometryRefusal::Upstream(reason) => {
+            MachineUseRefusal::RegisterGeometry(reason)
+        }
+        MachineRegisterGeometryRefusal::InvalidBitRange => MachineUseRefusal::InvalidBitRange,
+    }
+}
+
+fn write_refusal_for_register_geometry(
+    reason: MachineRegisterGeometryRefusal,
+) -> MachineWriteRefusal {
+    match reason {
+        MachineRegisterGeometryRefusal::Missing => MachineWriteRefusal::MissingRegisterGeometry,
+        MachineRegisterGeometryRefusal::Malformed => MachineWriteRefusal::MalformedRegisterGeometry,
+        MachineRegisterGeometryRefusal::Upstream(reason) => {
+            MachineWriteRefusal::RegisterGeometry(reason)
+        }
+        MachineRegisterGeometryRefusal::InvalidBitRange => MachineWriteRefusal::InvalidBitRange,
+    }
+}
+
+fn compose_machine_use_slice(
+    operation_relative: MachineUseSlice,
+    carrier_bit_offset: u32,
+    carrier_width_bits: u32,
+) -> Result<MachineUseSlice, MachineUseRefusal> {
+    let bit_offset = carrier_bit_offset
+        .checked_add(operation_relative.bit_offset)
+        .ok_or(MachineUseRefusal::InvalidBitRange)?;
+    let canonical = MachineUseSlice {
+        bit_offset,
+        carrier_width_bits,
+        ..operation_relative
+    };
+    validate_machine_use_slice(canonical, carrier_width_bits)
+        .map_err(|_| MachineUseRefusal::InvalidBitRange)?;
+    Ok(canonical)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ExactRegisterGeometry {
-    carrier: CanonicalStorageId,
     bit_offset: u32,
     width_bits: u32,
     carrier_bits: u32,
@@ -1133,48 +1346,48 @@ struct ExactRegisterGeometry {
 fn exact_register_geometry(
     artifact: &SsaArtifact,
     written: CanonicalStorageId,
-) -> Result<ExactRegisterGeometry, MachineWriteRefusal> {
+) -> Result<ExactRegisterGeometry, MachineRegisterGeometryRefusal> {
     if written.space != CanonicalStorageSpace::Register {
-        return Err(MachineWriteRefusal::InvalidBitRange);
+        return Err(MachineRegisterGeometryRefusal::InvalidBitRange);
     }
     match artifact.machine_context().register_geometry_state() {
         MachineRegisterGeometryState::Unavailable => {
-            return Err(MachineWriteRefusal::MissingRegisterGeometry);
+            return Err(MachineRegisterGeometryRefusal::Missing);
         }
         MachineRegisterGeometryState::Malformed => {
-            return Err(MachineWriteRefusal::MalformedRegisterGeometry);
+            return Err(MachineRegisterGeometryRefusal::Malformed);
         }
         MachineRegisterGeometryState::Available => {}
     }
     let projection = artifact
         .machine_context()
         .register_projection(written)
-        .ok_or(MachineWriteRefusal::InvalidBitRange)?;
+        .ok_or(MachineRegisterGeometryRefusal::InvalidBitRange)?;
     if projection.written.offset != written.offset || projection.written.size != written.size {
-        return Err(MachineWriteRefusal::InvalidBitRange);
+        return Err(MachineRegisterGeometryRefusal::InvalidBitRange);
     }
     let r2il::RegisterProjectionDisposition::Bound { carrier, slice } = projection.disposition
     else {
         let r2il::RegisterProjectionDisposition::Refused { reason } = projection.disposition else {
             unreachable!("register projection disposition is exhaustive")
         };
-        return Err(MachineWriteRefusal::RegisterGeometry(reason));
+        return Err(MachineRegisterGeometryRefusal::Upstream(reason));
     };
     if !carrier.contains(projection.written) {
-        return Err(MachineWriteRefusal::InvalidBitRange);
+        return Err(MachineRegisterGeometryRefusal::InvalidBitRange);
     }
     let written_bits = written
         .size
         .checked_mul(8)
-        .ok_or(MachineWriteRefusal::InvalidBitRange)?;
+        .ok_or(MachineRegisterGeometryRefusal::InvalidBitRange)?;
     let carrier_bits = carrier
         .size
         .checked_mul(8)
-        .ok_or(MachineWriteRefusal::InvalidBitRange)?;
-    let bit_offset =
-        u32::try_from(slice.lsb_bit_offset).map_err(|_| MachineWriteRefusal::InvalidBitRange)?;
-    let width_bits =
-        u32::try_from(slice.size_bits).map_err(|_| MachineWriteRefusal::InvalidBitRange)?;
+        .ok_or(MachineRegisterGeometryRefusal::InvalidBitRange)?;
+    let bit_offset = u32::try_from(slice.lsb_bit_offset)
+        .map_err(|_| MachineRegisterGeometryRefusal::InvalidBitRange)?;
+    let width_bits = u32::try_from(slice.size_bits)
+        .map_err(|_| MachineRegisterGeometryRefusal::InvalidBitRange)?;
     if width_bits == 0
         || width_bits != written_bits
         || bit_offset
@@ -1182,14 +1395,9 @@ fn exact_register_geometry(
             .is_none_or(|end| end > carrier_bits)
         || (carrier == projection.written && (bit_offset != 0 || width_bits != carrier_bits))
     {
-        return Err(MachineWriteRefusal::InvalidBitRange);
+        return Err(MachineRegisterGeometryRefusal::InvalidBitRange);
     }
     Ok(ExactRegisterGeometry {
-        carrier: CanonicalStorageId {
-            space: CanonicalStorageSpace::Register,
-            offset: carrier.offset,
-            size: carrier.size,
-        },
         bit_offset,
         width_bits,
         carrier_bits,
@@ -1248,7 +1456,9 @@ fn machine_write_disposition(
     }
     let geometry = match exact_register_geometry(artifact, storage) {
         Ok(geometry) => geometry,
-        Err(reason) => return MachineWriteDisposition::Refused(reason),
+        Err(reason) => {
+            return MachineWriteDisposition::Refused(write_refusal_for_register_geometry(reason));
+        }
     };
     if let Some(zero_extend) = exact_zero_extend_write(artifact, inst, root, geometry) {
         return MachineWriteDisposition::Exact(zero_extend);
@@ -1259,16 +1469,19 @@ fn machine_write_disposition(
         MachineWriteDisposition::Exact(MachineWriteProjection::Insert {
             bit_offset: geometry.bit_offset,
             width_bits: geometry.width_bits,
+            carrier_width_bits: geometry.carrier_bits,
         })
     }
 }
 
-fn validate_machine_use_slice(slice: MachineUseSlice, source_bits: u32) -> Result<(), ()> {
-    if slice.width_bits == 0
+fn validate_machine_use_slice(slice: MachineUseSlice, carrier_width_bits: u32) -> Result<(), ()> {
+    if carrier_width_bits == 0
+        || slice.carrier_width_bits != carrier_width_bits
+        || slice.width_bits == 0
         || slice
             .bit_offset
             .checked_add(slice.width_bits)
-            .is_none_or(|end| end > source_bits)
+            .is_none_or(|end| end > carrier_width_bits)
     {
         return Err(());
     }
@@ -1291,6 +1504,7 @@ const fn whole_machine_use(source: MachineValueBinding) -> MachineUseSlice {
     MachineUseSlice {
         bit_offset: 0,
         width_bits: source.width_bits,
+        carrier_width_bits: source.width_bits,
         conversion: None,
     }
 }
@@ -1313,6 +1527,7 @@ fn machine_use_slice_for_input(
         return Some(MachineUseSlice {
             bit_offset: 0,
             width_bits: source.width_bits,
+            carrier_width_bits: source.width_bits,
             conversion: Some(MachineUseConversion {
                 kind: *kind,
                 to_width_bits: root.ty.width_bits(),
@@ -1326,6 +1541,7 @@ fn machine_use_slice_for_input(
         return Some(MachineUseSlice {
             bit_offset: *lsb_bits,
             width_bits: root.ty.width_bits(),
+            carrier_width_bits: source.width_bits,
             conversion: None,
         });
     }
@@ -1333,6 +1549,7 @@ fn machine_use_slice_for_input(
         return Some(MachineUseSlice {
             bit_offset: *lsb_bits,
             width_bits: child.ty.width_bits(),
+            carrier_width_bits: source.width_bits,
             conversion: None,
         });
     }
@@ -2055,6 +2272,7 @@ impl MachineBuilder {
                 MachineUseSlice {
                     bit_offset: 0,
                     width_bits: result_bits,
+                    carrier_width_bits: input_bits,
                     conversion: None,
                 },
             )?;
@@ -2444,6 +2662,7 @@ impl MachineBuilder {
                     MachineUseSlice {
                         bit_offset: 0,
                         width_bits: from,
+                        carrier_width_bits: from,
                         conversion: Some(MachineUseConversion {
                             kind,
                             to_width_bits: output.width_bits,
@@ -2491,6 +2710,7 @@ impl MachineBuilder {
                     MachineUseSlice {
                         bit_offset: lsb_bits,
                         width_bits: output.width_bits,
+                        carrier_width_bits: source_bits,
                         conversion: None,
                     },
                 )?;
@@ -2972,6 +3192,43 @@ mod tests {
                 written: ah,
                 disposition: RegisterProjectionDisposition::Bound {
                     carrier: rax,
+                    slice: RegisterBitSlice {
+                        lsb_bit_offset: 8,
+                        size_bits: 8,
+                    },
+                },
+            },
+        ];
+        arch
+    }
+
+    fn big_endian_register_geometry_arch() -> ArchSpec {
+        let carrier = RegisterStorage { offset: 0, size: 8 };
+        let high_byte = RegisterStorage { offset: 6, size: 1 };
+        let mut arch = ArchSpec::new("geometry-test-be");
+        arch.set_instruction_endianness(Endianness::Big);
+        arch.set_memory_endianness(Endianness::Big);
+        arch.add_register(RegisterDef::new("carrier", carrier.offset, carrier.size));
+        arch.add_register(RegisterDef::new(
+            "high_byte",
+            high_byte.offset,
+            high_byte.size,
+        ));
+        arch.register_projections = vec![
+            RegisterProjection {
+                written: carrier,
+                disposition: RegisterProjectionDisposition::Bound {
+                    carrier,
+                    slice: RegisterBitSlice {
+                        lsb_bit_offset: 0,
+                        size_bits: 64,
+                    },
+                },
+            },
+            RegisterProjection {
+                written: high_byte,
+                disposition: RegisterProjectionDisposition::Bound {
+                    carrier,
                     slice: RegisterBitSlice {
                         lsb_bit_offset: 8,
                         size_bits: 8,
@@ -3734,6 +3991,7 @@ mod tests {
             MachineWriteProjection::Insert {
                 bit_offset: 0,
                 width_bits: 32,
+                carrier_width_bits: 64,
             }
         );
 
@@ -3750,6 +4008,7 @@ mod tests {
             MachineWriteProjection::Insert {
                 bit_offset: 8,
                 width_bits: 8,
+                carrier_width_bits: 64,
             }
         );
 
@@ -3789,6 +4048,192 @@ mod tests {
                 from_width_bits: 32,
                 to_width_bits: 64,
             }
+        );
+    }
+
+    #[test]
+    fn register_use_slices_are_relative_to_the_canonical_carrier() {
+        let arch = register_geometry_arch();
+        let artifact = artifact_with_arch(
+            [
+                R2ILOp::Copy {
+                    dst: Varnode::unique(0x10, 4),
+                    src: Varnode::register(0, 4),
+                },
+                R2ILOp::Copy {
+                    dst: Varnode::unique(0x20, 1),
+                    src: Varnode::register(1, 1),
+                },
+            ],
+            &arch,
+        );
+        let projection = MachineProjection::from_artifact(&artifact).expect("use projection");
+
+        assert_eq!(
+            exact_use(&projection, &artifact, 0, 0),
+            MachineUseSlice {
+                bit_offset: 0,
+                width_bits: 32,
+                carrier_width_bits: 64,
+                conversion: None,
+            }
+        );
+        assert_eq!(
+            exact_use(&projection, &artifact, 1, 0),
+            MachineUseSlice {
+                bit_offset: 8,
+                width_bits: 8,
+                carrier_width_bits: 64,
+                conversion: None,
+            }
+        );
+        projection
+            .validate_against(&artifact)
+            .expect("carrier-relative uses remain source-bound");
+
+        let mut corrupted = projection;
+        let high_inst = artifact
+            .graph()
+            .inst_id_for_op_site(0x1000, 1)
+            .expect("high-byte copy instruction");
+        let MachineUseDisposition::Exact(high_slice) =
+            &mut corrupted.use_dispositions[high_inst.0 as usize][0]
+        else {
+            panic!("high-byte use must be exact");
+        };
+        high_slice.bit_offset = 0;
+        assert_eq!(
+            corrupted.validate_against(&artifact),
+            Err(MachineBuildError::UseDispositionMismatch(UseSite {
+                inst: high_inst,
+                input_idx: 0,
+            }))
+        );
+
+        let mut corrupted =
+            MachineProjection::from_artifact(&artifact).expect("valid carrier-relative projection");
+        let MachineUseDisposition::Exact(high_slice) =
+            &mut corrupted.use_dispositions[high_inst.0 as usize][0]
+        else {
+            panic!("high-byte use must be exact");
+        };
+        high_slice.carrier_width_bits = 16;
+        assert_eq!(
+            corrupted.validate_against(&artifact),
+            Err(MachineBuildError::UseDispositionMismatch(UseSite {
+                inst: high_inst,
+                input_idx: 0,
+            }))
+        );
+    }
+
+    #[test]
+    fn big_endian_register_use_slice_keeps_upstream_byte_significance() {
+        let arch = big_endian_register_geometry_arch();
+        let artifact = artifact_with_arch(
+            [R2ILOp::Copy {
+                dst: Varnode::unique(0x10, 1),
+                src: Varnode::register(6, 1),
+            }],
+            &arch,
+        );
+        let projection = MachineProjection::from_artifact(&artifact).expect("use projection");
+
+        assert_eq!(
+            exact_use(&projection, &artifact, 0, 0),
+            MachineUseSlice {
+                bit_offset: 8,
+                width_bits: 8,
+                carrier_width_bits: 64,
+                conversion: None,
+            }
+        );
+        projection
+            .validate_against(&artifact)
+            .expect("big-endian carrier-relative use remains source-bound");
+    }
+
+    #[test]
+    fn register_use_slices_compose_nested_offsets_and_refuse_overflow() {
+        let operation_relative = MachineUseSlice {
+            bit_offset: 4,
+            width_bits: 4,
+            carrier_width_bits: 8,
+            conversion: None,
+        };
+        assert_eq!(
+            compose_machine_use_slice(operation_relative, 8, 64),
+            Ok(MachineUseSlice {
+                bit_offset: 12,
+                width_bits: 4,
+                carrier_width_bits: 64,
+                conversion: None,
+            })
+        );
+        assert_eq!(
+            compose_machine_use_slice(operation_relative, u32::MAX, u32::MAX),
+            Err(MachineUseRefusal::InvalidBitRange)
+        );
+    }
+
+    #[test]
+    fn register_use_projection_refuses_unavailable_and_invalid_geometry() {
+        let read = |arch: &ArchSpec, source: Varnode| {
+            let artifact = artifact_with_arch(
+                [R2ILOp::Copy {
+                    dst: Varnode::unique(0x10, source.size),
+                    src: source,
+                }],
+                arch,
+            );
+            let projection = MachineProjection::from_artifact(&artifact).expect("typed refusal");
+            let inst = artifact
+                .graph()
+                .inst_id_for_op_site(0x1000, 0)
+                .expect("copy instruction");
+            projection
+                .use_disposition(UseSite { inst, input_idx: 0 })
+                .copied()
+                .expect("dense use disposition")
+        };
+
+        let mut missing = register_geometry_arch();
+        missing.register_projections.clear();
+        assert_eq!(
+            read(&missing, Varnode::register(1, 1)),
+            MachineUseDisposition::Refused(MachineUseRefusal::MissingRegisterGeometry)
+        );
+
+        let mut refused = register_geometry_arch();
+        for projection in &mut refused.register_projections {
+            projection.disposition = RegisterProjectionDisposition::Refused {
+                reason: RegisterProjectionRefusal::MissingRegisterEndianness,
+            };
+        }
+        assert_eq!(
+            read(&refused, Varnode::register(1, 1)),
+            MachineUseDisposition::Refused(MachineUseRefusal::RegisterGeometry(
+                RegisterProjectionRefusal::MissingRegisterEndianness
+            ))
+        );
+
+        let mut malformed = refused;
+        malformed.register_projections[0].disposition = RegisterProjectionDisposition::Bound {
+            carrier: RegisterStorage { offset: 0, size: 8 },
+            slice: RegisterBitSlice {
+                lsb_bit_offset: 0,
+                size_bits: 32,
+            },
+        };
+        assert_eq!(
+            read(&malformed, Varnode::register(1, 1)),
+            MachineUseDisposition::Refused(MachineUseRefusal::MalformedRegisterGeometry)
+        );
+
+        let arch = register_geometry_arch();
+        assert_eq!(
+            read(&arch, Varnode::register(0x80, 1)),
+            MachineUseDisposition::Refused(MachineUseRefusal::InvalidBitRange)
         );
     }
 
@@ -3898,6 +4343,31 @@ mod tests {
             MachineWriteProjection::Insert {
                 bit_offset: 0,
                 width_bits: 32,
+                carrier_width_bits: 64,
+            },
+        ));
+        assert_eq!(
+            projection.validate_against(&artifact),
+            Err(MachineBuildError::WriteDispositionMismatch(inst))
+        );
+
+        let artifact = artifact_with_arch(
+            [R2ILOp::Copy {
+                dst: Varnode::register(1, 1),
+                src: Varnode::constant(7, 1),
+            }],
+            &arch,
+        );
+        let mut projection = MachineProjection::from_artifact(&artifact).expect("projection");
+        let inst = artifact
+            .graph()
+            .inst_id_for_op_site(0x1000, 0)
+            .expect("copy instruction");
+        projection.write_dispositions[inst.0 as usize] = Some(MachineWriteDisposition::Exact(
+            MachineWriteProjection::Insert {
+                bit_offset: 8,
+                width_bits: 8,
+                carrier_width_bits: 16,
             },
         ));
         assert_eq!(
@@ -3912,42 +4382,42 @@ mod tests {
         let artifact = artifact_with_ops([
             R2ILOp::Copy {
                 dst: Varnode::unique(0x10, 8),
-                src: Varnode::register(0, 8),
+                src: Varnode::unique(0x100, 8),
             },
             R2ILOp::Subpiece {
                 dst: Varnode::unique(0x18, 4),
-                src: Varnode::register(8, 8),
+                src: Varnode::unique(0x108, 8),
                 offset: 4,
             },
             R2ILOp::IntAnd {
                 dst: Varnode::unique(0x20, 4),
-                a: Varnode::register(16, 8),
+                a: Varnode::unique(0x110, 8),
                 b: Varnode::constant(0xff, 8),
             },
             R2ILOp::IntZExt {
                 dst: Varnode::unique(0x28, 8),
-                src: Varnode::register(24, 1),
+                src: Varnode::unique(0x118, 1),
             },
             R2ILOp::IntSExt {
                 dst: Varnode::unique(0x30, 8),
-                src: Varnode::register(25, 1),
+                src: Varnode::unique(0x119, 1),
             },
             R2ILOp::Trunc {
                 dst: Varnode::unique(0x38, 4),
-                src: Varnode::register(32, 8),
+                src: Varnode::unique(0x120, 8),
             },
             R2ILOp::Cast {
                 dst: Varnode::unique(0x40, 4),
-                src: Varnode::register(40, 4),
+                src: Varnode::unique(0x128, 4),
             },
             R2ILOp::Store {
                 space: SpaceId::Ram,
-                addr: Varnode::register(48, 8),
-                val: Varnode::register(56, 4),
+                addr: Varnode::unique(0x130, 8),
+                val: Varnode::unique(0x138, 4),
             },
             R2ILOp::IntDiv {
                 dst: unsupported.clone(),
-                a: Varnode::register(64, 8),
+                a: Varnode::unique(0x140, 8),
                 b: Varnode::constant(3, 8),
             },
             R2ILOp::Copy {
@@ -3955,7 +4425,7 @@ mod tests {
                 src: unsupported,
             },
             R2ILOp::Return {
-                target: Varnode::register(72, 8),
+                target: Varnode::unique(0x148, 8),
             },
         ]);
         let projection = MachineProjection::from_artifact(&artifact).expect("use projection");
@@ -3976,6 +4446,7 @@ mod tests {
             MachineUseSlice {
                 bit_offset: 0,
                 width_bits: 64,
+                carrier_width_bits: 64,
                 conversion: None,
             }
         );
@@ -3984,6 +4455,7 @@ mod tests {
             MachineUseSlice {
                 bit_offset: 32,
                 width_bits: 32,
+                carrier_width_bits: 64,
                 conversion: None,
             }
         );
@@ -3993,6 +4465,7 @@ mod tests {
                 MachineUseSlice {
                     bit_offset: 0,
                     width_bits: 32,
+                    carrier_width_bits: 64,
                     conversion: None,
                 }
             );
@@ -4008,6 +4481,7 @@ mod tests {
                 MachineUseSlice {
                     bit_offset: 0,
                     width_bits: source_bits,
+                    carrier_width_bits: source_bits,
                     conversion: Some(MachineUseConversion {
                         kind,
                         to_width_bits: target_bits,
@@ -4063,11 +4537,11 @@ mod tests {
         let artifact = artifact_with_ops([
             R2ILOp::Copy {
                 dst: Varnode::unique(0x20, 8),
-                src: Varnode::register(8, 8),
+                src: Varnode::unique(0x100, 8),
             },
             R2ILOp::IntZExt {
                 dst: Varnode::unique(0x28, 8),
-                src: Varnode::register(16, 1),
+                src: Varnode::unique(0x108, 1),
             },
         ]);
         let mut projection =

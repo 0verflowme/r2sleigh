@@ -3,7 +3,8 @@
 use r2sleigh_lift::{Disassembler, TrustedSleighProfile};
 use r2ssa::{
     CanonicalStorageId, CanonicalStorageSpace, FunctionPrepareMode, MachineProjection,
-    MachineWriteDisposition, MachineWriteProjection, SsaArtifact,
+    MachineUseDisposition, MachineUseSlice, MachineWriteDisposition, MachineWriteProjection,
+    SsaArtifact, UseSite,
 };
 
 fn declared_register_storage(arch: &r2il::ArchSpec, name: &str) -> CanonicalStorageId {
@@ -76,6 +77,49 @@ fn exact_single_write_to_storage(
     }
 }
 
+fn exact_uses_from_storage(
+    artifact: &SsaArtifact,
+    projection: &MachineProjection,
+    storage: CanonicalStorageId,
+) -> Vec<MachineUseSlice> {
+    let uses = artifact
+        .graph()
+        .insts
+        .iter()
+        .flat_map(|inst| {
+            inst.inputs
+                .iter()
+                .enumerate()
+                .filter_map(move |(input_idx, input)| {
+                    (artifact
+                        .graph()
+                        .value(*input)
+                        .and_then(|value| value.canonical_storage)
+                        == Some(storage))
+                    .then_some(UseSite {
+                        inst: inst.id,
+                        input_idx,
+                    })
+                })
+        })
+        .collect::<Vec<_>>();
+    assert!(!uses.is_empty(), "storage must have a surviving use");
+    uses.into_iter()
+        .map(|site| {
+            match projection
+                .use_disposition(site)
+                .copied()
+                .expect("dense storage use disposition")
+            {
+                MachineUseDisposition::Exact(slice) => slice,
+                MachineUseDisposition::Refused(reason) => {
+                    panic!("storage use must be exact, got {reason:?}")
+                }
+            }
+        })
+        .collect()
+}
+
 #[test]
 fn genuine_x86_eax_write_survives_as_one_carrier_zero_extension() {
     let (artifact, projection, arch) = genuine_optimized_projection(
@@ -123,6 +167,60 @@ fn genuine_x86_ah_write_survives_as_one_high_slice_insert() {
         MachineWriteProjection::Insert {
             bit_offset: 8,
             width_bits: 8,
+            carrier_width_bits: 64,
         }
     );
+}
+
+#[test]
+fn genuine_x86_ah_read_is_relative_to_rax() {
+    let (artifact, projection, arch) = genuine_optimized_projection(
+        TrustedSleighProfile::X86_64,
+        &[0x88, 0xe3], // mov bl, ah
+    );
+    let ah = declared_register_storage(&arch, "AH");
+
+    let slices = exact_uses_from_storage(&artifact, &projection, ah);
+    assert_eq!(slices.len(), 1);
+    assert!(slices.iter().all(|slice| {
+        slice.bit_offset() == 8
+            && slice.width_bits() == 8
+            && slice.carrier_width_bits() == 64
+            && slice.conversion().is_none()
+    }));
+}
+
+#[test]
+fn genuine_x86_ah_zero_extend_preserves_rax_relative_source_slice() {
+    let (artifact, projection, arch) = genuine_optimized_projection(
+        TrustedSleighProfile::X86_64,
+        &[0x0f, 0xb6, 0xc4], // movzx eax, ah
+    );
+    let ah = declared_register_storage(&arch, "AH");
+
+    let slices = exact_uses_from_storage(&artifact, &projection, ah);
+    assert_eq!(slices.len(), 1);
+    let slice = slices[0];
+    assert_eq!(slice.bit_offset(), 8);
+    assert_eq!(slice.width_bits(), 8);
+    assert_eq!(slice.carrier_width_bits(), 64);
+    let conversion = slice
+        .conversion()
+        .expect("movzx use must retain conversion");
+    assert_eq!(conversion.kind(), r2ssa::MachineCastKind::ZeroExtend);
+    assert_eq!(conversion.to_width_bits(), 32);
+}
+
+#[test]
+fn genuine_x86_eax_read_is_relative_to_rax() {
+    let (artifact, projection, arch) = genuine_optimized_projection(
+        TrustedSleighProfile::X86_64,
+        &[0x89, 0xc3], // mov ebx, eax
+    );
+    let eax = declared_register_storage(&arch, "EAX");
+
+    let slices = exact_uses_from_storage(&artifact, &projection, eax);
+    assert!(slices.iter().all(|slice| {
+        slice.bit_offset() == 0 && slice.width_bits() == 32 && slice.carrier_width_bits() == 64
+    }));
 }
