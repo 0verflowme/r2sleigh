@@ -4709,5 +4709,24 @@ It does not fix the failure. `xxhash32` still fails on `tmp_4700_7`, which is th
 two-spelling problem this section opened with, and the corpus is 35 of 54
 throughout. What it removes is a pass actively making that problem worse.
 
+### Why the reverse index does not reach this case
+
+`for_ssa_name` resolves an origin only when some identifier has been *noted* as
+rendering that value. Two refinements to make it answer here were built and are
+both inert: keeping the first identifier minted for a value rather than dropping
+the entry as ambiguous, and preferring whichever of them is a legal C identifier.
+Neither changes the rendering.
+
+The reason is that the rendered symbol `t4700_7` never has `note_ssa_name`
+called for `tmp:4700_7` at all, so there is nothing for the index to find and no
+preference rule can invent it. The index works where the link is recorded -- it
+removed the earlier `tmp_4700_7` failure in the state before `post_rename` was
+corrected -- and this value is not linked.
+
+So the remaining work on this family is not in the index or its tie-breaks. It is
+that a symbol minted to render a value does not always record which value it
+renders, and until it does, nothing downstream can tell that two identifiers are
+one value.
+
 The corpus is 35 of 54 throughout -- this moves `xxhash32` from one undeclared
 name to another rather than to a rendering that compiles.
