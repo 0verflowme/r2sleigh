@@ -67,7 +67,7 @@ def repair(src, name):
     rest = re.sub(r'/\*.*?\*/', '', rest, flags=re.S)
     rest = re.sub(r'\b(?:u?int(?:8|16|32|64|128|512)_t)\s+(\w+)', r'long \1', rest)
     # a stated width keeps its width
-    rest = re.sub(r'\*\s*\(\s*(u?int(?:8|16|32|64)_t)\s*\*\s*\)\s*',
+    rest = re.sub(r'\*\s*\(\s*((?:__)?u?int(?:8|16|32|64|128)_t)\s*\*\s*\)\s*',
                   r'@@D\1@@', rest)
     # `name[index]` on an integer-typed value
     def idx(m):
@@ -87,7 +87,7 @@ def repair(src, name):
         return f'(*(unsigned char *)(long)({m.group(1)}))'
     rest = re.sub(r'\*\(([^()]*)\)', bare, rest)
     rest = re.sub(r'\*([A-Za-z_]\w*)\b', bare, rest)
-    rest = re.sub(r'@@D(u?int(?:8|16|32|64)_t)@@', r'*(\1 *)(long)', rest)
+    rest = re.sub(r'@@D((?:__)?u?int(?:8|16|32|64|128)_t)@@', r'*(\1 *)(long)', rest)
     return sig + rest, n, assumed
 
 results = {}

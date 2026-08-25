@@ -157,12 +157,26 @@ learn.
      compilers call it. Both arm64 -O2 failures advance past the type error:
      crc32_bitwise to an undeclared `tregpiece_...`, xxhash32 to a mangled cast.
 
-     That mangled cast is worth knowing about, because it is the harness's:
-     `verify_rendering.py` rewrites `*(X)` into `(*(unsigned char *)(long)(X))`,
-     and applied to `(__uint128_t*)t7400_2` it produces
-     `(*(unsigned char *)(long)(__uint128_t*))t7400_2`, which is not an
-     expression. The rewrite corrupts pointer casts. It was always doing so here
-     and was simply hidden behind the undeclared type.
+     That mangled cast was the harness's own. `verify_rendering.py` stashes
+     `*(uintN_t *)` casts before rewriting bare dereferences, so its own
+     `*(X) -> (*(unsigned char *)(long)(X))` rule cannot corrupt them -- but the
+     protected list stopped at 64 bits, so a valid `*(__uint128_t *)` was
+     rewritten into `(*(unsigned char *)(long)(__uint128_t*))t7400_2`, which is
+     not an expression. The list now covers 128-bit and the optional `__`
+     prefix. Corpus is 37 before and after, so no verdict depends on it: the fix
+     stops the instrument corrupting valid output rather than changing what
+     counts as correct.
+
+     Worth watching when editing that file: writing the prefix as `__?` rather
+     than `(?:__)?` makes the underscore *mandatory* and unprotects every
+     ordinary `uint32_t` cast. That drops the corpus from 37 to 18 and looks
+     exactly like a decompiler regression.
+
+     With the cast intact, arm64 -O2 xxhash32 advances again, to
+     `call to undeclared function 'callother'` -- a Sleigh CALLOTHER for an
+     instruction the lifter does not model reaching the page. That is a real
+     limitation rather than a rendering defect, and it is the first of its kind
+     to surface in this corpus.
 
      `sym__rotl32` compiles once declared but cannot link, because the harness
      builds one function per file.
