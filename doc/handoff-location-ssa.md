@@ -336,6 +336,31 @@ learn.
      where the next attempt should start, and it should start by finding the
      defining op for `EAX_4` and asking what dropped it.
 
+     **How far the trace got, so the next one starts here.** Taking `eax_4` in
+     xxhash32 at x86-64 -O1:
+
+     * Its definition is recorded and passes every filter:
+       `DEFFILTER EAX_4 self=false safe=true carrier=false`.
+     * The resolver behaves correctly: `GETEXPR key=EAX_4 def=true
+       value_id=Some(878) use_count=8` and it hands back a bare `Var`, which is
+       right -- eight uses should not be inlined, they should read a statement.
+     * The op is `Subpiece { dst: EAX_4, src: tmp:4c780_17, offset: 0 }`, a
+       truncation, and `op_to_stmt_impl` *does* reach it.
+     * `assign_stmt` does *not* drop it: instrumenting all four of its
+       `return None` paths shows only one firing in this function, for two other
+       symbols.
+     * The block-local prune in `aliases.rs` never sees it as a target, under
+       either spelling.
+     * Yet no pass in the pipeline ever sees `eax_4` as an assignment target --
+       it is already gone at the first one.
+
+     So a statement is built for it and something between building and the pass
+     pipeline discards it. The remaining suspect is the block: if `EAX_4`'s
+     defining block is dropped during structuring, every statement in it goes
+     with it and no per-statement filter is ever consulted -- which is the same
+     shape as 0g, where murmur3's tail switch renders with all three case bodies
+     empty. Check that before looking at any per-statement rule.
+
      Not in this cluster despite looking like it: `r8d` in fnv1a64 -O2 appears
      inside a piece composition, `(hi << 32) | (uint64_t)r8d`, which is the width
      layer rather than carrier membership; and `x8_30` in arm64 -O0 murmur3_32 is
