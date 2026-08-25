@@ -524,6 +524,40 @@ learn.
      xxhash32 -O1 returns nothing against `e7583aa4` -- so they are a different
      defect rather than this one.
 
+  0j. **A four-byte read of a byte array renders as one element.** This is what
+     murmur3_32 at x86-64 -O1 now fails on, having reached the value layer.
+
+     The machine reads a dword:
+
+     ```
+     imul r8d, dword [rdi + rcx*4], 0xcc9e2d51
+     ```
+
+     and the rendering is `(((unsigned char *)(long)(arg0))[t4900_2])` -- one
+     byte, a quarter of the word the hash consumes. It returns `ec1fbeef` against
+     a wanted `7e4102af`.
+
+     The width is right everywhere until the access is built. Probing the `Load`
+     arm gives `LOAD dst=tmp:11f00_2 size=4 addr=tmp:4a00_2 hint=None`, so the
+     SSA says four bytes and there is no type hint to argue with; `elem_ty`
+     therefore comes out of `uint_type_from_size(4)` as `uint32_t` and is passed
+     into `render_canonical_load_expr` correctly. Something inside that renderer
+     prefers the *object's* element type -- murmur3 takes `const uint8_t *data`,
+     so the array's elements are bytes -- over the width of the access being
+     rendered. A four-byte read of a byte array is `*(uint32_t *)(data + i * 4)`,
+     not `data[i]`.
+
+     Ruled out on the way: constraining the type hint to the access width
+     (`filter(|ty| ty.size == dst.size)`) changes nothing, because there is no
+     hint here at all. Reverted.
+
+     Also visible in the same function and probably a second defect: the tail
+     renders `switch (arg1)` where `switch (arg1 & 3)` is meant, so a 61-byte
+     message matches none of `case 1/2/3` and the tail is skipped entirely.
+     Using the selector value rather than `prepared_canonical_value_root` of it
+     does *not* fix that -- measured, unchanged, reverted -- so the mask is
+     already absent from the selector the switch facts carry.
+
   0g. **murmur3's tail switch renders with empty bodies.** This is what arm64 -O0
      `murmur3_32` now fails on, and the undeclared `x8_30` is a symptom of it
      rather than the defect. The rendering is
