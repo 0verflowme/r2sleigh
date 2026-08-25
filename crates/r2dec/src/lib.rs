@@ -42,6 +42,7 @@ pub(crate) mod fold;
 pub mod highlight;
 pub(crate) mod naming;
 pub(crate) mod normalize;
+mod observation_journal;
 pub(crate) mod planner;
 pub(crate) mod post_rename;
 pub mod region;
@@ -62,7 +63,7 @@ pub use region::{Region, RegionAnalyzer};
 pub(crate) use structure::ControlFlowStructurer;
 pub use variable::VariableRecovery;
 
-use crate::codegen::CodeGenerator;
+use crate::codegen::{CodeGenerator, prepare_function_for_emission};
 use crate::fold::FoldingContext;
 use crate::fold::context::{FoldArchConfig, FoldInputs};
 use r2ssa::SSAFunction;
@@ -1481,10 +1482,11 @@ fn note_unproven_constructs(func: &mut CFunction, ledger: Option<&r2ssa::ledger:
 fn reconcile_ledger_with_body(
     ledger: &mut r2ssa::ledger::ObligationLedger,
     func: &CFunction,
+    prepared: &r2ssa::SsaArtifact,
     proofs: &[crate::fold::context::EffectRenderProof],
 ) {
     use r2ssa::ledger::{LedgerLayer, Outcome, RefusalReason};
-    debug_log_render_witness(ledger, func, proofs);
+    debug_log_render_witness(ledger, func, prepared, proofs);
     let rendered_any_statement = func
         .body
         .iter()
@@ -1526,6 +1528,7 @@ fn reconcile_ledger_with_body(
 fn debug_log_render_witness(
     ledger: &r2ssa::ledger::ObligationLedger,
     func: &CFunction,
+    prepared: &r2ssa::SsaArtifact,
     proofs: &[crate::fold::context::EffectRenderProof],
 ) {
     if !unowned_report_requested() {
@@ -1553,7 +1556,19 @@ fn debug_log_render_witness(
             .chain(proof.values.iter())
             .any(|value| named_values.contains(value));
         if touches {
-            witnessed_sites.insert((proof.block_addr, proof.op_idx));
+            for id in &proof.obligation_ids {
+                match id.instruction.site {
+                    r2ssa::CanonicalInstructionSite::Phi(_) => {
+                        witnessed_sites.insert((id.instruction.block_addr, 0));
+                    }
+                    r2ssa::CanonicalInstructionSite::Op(op_idx) => {
+                        if let Ok(op_idx) = usize::try_from(op_idx) {
+                            witnessed_sites.insert((id.instruction.block_addr, op_idx));
+                        }
+                    }
+                    r2ssa::CanonicalInstructionSite::NativeSpan { .. } => {}
+                }
+            }
         }
     }
     let (claimed, witnessed) = ledger.entries().fold((0usize, 0usize), |(all, seen), (_, outcome)| {
@@ -1623,11 +1638,16 @@ fn count_body_statements(stmts: &[CStmt]) -> usize {
 /// disappearing, and the counts sum to the inventory by construction.
 fn build_obligation_ledger(
     prepared: &r2ssa::SsaArtifact,
+    normalized: &r2ssa::SSAFunction,
+    origins: &crate::normalize::NormalizationOrigins,
     proofs: &[crate::fold::context::EffectRenderProof],
     folded_blocks: &std::collections::BTreeSet<u64>,
-    elided_op_sites: &std::collections::BTreeMap<(u64, usize), &'static str>,
+    elided_obligations: &std::collections::BTreeMap<r2ssa::SemanticObligationId, &'static str>,
 ) -> r2ssa::ledger::ObligationLedger {
-    use r2ssa::SemanticObligationKind as Kind;
+    use r2ssa::{
+        CanonicalInstructionSite, SemanticObligationComponent, SemanticObligationKind as Kind,
+        UseSite,
+    };
     use r2ssa::ledger::{ElisionReason, LedgerLayer, ObligationLedger, Outcome, RefusalReason};
 
     let obligations = prepared.obligations();
@@ -1635,25 +1655,68 @@ fn build_obligation_ledger(
     let unobserved = prepared.unobserved_merges();
     let mut ledger = ObligationLedger::open(obligations);
 
-    // InstId is a dense index, so membership is a direct probe rather than a tree
-    // walk, and the site an obligation rendered at is read back from the same table.
-    let inst_count = graph.insts.len();
-    let mut rendered_site = vec![None::<(u64, usize)>; inst_count];
+    let canonical_render_site = |id: r2ssa::SemanticObligationId| match id.instruction.site {
+        CanonicalInstructionSite::Phi(_) => Some((id.instruction.block_addr, 0)),
+        CanonicalInstructionSite::Op(op_idx) => {
+            usize::try_from(op_idx).ok().map(|op_idx| (id.instruction.block_addr, op_idx))
+        }
+        CanonicalInstructionSite::NativeSpan { .. } => None,
+    };
+    let mut rendered = std::collections::BTreeMap::new();
+    let mut rendered_phi_sites = std::collections::BTreeSet::<UseSite>::new();
     for proof in proofs {
-        if let Some(inst) = graph.inst_id_for_op_site(proof.block_addr, proof.op_idx)
-            && let Some(slot) = rendered_site.get_mut(inst.0 as usize)
-        {
-            *slot = Some((proof.block_addr, proof.op_idx));
+        for id in &proof.obligation_ids {
+            if let Some(site) = canonical_render_site(*id) {
+                rendered.insert(*id, site);
+            }
+        }
+        if let Some(phi_edge) = &proof.phi_edge {
+            rendered_phi_sites.extend(phi_edge.sites.iter().copied());
         }
     }
-    let mut elided_reason = vec![None::<&'static str>; inst_count];
-    for ((block_addr, op_idx), reason) in elided_op_sites {
-        if let Some(inst) = graph.inst_id_for_op_site(*block_addr, *op_idx)
-            && let Some(slot) = elided_reason.get_mut(inst.0 as usize)
-        {
-            *slot = Some(*reason);
+
+    // The normalized sidecar is the sole authority for how each removed phi
+    // input survived. Build a compact inverse once; no operation shape, name,
+    // or folded-block membership participates in this decision.
+    let mut materialized_phi_sites = std::collections::BTreeSet::<UseSite>::new();
+    for block_id in &graph.block_order {
+        let Some(block_addr) = graph.block(*block_id).map(|block| block.addr) else {
+            continue;
+        };
+        let Some(block) = normalized.get_block(block_addr) else {
+            continue;
+        };
+        for op_idx in 0..block.ops.len() {
+            match origins.origin(crate::normalize::NormalizedOpSite {
+                block: *block_id,
+                op_idx,
+            }) {
+                Some(crate::normalize::NormalizedOpOrigin::PhiEdgeCopy(origin)) => {
+                    materialized_phi_sites.insert(origin.incoming);
+                }
+                Some(crate::normalize::NormalizedOpOrigin::RelocatedInitializer(origin)) => {
+                    materialized_phi_sites.extend(origin.replaced_sites.iter().copied());
+                }
+                Some(crate::normalize::NormalizedOpOrigin::Original(_)) | None => {}
+            }
         }
     }
+    let removed_phi = origins
+        .removed_phis()
+        .iter()
+        .map(|removed| (removed.definition.inst, removed))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let phi_site_for_predecessor = |inst: r2ssa::InstId, predecessor: u64| {
+        let definition = graph.inst(inst)?;
+        let r2ssa::InstPayload::Phi { predecessors } = &definition.payload else {
+            return None;
+        };
+        let mut matches = predecessors.iter().enumerate().filter_map(|(input_idx, block)| {
+            (graph.block(*block)?.addr == predecessor).then_some(UseSite { inst, input_idx })
+        });
+        let first = matches.next()?;
+        matches.next().is_none().then_some(first)
+    };
 
     for id in obligations.obligations().keys() {
         // The admission rule asks these to residualize rather than be owned, which
@@ -1683,40 +1746,92 @@ fn build_obligation_ledger(
             ledger.record(*id, Outcome::Elided(ElisionReason::UnobservedMerge));
             continue;
         }
+        if let Some(reason) = elided_obligations.get(id) {
+            ledger.record(*id, Outcome::Elided(elision_reason(reason)));
+            continue;
+        }
+        if !matches!(id.instruction.site, CanonicalInstructionSite::Phi(_))
+            && let Some((block_addr, op_idx)) = rendered.get(id).copied()
+        {
+            ledger.record(*id, Outcome::Rendered { block_addr, op_idx });
+            continue;
+        }
         let block_rendered = folded_blocks.contains(&id.instruction.block_addr);
-        // A merge sits at the head of its block rather than at any operation, so no
-        // operation site can name it; the block it heads is what expresses it.
-        let outcome = match id.instruction.site {
-            r2ssa::CanonicalInstructionSite::Phi(_) if block_rendered => Outcome::Rendered {
-                block_addr: id.instruction.block_addr,
-                op_idx: 0,
+        let source_inst = obligations
+            .instructions()
+            .get(&id.instruction)
+            .and_then(|disposition| disposition.source.graph_inst());
+        let outcome = match (id.instruction.site, id.kind, id.component, source_inst) {
+            (
+                CanonicalInstructionSite::Phi(_),
+                Kind::LiveStateTransition,
+                SemanticObligationComponent::LoopTransition { predecessor, .. },
+                Some(inst),
+            ) => match phi_site_for_predecessor(inst, predecessor) {
+                Some(site)
+                    if materialized_phi_sites.contains(&site)
+                        && rendered_phi_sites.contains(&site) => Outcome::Rendered {
+                    block_addr: id.instruction.block_addr,
+                    op_idx: 0,
+                },
+                Some(site)
+                    if removed_phi
+                        .get(&inst)
+                        .is_some_and(|removed| removed.noop_sites().contains(&site)) =>
+                {
+                    Outcome::Elided(ElisionReason::DeadUnclassified)
+                }
+                _ => Outcome::Refused {
+                    layer: LedgerLayer::Fold,
+                    reason: RefusalReason::Unclassified,
+                },
             },
-            r2ssa::CanonicalInstructionSite::Phi(_) => Outcome::Refused {
+            (CanonicalInstructionSite::Phi(_), Kind::LoopCarriedState, _, Some(inst)) => {
+                match removed_phi.get(&inst) {
+                    Some(removed)
+                        if removed
+                            .incoming_sites
+                            .iter()
+                            .all(|site| {
+                                (materialized_phi_sites.contains(site)
+                                    && rendered_phi_sites.contains(site))
+                                    || removed.noop_sites().contains(site)
+                            }) =>
+                    {
+                        if removed
+                            .incoming_sites
+                            .iter()
+                            .any(|site| {
+                                materialized_phi_sites.contains(site)
+                                    && rendered_phi_sites.contains(site)
+                            })
+                        {
+                            Outcome::Rendered {
+                                block_addr: id.instruction.block_addr,
+                                op_idx: 0,
+                            }
+                        } else {
+                            Outcome::Elided(ElisionReason::DeadUnclassified)
+                        }
+                    }
+                    _ => Outcome::Refused {
+                        layer: LedgerLayer::Fold,
+                        reason: RefusalReason::Unclassified,
+                    },
+                }
+            }
+            (CanonicalInstructionSite::Phi(_), _, _, _) => Outcome::Refused {
+                layer: LedgerLayer::Fold,
+                reason: RefusalReason::Unclassified,
+            },
+            _ if !block_rendered => Outcome::Refused {
                 layer: LedgerLayer::Structure,
                 reason: RefusalReason::BlockNotRendered,
             },
-            _ => {
-                let inst = obligations
-                    .instructions()
-                    .get(&id.instruction)
-                    .and_then(|disposition| disposition.source.graph_inst());
-                let index = inst.map(|inst| inst.0 as usize);
-                let site = index.and_then(|index| rendered_site.get(index).copied().flatten());
-                match site {
-                    Some((block_addr, op_idx)) => Outcome::Rendered { block_addr, op_idx },
-                    None => {
-                        match index.and_then(|index| elided_reason.get(index).copied().flatten()) {
-                            Some(reason) => Outcome::Elided(elision_reason(reason)),
-                            None if !block_rendered => Outcome::Refused {
-                                layer: LedgerLayer::Structure,
-                                reason: RefusalReason::BlockNotRendered,
-                            },
-                            // The block rendered and no rule reached this obligation.
-                            None => Outcome::Unattributed,
-                        }
-                    }
-                }
-            }
+            _ => Outcome::Refused {
+                layer: LedgerLayer::Fold,
+                reason: RefusalReason::Unclassified,
+            },
         };
         ledger.record(*id, outcome);
     }
@@ -1726,15 +1841,18 @@ fn build_obligation_ledger(
         // proof and no elision can be named rather than counted.
         let mut sites = proofs
             .iter()
-            .map(|proof| (proof.block_addr, proof.op_idx))
+            .flat_map(|proof| proof.obligation_ids.iter().copied())
+            .filter_map(canonical_render_site)
             .collect::<Vec<_>>();
         sites.sort_unstable();
         sites.dedup();
         for (block_addr, op_idx) in sites {
             eprintln!("PROOFSITE block={block_addr:#x} idx={op_idx}");
         }
-        for ((block_addr, op_idx), reason) in elided_op_sites {
-            eprintln!("ELIDEDSITE block={block_addr:#x} idx={op_idx} reason={reason}");
+        for (id, reason) in elided_obligations {
+            if let Some((block_addr, op_idx)) = canonical_render_site(*id) {
+                eprintln!("ELIDEDSITE block={block_addr:#x} idx={op_idx} reason={reason}");
+            }
         }
     }
     debug_log_ledger(prepared, &ledger);
@@ -2922,7 +3040,8 @@ impl Decompiler {
         let c_func = self.build_function_from_input_with_control(input, control)?;
         let render_work = work.with_phase(DecompileWorkPhase::Rendering);
         render_work.poll()?;
-        let output = CodeGenerator::new(self.config.codegen.clone()).generate_function(&c_func);
+        let ready = prepare_function_for_emission(&c_func);
+        let output = CodeGenerator::new(self.config.codegen.clone()).generate_function(&ready);
         // This is deliberately the last production work-control decision.
         // Everything below is observational Stage 4 shadow work.
         render_work.poll()?;
@@ -2964,7 +3083,8 @@ impl Decompiler {
                     .build_function_from_input_with_control(input, &unchecked)
                     .ok()
                     .map(|c_func| {
-                        CodeGenerator::new(self.config.codegen.clone()).generate_function(&c_func)
+                        let ready = prepare_function_for_emission(&c_func);
+                        CodeGenerator::new(self.config.codegen.clone()).generate_function(&ready)
                     });
                 Err((stop, partial))
             }
@@ -3476,24 +3596,65 @@ impl Decompiler {
                 }
             }
         }
-        let (mut normalized_func, materialized_edge_copies) =
+        let normalization_refusal = |error: normalize::NormalizationOriginError| {
+            let func_name = func
+                .name
+                .clone()
+                .unwrap_or_else(|| format!("sub_{:x}", func.entry));
+            residual_function_for_render_boundary(
+                &func_name,
+                &format!("normalization origin refusal: {error}"),
+            )
+        };
+        let (mut normalized_func, mut normalization_origins) =
             if let Some(render_facts) = self.context.function_facts.render() {
-                normalize::materialize_certified_loop_carriers_with_control(
+                match normalize::materialize_certified_loop_carriers_with_control(
                     func,
                     prepared,
                     render_facts,
                     work,
-                )?
+                ) {
+                    Ok(result) => result,
+                    Err(normalize::NormalizationFailure::Execution(error)) => return Err(error),
+                    Err(normalize::NormalizationFailure::Origins(error)) => {
+                        return Ok(normalization_refusal(error));
+                    }
+                }
             } else {
-                (func.clone(), normalize::MaterializedEdgeCopies::default())
+                (
+                    func.clone(),
+                    normalize::NormalizationOrigins::for_unchanged(func, prepared),
+                )
             };
         if let Some(render_facts) = self.context.function_facts.render() {
-            normalize::materialize_certified_loop_carrier_initializers_with_control(
+            if let Err(error) = normalize::materialize_certified_loop_carrier_initializers_with_control(
                 &mut normalized_func,
+                &mut normalization_origins,
                 prepared,
                 render_facts,
                 work,
-            )?;
+            ) {
+                match error {
+                    normalize::NormalizationFailure::Execution(error) => return Err(error),
+                    normalize::NormalizationFailure::Origins(error) => {
+                        return Ok(normalization_refusal(error));
+                    }
+                }
+            }
+        }
+        if let Err(error) = normalization_origins.validate(
+            &normalized_func,
+            prepared,
+            self.context.function_facts.render(),
+        ) {
+            let func_name = func
+                .name
+                .clone()
+                .unwrap_or_else(|| format!("sub_{:x}", func.entry));
+            return Ok(residual_function_for_render_boundary(
+                &func_name,
+                &format!("normalization origin refusal: {error:?}"),
+            ));
         }
         work.poll()?;
         if std::env::var_os("R2SLEIGH_DEBUG_MERGES").is_some() {
@@ -3683,7 +3844,7 @@ impl Decompiler {
             })
         });
         let fold_inputs = FoldInputs {
-            materialized_edge_copies: &materialized_edge_copies,
+            normalization_origins: Some(&normalization_origins),
             arch: &fold_arch,
             display_names: self.context.function_facts.display_names(),
             #[cfg(test)]
@@ -3939,11 +4100,18 @@ impl Decompiler {
         }
         let mut ledger = build_obligation_ledger(
             prepared,
+            &normalized_func,
+            &normalization_origins,
             &fold_ctx.effect_render_proofs_since(0),
             &fold_ctx.folded_block_addrs(),
-            &fold_ctx.elided_op_sites(),
+            &fold_ctx.elided_obligations(),
         );
-        reconcile_ledger_with_body(&mut ledger, &c_function, &fold_ctx.effect_render_proofs_since(0));
+        reconcile_ledger_with_body(
+            &mut ledger,
+            &c_function,
+            prepared,
+            &fold_ctx.effect_render_proofs_since(0),
+        );
         note_unproven_constructs(&mut c_function, Some(&ledger));
         // Every name the body assigns has a declaration by now, so a name
         // still without one is never assigned: it is read, and nothing in the
@@ -4039,6 +4207,7 @@ impl Decompiler {
 
 fn collect_expr_var_names(expr: &CExpr, out: &mut HashSet<crate::symbol::SymbolId>) {
     match expr {
+        CExpr::Observed { expr, .. } => collect_expr_var_names(expr, out),
         CExpr::Var(name) => {
             out.insert(*name);
         }
@@ -4094,6 +4263,7 @@ fn collect_expr_var_names(expr: &CExpr, out: &mut HashSet<crate::symbol::SymbolI
 pub(crate) fn declarations_in_stmts(stmts: &[CStmt]) -> Vec<crate::symbol::SymbolId> {
     fn visit(stmt: &CStmt, out: &mut Vec<crate::symbol::SymbolId>) {
         match stmt {
+            CStmt::Observed { stmt, .. } => visit(stmt, out),
             CStmt::Decl { name, .. } => out.push(*name),
             CStmt::Block(body) => body.iter().for_each(|s| visit(s, out)),
             CStmt::If {
@@ -4134,6 +4304,7 @@ pub(crate) fn declarations_in_stmts(stmts: &[CStmt]) -> Vec<crate::symbol::Symbo
 pub(crate) fn collect_stmt_var_names(stmts: &[CStmt]) -> HashSet<crate::symbol::SymbolId> {
     fn visit_stmt(stmt: &CStmt, out: &mut HashSet<crate::symbol::SymbolId>) {
         match stmt {
+            CStmt::Observed { stmt, .. } => visit_stmt(stmt, out),
             CStmt::Empty
             | CStmt::Break
             | CStmt::Continue
@@ -4374,15 +4545,18 @@ fn debug_assigned_locals(func: &CFunction, after: &str) {
 
 fn drop_overwritten_assignments(func: &mut CFunction) {
     fn assignment_target(stmt: &CStmt) -> Option<(crate::symbol::SymbolId, &CExpr)> {
-        let CStmt::Expr(CExpr::Binary {
+        let CStmt::Expr(expr) = stmt.unobserved() else {
+            return None;
+        };
+        let CExpr::Binary {
             op: BinaryOp::Assign,
             left,
             right,
-        }) = stmt
+        } = expr.unobserved()
         else {
             return None;
         };
-        let CExpr::Var(name) = left.as_ref() else {
+        let CExpr::Var(name) = left.unobserved() else {
             return None;
         };
         Some((*name, right.as_ref()))
@@ -4425,7 +4599,7 @@ fn drop_overwritten_assignments(func: &mut CFunction) {
                     break;
                 }
                 // Only straight-line statements are crossed; anything else may read it out of order.
-                if !matches!(stmt, CStmt::Expr(_) | CStmt::Decl { .. }) {
+                if !matches!(stmt.unobserved(), CStmt::Expr(_) | CStmt::Decl { .. }) {
                     break;
                 }
             }
@@ -4581,15 +4755,18 @@ fn drop_dead_undeclared_carriers(symbols: &std::cell::RefCell<crate::symbol::Sym
                 removed,
             );
         });
-        let CStmt::Expr(CExpr::Binary {
+        let CStmt::Expr(expr) = stmt.unobserved() else {
+            continue;
+        };
+        let CExpr::Binary {
             op: BinaryOp::Assign,
             left,
             right,
-        }) = stmt
+        } = expr.unobserved()
         else {
             continue;
         };
-        let CExpr::Var(name) = left.as_ref() else {
+        let CExpr::Var(name) = left.unobserved() else {
             continue;
         };
         let lower = crate::symbol::spelling(symbols, *name).to_ascii_lowercase();
@@ -4617,6 +4794,18 @@ fn drop_dead_undeclared_comma_carriers(symbols: &std::cell::RefCell<crate::symbo
     returns_value: bool,
     removed: &mut bool,
 ) {
+    if let CExpr::Observed { expr, .. } = expr {
+        drop_dead_undeclared_comma_carriers(
+            symbols,
+            expr,
+            declared,
+            reads,
+            fold_ctx,
+            returns_value,
+            removed,
+        );
+        return;
+    }
     for child in single_evaluation::children_mut(expr) {
         drop_dead_undeclared_comma_carriers(symbols, child, declared, reads, fold_ctx, returns_value, removed);
     }
@@ -4662,11 +4851,11 @@ fn dead_undeclared_carrier_assignment(symbols: &std::cell::RefCell<crate::symbol
         op: BinaryOp::Assign,
         left,
         right,
-    } = expr
+    } = expr.unobserved()
     else {
         return false;
     };
-    let CExpr::Var(name) = left.as_ref() else {
+    let CExpr::Var(name) = left.unobserved() else {
         return false;
     };
     let lower = crate::symbol::spelling(symbols, *name).to_ascii_lowercase();
@@ -4684,12 +4873,13 @@ fn collect_undeclared_carrier_targets(symbols: &std::cell::RefCell<crate::symbol
     out: &mut Vec<(String, CExpr)>,
 ) {
     for stmt in stmts.iter_mut() {
-        if let CStmt::Expr(CExpr::Binary {
+        if let CStmt::Expr(expr) = stmt.unobserved()
+            && let CExpr::Binary {
             op: BinaryOp::Assign,
             left,
             right,
-        }) = stmt
-            && let CExpr::Var(name) = left.as_ref()
+        } = expr.unobserved()
+            && let CExpr::Var(name) = left.unobserved()
             && !declared.contains(&crate::symbol::spelling(symbols, *name).to_ascii_lowercase())
         {
             out.push((crate::symbol::spelling(symbols, *name).to_string(), right.as_ref().clone()));
@@ -4790,6 +4980,9 @@ fn propagate_single_use_register_carriers(func: &mut CFunction, fold_ctx: &Foldi
         whole_body: &[CStmt],
     ) {
         match stmt {
+            CStmt::Observed { stmt, .. } => {
+                visit_nested(symbols, stmt, fold_ctx, declared, in_loop, whole_body)
+            }
             CStmt::Block(stmts) => {
                 visit_block(symbols, stmts, fold_ctx, declared, in_loop, whole_body)
             }
@@ -4852,15 +5045,18 @@ fn carrier_assignment(
     fold_ctx: &FoldingContext<'_>,
     declared: &std::collections::HashSet<crate::symbol::SymbolId>,
 ) -> Option<(crate::symbol::SymbolId, CExpr)> {
-    let CStmt::Expr(CExpr::Binary {
+    let CStmt::Expr(expr) = stmt.unobserved() else {
+        return None;
+    };
+    let CExpr::Binary {
         op: BinaryOp::Assign,
         left,
         right,
-    }) = stmt
+    } = expr.unobserved()
     else {
         return None;
     };
-    let CExpr::Var(name) = left.as_ref() else {
+    let CExpr::Var(name) = left.unobserved() else {
         return None;
     };
     // Either a register carrier, which this pass has always folded, or a name
@@ -4912,6 +5108,7 @@ fn fold_constant_arithmetic_in_stmt(
 ) {
     let mut fold_expr = |expr: &mut CExpr| fold_constant_arithmetic_in_expr(expr, strings);
     match stmt {
+        CStmt::Observed { stmt, .. } => fold_constant_arithmetic_in_stmt(stmt, strings),
         CStmt::Empty
         | CStmt::Break
         | CStmt::Continue
@@ -4989,6 +5186,7 @@ fn fold_constant_arithmetic_in_stmt(
 /// The unsigned value of an integer literal, ignoring any cast around it.
 fn literal_value(expr: &CExpr) -> Option<u64> {
     match expr {
+        CExpr::Observed { expr, .. } => literal_value(expr),
         CExpr::UIntLit(value) => Some(*value),
         CExpr::IntLit(value) => u64::try_from(*value).ok(),
         CExpr::Paren(inner) | CExpr::Cast { expr: inner, .. } => literal_value(inner),
@@ -5000,6 +5198,11 @@ fn fold_constant_arithmetic_in_expr(
     expr: &mut CExpr,
     strings: &std::collections::BTreeMap<u64, String>,
 ) {
+    if let CExpr::Observed { expr, .. } = expr {
+        fold_constant_arithmetic_in_expr(expr, strings);
+        return;
+    }
+    let mut replacement = None;
     match expr {
         CExpr::Unary { operand, .. }
         | CExpr::Cast { expr: operand, .. }
@@ -5019,7 +5222,7 @@ fn fold_constant_arithmetic_in_expr(
                     _ => None,
                 };
                 if let Some(folded) = folded {
-                    *expr = CExpr::UIntLit(folded);
+                    replacement = Some(CExpr::UIntLit(folded));
                 }
             }
         }
@@ -5052,11 +5255,19 @@ fn fold_constant_arithmetic_in_expr(
         }
         _ => {}
     }
+    if let Some(replacement) = replacement {
+        let source = std::mem::replace(expr, CExpr::IntLit(0));
+        *expr = crate::ast::carry_expr_render_observations(&source, replacement);
+    }
     // Once the address is one number the string table can answer for it.
     if let Some(value) = literal_value(expr)
         && let Some(text) = strings.get(&value)
     {
-        *expr = CExpr::StringLit(text.clone());
+        let source = std::mem::replace(expr, CExpr::IntLit(0));
+        *expr = crate::ast::carry_expr_render_observations(
+            &source,
+            CExpr::StringLit(text.clone()),
+        );
     }
 }
 
@@ -5078,6 +5289,7 @@ fn count_var_reads_in_stmt(symbols: &std::cell::RefCell<crate::symbol::SymbolTab
         });
     };
     match stmt {
+        CStmt::Observed { stmt, .. } => count_var_reads_in_stmt(symbols, stmt, name, reads),
         CStmt::Empty
         | CStmt::Break
         | CStmt::Continue
@@ -5155,6 +5367,7 @@ fn count_var_reads_in_stmt(symbols: &std::cell::RefCell<crate::symbol::SymbolTab
 /// Put `value` wherever `name` is read in this statement.
 fn substitute_var_in_stmt(stmt: &mut CStmt, name: crate::symbol::SymbolId, value: &CExpr) {
     match stmt {
+        CStmt::Observed { stmt, .. } => substitute_var_in_stmt(stmt, name, value),
         CStmt::Empty
         | CStmt::Break
         | CStmt::Continue
@@ -5235,6 +5448,7 @@ fn substitute_var_in_expr(expr: &mut CExpr, name: crate::symbol::SymbolId, value
         return;
     }
     match expr {
+        CExpr::Observed { expr, .. } => substitute_var_in_expr(expr, name, value),
         CExpr::Unary { operand, .. }
         | CExpr::Cast { expr: operand, .. }
         | CExpr::Sizeof(operand)
@@ -5366,18 +5580,23 @@ fn normalize_redundant_return_carrier_casts(func: &mut CFunction) {
     let symbols = &func.symbols;
     fn visit(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, stmt: &mut CStmt, ret_type: &CType, declared_types: &HashMap<String, CType>) {
         match stmt {
+            CStmt::Observed { stmt, .. } => visit(symbols, stmt, ret_type, declared_types),
             CStmt::Return(Some(expr)) => {
-                let CExpr::Cast { expr: inner, .. } = expr else {
+                let mut target = expr;
+                while let CExpr::Observed { expr: inner, .. } = target {
+                    target = inner;
+                }
+                let CExpr::Cast { expr: inner, .. } = target else {
                     return;
                 };
-                let CExpr::Var(name) = inner.as_ref() else {
+                let CExpr::Var(name) = inner.unobserved() else {
                     return;
                 };
                 if declared_types
                     .get(&crate::symbol::spelling(symbols, *name).to_ascii_lowercase())
                     .is_some_and(|ty| ty == ret_type)
                 {
-                    *expr = *inner.clone();
+                    *target = *inner.clone();
                 }
             }
             CStmt::Block(stmts) => {
@@ -5505,6 +5724,7 @@ fn normalize_literal_for_declared_type(expr: &mut CExpr, ty: &CType) {
         return;
     }
     match expr {
+        CExpr::Observed { expr, .. } => normalize_literal_for_declared_type(expr, ty),
         CExpr::UIntLit(value) => {
             *expr = typed_integer_literal_expr(*value, is_signed, bits);
         }
@@ -5523,7 +5743,7 @@ fn normalize_literal_for_declared_type(expr: &mut CExpr, ty: &CType) {
 /// operator alongside the operands preserves the meaning exactly.
 fn normalize_comparison_operand_order(func: &mut CFunction) {
     fn is_literal(expr: &CExpr) -> bool {
-        match expr {
+        match expr.unobserved() {
             CExpr::IntLit(_) | CExpr::UIntLit(_) | CExpr::CharLit(_) => true,
             CExpr::Paren(inner) => is_literal(inner),
             _ => false,
@@ -5543,6 +5763,10 @@ fn normalize_comparison_operand_order(func: &mut CFunction) {
     }
 
     fn visit(expr: &mut CExpr) {
+        if let CExpr::Observed { expr, .. } = expr {
+            visit(expr);
+            return;
+        }
         for child in single_evaluation::children_mut(expr) {
             visit(child);
         }
@@ -5581,6 +5805,7 @@ fn normalize_declared_assignment_literals(func: &mut CFunction) {
     let symbols = &func.symbols;
     fn visit_expr(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, expr: &mut CExpr, declared_types: &HashMap<String, CType>) {
         match expr {
+            CExpr::Observed { expr, .. } => visit_expr(symbols, expr, declared_types),
             CExpr::Unary { operand, .. }
             | CExpr::Cast { expr: operand, .. }
             | CExpr::Sizeof(operand)
@@ -5636,7 +5861,7 @@ fn normalize_declared_assignment_literals(func: &mut CFunction) {
         else {
             return;
         };
-        let CExpr::Var(name) = left.as_ref() else {
+        let CExpr::Var(name) = left.unobserved() else {
             return;
         };
         if let Some(ty) = declared_types.get(&crate::symbol::spelling(symbols, *name).to_ascii_lowercase()) {
@@ -5646,6 +5871,7 @@ fn normalize_declared_assignment_literals(func: &mut CFunction) {
 
     fn visit_stmt(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, stmt: &mut CStmt, declared_types: &HashMap<String, CType>) {
         match stmt {
+            CStmt::Observed { stmt, .. } => visit_stmt(symbols, stmt, declared_types),
             CStmt::Expr(expr) => visit_expr(symbols, expr, declared_types),
             CStmt::Decl { ty, init, .. } => {
                 if let Some(init) = init {
@@ -5781,6 +6007,7 @@ fn collect_function_local_reads(symbols: &std::cell::RefCell<crate::symbol::Symb
 
 fn collect_stmt_local_reads(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, stmt: &CStmt, reads: &mut HashSet<String>) {
     match stmt {
+        CStmt::Observed { stmt, .. } => collect_stmt_local_reads(symbols, stmt, reads),
         CStmt::Empty
         | CStmt::Break
         | CStmt::Continue
@@ -5792,7 +6019,7 @@ fn collect_stmt_local_reads(symbols: &std::cell::RefCell<crate::symbol::SymbolTa
             left,
             right,
         }) => {
-            if !matches!(left.as_ref(), CExpr::Var(_)) {
+            if !matches!(left.unobserved(), CExpr::Var(_)) {
                 collect_expr_local_reads(symbols, left, reads);
             }
             collect_expr_local_reads(symbols, right, reads);
@@ -5869,6 +6096,7 @@ fn collect_stmt_local_reads(symbols: &std::cell::RefCell<crate::symbol::SymbolTa
 
 fn collect_expr_local_reads(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, expr: &CExpr, reads: &mut HashSet<String>) {
     match expr {
+        CExpr::Observed { expr, .. } => collect_expr_local_reads(symbols, expr, reads),
         CExpr::Var(name) => {
             reads.insert(crate::symbol::spelling(symbols, *name).to_ascii_lowercase());
         }
@@ -5887,7 +6115,7 @@ fn collect_expr_local_reads(symbols: &std::cell::RefCell<crate::symbol::SymbolTa
             op: BinaryOp::Assign,
             left,
             right,
-        } if matches!(left.as_ref(), CExpr::Var(_)) => {
+        } if matches!(left.unobserved(), CExpr::Var(_)) => {
             collect_expr_local_reads(symbols, right, reads);
         }
         CExpr::Binary { left, right, .. } => {
@@ -5939,13 +6167,27 @@ fn prune_unused_pure_local_stmts(symbols: &std::cell::RefCell<crate::symbol::Sym
 
 fn prune_unused_pure_local_stmt(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, stmt: &mut CStmt, dead_locals: &HashSet<String>) {
     match stmt {
-        CStmt::Expr(CExpr::Binary {
-            op: BinaryOp::Assign,
-            left,
-            right,
-        }) => {
-            if let CExpr::Var(name) = left.as_ref()
-                && dead_locals.contains(&crate::symbol::spelling(symbols, *name).to_ascii_lowercase())
+        CStmt::Observed { stmt: inner, .. } => {
+            let drops_dead_declaration = matches!(inner.unobserved(), CStmt::Decl { name, init: Some(init), .. }
+                if dead_locals.contains(
+                    &crate::symbol::spelling(symbols, *name).to_ascii_lowercase()
+                ) && !expr_is_pure_for_dead_local_prune(init));
+            prune_unused_pure_local_stmt(symbols, inner, dead_locals);
+            if matches!(inner.as_ref(), CStmt::Empty) {
+                *stmt = CStmt::Empty;
+            } else if drops_dead_declaration {
+                *stmt = std::mem::replace(inner.as_mut(), CStmt::Empty);
+            }
+        }
+        CStmt::Expr(expr) => {
+            if let CExpr::Binary {
+                op: BinaryOp::Assign,
+                left,
+                right,
+            } = expr.unobserved()
+                && let CExpr::Var(name) = left.unobserved()
+                && dead_locals
+                    .contains(&crate::symbol::spelling(symbols, *name).to_ascii_lowercase())
                 && expr_is_pure_for_dead_local_prune(right)
             {
                 *stmt = CStmt::Empty;
@@ -5992,7 +6234,6 @@ fn prune_unused_pure_local_stmt(symbols: &std::cell::RefCell<crate::symbol::Symb
             }
         }
         CStmt::Empty
-        | CStmt::Expr(_)
         | CStmt::Return(_)
         | CStmt::Break
         | CStmt::Continue
@@ -6004,6 +6245,7 @@ fn prune_unused_pure_local_stmt(symbols: &std::cell::RefCell<crate::symbol::Symb
 
 fn expr_is_pure_for_dead_local_prune(expr: &CExpr) -> bool {
     match expr {
+        CExpr::Observed { expr, .. } => expr_is_pure_for_dead_local_prune(expr),
         CExpr::IntLit(_)
         | CExpr::UIntLit(_)
         | CExpr::FloatLit(_)
@@ -6217,7 +6459,7 @@ mod tests {
             caller_saved_regs: HashSet::new(),
         }));
         FoldingContext::from_inputs(FoldInputs {
-            materialized_edge_copies: crate::normalize::no_materialized_edge_copies(),
+            normalization_origins: None,
             display_names: crate::empty_display_names(),
             arch,
             function_names: Box::leak(Box::new(HashMap::new())),
@@ -6835,6 +7077,51 @@ mod tests {
     }
 
     #[test]
+    fn dead_declaration_drops_write_marker_but_keeps_impure_initializer_marker() {
+        let symbols = test_table();
+        let dead = crate::symbol::declare(&symbols, "dead");
+        let mut observations = crate::ast::RenderObservationOwner::new();
+        let (initializer_id, initializer) = observations
+            .observe_expr(CExpr::call(
+                CExpr::External {
+                    name: "effect".to_string(),
+                    kind: crate::symbol::ExternalKind::Function,
+                },
+                Vec::new(),
+            ))
+            .expect("initializer observation");
+        let (write_id, declaration) = observations
+            .observe_stmt(CStmt::Decl {
+                ty: CType::Int(32),
+                name: dead,
+                init: Some(initializer),
+            })
+            .expect("declaration write observation");
+        let mut func = CFunction::new("dead_init", CType::Void).with_body(vec![declaration]);
+        func.locals.push(ast::CLocal {
+            ty: CType::Int(32),
+            name: dead,
+            stack_offset: None,
+        });
+        func.symbols = std::rc::Rc::new(symbols);
+
+        prune_unused_pure_locals(&func.symbols.clone(), &mut func);
+
+        assert!(func.locals.is_empty());
+        let reachable = crate::ast::strip_render_observations(
+            &mut func,
+            observations.expected_count(),
+        )
+        .expect("remaining marker domain is valid");
+        assert!(reachable.contains(initializer_id));
+        assert!(!reachable.contains(write_id));
+        assert!(matches!(
+            func.body.as_slice(),
+            [CStmt::Expr(CExpr::Call { .. })]
+        ));
+    }
+
+    #[test]
     fn decompile_input_enforces_configured_block_budget_before_route_work() {
         let arch = test_arch_for_decompile();
         let mut first = R2ILBlock::new(0x1000, 4);
@@ -7006,8 +7293,7 @@ mod tests {
 
     #[test]
     fn foreign_interproc_summary_never_reaches_decompiler_input() {
-        let mut arch = test_arch_for_decompile();
-        arch.add_register(RegisterDef::new("RIP", 0x30, 8));
+        let arch = test_arch_for_decompile();
         let mut block = R2ILBlock::new(0x1000, 4);
         block.push(R2ILOp::Return {
             target: Varnode::constant(0, 8),
@@ -7346,7 +7632,8 @@ mod tests {
             .build_function_internal_with_control(&input, semantic_route, work)
             .expect("native production build");
 
-        let internal_output = CodeGenerator::new(config.codegen).generate_function(&built);
+        let ready = prepare_function_for_emission(&built);
+        let internal_output = CodeGenerator::new(config.codegen).generate_function(&ready);
         let public_output = public_decompiler.decompile_input(&input);
         assert_eq!(internal_output, public_output);
         let audited = public_decompiler.decompile_input_with_binding_audit(&input);

@@ -356,6 +356,7 @@ fn call_arg_expr_preservation_score(symbols: &std::cell::RefCell<crate::symbol::
     }
 
     match expr {
+        CExpr::Observed { expr, .. } => call_arg_expr_preservation_score(symbols, expr, depth),
         CExpr::StringLit(_) => 320,
         CExpr::IntLit(_) | CExpr::UIntLit(_) | CExpr::FloatLit(_) | CExpr::CharLit(_) => 80,
         CExpr::External { .. } => 80,
@@ -3791,6 +3792,9 @@ fn accumulate_formatted_def_expr_quality(symbols: &std::cell::RefCell<crate::sym
     quality: &mut (i32, i32, i32, i32, i32, i32),
 ) {
     match expr {
+        CExpr::Observed { expr, .. } => {
+            accumulate_formatted_def_expr_quality(symbols, expr, env, quality);
+        }
         // No penalty applies: none of these ask about a name the renderer chose.
         CExpr::External { .. } => {}
         CExpr::Var(name) => {
@@ -3862,7 +3866,7 @@ fn accumulate_formatted_def_expr_quality(symbols: &std::cell::RefCell<crate::sym
 }
 
 fn literal_zero(expr: &CExpr) -> bool {
-    matches!(expr, CExpr::IntLit(0) | CExpr::UIntLit(0))
+    matches!(expr.unobserved(), CExpr::IntLit(0) | CExpr::UIntLit(0))
 }
 
 fn is_generic_stack_alias_name(name: &str) -> bool {
@@ -5435,6 +5439,10 @@ fn normalize_call_arg_expr_for_definition(symbols: &std::cell::RefCell<crate::sy
     }
 
     match expr {
+        CExpr::Observed { id, expr } => {
+            normalize_call_arg_expr_for_definition(symbols, info, lower, *expr, depth, visited)
+                .map(|expr| CExpr::observed(id, expr))
+        }
         // An external name has no definition in this function to normalise to.
         external @ CExpr::External { .. } => Some(external),
         CExpr::Var(name) => {
@@ -5590,9 +5598,21 @@ fn normalize_call_arg_var_for_definition(symbols: &std::cell::RefCell<crate::sym
         Some(crate::symbol::var_ref(symbols, alias.clone()))
     } else {
         let lowered = lower.expr_for_ssa_name(&name);
-        match lowered {
-            CExpr::Var(ref lowered_name) if &*crate::symbol::spelling(symbols, *lowered_name) == &name => Some(crate::symbol::var_ref(symbols, name.clone())),
-            other => normalize_call_arg_expr_for_definition(symbols, info, lower, other, depth + 1, visited),
+        if matches!(
+            lowered.unobserved(),
+            CExpr::Var(lowered_name)
+                if &*crate::symbol::spelling(symbols, *lowered_name) == &name
+        ) {
+            Some(lowered)
+        } else {
+            normalize_call_arg_expr_for_definition(
+                symbols,
+                info,
+                lower,
+                lowered,
+                depth + 1,
+                visited,
+            )
         }
     };
 
@@ -5602,6 +5622,9 @@ fn normalize_call_arg_var_for_definition(symbols: &std::cell::RefCell<crate::sym
 
 fn take_address_of_definition_expr(expr: CExpr) -> Option<CExpr> {
     match expr {
+        CExpr::Observed { id, expr } => {
+            take_address_of_definition_expr(*expr).map(|expr| CExpr::observed(id, expr))
+        }
         CExpr::Var(_)
         | CExpr::Subscript { .. }
         | CExpr::Member { .. }
@@ -5627,20 +5650,34 @@ fn rewrite_call_result_binding(symbols: &std::cell::RefCell<crate::symbol::Symbo
     call_result_defs: &HashMap<String, CExpr>,
 ) -> Option<CallArgBinding> {
     let arg = match &binding.arg {
-        SemanticCallArg::FallbackExpr(CExpr::Var(name)) => call_result_defs
-            .get(&*crate::symbol::spelling(symbols, *name))
-            .cloned()
-            .map(SemanticCallArg::FallbackExpr),
-        SemanticCallArg::FallbackExpr(CExpr::Paren(inner))
-        | SemanticCallArg::FallbackExpr(CExpr::Cast { expr: inner, .. }) => {
-            let inner_arg = SemanticCallArg::FallbackExpr((**inner).clone());
-            rewrite_call_result_binding(symbols, &CallArgBinding::from(inner_arg), call_result_defs)
-                .map(|binding| binding.arg)
+        SemanticCallArg::FallbackExpr(expr) => {
+            let rewritten = match expr.unobserved() {
+                CExpr::Var(name) => call_result_defs
+                    .get(&*crate::symbol::spelling(symbols, *name))
+                    .map(CExpr::clone_without_render_observations)
+                    .map(SemanticCallArg::FallbackExpr),
+                CExpr::Paren(inner) | CExpr::Cast { expr: inner, .. } => {
+                    let inner_arg = SemanticCallArg::FallbackExpr((**inner).clone());
+                    rewrite_call_result_binding(
+                        symbols,
+                        &CallArgBinding::from(inner_arg),
+                        call_result_defs,
+                    )
+                    .map(|binding| binding.arg)
+                }
+                _ => None,
+            };
+            rewritten.map(|arg| match arg {
+                SemanticCallArg::FallbackExpr(rewritten) => SemanticCallArg::FallbackExpr(
+                    crate::ast::carry_outer_expr_observations(expr, rewritten),
+                ),
+                other => other,
+            })
         }
         SemanticCallArg::Semantic(SemanticValue::Scalar(ScalarValue::Root(root))) => {
             call_result_defs
                 .get(&root.display_name())
-                .cloned()
+                .map(CExpr::clone_without_render_observations)
                 .map(SemanticCallArg::FallbackExpr)
         }
         _ => None,
@@ -6017,19 +6054,22 @@ fn semantic_call_arg_is_transient_register_fallback(symbols: &std::cell::RefCell
     env: &PassEnv<'_>,
 ) -> bool {
     match arg {
-        SemanticCallArg::FallbackExpr(CExpr::Var(name)) => {
-            let lower = crate::symbol::spelling(symbols, *name).to_ascii_lowercase();
-            is_call_arg_placeholder_name(&lower)
-                || is_call_arg_transient_name(symbols, &lower)
-                || env.param_register_aliases.contains_key(&lower)
-        }
-        SemanticCallArg::FallbackExpr(CExpr::Paren(inner))
-        | SemanticCallArg::FallbackExpr(CExpr::Cast { expr: inner, .. }) => {
-            semantic_call_arg_is_transient_register_fallback(symbols,
-                &SemanticCallArg::FallbackExpr((**inner).clone()),
-                env,
-            )
-        }
+        SemanticCallArg::FallbackExpr(expr) => match expr.unobserved() {
+            CExpr::Var(name) => {
+                let lower = crate::symbol::spelling(symbols, *name).to_ascii_lowercase();
+                is_call_arg_placeholder_name(&lower)
+                    || is_call_arg_transient_name(symbols, &lower)
+                    || env.param_register_aliases.contains_key(&lower)
+            }
+            CExpr::Paren(inner) | CExpr::Cast { expr: inner, .. } => {
+                semantic_call_arg_is_transient_register_fallback(
+                    symbols,
+                    &SemanticCallArg::FallbackExpr((**inner).clone()),
+                    env,
+                )
+            }
+            _ => false,
+        },
         _ => false,
     }
 }
@@ -6467,9 +6507,15 @@ fn lowered_post_call_result_source_var(symbols: &std::cell::RefCell<crate::symbo
     )
 }
 
-fn lowered_var_alias_from_expr(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, expr: &CExpr, default_size: u32) -> Option<SSAVar> {
-    match expr {
-        CExpr::Var(name) => ssa_var_from_display_name(&crate::symbol::spelling(symbols, *name), default_size),
+fn lowered_var_alias_from_expr(
+    symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
+    expr: &CExpr,
+    default_size: u32,
+) -> Option<SSAVar> {
+    match expr.unobserved() {
+        CExpr::Var(name) => {
+            ssa_var_from_display_name(&crate::symbol::spelling(symbols, *name), default_size)
+        }
         CExpr::Paren(inner) | CExpr::Cast { expr: inner, .. } => {
             lowered_var_alias_from_expr(symbols, inner, default_size)
         }
@@ -6568,18 +6614,24 @@ fn call_arg_semantic_source_offset(symbols: &std::cell::RefCell<crate::symbol::S
         SemanticCallArg::Semantic(value) => {
             semantic_value_source_offset(info, value, depth + 1, visited)
         }
-        SemanticCallArg::FallbackExpr(CExpr::Var(name)) => {
-            semantic_value_source_offset_by_name(info, &crate::symbol::spelling(symbols, *name), depth + 1, visited)
-        }
-        SemanticCallArg::FallbackExpr(CExpr::Paren(inner))
-        | SemanticCallArg::FallbackExpr(CExpr::Cast { expr: inner, .. }) => {
-            call_arg_semantic_source_offset(symbols,
+        SemanticCallArg::FallbackExpr(expr) => match expr.unobserved() {
+            CExpr::Var(name) => semantic_value_source_offset_by_name(
                 info,
-                &SemanticCallArg::FallbackExpr((**inner).clone()),
+                &crate::symbol::spelling(symbols, *name),
                 depth + 1,
                 visited,
-            )
-        }
+            ),
+            CExpr::Paren(inner) | CExpr::Cast { expr: inner, .. } => {
+                call_arg_semantic_source_offset(
+                    symbols,
+                    info,
+                    &SemanticCallArg::FallbackExpr((**inner).clone()),
+                    depth + 1,
+                    visited,
+                )
+            }
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -6693,15 +6745,19 @@ fn should_prefer_stack_home_call_arg(symbols: &std::cell::RefCell<crate::symbol:
 
 fn semantic_call_arg_is_transient_fallback(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, arg: &SemanticCallArg) -> bool {
     match arg {
-        SemanticCallArg::FallbackExpr(CExpr::Var(name)) => {
-            is_call_arg_transient_name(symbols, &crate::symbol::spelling(symbols, *name)) || is_call_arg_placeholder_name(&crate::symbol::spelling(symbols, *name))
-        }
-        SemanticCallArg::FallbackExpr(CExpr::Paren(inner))
-        | SemanticCallArg::FallbackExpr(CExpr::Cast { expr: inner, .. }) => {
-            semantic_call_arg_is_transient_fallback(symbols, &SemanticCallArg::FallbackExpr(
-                (**inner).clone(),
-            ))
-        }
+        SemanticCallArg::FallbackExpr(expr) => match expr.unobserved() {
+            CExpr::Var(name) => {
+                is_call_arg_transient_name(symbols, &crate::symbol::spelling(symbols, *name))
+                    || is_call_arg_placeholder_name(&crate::symbol::spelling(symbols, *name))
+            }
+            CExpr::Paren(inner) | CExpr::Cast { expr: inner, .. } => {
+                semantic_call_arg_is_transient_fallback(
+                    symbols,
+                    &SemanticCallArg::FallbackExpr((**inner).clone()),
+                )
+            }
+            _ => false,
+        },
         _ => false,
     }
 }
@@ -6712,20 +6768,23 @@ fn semantic_call_arg_is_generic_register_root(symbols: &std::cell::RefCell<crate
             .arg_regs
             .iter()
             .any(|reg| root.var.name.eq_ignore_ascii_case(reg)),
-        SemanticCallArg::FallbackExpr(CExpr::Var(name)) => ssa_key_parts(&crate::symbol::spelling(symbols, *name))
-            .map(|(base, _)| {
-                env.arg_regs
-                    .iter()
-                    .any(|reg| base.eq_ignore_ascii_case(reg.as_str()))
-            })
-            .unwrap_or(false),
-        SemanticCallArg::FallbackExpr(CExpr::Paren(inner))
-        | SemanticCallArg::FallbackExpr(CExpr::Cast { expr: inner, .. }) => {
-            semantic_call_arg_is_generic_register_root(symbols,
-                &SemanticCallArg::FallbackExpr((**inner).clone()),
-                env,
-            )
-        }
+        SemanticCallArg::FallbackExpr(expr) => match expr.unobserved() {
+            CExpr::Var(name) => ssa_key_parts(&crate::symbol::spelling(symbols, *name))
+                .map(|(base, _)| {
+                    env.arg_regs
+                        .iter()
+                        .any(|reg| base.eq_ignore_ascii_case(reg.as_str()))
+                })
+                .unwrap_or(false),
+            CExpr::Paren(inner) | CExpr::Cast { expr: inner, .. } => {
+                semantic_call_arg_is_generic_register_root(
+                    symbols,
+                    &SemanticCallArg::FallbackExpr((**inner).clone()),
+                    env,
+                )
+            }
+            _ => false,
+        },
         _ => false,
     }
 }
@@ -6853,8 +6912,12 @@ fn semantic_call_arg_for_var(symbols: &std::cell::RefCell<crate::symbol::SymbolT
     SemanticCallArg::FallbackExpr(expr)
 }
 
-fn expr_preserves_pointer_identity_for_call_arg(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, expr: &CExpr, env: &PassEnv<'_>) -> bool {
-    match expr {
+fn expr_preserves_pointer_identity_for_call_arg(
+    symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
+    expr: &CExpr,
+    env: &PassEnv<'_>,
+) -> bool {
+    match expr.unobserved() {
         CExpr::Var(name) => {
             !is_call_arg_placeholder_name(&crate::symbol::spelling(symbols, *name))
                 && !is_call_arg_transient_name(symbols, &crate::symbol::spelling(symbols, *name))
@@ -6961,8 +7024,12 @@ fn semantic_call_arg_prefers_expr_over_stack_reload(symbols: &std::cell::RefCell
         && call_arg_expr_score(symbols, expr, env) > 0
 }
 
-fn expr_is_meaningful_stack_reload_fallback(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, expr: &CExpr, env: &PassEnv<'_>) -> bool {
-    match expr {
+fn expr_is_meaningful_stack_reload_fallback(
+    symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
+    expr: &CExpr,
+    env: &PassEnv<'_>,
+) -> bool {
+    match expr.unobserved() {
         CExpr::Var(name) => {
             let lower = crate::symbol::spelling(symbols, *name).to_ascii_lowercase();
             !crate::symbol::spelling(symbols, *name).eq_ignore_ascii_case("argc")
@@ -6984,7 +7051,7 @@ fn expr_is_meaningful_stack_reload_fallback(symbols: &std::cell::RefCell<crate::
             let left_meaningful = expr_is_meaningful_stack_reload_fallback(symbols, left, env);
             let right_meaningful = expr_is_meaningful_stack_reload_fallback(symbols, right, env);
             let left_constish = matches!(
-                left.as_ref(),
+                left.unobserved(),
                 CExpr::IntLit(_)
                     | CExpr::UIntLit(_)
                     | CExpr::FloatLit(_)
@@ -6992,7 +7059,7 @@ fn expr_is_meaningful_stack_reload_fallback(symbols: &std::cell::RefCell<crate::
                     | CExpr::SizeofType(_)
             );
             let right_constish = matches!(
-                right.as_ref(),
+                right.unobserved(),
                 CExpr::IntLit(_)
                     | CExpr::UIntLit(_)
                     | CExpr::FloatLit(_)
@@ -7089,18 +7156,21 @@ fn stable_negative_stack_load_size(symbols: &std::cell::RefCell<crate::symbol::S
         SemanticCallArg::Semantic(SemanticValue::Scalar(ScalarValue::Root(root))) => {
             root.var.size.max(1)
         }
-        SemanticCallArg::FallbackExpr(CExpr::Paren(inner))
-        | SemanticCallArg::FallbackExpr(CExpr::Cast { expr: inner, .. }) => {
-            stable_negative_stack_load_size(symbols,
-                &SemanticCallArg::FallbackExpr((**inner).clone()),
-                default_size,
-            )
-        }
-        SemanticCallArg::FallbackExpr(CExpr::Var(name)) => {
-            ssa_var_from_display_name(&crate::symbol::spelling(symbols, *name), default_size)
-                .map(|var| var.size.max(1))
-                .unwrap_or(default_size.max(1))
-        }
+        SemanticCallArg::FallbackExpr(expr) => match expr.unobserved() {
+            CExpr::Paren(inner) | CExpr::Cast { expr: inner, .. } => {
+                stable_negative_stack_load_size(
+                    symbols,
+                    &SemanticCallArg::FallbackExpr((**inner).clone()),
+                    default_size,
+                )
+            }
+            CExpr::Var(name) => {
+                ssa_var_from_display_name(&crate::symbol::spelling(symbols, *name), default_size)
+                    .map(|var| var.size.max(1))
+                    .unwrap_or(default_size.max(1))
+            }
+            _ => default_size.max(1),
+        },
         _ => default_size.max(1),
     }
 }
@@ -7183,18 +7253,24 @@ fn exact_negative_stack_offset_for_call_arg(symbols: &std::cell::RefCell<crate::
         SemanticCallArg::Semantic(value) => {
             exact_negative_stack_offset_for_value(info, value, depth + 1, visited)
         }
-        SemanticCallArg::FallbackExpr(CExpr::Var(name)) => {
-            exact_negative_stack_offset_by_name(info, &crate::symbol::spelling(symbols, *name), depth + 1, visited)
-        }
-        SemanticCallArg::FallbackExpr(CExpr::Paren(inner))
-        | SemanticCallArg::FallbackExpr(CExpr::Cast { expr: inner, .. }) => {
-            exact_negative_stack_offset_for_call_arg(symbols,
+        SemanticCallArg::FallbackExpr(expr) => match expr.unobserved() {
+            CExpr::Var(name) => exact_negative_stack_offset_by_name(
                 info,
-                &SemanticCallArg::FallbackExpr((**inner).clone()),
+                &crate::symbol::spelling(symbols, *name),
                 depth + 1,
                 visited,
-            )
-        }
+            ),
+            CExpr::Paren(inner) | CExpr::Cast { expr: inner, .. } => {
+                exact_negative_stack_offset_for_call_arg(
+                    symbols,
+                    info,
+                    &SemanticCallArg::FallbackExpr((**inner).clone()),
+                    depth + 1,
+                    visited,
+                )
+            }
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -7345,7 +7421,7 @@ fn semantic_call_arg_addr_from_expr(symbols: &std::cell::RefCell<crate::symbol::
         return Some(addr);
     }
 
-    match expr {
+    match expr.unobserved() {
         CExpr::Var(name) => {
             if !visited.insert(crate::symbol::spelling(symbols, *name).to_string()) {
                 return None;
@@ -7442,7 +7518,7 @@ fn hex_digit_offset_call_arg_address(expr: &CExpr, env: &PassEnv<'_>, depth: u32
         return None;
     }
 
-    let addr = match expr {
+    let addr = match expr.unobserved() {
         CExpr::Paren(inner) | CExpr::AddrOf(inner) => {
             return hex_digit_offset_call_arg_address(inner, env, depth + 1);
         }
@@ -7479,7 +7555,7 @@ fn reinterpret_decimal_digits_as_hex_call_arg(expr: &CExpr, depth: u32) -> Optio
         return None;
     }
 
-    match expr {
+    match expr.unobserved() {
         CExpr::Paren(inner) | CExpr::AddrOf(inner) => {
             reinterpret_decimal_digits_as_hex_call_arg(inner, depth + 1)
         }
@@ -7558,7 +7634,7 @@ fn semantic_call_arg_score(symbols: &std::cell::RefCell<crate::symbol::SymbolTab
         }
         SemanticCallArg::FallbackExpr(actual_expr) => {
             let mut score = call_arg_candidate_score(symbols, info, var, actual_expr, env);
-            if matches!(actual_expr, CExpr::Call { .. }) {
+            if matches!(actual_expr.unobserved(), CExpr::Call { .. }) {
                 score += 220;
             }
             score
@@ -7574,21 +7650,26 @@ fn semantic_call_arg_is_generic_entry_root(symbols: &std::cell::RefCell<crate::s
                     .param_register_aliases
                     .contains_key(&root.var.name.to_ascii_lowercase())
         }
-        SemanticCallArg::FallbackExpr(CExpr::Var(name)) => {
-            crate::symbol::spelling(symbols, *name).eq_ignore_ascii_case("argc")
-                || crate::symbol::spelling(symbols, *name).eq_ignore_ascii_case("argv")
-                || crate::symbol::spelling(symbols, *name).eq_ignore_ascii_case("envp")
-                || crate::symbol::spelling(symbols, *name).strip_prefix("arg").is_some_and(|suffix| {
-                    !suffix.is_empty() && suffix.chars().all(|ch| ch.is_ascii_digit())
-                })
-        }
-        SemanticCallArg::FallbackExpr(CExpr::Paren(inner))
-        | SemanticCallArg::FallbackExpr(CExpr::Cast { expr: inner, .. }) => {
-            semantic_call_arg_is_generic_entry_root(symbols,
-                &SemanticCallArg::FallbackExpr((**inner).clone()),
-                env,
-            )
-        }
+        SemanticCallArg::FallbackExpr(expr) => match expr.unobserved() {
+            CExpr::Var(name) => {
+                crate::symbol::spelling(symbols, *name).eq_ignore_ascii_case("argc")
+                    || crate::symbol::spelling(symbols, *name).eq_ignore_ascii_case("argv")
+                    || crate::symbol::spelling(symbols, *name).eq_ignore_ascii_case("envp")
+                    || crate::symbol::spelling(symbols, *name)
+                        .strip_prefix("arg")
+                        .is_some_and(|suffix| {
+                            !suffix.is_empty() && suffix.chars().all(|ch| ch.is_ascii_digit())
+                        })
+            }
+            CExpr::Paren(inner) | CExpr::Cast { expr: inner, .. } => {
+                semantic_call_arg_is_generic_entry_root(
+                    symbols,
+                    &SemanticCallArg::FallbackExpr((**inner).clone()),
+                    env,
+                )
+            }
+            _ => false,
+        },
         _ => false,
     }
 }
@@ -7628,14 +7709,14 @@ fn should_keep_later_call_arg_candidate(
 }
 
 fn is_plain_scalar_call_arg_candidate(arg: &SemanticCallArg) -> bool {
-    matches!(
-        arg,
-        SemanticCallArg::Semantic(SemanticValue::Scalar(ScalarValue::Expr(
+    match arg {
+        SemanticCallArg::Semantic(SemanticValue::Scalar(ScalarValue::Expr(expr)))
+        | SemanticCallArg::FallbackExpr(expr) => matches!(
+            expr.unobserved(),
             CExpr::IntLit(_) | CExpr::UIntLit(_) | CExpr::FloatLit(_) | CExpr::CharLit(_)
-        ))) | SemanticCallArg::FallbackExpr(
-            CExpr::IntLit(_) | CExpr::UIntLit(_) | CExpr::FloatLit(_) | CExpr::CharLit(_)
-        )
-    )
+        ),
+        _ => false,
+    }
 }
 
 fn is_structured_call_arg_candidate(arg: &SemanticCallArg) -> bool {
@@ -7645,7 +7726,7 @@ fn is_structured_call_arg_candidate(arg: &SemanticCallArg) -> bool {
         | SemanticCallArg::Semantic(SemanticValue::Load { .. }) => true,
         SemanticCallArg::Semantic(SemanticValue::Scalar(ScalarValue::Expr(expr)))
         | SemanticCallArg::FallbackExpr(expr) => !matches!(
-            expr,
+            expr.unobserved(),
             CExpr::IntLit(_) | CExpr::UIntLit(_) | CExpr::FloatLit(_) | CExpr::CharLit(_)
         ),
         SemanticCallArg::Semantic(SemanticValue::Scalar(ScalarValue::Root(_)))
@@ -7719,6 +7800,7 @@ fn call_arg_expr_semantic_weight(symbols: &std::cell::RefCell<crate::symbol::Sym
         return 0;
     }
     match expr {
+        CExpr::Observed { expr, .. } => call_arg_expr_semantic_weight(symbols, expr, depth),
         CExpr::StringLit(_) => 80,
         CExpr::External { .. } => 40,
         CExpr::Subscript { base, index } => {
@@ -7780,6 +7862,9 @@ fn call_arg_expr_contains_stack_placeholder(symbols: &std::cell::RefCell<crate::
         return false;
     }
     match expr {
+        CExpr::Observed { expr, .. } => {
+            call_arg_expr_contains_stack_placeholder(symbols, expr, depth)
+        }
         CExpr::External { .. } => false,
         CExpr::Var(name) => is_call_arg_placeholder_name(&crate::symbol::spelling(symbols, *name)),
         CExpr::Deref(inner)
@@ -7831,6 +7916,7 @@ fn call_arg_expr_contains_transient_name(symbols: &std::cell::RefCell<crate::sym
         return false;
     }
     match expr {
+        CExpr::Observed { expr, .. } => call_arg_expr_contains_transient_name(symbols, expr, depth),
         CExpr::External { .. } => false,
         CExpr::Var(name) => is_call_arg_transient_name(symbols, &crate::symbol::spelling(symbols, *name)),
         CExpr::Deref(inner)
@@ -7882,6 +7968,9 @@ fn call_arg_expr_contains_low_quality_name(symbols: &std::cell::RefCell<crate::s
         return false;
     }
     match expr {
+        CExpr::Observed { expr, .. } => {
+            call_arg_expr_contains_low_quality_name(symbols, expr, depth)
+        }
         CExpr::External { .. } => false,
         CExpr::Var(name) => is_call_arg_low_quality_name(&crate::symbol::spelling(symbols, *name)),
         CExpr::Deref(inner)
@@ -7933,7 +8022,7 @@ fn call_arg_expr_resolves_to_literal(expr: &CExpr, env: &PassEnv<'_>, depth: u32
         return false;
     }
 
-    let addr = match expr {
+    let addr = match expr.unobserved() {
         CExpr::IntLit(value) => (*value >= 0).then_some(*value as u64),
         CExpr::UIntLit(value) => Some(*value),
         CExpr::Paren(inner) | CExpr::AddrOf(inner) => {
@@ -7975,7 +8064,7 @@ fn call_arg_expr_literal_value(expr: &CExpr, depth: u32) -> Option<u64> {
     if depth > 8 {
         return None;
     }
-    match expr {
+    match expr.unobserved() {
         CExpr::IntLit(value) => (*value >= 0).then_some(*value as u64),
         CExpr::UIntLit(value) => Some(*value),
         CExpr::Paren(inner) | CExpr::AddrOf(inner) => call_arg_expr_literal_value(inner, depth + 1),
@@ -8160,6 +8249,131 @@ mod tests {
         let symbols = test_table();
         let fixture = TestEnvFixture::new();
         analyze(&symbols, &blocks, &fixture.env())
+    }
+
+    #[test]
+    fn address_taking_reapplies_the_exact_observation_once() {
+        let symbols = test_table();
+        let value = crate::symbol::declare(&symbols, "value");
+        let mut owner = crate::ast::RenderObservationOwner::new();
+        let (id, observed) = owner
+            .observe_expr(CExpr::Var(value))
+            .expect("allocate address-source observation");
+        let rewritten = take_address_of_definition_expr(observed)
+            .expect("an observed variable remains addressable");
+        assert!(matches!(
+            rewritten.unobserved(),
+            CExpr::AddrOf(inner) if matches!(inner.unobserved(), CExpr::Var(name) if *name == value)
+        ));
+
+        let mut function = crate::ast::CFunction::new("address", CType::Void)
+            .with_body(vec![crate::ast::CStmt::Expr(rewritten)]);
+        let reachable =
+            crate::ast::strip_render_observations(&mut function, owner.expected_count())
+                .expect("address taking must preserve a unique observation");
+        assert_eq!(reachable.ids().collect::<Vec<_>>(), vec![id]);
+    }
+
+    #[test]
+    fn call_result_rebinding_moves_use_observation_without_cloning_definition_observation() {
+        let symbols = test_table();
+        let source = crate::symbol::declare(&symbols, "call_result");
+        let replacement = crate::symbol::declare(&symbols, "owned_result");
+        let mut owner = crate::ast::RenderObservationOwner::new();
+        let (definition_id, definition) = owner
+            .observe_expr(CExpr::Var(replacement))
+            .expect("allocate stored-definition observation");
+        let (use_id, observed_source) = owner
+            .observe_expr(CExpr::Var(source))
+            .expect("allocate use observation");
+        let definitions = HashMap::from([("call_result".to_string(), definition)]);
+        let binding = CallArgBinding::from(SemanticCallArg::FallbackExpr(observed_source));
+        let rewritten = rewrite_call_result_binding(&symbols, &binding, &definitions)
+            .expect("observed fallback should still resolve");
+        let SemanticCallArg::FallbackExpr(expr) = rewritten.arg else {
+            panic!("rewritten call result should stay a fallback expression");
+        };
+        assert!(matches!(expr.unobserved(), CExpr::Var(name) if *name == replacement));
+
+        let mut function = crate::ast::CFunction::new("result", CType::Void)
+            .with_body(vec![crate::ast::CStmt::Expr(expr)]);
+        let reachable =
+            crate::ast::strip_render_observations(&mut function, owner.expected_count())
+                .expect("result rebinding must not duplicate definition observations");
+        assert_eq!(reachable.ids().collect::<Vec<_>>(), vec![use_id]);
+        assert!(!reachable.contains(definition_id));
+    }
+
+    #[test]
+    fn observed_alias_pointer_stack_and_candidate_classifiers_match_plain_expressions() {
+        let symbols = test_table();
+        let mut fixture = TestEnvFixture::new();
+        fixture
+            .param_register_aliases
+            .insert("rdi".to_string(), "arg0".to_string());
+        let env = fixture.env();
+        let mut owner = crate::ast::RenderObservationOwner::new();
+
+        let alias = crate::symbol::var_ref(&symbols, "eax_3");
+        let (_, observed_alias) = owner.observe_expr(alias.clone()).unwrap();
+        assert_eq!(
+            lowered_var_alias_from_expr(&symbols, &observed_alias, 4),
+            lowered_var_alias_from_expr(&symbols, &alias, 4)
+        );
+
+        let pointer = crate::symbol::var_ref(&symbols, "owned_pointer");
+        let (_, observed_pointer) = owner.observe_expr(pointer.clone()).unwrap();
+        assert_eq!(
+            expr_preserves_pointer_identity_for_call_arg(&symbols, &observed_pointer, &env),
+            expr_preserves_pointer_identity_for_call_arg(&symbols, &pointer, &env)
+        );
+
+        let stack_reload = CExpr::Subscript {
+            base: Box::new(pointer),
+            index: Box::new(CExpr::IntLit(1)),
+        };
+        let (_, observed_stack_reload) = owner.observe_expr(stack_reload.clone()).unwrap();
+        assert_eq!(
+            expr_is_meaningful_stack_reload_fallback(&symbols, &observed_stack_reload, &env),
+            expr_is_meaningful_stack_reload_fallback(&symbols, &stack_reload, &env)
+        );
+
+        let literal = CExpr::IntLit(7);
+        let (_, observed_literal) = owner.observe_expr(literal.clone()).unwrap();
+        let plain_literal_arg = SemanticCallArg::FallbackExpr(literal);
+        let observed_literal_arg = SemanticCallArg::FallbackExpr(observed_literal);
+        assert!(is_plain_scalar_call_arg_candidate(&observed_literal_arg));
+        assert!(!is_structured_call_arg_candidate(&observed_literal_arg));
+        assert_eq!(
+            is_plain_scalar_call_arg_candidate(&observed_literal_arg),
+            is_plain_scalar_call_arg_candidate(&plain_literal_arg)
+        );
+
+        let call = CExpr::Call {
+            func: Box::new(crate::symbol::var_ref(&symbols, "callee")),
+            args: Vec::new(),
+            site: None,
+        };
+        let (_, observed_call) = owner.observe_expr(call.clone()).unwrap();
+        let info = UseInfo::default();
+        let var = mk("rdi", 1, 8);
+        let plain_score = semantic_call_arg_score(
+            &symbols,
+            &info,
+            &var,
+            &SemanticCallArg::FallbackExpr(call),
+            &crate::symbol::var_ref(&symbols, "rdi_1"),
+            &env,
+        );
+        let observed_score = semantic_call_arg_score(
+            &symbols,
+            &info,
+            &var,
+            &SemanticCallArg::FallbackExpr(observed_call),
+            &crate::symbol::var_ref(&symbols, "rdi_1"),
+            &env,
+        );
+        assert_eq!(observed_score, plain_score);
     }
 
     #[test]
@@ -9236,6 +9450,7 @@ mod tests {
             expr: &CExpr,
         ) -> bool {
             match expr {
+                CExpr::Observed { expr, .. } => fallback_contains_stack_placeholder(symbols, expr),
                 CExpr::External { .. } => false,
                 CExpr::Var(name) => {
                     let lower = crate::symbol::spelling(symbols, *name).to_ascii_lowercase();

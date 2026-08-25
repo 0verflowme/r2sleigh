@@ -159,17 +159,17 @@ impl<'a> FoldingContext<'a> {
             LoweredOp::Assign { lhs, rhs } => CExpr::assign(lhs, rhs),
             LoweredOp::Return(Some(expr)) => expr,
             LoweredOp::Return(None) => CExpr::External {
-                    name: "return".to_string(),
-                    kind: crate::symbol::ExternalKind::Intrinsic,
-                },
+                name: "return".to_string(),
+                kind: crate::symbol::ExternalKind::Intrinsic,
+            },
             LoweredOp::Comment(_) | LoweredOp::None => {
                 if let Some(dst) = op.dst() {
                     self.name_ref(&self.var_name(dst))
                 } else {
                     CExpr::External {
-                            name: "__unhandled_op__".to_string(),
-                            kind: crate::symbol::ExternalKind::Intrinsic,
-                        }
+                        name: "__unhandled_op__".to_string(),
+                        kind: crate::symbol::ExternalKind::Intrinsic,
+                    }
                 }
             }
         }
@@ -182,7 +182,14 @@ impl<'a> FoldingContext<'a> {
         block_addr: u64,
         op_idx: usize,
     ) -> Option<CStmt> {
-        let mut frame = LowerFrame::for_stmt(block_addr, op_idx, true);
+        let source_site = self.source_op_site_for_normalized_op(block_addr, op_idx);
+        if matches!(op, SSAOp::Call { .. } | SSAOp::CallInd { .. }) && source_site.is_none() {
+            return Some(self.certified_residual_comment(format!(
+                "synthetic operation cannot carry callsite facts at 0x{block_addr:x}:{op_idx}"
+            )));
+        }
+        let (source_block, source_op_idx) = source_site.unwrap_or((block_addr, op_idx));
+        let mut frame = LowerFrame::for_stmt(source_block, source_op_idx, true);
         let stmt = self.lowered_to_stmt(self.lower_op(op, &mut frame))?;
 
         if stmt_contains_memory_like_access(&stmt) {
@@ -192,7 +199,7 @@ impl<'a> FoldingContext<'a> {
                         .certified_memory_access_for_current_op(false)
                         .map(|cert| (cert.space, cert.address, cert.value))
                     {
-                        self.record_effect_render_proof_for_memory(
+                        self.record_effect_render_proof_for_normalized_memory(
                             EffectRenderProofKind::MemoryRead,
                             block_addr,
                             op_idx,
@@ -207,7 +214,7 @@ impl<'a> FoldingContext<'a> {
                         .certified_memory_access_for_current_op(true)
                         .map(|cert| (cert.space, cert.address, cert.value))
                     {
-                        self.record_effect_render_proof_for_memory(
+                        self.record_effect_render_proof_for_normalized_memory(
                             EffectRenderProofKind::MemoryWrite,
                             block_addr,
                             op_idx,

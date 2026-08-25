@@ -253,6 +253,21 @@ impl BindingPlan {
         self.bindings.get(id.index())
     }
 
+    /// Number of sealed bindings in the dense `BindingId` domain.
+    pub(crate) const fn binding_count(&self) -> usize {
+        self.bindings.len()
+    }
+
+    /// Iterate sealed bindings in ascending, deterministic `BindingId` order.
+    pub(crate) fn bindings(&self) -> impl ExactSizeIterator<Item = (BindingId, &Binding)> {
+        self.bindings.iter().enumerate().map(|(index, binding)| {
+            let id = u32::try_from(index)
+                .map(BindingId)
+                .expect("sealed binding count fits the BindingId domain");
+            (id, binding)
+        })
+    }
+
     pub(crate) fn disposition(&self, value: ValueId) -> Option<&ValueDisposition> {
         self.dispositions.get(value.0 as usize)
     }

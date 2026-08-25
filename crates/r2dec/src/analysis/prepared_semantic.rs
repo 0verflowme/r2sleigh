@@ -397,7 +397,11 @@ pub(crate) fn build_prepared_runtime_facts(symbols: &std::cell::RefCell<crate::s
     let execution = r2ssa::SsaExecutionControl::default();
     let control =
         crate::DecompileWorkControl::new(&execution, crate::DecompileWorkPhase::Structuring);
-    build_prepared_runtime_facts_with_control(symbols, blocks, env, prepared, view, control)
+    let origins =
+        crate::normalize::NormalizationOrigins::for_unchanged(prepared.function(), prepared);
+    build_prepared_runtime_facts_with_control(
+        symbols, blocks, env, prepared, view, &origins, control,
+    )
         .expect("default decompiler work control cannot stop")
 }
 
@@ -407,6 +411,7 @@ pub(crate) fn build_prepared_runtime_facts_with_control(
     env: &PassEnv<'_>,
     prepared: &SsaArtifact,
     view: &PreparedSemanticView,
+    origins: &crate::normalize::NormalizationOrigins,
     control: crate::DecompileWorkControl<'_>,
 ) -> Result<DecompilerFacts, crate::DecompileExecutionStop> {
     control.poll()?;
@@ -431,7 +436,15 @@ pub(crate) fn build_prepared_runtime_facts_with_control(
     collect_prepared_runtime_facts(symbols, &mut use_info, &mut flag_info, blocks, env, prepared, view);
     pin_prepared_loop_carried_phi_values(&mut use_info, prepared, view);
     pin_aliases_for_prepared_pinned_values(&mut use_info);
-    populate_prepared_call_runtime_facts(symbols, &mut use_info, blocks, env, prepared, view);
+    populate_prepared_call_runtime_facts(
+        symbols,
+        &mut use_info,
+        blocks,
+        env,
+        prepared,
+        view,
+        origins,
+    );
     overlay_prepared_switch_roots(&mut use_info, prepared, view);
     populate_prepared_render_definitions(symbols, &mut use_info, blocks, env);
 
@@ -3313,13 +3326,28 @@ fn populate_prepared_call_runtime_facts(symbols: &std::cell::RefCell<crate::symb
     env: &PassEnv<'_>,
     prepared: &SsaArtifact,
     view: &PreparedSemanticView,
+    origins: &crate::normalize::NormalizationOrigins,
 ) {
     for block in blocks {
         for (op_idx, op) in block.ops.iter().enumerate() {
             if !matches!(op, SSAOp::Call { .. } | SSAOp::CallInd { .. }) {
                 continue;
             }
-            let site = (block.addr, op_idx);
+            let Some(block_id) = prepared.graph().block_id_for_addr(block.addr) else {
+                continue;
+            };
+            let normalized_site = crate::normalize::NormalizedOpSite {
+                block: block_id,
+                op_idx,
+            };
+            let Some(crate::normalize::NormalizedOpOrigin::Original(inst)) =
+                origins.origin(normalized_site)
+            else {
+                continue;
+            };
+            let Some(site) = prepared.inst_op_site(*inst) else {
+                continue;
+            };
             let Some(call_view) = view.call_view_for_site(site) else {
                 continue;
             };
@@ -3344,8 +3372,8 @@ fn populate_prepared_call_runtime_facts(symbols: &std::cell::RefCell<crate::symb
             if let Some(call_expr) = prepared_call_expr(site, symbols, call_view, view, env) {
                 use_info.call_result_exprs.insert(site, call_expr.clone());
                 record_prepared_consumed_by_call(use_info, block, op_idx, env, prepared, view);
-                record_prepared_call_result_aliases(symbols, 
-                    use_info, block, op_idx, prepared, view, &call_expr,
+                record_prepared_call_result_aliases(symbols,
+                    use_info, site, prepared, view, &call_expr,
                 );
             }
         }
@@ -3620,17 +3648,19 @@ fn record_prepared_consumed_by_call(
 
 fn record_prepared_call_result_aliases(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
     use_info: &mut UseInfo,
-    block: &SSABlock,
-    call_idx: usize,
+    source_site: (u64, usize),
     prepared: &SsaArtifact,
     view: &PreparedSemanticView,
     call_expr: &CExpr,
 ) {
-    let site = (block.addr, call_idx);
+    let site = source_site;
     for cert in view
         .call_result_facts_by_value
         .values()
-        .filter(|cert| cert.callsite.block_addr == block.addr && cert.callsite.op_index == call_idx)
+        .filter(|cert| {
+            cert.callsite.block_addr == source_site.0
+                && cert.callsite.op_index == source_site.1
+        })
     {
         let Some(var) = prepared.value_var(cert.value) else {
             continue;

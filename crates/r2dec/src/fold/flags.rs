@@ -14,6 +14,22 @@ use crate::analysis;
 use crate::analysis::{FlagCompareKind, FlagCompareProvenance, utils};
 use crate::ast::{BinaryOp, CExpr, CType, UnaryOp};
 
+/// Run one shape-changing flag rewrite against semantic AST only, then move
+/// every occurrence-owned observation from the replaced tree exactly once.
+///
+/// Keeping the semantic pass marker-free is important: a marker around either
+/// operand must not change which flag pattern the expression represents.  A
+/// replacement assembled from stored definitions is stripped as well, because
+/// cloning an occurrence-owned marker out of a definition table would create a
+/// second occurrence of the same ID.
+fn carry_flag_rewrite_observations(source: CExpr, replacement: CExpr) -> CExpr {
+    if source.transparently_eq(&replacement) {
+        return source;
+    }
+    let replacement = replacement.clone_without_render_observations();
+    crate::ast::carry_expr_render_observations(&source, replacement)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum CompareContext {
     Eq,
@@ -82,6 +98,11 @@ impl<'a> FoldingContext<'a> {
         current: &CExpr,
         candidate: &CExpr,
     ) -> bool {
+        let current = current.clone_without_render_observations();
+        let candidate = candidate.clone_without_render_observations();
+        let current = &current;
+        let candidate = &candidate;
+
         fn lhs(expr: &CExpr) -> Option<&CExpr> {
             match expr {
                 CExpr::Binary { left, .. } => Some(left.as_ref()),
@@ -173,6 +194,9 @@ impl<'a> FoldingContext<'a> {
     }
 
     fn prepared_candidate_needs_legacy_compare_help(&self, expr: &CExpr) -> bool {
+        let semantic = expr.clone_without_render_observations();
+        let expr = &semantic;
+
         fn strips_wrappers(expr: &CExpr) -> &CExpr {
             match expr {
                 CExpr::Paren(inner) | CExpr::Cast { expr: inner, .. } => strips_wrappers(inner),
@@ -922,9 +946,17 @@ impl<'a> FoldingContext<'a> {
     }
 
     fn prepared_predicate_operand_is_generic_entry_or_return(&self, expr: &CExpr) -> bool {
+        let semantic = expr.clone_without_render_observations();
+        self.prepared_predicate_operand_is_generic_entry_or_return_semantic(&semantic)
+    }
+
+    fn prepared_predicate_operand_is_generic_entry_or_return_semantic(
+        &self,
+        expr: &CExpr,
+    ) -> bool {
         match expr {
             CExpr::Paren(inner) | CExpr::Cast { expr: inner, .. } => {
-                self.prepared_predicate_operand_is_generic_entry_or_return(inner)
+                self.prepared_predicate_operand_is_generic_entry_or_return_semantic(inner)
             }
             CExpr::Var(name) => {
                 is_generic_arg_name(&self.spelling(*name))
@@ -951,6 +983,11 @@ impl<'a> FoldingContext<'a> {
     }
 
     pub(super) fn is_assignment_predicate_expr(&self, expr: &CExpr) -> bool {
+        let semantic = expr.clone_without_render_observations();
+        self.is_assignment_predicate_expr_semantic(&semantic)
+    }
+
+    fn is_assignment_predicate_expr_semantic(&self, expr: &CExpr) -> bool {
         match expr {
             CExpr::Var(name) => {
                 self.inputs.arch.is_flag_name(&self.spelling(*name))
@@ -973,8 +1010,10 @@ impl<'a> FoldingContext<'a> {
                     | BinaryOp::Or
                     | BinaryOp::BitAnd
             ),
-            CExpr::Paren(inner) => self.is_assignment_predicate_expr(inner),
-            CExpr::Cast { expr: inner, .. } => self.is_assignment_predicate_expr(inner),
+            CExpr::Paren(inner) => self.is_assignment_predicate_expr_semantic(inner),
+            CExpr::Cast { expr: inner, .. } => {
+                self.is_assignment_predicate_expr_semantic(inner)
+            }
             _ => false,
         }
     }
@@ -1300,6 +1339,12 @@ impl<'a> FoldingContext<'a> {
     }
 
     fn normalize_local_branch_expr(&self, expr: CExpr) -> CExpr {
+        let semantic = expr.clone_without_render_observations();
+        let normalized = self.normalize_local_branch_expr_semantic(semantic);
+        carry_flag_rewrite_observations(expr, normalized)
+    }
+
+    fn normalize_local_branch_expr_semantic(&self, expr: CExpr) -> CExpr {
         let normalized = match expr {
             CExpr::Binary {
                 op: BinaryOp::Eq,
@@ -1356,15 +1401,20 @@ impl<'a> FoldingContext<'a> {
     }
 
     fn is_degenerate_constant_condition(&self, expr: &CExpr) -> bool {
+        let semantic = expr.clone_without_render_observations();
+        self.is_degenerate_constant_condition_semantic(&semantic)
+    }
+
+    fn is_degenerate_constant_condition_semantic(&self, expr: &CExpr) -> bool {
         match expr {
             CExpr::IntLit(_) | CExpr::UIntLit(_) => true,
             CExpr::Paren(inner) | CExpr::Cast { expr: inner, .. } => {
-                self.is_degenerate_constant_condition(inner)
+                self.is_degenerate_constant_condition_semantic(inner)
             }
             CExpr::Unary {
                 op: UnaryOp::Not,
                 operand,
-            } => self.is_degenerate_constant_condition(operand),
+            } => self.is_degenerate_constant_condition_semantic(operand),
             CExpr::Binary {
                 op:
                     BinaryOp::Eq
@@ -1601,11 +1651,16 @@ impl<'a> FoldingContext<'a> {
     }
 
     pub(super) fn simplify_condition_expr(&self, expr: CExpr) -> CExpr {
-        analysis::PredicateSimplifier::new(self).simplify_condition_expr(expr)
+        let semantic = expr.clone_without_render_observations();
+        let simplified =
+            analysis::PredicateSimplifier::new(self).simplify_condition_expr(semantic);
+        carry_flag_rewrite_observations(expr, simplified)
     }
 
     pub(crate) fn simplify_predicate_expr(&self, expr: CExpr) -> CExpr {
-        self.simplify_predicate_expr_inner(expr, 0)
+        let semantic = expr.clone_without_render_observations();
+        let simplified = self.simplify_predicate_expr_inner(semantic, 0);
+        carry_flag_rewrite_observations(expr, simplified)
     }
 
     pub(super) fn simplify_predicate_expr_inner(&self, expr: CExpr, depth: u32) -> CExpr {
@@ -2460,6 +2515,15 @@ impl<'a> FoldingContext<'a> {
     /// - CF -> a < b (unsigned, JB)
     /// - CF || ZF -> a <= b (unsigned, JBE)
     pub(crate) fn try_reconstruct_condition(&self, expr: &CExpr) -> Option<CExpr> {
+        let semantic = expr.clone_without_render_observations();
+        let rewritten = self.try_reconstruct_condition_semantic(&semantic)?;
+        Some(crate::ast::carry_expr_render_observations(
+            expr,
+            rewritten.clone_without_render_observations(),
+        ))
+    }
+
+    fn try_reconstruct_condition_semantic(&self, expr: &CExpr) -> Option<CExpr> {
         match expr {
             // Pattern: Binary AND - check for signed greater than: !ZF && (OF == SF)
             CExpr::Binary {
@@ -2652,10 +2716,10 @@ impl<'a> FoldingContext<'a> {
                 None
             }
 
-            CExpr::Paren(inner) => self.try_reconstruct_condition(inner),
+            CExpr::Paren(inner) => self.try_reconstruct_condition_semantic(inner),
 
             CExpr::Cast { ty, expr: inner } => {
-                self.try_reconstruct_condition(inner)
+                self.try_reconstruct_condition_semantic(inner)
                     .map(|reconstructed| CExpr::Cast {
                         ty: ty.clone(),
                         expr: Box::new(reconstructed),
@@ -2720,7 +2784,7 @@ impl<'a> FoldingContext<'a> {
                 }
 
                 // Try to recurse into the operand and negate the result
-                if let Some(inner) = self.try_reconstruct_condition(operand) {
+                if let Some(inner) = self.try_reconstruct_condition_semantic(operand) {
                     // Negate comparison operators directly instead of wrapping in !()
                     return Some(match inner {
                         CExpr::Binary {
@@ -3177,7 +3241,7 @@ impl<'a> FoldingContext<'a> {
     }
 
     pub(super) fn compare_tuple_operands_match(&self, a: &CompareTuple, b: &CompareTuple) -> bool {
-        a.lhs == b.lhs && a.rhs == b.rhs
+        a.lhs.transparently_eq(&b.lhs) && a.rhs.transparently_eq(&b.rhs)
     }
 
     pub(super) fn compare_tuple_matches_flag_origin(
@@ -3939,6 +4003,81 @@ fn is_flag_base_name(name: &str) -> bool {
 /// it, so the two could disagree about what a flag is while every rule here
 /// assumed they could not.
 pub(crate) use crate::analysis::utils::is_cpu_flag;
+
+#[cfg(test)]
+mod observation_transparency_tests {
+    use super::*;
+    use crate::ast::{
+        CFunction, CStmt, ReachableObservations, RenderObservationOwner, strip_render_observations,
+    };
+
+    fn strip_expression(
+        ctx: &FoldingContext<'_>,
+        expr: CExpr,
+        owner: &RenderObservationOwner,
+    ) -> (CExpr, ReachableObservations) {
+        let mut function = CFunction::new("observed_flags", CType::Bool)
+            .with_body(vec![CStmt::Return(Some(expr))]);
+        function.symbols = std::rc::Rc::clone(&ctx.symbols);
+        let reachable = strip_render_observations(&mut function, owner.expected_count())
+            .expect("each transferred observation must remain unique and in range");
+        let CStmt::Return(Some(expr)) = function.body.remove(0) else {
+            panic!("fixture must remain one returned expression");
+        };
+        (expr, reachable)
+    }
+
+    #[test]
+    fn nested_flag_operand_reconstructs_and_transfers_each_observation_once() {
+        let mut ctx = FoldingContext::new(64);
+        ctx.state.analysis_ctx.flag_info.flag_origins.insert(
+            "zf_1".to_string(),
+            ("left".to_string(), "right".to_string()),
+        );
+        let mut owner = RenderObservationOwner::new();
+        let (operand_id, operand) = owner
+            .observe_expr(ctx.name_ref("zf_1"))
+            .expect("test observation ID");
+        let (root_id, source) = owner
+            .observe_expr(CExpr::unary(UnaryOp::Not, operand))
+            .expect("test observation ID");
+
+        let rewritten = ctx
+            .try_reconstruct_condition(&source)
+            .expect("a marked !ZF operand must still reconstruct");
+        let (semantic, reachable) = strip_expression(&ctx, rewritten, &owner);
+
+        assert_eq!(
+            semantic,
+            CExpr::binary(BinaryOp::Ne, ctx.name_ref("left"), ctx.name_ref("right"),)
+        );
+        assert!(reachable.contains(root_id));
+        assert!(reachable.contains(operand_id));
+    }
+
+    #[test]
+    fn nested_predicate_operands_simplify_without_losing_or_duplicating_ids() {
+        let ctx = FoldingContext::new(64);
+        let mut owner = RenderObservationOwner::new();
+        let (value_id, value) = owner
+            .observe_expr(ctx.name_ref("value"))
+            .expect("test observation ID");
+        let (zero_id, zero) = owner
+            .observe_expr(CExpr::IntLit(0))
+            .expect("test observation ID");
+        let (root_id, source) = owner
+            .observe_expr(CExpr::binary(BinaryOp::Sub, value, zero))
+            .expect("test observation ID");
+
+        let rewritten = ctx.simplify_predicate_expr(source);
+        let (semantic, reachable) = strip_expression(&ctx, rewritten, &owner);
+
+        assert_eq!(semantic, ctx.name_ref("value"));
+        assert!(reachable.contains(root_id));
+        assert!(reachable.contains(value_id));
+        assert!(reachable.contains(zero_id));
+    }
+}
 
 #[cfg(test)]
 #[path = "tests/flags.rs"]

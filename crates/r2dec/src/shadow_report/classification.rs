@@ -64,6 +64,7 @@ impl ValueClassInterner {
 enum NormalizedValueObservation {
     Bound(ValueClassId),
     InlineConstant,
+    InlineNonLiteral,
     Elided,
     Refused(ValueRefusal),
     LegacyAbsent,
@@ -372,6 +373,9 @@ fn normalized_legacy_value(
             .map(NormalizedValueObservation::Bound)
             .ok_or(ShadowReportError::InvalidLegacyBinding { binding }),
         LegacyValueObservation::InlineConstant => Ok(NormalizedValueObservation::InlineConstant),
+        LegacyValueObservation::InlineNonLiteral => {
+            Ok(NormalizedValueObservation::InlineNonLiteral)
+        }
         LegacyValueObservation::Elided => Ok(NormalizedValueObservation::Elided),
         LegacyValueObservation::Refused(reason) => Ok(NormalizedValueObservation::Refused(reason)),
         LegacyValueObservation::LegacyAbsent => Ok(NormalizedValueObservation::LegacyAbsent),

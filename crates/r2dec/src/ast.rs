@@ -160,6 +160,16 @@ impl std::fmt::Display for CType {
 /// A C expression.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum CExpr {
+    /// Internal marker attached to one exact rendered expression occurrence.
+    ///
+    /// This is transparent to C rendering and must be stripped before a
+    /// `CFunction` leaves the decompiler.
+    #[doc(hidden)]
+    #[serde(skip)]
+    Observed {
+        id: RenderObservationId,
+        expr: Box<CExpr>,
+    },
     /// Integer literal.
     IntLit(i64),
     /// Unsigned integer literal.
@@ -293,6 +303,169 @@ pub enum BinaryOp {
 }
 
 impl CExpr {
+    /// Attach an internal observation marker to this exact occurrence.
+    pub(crate) fn observed(id: RenderObservationId, expr: CExpr) -> Self {
+        Self::Observed {
+            id,
+            expr: Box::new(expr),
+        }
+    }
+
+    /// Borrow the semantic expression beneath any internal observation markers.
+    pub(crate) fn unobserved(&self) -> &Self {
+        let mut expr = self;
+        while let Self::Observed { expr: inner, .. } = expr {
+            expr = inner;
+        }
+        expr
+    }
+
+    /// Structural equality that treats observation wrappers as metadata at
+    /// every depth, not only at the root.
+    pub(crate) fn transparently_eq(&self, other: &Self) -> bool {
+        let left = self.unobserved();
+        let right = other.unobserved();
+        match (left, right) {
+            (Self::IntLit(left), Self::IntLit(right)) => left == right,
+            (Self::UIntLit(left), Self::UIntLit(right)) => left == right,
+            (Self::FloatLit(left), Self::FloatLit(right)) => left == right,
+            (Self::StringLit(left), Self::StringLit(right)) => left == right,
+            (Self::CharLit(left), Self::CharLit(right)) => left == right,
+            (Self::Var(left), Self::Var(right)) => left == right,
+            (
+                Self::External {
+                    name: left_name,
+                    kind: left_kind,
+                },
+                Self::External {
+                    name: right_name,
+                    kind: right_kind,
+                },
+            ) => left_name == right_name && left_kind == right_kind,
+            (
+                Self::Unary {
+                    op: left_op,
+                    operand: left_operand,
+                },
+                Self::Unary {
+                    op: right_op,
+                    operand: right_operand,
+                },
+            ) => left_op == right_op && left_operand.transparently_eq(right_operand),
+            (
+                Self::Binary {
+                    op: left_op,
+                    left: left_left,
+                    right: left_right,
+                },
+                Self::Binary {
+                    op: right_op,
+                    left: right_left,
+                    right: right_right,
+                },
+            ) => {
+                left_op == right_op
+                    && left_left.transparently_eq(right_left)
+                    && left_right.transparently_eq(right_right)
+            }
+            (
+                Self::Ternary {
+                    cond: left_cond,
+                    then_expr: left_then,
+                    else_expr: left_else,
+                },
+                Self::Ternary {
+                    cond: right_cond,
+                    then_expr: right_then,
+                    else_expr: right_else,
+                },
+            ) => {
+                left_cond.transparently_eq(right_cond)
+                    && left_then.transparently_eq(right_then)
+                    && left_else.transparently_eq(right_else)
+            }
+            (
+                Self::Cast {
+                    ty: left_ty,
+                    expr: left_expr,
+                },
+                Self::Cast {
+                    ty: right_ty,
+                    expr: right_expr,
+                },
+            ) => left_ty == right_ty && left_expr.transparently_eq(right_expr),
+            (
+                Self::Call {
+                    func: left_func,
+                    args: left_args,
+                    site: left_site,
+                },
+                Self::Call {
+                    func: right_func,
+                    args: right_args,
+                    site: right_site,
+                },
+            ) => {
+                left_site == right_site
+                    && left_func.transparently_eq(right_func)
+                    && transparent_expr_slices_eq(left_args, right_args)
+            }
+            (
+                Self::Subscript {
+                    base: left_base,
+                    index: left_index,
+                },
+                Self::Subscript {
+                    base: right_base,
+                    index: right_index,
+                },
+            ) => {
+                left_base.transparently_eq(right_base)
+                    && left_index.transparently_eq(right_index)
+            }
+            (
+                Self::Member {
+                    base: left_base,
+                    member: left_member,
+                },
+                Self::Member {
+                    base: right_base,
+                    member: right_member,
+                },
+            )
+            | (
+                Self::PtrMember {
+                    base: left_base,
+                    member: left_member,
+                },
+                Self::PtrMember {
+                    base: right_base,
+                    member: right_member,
+                },
+            ) => left_member == right_member && left_base.transparently_eq(right_base),
+            (Self::Sizeof(left), Self::Sizeof(right))
+            | (Self::AddrOf(left), Self::AddrOf(right))
+            | (Self::Deref(left), Self::Deref(right))
+            | (Self::Paren(left), Self::Paren(right)) => left.transparently_eq(right),
+            (Self::SizeofType(left), Self::SizeofType(right)) => left == right,
+            (Self::Comma(left), Self::Comma(right)) => transparent_expr_slices_eq(left, right),
+            _ => false,
+        }
+    }
+
+    /// Clone semantic expression structure without copying occurrence-owned
+    /// observation IDs into a second location.
+    pub(crate) fn clone_without_render_observations(&self) -> Self {
+        fn strip(expr: CExpr) -> CExpr {
+            match expr {
+                CExpr::Observed { expr, .. } => strip(*expr),
+                other => other.map_children(&mut strip),
+            }
+        }
+
+        strip(self.clone())
+    }
+
     /// Create an integer literal.
     pub fn int(value: i64) -> Self {
         Self::IntLit(value)
@@ -377,6 +550,7 @@ impl CExpr {
     /// Get operator precedence (higher = binds tighter).
     pub fn precedence(&self) -> u8 {
         match self {
+            Self::Observed { expr, .. } => expr.precedence(),
             Self::Comma(_) => 1,
             Self::Binary {
                 op:
@@ -449,6 +623,10 @@ impl CExpr {
     /// Apply a transformation to immediate child expressions.
     pub fn map_children(self, f: &mut impl FnMut(CExpr) -> CExpr) -> Self {
         match self {
+            Self::Observed { id, expr } => Self::Observed {
+                id,
+                expr: Box::new(f(*expr)),
+            },
             Self::Unary { op, operand } => Self::Unary {
                 op,
                 operand: Box::new(f(*operand)),
@@ -499,6 +677,10 @@ impl CExpr {
 
     /// Visit this expression and all descendants in pre-order.
     pub fn visit(&self, f: &mut impl FnMut(&CExpr)) {
+        if let Self::Observed { expr, .. } = self {
+            expr.visit(f);
+            return;
+        }
         f(self);
         match self {
             Self::Unary { operand, .. }
@@ -544,7 +726,69 @@ impl CExpr {
             | Self::Var(_)
             | Self::External { .. }
             | Self::SizeofType(_) => {}
+            Self::Observed { .. } => unreachable!("handled before visiting semantic nodes"),
         }
+    }
+}
+
+fn transparent_expr_slices_eq(left: &[CExpr], right: &[CExpr]) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right)
+            .all(|(left, right)| left.transparently_eq(right))
+}
+
+pub use crate::observation_journal::RenderObservationId;
+
+/// Test-only marker allocator. Production IDs are owned by the sealed journal.
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub(crate) struct RenderObservationOwner {
+    next: u32,
+}
+
+/// Allocation failed before an observation could be attached.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RenderObservationAllocationError {
+    IdSpaceExhausted,
+}
+
+#[cfg(test)]
+impl RenderObservationOwner {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    fn allocate(&mut self) -> Result<RenderObservationId, RenderObservationAllocationError> {
+        let next = self
+            .next
+            .checked_add(1)
+            .ok_or(RenderObservationAllocationError::IdSpaceExhausted)?;
+        let id = crate::observation_journal::test_render_observation_id(self.next);
+        self.next = next;
+        Ok(id)
+    }
+
+    pub(crate) fn observe_expr(
+        &mut self,
+        expr: CExpr,
+    ) -> Result<(RenderObservationId, CExpr), RenderObservationAllocationError> {
+        let id = self.allocate()?;
+        Ok((id, CExpr::observed(id, expr)))
+    }
+
+    pub(crate) fn observe_stmt(
+        &mut self,
+        stmt: CStmt,
+    ) -> Result<(RenderObservationId, CStmt), RenderObservationAllocationError> {
+        let id = self.allocate()?;
+        Ok((id, CStmt::observed(id, stmt)))
+    }
+
+    pub(crate) fn expected_count(&self) -> usize {
+        usize::try_from(self.next).unwrap_or(usize::MAX)
     }
 }
 
@@ -626,6 +870,16 @@ impl UnaryOp {
 /// A C statement.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum CStmt {
+    /// Internal marker attached to one exact rendered statement occurrence.
+    ///
+    /// This is transparent to C rendering and must be stripped before a
+    /// `CFunction` leaves the decompiler.
+    #[doc(hidden)]
+    #[serde(skip)]
+    Observed {
+        id: RenderObservationId,
+        stmt: Box<CStmt>,
+    },
     /// Empty statement.
     Empty,
     /// Expression statement.
@@ -685,6 +939,30 @@ pub struct SwitchCase {
 }
 
 impl CStmt {
+    /// Attach an internal observation marker to this exact occurrence.
+    pub(crate) fn observed(id: RenderObservationId, stmt: CStmt) -> Self {
+        Self::Observed {
+            id,
+            stmt: Box::new(stmt),
+        }
+    }
+
+    /// Borrow the semantic statement beneath any internal observation markers.
+    pub(crate) fn unobserved(&self) -> &Self {
+        let mut stmt = self;
+        while let Self::Observed { stmt: inner, .. } = stmt {
+            stmt = inner;
+        }
+        stmt
+    }
+
+    /// Clone semantic statement data while omitting every observation wrapper.
+    pub(crate) fn clone_without_render_observations(&self) -> Self {
+        let mut clone = self.clone();
+        strip_stmt_observations(&mut clone);
+        clone
+    }
+
     /// Create an expression statement.
     pub fn expr(e: CExpr) -> Self {
         Self::Expr(e)
@@ -810,6 +1088,707 @@ impl CFunction {
     }
 }
 
+/// Validated reachability for one owner's fixed observation-ID domain.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReachableObservations {
+    reachable: Vec<bool>,
+}
+
+impl ReachableObservations {
+    pub(crate) fn contains(&self, id: RenderObservationId) -> bool {
+        usize::try_from(id.index())
+            .ok()
+            .and_then(|index| self.reachable.get(index))
+            .copied()
+            .unwrap_or(false)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn ids(&self) -> impl Iterator<Item = RenderObservationId> + '_ {
+        self.reachable
+            .iter()
+            .enumerate()
+            .filter_map(|(index, reachable)| {
+                if *reachable {
+                        u32::try_from(index)
+                            .ok()
+                            .map(crate::observation_journal::test_render_observation_id)
+                } else {
+                    None
+                }
+            })
+    }
+}
+
+/// A marked AST did not belong to the supplied dense observation-ID domain.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RenderObservationStripError {
+    DomainTooLarge {
+        expected_count: usize,
+    },
+    CapacityUnavailable {
+        expected_count: usize,
+    },
+    OutOfRange {
+        id: RenderObservationId,
+        expected_count: usize,
+    },
+    Duplicate {
+        id: RenderObservationId,
+    },
+}
+
+impl std::fmt::Display for RenderObservationStripError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::DomainTooLarge { expected_count } => write!(
+                f,
+                "observation domain of size {expected_count} exceeds the ID space"
+            ),
+            Self::CapacityUnavailable { expected_count } => {
+                write!(
+                    f,
+                    "cannot allocate observation domain of size {expected_count}"
+                )
+            }
+            Self::OutOfRange { id, expected_count } => write!(
+                f,
+                "observation {} is outside expected domain 0..{expected_count}",
+                id.index()
+            ),
+            Self::Duplicate { id } => {
+                write!(f, "observation {} occurs more than once", id.index())
+            }
+        }
+    }
+}
+
+impl std::error::Error for RenderObservationStripError {}
+
+/// Final AST node carried by one validated observation marker.
+///
+/// The node is borrowed from inside the wrapper, after every render rewrite
+/// has completed.  Consumers therefore inspect what survived, rather than
+/// treating marker reachability as a proxy for the final disposition.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum RenderObservationNode<'a> {
+    Expr(&'a CExpr),
+    Stmt(&'a CStmt),
+}
+
+/// Failure while transactionally inspecting a fixed observation domain.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RenderObservationInspectError<E> {
+    Markers(RenderObservationStripError),
+    Observer(E),
+}
+
+fn validate_render_observations(
+    function: &CFunction,
+    expected_count: usize,
+) -> Result<ReachableObservations, RenderObservationStripError> {
+    if expected_count > usize::try_from(u32::MAX).unwrap_or(usize::MAX) {
+        return Err(RenderObservationStripError::DomainTooLarge { expected_count });
+    }
+    let mut reachable = Vec::new();
+    reachable
+        .try_reserve_exact(expected_count)
+        .map_err(|_| RenderObservationStripError::CapacityUnavailable { expected_count })?;
+    reachable.resize(expected_count, false);
+    let mut observations = ReachableObservations { reachable };
+    for stmt in &function.body {
+        visit_stmt_observations(stmt, &mut |id| observations.record(id))?;
+    }
+    Ok(observations)
+}
+
+/// Whether a function still contains any internal render observation marker.
+pub(crate) fn has_render_observations(function: &CFunction) -> bool {
+    validate_render_observations(function, 0).is_err()
+}
+
+/// Whether one statement subtree contains any render observation marker.
+pub(crate) fn stmt_has_render_observations(stmt: &CStmt) -> bool {
+    let mut found = false;
+    let never = visit_stmt_observations(stmt, &mut |_| {
+        found = true;
+        Ok::<_, std::convert::Infallible>(())
+    });
+    match never {
+        Ok(()) => found,
+        Err(never) => match never {},
+    }
+}
+
+/// Validate every marker before exposing any final wrapped node to `inspect`.
+///
+/// Marker-domain errors invoke no callback.  Callers can likewise accumulate
+/// observations in temporary storage and commit it only after this function
+/// succeeds, making conflict handling transactional as well.
+pub(crate) fn inspect_render_observations<E>(
+    function: &CFunction,
+    expected_count: usize,
+    mut inspect: impl FnMut(RenderObservationId, RenderObservationNode<'_>) -> Result<(), E>,
+) -> Result<ReachableObservations, RenderObservationInspectError<E>> {
+    let observations = validate_render_observations(function, expected_count)
+        .map_err(RenderObservationInspectError::Markers)?;
+    for stmt in &function.body {
+        inspect_stmt_observations(stmt, &mut inspect)
+            .map_err(RenderObservationInspectError::Observer)?;
+    }
+    Ok(observations)
+}
+
+/// Transactionally inspect final wrapped nodes and then remove all markers.
+///
+/// Marker validation and observer callbacks both complete before mutation.
+/// On success the already-validated AST is stripped without a redundant
+/// validation pass.
+pub(crate) fn inspect_and_strip_render_observations<E>(
+    function: &mut CFunction,
+    expected_count: usize,
+    inspect: impl FnMut(RenderObservationId, RenderObservationNode<'_>) -> Result<(), E>,
+) -> Result<ReachableObservations, RenderObservationInspectError<E>> {
+    let observations = inspect_render_observations(function, expected_count, inspect)?;
+    for stmt in &mut function.body {
+        strip_stmt_observations(stmt);
+    }
+    Ok(observations)
+}
+
+/// Validate and remove every internal render observation before a `CFunction`
+/// is exposed or serialized.
+///
+/// Validation is a read-only linear pass over a fixed-size dense bitset. The
+/// AST is stripped only after every reachable marker is proven unique and in
+/// range, so an error leaves the input unchanged.
+pub(crate) fn strip_render_observations(
+    function: &mut CFunction,
+    expected_count: usize,
+) -> Result<ReachableObservations, RenderObservationStripError> {
+    let observations = validate_render_observations(function, expected_count)?;
+    for stmt in &mut function.body {
+        strip_stmt_observations(stmt);
+    }
+    Ok(observations)
+}
+
+fn inspect_expr_observations<E>(
+    expr: &CExpr,
+    inspect: &mut impl FnMut(RenderObservationId, RenderObservationNode<'_>) -> Result<(), E>,
+) -> Result<(), E> {
+    if let CExpr::Observed { id, expr } = expr {
+        inspect(*id, RenderObservationNode::Expr(expr))?;
+        return inspect_expr_observations(expr, inspect);
+    }
+    match expr {
+        CExpr::Observed { .. } => unreachable!("handled before semantic expression"),
+        CExpr::Unary { operand, .. }
+        | CExpr::Cast { expr: operand, .. }
+        | CExpr::Sizeof(operand)
+        | CExpr::AddrOf(operand)
+        | CExpr::Deref(operand)
+        | CExpr::Paren(operand) => inspect_expr_observations(operand, inspect)?,
+        CExpr::Binary { left, right, .. } => {
+            inspect_expr_observations(left, inspect)?;
+            inspect_expr_observations(right, inspect)?;
+        }
+        CExpr::Ternary {
+            cond,
+            then_expr,
+            else_expr,
+        } => {
+            inspect_expr_observations(cond, inspect)?;
+            inspect_expr_observations(then_expr, inspect)?;
+            inspect_expr_observations(else_expr, inspect)?;
+        }
+        CExpr::Call { func, args, .. } => {
+            inspect_expr_observations(func, inspect)?;
+            for arg in args {
+                inspect_expr_observations(arg, inspect)?;
+            }
+        }
+        CExpr::Subscript { base, index } => {
+            inspect_expr_observations(base, inspect)?;
+            inspect_expr_observations(index, inspect)?;
+        }
+        CExpr::Member { base, .. } | CExpr::PtrMember { base, .. } => {
+            inspect_expr_observations(base, inspect)?;
+        }
+        CExpr::Comma(items) => {
+            for item in items {
+                inspect_expr_observations(item, inspect)?;
+            }
+        }
+        CExpr::IntLit(_)
+        | CExpr::UIntLit(_)
+        | CExpr::FloatLit(_)
+        | CExpr::StringLit(_)
+        | CExpr::CharLit(_)
+        | CExpr::Var(_)
+        | CExpr::External { .. }
+        | CExpr::SizeofType(_) => {}
+    }
+    Ok(())
+}
+
+impl ReachableObservations {
+    fn record(&mut self, id: RenderObservationId) -> Result<(), RenderObservationStripError> {
+        let Ok(index) = usize::try_from(id.index()) else {
+            return Err(RenderObservationStripError::OutOfRange {
+                id,
+                expected_count: self.reachable.len(),
+            });
+        };
+        let Some(reachable) = self.reachable.get_mut(index) else {
+            return Err(RenderObservationStripError::OutOfRange {
+                id,
+                expected_count: self.reachable.len(),
+            });
+        };
+        if *reachable {
+            return Err(RenderObservationStripError::Duplicate { id });
+        }
+        *reachable = true;
+        Ok(())
+    }
+}
+
+fn visit_expr_observations<E>(
+    expr: &CExpr,
+    visit: &mut impl FnMut(RenderObservationId) -> Result<(), E>,
+) -> Result<(), E> {
+    if let CExpr::Observed { id, expr } = expr {
+        visit(*id)?;
+        return visit_expr_observations(expr, visit);
+    }
+    match expr {
+        CExpr::Observed { .. } => unreachable!("handled before semantic expression"),
+        CExpr::Unary { operand, .. }
+        | CExpr::Cast { expr: operand, .. }
+        | CExpr::Sizeof(operand)
+        | CExpr::AddrOf(operand)
+        | CExpr::Deref(operand)
+        | CExpr::Paren(operand) => visit_expr_observations(operand, visit)?,
+        CExpr::Binary { left, right, .. } => {
+            visit_expr_observations(left, visit)?;
+            visit_expr_observations(right, visit)?;
+        }
+        CExpr::Ternary {
+            cond,
+            then_expr,
+            else_expr,
+        } => {
+            visit_expr_observations(cond, visit)?;
+            visit_expr_observations(then_expr, visit)?;
+            visit_expr_observations(else_expr, visit)?;
+        }
+        CExpr::Call { func, args, .. } => {
+            visit_expr_observations(func, visit)?;
+            for arg in args {
+                visit_expr_observations(arg, visit)?;
+            }
+        }
+        CExpr::Subscript { base, index } => {
+            visit_expr_observations(base, visit)?;
+            visit_expr_observations(index, visit)?;
+        }
+        CExpr::Member { base, .. } | CExpr::PtrMember { base, .. } => {
+            visit_expr_observations(base, visit)?;
+        }
+        CExpr::Comma(items) => {
+            for item in items {
+                visit_expr_observations(item, visit)?;
+            }
+        }
+        CExpr::IntLit(_)
+        | CExpr::UIntLit(_)
+        | CExpr::FloatLit(_)
+        | CExpr::StringLit(_)
+        | CExpr::CharLit(_)
+        | CExpr::Var(_)
+        | CExpr::External { .. }
+        | CExpr::SizeofType(_) => {}
+    }
+    Ok(())
+}
+
+fn strip_expr_observations(expr: &mut CExpr) {
+    while let CExpr::Observed { id, expr: inner } = expr {
+        let _ = id;
+        *expr = std::mem::replace(inner.as_mut(), CExpr::IntLit(0));
+    }
+    match expr {
+        CExpr::Observed { .. } => unreachable!("all leading observations were stripped"),
+        CExpr::Unary { operand, .. }
+        | CExpr::Cast { expr: operand, .. }
+        | CExpr::Sizeof(operand)
+        | CExpr::AddrOf(operand)
+        | CExpr::Deref(operand)
+        | CExpr::Paren(operand) => strip_expr_observations(operand),
+        CExpr::Binary { left, right, .. } => {
+            strip_expr_observations(left);
+            strip_expr_observations(right);
+        }
+        CExpr::Ternary {
+            cond,
+            then_expr,
+            else_expr,
+        } => {
+            strip_expr_observations(cond);
+            strip_expr_observations(then_expr);
+            strip_expr_observations(else_expr);
+        }
+        CExpr::Call { func, args, .. } => {
+            strip_expr_observations(func);
+            for arg in args {
+                strip_expr_observations(arg);
+            }
+        }
+        CExpr::Subscript { base, index } => {
+            strip_expr_observations(base);
+            strip_expr_observations(index);
+        }
+        CExpr::Member { base, .. } | CExpr::PtrMember { base, .. } => {
+            strip_expr_observations(base);
+        }
+        CExpr::Comma(items) => {
+            for item in items {
+                strip_expr_observations(item);
+            }
+        }
+        CExpr::IntLit(_)
+        | CExpr::UIntLit(_)
+        | CExpr::FloatLit(_)
+        | CExpr::StringLit(_)
+        | CExpr::CharLit(_)
+        | CExpr::Var(_)
+        | CExpr::External { .. }
+        | CExpr::SizeofType(_) => {}
+    }
+}
+
+fn visit_stmt_observations<E>(
+    stmt: &CStmt,
+    visit: &mut impl FnMut(RenderObservationId) -> Result<(), E>,
+) -> Result<(), E> {
+    if let CStmt::Observed { id, stmt } = stmt {
+        visit(*id)?;
+        return visit_stmt_observations(stmt, visit);
+    }
+    match stmt {
+        CStmt::Observed { .. } => unreachable!("handled before semantic statement"),
+        CStmt::Expr(expr) => visit_expr_observations(expr, visit)?,
+        CStmt::Decl { init, .. } | CStmt::Return(init) => {
+            if let Some(expr) = init {
+                visit_expr_observations(expr, visit)?;
+            }
+        }
+        CStmt::Block(stmts) => {
+            for stmt in stmts {
+                visit_stmt_observations(stmt, visit)?;
+            }
+        }
+        CStmt::If {
+            cond,
+            then_body,
+            else_body,
+        } => {
+            visit_expr_observations(cond, visit)?;
+            visit_stmt_observations(then_body, visit)?;
+            if let Some(else_body) = else_body {
+                visit_stmt_observations(else_body, visit)?;
+            }
+        }
+        CStmt::While { cond, body } => {
+            visit_expr_observations(cond, visit)?;
+            visit_stmt_observations(body, visit)?;
+        }
+        CStmt::DoWhile { body, cond } => {
+            visit_stmt_observations(body, visit)?;
+            visit_expr_observations(cond, visit)?;
+        }
+        CStmt::For {
+            init,
+            cond,
+            update,
+            body,
+        } => {
+            if let Some(init) = init {
+                visit_stmt_observations(init, visit)?;
+            }
+            if let Some(cond) = cond {
+                visit_expr_observations(cond, visit)?;
+            }
+            if let Some(update) = update {
+                visit_expr_observations(update, visit)?;
+            }
+            visit_stmt_observations(body, visit)?;
+        }
+        CStmt::Switch {
+            expr,
+            cases,
+            default,
+        } => {
+            visit_expr_observations(expr, visit)?;
+            for case in cases {
+                visit_expr_observations(&case.value, visit)?;
+                for stmt in &case.body {
+                    visit_stmt_observations(stmt, visit)?;
+                }
+            }
+            if let Some(default) = default {
+                for stmt in default {
+                    visit_stmt_observations(stmt, visit)?;
+                }
+            }
+        }
+        CStmt::Empty
+        | CStmt::Break
+        | CStmt::Continue
+        | CStmt::Goto(_)
+        | CStmt::Label(_)
+        | CStmt::Comment(_) => {}
+    }
+    Ok(())
+}
+
+fn inspect_stmt_observations<E>(
+    stmt: &CStmt,
+    inspect: &mut impl FnMut(RenderObservationId, RenderObservationNode<'_>) -> Result<(), E>,
+) -> Result<(), E> {
+    if let CStmt::Observed { id, stmt } = stmt {
+        inspect(*id, RenderObservationNode::Stmt(stmt))?;
+        return inspect_stmt_observations(stmt, inspect);
+    }
+    match stmt {
+        CStmt::Observed { .. } => unreachable!("handled before semantic statement"),
+        CStmt::Expr(expr) => inspect_expr_observations(expr, inspect)?,
+        CStmt::Decl { init, .. } | CStmt::Return(init) => {
+            if let Some(expr) = init {
+                inspect_expr_observations(expr, inspect)?;
+            }
+        }
+        CStmt::Block(stmts) => {
+            for stmt in stmts {
+                inspect_stmt_observations(stmt, inspect)?;
+            }
+        }
+        CStmt::If {
+            cond,
+            then_body,
+            else_body,
+        } => {
+            inspect_expr_observations(cond, inspect)?;
+            inspect_stmt_observations(then_body, inspect)?;
+            if let Some(else_body) = else_body {
+                inspect_stmt_observations(else_body, inspect)?;
+            }
+        }
+        CStmt::While { cond, body } => {
+            inspect_expr_observations(cond, inspect)?;
+            inspect_stmt_observations(body, inspect)?;
+        }
+        CStmt::DoWhile { body, cond } => {
+            inspect_stmt_observations(body, inspect)?;
+            inspect_expr_observations(cond, inspect)?;
+        }
+        CStmt::For {
+            init,
+            cond,
+            update,
+            body,
+        } => {
+            if let Some(init) = init {
+                inspect_stmt_observations(init, inspect)?;
+            }
+            if let Some(cond) = cond {
+                inspect_expr_observations(cond, inspect)?;
+            }
+            if let Some(update) = update {
+                inspect_expr_observations(update, inspect)?;
+            }
+            inspect_stmt_observations(body, inspect)?;
+        }
+        CStmt::Switch {
+            expr,
+            cases,
+            default,
+        } => {
+            inspect_expr_observations(expr, inspect)?;
+            for case in cases {
+                inspect_expr_observations(&case.value, inspect)?;
+                for stmt in &case.body {
+                    inspect_stmt_observations(stmt, inspect)?;
+                }
+            }
+            if let Some(default) = default {
+                for stmt in default {
+                    inspect_stmt_observations(stmt, inspect)?;
+                }
+            }
+        }
+        CStmt::Empty
+        | CStmt::Break
+        | CStmt::Continue
+        | CStmt::Goto(_)
+        | CStmt::Label(_)
+        | CStmt::Comment(_) => {}
+    }
+    Ok(())
+}
+
+pub(crate) fn carry_render_observations(stmts: &[CStmt], mut replacement: CStmt) -> CStmt {
+    let mut ids = Vec::new();
+    for stmt in stmts {
+        let never = visit_stmt_observations(stmt, &mut |id| {
+            ids.push(id);
+            Ok::<_, std::convert::Infallible>(())
+        });
+        match never {
+            Ok(()) => {}
+            Err(never) => match never {},
+        }
+    }
+    for id in ids.into_iter().rev() {
+        replacement = CStmt::observed(id, replacement);
+    }
+    replacement
+}
+
+/// Move every observation nested anywhere in `source` onto one replacement.
+///
+/// Whole-tree folds use this together with
+/// [`CExpr::clone_without_render_observations`] so each source marker occurs
+/// exactly once in the replacement tree.
+pub(crate) fn carry_expr_render_observations(
+    source: &CExpr,
+    mut replacement: CExpr,
+) -> CExpr {
+    let mut ids = Vec::new();
+    let never = visit_expr_observations(source, &mut |id| {
+        ids.push(id);
+        Ok::<_, std::convert::Infallible>(())
+    });
+    match never {
+        Ok(()) => {}
+        Err(never) => match never {},
+    }
+    for id in ids.into_iter().rev() {
+        replacement = CExpr::observed(id, replacement);
+    }
+    replacement
+}
+
+pub(crate) fn carry_outer_stmt_observations(source: &CStmt, mut replacement: CStmt) -> CStmt {
+    let mut source = source;
+    let mut ids = Vec::new();
+    while let CStmt::Observed { id, stmt } = source {
+        ids.push(*id);
+        source = stmt;
+    }
+    for id in ids.into_iter().rev() {
+        replacement = CStmt::observed(id, replacement);
+    }
+    replacement
+}
+
+/// Move only a source expression's leading observation wrappers onto a
+/// replacement for that same occurrence.
+pub(crate) fn carry_outer_expr_observations(source: &CExpr, mut replacement: CExpr) -> CExpr {
+    let mut ids = Vec::new();
+    let mut source = source;
+    while let CExpr::Observed { id, expr } = source {
+        ids.push(*id);
+        source = expr;
+    }
+    for id in ids.into_iter().rev() {
+        replacement = CExpr::observed(id, replacement);
+    }
+    replacement
+}
+
+fn strip_stmt_observations(stmt: &mut CStmt) {
+    while let CStmt::Observed { id, stmt: inner } = stmt {
+        let _ = id;
+        *stmt = std::mem::replace(inner.as_mut(), CStmt::Empty);
+    }
+    match stmt {
+        CStmt::Observed { .. } => unreachable!("all leading observations were stripped"),
+        CStmt::Expr(expr) => strip_expr_observations(expr),
+        CStmt::Decl { init, .. } | CStmt::Return(init) => {
+            if let Some(expr) = init {
+                strip_expr_observations(expr);
+            }
+        }
+        CStmt::Block(stmts) => {
+            for stmt in stmts {
+                strip_stmt_observations(stmt);
+            }
+        }
+        CStmt::If {
+            cond,
+            then_body,
+            else_body,
+        } => {
+            strip_expr_observations(cond);
+            strip_stmt_observations(then_body);
+            if let Some(else_body) = else_body {
+                strip_stmt_observations(else_body);
+            }
+        }
+        CStmt::While { cond, body } => {
+            strip_expr_observations(cond);
+            strip_stmt_observations(body);
+        }
+        CStmt::DoWhile { body, cond } => {
+            strip_stmt_observations(body);
+            strip_expr_observations(cond);
+        }
+        CStmt::For {
+            init,
+            cond,
+            update,
+            body,
+        } => {
+            if let Some(init) = init {
+                strip_stmt_observations(init);
+            }
+            if let Some(cond) = cond {
+                strip_expr_observations(cond);
+            }
+            if let Some(update) = update {
+                strip_expr_observations(update);
+            }
+            strip_stmt_observations(body);
+        }
+        CStmt::Switch {
+            expr,
+            cases,
+            default,
+        } => {
+            strip_expr_observations(expr);
+            for case in cases {
+                strip_expr_observations(&mut case.value);
+                for stmt in &mut case.body {
+                    strip_stmt_observations(stmt);
+                }
+            }
+            if let Some(default) = default {
+                for stmt in default {
+                    strip_stmt_observations(stmt);
+                }
+            }
+        }
+        CStmt::Empty
+        | CStmt::Break
+        | CStmt::Continue
+        | CStmt::Goto(_)
+        | CStmt::Label(_)
+        | CStmt::Comment(_) => {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -897,5 +1876,209 @@ mod tests {
             panic!("expected binary expression");
         };
         assert_eq!(*left, CExpr::var(crate::symbol::declare(&symbols, "x")));
+    }
+
+    #[test]
+    fn observations_survive_recursive_expression_rewrites() {
+        fn rewrite(expr: CExpr) -> CExpr {
+            let expr = expr.map_children(&mut rewrite);
+            match expr {
+                CExpr::IntLit(1) => CExpr::IntLit(2),
+                other => other,
+            }
+        }
+
+        let mut owner = RenderObservationOwner::new();
+        let (id, observed_one) = owner
+            .observe_expr(CExpr::IntLit(1))
+            .expect("allocate observation");
+        let rewritten = rewrite(CExpr::binary(
+            BinaryOp::Add,
+            observed_one,
+            CExpr::IntLit(1),
+        ));
+        assert_eq!(
+            rewritten,
+            CExpr::binary(
+                BinaryOp::Add,
+                CExpr::observed(id, CExpr::IntLit(2)),
+                CExpr::IntLit(2),
+            )
+        );
+    }
+
+    #[test]
+    fn final_node_inspection_visits_subscript_markers_once() {
+        let mut owner = RenderObservationOwner::new();
+        let (base_id, base) = owner
+            .observe_expr(CExpr::IntLit(1))
+            .expect("base observation");
+        let (index_id, index) = owner
+            .observe_expr(CExpr::IntLit(2))
+            .expect("index observation");
+        let function = CFunction::new("inspect", CType::Void).with_body(vec![CStmt::Expr(
+            CExpr::Subscript {
+                base: Box::new(base),
+                index: Box::new(index),
+            },
+        )]);
+        let mut visited = Vec::new();
+        inspect_render_observations(
+            &function,
+            owner.expected_count(),
+            |id, node| -> Result<(), std::convert::Infallible> {
+                assert!(matches!(node, RenderObservationNode::Expr(CExpr::IntLit(_))));
+                visited.push(id);
+                Ok(())
+            },
+        )
+        .expect("valid marker inspection");
+        assert_eq!(visited, vec![base_id, index_id]);
+    }
+
+    #[test]
+    fn semantic_clones_and_aggregate_replacements_do_not_duplicate_ids() {
+        let mut owner = RenderObservationOwner::new();
+        let (left_id, left) = owner
+            .observe_expr(CExpr::IntLit(1))
+            .expect("left observation");
+        let (right_id, right) = owner
+            .observe_expr(CExpr::IntLit(2))
+            .expect("right observation");
+        let source = CExpr::binary(BinaryOp::Add, left, right);
+        assert_eq!(
+            source.clone_without_render_observations(),
+            CExpr::binary(BinaryOp::Add, CExpr::IntLit(1), CExpr::IntLit(2))
+        );
+        let replacement = carry_expr_render_observations(&source, CExpr::IntLit(3));
+        let mut function =
+            CFunction::new("fold", CType::Void).with_body(vec![CStmt::Expr(replacement)]);
+        let reachable = strip_render_observations(&mut function, owner.expected_count())
+            .expect("each carried ID occurs once");
+        assert_eq!(reachable.ids().collect::<Vec<_>>(), vec![left_id, right_id]);
+        assert_eq!(function.body, vec![CStmt::Expr(CExpr::IntLit(3))]);
+    }
+
+    #[test]
+    fn stripping_reports_only_reachable_observations_and_restores_the_ast() {
+        let mut plain =
+            CFunction::new("observed", CType::Int(32)).with_body(vec![CStmt::Block(vec![
+                CStmt::Expr(CExpr::binary(
+                    BinaryOp::Add,
+                    CExpr::IntLit(1),
+                    CExpr::IntLit(2),
+                )),
+            ])]);
+        let expected = plain.clone();
+        let mut owner = RenderObservationOwner::new();
+        let (nested_expr_id, nested_expr) = owner
+            .observe_expr(CExpr::IntLit(1))
+            .expect("allocate nested expression observation");
+        let (expr_id, expr) = owner
+            .observe_expr(CExpr::binary(
+                BinaryOp::Add,
+                nested_expr,
+                CExpr::IntLit(2),
+            ))
+            .expect("allocate expression observation");
+        let (stmt_id, stmt) = owner
+            .observe_stmt(CStmt::Block(vec![CStmt::Expr(expr)]))
+            .expect("allocate statement observation");
+        let (dropped_id, dropped_stmt) = owner
+            .observe_stmt(CStmt::Expr(CExpr::IntLit(99)))
+            .expect("allocate dropped observation");
+        plain.body = vec![
+            stmt,
+            dropped_stmt,
+        ];
+
+        plain.body.pop();
+        let reachable = strip_render_observations(&mut plain, owner.expected_count())
+            .expect("valid observation domain");
+
+        assert_eq!(
+            reachable.ids().collect::<Vec<_>>(),
+            vec![nested_expr_id, expr_id, stmt_id],
+            "dense-ID order is independent of AST traversal order"
+        );
+        assert!(!reachable.contains(dropped_id));
+        assert_eq!(plain, expected);
+        assert_eq!(expr_id.index(), 1);
+    }
+
+    #[test]
+    fn observations_are_rejected_by_serde_until_the_boundary_strips_them() {
+        let mut owner = RenderObservationOwner::new();
+        let (id, stmt) = owner
+            .observe_stmt(CStmt::Expr(CExpr::IntLit(1)))
+            .expect("allocate observation");
+        let mut function = CFunction::new("observed", CType::Void).with_body(vec![stmt]);
+
+        assert!(serde_json::to_string(&function).is_err());
+        assert!(
+            serde_json::from_str::<CStmt>(
+                r#"{"Observed":{"id":0,"stmt":{"Expr":{"IntLit":1}}}}"#,
+            )
+            .is_err()
+        );
+
+        let reachable = strip_render_observations(&mut function, owner.expected_count())
+            .expect("valid observation domain");
+        assert_eq!(reachable.ids().collect::<Vec<_>>(), vec![id]);
+        let stripped = serde_json::to_string(&function).expect("serialize stripped AST");
+        assert!(!stripped.contains("Observed"));
+    }
+
+    #[test]
+    fn stripping_rejects_duplicate_and_out_of_range_observations_without_mutation() {
+        let duplicate = RenderObservationId::from_index(0);
+        let mut duplicate_function = CFunction::new("duplicate", CType::Void).with_body(vec![
+            CStmt::observed(
+                duplicate,
+                CStmt::Expr(CExpr::observed(duplicate, CExpr::IntLit(1))),
+            ),
+        ]);
+        let duplicate_before = duplicate_function.clone();
+        assert_eq!(
+            strip_render_observations(&mut duplicate_function, 1),
+            Err(RenderObservationStripError::Duplicate { id: duplicate })
+        );
+        assert_eq!(duplicate_function, duplicate_before);
+
+        let out_of_range = RenderObservationId::from_index(1);
+        let mut out_of_range_function = CFunction::new("range", CType::Void).with_body(vec![
+            CStmt::observed(out_of_range, CStmt::Empty),
+        ]);
+        let out_of_range_before = out_of_range_function.clone();
+        assert_eq!(
+            strip_render_observations(&mut out_of_range_function, 1),
+            Err(RenderObservationStripError::OutOfRange {
+                id: out_of_range,
+                expected_count: 1,
+            })
+        );
+        assert_eq!(out_of_range_function, out_of_range_before);
+
+        #[cfg(target_pointer_width = "64")]
+        {
+            let mut empty = CFunction::new("large", CType::Void);
+            let expected_count = usize::try_from(u64::from(u32::MAX) + 1).unwrap();
+            assert_eq!(
+                strip_render_observations(&mut empty, expected_count),
+                Err(RenderObservationStripError::DomainTooLarge { expected_count })
+            );
+        }
+    }
+
+    #[test]
+    fn transparent_equality_ignores_nested_observations() {
+        let mut owner = RenderObservationOwner::new();
+        let (_, nested) = owner
+            .observe_expr(CExpr::IntLit(1))
+            .expect("allocate nested observation");
+        let plain = CExpr::binary(BinaryOp::Add, CExpr::IntLit(1), CExpr::IntLit(2));
+        let wrapped = CExpr::binary(BinaryOp::Add, nested, CExpr::IntLit(2));
+        assert!(plain.transparently_eq(&wrapped));
+        assert!(wrapped.transparently_eq(&plain));
     }
 }

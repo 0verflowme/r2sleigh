@@ -42,25 +42,29 @@ impl<'a> CallIndex<'a> {
         Self {
             entries: call_exprs
                 .iter()
-                .filter(|(_, expr)| matches!(expr, CExpr::Call { .. }))
+                .filter(|(_, expr)| matches!(expr.unobserved(), CExpr::Call { .. }))
                 .map(|(source, expr)| (expr, *source))
                 .collect(),
         }
     }
 
     fn source_of(&self, expr: &CExpr) -> Option<Source> {
+        let semantic_expr = expr.unobserved();
         // A call that knows its site says which site it is. Comparing shapes
         // only works while every layer builds the same expression for a call,
         // and they do not: the analysis layer and the fold each build their own.
-        if let CExpr::Call { site: Some(site), .. } = expr {
+        if let CExpr::Call {
+            site: Some(site), ..
+        } = semantic_expr
+        {
             return Some(*site);
         }
-        if !matches!(expr, CExpr::Call { .. }) {
+        if !matches!(semantic_expr, CExpr::Call { .. }) {
             return None;
         }
         let mut found = None;
         for (candidate, source) in &self.entries {
-            if *candidate == expr {
+            if candidate.transparently_eq(expr) {
                 if found.is_some() {
                     return None;
                 }
@@ -138,7 +142,7 @@ fn drop_bare_statements_for_bound_sites(
     index: &CallIndex<'_>,
     bound: &BTreeMap<Source, crate::symbol::SymbolId>,
 ) {
-    body.retain(|stmt| match stmt {
+    body.retain(|stmt| match stmt.unobserved() {
         CStmt::Expr(expr) => index
             .source_of(expr)
             .is_none_or(|source| !bound.contains_key(&source)),
@@ -174,12 +178,8 @@ fn collect_assignment_names(
     repeated: &[Source],
     out: &mut BTreeMap<Source, crate::symbol::SymbolId>,
 ) {
-    if let CStmt::Expr(CExpr::Binary {
-        op: BinaryOp::Assign,
-        left,
-        right,
-    }) = stmt
-        && let CExpr::Var(name) = left.as_ref()
+    if let Some((left, right)) = assignment_parts(stmt)
+        && let CExpr::Var(name) = left.unobserved()
         && let Some(source) = index.source_of(right)
         && repeated.contains(&source)
     {
@@ -190,6 +190,21 @@ fn collect_assignment_names(
             collect_assignment_names(inner, index, repeated, out);
         }
     });
+}
+
+fn assignment_parts(stmt: &CStmt) -> Option<(&CExpr, &CExpr)> {
+    let CStmt::Expr(expr) = stmt.unobserved() else {
+        return None;
+    };
+    let CExpr::Binary {
+        op: BinaryOp::Assign,
+        left,
+        right,
+    } = expr.unobserved()
+    else {
+        return None;
+    };
+    Some((left, right))
 }
 
 fn rewrite_block(
@@ -207,12 +222,8 @@ fn rewrite_block(
         // binding this pass would otherwise have to invent, so it is adopted
         // rather than duplicated -- unless the site is bound already, in which
         // case the assignment is a second evaluation and becomes a copy.
-        if let CStmt::Expr(CExpr::Binary {
-            op: BinaryOp::Assign,
-            left,
-            right,
-        }) = &stmt
-            && let CExpr::Var(name) = left.as_ref()
+        if let Some((left, right)) = assignment_parts(&stmt)
+            && let CExpr::Var(name) = left.unobserved()
             && let Some(source) = index.source_of(right)
             && repeated.contains(&source)
             && !bound.contains_key(&source)
@@ -225,11 +236,11 @@ fn rewrite_block(
         // A second assignment of an already-bound site is a second evaluation
         // of it. Rewriting turns the right-hand side into the bound name, and
         // what is left says only that the variable still holds what it holds.
-        let reassigns_bound_site = matches!(
-            &stmt,
-            CStmt::Expr(CExpr::Binary { op: BinaryOp::Assign, right, .. })
-                if index.source_of(right).is_some_and(|source| bound.contains_key(&source))
-        );
+        let reassigns_bound_site = assignment_parts(&stmt).is_some_and(|(_, right)| {
+            index
+                .source_of(right)
+                .is_some_and(|source| bound.contains_key(&source))
+        });
 
         let mut hoists: Vec<CStmt> = Vec::new();
         for_each_expr_mut(&mut stmt, &mut |expr| {
@@ -251,7 +262,8 @@ fn rewrite_block(
         if reassigns_bound_site && is_self_assignment(&stmt) {
             continue;
         }
-        if matches!(&stmt, CStmt::Expr(CExpr::Var(_))) {
+        if matches!(stmt.unobserved(), CStmt::Expr(expr) if matches!(expr.unobserved(), CExpr::Var(_)))
+        {
             continue;
         }
 
@@ -272,16 +284,11 @@ fn rewrite_block(
 }
 
 fn is_self_assignment(stmt: &CStmt) -> bool {
-    let CStmt::Expr(CExpr::Binary {
-        op: BinaryOp::Assign,
-        left,
-        right,
-    }) = stmt
-    else {
+    let Some((left, right)) = assignment_parts(stmt) else {
         return false;
     };
     matches!(
-        (left.as_ref(), right.as_ref()),
+        (left.unobserved(), right.unobserved()),
         (CExpr::Var(target), CExpr::Var(value)) if target == value
     )
 }
@@ -311,7 +318,7 @@ fn rewrite_expr(
     }
 
     if let Some(name) = bound.get(&source) {
-        *expr = CExpr::Var(name.clone());
+        *expr = crate::ast::carry_outer_expr_observations(expr, CExpr::Var(*name));
         return;
     }
 
@@ -337,8 +344,8 @@ fn introduced_name_for(
     introduced: &[crate::symbol::SymbolId],
     symbols: &crate::symbol::SymbolTable,
 ) -> String {
-    let callee = match expr {
-        CExpr::Call { func, .. } => match func.as_ref() {
+    let callee = match expr.unobserved() {
+        CExpr::Call { func, .. } => match func.unobserved() {
             CExpr::Var(id) => {
                 let name = symbols.name(*id);
                 let tail = name.rsplit('.').next().unwrap_or(name);
@@ -375,6 +382,7 @@ fn introduced_name_for(
 
 pub(crate) fn children_mut(expr: &mut CExpr) -> Vec<&mut CExpr> {
     match expr {
+        CExpr::Observed { expr, .. } => vec![expr.as_mut()],
         CExpr::IntLit(_)
         | CExpr::UIntLit(_)
         | CExpr::FloatLit(_)
@@ -407,6 +415,7 @@ pub(crate) fn children_mut(expr: &mut CExpr) -> Vec<&mut CExpr> {
 
 fn for_each_expr(stmt: &CStmt, f: &mut impl FnMut(&CExpr)) {
     match stmt {
+        CStmt::Observed { stmt, .. } => for_each_expr(stmt, f),
         CStmt::Expr(expr) | CStmt::Return(Some(expr)) => f(expr),
         CStmt::Decl {
             init: Some(expr), ..
@@ -428,6 +437,7 @@ fn for_each_expr(stmt: &CStmt, f: &mut impl FnMut(&CExpr)) {
 
 pub(crate) fn for_each_expr_mut(stmt: &mut CStmt, f: &mut impl FnMut(&mut CExpr)) {
     match stmt {
+        CStmt::Observed { stmt, .. } => for_each_expr_mut(stmt, f),
         CStmt::Expr(expr) | CStmt::Return(Some(expr)) => f(expr),
         CStmt::Decl {
             init: Some(expr), ..
@@ -449,6 +459,7 @@ pub(crate) fn for_each_expr_mut(stmt: &mut CStmt, f: &mut impl FnMut(&mut CExpr)
 
 pub(crate) fn for_each_child_block(stmt: &CStmt, f: &mut impl FnMut(&[CStmt])) {
     match stmt {
+        CStmt::Observed { stmt, .. } => for_each_child_block(stmt, f),
         CStmt::Block(stmts) => f(stmts),
         CStmt::If {
             then_body,
@@ -490,6 +501,7 @@ pub(crate) fn for_each_child_block_mut(
 ) {
     fn as_block(body: &mut Box<CStmt>, f: &mut impl FnMut(&mut Vec<CStmt>, bool), shares: bool) {
         match body.as_mut() {
+            CStmt::Observed { stmt, .. } => as_block(stmt, f, shares),
             CStmt::Block(stmts) => f(stmts, shares),
             other => {
                 let mut stmts = vec![std::mem::replace(other, CStmt::Empty)];
@@ -504,6 +516,7 @@ pub(crate) fn for_each_child_block_mut(
     }
 
     match stmt {
+        CStmt::Observed { stmt, .. } => for_each_child_block_mut(stmt, f),
         CStmt::Block(stmts) => f(stmts, true),
         CStmt::If {
             then_body,
@@ -535,7 +548,9 @@ pub(crate) fn for_each_child_block_mut(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ast::{CLocal, CParam, CType};
+    use crate::ast::{
+        CLocal, CParam, CType, RenderObservationOwner, strip_render_observations,
+    };
 
     /// The names a fixture in this module declares.
     fn test_table() -> std::cell::RefCell<crate::symbol::SymbolTable> {
@@ -724,5 +739,31 @@ mod tests {
 
         assert_eq!(func.body, before);
         assert!(func.locals.is_empty());
+    }
+
+    #[test]
+    fn observations_follow_rewritten_occurrences_and_deleted_ones_disappear() {
+        let symbols = test_table();
+        let mut observations = RenderObservationOwner::new();
+        let (dropped, dropped_stmt) = observations
+            .observe_stmt(CStmt::Expr(call(&symbols, "fcn.1000")))
+            .unwrap();
+        let (surviving, surviving_expr) = observations
+            .observe_expr(call(&symbols, "fcn.1000"))
+            .unwrap();
+        let mut func = function_from(
+            &symbols,
+            vec![
+                dropped_stmt,
+                CStmt::Return(Some(surviving_expr)),
+            ],
+        );
+
+        bind_each_call_site_once(&mut func, &one_site(&symbols));
+        let reachable = strip_render_observations(&mut func, observations.expected_count())
+            .expect("single-evaluation rewriting must preserve unique observation IDs");
+
+        assert_eq!(reachable.ids().collect::<Vec<_>>(), vec![surviving]);
+        assert!(!reachable.contains(dropped));
     }
 }

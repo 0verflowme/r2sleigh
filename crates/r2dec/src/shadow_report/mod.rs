@@ -37,6 +37,8 @@ pub(crate) struct LegacyBindingId(pub(crate) u32);
 pub(crate) enum LegacyValueObservation {
     Bound { binding: LegacyBindingId },
     InlineConstant,
+    /// A surviving expression that is not a source-backed literal proof.
+    InlineNonLiteral,
     Elided,
     Refused(ValueRefusal),
     LegacyAbsent,
@@ -146,6 +148,32 @@ impl LegacyAnalysisSnapshot {
             .collect::<Vec<_>>()
             .into_boxed_slice();
         Self::new(source, values, uses, writes)
+    }
+
+    pub(crate) fn value_observation(
+        &self,
+        value: ValueId,
+    ) -> Option<LegacyValueObservation> {
+        self.values
+            .get(value.0 as usize)
+            .filter(|cell| cell.value == value)
+            .map(|cell| cell.observation)
+    }
+
+    pub(crate) fn use_observation(&self, site: UseSite) -> Option<LegacyUseObservation> {
+        self.uses
+            .get(site.inst.0 as usize)?
+            .get(site.input_idx)
+            .filter(|cell| cell.site == site)
+            .map(|cell| cell.observation)
+    }
+
+    pub(crate) fn write_observation(&self, inst: InstId) -> Option<LegacyWriteObservation> {
+        self.writes
+            .get(inst.0 as usize)?
+            .as_ref()
+            .filter(|cell| cell.inst == inst)
+            .map(|cell| cell.observation)
     }
 }
 

@@ -151,7 +151,10 @@ fn split_ssa_suffix(name: &str) -> Option<(&str, &str)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ast::{BinaryOp, CExpr, CLocal, CParam, CStmt, CType, SwitchCase};
+    use crate::ast::{
+        BinaryOp, CExpr, CLocal, CParam, CStmt, CType, RenderObservationOwner, SwitchCase,
+        strip_render_observations,
+    };
     use crate::symbol::{SymbolTable, var_ref};
     use std::cell::RefCell;
 
@@ -196,6 +199,26 @@ mod tests {
         rewrite(&mut func);
         assert!(spells(&func, "eax"));
         assert!(!spells(&func, "eax_3"));
+    }
+
+    #[test]
+    fn renaming_keeps_observation_wrapped_occurrences_reachable() {
+        let symbols = table();
+        let mut observations = RenderObservationOwner::new();
+        let mut func = mk_func(symbols, Vec::new());
+        let value = func.symbols.borrow_mut().declare_or_reuse("eax_3");
+        let (expr_id, expr) = observations.observe_expr(CExpr::Var(value)).unwrap();
+        let (stmt_id, stmt) = observations
+            .observe_stmt(CStmt::Return(Some(expr)))
+            .unwrap();
+        func.body = vec![stmt];
+
+        rewrite(&mut func);
+        let reachable = strip_render_observations(&mut func, observations.expected_count())
+            .expect("renaming must preserve unique observation IDs");
+
+        assert_eq!(reachable.ids().collect::<Vec<_>>(), vec![expr_id, stmt_id]);
+        assert!(spells(&func, "eax"));
     }
 
     #[test]

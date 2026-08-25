@@ -607,7 +607,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         let Some(op_idx) = block.ops.len().checked_sub(1) else {
             return;
         };
-        self.fold_ctx.record_effect_render_proof_for_value(
+        self.fold_ctx.record_effect_render_proof_for_normalized_value(
             crate::fold::context::EffectRenderProofKind::Expression,
             anchor,
             op_idx,
@@ -1985,9 +1985,9 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                     successors.len()
                 ));
             };
-            if !block.ops.iter().all(|op| {
+            if !block.ops.iter().enumerate().all(|(op_idx, op)| {
                 self.is_transparent_branch_forwarder_op(op)
-                    || self.is_materialized_phi_edge_copy(current, *next, op)
+                    || self.is_materialized_phi_edge_copy(current, op_idx, *next)
             }) {
                 return Err(format!(
                     "forwarder block 0x{current:x} owns live non-phi SSA effects"
@@ -2429,11 +2429,14 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
     /// Recursively clean up children first, then apply local simplifications.
     fn cleanup_recurse(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, stmt: CStmt) -> CStmt {
         match stmt {
+            CStmt::Observed { id, stmt } => {
+                CStmt::observed(id, Self::cleanup_recurse(symbols, *stmt))
+            }
             CStmt::Block(stmts) => {
                 let cleaned = stmts
                     .into_iter()
                     .map(|x| Self::cleanup_recurse(symbols, x))
-                    .filter(|s| !matches!(s, CStmt::Empty))
+                    .filter(|s| !matches!(s.unobserved(), CStmt::Empty))
                     .collect();
                 let cleaned = Self::rewrite_block_tail_guard_clauses(cleaned);
                 let cleaned = Self::rewrite_guarded_switch_if_else(cleaned);
@@ -2457,7 +2460,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                 let then_body = Box::new(Self::cleanup_recurse(symbols, *then_body));
                 let else_body = else_body
                     .map(|e| Box::new(Self::cleanup_recurse(symbols, *e)))
-                    .and_then(|e| (!matches!(*e, CStmt::Empty)).then_some(e));
+                    .and_then(|e| (!matches!(e.unobserved(), CStmt::Empty)).then_some(e));
                 let stmt = CStmt::If {
                     cond,
                     then_body,
@@ -2532,12 +2535,15 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         let cleaned = stmts
             .into_iter()
             .map(|x| Self::cleanup_recurse(symbols, x))
-            .filter(|stmt| !matches!(stmt, CStmt::Empty))
+            .filter(|stmt| !matches!(stmt.unobserved(), CStmt::Empty))
             .collect();
         Self::truncate_dead_straight_line_tail(cleaned)
     }
 
     fn rewrite_compound_assignment_expr(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, expr: CExpr) -> CExpr {
+        if let CExpr::Observed { id, expr } = expr {
+            return CExpr::observed(id, Self::rewrite_compound_assignment_expr(symbols, *expr));
+        }
         let CExpr::Binary {
             op: BinaryOp::Assign,
             left,
@@ -2625,7 +2631,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         expr: &CExpr,
         target_name: &str,
     ) -> bool {
-        matches!(expr, CExpr::Var(name) if &*crate::symbol::spelling(symbols, *name) == target_name)
+        matches!(expr.unobserved(), CExpr::Var(name) if &*crate::symbol::spelling(symbols, *name) == target_name)
     }
 
     fn is_assignment_like_op(op: BinaryOp) -> bool {
@@ -2651,21 +2657,23 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
     }
 
     fn is_const_true_expr(expr: &CExpr) -> bool {
-        matches!(expr, CExpr::IntLit(1) | CExpr::UIntLit(1))
+        matches!(expr.unobserved(), CExpr::IntLit(1) | CExpr::UIntLit(1))
     }
 
     fn is_const_false_expr(expr: &CExpr) -> bool {
-        matches!(expr, CExpr::IntLit(0) | CExpr::UIntLit(0))
+        matches!(expr.unobserved(), CExpr::IntLit(0) | CExpr::UIntLit(0))
     }
 
     fn rewrite_if_short_circuit(stmt: CStmt) -> CStmt {
+        let source = stmt;
+        let semantic = source.clone_without_render_observations();
         let CStmt::If {
             cond,
             then_body,
             else_body,
-        } = stmt
+        } = semantic
         else {
-            return stmt;
+            return source;
         };
 
         let then_stmt = (*then_body).clone();
@@ -2679,11 +2687,12 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                 else_body: None,
             } = &then_stmt
         {
-            return CStmt::If {
+            let rewritten = CStmt::If {
                 cond: CExpr::binary(BinaryOp::And, cond, inner_cond.clone()),
                 then_body: inner_then.clone(),
                 else_body: None,
             };
+            return crate::ast::carry_render_observations(&[source], rewritten);
         }
 
         // if (a) { T } else if (b) { T } -> if (a || b) { T }
@@ -2692,13 +2701,14 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             then_body: right_then,
             else_body: None,
         }) = else_stmt.as_ref()
-            && then_stmt == **right_then
+            && Self::stmt_transparently_eq(&then_stmt, right_then)
         {
-            return CStmt::If {
+            let rewritten = CStmt::If {
                 cond: CExpr::binary(BinaryOp::Or, cond, right_cond.clone()),
                 then_body: Box::new(then_stmt),
                 else_body: None,
             };
+            return crate::ast::carry_render_observations(&[source], rewritten);
         }
 
         // if (a) { if (b) { T } } else { T } -> if (!a || b) { T }
@@ -2708,9 +2718,9 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             else_body: None,
         } = &then_stmt
             && let Some(outer_else) = else_stmt.as_ref()
-            && *outer_else == **inner_then
+            && Self::stmt_transparently_eq(outer_else, inner_then)
         {
-            return CStmt::If {
+            let rewritten = CStmt::If {
                 cond: CExpr::binary(
                     BinaryOp::Or,
                     Self::negate_condition(cond),
@@ -2719,6 +2729,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                 then_body: inner_then.clone(),
                 else_body: None,
             };
+            return crate::ast::carry_render_observations(&[source], rewritten);
         }
 
         // if (a) { if (b) { T } else { E } } else { E } -> if (a && b) { T } else { E }
@@ -2728,20 +2739,17 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             else_body: Some(inner_else),
         } = &then_stmt
             && let Some(outer_else) = else_stmt.as_ref()
-            && *outer_else == **inner_else
+            && Self::stmt_transparently_eq(outer_else, inner_else)
         {
-            return CStmt::If {
+            let rewritten = CStmt::If {
                 cond: CExpr::binary(BinaryOp::And, cond, inner_cond.clone()),
                 then_body: inner_then.clone(),
                 else_body: Some(inner_else.clone()),
             };
+            return crate::ast::carry_render_observations(&[source], rewritten);
         }
 
-        CStmt::If {
-            cond,
-            then_body,
-            else_body,
-        }
+        source
     }
 
     fn rewrite_if_condition_inversion(stmt: CStmt) -> CStmt {
@@ -2796,7 +2804,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             return stmt;
         };
 
-        if matches!(then_body.as_ref(), CStmt::Empty) {
+        if matches!(then_body.unobserved(), CStmt::Empty) {
             return match else_body {
                 Some(else_body) => CStmt::If {
                     cond: Self::negate_condition(cond),
@@ -2844,7 +2852,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
     }
 
     fn single_return_expr(stmt: &CStmt) -> Option<CExpr> {
-        match stmt {
+        match stmt.unobserved() {
             CStmt::Return(Some(expr)) => Some(expr.clone()),
             CStmt::Block(stmts) if stmts.len() == 1 => Self::single_return_expr(&stmts[0]),
             _ => None,
@@ -2863,7 +2871,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
     }
 
     fn zero_compare_operand(cond: &CExpr) -> Option<(&CExpr, bool)> {
-        match cond {
+        match cond.unobserved() {
             CExpr::Paren(inner) | CExpr::Cast { expr: inner, .. } => {
                 Self::zero_compare_operand(inner)
             }
@@ -2882,16 +2890,16 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
     }
 
     fn is_zero_literal(expr: &CExpr) -> bool {
-        matches!(expr, CExpr::IntLit(0) | CExpr::UIntLit(0))
+        matches!(expr.unobserved(), CExpr::IntLit(0) | CExpr::UIntLit(0))
     }
 
     fn expr_divides_by(expr: &CExpr, denominator: &CExpr) -> bool {
-        match expr {
+        match expr.unobserved() {
             CExpr::Binary {
                 op: BinaryOp::Div,
                 right,
                 ..
-            } => right.as_ref() == denominator,
+            } => right.transparently_eq(denominator),
             CExpr::Paren(inner) | CExpr::Cast { expr: inner, .. } => {
                 Self::expr_divides_by(inner, denominator)
             }
@@ -3269,9 +3277,9 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             let [successor] = successors.as_slice() else {
                 return None;
             };
-            if !block.ops.iter().all(|op| {
+            if !block.ops.iter().enumerate().all(|(op_idx, op)| {
                 self.is_transparent_branch_forwarder_op(op)
-                    || self.is_materialized_phi_edge_copy(current, *successor, op)
+                    || self.is_materialized_phi_edge_copy(current, op_idx, *successor)
             }) {
                 return None;
             }
@@ -3293,9 +3301,9 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         let [successor] = successors.as_slice() else {
             return None;
         };
-        if !block.ops.iter().all(|op| {
+        if !block.ops.iter().enumerate().all(|(op_idx, op)| {
             self.is_transparent_branch_forwarder_op(op)
-                || self.is_materialized_phi_edge_copy(addr, *successor, op)
+                || self.is_materialized_phi_edge_copy(addr, op_idx, *successor)
         }) {
             return None;
         }
@@ -3310,25 +3318,26 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             .then_some(*successor)
     }
 
-    fn is_materialized_phi_edge_copy(&self, pred_addr: u64, successor: u64, op: &SSAOp) -> bool {
-        let SSAOp::Copy { dst, src } = op else {
-            return false;
-        };
-        self.func.get_block(successor).is_some_and(|block| {
-            block.phis.iter().any(|phi| {
-                phi.dst == *dst
-                    && phi
-                        .sources
-                        .iter()
-                        .any(|(pred, value)| *pred == pred_addr && value == src)
-            })
-        })
+    fn is_materialized_phi_edge_copy(&self, pred_addr: u64, op_idx: usize, successor: u64) -> bool {
+        self.fold_ctx
+            .is_unconditional_materialized_phi_edge_copy(pred_addr, op_idx, successor)
     }
 
     fn is_transparent_branch_forwarder_op(&self, op: &SSAOp) -> bool {
         match op {
             SSAOp::Branch { .. } | SSAOp::Nop => true,
-            SSAOp::Copy { dst, .. } => !self.func.has_noncarrier_use(dst),
+            // A copy with no reader is dead and therefore transparent. Any
+            // copy feeding a phi or another carrier is transparent only when
+            // the sealed normalization origin above identifies that exact
+            // occurrence; operation shape is not proof of a transformed edge.
+            SSAOp::Copy { dst, .. } => {
+                self.func.find_uses(dst).is_empty()
+                    && !self.func.blocks().any(|block| {
+                        block.phis.iter().any(|phi| {
+                            phi.dst == *dst || phi.sources.iter().any(|(_, src)| src == dst)
+                        })
+                    })
+            }
             _ => false,
         }
     }
@@ -3523,7 +3532,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
     }
 
     fn record_return_value_render_proof(&self, block_addr: u64, op_idx: usize, value: ValueId) {
-        self.fold_ctx.record_effect_render_proof_for_value(
+        self.fold_ctx.record_effect_render_proof_for_source_value(
             EffectRenderProofKind::Return,
             block_addr,
             op_idx,
@@ -3542,7 +3551,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                 )
             })
         {
-            self.fold_ctx.record_effect_render_proof_for_memory(
+            self.fold_ctx.record_effect_render_proof_for_source_memory(
                 EffectRenderProofKind::MemoryRead,
                 read_block,
                 read_op,
@@ -3636,13 +3645,18 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                 && Self::single_terminator_stmt(then_body.as_ref()).is_none()
                 && !matches!(then_body.as_ref(), CStmt::Empty)
             {
-                rewritten.push(CStmt::If {
-                    cond: Self::negate_condition(cond.clone()),
-                    then_body: Box::new(terminator),
+                let sources = [stmts[i].clone(), stmts[i + 1].clone()];
+                let guard = CStmt::If {
+                    cond: Self::negate_condition(cond.clone_without_render_observations()),
+                    then_body: Box::new(terminator.clone_without_render_observations()),
                     else_body: None,
-                });
-                Self::append_stmt_body_flat(&mut rewritten, (**then_body).clone());
-                rewritten.push(stmts[i + 1].clone());
+                };
+                rewritten.push(crate::ast::carry_render_observations(&sources, guard));
+                Self::append_stmt_body_flat(
+                    &mut rewritten,
+                    then_body.clone_without_render_observations(),
+                );
+                rewritten.push(stmts[i + 1].clone_without_render_observations());
                 i += 2;
                 continue;
             }
@@ -3743,12 +3757,22 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
     ) -> Vec<CStmt> {
         let mut common_suffix = Vec::new();
         while then_stmts.last().is_some()
-            && then_stmts.last() == else_stmts.last()
+            && then_stmts
+                .last()
+                .zip(else_stmts.last())
+                .is_some_and(|(then_stmt, else_stmt)| {
+                    Self::stmt_transparently_eq(then_stmt, else_stmt)
+                })
             && !Self::stmt_list_contains_control_transfer(&then_stmts[..then_stmts.len() - 1])
             && !Self::stmt_list_contains_control_transfer(&else_stmts[..else_stmts.len() - 1])
         {
-            common_suffix.push(then_stmts.pop().expect("then suffix"));
-            else_stmts.pop();
+            let then_suffix = then_stmts.pop().expect("then suffix");
+            let else_suffix = else_stmts.pop().expect("else suffix");
+            let semantic_suffix = then_suffix.clone_without_render_observations();
+            common_suffix.push(crate::ast::carry_render_observations(
+                &[then_suffix, else_suffix],
+                semantic_suffix,
+            ));
         }
         common_suffix.reverse();
 
@@ -3777,6 +3801,160 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         out
     }
 
+    fn stmt_transparently_eq(left: &CStmt, right: &CStmt) -> bool {
+        let left = left.unobserved();
+        let right = right.unobserved();
+        match (left, right) {
+            (CStmt::Empty, CStmt::Empty)
+            | (CStmt::Break, CStmt::Break)
+            | (CStmt::Continue, CStmt::Continue) => true,
+            (CStmt::Expr(left), CStmt::Expr(right)) => left.transparently_eq(right),
+            (
+                CStmt::Decl {
+                    ty: left_ty,
+                    name: left_name,
+                    init: left_init,
+                },
+                CStmt::Decl {
+                    ty: right_ty,
+                    name: right_name,
+                    init: right_init,
+                },
+            ) => {
+                left_ty == right_ty
+                    && left_name == right_name
+                    && match (left_init, right_init) {
+                        (Some(left), Some(right)) => left.transparently_eq(right),
+                        (None, None) => true,
+                        _ => false,
+                    }
+            }
+            (CStmt::Block(left), CStmt::Block(right)) => {
+                Self::stmt_slices_transparently_eq(left, right)
+            }
+            (
+                CStmt::If {
+                    cond: left_cond,
+                    then_body: left_then,
+                    else_body: left_else,
+                },
+                CStmt::If {
+                    cond: right_cond,
+                    then_body: right_then,
+                    else_body: right_else,
+                },
+            ) => {
+                left_cond.transparently_eq(right_cond)
+                    && Self::stmt_transparently_eq(left_then, right_then)
+                    && match (left_else, right_else) {
+                        (Some(left), Some(right)) => Self::stmt_transparently_eq(left, right),
+                        (None, None) => true,
+                        _ => false,
+                    }
+            }
+            (
+                CStmt::While {
+                    cond: left_cond,
+                    body: left_body,
+                },
+                CStmt::While {
+                    cond: right_cond,
+                    body: right_body,
+                },
+            )
+            | (
+                CStmt::DoWhile {
+                    body: left_body,
+                    cond: left_cond,
+                },
+                CStmt::DoWhile {
+                    body: right_body,
+                    cond: right_cond,
+                },
+            ) => {
+                left_cond.transparently_eq(right_cond)
+                    && Self::stmt_transparently_eq(left_body, right_body)
+            }
+            (
+                CStmt::For {
+                    init: left_init,
+                    cond: left_cond,
+                    update: left_update,
+                    body: left_body,
+                },
+                CStmt::For {
+                    init: right_init,
+                    cond: right_cond,
+                    update: right_update,
+                    body: right_body,
+                },
+            ) => {
+                let init_equal = match (left_init, right_init) {
+                    (Some(left), Some(right)) => Self::stmt_transparently_eq(left, right),
+                    (None, None) => true,
+                    _ => false,
+                };
+                let cond_equal = match (left_cond, right_cond) {
+                    (Some(left), Some(right)) => left.transparently_eq(right),
+                    (None, None) => true,
+                    _ => false,
+                };
+                let update_equal = match (left_update, right_update) {
+                    (Some(left), Some(right)) => left.transparently_eq(right),
+                    (None, None) => true,
+                    _ => false,
+                };
+                init_equal
+                    && cond_equal
+                    && update_equal
+                    && Self::stmt_transparently_eq(left_body, right_body)
+            }
+            (
+                CStmt::Switch {
+                    expr: left_expr,
+                    cases: left_cases,
+                    default: left_default,
+                },
+                CStmt::Switch {
+                    expr: right_expr,
+                    cases: right_cases,
+                    default: right_default,
+                },
+            ) => {
+                left_expr.transparently_eq(right_expr)
+                    && left_cases.len() == right_cases.len()
+                    && left_cases.iter().zip(right_cases).all(|(left, right)| {
+                        left.value.transparently_eq(&right.value)
+                            && Self::stmt_slices_transparently_eq(&left.body, &right.body)
+                    })
+                    && match (left_default, right_default) {
+                        (Some(left), Some(right)) => {
+                            Self::stmt_slices_transparently_eq(left, right)
+                        }
+                        (None, None) => true,
+                        _ => false,
+                    }
+            }
+            (CStmt::Return(left), CStmt::Return(right)) => match (left, right) {
+                (Some(left), Some(right)) => left.transparently_eq(right),
+                (None, None) => true,
+                _ => false,
+            },
+            (CStmt::Goto(left), CStmt::Goto(right))
+            | (CStmt::Label(left), CStmt::Label(right))
+            | (CStmt::Comment(left), CStmt::Comment(right)) => left == right,
+            _ => false,
+        }
+    }
+
+    fn stmt_slices_transparently_eq(left: &[CStmt], right: &[CStmt]) -> bool {
+        left.len() == right.len()
+            && left
+                .iter()
+                .zip(right)
+                .all(|(left, right)| Self::stmt_transparently_eq(left, right))
+    }
+
     fn stmt_list_contains_control_transfer(stmts: &[CStmt]) -> bool {
         stmts.iter().any(Self::stmt_contains_control_transfer)
     }
@@ -3785,7 +3963,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         if Self::stmt_is_unconditional_terminator(stmt) {
             return true;
         }
-        match stmt {
+        match stmt.unobserved() {
             CStmt::Block(stmts) => Self::stmt_list_contains_control_transfer(stmts),
             CStmt::If {
                 then_body,
@@ -3814,14 +3992,23 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
 
     fn split_trailing_update_continue(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, stmt: CStmt) -> Option<(Vec<CStmt>, CStmt)> {
         let mut stmts = Self::stmt_into_vec(stmt);
-        while matches!(stmts.last(), Some(CStmt::Empty)) {
+        while stmts
+            .last()
+            .is_some_and(|stmt| matches!(stmt.unobserved(), CStmt::Empty))
+        {
             stmts.pop();
         }
-        if !matches!(stmts.last(), Some(CStmt::Continue)) {
+        if !stmts
+            .last()
+            .is_some_and(|stmt| matches!(stmt.unobserved(), CStmt::Continue))
+        {
             return None;
         }
         stmts.pop();
-        while matches!(stmts.last(), Some(CStmt::Empty)) {
+        while stmts
+            .last()
+            .is_some_and(|stmt| matches!(stmt.unobserved(), CStmt::Empty))
+        {
             stmts.pop();
         }
         while stmts
@@ -3829,7 +4016,10 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             .is_some_and(|x| Self::is_generated_side_effect_free_assignment(symbols, x))
         {
             stmts.pop();
-            while matches!(stmts.last(), Some(CStmt::Empty)) {
+            while stmts
+                .last()
+                .is_some_and(|stmt| matches!(stmt.unobserved(), CStmt::Empty))
+            {
                 stmts.pop();
             }
         }
@@ -3839,13 +4029,15 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
 
     fn strip_trailing_for_update(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, body: CStmt, update: &CExpr) -> CStmt {
         let mut stmts = Self::stmt_into_vec(body);
-        while matches!(stmts.last(), Some(CStmt::Empty)) {
+        while stmts
+            .last()
+            .is_some_and(|stmt| matches!(stmt.unobserved(), CStmt::Empty))
+        {
             stmts.pop();
         }
-        if matches!(
-            stmts.last(),
-            Some(CStmt::Expr(expr)) if Self::expr_matches_for_update(symbols, expr, update)
-        ) {
+        if stmts.last().is_some_and(|stmt| {
+            matches!(stmt.unobserved(), CStmt::Expr(expr) if Self::expr_matches_for_update(symbols, expr, update))
+        }) {
             stmts.pop();
         }
         Self::stmt_from_vec(stmts)
@@ -3932,7 +4124,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
     }
 
     fn expr_matches_for_update(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, body_expr: &CExpr, for_update: &CExpr) -> bool {
-        if body_expr == for_update {
+        if body_expr.transparently_eq(for_update) {
             return true;
         }
 
@@ -3942,10 +4134,10 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
     }
 
     fn normalized_self_update_signature(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, expr: &CExpr) -> Option<(String, BinaryOp, CExpr)> {
-        let CExpr::Binary { op, left, right } = expr else {
+        let CExpr::Binary { op, left, right } = expr.unobserved() else {
             return None;
         };
-        let CExpr::Var(name) = left.as_ref() else {
+        let CExpr::Var(name) = left.unobserved() else {
             return None;
         };
 
@@ -3963,18 +4155,18 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
     }
 
     fn stmt_is_self_update(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, stmt: &CStmt) -> bool {
-        let CStmt::Expr(expr) = stmt else {
+        let CStmt::Expr(expr) = stmt.unobserved() else {
             return false;
         };
-        match expr {
+        match expr.unobserved() {
             CExpr::Unary { op, operand } => {
                 matches!(
                     op,
                     UnaryOp::PreInc | UnaryOp::PostInc | UnaryOp::PreDec | UnaryOp::PostDec
-                ) && matches!(operand.as_ref(), CExpr::Var(_))
+                ) && matches!(operand.unobserved(), CExpr::Var(_))
             }
             CExpr::Binary { op, left, right } => {
-                let CExpr::Var(name) = left.as_ref() else {
+                let CExpr::Var(name) = left.unobserved() else {
                     return false;
                 };
                 if Self::is_compound_assign_op(*op) {
@@ -4015,7 +4207,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
 
     /// Whether anything can jump into this statement.
     fn stmt_carries_label(stmt: &CStmt) -> bool {
-        match stmt {
+        match stmt.unobserved() {
             CStmt::Label(_) => true,
             CStmt::Block(stmts) => stmts.iter().any(Self::stmt_carries_label),
             CStmt::If {
@@ -4048,11 +4240,11 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             return true;
         }
 
-        match stmt {
+        match stmt.unobserved() {
             CStmt::Block(stmts) => stmts
                 .iter()
                 .rev()
-                .find(|stmt| !matches!(stmt, CStmt::Empty))
+                .find(|stmt| !matches!(stmt.unobserved(), CStmt::Empty))
                 .is_some_and(Self::stmt_guarantees_termination),
             CStmt::If {
                 then_body,
@@ -4071,33 +4263,42 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             return Some(stmt.clone());
         }
 
-        if let CStmt::Block(stmts) = stmt
+        if let CStmt::Block(stmts) = stmt.unobserved()
             && stmts.len() == 1
             && Self::stmt_is_unconditional_terminator(&stmts[0])
         {
-            return Some(stmts[0].clone());
+            return Some(crate::ast::carry_render_observations(
+                &[stmt.clone()],
+                stmts[0].clone_without_render_observations(),
+            ));
         }
 
         None
     }
 
     fn single_switch_stmt(stmt: &CStmt) -> Option<CStmt> {
-        match stmt {
+        match stmt.unobserved() {
             CStmt::Switch { .. } => Some(stmt.clone()),
-            CStmt::Block(stmts) if stmts.len() == 1 && matches!(stmts[0], CStmt::Switch { .. }) => {
-                Some(stmts[0].clone())
+            CStmt::Block(stmts)
+                if stmts.len() == 1
+                    && matches!(stmts[0].unobserved(), CStmt::Switch { .. }) =>
+            {
+                Some(crate::ast::carry_render_observations(
+                    &[stmt.clone()],
+                    stmts[0].clone_without_render_observations(),
+                ))
             }
             _ => None,
         }
     }
 
     fn extract_switch_with_trailing_stmt(stmt: &CStmt) -> Option<(CStmt, Option<CStmt>)> {
-        match stmt {
+        match stmt.unobserved() {
             CStmt::Switch { .. } => Some((stmt.clone(), None)),
             CStmt::Block(stmts) => {
                 let stmts = stmts
                     .iter()
-                    .filter(|stmt| !matches!(stmt, CStmt::Empty))
+                    .filter(|stmt| !matches!(stmt.unobserved(), CStmt::Empty))
                     .cloned()
                     .collect::<Vec<_>>();
                 match stmts.as_slice() {
@@ -4114,6 +4315,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
 
     fn negate_condition(cond: CExpr) -> CExpr {
         match cond {
+            CExpr::Observed { id, expr } => CExpr::observed(id, Self::negate_condition(*expr)),
             CExpr::Unary {
                 op: UnaryOp::Not,
                 operand,
@@ -4189,7 +4391,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
     }
 
     fn relation_signature(expr: &CExpr) -> Option<(&CExpr, &CExpr, BinaryOp)> {
-        match expr {
+        match expr.unobserved() {
             CExpr::Paren(inner) | CExpr::Cast { expr: inner, .. } => {
                 Self::relation_signature(inner)
             }
@@ -4211,11 +4413,18 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         let mut i = 0;
         while i < stmts.len() {
             if i + 1 < stmts.len()
-                && let Some(mut for_stmts) = Self::try_rewrite_while_with_preheader_init(symbols, 
-                    stmts[i].clone(),
-                    stmts[i + 1].clone(),
+                && let Some(mut for_stmts) = Self::try_rewrite_while_with_preheader_init(symbols,
+                    stmts[i].clone_without_render_observations(),
+                    stmts[i + 1].clone_without_render_observations(),
                 )
             {
+                if let Some(first) = for_stmts.first_mut() {
+                    let semantic_first = std::mem::replace(first, CStmt::Empty);
+                    *first = crate::ast::carry_render_observations(
+                        &[stmts[i].clone(), stmts[i + 1].clone()],
+                        semantic_first,
+                    );
+                }
                 rewritten.append(&mut for_stmts);
                 i += 2;
                 continue;
@@ -4235,8 +4444,8 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             return None;
         };
 
-        let (loop_cond, loop_body) = match cond {
-            CExpr::IntLit(v) if v != 0 => {
+        let (loop_cond, loop_body) = match cond.unobserved() {
+            CExpr::IntLit(v) if *v != 0 => {
                 let (exit_cond, stripped_body) = Self::extract_guard_break_cond(*body)?;
                 (CExpr::unary(UnaryOp::Not, exit_cond), stripped_body)
             }
@@ -4270,15 +4479,21 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
     }
 
     fn extract_induction_var_from_init(init_stmt: &CStmt) -> Option<crate::symbol::SymbolId> {
-        match init_stmt {
-            CStmt::Expr(CExpr::Binary {
-                op: BinaryOp::Assign,
-                left,
-                ..
-            }) => match left.as_ref() {
-                CExpr::Var(name) => Some(*name),
-                _ => None,
-            },
+        match init_stmt.unobserved() {
+            CStmt::Expr(expr) => {
+                let CExpr::Binary {
+                    op: BinaryOp::Assign,
+                    left,
+                    ..
+                } = expr.unobserved()
+                else {
+                    return None;
+                };
+                match left.unobserved() {
+                    CExpr::Var(name) => Some(*name),
+                    _ => None,
+                }
+            }
             CStmt::Decl {
                 name,
                 init: Some(_),
@@ -4296,7 +4511,10 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         let CStmt::Block(mut prefix) = preheader_stmt else {
             return None;
         };
-        while matches!(prefix.last(), Some(CStmt::Empty)) {
+        while prefix
+            .last()
+            .is_some_and(|stmt| matches!(stmt.unobserved(), CStmt::Empty))
+        {
             prefix.pop();
         }
         let init_stmt = prefix.pop()?;
@@ -4324,7 +4542,9 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             }
         }
 
-        while matches!(effective.last(), Some(CStmt::Empty | CStmt::Continue)) {
+        while effective.last().is_some_and(|stmt| {
+            matches!(stmt.unobserved(), CStmt::Empty | CStmt::Continue)
+        }) {
             effective.pop();
         }
         if effective.is_empty() {
@@ -4364,20 +4584,20 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         prev_stmts: &[CStmt],
         stmt: &CStmt,
     ) -> Option<(CExpr, bool)> {
-        let CStmt::Expr(expr) = stmt else {
+        let CStmt::Expr(expr) = stmt.unobserved() else {
             return None;
         };
-        match expr {
+        match expr.unobserved() {
             CExpr::Unary { op, operand }
                 if matches!(
                     op,
                     UnaryOp::PreInc | UnaryOp::PostInc | UnaryOp::PreDec | UnaryOp::PostDec
-                ) && matches!(operand.as_ref(), CExpr::Var(name) if Self::loop_var_equiv(&crate::symbol::spelling(symbols, *name), var)) =>
+                ) && matches!(operand.unobserved(), CExpr::Var(name) if Self::loop_var_equiv(&crate::symbol::spelling(symbols, *name), var)) =>
             {
                 Some((expr.clone(), false))
             }
-            CExpr::Binary { op, left, right } if matches!(left.as_ref(), CExpr::Var(_)) => {
-                let CExpr::Var(left_name) = left.as_ref() else {
+            CExpr::Binary { op, left, right } if matches!(left.unobserved(), CExpr::Var(_)) => {
+                let CExpr::Var(left_name) = left.unobserved() else {
                     return None;
                 };
                 let left_is_induction = Self::loop_var_equiv(&crate::symbol::spelling(symbols, *left_name), var);
@@ -4395,7 +4615,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                     }
                 }
                 if Self::is_compound_assign_op(*op)
-                    && matches!(left.as_ref(), CExpr::Var(name) if Self::loop_var_equiv(&crate::symbol::spelling(symbols, *name), var))
+                    && matches!(left.unobserved(), CExpr::Var(name) if Self::loop_var_equiv(&crate::symbol::spelling(symbols, *name), var))
                 {
                     return Some((expr.clone(), false));
                 }
@@ -4410,13 +4630,17 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         var: &str,
         cond_vars: &HashSet<String>,
     ) -> bool {
-        let (name, rhs) = match stmt {
-            CStmt::Expr(CExpr::Binary {
-                op: BinaryOp::Assign,
-                left,
-                right,
-            }) => {
-                let CExpr::Var(name) = left.as_ref() else {
+        let (name, rhs) = match stmt.unobserved() {
+            CStmt::Expr(expr) => {
+                let CExpr::Binary {
+                    op: BinaryOp::Assign,
+                    left,
+                    right,
+                } = expr.unobserved()
+                else {
+                    return false;
+                };
+                let CExpr::Var(name) = left.unobserved() else {
                     return false;
                 };
                 (&*crate::symbol::spelling(symbols, *name), right.as_ref())
@@ -4435,13 +4659,17 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
     }
 
     fn is_generated_side_effect_free_assignment(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, stmt: &CStmt) -> bool {
-        let (name, rhs) = match stmt {
-            CStmt::Expr(CExpr::Binary {
-                op: BinaryOp::Assign,
-                left,
-                right,
-            }) => {
-                let CExpr::Var(name) = left.as_ref() else {
+        let (name, rhs) = match stmt.unobserved() {
+            CStmt::Expr(expr) => {
+                let CExpr::Binary {
+                    op: BinaryOp::Assign,
+                    left,
+                    right,
+                } = expr.unobserved()
+                else {
+                    return false;
+                };
+                let CExpr::Var(name) = left.unobserved() else {
                     return false;
                 };
                 (&*crate::symbol::spelling(symbols, *name), right.as_ref())
@@ -4500,12 +4728,12 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             cond,
             then_body,
             else_body: None,
-        } = stmt
+        } = stmt.unobserved()
         else {
             return None;
         };
-        if matches!(then_body.as_ref(), CStmt::Break)
-            || matches!(then_body.as_ref(), CStmt::Block(v) if v.len() == 1 && matches!(v[0], CStmt::Break))
+        if matches!(then_body.unobserved(), CStmt::Break)
+            || matches!(then_body.unobserved(), CStmt::Block(v) if v.len() == 1 && Self::stmt_is_unconditional_break(&v[0]))
         {
             return Some(cond.clone());
         }
@@ -4530,9 +4758,13 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
 
     fn stmt_is_unconditional_terminator(stmt: &CStmt) -> bool {
         matches!(
-            stmt,
+            stmt.unobserved(),
             CStmt::Break | CStmt::Continue | CStmt::Return(_) | CStmt::Goto(_)
         )
+    }
+
+    fn stmt_is_unconditional_break(stmt: &CStmt) -> bool {
+        matches!(stmt.unobserved(), CStmt::Break)
     }
 
     fn stmt_into_vec(stmt: CStmt) -> Vec<CStmt> {
@@ -4574,28 +4806,36 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
     }
 
     fn stmt_def_and_reads(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, stmt: &CStmt) -> Option<(String, HashSet<String>)> {
-        let CStmt::Expr(CExpr::Binary {
-            op: BinaryOp::Assign,
-            left,
-            right,
-        }) = stmt
+        let CStmt::Expr(expr) = stmt.unobserved()
         else {
             return None;
         };
-        let CExpr::Var(def) = left.as_ref() else {
+        let CExpr::Binary {
+            op: BinaryOp::Assign,
+            left,
+            right,
+        } = expr.unobserved()
+        else {
+            return None;
+        };
+        let CExpr::Var(def) = left.unobserved() else {
             return None;
         };
         Some((crate::symbol::spelling(symbols, *def).to_string(), Self::collect_expr_vars(symbols, right)))
     }
 
     fn stmt_assignment_def_reads(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, stmt: &CStmt) -> Option<(String, HashSet<String>, bool, bool)> {
-        match stmt {
-            CStmt::Expr(CExpr::Binary {
-                op: BinaryOp::Assign,
-                left,
-                right,
-            }) => {
-                let CExpr::Var(def) = left.as_ref() else {
+        match stmt.unobserved() {
+            CStmt::Expr(expr) => {
+                let CExpr::Binary {
+                    op: BinaryOp::Assign,
+                    left,
+                    right,
+                } = expr.unobserved()
+                else {
+                    return None;
+                };
+                let CExpr::Var(def) = left.unobserved() else {
                     return None;
                 };
                 Some((
@@ -4627,6 +4867,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
 
     fn collect_stmt_vars_into(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, stmt: &CStmt, out: &mut HashSet<String>) {
         match stmt {
+            CStmt::Observed { stmt, .. } => Self::collect_stmt_vars_into(symbols, stmt, out),
             CStmt::Expr(expr) | CStmt::Return(Some(expr)) => {
                 Self::collect_expr_vars_into(symbols, expr, out)
             }
@@ -4707,6 +4948,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
 
     fn normalize_loop_expr_refs(expr: &CExpr) -> &CExpr {
         match expr {
+            CExpr::Observed { expr, .. } => Self::normalize_loop_expr_refs(expr),
             CExpr::Paren(inner) | CExpr::Cast { expr: inner, .. } => {
                 Self::normalize_loop_expr_refs(inner)
             }
@@ -4724,6 +4966,10 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
 
     fn normalize_condition_addr_artifacts(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, expr: CExpr) -> CExpr {
         match expr {
+            CExpr::Observed { id, expr } => CExpr::observed(
+                id,
+                Self::normalize_condition_addr_artifacts(symbols, *expr),
+            ),
             CExpr::Var(name)
                 if crate::symbol::spelling(symbols, name).starts_with('&')
                     && crate::symbol::spelling(symbols, name).len() > 1 =>
@@ -4808,6 +5054,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
 
     fn collect_expr_vars_into(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, expr: &CExpr, out: &mut HashSet<String>) {
         match Self::normalize_loop_expr_refs(expr) {
+            CExpr::Observed { expr, .. } => Self::collect_expr_vars_into(symbols, expr, out),
             CExpr::Var(name) => {
                 out.insert(crate::symbol::spelling(symbols, *name).trim_start_matches('&').to_string());
             }
@@ -4916,10 +5163,21 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
     /// if it's the only exit path.
     fn strip_trailing_continue(stmt: CStmt) -> CStmt {
         match stmt {
+            CStmt::Observed { id, stmt } => {
+                let stripped = Self::strip_trailing_continue(*stmt);
+                if matches!(stripped.unobserved(), CStmt::Empty) {
+                    CStmt::Empty
+                } else {
+                    CStmt::observed(id, stripped)
+                }
+            }
             CStmt::Continue => CStmt::Empty,
             CStmt::Block(mut stmts) => {
                 // Remove trailing Continue
-                while matches!(stmts.last(), Some(CStmt::Continue)) {
+                while stmts
+                    .last()
+                    .is_some_and(|stmt| matches!(stmt.unobserved(), CStmt::Continue))
+                {
                     stmts.pop();
                 }
                 if stmts.is_empty() {
@@ -4942,9 +5200,19 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
     /// resulting do-while would force the loop to execute only once.
     fn strip_trailing_latch_marker(stmt: CStmt) -> CStmt {
         match stmt {
+            CStmt::Observed { id, stmt } => {
+                let stripped = Self::strip_trailing_latch_marker(*stmt);
+                if matches!(stripped.unobserved(), CStmt::Empty) {
+                    CStmt::Empty
+                } else {
+                    CStmt::observed(id, stripped)
+                }
+            }
             CStmt::Break | CStmt::Continue => CStmt::Empty,
             CStmt::Block(mut stmts) => {
-                while matches!(stmts.last(), Some(CStmt::Break | CStmt::Continue)) {
+                while stmts.last().is_some_and(|stmt| {
+                    matches!(stmt.unobserved(), CStmt::Break | CStmt::Continue)
+                }) {
                     stmts.pop();
                 }
                 if stmts.is_empty() {
@@ -4963,7 +5231,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
     /// `while(!cond) { body... }`.
     fn try_convert_do_while_to_while(body: CStmt, cond: CExpr) -> CStmt {
         // Only applies when condition is always true (literal 1 or true)
-        let is_infinite = match &cond {
+        let is_infinite = match cond.unobserved() {
             CExpr::IntLit(v) => *v != 0,
             _ => false,
         };
@@ -4975,9 +5243,9 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         }
 
         // Extract the body statements
-        let stmts = match &body {
+        let stmts = match body.unobserved() {
             CStmt::Block(stmts) => stmts.clone(),
-            CStmt::If { .. } => vec![body.clone()],
+            CStmt::If { .. } => vec![body.clone_without_render_observations()],
             _ => {
                 return CStmt::DoWhile {
                     body: Box::new(body),
@@ -4998,10 +5266,10 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             cond: break_cond,
             then_body,
             else_body: None,
-        } = &stmts[0]
+        } = stmts[0].unobserved()
         {
-            let is_break = matches!(then_body.as_ref(), CStmt::Break)
-                || matches!(then_body.as_ref(), CStmt::Block(v) if v.len() == 1 && matches!(v[0], CStmt::Break));
+            let is_break = Self::stmt_is_unconditional_break(then_body)
+                || matches!(then_body.unobserved(), CStmt::Block(v) if v.len() == 1 && Self::stmt_is_unconditional_break(&v[0]));
             if is_break {
                 // Negate the condition
                 let negated = CExpr::unary(crate::ast::UnaryOp::Not, break_cond.clone());
@@ -5048,7 +5316,10 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
 #[cfg(test)]
 mod tests {
     use super::{BDD_FALSE, BDD_TRUE, ControlBdd, ControlFlowStructurer};
-    use crate::ast::{BinaryOp, CExpr, CStmt, CType, UnaryOp};
+    use crate::ast::{
+        BinaryOp, CExpr, CFunction, CStmt, CType, RenderObservationOwner, UnaryOp,
+        strip_render_observations,
+    };
     use crate::fold::FoldingContext;
     use crate::region::Region;
     use r2il::{ArchSpec, R2ILBlock, R2ILOp, RegisterDef, Varnode};
@@ -5108,6 +5379,18 @@ mod tests {
         rhs: CExpr,
     ) -> CStmt {
         expr_stmt(CExpr::assign(v(symbols, lhs), rhs))
+    }
+
+    fn strip_test_observations(
+        owner: &RenderObservationOwner,
+        stmt: CStmt,
+    ) -> (CStmt, crate::ast::ReachableObservations) {
+        let mut function = CFunction::new("observed_structure", CType::Int(32))
+            .with_body(vec![stmt]);
+        let reachable = strip_render_observations(&mut function, owner.expected_count())
+            .expect("structure rewrite must retain each observation at most once");
+        let stmt = function.body.pop().unwrap_or(CStmt::Empty);
+        (stmt, reachable)
     }
 
     #[test]
@@ -5438,19 +5721,130 @@ mod tests {
     }
 
     #[test]
-    fn merge_predecessor_accepts_exact_materialized_phi_edge_copies() {
+    fn merge_predecessor_rejects_phi_shaped_copy_without_normalization_origin() {
         let func = function_with_materialized_phi_branch_to_merge();
         let ctx = FoldingContext::new(64);
         let structurer = ControlFlowStructurer::new(&func, &ctx);
 
         assert_eq!(
             structurer.unique_region_predecessor_to_merge(&Region::Block(0x1000), 0x1020),
-            Some(0x1010)
+            None
         );
     }
 
     #[test]
-    fn transparent_transfer_path_accepts_exact_materialized_phi_edge_copy() {
+    fn structurer_accepts_only_producer_issued_phi_edge_origin() {
+        let mut entry = R2ILBlock::new(0x2000, 4);
+        entry.push(R2ILOp::Copy {
+            dst: Varnode::register(0, 8),
+            src: Varnode::constant(0, 8),
+        });
+        entry.push(R2ILOp::Branch {
+            target: Varnode::constant(0x2004, 8),
+        });
+        let mut header = R2ILBlock::new(0x2004, 4);
+        header.push(R2ILOp::CBranch {
+            cond: Varnode::register(0x10, 8),
+            target: Varnode::constant(0x200c, 8),
+        });
+        let mut latch = R2ILBlock::new(0x2008, 4);
+        latch.push(R2ILOp::IntAdd {
+            dst: Varnode::register(0, 8),
+            a: Varnode::register(0, 8),
+            b: Varnode::constant(1, 8),
+        });
+        latch.push(R2ILOp::Branch {
+            target: Varnode::constant(0x2004, 8),
+        });
+        let mut exit = R2ILBlock::new(0x200c, 4);
+        exit.push(R2ILOp::Return {
+            target: Varnode::register(0, 8),
+        });
+
+        let mut arch = test_arch();
+        arch.addr_size = 8;
+        let storage = |offset| r2ssa::CanonicalStorageId {
+            space: r2ssa::CanonicalStorageSpace::Register,
+            offset,
+            size: 8,
+        };
+        let interface = r2ssa::SourceFunctionInterface::new_exact(
+            b"r2dec-structure-normalization-owner".to_vec(),
+            "sysv64",
+            std::iter::empty::<r2ssa::SourceAbiParameterSpec>(),
+            r2ssa::SourceFunctionReturn::Register {
+                storage: storage(0),
+            },
+            std::iter::empty::<r2ssa::SourceStackSlotSpec>(),
+        )
+        .and_then(|interface| interface.with_stack_pointer_storage(storage(0x28)))
+        .and_then(|interface| interface.with_return_address_storage(storage(0x30)))
+        .expect("exact test interface");
+        let prepared = Arc::new(
+            SsaArtifact::for_decompile_with_interface(
+                &[entry, header, latch, exit],
+                Some(&arch),
+                interface,
+            )
+            .expect("loop SSA artifact"),
+        );
+        let analysis = r2types::build_source_owned_type_writeback_analysis(
+            r2types::TypeWritebackAnalysisRequest::new(
+                Arc::clone(&prepared),
+                r2types::ParsedExternalContext::default(),
+            )
+            .expect("matching source assumptions"),
+        )
+        .expect("source-owned loop analysis");
+        let render_facts = analysis.function_facts().render_facts();
+        let (normalized, origins) = crate::normalize::materialize_certified_loop_carriers(
+            prepared.function(),
+            prepared.as_ref(),
+            render_facts,
+        )
+        .expect("producer-issued loop normalization origins");
+        origins
+            .validate(&normalized, prepared.as_ref(), Some(render_facts))
+            .expect("producer-issued origins seal against source authority");
+        let (block_addr, op_idx, successor) = prepared
+            .graph()
+            .block_order
+            .iter()
+            .find_map(|block_id| {
+                let block_addr = prepared.graph().block(*block_id)?.addr;
+                normalized
+                    .get_block(block_addr)?
+                    .ops
+                    .iter()
+                    .enumerate()
+                    .find_map(|(op_idx, _)| match origins.origin(
+                        crate::normalize::NormalizedOpSite {
+                            block: *block_id,
+                            op_idx,
+                        },
+                    ) {
+                        Some(crate::normalize::NormalizedOpOrigin::PhiEdgeCopy(origin))
+                            if origin.guarded.is_none() =>
+                        {
+                            Some((block_addr, op_idx, origin.target))
+                        }
+                        _ => None,
+                    })
+            })
+            .expect("loop normalization emits an unconditional phi-edge copy");
+
+        let mut ctx = FoldingContext::new(64);
+        ctx.inputs.prepared_ssa = Some(prepared.as_ref());
+        ctx.inputs.normalization_origins = Some(&origins);
+        let structurer = ControlFlowStructurer::new(&normalized, &ctx);
+        assert!(
+            structurer.is_materialized_phi_edge_copy(block_addr, op_idx, successor),
+            "the structurer must consume the exact producer-issued occurrence"
+        );
+    }
+
+    #[test]
+    fn transparent_transfer_path_rejects_phi_shaped_copy_without_normalization_origin() {
         let mut forwarder = R2ILBlock::new(0x1000, 4);
         forwarder.push(R2ILOp::Branch {
             target: Varnode::constant(0x1010, 8),
@@ -5483,9 +5877,9 @@ mod tests {
         let mut structurer = ControlFlowStructurer::new(&func, &ctx);
         structurer.structured_region_blocks.insert(0x1010);
 
-        assert_eq!(
-            structurer.transparent_transfer_path(0x1000),
-            Ok(vec![0x1000, 0x1010])
+        assert!(
+            structurer.transparent_transfer_path(0x1000).is_err(),
+            "an SSA copy shaped like a phi edge is not transformation evidence"
         );
     }
 
@@ -5894,6 +6288,88 @@ mod tests {
             &CStmt::Expr(CExpr::binary(BinaryOp::BitXorAssign, v(&symbols, "hash"), v(&symbols, "c"))),
             "for latch update should own the duplicated trailing body update"
         );
+    }
+
+    #[test]
+    fn observed_loop_init_condition_and_update_survive_for_recognition_once() {
+        let symbols = test_table();
+        let mut owner = RenderObservationOwner::new();
+        let (init_id, init) = owner
+            .observe_stmt(assign(&symbols, "i", CExpr::IntLit(0)))
+            .expect("loop init observation");
+        let (cond_id, cond) = owner
+            .observe_expr(CExpr::binary(
+                BinaryOp::Lt,
+                v(&symbols, "i"),
+                v(&symbols, "n"),
+            ))
+            .expect("loop condition observation");
+        let (update_id, update) = owner
+            .observe_expr(CExpr::binary(
+                BinaryOp::Assign,
+                v(&symbols, "i"),
+                CExpr::binary(BinaryOp::Add, v(&symbols, "i"), CExpr::IntLit(1)),
+            ))
+            .expect("loop update observation");
+        let input = CStmt::Block(vec![
+            init,
+            CStmt::while_loop(
+                cond,
+                CStmt::Block(vec![
+                    assign(&symbols, "sum", v(&symbols, "i")),
+                    CStmt::Expr(update),
+                ]),
+            ),
+        ]);
+
+        let cleaned = ControlFlowStructurer::cleanup(&symbols, input);
+        let (plain, reachable) = strip_test_observations(&owner, cleaned);
+        assert!(reachable.contains(init_id));
+        assert!(reachable.contains(cond_id));
+        assert!(reachable.contains(update_id));
+        assert!(matches!(plain, CStmt::For { .. }));
+    }
+
+    #[test]
+    fn observed_terminators_classify_transparently_and_trailing_markers_are_deleted() {
+        let symbols = test_table();
+        let mut owner = RenderObservationOwner::new();
+        let (return_id, observed_return) = owner
+            .observe_stmt(CStmt::ret(Some(CExpr::IntLit(3))))
+            .expect("return observation");
+        assert!(ControlFlowStructurer::stmt_guarantees_termination(
+            &observed_return
+        ));
+        let extracted = ControlFlowStructurer::single_terminator_stmt(&CStmt::Block(vec![
+            observed_return,
+        ]))
+        .expect("observed terminator must classify through its wrapper");
+
+        let (body_id, body_stmt) = owner
+            .observe_stmt(assign(&symbols, "x", CExpr::IntLit(1)))
+            .expect("loop body observation");
+        let (continue_id, trailing_continue) = owner
+            .observe_stmt(CStmt::Continue)
+            .expect("continue observation");
+        let stripped_continue = ControlFlowStructurer::strip_trailing_continue(CStmt::Block(vec![
+            body_stmt,
+            trailing_continue,
+        ]));
+        let (break_id, trailing_break) = owner
+            .observe_stmt(CStmt::Break)
+            .expect("latch marker observation");
+        let stripped_latch =
+            ControlFlowStructurer::strip_trailing_latch_marker(trailing_break);
+
+        let (plain, reachable) = strip_test_observations(
+            &owner,
+            CStmt::Block(vec![extracted, stripped_continue, stripped_latch]),
+        );
+        assert!(reachable.contains(return_id));
+        assert!(reachable.contains(body_id));
+        assert!(!reachable.contains(continue_id));
+        assert!(!reachable.contains(break_id));
+        assert!(matches!(plain, CStmt::Block(_)));
     }
 
     #[test]
@@ -6344,6 +6820,66 @@ mod tests {
     }
 
     #[test]
+    fn guarded_tail_rewrite_moves_observations_without_duplicating_terminator() {
+        let symbols = test_table();
+        let mut owner = RenderObservationOwner::new();
+        let (cond_id, cond) = owner
+            .observe_expr(v(&symbols, "ready"))
+            .expect("condition observation");
+        let (body_id, body) = owner
+            .observe_stmt(assign(&symbols, "x", CExpr::IntLit(1)))
+            .expect("body observation");
+        let (return_id, terminator) = owner
+            .observe_stmt(CStmt::ret(Some(CExpr::IntLit(0))))
+            .expect("terminator observation");
+        let cleaned = ControlFlowStructurer::cleanup(
+            &symbols,
+            CStmt::Block(vec![CStmt::if_stmt(cond, body, None), terminator]),
+        );
+
+        let (plain, reachable) = strip_test_observations(&owner, cleaned);
+        assert!(reachable.contains(cond_id));
+        assert!(reachable.contains(body_id));
+        assert!(reachable.contains(return_id));
+        assert_eq!(
+            plain,
+            CStmt::Block(vec![
+                CStmt::if_stmt(
+                    CExpr::unary(UnaryOp::Not, v(&symbols, "ready")),
+                    CStmt::ret(Some(CExpr::IntLit(0))),
+                    None,
+                ),
+                assign(&symbols, "x", CExpr::IntLit(1)),
+                CStmt::ret(Some(CExpr::IntLit(0))),
+            ])
+        );
+    }
+
+    #[test]
+    fn common_suffix_factoring_coalesces_distinct_observations_once() {
+        let symbols = test_table();
+        let suffix = assign(&symbols, "hash", v(&symbols, "c"));
+        let mut owner = RenderObservationOwner::new();
+        let (then_id, then_suffix) = owner
+            .observe_stmt(suffix.clone())
+            .expect("then suffix observation");
+        let (else_id, else_suffix) = owner
+            .observe_stmt(suffix.clone())
+            .expect("else suffix observation");
+
+        let factored = ControlFlowStructurer::factor_guarded_common_suffix(
+            v(&symbols, "guard"),
+            vec![then_suffix],
+            vec![else_suffix],
+        );
+        let (plain, reachable) =
+            strip_test_observations(&owner, CStmt::Block(factored));
+        assert!(reachable.contains(then_id));
+        assert!(reachable.contains(else_id));
+        assert_eq!(plain, CStmt::Block(vec![suffix]));
+    }
+
+    #[test]
     fn does_not_rewrite_trailing_guard_when_following_stmt_is_not_terminator() {
         let symbols = test_table();
         let input = CStmt::Block(vec![
@@ -6426,6 +6962,31 @@ mod tests {
         let input = CStmt::if_stmt(CExpr::IntLit(1), assign(&symbols, "x", CExpr::IntLit(7)), None);
         let cleaned = ControlFlowStructurer::cleanup(&symbols, input);
         assert_eq!(cleaned, assign(&symbols, "x", CExpr::IntLit(7)));
+    }
+
+    #[test]
+    fn observed_constant_condition_collapses_and_drops_only_deleted_occurrences() {
+        let symbols = test_table();
+        let mut owner = RenderObservationOwner::new();
+        let (cond_id, cond) = owner
+            .observe_expr(CExpr::IntLit(1))
+            .expect("constant condition observation");
+        let (then_id, then_stmt) = owner
+            .observe_stmt(assign(&symbols, "x", CExpr::IntLit(7)))
+            .expect("surviving branch observation");
+        let (else_id, else_stmt) = owner
+            .observe_stmt(assign(&symbols, "x", CExpr::IntLit(9)))
+            .expect("deleted branch observation");
+
+        let cleaned = ControlFlowStructurer::cleanup(
+            &symbols,
+            CStmt::if_stmt(cond, then_stmt, Some(else_stmt)),
+        );
+        let (plain, reachable) = strip_test_observations(&owner, cleaned);
+        assert!(!reachable.contains(cond_id));
+        assert!(reachable.contains(then_id));
+        assert!(!reachable.contains(else_id));
+        assert_eq!(plain, assign(&symbols, "x", CExpr::IntLit(7)));
     }
 
     #[test]

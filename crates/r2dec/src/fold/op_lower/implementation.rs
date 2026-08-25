@@ -156,8 +156,7 @@ impl<'a> FoldingContext<'a> {
         &self,
         is_write: bool,
     ) -> Option<&r2types::MemoryAccessRenderFact> {
-        let block_addr = self.current_block_addr.get()?;
-        let op_idx = self.current_op_idx.get()?;
+        let (block_addr, op_idx) = self.current_source_op_site()?;
         self.certified_render_context()?
             .memory_access_for_op(block_addr, op_idx, is_write)
     }
@@ -170,11 +169,12 @@ impl<'a> FoldingContext<'a> {
             .memory_read_for_value_dependency(value)
     }
 
-    pub(crate) fn certified_return_for_op(
+    pub(crate) fn certified_return_for_normalized_op(
         &self,
         block_addr: u64,
         op_idx: usize,
     ) -> Option<&ReturnValueRenderFact> {
+        let (block_addr, op_idx) = self.source_op_site_for_normalized_op(block_addr, op_idx)?;
         self.certified_render_context()?
             .return_for_op(block_addr, op_idx)
     }
@@ -412,7 +412,7 @@ impl<'a> FoldingContext<'a> {
                         {
                             return None;
                         }
-                        self.record_effect_render_proof_for_memory(
+                        self.record_effect_render_proof_for_source_memory(
                             EffectRenderProofKind::MemoryRead,
                             block_addr,
                             op_idx,
@@ -917,8 +917,7 @@ impl<'a> FoldingContext<'a> {
 
     pub(crate) fn prepared_memory_defs_for_current_op(&self) -> Option<&[MemoryDefFact]> {
         let prepared = self.inputs.prepared_ssa?;
-        let block_addr = self.current_block_addr.get()?;
-        let op_idx = self.current_op_idx.get()?;
+        let (block_addr, op_idx) = self.current_source_op_site()?;
         prepared.memory_defs_for_op_site(block_addr, op_idx)
     }
 
@@ -2173,11 +2172,17 @@ impl<'a> FoldingContext<'a> {
                     certified_rendering_required: false,
                 })
             });
-            self.state.analysis_ctx = analysis::build_prepared_runtime_facts_with_control(&symbols,
+            let normalization_origins = self
+                .inputs
+                .normalization_origins
+                .expect("prepared folding requires sealed normalization origins");
+            self.state.analysis_ctx = analysis::build_prepared_runtime_facts_with_control(
+                &symbols,
                 blocks,
                 &env,
                 prepared,
                 &prepared_view,
+                normalization_origins,
                 control,
             )?;
             self.state.analysis_ctx.ownership = self.build_semantic_ownership_facts();
@@ -3994,6 +3999,7 @@ impl<'a> FoldingContext<'a> {
 
     fn expr_contains_synthetic_stack_placeholder(&self, expr: &CExpr) -> bool {
         match expr {
+            CExpr::Observed { expr, .. } => self.expr_contains_synthetic_stack_placeholder(expr),
             CExpr::External { .. } => false,
             CExpr::Var(name) => {
                 let lower = self.spelling(*name).to_ascii_lowercase();
@@ -8079,6 +8085,9 @@ impl<'a> FoldingContext<'a> {
 
         quality.node_penalty -= 1;
         match expr {
+            CExpr::Observed { expr, .. } => {
+                self.accumulate_visible_expr_quality(expr, quality, depth, context)
+            }
             CExpr::External { .. } => {}
             CExpr::Var(name) => {
                 if is_generic_stack_placeholder_alias(&self.spelling(*name)) {
@@ -8779,8 +8788,7 @@ impl<'a> FoldingContext<'a> {
     }
 
     fn current_block_producer_for_value(&self, value: &SSAVar) -> Option<&SSAOp> {
-        let block_addr = self.current_block_addr.get()?;
-        let current_op_idx = self.current_op_idx.get()?;
+        let (block_addr, current_op_idx) = self.current_source_op_site()?;
         let block = self.prepared_ssa()?.function().get_block(block_addr)?;
         block
             .ops
@@ -9769,6 +9777,7 @@ impl<'a> FoldingContext<'a> {
     /// Whether a memory access already says how wide it is.
     fn expr_states_its_pointee(expr: &CExpr) -> bool {
         let target = match expr {
+            CExpr::Observed { expr, .. } => return Self::expr_states_its_pointee(expr),
             CExpr::Deref(inner) => inner.as_ref(),
             CExpr::Subscript { base, .. } => base.as_ref(),
             _ => return false,
@@ -9802,6 +9811,9 @@ impl<'a> FoldingContext<'a> {
         }
 
         match expr {
+            CExpr::Observed { id, expr } => {
+                CExpr::observed(*id, self.semanticize_visible_expr(expr, depth, visited))
+            }
             CExpr::External { .. } => return expr.clone(),
             CExpr::Var(name) => {
                 // A carrier's name is mutable state, so no semantic value speaks for it.
@@ -10549,6 +10561,9 @@ impl<'a> FoldingContext<'a> {
         }
 
         match expr {
+            CExpr::Observed { id, expr } => {
+                CExpr::observed(*id, self.expand_call_arg_expr(expr, depth, visited))
+            }
             CExpr::External { .. } => expr.clone(),
             CExpr::Var(name) => {
                 if let Some(value) = parse_const_value(&self.spelling(*name)) {
@@ -10687,6 +10702,7 @@ impl<'a> FoldingContext<'a> {
         }
 
         match expr {
+            CExpr::Observed { expr, .. } => self.call_arg_contains_stack_placeholder(expr, depth),
             CExpr::External { .. } => false,
             CExpr::Var(name) => is_generic_stack_placeholder_alias(&self.spelling(*name)),
             CExpr::Deref(inner)
@@ -10739,6 +10755,7 @@ impl<'a> FoldingContext<'a> {
         }
 
         match expr {
+            CExpr::Observed { expr, .. } => self.call_arg_contains_transient_name(expr, depth),
             CExpr::External { .. } => false,
             CExpr::Var(name) => self.is_transient_visible_name(&self.spelling(*name)),
             CExpr::Deref(inner)
@@ -10793,6 +10810,7 @@ impl<'a> FoldingContext<'a> {
         }
 
         match expr {
+            CExpr::Observed { expr, .. } => self.call_arg_contains_low_quality_name(expr, depth),
             CExpr::External { .. } => false,
             CExpr::Var(name) => Self::is_low_quality_imported_call_arg_name(&symbols, *name),
             CExpr::Deref(inner)
@@ -10845,6 +10863,7 @@ impl<'a> FoldingContext<'a> {
         }
 
         match expr {
+            CExpr::Observed { expr, .. } => self.call_arg_contains_call(expr, depth),
             CExpr::Call { .. } => true,
             CExpr::External { .. } => false,
             CExpr::Deref(inner)
@@ -11035,7 +11054,7 @@ impl<'a> FoldingContext<'a> {
         !self.call_arg_contains_stack_placeholder(expr, 0)
             && !self.call_arg_contains_transient_name(expr, 0)
             && !self.call_arg_contains_low_quality_name(expr, 0)
-            && !matches!(expr, CExpr::Call { .. })
+            && !matches!(expr.unobserved(), CExpr::Call { .. })
     }
 
     #[allow(dead_code)]
@@ -11060,6 +11079,10 @@ impl<'a> FoldingContext<'a> {
         }
 
         let resolved = match expr {
+            CExpr::Observed { id, expr } => CExpr::observed(
+                *id,
+                self.resolve_imported_call_arg_expr(expr, depth, visited),
+            ),
             CExpr::External { .. } => expr.clone(),
             CExpr::Var(name) => {
                 if let Some(source_call) = self
@@ -11966,6 +11989,11 @@ impl<'a> FoldingContext<'a> {
 
     pub(crate) fn fold_block(&self, block: &SSABlock, current_block_addr: u64) -> Vec<CStmt> {
         self.current_block_addr.set(Some(current_block_addr));
+        self.current_block_id.set(
+            self.inputs
+                .prepared_ssa
+                .and_then(|prepared| prepared.graph().block_id_for_addr(current_block_addr)),
+        );
         self.current_op_idx.set(None);
         self.folded_blocks.borrow_mut().insert(block.addr);
         let mut stmts = Vec::new();
@@ -11981,7 +12009,7 @@ impl<'a> FoldingContext<'a> {
             self.current_op_idx.set(Some(op_idx));
             // Skip stack frame setup/teardown if enabled
             if self.is_stack_frame_op(op) {
-                self.note_elided_op_site(block.addr, op_idx, "stack-frame");
+                self.note_elided_normalized_op(block.addr, op_idx, "stack-frame");
                 continue;
             }
 
@@ -11991,7 +12019,7 @@ impl<'a> FoldingContext<'a> {
             // the ones that happened to become statements, and an accounting of what
             // the output owes reads every inlined effect as missing.
             if self.is_inlined_single_use_call_result(block, op_idx, op) {
-                self.record_effect_render_proof_for_value(
+                self.record_effect_render_proof_for_normalized_value(
                     EffectRenderProofKind::Expression,
                     block.addr,
                     op_idx,
@@ -12001,16 +12029,9 @@ impl<'a> FoldingContext<'a> {
             }
 
             if self.is_consumed_immediate_call_home_store(block, op_idx, op) {
-                if let SSAOp::Store { space, addr, val } = op {
-                    self.record_effect_render_proof_for_memory(
-                        EffectRenderProofKind::MemoryWrite,
-                        block.addr,
-                        op_idx,
-                        *space,
-                        self.value_id_for_rendered_op(addr),
-                        self.value_id_for_rendered_op(val),
-                    );
-                }
+                // The call may subsume this presentation-level home store, but
+                // no memory statement was emitted here. Only an exact canonical
+                // elision certificate may discharge its write obligation.
                 continue;
             }
 
@@ -12044,7 +12065,7 @@ impl<'a> FoldingContext<'a> {
                     self.merged_return_candidate_for_block_slot(block.addr, offset),
                 );
                 last_ret_value_op_idx = self
-                    .certified_return_for_op(block.addr, op_idx)
+                    .certified_return_for_normalized_op(block.addr, op_idx)
                     .map(|_| op_idx);
                 if let Some(local_name) = self
                     .resolve_stack_var(offset)
@@ -12070,7 +12091,7 @@ impl<'a> FoldingContext<'a> {
                 && self.state.return_stack_slots.contains(&offset)
             {
                 if let SSAOp::Load { dst, space, addr } = op {
-                    self.record_effect_render_proof_for_memory(
+                    self.record_effect_render_proof_for_normalized_memory(
                         EffectRenderProofKind::MemoryRead,
                         block.addr,
                         op_idx,
@@ -12107,7 +12128,7 @@ impl<'a> FoldingContext<'a> {
                         };
                         last_ret_value = Some(src_expr);
                         last_ret_value_op_idx = self
-                            .certified_return_for_op(block.addr, op_idx)
+                            .certified_return_for_normalized_op(block.addr, op_idx)
                             .map(|_| op_idx);
                     }
                     SSAOp::IntZExt { dst, src }
@@ -12136,7 +12157,7 @@ impl<'a> FoldingContext<'a> {
                         };
                         last_ret_value = Some(self.tracked_return_cast_expr(dst, src, src_expr));
                         last_ret_value_op_idx = self
-                            .certified_return_for_op(block.addr, op_idx)
+                            .certified_return_for_normalized_op(block.addr, op_idx)
                             .map(|_| op_idx);
                     }
                     _ => {
@@ -12167,7 +12188,7 @@ impl<'a> FoldingContext<'a> {
                             };
                             last_ret_value = Some(final_expr);
                             last_ret_value_op_idx = self
-                                .certified_return_for_op(block.addr, op_idx)
+                                .certified_return_for_normalized_op(block.addr, op_idx)
                                 .map(|_| op_idx);
                         }
                     }
@@ -12278,7 +12299,7 @@ impl<'a> FoldingContext<'a> {
                         self.resolve_return_target_expr(target_expr, last_ret_value.clone())
                     };
                     let value = self
-                        .certified_return_for_op(block.addr, return_op_idx)
+                        .certified_return_for_normalized_op(block.addr, return_op_idx)
                         .map(|cert| cert.value);
                     (expr, value)
                 };
@@ -12294,7 +12315,7 @@ impl<'a> FoldingContext<'a> {
                     break;
                 }
                 let return_stmt = CStmt::Return(Some(final_expr));
-                self.record_effect_render_proof_for_value(
+                self.record_effect_render_proof_for_normalized_value(
                     EffectRenderProofKind::Return,
                     block.addr,
                     return_op_idx,
@@ -12334,7 +12355,7 @@ impl<'a> FoldingContext<'a> {
             // Skip operations that produce dead values
             if let Some(dst) = op.dst() {
                 if self.is_dead(dst) {
-                    self.note_elided_op_site(block.addr, op_idx, self.dead_value_reason(dst));
+                    self.note_elided_normalized_op(block.addr, op_idx, self.dead_value_reason(dst));
                     continue;
                 }
 
@@ -12346,25 +12367,28 @@ impl<'a> FoldingContext<'a> {
                     // carried, so the promise is kept from the same answer that
                     // made it rather than reconstructed later by another rule.
                     let inlined = self.op_to_expr(op);
-                    if !matches!(&inlined, CExpr::Var(id) if *self.spelling(*id) == *self.var_name(dst))
-                    {
+                    let rendered_inline =
+                        !matches!(&inlined, CExpr::Var(id) if *self.spelling(*id) == *self.var_name(dst));
+                    if rendered_inline {
                         self.inlined_renderings
                             .borrow_mut()
                             .insert(key.clone(), inlined);
+                        // This event has a concrete expression for the omitted
+                        // producer. A raw destination fallback has rendered no
+                        // definition and must not mint a proof.
+                        self.record_effect_render_proof_for_normalized_value(
+                            EffectRenderProofKind::Expression,
+                            block.addr,
+                            op_idx,
+                            self.value_id_for_rendered_op(dst),
+                        );
                     }
-                    // Inlined is rendered, and the expression reading it owns it
-                    self.record_effect_render_proof_for_value(
-                        EffectRenderProofKind::Expression,
-                        block.addr,
-                        op_idx,
-                        self.value_id_for_rendered_op(dst),
-                    );
                     continue;
                 }
 
                 // Skip if this op's destination was consumed by call argument collection
                 if self.consumed_by_call_set().contains(&key) {
-                    self.record_effect_render_proof_for_value(
+                    self.record_effect_render_proof_for_normalized_value(
                         EffectRenderProofKind::Expression,
                         block.addr,
                         op_idx,
@@ -12378,12 +12402,14 @@ impl<'a> FoldingContext<'a> {
                 // An op that became a statement is owned by that statement. Only the
                 // memory ones were on record, so arithmetic, copies and everything
                 // else that reached the page read as unaccounted for.
-                self.record_effect_render_proof_for_value(
-                    EffectRenderProofKind::Expression,
-                    block.addr,
-                    op_idx,
-                    op.dst().and_then(|dst| self.value_id_for_rendered_op(dst)),
-                );
+                if !matches!(stmt, CStmt::Comment(_) | CStmt::Empty) {
+                    self.record_effect_render_proof_for_normalized_value(
+                        EffectRenderProofKind::Expression,
+                        block.addr,
+                        op_idx,
+                        op.dst().and_then(|dst| self.value_id_for_rendered_op(dst)),
+                    );
+                }
                 let is_return = matches!(stmt, CStmt::Return(_));
                 stmts.push(stmt);
                 if is_return {
@@ -12397,7 +12423,7 @@ impl<'a> FoldingContext<'a> {
                 // A value nothing reads is a different case and stays unrecorded,
                 // because that is exactly what an accounting of the output has to
                 // be able to see.
-                self.record_effect_render_proof_for_value(
+                self.record_effect_render_proof_for_normalized_value(
                     EffectRenderProofKind::Expression,
                     block.addr,
                     op_idx,
@@ -12427,10 +12453,10 @@ impl<'a> FoldingContext<'a> {
                     let return_stmt = CStmt::Return(Some(final_expr));
                     if let Some(op_idx) = last_ret_value_op_idx {
                         let value = certified_value.or_else(|| {
-                            self.certified_return_for_op(block.addr, op_idx)
+                            self.certified_return_for_normalized_op(block.addr, op_idx)
                                 .map(|cert| cert.value)
                         });
-                        self.record_effect_render_proof_for_value(
+                        self.record_effect_render_proof_for_normalized_value(
                             EffectRenderProofKind::Return,
                             block.addr,
                             op_idx,
@@ -12461,6 +12487,7 @@ impl<'a> FoldingContext<'a> {
             eprintln!("FOLDPOST block={:#x} after_slots={}", block.addr, out.len());
         }
         self.current_block_addr.set(None);
+        self.current_block_id.set(None);
         self.current_op_idx.set(None);
         out
     }
@@ -12561,7 +12588,9 @@ impl<'a> FoldingContext<'a> {
         for next_idx in (op_idx + 1)..block.ops.len() {
             match &block.ops[next_idx] {
                 SSAOp::Call { .. } | SSAOp::CallInd { .. } => {
-                    return self.call_args_map().contains_key(&(block.addr, next_idx));
+                    return self
+                        .source_op_site_for_normalized_op(block.addr, next_idx)
+                        .is_some_and(|site| self.call_args_map().contains_key(&site));
                 }
                 SSAOp::Branch { .. } | SSAOp::CBranch { .. } | SSAOp::Return { .. } => {
                     return false;
@@ -12849,7 +12878,7 @@ impl<'a> FoldingContext<'a> {
                     rhs = CExpr::cast(val_ty, rhs);
                 }
                 if let Some((block_addr, op_idx, space, address, value)) = certified_store_fact {
-                    self.record_effect_render_proof_for_memory(
+                    self.record_effect_render_proof_for_source_memory(
                         EffectRenderProofKind::MemoryWrite,
                         block_addr,
                         op_idx,

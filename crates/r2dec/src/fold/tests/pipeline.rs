@@ -858,7 +858,7 @@ mod tests {
         let empty_str = Box::leak(Box::new(HashMap::new()));
         let empty_ty = Box::leak(Box::new(HashMap::new()));
         FoldingContext::from_inputs(FoldInputs {
-            materialized_edge_copies: crate::normalize::no_materialized_edge_copies(),
+            normalization_origins: None,
             display_names: crate::empty_display_names(),
             arch,
             function_names: empty_u64,
@@ -908,7 +908,7 @@ mod tests {
         let empty_str = Box::leak(Box::new(HashMap::new()));
         let empty_ty = Box::leak(Box::new(HashMap::new()));
         FoldingContext::from_inputs(FoldInputs {
-            materialized_edge_copies: crate::normalize::no_materialized_edge_copies(),
+            normalization_origins: None,
             display_names: crate::empty_display_names(),
             arch,
             function_names: empty_u64,
@@ -1277,6 +1277,12 @@ mod tests {
         let mut ctx = make_x86_64_ctx();
         ctx.inputs.prepared_ssa = Some(prepared_ssa);
         ctx.inputs.function_facts = prepared_ssa.function_facts();
+        ctx.inputs.normalization_origins = Some(Box::leak(Box::new(
+            crate::normalize::NormalizationOrigins::for_unchanged(
+                prepared_ssa.function(),
+                prepared_ssa,
+            ),
+        )));
         ctx
     }
 
@@ -1286,6 +1292,12 @@ mod tests {
         let mut ctx = make_aarch64_ctx();
         ctx.inputs.prepared_ssa = Some(prepared_ssa);
         ctx.inputs.function_facts = prepared_ssa.function_facts();
+        ctx.inputs.normalization_origins = Some(Box::leak(Box::new(
+            crate::normalize::NormalizationOrigins::for_unchanged(
+                prepared_ssa.function(),
+                prepared_ssa,
+            ),
+        )));
         ctx
     }
 
@@ -1484,6 +1496,7 @@ mod tests {
 
     fn expr_contains_var(ctx: &FoldingContext<'_>, expr: &CExpr, target: &str) -> bool {
         match expr {
+            CExpr::Observed { expr, .. } => expr_contains_var(ctx, expr, target),
             CExpr::External { .. } => false,
             CExpr::Var(name) => &*ctx.spelling(*name) == target,
             CExpr::Unary { operand, .. }
@@ -1526,6 +1539,7 @@ mod tests {
 
     fn expr_contains_addr_of(expr: &CExpr) -> bool {
         match expr {
+            CExpr::Observed { expr, .. } => expr_contains_addr_of(expr),
             CExpr::AddrOf(_) => true,
             CExpr::External { .. } => false,
             CExpr::Unary { operand, .. }
@@ -3293,7 +3307,7 @@ mod tests {
             &mut ctx,
             __fixture_args.0,
             __fixture_args.1,
-        );;
+        );
 
         let stmt = ctx
             .op_to_stmt_with_args(
@@ -3355,7 +3369,7 @@ mod tests {
             &mut ctx,
             __fixture_args.0,
             __fixture_args.1,
-        );;
+        );
         let helper_call = CExpr::call(
             CExpr::External {
                 name: "sym._unlock".to_string(),
@@ -3381,7 +3395,7 @@ mod tests {
             &mut ctx,
             __fixture_args.0,
             __fixture_args.1,
-        );;
+        );
 
         let stmt = ctx
             .op_to_stmt_with_args(
@@ -3438,7 +3452,7 @@ mod tests {
             &mut ctx,
             __fixture_args.0,
             __fixture_args.1,
-        );;
+        );
 
         let stmt = ctx
             .op_to_stmt_with_args(
@@ -3512,7 +3526,7 @@ mod tests {
             &mut ctx,
             __fixture_args.0,
             __fixture_args.1,
-        );;
+        );
 
         let stmt = ctx
             .op_to_stmt_with_args(
@@ -5241,8 +5255,7 @@ mod tests {
 
     #[test]
     fn prepared_stack_load_uses_defining_op_owner_not_current_consumer() {
-        let mut arch = make_test_arch_x86_64();
-        arch.add_register(RegisterDef::new("RIP", 0x30, 8));
+        let arch = make_test_arch_x86_64();
         let mut entry = R2ILBlock::new(0x1000, 4);
         entry.push(R2ILOp::IntAdd {
             dst: Varnode::unique(0x100, 8),
@@ -5311,7 +5324,44 @@ mod tests {
             r2ssa::SsaArtifact::for_decompile_with_interface(&[entry], Some(&arch), interface)
                 .expect("typed prepared SSA should build")
                 .with_name("defining_load_owner"),
-        );
+        )
+        .with_context(r2types::ParsedExternalContext {
+            stack_slots: BTreeMap::from([
+                (
+                    StackSlotKey {
+                        base: ExternalStackBase::FramePointer,
+                        offset: -4,
+                    },
+                    r2types::ExternalStackSlotSpec {
+                        name: "first_slot".to_string(),
+                        ty: Some(r2types::CTypeLike::Int {
+                            bits: 32,
+                            signedness: r2types::Signedness::Signed,
+                        }),
+                        base: ExternalStackBase::FramePointer,
+                        role: r2types::ExternalStackSlotRole::Local,
+                        ..r2types::ExternalStackSlotSpec::default()
+                    },
+                ),
+                (
+                    StackSlotKey {
+                        base: ExternalStackBase::FramePointer,
+                        offset: -8,
+                    },
+                    r2types::ExternalStackSlotSpec {
+                        name: "second_slot".to_string(),
+                        ty: Some(r2types::CTypeLike::Int {
+                            bits: 32,
+                            signedness: r2types::Signedness::Signed,
+                        }),
+                        base: ExternalStackBase::FramePointer,
+                        role: r2types::ExternalStackSlotRole::Local,
+                        ..r2types::ExternalStackSlotSpec::default()
+                    },
+                ),
+            ]),
+            ..r2types::ParsedExternalContext::default()
+        });
         let block = prepared
             .function()
             .get_block(0x1000)
@@ -5328,10 +5378,7 @@ mod tests {
         assert_eq!(loads.len(), 2, "fixture should contain two distinct loads");
 
         let mut ctx = make_x86_64_ctx_with_prepared(&prepared);
-        ctx.inputs.visible_bindings = Box::leak(Box::new(vec![
-            visible_stack_binding("first_slot", Some(CType::i32()), -4),
-            visible_stack_binding("second_slot", Some(CType::i32()), -8),
-        ]));
+        ctx.inputs.visible_bindings = &prepared.function_facts().type_facts().visible_bindings;
         ctx.current_block_addr.set(Some(0x1000));
         ctx.current_op_idx.set(Some(loads[1].0));
 
@@ -8261,44 +8308,6 @@ mod tests {
     }
 
     #[test]
-    fn carrier_names_close_over_a_chain_of_copies_whatever_order_it_arrives_in() {
-        // Materialisation hands its copies over as a `HashSet`, so the order is
-        // whatever the seed produced. A single pass only reaches the copies
-        // whose named end it happens to see first, which is why two renders of
-        // one function in one process disagreed about how many names existed:
-        // the same copies, closed to a different depth.
-        let edge = |addr: u64, dst: &str, src: &str| {
-            (
-                addr,
-                r2ssa::SSAVar::new(dst, 1, 8),
-                r2ssa::SSAVar::new(src, 1, 8),
-            )
-        };
-        // rax -> a -> b -> c, given in the order that defeats a single pass.
-        let copies: crate::normalize::MaterializedEdgeCopies = [
-            edge(0x30, "c", "b"),
-            edge(0x20, "b", "a"),
-            edge(0x10, "a", "rax"),
-        ]
-        .into_iter()
-        .collect();
-
-        let mut aliases = std::collections::HashMap::new();
-        // `display_name` uppercases a register spelling, so these are the keys
-        // the production map is built from.
-        aliases.insert("RAX_1".to_string(), "rax".to_string());
-        crate::fold::context::close_carrier_aliases_over_edge_copies(&mut aliases, &copies);
-
-        for name in ["A_1", "B_1", "C_1"] {
-            assert_eq!(
-                aliases.get(name).map(String::as_str),
-                Some("rax"),
-                "every end of the chain carries the name, not just the first link"
-            );
-        }
-    }
-
-    #[test]
     fn a_carrier_read_at_another_width_resolves_to_a_cast_of_the_carrier() {
         // The half of the location model an alias map cannot hold. `eax_5` is
         // not `rax`, it is `(uint32_t)rax`; answering with the carrier's name
@@ -11027,11 +11036,12 @@ mod tests {
         let prepared =
             prepared_from_r2il_blocks(&[entry, left, right, exit], &arch).with_name("phi_carrier");
         let render_facts = test_render_facts(&prepared);
-        let normalized = crate::normalize::materialize_certified_loop_carriers(
+        let (normalized, origins) = crate::normalize::materialize_certified_loop_carriers(
             prepared.function(),
             &prepared,
             &render_facts,
-        );
+        )
+        .expect("genuine noncarrier normalization must validate");
         assert!(
             normalized
                 .get_block(0x181c)
@@ -11039,7 +11049,10 @@ mod tests {
             "ordinary merge phis must remain immutable certified expressions"
         );
         let fold_blocks = normalized.blocks().cloned().collect::<Vec<_>>();
-        let mut ctx = make_x86_64_ctx_with_prepared(&prepared);
+        let base_ctx = make_x86_64_ctx_with_prepared(&prepared);
+        let mut inputs = base_ctx.inputs;
+        inputs.normalization_origins = Some(Box::leak(Box::new(origins)));
+        let mut ctx = FoldingContext::from_inputs(inputs);
         ctx.analyze_blocks(&fold_blocks);
 
         let left_stmts = ctx.fold_block(
@@ -11059,6 +11072,237 @@ mod tests {
                 .all(|stmt| !stmt.contains("r2sleigh residual:")),
             "noncarrier phi predecessors should not invent mutable render effects: {rendered:?}"
         );
+    }
+
+    #[test]
+    fn synthetic_normalization_sites_cannot_discharge_shifted_source_effects() {
+        let arch = make_test_arch_x86_64();
+        let mut entry = R2ILBlock::new(0x1900, 4);
+        entry.push(R2ILOp::Copy {
+            dst: Varnode::register(0, 8),
+            src: Varnode::constant(0, 8),
+        });
+        entry.push(R2ILOp::Branch {
+            target: Varnode::constant(0x1904, 8),
+        });
+
+        let mut header = R2ILBlock::new(0x1904, 4);
+        header.push(R2ILOp::CBranch {
+            cond: Varnode::register(0x10, 8),
+            target: Varnode::constant(0x190c, 8),
+        });
+
+        let mut latch = R2ILBlock::new(0x1908, 4);
+        latch.push(R2ILOp::IntAdd {
+            dst: Varnode::register(0, 8),
+            a: Varnode::register(0, 8),
+            b: Varnode::constant(1, 8),
+        });
+        latch.push(R2ILOp::Branch {
+            target: Varnode::constant(0x1904, 8),
+        });
+
+        let mut exit = R2ILBlock::new(0x190c, 4);
+        exit.push(R2ILOp::Return {
+            target: Varnode::register(0, 8),
+        });
+
+        let prepared = prepared_from_r2il_blocks(&[entry, header, latch, exit], &arch)
+            .with_name("normalization_origin_effect_gate");
+        let render_facts = test_render_facts(&prepared);
+        let (normalized, origins) = crate::normalize::materialize_certified_loop_carriers(
+            prepared.function(),
+            &prepared,
+            &render_facts,
+        )
+        .expect("genuine loop normalization must validate");
+        let materialized_value_edges = origins.materialized_value_edges().collect::<Vec<_>>();
+        origins
+            .validate(&normalized, &prepared, Some(&render_facts))
+            .expect("genuine normalized loop origins must remain sealed");
+
+        let graph = prepared.graph();
+        let (block_addr, synthetic_idx, shifted_idx, shifted_inst) = graph
+            .block_order
+            .iter()
+            .find_map(|block_id| {
+                let block_addr = graph.block(*block_id)?.addr;
+                let block = normalized.get_block(block_addr)?;
+                let synthetic_idx = (0..block.ops.len()).find(|op_idx| {
+                    matches!(
+                        origins.origin(crate::normalize::NormalizedOpSite {
+                            block: *block_id,
+                            op_idx: *op_idx,
+                        }),
+                        Some(crate::normalize::NormalizedOpOrigin::PhiEdgeCopy(_))
+                            | Some(crate::normalize::NormalizedOpOrigin::RelocatedInitializer(
+                                _
+                            ))
+                    )
+                })?;
+                let (shifted_idx, shifted_inst) =
+                    (synthetic_idx + 1..block.ops.len()).find_map(|op_idx| {
+                        match origins.origin(crate::normalize::NormalizedOpSite {
+                            block: *block_id,
+                            op_idx,
+                        }) {
+                            Some(crate::normalize::NormalizedOpOrigin::Original(inst))
+                                if graph.op_site_for_inst(*inst)?.1 != op_idx =>
+                            {
+                                Some((op_idx, *inst))
+                            }
+                            _ => None,
+                        }
+                    })?;
+                Some((block_addr, synthetic_idx, shifted_idx, shifted_inst))
+            })
+            .expect("materialized loop must insert a synthetic op before an original terminator");
+
+        let base_ctx = make_x86_64_ctx_with_prepared(&prepared);
+        let mut inputs = base_ctx.inputs;
+        inputs.normalization_origins = Some(Box::leak(Box::new(origins)));
+        let ctx = FoldingContext::from_inputs(inputs);
+        let mut aliased_edges = 0;
+        for (left, right) in materialized_value_edges {
+            let left = graph
+                .value(left)
+                .expect("edge left value")
+                .var
+                .display_name();
+            let right = graph
+                .value(right)
+                .expect("edge right value")
+                .var
+                .display_name();
+            let pair = (
+                ctx.carrier_aliases.get(&left),
+                ctx.carrier_aliases.get(&right),
+            );
+            if pair.0.is_some() || pair.1.is_some() {
+                aliased_edges += 1;
+                assert_eq!(
+                    pair.0, pair.1,
+                    "legacy presentation aliases must close over exact ValueId edges"
+                );
+            }
+        }
+        assert!(
+            aliased_edges > 0,
+            "the genuine carrier fixture must exercise presentation alias propagation"
+        );
+        assert_eq!(
+            ctx.source_op_site_for_normalized_op(block_addr, synthetic_idx),
+            None,
+            "synthetic geometry must never fall back to its normalized numeric site"
+        );
+        assert_eq!(
+            ctx.source_op_site_for_normalized_op(block_addr, shifted_idx),
+            graph.op_site_for_inst(shifted_inst),
+            "the shifted original must resolve through its exact InstId"
+        );
+        let proof_checkpoint = ctx.effect_render_proof_checkpoint();
+        ctx.record_effect_render_proof_for_normalized_value(
+            EffectRenderProofKind::Expression,
+            block_addr,
+            synthetic_idx,
+            None,
+        );
+        let synthetic_proofs = ctx.effect_render_proofs_since(proof_checkpoint);
+        assert_eq!(synthetic_proofs.len(), 1);
+        assert!(
+            synthetic_proofs[0]
+                .phi_edge
+                .as_ref()
+                .is_some_and(|edge| !edge.sites.is_empty()),
+            "a synthetic phi operation may carry only its exact original input evidence"
+        );
+        ctx.note_elided_normalized_op(block_addr, synthetic_idx, "synthetic test");
+        assert!(
+            ctx.elided_obligations().is_empty(),
+            "a renderer heuristic must not discharge the canonical elision ledger"
+        );
+
+        let shifted_checkpoint = ctx.effect_render_proof_checkpoint();
+        ctx.record_effect_render_proof_for_normalized_value(
+            EffectRenderProofKind::Expression,
+            block_addr,
+            shifted_idx,
+            None,
+        );
+        let proofs = ctx.effect_render_proofs_since(shifted_checkpoint);
+        assert_eq!(proofs.len(), 1);
+        let shifted_instruction = prepared
+            .obligations()
+            .instruction_for_inst(shifted_inst)
+            .expect("shifted source terminator has canonical identity")
+            .id;
+        assert!(
+            !proofs[0].obligation_ids.is_empty()
+                && proofs[0]
+                    .obligation_ids
+                    .iter()
+                    .all(|id| id.instruction == shifted_instruction),
+            "the shifted normalized index must discharge only exact obligations of its original InstId"
+        );
+        ctx.note_elided_normalized_op(block_addr, shifted_idx, "shifted source test");
+        assert!(
+            ctx.elided_obligations().is_empty(),
+            "a shifted renderer heuristic still cannot mint canonical elision evidence"
+        );
+    }
+
+    #[test]
+    fn rendered_memory_component_does_not_claim_other_obligations_on_its_instruction() {
+        let arch = make_test_arch_x86_64();
+        let mut entry = R2ILBlock::new(0x1920, 4);
+        entry.push(R2ILOp::Load {
+            dst: Varnode::register(0, 8),
+            space: r2il::SpaceId::Ram,
+            addr: Varnode::register(0x10, 8),
+        });
+        entry.push(R2ILOp::Return {
+            target: Varnode::register(0, 8),
+        });
+        let prepared = prepared_from_r2il_blocks(&[entry], &arch)
+            .with_name("exact_memory_obligation_proof");
+        let mut ctx = make_x86_64_ctx_with_prepared(&prepared);
+        install_certified_function_facts(&mut ctx);
+        let fact = ctx
+            .inputs
+            .render_facts()
+            .and_then(|facts| {
+                facts.memory_access_for_op(0x1920, 0, false, r2il::SpaceId::Ram)
+            })
+            .expect("genuine load has one canonical memory fact")
+            .clone();
+        assert!(
+            prepared
+                .obligations()
+                .obligations_for_inst(fact.access.inst)
+                .any(|obligation| {
+                    obligation.id.kind == r2ssa::SemanticObligationKind::LiveValueProducer
+                }),
+            "fixture must put multiple obligations on the load instruction"
+        );
+
+        let checkpoint = ctx.effect_render_proof_checkpoint();
+        ctx.record_effect_render_proof_for_source_memory(
+            EffectRenderProofKind::MemoryRead,
+            fact.block_addr,
+            fact.op_index,
+            fact.space,
+            Some(fact.address),
+            fact.value,
+        );
+
+        let proofs = ctx.effect_render_proofs_since(checkpoint);
+        assert_eq!(proofs.len(), 1);
+        assert_eq!(proofs[0].obligation_ids.len(), 1);
+        assert!(proofs[0].obligation_ids.iter().all(|id| {
+            id.kind == r2ssa::SemanticObligationKind::ObservableMemoryRead
+                && id.component
+                    == r2ssa::SemanticObligationComponent::MemoryAccess(fact.access.ordinal)
+        }));
     }
 
     #[test]
@@ -11702,7 +11946,7 @@ mod tests {
             &mut ctx,
             __fixture_args.0,
             __fixture_args.1,
-        );;
+        );
 
         let binding = crate::analysis::CallArgBinding::input(
             crate::analysis::SemanticCallArg::FallbackExpr(ctx.name_ref("fallback")),
@@ -12865,10 +13109,7 @@ mod tests {
         where
             F: FnOnce(&mut FoldingContext<'_>, &str, (u64, usize)) -> BTreeSet<String>,
         {
-            let mut arch = make_test_arch_x86_64();
-            if install_function_facts {
-                arch.add_register(RegisterDef::new("RIP", 0x30, 8));
-            }
+            let arch = make_test_arch_x86_64();
             let mut entry = R2ILBlock::new(0x1000, 4);
             entry.push(R2ILOp::Call {
                 target: Varnode::constant(0x401050, 8),

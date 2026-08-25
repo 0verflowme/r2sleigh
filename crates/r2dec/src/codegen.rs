@@ -4,7 +4,11 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::ast::{BinaryOp, CExpr, CFunction, CLocal, CStmt, CType, UnaryOp};
+use crate::ast::{
+    BinaryOp, CExpr, CFunction, CLocal, CStmt, CType, UnaryOp, carry_outer_stmt_observations,
+    carry_render_observations, has_render_observations, stmt_has_render_observations,
+};
+use crate::observation_journal::ObservationSealAuthority;
 
 /// Threshold for detecting 64-bit negative values stored as unsigned.
 /// Values above this are likely negative offsets (within ~65536 of u64::MAX).
@@ -52,6 +56,61 @@ impl Default for CodeGenConfig {
     }
 }
 
+/// Owned AST after every semantics-preserving emission rewrite has run.
+///
+/// Observation sealing must inspect this exact function. The emitter accepts
+/// no raw `CFunction`, which prevents a private clone from being rewritten
+/// after the provenance journal has certified a different tree.
+pub(crate) struct EmissionReadyFunction {
+    function: CFunction,
+}
+
+impl EmissionReadyFunction {
+    pub(crate) fn function(&self) -> &CFunction {
+        assert!(
+            !has_render_observations(&self.function),
+            "marked C AST reached an emission/public boundary without journal sealing"
+        );
+        &self.function
+    }
+
+    pub(crate) fn function_mut_for_observation_seal(
+        &mut self,
+        _authority: &mut ObservationSealAuthority,
+    ) -> &mut CFunction {
+        &mut self.function
+    }
+
+    #[allow(
+        dead_code,
+        reason = "used by public Stage 5 AST boundaries after markers are sealed"
+    )]
+    pub(crate) fn into_function(self) -> CFunction {
+        assert!(
+            !has_render_observations(&self.function),
+            "marked C AST reached a public boundary without journal sealing"
+        );
+        self.function
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn function_for_marker_test(&self) -> &CFunction {
+        &self.function
+    }
+}
+
+/// Run all AST rewrites required solely by textual C emission.
+pub(crate) fn prepare_function_for_emission(func: &CFunction) -> EmissionReadyFunction {
+    let (locals, body) = inline_local_declaration_initializers(func);
+    EmissionReadyFunction {
+        function: CFunction {
+            locals,
+            body: prepare_stmt_sequence_for_emission(&body),
+            ..func.clone()
+        },
+    }
+}
+
 /// C code generator.
 pub(crate) struct CodeGenerator {
     config: CodeGenConfig,
@@ -73,10 +132,10 @@ impl CodeGenerator {
     }
 
     /// Generate code for a function.
-    pub(crate) fn generate_function(&mut self, func: &CFunction) -> String {
+    pub(crate) fn generate_function(&mut self, ready: &EmissionReadyFunction) -> String {
+        let func = ready.function();
         self.symbols = func.symbols.borrow().clone();
         self.output.clear();
-        let (locals, body) = inline_local_declaration_initializers(func);
 
         // Function signature
         self.emit_type(&func.ret_type);
@@ -106,7 +165,7 @@ impl CodeGenerator {
         self.indent_level += 1;
 
         // Local variable declarations
-        for local in &locals {
+        for local in &func.locals {
             self.emit_indent();
             self.emit_type(&local.ty);
             self.output.push(' ');
@@ -114,12 +173,12 @@ impl CodeGenerator {
             self.output.push_str(";\n");
         }
 
-        if !locals.is_empty() {
+        if !func.locals.is_empty() {
             self.output.push('\n');
         }
 
         // Function body
-        self.emit_stmt_sequence(&body);
+        self.emit_stmt_sequence(&func.body);
 
         self.indent_level -= 1;
         self.output.push_str("}\n");
@@ -129,6 +188,10 @@ impl CodeGenerator {
 
     /// Generate code for a statement.
     pub(crate) fn generate_stmt(&mut self, stmt: &CStmt) -> String {
+        assert!(
+            !stmt_has_render_observations(stmt),
+            "marked C statement reached codegen without journal sealing"
+        );
         self.output.clear();
         self.emit_stmt(stmt);
         self.output.clone()
@@ -144,6 +207,7 @@ impl CodeGenerator {
 
     /// Emit a statement.
     fn emit_stmt(&mut self, stmt: &CStmt) {
+        let stmt = stmt.unobserved();
         match stmt {
             CStmt::Empty => {}
             CStmt::Expr(expr) => {
@@ -188,7 +252,7 @@ impl CodeGenerator {
 
                 if let Some(else_stmt) = else_body {
                     // Check if else body is another if (else-if chain)
-                    if matches!(else_stmt.as_ref(), CStmt::If { .. }) {
+                    if matches!(else_stmt.unobserved(), CStmt::If { .. }) {
                         self.output.push_str(" else ");
                         self.emit_stmt_inline(else_stmt);
                     } else {
@@ -311,25 +375,20 @@ impl CodeGenerator {
                     self.output.push_str(" */\n");
                 }
             }
+            CStmt::Observed { .. } => unreachable!("unobserved statement expected"),
         }
     }
 
     /// Emit a straight-line sequence, coalescing adjacent scalar self-updates.
     fn emit_stmt_sequence(&mut self, stmts: &[CStmt]) {
-        let mut idx = 0;
-        while idx < stmts.len() {
-            if let Some((run_len, stmt)) = coalesced_scalar_update_run(&stmts[idx..]) {
-                self.emit_stmt(&stmt);
-                idx += run_len;
-            } else {
-                self.emit_stmt(&stmts[idx]);
-                idx += 1;
-            }
+        for stmt in stmts {
+            self.emit_stmt(stmt);
         }
     }
 
     /// Emit a statement body (handles braces for single statements).
     fn emit_stmt_body(&mut self, stmt: &CStmt) {
+        let stmt = stmt.unobserved();
         match stmt {
             CStmt::Block(stmts) => {
                 self.output.push_str("{\n");
@@ -352,6 +411,7 @@ impl CodeGenerator {
 
     /// Emit a statement inline (no newline, for for-loop init).
     fn emit_stmt_inline(&mut self, stmt: &CStmt) {
+        let stmt = stmt.unobserved();
         match stmt {
             CStmt::Expr(expr) => {
                 if let Some(compact) = scalar_update_expr(expr) {
@@ -380,7 +440,7 @@ impl CodeGenerator {
                 self.emit_stmt_body(then_body);
                 if let Some(else_stmt) = else_body {
                     self.output.push_str(" else ");
-                    if matches!(else_stmt.as_ref(), CStmt::If { .. }) {
+                    if matches!(else_stmt.unobserved(), CStmt::If { .. }) {
                         self.emit_stmt_inline(else_stmt);
                     } else {
                         self.emit_stmt_body(else_stmt);
@@ -393,6 +453,7 @@ impl CodeGenerator {
 
     /// Emit an expression with parent precedence for parenthesization.
     fn emit_expr(&mut self, expr: &CExpr, parent_prec: u8) {
+        let expr = expr.unobserved();
         let my_prec = expr.precedence();
         let need_parens = my_prec < parent_prec;
 
@@ -583,6 +644,7 @@ impl CodeGenerator {
                 self.emit_expr(inner, 0);
                 self.output.push(')');
             }
+            CExpr::Observed { .. } => unreachable!("unobserved expression expected"),
         }
 
         if need_parens {
@@ -620,7 +682,8 @@ impl CodeGenerator {
 #[cfg(test)]
 fn generate(func: &CFunction) -> String {
     let mut codegen = CodeGenerator::new(CodeGenConfig::default());
-    codegen.generate_function(func)
+    let ready = prepare_function_for_emission(func);
+    codegen.generate_function(&ready)
 }
 
 fn inline_local_declaration_initializers(func: &CFunction) -> (Vec<CLocal>, Vec<CStmt>) {
@@ -666,11 +729,15 @@ fn inline_decls_in_stmt_list(
                 )
             {
                 declared.insert(name);
-                return CStmt::Decl {
-                    ty: local_types[&name].clone(),
-                    name,
-                    init: Some(init.clone()),
-                };
+                let replacement = carry_assignment_decl_observations(
+                    stmt,
+                    CStmt::Decl {
+                        ty: local_types[&name].clone(),
+                        name,
+                        init: Some(init.clone()),
+                    },
+                );
+                return carry_outer_stmt_observations(stmt, replacement);
             }
             inline_decls_in_stmt(stmt, local_types, global_counts, declared)
         })
@@ -684,6 +751,10 @@ fn inline_decls_in_stmt(
     declared: &mut HashSet<crate::symbol::SymbolId>,
 ) -> CStmt {
     match stmt {
+        CStmt::Observed { id, stmt } => CStmt::observed(
+            *id,
+            inline_decls_in_stmt(stmt, local_types, global_counts, declared),
+        ),
         CStmt::Block(stmts) => CStmt::Block(inline_decls_in_stmt_list(
             stmts,
             local_types,
@@ -748,11 +819,15 @@ fn inline_decls_in_stmt(
                     )
                 {
                     declared.insert(name);
-                    Box::new(CStmt::Decl {
-                        ty: local_types[&name].clone(),
-                        name,
-                        init: Some(init_expr.clone()),
-                    })
+                    let replacement = carry_assignment_decl_observations(
+                        init,
+                        CStmt::Decl {
+                            ty: local_types[&name].clone(),
+                            name,
+                            init: Some(init_expr.clone()),
+                        },
+                    );
+                    Box::new(carry_outer_stmt_observations(init, replacement))
                 } else {
                     Box::new(inline_decls_in_stmt(
                         init,
@@ -816,18 +891,51 @@ fn can_inline_decl(
 }
 
 fn assignment_decl_candidate(stmt: &CStmt) -> Option<(crate::symbol::SymbolId, &CExpr)> {
-    let CStmt::Expr(CExpr::Binary {
+    let stmt = stmt.unobserved();
+    let CStmt::Expr(expr) = stmt else {
+        return None;
+    };
+    let CExpr::Binary {
         op: BinaryOp::Assign,
         left,
         right,
-    }) = stmt
+    } = expr.unobserved()
     else {
         return None;
     };
-    let CExpr::Var(name) = left.as_ref() else {
+    let CExpr::Var(name) = left.unobserved() else {
         return None;
     };
     Some((*name, right.as_ref()))
+}
+
+fn carry_assignment_decl_observations(source: &CStmt, mut replacement: CStmt) -> CStmt {
+    let CStmt::Expr(expr) = source.unobserved() else {
+        return replacement;
+    };
+    let mut ids = Vec::new();
+    let mut cursor = expr;
+    while let CExpr::Observed { id, expr } = cursor {
+        ids.push(*id);
+        cursor = expr.as_ref();
+    }
+    let CExpr::Binary {
+        op: BinaryOp::Assign,
+        left,
+        ..
+    } = cursor
+    else {
+        return replacement;
+    };
+    let mut left = left.as_ref();
+    while let CExpr::Observed { id, expr } = left {
+        ids.push(*id);
+        left = expr.as_ref();
+    }
+    for id in ids.into_iter().rev() {
+        replacement = CStmt::observed(id, replacement);
+    }
+    replacement
 }
 
 fn expr_reads_var(expr: &CExpr, name: crate::symbol::SymbolId) -> bool {
@@ -865,6 +973,7 @@ fn count_vars_in_stmt_into(
     local_types: &HashMap<crate::symbol::SymbolId, CType>,
     counts: &mut HashMap<crate::symbol::SymbolId, usize>,
 ) {
+    let stmt = stmt.unobserved();
     match stmt {
         CStmt::Expr(expr) | CStmt::Return(Some(expr)) => {
             count_vars_in_expr_into(expr, local_types, counts);
@@ -939,6 +1048,7 @@ fn count_vars_in_stmt_into(
         | CStmt::Goto(_)
         | CStmt::Label(_)
         | CStmt::Comment(_) => {}
+        CStmt::Observed { .. } => unreachable!("unobserved statement expected"),
     }
 }
 
@@ -954,6 +1064,91 @@ fn count_vars_in_expr_into(
             *counts.entry(*name).or_insert(0) += 1;
         }
     });
+}
+
+fn prepare_stmt_sequence_for_emission(stmts: &[CStmt]) -> Vec<CStmt> {
+    let nested = stmts
+        .iter()
+        .map(prepare_stmt_for_emission)
+        .collect::<Vec<_>>();
+    let mut prepared = Vec::with_capacity(nested.len());
+    let mut index = 0;
+    while index < nested.len() {
+        if let Some((run_len, stmt)) = coalesced_scalar_update_run(&nested[index..]) {
+            prepared.push(stmt);
+            index += run_len;
+        } else {
+            prepared.push(nested[index].clone());
+            index += 1;
+        }
+    }
+    prepared
+}
+
+fn prepare_stmt_for_emission(stmt: &CStmt) -> CStmt {
+    match stmt {
+        CStmt::Observed { id, stmt } => {
+            CStmt::observed(*id, prepare_stmt_for_emission(stmt.as_ref()))
+        }
+        CStmt::Block(stmts) => CStmt::Block(prepare_stmt_sequence_for_emission(stmts)),
+        CStmt::If {
+            cond,
+            then_body,
+            else_body,
+        } => CStmt::If {
+            cond: cond.clone(),
+            then_body: Box::new(prepare_stmt_for_emission(then_body)),
+            else_body: else_body
+                .as_deref()
+                .map(prepare_stmt_for_emission)
+                .map(Box::new),
+        },
+        CStmt::While { cond, body } => CStmt::While {
+            cond: cond.clone(),
+            body: Box::new(prepare_stmt_for_emission(body)),
+        },
+        CStmt::DoWhile { body, cond } => CStmt::DoWhile {
+            body: Box::new(prepare_stmt_for_emission(body)),
+            cond: cond.clone(),
+        },
+        CStmt::For {
+            init,
+            cond,
+            update,
+            body,
+        } => CStmt::For {
+            init: init.as_deref().map(prepare_stmt_for_emission).map(Box::new),
+            cond: cond.clone(),
+            update: update.clone(),
+            body: Box::new(prepare_stmt_for_emission(body)),
+        },
+        CStmt::Switch {
+            expr,
+            cases,
+            default,
+        } => CStmt::Switch {
+            expr: expr.clone(),
+            cases: cases
+                .iter()
+                .map(|case| crate::ast::SwitchCase {
+                    value: case.value.clone(),
+                    body: prepare_stmt_sequence_for_emission(&case.body),
+                })
+                .collect(),
+            default: default
+                .as_ref()
+                .map(|stmts| prepare_stmt_sequence_for_emission(stmts)),
+        },
+        CStmt::Decl { .. }
+        | CStmt::Expr(_)
+        | CStmt::Return(_)
+        | CStmt::Empty
+        | CStmt::Break
+        | CStmt::Continue
+        | CStmt::Goto(_)
+        | CStmt::Label(_)
+        | CStmt::Comment(_) => stmt.clone(),
+    }
 }
 
 fn coalesced_scalar_update_run(stmts: &[CStmt]) -> Option<(usize, CStmt)> {
@@ -976,12 +1171,17 @@ fn coalesced_scalar_update_run(stmts: &[CStmt]) -> Option<(usize, CStmt)> {
         return None;
     }
 
-    Some((run_len, scalar_update_stmt(name, total)?))
+    let stmt = scalar_update_stmt(name, total)?;
+    Some((run_len, carry_render_observations(&stmts[..run_len], stmt)))
 }
 
 fn scalar_update_stmt(name: crate::symbol::SymbolId, delta: i64) -> Option<CStmt> {
     if delta == 0 {
-        return Some(CStmt::Empty);
+        // Removing the whole run would also remove the source definitions it
+        // represents. Keep the original statements until an explicit elision
+        // proof, rather than carrying exact render observations onto an empty
+        // statement that emits no C.
+        return None;
     }
     let (op, amount) = if delta < 0 {
         (BinaryOp::SubAssign, delta.checked_abs()?)
@@ -1015,6 +1215,7 @@ fn scalar_update_expr(expr: &CExpr) -> Option<CExpr> {
 }
 
 fn scalar_self_update_delta(stmt: &CStmt) -> Option<(crate::symbol::SymbolId, i64)> {
+    let stmt = stmt.unobserved();
     let CStmt::Expr(expr) = stmt else {
         return None;
     };
@@ -1022,10 +1223,11 @@ fn scalar_self_update_delta(stmt: &CStmt) -> Option<(crate::symbol::SymbolId, i6
 }
 
 fn scalar_self_update_delta_expr(expr: &CExpr) -> Option<(crate::symbol::SymbolId, i64)> {
+    let expr = expr.unobserved();
     let CExpr::Binary { op, left, right } = expr else {
         return None;
     };
-    let CExpr::Var(lhs_name) = left.as_ref() else {
+    let CExpr::Var(lhs_name) = left.unobserved() else {
         return None;
     };
     match op {
@@ -1042,6 +1244,7 @@ fn update_delta_for_rhs(
     lhs_name: crate::symbol::SymbolId,
     rhs: &CExpr,
 ) -> Option<(crate::symbol::SymbolId, i64)> {
+    let rhs = rhs.unobserved();
     let CExpr::Binary { op, left, right } = rhs else {
         return None;
     };
@@ -1064,10 +1267,11 @@ fn update_delta_for_rhs(
 }
 
 fn expr_is_var(expr: &CExpr, name: crate::symbol::SymbolId) -> bool {
-    matches!(expr, CExpr::Var(candidate) if *candidate == name)
+    matches!(expr.unobserved(), CExpr::Var(candidate) if *candidate == name)
 }
 
 fn literal_i64(expr: &CExpr) -> Option<i64> {
+    let expr = expr.unobserved();
     match expr {
         CExpr::IntLit(value) => Some(*value),
         CExpr::UIntLit(value) => i64::try_from(*value).ok(),
@@ -1094,6 +1298,7 @@ fn additive_negative_rhs_rewrite(
 }
 
 fn negative_literal_magnitude(expr: &CExpr) -> Option<PositiveLiteralMagnitude> {
+    let expr = expr.unobserved();
     match expr {
         CExpr::IntLit(value) if *value < 0 => Some(PositiveLiteralMagnitude {
             value: value.unsigned_abs(),
@@ -1119,6 +1324,7 @@ fn additive_negative_product_rhs_rewrite(op: BinaryOp, rhs: &CExpr) -> Option<(B
 }
 
 fn negative_product_positive_rhs(expr: &CExpr) -> Option<CExpr> {
+    let expr = expr.unobserved();
     match expr {
         CExpr::Binary {
             op: BinaryOp::Mul,
@@ -1193,6 +1399,227 @@ mod tests {
         let code = generate(&func);
         assert!(code.contains("int32_t add(int32_t a, int32_t b)"));
         assert!(code.contains("return a + b;"));
+    }
+
+    #[test]
+    fn unsealed_observation_wrappers_cannot_reach_codegen() {
+        let symbols = test_table();
+        let value = crate::symbol::declare(&symbols, "value");
+        let plain = CFunction {
+            name: "observed".to_string(),
+            ret_type: CType::i32(),
+            params: vec![],
+            locals: vec![],
+            body: vec![CStmt::If {
+                cond: CExpr::binary(BinaryOp::Gt, CExpr::var(value), CExpr::int(0)),
+                then_body: Box::new(CStmt::Return(Some(CExpr::binary(
+                    BinaryOp::Add,
+                    CExpr::var(value),
+                    CExpr::int(1),
+                )))),
+                else_body: Some(Box::new(CStmt::Return(Some(CExpr::int(0))))),
+            }],
+            params_known: true,
+            symbols: std::rc::Rc::new(symbols),
+        };
+        let mut observed = plain.clone();
+        let mut observation_owner = crate::ast::RenderObservationOwner::new();
+        let (_, observed_value) = observation_owner
+            .observe_expr(CExpr::var(value))
+            .expect("allocate value observation");
+        let (_, observed_cond) = observation_owner
+            .observe_expr(CExpr::binary(
+                BinaryOp::Gt,
+                CExpr::var(value),
+                CExpr::int(0),
+            ))
+            .expect("allocate condition observation");
+        let (_, observed_stmt) = observation_owner
+            .observe_stmt(CStmt::If {
+                cond: observed_cond,
+                then_body: Box::new(CStmt::Return(Some(CExpr::binary(
+                    BinaryOp::Add,
+                    observed_value,
+                    CExpr::int(1),
+                )))),
+                else_body: Some(Box::new(CStmt::Return(Some(CExpr::int(0))))),
+            })
+            .expect("allocate statement observation");
+        observed.body = vec![observed_stmt];
+
+        let statement_refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            CodeGenerator::new(CodeGenConfig::default()).generate_stmt(&observed.body[0])
+        }));
+        assert!(
+            statement_refused.is_err(),
+            "marked statement bypassed journal sealing"
+        );
+        let ready = prepare_function_for_emission(&observed);
+        let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            CodeGenerator::new(CodeGenConfig::default()).generate_function(&ready)
+        }));
+        assert!(refused.is_err(), "marked AST bypassed journal sealing");
+        assert!(!generate(&plain).is_empty());
+    }
+
+    #[test]
+    fn observation_wrappers_survive_codegen_ast_transformations() {
+        let symbols = test_table();
+        let value = crate::symbol::declare(&symbols, "value");
+        let local = CLocal {
+            ty: CType::i32(),
+            name: value,
+            stack_offset: None,
+        };
+        let assignment = CStmt::Expr(CExpr::assign(CExpr::var(value), CExpr::int(1)));
+        let plain = CFunction {
+            name: "inline_decl".to_string(),
+            ret_type: CType::Void,
+            params: vec![],
+            locals: vec![local.clone()],
+            body: vec![assignment.clone()],
+            params_known: true,
+            symbols: std::rc::Rc::new(symbols),
+        };
+        let (plain_locals, plain_body) = inline_local_declaration_initializers(&plain);
+
+        let mut owner = crate::ast::RenderObservationOwner::new();
+        let (lhs_id, lhs) = owner
+            .observe_expr(CExpr::var(value))
+            .expect("allocate lhs observation");
+        let (rhs_id, rhs) = owner
+            .observe_expr(CExpr::int(1))
+            .expect("allocate rhs observation");
+        let (assignment_id, assignment) = owner
+            .observe_expr(CExpr::assign(lhs, rhs))
+            .expect("allocate assignment observation");
+        let (stmt_id, stmt) = owner
+            .observe_stmt(CStmt::Expr(assignment))
+            .expect("allocate statement observation");
+        let observed = CFunction {
+            body: vec![stmt],
+            ..plain.clone()
+        };
+        let (observed_locals, observed_body) = inline_local_declaration_initializers(&observed);
+        let mut transformed = CFunction {
+            locals: observed_locals,
+            body: observed_body,
+            ..observed
+        };
+        let reachable =
+            crate::ast::strip_render_observations(&mut transformed, owner.expected_count())
+                .expect("declaration inlining preserved a valid observation domain");
+
+        assert_eq!(transformed.locals, plain_locals);
+        assert_eq!(transformed.body, plain_body);
+        assert_eq!(
+            reachable.ids().collect::<Vec<_>>(),
+            vec![lhs_id, rhs_id, assignment_id, stmt_id]
+        );
+
+        let update = |amount| {
+            CStmt::Expr(CExpr::assign(
+                CExpr::var(value),
+                CExpr::binary(BinaryOp::Add, CExpr::var(value), CExpr::int(amount)),
+            ))
+        };
+        let plain_updates = vec![update(1), update(2)];
+        let (_, plain_update) =
+            coalesced_scalar_update_run(&plain_updates).expect("plain scalar run");
+        let mut owner = crate::ast::RenderObservationOwner::new();
+        let mut observed_updates = Vec::new();
+        let mut expected_ids = Vec::new();
+        for amount in [1, 2] {
+            let (expr_id, expr) = owner
+                .observe_expr(CExpr::assign(
+                    CExpr::var(value),
+                    CExpr::binary(BinaryOp::Add, CExpr::var(value), CExpr::int(amount)),
+                ))
+                .expect("allocate update observation");
+            let (stmt_id, stmt) = owner
+                .observe_stmt(CStmt::Expr(expr))
+                .expect("allocate update statement observation");
+            expected_ids.extend([expr_id, stmt_id]);
+            observed_updates.push(stmt);
+        }
+        let (_, observed_update) =
+            coalesced_scalar_update_run(&observed_updates).expect("observed scalar run");
+        let mut transformed =
+            CFunction::new("updates", CType::Void).with_body(vec![observed_update]);
+        let reachable =
+            crate::ast::strip_render_observations(&mut transformed, owner.expected_count())
+                .expect("coalescing preserved a valid observation domain");
+
+        assert_eq!(transformed.body, vec![plain_update]);
+        assert_eq!(reachable.ids().collect::<Vec<_>>(), expected_ids);
+    }
+
+    #[test]
+    fn for_init_declaration_inlining_preserves_every_assignment_observation() {
+        let symbols = test_table();
+        let value = crate::symbol::declare(&symbols, "value");
+        let local = CLocal {
+            ty: CType::i32(),
+            name: value,
+            stack_offset: None,
+        };
+        let plain = CFunction {
+            name: "inline_for_init".to_string(),
+            ret_type: CType::Void,
+            params: vec![],
+            locals: vec![local],
+            body: vec![CStmt::For {
+                init: Some(Box::new(CStmt::Expr(CExpr::assign(
+                    CExpr::var(value),
+                    CExpr::int(0),
+                )))),
+                cond: None,
+                update: None,
+                body: Box::new(CStmt::Empty),
+            }],
+            params_known: true,
+            symbols: std::rc::Rc::new(symbols),
+        };
+        let (plain_locals, plain_body) = inline_local_declaration_initializers(&plain);
+
+        let mut owner = crate::ast::RenderObservationOwner::new();
+        let (lhs_id, lhs) = owner
+            .observe_expr(CExpr::var(value))
+            .expect("allocate lhs observation");
+        let (rhs_id, rhs) = owner
+            .observe_expr(CExpr::int(0))
+            .expect("allocate rhs observation");
+        let (assignment_id, assignment) = owner
+            .observe_expr(CExpr::assign(lhs, rhs))
+            .expect("allocate assignment observation");
+        let (stmt_id, init) = owner
+            .observe_stmt(CStmt::Expr(assignment))
+            .expect("allocate init statement observation");
+        let observed = CFunction {
+            body: vec![CStmt::For {
+                init: Some(Box::new(init)),
+                cond: None,
+                update: None,
+                body: Box::new(CStmt::Empty),
+            }],
+            ..plain.clone()
+        };
+        let (locals, body) = inline_local_declaration_initializers(&observed);
+        let mut transformed = CFunction {
+            locals,
+            body,
+            ..observed
+        };
+        let reachable =
+            crate::ast::strip_render_observations(&mut transformed, owner.expected_count())
+                .expect("for-init declaration inlining preserved a valid observation domain");
+
+        assert_eq!(transformed.locals, plain_locals);
+        assert_eq!(transformed.body, plain_body);
+        assert_eq!(
+            reachable.ids().collect::<Vec<_>>(),
+            vec![lhs_id, rhs_id, assignment_id, stmt_id]
+        );
     }
 
     #[test]
@@ -1408,15 +1835,27 @@ mod tests {
         let mut func = CFunction::new("updates", CType::Void).with_body(vec![
             CStmt::expr(CExpr::assign(
                 CExpr::var(crate::symbol::declare(&symbols, "acc")),
-                CExpr::binary(BinaryOp::Add, CExpr::var(crate::symbol::declare(&symbols, "acc")), CExpr::int(3)),
+                CExpr::binary(
+                    BinaryOp::Add,
+                    CExpr::var(crate::symbol::declare(&symbols, "acc")),
+                    CExpr::int(3),
+                ),
             )),
             CStmt::expr(CExpr::assign(
                 CExpr::var(crate::symbol::declare(&symbols, "acc")),
-                CExpr::binary(BinaryOp::Add, CExpr::int(4), CExpr::var(crate::symbol::declare(&symbols, "acc"))),
+                CExpr::binary(
+                    BinaryOp::Add,
+                    CExpr::int(4),
+                    CExpr::var(crate::symbol::declare(&symbols, "acc")),
+                ),
             )),
             CStmt::expr(CExpr::assign(
                 CExpr::var(crate::symbol::declare(&symbols, "acc")),
-                CExpr::binary(BinaryOp::Sub, CExpr::var(crate::symbol::declare(&symbols, "acc")), CExpr::int(2)),
+                CExpr::binary(
+                    BinaryOp::Sub,
+                    CExpr::var(crate::symbol::declare(&symbols, "acc")),
+                    CExpr::int(2),
+                ),
             )),
             CStmt::Return(None),
         ]);
@@ -1437,16 +1876,31 @@ mod tests {
         let mut func = CFunction::new("updates", CType::Void).with_body(vec![
             CStmt::expr(CExpr::assign(
                 CExpr::var(crate::symbol::declare(&symbols, "acc")),
-                CExpr::binary(BinaryOp::Add, CExpr::var(crate::symbol::declare(&symbols, "acc")), CExpr::int(1)),
+                CExpr::binary(
+                    BinaryOp::Add,
+                    CExpr::var(crate::symbol::declare(&symbols, "acc")),
+                    CExpr::int(1),
+                ),
             )),
-            CStmt::expr(CExpr::call(CExpr::var(crate::symbol::declare(&symbols, "observe")), vec![CExpr::var(crate::symbol::declare(&symbols, "acc"))])),
+            CStmt::expr(CExpr::call(
+                CExpr::var(crate::symbol::declare(&symbols, "observe")),
+                vec![CExpr::var(crate::symbol::declare(&symbols, "acc"))],
+            )),
             CStmt::expr(CExpr::assign(
                 CExpr::var(crate::symbol::declare(&symbols, "acc")),
-                CExpr::binary(BinaryOp::Add, CExpr::var(crate::symbol::declare(&symbols, "acc")), CExpr::int(2)),
+                CExpr::binary(
+                    BinaryOp::Add,
+                    CExpr::var(crate::symbol::declare(&symbols, "acc")),
+                    CExpr::int(2),
+                ),
             )),
             CStmt::expr(CExpr::assign(
                 CExpr::var(crate::symbol::declare(&symbols, "acc")),
-                CExpr::binary(BinaryOp::Add, CExpr::var(crate::symbol::declare(&symbols, "acc")), CExpr::int(3)),
+                CExpr::binary(
+                    BinaryOp::Add,
+                    CExpr::var(crate::symbol::declare(&symbols, "acc")),
+                    CExpr::int(3),
+                ),
             )),
         ]);
         func.symbols = std::rc::Rc::new(symbols);
@@ -1456,6 +1910,30 @@ mod tests {
         assert!(
             code.contains("acc++;\n    observe(acc);\n    acc += 5;"),
             "observable call should break the update run, got:\n{code}"
+        );
+    }
+
+    #[test]
+    fn zero_sum_scalar_updates_remain_explicit() {
+        let symbols = test_table();
+        let acc = crate::symbol::declare(&symbols, "acc");
+        let mut func = CFunction::new("updates", CType::Void).with_body(vec![
+            CStmt::expr(CExpr::assign(
+                CExpr::var(acc),
+                CExpr::binary(BinaryOp::Add, CExpr::var(acc), CExpr::int(1)),
+            )),
+            CStmt::expr(CExpr::assign(
+                CExpr::var(acc),
+                CExpr::binary(BinaryOp::Sub, CExpr::var(acc), CExpr::int(1)),
+            )),
+        ]);
+        func.symbols = std::rc::Rc::new(symbols);
+
+        let code = generate(&func);
+
+        assert!(
+            code.contains("acc++;\n    acc--;"),
+            "zero-sum definitions must not disappear without an elision proof:\n{code}"
         );
     }
 }

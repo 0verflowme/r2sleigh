@@ -45,6 +45,9 @@ pub(crate) fn drop_values_from_void_returns(func: &mut CFunction) {
 
 fn drop_void_return_value(stmt: CStmt) -> CStmt {
     match stmt {
+        CStmt::Observed { id, stmt } => {
+            CStmt::observed(id, drop_void_return_value(*stmt))
+        }
         CStmt::Return(Some(_)) => CStmt::Return(None),
         CStmt::Block(body) => {
             CStmt::Block(body.into_iter().map(drop_void_return_value).collect())
@@ -313,6 +316,7 @@ pub(crate) fn prune_unreferenced_labels(func: &mut CFunction) {
 
 fn collect_goto_targets(stmt: &CStmt, out: &mut std::collections::BTreeSet<String>) {
     match stmt {
+        CStmt::Observed { stmt, .. } => collect_goto_targets(stmt, out),
         CStmt::Goto(label) => {
             out.insert(label.clone());
         }
@@ -355,6 +359,8 @@ fn drop_labels_outside(
     targeted: &std::collections::BTreeSet<String>,
 ) -> Option<CStmt> {
     match stmt {
+        CStmt::Observed { id, stmt } => drop_labels_outside(*stmt, targeted)
+            .map(|stmt| CStmt::observed(id, stmt)),
         CStmt::Label(name) if !targeted.contains(&name) => None,
         CStmt::Block(body) => Some(CStmt::Block(
             body.into_iter()
@@ -489,7 +495,7 @@ fn collect_assigned_undeclared(
                     left,
                     right,
                 } = node
-                    && let CExpr::Var(name) = left.as_ref()
+                    && let CExpr::Var(name) = left.unobserved()
                     && !declared.contains(name)
                     && !out.iter().any(|(seen, _)| seen == name)
                 {
@@ -497,7 +503,7 @@ fn collect_assigned_undeclared(
                 }
             });
         };
-        match stmt {
+        match stmt.unobserved() {
             CStmt::Expr(expr) | CStmt::Return(Some(expr)) => inspect(expr),
             CStmt::If { cond, .. } | CStmt::While { cond, .. } | CStmt::DoWhile { cond, .. } => {
                 inspect(cond)
@@ -505,7 +511,9 @@ fn collect_assigned_undeclared(
             CStmt::For {
                 init, cond, update, ..
             } => {
-                if let Some(CStmt::Expr(expr)) = init.as_deref() {
+                if let Some(init) = init.as_deref()
+                    && let CStmt::Expr(expr) = init.unobserved()
+                {
                     inspect(expr);
                 }
                 if let Some(cond) = cond {
@@ -527,7 +535,7 @@ fn collect_assigned_undeclared(
 
 /// The type to declare an induction variable with, taken from what it starts as.
 fn width_of_initial_value(value: &CExpr) -> crate::ast::CType {
-    match value {
+    match value.unobserved() {
         CExpr::Cast { ty, .. } => ty.clone(),
         CExpr::UIntLit(_) => crate::ast::CType::UInt(64),
         _ => crate::ast::CType::Int(64),

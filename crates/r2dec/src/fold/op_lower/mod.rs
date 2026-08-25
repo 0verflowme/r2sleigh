@@ -348,6 +348,7 @@ fn expr_contains_call(expr: &CExpr) -> bool {
 
 pub(crate) fn expr_is_side_effect_free(expr: &CExpr) -> bool {
     match expr {
+        CExpr::Observed { expr, .. } => expr_is_side_effect_free(expr),
         CExpr::IntLit(_)
         | CExpr::UIntLit(_)
         | CExpr::FloatLit(_)
@@ -394,8 +395,7 @@ pub(crate) fn expr_is_side_effect_free(expr: &CExpr) -> bool {
                 && expr_is_side_effect_free(else_expr)
         }
         CExpr::Subscript { base, index } => {
-            expr_is_side_effect_free(base)
-                && expr_is_side_effect_free(index)
+            expr_is_side_effect_free(base) && expr_is_side_effect_free(index)
         }
         CExpr::Member { base, .. } | CExpr::PtrMember { base, .. } => {
             expr_is_side_effect_free(base)
@@ -406,7 +406,6 @@ pub(crate) fn expr_is_side_effect_free(expr: &CExpr) -> bool {
 }
 
 fn is_static_jump_table_base_name(name: &str) -> bool {
-
     let lower = name.to_ascii_lowercase();
     if matches!(
         SSAVarNameKind::classify(&lower),
@@ -420,13 +419,20 @@ fn is_static_jump_table_base_name(name: &str) -> bool {
 }
 
 fn side_effect_free_assignment_name(stmt: &CStmt) -> Option<crate::symbol::SymbolId> {
+    if let CStmt::Observed { stmt, .. } = stmt {
+        return side_effect_free_assignment_name(stmt);
+    }
     let (name, rhs) = match stmt {
-        CStmt::Expr(CExpr::Binary {
-            op: BinaryOp::Assign,
-            left,
-            right,
-        }) => {
-            let CExpr::Var(name) = left.as_ref() else {
+        CStmt::Expr(expr) => {
+            let CExpr::Binary {
+                op: BinaryOp::Assign,
+                left,
+                right,
+            } = expr.unobserved()
+            else {
+                return None;
+            };
+            let CExpr::Var(name) = left.unobserved() else {
                 return None;
             };
             (*name, right.as_ref())
@@ -443,6 +449,7 @@ fn side_effect_free_assignment_name(stmt: &CStmt) -> Option<crate::symbol::Symbo
 
 fn stmt_contains_memory_like_access(stmt: &CStmt) -> bool {
     match stmt {
+        CStmt::Observed { stmt, .. } => stmt_contains_memory_like_access(stmt),
         CStmt::Expr(expr) | CStmt::Return(Some(expr)) => expr_contains_memory_like_access(expr),
         CStmt::Decl { init, .. } => init.as_ref().is_some_and(expr_contains_memory_like_access),
         CStmt::Block(stmts) => stmts.iter().any(stmt_contains_memory_like_access),
@@ -828,7 +835,6 @@ fn shift_matches_signed_concat_width(
 }
 
 pub(super) fn is_generic_arg_name(name: &str) -> bool {
-
     let lower = name.to_ascii_lowercase();
     lower
         .strip_prefix("arg")
@@ -837,7 +843,6 @@ pub(super) fn is_generic_arg_name(name: &str) -> bool {
 }
 
 pub(crate) fn should_replace_preserved_stack_alias(existing: &str) -> bool {
-
     let normalized = existing.trim_start_matches('&');
     normalized == "stack"
         || normalized.starts_with("local_")
@@ -846,7 +851,6 @@ pub(crate) fn should_replace_preserved_stack_alias(existing: &str) -> bool {
 }
 
 pub(crate) fn is_generic_stack_placeholder_alias(existing: &str) -> bool {
-
     analysis::utils::is_generic_stack_placeholder_alias(existing)
 }
 
@@ -855,6 +859,7 @@ fn call_arg_callee_name(
     expr: &CExpr,
 ) -> Option<std::rc::Rc<str>> {
     match expr {
+        CExpr::Observed { expr, .. } => call_arg_callee_name(symbols, expr),
         CExpr::Var(name) => Some(crate::symbol::spelling(symbols, *name)),
         // A call names something outside the function, so the callee is an
         // external. Matching only variables here lost the signature for every
