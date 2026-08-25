@@ -42,6 +42,7 @@ use crate::semantic::{
     PreparedFunctionFacts, ReturnValueCertificate, StackReloadSourceCertificate,
     StructuredDataflowFacts,
 };
+use crate::span::StorageSpans;
 use crate::var::{SSAVar, SSAVarNameKind};
 
 /// Switch case information: Vec of (case_value, target_address) pairs and optional default target.
@@ -145,6 +146,7 @@ pub struct SsaArtifact {
     provenance: SsaArtifactProvenance,
     function: SSAFunction,
     graph: SsaGraph,
+    storage_spans: StorageSpans,
     mode: FunctionPrepareMode,
     facts: PreparedFunctionFacts,
     machine_context: SourceMachineContext,
@@ -285,6 +287,7 @@ impl SsaArtifact {
         control.poll()?;
         machine_context.remap_memory_sites_to_prepared(&function);
         let graph = SsaGraph::from_function_with_storage(&function);
+        let storage_spans = StorageSpans::compute(&function, &graph);
         control.poll()?;
         let facts = PreparedFunctionFacts::collect_with_context(
             &function,
@@ -304,6 +307,7 @@ impl SsaArtifact {
             provenance,
             function,
             graph,
+            storage_spans,
             mode,
             facts,
             machine_context,
@@ -618,8 +622,8 @@ impl SsaArtifact {
     }
 
     /// Where each storage stops holding one value and starts holding another.
-    pub fn storage_spans(&self) -> crate::span::StorageSpans {
-        crate::span::StorageSpans::compute(&self.function, &self.graph)
+    pub const fn storage_spans(&self) -> &StorageSpans {
+        &self.storage_spans
     }
 
     /// Carriers whose values are not all one storage holding one value.
@@ -675,7 +679,7 @@ impl SsaArtifact {
             .copied()
             .filter(|member| {
                 storage_of(*member)
-                    .is_some_and(|storage| crate::span::same_run(carrier_storage, storage))
+                    .is_some_and(|storage| carrier_storage.location() == storage.location())
             })
             .collect()
     }
@@ -778,6 +782,7 @@ impl SsaArtifact {
             provenance: SsaArtifactProvenance::Manual,
             function: self.function.clone(),
             graph: self.graph.clone(),
+            storage_spans: self.storage_spans.clone(),
             mode: self.mode,
             facts,
             machine_context: self.machine_context.clone(),

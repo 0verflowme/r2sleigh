@@ -18,32 +18,36 @@
 //! The grouping is a disjoint set over values, so building it costs one pass over
 //! the instructions and answering costs effectively constant time.
 
-use std::collections::BTreeSet;
-
 use crate::function::SSAFunction;
 use crate::graph::{SsaGraph, ValueId};
-use crate::var::CanonicalStorageId;
 
 /// One run of definitions over which a storage holds a single value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SpanId(u32);
 
 /// Which values belong to the same run of one storage.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+///
+/// Construction roots are deliberately not retained: union-by-rank chooses a
+/// representative based on traversal order, so exposing that root as a span
+/// identity makes otherwise identical artifacts disagree. Finalized IDs are
+/// dense and ordered by the minimum stable [`ValueId`] in each component.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StorageSpans {
+    span_by_value: Vec<SpanId>,
+}
+
+/// Mutable construction state that cannot escape as a semantic artifact.
+struct StorageSpanBuilder {
     parent: Vec<u32>,
     rank: Vec<u8>,
 }
 
 impl StorageSpans {
     /// Cut every storage into the runs over which it holds one value.
-    pub fn compute(func: &SSAFunction, graph: &SsaGraph) -> Self {
-        let mut spans = Self {
-            parent: (0..graph.values.len() as u32).collect(),
-            rank: vec![0; graph.values.len()],
-        };
+    pub(crate) fn compute(func: &SSAFunction, graph: &SsaGraph) -> Self {
+        let mut builder = StorageSpanBuilder::new(graph.values.len());
 
-        let storage_of = |value: ValueId| -> Option<CanonicalStorageId> {
+        let storage_of = |value: ValueId| {
             graph
                 .value(value)
                 .and_then(|value| value.canonical_storage)
@@ -51,16 +55,19 @@ impl StorageSpans {
         };
         // A definition that reads its own storage continues that storage's run.
         // One that reads none of it begins a new run, whatever it is called.
-        let mut join_with_same_storage = |output: ValueId, inputs: &[ValueId], spans: &mut Self| {
-            let Some(storage) = storage_of(output) else {
-                return;
-            };
-            for input in inputs {
-                if storage_of(*input).is_some_and(|other| same_run(storage, other)) {
-                    spans.union(output, *input);
+        let join_with_same_storage =
+            |output: ValueId, inputs: &[ValueId], builder: &mut StorageSpanBuilder| {
+                let Some(storage) = storage_of(output) else {
+                    return;
+                };
+                for input in inputs {
+                    if storage_of(*input)
+                        .is_some_and(|other| storage.location() == other.location())
+                    {
+                        builder.union(output, *input);
+                    }
                 }
-            }
-        };
+            };
 
         for block in func.blocks() {
             for phi in &block.phis {
@@ -72,7 +79,7 @@ impl StorageSpans {
                     .iter()
                     .filter_map(|(_, source)| graph.value_id_for_var(source))
                     .collect::<Vec<_>>();
-                join_with_same_storage(output, &sources, &mut spans);
+                join_with_same_storage(output, &sources, &mut builder);
             }
             for (op_index, _) in block.ops.iter().enumerate() {
                 let Some(inst) = graph
@@ -84,10 +91,39 @@ impl StorageSpans {
                 let Some(output) = inst.output else {
                     continue;
                 };
-                join_with_same_storage(output, &inst.inputs, &mut spans);
+                join_with_same_storage(output, &inst.inputs, &mut builder);
             }
         }
-        spans
+        builder.finalize()
+    }
+
+    /// The run this value belongs to.
+    pub fn span_of(&self, value: ValueId) -> Option<SpanId> {
+        self.span_by_value.get(value.0 as usize).copied()
+    }
+
+    /// Whether every one of these values is the same storage holding one value.
+    pub fn all_one_span(&self, values: impl IntoIterator<Item = ValueId>) -> bool {
+        let mut first = None;
+        for value in values {
+            let Some(span) = self.span_of(value) else {
+                return false;
+            };
+            if first.is_some_and(|first| first != span) {
+                return false;
+            }
+            first = Some(span);
+        }
+        first.is_some()
+    }
+}
+
+impl StorageSpanBuilder {
+    fn new(value_count: usize) -> Self {
+        Self {
+            parent: (0..value_count as u32).collect(),
+            rank: vec![0; value_count],
+        }
     }
 
     fn union(&mut self, left: ValueId, right: ValueId) {
@@ -105,7 +141,7 @@ impl StorageSpans {
         }
     }
 
-    /// Find with path compression, so repeated questions stay effectively constant.
+    /// Find with path compression, so construction stays effectively linear.
     fn find_mut(&mut self, mut index: u32) -> u32 {
         while self.parent[index as usize] != index {
             let grandparent = self.parent[self.parent[index as usize] as usize];
@@ -115,49 +151,59 @@ impl StorageSpans {
         index
     }
 
-    /// The run this value belongs to.
-    pub fn span_of(&self, value: ValueId) -> Option<SpanId> {
-        if value.0 as usize >= self.parent.len() {
-            return None;
+    fn finalize(mut self) -> StorageSpans {
+        let roots = (0..self.parent.len())
+            .map(|index| self.find_mut(index as u32))
+            .collect::<Vec<_>>();
+        let mut minimum_by_root = vec![None::<u32>; roots.len()];
+        for (member, root) in roots.iter().copied().enumerate() {
+            let minimum = &mut minimum_by_root[root as usize];
+            *minimum = Some(minimum.map_or(member as u32, |old| old.min(member as u32)));
         }
-        // Read-only find; the compressing one is used while building.
-        let mut index = value.0;
-        while self.parent[index as usize] != index {
-            index = self.parent[index as usize];
-        }
-        Some(SpanId(index))
-    }
 
-    /// Whether every one of these values is the same storage holding one value.
-    pub fn all_one_span(&self, values: impl IntoIterator<Item = ValueId>) -> bool {
-        let mut spans = BTreeSet::new();
-        for value in values {
-            match self.span_of(value) {
-                Some(span) => {
-                    spans.insert(span);
-                }
-                None => return false,
-            }
-            if spans.len() > 1 {
-                return false;
-            }
+        let mut component_starts = vec![false; roots.len()];
+        for minimum in minimum_by_root.iter().flatten() {
+            component_starts[*minimum as usize] = true;
         }
-        !spans.is_empty()
+        let mut next_span = 0;
+        let span_by_minimum = component_starts
+            .into_iter()
+            .map(|is_start| {
+                is_start.then(|| {
+                    let span = SpanId(next_span);
+                    next_span += 1;
+                    span
+                })
+            })
+            .collect::<Vec<_>>();
+        let span_by_value = roots
+            .into_iter()
+            .map(|root| {
+                let minimum = minimum_by_root[root as usize]
+                    .expect("every finalized root has at least one member");
+                span_by_minimum[minimum as usize]
+                    .expect("every component minimum has a canonical span")
+            })
+            .collect();
+        StorageSpans { span_by_value }
     }
 }
 
-/// Whether two storage identities are the same place read at possibly different widths.
-///
-/// Sub-register writes land at the same offset in the same space, so the offset
-/// and space are what say "same place" and the size says only how much of it was
-/// touched.
-pub fn same_run(left: CanonicalStorageId, right: CanonicalStorageId) -> bool {
-    left.space == right.space && left.offset == right.offset
+#[cfg(test)]
+impl StorageSpans {
+    fn from_unions(value_count: usize, unions: &[(ValueId, ValueId)]) -> Self {
+        let mut builder = StorageSpanBuilder::new(value_count);
+        for &(left, right) in unions {
+            builder.union(left, right);
+        }
+        builder.finalize()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
     use r2il::{ArchSpec, R2ILBlock, R2ILOp, RegisterDef, SpaceId, Varnode};
 
     fn reg(offset: u64, size: u32) -> Varnode {
@@ -183,6 +229,88 @@ mod tests {
             })
             .map(|index| ValueId(index as u32))
             .unwrap_or_else(|| panic!("no {name}_{version}"))
+    }
+
+    #[test]
+    fn finalized_span_ids_ignore_union_order_and_direction() {
+        let forward = [
+            (ValueId(5), ValueId(3)),
+            (ValueId(3), ValueId(4)),
+            (ValueId(2), ValueId(1)),
+        ];
+        let reversed = [
+            (ValueId(1), ValueId(2)),
+            (ValueId(4), ValueId(3)),
+            (ValueId(3), ValueId(5)),
+        ];
+
+        assert_eq!(
+            StorageSpans::from_unions(6, &forward),
+            StorageSpans::from_unions(6, &reversed)
+        );
+    }
+
+    proptest! {
+        #[test]
+        fn finalized_span_ids_ignore_arbitrary_union_schedules(
+            value_count in 1usize..64,
+            raw_edges in prop::collection::vec(
+                (any::<u8>(), any::<u8>(), any::<u16>(), any::<bool>()),
+                0..128,
+            ),
+        ) {
+            let baseline_edges = raw_edges
+                .iter()
+                .map(|(left, right, _, _)| {
+                    (
+                        ValueId(u32::from(*left) % value_count as u32),
+                        ValueId(u32::from(*right) % value_count as u32),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let baseline = StorageSpans::from_unions(value_count, &baseline_edges);
+
+            let mut scheduled = raw_edges
+                .iter()
+                .enumerate()
+                .map(|(index, (left, right, order, reverse))| {
+                    let left = ValueId(u32::from(*left) % value_count as u32);
+                    let right = ValueId(u32::from(*right) % value_count as u32);
+                    let edge = if *reverse { (right, left) } else { (left, right) };
+                    (*order, index, edge)
+                })
+                .collect::<Vec<_>>();
+            scheduled.sort_by_key(|(order, index, _)| (*order, *index));
+            let scheduled_edges = scheduled
+                .into_iter()
+                .map(|(_, _, edge)| edge)
+                .collect::<Vec<_>>();
+
+            prop_assert_eq!(
+                baseline,
+                StorageSpans::from_unions(value_count, &scheduled_edges)
+            );
+        }
+    }
+
+    #[test]
+    fn finalized_span_ids_are_dense_in_minimum_member_order() {
+        let spans = StorageSpans::from_unions(
+            6,
+            &[
+                (ValueId(5), ValueId(0)),
+                (ValueId(5), ValueId(4)),
+                (ValueId(2), ValueId(1)),
+            ],
+        );
+
+        assert_eq!(spans.span_of(ValueId(0)), Some(SpanId(0)));
+        assert_eq!(spans.span_of(ValueId(4)), Some(SpanId(0)));
+        assert_eq!(spans.span_of(ValueId(5)), Some(SpanId(0)));
+        assert_eq!(spans.span_of(ValueId(1)), Some(SpanId(1)));
+        assert_eq!(spans.span_of(ValueId(2)), Some(SpanId(1)));
+        assert_eq!(spans.span_of(ValueId(3)), Some(SpanId(2)));
+        assert_eq!(spans.span_of(ValueId(6)), None);
     }
 
     #[test]
