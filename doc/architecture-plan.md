@@ -1,11 +1,17 @@
 # Architecture plan: dispositions, bindings, and projections
 
-Execution status as of 2026-08-25 on `codex/binding-spine-rewrite`:
-stage 0 is committed at `e787934`. The pristine 54-cell raw baseline is
-complete; the strict raw gate reports 0 passing, 26 compile failures, 27
-signature mismatches, and 1 blocked renderer error. The old “38 of 54” number
-was produced only after the harness erased declared types and is not a quality
-measurement.
+Execution status as of 2026-08-26 on `codex/binding-spine-rewrite`:
+
+- stage 0, the honest 54-cell harness, is committed at `e787934`;
+- stage 1, the non-consuming binding-plan contract, is committed at `5078419`;
+- stage 2, canonical spans and sealed register/use/write projections, is
+  committed at `8c56573`, `697cc9a`, and `00eccbb`;
+- stage 3, the topology-only lowering split, is committed at `32f7adc`.
+
+Every completed stage preserved all 54 raw-output snapshots byte-for-byte. The
+strict raw baseline reports 0 passing, 26 compile failures, 27 signature
+mismatches, and 1 blocked renderer error. The old “38 of 54” number was produced
+only after the harness erased declared types and is not a quality measurement.
 
 Revision 2. Revision 1 proposed one `Binding` per `ValueId`. That model was
 wrong at the cardinality, rebuilt an upstream fact downstream, and was gated on
@@ -393,24 +399,39 @@ byte-identical on all 54 raw outputs.
 
 ### Stage 2 — Extend the canonical upstream facts
 
-In `r2ssa` and `r2types`: give `StorageSpans` a canonical minimum representative;
-fold `span::same_run` into `CanonicalStorageId::location()`, which it duplicates;
+In `r2il`, `r2sleigh-lift`, and `r2ssa`: give `StorageSpans` a canonical minimum
+representative; fold `span::same_run` into `CanonicalStorageId::location()`,
+which it duplicates; seal architecture register geometry at the lift boundary;
 expose per-`UseSite` slice facts so `UseProjection` is read from upstream rather
-than inferred downstream; record `ZeroExtend` at definitions instead of consulting
-`narrow_write_clears_register` at render time.
+than inferred downstream; and record `ZeroExtend` at definitions instead of
+consulting `narrow_write_clears_register` at render time. Existing downstream
+answers remain temporarily untouched because this is still a non-consuming
+stage; they are deleted atomically at the relevant cutover.
 
 **Gate:** every fact `UseProjection` needs is answerable from `r2ssa`/`r2types`
 without a renderer table. Shuffle property test passes on the span partition.
 Corpus byte-identical on all 54.
 
-### Stage 3 — Split along the defined APIs
+### Stage 3 — Split the lowering topology behind the defined APIs
 
-Split `op_lower/mod.rs` (14,401) and `use_info.rs` (12,311) along the stage-1
-APIs — moving code, not editing it. `writeback.rs` and `native_worker.rs` are
-deferred: neither is on an ownership seam this rewrite touches.
+Split `op_lower/mod.rs` (14,401) and `use_info.rs` (12,311) behind the stage-1
+facades — moving code, not editing it. This is deliberately a topology-only
+split. `UseAnalysisInput` and `PlannedLoweringInput` have the correct authority
+shape, but they are not yet mandatory runtime seams: production use analysis
+operates on normalized/materialized blocks with additional environment, control,
+and prepared-fact inputs, while production lowering enters through `FoldInputs`
+and `FoldingContext`. Pretending a mechanical move had sealed those paths would
+create a paper invariant. Stage 4 must carry the exact source and plan authority
+through those real inputs when it constructs the shadow plan.
+
+`writeback.rs` and `native_worker.rs` are deferred: neither is on an ownership
+seam this rewrite touches.
 
 **Gate:** **all 54 raw outputs byte-identical**, not "38 still pass". Tests
-unchanged at 2340. A single differing byte means the split was not mechanical.
+retain the exact pre-split behavior. The focused `r2dec` result remains 623
+passing with the same three pre-existing failures; the split neither fixes nor
+hides them. A single differing raw-output byte means the split was not
+mechanical.
 
 ### Stage 4 — Shadow construction and divergence classification
 
