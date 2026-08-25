@@ -147,13 +147,25 @@ learn.
      too, and an earlier note in this document calling those two entries a pure
      harness artifact was wrong. Counting first errors understates the work.
 
-     Two of these look cheap and are not. `uint128_t` comes from `CType::UInt(128)`
-     printing `uint{bits}_t` in `ast.rs:129`, but the reason a 128-bit type is
-     there at all is that a 32-bit table is being read 128 bits wide:
-     `((uint128_t*)0x100000000U)[245]`. Spelling it `__uint128_t` would move the
-     verdict from `nocompile` to `wrong`, not to `CORRECT`, so it belongs to the
-     width layer and not to naming. Likewise `sym__rotl32` compiles once declared
-     but cannot link, because the harness builds one function per file.
+     `uint128_t` [FIXED]. This document previously called it a width defect --
+     "a 32-bit table read 128 bits wide" -- on the strength of
+     `((uint128_t*)0x100000000U)[245]` looking wrong. It is not: `0x100000000` is
+     the Mach-O image base, so that is a genuine table read, and arm64 -O2 really
+     does load sixteen bytes at a time with a vector register. The 128-bit type
+     was honest; `uint128_t` simply is not how C spells it. `CType::UInt(128)`
+     now prints `__uint128_t` (and `Int(128)` prints `__int128_t`), which is what
+     compilers call it. Both arm64 -O2 failures advance past the type error:
+     crc32_bitwise to an undeclared `tregpiece_...`, xxhash32 to a mangled cast.
+
+     That mangled cast is worth knowing about, because it is the harness's:
+     `verify_rendering.py` rewrites `*(X)` into `(*(unsigned char *)(long)(X))`,
+     and applied to `(__uint128_t*)t7400_2` it produces
+     `(*(unsigned char *)(long)(__uint128_t*))t7400_2`, which is not an
+     expression. The rewrite corrupts pointer casts. It was always doing so here
+     and was simply hidden behind the undeclared type.
+
+     `sym__rotl32` compiles once declared but cannot link, because the harness
+     builds one function per file.
 
   0a. **[FIXED] `stp x29, x30` rendered as a store through an argument
      (arm64, non-leaf).** The cause was `variable.rs`, which decided whether a

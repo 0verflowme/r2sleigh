@@ -121,11 +121,16 @@ impl std::fmt::Display for CType {
             Self::Int(16) => write!(f, "int16_t"),
             Self::Int(32) => write!(f, "int32_t"),
             Self::Int(64) => write!(f, "int64_t"),
+            Self::Int(128) => write!(f, "__int128_t"),
             Self::Int(bits) => write!(f, "int{}_t", bits),
             Self::UInt(8) => write!(f, "uint8_t"),
             Self::UInt(16) => write!(f, "uint16_t"),
             Self::UInt(32) => write!(f, "uint32_t"),
             Self::UInt(64) => write!(f, "uint64_t"),
+            // A 128-bit read is real on targets with vector registers -- arm64
+            // crc32 loads its table sixteen bytes at a time -- but `uint128_t`
+            // is not a C type. `__uint128_t` is the spelling compilers give it.
+            Self::UInt(128) => write!(f, "__uint128_t"),
             Self::UInt(bits) => write!(f, "uint{}_t", bits),
             Self::Float(32) => write!(f, "float"),
             Self::Float(64) => write!(f, "double"),
