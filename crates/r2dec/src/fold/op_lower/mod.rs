@@ -13030,12 +13030,20 @@ impl<'a> FoldingContext<'a> {
 
             // In return-context blocks, keep return-register writes as tracking-only.
             // Emit a single high-level return at the SSA Return terminator.
+            //
+            // Only when the return is the value's one reader. A return register
+            // is an ordinary register until the function ends, so the tail can
+            // compute in it and read the result again: `EAX_4 = Subpiece(...)`
+            // in xxhash32 is read eight more times by the statements that finish
+            // the hash. Dropping its write on the promise of a single `return`
+            // left all eight reading a name nothing defined.
             if track_return_value
                 && let Some(dst) = op.dst()
                 && self
                     .inputs
                     .arch
                     .is_return_register_name(&dst.name.to_lowercase())
+                && self.use_count_of(&dst.display_name()) <= 1
             {
                 continue;
             }

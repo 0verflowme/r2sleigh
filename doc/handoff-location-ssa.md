@@ -354,6 +354,40 @@ learn.
      * Yet no pass in the pipeline ever sees `eax_4` as an assignment target --
        it is already gone at the first one.
 
+     **[FIXED] The cause was the return-register rule.** Bisecting the emission
+     loop with a probe per `continue`, as this item recommended, lands on one
+     guard:
+
+     ```rust
+     // In return-context blocks, keep return-register writes as tracking-only.
+     // Emit a single high-level return at the SSA Return terminator.
+     if track_return_value
+         && let Some(dst) = op.dst()
+         && self.inputs.arch.is_return_register_name(&dst.name.to_lowercase())
+     ```
+
+     Every write to the return register in a return-context block was dropped, on
+     the promise that one `return` statement would carry the value. But a return
+     register is an ordinary register until the function ends, so the tail can
+     compute in it and read the result again -- `EAX_4` is read eight more times
+     by the statements that finish the hash. All eight were left reading a name
+     nothing defined.
+
+     Fixed by suppressing the write only when the return is the value's one
+     reader (`use_count_of(dst) <= 1`).
+
+     Measured: `eax_4`, `eax_5` and `eax_8` all resolve, and three x86-64 -O1
+     functions -- adler32, murmur3_32 and xxhash32 -- go from *not compiling* to
+     compiling and running. They return the wrong values so far
+     (`9dd20001` against `9dd21488`, `ec1fbeef` against `7e4102af`), which is the
+     next layer rather than this one. x86-64 -O2 adler32 advances from `eax_12`
+     to `ecx_9`. Corpus holds at 36 of 54: three functions crossed from
+     unbuildable to buildable, none yet to correct.
+
+     Worth recording that reading the code predicted this wrongly twice -- once
+     as block elision, once as the inline promise -- and the probe found it in
+     one run. Bisect this loop rather than reasoning about it.
+
      The block is *not* the answer. `EAX_4`'s block, `0x1000009ec`, is folded
      normally with 196 ops, so nothing dropped it.
 
