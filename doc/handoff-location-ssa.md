@@ -4627,3 +4627,37 @@ corpus stays at 35 of 54 for that reason, and 2334 tests pass.
 The cast is not blanket noise: it is skipped when the base is already a pointer
 cast, and every other subscript builder in the tree does the same thing already.
 This was the one that did not.
+
+## An identifier can now be found from the SSA name it renders
+
+The two spellings of one value -- `t4700_7` from the project's rule and
+`tmp_4700_7` from sanitising the raw SSA name -- could not be unified at either
+end. Spelling the emitter costs six correct renderings; sanitising to the
+project's rule collides with the symbol that already holds that name; and
+`SymbolTable::follow_renames` refuses to rename onto an existing name, on the
+rule that *"two names cannot become one, or two variables would"*. The table has
+no merge, deliberately.
+
+So the second symbol must never be minted. The table already records, per symbol,
+the SSA value it was minted to render; it had no reverse index. It has one now --
+`by_ssa_name`, maintained by `note_ssa_name`, dropping any name minted for more
+than one value rather than answering for it -- and `for_ssa_name` reads it.
+
+`origin_name_to_expr` uses it: an origin is an SSA display name, so if an
+identifier already renders that value, the origin is that identifier rather than
+a fresh one from the raw string. `xxhash32`'s undeclared `tmp_4700_7` is gone.
+
+### What that exposes: an origin without a version is not a value
+
+The same rendering now fails on `tmp_4700`, and the missing version is the point.
+That origin names `tmp:4700` -- a *storage*, with no SSA version -- so it cannot
+identify a value at all, and no amount of spelling unification will connect it to
+a versioned assignment. `for_ssa_name` correctly finds nothing.
+
+That is a sharper statement of this whole family than "two spellings". Some
+origins are values and resolve; some are storages and cannot. The fix for those
+is upstream of spelling: whatever records the origin has to record which version
+it meant.
+
+The corpus is 35 of 54 throughout -- this moves `xxhash32` from one undeclared
+name to another rather than to a rendering that compiles.

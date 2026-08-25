@@ -138,6 +138,19 @@ pub struct SymbolTable {
     symbols: Vec<Symbol>,
     /// Which identifiers are taken, so a second declaration cannot shadow a first.
     by_name: HashMap<String, SymbolId>,
+    /// Which identifier was minted to render a given SSA value, by that value's
+    /// display name.
+    ///
+    /// The forward direction is already stored per symbol as `SsaOrigin`. This
+    /// is the reverse, so a layer holding a raw SSA name can reach the
+    /// identifier that already renders it instead of minting a second one --
+    /// which is how `tmp:4700_7` came to be spelled `t4700_7` in a statement and
+    /// `tmp_4700_7` in a condition, with neither seeing the other.
+    ///
+    /// A name minted for more than one value is removed rather than answered
+    /// for, on the same rule the table applies everywhere: two values must not
+    /// become one identifier.
+    by_ssa_name: HashMap<String, SymbolId>,
     /// Which value each name stands for, so asking twice costs one probe, not a scan.
     by_value: HashMap<r2ssa::ValueId, SymbolId>,
 }
@@ -255,6 +268,20 @@ impl SymbolTable {
             SsaOrigin::One(current) if &**current == ssa_name => return,
             SsaOrigin::One(_) | SsaOrigin::Ambiguous => SsaOrigin::Ambiguous,
         };
+        match self.by_ssa_name.entry(ssa_name.to_string()) {
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(id);
+            }
+            std::collections::hash_map::Entry::Occupied(slot) if *slot.get() != id => {
+                slot.remove();
+            }
+            std::collections::hash_map::Entry::Occupied(_) => {}
+        }
+    }
+
+    /// The identifier already minted to render this SSA value, if exactly one is.
+    pub fn for_ssa_name(&self, ssa_name: &str) -> Option<SymbolId> {
+        self.by_ssa_name.get(ssa_name).copied()
     }
 
     #[track_caller]

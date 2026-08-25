@@ -3235,6 +3235,15 @@ impl<'a> FoldingContext<'a> {
         if let Some(parsed) = self.parse_expr_from_name(name) {
             return parsed;
         }
+        // An origin is an SSA display name. If something already minted an
+        // identifier to render that value, this is the same value and takes the
+        // same identifier; minting a second one from the raw string is how
+        // `tmp:4700_7` came to be spelled `t4700_7` in a statement and
+        // `tmp_4700_7` in a condition, with neither seeing the other and the
+        // statement then dropped as dead.
+        if let Some(id) = self.symbols.borrow().for_ssa_name(name) {
+            return CExpr::Var(id);
+        }
         self.name_ref(name)
     }
 
