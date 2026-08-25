@@ -1068,6 +1068,40 @@ impl CertifiedEntity {
             | Self::LoopCarrier { id, .. } => *id,
         }
     }
+
+    /// Canonical SSA values that may name one mutable renderer binding.
+    ///
+    /// Membership is program-point sensitive: entry values, loop updates, and
+    /// dominating initializers may participate only when lowering preserves the
+    /// assignments at their original definition sites. This certificate does
+    /// not authorize globally substituting any member's expression with the
+    /// binding. Stack-slot entities return `None` because object identity alone
+    /// is not a certificate of `ValueId` membership.
+    pub fn coalescing_values(&self) -> Option<BTreeSet<r2ssa::ValueId>> {
+        match self {
+            Self::Parameter { entry_values, .. } => Some(entry_values.clone()),
+            Self::LoopCarrier {
+                identity_values,
+                entries,
+                updates,
+                dominating_initializers,
+                ..
+            } => {
+                let mut values = identity_values.clone();
+                values.extend(entries.iter().map(|entry| entry.value));
+                values.extend(updates.iter().flat_map(|update| {
+                    std::iter::once(update.value).chain(update.identity_values.iter().copied())
+                }));
+                values.extend(
+                    dominating_initializers
+                        .iter()
+                        .map(|initializer| initializer.value),
+                );
+                Some(values)
+            }
+            Self::StackSlot { .. } => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -4617,7 +4651,126 @@ mod tests {
     use super::*;
     use crate::{ExternalStackBase, FunctionParamSpec};
     use r2il::{ArchSpec, R2ILBlock, R2ILOp, RegisterDef, SpaceId, Varnode};
-    use std::collections::{BTreeMap, HashMap};
+    use std::collections::{BTreeMap, BTreeSet, HashMap};
+
+    #[test]
+    fn parameter_coalescing_values_are_exact_entry_membership() {
+        let entry_values =
+            BTreeSet::from([r2ssa::ValueId(7), r2ssa::ValueId(2), r2ssa::ValueId(11)]);
+        let entity = CertifiedEntity::Parameter {
+            id: r2ssa::SemanticId::Parameter(0),
+            slot: 0,
+            entry_values: entry_values.clone(),
+            carrier_width: 8,
+        };
+
+        assert_eq!(entity.coalescing_values(), Some(entry_values));
+    }
+
+    #[test]
+    fn loop_carrier_coalescing_values_cover_every_program_point_role() {
+        let entity = CertifiedEntity::LoopCarrier {
+            id: r2ssa::SemanticId::LoopCarrier(r2ssa::ValueId(1)),
+            loop_id: r2ssa::LoopId(0),
+            header: 0x401000,
+            phi: r2ssa::ValueId(1),
+            width: 4,
+            identity_values: BTreeSet::from([r2ssa::ValueId(4), r2ssa::ValueId(1)]),
+            entries: vec![
+                r2ssa::LoopCarrierEdgeValue {
+                    predecessor: 0x400ff0,
+                    value: r2ssa::ValueId(7),
+                },
+                r2ssa::LoopCarrierEdgeValue {
+                    predecessor: 0x400fe0,
+                    value: r2ssa::ValueId(3),
+                },
+            ],
+            updates: vec![r2ssa::LoopCarrierUpdateFact {
+                predecessor: 0x401010,
+                value: r2ssa::ValueId(9),
+                identity_values: BTreeSet::from([r2ssa::ValueId(8), r2ssa::ValueId(2)]),
+            }],
+            dominating_initializers: vec![
+                r2ssa::LoopCarrierEdgeValue {
+                    predecessor: 0x400fd0,
+                    value: r2ssa::ValueId(6),
+                },
+                r2ssa::LoopCarrierEdgeValue {
+                    predecessor: 0x400fc0,
+                    value: r2ssa::ValueId(3),
+                },
+            ],
+            ty: None,
+        };
+
+        assert_eq!(
+            entity.coalescing_values(),
+            Some(BTreeSet::from([
+                r2ssa::ValueId(1),
+                r2ssa::ValueId(2),
+                r2ssa::ValueId(3),
+                r2ssa::ValueId(4),
+                r2ssa::ValueId(6),
+                r2ssa::ValueId(7),
+                r2ssa::ValueId(8),
+                r2ssa::ValueId(9),
+            ]))
+        );
+    }
+
+    #[test]
+    fn coalescing_membership_is_order_independent_and_stack_slots_refuse_it() {
+        let edge = |predecessor, value| r2ssa::LoopCarrierEdgeValue {
+            predecessor,
+            value: r2ssa::ValueId(value),
+        };
+        let update = |predecessor, value, identities| r2ssa::LoopCarrierUpdateFact {
+            predecessor,
+            value: r2ssa::ValueId(value),
+            identity_values: identities,
+        };
+        let make_carrier =
+            |entries, updates, dominating_initializers| CertifiedEntity::LoopCarrier {
+                id: r2ssa::SemanticId::LoopCarrier(r2ssa::ValueId(1)),
+                loop_id: r2ssa::LoopId(0),
+                header: 0x401000,
+                phi: r2ssa::ValueId(1),
+                width: 8,
+                identity_values: BTreeSet::from([r2ssa::ValueId(5), r2ssa::ValueId(1)]),
+                entries,
+                updates,
+                dominating_initializers,
+                ty: None,
+            };
+        let forward = make_carrier(
+            vec![edge(10, 2), edge(20, 3)],
+            vec![
+                update(30, 4, BTreeSet::from([r2ssa::ValueId(6)])),
+                update(40, 7, BTreeSet::from([r2ssa::ValueId(8)])),
+            ],
+            vec![edge(50, 9), edge(60, 10)],
+        );
+        let reversed = make_carrier(
+            vec![edge(20, 3), edge(10, 2)],
+            vec![
+                update(40, 7, BTreeSet::from([r2ssa::ValueId(8)])),
+                update(30, 4, BTreeSet::from([r2ssa::ValueId(6)])),
+            ],
+            vec![edge(60, 10), edge(50, 9)],
+        );
+        let object = r2ssa::ObjectId(3);
+        let stack_slot = CertifiedEntity::StackSlot {
+            id: r2ssa::SemanticId::stack_slot(object),
+            object,
+            base: r2ssa::StackAddressBase::FramePointer,
+            offset: -8,
+            size: Some(8),
+        };
+
+        assert_eq!(forward.coalescing_values(), reversed.coalescing_values());
+        assert_eq!(stack_slot.coalescing_values(), None);
+    }
 
     #[test]
     fn exact_source_param_slots_include_source_owned_low_width_aliases() {
