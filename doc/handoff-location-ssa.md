@@ -572,14 +572,28 @@ learn.
      one being edited -- a memo hit, an inlined rendering replayed from
      `inlined_renderings`, or a second lowering of the same op.
 
-     Before editing anything else here, establish which call produces the
-     statement: put a counter in `render_canonical_load_expr_uncached`, print it
-     with the returned expression, and print the same counter from the `Load` arm
-     of `op_to_stmt_impl`. If the numbers differ, the statement is being built
-     somewhere the edits never ran, and that is the thing to find -- not another
-     rule about pointees. Four fixes have now been written against this defect
-     and all four were inert, which is the signature of editing a path the output
-     does not take.
+     That test has now been run, and it clears the memo: instrumenting both sides
+     gives exactly one `MEMO miss` and one `MEMO hit` for this value, and *both*
+     report the same bare `Subscript`. So `render_canonical_load_expr_uncached`
+     really is the function that produces the emitted expression, and it is
+     reached exactly once.
+
+     Which leaves the uncomfortable conclusion that the edits themselves never
+     took effect, not the path. Both were placed immediately after
+     `best = self.choose_preferred_visible_expr(best, fallback_rendered);` and
+     mapped `best` through a helper whose every branch returns something other
+     than its input, yet the output was byte-identical each time. The next
+     attempt should re-apply the smallest possible version -- an unconditional
+     `eprintln!` at the top of that helper and nothing else -- and confirm it
+     runs at all before adding any logic to it. If it does not print, the edit is
+     not where the build thinks it is; if it does print and the output is still
+     unchanged, then `best` is not what reaches the statement despite the memo
+     saying otherwise, and the next thing to instrument is the `if let Some(expr)
+     = best` block's three exits.
+
+     Five fixes have now been written against this defect and all five measured
+     inert. That is no longer evidence about the decompiler; it is evidence about
+     the method, and the method should change before another rule is written.
 
      One constraint holds whatever the fix: the index counts bytes.
      `t4900_2 = rcx * 4` is address arithmetic the lifter already did, so the
