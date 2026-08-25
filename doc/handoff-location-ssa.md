@@ -572,13 +572,28 @@ learn.
      non-scalar candidate, and the `pointee_load` cast. A `Subscript` that is
      already a "scalar memory candidate" is returned untyped.
 
-     That is very likely the defect: the renderer accepts an authoritative
-     subscript as-is and never checks that its element width matches the access
-     it was asked to render. What it does not yet explain is where the
-     `(unsigned char *)(long)` text comes from, since the returned expression
-     carries no cast and codegen adds none. Print the final `CStmt` for this op
-     before the pass pipeline runs and compare it with the emitted line; that
-     gap is now three lines wide.
+     **Found.** The width comes from a pointer-access *fact*, not from the load.
+     `LowerCtx::ptr_subscript_expr` builds the subscript with
+     `uint_type_from_size(ptr.element_size)` and `build_subscript_expr` casts the
+     base to `ptr(elem_ty)` -- and `ptr.element_size` describes the *address
+     arithmetic*, which for `arg0 + rcx * 4` is byte-based, so the element is one
+     byte and the index carries the scaling. That is a correct description of the
+     address and the wrong element type for a four-byte read through it.
+
+     The load never gets to say otherwise: `render_canonical_load_expr` takes its
+     `return expr` branch for an authoritative subscript and hands `best` back
+     untouched, with the correct `elem_ty` of `UInt(32)` unused. Confirmed by
+     probe -- `LOADSTMT dst=tmp:11f00_2 elem_ty=UInt(32) rhs=Subscript { base:
+     Var(47), index: Var(10) }` and `LOADBASE spelling=arg0 def=None`, so the
+     fold's own expression really is the bare `arg0[t4900_2]` and the cast is the
+     analysis-built subscript reaching the page by another route.
+
+     So the fix has to reconcile two facts that are each right on their own: the
+     pointer fact owns the address shape, the load owns the width. A four-byte
+     read through a byte-scaled pointer is `((uint32_t *)arg0)[i]` once the index
+     is unscaled, or `*(uint32_t *)((uint8_t *)arg0 + i * 4)` when it cannot be.
+     Whichever is chosen, the element type must come from the access, not from
+     the addressing.
 
      Three fixes were tried at the load renderer and all three are inert,
      because that is the wrong end of the pipeline. Reverted, and recorded so
