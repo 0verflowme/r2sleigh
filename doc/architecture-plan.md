@@ -1,385 +1,515 @@
-# Architecture plan: one binding per value
+# Architecture plan: dispositions, bindings, and projections
 
-Status as of 2026-08-25, branch `arch/location-ssa`, HEAD `aa1c01f`.
+Status as of 2026-08-25, branch `arch/location-ssa`, HEAD `ed7dfdc`.
 Corpus 38 of 54. 2340 tests pass. Tree clean.
 
-This document states what we are building, why the current shape blocks us, how
-we get there, and in what order. It is written to be read without the session
-that produced it.
+Revision 2. Revision 1 proposed one `Binding` per `ValueId`. That model was
+wrong at the cardinality, rebuilt an upstream fact downstream, and was gated on
+measurements the harness cannot make. This revision replaces it.
 
 ---
 
 ## 1. The end goal
 
 The decompiler should produce, for any function it accepts, a single C rendering
-that is **correct by construction** rather than correct by inspection. Concretely,
-"done" is four testable properties:
+whose correctness is *structural* rather than observed. "Done" is four
+properties, each with a stated way of being proved — and none of them is proved
+by a corpus pass count.
 
-1. **Every emitted identifier is declared exactly once, before its first read.**
-   Not checked by a detector after the fact — impossible to violate, because the
-   thing that decides a value has a name is the same thing that emits its
-   declaration.
-2. **Every value is rendered at the width it is read at.** A 32-bit read of a
-   64-bit register renders as a cast or a member view, never as the wrong value
-   and never as an undeclared narrow twin.
-3. **The rendering is deterministic.** Same input bytes, same output text, on
-   every run and every platform. No iteration-order dependence anywhere on the
-   path from SSA to text.
-4. **The corpus is 54 of 54** — nine functions across six configurations
-   (x86-64 and AArch64 at -O0, -O1, -O2), each compiled from the decompiler's own
-   output and run to the value the original produces.
+1. **Every emitted identifier is declared once, in a scope that dominates every
+   surviving read, and is assigned before that read on every path.** Proved by
+   construction: the phase that decides a value is named is the phase that emits
+   its declaration, and placement is derived from the sealed region tree rather
+   than stored.
+2. **Every use renders the exact slice it consumes.** Proved by an internal
+   invariant — every `UseSite` carries a projection backed by an upstream
+   canonical fact — and tripwired externally by compiling the untouched emitted
+   declarations under a strict dialect with warnings as errors.
+3. **The rendering is deterministic.** Proved by a property test that shuffles
+   input orderings and requires the same partition, the same bindings, and
+   byte-identical output.
+4. **Every obligation is accounted for.** `rendered + justified_elision +
+   refused = total obligations`, and `unaccounted = 0`. Separately, `refused` is
+   an explicit failure and `defects = 0` for output the decompiler accepts.
 
-Property 4 is the measurement. Properties 1–3 are the reason it can be reached
-and held rather than approached asymptotically.
-
-Beyond that: the plugin should be fast enough that `pdd` on a large function is
-not something the user waits on, and the codebase should be small enough that a
-person can find the code that decides a given piece of output in one search.
+The corpus is a canary against regression. It is not the specification, and no
+gate below is satisfied by passing it. Section 6 says why.
 
 ---
 
 ## 2. Where we actually are
 
-Measured, not estimated.
+Measured at `ed7dfdc`.
 
-| Crate            | Lines  |
-|------------------|--------|
-| r2dec            | 91,675 |
-| r2sym            | 71,187 |
-| r2ssa            | 55,778 |
-| r2types          | 54,095 |
-| r2engine         | 12,057 |
-| r2source         |  9,812 |
-| r2sleigh-lift    |  8,166 |
-| r2il             |  4,621 |
-| **total Rust**   | **325,539** |
-
-Largest files: `r2types/src/writeback.rs` (22,006 lines),
-`r2dec/src/fold/op_lower/mod.rs` (14,401), `r2dec/src/fold/tests/pipeline.rs`
-(13,167), `r2sym/src/semantics/native_worker.rs` (12,667),
-`r2dec/src/analysis/use_info.rs` (12,311).
+| Crate            | Lines  | Largest file                      | Lines  |
+|------------------|--------|-----------------------------------|--------|
+| r2dec            | 91,675 | `fold/op_lower/mod.rs`            | 14,401 |
+| r2sym            | 71,187 | `semantics/native_worker.rs`      | 12,667 |
+| r2ssa            | 55,778 | `function.rs`                     |  9,903 |
+| r2types          | 54,095 | `writeback.rs`                    | 22,006 |
+| r2engine         | 12,057 | `lib.rs`                          | 10,737 |
+| r2source         |  9,812 | —                                 |        |
+| r2sleigh-lift    |  8,166 | —                                 |        |
+| r2il             |  4,621 | —                                 |        |
+| **total Rust**   | **325,539** |                              |        |
 
 Other signals: 46 `allow(dead_code)`, 14 TODO/FIXME/HACK, 684 call sites of
 `display_name()`, 225 sites touching the alias tables, 950 `cargo fmt` hunks,
 184 clippy diagnostics, 57 build warnings.
 
-The corpus went 4 → 38 of 54 on this branch. Per configuration at HEAD:
-x64 -O0 7, x64 -O1 7, x64 -O2 4, arm64 -O0 7, arm64 -O1 7, arm64 -O2 6.
+Corpus 4 → 38 of 54 on this branch. Per configuration: x64 -O0 7, x64 -O1 7,
+x64 -O2 4, arm64 -O0 7, arm64 -O1 7, arm64 -O2 6.
 
 ---
 
 ## 3. The one defect
 
-Everything expensive on this branch traces to a single shape:
-
 > **A value has many tables that can answer for it, and they are allowed to
 > disagree.**
 
-The exhibit is `UseInfo` in `crates/r2dec/src/analysis/mod.rs`. It has **36
-fields**. Several of them are the same fact keyed differently:
+The exhibit is `UseInfo` in `crates/r2dec/src/analysis/mod.rs`, at **36 fields**.
+Several are one fact keyed differently: `value_ids_by_var`, `value_ids_by_name`
+and `vars_by_value_id` are one relation in three directions, each writable
+independently; `ambiguous_value_vars` / `ambiguous_value_ids` /
+`ambiguous_value_names` are one set under three key types; `definitions_by_value`
+is value-keyed where `formatted_defs` is string-keyed.
 
-- `value_ids_by_var`, `value_ids_by_name`, `vars_by_value_id` — one relation,
-  three directions, each writable independently.
-- `ambiguous_value_vars`, `ambiguous_value_ids`, `ambiguous_value_names` — one
-  set, three key types.
-- `definitions_by_value` (value-keyed) and `formatted_defs` (string-keyed).
-- `semantic_values_by_value`, `stable_memory_values`,
-  `stable_memory_values_by_value`.
-
-The tree already admits this. The last field of the struct is:
+The tree already admits it. The struct's last field is a shipped counter of the
+drift, whose comment says the drift is structural rather than a discipline
+failure at the call sites:
 
 ```rust
 /// Writes that reached the string-keyed half and not the value-keyed one.
-///
-/// Every paired store is written through one helper, so the two halves
-/// cannot drift by a missed call site. They still drift when the value has
-/// no canonical identity to key on: the helper writes the name and skips the
-/// `ValueId`. Those entries are exactly what the location model has to
-/// account for before the string-keyed half can be derived rather than
-/// stored ...
+/// ...
+/// Those entries are exactly what the location model has to account for
+/// before the string-keyed half can be derived rather than stored ...
 pub(crate) unkeyed_writes: BTreeMap<&'static str, usize>,
 ```
 
-That is a **counter of the drift**, shipped in production, with a comment saying
-the drift is structural and cannot be fixed by discipline at the call sites.
+### What the shape cost, observed
 
-### What this shape costs, in observed failures
+- **Six inert fixes in a row.** Each edited a rule governing the *name* when the
+  rule on the path governed the *value*, or the reverse. Located only by planting
+  `CExpr::External { name: "ZZMARKERZZ" }` and grepping `pdd`.
+- **Three measured regressions from single-table edits.** Span-gate widening
+  37 → 19; a guard on the `Block` arm of `structure_region` 37 → 17; excluding
+  self-zeroing writes in parameter recovery 37 → 36. Each was correct alone;
+  another table still answered, and the answers differed.
+- **A rendering non-determinism** from `close_carrier_aliases_over_edge_copies`
+  making one unordered, non-fixpoint pass over edges.
+- **A naming ladder** — `carrier_alias` → `var_alias` → `param_alias` → base —
+  over 225 sites, where which rung answers depends on insertion order in tables
+  written by different passes.
 
-**Six inert fixes in a row.** Each edited a rule that governed the name, when the
-rule on the path governed the value — or the reverse. The defect was only located
-by planting `CExpr::External { name: "ZZMARKERZZ" }` and grepping `pdd` output to
-find which table actually answered.
-
-**Three measured regressions from single-table edits.** Widening the span gate:
-37 → 19. Guarding the Block arm of `structure_region`: 37 → 17. Excluding
-self-zeroing writes in parameter recovery: 37 → 36. In each case the edit was
-correct in isolation; another table still answered for the same value and the two
-answers now differed.
-
-**A rendering non-determinism** that survived because `close_carrier_aliases_over_edge_copies`
-made a single unordered pass over edges. Same binary, different output. Fixed by
-sorting and iterating to fixpoint — but the bug was only possible because the
-alias closure is a table separate from the thing it aliases.
-
-**A naming ladder** — `carrier_alias` → `var_alias` → `param_alias` → base name —
-spread across 225 sites. Each rung is a table. Which rung answers depends on
-insertion order in tables written by different passes.
-
-The pinned rule for this project ("trace to the source, fix it there, no
-compensating workaround at the symptom site") is *unimplementable* under this
-shape, because "the source" is not a place. A value has four sources. That is the
-thing to fix.
+The project's standing rule — trace a defect to its source, fix it there, never
+at the symptom site — is *unimplementable* under this shape, because "the source"
+is not a place. That is the thing to fix.
 
 ---
 
-## 4. What we build
+## 4. The model
 
-**One record per value. One place that decides.**
+Five identities. **Four already exist in the tree.** Only `BindingId` is new.
+
+```
+CanonicalLocation   the machine place       r2source/src/contracts.rs:30
+StorageSpanId       one uninterrupted run   r2ssa/src/span.rs:28
+ValueId             one SSA version         r2ssa/src/graph.rs:17
+UseSite             one consumption         r2ssa/src/graph.rs:20
+BindingId           one rendered C object   (new)
+```
+
+### This is not a hierarchy
+
+Revision 1 arranged these as a strict containment chain with
+`Binding -> Option<CanonicalLocation>`. That is wrong, and the tree says why in
+two places. `r2ssa/src/span.rs` opens:
+
+> A register is not a variable. A compiler will keep an accumulator in `RAX` for
+> one loop and an index in it for the next, and every layer that reasons about
+> "the value in `RAX`" then has to decide which of those it means.
+
+and `normalize.rs:1057`:
+
+> an entry value, a phi, a latch update and a post-loop merge are four SSA values
+> and one C local.
+
+So the relation runs both ways. One `CanonicalLocation` holds several unrelated
+program variables over time; one recovered variable moves register → stack →
+register. `Binding -> Option<CanonicalLocation>` is only valid in the restricted
+single-location case, which is not the general one.
+
+The correct shape:
+
+```
+CanonicalLocation ──has temporal contents──▶ StorageSpanId
+StorageSpanId     ──contains──────────────▶ ValueId
+ValueId           ──is consumed at────────▶ UseSite
+
+BindingId ──coalesces a certified set of──▶ ValueId / StorageSpanId
+```
+
+`BindingId` is a **renderer projection across the SSA graph**, not a child of a
+machine location. It references an upstream coalescing or carrier certificate; it
+never stores a second origin claim of its own. That distinction is the whole
+correction: revision 1's `Origin { Carrier { id, width }, StackSlot(off), ... }`
+rebuilt `CanonicalLocation` inside the renderer, which is the same defect this
+plan exists to remove, committed by the plan itself.
+
+### Disposition, not a nullable name
+
+Revision 1 held `name: Option<SymbolId>` beside an independent `Site`, which
+permits invalid combinations and detects them with a debug assertion. Encode the
+legal states instead, so the invalid ones cannot be written:
 
 ```rust
-/// The single answer for one SSA value: whether it is named, what width it is
-/// read at, where it is emitted, and what it came from.
-struct Binding {
-    value: ValueId,
-    /// `None` means this value has no name and must be inlined at its use.
-    name:  Option<SymbolId>,
-    /// The width the value is *read* at, not the width its storage has.
-    ty:    CType,
-    site:  Site,
-    origin: Origin,
-}
-
-enum Site {
-    /// Emitted as a declaration at this position; the only place a name is bound.
-    Emit { block: BlockId, index: usize },
-    /// Substituted into each reader; has no declaration.
-    Inline,
-    /// Bound by the function signature.
-    Parameter(usize),
-    /// Deliberately not emitted; carries the reason so it can be explained.
-    Elided(ElisionReason),
-}
-
-enum Origin {
-    Carrier { id: CarrierId, width: u32 },
-    StackSlot(i64),
-    Param(usize),
-    Temp,
-    Global(u64),
+enum ValueDisposition {
+    Bound   { binding: BindingId },
+    Inline  { expr: ExprId, proof: InlineProof },
+    Elided  { reason: ElisionReason, proof: DeadValueProof },
+    Refused { reason: RefusalReason },
 }
 ```
 
-Held in one table, `BindingTable: BTreeMap<ValueId, Binding>` — ordered, so
-iteration is deterministic by construction rather than by remembering to sort.
+Validation returns a typed refusal in release builds. A malformed artifact must
+not silently render, and must not panic during `pdd`.
 
-### Invariants
+### Width belongs to the use
 
-These are checked, in debug builds, at the boundary between analysis and
-rendering. A violation is a panic with the offending `ValueId`, not a silently
-wrong rendering.
+One value is read at several widths. A single declaration type cannot describe
+that, and cannot express `AH`, SIMD lanes, extraction offsets, partial writes, or
+target-specific zero-extension. `CanonicalLocation` exists precisely because
+`CanonicalStorageId` conflates the place with the slice:
 
-1. `binding.name.is_some()` **iff** `site` is `Emit` or `Parameter`.
-   *(A name exists exactly when something declares it. This is property 1 of the
-   end goal, as a data-structure invariant.)*
-2. `site == Inline` **implies** an expression is reconstructible for the value.
-3. `site == Elided(_)` **implies** the value has zero readers.
-4. Two bindings never share a `SymbolId`.
-5. A reader of a value at width *w* sees `binding.ty` of width *w*, or an
-   explicit cast node — never a second binding for the same storage.
+> A `CanonicalStorageId` records a slice: `EAX` and `RAX` differ in it because
+> they differ in size, which makes two writes to one register look like writes to
+> two places. A location is the register, and the slice is what a particular
+> access took of it.
 
-Invariant 5 is what dissolves the narrow-carrier-member family (`eax_5`,
-`rcx_6`, `ecx_9`) that consumed most of this branch: a 32-bit read of a 64-bit
-carrier stops being a second value that needs its own name and becomes a width
-recorded on the one binding.
+So:
 
-### Why this is the right cut
+```rust
+struct Binding { declaration_type: CType, /* ... */ }
 
-The renderer stops asking questions. Today `get_expr_inner` and its neighbours
-ask, for each value: is it a carrier? does it have an alias? is it a member view?
-is it single-use? is it a return register? — and each question is a table lookup
-that can disagree with the last. Under the binding table there is one lookup and
-the answer is total. The 684 `display_name()` sites collapse toward one accessor
-on `Binding`.
+/// What one reader takes of the binding. Keyed by `UseSite`.
+struct UseProjection { bit_offset: u32, width: u32, conversion: Conversion }
+
+/// What one definition puts back. Keyed by definition site.
+enum WriteProjection { Full, Insert { bit_offset: u32 }, ZeroExtend { from: u32 } }
+```
+
+`ZeroExtend` is where `narrow_write_clears_register` moves: it stops being a
+predicate consulted at render time and becomes a fact recorded at the definition.
+
+### Placement is derived, never stored
+
+Declaration placement is a pure lowering phase immediately before AST emission:
+
+```
+sealed region tree
+  + binding definitions
+  + surviving planned uses
+  → declaration location | PlacementRefusal
+```
+
+No parallel authoritative placement table. The emitted AST contains the resulting
+declaration, and that is the only record. Storing a placement plus a proof of the
+placement would recreate exactly the two-answerers defect: the stored placement
+and the region tree it came from can drift.
+
+Three things the calculation must keep separate:
+
+1. **Declaration scope** — where the C object is introduced.
+2. **Initialization and assignment sites** — where values are written into it.
+3. **Reaching-definition validity** — whether every surviving read is preceded by
+   an assignment on every path.
+
+These are not the same question, and conflating them is a way to be wrong
+quietly: **hoisting a declaration can make C compile without fixing a read that is
+semantically uninitialized.** A value assigned in both arms of an `if` and read
+after the merge needs one declaration before the `if`, an assignment in each arm,
+and the read after — hoisting alone produces the same text whether or not the
+second arm actually assigns. Reaching-definition validity is what separates them,
+and a failure of it is a `PlacementRefusal`, not a hoist.
+
+The calculation uses **surviving planned uses**, not every original SSA use.
+Inlined, elided and refused values have no uses to dominate.
+
+### The obligation ledger
+
+Value disposition and effect disposition are separate ledgers. "Zero readers"
+justifies removing a *pure* computation only; a call, a store, a volatile load or
+a `callother` must survive with no readers at all. This is not a refinement — it
+is on the critical path, because `callother` is one of the open corpus failures.
+
+Accounting is two equations, kept apart from quality:
+
+```
+rendered + justified_elision + refused = total obligations
+unaccounted = 0
+```
+
+and then, separately:
+
+```
+refused  = explicit failure, never success
+defects  = 0 for output the decompiler accepts as native
+```
+
+The split is what stops both games. "Declare everything" cannot satisfy the first
+equation without also raising `defects`. "Refuse everything" satisfies the first
+equation and fails outright on the second. The tree already prints this shape:
+`632 rendered, 38 elided, 0 refused, 11 unaccounted, 96 defects`.
+
+### Determinism
+
+The rule is not a container choice:
+
+> Every closure computes a unique least fixpoint using a monotone transfer over a
+> stable domain; scheduling uses a sorted worklist.
+
+`ValueId` allocation is already dense and stable — `graph.rs:135` interns
+`ValueId(values.len())` over a `BTreeMap`-keyed traversal — so indexed vectors
+give deterministic O(1) lookup and iteration, and a `BTreeMap` buys nothing there.
+But the actual determinism bug on this branch was not map order; it was a single
+non-fixpoint pass. Dense storage does not address that class.
+
+Where the relation is genuinely an equivalence, union-find with a **canonical
+minimum representative** is simpler and nearly linear. `StorageSpans` is already
+union-find (`span.rs:33`) — but its representative is *not* canonical. `union`
+merges by rank (`span.rs:99`) and `span_of` returns whichever node became root,
+so the **partition** is stable while the **`SpanId` value** depends on union
+order. Anything keying naming or ordering off a `SpanId` inherits that. Taking
+the class minimum as the representative closes it.
+
+Every closure gets a property test that shuffles input edge order and requires
+the same partition, the same bindings, and byte-identical rendered output.
 
 ---
 
 ## 5. Honest scope
 
-**Fixed directly:**
-- `UseInfo` (36 fields) — the multi-table state the binding table replaces.
-- `PreparedSemanticView` (24 fields) — same reason, partially.
-- The naming ladder and its 225 sites.
-- The undeclared-identifier family (invariant 1).
-- The width family (invariant 5).
-- Rendering determinism (ordered table).
+**Addressed:** `UseInfo` (36 fields); `PreparedSemanticView` (24), partially; the
+naming ladder and its 225 sites; undeclared identifiers (property 1); wrong-width
+rendering (property 2); rendering determinism (property 3); the elision-versus-
+effect confusion (property 4).
 
-**Not fixed by this, and needing separate work:**
-- `CompiledSemanticInfo` (38 fields, r2sym), `RadareAbi138Accessors` (34,
-  r2source), `ExploreStats` (31), `VmStepSummary` (27),
-  `EngineTypeWritebackJsonCore` (28). These are report, accessor and statistics
-  structs in crates the binding table does not reach. 13 structs sit at ≥20
-  fields; this plan addresses 2 of them, but they are the 2 that produce
-  rendering defects.
-- The 13-parameter functions (`make_ctx` in `r2dec/src/analysis/lower.rs`,
-  `insert_structured_memory_access` and `insert_raw_memory_subeffect` in
-  `r2ssa/src/semantic.rs`, `from_captured_parts` in `r2source`). These need
-  parameter objects and function splitting, which is mechanical and independent.
-  No Rust or C function in the repo reaches 20 parameters; the maximum is 13 in
-  Rust and 8 in C.
-- Deep nesting: 440 of 9,844 functions nest ≥6 levels, maximum 12. Mostly in the
-  same god files; splitting them addresses most of it.
-- `writeback.rs` at 22,006 lines. Splitting is required but is not architecture.
+**Not addressed, needing separate work:** `CompiledSemanticInfo` (38 fields,
+r2sym), `RadareAbi138Accessors` (34, r2source), `ExploreStats` (31),
+`EngineTypeWritebackJsonCore` (28), `VmStepSummary` (27). The 13-parameter
+functions — `make_ctx`, `insert_structured_memory_access`,
+`insert_raw_memory_subeffect`, `from_captured_parts` — which need parameter
+objects and splitting. Deep nesting: 440 of 9,844 functions at ≥6 levels, max 12.
+`writeback.rs` at 22,006 lines and `native_worker.rs` at 12,667: neither is on the
+naming, projection or placement path, and both are deferred.
+
+Thirteen structs sit at ≥20 fields; this plan addresses 2, which are the 2 that
+produce rendering defects. No Rust or C function in the repo reaches 20
+parameters — the maximum is 13 in Rust and 8 in C.
+
+**Not addressed and not fixed by this rewrite:** `callother` lowering,
+sibling-function linking (`sym__rotl32`), and struct typing. They appear in the
+open-defect table and must not be counted on any binding-rewrite gate.
 
 ---
 
-## 6. The plan
+## 6. Why the corpus is not the specification
 
-Six stages. Each has an exit gate that is a measurement, not a judgement. The
-corpus number is reported at every gate whether it moved up, down, or not at all.
+`tests/corpus/verify_rendering.py` rewrites the C it verifies:
 
-### Stage 0 — Make the harness honest *(prerequisite, small)*
+- one fixed input (`msg`, a single 61-byte string);
+- every parameter and every local declaration rewritten to `long`
+  (lines 65, 66, 68);
+- a width invented for every dereference the rendering left untyped
+  (lines 76, 87), counted as `assumed` but not fatal;
+- subscripts rewritten to `(((unsigned char *)(long)(X))[Y])`;
+- compiled with `clang -w` (line 168), suppressing all warnings.
 
-`tests/corpus/verify_rendering.py` rewrites the C it verifies — it patches
-subscripts to `(((unsigned char *)(long)(X))[Y])` and stashes casts behind a
-regex. Two full turns were lost this session hunting a cast that the *harness*
-had inserted, and one regex slip (`__?u?int` for `(?:__)?u?int`) moved the corpus
-37 → 18 with no decompiler change at all.
+The consequence is sharper than leniency. **The harness deletes declared types
+before compiling**, so it is structurally incapable of observing a value rendered
+at the wrong width — which is property 2, the thing most of this work exists to
+establish. A transformed success is not proof of emitted-C correctness. Logging
+the rewrites is useful; it does not convert a transformed pass into a proof.
 
-Do: emit the decompiler's output verbatim to `raw/<config>_<fn>.c` alongside the
-patched copy, and have the verifier print which rewrites it applied to each file.
+Three separate scores replace the single number:
 
-**Gate:** every failing function's raw output is readable without running `pdd`
-by hand, and the rewrite list is printed.
+| Score | What it is | What it proves |
+|---|---|---|
+| **Raw** | Emitted C compiles with only an external prelude and data mapping — declarations untouched, explicit strict dialect, warnings as errors | Syntax and declared typing |
+| **Diagnostic** | The transformed C compiles and runs | The rendering computes something, on one input |
+| **Differential** | Behaviour matches the original across empty, boundary-length and randomised inputs and seeds | Semantics, on a distribution |
 
-### Stage 1 — Mechanical splitting *(no behaviour change)*
-
-Split the four god files along seams that already exist, moving code without
-editing it. `writeback.rs` (22,006), `op_lower/mod.rs` (14,401),
-`use_info.rs` (12,311), `native_worker.rs` (12,667).
-
-This is deliberately **before** the rewrite, not after. Stage 3 has to touch
-hundreds of call sites; doing that inside 22,000-line files is where the six
-inert fixes came from. This stage is safe, parallelisable, and makes every later
-stage cheaper.
-
-**Gate:** no file over 3,000 lines in `r2dec` and `r2types`; corpus unchanged at
-38; tests unchanged at 2340. A corpus move here means the split was not
-mechanical — revert and redo it.
-
-### Stage 2 — Build the table alongside, believe nothing
-
-Construct the `BindingTable` from the existing analysis. Do not consume it. At
-the analysis/render boundary, compare each binding against what the existing
-tables say and log divergences under `R2SLEIGH_DEBUG_BINDINGS`.
-
-**Gate:** divergence count printed per function across all 54 corpus entries.
-Corpus unchanged at 38 (nothing consumes the table yet — a move means something
-does, find it). The divergence list *is* the specification for stage 3: every
-divergence is a place the old tables disagree with each other.
-
-### Stage 3 — Consume for names, delete the ladder
-
-Make `Binding::name` the only source of an identifier. Delete `carrier_alias`,
-`var_alias`, `param_alias` and the ladder that orders them. Turn invariant 1 on.
-
-This is the stage that regresses. That is expected and acceptable: a measured
-regression here is information about how far the rewrite still has to go, not
-grounds for reverting it. Report the number plainly and keep going.
-
-**Gate:** invariant 1 holds on all 54 entries — zero undeclared identifiers, by
-construction rather than by detector. Corpus is reported honestly whatever it is.
-
-### Stage 4 — Consume for width, then for elision
-
-Turn on invariant 5 (`ty` is the read width). Then invariant 3 (elided implies
-no readers), which subsumes the single-use propagation pass and its whole-body
-read count.
-
-**Gate:** all five invariants on. Corpus back above 38 and climbing.
-
-### Stage 5 — Delete the dead tables
-
-Remove every field of `UseInfo` the binding table now answers for, including
-`unkeyed_writes` — the drift counter has nothing left to count. Remove the
-`allow(dead_code)` markers that were hiding the removed paths.
-
-**Gate:** `UseInfo` under 12 fields. Zero clippy diagnostics, zero build
-warnings, `cargo fmt` clean. Corpus 54 of 54.
+Warnings-as-errors is necessary and still not sufficient: an explicitly wrong
+cast compiles silently. So property 2 has two gates, not one — the compiler is
+the **external tripwire**, and the internal invariant that every `UseSite` carries
+an exact, upstream-backed projection is the **proof**.
 
 ---
 
-## 7. Fastest path
+## 7. The plan
 
-The ordering above is chosen for speed, not tidiness.
+Eight stages. Each exits on a stated measurement. Corpus numbers are reported at
+every gate, up, down or flat — as a signal, never as the gate.
 
-- **Stage 0 first** because every later stage is measured through the harness,
-  and a dishonest harness makes every measurement suspect. It cost two turns
-  once; over five stages it would cost far more. It is a few hours.
-- **Stage 1 before stage 2**, not after, because stage 3's edits land in the
-  files stage 1 splits. Splitting after the rewrite means doing the rewrite in
-  the hardest possible place first.
-- **Stage 2's divergence log replaces guessing.** The single most expensive
-  pattern on this branch was writing a fix before taking a trace. The divergence
-  list is the trace, taken once, for every value at once.
-- **Stages 1 and 0 are parallelisable** — different files, no shared state. So
-  are the four file splits inside stage 1.
-- **Do not chase the remaining 16 corpus failures before stage 3.** Five of them
-  (murmur3 ordering, murmur3's lost zero, crc32_bitwise's undeclared temporaries)
-  are name and width defects that stages 3 and 4 dissolve. Fixing them
-  individually first means fixing them twice.
+### Stage 0 — Make the raw and differential harness trustworthy
 
-The genuinely independent work — the 13-parameter functions, deep nesting,
-`r2sym`'s wide structs, clippy and fmt — can be done at any point and does not
-block anything. It should not be done *instead of* the stages.
+Emit each rendering verbatim to `raw/<config>_<fn>.c` beside the transformed
+copy. Add the strict-dialect raw compile and the differential runner. Print, per
+file, which rewrites the transformer applied and how many widths it assumed.
+
+**Gate:** all three scores reported per entry. Raw and differential scores exist
+for all 54 whether or not they pass. Every transformer rewrite is listed.
+
+### Stage 1 — Define the model, consume nothing
+
+Land `ValueDisposition`, `BindingId`, `Binding`, `UseProjection`,
+`WriteProjection`, the effect-disposition enum, and the refusal types. No
+construction, no consumption. Define the module APIs of `op_lower` and
+`use_info` in the same stage, because stage 3 splits along them.
+
+**Gate:** types compile and are unreferenced by the render path. Corpus
+byte-identical on all 54 raw outputs.
+
+### Stage 2 — Extend the canonical upstream facts
+
+In `r2ssa` and `r2types`: give `StorageSpans` a canonical minimum representative;
+fold `span::same_run` into `CanonicalStorageId::location()`, which it duplicates;
+expose per-`UseSite` slice facts so `UseProjection` is read from upstream rather
+than inferred downstream; record `ZeroExtend` at definitions instead of consulting
+`narrow_write_clears_register` at render time.
+
+**Gate:** every fact `UseProjection` needs is answerable from `r2ssa`/`r2types`
+without a renderer table. Shuffle property test passes on the span partition.
+Corpus byte-identical on all 54.
+
+### Stage 3 — Split along the defined APIs
+
+Split `op_lower/mod.rs` (14,401) and `use_info.rs` (12,311) along the stage-1
+APIs — moving code, not editing it. `writeback.rs` and `native_worker.rs` are
+deferred: neither is on an ownership seam this rewrite touches.
+
+**Gate:** **all 54 raw outputs byte-identical**, not "38 still pass". Tests
+unchanged at 2340. A single differing byte means the split was not mechanical.
+
+### Stage 4 — Shadow construction and divergence classification
+
+Build the disposition, binding and projection tables from the existing analysis
+without consuming them. At the analysis/render boundary, classify each divergence
+from the old tables **against canonical upstream evidence** — which of the two is
+right, and which upstream fact says so.
+
+The divergence list is *evidence*, not the specification. A divergence where both
+sides disagree with upstream is a third finding, not a tie.
+
+**Gate:** every divergence classified as old-wrong, new-wrong, or both-wrong,
+each citing the upstream fact. Corpus byte-identical on all 54 — nothing consumes
+the tables yet, so any change means something does; find it.
+
+### Stage 5 — Cut over naming, delete the naming tables
+
+`ValueDisposition::Bound` becomes the only source of an identifier. Delete
+`carrier_alias`, `var_alias`, `param_alias` and the ladder ordering them, in the
+same change as the cutover — not a stage later.
+
+Expect a regression. A measured regression here is how far the rewrite still has
+to go, not grounds for reverting it.
+
+**Gate:** ledger balances — `rendered + justified_elision + refused = total`,
+`unaccounted = 0` — on all 54. `refused` reported as failure. Corpus reported
+honestly, whatever it is.
+
+### Stage 6 — Cut over per-use projection, delete the width aliases
+
+Every `UseSite` renders through its `UseProjection`. Delete the width and
+member-view aliases in the same change.
+
+**Gate:** raw score compiles under strict dialect with warnings as errors, on
+every entry that renders. Every `UseSite` has an upstream-backed projection —
+zero inferred. Both gates, not either.
+
+### Stage 7 — Cut over placement, inlining, elision, and the effect ledger
+
+Placement becomes the pure lowering phase over the sealed region tree.
+`InlineProof` and `DeadValueProof` become required. The effect ledger lands
+separately from the value ledger.
+
+**Gate:** every surviving read is dominated by its declaration and preceded by an
+assignment on every path, or the binding is a `PlacementRefusal`. No effectful
+obligation elided for want of readers. Differential score reported across all
+input classes.
 
 ---
 
-## 8. Rules of engagement
+## 8. Fastest path
 
-Learned on this branch, at cost.
+- **Stage 0 first.** Every later stage is measured through the harness, and the
+  current one cannot see property 2 at all. Two turns were lost once to a cast the
+  harness itself inserted; one regex slip (`__?u?int` for `(?:__)?u?int`) moved
+  the corpus 37 → 18 with no decompiler change.
+- **Stage 1 before stage 3.** Splitting along an API that does not exist yet is
+  how you split along the wrong seam. Define, then split.
+- **Stage 2 before stage 4.** Divergences are classified against upstream
+  evidence, so the evidence has to be answerable first, or the classification
+  degrades into preferring whichever table is newer.
+- **Delete at cutover, never later.** A stage that leaves the old table in place
+  leaves two answerers, which is the defect.
+- **Do not chase the open corpus failures before stage 5.** The name and width
+  families dissolve in stages 5 and 6. Fixing them individually first means
+  fixing them twice — and three of the six inert fixes were exactly that.
+- **Deferred and unblocking:** `writeback.rs`, `native_worker.rs`, the
+  13-parameter functions, deep nesting, clippy, fmt. Any time. Not instead of a
+  stage.
 
-1. **Trace before the guard.** A value typically has several tables that can
-   answer for it. Suppressing one is indistinguishable from a wrong fix while
-   another still answers. Count the tables, change them together.
+---
+
+## 9. Rules of engagement
+
+1. **Trace before the guard.** A value has several tables that can answer for it.
+   Suppressing one is indistinguishable from a wrong fix while another answers.
 2. **A change that alters no rendered output does not stay in the tree.** It
-   proves nothing. This does *not* apply to a change that genuinely restructures
-   a blocking seam and costs corpus results on the way — that is progress with a
-   price, and it stays.
+   proves nothing. This does *not* apply to a change that restructures a blocking
+   seam and costs corpus results on the way; that is progress with a price.
 3. **Never trust a corpus number without confirming the install.** `make -C
    r2plugin install` must print `Installed to ...`. A failed install silently
-   leaves the old plugin and reads as a regression identical to a real one.
-4. **Check `df` at the first `codesign` failure.** About 40 codesign errors and
-   two false corpus readings this session had one cause: a full disk, from a
-   69 GB `target/debug` in a release-only workflow.
-5. **When the number moves and it should not have, stop.** The `__?u?int` regex
-   slip was caught only because 37 → 18 was impossible for the change made.
-6. **The 2340 tests caught none of this branch's defects.** They are a
-   regression net, not a specification. The corpus is the specification. Add
-   invariant checks (section 4) as the thing tests can actually assert.
+   leaves the old plugin and reads exactly like a regression.
+4. **Check `df` at the first `codesign` failure.** Roughly 40 codesign errors and
+   two false readings had one cause: a full disk from a 69 GB `target/debug` in a
+   release-only workflow.
+5. **When a number moves and it should not have, stop.** The regex slip was caught
+   only because 37 → 18 was impossible for the change made.
+6. **The 2340 tests caught none of this branch's defects.** They are a regression
+   net. The invariants in section 4 and the ledger in section 4 are what tests can
+   actually assert.
+7. **A refusal is a failure, not a pass.** Satisfying a checker by declining to
+   answer is the same shape as the reverted pass that satisfied the undefined-name
+   detector by declaring the undefined names.
 
 ---
 
-## 9. Open defects at HEAD
+## 10. Open defects at HEAD
 
-Sixteen corpus failures, five causes. Each is recorded with its trace in
-`doc/handoff-location-ssa.md`.
+**This inventory is incomplete.** 54 − 38 = 16 failures; the rows below account
+for 13. The missing 3 are not currently identified — the inventory was assembled
+from traces across a long session rather than from a fresh enumeration, and
+closing that gap is part of stage 0.
 
-| Cause | Entries | Disposition |
+| Cause | Entries | Cleared by |
 |---|---|---|
-| murmur3 region/ordering — `t20380_5`, `t11f00_10` read before the merge declares them | 2 | Stage 3 |
-| murmur3 lost zero — `k1` renders as `arg3`, from parameter over-recovery | 2 | Stage 3 |
-| crc32_bitwise — undeclared `tregalias_`, `tregpiece_` temporaries | 2 | Stage 3 |
-| fnv1a64 — `r8d` piece composition | 1 | Stage 4 |
-| xxhash32 — 2 harness-blocked on `sym__rotl32`, 2 wrong values, 1 `callother`, 1 struct type error | 6 | Stage 0 and 4 |
+| murmur3 region/ordering — `t20380_5`, `t11f00_10` read before the merge declares them | 2 | Stage 5, 7 |
+| murmur3 lost zero — `k1` renders as `arg3`, from parameter over-recovery | 2 | Stage 5 |
+| crc32_bitwise — undeclared `tregalias_`, `tregpiece_` temporaries | 2 | Stage 5 |
+| fnv1a64 — `r8d` piece composition | 1 | Stage 6 |
+| xxhash32 — 2 blocked on `sym__rotl32` linking, 2 wrong values, 1 `callother`, 1 struct type error | 6 | **Not this rewrite** — stage 0 for the linking, separate work for `callother` and struct typing |
+| unidentified | 3 | Stage 0 enumerates them |
 
 ---
 
-## 10. What "done" looks like
+## 11. The durable statement
 
-The corpus at 54 of 54, held across a rebuild. `UseInfo` under 12 fields.
-No file over 3,000 lines. Five invariants asserted at the analysis/render
-boundary, so that the properties in section 1 are structural rather than
-observed. Zero warnings, zero clippy diagnostics, `cargo fmt` clean.
+> One canonical location per machine place, one certified span per uninterrupted
+> content, one disposition per SSA value, one binding per rendered C object, and
+> one projection per use.
 
-And the pinned rule finally implementable: when a value renders wrong, there is
-exactly one record that decided it, and that record is where the fix goes.
+Four of those five already exist upstream. The rewrite is mostly a matter of
+letting the renderer read them instead of re-deriving them — and of deleting what
+it used to re-derive them with, in the same change that stops using it.
