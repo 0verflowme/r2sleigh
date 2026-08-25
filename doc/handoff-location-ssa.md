@@ -572,6 +572,35 @@ learn.
      one being edited -- a memo hit, an inlined rendering replayed from
      `inlined_renderings`, or a second lowering of the same op.
 
+     **The minimal test has now been run, and the result is stranger than the
+     hypotheses.** With a print at the very top of the transform helper:
+
+     ```
+     TYPEDSUB in=Subscript { base: Var(47), index: Var(10) } elem_ty=UInt(32)
+     ```
+
+     The helper *is* called, with the right expression and the right width, and
+     every branch below that point returns something other than its input -- yet
+     `pdd` still emits `uint64_t t11f00_2 = arg0[t4900_2];` unchanged. The
+     transform was tried in two positions, on the `best` candidate and on the
+     finished return value of `render_canonical_load_expr`, with the same result
+     both times.
+
+     So the emitted statement is not this function's return value, even though
+     the memo records the function being called exactly once for this
+     destination and returning exactly this expression. Something renders that
+     statement from another source. `structure.rs` keeps a `folded_block_cache`
+     keyed by block address and the fold debug prints `FOLDCACHE hit/miss` -- if
+     block `0x100000830` is folded more than once, or its statements are cached
+     from a fold that ran before this path, that would explain every inert fix.
+     Instrument `folded_block_stmts` for that block: print how many times it
+     folds and whether the `t11f00_2` statement in the cached list matches the
+     one the fold just built.
+
+     Six fixes have now been written against this defect and all six measured
+     inert. Do not write a seventh until the statement's actual source is
+     identified.
+
      That test has now been run, and it clears the memo: instrumenting both sides
      gives exactly one `MEMO miss` and one `MEMO hit` for this value, and *both*
      report the same bare `Subscript`. So `render_canonical_load_expr_uncached`
