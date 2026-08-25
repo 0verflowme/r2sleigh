@@ -109,12 +109,80 @@ learn.
 
 ### Open, each scoped by measurement
 
-  0. **A value has two spellings and the alias that picks between them is not
-     owned by the symbol table.** This is what eleven of the twelve remaining
-     corpus failures are, and it is the one to read first.
+  0. **The failures are eight causes, not one.** An earlier revision of this
+     item claimed that eleven of twelve remaining failures were the spelling
+     defect below. That was read off `out_x64_O0.txt` while it was stale. Fresh
+     dumps at 35 of 54 give this distribution, and the spelling defect is three
+     of eighteen:
+
+     | cause | count | where |
+     | --- | --- | --- |
+     | `x30` stored through an argument | 2 | arm64 -O0 murmur3_32, xxhash32 |
+     | `uint128_t` is not a C type | 2 | arm64 -O2 crc32_bitwise, xxhash32 |
+     | register-named value never declared (`r8d`, `eax_5`, `eax_8`, `eax_12`, `rcx_6`) | 5 | x64 -O1/-O2 |
+     | `tmp_4700_7` / `tmp_11f80_4` -- the spelling defect | 3 | x64 -O1/-O2, arm64 -O1 xxhash32 |
+     | `t11f00_10` / `t20380_4` -- murmur3's duplicated merge block | 3 | x64 -O0, arm64 -O1/-O2 |
+     | `sym__rotl32` called with no declaration | 1 | x64 -O0 xxhash32 |
+     | `tregalias_...` never declared | 1 | x64 -O2 crc32_bitwise |
+     | wrong checksum | 1 | x64 -O2 pearson |
+
+     Two of these look cheap and are not. `uint128_t` comes from `CType::UInt(128)`
+     printing `uint{bits}_t` in `ast.rs:129`, but the reason a 128-bit type is
+     there at all is that a 32-bit table is being read 128 bits wide:
+     `((uint128_t*)0x100000000U)[245]`. Spelling it `__uint128_t` would move the
+     verdict from `nocompile` to `wrong`, not to `CORRECT`, so it belongs to the
+     width layer and not to naming. Likewise `sym__rotl32` compiles once declared
+     but cannot link, because the harness builds one function per file.
+
+  0a. **`stp x29, x30` renders as a store through an argument (arm64, non-leaf).**
+     Both arm64 -O0 failures are this, and only this. The first statement of
+     `murmur3_32` is
+
+     ```c
+     (((unsigned char *)(long)(arg2))[1]) = x30;
+     ```
+
+     which is the prologue's frame-record save, `stp x29, x30, [sp, 0x60]`, where
+     the frame is `sub sp, sp, 0x70` and `add x29, sp, 0x60` follows. It appears
+     only in non-leaf functions: `fnv1a32` and the other six correct arm64 -O0
+     functions are leaves, never establish `x29`, and stay entirely sp-relative.
+
+     The trace runs: `render_canonical_store_target_expr` is handed
+     `addr=tmp:3a600_1`, whose raw definition is `AddrOf(Var(81)) + 8` with
+     symbol 81 spelling `arg2`. Following that back, `resolve_stack_var(-0x10)`
+     answers `arg2` from all three of its sources at once --
+     `prepared=Some("arg2") external=Some("arg2") map=Some("arg2")` -- so this is
+     not a precedence bug between them. The offset is what is wrong.
+
+     Two offset spaces are in play and are being mixed. r2 names the third
+     argument `arg3 @ x2` and reports `var_60h @ sp+0x60`; the plugin renumbers
+     to `arg0..arg2`. In x29-space, `x29 - 0x10` is where r2's `arg2` (`x1`) is
+     homed, which is why `-0x10` resolves to that name. The store being resolved
+     is at `sp + 0x68`, which is `x29 + 8` -- offset zero plus eight, not
+     `-0x10` plus eight. So the base was selected in one space and the
+     displacement applied in another.
+
+     What is *not* yet established is which producer writes that definition.
+     `insert_definition_for_var`, the `SSAOp::Store` arm of `op_to_stmt_impl`,
+     `render_call_arg_addr_for_definition` and the `stack_slot_addr_alias`
+     closure in `resolve_visible_stack_addr` were each instrumented and none of
+     them fires for this value; the definition arrives through some other route
+     into `lookup_definition_raw`. Name that route before changing anything --
+     `resolve_stack_var` already has a `saved_fp` name for exactly this slot, and
+     an external r2 name is allowed to override it at `fold/stack.rs:778`, which
+     is a tempting place to put a guard that would not be the cause.
+
+  0b. **A value has two spellings and the alias that picks between them is not
+     owned by the symbol table.** Three of the eighteen failures, not eleven of
+     twelve.
 
      A value lifted into a stack local has both names: `local_28`, its rendered
-     spelling, and `tmp:11f80_2`, the temporary it came from. Which is correct
+     spelling, and `tmp:11f80_2`, the temporary it came from. Note that the
+     example line this item used to quote,
+     `for (int64_t local_28 = 0; t11f80_2 < arg1; ...)` in `fnv1a32`, no longer
+     reproduces: the current tree renders `local_28 < arg1` there and `fnv1a32`
+     is CORRECT in all six configurations. The defect survives as `tmp_4700_7`
+     and `tmp_11f80_4` in xxhash32. Which is correct
      depends on context, and that context lives in `var_aliases`, a map each
      reader consults for itself. Any route that reaches the value without going
      through that map prints the wrong one.
