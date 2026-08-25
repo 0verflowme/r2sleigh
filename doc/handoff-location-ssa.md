@@ -589,17 +589,33 @@ learn.
      So the emitted statement is not this function's return value, even though
      the memo records the function being called exactly once for this
      destination and returning exactly this expression. Something renders that
-     statement from another source. `structure.rs` keeps a `folded_block_cache`
-     keyed by block address and the fold debug prints `FOLDCACHE hit/miss` -- if
-     block `0x100000830` is folded more than once, or its statements are cached
-     from a fold that ran before this path, that would explain every inert fix.
-     Instrument `folded_block_stmts` for that block: print how many times it
-     folds and whether the `t11f00_2` statement in the cached list matches the
-     one the fold just built.
+     statement from another source -- but not the block cache, which was the last
+     candidate and is now excluded: `FOLDCACHE miss block=0x100000830 stmts=31`
+     appears exactly once with no hit, and the statement is present in that
+     fold's own output as `FSTMT 1 target=t11f00_2 reads=["arg0", "t11f00_2",
+     "t4900_2"]`. The block folds once, the statement is the Load's, and it is
+     built on the path the transform sits on.
+
+     Every explanation offered for this defect is now excluded by measurement:
+     the memo, the inlined rendering, a second lowering, `assign_stmt`, the pass
+     pipeline, the post-pipeline steps, codegen, and the block cache. The
+     transform is reached with the right expression and the right width, returns
+     a different expression on every branch, and the emitted text does not
+     change. Those facts do not reconcile, and this document says so rather than
+     offering a seventh guess.
+
+     What a fresh attempt should do differently: stop probing and make the
+     transform *unmistakable* -- have it return a `CExpr::External` carrying a
+     unique marker string instead of a typed access, rebuild, and grep `pdd` for
+     the marker. If the marker does not appear, the emitted statement provably
+     comes from somewhere else and the search resumes with that certainty. If it
+     does appear, the earlier transforms were correct and something normalises
+     them away afterwards, which narrows the search to expression normalisation
+     rather than expression construction. Either answer is worth more than
+     another rule.
 
      Six fixes have now been written against this defect and all six measured
-     inert. Do not write a seventh until the statement's actual source is
-     identified.
+     inert. Do not write a seventh until that marker test has been run.
 
      That test has now been run, and it clears the memo: instrumenting both sides
      gives exactly one `MEMO miss` and one `MEMO hit` for this value, and *both*
