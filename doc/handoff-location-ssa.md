@@ -588,6 +588,24 @@ learn.
      fold's own expression really is the bare `arg0[t4900_2]` and the cast is the
      analysis-built subscript reaching the page by another route.
 
+     Correction, from measuring it: `ptr_subscript_expr` is *not* the path this
+     load takes. Declining the ptr-arith subscript whenever
+     `ptr.element_size != elem_size` changes nothing -- built, measured at 37,
+     reverted. And neither subscript branch could have produced a byte cast in
+     any case: `try_subscript_from_addr_expr` types the element with
+     `uint_type_from_size(elem_size)`, the *access* width, and discards the scale
+     it extracted, so its failure mode is the double-scaled
+     `((uint32_t *)arg0)[i * 4]` rather than a byte view.
+
+     That leaves the branch tried ahead of both, at `analysis/lower.rs:281`:
+     `render_semantic_value_for_var(dst, ..)`. The recorded semantic value for
+     the load's destination wins over every subscript path below it, so the
+     `(unsigned char *)` was chosen when that semantic value was built. Probe
+     there next -- and note that a probe on
+     `prepared_load_access_expr_for_addr` keyed on the address `tmp:4a00_2`
+     printed nothing, so the semantic value is reaching that destination by some
+     other route than the one whose comment names murmur3.
+
      So the fix has to reconcile two facts that are each right on their own: the
      pointer fact owns the address shape, the load owns the width. A four-byte
      read through a byte-scaled pointer is `((uint32_t *)arg0)[i]` once the index
