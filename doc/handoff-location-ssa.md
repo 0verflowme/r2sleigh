@@ -4601,5 +4601,16 @@ Codegen is not stripping it. `CExpr::Subscript` emits its base through
 `(arg0 + (arg1 & -0x4))` correctly parenthesised -- so a cast on that base would
 have survived and printed.
 
-A fifth construction site, or a pass that removes the cast, is unaccounted for.
-The four eliminated candidates are recorded so they are not re-checked.
+The fifth site is `prepared_load_access_expr_from_visible_addr` in
+`prepared_semantic.rs`, which turns an address expression into a subscript or a
+deref and casts neither. It is a free function with no type context, but it does
+not need one: it is given `elem_size`, so the pointee is known. It now casts the
+base to `uintN *` before subscripting.
+
+`murmur3_32` stops failing on the subscript at both optimised arm64 builds and
+fails instead on `t20380_4`, an undeclared name -- the family recorded above. The
+corpus stays at 35 of 54 for that reason, and 2334 tests pass.
+
+The cast is not blanket noise: it is skipped when the base is already a pointer
+cast, and every other subscript builder in the tree does the same thing already.
+This was the one that did not.

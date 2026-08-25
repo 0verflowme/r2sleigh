@@ -1400,7 +1400,22 @@ fn prepared_load_access_expr_from_visible_addr(
     elem_size: u32,
     member_projected: &HashSet<(u64, u32)>,
 ) -> Option<CExpr> {
-    let elem_size = i64::from(elem_size.max(1));
+    let elem_bytes = elem_size.max(1);
+    let elem_size = i64::from(elem_bytes);
+
+    // The address is an integer expression; subscripting or dereferencing it
+    // needs a pointer. `murmur3_32` renders `(arg0 + (arg1 & -0x4))[1]` without
+    // this, and C reads that as indexing an integer. The element width is known
+    // here, so the pointee is too.
+    fn as_pointer(expr: CExpr, elem_bytes: u32) -> CExpr {
+        if matches!(&expr, CExpr::Cast { ty: crate::ast::CType::Pointer(_), .. }) {
+            return expr;
+        }
+        CExpr::cast(
+            crate::ast::CType::ptr(crate::ast::CType::UInt(elem_bytes.saturating_mul(8))),
+            expr,
+        )
+    }
 
     fn literal_i64(expr: &CExpr) -> Option<i64> {
         match expr {
@@ -1440,7 +1455,7 @@ fn prepared_load_access_expr_from_visible_addr(
                     // index decided it first and `cur->next` rendered as `cur[1]`.
                     CExpr::deref(CExpr::binary(BinaryOp::Add, *left, *right))
                 } else {
-                    CExpr::subscript(*left, CExpr::IntLit(index))
+                    CExpr::subscript(as_pointer(*left, elem_bytes), CExpr::IntLit(index))
                 });
             }
             if let Some(offset) = literal_i64(left.as_ref())
@@ -1450,7 +1465,7 @@ fn prepared_load_access_expr_from_visible_addr(
                 return Some(if index == 0 {
                     CExpr::deref(*right)
                 } else {
-                    CExpr::subscript(*right, CExpr::IntLit(index))
+                    CExpr::subscript(as_pointer(*right, elem_bytes), CExpr::IntLit(index))
                 });
             }
             Some(CExpr::deref(CExpr::binary(BinaryOp::Add, *left, *right)))
@@ -1467,7 +1482,7 @@ fn prepared_load_access_expr_from_visible_addr(
                 return Some(if index == 0 {
                     CExpr::deref(*left)
                 } else {
-                    CExpr::subscript(*left, CExpr::IntLit(index))
+                    CExpr::subscript(as_pointer(*left, elem_bytes), CExpr::IntLit(index))
                 });
             }
             Some(CExpr::deref(CExpr::binary(BinaryOp::Sub, *left, *right)))
