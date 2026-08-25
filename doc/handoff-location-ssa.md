@@ -696,12 +696,22 @@ learn.
      entry. Built, measured, reverted.
 
      The reason is that *every* register a function reuses anywhere now
-     disqualifies its carrier, and a compiler reuses registers constantly. The
-     question has to be bounded by the carrier's live range: does another value
-     occupy this place *between* the carrier's first and last member, rather than
-     anywhere in the function. `StorageSpans` already tracks runs, so the
-     bound exists; it is the occupant set that needs restricting, not widening
-     without one.
+     disqualifies its carrier, and a compiler reuses registers constantly.
+
+     A live-range bound is the obvious repair and would not work either, which is
+     worth saying before someone builds it: murmur3's `xor ecx, ecx` happens
+     *after* the loop, so it is outside the carrier's range by construction. A
+     rule that only counts occupants between the carrier's first and last member
+     would not see it.
+
+     Which points at the renderer rather than the gate. The carrier's range ends
+     at the loop exit; the tail then uses `rcx` as a different variable. Reads of
+     `rcx` in the tail resolve to the carrier because they share its *name* --
+     `carrier_name_aliases` maps member values to `rcx`, and anything else
+     spelled `rcx` inherits the association -- not because they are members. So
+     the question to ask is not "does this carrier span a reuse" but "is this
+     read inside the carrier's range at all", and the answer belongs where a name
+     is resolved to a carrier, not where carriers are certified.
 
      A measurement note that cost an hour here: when `make -C r2plugin install`
      fails -- and it does, intermittently, with `codesign: internal error in Code
