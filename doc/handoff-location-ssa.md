@@ -597,14 +597,27 @@ learn.
      it extracted, so its failure mode is the double-scaled
      `((uint32_t *)arg0)[i * 4]` rather than a byte view.
 
-     That leaves the branch tried ahead of both, at `analysis/lower.rs:281`:
-     `render_semantic_value_for_var(dst, ..)`. The recorded semantic value for
-     the load's destination wins over every subscript path below it, so the
-     `(unsigned char *)` was chosen when that semantic value was built. Probe
-     there next -- and note that a probe on
-     `prepared_load_access_expr_for_addr` keyed on the address `tmp:4a00_2`
-     printed nothing, so the semantic value is reaching that destination by some
-     other route than the one whose comment names murmur3.
+     `render_semantic_value_for_var` is ruled out too: a probe inside that branch,
+     keyed on `tmp:11f00_2`, prints nothing. So the whole of `LowerCtx::op_to_expr`
+     is off the path -- none of its three renderings produce this line.
+
+     Ten sites are now eliminated with evidence, and the shortest true statement
+     of what remains is this: the fold's own answer for this load is the bare
+     `arg0[t4900_2]` (measured), codegen emits a `Subscript` verbatim (read), and
+     the emitted line nevertheless reads
+     `(((unsigned char *)(long)(arg0))[t4900_2])`. Something rewrites the
+     subscript's base between `op_to_stmt_impl` returning the statement and
+     codegen consuming it, and it is not any of: `render_canonical_load_expr` and
+     its memo, `prepared_load_access_expr_for_addr`, the recorded definition
+     (rejected as unsafe), the recorded semantic value, `ptr_subscript_expr`,
+     `try_subscript_from_addr_expr`, or `cast_addr_expr_to_ptr_if_needed` (its
+     branch is not taken).
+
+     The next probe should stop searching by name and instead dump the statement
+     list for block `0x100000830` after each pass in `decompile_input`'s
+     pipeline, comparing the `t11f00_2` assignment each time. The rewrite happens
+     between two adjacent entries in that list, and the bisect that found the
+     return-register guard found it in one run after two wrong guesses.
 
      So the fix has to reconcile two facts that are each right on their own: the
      pointer fact owns the address shape, the load owns the width. A four-byte
