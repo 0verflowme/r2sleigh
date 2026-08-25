@@ -10514,6 +10514,22 @@ impl<'a> FoldingContext<'a> {
         ))
     }
 
+    /// Whether a memory access already says how wide it is.
+    fn expr_states_its_pointee(expr: &CExpr) -> bool {
+        let target = match expr {
+            CExpr::Deref(inner) => inner.as_ref(),
+            CExpr::Subscript { base, .. } => base.as_ref(),
+            _ => return false,
+        };
+        matches!(
+            target,
+            CExpr::Cast {
+                ty: CType::Pointer(_),
+                ..
+            }
+        )
+    }
+
     fn semanticize_visible_expr(
         &self,
         expr: &CExpr,
@@ -10521,6 +10537,15 @@ impl<'a> FoldingContext<'a> {
         visited: &mut HashSet<String>,
     ) -> CExpr {
         if depth > Self::MAX_SEMANTIC_RENDER_DEPTH {
+            return expr.clone();
+        }
+
+        // An access that already states its pointee is finished. Re-deriving it
+        // from the address reaches the same place by a route that has forgotten
+        // the width, turning `*(uint32_t *)((uint8_t *)data + i)` back into
+        // `data[i]` -- and an untyped subscript makes every reader invent a
+        // width, which is how murmur3's dword read became a byte read.
+        if Self::expr_states_its_pointee(expr) {
             return expr.clone();
         }
 

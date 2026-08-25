@@ -909,13 +909,86 @@ impl<'a> FoldingContext<'a> {
         {
             return cached;
         }
-        let rendered = self.render_canonical_load_expr_uncached(dst, addr, elem_ty);
+        let rendered = self.render_canonical_load_expr_uncached(dst, addr, elem_ty.clone());
+        // A subscript on an integer base does not say what it reads, and the
+        // width is known here. Left unstated, every consumer invents one: the
+        // corpus harness rewrites `x[i]` as `((unsigned char *)x)[i]`, so
+        // murmur3's dword read became a byte read and the hash came out wrong.
+        let rendered = self.typed_subscript_access(rendered, &elem_ty);
         if let Some(key) = memo_key {
             self.load_expr_memo
                 .borrow_mut()
                 .insert(key, rendered.clone());
         }
         rendered
+    }
+
+    /// State the pointee an integer-based subscript reads.
+    ///
+    /// The index counts bytes -- the lifter scaled it when it built the address
+    /// -- so widening the pointee means dividing that scaling back out, or the
+    /// read moves: `((uint32_t *)data)[i * 4]` lands at `i * 16`.
+    fn typed_subscript_access(&self, expr: CExpr, elem_ty: &CType) -> CExpr {
+        let CExpr::Subscript { base, index } = expr else {
+            return expr;
+        };
+        let elem_bytes = match elem_ty {
+            CType::Int(bits) | CType::UInt(bits) | CType::Float(bits) => bits / 8,
+            _ => 0,
+        };
+        let already_typed = matches!(
+            base.as_ref(),
+            CExpr::Cast {
+                ty: CType::Pointer(_),
+                ..
+            }
+        );
+        if elem_bytes <= 1 || already_typed {
+            return CExpr::Subscript { base, index };
+        }
+        let scaled = match index.as_ref() {
+            CExpr::Var(name) => self
+                .definition_of(&self.spelling(*name))
+                .unwrap_or_else(|| (*index).clone()),
+            other => other.clone(),
+        };
+        match Self::index_in_elements(&scaled, elem_bytes) {
+            Some(unscaled) => CExpr::Subscript {
+                base: Box::new(CExpr::cast(CType::ptr(elem_ty.clone()), *base)),
+                index: Box::new(unscaled),
+            },
+            None => CExpr::Deref(Box::new(CExpr::cast(
+                CType::ptr(elem_ty.clone()),
+                CExpr::binary(
+                    BinaryOp::Add,
+                    CExpr::cast(CType::ptr(CType::UInt(8)), *base),
+                    *index,
+                ),
+            ))),
+        }
+    }
+
+    /// A byte-counting index expressed in elements, when it divides exactly.
+    fn index_in_elements(index: &CExpr, elem_bytes: u32) -> Option<CExpr> {
+        match index {
+            CExpr::Paren(inner) => Self::index_in_elements(inner, elem_bytes),
+            CExpr::Binary {
+                op: BinaryOp::Mul,
+                left,
+                right,
+            } => match (left.as_ref(), right.as_ref()) {
+                (other, CExpr::IntLit(value)) | (CExpr::IntLit(value), other)
+                    if *value == i64::from(elem_bytes) =>
+                {
+                    Some(other.clone())
+                }
+                _ => None,
+            },
+            CExpr::IntLit(value) if value % i64::from(elem_bytes) == 0 => {
+                Some(CExpr::IntLit(value / i64::from(elem_bytes)))
+            }
+            _ => None,
+        }
     }
 
     fn render_canonical_load_expr_uncached(

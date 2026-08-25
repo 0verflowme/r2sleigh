@@ -524,126 +524,49 @@ learn.
      xxhash32 -O1 returns nothing against `e7583aa4` -- so they are a different
      defect rather than this one.
 
-  0j. **The `unsigned char` cast is the harness's, not the decompiler's.**
-     Correcting two turns of work that chased it.
+  0j. **[FIXED] A memory access did not say how wide it was.** Seven attempts,
+     and the last one worked because a marker test finally located the defect.
 
-     `verify_rendering.py` line 76 rewrites every `X[Y]` in the dump into
-     `(((unsigned char *)(long)(X))[Y])`, because the decompiler emits a
-     subscript on an integer and C will not compile that. A byte is the harness's
-     only available guess. So the `((unsigned char *)arg0)[i]` that this item
-     previously called a decompiler defect is a harness patch, and murmur3's
-     one-byte read follows from the guess rather than from a width the decompiler
-     chose.
+     Two things were confused for one another here, and the record is worth
+     keeping. `verify_rendering.py` line 76 rewrites every `X[Y]` in the dump
+     into `(((unsigned char *)(long)(X))[Y])`, because the decompiler emitted a
+     subscript on an integer and C will not compile that -- a byte is the
+     harness's only available guess. So the `((unsigned char *)arg0)[i]` that
+     several turns chased is a harness patch, not a decompiler defect. Read `pdd`
+     output when asking what the decompiler renders; `verify/*.c` is rewritten.
 
-     What the decompiler actually emits is
+     The real defect was that the decompiler emitted `arg0[t4900_2]` -- a
+     subscript on a `long`, stating no pointee at all -- so every consumer had to
+     invent a width, and murmur3's dword read became a byte read.
 
-     ```c
-     uint64_t t11f00_2 = arg0[t4900_2];
-     ```
-
-     -- a subscript on a `long`, with no pointee stated anywhere. That is the
-     real defect: the access knows it reads four bytes and says nothing, so
-     whoever consumes the output has to invent a width.
-
-     **This invalidates the method, not the eliminations.** Ten sites were ruled
-     out by probes on the decompiler's own data structures and those results
-     stand: the `Load` arm computes `elem_ty` as `UInt(32)`;
-     `render_canonical_load_expr` returns a bare `Subscript` with `elem_ty`
-     unused; the recorded definition is rejected (`safe=false`); the semantic
-     value branch is never taken; the memo is keyed on width;
-     `prepared_load_access_expr_for_addr` is never called for this address; and
-     a per-pass dump shows the RHS remaining a bare `Subscript` through every
-     pass and every post-pipeline step. But the *thing* being hunted -- the cast
-     -- was never in the decompiler at all. Read `pdd` output directly when
-     asking what the decompiler renders; `verify/*.c` is a rewritten artefact.
-
-     Two attempts at stating the pointee were then measured against the real
-     output and both left `arg0[t4900_2]` unchanged: applying `elem_ty` to the
-     subscript base in `render_canonical_load_expr_uncached`, and the same with
-     `looks_like_pointer` dropped from the guard so that only an explicit cast
-     counts. `assign_stmt` is not the culprit either -- probing it directly gives
-     `in=Subscript{..}` and `out=Assign(.., Subscript{..})`, an unchanged
-     pass-through.
-
-     So an edit inside `render_canonical_load_expr_uncached` does not reach the
-     statement that gets emitted, even though a probe in that same function
-     reports the same expression the statement carries. The two facts are only
-     consistent if the emitted statement comes from a *different* call than the
-     one being edited -- a memo hit, an inlined rendering replayed from
-     `inlined_renderings`, or a second lowering of the same op.
-
-     **The minimal test has now been run, and the result is stranger than the
-     hypotheses.** With a print at the very top of the transform helper:
+     Six fixes at the construction site were inert, and the reason was found by
+     making the transform unmistakable rather than by more probing: returning a
+     `CExpr::External` marker instead of a typed access, and grepping `pdd` for
+     it. The marker *appeared*. So the return value did reach the statement all
+     along, and something was normalising the typed accesses away afterwards.
+     Tracing the three normalisers in `assign_stmt` shows exactly where:
 
      ```
-     TYPEDSUB in=Subscript { base: Var(47), index: Var(10) } elem_ty=UInt(32)
+     1-identity = Deref(Cast{ptr(UInt(32)), Cast{ptr(UInt(8)), arg0} + t4900_2})
+     2-semantic = Subscript { base: arg0, index: t4900_2 }
      ```
 
-     The helper *is* called, with the right expression and the right width, and
-     every branch below that point returns something other than its input -- yet
-     `pdd` still emits `uint64_t t11f00_2 = arg0[t4900_2];` unchanged. The
-     transform was tried in two positions, on the `best` candidate and on the
-     finished return value of `render_canonical_load_expr`, with the same result
-     both times.
+     `semanticize_visible_expr` re-derives the access from its address and
+     reaches the same place by a route that has forgotten the width.
 
-     So the emitted statement is not this function's return value, even though
-     the memo records the function being called exactly once for this
-     destination and returning exactly this expression. Something renders that
-     statement from another source -- but not the block cache, which was the last
-     candidate and is now excluded: `FOLDCACHE miss block=0x100000830 stmts=31`
-     appears exactly once with no hit, and the statement is present in that
-     fold's own output as `FSTMT 1 target=t11f00_2 reads=["arg0", "t11f00_2",
-     "t4900_2"]`. The block folds once, the statement is the Load's, and it is
-     built on the path the transform sits on.
+     Fixed by having it decline: an access whose base is already a pointer cast
+     states its pointee and is finished. murmur3's main loop now renders
+     `*(uint32_t *)((uint8_t *)arg0 + t4900_2)`, the width the machine reads at
+     the offset it uses. Corpus holds at 37 of 54 with the harness assuming one
+     fewer width, and murmur3 still returns `ec1fbeef` against `7e4102af` --
+     the remaining error is the tail below, not this.
 
-     Every explanation offered for this defect is now excluded by measurement:
-     the memo, the inlined rendering, a second lowering, `assign_stmt`, the pass
-     pipeline, the post-pipeline steps, codegen, and the block cache. The
-     transform is reached with the right expression and the right width, returns
-     a different expression on every branch, and the emitted text does not
-     change. Those facts do not reconcile, and this document says so rather than
-     offering a seventh guess.
-
-     What a fresh attempt should do differently: stop probing and make the
-     transform *unmistakable* -- have it return a `CExpr::External` carrying a
-     unique marker string instead of a typed access, rebuild, and grep `pdd` for
-     the marker. If the marker does not appear, the emitted statement provably
-     comes from somewhere else and the search resumes with that certainty. If it
-     does appear, the earlier transforms were correct and something normalises
-     them away afterwards, which narrows the search to expression normalisation
-     rather than expression construction. Either answer is worth more than
-     another rule.
-
-     Six fixes have now been written against this defect and all six measured
-     inert. Do not write a seventh until that marker test has been run.
-
-     That test has now been run, and it clears the memo: instrumenting both sides
-     gives exactly one `MEMO miss` and one `MEMO hit` for this value, and *both*
-     report the same bare `Subscript`. So `render_canonical_load_expr_uncached`
-     really is the function that produces the emitted expression, and it is
-     reached exactly once.
-
-     Which leaves the uncomfortable conclusion that the edits themselves never
-     took effect, not the path. Both were placed immediately after
-     `best = self.choose_preferred_visible_expr(best, fallback_rendered);` and
-     mapped `best` through a helper whose every branch returns something other
-     than its input, yet the output was byte-identical each time. The next
-     attempt should re-apply the smallest possible version -- an unconditional
-     `eprintln!` at the top of that helper and nothing else -- and confirm it
-     runs at all before adding any logic to it. If it does not print, the edit is
-     not where the build thinks it is; if it does print and the output is still
-     unchanged, then `best` is not what reaches the statement despite the memo
-     saying otherwise, and the next thing to instrument is the `if let Some(expr)
-     = best` block's three exits.
-
-     Five fixes have now been written against this defect and all five measured
-     inert. That is no longer evidence about the decompiler; it is evidence about
-     the method, and the method should change before another rule is written.
-
-     One constraint holds whatever the fix: the index counts bytes.
-     `t4900_2 = rcx * 4` is address arithmetic the lifter already did, so the
-     correct forms are `((uint32_t *)arg0)[rcx]` after unscaling or
-     `*(uint32_t *)((uint8_t *)arg0 + t4900_2)` when the scaling cannot be seen.
+     Also visible in the same function and a separate defect: the tail renders
+     `switch (arg1)` where `switch (arg1 & 3)` is meant, so a 61-byte message
+     matches none of `case 1/2/3` and the tail is skipped. Using the selector
+     value rather than `prepared_canonical_value_root` of it does not fix that --
+     measured, unchanged, reverted -- so the mask is already absent from the
+     selector the switch facts carry.
 
   0g. **murmur3's tail switch renders with empty bodies.** This is what arm64 -O0
      `murmur3_32` now fails on, and the undeclared `x8_30` is a symptom of it
