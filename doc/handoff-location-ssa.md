@@ -946,6 +946,40 @@ learn.
      measured there, one at 37 to 17, one that landed, and this check, and each
      addressed a different defect behind the same rendered lines.
 
+  0m. **pearson's return reads the loop's exit merge by its own name.** One
+     failure, x86-64 -O1, and the smallest remaining case of the carrier family.
+
+     ```c
+     rcx = (int64_t)0;
+     do { ...; rcx = (int64_t)t11e00_3; ... } while (arg1 != rax);
+     return (uint8_t)rcx_6;     /* wants `(uint8_t)rcx` */
+     ```
+
+     `rcx` is a certified carrier with members `RCX_1`, `RCX_2` and `RCX_4`.
+     `RCX_6` is a phi -- it has no defining op -- and is the loop's exit merge,
+     but it is not aliased to the carrier, so the return prints a name nothing
+     declares.
+
+     `exit_merges_for_carrier` rejects it, and probing the three conditions says
+     why:
+
+     ```
+     EXITMERGE carrier=RCX_2 cand=RCX_6 all=false any_entry=false any_update=true
+     ```
+
+     One of its sources is a certified update, but not all sources are in
+     `entries ∪ updates`, and none is an entry. The likely reason is that the
+     bypass path -- "the loop never ran" -- carries the value from *before* the
+     header phi rather than the phi's own entry source, so it is a different
+     `ValueId` and fails the membership test.
+
+     Relaxing that test needs care: its comment explains that the carrier is a
+     third name rather than either source, and that the entry/update requirement
+     is what stops an unrelated merge over the same storage being claimed. Before
+     changing it, confirm what `RCX_6`'s non-update source actually is -- if it is
+     the initialiser the carrier already knows about, admitting
+     `dominating_initializers` alongside `entries` would be the narrow fix.
+
   0g. **murmur3's tail switch renders with empty bodies.** This is what arm64 -O0
      `murmur3_32` now fails on, and the undeclared `x8_30` is a symptom of it
      rather than the defect. The rendering is
