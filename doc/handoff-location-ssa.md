@@ -480,9 +480,33 @@ learn.
      an external r2 name is allowed to override it at `fold/stack.rs:778`, which
      is a tempting place to put a guard that would not be the cause.
 
-  0b. **A value has two spellings and the alias that picks between them is not
-     owned by the symbol table.** Three of the eighteen failures, not eleven of
-     twelve.
+  0b. **[FIXED] A value had two spellings, and the condition minted its own.**
+     `resolve_prepared_predicate_operand_with_width` holds the operand as an
+     `SSAVar` and was converting it to a display name for `origin_name_to_expr`,
+     which mints from the raw string when the reverse index misses. That is how
+     `tmp:4700_7` printed as `t4700_7` in the statement defining it and
+     `tmp_4700_7` in the condition reading it, with the statement then dropped as
+     dead because nothing appeared to read it.
+
+     Fixed by `origin_operand_expr`, which asks `var_ref` for the value -- the
+     same call the statement makes -- but only when nothing else already names
+     it: no stack slot, no coalesced alias, no carrier, not a constant. That
+     guard is the whole difference between this and the attempt that took
+     x86-64 -O0 and arm64 -O0 from seven correct to zero: a stack-lifted value is
+     named by its slot from the stack facts, not by `spell_var`, so routing
+     *those* through `var_ref` prints the temporary they were lifted from.
+     Paired with `sym_for_var` returning the identifier already minted for a
+     value when the spelling matches, so the two sites converge on one name
+     instead of the reverse index erasing itself.
+
+     Measured: `tmp_4700_7` and `tmp_11f80_4` are gone from all three
+     configurations that had them, `long t4700_7 = rdi + 4;` is emitted and read
+     by its own condition, and every failure that was this defect advances to a
+     different cause -- x86-64 -O1 to `eax_4` (the narrow-carrier-member cluster),
+     x86-64 -O2 to a struct type error, and arm64 -O1 xxhash32 all the way to
+     compiling and running, where it now returns 6c5cba44 against a wanted
+     e7583aa4. Corpus holds at 36 of 54: three functions moved forward, none
+     over the line.
 
      A value lifted into a stack local has both names: `local_28`, its rendered
      spelling, and `tmp:11f80_2`, the temporary it came from. Note that the

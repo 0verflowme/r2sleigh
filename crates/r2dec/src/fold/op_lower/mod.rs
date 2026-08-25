@@ -1867,10 +1867,19 @@ impl<'a> FoldingContext<'a> {
     /// The identifier this spelling renders, remembering which value it renders.
     #[track_caller]
     pub(crate) fn sym_for_var(&self, name: &str, var: &SSAVar) -> crate::symbol::SymbolId {
+        // Asking twice for the same spelling of the same value is one identifier.
+        // `declare` uniquifies, so a repeat request minted a fresh id and
+        // `note_ssa_name` then saw two ids claiming one SSA name and dropped the
+        // reverse-index entry -- the only thing that could tell a later reader
+        // the two were the same value.
+        let ssa_name = var.display_name();
+        if let Some(id) = self.symbols.borrow().for_ssa_name(&ssa_name)
+            && &*self.spelling(id) == name
+        {
+            return id;
+        }
         let id = self.sym(name);
-        self.symbols
-            .borrow_mut()
-            .note_ssa_name(id, &var.display_name());
+        self.symbols.borrow_mut().note_ssa_name(id, &ssa_name);
         id
     }
 

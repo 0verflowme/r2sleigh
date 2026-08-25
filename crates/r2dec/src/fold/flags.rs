@@ -884,7 +884,7 @@ impl<'a> FoldingContext<'a> {
             );
         }
         let resolved = self.resolve_predicate_operand(
-            &self.origin_name_to_expr(&rooted_name),
+            &self.origin_operand_expr(&rooted),
             0,
             &mut HashSet::new(),
         );
@@ -3229,6 +3229,34 @@ impl<'a> FoldingContext<'a> {
                 | FlagCompareKind::Overflow => CompareContext::SignedNegative,
             },
         }))
+    }
+
+    /// The operand expression for an origin whose value is in hand.
+    ///
+    /// A *temporary* is the one case where going through the display string
+    /// produces a name nothing else uses: `tmp:4700_7` mints as `tmp_4700_7`
+    /// here and as `t4700_7` in the statement that defines it, and the statement
+    /// is then dropped as dead because nothing appears to read it. Asking
+    /// `var_ref` spells it the way the statement does and records which value the
+    /// identifier renders, so the two converge on one name.
+    ///
+    /// Only when nothing else names the value. A stack-lifted value is rendered
+    /// by its slot's name, and that name comes from the stack facts rather than
+    /// from `spell_var` -- so routing those through `var_ref` prints the
+    /// temporary they were lifted from and takes x86-64 -O0 and arm64 -O0 from
+    /// seven correct to zero. The same goes for a carrier member or a coalesced
+    /// name: those already have an owner, and this is for the values that have
+    /// none.
+    pub(super) fn origin_operand_expr(&self, var: &SSAVar) -> CExpr {
+        let display = var.display_name();
+        if self.stack_slot_offset_for_var(var).is_none()
+            && self.var_aliases_map().get(&display).is_none()
+            && self.carrier_aliases.get(&display).is_none()
+            && self.parse_expr_from_name(&display).is_none()
+        {
+            return self.var_ref(var);
+        }
+        self.origin_name_to_expr(&display)
     }
 
     pub(super) fn origin_name_to_expr(&self, name: &str) -> CExpr {
