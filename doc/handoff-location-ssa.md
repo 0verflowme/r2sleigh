@@ -4659,5 +4659,17 @@ origins are values and resolve; some are storages and cannot. The fix for those
 is upstream of spelling: whatever records the origin has to record which version
 it meant.
 
+Two searches for the producer came back empty and are worth recording so they are
+not repeated. `name_ref` never receives `tmp:4700` -- a `#[track_caller]` probe on
+it fires for no such call -- and neither does `SymbolTable::declare_or_reuse`. So
+the symbol carrying that name is created by neither of the two obvious routes,
+and the name reaches the page through `spell_every_name_as_c`, which sanitises
+`tmp:4700` to `tmp_4700` because it is a symbol name that is not a legal
+identifier.
+
+`SSAVar::display_name` always appends `_{version}`, so `tmp:4700` cannot have come
+from a display name at all. Something is putting a bare storage name where a
+value name belongs, and finding that site is the next step for this family.
+
 The corpus is 35 of 54 throughout -- this moves `xxhash32` from one undeclared
 name to another rather than to a rendering that compiles.
