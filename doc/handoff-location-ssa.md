@@ -561,12 +561,31 @@ learn.
      fewer width, and murmur3 still returns `ec1fbeef` against `7e4102af` --
      the remaining error is the tail below, not this.
 
-     Also visible in the same function and a separate defect: the tail renders
-     `switch (arg1)` where `switch (arg1 & 3)` is meant, so a 61-byte message
-     matches none of `case 1/2/3` and the tail is skipped. Using the selector
-     value rather than `prepared_canonical_value_root` of it does not fix that --
-     measured, unchanged, reverted -- so the mask is already absent from the
-     selector the switch facts carry.
+  0k. **murmur3's tail switch has no selector at all.** This is what murmur3_32
+     at x86-64 -O1 now fails on, and it is worth more than the `& 3` it looks
+     like.
+
+     The tail renders `switch (arg1)` where `switch (arg1 & 3)` is meant, so a
+     61-byte message matches none of `case 1/2/3` and the whole tail is skipped;
+     the function returns `ec1fbeef` against `7e4102af`. But the mask is not
+     merely lost -- probing `infer_switch_selector_var` shows
+     `SELECTOR block=0x10000085c target=R8_11 found=None` for both switch blocks
+     in the function. There is no selector, and `switch (arg1)` is a fallback
+     rendering chosen without one.
+
+     Why the inference fails is visible in the same probe: the branch target is
+     `R8_11 = R8_10 + R9_1`, the offset-table pattern -- `lea` the table, load a
+     32-bit entry, add it to the base, jump. `infer_switch_selector_var_from_sum`
+     is handed two register operands and gives up, where it needs to follow the
+     one that is not the table base: `R9_1` is loaded from `[table + i * 4]`, and
+     `i` is the masked length.
+
+     Two things measured and reverted, so they are not retried: using the
+     selector value instead of `prepared_canonical_value_root` of it changes
+     nothing (there is no selector to root), and adding `SSAOp::IntAnd` to the
+     selector walk as a stopping point is *necessary but not sufficient* -- the
+     walk never reaches the mask because it fails at the sum two steps earlier.
+     Fix the sum first, then the mask arm will matter.
 
   0g. **murmur3's tail switch renders with empty bodies.** This is what arm64 -O0
      `murmur3_32` now fails on, and the undeclared `x8_30` is a symptom of it
