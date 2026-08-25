@@ -669,7 +669,23 @@ learn.
      provably the narrow one zero-extended -- is the change, and it is in the
      semantic layer rather than the renderer.
 
-     Note that this is the *third* place the same rule is needed, which is an
+     One correction to that plan, found by reading the growth code: the carrier
+     `rcx` belongs to murmur3's *main loop*, and the `xor ecx, ecx` happens after
+     that loop, in the tail. It is not a missing initialiser for the carrier --
+     it is the register being **reused** for a different variable once the loop
+     is over. `updates` and `entries` are built from the header phi's latch and
+     non-latch sources, so a post-loop write was never going to appear there
+     whatever width it had.
+
+     That points at the span machinery instead. `StorageSpans` exists to say
+     where a storage stops holding one value, and `carriers_spanning_a_reuse`
+     already reports carriers that cross such a point -- but the dump for
+     murmur3 shows both gates empty (`mirrored=[] reused=[]`), so this reuse is
+     not being detected. Check why `carriers_spanning_a_reuse` does not include
+     `rcx` here before changing carrier growth; if the span ended where the tail
+     reuses the register, the carrier would not answer for `k1` at all.
+
+     Note that the same width question is asked in a *third* place, which is an
      argument for putting it somewhere shared: `carrier_member_views` in
      `normalize.rs` applies it to header phis, `exit_merges_for_carrier` was
      widened to apply it to exit merges and measured inert because those values
