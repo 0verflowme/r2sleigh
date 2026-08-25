@@ -1176,6 +1176,13 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
     }
 
     fn structure_block_from_predecessor(&mut self, addr: u64, pred_block: u64) -> CStmt {
+        // A branch that runs into the merge its own `if` deferred must not print
+        // it: the `if` prints it once the branches are done. Printing it here as
+        // well renders the same statements twice, and the copy inside the branch
+        // reads names the copy after it declares -- murmur3 at arm64 -O1.
+        if self.deferred_merge_blocks.contains(&addr) {
+            return CStmt::Empty;
+        }
         let stmt = self.structure_block(addr);
         if !self.block_allows_predecessor_return_register_rewrite(addr) {
             return stmt;

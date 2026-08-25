@@ -809,16 +809,31 @@ learn.
      is consulted **only in the `IfThenElse` arm**. A branch region that reaches
      the merge as a plain `Region::Block` has nothing to stop it.
 
-     Applying the guard there -- returning `CStmt::Empty` for a
-     `Region::Block(addr)` already in `deferred_merge_blocks` -- takes the corpus
-     from **37 to 17**. Built, measured, reverted. The reason is that a deferral
-     is a *may*, not a *will*: the ancestor only emits the merge when
-     `!branches_terminate && !merge_owned_by_ancestor`, so an unconditional skip
-     deletes statements nothing else prints.
+     Applying the guard to `structure_region`'s `Region::Block` arm takes the
+     corpus from **37 to 17** -- and it never touched this defect at all, because
+     a branch region does not go through that arm. `structure_branch_region`
+     routes a `Region::Block` to `structure_block_from_predecessor`, and the
+     guard belongs there. Placed correctly it holds the corpus at 37 and halves
+     the duplication: `t20380_4` appears twice instead of four times, and the
+     merge is emitted once.
 
-     Whatever fixes this has to make the deferral a promise before it can be
-     relied on -- the ancestor deciding up front whether it will emit the merge,
-     and the stack recording only the ones it will.
+     What the duplicate was masking is now visible. The `else` branch returns a
+     value the merge computes:
+
+     ```c
+     } else {
+         long t20380_7 = (uint32_t)(int64_t)t20380_5 ^ arg1;
+         return ...;
+     }
+     long t20380_4 = ...;      /* the merge, after the if */
+     long t20380_5 = ...;
+     ```
+
+     so `t20380_5` is read before it is declared. The else path flows *through*
+     the merge and then returns, and structuring puts the return in the branch
+     while leaving the merge after the `if`. That ordering is the remaining
+     defect, and it was always there -- the duplicated copy sat in the *then*
+     branch, so it never helped the `else` path either.
 
   0g. **murmur3's tail switch renders with empty bodies.** This is what arm64 -O0
      `murmur3_32` now fails on, and the undeclared `x8_30` is a symptom of it
