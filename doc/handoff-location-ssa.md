@@ -574,11 +574,34 @@ learn.
      values that were previously consistent by accident.
 
      So the fix cannot be another fallback, however well-founded. It has to
-     replace the ladder with one decision: a value's name is chosen once, from
-     everything known about it, and every layer asks for that name rather than
-     re-deriving it from whichever table it happens to hold. That is the location
-     model's naming half stated as an instruction, and the 22 is the measurement
-     that says a partial version of it is worse than none.
+     replace the ladder with one decision. That was then built and measured too,
+     and the measurement corrects the instruction.
+
+     A `decided_name` hook was added to `NameSource` and consulted by `spell_var`
+     before anything else, answered by `FoldingContext` from the value's
+     *canonical* var so that every SSA name for one value spells the way that
+     value spells, decided once and memoised. It holds the corpus at 36 -- the
+     first structural naming change here that does not collapse -- and the
+     failure list is byte-identical. Instrumenting it explains why: over a whole
+     function it fires **zero** times. `prepared_var_for_value_id` returns the
+     var that asked, every time.
+
+     **Value and var are one-to-one here.** "One name per value" is therefore
+     already true at the var level, and was never the problem. The two spellings
+     of `tmp:4700_7` are not two vars for one value; they are *one var spelled
+     twice by different code paths* -- `spell_var` on one side, a mint from the
+     raw display string in `origin_name_to_expr` on the other.
+
+     That narrows the target and also sharpens the earlier 22. When the flag path
+     was made to go through `var_ref`, and so through `spell_var`, it printed
+     `t11f80_2` for the loop variable while the statement printed `local_28` --
+     so the *statement* is not going through `spell_var` either. There are at
+     least two things that turn a value into a rendered name, and they disagree.
+     The single decision has to be at the level of "what renders this value",
+     not "which var names it"; the ladder is one of the two producers, not the
+     whole of the problem. Finding the second producer -- what gives a stack
+     local its `local_28` -- is the next step, and it is a smaller question than
+     the ladder rewrite this item previously called for.
 
      What is known to work is narrower and already landed: `for_ssa_name` lets a
      caller holding a raw SSA name reach the identifier already minted for that
