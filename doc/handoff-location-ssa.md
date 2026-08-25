@@ -704,14 +704,29 @@ learn.
      rule that only counts occupants between the carrier's first and last member
      would not see it.
 
-     Which points at the renderer rather than the gate. The carrier's range ends
-     at the loop exit; the tail then uses `rcx` as a different variable. Reads of
-     `rcx` in the tail resolve to the carrier because they share its *name* --
-     `carrier_name_aliases` maps member values to `rcx`, and anything else
-     spelled `rcx` inherits the association -- not because they are members. So
-     the question to ask is not "does this carrier span a reuse" but "is this
-     read inside the carrier's range at all", and the answer belongs where a name
-     is resolved to a carrier, not where carriers are certified.
+     Which points at the renderer rather than the gate, and dumping the members
+     settles what the carrier actually is. All three are the loop counter:
+
+     ```
+     RCX_1 = IntZExt(ECX_1)          # i = 0, from the xor at 0x100000821
+     RCX_2 = Copy(RCX_1)             # entry
+     RCX_3 = RCX_2 + const:1         # increment
+     RCX_2 = Copy(RCX_3)             # latch
+     ```
+
+     The tail's `xor ecx, ecx` at `0x10000086a` produces `ECX_3`, which is *not*
+     among them. So the carrier is correct, the reuse is correct, and the defect
+     is that a value which is not a member is nevertheless spelled with the
+     carrier's name: two variables share the register, the carrier owns the name
+     `rcx`, and `k1` is rendered as `rcx` too -- at which point its zeroing
+     statement becomes a write to the carrier and resolves to the carrier's entry
+     value.
+
+     So the question is narrower than "spans a reuse" and narrower than live
+     range: **why is `ECX_3` spelled `rcx` when it is not a member of the `rcx`
+     carrier?** Trace `spell_var` for `ECX_3` -- its own base name is `ecx` -- and
+     find which table hands back the carrier's name for it. That table is the
+     defect, and neither the certification nor the span gate needs to change.
 
      A measurement note that cost an hour here: when `make -C r2plugin install`
      fails -- and it does, intermittently, with `codesign: internal error in Code
