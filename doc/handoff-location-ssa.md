@@ -687,14 +687,29 @@ learn.
      reuse. The detector cannot see a reuse by a value outside the carrier,
      which is the only kind of reuse there is.
 
-     Asking the question of the *place* rather than of the members would answer
-     it: are there values at `{Register, offset 0}` in a different span from the
-     carrier's own. But note the warning in that function's own comment before
-     widening it -- over-reporting "spans a reuse" once dropped every counter on
-     this target from the name aliases and rendered each as the value it held on
-     entry, "a loop whose condition never changes". The gate was tightened
-     deliberately, so any widening needs the arm64 -O0 and -O1 counters measured
-     specifically, not just the corpus total.
+     Asking the question of the *place* rather than of the members does answer
+     it, and it is far too broad: extending the occupant set with every value
+     whose canonical storage shares the carrier's run takes the corpus from
+     **37 to 19**, with x86-64 -O2, arm64 -O1 and arm64 -O2 all falling to zero.
+     That is exactly the failure the function's own comment describes -- carriers
+     dropped from the name aliases and each loop rendered as the value it held on
+     entry. Built, measured, reverted.
+
+     The reason is that *every* register a function reuses anywhere now
+     disqualifies its carrier, and a compiler reuses registers constantly. The
+     question has to be bounded by the carrier's live range: does another value
+     occupy this place *between* the carrier's first and last member, rather than
+     anywhere in the function. `StorageSpans` already tracks runs, so the
+     bound exists; it is the occupant set that needs restricting, not widening
+     without one.
+
+     A measurement note that cost an hour here: when `make -C r2plugin install`
+     fails -- and it does, intermittently, with `codesign: internal error in Code
+     Signing subsystem` -- copying the dylib by hand installs a *mixed* plugin
+     and the corpus reads 19 regardless of what the code says. Both the failing
+     install and the real regression produce the same number. Always check that
+     the install actually printed `Installed to ...` before believing a
+     measurement, and re-run it until it does.
 
      Note that the same width question is asked in a *third* place, which is an
      argument for putting it somewhere shared: `carrier_member_views` in
