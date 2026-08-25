@@ -4483,7 +4483,9 @@ fn propagate_single_use_register_carriers(func: &mut CFunction, fold_ctx: &Foldi
         whole_body: &[CStmt],
     ) {
         match stmt {
-            CStmt::Block(stmts) => visit_block(symbols, stmts, fold_ctx, declared, in_loop, whole_body),
+            CStmt::Block(stmts) => {
+                visit_block(symbols, stmts, fold_ctx, declared, in_loop, whole_body)
+            }
             CStmt::If {
                 then_body,
                 else_body,
@@ -4505,7 +4507,14 @@ fn propagate_single_use_register_carriers(func: &mut CFunction, fold_ctx: &Foldi
             }
             CStmt::Switch { cases, default, .. } => {
                 for case in cases {
-                    visit_block(symbols, &mut case.body, fold_ctx, declared, in_loop, whole_body);
+                    visit_block(
+                        symbols,
+                        &mut case.body,
+                        fold_ctx,
+                        declared,
+                        in_loop,
+                        whole_body,
+                    );
                 }
                 if let Some(default) = default {
                     visit_block(symbols, default, fold_ctx, declared, in_loop, whole_body);

@@ -119,7 +119,7 @@ learn.
      | --- | --- | --- |
      | `x30` stored through an argument | 2 | arm64 -O0 murmur3_32, xxhash32 |
      | `uint128_t` is not a C type | 2 | arm64 -O2 crc32_bitwise, xxhash32 |
-     | narrow carrier member read after a loop (`eax_5`, `eax_8`, `eax_12`/`ecx_9`, `rcx_6`) | 4 | x64 -O1/-O2 |
+     | narrow carrier member read after a loop (`eax_5`, `eax_8`, `eax_12`/`ecx_9`, `rcx_6`) -- **all fixed** | 0 | x64 -O1/-O2 |
      | `r8d` in a piece composition | 1 | x64 -O2 fnv1a64 |
      | `tmp_4700_7` / `tmp_11f80_4` -- the spelling defect | 3 | x64 -O1/-O2, arm64 -O1 xxhash32 |
      | `t11f00_10` / `t20380_4` -- murmur3's duplicated merge block | 3 | x64 -O0, arm64 -O1/-O2 |
@@ -989,6 +989,25 @@ learn.
      was about a different axis -- claiming merges in unrelated *storage*, which
      the size and storage checks above still prevent -- and not about which
      values the non-update edge may carry.
+
+  0n. **[FIXED] A single-use propagation counted readers in one list only.**
+     `propagate_single_use_register_carriers` substitutes an assignment into its
+     one reader and deletes it, and it counted readers only in `rest` -- the
+     remainder of the statement list it is walking. A value computed in one block
+     and read in a later one is read once *there* and many times overall, so the
+     pass deleted it and left the reader quoting a name nothing declares.
+
+     The pass already carried this mistake once. The `if in_loop { return; }`
+     guard above the loop explains that "the rest of this list" is not all the
+     readers, because a carrier is read again on the next iteration. The same is
+     true across sibling blocks and enclosing scopes; the count is now taken
+     against the whole function body as it stood when the pass began.
+
+     adler32 at x86-64 -O2 was the case that showed it: `ecx_9` is computed in
+     the tail and returned, `use_count_of` reported nine readers, and the
+     statement was still removed. It now compiles and runs, returning `894a1488`
+     against a wanted `9dd21488` -- the low half, the `a` accumulator, is correct
+     and `b` is not.
 
   0g. **murmur3's tail switch renders with empty bodies.** This is what arm64 -O0
      `murmur3_32` now fails on, and the undeclared `x8_30` is a symptom of it
