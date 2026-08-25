@@ -524,12 +524,40 @@ learn.
      differ, so they were never going to collide on spelling. Written, measured
      inert, reverted.
 
-     What that leaves is an interface requirement rather than a naming trick: the
-     flag path resolves origins by *display name*, and a display name cannot be
-     resolved back to a value once more than one identifier has claimed it. The
-     provenance would have to carry the `SSAVar` -- the value -- so the condition
-     asks for the same thing the statement asks for. Everything short of that is
-     trying to reconstruct an identity from a string that was never unique.
+     **The interface change was built, measured, and reverted -- and it named the
+     next component.** `resolve_prepared_predicate_operand_with_width` already
+     holds both `var` and `rooted` as `SSAVar`s and converts them to display
+     names for `origin_name_to_expr` (the call is `flags.rs:887`, confirmed by
+     tracing the caller of the mint). Resolving by value instead -- an
+     `origin_var_to_expr` that calls `var_ref` -- together with the `sym_for_var`
+     reuse above is the pair that makes the condition and the statement reach one
+     identifier.
+
+     Measured: **36 correct down to 22**, with x86-64 -O0 and arm64 -O0 each
+     going from 7 to 0, and the line is the one this document has recorded three
+     times:
+
+     ```c
+     for (long local_28 = 0; t11f80_2 < arg1; local_28 = t6b00) {
+     ```
+
+     That reproduces deterministically now, so the historical measurement was
+     real rather than a sample of the nondeterminism fixed in 0h.
+
+     Why it fails is now precise. `var_ref` spells through `spell_var`, and
+     `FoldingContext`'s `NameSource::var_alias` consults only
+     `var_aliases_map()`. The loop variable here is a *stack-lifted* value whose
+     rendered name `local_28` does not live in `var_aliases` at all -- it comes
+     from the stack facts, which the spelling path cannot see. So resolving the
+     origin by value is right for a temporary and wrong for a stack local: it
+     spells the temporary correctly and the stack local by its temp name.
+
+     The completing set is therefore four things, not two: resolve origins by
+     value; have `sym_for_var` reuse the identifier; **make the stack slot's name
+     reachable from the spelling path**; and only then does the condition agree
+     with the statement for both kinds of value. The third is the one still
+     missing, and it is the same gap recorded at the top of this item -- the
+     alias is not where the speller looks.
 
      What is known to work is narrower and already landed: `for_ssa_name` lets a
      caller holding a raw SSA name reach the identifier already minted for that
