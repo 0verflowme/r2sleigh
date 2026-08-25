@@ -354,12 +354,27 @@ learn.
      * Yet no pass in the pipeline ever sees `eax_4` as an assignment target --
        it is already gone at the first one.
 
-     So a statement is built for it and something between building and the pass
-     pipeline discards it. The remaining suspect is the block: if `EAX_4`'s
-     defining block is dropped during structuring, every statement in it goes
-     with it and no per-statement filter is ever consulted -- which is the same
-     shape as 0g, where murmur3's tail switch renders with all three case bodies
-     empty. Check that before looking at any per-statement rule.
+     The block is *not* the answer. `EAX_4`'s block, `0x1000009ec`, is folded
+     normally with 196 ops, so nothing dropped it.
+
+     Two further things were built and measured, and both are inert. The
+     statement-emission loop skips an op when `should_inline(dst)` holds, and
+     records what the reader promised to show -- except when the only rendering
+     the op has is the destination's own name, in which case the recording is
+     skipped and the promise cannot be kept. Emitting the op in exactly that case
+     changes nothing here, so `should_inline(EAX_4)` is not what drops it.
+     Reverted.
+
+     Where it actually stops, and this is the puzzle to pick up: instrumenting
+     the emission loop shows the op passing every guard at the top --
+     `GUARD dst=EAX_4 frame=false inlined_call=false home_store=false
+     shadow=false` -- and then never reaching the `is_dead` / `should_inline`
+     block a hundred lines later, where a second probe never fires. Every
+     `continue` between those two points is inside the Store or Load
+     return-slot handling and cannot apply to a `Subpiece`. So the op leaves the
+     loop somewhere that reading the code does not explain, and the next session
+     should bisect that span with a probe per `continue` rather than reasoning
+     about it -- the reasoning has now been wrong twice.
 
      Not in this cluster despite looking like it: `r8d` in fnv1a64 -O2 appears
      inside a piece composition, `(hi << 32) | (uint64_t)r8d`, which is the width
