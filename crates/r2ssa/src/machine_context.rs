@@ -6,7 +6,10 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use r2il::{ArchSpec, Endianness, R2ILBlock, R2ILOp, SpaceId, effective_arch_address_size};
+use r2il::{
+    ArchSpec, Endianness, R2ILBlock, R2ILOp, RegisterProjection, RegisterProjectionDisposition,
+    RegisterProjectionRefusal, RegisterStorage, SpaceId, effective_arch_address_size,
+};
 use serde::Serialize;
 
 use crate::function::SSAFunction;
@@ -18,14 +21,13 @@ pub use r2source::{
     SourceAbiParameterSpec, SourceAggregateLayout, SourceAggregateMember, SourceCallArgumentSpec,
     SourceCallResult, SourceCallSiteIdentity, SourceCallSiteInterface,
     SourceCallSiteInterfaceError, SourceCarrierKind, SourceCarrierProjection,
-    SourceFunctionInterface, SourceFunctionInterfaceError, SourceFunctionReturn,
-    SourceLogicalValue, SourceMachineRoles,
-    SourceConventionSlots, SourceStackAllocationContract, SourceStackGrowth,
-    SourceStackSlotRole, SourceStackSlotSpec, SourceType, SourceTypeGraph, SourceTypeGraphError,
-    SourceTypeKind, StackAddressBase,
+    SourceConventionSlots, SourceFunctionInterface, SourceFunctionInterfaceError,
+    SourceFunctionReturn, SourceLogicalValue, SourceMachineRoles, SourceStackAllocationContract,
+    SourceStackGrowth, SourceStackSlotRole, SourceStackSlotSpec, SourceType, SourceTypeGraph,
+    SourceTypeGraphError, SourceTypeKind, StackAddressBase,
 };
 
-pub const MACHINE_CONTEXT_SCHEMA_VERSION: u32 = 16;
+pub const MACHINE_CONTEXT_SCHEMA_VERSION: u32 = 17;
 
 /// Canonical architecture family captured from the exact lifting profile.
 ///
@@ -483,6 +485,14 @@ fn return_mechanism_matches_machine(
         && is_exact_top_level_address_register(arch, stack_pointer, address_size)
 }
 
+/// Ingress disposition of the source-owned register geometry contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum MachineRegisterGeometryState {
+    Unavailable,
+    Available,
+    Malformed,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SourceMachineContext {
     schema_version: u32,
@@ -498,6 +508,9 @@ pub struct SourceMachineContext {
     architecture_result_slot: Option<CanonicalStorageId>,
     abi_model: MachineAbiModel,
     register_storages_by_name: BTreeMap<String, CanonicalStorageId>,
+    /// Exact source-owned register geometry; no write policy is stored here.
+    register_geometry_state: MachineRegisterGeometryState,
+    register_projections: Box<[RegisterProjection]>,
     raw_call_sites_by_id: BTreeMap<CallSiteId, SourceCallSiteIdentity>,
     call_site_interfaces: BTreeMap<SourceCallSiteIdentity, SourceCallSiteInterface>,
     memory_spaces_by_op: BTreeMap<(u64, usize), SpaceId>,
@@ -816,21 +829,49 @@ impl SourceMachineContext {
                 size: reg.size,
             })
         });
-        let register_storages_by_name: BTreeMap<String, CanonicalStorageId> = arch
-            .into_iter()
-            .flat_map(|arch| &arch.registers)
-            .map(|register| {
-                (
-                    register.name.to_ascii_lowercase(),
-                    CanonicalStorageId {
-                        space: CanonicalStorageSpace::Register,
-                        offset: register.offset,
-                        size: register.size,
-                    },
-                )
-            })
-            .collect();
         let architecture_family = MachineArchitectureFamily::from_arch_spec(arch);
+        let mut register_declarations_by_name = BTreeMap::<String, Vec<CanonicalStorageId>>::new();
+        for register in arch.into_iter().flat_map(|arch| &arch.registers) {
+            let storage = CanonicalStorageId {
+                space: CanonicalStorageSpace::Register,
+                offset: register.offset,
+                size: register.size,
+            };
+            if register.size != 0
+                && register
+                    .offset
+                    .checked_add(u64::from(register.size))
+                    .is_some()
+            {
+                register_declarations_by_name
+                    .entry(register.name.trim().to_ascii_lowercase())
+                    .or_default()
+                    .push(storage);
+            }
+        }
+        let register_storages_by_name: BTreeMap<String, CanonicalStorageId> =
+            register_declarations_by_name
+                .into_iter()
+                .filter_map(|(name, storages)| {
+                    let [storage] = storages.as_slice() else {
+                        return None;
+                    };
+                    Some((name, *storage))
+                })
+                .collect();
+        let (register_geometry_state, register_projections) = match arch {
+            None => (MachineRegisterGeometryState::Unavailable, Box::default()),
+            Some(arch) => match r2il::validate_register_geometry(arch) {
+                Err(_) => (MachineRegisterGeometryState::Malformed, Box::default()),
+                Ok(()) if arch.register_projections.is_empty() => {
+                    (MachineRegisterGeometryState::Unavailable, Box::default())
+                }
+                Ok(()) => (
+                    MachineRegisterGeometryState::Available,
+                    arch.register_projections.clone().into_boxed_slice(),
+                ),
+            },
+        };
         let memory_model = MachineMemoryModel::from_arch(arch);
         let frame_pointer_storage = function_interface
             .as_ref()
@@ -973,6 +1014,8 @@ impl SourceMachineContext {
             architecture_result_slot,
             abi_model,
             register_storages_by_name,
+            register_geometry_state,
+            register_projections,
             raw_call_sites_by_id,
             call_site_interfaces: call_site_interfaces_by_identity,
             memory_spaces_by_op,
@@ -1065,7 +1108,7 @@ impl SourceMachineContext {
 
     pub fn register_storage(&self, name: &str) -> Option<CanonicalStorageId> {
         self.register_storages_by_name
-            .get(&name.to_ascii_lowercase())
+            .get(&name.trim().to_ascii_lowercase())
             .copied()
     }
 
@@ -1121,6 +1164,38 @@ impl SourceMachineContext {
         &self.register_storages_by_name
     }
 
+    pub const fn register_geometry_state(&self) -> MachineRegisterGeometryState {
+        self.register_geometry_state
+    }
+
+    /// Exact source-owned register carrier geometry.
+    ///
+    /// A non-empty slice is the validated, sorted `r2il` contract without any
+    /// downstream reconstruction or architecture-specific write policy. When
+    /// it is empty, [`Self::register_geometry_state`] distinguishes unavailable
+    /// source facts from a malformed non-empty source contract.
+    pub const fn register_projections(&self) -> &[RegisterProjection] {
+        &self.register_projections
+    }
+
+    /// Resolve one exact written storage without consulting register spellings.
+    pub fn register_projection(
+        &self,
+        written_storage: CanonicalStorageId,
+    ) -> Option<&RegisterProjection> {
+        if written_storage.space != CanonicalStorageSpace::Register {
+            return None;
+        }
+        let written = RegisterStorage {
+            offset: written_storage.offset,
+            size: written_storage.size,
+        };
+        self.register_projections
+            .binary_search_by_key(&written, |projection| projection.written)
+            .ok()
+            .and_then(|index| self.register_projections.get(index))
+    }
+
     pub const fn raw_call_sites_by_id(&self) -> &BTreeMap<CallSiteId, SourceCallSiteIdentity> {
         &self.raw_call_sites_by_id
     }
@@ -1154,7 +1229,7 @@ impl SourceMachineContext {
     /// machine/source fact that can affect prepared semantics or certification.
     pub(crate) fn semantic_identity_bytes(&self) -> Box<[u8]> {
         let mut writer = MachineContextIdentityWriter::new();
-        writer.bytes(b"r2ssa-machine-context-semantic-v2");
+        writer.bytes(b"r2ssa-machine-context-semantic-v4");
         writer.u32(self.schema_version);
         writer.u8(match self.architecture_family {
             MachineArchitectureFamily::Unknown => 0,
@@ -1213,6 +1288,43 @@ impl SourceMachineContext {
         writer.usize(register_storages.len());
         for storage in register_storages {
             writer.storage(storage);
+        }
+
+        writer.u8(match self.register_geometry_state {
+            MachineRegisterGeometryState::Unavailable => 0,
+            MachineRegisterGeometryState::Available => 1,
+            MachineRegisterGeometryState::Malformed => 2,
+        });
+        writer.usize(self.register_projections.len());
+        for projection in &self.register_projections {
+            writer.storage(CanonicalStorageId {
+                space: CanonicalStorageSpace::Register,
+                offset: projection.written.offset,
+                size: projection.written.size,
+            });
+            match projection.disposition {
+                RegisterProjectionDisposition::Bound { carrier, slice } => {
+                    writer.u8(1);
+                    writer.storage(CanonicalStorageId {
+                        space: CanonicalStorageSpace::Register,
+                        offset: carrier.offset,
+                        size: carrier.size,
+                    });
+                    writer.u64(slice.lsb_bit_offset);
+                    writer.u64(slice.size_bits);
+                }
+                RegisterProjectionDisposition::Refused { reason } => {
+                    writer.u8(2);
+                    writer.u8(match reason {
+                        RegisterProjectionRefusal::InvalidStorageRange => 1,
+                        RegisterProjectionRefusal::NoContainingCarrier => 2,
+                        RegisterProjectionRefusal::AmbiguousContainingCarrier => 3,
+                        RegisterProjectionRefusal::ConflictingDeclarations => 4,
+                        RegisterProjectionRefusal::PartialOverlap => 5,
+                        RegisterProjectionRefusal::MissingRegisterEndianness => 6,
+                    });
+                }
+            }
         }
 
         writer.usize(self.raw_call_sites_by_id.len());
@@ -1394,6 +1506,108 @@ mod tests {
     }
 
     #[test]
+    fn source_register_geometry_is_copied_without_downstream_reconstruction() {
+        let eax = RegisterStorage { offset: 0, size: 4 };
+        let rax = RegisterStorage { offset: 0, size: 8 };
+        let mut arch = ArchSpec::new("x86-64");
+        arch.add_register(RegisterDef::sub(" EAX ", 0, 4, "RAX"));
+        arch.add_register(RegisterDef::new("RAX", 0, 8));
+
+        let absent = SourceMachineContext::from_blocks(&[], Some(&arch));
+        assert!(absent.register_projections().is_empty());
+        assert_eq!(
+            absent.register_geometry_state(),
+            MachineRegisterGeometryState::Unavailable
+        );
+        assert_eq!(
+            absent.register_storage(" eax "),
+            Some(register_storage(0, 4))
+        );
+
+        let mut invalid_empty = ArchSpec::new("invalid-empty-geometry");
+        invalid_empty.add_register(RegisterDef::new("broken", 0, 0));
+        let invalid_empty = SourceMachineContext::from_blocks(&[], Some(&invalid_empty));
+        assert_eq!(
+            invalid_empty.register_geometry_state(),
+            MachineRegisterGeometryState::Malformed
+        );
+        assert_ne!(
+            absent.semantic_identity_bytes(),
+            invalid_empty.semantic_identity_bytes()
+        );
+
+        arch.register_projections = vec![
+            RegisterProjection {
+                written: eax,
+                disposition: RegisterProjectionDisposition::Bound {
+                    carrier: rax,
+                    slice: r2il::RegisterBitSlice {
+                        lsb_bit_offset: 0,
+                        size_bits: 32,
+                    },
+                },
+            },
+            RegisterProjection {
+                written: rax,
+                disposition: RegisterProjectionDisposition::Bound {
+                    carrier: rax,
+                    slice: r2il::RegisterBitSlice {
+                        lsb_bit_offset: 0,
+                        size_bits: 64,
+                    },
+                },
+            },
+        ];
+        let bound = SourceMachineContext::from_blocks(&[], Some(&arch));
+        assert_eq!(
+            bound.register_geometry_state(),
+            MachineRegisterGeometryState::Available
+        );
+        assert_eq!(bound.register_projections(), arch.register_projections);
+        assert_eq!(
+            bound.register_projection(register_storage(0, 4)),
+            arch.register_projections.first()
+        );
+        assert_ne!(
+            absent.semantic_identity_bytes(),
+            bound.semantic_identity_bytes()
+        );
+
+        for projection in &mut arch.register_projections {
+            projection.disposition = RegisterProjectionDisposition::Refused {
+                reason: RegisterProjectionRefusal::MissingRegisterEndianness,
+            };
+        }
+        let refused = SourceMachineContext::from_blocks(&[], Some(&arch));
+        assert_eq!(
+            refused.register_geometry_state(),
+            MachineRegisterGeometryState::Available
+        );
+        assert_ne!(
+            bound.semantic_identity_bytes(),
+            refused.semantic_identity_bytes()
+        );
+
+        arch.register_projections[1].disposition = RegisterProjectionDisposition::Bound {
+            carrier: rax,
+            slice: r2il::RegisterBitSlice {
+                lsb_bit_offset: 0,
+                size_bits: 64,
+            },
+        };
+        let malformed = SourceMachineContext::from_blocks(&[], Some(&arch));
+        assert_eq!(
+            malformed.register_geometry_state(),
+            MachineRegisterGeometryState::Malformed
+        );
+        assert!(malformed.register_projections().is_empty());
+        assert_ne!(
+            absent.semantic_identity_bytes(),
+            malformed.semantic_identity_bytes()
+        );
+    }
+
+    #[test]
     fn argument_registers_come_from_the_convention_not_the_pointer_width() {
         let mut arch = ArchSpec::new("AARCH64:LE:64:v8A");
         arch.addr_size = 8;
@@ -1442,8 +1656,8 @@ mod tests {
         let x86_context = SourceMachineContext::from_blocks(&[], Some(&x86));
         let arm_context = SourceMachineContext::from_blocks(&[], Some(&arm));
 
-        assert_eq!(MACHINE_CONTEXT_SCHEMA_VERSION, 16);
-        assert_eq!(x86_context.schema_version(), 16);
+        assert_eq!(MACHINE_CONTEXT_SCHEMA_VERSION, 17);
+        assert_eq!(x86_context.schema_version(), 17);
         assert_eq!(
             x86_context.architecture_family(),
             MachineArchitectureFamily::X86_64

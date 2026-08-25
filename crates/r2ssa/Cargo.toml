@@ -18,6 +18,7 @@ sleigh-config = ["dep:sleigh-config"]
 
 [dev-dependencies]
 proptest = "1.6"
+r2sleigh-lift = { path = "../r2sleigh-lift", default-features = false, features = ["x86", "arm"] }
 serde_json.workspace = true
 
 [dependencies.sleigh-config]

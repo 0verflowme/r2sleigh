@@ -9,15 +9,17 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::Serialize;
 
-use crate::CanonicalStorageId;
 use crate::function::{SsaArtifact, StackAddressBase};
-use crate::graph::{BlockId, GraphInst, GraphValue, InstId, InstPayload, SsaGraph, ValueId};
-use crate::machine_context::MachineMemoryEndianness;
+use crate::graph::{
+    BlockId, GraphInst, GraphValue, InstId, InstPayload, SsaGraph, UseSite, ValueId,
+};
+use crate::machine_context::{MachineMemoryEndianness, MachineRegisterGeometryState};
 use crate::obligation::{CanonicalInstructionId, SemanticObligationId};
 use crate::op::SSAOp;
 use crate::semantic::{
     ObjectId, ObjectKind, ObjectModel, StructuredAccessId, StructuredMemoryAccessFact,
 };
+use crate::{CanonicalStorageId, CanonicalStorageSpace};
 
 fn memory_access_authorities_match(
     graph: &SsaGraph,
@@ -427,6 +429,97 @@ pub enum MachineCastKind {
     AddressToInteger,
 }
 
+/// A typed conversion applied after selecting the exact source bit slice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+pub struct MachineUseConversion {
+    kind: MachineCastKind,
+    to_width_bits: u32,
+}
+
+impl MachineUseConversion {
+    pub const fn kind(self) -> MachineCastKind {
+        self.kind
+    }
+
+    pub const fn to_width_bits(self) -> u32 {
+        self.to_width_bits
+    }
+}
+
+/// Exact source bits consumed at one dense [`UseSite`] table position.
+///
+/// The site and source value are deliberately not repeated here: the table
+/// position is the canonical site, and the owning graph is the canonical
+/// `UseSite -> ValueId -> width` binding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct MachineUseSlice {
+    bit_offset: u32,
+    width_bits: u32,
+    conversion: Option<MachineUseConversion>,
+}
+
+impl MachineUseSlice {
+    pub const fn bit_offset(self) -> u32 {
+        self.bit_offset
+    }
+
+    pub const fn width_bits(self) -> u32 {
+        self.width_bits
+    }
+
+    pub const fn conversion(self) -> Option<MachineUseConversion> {
+        self.conversion
+    }
+}
+
+/// Why one graph use has no honest machine slice projection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum MachineUseRefusal {
+    /// The value-producing instruction is outside the machine vocabulary.
+    UnsupportedOperation,
+    /// Operand counts, widths, or slices were internally incoherent.
+    IncoherentOperation,
+}
+
+/// Complete disposition for one graph use, keyed only by its dense table cell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum MachineUseDisposition {
+    Exact(MachineUseSlice),
+    Refused(MachineUseRefusal),
+}
+
+/// Exact effect one surviving definition has on its source-owned carrier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum MachineWriteProjection {
+    /// The definition replaces every bit of its carrier.
+    Full,
+    /// The definition replaces one slice and preserves bits outside it.
+    Insert { bit_offset: u32, width_bits: u32 },
+    /// A full-carrier definition zero-extends an exact narrower input.
+    ZeroExtend {
+        from_width_bits: u32,
+        to_width_bits: u32,
+    },
+}
+
+/// Why one surviving definition has no honest carrier write projection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum MachineWriteRefusal {
+    MissingRegisterGeometry,
+    MalformedRegisterGeometry,
+    RegisterGeometry(r2il::RegisterProjectionRefusal),
+    InvalidBitRange,
+    UnsupportedOperation,
+    IncoherentOperation,
+}
+
+/// Complete write disposition for one output-producing [`InstId`] table cell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum MachineWriteDisposition {
+    Exact(MachineWriteProjection),
+    Refused(MachineWriteRefusal),
+}
+
 /// One immutable machine expression node.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub enum MachineExprKind {
@@ -623,6 +716,8 @@ pub enum MachineBuildError {
     MachineContextMismatch,
     MissingInstruction(InstId),
     MissingInstructionDisposition(InstId),
+    MissingUseDisposition(UseSite),
+    MissingWriteDisposition(InstId),
     MissingOutput(InstId),
     InvalidValueWidth {
         value: ValueId,
@@ -664,6 +759,8 @@ pub enum MachineBuildError {
     DuplicateEntity(ValueId),
     EntityMismatch(InstId),
     ObligationMismatch(InstId),
+    UseDispositionMismatch(UseSite),
+    WriteDispositionMismatch(InstId),
     /// A source obligation has no coherent graph-instruction owner. This keeps
     /// first-class native spans keyed by exact source identity instead of
     /// coercing them into a fabricated `InstId`.
@@ -713,6 +810,9 @@ impl MachineProjectionFailure {
 pub struct MachineProjection {
     machine: MachineFunction,
     failures: Box<[MachineProjectionFailure]>,
+    use_dispositions: Box<[Box<[MachineUseDisposition]>]>,
+    /// Dense by `InstId`; `None` is reserved for graph instructions with no output.
+    write_dispositions: Box<[Option<MachineWriteDisposition>]>,
 }
 
 impl MachineProjection {
@@ -721,12 +821,18 @@ impl MachineProjection {
             return Err(MachineBuildError::IncompleteObligationInventory);
         }
         let graph = artifact.graph();
-        let mut builder = MachineBuilder::default();
+        let mut builder = MachineBuilder::for_graph(graph);
         let mut entities = Vec::new();
         let mut failures = Vec::new();
+        let mut write_dispositions = Vec::with_capacity(graph.insts.len());
 
-        for inst in &graph.insts {
+        for (inst_index, inst) in graph.insts.iter().enumerate() {
+            if inst.id.0 as usize != inst_index {
+                return Err(MachineBuildError::TopologyMismatch);
+            }
             let Some(output_id) = inst.output else {
+                builder.lower_outputless_inst(graph, inst)?;
+                write_dispositions.push(None);
                 continue;
             };
             let disposition = artifact
@@ -738,13 +844,25 @@ impl MachineProjection {
                 .ok_or(MachineBuildError::MissingGraphValue(output_id))?;
             let output = binding_for_value(graph_value)?;
             match builder.lower_inst(artifact, inst, disposition.id, output) {
-                Ok(root) => entities.push(MachineEntity {
-                    output,
-                    root,
-                    producer: disposition.id,
-                    source_obligations: disposition.obligations.clone(),
-                }),
-                Err(error @ MachineBuildError::UnsupportedOperation { .. }) => {
+                Ok(root) => {
+                    let root_expr = builder
+                        .nodes
+                        .get(root.index())
+                        .ok_or(MachineBuildError::MissingWriteDisposition(inst.id))?;
+                    write_dispositions
+                        .push(Some(machine_write_disposition(artifact, inst, root_expr)));
+                    entities.push(MachineEntity {
+                        output,
+                        root,
+                        producer: disposition.id,
+                        source_obligations: disposition.obligations.clone(),
+                    });
+                }
+                Err(error) if is_local_projection_failure(&error, inst.id) => {
+                    builder.refuse_inst_uses(inst, use_refusal_for_error(&error))?;
+                    write_dispositions.push(Some(MachineWriteDisposition::Refused(
+                        write_refusal_for_error(&error),
+                    )));
                     failures.push(MachineProjectionFailure {
                         output: output_id,
                         producer: disposition.id,
@@ -763,6 +881,13 @@ impl MachineProjection {
                 entities: entities.into_boxed_slice(),
             },
             failures: failures.into_boxed_slice(),
+            use_dispositions: builder
+                .use_dispositions
+                .into_iter()
+                .map(Vec::into_boxed_slice)
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+            write_dispositions: write_dispositions.into_boxed_slice(),
         };
         projection.validate_against(artifact)?;
         Ok(projection)
@@ -778,6 +903,28 @@ impl MachineProjection {
 
     pub const fn failures(&self) -> &[MachineProjectionFailure] {
         &self.failures
+    }
+
+    /// Dense O(1) lookup for the disposition of one exact graph input use.
+    pub fn use_disposition(&self, site: UseSite) -> Option<&MachineUseDisposition> {
+        self.use_dispositions
+            .get(site.inst.0 as usize)?
+            .get(site.input_idx)
+    }
+
+    /// Dense rows indexed by `InstId`, with cells indexed by input position.
+    pub const fn use_dispositions(&self) -> &[Box<[MachineUseDisposition]>] {
+        &self.use_dispositions
+    }
+
+    /// Dense O(1) lookup for one output-producing graph instruction.
+    pub fn write_disposition(&self, inst: InstId) -> Option<&MachineWriteDisposition> {
+        self.write_dispositions.get(inst.0 as usize)?.as_ref()
+    }
+
+    /// Dense rows indexed by `InstId`; `None` means the instruction has no output.
+    pub const fn write_dispositions(&self) -> &[Option<MachineWriteDisposition>] {
+        &self.write_dispositions
     }
 
     pub fn expr(&self, id: MachineExprId) -> Option<&MachineExpr> {
@@ -825,12 +972,371 @@ impl MachineProjection {
                 return Err(MachineBuildError::EntityMismatch(inst.id));
             }
         }
+        self.validate_use_dispositions(artifact, &entities, &failed_outputs)?;
+        self.validate_write_dispositions(artifact, &entities, &failed_outputs)?;
+        Ok(())
+    }
+
+    fn validate_use_dispositions(
+        &self,
+        artifact: &SsaArtifact,
+        entities: &BTreeMap<ValueId, &MachineEntity>,
+        failures: &BTreeMap<ValueId, &MachineProjectionFailure>,
+    ) -> Result<(), MachineBuildError> {
+        let graph = artifact.graph();
+        if self.use_dispositions.len() != graph.insts.len() {
+            return Err(MachineBuildError::TopologyMismatch);
+        }
+        for (inst_index, inst) in graph.insts.iter().enumerate() {
+            if inst.id.0 as usize != inst_index {
+                return Err(MachineBuildError::TopologyMismatch);
+            }
+            let row = &self.use_dispositions[inst_index];
+            if row.len() != inst.inputs.len() {
+                return Err(MachineBuildError::TopologyMismatch);
+            }
+            let expected_refusal = inst
+                .output
+                .and_then(|output| failures.get(&output))
+                .map(|failure| use_refusal_for_error(failure.error()));
+            let root = inst
+                .output
+                .and_then(|output| entities.get(&output))
+                .and_then(|entity| self.machine.expr(entity.root()));
+            let root_children = root.map(|root| root.kind.children());
+
+            for (input_idx, disposition) in row.iter().enumerate() {
+                let site = UseSite {
+                    inst: inst.id,
+                    input_idx,
+                };
+                let input = *inst
+                    .inputs
+                    .get(input_idx)
+                    .ok_or(MachineBuildError::MissingUseDisposition(site))?;
+                let graph_value = graph
+                    .value(input)
+                    .ok_or(MachineBuildError::MissingGraphValue(input))?;
+                let source = binding_for_value(graph_value)?;
+                match (disposition, expected_refusal, root) {
+                    (MachineUseDisposition::Refused(actual), Some(expected), _)
+                        if *actual == expected => {}
+                    (MachineUseDisposition::Exact(actual), None, root) => {
+                        let expected = match root {
+                            Some(root) => machine_use_slice_for_input(
+                                &self.machine.arena,
+                                root,
+                                *root_children
+                                    .as_ref()
+                                    .and_then(|children| children.get(input_idx))
+                                    .ok_or(MachineBuildError::UseDispositionMismatch(site))?,
+                                source,
+                            )
+                            .ok_or(MachineBuildError::UseDispositionMismatch(site))?,
+                            None if inst.output.is_none() => whole_machine_use(source),
+                            None => return Err(MachineBuildError::UseDispositionMismatch(site)),
+                        };
+                        validate_machine_use_slice(*actual, source.width_bits)
+                            .map_err(|_| MachineBuildError::UseDispositionMismatch(site))?;
+                        if *actual != expected {
+                            return Err(MachineBuildError::UseDispositionMismatch(site));
+                        }
+                    }
+                    _ => return Err(MachineBuildError::UseDispositionMismatch(site)),
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_write_dispositions(
+        &self,
+        artifact: &SsaArtifact,
+        entities: &BTreeMap<ValueId, &MachineEntity>,
+        failures: &BTreeMap<ValueId, &MachineProjectionFailure>,
+    ) -> Result<(), MachineBuildError> {
+        let graph = artifact.graph();
+        if self.write_dispositions.len() != graph.insts.len() {
+            return Err(MachineBuildError::TopologyMismatch);
+        }
+        for (inst_index, inst) in graph.insts.iter().enumerate() {
+            if inst.id.0 as usize != inst_index {
+                return Err(MachineBuildError::TopologyMismatch);
+            }
+            let actual = self
+                .write_dispositions
+                .get(inst_index)
+                .ok_or(MachineBuildError::MissingWriteDisposition(inst.id))?;
+            let Some(output) = inst.output else {
+                if actual.is_some() {
+                    return Err(MachineBuildError::WriteDispositionMismatch(inst.id));
+                }
+                continue;
+            };
+            let expected = if let Some(entity) = entities.get(&output) {
+                let root = self
+                    .machine
+                    .expr(entity.root())
+                    .ok_or(MachineBuildError::WriteDispositionMismatch(inst.id))?;
+                machine_write_disposition(artifact, inst, root)
+            } else if let Some(failure) = failures.get(&output) {
+                MachineWriteDisposition::Refused(write_refusal_for_error(failure.error()))
+            } else {
+                return Err(MachineBuildError::WriteDispositionMismatch(inst.id));
+            };
+            if *actual != Some(expected) {
+                return Err(MachineBuildError::WriteDispositionMismatch(inst.id));
+            }
+        }
         Ok(())
     }
 
     fn into_machine(self) -> MachineFunction {
         self.machine
     }
+}
+
+fn is_local_projection_failure(error: &MachineBuildError, inst: InstId) -> bool {
+    matches!(
+        error,
+        MachineBuildError::UnsupportedOperation { inst: actual, .. }
+            | MachineBuildError::WrongOperandCount { inst: actual, .. }
+            | MachineBuildError::WidthMismatch { inst: actual, .. }
+            | MachineBuildError::InvalidCastWidth { inst: actual, .. }
+            | MachineBuildError::InvalidSubpiece { inst: actual, .. }
+            if *actual == inst
+    )
+}
+
+fn use_refusal_for_error(error: &MachineBuildError) -> MachineUseRefusal {
+    match error {
+        MachineBuildError::UnsupportedOperation { .. } => MachineUseRefusal::UnsupportedOperation,
+        _ => MachineUseRefusal::IncoherentOperation,
+    }
+}
+
+fn write_refusal_for_error(error: &MachineBuildError) -> MachineWriteRefusal {
+    match error {
+        MachineBuildError::UnsupportedOperation { .. } => MachineWriteRefusal::UnsupportedOperation,
+        _ => MachineWriteRefusal::IncoherentOperation,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ExactRegisterGeometry {
+    carrier: CanonicalStorageId,
+    bit_offset: u32,
+    width_bits: u32,
+    carrier_bits: u32,
+}
+
+fn exact_register_geometry(
+    artifact: &SsaArtifact,
+    written: CanonicalStorageId,
+) -> Result<ExactRegisterGeometry, MachineWriteRefusal> {
+    if written.space != CanonicalStorageSpace::Register {
+        return Err(MachineWriteRefusal::InvalidBitRange);
+    }
+    match artifact.machine_context().register_geometry_state() {
+        MachineRegisterGeometryState::Unavailable => {
+            return Err(MachineWriteRefusal::MissingRegisterGeometry);
+        }
+        MachineRegisterGeometryState::Malformed => {
+            return Err(MachineWriteRefusal::MalformedRegisterGeometry);
+        }
+        MachineRegisterGeometryState::Available => {}
+    }
+    let projection = artifact
+        .machine_context()
+        .register_projection(written)
+        .ok_or(MachineWriteRefusal::InvalidBitRange)?;
+    if projection.written.offset != written.offset || projection.written.size != written.size {
+        return Err(MachineWriteRefusal::InvalidBitRange);
+    }
+    let r2il::RegisterProjectionDisposition::Bound { carrier, slice } = projection.disposition
+    else {
+        let r2il::RegisterProjectionDisposition::Refused { reason } = projection.disposition else {
+            unreachable!("register projection disposition is exhaustive")
+        };
+        return Err(MachineWriteRefusal::RegisterGeometry(reason));
+    };
+    if !carrier.contains(projection.written) {
+        return Err(MachineWriteRefusal::InvalidBitRange);
+    }
+    let written_bits = written
+        .size
+        .checked_mul(8)
+        .ok_or(MachineWriteRefusal::InvalidBitRange)?;
+    let carrier_bits = carrier
+        .size
+        .checked_mul(8)
+        .ok_or(MachineWriteRefusal::InvalidBitRange)?;
+    let bit_offset =
+        u32::try_from(slice.lsb_bit_offset).map_err(|_| MachineWriteRefusal::InvalidBitRange)?;
+    let width_bits =
+        u32::try_from(slice.size_bits).map_err(|_| MachineWriteRefusal::InvalidBitRange)?;
+    if width_bits == 0
+        || width_bits != written_bits
+        || bit_offset
+            .checked_add(width_bits)
+            .is_none_or(|end| end > carrier_bits)
+        || (carrier == projection.written && (bit_offset != 0 || width_bits != carrier_bits))
+    {
+        return Err(MachineWriteRefusal::InvalidBitRange);
+    }
+    Ok(ExactRegisterGeometry {
+        carrier: CanonicalStorageId {
+            space: CanonicalStorageSpace::Register,
+            offset: carrier.offset,
+            size: carrier.size,
+        },
+        bit_offset,
+        width_bits,
+        carrier_bits,
+    })
+}
+
+fn exact_zero_extend_write(
+    artifact: &SsaArtifact,
+    inst: &GraphInst,
+    root: &MachineExpr,
+    output: ExactRegisterGeometry,
+) -> Option<MachineWriteProjection> {
+    if output.bit_offset != 0 || output.width_bits != output.carrier_bits {
+        return None;
+    }
+    if !matches!(
+        &root.kind,
+        MachineExprKind::Cast {
+            kind: MachineCastKind::ZeroExtend,
+            ..
+        }
+    ) {
+        return None;
+    }
+    let [input] = inst.inputs.as_slice() else {
+        return None;
+    };
+    let graph_value = artifact.graph().value(*input)?;
+    let input_width = graph_value.var.size.checked_mul(8)?;
+    if input_width >= output.carrier_bits || root.ty.width_bits() != output.carrier_bits {
+        return None;
+    }
+    Some(MachineWriteProjection::ZeroExtend {
+        from_width_bits: input_width,
+        to_width_bits: output.carrier_bits,
+    })
+}
+
+fn machine_write_disposition(
+    artifact: &SsaArtifact,
+    inst: &GraphInst,
+    root: &MachineExpr,
+) -> MachineWriteDisposition {
+    let Some(output) = inst.output else {
+        return MachineWriteDisposition::Refused(MachineWriteRefusal::IncoherentOperation);
+    };
+    let Some(storage) = artifact
+        .graph()
+        .value(output)
+        .and_then(|value| value.canonical_storage)
+    else {
+        return MachineWriteDisposition::Exact(MachineWriteProjection::Full);
+    };
+    if storage.space != CanonicalStorageSpace::Register {
+        return MachineWriteDisposition::Exact(MachineWriteProjection::Full);
+    }
+    let geometry = match exact_register_geometry(artifact, storage) {
+        Ok(geometry) => geometry,
+        Err(reason) => return MachineWriteDisposition::Refused(reason),
+    };
+    if let Some(zero_extend) = exact_zero_extend_write(artifact, inst, root, geometry) {
+        return MachineWriteDisposition::Exact(zero_extend);
+    }
+    if geometry.bit_offset == 0 && geometry.width_bits == geometry.carrier_bits {
+        MachineWriteDisposition::Exact(MachineWriteProjection::Full)
+    } else {
+        MachineWriteDisposition::Exact(MachineWriteProjection::Insert {
+            bit_offset: geometry.bit_offset,
+            width_bits: geometry.width_bits,
+        })
+    }
+}
+
+fn validate_machine_use_slice(slice: MachineUseSlice, source_bits: u32) -> Result<(), ()> {
+    if slice.width_bits == 0
+        || slice
+            .bit_offset
+            .checked_add(slice.width_bits)
+            .is_none_or(|end| end > source_bits)
+    {
+        return Err(());
+    }
+    let Some(conversion) = slice.conversion else {
+        return Ok(());
+    };
+    let valid = match conversion.kind {
+        MachineCastKind::ZeroExtend | MachineCastKind::SignExtend => {
+            conversion.to_width_bits > slice.width_bits
+        }
+        MachineCastKind::Truncate => conversion.to_width_bits < slice.width_bits,
+        MachineCastKind::BitReinterpret
+        | MachineCastKind::IntegerToAddress
+        | MachineCastKind::AddressToInteger => conversion.to_width_bits == slice.width_bits,
+    };
+    valid.then_some(()).ok_or(())
+}
+
+const fn whole_machine_use(source: MachineValueBinding) -> MachineUseSlice {
+    MachineUseSlice {
+        bit_offset: 0,
+        width_bits: source.width_bits,
+        conversion: None,
+    }
+}
+
+fn machine_use_slice_for_input(
+    arena: &MachineExprArena,
+    root: &MachineExpr,
+    child_id: MachineExprId,
+    source: MachineValueBinding,
+) -> Option<MachineUseSlice> {
+    let child = arena.get(child_id)?;
+    if operand_leaf_binding(arena, child_id)? != source {
+        return None;
+    }
+
+    if let MachineExprKind::Cast { kind, input } = &root.kind {
+        if *input != child_id {
+            return None;
+        }
+        return Some(MachineUseSlice {
+            bit_offset: 0,
+            width_bits: source.width_bits,
+            conversion: Some(MachineUseConversion {
+                kind: *kind,
+                to_width_bits: root.ty.width_bits(),
+            }),
+        });
+    }
+    if let MachineExprKind::Extract { input, lsb_bits } = &root.kind {
+        if *input != child_id {
+            return None;
+        }
+        return Some(MachineUseSlice {
+            bit_offset: *lsb_bits,
+            width_bits: root.ty.width_bits(),
+            conversion: None,
+        });
+    }
+    if let MachineExprKind::Extract { lsb_bits, .. } = &child.kind {
+        return Some(MachineUseSlice {
+            bit_offset: *lsb_bits,
+            width_bits: child.ty.width_bits(),
+            conversion: None,
+        });
+    }
+    Some(whole_machine_use(source))
 }
 
 /// Immutable machine-semantic projection of the value-producing SSA graph.
@@ -1274,9 +1780,105 @@ struct MachineBuilder {
     nodes: Vec<MachineExpr>,
     value_nodes: BTreeMap<(ValueId, MachineType), MachineExprId>,
     address_nodes: BTreeMap<(ValueId, ObjectId, MachineAddressSpace), MachineExprId>,
+    use_dispositions: Vec<Vec<MachineUseDisposition>>,
 }
 
 impl MachineBuilder {
+    fn for_graph(graph: &SsaGraph) -> Self {
+        Self {
+            use_dispositions: graph
+                .insts
+                .iter()
+                .map(|inst| {
+                    vec![
+                        MachineUseDisposition::Refused(MachineUseRefusal::UnsupportedOperation);
+                        inst.inputs.len()
+                    ]
+                })
+                .collect(),
+            ..Self::default()
+        }
+    }
+
+    fn record_use(
+        &mut self,
+        graph: &SsaGraph,
+        inst: &GraphInst,
+        input_idx: usize,
+        slice: MachineUseSlice,
+    ) -> Result<(), MachineBuildError> {
+        let site = UseSite {
+            inst: inst.id,
+            input_idx,
+        };
+        let input = *inst
+            .inputs
+            .get(input_idx)
+            .ok_or(MachineBuildError::MissingUseDisposition(site))?;
+        let source = binding_for_value(
+            graph
+                .value(input)
+                .ok_or(MachineBuildError::MissingGraphValue(input))?,
+        )?;
+        validate_machine_use_slice(slice, source.width_bits)
+            .map_err(|_| MachineBuildError::UseDispositionMismatch(site))?;
+        let cell = self
+            .use_dispositions
+            .get_mut(inst.id.0 as usize)
+            .and_then(|row| row.get_mut(input_idx))
+            .ok_or(MachineBuildError::MissingUseDisposition(site))?;
+        *cell = MachineUseDisposition::Exact(slice);
+        Ok(())
+    }
+
+    fn record_whole_use(
+        &mut self,
+        graph: &SsaGraph,
+        inst: &GraphInst,
+        input_idx: usize,
+    ) -> Result<(), MachineBuildError> {
+        let input = *inst
+            .inputs
+            .get(input_idx)
+            .ok_or(MachineBuildError::MissingUseDisposition(UseSite {
+                inst: inst.id,
+                input_idx,
+            }))?;
+        let source = binding_for_value(
+            graph
+                .value(input)
+                .ok_or(MachineBuildError::MissingGraphValue(input))?,
+        )?;
+        self.record_use(graph, inst, input_idx, whole_machine_use(source))
+    }
+
+    fn refuse_inst_uses(
+        &mut self,
+        inst: &GraphInst,
+        refusal: MachineUseRefusal,
+    ) -> Result<(), MachineBuildError> {
+        let row = self
+            .use_dispositions
+            .get_mut(inst.id.0 as usize)
+            .ok_or(MachineBuildError::MissingInstruction(inst.id))?;
+        if row.len() != inst.inputs.len() {
+            return Err(MachineBuildError::TopologyMismatch);
+        }
+        row.fill(MachineUseDisposition::Refused(refusal));
+        Ok(())
+    }
+
+    fn lower_outputless_inst(
+        &mut self,
+        graph: &SsaGraph,
+        inst: &GraphInst,
+    ) -> Result<(), MachineBuildError> {
+        for input_idx in 0..inst.inputs.len() {
+            self.record_whole_use(graph, inst, input_idx)?;
+        }
+        Ok(())
+    }
+
     fn push(
         &mut self,
         ty: MachineType,
@@ -1407,15 +2009,15 @@ impl MachineBuilder {
                 actual: inst.inputs.len(),
             });
         }
-        inst.inputs
-            .iter()
-            .map(|value| {
-                let graph_value = graph
-                    .value(*value)
-                    .ok_or(MachineBuildError::MissingGraphValue(*value))?;
-                self.intern_value(graph_value)
-            })
-            .collect()
+        let mut nodes = Vec::with_capacity(expected);
+        for (input_idx, value) in inst.inputs.iter().copied().enumerate() {
+            let graph_value = graph
+                .value(value)
+                .ok_or(MachineBuildError::MissingGraphValue(value))?;
+            nodes.push(self.intern_value(graph_value)?);
+            self.record_whole_use(graph, inst, input_idx)?;
+        }
+        Ok(nodes)
     }
 
     fn narrowed_operand_nodes(
@@ -1425,28 +2027,48 @@ impl MachineBuilder {
         expected: usize,
         result_bits: u32,
     ) -> Result<Vec<MachineExprId>, MachineBuildError> {
-        let inputs = self.operand_nodes(graph, inst, expected)?;
-        inputs
-            .into_iter()
-            .map(|input| {
-                let input_bits = self.nodes[input.index()].ty.width_bits();
-                if input_bits < result_bits {
-                    return Err(MachineBuildError::WidthMismatch {
-                        inst: inst.id,
-                        expected_bits: result_bits,
-                        actual_bits: input_bits,
-                    });
-                }
-                if input_bits == result_bits {
-                    return Ok(input);
-                }
-                Ok(self.push(
-                    integer_type(result_bits, MachineSignedness::Unsigned),
-                    None,
-                    MachineExprKind::Extract { input, lsb_bits: 0 },
-                ))
-            })
-            .collect()
+        if inst.inputs.len() != expected {
+            return Err(MachineBuildError::WrongOperandCount {
+                inst: inst.id,
+                expected,
+                actual: inst.inputs.len(),
+            });
+        }
+        let mut inputs = Vec::with_capacity(expected);
+        for (input_idx, value) in inst.inputs.iter().copied().enumerate() {
+            let graph_value = graph
+                .value(value)
+                .ok_or(MachineBuildError::MissingGraphValue(value))?;
+            let input = self.intern_value(graph_value)?;
+            let input_bits = self.nodes[input.index()].ty.width_bits();
+            if input_bits < result_bits {
+                return Err(MachineBuildError::WidthMismatch {
+                    inst: inst.id,
+                    expected_bits: result_bits,
+                    actual_bits: input_bits,
+                });
+            }
+            self.record_use(
+                graph,
+                inst,
+                input_idx,
+                MachineUseSlice {
+                    bit_offset: 0,
+                    width_bits: result_bits,
+                    conversion: None,
+                },
+            )?;
+            if input_bits == result_bits {
+                inputs.push(input);
+                continue;
+            }
+            inputs.push(self.push(
+                integer_type(result_bits, MachineSignedness::Unsigned),
+                None,
+                MachineExprKind::Extract { input, lsb_bits: 0 },
+            ));
+        }
+        Ok(inputs)
     }
 
     fn lower_inst(
@@ -1468,7 +2090,7 @@ impl MachineBuilder {
                     });
                 }
                 let mut inputs = Vec::with_capacity(inst.inputs.len());
-                for value in &inst.inputs {
+                for (input_idx, value) in inst.inputs.iter().enumerate() {
                     inputs.push(
                         self.intern_value(
                             graph
@@ -1476,6 +2098,7 @@ impl MachineBuilder {
                                 .ok_or(MachineBuildError::MissingGraphValue(*value))?,
                         )?,
                     );
+                    self.record_whole_use(graph, inst, input_idx)?;
                 }
                 (
                     output_unsigned,
@@ -1564,6 +2187,7 @@ impl MachineBuilder {
                     space,
                     space_model.address_bits(),
                 )?;
+                self.record_whole_use(graph, inst, 0)?;
                 Ok((
                     unsigned,
                     MachineExprKind::MemoryRead {
@@ -1655,6 +2279,7 @@ impl MachineBuilder {
                     .value(inst.inputs[0])
                     .ok_or(MachineBuildError::MissingGraphValue(inst.inputs[0]))?;
                 let input = self.intern_boolean_value(graph, input_value, inst.id)?;
+                self.record_whole_use(graph, inst, 0)?;
                 Ok((
                     MachineType::Bool {
                         storage_bits: output.width_bits,
@@ -1678,6 +2303,8 @@ impl MachineBuilder {
                     .ok_or(MachineBuildError::MissingGraphValue(inst.inputs[1]))?;
                 let left = self.intern_boolean_value(graph, left_value, inst.id)?;
                 let right = self.intern_boolean_value(graph, right_value, inst.id)?;
+                self.record_whole_use(graph, inst, 0)?;
+                self.record_whole_use(graph, inst, 1)?;
                 let op = match op {
                     SSAOp::BoolAnd { .. } => MachineBooleanOp::And,
                     SSAOp::BoolOr { .. } => MachineBooleanOp::Or,
@@ -1767,8 +2394,18 @@ impl MachineBuilder {
             | SSAOp::IntSExt { .. }
             | SSAOp::Trunc { .. }
             | SSAOp::Cast { .. } => {
-                let inputs = self.operand_nodes(graph, inst, 1)?;
-                let from = self.nodes[inputs[0].index()].ty.width_bits();
+                if inst.inputs.len() != 1 {
+                    return Err(MachineBuildError::WrongOperandCount {
+                        inst: inst.id,
+                        expected: 1,
+                        actual: inst.inputs.len(),
+                    });
+                }
+                let input_value = graph
+                    .value(inst.inputs[0])
+                    .ok_or(MachineBuildError::MissingGraphValue(inst.inputs[0]))?;
+                let input = self.intern_value(input_value)?;
+                let from = self.nodes[input.index()].ty.width_bits();
                 let (kind, ty, valid) = match op {
                     SSAOp::IntZExt { .. } => (
                         MachineCastKind::ZeroExtend,
@@ -1800,17 +2437,34 @@ impl MachineBuilder {
                         to_bits: output.width_bits,
                     });
                 }
-                Ok((
-                    ty,
-                    MachineExprKind::Cast {
-                        kind,
-                        input: inputs[0],
+                self.record_use(
+                    graph,
+                    inst,
+                    0,
+                    MachineUseSlice {
+                        bit_offset: 0,
+                        width_bits: from,
+                        conversion: Some(MachineUseConversion {
+                            kind,
+                            to_width_bits: output.width_bits,
+                        }),
                     },
-                ))
+                )?;
+                Ok((ty, MachineExprKind::Cast { kind, input }))
             }
             SSAOp::Subpiece { offset, .. } => {
-                let inputs = self.operand_nodes(graph, inst, 1)?;
-                let source_bits = self.nodes[inputs[0].index()].ty.width_bits();
+                if inst.inputs.len() != 1 {
+                    return Err(MachineBuildError::WrongOperandCount {
+                        inst: inst.id,
+                        expected: 1,
+                        actual: inst.inputs.len(),
+                    });
+                }
+                let input_value = graph
+                    .value(inst.inputs[0])
+                    .ok_or(MachineBuildError::MissingGraphValue(inst.inputs[0]))?;
+                let input = self.intern_value(input_value)?;
+                let source_bits = self.nodes[input.index()].ty.width_bits();
                 let lsb_bits = offset
                     .checked_mul(8)
                     .ok_or(MachineBuildError::InvalidSubpiece {
@@ -1830,13 +2484,17 @@ impl MachineBuilder {
                         lsb_bits,
                     });
                 }
-                Ok((
-                    unsigned,
-                    MachineExprKind::Extract {
-                        input: inputs[0],
-                        lsb_bits,
+                self.record_use(
+                    graph,
+                    inst,
+                    0,
+                    MachineUseSlice {
+                        bit_offset: lsb_bits,
+                        width_bits: output.width_bits,
+                        conversion: None,
                     },
-                ))
+                )?;
+                Ok((unsigned, MachineExprKind::Extract { input, lsb_bits }))
             }
             SSAOp::Select { .. } => {
                 if inst.inputs.len() != 3 {
@@ -1858,6 +2516,9 @@ impl MachineBuilder {
                     .ok_or(MachineBuildError::MissingGraphValue(inst.inputs[2]))?;
                 let if_true = self.intern_value_with_type(if_true_value, unsigned.clone())?;
                 let if_false = self.intern_value_with_type(if_false_value, unsigned.clone())?;
+                self.record_whole_use(graph, inst, 0)?;
+                self.record_whole_use(graph, inst, 1)?;
+                self.record_whole_use(graph, inst, 2)?;
                 Ok((
                     unsigned,
                     MachineExprKind::Select {
@@ -2256,7 +2917,11 @@ fn value_has_boolean_producer(graph: &crate::graph::SsaGraph, value: ValueId) ->
 mod tests {
     use super::*;
     use crate::SSAVar;
-    use r2il::{ArchSpec, Endianness, R2ILBlock, R2ILOp, SpaceId, Varnode};
+    use r2il::{
+        ArchSpec, Endianness, R2ILBlock, R2ILOp, RegisterBitSlice, RegisterDef, RegisterProjection,
+        RegisterProjectionDisposition, RegisterProjectionRefusal, RegisterStorage, SpaceId,
+        Varnode,
+    };
 
     fn artifact_with_ops(ops: impl IntoIterator<Item = R2ILOp>) -> SsaArtifact {
         let mut block = R2ILBlock::new(0x1000, 4);
@@ -2264,6 +2929,57 @@ mod tests {
             block.push(op);
         }
         SsaArtifact::raw(&[block], None).expect("test SSA artifact")
+    }
+
+    fn artifact_with_arch(ops: impl IntoIterator<Item = R2ILOp>, arch: &ArchSpec) -> SsaArtifact {
+        let mut block = R2ILBlock::new(0x1000, 4);
+        for op in ops {
+            block.push(op);
+        }
+        SsaArtifact::raw(&[block], Some(arch)).expect("test SSA artifact")
+    }
+
+    fn register_geometry_arch() -> ArchSpec {
+        let eax = RegisterStorage { offset: 0, size: 4 };
+        let rax = RegisterStorage { offset: 0, size: 8 };
+        let ah = RegisterStorage { offset: 1, size: 1 };
+        let mut arch = ArchSpec::new("geometry-test");
+        arch.add_register(RegisterDef::new("eax", eax.offset, eax.size));
+        arch.add_register(RegisterDef::new("rax", rax.offset, rax.size));
+        arch.add_register(RegisterDef::new("ah", ah.offset, ah.size));
+        arch.register_projections = vec![
+            RegisterProjection {
+                written: eax,
+                disposition: RegisterProjectionDisposition::Bound {
+                    carrier: rax,
+                    slice: RegisterBitSlice {
+                        lsb_bit_offset: 0,
+                        size_bits: 32,
+                    },
+                },
+            },
+            RegisterProjection {
+                written: rax,
+                disposition: RegisterProjectionDisposition::Bound {
+                    carrier: rax,
+                    slice: RegisterBitSlice {
+                        lsb_bit_offset: 0,
+                        size_bits: 64,
+                    },
+                },
+            },
+            RegisterProjection {
+                written: ah,
+                disposition: RegisterProjectionDisposition::Bound {
+                    carrier: rax,
+                    slice: RegisterBitSlice {
+                        lsb_bit_offset: 8,
+                        size_bits: 8,
+                    },
+                },
+            },
+        ];
+        arch
     }
 
     #[test]
@@ -2850,6 +3566,16 @@ mod tests {
                 .and_then(|inst| artifact.graph().inst(inst))
                 .is_some_and(|inst| matches!(&inst.payload, InstPayload::Op(SSAOp::IntAdd { .. })))
         }));
+        let failed_inst = artifact
+            .graph()
+            .def_inst(projection.failures()[0].output())
+            .expect("failed producer instruction");
+        assert_eq!(
+            projection.write_disposition(failed_inst),
+            Some(&MachineWriteDisposition::Refused(
+                MachineWriteRefusal::UnsupportedOperation
+            ))
+        );
         projection
             .validate_against(&artifact)
             .expect("valid partial projection");
@@ -2934,5 +3660,465 @@ mod tests {
             machine.validate_against(&artifact),
             Err(MachineBuildError::EntityMismatch(_))
         ));
+    }
+
+    fn exact_use(
+        projection: &MachineProjection,
+        artifact: &SsaArtifact,
+        op_index: usize,
+        input_idx: usize,
+    ) -> MachineUseSlice {
+        let inst = artifact
+            .graph()
+            .inst_id_for_op_site(0x1000, op_index)
+            .expect("operation instruction");
+        match projection
+            .use_disposition(UseSite { inst, input_idx })
+            .copied()
+            .expect("dense use disposition")
+        {
+            MachineUseDisposition::Exact(slice) => slice,
+            MachineUseDisposition::Refused(reason) => {
+                panic!("expected exact use projection, got {reason:?}")
+            }
+        }
+    }
+
+    fn exact_write(
+        projection: &MachineProjection,
+        artifact: &SsaArtifact,
+        op_index: usize,
+    ) -> MachineWriteProjection {
+        let inst = artifact
+            .graph()
+            .inst_id_for_op_site(0x1000, op_index)
+            .expect("operation instruction");
+        match projection
+            .write_disposition(inst)
+            .copied()
+            .expect("dense write disposition")
+        {
+            MachineWriteDisposition::Exact(write) => write,
+            MachineWriteDisposition::Refused(reason) => {
+                panic!("expected exact write projection, got {reason:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn dense_write_projections_cover_full_insert_high_slice_and_zero_extension() {
+        let arch = register_geometry_arch();
+        let full = artifact_with_arch(
+            [R2ILOp::Copy {
+                dst: Varnode::register(0, 8),
+                src: Varnode::constant(7, 8),
+            }],
+            &arch,
+        );
+        let full_projection = MachineProjection::from_artifact(&full).expect("full projection");
+        assert_eq!(
+            exact_write(&full_projection, &full, 0),
+            MachineWriteProjection::Full
+        );
+
+        let low = artifact_with_arch(
+            [R2ILOp::Copy {
+                dst: Varnode::register(0, 4),
+                src: Varnode::constant(7, 4),
+            }],
+            &arch,
+        );
+        let low_projection = MachineProjection::from_artifact(&low).expect("low projection");
+        assert_eq!(
+            exact_write(&low_projection, &low, 0),
+            MachineWriteProjection::Insert {
+                bit_offset: 0,
+                width_bits: 32,
+            }
+        );
+
+        let high = artifact_with_arch(
+            [R2ILOp::Copy {
+                dst: Varnode::register(1, 1),
+                src: Varnode::constant(7, 1),
+            }],
+            &arch,
+        );
+        let high_projection = MachineProjection::from_artifact(&high).expect("high projection");
+        assert_eq!(
+            exact_write(&high_projection, &high, 0),
+            MachineWriteProjection::Insert {
+                bit_offset: 8,
+                width_bits: 8,
+            }
+        );
+
+        let zero_extend = artifact_with_arch(
+            [R2ILOp::IntZExt {
+                dst: Varnode::register(0, 8),
+                src: Varnode::register(0, 4),
+            }],
+            &arch,
+        );
+        let zero_projection =
+            MachineProjection::from_artifact(&zero_extend).expect("zero-extension projection");
+        assert_eq!(
+            exact_write(&zero_projection, &zero_extend, 0),
+            MachineWriteProjection::ZeroExtend {
+                from_width_bits: 32,
+                to_width_bits: 64,
+            }
+        );
+        assert_eq!(
+            zero_projection.write_dispositions().len(),
+            zero_extend.graph().insts.len()
+        );
+
+        let external_zero_extend = artifact_with_arch(
+            [R2ILOp::IntZExt {
+                dst: Varnode::register(0, 8),
+                src: Varnode::unique(0x80, 4),
+            }],
+            &arch,
+        );
+        let external_projection = MachineProjection::from_artifact(&external_zero_extend)
+            .expect("external zero-extension projection");
+        assert_eq!(
+            exact_write(&external_projection, &external_zero_extend, 0),
+            MachineWriteProjection::ZeroExtend {
+                from_width_bits: 32,
+                to_width_bits: 64,
+            }
+        );
+    }
+
+    #[test]
+    fn write_projection_refuses_missing_and_upstream_refused_geometry() {
+        let mut missing = register_geometry_arch();
+        missing.register_projections.clear();
+        let missing_artifact = artifact_with_arch(
+            [R2ILOp::Copy {
+                dst: Varnode::register(0, 4),
+                src: Varnode::constant(1, 4),
+            }],
+            &missing,
+        );
+        let missing_projection =
+            MachineProjection::from_artifact(&missing_artifact).expect("typed refusal");
+        let missing_inst = missing_artifact
+            .graph()
+            .inst_id_for_op_site(0x1000, 0)
+            .expect("copy instruction");
+        assert_eq!(
+            missing_projection.write_disposition(missing_inst),
+            Some(&MachineWriteDisposition::Refused(
+                MachineWriteRefusal::MissingRegisterGeometry
+            ))
+        );
+
+        let mut refused = register_geometry_arch();
+        for projection in &mut refused.register_projections {
+            projection.disposition = RegisterProjectionDisposition::Refused {
+                reason: RegisterProjectionRefusal::MissingRegisterEndianness,
+            };
+        }
+        let refused_artifact = artifact_with_arch(
+            [R2ILOp::Copy {
+                dst: Varnode::register(0, 4),
+                src: Varnode::constant(1, 4),
+            }],
+            &refused,
+        );
+        let refused_projection =
+            MachineProjection::from_artifact(&refused_artifact).expect("upstream refusal");
+        let refused_inst = refused_artifact
+            .graph()
+            .inst_id_for_op_site(0x1000, 0)
+            .expect("copy instruction");
+        assert_eq!(
+            refused_projection.write_disposition(refused_inst),
+            Some(&MachineWriteDisposition::Refused(
+                MachineWriteRefusal::RegisterGeometry(
+                    RegisterProjectionRefusal::MissingRegisterEndianness
+                )
+            ))
+        );
+
+        let mut malformed = refused;
+        malformed.register_projections[0].disposition = RegisterProjectionDisposition::Bound {
+            carrier: RegisterStorage { offset: 0, size: 8 },
+            slice: RegisterBitSlice {
+                lsb_bit_offset: 0,
+                size_bits: 32,
+            },
+        };
+        let malformed_artifact = artifact_with_arch(
+            [R2ILOp::Copy {
+                dst: Varnode::register(0, 4),
+                src: Varnode::constant(1, 4),
+            }],
+            &malformed,
+        );
+        let malformed_projection =
+            MachineProjection::from_artifact(&malformed_artifact).expect("malformed refusal");
+        let malformed_inst = malformed_artifact
+            .graph()
+            .inst_id_for_op_site(0x1000, 0)
+            .expect("copy instruction");
+        assert_eq!(
+            malformed_projection.write_disposition(malformed_inst),
+            Some(&MachineWriteDisposition::Refused(
+                MachineWriteRefusal::MalformedRegisterGeometry
+            ))
+        );
+        assert_ne!(
+            missing_artifact.machine_context().semantic_identity_bytes(),
+            malformed_artifact
+                .machine_context()
+                .semantic_identity_bytes()
+        );
+    }
+
+    #[test]
+    fn corrupted_write_disposition_is_rejected() {
+        let arch = register_geometry_arch();
+        let artifact = artifact_with_arch(
+            [R2ILOp::Copy {
+                dst: Varnode::register(0, 8),
+                src: Varnode::constant(7, 8),
+            }],
+            &arch,
+        );
+        let mut projection = MachineProjection::from_artifact(&artifact).expect("projection");
+        let inst = artifact
+            .graph()
+            .inst_id_for_op_site(0x1000, 0)
+            .expect("copy instruction");
+        projection.write_dispositions[inst.0 as usize] = Some(MachineWriteDisposition::Exact(
+            MachineWriteProjection::Insert {
+                bit_offset: 0,
+                width_bits: 32,
+            },
+        ));
+        assert_eq!(
+            projection.validate_against(&artifact),
+            Err(MachineBuildError::WriteDispositionMismatch(inst))
+        );
+    }
+
+    #[test]
+    fn dense_use_slices_cover_whole_subpiece_narrow_bitwise_casts_and_effects() {
+        let unsupported = Varnode::unique(0x60, 8);
+        let artifact = artifact_with_ops([
+            R2ILOp::Copy {
+                dst: Varnode::unique(0x10, 8),
+                src: Varnode::register(0, 8),
+            },
+            R2ILOp::Subpiece {
+                dst: Varnode::unique(0x18, 4),
+                src: Varnode::register(8, 8),
+                offset: 4,
+            },
+            R2ILOp::IntAnd {
+                dst: Varnode::unique(0x20, 4),
+                a: Varnode::register(16, 8),
+                b: Varnode::constant(0xff, 8),
+            },
+            R2ILOp::IntZExt {
+                dst: Varnode::unique(0x28, 8),
+                src: Varnode::register(24, 1),
+            },
+            R2ILOp::IntSExt {
+                dst: Varnode::unique(0x30, 8),
+                src: Varnode::register(25, 1),
+            },
+            R2ILOp::Trunc {
+                dst: Varnode::unique(0x38, 4),
+                src: Varnode::register(32, 8),
+            },
+            R2ILOp::Cast {
+                dst: Varnode::unique(0x40, 4),
+                src: Varnode::register(40, 4),
+            },
+            R2ILOp::Store {
+                space: SpaceId::Ram,
+                addr: Varnode::register(48, 8),
+                val: Varnode::register(56, 4),
+            },
+            R2ILOp::IntDiv {
+                dst: unsupported.clone(),
+                a: Varnode::register(64, 8),
+                b: Varnode::constant(3, 8),
+            },
+            R2ILOp::Copy {
+                dst: Varnode::unique(0x68, 8),
+                src: unsupported,
+            },
+            R2ILOp::Return {
+                target: Varnode::register(72, 8),
+            },
+        ]);
+        let projection = MachineProjection::from_artifact(&artifact).expect("use projection");
+
+        assert_eq!(
+            projection.use_dispositions().len(),
+            artifact.graph().insts.len()
+        );
+        for inst in &artifact.graph().insts {
+            assert_eq!(
+                projection.use_dispositions()[inst.id.0 as usize].len(),
+                inst.inputs.len()
+            );
+        }
+
+        assert_eq!(
+            exact_use(&projection, &artifact, 0, 0),
+            MachineUseSlice {
+                bit_offset: 0,
+                width_bits: 64,
+                conversion: None,
+            }
+        );
+        assert_eq!(
+            exact_use(&projection, &artifact, 1, 0),
+            MachineUseSlice {
+                bit_offset: 32,
+                width_bits: 32,
+                conversion: None,
+            }
+        );
+        for input_idx in 0..2 {
+            assert_eq!(
+                exact_use(&projection, &artifact, 2, input_idx),
+                MachineUseSlice {
+                    bit_offset: 0,
+                    width_bits: 32,
+                    conversion: None,
+                }
+            );
+        }
+        for (op_index, kind, source_bits, target_bits) in [
+            (3, MachineCastKind::ZeroExtend, 8, 64),
+            (4, MachineCastKind::SignExtend, 8, 64),
+            (5, MachineCastKind::Truncate, 64, 32),
+            (6, MachineCastKind::BitReinterpret, 32, 32),
+        ] {
+            assert_eq!(
+                exact_use(&projection, &artifact, op_index, 0),
+                MachineUseSlice {
+                    bit_offset: 0,
+                    width_bits: source_bits,
+                    conversion: Some(MachineUseConversion {
+                        kind,
+                        to_width_bits: target_bits,
+                    }),
+                }
+            );
+        }
+        assert_eq!(exact_use(&projection, &artifact, 7, 0).width_bits(), 64);
+        assert_eq!(exact_use(&projection, &artifact, 7, 1).width_bits(), 32);
+
+        let unsupported_inst = artifact
+            .graph()
+            .inst_id_for_op_site(0x1000, 8)
+            .expect("division instruction");
+        for input_idx in 0..2 {
+            assert_eq!(
+                projection.use_disposition(UseSite {
+                    inst: unsupported_inst,
+                    input_idx,
+                }),
+                Some(&MachineUseDisposition::Refused(
+                    MachineUseRefusal::UnsupportedOperation
+                ))
+            );
+        }
+        assert_eq!(exact_use(&projection, &artifact, 9, 0).width_bits(), 64);
+        assert_eq!(exact_use(&projection, &artifact, 10, 0).width_bits(), 64);
+        projection
+            .validate_against(&artifact)
+            .expect("all dense uses remain source-bound");
+    }
+
+    #[test]
+    fn incoherent_slice_is_a_refusal_and_corrupted_exact_facts_are_rejected() {
+        let incoherent = artifact_with_ops([R2ILOp::Subpiece {
+            dst: Varnode::unique(0x10, 4),
+            src: Varnode::register(0, 4),
+            offset: 2,
+        }]);
+        let projection = MachineProjection::from_artifact(&incoherent)
+            .expect("local incoherence remains a partial projection");
+        let inst = incoherent
+            .graph()
+            .inst_id_for_op_site(0x1000, 0)
+            .expect("subpiece instruction");
+        assert_eq!(
+            projection.use_disposition(UseSite { inst, input_idx: 0 }),
+            Some(&MachineUseDisposition::Refused(
+                MachineUseRefusal::IncoherentOperation
+            ))
+        );
+
+        let artifact = artifact_with_ops([
+            R2ILOp::Copy {
+                dst: Varnode::unique(0x20, 8),
+                src: Varnode::register(8, 8),
+            },
+            R2ILOp::IntZExt {
+                dst: Varnode::unique(0x28, 8),
+                src: Varnode::register(16, 1),
+            },
+        ]);
+        let mut projection =
+            MachineProjection::from_artifact(&artifact).expect("valid exact projection");
+        let copy_inst = artifact
+            .graph()
+            .inst_id_for_op_site(0x1000, 0)
+            .expect("copy instruction");
+        let MachineUseDisposition::Exact(copy) =
+            &mut projection.use_dispositions[copy_inst.0 as usize][0]
+        else {
+            panic!("exact copy use expected");
+        };
+        copy.width_bits = 56;
+        assert_eq!(
+            projection.validate_against(&artifact),
+            Err(MachineBuildError::UseDispositionMismatch(UseSite {
+                inst: copy_inst,
+                input_idx: 0,
+            }))
+        );
+
+        let mut projection =
+            MachineProjection::from_artifact(&artifact).expect("valid exact projection");
+        let cast_inst = artifact
+            .graph()
+            .inst_id_for_op_site(0x1000, 1)
+            .expect("cast instruction");
+        let MachineUseDisposition::Exact(cast) =
+            &mut projection.use_dispositions[cast_inst.0 as usize][0]
+        else {
+            panic!("exact cast use expected");
+        };
+        cast.conversion = Some(MachineUseConversion {
+            kind: MachineCastKind::SignExtend,
+            to_width_bits: 64,
+        });
+        assert_eq!(
+            projection.validate_against(&artifact),
+            Err(MachineBuildError::UseDispositionMismatch(UseSite {
+                inst: cast_inst,
+                input_idx: 0,
+            }))
+        );
+
+        let mut projection =
+            MachineProjection::from_artifact(&artifact).expect("valid exact projection");
+        projection.use_dispositions[copy_inst.0 as usize] = Box::new([]);
+        assert_eq!(
+            projection.validate_against(&artifact),
+            Err(MachineBuildError::TopologyMismatch)
+        );
     }
 }

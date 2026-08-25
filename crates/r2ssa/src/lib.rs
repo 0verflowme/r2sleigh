@@ -106,11 +106,14 @@ pub use machine::{
     MachineCastKind, MachineComparisonOp, MachineEntity, MachineExpr, MachineExprArena,
     MachineExprId, MachineExprKind, MachineFunction, MachineOvershiftBehavior, MachineProjection,
     MachineProjectionFailure, MachineShiftKind, MachineSignedness, MachineStackBase, MachineType,
-    MachineValueBinding, MachineValueUse, machine_address_provenance,
+    MachineUseConversion, MachineUseDisposition, MachineUseRefusal, MachineUseSlice,
+    MachineValueBinding, MachineValueUse, MachineWriteDisposition, MachineWriteProjection,
+    MachineWriteRefusal, machine_address_provenance,
 };
 pub use machine_context::{
     MACHINE_CONTEXT_SCHEMA_VERSION, MachineAbiModel, MachineAbiRegisterSlot,
     MachineArchitectureFamily, MachineMemoryEndianness, MachineMemoryModel, MachineMemorySpace,
+    MachineRegisterGeometryState,
     SOURCE_CALL_SITE_INTERFACE_SCHEMA_VERSION, SOURCE_FUNCTION_INTERFACE_SCHEMA_VERSION,
     SOURCE_TYPE_GRAPH_SCHEMA_VERSION, SourceAbiParameterSpec, SourceAggregateLayout,
     SourceAggregateMember, SourceCallArgumentSpec, SourceCallResult, SourceCallSiteIdentity,

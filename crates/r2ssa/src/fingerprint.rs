@@ -14,7 +14,7 @@ use r2il::{MemoryOrdering, SpaceId};
 /// Version of the byte-level semantic fingerprint contract.
 ///
 /// Bump this whenever a tag or field encoding below changes.
-pub const SSA_SEMANTIC_FINGERPRINT_SCHEMA_VERSION: u32 = 4;
+pub const SSA_SEMANTIC_FINGERPRINT_SCHEMA_VERSION: u32 = 5;
 
 const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
@@ -2403,7 +2403,7 @@ mod tests {
     }
 
     #[test]
-    fn semantic_fingerprint_schema_is_v4() {
-        assert_eq!(SSA_SEMANTIC_FINGERPRINT_SCHEMA_VERSION, 4);
+    fn semantic_fingerprint_schema_is_v5() {
+        assert_eq!(SSA_SEMANTIC_FINGERPRINT_SCHEMA_VERSION, 5);
     }
 }
