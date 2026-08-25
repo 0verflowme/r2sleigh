@@ -740,11 +740,31 @@ learn.
      argument this function does not have. Any version-zero read of `ecx` then
      renders as `arg3` -- which is exactly what the lost zero looks like.
 
-     That is the same shape as the arm64 defect fixed earlier on this branch,
-     where `x29` and `x30` were recovered as the third and fourth arguments
-     because the argument-register test matched by substring. The x86-64 side has
-     its own over-recovery: check why `murmur3_32` recovers five parameters when
-     r2 reports three, before any further work on carriers or spelling.
+     Where the five come from, measured rather than assumed:
+
+     ```
+     PARAMS params=[arg0..arg4] recovered=[RDI, RSI, EDX, ECX, R8]
+     r2 afv:  arg1 @ rdi, arg2 @ rsi, arg3 @ rcx, arg4 @ r8
+     ```
+
+     **radare2 itself reports four arguments for this three-argument function**,
+     naming `rcx` and `r8` and omitting `rdx` entirely. So the over-recovery is
+     partly inherited, not purely ours; our scan adds `EDX` back and keeps r2's
+     two spurious ones.
+
+     Why our scan sees `ECX`: `xor ecx, ecx` mentions the register twice at
+     version zero, and the scan counts a version-zero mention as an entry read.
+     Excluding self-zeroing operations from that scan is the obvious fix and
+     **costs a function**: corpus 37 to 36, x86-64 -O2 from 4 to 3, and
+     `murmur3_32` still recovers five parameters because r2's own four survive
+     the change. Built, measured, reverted.
+
+     So this cannot be fixed on our side of the seam alone. Either the recovered
+     set has to be reconciled against something better than r2's `afv` -- the
+     ABI plus actual entry liveness -- or the spurious names have to stop being
+     usable as spellings for values that merely pass through those registers.
+     The second is the smaller change and is where the lost zero actually shows
+     up.
 
      A measurement note that cost an hour here: when `make -C r2plugin install`
      fails -- and it does, intermittently, with `codesign: internal error in Code
