@@ -637,15 +637,26 @@ learn.
      here.
 
      What the inert result actually means is that the zeroing rule is not what
-     drops this statement. Had it been, requiring a zero use count would have
-     kept the statement and changed the line. Look instead at what `rcx =
-     (uint32_t)arg3;` *is*: it reads as a carrier initialiser rather than an
-     elided xor, so the next thing to check is whether `rcx` is a certified
-     carrier in this function and what
-     `materialize_certified_loop_carrier_initializers_with_control` places for
-     it. If the initialiser is being sourced from the register's entry value
-     instead of from the `xor`'s zero, that is the defect, and it is a different
-     one from the rule whose comment first drew attention here.
+     drops this statement -- and the real answer folds this defect into the
+     location model rather than standing beside it.
+
+     `rcx` is a certified carrier in this function, with members `RCX_1`, `RCX_2`
+     and `RCX_3` (`CARRIERALIAS member=RCX_1 name=rcx`). The zeroing writes
+     `ECX_3`, which is the *32-bit view of that same place* -- `{Register,
+     offset 0}` at four bytes against the carrier's eight -- and is therefore not
+     in the member set. So the carrier never sees its initialiser, takes the
+     register's entry value instead, and `k1` starts as `arg3`.
+
+     That makes murmur3's wrong checksum the same defect as item 0f, not a
+     separate one: a narrow write to a carrier's place is not a write to the
+     carrier. The `CarrierMemberView` work covers a narrow *phi* beside a carrier
+     phi in the same header block; this needs the narrow *write* to count as an
+     update of the carrier, which is a change to how carriers are certified in
+     r2ssa rather than to how they are rendered in r2dec.
+
+     Two candidates were tried against this line and both measured inert, so
+     neither is the way in: guarding the zeroing rule on a zero use count, and
+     the name-versus-value theory that guard was based on.
 
      Also still recorded: using the selector value instead of
      `prepared_canonical_value_root` of it changes nothing, because there was no
