@@ -319,6 +319,23 @@ learn.
      than to a bare name. The second half cannot live in `spell_var`, which
      returns a `String`; it belongs where expressions are produced.
 
+     **What they are not.** `exit_merges_for_carrier` skips any merge whose size
+     differs from the carrier's, which reads like the exact exclusion this
+     cluster needs. It was widened to accept a merge over the same
+     `{space, offset}` at any width -- gated on `narrow_write_clears_register`,
+     with the narrow ones routed to `CarrierMemberView` so they render as a cast
+     rather than taking the carrier's bare name. Measured: nothing moves. Corpus
+     stays at 36 and every one of `eax_4`, `eax_5`, `eax_8`, `eax_12` and
+     `rcx_6` fails exactly as before. Reverted.
+
+     So these values are not phis, and not exit merges either: they are ordinary
+     definitions, computed once and read after the loop, and no carrier fact
+     covers them at all. Widening the carrier machinery is the wrong direction --
+     the question is why a definition that exists in the SSA is not rendered,
+     which is a liveness or elision question rather than a naming one. That is
+     where the next attempt should start, and it should start by finding the
+     defining op for `EAX_4` and asking what dropped it.
+
      Not in this cluster despite looking like it: `r8d` in fnv1a64 -O2 appears
      inside a piece composition, `(hi << 32) | (uint64_t)r8d`, which is the width
      layer rather than carrier membership; and `x8_30` in arm64 -O0 murmur3_32 is
