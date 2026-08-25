@@ -65,7 +65,8 @@ learn.
     them, so a real structuring nested inside a declined attempt saw a merge as
     already claimed and left it out -- `murmur3_32` lost its `return` entirely on
     both optimised arm64 builds. The deferral stack is now truncated back after
-    the attempts.
+    the attempts. Partial: the merge is now emitted twice instead of not at all,
+    because the region is still structured twice. See the section below.
   * **A merge reached from a branching predecessor is placed.** One unplaceable
     merge abandoned every merge in its block, and the backedge test required the
     target to dominate the predecessor, which refused every merge on a loop
@@ -4541,11 +4542,23 @@ So the defect is that a speculative attempt structures a subtree while holding
 deferrals that the real structuring of that same subtree will then observe. The
 speculative attempt has to leave no trace -- deferrals included.
 
-**Fixed.** `Region::IfThenElse` now records the deferral depth before its three
-speculative rewrites and truncates back to it after they decline. `murmur3_32`
-renders its return at both arm64 -O1 and -O2, and the two `noreturn` verdicts are
-gone; both now fail later and differently, on a subscript type in the tail
-switch, which is an ordinary defect rather than a missing function body.
+**Half fixed, and the half matters.** `Region::IfThenElse` now records the
+deferral depth before its three speculative rewrites and truncates back to it
+after they decline. `murmur3_32` renders its return at both arm64 -O1 and -O2 and
+the two `noreturn` verdicts are gone.
+
+But the merge block is now emitted **twice**. Before the change `t20380_4` appears
+nowhere in the rendering; after it, once as a bare assignment inside the `else`
+arm and again as a declaration after the `if`/`else` -- and the assignment comes
+first, so it does not compile. The underlying defect is untouched: a region is
+still structured twice, and truncating the deferrals only changed which copy
+survives. Losing the block and duplicating it are both wrong.
+
+Keeping the change is a judgement, not a clear win. The return is present, the
+ledger is honest about the body, and the failure is visible rather than a
+silently absent function tail; the corpus is 35 of 54 either way. What it does
+not do is fix the structuring, and the entry above that reads as a clean fix
+should be read with this.
 
 The corpus total does not move -- 35 of 54 either way -- because the same two
 functions still do not compile. What changed is that a function which produced no
