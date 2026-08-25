@@ -3441,6 +3441,21 @@ impl<'a> FoldingContext<'a> {
             return self.const_to_expr(var);
         }
 
+        // A carrier read at one of its other widths is the carrier, narrowed.
+        // The alias map cannot say this: it maps a name to a name, and `eax_5`
+        // is not `rax` but `(uint32_t)rax`. Answering with the name alone is
+        // what made this change render right names over wrong values.
+        // Narrowing and widening are the same cast here: widening is sound only
+        // because a narrow write clears the rest of the register, which is what
+        // admitted the pairing at all, so the wide value is the narrow one
+        // zero-extended and an unsigned cast says exactly that.
+        if let Some(view) = self.carrier_member_views.get(&key) {
+            return CExpr::cast(
+                crate::ast::CType::UInt(view.width.saturating_mul(8)),
+                self.name_ref(&view.carrier),
+            );
+        }
+
         // A statement that was left out on the promise of being inlined recorded
         // what it would have shown. That is the answer, not a candidate.
         if let Some(inlined) = self.inlined_renderings.borrow().get(&key) {

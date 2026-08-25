@@ -629,6 +629,7 @@ pub(crate) fn materialize_certified_loop_carrier_initializers_with_control(
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
     use crate::ast::{BinaryOp, UnaryOp};
     use crate::fold::FoldingContext;
@@ -1069,6 +1070,97 @@ mod tests {
 ///
 /// Constants are skipped. An entry edge arriving as a literal is the
 /// initializer, not another spelling of the variable.
+/// A carrier read at a width other than the one it is carried at.
+///
+/// `eax` and `rax` are one place at two widths, and a loop that carries the
+/// place at one of them is still the source of a read at the other. The name is
+/// the carrier's; the width is the width of *this* view of it, which is what
+/// makes the difference between the two expressible at all -- an alias maps a
+/// name to a name and cannot say "the low four bytes of".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CarrierMemberView {
+    /// The carrier this value is a view of.
+    pub(crate) carrier: String,
+    /// Width of this view, in bytes.
+    pub(crate) width: u32,
+    /// Width the carrier itself is held at, in bytes.
+    pub(crate) carrier_width: u32,
+}
+
+/// Values that are one of a carrier's other widths.
+///
+/// A loop header carries a place once, but Sleigh gives each width its own phi:
+/// adler32 at x86-64 -O1 has `RAX_2` certified as the carrier and `EAX_2`
+/// beside it in the same block, over `{ Register, offset 0 }` at four bytes
+/// instead of eight. Without the pairing the narrow phi belongs to no carrier,
+/// so the tail that reads it after the loop is dropped and the return is left
+/// quoting a name nothing defines.
+///
+/// Only a phi in the carrier's own header block counts. Every value at the place
+/// is *not* the carrier -- that is the whole-function renaming that was measured
+/// at 34 correct down to 13 -- and a phi in the header is the narrow point where
+/// the two widths are provably the same run of the same storage.
+pub(crate) fn carrier_member_views(
+    prepared: &r2ssa::SsaArtifact,
+    render_facts: &r2types::FunctionRenderFacts,
+    aliases: &HashMap<String, String>,
+) -> HashMap<String, CarrierMemberView> {
+    use r2types::CertifiedEntity;
+
+    // The pairing is only sound where the machine guarantees it: after a narrow
+    // write the wide value is the narrow one zero-extended, so one answers for
+    // the other. Where it does not hold, the upper bytes are whatever they were.
+    if !prepared.narrow_write_clears_register() {
+        return HashMap::new();
+    }
+
+    let graph = prepared.graph();
+    let mut views = HashMap::new();
+    for carrier in render_facts.loop_carriers() {
+        let CertifiedEntity::LoopCarrier { phi, .. } = carrier else {
+            continue;
+        };
+        let Some(carrier_var) = graph.value(*phi).map(|value| value.var.clone()) else {
+            continue;
+        };
+        let Some(name) = aliases.get(&carrier_var.display_name()).cloned() else {
+            continue;
+        };
+        let Some(storage) = graph.canonical_storage_for_var(&carrier_var) else {
+            continue;
+        };
+        for block in prepared.function().blocks() {
+            if !block.phis.iter().any(|phi| phi.dst == carrier_var) {
+                continue;
+            }
+            for peer in &block.phis {
+                if peer.dst == carrier_var || peer.dst.size == carrier_var.size {
+                    continue;
+                }
+                // A peer that is a carrier in its own right keeps its own name.
+                if aliases.contains_key(&peer.dst.display_name()) {
+                    continue;
+                }
+                let Some(peer_storage) = graph.canonical_storage_for_var(&peer.dst) else {
+                    continue;
+                };
+                if peer_storage.space != storage.space || peer_storage.offset != storage.offset {
+                    continue;
+                }
+                views.insert(
+                    peer.dst.display_name(),
+                    CarrierMemberView {
+                        carrier: name.clone(),
+                        width: peer.dst.size,
+                        carrier_width: carrier_var.size,
+                    },
+                );
+            }
+        }
+    }
+    views
+}
+
 pub(crate) fn carrier_name_aliases(
     prepared: &r2ssa::SsaArtifact,
     render_facts: &r2types::FunctionRenderFacts,

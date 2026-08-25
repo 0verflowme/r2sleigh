@@ -268,6 +268,26 @@ learn.
      statements are dropped and the return is left quoting a name nothing
      defines.
 
+     **Half of this is now built.** `CarrierMemberView` in `normalize.rs` pairs a
+     carrier phi with the phis beside it in the same header block over the same
+     `{space, offset}` at a different size, and `get_expr_inner` resolves such a
+     value to a cast of the carrier rather than to a name. On adler32 at x86-64
+     -O1 that pairs `EAX_2` to carrier `rax` at width 4, and `R8_2` to carrier
+     `r8d` at width 8 -- both directions, because a carrier may be held at either
+     width. It is gated on `SsaArtifact::narrow_write_clears_register`, which is
+     what makes the widening sound.
+
+     Only a phi in the carrier's own header block counts. Treating *every* value
+     at the place as the carrier is the whole-function renaming that measured 34
+     correct down to 13; a header phi is the narrow point where the two widths
+     are provably the same run of the same storage.
+
+     Measured: 32 cast sites appear across x86-64 -O1 and -O2, the corpus holds
+     at 36 of 54 with no regression, and adler32 -O2's failure moves from an
+     undeclared `eax_12` to an undeclared `rax`. What remains is the *derived*
+     values -- `EAX_5 = EAX_4 << 16` is not a phi, so it has no view, and the
+     tail that computes it is still dropped.
+
      **Why the earlier attempt regressed 34 correct to 13, and what landing it
      whole means.** Aliasing the narrow member to the carrier's name is only half
      of it: `eax_5` is not `rax`, it is `(uint32_t)rax`. An alias map maps a name
@@ -283,6 +303,29 @@ learn.
      inside a piece composition, `(hi << 32) | (uint64_t)r8d`, which is the width
      layer rather than carrier membership; and `x8_30` in arm64 -O0 murmur3_32 is
      not a naming defect at all -- see 0g.
+
+  0h. **Rendering one function changes how the next one renders.** This is
+     independent of everything above, it predates all of it, and it undermines
+     any measurement taken over a sweep.
+
+     ```
+     r2 -c 'a:sla; aaa; s sym._adler32; pdd'                    -> no `rax` declaration
+     r2 -c 'a:sla; aaa; s sym._djb2; pdd; s sym._adler32; pdd'  ->    `rax` declared
+     ```
+
+     Rendering `djb2` first changes `adler32`'s declaration block. It is not
+     self-contamination -- rendering `adler32` twice gives the same answer both
+     times -- and not every predecessor does it: `fnv1a32` first leaves
+     `adler32` unchanged. Confirmed present on the build before the carrier-view
+     work as well, in the opposite direction, so it is not caused by it.
+
+     Decompiling a function should be a pure function of that function's inputs.
+     Until it is, the corpus number depends on the order `sweep.sh` happens to
+     use, and a single-function reproduction may not show what the sweep saw --
+     which is worth knowing before trusting any trace taken one function at a
+     time. The obvious suspect is the type writeback, which mutates radare2's own
+     state as a side effect of rendering, but that is a guess and has not been
+     traced.
 
   0g. **murmur3's tail switch renders with empty bodies.** This is what arm64 -O0
      `murmur3_32` now fails on, and the undeclared `x8_30` is a symptom of it

@@ -225,6 +225,8 @@ pub(crate) struct FoldingContext<'a> {
     pub(crate) folded_blocks: std::cell::RefCell<std::collections::BTreeSet<u64>>,
     /// One name per certified loop carrier, derived once because it is settled once.
     pub(crate) carrier_aliases: HashMap<String, String>,
+    /// Values that are a carrier read at one of its other widths.
+    pub(crate) carrier_member_views: HashMap<String, crate::normalize::CarrierMemberView>,
     /// Names some other block reads, which a block-local prune must not delete.
     pub(crate) cross_block_reads: std::cell::RefCell<HashSet<String>>,
     /// Names minted while folding, handed to the function when it is built.
@@ -325,15 +327,30 @@ impl<'a> FoldingContext<'a> {
                 carrier_aliases.entry(src_key).or_insert(name);
             }
         }
+        let carrier_member_views = match (inputs.prepared_ssa, inputs.function_facts.render()) {
+            (Some(prepared), Some(render)) => {
+                crate::normalize::carrier_member_views(prepared, render, &carrier_aliases)
+            }
+            _ => HashMap::new(),
+        };
         if std::env::var_os("R2SLEIGH_DEBUG_MERGES").is_some() {
             let mut entries = carrier_aliases.iter().collect::<Vec<_>>();
             entries.sort();
             for (member, name) in entries {
                 eprintln!("FOLDALIAS member={member} name={name}");
             }
+            let mut views = carrier_member_views.iter().collect::<Vec<_>>();
+            views.sort_by(|left, right| left.0.cmp(right.0));
+            for (member, view) in views {
+                eprintln!(
+                    "FOLDVIEW member={member} carrier={} width={} carrier_width={}",
+                    view.carrier, view.width, view.carrier_width
+                );
+            }
         }
         Self {
             carrier_aliases,
+            carrier_member_views,
             cross_block_reads: std::cell::RefCell::new(HashSet::new()),
             symbols: std::rc::Rc::new(std::cell::RefCell::new(crate::symbol::SymbolTable::new())),
             inputs,

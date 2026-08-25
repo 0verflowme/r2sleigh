@@ -8261,6 +8261,59 @@ mod tests {
     }
 
     #[test]
+    fn a_carrier_read_at_another_width_resolves_to_a_cast_of_the_carrier() {
+        // The half of the location model an alias map cannot hold. `eax_5` is
+        // not `rax`, it is `(uint32_t)rax`; answering with the carrier's name
+        // alone renders the right identifier over the wrong value, which is what
+        // a corpus measured in checksums reports as a collapse.
+        let mut ctx = FoldingContext::new(64);
+        ctx.carrier_member_views.insert(
+            "EAX_2".to_string(),
+            crate::normalize::CarrierMemberView {
+                carrier: "rax".to_string(),
+                width: 4,
+                carrier_width: 8,
+            },
+        );
+        // A carrier held narrow still answers a wide read, because a narrow
+        // write clears the rest of the register.
+        ctx.carrier_member_views.insert(
+            "R8_2".to_string(),
+            crate::normalize::CarrierMemberView {
+                carrier: "r8d".to_string(),
+                width: 8,
+                carrier_width: 4,
+            },
+        );
+
+        let narrowed = ctx.get_expr(&make_var("EAX", 2, 4));
+        assert!(
+            matches!(
+                &narrowed,
+                CExpr::Cast {
+                    ty: CType::UInt(32),
+                    expr,
+                } if matches!(expr.as_ref(), CExpr::Var(name)
+                    if &*ctx.spelling(*name) == "rax")
+            ),
+            "expected (uint32_t)rax, got {narrowed:?}"
+        );
+
+        let widened = ctx.get_expr(&make_var("R8", 2, 8));
+        assert!(
+            matches!(
+                &widened,
+                CExpr::Cast {
+                    ty: CType::UInt(64),
+                    expr,
+                } if matches!(expr.as_ref(), CExpr::Var(name)
+                    if &*ctx.spelling(*name) == "r8d")
+            ),
+            "expected (uint64_t)r8d, got {widened:?}"
+        );
+    }
+
+    #[test]
     fn stack_frame_op_elides_the_entry_link_register_save_but_not_a_scratch_one() {
         // `stp x29, x30, [sp, N]` is the arm64 frame record. The link register
         // is not callee-saved -- a leaf may clobber it -- so the callee-saved

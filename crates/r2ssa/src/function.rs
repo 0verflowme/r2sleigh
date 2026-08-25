@@ -737,6 +737,21 @@ impl SsaArtifact {
         &self.facts
     }
 
+    /// Whether a narrow write to a general register clears the rest of it.
+    ///
+    /// x86-64 does this when it writes `eax`, AArch64 when it writes `w0`. It is
+    /// what makes two widths of one register one location: after a narrow write
+    /// the wide value is the narrow one zero-extended, so a value held at one
+    /// width answers for a read at the other. Where it does not hold, the upper
+    /// bytes keep whatever they had and the two widths are two values.
+    pub const fn narrow_write_clears_register(&self) -> bool {
+        matches!(
+            self.machine_context.architecture_family(),
+            crate::machine_context::MachineArchitectureFamily::X86_64
+                | crate::machine_context::MachineArchitectureFamily::AArch64
+        )
+    }
+
     pub const fn machine_context(&self) -> &SourceMachineContext {
         &self.machine_context
     }
@@ -3531,11 +3546,7 @@ impl RegisterFamilyInfo {
                 .insert(reg.size);
         }
 
-        // Both of these clear the rest of the register on a 32-bit write: x86-64
-        // when it writes eax, aarch64 when it writes w0.
-        let narrow_write_clears_register = arch.name.eq_ignore_ascii_case("x86-64")
-            || arch.name.eq_ignore_ascii_case("aarch64")
-            || arch.name.eq_ignore_ascii_case("arm64");
+        let narrow_write_clears_register = arch_narrow_write_clears_register(arch);
         if arch.name.eq_ignore_ascii_case("x86-64") || arch.name.eq_ignore_ascii_case("x86") {
             seed_x86_low_register_aliases(&mut name_to_member, &mut family_width_sets);
         }
@@ -4576,6 +4587,15 @@ fn signed_stack_delta_through_roots(
     }
     let root = resolve_value_root(var, roots, family_state, family_info);
     (root != *var).then(|| signed_stack_delta(&root)).flatten()
+}
+
+/// Whether a narrow write to a general register clears the rest of it.
+///
+/// Both x86-64 and AArch64 do: writing `eax` or `w0` zeroes the upper half.
+fn arch_narrow_write_clears_register(arch: &ArchSpec) -> bool {
+    arch.name.eq_ignore_ascii_case("x86-64")
+        || arch.name.eq_ignore_ascii_case("aarch64")
+        || arch.name.eq_ignore_ascii_case("arm64")
 }
 
 fn signed_stack_delta(var: &SSAVar) -> Option<i64> {
