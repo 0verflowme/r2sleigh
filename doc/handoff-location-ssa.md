@@ -852,11 +852,30 @@ learn.
      The else region therefore contains blocks that belong after the merge, which
      is why it reads `t20380_5` before the merge declares it.
 
-     So the question for the next attempt is why the else region extends past its
-     own merge, and it is a region-building question. Do not reach for another
-     guard in `structure.rs`: three have now been measured there, one at 37 to 17,
-     one that landed, and this check, and each addressed a different defect behind
-     the same rendered lines.
+     So the question is why the else region extends past its own merge, and it is
+     a region-building question. `analyze_conditional` in `region.rs` calls
+     `analyze_region_recursive(false_target)` with no bound at all, and
+     `analyze_region_recursive_inner` stops only on `self.processed` -- so a
+     branch walks straight through the merge unless something has marked it.
+
+     Marking the merge processed for the duration of the branch analysis, and
+     unmarking it afterwards so the parent still emits it, is the obvious bound
+     and **changes nothing**: corpus 37, and murmur3's `else` still contains the
+     finaliser and its return. Built, measured, reverted. So either the branch is
+     not reaching the merge through `analyze_region_recursive` at all, or the
+     finaliser arrives in the else by some route other than region growth.
+
+     Caveat on that measurement, and it matters: `make -C r2plugin install` was
+     failing throughout with the `codesign` fault, so the build was installed by
+     hand -- signing the dylib in place, copying it, and re-signing the two C
+     plugins. The corpus read 37 both before and after, which is the signature of
+     a *working* install rather than the mixed one that reads 19, but a
+     hand-install is weaker evidence than the real thing. Re-run this measurement
+     with a successful `make install` before trusting the inert result.
+
+     Do not reach for another guard in `structure.rs`: three have now been
+     measured there, one at 37 to 17, one that landed, and this check, and each
+     addressed a different defect behind the same rendered lines.
 
   0g. **murmur3's tail switch renders with empty bodies.** This is what arm64 -O0
      `murmur3_32` now fails on, and the undeclared `x8_30` is a symptom of it
