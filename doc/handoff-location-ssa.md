@@ -482,6 +482,35 @@ learn.
      changed `adler32`'s output. That was one sample per condition, and what it
      actually sampled was this.
 
+  0i. **A carrier reaches the return as its initialiser.** This is what the three
+     x86-64 -O1 functions now fail on, having crossed from not compiling to
+     compiling with the return-register fix. adler32 renders
+
+     ```c
+     r8d = 1;                       /* before the loop      */
+     do { ...; r8d = r9d_3 - r9d_4; ... } while (arg1 != rcx);
+     return eax_4 << 16 | 1;        /* wants `| r8d`        */
+     ```
+
+     and returns `9dd20001` against a wanted `9dd21488` -- the high half, which
+     is `eax_4`, is right, and the low half is the accumulator's *initial* value
+     instead of its final one. adler32 returns `(b << 16) | a`, so this is `a`
+     read as 1.
+
+     The constant is baked in before the return is reached: probing the
+     `SSAOp::Return` arm shows `last_ret_value` already holding
+     `Binary { BitOr, Var(..), IntLit(1) }`. So the write to the return register
+     that produced it had already resolved `r8d` to its initialiser.
+     `resolve_return_expr_from_defs` is *not* the culprit -- it only handles
+     `Paren`, `Cast` and `Var` and returns `None` for a `Binary`, so it cannot
+     rewrite inside this expression. Look instead at what `get_expr` answers for
+     the `R8D` version that write reads, and at whether the carrier's
+     initialiser has been recorded as that value's definition.
+
+     The same shape is worth checking on the other two: murmur3_32 -O1 returns
+     `ec1fbeef` against `7e4102af`, and xxhash32 -O1 returns nothing at all
+     against `e7583aa4`.
+
   0g. **murmur3's tail switch renders with empty bodies.** This is what arm64 -O0
      `murmur3_32` now fails on, and the undeclared `x8_30` is a symptom of it
      rather than the defect. The rendering is
