@@ -122,6 +122,10 @@ pub(crate) struct FoldInputs<'a> {
     pub(crate) prepared_memory: Option<&'a MemorySSAFacts>,
     /// Exact origin of every operation in the normalized function.
     pub(crate) normalization_origins: Option<&'a crate::normalize::NormalizationOrigins>,
+    /// Sole authority-bound observation journal for this native rendering.
+    /// Test and residual-only folds deliberately carry no journal.
+    pub(crate) observation_journal:
+        Option<&'a std::cell::RefCell<crate::observation_journal::LegacyObservationJournal>>,
 }
 
 impl<'a> FoldInputs<'a> {
@@ -249,6 +253,11 @@ pub(crate) struct FoldingContext<'a> {
     /// Downstream dead-name heuristics are not authority to populate this map.
     pub(crate) elided_obligations:
         std::cell::RefCell<std::collections::BTreeMap<SemanticObligationId, &'static str>>,
+    /// First exact-observation failure. Lowering is largely `Option`-based, so
+    /// marker issuance records the typed failure here and the native boundary
+    /// converts the entire run to a fresh marker-free residual.
+    pub(crate) observation_error:
+        std::cell::RefCell<Option<crate::observation_journal::LegacyObservationJournalError>>,
 }
 
 impl FoldArchConfig {
@@ -489,6 +498,7 @@ impl<'a> FoldingContext<'a> {
             effect_render_proofs: std::cell::RefCell::new(Vec::new()),
             folded_blocks: std::cell::RefCell::new(std::collections::BTreeSet::new()),
             elided_obligations: std::cell::RefCell::new(std::collections::BTreeMap::new()),
+            observation_error: std::cell::RefCell::new(None),
         }
     }
 
@@ -507,6 +517,154 @@ impl<'a> FoldingContext<'a> {
             .graph()
             .block_id_for_addr(block_addr)?;
         Some(crate::normalize::NormalizedOpSite { block, op_idx })
+    }
+
+    fn observation_site(
+        &self,
+        block_addr: u64,
+        op_idx: usize,
+    ) -> Result<
+        crate::normalize::NormalizedOpSite,
+        crate::observation_journal::LegacyObservationJournalError,
+    > {
+        self.normalized_site(block_addr, op_idx).ok_or(
+            crate::observation_journal::LegacyObservationJournalError::MissingNormalizedBlock(
+                block_addr,
+            ),
+        )
+    }
+
+    fn retain_first_observation_error(
+        &self,
+        error: crate::observation_journal::LegacyObservationJournalError,
+    ) {
+        let mut first = self.observation_error.borrow_mut();
+        if first.is_none() {
+            *first = Some(error);
+        }
+    }
+
+    /// Wrap one exact normalized operand occurrence. The journal owns every
+    /// translation from normalized coordinates to original V/U identities.
+    pub(crate) fn observe_normalized_input_expr(
+        &self,
+        block_addr: u64,
+        op_idx: usize,
+        input_idx: usize,
+        expr: CExpr,
+    ) -> CExpr {
+        let site = match self.observation_site(block_addr, op_idx) {
+            Ok(site) => Some(site),
+            Err(error) => {
+                if self.inputs.observation_journal.is_some() {
+                    self.retain_first_observation_error(error);
+                }
+                None
+            }
+        };
+        self.observe_optional_normalized_input_expr(site, input_idx, expr)
+    }
+
+    pub(crate) fn observe_optional_normalized_input_expr(
+        &self,
+        site: Option<crate::normalize::NormalizedOpSite>,
+        input_idx: usize,
+        expr: CExpr,
+    ) -> CExpr {
+        let Some(journal) = self.inputs.observation_journal else {
+            return expr;
+        };
+        let Some(site) = site else {
+            self.retain_first_observation_error(
+                crate::observation_journal::LegacyObservationJournalError::MissingNormalizedSiteContext,
+            );
+            return expr;
+        };
+        let fallback = expr.clone();
+        let result = journal
+            .borrow_mut()
+            .observe_normalized_input_expr(site, input_idx, expr);
+        match result {
+            Ok(marked) => marked,
+            Err(error) => {
+                self.retain_first_observation_error(error);
+                fallback
+            }
+        }
+    }
+
+    pub(crate) fn observe_current_normalized_input_expr(
+        &self,
+        input_idx: usize,
+        expr: CExpr,
+    ) -> CExpr {
+        let Some(block_addr) = self.current_block_addr.get() else {
+            if self.inputs.observation_journal.is_some() {
+                self.retain_first_observation_error(
+                    crate::observation_journal::LegacyObservationJournalError::MissingNormalizedSiteContext,
+                );
+            }
+            return expr;
+        };
+        let Some(op_idx) = self.current_op_idx.get() else {
+            if self.inputs.observation_journal.is_some() {
+                self.retain_first_observation_error(
+                    crate::observation_journal::LegacyObservationJournalError::MissingNormalizedSiteContext,
+                );
+            }
+            return expr;
+        };
+        self.observe_normalized_input_expr(block_addr, op_idx, input_idx, expr)
+    }
+
+    /// Wrap one exact normalized definition that survives as a statement.
+    pub(crate) fn observe_normalized_output_stmt(
+        &self,
+        block_addr: u64,
+        op_idx: usize,
+        stmt: crate::ast::CStmt,
+    ) -> crate::ast::CStmt {
+        let Some(journal) = self.inputs.observation_journal else {
+            return stmt;
+        };
+        let fallback = stmt.clone();
+        let result = self.observation_site(block_addr, op_idx).and_then(|site| {
+            journal
+                .borrow_mut()
+                .observe_normalized_output_stmt(site, stmt)
+        });
+        match result {
+            Ok(marked) => marked,
+            Err(error) => {
+                self.retain_first_observation_error(error);
+                fallback
+            }
+        }
+    }
+
+    /// Wrap one exact normalized definition that survives inside a consumer.
+    pub(crate) fn observe_normalized_output_expr(
+        &self,
+        block_addr: u64,
+        op_idx: usize,
+        expr: CExpr,
+    ) -> CExpr {
+        let Some(journal) = self.inputs.observation_journal else {
+            return expr;
+        };
+        let fallback = expr.clone();
+        let result = self.observation_site(block_addr, op_idx).and_then(|site| {
+            journal
+                .borrow_mut()
+                .observe_normalized_output_expr(site, expr)
+        });
+        match result {
+            Ok(marked) => marked,
+            Err(error) => {
+                self.retain_first_observation_error(error);
+                fallback
+            }
+        }
     }
 
     /// O(1) origin lookup once the caller holds the normalized block's dense id.
@@ -1013,6 +1171,7 @@ impl<'a> FoldingContext<'a> {
 
         let inputs = FoldInputs {
             normalization_origins: None,
+            observation_journal: None,
             binding_names: None,
             display_names: crate::empty_display_names(),
             arch,

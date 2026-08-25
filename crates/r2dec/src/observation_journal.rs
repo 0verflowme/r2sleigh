@@ -93,6 +93,8 @@ pub(crate) enum LegacyObservationJournalError {
     InvalidWrite(InstId),
     OutputlessWrite(InstId),
     InvalidNormalizedSite(NormalizedOpSite),
+    MissingNormalizedBlock(u64),
+    MissingNormalizedSiteContext,
     InvalidNormalizedInput {
         site: NormalizedOpSite,
         input_idx: usize,
@@ -109,6 +111,86 @@ pub(crate) enum LegacyObservationJournalError {
     ConflictingUse(UseSite),
     ConflictingWrite(InstId),
     Markers(RenderObservationStripError),
+}
+
+/// Final coverage of one dense source domain after marker inspection.
+///
+/// `accounted` counts only decisions that survived in the final emission tree
+/// or were recorded explicitly as typed elision/refusal. `absent` is therefore
+/// observable missing legacy coverage, not an inferred decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LegacyObservationDomainCoverage {
+    pub(crate) total: usize,
+    pub(crate) accounted: usize,
+    pub(crate) absent: usize,
+    pub(crate) refused: usize,
+}
+
+impl LegacyObservationDomainCoverage {
+    fn from_counts(total: usize, accounted: usize, refused: usize) -> Self {
+        Self {
+            total,
+            accounted,
+            absent: total - accounted,
+            refused,
+        }
+    }
+
+    pub(crate) fn equations_hold(self) -> bool {
+        self.accounted.checked_add(self.absent) == Some(self.total)
+            && self.refused <= self.accounted
+    }
+
+    pub(crate) fn is_complete(self) -> bool {
+        self.equations_hold() && self.absent == 0
+    }
+
+    pub(crate) fn passes_quality(self) -> bool {
+        self.is_complete() && self.refused == 0
+    }
+}
+
+/// Dense V/U/W coverage sealed from the final marker-bearing emission tree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LegacyObservationCoverage {
+    pub(crate) values: LegacyObservationDomainCoverage,
+    pub(crate) uses: LegacyObservationDomainCoverage,
+    pub(crate) writes: LegacyObservationDomainCoverage,
+}
+
+impl LegacyObservationCoverage {
+    pub(crate) fn equations_hold(self) -> bool {
+        self.values.equations_hold() && self.uses.equations_hold() && self.writes.equations_hold()
+    }
+
+    pub(crate) fn is_complete(self) -> bool {
+        self.values.is_complete() && self.uses.is_complete() && self.writes.is_complete()
+    }
+
+    pub(crate) fn passes_quality(self) -> bool {
+        self.values.passes_quality()
+            && self.uses.passes_quality()
+            && self.writes.passes_quality()
+    }
+}
+
+/// One dense legacy snapshot and the independently visible coverage that
+/// produced it. Missing cells remain `LegacyAbsent` in the snapshot while the
+/// coverage keeps them distinguishable from explicit final decisions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SealedLegacyObservations {
+    snapshot: LegacyAnalysisSnapshot,
+    coverage: LegacyObservationCoverage,
+}
+
+impl SealedLegacyObservations {
+    pub(crate) const fn snapshot(&self) -> &LegacyAnalysisSnapshot {
+        &self.snapshot
+    }
+
+    pub(crate) const fn coverage(&self) -> LegacyObservationCoverage {
+        self.coverage
+    }
 }
 
 /// Sealed, source-authority-bound recorder for one legacy rendering run.
@@ -158,7 +240,7 @@ impl MarkedNativeDraft {
 /// Marker-free exact emission tree paired with the observations sealed from it.
 pub(crate) struct SealedNativeFunction {
     ready: EmissionReadyFunction,
-    observations: LegacyAnalysisSnapshot,
+    observations: SealedLegacyObservations,
     plan: Rc<BindingPlan>,
 }
 
@@ -168,7 +250,11 @@ impl SealedNativeFunction {
     }
 
     pub(crate) const fn observations(&self) -> &LegacyAnalysisSnapshot {
-        &self.observations
+        self.observations.snapshot()
+    }
+
+    pub(crate) const fn observation_coverage(&self) -> LegacyObservationCoverage {
+        self.observations.coverage()
     }
 
     pub(crate) fn plan(&self) -> &BindingPlan {
@@ -240,7 +326,7 @@ impl LegacyObservationJournal {
             .into_boxed_slice();
         let writes = vec![None; graph.insts.len()].into_boxed_slice();
 
-        Ok(Self {
+        let mut journal = Self {
             authority: source.source().authority().clone(),
             plan,
             normalized_projections,
@@ -251,17 +337,118 @@ impl LegacyObservationJournal {
             write_has_output,
             writes,
             targets: Vec::new(),
-        })
+        };
+        journal.record_upstream_nonrendered_dispositions()?;
+        Ok(journal)
     }
 
-    fn allocate(
+    /// Seed only decisions whose upstream disposition proves that no rendered
+    /// occurrence may exist. Bound, inline, and exact machine cells remain
+    /// absent until a marker actually survives final emission.
+    fn record_upstream_nonrendered_dispositions(
         &mut self,
-        target: ObservationTarget,
-    ) -> Result<RenderObservationId, LegacyObservationJournalError> {
-        let index = u32::try_from(self.targets.len())
+    ) -> Result<(), LegacyObservationJournalError> {
+        let nonrendered_values = (0..self.values.len())
+            .filter_map(|index| {
+                let value = ValueId(index as u32);
+                matches!(
+                    self.plan.disposition(value),
+                    Some(ValueDisposition::Elided { .. } | ValueDisposition::Refused { .. })
+                )
+                .then_some(value)
+            })
+            .collect::<Vec<_>>();
+        let refused_uses = self
+            .plan
+            .machine_projection()
+            .use_dispositions()
+            .iter()
+            .enumerate()
+            .flat_map(|(inst, row)| {
+                row.iter().enumerate().filter_map(move |(input_idx, disposition)| {
+                    matches!(disposition, MachineUseDisposition::Refused(_)).then_some(UseSite {
+                        inst: InstId(inst as u32),
+                        input_idx,
+                    })
+                })
+            })
+            .collect::<Vec<_>>();
+        let refused_writes = self
+            .plan
+            .machine_projection()
+            .write_dispositions()
+            .iter()
+            .enumerate()
+            .filter_map(|(inst, disposition)| {
+                matches!(disposition, Some(MachineWriteDisposition::Refused(_)))
+                    .then_some(InstId(inst as u32))
+            })
+            .collect::<Vec<_>>();
+
+        for value in nonrendered_values {
+            self.record_nonrendered_value(value)?;
+        }
+        for site in refused_uses {
+            self.record_refused_use(site)?;
+        }
+        for inst in refused_writes {
+            self.record_refused_write(inst)?;
+        }
+        Ok(())
+    }
+
+    fn allocate_pair(
+        &mut self,
+        first: ObservationTarget,
+        second: ObservationTarget,
+    ) -> Result<(RenderObservationId, RenderObservationId), LegacyObservationJournalError> {
+        let first_index = u32::try_from(self.targets.len())
             .map_err(|_| LegacyObservationJournalError::TooManyObservations)?;
-        self.targets.push(target);
-        Ok(RenderObservationId(index))
+        let second_index = first_index
+            .checked_add(1)
+            .ok_or(LegacyObservationJournalError::TooManyObservations)?;
+        self.targets.push(first);
+        self.targets.push(second);
+        Ok((
+            RenderObservationId(first_index),
+            RenderObservationId(second_index),
+        ))
+    }
+
+    fn allocate_many(
+        &mut self,
+        targets: Vec<ObservationTarget>,
+    ) -> Result<Vec<RenderObservationId>, LegacyObservationJournalError> {
+        let first = u32::try_from(self.targets.len())
+            .map_err(|_| LegacyObservationJournalError::TooManyObservations)?;
+        let count = u32::try_from(targets.len())
+            .map_err(|_| LegacyObservationJournalError::TooManyObservations)?;
+        if count > 0 {
+            first
+                .checked_add(count - 1)
+                .ok_or(LegacyObservationJournalError::TooManyObservations)?;
+        }
+        let ids = (0..count)
+            .map(|offset| RenderObservationId(first + offset))
+            .collect();
+        self.targets.extend(targets);
+        Ok(ids)
+    }
+
+    fn allocate_normalized_output_targets(
+        &mut self,
+        site: NormalizedOpSite,
+    ) -> Result<(RenderObservationId, RenderObservationId), LegacyObservationJournalError> {
+        let output = self.normalized_output(site)?;
+        self.value_slot(output.value)?;
+        let write = self.rendered_write_observation(output.inst)?;
+        self.allocate_pair(
+            ObservationTarget::Value(output.value),
+            ObservationTarget::Write {
+                inst: output.inst,
+                observation: write,
+            },
+        )
     }
 
     /// Mark one value occurrence and every original use represented by the
@@ -284,14 +471,21 @@ impl LegacyObservationJournal {
             .ok_or(LegacyObservationJournalError::InvalidNormalizedInput { site, input_idx })?;
         let value = input.value;
         self.value_slot(value)?;
-        let id = self.allocate(ObservationTarget::Value(value))?;
-        let mut marked = CExpr::observed(id, expr);
+        let mut targets = Vec::with_capacity(1 + input.uses.len());
+        targets.push(ObservationTarget::Value(value));
         for use_site in input.uses {
             let observation = self.rendered_use_observation(use_site)?;
-            let id = self.allocate(ObservationTarget::Use {
+            targets.push(ObservationTarget::Use {
                 site: use_site,
                 observation,
-            })?;
+            });
+        }
+        let mut ids = self.allocate_many(targets)?.into_iter();
+        let value_id = ids
+            .next()
+            .expect("a normalized input always allocates its value observation");
+        let mut marked = CExpr::observed(value_id, expr);
+        for id in ids {
             marked = CExpr::observed(id, marked);
         }
         Ok(marked)
@@ -304,15 +498,22 @@ impl LegacyObservationJournal {
         site: NormalizedOpSite,
         stmt: CStmt,
     ) -> Result<CStmt, LegacyObservationJournalError> {
-        let output = self.normalized_output(site)?;
-        self.value_slot(output.value)?;
-        let write = self.rendered_write_observation(output.inst)?;
-        let value_id = self.allocate(ObservationTarget::Value(output.value))?;
-        let write_id = self.allocate(ObservationTarget::Write {
-            inst: output.inst,
-            observation: write,
-        })?;
+        let (value_id, write_id) = self.allocate_normalized_output_targets(site)?;
         Ok(CStmt::observed(write_id, CStmt::observed(value_id, stmt)))
+    }
+
+    /// Mark one rendered definition that survives inside an expression.
+    ///
+    /// This is the expression twin of [`Self::observe_normalized_output_stmt`].
+    /// Both value and write identity come exclusively from the authority-bound
+    /// normalized output projection retained by this journal.
+    pub(crate) fn observe_normalized_output_expr(
+        &mut self,
+        site: NormalizedOpSite,
+        expr: CExpr,
+    ) -> Result<CExpr, LegacyObservationJournalError> {
+        let (value_id, write_id) = self.allocate_normalized_output_targets(site)?;
+        Ok(CExpr::observed(write_id, CExpr::observed(value_id, expr)))
     }
 
     /// Record a value only when the sealed plan proves that no rendered AST
@@ -422,7 +623,7 @@ impl LegacyObservationJournal {
         mut self,
         source: &SourceOwnedFunctionFacts,
         ready: &mut EmissionReadyFunction,
-    ) -> Result<LegacyAnalysisSnapshot, LegacyObservationJournalError> {
+    ) -> Result<SealedLegacyObservations, LegacyObservationJournalError> {
         if self.authority != *source.source().authority() {
             return Err(LegacyObservationJournalError::SourceAuthority);
         }
@@ -478,7 +679,78 @@ impl LegacyObservationJournal {
         self.values = values;
         self.uses = uses;
         self.writes = writes;
-        Ok(self.into_snapshot(source))
+        Ok(self.into_sealed_observations(source))
+    }
+
+    fn final_coverage(&self) -> LegacyObservationCoverage {
+        let value_total = self.values.len();
+        let value_accounted = self.values.iter().filter(|cell| cell.is_some()).count();
+        let value_refused = self
+            .values
+            .iter()
+            .filter(|cell| matches!(cell, Some(LegacyValueObservation::Refused(_))))
+            .count();
+
+        let use_total = self.uses.iter().map(|row| row.len()).sum();
+        let use_accounted = self
+            .uses
+            .iter()
+            .flat_map(|row| row.iter())
+            .filter(|cell| cell.is_some())
+            .count();
+        let use_refused = self
+            .uses
+            .iter()
+            .flat_map(|row| row.iter())
+            .filter(|cell| matches!(cell, Some(LegacyUseObservation::Refused(_))))
+            .count();
+
+        let write_total = self
+            .write_has_output
+            .iter()
+            .filter(|has_output| **has_output)
+            .count();
+        let write_accounted = self
+            .writes
+            .iter()
+            .zip(self.write_has_output.iter())
+            .filter(|(cell, has_output)| **has_output && cell.is_some())
+            .count();
+        let write_refused = self
+            .writes
+            .iter()
+            .zip(self.write_has_output.iter())
+            .filter(|(cell, has_output)| {
+                **has_output && matches!(cell, Some(LegacyWriteObservation::Refused(_)))
+            })
+            .count();
+
+        LegacyObservationCoverage {
+            values: LegacyObservationDomainCoverage::from_counts(
+                value_total,
+                value_accounted,
+                value_refused,
+            ),
+            uses: LegacyObservationDomainCoverage::from_counts(
+                use_total,
+                use_accounted,
+                use_refused,
+            ),
+            writes: LegacyObservationDomainCoverage::from_counts(
+                write_total,
+                write_accounted,
+                write_refused,
+            ),
+        }
+    }
+
+    fn into_sealed_observations(
+        self,
+        source: &SourceOwnedFunctionFacts,
+    ) -> SealedLegacyObservations {
+        let coverage = self.final_coverage();
+        let snapshot = self.into_snapshot(source);
+        SealedLegacyObservations { snapshot, coverage }
     }
 
     fn into_snapshot(self, source: &SourceOwnedFunctionFacts) -> LegacyAnalysisSnapshot {
@@ -893,6 +1165,32 @@ mod tests {
             .expect("fixture has an exactly projected bound input")
     }
 
+    fn first_bound_rendered_output(
+        plan: &BindingPlan,
+        source: &SourceOwnedFunctionFacts,
+    ) -> (ValueId, BindingId, InstId, NormalizedOpSite) {
+        let graph = source.source().graph();
+        graph
+            .insts
+            .iter()
+            .find_map(|inst| {
+                let value = inst.output?;
+                let ValueDisposition::Bound { binding } = plan.disposition(value)? else {
+                    return None;
+                };
+                if !matches!(
+                    plan.write_disposition(inst.id),
+                    Some(MachineWriteDisposition::Exact(_))
+                ) {
+                    return None;
+                }
+                let (block_addr, op_idx) = source.source().inst_op_site(inst.id)?;
+                let block = graph.block_id_for_addr(block_addr)?;
+                Some((value, *binding, inst.id, NormalizedOpSite { block, op_idx }))
+            })
+            .expect("fixture has an exactly projected bound output")
+    }
+
     fn replace_observed_expr_semantic(expr: &mut CExpr, replacement: CExpr) {
         let mut semantic = expr;
         while let CExpr::Observed { expr, .. } = semantic {
@@ -950,11 +1248,11 @@ mod tests {
             .expect("second projected occurrence");
         function.body = vec![CStmt::Expr(first), CStmt::Expr(second)];
         let mut ready = crate::codegen::prepare_function_for_emission(&function);
-        let snapshot = journal
+        let sealed = journal
             .seal(&source, &mut ready)
             .expect("same projected cell is idempotent");
         assert_eq!(
-            snapshot.value_observation(value),
+            sealed.snapshot().value_observation(value),
             Some(LegacyValueObservation::Bound {
                 binding: LegacyBindingId(0),
             })
@@ -966,6 +1264,89 @@ mod tests {
             journal.record_nonrendered_value(value),
             Err(LegacyObservationJournalError::RenderedValueRequired(value))
         );
+    }
+
+    #[test]
+    fn normalized_output_expression_is_idempotent_and_reports_dense_coverage() {
+        let (source, plan, mut function, mut journal) = journal_fixture();
+        let (value, binding, inst, site) = first_bound_rendered_output(&plan, &source);
+        let symbol = declare_legacy_local(&mut function, &plan, binding, "inline_output");
+        let first = journal
+            .observe_normalized_output_expr(site, CExpr::Var(symbol))
+            .expect("first output expression");
+        let second = journal
+            .observe_normalized_output_expr(site, CExpr::Var(symbol))
+            .expect("second output expression");
+        function.body = vec![CStmt::Expr(first), CStmt::Expr(second)];
+
+        let expected_write = match plan.write_disposition(inst) {
+            Some(MachineWriteDisposition::Exact(write)) => LegacyWriteObservation::Exact(*write),
+            other => panic!("expected exact write, got {other:?}"),
+        };
+        let mut ready = crate::codegen::prepare_function_for_emission(&function);
+        let sealed = journal
+            .seal(&source, &mut ready)
+            .expect("identical output decisions are idempotent");
+
+        assert_eq!(
+            sealed.snapshot().value_observation(value),
+            Some(LegacyValueObservation::Bound {
+                binding: LegacyBindingId(0),
+            })
+        );
+        assert_eq!(
+            sealed.snapshot().write_observation(inst),
+            Some(expected_write)
+        );
+
+        let coverage = sealed.coverage();
+        let graph = source.source().graph();
+        assert_eq!(coverage.values.total, graph.values.len());
+        assert_eq!(
+            coverage.uses.total,
+            graph
+                .insts
+                .iter()
+                .map(|inst| inst.inputs.len())
+                .sum::<usize>()
+        );
+        assert_eq!(
+            coverage.writes.total,
+            graph
+                .insts
+                .iter()
+                .filter(|inst| inst.output.is_some())
+                .count()
+        );
+        assert_eq!(coverage.values.accounted, 1);
+        assert_eq!(coverage.uses.accounted, 0);
+        assert_eq!(coverage.writes.accounted, 1);
+        assert_eq!(coverage.values.refused, 0);
+        assert_eq!(coverage.uses.refused, 0);
+        assert_eq!(coverage.writes.refused, 0);
+        assert!(coverage.equations_hold());
+    }
+
+    #[test]
+    fn conflicting_output_expression_decisions_are_transactional() {
+        let (source, plan, mut function, mut journal) = journal_fixture();
+        let (value, binding, _inst, site) = first_bound_rendered_output(&plan, &source);
+        let symbol = declare_legacy_local(&mut function, &plan, binding, "conflicting_output");
+        let bound = journal
+            .observe_normalized_output_expr(site, CExpr::Var(symbol))
+            .expect("bound output expression");
+        let inline = journal
+            .observe_normalized_output_expr(site, CExpr::IntLit(7))
+            .expect("inline output expression");
+        function.body = vec![CStmt::Expr(bound), CStmt::Expr(inline)];
+
+        let mut ready = crate::codegen::prepare_function_for_emission(&function);
+        let unchanged = ready.function_for_marker_test().clone();
+        assert_eq!(
+            journal.seal(&source, &mut ready),
+            Err(LegacyObservationJournalError::ConflictingValue(value))
+        );
+        assert_eq!(ready.function_for_marker_test(), &unchanged);
     }
 
     #[test]
@@ -983,11 +1364,11 @@ mod tests {
         replace_observed_expr_semantic(expr, CExpr::IntLit(7));
 
         let mut ready = crate::codegen::prepare_function_for_emission(&function);
-        let snapshot = journal
+        let sealed = journal
             .seal(&source, &mut ready)
             .expect("sealed final observations");
         assert_eq!(
-            snapshot.value_observation(value),
+            sealed.snapshot().value_observation(value),
             Some(LegacyValueObservation::InlineNonLiteral)
         );
         assert!(!matches!(
@@ -1061,11 +1442,11 @@ mod tests {
                 .expect("value marker"),
         )];
         let mut ready = crate::codegen::prepare_function_for_emission(&function);
-        let snapshot = journal
+        let sealed = journal
             .seal(&source, &mut ready)
             .expect("declared binding is authoritative");
         assert_eq!(
-            snapshot.value_observation(value),
+            sealed.snapshot().value_observation(value),
             Some(LegacyValueObservation::Bound {
                 binding: LegacyBindingId(0),
             })

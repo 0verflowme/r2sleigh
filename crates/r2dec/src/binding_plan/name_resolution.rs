@@ -1,11 +1,36 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use r2ssa::{SsaArtifactAuthority, ValueId};
+use r2ssa::{MachineExprId, ObjectId, SsaArtifactAuthority, ValueId};
 use r2types::SourceOwnedFunctionFacts;
 
-use super::{BindingId, BindingPlan, BindingPlanSourceMismatch, ValueDisposition};
+use super::{
+    BindingId, BindingPlan, BindingPlanSourceMismatch, StackObjectDisposition, StackObjectRefusal,
+    ValueDisposition, ValueRefusal,
+};
 use crate::symbol::{SymbolId, SymbolRole, SymbolTable};
+
+/// Exact naming answer for one SSA value in a sealed binding plan.
+///
+/// Expression identities and typed reasons are copied out of the plan only as
+/// stable evidence keys. The inline and dead-value proofs remain owned by the
+/// plan and are not reconstructed here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PlannedValueSymbol {
+    Bound(SymbolId),
+    Inline(MachineExprId),
+    Elided(r2ssa::ledger::ElisionReason),
+    Refused(ValueRefusal),
+    Absent,
+}
+
+/// Exact naming answer for one source-owned stack object.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PlannedStackSymbol {
+    Bound(SymbolId),
+    Refused(StackObjectRefusal),
+    Absent,
+}
 
 /// Failure to project one sealed binding plan into the identifier table used
 /// by a single native rendering.
@@ -101,10 +126,37 @@ impl BindingNameResolution {
     }
 
     pub(crate) fn symbol_for_value(&self, value: ValueId) -> Option<SymbolId> {
-        let ValueDisposition::Bound { binding } = self.plan.disposition(value)? else {
-            return None;
-        };
-        self.symbol_for_binding(*binding)
+        match self.resolve_value(value) {
+            PlannedValueSymbol::Bound(symbol) => Some(symbol),
+            PlannedValueSymbol::Inline(_)
+            | PlannedValueSymbol::Elided(_)
+            | PlannedValueSymbol::Refused(_)
+            | PlannedValueSymbol::Absent => None,
+        }
+    }
+
+    /// Resolve one dense `ValueId` without recovering identity from an SSA
+    /// variable or presentation name.
+    pub(crate) fn resolve_value(&self, value: ValueId) -> PlannedValueSymbol {
+        match self.plan.disposition(value) {
+            Some(ValueDisposition::Bound { binding }) => self
+                .symbol_for_binding(*binding)
+                .map_or(PlannedValueSymbol::Absent, PlannedValueSymbol::Bound),
+            Some(ValueDisposition::Inline { expr, .. }) => PlannedValueSymbol::Inline(*expr),
+            Some(ValueDisposition::Elided { reason, .. }) => PlannedValueSymbol::Elided(*reason),
+            Some(ValueDisposition::Refused { reason }) => PlannedValueSymbol::Refused(*reason),
+            None => PlannedValueSymbol::Absent,
+        }
+    }
+
+    /// The sealed disposition for one exact SSA value.
+    ///
+    /// This delegates to the plan's dense `ValueId` table. Consumers that must
+    /// distinguish "there is no planned value here" from an authoritative
+    /// inline/elide/refuse answer use this instead of treating
+    /// [`symbol_for_value`](Self::symbol_for_value) as a boolean.
+    pub(crate) fn disposition_for_value(&self, value: ValueId) -> Option<&ValueDisposition> {
+        self.plan.disposition(value)
     }
 
     pub(crate) fn name_for_value(&self, value: ValueId) -> Option<String> {
@@ -112,13 +164,23 @@ impl BindingNameResolution {
         Some(self.symbols.borrow().name(symbol).to_string())
     }
 
-    pub(crate) fn symbol_for_stack_object(&self, object: r2ssa::ObjectId) -> Option<SymbolId> {
-        let super::StackObjectDisposition::Bound { binding } =
-            self.plan.stack_object_disposition(object)?
-        else {
-            return None;
-        };
-        self.symbol_for_binding(binding)
+    /// Resolve one source-owned `ObjectId` without copying the plan-owned stack
+    /// disposition into a parallel table.
+    pub(crate) fn resolve_stack(&self, object: ObjectId) -> PlannedStackSymbol {
+        match self.plan.stack_object_disposition(object) {
+            Some(StackObjectDisposition::Bound { binding }) => self
+                .symbol_for_binding(binding)
+                .map_or(PlannedStackSymbol::Absent, PlannedStackSymbol::Bound),
+            Some(StackObjectDisposition::Refused { reason }) => PlannedStackSymbol::Refused(reason),
+            None => PlannedStackSymbol::Absent,
+        }
+    }
+
+    pub(crate) fn symbol_for_stack_object(&self, object: ObjectId) -> Option<SymbolId> {
+        match self.resolve_stack(object) {
+            PlannedStackSymbol::Bound(symbol) => Some(symbol),
+            PlannedStackSymbol::Refused(_) | PlannedStackSymbol::Absent => None,
+        }
     }
 
     pub(crate) fn name_for_stack_object(&self, object: r2ssa::ObjectId) -> Option<String> {
@@ -284,14 +346,136 @@ mod tests {
         let foreign = source_owned();
         let plan = BindingPlan::build_shadow(&source).expect("plan");
         let symbols = Rc::new(RefCell::new(SymbolTable::new()));
-        let resolution =
-            BindingNameResolution::build(&source, Rc::new(plan), Rc::clone(&symbols))
-                .expect("resolution");
+        let resolution = BindingNameResolution::build(&source, Rc::new(plan), Rc::clone(&symbols))
+            .expect("resolution");
         let foreign_symbols = RefCell::new(SymbolTable::new());
 
         assert!(resolution.validates_artifact(source.source()));
         assert!(!resolution.validates_artifact(foreign.source()));
         assert!(resolution.owns_symbol_table(symbols.as_ref()));
         assert!(!resolution.owns_symbol_table(&foreign_symbols));
+    }
+
+    #[test]
+    fn value_resolution_keeps_every_planned_answer_distinct() {
+        let source = source_owned();
+        let plan = BindingPlan::build_shadow(&source).expect("plan");
+        let symbols = Rc::new(RefCell::new(SymbolTable::new()));
+        let resolution =
+            BindingNameResolution::build(&source, Rc::new(plan.clone()), Rc::clone(&symbols))
+                .expect("resolution");
+
+        let bound = source
+            .source()
+            .graph()
+            .values
+            .iter()
+            .find_map(|value| match plan.disposition(value.id) {
+                Some(ValueDisposition::Bound { binding }) => Some((value.id, *binding)),
+                _ => None,
+            })
+            .expect("bound value");
+        let inline = source
+            .source()
+            .graph()
+            .values
+            .iter()
+            .find_map(|value| match plan.disposition(value.id) {
+                Some(ValueDisposition::Inline { expr, .. }) => Some((value.id, *expr)),
+                _ => None,
+            })
+            .expect("inline value");
+        assert_eq!(
+            resolution.resolve_value(bound.0),
+            PlannedValueSymbol::Bound(
+                resolution
+                    .symbol_for_binding(bound.1)
+                    .expect("bound symbol")
+            )
+        );
+        assert_eq!(
+            resolution.resolve_value(inline.0),
+            PlannedValueSymbol::Inline(inline.1)
+        );
+        assert_eq!(
+            resolution.resolve_value(ValueId(u32::MAX)),
+            PlannedValueSymbol::Absent
+        );
+
+        let obligation = *source
+            .source()
+            .obligations()
+            .obligations()
+            .keys()
+            .next()
+            .expect("semantic obligation");
+        let mut elided_plan = plan.clone();
+        elided_plan.replace_value_disposition_for_shadow_test(
+            bound.0,
+            ValueDisposition::Elided {
+                reason: r2ssa::ledger::ElisionReason::DeadUnusedTemporary,
+                proof: crate::binding_plan::DeadValueProof {
+                    authority: source.source().authority().clone(),
+                    obligation,
+                },
+            },
+        );
+        let elided = BindingNameResolution::build(
+            &source,
+            Rc::new(elided_plan),
+            Rc::new(RefCell::new(SymbolTable::new())),
+        )
+        .expect("elided resolution");
+        assert_eq!(
+            elided.resolve_value(bound.0),
+            PlannedValueSymbol::Elided(r2ssa::ledger::ElisionReason::DeadUnusedTemporary)
+        );
+
+        let refusal = ValueRefusal::MissingBindingCertificate { value: bound.0 };
+        let mut refused_plan = plan;
+        refused_plan.replace_value_disposition_for_shadow_test(
+            bound.0,
+            ValueDisposition::Refused { reason: refusal },
+        );
+        let refused = BindingNameResolution::build(
+            &source,
+            Rc::new(refused_plan),
+            Rc::new(RefCell::new(SymbolTable::new())),
+        )
+        .expect("refused resolution");
+        assert_eq!(
+            refused.resolve_value(bound.0),
+            PlannedValueSymbol::Refused(refusal)
+        );
+    }
+
+    #[test]
+    fn stack_resolution_keeps_refusal_and_absence_distinct() {
+        let source = source_owned();
+        let plan = BindingPlan::build_shadow(&source).expect("plan");
+        let resolution = BindingNameResolution::build(
+            &source,
+            Rc::new(plan),
+            Rc::new(RefCell::new(SymbolTable::new())),
+        )
+        .expect("resolution");
+        let symbol = resolution
+            .symbol_for_binding(BindingId(0))
+            .expect("first binding symbol");
+        let answers = [
+            PlannedStackSymbol::Bound(symbol),
+            PlannedStackSymbol::Refused(StackObjectRefusal::MissingWidth {
+                object: ObjectId(7),
+            }),
+            PlannedStackSymbol::Absent,
+        ];
+
+        for (index, answer) in answers.iter().enumerate() {
+            assert!(answers[index + 1..].iter().all(|other| answer != other));
+        }
+        assert_eq!(
+            resolution.resolve_stack(ObjectId(u32::MAX)),
+            PlannedStackSymbol::Absent
+        );
     }
 }

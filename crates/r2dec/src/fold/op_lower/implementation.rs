@@ -2839,47 +2839,33 @@ impl<'a> FoldingContext<'a> {
         fallback
     }
 
-    fn op_to_expr_impl(&self, op: &SSAOp) -> CExpr {
+    fn op_to_expr_impl(&self, op: &SSAOp, frame: &LowerFrame) -> Option<CExpr> {
         if let SSAOp::Copy { src, .. } = op {
-            return self.get_expr(src);
+            return Some(self.observed_input(frame, 0, self.get_expr(src)));
         }
 
-        if let Some(stmt) = self.op_to_stmt_impl(op) {
+        if let Some(stmt) = self.op_to_stmt_impl(op, frame) {
             return match Self::lowered_from_stmt(stmt) {
-                LoweredOp::Assign { rhs, .. } => rhs,
-                LoweredOp::Expr(expr) => expr,
-                LoweredOp::Return(Some(expr)) => expr,
-                LoweredOp::Return(None) => CExpr::External {
+                LoweredOp::Assign { rhs, .. } => Some(rhs),
+                LoweredOp::Expr(expr) => Some(expr),
+                LoweredOp::Return(Some(expr)) => Some(expr),
+                LoweredOp::Return(None) => Some(CExpr::External {
                     name: "return".to_string(),
                     kind: crate::symbol::ExternalKind::Intrinsic,
-                },
-                LoweredOp::Comment(_) | LoweredOp::None => {
-                    if let Some(dst) = op.dst() {
-                        self.var_ref(dst)
-                    } else {
-                        CExpr::External {
-                        name: "__unhandled_op__".to_string(),
-                        kind: crate::symbol::ExternalKind::Intrinsic,
-                    }
-                    }
-                }
+                }),
+                LoweredOp::Comment(_) | LoweredOp::None => None,
             };
         }
 
         match op {
             // These ops do not lower to statements but still need expression form.
-            SSAOp::CBranch { cond, .. } => self.get_condition_expr(cond),
-            SSAOp::Return { target } => self.get_return_expr(target),
-            _ => {
-                if let Some(dst) = op.dst() {
-                    self.var_ref(dst)
-                } else {
-                    CExpr::External {
-                        name: "__unhandled_op__".to_string(),
-                        kind: crate::symbol::ExternalKind::Intrinsic,
-                    }
-                }
+            SSAOp::CBranch { cond, .. } => {
+                Some(self.observed_input(frame, 1, self.get_condition_expr(cond)))
             }
+            SSAOp::Return { target } => {
+                Some(self.observed_input(frame, 0, self.get_return_expr(target)))
+            }
+            _ => None,
         }
     }
 
@@ -3385,13 +3371,14 @@ impl<'a> FoldingContext<'a> {
 
     fn ptr_arith_expr(
         &self,
+        frame: &LowerFrame,
         base: &SSAVar,
         index: &SSAVar,
         element_size: u32,
         is_sub: bool,
     ) -> CExpr {
-        let base_expr = self.get_expr(base);
-        let index_expr = self.get_expr(index);
+        let base_expr = self.observed_input(frame, 0, self.get_expr(base));
+        let index_expr = self.observed_input(frame, 1, self.get_expr(index));
         let scaled = if element_size <= 1 {
             index_expr
         } else {
@@ -12305,6 +12292,24 @@ impl<'a> FoldingContext<'a> {
                     )));
                     break;
                 }
+                let final_expr = block
+                    .ops
+                    .get(return_op_idx)
+                    .filter(|producer| producer.dst().is_some())
+                    .map_or(final_expr.clone(), |producer| {
+                        self.observe_normalized_computed_expr(
+                            producer,
+                            block.addr,
+                            return_op_idx,
+                            final_expr,
+                        )
+                    });
+                let final_expr = self.observe_normalized_input_expr(
+                    block.addr,
+                    op_idx,
+                    0,
+                    final_expr,
+                );
                 let return_stmt = CStmt::Return(Some(final_expr));
                 self.record_effect_render_proof_for_normalized_value(
                     EffectRenderProofKind::Return,
@@ -12357,7 +12362,7 @@ impl<'a> FoldingContext<'a> {
                     // value. Record the expression this statement would have
                     // carried, so the promise is kept from the same answer that
                     // made it rather than reconstructed later by another rule.
-                    let inlined = self.op_to_expr(op);
+                    let inlined = self.op_to_expr_at(op, block.addr, op_idx);
                     let rendered_inline =
                         !matches!(&inlined, CExpr::Var(id) if *self.spelling(*id) == *self.var_name(dst));
                     if rendered_inline {
@@ -12441,8 +12446,20 @@ impl<'a> FoldingContext<'a> {
                         last_ret_value_op_idx.unwrap_or(0)
                     )));
                 } else {
-                    let return_stmt = CStmt::Return(Some(final_expr));
                     if let Some(op_idx) = last_ret_value_op_idx {
+                        let final_expr = block
+                            .ops
+                            .get(op_idx)
+                            .filter(|producer| producer.dst().is_some())
+                            .map_or(final_expr.clone(), |producer| {
+                                self.observe_normalized_computed_expr(
+                                    producer,
+                                    block.addr,
+                                    op_idx,
+                                    final_expr,
+                                )
+                            });
+                        let return_stmt = CStmt::Return(Some(final_expr));
                         let value = certified_value.or_else(|| {
                             self.certified_return_for_normalized_op(block.addr, op_idx)
                                 .map(|cert| cert.value)
@@ -12455,7 +12472,7 @@ impl<'a> FoldingContext<'a> {
                         );
                         stmts.push(return_stmt);
                     } else {
-                        stmts.push(return_stmt);
+                        stmts.push(CStmt::Return(Some(final_expr)));
                     }
                 };
             }
@@ -12627,7 +12644,10 @@ impl<'a> FoldingContext<'a> {
         })
     }
 
-    fn op_to_stmt_impl(&self, op: &SSAOp) -> Option<CStmt> {
+    fn op_to_stmt_impl(&self, op: &SSAOp, frame: &LowerFrame) -> Option<CStmt> {
+        let input = |input_idx: usize, var: &SSAVar| {
+            self.observed_input(frame, input_idx, self.get_expr(var))
+        };
         match op {
             SSAOp::Copy { dst, src } => {
                 if self.is_carrier_self_copy(dst, src) {
@@ -12701,6 +12721,7 @@ impl<'a> FoldingContext<'a> {
                     rhs
                 };
                 let rhs = self.assignment_rhs_with_type_policy(dst, Some(src), rhs);
+                let rhs = self.observed_input(frame, 0, rhs);
                 self.assign_stmt(lhs, rhs)
             }
             SSAOp::Load { dst, addr, space } => {
@@ -12751,6 +12772,7 @@ impl<'a> FoldingContext<'a> {
                 } else {
                     rhs
                 };
+                let rhs = self.observed_input(frame, 0, rhs);
                 self.assign_stmt(lhs, rhs)
             }
             SSAOp::Store { addr, val, space } => {
@@ -12878,6 +12900,8 @@ impl<'a> FoldingContext<'a> {
                         value,
                     );
                 }
+                let lhs = self.observed_input(frame, 0, lhs);
+                let rhs = self.observed_input(frame, 1, rhs);
                 self.assign_stmt(lhs, rhs)
             }
             SSAOp::Fence { ordering } => Some(CStmt::Expr(CExpr::call(
@@ -12895,7 +12919,7 @@ impl<'a> FoldingContext<'a> {
                     self.name_ref(&"load_linked".to_string()),
                     vec![
                         CExpr::StringLit(space.to_string()),
-                        self.get_expr(addr),
+                        input(0, addr),
                         CExpr::StringLit(memory_ordering_name(ordering).to_string()),
                     ],
                 );
@@ -12912,8 +12936,8 @@ impl<'a> FoldingContext<'a> {
                     self.name_ref(&"store_conditional".to_string()),
                     vec![
                         CExpr::StringLit(space.to_string()),
-                        self.get_expr(addr),
-                        self.get_expr(val),
+                        input(0, addr),
+                        input(1, val),
                         CExpr::StringLit(memory_ordering_name(ordering).to_string()),
                     ],
                 );
@@ -12937,9 +12961,9 @@ impl<'a> FoldingContext<'a> {
                     self.name_ref(&"atomic_cas".to_string()),
                     vec![
                         CExpr::StringLit(space.to_string()),
-                        self.get_expr(addr),
-                        self.get_expr(expected),
-                        self.get_expr(replacement),
+                        input(0, addr),
+                        input(1, expected),
+                        input(2, replacement),
                         CExpr::StringLit(memory_ordering_name(ordering).to_string()),
                     ],
                 );
@@ -12957,8 +12981,8 @@ impl<'a> FoldingContext<'a> {
                     self.name_ref(&"load_guarded".to_string()),
                     vec![
                         CExpr::StringLit(space.to_string()),
-                        self.get_expr(addr),
-                        self.get_expr(guard),
+                        input(0, addr),
+                        input(1, guard),
                         CExpr::StringLit(memory_ordering_name(ordering).to_string()),
                     ],
                 );
@@ -12974,36 +12998,39 @@ impl<'a> FoldingContext<'a> {
                 self.name_ref(&"store_guarded".to_string()),
                 vec![
                     CExpr::StringLit(space.to_string()),
-                    self.get_expr(addr),
-                    self.get_expr(val),
-                    self.get_expr(guard),
+                    input(0, addr),
+                    input(1, val),
+                    input(2, guard),
                     CExpr::StringLit(memory_ordering_name(ordering).to_string()),
                 ],
             ))),
-            SSAOp::IntAdd { dst, a, b } => self.binary_stmt(dst, a, b, BinaryOp::Add),
-            SSAOp::IntSub { dst, a, b } => self.binary_stmt(dst, a, b, BinaryOp::Sub),
-            SSAOp::IntMult { dst, a, b } => self.binary_stmt(dst, a, b, BinaryOp::Mul),
+            SSAOp::IntAdd { dst, a, b } => self.binary_stmt(frame, dst, a, b, BinaryOp::Add),
+            SSAOp::IntSub { dst, a, b } => self.binary_stmt(frame, dst, a, b, BinaryOp::Sub),
+            SSAOp::IntMult { dst, a, b } => self.binary_stmt(frame, dst, a, b, BinaryOp::Mul),
             SSAOp::IntDiv { dst, a, b } => self.binary_stmt_typed(
+                frame,
                 dst,
                 a,
                 b,
                 BinaryOp::Div,
                 Some(uint_type_from_size(dst.size)),
             ),
-            SSAOp::IntSDiv { dst, a, b } => self.signed_divrem_stmt(dst, a, b, BinaryOp::Div),
+            SSAOp::IntSDiv { dst, a, b } => self.signed_divrem_stmt(frame, dst, a, b, BinaryOp::Div),
             SSAOp::IntRem { dst, a, b } => self.binary_stmt_typed(
+                frame,
                 dst,
                 a,
                 b,
                 BinaryOp::Mod,
                 Some(uint_type_from_size(dst.size)),
             ),
-            SSAOp::IntSRem { dst, a, b } => self.signed_divrem_stmt(dst, a, b, BinaryOp::Mod),
-            SSAOp::IntAnd { dst, a, b } => self.binary_stmt(dst, a, b, BinaryOp::BitAnd),
-            SSAOp::IntOr { dst, a, b } => self.binary_stmt(dst, a, b, BinaryOp::BitOr),
-            SSAOp::IntXor { dst, a, b } => self.binary_stmt(dst, a, b, BinaryOp::BitXor),
-            SSAOp::IntLeft { dst, a, b } => self.binary_stmt(dst, a, b, BinaryOp::Shl),
+            SSAOp::IntSRem { dst, a, b } => self.signed_divrem_stmt(frame, dst, a, b, BinaryOp::Mod),
+            SSAOp::IntAnd { dst, a, b } => self.binary_stmt(frame, dst, a, b, BinaryOp::BitAnd),
+            SSAOp::IntOr { dst, a, b } => self.binary_stmt(frame, dst, a, b, BinaryOp::BitOr),
+            SSAOp::IntXor { dst, a, b } => self.binary_stmt(frame, dst, a, b, BinaryOp::BitXor),
+            SSAOp::IntLeft { dst, a, b } => self.binary_stmt(frame, dst, a, b, BinaryOp::Shl),
             SSAOp::IntRight { dst, a, b } => self.binary_stmt_typed(
+                frame,
                 dst,
                 a,
                 b,
@@ -13011,9 +13038,10 @@ impl<'a> FoldingContext<'a> {
                 Some(uint_type_from_size(dst.size)),
             ),
             SSAOp::IntSRight { dst, a, b } => {
-                self.binary_stmt_typed(dst, a, b, BinaryOp::Shr, Some(type_from_size(dst.size)))
+                self.binary_stmt_typed(frame, dst, a, b, BinaryOp::Shr, Some(type_from_size(dst.size)))
             }
             SSAOp::IntLess { dst, a, b } => self.binary_stmt_typed(
+                frame,
                 dst,
                 a,
                 b,
@@ -13021,6 +13049,7 @@ impl<'a> FoldingContext<'a> {
                 Some(uint_type_from_size(a.size.max(b.size))),
             ),
             SSAOp::IntSLess { dst, a, b } => self.binary_stmt_typed(
+                frame,
                 dst,
                 a,
                 b,
@@ -13028,6 +13057,7 @@ impl<'a> FoldingContext<'a> {
                 Some(type_from_size(a.size.max(b.size))),
             ),
             SSAOp::IntLessEqual { dst, a, b } => self.binary_stmt_typed(
+                frame,
                 dst,
                 a,
                 b,
@@ -13035,32 +13065,33 @@ impl<'a> FoldingContext<'a> {
                 Some(uint_type_from_size(a.size.max(b.size))),
             ),
             SSAOp::IntSLessEqual { dst, a, b } => self.binary_stmt_typed(
+                frame,
                 dst,
                 a,
                 b,
                 BinaryOp::Le,
                 Some(type_from_size(a.size.max(b.size))),
             ),
-            SSAOp::IntEqual { dst, a, b } => self.binary_stmt(dst, a, b, BinaryOp::Eq),
-            SSAOp::IntNotEqual { dst, a, b } => self.binary_stmt(dst, a, b, BinaryOp::Ne),
+            SSAOp::IntEqual { dst, a, b } => self.binary_stmt(frame, dst, a, b, BinaryOp::Eq),
+            SSAOp::IntNotEqual { dst, a, b } => self.binary_stmt(frame, dst, a, b, BinaryOp::Ne),
             SSAOp::IntNegate { dst, src } => {
                 let lhs = self.assignment_lhs_expr(dst);
-                let rhs = CExpr::unary(UnaryOp::Neg, self.get_expr(src));
+                let rhs = CExpr::unary(UnaryOp::Neg, input(0, src));
                 self.assign_stmt(lhs, rhs)
             }
             SSAOp::IntNot { dst, src } => {
                 let lhs = self.assignment_lhs_expr(dst);
-                let rhs = CExpr::unary(UnaryOp::BitNot, self.get_expr(src));
+                let rhs = CExpr::unary(UnaryOp::BitNot, input(0, src));
                 self.assign_stmt(lhs, rhs)
             }
-            SSAOp::BoolAnd { dst, a, b } => self.boolean_stmt(dst, BinaryOp::And, a, b),
-            SSAOp::BoolOr { dst, a, b } => self.boolean_stmt(dst, BinaryOp::Or, a, b),
-            SSAOp::BoolXor { dst, a, b } => self.boolean_stmt(dst, BinaryOp::BitXor, a, b),
+            SSAOp::BoolAnd { dst, a, b } => self.boolean_stmt(frame, dst, BinaryOp::And, a, b),
+            SSAOp::BoolOr { dst, a, b } => self.boolean_stmt(frame, dst, BinaryOp::Or, a, b),
+            SSAOp::BoolXor { dst, a, b } => self.boolean_stmt(frame, dst, BinaryOp::BitXor, a, b),
             SSAOp::BoolNot { dst, src } => {
                 let lhs = self.assignment_lhs_expr(dst);
                 let rhs = self.resolve_predicate_rhs_for_var(
                     dst,
-                    CExpr::unary(UnaryOp::Not, self.get_expr(src)),
+                    CExpr::unary(UnaryOp::Not, input(0, src)),
                 );
                 self.assign_stmt(lhs, rhs)
             }
@@ -13068,22 +13099,22 @@ impl<'a> FoldingContext<'a> {
                 let lhs = self.assignment_lhs_expr(dst);
                 let ty = type_from_size(dst.size);
                 let rhs =
-                    self.resolve_predicate_rhs_for_var(dst, CExpr::cast(ty, self.get_expr(src)));
+                    self.resolve_predicate_rhs_for_var(dst, CExpr::cast(ty, input(0, src)));
                 self.assign_stmt(lhs, rhs)
             }
             SSAOp::Trunc { dst, src } => {
                 let lhs = self.assignment_lhs_expr(dst);
                 let ty = type_from_size(dst.size);
                 let rhs =
-                    self.resolve_predicate_rhs_for_var(dst, CExpr::cast(ty, self.get_expr(src)));
+                    self.resolve_predicate_rhs_for_var(dst, CExpr::cast(ty, input(0, src)));
                 self.assign_stmt(lhs, rhs)
             }
             SSAOp::Piece { dst, hi, lo } => {
                 let lhs = self.assignment_lhs_expr(dst);
                 let shift_bits = lo.size.saturating_mul(8);
                 let dst_ty = uint_type_from_size(dst.size);
-                let hi_cast = CExpr::cast(dst_ty.clone(), self.get_expr(hi));
-                let lo_cast = CExpr::cast(dst_ty.clone(), self.get_expr(lo));
+                let hi_cast = CExpr::cast(dst_ty.clone(), input(0, hi));
+                let lo_cast = CExpr::cast(dst_ty.clone(), input(1, lo));
                 let shifted = if shift_bits == 0 {
                     hi_cast
                 } else {
@@ -13094,7 +13125,7 @@ impl<'a> FoldingContext<'a> {
             }
             SSAOp::Subpiece { dst, src, offset } => {
                 let lhs = self.assignment_lhs_expr(dst);
-                let src_expr = self.get_expr(src);
+                let src_expr = input(0, src);
                 let rhs = if *offset == 0 && dst.size == src.size {
                     src_expr
                 } else if *offset == 0
@@ -13112,62 +13143,62 @@ impl<'a> FoldingContext<'a> {
                 };
                 self.assign_stmt(lhs, rhs)
             }
-            SSAOp::FloatAdd { dst, a, b } => self.binary_stmt(dst, a, b, BinaryOp::Add),
-            SSAOp::FloatSub { dst, a, b } => self.binary_stmt(dst, a, b, BinaryOp::Sub),
-            SSAOp::FloatMult { dst, a, b } => self.binary_stmt(dst, a, b, BinaryOp::Mul),
-            SSAOp::FloatDiv { dst, a, b } => self.binary_stmt(dst, a, b, BinaryOp::Div),
+            SSAOp::FloatAdd { dst, a, b } => self.binary_stmt(frame, dst, a, b, BinaryOp::Add),
+            SSAOp::FloatSub { dst, a, b } => self.binary_stmt(frame, dst, a, b, BinaryOp::Sub),
+            SSAOp::FloatMult { dst, a, b } => self.binary_stmt(frame, dst, a, b, BinaryOp::Mul),
+            SSAOp::FloatDiv { dst, a, b } => self.binary_stmt(frame, dst, a, b, BinaryOp::Div),
             SSAOp::FloatNeg { dst, src } => {
                 let lhs = self.assignment_lhs_expr(dst);
-                let rhs = CExpr::unary(UnaryOp::Neg, self.get_expr(src));
+                let rhs = CExpr::unary(UnaryOp::Neg, input(0, src));
                 self.assign_stmt(lhs, rhs)
             }
             SSAOp::FloatAbs { dst, src } => {
                 let lhs = self.assignment_lhs_expr(dst);
-                let rhs = CExpr::call(self.name_ref(&"fabs".to_string()), vec![self.get_expr(src)]);
+                let rhs = CExpr::call(self.name_ref(&"fabs".to_string()), vec![input(0, src)]);
                 self.assign_stmt(lhs, rhs)
             }
             SSAOp::FloatSqrt { dst, src } => {
                 let lhs = self.assignment_lhs_expr(dst);
-                let rhs = CExpr::call(self.name_ref(&"sqrt".to_string()), vec![self.get_expr(src)]);
+                let rhs = CExpr::call(self.name_ref(&"sqrt".to_string()), vec![input(0, src)]);
                 self.assign_stmt(lhs, rhs)
             }
             SSAOp::FloatCeil { dst, src } => {
                 let lhs = self.assignment_lhs_expr(dst);
-                let rhs = CExpr::call(self.name_ref(&"ceil".to_string()), vec![self.get_expr(src)]);
+                let rhs = CExpr::call(self.name_ref(&"ceil".to_string()), vec![input(0, src)]);
                 self.assign_stmt(lhs, rhs)
             }
             SSAOp::FloatFloor { dst, src } => {
                 let lhs = self.assignment_lhs_expr(dst);
-                let rhs = CExpr::call(self.name_ref(&"floor".to_string()), vec![self.get_expr(src)]);
+                let rhs = CExpr::call(self.name_ref(&"floor".to_string()), vec![input(0, src)]);
                 self.assign_stmt(lhs, rhs)
             }
             SSAOp::FloatRound { dst, src } => {
                 let lhs = self.assignment_lhs_expr(dst);
-                let rhs = CExpr::call(self.name_ref(&"round".to_string()), vec![self.get_expr(src)]);
+                let rhs = CExpr::call(self.name_ref(&"round".to_string()), vec![input(0, src)]);
                 self.assign_stmt(lhs, rhs)
             }
             SSAOp::FloatNaN { dst, src } => {
                 let lhs = self.assignment_lhs_expr(dst);
-                let rhs = CExpr::call(self.name_ref(&"isnan".to_string()), vec![self.get_expr(src)]);
+                let rhs = CExpr::call(self.name_ref(&"isnan".to_string()), vec![input(0, src)]);
                 self.assign_stmt(lhs, rhs)
             }
-            SSAOp::FloatLess { dst, a, b } => self.binary_stmt(dst, a, b, BinaryOp::Lt),
-            SSAOp::FloatLessEqual { dst, a, b } => self.binary_stmt(dst, a, b, BinaryOp::Le),
-            SSAOp::FloatEqual { dst, a, b } => self.binary_stmt(dst, a, b, BinaryOp::Eq),
-            SSAOp::FloatNotEqual { dst, a, b } => self.binary_stmt(dst, a, b, BinaryOp::Ne),
+            SSAOp::FloatLess { dst, a, b } => self.binary_stmt(frame, dst, a, b, BinaryOp::Lt),
+            SSAOp::FloatLessEqual { dst, a, b } => self.binary_stmt(frame, dst, a, b, BinaryOp::Le),
+            SSAOp::FloatEqual { dst, a, b } => self.binary_stmt(frame, dst, a, b, BinaryOp::Eq),
+            SSAOp::FloatNotEqual { dst, a, b } => self.binary_stmt(frame, dst, a, b, BinaryOp::Ne),
             SSAOp::Int2Float { dst, src } => {
                 let lhs = self.assignment_lhs_expr(dst);
-                let rhs = CExpr::cast(CType::Float(dst.size), self.get_expr(src));
+                let rhs = CExpr::cast(CType::Float(dst.size), input(0, src));
                 self.assign_stmt(lhs, rhs)
             }
             SSAOp::Float2Int { dst, src } => {
                 let lhs = self.assignment_lhs_expr(dst);
-                let rhs = CExpr::cast(type_from_size(dst.size), self.get_expr(src));
+                let rhs = CExpr::cast(type_from_size(dst.size), input(0, src));
                 self.assign_stmt(lhs, rhs)
             }
             SSAOp::FloatFloat { dst, src } => {
                 let lhs = self.assignment_lhs_expr(dst);
-                let rhs = CExpr::cast(CType::Float(dst.size), self.get_expr(src));
+                let rhs = CExpr::cast(CType::Float(dst.size), input(0, src));
                 self.assign_stmt(lhs, rhs)
             }
             SSAOp::Call { target } => {
@@ -13179,6 +13210,7 @@ impl<'a> FoldingContext<'a> {
                     }
                     _ => self.resolve_call_target(target),
                 };
+                let func_expr = self.observed_input(frame, 0, func_expr);
                 let call = CExpr::call(func_expr, vec![]);
                 Some(CStmt::Expr(call))
             }
@@ -13189,8 +13221,9 @@ impl<'a> FoldingContext<'a> {
                     (Some(block_addr), Some(op_idx)) => self
                         .resolved_callee_identity_expr_for_site(block_addr, op_idx)
                         .unwrap_or_else(|| CExpr::Deref(Box::new(self.get_expr(target)))),
-                    _ => CExpr::Deref(Box::new(self.get_expr(target))),
+                    _ => CExpr::Deref(Box::new(input(0, target))),
                 };
+                let func_expr = self.observed_input(frame, 0, func_expr);
                 let call = CExpr::call(func_expr, vec![]);
                 Some(CStmt::Expr(call))
             }
@@ -13201,8 +13234,8 @@ impl<'a> FoldingContext<'a> {
             } => {
                 let mut args = Vec::with_capacity(inputs.len() + 1);
                 args.push(CExpr::StringLit(format!("userop_{}", userop)));
-                for input in inputs {
-                    args.push(self.get_expr(input));
+                for (input_idx, input_var) in inputs.iter().enumerate() {
+                    args.push(input(input_idx, input_var));
                 }
                 let call = CExpr::call(CExpr::External {
                     name: "callother".to_string(),
@@ -13233,7 +13266,7 @@ impl<'a> FoldingContext<'a> {
                 element_size,
             } => {
                 let lhs = self.assignment_lhs_expr(dst);
-                let rhs = self.ptr_arith_expr(base, index, *element_size, false);
+                let rhs = self.ptr_arith_expr(frame, base, index, *element_size, false);
                 self.assign_stmt(lhs, rhs)
             }
             SSAOp::PtrSub {
@@ -13243,14 +13276,14 @@ impl<'a> FoldingContext<'a> {
                 element_size,
             } => {
                 let lhs = self.assignment_lhs_expr(dst);
-                let rhs = self.ptr_arith_expr(base, index, *element_size, true);
+                let rhs = self.ptr_arith_expr(frame, base, index, *element_size, true);
                 self.assign_stmt(lhs, rhs)
             }
             SSAOp::Cast { dst, src } => {
                 let lhs = self.assignment_lhs_expr(dst);
                 let rhs = self.resolve_predicate_rhs_for_var(
                     dst,
-                    CExpr::cast(type_from_size(dst.size), self.get_expr(src)),
+                    CExpr::cast(type_from_size(dst.size), input(0, src)),
                 );
                 self.assign_stmt(lhs, rhs)
             }
@@ -13263,19 +13296,23 @@ impl<'a> FoldingContext<'a> {
                 let lhs = self.assignment_lhs_expr(dst);
                 let certified = |_var: &SSAVar| -> Option<CExpr> { None };
                 let rhs = CExpr::Ternary {
-                    cond: Box::new(certified(cond).unwrap_or_else(|| self.get_expr(cond))),
+                    cond: Box::new(certified(cond).unwrap_or_else(|| input(0, cond))),
                     then_expr: Box::new(
-                        certified(if_true).unwrap_or_else(|| self.get_expr(if_true)),
+                        certified(if_true).unwrap_or_else(|| input(1, if_true)),
                     ),
                     else_expr: Box::new(
-                        certified(if_false).unwrap_or_else(|| self.get_expr(if_false)),
+                        certified(if_false).unwrap_or_else(|| input(2, if_false)),
                     ),
                 };
                 let rhs = self.assignment_rhs_with_type_policy(dst, None, rhs);
                 self.assign_stmt(lhs, rhs)
             }
             SSAOp::Return { target } => Some(CStmt::Return(Some(
-                self.rewrite_stack_expr(self.get_return_expr(target)),
+                self.observed_input(
+                    frame,
+                    0,
+                    self.rewrite_stack_expr(self.get_return_expr(target)),
+                ),
             ))),
             SSAOp::Branch { .. } | SSAOp::CBranch { .. } => {
                 // Handled by control flow structuring
@@ -13292,12 +13329,20 @@ impl<'a> FoldingContext<'a> {
     }
 
     /// Create a binary operation statement.
-    fn binary_stmt(&self, dst: &SSAVar, a: &SSAVar, b: &SSAVar, op: BinaryOp) -> Option<CStmt> {
-        self.binary_stmt_typed(dst, a, b, op, None)
+    fn binary_stmt(
+        &self,
+        frame: &LowerFrame,
+        dst: &SSAVar,
+        a: &SSAVar,
+        b: &SSAVar,
+        op: BinaryOp,
+    ) -> Option<CStmt> {
+        self.binary_stmt_typed(frame, dst, a, b, op, None)
     }
 
     fn binary_stmt_typed(
         &self,
+        frame: &LowerFrame,
         dst: &SSAVar,
         a: &SSAVar,
         b: &SSAVar,
@@ -13326,11 +13371,13 @@ impl<'a> FoldingContext<'a> {
                 })
                 .or_else(|| self.synthesized_call_expr_for_source_call(left_source))
         {
+            let call_expr = self.observed_input(frame, 0, call_expr);
+            let call_expr = self.observed_input(frame, 1, call_expr);
             let rhs = self.assignment_rhs_with_type_policy(dst, None, call_expr);
             return self.assign_stmt(lhs, rhs);
         }
-        let mut lhs_expr = self.get_expr(a);
-        let mut rhs_expr = self.get_expr(b);
+        let mut lhs_expr = self.observed_input(frame, 0, self.get_expr(a));
+        let mut rhs_expr = self.observed_input(frame, 1, self.get_expr(b));
         if let Some(ty) = operand_ty {
             let a_hint = self.type_hint_for_var(a);
             let b_hint = self.type_hint_for_var(b);
@@ -13361,6 +13408,7 @@ impl<'a> FoldingContext<'a> {
 
     fn signed_divrem_stmt(
         &self,
+        frame: &LowerFrame,
         dst: &SSAVar,
         dividend: &SSAVar,
         divisor: &SSAVar,
@@ -13369,6 +13417,7 @@ impl<'a> FoldingContext<'a> {
         let lhs = self.assignment_lhs_expr(dst);
         let Some(rhs) = self.signed_divrem_expr(dividend, divisor, op) else {
             return self.binary_stmt_typed(
+                frame,
                 dst,
                 dividend,
                 divisor,
@@ -13376,6 +13425,8 @@ impl<'a> FoldingContext<'a> {
                 Some(type_from_size(dst.size)),
             );
         };
+        let rhs = self.observed_input(frame, 0, rhs);
+        let rhs = self.observed_input(frame, 1, rhs);
         let rhs = self.assignment_rhs_with_type_policy(dst, None, rhs);
         self.assign_stmt(lhs, rhs)
     }
@@ -13476,11 +13527,22 @@ impl<'a> FoldingContext<'a> {
         }
     }
 
-    fn boolean_stmt(&self, dst: &SSAVar, op: BinaryOp, a: &SSAVar, b: &SSAVar) -> Option<CStmt> {
+    fn boolean_stmt(
+        &self,
+        frame: &LowerFrame,
+        dst: &SSAVar,
+        op: BinaryOp,
+        a: &SSAVar,
+        b: &SSAVar,
+    ) -> Option<CStmt> {
         let lhs = self.assignment_lhs_expr(dst);
         let rhs = self.resolve_predicate_rhs_for_var(
             dst,
-            CExpr::binary(op, self.get_expr(a), self.get_expr(b)),
+            CExpr::binary(
+                op,
+                self.observed_input(frame, 0, self.get_expr(a)),
+                self.observed_input(frame, 1, self.get_expr(b)),
+            ),
         );
         self.assign_stmt(lhs, rhs)
     }
@@ -13492,13 +13554,14 @@ fn callother_ids_share_effect_and_result_lowering() {
     let ctx = FoldingContext::new(64);
     let input = SSAVar::new("X30", 0, 8);
     let output = SSAVar::new("X30", 1, 8);
+    let frame = LowerFrame::for_expr();
 
     for userop in [7, 0x7fff_ffff, 0x8000_0000, u32::MAX] {
         let stmt = ctx.op_to_stmt_impl(&SSAOp::CallOther {
             output: Some(output.clone()),
             userop,
             inputs: vec![input.clone()],
-        });
+        }, &frame);
         assert_eq!(
             stmt,
             Some(CStmt::Expr(CExpr::assign(
@@ -13523,7 +13586,7 @@ fn callother_ids_share_effect_and_result_lowering() {
         output: None,
         userop: effect_userop,
         inputs: vec![input],
-    });
+    }, &frame);
     assert_eq!(
         stmt,
         Some(CStmt::Expr(CExpr::call(

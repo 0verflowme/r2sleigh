@@ -517,8 +517,10 @@ enum LowerMode {
 #[derive(Debug, Clone, Copy)]
 struct LowerFrame {
     mode: LowerMode,
-    block_addr: u64,
-    op_idx: usize,
+    /// Exact normalized operation used only for render-observation identity.
+    normalized_site: Option<crate::normalize::NormalizedOpSite>,
+    /// Original source operation used only for callsite/type/render facts.
+    source_call_site: Option<(u64, usize)>,
     with_call_args: bool,
 }
 
@@ -772,17 +774,33 @@ impl LowerFrame {
     fn for_expr() -> Self {
         Self {
             mode: LowerMode::Expr,
-            block_addr: 0,
-            op_idx: 0,
+            normalized_site: None,
+            source_call_site: None,
             with_call_args: false,
         }
     }
 
-    fn for_stmt(block_addr: u64, op_idx: usize, with_call_args: bool) -> Self {
+    fn for_expr_at(
+        normalized_site: Option<crate::normalize::NormalizedOpSite>,
+        source_call_site: Option<(u64, usize)>,
+    ) -> Self {
+        Self {
+            mode: LowerMode::Expr,
+            normalized_site,
+            source_call_site,
+            with_call_args: false,
+        }
+    }
+
+    fn for_stmt(
+        normalized_site: Option<crate::normalize::NormalizedOpSite>,
+        source_call_site: Option<(u64, usize)>,
+        with_call_args: bool,
+    ) -> Self {
         Self {
             mode: LowerMode::Stmt,
-            block_addr,
-            op_idx,
+            normalized_site,
+            source_call_site,
             with_call_args,
         }
     }

@@ -23,6 +23,8 @@ use crate::analysis::utils::{
     is_temporary_constant_or_memory_name, is_temporary_or_memory_name, parse_const_value,
 };
 use crate::ast::{BinaryOp, CExpr, UnaryOp};
+use crate::binding_plan::ValueDisposition;
+use crate::symbol::SymbolId;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StackAliasView {
@@ -93,6 +95,37 @@ pub(crate) struct PreparedSemanticViewInputs<'a> {
 pub(crate) enum PreparedSemanticViewBuildError {
     SourceAuthorityMismatch,
     SymbolTableMismatch,
+}
+
+/// Exact planned naming answer for one source SSA value.
+///
+/// `Absent` alone permits the legacy test/compatibility spelling path. The
+/// other non-bound variants are authoritative answers from the sealed plan and
+/// must never be converted into a variable by a name-based fallback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PlannedValueName {
+    Bound(SymbolId),
+    Inline,
+    Elided,
+    Refused,
+    Absent,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PlannedVariableUse {
+    Exact(SymbolId),
+    Refuse,
+    Legacy,
+}
+
+impl PlannedValueName {
+    const fn variable_use(self) -> PlannedVariableUse {
+        match self {
+            Self::Bound(symbol) => PlannedVariableUse::Exact(symbol),
+            Self::Inline | Self::Elided | Self::Refused => PlannedVariableUse::Refuse,
+            Self::Absent => PlannedVariableUse::Legacy,
+        }
+    }
 }
 
 impl<'a> PreparedSemanticViewInputs<'a> {
@@ -242,6 +275,28 @@ impl PreparedSemanticView {
 
     pub(crate) fn value_id_for_var(&self, var: &SSAVar) -> Option<ValueId> {
         self.value_id_by_var.get(var).copied()
+    }
+
+    fn planned_name_for_value(&self, value: ValueId) -> PlannedValueName {
+        let Some(names) = self.binding_names.as_ref() else {
+            return PlannedValueName::Absent;
+        };
+        match names.disposition_for_value(value) {
+            Some(ValueDisposition::Bound { binding }) => names
+                .symbol_for_binding(*binding)
+                .map_or(PlannedValueName::Refused, PlannedValueName::Bound),
+            Some(ValueDisposition::Inline { .. }) => PlannedValueName::Inline,
+            Some(ValueDisposition::Elided { .. }) => PlannedValueName::Elided,
+            Some(ValueDisposition::Refused { .. }) => PlannedValueName::Refused,
+            None => PlannedValueName::Absent,
+        }
+    }
+
+    fn planned_name_for_var(&self, var: &SSAVar) -> PlannedValueName {
+        self.value_id_for_var(var)
+            .map_or(PlannedValueName::Absent, |value| {
+                self.planned_name_for_value(value)
+            })
     }
 
     pub(crate) fn var_for_value_id(&self, value_id: ValueId) -> Option<&SSAVar> {
@@ -1575,8 +1630,24 @@ fn populate_predicates(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
             continue;
         };
         let compare_width = lhs_var.size.max(rhs_var.size);
-        let lhs = expr_for_compare_operand_with_width(symbols, inputs, lhs_var.clone(), view, compare_width);
-        let rhs = expr_for_compare_operand_with_width(symbols, inputs, rhs_var.clone(), view, compare_width);
+        let Some(lhs) = expr_for_compare_operand_with_width(
+            symbols,
+            inputs,
+            lhs_var.clone(),
+            view,
+            compare_width,
+        ) else {
+            continue;
+        };
+        let Some(rhs) = expr_for_compare_operand_with_width(
+            symbols,
+            inputs,
+            rhs_var.clone(),
+            view,
+            compare_width,
+        ) else {
+            continue;
+        };
         let expr = CExpr::binary(binary_op_for_compare(compare.kind), lhs, rhs);
         let Some(cond_var) = prepared_var(inputs.prepared, predicate.condition) else {
             continue;
@@ -1692,8 +1763,10 @@ fn compare_expr_for_sources(symbols: &std::cell::RefCell<crate::symbol::SymbolTa
     }
 
     let compare_width = lhs.size.max(rhs.size);
-    let lhs = expr_for_compare_operand_with_width(symbols, inputs, lhs.clone(), view, compare_width);
-    let rhs = expr_for_compare_operand_with_width(symbols, inputs, rhs.clone(), view, compare_width);
+    let lhs =
+        expr_for_compare_operand_with_width(symbols, inputs, lhs.clone(), view, compare_width)?;
+    let rhs =
+        expr_for_compare_operand_with_width(symbols, inputs, rhs.clone(), view, compare_width)?;
     Some(CExpr::binary(op, lhs, rhs))
 }
 
@@ -1746,12 +1819,25 @@ fn reconstruct_zero_compare_from_nonzero_def(symbols: &std::cell::RefCell<crate:
         }
         SSAOp::IntSub { a, b, .. } => {
             let compare_width = a.size.max(b.size);
-            let lhs = expr_for_compare_operand_with_width(symbols, inputs, a.clone(), view, compare_width);
-            let rhs = expr_for_compare_operand_with_width(symbols, inputs, b.clone(), view, compare_width);
+            let lhs = expr_for_compare_operand_with_width(
+                symbols,
+                inputs,
+                a.clone(),
+                view,
+                compare_width,
+            )?;
+            let rhs = expr_for_compare_operand_with_width(
+                symbols,
+                inputs,
+                b.clone(),
+                view,
+                compare_width,
+            )?;
             Some(CExpr::binary(op, lhs, rhs))
         }
         SSAOp::IntAnd { a, b, .. } if a == b => {
-            let lhs = expr_for_compare_operand_with_width(symbols, inputs, a.clone(), view, a.size);
+            let lhs =
+                expr_for_compare_operand_with_width(symbols, inputs, a.clone(), view, a.size)?;
             Some(CExpr::binary(op, lhs, CExpr::IntLit(0)))
         }
         _ => None,
@@ -1785,19 +1871,34 @@ fn predicate_expr_for_operand_with_depth(
         return None;
     }
 
-    if let Some(expr) = view.predicate_expr_for_cond(var).cloned() {
-        return Some(expr);
+    match view.planned_name_for_var(var) {
+        PlannedValueName::Bound(symbol) => return Some(CExpr::Var(symbol)),
+        PlannedValueName::Inline if var.is_const() => return Some(compare_const_to_expr(var)),
+        PlannedValueName::Inline | PlannedValueName::Elided | PlannedValueName::Refused => {
+            return None;
+        }
+        PlannedValueName::Absent => {}
     }
     if var.is_const() {
         return Some(compare_const_to_expr(var));
+    }
+    if let Some(expr) = view.predicate_expr_for_cond(var).cloned() {
+        return Some(expr);
     }
     if is_flag_name(symbols, &var.name) {
         if let Some(expr) = compare_def_expr_for_flag_operand(symbols, view, inputs, var, depth + 1) {
             return Some(expr);
         }
-        return Some(crate::symbol::var_ref(symbols, crate::naming::spell_var(var, view)));
+        return match view.planned_name_for_var(var).variable_use() {
+            PlannedVariableUse::Exact(symbol) => Some(CExpr::Var(symbol)),
+            PlannedVariableUse::Refuse => None,
+            PlannedVariableUse::Legacy => Some(crate::symbol::var_ref(
+                symbols,
+                crate::naming::spell_var(var, view),
+            )),
+        };
     }
-    let expr = expr_for_compare_operand(symbols, inputs, var.clone(), view);
+    let expr = expr_for_compare_operand(symbols, inputs, var.clone(), view)?;
     (!matches!(expr, CExpr::Var(ref name) if &*crate::symbol::spelling(symbols, *name) == &var.display_name())).then_some(expr)
 }
 
@@ -1871,10 +1972,11 @@ fn populate_switches(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, v
         if let Some(selector_value) = switch.selector
             && let Some(selector) = prepared_var(inputs.prepared, selector_value).cloned()
         {
-            let expr = expr_for_compare_operand(symbols, inputs, selector, view);
-            view.switch_selector_value_by_block
-                .insert(*block_addr, selector_value);
-            view.switch_selector_expr_by_block.insert(*block_addr, expr);
+            if let Some(expr) = expr_for_compare_operand(symbols, inputs, selector, view) {
+                view.switch_selector_value_by_block
+                    .insert(*block_addr, selector_value);
+                view.switch_selector_expr_by_block.insert(*block_addr, expr);
+            }
         }
     }
 }
@@ -2030,10 +2132,26 @@ fn authoritative_expr_for_prepared_value(symbols: &std::cell::RefCell<crate::sym
     value: ValueId,
 ) -> Option<CExpr> {
     let var = prepared.value_var(value)?;
+    match view.planned_name_for_value(value) {
+        PlannedValueName::Bound(symbol) => return Some(CExpr::Var(symbol)),
+        PlannedValueName::Inline if var.is_const() => {
+            return compare_style_operand_expr(var, var.size);
+        }
+        PlannedValueName::Inline | PlannedValueName::Elided | PlannedValueName::Refused => {
+            return None;
+        }
+        PlannedValueName::Absent => {}
+    }
     authoritative_scalar_expr_for_value(symbols, block, view, var, 0)
         .or_else(|| scalar_owner_expr_for_value(symbols, view, var, var.size))
         .or_else(|| view.owner_expr_for_var(var).cloned())
-        .or_else(|| Some(crate::symbol::var_ref(symbols, crate::naming::spell_var(var, view))))
+        .or_else(|| match view.planned_name_for_value(value).variable_use() {
+            PlannedVariableUse::Legacy => Some(crate::symbol::var_ref(
+                symbols,
+                crate::naming::spell_var(var, view),
+            )),
+            PlannedVariableUse::Exact(_) | PlannedVariableUse::Refuse => None,
+        })
 }
 
 fn prepared_call_max_arity(
@@ -2056,6 +2174,16 @@ fn authoritative_scalar_expr_for_value(symbols: &std::cell::RefCell<crate::symbo
         return None;
     }
 
+    match view.planned_name_for_var(var) {
+        PlannedValueName::Bound(symbol) => return Some(CExpr::Var(symbol)),
+        PlannedValueName::Inline if var.is_const() => {
+            return compare_style_operand_expr(var, var.size);
+        }
+        PlannedValueName::Inline | PlannedValueName::Elided | PlannedValueName::Refused => {
+            return None;
+        }
+        PlannedValueName::Absent => {}
+    }
     if let Some(expr) = compare_style_operand_expr(var, var.size) {
         return Some(expr);
     }
@@ -2176,7 +2304,12 @@ fn certified_call_result_owner_expr(symbols: &std::cell::RefCell<crate::symbol::
         }
         Some(ValueOwner::Value(value)) if *value != cert.value => {
             let var = prepared.value_var(*value)?;
-            (!var.is_register()).then(|| crate::symbol::var_ref(symbols, crate::naming::spell_var(var, view)))
+            match view.planned_name_for_value(*value).variable_use() {
+                PlannedVariableUse::Exact(symbol) => Some(CExpr::Var(symbol)),
+                PlannedVariableUse::Refuse => None,
+                PlannedVariableUse::Legacy => (!var.is_register())
+                    .then(|| crate::symbol::var_ref(symbols, crate::naming::spell_var(var, view))),
+            }
         }
         Some(ValueOwner::StackSlot { .. }) | Some(ValueOwner::Value(_)) | None => None,
     }
@@ -2300,9 +2433,15 @@ fn stack_offset_for_object_kind(kind: &ObjectKind) -> Option<i64> {
 
 fn prepared_stack_reload_param_alias_expr(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
     prepared: &SsaArtifact,
+    view: &PreparedSemanticView,
     env: &PassEnv<'_>,
     value_id: ValueId,
 ) -> Option<CExpr> {
+    match view.planned_name_for_value(value_id).variable_use() {
+        PlannedVariableUse::Exact(symbol) => return Some(CExpr::Var(symbol)),
+        PlannedVariableUse::Refuse => return None,
+        PlannedVariableUse::Legacy => {}
+    }
     let cert = prepared.stack_reload_certificate_for_value(value_id)?;
     if prepared
         .objects()
@@ -2322,7 +2461,7 @@ fn expr_for_compare_operand(symbols: &std::cell::RefCell<crate::symbol::SymbolTa
     inputs: &PreparedSemanticViewInputs<'_>,
     var: SSAVar,
     view: &PreparedSemanticView,
-) -> CExpr {
+) -> Option<CExpr> {
     expr_for_compare_operand_with_width(symbols, inputs, var, view, 0)
 }
 
@@ -2331,9 +2470,19 @@ fn expr_for_compare_operand_with_width(symbols: &std::cell::RefCell<crate::symbo
     var: SSAVar,
     view: &PreparedSemanticView,
     compare_width: u32,
-) -> CExpr {
+) -> Option<CExpr> {
+    match view.planned_name_for_var(&var) {
+        PlannedValueName::Bound(symbol) => return Some(CExpr::Var(symbol)),
+        PlannedValueName::Inline if var.is_const() => {
+            return compare_style_operand_expr(&var, compare_width);
+        }
+        PlannedValueName::Inline | PlannedValueName::Elided | PlannedValueName::Refused => {
+            return None;
+        }
+        PlannedValueName::Absent => {}
+    }
     if let Some(expr) = compare_style_operand_expr(&var, compare_width) {
-        return expr;
+        return Some(expr);
     }
 
     let root = inputs
@@ -2343,14 +2492,24 @@ fn expr_for_compare_operand_with_width(symbols: &std::cell::RefCell<crate::symbo
         .and_then(|facts| facts.canonical_root_of(&var))
         .cloned()
         .unwrap_or_else(|| var.clone());
+    match view.planned_name_for_var(&root) {
+        PlannedValueName::Bound(symbol) => return Some(CExpr::Var(symbol)),
+        PlannedValueName::Inline if root.is_const() => {
+            return compare_style_operand_expr(&root, compare_width);
+        }
+        PlannedValueName::Inline | PlannedValueName::Elided | PlannedValueName::Refused => {
+            return None;
+        }
+        PlannedValueName::Absent => {}
+    }
     if let Some(expr) = compare_style_operand_expr(&root, compare_width) {
-        return expr;
+        return Some(expr);
     }
 
     if let Some(alias) = param_alias_for_var(inputs.param_register_aliases, &root)
         .or_else(|| param_alias_for_var(inputs.param_register_aliases, &var))
     {
-        return crate::symbol::var_ref(symbols, alias);
+        return Some(crate::symbol::var_ref(symbols, alias));
     }
 
     if let Some(expr) = non_generic_prepared_owner_expr(symbols, view, &var)
@@ -2358,39 +2517,42 @@ fn expr_for_compare_operand_with_width(symbols: &std::cell::RefCell<crate::symbo
         .or_else(|| non_generic_prepared_owner_expr(symbols, view, &root))
         .or_else(|| non_generic_prepared_predicate_expr(symbols, view, &root))
     {
-        return expr;
+        return Some(expr);
     }
 
     if let Some(alias) = preferred_non_generic_stack_alias(view, &var)
         .or_else(|| preferred_non_generic_stack_alias(view, &root))
     {
-        return crate::symbol::var_ref(symbols, alias);
+        return Some(crate::symbol::var_ref(symbols, alias));
     }
 
     if let Some(expr) =
         generic_prepared_owner_expr(view, &var).or_else(|| generic_prepared_owner_expr(view, &root))
     {
-        return expr;
+        return Some(expr);
     }
 
     if let Some(offset) = view.stack_offset_for_var(&var)
         && let Some(alias) = preferred_stack_alias_name(view, offset)
     {
-        return crate::symbol::var_ref(symbols, alias);
+        return Some(crate::symbol::var_ref(symbols, alias));
     }
     if let Some(offset) = view.stack_offset_for_var(&root)
         && let Some(alias) = preferred_stack_alias_name(view, offset)
     {
-        return crate::symbol::var_ref(symbols, alias);
+        return Some(crate::symbol::var_ref(symbols, alias));
     }
 
-    if let Some(expr) =
-        prepared_fallback_visible_expr(symbols, view, &root).or_else(|| prepared_fallback_visible_expr(symbols, view, &var))
+    if let Some(expr) = prepared_fallback_visible_expr(symbols, view, &root)
+        .or_else(|| prepared_fallback_visible_expr(symbols, view, &var))
     {
-        return expr;
+        return Some(expr);
     }
 
-    crate::symbol::var_ref(symbols, crate::naming::spell_var(&var, view))
+    Some(crate::symbol::var_ref(
+        symbols,
+        crate::naming::spell_var(&var, view),
+    ))
 }
 
 fn compare_style_operand_expr(var: &SSAVar, compare_width: u32) -> Option<CExpr> {
@@ -2481,9 +2643,23 @@ fn scalar_owner_expr_for_value(symbols: &std::cell::RefCell<crate::symbol::Symbo
     var: &SSAVar,
     compare_width: u32,
 ) -> Option<CExpr> {
-    compare_style_operand_expr(var, compare_width)
-        .or_else(|| prepared_param_alias_for_var(view, var).map(|n| crate::symbol::var_ref(symbols, n)))
-        .or_else(|| non_generic_prepared_predicate_expr(symbols, view, var))
+    match view.planned_name_for_var(var) {
+        PlannedValueName::Bound(symbol) => return Some(CExpr::Var(symbol)),
+        PlannedValueName::Inline if var.is_const() => {
+            return compare_style_operand_expr(var, compare_width);
+        }
+        PlannedValueName::Inline | PlannedValueName::Elided | PlannedValueName::Refused => {
+            return None;
+        }
+        PlannedValueName::Absent => {}
+    }
+    if let Some(expr) = compare_style_operand_expr(var, compare_width) {
+        return Some(expr);
+    }
+    if let Some(alias) = prepared_param_alias_for_var(view, var) {
+        return Some(crate::symbol::var_ref(symbols, alias));
+    }
+    non_generic_prepared_predicate_expr(symbols, view, var)
         .or_else(|| non_generic_prepared_owner_expr(symbols, view, var))
         .or_else(|| {
             // A value that *is* the address of a stack slot is not named by
@@ -2914,6 +3090,12 @@ fn prepared_fallback_visible_expr(symbols: &std::cell::RefCell<crate::symbol::Sy
         return None;
     }
 
+    match view.planned_name_for_var(var).variable_use() {
+        PlannedVariableUse::Exact(symbol) => return Some(CExpr::Var(symbol)),
+        PlannedVariableUse::Refuse => return None,
+        PlannedVariableUse::Legacy => {}
+    }
+
     // Writing the value's name here is a promise that something will define it,
     // and this pass is not in a position to make it: it runs over every block
     // before the fold decides which statements exist, so a value whose statement
@@ -3310,7 +3492,9 @@ fn collect_prepared_runtime_facts(symbols: &std::cell::RefCell<crate::symbol::Sy
                     let reload_param_expr = prepared_stack_owner_offset_authorized(view, offset)
                         .then(|| {
                             reload_value.and_then(|value_id| {
-                                prepared_stack_reload_param_alias_expr(symbols, prepared, env, value_id)
+                                prepared_stack_reload_param_alias_expr(
+                                    symbols, prepared, view, env, value_id,
+                                )
                             })
                         })
                         .flatten();
@@ -3970,6 +4154,28 @@ mod tests {
     /// The names a fixture in this module declares.
     fn test_table() -> std::cell::RefCell<crate::symbol::SymbolTable> {
         std::cell::RefCell::new(crate::symbol::SymbolTable::new())
+    }
+
+    #[test]
+    fn planned_variable_use_allows_legacy_only_when_absent() {
+        let symbols = test_table();
+        let symbol = crate::symbol::declare(&symbols, "planned");
+
+        assert_eq!(
+            PlannedValueName::Bound(symbol).variable_use(),
+            PlannedVariableUse::Exact(symbol)
+        );
+        for disposition in [
+            PlannedValueName::Inline,
+            PlannedValueName::Elided,
+            PlannedValueName::Refused,
+        ] {
+            assert_eq!(disposition.variable_use(), PlannedVariableUse::Refuse);
+        }
+        assert_eq!(
+            PlannedValueName::Absent.variable_use(),
+            PlannedVariableUse::Legacy
+        );
     }
 
     #[test]
@@ -5418,11 +5624,6 @@ mod tests {
 }
 
 impl crate::naming::NameSource for PreparedSemanticView {
-    fn planned_binding_name(&self, var: &SSAVar) -> Option<String> {
-        let value = self.value_id_for_var(var)?;
-        self.binding_names.as_ref()?.name_for_value(value)
-    }
-
     fn carrier_alias(&self, display: &str) -> Option<String> {
         self.carrier_alias_by_name.get(display).cloned()
     }

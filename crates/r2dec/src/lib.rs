@@ -63,9 +63,12 @@ pub use region::{Region, RegionAnalyzer};
 pub(crate) use structure::ControlFlowStructurer;
 pub use variable::VariableRecovery;
 
-use crate::codegen::{CodeGenerator, prepare_function_for_emission};
+use crate::codegen::{CodeGenerator, EmissionReadyFunction, prepare_function_for_emission};
 use crate::fold::FoldingContext;
 use crate::fold::context::{FoldArchConfig, FoldInputs};
+use crate::observation_journal::{
+    LegacyObservationCoverage, LegacyObservationJournal, MarkedNativeDraft, SealedNativeFunction,
+};
 use r2ssa::SSAFunction;
 use r2ssa::SSAOp;
 use r2ssa::cfg::BlockTerminator;
@@ -2628,7 +2631,14 @@ enum BindingShadowFailure {
     Build(crate::binding_plan::BindingPlanBuildError),
     Pairing(crate::binding_plan::BindingPlanSourceMismatch),
     Report(crate::shadow_report::ShadowReportError),
-    NonQuality(crate::shadow_report::ShadowLedger),
+    IncompleteObservations {
+        ledger: crate::shadow_report::ShadowLedger,
+        coverage: LegacyObservationCoverage,
+    },
+    NonQuality {
+        ledger: crate::shadow_report::ShadowLedger,
+        coverage: LegacyObservationCoverage,
+    },
 }
 
 #[allow(
@@ -2640,6 +2650,7 @@ struct BindingShadow {
     plan: crate::binding_plan::BindingPlan,
     report: crate::shadow_report::ShadowReport,
     ledger: crate::shadow_report::ShadowLedger,
+    coverage: LegacyObservationCoverage,
 }
 
 #[allow(
@@ -2657,6 +2668,7 @@ impl BindingShadowOutcome {
         plan: &crate::binding_plan::BindingPlan,
         source: &r2types::function_facts::SourceOwnedFunctionFacts,
         legacy: &crate::shadow_report::LegacyAnalysisSnapshot,
+        coverage: LegacyObservationCoverage,
     ) -> Self {
         if let Err(error) = crate::fold::op_lower::PlannedLoweringInput::try_new(source, plan) {
             return Self::Failed(BindingShadowFailure::Pairing(error));
@@ -2669,13 +2681,20 @@ impl BindingShadowOutcome {
             return Self::Failed(BindingShadowFailure::Report(error));
         }
         let ledger = report.ledger(source);
-        if !ledger.passes_quality() {
-            return Self::Failed(BindingShadowFailure::NonQuality(ledger));
+        if !coverage.is_complete() {
+            return Self::Failed(BindingShadowFailure::IncompleteObservations {
+                ledger,
+                coverage,
+            });
+        }
+        if !ledger.passes_quality() || !coverage.passes_quality() {
+            return Self::Failed(BindingShadowFailure::NonQuality { ledger, coverage });
         }
         Self::Complete(BindingShadow {
             plan: plan.clone(),
             report,
             ledger,
+            coverage,
         })
     }
 }
@@ -2747,6 +2766,86 @@ impl From<crate::shadow_report::DomainLedger> for BindingShadowDomainAudit {
     }
 }
 
+/// Public count of exact legacy-render observations for one source domain.
+///
+/// This is deliberately separate from the shadow classification ledger. A
+/// dense shadow report can classify `LegacyAbsent` as an old-renderer defect;
+/// only this equation proves that the renderer actually accounted for every
+/// source value, use, and write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BindingObservationDomainAudit {
+    pub total: usize,
+    pub accounted: usize,
+    pub absent: usize,
+    pub refused: usize,
+}
+
+impl BindingObservationDomainAudit {
+    pub const fn equations_hold(self) -> bool {
+        let Some(accounted) = self.accounted.checked_add(self.absent) else {
+            return false;
+        };
+        accounted == self.total && self.refused <= self.accounted
+    }
+
+    pub const fn is_complete(self) -> bool {
+        self.equations_hold() && self.absent == 0
+    }
+
+    pub const fn passes_quality(self) -> bool {
+        self.is_complete() && self.refused == 0
+    }
+}
+
+impl From<crate::observation_journal::LegacyObservationDomainCoverage>
+    for BindingObservationDomainAudit
+{
+    fn from(coverage: crate::observation_journal::LegacyObservationDomainCoverage) -> Self {
+        Self {
+            total: coverage.total,
+            accounted: coverage.accounted,
+            absent: coverage.absent,
+            refused: coverage.refused,
+        }
+    }
+}
+
+/// Exact V/U/W observation coverage, independent of shadow correctness.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BindingObservationAudit {
+    pub values: BindingObservationDomainAudit,
+    pub uses: BindingObservationDomainAudit,
+    pub writes: BindingObservationDomainAudit,
+}
+
+impl BindingObservationAudit {
+    pub const fn equations_hold(self) -> bool {
+        self.values.equations_hold()
+            && self.uses.equations_hold()
+            && self.writes.equations_hold()
+    }
+
+    pub const fn is_complete(self) -> bool {
+        self.values.is_complete() && self.uses.is_complete() && self.writes.is_complete()
+    }
+
+    pub const fn passes_quality(self) -> bool {
+        self.values.passes_quality()
+            && self.uses.passes_quality()
+            && self.writes.passes_quality()
+    }
+}
+
+impl From<LegacyObservationCoverage> for BindingObservationAudit {
+    fn from(coverage: LegacyObservationCoverage) -> Self {
+        Self {
+            values: coverage.values.into(),
+            uses: coverage.uses.into(),
+            writes: coverage.writes.into(),
+        }
+    }
+}
+
 /// Observable Stage 4 ledger, kept separate from all renderer inputs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BindingShadowAuditLedger {
@@ -2785,7 +2884,14 @@ pub enum BindingShadowAuditFailure {
     PlanBuild,
     SourcePairing,
     Report,
-    NonQuality { ledger: BindingShadowAuditLedger },
+    IncompleteObservations {
+        ledger: BindingShadowAuditLedger,
+        observations: BindingObservationAudit,
+    },
+    NonQuality {
+        ledger: BindingShadowAuditLedger,
+        observations: BindingObservationAudit,
+    },
 }
 
 /// Non-consuming binding audit exposed to corpus and integration tooling.
@@ -2793,6 +2899,7 @@ pub enum BindingShadowAuditFailure {
 pub enum BindingShadowAuditOutcome {
     Complete {
         ledger: BindingShadowAuditLedger,
+        observations: BindingObservationAudit,
     },
     Failed(BindingShadowAuditFailure),
     /// The selected route never entered the native Standard renderer.
@@ -2804,6 +2911,7 @@ impl BindingShadowAuditOutcome {
         match outcome {
             BindingShadowOutcome::Complete(shadow) => Self::Complete {
                 ledger: shadow.ledger.into(),
+                observations: shadow.coverage.into(),
             },
             BindingShadowOutcome::Failed(BindingShadowFailure::Build(_)) => {
                 Self::Failed(BindingShadowAuditFailure::PlanBuild)
@@ -2814,9 +2922,20 @@ impl BindingShadowAuditOutcome {
             BindingShadowOutcome::Failed(BindingShadowFailure::Report(_)) => {
                 Self::Failed(BindingShadowAuditFailure::Report)
             }
-            BindingShadowOutcome::Failed(BindingShadowFailure::NonQuality(ledger)) => {
+            BindingShadowOutcome::Failed(BindingShadowFailure::IncompleteObservations {
+                ledger,
+                coverage,
+            }) => Self::Failed(BindingShadowAuditFailure::IncompleteObservations {
+                ledger: (*ledger).into(),
+                observations: (*coverage).into(),
+            }),
+            BindingShadowOutcome::Failed(BindingShadowFailure::NonQuality {
+                ledger,
+                coverage,
+            }) => {
                 Self::Failed(BindingShadowAuditFailure::NonQuality {
                     ledger: (*ledger).into(),
+                    observations: (*coverage).into(),
                 })
             }
         }
@@ -2851,34 +2970,78 @@ impl DecompileBindingAudit {
     }
 }
 
-fn capture_legacy_binding_analysis(
-    input: crate::analysis::use_info::UseAnalysisInput<'_>,
-) -> crate::shadow_report::LegacyAnalysisSnapshot {
-    let source = input.source();
-    let values = source
-        .source()
-        .graph()
-        .values
-        .iter()
-        .map(|value| {
-            let observation = if value.var.constant_bits().is_some() {
-                crate::shadow_report::LegacyValueObservation::InlineConstant
-            } else {
-                // The legacy renderer has no authority-sealed value-decision
-                // journal. A rendered spelling cannot prove object identity,
-                // so non-literals remain absent until Stage 5 records the real
-                // decision. Uses/writes likewise require original normalized
-                // sites and are populated as absent by the snapshot builder.
-                crate::shadow_report::LegacyValueObservation::LegacyAbsent
-            };
-            crate::shadow_report::LegacyValueCell {
-                value: value.id,
-                observation,
-            }
-        })
-        .collect::<Vec<_>>()
-        .into_boxed_slice();
-    crate::shadow_report::LegacyAnalysisSnapshot::with_absent_machine_observations(source, values)
+/// Private result of one source-authority-bound native build.
+///
+/// Native output retains the exact binding plan and final-AST observations.
+/// Residual output is marker-free and carries no pretend native audit.
+enum InternalBuildProduct {
+    Native(SealedNativeFunction),
+    Residual {
+        ready: EmissionReadyFunction,
+        /// Exact sealed evidence from a native attempt that had to refuse
+        /// executable C. The residual is what may be emitted; this retained
+        /// attempt exists only so refusal remains visible in the audit ledger.
+        attempted_native: Option<SealedNativeFunction>,
+    },
+}
+
+enum PreparedDecompile {
+    Immediate(DecompileBindingAudit),
+    NativeOrResidual(InternalBuildProduct),
+}
+
+impl InternalBuildProduct {
+    fn residual(function: CFunction) -> Self {
+        Self::Residual {
+            ready: prepare_function_for_emission(&function),
+            attempted_native: None,
+        }
+    }
+
+    fn residual_after_native_attempt(
+        function: CFunction,
+        attempted_native: SealedNativeFunction,
+    ) -> Self {
+        Self::Residual {
+            ready: prepare_function_for_emission(&function),
+            attempted_native: Some(attempted_native),
+        }
+    }
+
+    fn emission(&self) -> &EmissionReadyFunction {
+        match self {
+            Self::Native(native) => native.emission(),
+            Self::Residual { ready, .. } => ready,
+        }
+    }
+
+    fn into_function(self) -> CFunction {
+        match self {
+            Self::Native(native) => native.into_function(),
+            Self::Residual { ready, .. } => ready.into_function(),
+        }
+    }
+
+    fn binding_shadow(&self, source: &r2types::SourceOwnedFunctionFacts) -> BindingShadowAuditOutcome {
+        let native = match self {
+            Self::Native(native) => native,
+            Self::Residual {
+                attempted_native: Some(native),
+                ..
+            } => native,
+            Self::Residual {
+                attempted_native: None,
+                ..
+            } => return BindingShadowAuditOutcome::NotRun,
+        };
+        let outcome = BindingShadowOutcome::build(
+            native.plan(),
+            source,
+            native.observations(),
+            native.observation_coverage(),
+        );
+        BindingShadowAuditOutcome::from_internal(&outcome)
+    }
 }
 
 /// The main decompiler.
@@ -2979,12 +3142,11 @@ impl Decompiler {
             .expect("default decompiler control never stops")
     }
 
-    /// Controlled form of [`Self::decompile_input_with_binding_audit`].
-    pub fn decompile_input_with_binding_audit_and_control<'a>(
+    fn prepare_decompile_with_control<'a>(
         &self,
         input: &'a DecompilerInput,
         control: &'a dyn r2ssa::SsaWorkControl,
-    ) -> Result<DecompileBindingAudit, DecompileExecutionStop> {
+    ) -> Result<PreparedDecompile, DecompileExecutionStop> {
         let work = DecompileWorkControl::new(control, DecompileWorkPhase::Normalization);
         work.poll()?;
         let func = input.prepared_ssa().function();
@@ -2994,65 +3156,81 @@ impl Decompiler {
             .unwrap_or_else(|| format!("sub_{:x}", func.entry));
         let block_count = func.blocks().count();
         if block_count > self.config.max_blocks {
-            return Ok(DecompileBindingAudit::not_run(
-                block_guard_fallback_comment(&func_name, block_count, self.config.max_blocks),
+            return Ok(PreparedDecompile::Immediate(
+                DecompileBindingAudit::not_run(block_guard_fallback_comment(
+                    &func_name,
+                    block_count,
+                    self.config.max_blocks,
+                )),
             ));
         }
         let function_facts = input.function_facts();
         let Some(semantic_route) = function_facts.decompile_route() else {
-            return Ok(DecompileBindingAudit::not_run(
-                missing_decompile_route_residual_comment(&func_name),
+            return Ok(PreparedDecompile::Immediate(
+                DecompileBindingAudit::not_run(missing_decompile_route_residual_comment(
+                    &func_name,
+                )),
             ));
         };
         if let Some(reason) = route_fallback_reason(semantic_route) {
-            return Ok(DecompileBindingAudit::not_run(
-                artifact_guard_fallback_comment(&func_name, reason),
+            return Ok(PreparedDecompile::Immediate(
+                DecompileBindingAudit::not_run(artifact_guard_fallback_comment(
+                    &func_name, reason,
+                )),
             ));
         }
         if let Some(reason) = summary_only_semantics_standard_render_residual_reason(
             function_facts.decompile_route(),
             function_facts.semantic_report(),
         ) {
-            return Ok(DecompileBindingAudit::not_run(
-                artifact_guard_fallback_comment(&func_name, &reason),
+            return Ok(PreparedDecompile::Immediate(
+                DecompileBindingAudit::not_run(artifact_guard_fallback_comment(
+                    &func_name, &reason,
+                )),
             ));
         }
         if let Some(output) =
             self.vm_summary_output_for_route(&func_name, function_facts, semantic_route)
         {
-            return Ok(DecompileBindingAudit::not_run(output));
+            return Ok(PreparedDecompile::Immediate(
+                DecompileBindingAudit::not_run(output),
+            ));
         }
         if let Some(output) = self.semantic_worker_summary_output_for_route(
             &func_name,
             function_facts,
             semantic_route,
         ) {
-            return Ok(DecompileBindingAudit::not_run(output));
+            return Ok(PreparedDecompile::Immediate(
+                DecompileBindingAudit::not_run(output),
+            ));
         }
-        let c_func = self.build_function_from_input_with_control(input, control)?;
-        let render_work = work.with_phase(DecompileWorkPhase::Rendering);
-        render_work.poll()?;
-        let ready = prepare_function_for_emission(&c_func);
-        let output = CodeGenerator::new(self.config.codegen.clone()).generate_function(&ready);
-        // This is deliberately the last production work-control decision.
-        // Everything below is observational Stage 4 shadow work.
-        render_work.poll()?;
-        let legacy_binding_analysis = capture_legacy_binding_analysis(
-            crate::analysis::use_info::UseAnalysisInput::new(input.source_owned_facts()),
-        );
-        let binding_shadow = match crate::binding_plan::BindingPlan::build_shadow(
-            input.source_owned_facts(),
-        ) {
-            Ok(plan) => BindingShadowOutcome::build(
-                &plan,
-                input.source_owned_facts(),
-                &legacy_binding_analysis,
-            ),
-            Err(error) => BindingShadowOutcome::Failed(BindingShadowFailure::Build(error)),
+        self.build_product_from_input_with_control(input, control)
+            .map(PreparedDecompile::NativeOrResidual)
+    }
+
+    /// Controlled form of [`Self::decompile_input_with_binding_audit`].
+    pub fn decompile_input_with_binding_audit_and_control<'a>(
+        &self,
+        input: &'a DecompilerInput,
+        control: &'a dyn r2ssa::SsaWorkControl,
+    ) -> Result<DecompileBindingAudit, DecompileExecutionStop> {
+        let product = match self.prepare_decompile_with_control(input, control)? {
+            PreparedDecompile::Immediate(audit) => return Ok(audit),
+            PreparedDecompile::NativeOrResidual(product) => product,
         };
+        let render_work =
+            DecompileWorkControl::new(control, DecompileWorkPhase::Rendering);
+        render_work.poll()?;
+        let output = CodeGenerator::new(self.config.codegen.clone())
+            .generate_function(product.emission());
+        // This is deliberately the last production work-control decision.
+        // Everything below classifies the already sealed observation journal.
+        render_work.poll()?;
+        let binding_shadow = product.binding_shadow(input.source_owned_facts());
         Ok(DecompileBindingAudit {
             output,
-            binding_shadow: BindingShadowAuditOutcome::from_internal(&binding_shadow),
+            binding_shadow,
         })
     }
 
@@ -3072,24 +3250,24 @@ impl Decompiler {
         input: &'a DecompilerInput,
         control: &'a dyn r2ssa::SsaWorkControl,
     ) -> Result<String, (DecompileExecutionStop, Option<String>)> {
-        match self.decompile_input_with_control(input, control) {
-            Ok(output) => Ok(output),
-            Err(stop) if stop.phase() == DecompileWorkPhase::Rendering => {
-                // Rebuilt without a budget: the point is to keep what the run
-                // had reached, and re-imposing the exhausted budget would stop
-                // again at the same place.
-                let unchecked = r2ssa::SsaExecutionControl::default();
-                let partial = self
-                    .build_function_from_input_with_control(input, &unchecked)
-                    .ok()
-                    .map(|c_func| {
-                        let ready = prepare_function_for_emission(&c_func);
-                        CodeGenerator::new(self.config.codegen.clone()).generate_function(&ready)
-                    });
-                Err((stop, partial))
-            }
-            Err(stop) => Err((stop, None)),
+        let product = match self.prepare_decompile_with_control(input, control) {
+            Ok(PreparedDecompile::Immediate(audit)) => return Ok(audit.into_output()),
+            Ok(PreparedDecompile::NativeOrResidual(product)) => product,
+            Err(stop) => return Err((stop, None)),
+        };
+        let render_work =
+            DecompileWorkControl::new(control, DecompileWorkPhase::Rendering);
+        if let Err(stop) = render_work.poll() {
+            let partial = CodeGenerator::new(self.config.codegen.clone())
+                .generate_function(product.emission());
+            return Err((stop, Some(partial)));
         }
+        let output = CodeGenerator::new(self.config.codegen.clone())
+            .generate_function(product.emission());
+        if let Err(stop) = render_work.poll() {
+            return Err((stop, Some(output)));
+        }
+        Ok(output)
     }
 
     /// Build a C function from a prepared function + typed context payload.
@@ -3105,6 +3283,15 @@ impl Decompiler {
         input: &'a DecompilerInput,
         control: &'a dyn r2ssa::SsaWorkControl,
     ) -> Result<CFunction, DecompileExecutionStop> {
+        self.build_product_from_input_with_control(input, control)
+            .map(InternalBuildProduct::into_function)
+    }
+
+    fn build_product_from_input_with_control<'a>(
+        &self,
+        input: &'a DecompilerInput,
+        control: &'a dyn r2ssa::SsaWorkControl,
+    ) -> Result<InternalBuildProduct, DecompileExecutionStop> {
         let work = DecompileWorkControl::new(control, DecompileWorkPhase::Normalization);
         work.poll()?;
         let func = input.prepared_ssa().function();
@@ -3114,32 +3301,32 @@ impl Decompiler {
             .unwrap_or_else(|| format!("sub_{:x}", func.entry));
         let block_count = func.blocks().count();
         if block_count > self.config.max_blocks {
-            return Ok(residual_function_for_render_boundary(
+            return Ok(InternalBuildProduct::residual(residual_function_for_render_boundary(
                 &func_name,
                 &block_guard_fallback_comment(&func_name, block_count, self.config.max_blocks),
-            ));
+            )));
         }
         let decompiler = Self::new(self.config.clone()).with_context(input.context_projection());
         let Some(semantic_route) = decompiler.context.function_facts.decompile_route() else {
-            return Ok(residual_function_for_render_boundary(
+            return Ok(InternalBuildProduct::residual(residual_function_for_render_boundary(
                 &func_name,
                 &missing_decompile_route_residual_comment(&func_name),
-            ));
+            )));
         };
         if let Some(reason) = route_fallback_reason(semantic_route) {
-            return Ok(residual_function_for_render_boundary(&func_name, reason));
+            return Ok(InternalBuildProduct::residual(residual_function_for_render_boundary(&func_name, reason)));
         }
         if let Some(reason) = summary_only_semantics_standard_render_residual_reason(
             decompiler.context.function_facts.decompile_route(),
             decompiler.context.function_facts.semantic_report(),
         ) {
-            return Ok(residual_function_for_render_boundary(&func_name, &reason));
+            return Ok(InternalBuildProduct::residual(residual_function_for_render_boundary(&func_name, &reason)));
         }
         if route_is_summary_boundary(semantic_route) {
-            return Ok(residual_function_for_summary_route_boundary(
+            return Ok(InternalBuildProduct::residual(residual_function_for_summary_route_boundary(
                 &func_name,
                 semantic_route,
-            ));
+            )));
         }
         decompiler.build_function_internal_with_control(input, semantic_route, work)
     }
@@ -3490,7 +3677,7 @@ impl Decompiler {
         input: &'a DecompilerInput,
         semantic_route: &DecompileRouteFacts,
         work: DecompileWorkControl<'a>,
-    ) -> Result<CFunction, DecompileExecutionStop> {
+    ) -> Result<InternalBuildProduct, DecompileExecutionStop> {
         // The names this rendering declares, from the first pass that mints one.
         let symbol_table =
             std::rc::Rc::new(std::cell::RefCell::new(crate::symbol::SymbolTable::new()));
@@ -3617,7 +3804,7 @@ impl Decompiler {
                     Ok(result) => result,
                     Err(normalize::NormalizationFailure::Execution(error)) => return Err(error),
                     Err(normalize::NormalizationFailure::Origins(error)) => {
-                        return Ok(normalization_refusal(error));
+                        return Ok(InternalBuildProduct::residual(normalization_refusal(error)));
                     }
                 }
             } else {
@@ -3637,7 +3824,7 @@ impl Decompiler {
                 match error {
                     normalize::NormalizationFailure::Execution(error) => return Err(error),
                     normalize::NormalizationFailure::Origins(error) => {
-                        return Ok(normalization_refusal(error));
+                        return Ok(InternalBuildProduct::residual(normalization_refusal(error)));
                     }
                 }
             }
@@ -3651,36 +3838,36 @@ impl Decompiler {
                 .name
                 .clone()
                 .unwrap_or_else(|| format!("sub_{:x}", func.entry));
-            return Ok(residual_function_for_render_boundary(
+            return Ok(InternalBuildProduct::residual(residual_function_for_render_boundary(
                 &func_name,
                 &format!("normalization origin refusal: {error:?}"),
-            ));
+            )));
         }
         let binding_plan = match crate::binding_plan::BindingPlan::build_shadow(
             input.source_owned_facts(),
         ) {
             Ok(plan) => std::rc::Rc::new(plan),
             Err(error) => {
-                return Ok(residual_function_for_render_boundary(
+                return Ok(InternalBuildProduct::residual(residual_function_for_render_boundary(
                     &func
                         .name
                         .clone()
                         .unwrap_or_else(|| format!("sub_{:x}", func.entry)),
                     &format!("binding plan refusal: {error:?}"),
-                ));
+                )));
             }
         };
         if let Err(error) = crate::fold::op_lower::PlannedLoweringInput::try_new(
             input.source_owned_facts(),
             &binding_plan,
         ) {
-            return Ok(residual_function_for_render_boundary(
+            return Ok(InternalBuildProduct::residual(residual_function_for_render_boundary(
                 &func
                     .name
                     .clone()
                     .unwrap_or_else(|| format!("sub_{:x}", func.entry)),
                 &format!("binding source refusal: {error:?}"),
-            ));
+            )));
         }
         let binding_names = match crate::binding_plan::BindingNameResolution::build(
             input.source_owned_facts(),
@@ -3689,12 +3876,32 @@ impl Decompiler {
         ) {
             Ok(names) => std::rc::Rc::new(names),
             Err(error) => {
-                return Ok(residual_function_for_render_boundary(
+                return Ok(InternalBuildProduct::residual(residual_function_for_render_boundary(
                     &func
                         .name
                         .clone()
                         .unwrap_or_else(|| format!("sub_{:x}", func.entry)),
                     &format!("binding name refusal: {error:?}"),
+                )));
+            }
+        };
+        let observation_journal = match LegacyObservationJournal::new(
+            input.source_owned_facts(),
+            &normalized_func,
+            &normalization_origins,
+            Rc::clone(&binding_plan),
+            Rc::clone(&symbol_table),
+        ) {
+            Ok(journal) => std::cell::RefCell::new(journal),
+            Err(error) => {
+                return Ok(InternalBuildProduct::residual(
+                    residual_function_for_render_boundary(
+                        &func
+                            .name
+                            .clone()
+                            .unwrap_or_else(|| format!("sub_{:x}", func.entry)),
+                        &format!("observation journal refusal: {error:?}"),
+                    ),
                 ));
             }
         };
@@ -3892,17 +4099,18 @@ impl Decompiler {
         ) {
             Ok(view) => view,
             Err(error) => {
-                return Ok(residual_function_for_render_boundary(
+                return Ok(InternalBuildProduct::residual(residual_function_for_render_boundary(
                     &func
                         .name
                         .clone()
                         .unwrap_or_else(|| format!("sub_{:x}", func.entry)),
                     &format!("prepared semantic view refusal: {error:?}"),
-                ));
+                )));
             }
         };
         let fold_inputs = FoldInputs {
             normalization_origins: Some(&normalization_origins),
+            observation_journal: Some(&observation_journal),
             arch: &fold_arch,
             display_names: self.context.function_facts.display_names(),
             #[cfg(test)]
@@ -4096,7 +4304,7 @@ impl Decompiler {
             .collect::<Vec<_>>();
         let mut c_function = CFunction {
             symbols: std::rc::Rc::clone(&symbol_table),
-            name: func_name,
+            name: func_name.clone(),
             ret_type: render_signature
                 .and_then(|sig| sig.ret_type.as_ref().map(type_like_to_ctype))
                 .unwrap_or_else(|| inferred_ret_type.clone()),
@@ -4170,10 +4378,10 @@ impl Decompiler {
         // owes, and rendering it says the effects were all handled when nothing
         // ever enumerated them.
         if let Some(reason) = incomplete_source_obligations_reason(prepared) {
-            return Ok(residual_function_for_render_boundary(
+            return Ok(InternalBuildProduct::residual(residual_function_for_render_boundary(
                 &c_function.name,
                 &reason,
-            ));
+            )));
         }
         let mut ledger = build_obligation_ledger(
             prepared,
@@ -4220,8 +4428,41 @@ impl Decompiler {
             }
         }
 
-        work.with_phase(DecompileWorkPhase::Rendering).poll()?;
-        Ok(c_function)
+        let observation_error = fold_ctx.observation_error.borrow().clone();
+        if let Some(error) = observation_error {
+            let residual = residual_function_for_render_boundary(
+                &c_function.name,
+                &format!("observation journal refusal: {error:?}"),
+            );
+            drop(fold_ctx);
+            let journal = observation_journal.into_inner();
+            let draft = MarkedNativeDraft::new(c_function, journal);
+            return Ok(match draft.seal(input.source_owned_facts()) {
+                Ok(attempted_native) => {
+                    InternalBuildProduct::residual_after_native_attempt(residual, attempted_native)
+                }
+                Err(seal_error) => InternalBuildProduct::residual(
+                    residual_function_for_render_boundary(
+                        &func_name,
+                        &format!(
+                            "observation journal refusal: {error:?}; sealing refusal: {seal_error:?}"
+                        ),
+                    ),
+                ),
+            });
+        }
+        drop(fold_ctx);
+        let journal = observation_journal.into_inner();
+        let draft = MarkedNativeDraft::new(c_function, journal);
+        match draft.seal(input.source_owned_facts()) {
+            Ok(native) => Ok(InternalBuildProduct::Native(native)),
+            Err(error) => Ok(InternalBuildProduct::residual(
+                residual_function_for_render_boundary(
+                    &func_name,
+                    &format!("observation journal refusal: {error:?}"),
+                ),
+            )),
+        }
     }
 
     /// Convert a CStmt to a Vec<CStmt>.
@@ -6537,6 +6778,7 @@ mod tests {
         }));
         FoldingContext::from_inputs(FoldInputs {
             normalization_origins: None,
+            observation_journal: None,
             display_names: crate::empty_display_names(),
             arch,
             function_names: Box::leak(Box::new(HashMap::new())),
@@ -7710,17 +7952,22 @@ mod tests {
             .build_function_internal_with_control(&input, semantic_route, work)
             .expect("native production build");
 
-        let ready = prepare_function_for_emission(&built);
-        let internal_output = CodeGenerator::new(config.codegen).generate_function(&ready);
+        let internal_output = CodeGenerator::new(config.codegen).generate_function(built.emission());
         let public_output = public_decompiler.decompile_input(&input);
         assert_eq!(internal_output, public_output);
         let audited = public_decompiler.decompile_input_with_binding_audit(&input);
         assert_eq!(audited.output(), public_output);
-        let BindingShadowAuditOutcome::Complete { ledger } = audited.binding_shadow() else {
+        let BindingShadowAuditOutcome::Complete {
+            ledger,
+            observations,
+        } = audited.binding_shadow()
+        else {
             panic!("public native path did not expose its complete shadow audit");
         };
         assert!(ledger.equations_hold());
         assert!(ledger.passes_quality());
+        assert!(observations.equations_hold());
+        assert!(observations.passes_quality());
         let mut corrupted_public_ledger = ledger;
         corrupted_public_ledger.values.observed =
             corrupted_public_ledger.values.observed.saturating_sub(1);
@@ -7729,7 +7976,7 @@ mod tests {
     }
 
     #[test]
-    fn native_shadow_quality_refusal_is_observable_without_changing_output() {
+    fn native_shadow_refusal_and_incomplete_coverage_are_observable_without_changing_output() {
         let arch = test_arch_for_decompile();
         let prepared = prepared_from_ops(
             vec![R2ILOp::Return {
@@ -7750,16 +7997,25 @@ mod tests {
         let output = decompiler.decompile_input(&input);
         let audited = decompiler.decompile_input_with_binding_audit(&input);
         assert_eq!(audited.output(), output);
-        let BindingShadowAuditOutcome::Failed(BindingShadowAuditFailure::NonQuality { ledger }) =
-            audited.binding_shadow()
+        let BindingShadowAuditOutcome::Failed(BindingShadowAuditFailure::IncompleteObservations {
+            ledger,
+            observations,
+        }) = audited.binding_shadow()
         else {
             panic!(
-                "missing register geometry must remain an observable non-quality audit: {:?}",
-                audited.binding_shadow()
+                "missing register geometry must remain an observable non-quality audit: {:?}; output={}",
+                audited.binding_shadow(),
+                audited.output()
             );
         };
         assert!(ledger.equations_hold());
         assert!(!ledger.passes_quality());
+        assert!(observations.equations_hold());
+        assert!(!observations.is_complete());
+        assert!(!observations.passes_quality());
+        assert!(
+            observations.values.absent + observations.uses.absent + observations.writes.absent > 0
+        );
         assert!(ledger.values.refused + ledger.uses.refused + ledger.writes.refused > 0);
     }
 

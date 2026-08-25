@@ -2068,7 +2068,12 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
 
     fn folded_block_stmts(&mut self, block: &r2ssa::FunctionSSABlock, addr: u64) -> Vec<CStmt> {
         self.fold_ctx.folded_blocks.borrow_mut().insert(addr);
-        let stmts = if let Some(folded) = self.folded_block_cache.get(&addr) {
+        let stmts = if self.fold_ctx.inputs.observation_journal.is_some() {
+            // A cached statement tree can be cloned into multiple reachable
+            // regions. Observation IDs are occurrence identities, so native
+            // journal runs fold each occurrence once instead of cloning IDs.
+            self.fold_ctx.fold_block(block, addr)
+        } else if let Some(folded) = self.folded_block_cache.get(&addr) {
             if std::env::var_os("R2SLEIGH_DEBUG_MERGES").is_some() {
                 eprintln!("FOLDCACHE hit block={addr:#x} stmts={}", folded.stmts.len());
             }

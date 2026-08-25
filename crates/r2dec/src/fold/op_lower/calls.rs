@@ -1785,7 +1785,7 @@ impl<'a> FoldingContext<'a> {
     /// Convert an SSA operation to a C statement.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn op_to_stmt(&self, op: &SSAOp) -> Option<CStmt> {
-        let mut frame = LowerFrame::for_stmt(0, 0, false);
+        let mut frame = LowerFrame::for_stmt(None, Some((0, 0)), false);
         self.lowered_to_stmt(self.lower_op(op, &mut frame))
     }
 }

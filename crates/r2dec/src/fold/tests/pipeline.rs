@@ -4,6 +4,7 @@ mod tests {
     use std::{
         collections::{BTreeMap, BTreeSet, HashMap, HashSet},
         ops::Deref,
+        rc::Rc,
         sync::Arc,
     };
 
@@ -63,6 +64,7 @@ mod tests {
             CallOwner, CallOwnerKind, CallOwnershipFact, CallSiteId, PassEnv, PreparedSemanticView,
             ScalarValue, SemanticValue, StackSlotProvenance, StackSlotValueKind,
         },
+        ast::{CFunction, CLocal},
     };
     use r2il::{ArchSpec, R2ILBlock, R2ILOp, RegisterDef, SpaceId, Varnode};
     /// The names a fixture in this module declares.
@@ -859,6 +861,7 @@ mod tests {
         let empty_ty = Box::leak(Box::new(HashMap::new()));
         FoldingContext::from_inputs(FoldInputs {
             normalization_origins: None,
+            observation_journal: None,
             binding_names: None,
             display_names: crate::empty_display_names(),
             arch,
@@ -910,6 +913,7 @@ mod tests {
         let empty_ty = Box::leak(Box::new(HashMap::new()));
         FoldingContext::from_inputs(FoldInputs {
             normalization_origins: None,
+            observation_journal: None,
             binding_names: None,
             display_names: crate::empty_display_names(),
             arch,
@@ -1301,6 +1305,328 @@ mod tests {
             ),
         )));
         ctx
+    }
+
+    fn install_observed_lowering<'a>(
+        ctx: &mut FoldingContext<'a>,
+        prepared: &SourceOwnedPreparedFixture,
+    ) -> (
+        Rc<crate::binding_plan::BindingPlan>,
+        &'static Rc<crate::binding_plan::BindingNameResolution>,
+        &'static std::cell::RefCell<crate::observation_journal::LegacyObservationJournal>,
+    ) {
+        let plan = Rc::new(
+            crate::binding_plan::BindingPlan::build_shadow(&prepared.facts)
+                .expect("observed lowering binding plan"),
+        );
+        let names = Box::leak(Box::new(Rc::new(
+            crate::binding_plan::BindingNameResolution::build(
+                &prepared.facts,
+                Rc::clone(&plan),
+                Rc::clone(&ctx.symbols),
+            )
+            .expect("observed lowering binding names"),
+        )));
+        let origins = ctx
+            .inputs
+            .normalization_origins
+            .expect("prepared observed lowering origins");
+        let journal = Box::leak(Box::new(std::cell::RefCell::new(
+            crate::observation_journal::LegacyObservationJournal::new(
+                &prepared.facts,
+                prepared.function(),
+                origins,
+                Rc::clone(&plan),
+                Rc::clone(&ctx.symbols),
+            )
+            .expect("observed lowering journal"),
+        )));
+        ctx.inputs.binding_names = Some(names);
+        ctx.inputs.observation_journal = Some(journal);
+        (plan, names, journal)
+    }
+
+    fn seal_observed_lowering(
+        prepared: &SourceOwnedPreparedFixture,
+        plan: Rc<crate::binding_plan::BindingPlan>,
+        names: &Rc<crate::binding_plan::BindingNameResolution>,
+        journal: &std::cell::RefCell<crate::observation_journal::LegacyObservationJournal>,
+        symbols: Rc<std::cell::RefCell<crate::symbol::SymbolTable>>,
+        ret_type: CType,
+        body: Vec<CStmt>,
+    ) -> crate::observation_journal::SealedNativeFunction {
+        let origins =
+            crate::normalize::NormalizationOrigins::for_unchanged(prepared.function(), prepared);
+        let replacement = crate::observation_journal::LegacyObservationJournal::new(
+            &prepared.facts,
+            prepared.function(),
+            &origins,
+            Rc::clone(&plan),
+            Rc::clone(&symbols),
+        )
+        .expect("replacement journal for owned extraction");
+        let journal = journal.replace(replacement);
+        let mut function = CFunction::new("observed_lowering", ret_type);
+        function.symbols = symbols;
+        function.locals = plan
+            .bindings()
+            .map(|(binding, fact)| CLocal {
+                ty: fact.declaration_type().clone(),
+                name: names
+                    .symbol_for_binding(binding)
+                    .expect("dense observed binding name"),
+                stack_offset: None,
+            })
+            .collect();
+        function.body = body;
+        crate::observation_journal::MarkedNativeDraft::new(function, journal)
+            .seal(&prepared.facts)
+            .expect("observed lowering must seal")
+    }
+
+    fn exact_legacy_use(
+        plan: &crate::binding_plan::BindingPlan,
+        site: r2ssa::UseSite,
+    ) -> crate::shadow_report::LegacyUseObservation {
+        match plan.use_disposition(site) {
+            Some(r2ssa::MachineUseDisposition::Exact(slice)) => {
+                crate::shadow_report::LegacyUseObservation::Exact(*slice)
+            }
+            other => panic!("expected exact machine use at {site:?}, got {other:?}"),
+        }
+    }
+
+    fn exact_legacy_write(
+        plan: &crate::binding_plan::BindingPlan,
+        inst: r2ssa::InstId,
+    ) -> crate::shadow_report::LegacyWriteObservation {
+        match plan.write_disposition(inst) {
+            Some(r2ssa::MachineWriteDisposition::Exact(write)) => {
+                crate::shadow_report::LegacyWriteObservation::Exact(*write)
+            }
+            other => panic!("expected exact machine write at {inst:?}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn observed_inline_repeated_equal_operands_keep_distinct_use_sites_and_output() {
+        let arch = make_test_arch_x86_64();
+        let mut entry = R2ILBlock::new(0x1000, 4);
+        entry.push(R2ILOp::Copy {
+            dst: Varnode::unique(0x10, 8),
+            src: Varnode::constant(5, 8),
+        });
+        entry.push(R2ILOp::IntAdd {
+            dst: Varnode::unique(0x20, 8),
+            a: Varnode::unique(0x10, 8),
+            b: Varnode::unique(0x10, 8),
+        });
+        let prepared = prepared_from_r2il_blocks(&[entry], &arch)
+            .with_name("observed_repeated_equal_operands");
+        let block = prepared.function().get_block(0x1000).expect("entry block");
+        let op_idx = block
+            .ops
+            .iter()
+            .position(|op| matches!(op, SSAOp::IntAdd { .. }))
+            .expect("integer addition");
+        let inst = prepared
+            .graph()
+            .inst_id_for_op_site(block.addr, op_idx)
+            .expect("addition graph instruction");
+        let graph_inst = prepared.graph().inst(inst).expect("addition graph row");
+        assert_eq!(graph_inst.inputs.len(), 2);
+        assert_eq!(graph_inst.inputs[0], graph_inst.inputs[1]);
+        let left = r2ssa::UseSite { inst, input_idx: 0 };
+        let right = r2ssa::UseSite { inst, input_idx: 1 };
+
+        let mut ctx = make_x86_64_ctx_with_prepared(&prepared);
+        let (plan, names, journal) = install_observed_lowering(&mut ctx, &prepared);
+        let expr = ctx.op_to_expr_at(&block.ops[op_idx], block.addr, op_idx);
+        assert_eq!(*ctx.observation_error.borrow(), None);
+        let symbols = Rc::clone(&ctx.symbols);
+        drop(ctx);
+        let sealed = seal_observed_lowering(
+            &prepared,
+            Rc::clone(&plan),
+            names,
+            journal,
+            symbols,
+            CType::UInt(64),
+            vec![CStmt::Return(Some(expr))],
+        );
+
+        assert_eq!(
+            sealed.observations().use_observation(left),
+            Some(exact_legacy_use(&plan, left))
+        );
+        assert_eq!(
+            sealed.observations().use_observation(right),
+            Some(exact_legacy_use(&plan, right))
+        );
+        assert_eq!(
+            sealed.observations().write_observation(inst),
+            Some(exact_legacy_write(&plan, inst)),
+            "the supported expression result must retain its exact output occurrence"
+        );
+    }
+
+    fn assert_observed_call_marks_only_graph_target(indirect: bool) {
+        let arch = make_test_arch_x86_64();
+        let mut entry = R2ILBlock::new(0x1000, 4);
+        entry.push(R2ILOp::Copy {
+            dst: Varnode::register(0x10, 8),
+            src: Varnode::constant(7, 8),
+        });
+        entry.push(R2ILOp::Copy {
+            dst: Varnode::unique(0x10, 8),
+            src: Varnode::constant(0x401050, 8),
+        });
+        let target = Varnode::unique(0x10, 8);
+        if indirect {
+            entry.push(R2ILOp::CallInd { target });
+        } else {
+            entry.push(R2ILOp::Call { target });
+        }
+        let prepared = prepared_from_r2il_blocks(&[entry], &arch).with_name(if indirect {
+            "observed_indirect_call_target"
+        } else {
+            "observed_direct_call_target"
+        });
+        let block = prepared.function().get_block(0x1000).expect("entry block");
+        let op_idx = block
+            .ops
+            .iter()
+            .position(|op| {
+                if indirect {
+                    matches!(op, SSAOp::CallInd { .. })
+                } else {
+                    matches!(op, SSAOp::Call { .. })
+                }
+            })
+            .expect("call operation");
+        let inst = prepared
+            .graph()
+            .inst_id_for_op_site(block.addr, op_idx)
+            .expect("call graph instruction");
+        let graph_inst = prepared.graph().inst(inst).expect("call graph row");
+        assert_eq!(
+            graph_inst.inputs.len(),
+            1,
+            "semantic call arguments must not become graph inputs"
+        );
+        let target_site = r2ssa::UseSite { inst, input_idx: 0 };
+
+        let mut ctx = make_x86_64_ctx_with_prepared(&prepared);
+        install_certified_function_facts(&mut ctx);
+        let (plan, names, journal) = install_observed_lowering(&mut ctx, &prepared);
+        let stmt = ctx
+            .op_to_stmt_with_args(&block.ops[op_idx], block.addr, op_idx)
+            .expect("certified call statement");
+        let CStmt::Expr(call) = stmt.unobserved() else {
+            panic!("expected call expression, got {stmt:?}");
+        };
+        let CExpr::Call { args, .. } = call.unobserved() else {
+            panic!("expected call expression, got {call:?}");
+        };
+        assert!(
+            !args.is_empty(),
+            "fixture must render at least one semantic argument"
+        );
+        assert_eq!(*ctx.observation_error.borrow(), None);
+        let symbols = Rc::clone(&ctx.symbols);
+        drop(ctx);
+        let sealed = seal_observed_lowering(
+            &prepared,
+            Rc::clone(&plan),
+            names,
+            journal,
+            symbols,
+            CType::Void,
+            vec![stmt],
+        );
+
+        assert_eq!(
+            sealed.observations().use_observation(target_site),
+            Some(exact_legacy_use(&plan, target_site))
+        );
+        assert_eq!(
+            sealed
+                .observations()
+                .use_observation(r2ssa::UseSite { inst, input_idx: 1 }),
+            None,
+            "rendered semantic arguments are not SSA graph uses of the call"
+        );
+    }
+
+    #[test]
+    fn observed_direct_call_marks_only_graph_target_input() {
+        assert_observed_call_marks_only_graph_target(false);
+    }
+
+    #[test]
+    fn observed_indirect_call_marks_only_graph_target_input() {
+        assert_observed_call_marks_only_graph_target(true);
+    }
+
+    #[test]
+    fn unsupported_expression_fallback_does_not_claim_output() {
+        let arch = make_test_arch_x86_64();
+        let mut entry = R2ILBlock::new(0x1000, 4);
+        entry.push(R2ILOp::IntCarry {
+            dst: Varnode::unique(0x20, 1),
+            a: Varnode::register(0x10, 8),
+            b: Varnode::constant(1, 8),
+        });
+        let prepared =
+            prepared_from_r2il_blocks(&[entry], &arch).with_name("unsupported_expression_fallback");
+        let block = prepared.function().get_block(0x1000).expect("entry block");
+        let op_idx = block
+            .ops
+            .iter()
+            .position(|op| matches!(op, SSAOp::IntCarry { .. }))
+            .expect("unsupported carry operation");
+        let inst = prepared
+            .graph()
+            .inst_id_for_op_site(block.addr, op_idx)
+            .expect("carry graph instruction");
+        assert!(
+            prepared
+                .graph()
+                .inst(inst)
+                .and_then(|row| row.output)
+                .is_some(),
+            "fixture must have a genuine graph output"
+        );
+
+        let mut ctx = make_x86_64_ctx_with_prepared(&prepared);
+        let (plan, names, journal) = install_observed_lowering(&mut ctx, &prepared);
+        assert!(
+            matches!(
+                plan.write_disposition(inst),
+                Some(r2ssa::MachineWriteDisposition::Exact(_))
+            ),
+            "absence is meaningful only for an exact upstream write"
+        );
+        let fallback = ctx.op_to_expr_at(&block.ops[op_idx], block.addr, op_idx);
+        assert!(matches!(fallback.unobserved(), CExpr::Var(_)));
+        assert_eq!(*ctx.observation_error.borrow(), None);
+        let symbols = Rc::clone(&ctx.symbols);
+        drop(ctx);
+        let sealed = seal_observed_lowering(
+            &prepared,
+            plan,
+            names,
+            journal,
+            symbols,
+            CType::UInt(8),
+            vec![CStmt::Return(Some(fallback))],
+        );
+
+        assert_eq!(
+            sealed.observations().write_observation(inst),
+            Some(crate::shadow_report::LegacyWriteObservation::LegacyAbsent),
+            "a destination-name fallback is not a rendered definition"
+        );
     }
 
     fn configure_aarch64_helper_printf_ctx(
@@ -3161,7 +3487,7 @@ mod tests {
         let stmt = ctx
             .op_to_stmt_impl(&SSAOp::CallInd {
                 target: make_var("X16", 0, 8),
-            })
+            }, &super::LowerFrame::for_expr())
             .expect("fallback indirect call statement");
 
         assert_eq!(

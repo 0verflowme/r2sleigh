@@ -304,21 +304,22 @@ impl<'a> FoldingContext<'a> {
     }
 
     pub fn extract_condition_from_block(&self, block: &FunctionSSABlock) -> Option<CExpr> {
+        let (branch_idx, cond) = block
+            .ops
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(idx, op)| match op {
+                SSAOp::CBranch { cond, .. } => Some((idx, cond)),
+                _ => None,
+            })?;
         if self.inputs.prepared_ssa.is_some() {
             return self
                 .certified_branch_condition_from_block(block)
-                .map(|(expr, _, _)| expr);
+                .map(|(expr, _, _)| {
+                    self.observe_normalized_input_expr(block.addr, branch_idx, 1, expr)
+                });
         }
-        let (branch_idx, cond) =
-            block
-                .ops
-                .iter()
-                .enumerate()
-                .rev()
-                .find_map(|(idx, op)| match op {
-                    SSAOp::CBranch { cond, .. } => Some((idx, cond)),
-                    _ => None,
-                })?;
         let prepared_branch_candidate = self.prepared_branch_condition_expr(block.addr);
         let prepared_block_candidate =
             self.prepared_predicate_candidate_for_branch_block(block.addr, cond);
@@ -343,8 +344,8 @@ impl<'a> FoldingContext<'a> {
         });
         self.current_block_addr.set(prev_block_addr);
         self.current_op_idx.set(prev_op_idx);
-        if strong_prepared.is_some() {
-            return strong_prepared;
+        if let Some(expr) = strong_prepared {
+            return Some(self.observe_normalized_input_expr(block.addr, branch_idx, 1, expr));
         }
 
         let allow_legacy_flag_provenance = ![
@@ -392,7 +393,9 @@ impl<'a> FoldingContext<'a> {
             let result = result.map(|expr| self.finalize_condition_expr(expr));
             self.current_block_addr.set(prev_block_addr);
             self.current_op_idx.set(prev_op_idx);
-            return result;
+            return result.map(|expr| {
+                self.observe_normalized_input_expr(block.addr, branch_idx, 1, expr)
+            });
         }
         {
             let mut consider = |candidate: Option<CExpr>| {
@@ -446,7 +449,9 @@ impl<'a> FoldingContext<'a> {
 
         self.current_block_addr.set(prev_block_addr);
         self.current_op_idx.set(prev_op_idx);
-        result
+        result.map(|expr| {
+            self.observe_normalized_input_expr(block.addr, branch_idx, 1, expr)
+        })
     }
 
     pub(super) fn certified_branch_condition_from_block(
