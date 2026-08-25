@@ -4680,25 +4680,45 @@ mod tests {
                 r2ssa::LoopCarrierEdgeValue {
                     predecessor: 0x400ff0,
                     value: r2ssa::ValueId(7),
+                    site: r2ssa::UseSite {
+                        inst: r2ssa::InstId(20),
+                        input_idx: 0,
+                    },
                 },
                 r2ssa::LoopCarrierEdgeValue {
                     predecessor: 0x400fe0,
                     value: r2ssa::ValueId(3),
+                    site: r2ssa::UseSite {
+                        inst: r2ssa::InstId(20),
+                        input_idx: 1,
+                    },
                 },
             ],
             updates: vec![r2ssa::LoopCarrierUpdateFact {
                 predecessor: 0x401010,
                 value: r2ssa::ValueId(9),
+                site: r2ssa::UseSite {
+                    inst: r2ssa::InstId(20),
+                    input_idx: 2,
+                },
                 identity_values: BTreeSet::from([r2ssa::ValueId(8), r2ssa::ValueId(2)]),
             }],
             dominating_initializers: vec![
                 r2ssa::LoopCarrierEdgeValue {
                     predecessor: 0x400fd0,
                     value: r2ssa::ValueId(6),
+                    site: r2ssa::UseSite {
+                        inst: r2ssa::InstId(30),
+                        input_idx: 0,
+                    },
                 },
                 r2ssa::LoopCarrierEdgeValue {
                     predecessor: 0x400fc0,
                     value: r2ssa::ValueId(3),
+                    site: r2ssa::UseSite {
+                        inst: r2ssa::InstId(30),
+                        input_idx: 1,
+                    },
                 },
             ],
             ty: None,
@@ -4724,10 +4744,18 @@ mod tests {
         let edge = |predecessor, value| r2ssa::LoopCarrierEdgeValue {
             predecessor,
             value: r2ssa::ValueId(value),
+            site: r2ssa::UseSite {
+                inst: r2ssa::InstId(value),
+                input_idx: 0,
+            },
         };
         let update = |predecessor, value, identities| r2ssa::LoopCarrierUpdateFact {
             predecessor,
             value: r2ssa::ValueId(value),
+            site: r2ssa::UseSite {
+                inst: r2ssa::InstId(value),
+                input_idx: 0,
+            },
             identity_values: identities,
         };
         let make_carrier =
@@ -5629,6 +5657,28 @@ mod tests {
         let mut facts = FunctionFacts::new(type_facts, None);
 
         facts.attach_prepared_decompile_evidence(&prepared);
+        let upstream_carrier = prepared
+            .structured()
+            .loops
+            .values()
+            .flat_map(|loop_fact| loop_fact.carriers.iter())
+            .next()
+            .expect("prepared loop carrier");
+        let projected_carrier = facts
+            .render()
+            .and_then(|render| render.certified_entities.get(&upstream_carrier.id))
+            .expect("projected loop carrier");
+        assert!(matches!(
+            projected_carrier,
+            CertifiedEntity::LoopCarrier {
+                entries,
+                updates,
+                dominating_initializers,
+                ..
+            } if entries == &upstream_carrier.entries
+                && updates == &upstream_carrier.updates
+                && dominating_initializers == &upstream_carrier.dominating_initializers
+        ));
         facts.populate_member_access_render_facts_from_field_certificates(
             &prepared,
             &x86_stack_home_param_slots(),

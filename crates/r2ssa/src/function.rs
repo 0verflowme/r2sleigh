@@ -7716,7 +7716,7 @@ mod tests {
         ];
         function.get_block_mut(0x1a30).expect("loop exit").phis = vec![PhiNode {
             dst: result.clone(),
-            sources: vec![(0x1a00, init.clone()), (0x1a20, update)],
+            sources: vec![(0x1a00, init.clone()), (0x1a20, update.clone())],
             canonical_storage: None,
         }];
         function.get_block_mut(0x1a30).expect("loop exit").ops = vec![SSAOp::Return {
@@ -7726,7 +7726,10 @@ mod tests {
         let prepared = SsaArtifact::new(function, FunctionPrepareMode::Raw);
         let phi_value = prepared.graph().value_id_for_var(&phi).unwrap();
         let init_value = prepared.graph().value_id_for_var(&init).unwrap();
+        let update_value = prepared.graph().value_id_for_var(&update).unwrap();
         let result_value = prepared.graph().value_id_for_var(&result).unwrap();
+        let phi_inst = prepared.graph().def_inst(phi_value).unwrap();
+        let result_inst = prepared.graph().def_inst(result_value).unwrap();
         let carrier = prepared
             .structured()
             .loops
@@ -7734,13 +7737,46 @@ mod tests {
             .flat_map(|loop_fact| loop_fact.carriers.iter())
             .find(|carrier| carrier.phi == phi_value)
             .expect("loop carrier");
+        assert!(carrier.validate(prepared.graph()));
         assert!(carrier.identity_values.contains(&result_value));
+        assert_eq!(
+            carrier.entries,
+            vec![crate::LoopCarrierEdgeValue {
+                predecessor: 0x1a10,
+                value: init_value,
+                site: crate::UseSite {
+                    inst: phi_inst,
+                    input_idx: 0,
+                },
+            }]
+        );
+        assert_eq!(carrier.updates.len(), 1);
+        assert_eq!(carrier.updates[0].predecessor, 0x1a20);
+        assert_eq!(carrier.updates[0].value, update_value);
+        assert_eq!(
+            carrier.updates[0].site,
+            crate::UseSite {
+                inst: phi_inst,
+                input_idx: 1,
+            }
+        );
         assert_eq!(
             carrier.dominating_initializers,
             vec![crate::LoopCarrierEdgeValue {
                 predecessor: 0x1a00,
                 value: init_value,
+                site: crate::UseSite {
+                    inst: result_inst,
+                    input_idx: 0,
+                },
             }]
+        );
+
+        let mut forged = carrier.clone();
+        forged.entries[0].site.input_idx = 1;
+        assert!(
+            !forged.validate(prepared.graph()),
+            "a carrier must reject a site that names a different phi input"
         );
     }
 

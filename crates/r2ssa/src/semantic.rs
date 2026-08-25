@@ -12,7 +12,7 @@ use crate::address::{AddressProvenanceFacts, collect_address_provenance};
 use crate::assumption::{AssumptionSet, AssumptionSubject, AssumptionUsageReport, AssumptionValue};
 use crate::cfg::BlockTerminator;
 use crate::function::{DecompilePrepFacts, SSAFunction, StackAddressBase, StackAddressRoot};
-use crate::graph::{InstId, InstPayload, SsaGraph, ValueId};
+use crate::graph::{InstId, InstPayload, SsaGraph, UseSite, ValueId};
 use crate::machine_context::{
     SOURCE_FUNCTION_INTERFACE_SCHEMA_VERSION, SOURCE_TYPE_GRAPH_SCHEMA_VERSION, SourceCallResult,
     SourceCallSiteIdentity, SourceCarrierKind, SourceFunctionReturn, SourceLogicalValue,
@@ -754,14 +754,38 @@ pub enum StructuredLoopKind {
 pub struct LoopCarrierEdgeValue {
     pub predecessor: u64,
     pub value: ValueId,
+    /// Exact phi input consuming `value` on `predecessor`'s edge.
+    ///
+    /// Loop-carrier facts are an in-memory prepared-fact contract and are not
+    /// part of r2ssa's serde schema, so this field does not change persisted
+    /// artifact compatibility.
+    pub site: UseSite,
+}
+
+impl LoopCarrierEdgeValue {
+    /// Prove that this edge names the exact indexed input and predecessor of a
+    /// canonical graph phi. This is O(1) in the size of the graph.
+    pub fn validate(&self, graph: &SsaGraph) -> bool {
+        loop_carrier_phi_input_matches(graph, self.predecessor, self.value, self.site)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct LoopCarrierUpdateFact {
     pub predecessor: u64,
     pub value: ValueId,
+    /// Exact header-phi input consuming `value` on `predecessor`'s edge.
+    pub site: UseSite,
     /// Values bit-identical to `value` through same-width copy chains.
     pub identity_values: BTreeSet<ValueId>,
+}
+
+impl LoopCarrierUpdateFact {
+    /// Prove that this update names the exact indexed input and predecessor of
+    /// a canonical graph phi. This is O(1) in the size of the graph.
+    pub fn validate(&self, graph: &SsaGraph) -> bool {
+        loop_carrier_phi_input_matches(graph, self.predecessor, self.value, self.site)
+    }
 }
 
 /// A loop-carried mutable value proven directly from header phi edges.
@@ -783,6 +807,73 @@ pub struct LoopCarrierFact {
     /// Entry-valued predecessor edges that dominate the loop header and can
     /// initialize the coalesced carrier before zero-iteration exits.
     pub dominating_initializers: Vec<LoopCarrierEdgeValue>,
+}
+
+impl LoopCarrierFact {
+    /// Validate every retained edge against the graph that owns this fact.
+    ///
+    /// Entry and update sites must be inputs of this carrier's header phi.
+    /// Dominating initializer sites must be inputs of a phi whose output is
+    /// one of this carrier's certified identity values.
+    pub fn validate(&self, graph: &SsaGraph) -> bool {
+        let Some(phi_inst) = graph.def_inst(self.phi) else {
+            return false;
+        };
+        let Some(inst) = graph.inst(phi_inst) else {
+            return false;
+        };
+        if !matches!(inst.payload, InstPayload::Phi { .. })
+            || inst.output != Some(self.phi)
+            || graph.block(inst.block).map(|block| block.addr) != Some(self.header)
+            || self.id != SemanticId::loop_carrier(self.phi)
+        {
+            return false;
+        }
+
+        let entry_values = self
+            .entries
+            .iter()
+            .map(|entry| entry.value)
+            .collect::<BTreeSet<_>>();
+
+        self.entries
+            .iter()
+            .all(|edge| edge.site.inst == phi_inst && edge.validate(graph))
+            && self
+                .updates
+                .iter()
+                .all(|update| update.site.inst == phi_inst && update.validate(graph))
+            && self.dominating_initializers.iter().all(|edge| {
+                edge.site.inst != phi_inst
+                    && edge.validate(graph)
+                    && entry_values.contains(&edge.value)
+                    && graph
+                        .inst(edge.site.inst)
+                        .and_then(|inst| inst.output)
+                        .is_some_and(|output| self.identity_values.contains(&output))
+            })
+    }
+}
+
+fn loop_carrier_phi_input_matches(
+    graph: &SsaGraph,
+    predecessor: u64,
+    value: ValueId,
+    site: UseSite,
+) -> bool {
+    let Some(inst) = graph.inst(site.inst) else {
+        return false;
+    };
+    let InstPayload::Phi { predecessors } = &inst.payload else {
+        return false;
+    };
+
+    inst.inputs.get(site.input_idx) == Some(&value)
+        && predecessors
+            .get(site.input_idx)
+            .and_then(|predecessor| graph.block(*predecessor))
+            .map(|block| block.addr)
+            == Some(predecessor)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -5133,6 +5224,7 @@ fn loop_carrier_facts(
         .iter()
         .filter_map(|phi| {
             let phi_value = graph.value_id_for_var(&phi.dst)?;
+            let phi_inst = graph.def_inst(phi_value)?;
             // Pruned SSA is not guaranteed at this seam. A loop-local output
             // can induce a syntactic header phi whose value is never read;
             // such a dead merge carries no live state and must not acquire a
@@ -5144,15 +5236,23 @@ fn loop_carrier_facts(
             }
             let mut entries = Vec::new();
             let mut updates = Vec::new();
-            for (predecessor, source) in &phi.sources {
+            for (input_idx, (predecessor, source)) in phi.sources.iter().enumerate() {
                 let edge = LoopCarrierEdgeValue {
                     predecessor: *predecessor,
                     value: graph.value_id_for_var(source)?,
+                    site: UseSite {
+                        inst: phi_inst,
+                        input_idx,
+                    },
                 };
+                if !edge.validate(graph) {
+                    return None;
+                }
                 if latches.contains(predecessor) {
                     updates.push(LoopCarrierUpdateFact {
                         predecessor: edge.predecessor,
                         value: edge.value,
+                        site: edge.site,
                         identity_values: exact_copy_identity_values(graph, edge.value),
                     });
                 } else {
@@ -5194,18 +5294,39 @@ fn loop_carrier_facts(
                 let Some(output) = graph.value_id_for_var(&phi.dst) else {
                     continue;
                 };
+                let Some(phi_inst) = graph.def_inst(output) else {
+                    continue;
+                };
                 if carriers
                     .iter()
                     .any(|carrier| carrier.identity_values.contains(&output))
                 {
                     continue;
                 }
-                let inputs = phi
+                let Some(source_edges) = phi
                     .sources
                     .iter()
-                    .filter_map(|(_, source)| graph.value_id_for_var(source))
+                    .enumerate()
+                    .map(|(input_idx, (predecessor, source))| {
+                        let edge = LoopCarrierEdgeValue {
+                            predecessor: *predecessor,
+                            value: graph.value_id_for_var(source)?,
+                            site: UseSite {
+                                inst: phi_inst,
+                                input_idx,
+                            },
+                        };
+                        edge.validate(graph).then_some(edge)
+                    })
+                    .collect::<Option<Vec<_>>>()
+                else {
+                    continue;
+                };
+                let inputs = source_edges
+                    .iter()
+                    .map(|edge| edge.value)
                     .collect::<BTreeSet<_>>();
-                if inputs.len() != phi.sources.len() || inputs.is_empty() {
+                if inputs.len() != source_edges.len() || inputs.is_empty() {
                     continue;
                 }
                 let mut matches = carriers.iter_mut().filter(|carrier| {
@@ -5231,17 +5352,14 @@ fn loop_carrier_facts(
                     continue;
                 };
                 if matches.next().is_none() && carrier.identity_values.insert(output) {
-                    for (predecessor, source) in &phi.sources {
-                        let Some(value) = graph.value_id_for_var(source) else {
-                            continue;
-                        };
-                        if carrier.entries.iter().any(|entry| entry.value == value)
-                            && function.dominates(*predecessor, header)
+                    for edge in source_edges {
+                        if carrier
+                            .entries
+                            .iter()
+                            .any(|entry| entry.value == edge.value)
+                            && function.dominates(edge.predecessor, header)
                         {
-                            carrier.dominating_initializers.push(LoopCarrierEdgeValue {
-                                predecessor: *predecessor,
-                                value,
-                            });
+                            carrier.dominating_initializers.push(edge);
                         }
                     }
                     changed = true;
@@ -5254,6 +5372,7 @@ fn loop_carrier_facts(
         carrier.dominating_initializers.sort_unstable();
         carrier.dominating_initializers.dedup();
     }
+    carriers.retain(|carrier| carrier.validate(graph));
     carriers.sort_by_key(|carrier| carrier.phi);
     carriers
 }
@@ -9114,5 +9233,4 @@ mod tests {
         let block = block_with_phis(vec![phi_of("RCX", 8), phi_of("RDX", 8)]);
         assert_eq!(unique_return_value_phi_for_block(Some(&machine), &block), None);
     }
-
 }
