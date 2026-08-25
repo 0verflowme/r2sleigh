@@ -552,12 +552,33 @@ learn.
      origin by value is right for a temporary and wrong for a stack local: it
      spells the temporary correctly and the stack local by its temp name.
 
-     The completing set is therefore four things, not two: resolve origins by
-     value; have `sym_for_var` reuse the identifier; **make the stack slot's name
-     reachable from the spelling path**; and only then does the condition agree
-     with the statement for both kinds of value. The third is the one still
-     missing, and it is the same gap recorded at the top of this item -- the
-     alias is not where the speller looks.
+     The third was then built on its own and measured too. `NameSource` gained a
+     `stack_alias` hook, consulted by `spell_var` after `var_alias`, answered by
+     `FoldingContext` from `stack_slot_for_name` and restricted to `Scalar`
+     slots so an address-like value could not lose its `&`. It reaches **the same
+     22**, and the loop header it was aimed at is *fixed* --
+     `for (long local_28 = 0; local_28 < arg1; ...)` -- while a different line
+     breaks: `local_1c = t11e00 ^ t11f00_2;`, where `t11f00_2` is now undeclared.
+     A value that used to spell `t11f00_2` now spells `local_1c`, and the other
+     value that shared that spelling does not, so a pairing that held by accident
+     comes apart.
+
+     **That is the finding, and it is the important one.** Three different
+     partial applications -- spelling at the origin, resolving origins by value
+     with identifier reuse, and adding a stack source to the speller -- each land
+     on exactly 36 down to 22. The spelling layers are an additive ladder of
+     fallbacks (`carrier_alias`, then `var_alias`, then `param_alias`, then a
+     base name), and values that agree today often agree because they fall
+     through to the *same* rung, not because anything decided they were the same.
+     Adding a source to any rung re-sorts that agreement and desynchronises
+     values that were previously consistent by accident.
+
+     So the fix cannot be another fallback, however well-founded. It has to
+     replace the ladder with one decision: a value's name is chosen once, from
+     everything known about it, and every layer asks for that name rather than
+     re-deriving it from whichever table it happens to hold. That is the location
+     model's naming half stated as an instruction, and the 22 is the measurement
+     that says a partial version of it is worse than none.
 
      What is known to work is narrower and already landed: `for_ssa_name` lets a
      caller holding a raw SSA name reach the identifier already minted for that
