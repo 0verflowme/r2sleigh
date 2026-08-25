@@ -677,13 +677,24 @@ learn.
      non-latch sources, so a post-loop write was never going to appear there
      whatever width it had.
 
-     That points at the span machinery instead. `StorageSpans` exists to say
-     where a storage stops holding one value, and `carriers_spanning_a_reuse`
-     already reports carriers that cross such a point -- but the dump for
-     murmur3 shows both gates empty (`mirrored=[] reused=[]`), so this reuse is
-     not being detected. Check why `carriers_spanning_a_reuse` does not include
-     `rcx` here before changing carrier growth; if the span ended where the tail
-     reuses the register, the carrier would not answer for `k1` at all.
+     That points at the span machinery instead, and reading it explains the empty
+     gate. `carriers_spanning_a_reuse` builds its occupant set from
+     `carrier_members(carrier)` and then filters those to the ones sharing the
+     carrier's storage, so it only ever inspects values the carrier already
+     claims. murmur3's `ECX_3` is not a member -- it is the write that *takes the
+     register over* after the loop -- so it is not an occupant, the members it
+     does see are all in one span, and the carrier is reported as not spanning a
+     reuse. The detector cannot see a reuse by a value outside the carrier,
+     which is the only kind of reuse there is.
+
+     Asking the question of the *place* rather than of the members would answer
+     it: are there values at `{Register, offset 0}` in a different span from the
+     carrier's own. But note the warning in that function's own comment before
+     widening it -- over-reporting "spans a reuse" once dropped every counter on
+     this target from the name aliases and rendered each as the value it held on
+     entry, "a loop whose condition never changes". The gate was tightened
+     deliberately, so any widening needs the arm64 -O0 and -O1 counters measured
+     specifically, not just the corpus total.
 
      Note that the same width question is asked in a *third* place, which is an
      argument for putting it somewhere shared: `carrier_member_views` in
