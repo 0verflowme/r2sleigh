@@ -722,11 +722,29 @@ learn.
      statement becomes a write to the carrier and resolves to the carrier's entry
      value.
 
-     So the question is narrower than "spans a reuse" and narrower than live
-     range: **why is `ECX_3` spelled `rcx` when it is not a member of the `rcx`
-     carrier?** Trace `spell_var` for `ECX_3` -- its own base name is `ecx` -- and
-     find which table hands back the carrier's name for it. That table is the
-     defect, and neither the certification nor the span gate needs to change.
+     Tracing `spell_var` for `ECX_3` answers that and moves the question again:
+
+     ```
+     SPELL display=ECX_3 carrier=None var_alias=None param=Some("arg3") base=ecx
+     ```
+
+     `ECX_3` is *not* spelled `rcx` -- no carrier alias, no coalesced alias, and
+     its own base name is `ecx`. So the `rcx = (uint32_t)arg3;` line is not this
+     value's statement, and identifying which SSA value it does assign is the
+     next step.
+
+     But the same probe shows something to chase first: `param_alias(ECX)` is
+     `Some("arg3")`. murmur3 takes three parameters and is rendered with five
+     (`arg0..arg4`), so `ecx` is in `param_register_aliases` only because `rcx` is
+     the fourth SysV argument register and parameter recovery claimed a fourth
+     argument this function does not have. Any version-zero read of `ecx` then
+     renders as `arg3` -- which is exactly what the lost zero looks like.
+
+     That is the same shape as the arm64 defect fixed earlier on this branch,
+     where `x29` and `x30` were recovered as the third and fourth arguments
+     because the argument-register test matched by substring. The x86-64 side has
+     its own over-recovery: check why `murmur3_32` recovers five parameters when
+     r2 reports three, before any further work on carriers or spelling.
 
      A measurement note that cost an hour here: when `make -C r2plugin install`
      fails -- and it does, intermittently, with `codesign: internal error in Code
