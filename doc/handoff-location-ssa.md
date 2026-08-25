@@ -4668,8 +4668,19 @@ and the name reaches the page through `spell_every_name_as_c`, which sanitises
 identifier.
 
 `SSAVar::display_name` always appends `_{version}`, so `tmp:4700` cannot have come
-from a display name at all. Something is putting a bare storage name where a
-value name belongs, and finding that site is the next step for this family.
+from a display name at all.
+
+Four probes now come back empty for it: `name_ref`, `SymbolTable::declare_or_reuse`,
+`SymbolTable::declare` (which carries its own `NAMEDECLARE` trace), and the
+`NAMEDECL`/`NAMEMINT` sites in `variable.rs` and `prepared_semantic.rs` that fire
+for ordinary names like `rdi_5`. None of them ever sees `tmp:4700`, `tmp_4700`,
+`t4700` or `tmp:4700_0`.
+
+So the identifier on the page was not minted by any route this branch knows how
+to watch. That is the state: something puts a bare storage name where a value
+name belongs, and the four ways a name normally comes into being are all
+eliminated. Finding the fifth is the next step, and it wants a probe on the
+symbol table's construction rather than on its named entry points.
 
 The corpus is 35 of 54 throughout -- this moves `xxhash32` from one undeclared
 name to another rather than to a rendering that compiles.
