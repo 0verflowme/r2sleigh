@@ -5,8 +5,14 @@ Execution status as of 2026-08-26 on `codex/binding-spine-rewrite`:
 - stage 0, the honest 54-cell harness, is committed at `e787934`;
 - stage 1, the non-consuming binding-plan contract, is committed at `5078419`;
 - stage 2, canonical spans and sealed register/use/write projections, is
-  committed at `8c56573`, `697cc9a`, and `00eccbb`;
-- stage 3, the topology-only lowering split, is committed at `32f7adc`.
+  committed at `8c56573`, `697cc9a`, `00eccbb`, and `d7b378d`;
+- stage 3, the topology-only lowering split, is committed at `32f7adc`;
+- the exact loop-edge `UseSite` prerequisite for stage 5 is committed at
+  `ce53a33`;
+- the source-coherence fix that retains outputless literal leaves is committed
+  at `798a742`;
+- stage 4, the independent non-consuming binding audit, is committed at
+  `6f6cc33`.
 
 Every completed stage preserved all 54 raw-output snapshots byte-for-byte. The
 strict raw baseline reports 0 passing, 26 compile failures, 27 signature
@@ -204,20 +210,30 @@ target-specific zero-extension. `CanonicalLocation` exists precisely because
 > two places. A location is the register, and the slice is what a particular
 > access took of it.
 
-So:
+So the canonical upstream contract is:
 
 ```rust
 struct Binding { declaration_type: CType, /* ... */ }
 
 /// What one reader takes of the binding. Keyed by `UseSite`.
-struct UseProjection { bit_offset: u32, width: u32, conversion: Conversion }
+enum MachineUseDisposition {
+    Exact(MachineUseSlice),
+    Refused(MachineUseRefusal),
+}
 
 /// What one definition puts back. Keyed by definition site.
-enum WriteProjection { Full, Insert { bit_offset: u32 }, ZeroExtend { from: u32 } }
+enum MachineWriteDisposition {
+    Exact(MachineWriteProjection),
+    Refused(MachineWriteRefusal),
+}
 ```
 
 `ZeroExtend` is where `narrow_write_clears_register` moves: it stops being a
 predicate consulted at render time and becomes a fact recorded at the definition.
+`BindingPlan` owns one validated `MachineProjection` and delegates both lookups
+to it. Copying slice or write geometry into renderer-owned tables, even with an
+opaque proof beside each copy, would create the second answerer this rewrite is
+removing.
 
 ### Placement is derived, never stored
 
@@ -383,10 +399,13 @@ for all 54 whether or not they pass. Every transformer rewrite is listed.
 
 ### Stage 1 — Define the model, consume nothing
 
-Land `ValueDisposition`, `BindingId`, `Binding`, `UseProjection`,
-`WriteProjection`, the effect-disposition enum, and the refusal types. No
-construction, no consumption. Define the module APIs of `op_lower` and
-`use_info` in the same stage, because stage 3 splits along them.
+Land `ValueDisposition`, `BindingId`, `Binding`, the initial projection views,
+the effect-disposition enum, and the refusal types. No construction, no
+consumption. Define the module APIs of `op_lower` and `use_info` in the same
+stage, because stage 3 splits behind them. Stage 4 deletes the initial
+renderer-owned projection copies after the upstream `MachineProjection` proves
+it already owns the exact/refused dense tables; keeping both would violate the
+model rather than complete it.
 
 `analysis::use_info::UseAnalysisInput` owns the exact source-analysis seam.
 `fold::op_lower::PlannedLoweringInput::try_new` owns the source/plan seam and
@@ -435,26 +454,75 @@ mechanical.
 
 ### Stage 4 — Shadow construction and divergence classification
 
-Build the disposition, binding and projection tables from the existing analysis
-without consuming them. The checked seal proves exact source authority, machine
-projection validity, dense table completeness, certificate membership, and one
-disposition per obligation before producing a `BindingPlan`. At the
-analysis/render boundary, classify each divergence
-from the old tables **against canonical upstream evidence** — which of the two is
+Build the value-disposition and binding tables from the existing analysis
+without consuming them. Retain one validated upstream `MachineProjection` and
+delegate its dense use/write lookups rather than copying their facts. The checked
+seal proves exact source authority, machine-projection validity, dense domain
+completeness, certificate membership, and one disposition per SSA value before
+producing a `BindingPlan`. At the analysis/render boundary, classify each
+divergence from the old tables **against canonical upstream evidence** — which of the two is
 right, and which upstream fact says so.
 
 The divergence list is *evidence*, not the specification. A divergence where both
 sides disagree with upstream is a third finding, not a tie.
 
-**Gate:** every divergence classified as old-wrong, new-wrong, or both-wrong,
-each citing the upstream fact. Corpus byte-identical on all 54 — nothing consumes
-the tables yet, so any change means something does; find it.
+Observable-effect outcomes are deliberately not stored in this pre-render plan.
+Whether an effect rendered is knowable only after folding and final AST/ledger
+reconciliation; copying that answer backward into a future lowering input would
+be temporal circularity. Stage 4 records only the honest legacy observations
+available today: graph literals are inline, while nonconstant values, uses, and
+writes are `LegacyAbsent`. The old renderer has neither an authority-sealed
+value-decision journal nor stable original use/write identities after
+normalization. Inventing those answers from names would make the shadow result
+look complete by repeating the defect it is meant to expose. The decision
+journal lands after normalized origins in stage 5; the canonical effect ledger
+cuts over in stage 7.
+
+The shadow oracle is constructed independently from the candidate plan: it
+reseals the exact source artifact, builds a fresh machine projection, and derives
+certificate components with its own traversal. The report then re-derives and
+validates every stored observation and count. Its public audit ledger exposes
+the three domain equations and refusal total rather than caching a pass bit.
+Construction occurs only after code generation and the historical final work
+poll, so it cannot change rendered C or cancellation/deadline decisions.
+
+**Gate:** independently enumerate every canonical `ValueId`, every graph-input
+`UseSite`, and every output-producing `InstId`; the observed and classified
+counts must equal those three domain counts. Every non-agreement is classified
+as old-wrong, shadow-wrong, or both-wrong with a typed upstream evidence key,
+including equal-but-both-wrong cases. The gate requires
+`shadow_wrong = both_wrong = unclassified = 0` and `refused = 0`. A typed
+canonical refusal remains visible in the ledger, but it is a non-quality result,
+never a pass. The seal must be valid, and a non-empty source must produce a
+non-empty domain. Corpus raw output remains byte-identical on all 54 — nothing
+consumes the plan yet, so any change means something does; find it.
 
 ### Stage 5 — Cut over naming, delete the naming tables
 
 `ValueDisposition::Bound` becomes the only source of an identifier. Delete
 `carrier_alias`, `var_alias`, `param_alias` and the ladder ordering them, in the
 same change as the cutover — not a stage later.
+
+The cutover first replaces `MaterializedEdgeCopies` with a sealed normalization
+artifact whose block-aligned origin rows move with every inserted or removed op.
+An inserted phi-edge copy names its original phi definition and incoming
+`UseSite`; a guarded edge also records the original guard use and identifies its
+synthetic preserve operand as synthetic; a relocated certified initializer
+records the complete sorted set of phi uses it replaces. These are transformation
+origins, not new semantic identities. The current tuple `HashSet<(block, dst,
+src)>` loses those facts and can collapse distinct occurrences, so it cannot
+authorize the cutover. Where the upstream loop-carrier edge contract does not
+retain the exact phi-input `UseSite`, extend that contract in `r2ssa`; `r2dec`
+must not recover it from a predecessor/value pair.
+
+Once those origins are sealed, add an authority-bound legacy observation journal
+at the points where the old renderer actually binds, inlines, elides, or refuses
+each value/use/write obligation. Initialize the full dense V/U/W domain, accept
+only idempotent duplicate decisions, reject conflicts, and seal after final AST
+materialization. Binding equivalence comes from complete sorted `ValueId` member
+sets, never from emitted names or symbol-allocation order. This journal is the
+last comparison oracle for the naming cutover; it is not a second renderer
+contract.
 
 Expect a regression. A measured regression here is how far the rewrite still has
 to go, not grounds for reverting it.
@@ -465,8 +533,8 @@ honestly, whatever it is.
 
 ### Stage 6 — Cut over per-use projection, delete the width aliases
 
-Every `UseSite` renders through its `UseProjection`. Delete the width and
-member-view aliases in the same change.
+Every `UseSite` renders through its canonical `MachineUseDisposition`. Delete
+the width and member-view aliases in the same change.
 
 **Gate:** raw score compiles under strict dialect with warnings as errors, on
 every entry that renders. Every `UseSite` has an upstream-backed projection —
