@@ -890,11 +890,31 @@ learn.
      message. The bound is genuinely inert, not a stale reading.
 
      Practical note for anyone measuring here: `make -C r2plugin install` fails
-     intermittently with `codesign: internal error in Code Signing subsystem`,
-     sometimes for a dozen attempts in a row and sometimes not at all. A failed
-     install leaves the previous plugin in place, so the sweep silently reports
-     the *old* build's number. Loop the install until it prints `Installed to`
-     before every measurement; a hand-copy of the dylib is not equivalent.
+     intermittently with `codesign: internal error in Code Signing subsystem` --
+     sometimes once, sometimes for forty attempts in a row. **A failed install
+     leaves the previous plugin in place, so the sweep silently reports the old
+     build's number**, which is how two readings in this document were briefly
+     wrong. Always loop until it prints `Installed to`.
+
+     When it will not, this fallback is verified equivalent -- it reproduces the
+     same corpus number as a successful `make install` on the same tree:
+
+     ```sh
+     codesign --force --sign - target/release/libr2sleigh_plugin.dylib
+     cp -f target/release/libr2sleigh_plugin.dylib r2plugin/r2sleigh/
+     cp -f r2plugin/r2sleigh/libr2sleigh_plugin.dylib \
+        ~/.local/share/radare2/plugins/r2sleigh/
+     for f in anal_sleigh arch_sleigh; do
+       codesign --force --sign - ~/.local/share/radare2/plugins/$f.dylib
+     done
+     ```
+
+     The last loop is the part that matters and the part an earlier attempt
+     omitted: copying only the Rust dylib leaves the two C plugins signed against
+     the previous one, and the corpus then reads 19 -- the same number a real
+     regression produces. Signing in place works even when signing a fresh copy
+     in a temporary directory does not, which is the whole of why the Makefile's
+     step fails and this one does not.
 
      Do not reach for another guard in `structure.rs`: three have now been
      measured there, one at 37 to 17, one that landed, and this check, and each
