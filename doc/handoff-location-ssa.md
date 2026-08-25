@@ -865,6 +865,24 @@ learn.
      not reaching the merge through `analyze_region_recursive` at all, or the
      finaliser arrives in the else by some route other than region growth.
 
+     **Why it is inert, read from the code rather than measured:** murmur3 does
+     not go through `analyze_conditional` at all. A probe there prints nothing
+     for this function, so the `IfThenElse` comes from the other construction
+     site in `region.rs`, the bottom-up one that builds a `region_map` and then
+     forms conditionals from it:
+
+     ```rust
+     let else_region = if Some(false_succ) != merge {
+         region_map.remove(&false_succ).map(Box::new)
+     } else { None };
+     ```
+
+     The else region is *taken already built*. Its extent was decided when the
+     region for `false_succ` was constructed, before this conditional existed, so
+     bounding branch analysis at the merge cannot affect it -- there is no branch
+     analysis here to bound. Fixing this means splitting a pre-built region at
+     the merge, which is a change to that algorithm rather than a guard anywhere.
+
      That inert result has since been re-measured with a verified
      `make install` -- the run printed `Installed to ...` on the eighth attempt,
      the `codesign` fault having failed the first seven -- and it holds: corpus
