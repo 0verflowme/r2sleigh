@@ -109,6 +109,17 @@ fn should_exclude_name(name: &str, known_function_names: &HashSet<String>) -> bo
         return true;
     }
 
+    // A raw SSA name is not a rendered identifier, and dropping its version
+    // turns a value into a storage: `tmp:4700_7` becomes `tmp:4700`, which names
+    // the temporary rather than the seventh value in it, and is later sanitised
+    // to `tmp_4700`. The same value's other symbol keeps `t4700_7`, so the two
+    // spellings diverge and the condition names something no statement assigns.
+    // This pass exists to make rendered names readable; a name it cannot spell
+    // is not one of them.
+    if name.contains(':') {
+        return true;
+    }
+
     // Semantic names should not be treated as SSA suffix candidates.
     if lower.starts_with("local_")
         || lower.starts_with("arg")

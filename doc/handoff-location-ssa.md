@@ -4687,12 +4687,27 @@ So six routes are ruled out: `name_ref`, `declare_or_reuse`, `declare`, `rename`
 the `NAMEDECL`/`NAMEMINT` sites, and `External`. The identifier reaches the page
 without passing any of them.
 
-That is the honest state of this thread. The remaining possibilities are narrow
--- a symbol created before those entry points are reachable, or a table merged in
-from elsewhere -- and distinguishing them wants a probe on `Symbol` construction
-itself rather than on any named API. It is the next step and it is a different
-kind of instrumentation from anything used so far, which is worth knowing before
-starting.
+Dumping the table settles it. A symbol named `tmp:4700` does exist, beside
+`t4700_1`, `t4700_7` and the rest -- and the trace that finds it is
+`NAMEFOLLOW tmp:4700_7 -> tmp:4700`. Nothing mints that name; a **rename**
+produces it.
+
+`post_rename::build_rename_map` drops the version suffix when a base has exactly
+one version, which makes `x10_2` read as `x10`. Applied to a raw SSA name it
+turns a value into a storage: `tmp:4700_7`, the seventh value in that temporary,
+becomes `tmp:4700`, the temporary itself. `spell_every_name_as_c` then sanitises
+that to `tmp_4700`, while the same value's other symbol keeps `t4700_7`, and the
+two spellings diverge further than they started.
+
+`should_exclude_name` now excludes any name containing a colon. A raw SSA name is
+not a rendered identifier, and a pass that exists to make rendered names readable
+has no business renaming one it cannot spell. The condition keeps its version --
+`tmp_4700_7` rather than `tmp_4700` -- so a value is no longer renamed into a
+storage.
+
+It does not fix the failure. `xxhash32` still fails on `tmp_4700_7`, which is the
+two-spelling problem this section opened with, and the corpus is 35 of 54
+throughout. What it removes is a pass actively making that problem worse.
 
 The corpus is 35 of 54 throughout -- this moves `xxhash32` from one undeclared
 name to another rather than to a rendering that compiles.
