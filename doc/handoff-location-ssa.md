@@ -865,13 +865,18 @@ learn.
      not reaching the merge through `analyze_region_recursive` at all, or the
      finaliser arrives in the else by some route other than region growth.
 
-     Caveat on that measurement, and it matters: `make -C r2plugin install` was
-     failing throughout with the `codesign` fault, so the build was installed by
-     hand -- signing the dylib in place, copying it, and re-signing the two C
-     plugins. The corpus read 37 both before and after, which is the signature of
-     a *working* install rather than the mixed one that reads 19, but a
-     hand-install is weaker evidence than the real thing. Re-run this measurement
-     with a successful `make install` before trusting the inert result.
+     That inert result has since been re-measured with a verified
+     `make install` -- the run printed `Installed to ...` on the eighth attempt,
+     the `codesign` fault having failed the first seven -- and it holds: corpus
+     37, and `murmur3_32` at arm64 -O1 fails on the same line with the same
+     message. The bound is genuinely inert, not a stale reading.
+
+     Practical note for anyone measuring here: `make -C r2plugin install` fails
+     intermittently with `codesign: internal error in Code Signing subsystem`,
+     sometimes for a dozen attempts in a row and sometimes not at all. A failed
+     install leaves the previous plugin in place, so the sweep silently reports
+     the *old* build's number. Loop the install until it prints `Installed to`
+     before every measurement; a hand-copy of the dylib is not equivalent.
 
      Do not reach for another guard in `structure.rs`: three have now been
      measured there, one at 37 to 17, one that landed, and this check, and each
