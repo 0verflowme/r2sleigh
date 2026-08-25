@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet};
 use r2ssa::{ObjectKind, SSAFunction, SSAOp, SSAVar, SsaArtifact};
 use r2types::{
     CTypeLike, ExternalStackBase, ExternalStackSlotRole, FunctionTypeFacts, StackSlotKey,
-    VisibleBinding, VisibleBindingKind,
+    VisibleBinding, VisibleBindingKind, register_alias_names,
 };
 
 use crate::DecompilerInput;
@@ -65,6 +65,16 @@ struct VarAttrs {
     is_local: bool,
     stack_offset: Option<i64>,
     param_ordinal: Option<usize>,
+}
+
+/// The register a source name spells, ignoring the space that qualifies it.
+///
+/// Sleigh writes a register source either bare (`x0`) or qualified by the space
+/// it lives in (`reg:x0`), and the argument-register test has to see the same
+/// token either way.
+fn register_token(name_lower: &str) -> Option<&str> {
+    let token = name_lower.rsplit(':').next()?;
+    (!token.is_empty()).then_some(token)
 }
 
 impl VarAttrs {
@@ -629,20 +639,35 @@ impl VariableRecovery {
             return;
         }
 
-        // Scan entire function for version-0 uses of CC arg registers
+        // Scan entire function for version-0 uses of CC arg registers.
+        //
+        // A register is an argument register when it *is* one, not when its name
+        // happens to contain one. Matching by substring made `x29` answer for
+        // `x2` and `x30` for `x3`, so every non-leaf arm64 function recovered
+        // its frame pointer and link register as its third and fourth
+        // parameters -- and the real third argument, spelled `w2`, never
+        // matched `x2` at all. The alias table already knows that `x2` is
+        // spelled `x2` or `w2` and nothing else.
+        let alias_to_cc_reg: HashMap<String, String> = self
+            .arg_regs
+            .iter()
+            .flat_map(|cc_reg| {
+                register_alias_names(cc_reg)
+                    .into_iter()
+                    .map(move |alias| (alias, cc_reg.to_string()))
+            })
+            .collect();
         let mut seen_v0: HashMap<String, SSAVar> = HashMap::new();
 
         for block in func.blocks() {
             for op in &block.ops {
                 for src in op.sources() {
                     if src.version == 0 {
-                        let name_lower = src.name.to_lowercase();
-                        for cc_reg in &self.arg_regs {
-                            if name_lower.contains(cc_reg) {
-                                seen_v0
-                                    .entry(cc_reg.to_string())
-                                    .or_insert_with(|| src.clone());
-                            }
+                        let name_lower = src.name.to_ascii_lowercase();
+                        if let Some(cc_reg) =
+                            register_token(&name_lower).and_then(|token| alias_to_cc_reg.get(token))
+                        {
+                            seen_v0.entry(cc_reg.clone()).or_insert_with(|| src.clone());
                         }
                     }
                 }
@@ -651,13 +676,11 @@ impl VariableRecovery {
             for phi in &block.phis {
                 for (_, src) in &phi.sources {
                     if src.version == 0 {
-                        let name_lower = src.name.to_lowercase();
-                        for cc_reg in &self.arg_regs {
-                            if name_lower.contains(cc_reg) {
-                                seen_v0
-                                    .entry(cc_reg.to_string())
-                                    .or_insert_with(|| src.clone());
-                            }
+                        let name_lower = src.name.to_ascii_lowercase();
+                        if let Some(cc_reg) =
+                            register_token(&name_lower).and_then(|token| alias_to_cc_reg.get(token))
+                        {
+                            seen_v0.entry(cc_reg.clone()).or_insert_with(|| src.clone());
                         }
                     }
                 }
@@ -1378,6 +1401,67 @@ mod tests {
 
         assert_eq!(stack_offsets_for_space(r2il::SpaceId::Ram), vec![-16, -8]);
         assert!(stack_offsets_for_space(r2il::SpaceId::Custom(7)).is_empty());
+    }
+
+    #[test]
+    fn frame_and_link_registers_are_not_recovered_as_arguments() {
+        // `x29` contains `x2` and `x30` contains `x3`, so a substring test made
+        // every non-leaf arm64 function recover its frame pointer and link
+        // register as its third and fourth arguments -- while the real third
+        // argument, spelled `w2`, matched nothing. The recovered parameters are
+        // then paired to the declared ones by position, so `x29` was handed the
+        // name `arg2` and every address it held rendered as that argument.
+        let symbols = test_table();
+        let mut block = R2ILBlock::new(0x1000, 1);
+        block.push(R2ILOp::Return {
+            target: Varnode::constant(0, 8),
+        });
+        let mut func = SSAFunction::from_blocks_raw_no_arch(&[block]).expect("ssa function");
+        func.get_block_mut(0x1000).expect("entry").ops = vec![
+            SSAOp::Copy {
+                dst: SSAVar::new("tmp:a", 1, 8),
+                src: SSAVar::new("x0", 0, 8),
+            },
+            SSAOp::Copy {
+                dst: SSAVar::new("tmp:b", 1, 8),
+                src: SSAVar::new("x1", 0, 8),
+            },
+            SSAOp::Copy {
+                dst: SSAVar::new("tmp:c", 1, 4),
+                src: SSAVar::new("w2", 0, 4),
+            },
+            SSAOp::Copy {
+                dst: SSAVar::new("tmp:frame", 1, 8),
+                src: SSAVar::new("x29", 0, 8),
+            },
+            SSAOp::Copy {
+                dst: SSAVar::new("tmp:link", 1, 8),
+                src: SSAVar::new("x30", 0, 8),
+            },
+        ];
+
+        let mut recovery = VariableRecovery::new_with_abi(
+            "sp",
+            "x29",
+            64,
+            ["x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7"]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            ["x0"].into_iter().map(str::to_string).collect(),
+        );
+        recovery.recover(&func, &symbols);
+
+        let recovered: Vec<_> = recovery
+            .parameters()
+            .into_iter()
+            .map(|info| info.ssa_var.name.to_ascii_lowercase())
+            .collect();
+        assert_eq!(
+            recovered,
+            vec!["x0", "x1", "w2"],
+            "the third argument is spelled w2, and x29/x30 are not arguments at all"
+        );
     }
 
     #[test]

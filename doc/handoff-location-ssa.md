@@ -134,7 +134,44 @@ learn.
      width layer and not to naming. Likewise `sym__rotl32` compiles once declared
      but cannot link, because the harness builds one function per file.
 
-  0a. **`stp x29, x30` renders as a store through an argument (arm64, non-leaf).**
+  0a. **[FIXED] `stp x29, x30` rendered as a store through an argument
+     (arm64, non-leaf).** The cause was `variable.rs`, which decided whether a
+     version-zero register was an argument register with
+     `name_lower.contains(cc_reg)`. `"x29"` contains `"x2"` and `"x30"` contains
+     `"x3"`, so every non-leaf arm64 function recovered its frame pointer and
+     link register as its third and fourth parameters, while the real third
+     argument -- spelled `w2` -- matched `"x2"` nowhere. `build_param_register_aliases`
+     then pairs recovered parameters to declared ones by position, which handed
+     `x29` the name `arg2`; from there every address held in `x29` rendered as
+     that argument, and the prologue's frame save came out as a store through it.
+
+     The trace that found it, in order: the store target resolves through
+     `render_canonical_store_target_expr` to `AddrOf(Var(81)) + 8` with symbol 81
+     spelling `arg2`; the definition is written at `prepared_semantic.rs:533` from
+     `lower.op_to_expr`, one level down from `tmp:7b80_1`, whose own definition
+     comes from site 3407; that resolves through `resolve_stack_var(-0x10)`,
+     which answers `arg2` from prepared, external and map at once; the single
+     alias-map entry at that offset carries `visible=local_10` but
+     `arg_alias=Some("arg2")` with `kind=None`, which is the store-scan writer;
+     and that writer's `param_register_aliases` contains `"x29": "arg2"`.
+
+     Fixed by matching against the register's alias set -- `register_alias_names`
+     already knows `x2` is spelled `x2` or `w2` and nothing else -- with a
+     `register_token` helper so the qualified spelling `reg:x0` still matches.
+     Regression test `frame_and_link_registers_are_not_recovered_as_arguments`;
+     it fails on the old code with `["x0", "x1", "x29", "x30"]`.
+
+     Corpus 35 to 36: x86-64 -O2 `pearson` goes from a wrong checksum to correct,
+     because the widened match now also admits the 32-bit spellings on x86-64,
+     which is what that function's arguments are. Both arm64 -O0 failures change
+     identity rather than clearing: the false `arg2` is gone and the frame-record
+     store now reads `((unsigned char *)t7b80_1)[1] = x30`, undeclared. Removing
+     the false arg alias also removed the map's only entry at that offset, since
+     the store scan was what created it, so the slot now has no visible name at
+     all. What remains there is that the prologue's frame save should not be
+     rendered as a program statement.
+
+  0c. **Superseded trace notes for 0a.**
      Both arm64 -O0 failures are this, and only this. The first statement of
      `murmur3_32` is
 
