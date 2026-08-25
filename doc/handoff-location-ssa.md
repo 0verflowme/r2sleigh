@@ -482,7 +482,7 @@ learn.
      changed `adler32`'s output. That was one sample per condition, and what it
      actually sampled was this.
 
-  0i. **A carrier reaches the return as its initialiser.** This is what the three
+  0i. **[FIXED] A carrier reached the return as its initialiser.** This is what the three
      x86-64 -O1 functions now fail on, having crossed from not compiling to
      compiling with the return-register fix. adler32 renders
 
@@ -507,9 +507,22 @@ learn.
      the `R8D` version that write reads, and at whether the carrier's
      initialiser has been recorded as that value's definition.
 
-     The same shape is worth checking on the other two: murmur3_32 -O1 returns
-     `ec1fbeef` against `7e4102af`, and xxhash32 -O1 returns nothing at all
-     against `e7583aa4`.
+     It was `expand_return_expr_in_context`. That function expands a name into
+     its definition to build a self-contained return expression, and had no
+     carrier guard at all -- while the predicate path a few hundred lines away
+     declines to expand a carrier and carries a comment describing this exact
+     failure ("Every counted loop exited one iteration early on that"). A carrier
+     holds a different value on each iteration, so its definition is only one of
+     them; expanding it answers the return with whichever that is. This is the
+     second table answering for one value.
+
+     Fixed by declining to expand a name that is a carrier's rendered name.
+
+     Measured: **corpus 36 to 37**. adler32 at x86-64 -O1 returns `9dd21488`,
+     which is correct, and that configuration goes from 5 to 6. The other two
+     still differ -- murmur3_32 -O1 returns `ec1fbeef` against `7e4102af`, and
+     xxhash32 -O1 returns nothing against `e7583aa4` -- so they are a different
+     defect rather than this one.
 
   0g. **murmur3's tail switch renders with empty bodies.** This is what arm64 -O0
      `murmur3_32` now fails on, and the undeclared `x8_30` is a symptom of it

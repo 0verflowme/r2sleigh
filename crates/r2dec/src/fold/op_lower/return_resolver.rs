@@ -909,6 +909,16 @@ impl<'a> FoldingContext<'a> {
 
         match expr {
             CExpr::Var(name) => {
+                // A carrier holds a different value on each iteration, so its
+                // definition is only one of them and expanding it here answers
+                // the return with whichever one that is. adler32 returned
+                // `eax_4 << 16 | 1` where `| r8d` was meant -- the accumulator's
+                // initialiser, read as its result. The predicate path already
+                // declines to expand a carrier for the same reason; this is the
+                // second table that answered for one.
+                if self.is_carrier_rendered_name(&self.spelling(*name)) {
+                    return expr.clone();
+                }
                 if let Some(val) = parse_const_value(&self.spelling(*name)) {
                     return self.typed_integer_literal_expr_in_context(val, context);
                 }
