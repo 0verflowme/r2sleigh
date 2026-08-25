@@ -24,7 +24,7 @@ pub enum SerializeError {
     #[error("Invalid architecture specification: {0}")]
     Validation(#[from] crate::ValidationError),
 
-    #[error("Invalid format discriminator: expected R2PSTC06")]
+    #[error("Invalid format discriminator: expected R2PSTC07")]
     InvalidMagic,
 
     #[error("Truncated r2il representation")]
@@ -73,6 +73,91 @@ impl RegisterDef {
             parent: Some(parent.into()),
         }
     }
+
+    /// Return the name-free storage occupied by this register declaration.
+    pub const fn storage(&self) -> RegisterStorage {
+        RegisterStorage {
+            offset: self.offset,
+            size: self.size,
+        }
+    }
+}
+
+/// One byte range in the architecture's register address space.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct RegisterStorage {
+    /// Byte offset in register space.
+    pub offset: u64,
+    /// Width in bytes.
+    pub size: u32,
+}
+
+impl RegisterStorage {
+    /// Return the exclusive byte end, or `None` when the range is invalid.
+    pub fn checked_end(self) -> Option<u64> {
+        (self.size != 0)
+            .then(|| self.offset.checked_add(u64::from(self.size)))
+            .flatten()
+    }
+
+    /// Whether this valid storage completely contains another valid storage.
+    pub fn contains(self, other: Self) -> bool {
+        self.offset <= other.offset
+            && self
+                .checked_end()
+                .zip(other.checked_end())
+                .is_some_and(|(carrier_end, written_end)| written_end <= carrier_end)
+    }
+}
+
+/// The exact bit range a register access occupies in its canonical carrier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct RegisterBitSlice {
+    /// Least-significant bit offset in the carrier.
+    pub lsb_bit_offset: u64,
+    /// Width in bits.
+    pub size_bits: u64,
+}
+
+/// Why source-owned register geometry could not certify a projection.
+///
+/// These are geometry failures only. Architectural write effects are properties
+/// of lifted definitions and deliberately do not appear in this contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum RegisterProjectionRefusal {
+    /// A declared byte range is empty or its exclusive end overflows.
+    InvalidStorageRange,
+    /// No declared carrier contains this storage.
+    NoContainingCarrier,
+    /// More than one incomparable carrier could own this storage.
+    AmbiguousContainingCarrier,
+    /// Two declarations for one storage supplied incompatible geometry.
+    ConflictingDeclarations,
+    /// Declared register ranges overlap without either containing the other.
+    PartialOverlap,
+    /// The source did not provide the byte significance needed for a bit slice.
+    MissingRegisterEndianness,
+}
+
+/// Either an exact carrier projection or a typed geometry refusal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum RegisterProjectionDisposition {
+    /// Exact source-owned carrier and bit slice.
+    Bound {
+        carrier: RegisterStorage,
+        slice: RegisterBitSlice,
+    },
+    /// Geometry was present but could not be certified.
+    Refused { reason: RegisterProjectionRefusal },
+}
+
+/// Canonical projection for one unique declared register storage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct RegisterProjection {
+    /// The accessed register storage this entry describes.
+    pub written: RegisterStorage,
+    /// Its certified carrier geometry or explicit refusal.
+    pub disposition: RegisterProjectionDisposition,
 }
 
 /// Instruction pattern and its semantic definition.
@@ -113,6 +198,13 @@ pub struct ArchSpec {
     /// Register definitions
     pub registers: Vec<RegisterDef>,
 
+    /// Name-free register carrier geometry, sorted by `written` storage.
+    ///
+    /// An empty table means the architecture source did not provide this
+    /// contract. A non-empty table covers every unique declared register
+    /// storage exactly once.
+    pub register_projections: Vec<RegisterProjection>,
+
     /// Registers this architecture's calling convention returns a value in, in
     /// preference order.
     ///
@@ -138,6 +230,7 @@ impl ArchSpec {
             alignment: 1,
             spaces: Vec::new(),
             registers: Vec::new(),
+            register_projections: Vec::new(),
             return_registers: Vec::new(),
         }
     }
@@ -174,6 +267,19 @@ impl ArchSpec {
     /// Look up a register by name.
     pub fn get_register(&self, name: &str) -> Option<&RegisterDef> {
         self.registers.iter().find(|r| r.name == name)
+    }
+
+    /// Look up source-owned register geometry in `O(log n)` time.
+    ///
+    /// Returns `None` when geometry is unavailable or the storage was not
+    /// declared. Validation guarantees that a non-empty table is sorted and
+    /// complete.
+    pub fn register_projection(&self, written: RegisterStorage) -> Option<&RegisterProjection> {
+        let index = self
+            .register_projections
+            .binary_search_by_key(&written, |projection| projection.written)
+            .ok()?;
+        self.register_projections.get(index)
     }
 }
 
@@ -288,6 +394,30 @@ mod tests {
 
         arch.add_register(RegisterDef::new("RAX", 0, 8));
         arch.add_register(RegisterDef::sub("EAX", 0, 4, "RAX"));
+        let rax = RegisterStorage { offset: 0, size: 8 };
+        let eax = RegisterStorage { offset: 0, size: 4 };
+        arch.register_projections = vec![
+            RegisterProjection {
+                written: eax,
+                disposition: RegisterProjectionDisposition::Bound {
+                    carrier: rax,
+                    slice: RegisterBitSlice {
+                        lsb_bit_offset: 0,
+                        size_bits: 32,
+                    },
+                },
+            },
+            RegisterProjection {
+                written: rax,
+                disposition: RegisterProjectionDisposition::Bound {
+                    carrier: rax,
+                    slice: RegisterBitSlice {
+                        lsb_bit_offset: 0,
+                        size_bits: 64,
+                    },
+                },
+            },
+        ];
 
         arch.add_space(AddressSpace::ram(8));
         arch.add_space(AddressSpace::register());
@@ -301,6 +431,19 @@ mod tests {
         assert_eq!(loaded.memory_endianness, Endianness::Little);
         assert_eq!(loaded.addr_size, 8);
         assert_eq!(loaded.registers.len(), 2);
+        assert_eq!(loaded.register_projections, arch.register_projections);
+        assert_eq!(
+            loaded.register_projection(eax),
+            Some(&arch.register_projections[0])
+        );
+        assert_eq!(
+            loaded.register_projection(rax),
+            Some(&arch.register_projections[1])
+        );
+        assert_eq!(
+            loaded.register_projection(RegisterStorage { offset: 8, size: 8 }),
+            None
+        );
         assert_eq!(loaded.spaces.len(), 2);
         assert_eq!(&bytes[..MAGIC.len()], MAGIC);
     }
@@ -315,11 +458,37 @@ mod tests {
     #[test]
     fn previous_format_discriminator_is_rejected() {
         let mut bytes = to_bytes(&valid_arch("previous-format")).expect("serialize fixture");
-        bytes[..MAGIC.len()].copy_from_slice(b"R2PSTC05");
+        bytes[..MAGIC.len()].copy_from_slice(b"R2PSTC06");
         assert!(matches!(
             from_bytes(&bytes),
             Err(SerializeError::InvalidMagic)
         ));
+    }
+
+    #[test]
+    fn current_roundtrip_preserves_typed_geometry_refusals() {
+        let mut arch = valid_arch("projection-refusal");
+        let first = RegisterStorage { offset: 0, size: 4 };
+        let second = RegisterStorage { offset: 2, size: 4 };
+        arch.add_register(RegisterDef::new("first", first.offset, first.size));
+        arch.add_register(RegisterDef::new("second", second.offset, second.size));
+        arch.register_projections = vec![
+            RegisterProjection {
+                written: first,
+                disposition: RegisterProjectionDisposition::Refused {
+                    reason: RegisterProjectionRefusal::PartialOverlap,
+                },
+            },
+            RegisterProjection {
+                written: second,
+                disposition: RegisterProjectionDisposition::Refused {
+                    reason: RegisterProjectionRefusal::PartialOverlap,
+                },
+            },
+        ];
+
+        let loaded = from_bytes(&to_bytes(&arch).expect("serialize")).expect("deserialize");
+        assert_eq!(loaded.register_projections, arch.register_projections);
     }
 
     #[test]

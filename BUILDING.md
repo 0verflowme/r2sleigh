@@ -156,8 +156,8 @@ cargo clippy --all-targets --all-features -- -D warnings
 R2IL Format Compatibility
 -------------------------
 
-- The sole format identity is `R2PSTC06`; there is no separate format-version authority.
-- The loader accepts exactly `R2PSTC06 || payload_length_u64_le || postcard(ArchSpec)` and rejects truncation or trailing bytes.
+- The sole format identity is `R2PSTC07`; there is no separate format-version authority.
+- The loader accepts exactly `R2PSTC07 || payload_length_u64_le || postcard(ArchSpec)` and rejects truncation or trailing bytes.
 - Older versions and encodings are rejected instead of being migrated through a second semantic path.
 
 Troubleshooting

@@ -2779,6 +2779,111 @@ mod tests {
         Varnode::register(offset, size)
     }
 
+    fn declared_register_storage(arch: &r2il::ArchSpec, name: &str) -> r2il::RegisterStorage {
+        arch.get_register(name)
+            .unwrap_or_else(|| panic!("embedded specification is missing {name}"))
+            .storage()
+    }
+
+    fn register_varnode(storage: r2il::RegisterStorage) -> Varnode {
+        Varnode::register(storage.offset, storage.size)
+    }
+
+    fn padded_instruction<const N: usize>(instruction: [u8; N]) -> [u8; 16] {
+        let mut bytes = [0_u8; 16];
+        bytes[..N].copy_from_slice(&instruction);
+        bytes
+    }
+
+    #[cfg(feature = "x86")]
+    #[test]
+    fn x86_32_bit_register_write_explicitly_zero_extends_its_declared_carrier() {
+        let disassembler = Disassembler::from_trusted_profile(TrustedSleighProfile::X86_64)
+            .expect("trusted x86-64 specification");
+        let bytes = padded_instruction([0x89, 0xd8]);
+        let lifted = disassembler
+            .lift_genuine_block(&bytes, 0x1000, 2)
+            .expect("mov eax, ebx lift");
+        let arch = lifted.authority().arch_spec();
+        let eax = declared_register_storage(arch, "EAX");
+        let ebx = declared_register_storage(arch, "EBX");
+        let rax = declared_register_storage(arch, "RAX");
+
+        assert_eq!(
+            lifted.block().ops,
+            vec![
+                R2ILOp::Copy {
+                    dst: register_varnode(eax),
+                    src: register_varnode(ebx),
+                },
+                R2ILOp::IntZExt {
+                    dst: register_varnode(rax),
+                    src: register_varnode(eax),
+                },
+            ]
+        );
+    }
+
+    #[cfg(feature = "arm")]
+    #[test]
+    fn aarch64_w_register_write_explicitly_zero_extends_its_declared_carrier() {
+        let disassembler = Disassembler::from_trusted_profile(TrustedSleighProfile::Aarch64Le)
+            .expect("trusted AArch64 specification");
+        // mov w0, w1 (alias of orr w0, wzr, w1), little-endian encoding.
+        let bytes = padded_instruction([0xe0, 0x03, 0x01, 0x2a]);
+        let lifted = disassembler
+            .lift_genuine_block(&bytes, 0x1000, 4)
+            .expect("mov w0, w1 lift");
+        let arch = lifted.authority().arch_spec();
+        let w0 = declared_register_storage(arch, "w0");
+        let w1 = declared_register_storage(arch, "w1");
+        let x0 = declared_register_storage(arch, "x0");
+
+        assert_eq!(
+            lifted.block().ops,
+            vec![R2ILOp::IntZExt {
+                dst: register_varnode(x0),
+                src: register_varnode(w1),
+            }]
+        );
+        assert!(matches!(
+            arch.register_projection(w0).map(|projection| projection.disposition),
+            Some(r2il::RegisterProjectionDisposition::Bound { carrier, .. })
+                if carrier == x0
+        ));
+    }
+
+    #[cfg(feature = "x86")]
+    #[test]
+    fn x86_byte_register_writes_do_not_invent_full_carrier_zero_extensions() {
+        for (instruction, destination_name) in [([0x88, 0xd8], "AL"), ([0x88, 0xdc], "AH")] {
+            let disassembler = Disassembler::from_trusted_profile(TrustedSleighProfile::X86_64)
+                .expect("trusted x86-64 specification");
+            let bytes = padded_instruction(instruction);
+            let lifted = disassembler
+                .lift_genuine_block(&bytes, 0x1000, 2)
+                .unwrap_or_else(|error| panic!("mov {destination_name}, bl lift: {error}"));
+            let arch = lifted.authority().arch_spec();
+            let destination = declared_register_storage(arch, destination_name);
+            let bl = declared_register_storage(arch, "BL");
+            let rax = declared_register_storage(arch, "RAX");
+
+            assert_eq!(
+                lifted.block().ops,
+                vec![R2ILOp::Copy {
+                    dst: register_varnode(destination),
+                    src: register_varnode(bl),
+                }]
+            );
+            assert!(!lifted.block().ops.iter().any(|op| matches!(
+                op,
+                R2ILOp::IntZExt { dst, src }
+                    if dst == &register_varnode(rax)
+                        && src == &register_varnode(destination)
+            )));
+        }
+    }
+
     #[test]
     fn pinned_arm64_memory_space_is_ram_and_instance_stable() {
         let first = Disassembler::from_sla(

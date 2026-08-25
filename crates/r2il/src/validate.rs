@@ -4,11 +4,13 @@
 //! specifications and lifted blocks. The checks are intentionally conservative
 //! and avoid deep semantic/type reasoning.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt;
 
 use crate::opcode::{R2ILBlock, R2ILOp};
-use crate::serialize::ArchSpec;
+use crate::serialize::{
+    ArchSpec, RegisterProjectionDisposition, RegisterProjectionRefusal, RegisterStorage,
+};
 use crate::{SpaceId, Varnode};
 
 /// A single validation issue.
@@ -158,13 +160,6 @@ pub fn validate_archspec(arch: &ArchSpec) -> Result<(), ValidationError> {
 
     let mut seen_reg_names = HashSet::new();
     for (i, reg) in arch.registers.iter().enumerate() {
-        if reg.size == 0 {
-            issues.push(ValidationIssue::new(
-                "arch.registers.size.zero",
-                format!("arch.registers[{i}].size"),
-                "register size must be > 0",
-            ));
-        }
         if !seen_reg_names.insert(reg.name.clone()) {
             issues.push(ValidationIssue::new(
                 "arch.registers.duplicate_name",
@@ -174,10 +169,454 @@ pub fn validate_archspec(arch: &ArchSpec) -> Result<(), ValidationError> {
         }
     }
 
+    if let Err(error) = validate_register_geometry(arch) {
+        issues.extend(error.issues);
+    }
+
     if issues.is_empty() {
         Ok(())
     } else {
         Err(ValidationError::from_issues(issues))
+    }
+}
+
+/// Validate only the source-owned register geometry contract.
+///
+/// This checks register storage ranges and every invariant of a non-empty
+/// projection table. It deliberately ignores architecture names, address
+/// spaces, alignment, address width, and other facts unrelated to register
+/// geometry, so consumers can validate the canonical table without creating a
+/// second partial `ArchSpec` validator.
+pub fn validate_register_geometry(arch: &ArchSpec) -> Result<(), ValidationError> {
+    let mut issues = Vec::new();
+    let mut declared_register_storages = BTreeSet::new();
+    for (index, register) in arch.registers.iter().enumerate() {
+        if register.size == 0 {
+            issues.push(ValidationIssue::new(
+                "arch.registers.size.zero",
+                format!("arch.registers[{index}].size"),
+                "register size must be > 0",
+            ));
+        } else if register.storage().checked_end().is_none() {
+            issues.push(ValidationIssue::new(
+                "arch.registers.range.overflow",
+                format!("arch.registers[{index}]"),
+                "register storage end must fit in u64",
+            ));
+        }
+        declared_register_storages.insert(register.storage());
+    }
+
+    validate_register_projection_table(
+        &mut issues,
+        &declared_register_storages,
+        &arch.register_projections,
+    );
+    if issues.is_empty() {
+        Ok(())
+    } else {
+        Err(ValidationError::from_issues(issues))
+    }
+}
+
+fn validate_register_projection_table(
+    issues: &mut Vec<ValidationIssue>,
+    declared: &BTreeSet<RegisterStorage>,
+    projections: &[crate::RegisterProjection],
+) {
+    // Empty is the one explicit representation of unavailable source geometry.
+    if projections.is_empty() {
+        return;
+    }
+
+    let mut seen_written = BTreeSet::new();
+    for (index, projection) in projections.iter().enumerate() {
+        if !seen_written.insert(projection.written) {
+            issues.push(ValidationIssue::new(
+                "arch.register_projections.duplicate_written",
+                format!("arch.register_projections[{index}].written"),
+                "each unique register storage must have exactly one projection",
+            ));
+        }
+    }
+    for (index, pair) in projections.windows(2).enumerate() {
+        if pair[0].written > pair[1].written {
+            issues.push(ValidationIssue::new(
+                "arch.register_projections.unsorted",
+                format!("arch.register_projections[{}].written", index + 1),
+                "register projections must be strictly sorted by written storage",
+            ));
+        }
+    }
+
+    let projected = projections
+        .iter()
+        .map(|projection| projection.written)
+        .collect::<BTreeSet<_>>();
+    for storage in declared.difference(&projected) {
+        issues.push(ValidationIssue::new(
+            "arch.register_projections.missing_written",
+            "arch.register_projections",
+            format!(
+                "declared register storage at {:#x} with size {} has no projection",
+                storage.offset, storage.size
+            ),
+        ));
+    }
+    for storage in projected.difference(declared) {
+        issues.push(ValidationIssue::new(
+            "arch.register_projections.unknown_written",
+            "arch.register_projections",
+            format!(
+                "projection storage at {:#x} with size {} is not declared",
+                storage.offset, storage.size
+            ),
+        ));
+    }
+
+    for (index, projection) in projections.iter().enumerate() {
+        let path = format!("arch.register_projections[{index}]");
+        if projection.written.checked_end().is_none() {
+            issues.push(ValidationIssue::new(
+                "arch.register_projections.written.invalid_range",
+                format!("{path}.written"),
+                "written storage must be non-empty and its end must fit in u64",
+            ));
+        }
+        let RegisterProjectionDisposition::Bound { carrier, slice } = projection.disposition else {
+            continue;
+        };
+        if carrier.checked_end().is_none() {
+            issues.push(ValidationIssue::new(
+                "arch.register_projections.carrier.invalid_range",
+                format!("{path}.disposition.carrier"),
+                "carrier storage must be non-empty and its end must fit in u64",
+            ));
+            continue;
+        }
+        if !declared.contains(&carrier) {
+            issues.push(ValidationIssue::new(
+                "arch.register_projections.carrier.undeclared",
+                format!("{path}.disposition.carrier"),
+                "carrier storage must be one of the declared register storages",
+            ));
+        }
+        if !carrier.contains(projection.written) {
+            issues.push(ValidationIssue::new(
+                "arch.register_projections.carrier.does_not_contain_written",
+                format!("{path}.disposition.carrier"),
+                "carrier storage must completely contain written storage",
+            ));
+        }
+
+        let written_bits = u64::from(projection.written.size) * 8;
+        let carrier_bits = u64::from(carrier.size) * 8;
+        if slice.size_bits == 0 {
+            issues.push(ValidationIssue::new(
+                "arch.register_projections.slice.size.zero",
+                format!("{path}.disposition.slice.size_bits"),
+                "register bit-slice size must be > 0",
+            ));
+        }
+        if slice.size_bits != written_bits {
+            issues.push(ValidationIssue::new(
+                "arch.register_projections.slice.size_mismatch",
+                format!("{path}.disposition.slice.size_bits"),
+                format!(
+                    "bit-slice size {} must match written storage width {written_bits}",
+                    slice.size_bits
+                ),
+            ));
+        }
+        match slice.lsb_bit_offset.checked_add(slice.size_bits) {
+            Some(slice_end) if slice_end <= carrier_bits => {}
+            Some(slice_end) => issues.push(ValidationIssue::new(
+                "arch.register_projections.slice.outside_carrier",
+                format!("{path}.disposition.slice"),
+                format!("bit slice ends at {slice_end}, beyond carrier width {carrier_bits}"),
+            )),
+            None => issues.push(ValidationIssue::new(
+                "arch.register_projections.slice.range_overflow",
+                format!("{path}.disposition.slice"),
+                "bit-slice end must fit in u64",
+            )),
+        }
+        if projection.written == carrier
+            && (slice.lsb_bit_offset != 0 || slice.size_bits != carrier_bits)
+        {
+            issues.push(ValidationIssue::new(
+                "arch.register_projections.full_storage.invalid_slice",
+                format!("{path}.disposition.slice"),
+                "a full-storage projection must use offset zero and the full carrier width",
+            ));
+        }
+    }
+
+    validate_register_projection_components(issues, declared, projections);
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RegisterGeometry {
+    storage: RegisterStorage,
+    end: u64,
+}
+
+fn register_components(declared: &BTreeSet<RegisterStorage>) -> Vec<Vec<RegisterGeometry>> {
+    let mut geometry = declared
+        .iter()
+        .filter_map(|storage| {
+            storage.checked_end().map(|end| RegisterGeometry {
+                storage: *storage,
+                end,
+            })
+        })
+        .collect::<Vec<_>>();
+    geometry.sort_by(|left, right| {
+        left.storage
+            .offset
+            .cmp(&right.storage.offset)
+            .then_with(|| right.end.cmp(&left.end))
+            .then_with(|| left.storage.cmp(&right.storage))
+    });
+
+    let mut components = Vec::new();
+    let mut start = 0;
+    while start < geometry.len() {
+        let mut end = geometry[start].end;
+        let mut limit = start + 1;
+        while limit < geometry.len() && geometry[limit].storage.offset < end {
+            end = end.max(geometry[limit].end);
+            limit += 1;
+        }
+        components.push(geometry[start..limit].to_vec());
+        start = limit;
+    }
+    components
+}
+
+fn component_has_partial_overlap(component: &[RegisterGeometry]) -> bool {
+    let mut containing_ends = Vec::<u64>::new();
+    for geometry in component {
+        while containing_ends
+            .last()
+            .is_some_and(|end| *end <= geometry.storage.offset)
+        {
+            containing_ends.pop();
+        }
+        if containing_ends
+            .last()
+            .is_some_and(|parent_end| geometry.end > *parent_end)
+        {
+            return true;
+        }
+        containing_ends.push(geometry.end);
+    }
+    false
+}
+
+fn validate_register_projection_components(
+    issues: &mut Vec<ValidationIssue>,
+    declared: &BTreeSet<RegisterStorage>,
+    projections: &[crate::RegisterProjection],
+) {
+    let projection_by_storage = projections.iter().enumerate().fold(
+        BTreeMap::new(),
+        |mut by_storage, (index, projection)| {
+            by_storage
+                .entry(projection.written)
+                .or_insert((index, projection));
+            by_storage
+        },
+    );
+
+    for component in register_components(declared) {
+        if component_has_partial_overlap(&component) {
+            for geometry in &component {
+                let Some((index, projection)) = projection_by_storage.get(&geometry.storage) else {
+                    continue;
+                };
+                if !matches!(
+                    projection.disposition,
+                    RegisterProjectionDisposition::Refused {
+                        reason: RegisterProjectionRefusal::PartialOverlap
+                    }
+                ) {
+                    issues.push(ValidationIssue::new(
+                        "arch.register_projections.component.partial_overlap_requires_refusal",
+                        format!("arch.register_projections[{index}].disposition"),
+                        "every storage in a partial-overlap component must refuse with PartialOverlap",
+                    ));
+                }
+            }
+            continue;
+        }
+
+        // `register_components` orders equal starts widest-first. Once the
+        // crossing-range check above proves this component laminar, its first
+        // interval is therefore the only possible maximal carrier: every
+        // later overlapping interval must be nested inside it. Retain the
+        // linear containment check as a fail-closed guard for that proof.
+        let canonical_carrier = component[0].storage;
+        if component
+            .iter()
+            .skip(1)
+            .any(|member| !canonical_carrier.contains(member.storage))
+        {
+            validate_component_refusal(
+                issues,
+                &component,
+                &projection_by_storage,
+                RegisterProjectionRefusal::AmbiguousContainingCarrier,
+            );
+            continue;
+        }
+        validate_laminar_component(
+            issues,
+            &component,
+            &projection_by_storage,
+            canonical_carrier,
+        );
+    }
+}
+
+fn validate_component_refusal(
+    issues: &mut Vec<ValidationIssue>,
+    component: &[RegisterGeometry],
+    projection_by_storage: &BTreeMap<RegisterStorage, (usize, &crate::RegisterProjection)>,
+    expected: RegisterProjectionRefusal,
+) {
+    for geometry in component {
+        let Some((index, projection)) = projection_by_storage.get(&geometry.storage) else {
+            continue;
+        };
+        if !matches!(
+            projection.disposition,
+            RegisterProjectionDisposition::Refused { reason } if reason == expected
+        ) {
+            issues.push(ValidationIssue::new(
+                "arch.register_projections.component.wrong_refusal",
+                format!("arch.register_projections[{index}].disposition"),
+                format!("every storage in this component must refuse with {expected:?}"),
+            ));
+        }
+    }
+}
+
+fn validate_laminar_component(
+    issues: &mut Vec<ValidationIssue>,
+    component: &[RegisterGeometry],
+    projection_by_storage: &BTreeMap<RegisterStorage, (usize, &crate::RegisterProjection)>,
+    canonical_carrier: RegisterStorage,
+) {
+    let entries = component
+        .iter()
+        .filter_map(|geometry| {
+            projection_by_storage
+                .get(&geometry.storage)
+                .map(|(index, projection)| (*index, *projection))
+        })
+        .collect::<Vec<_>>();
+    let has_bound = entries.iter().any(|(_, projection)| {
+        matches!(
+            projection.disposition,
+            RegisterProjectionDisposition::Bound { .. }
+        )
+    });
+    let has_refused = entries.iter().any(|(_, projection)| {
+        matches!(
+            projection.disposition,
+            RegisterProjectionDisposition::Refused { .. }
+        )
+    });
+    if has_bound && has_refused {
+        issues.push(ValidationIssue::new(
+            "arch.register_projections.component.mixed_bound_and_refused",
+            "arch.register_projections",
+            "a laminar register component must be wholly bound or wholly refused",
+        ));
+        return;
+    }
+    if has_refused {
+        let mut component_reason = None;
+        for (index, projection) in entries {
+            let RegisterProjectionDisposition::Refused { reason } = projection.disposition else {
+                continue;
+            };
+            if !matches!(
+                reason,
+                RegisterProjectionRefusal::MissingRegisterEndianness
+                    | RegisterProjectionRefusal::ConflictingDeclarations
+            ) {
+                issues.push(ValidationIssue::new(
+                    "arch.register_projections.component.inapplicable_refusal",
+                    format!("arch.register_projections[{index}].disposition"),
+                    "a laminar component may refuse only missing or conflicting byte significance",
+                ));
+            }
+            match component_reason {
+                Some(existing) if existing != reason => issues.push(ValidationIssue::new(
+                    "arch.register_projections.component.inconsistent_refusal",
+                    format!("arch.register_projections[{index}].disposition"),
+                    "every storage in a refused component must carry the same reason",
+                )),
+                Some(_) => {}
+                None => component_reason = Some(reason),
+            }
+        }
+        return;
+    }
+
+    let carrier_end = canonical_carrier
+        .checked_end()
+        .expect("component excludes invalid register ranges");
+    let mut little_endian_possible = true;
+    let mut big_endian_possible = true;
+    for (index, projection) in entries {
+        let RegisterProjectionDisposition::Bound { carrier, slice } = projection.disposition else {
+            continue;
+        };
+        if carrier != canonical_carrier {
+            issues.push(ValidationIssue::new(
+                "arch.register_projections.component.noncanonical_carrier",
+                format!("arch.register_projections[{index}].disposition.carrier"),
+                format!(
+                    "all bound storages in this component must use carrier at {:#x} with size {}",
+                    canonical_carrier.offset, canonical_carrier.size
+                ),
+            ));
+        }
+        let Some(written_end) = projection.written.checked_end() else {
+            continue;
+        };
+        let little_offset = projection
+            .written
+            .offset
+            .checked_sub(canonical_carrier.offset)
+            .and_then(|bytes| bytes.checked_mul(8));
+        let big_offset = carrier_end
+            .checked_sub(written_end)
+            .and_then(|bytes| bytes.checked_mul(8));
+        let matches_little = little_offset == Some(slice.lsb_bit_offset);
+        let matches_big = big_offset == Some(slice.lsb_bit_offset);
+        if !matches_little && !matches_big {
+            issues.push(ValidationIssue::new(
+                "arch.register_projections.slice.impossible_endian_offset",
+                format!("arch.register_projections[{index}].disposition.slice.lsb_bit_offset"),
+                format!(
+                    "bit offset {} matches neither little-endian {:?} nor big-endian {:?} geometry",
+                    slice.lsb_bit_offset, little_offset, big_offset
+                ),
+            ));
+        }
+        little_endian_possible &= matches_little;
+        big_endian_possible &= matches_big;
+    }
+    if !little_endian_possible && !big_endian_possible {
+        issues.push(ValidationIssue::new(
+            "arch.register_projections.component.inconsistent_endianness",
+            "arch.register_projections",
+            "bound bit slices do not share one consistent register-byte orientation",
+        ));
     }
 }
 
@@ -1363,7 +1802,10 @@ fn check_size_addr_width(
 mod tests {
     use super::*;
     use crate::opcode::{SwitchCase, SwitchInfo};
-    use crate::serialize::RegisterDef;
+    use crate::serialize::{
+        RegisterBitSlice, RegisterDef, RegisterProjection, RegisterProjectionDisposition,
+        RegisterProjectionRefusal, RegisterStorage,
+    };
     use crate::{AddressSpace, R2ILOp};
 
     fn valid_archspec() -> ArchSpec {
@@ -1566,6 +2008,498 @@ mod tests {
                 .iter()
                 .any(|i| i.code == "arch.registers.duplicate_name")
         );
+    }
+
+    #[test]
+    fn geometry_validation_ignores_unrelated_architecture_failures() {
+        let mut arch = ArchSpec::new(" ");
+        arch.addr_size = 0;
+        arch.alignment = 0;
+        let storage = RegisterStorage { offset: 0, size: 8 };
+        arch.add_register(RegisterDef::new("RAX", storage.offset, storage.size));
+        arch.register_projections = vec![RegisterProjection {
+            written: storage,
+            disposition: RegisterProjectionDisposition::Bound {
+                carrier: storage,
+                slice: RegisterBitSlice {
+                    lsb_bit_offset: 0,
+                    size_bits: 64,
+                },
+            },
+        }];
+
+        assert!(validate_register_geometry(&arch).is_ok());
+        let error = validate_archspec(&arch).expect_err("unrelated ArchSpec fields remain invalid");
+        assert!(
+            error
+                .issues
+                .iter()
+                .any(|issue| issue.code == "arch.name.empty")
+        );
+        assert!(
+            error
+                .issues
+                .iter()
+                .any(|issue| issue.code == "arch.addr_size.zero")
+        );
+        assert!(
+            error
+                .issues
+                .iter()
+                .any(|issue| issue.code == "arch.alignment.zero")
+        );
+        assert!(
+            error
+                .issues
+                .iter()
+                .any(|issue| issue.code == "arch.spaces.empty")
+        );
+    }
+
+    #[test]
+    fn geometry_validation_rejects_malformed_projection_without_other_checks() {
+        let mut arch = ArchSpec::new(" ");
+        let storage = RegisterStorage { offset: 0, size: 8 };
+        arch.add_register(RegisterDef::new("RAX", storage.offset, storage.size));
+        arch.register_projections = vec![RegisterProjection {
+            written: storage,
+            disposition: RegisterProjectionDisposition::Bound {
+                carrier: storage,
+                slice: RegisterBitSlice {
+                    lsb_bit_offset: 1,
+                    size_bits: 64,
+                },
+            },
+        }];
+
+        let error = validate_register_geometry(&arch).expect_err("forged geometry must fail");
+        assert!(
+            error.issues.iter().any(|issue| {
+                issue.code == "arch.register_projections.full_storage.invalid_slice"
+            })
+        );
+    }
+
+    #[test]
+    fn complete_sorted_register_projection_table_passes_and_aliases_share_one_entry() {
+        let mut arch = valid_archspec();
+        arch.add_register(RegisterDef::new("RAX_ALIAS", 0, 8));
+        arch.add_register(RegisterDef::sub("EAX", 0, 4, "RAX"));
+        let eax = RegisterStorage { offset: 0, size: 4 };
+        let rax = RegisterStorage { offset: 0, size: 8 };
+        arch.register_projections = vec![
+            RegisterProjection {
+                written: eax,
+                disposition: RegisterProjectionDisposition::Bound {
+                    carrier: rax,
+                    slice: RegisterBitSlice {
+                        lsb_bit_offset: 0,
+                        size_bits: 32,
+                    },
+                },
+            },
+            RegisterProjection {
+                written: rax,
+                disposition: RegisterProjectionDisposition::Bound {
+                    carrier: rax,
+                    slice: RegisterBitSlice {
+                        lsb_bit_offset: 0,
+                        size_bits: 64,
+                    },
+                },
+            },
+        ];
+
+        assert!(validate_archspec(&arch).is_ok());
+        assert_eq!(
+            arch.register_projection(eax),
+            arch.register_projections.first()
+        );
+        assert_eq!(
+            arch.register_projection(rax),
+            arch.register_projections.get(1)
+        );
+    }
+
+    #[test]
+    fn nonempty_register_projection_table_requires_sorted_exact_coverage() {
+        let mut arch = valid_archspec();
+        arch.add_register(RegisterDef::sub("EAX", 0, 4, "RAX"));
+        let eax = RegisterStorage { offset: 0, size: 4 };
+        let rax = RegisterStorage { offset: 0, size: 8 };
+        let unknown = RegisterStorage { offset: 8, size: 8 };
+        arch.register_projections = vec![
+            RegisterProjection {
+                written: unknown,
+                disposition: RegisterProjectionDisposition::Refused {
+                    reason: RegisterProjectionRefusal::NoContainingCarrier,
+                },
+            },
+            RegisterProjection {
+                written: rax,
+                disposition: RegisterProjectionDisposition::Refused {
+                    reason: RegisterProjectionRefusal::MissingRegisterEndianness,
+                },
+            },
+            RegisterProjection {
+                written: unknown,
+                disposition: RegisterProjectionDisposition::Refused {
+                    reason: RegisterProjectionRefusal::NoContainingCarrier,
+                },
+            },
+        ];
+
+        let err = validate_archspec(&arch).expect_err("projection table should fail");
+        assert!(
+            err.issues
+                .iter()
+                .any(|issue| issue.code == "arch.register_projections.unsorted")
+        );
+        assert!(
+            err.issues
+                .iter()
+                .any(|issue| issue.code == "arch.register_projections.duplicate_written")
+        );
+        assert!(
+            err.issues
+                .iter()
+                .any(|issue| issue.code == "arch.register_projections.missing_written")
+        );
+        assert!(
+            err.issues
+                .iter()
+                .any(|issue| issue.code == "arch.register_projections.unknown_written")
+        );
+        assert!(arch.register_projection(eax).is_none());
+    }
+
+    #[test]
+    fn bound_register_projection_requires_containment_and_exact_checked_slice() {
+        let mut arch = valid_archspec();
+        let rax = RegisterStorage { offset: 0, size: 8 };
+        arch.register_projections = vec![RegisterProjection {
+            written: rax,
+            disposition: RegisterProjectionDisposition::Bound {
+                carrier: RegisterStorage { offset: 4, size: 4 },
+                slice: RegisterBitSlice {
+                    lsb_bit_offset: u64::MAX,
+                    size_bits: 32,
+                },
+            },
+        }];
+
+        let err = validate_archspec(&arch).expect_err("invalid bound projection should fail");
+        assert!(err.issues.iter().any(|issue| {
+            issue.code == "arch.register_projections.carrier.does_not_contain_written"
+        }));
+        assert!(
+            err.issues
+                .iter()
+                .any(|issue| issue.code == "arch.register_projections.slice.size_mismatch")
+        );
+        assert!(
+            err.issues
+                .iter()
+                .any(|issue| issue.code == "arch.register_projections.slice.range_overflow")
+        );
+    }
+
+    #[test]
+    fn full_storage_projection_requires_zero_offset_full_slice() {
+        let mut arch = valid_archspec();
+        let rax = RegisterStorage { offset: 0, size: 8 };
+        arch.register_projections = vec![RegisterProjection {
+            written: rax,
+            disposition: RegisterProjectionDisposition::Bound {
+                carrier: rax,
+                slice: RegisterBitSlice {
+                    lsb_bit_offset: 1,
+                    size_bits: 64,
+                },
+            },
+        }];
+
+        let err = validate_archspec(&arch).expect_err("invalid full projection should fail");
+        assert!(
+            err.issues.iter().any(|issue| {
+                issue.code == "arch.register_projections.full_storage.invalid_slice"
+            })
+        );
+    }
+
+    #[test]
+    fn register_and_projection_ranges_are_checked() {
+        let mut arch = valid_archspec();
+        arch.registers.clear();
+        arch.add_register(RegisterDef::new("overflow", u64::MAX, 1));
+        arch.register_projections = vec![RegisterProjection {
+            written: RegisterStorage {
+                offset: u64::MAX,
+                size: 1,
+            },
+            disposition: RegisterProjectionDisposition::Refused {
+                reason: RegisterProjectionRefusal::InvalidStorageRange,
+            },
+        }];
+
+        let err = validate_archspec(&arch).expect_err("overflowing ranges should fail");
+        assert!(
+            err.issues
+                .iter()
+                .any(|issue| issue.code == "arch.registers.range.overflow")
+        );
+        assert!(
+            err.issues
+                .iter()
+                .any(|issue| { issue.code == "arch.register_projections.written.invalid_range" })
+        );
+    }
+
+    #[test]
+    fn bound_projection_rejects_an_undeclared_carrier() {
+        let mut arch = valid_archspec();
+        let rax = RegisterStorage { offset: 0, size: 8 };
+        arch.register_projections = vec![RegisterProjection {
+            written: rax,
+            disposition: RegisterProjectionDisposition::Bound {
+                carrier: RegisterStorage {
+                    offset: 0,
+                    size: 16,
+                },
+                slice: RegisterBitSlice {
+                    lsb_bit_offset: 0,
+                    size_bits: 64,
+                },
+            },
+        }];
+
+        let err = validate_archspec(&arch).expect_err("undeclared carrier must fail");
+        assert!(
+            err.issues
+                .iter()
+                .any(|issue| issue.code == "arch.register_projections.carrier.undeclared")
+        );
+    }
+
+    #[test]
+    fn laminar_component_rejects_separate_nested_carriers() {
+        let mut arch = valid_archspec();
+        arch.add_register(RegisterDef::sub("EAX", 0, 4, "RAX"));
+        arch.add_register(RegisterDef::sub("AX", 0, 2, "EAX"));
+        let ax = RegisterStorage { offset: 0, size: 2 };
+        let eax = RegisterStorage { offset: 0, size: 4 };
+        let rax = RegisterStorage { offset: 0, size: 8 };
+        arch.register_projections = vec![
+            RegisterProjection {
+                written: ax,
+                disposition: RegisterProjectionDisposition::Bound {
+                    carrier: eax,
+                    slice: RegisterBitSlice {
+                        lsb_bit_offset: 0,
+                        size_bits: 16,
+                    },
+                },
+            },
+            RegisterProjection {
+                written: eax,
+                disposition: RegisterProjectionDisposition::Bound {
+                    carrier: rax,
+                    slice: RegisterBitSlice {
+                        lsb_bit_offset: 0,
+                        size_bits: 32,
+                    },
+                },
+            },
+            RegisterProjection {
+                written: rax,
+                disposition: RegisterProjectionDisposition::Bound {
+                    carrier: rax,
+                    slice: RegisterBitSlice {
+                        lsb_bit_offset: 0,
+                        size_bits: 64,
+                    },
+                },
+            },
+        ];
+
+        let err = validate_archspec(&arch).expect_err("split carriers must fail");
+        assert!(err.issues.iter().any(|issue| {
+            issue.code == "arch.register_projections.component.noncanonical_carrier"
+        }));
+    }
+
+    #[test]
+    fn every_member_of_partial_overlap_component_must_refuse() {
+        let mut arch = valid_archspec();
+        arch.registers.clear();
+        arch.add_register(RegisterDef::new("low", 0, 2));
+        arch.add_register(RegisterDef::new("first", 0, 4));
+        arch.add_register(RegisterDef::new("second", 2, 4));
+        let low = RegisterStorage { offset: 0, size: 2 };
+        let first = RegisterStorage { offset: 0, size: 4 };
+        let second = RegisterStorage { offset: 2, size: 4 };
+        arch.register_projections = vec![
+            RegisterProjection {
+                written: low,
+                disposition: RegisterProjectionDisposition::Refused {
+                    reason: RegisterProjectionRefusal::PartialOverlap,
+                },
+            },
+            RegisterProjection {
+                written: first,
+                disposition: RegisterProjectionDisposition::Refused {
+                    reason: RegisterProjectionRefusal::MissingRegisterEndianness,
+                },
+            },
+            RegisterProjection {
+                written: second,
+                disposition: RegisterProjectionDisposition::Bound {
+                    carrier: second,
+                    slice: RegisterBitSlice {
+                        lsb_bit_offset: 0,
+                        size_bits: 32,
+                    },
+                },
+            },
+        ];
+
+        let err = validate_archspec(&arch).expect_err("partial overlap must fail closed");
+        assert_eq!(
+            err.issues
+                .iter()
+                .filter(|issue| {
+                    issue.code
+                        == "arch.register_projections.component.partial_overlap_requires_refusal"
+                })
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn bound_slice_must_match_a_real_byte_orientation() {
+        let mut arch = valid_archspec();
+        arch.add_register(RegisterDef::new("middle", 1, 2));
+        let carrier = RegisterStorage { offset: 0, size: 8 };
+        let middle = RegisterStorage { offset: 1, size: 2 };
+        arch.register_projections = vec![
+            RegisterProjection {
+                written: carrier,
+                disposition: RegisterProjectionDisposition::Bound {
+                    carrier,
+                    slice: RegisterBitSlice {
+                        lsb_bit_offset: 0,
+                        size_bits: 64,
+                    },
+                },
+            },
+            RegisterProjection {
+                written: middle,
+                disposition: RegisterProjectionDisposition::Bound {
+                    carrier,
+                    slice: RegisterBitSlice {
+                        lsb_bit_offset: 16,
+                        size_bits: 16,
+                    },
+                },
+            },
+        ];
+
+        let err = validate_archspec(&arch).expect_err("impossible byte offset must fail");
+        assert!(err.issues.iter().any(|issue| {
+            issue.code == "arch.register_projections.slice.impossible_endian_offset"
+        }));
+    }
+
+    #[test]
+    fn bound_component_requires_one_byte_orientation() {
+        let mut arch = valid_archspec();
+        arch.add_register(RegisterDef::new("low", 0, 2));
+        arch.add_register(RegisterDef::new("high", 6, 2));
+        let low = RegisterStorage { offset: 0, size: 2 };
+        let carrier = RegisterStorage { offset: 0, size: 8 };
+        let high = RegisterStorage { offset: 6, size: 2 };
+        arch.register_projections = vec![
+            RegisterProjection {
+                written: low,
+                disposition: RegisterProjectionDisposition::Bound {
+                    carrier,
+                    slice: RegisterBitSlice {
+                        lsb_bit_offset: 0,
+                        size_bits: 16,
+                    },
+                },
+            },
+            RegisterProjection {
+                written: carrier,
+                disposition: RegisterProjectionDisposition::Bound {
+                    carrier,
+                    slice: RegisterBitSlice {
+                        lsb_bit_offset: 0,
+                        size_bits: 64,
+                    },
+                },
+            },
+            RegisterProjection {
+                written: high,
+                disposition: RegisterProjectionDisposition::Bound {
+                    carrier,
+                    slice: RegisterBitSlice {
+                        lsb_bit_offset: 0,
+                        size_bits: 16,
+                    },
+                },
+            },
+        ];
+
+        let err = validate_archspec(&arch).expect_err("mixed byte orientation must fail");
+        assert!(err.issues.iter().any(|issue| {
+            issue.code == "arch.register_projections.component.inconsistent_endianness"
+        }));
+    }
+
+    #[test]
+    fn big_endian_register_component_is_valid_when_consistent() {
+        let mut arch = valid_archspec();
+        arch.add_register(RegisterDef::new("low-address", 0, 2));
+        arch.add_register(RegisterDef::new("high-address", 6, 2));
+        let low_address = RegisterStorage { offset: 0, size: 2 };
+        let carrier = RegisterStorage { offset: 0, size: 8 };
+        let high_address = RegisterStorage { offset: 6, size: 2 };
+        arch.register_projections = vec![
+            RegisterProjection {
+                written: low_address,
+                disposition: RegisterProjectionDisposition::Bound {
+                    carrier,
+                    slice: RegisterBitSlice {
+                        lsb_bit_offset: 48,
+                        size_bits: 16,
+                    },
+                },
+            },
+            RegisterProjection {
+                written: carrier,
+                disposition: RegisterProjectionDisposition::Bound {
+                    carrier,
+                    slice: RegisterBitSlice {
+                        lsb_bit_offset: 0,
+                        size_bits: 64,
+                    },
+                },
+            },
+            RegisterProjection {
+                written: high_address,
+                disposition: RegisterProjectionDisposition::Bound {
+                    carrier,
+                    slice: RegisterBitSlice {
+                        lsb_bit_offset: 0,
+                        size_bits: 16,
+                    },
+                },
+            },
+        ];
+
+        assert!(validate_archspec(&arch).is_ok());
     }
 
     #[test]
