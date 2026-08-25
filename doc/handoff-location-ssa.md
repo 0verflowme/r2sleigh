@@ -109,6 +109,37 @@ learn.
 
 ### Open, each scoped by measurement
 
+  0. **A value has two spellings and the alias that picks between them is not
+     owned by the symbol table.** This is what eleven of the twelve remaining
+     corpus failures are, and it is the one to read first.
+
+     A value lifted into a stack local has both names: `local_28`, its rendered
+     spelling, and `tmp:11f80_2`, the temporary it came from. Which is correct
+     depends on context, and that context lives in `var_aliases`, a map each
+     reader consults for itself. Any route that reaches the value without going
+     through that map prints the wrong one.
+
+     Three separate attempts to unify the spellings have failed on this same
+     value, and all three failed for this reason: spelling at the mint, spelling
+     at `origin_name_to_expr`, and recording which value an identifier renders at
+     the analysis mint sites. Each takes x86-64 -O0 and arm64 -O0 from seven
+     correct to zero, and each produces the same wrong line --
+     `for (int64_t local_28 = 0; t11f80_2 < arg1; ...)`. The incremental path is
+     ruled out too: making `definition_for_symbol` ask both routes is safe on its
+     own and does not make the recording safe, because a third reader,
+     `ssa_name_for_spelling`, exists precisely to resolve differently.
+
+     What is known to work is narrower and already landed: `for_ssa_name` lets a
+     caller holding a raw SSA name reach the identifier already minted for that
+     value, and `post_rename` no longer renames a value name into a storage name.
+     Both are safe because neither changes which spelling wins.
+
+     The fix is that the alias must be something the table owns, so that one
+     name per value is decided in one place rather than by whichever map a reader
+     happens to hold. That is the location model's statement one layer up, and
+     it is why naming registers by place regresses 34 correct to 13 while this is
+     outstanding.
+
   1. **The same value is constructed more than once, by different layers, and
      nothing says which construction is the value.** The **call** instance of
      this is now **fixed**: `CExpr::Call` carries the site that makes it,
