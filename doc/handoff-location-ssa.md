@@ -171,6 +171,38 @@ learn.
      all. What remains there is that the prologue's frame save should not be
      rendered as a program statement.
 
+  0d. **arm64 -O0 renders frame accesses as pointer arithmetic where x86-64
+     renders named locals.** This is what both arm64 -O0 failures are now, after
+     the argument-register and frame-record fixes above, and it is bigger than
+     either of them.
+
+     The same source function at the same optimisation level renders
+
+     ```c
+     long local_20 = arg2;                                  /* x86-64 -O0 */
+     *(int32_t *)(long)(t11f80_1 - 0x14) = arg2;            /* arm64 -O0  */
+     ```
+
+     where `t11f80_1 = local_70 + 96` is the frame base itself, used as a value
+     and never declared. The stack-address roots are present -- a trace at the
+     store-elision gate reports `is_slot=true` with concrete offsets for these
+     addresses -- so the offsets are known and it is the *names* that are
+     missing. A dump of `stack_aliases_by_offset` for `murmur3_32` on arm64 held
+     exactly one entry, and that one was created by the argument-home store scan
+     rather than by r2's variables. r2 itself reports ten stack variables for
+     that function (`afvs 96 var_60h`, `afvs 20 var_14h`, and eight more), so
+     the ingestion from r2's sp-relative offsets into the frame-relative space
+     the map is keyed by is what to look at first. Confirm the map is empty
+     before assuming it, since the dump above predates the two fixes.
+
+     Note for whoever picks this up: completing the frame-setup rule set in
+     `is_stack_frame_op` is *not* it. `fp = sp + const` is genuinely missing
+     there -- x86-64 establishes its frame pointer with `mov rbp, rsp` and is
+     caught by the Copy arm, while arm64 writes `add x29, sp, 0x60` and matches
+     nothing -- but adding it changes no rendered output, because Sleigh routes
+     the add through a temp and eliding the add would not remove the uses of
+     that temp. It was written, measured inert, and reverted.
+
   0c. **Superseded trace notes for 0a.**
      Both arm64 -O0 failures are this, and only this. The first statement of
      `murmur3_32` is
