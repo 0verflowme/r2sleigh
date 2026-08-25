@@ -537,15 +537,34 @@ learn.
      byte, a quarter of the word the hash consumes. It returns `ec1fbeef` against
      a wanted `7e4102af`.
 
-     The width is right everywhere until the access is built. Probing the `Load`
-     arm gives `LOAD dst=tmp:11f00_2 size=4 addr=tmp:4a00_2 hint=None`, so the
-     SSA says four bytes and there is no type hint to argue with; `elem_ty`
-     therefore comes out of `uint_type_from_size(4)` as `uint32_t` and is passed
-     into `render_canonical_load_expr` correctly. Something inside that renderer
-     prefers the *object's* element type -- murmur3 takes `const uint8_t *data`,
-     so the array's elements are bytes -- over the width of the access being
-     rendered. A four-byte read of a byte array is `*(uint32_t *)(data + i * 4)`,
-     not `data[i]`.
+     The width is right everywhere until the access is built, and the cast is
+     added by neither end of the pipeline. Measured:
+
+     * `LOAD dst=tmp:11f00_2 size=4 addr=tmp:4a00_2 hint=None` -- the SSA says
+       four bytes and no type hint argues with it, so `elem_ty` is `UInt(32)`.
+     * Inside `render_canonical_load_expr_uncached`, that correct `elem_ty` is
+       carried alongside a chosen expression of
+       `Subscript { base: Var(..), index: Var(..) }` -- **no cast at all**. The
+       renderer never applies the width it was given.
+     * `codegen.rs` emits `Subscript` as `base[index]` verbatim, adding nothing.
+
+     So the `(unsigned char *)(long)` cast is inserted by a pass *between* the
+     fold and codegen. Find that pass; it is choosing a default pointee rather
+     than the width of the access, and it is the only place left that can be
+     doing it.
+
+     Three fixes were tried at the load renderer and all three are inert,
+     because that is the wrong end of the pipeline. Reverted, and recorded so
+     they are not tried again: casting the subscript base to `elem_ty*`;
+     rescaling the index by a literal element width; and resolving the index's
+     definition before rescaling, with a byte-offset deref as fallback.
+
+     One thing those attempts did establish, which the next fix must respect:
+     **the index counts bytes.** `t4900_2 = rcx * 4` is the address arithmetic
+     the lifter already did, so widening the pointee without unscaling reads
+     `((uint32_t *)data)[i * 4]`, which is `i * 16`. The correct renderings are
+     `((uint32_t *)data)[i]` after unscaling, or `*(uint32_t *)((uint8_t *)data + i * 4)`
+     when the scaling cannot be seen.
 
      Ruled out on the way: constraining the type hint to the access width
      (`filter(|ty| ty.size == dst.size)`) changes nothing, because there is no
