@@ -119,7 +119,8 @@ learn.
      | --- | --- | --- |
      | `x30` stored through an argument | 2 | arm64 -O0 murmur3_32, xxhash32 |
      | `uint128_t` is not a C type | 2 | arm64 -O2 crc32_bitwise, xxhash32 |
-     | register-named value never declared (`r8d`, `eax_5`, `eax_8`, `eax_12`, `rcx_6`) | 5 | x64 -O1/-O2 |
+     | narrow carrier member read after a loop (`eax_5`, `eax_8`, `eax_12`/`ecx_9`, `rcx_6`) | 4 | x64 -O1/-O2 |
+     | `r8d` in a piece composition | 1 | x64 -O2 fnv1a64 |
      | `tmp_4700_7` / `tmp_11f80_4` -- the spelling defect | 3 | x64 -O1/-O2, arm64 -O1 xxhash32 |
      | `t11f00_10` / `t20380_4` -- murmur3's duplicated merge block | 3 | x64 -O0, arm64 -O1/-O2 |
      | `sym__rotl32` called with no declaration | 1 | x64 -O0 xxhash32 |
@@ -223,6 +224,56 @@ learn.
      at parity with x86-64 -O0; `murmur3_32` fails on an undeclared `x8_30`,
      several layers further in than where it was. Count and quality moved apart
      here, and the quality is the part that matters for what follows.
+
+  0f. **The largest remaining cluster is one cause, and it is the location
+     model.** Four x86-64 failures are the same shape, and they are the biggest
+     group left:
+
+     ```c
+     return eax_5 | 1;                             /* -O1 adler32   */
+     return (uint8_t)rcx_6;                        /* -O1 pearson   */
+     return eax_12 | (uint32_t)(int64_t)ecx_9;     /* -O2 adler32   */
+     ... (eax_8 ^ esi_1) * 0x85ebca6bU ...         /* -O1 murmur3   */
+     ```
+
+     Each reads, after a loop, a *narrow member* of a storage whose carrier was
+     chosen at the wide name. In adler32 -O1 the loop body ends
+     `rax = (int64_t)eax_4;` -- `rax` is the carrier and `eax_5` is the 32-bit
+     member of the same place, so the value the return wants is carried under one
+     name and read under another, and the name it is read under is declared
+     nowhere. `ecx_9` in the -O2 line is the same value this document already
+     recorded as adler32's blocker; it is not one function's problem but four.
+
+     This is the location model in its most concrete form: a register is a place,
+     and `eax`/`rax` or `w8`/`x8` are members of one place at different widths.
+     Until membership is modelled, the carrier cannot answer for the narrow read.
+     The measured cost of doing it incompletely is recorded above -- naming
+     registers by place regresses 34 correct to 13 -- so it has to land whole.
+
+     Not in this cluster despite looking like it: `r8d` in fnv1a64 -O2 appears
+     inside a piece composition, `(hi << 32) | (uint64_t)r8d`, which is the width
+     layer rather than carrier membership; and `x8_30` in arm64 -O0 murmur3_32 is
+     not a naming defect at all -- see 0g.
+
+  0g. **murmur3's tail switch renders with empty bodies.** This is what arm64 -O0
+     `murmur3_32` now fails on, and the undeclared `x8_30` is a symptom of it
+     rather than the defect. The rendering is
+
+     ```c
+     if ((arg1 & 3) != 1) {
+         if (local_68 == 2) {
+         } else {
+             if (x8_30 == 3) {
+             }
+         }
+     ```
+
+     -- the three tail cases of `switch (len & 3)`, all with their bodies
+     dropped. `x8_30` has no definition, no copy source and no rendered spelling
+     (`def=None copy=None spelling=None`), and the unkeyed-write counter reports
+     zero, so nothing was written under a name that could not be keyed: the facts
+     were never recorded because the statements that would have carried them were
+     elided. Do not fix the undeclared name; find why the case bodies are empty.
 
   0e. **Superseded: arm64 -O0 renders frame accesses as pointer arithmetic.** This is what both arm64 -O0 failures are now, after
      the argument-register and frame-record fixes above, and it is bigger than
