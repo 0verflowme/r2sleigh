@@ -561,10 +561,25 @@ learn.
      output and both left `arg0[t4900_2]` unchanged: applying `elem_ty` to the
      subscript base in `render_canonical_load_expr_uncached`, and the same with
      `looks_like_pointer` dropped from the guard so that only an explicit cast
-     counts. Something after that function re-derives the expression --
-     `assign_stmt` runs `semanticize_visible_expr` and `rewrite_stack_expr` over
-     the RHS -- so the next probe belongs there, on what those two return for
-     this access.
+     counts. `assign_stmt` is not the culprit either -- probing it directly gives
+     `in=Subscript{..}` and `out=Assign(.., Subscript{..})`, an unchanged
+     pass-through.
+
+     So an edit inside `render_canonical_load_expr_uncached` does not reach the
+     statement that gets emitted, even though a probe in that same function
+     reports the same expression the statement carries. The two facts are only
+     consistent if the emitted statement comes from a *different* call than the
+     one being edited -- a memo hit, an inlined rendering replayed from
+     `inlined_renderings`, or a second lowering of the same op.
+
+     Before editing anything else here, establish which call produces the
+     statement: put a counter in `render_canonical_load_expr_uncached`, print it
+     with the returned expression, and print the same counter from the `Load` arm
+     of `op_to_stmt_impl`. If the numbers differ, the statement is being built
+     somewhere the edits never ran, and that is the thing to find -- not another
+     rule about pointees. Four fixes have now been written against this defect
+     and all four were inert, which is the signature of editing a path the output
+     does not take.
 
      One constraint holds whatever the fix: the index counts bytes.
      `t4900_2 = rcx * 4` is address arithmetic the lifter already did, so the
