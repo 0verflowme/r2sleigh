@@ -333,7 +333,22 @@ impl BindingPlan {
         let expected_binding_count = width_evidence
             .iter()
             .filter(|evidence| matches!(evidence, SealWidthEvidence::Exact { .. }))
-            .count();
+            .count()
+            + source_owned
+                .report()
+                .render()
+                .into_iter()
+                .flat_map(|render| render.certified_entities.values())
+                .filter(|entity| {
+                    matches!(
+                        entity,
+                        r2types::CertifiedEntity::StackSlot {
+                            size: Some(size),
+                            ..
+                        } if size.checked_mul(8).is_some_and(|width| width > 0)
+                    )
+                })
+                .count();
         if self.bindings.len() != expected_binding_count {
             return Err(BindingPlanBuildError::Seal(
                 BindingPlanSourceMismatch::BindingCount {
@@ -440,6 +455,92 @@ impl BindingPlan {
                     }
                 }
             }
+        }
+
+        let expected_stack_objects = source_owned
+            .report()
+            .render()
+            .into_iter()
+            .flat_map(|render| render.certified_entities.values())
+            .filter_map(|entity| match entity {
+                r2types::CertifiedEntity::StackSlot {
+                    id, object, size, ..
+                } => Some((*id, *object, *size)),
+                r2types::CertifiedEntity::Parameter { .. }
+                | r2types::CertifiedEntity::LoopCarrier { .. } => None,
+            })
+            .collect::<Vec<_>>();
+        if self.stack_objects.len() != expected_stack_objects.len() {
+            return Err(BindingPlanBuildError::Seal(
+                BindingPlanSourceMismatch::StackObjectCount {
+                    expected: expected_stack_objects.len(),
+                    actual: self.stack_objects.len(),
+                },
+            ));
+        }
+        for (entity, object, size) in expected_stack_objects {
+            let expected_disposition = match size {
+                None => StackObjectDisposition::Refused {
+                    reason: StackObjectRefusal::MissingWidth { object },
+                },
+                Some(size_bytes) => match size_bytes.checked_mul(8).filter(|width| *width > 0) {
+                    Some(width_bits) => {
+                        let binding = BindingId(binding_index as u32);
+                        let planned =
+                            self.bindings
+                                .get(binding_index)
+                                .ok_or(BindingPlanBuildError::Seal(
+                                    BindingPlanSourceMismatch::UnexpectedStackObjectDisposition {
+                                        object,
+                                    },
+                                ))?;
+                        if planned.certificate.sources.as_ref()
+                            != [BindingCertificateSource::CertifiedEntity(entity)]
+                        {
+                            return Err(BindingPlanBuildError::Seal(
+                                BindingPlanSourceMismatch::StackObjectCertificate {
+                                    object,
+                                    binding,
+                                },
+                            ));
+                        }
+                        if planned.declaration_type != CType::UInt(width_bits) {
+                            return Err(BindingPlanBuildError::Seal(
+                                BindingPlanSourceMismatch::StackObjectDeclarationWidth {
+                                    object,
+                                    binding,
+                                },
+                            ));
+                        }
+                        if !actual_by_binding[binding_index].is_empty() {
+                            return Err(BindingPlanBuildError::Seal(
+                                BindingPlanSourceMismatch::StackObjectCertificate {
+                                    object,
+                                    binding,
+                                },
+                            ));
+                        }
+                        binding_index += 1;
+                        StackObjectDisposition::Bound { binding }
+                    }
+                    None => StackObjectDisposition::Refused {
+                        reason: StackObjectRefusal::InvalidWidth { object, size_bytes },
+                    },
+                },
+            };
+            if self.stack_object_disposition(object) != Some(expected_disposition) {
+                return Err(BindingPlanBuildError::Seal(
+                    BindingPlanSourceMismatch::UnexpectedStackObjectDisposition { object },
+                ));
+            }
+        }
+        if binding_index != self.bindings.len() {
+            return Err(BindingPlanBuildError::Seal(
+                BindingPlanSourceMismatch::BindingCount {
+                    expected: binding_index,
+                    actual: self.bindings.len(),
+                },
+            ));
         }
         Ok(())
     }

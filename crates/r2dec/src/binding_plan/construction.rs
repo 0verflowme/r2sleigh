@@ -356,11 +356,62 @@ impl BindingPlan {
             });
         }
 
+        let mut stack_objects = BTreeMap::new();
+        if let Some(render) = source_owned.report().render() {
+            for entity in render.certified_entities.values() {
+                let r2types::CertifiedEntity::StackSlot {
+                    id,
+                    object,
+                    offset,
+                    size,
+                    ..
+                } = entity
+                else {
+                    continue;
+                };
+                let Some(size_bytes) = *size else {
+                    stack_objects.insert(
+                        *object,
+                        StackObjectDisposition::Refused {
+                            reason: StackObjectRefusal::MissingWidth { object: *object },
+                        },
+                    );
+                    continue;
+                };
+                let Some(width_bits) = size_bytes.checked_mul(8).filter(|width| *width > 0) else {
+                    stack_objects.insert(
+                        *object,
+                        StackObjectDisposition::Refused {
+                            reason: StackObjectRefusal::InvalidWidth {
+                                object: *object,
+                                size_bytes,
+                            },
+                        },
+                    );
+                    continue;
+                };
+                let binding = BindingId(bindings.len() as u32);
+                bindings.push(Binding {
+                    declaration_type: CType::UInt(width_bits),
+                    certificate: BindingCertificate {
+                        sources: Box::new([BindingCertificateSource::CertifiedEntity(*id)]),
+                    },
+                    presentation_name_hint: Some(if *offset < 0 {
+                        format!("stack_m{}", offset.unsigned_abs())
+                    } else {
+                        format!("stack_p{}", offset.unsigned_abs())
+                    }),
+                });
+                stack_objects.insert(*object, StackObjectDisposition::Bound { binding });
+            }
+        }
+
         let plan = Self {
             authority: source.authority().clone(),
             machine_projection,
             bindings: bindings.into_boxed_slice(),
             dispositions: dispositions.into_boxed_slice(),
+            stack_objects,
         };
         plan.validate_seal(source_owned)?;
         Ok(plan)

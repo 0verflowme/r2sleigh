@@ -524,3 +524,62 @@ fn overlapping_parameter_and_span_certificates_close_transitively_in_canonical_o
     );
     assert!(plan.validate_seal(&source_owned).is_ok());
 }
+
+#[test]
+fn certified_stack_objects_get_bindings_without_invented_value_membership() {
+    let address = Varnode::unique(0x80, 8);
+    let source_owned = source_owned([
+        R2ILOp::IntSub {
+            dst: address.clone(),
+            a: Varnode::register(0x28, 8),
+            b: Varnode::constant(8, 8),
+        },
+        R2ILOp::Store {
+            space: SpaceId::Ram,
+            addr: address.clone(),
+            val: Varnode::constant(7, 8),
+        },
+        R2ILOp::Load {
+            dst: Varnode::unique(0x88, 8),
+            space: SpaceId::Ram,
+            addr: address,
+        },
+    ]);
+    let stack_slots = source_owned
+        .report()
+        .render()
+        .expect("render facts")
+        .stack_slots()
+        .collect::<Vec<_>>();
+    assert!(
+        !stack_slots.is_empty(),
+        "source must certify a stack object"
+    );
+
+    let plan = BindingPlan::build_shadow(&source_owned).expect("stack-aware plan");
+    for (object, _, _, size) in stack_slots {
+        match (size, plan.stack_object_disposition(object)) {
+            (Some(size), Some(StackObjectDisposition::Bound { binding })) if size > 0 => {
+                assert_eq!(
+                    plan.binding(binding).map(Binding::declaration_type),
+                    Some(&CType::UInt(size * 8))
+                );
+                assert!(matches!(
+                    plan.binding(binding)
+                        .map(|binding| binding.certificate.sources.as_ref()),
+                    Some([BindingCertificateSource::CertifiedEntity(
+                        SemanticId::StackSlot(certified)
+                    )]) if *certified == object
+                ));
+            }
+            (
+                None,
+                Some(StackObjectDisposition::Refused {
+                    reason: StackObjectRefusal::MissingWidth { object: refused },
+                }),
+            ) if refused == object => {}
+            other => panic!("unexpected stack object disposition: {other:?}"),
+        }
+    }
+    assert!(plan.validate_seal(&source_owned).is_ok());
+}

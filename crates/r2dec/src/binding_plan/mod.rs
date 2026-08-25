@@ -117,19 +117,76 @@ pub(crate) enum PlacementRefusal {
     ReadBeforeAssignment { binding: BindingId, site: UseSite },
 }
 
+/// Typed disposition of an addressable stack object. Stack objects do not have
+/// SSA-value membership, so they occupy their own plan domain instead of being
+/// reconstructed from an offset or a rendered local name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StackObjectDisposition {
+    Bound { binding: BindingId },
+    Refused { reason: StackObjectRefusal },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StackObjectRefusal {
+    MissingWidth {
+        object: r2ssa::ObjectId,
+    },
+    InvalidWidth {
+        object: r2ssa::ObjectId,
+        size_bytes: u32,
+    },
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum BindingPlanSourceMismatch {
     Authority,
     MachineProjection(r2ssa::MachineBuildError),
-    ValueTopology { index: usize, value: ValueId },
-    DispositionCount { expected: usize, actual: usize },
-    BindingCount { expected: usize, actual: usize },
-    InvalidBindingReference { value: ValueId, binding: BindingId },
-    NonBoundValue { value: ValueId },
-    CertificateMembership { binding: BindingId },
-    DeclarationWidth { binding: BindingId },
-    InvalidLiteralInline { value: ValueId },
-    UnexpectedValueDisposition { value: ValueId },
+    ValueTopology {
+        index: usize,
+        value: ValueId,
+    },
+    DispositionCount {
+        expected: usize,
+        actual: usize,
+    },
+    BindingCount {
+        expected: usize,
+        actual: usize,
+    },
+    InvalidBindingReference {
+        value: ValueId,
+        binding: BindingId,
+    },
+    NonBoundValue {
+        value: ValueId,
+    },
+    CertificateMembership {
+        binding: BindingId,
+    },
+    DeclarationWidth {
+        binding: BindingId,
+    },
+    InvalidLiteralInline {
+        value: ValueId,
+    },
+    UnexpectedValueDisposition {
+        value: ValueId,
+    },
+    StackObjectCount {
+        expected: usize,
+        actual: usize,
+    },
+    UnexpectedStackObjectDisposition {
+        object: r2ssa::ObjectId,
+    },
+    StackObjectCertificate {
+        object: r2ssa::ObjectId,
+        binding: BindingId,
+    },
+    StackObjectDeclarationWidth {
+        object: r2ssa::ObjectId,
+        binding: BindingId,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -229,11 +286,14 @@ pub(crate) struct BindingPlan {
     machine_projection: MachineProjection,
     bindings: Box<[Binding]>,
     dispositions: Box<[ValueDisposition]>,
+    stack_objects: BTreeMap<r2ssa::ObjectId, StackObjectDisposition>,
 }
 
 mod construction;
+mod name_resolution;
 mod seal;
 
+pub(crate) use name_resolution::{BindingNameResolution, BindingNameResolutionError};
 pub(crate) use seal::build_upstream_shadow_oracle;
 
 #[cfg(test)]
@@ -270,6 +330,13 @@ impl BindingPlan {
 
     pub(crate) fn disposition(&self, value: ValueId) -> Option<&ValueDisposition> {
         self.dispositions.get(value.0 as usize)
+    }
+
+    pub(crate) fn stack_object_disposition(
+        &self,
+        object: r2ssa::ObjectId,
+    ) -> Option<StackObjectDisposition> {
+        self.stack_objects.get(&object).copied()
     }
 
     pub(crate) fn use_disposition(&self, site: UseSite) -> Option<&r2ssa::MachineUseDisposition> {

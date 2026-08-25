@@ -163,6 +163,21 @@ impl SymbolTable {
         }
     }
 
+    /// Reserve the identity of a sealed renderer binding before declaration
+    /// placement is derived.
+    ///
+    /// This does not assert that the final AST declares the symbol. Only the
+    /// placement phase may add it to a parameter, function-local, or lexical
+    /// declaration site; emission refuses any surviving unplaced reference.
+    pub(crate) fn reserve_binding(
+        &mut self,
+        presentation_name: impl Into<String>,
+        ty: CType,
+        role: SymbolRole,
+    ) -> SymbolId {
+        self.declare(presentation_name, ty, role, SymbolOrigin::default())
+    }
+
     /// Mint an identifier for a position in this table.
     fn id_at(&self, index: usize) -> SymbolId {
         SymbolId {
@@ -232,14 +247,7 @@ impl SymbolTable {
         if let Some(existing) = self.for_value(value) {
             return existing;
         }
-        self.declare(
-            name,
-            ty,
-            role,
-            SymbolOrigin {
-                value: Some(value),
-            },
-        )
+        self.declare(name, ty, role, SymbolOrigin { value: Some(value) })
     }
 
     /// The identifier for this spelling, declaring it if nothing has yet.
@@ -349,10 +357,7 @@ impl SymbolTable {
             if let Ok(want) = std::env::var("R2SLEIGH_TRACE_NAME")
                 && target.eq_ignore_ascii_case(&want)
             {
-                eprintln!(
-                    "NAMEFOLLOW {} -> {target}",
-                    self.symbols[index].name
-                );
+                eprintln!("NAMEFOLLOW {} -> {target}", self.symbols[index].name);
             }
             let previous =
                 std::mem::replace(&mut self.symbols[index].name, Rc::from(target.as_str()));
@@ -421,8 +426,7 @@ impl SymbolTable {
             return;
         }
         let name = self.unique_name(requested);
-        let previous =
-            std::mem::replace(&mut self.symbols[index].name, Rc::from(name.as_str()));
+        let previous = std::mem::replace(&mut self.symbols[index].name, Rc::from(name.as_str()));
         self.by_name.remove(&*previous);
         self.by_name.insert(name, id);
     }
