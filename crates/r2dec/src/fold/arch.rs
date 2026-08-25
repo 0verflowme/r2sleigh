@@ -84,6 +84,22 @@ impl FoldArchConfig {
         base == self.fp_name || matches!(base.as_str(), "rbp" | "ebp" | "fp" | "x29" | "$fp")
     }
 
+    /// Whether this register holds the return address.
+    ///
+    /// A non-leaf function saves it in the prologue and restores it in the
+    /// epilogue. The ABI does not call it callee-saved, because a leaf function
+    /// is free to clobber it, but the save a non-leaf writes is frame
+    /// bookkeeping rather than program semantics all the same.
+    pub(crate) fn is_return_address_name(&self, name: &str) -> bool {
+        let base = normalized_base_name(name);
+        matches!(base.as_str(), "x30" | "w30" | "lr" | "ra" | "$ra")
+    }
+
+    /// Whether this register is one half of the frame record a prologue saves.
+    pub(crate) fn is_frame_record_name(&self, name: &str) -> bool {
+        self.is_frame_pointer_name(name) || self.is_return_address_name(name)
+    }
+
     pub(crate) fn is_stack_base_name(&self, name: &str) -> bool {
         self.is_stack_pointer_name(name) || self.is_frame_pointer_name(name)
     }

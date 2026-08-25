@@ -8,6 +8,22 @@ use r2types::{
 
 use crate::analysis::prepared_semantic::StackAliasView;
 use crate::analysis::utils;
+
+/// Whether this spelling names the value a register was entered with.
+///
+/// Version zero reaches here spelled both ways: `display_name` drops the suffix
+/// for it, while the copy-source route keeps it and writes `x30_0`. Only a
+/// suffix naming a later version means the register was written since entry.
+fn is_entry_value_spelling(display_name: &str) -> bool {
+    match display_name.rsplit_once('_') {
+        Some((_, version))
+            if !version.is_empty() && version.chars().all(|c| c.is_ascii_digit()) =>
+        {
+            version.parse::<u32>().is_ok_and(|version| version == 0)
+        }
+        _ => true,
+    }
+}
 use crate::ast::{BinaryOp, CExpr};
 
 use super::context::FoldingContext;
@@ -911,8 +927,15 @@ impl<'a> FoldingContext<'a> {
                 // The P-code often uses temps: Copy tmp:X = RBX; Store [RSP], tmp:X
                 // So we need to check both direct and indirect through temps.
                 if (addr_is_sp || self.addr_is_stack_slot(addr)) && !val.is_const() {
-                    // Direct: val is a callee-saved register
-                    if self.inputs.arch.is_callee_saved_name(&val_name) {
+                    // Direct: val is a callee-saved register, or the entry
+                    // value of the frame record. `stp x29, x30, [sp, N]` writes
+                    // the second of those, and only the value the function was
+                    // entered with is prologue state -- a later value in the
+                    // same register is a scratch use and its store is real.
+                    if self.inputs.arch.is_callee_saved_name(&val_name)
+                        || (self.inputs.arch.is_frame_record_name(&val_name)
+                            && is_entry_value_spelling(&val_name))
+                    {
                         return true;
                     }
                     // Indirect: val is a temp, trace it back via copy_sources
@@ -926,7 +949,8 @@ impl<'a> FoldingContext<'a> {
                         {
                             let src_lower = src_key.to_lowercase();
                             if self.inputs.arch.is_callee_saved_name(&src_lower)
-                                || self.inputs.arch.is_frame_pointer_name(&src_lower)
+                                || (self.inputs.arch.is_frame_record_name(&src_lower)
+                                    && is_entry_value_spelling(&src_lower))
                             {
                                 return true;
                             }

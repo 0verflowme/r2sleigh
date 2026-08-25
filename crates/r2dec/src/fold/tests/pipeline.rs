@@ -8261,6 +8261,54 @@ mod tests {
     }
 
     #[test]
+    fn stack_frame_op_elides_the_entry_link_register_save_but_not_a_scratch_one() {
+        // `stp x29, x30, [sp, N]` is the arm64 frame record. The link register
+        // is not callee-saved -- a leaf may clobber it -- so the callee-saved
+        // list never covered it, and a non-leaf function's prologue save came
+        // out as a program statement. Only the value the function was entered
+        // with is frame bookkeeping; a later value in x30 is a scratch use and
+        // its store is real text.
+        let mut ctx = FoldingContext::new(64);
+        let addr = make_var("tmp:stack", 1, 8);
+        ctx.state
+            .analysis_ctx
+            .use_info
+            .insert_definition_for_name_if_absent(
+                &addr.display_name(),
+                CExpr::binary(BinaryOp::Sub, ctx.name_ref("rsp"), CExpr::IntLit(0x20)),
+            );
+
+        let entry_save = make_var("TMP:entry_lr", 1, 8);
+        let scratch_save = make_var("TMP:scratch_lr", 1, 8);
+        let x30_0 = r2ssa::SSAVar::new("x30", 0, 8);
+        let x30_1 = r2ssa::SSAVar::new("x30", 1, 8);
+        let info = &mut ctx.state.analysis_ctx.use_info;
+        info.bind_value_id(&entry_save, r2ssa::ValueId(940));
+        info.bind_value_id(&scratch_save, r2ssa::ValueId(941));
+        info.bind_value_id(&x30_0, r2ssa::ValueId(942));
+        info.bind_value_id(&x30_1, r2ssa::ValueId(943));
+        info.insert_copy_source_for_vars(&entry_save, &x30_0);
+        info.insert_copy_source_for_vars(&scratch_save, &x30_1);
+
+        assert!(
+            ctx.is_stack_frame_op(&SSAOp::Store {
+                space: r2il::SpaceId::Ram,
+                addr: addr.clone(),
+                val: entry_save,
+            }),
+            "saving the link register the function was entered with is prologue state"
+        );
+        assert!(
+            !ctx.is_stack_frame_op(&SSAOp::Store {
+                space: r2il::SpaceId::Ram,
+                addr,
+                val: scratch_save,
+            }),
+            "storing a later value of the link register is program text"
+        );
+    }
+
+    #[test]
     fn stack_frame_op_uses_typed_temp_for_indirect_callee_saved_push() {
         let mut ctx = FoldingContext::new(64);
         let addr = make_var("tmp:stack", 1, 8);
