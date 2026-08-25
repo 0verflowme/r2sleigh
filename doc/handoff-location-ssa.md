@@ -557,11 +557,28 @@ learn.
      comment names murmur3, is never called for this address at all -- a probe
      on `tmp:4a00_2` prints nothing.
 
-     What is left to check is the analysis-side definition: the statement may be
-     rendered from the recorded definition rather than from
-     `render_canonical_load_expr`, in which case the cast was chosen when that
-     definition was built. Probe `populate_prepared_render_definitions` and
-     `LowerCtx::op_to_expr` for this value next.
+     The analysis-side definition is ruled out too, and how it is ruled out is
+     itself a finding: `DEFFILTER tmp:11f00_2 self=false safe=false
+     carrier=false`. `prepared_render_definition_is_safe` rejects this load, so
+     **no definition is recorded for it at all** -- the statement cannot be
+     coming from one.
+
+     Which leaves the path actually taken, traced end to end: the `Load` arm of
+     `op_to_stmt_impl` computes `elem_ty` correctly as `UInt(32)`, hands it to
+     `render_canonical_load_expr`, and that function takes the `return expr`
+     branch -- returning `best`, the bare `Subscript`, without consulting
+     `elem_ty` at all. `elem_ty` is used only on the three branches *not* taken
+     here: `indexed_pointer_add_expr` for a `Deref`, `typed_deref_expr` for a
+     non-scalar candidate, and the `pointee_load` cast. A `Subscript` that is
+     already a "scalar memory candidate" is returned untyped.
+
+     That is very likely the defect: the renderer accepts an authoritative
+     subscript as-is and never checks that its element width matches the access
+     it was asked to render. What it does not yet explain is where the
+     `(unsigned char *)(long)` text comes from, since the returned expression
+     carries no cast and codegen adds none. Print the final `CStmt` for this op
+     before the pass pipeline runs and compare it with the emitted line; that
+     gap is now three lines wide.
 
      Three fixes were tried at the load renderer and all three are inert,
      because that is the wrong end of the pipeline. Reverted, and recorded so
