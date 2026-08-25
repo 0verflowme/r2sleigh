@@ -603,8 +603,37 @@ learn.
      message is 61 bytes, so `len & 3` is 1 and only `case 1` ever runs. It is
      wrong for every other length, which the corpus does not exercise.
 
-     murmur3_32 at x86-64 -O1 still returns `16a1e234` against `7e4102af`, so the
-     remaining error is in the loop or the finaliser rather than the tail.
+     murmur3_32 at x86-64 -O1 still returns `16a1e234` against `7e4102af`, and
+     the cause is now identified. The source opens the tail with
+     `uint32_t k1 = 0;`, which the compiler emits as `xor ecx, ecx` at
+     `0x10000086a`, and the SSA has it as
+     `ECX_3 = IntXor(tmp:regalias:...:18:0_1, tmp:regalias:...:18:0_1)`. The
+     rendering is `rcx = (uint32_t)arg3;` -- the register's *entry* value, read
+     from a parameter murmur3 does not have -- so `k1` starts as garbage and the
+     tail mixes it into the hash.
+
+     The rule responsible is in the dead-value predicate in
+     `fold/op_lower/mod.rs` and its own comment states the condition the code
+     omits:
+
+     ```rust
+     // Eliminate explicit zeroing idioms when the value is never used
+     // beyond setup/flag chains (e.g., eax = eax ^ eax).
+     if let Some(expr) = self.definition_for_name(&key)
+         && self.is_zeroing_expr(expr)
+     { return true; }
+     ```
+
+     There is no check that the value is unused, so a zeroing whose result the
+     switch reads is dropped anyway.
+
+     Adding `&& self.use_count_of(&key) == 0` is the obvious fix and measures
+     inert -- built, corpus unchanged at 37, the line unchanged, reverted. The
+     reason is worth more than the attempt: `use_count_of` asks by *name*, and
+     `ECX_3`'s count is zero because the switch reads that value under a
+     different name. The guard needs a value-keyed use count, not a name-keyed
+     one. That is the same name-versus-value split this document records
+     elsewhere, showing up in a fifth place.
 
      Also still recorded: using the selector value instead of
      `prepared_canonical_value_root` of it changes nothing, because there was no
