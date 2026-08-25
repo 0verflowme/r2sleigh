@@ -831,21 +831,32 @@ learn.
 
      so `t20380_5` is read before it is declared.
 
-     The likely shape, which the next attempt should confirm before acting on it:
-     the duplicate sat in the *then* branch and the guard emptied it there, so
-     only the then branch ever reached that block. If the `else` branch does not
-     reach it either, then the block is not a merge of both branches at all -- it
-     is part of the then branch that region building labelled a merge, and the
-     `else` reads its result only because the finaliser was folded into the
-     branch. Check the CFG: does the else region's exit reach the block the
-     `IfThenElse` calls its merge?
+     The check recorded here has been run and it disproves the guess. Both
+     branches reach the merge:
 
-     If it does not, the fix is in region building rather than in structuring --
-     a block only one branch reaches belongs to that branch, and emitting it
-     after the `if` puts it after a `return` that needs it. Do not reach for
-     another guard in `structure.rs`; two have been measured there already, one
-     at 37 to 17 and one that landed, and this is the third distinct defect
-     behind the same rendering.
+     ```
+     MERGEREACH cond=0x1000007e8 merge=0x100000820 then=true else=Some(true)
+     ```
+
+     So the block really is a merge of both branches, and the mislabelling theory
+     is wrong. What is wrong instead is the *extent* of the else region: if both
+     branches flow into the merge, the correct shape is
+
+     ```c
+     if (cond) { then } else { else }
+     /* merge: t20380_4, t20380_5 */
+     /* finaliser, return */
+     ```
+
+     and what is rendered puts the finaliser and its `return` *inside* the else.
+     The else region therefore contains blocks that belong after the merge, which
+     is why it reads `t20380_5` before the merge declares it.
+
+     So the question for the next attempt is why the else region extends past its
+     own merge, and it is a region-building question. Do not reach for another
+     guard in `structure.rs`: three have now been measured there, one at 37 to 17,
+     one that landed, and this check, and each addressed a different defect behind
+     the same rendered lines.
 
   0g. **murmur3's tail switch renders with empty bodies.** This is what arm64 -O0
      `murmur3_32` now fails on, and the undeclared `x8_30` is a symptom of it
