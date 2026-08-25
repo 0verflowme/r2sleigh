@@ -658,6 +658,25 @@ learn.
      neither is the way in: guarding the zeroing rule on a zero use count, and
      the name-versus-value theory that guard was based on.
 
+     **Where the change belongs.** Carriers are grown in
+     `crates/r2ssa/src/semantic.rs`, in the fixpoint around lines 5178-5250 that
+     accumulates `identity_values`, `entries`, `updates` and
+     `dominating_initializers` before `function_facts.rs:4165` freezes them into
+     a `CertifiedEntity::LoopCarrier`. Membership there is by exact value
+     identity, so a write to the place at a different width is invisible to it.
+     Admitting such a write as an update -- same `{space, offset}`, smaller size,
+     gated on `SsaArtifact::narrow_write_clears_register` so the wide value is
+     provably the narrow one zero-extended -- is the change, and it is in the
+     semantic layer rather than the renderer.
+
+     Note that this is the *third* place the same rule is needed, which is an
+     argument for putting it somewhere shared: `carrier_member_views` in
+     `normalize.rs` applies it to header phis, `exit_merges_for_carrier` was
+     widened to apply it to exit merges and measured inert because those values
+     are not phis either, and carrier growth needs it for writes. All three ask
+     the same question -- is this value the carrier's place at another width --
+     and all three answer it separately.
+
      Also still recorded: using the selector value instead of
      `prepared_canonical_value_root` of it changes nothing, because there was no
      selector to root.
