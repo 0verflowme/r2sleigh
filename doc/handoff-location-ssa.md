@@ -4757,10 +4757,29 @@ there -- resolving differently *is* its purpose. So the link is read by at least
 three places with three different meanings, and recording it changes all of them
 at once.
 
-Both changes are reverted. What this rules out is the incremental path: there is
-no order in which the mint sites can start recording what they render while the
-readers disagree about what the record means. The readers have to be reconciled
-first, and that is a larger piece of work than any single site.
+Both changes are reverted, and looking at *what* breaks ties this thread to the
+one at the top of this section. The canary is always `t11f80_2`, and the damage
+is always the same shape:
+
+    for (int64_t local_28 = 0; t11f80_2 < arg1; local_28 = t6b00)
+
+`tmp:11f80_2` and `local_28` are one value. The stack local is its rendered
+spelling and the temporary is what it was lifted from, and recording the SSA link
+lets a reader reach the value by a route that bypasses the alias. That is exactly
+the diagnosis recorded for the mint attempt -- *the spelling of a value depends on
+context the table does not hold* -- reached now from a third direction, and it
+explains the `origin_name_to_expr` attempts too. All three failed on this one
+name for one reason.
+
+So the readers do not disagree about the record; they disagree about **which of a
+value's spellings is the one to print**, and the alias is not in the table. Until
+it is, any route that reaches a value without going through the alias map will
+print the wrong one of its two names.
+
+That is the reconciliation: the alias has to be something the table owns, not
+something each reader consults separately. It is the same statement as the
+location model's, one layer up -- one name per value, with the context that
+chooses it held in one place.
 
 The corpus is 35 of 54 throughout -- this moves `xxhash32` from one undeclared
 name to another rather than to a rendering that compiles.
