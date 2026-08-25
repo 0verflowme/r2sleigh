@@ -1957,6 +1957,10 @@ fn collect_definitions(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
             } else {
                 let expr = {
                     let lower = LowerCtx {
+                        // Legacy UseInfo numbers values in traversal order and
+                        // has no source-authority seal. Its numeric IDs must
+                        // never index the upstream binding plan.
+                        binding_names: None,
                         symbols,
                         string_literals: env.string_literals,
                         use_info: Some(&scratch.info),
@@ -2023,6 +2027,7 @@ fn rebuild_definitions(
                 expr
             } else {
                 let lower = LowerCtx {
+                    binding_names: None,
                     symbols,
                     string_literals: env.string_literals,
                     use_info: Some(&scratch.info),
@@ -4644,6 +4649,7 @@ fn analyze_call_args(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, s
                 .filter_map(|(idx, op)| op.dst().map(|dst| (dst.display_name(), idx)))
                 .collect::<HashMap<_, _>>();
             let lower = LowerCtx {
+                binding_names: None,
                 symbols,
                 string_literals: env.string_literals,
                 use_info: None,
@@ -4877,6 +4883,7 @@ fn analyze_call_args(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, s
 
             if let Some(ret_family) = ret_family.as_deref() {
                 let lower = LowerCtx {
+                    binding_names: None,
                     symbols,
                     string_literals: env.string_literals,
                     use_info: Some(&scratch.info),
@@ -4962,6 +4969,7 @@ fn bind_single_use_call_result_definitions(symbols: &std::cell::RefCell<crate::s
             .collect::<HashMap<_, _>>();
         for (op_idx, op) in block.ops.iter().enumerate() {
             let lower = LowerCtx {
+                binding_names: None,
                 symbols,
                 string_literals: env.string_literals,
                 use_info: None,
@@ -5059,6 +5067,7 @@ fn bind_call_result_alias_definitions(symbols: &std::cell::RefCell<crate::symbol
             let src_key = src.display_name();
             let uses_current_call_result = {
                 let lower = LowerCtx {
+                    binding_names: None,
                     symbols,
                     string_literals: env.string_literals,
                     use_info: Some(info),
@@ -8216,6 +8225,7 @@ mod tests {
 
         fn env(&self) -> PassEnv<'_> {
             PassEnv {
+                binding_names: None,
                 carrier_aliases: crate::analysis::no_carrier_aliases(),
                 string_literals: crate::analysis::lower::no_string_literals(),
                 ptr_size: 64,
@@ -9586,6 +9596,7 @@ mod tests {
 
         let info = analyze(&fixture.symbols, std::slice::from_ref(&block), &env);
         let lower = LowerCtx {
+            binding_names: None,
             symbols: &fixture.symbols,
             string_literals: env.string_literals,
             use_info: Some(&info),
@@ -9944,6 +9955,7 @@ mod tests {
 
         let info = analyze(&symbols, std::slice::from_ref(&block), &env);
         let lower = LowerCtx {
+            binding_names: None,
             symbols: &symbols,
             string_literals: env.string_literals,
             use_info: None,

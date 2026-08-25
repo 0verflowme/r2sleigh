@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::rc::Rc;
 
 use r2ssa::function::DefLocation;
 use r2ssa::{
@@ -40,8 +41,12 @@ pub(crate) struct PreparedCallView {
     pub(crate) render_fact: Option<r2types::CallsiteRenderFact>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default)]
 pub(crate) struct PreparedSemanticView {
+    /// The sole BindingId-to-SymbolId projection for this rendering. Keeping
+    /// the resolver itself avoids a second ValueId/name table that could drift
+    /// from the sealed binding plan.
+    pub(crate) binding_names: Option<Rc<crate::binding_plan::BindingNameResolution>>,
     pub(crate) stack_aliases_by_offset: BTreeMap<i64, StackAliasView>,
     pub(crate) param_alias_by_reg: HashMap<String, String>,
     pub(crate) carrier_alias_by_name: HashMap<String, String>,
@@ -84,6 +89,12 @@ pub(crate) struct PreparedSemanticViewInputs<'a> {
     pub(crate) certified_rendering_required: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PreparedSemanticViewBuildError {
+    SourceAuthorityMismatch,
+    SymbolTableMismatch,
+}
+
 impl<'a> PreparedSemanticViewInputs<'a> {
     fn callee_resolution(&self) -> Option<&'a CalleeResolutionFacts> {
         self.function_facts.callee_resolution()
@@ -108,11 +119,34 @@ impl<'a> PreparedSemanticViewInputs<'a> {
 
 impl PreparedSemanticView {
     pub(crate) fn build(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, inputs: PreparedSemanticViewInputs<'_>) -> Self {
+        Self::build_inner(symbols, inputs, None)
+    }
+
+    pub(crate) fn build_with_bindings(
+        symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
+        inputs: PreparedSemanticViewInputs<'_>,
+        binding_names: Rc<crate::binding_plan::BindingNameResolution>,
+    ) -> Result<Self, PreparedSemanticViewBuildError> {
+        if !binding_names.validates_artifact(inputs.prepared) {
+            return Err(PreparedSemanticViewBuildError::SourceAuthorityMismatch);
+        }
+        if !binding_names.owns_symbol_table(symbols) {
+            return Err(PreparedSemanticViewBuildError::SymbolTableMismatch);
+        }
+        Ok(Self::build_inner(symbols, inputs, Some(binding_names)))
+    }
+
+    fn build_inner(
+        symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
+        inputs: PreparedSemanticViewInputs<'_>,
+        binding_names: Option<Rc<crate::binding_plan::BindingNameResolution>>,
+    ) -> Self {
         #[cfg(test)]
         let certified_rendering_required = inputs.certified_rendering_required;
         #[cfg(not(test))]
         let certified_rendering_required = false;
         let mut view = Self {
+            binding_names,
             param_alias_by_reg: inputs.param_register_aliases.clone(),
             carrier_alias_by_name: match inputs.function_facts.render() {
                 Some(render) => {
@@ -507,6 +541,7 @@ fn populate_prepared_render_definitions(symbols: &std::cell::RefCell<crate::symb
             }
             let expr = {
                 let lower = LowerCtx {
+                    binding_names: env.binding_names,
                     symbols,
                     string_literals: crate::analysis::lower::no_string_literals(),
                     use_info: Some(use_info),
@@ -5080,6 +5115,7 @@ mod tests {
         let caller_saved_regs = HashSet::new();
         let type_hints = HashMap::from([("result".to_string(), crate::ast::CType::u64())]);
         let env = PassEnv {
+            binding_names: None,
             carrier_aliases: crate::analysis::no_carrier_aliases(),
             string_literals: crate::analysis::lower::no_string_literals(),
             ptr_size: 8,
@@ -5117,6 +5153,7 @@ mod tests {
         let caller_saved_regs = HashSet::from(["RCX".to_string()]);
         let type_hints: HashMap<String, crate::ast::CType> = HashMap::new();
         let env = PassEnv {
+            binding_names: None,
             carrier_aliases: crate::analysis::no_carrier_aliases(),
             string_literals: crate::analysis::lower::no_string_literals(),
             ptr_size: 8,
@@ -5381,6 +5418,11 @@ mod tests {
 }
 
 impl crate::naming::NameSource for PreparedSemanticView {
+    fn planned_binding_name(&self, var: &SSAVar) -> Option<String> {
+        let value = self.value_id_for_var(var)?;
+        self.binding_names.as_ref()?.name_for_value(value)
+    }
+
     fn carrier_alias(&self, display: &str) -> Option<String> {
         self.carrier_alias_by_name.get(display).cloned()
     }

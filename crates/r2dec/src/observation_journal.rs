@@ -114,7 +114,7 @@ pub(crate) enum LegacyObservationJournalError {
 /// Sealed, source-authority-bound recorder for one legacy rendering run.
 pub(crate) struct LegacyObservationJournal {
     authority: SsaArtifactAuthority,
-    plan: BindingPlan,
+    plan: Rc<BindingPlan>,
     normalized_projections: Vec<Box<[NormalizedOpProjection]>>,
     symbols: Rc<RefCell<SymbolTable>>,
     value_is_literal: Box<[bool]>,
@@ -145,10 +145,12 @@ impl MarkedNativeDraft {
         source: &SourceOwnedFunctionFacts,
     ) -> Result<SealedNativeFunction, LegacyObservationJournalError> {
         let mut ready = prepare_function_for_emission(&self.function);
+        let plan = Rc::clone(&self.journal.plan);
         let observations = self.journal.seal(source, &mut ready)?;
         Ok(SealedNativeFunction {
             ready,
             observations,
+            plan,
         })
     }
 }
@@ -157,6 +159,7 @@ impl MarkedNativeDraft {
 pub(crate) struct SealedNativeFunction {
     ready: EmissionReadyFunction,
     observations: LegacyAnalysisSnapshot,
+    plan: Rc<BindingPlan>,
 }
 
 impl SealedNativeFunction {
@@ -166,6 +169,10 @@ impl SealedNativeFunction {
 
     pub(crate) const fn observations(&self) -> &LegacyAnalysisSnapshot {
         &self.observations
+    }
+
+    pub(crate) fn plan(&self) -> &BindingPlan {
+        &self.plan
     }
 
     pub(crate) fn into_function(self) -> CFunction {
@@ -178,7 +185,7 @@ impl LegacyObservationJournal {
         source: &SourceOwnedFunctionFacts,
         normalized: &SSAFunction,
         origins: &NormalizationOrigins,
-        plan: &BindingPlan,
+        plan: Rc<BindingPlan>,
         symbols: Rc<RefCell<SymbolTable>>,
     ) -> Result<Self, LegacyObservationJournalError> {
         plan.validate_source(source.source())
@@ -235,7 +242,7 @@ impl LegacyObservationJournal {
 
         Ok(Self {
             authority: source.source().authority().clone(),
-            plan: plan.clone(),
+            plan,
             normalized_projections,
             symbols,
             value_is_literal,
@@ -829,7 +836,7 @@ mod tests {
             &source,
             &normalized,
             &origins,
-            &plan,
+            Rc::new(plan.clone()),
             Rc::clone(&function.symbols),
         )
         .expect("authority-bound journal");

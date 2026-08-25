@@ -53,6 +53,10 @@ pub struct VarInfo {
     pub is_local: bool,
     /// Stack offset (if stack variable).
     pub stack_offset: Option<i64>,
+    /// Exact upstream object identity for a certified stack local. An offset
+    /// without this identity is only a legacy recovery hint and cannot select a
+    /// planned binding.
+    pub stack_object: Option<r2ssa::ObjectId>,
     /// Stable recovery order for deterministic output.
     order_index: usize,
     /// ABI slot ordinal for parameters before any external rename.
@@ -64,6 +68,7 @@ struct VarAttrs {
     is_param: bool,
     is_local: bool,
     stack_offset: Option<i64>,
+    stack_object: Option<r2ssa::ObjectId>,
     param_ordinal: Option<usize>,
 }
 
@@ -78,11 +83,12 @@ fn register_token(name_lower: &str) -> Option<&str> {
 }
 
 impl VarAttrs {
-    const fn local(stack_offset: i64) -> Self {
+    const fn local(stack_offset: i64, stack_object: Option<r2ssa::ObjectId>) -> Self {
         Self {
             is_param: false,
             is_local: true,
             stack_offset: Some(stack_offset),
+            stack_object,
             param_ordinal: None,
         }
     }
@@ -92,6 +98,7 @@ impl VarAttrs {
             is_param: true,
             is_local: false,
             stack_offset: None,
+            stack_object: None,
             param_ordinal: Some(param_ordinal),
         }
     }
@@ -456,10 +463,10 @@ impl VariableRecovery {
                         space: r2il::SpaceId::Ram,
                         addr,
                     } => {
-                        if let Some(offset) =
-                            self.get_stack_offset(func, prepared, addr, &definitions, symbols)
+                        if let Some((object, offset)) =
+                            self.get_stack_object(func, prepared, addr, &definitions, symbols)
                         {
-                            self.ensure_stack_local(offset, dst.size);
+                            self.ensure_stack_local(object, offset, dst.size);
                         }
                     }
                     SSAOp::Store {
@@ -467,10 +474,10 @@ impl VariableRecovery {
                         addr,
                         val,
                     } => {
-                        if let Some(offset) =
-                            self.get_stack_offset(func, prepared, addr, &definitions, symbols)
+                        if let Some((object, offset)) =
+                            self.get_stack_object(func, prepared, addr, &definitions, symbols)
                         {
-                            self.ensure_stack_local(offset, val.size);
+                            self.ensure_stack_local(object, offset, val.size);
                         }
                     }
                     _ => {}
@@ -479,8 +486,16 @@ impl VariableRecovery {
         }
     }
 
-    fn ensure_stack_local(&mut self, offset: i64, size: u32) {
-        if self.stack_locals_by_offset.contains_key(&offset) {
+    fn ensure_stack_local(
+        &mut self,
+        object: Option<r2ssa::ObjectId>,
+        offset: i64,
+        size: u32,
+    ) {
+        if let Some(existing) = self.stack_locals_by_offset.get_mut(&offset) {
+            if existing.stack_object.is_none() {
+                existing.stack_object = object;
+            }
             return;
         }
         let name = self.gen_stack_var_name(offset);
@@ -488,38 +503,42 @@ impl VariableRecovery {
             .visible_stack_type_for_offset(offset)
             .unwrap_or_else(|| self.type_from_size(size));
         let synthetic = SSAVar::new(format!("stack:{offset}"), 0, size);
-        let info = self.make_var_info(synthetic, name, ty, VarAttrs::local(offset));
+        let info = self.make_var_info(synthetic, name, ty, VarAttrs::local(offset, object));
         self.stack_locals_by_offset.insert(offset, info);
     }
 
     /// Get stack offset from an address variable.
-    fn get_stack_offset(
+    fn get_stack_object(
         &self,
         func: &SSAFunction,
         prepared: Option<&SsaArtifact>,
         addr: &SSAVar,
         definitions: &HashMap<String, CExpr>,
         symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
-    ) -> Option<i64> {
+    ) -> Option<(Option<r2ssa::ObjectId>, i64)> {
 
-        if let Some(offset) = prepared
-            .and_then(|artifact| artifact.object_for_var(addr, r2il::SpaceId::Ram))
-            .and_then(|object| prepared?.objects().object(object))
-            .and_then(|object| match object.kind {
-                ObjectKind::StackSlot { offset, .. } | ObjectKind::FrameObject { offset, .. } => {
-                    Some(offset)
-                }
-                _ => None,
+        if let Some((object, offset)) = prepared
+            .and_then(|artifact| {
+                artifact
+                    .object_for_var(addr, r2il::SpaceId::Ram)
+                    .map(|object| (artifact, object))
+            })
+            .and_then(|(artifact, object)| {
+                artifact.objects().object(object).and_then(|fact| match fact.kind {
+                    ObjectKind::StackSlot { offset, .. }
+                    | ObjectKind::FrameObject { offset, .. } => Some((object, offset)),
+                    _ => None,
+                })
             })
         {
-            return Some(offset);
+            return Some((Some(object), offset));
         }
         if let Some(offset) = func
             .decompile_prep_facts()
             .and_then(|facts| facts.stack_address_root_of(addr))
             .map(|root| root.offset)
         {
-            return Some(offset);
+            return Some((None, offset));
         }
         utils::extract_stack_offset_from_var(
             symbols,
@@ -528,6 +547,7 @@ impl VariableRecovery {
             &self.fp_name,
             &self.sp_name,
         )
+        .map(|offset| (None, offset))
     }
 
     fn collect_definitions(
@@ -824,6 +844,7 @@ impl VariableRecovery {
             is_param: attrs.is_param,
             is_local: attrs.is_local,
             stack_offset: attrs.stack_offset,
+            stack_object: attrs.stack_object,
             order_index,
             param_ordinal: attrs.param_ordinal,
         }
@@ -1503,19 +1524,19 @@ mod tests {
             local_c.clone(),
             "slot".to_string(),
             CType::Int(32),
-            VarAttrs::local(8),
+            VarAttrs::local(8, None),
         );
         vr.insert_var_info(
             local_b.clone(),
             "slot".to_string(),
             CType::Int(32),
-            VarAttrs::local(8),
+            VarAttrs::local(8, None),
         );
         vr.insert_var_info(
             local_a.clone(),
             "alpha".to_string(),
             CType::Int(32),
-            VarAttrs::local(4),
+            VarAttrs::local(4, None),
         );
         vr.insert_var_info(
             temp.clone(),

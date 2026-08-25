@@ -78,6 +78,7 @@ use r2types::{
 use r2types::{ExternalTypeDb, FunctionType};
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
+use std::rc::Rc;
 #[cfg(test)]
 use std::sync::Arc;
 
@@ -2589,12 +2590,6 @@ impl DecompilerContext {
             .is_some_and(|route| route.skip_runtime_type_inference)
     }
 
-    fn use_prepared_semantic_view(&self, prepared: &r2ssa::SsaArtifact) -> bool {
-        let _ = prepared;
-        self.function_facts
-            .decompile_route()
-            .is_some_and(|route| route.use_prepared_semantic_view)
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -2659,21 +2654,18 @@ enum BindingShadowOutcome {
 
 impl BindingShadowOutcome {
     fn build(
+        plan: &crate::binding_plan::BindingPlan,
         source: &r2types::function_facts::SourceOwnedFunctionFacts,
         legacy: &crate::shadow_report::LegacyAnalysisSnapshot,
     ) -> Self {
-        let plan = match crate::binding_plan::BindingPlan::build_shadow(source) {
-            Ok(plan) => plan,
-            Err(error) => return Self::Failed(BindingShadowFailure::Build(error)),
-        };
-        if let Err(error) = crate::fold::op_lower::PlannedLoweringInput::try_new(source, &plan) {
+        if let Err(error) = crate::fold::op_lower::PlannedLoweringInput::try_new(source, plan) {
             return Self::Failed(BindingShadowFailure::Pairing(error));
         }
-        let report = match crate::shadow_report::ShadowReport::build(&plan, source, legacy) {
+        let report = match crate::shadow_report::ShadowReport::build(plan, source, legacy) {
             Ok(report) => report,
             Err(error) => return Self::Failed(BindingShadowFailure::Report(error)),
         };
-        if let Err(error) = report.validate_against(&plan, source, legacy) {
+        if let Err(error) = report.validate_against(plan, source, legacy) {
             return Self::Failed(BindingShadowFailure::Report(error));
         }
         let ledger = report.ledger(source);
@@ -2681,7 +2673,7 @@ impl BindingShadowOutcome {
             return Self::Failed(BindingShadowFailure::NonQuality(ledger));
         }
         Self::Complete(BindingShadow {
-            plan,
+            plan: plan.clone(),
             report,
             ledger,
         })
@@ -3048,8 +3040,16 @@ impl Decompiler {
         let legacy_binding_analysis = capture_legacy_binding_analysis(
             crate::analysis::use_info::UseAnalysisInput::new(input.source_owned_facts()),
         );
-        let binding_shadow =
-            BindingShadowOutcome::build(input.source_owned_facts(), &legacy_binding_analysis);
+        let binding_shadow = match crate::binding_plan::BindingPlan::build_shadow(
+            input.source_owned_facts(),
+        ) {
+            Ok(plan) => BindingShadowOutcome::build(
+                &plan,
+                input.source_owned_facts(),
+                &legacy_binding_analysis,
+            ),
+            Err(error) => BindingShadowOutcome::Failed(BindingShadowFailure::Build(error)),
+        };
         Ok(DecompileBindingAudit {
             output,
             binding_shadow: BindingShadowAuditOutcome::from_internal(&binding_shadow),
@@ -3656,6 +3656,48 @@ impl Decompiler {
                 &format!("normalization origin refusal: {error:?}"),
             ));
         }
+        let binding_plan = match crate::binding_plan::BindingPlan::build_shadow(
+            input.source_owned_facts(),
+        ) {
+            Ok(plan) => std::rc::Rc::new(plan),
+            Err(error) => {
+                return Ok(residual_function_for_render_boundary(
+                    &func
+                        .name
+                        .clone()
+                        .unwrap_or_else(|| format!("sub_{:x}", func.entry)),
+                    &format!("binding plan refusal: {error:?}"),
+                ));
+            }
+        };
+        if let Err(error) = crate::fold::op_lower::PlannedLoweringInput::try_new(
+            input.source_owned_facts(),
+            &binding_plan,
+        ) {
+            return Ok(residual_function_for_render_boundary(
+                &func
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| format!("sub_{:x}", func.entry)),
+                &format!("binding source refusal: {error:?}"),
+            ));
+        }
+        let binding_names = match crate::binding_plan::BindingNameResolution::build(
+            input.source_owned_facts(),
+            std::rc::Rc::clone(&binding_plan),
+            std::rc::Rc::clone(&symbol_table),
+        ) {
+            Ok(names) => std::rc::Rc::new(names),
+            Err(error) => {
+                return Ok(residual_function_for_render_boundary(
+                    &func
+                        .name
+                        .clone()
+                        .unwrap_or_else(|| format!("sub_{:x}", func.entry)),
+                    &format!("binding name refusal: {error:?}"),
+                ));
+            }
+        };
         work.poll()?;
         if std::env::var_os("R2SLEIGH_DEBUG_MERGES").is_some() {
             // What materialisation left behind, so a carrier update that renders
@@ -3763,7 +3805,11 @@ impl Decompiler {
                                 type_like_to_ctype(&type_inference.get_type(&v.ssa_var))
                             })
                             .unwrap_or_else(|| v.ty.clone()),
-                        name: crate::symbol::declare(&symbols, &v.name),
+                        name: prepared
+                            .graph()
+                            .value_id_for_var(&v.ssa_var)
+                            .and_then(|value| binding_names.symbol_for_value(value))
+                            .unwrap_or_else(|| crate::symbol::declare(&symbols, &v.name)),
                     },
                 )
             })
@@ -3830,9 +3876,9 @@ impl Decompiler {
                 .into_iter()
                 .collect(),
         };
-        let use_prepared_semantic_view = self.context.use_prepared_semantic_view(prepared);
-        let prepared_semantic_view = use_prepared_semantic_view.then(|| {
-            analysis::PreparedSemanticView::build(symbols, analysis::PreparedSemanticViewInputs {
+        let prepared_semantic_view = match analysis::PreparedSemanticView::build_with_bindings(
+            symbols,
+            analysis::PreparedSemanticViewInputs {
                 prepared,
                 abi_arg_regs: &self.config.arg_regs,
                 stack_slots: &self.context.type_facts().stack_slots,
@@ -3841,8 +3887,20 @@ impl Decompiler {
                 function_facts: &self.context.function_facts,
                 #[cfg(test)]
                 certified_rendering_required: false,
-            })
-        });
+            },
+            Rc::clone(&binding_names),
+        ) {
+            Ok(view) => view,
+            Err(error) => {
+                return Ok(residual_function_for_render_boundary(
+                    &func
+                        .name
+                        .clone()
+                        .unwrap_or_else(|| format!("sub_{:x}", func.entry)),
+                    &format!("prepared semantic view refusal: {error:?}"),
+                ));
+            }
+        };
         let fold_inputs = FoldInputs {
             normalization_origins: Some(&normalization_origins),
             arch: &fold_arch,
@@ -3866,7 +3924,8 @@ impl Decompiler {
             type_oracle,
             function_return_type: fold_function_return_type,
             prepared_ssa: Some(prepared),
-            prepared_semantic_view: prepared_semantic_view.as_ref(),
+            binding_names: Some(&binding_names),
+            prepared_semantic_view: Some(&prepared_semantic_view),
             prepared_objects: Some(prepared.objects()),
             prepared_memory: Some(prepared.memory()),
         };
@@ -3961,7 +4020,16 @@ impl Decompiler {
                             .unwrap_or_else(|| v.ty.clone()),
                         runtime_type_hint_for_name(&type_hints, &v.name),
                     ),
-                    name: crate::symbol::declare(&symbols, &v.name),
+                    name: v
+                        .stack_object
+                        .and_then(|object| binding_names.symbol_for_stack_object(object))
+                        .or_else(|| {
+                            prepared
+                                .graph()
+                                .value_id_for_var(&v.ssa_var)
+                                .and_then(|value| binding_names.symbol_for_value(value))
+                        })
+                        .unwrap_or_else(|| crate::symbol::declare(&symbols, &v.name)),
                     stack_offset: v.stack_offset,
                 })
                 .collect()
@@ -3991,7 +4059,16 @@ impl Decompiler {
                             .unwrap_or_else(|| v.ty.clone()),
                         runtime_type_hint_for_name(&type_hints, &v.name),
                     ),
-                    name: crate::symbol::declare(&symbols, &v.name),
+                    name: v
+                        .stack_object
+                        .and_then(|object| binding_names.symbol_for_stack_object(object))
+                        .or_else(|| {
+                            prepared
+                                .graph()
+                                .value_id_for_var(&v.ssa_var)
+                                .and_then(|value| binding_names.symbol_for_value(value))
+                        })
+                        .unwrap_or_else(|| crate::symbol::declare(&symbols, &v.name)),
                     stack_offset: v.stack_offset,
                 })
                 .collect::<Vec<_>>();
@@ -6477,6 +6554,7 @@ mod tests {
             type_oracle: None,
             function_return_type: None,
             prepared_ssa: None,
+            binding_names: None,
             prepared_semantic_view: None,
             prepared_objects: None,
             prepared_memory: None,

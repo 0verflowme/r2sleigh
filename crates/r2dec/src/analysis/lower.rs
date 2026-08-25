@@ -21,6 +21,9 @@ pub(crate) fn no_string_literals() -> &'static std::collections::BTreeMap<u64, S
 }
 
 pub(crate) struct LowerCtx<'a> {
+    /// The sole binding-name projection for this rendering. Value identity is
+    /// still resolved through `UseInfo`; no parallel ValueId table lives here.
+    pub(crate) binding_names: Option<&'a crate::binding_plan::BindingNameResolution>,
     pub(crate) use_info: Option<&'a UseInfo>,
     pub(crate) pinned: &'a HashSet<String>,
     pub(crate) var_aliases: &'a HashMap<String, String>,
@@ -1437,6 +1440,7 @@ mod tests {
         let semantic_values: &'static HashMap<String, SemanticValue> = Box::leak(Box::new(HashMap::new()));
         let param_register_aliases = Box::leak(Box::new(HashMap::new()));
         LowerCtx {
+            binding_names: None,
             symbols,
             string_literals: crate::analysis::lower::no_string_literals(),
             // These facts live in one store keyed by identity, so the maps a
@@ -2238,6 +2242,11 @@ mod tests {
 }
 
 impl crate::naming::NameSource for LowerCtx<'_> {
+    fn planned_binding_name(&self, var: &SSAVar) -> Option<String> {
+        let value = self.use_info?.exact_value_id_for_var(var)?;
+        self.binding_names?.name_for_value(value)
+    }
+
     fn carrier_alias(&self, _display: &str) -> Option<String> {
         None
     }

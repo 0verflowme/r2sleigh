@@ -1371,6 +1371,12 @@ impl<'a> FoldingContext<'a> {
 }
 
 impl crate::naming::NameSource for FoldingContext<'_> {
+    fn planned_binding_name(&self, var: &SSAVar) -> Option<String> {
+        let prepared = self.inputs.prepared_ssa?;
+        let value = prepared.graph().value_id_for_var(var)?;
+        self.inputs.binding_names?.name_for_value(value)
+    }
+
     fn carrier_alias(&self, display: &str) -> Option<String> {
         self.carrier_aliases.get(display).cloned()
     }

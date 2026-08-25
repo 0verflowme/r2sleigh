@@ -113,6 +113,9 @@ pub(crate) struct FoldInputs<'a> {
     pub(crate) type_oracle: Option<&'a dyn TypeOracle>,
     pub(crate) function_return_type: Option<&'a CType>,
     pub(crate) prepared_ssa: Option<&'a SsaArtifact>,
+    /// Sole `BindingId -> SymbolId` projection for this native rendering.
+    pub(crate) binding_names:
+        Option<&'a std::rc::Rc<crate::binding_plan::BindingNameResolution>>,
     pub(crate) prepared_semantic_view: Option<&'a analysis::PreparedSemanticView>,
     pub(crate) prepared_objects: Option<&'a ObjectModel>,
     #[allow(dead_code)]
@@ -217,8 +220,8 @@ pub(crate) struct FoldingContext<'a> {
     pub(crate) call_result_owner_name_cache:
         std::cell::RefCell<BTreeMap<(u64, usize), Option<String>>>,
     pub(crate) owned_call_visible_names_cache: std::cell::RefCell<Option<HashSet<String>>>,
+    #[cfg(test)]
     pub(crate) prepared_semantic_view_cache: OnceCell<analysis::PreparedSemanticView>,
-    pub(crate) prepared_semantic_view_building: Cell<bool>,
     pub(crate) semantic_render_in_progress: std::cell::RefCell<HashSet<String>>,
     pub(crate) value_render_in_progress: std::cell::RefCell<HashSet<String>>,
     pub(crate) definition_lookup_in_progress: std::cell::RefCell<HashSet<String>>,
@@ -476,8 +479,8 @@ impl<'a> FoldingContext<'a> {
             inlined_renderings: std::cell::RefCell::new(HashMap::new()),
             call_result_owner_name_cache: std::cell::RefCell::new(BTreeMap::new()),
             owned_call_visible_names_cache: std::cell::RefCell::new(None),
+            #[cfg(test)]
             prepared_semantic_view_cache: OnceCell::new(),
-            prepared_semantic_view_building: Cell::new(false),
             semantic_render_in_progress: std::cell::RefCell::new(HashSet::new()),
             value_render_in_progress: std::cell::RefCell::new(HashSet::new()),
             definition_lookup_in_progress: std::cell::RefCell::new(HashSet::new()),
@@ -1010,6 +1013,7 @@ impl<'a> FoldingContext<'a> {
 
         let inputs = FoldInputs {
             normalization_origins: None,
+            binding_names: None,
             display_names: crate::empty_display_names(),
             arch,
             #[cfg(test)]

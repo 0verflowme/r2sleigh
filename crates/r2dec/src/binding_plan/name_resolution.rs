@@ -133,6 +133,14 @@ impl BindingNameResolution {
     pub(crate) fn validate_source(&self, source: &SourceOwnedFunctionFacts) -> bool {
         self.authority == *source.source().authority()
     }
+
+    pub(crate) fn validates_artifact(&self, source: &r2ssa::SsaArtifact) -> bool {
+        self.authority == *source.authority()
+    }
+
+    pub(crate) fn owns_symbol_table(&self, symbols: &RefCell<SymbolTable>) -> bool {
+        std::ptr::eq(self.symbols.as_ref(), symbols)
+    }
 }
 
 #[cfg(test)]
@@ -268,5 +276,22 @@ mod tests {
             Some("accumulator")
         );
         assert!(resolution.validate_source(&source));
+    }
+
+    #[test]
+    fn resolver_rejects_foreign_source_and_symbol_table_pairing() {
+        let source = source_owned();
+        let foreign = source_owned();
+        let plan = BindingPlan::build_shadow(&source).expect("plan");
+        let symbols = Rc::new(RefCell::new(SymbolTable::new()));
+        let resolution =
+            BindingNameResolution::build(&source, Rc::new(plan), Rc::clone(&symbols))
+                .expect("resolution");
+        let foreign_symbols = RefCell::new(SymbolTable::new());
+
+        assert!(resolution.validates_artifact(source.source()));
+        assert!(!resolution.validates_artifact(foreign.source()));
+        assert!(resolution.owns_symbol_table(symbols.as_ref()));
+        assert!(!resolution.owns_symbol_table(&foreign_symbols));
     }
 }

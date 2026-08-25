@@ -832,20 +832,18 @@ impl<'a> FoldingContext<'a> {
     }
 
     pub(crate) fn prepared_semantic_view(&self) -> Option<&analysis::PreparedSemanticView> {
-        let symbols = &self.symbols;
-
         if let Some(view) = self.inputs.prepared_semantic_view {
             return Some(view);
         }
 
-        let prepared = self.inputs.prepared_ssa?;
-        if self.prepared_semantic_view_building.get() {
-            return None;
-        }
+        #[cfg(not(test))]
+        return None;
 
-        self.prepared_semantic_view_building.set(true);
-        let view = self.prepared_semantic_view_cache.get_or_init(|| {
-            analysis::PreparedSemanticView::build(&symbols, analysis::PreparedSemanticViewInputs {
+        #[cfg(test)]
+        {
+        let prepared = self.inputs.prepared_ssa?;
+        Some(self.prepared_semantic_view_cache.get_or_init(|| {
+            analysis::PreparedSemanticView::build(&self.symbols, analysis::PreparedSemanticViewInputs {
                 prepared,
                 abi_arg_regs: &self.inputs.arch.arg_regs,
                 stack_slots: self.inputs.stack_slots,
@@ -855,9 +853,8 @@ impl<'a> FoldingContext<'a> {
                 #[cfg(test)]
                 certified_rendering_required: false,
             })
-        });
-        self.prepared_semantic_view_building.set(false);
-        Some(view)
+        }))
+        }
     }
 
     fn prepared_facts(&self) -> Option<&PreparedFunctionFacts> {
@@ -1186,6 +1183,7 @@ impl<'a> FoldingContext<'a> {
     }
     pub(crate) fn to_pass_env(&self) -> analysis::PassEnv<'_> {
         analysis::PassEnv {
+            binding_names: self.inputs.binding_names.map(std::rc::Rc::as_ref),
             symbols: &self.symbols,
             string_literals: self.inputs.display_names.strings(),
             ptr_size: self.inputs.arch.ptr_size,
@@ -1526,6 +1524,7 @@ impl<'a> FoldingContext<'a> {
         }
         let type_hints = self.state.analysis_ctx.semantic().type_hints.clone();
         let env = analysis::PassEnv {
+            binding_names: self.inputs.binding_names.map(std::rc::Rc::as_ref),
             symbols: &self.symbols,
             carrier_aliases: crate::analysis::no_carrier_aliases(),
             string_literals: self.inputs.display_names.strings(),
@@ -2160,18 +2159,10 @@ impl<'a> FoldingContext<'a> {
         if let Some(prepared) = self.inputs.prepared_ssa {
             self.state.analysis_ctx.semantic_mut().type_hints = self.inputs.type_hints.clone();
             let env = self.to_pass_env();
-            let prepared_view = self.prepared_semantic_view().cloned().unwrap_or_else(|| {
-                analysis::PreparedSemanticView::build(&symbols, analysis::PreparedSemanticViewInputs {
-                    prepared,
-                    abi_arg_regs: &self.inputs.arch.arg_regs,
-                    stack_slots: self.inputs.stack_slots,
-                    visible_bindings: self.inputs.visible_bindings,
-                    param_register_aliases: self.inputs.param_register_aliases,
-                    function_facts: self.inputs.function_facts,
-                    #[cfg(test)]
-                    certified_rendering_required: false,
-                })
-            });
+            let prepared_view = self
+                .prepared_semantic_view()
+                .cloned()
+                .expect("prepared folding requires one prebuilt semantic view");
             let normalization_origins = self
                 .inputs
                 .normalization_origins

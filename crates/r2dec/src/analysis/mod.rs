@@ -91,6 +91,9 @@ pub(crate) fn no_carrier_aliases() -> &'static HashMap<String, String> {
 #[derive(Clone)]
 
 pub(crate) struct PassEnv<'a> {
+    /// The one renderer projection from BindingId to SymbolId. Analysis only
+    /// borrows it while translating exact ValueIds into references.
+    pub(crate) binding_names: Option<&'a crate::binding_plan::BindingNameResolution>,
     pub(crate) ptr_size: u32,
     pub(crate) sp_name: &'a str,
     pub(crate) fp_name: &'a str,
