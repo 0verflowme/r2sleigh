@@ -4587,3 +4587,19 @@ parameter is used as a pointer base and typed as an integer, and every layer
 downstream is being consistent with the type it was given. It is a different
 family from the undefined names, and it is what stands between `murmur3_32` and
 compiling on both optimised arm64 builds.
+
+Where the uncast subscript is *built* is still not found, and the search is worth
+recording because it eliminates the obvious answers. Four places construct
+`CExpr::Subscript`: `subscript_expr_for_base_and_index` casts its base through
+`cast_expr_if_needed`; `analysis/lower.rs:1192` casts unconditionally with
+`CExpr::cast(CType::ptr(elem_ty), base_expr)`; and the two certified builders in
+`memory_renderer.rs` do not. Adding the same cast to the certified linear builder
+was measured and is inert, so the expression does not come from there either.
+
+Codegen is not stripping it. `CExpr::Subscript` emits its base through
+`emit_expr(base, my_prec)` at postfix precedence, and the rendering shows
+`(arg0 + (arg1 & -0x4))` correctly parenthesised -- so a cast on that base would
+have survived and printed.
+
+A fifth construction site, or a pass that removes the cast, is unaccounted for.
+The four eliminated candidates are recorded so they are not re-checked.
