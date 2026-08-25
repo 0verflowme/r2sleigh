@@ -786,6 +786,40 @@ learn.
      `prepared_canonical_value_root` of it changes nothing, because there was no
      selector to root.
 
+  0l. **A deferred merge block is rendered twice on arm64.** This is what
+     `murmur3_32` fails on at arm64 -O1 and -O2, two of the sixteen remaining
+     failures, and it is the known consequence of an earlier fix on this branch
+     rather than a new defect.
+
+     The same two statements appear in both places:
+
+     ```c
+     if ((arg1 & 3) != 0) {
+         t20380_4 = ... ;          /* line 49, no declaration */
+         t20380_5 = ... ;
+     }
+     long t20380_4 = ... ;         /* line 55, the declaration */
+     long t20380_5 = ... ;
+     ```
+
+     The first copy reads names the second declares, so the file does not
+     compile. `IfThenElse` pushes its merge onto `deferred_merge_blocks` before
+     structuring the branches and emits it afterwards, and the
+     `merge_owned_by_ancestor` guard that stops a nested construct re-emitting it
+     is consulted **only in the `IfThenElse` arm**. A branch region that reaches
+     the merge as a plain `Region::Block` has nothing to stop it.
+
+     Applying the guard there -- returning `CStmt::Empty` for a
+     `Region::Block(addr)` already in `deferred_merge_blocks` -- takes the corpus
+     from **37 to 17**. Built, measured, reverted. The reason is that a deferral
+     is a *may*, not a *will*: the ancestor only emits the merge when
+     `!branches_terminate && !merge_owned_by_ancestor`, so an unconditional skip
+     deletes statements nothing else prints.
+
+     Whatever fixes this has to make the deferral a promise before it can be
+     relied on -- the ancestor deciding up front whether it will emit the merge,
+     and the stack recording only the ones it will.
+
   0g. **murmur3's tail switch renders with empty bodies.** This is what arm64 -O0
      `murmur3_32` now fails on, and the undeclared `x8_30` is a symptom of it
      rather than the defect. The rendering is
