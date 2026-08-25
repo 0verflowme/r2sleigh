@@ -134,11 +134,23 @@ learn.
      value, and `post_rename` no longer renames a value name into a storage name.
      Both are safe because neither changes which spelling wins.
 
-     The fix is that the alias must be something the table owns, so that one
-     name per value is decided in one place rather than by whichever map a reader
-     happens to hold. That is the location model's statement one layer up, and
-     it is why naming registers by place regresses 34 correct to 13 while this is
-     outstanding.
+     The fix is *not* that readers consult the alias map -- `spell_var` already
+     does, asking `source.var_alias(&display)` before it falls back to a base
+     name. A probe on that path shows `LowerCtx::var_name` answering `t11f80_2`
+     for `tmp:11f80_2`, which means it asked and the map had nothing: the alias
+     `local_28` is not known yet when the analysis lowering names that value.
+
+     So this is an **ordering** problem rather than an ownership one. Aliases are
+     established after the lowering that spells values has already run, and every
+     later route that reaches the value by its SSA name finds the spelling that
+     was chosen before the alias existed. Recording links, unifying spellings or
+     re-keying stores all leave that ordering untouched, which is why all three
+     regress on the same line.
+
+     What wants doing is that a value's alias is settled before anything spells
+     it. That is the same statement as the location model's -- one name per value,
+     decided once -- and it is why naming registers by place regresses 34 correct
+     to 13 while this is outstanding.
 
   1. **The same value is constructed more than once, by different layers, and
      nothing says which construction is the value.** The **call** instance of
