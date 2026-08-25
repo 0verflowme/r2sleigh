@@ -127,6 +127,26 @@ learn.
      | `tregalias_...` never declared | 1 | x64 -O2 crc32_bitwise |
      | wrong checksum | 1 | x64 -O2 pearson |
 
+     **The first compile error is not the only one.** `verify_rendering.py`
+     compiles one function per file and reports the first `error:` clang emits,
+     so a function's entry in that table names its *first* symptom, not its
+     defects. `xxhash32` at x86-64 -O0 reports `sym__rotl32` undeclared, which is
+     genuinely a harness limit -- the helper is a sibling function the harness
+     never compiles. But supplying only that helper and rebuilding shows what the
+     limit was hiding:
+
+     ```
+     use of undeclared identifier 'edi_3'   (also edi_5, edi_7, edi_9, edi_17, edi_20)
+     use of undeclared identifier 'eax_60'; did you mean 'rax_60'?
+     use of undeclared identifier 'local_38'
+     ```
+
+     and the arm64 -O0 twin hides `t12280_9`, `t12280_17`, `t12280_19`,
+     `local_30` and `local_40`. `eax_60` beside `rax_60` is item 0f exactly --
+     the narrow member of a carrier -- so xxhash32 at -O0 belongs to that cluster
+     too, and an earlier note in this document calling those two entries a pure
+     harness artifact was wrong. Counting first errors understates the work.
+
      Two of these look cheap and are not. `uint128_t` comes from `CType::UInt(128)`
      printing `uint{bits}_t` in `ast.rs:129`, but the reason a 128-bit type is
      there at all is that a 32-bit table is being read 128 bits wide:
