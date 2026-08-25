@@ -1157,6 +1157,27 @@ pub(crate) fn carrier_member_views(
                 );
             }
         }
+        // The loop's exit value at another width is the same read one block
+        // later: adler32's tail consumes the accumulator as `ecx` where the
+        // carrier is `rcx`, and without this the return quotes `ecx_9`, a name
+        // nothing declares.
+        let CertifiedEntity::LoopCarrier { updates, .. } = carrier else {
+            continue;
+        };
+        let update_values: HashSet<_> = updates.iter().map(|update| update.value).collect();
+        for (merge, width) in exit_merges_for_carrier(prepared, *phi, &update_values) {
+            if width == carrier_var.size || aliases.contains_key(&merge) {
+                continue;
+            }
+            views.insert(
+                merge,
+                CarrierMemberView {
+                    carrier: name.clone(),
+                    width,
+                    carrier_width: carrier_var.size,
+                },
+            );
+        }
     }
     views
 }
@@ -1238,8 +1259,15 @@ pub(crate) fn carrier_name_aliases(
             }
             aliases.insert(var.display_name(), name.clone());
         }
-        for merge in exit_merges_for_carrier(prepared, *phi, &update_values) {
-            aliases.insert(merge, name.clone());
+        let carrier_width = graph.value(*phi).map_or(0, |value| value.var.size);
+        for (merge, width) in exit_merges_for_carrier(prepared, *phi, &update_values) {
+            // A merge at the carrier's own width *is* the carrier and takes its
+            // name. One at another width is the carrier read at that width,
+            // which a name cannot express -- `carrier_member_views` renders
+            // those as a cast instead.
+            if width == carrier_width {
+                aliases.insert(merge, name.clone());
+            }
         }
     }
     aliases
@@ -1260,7 +1288,7 @@ fn exit_merges_for_carrier(
     prepared: &r2ssa::SsaArtifact,
     phi: r2ssa::ValueId,
     update_values: &HashSet<r2ssa::ValueId>,
-) -> Vec<String> {
+) -> Vec<(String, u32)> {
     let graph = prepared.graph();
     let Some(carrier) = graph.value(phi).map(|value| value.var.clone()) else {
         return Vec::new();
@@ -1268,8 +1296,27 @@ fn exit_merges_for_carrier(
     let mut merges = Vec::new();
     for block in prepared.function().blocks() {
         for merge in &block.phis {
-            if merge.dst == carrier || merge.dst.size != carrier.size {
+            if merge.dst == carrier {
                 continue;
+            }
+            // A merge at another width over the same place is this carrier read
+            // at that width -- adler32 leaves its loop through `ecx` where the
+            // carrier is `rcx`. Sound only where a narrow write clears the rest
+            // of the register, which is what makes the two one location.
+            if merge.dst.size != carrier.size {
+                let same_place = match (
+                    graph.canonical_storage_for_var(&carrier),
+                    graph.canonical_storage_for_var(&merge.dst),
+                ) {
+                    (Some(carrier_place), Some(merge_place)) => {
+                        carrier_place.space == merge_place.space
+                            && carrier_place.offset == merge_place.offset
+                    }
+                    _ => false,
+                };
+                if !same_place || !prepared.narrow_write_clears_register() {
+                    continue;
+                }
             }
             let Some(values) = merge
                 .sources
@@ -1300,7 +1347,7 @@ fn exit_merges_for_carrier(
             if values.iter().any(|value| update_values.contains(value))
                 && values.iter().any(|value| !update_values.contains(value))
             {
-                merges.push(merge.dst.display_name());
+                merges.push((merge.dst.display_name(), merge.dst.size));
             }
         }
     }

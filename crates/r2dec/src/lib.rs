@@ -4412,9 +4412,10 @@ fn propagate_single_use_register_carriers(func: &mut CFunction, fold_ctx: &Foldi
         fold_ctx: &FoldingContext<'_>,
         declared: &std::collections::HashSet<crate::symbol::SymbolId>,
         in_loop: bool,
+        whole_body: &[CStmt],
     ) {
         for stmt in stmts.iter_mut() {
-            visit_nested(symbols, stmt, fold_ctx, declared, in_loop);
+            visit_nested(symbols, stmt, fold_ctx, declared, in_loop, whole_body);
         }
         // Inside a loop, "the rest of this list" is not all the readers: the
         // carrier is read again on the next iteration and after the loop ends.
@@ -4431,7 +4432,18 @@ fn propagate_single_use_register_carriers(func: &mut CFunction, fold_ctx: &Foldi
                 continue;
             };
             let rest = &stmts[index + 1..];
-            if count_var_reads_in_stmts(symbols, rest, &crate::symbol::spelling(symbols, name)) != 1 {
+            let spelled = crate::symbol::spelling(symbols, name);
+            // "The rest of this list" is not all the readers. A value computed
+            // in one block and read in a later one is read once *here* and many
+            // times overall: adler32 at x86-64 -O2 computes `ecx_9` in its tail
+            // and returns it, and propagating it into its one local reader
+            // deleted the statement, leaving the return quoting a name nothing
+            // declares. The loop case below was the same mistake, caught first.
+            if count_var_reads_in_stmts(symbols, whole_body, &spelled) != 1 {
+                index += 1;
+                continue;
+            }
+            if count_var_reads_in_stmts(symbols, rest, &spelled) != 1 {
                 index += 1;
                 continue;
             }
@@ -4468,41 +4480,53 @@ fn propagate_single_use_register_carriers(func: &mut CFunction, fold_ctx: &Foldi
         fold_ctx: &FoldingContext<'_>,
         declared: &std::collections::HashSet<crate::symbol::SymbolId>,
         in_loop: bool,
+        whole_body: &[CStmt],
     ) {
         match stmt {
-            CStmt::Block(stmts) => visit_block(symbols, stmts, fold_ctx, declared, in_loop),
+            CStmt::Block(stmts) => visit_block(symbols, stmts, fold_ctx, declared, in_loop, whole_body),
             CStmt::If {
                 then_body,
                 else_body,
                 ..
             } => {
-                visit_nested(symbols, then_body, fold_ctx, declared, in_loop);
+                visit_nested(symbols, then_body, fold_ctx, declared, in_loop, whole_body);
                 if let Some(else_body) = else_body {
-                    visit_nested(symbols, else_body, fold_ctx, declared, in_loop);
+                    visit_nested(symbols, else_body, fold_ctx, declared, in_loop, whole_body);
                 }
             }
             CStmt::While { body, .. } | CStmt::DoWhile { body, .. } => {
-                visit_nested(symbols, body, fold_ctx, declared, true)
+                visit_nested(symbols, body, fold_ctx, declared, true, whole_body)
             }
             CStmt::For { init, body, .. } => {
                 if let Some(init) = init {
-                    visit_nested(symbols, init, fold_ctx, declared, true);
+                    visit_nested(symbols, init, fold_ctx, declared, true, whole_body);
                 }
-                visit_nested(symbols, body, fold_ctx, declared, true);
+                visit_nested(symbols, body, fold_ctx, declared, true, whole_body);
             }
             CStmt::Switch { cases, default, .. } => {
                 for case in cases {
-                    visit_block(symbols, &mut case.body, fold_ctx, declared, in_loop);
+                    visit_block(symbols, &mut case.body, fold_ctx, declared, in_loop, whole_body);
                 }
                 if let Some(default) = default {
-                    visit_block(symbols, default, fold_ctx, declared, in_loop);
+                    visit_block(symbols, default, fold_ctx, declared, in_loop, whole_body);
                 }
             }
             _ => {}
         }
     }
 
-    visit_block(symbols, &mut func.body, fold_ctx, &declared, false);
+    // Counted against the body as it stands when the pass begins. A name whose
+    // only reader is deleted later simply stops being a candidate, which is the
+    // safe direction.
+    let whole_body = func.body.clone();
+    visit_block(
+        symbols,
+        &mut func.body,
+        fold_ctx,
+        &declared,
+        false,
+        &whole_body,
+    );
 }
 
 /// The carrier assigned by this statement, when it is one worth propagating.
