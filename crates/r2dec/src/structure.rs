@@ -2050,13 +2050,8 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
     ) -> Result<CExpr, String> {
         let mut expressions = Vec::with_capacity(prefix.len().saturating_add(1));
         for stmt in prefix {
-            match stmt {
-                CStmt::Expr(expr) => expressions.push(expr),
-                CStmt::Empty => {}
-                CStmt::Comment(reason) => return Err(reason),
-                other => {
-                    return Err(format!("unsupported condition-prefix statement {other:?}"));
-                }
+            if let Some(expr) = Self::loop_condition_prefix_expr(stmt)? {
+                expressions.push(expr);
             }
         }
         if expressions.is_empty() {
@@ -2064,6 +2059,17 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         }
         expressions.push(condition);
         Ok(CExpr::Comma(expressions))
+    }
+
+    fn loop_condition_prefix_expr(stmt: CStmt) -> Result<Option<CExpr>, String> {
+        match stmt {
+            CStmt::Observed { id, stmt } => Self::loop_condition_prefix_expr(*stmt)
+                .map(|expr| expr.map(|expr| CExpr::observed(id, expr))),
+            CStmt::Expr(expr) => Ok(Some(expr)),
+            CStmt::Empty => Ok(None),
+            CStmt::Comment(reason) => Err(reason),
+            other => Err(format!("unsupported condition-prefix statement {other:?}")),
+        }
     }
 
     fn folded_block_stmts(&mut self, block: &r2ssa::FunctionSSABlock, addr: u64) -> Vec<CStmt> {
@@ -5410,6 +5416,48 @@ mod tests {
                 condition.clone(),
             ),
             Ok(CExpr::Comma(vec![load, condition]))
+        );
+    }
+
+    #[test]
+    fn observed_loop_condition_prefix_is_transparent_and_survives_once() {
+        let symbols = test_table();
+        let mut owner = RenderObservationOwner::new();
+        let load = CExpr::assign(
+            v(&symbols, "byte"),
+            CExpr::Deref(Box::new(v(&symbols, "cursor"))),
+        );
+        let (expr_id, observed_load) = owner
+            .observe_expr(load.clone())
+            .expect("prefix expression observation");
+        let (inner_stmt_id, observed_stmt) = owner
+            .observe_stmt(CStmt::Expr(observed_load))
+            .expect("inner prefix statement observation");
+        let (outer_stmt_id, observed_stmt) = owner
+            .observe_stmt(observed_stmt)
+            .expect("outer prefix statement observation");
+        let condition = CExpr::binary(
+            BinaryOp::Ne,
+            v(&symbols, "byte"),
+            CExpr::IntLit(0),
+        );
+
+        let combined = ControlFlowStructurer::combine_loop_condition_prefix(
+            vec![observed_stmt],
+            condition.clone(),
+        )
+        .expect("observation metadata must not reject a valid loop prefix");
+        let (plain, reachable) = strip_test_observations(
+            &owner,
+            CStmt::while_loop(combined, CStmt::Empty),
+        );
+
+        assert!(reachable.contains(outer_stmt_id));
+        assert!(reachable.contains(inner_stmt_id));
+        assert!(reachable.contains(expr_id));
+        assert_eq!(
+            plain,
+            CStmt::while_loop(CExpr::Comma(vec![load, condition]), CStmt::Empty)
         );
     }
 
