@@ -4728,5 +4728,21 @@ that a symbol minted to render a value does not always record which value it
 renders, and until it does, nothing downstream can tell that two identifiers are
 one value.
 
+**And recording it is not free.** The fold's `sym_for_var` notes the link;
+`analysis/lower.rs` mints the same kind of identifier at two sites with the
+`SSAVar` in hand and notes nothing. Making those two sites note it takes x86-64
+-O0 and arm64 -O0 from seven correct each to zero -- fourteen renderings.
+
+The reason is `definition_for_symbol`, which asks `ssa_name(id)` first and falls
+back to the spelling. An identifier with no recorded value is looked up by its
+spelling; giving it one silently moves it to a different lookup, and for these
+values the spelling was finding the definition that the SSA name does not.
+
+That is the shape of the whole family in one measurement. The two spellings are
+not merely inconsistent -- each is *load-bearing* for a different set of lookups,
+and unifying them moves values between routes that answer differently. Nothing
+here can be fixed by making one site agree with another; the routes have to agree
+first.
+
 The corpus is 35 of 54 throughout -- this moves `xxhash32` from one undeclared
 name to another rather than to a rendering that compiles.
