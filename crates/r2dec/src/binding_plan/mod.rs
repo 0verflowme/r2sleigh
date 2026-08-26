@@ -54,6 +54,18 @@ enum BindingCertificateSource {
     CertifiedEntity(SemanticId),
 }
 
+/// Declaration role proved by the same sealed facts that own the binding.
+///
+/// This is deliberately typed and name-free. In particular, a parameter is
+/// externally declared because an exact source ABI slot owns it, never because
+/// its presentation spelling resembles an argument register.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BindingRole {
+    Local,
+    Parameter { slot: u32 },
+    StackObject { object: r2ssa::ObjectId },
+}
+
 /// One rendered C object. The name hint is presentation only, never identity.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Binding {
@@ -150,6 +162,55 @@ pub(crate) enum StackObjectRefusal {
     },
 }
 
+/// Exact disposition of one source-certified ABI parameter slot.
+///
+/// The width is the formal carrier width in bits. It is kept separate from a
+/// reused binding's machine-carrier declaration width because an exact use may
+/// project a narrow formal from a wider canonical register carrier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ParameterDisposition {
+    Bound { binding: BindingId, width_bits: u32 },
+    Refused { reason: ParameterRefusal },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ParameterRefusal {
+    MissingWidth {
+        entity: SemanticId,
+        slot: u32,
+    },
+    InvalidWidth {
+        entity: SemanticId,
+        slot: u32,
+        size_bytes: u32,
+    },
+    UnsupportedWidth {
+        entity: SemanticId,
+        slot: u32,
+        width_bits: u32,
+    },
+    ConflictingSlotOwnership {
+        slot: u32,
+        first: SemanticId,
+        second: SemanticId,
+    },
+    ConflictingEntityOwnership {
+        entity: SemanticId,
+        expected_slot: u32,
+        claimed_slot: u32,
+    },
+    MissingValueBinding {
+        entity: SemanticId,
+        slot: u32,
+        value: ValueId,
+    },
+    ConflictingBindingOwnership {
+        binding: BindingId,
+        first_slot: u32,
+        second_slot: u32,
+    },
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum BindingPlanSourceMismatch {
     Authority,
@@ -201,6 +262,28 @@ pub(crate) enum BindingPlanSourceMismatch {
     },
     StackObjectDeclarationWidth {
         object: r2ssa::ObjectId,
+        binding: BindingId,
+    },
+    ParameterCount {
+        expected: usize,
+        actual: usize,
+    },
+    UnexpectedParameterDisposition {
+        slot: u32,
+    },
+    ParameterCertificate {
+        slot: u32,
+        binding: BindingId,
+    },
+    ParameterDeclarationWidth {
+        slot: u32,
+        binding: BindingId,
+    },
+    ParameterRole {
+        slot: u32,
+        binding: BindingId,
+    },
+    BindingRole {
         binding: BindingId,
     },
 }
@@ -303,6 +386,7 @@ pub(crate) struct BindingPlan {
     machine_projection: MachineProjection,
     bindings: Box<[Binding]>,
     dispositions: Box<[ValueDisposition]>,
+    parameters: Box<[Option<ParameterDisposition>]>,
     stack_objects: BTreeMap<r2ssa::ObjectId, StackObjectDisposition>,
 }
 
@@ -311,7 +395,7 @@ mod name_resolution;
 mod seal;
 
 pub(crate) use name_resolution::{
-    BindingNameResolution, BindingNameResolutionError, PlannedValueSymbol,
+    BindingNameResolution, BindingNameResolutionError, PlannedParameterSymbol, PlannedValueSymbol,
 };
 pub(crate) use seal::build_upstream_shadow_oracle;
 
@@ -349,6 +433,45 @@ impl BindingPlan {
 
     pub(crate) fn disposition(&self, value: ValueId) -> Option<&ValueDisposition> {
         self.dispositions.get(value.0 as usize)
+    }
+
+    /// Resolve one exact ABI slot in O(1). The table is dense-indexed but may
+    /// contain empty cells when the certified slot domain is sparse.
+    pub(crate) fn parameter_disposition(&self, slot: u32) -> Option<ParameterDisposition> {
+        self.parameters.get(slot as usize).copied().flatten()
+    }
+
+    /// Resolve a typed semantic parameter identity without a reverse spelling
+    /// table. Non-parameter identities are outside this domain.
+    pub(crate) fn parameter_entity_disposition(
+        &self,
+        entity: SemanticId,
+    ) -> Option<ParameterDisposition> {
+        let SemanticId::Parameter(slot) = entity else {
+            return None;
+        };
+        self.parameter_disposition(slot)
+    }
+
+    pub(crate) fn binding_role(&self, binding: BindingId) -> Option<BindingRole> {
+        let binding = self.binding(binding)?;
+        let mut roles = binding.certificate.sources.iter().filter_map(|source| {
+            let BindingCertificateSource::CertifiedEntity(entity) = source else {
+                return None;
+            };
+            match *entity {
+                SemanticId::Parameter(slot) => Some(BindingRole::Parameter { slot }),
+                SemanticId::StackSlot(object) => Some(BindingRole::StackObject { object }),
+                _ => None,
+            }
+        });
+        let role = roles.next().unwrap_or(BindingRole::Local);
+        roles.all(|other| other == role).then_some(role)
+    }
+
+    pub(crate) fn binding_is_externally_declared(&self, binding: BindingId) -> Option<bool> {
+        self.binding_role(binding)
+            .map(|role| matches!(role, BindingRole::Parameter { .. }))
     }
 
     pub(crate) fn stack_object_disposition(

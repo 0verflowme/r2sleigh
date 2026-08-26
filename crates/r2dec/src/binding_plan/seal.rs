@@ -1,5 +1,140 @@
 use super::*;
 
+#[derive(Debug)]
+enum SealParameterCandidate {
+    Exact {
+        entity: SemanticId,
+        width_bytes: u32,
+        entry_values: BTreeSet<ValueId>,
+    },
+    Refused(ParameterRefusal),
+}
+
+/// Rebuild the formal-parameter evidence independently of construction.
+fn seal_parameter_candidates(
+    source_owned: &SourceOwnedFunctionFacts,
+) -> Vec<Option<SealParameterCandidate>> {
+    let mut result = Vec::new();
+    if let Some(interface) = source_owned
+        .source()
+        .machine_context()
+        .function_interface()
+    {
+        for parameter in interface.parameters() {
+            let slot = parameter.index();
+            let index = slot as usize;
+            if index >= result.len() {
+                result.resize_with(index.saturating_add(1), || None);
+            }
+            let entity = SemanticId::Parameter(slot);
+            result[index] = Some(match &result[index] {
+                None => SealParameterCandidate::Exact {
+                    entity,
+                    width_bytes: parameter.storage().size,
+                    entry_values: BTreeSet::new(),
+                },
+                Some(SealParameterCandidate::Exact { entity: first, .. }) => {
+                    SealParameterCandidate::Refused(
+                        ParameterRefusal::ConflictingSlotOwnership {
+                            slot,
+                            first: *first,
+                            second: entity,
+                        },
+                    )
+                }
+                Some(SealParameterCandidate::Refused(reason)) => {
+                    SealParameterCandidate::Refused(*reason)
+                }
+            });
+        }
+    }
+    let Some(render) = source_owned.report().render() else {
+        return result;
+    };
+    for (map_id, entity) in &render.certified_entities {
+        let r2types::CertifiedEntity::Parameter {
+            id,
+            slot,
+            entry_values,
+            carrier_width,
+        } = entity
+        else {
+            continue;
+        };
+        let index = *slot as usize;
+        if index >= result.len() {
+            result.resize_with(index.saturating_add(1), || None);
+        }
+        let expected = SemanticId::Parameter(*slot);
+        if map_id != id || *id != expected {
+            result[index] = Some(SealParameterCandidate::Refused(
+                ParameterRefusal::ConflictingEntityOwnership {
+                    entity: *id,
+                    expected_slot: *slot,
+                    claimed_slot: match *id {
+                        SemanticId::Parameter(claimed) => claimed,
+                        _ => u32::MAX,
+                    },
+                },
+            ));
+            continue;
+        }
+        match &result[index] {
+            Some(SealParameterCandidate::Exact {
+                entity: owner, ..
+            }) if owner == id => {
+                result[index] = Some(SealParameterCandidate::Exact {
+                    entity: *id,
+                    width_bytes: *carrier_width,
+                    entry_values: entry_values.clone(),
+                });
+            }
+            Some(SealParameterCandidate::Exact { entity: owner, .. }) => {
+                result[index] = Some(SealParameterCandidate::Refused(
+                    ParameterRefusal::ConflictingSlotOwnership {
+                        slot: *slot,
+                        first: *owner,
+                        second: *id,
+                    },
+                ));
+            }
+            Some(SealParameterCandidate::Refused(_)) => {}
+            None => {
+                result[index] = Some(SealParameterCandidate::Exact {
+                    entity: *id,
+                    width_bytes: *carrier_width,
+                    entry_values: entry_values.clone(),
+                });
+            }
+        }
+    }
+    result
+}
+
+fn seal_parameter_width(
+    entity: SemanticId,
+    slot: u32,
+    size_bytes: u32,
+) -> Result<u32, ParameterRefusal> {
+    if size_bytes == 0 {
+        return Err(ParameterRefusal::MissingWidth { entity, slot });
+    }
+    let width_bits = size_bytes
+        .checked_mul(8)
+        .ok_or(ParameterRefusal::InvalidWidth {
+            entity,
+            slot,
+            size_bytes,
+        })?;
+    declaration_width_is_supported(width_bits)
+        .then_some(width_bits)
+        .ok_or(ParameterRefusal::UnsupportedWidth {
+            entity,
+            slot,
+            width_bits,
+        })
+}
+
 fn binding_declaration_width(ty: &CType) -> Option<u32> {
     match ty {
         CType::UInt(bits) if *bits <= 128 => Some(*bits),
@@ -357,34 +492,6 @@ impl BindingPlan {
             .iter()
             .map(|component| seal_width_evidence(source, &self.machine_projection, component))
             .collect::<Result<Vec<_>, _>>()?;
-        let expected_binding_count = width_evidence
-            .iter()
-            .filter(|evidence| matches!(evidence, SealWidthEvidence::Exact { .. }))
-            .count()
-            + source_owned
-                .report()
-                .render()
-                .into_iter()
-                .flat_map(|render| render.certified_entities.values())
-                .filter(|entity| {
-                    matches!(
-                        entity,
-                        r2types::CertifiedEntity::StackSlot {
-                            size: Some(size),
-                            ..
-                        } if size.checked_mul(8).is_some_and(|width| width > 0)
-                    )
-                })
-                .count();
-        if self.bindings.len() != expected_binding_count {
-            return Err(BindingPlanBuildError::Seal(
-                BindingPlanSourceMismatch::BindingCount {
-                    expected: expected_binding_count,
-                    actual: self.bindings.len(),
-                },
-            ));
-        }
-
         let mut actual_by_binding = vec![BTreeSet::<ValueId>::new(); self.bindings.len()];
         for (index, disposition) in self.dispositions.iter().enumerate() {
             let value = ValueId(index as u32);
@@ -494,6 +601,145 @@ impl BindingPlan {
                         }
                     }
                 }
+            }
+        }
+
+        let parameter_candidates = seal_parameter_candidates(source_owned);
+        if self.parameters.len() != parameter_candidates.len() {
+            return Err(BindingPlanBuildError::Seal(
+                BindingPlanSourceMismatch::ParameterCount {
+                    expected: parameter_candidates.len(),
+                    actual: self.parameters.len(),
+                },
+            ));
+        }
+        let mut slots_by_reused_binding = BTreeMap::<BindingId, Vec<u32>>::new();
+        for (index, candidate) in parameter_candidates.iter().enumerate() {
+            let Some(SealParameterCandidate::Exact {
+                entity,
+                width_bytes,
+                entry_values,
+            }) = candidate
+            else {
+                continue;
+            };
+            let slot = index as u32;
+            if seal_parameter_width(*entity, slot, *width_bytes).is_err()
+                || entry_values.is_empty()
+            {
+                continue;
+            }
+            let mut binding = None;
+            if entry_values.iter().all(|value| match self.disposition(*value) {
+                Some(ValueDisposition::Bound { binding: candidate })
+                    if binding.is_none_or(|existing| existing == *candidate) =>
+                {
+                    binding = Some(*candidate);
+                    true
+                }
+                _ => false,
+            }) && let Some(binding) = binding
+            {
+                slots_by_reused_binding.entry(binding).or_default().push(slot);
+            }
+        }
+
+        for (index, candidate) in parameter_candidates.into_iter().enumerate() {
+            let slot = index as u32;
+            let expected_disposition = match candidate {
+                None => {
+                    if self.parameters[index].is_some() {
+                        return Err(BindingPlanBuildError::Seal(
+                            BindingPlanSourceMismatch::UnexpectedParameterDisposition { slot },
+                        ));
+                    }
+                    continue;
+                }
+                Some(SealParameterCandidate::Refused(reason)) => {
+                    ParameterDisposition::Refused { reason }
+                }
+                Some(SealParameterCandidate::Exact {
+                    entity,
+                    width_bytes,
+                    entry_values,
+                }) => match seal_parameter_width(entity, slot, width_bytes) {
+                    Err(reason) => ParameterDisposition::Refused { reason },
+                    Ok(width_bits) if entry_values.is_empty() => {
+                        let binding = BindingId(binding_index as u32);
+                        let planned = self.bindings.get(binding_index).ok_or(
+                            BindingPlanBuildError::Seal(
+                                BindingPlanSourceMismatch::UnexpectedParameterDisposition { slot },
+                            ),
+                        )?;
+                        if planned.certificate.sources.as_ref()
+                            != [BindingCertificateSource::CertifiedEntity(entity)]
+                            || !actual_by_binding[binding_index].is_empty()
+                        {
+                            return Err(BindingPlanBuildError::Seal(
+                                BindingPlanSourceMismatch::ParameterCertificate { slot, binding },
+                            ));
+                        }
+                        if planned.declaration_type != CType::machine_bits(width_bits) {
+                            return Err(BindingPlanBuildError::Seal(
+                                BindingPlanSourceMismatch::ParameterDeclarationWidth {
+                                    slot,
+                                    binding,
+                                },
+                            ));
+                        }
+                        binding_index += 1;
+                        ParameterDisposition::Bound {
+                            binding,
+                            width_bits,
+                        }
+                    }
+                    Ok(width_bits) => {
+                        let mut binding = None;
+                        let missing = entry_values.iter().copied().find(|value| {
+                            match self.disposition(*value) {
+                                Some(ValueDisposition::Bound { binding: candidate })
+                                    if binding
+                                        .is_none_or(|existing| existing == *candidate) =>
+                                {
+                                    binding = Some(*candidate);
+                                    false
+                                }
+                                _ => true,
+                            }
+                        });
+                        if let Some(value) = missing {
+                            ParameterDisposition::Refused {
+                                reason: ParameterRefusal::MissingValueBinding {
+                                    entity,
+                                    slot,
+                                    value,
+                                },
+                            }
+                        } else {
+                            let binding = binding.expect("non-empty exact entry-value set");
+                            let owners = &slots_by_reused_binding[&binding];
+                            if owners.len() > 1 {
+                                ParameterDisposition::Refused {
+                                    reason: ParameterRefusal::ConflictingBindingOwnership {
+                                        binding,
+                                        first_slot: owners[0],
+                                        second_slot: owners[1],
+                                    },
+                                }
+                            } else {
+                                ParameterDisposition::Bound {
+                                    binding,
+                                    width_bits,
+                                }
+                            }
+                        }
+                    }
+                },
+            };
+            if self.parameter_disposition(slot) != Some(expected_disposition) {
+                return Err(BindingPlanBuildError::Seal(
+                    BindingPlanSourceMismatch::UnexpectedParameterDisposition { slot },
+                ));
             }
         }
 

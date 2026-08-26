@@ -1,5 +1,190 @@
 use super::*;
 
+#[derive(Debug)]
+enum ParameterCandidate {
+    Exact {
+        entity: SemanticId,
+        width_bytes: u32,
+        entry_values: BTreeSet<ValueId>,
+    },
+    Refused {
+        entity: SemanticId,
+        reason: ParameterRefusal,
+    },
+}
+
+/// Collect the dense exact ABI-parameter domain without consulting names.
+/// The source interface supplies unused formals; a matching render entity
+/// supplies its exact entry-value membership and source-var carrier width.
+fn parameter_candidates(
+    source_owned: &SourceOwnedFunctionFacts,
+) -> Vec<Option<ParameterCandidate>> {
+    let interface = source_owned.source().machine_context().function_interface();
+    let mut candidates = Vec::new();
+    if let Some(interface) = interface {
+        for parameter in interface.parameters() {
+            insert_formal_parameter_candidate(
+                &mut candidates,
+                parameter.index(),
+                parameter.storage().size,
+            );
+        }
+    }
+    let Some(render) = source_owned.report().render() else {
+        return candidates;
+    };
+
+    for (key, certified) in &render.certified_entities {
+        let r2types::CertifiedEntity::Parameter {
+            id,
+            slot,
+            entry_values,
+            carrier_width,
+        } = certified
+        else {
+            continue;
+        };
+        let Ok(index) = usize::try_from(*slot) else {
+            continue;
+        };
+        if index >= candidates.len() {
+            candidates.resize_with(index.saturating_add(1), || None);
+        }
+        let canonical = SemanticId::Parameter(*slot);
+        if *key != *id || *id != canonical {
+            candidates[index] = Some(ParameterCandidate::Refused {
+                entity: canonical,
+                reason: ParameterRefusal::ConflictingEntityOwnership {
+                    entity: *id,
+                    expected_slot: *slot,
+                    claimed_slot: match *id {
+                        SemanticId::Parameter(claimed) => claimed,
+                        _ => u32::MAX,
+                    },
+                },
+            });
+            continue;
+        }
+        match &candidates[index] {
+            Some(ParameterCandidate::Exact {
+                entity: existing, ..
+            }) if *existing == *id => {
+                candidates[index] = Some(ParameterCandidate::Exact {
+                    entity: *id,
+                    width_bytes: *carrier_width,
+                    entry_values: entry_values.clone(),
+                });
+            }
+            Some(ParameterCandidate::Exact {
+                entity: existing, ..
+            })
+            | Some(ParameterCandidate::Refused {
+                entity: existing, ..
+            }) => {
+                candidates[index] = Some(ParameterCandidate::Refused {
+                    entity: canonical,
+                    reason: ParameterRefusal::ConflictingSlotOwnership {
+                        slot: *slot,
+                        first: *existing,
+                        second: *id,
+                    },
+                });
+            }
+            None => {
+                candidates[index] = Some(ParameterCandidate::Exact {
+                    entity: *id,
+                    width_bytes: *carrier_width,
+                    entry_values: entry_values.clone(),
+                });
+            }
+        }
+    }
+    candidates
+}
+
+fn insert_formal_parameter_candidate(
+    candidates: &mut Vec<Option<ParameterCandidate>>,
+    slot: u32,
+    width_bytes: u32,
+) {
+    let index = slot as usize;
+    if index >= candidates.len() {
+        candidates.resize_with(index.saturating_add(1), || None);
+    }
+    let entity = SemanticId::Parameter(slot);
+    candidates[index] = Some(match &candidates[index] {
+        None => ParameterCandidate::Exact {
+            entity,
+            width_bytes,
+            entry_values: BTreeSet::new(),
+        },
+        Some(ParameterCandidate::Exact {
+            entity: first, ..
+        })
+        | Some(ParameterCandidate::Refused { entity: first, .. }) => {
+            ParameterCandidate::Refused {
+                entity,
+                reason: ParameterRefusal::ConflictingSlotOwnership {
+                    slot,
+                    first: *first,
+                    second: entity,
+                },
+            }
+        }
+    });
+}
+
+fn parameter_width(
+    entity: SemanticId,
+    slot: u32,
+    width_bytes: u32,
+) -> Result<u32, ParameterRefusal> {
+    if width_bytes == 0 {
+        return Err(ParameterRefusal::MissingWidth { entity, slot });
+    }
+    let Some(width_bits) = width_bytes.checked_mul(8) else {
+        return Err(ParameterRefusal::InvalidWidth {
+            entity,
+            slot,
+            size_bytes: width_bytes,
+        });
+    };
+    if !declaration_width_is_supported(width_bits) {
+        return Err(ParameterRefusal::UnsupportedWidth {
+            entity,
+            slot,
+            width_bits,
+        });
+    }
+    Ok(width_bits)
+}
+
+fn refuse_conflicting_parameter_bindings(parameters: &mut [Option<ParameterDisposition>]) {
+    let mut parameter_slots_by_binding = BTreeMap::<BindingId, Vec<u32>>::new();
+    for (index, disposition) in parameters.iter().enumerate() {
+        let Some(ParameterDisposition::Bound { binding, .. }) = disposition else {
+            continue;
+        };
+        parameter_slots_by_binding
+            .entry(*binding)
+            .or_default()
+            .push(index as u32);
+    }
+    for (binding, slots) in parameter_slots_by_binding {
+        if slots.len() < 2 {
+            continue;
+        }
+        let reason = ParameterRefusal::ConflictingBindingOwnership {
+            binding,
+            first_slot: slots[0],
+            second_slot: slots[1],
+        };
+        for slot in slots {
+            parameters[slot as usize] = Some(ParameterDisposition::Refused { reason });
+        }
+    }
+}
+
 /// Compute the transitive closure of every exact upstream coalescing set.
 ///
 /// Constants are deliberately outside the relation: they are expressions that
@@ -377,6 +562,84 @@ impl BindingPlan {
             });
         }
 
+        let candidates = parameter_candidates(source_owned);
+        let mut parameters = vec![None; candidates.len()];
+        for (index, candidate) in candidates.into_iter().enumerate() {
+            let Some(candidate) = candidate else {
+                continue;
+            };
+            let slot = u32::try_from(index).expect("dense parameter domain fits u32");
+            let (entity, width_bytes, entry_values) = match candidate {
+                ParameterCandidate::Exact {
+                    entity,
+                    width_bytes,
+                    entry_values,
+                } => (entity, width_bytes, entry_values),
+                ParameterCandidate::Refused { reason, .. } => {
+                    parameters[index] = Some(ParameterDisposition::Refused { reason });
+                    continue;
+                }
+            };
+            let width_bits = match parameter_width(entity, slot, width_bytes) {
+                Ok(width_bits) => width_bits,
+                Err(reason) => {
+                    parameters[index] = Some(ParameterDisposition::Refused { reason });
+                    continue;
+                }
+            };
+
+            let mut value_binding = None;
+            let mut missing_value = None;
+            for value in entry_values {
+                match dispositions.get(value.0 as usize) {
+                    Some(ValueDisposition::Bound { binding })
+                        if value_binding.is_none_or(|existing| existing == *binding) =>
+                    {
+                        value_binding = Some(*binding);
+                    }
+                    _ => {
+                        missing_value = Some(value);
+                        break;
+                    }
+                }
+            }
+            if let Some(value) = missing_value {
+                parameters[index] = Some(ParameterDisposition::Refused {
+                    reason: ParameterRefusal::MissingValueBinding {
+                        entity,
+                        slot,
+                        value,
+                    },
+                });
+                continue;
+            }
+
+            let binding = match value_binding {
+                Some(binding) => binding,
+                None => {
+                    let Some(binding) = BindingId::from_dense_index(bindings.len()) else {
+                        return Err(BindingPlanBuildError::TooManyBindings {
+                            count: bindings.len().saturating_add(1),
+                        });
+                    };
+                    bindings.push(Binding {
+                        declaration_type: CType::machine_bits(width_bits),
+                        certificate: BindingCertificate {
+                            sources: Box::new([BindingCertificateSource::CertifiedEntity(entity)]),
+                        },
+                        presentation_name_hint: None,
+                    });
+                    binding
+                }
+            };
+
+            parameters[index] = Some(ParameterDisposition::Bound {
+                binding,
+                width_bits,
+            });
+        }
+        refuse_conflicting_parameter_bindings(&mut parameters);
+
         let mut stack_objects = BTreeMap::new();
         if let Some(render) = source_owned.report().render() {
             for entity in render.certified_entities.values() {
@@ -432,9 +695,64 @@ impl BindingPlan {
             machine_projection,
             bindings: bindings.into_boxed_slice(),
             dispositions: dispositions.into_boxed_slice(),
+            parameters: parameters.into_boxed_slice(),
             stack_objects,
         };
         plan.validate_seal(source_owned)?;
         Ok(plan)
+    }
+}
+
+#[cfg(test)]
+mod parameter_tests {
+    use super::*;
+
+    #[test]
+    fn sparse_out_of_order_slots_keep_their_exact_indices() {
+        let mut candidates = Vec::new();
+        insert_formal_parameter_candidate(&mut candidates, 3, 8);
+        insert_formal_parameter_candidate(&mut candidates, 1, 4);
+
+        assert_eq!(candidates.len(), 4);
+        assert!(candidates[0].is_none());
+        assert!(matches!(
+            candidates[1],
+            Some(ParameterCandidate::Exact {
+                entity: SemanticId::Parameter(1),
+                width_bytes: 4,
+                ..
+            })
+        ));
+        assert!(candidates[2].is_none());
+        assert!(matches!(
+            candidates[3],
+            Some(ParameterCandidate::Exact {
+                entity: SemanticId::Parameter(3),
+                width_bytes: 8,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn three_slot_binding_conflict_has_one_deterministic_reason() {
+        let binding = BindingId::from_dense_index(7).expect("binding");
+        let mut parameters = vec![
+            Some(ParameterDisposition::Bound {
+                binding,
+                width_bits: 64,
+            });
+            3
+        ];
+        refuse_conflicting_parameter_bindings(&mut parameters);
+
+        let expected = Some(ParameterDisposition::Refused {
+            reason: ParameterRefusal::ConflictingBindingOwnership {
+                binding,
+                first_slot: 0,
+                second_slot: 1,
+            },
+        });
+        assert!(parameters.iter().all(|disposition| *disposition == expected));
     }
 }

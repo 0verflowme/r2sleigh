@@ -5,8 +5,8 @@ use r2ssa::{MachineExprId, ObjectId, SsaArtifactAuthority, ValueId};
 use r2types::SourceOwnedFunctionFacts;
 
 use super::{
-    BindingId, BindingPlan, BindingPlanSourceMismatch, StackObjectDisposition, StackObjectRefusal,
-    ValueDisposition, ValueRefusal,
+    BindingId, BindingPlan, BindingPlanSourceMismatch, BindingRole, ParameterDisposition,
+    ParameterRefusal, StackObjectDisposition, StackObjectRefusal, ValueDisposition, ValueRefusal,
 };
 use crate::symbol::{SymbolId, SymbolRole, SymbolTable};
 
@@ -29,6 +29,14 @@ pub(crate) enum PlannedValueSymbol {
 pub(crate) enum PlannedStackSymbol {
     Bound(SymbolId),
     Refused(StackObjectRefusal),
+    Absent,
+}
+
+/// Exact identifier answer for one certified ABI parameter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PlannedParameterSymbol {
+    Bound { symbol: SymbolId, width_bits: u32 },
+    Refused(ParameterRefusal),
     Absent,
 }
 
@@ -70,37 +78,32 @@ impl BindingNameResolution {
 
         let mut by_binding = Vec::with_capacity(plan.binding_count());
         for (binding_id, binding) in plan.bindings() {
-            let mut roles = binding
-                .certificate
-                .sources
-                .iter()
-                .filter_map(|source| {
-                    let super::BindingCertificateSource::CertifiedEntity(id) = source else {
-                        return None;
-                    };
-                    match source_owned.report().render()?.certified_entities.get(id)? {
-                        r2types::CertifiedEntity::Parameter { slot, .. } => {
-                            Some(SymbolRole::Parameter(*slot))
+            let role = match plan.binding_role(binding_id) {
+                Some(BindingRole::Parameter { slot }) => SymbolRole::Parameter(slot),
+                Some(BindingRole::StackObject { object }) => {
+                    let entity = r2ssa::SemanticId::StackSlot(object);
+                    match source_owned
+                        .report()
+                        .render()
+                        .and_then(|render| render.certified_entities.get(&entity))
+                    {
+                        Some(r2types::CertifiedEntity::StackSlot { offset, .. }) => {
+                            SymbolRole::StackLocal(*offset)
                         }
-                        r2types::CertifiedEntity::StackSlot { offset, .. } => {
-                            Some(SymbolRole::StackLocal(*offset))
+                        _ => {
+                            return Err(BindingNameResolutionError::ConflictingCertifiedRoles(
+                                binding_id,
+                            ));
                         }
-                        r2types::CertifiedEntity::LoopCarrier { .. } => None,
                     }
-                })
-                .collect::<Vec<_>>();
-            roles.sort_by_key(|role| match role {
-                SymbolRole::Parameter(slot) => (0_u8, i64::from(*slot)),
-                SymbolRole::StackLocal(offset) => (1_u8, *offset),
-                SymbolRole::Carrier => (2_u8, 0),
-            });
-            roles.dedup();
-            if roles.len() > 1 {
-                return Err(BindingNameResolutionError::ConflictingCertifiedRoles(
-                    binding_id,
-                ));
-            }
-            let role = roles.pop().unwrap_or(SymbolRole::Carrier);
+                }
+                Some(BindingRole::Local) => SymbolRole::Carrier,
+                None => {
+                    return Err(BindingNameResolutionError::ConflictingCertifiedRoles(
+                        binding_id,
+                    ));
+                }
+            };
             let presentation = binding
                 .presentation_name_hint()
                 .map(ToOwned::to_owned)
@@ -123,6 +126,26 @@ impl BindingNameResolution {
 
     pub(crate) fn symbol_for_binding(&self, binding: BindingId) -> Option<SymbolId> {
         self.by_binding.get(binding.index()).copied()
+    }
+
+    /// Canonical declaration role derived while resolving the binding's
+    /// upstream certificate. Placement uses this to seed ABI parameters; it
+    /// never infers entry assignment from a presentation spelling.
+    pub(crate) fn role_for_binding(&self, binding: BindingId) -> Option<SymbolRole> {
+        let symbol = self.symbol_for_binding(binding)?;
+        Some(self.symbols.borrow().get(symbol).role)
+    }
+
+    pub(crate) const fn plan(&self) -> &Rc<BindingPlan> {
+        &self.plan
+    }
+
+    pub(crate) fn binding_role(&self, binding: BindingId) -> Option<BindingRole> {
+        self.plan.binding_role(binding)
+    }
+
+    pub(crate) fn binding_is_externally_declared(&self, binding: BindingId) -> Option<bool> {
+        self.plan.binding_is_externally_declared(binding)
     }
 
     /// Resolve one plan-owned inline expression without exposing the plan.
@@ -188,6 +211,49 @@ impl BindingNameResolution {
         Some(self.symbols.borrow().name(symbol).to_string())
     }
 
+    pub(crate) fn resolve_parameter_slot(&self, slot: u32) -> PlannedParameterSymbol {
+        match self.plan.parameter_disposition(slot) {
+            Some(ParameterDisposition::Bound {
+                binding,
+                width_bits,
+            }) => self.symbol_for_binding(binding).map_or(
+                PlannedParameterSymbol::Absent,
+                |symbol| PlannedParameterSymbol::Bound { symbol, width_bits },
+            ),
+            Some(ParameterDisposition::Refused { reason }) => {
+                PlannedParameterSymbol::Refused(reason)
+            }
+            None => PlannedParameterSymbol::Absent,
+        }
+    }
+
+    pub(crate) fn resolve_parameter_entity(
+        &self,
+        entity: r2ssa::SemanticId,
+    ) -> PlannedParameterSymbol {
+        let r2ssa::SemanticId::Parameter(slot) = entity else {
+            return PlannedParameterSymbol::Absent;
+        };
+        self.resolve_parameter_slot(slot)
+    }
+
+    pub(crate) fn symbol_for_parameter_slot(&self, slot: u32) -> Option<SymbolId> {
+        match self.resolve_parameter_slot(slot) {
+            PlannedParameterSymbol::Bound { symbol, .. } => Some(symbol),
+            PlannedParameterSymbol::Refused(_) | PlannedParameterSymbol::Absent => None,
+        }
+    }
+
+    pub(crate) fn symbol_for_parameter_entity(
+        &self,
+        entity: r2ssa::SemanticId,
+    ) -> Option<SymbolId> {
+        match self.resolve_parameter_entity(entity) {
+            PlannedParameterSymbol::Bound { symbol, .. } => Some(symbol),
+            PlannedParameterSymbol::Refused(_) | PlannedParameterSymbol::Absent => None,
+        }
+    }
+
     /// Resolve one source-owned `ObjectId` without copying the plan-owned stack
     /// disposition into a parallel table.
     pub(crate) fn resolve_stack(&self, object: ObjectId) -> PlannedStackSymbol {
@@ -238,8 +304,8 @@ mod tests {
         RegisterProjection, RegisterProjectionDisposition, RegisterStorage, Varnode,
     };
     use r2ssa::{
-        CanonicalStorageId, CanonicalStorageSpace, SourceFunctionInterface, SourceFunctionReturn,
-        SsaArtifact,
+        CanonicalStorageId, CanonicalStorageSpace, SourceAbiParameterSpec,
+        SourceFunctionInterface, SourceFunctionReturn, SsaArtifact,
     };
 
     use super::*;
@@ -257,12 +323,32 @@ mod tests {
         block.push(R2ILOp::Return {
             target: Varnode::unique(0x20, 8),
         });
+        source_owned_from_block(block, 8)
+    }
+
+    fn source_owned_using_parameter(width_bytes: u32) -> r2types::SourceOwnedFunctionFacts {
+        let mut block = R2ILBlock::new(0x1000, 4);
+        block.push(R2ILOp::Copy {
+            dst: Varnode::unique(0x10, width_bytes),
+            src: Varnode::register(0x38, width_bytes),
+        });
+        block.push(R2ILOp::Return {
+            target: Varnode::unique(0x10, width_bytes),
+        });
+        source_owned_from_block(block, width_bytes)
+    }
+
+    fn source_owned_from_block(
+        block: R2ILBlock,
+        parameter_width: u32,
+    ) -> r2types::SourceOwnedFunctionFacts {
         let mut arch = ArchSpec::new("x86-64");
         arch.add_space(AddressSpace::ram(8));
         arch.add_register(RegisterDef::new("RAX", 0, 8));
         arch.add_register(RegisterDef::new("RSP", 0x28, 8));
         arch.add_register(RegisterDef::new("RIP", 0x30, 8));
-        arch.register_projections = [(0, 8), (0x28, 8), (0x30, 8)]
+        arch.add_register(RegisterDef::new("RDI", 0x38, parameter_width));
+        arch.register_projections = [(0, 8), (0x28, 8), (0x30, 8), (0x38, parameter_width)]
             .into_iter()
             .map(|(offset, size)| RegisterProjection {
                 written: RegisterStorage { offset, size },
@@ -283,7 +369,11 @@ mod tests {
         let interface = SourceFunctionInterface::new_exact(
             b"binding-name-resolution".to_vec(),
             "sysv64",
-            std::iter::empty(),
+            [SourceAbiParameterSpec::new(0, CanonicalStorageId {
+                space: CanonicalStorageSpace::Register,
+                offset: 0x38,
+                size: parameter_width,
+            })],
             SourceFunctionReturn::Register {
                 storage: storage(0),
             },
@@ -369,6 +459,16 @@ mod tests {
         let source = source_owned();
         let foreign = source_owned();
         let plan = BindingPlan::build_shadow(&source).expect("plan");
+        assert!(matches!(
+            BindingNameResolution::build(
+                &foreign,
+                Rc::new(plan.clone()),
+                Rc::new(RefCell::new(SymbolTable::new()))
+            ),
+            Err(BindingNameResolutionError::Source(
+                BindingPlanSourceMismatch::Authority
+            ))
+        ));
         let symbols = Rc::new(RefCell::new(SymbolTable::new()));
         let resolution = BindingNameResolution::build(&source, Rc::new(plan), Rc::clone(&symbols))
             .expect("resolution");
@@ -378,6 +478,138 @@ mod tests {
         assert!(!resolution.validates_artifact(foreign.source()));
         assert!(resolution.owns_symbol_table(symbols.as_ref()));
         assert!(!resolution.owns_symbol_table(&foreign_symbols));
+    }
+
+    #[test]
+    fn unused_certified_parameter_gets_an_exact_external_binding() {
+        let source = source_owned();
+        assert_eq!(
+            source
+                .report()
+                .render()
+                .expect("render facts")
+                .parameter_values(0)
+                .count(),
+            0,
+            "fixture parameter must have no entry ValueId"
+        );
+        let plan = BindingPlan::build_shadow(&source).expect("unused parameter plan");
+        let ParameterDisposition::Bound {
+            binding,
+            width_bits,
+        } = plan.parameter_disposition(0).expect("slot zero disposition")
+        else {
+            panic!("unused certified parameter was refused")
+        };
+        assert_eq!(width_bits, 64);
+        assert_eq!(
+            plan.parameter_entity_disposition(r2ssa::SemanticId::Parameter(0)),
+            plan.parameter_disposition(0)
+        );
+        assert_eq!(
+            plan.binding_role(binding),
+            Some(BindingRole::Parameter { slot: 0 })
+        );
+        assert_eq!(plan.binding_is_externally_declared(binding), Some(true));
+        assert!(source.source().graph().values.iter().all(|value| {
+            plan.disposition(value.id) != Some(&ValueDisposition::Bound { binding })
+        }));
+
+        let resolution = BindingNameResolution::build(
+            &source,
+            Rc::new(plan),
+            Rc::new(RefCell::new(SymbolTable::new())),
+        )
+        .expect("unused parameter resolution");
+        let symbol = resolution
+            .symbol_for_parameter_slot(0)
+            .expect("parameter symbol");
+        assert_eq!(
+            resolution.resolve_parameter_entity(r2ssa::SemanticId::Parameter(0)),
+            PlannedParameterSymbol::Bound {
+                symbol,
+                width_bits: 64
+            }
+        );
+        assert_eq!(
+            resolution.symbol_for_parameter_entity(r2ssa::SemanticId::Parameter(0)),
+            Some(symbol)
+        );
+    }
+
+    #[test]
+    fn value_backed_parameter_reuses_its_certified_binding() {
+        let source = source_owned_using_parameter(8);
+        let entry_values = source
+            .report()
+            .render()
+            .expect("render facts")
+            .parameter_values(0)
+            .collect::<Vec<_>>();
+        assert!(!entry_values.is_empty(), "fixture must certify an entry value");
+        let plan = BindingPlan::build_shadow(&source).expect("value-backed parameter plan");
+        let ParameterDisposition::Bound { binding, .. } =
+            plan.parameter_disposition(0).expect("slot zero disposition")
+        else {
+            panic!("value-backed parameter was refused")
+        };
+        assert!(entry_values.iter().all(|value| {
+            plan.disposition(*value) == Some(&ValueDisposition::Bound { binding })
+        }));
+        assert_eq!(
+            plan.binding(binding)
+                .expect("reused binding")
+                .certificate
+                .sources
+                .iter()
+                .filter(|source| {
+                    **source
+                        == super::super::BindingCertificateSource::CertifiedEntity(
+                            r2ssa::SemanticId::Parameter(0),
+                        )
+                })
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn unsupported_parameter_width_is_refused_and_conflicting_roles_are_rejected() {
+        let source = source_owned_using_parameter(3);
+        let plan = BindingPlan::build_shadow(&source).expect("refusing parameter plan");
+        assert_eq!(
+            plan.parameter_disposition(0),
+            Some(ParameterDisposition::Refused {
+                reason: ParameterRefusal::UnsupportedWidth {
+                    entity: r2ssa::SemanticId::Parameter(0),
+                    slot: 0,
+                    width_bits: 24,
+                }
+            })
+        );
+
+        let conflict_source = source_owned();
+        let mut conflict_plan =
+            BindingPlan::build_shadow(&conflict_source).expect("conflict fixture plan");
+        let binding = conflict_plan.bindings().next().expect("fixture binding").0;
+        conflict_plan.bindings[binding.index()].certificate.sources = Box::new([
+            super::super::BindingCertificateSource::CertifiedEntity(
+                r2ssa::SemanticId::Parameter(0),
+            ),
+            super::super::BindingCertificateSource::CertifiedEntity(
+                r2ssa::SemanticId::Parameter(1),
+            ),
+        ]);
+        assert_eq!(conflict_plan.binding_role(binding), None);
+        assert!(matches!(
+            BindingNameResolution::build(
+                &conflict_source,
+                Rc::new(conflict_plan),
+                Rc::new(RefCell::new(SymbolTable::new()))
+            ),
+            Err(BindingNameResolutionError::ConflictingCertifiedRoles(conflict))
+                if conflict == binding
+        ));
     }
 
     #[test]
