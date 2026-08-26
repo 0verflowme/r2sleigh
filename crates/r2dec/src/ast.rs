@@ -308,8 +308,34 @@ impl CExpr {
         Self::Var(name)
     }
 
+    fn nonnegative_literal_u64(expr: &Self) -> Option<u64> {
+        match expr {
+            Self::UIntLit(value) => Some(*value),
+            Self::IntLit(value) => u64::try_from(*value).ok(),
+            _ => None,
+        }
+    }
+
+    fn fold_unsigned_bitwise_literals(op: BinaryOp, left: &Self, right: &Self) -> Option<Self> {
+        if !matches!(left, Self::UIntLit(_)) && !matches!(right, Self::UIntLit(_)) {
+            return None;
+        }
+        let left = Self::nonnegative_literal_u64(left)?;
+        let right = Self::nonnegative_literal_u64(right)?;
+        let value = match op {
+            BinaryOp::BitAnd => left & right,
+            BinaryOp::BitOr => left | right,
+            BinaryOp::BitXor => left ^ right,
+            _ => return None,
+        };
+        Some(Self::UIntLit(value))
+    }
+
     /// Create a binary operation.
     pub fn binary(op: BinaryOp, left: CExpr, right: CExpr) -> Self {
+        if let Some(folded) = Self::fold_unsigned_bitwise_literals(op, &left, &right) {
+            return folded;
+        }
         Self::Binary {
             op,
             left: Box::new(left),
@@ -844,6 +870,49 @@ mod tests {
     }
 
     #[test]
+    fn unsigned_bitwise_literals_fold_movk_mask_or_chain() {
+        let expr = CExpr::binary(
+            BinaryOp::BitOr,
+            CExpr::binary(
+                BinaryOp::BitAnd,
+                CExpr::binary(
+                    BinaryOp::BitOr,
+                    CExpr::binary(
+                        BinaryOp::BitAnd,
+                        CExpr::binary(
+                            BinaryOp::BitOr,
+                            CExpr::binary(
+                                BinaryOp::BitAnd,
+                                CExpr::UIntLit(0x2325),
+                                CExpr::UIntLit(0xffff_ffff_0000_ffff),
+                            ),
+                            CExpr::UIntLit(0x8422_0000),
+                        ),
+                        CExpr::UIntLit(0xffff_0000_ffff_ffff),
+                    ),
+                    CExpr::UIntLit(0x9ce4_0000_0000),
+                ),
+                CExpr::UIntLit(0x0000_ffff_ffff_ffff),
+            ),
+            CExpr::UIntLit(0xcbf2_0000_0000_0000),
+        );
+
+        assert_eq!(expr, CExpr::UIntLit(0xcbf2_9ce4_8422_2325));
+    }
+
+    #[test]
+    fn signed_only_bitwise_literals_remain_regular_binary_expressions() {
+        let expr = CExpr::binary(BinaryOp::BitOr, CExpr::IntLit(1), CExpr::IntLit(2));
+        assert!(matches!(
+            expr,
+            CExpr::Binary {
+                op: BinaryOp::BitOr,
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn test_stmt_creation() {
         let symbols = test_table();
         let stmt = CStmt::if_stmt(
@@ -871,7 +940,13 @@ mod tests {
         let expr = CExpr::binary(
             BinaryOp::Add,
             CExpr::var(crate::symbol::declare(&symbols, "a")),
-            CExpr::call(CExpr::var(crate::symbol::declare(&symbols, "f")), vec![CExpr::int(1), CExpr::var(crate::symbol::declare(&symbols, "b"))]),
+            CExpr::call(
+                CExpr::var(crate::symbol::declare(&symbols, "f")),
+                vec![
+                    CExpr::int(1),
+                    CExpr::var(crate::symbol::declare(&symbols, "b")),
+                ],
+            ),
         );
         let mut vars = Vec::new();
         expr.visit(&mut |node| {
@@ -887,9 +962,15 @@ mod tests {
     #[test]
     fn test_expr_map_children_updates_direct_children() {
         let symbols = test_table();
-        let expr = CExpr::binary(BinaryOp::Add, CExpr::var(crate::symbol::declare(&symbols, "a")), CExpr::int(1));
+        let expr = CExpr::binary(
+            BinaryOp::Add,
+            CExpr::var(crate::symbol::declare(&symbols, "a")),
+            CExpr::int(1),
+        );
         let mut mapper = |child: CExpr| match child {
-            CExpr::Var(name) if name == crate::symbol::declare(&symbols, "a") => CExpr::var(crate::symbol::declare(&symbols, "x")),
+            CExpr::Var(name) if name == crate::symbol::declare(&symbols, "a") => {
+                CExpr::var(crate::symbol::declare(&symbols, "x"))
+            }
             other => other,
         };
         let rewritten = expr.map_children(&mut mapper);
