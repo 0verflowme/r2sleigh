@@ -266,6 +266,7 @@ impl<'a> LowerCtx<'a> {
         self.expr_for_ssa_name_with_depth(name, 0, &mut HashSet::new())
     }
 
+    #[cfg(test)]
     pub(crate) fn expr_for_semantic_value(
         &self,
         value: &SemanticValue,

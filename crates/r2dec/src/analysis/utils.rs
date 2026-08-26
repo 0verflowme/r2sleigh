@@ -19,57 +19,6 @@ pub(crate) fn flag_base_name(name: &str) -> String {
     }
 }
 
-pub(crate) fn is_cpu_flag(name: &str) -> bool {
-    if matches!(
-        name,
-        "cf" | "pf"
-            | "af"
-            | "zf"
-            | "sf"
-            | "of"
-            | "cy"
-            | "zr"
-            | "ng"
-            | "ov"
-            | "nf"
-            | "vf"
-            | "df"
-            | "tf"
-            | "if"
-            | "iopl"
-            | "nt"
-            | "rf"
-            | "vm"
-            | "ac"
-            | "vif"
-            | "vip"
-            | "id"
-            | "tmpcy"
-            | "tmpzr"
-            | "tmpng"
-            | "tmpov"
-    ) {
-        return true;
-    }
-
-    name.starts_with("cf_")
-        || name.starts_with("pf_")
-        || name.starts_with("af_")
-        || name.starts_with("zf_")
-        || name.starts_with("sf_")
-        || name.starts_with("of_")
-        || name.starts_with("cy_")
-        || name.starts_with("zr_")
-        || name.starts_with("ng_")
-        || name.starts_with("ov_")
-        || name.starts_with("nf_")
-        || name.starts_with("vf_")
-        || name.starts_with("tmpcy_")
-        || name.starts_with("tmpzr_")
-        || name.starts_with("tmpng_")
-        || name.starts_with("tmpov_")
-}
-
 pub(crate) fn parse_const_value(name: &str) -> Option<u64> {
     let val_str = name.strip_prefix("const:")?;
     let val_str = val_str.split('_').next().unwrap_or(val_str);
@@ -133,6 +82,7 @@ pub(crate) fn compare_const_to_expr(var: &SSAVar) -> CExpr {
     compare_const_to_expr_with_width(var, var.size)
 }
 
+#[cfg(test)]
 pub(crate) fn parse_const_offset(var: &SSAVar) -> Option<i64> {
     if !var.is_const() {
         return None;
@@ -166,17 +116,6 @@ pub(crate) fn parse_const_offset(var: &SSAVar) -> Option<i64> {
     } else {
         Some(val as i64)
     }
-}
-
-#[cfg(test)]
-pub(crate) fn uf_find(parent: &mut HashMap<String, String>, x: &str) -> String {
-    let p = parent.get(x).cloned().unwrap_or_else(|| x.to_string());
-    if p == x {
-        return x.to_string();
-    }
-    let root = uf_find(parent, &p);
-    parent.insert(x.to_string(), root.clone());
-    root
 }
 
 /// How a value keyed only by its display name is spelled.

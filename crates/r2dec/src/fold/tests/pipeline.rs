@@ -33,7 +33,6 @@ mod tests {
         ast::{CFunction, CLocal},
     };
     use crate::analysis::ownership::CallOwnerIdentity;
-    use crate::analysis::utils::is_cpu_flag;
     use r2il::{
         ArchSpec, R2ILBlock, R2ILOp, RegisterBitSlice, RegisterDef, RegisterProjection,
         RegisterProjectionDisposition, RegisterStorage, SpaceId, Varnode,
@@ -4401,20 +4400,6 @@ install_test_param_aliases(&mut ctx, HashMap::from([(
             )))),
             Some(CType::Int(16))
         );
-    }
-
-    #[test]
-    fn test_is_cpu_flag() {
-        assert!(is_cpu_flag("cf"));
-        assert!(is_cpu_flag("zf"));
-        assert!(is_cpu_flag("sf"));
-        assert!(is_cpu_flag("cf_1"));
-        assert!(is_cpu_flag("ng"));
-        assert!(is_cpu_flag("zr"));
-        assert!(is_cpu_flag("tmpng"));
-        assert!(is_cpu_flag("tmpzr_1"));
-        assert!(!is_cpu_flag("rax"));
-        assert!(!is_cpu_flag("rbp"));
     }
 
     #[test]
