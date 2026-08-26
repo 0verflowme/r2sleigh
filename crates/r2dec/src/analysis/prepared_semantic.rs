@@ -1,13 +1,13 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::rc::Rc;
 
+#[cfg(test)]
+use r2ssa::SSAVarNameKind;
 use r2ssa::function::DefLocation;
 use r2ssa::{
     CompareKind, MemoryLocation, ObjectKind, ReturnCarrier, SSAOp, SSAVar, SsaArtifact, ValueId,
     ValueOwner,
 };
-#[cfg(test)]
-use r2ssa::SSAVarNameKind;
 use r2types::{
     CalleeIdentity, CalleeResolutionFacts, CalleeTargetIdentityRequest, CallsiteKey,
     FunctionCallResultFacts, FunctionCallsiteFacts, FunctionFacts,
@@ -20,9 +20,8 @@ use r2types::{
 
 use super::lower::LowerCtx;
 use super::{
-    BaseRef, DecompilerFacts, NormalizedAddr, PassEnv, SSABlock, ScalarValue,
-    SemanticValue, StackInfo, StackSlotProvenance, StackSlotValueKind, UseInfo, ValueProvenance,
-    ValueRef,
+    BaseRef, DecompilerFacts, NormalizedAddr, PassEnv, SSABlock, ScalarValue, SemanticValue,
+    StackInfo, StackSlotProvenance, StackSlotValueKind, UseInfo, ValueProvenance, ValueRef,
 };
 use crate::ast::{BinaryOp, CExpr, UnaryOp};
 use crate::binding_plan::{
@@ -142,7 +141,10 @@ impl<'a> PreparedSemanticViewInputs<'a> {
 
 impl PreparedSemanticView {
     #[cfg(test)]
-    pub(crate) fn build(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, inputs: PreparedSemanticViewInputs<'_>) -> Self {
+    pub(crate) fn build(
+        symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
+        inputs: PreparedSemanticViewInputs<'_>,
+    ) -> Self {
         Self::build_inner(symbols, inputs, None)
     }
 
@@ -277,11 +279,7 @@ impl PreparedSemanticView {
             .decompile_prep_facts()?
             .formal_parameter_of(var)?;
         let slot = u32::try_from(slot).ok()?;
-        let disposition = match self
-            .binding_names
-            .as_ref()?
-            .require_parameter_slot(slot)
-        {
+        let disposition = match self.binding_names.as_ref()?.require_parameter_slot(slot) {
             Ok(disposition) => disposition,
             Err(_) => return None,
         };
@@ -331,11 +329,8 @@ impl PreparedSemanticView {
     }
 
     pub(crate) fn call_result_source_for_var(&self, var: &SSAVar) -> Option<(u64, usize)> {
-        self.value_id_for_var(var).and_then(|value_id| {
-            self.call_result_source_by_value
-                .get(&value_id)
-                .copied()
-        })
+        self.value_id_for_var(var)
+            .and_then(|value_id| self.call_result_source_by_value.get(&value_id).copied())
     }
 
     #[allow(dead_code)]
@@ -394,12 +389,13 @@ fn preflight_rendered_identities(
     }
 
     let mut parameter_slots = BTreeSet::new();
-    if let Some(interface) = inputs
-        .prepared
-        .machine_context()
-        .function_interface()
-    {
-        parameter_slots.extend(interface.parameters().iter().map(|parameter| parameter.index()));
+    if let Some(interface) = inputs.prepared.machine_context().function_interface() {
+        parameter_slots.extend(
+            interface
+                .parameters()
+                .iter()
+                .map(|parameter| parameter.index()),
+        );
     }
     if let Some(prep) = inputs.prepared.function().decompile_prep_facts() {
         parameter_slots.extend(
@@ -415,7 +411,20 @@ fn preflight_rendered_identities(
                     parameter_slots.insert(*slot);
                 }
                 r2types::CertifiedEntity::StackSlot { object, .. } => {
-                    let _ = resolver.require_stack(*object)?;
+                    // A discovered stack address is not necessarily a C
+                    // variable: saved frame pointers and return-stack
+                    // machinery also occupy exact stack objects.  Preflight
+                    // proves the sealed plan covers the complete object
+                    // domain, while the surviving lowering site is what must
+                    // require a Bound disposition.  This keeps an unused or
+                    // structurally elided machine resource from becoming a
+                    // fabricated program variable without letting a live use
+                    // bypass its typed refusal.
+                    if resolver.plan().stack_object_disposition(*object).is_none() {
+                        return Err(RenderedIdentityRefusal::MissingStackDisposition {
+                            object: *object,
+                        });
+                    }
                 }
                 r2types::CertifiedEntity::LoopCarrier { .. } => {}
             }
@@ -528,7 +537,8 @@ fn prepared_call_site_tuple(
 }
 
 #[allow(dead_code)]
-pub(crate) fn build_prepared_runtime_facts(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
+pub(crate) fn build_prepared_runtime_facts(
+    symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
     blocks: &[SSABlock],
     env: &PassEnv<'_>,
     prepared: &SsaArtifact,
@@ -542,7 +552,7 @@ pub(crate) fn build_prepared_runtime_facts(symbols: &std::cell::RefCell<crate::s
     build_prepared_runtime_facts_with_control(
         symbols, blocks, env, prepared, view, &origins, control,
     )
-        .expect("default decompiler work control cannot stop")
+    .expect("default decompiler work control cannot stop")
 }
 
 pub(crate) fn build_prepared_runtime_facts_with_control(
@@ -604,7 +614,8 @@ fn pin_prepared_phi_materialized_var(use_info: &mut UseInfo, var: &SSAVar) {
     use_info.pinned.insert(display.to_ascii_lowercase());
 }
 
-fn populate_prepared_render_definitions(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
+fn populate_prepared_render_definitions(
+    symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
     use_info: &mut UseInfo,
     blocks: &[SSABlock],
     env: &PassEnv<'_>,
@@ -648,9 +659,7 @@ fn populate_prepared_render_definitions(symbols: &std::cell::RefCell<crate::symb
                     }
                 }
             };
-            if std::env::var("R2SLEIGH_TRACE_DEFFILTER").as_deref()
-                == Ok(&*dst.display_name())
-            {
+            if std::env::var("R2SLEIGH_TRACE_DEFFILTER").as_deref() == Ok(&*dst.display_name()) {
                 eprintln!(
                     "DEFFILTER {} self={} safe={} carrier={}",
                     dst.display_name(),
@@ -669,9 +678,10 @@ fn populate_prepared_render_definitions(symbols: &std::cell::RefCell<crate::symb
             }
             // A carrier and the values that read it are mutable state; the only
             // definition available for one is the value it held on some path.
-            if use_info.value_id_for_var(dst).is_some_and(|value| {
-                view.certified_loop_carrier_values.contains(&value)
-            }) {
+            if use_info
+                .value_id_for_var(dst)
+                .is_some_and(|value| view.certified_loop_carrier_values.contains(&value))
+            {
                 continue;
             }
             if let Some(value_id) = use_info.value_id_for_var(dst) {
@@ -750,7 +760,11 @@ fn prepared_op_has_render_definition(op: &SSAOp) -> bool {
     )
 }
 
-fn prepared_render_definition_is_safe(_symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, expr: &CExpr, env: &PassEnv<'_>) -> bool {
+fn prepared_render_definition_is_safe(
+    _symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
+    expr: &CExpr,
+    env: &PassEnv<'_>,
+) -> bool {
     let mut safe = true;
     expr.visit(&mut |node| {
         if matches!(
@@ -777,7 +791,11 @@ fn prepared_render_definition_is_safe(_symbols: &std::cell::RefCell<crate::symbo
 }
 
 #[cfg(test)]
-fn is_self_render_definition(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, dst: &SSAVar, expr: &CExpr) -> bool {
+fn is_self_render_definition(
+    symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
+    dst: &SSAVar,
+    expr: &CExpr,
+) -> bool {
     let dst_display = dst.display_name();
     let dst_rendered = if let Some(tmp_name) = SSAVarNameKind::strip_temporary_prefix(&dst.name) {
         let suffix = if dst.version > 0 {
@@ -977,7 +995,11 @@ fn populate_stack_offsets(view: &mut PreparedSemanticView, prepared: &SsaArtifac
     }
 }
 
-fn populate_owner_exprs(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, view: &mut PreparedSemanticView, inputs: &PreparedSemanticViewInputs<'_>) {
+fn populate_owner_exprs(
+    symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
+    view: &mut PreparedSemanticView,
+    inputs: &PreparedSemanticViewInputs<'_>,
+) {
     let prepared = inputs.prepared;
     let mut producer_by_dst = HashMap::<SSAVar, &SSAOp>::new();
     for block in prepared.function().blocks() {
@@ -1012,12 +1034,14 @@ fn populate_owner_exprs(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>
             {
                 let derived = prepared_direct_stack_load_offset(prepared, view, addr)
                     .and_then(|offset| {
-                        local_store_owner_expr_for_offset(symbols, view, prepared, block, op_idx, offset)
-                            .map(|expr| (expr, Some(offset)))
-                            .or_else(|| {
-                                prepared_stack_alias_expr_for_offset(symbols, view, offset)
-                                    .map(|expr| (expr, Some(offset)))
-                            })
+                        local_store_owner_expr_for_offset(
+                            symbols, view, prepared, block, op_idx, offset,
+                        )
+                        .map(|expr| (expr, Some(offset)))
+                        .or_else(|| {
+                            prepared_stack_alias_expr_for_offset(symbols, view, offset)
+                                .map(|expr| (expr, Some(offset)))
+                        })
                     })
                     .or_else(|| {
                         prepared
@@ -1031,13 +1055,19 @@ fn populate_owner_exprs(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>
                             })
                             .and_then(|fact| {
                                 let offset = fact.location.address.exact_offset()?;
-                                stack_program_expr_for_memory_location(symbols, view, &fact.location)
-                                    .map(|expr| (expr, Some(offset)))
+                                stack_program_expr_for_memory_location(
+                                    symbols,
+                                    view,
+                                    &fact.location,
+                                )
+                                .map(|expr| (expr, Some(offset)))
                             })
                     })
                     .or_else(|| {
-                        prepared_load_access_expr_for_addr(symbols, prepared, block, view, addr, dst.size)
-                            .map(|expr| (expr, None))
+                        prepared_load_access_expr_for_addr(
+                            symbols, prepared, block, view, addr, dst.size,
+                        )
+                        .map(|expr| (expr, None))
                     });
                 let Some((expr, offset)) = derived else {
                     continue;
@@ -1064,11 +1094,9 @@ fn populate_owner_exprs(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>
                     | SSAOp::Trunc { dst, src }
                     | SSAOp::Cast { dst, src, .. }
                     | SSAOp::Subpiece { dst, src, .. } => {
-                        if let Some(expr) = view
-                            .owner_expr_for_var(src)
-                            .cloned()
-                            .or_else(|| scalar_owner_expr_for_value(symbols, prepared, view, src, src.size))
-                            && view.owner_expr_for_var(dst) != Some(&expr)
+                        if let Some(expr) = view.owner_expr_for_var(src).cloned().or_else(|| {
+                            scalar_owner_expr_for_value(symbols, prepared, view, src, src.size)
+                        }) && view.owner_expr_for_var(dst) != Some(&expr)
                         {
                             view.insert_owner_expr(dst, expr);
                             changed = true;
@@ -1082,25 +1110,40 @@ fn populate_owner_exprs(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>
                     }
                     SSAOp::IntSub { dst, a, b } => {
                         let compare_width = a.size.max(b.size);
-                        let derived =
-                            prepared_binary_owner_expr(symbols, prepared, view, BinaryOp::Sub, a, b, compare_width)
-                                .or_else(|| {
-                                    prepared_address_owner_expr_for_value(symbols, prepared, view, a, compare_width)
-                                        .zip(prepared_address_owner_expr_for_value(symbols, 
-                                            prepared,
-                                            view,
-                                            b,
-                                            compare_width,
-                                        ))
-                                        .map(|(lhs, rhs)| {
-                                            prepared_simplify_binary_expr(symbols, 
-                                                view,
-                                                BinaryOp::Sub,
-                                                lhs,
-                                                rhs,
-                                            )
-                                        })
-                                });
+                        let derived = prepared_binary_owner_expr(
+                            symbols,
+                            prepared,
+                            view,
+                            BinaryOp::Sub,
+                            a,
+                            b,
+                            compare_width,
+                        )
+                        .or_else(|| {
+                            prepared_address_owner_expr_for_value(
+                                symbols,
+                                prepared,
+                                view,
+                                a,
+                                compare_width,
+                            )
+                            .zip(prepared_address_owner_expr_for_value(
+                                symbols,
+                                prepared,
+                                view,
+                                b,
+                                compare_width,
+                            ))
+                            .map(|(lhs, rhs)| {
+                                prepared_simplify_binary_expr(
+                                    symbols,
+                                    view,
+                                    BinaryOp::Sub,
+                                    lhs,
+                                    rhs,
+                                )
+                            })
+                        });
                         if let Some(expr) = derived
                             && view.owner_expr_for_var(dst) != Some(&expr)
                         {
@@ -1110,20 +1153,40 @@ fn populate_owner_exprs(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>
                     }
                     SSAOp::IntLeft { dst, a, b } => {
                         let compare_width = a.size.max(b.size);
-                        let derived =
-                            prepared_binary_owner_expr(symbols, prepared, view, BinaryOp::Shl, a, b, compare_width)
-                                .or_else(|| {
-                                    prepared_scaled_index_owner_expr(symbols, prepared, view, a, compare_width)
-                                        .zip(scalar_owner_expr_for_value(symbols, prepared, view, b, compare_width))
-                                        .map(|(lhs, rhs)| {
-                                            prepared_simplify_binary_expr(symbols, 
-                                                view,
-                                                BinaryOp::Shl,
-                                                lhs,
-                                                rhs,
-                                            )
-                                        })
-                                });
+                        let derived = prepared_binary_owner_expr(
+                            symbols,
+                            prepared,
+                            view,
+                            BinaryOp::Shl,
+                            a,
+                            b,
+                            compare_width,
+                        )
+                        .or_else(|| {
+                            prepared_scaled_index_owner_expr(
+                                symbols,
+                                prepared,
+                                view,
+                                a,
+                                compare_width,
+                            )
+                            .zip(scalar_owner_expr_for_value(
+                                symbols,
+                                prepared,
+                                view,
+                                b,
+                                compare_width,
+                            ))
+                            .map(|(lhs, rhs)| {
+                                prepared_simplify_binary_expr(
+                                    symbols,
+                                    view,
+                                    BinaryOp::Shl,
+                                    lhs,
+                                    rhs,
+                                )
+                            })
+                        });
                         if let Some(expr) = derived
                             && view.owner_expr_for_var(dst) != Some(&expr)
                         {
@@ -1133,25 +1196,40 @@ fn populate_owner_exprs(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>
                     }
                     SSAOp::IntMult { dst, a, b } => {
                         let compare_width = a.size.max(b.size);
-                        let derived =
-                            prepared_binary_owner_expr(symbols, prepared, view, BinaryOp::Mul, a, b, compare_width)
-                                .or_else(|| {
-                                    prepared_scaled_index_owner_expr(symbols, prepared, view, a, compare_width)
-                                        .zip(prepared_scaled_index_owner_expr(symbols, 
-                                            prepared,
-                                            view,
-                                            b,
-                                            compare_width,
-                                        ))
-                                        .map(|(lhs, rhs)| {
-                                            prepared_simplify_binary_expr(symbols, 
-                                                view,
-                                                BinaryOp::Mul,
-                                                lhs,
-                                                rhs,
-                                            )
-                                        })
-                                });
+                        let derived = prepared_binary_owner_expr(
+                            symbols,
+                            prepared,
+                            view,
+                            BinaryOp::Mul,
+                            a,
+                            b,
+                            compare_width,
+                        )
+                        .or_else(|| {
+                            prepared_scaled_index_owner_expr(
+                                symbols,
+                                prepared,
+                                view,
+                                a,
+                                compare_width,
+                            )
+                            .zip(prepared_scaled_index_owner_expr(
+                                symbols,
+                                prepared,
+                                view,
+                                b,
+                                compare_width,
+                            ))
+                            .map(|(lhs, rhs)| {
+                                prepared_simplify_binary_expr(
+                                    symbols,
+                                    view,
+                                    BinaryOp::Mul,
+                                    lhs,
+                                    rhs,
+                                )
+                            })
+                        });
                         if let Some(expr) = derived
                             && view.owner_expr_for_var(dst) != Some(&expr)
                         {
@@ -1161,25 +1239,40 @@ fn populate_owner_exprs(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>
                     }
                     SSAOp::IntAdd { dst, a, b } => {
                         let compare_width = a.size.max(b.size);
-                        let derived =
-                            prepared_binary_owner_expr(symbols, prepared, view, BinaryOp::Add, a, b, compare_width)
-                                .or_else(|| {
-                                    prepared_address_owner_expr_for_value(symbols, prepared, view, a, compare_width)
-                                        .zip(prepared_address_owner_expr_for_value(symbols, 
-                                            prepared,
-                                            view,
-                                            b,
-                                            compare_width,
-                                        ))
-                                        .map(|(lhs, rhs)| {
-                                            prepared_simplify_binary_expr(symbols, 
-                                                view,
-                                                BinaryOp::Add,
-                                                lhs,
-                                                rhs,
-                                            )
-                                        })
-                                });
+                        let derived = prepared_binary_owner_expr(
+                            symbols,
+                            prepared,
+                            view,
+                            BinaryOp::Add,
+                            a,
+                            b,
+                            compare_width,
+                        )
+                        .or_else(|| {
+                            prepared_address_owner_expr_for_value(
+                                symbols,
+                                prepared,
+                                view,
+                                a,
+                                compare_width,
+                            )
+                            .zip(prepared_address_owner_expr_for_value(
+                                symbols,
+                                prepared,
+                                view,
+                                b,
+                                compare_width,
+                            ))
+                            .map(|(lhs, rhs)| {
+                                prepared_simplify_binary_expr(
+                                    symbols,
+                                    view,
+                                    BinaryOp::Add,
+                                    lhs,
+                                    rhs,
+                                )
+                            })
+                        });
                         if let Some(expr) = derived
                             && view.owner_expr_for_var(dst) != Some(&expr)
                         {
@@ -1194,9 +1287,15 @@ fn populate_owner_exprs(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>
                             BinaryOp::Mod
                         };
                         let compare_width = a.size.max(b.size);
-                        if let Some(expr) =
-                            prepared_binary_owner_expr(symbols, prepared, view, op, a, b, compare_width)
-                            && view.owner_expr_for_var(dst) != Some(&expr)
+                        if let Some(expr) = prepared_binary_owner_expr(
+                            symbols,
+                            prepared,
+                            view,
+                            op,
+                            a,
+                            b,
+                            compare_width,
+                        ) && view.owner_expr_for_var(dst) != Some(&expr)
                         {
                             view.insert_owner_expr(dst, expr);
                             changed = true;
@@ -1209,10 +1308,34 @@ fn populate_owner_exprs(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>
                             BinaryOp::Mod
                         };
                         let compare_width = a.size.max(b.size);
-                        let derived = prepared_signed_dividend_expr(symbols, prepared, view, &producer_by_dst, a)
-                            .zip(scalar_owner_expr_for_value(symbols, prepared, view, b, compare_width))
-                            .map(|(lhs, rhs)| prepared_simplify_binary_expr(symbols, view, op, lhs, rhs))
-                            .or_else(|| prepared_binary_owner_expr(symbols, prepared, view, op, a, b, compare_width));
+                        let derived = prepared_signed_dividend_expr(
+                            symbols,
+                            prepared,
+                            view,
+                            &producer_by_dst,
+                            a,
+                        )
+                        .zip(scalar_owner_expr_for_value(
+                            symbols,
+                            prepared,
+                            view,
+                            b,
+                            compare_width,
+                        ))
+                        .map(|(lhs, rhs)| {
+                            prepared_simplify_binary_expr(symbols, view, op, lhs, rhs)
+                        })
+                        .or_else(|| {
+                            prepared_binary_owner_expr(
+                                symbols,
+                                prepared,
+                                view,
+                                op,
+                                a,
+                                b,
+                                compare_width,
+                            )
+                        });
                         if let Some(expr) = derived
                             && view.owner_expr_for_var(dst) != Some(&expr)
                         {
@@ -1230,9 +1353,15 @@ fn populate_owner_exprs(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>
                             _ => unreachable!(),
                         };
                         let compare_width = a.size.max(b.size);
-                        if let Some(expr) =
-                            prepared_binary_owner_expr(symbols, prepared, view, op, a, b, compare_width)
-                            && view.owner_expr_for_var(dst) != Some(&expr)
+                        if let Some(expr) = prepared_binary_owner_expr(
+                            symbols,
+                            prepared,
+                            view,
+                            op,
+                            a,
+                            b,
+                            compare_width,
+                        ) && view.owner_expr_for_var(dst) != Some(&expr)
                         {
                             view.insert_owner_expr(dst, expr);
                             changed = true;
@@ -1251,7 +1380,8 @@ fn populate_owner_exprs(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>
     refine_load_owner_exprs(symbols, view, inputs);
 }
 
-fn refine_load_owner_exprs(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
+fn refine_load_owner_exprs(
+    symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
     view: &mut PreparedSemanticView,
     inputs: &PreparedSemanticViewInputs<'_>,
 ) {
@@ -1268,12 +1398,14 @@ fn refine_load_owner_exprs(symbols: &std::cell::RefCell<crate::symbol::SymbolTab
             };
             let candidate = prepared_direct_stack_load_offset(prepared, view, addr)
                 .and_then(|offset| {
-                    local_store_owner_expr_for_offset(symbols, view, prepared, block, op_idx, offset)
-                        .map(|expr| (expr, Some(offset)))
-                        .or_else(|| {
-                            prepared_stack_alias_expr_for_offset(symbols, view, offset)
-                                .map(|expr| (expr, Some(offset)))
-                        })
+                    local_store_owner_expr_for_offset(
+                        symbols, view, prepared, block, op_idx, offset,
+                    )
+                    .map(|expr| (expr, Some(offset)))
+                    .or_else(|| {
+                        prepared_stack_alias_expr_for_offset(symbols, view, offset)
+                            .map(|expr| (expr, Some(offset)))
+                    })
                 })
                 .or_else(|| {
                     prepared
@@ -1292,8 +1424,10 @@ fn refine_load_owner_exprs(symbols: &std::cell::RefCell<crate::symbol::SymbolTab
                         })
                 })
                 .or_else(|| {
-                    prepared_load_access_expr_for_addr(symbols, prepared, block, view, addr, dst.size)
-                        .map(|expr| (expr, None))
+                    prepared_load_access_expr_for_addr(
+                        symbols, prepared, block, view, addr, dst.size,
+                    )
+                    .map(|expr| (expr, None))
                 });
             let Some((candidate_expr, candidate_offset)) = candidate else {
                 continue;
@@ -1313,7 +1447,11 @@ fn refine_load_owner_exprs(symbols: &std::cell::RefCell<crate::symbol::SymbolTab
     }
 }
 
-fn prepared_load_owner_candidate_should_replace(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, current: &CExpr, candidate: &CExpr) -> bool {
+fn prepared_load_owner_candidate_should_replace(
+    symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
+    current: &CExpr,
+    candidate: &CExpr,
+) -> bool {
     current != candidate
         && ((prepared_expr_is_generic_scalar_alias(symbols, current)
             && !prepared_expr_is_generic_scalar_alias(symbols, candidate))
@@ -1321,7 +1459,10 @@ fn prepared_load_owner_candidate_should_replace(symbols: &std::cell::RefCell<cra
                 && prepared_expr_is_structured_load_access(candidate)))
 }
 
-fn prepared_expr_is_generic_scalar_alias(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, expr: &CExpr) -> bool {
+fn prepared_expr_is_generic_scalar_alias(
+    symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
+    expr: &CExpr,
+) -> bool {
     #[cfg(not(test))]
     {
         let _ = (symbols, expr);
@@ -1329,7 +1470,10 @@ fn prepared_expr_is_generic_scalar_alias(symbols: &std::cell::RefCell<crate::sym
     }
     #[cfg(test)]
     match expr {
-        CExpr::Var(name) => is_generic_prepared_stack_alias(&crate::symbol::spelling(symbols, *name)) || crate::symbol::spelling(symbols, *name).ends_with("_home"),
+        CExpr::Var(name) => {
+            is_generic_prepared_stack_alias(&crate::symbol::spelling(symbols, *name))
+                || crate::symbol::spelling(symbols, *name).ends_with("_home")
+        }
         CExpr::Paren(inner) | CExpr::Cast { expr: inner, .. } => {
             prepared_expr_is_generic_scalar_alias(symbols, inner)
         }
@@ -1385,7 +1529,8 @@ fn prepared_direct_stack_load_offset(
         })
 }
 
-fn prepared_load_access_expr_for_addr(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
+fn prepared_load_access_expr_for_addr(
+    symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
     prepared: &SsaArtifact,
     block: &r2ssa::FunctionSSABlock,
     view: &PreparedSemanticView,
@@ -1415,7 +1560,13 @@ fn prepared_load_access_expr_from_visible_addr(
     // this, and C reads that as indexing an integer. The element width is known
     // here, so the pointee is too.
     fn as_pointer(expr: CExpr, elem_bytes: u32) -> CExpr {
-        if matches!(&expr, CExpr::Cast { ty: crate::ast::CType::Pointer(_), .. }) {
+        if matches!(
+            &expr,
+            CExpr::Cast {
+                ty: crate::ast::CType::Pointer(_),
+                ..
+            }
+        ) {
             return expr;
         }
         CExpr::cast(
@@ -1515,7 +1666,11 @@ fn populate_call_result_sources(
     }
 }
 
-fn populate_predicates(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, view: &mut PreparedSemanticView, inputs: &PreparedSemanticViewInputs<'_>) {
+fn populate_predicates(
+    symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
+    view: &mut PreparedSemanticView,
+    inputs: &PreparedSemanticViewInputs<'_>,
+) {
     view.predicate_expr_by_value.clear();
 
     let Some(control_facts) = inputs.control_facts() else {
@@ -1533,8 +1688,20 @@ fn populate_predicates(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
             continue;
         };
         let compare_width = lhs_var.size.max(rhs_var.size);
-        let lhs = expr_for_compare_operand_with_width(symbols, inputs, lhs_var.clone(), view, compare_width);
-        let rhs = expr_for_compare_operand_with_width(symbols, inputs, rhs_var.clone(), view, compare_width);
+        let lhs = expr_for_compare_operand_with_width(
+            symbols,
+            inputs,
+            lhs_var.clone(),
+            view,
+            compare_width,
+        );
+        let rhs = expr_for_compare_operand_with_width(
+            symbols,
+            inputs,
+            rhs_var.clone(),
+            view,
+            compare_width,
+        );
         let expr = CExpr::binary(binary_op_for_compare(compare.kind), lhs, rhs);
         let Some(cond_var) = prepared_var(inputs.prepared, predicate.condition) else {
             continue;
@@ -1545,7 +1712,8 @@ fn populate_predicates(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
     populate_derived_predicates(symbols, view, inputs);
 }
 
-fn populate_derived_predicates(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
+fn populate_derived_predicates(
+    symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
     view: &mut PreparedSemanticView,
     inputs: &PreparedSemanticViewInputs<'_>,
 ) {
@@ -1607,10 +1775,10 @@ fn populate_derived_predicates(symbols: &std::cell::RefCell<crate::symbol::Symbo
             break;
         }
     }
-
 }
 
-fn boolean_expr_for_sources(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
+fn boolean_expr_for_sources(
+    symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
     view: &PreparedSemanticView,
     inputs: &PreparedSemanticViewInputs<'_>,
     lhs: &SSAVar,
@@ -1622,7 +1790,8 @@ fn boolean_expr_for_sources(symbols: &std::cell::RefCell<crate::symbol::SymbolTa
     Some(CExpr::binary(op, lhs, rhs))
 }
 
-fn compare_expr_for_sources(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
+fn compare_expr_for_sources(
+    symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
     view: &PreparedSemanticView,
     inputs: &PreparedSemanticViewInputs<'_>,
     lhs: &SSAVar,
@@ -1637,12 +1806,15 @@ fn compare_expr_for_sources(symbols: &std::cell::RefCell<crate::symbol::SymbolTa
     }
 
     let compare_width = lhs.size.max(rhs.size);
-    let lhs = expr_for_compare_operand_with_width(symbols, inputs, lhs.clone(), view, compare_width);
-    let rhs = expr_for_compare_operand_with_width(symbols, inputs, rhs.clone(), view, compare_width);
+    let lhs =
+        expr_for_compare_operand_with_width(symbols, inputs, lhs.clone(), view, compare_width);
+    let rhs =
+        expr_for_compare_operand_with_width(symbols, inputs, rhs.clone(), view, compare_width);
     Some(CExpr::binary(op, lhs, rhs))
 }
 
-fn reconstruct_zero_compare_from_def(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
+fn reconstruct_zero_compare_from_def(
+    symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
     view: &PreparedSemanticView,
     inputs: &PreparedSemanticViewInputs<'_>,
     candidate: &SSAVar,
@@ -1654,11 +1826,7 @@ fn reconstruct_zero_compare_from_def(symbols: &std::cell::RefCell<crate::symbol:
         return None;
     }
 
-    let zero = compare_style_operand_expr(
-        inputs.prepared,
-        zero,
-        candidate.size.max(zero.size),
-    )?;
+    let zero = compare_style_operand_expr(inputs.prepared, zero, candidate.size.max(zero.size))?;
     if !matches!(zero, CExpr::IntLit(0) | CExpr::UIntLit(0)) {
         return None;
     }
@@ -1666,7 +1834,8 @@ fn reconstruct_zero_compare_from_def(symbols: &std::cell::RefCell<crate::symbol:
     reconstruct_zero_compare_from_nonzero_def(symbols, view, inputs, candidate, op, depth)
 }
 
-fn reconstruct_zero_compare_from_nonzero_def(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
+fn reconstruct_zero_compare_from_nonzero_def(
+    symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
     view: &PreparedSemanticView,
     inputs: &PreparedSemanticViewInputs<'_>,
     candidate: &SSAVar,
@@ -1695,8 +1864,20 @@ fn reconstruct_zero_compare_from_nonzero_def(symbols: &std::cell::RefCell<crate:
         }
         SSAOp::IntSub { a, b, .. } => {
             let compare_width = a.size.max(b.size);
-            let lhs = expr_for_compare_operand_with_width(symbols, inputs, a.clone(), view, compare_width);
-            let rhs = expr_for_compare_operand_with_width(symbols, inputs, b.clone(), view, compare_width);
+            let lhs = expr_for_compare_operand_with_width(
+                symbols,
+                inputs,
+                a.clone(),
+                view,
+                compare_width,
+            );
+            let rhs = expr_for_compare_operand_with_width(
+                symbols,
+                inputs,
+                b.clone(),
+                view,
+                compare_width,
+            );
             Some(CExpr::binary(op, lhs, rhs))
         }
         SSAOp::IntAnd { a, b, .. } if a == b => {
@@ -1707,7 +1888,8 @@ fn reconstruct_zero_compare_from_nonzero_def(symbols: &std::cell::RefCell<crate:
     }
 }
 
-fn predicate_expr_for_operand(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
+fn predicate_expr_for_operand(
+    symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
     view: &PreparedSemanticView,
     inputs: &PreparedSemanticViewInputs<'_>,
     var: &SSAVar,
@@ -1744,7 +1926,8 @@ fn predicate_expr_for_operand_with_depth(
     (!is_self).then_some(expr)
 }
 
-fn compare_def_expr_for_predicate_operand(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
+fn compare_def_expr_for_predicate_operand(
+    symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
     view: &PreparedSemanticView,
     inputs: &PreparedSemanticViewInputs<'_>,
     var: &SSAVar,
@@ -1788,7 +1971,9 @@ fn compare_def_expr_for_predicate_operand(symbols: &std::cell::RefCell<crate::sy
             let rhs = predicate_expr_for_operand_with_depth(symbols, view, inputs, b, depth + 1)?;
             Some(CExpr::binary(BinaryOp::BitXor, lhs, rhs))
         }
-        SSAOp::IntEqual { a, b, .. } => compare_expr_for_sources(symbols, view, inputs, a, b, BinaryOp::Eq),
+        SSAOp::IntEqual { a, b, .. } => {
+            compare_expr_for_sources(symbols, view, inputs, a, b, BinaryOp::Eq)
+        }
         SSAOp::IntNotEqual { a, b, .. } => {
             compare_expr_for_sources(symbols, view, inputs, a, b, BinaryOp::Ne)
         }
@@ -1805,7 +1990,11 @@ fn compare_def_expr_for_predicate_operand(symbols: &std::cell::RefCell<crate::sy
     }
 }
 
-fn populate_switches(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, view: &mut PreparedSemanticView, inputs: &PreparedSemanticViewInputs<'_>) {
+fn populate_switches(
+    symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
+    view: &mut PreparedSemanticView,
+    inputs: &PreparedSemanticViewInputs<'_>,
+) {
     let Some(control_facts) = inputs.control_facts() else {
         return;
     };
@@ -1822,7 +2011,11 @@ fn populate_switches(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, v
     }
 }
 
-fn populate_calls(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, view: &mut PreparedSemanticView, inputs: &PreparedSemanticViewInputs<'_>) {
+fn populate_calls(
+    symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
+    view: &mut PreparedSemanticView,
+    inputs: &PreparedSemanticViewInputs<'_>,
+) {
     for call_site in inputs.prepared.call_sites().by_id.values() {
         let Some(site) = prepared_call_site_tuple(inputs.prepared, call_site.at) else {
             continue;
@@ -1854,8 +2047,13 @@ fn populate_calls(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, view
                 })
                 .cloned(),
         };
-        call_view.result_owner =
-            certified_call_result_owner(symbols, site, inputs.prepared, view, inputs.call_result_facts());
+        call_view.result_owner = certified_call_result_owner(
+            symbols,
+            site,
+            inputs.prepared,
+            view,
+            inputs.call_result_facts(),
+        );
         if let Some(owner) = call_view.result_owner.clone() {
             assign_certified_call_result_owner(
                 site,
@@ -1866,7 +2064,8 @@ fn populate_calls(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, view
             );
         }
         let max_arity = prepared_call_max_arity(inputs, &call_view);
-        let authoritative_args = canonical_call_authoritative_args(symbols, 
+        let authoritative_args = canonical_call_authoritative_args(
+            symbols,
             site,
             inputs.prepared.function(),
             inputs.prepared,
@@ -1896,7 +2095,8 @@ fn callsite_direct_target(
         .direct_target
 }
 
-fn canonical_call_authoritative_args(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
+fn canonical_call_authoritative_args(
+    symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
     site: (u64, usize),
     function: &r2ssa::SSAFunction,
     prepared: &SsaArtifact,
@@ -1966,7 +2166,8 @@ fn call_arg_value_has_location_certificate(
             .any(|location| location.index == index && location.value == value)
 }
 
-fn authoritative_expr_for_prepared_value(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
+fn authoritative_expr_for_prepared_value(
+    symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
     block: &r2ssa::FunctionSSABlock,
     prepared: &SsaArtifact,
     view: &PreparedSemanticView,
@@ -1989,7 +2190,8 @@ fn prepared_call_max_arity(
         .and_then(CalleeIdentity::non_variadic_known_arity)
 }
 
-fn authoritative_scalar_expr_for_value(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
+fn authoritative_scalar_expr_for_value(
+    symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
     prepared: &SsaArtifact,
     block: &r2ssa::FunctionSSABlock,
     view: &PreparedSemanticView,
@@ -2053,8 +2255,15 @@ fn authoritative_scalar_expr_for_value(symbols: &std::cell::RefCell<crate::symbo
             authoritative_scalar_expr_for_value(symbols, prepared, block, view, a, depth + 1)
                 .or_else(|| scalar_owner_expr_for_value(symbols, prepared, view, a, a.size))
                 .zip(
-                    authoritative_scalar_expr_for_value(symbols, prepared, block, view, b, depth + 1)
-                        .or_else(|| scalar_owner_expr_for_value(symbols, prepared, view, b, b.size)),
+                    authoritative_scalar_expr_for_value(
+                        symbols,
+                        prepared,
+                        block,
+                        view,
+                        b,
+                        depth + 1,
+                    )
+                    .or_else(|| scalar_owner_expr_for_value(symbols, prepared, view, b, b.size)),
                 )
                 .map(|(lhs, rhs)| CExpr::binary(BinaryOp::Add, lhs, rhs))
         }
@@ -2062,8 +2271,15 @@ fn authoritative_scalar_expr_for_value(symbols: &std::cell::RefCell<crate::symbo
             authoritative_scalar_expr_for_value(symbols, prepared, block, view, a, depth + 1)
                 .or_else(|| scalar_owner_expr_for_value(symbols, prepared, view, a, a.size))
                 .zip(
-                    authoritative_scalar_expr_for_value(symbols, prepared, block, view, b, depth + 1)
-                        .or_else(|| scalar_owner_expr_for_value(symbols, prepared, view, b, b.size)),
+                    authoritative_scalar_expr_for_value(
+                        symbols,
+                        prepared,
+                        block,
+                        view,
+                        b,
+                        depth + 1,
+                    )
+                    .or_else(|| scalar_owner_expr_for_value(symbols, prepared, view, b, b.size)),
                 )
                 .map(|(lhs, rhs)| CExpr::binary(BinaryOp::Sub, lhs, rhs))
         }
@@ -2071,8 +2287,15 @@ fn authoritative_scalar_expr_for_value(symbols: &std::cell::RefCell<crate::symbo
             authoritative_scalar_expr_for_value(symbols, prepared, block, view, a, depth + 1)
                 .or_else(|| scalar_owner_expr_for_value(symbols, prepared, view, a, a.size))
                 .zip(
-                    authoritative_scalar_expr_for_value(symbols, prepared, block, view, b, depth + 1)
-                        .or_else(|| scalar_owner_expr_for_value(symbols, prepared, view, b, b.size)),
+                    authoritative_scalar_expr_for_value(
+                        symbols,
+                        prepared,
+                        block,
+                        view,
+                        b,
+                        depth + 1,
+                    )
+                    .or_else(|| scalar_owner_expr_for_value(symbols, prepared, view, b, b.size)),
                 )
                 .map(|(lhs, rhs)| CExpr::binary(BinaryOp::Eq, lhs, rhs))
         }
@@ -2080,8 +2303,15 @@ fn authoritative_scalar_expr_for_value(symbols: &std::cell::RefCell<crate::symbo
             authoritative_scalar_expr_for_value(symbols, prepared, block, view, a, depth + 1)
                 .or_else(|| scalar_owner_expr_for_value(symbols, prepared, view, a, a.size))
                 .zip(
-                    authoritative_scalar_expr_for_value(symbols, prepared, block, view, b, depth + 1)
-                        .or_else(|| scalar_owner_expr_for_value(symbols, prepared, view, b, b.size)),
+                    authoritative_scalar_expr_for_value(
+                        symbols,
+                        prepared,
+                        block,
+                        view,
+                        b,
+                        depth + 1,
+                    )
+                    .or_else(|| scalar_owner_expr_for_value(symbols, prepared, view, b, b.size)),
                 )
                 .map(|(lhs, rhs)| CExpr::binary(BinaryOp::Ne, lhs, rhs))
         }
@@ -2089,7 +2319,11 @@ fn authoritative_scalar_expr_for_value(symbols: &std::cell::RefCell<crate::symbo
     }
 }
 
-fn prepared_result_expr_for_var(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, view: &PreparedSemanticView, var: &SSAVar) -> Option<CExpr> {
+fn prepared_result_expr_for_var(
+    symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
+    view: &PreparedSemanticView,
+    var: &SSAVar,
+) -> Option<CExpr> {
     let site = view.call_result_source_for_var(var)?;
     let call_view = view.call_view_for_site(site)?;
     call_view
@@ -2098,7 +2332,8 @@ fn prepared_result_expr_for_var(symbols: &std::cell::RefCell<crate::symbol::Symb
         .or_else(|| prepared_call_expr_from_view(symbols, call_view))
 }
 
-fn certified_call_result_owner(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
+fn certified_call_result_owner(
+    symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
     site: (u64, usize),
     prepared: &SsaArtifact,
     view: &PreparedSemanticView,
@@ -2113,7 +2348,8 @@ fn certified_call_result_owner(symbols: &std::cell::RefCell<crate::symbol::Symbo
         .next()
 }
 
-fn certified_call_result_owner_expr(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
+fn certified_call_result_owner_expr(
+    symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
     cert: &r2types::CallResultFact,
     prepared: &SsaArtifact,
     view: &PreparedSemanticView,
@@ -2257,10 +2493,7 @@ fn prepared_stack_program_expr_for_object_offset(
     }
 }
 
-fn prepared_stack_object_for_var(
-    prepared: &SsaArtifact,
-    var: &SSAVar,
-) -> Option<r2ssa::ObjectId> {
+fn prepared_stack_object_for_var(prepared: &SsaArtifact, var: &SSAVar) -> Option<r2ssa::ObjectId> {
     prepared
         .object_for_var(var, r2il::SpaceId::Ram)
         .or_else(|| {
@@ -2307,7 +2540,11 @@ fn prepared_stack_alias_name_for_offset(
         .filter(|alias| prepared_stack_owner_recovery_allowed(view, offset, alias))
 }
 
-fn prepared_stack_alias_expr_for_offset(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, view: &PreparedSemanticView, offset: i64) -> Option<CExpr> {
+fn prepared_stack_alias_expr_for_offset(
+    symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
+    view: &PreparedSemanticView,
+    offset: i64,
+) -> Option<CExpr> {
     #[cfg(test)]
     {
         if view.binding_names.is_none() {
@@ -2373,7 +2610,8 @@ fn prepared_stack_reload_param_alias_expr(
         .map(CExpr::Var)
 }
 
-fn expr_for_compare_operand(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
+fn expr_for_compare_operand(
+    symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
     inputs: &PreparedSemanticViewInputs<'_>,
     var: SSAVar,
     view: &PreparedSemanticView,
@@ -2381,7 +2619,8 @@ fn expr_for_compare_operand(symbols: &std::cell::RefCell<crate::symbol::SymbolTa
     expr_for_compare_operand_with_width(symbols, inputs, var, view, 0)
 }
 
-fn expr_for_compare_operand_with_width(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
+fn expr_for_compare_operand_with_width(
+    symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
     inputs: &PreparedSemanticViewInputs<'_>,
     var: SSAVar,
     view: &PreparedSemanticView,
@@ -2418,23 +2657,15 @@ fn expr_for_compare_operand_with_width(symbols: &std::cell::RefCell<crate::symbo
 
     #[cfg(test)]
     if preferred_non_generic_stack_alias(view, &var).is_some()
-        && let Some(expr) = prepared_stack_program_expr_for_var(
-            symbols,
-            view,
-            inputs.prepared,
-            &var,
-        )
+        && let Some(expr) =
+            prepared_stack_program_expr_for_var(symbols, view, inputs.prepared, &var)
     {
         return expr;
     }
     #[cfg(test)]
     if preferred_non_generic_stack_alias(view, &root).is_some()
-        && let Some(expr) = prepared_stack_program_expr_for_var(
-            symbols,
-            view,
-            inputs.prepared,
-            &root,
-        )
+        && let Some(expr) =
+            prepared_stack_program_expr_for_var(symbols, view, inputs.prepared, &root)
     {
         return expr;
     }
@@ -2446,28 +2677,20 @@ fn expr_for_compare_operand_with_width(symbols: &std::cell::RefCell<crate::symbo
     }
 
     if view.stack_offset_for_var(&var).is_some()
-        && let Some(expr) = prepared_stack_program_expr_for_var(
-            symbols,
-            view,
-            inputs.prepared,
-            &var,
-        )
+        && let Some(expr) =
+            prepared_stack_program_expr_for_var(symbols, view, inputs.prepared, &var)
     {
         return expr;
     }
     if view.stack_offset_for_var(&root).is_some()
-        && let Some(expr) = prepared_stack_program_expr_for_var(
-            symbols,
-            view,
-            inputs.prepared,
-            &root,
-        )
+        && let Some(expr) =
+            prepared_stack_program_expr_for_var(symbols, view, inputs.prepared, &root)
     {
         return expr;
     }
 
-    if let Some(expr) =
-        prepared_fallback_visible_expr(symbols, view, &root).or_else(|| prepared_fallback_visible_expr(symbols, view, &var))
+    if let Some(expr) = prepared_fallback_visible_expr(symbols, view, &root)
+        .or_else(|| prepared_fallback_visible_expr(symbols, view, &var))
     {
         return expr;
     }
@@ -2532,7 +2755,8 @@ fn lookup_callee_identity_for_site(
     .map(|target| target.identity)
 }
 
-fn scalar_owner_expr_for_value(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
+fn scalar_owner_expr_for_value(
+    symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
     prepared: &SsaArtifact,
     view: &PreparedSemanticView,
     var: &SSAVar,
@@ -2571,7 +2795,8 @@ fn scalar_owner_expr_for_value(symbols: &std::cell::RefCell<crate::symbol::Symbo
         .or_else(|| generic_prepared_owner_expr(view, var))
 }
 
-fn prepared_binary_owner_expr(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
+fn prepared_binary_owner_expr(
+    symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
     prepared: &SsaArtifact,
     view: &PreparedSemanticView,
     op: BinaryOp,
@@ -2584,14 +2809,16 @@ fn prepared_binary_owner_expr(symbols: &std::cell::RefCell<crate::symbol::Symbol
     Some(prepared_simplify_binary_expr(symbols, view, op, lhs, rhs))
 }
 
-fn prepared_simplify_binary_expr(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
+fn prepared_simplify_binary_expr(
+    symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
     view: &PreparedSemanticView,
     op: BinaryOp,
     mut lhs: CExpr,
     mut rhs: CExpr,
 ) -> CExpr {
     if prepared_binary_op_is_commutative(op)
-        && prepared_expr_order_key(symbols, view, &rhs) < prepared_expr_order_key(symbols, view, &lhs)
+        && prepared_expr_order_key(symbols, view, &rhs)
+            < prepared_expr_order_key(symbols, view, &lhs)
     {
         std::mem::swap(&mut lhs, &mut rhs);
     }
@@ -2602,7 +2829,8 @@ fn prepared_simplify_binary_expr(symbols: &std::cell::RefCell<crate::symbol::Sym
                 rhs
             } else if prepared_expr_is_zero(&rhs) {
                 lhs
-            } else if let Some(expr) = prepared_simplify_linear_addition(symbols, view, &lhs, &rhs) {
+            } else if let Some(expr) = prepared_simplify_linear_addition(symbols, view, &lhs, &rhs)
+            {
                 expr
             } else {
                 CExpr::binary(op, lhs, rhs)
@@ -2646,7 +2874,8 @@ fn prepared_simplify_binary_expr(symbols: &std::cell::RefCell<crate::symbol::Sym
     }
 }
 
-fn prepared_simplify_linear_addition(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
+fn prepared_simplify_linear_addition(
+    symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
     view: &PreparedSemanticView,
     left: &CExpr,
     right: &CExpr,
@@ -2671,7 +2900,8 @@ fn prepared_simplify_linear_addition(symbols: &std::cell::RefCell<crate::symbol:
     Some(iter.fold(first, |acc, expr| CExpr::binary(BinaryOp::Add, acc, expr)))
 }
 
-fn prepared_collect_linear_add_terms(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
+fn prepared_collect_linear_add_terms(
+    symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
     view: &PreparedSemanticView,
     expr: &CExpr,
     scale: i64,
@@ -2738,11 +2968,13 @@ fn prepared_parameter_rank(
         })
 }
 
-fn prepared_linear_atom_expr(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, view: &PreparedSemanticView, expr: &CExpr) -> Option<CExpr> {
+fn prepared_linear_atom_expr(
+    symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
+    view: &PreparedSemanticView,
+    expr: &CExpr,
+) -> Option<CExpr> {
     match expr {
-        CExpr::Var(name) if prepared_parameter_rank(view, *name).is_some() => {
-            Some(expr.clone())
-        }
+        CExpr::Var(name) if prepared_parameter_rank(view, *name).is_some() => Some(expr.clone()),
         CExpr::Paren(inner) => prepared_linear_atom_expr(symbols, view, inner),
         CExpr::Cast { ty, expr: inner }
             if ty.is_integer() && prepared_linear_atom_expr(symbols, view, inner).is_some() =>
@@ -2789,17 +3021,33 @@ fn prepared_binary_op_is_commutative(op: BinaryOp) -> bool {
     )
 }
 
-fn prepared_expr_order_key(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, view: &PreparedSemanticView, expr: &CExpr) -> (u8, usize, std::rc::Rc<str>) {
+fn prepared_expr_order_key(
+    symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
+    view: &PreparedSemanticView,
+    expr: &CExpr,
+) -> (u8, usize, std::rc::Rc<str>) {
     match expr {
         CExpr::Var(name) => prepared_parameter_rank(view, *name)
             .map(|rank| (0, rank, crate::symbol::spelling(symbols, *name)))
             .unwrap_or_else(|| (1, usize::MAX, crate::symbol::spelling(symbols, *name))),
-        CExpr::IntLit(value) => (2, usize::MAX, std::rc::Rc::from(format!("{value:020}").as_str())),
-        CExpr::UIntLit(value) => (2, usize::MAX, std::rc::Rc::from(format!("{value:020}").as_str())),
+        CExpr::IntLit(value) => (
+            2,
+            usize::MAX,
+            std::rc::Rc::from(format!("{value:020}").as_str()),
+        ),
+        CExpr::UIntLit(value) => (
+            2,
+            usize::MAX,
+            std::rc::Rc::from(format!("{value:020}").as_str()),
+        ),
         CExpr::Paren(inner) | CExpr::Cast { expr: inner, .. } => {
             prepared_expr_order_key(symbols, view, inner)
         }
-        _ => (1, usize::MAX, std::rc::Rc::from(format!("{expr:?}").as_str())),
+        _ => (
+            1,
+            usize::MAX,
+            std::rc::Rc::from(format!("{expr:?}").as_str()),
+        ),
     }
 }
 
@@ -2821,7 +3069,8 @@ fn prepared_expr_is_one(expr: &CExpr) -> bool {
     }
 }
 
-fn prepared_signed_dividend_expr(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
+fn prepared_signed_dividend_expr(
+    symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
     prepared: &SsaArtifact,
     view: &PreparedSemanticView,
     producer_by_dst: &HashMap<SSAVar, &SSAOp>,
@@ -2910,7 +3159,8 @@ fn prepared_shift_matches_signed_concat_width(
         .any(|size| shift_bits == u64::from(size.saturating_mul(8)))
 }
 
-fn prepared_address_owner_expr_for_value(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
+fn prepared_address_owner_expr_for_value(
+    symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
     prepared: &SsaArtifact,
     view: &PreparedSemanticView,
     var: &SSAVar,
@@ -2919,7 +3169,8 @@ fn prepared_address_owner_expr_for_value(symbols: &std::cell::RefCell<crate::sym
     scalar_owner_expr_for_value(symbols, prepared, view, var, compare_width)
 }
 
-fn prepared_scaled_index_owner_expr(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
+fn prepared_scaled_index_owner_expr(
+    symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
     prepared: &SsaArtifact,
     view: &PreparedSemanticView,
     var: &SSAVar,
@@ -2953,7 +3204,11 @@ fn preferred_non_generic_stack_alias(view: &PreparedSemanticView, var: &SSAVar) 
         .filter(|alias| !is_generic_prepared_stack_alias(alias) && !alias.ends_with("_home"))
 }
 
-fn non_generic_prepared_owner_expr(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, view: &PreparedSemanticView, var: &SSAVar) -> Option<CExpr> {
+fn non_generic_prepared_owner_expr(
+    symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
+    view: &PreparedSemanticView,
+    var: &SSAVar,
+) -> Option<CExpr> {
     view.owner_expr_for_var(var)
         .cloned()
         .filter(|expr| !matches!(expr, CExpr::AddrOf(_)))
@@ -2966,13 +3221,21 @@ fn generic_prepared_owner_expr(view: &PreparedSemanticView, var: &SSAVar) -> Opt
         .filter(|expr| !matches!(expr, CExpr::AddrOf(_)))
 }
 
-fn non_generic_prepared_predicate_expr(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, view: &PreparedSemanticView, var: &SSAVar) -> Option<CExpr> {
+fn non_generic_prepared_predicate_expr(
+    symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
+    view: &PreparedSemanticView,
+    var: &SSAVar,
+) -> Option<CExpr> {
     view.predicate_expr_for_cond(var)
         .cloned()
         .filter(|expr| !prepared_expr_is_generic_scalar_alias(symbols, expr))
 }
 
-fn prepared_fallback_visible_expr(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, view: &PreparedSemanticView, var: &SSAVar) -> Option<CExpr> {
+fn prepared_fallback_visible_expr(
+    symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
+    view: &PreparedSemanticView,
+    var: &SSAVar,
+) -> Option<CExpr> {
     if var.constant_bits().is_some() {
         return None;
     }
@@ -3003,7 +3266,8 @@ fn prepared_fallback_visible_expr(symbols: &std::cell::RefCell<crate::symbol::Sy
 }
 
 #[cfg(test)]
-fn local_store_owner_expr_for_offset(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
+fn local_store_owner_expr_for_offset(
+    symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
     view: &PreparedSemanticView,
     prepared: &SsaArtifact,
     block: &r2ssa::FunctionSSABlock,
@@ -3034,11 +3298,13 @@ fn local_store_owner_expr_for_offset(symbols: &std::cell::RefCell<crate::symbol:
         }
         if let Some(expr) = scalar_owner_expr_for_value(symbols, prepared, view, val, val.size) {
             if prefer_stack_object
-                && let Some(stack) = prepared_stack_program_expr_for_var(symbols, view, prepared, addr)
+                && let Some(stack) =
+                    prepared_stack_program_expr_for_var(symbols, view, prepared, addr)
             {
                 return Some(stack);
             }
-            if matches!(&expr, CExpr::Var(name) if !is_generic_prepared_stack_alias(&crate::symbol::spelling(symbols, *name))) {
+            if matches!(&expr, CExpr::Var(name) if !is_generic_prepared_stack_alias(&crate::symbol::spelling(symbols, *name)))
+            {
                 return Some(expr);
             }
             return Some(expr);
@@ -3068,7 +3334,6 @@ fn preferred_stack_alias_name(view: &PreparedSemanticView, offset: i64) -> Optio
 
 #[cfg(test)]
 fn is_generic_prepared_stack_alias(name: &str) -> bool {
-
     name.starts_with("var_")
         || name.starts_with("local_")
         || name.starts_with("stack_")
@@ -3096,7 +3361,8 @@ fn synthetic_stack_name(offset: i64) -> String {
     }
 }
 
-fn seed_prepared_stack_facts(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
+fn seed_prepared_stack_facts(
+    symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
     use_info: &mut UseInfo,
     _stack_info: &mut StackInfo,
     prepared: &SsaArtifact,
@@ -3111,7 +3377,10 @@ fn seed_prepared_stack_facts(symbols: &std::cell::RefCell<crate::symbol::SymbolT
                 continue;
             };
             let name = crate::symbol::spelling(symbols, stack_symbol).to_string();
-            _stack_info.stack_vars.entry(*offset).or_insert(name.clone());
+            _stack_info
+                .stack_vars
+                .entry(*offset)
+                .or_insert(name.clone());
             let provenance = StackSlotProvenance {
                 offset: *offset,
                 predicate_carrier: false,
@@ -3127,7 +3396,9 @@ fn seed_prepared_stack_facts(symbols: &std::cell::RefCell<crate::symbol::SymbolT
                 use_info
                     .stable_stack_values
                     .entry(*offset)
-                    .or_insert_with(|| SemanticValue::Scalar(ScalarValue::Expr(CExpr::Var(stack_symbol))));
+                    .or_insert_with(|| {
+                        SemanticValue::Scalar(ScalarValue::Expr(CExpr::Var(stack_symbol)))
+                    });
             }
         }
     }
@@ -3186,7 +3457,8 @@ fn seed_prepared_stack_facts(symbols: &std::cell::RefCell<crate::symbol::SymbolT
     }
 }
 
-fn collect_prepared_runtime_facts(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
+fn collect_prepared_runtime_facts(
+    symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
     use_info: &mut UseInfo,
     blocks: &[SSABlock],
     prepared: &SsaArtifact,
@@ -3278,11 +3550,7 @@ fn collect_prepared_runtime_facts(symbols: &std::cell::RefCell<crate::symbol::Sy
                         if let (Some(dst_id), Some(src_id)) = (bound_dst_id, bound_src_id) {
                             use_info.forwarded_values_by_value.insert(
                                 dst_id,
-                                exact_prepared_copy_provenance(
-                                    src,
-                                    src_id,
-                                    source_stack_slot,
-                                ),
+                                exact_prepared_copy_provenance(src, src_id, source_stack_slot),
                             );
                         } else {
                             *use_info
@@ -3312,7 +3580,8 @@ fn collect_prepared_runtime_facts(symbols: &std::cell::RefCell<crate::symbol::Sy
                     let reload_param_expr = reload_value.and_then(|value_id| {
                         prepared_stack_reload_param_alias_expr(prepared, view, value_id)
                     });
-                    let stack_alias_expr = prepared_stack_alias_expr_for_offset(symbols, view, offset);
+                    let stack_alias_expr =
+                        prepared_stack_alias_expr_for_offset(symbols, view, offset);
                     if let Some(expr) = reload_param_expr.or(stack_alias_expr) {
                         if let Some(value_id) = reload_value {
                             use_info
@@ -3342,7 +3611,8 @@ fn collect_prepared_runtime_facts(symbols: &std::cell::RefCell<crate::symbol::Sy
     }
 }
 
-fn populate_prepared_call_runtime_facts(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
+fn populate_prepared_call_runtime_facts(
+    symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
     use_info: &mut UseInfo,
     blocks: &[SSABlock],
     env: &PassEnv<'_>,
@@ -3379,8 +3649,8 @@ fn populate_prepared_call_runtime_facts(symbols: &std::cell::RefCell<crate::symb
 
             if let Some(call_expr) = prepared_call_expr(site, symbols, call_view, view, env) {
                 use_info.call_result_exprs.insert(site, call_expr.clone());
-                record_prepared_call_result_facts(symbols,
-                    use_info, site, prepared, view, &call_expr,
+                record_prepared_call_result_facts(
+                    symbols, use_info, site, prepared, view, &call_expr,
                 );
             }
         }
@@ -3398,9 +3668,10 @@ fn overlay_prepared_switch_roots(
         };
         use_info.switch_selector_roots.insert(
             *block_addr,
-            SemanticValue::Scalar(ScalarValue::Root(
-                ValueRef::with_value_id(*selector_value, selector.clone()),
-            )),
+            SemanticValue::Scalar(ScalarValue::Root(ValueRef::with_value_id(
+                *selector_value,
+                selector.clone(),
+            ))),
         );
     }
 }
@@ -3421,7 +3692,8 @@ fn merge_prepared_stack_slot(
     }
 }
 
-fn seed_prepared_value_fact(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
+fn seed_prepared_value_fact(
+    symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
     use_info: &mut UseInfo,
     var: &SSAVar,
     prepared: &SsaArtifact,
@@ -3518,7 +3790,9 @@ fn stack_value_kind_for_prepared_expr(expr: &CExpr) -> StackSlotValueKind {
     }
 }
 
-fn prepared_call_expr(site: (u64, usize), symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
+fn prepared_call_expr(
+    site: (u64, usize),
+    symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
     call_view: &PreparedCallView,
     view: &PreparedSemanticView,
     env: &PassEnv<'_>,
@@ -3533,12 +3807,17 @@ fn prepared_call_expr(site: (u64, usize), symbols: &std::cell::RefCell<crate::sy
     let args = call_view
         .authoritative_args
         .iter()
-        .map(|arg| normalize_prepared_inline_expr(symbols, arg.clone(), view, env, 0, &mut HashSet::new()))
+        .map(|arg| {
+            normalize_prepared_inline_expr(symbols, arg.clone(), view, env, 0, &mut HashSet::new())
+        })
         .collect();
     Some(CExpr::call_at(site, callee, args))
 }
 
-fn prepared_call_callee_expr(_symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, call_view: &PreparedCallView) -> Option<CExpr> {
+fn prepared_call_callee_expr(
+    _symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
+    call_view: &PreparedCallView,
+) -> Option<CExpr> {
     let identity = call_view.callee_identity.as_ref()?;
     let name = identity
         .display_name
@@ -3555,7 +3834,10 @@ fn prepared_call_callee_expr(_symbols: &std::cell::RefCell<crate::symbol::Symbol
     Some(CExpr::External { name, kind })
 }
 
-fn prepared_call_expr_from_view(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, call_view: &PreparedCallView) -> Option<CExpr> {
+fn prepared_call_expr_from_view(
+    symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
+    call_view: &PreparedCallView,
+) -> Option<CExpr> {
     if !prepared_call_render_authorized(call_view) {
         return None;
     }
@@ -3591,7 +3873,8 @@ fn prepared_call_render_authorized(call_view: &PreparedCallView) -> bool {
             .eq(call_view.authoritative_arg_values.iter().copied())
 }
 
-fn record_prepared_call_result_facts(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
+fn record_prepared_call_result_facts(
+    symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
     use_info: &mut UseInfo,
     source_site: (u64, usize),
     _prepared: &SsaArtifact,
@@ -3599,14 +3882,9 @@ fn record_prepared_call_result_facts(symbols: &std::cell::RefCell<crate::symbol:
     call_expr: &CExpr,
 ) {
     let site = source_site;
-    for cert in view
-        .call_result_facts_by_value
-        .values()
-        .filter(|cert| {
-            cert.callsite.block_addr == source_site.0
-                && cert.callsite.op_index == source_site.1
-        })
-    {
+    for cert in view.call_result_facts_by_value.values().filter(|cert| {
+        cert.callsite.block_addr == source_site.0 && cert.callsite.op_index == source_site.1
+    }) {
         let direct = matches!(cert.owner.as_ref(), Some(ValueOwner::Value(_)))
             && matches!(&cert.carrier, ReturnCarrier::Register { .. });
         use_info.insert_call_result_source_for_value(cert.value, site);
@@ -3617,12 +3895,8 @@ fn record_prepared_call_result_facts(symbols: &std::cell::RefCell<crate::symbol:
                 .or_insert_with(|| call_expr.clone());
         }
         if let Some(ValueOwner::StackSlot { object, offset }) = cert.owner.as_ref() {
-            let Some(expr @ CExpr::Var(_symbol)) = prepared_stack_program_expr_for_object_offset(
-                symbols,
-                view,
-                *object,
-                *offset,
-            )
+            let Some(expr @ CExpr::Var(_symbol)) =
+                prepared_stack_program_expr_for_object_offset(symbols, view, *object, *offset)
             else {
                 *use_info.unkeyed_writes.entry("stack_slots").or_default() += 1;
                 continue;
@@ -3637,7 +3911,8 @@ fn record_prepared_call_result_facts(symbols: &std::cell::RefCell<crate::symbol:
     }
 }
 
-fn normalize_prepared_inline_expr(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
+fn normalize_prepared_inline_expr(
+    symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
     expr: CExpr,
     view: &PreparedSemanticView,
     env: &PassEnv<'_>,
@@ -3652,7 +3927,8 @@ fn normalize_prepared_inline_expr(symbols: &std::cell::RefCell<crate::symbol::Sy
         // SymbolId already is the exact rendered identity. No presentation
         // spelling is reversed to discover another value.
         CExpr::Var(name) => CExpr::Var(name),
-        CExpr::Paren(inner) => CExpr::Paren(Box::new(normalize_prepared_inline_expr(symbols, 
+        CExpr::Paren(inner) => CExpr::Paren(Box::new(normalize_prepared_inline_expr(
+            symbols,
             *inner,
             view,
             env,
@@ -3663,14 +3939,16 @@ fn normalize_prepared_inline_expr(symbols: &std::cell::RefCell<crate::symbol::Sy
             ty,
             normalize_prepared_inline_expr(symbols, *expr, view, env, depth + 1, visited),
         ),
-        CExpr::AddrOf(inner) => CExpr::AddrOf(Box::new(normalize_prepared_inline_expr(symbols, 
+        CExpr::AddrOf(inner) => CExpr::AddrOf(Box::new(normalize_prepared_inline_expr(
+            symbols,
             *inner,
             view,
             env,
             depth + 1,
             visited,
         ))),
-        CExpr::Deref(inner) => CExpr::Deref(Box::new(normalize_prepared_inline_expr(symbols, 
+        CExpr::Deref(inner) => CExpr::Deref(Box::new(normalize_prepared_inline_expr(
+            symbols,
             *inner,
             view,
             env,
@@ -3687,14 +3965,16 @@ fn normalize_prepared_inline_expr(symbols: &std::cell::RefCell<crate::symbol::Sy
             normalize_prepared_inline_expr(symbols, *right, view, env, depth + 1, visited),
         ),
         CExpr::Subscript { base, index } => CExpr::Subscript {
-            base: Box::new(normalize_prepared_inline_expr(symbols, 
+            base: Box::new(normalize_prepared_inline_expr(
+                symbols,
                 *base,
                 view,
                 env,
                 depth + 1,
                 visited,
             )),
-            index: Box::new(normalize_prepared_inline_expr(symbols, 
+            index: Box::new(normalize_prepared_inline_expr(
+                symbols,
                 *index,
                 view,
                 env,
@@ -3703,7 +3983,8 @@ fn normalize_prepared_inline_expr(symbols: &std::cell::RefCell<crate::symbol::Sy
             )),
         },
         CExpr::Member { base, member } => CExpr::Member {
-            base: Box::new(normalize_prepared_inline_expr(symbols, 
+            base: Box::new(normalize_prepared_inline_expr(
+                symbols,
                 *base,
                 view,
                 env,
@@ -3713,7 +3994,8 @@ fn normalize_prepared_inline_expr(symbols: &std::cell::RefCell<crate::symbol::Sy
             member,
         },
         CExpr::PtrMember { base, member } => CExpr::PtrMember {
-            base: Box::new(normalize_prepared_inline_expr(symbols, 
+            base: Box::new(normalize_prepared_inline_expr(
+                symbols,
                 *base,
                 view,
                 env,
@@ -3724,7 +4006,8 @@ fn normalize_prepared_inline_expr(symbols: &std::cell::RefCell<crate::symbol::Sy
         },
         CExpr::Call { func, args, site } => CExpr::Call {
             site,
-            func: Box::new(normalize_prepared_inline_expr(symbols, 
+            func: Box::new(normalize_prepared_inline_expr(
+                symbols,
                 *func,
                 view,
                 env,
@@ -3733,7 +4016,9 @@ fn normalize_prepared_inline_expr(symbols: &std::cell::RefCell<crate::symbol::Sy
             )),
             args: args
                 .into_iter()
-                .map(|arg| normalize_prepared_inline_expr(symbols, arg, view, env, depth + 1, visited))
+                .map(|arg| {
+                    normalize_prepared_inline_expr(symbols, arg, view, env, depth + 1, visited)
+                })
                 .collect(),
         },
         CExpr::Ternary {
@@ -3741,21 +4026,24 @@ fn normalize_prepared_inline_expr(symbols: &std::cell::RefCell<crate::symbol::Sy
             then_expr,
             else_expr,
         } => CExpr::Ternary {
-            cond: Box::new(normalize_prepared_inline_expr(symbols, 
+            cond: Box::new(normalize_prepared_inline_expr(
+                symbols,
                 *cond,
                 view,
                 env,
                 depth + 1,
                 visited,
             )),
-            then_expr: Box::new(normalize_prepared_inline_expr(symbols, 
+            then_expr: Box::new(normalize_prepared_inline_expr(
+                symbols,
                 *then_expr,
                 view,
                 env,
                 depth + 1,
                 visited,
             )),
-            else_expr: Box::new(normalize_prepared_inline_expr(symbols, 
+            else_expr: Box::new(normalize_prepared_inline_expr(
+                symbols,
                 *else_expr,
                 view,
                 env,
@@ -3766,7 +4054,9 @@ fn normalize_prepared_inline_expr(symbols: &std::cell::RefCell<crate::symbol::Sy
         CExpr::Comma(items) => CExpr::Comma(
             items
                 .into_iter()
-                .map(|item| normalize_prepared_inline_expr(symbols, item, view, env, depth + 1, visited))
+                .map(|item| {
+                    normalize_prepared_inline_expr(symbols, item, view, env, depth + 1, visited)
+                })
                 .collect(),
         ),
         other => other,
@@ -4241,14 +4531,17 @@ mod tests {
         let function_facts =
             FunctionFacts::default().with_callee_resolution(callee_resolution.clone());
 
-        let view = PreparedSemanticView::build(&symbols, PreparedSemanticViewInputs {
-            prepared: &prepared,
-            stack_slots: &stack_slots,
-            visible_bindings: &visible_bindings,
-            param_register_aliases: &param_register_aliases,
-            function_facts: &function_facts,
-            certified_rendering_required: false,
-        });
+        let view = PreparedSemanticView::build(
+            &symbols,
+            PreparedSemanticViewInputs {
+                prepared: &prepared,
+                stack_slots: &stack_slots,
+                visible_bindings: &visible_bindings,
+                param_register_aliases: &param_register_aliases,
+                function_facts: &function_facts,
+                certified_rendering_required: false,
+            },
+        );
 
         let call_view = view
             .call_view_for_site((0x1000, 0))
@@ -4299,14 +4592,17 @@ mod tests {
             .with_callee_resolution(callee_resolution.clone())
             .with_callsites(callsite_facts.clone());
 
-        let view = PreparedSemanticView::build(&symbols, PreparedSemanticViewInputs {
-            prepared: &prepared,
-            stack_slots: &stack_slots,
-            visible_bindings: &visible_bindings,
-            param_register_aliases: &param_register_aliases,
-            function_facts: &function_facts,
-            certified_rendering_required: false,
-        });
+        let view = PreparedSemanticView::build(
+            &symbols,
+            PreparedSemanticViewInputs {
+                prepared: &prepared,
+                stack_slots: &stack_slots,
+                visible_bindings: &visible_bindings,
+                param_register_aliases: &param_register_aliases,
+                function_facts: &function_facts,
+                certified_rendering_required: false,
+            },
+        );
 
         let call_view = view
             .call_view_for_site((0x1000, 0))
@@ -4354,14 +4650,17 @@ mod tests {
         let function_facts =
             FunctionFacts::default().with_callee_resolution(callee_resolution.clone());
 
-        let view = PreparedSemanticView::build(&symbols, PreparedSemanticViewInputs {
-            prepared: &prepared,
-            stack_slots: &stack_slots,
-            visible_bindings: &visible_bindings,
-            param_register_aliases: &param_register_aliases,
-            function_facts: &function_facts,
-            certified_rendering_required: false,
-        });
+        let view = PreparedSemanticView::build(
+            &symbols,
+            PreparedSemanticViewInputs {
+                prepared: &prepared,
+                stack_slots: &stack_slots,
+                visible_bindings: &visible_bindings,
+                param_register_aliases: &param_register_aliases,
+                function_facts: &function_facts,
+                certified_rendering_required: false,
+            },
+        );
 
         let call_view = view
             .call_view_for_site((0x1000, 0))
@@ -4384,14 +4683,17 @@ mod tests {
         let visible_bindings = Vec::new();
         let param_register_aliases = HashMap::new();
 
-        let view = PreparedSemanticView::build(&symbols, PreparedSemanticViewInputs {
-            prepared: &prepared,
-            stack_slots: &stack_slots,
-            visible_bindings: &visible_bindings,
-            param_register_aliases: &param_register_aliases,
-            function_facts: leak_function_facts(FunctionFacts::default()),
-            certified_rendering_required: false,
-        });
+        let view = PreparedSemanticView::build(
+            &symbols,
+            PreparedSemanticViewInputs {
+                prepared: &prepared,
+                stack_slots: &stack_slots,
+                visible_bindings: &visible_bindings,
+                param_register_aliases: &param_register_aliases,
+                function_facts: leak_function_facts(FunctionFacts::default()),
+                certified_rendering_required: false,
+            },
+        );
 
         let call_view = view
             .call_view_for_site((0x1000, 0))
@@ -4419,14 +4721,17 @@ mod tests {
         let visible_bindings = Vec::new();
         let param_register_aliases = HashMap::new();
 
-        let view = PreparedSemanticView::build(&symbols, PreparedSemanticViewInputs {
-            prepared: &prepared,
-            stack_slots: &stack_slots,
-            visible_bindings: &visible_bindings,
-            param_register_aliases: &param_register_aliases,
-            function_facts: leak_function_facts(FunctionFacts::default()),
-            certified_rendering_required: false,
-        });
+        let view = PreparedSemanticView::build(
+            &symbols,
+            PreparedSemanticViewInputs {
+                prepared: &prepared,
+                stack_slots: &stack_slots,
+                visible_bindings: &visible_bindings,
+                param_register_aliases: &param_register_aliases,
+                function_facts: leak_function_facts(FunctionFacts::default()),
+                certified_rendering_required: false,
+            },
+        );
 
         let call_view = view
             .call_view_for_site((0x1500, 0))
@@ -4485,14 +4790,17 @@ mod tests {
             .with_callee_resolution(callee_resolution.clone())
             .with_callsites(callsite_facts.clone());
 
-        let view = PreparedSemanticView::build(&symbols, PreparedSemanticViewInputs {
-            prepared: &prepared,
-            stack_slots: &stack_slots,
-            visible_bindings: &visible_bindings,
-            param_register_aliases: &param_register_aliases,
-            function_facts: &function_facts,
-            certified_rendering_required: false,
-        });
+        let view = PreparedSemanticView::build(
+            &symbols,
+            PreparedSemanticViewInputs {
+                prepared: &prepared,
+                stack_slots: &stack_slots,
+                visible_bindings: &visible_bindings,
+                param_register_aliases: &param_register_aliases,
+                function_facts: &function_facts,
+                certified_rendering_required: false,
+            },
+        );
 
         let call_view = view
             .call_view_for_site((0x1000, 2))
@@ -4521,14 +4829,17 @@ mod tests {
         let visible_bindings = Vec::new();
         let param_register_aliases = HashMap::new();
 
-        let view = PreparedSemanticView::build(&symbols, PreparedSemanticViewInputs {
-            prepared: &prepared,
-            stack_slots: &stack_slots,
-            visible_bindings: &visible_bindings,
-            param_register_aliases: &param_register_aliases,
-            function_facts: leak_function_facts(FunctionFacts::default()),
-            certified_rendering_required: false,
-        });
+        let view = PreparedSemanticView::build(
+            &symbols,
+            PreparedSemanticViewInputs {
+                prepared: &prepared,
+                stack_slots: &stack_slots,
+                visible_bindings: &visible_bindings,
+                param_register_aliases: &param_register_aliases,
+                function_facts: leak_function_facts(FunctionFacts::default()),
+                certified_rendering_required: false,
+            },
+        );
 
         let call_view = view
             .call_view_for_site((0x1000, 2))
@@ -4559,14 +4870,17 @@ mod tests {
         let param_register_aliases = HashMap::new();
         let function_facts = FunctionFacts::default().with_callsites(callsite_facts.clone());
 
-        let view = PreparedSemanticView::build(&symbols, PreparedSemanticViewInputs {
-            prepared: &prepared,
-            stack_slots: &stack_slots,
-            visible_bindings: &visible_bindings,
-            param_register_aliases: &param_register_aliases,
-            function_facts: &function_facts,
-            certified_rendering_required: false,
-        });
+        let view = PreparedSemanticView::build(
+            &symbols,
+            PreparedSemanticViewInputs {
+                prepared: &prepared,
+                stack_slots: &stack_slots,
+                visible_bindings: &visible_bindings,
+                param_register_aliases: &param_register_aliases,
+                function_facts: &function_facts,
+                certified_rendering_required: false,
+            },
+        );
 
         let call_view = view
             .call_view_for_site((0x1000, 2))
@@ -4588,14 +4902,17 @@ mod tests {
         let param_register_aliases = HashMap::new();
         let function_facts = FunctionFacts::default().with_callsites(callsite_facts.clone());
 
-        let view = PreparedSemanticView::build(&symbols, PreparedSemanticViewInputs {
-            prepared: &prepared,
-            stack_slots: &stack_slots,
-            visible_bindings: &visible_bindings,
-            param_register_aliases: &param_register_aliases,
-            function_facts: &function_facts,
-            certified_rendering_required: false,
-        });
+        let view = PreparedSemanticView::build(
+            &symbols,
+            PreparedSemanticViewInputs {
+                prepared: &prepared,
+                stack_slots: &stack_slots,
+                visible_bindings: &visible_bindings,
+                param_register_aliases: &param_register_aliases,
+                function_facts: &function_facts,
+                certified_rendering_required: false,
+            },
+        );
 
         let call_view = view
             .call_view_for_site((0x1000, 2))
@@ -4624,14 +4941,17 @@ mod tests {
         let visible_bindings = Vec::new();
         let param_register_aliases = HashMap::new();
 
-        let view = PreparedSemanticView::build(&symbols, PreparedSemanticViewInputs {
-            prepared: &prepared,
-            stack_slots: &stack_slots,
-            visible_bindings: &visible_bindings,
-            param_register_aliases: &param_register_aliases,
-            function_facts: leak_function_facts(FunctionFacts::default()),
-            certified_rendering_required: false,
-        });
+        let view = PreparedSemanticView::build(
+            &symbols,
+            PreparedSemanticViewInputs {
+                prepared: &prepared,
+                stack_slots: &stack_slots,
+                visible_bindings: &visible_bindings,
+                param_register_aliases: &param_register_aliases,
+                function_facts: leak_function_facts(FunctionFacts::default()),
+                certified_rendering_required: false,
+            },
+        );
 
         let call_view = view
             .call_view_for_site((0x1780, 1))
@@ -4730,45 +5050,54 @@ mod tests {
     fn self_render_definition_uses_typed_temporary_render_name() {
         let symbols = test_table();
         let dst = test_var("tmp:11f80", 2, 8);
-        assert!(is_self_render_definition(&symbols, 
+        assert!(is_self_render_definition(
+            &symbols,
             &dst,
             &crate::symbol::var_ref(&symbols, "t11f80_2")
         ));
-        assert!(is_self_render_definition(&symbols, 
+        assert!(is_self_render_definition(
+            &symbols,
             &dst,
             &CExpr::Var(crate::symbol::declare(&symbols, &dst.display_name()))
         ));
-        assert!(!is_self_render_definition(&symbols, 
+        assert!(!is_self_render_definition(
+            &symbols,
             &dst,
             &crate::symbol::var_ref(&symbols, "t11f80_3")
         ));
 
         let version_zero_temp = test_var("tmp:11f80", 0, 8);
-        assert!(is_self_render_definition(&symbols, 
+        assert!(is_self_render_definition(
+            &symbols,
             &version_zero_temp,
             &crate::symbol::var_ref(&symbols, "t11f80")
         ));
-        assert!(!is_self_render_definition(&symbols, 
+        assert!(!is_self_render_definition(
+            &symbols,
             &version_zero_temp,
             &crate::symbol::var_ref(&symbols, "t11f80_0")
         ));
 
         let versioned_reg = test_var("rax", 2, 8);
-        assert!(is_self_render_definition(&symbols, 
+        assert!(is_self_render_definition(
+            &symbols,
             &versioned_reg,
             &crate::symbol::var_ref(&symbols, "rax_2")
         ));
-        assert!(!is_self_render_definition(&symbols, 
+        assert!(!is_self_render_definition(
+            &symbols,
             &versioned_reg,
             &crate::symbol::var_ref(&symbols, "rax")
         ));
 
         let version_zero_reg = test_var("rbx", 0, 8);
-        assert!(is_self_render_definition(&symbols, 
+        assert!(is_self_render_definition(
+            &symbols,
             &version_zero_reg,
             &crate::symbol::var_ref(&symbols, "rbx")
         ));
-        assert!(!is_self_render_definition(&symbols, 
+        assert!(!is_self_render_definition(
+            &symbols,
             &version_zero_reg,
             &crate::symbol::var_ref(&symbols, "rbx_0")
         ));
