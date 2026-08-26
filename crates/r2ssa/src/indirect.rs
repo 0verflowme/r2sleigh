@@ -734,8 +734,12 @@ mod tests {
         (cfg, domtree)
     }
 
-    fn var(name: &str) -> SSAVar {
-        SSAVar::new(name, 1, 8)
+    fn input(name: &str, size: u32) -> SSAVar {
+        SSAVar::new(name, 0, size)
+    }
+
+    fn temp(name: &str, size: u32) -> SSAVar {
+        SSAVar::new(name, 1, size)
     }
 
     /// A guarded dispatch: `if (i >= 5) return; call table[i]`.
@@ -743,11 +747,11 @@ mod tests {
     /// Block 0 tests the bound and branches away on failure, so arriving at
     /// block 0x20 proves `i < 5`; the unsigned test proves `i >= 0`.
     fn guarded_dispatch(bound: u64, entries: usize) -> (Vec<SSABlock>, Vec<Table>) {
-        let index = var("index");
-        let cond = var("cond");
-        let scaled = var("scaled");
-        let addr = var("addr");
-        let callee = var("callee");
+        let index = input("index", 8);
+        let cond = temp("cond", 1);
+        let scaled = temp("scaled", 8);
+        let addr = temp("addr", 8);
+        let callee = temp("callee", 8);
         let blocks = vec![
             SSABlock {
                 addr: 0,
@@ -769,7 +773,9 @@ mod tests {
                 addr: 0x10,
                 phis: Vec::new(),
                 size: 0x10,
-                ops: vec![SSAOp::Return { target: var("ret") }],
+                ops: vec![SSAOp::Return {
+                    target: SSAVar::constant(0, 8),
+                }],
             },
             SSABlock {
                 addr: 0x20,
@@ -843,17 +849,17 @@ mod tests {
     /// is built by `adrp`+`add`, and the transfer is a tail-call branch. None
     /// of it is a literal operand, and all of it is exact.
     fn hardware_dispatch(entries: usize) -> (Vec<SSABlock>, Vec<Table>) {
-        let index = var("w0");
-        let flag = var("cy");
-        let zero = var("zr");
-        let negated = var("tmp:b00");
-        let lower_or_same = var("tmp:1000");
-        let page = var("x8_page");
-        let base = var("x8");
-        let widened = var("x9");
-        let scaled = var("tmp:7100");
-        let addr = var("tmp:7580");
-        let callee = var("x3");
+        let index = input("w0", 4);
+        let flag = temp("cy", 1);
+        let zero = temp("zr", 1);
+        let negated = temp("tmp:b00", 1);
+        let lower_or_same = temp("tmp:1000", 1);
+        let page = temp("x8_page", 8);
+        let base = temp("x8", 8);
+        let widened = temp("x9", 8);
+        let scaled = temp("tmp:7100", 8);
+        let addr = temp("tmp:7580", 8);
+        let callee = temp("x3", 8);
         let blocks = vec![
             SSABlock {
                 addr: 0,
@@ -892,7 +898,9 @@ mod tests {
                 addr: 0x10,
                 phis: Vec::new(),
                 size: 0x10,
-                ops: vec![SSAOp::Return { target: var("ret") }],
+                ops: vec![SSAOp::Return {
+                    target: SSAVar::constant(0, 8),
+                }],
             },
             SSABlock {
                 addr: 0x20,
@@ -968,10 +976,10 @@ mod tests {
 
     #[test]
     fn an_unguarded_index_resolves_to_nothing() {
-        let index = var("index");
-        let scaled = var("scaled");
-        let addr = var("addr");
-        let callee = var("callee");
+        let index = input("index", 8);
+        let scaled = temp("scaled", 8);
+        let addr = temp("addr", 8);
+        let callee = temp("callee", 8);
         let blocks = vec![SSABlock {
             addr: 0,
             phis: Vec::new(),
@@ -1008,13 +1016,13 @@ mod tests {
 
     #[test]
     fn colliding_display_spelling_cannot_transfer_a_bound_between_values() {
-        let narrow_index = SSAVar::new("index", 1, 4);
-        let wide_index = SSAVar::new("index", 1, 8);
+        let narrow_index = input("index", 4);
+        let wide_index = input("index", 8);
         assert_eq!(narrow_index.display_name(), wide_index.display_name());
-        let condition = var("condition");
-        let scaled = var("scaled");
-        let address = var("address");
-        let callee = var("callee");
+        let condition = temp("condition", 1);
+        let scaled = temp("scaled", 8);
+        let address = temp("address", 8);
+        let callee = temp("callee", 8);
         let blocks = vec![
             SSABlock {
                 addr: 0,
@@ -1036,7 +1044,9 @@ mod tests {
                 addr: 0x10,
                 phis: Vec::new(),
                 size: 0x10,
-                ops: vec![SSAOp::Return { target: var("ret") }],
+                ops: vec![SSAOp::Return {
+                    target: SSAVar::constant(0, 8),
+                }],
             },
             SSABlock {
                 addr: 0x20,
