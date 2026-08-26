@@ -12,7 +12,7 @@
 //! 3. **Region Identification** (`region`): Identify control flow regions
 //! 4. **Control Flow Structuring** (`structure`): Convert CFG to structured code
 //! 5. **Type Facts** (`r2types`): Consume inferred type/layout facts
-//! 6. **Variable Recovery** (`variable`): Recover variable names and types
+//! 6. **Binding Planning** (`binding_plan`): Project exact SSA identities into C bindings
 //! 7. **Code Generation** (`codegen`): Generate readable C source code
 //!
 //! ## Usage
@@ -54,7 +54,7 @@ pub mod structure;
 mod structured_region;
 pub mod symbol;
 pub(crate) mod unrendered;
-pub mod variable;
+mod variable;
 
 pub use ast::{BinaryOp, CExpr, CFunction, CStmt, CType, UnaryOp};
 pub use codegen::CodeGenConfig;
@@ -63,8 +63,6 @@ pub use fold::lower_ssa_ops_to_stmts;
 pub use highlight::highlight_c_ansi;
 pub use region::{Region, RegionAnalyzer};
 pub(crate) use structure::ControlFlowStructurer;
-pub use variable::VariableRecovery;
-
 use crate::codegen::{CodeGenerator, EmissionReadyFunction, prepare_function_for_emission};
 use crate::fold::FoldingContext;
 use crate::fold::context::{FoldArchConfig, FoldInputs};

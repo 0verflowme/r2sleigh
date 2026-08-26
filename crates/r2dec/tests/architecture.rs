@@ -77,7 +77,7 @@ fn production_has_no_legacy_name_identity_or_repair_answerers() {
         for (line_idx, line) in production_lines(&text) {
             let trimmed = line.trim();
             for (token, reason) in forbidden {
-                if matches!(rel.as_str(), "symbol.rs" | "variable.rs")
+                if rel == "symbol.rs"
                     && matches!(
                         token,
                         "symbol::var_ref(" | "symbol::declare(" | "declare_or_reuse("
