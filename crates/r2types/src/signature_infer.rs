@@ -1586,6 +1586,7 @@ mod tests {
         let mut arch = r2il::ArchSpec::new("x86-64");
         arch.add_register(r2il::RegisterDef::new("RAX", 0, 8));
         arch.add_register(r2il::RegisterDef::new("RIP", 8, 8));
+        arch.add_register(r2il::RegisterDef::new("RSP", 16, 8));
         arch
     }
 
@@ -1794,7 +1795,42 @@ mod tests {
         block.push(r2il::R2ILOp::Return {
             target: r2il::Varnode::register(8, 8),
         });
-        let prepared = SsaArtifact::for_patterns(&[block], Some(&arch)).expect("prepared SSA");
+        let return_storage = r2ssa::CanonicalStorageId {
+            space: r2ssa::CanonicalStorageSpace::Register,
+            offset: 0,
+            size: 8,
+        };
+        let interface = r2ssa::SourceFunctionInterface::new_exact(
+            b"certified-signature-return-fixture".to_vec(),
+            "sysv64",
+            [],
+            r2ssa::SourceFunctionReturn::Register {
+                storage: return_storage,
+            },
+            [],
+        )
+        .and_then(|interface| {
+            interface.with_return_address_storage(r2ssa::CanonicalStorageId {
+                space: r2ssa::CanonicalStorageSpace::Register,
+                offset: 8,
+                size: 8,
+            })
+        })
+        .and_then(|interface| {
+            interface.with_stack_pointer_storage(r2ssa::CanonicalStorageId {
+                space: r2ssa::CanonicalStorageSpace::Register,
+                offset: 16,
+                size: 8,
+            })
+        })
+        .expect("exact function return interface");
+        let prepared = SsaArtifact::for_decompile_with_interface(&[block], Some(&arch), interface)
+            .expect("prepared exact return SSA");
+        assert_eq!(
+            prepared.certificates().returns.len(),
+            1,
+            "source-owned return fixture must certify one value"
+        );
         let inferred = infer_signature_from_prepared_ssa(&prepared);
 
         assert_eq!(inferred.ret_type, "uint32_t");

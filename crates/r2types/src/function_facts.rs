@@ -5406,8 +5406,36 @@ mod tests {
             addr: Varnode::unique(0x100, 8),
             val: Varnode::register(0x00, 8),
         });
-        let prepared = r2ssa::SsaArtifact::for_decompile(&[block], Some(&x86_stack_home_arch()))
-            .expect("prepared");
+        let result_storage = r2ssa::CanonicalStorageId {
+            space: r2ssa::CanonicalStorageSpace::Register,
+            offset: 0,
+            size: 8,
+        };
+        let target_storage = r2ssa::CanonicalStorageId {
+            space: r2ssa::CanonicalStorageSpace::Constant,
+            offset: 0x402000,
+            size: 8,
+        };
+        let call_interface = r2ssa::SourceCallSiteInterface::new(
+            b"certified-call-result-fixture".to_vec(),
+            r2ssa::SourceCallSiteIdentity::new(0x401000, 0, target_storage),
+            true,
+            "sysv64",
+            [],
+            false,
+            false,
+            r2ssa::SourceCallResult::Register {
+                storage: result_storage,
+            },
+        )
+        .expect("exact call-result interface");
+        let prepared = r2ssa::SsaArtifact::for_decompile_with_interfaces(
+            &[block],
+            Some(&x86_stack_home_arch()),
+            None,
+            vec![call_interface],
+        )
+        .expect("prepared exact call-result fixture");
         let mut facts = FunctionFacts::default();
         facts.attach_prepared_decompile_evidence(&prepared);
 
@@ -5834,7 +5862,9 @@ mod tests {
             b"x86-stack-home-fixture".to_vec(),
             "sysv64",
             [r2ssa::SourceAbiParameterSpec::new(0, parameter)],
-            r2ssa::SourceFunctionReturn::Void,
+            r2ssa::SourceFunctionReturn::Register {
+                storage: register_storage(0x00),
+            },
             [r2ssa::SourceStackSlotSpec::new_parameter_home(
                 r2ssa::StackAddressBase::FramePointer,
                 frame_pointer,
@@ -5879,12 +5909,12 @@ mod tests {
             addr: Varnode::unique(0x100, 8),
         });
         block.push(R2ILOp::IntAdd {
-            dst: Varnode::unique(0x108, 8),
+            dst: Varnode::register(0x00, 8),
             a: Varnode::register(0x00, 8),
             b: Varnode::register(0x00, 8),
         });
         block.push(R2ILOp::Return {
-            target: Varnode::unique(0x108, 8),
+            target: Varnode::register(0x30, 8),
         });
         let prepared = x86_stack_home_prepared(&[block]);
         let signature = FunctionSignatureSpec {
