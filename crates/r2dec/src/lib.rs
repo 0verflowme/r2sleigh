@@ -6846,6 +6846,226 @@ mod tests {
     }
 
     #[test]
+    fn shuffled_block_schedule_keeps_spans_bindings_placement_and_bytes_identical() {
+        fn exact_diamond_input(
+            blocks: &[R2ILBlock],
+        ) -> (r2ssa::span::StorageSpans, DecompilerInput) {
+            let arch = test_arch_for_decompile();
+            let storage = |offset| r2ssa::CanonicalStorageId {
+                space: r2ssa::CanonicalStorageSpace::Register,
+                offset,
+                size: 8,
+            };
+            let logical_u64 = r2ssa::SourceLogicalValue::new(
+                0,
+                r2ssa::SourceCarrierProjection::new(r2ssa::SourceCarrierKind::Full, 0, 64),
+            );
+            let type_graph = r2ssa::SourceTypeGraph::new(
+                [r2ssa::SourceType::new(
+                    0,
+                    r2ssa::SourceTypeKind::UnsignedInteger,
+                    64,
+                    64,
+                )],
+                [],
+            )
+            .expect("exact diamond type graph");
+            let interface = r2ssa::SourceFunctionInterface::new_exact_with_logical_types(
+                b"r2dec-shuffled-diamond".to_vec(),
+                "sysv64",
+                [r2ssa::SourceAbiParameterSpec::new(0, storage(0x10))],
+                r2ssa::SourceFunctionReturn::Register {
+                    storage: storage(0),
+                },
+                [],
+                [logical_u64],
+                Some(logical_u64),
+                Some(type_graph),
+            )
+            .and_then(|interface| interface.with_return_address_storage(storage(0x30)))
+            .and_then(|interface| interface.with_stack_pointer_storage(storage(0x28)))
+            .expect("exact diamond interface");
+            let prepared = Arc::new(
+                r2ssa::SsaArtifact::for_decompile_with_interface(blocks, Some(&arch), interface)
+                    .expect("prepared shuffled diamond")
+                    .with_name("stable_diamond"),
+            );
+            let spans = prepared.storage_spans().clone();
+            let signature = signature_spec(
+                Some(CType::UInt(64)),
+                vec![("condition", Some(CType::UInt(64)))],
+            );
+            let parsed_context = r2types::ParsedExternalContext {
+                current_signature: Some(signature.clone()),
+                merged_signature: Some(signature),
+                ..r2types::ParsedExternalContext::default()
+            };
+            let request = r2types::TypeWritebackAnalysisRequest::new(prepared, parsed_context)
+                .expect("source-owned shuffled diamond request");
+            let source_owned_facts = r2types::build_source_owned_type_writeback_analysis(request)
+                .expect("source-owned shuffled diamond analysis")
+                .finalize_for_decompile(r2types::DecompileFinalization {
+                    kind: r2types::DecompileRouteKind::Standard,
+                    reason: "shuffled determinism proof".to_string(),
+                    fallback_comment: None,
+                })
+                .expect("source-owned shuffled diamond finalization");
+            let input = DecompilerInput::new(source_owned_facts);
+            (spans, input)
+        }
+
+        fn binding_signature(input: &DecompilerInput) -> (Vec<String>, Vec<String>) {
+            let plan = crate::binding_plan::BindingPlan::build_shadow(input.source_owned_facts())
+                .expect("sealed deterministic plan");
+            let bindings = plan
+                .bindings()
+                .map(|(id, binding)| {
+                    format!(
+                        "{}:{:?}:{:?}:{:?}",
+                        id.index(),
+                        binding.declaration_type(),
+                        binding.presentation_name_hint(),
+                        plan.binding_role(id)
+                    )
+                })
+                .collect();
+            let dispositions = (0..input.prepared_ssa().graph().values.len())
+                .map(|index| {
+                    let value = r2ssa::ValueId(index as u32);
+                    match plan
+                        .disposition(value)
+                        .expect("one disposition per dense value")
+                    {
+                        crate::binding_plan::ValueDisposition::Bound { binding } => {
+                            format!("bound:{}", binding.index())
+                        }
+                        crate::binding_plan::ValueDisposition::Inline { expr, .. } => {
+                            format!("inline:{}", expr.index())
+                        }
+                        crate::binding_plan::ValueDisposition::Elided { reason, .. } => {
+                            format!("elided:{reason:?}")
+                        }
+                        crate::binding_plan::ValueDisposition::Refused { reason } => {
+                            format!("refused:{reason:?}")
+                        }
+                    }
+                })
+                .collect();
+            (bindings, dispositions)
+        }
+
+        let mut entry = R2ILBlock::new(0x1000, 0x10);
+        entry.push(R2ILOp::CBranch {
+            target: Varnode::constant(0x1020, 8),
+            cond: Varnode::register(0x10, 8),
+        });
+        let mut false_arm = R2ILBlock::new(0x1010, 0x10);
+        false_arm.push(R2ILOp::Copy {
+            dst: Varnode::register(0, 8),
+            src: Varnode::constant(1, 8),
+        });
+        false_arm.push(R2ILOp::Branch {
+            target: Varnode::constant(0x1030, 8),
+        });
+        let mut true_arm = R2ILBlock::new(0x1020, 0x10);
+        true_arm.push(R2ILOp::Copy {
+            dst: Varnode::register(0, 8),
+            src: Varnode::constant(2, 8),
+        });
+        true_arm.push(R2ILOp::Branch {
+            target: Varnode::constant(0x1030, 8),
+        });
+        let mut merge = R2ILBlock::new(0x1030, 4);
+        merge.push(R2ILOp::Return {
+            target: Varnode::register(0x30, 8),
+        });
+
+        let peers = [false_arm, true_arm, merge];
+        let baseline_blocks = vec![
+            entry.clone(),
+            peers[0].clone(),
+            peers[1].clone(),
+            peers[2].clone(),
+        ];
+        let (baseline_spans, baseline_input) = exact_diamond_input(&baseline_blocks);
+        let decompiler = Decompiler::new(DecompilerConfig::x86_64());
+        let baseline = decompiler.decompile_input_with_binding_audit(&baseline_input);
+        let baseline_binding_signature = binding_signature(&baseline_input);
+        let baseline_values = baseline_input
+            .prepared_ssa()
+            .graph()
+            .values
+            .iter()
+            .map(|value| {
+                format!(
+                    "{:?}:{}:{:?}",
+                    value.id,
+                    value.var.display_name(),
+                    value.canonical_storage
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            baseline.placement_audit(),
+            PlacementAudit::Applied,
+            "baseline must reach placement: output={} refusal={:?} binding={:?} effects={:?} signature={baseline_binding_signature:?} values={baseline_values:?} type_facts={:?}",
+            baseline.output(),
+            baseline.render_refusal(),
+            baseline.binding_shadow(),
+            baseline.effect_obligations(),
+            baseline_input.function_facts().type_facts(),
+        );
+
+        // Exhaust the complete schedule domain of the non-entry blocks. Entry
+        // identity is semantic input; node/edge insertion order is not.
+        for schedule in [
+            [0, 1, 2],
+            [0, 2, 1],
+            [1, 0, 2],
+            [1, 2, 0],
+            [2, 0, 1],
+            [2, 1, 0],
+        ] {
+            let mut shuffled_blocks = vec![entry.clone()];
+            shuffled_blocks.extend(schedule.map(|index| peers[index].clone()));
+            let (shuffled_spans, shuffled_input) = exact_diamond_input(&shuffled_blocks);
+            let shuffled = decompiler.decompile_input_with_binding_audit(&shuffled_input);
+
+            assert_eq!(baseline_spans, shuffled_spans, "schedule={schedule:?}");
+            assert_eq!(
+                baseline_binding_signature,
+                binding_signature(&shuffled_input),
+                "schedule={schedule:?}"
+            );
+            assert_eq!(
+                baseline.placement_audit(),
+                shuffled.placement_audit(),
+                "schedule={schedule:?}"
+            );
+            assert_eq!(
+                baseline.binding_shadow(),
+                shuffled.binding_shadow(),
+                "schedule={schedule:?}"
+            );
+            assert_eq!(
+                baseline.effect_obligations(),
+                shuffled.effect_obligations(),
+                "schedule={schedule:?}"
+            );
+            assert_eq!(
+                baseline.render_refusal(),
+                shuffled.render_refusal(),
+                "schedule={schedule:?}"
+            );
+            assert_eq!(
+                baseline.output().as_bytes(),
+                shuffled.output().as_bytes(),
+                "schedule={schedule:?}"
+            );
+        }
+    }
+
+    #[test]
     fn binding_shadow_adds_no_post_render_work_control_decision() {
         struct CountingControl {
             polls: std::cell::Cell<usize>,
