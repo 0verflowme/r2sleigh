@@ -121,7 +121,7 @@ pub use machine_context::{
     MachineArchitectureFamily, MachineMemoryEndianness, MachineMemoryModel, MachineMemorySpace,
     MachineRegisterGeometryState,
     SOURCE_CALL_SITE_INTERFACE_SCHEMA_VERSION, SOURCE_FUNCTION_INTERFACE_SCHEMA_VERSION,
-    SOURCE_TYPE_GRAPH_SCHEMA_VERSION, SourceAbiParameterSpec, SourceAggregateLayout,
+    SOURCE_TYPE_GRAPH_SCHEMA_VERSION, SourceAbiClass, SourceAbiParameterSpec, SourceAggregateLayout,
     SourceAggregateMember, SourceCallArgumentSpec, SourceCallResult, SourceCallSiteIdentity,
     SourceCallSiteInterface, SourceCallSiteInterfaceError, SourceCarrierKind,
     SourceCarrierProjection, SourceFunctionInterface, SourceFunctionInterfaceError,

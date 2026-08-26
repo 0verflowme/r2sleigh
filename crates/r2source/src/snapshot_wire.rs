@@ -22,7 +22,8 @@ pub const SNAPSHOT_WIRE_MAGIC: u32 = 0x5232_5357; // "R2SW"
 
 /// Format revision. Owned by this crate, and bumped only when the encoding
 /// changes; it is not radare2's ABI version, which moves for unrelated reasons.
-pub const SNAPSHOT_WIRE_FORMAT_VERSION: u32 = 1;
+pub const SNAPSHOT_WIRE_FORMAT_VERSION: u32 = 2;
+const SNAPSHOT_WIRE_MIN_FORMAT_VERSION: u32 = 1;
 
 /// Bytes of fixed header preceding the string table.
 pub const SNAPSHOT_WIRE_HEADER_BYTES: usize = 24;
@@ -176,6 +177,7 @@ impl SnapshotWireWriter {
 /// yielding a plausible-looking record.
 #[derive(Debug)]
 pub struct SnapshotWireReader<'a> {
+    format_version: u32,
     strings: Vec<&'a str>,
     payload: &'a [u8],
     cursor: usize,
@@ -194,7 +196,7 @@ impl<'a> SnapshotWireReader<'a> {
             return Err(SnapshotWireError::BadMagic(magic));
         }
         let version = word(4);
-        if version != SNAPSHOT_WIRE_FORMAT_VERSION {
+        if !(SNAPSHOT_WIRE_MIN_FORMAT_VERSION..=SNAPSHOT_WIRE_FORMAT_VERSION).contains(&version) {
             return Err(SnapshotWireError::UnsupportedVersion(version));
         }
         let count = word(8) as usize;
@@ -242,10 +244,15 @@ impl<'a> SnapshotWireReader<'a> {
             return Err(SnapshotWireError::SectionOutOfBounds);
         }
         Ok(Self {
+            format_version: version,
             strings,
             payload: &buffer[table_end..payload_end],
             cursor: 0,
         })
+    }
+
+    pub const fn format_version(&self) -> u32 {
+        self.format_version
     }
 
     fn take(&mut self, len: usize) -> Result<&'a [u8], SnapshotWireError> {
@@ -336,11 +343,11 @@ impl<'a> SnapshotWireReader<'a> {
 
 use crate::contracts::{
     CanonicalStorageId, CanonicalStorageSpace, SourceAbiParameterSpec, SourceAggregateLayout,
-    SourceAggregateMember, SourceCallArgumentSpec, SourceCallResult, SourceCarrierKind,
-    SourceCarrierProjection, SourceConventionSlots, SourceFunctionInterface, SourceFunctionReturn,
-    SourceLogicalValue, SourceMachineRoles, SourceReturnMechanism, SourceStackAllocationContract,
-    SourceStackGrowth, SourceStackSlotRole, SourceStackSlotSpec, SourceType, SourceTypeGraph,
-    SourceTypeKind, StackAddressBase,
+    SourceAbiClass, SourceAggregateMember, SourceCallArgumentSpec, SourceCallResult,
+    SourceCarrierKind, SourceCarrierProjection, SourceConventionSlots, SourceFunctionInterface,
+    SourceFunctionReturn, SourceLogicalValue, SourceMachineRoles, SourceReturnMechanism,
+    SourceStackAllocationContract, SourceStackGrowth, SourceStackSlotRole, SourceStackSlotSpec,
+    SourceType, SourceTypeGraph, SourceTypeKind, StackAddressBase,
 };
 use crate::{
     AdvisoryCallPrototype, AdvisoryCallSite, AdvisorySuccessor, AdvisorySuccessorKind,
@@ -352,6 +359,90 @@ use crate::{
 
 const ENDIAN_LITTLE: u8 = 0;
 const ENDIAN_BIG: u8 = 1;
+
+const ABI_UNKNOWN: u8 = 0;
+const ABI_OTHER: u8 = 1;
+const ABI_MICROSOFT: u8 = 2;
+const ABI_MICROSOFT_X64: u8 = 3;
+const ABI_SYSTEM_V: u8 = 4;
+const ABI_SYSTEM_V_AMD64: u8 = 5;
+const ABI_AAPCS: u8 = 6;
+const ABI_AAPCS64: u8 = 7;
+const ABI_RISCV32: u8 = 8;
+const ABI_RISCV64: u8 = 9;
+const ABI_CDECL: u8 = 10;
+const ABI_STDCALL: u8 = 11;
+const ABI_FASTCALL: u8 = 12;
+const ABI_THISCALL: u8 = 13;
+const ABI_VECTORCALL: u8 = 14;
+
+fn write_abi_class(writer: &mut SnapshotWireWriter, abi_class: SourceAbiClass) {
+    writer.u8(match abi_class {
+        SourceAbiClass::Unknown => ABI_UNKNOWN,
+        SourceAbiClass::Other => ABI_OTHER,
+        SourceAbiClass::Microsoft => ABI_MICROSOFT,
+        SourceAbiClass::MicrosoftX64 => ABI_MICROSOFT_X64,
+        SourceAbiClass::SystemV => ABI_SYSTEM_V,
+        SourceAbiClass::SystemVAMD64 => ABI_SYSTEM_V_AMD64,
+        SourceAbiClass::Aapcs => ABI_AAPCS,
+        SourceAbiClass::Aapcs64 => ABI_AAPCS64,
+        SourceAbiClass::RiscV32 => ABI_RISCV32,
+        SourceAbiClass::RiscV64 => ABI_RISCV64,
+        SourceAbiClass::Cdecl => ABI_CDECL,
+        SourceAbiClass::Stdcall => ABI_STDCALL,
+        SourceAbiClass::Fastcall => ABI_FASTCALL,
+        SourceAbiClass::Thiscall => ABI_THISCALL,
+        SourceAbiClass::Vectorcall => ABI_VECTORCALL,
+    });
+}
+
+fn read_abi_class(
+    reader: &mut SnapshotWireReader<'_>,
+) -> Result<SourceAbiClass, SnapshotWireError> {
+    match reader.u8()? {
+        ABI_UNKNOWN => Ok(SourceAbiClass::Unknown),
+        ABI_OTHER => Ok(SourceAbiClass::Other),
+        ABI_MICROSOFT => Ok(SourceAbiClass::Microsoft),
+        ABI_MICROSOFT_X64 => Ok(SourceAbiClass::MicrosoftX64),
+        ABI_SYSTEM_V => Ok(SourceAbiClass::SystemV),
+        ABI_SYSTEM_V_AMD64 => Ok(SourceAbiClass::SystemVAMD64),
+        ABI_AAPCS => Ok(SourceAbiClass::Aapcs),
+        ABI_AAPCS64 => Ok(SourceAbiClass::Aapcs64),
+        ABI_RISCV32 => Ok(SourceAbiClass::RiscV32),
+        ABI_RISCV64 => Ok(SourceAbiClass::RiscV64),
+        ABI_CDECL => Ok(SourceAbiClass::Cdecl),
+        ABI_STDCALL => Ok(SourceAbiClass::Stdcall),
+        ABI_FASTCALL => Ok(SourceAbiClass::Fastcall),
+        ABI_THISCALL => Ok(SourceAbiClass::Thiscall),
+        ABI_VECTORCALL => Ok(SourceAbiClass::Vectorcall),
+        tag => Err(SnapshotWireError::UnknownDiscriminant {
+            record: "source ABI class",
+            tag: u64::from(tag),
+        }),
+    }
+}
+
+fn read_recorded_abi_class(
+    reader: &mut SnapshotWireReader<'_>,
+) -> Result<Option<SourceAbiClass>, SnapshotWireError> {
+    (reader.format_version() >= 2)
+        .then(|| read_abi_class(reader))
+        .transpose()
+}
+
+fn verify_recorded_abi_class(
+    recorded: Option<SourceAbiClass>,
+    classified: SourceAbiClass,
+    contract: &'static str,
+) -> Result<(), SnapshotWireError> {
+    if recorded.is_some_and(|recorded| recorded != classified) {
+        return Err(SnapshotWireError::RejectedContract {
+            contract,
+            reason: "calling-convention spelling and typed ABI class disagree".to_string(),
+        });
+    }
+    Ok(())
+}
 
 pub fn write_machine_profile(
     writer: &mut SnapshotWireWriter,
@@ -713,6 +804,7 @@ pub fn write_convention_slots(
     let count =
         u32::try_from(slots.argument_slots().len()).map_err(|_| SnapshotWireError::ValueTooWide)?;
     writer.string(slots.calling_convention())?;
+    write_abi_class(writer, slots.abi_class());
     writer.u32(count);
     for storage in slots.argument_slots() {
         write_storage(writer, *storage);
@@ -725,6 +817,7 @@ pub fn read_convention_slots(
     reader: &mut SnapshotWireReader<'_>,
 ) -> Result<SourceConventionSlots, SnapshotWireError> {
     let calling_convention = reader.string()?.to_string();
+    let recorded_abi_class = read_recorded_abi_class(reader)?;
     let count = reader.u32()? as usize;
     let mut argument_slots = Vec::with_capacity(count.min(64));
     for _ in 0..count {
@@ -733,12 +826,17 @@ pub fn read_convention_slots(
     let result_slot = read_optional_storage(reader)?;
     // new() revalidates, so a buffer cannot mint candidate slots the in-crate
     // constructor would have rejected.
-    SourceConventionSlots::new(calling_convention, argument_slots, result_slot).map_err(|error| {
-        SnapshotWireError::RejectedContract {
+    let slots = SourceConventionSlots::new(calling_convention, argument_slots, result_slot)
+        .map_err(|error| SnapshotWireError::RejectedContract {
             contract: "SourceConventionSlots::new",
             reason: format!("{error:?}"),
-        }
-    })
+        })?;
+    verify_recorded_abi_class(
+        recorded_abi_class,
+        slots.abi_class(),
+        "SourceConventionSlots ABI class",
+    )?;
+    Ok(slots)
 }
 
 const SUCCESSOR_DIRECT: u8 = 0;
@@ -1434,6 +1532,7 @@ pub fn write_interface(
     });
     writer.bytes(interface.revision_identity())?;
     writer.string(interface.calling_convention())?;
+    write_abi_class(writer, interface.abi_class());
 
     let parameters =
         u32::try_from(interface.parameters().len()).map_err(|_| SnapshotWireError::ValueTooWide)?;
@@ -1502,6 +1601,7 @@ pub fn read_interface(
     let variant = reader.u8()?;
     let revision = reader.bytes()?.to_vec();
     let calling_convention = reader.string()?.to_string();
+    let recorded_abi_class = read_recorded_abi_class(reader)?;
 
     let parameter_count = reader.u32()? as usize;
     let mut parameters = Vec::with_capacity(parameter_count.min(256));
@@ -1594,6 +1694,11 @@ pub fn read_interface(
         contract: "SourceFunctionInterface::new",
         reason: format!("{error:?}"),
     })?;
+    verify_recorded_abi_class(
+        recorded_abi_class,
+        interface.abi_class(),
+        "SourceFunctionInterface ABI class",
+    )?;
 
     interface =
         interface.with_preserved_call_carriers(stack_pointer_preserved, frame_pointer_preserved);
@@ -1961,6 +2066,38 @@ mod tests {
         }
         assert_eq!(reader.string().expect("string"), "rbp");
         reader.finish().expect("consumed exactly");
+    }
+
+    #[test]
+    fn version_one_convention_slots_are_migrated_through_the_source_classifier() {
+        let mut writer = SnapshotWireWriter::new();
+        writer.string("amd64").expect("convention");
+        writer.u32(0);
+        write_optional_storage(&mut writer, None);
+        let mut buffer = writer.finish().expect("finish");
+        buffer[4..8].copy_from_slice(&1u32.to_le_bytes());
+
+        let mut reader = SnapshotWireReader::new(&buffer).expect("version one header");
+        let slots = read_convention_slots(&mut reader).expect("legacy convention slots");
+        reader.finish().expect("consumed exactly");
+        assert_eq!(slots.calling_convention(), "amd64");
+        assert_eq!(slots.abi_class(), SourceAbiClass::SystemVAMD64);
+    }
+
+    #[test]
+    fn version_two_refuses_a_typed_abi_tag_that_disagrees_with_the_spelling() {
+        let mut writer = SnapshotWireWriter::new();
+        writer.string("amd64").expect("convention");
+        write_abi_class(&mut writer, SourceAbiClass::MicrosoftX64);
+        writer.u32(0);
+        write_optional_storage(&mut writer, None);
+        let buffer = writer.finish().expect("finish");
+
+        let mut reader = SnapshotWireReader::new(&buffer).expect("version two header");
+        assert!(matches!(
+            read_convention_slots(&mut reader),
+            Err(SnapshotWireError::RejectedContract { .. })
+        ));
     }
 
     #[test]

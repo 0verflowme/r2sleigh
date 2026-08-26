@@ -83,9 +83,75 @@ pub enum StackAddressBase {
     StackPointer,
 }
 
-pub const SOURCE_FUNCTION_INTERFACE_SCHEMA_VERSION: u32 = 10;
-pub const SOURCE_CALL_SITE_INTERFACE_SCHEMA_VERSION: u32 = 1;
+pub const SOURCE_FUNCTION_INTERFACE_SCHEMA_VERSION: u32 = 11;
+pub const SOURCE_CALL_SITE_INTERFACE_SCHEMA_VERSION: u32 = 2;
 pub const SOURCE_TYPE_GRAPH_SCHEMA_VERSION: u32 = 1;
+
+/// Typed classification of one source-owned calling-convention spelling.
+///
+/// The source spelling remains available for presentation, but semantic
+/// consumers use this closed value. Classification happens once when a source
+/// contract is constructed; consumers must not parse the spelling again.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+pub enum SourceAbiClass {
+    /// The source supplied no convention, or explicitly marked it unknown.
+    #[default]
+    Unknown,
+    /// The source supplied a convention outside the closed vocabulary below.
+    Other,
+    Microsoft,
+    MicrosoftX64,
+    SystemV,
+    SystemVAMD64,
+    Aapcs,
+    Aapcs64,
+    RiscV32,
+    RiscV64,
+    Cdecl,
+    Stdcall,
+    Fastcall,
+    Thiscall,
+    Vectorcall,
+}
+
+impl SourceAbiClass {
+    /// Classify an exact source spelling without architecture or symbol hints.
+    pub fn from_source_spelling(spelling: &str) -> Self {
+        let mut normalized = String::with_capacity(spelling.len());
+        for ch in spelling.trim().chars() {
+            if ch.is_ascii_alphanumeric() {
+                normalized.push(ch.to_ascii_lowercase());
+            } else if ch.is_ascii_whitespace() || matches!(ch, '-' | '_' | ':' | '.' | '/') {
+                continue;
+            } else {
+                return Self::Other;
+            }
+        }
+        match normalized.as_str() {
+            "" | "unknown" | "unspecified" | "default" | "none" => Self::Unknown,
+            "ms" | "msvc" | "microsoft" => Self::Microsoft,
+            "ms64" | "msx64" | "win64" | "windowsx64" | "microsoftx64"
+            | "x64windows" | "amd64windows" => Self::MicrosoftX64,
+            "sysv" | "systemv" => Self::SystemV,
+            "amd64" | "sysv64" | "sysvamd64" | "systemvamd64" | "amd64sysv"
+            | "x8664sysv" => {
+                Self::SystemVAMD64
+            }
+            "aapcs" => Self::Aapcs,
+            "aapcs64" => Self::Aapcs64,
+            "riscv32" | "rv32" => Self::RiscV32,
+            "riscv64" | "rv64" => Self::RiscV64,
+            "cdecl" => Self::Cdecl,
+            "stdcall" => Self::Stdcall,
+            "fastcall" => Self::Fastcall,
+            "thiscall" => Self::Thiscall,
+            "vectorcall" => Self::Vectorcall,
+            _ => Self::Other,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum SourceTypeKind {
@@ -798,6 +864,7 @@ pub struct SourceFunctionInterface {
     schema_version: u32,
     revision_identity: Box<[u8]>,
     calling_convention: String,
+    abi_class: SourceAbiClass,
     parameters: Box<[SourceAbiParameterSpec]>,
     return_kind: SourceFunctionReturn,
     return_address_storage: Option<CanonicalStorageId>,
@@ -951,6 +1018,7 @@ impl SourceFunctionInterface {
         if calling_convention.trim().is_empty() {
             return Err(SourceFunctionInterfaceError::EmptyCallingConvention);
         }
+        let abi_class = SourceAbiClass::from_source_spelling(&calling_convention);
         let parameters = parameters.into_iter().collect::<Vec<_>>();
         if parameters
             .iter()
@@ -1073,6 +1141,7 @@ impl SourceFunctionInterface {
             schema_version: SOURCE_FUNCTION_INTERFACE_SCHEMA_VERSION,
             revision_identity: revision_identity.into_boxed_slice(),
             calling_convention,
+            abi_class,
             parameters: parameters.into_boxed_slice(),
             return_kind,
             return_address_storage: None,
@@ -1102,6 +1171,10 @@ impl SourceFunctionInterface {
 
     pub fn calling_convention(&self) -> &str {
         &self.calling_convention
+    }
+
+    pub const fn abi_class(&self) -> SourceAbiClass {
+        self.abi_class
     }
 
     pub const fn parameters(&self) -> &[SourceAbiParameterSpec] {
@@ -1544,6 +1617,7 @@ pub struct SourceCallSiteInterface {
     identity: SourceCallSiteIdentity,
     complete: bool,
     calling_convention: String,
+    abi_class: SourceAbiClass,
     arguments: Box<[SourceCallArgumentSpec]>,
     variadic: bool,
     noreturn: bool,
@@ -1592,6 +1666,7 @@ impl SourceCallSiteInterface {
         if calling_convention.trim().is_empty() {
             return Err(SourceCallSiteInterfaceError::EmptyCallingConvention);
         }
+        let abi_class = SourceAbiClass::from_source_spelling(&calling_convention);
         let arguments = arguments.into_iter().collect::<Vec<_>>();
         if arguments
             .iter()
@@ -1626,6 +1701,7 @@ impl SourceCallSiteInterface {
             identity,
             complete,
             calling_convention,
+            abi_class,
             arguments: arguments.into_boxed_slice(),
             variadic,
             noreturn,
@@ -1651,6 +1727,10 @@ impl SourceCallSiteInterface {
 
     pub fn calling_convention(&self) -> &str {
         &self.calling_convention
+    }
+
+    pub const fn abi_class(&self) -> SourceAbiClass {
+        self.abi_class
     }
 
     pub const fn arguments(&self) -> &[SourceCallArgumentSpec] {
@@ -1706,6 +1786,111 @@ mod tests {
         .and_then(|interface| interface.with_return_address_storage(register_storage(80, 8)))
         .and_then(|interface| interface.with_stack_pointer_storage(register_storage(72, 8)))
         .expect("exact return carriers")
+    }
+
+    fn test_call_site(calling_convention: &str) -> SourceCallSiteInterface {
+        SourceCallSiteInterface::new(
+            b"abi-class-callsite".to_vec(),
+            SourceCallSiteIdentity::new(
+                0x1000,
+                0,
+                CanonicalStorageId {
+                    space: CanonicalStorageSpace::Constant,
+                    offset: 0x2000,
+                    size: 8,
+                },
+            ),
+            true,
+            calling_convention,
+            [],
+            false,
+            false,
+            SourceCallResult::Void,
+        )
+        .expect("test callsite")
+    }
+
+    #[test]
+    fn abi_class_synonyms_are_classified_once_on_each_source_contract() {
+        let slots = SourceConventionSlots::new("windows_x64", [], None).expect("slots");
+        assert_eq!(slots.abi_class(), SourceAbiClass::MicrosoftX64);
+        assert_eq!(slots.calling_convention(), "windows_x64");
+
+        let function = SourceFunctionInterface::new_exact(
+            b"abi-class-function".to_vec(),
+            "sysv-amd64",
+            [],
+            SourceFunctionReturn::Void,
+            [],
+        )
+        .expect("function interface");
+        assert_eq!(function.abi_class(), SourceAbiClass::SystemVAMD64);
+        assert_eq!(function.calling_convention(), "sysv-amd64");
+
+        let callsite = test_call_site("microsoft-x64");
+        assert_eq!(callsite.abi_class(), SourceAbiClass::MicrosoftX64);
+        assert_eq!(callsite.calling_convention(), "microsoft-x64");
+
+        assert_eq!(
+            SourceAbiClass::from_source_spelling("ms"),
+            SourceAbiClass::Microsoft
+        );
+
+        for spelling in ["win64", "windows-x64", "MS_X64"] {
+            assert_eq!(
+                SourceAbiClass::from_source_spelling(spelling),
+                SourceAbiClass::MicrosoftX64
+            );
+        }
+        for spelling in ["sysv64", "system-v-amd64", "x86_64_sysv"] {
+            assert_eq!(
+                SourceAbiClass::from_source_spelling(spelling),
+                SourceAbiClass::SystemVAMD64
+            );
+        }
+    }
+
+    #[test]
+    fn abi_class_preserves_renamed_other_spellings_as_presentation_only() {
+        let first = SourceConventionSlots::new("vendor-abi-a", [], None).expect("first slots");
+        let renamed = SourceConventionSlots::new("renamed-vendor-abi", [], None)
+            .expect("renamed slots");
+
+        assert_eq!(first.abi_class(), SourceAbiClass::Other);
+        assert_eq!(renamed.abi_class(), SourceAbiClass::Other);
+        assert_ne!(first.calling_convention(), renamed.calling_convention());
+    }
+
+    #[test]
+    fn abi_class_keeps_unknown_and_source_specific_spellings_honest() {
+        let absent = SourceConventionSlots::new("", [], None).expect("absent convention slots");
+        assert_eq!(absent.abi_class(), SourceAbiClass::Unknown);
+        assert_eq!(
+            SourceFunctionInterface::new_exact(
+                b"unknown-function-abi".to_vec(),
+                "unknown",
+                [],
+                SourceFunctionReturn::Void,
+                [],
+            )
+            .expect("unknown function convention")
+            .abi_class(),
+            SourceAbiClass::Unknown
+        );
+        assert_eq!(test_call_site("default").abi_class(), SourceAbiClass::Unknown);
+        assert_eq!(
+            SourceAbiClass::from_source_spelling("amd64"),
+            SourceAbiClass::SystemVAMD64,
+            "radare2's exact callconv field uses amd64 for System V AMD64"
+        );
+        assert_eq!(
+            SourceAbiClass::from_source_spelling("aapcs64"),
+            SourceAbiClass::Aapcs64
+        );
+        assert_eq!(
+            SourceAbiClass::from_source_spelling("riscv64"),
+            SourceAbiClass::RiscV64
+        );
     }
 
     #[test]
@@ -2317,6 +2502,7 @@ pub struct SourceMachineRoles {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SourceConventionSlots {
     calling_convention: String,
+    abi_class: SourceAbiClass,
     argument_slots: Box<[CanonicalStorageId]>,
     result_slot: Option<CanonicalStorageId>,
 }
@@ -2330,6 +2516,7 @@ impl SourceConventionSlots {
         result_slot: Option<CanonicalStorageId>,
     ) -> Result<Self, SourceMachineRolesError> {
         let calling_convention = calling_convention.into();
+        let abi_class = SourceAbiClass::from_source_spelling(&calling_convention);
         let argument_slots = argument_slots.into_iter().collect::<Vec<_>>();
         if argument_slots
             .iter()
@@ -2347,6 +2534,7 @@ impl SourceConventionSlots {
         }
         Ok(Self {
             calling_convention,
+            abi_class,
             argument_slots: argument_slots.into_boxed_slice(),
             result_slot,
         })
@@ -2356,6 +2544,10 @@ impl SourceConventionSlots {
     /// recovered.
     pub fn calling_convention(&self) -> &str {
         &self.calling_convention
+    }
+
+    pub const fn abi_class(&self) -> SourceAbiClass {
+        self.abi_class
     }
 
     pub const fn argument_slots(&self) -> &[CanonicalStorageId] {

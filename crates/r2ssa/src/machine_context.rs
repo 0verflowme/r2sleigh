@@ -19,8 +19,8 @@ use crate::semantic::CallSiteId;
 pub use r2source::{
     CanonicalStorageId, CanonicalStorageSpace, SOURCE_CALL_SITE_INTERFACE_SCHEMA_VERSION,
     SOURCE_FUNCTION_INTERFACE_SCHEMA_VERSION, SOURCE_TYPE_GRAPH_SCHEMA_VERSION,
-    SourceAbiParameterSpec, SourceAggregateLayout, SourceAggregateMember, SourceCallArgumentSpec,
-    SourceCallResult, SourceCallSiteIdentity, SourceCallSiteInterface,
+    SourceAbiClass, SourceAbiParameterSpec, SourceAggregateLayout, SourceAggregateMember,
+    SourceCallArgumentSpec, SourceCallResult, SourceCallSiteIdentity, SourceCallSiteInterface,
     SourceCallSiteInterfaceError, SourceCarrierKind, SourceCarrierProjection,
     SourceConventionSlots, SourceFunctionInterface, SourceFunctionInterfaceError,
     SourceFunctionReturn, SourceLogicalValue, SourceMachineRoles, SourceStackAllocationContract,
@@ -28,7 +28,7 @@ pub use r2source::{
     SourceTypeGraphError, SourceTypeKind, StackAddressBase,
 };
 
-pub const MACHINE_CONTEXT_SCHEMA_VERSION: u32 = 18;
+pub const MACHINE_CONTEXT_SCHEMA_VERSION: u32 = 19;
 
 /// Canonical architecture family captured from the exact lifting profile.
 ///
@@ -109,6 +109,17 @@ impl MachineArchitectureFamily {
             Self::PowerPc64
         } else {
             Self::Unknown
+        }
+    }
+
+    /// Resolve a generic source convention only when this exact machine family
+    /// supplies the missing architectural qualifier.
+    pub const fn refine_abi_class(self, abi_class: SourceAbiClass) -> SourceAbiClass {
+        match (self, abi_class) {
+            (Self::X86_64, SourceAbiClass::Microsoft) => SourceAbiClass::MicrosoftX64,
+            (Self::X86_64, SourceAbiClass::SystemV) => SourceAbiClass::SystemVAMD64,
+            (Self::AArch64, SourceAbiClass::Aapcs) => SourceAbiClass::Aapcs64,
+            (_, abi_class) => abi_class,
         }
     }
 }
@@ -553,10 +564,6 @@ impl MachineContextIdentityWriter {
         self.0.extend_from_slice(value);
     }
 
-    fn string(&mut self, value: &str) {
-        self.bytes(value.as_bytes());
-    }
-
     fn storage(&mut self, storage: CanonicalStorageId) {
         self.u8(match storage.space {
             CanonicalStorageSpace::Ram => 1,
@@ -629,6 +636,26 @@ fn write_memory_endianness(
         MachineMemoryEndianness::Mixed => 3,
         MachineMemoryEndianness::Custom => 4,
         MachineMemoryEndianness::Unknown => 5,
+    });
+}
+
+fn write_abi_class(writer: &mut MachineContextIdentityWriter, abi_class: SourceAbiClass) {
+    writer.u8(match abi_class {
+        SourceAbiClass::Unknown => 0,
+        SourceAbiClass::Other => 1,
+        SourceAbiClass::Microsoft => 2,
+        SourceAbiClass::MicrosoftX64 => 3,
+        SourceAbiClass::SystemV => 4,
+        SourceAbiClass::SystemVAMD64 => 5,
+        SourceAbiClass::Aapcs => 6,
+        SourceAbiClass::Aapcs64 => 7,
+        SourceAbiClass::RiscV32 => 8,
+        SourceAbiClass::RiscV64 => 9,
+        SourceAbiClass::Cdecl => 10,
+        SourceAbiClass::Stdcall => 11,
+        SourceAbiClass::Fastcall => 12,
+        SourceAbiClass::Thiscall => 13,
+        SourceAbiClass::Vectorcall => 14,
     });
 }
 
@@ -705,7 +732,7 @@ fn write_function_interface(
     writer.u8(1);
     writer.u32(interface.schema_version());
     writer.bytes(interface.revision_identity());
-    writer.string(interface.calling_convention());
+    write_abi_class(writer, interface.abi_class());
     writer.usize(interface.parameters().len());
     for parameter in interface.parameters() {
         writer.u32(parameter.index());
@@ -784,7 +811,7 @@ fn write_call_site_interface(
     writer.bytes(interface.revision_identity());
     write_call_identity(writer, interface.identity());
     writer.bool(interface.is_complete());
-    writer.string(interface.calling_convention());
+    write_abi_class(writer, interface.abi_class());
     writer.usize(interface.arguments().len());
     for argument in interface.arguments() {
         writer.u32(argument.index());
@@ -1074,6 +1101,34 @@ impl SourceMachineContext {
         self.function_interface.as_ref()
     }
 
+    /// Exact source-owned convention slots, including their typed ABI class.
+    pub const fn convention_slots(&self) -> Option<&SourceConventionSlots> {
+        self.convention_slots.as_ref()
+    }
+
+    /// Decisive function ABI after combining the source convention with the
+    /// exact lifted architecture family. Conflicting source contracts refuse
+    /// to choose one ABI.
+    pub fn effective_abi_class(&self) -> SourceAbiClass {
+        let function_class = self
+            .function_interface
+            .as_ref()
+            .map(SourceFunctionInterface::abi_class)
+            .unwrap_or(SourceAbiClass::Unknown);
+        let slot_class = self
+            .convention_slots
+            .as_ref()
+            .map(SourceConventionSlots::abi_class)
+            .unwrap_or(SourceAbiClass::Unknown);
+        let function_class = self.architecture_family.refine_abi_class(function_class);
+        let slot_class = self.architecture_family.refine_abi_class(slot_class);
+        match (function_class, slot_class) {
+            (SourceAbiClass::Unknown, other) | (other, SourceAbiClass::Unknown) => other,
+            (left, right) if left == right => left,
+            _ => SourceAbiClass::Unknown,
+        }
+    }
+
     /// Borrow the machine carriers the source resolved from its register
     /// profile. These are available whether or not an ABI was recovered.
     pub const fn machine_roles(&self) -> &SourceMachineRoles {
@@ -1262,7 +1317,7 @@ impl SourceMachineContext {
     /// machine/source fact that can affect prepared semantics or certification.
     pub(crate) fn semantic_identity_bytes(&self) -> Box<[u8]> {
         let mut writer = MachineContextIdentityWriter::new();
-        writer.bytes(b"r2ssa-machine-context-semantic-v4");
+        writer.bytes(b"r2ssa-machine-context-semantic-v5");
         writer.u32(self.schema_version);
         writer.u8(match self.architecture_family {
             MachineArchitectureFamily::Unknown => 0,
@@ -1297,6 +1352,7 @@ impl SourceMachineContext {
         writer.u32(abi.schema_version());
         writer.bool(abi.is_available());
         writer.bool(abi.is_coherent());
+        write_abi_class(&mut writer, self.effective_abi_class());
         writer.usize(abi.argument_registers().len());
         for slot in abi.argument_registers() {
             writer.u32(slot.index());
@@ -1310,6 +1366,19 @@ impl SourceMachineContext {
         writer.option_storage(abi.frame_pointer_storage());
 
         write_function_interface(&mut writer, self.function_interface.as_ref());
+
+        match self.convention_slots.as_ref() {
+            Some(slots) => {
+                writer.u8(1);
+                write_abi_class(&mut writer, slots.abi_class());
+                writer.usize(slots.argument_slots().len());
+                for storage in slots.argument_slots() {
+                    writer.storage(*storage);
+                }
+                writer.option_storage(slots.result_slot());
+            }
+            None => writer.u8(0),
+        }
 
         let mut register_storages = self
             .register_storages_by_name
@@ -1789,8 +1858,8 @@ mod tests {
         let x86_context = SourceMachineContext::from_blocks(&[], Some(&x86));
         let arm_context = SourceMachineContext::from_blocks(&[], Some(&arm));
 
-        assert_eq!(MACHINE_CONTEXT_SCHEMA_VERSION, 18);
-        assert_eq!(x86_context.schema_version(), 18);
+        assert_eq!(MACHINE_CONTEXT_SCHEMA_VERSION, 19);
+        assert_eq!(x86_context.schema_version(), 19);
         assert_eq!(
             x86_context.architecture_family(),
             MachineArchitectureFamily::X86_64
@@ -1802,6 +1871,40 @@ mod tests {
         assert_ne!(
             x86_context.semantic_identity_bytes(),
             arm_context.semantic_identity_bytes()
+        );
+    }
+
+    #[test]
+    fn effective_abi_class_resolves_exact_radare2_conventions_with_architecture() {
+        let mut arch = ArchSpec::new("x86-64");
+        arch.addr_size = 8;
+        arch.alignment = 1;
+        arch.add_space(AddressSpace::ram(8));
+
+        let context = |spelling| {
+            SourceMachineContext::from_blocks_with_interfaces(
+                &[],
+                Some(&arch),
+                None,
+                SourceMachineRoles::default(),
+                Some(SourceConventionSlots::new(spelling, [], None).expect("convention slots")),
+                Vec::new(),
+            )
+        };
+        let microsoft = context("ms");
+        let system_v = context("amd64");
+        let microsoft_synonym = context("windows-x64");
+
+        assert_eq!(microsoft.convention_slots().unwrap().calling_convention(), "ms");
+        assert_eq!(microsoft.effective_abi_class(), SourceAbiClass::MicrosoftX64);
+        assert_eq!(system_v.effective_abi_class(), SourceAbiClass::SystemVAMD64);
+        assert_eq!(
+            microsoft_synonym.effective_abi_class(),
+            SourceAbiClass::MicrosoftX64
+        );
+        assert_ne!(
+            microsoft.semantic_identity_bytes(),
+            system_v.semantic_identity_bytes()
         );
     }
 
