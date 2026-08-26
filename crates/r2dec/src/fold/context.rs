@@ -1,20 +1,18 @@
 use std::cell::Cell;
 #[cfg(test)]
 use std::cell::OnceCell;
-use std::collections::{BTreeMap, BTreeSet, HashSet};
 #[cfg(test)]
 use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 #[cfg(test)]
 use std::sync::OnceLock;
 
 use crate::analysis;
 use crate::ast::{CExpr, CType};
 use r2ssa::{BlockId, InstId, SemanticObligationId, SsaArtifact, UseSite, ValueId};
+use r2types::{CalleeFact, CalleeResolutionFacts, FunctionFacts, InterprocSummaryView, TypeOracle};
 #[cfg(test)]
 use r2types::{ExternalStackSlotSpec, StackSlotKey, VisibleBinding};
-use r2types::{
-    CalleeFact, CalleeResolutionFacts, FunctionFacts, InterprocSummaryView, TypeOracle,
-};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum EffectOccurrenceKind {
@@ -677,20 +675,13 @@ impl<'a> FoldingContext<'a> {
         let graph = prepared.graph();
         let mut obligation_ids = BTreeSet::new();
         for site in sites {
-            let predecessor = graph.inst(site.inst).and_then(|inst| match &inst.payload {
-                r2ssa::InstPayload::Phi { predecessors } => predecessors.get(site.input_idx),
-                r2ssa::InstPayload::Op(_) => None,
-            });
-            let predecessor = predecessor
-                .and_then(|block| graph.block(*block))
-                .map(|block| block.addr);
             for obligation in prepared.obligations().obligations_for_inst(definition) {
                 if obligation.id.kind == SemanticObligationKind::LiveStateTransition
                     && matches!(
                         obligation.id.component,
-                        SemanticObligationComponent::LoopTransition { predecessor: owner, .. }
-                            if Some(owner) == predecessor
+                        SemanticObligationComponent::LoopTransition { .. }
                     )
+                    && obligation.edge_use == Some(*site)
                     && obligation.inputs
                         == graph
                             .inst(site.inst)

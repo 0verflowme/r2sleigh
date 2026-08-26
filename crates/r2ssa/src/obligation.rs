@@ -11,11 +11,11 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use serde::{Deserialize, Serialize};
 
 use crate::CanonicalStorageId;
-use crate::graph::{InstId, InstPayload, SsaGraph, ValueId};
+use crate::graph::{InstId, InstPayload, SsaGraph, UseSite, ValueId};
 use crate::op::SSAOp;
 use crate::semantic::{SourceBoundaryFacts, StructuredDataflowFacts};
 
-pub const SEMANTIC_OBLIGATION_SCHEMA_VERSION: u32 = 6;
+pub const SEMANTIC_OBLIGATION_SCHEMA_VERSION: u32 = 7;
 
 /// Stable location of one canonical SSA instruction.
 ///
@@ -229,6 +229,13 @@ pub struct SemanticObligation {
     pub source: SemanticSourceSite,
     /// Exact canonical values needed to realize this obligation.
     pub inputs: Vec<ValueId>,
+    /// Exact graph use certified by an edge-specific obligation.
+    ///
+    /// This is present for a loop state transition and absent for obligations
+    /// that are owned by an instruction as a whole. Consumers must use this
+    /// indexed site directly instead of recovering a phi input from a
+    /// predecessor address or value match.
+    pub edge_use: Option<UseSite>,
 }
 
 /// Complete source inventory for one prepared function.
@@ -324,6 +331,10 @@ impl SemanticObligationInventory {
         let mut explicit_inputs = BTreeMap::<
             (InstId, SemanticObligationKind, SemanticObligationComponent),
             Vec<ValueId>,
+        >::new();
+        let mut explicit_edge_uses = BTreeMap::<
+            (InstId, SemanticObligationKind, SemanticObligationComponent),
+            UseSite,
         >::new();
         let mut unsupported = BTreeSet::<InstId>::new();
         let mut duplicate_seeds =
@@ -584,19 +595,30 @@ impl SemanticObligationInventory {
                     .and_then(|inst| graph.inst(inst))
                     .and_then(|inst| inst.canonical_storage);
                 for update in &carrier.updates {
-                    if let (Some(carrier_inst), Some(carrier)) = (carrier_inst, carrier_storage) {
+                    if let (Some(carrier_inst), Some(carrier)) = (carrier_inst, carrier_storage)
+                        && update.site.inst == carrier_inst
+                        && update.validate(graph)
+                    {
+                        let component = SemanticObligationComponent::LoopTransition {
+                            carrier,
+                            predecessor: update.predecessor,
+                        };
                         seed_instruction_with_inputs(
                             carrier_inst,
                             SemanticObligationKind::LiveStateTransition,
-                            SemanticObligationComponent::LoopTransition {
-                                carrier,
-                                predecessor: update.predecessor,
-                            },
+                            component,
                             vec![update.value],
                             &mut required,
                             &mut explicit_inputs,
                             &mut duplicate_seeds,
                         );
+                        explicit_edge_uses
+                            .entry((
+                                carrier_inst,
+                                SemanticObligationKind::LiveStateTransition,
+                                component,
+                            ))
+                            .or_insert(update.site);
                     } else if let Some(carrier_inst) = carrier_inst {
                         unsupported.insert(carrier_inst);
                         seed_instruction(
@@ -655,6 +677,7 @@ impl SemanticObligationInventory {
                         inputs: explicit_inputs
                             .remove(&(inst.id, kind, component))
                             .unwrap_or_else(|| inst.inputs.clone()),
+                        edge_use: explicit_edge_uses.remove(&(inst.id, kind, component)),
                     },
                 );
             }
@@ -720,6 +743,7 @@ impl SemanticObligationInventory {
                             id: obligation_id,
                             source: SemanticSourceSite::GenuineNativeSpan(span),
                             inputs: Vec::new(),
+                            edge_use: None,
                         },
                     )
                     .is_some()
@@ -885,6 +909,14 @@ impl SemanticObligationInventory {
                         instruction.source != obligation.source
                             || !instruction.obligations.contains(id)
                     })
+                || match (id.kind, id.component, obligation.source) {
+                    (
+                        SemanticObligationKind::LiveStateTransition,
+                        SemanticObligationComponent::LoopTransition { .. },
+                        SemanticSourceSite::GraphInstruction(inst),
+                    ) => obligation.edge_use.is_none_or(|site| site.inst != inst),
+                    _ => obligation.edge_use.is_some(),
+                }
             {
                 return false;
             }
@@ -2439,7 +2471,40 @@ mod tests {
     }
 
     #[test]
-    fn loop_transition_is_carrier_edge_owned_even_without_update_definition() {
+    fn loop_transition_carries_the_exact_phi_input_use_site() {
+        let artifact = SsaArtifact::raw(&loop_carrier_fixture(), None).expect("loop artifact");
+        let carrier = artifact
+            .structured()
+            .loops
+            .values()
+            .flat_map(|loop_fact| loop_fact.carriers.iter())
+            .next()
+            .expect("loop carrier");
+        let update = carrier.updates.first().expect("loop update");
+        let phi_inst = artifact
+            .graph()
+            .def_inst(carrier.phi)
+            .expect("phi definition");
+        let transition = artifact
+            .obligations()
+            .obligations_for_inst(phi_inst)
+            .find(|obligation| {
+                obligation.id.kind == SemanticObligationKind::LiveStateTransition
+                    && matches!(
+                        obligation.id.component,
+                        SemanticObligationComponent::LoopTransition { predecessor, .. }
+                            if predecessor == update.predecessor
+                    )
+            })
+            .expect("carrier-edge transition");
+
+        assert_eq!(transition.edge_use, Some(update.site));
+        assert_eq!(transition.inputs, vec![update.value]);
+        assert!(update.validate(artifact.graph()));
+    }
+
+    #[test]
+    fn malformed_loop_transition_edge_fails_closed() {
         let artifact = SsaArtifact::raw(&loop_carrier_fixture(), None).expect("loop artifact");
         let mut structured = artifact.structured().clone();
         let undef = artifact
@@ -2456,58 +2521,92 @@ mod tests {
             .next()
             .expect("loop carrier");
         carrier.updates[0].value = undef;
-        let predecessor = carrier.updates[0].predecessor;
         let phi_inst = artifact
             .graph()
             .def_inst(carrier.phi)
             .expect("phi definition");
-        let storage = artifact
-            .graph()
-            .inst(phi_inst)
-            .and_then(|inst| inst.canonical_storage)
-            .expect("phi storage");
 
         let inventory = SemanticObligationInventory::collect(
             artifact.graph(),
             &structured,
             &artifact.facts().boundaries,
         );
-        let transition = inventory
-            .obligations_for_inst(phi_inst)
-            .find(|obligation| {
-                obligation.id.kind == SemanticObligationKind::LiveStateTransition
-                    && obligation.id.component
-                        == SemanticObligationComponent::LoopTransition {
-                            carrier: storage,
-                            predecessor,
-                        }
-            })
-            .expect("carrier-edge transition");
-        assert_eq!(transition.inputs, vec![undef]);
+        assert!(
+            inventory
+                .obligations_for_inst(phi_inst)
+                .all(|obligation| obligation.id.kind
+                    != SemanticObligationKind::LiveStateTransition),
+            "a value/site mismatch must not produce an exact transition certificate"
+        );
+        assert!(inventory.obligations_for_inst(phi_inst).any(|obligation| {
+            obligation.id.kind == SemanticObligationKind::VolatileOrUnknownEffect
+        }));
     }
 
     #[test]
     fn shared_loop_update_values_keep_distinct_predecessor_obligations() {
-        let artifact = SsaArtifact::raw(&loop_carrier_fixture(), None).expect("loop artifact");
-        let mut structured = artifact.structured().clone();
-        let carrier = structured
+        let accumulator = Varnode::register(0, 8);
+        let mut entry = R2ILBlock::new(0x2000, 4);
+        entry.push(R2ILOp::Copy {
+            dst: accumulator.clone(),
+            src: Varnode::constant(0, 8),
+        });
+        entry.push(R2ILOp::Branch {
+            target: Varnode::ram(0x2010, 8),
+        });
+        let mut header = R2ILBlock::new(0x2010, 4);
+        header.push(R2ILOp::CBranch {
+            target: Varnode::ram(0x2020, 8),
+            cond: Varnode::constant(1, 1),
+        });
+        let mut exit = R2ILBlock::new(0x2014, 4);
+        exit.push(R2ILOp::Return {
+            target: Varnode::constant(0, 8),
+        });
+        let mut update = R2ILBlock::new(0x2020, 4);
+        update.push(R2ILOp::IntAdd {
+            dst: accumulator.clone(),
+            a: accumulator,
+            b: Varnode::constant(1, 8),
+        });
+        update.push(R2ILOp::CBranch {
+            target: Varnode::ram(0x2030, 8),
+            cond: Varnode::constant(1, 1),
+        });
+        let mut left_latch = R2ILBlock::new(0x2024, 4);
+        left_latch.push(R2ILOp::Branch {
+            target: Varnode::ram(0x2010, 8),
+        });
+        let mut right_latch = R2ILBlock::new(0x2030, 4);
+        right_latch.push(R2ILOp::Branch {
+            target: Varnode::ram(0x2010, 8),
+        });
+        let artifact = SsaArtifact::raw(
+            &[entry, header, exit, update, left_latch, right_latch],
+            None,
+        )
+        .expect("two-latch loop artifact");
+        let carrier = artifact
+            .structured()
             .loops
-            .values_mut()
-            .flat_map(|loop_fact| loop_fact.carriers.iter_mut())
+            .values()
+            .flat_map(|loop_fact| loop_fact.carriers.iter())
             .next()
             .expect("loop carrier");
-        let mut second = carrier.updates[0].clone();
-        second.predecessor = 0x2030;
-        carrier.updates.push(second);
+        assert_eq!(carrier.updates.len(), 2);
+        assert_eq!(carrier.updates[0].value, carrier.updates[1].value);
+        assert_ne!(carrier.updates[0].site, carrier.updates[1].site);
         let phi_inst = artifact
             .graph()
             .def_inst(carrier.phi)
             .expect("phi definition");
-        let inventory = SemanticObligationInventory::collect(
-            artifact.graph(),
-            &structured,
-            &artifact.facts().boundaries,
+        assert!(
+            carrier
+                .updates
+                .iter()
+                .all(|update| update.site.inst == phi_inst && update.validate(artifact.graph()))
         );
+        let inventory = artifact.obligations();
         let transitions = inventory
             .obligations_for_inst(phi_inst)
             .filter(|obligation| obligation.id.kind == SemanticObligationKind::LiveStateTransition)

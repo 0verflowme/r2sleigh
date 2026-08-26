@@ -10,7 +10,7 @@ use crate::observation_journal::SurvivingEffectObservations;
 use r2ssa::ledger::{ElisionReason, LedgerLayer, ObligationLedger, Outcome, RefusalReason};
 use r2ssa::{
     CanonicalInstructionSite, SemanticObligationComponent, SemanticObligationId,
-    SemanticObligationKind, SsaArtifact, UseSite,
+    SemanticObligationKind, SsaArtifact,
 };
 
 fn rendered_site(id: SemanticObligationId) -> Option<(u64, usize)> {
@@ -23,45 +23,25 @@ fn rendered_site(id: SemanticObligationId) -> Option<(u64, usize)> {
     }
 }
 
-fn phi_site_for_predecessor(
-    prepared: &SsaArtifact,
-    inst: r2ssa::InstId,
-    predecessor: u64,
-) -> Option<UseSite> {
-    let graph = prepared.graph();
-    let definition = graph.inst(inst)?;
-    let r2ssa::InstPayload::Phi { predecessors } = &definition.payload else {
-        return None;
-    };
-    let mut matches = predecessors
-        .iter()
-        .enumerate()
-        .filter_map(|(input_idx, block)| {
-            (graph.block(*block)?.addr == predecessor).then_some(UseSite { inst, input_idx })
-        });
-    let first = matches.next()?;
-    matches.next().is_none().then_some(first)
-}
-
 /// Exact upstream disposition for a source effect that has no final occurrence.
 ///
 /// These are not renderer guesses. Unsupported native effects are inventory
 /// policy, unobserved merges are canonical SSA facts, and redundant phi edges
-/// are certified by the sealed normalization sidecar. Every other zero remains
-/// unattributed so deletion cannot be relabelled as successful elision.
+/// are certified by the sealed normalization sidecar. Every other zero is a
+/// typed codegen refusal so deletion cannot be relabelled as successful elision.
 fn upstream_zero_occurrence_outcome(
     prepared: &SsaArtifact,
     origins: &NormalizationOrigins,
     id: SemanticObligationId,
-) -> Option<Outcome> {
+) -> Outcome {
     if matches!(
         id.kind,
         SemanticObligationKind::VolatileOrUnknownEffect | SemanticObligationKind::Trap
     ) {
-        return Some(Outcome::Refused {
+        return Outcome::Refused {
             layer: LedgerLayer::Ssa,
             reason: RefusalReason::UnsupportedEffect,
-        });
+        };
     }
 
     let graph = prepared.graph();
@@ -76,30 +56,43 @@ fn upstream_zero_occurrence_outcome(
             .and_then(|inst| inst.output)
             .is_some_and(|value| prepared.unobserved_merges().contains(value))
     {
-        return Some(Outcome::Elided(ElisionReason::UnobservedMerge));
+        return Outcome::Elided(ElisionReason::UnobservedMerge);
     }
 
-    let inst = source_inst?;
-    let removed = origins
-        .removed_phis()
-        .iter()
-        .find(|removed| removed.definition.inst == inst)?;
-    match (id.kind, id.component) {
-        (
-            SemanticObligationKind::LiveStateTransition,
-            SemanticObligationComponent::LoopTransition { predecessor, .. },
-        ) => phi_site_for_predecessor(prepared, inst, predecessor)
-            .filter(|site| removed.noop_sites().contains(site))
-            .map(|_| Outcome::Elided(ElisionReason::RedundantPhiEdge)),
-        (SemanticObligationKind::LoopCarriedState, _)
-            if removed
-                .incoming_sites
-                .iter()
-                .all(|site| removed.noop_sites().contains(site)) =>
-        {
-            Some(Outcome::Elided(ElisionReason::RedundantPhiEdge))
+    if let Some(inst) = source_inst
+        && let Some(removed) = origins
+            .removed_phis()
+            .iter()
+            .find(|removed| removed.definition.inst == inst)
+    {
+        match (id.kind, id.component) {
+            (
+                SemanticObligationKind::LiveStateTransition,
+                SemanticObligationComponent::LoopTransition { .. },
+            ) if prepared
+                .obligations()
+                .obligations()
+                .get(&id)
+                .and_then(|obligation| obligation.edge_use)
+                .is_some_and(|site| removed.noop_sites().contains(&site)) =>
+            {
+                return Outcome::Elided(ElisionReason::RedundantPhiEdge);
+            }
+            (SemanticObligationKind::LoopCarriedState, _)
+                if removed
+                    .incoming_sites
+                    .iter()
+                    .all(|site| removed.noop_sites().contains(site)) =>
+            {
+                return Outcome::Elided(ElisionReason::RedundantPhiEdge);
+            }
+            _ => {}
         }
-        _ => None,
+    }
+
+    Outcome::Refused {
+        layer: LedgerLayer::Codegen,
+        reason: RefusalReason::BlockNotRendered,
     }
 }
 
@@ -116,7 +109,7 @@ pub(crate) fn build_obligation_ledger(
             .occurrence_count(id)
             .expect("effect observation domain is opened from this source inventory");
         let outcome = match count {
-            0 => upstream_zero_occurrence_outcome(prepared, origins, id),
+            0 => Some(upstream_zero_occurrence_outcome(prepared, origins, id)),
             1 => rendered_site(id)
                 .map(|(block_addr, op_idx)| Outcome::Rendered { block_addr, op_idx }),
             _ => Some(Outcome::Refused {

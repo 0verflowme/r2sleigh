@@ -260,43 +260,39 @@ mod tests {
         let call_site_interfaces = blocks
             .iter()
             .flat_map(|block| {
-                block
-                    .ops
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(op_index, op)| {
-                        let target = match op {
-                            R2ILOp::Call { target } | R2ILOp::CallInd { target } => target,
-                            _ => return None,
-                        };
-                        Some(
-                            r2ssa::SourceCallSiteInterface::new(
-                                revision.to_vec(),
-                                r2ssa::SourceCallSiteIdentity::new(
-                                    block.addr,
-                                    op_index,
-                                    r2ssa::CanonicalStorageId::from_varnode(target),
-                                ),
-                                true,
-                                calling_convention,
-                                parameter_offsets
-                                    .iter()
-                                    .copied()
-                                    .take(call_argument_count)
-                                    .enumerate()
-                                    .map(|(index, offset)| {
-                                        r2ssa::SourceCallArgumentSpec::new(
-                                            index as u32,
-                                            storage(offset),
-                                        )
-                                    }),
-                                false,
-                                false,
-                                r2ssa::SourceCallResult::Void,
-                            )
-                            .expect("exact test callsite interface"),
+                block.ops.iter().enumerate().filter_map(|(op_index, op)| {
+                    let target = match op {
+                        R2ILOp::Call { target } | R2ILOp::CallInd { target } => target,
+                        _ => return None,
+                    };
+                    Some(
+                        r2ssa::SourceCallSiteInterface::new(
+                            revision.to_vec(),
+                            r2ssa::SourceCallSiteIdentity::new(
+                                block.addr,
+                                op_index,
+                                r2ssa::CanonicalStorageId::from_varnode(target),
+                            ),
+                            true,
+                            calling_convention,
+                            parameter_offsets
+                                .iter()
+                                .copied()
+                                .take(call_argument_count)
+                                .enumerate()
+                                .map(|(index, offset)| {
+                                    r2ssa::SourceCallArgumentSpec::new(
+                                        index as u32,
+                                        storage(offset),
+                                    )
+                                }),
+                            false,
+                            false,
+                            r2ssa::SourceCallResult::Void,
                         )
-                    })
+                        .expect("exact test callsite interface"),
+                    )
+                })
             })
             .collect();
         source_owned_fixture(
@@ -2502,7 +2498,7 @@ mod tests {
 
         let mut exit = R2ILBlock::new(0x190c, 4);
         exit.push(R2ILOp::Return {
-            target: Varnode::register(0, 8),
+            target: Varnode::register(0x30, 8),
         });
 
         let prepared = prepared_from_r2il_blocks(&[entry, header, latch, exit], &arch)
@@ -2519,6 +2515,19 @@ mod tests {
             .expect("genuine normalized loop origins must remain sealed");
 
         let graph = prepared.graph();
+        let transition_sites = prepared
+            .obligations()
+            .obligations()
+            .values()
+            .filter(|obligation| {
+                obligation.id.kind == r2ssa::SemanticObligationKind::LiveStateTransition
+            })
+            .filter_map(|obligation| obligation.edge_use)
+            .collect::<BTreeSet<_>>();
+        assert!(
+            !transition_sites.is_empty(),
+            "fixture must retain an exact loop-transition edge"
+        );
         let (block_addr, synthetic_idx, shifted_idx, shifted_inst) = graph
             .block_order
             .iter()
@@ -2526,16 +2535,28 @@ mod tests {
                 let block_addr = graph.block(*block_id)?.addr;
                 let block = normalized.get_block(block_addr)?;
                 let synthetic_idx = (0..block.ops.len()).find(|op_idx| {
+                    let site = crate::normalize::NormalizedOpSite {
+                        block: *block_id,
+                        op_idx: *op_idx,
+                    };
                     matches!(
-                        origins.origin(crate::normalize::NormalizedOpSite {
-                            block: *block_id,
-                            op_idx: *op_idx,
-                        }),
+                        origins.origin(site),
                         Some(crate::normalize::NormalizedOpOrigin::PhiEdgeCopy(_))
                             | Some(crate::normalize::NormalizedOpOrigin::RelocatedInitializer(
                                 _
                             ))
-                    )
+                    ) && origins
+                        .projection(site, &prepared)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|projection| {
+                            projection.inputs.iter().any(|input| {
+                                input
+                                    .uses
+                                    .iter()
+                                    .any(|site| transition_sites.contains(site))
+                            })
+                        })
                 })?;
                 let (shifted_idx, shifted_inst) =
                     (synthetic_idx + 1..block.ops.len()).find_map(|op_idx| {
@@ -2554,6 +2575,22 @@ mod tests {
                 Some((block_addr, synthetic_idx, shifted_idx, shifted_inst))
             })
             .expect("materialized loop must insert a synthetic op before an original terminator");
+        let synthetic_source_uses = origins
+            .projection(
+                crate::normalize::NormalizedOpSite {
+                    block: graph
+                        .block_id_for_addr(block_addr)
+                        .expect("normalized block has a source graph identity"),
+                    op_idx: synthetic_idx,
+                },
+                &prepared,
+            )
+            .expect("normalization projection is authority-bound")
+            .expect("synthetic phi operation has an exact source projection")
+            .inputs
+            .iter()
+            .flat_map(|input| input.uses.iter().copied())
+            .collect::<BTreeSet<_>>();
 
         let base_ctx = make_x86_64_ctx_with_prepared(&prepared);
         let mut inputs = base_ctx.inputs;
@@ -2576,10 +2613,17 @@ mod tests {
             None,
         );
         assert!(
-            synthetic_obligations.iter().all(|id| {
-                id.kind == r2ssa::SemanticObligationKind::LiveStateTransition
-                    && matches!(id.instruction.site, r2ssa::CanonicalInstructionSite::Phi(_))
-            }),
+            !synthetic_obligations.is_empty()
+                && synthetic_obligations.iter().all(|id| {
+                    id.kind == r2ssa::SemanticObligationKind::LiveStateTransition
+                        && matches!(id.instruction.site, r2ssa::CanonicalInstructionSite::Phi(_))
+                        && prepared
+                            .obligations()
+                            .obligations()
+                            .get(id)
+                            .and_then(|obligation| obligation.edge_use)
+                            .is_some_and(|site| synthetic_source_uses.contains(&site))
+                }),
             "a synthetic phi operation may carry only an obligation that exists for its exact original input edge"
         );
         let obligations = ctx.exact_effect_obligations_for_normalized_value(
@@ -2700,10 +2744,8 @@ mod tests {
     fn prepared_runtime_analysis_refuses_without_exact_source_artifact() {
         let mut ctx = FoldingContext::new(64);
         let execution = r2ssa::SsaExecutionControl::default();
-        let control = crate::DecompileWorkControl::new(
-            &execution,
-            crate::DecompileWorkPhase::Structuring,
-        );
+        let control =
+            crate::DecompileWorkControl::new(&execution, crate::DecompileWorkPhase::Structuring);
 
         assert_eq!(
             ctx.analyze_blocks_with_control(&[], control),
