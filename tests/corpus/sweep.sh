@@ -41,4 +41,5 @@ done
 echo "R2SLEIGH_CORPUS_TOOL__$r2_bin"
 "$r2_bin" -v | head -n 1
 echo "R2SLEIGH_CORPUS_BINARY__$binary"
-"$r2_bin" -e scr.color=0 -q -c "$command_text" "$binary" 2>&1
+R2SLEIGH_BINDING_AUDIT=1 \
+    "$r2_bin" -e scr.color=0 -q -c "$command_text" "$binary" 2>&1

@@ -1359,7 +1359,7 @@ fn count_residual_markers(stmts: &[CStmt]) -> usize {
         }
     }
     fn walk_one(stmt: &CStmt, found: &mut usize) {
-        match stmt {
+        match stmt.unobserved() {
             CStmt::Comment(text) => {
                 if text.contains("r2dec residual:") {
                     *found += 1;
@@ -1494,7 +1494,7 @@ fn reconcile_ledger_with_body(
     let rendered_any_statement = func
         .body
         .iter()
-        .any(|stmt| !matches!(stmt, CStmt::Comment(_) | CStmt::Empty));
+        .any(|stmt| !matches!(stmt.unobserved(), CStmt::Comment(_) | CStmt::Empty));
     if rendered_any_statement {
         return;
     }
@@ -1605,7 +1605,7 @@ fn debug_log_render_witness(
 /// Statements the body holds, counting the ones nested inside control flow.
 fn count_body_statements(stmts: &[CStmt]) -> usize {
     fn visit(stmt: &CStmt) -> usize {
-        match stmt {
+        match stmt.unobserved() {
             CStmt::Comment(_) | CStmt::Empty => 0,
             CStmt::Block(inner) => inner.iter().map(visit).sum(),
             CStmt::If {
@@ -2051,7 +2051,7 @@ fn summary_non_void_return_type(
 }
 
 fn summary_stmt_contains_return(stmt: &CStmt) -> bool {
-    match stmt {
+    match stmt.unobserved() {
         CStmt::Return(_) => true,
         CStmt::Block(stmts) => stmts.iter().any(summary_stmt_contains_return),
         CStmt::If {
@@ -2775,21 +2775,28 @@ impl From<crate::shadow_report::DomainLedger> for BindingShadowDomainAudit {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BindingObservationDomainAudit {
     pub total: usize,
-    pub accounted: usize,
-    pub absent: usize,
+    pub rendered: usize,
+    pub justified_elision: usize,
     pub refused: usize,
+    pub unaccounted: usize,
 }
 
 impl BindingObservationDomainAudit {
     pub const fn equations_hold(self) -> bool {
-        let Some(accounted) = self.accounted.checked_add(self.absent) else {
+        let Some(accounted) = self.rendered.checked_add(self.justified_elision) else {
             return false;
         };
-        accounted == self.total && self.refused <= self.accounted
+        let Some(accounted) = accounted.checked_add(self.refused) else {
+            return false;
+        };
+        let Some(accounted) = accounted.checked_add(self.unaccounted) else {
+            return false;
+        };
+        accounted == self.total
     }
 
     pub const fn is_complete(self) -> bool {
-        self.equations_hold() && self.absent == 0
+        self.equations_hold() && self.unaccounted == 0
     }
 
     pub const fn passes_quality(self) -> bool {
@@ -2803,9 +2810,10 @@ impl From<crate::observation_journal::LegacyObservationDomainCoverage>
     fn from(coverage: crate::observation_journal::LegacyObservationDomainCoverage) -> Self {
         Self {
             total: coverage.total,
-            accounted: coverage.accounted,
-            absent: coverage.absent,
+            rendered: coverage.rendered,
+            justified_elision: coverage.justified_elision,
             refused: coverage.refused,
+            unaccounted: coverage.unaccounted,
         }
     }
 }
@@ -2878,11 +2886,330 @@ impl From<crate::shadow_report::ShadowLedger> for BindingShadowAuditLedger {
     }
 }
 
+/// Stable public cause retained when the observation journal cannot be built or sealed.
+///
+/// The journal's implementation error type remains private because it also
+/// carries renderer-only contracts.  This projection preserves every error
+/// category and the canonical IDs or counts that are safe to expose across the
+/// `r2dec`/`r2engine` boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BindingMachineProjectionFailure {
+    UntrustedArtifactProvenance,
+    IncompleteObligationInventory,
+    MissingGraphValue { value: r2ssa::ValueId },
+    MissingGraphBlock { block: r2ssa::BlockId },
+    DuplicateBlockAddress { address: u64 },
+    TopologyMismatch,
+    MachineContextMismatch,
+    MissingInstruction { inst: r2ssa::InstId },
+    MissingInstructionDisposition { inst: r2ssa::InstId },
+    MissingUseDisposition { site: r2ssa::UseSite },
+    MissingWriteDisposition { inst: r2ssa::InstId },
+    MissingOutput { inst: r2ssa::InstId },
+    InvalidValueWidth { value: r2ssa::ValueId, size_bytes: u32 },
+    ConstantTooWide { value: r2ssa::ValueId, width_bits: u32 },
+    WrongOperandCount { inst: r2ssa::InstId, expected: usize, actual: usize },
+    WidthMismatch { inst: r2ssa::InstId, expected_bits: u32, actual_bits: u32 },
+    InvalidCastWidth {
+        inst: r2ssa::InstId,
+        kind: r2ssa::MachineCastKind,
+        from_bits: u32,
+        to_bits: u32,
+    },
+    InvalidSubpiece {
+        inst: r2ssa::InstId,
+        source_bits: u32,
+        result_bits: u32,
+        lsb_bits: u32,
+    },
+    InvalidChild { expr_index: usize, child_index: usize },
+    InvalidExpressionType { expr_index: usize },
+    DuplicateEntity { value: r2ssa::ValueId },
+    EntityMismatch { inst: r2ssa::InstId },
+    ObligationMismatch { inst: r2ssa::InstId },
+    UseDispositionMismatch { site: r2ssa::UseSite },
+    WriteDispositionMismatch { inst: r2ssa::InstId },
+    ObligationSourceMismatch { instruction: r2ssa::CanonicalInstructionId },
+    UnsupportedOperation { inst: r2ssa::InstId },
+}
+
+impl BindingMachineProjectionFailure {
+    pub const fn kind(self) -> &'static str {
+        match self {
+            Self::UntrustedArtifactProvenance => "binding_plan_machine_untrusted_artifact_provenance",
+            Self::IncompleteObligationInventory => "binding_plan_machine_incomplete_obligation_inventory",
+            Self::MissingGraphValue { .. } => "binding_plan_machine_missing_graph_value",
+            Self::MissingGraphBlock { .. } => "binding_plan_machine_missing_graph_block",
+            Self::DuplicateBlockAddress { .. } => "binding_plan_machine_duplicate_block_address",
+            Self::TopologyMismatch => "binding_plan_machine_topology_mismatch",
+            Self::MachineContextMismatch => "binding_plan_machine_context_mismatch",
+            Self::MissingInstruction { .. } => "binding_plan_machine_missing_instruction",
+            Self::MissingInstructionDisposition { .. } => {
+                "binding_plan_machine_missing_instruction_disposition"
+            }
+            Self::MissingUseDisposition { .. } => "binding_plan_machine_missing_use_disposition",
+            Self::MissingWriteDisposition { .. } => {
+                "binding_plan_machine_missing_write_disposition"
+            }
+            Self::MissingOutput { .. } => "binding_plan_machine_missing_output",
+            Self::InvalidValueWidth { .. } => "binding_plan_machine_invalid_value_width",
+            Self::ConstantTooWide { .. } => "binding_plan_machine_constant_too_wide",
+            Self::WrongOperandCount { .. } => "binding_plan_machine_wrong_operand_count",
+            Self::WidthMismatch { .. } => "binding_plan_machine_width_mismatch",
+            Self::InvalidCastWidth { kind, .. } => match kind {
+                r2ssa::MachineCastKind::ZeroExtend => {
+                    "binding_plan_machine_invalid_zero_extend_width"
+                }
+                r2ssa::MachineCastKind::SignExtend => {
+                    "binding_plan_machine_invalid_sign_extend_width"
+                }
+                r2ssa::MachineCastKind::Truncate => {
+                    "binding_plan_machine_invalid_truncate_width"
+                }
+                r2ssa::MachineCastKind::BitReinterpret => {
+                    "binding_plan_machine_invalid_bit_reinterpret_width"
+                }
+                r2ssa::MachineCastKind::IntegerToAddress => {
+                    "binding_plan_machine_invalid_integer_to_address_width"
+                }
+                r2ssa::MachineCastKind::AddressToInteger => {
+                    "binding_plan_machine_invalid_address_to_integer_width"
+                }
+            },
+            Self::InvalidSubpiece { .. } => "binding_plan_machine_invalid_subpiece",
+            Self::InvalidChild { .. } => "binding_plan_machine_invalid_child",
+            Self::InvalidExpressionType { .. } => "binding_plan_machine_invalid_expression_type",
+            Self::DuplicateEntity { .. } => "binding_plan_machine_duplicate_entity",
+            Self::EntityMismatch { .. } => "binding_plan_machine_entity_mismatch",
+            Self::ObligationMismatch { .. } => "binding_plan_machine_obligation_mismatch",
+            Self::UseDispositionMismatch { .. } => "binding_plan_machine_use_disposition_mismatch",
+            Self::WriteDispositionMismatch { .. } => {
+                "binding_plan_machine_write_disposition_mismatch"
+            }
+            Self::ObligationSourceMismatch { instruction } => match instruction.site {
+                r2ssa::CanonicalInstructionSite::Phi(storage) => match storage.space {
+                    r2ssa::CanonicalStorageSpace::Ram => {
+                        "binding_plan_machine_obligation_source_mismatch_phi_ram"
+                    }
+                    r2ssa::CanonicalStorageSpace::Register => {
+                        "binding_plan_machine_obligation_source_mismatch_phi_register"
+                    }
+                    r2ssa::CanonicalStorageSpace::Unique => {
+                        "binding_plan_machine_obligation_source_mismatch_phi_unique"
+                    }
+                    r2ssa::CanonicalStorageSpace::Constant => {
+                        "binding_plan_machine_obligation_source_mismatch_phi_constant"
+                    }
+                    r2ssa::CanonicalStorageSpace::Custom(_) => {
+                        "binding_plan_machine_obligation_source_mismatch_phi_custom"
+                    }
+                    r2ssa::CanonicalStorageSpace::Unknown => {
+                        "binding_plan_machine_obligation_source_mismatch_phi_unknown"
+                    }
+                },
+                r2ssa::CanonicalInstructionSite::Op(_) => {
+                    "binding_plan_machine_obligation_source_mismatch_op"
+                }
+                r2ssa::CanonicalInstructionSite::NativeSpan { .. } => {
+                    "binding_plan_machine_obligation_source_mismatch_native_span"
+                }
+            },
+            Self::UnsupportedOperation { .. } => "binding_plan_machine_unsupported_operation",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BindingObservationJournalFailure {
+    SourceAuthority,
+    BindingPlanAuthority,
+    BindingPlanMachineProjection(BindingMachineProjectionFailure),
+    BindingPlanValueTopology { index: usize, value: r2ssa::ValueId },
+    BindingPlanDispositionCount { expected: usize, actual: usize },
+    BindingPlanBindingCount { expected: usize, actual: usize },
+    BindingPlanInvalidBindingReference { value: r2ssa::ValueId, binding_index: usize },
+    BindingPlanNonBoundValue { value: r2ssa::ValueId },
+    BindingPlanCertificateMembership { binding_index: usize },
+    BindingPlanDeclarationWidth { binding_index: usize },
+    BindingPlanInvalidLiteralInline { value: r2ssa::ValueId },
+    BindingPlanUnexpectedValueDisposition { value: r2ssa::ValueId },
+    BindingPlanStackObjectCount { expected: usize, actual: usize },
+    BindingPlanUnexpectedStackObjectDisposition { object: r2ssa::ObjectId },
+    BindingPlanStackObjectCertificate { object: r2ssa::ObjectId, binding_index: usize },
+    BindingPlanStackObjectDeclarationWidth { object: r2ssa::ObjectId, binding_index: usize },
+    NormalizationSourceAuthority,
+    NormalizationBlockTopology,
+    NormalizationRowCount { block_address: u64 },
+    NormalizationOriginalInstruction { block_address: u64, op_idx: usize },
+    NormalizationOriginalCoverage,
+    NormalizationPhiEdge { block_address: u64, op_idx: usize },
+    NormalizationRelocatedInitializer { block_address: u64, op_idx: usize },
+    NormalizationRemovedPhi,
+    NormalizationRemovedPhiEdge,
+    NormalizationInvalidCarrierCertificates,
+    TooManyObservations,
+    InvalidValue {
+        value: r2ssa::ValueId,
+    },
+    InvalidUse {
+        site: r2ssa::UseSite,
+    },
+    InvalidWrite {
+        inst: r2ssa::InstId,
+    },
+    OutputlessWrite {
+        inst: r2ssa::InstId,
+    },
+    InvalidNormalizedSite {
+        block: r2ssa::BlockId,
+        op_idx: usize,
+    },
+    MissingNormalizedBlock {
+        address: u64,
+    },
+    MissingNormalizedSiteContext,
+    InvalidNormalizedInput {
+        block: r2ssa::BlockId,
+        op_idx: usize,
+        input_idx: usize,
+    },
+    MissingNormalizedOutput {
+        block: r2ssa::BlockId,
+        op_idx: usize,
+    },
+    RefusedRenderedUse {
+        site: r2ssa::UseSite,
+    },
+    RefusedRenderedWrite {
+        inst: r2ssa::InstId,
+    },
+    RenderedValueRequired {
+        value: r2ssa::ValueId,
+    },
+    ExactUseRequiresRenderedOccurrence {
+        site: r2ssa::UseSite,
+    },
+    ExactWriteRequiresRenderedOccurrence {
+        inst: r2ssa::InstId,
+    },
+    SymbolTableMismatch,
+    UnownedBindingSymbol {
+        symbol_index: usize,
+    },
+    ConflictingValue {
+        value: r2ssa::ValueId,
+    },
+    ConflictingUse {
+        site: r2ssa::UseSite,
+    },
+    ConflictingWrite {
+        inst: r2ssa::InstId,
+    },
+    ObservationDomainTooLarge {
+        expected_count: usize,
+    },
+    ObservationCapacityUnavailable {
+        expected_count: usize,
+    },
+    ObservationOutOfRange {
+        observation_id: u32,
+        expected_count: usize,
+    },
+    DuplicateObservation {
+        observation_id: u32,
+    },
+}
+
+impl BindingObservationJournalFailure {
+    /// Stable machine-readable category used by the plugin JSON boundary.
+    pub const fn kind(self) -> &'static str {
+        match self {
+            Self::SourceAuthority => "source_authority",
+            Self::BindingPlanAuthority => "binding_plan_authority",
+            Self::BindingPlanMachineProjection(failure) => failure.kind(),
+            Self::BindingPlanValueTopology { .. } => "binding_plan_value_topology",
+            Self::BindingPlanDispositionCount { .. } => "binding_plan_disposition_count",
+            Self::BindingPlanBindingCount { .. } => "binding_plan_binding_count",
+            Self::BindingPlanInvalidBindingReference { .. } => {
+                "binding_plan_invalid_binding_reference"
+            }
+            Self::BindingPlanNonBoundValue { .. } => "binding_plan_non_bound_value",
+            Self::BindingPlanCertificateMembership { .. } => {
+                "binding_plan_certificate_membership"
+            }
+            Self::BindingPlanDeclarationWidth { .. } => "binding_plan_declaration_width",
+            Self::BindingPlanInvalidLiteralInline { .. } => "binding_plan_invalid_literal_inline",
+            Self::BindingPlanUnexpectedValueDisposition { .. } => {
+                "binding_plan_unexpected_value_disposition"
+            }
+            Self::BindingPlanStackObjectCount { .. } => "binding_plan_stack_object_count",
+            Self::BindingPlanUnexpectedStackObjectDisposition { .. } => {
+                "binding_plan_unexpected_stack_object_disposition"
+            }
+            Self::BindingPlanStackObjectCertificate { .. } => {
+                "binding_plan_stack_object_certificate"
+            }
+            Self::BindingPlanStackObjectDeclarationWidth { .. } => {
+                "binding_plan_stack_object_declaration_width"
+            }
+            Self::NormalizationSourceAuthority => "normalization_source_authority",
+            Self::NormalizationBlockTopology => "normalization_block_topology",
+            Self::NormalizationRowCount { .. } => "normalization_row_count",
+            Self::NormalizationOriginalInstruction { .. } => {
+                "normalization_original_instruction"
+            }
+            Self::NormalizationOriginalCoverage => "normalization_original_coverage",
+            Self::NormalizationPhiEdge { .. } => "normalization_phi_edge",
+            Self::NormalizationRelocatedInitializer { .. } => {
+                "normalization_relocated_initializer"
+            }
+            Self::NormalizationRemovedPhi => "normalization_removed_phi",
+            Self::NormalizationRemovedPhiEdge => "normalization_removed_phi_edge",
+            Self::NormalizationInvalidCarrierCertificates => {
+                "normalization_invalid_carrier_certificates"
+            }
+            Self::TooManyObservations => "too_many_observations",
+            Self::InvalidValue { .. } => "invalid_value",
+            Self::InvalidUse { .. } => "invalid_use",
+            Self::InvalidWrite { .. } => "invalid_write",
+            Self::OutputlessWrite { .. } => "outputless_write",
+            Self::InvalidNormalizedSite { .. } => "invalid_normalized_site",
+            Self::MissingNormalizedBlock { .. } => "missing_normalized_block",
+            Self::MissingNormalizedSiteContext => "missing_normalized_site_context",
+            Self::InvalidNormalizedInput { .. } => "invalid_normalized_input",
+            Self::MissingNormalizedOutput { .. } => "missing_normalized_output",
+            Self::RefusedRenderedUse { .. } => "refused_rendered_use",
+            Self::RefusedRenderedWrite { .. } => "refused_rendered_write",
+            Self::RenderedValueRequired { .. } => "rendered_value_required",
+            Self::ExactUseRequiresRenderedOccurrence { .. } => {
+                "exact_use_requires_rendered_occurrence"
+            }
+            Self::ExactWriteRequiresRenderedOccurrence { .. } => {
+                "exact_write_requires_rendered_occurrence"
+            }
+            Self::SymbolTableMismatch => "symbol_table_mismatch",
+            Self::UnownedBindingSymbol { .. } => "unowned_binding_symbol",
+            Self::ConflictingValue { .. } => "conflicting_value",
+            Self::ConflictingUse { .. } => "conflicting_use",
+            Self::ConflictingWrite { .. } => "conflicting_write",
+            Self::ObservationDomainTooLarge { .. } => "observation_domain_too_large",
+            Self::ObservationCapacityUnavailable { .. } => {
+                "observation_capacity_unavailable"
+            }
+            Self::ObservationOutOfRange { .. } => "observation_out_of_range",
+            Self::DuplicateObservation { .. } => "duplicate_observation",
+        }
+    }
+}
+
 /// Typed reason a production binding-shadow audit did not complete cleanly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BindingShadowAuditFailure {
     PlanBuild,
     SourcePairing,
+    JournalConstruction(BindingObservationJournalFailure),
+    JournalRecording(BindingObservationJournalFailure),
+    JournalSeal(BindingObservationJournalFailure),
     Report,
     IncompleteObservations {
         ledger: BindingShadowAuditLedger,
@@ -2970,19 +3297,68 @@ impl DecompileBindingAudit {
     }
 }
 
+/// Rendered C whose same-run binding classification is deliberately deferred.
+///
+/// The engine uses this boundary to make every production cancellation and
+/// deadline decision before the diagnostic shadow comparison runs. Finalizing
+/// consumes the exact rendered product; dropping it emits the same C without
+/// paying for or consulting the audit.
+pub struct PendingDecompileBindingAudit {
+    output: String,
+    product: Option<(
+        InternalBuildProduct,
+        r2types::function_facts::SourceOwnedFunctionFacts,
+    )>,
+    ready: BindingShadowAuditOutcome,
+}
+
+impl PendingDecompileBindingAudit {
+    fn from_audit(audit: DecompileBindingAudit) -> Self {
+        Self {
+            output: audit.output,
+            product: None,
+            ready: audit.binding_shadow,
+        }
+    }
+
+    fn from_product(
+        output: String,
+        product: InternalBuildProduct,
+        source: r2types::function_facts::SourceOwnedFunctionFacts,
+    ) -> Self {
+        Self {
+            output,
+            product: Some((product, source)),
+            ready: BindingShadowAuditOutcome::NotRun,
+        }
+    }
+
+    pub fn output(&self) -> &str {
+        &self.output
+    }
+
+    pub fn into_output(self) -> String {
+        self.output
+    }
+
+    pub fn finalize(self) -> DecompileBindingAudit {
+        let binding_shadow = self.product.map_or(self.ready, |(product, source)| {
+            product.binding_shadow(&source)
+        });
+        DecompileBindingAudit {
+            output: self.output,
+            binding_shadow,
+        }
+    }
+}
+
 /// Private result of one source-authority-bound native build.
 ///
 /// Native output retains the exact binding plan and final-AST observations.
 /// Residual output is marker-free and carries no pretend native audit.
 enum InternalBuildProduct {
     Native(SealedNativeFunction),
-    Residual {
-        ready: EmissionReadyFunction,
-        /// Exact sealed evidence from a native attempt that had to refuse
-        /// executable C. The residual is what may be emitted; this retained
-        /// attempt exists only so refusal remains visible in the audit ledger.
-        attempted_native: Option<SealedNativeFunction>,
-    },
+    Residual(EmissionReadyFunction),
 }
 
 enum PreparedDecompile {
@@ -2992,53 +3368,36 @@ enum PreparedDecompile {
 
 impl InternalBuildProduct {
     fn residual(function: CFunction) -> Self {
-        Self::Residual {
-            ready: prepare_function_for_emission(&function),
-            attempted_native: None,
-        }
-    }
-
-    fn residual_after_native_attempt(
-        function: CFunction,
-        attempted_native: SealedNativeFunction,
-    ) -> Self {
-        Self::Residual {
-            ready: prepare_function_for_emission(&function),
-            attempted_native: Some(attempted_native),
-        }
+        Self::Residual(prepare_function_for_emission(&function))
     }
 
     fn emission(&self) -> &EmissionReadyFunction {
         match self {
             Self::Native(native) => native.emission(),
-            Self::Residual { ready, .. } => ready,
+            Self::Residual(ready) => ready,
         }
     }
 
     fn into_function(self) -> CFunction {
         match self {
             Self::Native(native) => native.into_function(),
-            Self::Residual { ready, .. } => ready.into_function(),
+            Self::Residual(ready) => ready.into_function(),
         }
     }
 
     fn binding_shadow(&self, source: &r2types::SourceOwnedFunctionFacts) -> BindingShadowAuditOutcome {
-        let native = match self {
-            Self::Native(native) => native,
-            Self::Residual {
-                attempted_native: Some(native),
-                ..
-            } => native,
-            Self::Residual {
-                attempted_native: None,
-                ..
-            } => return BindingShadowAuditOutcome::NotRun,
+        let Self::Native(native) = self else {
+            return BindingShadowAuditOutcome::NotRun;
+        };
+        let (observations, coverage) = match native.audit_observations() {
+            Ok(observations) => observations,
+            Err(failure) => return BindingShadowAuditOutcome::Failed(failure),
         };
         let outcome = BindingShadowOutcome::build(
             native.plan(),
             source,
-            native.observations(),
-            native.observation_coverage(),
+            observations,
+            coverage,
         );
         BindingShadowAuditOutcome::from_internal(&outcome)
     }
@@ -3250,24 +3609,82 @@ impl Decompiler {
         input: &'a DecompilerInput,
         control: &'a dyn r2ssa::SsaWorkControl,
     ) -> Result<String, (DecompileExecutionStop, Option<String>)> {
+        self.decompile_input_keeping_partial_with_pending_binding_audit(input, control)
+            .map(PendingDecompileBindingAudit::into_output)
+            .map_err(|(stop, partial)| {
+                (
+                    stop,
+                    partial.map(PendingDecompileBindingAudit::into_output),
+                )
+            })
+    }
+
+    /// Render with a same-run binding audit, retaining both after a rendering stop.
+    ///
+    /// A product-bound partial is classified from the exact product that was
+    /// rendered. The audit is never rebuilt, and its construction performs no
+    /// work-control poll. Stops before a product exists therefore retain no
+    /// partial; either rendering poll retains the already sealed product's C and
+    /// audit together.
+    pub fn decompile_input_keeping_partial_with_binding_audit<'a>(
+        &self,
+        input: &'a DecompilerInput,
+        control: &'a dyn r2ssa::SsaWorkControl,
+    ) -> Result<DecompileBindingAudit, (DecompileExecutionStop, Option<DecompileBindingAudit>)> {
+        self.decompile_input_keeping_partial_with_pending_binding_audit(input, control)
+            .map(PendingDecompileBindingAudit::finalize)
+            .map_err(|(stop, partial)| {
+                (stop, partial.map(PendingDecompileBindingAudit::finalize))
+            })
+    }
+
+    /// Render while deferring non-consuming binding classification until the
+    /// caller has made every production control decision.
+    pub fn decompile_input_keeping_partial_with_pending_binding_audit<'a>(
+        &self,
+        input: &'a DecompilerInput,
+        control: &'a dyn r2ssa::SsaWorkControl,
+    ) -> Result<
+        PendingDecompileBindingAudit,
+        (DecompileExecutionStop, Option<PendingDecompileBindingAudit>),
+    > {
         let product = match self.prepare_decompile_with_control(input, control) {
-            Ok(PreparedDecompile::Immediate(audit)) => return Ok(audit.into_output()),
+            Ok(PreparedDecompile::Immediate(audit)) => {
+                return Ok(PendingDecompileBindingAudit::from_audit(audit));
+            }
             Ok(PreparedDecompile::NativeOrResidual(product)) => product,
             Err(stop) => return Err((stop, None)),
         };
-        let render_work =
-            DecompileWorkControl::new(control, DecompileWorkPhase::Rendering);
+        let render_work = DecompileWorkControl::new(control, DecompileWorkPhase::Rendering);
         if let Err(stop) = render_work.poll() {
-            let partial = CodeGenerator::new(self.config.codegen.clone())
+            let output = CodeGenerator::new(self.config.codegen.clone())
                 .generate_function(product.emission());
-            return Err((stop, Some(partial)));
+            return Err((
+                stop,
+                Some(PendingDecompileBindingAudit::from_product(
+                    output,
+                    product,
+                    input.source_owned_facts().clone(),
+                )),
+            ));
         }
         let output = CodeGenerator::new(self.config.codegen.clone())
             .generate_function(product.emission());
         if let Err(stop) = render_work.poll() {
-            return Err((stop, Some(output)));
+            return Err((
+                stop,
+                Some(PendingDecompileBindingAudit::from_product(
+                    output,
+                    product,
+                    input.source_owned_facts().clone(),
+                )),
+            ));
         }
-        Ok(output)
+        Ok(PendingDecompileBindingAudit::from_product(
+            output,
+            product,
+            input.source_owned_facts().clone(),
+        ))
     }
 
     /// Build a C function from a prepared function + typed context payload.
@@ -3332,14 +3749,18 @@ impl Decompiler {
     }
 
     pub(crate) fn prepend_comment(stmt: CStmt, text: String) -> CStmt {
+        let (semantic, observations) = stmt.into_semantic_with_observations();
         let comment = CStmt::comment(text);
-        match stmt {
+        match semantic {
             CStmt::Empty => CStmt::Block(vec![comment]),
             CStmt::Block(mut stmts) => {
+                // Inserting a new sibling splits the observed block position;
+                // no existing child is an exact owner for its outer markers.
+                // Nested child observations remain intact.
                 stmts.insert(0, comment);
                 CStmt::Block(stmts)
             }
-            other => CStmt::Block(vec![comment, other]),
+            other => CStmt::Block(vec![comment, observations.reapply(other)]),
         }
     }
 
@@ -3885,25 +4306,20 @@ impl Decompiler {
                 )));
             }
         };
-        let observation_journal = match LegacyObservationJournal::new(
+        let (observation_journal, observation_failure) = match LegacyObservationJournal::new(
             input.source_owned_facts(),
             &normalized_func,
             &normalization_origins,
             Rc::clone(&binding_plan),
             Rc::clone(&symbol_table),
         ) {
-            Ok(journal) => std::cell::RefCell::new(journal),
-            Err(error) => {
-                return Ok(InternalBuildProduct::residual(
-                    residual_function_for_render_boundary(
-                        &func
-                            .name
-                            .clone()
-                            .unwrap_or_else(|| format!("sub_{:x}", func.entry)),
-                        &format!("observation journal refusal: {error:?}"),
-                    ),
-                ));
-            }
+            Ok(journal) => (Some(std::cell::RefCell::new(journal)), None),
+            Err(error) => (
+                None,
+                Some(BindingShadowAuditFailure::JournalConstruction(
+                    BindingObservationJournalFailure::from(&error),
+                )),
+            ),
         };
         work.poll()?;
         if std::env::var_os("R2SLEIGH_DEBUG_MERGES").is_some() {
@@ -4110,7 +4526,7 @@ impl Decompiler {
         };
         let fold_inputs = FoldInputs {
             normalization_origins: Some(&normalization_origins),
-            observation_journal: Some(&observation_journal),
+            observation_journal: observation_journal.as_ref(),
             arch: &fold_arch,
             display_names: self.context.function_facts.display_names(),
             #[cfg(test)]
@@ -4429,48 +4845,30 @@ impl Decompiler {
         }
 
         let observation_error = fold_ctx.observation_error.borrow().clone();
-        if let Some(error) = observation_error {
-            let residual = residual_function_for_render_boundary(
-                &c_function.name,
-                &format!("observation journal refusal: {error:?}"),
-            );
-            drop(fold_ctx);
-            let journal = observation_journal.into_inner();
-            let draft = MarkedNativeDraft::new(c_function, journal);
-            return Ok(match draft.seal(input.source_owned_facts()) {
-                Ok(attempted_native) => {
-                    InternalBuildProduct::residual_after_native_attempt(residual, attempted_native)
-                }
-                Err(seal_error) => InternalBuildProduct::residual(
-                    residual_function_for_render_boundary(
-                        &func_name,
-                        &format!(
-                            "observation journal refusal: {error:?}; sealing refusal: {seal_error:?}"
-                        ),
-                    ),
-                ),
-            });
-        }
         drop(fold_ctx);
-        let journal = observation_journal.into_inner();
-        let draft = MarkedNativeDraft::new(c_function, journal);
-        match draft.seal(input.source_owned_facts()) {
-            Ok(native) => Ok(InternalBuildProduct::Native(native)),
-            Err(error) => Ok(InternalBuildProduct::residual(
-                residual_function_for_render_boundary(
-                    &func_name,
-                    &format!("observation journal refusal: {error:?}"),
-                ),
-            )),
-        }
+        let native = match observation_journal {
+            Some(journal) => MarkedNativeDraft::new(c_function, journal.into_inner())
+                .finish_non_consuming(input.source_owned_facts(), observation_error),
+            None => SealedNativeFunction::without_observations(
+                c_function,
+                binding_plan,
+                observation_failure
+                    .expect("missing observation journal retains its construction failure"),
+            ),
+        };
+        Ok(InternalBuildProduct::Native(native))
     }
 
     /// Convert a CStmt to a Vec<CStmt>.
     fn stmt_to_vec(&self, stmt: CStmt) -> Vec<CStmt> {
-        match stmt {
-            CStmt::Block(stmts) => stmts,
+        let (semantic, observations) = stmt.into_semantic_with_observations();
+        match semantic {
+            CStmt::Block(mut stmts) => {
+                observations.reapply_to_unique(&mut stmts);
+                stmts
+            }
             CStmt::Empty => vec![],
-            other => vec![other],
+            other => vec![observations.reapply(other)],
         }
     }
 
@@ -4883,7 +5281,7 @@ fn drop_overwritten_assignments(func: &mut CFunction) {
     fn visit(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, stmts: &mut Vec<CStmt>) {
         for stmt in stmts.iter_mut() {
             single_evaluation::for_each_child_block_mut(stmt, &mut |body, _| visit(symbols, body));
-            if let CStmt::For { init: Some(init), .. } = stmt {
+            if let CStmt::For { init: Some(init), .. } = stmt.unobserved_mut() {
                 let mut one = vec![(**init).clone()];
                 visit(symbols, &mut one);
                 if let Some(first) = one.into_iter().next() {
@@ -4939,7 +5337,7 @@ fn simplify_identities_in_function(func: &mut CFunction, fold_ctx: &FoldingConte
             let taken = std::mem::replace(expr, CExpr::IntLit(0));
             *expr = fold_ctx.simplify_identities(taken);
         });
-        if let CStmt::For { init: Some(init), .. } = stmt {
+        if let CStmt::For { init: Some(init), .. } = stmt.unobserved_mut() {
             visit(init, fold_ctx);
         }
         single_evaluation::for_each_child_block_mut(stmt, &mut |body, _| {
@@ -5575,14 +5973,14 @@ fn fold_constant_arithmetic_in_expr(
     }
     if let Some(replacement) = replacement {
         let source = std::mem::replace(expr, CExpr::IntLit(0));
-        *expr = crate::ast::carry_expr_render_observations(&source, replacement);
+        *expr = crate::ast::carry_outer_expr_observations(&source, replacement);
     }
     // Once the address is one number the string table can answer for it.
     if let Some(value) = literal_value(expr)
         && let Some(text) = strings.get(&value)
     {
         let source = std::mem::replace(expr, CExpr::IntLit(0));
-        *expr = crate::ast::carry_expr_render_observations(
+        *expr = crate::ast::carry_outer_expr_observations(
             &source,
             CExpr::StringLit(text.clone()),
         );
@@ -7372,6 +7770,38 @@ mod tests {
     }
 
     #[test]
+    fn folded_constant_keeps_only_the_rewritten_root_observation() {
+        let mut observations = crate::ast::RenderObservationOwner::new();
+        let (left_id, left) = observations
+            .observe_expr(CExpr::UIntLit(0x1000))
+            .expect("left operand observation");
+        let (right_id, right) = observations
+            .observe_expr(CExpr::UIntLit(4))
+            .expect("right operand observation");
+        let (root_id, mut expr) = observations
+            .observe_expr(CExpr::binary(BinaryOp::Add, left, right))
+            .expect("root observation");
+        let strings = BTreeMap::from([(0x1004, "text".to_string())]);
+
+        fold_constant_arithmetic_in_expr(&mut expr, &strings);
+        let mut function = CFunction::new("folded", CType::Pointer(Box::new(CType::Int(8))))
+            .with_body(vec![CStmt::Return(Some(expr))]);
+        let reachable = crate::ast::strip_render_observations(
+            &mut function,
+            observations.expected_count(),
+        )
+        .expect("constant folding preserves a valid marker domain");
+
+        assert!(reachable.contains(root_id));
+        assert!(!reachable.contains(left_id));
+        assert!(!reachable.contains(right_id));
+        assert_eq!(
+            function.body,
+            vec![CStmt::Return(Some(CExpr::StringLit("text".to_string())))]
+        );
+    }
+
+    #[test]
     fn unreferenced_local_declaration_is_removed_without_touching_live_locals() {
         let symbols = test_table();
         let mut func = CFunction::new("locals", CType::Int(32))
@@ -7439,6 +7869,102 @@ mod tests {
             func.body.as_slice(),
             [CStmt::Expr(CExpr::Call { .. })]
         ));
+    }
+
+    #[test]
+    fn prepended_comment_keeps_only_the_exact_original_statement_observation() {
+        let mut observations = crate::ast::RenderObservationOwner::new();
+        let (stmt_id, stmt) = observations
+            .observe_stmt(CStmt::Return(Some(CExpr::IntLit(7))))
+            .expect("return observation");
+        let commented = Decompiler::prepend_comment(stmt, "summary".to_string());
+        assert_eq!(
+            commented,
+            CStmt::Block(vec![
+                CStmt::comment("summary"),
+                CStmt::observed(stmt_id, CStmt::Return(Some(CExpr::IntLit(7)))),
+            ])
+        );
+
+        let mut function = CFunction::new("commented", CType::Int(32))
+            .with_body(vec![commented]);
+        let reachable = crate::ast::strip_render_observations(
+            &mut function,
+            observations.expected_count(),
+        )
+        .expect("comment insertion preserves a valid marker domain");
+        assert!(reachable.contains(stmt_id));
+    }
+
+    #[test]
+    fn prepended_comment_does_not_move_a_split_block_observation() {
+        let mut observations = crate::ast::RenderObservationOwner::new();
+        let (child_id, child) = observations
+            .observe_stmt(CStmt::Return(Some(CExpr::IntLit(1))))
+            .expect("child observation");
+        let (block_id, block) = observations
+            .observe_stmt(CStmt::Block(vec![
+                child,
+                CStmt::Return(Some(CExpr::IntLit(2))),
+            ]))
+            .expect("block observation");
+        let commented = Decompiler::prepend_comment(block, "summary".to_string());
+        let mut function = CFunction::new("commented_block", CType::Int(32))
+            .with_body(vec![commented]);
+
+        let reachable = crate::ast::strip_render_observations(
+            &mut function,
+            observations.expected_count(),
+        )
+        .expect("comment insertion preserves a valid marker domain");
+        assert!(reachable.contains(child_id));
+        assert!(
+            !reachable.contains(block_id),
+            "a new comment sibling leaves no exact owner for the old block marker"
+        );
+        assert_eq!(
+            function.body,
+            vec![CStmt::Block(vec![
+                CStmt::comment("summary"),
+                CStmt::Return(Some(CExpr::IntLit(1))),
+                CStmt::Return(Some(CExpr::IntLit(2))),
+            ])]
+        );
+    }
+
+    #[test]
+    fn split_block_observation_is_not_assigned_to_its_first_child() {
+        let mut observations = crate::ast::RenderObservationOwner::new();
+        let (first_id, first) = observations
+            .observe_stmt(CStmt::Return(Some(CExpr::IntLit(1))))
+            .expect("first statement observation");
+        let (block_id, block) = observations
+            .observe_stmt(CStmt::Block(vec![
+                first,
+                CStmt::Return(Some(CExpr::IntLit(2))),
+            ]))
+            .expect("block observation");
+        let decompiler = Decompiler::new(DecompilerConfig::x86_64());
+        let body = decompiler.stmt_to_vec(block);
+        let mut function = CFunction::new("split", CType::Int(32)).with_body(body);
+
+        let reachable = crate::ast::strip_render_observations(
+            &mut function,
+            observations.expected_count(),
+        )
+        .expect("block decomposition preserves a valid marker domain");
+        assert!(reachable.contains(first_id));
+        assert!(
+            !reachable.contains(block_id),
+            "a multi-statement block has no exact first-child projection"
+        );
+        assert_eq!(
+            function.body,
+            vec![
+                CStmt::Return(Some(CExpr::IntLit(1))),
+                CStmt::Return(Some(CExpr::IntLit(2))),
+            ]
+        );
     }
 
     #[test]
@@ -7976,7 +8502,7 @@ mod tests {
     }
 
     #[test]
-    fn native_shadow_refusal_and_incomplete_coverage_are_observable_without_changing_output() {
+    fn native_shadow_refused_rendered_use_is_an_exact_non_consuming_failure() {
         let arch = test_arch_for_decompile();
         let prepared = prepared_from_ops(
             vec![R2ILOp::Return {
@@ -7997,26 +8523,23 @@ mod tests {
         let output = decompiler.decompile_input(&input);
         let audited = decompiler.decompile_input_with_binding_audit(&input);
         assert_eq!(audited.output(), output);
-        let BindingShadowAuditOutcome::Failed(BindingShadowAuditFailure::IncompleteObservations {
-            ledger,
-            observations,
-        }) = audited.binding_shadow()
+        let BindingShadowAuditOutcome::Failed(BindingShadowAuditFailure::JournalRecording(
+            BindingObservationJournalFailure::RefusedRenderedUse { site },
+        )) = audited.binding_shadow()
         else {
             panic!(
-                "missing register geometry must remain an observable non-quality audit: {:?}; output={}",
+                "rendering a refused use must remain an exact non-consuming audit failure: {:?}; output={}",
                 audited.binding_shadow(),
                 audited.output()
             );
         };
-        assert!(ledger.equations_hold());
-        assert!(!ledger.passes_quality());
-        assert!(observations.equations_hold());
-        assert!(!observations.is_complete());
-        assert!(!observations.passes_quality());
-        assert!(
-            observations.values.absent + observations.uses.absent + observations.writes.absent > 0
+        assert_eq!(
+            site,
+            r2ssa::UseSite {
+                inst: r2ssa::InstId(0),
+                input_idx: 0,
+            }
         );
-        assert!(ledger.values.refused + ledger.uses.refused + ledger.writes.refused > 0);
     }
 
     #[test]
@@ -8081,6 +8604,102 @@ mod tests {
             .decompile_input_with_binding_audit_and_control(&input, &no_later_poll)
             .expect("shadow capture and classification must not poll work control");
         assert_eq!(no_later_poll.polls.get(), final_production_poll);
+    }
+
+    #[test]
+    fn audited_partial_retains_the_same_product_without_extra_polls() {
+        struct CountingControl {
+            polls: std::cell::Cell<usize>,
+            stop_at: Option<usize>,
+        }
+
+        impl r2ssa::SsaWorkControl for CountingControl {
+            fn poll(&self) -> Result<(), r2ssa::SsaExecutionStopReason> {
+                let poll = self.polls.get() + 1;
+                self.polls.set(poll);
+                if self.stop_at == Some(poll) {
+                    Err(r2ssa::SsaExecutionStopReason::Cancelled)
+                } else {
+                    Ok(())
+                }
+            }
+        }
+
+        let arch = test_arch_for_decompile();
+        let prepared = prepared_from_ops(
+            vec![R2ILOp::Return {
+                target: Varnode::constant(0, 8),
+            }],
+            &arch,
+        );
+        let input = source_owned_decompiler_input(
+            prepared,
+            (
+                r2types::DecompileRouteKind::Standard,
+                "same-run audited partial",
+                None,
+            ),
+        );
+        let decompiler = Decompiler::new(DecompilerConfig::x86_64());
+
+        let baseline_control = CountingControl {
+            polls: std::cell::Cell::new(0),
+            stop_at: None,
+        };
+        let baseline = decompiler
+            .decompile_input_keeping_partial_with_binding_audit(&input, &baseline_control)
+            .expect("unbounded audited rendering");
+        let final_poll = baseline_control.polls.get();
+        let first_render_poll = final_poll
+            .checked_sub(1)
+            .expect("successful product rendering has two rendering polls");
+
+        for stop_at in [first_render_poll, final_poll] {
+            let stopped_control = CountingControl {
+                polls: std::cell::Cell::new(0),
+                stop_at: Some(stop_at),
+            };
+            let (stop, partial) = decompiler
+                .decompile_input_keeping_partial_with_binding_audit(&input, &stopped_control)
+                .expect_err("selected rendering poll must stop");
+            assert_eq!(stop.phase(), DecompileWorkPhase::Rendering);
+            assert_eq!(stop.reason(), r2ssa::SsaExecutionStopReason::Cancelled);
+            assert_eq!(
+                stopped_control.polls.get(),
+                stop_at,
+                "retaining output and audit must neither rebuild nor poll again"
+            );
+            assert_eq!(
+                partial.as_ref(),
+                Some(&baseline),
+                "the partial must classify the exact retained product"
+            );
+        }
+
+        let pre_product_control = CountingControl {
+            polls: std::cell::Cell::new(0),
+            stop_at: Some(1),
+        };
+        let (stop, partial) = decompiler
+            .decompile_input_keeping_partial_with_binding_audit(&input, &pre_product_control)
+            .expect_err("initial preparation poll must stop");
+        assert_eq!(stop.phase(), DecompileWorkPhase::Normalization);
+        assert_eq!(partial, None);
+        assert_eq!(pre_product_control.polls.get(), 1);
+
+        let compatibility_control = CountingControl {
+            polls: std::cell::Cell::new(0),
+            stop_at: None,
+        };
+        let compatibility_output = decompiler
+            .decompile_input_keeping_partial(&input, &compatibility_control)
+            .expect("compatibility rendering");
+        assert_eq!(compatibility_output, baseline.output());
+        assert_eq!(
+            compatibility_control.polls.get(),
+            final_poll,
+            "the string compatibility mapper must add no work-control decision"
+        );
     }
 
     /// Nothing in this function is unproven, so it carries no proof note. A

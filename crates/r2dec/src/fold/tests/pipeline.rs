@@ -1441,7 +1441,11 @@ mod tests {
 
         let mut ctx = make_x86_64_ctx_with_prepared(&prepared);
         let (plan, names, journal) = install_observed_lowering(&mut ctx, &prepared);
-        let expr = ctx.op_to_expr_at(&block.ops[op_idx], block.addr, op_idx);
+        let LoweredExprAt::Rendered(expr) =
+            ctx.op_to_expr_at(&block.ops[op_idx], block.addr, op_idx)
+        else {
+            panic!("integer addition must lower to a rendered expression");
+        };
         assert_eq!(*ctx.observation_error.borrow(), None);
         let symbols = Rc::clone(&ctx.symbols);
         drop(ctx);
@@ -1569,6 +1573,44 @@ mod tests {
     }
 
     #[test]
+    fn observed_statement_lowering_preserves_the_direct_finalized_statement() {
+        let arch = make_test_arch_x86_64();
+        let mut entry = R2ILBlock::new(0x1000, 4);
+        entry.push(R2ILOp::Copy {
+            dst: Varnode::unique(0x20, 8),
+            src: Varnode::constant(7, 8),
+        });
+        let prepared = prepared_from_r2il_blocks(&[entry], &arch)
+            .with_name("observed_finalized_statement_once");
+        let block = prepared.function().get_block(0x1000).expect("entry block");
+        let op_idx = block
+            .ops
+            .iter()
+            .position(|op| matches!(op, SSAOp::Copy { .. }))
+            .expect("copy operation");
+
+        let mut ctx = make_x86_64_ctx_with_prepared(&prepared);
+        let _observations = install_observed_lowering(&mut ctx, &prepared);
+        let frame = LowerFrame::for_stmt(
+            ctx.normalized_site(block.addr, op_idx),
+            Some((block.addr, op_idx)),
+            true,
+        );
+        let direct = ctx
+            .op_to_stmt_impl(&block.ops[op_idx], &frame)
+            .expect("direct finalized statement");
+        let lowered = ctx
+            .op_to_stmt_with_args(&block.ops[op_idx], block.addr, op_idx)
+            .expect("public statement lowering");
+
+        assert_eq!(
+            direct.clone_without_render_observations(),
+            lowered.clone_without_render_observations(),
+            "statement lowering must attach output identity without re-running assignment finalization",
+        );
+    }
+
+    #[test]
     fn unsupported_expression_fallback_does_not_claim_output() {
         let arch = make_test_arch_x86_64();
         let mut entry = R2ILBlock::new(0x1000, 4);
@@ -1607,7 +1649,11 @@ mod tests {
             ),
             "absence is meaningful only for an exact upstream write"
         );
-        let fallback = ctx.op_to_expr_at(&block.ops[op_idx], block.addr, op_idx);
+        let LoweredExprAt::DestinationFallback(fallback) =
+            ctx.op_to_expr_at(&block.ops[op_idx], block.addr, op_idx)
+        else {
+            panic!("unsupported carry must remain a typed destination fallback");
+        };
         assert!(matches!(fallback.unobserved(), CExpr::Var(_)));
         assert_eq!(*ctx.observation_error.borrow(), None);
         let symbols = Rc::clone(&ctx.symbols);
@@ -3504,6 +3550,31 @@ mod tests {
     }
 
     #[test]
+    fn indirect_callable_classification_is_observation_transparent() {
+        let ctx = FoldingContext::new(64);
+        let mut owner = crate::ast::RenderObservationOwner::new();
+        let (target_id, target) = owner
+            .observe_expr(ctx.name_ref("callback"))
+            .expect("target observation");
+        let callable = FoldingContext::indirect_callable_expr(target);
+        let mut function = CFunction::new("invoke", CType::Void)
+            .with_body(vec![CStmt::Expr(callable)]);
+
+        let reachable = crate::ast::strip_render_observations(
+            &mut function,
+            owner.expected_count(),
+        )
+        .expect("target marker must survive exactly once");
+
+        assert!(reachable.contains(target_id));
+        assert_eq!(
+            function.body,
+            vec![CStmt::Expr(ctx.name_ref("callback"))],
+            "a marker around an already-callable variable must not invent a dereference"
+        );
+    }
+
+    #[test]
     fn call_with_args_lowering_residualizes_typed_identity_without_callsite_facts() {
         let mut ctx = FoldingContext::new(64);
         let source_call = (0x1000, 0);
@@ -4361,6 +4432,42 @@ mod tests {
         assert_eq!(
             ctx.expr_type_hint(&CExpr::call(callee, vec![])),
             Some(CType::ptr(CType::Void))
+        );
+    }
+
+    #[test]
+    fn undeclared_carrier_type_evidence_is_observation_transparent() {
+        let mut ctx = make_x86_64_ctx();
+        ctx.set_known_function_signatures(HashMap::from([(
+            "sym.helper".to_string(),
+            FunctionType {
+                return_type: CType::Int(32),
+                params: vec![],
+                variadic: false,
+            },
+        )]));
+        let mut owner = crate::ast::RenderObservationOwner::new();
+
+        let cast = CExpr::cast(CType::ptr(CType::UInt(8)), ctx.name_ref("raw"));
+        let (_, marked_cast) = owner
+            .observe_expr(cast.clone())
+            .expect("cast observation");
+        assert_eq!(
+            ctx.declared_type_for_carrier("mystery", &marked_cast),
+            ctx.declared_type_for_carrier("mystery", &cast)
+        );
+
+        let call = CExpr::call(ctx.name_ref("sym.helper"), vec![]);
+        let (_, marked_call) = owner
+            .observe_expr(call.clone())
+            .expect("call observation");
+        assert_eq!(
+            ctx.declared_type_for_carrier("another_mystery", &marked_call),
+            ctx.declared_type_for_carrier("another_mystery", &call)
+        );
+        assert_eq!(
+            ctx.declared_type_for_carrier("another_mystery", &call),
+            CType::Int(32)
         );
     }
 
@@ -6635,6 +6742,276 @@ mod tests {
     }
 
     #[test]
+    fn identity_simplification_keeps_only_surviving_occurrence_observations() {
+        let ctx = FoldingContext::new(64);
+        let mut owner = crate::ast::RenderObservationOwner::new();
+        let (value_id, value) = owner
+            .observe_expr(ctx.name_ref("x"))
+            .expect("value observation");
+        let (zero_id, zero) = owner
+            .observe_expr(CExpr::IntLit(0))
+            .expect("literal observation");
+        let (result_id, source) = owner
+            .observe_expr(CExpr::binary(BinaryOp::Add, value, zero))
+            .expect("result observation");
+        let simplified = ctx.simplify_identities(source);
+        let mut function = CFunction::new("identity", CType::Int(32))
+            .with_body(vec![CStmt::Return(Some(simplified))]);
+
+        let reachable = crate::ast::strip_render_observations(
+            &mut function,
+            owner.expected_count(),
+        )
+        .expect("surviving identity observations remain well formed");
+
+        assert!(reachable.contains(value_id));
+        assert!(reachable.contains(result_id));
+        assert!(
+            !reachable.contains(zero_id),
+            "the eliminated literal must remain unaccounted, not move onto x"
+        );
+        assert_eq!(
+            function.body,
+            vec![CStmt::Return(Some(ctx.name_ref("x")))]
+        );
+    }
+
+    #[test]
+    fn linear_identity_rewrite_does_not_guess_a_surviving_operand_occurrence() {
+        let mut ctx = FoldingContext::new(64);
+        ctx.set_type_hints(HashMap::from([("x".to_string(), CType::Int(32))]));
+        let mut owner = crate::ast::RenderObservationOwner::new();
+        let (first_id, first) = owner
+            .observe_expr(ctx.name_ref("x"))
+            .expect("first x observation");
+        let (second_id, second) = owner
+            .observe_expr(ctx.name_ref("x"))
+            .expect("second x observation");
+        let source = CExpr::binary(
+            BinaryOp::Add,
+            first,
+            CExpr::binary(BinaryOp::Mul, second, CExpr::IntLit(2)),
+        );
+        let (result_id, source) = owner
+            .observe_expr(source)
+            .expect("result observation");
+        let simplified = ctx.simplify_identities(source);
+        let mut function = CFunction::new("linear_identity", CType::Int(32))
+            .with_body(vec![CStmt::Return(Some(simplified))]);
+
+        let reachable = crate::ast::strip_render_observations(
+            &mut function,
+            owner.expected_count(),
+        )
+        .expect("linear identity observations remain well formed");
+
+        assert!(reachable.contains(result_id));
+        assert!(!reachable.contains(first_id));
+        assert!(!reachable.contains(second_id));
+        assert_eq!(
+            function.body,
+            vec![CStmt::Return(Some(CExpr::binary(
+                BinaryOp::Mul,
+                ctx.name_ref("x"),
+                CExpr::IntLit(3),
+            )))]
+        );
+    }
+
+    #[test]
+    fn assignment_cleanup_is_observation_transparent() {
+        let ctx = FoldingContext::new(64);
+        let lhs = ctx.name_ref("x");
+        let plain = ctx.assign_stmt(lhs.clone(), ctx.name_ref("x"));
+        let mut owner = crate::ast::RenderObservationOwner::new();
+        let (_, observed_rhs) = owner
+            .observe_expr(ctx.name_ref("x"))
+            .expect("assignment observation");
+        let marked = ctx.assign_stmt(lhs, observed_rhs);
+
+        assert_eq!(plain, None);
+        assert_eq!(
+            marked, plain,
+            "metadata around a semantic self-assignment must not keep the statement alive"
+        );
+    }
+
+    #[test]
+    fn assignment_definition_safeguard_is_observation_transparent() {
+        let mut ctx = FoldingContext::new(64);
+        ctx.state
+            .analysis_ctx
+            .use_info
+            .insert_definition_for_name_if_absent("t1", ctx.name_ref("prev"));
+
+        let plain = ctx
+            .assign_stmt(ctx.name_ref("prev"), ctx.name_ref("t1"))
+            .expect("the source assignment must survive definition rewriting");
+        let mut owner = crate::ast::RenderObservationOwner::new();
+        let (write_id, observed_lhs) = owner
+            .observe_expr(ctx.name_ref("prev"))
+            .expect("assignment target observation");
+        let (use_id, observed_rhs) = owner
+            .observe_expr(ctx.name_ref("t1"))
+            .expect("assignment source observation");
+        let marked = ctx
+            .assign_stmt(observed_lhs, observed_rhs)
+            .expect("metadata must not turn the source assignment into a self-assignment");
+        let mut function = CFunction::new("assign", CType::Void).with_body(vec![marked]);
+        let reachable = crate::ast::strip_render_observations(
+            &mut function,
+            owner.expected_count(),
+        )
+        .expect("the source observation must survive exactly once");
+
+        assert!(reachable.contains(write_id));
+        assert!(reachable.contains(use_id));
+        assert_eq!(function.body, vec![plain]);
+    }
+
+    #[test]
+    fn assignment_pointer_guard_is_observation_transparent() {
+        let mut ctx = FoldingContext::new(64);
+        ctx.set_type_hints(HashMap::from([(
+            "arg1".to_string(),
+            CType::ptr(CType::Int(8)),
+        )]));
+        let rhs = CExpr::Deref(Box::new(ctx.name_ref("arg1")));
+        let plain = ctx
+            .assign_stmt(ctx.name_ref("arg1"), rhs.clone())
+            .expect("a pointer-shaped RHS must survive the generic-argument safeguard");
+        let mut owner = crate::ast::RenderObservationOwner::new();
+        let (use_id, observed_rhs) = owner
+            .observe_expr(rhs)
+            .expect("pointer RHS observation");
+        let marked = ctx
+            .assign_stmt(ctx.name_ref("arg1"), observed_rhs)
+            .expect("metadata must not hide a pointer-shaped RHS");
+        let mut function = CFunction::new("assign", CType::Void).with_body(vec![marked]);
+        let reachable = crate::ast::strip_render_observations(
+            &mut function,
+            owner.expected_count(),
+        )
+        .expect("the pointer observation must survive exactly once");
+
+        assert!(reachable.contains(use_id));
+        assert_eq!(function.body, vec![plain]);
+    }
+
+    #[test]
+    fn scalar_address_artifact_classification_is_observation_transparent() {
+        let ctx = FoldingContext::new(64);
+        let plain = CExpr::AddrOf(Box::new(ctx.name_ref("local_8")));
+        let mut owner = crate::ast::RenderObservationOwner::new();
+        let (_, observed) = owner
+            .observe_expr(plain.clone())
+            .expect("address observation");
+
+        assert!(ctx.expr_is_address_artifact_in_scalar_context(&plain));
+        assert_eq!(
+            ctx.expr_is_address_artifact_in_scalar_context(&observed),
+            ctx.expr_is_address_artifact_in_scalar_context(&plain),
+            "observation metadata must not change scalar address classification"
+        );
+    }
+
+    #[test]
+    fn assignment_cast_policy_is_observation_transparent() {
+        let ctx = FoldingContext::new(64);
+        let target = CType::Int(32);
+        let source = CType::UInt(64);
+        let cast = CExpr::cast(target.clone(), ctx.name_ref("value"));
+        let plain = ctx.cast_expr_if_needed(cast.clone(), target.clone(), Some(&source));
+        let mut owner = crate::ast::RenderObservationOwner::new();
+        let (use_id, observed) = owner
+            .observe_expr(cast)
+            .expect("cast observation");
+        let marked = ctx.cast_expr_if_needed(observed, target, Some(&source));
+        let mut function = CFunction::new("cast", CType::Void)
+            .with_body(vec![CStmt::Expr(marked)]);
+        let reachable = crate::ast::strip_render_observations(
+            &mut function,
+            owner.expected_count(),
+        )
+        .expect("the cast observation must survive exactly once");
+
+        assert!(reachable.contains(use_id));
+        assert_eq!(function.body, vec![CStmt::Expr(plain)]);
+    }
+
+    #[test]
+    fn typed_literal_rewrite_is_observation_transparent() {
+        let ctx = FoldingContext::new(64);
+        let target = CType::Int(8);
+        let literal = CExpr::UIntLit(255);
+        let plain = ctx.rewrite_typed_assignment_literal_expr(literal.clone(), &target);
+        let mut owner = crate::ast::RenderObservationOwner::new();
+        let (use_id, observed) = owner
+            .observe_expr(literal)
+            .expect("literal observation");
+        let marked = ctx.rewrite_typed_assignment_literal_expr(observed, &target);
+        let mut function = CFunction::new("literal", CType::Void)
+            .with_body(vec![CStmt::Expr(marked)]);
+        let reachable = crate::ast::strip_render_observations(
+            &mut function,
+            owner.expected_count(),
+        )
+        .expect("the literal observation must survive exactly once");
+
+        assert!(reachable.contains(use_id));
+        assert_eq!(plain, CExpr::IntLit(-1));
+        assert_eq!(function.body, vec![CStmt::Expr(plain)]);
+    }
+
+    #[test]
+    fn redundant_return_slot_pruning_is_observation_transparent() {
+        let mut ctx = FoldingContext::new(64);
+        ctx.state.return_stack_slots.insert(-8);
+        let assignment = CStmt::Expr(CExpr::assign(
+            ctx.name_ref("local_8"),
+            ctx.name_ref("arg1"),
+        ));
+        let ret = CStmt::Return(Some(ctx.name_ref("arg1")));
+        let plain = ctx.prune_redundant_return_slot_assignments(vec![
+            assignment.clone(),
+            ret.clone(),
+        ]);
+        let repeated_plain = ctx.prune_redundant_return_slot_assignments(vec![
+            assignment.clone(),
+            ret.clone(),
+        ]);
+        assert_eq!(repeated_plain, plain, "the pruning decision must be repeatable");
+
+        let mut owner = crate::ast::RenderObservationOwner::new();
+        let (_, marked_assignment) = owner
+            .observe_stmt(assignment.clone())
+            .expect("assignment observation");
+        let (_, marked_return) = owner
+            .observe_stmt(ret)
+            .expect("return observation");
+        assert_eq!(
+            marked_assignment.clone_without_render_observations(),
+            assignment,
+            "stripping statement metadata must preserve the assignment"
+        );
+        assert_eq!(
+            marked_return.clone_without_render_observations(),
+            CStmt::Return(Some(ctx.name_ref("arg1"))),
+            "stripping statement metadata must preserve the return"
+        );
+        let marked = ctx.prune_redundant_return_slot_assignments(vec![
+            marked_assignment,
+            marked_return,
+        ]);
+        let mut function = CFunction::new("return_slot", CType::Int(32)).with_body(marked);
+        crate::ast::strip_render_observations(&mut function, owner.expected_count())
+            .expect("surviving observations remain well formed");
+
+        assert_eq!(plain, vec![CStmt::Return(Some(ctx.name_ref("arg1")))]);
+        assert_eq!(function.body, plain);
+    }
+
+    #[test]
     fn test_identity_add_repeated_scaled_term() {
         let mut ctx = FoldingContext::new(64);
         ctx.set_type_hints(HashMap::from([("x".to_string(), CType::Int(32))]));
@@ -7206,19 +7583,40 @@ mod tests {
                 index: Box::new(CExpr::IntLit(367)),
             }],
         );
+        let mut observations = crate::ast::RenderObservationOwner::new();
+        let (call_id, observed_call) = observations
+            .observe_expr(call.clone())
+            .expect("call observation");
+        let (write_id, observed_assignment) = observations
+            .observe_stmt(CStmt::Expr(CExpr::assign(
+                ctx.name_ref("x0_8"),
+                observed_call,
+            )))
+            .expect("assignment observation");
         let stmts = vec![
-            CStmt::Expr(CExpr::assign(ctx.name_ref("x0_8"), call.clone())),
+            observed_assignment,
             CStmt::Return(Some(ctx.name_ref("x0_3"))),
         ];
 
         let pruned = ctx.prune_dead_temp_assignments(stmts);
+        let mut function = CFunction::new("dead_call_result", CType::Void).with_body(pruned);
+        let reachable = crate::ast::strip_render_observations(
+            &mut function,
+            observations.expected_count(),
+        )
+        .expect("demoted call preserves a valid marker domain");
 
         assert_eq!(
-            pruned,
+            function.body,
             vec![
                 CStmt::Expr(call),
                 CStmt::Return(Some(ctx.name_ref("x0_3"))),
             ]
+        );
+        assert!(reachable.contains(call_id));
+        assert!(
+            !reachable.contains(write_id),
+            "the eliminated assignment must not earn rendered write coverage"
         );
     }
 
@@ -10323,6 +10721,35 @@ mod tests {
             ),
             Some(CExpr::AddrOf(Box::new(ctx.name_ref("var_8h"))))
         );
+    }
+
+    #[test]
+    fn visible_expression_quality_is_observation_transparent_in_every_context() {
+        let ctx = make_x86_64_ctx();
+        let plain = CExpr::binary(
+            BinaryOp::Ne,
+            ctx.name_ref("arg1"),
+            CExpr::IntLit(0),
+        );
+        let mut owner = crate::ast::RenderObservationOwner::new();
+        let (_, inner) = owner
+            .observe_expr(plain.clone())
+            .expect("inner quality observation");
+        let (_, marked) = owner
+            .observe_expr(inner)
+            .expect("outer quality observation");
+
+        for context in [
+            VisibleExprContext::Generic,
+            VisibleExprContext::ScalarPredicate,
+            VisibleExprContext::ScalarReturn,
+        ] {
+            assert_eq!(
+                ctx.debug_visible_expr_quality(&marked, context),
+                ctx.debug_visible_expr_quality(&plain, context),
+                "observation wrappers must have zero ranking weight in {context:?}"
+            );
+        }
     }
 
     #[test]

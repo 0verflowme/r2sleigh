@@ -51,6 +51,165 @@ STRICT_C_FLAGS = (
     "-Werror",
     "-O0",
 )
+BINDING_AUDIT_PREFIX = "R2SLEIGH_BINDING_AUDIT__"
+BINDING_AUDIT_DOMAINS = ("values", "uses", "writes")
+BINDING_AUDIT_JOURNAL_FAILURE_REASONS = {
+    "journal_construction_failure",
+    "journal_recording_failure",
+    "journal_seal_failure",
+}
+BINDING_AUDIT_FAILURE_REASONS = BINDING_AUDIT_JOURNAL_FAILURE_REASONS | {
+    "plan_build_failure",
+    "source_pairing_failure",
+    "report_failure",
+}
+BINDING_AUDIT_MAX_COUNT = (1 << 64) - 1
+BINDING_AUDIT_JOURNAL_CAUSE_FIELDS = {
+    "source_authority": frozenset(),
+    "binding_plan_authority": frozenset(),
+    "binding_plan_machine_untrusted_artifact_provenance": frozenset(),
+    "binding_plan_machine_incomplete_obligation_inventory": frozenset(),
+    "binding_plan_machine_missing_graph_value": frozenset({"value_id"}),
+    "binding_plan_machine_missing_graph_block": frozenset({"block_id"}),
+    "binding_plan_machine_duplicate_block_address": frozenset({"address"}),
+    "binding_plan_machine_topology_mismatch": frozenset(),
+    "binding_plan_machine_context_mismatch": frozenset(),
+    "binding_plan_machine_missing_instruction": frozenset({"instruction_id"}),
+    "binding_plan_machine_missing_instruction_disposition": frozenset(
+        {"instruction_id"}
+    ),
+    "binding_plan_machine_missing_use_disposition": frozenset(
+        {"instruction_id", "input_index"}
+    ),
+    "binding_plan_machine_missing_write_disposition": frozenset(
+        {"instruction_id"}
+    ),
+    "binding_plan_machine_missing_output": frozenset({"instruction_id"}),
+    "binding_plan_machine_invalid_value_width": frozenset(
+        {"value_id", "size_bytes"}
+    ),
+    "binding_plan_machine_constant_too_wide": frozenset(
+        {"value_id", "width_bits"}
+    ),
+    "binding_plan_machine_wrong_operand_count": frozenset(
+        {"instruction_id", "expected_count", "actual_count"}
+    ),
+    "binding_plan_machine_width_mismatch": frozenset(
+        {"instruction_id", "expected_bits", "actual_bits"}
+    ),
+    **{
+        f"binding_plan_machine_invalid_{kind}_width": frozenset(
+            {"instruction_id", "from_bits", "to_bits"}
+        )
+        for kind in (
+            "zero_extend",
+            "sign_extend",
+            "truncate",
+            "bit_reinterpret",
+            "integer_to_address",
+            "address_to_integer",
+        )
+    },
+    "binding_plan_machine_invalid_subpiece": frozenset(
+        {"instruction_id", "source_bits", "result_bits", "lsb_bits"}
+    ),
+    "binding_plan_machine_invalid_child": frozenset(
+        {"expression_index", "child_index"}
+    ),
+    "binding_plan_machine_invalid_expression_type": frozenset(
+        {"expression_index"}
+    ),
+    "binding_plan_machine_duplicate_entity": frozenset({"value_id"}),
+    "binding_plan_machine_entity_mismatch": frozenset({"instruction_id"}),
+    "binding_plan_machine_obligation_mismatch": frozenset({"instruction_id"}),
+    "binding_plan_machine_use_disposition_mismatch": frozenset(
+        {"instruction_id", "input_index"}
+    ),
+    "binding_plan_machine_write_disposition_mismatch": frozenset(
+        {"instruction_id"}
+    ),
+    **{
+        f"binding_plan_machine_obligation_source_mismatch_phi_{space}": frozenset(
+            {"block_address", "storage_offset", "storage_size"}
+        )
+        for space in ("ram", "register", "unique", "constant", "unknown")
+    },
+    "binding_plan_machine_obligation_source_mismatch_phi_custom": frozenset(
+        {"block_address", "storage_custom_id", "storage_offset", "storage_size"}
+    ),
+    "binding_plan_machine_obligation_source_mismatch_op": frozenset(
+        {"block_address", "op_ordinal"}
+    ),
+    "binding_plan_machine_obligation_source_mismatch_native_span": frozenset(
+        {"block_address", "instruction_address", "instruction_size"}
+    ),
+    "binding_plan_machine_unsupported_operation": frozenset({"instruction_id"}),
+    "binding_plan_value_topology": frozenset({"index", "value_id"}),
+    "binding_plan_disposition_count": frozenset({"expected_count", "actual_count"}),
+    "binding_plan_binding_count": frozenset({"expected_count", "actual_count"}),
+    "binding_plan_invalid_binding_reference": frozenset(
+        {"value_id", "binding_index"}
+    ),
+    "binding_plan_non_bound_value": frozenset({"value_id"}),
+    "binding_plan_certificate_membership": frozenset({"binding_index"}),
+    "binding_plan_declaration_width": frozenset({"binding_index"}),
+    "binding_plan_invalid_literal_inline": frozenset({"value_id"}),
+    "binding_plan_unexpected_value_disposition": frozenset({"value_id"}),
+    "binding_plan_stack_object_count": frozenset({"expected_count", "actual_count"}),
+    "binding_plan_unexpected_stack_object_disposition": frozenset({"object_id"}),
+    "binding_plan_stack_object_certificate": frozenset(
+        {"object_id", "binding_index"}
+    ),
+    "binding_plan_stack_object_declaration_width": frozenset(
+        {"object_id", "binding_index"}
+    ),
+    "normalization_source_authority": frozenset(),
+    "normalization_block_topology": frozenset(),
+    "normalization_row_count": frozenset({"block_address"}),
+    "normalization_original_instruction": frozenset({"block_address", "op_index"}),
+    "normalization_original_coverage": frozenset(),
+    "normalization_phi_edge": frozenset({"block_address", "op_index"}),
+    "normalization_relocated_initializer": frozenset(
+        {"block_address", "op_index"}
+    ),
+    "normalization_removed_phi": frozenset(),
+    "normalization_removed_phi_edge": frozenset(),
+    "normalization_invalid_carrier_certificates": frozenset(),
+    "too_many_observations": frozenset(),
+    "invalid_value": frozenset({"value_id"}),
+    "invalid_use": frozenset({"instruction_id", "input_index"}),
+    "invalid_write": frozenset({"instruction_id"}),
+    "outputless_write": frozenset({"instruction_id"}),
+    "invalid_normalized_site": frozenset({"block_id", "op_index"}),
+    "missing_normalized_block": frozenset({"address"}),
+    "missing_normalized_site_context": frozenset(),
+    "invalid_normalized_input": frozenset(
+        {"block_id", "op_index", "input_index"}
+    ),
+    "missing_normalized_output": frozenset({"block_id", "op_index"}),
+    "refused_rendered_use": frozenset({"instruction_id", "input_index"}),
+    "refused_rendered_write": frozenset({"instruction_id"}),
+    "rendered_value_required": frozenset({"value_id"}),
+    "exact_use_requires_rendered_occurrence": frozenset(
+        {"instruction_id", "input_index"}
+    ),
+    "exact_write_requires_rendered_occurrence": frozenset({"instruction_id"}),
+    "symbol_table_mismatch": frozenset(),
+    "unowned_binding_symbol": frozenset({"symbol_index"}),
+    "conflicting_value": frozenset({"value_id"}),
+    "conflicting_use": frozenset({"instruction_id", "input_index"}),
+    "conflicting_write": frozenset({"instruction_id"}),
+    "observation_domain_too_large": frozenset({"expected_count"}),
+    "observation_capacity_unavailable": frozenset({"expected_count"}),
+    "observation_out_of_range": frozenset(
+        {"observation_id", "expected_count"}
+    ),
+    "duplicate_observation": frozenset({"observation_id"}),
+}
+BINDING_AUDIT_LINE = re.compile(
+    rf"^{re.escape(BINDING_AUDIT_PREFIX)}(?P<payload>[^\r\n]*)(?:\r?\n|$)",
+    re.MULTILINE,
+)
 
 
 @dataclass(frozen=True)
@@ -142,6 +301,285 @@ def marked_sections(text: str) -> dict[str, list[str]]:
     for match in marker.finditer(text):
         sections.setdefault(match.group("name"), []).append(match.group("body"))
     return sections
+
+
+class BindingAuditFormatError(ValueError):
+    """One binding-audit marker is present but does not match schema version 2."""
+
+
+def _exact_object(
+    value: Any, expected_keys: set[str], *, context: str
+) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise BindingAuditFormatError(f"{context} must be a JSON object")
+    actual_keys = set(value)
+    if actual_keys != expected_keys:
+        missing = sorted(expected_keys - actual_keys)
+        unexpected = sorted(actual_keys - expected_keys)
+        raise BindingAuditFormatError(
+            f"{context} keys mismatch: missing={missing} unexpected={unexpected}"
+        )
+    return value
+
+
+def _count(value: Any, *, context: str) -> int:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or value < 0
+        or value > BINDING_AUDIT_MAX_COUNT
+    ):
+        raise BindingAuditFormatError(f"{context} must be an unsigned 64-bit integer")
+    return value
+
+
+def _audit_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    value: dict[str, Any] = {}
+    for key, item in pairs:
+        if key in value:
+            raise BindingAuditFormatError(f"duplicate binding audit field: {key}")
+        value[key] = item
+    return value
+
+
+def _invalid_json_constant(value: str) -> None:
+    raise BindingAuditFormatError(f"invalid binding audit JSON constant: {value}")
+
+
+def _audit_domains(
+    value: Any, fields: tuple[str, ...], *, context: str
+) -> dict[str, dict[str, int]]:
+    domains = _exact_object(value, set(BINDING_AUDIT_DOMAINS), context=context)
+    parsed: dict[str, dict[str, int]] = {}
+    for domain in BINDING_AUDIT_DOMAINS:
+        counts = _exact_object(
+            domains[domain], set(fields), context=f"{context}.{domain}"
+        )
+        parsed[domain] = {
+            field: _count(counts[field], context=f"{context}.{domain}.{field}")
+            for field in fields
+        }
+    return parsed
+
+
+def _score_counted_binding_audit(
+    envelope: dict[str, Any], audit: dict[str, Any]
+) -> dict[str, Any]:
+    audit = _exact_object(
+        audit,
+        {"schema_version", "status", "observations", "shadow"},
+        context="binding audit",
+    )
+    if isinstance(audit["schema_version"], bool) or audit["schema_version"] != 2:
+        raise BindingAuditFormatError("binding audit schema_version must be 2")
+    source_status = audit["status"]
+    if source_status not in {
+        "complete",
+        "incomplete_observations",
+        "non_quality",
+    }:
+        raise BindingAuditFormatError("counted binding audit has an invalid status")
+
+    observations = _audit_domains(
+        audit["observations"],
+        (
+            "total",
+            "rendered",
+            "justified_elision",
+            "refused",
+            "unaccounted",
+        ),
+        context="binding audit observations",
+    )
+    shadow = _audit_domains(
+        audit["shadow"],
+        (
+            "total",
+            "observed",
+            "agree_correct",
+            "old_wrong",
+            "shadow_wrong",
+            "both_wrong_equal",
+            "both_wrong_different",
+            "unclassified",
+            "refused",
+        ),
+        context="binding audit shadow",
+    )
+
+    observation_equations = {
+        domain: counts["total"]
+        == counts["rendered"]
+        + counts["justified_elision"]
+        + counts["refused"]
+        + counts["unaccounted"]
+        for domain, counts in observations.items()
+    }
+    shadow_equations = {
+        domain: counts["total"] == counts["observed"]
+        and counts["observed"]
+        == counts["agree_correct"]
+        + counts["old_wrong"]
+        + counts["shadow_wrong"]
+        + counts["both_wrong_equal"]
+        + counts["both_wrong_different"]
+        + counts["unclassified"]
+        for domain, counts in shadow.items()
+    }
+    totals_match = {
+        domain: observations[domain]["total"] == shadow[domain]["total"]
+        for domain in BINDING_AUDIT_DOMAINS
+    }
+    observation_quality = {
+        domain: observation_equations[domain]
+        and counts["unaccounted"] == 0
+        and counts["refused"] == 0
+        for domain, counts in observations.items()
+    }
+    shadow_quality = {
+        domain: shadow_equations[domain]
+        and counts["shadow_wrong"] == 0
+        and counts["both_wrong_equal"] == 0
+        and counts["both_wrong_different"] == 0
+        and counts["unclassified"] == 0
+        and counts["refused"] == 0
+        for domain, counts in shadow.items()
+    }
+    canonical_total = sum(
+        observations[domain]["total"] for domain in BINDING_AUDIT_DOMAINS
+    )
+    passes = (
+        envelope["request_status"] == "completed"
+        and source_status == "complete"
+        and all(observation_quality.values())
+        and all(shadow_quality.values())
+        and all(totals_match.values())
+        and canonical_total > 0
+    )
+    return {
+        "status": "pass" if passes else "non_quality",
+        "request_status": envelope["request_status"],
+        "source_status": source_status,
+        "marker_count": 1,
+        "record": envelope,
+        "equations": {
+            "observations": observation_equations,
+            "shadow": shadow_equations,
+            "totals_match": totals_match,
+        },
+        "quality": {
+            "observations": observation_quality,
+            "shadow": shadow_quality,
+            "canonical_nonempty": canonical_total > 0,
+        },
+        "canonical_total": canonical_total,
+    }
+
+
+def _validate_binding_journal_cause(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise BindingAuditFormatError("binding audit seal cause must be an object")
+    kind = value.get("kind")
+    if not isinstance(kind, str) or kind not in BINDING_AUDIT_JOURNAL_CAUSE_FIELDS:
+        raise BindingAuditFormatError("binding audit seal cause kind is invalid")
+    fields = BINDING_AUDIT_JOURNAL_CAUSE_FIELDS[kind]
+    cause = _exact_object(
+        value,
+        {"kind", *fields},
+        context="binding audit seal cause",
+    )
+    for field in fields:
+        _count(cause[field], context=f"binding audit seal cause.{field}")
+    return cause
+
+
+def parse_binding_audit(section: str) -> tuple[str, dict[str, Any]]:
+    """Remove and score the one exact out-of-band audit line in a section."""
+    matches = list(BINDING_AUDIT_LINE.finditer(section))
+    cleaned = BINDING_AUDIT_LINE.sub("", section)
+    if not matches:
+        return cleaned, {"status": "missing", "marker_count": 0}
+    if len(matches) != 1:
+        return cleaned, {"status": "duplicate", "marker_count": len(matches)}
+
+    payload = matches[0].group("payload")
+    try:
+        record = json.loads(
+            payload,
+            object_pairs_hook=_audit_json_object,
+            parse_constant=_invalid_json_constant,
+        )
+        if not isinstance(record, dict):
+            raise BindingAuditFormatError("binding audit must be a JSON object")
+        if payload != json.dumps(record, separators=(",", ":"), ensure_ascii=False):
+            raise BindingAuditFormatError(
+                "binding audit JSON must be compact and directly follow the prefix"
+            )
+        record = _exact_object(
+            record,
+            {"schema_version", "request_status", "audit"},
+            context="binding audit envelope",
+        )
+        if isinstance(record["schema_version"], bool) or record["schema_version"] != 2:
+            raise BindingAuditFormatError(
+                "binding audit envelope schema_version must be 2"
+            )
+        request_status = record["request_status"]
+        if request_status not in {"completed", "refused"}:
+            raise BindingAuditFormatError(
+                "binding audit request_status must be completed or refused"
+            )
+        audit = record["audit"]
+        if not isinstance(audit, dict):
+            raise BindingAuditFormatError("binding audit audit must be a JSON object")
+        status = audit.get("status")
+        if status in {"complete", "incomplete_observations", "non_quality"}:
+            return cleaned, _score_counted_binding_audit(record, audit)
+        if status == "failed":
+            reason = audit.get("reason")
+            if reason not in BINDING_AUDIT_FAILURE_REASONS:
+                raise BindingAuditFormatError(
+                    "failed binding audit reason is not in the schema"
+                )
+            expected_fields = {"schema_version", "status", "reason"}
+            if reason in BINDING_AUDIT_JOURNAL_FAILURE_REASONS:
+                expected_fields.add("cause")
+            _exact_object(
+                audit,
+                expected_fields,
+                context="failed binding audit",
+            )
+            if isinstance(audit["schema_version"], bool) or audit["schema_version"] != 2:
+                raise BindingAuditFormatError("binding audit schema_version must be 2")
+            if reason in BINDING_AUDIT_JOURNAL_FAILURE_REASONS:
+                _validate_binding_journal_cause(audit["cause"])
+            return cleaned, {
+                "status": "failed",
+                "request_status": request_status,
+                "marker_count": 1,
+                "record": record,
+            }
+        if status == "not_run":
+            _exact_object(
+                audit,
+                {"schema_version", "status"},
+                context="not-run binding audit",
+            )
+            if isinstance(audit["schema_version"], bool) or audit["schema_version"] != 2:
+                raise BindingAuditFormatError("binding audit schema_version must be 2")
+            return cleaned, {
+                "status": "not_run",
+                "request_status": request_status,
+                "marker_count": 1,
+                "record": record,
+            }
+        raise BindingAuditFormatError(f"unsupported binding audit status: {status!r}")
+    except (json.JSONDecodeError, BindingAuditFormatError) as error:
+        return cleaned, {
+            "status": "malformed",
+            "marker_count": 1,
+            "error": str(error),
+        }
 
 
 def _matching_brace(text: str, opening: int) -> int | None:
@@ -660,6 +1098,7 @@ def verify(args: argparse.Namespace) -> dict[str, Any]:
             "diagnostic": {"status": "not_run"},
             "differential": {"status": "not_run", "cases": []},
             "snapshot": {"status": "missing"},
+            "binding_audit": {"status": "missing", "marker_count": 0},
         }
         found = sections.get(name, [])
         entry["generation"]["section_count"] = len(found)
@@ -667,7 +1106,7 @@ def verify(args: argparse.Namespace) -> dict[str, Any]:
             entry["generation"]["status"] = "missing" if not found else "duplicate"
             entries.append(entry)
             continue
-        exact_section = found[0]
+        exact_section, entry["binding_audit"] = parse_binding_audit(found[0])
         section_dir = artifact_root / "raw-sections"
         section_dir.mkdir(parents=True, exist_ok=True)
         section_path = section_dir / f"{args.config}_{name}.txt"
@@ -687,7 +1126,7 @@ def verify(args: argparse.Namespace) -> dict[str, Any]:
             "expected_sha256": expected_hash,
             "actual_sha256": section_hash,
         }
-        raw_source, extraction_error = extract_function(found[0], name)
+        raw_source, extraction_error = extract_function(exact_section, name)
         if extraction_error or raw_source is None:
             terminal_status = (
                 "renderer_error"
@@ -875,7 +1314,8 @@ def print_summary(report: dict[str, Any]) -> None:
             f"diag={entry['diagnostic']['status']:<18} "
             f"diff={entry['differential']['status']:<16} "
             f"basis={str(entry['differential'].get('basis')):<10} "
-            f"snapshot={entry['snapshot']['status']}"
+            f"snapshot={entry['snapshot']['status']:<10} "
+            f"binding_audit={entry['binding_audit']['status']}"
         )
         if entry["raw"].get("status") == "failed":
             print(f"    raw: {first_error(entry['raw'])}")

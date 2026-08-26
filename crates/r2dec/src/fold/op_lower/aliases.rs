@@ -761,10 +761,11 @@ impl<'a> FoldingContext<'a> {
                 // pass's judgement to make -- rendering each site once is
                 // settled before the output is pruned.
                 if dead_transient_call_result {
-                    stmt = crate::ast::carry_outer_stmt_observations(
-                        &stmt,
-                        CStmt::Expr(rhs.clone()),
-                    );
+                    // The call occurrence survives, but the assignment/write
+                    // occurrence does not. Keeping the RHS preserves its own
+                    // markers; moving the statement marker would credit a
+                    // write that is absent from the emitted C.
+                    stmt = CStmt::Expr(rhs.clone());
                     (reads, def) = self.stmt_reads_and_def(&stmt);
                     false
                 } else {

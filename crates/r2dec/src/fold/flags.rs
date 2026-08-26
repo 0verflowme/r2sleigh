@@ -14,20 +14,19 @@ use crate::analysis;
 use crate::analysis::{FlagCompareKind, FlagCompareProvenance, utils};
 use crate::ast::{BinaryOp, CExpr, CType, UnaryOp};
 
-/// Run one shape-changing flag rewrite against semantic AST only, then move
-/// every occurrence-owned observation from the replaced tree exactly once.
+/// Run one shape-changing flag rewrite against semantic AST only, preserving
+/// only an observation on the rewritten condition occurrence itself.
 ///
-/// Keeping the semantic pass marker-free is important: a marker around either
-/// operand must not change which flag pattern the expression represents.  A
-/// replacement assembled from stored definitions is stripped as well, because
-/// cloning an occurrence-owned marker out of a definition table would create a
-/// second occurrence of the same ID.
+/// Operand observations belong to flag expressions eliminated by the rewrite,
+/// so moving them onto the reconstructed comparison would manufacture rendered
+/// coverage. A replacement assembled from stored definitions is stripped too,
+/// because cloning occurrence-owned markers would duplicate their IDs.
 fn carry_flag_rewrite_observations(source: CExpr, replacement: CExpr) -> CExpr {
     if source.transparently_eq(&replacement) {
         return source;
     }
     let replacement = replacement.clone_without_render_observations();
-    crate::ast::carry_expr_render_observations(&source, replacement)
+    crate::ast::carry_outer_expr_observations(&source, replacement)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2359,6 +2358,7 @@ impl<'a> FoldingContext<'a> {
 
     pub(super) fn is_predicate_like_expr(&self, expr: &CExpr) -> bool {
         match expr {
+            CExpr::Observed { expr, .. } => self.is_predicate_like_expr(expr),
             CExpr::Var(name) => {
                 self.inputs.arch.is_flag_name(&self.spelling(*name))
                     || self.flag_only_values_set().contains(&*self.spelling(*name))
@@ -2522,7 +2522,7 @@ impl<'a> FoldingContext<'a> {
     pub(crate) fn try_reconstruct_condition(&self, expr: &CExpr) -> Option<CExpr> {
         let semantic = expr.clone_without_render_observations();
         let rewritten = self.try_reconstruct_condition_semantic(&semantic)?;
-        Some(crate::ast::carry_expr_render_observations(
+        Some(crate::ast::carry_outer_expr_observations(
             expr,
             rewritten.clone_without_render_observations(),
         ))
@@ -4033,7 +4033,7 @@ mod observation_transparency_tests {
     }
 
     #[test]
-    fn nested_flag_operand_reconstructs_and_transfers_each_observation_once() {
+    fn reconstructed_flag_condition_keeps_only_its_root_observation() {
         let mut ctx = FoldingContext::new(64);
         ctx.state.analysis_ctx.flag_info.flag_origins.insert(
             "zf_1".to_string(),
@@ -4057,11 +4057,11 @@ mod observation_transparency_tests {
             CExpr::binary(BinaryOp::Ne, ctx.name_ref("left"), ctx.name_ref("right"),)
         );
         assert!(reachable.contains(root_id));
-        assert!(reachable.contains(operand_id));
+        assert!(!reachable.contains(operand_id));
     }
 
     #[test]
-    fn nested_predicate_operands_simplify_without_losing_or_duplicating_ids() {
+    fn reconstructed_predicate_keeps_only_its_root_observation() {
         let ctx = FoldingContext::new(64);
         let mut owner = RenderObservationOwner::new();
         let (value_id, value) = owner
@@ -4079,8 +4079,8 @@ mod observation_transparency_tests {
 
         assert_eq!(semantic, ctx.name_ref("value"));
         assert!(reachable.contains(root_id));
-        assert!(reachable.contains(value_id));
-        assert!(reachable.contains(zero_id));
+        assert!(!reachable.contains(value_id));
+        assert!(!reachable.contains(zero_id));
     }
 }
 

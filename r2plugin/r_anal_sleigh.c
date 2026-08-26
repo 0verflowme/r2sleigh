@@ -840,6 +840,8 @@ static bool sleigh_json_is_single_object(const char *text, size_t len) {
 #define SLEIGH_SEMANTIC_KERNEL_WARNING_LIMIT 8
 #define SLEIGH_SEMANTIC_KERNEL_WARNING_BYTES 4096
 #define SLEIGH_ENGINE_DIAGNOSTICS_BYTES (1024 * 1024)
+#define SLEIGH_BINDING_AUDIT_ENV "R2SLEIGH_BINDING_AUDIT"
+#define SLEIGH_BINDING_AUDIT_PREFIX "R2SLEIGH_BINDING_AUDIT__"
 
 static void sleigh_engine_v2_log_semantic_kernel_warnings(R2SleighByteViewV2 view) {
 	if (!view.data || !view.len || view.len > SLEIGH_ENGINE_DIAGNOSTICS_BYTES
@@ -875,6 +877,50 @@ static void sleigh_engine_v2_log_semantic_kernel_warnings(R2SleighByteViewV2 vie
 			}
 			R_LOG_DEBUG ("r2sleigh: %s", warning->str_value);
 			count++;
+		}
+	}
+	r_json_free (diagnostics);
+	free (text);
+}
+
+// Emit the typed binding audit only for explicit diagnostic runs. Keeping the
+// sidecar out of ordinary pdd output preserves the user-facing renderer bytes;
+// the corpus enables it and associates the one JSON record with its surrounding
+// function markers.
+static void sleigh_engine_v2_emit_binding_audit(R2SleighByteViewV2 view) {
+	if (!r_sys_getenv_asbool (SLEIGH_BINDING_AUDIT_ENV)
+		|| !view.data || !view.len || view.len > SLEIGH_ENGINE_DIAGNOSTICS_BYTES
+		|| !sleigh_json_is_single_object ((const char *)view.data, view.len)) {
+		return;
+	}
+	char *text = sleigh_byte_view_v2_copy (view);
+	if (!text) {
+		return;
+	}
+	RJson *diagnostics = r_json_parse (text);
+	const RJson *outcome = diagnostics && diagnostics->type == R_JSON_OBJECT
+		? r_json_get (diagnostics, "outcome")
+		: NULL;
+	const RJson *audit = diagnostics && diagnostics->type == R_JSON_OBJECT
+		? r_json_get (diagnostics, "binding_audit")
+		: NULL;
+	if (outcome && outcome->type == R_JSON_STRING && outcome->str_value
+		&& (!strcmp (outcome->str_value, "completed")
+			|| !strcmp (outcome->str_value, "refused"))
+		&& audit && audit->type == R_JSON_OBJECT) {
+		PJ *pj = pj_new ();
+		if (pj) {
+			pj_o (pj);
+			pj_kn (pj, "schema_version", 2);
+			pj_ks (pj, "request_status", outcome->str_value);
+			pj_k (pj, "audit");
+			pj_rj (pj, (RJson *)audit);
+			pj_end (pj);
+			char *json = pj_drain (pj);
+			if (json) {
+				fprintf (stderr, "%s%s\n", SLEIGH_BINDING_AUDIT_PREFIX, json);
+				free (json);
+			}
 		}
 	}
 	r_json_free (diagnostics);
@@ -1047,6 +1093,7 @@ static char *sleigh_engine_execute_v2(uint32_t kind, uint64_t required_capabilit
 		sleigh_engine_v2_log_error (api, session, status);
 	}
 	sleigh_engine_v2_log_semantic_kernel_warnings (info.diagnostics_json);
+	sleigh_engine_v2_emit_binding_audit (info.diagnostics_json);
 	uint32_t free_status = sleigh_engine_v2_release_or_preserve (api, &response, &session);
 	if (free_status != R2SLEIGH_STATUS_OK_V2) {
 		free (result);

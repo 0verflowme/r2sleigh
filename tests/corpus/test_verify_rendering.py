@@ -15,6 +15,7 @@ from unittest import mock
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import check_binding_audit_schema as schema_checker  # noqa: E402
 import verify_rendering as verifier  # noqa: E402
 
 
@@ -72,6 +73,304 @@ R2SLEIGH_CORPUS_END__fnv1a32
 
             self.assertEqual(crlf, "line one\r\nline two\r\n")
             self.assertNotEqual(verifier.sha256_text(crlf), verifier.sha256_text(lf))
+
+
+class BindingAuditTests(unittest.TestCase):
+    def test_typed_cause_oracle_requires_exact_unique_schema_coverage(self) -> None:
+        schema = {
+            "no_fields": frozenset(),
+            "one_field": frozenset({"value_id"}),
+        }
+        with mock.patch.object(
+            verifier, "BINDING_AUDIT_JOURNAL_CAUSE_FIELDS", schema
+        ):
+            self.assertEqual(
+                schema_checker.validate_oracle(
+                    [
+                        {"kind": "no_fields"},
+                        {"kind": "one_field", "value_id": 7},
+                    ]
+                ),
+                2,
+            )
+            malformed = [
+                [{"kind": "no_fields"}],
+                [{"kind": "no_fields"}, {"kind": "no_fields"}],
+                [
+                    {"kind": "no_fields"},
+                    {"kind": "one_field", "value_id": 7, "legacy": 1},
+                ],
+            ]
+            for candidate in malformed:
+                with self.subTest(candidate=candidate):
+                    with self.assertRaises(verifier.BindingAuditFormatError):
+                        schema_checker.validate_oracle(candidate)
+
+    @staticmethod
+    def complete_record() -> dict[str, object]:
+        observations = {
+            domain: {
+                "total": 3,
+                "rendered": 2,
+                "justified_elision": 1,
+                "refused": 0,
+                "unaccounted": 0,
+            }
+            for domain in verifier.BINDING_AUDIT_DOMAINS
+        }
+        shadow = {
+            domain: {
+                "total": 3,
+                "observed": 3,
+                "agree_correct": 2,
+                "old_wrong": 1,
+                "shadow_wrong": 0,
+                "both_wrong_equal": 0,
+                "both_wrong_different": 0,
+                "unclassified": 0,
+                "refused": 0,
+            }
+            for domain in verifier.BINDING_AUDIT_DOMAINS
+        }
+        return {
+            "schema_version": 2,
+            "request_status": "completed",
+            "audit": {
+                "schema_version": 2,
+                "status": "complete",
+                "observations": observations,
+                "shadow": shadow,
+            },
+        }
+
+    @classmethod
+    def marker(cls, record: dict[str, object] | None = None) -> str:
+        payload = record if record is not None else cls.complete_record()
+        return verifier.BINDING_AUDIT_PREFIX + json.dumps(
+            payload, separators=(",", ":")
+        )
+
+    def test_exact_marker_is_removed_and_both_ledgers_are_recomputed(self) -> None:
+        section = f"rendered C\n{self.marker()}\ndiagnostic tail\n"
+
+        cleaned, score = verifier.parse_binding_audit(section)
+
+        self.assertEqual(cleaned, "rendered C\ndiagnostic tail\n")
+        self.assertEqual(score["status"], "pass")
+        self.assertEqual(score["marker_count"], 1)
+        self.assertTrue(all(score["equations"]["observations"].values()))
+        self.assertTrue(all(score["equations"]["shadow"].values()))
+        self.assertTrue(all(score["equations"]["totals_match"].values()))
+        self.assertTrue(all(score["quality"]["observations"].values()))
+        self.assertTrue(all(score["quality"]["shadow"].values()))
+
+    def test_missing_duplicate_and_malformed_markers_are_distinct(self) -> None:
+        marker = self.marker()
+        cases = {
+            "missing": ("rendered C\n", "rendered C\n", 0),
+            "duplicate": (
+                f"rendered C\n{marker}\n{marker}\n",
+                "rendered C\n",
+                2,
+            ),
+            "malformed": (
+                f"rendered C\n{verifier.BINDING_AUDIT_PREFIX}{{bad json}}\n",
+                "rendered C\n",
+                1,
+            ),
+        }
+        for expected_status, (section, expected_cleaned, count) in cases.items():
+            with self.subTest(status=expected_status):
+                cleaned, score = verifier.parse_binding_audit(section)
+                self.assertEqual(cleaned, expected_cleaned)
+                self.assertEqual(score["status"], expected_status)
+                self.assertEqual(score["marker_count"], count)
+
+    def test_balanced_unaccounted_refusal_or_shadow_defect_cannot_pass(self) -> None:
+        mutations = {
+            "unaccounted": lambda record: record["audit"]["observations"][
+                "values"
+            ].update(
+                {"justified_elision": 0, "unaccounted": 1}
+            ),
+            "observation_refusal": lambda record: record["audit"]["observations"][
+                "uses"
+            ].update(
+                {"justified_elision": 0, "refused": 1}
+            ),
+            "shadow_wrong": lambda record: record["audit"]["shadow"]["writes"].update(
+                {"agree_correct": 1, "shadow_wrong": 1}
+            ),
+            "shadow_refusal": lambda record: record["audit"]["shadow"]["values"].update(
+                {"refused": 1}
+            ),
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(label=label):
+                record = self.complete_record()
+                mutate(record)
+                _, score = verifier.parse_binding_audit(self.marker(record) + "\n")
+                self.assertEqual(score["status"], "non_quality")
+
+    def test_counted_producer_failure_keeps_counts_but_cannot_pass(self) -> None:
+        record = self.complete_record()
+        record["audit"]["status"] = "incomplete_observations"
+        record["audit"]["observations"]["values"].update(
+            {"justified_elision": 0, "unaccounted": 1}
+        )
+
+        _, score = verifier.parse_binding_audit(self.marker(record) + "\n")
+
+        self.assertEqual(score["status"], "non_quality")
+        self.assertEqual(score["source_status"], "incomplete_observations")
+        self.assertEqual(
+            score["record"]["audit"]["observations"]["values"]["unaccounted"],
+            1,
+        )
+        self.assertTrue(score["equations"]["observations"]["values"])
+
+    def test_category_equation_or_extra_count_fields_are_not_trusted(self) -> None:
+        unbalanced = self.complete_record()
+        unbalanced["audit"]["observations"]["values"]["total"] = 4
+        _, score = verifier.parse_binding_audit(self.marker(unbalanced) + "\n")
+        self.assertEqual(score["status"], "non_quality")
+        self.assertFalse(score["equations"]["observations"]["values"])
+
+        extra = self.complete_record()
+        extra["audit"]["observations"]["values"]["accounted"] = 3
+        _, score = verifier.parse_binding_audit(self.marker(extra) + "\n")
+        self.assertEqual(score["status"], "malformed")
+
+    def test_refused_request_cannot_pass_a_complete_audit(self) -> None:
+        record = self.complete_record()
+        record["request_status"] = "refused"
+
+        _, score = verifier.parse_binding_audit(self.marker(record) + "\n")
+
+        self.assertEqual(score["status"], "non_quality")
+        self.assertEqual(score["request_status"], "refused")
+        self.assertTrue(all(score["quality"]["observations"].values()))
+        self.assertTrue(all(score["quality"]["shadow"].values()))
+
+    def test_failed_journal_audit_requires_an_exact_typed_cause(self) -> None:
+        record = {
+            "schema_version": 2,
+            "request_status": "completed",
+            "audit": {
+                "schema_version": 2,
+                "status": "failed",
+                "reason": "journal_seal_failure",
+                "cause": {
+                    "kind": "observation_out_of_range",
+                    "observation_id": 7,
+                    "expected_count": 5,
+                },
+            },
+        }
+
+        _, score = verifier.parse_binding_audit(self.marker(record) + "\n")
+
+        self.assertEqual(score["status"], "failed")
+        self.assertEqual(
+            score["record"]["audit"]["cause"],
+            record["audit"]["cause"],
+        )
+
+        construction = json.loads(json.dumps(record))
+        construction["audit"]["reason"] = "journal_construction_failure"
+        _, construction_score = verifier.parse_binding_audit(
+            self.marker(construction) + "\n"
+        )
+        self.assertEqual(construction_score["status"], "failed")
+        self.assertEqual(
+            construction_score["record"]["audit"]["cause"],
+            record["audit"]["cause"],
+        )
+
+        recording = json.loads(json.dumps(record))
+        recording["audit"]["reason"] = "journal_recording_failure"
+        _, recording_score = verifier.parse_binding_audit(
+            self.marker(recording) + "\n"
+        )
+        self.assertEqual(recording_score["status"], "failed")
+        self.assertEqual(
+            recording_score["record"]["audit"]["cause"],
+            record["audit"]["cause"],
+        )
+
+        machine = json.loads(json.dumps(record))
+        machine["audit"]["cause"] = {
+            "kind": "binding_plan_machine_width_mismatch",
+            "instruction_id": 11,
+            "expected_bits": 64,
+            "actual_bits": 32,
+        }
+        _, machine_score = verifier.parse_binding_audit(self.marker(machine) + "\n")
+        self.assertEqual(machine_score["status"], "failed")
+        self.assertEqual(
+            machine_score["record"]["audit"]["cause"],
+            machine["audit"]["cause"],
+        )
+
+        malformed = []
+        collapsed = json.loads(json.dumps(record))
+        collapsed["audit"]["cause"] = {"kind": "binding_plan"}
+        malformed.append(collapsed)
+        missing = json.loads(json.dumps(record))
+        del missing["audit"]["cause"]
+        malformed.append(missing)
+        extra = json.loads(json.dumps(record))
+        extra["audit"]["cause"]["unexpected"] = 1
+        malformed.append(extra)
+        wrong_fields = json.loads(json.dumps(record))
+        del wrong_fields["audit"]["cause"]["expected_count"]
+        malformed.append(wrong_fields)
+        unknown = json.loads(json.dumps(record))
+        unknown["audit"]["cause"] = {"kind": "unknown"}
+        malformed.append(unknown)
+        for reason in [
+            "journal_failure",
+            "binding_plan_failure",
+            "legacy_collapsed_failure",
+        ]:
+            unknown_reason = json.loads(json.dumps(record))
+            unknown_reason["audit"]["reason"] = reason
+            del unknown_reason["audit"]["cause"]
+            malformed.append(unknown_reason)
+
+        for candidate in malformed:
+            with self.subTest(candidate=candidate):
+                _, rejected = verifier.parse_binding_audit(
+                    self.marker(candidate) + "\n"
+                )
+                self.assertEqual(rejected["status"], "malformed")
+
+    def test_all_zero_complete_audit_cannot_pass(self) -> None:
+        record = self.complete_record()
+        for domain in verifier.BINDING_AUDIT_DOMAINS:
+            record["audit"]["observations"][domain].update(
+                {
+                    "total": 0,
+                    "rendered": 0,
+                    "justified_elision": 0,
+                    "refused": 0,
+                    "unaccounted": 0,
+                }
+            )
+            record["audit"]["shadow"][domain].update(
+                {
+                    "total": 0,
+                    "observed": 0,
+                    "agree_correct": 0,
+                    "old_wrong": 0,
+                }
+            )
+
+        _, score = verifier.parse_binding_audit(self.marker(record) + "\n")
+
+        self.assertEqual(score["status"], "non_quality")
+        self.assertEqual(score["canonical_total"], 0)
+        self.assertFalse(score["quality"]["canonical_nonempty"])
 
 
 class ExtractionTests(unittest.TestCase):
@@ -328,6 +627,7 @@ class VerificationTests(unittest.TestCase):
                     "diagnostic": {"status": "not_run"},
                     "differential": {"status": "not_run", "cases": []},
                     "snapshot": {"status": "missing"},
+                    "binding_audit": {"status": "missing", "marker_count": 0},
                 }
                 for name in verifier.SPECS
             ]
@@ -351,6 +651,8 @@ class VerificationTests(unittest.TestCase):
         dump_text = (
             "R2SLEIGH_CORPUS_BEGIN__murmur3_32\n"
             + renderer_error
+            + BindingAuditTests.marker()
+            + "\n"
             + "R2SLEIGH_CORPUS_END__murmur3_32\n"
         )
         with tempfile.TemporaryDirectory() as temporary:
@@ -387,6 +689,7 @@ class VerificationTests(unittest.TestCase):
             entry["generation"]["section_sha256"],
             verifier.sha256_text(renderer_error),
         )
+        self.assertEqual(entry["binding_audit"]["status"], "pass")
         for stage in ("raw", "diagnostic", "differential"):
             self.assertEqual(entry[stage]["status"], "blocked_generation")
 

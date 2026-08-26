@@ -34,6 +34,10 @@ use crate::shadow_report::{
     LegacyValueObservation, LegacyWriteCell, LegacyWriteObservation,
 };
 use crate::symbol::{SymbolId, SymbolTable};
+use crate::{
+    BindingMachineProjectionFailure, BindingObservationJournalFailure,
+    BindingShadowAuditFailure,
+};
 
 /// Opaque dense identity of one exact marked AST occurrence.
 ///
@@ -113,36 +117,360 @@ pub(crate) enum LegacyObservationJournalError {
     Markers(RenderObservationStripError),
 }
 
+impl From<&r2ssa::MachineBuildError> for BindingMachineProjectionFailure {
+    fn from(error: &r2ssa::MachineBuildError) -> Self {
+        use r2ssa::MachineBuildError as Error;
+        match error {
+            Error::UntrustedArtifactProvenance => Self::UntrustedArtifactProvenance,
+            Error::IncompleteObligationInventory => Self::IncompleteObligationInventory,
+            Error::MissingGraphValue(value) => Self::MissingGraphValue { value: *value },
+            Error::MissingGraphBlock(block) => Self::MissingGraphBlock { block: *block },
+            Error::DuplicateBlockAddress(address) => {
+                Self::DuplicateBlockAddress { address: *address }
+            }
+            Error::TopologyMismatch => Self::TopologyMismatch,
+            Error::MachineContextMismatch => Self::MachineContextMismatch,
+            Error::MissingInstruction(inst) => Self::MissingInstruction { inst: *inst },
+            Error::MissingInstructionDisposition(inst) => {
+                Self::MissingInstructionDisposition { inst: *inst }
+            }
+            Error::MissingUseDisposition(site) => Self::MissingUseDisposition { site: *site },
+            Error::MissingWriteDisposition(inst) => {
+                Self::MissingWriteDisposition { inst: *inst }
+            }
+            Error::MissingOutput(inst) => Self::MissingOutput { inst: *inst },
+            Error::InvalidValueWidth { value, size_bytes } => Self::InvalidValueWidth {
+                value: *value,
+                size_bytes: *size_bytes,
+            },
+            Error::ConstantTooWide { value, width_bits } => Self::ConstantTooWide {
+                value: *value,
+                width_bits: *width_bits,
+            },
+            Error::WrongOperandCount {
+                inst,
+                expected,
+                actual,
+            } => Self::WrongOperandCount {
+                inst: *inst,
+                expected: *expected,
+                actual: *actual,
+            },
+            Error::WidthMismatch {
+                inst,
+                expected_bits,
+                actual_bits,
+            } => Self::WidthMismatch {
+                inst: *inst,
+                expected_bits: *expected_bits,
+                actual_bits: *actual_bits,
+            },
+            Error::InvalidCastWidth {
+                inst,
+                kind,
+                from_bits,
+                to_bits,
+            } => Self::InvalidCastWidth {
+                inst: *inst,
+                kind: *kind,
+                from_bits: *from_bits,
+                to_bits: *to_bits,
+            },
+            Error::InvalidSubpiece {
+                inst,
+                source_bits,
+                result_bits,
+                lsb_bits,
+            } => Self::InvalidSubpiece {
+                inst: *inst,
+                source_bits: *source_bits,
+                result_bits: *result_bits,
+                lsb_bits: *lsb_bits,
+            },
+            Error::InvalidChild { expr, child } => Self::InvalidChild {
+                expr_index: expr.index(),
+                child_index: child.index(),
+            },
+            Error::InvalidExpressionType { expr } => Self::InvalidExpressionType {
+                expr_index: expr.index(),
+            },
+            Error::DuplicateEntity(value) => Self::DuplicateEntity { value: *value },
+            Error::EntityMismatch(inst) => Self::EntityMismatch { inst: *inst },
+            Error::ObligationMismatch(inst) => Self::ObligationMismatch { inst: *inst },
+            Error::UseDispositionMismatch(site) => Self::UseDispositionMismatch { site: *site },
+            Error::WriteDispositionMismatch(inst) => {
+                Self::WriteDispositionMismatch { inst: *inst }
+            }
+            Error::ObligationSourceMismatch(instruction) => Self::ObligationSourceMismatch {
+                instruction: *instruction,
+            },
+            Error::UnsupportedOperation { inst, .. } => Self::UnsupportedOperation { inst: *inst },
+        }
+    }
+}
+
+fn binding_plan_failure(error: &BindingPlanSourceMismatch) -> BindingObservationJournalFailure {
+    match error {
+        BindingPlanSourceMismatch::Authority => BindingObservationJournalFailure::BindingPlanAuthority,
+        BindingPlanSourceMismatch::MachineProjection(error) => {
+            BindingObservationJournalFailure::BindingPlanMachineProjection(error.into())
+        }
+        BindingPlanSourceMismatch::ValueTopology { index, value } => {
+            BindingObservationJournalFailure::BindingPlanValueTopology {
+                index: *index,
+                value: *value,
+            }
+        }
+        BindingPlanSourceMismatch::DispositionCount { expected, actual } => {
+            BindingObservationJournalFailure::BindingPlanDispositionCount {
+                expected: *expected,
+                actual: *actual,
+            }
+        }
+        BindingPlanSourceMismatch::BindingCount { expected, actual } => {
+            BindingObservationJournalFailure::BindingPlanBindingCount {
+                expected: *expected,
+                actual: *actual,
+            }
+        }
+        BindingPlanSourceMismatch::InvalidBindingReference { value, binding } => {
+            BindingObservationJournalFailure::BindingPlanInvalidBindingReference {
+                value: *value,
+                binding_index: binding.index(),
+            }
+        }
+        BindingPlanSourceMismatch::NonBoundValue { value } => {
+            BindingObservationJournalFailure::BindingPlanNonBoundValue { value: *value }
+        }
+        BindingPlanSourceMismatch::CertificateMembership { binding } => {
+            BindingObservationJournalFailure::BindingPlanCertificateMembership {
+                binding_index: binding.index(),
+            }
+        }
+        BindingPlanSourceMismatch::DeclarationWidth { binding } => {
+            BindingObservationJournalFailure::BindingPlanDeclarationWidth {
+                binding_index: binding.index(),
+            }
+        }
+        BindingPlanSourceMismatch::InvalidLiteralInline { value } => {
+            BindingObservationJournalFailure::BindingPlanInvalidLiteralInline { value: *value }
+        }
+        BindingPlanSourceMismatch::UnexpectedValueDisposition { value } => {
+            BindingObservationJournalFailure::BindingPlanUnexpectedValueDisposition {
+                value: *value,
+            }
+        }
+        BindingPlanSourceMismatch::StackObjectCount { expected, actual } => {
+            BindingObservationJournalFailure::BindingPlanStackObjectCount {
+                expected: *expected,
+                actual: *actual,
+            }
+        }
+        BindingPlanSourceMismatch::UnexpectedStackObjectDisposition { object } => {
+            BindingObservationJournalFailure::BindingPlanUnexpectedStackObjectDisposition {
+                object: *object,
+            }
+        }
+        BindingPlanSourceMismatch::StackObjectCertificate { object, binding } => {
+            BindingObservationJournalFailure::BindingPlanStackObjectCertificate {
+                object: *object,
+                binding_index: binding.index(),
+            }
+        }
+        BindingPlanSourceMismatch::StackObjectDeclarationWidth { object, binding } => {
+            BindingObservationJournalFailure::BindingPlanStackObjectDeclarationWidth {
+                object: *object,
+                binding_index: binding.index(),
+            }
+        }
+    }
+}
+
+fn normalization_failure(error: NormalizationOriginError) -> BindingObservationJournalFailure {
+    match error {
+        NormalizationOriginError::SourceAuthority => {
+            BindingObservationJournalFailure::NormalizationSourceAuthority
+        }
+        NormalizationOriginError::BlockTopology => {
+            BindingObservationJournalFailure::NormalizationBlockTopology
+        }
+        NormalizationOriginError::RowCount { block } => {
+            BindingObservationJournalFailure::NormalizationRowCount {
+                block_address: block,
+            }
+        }
+        NormalizationOriginError::OriginalInstruction { block, op_idx } => {
+            BindingObservationJournalFailure::NormalizationOriginalInstruction {
+                block_address: block,
+                op_idx,
+            }
+        }
+        NormalizationOriginError::OriginalCoverage => {
+            BindingObservationJournalFailure::NormalizationOriginalCoverage
+        }
+        NormalizationOriginError::PhiEdge { block, op_idx } => {
+            BindingObservationJournalFailure::NormalizationPhiEdge {
+                block_address: block,
+                op_idx,
+            }
+        }
+        NormalizationOriginError::RelocatedInitializer { block, op_idx } => {
+            BindingObservationJournalFailure::NormalizationRelocatedInitializer {
+                block_address: block,
+                op_idx,
+            }
+        }
+        NormalizationOriginError::RemovedPhi => {
+            BindingObservationJournalFailure::NormalizationRemovedPhi
+        }
+        NormalizationOriginError::RemovedPhiEdge => {
+            BindingObservationJournalFailure::NormalizationRemovedPhiEdge
+        }
+        NormalizationOriginError::InvalidCarrierCertificates => {
+            BindingObservationJournalFailure::NormalizationInvalidCarrierCertificates
+        }
+    }
+}
+
+impl From<&LegacyObservationJournalError> for BindingObservationJournalFailure {
+    fn from(error: &LegacyObservationJournalError) -> Self {
+        match error {
+            LegacyObservationJournalError::SourceAuthority => Self::SourceAuthority,
+            LegacyObservationJournalError::BindingPlan(error) => binding_plan_failure(error),
+            LegacyObservationJournalError::Normalization(error) => normalization_failure(*error),
+            LegacyObservationJournalError::TooManyObservations => Self::TooManyObservations,
+            LegacyObservationJournalError::InvalidValue(value) => {
+                Self::InvalidValue { value: *value }
+            }
+            LegacyObservationJournalError::InvalidUse(site) => Self::InvalidUse { site: *site },
+            LegacyObservationJournalError::InvalidWrite(inst) => {
+                Self::InvalidWrite { inst: *inst }
+            }
+            LegacyObservationJournalError::OutputlessWrite(inst) => {
+                Self::OutputlessWrite { inst: *inst }
+            }
+            LegacyObservationJournalError::InvalidNormalizedSite(site) => {
+                Self::InvalidNormalizedSite {
+                    block: site.block,
+                    op_idx: site.op_idx,
+                }
+            }
+            LegacyObservationJournalError::MissingNormalizedBlock(address) => {
+                Self::MissingNormalizedBlock { address: *address }
+            }
+            LegacyObservationJournalError::MissingNormalizedSiteContext => {
+                Self::MissingNormalizedSiteContext
+            }
+            LegacyObservationJournalError::InvalidNormalizedInput { site, input_idx } => {
+                Self::InvalidNormalizedInput {
+                    block: site.block,
+                    op_idx: site.op_idx,
+                    input_idx: *input_idx,
+                }
+            }
+            LegacyObservationJournalError::MissingNormalizedOutput(site) => {
+                Self::MissingNormalizedOutput {
+                    block: site.block,
+                    op_idx: site.op_idx,
+                }
+            }
+            LegacyObservationJournalError::RefusedRenderedUse(site) => {
+                Self::RefusedRenderedUse { site: *site }
+            }
+            LegacyObservationJournalError::RefusedRenderedWrite(inst) => {
+                Self::RefusedRenderedWrite { inst: *inst }
+            }
+            LegacyObservationJournalError::RenderedValueRequired(value) => {
+                Self::RenderedValueRequired { value: *value }
+            }
+            LegacyObservationJournalError::ExactUseRequiresRenderedOccurrence(site) => {
+                Self::ExactUseRequiresRenderedOccurrence { site: *site }
+            }
+            LegacyObservationJournalError::ExactWriteRequiresRenderedOccurrence(inst) => {
+                Self::ExactWriteRequiresRenderedOccurrence { inst: *inst }
+            }
+            LegacyObservationJournalError::SymbolTableMismatch => Self::SymbolTableMismatch,
+            LegacyObservationJournalError::UnownedBindingSymbol(symbol) => {
+                Self::UnownedBindingSymbol {
+                    symbol_index: symbol.index(),
+                }
+            }
+            LegacyObservationJournalError::ConflictingValue(value) => {
+                Self::ConflictingValue { value: *value }
+            }
+            LegacyObservationJournalError::ConflictingUse(site) => {
+                Self::ConflictingUse { site: *site }
+            }
+            LegacyObservationJournalError::ConflictingWrite(inst) => {
+                Self::ConflictingWrite { inst: *inst }
+            }
+            LegacyObservationJournalError::Markers(
+                RenderObservationStripError::DomainTooLarge { expected_count },
+            ) => Self::ObservationDomainTooLarge {
+                expected_count: *expected_count,
+            },
+            LegacyObservationJournalError::Markers(
+                RenderObservationStripError::CapacityUnavailable { expected_count },
+            ) => Self::ObservationCapacityUnavailable {
+                expected_count: *expected_count,
+            },
+            LegacyObservationJournalError::Markers(RenderObservationStripError::OutOfRange {
+                id,
+                expected_count,
+            }) => Self::ObservationOutOfRange {
+                observation_id: id.index(),
+                expected_count: *expected_count,
+            },
+            LegacyObservationJournalError::Markers(RenderObservationStripError::Duplicate {
+                id,
+            }) => Self::DuplicateObservation {
+                observation_id: id.index(),
+            },
+        }
+    }
+}
+
 /// Final coverage of one dense source domain after marker inspection.
 ///
-/// `accounted` counts only decisions that survived in the final emission tree
-/// or were recorded explicitly as typed elision/refusal. `absent` is therefore
-/// observable missing legacy coverage, not an inferred decision.
+/// The four disposition counts are deliberately disjoint. This lets an
+/// external gate reconstruct the exact coverage equation instead of treating
+/// refusal as a successful kind of "accounted" output.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct LegacyObservationDomainCoverage {
     pub(crate) total: usize,
-    pub(crate) accounted: usize,
-    pub(crate) absent: usize,
+    pub(crate) rendered: usize,
+    pub(crate) justified_elision: usize,
     pub(crate) refused: usize,
+    pub(crate) unaccounted: usize,
 }
 
 impl LegacyObservationDomainCoverage {
-    fn from_counts(total: usize, accounted: usize, refused: usize) -> Self {
+    fn from_counts(
+        total: usize,
+        rendered: usize,
+        justified_elision: usize,
+        refused: usize,
+        unaccounted: usize,
+    ) -> Self {
         Self {
             total,
-            accounted,
-            absent: total - accounted,
+            rendered,
+            justified_elision,
             refused,
+            unaccounted,
         }
     }
 
     pub(crate) fn equations_hold(self) -> bool {
-        self.accounted.checked_add(self.absent) == Some(self.total)
-            && self.refused <= self.accounted
+        self.rendered
+            .checked_add(self.justified_elision)
+            .and_then(|count| count.checked_add(self.refused))
+            .and_then(|count| count.checked_add(self.unaccounted))
+            == Some(self.total)
     }
 
     pub(crate) fn is_complete(self) -> bool {
-        self.equations_hold() && self.absent == 0
+        self.equations_hold() && self.unaccounted == 0
     }
 
     pub(crate) fn passes_quality(self) -> bool {
@@ -231,30 +559,111 @@ impl MarkedNativeDraft {
         let observations = self.journal.seal(source, &mut ready)?;
         Ok(SealedNativeFunction {
             ready,
-            observations,
+            observations: Some(observations),
+            observation_failure: None,
             plan,
         })
+    }
+
+    /// Finish the native product without allowing shadow-audit failure to
+    /// change the rendered program.
+    ///
+    /// The strict [`Self::seal`] API remains available to tests of the journal
+    /// contract. Production shadowing uses this boundary: a failed audit is
+    /// retained as unavailable evidence, every internal marker is discarded,
+    /// and the same prepared native AST remains the emission product.
+    pub(crate) fn finish_non_consuming(
+        self,
+        source: &SourceOwnedFunctionFacts,
+        recording_failure: Option<LegacyObservationJournalError>,
+    ) -> SealedNativeFunction {
+        let mut ready = prepare_function_for_emission(&self.function);
+        let plan = Rc::clone(&self.journal.plan);
+        let (observations, observation_failure) = if let Some(error) = recording_failure {
+            let mut authority = ObservationSealAuthority::new();
+            ready.discard_observation_markers(&mut authority);
+            (
+                None,
+                Some(BindingShadowAuditFailure::JournalRecording(
+                    BindingObservationJournalFailure::from(&error),
+                )),
+            )
+        } else {
+            match self.journal.seal(source, &mut ready) {
+                Ok(observations) => (Some(observations), None),
+                Err(error) => {
+                    let mut authority = ObservationSealAuthority::new();
+                    ready.discard_observation_markers(&mut authority);
+                    (
+                        None,
+                        Some(BindingShadowAuditFailure::JournalSeal(
+                            BindingObservationJournalFailure::from(&error),
+                        )),
+                    )
+                }
+            }
+        };
+        SealedNativeFunction {
+            ready,
+            observations,
+            observation_failure,
+            plan,
+        }
     }
 }
 
 /// Marker-free exact emission tree paired with the observations sealed from it.
 pub(crate) struct SealedNativeFunction {
     ready: EmissionReadyFunction,
-    observations: SealedLegacyObservations,
+    observations: Option<SealedLegacyObservations>,
+    observation_failure: Option<BindingShadowAuditFailure>,
     plan: Rc<BindingPlan>,
 }
 
 impl SealedNativeFunction {
+    /// Build a marker-free native product when the observation journal could
+    /// not be initialized. The missing audit remains explicit to the caller.
+    pub(crate) fn without_observations(
+        function: CFunction,
+        plan: Rc<BindingPlan>,
+        failure: BindingShadowAuditFailure,
+    ) -> Self {
+        Self {
+            ready: prepare_function_for_emission(&function),
+            observations: None,
+            observation_failure: Some(failure),
+            plan,
+        }
+    }
+
     pub(crate) const fn emission(&self) -> &EmissionReadyFunction {
         &self.ready
     }
 
-    pub(crate) const fn observations(&self) -> &LegacyAnalysisSnapshot {
-        self.observations.snapshot()
+    pub(crate) fn observations(&self) -> &LegacyAnalysisSnapshot {
+        self.observations
+            .as_ref()
+            .map(SealedLegacyObservations::snapshot)
+            .expect("strictly sealed native function must retain observations")
     }
 
-    pub(crate) const fn observation_coverage(&self) -> LegacyObservationCoverage {
-        self.observations.coverage()
+    pub(crate) fn observation_coverage(&self) -> LegacyObservationCoverage {
+        self.observations
+            .as_ref()
+            .map(SealedLegacyObservations::coverage)
+            .expect("strictly sealed native function must retain observation coverage")
+    }
+
+    pub(crate) fn audit_observations(
+        &self,
+    ) -> Result<(&LegacyAnalysisSnapshot, LegacyObservationCoverage), BindingShadowAuditFailure> {
+        self.observations
+            .as_ref()
+            .map(|observations| (observations.snapshot(), observations.coverage()))
+            .ok_or_else(|| {
+                self.observation_failure
+                    .expect("missing observations retain a typed failure category")
+            })
     }
 
     pub(crate) fn plan(&self) -> &BindingPlan {
@@ -433,6 +842,42 @@ impl LegacyObservationJournal {
             .collect();
         self.targets.extend(targets);
         Ok(ids)
+    }
+
+    fn duplicate_observation_target(
+        &mut self,
+        id: RenderObservationId,
+    ) -> Result<RenderObservationId, LegacyObservationJournalError> {
+        let index = usize::try_from(id.index()).map_err(|_| {
+            LegacyObservationJournalError::Markers(RenderObservationStripError::OutOfRange {
+                id,
+                expected_count: self.targets.len(),
+            })
+        })?;
+        let target = self.targets.get(index).cloned().ok_or_else(|| {
+            LegacyObservationJournalError::Markers(RenderObservationStripError::OutOfRange {
+                id,
+                expected_count: self.targets.len(),
+            })
+        })?;
+        self.allocate_many(vec![target])?
+            .into_iter()
+            .next()
+            .ok_or(LegacyObservationJournalError::TooManyObservations)
+    }
+
+    /// Clone a cached semantic fold while assigning fresh IDs to its concrete
+    /// AST occurrence. The new IDs retain the exact authority-bound targets of
+    /// the cached template; no use, value, or write identity is reconstructed.
+    pub(crate) fn clone_render_occurrence(
+        &mut self,
+        stmts: &[CStmt],
+    ) -> Result<Vec<CStmt>, LegacyObservationJournalError> {
+        let mut clone = stmts.to_vec();
+        crate::ast::remap_render_observation_ids(&mut clone, &mut |id| {
+            self.duplicate_observation_target(id)
+        })?;
+        Ok(clone)
     }
 
     fn allocate_normalized_output_targets(
@@ -684,19 +1129,38 @@ impl LegacyObservationJournal {
 
     fn final_coverage(&self) -> LegacyObservationCoverage {
         let value_total = self.values.len();
-        let value_accounted = self.values.iter().filter(|cell| cell.is_some()).count();
+        let value_rendered = self
+            .values
+            .iter()
+            .filter(|cell| {
+                matches!(
+                    cell,
+                    Some(
+                        LegacyValueObservation::Bound { .. }
+                            | LegacyValueObservation::InlineConstant
+                            | LegacyValueObservation::InlineNonLiteral
+                    )
+                )
+            })
+            .count();
+        let value_justified_elision = self
+            .values
+            .iter()
+            .filter(|cell| matches!(cell, Some(LegacyValueObservation::Elided)))
+            .count();
         let value_refused = self
             .values
             .iter()
             .filter(|cell| matches!(cell, Some(LegacyValueObservation::Refused(_))))
             .count();
+        let value_unaccounted = self.values.iter().filter(|cell| cell.is_none()).count();
 
         let use_total = self.uses.iter().map(|row| row.len()).sum();
-        let use_accounted = self
+        let use_rendered = self
             .uses
             .iter()
             .flat_map(|row| row.iter())
-            .filter(|cell| cell.is_some())
+            .filter(|cell| matches!(cell, Some(LegacyUseObservation::Exact(_))))
             .count();
         let use_refused = self
             .uses
@@ -704,17 +1168,25 @@ impl LegacyObservationJournal {
             .flat_map(|row| row.iter())
             .filter(|cell| matches!(cell, Some(LegacyUseObservation::Refused(_))))
             .count();
+        let use_unaccounted = self
+            .uses
+            .iter()
+            .flat_map(|row| row.iter())
+            .filter(|cell| cell.is_none())
+            .count();
 
         let write_total = self
             .write_has_output
             .iter()
             .filter(|has_output| **has_output)
             .count();
-        let write_accounted = self
+        let write_rendered = self
             .writes
             .iter()
             .zip(self.write_has_output.iter())
-            .filter(|(cell, has_output)| **has_output && cell.is_some())
+            .filter(|(cell, has_output)| {
+                **has_output && matches!(cell, Some(LegacyWriteObservation::Exact(_)))
+            })
             .count();
         let write_refused = self
             .writes
@@ -724,22 +1196,34 @@ impl LegacyObservationJournal {
                 **has_output && matches!(cell, Some(LegacyWriteObservation::Refused(_)))
             })
             .count();
+        let write_unaccounted = self
+            .writes
+            .iter()
+            .zip(self.write_has_output.iter())
+            .filter(|(cell, has_output)| **has_output && cell.is_none())
+            .count();
 
         LegacyObservationCoverage {
             values: LegacyObservationDomainCoverage::from_counts(
                 value_total,
-                value_accounted,
+                value_rendered,
+                value_justified_elision,
                 value_refused,
+                value_unaccounted,
             ),
             uses: LegacyObservationDomainCoverage::from_counts(
                 use_total,
-                use_accounted,
+                use_rendered,
+                0,
                 use_refused,
+                use_unaccounted,
             ),
             writes: LegacyObservationDomainCoverage::from_counts(
                 write_total,
-                write_accounted,
+                write_rendered,
+                0,
                 write_refused,
+                write_unaccounted,
             ),
         }
     }
@@ -884,22 +1368,34 @@ fn classify_value_node(
     value_is_literal: &[bool],
     symbol_bindings: &BTreeMap<SymbolId, LegacyBindingId>,
 ) -> Result<LegacyValueObservation, LegacyObservationJournalError> {
-    let expr = match node {
-        RenderObservationNode::Expr(expr) => expr.unobserved(),
+    let (expr, statement_level) = match node {
+        RenderObservationNode::Expr(expr) => (expr.unobserved(), false),
         RenderObservationNode::Stmt(stmt) => match stmt.unobserved() {
             CStmt::Decl { name, .. } => return classify_symbol(*name, symbol_bindings),
-            CStmt::Expr(expr) | CStmt::Return(Some(expr)) => expr.unobserved(),
+            CStmt::Expr(expr) => (expr.unobserved(), true),
+            CStmt::Return(Some(expr)) => (expr.unobserved(), false),
             _ => return Ok(LegacyValueObservation::InlineNonLiteral),
         },
     };
     if let CExpr::Var(symbol) = expr {
         return classify_symbol(*symbol, symbol_bindings);
     }
-    if let CExpr::Binary {
-        op: BinaryOp::Assign,
-        left,
-        ..
-    } = expr
+    if let CExpr::Binary { op, left, .. } = expr
+        && (*op == BinaryOp::Assign
+            || (statement_level
+                && matches!(
+                    op,
+                    BinaryOp::AddAssign
+                        | BinaryOp::SubAssign
+                        | BinaryOp::MulAssign
+                        | BinaryOp::DivAssign
+                        | BinaryOp::ModAssign
+                        | BinaryOp::BitAndAssign
+                        | BinaryOp::BitOrAssign
+                        | BinaryOp::BitXorAssign
+                        | BinaryOp::ShlAssign
+                        | BinaryOp::ShrAssign
+                )))
         && let CExpr::Var(symbol) = left.unobserved()
     {
         return classify_symbol(*symbol, symbol_bindings);
@@ -1236,6 +1732,182 @@ mod tests {
     }
 
     #[test]
+    fn every_private_journal_error_has_a_stable_public_seal_cause() {
+        let function = CFunction::new("seal_cause", CType::Void);
+        let symbol = function.symbols.borrow_mut().declare(
+            "unowned",
+            CType::Int(32),
+            SymbolRole::Carrier,
+            SymbolOrigin::default(),
+        );
+        let site = UseSite {
+            inst: InstId(17),
+            input_idx: 3,
+        };
+        let normalized_site = NormalizedOpSite {
+            block: r2ssa::BlockId(5),
+            op_idx: 7,
+        };
+        let marker = test_render_observation_id(11);
+        let cases = [
+            (
+                LegacyObservationJournalError::SourceAuthority,
+                BindingObservationJournalFailure::SourceAuthority,
+            ),
+            (
+                LegacyObservationJournalError::BindingPlan(
+                    BindingPlanSourceMismatch::Authority,
+                ),
+                BindingObservationJournalFailure::BindingPlanAuthority,
+            ),
+            (
+                LegacyObservationJournalError::Normalization(
+                    NormalizationOriginError::BlockTopology,
+                ),
+                BindingObservationJournalFailure::NormalizationBlockTopology,
+            ),
+            (
+                LegacyObservationJournalError::TooManyObservations,
+                BindingObservationJournalFailure::TooManyObservations,
+            ),
+            (
+                LegacyObservationJournalError::InvalidValue(ValueId(13)),
+                BindingObservationJournalFailure::InvalidValue { value: ValueId(13) },
+            ),
+            (
+                LegacyObservationJournalError::InvalidUse(site),
+                BindingObservationJournalFailure::InvalidUse { site },
+            ),
+            (
+                LegacyObservationJournalError::InvalidWrite(InstId(19)),
+                BindingObservationJournalFailure::InvalidWrite { inst: InstId(19) },
+            ),
+            (
+                LegacyObservationJournalError::OutputlessWrite(InstId(23)),
+                BindingObservationJournalFailure::OutputlessWrite { inst: InstId(23) },
+            ),
+            (
+                LegacyObservationJournalError::InvalidNormalizedSite(normalized_site),
+                BindingObservationJournalFailure::InvalidNormalizedSite {
+                    block: r2ssa::BlockId(5),
+                    op_idx: 7,
+                },
+            ),
+            (
+                LegacyObservationJournalError::MissingNormalizedBlock(0x1234),
+                BindingObservationJournalFailure::MissingNormalizedBlock { address: 0x1234 },
+            ),
+            (
+                LegacyObservationJournalError::MissingNormalizedSiteContext,
+                BindingObservationJournalFailure::MissingNormalizedSiteContext,
+            ),
+            (
+                LegacyObservationJournalError::InvalidNormalizedInput {
+                    site: normalized_site,
+                    input_idx: 9,
+                },
+                BindingObservationJournalFailure::InvalidNormalizedInput {
+                    block: r2ssa::BlockId(5),
+                    op_idx: 7,
+                    input_idx: 9,
+                },
+            ),
+            (
+                LegacyObservationJournalError::MissingNormalizedOutput(normalized_site),
+                BindingObservationJournalFailure::MissingNormalizedOutput {
+                    block: r2ssa::BlockId(5),
+                    op_idx: 7,
+                },
+            ),
+            (
+                LegacyObservationJournalError::RefusedRenderedUse(site),
+                BindingObservationJournalFailure::RefusedRenderedUse { site },
+            ),
+            (
+                LegacyObservationJournalError::RefusedRenderedWrite(InstId(29)),
+                BindingObservationJournalFailure::RefusedRenderedWrite { inst: InstId(29) },
+            ),
+            (
+                LegacyObservationJournalError::RenderedValueRequired(ValueId(31)),
+                BindingObservationJournalFailure::RenderedValueRequired { value: ValueId(31) },
+            ),
+            (
+                LegacyObservationJournalError::ExactUseRequiresRenderedOccurrence(site),
+                BindingObservationJournalFailure::ExactUseRequiresRenderedOccurrence { site },
+            ),
+            (
+                LegacyObservationJournalError::ExactWriteRequiresRenderedOccurrence(InstId(37)),
+                BindingObservationJournalFailure::ExactWriteRequiresRenderedOccurrence {
+                    inst: InstId(37),
+                },
+            ),
+            (
+                LegacyObservationJournalError::SymbolTableMismatch,
+                BindingObservationJournalFailure::SymbolTableMismatch,
+            ),
+            (
+                LegacyObservationJournalError::UnownedBindingSymbol(symbol),
+                BindingObservationJournalFailure::UnownedBindingSymbol {
+                    symbol_index: symbol.index(),
+                },
+            ),
+            (
+                LegacyObservationJournalError::ConflictingValue(ValueId(41)),
+                BindingObservationJournalFailure::ConflictingValue { value: ValueId(41) },
+            ),
+            (
+                LegacyObservationJournalError::ConflictingUse(site),
+                BindingObservationJournalFailure::ConflictingUse { site },
+            ),
+            (
+                LegacyObservationJournalError::ConflictingWrite(InstId(43)),
+                BindingObservationJournalFailure::ConflictingWrite { inst: InstId(43) },
+            ),
+            (
+                LegacyObservationJournalError::Markers(
+                    RenderObservationStripError::DomainTooLarge { expected_count: 47 },
+                ),
+                BindingObservationJournalFailure::ObservationDomainTooLarge {
+                    expected_count: 47,
+                },
+            ),
+            (
+                LegacyObservationJournalError::Markers(
+                    RenderObservationStripError::CapacityUnavailable { expected_count: 53 },
+                ),
+                BindingObservationJournalFailure::ObservationCapacityUnavailable {
+                    expected_count: 53,
+                },
+            ),
+            (
+                LegacyObservationJournalError::Markers(
+                    RenderObservationStripError::OutOfRange {
+                        id: marker,
+                        expected_count: 59,
+                    },
+                ),
+                BindingObservationJournalFailure::ObservationOutOfRange {
+                    observation_id: 11,
+                    expected_count: 59,
+                },
+            ),
+            (
+                LegacyObservationJournalError::Markers(RenderObservationStripError::Duplicate {
+                    id: marker,
+                }),
+                BindingObservationJournalFailure::DuplicateObservation {
+                    observation_id: 11,
+                },
+            ),
+        ];
+
+        for (private, public) in cases {
+            assert_eq!(BindingObservationJournalFailure::from(&private), public);
+            assert!(!public.kind().is_empty());
+        }
+    }
+
+    #[test]
     fn normalized_issuance_is_idempotent_and_raw_bound_recording_is_rejected() {
         let (source, plan, mut function, mut journal) = journal_fixture();
         let (value, binding, site, input_idx) = first_bound_rendered_input(&plan, &source);
@@ -1263,6 +1935,33 @@ mod tests {
         assert_eq!(
             journal.record_nonrendered_value(value),
             Err(LegacyObservationJournalError::RenderedValueRequired(value))
+        );
+    }
+
+    #[test]
+    fn cached_render_clone_reissues_unique_ids_for_the_same_targets() {
+        let (source, plan, mut function, mut journal) = journal_fixture();
+        let (value, binding, site, input_idx) = first_bound_rendered_input(&plan, &source);
+        let symbol = declare_legacy_local(&mut function, &plan, binding, "cached_value");
+        let marked = journal
+            .observe_normalized_input_expr(site, input_idx, CExpr::Var(symbol))
+            .expect("template occurrence");
+        let template = vec![CStmt::Expr(marked)];
+        let cloned = journal
+            .clone_render_occurrence(&template)
+            .expect("fresh cached occurrence");
+        function.body.extend(template);
+        function.body.extend(cloned);
+
+        let mut ready = crate::codegen::prepare_function_for_emission(&function);
+        let sealed = journal
+            .seal(&source, &mut ready)
+            .expect("fresh occurrence IDs must not collide");
+        assert_eq!(
+            sealed.snapshot().value_observation(value),
+            Some(LegacyValueObservation::Bound {
+                binding: LegacyBindingId(0),
+            })
         );
     }
 
@@ -1318,13 +2017,59 @@ mod tests {
                 .filter(|inst| inst.output.is_some())
                 .count()
         );
-        assert_eq!(coverage.values.accounted, 1);
-        assert_eq!(coverage.uses.accounted, 0);
-        assert_eq!(coverage.writes.accounted, 1);
+        assert_eq!(coverage.values.rendered, 1);
+        assert_eq!(coverage.uses.rendered, 0);
+        assert_eq!(coverage.writes.rendered, 1);
         assert_eq!(coverage.values.refused, 0);
         assert_eq!(coverage.uses.refused, 0);
         assert_eq!(coverage.writes.refused, 0);
         assert!(coverage.equations_hold());
+    }
+
+    #[test]
+    fn compound_assignment_keeps_statement_level_output_bound_to_its_lhs() {
+        let (source, plan, mut function, mut journal) = journal_fixture();
+        let (value, binding, inst, site) = first_bound_rendered_output(&plan, &source);
+        let symbol = declare_legacy_local(&mut function, &plan, binding, "accumulator");
+        let assignment = CStmt::Expr(CExpr::assign(
+            CExpr::Var(symbol),
+            CExpr::binary(BinaryOp::Add, CExpr::Var(symbol), CExpr::IntLit(1)),
+        ));
+        let marked = journal
+            .observe_normalized_output_stmt(site, assignment)
+            .expect("marked output statement");
+        let rewritten = crate::structure::ControlFlowStructurer::cleanup(
+            function.symbols.as_ref(),
+            marked,
+        );
+        function.body = vec![rewritten, CStmt::Return(Some(CExpr::Var(symbol)))];
+
+        let expected_write = match plan.write_disposition(inst) {
+            Some(MachineWriteDisposition::Exact(write)) => LegacyWriteObservation::Exact(*write),
+            other => panic!("expected exact write, got {other:?}"),
+        };
+        let mut ready = crate::codegen::prepare_function_for_emission(&function);
+        let sealed = journal
+            .seal(&source, &mut ready)
+            .expect("compound output remains exactly classifiable");
+
+        assert_eq!(
+            sealed.snapshot().value_observation(value),
+            Some(LegacyValueObservation::Bound {
+                binding: LegacyBindingId(0),
+            })
+        );
+        assert_eq!(
+            sealed.snapshot().write_observation(inst),
+            Some(expected_write)
+        );
+        assert!(matches!(
+            ready.function().body.first().map(CStmt::unobserved),
+            Some(CStmt::Expr(CExpr::Binary {
+                op: BinaryOp::AddAssign,
+                ..
+            }))
+        ));
     }
 
     #[test]
@@ -1417,6 +2162,73 @@ mod tests {
             ))
         ));
         assert_eq!(range_ready.function_for_marker_test(), &unchanged);
+    }
+
+    #[test]
+    fn production_audit_failure_keeps_the_marker_free_native_product() {
+        let (source, plan, mut function, mut journal) = journal_fixture();
+        let (_value, binding, site, input_idx) = first_bound_rendered_input(&plan, &source);
+        let symbol = declare_legacy_symbol(&function, &plan, binding, "duplicate_native_value");
+        let marked = journal
+            .observe_normalized_input_expr(site, input_idx, CExpr::Var(symbol))
+            .expect("value marker");
+        let CExpr::Observed {
+            id: duplicate_id, ..
+        } = &marked
+        else {
+            panic!("rendered input must carry an observation")
+        };
+        let duplicate_id = duplicate_id.index();
+        function.body = vec![CStmt::Expr(marked.clone()), CStmt::Expr(marked)];
+
+        let mut expected_function = function.clone();
+        crate::ast::discard_render_observations(&mut expected_function);
+        let expected = crate::codegen::prepare_function_for_emission(&expected_function);
+        let native =
+            MarkedNativeDraft::new(function, journal).finish_non_consuming(&source, None);
+
+        assert_eq!(
+            native.audit_observations(),
+            Err(BindingShadowAuditFailure::JournalSeal(
+                BindingObservationJournalFailure::DuplicateObservation {
+                    observation_id: duplicate_id,
+                },
+            ))
+        );
+        assert_eq!(native.emission().function(), expected.function());
+        assert!(!crate::ast::has_render_observations(
+            native.emission().function()
+        ));
+    }
+
+    #[test]
+    fn production_recording_failure_keeps_its_exact_cause_and_native_product() {
+        let (source, plan, mut function, mut journal) = journal_fixture();
+        let (_value, binding, site, input_idx) = first_bound_rendered_input(&plan, &source);
+        let symbol = declare_legacy_symbol(&function, &plan, binding, "recording_value");
+        let marked = journal
+            .observe_normalized_input_expr(site, input_idx, CExpr::Var(symbol))
+            .expect("value marker");
+        function.body = vec![CStmt::Expr(marked)];
+
+        let mut expected_function = function.clone();
+        crate::ast::discard_render_observations(&mut expected_function);
+        let expected = crate::codegen::prepare_function_for_emission(&expected_function);
+        let native = MarkedNativeDraft::new(function, journal).finish_non_consuming(
+            &source,
+            Some(LegacyObservationJournalError::MissingNormalizedSiteContext),
+        );
+
+        assert_eq!(
+            native.audit_observations(),
+            Err(BindingShadowAuditFailure::JournalRecording(
+                BindingObservationJournalFailure::MissingNormalizedSiteContext,
+            ))
+        );
+        assert_eq!(native.emission().function(), expected.function());
+        assert!(!crate::ast::has_render_observations(
+            native.emission().function()
+        ));
     }
 
     #[test]

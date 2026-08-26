@@ -841,7 +841,7 @@ impl<'a> FoldingContext<'a> {
         ) && let Some(alias) = self.resolve_stack_alias_from_addr_expr(&rewritten, 0)
             && !super::op_lower::is_generic_stack_placeholder_alias(&alias)
         {
-            return crate::ast::carry_expr_render_observations(&rewritten, self.name_ref(&alias));
+            return self.name_ref(&alias);
         }
 
         match rewritten {
@@ -849,16 +849,10 @@ impl<'a> FoldingContext<'a> {
                 if let Some(alias) = self.resolve_stack_alias_from_addr_expr(&inner, 0)
                     && !super::op_lower::is_generic_stack_placeholder_alias(&alias)
                 {
-                    return crate::ast::carry_expr_render_observations(
-                        &inner,
-                        self.name_ref(&alias),
-                    );
+                    return self.name_ref(&alias);
                 }
                 if let Some(var_name) = self.extract_known_stack_var_name(&inner) {
-                    return crate::ast::carry_expr_render_observations(
-                        &inner,
-                        self.name_ref(&var_name),
-                    );
+                    return self.name_ref(&var_name);
                 }
                 CExpr::Deref(inner)
             }
@@ -1086,7 +1080,7 @@ mod observation_transparency_tests {
     }
 
     #[test]
-    fn nested_observed_stack_alias_rewrite_moves_each_marker_once() {
+    fn stack_alias_rewrite_leaves_eliminated_address_markers_unaccounted() {
         let mut ctx = FoldingContext::new(64);
         ctx.state
             .analysis_ctx
@@ -1112,8 +1106,15 @@ mod observation_transparency_tests {
             rewritten.transparently_eq(&ctx.name_ref("value")),
             "unexpected stack rewrite: {rewritten:?}"
         );
-        let stripped = validate_and_strip_expr(rewritten, &owner);
-        assert_eq!(stripped, ctx.name_ref("value"));
+        let mut function = CFunction::new("stack_alias", CType::Void)
+            .with_body(vec![CStmt::Expr(rewritten)]);
+        let reachable = strip_render_observations(&mut function, owner.expected_count())
+            .expect("stack alias rewrite preserves a valid marker domain");
+        assert_eq!(reachable.ids().count(), 0);
+        assert_eq!(
+            function.body,
+            vec![CStmt::Expr(ctx.name_ref("value"))]
+        );
     }
 
     #[test]

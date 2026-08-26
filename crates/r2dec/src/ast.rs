@@ -929,6 +929,43 @@ pub enum CStmt {
     Comment(String),
 }
 
+/// Ordered observation metadata peeled from the outside of one statement.
+///
+/// Shape-changing passes may need to inspect or decompose the semantic
+/// statement, but the observation IDs still belong to the same source
+/// position. This chain is the single owner of that temporary separation: IDs
+/// are stored outermost-to-innermost and reapplied in reverse construction
+/// order, so neither their nesting order nor their cardinality can drift.
+#[derive(Debug, Default)]
+pub(crate) struct StmtObservationChain {
+    outer_to_inner: Vec<RenderObservationId>,
+}
+
+impl StmtObservationChain {
+    /// Reattach this chain to the semantic statement at the same position.
+    pub(crate) fn reapply(self, mut stmt: CStmt) -> CStmt {
+        for id in self.outer_to_inner.into_iter().rev() {
+            stmt = CStmt::observed(id, stmt);
+        }
+        stmt
+    }
+
+    /// Reattach this chain when decomposition has one exact surviving statement.
+    ///
+    /// Returning `false` means the semantic position was deleted or split into
+    /// multiple statements, so no single final occurrence owns the IDs.
+    /// Callers must leave that coverage unaccounted rather than choosing a
+    /// child merely to keep the chain reachable.
+    pub(crate) fn reapply_to_unique(self, stmts: &mut [CStmt]) -> bool {
+        if stmts.len() != 1 {
+            return false;
+        }
+        let semantic = std::mem::replace(&mut stmts[0], CStmt::Empty);
+        stmts[0] = self.reapply(semantic);
+        true
+    }
+}
+
 /// A case in a switch statement.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SwitchCase {
@@ -947,6 +984,24 @@ impl CStmt {
         }
     }
 
+    /// Separate only the leading statement-observation chain from its semantic
+    /// node. Nested child observations remain in place.
+    pub(crate) fn into_semantic_with_observations(self) -> (Self, StmtObservationChain) {
+        let mut semantic = self;
+        let mut outer_to_inner = Vec::new();
+        loop {
+            match semantic {
+                Self::Observed { id, stmt } => {
+                    outer_to_inner.push(id);
+                    semantic = *stmt;
+                }
+                semantic => {
+                    return (semantic, StmtObservationChain { outer_to_inner });
+                }
+            }
+        }
+    }
+
     /// Borrow the semantic statement beneath any internal observation markers.
     pub(crate) fn unobserved(&self) -> &Self {
         let mut stmt = self;
@@ -954,6 +1009,17 @@ impl CStmt {
             stmt = inner;
         }
         stmt
+    }
+
+    /// Mutably borrow the semantic statement beneath leading observation metadata.
+    pub(crate) fn unobserved_mut(&mut self) -> &mut Self {
+        let mut stmt = self;
+        loop {
+            match stmt {
+                Self::Observed { stmt: inner, .. } => stmt = inner,
+                semantic => return semantic,
+            }
+        }
     }
 
     /// Clone semantic statement data while omitting every observation wrapper.
@@ -1271,6 +1337,176 @@ pub(crate) fn strip_render_observations(
         strip_stmt_observations(stmt);
     }
     Ok(observations)
+}
+
+/// Remove every internal observation wrapper after the audit path has failed.
+///
+/// This deliberately performs no validation: the observation journal owns the
+/// authority to report that failure, while native rendering must still emit the
+/// same marker-free AST it would have emitted without the shadow audit.
+pub(crate) fn discard_render_observations(function: &mut CFunction) {
+    for stmt in &mut function.body {
+        strip_stmt_observations(stmt);
+    }
+}
+
+/// Give every marker in a cloned statement tree a fresh occurrence identity.
+///
+/// A semantic block may be emitted in more than one certified region. Its
+/// cached AST is the authoritative fold result, but observation IDs belong to
+/// concrete AST occurrences and therefore cannot be copied with that cache.
+pub(crate) fn remap_render_observation_ids<E>(
+    stmts: &mut [CStmt],
+    remap: &mut impl FnMut(RenderObservationId) -> Result<RenderObservationId, E>,
+) -> Result<(), E> {
+    fn remap_expr<E>(
+        expr: &mut CExpr,
+        remap: &mut impl FnMut(RenderObservationId) -> Result<RenderObservationId, E>,
+    ) -> Result<(), E> {
+        if let CExpr::Observed { id, expr } = expr {
+            *id = remap(*id)?;
+            return remap_expr(expr, remap);
+        }
+        match expr {
+            CExpr::Observed { .. } => unreachable!("handled before semantic expression"),
+            CExpr::Unary { operand, .. }
+            | CExpr::Cast { expr: operand, .. }
+            | CExpr::Sizeof(operand)
+            | CExpr::AddrOf(operand)
+            | CExpr::Deref(operand)
+            | CExpr::Paren(operand) => remap_expr(operand, remap)?,
+            CExpr::Binary { left, right, .. } => {
+                remap_expr(left, remap)?;
+                remap_expr(right, remap)?;
+            }
+            CExpr::Ternary {
+                cond,
+                then_expr,
+                else_expr,
+            } => {
+                remap_expr(cond, remap)?;
+                remap_expr(then_expr, remap)?;
+                remap_expr(else_expr, remap)?;
+            }
+            CExpr::Call { func, args, .. } => {
+                remap_expr(func, remap)?;
+                for arg in args {
+                    remap_expr(arg, remap)?;
+                }
+            }
+            CExpr::Subscript { base, index } => {
+                remap_expr(base, remap)?;
+                remap_expr(index, remap)?;
+            }
+            CExpr::Member { base, .. } | CExpr::PtrMember { base, .. } => {
+                remap_expr(base, remap)?;
+            }
+            CExpr::Comma(items) => {
+                for item in items {
+                    remap_expr(item, remap)?;
+                }
+            }
+            CExpr::IntLit(_)
+            | CExpr::UIntLit(_)
+            | CExpr::FloatLit(_)
+            | CExpr::StringLit(_)
+            | CExpr::CharLit(_)
+            | CExpr::Var(_)
+            | CExpr::External { .. }
+            | CExpr::SizeofType(_) => {}
+        }
+        Ok(())
+    }
+
+    fn remap_stmt<E>(
+        stmt: &mut CStmt,
+        remap: &mut impl FnMut(RenderObservationId) -> Result<RenderObservationId, E>,
+    ) -> Result<(), E> {
+        if let CStmt::Observed { id, stmt } = stmt {
+            *id = remap(*id)?;
+            return remap_stmt(stmt, remap);
+        }
+        match stmt {
+            CStmt::Observed { .. } => unreachable!("handled before semantic statement"),
+            CStmt::Expr(expr) => remap_expr(expr, remap)?,
+            CStmt::Decl { init, .. } | CStmt::Return(init) => {
+                if let Some(expr) = init {
+                    remap_expr(expr, remap)?;
+                }
+            }
+            CStmt::Block(stmts) => {
+                for stmt in stmts {
+                    remap_stmt(stmt, remap)?;
+                }
+            }
+            CStmt::If {
+                cond,
+                then_body,
+                else_body,
+            } => {
+                remap_expr(cond, remap)?;
+                remap_stmt(then_body, remap)?;
+                if let Some(else_body) = else_body {
+                    remap_stmt(else_body, remap)?;
+                }
+            }
+            CStmt::While { cond, body } => {
+                remap_expr(cond, remap)?;
+                remap_stmt(body, remap)?;
+            }
+            CStmt::DoWhile { body, cond } => {
+                remap_stmt(body, remap)?;
+                remap_expr(cond, remap)?;
+            }
+            CStmt::For {
+                init,
+                cond,
+                update,
+                body,
+            } => {
+                if let Some(init) = init {
+                    remap_stmt(init, remap)?;
+                }
+                if let Some(cond) = cond {
+                    remap_expr(cond, remap)?;
+                }
+                if let Some(update) = update {
+                    remap_expr(update, remap)?;
+                }
+                remap_stmt(body, remap)?;
+            }
+            CStmt::Switch {
+                expr,
+                cases,
+                default,
+            } => {
+                remap_expr(expr, remap)?;
+                for case in cases {
+                    remap_expr(&mut case.value, remap)?;
+                    for stmt in &mut case.body {
+                        remap_stmt(stmt, remap)?;
+                    }
+                }
+                if let Some(default) = default {
+                    for stmt in default {
+                        remap_stmt(stmt, remap)?;
+                    }
+                }
+            }
+            CStmt::Empty
+            | CStmt::Break
+            | CStmt::Continue
+            | CStmt::Goto(_)
+            | CStmt::Label(_)
+            | CStmt::Comment(_) => {}
+        }
+        Ok(())
+    }
+
+    for stmt in stmts {
+        remap_stmt(stmt, remap)?;
+    }
+    Ok(())
 }
 
 fn inspect_expr_observations<E>(
@@ -1638,48 +1874,6 @@ fn inspect_stmt_observations<E>(
     Ok(())
 }
 
-pub(crate) fn carry_render_observations(stmts: &[CStmt], mut replacement: CStmt) -> CStmt {
-    let mut ids = Vec::new();
-    for stmt in stmts {
-        let never = visit_stmt_observations(stmt, &mut |id| {
-            ids.push(id);
-            Ok::<_, std::convert::Infallible>(())
-        });
-        match never {
-            Ok(()) => {}
-            Err(never) => match never {},
-        }
-    }
-    for id in ids.into_iter().rev() {
-        replacement = CStmt::observed(id, replacement);
-    }
-    replacement
-}
-
-/// Move every observation nested anywhere in `source` onto one replacement.
-///
-/// Whole-tree folds use this together with
-/// [`CExpr::clone_without_render_observations`] so each source marker occurs
-/// exactly once in the replacement tree.
-pub(crate) fn carry_expr_render_observations(
-    source: &CExpr,
-    mut replacement: CExpr,
-) -> CExpr {
-    let mut ids = Vec::new();
-    let never = visit_expr_observations(source, &mut |id| {
-        ids.push(id);
-        Ok::<_, std::convert::Infallible>(())
-    });
-    match never {
-        Ok(()) => {}
-        Err(never) => match never {},
-    }
-    for id in ids.into_iter().rev() {
-        replacement = CExpr::observed(id, replacement);
-    }
-    replacement
-}
-
 pub(crate) fn carry_outer_stmt_observations(source: &CStmt, mut replacement: CStmt) -> CStmt {
     let mut source = source;
     let mut ids = Vec::new();
@@ -1908,6 +2102,30 @@ mod tests {
     }
 
     #[test]
+    fn statement_observation_chain_round_trips_in_nesting_order_once() {
+        let semantic = CStmt::Expr(CExpr::IntLit(7));
+        let mut owner = RenderObservationOwner::new();
+        let (inner_id, inner) = owner
+            .observe_stmt(semantic.clone())
+            .expect("inner statement observation");
+        let (outer_id, wrapped) = owner
+            .observe_stmt(inner)
+            .expect("outer statement observation");
+
+        let (peeled, observations) = wrapped.clone().into_semantic_with_observations();
+        assert_eq!(peeled, semantic);
+        let rebuilt = observations.reapply(peeled);
+        assert_eq!(rebuilt, wrapped, "outer and inner IDs must not reorder");
+
+        let mut function = CFunction::new("stmt_chain", CType::Void).with_body(vec![rebuilt]);
+        let reachable = strip_render_observations(&mut function, owner.expected_count())
+            .expect("recomposition must retain every ID exactly once");
+        assert!(reachable.contains(inner_id));
+        assert!(reachable.contains(outer_id));
+        assert_eq!(function.body, vec![semantic]);
+    }
+
+    #[test]
     fn final_node_inspection_visits_subscript_markers_once() {
         let mut owner = RenderObservationOwner::new();
         let (base_id, base) = owner
@@ -1937,12 +2155,12 @@ mod tests {
     }
 
     #[test]
-    fn semantic_clones_and_aggregate_replacements_do_not_duplicate_ids() {
+    fn semantic_clones_drop_occurrence_owned_observations() {
         let mut owner = RenderObservationOwner::new();
-        let (left_id, left) = owner
+        let (_, left) = owner
             .observe_expr(CExpr::IntLit(1))
             .expect("left observation");
-        let (right_id, right) = owner
+        let (_, right) = owner
             .observe_expr(CExpr::IntLit(2))
             .expect("right observation");
         let source = CExpr::binary(BinaryOp::Add, left, right);
@@ -1950,12 +2168,11 @@ mod tests {
             source.clone_without_render_observations(),
             CExpr::binary(BinaryOp::Add, CExpr::IntLit(1), CExpr::IntLit(2))
         );
-        let replacement = carry_expr_render_observations(&source, CExpr::IntLit(3));
         let mut function =
-            CFunction::new("fold", CType::Void).with_body(vec![CStmt::Expr(replacement)]);
+            CFunction::new("fold", CType::Void).with_body(vec![CStmt::Expr(CExpr::IntLit(3))]);
         let reachable = strip_render_observations(&mut function, owner.expected_count())
-            .expect("each carried ID occurs once");
-        assert_eq!(reachable.ids().collect::<Vec<_>>(), vec![left_id, right_id]);
+            .expect("eliminated observations remain unaccounted");
+        assert_eq!(reachable.ids().count(), 0);
         assert_eq!(function.body, vec![CStmt::Expr(CExpr::IntLit(3))]);
     }
 

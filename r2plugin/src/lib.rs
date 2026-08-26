@@ -2584,6 +2584,7 @@ pub(crate) struct EngineV2Output {
     pub(crate) output: String,
     pub(crate) metrics: r2engine::EngineMetrics,
     pub(crate) diagnostics: r2engine::EngineDiagnostics,
+    pub(crate) binding_audit: Option<r2engine::BindingShadowAuditOutcome>,
 }
 
 /// The name the source gives this function, when it gives one.
@@ -2643,6 +2644,7 @@ fn r2sleigh_engine_decompile_trusted_output(
         output: response.output,
         metrics: response.metrics,
         diagnostics: response.diagnostics,
+        binding_audit: Some(response.binding_audit),
     })
 }
 
@@ -2696,6 +2698,7 @@ fn r2sleigh_engine_type_function_trusted_output(
                 .to_string(),
                 metrics: *refusal.metrics,
                 diagnostics: *refusal.diagnostics,
+                binding_audit: None,
             });
         }
     };
@@ -2722,6 +2725,7 @@ fn r2sleigh_engine_type_function_trusted_output(
         output: serde_json::to_string(&type_writeback).ok()?,
         metrics,
         diagnostics,
+        binding_audit: None,
     })
 }
 
@@ -2761,6 +2765,7 @@ fn r2sleigh_engine_proven_facts_trusted_output(
         output: output.to_string(),
         metrics: r2engine::EngineMetrics::default(),
         diagnostics: r2engine::EngineDiagnostics::default(),
+        binding_audit: None,
     })
 }
 

@@ -2847,6 +2847,14 @@ impl<'a> FoldingContext<'a> {
         if let Some(stmt) = self.op_to_stmt_impl(op, frame) {
             return match Self::lowered_from_stmt(stmt) {
                 LoweredOp::Assign { rhs, .. } => Some(rhs),
+                LoweredOp::FinalizedStmt(CStmt::Expr(CExpr::Binary {
+                    op: BinaryOp::Assign,
+                    right,
+                    ..
+                })) => Some(*right),
+                LoweredOp::FinalizedStmt(CStmt::Expr(expr)) => Some(expr),
+                LoweredOp::FinalizedStmt(CStmt::Return(Some(expr))) => Some(expr),
+                LoweredOp::FinalizedStmt(_) => None,
                 LoweredOp::Expr(expr) => Some(expr),
                 LoweredOp::Return(Some(expr)) => Some(expr),
                 LoweredOp::Return(None) => Some(CExpr::External {
@@ -2881,11 +2889,11 @@ impl<'a> FoldingContext<'a> {
     }
 
     fn is_literal_zero_expr(&self, expr: &CExpr) -> bool {
-        matches!(expr, CExpr::IntLit(0) | CExpr::UIntLit(0))
+        matches!(expr.unobserved(), CExpr::IntLit(0) | CExpr::UIntLit(0))
     }
 
     fn is_one_expr(&self, expr: &CExpr) -> bool {
-        matches!(expr, CExpr::IntLit(1) | CExpr::UIntLit(1))
+        matches!(expr.unobserved(), CExpr::IntLit(1) | CExpr::UIntLit(1))
     }
 
     fn is_all_ones_mask_expr(&self, expr: &CExpr, width_bytes: u32) -> bool {
@@ -2899,7 +2907,7 @@ impl<'a> FoldingContext<'a> {
             (1u64 << bits) - 1
         };
 
-        match expr {
+        match expr.unobserved() {
             CExpr::UIntLit(v) => *v == mask,
             CExpr::IntLit(v) => *v == -1 || u64::try_from(*v).map(|n| n == mask).unwrap_or(false),
             CExpr::Paren(inner) => self.is_all_ones_mask_expr(inner, width_bytes),
@@ -2915,31 +2923,63 @@ impl<'a> FoldingContext<'a> {
         right: CExpr,
         width_bytes: Option<u32>,
     ) -> CExpr {
+        self.identity_simplify_binary_semantic(op, left, right, width_bytes)
+    }
+
+    fn finish_nonpositional_identity_rewrite(
+        op: BinaryOp,
+        left: CExpr,
+        right: CExpr,
+        replacement: Option<CExpr>,
+    ) -> CExpr {
+        let source = CExpr::binary(op, left, right);
+        match replacement {
+            Some(replacement) if !source.transparently_eq(&replacement) => replacement,
+            Some(_) | None => source,
+        }
+    }
+
+    /// Simplify one binary expression while retaining only observations whose
+    /// exact operand occurrence survives the rewrite.
+    ///
+    /// Returning an original operand preserves that operand's markers. An
+    /// identity operand or folded constant that disappears takes its markers
+    /// with it, leaving the journal obligation unaccounted unless upstream had
+    /// already certified a non-rendered disposition.
+    fn identity_simplify_binary_semantic(
+        &self,
+        op: BinaryOp,
+        left: CExpr,
+        right: CExpr,
+        width_bytes: Option<u32>,
+    ) -> CExpr {
         if let Some(value) = self.literal_binary_value(op, &left, &right) {
             return CExpr::IntLit(value);
         }
         match op {
             BinaryOp::Sub if self.is_literal_zero_expr(&right) => left,
             BinaryOp::Sub => {
-                if let Some(expr) = self.simplify_linear_subtraction(&left, &right) {
-                    expr
-                } else {
-                    CExpr::binary(op, left, right)
-                }
+                let replacement = self.simplify_linear_subtraction(
+                    &left.clone_without_render_observations(),
+                    &right.clone_without_render_observations(),
+                );
+                Self::finish_nonpositional_identity_rewrite(op, left, right, replacement)
             }
             BinaryOp::Add => {
                 if self.is_literal_zero_expr(&right) {
                     left
                 } else if self.is_literal_zero_expr(&left) {
                     right
-                } else if let Some(expr) = self.simplify_linear_addition(&left, &right) {
-                    expr
                 } else {
-                    CExpr::binary(op, left, right)
+                    let replacement = self.simplify_linear_addition(
+                        &left.clone_without_render_observations(),
+                        &right.clone_without_render_observations(),
+                    );
+                    Self::finish_nonpositional_identity_rewrite(op, left, right, replacement)
                 }
             }
             BinaryOp::BitOr | BinaryOp::BitXor => {
-                if op == BinaryOp::BitXor && left == right {
+                if op == BinaryOp::BitXor && left.transparently_eq(&right) {
                     CExpr::IntLit(0)
                 } else if self.is_literal_zero_expr(&right) {
                     left
@@ -2955,13 +2995,19 @@ impl<'a> FoldingContext<'a> {
                 } else if self.is_one_expr(&left) {
                     right
                 } else if let Some(coeff) = self.literal_to_i64(&right)
-                    && let Some(expr) = self.simplify_linear_scale(&left, coeff)
                 {
-                    expr
+                    let replacement = self.simplify_linear_scale(
+                        &left.clone_without_render_observations(),
+                        coeff,
+                    );
+                    Self::finish_nonpositional_identity_rewrite(op, left, right, replacement)
                 } else if let Some(coeff) = self.literal_to_i64(&left)
-                    && let Some(expr) = self.simplify_linear_scale(&right, coeff)
                 {
-                    expr
+                    let replacement = self.simplify_linear_scale(
+                        &right.clone_without_render_observations(),
+                        coeff,
+                    );
+                    Self::finish_nonpositional_identity_rewrite(op, left, right, replacement)
                 } else {
                     CExpr::binary(op, left, right)
                 }
@@ -2989,9 +3035,12 @@ impl<'a> FoldingContext<'a> {
                     left
                 } else if let Some(shift) = self.literal_to_i64(&right)
                     && (0..=62).contains(&shift)
-                    && let Some(expr) = self.simplify_linear_scale(&left, 1i64 << shift)
                 {
-                    expr
+                    let replacement = self.simplify_linear_scale(
+                        &left.clone_without_render_observations(),
+                        1i64 << shift,
+                    );
+                    Self::finish_nonpositional_identity_rewrite(op, left, right, replacement)
                 } else {
                     CExpr::binary(op, left, right)
                 }
@@ -3214,7 +3263,7 @@ impl<'a> FoldingContext<'a> {
         }
         match expr {
             CExpr::Binary { op, left, right } => {
-                self.identity_simplify_binary(op, *left, *right, None)
+                self.identity_simplify_binary_semantic(op, *left, *right, None)
             }
             other => other,
         }
@@ -3231,17 +3280,17 @@ impl<'a> FoldingContext<'a> {
         // `x`, and rewriting it produced `x = local_10 + 8`, a statement
         // assigning a parameter the address of its own home slot. Left as the
         // temporary it is, the dead address computation is pruned instead.
-        let lhs = match &lhs {
+        let lhs = match lhs.unobserved() {
             CExpr::Var(name) if self.is_prunable_dead_binding_target(&self.spelling(*name)) => lhs,
             _ => self.rewrite_stack_expr(lhs),
         };
-        let rhs = self.identity_simplify_expr(rhs);
+        let rhs = self.simplify_identities(rhs);
         let rhs = {
             let mut semantic_visited = HashSet::new();
             self.semanticize_visible_expr(&rhs, 0, &mut semantic_visited)
         };
         let rhs = self.rewrite_stack_expr(rhs);
-        let mut rhs = if let CExpr::Var(lhs_name) = &lhs
+        let mut rhs = if let CExpr::Var(lhs_name) = lhs.unobserved()
             && self
                 .stack_offset_for_visible_storage_name(&self.spelling(*lhs_name))
                 .is_some()
@@ -3261,14 +3310,14 @@ impl<'a> FoldingContext<'a> {
         } else {
             rhs
         };
-        if let CExpr::Var(lhs_name) = &lhs
+        if let CExpr::Var(lhs_name) = lhs.unobserved()
             && is_generic_arg_name(&self.spelling(*lhs_name))
             && let Some(rhs_alias) = self.arg_alias_for_expr(&rhs)
             && self.spelling(*lhs_name).eq_ignore_ascii_case(&rhs_alias)
         {
             return None;
         }
-        if let CExpr::Var(lhs_name) = &lhs
+        if let CExpr::Var(lhs_name) = lhs.unobserved()
             && is_generic_arg_name(&self.spelling(*lhs_name))
             && self
                 .lookup_type_hint(&self.spelling(*lhs_name))
@@ -3278,19 +3327,26 @@ impl<'a> FoldingContext<'a> {
         {
             return None;
         }
-        if let CExpr::Var(lhs_name) = &lhs
-            && let CExpr::Cast { expr, .. } = &rhs
-            && matches!(expr.as_ref(), CExpr::Var(rhs_name) if self.spelling(*rhs_name).eq_ignore_ascii_case(&self.spelling(*lhs_name)))
+        if let CExpr::Var(lhs_name) = lhs.unobserved()
+            && let CExpr::Cast { expr, .. } = rhs.unobserved()
+            && matches!(expr.unobserved(), CExpr::Var(rhs_name) if self.spelling(*rhs_name).eq_ignore_ascii_case(&self.spelling(*lhs_name)))
         {
             return None;
         }
-        if let CExpr::Var(lhs_name) = &lhs
-            && let CExpr::Var(rhs_name) = &rhs
+        if let CExpr::Var(lhs_name) = lhs.unobserved()
+            && let CExpr::Var(rhs_name) = rhs.unobserved()
             && self.spelling(*lhs_name).eq_ignore_ascii_case(&self.spelling(*rhs_name))
             && let Some(recovered) =
                 self.recovered_owned_call_result_definition_rhs_for_visible_name(*lhs_name)
         {
-            rhs = recovered;
+            rhs = if rhs.transparently_eq(&recovered) {
+                rhs
+            } else {
+                crate::ast::carry_outer_expr_observations(
+                    &rhs,
+                    recovered.clone_without_render_observations(),
+                )
+            };
         }
         // A rewrite may resolve a name by the value behind it, and after this
         // statement the destination holds that value too, so the value has two
@@ -3302,17 +3358,17 @@ impl<'a> FoldingContext<'a> {
         //
         // A statement that did read the destination is left alone, so an
         // identity that reduces to it, `x = x - 0`, is still suppressed.
-        let rhs = match (&lhs, &rhs) {
+        let rhs = match (lhs.unobserved(), rhs.unobserved()) {
             (CExpr::Var(lhs_name), CExpr::Var(rhs_name))
                 if lhs_name == rhs_name
-                    && source_rhs != rhs
+                    && !source_rhs.transparently_eq(&rhs)
                     && !self.expr_mentions_rendered_name(&source_rhs, *lhs_name) =>
             {
                 source_rhs
             }
             _ => rhs,
         };
-        if lhs == rhs {
+        if lhs.transparently_eq(&rhs) {
             return None;
         }
         Some(CStmt::Expr(CExpr::assign(lhs, rhs)))
@@ -6268,7 +6324,7 @@ impl<'a> FoldingContext<'a> {
             return true;
         }
 
-        match expr {
+        match expr.unobserved() {
             CExpr::Cast { ty, .. } => matches!(ty, CType::Pointer(_)),
             CExpr::Deref(_) => true,
             CExpr::Subscript { .. } | CExpr::Member { .. } | CExpr::PtrMember { .. } => true,
@@ -7783,6 +7839,7 @@ impl<'a> FoldingContext<'a> {
 
     fn expr_is_stack_base_like(&self, expr: &CExpr) -> bool {
         match expr {
+            CExpr::Observed { expr, .. } => self.expr_is_stack_base_like(expr),
             CExpr::Var(name) => {
                 let lower = self.spelling(*name).to_ascii_lowercase();
                 self.inputs.arch.is_stack_base_name(&lower)
@@ -7801,6 +7858,9 @@ impl<'a> FoldingContext<'a> {
 
     fn expr_contains_raw_stack_base_arithmetic(&self, expr: &CExpr) -> bool {
         match expr {
+            CExpr::Observed { expr, .. } => {
+                self.expr_contains_raw_stack_base_arithmetic(expr)
+            }
             CExpr::Binary {
                 op: BinaryOp::Add | BinaryOp::Sub,
                 left,
@@ -7853,6 +7913,7 @@ impl<'a> FoldingContext<'a> {
     }
 
     pub(super) fn expr_is_address_artifact_in_scalar_context(&self, expr: &CExpr) -> bool {
+        let expr = expr.unobserved();
         match expr {
             CExpr::AddrOf(_) => true,
             CExpr::Deref(inner) => self.expr_contains_raw_stack_base_arithmetic(inner),
@@ -8050,6 +8111,15 @@ impl<'a> FoldingContext<'a> {
         quality
     }
 
+    #[cfg(test)]
+    pub(super) fn debug_visible_expr_quality(
+        &self,
+        expr: &CExpr,
+        context: VisibleExprContext,
+    ) -> VisibleExprQuality {
+        self.visible_expr_quality_in_context(expr, context)
+    }
+
     fn accumulate_visible_expr_quality(
         &self,
         expr: &CExpr,
@@ -8061,11 +8131,13 @@ impl<'a> FoldingContext<'a> {
             return;
         }
 
+        if let CExpr::Observed { expr, .. } = expr {
+            self.accumulate_visible_expr_quality(expr, quality, depth, context);
+            return;
+        }
         quality.node_penalty -= 1;
         match expr {
-            CExpr::Observed { expr, .. } => {
-                self.accumulate_visible_expr_quality(expr, quality, depth, context)
-            }
+            CExpr::Observed { .. } => unreachable!("observation handled before semantic scoring"),
             CExpr::External { .. } => {}
             CExpr::Var(name) => {
                 if is_generic_stack_placeholder_alias(&self.spelling(*name)) {
@@ -8406,7 +8478,7 @@ impl<'a> FoldingContext<'a> {
     }
 
     fn expr_type_hint(&self, expr: &CExpr) -> Option<CType> {
-        match expr {
+        match expr.unobserved() {
             CExpr::Var(name) => self
                 .lookup_type_hint(&self.spelling(*name))
                 .cloned()
@@ -8430,7 +8502,7 @@ impl<'a> FoldingContext<'a> {
         source_call: (u64, usize),
         expr: &CExpr,
     ) -> Option<CType> {
-        match expr {
+        match expr.unobserved() {
             CExpr::Call { .. } => self
                 .known_signature_for_site(source_call.0, source_call.1)
                 .map(|sig| crate::variable::type_like_to_ctype(&sig.return_type)),
@@ -8441,7 +8513,7 @@ impl<'a> FoldingContext<'a> {
     }
 
     fn root_visible_name_in_expr(&self, expr: &CExpr) -> Option<std::rc::Rc<str>> {
-        match expr {
+        match expr.unobserved() {
             CExpr::Var(name) => Some(self.spelling(*name)),
             CExpr::Cast { expr: inner, .. } | CExpr::Paren(inner) => {
                 self.root_visible_name_in_expr(inner)
@@ -8649,7 +8721,7 @@ impl<'a> FoldingContext<'a> {
     }
 
     fn cast_expr_if_needed(&self, expr: CExpr, target: CType, source: Option<&CType>) -> CExpr {
-        if let CExpr::Cast { ty, .. } = &expr
+        if let CExpr::Cast { ty, .. } = expr.unobserved()
             && *ty == target
         {
             return expr;
@@ -8684,6 +8756,10 @@ impl<'a> FoldingContext<'a> {
             return expr;
         }
         match expr {
+            CExpr::Observed { id, expr } => CExpr::observed(
+                id,
+                self.rewrite_typed_assignment_literal_expr(*expr, dst_ty),
+            ),
             CExpr::UIntLit(value) => crate::typed_integer_literal_expr(value, is_signed, bits),
             CExpr::IntLit(value) if value >= 0 => {
                 crate::typed_integer_literal_expr(value as u64, is_signed, bits)
@@ -8970,7 +9046,7 @@ impl<'a> FoldingContext<'a> {
     }
 
     fn literal_to_i64(&self, expr: &CExpr) -> Option<i64> {
-        match expr {
+        match expr.unobserved() {
             CExpr::IntLit(v) => Some(*v),
             CExpr::UIntLit(v) => i64::try_from(*v).ok(),
             CExpr::Paren(inner) | CExpr::Cast { expr: inner, .. } => self.literal_to_i64(inner),
@@ -12363,9 +12439,7 @@ impl<'a> FoldingContext<'a> {
                     // carried, so the promise is kept from the same answer that
                     // made it rather than reconstructed later by another rule.
                     let inlined = self.op_to_expr_at(op, block.addr, op_idx);
-                    let rendered_inline =
-                        !matches!(&inlined, CExpr::Var(id) if *self.spelling(*id) == *self.var_name(dst));
-                    if rendered_inline {
+                    if let LoweredExprAt::Rendered(inlined) = inlined {
                         self.inlined_renderings
                             .borrow_mut()
                             .insert(key.clone(), inlined);
@@ -12398,7 +12472,7 @@ impl<'a> FoldingContext<'a> {
                 // An op that became a statement is owned by that statement. Only the
                 // memory ones were on record, so arithmetic, copies and everything
                 // else that reached the page read as unaccounted for.
-                if !matches!(stmt, CStmt::Comment(_) | CStmt::Empty) {
+                if !matches!(stmt.unobserved(), CStmt::Comment(_) | CStmt::Empty) {
                     self.record_effect_render_proof_for_normalized_value(
                         EffectRenderProofKind::Expression,
                         block.addr,
@@ -12500,7 +12574,7 @@ impl<'a> FoldingContext<'a> {
         out
     }
 
-    fn prune_redundant_return_slot_assignments(&self, stmts: Vec<CStmt>) -> Vec<CStmt> {
+    pub(super) fn prune_redundant_return_slot_assignments(&self, stmts: Vec<CStmt>) -> Vec<CStmt> {
         if stmts.len() < 2 {
             return stmts;
         }
@@ -12508,8 +12582,12 @@ impl<'a> FoldingContext<'a> {
         let mut out = Vec::with_capacity(stmts.len());
         let mut idx = 0;
         while idx < stmts.len() {
-            let skip_assignment = if let Some(CStmt::Return(Some(ret_expr))) = stmts.get(idx + 1) {
-                match &stmts[idx] {
+            let current = stmts[idx].clone_without_render_observations();
+            let next = stmts
+                .get(idx + 1)
+                .map(CStmt::clone_without_render_observations);
+            let skip_assignment = if let Some(CStmt::Return(Some(ret_expr))) = next.as_ref() {
+                match &current {
                     CStmt::Expr(CExpr::Binary {
                         op: BinaryOp::Assign,
                         left,
@@ -12520,7 +12598,7 @@ impl<'a> FoldingContext<'a> {
                                 Some(offset) => {
                                     let rhs = self.resolve_return_candidate(right);
                                     let ret = self.resolve_return_candidate(ret_expr);
-                                    rhs == ret
+                                    rhs.transparently_eq(&ret)
                                         && self.state.return_stack_slots.contains(&offset)
                                         && !self.should_emit_return_slot_assignment(offset, &rhs)
                                 }

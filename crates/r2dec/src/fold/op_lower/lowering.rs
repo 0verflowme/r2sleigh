@@ -8,30 +8,24 @@ impl<'a> FoldingContext<'a> {
         input_idx: usize,
         expr: CExpr,
     ) -> CExpr {
-        self.observe_optional_normalized_input_expr(frame.normalized_site, input_idx, expr)
+        if frame.observe_inputs {
+            self.observe_optional_normalized_input_expr(frame.normalized_site, input_idx, expr)
+        } else {
+            expr
+        }
     }
 
     pub(super) fn lowered_from_stmt(stmt: CStmt) -> LoweredOp {
         match stmt {
-            CStmt::Expr(CExpr::Binary {
-                op: BinaryOp::Assign,
-                left,
-                right,
-            }) => LoweredOp::Assign {
-                lhs: *left,
-                rhs: *right,
-            },
-            CStmt::Expr(expr) => LoweredOp::Expr(expr),
-            CStmt::Return(expr) => LoweredOp::Return(expr),
-            CStmt::Comment(text) => LoweredOp::Comment(text),
             CStmt::Empty => LoweredOp::None,
-            _ => LoweredOp::None,
+            stmt => LoweredOp::FinalizedStmt(stmt),
         }
     }
 
     pub(super) fn lowered_to_stmt(&self, lowered: LoweredOp) -> Option<CStmt> {
         match lowered {
             LoweredOp::Assign { lhs, rhs } => self.assign_stmt(lhs, rhs),
+            LoweredOp::FinalizedStmt(stmt) => Some(stmt),
             LoweredOp::Expr(expr) => Some(CStmt::Expr(expr)),
             LoweredOp::Return(expr) => Some(CStmt::Return(expr)),
             LoweredOp::Comment(text) => Some(CStmt::Comment(text)),
@@ -130,10 +124,7 @@ impl<'a> FoldingContext<'a> {
                                 target,
                             );
                             let resolved_target = self.observed_input(frame, 0, resolved_target);
-                            let func_expr = match resolved_target {
-                                CExpr::Var(_) => resolved_target,
-                                other => CExpr::Deref(Box::new(other)),
-                            };
+                            let func_expr = Self::indirect_callable_expr(resolved_target);
                             let raw_args = self
                                 .call_args_map()
                                 .get(&(source_block, source_op_idx))
@@ -181,6 +172,12 @@ impl<'a> FoldingContext<'a> {
         match self.lower_op(op, &mut frame) {
             LoweredOp::Expr(expr) => expr,
             LoweredOp::Assign { lhs, rhs } => CExpr::assign(lhs, rhs),
+            LoweredOp::FinalizedStmt(CStmt::Expr(expr)) => expr,
+            LoweredOp::FinalizedStmt(CStmt::Return(Some(expr))) => expr,
+            LoweredOp::FinalizedStmt(_) => CExpr::External {
+                name: "__unhandled_op__".to_string(),
+                kind: crate::symbol::ExternalKind::Intrinsic,
+            },
             LoweredOp::Return(Some(expr)) => expr,
             LoweredOp::Return(None) => CExpr::External {
                 name: "return".to_string(),
@@ -204,37 +201,45 @@ impl<'a> FoldingContext<'a> {
         op: &SSAOp,
         block_addr: u64,
         op_idx: usize,
-    ) -> CExpr {
-        let normalized_site = self.normalized_site(block_addr, op_idx);
-        let source_call_site = self
-            .source_op_site_for_normalized_op(block_addr, op_idx)
-            .or(Some((block_addr, op_idx)));
-        let mut frame = LowerFrame::for_expr_at(normalized_site, source_call_site);
+    ) -> LoweredExprAt {
+        // Occurrence identity must not alter semantic lowering. Lower through
+        // the exact marker-free expression path, then decorate that answer.
+        let mut frame = LowerFrame::for_expr();
         let lowered = self.lower_op(op, &mut frame);
-        let rendered_output = !matches!(lowered, LoweredOp::Comment(_) | LoweredOp::None);
-        let expr = match lowered {
-            LoweredOp::Expr(expr) => expr,
-            LoweredOp::Assign { lhs, rhs } => CExpr::assign(lhs, rhs),
-            LoweredOp::Return(Some(expr)) => expr,
-            LoweredOp::Return(None) => CExpr::External {
+        let lowered = match lowered {
+            LoweredOp::Expr(expr) => LoweredExprAt::Rendered(expr),
+            LoweredOp::Assign { lhs, rhs } => {
+                LoweredExprAt::Rendered(CExpr::assign(lhs, rhs))
+            }
+            LoweredOp::FinalizedStmt(CStmt::Expr(expr)) => LoweredExprAt::Rendered(expr),
+            LoweredOp::FinalizedStmt(CStmt::Return(Some(expr))) => {
+                LoweredExprAt::Rendered(expr)
+            }
+            LoweredOp::FinalizedStmt(_) => LoweredExprAt::DestinationFallback(CExpr::External {
+                name: "__unhandled_op__".to_string(),
+                kind: crate::symbol::ExternalKind::Intrinsic,
+            }),
+            LoweredOp::Return(Some(expr)) => LoweredExprAt::Rendered(expr),
+            LoweredOp::Return(None) => LoweredExprAt::Rendered(CExpr::External {
                 name: "return".to_string(),
                 kind: crate::symbol::ExternalKind::Intrinsic,
-            },
+            }),
             LoweredOp::Comment(_) | LoweredOp::None => {
-                if let Some(dst) = op.dst() {
+                LoweredExprAt::DestinationFallback(if let Some(dst) = op.dst() {
                     self.name_ref(&self.var_name(dst))
                 } else {
                     CExpr::External {
                         name: "__unhandled_op__".to_string(),
                         kind: crate::symbol::ExternalKind::Intrinsic,
                     }
-                }
+                })
             }
         };
-        if op.dst().is_some() && rendered_output {
-            self.observe_normalized_output_expr(block_addr, op_idx, expr)
-        } else {
-            expr
+        match lowered {
+            LoweredExprAt::Rendered(expr) => LoweredExprAt::Rendered(
+                self.observe_normalized_computed_expr(op, block_addr, op_idx, expr),
+            ),
+            fallback @ LoweredExprAt::DestinationFallback(_) => fallback,
         }
     }
 
@@ -318,5 +323,14 @@ impl<'a> FoldingContext<'a> {
             stmt
         };
         Some(stmt)
+    }
+
+    /// Render one resolved indirect-call target without letting occurrence
+    /// metadata change whether an already-callable variable is dereferenced.
+    pub(super) fn indirect_callable_expr(resolved_target: CExpr) -> CExpr {
+        match resolved_target.unobserved() {
+            CExpr::Var(_) => resolved_target,
+            _ => CExpr::Deref(Box::new(resolved_target)),
+        }
     }
 }

@@ -313,10 +313,22 @@ mod return_resolver;
 #[derive(Debug, Clone, PartialEq)]
 enum LoweredOp {
     Assign { lhs: CExpr, rhs: CExpr },
+    FinalizedStmt(CStmt),
     Expr(CExpr),
     Return(Option<CExpr>),
     None,
     Comment(String),
+}
+
+/// The authoritative result of lowering one operation for expression use.
+///
+/// A destination fallback is a name for a value whose definition could not be
+/// rendered. It must never be inferred from the expression spelling because
+/// binding-name resolution can map that fallback onto another C symbol.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum LoweredExprAt {
+    Rendered(CExpr),
+    DestinationFallback(CExpr),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -517,6 +529,9 @@ enum LowerMode {
 #[derive(Debug, Clone, Copy)]
 struct LowerFrame {
     mode: LowerMode,
+    /// Whether ordinary operand lowering owns occurrence markers.
+    /// Marker-free expression lowering decorates its completed answer instead.
+    observe_inputs: bool,
     /// Exact normalized operation used only for render-observation identity.
     normalized_site: Option<crate::normalize::NormalizedOpSite>,
     /// Original source operation used only for callsite/type/render facts.
@@ -774,20 +789,9 @@ impl LowerFrame {
     fn for_expr() -> Self {
         Self {
             mode: LowerMode::Expr,
+            observe_inputs: false,
             normalized_site: None,
             source_call_site: None,
-            with_call_args: false,
-        }
-    }
-
-    fn for_expr_at(
-        normalized_site: Option<crate::normalize::NormalizedOpSite>,
-        source_call_site: Option<(u64, usize)>,
-    ) -> Self {
-        Self {
-            mode: LowerMode::Expr,
-            normalized_site,
-            source_call_site,
             with_call_args: false,
         }
     }
@@ -799,6 +803,7 @@ impl LowerFrame {
     ) -> Self {
         Self {
             mode: LowerMode::Stmt,
+            observe_inputs: true,
             normalized_site,
             source_call_site,
             with_call_args,

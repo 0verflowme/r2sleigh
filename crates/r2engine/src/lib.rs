@@ -32,6 +32,11 @@ pub use route::{
     should_use_prepared_semantic_view, type_cfg_allows_semantic_plan, type_cfg_bounded_reason,
     type_cfg_forces_bounded_plan, type_cfg_prefers_bounded_plan, type_route_decision,
 };
+pub use r2dec::{
+    BindingMachineProjectionFailure, BindingObservationAudit, BindingObservationDomainAudit,
+    BindingObservationJournalFailure, BindingShadowAuditFailure, BindingShadowAuditLedger,
+    BindingShadowAuditOutcome, BindingShadowDomainAudit,
+};
 #[cfg(test)]
 use route::{decompile_probe_decision, plan_decompile_request, semantic_route_reason};
 use route::{decompile_probe_decision_for_identity, decompile_route_decision};
@@ -4069,6 +4074,7 @@ impl EngineTypeAnalysisResponse {
 #[derive(Debug, Clone)]
 pub struct EngineDecompileResponse {
     pub output: String,
+    pub binding_audit: BindingShadowAuditOutcome,
     pub function_facts: FunctionFacts,
     pub input_quality: Option<r2types::FunctionInputQualityFacts>,
     pub metrics: EngineMetrics,
@@ -4561,13 +4567,15 @@ impl EngineSession {
                     planning_time,
                     render_time,
                 );
+                let binding_audit = stop.binding_audit;
                 let refusal = engine_render_execution_refusal(stop.reason, stop.phase, metrics);
-                return refused_decompile_response_with_metrics(
+                return refused_decompile_response_with_metrics_and_binding_audit(
                     &request.function_name,
                     &refusal.reason,
                     input_quality.clone(),
                     *refusal.metrics,
                     *refusal.diagnostics,
+                    binding_audit,
                 );
             }
         };
@@ -4618,16 +4626,19 @@ impl EngineSession {
         if let Err(refusal) =
             poll_engine_execution(&request.execution, EnginePhase::FfiConversion, &metrics)
         {
-            return refused_decompile_response_with_metrics(
+            return refused_decompile_response_with_metrics_and_binding_audit(
                 &request.function_name,
                 &refusal.reason,
                 input_quality,
                 *refusal.metrics,
                 *refusal.diagnostics,
+                BindingShadowAuditOutcome::NotRun,
             );
         }
+        let (output, binding_audit) = rendered.product.finalize();
         EngineDecompileResponse {
-            output: rendered.output,
+            output,
+            binding_audit,
             function_facts: response_function_facts,
             input_quality,
             metrics,
@@ -5183,9 +5194,8 @@ fn engine_plan_from_decompile_route_kind(kind: r2types::DecompileRouteKind) -> E
     }
 }
 
-#[derive(Debug)]
 struct EngineRenderedDecompile {
-    output: String,
+    product: EngineRenderedProduct,
     semantic_kernel_warnings: Vec<String>,
     structuring_executed: bool,
     /// Set when rendering stopped and the output above is what it had reached.
@@ -5196,10 +5206,42 @@ struct EngineRenderedDecompile {
     stopped: Option<EngineRenderExecutionStop>,
 }
 
+enum EngineRenderedProduct {
+    Ready {
+        output: String,
+        binding_audit: BindingShadowAuditOutcome,
+    },
+    Pending(r2dec::PendingDecompileBindingAudit),
+}
+
+impl EngineRenderedProduct {
+    fn output(&self) -> &str {
+        match self {
+            Self::Ready { output, .. } => output,
+            Self::Pending(pending) => pending.output(),
+        }
+    }
+
+    fn finalize(self) -> (String, BindingShadowAuditOutcome) {
+        match self {
+            Self::Ready {
+                output,
+                binding_audit,
+            } => (output, binding_audit),
+            Self::Pending(pending) => {
+                let audited = pending.finalize();
+                let binding_audit = audited.binding_shadow();
+                (audited.into_output(), binding_audit)
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct EngineRenderExecutionStop {
     reason: String,
     phase: EnginePhase,
+    binding_audit: BindingShadowAuditOutcome,
     certification_completed: bool,
     normalization_completed: bool,
     structuring_completed: bool,
@@ -5242,6 +5284,7 @@ fn engine_render_stop_reason(
     EngineRenderExecutionStop {
         reason,
         phase,
+        binding_audit: BindingShadowAuditOutcome::NotRun,
         certification_completed: false,
         normalization_completed: false,
         structuring_completed: false,
@@ -5271,6 +5314,7 @@ fn poll_engine_render_control_with_completion<C: r2ssa::SsaWorkControl + ?Sized>
 
 fn engine_render_stop_from_decompiler(
     stop: r2dec::DecompileExecutionStop,
+    binding_audit: BindingShadowAuditOutcome,
 ) -> EngineRenderExecutionStop {
     let phase = match stop.phase() {
         r2dec::DecompileWorkPhase::Normalization => EnginePhase::Normalization,
@@ -5278,6 +5322,7 @@ fn engine_render_stop_from_decompiler(
         r2dec::DecompileWorkPhase::Rendering => EnginePhase::Rendering,
     };
     let mut mapped = engine_render_stop_reason(stop.reason(), phase);
+    mapped.binding_audit = binding_audit;
     match stop.phase() {
         r2dec::DecompileWorkPhase::Normalization => {}
         r2dec::DecompileWorkPhase::Structuring => {
@@ -5303,7 +5348,10 @@ fn render_engine_decompile_request<C: r2ssa::SsaWorkControl>(
     ) {
         poll_engine_render_control(control, EnginePhase::Rendering)?;
         return Ok(EngineRenderedDecompile {
-            output,
+            product: EngineRenderedProduct::Ready {
+                output,
+                binding_audit: BindingShadowAuditOutcome::NotRun,
+            },
             semantic_kernel_warnings: Vec::new(),
             structuring_executed: false,
             stopped: None,
@@ -5314,27 +5362,37 @@ fn render_engine_decompile_request<C: r2ssa::SsaWorkControl>(
     // Keep a rendering the decompiler reached before it stopped. Discarding it
     // reports a function that ran out of budget as one that produced nothing,
     // and takes the ledger that would have said so with it.
-    let output = match r2dec::Decompiler::new(request.render_target.to_decompiler_config())
-        .decompile_input_keeping_partial(&input, control)
+    let audited = match r2dec::Decompiler::new(request.render_target.to_decompiler_config())
+        .decompile_input_keeping_partial_with_pending_binding_audit(&input, control)
     {
-        Ok(output) => output,
-        Err((stop, Some(partial))) if !partial.trim().is_empty() => {
+        Ok(pending) => pending,
+        Err((stop, Some(partial))) if !partial.output().trim().is_empty() => {
             return Ok(EngineRenderedDecompile {
-                output: partial,
+                product: EngineRenderedProduct::Pending(partial),
                 semantic_kernel_warnings: vec![format!(
                     "rendering stopped in {:?}: {}; the body above is what was reached",
                     stop.phase(),
                     stop.reason()
                 )],
                 structuring_executed: true,
-                stopped: Some(engine_render_stop_from_decompiler(stop)),
+                stopped: Some(engine_render_stop_from_decompiler(
+                    stop,
+                    BindingShadowAuditOutcome::NotRun,
+                )),
             });
         }
-        Err((stop, _)) => return Err(engine_render_stop_from_decompiler(stop)),
+        Err((stop, partial)) => {
+            let binding_audit = partial
+                .map(r2dec::PendingDecompileBindingAudit::finalize)
+                .map_or(BindingShadowAuditOutcome::NotRun, |audit| {
+                    audit.binding_shadow()
+                });
+            return Err(engine_render_stop_from_decompiler(stop, binding_audit));
+        }
     };
-    if !output.trim().is_empty() {
+    if !audited.output().trim().is_empty() {
         return Ok(EngineRenderedDecompile {
-            output,
+            product: EngineRenderedProduct::Pending(audited),
             semantic_kernel_warnings: Vec::new(),
             structuring_executed: true,
             stopped: None,
@@ -5342,11 +5400,14 @@ fn render_engine_decompile_request<C: r2ssa::SsaWorkControl>(
     }
 
     Ok(EngineRenderedDecompile {
-        output: decompile_route_output_from_function_facts(
-            &request.function_name,
-            request.function_facts(),
-        )
-        .unwrap_or_default(),
+        product: EngineRenderedProduct::Ready {
+            output: decompile_route_output_from_function_facts(
+                &request.function_name,
+                request.function_facts(),
+            )
+            .unwrap_or_default(),
+            binding_audit: audited.finalize().binding_shadow(),
+        },
         semantic_kernel_warnings: Vec::new(),
         structuring_executed: false,
         stopped: None,
@@ -5382,7 +5443,25 @@ fn refused_decompile_response_with_metrics(
     reason: &str,
     input_quality: Option<r2types::FunctionInputQualityFacts>,
     metrics: EngineMetrics,
+    diagnostics: EngineDiagnostics,
+) -> EngineDecompileResponse {
+    refused_decompile_response_with_metrics_and_binding_audit(
+        function_name,
+        reason,
+        input_quality,
+        metrics,
+        diagnostics,
+        BindingShadowAuditOutcome::NotRun,
+    )
+}
+
+fn refused_decompile_response_with_metrics_and_binding_audit(
+    function_name: &str,
+    reason: &str,
+    input_quality: Option<r2types::FunctionInputQualityFacts>,
+    metrics: EngineMetrics,
     mut diagnostics: EngineDiagnostics,
+    binding_audit: BindingShadowAuditOutcome,
 ) -> EngineDecompileResponse {
     let function_facts = refused_decompile_function_facts(function_name, reason);
     let output = decompile_route_output_from_function_facts(function_name, &function_facts)
@@ -5393,6 +5472,7 @@ fn refused_decompile_response_with_metrics(
     diagnostics.refusal = route_diagnostics.refusal;
     EngineDecompileResponse {
         output,
+        binding_audit,
         function_facts,
         input_quality,
         metrics,
@@ -6652,8 +6732,8 @@ mod tests {
             Vec::<r2ssa::SourceStackSlotSpec>::new(),
         )
         .expect("exact source interface")
-        .with_return_address_storage(register(0x10))
-        .and_then(|interface| interface.with_stack_pointer_storage(register(0x18)))
+        .with_return_address_storage(register(0x30))
+        .and_then(|interface| interface.with_stack_pointer_storage(register(0x28)))
         .expect("exact source machine carriers");
         let snapshot = Arc::new(
             EngineSourceSnapshot::new(
@@ -6667,11 +6747,9 @@ mod tests {
         );
         let mut blocks = direct_call_return_blocks(0x401000, 0x5000);
         blocks[0].ops[1] = r2il::R2ILOp::Return {
-            target: r2il::Varnode::register(0x10, 8),
+            target: r2il::Varnode::register(0x30, 8),
         };
-        let mut arch = x86_64_result_arch();
-        arch.add_register(r2il::RegisterDef::new("rip", 0x10, 8));
-        arch.add_register(r2il::RegisterDef::new("rsp", 0x18, 8));
+        let arch = x86_64_result_arch();
         let request =
             EngineAnalyzeRequest::full_semantics_for_function(EngineAnalyzeFunctionRequestInput {
                 function: EngineFunctionInput {
@@ -8172,6 +8250,12 @@ mod tests {
         let counting = CountingRenderControl::default();
         let controlled = session.decompile_with_r2dec_control(request.clone(), &counting);
         assert_eq!(controlled.output, legacy_output);
+        assert_ne!(
+            controlled.binding_audit,
+            BindingShadowAuditOutcome::NotRun,
+            "the completed native render must retain its exact r2dec audit"
+        );
+        let completed_binding_audit = controlled.binding_audit;
         let total_polls = counting.polls.get();
         assert!(total_polls > 3, "r2dec pipeline must expose inner polls");
 
@@ -8272,6 +8356,7 @@ mod tests {
             // recorded above -- phase refused, route reason, refusal -- so what
             // changed is that the reader also gets what was reached.
             if phase == EnginePhase::Rendering {
+                assert_eq!(response.binding_audit, completed_binding_audit);
                 assert!(
                     response.output.contains("sym.r2dec_controlled"),
                     "a rendering-phase stop keeps the body it reached: {}",
@@ -8283,6 +8368,7 @@ mod tests {
                     response.output
                 );
             } else {
+                assert_eq!(response.binding_audit, BindingShadowAuditOutcome::NotRun);
                 assert_eq!(
                     response
                         .function_facts
@@ -8320,8 +8406,10 @@ mod tests {
             ] {
                 let mapped = engine_render_stop_from_decompiler(
                     r2dec::DecompileExecutionStop::new(decompile_phase, reason),
+                    BindingShadowAuditOutcome::NotRun,
                 );
                 assert_eq!(mapped.phase, engine_phase);
+                assert_eq!(mapped.binding_audit, BindingShadowAuditOutcome::NotRun);
                 assert_eq!(
                     mapped.normalization_completed,
                     !matches!(decompile_phase, r2dec::DecompileWorkPhase::Normalization)

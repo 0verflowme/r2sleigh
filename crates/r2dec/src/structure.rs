@@ -2074,18 +2074,14 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
 
     fn folded_block_stmts(&mut self, block: &r2ssa::FunctionSSABlock, addr: u64) -> Vec<CStmt> {
         self.fold_ctx.folded_blocks.borrow_mut().insert(addr);
-        let stmts = if self.fold_ctx.inputs.observation_journal.is_some() {
-            // A cached statement tree can be cloned into multiple reachable
-            // regions. Observation IDs are occurrence identities, so native
-            // journal runs fold each occurrence once instead of cloning IDs.
-            self.fold_ctx.fold_block(block, addr)
-        } else if let Some(folded) = self.folded_block_cache.get(&addr) {
+        let stmts = if let Some(folded) = self.folded_block_cache.get(&addr) {
             if std::env::var_os("R2SLEIGH_DEBUG_MERGES").is_some() {
                 eprintln!("FOLDCACHE hit block={addr:#x} stmts={}", folded.stmts.len());
             }
             self.fold_ctx
                 .append_effect_render_proofs(&folded.effect_proofs);
-            folded.stmts.clone()
+            self.fold_ctx
+                .clone_cached_render_occurrence(&folded.stmts)
         } else {
             let proof_checkpoint = self.fold_ctx.effect_render_proof_checkpoint();
             let stmts = self.fold_ctx.fold_block(block, addr);
@@ -2572,7 +2568,11 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             };
         };
 
-        let Some((op, rhs)) = Self::compound_assignment_rhs_of(symbols, &crate::symbol::spelling(symbols, *target_name), right.as_ref()) else {
+        let Some((op, retained, eliminated)) = Self::compound_assignment_parts(
+            symbols,
+            &crate::symbol::spelling(symbols, *target_name),
+            right.as_ref(),
+        ) else {
             return CExpr::Binary {
                 op: BinaryOp::Assign,
                 left,
@@ -2580,20 +2580,21 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             };
         };
 
-        CExpr::Binary {
+        let left = crate::ast::carry_outer_expr_observations(eliminated, *left);
+        let rewritten = CExpr::Binary {
             op,
-            left,
-            right: Box::new(rhs),
-        }
+            left: Box::new(left),
+            right: Box::new(retained.clone()),
+        };
+        crate::ast::carry_outer_expr_observations(right.as_ref(), rewritten)
     }
 
-    fn compound_assignment_rhs_of(
+    fn compound_assignment_parts<'b>(
         symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
         target_name: &str,
-        rhs: &CExpr,
-    ) -> Option<(BinaryOp, CExpr)> {
-
-        let CExpr::Binary { op, left, right } = rhs else {
+        rhs: &'b CExpr,
+    ) -> Option<(BinaryOp, &'b CExpr, &'b CExpr)> {
+        let CExpr::Binary { op, left, right } = rhs.unobserved() else {
             return None;
         };
         let compound_op = Self::compound_assignment_op(*op)?;
@@ -2601,17 +2602,27 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         if Self::expr_is_var_named_of(symbols, left, target_name)
             && crate::fold::op_lower::expr_is_side_effect_free(right)
         {
-            return Some((compound_op, right.as_ref().clone()));
+            return Some((compound_op, right, left));
         }
 
         if Self::binary_op_is_commutative_for_compound(*op)
             && Self::expr_is_var_named_of(symbols, right, target_name)
             && crate::fold::op_lower::expr_is_side_effect_free(left)
         {
-            return Some((compound_op, left.as_ref().clone()));
+            return Some((compound_op, left, right));
         }
 
         None
+    }
+
+    fn compound_assignment_rhs_of(
+        symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
+        target_name: &str,
+        rhs: &CExpr,
+    ) -> Option<(BinaryOp, CExpr)> {
+        let semantic = rhs.clone_without_render_observations();
+        let (op, retained, _) = Self::compound_assignment_parts(symbols, target_name, &semantic)?;
+        Some((op, retained.clone()))
     }
 
     fn compound_assignment_op(op: BinaryOp) -> Option<BinaryOp> {
@@ -2676,19 +2687,15 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
     }
 
     fn rewrite_if_short_circuit(stmt: CStmt) -> CStmt {
-        let source = stmt;
-        let semantic = source.clone_without_render_observations();
+        let (semantic, observations) = stmt.into_semantic_with_observations();
         let CStmt::If {
             cond,
             then_body,
             else_body,
         } = semantic
         else {
-            return source;
+            return observations.reapply(semantic);
         };
-
-        let then_stmt = (*then_body).clone();
-        let else_stmt = else_body.as_ref().map(|b| (**b).clone());
 
         // if (a) { if (b) { T } } -> if (a && b) { T }
         if else_body.is_none()
@@ -2696,30 +2703,31 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                 cond: inner_cond,
                 then_body: inner_then,
                 else_body: None,
-            } = &then_stmt
+            } = then_body.unobserved()
         {
             let rewritten = CStmt::If {
                 cond: CExpr::binary(BinaryOp::And, cond, inner_cond.clone()),
                 then_body: inner_then.clone(),
                 else_body: None,
             };
-            return crate::ast::carry_render_observations(&[source], rewritten);
+            return observations.reapply(rewritten);
         }
 
         // if (a) { T } else if (b) { T } -> if (a || b) { T }
-        if let Some(CStmt::If {
+        if let Some(else_stmt) = else_body.as_deref()
+            && let CStmt::If {
             cond: right_cond,
             then_body: right_then,
             else_body: None,
-        }) = else_stmt.as_ref()
-            && Self::stmt_transparently_eq(&then_stmt, right_then)
+        } = else_stmt.unobserved()
+            && Self::stmt_transparently_eq(then_body.as_ref(), right_then)
         {
             let rewritten = CStmt::If {
                 cond: CExpr::binary(BinaryOp::Or, cond, right_cond.clone()),
-                then_body: Box::new(then_stmt),
+                then_body: then_body.clone(),
                 else_body: None,
             };
-            return crate::ast::carry_render_observations(&[source], rewritten);
+            return observations.reapply(rewritten);
         }
 
         // if (a) { if (b) { T } } else { T } -> if (!a || b) { T }
@@ -2727,8 +2735,8 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             cond: inner_cond,
             then_body: inner_then,
             else_body: None,
-        } = &then_stmt
-            && let Some(outer_else) = else_stmt.as_ref()
+        } = then_body.unobserved()
+            && let Some(outer_else) = else_body.as_deref()
             && Self::stmt_transparently_eq(outer_else, inner_then)
         {
             let rewritten = CStmt::If {
@@ -2740,7 +2748,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                 then_body: inner_then.clone(),
                 else_body: None,
             };
-            return crate::ast::carry_render_observations(&[source], rewritten);
+            return observations.reapply(rewritten);
         }
 
         // if (a) { if (b) { T } else { E } } else { E } -> if (a && b) { T } else { E }
@@ -2748,8 +2756,8 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             cond: inner_cond,
             then_body: inner_then,
             else_body: Some(inner_else),
-        } = &then_stmt
-            && let Some(outer_else) = else_stmt.as_ref()
+        } = then_body.unobserved()
+            && let Some(outer_else) = else_body.as_deref()
             && Self::stmt_transparently_eq(outer_else, inner_else)
         {
             let rewritten = CStmt::If {
@@ -2757,10 +2765,14 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                 then_body: inner_then.clone(),
                 else_body: Some(inner_else.clone()),
             };
-            return crate::ast::carry_render_observations(&[source], rewritten);
+            return observations.reapply(rewritten);
         }
 
-        source
+        observations.reapply(CStmt::If {
+            cond,
+            then_body,
+            else_body,
+        })
     }
 
     fn rewrite_if_condition_inversion(stmt: CStmt) -> CStmt {
@@ -2798,10 +2810,14 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
     }
 
     fn append_stmt_body_flat(out: &mut Vec<CStmt>, stmt: CStmt) {
-        match stmt {
-            CStmt::Block(stmts) => out.extend(stmts),
+        let (semantic, observations) = stmt.into_semantic_with_observations();
+        match semantic {
+            CStmt::Block(mut stmts) => {
+                observations.reapply_to_unique(&mut stmts);
+                out.extend(stmts);
+            }
             CStmt::Empty => {}
-            other => out.push(other),
+            other => out.push(observations.reapply(other)),
         }
     }
 
@@ -3651,23 +3667,19 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                     cond,
                     then_body,
                     else_body: None,
-                } = &stmts[i]
+                } = stmts[i].unobserved()
                 && let Some(terminator) = Self::single_terminator_stmt(&stmts[i + 1])
                 && Self::single_terminator_stmt(then_body.as_ref()).is_none()
-                && !matches!(then_body.as_ref(), CStmt::Empty)
+                && !matches!(then_body.unobserved(), CStmt::Empty)
             {
-                let sources = [stmts[i].clone(), stmts[i + 1].clone()];
                 let guard = CStmt::If {
-                    cond: Self::negate_condition(cond.clone_without_render_observations()),
+                    cond: Self::negate_condition(cond.clone()),
                     then_body: Box::new(terminator.clone_without_render_observations()),
                     else_body: None,
                 };
-                rewritten.push(crate::ast::carry_render_observations(&sources, guard));
-                Self::append_stmt_body_flat(
-                    &mut rewritten,
-                    then_body.clone_without_render_observations(),
-                );
-                rewritten.push(stmts[i + 1].clone_without_render_observations());
+                rewritten.push(guard);
+                Self::append_stmt_body_flat(&mut rewritten, then_body.as_ref().clone());
+                rewritten.push(stmts[i + 1].clone());
                 i += 2;
                 continue;
             }
@@ -3778,12 +3790,9 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             && !Self::stmt_list_contains_control_transfer(&else_stmts[..else_stmts.len() - 1])
         {
             let then_suffix = then_stmts.pop().expect("then suffix");
-            let else_suffix = else_stmts.pop().expect("else suffix");
+            let _else_suffix = else_stmts.pop().expect("else suffix");
             let semantic_suffix = then_suffix.clone_without_render_observations();
-            common_suffix.push(crate::ast::carry_render_observations(
-                &[then_suffix, else_suffix],
-                semantic_suffix,
-            ));
+            common_suffix.push(semantic_suffix);
         }
         common_suffix.reverse();
 
@@ -4054,66 +4063,112 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         Self::stmt_from_vec(stmts)
     }
 
-    fn remove_dead_generated_artifact_assignments(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, stmt: CStmt) -> CStmt {
-        match stmt {
+    fn remove_dead_generated_artifact_assignments(
+        symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
+        stmt: CStmt,
+    ) -> CStmt {
+        let (semantic, observations) = stmt.into_semantic_with_observations();
+        let (rewritten, exact_outer_statement_survives) = match semantic {
             CStmt::Block(stmts) => {
                 let stmts = stmts
                     .into_iter()
                     .map(|x| Self::remove_dead_generated_artifact_assignments(symbols, x))
                     .collect();
-                Self::stmt_from_vec(Self::remove_dead_generated_artifact_assignments_from_vec(symbols, 
-                    stmts,
-                ))
+                let rewritten = Self::stmt_from_vec(
+                    Self::remove_dead_generated_artifact_assignments_from_vec(
+                    symbols, stmts,
+                    ),
+                );
+                let preserves_block = matches!(rewritten, CStmt::Block(_));
+                (rewritten, preserves_block)
             }
             CStmt::If {
                 cond,
                 then_body,
                 else_body,
-            } => CStmt::If {
-                cond,
-                then_body: Box::new(Self::remove_dead_generated_artifact_assignments(symbols, *then_body)),
-                else_body: else_body
-                    .map(|body| Box::new(Self::remove_dead_generated_artifact_assignments(symbols, *body))),
-            },
-            CStmt::While { cond, body } => CStmt::While {
-                cond,
-                body: Box::new(Self::remove_dead_generated_artifact_assignments(symbols, *body)),
-            },
-            CStmt::DoWhile { body, cond } => CStmt::DoWhile {
-                body: Box::new(Self::remove_dead_generated_artifact_assignments(symbols, *body)),
-                cond,
-            },
+            } => (
+                CStmt::If {
+                    cond,
+                    then_body: Box::new(Self::remove_dead_generated_artifact_assignments(
+                        symbols, *then_body,
+                    )),
+                    else_body: else_body.map(|body| {
+                        Box::new(Self::remove_dead_generated_artifact_assignments(
+                            symbols, *body,
+                        ))
+                    }),
+                },
+                true,
+            ),
+            CStmt::While { cond, body } => (
+                CStmt::While {
+                    cond,
+                    body: Box::new(Self::remove_dead_generated_artifact_assignments(
+                        symbols, *body,
+                    )),
+                },
+                true,
+            ),
+            CStmt::DoWhile { body, cond } => (
+                CStmt::DoWhile {
+                    body: Box::new(Self::remove_dead_generated_artifact_assignments(
+                        symbols, *body,
+                    )),
+                    cond,
+                },
+                true,
+            ),
             CStmt::For {
                 init,
                 cond,
                 update,
                 body,
-            } => CStmt::For {
-                init,
-                cond,
-                update,
-                body: Box::new(Self::remove_dead_generated_artifact_assignments(symbols, *body)),
-            },
+            } => (
+                CStmt::For {
+                    init,
+                    cond,
+                    update,
+                    body: Box::new(Self::remove_dead_generated_artifact_assignments(
+                        symbols, *body,
+                    )),
+                },
+                true,
+            ),
             CStmt::Switch {
                 expr,
                 cases,
                 default,
-            } => CStmt::Switch {
-                expr,
-                cases: cases
-                    .into_iter()
-                    .map(|case| crate::ast::SwitchCase {
-                        value: case.value,
-                        body: Self::remove_dead_generated_artifact_assignments_from_vec(symbols, case.body),
-                    })
-                    .collect(),
-                default: default.map(|x| Self::remove_dead_generated_artifact_assignments_from_vec(symbols, x)),
-            },
-            other => other,
+            } => (
+                CStmt::Switch {
+                    expr,
+                    cases: cases
+                        .into_iter()
+                        .map(|case| crate::ast::SwitchCase {
+                            value: case.value,
+                            body: Self::remove_dead_generated_artifact_assignments_from_vec(
+                                symbols, case.body,
+                            ),
+                        })
+                        .collect(),
+                    default: default.map(|x| {
+                        Self::remove_dead_generated_artifact_assignments_from_vec(symbols, x)
+                    }),
+                },
+                true,
+            ),
+            other => (other, true),
+        };
+        if exact_outer_statement_survives {
+            observations.reapply(rewritten)
+        } else {
+            rewritten
         }
     }
 
-    fn remove_dead_generated_artifact_assignments_from_vec(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, stmts: Vec<CStmt>) -> Vec<CStmt> {
+    fn remove_dead_generated_artifact_assignments_from_vec(
+        symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
+        stmts: Vec<CStmt>,
+    ) -> Vec<CStmt> {
         let mut live = HashSet::new();
         let mut kept = Vec::with_capacity(stmts.len());
         for stmt in stmts.into_iter().rev() {
@@ -4145,7 +4200,8 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
     }
 
     fn normalized_self_update_signature(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, expr: &CExpr) -> Option<(String, BinaryOp, CExpr)> {
-        let CExpr::Binary { op, left, right } = expr.unobserved() else {
+        let semantic = expr.clone_without_render_observations();
+        let CExpr::Binary { op, left, right } = &semantic else {
             return None;
         };
         let CExpr::Var(name) = left.unobserved() else {
@@ -4278,10 +4334,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             && stmts.len() == 1
             && Self::stmt_is_unconditional_terminator(&stmts[0])
         {
-            return Some(crate::ast::carry_render_observations(
-                &[stmt.clone()],
-                stmts[0].clone_without_render_observations(),
-            ));
+            return Some(stmts[0].clone());
         }
 
         None
@@ -4294,10 +4347,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                 if stmts.len() == 1
                     && matches!(stmts[0].unobserved(), CStmt::Switch { .. }) =>
             {
-                Some(crate::ast::carry_render_observations(
-                    &[stmt.clone()],
-                    stmts[0].clone_without_render_observations(),
-                ))
+                Some(stmts[0].clone())
             }
             _ => None,
         }
@@ -4425,17 +4475,10 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         while i < stmts.len() {
             if i + 1 < stmts.len()
                 && let Some(mut for_stmts) = Self::try_rewrite_while_with_preheader_init(symbols,
-                    stmts[i].clone_without_render_observations(),
-                    stmts[i + 1].clone_without_render_observations(),
+                    stmts[i].clone(),
+                    stmts[i + 1].clone(),
                 )
             {
-                if let Some(first) = for_stmts.first_mut() {
-                    let semantic_first = std::mem::replace(first, CStmt::Empty);
-                    *first = crate::ast::carry_render_observations(
-                        &[stmts[i].clone(), stmts[i + 1].clone()],
-                        semantic_first,
-                    );
-                }
                 rewritten.append(&mut for_stmts);
                 i += 2;
                 continue;
@@ -4451,7 +4494,9 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         while_stmt: CStmt,
     ) -> Option<Vec<CStmt>> {
         let (prefix_stmts, init_stmt, induction_var) = Self::split_preheader_init(preheader_stmt)?;
-        let CStmt::While { cond, body } = while_stmt else {
+        let (while_semantic, _while_observations) =
+            while_stmt.into_semantic_with_observations();
+        let CStmt::While { cond, body } = while_semantic else {
             return None;
         };
 
@@ -4519,7 +4564,9 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             return Some((Vec::new(), preheader_stmt, var));
         }
 
-        let CStmt::Block(mut prefix) = preheader_stmt else {
+        let (semantic, _block_observations) =
+            preheader_stmt.into_semantic_with_observations();
+        let CStmt::Block(mut prefix) = semantic else {
             return None;
         };
         while prefix
@@ -4779,10 +4826,14 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
     }
 
     fn stmt_into_vec(stmt: CStmt) -> Vec<CStmt> {
-        match stmt {
-            CStmt::Block(stmts) => stmts,
+        let (semantic, observations) = stmt.into_semantic_with_observations();
+        match semantic {
+            CStmt::Block(mut stmts) => {
+                observations.reapply_to_unique(&mut stmts);
+                stmts
+            }
             CStmt::Empty => Vec::new(),
-            other => vec![other],
+            other => vec![observations.reapply(other)],
         }
     }
 
@@ -5162,10 +5213,13 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
 
     /// Flatten single-element blocks.
     fn flatten(stmt: CStmt) -> CStmt {
-        match stmt {
-            CStmt::Block(mut stmts) if stmts.len() == 1 => Self::flatten(stmts.remove(0)),
+        let (semantic, observations) = stmt.into_semantic_with_observations();
+        match semantic {
+            CStmt::Block(mut stmts) if stmts.len() == 1 => {
+                observations.reapply(Self::flatten(stmts.remove(0)))
+            }
             CStmt::Block(stmts) if stmts.is_empty() => CStmt::Empty,
-            other => other,
+            other => observations.reapply(other),
         }
     }
 
@@ -5256,7 +5310,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         // Extract the body statements
         let stmts = match body.unobserved() {
             CStmt::Block(stmts) => stmts.clone(),
-            CStmt::If { .. } => vec![body.clone_without_render_observations()],
+            CStmt::If { .. } => vec![body.unobserved().clone()],
             _ => {
                 return CStmt::DoWhile {
                     body: Box::new(body),
@@ -6344,6 +6398,59 @@ mod tests {
     }
 
     #[test]
+    fn observed_rhs_still_rewrites_to_compound_assignment_once() {
+        let symbols = test_table();
+        let mut owner = RenderObservationOwner::new();
+        let (read_id, read) = owner
+            .observe_expr(v(&symbols, "value"))
+            .expect("self-read observation");
+        let (retained_id, retained) = owner
+            .observe_expr(CExpr::IntLit(5))
+            .expect("retained operand observation");
+        let (rhs_id, rhs) = owner
+            .observe_expr(CExpr::binary(BinaryOp::Shl, read, retained))
+            .expect("rhs observation");
+        let rewritten = ControlFlowStructurer::rewrite_compound_assignment_expr(
+            &symbols,
+            CExpr::assign(v(&symbols, "value"), rhs),
+        );
+
+        assert_eq!(
+            rewritten,
+            CExpr::observed(
+                rhs_id,
+                CExpr::binary(
+                    BinaryOp::ShlAssign,
+                    CExpr::observed(read_id, v(&symbols, "value")),
+                    CExpr::observed(retained_id, CExpr::IntLit(5)),
+                ),
+            )
+        );
+        assert_eq!(
+            ControlFlowStructurer::normalized_self_update_signature(&symbols, &rewritten),
+            Some((
+                "value".to_string(),
+                BinaryOp::ShlAssign,
+                CExpr::IntLit(5),
+            ))
+        );
+
+        let (plain, reachable) =
+            strip_test_observations(&owner, CStmt::Expr(rewritten));
+        assert!(reachable.contains(read_id));
+        assert!(reachable.contains(retained_id));
+        assert!(reachable.contains(rhs_id));
+        assert_eq!(
+            plain,
+            CStmt::Expr(CExpr::binary(
+                BinaryOp::ShlAssign,
+                v(&symbols, "value"),
+                CExpr::IntLit(5),
+            ))
+        );
+    }
+
+    #[test]
     fn observed_loop_init_condition_and_update_survive_for_recognition_once() {
         let symbols = test_table();
         let mut owner = RenderObservationOwner::new();
@@ -6381,6 +6488,208 @@ mod tests {
         assert!(reachable.contains(cond_id));
         assert!(reachable.contains(update_id));
         assert!(matches!(plain, CStmt::For { .. }));
+    }
+
+    #[test]
+    fn for_recognition_preserves_only_positional_observations() {
+        let symbols = test_table();
+        let prefix = assign(&symbols, "sum", CExpr::IntLit(0));
+        let init = assign(&symbols, "i", CExpr::IntLit(0));
+        let cond = CExpr::binary(BinaryOp::Lt, v(&symbols, "i"), v(&symbols, "n"));
+        let work = assign(&symbols, "sum", v(&symbols, "i"));
+        let update = CExpr::assign(
+            v(&symbols, "i"),
+            CExpr::binary(BinaryOp::Add, v(&symbols, "i"), CExpr::IntLit(1)),
+        );
+        let plain = ControlFlowStructurer::rewrite_block_loops_to_for(
+            &symbols,
+            vec![
+                CStmt::Block(vec![prefix.clone(), init.clone()]),
+                CStmt::while_loop(
+                    cond.clone(),
+                    CStmt::Block(vec![work.clone(), CStmt::Expr(update.clone())]),
+                ),
+            ],
+        );
+
+        let mut owner = RenderObservationOwner::new();
+        let (prefix_id, prefix) = owner.observe_stmt(prefix).expect("prefix observation");
+        let (init_id, init) = owner.observe_stmt(init).expect("init observation");
+        let (preheader_id, preheader) = owner
+            .observe_stmt(CStmt::Block(vec![prefix, init]))
+            .expect("preheader block observation");
+        let (cond_id, cond) = owner.observe_expr(cond).expect("condition observation");
+        let (work_id, work) = owner.observe_stmt(work).expect("body observation");
+        let (update_id, update) = owner.observe_expr(update).expect("update observation");
+        let (body_id, body) = owner
+            .observe_stmt(CStmt::Block(vec![work, CStmt::Expr(update)]))
+            .expect("body block observation");
+        let (while_id, while_stmt) = owner
+            .observe_stmt(CStmt::while_loop(cond, body))
+            .expect("while observation");
+        let marked = ControlFlowStructurer::rewrite_block_loops_to_for(
+            &symbols,
+            vec![preheader, while_stmt],
+        );
+        let (stripped, reachable) =
+            strip_test_observations(&owner, CStmt::Block(marked));
+
+        for id in [prefix_id, init_id, cond_id, work_id, update_id] {
+            assert!(reachable.contains(id), "exact child occurrence was lost");
+        }
+        for id in [preheader_id, body_id, while_id] {
+            assert!(
+                !reachable.contains(id),
+                "eliminated control wrapper was relocated onto the for-loop"
+            );
+        }
+        assert_eq!(stripped, CStmt::Block(plain));
+    }
+
+    #[test]
+    fn split_hoisted_block_observations_remain_unaccounted_without_shape_changes() {
+        let symbols = test_table();
+        let first = assign(&symbols, "x", CExpr::IntLit(1));
+        let second = assign(&symbols, "y", CExpr::IntLit(2));
+        let plain_input = CStmt::if_stmt(
+            v(&symbols, "ready"),
+            CStmt::Block(vec![first.clone(), second.clone()]),
+            Some(CStmt::ret(Some(CExpr::IntLit(0)))),
+        );
+        let plain = ControlFlowStructurer::cleanup(&symbols, plain_input);
+
+        let mut owner = RenderObservationOwner::new();
+        let (first_id, first) = owner
+            .observe_stmt(first)
+            .expect("first hoisted statement observation");
+        let (second_id, second) = owner
+            .observe_stmt(second)
+            .expect("second hoisted statement observation");
+        let (inner_block_id, body) = owner
+            .observe_stmt(CStmt::Block(vec![first, second]))
+            .expect("inner body observation");
+        let (outer_block_id, body) = owner.observe_stmt(body).expect("outer body observation");
+        let marked = ControlFlowStructurer::cleanup(
+            &symbols,
+            CStmt::if_stmt(
+                v(&symbols, "ready"),
+                body,
+                Some(CStmt::ret(Some(CExpr::IntLit(0)))),
+            ),
+        );
+
+        let (stripped, reachable) = strip_test_observations(&owner, marked);
+        for id in [first_id, second_id] {
+            assert!(reachable.contains(id));
+        }
+        for id in [inner_block_id, outer_block_id] {
+            assert!(
+                !reachable.contains(id),
+                "a split block has no exact child occurrence that can inherit its marker"
+            );
+        }
+        assert_eq!(
+            stripped, plain,
+            "outer metadata must not turn a flattened hoisted body back into a nested block"
+        );
+    }
+
+    #[test]
+    fn split_for_body_observations_remain_unaccounted_without_shape_changes() {
+        let symbols = test_table();
+        let update = CExpr::assign(
+            v(&symbols, "i"),
+            CExpr::binary(BinaryOp::Add, v(&symbols, "i"), CExpr::IntLit(1)),
+        );
+        let first_work = assign(&symbols, "sum", v(&symbols, "i"));
+        let second_work = assign(&symbols, "hash", v(&symbols, "byte"));
+        let dead_generated = assign(&symbols, "tmp:dead", CExpr::IntLit(9));
+        let plain_input = CStmt::Block(vec![
+            CStmt::For {
+                init: None,
+                cond: Some(CExpr::binary(
+                    BinaryOp::Lt,
+                    v(&symbols, "i"),
+                    v(&symbols, "n"),
+                )),
+                update: Some(update.clone()),
+                body: Box::new(CStmt::Block(vec![
+                    first_work.clone(),
+                    CStmt::Expr(update.clone()),
+                ])),
+            },
+            CStmt::For {
+                init: None,
+                cond: Some(v(&symbols, "keep_going")),
+                update: None,
+                body: Box::new(CStmt::Block(vec![
+                    second_work.clone(),
+                    dead_generated.clone(),
+                ])),
+            },
+        ]);
+        let plain = ControlFlowStructurer::cleanup(&symbols, plain_input);
+
+        let mut owner = RenderObservationOwner::new();
+        let (first_work_id, first_work) = owner
+            .observe_stmt(first_work)
+            .expect("first loop work observation");
+        let (first_body_inner_id, first_body) = owner
+            .observe_stmt(CStmt::Block(vec![first_work, CStmt::Expr(update.clone())]))
+            .expect("first loop body observation");
+        let (first_body_outer_id, first_body) = owner
+            .observe_stmt(first_body)
+            .expect("outer first loop body observation");
+        let (second_work_id, second_work) = owner
+            .observe_stmt(second_work)
+            .expect("second loop work observation");
+        let (second_body_inner_id, second_body) = owner
+            .observe_stmt(CStmt::Block(vec![second_work, dead_generated]))
+            .expect("second loop body observation");
+        let (second_body_outer_id, second_body) = owner
+            .observe_stmt(second_body)
+            .expect("outer second loop body observation");
+        let marked = ControlFlowStructurer::cleanup(
+            &symbols,
+            CStmt::Block(vec![
+                CStmt::For {
+                    init: None,
+                    cond: Some(CExpr::binary(
+                        BinaryOp::Lt,
+                        v(&symbols, "i"),
+                        v(&symbols, "n"),
+                    )),
+                    update: Some(update),
+                    body: Box::new(first_body),
+                },
+                CStmt::For {
+                    init: None,
+                    cond: Some(v(&symbols, "keep_going")),
+                    update: None,
+                    body: Box::new(second_body),
+                },
+            ]),
+        );
+
+        let (stripped, reachable) = strip_test_observations(&owner, marked);
+        for id in [first_work_id, second_work_id] {
+            assert!(reachable.contains(id));
+        }
+        for id in [
+            first_body_inner_id,
+            first_body_outer_id,
+            second_body_inner_id,
+            second_body_outer_id,
+        ] {
+            assert!(
+                !reachable.contains(id),
+                "a split loop body has no exact child occurrence that can inherit its marker"
+            );
+        }
+        assert_eq!(
+            stripped, plain,
+            "statement decomposition must be transparent to for-body cleanup"
+        );
     }
 
     #[test]
@@ -6423,6 +6732,99 @@ mod tests {
         assert!(!reachable.contains(continue_id));
         assert!(!reachable.contains(break_id));
         assert!(matches!(plain, CStmt::Block(_)));
+    }
+
+    #[test]
+    fn single_item_block_extraction_keeps_only_the_child_observation() {
+        let mut owner = RenderObservationOwner::new();
+        let (return_id, return_stmt) = owner
+            .observe_stmt(CStmt::ret(Some(CExpr::IntLit(3))))
+            .expect("return observation");
+        let (return_block_id, return_block) = owner
+            .observe_stmt(CStmt::Block(vec![return_stmt]))
+            .expect("return block observation");
+        let extracted_return =
+            ControlFlowStructurer::single_terminator_stmt(&return_block).expect("terminator");
+
+        let switch = CStmt::Switch {
+            expr: CExpr::IntLit(0),
+            cases: Vec::new(),
+            default: None,
+        };
+        let (switch_id, switch_stmt) = owner
+            .observe_stmt(switch.clone())
+            .expect("switch observation");
+        let (switch_block_id, switch_block) = owner
+            .observe_stmt(CStmt::Block(vec![switch_stmt]))
+            .expect("switch block observation");
+        let extracted_switch =
+            ControlFlowStructurer::single_switch_stmt(&switch_block).expect("switch");
+
+        let (plain, reachable) = strip_test_observations(
+            &owner,
+            CStmt::Block(vec![extracted_return, extracted_switch]),
+        );
+        assert!(reachable.contains(return_id));
+        assert!(reachable.contains(switch_id));
+        assert!(!reachable.contains(return_block_id));
+        assert!(!reachable.contains(switch_block_id));
+        assert_eq!(
+            plain,
+            CStmt::Block(vec![CStmt::ret(Some(CExpr::IntLit(3))), switch])
+        );
+    }
+
+    #[test]
+    fn flattened_empty_block_observation_remains_unaccounted() {
+        let mut owner = RenderObservationOwner::new();
+        let (block_id, block) = owner
+            .observe_stmt(CStmt::Block(Vec::new()))
+            .expect("empty block observation");
+        let flattened = ControlFlowStructurer::flatten(block);
+        let (plain, reachable) = strip_test_observations(&owner, flattened);
+
+        assert_eq!(plain, CStmt::Empty);
+        assert!(!reachable.contains(block_id));
+    }
+
+    #[test]
+    fn direct_and_block_do_while_guards_preserve_only_the_surviving_condition() {
+        let symbols = test_table();
+        let infinite = CExpr::IntLit(1);
+
+        let mut direct_owner = RenderObservationOwner::new();
+        let (direct_cond_id, direct_cond) = direct_owner
+            .observe_expr(v(&symbols, "stop"))
+            .expect("direct condition observation");
+        let (direct_if_id, direct_if) = direct_owner
+            .observe_stmt(CStmt::if_stmt(direct_cond, CStmt::Break, None))
+            .expect("direct guard observation");
+        let direct = ControlFlowStructurer::try_convert_do_while_to_while(
+            direct_if,
+            infinite.clone(),
+        );
+        let (direct_plain, direct_reachable) =
+            strip_test_observations(&direct_owner, direct);
+
+        let mut block_owner = RenderObservationOwner::new();
+        let (block_cond_id, block_cond) = block_owner
+            .observe_expr(v(&symbols, "stop"))
+            .expect("block condition observation");
+        let (block_if_id, block_if) = block_owner
+            .observe_stmt(CStmt::if_stmt(block_cond, CStmt::Break, None))
+            .expect("block guard observation");
+        let (block_body_id, block_body) = block_owner
+            .observe_stmt(CStmt::Block(vec![block_if]))
+            .expect("block body observation");
+        let block = ControlFlowStructurer::try_convert_do_while_to_while(block_body, infinite);
+        let (block_plain, block_reachable) = strip_test_observations(&block_owner, block);
+
+        assert_eq!(direct_plain, block_plain);
+        assert!(direct_reachable.contains(direct_cond_id));
+        assert!(block_reachable.contains(block_cond_id));
+        assert!(!direct_reachable.contains(direct_if_id));
+        assert!(!block_reachable.contains(block_if_id));
+        assert!(!block_reachable.contains(block_body_id));
     }
 
     #[test]
@@ -6757,6 +7159,51 @@ mod tests {
     }
 
     #[test]
+    fn short_circuit_rewrite_keeps_only_positionally_surviving_observations() {
+        let symbols = test_table();
+        let body = assign(&symbols, "x", CExpr::IntLit(1));
+        let plain_input = CStmt::if_stmt(
+            v(&symbols, "a"),
+            body.clone(),
+            Some(CStmt::if_stmt(v(&symbols, "b"), body.clone(), None)),
+        );
+        let plain = ControlFlowStructurer::cleanup(&symbols, plain_input);
+
+        let mut owner = RenderObservationOwner::new();
+        let (left_cond_id, left_cond) = owner
+            .observe_expr(v(&symbols, "a"))
+            .expect("left condition observation");
+        let (left_body_id, left_body) = owner
+            .observe_stmt(body.clone())
+            .expect("surviving body observation");
+        let (right_cond_id, right_cond) = owner
+            .observe_expr(v(&symbols, "b"))
+            .expect("right condition observation");
+        let (right_body_id, right_body) = owner
+            .observe_stmt(body)
+            .expect("eliminated duplicate body observation");
+        let (inner_if_id, inner_if) = owner
+            .observe_stmt(CStmt::if_stmt(right_cond, right_body, None))
+            .expect("inner if observation");
+        let (outer_if_id, marked_input) = owner
+            .observe_stmt(CStmt::if_stmt(left_cond, left_body, Some(inner_if)))
+            .expect("outer if observation");
+        let marked = ControlFlowStructurer::cleanup(&symbols, marked_input);
+        let (stripped, reachable) = strip_test_observations(&owner, marked);
+
+        for id in [left_cond_id, right_cond_id, left_body_id, outer_if_id] {
+            assert!(reachable.contains(id), "exact surviving occurrence was lost");
+        }
+        for id in [right_body_id, inner_if_id] {
+            assert!(
+                !reachable.contains(id),
+                "eliminated nested occurrence was relocated onto the outer if"
+            );
+        }
+        assert_eq!(stripped, plain);
+    }
+
+    #[test]
     fn rewrites_shared_else_nested_if_to_short_circuit_and() {
         let symbols = test_table();
         let then_stmt = assign(&symbols, "x", CExpr::IntLit(1));
@@ -6873,7 +7320,7 @@ mod tests {
     }
 
     #[test]
-    fn guarded_tail_rewrite_moves_observations_without_duplicating_terminator() {
+    fn guarded_tail_rewrite_preserves_children_without_relocating_the_split_if() {
         let symbols = test_table();
         let mut owner = RenderObservationOwner::new();
         let (cond_id, cond) = owner
@@ -6885,15 +7332,22 @@ mod tests {
         let (return_id, terminator) = owner
             .observe_stmt(CStmt::ret(Some(CExpr::IntLit(0))))
             .expect("terminator observation");
+        let (if_id, guarded) = owner
+            .observe_stmt(CStmt::if_stmt(cond, body, None))
+            .expect("split if observation");
         let cleaned = ControlFlowStructurer::cleanup(
             &symbols,
-            CStmt::Block(vec![CStmt::if_stmt(cond, body, None), terminator]),
+            CStmt::Block(vec![guarded, terminator]),
         );
 
         let (plain, reachable) = strip_test_observations(&owner, cleaned);
         assert!(reachable.contains(cond_id));
         assert!(reachable.contains(body_id));
         assert!(reachable.contains(return_id));
+        assert!(
+            !reachable.contains(if_id),
+            "a split if has no exact output statement that owns its marker"
+        );
         assert_eq!(
             plain,
             CStmt::Block(vec![
@@ -6909,7 +7363,7 @@ mod tests {
     }
 
     #[test]
-    fn common_suffix_factoring_coalesces_distinct_observations_once() {
+    fn common_suffix_factoring_does_not_merge_distinct_occurrence_observations() {
         let symbols = test_table();
         let suffix = assign(&symbols, "hash", v(&symbols, "c"));
         let mut owner = RenderObservationOwner::new();
@@ -6927,8 +7381,8 @@ mod tests {
         );
         let (plain, reachable) =
             strip_test_observations(&owner, CStmt::Block(factored));
-        assert!(reachable.contains(then_id));
-        assert!(reachable.contains(else_id));
+        assert!(!reachable.contains(then_id));
+        assert!(!reachable.contains(else_id));
         assert_eq!(plain, CStmt::Block(vec![suffix]));
     }
 

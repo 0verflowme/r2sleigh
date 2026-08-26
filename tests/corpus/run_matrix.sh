@@ -15,24 +15,24 @@ while [[ $# -gt 0 ]]; do
             ;;
         --gate)
             if [[ $# -lt 2 ]]; then
-                echo "--gate requires measurement, snapshot, raw, or differential" >&2
+                echo "--gate requires measurement, snapshot, raw, differential, or binding-audit" >&2
                 exit 64
             fi
             gate=$2
             shift 2
             ;;
         *)
-            echo "usage: $0 [--accept-baseline] [--gate measurement|snapshot|raw|differential]" >&2
+            echo "usage: $0 [--accept-baseline] [--gate measurement|snapshot|raw|differential|binding-audit]" >&2
             exit 64
             ;;
     esac
 done
 if [[ -z $gate ]]; then
-    echo "--gate is required: measurement, snapshot, raw, or differential" >&2
+    echo "--gate is required: measurement, snapshot, raw, differential, or binding-audit" >&2
     exit 64
 fi
 case $gate in
-    measurement|snapshot|raw|differential) ;;
+    measurement|snapshot|raw|differential|binding-audit) ;;
     *)
         echo "unsupported gate: $gate" >&2
         exit 64
@@ -149,7 +149,9 @@ if accept_baseline:
 combined = {"schema_version": 1, "expected_entries": 54, "entries": entries}
 (result_dir / "matrix.json").write_text(json.dumps(combined, indent=2, sort_keys=True) + "\n")
 
-for score in ("generation", "raw", "diagnostic", "differential", "snapshot"):
+for score in (
+    "generation", "raw", "diagnostic", "differential", "snapshot", "binding_audit"
+):
     counts = {}
     for entry in entries:
         status = entry[score]["status"]
@@ -177,6 +179,10 @@ for entry in entries:
         failures.append(f"{key}: diagnostic was not measured")
     if entry["differential"]["status"] == "not_run":
         failures.append(f"{key}: differential was not measured")
+    if gate == "binding-audit" and entry["binding_audit"]["status"] != "pass":
+        failures.append(
+            f"{key}: binding_audit={entry['binding_audit']['status']}"
+        )
     if gate in {"snapshot", "raw", "differential"} and entry["snapshot"]["status"] not in {
         "match", "accepted"
     }:

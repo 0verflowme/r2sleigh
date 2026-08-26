@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::ast::{
     BinaryOp, CExpr, CFunction, CLocal, CStmt, CType, UnaryOp, carry_outer_stmt_observations,
-    carry_render_observations, has_render_observations, stmt_has_render_observations,
+    has_render_observations, stmt_has_render_observations,
 };
 use crate::observation_journal::ObservationSealAuthority;
 
@@ -79,6 +79,13 @@ impl EmissionReadyFunction {
         _authority: &mut ObservationSealAuthority,
     ) -> &mut CFunction {
         &mut self.function
+    }
+
+    pub(crate) fn discard_observation_markers(
+        &mut self,
+        _authority: &mut ObservationSealAuthority,
+    ) {
+        crate::ast::discard_render_observations(&mut self.function);
     }
 
     #[allow(
@@ -1172,7 +1179,10 @@ fn coalesced_scalar_update_run(stmts: &[CStmt]) -> Option<(usize, CStmt)> {
     }
 
     let stmt = scalar_update_stmt(name, total)?;
-    Some((run_len, carry_render_observations(&stmts[..run_len], stmt)))
+    // Coalescing multiple updates creates a new occurrence. None of the source
+    // statement/use/write markers has an exact position in it, so the ledger
+    // must report them unaccounted instead of transferring them to synthetic C.
+    Some((run_len, stmt))
 }
 
 fn scalar_update_stmt(name: crate::symbol::SymbolId, delta: i64) -> Option<CStmt> {
@@ -1463,7 +1473,7 @@ mod tests {
     }
 
     #[test]
-    fn observation_wrappers_survive_codegen_ast_transformations() {
+    fn observation_wrappers_follow_exact_codegen_occurrences() {
         let symbols = test_table();
         let value = crate::symbol::declare(&symbols, "value");
         let local = CLocal {
@@ -1551,7 +1561,12 @@ mod tests {
                 .expect("coalescing preserved a valid observation domain");
 
         assert_eq!(transformed.body, vec![plain_update]);
-        assert_eq!(reachable.ids().collect::<Vec<_>>(), expected_ids);
+        for id in expected_ids {
+            assert!(
+                !reachable.contains(id),
+                "a coalesced update has no exact source occurrence for marker {id:?}"
+            );
+        }
     }
 
     #[test]

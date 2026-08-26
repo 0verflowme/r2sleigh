@@ -255,7 +255,8 @@ pub(crate) struct FoldingContext<'a> {
         std::cell::RefCell<std::collections::BTreeMap<SemanticObligationId, &'static str>>,
     /// First exact-observation failure. Lowering is largely `Option`-based, so
     /// marker issuance records the typed failure here and the native boundary
-    /// converts the entire run to a fresh marker-free residual.
+    /// retains it in the non-consuming audit while emitting the same marker-free
+    /// native program.
     pub(crate) observation_error:
         std::cell::RefCell<Option<crate::observation_journal::LegacyObservationJournalError>>,
 }
@@ -541,6 +542,32 @@ impl<'a> FoldingContext<'a> {
         let mut first = self.observation_error.borrow_mut();
         if first.is_none() {
             *first = Some(error);
+        }
+    }
+
+    /// Materialize one cached fold as a distinct final-AST occurrence.
+    ///
+    /// Folding is stateful and must not be replayed merely to obtain fresh
+    /// diagnostic identities. The journal duplicates its own authority-bound
+    /// targets; on allocation failure the semantic clone survives marker-free
+    /// and the typed audit failure is retained.
+    pub(crate) fn clone_cached_render_occurrence(
+        &self,
+        stmts: &[crate::ast::CStmt],
+    ) -> Vec<crate::ast::CStmt> {
+        let Some(journal) = self.inputs.observation_journal else {
+            return stmts.to_vec();
+        };
+        let fallback = stmts
+            .iter()
+            .map(crate::ast::CStmt::clone_without_render_observations)
+            .collect();
+        match journal.borrow_mut().clone_render_occurrence(stmts) {
+            Ok(clone) => clone,
+            Err(error) => {
+                self.retain_first_observation_error(error);
+                fallback
+            }
         }
     }
 
