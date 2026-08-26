@@ -196,6 +196,7 @@ pub(super) fn binding_components(
     let value_count = graph.values.len();
     let unobserved_merges = source.unobserved_merges();
     let return_controls = certified_return_control_values(source);
+    let direct_control_targets = certified_direct_control_target_values(source);
     let structural_unused =
         source
             .obligations()
@@ -210,6 +211,7 @@ pub(super) fn binding_components(
             value.var.constant_bits().is_none()
                 && !unobserved_merges.contains(value.id)
                 && !return_controls.contains(&value.id)
+                && !direct_control_targets.contains(&value.id)
                 && !structural_unused.contains(&value.id)
         })
         .collect::<Vec<_>>();
@@ -476,6 +478,7 @@ impl BindingPlan {
             .map_err(BindingPlanBuildError::MachineProjection)?;
         let graph = source.graph();
         let return_controls = certified_return_control_values(source);
+        let direct_control_targets = certified_direct_control_target_values(source);
         let structural_unused = source.obligations().structural_unused_values(graph).ok_or(
             BindingPlanBuildError::Seal(BindingPlanSourceMismatch::Authority),
         )?;
@@ -510,6 +513,14 @@ impl BindingPlan {
             if return_controls.contains(&graph_value.id) {
                 dispositions[index] = ValueDisposition::Elided {
                     reason: r2ssa::ledger::ElisionReason::ReturnControl,
+                    proof: ValueElisionProof {
+                        authority: source.authority().clone(),
+                        value: graph_value.id,
+                    },
+                };
+            } else if direct_control_targets.contains(&graph_value.id) {
+                dispositions[index] = ValueDisposition::Elided {
+                    reason: r2ssa::ledger::ElisionReason::DirectControlTarget,
                     proof: ValueElisionProof {
                         authority: source.authority().clone(),
                         value: graph_value.id,

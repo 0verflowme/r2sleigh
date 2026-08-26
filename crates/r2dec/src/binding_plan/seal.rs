@@ -150,6 +150,7 @@ pub(super) fn seal_binding_components(
     let value_count = graph.values.len();
     let unobserved_merges = source.unobserved_merges();
     let return_controls = certified_return_control_values(source);
+    let direct_control_targets = certified_direct_control_target_values(source);
     let structural_unused =
         source
             .obligations()
@@ -164,6 +165,7 @@ pub(super) fn seal_binding_components(
             value.var.constant_bits().is_none()
                 && !unobserved_merges.contains(value.id)
                 && !return_controls.contains(&value.id)
+                && !direct_control_targets.contains(&value.id)
                 && !structural_unused.contains(&value.id)
         })
         .collect::<Vec<_>>();
@@ -385,6 +387,7 @@ pub(crate) fn build_upstream_shadow_oracle(
     let machine_projection = MachineProjection::from_artifact(source)
         .map_err(BindingPlanBuildError::MachineProjection)?;
     let return_controls = certified_return_control_values(source);
+    let direct_control_targets = certified_direct_control_target_values(source);
     let structural_unused =
         source
             .obligations()
@@ -416,6 +419,12 @@ pub(crate) fn build_upstream_shadow_oracle(
         if return_controls.contains(&graph_value.id) {
             values[graph_value.id.0 as usize] = Some(UpstreamValueDisposition::Elided(
                 r2ssa::ledger::ElisionReason::ReturnControl,
+            ));
+            continue;
+        }
+        if direct_control_targets.contains(&graph_value.id) {
+            values[graph_value.id.0 as usize] = Some(UpstreamValueDisposition::Elided(
+                r2ssa::ledger::ElisionReason::DirectControlTarget,
             ));
             continue;
         }
@@ -505,6 +514,7 @@ impl BindingPlan {
         let expected = seal_binding_components(source_owned)?;
         let unobserved_merges = source.unobserved_merges();
         let return_controls = certified_return_control_values(source);
+        let direct_control_targets = certified_direct_control_target_values(source);
         let structural_unused = source.obligations().structural_unused_values(graph).ok_or(
             BindingPlanBuildError::Seal(BindingPlanSourceMismatch::Authority),
         )?;
@@ -565,6 +575,7 @@ impl BindingPlan {
                     if graph_value.var.constant_bits().is_none()
                         && !unobserved_merges.contains(value)
                         && !return_controls.contains(&value)
+                        && !direct_control_targets.contains(&value)
                         && !structural_unused.contains(&value) => {}
                 ValueDisposition::Elided { reason, proof }
                     if *reason == r2ssa::ledger::ElisionReason::UnobservedMerge
@@ -576,6 +587,11 @@ impl BindingPlan {
                         && proof.authority == *source.authority()
                         && proof.value == value
                         && return_controls.contains(&value) => {}
+                ValueDisposition::Elided { reason, proof }
+                    if *reason == r2ssa::ledger::ElisionReason::DirectControlTarget
+                        && proof.authority == *source.authority()
+                        && proof.value == value
+                        && direct_control_targets.contains(&value) => {}
                 ValueDisposition::Elided { reason, proof }
                     if *reason == r2ssa::ledger::ElisionReason::UnusedStructuralValue
                         && proof.authority == *source.authority()

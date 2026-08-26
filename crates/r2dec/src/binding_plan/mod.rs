@@ -176,6 +176,53 @@ pub(super) fn certified_return_control_values(source: &r2ssa::SsaArtifact) -> BT
         .collect()
 }
 
+/// Exact direct-branch target uses already represented by CFG topology.
+///
+/// Only `Branch` and `CBranch` target operand zero qualify. Indirect branch,
+/// call, predicate, and return operands have different rendering contracts.
+pub(super) fn certified_direct_control_target_sites(
+    source: &r2ssa::SsaArtifact,
+) -> BTreeSet<UseSite> {
+    let graph = source.graph();
+    graph
+        .insts
+        .iter()
+        .filter_map(|inst| {
+            let target = match &inst.payload {
+                r2ssa::InstPayload::Op(
+                    r2ssa::SSAOp::Branch { target } | r2ssa::SSAOp::CBranch { target, .. },
+                ) => target,
+                _ => return None,
+            };
+            let value = graph.value_id_for_var(target)?;
+            let site = UseSite {
+                inst: inst.id,
+                input_idx: 0,
+            };
+            (inst.inputs.first().copied() == Some(value) && graph.use_sites(value).contains(&site))
+                .then_some(site)
+        })
+        .collect()
+}
+
+/// Direct-control target values whose complete use domain is CFG topology.
+pub(super) fn certified_direct_control_target_values(
+    source: &r2ssa::SsaArtifact,
+) -> BTreeSet<ValueId> {
+    let graph = source.graph();
+    let sites = certified_direct_control_target_sites(source);
+    sites
+        .iter()
+        .filter_map(|site| graph.inst(site.inst)?.inputs.get(site.input_idx).copied())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .filter(|value| {
+            let uses = graph.use_sites(*value);
+            !uses.is_empty() && uses.iter().all(|site| sites.contains(site))
+        })
+        .collect()
+}
+
 /// Failure of declaration placement or reaching-definition validation.
 ///
 /// Placement itself is deliberately absent: it is derived from the sealed

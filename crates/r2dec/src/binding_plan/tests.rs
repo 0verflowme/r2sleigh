@@ -295,6 +295,99 @@ fn exact_source_return_address_fact_alone_authorizes_control_target_elision() {
 }
 
 #[test]
+fn direct_cfg_target_is_elided_only_when_every_use_is_control_topology() {
+    let target = Varnode::constant(0x1020, 8);
+    let mut entry = R2ILBlock::new(0x1000, 0x10);
+    entry.push(R2ILOp::CBranch {
+        target: target.clone(),
+        cond: Varnode::register(0x38, 8),
+    });
+    let mut fallthrough = R2ILBlock::new(0x1010, 0x10);
+    fallthrough.push(R2ILOp::Branch {
+        target: Varnode::constant(0x1030, 8),
+    });
+    let mut taken = R2ILBlock::new(0x1020, 0x10);
+    taken.push(R2ILOp::Branch {
+        target: Varnode::constant(0x1030, 8),
+    });
+    let mut exit = R2ILBlock::new(0x1030, 4);
+    exit.push(R2ILOp::Return {
+        target: Varnode::register(0x30, 8),
+    });
+    let source_owned = source_owned_blocks(&[entry, fallthrough, taken, exit]);
+    let source = source_owned.source();
+    let control_site = certified_direct_control_target_sites(source)
+        .into_iter()
+        .find(|site| {
+            source.graph().inst(site.inst).is_some_and(|inst| {
+                inst.inputs.first().is_some_and(|value| {
+                    source
+                        .graph()
+                        .value(*value)
+                        .is_some_and(|value| value.var.constant_bits() == Some(target.offset))
+                })
+            })
+        })
+        .expect("exact conditional target site");
+    let target_value = source
+        .graph()
+        .inst(control_site.inst)
+        .expect("target op")
+        .inputs[0];
+    let plan = BindingPlan::build_shadow(&source_owned).expect("direct-control-aware plan");
+
+    assert!(matches!(
+        plan.disposition(target_value),
+        Some(ValueDisposition::Elided {
+            reason: r2ssa::ledger::ElisionReason::DirectControlTarget,
+            proof,
+        }) if proof.authority == *source.authority() && proof.value == target_value
+    ));
+    assert_eq!(
+        build_upstream_shadow_oracle(&source_owned)
+            .expect("independent direct-control oracle")
+            .value_disposition(target_value),
+        Some(UpstreamValueDisposition::Elided(
+            r2ssa::ledger::ElisionReason::DirectControlTarget
+        ))
+    );
+
+    let mut mixed_entry = R2ILBlock::new(0x1000, 0x10);
+    mixed_entry.push(R2ILOp::IntAdd {
+        dst: Varnode::unique(0x80, 8),
+        a: target.clone(),
+        b: Varnode::constant(1, 8),
+    });
+    mixed_entry.push(R2ILOp::CBranch {
+        target,
+        cond: Varnode::register(0x38, 8),
+    });
+    let mixed = source_owned_blocks(&[
+        mixed_entry,
+        R2ILBlock::new(0x1010, 0x10),
+        R2ILBlock::new(0x1020, 0x10),
+    ]);
+    let mixed_value = mixed
+        .source()
+        .graph()
+        .values
+        .iter()
+        .find(|value| value.var.constant_bits() == Some(0x1020))
+        .expect("shared target literal")
+        .id;
+    assert!(
+        mixed.source().graph().use_sites(mixed_value).len() > 1,
+        "fixture must share the literal between control and ordinary use"
+    );
+    assert!(matches!(
+        BindingPlan::build_shadow(&mixed)
+            .expect("mixed-use plan")
+            .disposition(mixed_value),
+        Some(ValueDisposition::Inline { .. })
+    ));
+}
+
+#[test]
 fn unobserved_merge_is_elided_by_its_source_certificate_not_bound() {
     let mut entry = R2ILBlock::new(0x1000, 4);
     entry.push(R2ILOp::CBranch {

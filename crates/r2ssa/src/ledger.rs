@@ -55,6 +55,16 @@ pub enum ElisionReason {
     /// `Return` operand transports the return address, while source boundary
     /// facts separately certify any semantic return value.
     ReturnControl,
+    /// A direct branch target already represented by the sealed CFG topology.
+    ///
+    /// The target operand is machine control, not a C expression. Conditional
+    /// predicates remain ordinary exact uses and are never covered by this
+    /// disposition.
+    DirectControlTarget,
+    /// An immutable phi whose inputs and output are one certified renderer
+    /// binding has no runtime C operation. Its graph cells remain accounted,
+    /// but no assignment or read is fabricated for the SSA merge itself.
+    CoalescedImmutablePhi,
     /// A condition-code write no rendered predicate reads.
     DeadCpuFlag,
     /// A value only ever read to compute a flag that is itself elided.
@@ -84,6 +94,8 @@ impl std::fmt::Display for ElisionReason {
         f.write_str(match self {
             Self::StackFrame => "stack-frame",
             Self::ReturnControl => "return-control",
+            Self::DirectControlTarget => "direct-control-target",
+            Self::CoalescedImmutablePhi => "coalesced-immutable-phi",
             Self::DeadCpuFlag => "dead-cpu-flag",
             Self::DeadFlagOnly => "dead-flag-only",
             Self::DeadUnusedTemporary => "dead-unused-temp",

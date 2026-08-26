@@ -14,12 +14,12 @@ use r2ssa::{
 };
 use r2types::SourceOwnedFunctionFacts;
 
+#[cfg(test)]
+use crate::ast::inspect_and_strip_render_observations;
 use crate::ast::{
     BinaryOp, CExpr, CFunction, CStmt, RenderObservationInspectError, RenderObservationNode,
     RenderObservationStripError, inspect_render_observations,
 };
-#[cfg(test)]
-use crate::ast::inspect_and_strip_render_observations;
 use crate::binding_plan::{BindingPlan, BindingPlanSourceMismatch, ValueDisposition};
 use crate::codegen::{EmissionReadyFunction, prepare_function_for_emission};
 use crate::normalize::{
@@ -31,8 +31,7 @@ use crate::shadow_report::{
 };
 use crate::symbol::{SymbolId, SymbolTable};
 use crate::{
-    BindingMachineProjectionFailure, BindingObservationJournalFailure,
-    BindingShadowAuditFailure,
+    BindingMachineProjectionFailure, BindingObservationJournalFailure, BindingShadowAuditFailure,
 };
 
 /// Opaque dense identity of one exact marked AST occurrence.
@@ -106,7 +105,10 @@ pub(crate) enum LegacyObservationJournalError {
     Normalization(NormalizationOriginError),
     TooManyObservations,
     InvalidValue(ValueId),
-    InvalidCertifiedValueRead { value: ValueId, at: InstId },
+    InvalidCertifiedValueRead {
+        value: ValueId,
+        at: InstId,
+    },
     InvalidUse(UseSite),
     InvalidWrite(InstId),
     InvalidEffectObligation(SemanticObligationId),
@@ -574,9 +576,7 @@ impl LegacyObservationCoverage {
     }
 
     pub(crate) fn passes_quality(self) -> bool {
-        self.values.passes_quality()
-            && self.uses.passes_quality()
-            && self.writes.passes_quality()
+        self.values.passes_quality() && self.uses.passes_quality() && self.writes.passes_quality()
     }
 }
 
@@ -622,8 +622,7 @@ impl SurvivingEffectObservations {
     }
 
     #[cfg(test)]
-    pub(crate) fn surviving(
-        &self) -> impl Iterator<Item = (SemanticObligationId, usize)> + '_ {
+    pub(crate) fn surviving(&self) -> impl Iterator<Item = (SemanticObligationId, usize)> + '_ {
         self.occurrences
             .iter()
             .filter_map(|(id, count)| (*count > 0).then_some((*id, *count)))
@@ -672,8 +671,12 @@ enum NativePlacementFailure {
     MissingStructuredRegionArtifact,
     Analysis(crate::placement::PlacementAnalysisError),
     Application(crate::placement::PlacementApplicationError),
-    MissingBindingRole { binding: crate::binding_plan::BindingId },
-    UndeclaredNames { count: usize },
+    MissingBindingRole {
+        binding: crate::binding_plan::BindingId,
+    },
+    UndeclaredNames {
+        count: usize,
+    },
     RegionFinalization(crate::structured_region::StructuredRegionFinalizationError),
 }
 
@@ -785,18 +788,14 @@ fn placement_analysis_refusal(
                 block_address: block,
             }
         }
-        Error::ExternalBindingOutsidePlan { binding } => {
-            Refusal::ExternalBindingOutsidePlan {
-                binding_index: binding.index(),
-            }
-        }
+        Error::ExternalBindingOutsidePlan { binding } => Refusal::ExternalBindingOutsidePlan {
+            binding_index: binding.index(),
+        },
         Error::RegionMarkers(error) => region_marker_refusal(error),
         Error::ObservationMarkers(error) => observation_marker_refusal(error),
-        Error::MissingObservationTarget { observation } => {
-            Refusal::MissingObservationTarget {
-                observation_id: observation.index(),
-            }
-        }
+        Error::MissingObservationTarget { observation } => Refusal::MissingObservationTarget {
+            observation_id: observation.index(),
+        },
         Error::InvalidUse { site } => Refusal::InvalidUse {
             instruction_id: site.inst.0,
             input_index: site.input_idx,
@@ -804,18 +803,12 @@ fn placement_analysis_refusal(
         Error::InvalidWrite { inst } => Refusal::InvalidWrite {
             instruction_id: inst.0,
         },
-        Error::InvalidCertifiedValueRead { value, at } => {
-            Refusal::InvalidCertifiedValueRead {
-                value_id: value.0,
-                instruction_id: at.0,
-            }
-        }
-        Error::MissingPlannedValue { value } => Refusal::MissingPlannedValue {
+        Error::InvalidCertifiedValueRead { value, at } => Refusal::InvalidCertifiedValueRead {
             value_id: value.0,
+            instruction_id: at.0,
         },
-        Error::RefusedPlannedValue { value } => Refusal::RefusedPlannedValue {
-            value_id: value.0,
-        },
+        Error::MissingPlannedValue { value } => Refusal::MissingPlannedValue { value_id: value.0 },
+        Error::RefusedPlannedValue { value } => Refusal::RefusedPlannedValue { value_id: value.0 },
         Error::UnscopedObservation { observation } => Refusal::UnscopedObservation {
             observation_id: observation.index(),
         },
@@ -824,11 +817,9 @@ fn placement_analysis_refusal(
                 observation_id: observation.index(),
             }
         }
-        Error::UnauthorizedProgramVariable { symbol } => {
-            Refusal::UnauthorizedProgramVariable {
-                symbol_index: symbol.index(),
-            }
-        }
+        Error::UnauthorizedProgramVariable { symbol } => Refusal::UnauthorizedProgramVariable {
+            symbol_index: symbol.index(),
+        },
         Error::UnobservedBindingRead { binding } => Refusal::UnobservedBindingRead {
             binding_index: binding.index(),
         },
@@ -883,9 +874,7 @@ impl From<NativePlacementFailure> for crate::PlacementAuditRefusal {
             NativePlacementFailure::MissingBindingRole { binding } => Self::MissingBindingRole {
                 binding_index: binding.index(),
             },
-            NativePlacementFailure::UndeclaredNames { count } => {
-                Self::UndeclaredNames { count }
-            }
+            NativePlacementFailure::UndeclaredNames { count } => Self::UndeclaredNames { count },
             NativePlacementFailure::RegionFinalization(error) => region_marker_refusal(error),
         }
     }
@@ -1072,7 +1061,8 @@ impl SealedNativeFunction {
 
     pub(crate) fn audit_observations(
         &self,
-    ) -> Result<(&LegacyAnalysisSnapshot, LegacyObservationCoverage), BindingShadowAuditFailure> {
+    ) -> Result<(&LegacyAnalysisSnapshot, LegacyObservationCoverage), BindingShadowAuditFailure>
+    {
         self.observations
             .as_ref()
             .map(|observations| (observations.snapshot(), observations.coverage()))
@@ -1299,12 +1289,63 @@ impl LegacyObservationJournal {
                 Some(_) => return Err(LegacyObservationJournalError::ConflictingUse(site)),
             }
         }
+        for site in crate::binding_plan::certified_direct_control_target_sites(source.source()) {
+            match elided_uses.insert(site, r2ssa::ledger::ElisionReason::DirectControlTarget) {
+                Some(r2ssa::ledger::ElisionReason::DirectControlTarget) | None => {}
+                Some(_) => return Err(LegacyObservationJournalError::ConflictingUse(site)),
+            }
+        }
         for site in origins.noop_sites() {
-            match elided_uses
-                .insert(site, r2ssa::ledger::ElisionReason::RedundantPhiEdge)
-            {
+            match elided_uses.insert(site, r2ssa::ledger::ElisionReason::RedundantPhiEdge) {
                 Some(r2ssa::ledger::ElisionReason::RedundantPhiEdge) | None => {}
                 Some(_) => return Err(LegacyObservationJournalError::ConflictingUse(site)),
+            }
+        }
+        let removed_phis = origins
+            .removed_phis()
+            .iter()
+            .map(|origin| origin.definition.inst)
+            .collect::<BTreeSet<_>>();
+        for inst in &graph.insts {
+            if removed_phis.contains(&inst.id)
+                || !matches!(inst.payload, r2ssa::InstPayload::Phi { .. })
+            {
+                continue;
+            }
+            let Some(output) = inst.output else {
+                return Err(LegacyObservationJournalError::InvalidWrite(inst.id));
+            };
+            let Some(ValueDisposition::Bound {
+                binding: output_binding,
+            }) = self.plan.disposition(output)
+            else {
+                continue;
+            };
+            if !inst.inputs.iter().all(|input| {
+                matches!(
+                    self.plan.disposition(*input),
+                    Some(ValueDisposition::Bound { binding }) if binding == output_binding
+                )
+            }) {
+                continue;
+            }
+            for input_idx in 0..inst.inputs.len() {
+                let site = UseSite {
+                    inst: inst.id,
+                    input_idx,
+                };
+                match elided_uses.insert(site, r2ssa::ledger::ElisionReason::CoalescedImmutablePhi)
+                {
+                    Some(r2ssa::ledger::ElisionReason::CoalescedImmutablePhi) | None => {}
+                    Some(_) => return Err(LegacyObservationJournalError::ConflictingUse(site)),
+                }
+            }
+            match elided_writes.insert(inst.id, r2ssa::ledger::ElisionReason::CoalescedImmutablePhi)
+            {
+                Some(r2ssa::ledger::ElisionReason::CoalescedImmutablePhi) | None => {}
+                Some(_) => {
+                    return Err(LegacyObservationJournalError::ConflictingWrite(inst.id));
+                }
             }
         }
         let refused_uses = self
@@ -1314,13 +1355,16 @@ impl LegacyObservationJournal {
             .iter()
             .enumerate()
             .flat_map(|(inst, row)| {
-                row.iter().enumerate().filter_map(move |(input_idx, disposition)| {
-                    matches!(disposition, MachineUseDisposition::Refused(_)).then_some(UseSite {
-                        inst: InstId(inst as u32),
-                        input_idx,
-                    },
+                row.iter()
+                    .enumerate()
+                    .filter_map(move |(input_idx, disposition)| {
+                        matches!(disposition, MachineUseDisposition::Refused(_)).then_some(
+                            UseSite {
+                                inst: InstId(inst as u32),
+                                input_idx,
+                            },
                         )
-                })
+                    })
             })
             .collect::<Vec<_>>();
         let refused_writes = self
@@ -1511,10 +1555,7 @@ impl LegacyObservationJournal {
             .and_then(|index| self.source.certificates().returns.get(*index))
             .is_some_and(|certificate| certificate.at == at && certificate.value == value);
         if !exact_certificate {
-            return Err(LegacyObservationJournalError::InvalidCertifiedValueRead {
-                value,
-                at,
-            });
+            return Err(LegacyObservationJournalError::InvalidCertifiedValueRead { value, at });
         }
         let Some(ValueDisposition::Bound { binding }) = self.plan.disposition(value) else {
             return Err(LegacyObservationJournalError::RenderedValueRequired(value));
@@ -1522,27 +1563,32 @@ impl LegacyObservationJournal {
         if !crate::placement::expr_reads_symbol(&expr, symbol) {
             return Err(LegacyObservationJournalError::RenderedValueRequired(value));
         }
-        let id = self
-            .allocate_many(vec![ObservationTarget::CertifiedValueRead {
-                value,
-                at,
-                binding: *binding,
-                symbol,
-            }])?
-            .into_iter()
+        let mut ids = self
+            .allocate_many(vec![
+                ObservationTarget::Value(value),
+                ObservationTarget::CertifiedValueRead {
+                    value,
+                    at,
+                    binding: *binding,
+                    symbol,
+                },
+            ])?
+            .into_iter();
+        let value_id = ids
             .next()
             .ok_or(LegacyObservationJournalError::TooManyObservations)?;
-        Ok(CExpr::observed(id, expr))
+        let read_id = ids
+            .next()
+            .ok_or(LegacyObservationJournalError::TooManyObservations)?;
+        Ok(CExpr::observed(read_id, CExpr::observed(value_id, expr)))
     }
 
-    fn first_unaccounted_render_observation(
-        &self,
-    ) -> Option<LegacyObservationJournalError> {
+    fn first_unaccounted_render_observation(&self) -> Option<LegacyObservationJournalError> {
         for (index, observation) in self.values.iter().enumerate() {
             if observation.is_none() {
-                return Some(LegacyObservationJournalError::RenderedValueRequired(ValueId(
-                    index as u32,
-                )));
+                return Some(LegacyObservationJournalError::RenderedValueRequired(
+                    ValueId(index as u32),
+                ));
             }
         }
         for (inst, row) in self.uses.iter().enumerate() {
@@ -1659,6 +1705,9 @@ impl LegacyObservationJournal {
         obligation_ids: &BTreeSet<SemanticObligationId>,
         stmt: CStmt,
     ) -> Result<CStmt, LegacyObservationJournalError> {
+        if matches!(stmt.unobserved(), CStmt::Comment(_) | CStmt::Empty) {
+            return Ok(stmt);
+        }
         let mut marked = stmt;
         for id in self.allocate_effect_targets(obligation_ids)? {
             marked = CStmt::observed(id, marked);
@@ -1706,8 +1755,7 @@ impl LegacyObservationJournal {
     ) -> Result<(), LegacyObservationJournalError> {
         let observation = match self.plan.use_disposition(site) {
             Some(MachineUseDisposition::Refused(reason)) => LegacyUseObservation::Refused(*reason),
-            Some(
-                MachineUseDisposition::Exact(_) | MachineUseDisposition::MemoryAddress(_))
+            Some(MachineUseDisposition::Exact(_) | MachineUseDisposition::MemoryAddress(_))
             | None => {
                 return Err(
                     LegacyObservationJournalError::ExactUseRequiresRenderedOccurrence(site),
@@ -1918,7 +1966,8 @@ impl LegacyObservationJournal {
                                 );
                                 return Ok(());
                             }
-                            Some(ValueDisposition::Bound { .. } | ValueDisposition::Inline { .. },
+                            Some(
+                                ValueDisposition::Bound { .. } | ValueDisposition::Inline { .. },
                             )
                             | None => {}
                         }
@@ -2014,10 +2063,7 @@ impl LegacyObservationJournal {
             .filter(|cell| {
                 matches!(
                     cell,
-                    Some(
-                        LegacyUseObservation::Exact(_)
-                            | LegacyUseObservation::MemoryAddress(_)
-                    )
+                    Some(LegacyUseObservation::Exact(_) | LegacyUseObservation::MemoryAddress(_))
                 )
             })
             .count();
@@ -2298,9 +2344,7 @@ fn classify_symbol(
     let binding = symbol_bindings
         .get(&symbol)
         .copied()
-        .ok_or(LegacyObservationJournalError::UnownedBindingSymbol {
-            value,
-            symbol })?;
+        .ok_or(LegacyObservationJournalError::UnownedBindingSymbol { value, symbol })?;
     Ok(LegacyValueObservation::Bound { binding })
 }
 
@@ -2392,9 +2436,7 @@ mod tests {
 
     use super::*;
     use crate::ast::{CLocal, CType};
-    use crate::binding_plan::{
-        BindingId, BindingNameResolution, ValueDisposition, ValueRefusal,
-    };
+    use crate::binding_plan::{BindingId, BindingNameResolution, ValueDisposition, ValueRefusal};
     use crate::structured_region::{
         StructuredRegionKind, StructuredRegionMarker, seal_structured_body,
     };
@@ -2478,7 +2520,17 @@ mod tests {
         CFunction,
         LegacyObservationJournal,
     ) {
-        let source = source_owned();
+        journal_fixture_for_source(source_owned())
+    }
+
+    fn journal_fixture_for_source(
+        source: SourceOwnedFunctionFacts,
+    ) -> (
+        SourceOwnedFunctionFacts,
+        BindingPlan,
+        CFunction,
+        LegacyObservationJournal,
+    ) {
         let plan = BindingPlan::build_shadow(&source).expect("sealed binding plan");
         let function = CFunction::new("journal", CType::Void);
         let normalized = source.source().function().clone();
@@ -2578,12 +2630,8 @@ mod tests {
         let plan = Rc::new(BindingPlan::build_shadow(&source).expect("return binding plan"));
         let mut function = CFunction::new("certified_read", CType::Int(64));
         let names = Rc::new(
-            BindingNameResolution::build(
-                &source,
-                Rc::clone(&plan),
-                Rc::clone(&function.symbols),
-            )
-            .expect("sealed return names"),
+            BindingNameResolution::build(&source, Rc::clone(&plan), Rc::clone(&function.symbols))
+                .expect("sealed return names"),
         );
         let symbol = names
             .symbol_for_value(certificate.value)
@@ -2658,9 +2706,7 @@ mod tests {
                 journal.placement_target_count(),
                 |id| journal.placement_target(id),
             ),
-            Err(crate::placement::PlacementAnalysisError::UnobservedBindingRead {
-                binding
-            })
+            Err(crate::placement::PlacementAnalysisError::UnobservedBindingRead { binding })
         );
     }
 
@@ -2681,7 +2727,7 @@ mod tests {
             .expect("source-owned effect marker");
         let deleted = journal
             .observe_effect_stmt(&obligations, CStmt::Empty)
-            .expect("second concrete marker occurrence");
+            .expect("empty statement cannot claim an effect occurrence");
         function.body.push(surviving);
         drop(deleted);
 
@@ -2691,6 +2737,60 @@ mod tests {
             .expect("final effect occurrences seal independently of V/U/W");
         assert_eq!(effects.occurrence_count(obligation), Some(1));
         assert_eq!(effects.surviving().collect::<Vec<_>>(), [(obligation, 1)]);
+    }
+
+    #[test]
+    fn residual_memory_effect_is_a_typed_refusal_not_a_rendered_occurrence() {
+        let mut block = R2ILBlock::new(0x1000, 4);
+        block.push(R2ILOp::Store {
+            space: r2il::SpaceId::Ram,
+            addr: Varnode::register(0x28, 8),
+            val: Varnode::constant(7, 8),
+        });
+        block.push(R2ILOp::Return {
+            target: Varnode::register(0x30, 8),
+        });
+        let source = source_owned_from_blocks(&[block]);
+        let (source, _plan, mut function, mut journal) = journal_fixture_for_source(source);
+        let obligation = source
+            .source()
+            .obligations()
+            .obligations()
+            .keys()
+            .copied()
+            .find(|id| id.kind == r2ssa::SemanticObligationKind::ObservableMemoryWrite)
+            .expect("fixture has an observable memory-write obligation");
+        let obligations = BTreeSet::from([obligation]);
+        let residual = journal
+            .observe_effect_stmt(
+                &obligations,
+                CStmt::Comment("unsupported exact memory store".to_string()),
+            )
+            .expect("residual is accepted without claiming the effect");
+        let empty = journal
+            .observe_effect_stmt(&obligations, CStmt::Empty)
+            .expect("empty statement is accepted without claiming the effect");
+        assert!(matches!(residual, CStmt::Comment(_)));
+        assert_eq!(empty, CStmt::Empty);
+        function.body = vec![residual, empty];
+
+        let mut ready = crate::codegen::prepare_function_for_emission(&function);
+        let effects = journal
+            .seal_effects_only(&source, &mut ready)
+            .expect("effect observations seal independently of V/U/W");
+        assert_eq!(effects.occurrence_count(obligation), Some(0));
+
+        let origins =
+            NormalizationOrigins::for_unchanged(source.source().function(), source.source());
+        let ledger =
+            crate::effect_ledger::build_obligation_ledger(source.source(), &origins, &effects);
+        assert_eq!(
+            ledger.outcome(&obligation),
+            r2ssa::ledger::Outcome::Refused {
+                layer: r2ssa::ledger::LedgerLayer::Codegen,
+                reason: r2ssa::ledger::RefusalReason::BlockNotRendered,
+            }
+        );
     }
 
     #[test]
@@ -2721,11 +2821,8 @@ mod tests {
 
         let origins =
             NormalizationOrigins::for_unchanged(source.source().function(), source.source());
-        let ledger = crate::effect_ledger::build_obligation_ledger(
-            source.source(),
-            &origins,
-            &effects,
-        );
+        let ledger =
+            crate::effect_ledger::build_obligation_ledger(source.source(), &origins, &effects);
         assert_eq!(
             ledger.outcome(&obligation),
             r2ssa::ledger::Outcome::Refused {
@@ -2860,6 +2957,91 @@ mod tests {
         assert!(coverage.values.justified_elision >= 1);
         assert!(coverage.uses.justified_elision >= input_count);
         assert!(coverage.writes.justified_elision >= 1);
+    }
+
+    #[test]
+    fn immutable_phi_coalesced_by_one_binding_accounts_for_edges_and_definition() {
+        let mut entry = R2ILBlock::new(0x1000, 4);
+        entry.push(R2ILOp::CBranch {
+            cond: Varnode::constant(1, 1),
+            target: Varnode::constant(0x1008, 8),
+        });
+        let mut left = R2ILBlock::new(0x1004, 4);
+        left.push(R2ILOp::Copy {
+            dst: Varnode::register(0, 8),
+            src: Varnode::constant(11, 8),
+        });
+        left.push(R2ILOp::Branch {
+            target: Varnode::constant(0x100c, 8),
+        });
+        let mut right = R2ILBlock::new(0x1008, 4);
+        right.push(R2ILOp::Copy {
+            dst: Varnode::register(0, 8),
+            src: Varnode::constant(12, 8),
+        });
+        right.push(R2ILOp::Branch {
+            target: Varnode::constant(0x100c, 8),
+        });
+        let mut join = R2ILBlock::new(0x100c, 4);
+        join.push(R2ILOp::Return {
+            target: Varnode::register(0x30, 8),
+        });
+        let source = source_owned_from_blocks(&[entry, left, right, join]);
+        let graph = source.source().graph();
+        let definition = graph
+            .insts
+            .iter()
+            .find(|inst| {
+                matches!(inst.payload, r2ssa::InstPayload::Phi { .. })
+                    && inst.output.is_some_and(|output| {
+                        !source.source().unobserved_merges().contains(output)
+                            && graph.value(output).is_some_and(|value| {
+                                value.canonical_storage.is_some_and(|storage| {
+                                    storage.space == CanonicalStorageSpace::Register
+                                        && storage.offset == 0
+                                })
+                            })
+                    })
+            })
+            .expect("live immutable return merge");
+        let output = definition.output.expect("phi output");
+        let plan = Rc::new(BindingPlan::build_shadow(&source).expect("coalesced phi plan"));
+        let output_binding = match plan.disposition(output) {
+            Some(ValueDisposition::Bound { binding }) => *binding,
+            other => panic!("live merge output must be bound: {other:?}"),
+        };
+        assert!(definition.inputs.iter().all(|input| matches!(
+            plan.disposition(*input),
+            Some(ValueDisposition::Bound { binding }) if *binding == output_binding
+        )));
+
+        let function = CFunction::new("coalesced_phi", CType::Int(64));
+        let normalized = source.source().function().clone();
+        let origins = NormalizationOrigins::for_unchanged(&normalized, source.source());
+        let journal = LegacyObservationJournal::new(
+            &source,
+            &normalized,
+            &origins,
+            plan,
+            Rc::clone(&function.symbols),
+        )
+        .expect("journal certifies immutable coalesced phi");
+
+        assert_eq!(journal.values[output.0 as usize], None);
+        for input_idx in 0..definition.inputs.len() {
+            assert_eq!(
+                journal.uses[definition.id.0 as usize][input_idx],
+                Some(LegacyUseObservation::Elided(
+                    r2ssa::ledger::ElisionReason::CoalescedImmutablePhi
+                ))
+            );
+        }
+        assert_eq!(
+            journal.writes[definition.id.0 as usize],
+            Some(LegacyWriteObservation::Elided(
+                r2ssa::ledger::ElisionReason::CoalescedImmutablePhi
+            ))
+        );
     }
 
     #[test]
@@ -3042,11 +3224,11 @@ mod tests {
     #[test]
     fn every_private_journal_error_has_a_stable_public_seal_cause() {
         let function = CFunction::new("seal_cause", CType::Void);
-        let symbol = function.symbols.borrow_mut().declare(
-            "unowned",
-            CType::Int(32),
-            SymbolRole::Carrier,
-        );
+        let symbol =
+            function
+                .symbols
+                .borrow_mut()
+                .declare("unowned", CType::Int(32), SymbolRole::Carrier);
         let site = UseSite {
             inst: InstId(17),
             input_idx: 3,
@@ -3076,8 +3258,7 @@ mod tests {
                 BindingObservationJournalFailure::SourceAuthority,
             ),
             (
-                LegacyObservationJournalError::BindingPlan(
-                    BindingPlanSourceMismatch::Authority),
+                LegacyObservationJournalError::BindingPlan(BindingPlanSourceMismatch::Authority),
                 BindingObservationJournalFailure::BindingPlanAuthority,
             ),
             (
@@ -3166,14 +3347,12 @@ mod tests {
                     value: ValueId(32),
                     reason: r2ssa::ledger::ElisionReason::DeadUnusedTemporary,
                 },
-                BindingObservationJournalFailure::PlannedElidedValueRendered {
-                    value: ValueId(32) },
+                BindingObservationJournalFailure::PlannedElidedValueRendered { value: ValueId(32) },
             ),
             (
                 LegacyObservationJournalError::PlannedRefusedValueRendered {
                     value: ValueId(33),
-                    reason: ValueRefusal::MissingBindingCertificate {
-                        value: ValueId(33) },
+                    reason: ValueRefusal::MissingBindingCertificate { value: ValueId(33) },
                 },
                 BindingObservationJournalFailure::PlannedRefusedValueRendered {
                     value: ValueId(33),
@@ -3181,8 +3360,7 @@ mod tests {
             ),
             (
                 LegacyObservationJournalError::MissingPlannedValue(ValueId(34)),
-                BindingObservationJournalFailure::MissingPlannedValue {
-                    value: ValueId(34) },
+                BindingObservationJournalFailure::MissingPlannedValue { value: ValueId(34) },
             ),
             (
                 LegacyObservationJournalError::InvalidPlannedInline {
@@ -3234,8 +3412,7 @@ mod tests {
                 LegacyObservationJournalError::Markers(
                     RenderObservationStripError::DomainTooLarge { expected_count: 47 },
                 ),
-                BindingObservationJournalFailure::ObservationDomainTooLarge {
-                    expected_count: 47 },
+                BindingObservationJournalFailure::ObservationDomainTooLarge { expected_count: 47 },
             ),
             (
                 LegacyObservationJournalError::Markers(
@@ -3246,11 +3423,10 @@ mod tests {
                 },
             ),
             (
-                LegacyObservationJournalError::Markers(
-                    RenderObservationStripError::OutOfRange {
-                        id: marker,
-                        expected_count: 59,
-                    }),
+                LegacyObservationJournalError::Markers(RenderObservationStripError::OutOfRange {
+                    id: marker,
+                    expected_count: 59,
+                }),
                 BindingObservationJournalFailure::ObservationOutOfRange {
                     observation_id: 11,
                     expected_count: 59,
@@ -3260,8 +3436,7 @@ mod tests {
                 LegacyObservationJournalError::Markers(RenderObservationStripError::Duplicate {
                     id: marker,
                 }),
-                BindingObservationJournalFailure::DuplicateObservation {
-                    observation_id: 11 },
+                BindingObservationJournalFailure::DuplicateObservation { observation_id: 11 },
             ),
         ];
 
@@ -3463,10 +3638,7 @@ mod tests {
         let unchanged = ready.function_for_marker_test().clone();
         assert_eq!(
             journal.seal(&source, &mut ready),
-            Err(LegacyObservationJournalError::UnownedBindingSymbol {
-                value,
-                symbol
-            })
+            Err(LegacyObservationJournalError::UnownedBindingSymbol { value, symbol })
         );
         assert_eq!(ready.function_for_marker_test(), &unchanged);
     }
