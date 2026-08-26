@@ -935,16 +935,6 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                 // that way.
                 let deferred_before = self.deferred_merge_blocks.len();
                 if !merge_owned_by_ancestor
-                    && let Some(rewritten) = self.try_structure_if_else_with_slot_merge_returns(
-                        *cond_block,
-                        then_region,
-                        else_region.as_deref(),
-                        *merge_block,
-                    )?
-                {
-                    return Ok(rewritten);
-                }
-                if !merge_owned_by_ancestor
                     && let Some(rewritten) = self.try_structure_if_else_with_register_merge_returns(
                         *cond_block,
                         then_region,
@@ -3171,102 +3161,6 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         CStmt::Block(rewritten)
     }
 
-    fn try_structure_if_else_with_slot_merge_returns(
-        &mut self,
-        cond_block: u64,
-        then_region: &Region,
-        else_region: Option<&Region>,
-        merge_block: Option<u64>,
-    ) -> ControlFlowStructureResult<Option<CStmt>> {
-        let Some(merge_block) = merge_block else {
-            return Ok(None);
-        };
-        let Some(else_region) = else_region else {
-            return Ok(None);
-        };
-
-        let summaries = self
-            .fold_ctx
-            .frame_slot_merges_map()
-            .values()
-            .filter(|summary| summary.merge_block_addr == merge_block)
-            .collect::<Vec<_>>();
-        let [summary] = summaries.as_slice() else {
-            return Ok(None);
-        };
-
-        let then_pred = self.unique_region_predecessor_to_merge(then_region, merge_block);
-        let else_pred = self.unique_region_predecessor_to_merge(else_region, merge_block);
-        let then_can_rewrite = then_pred
-            .is_some_and(|pred| self.has_merged_slot_return_expr(then_region, pred, summary));
-        let else_can_rewrite = else_pred
-            .is_some_and(|pred| self.has_merged_slot_return_expr(else_region, pred, summary));
-        if !then_can_rewrite && !else_can_rewrite {
-            return Ok(None);
-        }
-
-        let control_proof_checkpoint = self.control_render_proofs.len();
-        let mut then_stmt = self.structure_region(then_region)?;
-        let mut else_stmt = self.structure_region(else_region)?;
-        let mut rewrote_any = false;
-
-        if then_can_rewrite
-            && let Some(pred) = then_pred
-            && let Some(rewritten) = self.append_merged_slot_return_if_needed(
-                then_stmt.clone(),
-                then_region,
-                pred,
-                summary,
-            )?
-        {
-            then_stmt = rewritten;
-            rewrote_any = true;
-        }
-        if else_can_rewrite
-            && let Some(pred) = else_pred
-            && let Some(rewritten) = self.append_merged_slot_return_if_needed(
-                else_stmt.clone(),
-                else_region,
-                pred,
-                summary,
-            )?
-        {
-            else_stmt = rewritten;
-            rewrote_any = true;
-        }
-        if !rewrote_any
-            || !Self::stmt_guarantees_termination(&then_stmt)
-            || !Self::stmt_guarantees_termination(&else_stmt)
-        {
-            self.control_render_proofs
-                .truncate(control_proof_checkpoint);
-            return Ok(None);
-        }
-
-        let (cond, predicate, condition_value) =
-            self.get_branch_condition_with_predicate(cond_block);
-        let Some(cond) = cond else {
-            return Ok(None);
-        };
-        let if_stmt = self.observe_control_ownership(
-            cond_block,
-            CStmt::If {
-            cond,
-            then_body: Box::new(then_stmt),
-            else_body: Some(Box::new(else_stmt)),
-        },
-        );
-        self.note_merge_block_rendered_by_duplication(merge_block);
-        self.record_branch_render_proof(cond_block, predicate, condition_value);
-        let mut prefix = self.structure_block_prefix_stmts(cond_block)?;
-        prefix.push(if_stmt);
-        Ok(Some(if prefix.len() == 1 {
-            prefix.into_iter().next().unwrap_or(CStmt::Empty)
-        } else {
-            CStmt::Block(prefix)
-        }))
-    }
-
     fn try_structure_if_else_with_register_merge_returns(
         &mut self,
         cond_block: u64,
@@ -3579,67 +3473,6 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         })
     }
 
-    fn append_merged_slot_return_if_needed(
-        &self,
-        stmt: CStmt,
-        _region: &Region,
-        pred_addr: u64,
-        summary: &crate::analysis::FrameSlotMergeSummary,
-    ) -> ControlFlowStructureResult<Option<CStmt>> {
-        let mut visited = std::collections::HashSet::new();
-        let expr = summary
-            .incoming
-            .get(&pred_addr)
-            .and_then(|value| self.fold_ctx.render_semantic_value(value, 0, &mut visited))
-            .or_else(|| {
-                self.fold_ctx
-                    .merged_return_candidate_for_block_slot(pred_addr, summary.slot_offset)
-            });
-        let Some(expr) = expr else {
-            return Ok(None);
-        };
-        // What reaches the merged slot is recorded as the SSA carrier that
-        // wrote it, `x8_8`, which is a version of a machine register and not a
-        // name the function declares. Whether that reads as a program name has
-        // been decided elsewhere: while the carrier was also emitted as its own
-        // statement, `x8_8 = len;`, the later single-use fold replaced the
-        // return with the value; once the carrier is inlined instead, the
-        // statement is gone and the return is left naming nothing. Resolving
-        // here says the value in both cases, which is what the assignment
-        // prepended just below has always done with the same expression.
-        let expr = self.fold_ctx.resolve_return_candidate(&expr);
-        let stmt = self.prepend_named_merged_slot_assignment_if_needed(stmt, summary, &expr)?;
-        if let Some(rewritten) = self.rewrite_trailing_return_with_merged_expr(&stmt, &expr) {
-            return Ok(Some(rewritten));
-        }
-        if Self::single_terminator_stmt(&stmt).is_some() {
-            return Ok(Some(stmt));
-        }
-        let mut stmts = Vec::new();
-        Self::append_stmt_body_flat(&mut stmts, stmt);
-        stmts.push(CStmt::Return(Some(
-            expr.clone_without_render_observations(),
-        )));
-        Ok(Some(if stmts.len() == 1 {
-            stmts.into_iter().next().unwrap_or(CStmt::Empty)
-        } else {
-            CStmt::Block(stmts)
-        }))
-    }
-
-    fn has_merged_slot_return_expr(
-        &self,
-        _region: &Region,
-        pred_addr: u64,
-        summary: &crate::analysis::FrameSlotMergeSummary,
-    ) -> bool {
-        summary.incoming.contains_key(&pred_addr)
-            || self
-                .fold_ctx
-                .merged_return_candidate_for_block_slot(pred_addr, summary.slot_offset)
-                .is_some()
-    }
-
     fn append_merged_register_return_if_needed(
         &self,
         stmt: CStmt,
@@ -3775,25 +3608,14 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         self.fold_ctx.observe_effect_stmt(&obligations, stmt)
     }
 
-    fn prepend_named_merged_slot_assignment_if_needed(
-        &self,
-        stmt: CStmt,
-        summary: &crate::analysis::FrameSlotMergeSummary,
-        expr: &CExpr,
-    ) -> ControlFlowStructureResult<CStmt> {
-        let _ = (stmt, summary.slot_offset, expr);
-        Err(OpLoweringRefusal::MissingProgramVariableAuthorization.into())
-    }
-
     fn rewrite_trailing_return_with_merged_expr(
         &self,
         stmt: &CStmt,
         merged: &CExpr,
     ) -> Option<CStmt> {
         match stmt {
-            // A proven frame-slot merge is authoritative for this region tail.
-            // Once structure has matched the if/else -> merge-slot -> return pattern,
-            // do not let an earlier synthesized return expression beat the merged value.
+            // A certified predecessor value is authoritative for this region tail.
+            // Do not let an earlier synthesized return expression beat it.
             CStmt::Return(Some(_current)) => Some(CStmt::Return(Some(
                 merged.clone_without_render_observations(),
             ))),
