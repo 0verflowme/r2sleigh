@@ -2,11 +2,9 @@
 //!
 //! This module generates readable C source code from the AST.
 
-use std::collections::{HashMap, HashSet};
-
 use crate::ast::{
-    BinaryOp, CExpr, CFunction, CLocal, CStmt, CType, UnaryOp, carry_outer_stmt_observations,
-    has_render_observations, stmt_has_render_observations,
+    BinaryOp, CExpr, CFunction, CStmt, CType, UnaryOp, has_render_observations,
+    stmt_has_render_observations,
 };
 use crate::observation_journal::ObservationSealAuthority;
 
@@ -117,11 +115,9 @@ impl EmissionReadyFunction {
 
 /// Run all AST rewrites required solely by textual C emission.
 pub(crate) fn prepare_function_for_emission(func: &CFunction) -> EmissionReadyFunction {
-    let (locals, body) = inline_local_declaration_initializers(func);
     EmissionReadyFunction {
         function: CFunction {
-            locals,
-            body: prepare_stmt_sequence_for_emission(&body),
+            body: prepare_stmt_sequence_for_emission(&func.body),
             ..func.clone()
         },
     }
@@ -703,389 +699,6 @@ fn generate(func: &CFunction) -> String {
     codegen.generate_function(&ready)
 }
 
-fn inline_local_declaration_initializers(func: &CFunction) -> (Vec<CLocal>, Vec<CStmt>) {
-    let local_types = func
-        .locals
-        .iter()
-        .map(|local| (local.name, local.ty.clone()))
-        .collect::<HashMap<_, _>>();
-    if local_types.is_empty() {
-        return (func.locals.clone(), func.body.clone());
-    }
-
-    let global_counts = count_vars_in_stmts(&func.body, &local_types);
-    let mut declared = HashSet::new();
-    let body = inline_decls_in_stmt_list(&func.body, &local_types, &global_counts, &mut declared);
-    let locals = func
-        .locals
-        .iter()
-        .filter(|local| !declared.contains(&local.name))
-        .cloned()
-        .collect();
-    (locals, body)
-}
-
-fn inline_decls_in_stmt_list(
-    stmts: &[CStmt],
-    local_types: &HashMap<crate::symbol::SymbolId, CType>,
-    global_counts: &HashMap<crate::symbol::SymbolId, usize>,
-    declared: &mut HashSet<crate::symbol::SymbolId>,
-) -> Vec<CStmt> {
-    let block_counts = count_vars_in_stmts(stmts, local_types);
-    stmts
-        .iter()
-        .map(|stmt| {
-            if let Some((name, init)) = assignment_decl_candidate(stmt)
-                && can_inline_decl(
-                    name,
-                    init,
-                    local_types,
-                    global_counts,
-                    &block_counts,
-                    declared,
-                )
-            {
-                declared.insert(name);
-                let replacement = carry_assignment_decl_observations(
-                    stmt,
-                    CStmt::Decl {
-                        ty: local_types[&name].clone(),
-                        name,
-                        init: Some(init.clone()),
-                    },
-                );
-                return carry_outer_stmt_observations(stmt, replacement);
-            }
-            inline_decls_in_stmt(stmt, local_types, global_counts, declared)
-        })
-        .collect()
-}
-
-fn inline_decls_in_stmt(
-    stmt: &CStmt,
-    local_types: &HashMap<crate::symbol::SymbolId, CType>,
-    global_counts: &HashMap<crate::symbol::SymbolId, usize>,
-    declared: &mut HashSet<crate::symbol::SymbolId>,
-) -> CStmt {
-    match stmt {
-        CStmt::Observed { id, stmt } => CStmt::observed(
-            *id,
-            inline_decls_in_stmt(stmt, local_types, global_counts, declared),
-        ),
-        CStmt::Block(stmts) => CStmt::Block(inline_decls_in_stmt_list(
-            stmts,
-            local_types,
-            global_counts,
-            declared,
-        )),
-        CStmt::If {
-            cond,
-            then_body,
-            else_body,
-        } => CStmt::If {
-            cond: cond.clone(),
-            then_body: Box::new(inline_decls_in_stmt(
-                then_body,
-                local_types,
-                global_counts,
-                declared,
-            )),
-            else_body: else_body.as_ref().map(|stmt| {
-                Box::new(inline_decls_in_stmt(
-                    stmt,
-                    local_types,
-                    global_counts,
-                    declared,
-                ))
-            }),
-        },
-        CStmt::While { cond, body } => CStmt::While {
-            cond: cond.clone(),
-            body: Box::new(inline_decls_in_stmt(
-                body,
-                local_types,
-                global_counts,
-                declared,
-            )),
-        },
-        CStmt::DoWhile { body, cond } => CStmt::DoWhile {
-            body: Box::new(inline_decls_in_stmt(
-                body,
-                local_types,
-                global_counts,
-                declared,
-            )),
-            cond: cond.clone(),
-        },
-        CStmt::For {
-            init,
-            cond,
-            update,
-            body,
-        } => {
-            let for_counts = count_vars_in_stmt(stmt, local_types);
-            let init = init.as_ref().map(|init| {
-                if let Some((name, init_expr)) = assignment_decl_candidate(init)
-                    && can_inline_decl(
-                        name,
-                        init_expr,
-                        local_types,
-                        global_counts,
-                        &for_counts,
-                        declared,
-                    )
-                {
-                    declared.insert(name);
-                    let replacement = carry_assignment_decl_observations(
-                        init,
-                        CStmt::Decl {
-                            ty: local_types[&name].clone(),
-                            name,
-                            init: Some(init_expr.clone()),
-                        },
-                    );
-                    Box::new(carry_outer_stmt_observations(init, replacement))
-                } else {
-                    Box::new(inline_decls_in_stmt(
-                        init,
-                        local_types,
-                        global_counts,
-                        declared,
-                    ))
-                }
-            });
-            CStmt::For {
-                init,
-                cond: cond.clone(),
-                update: update.clone(),
-                body: Box::new(inline_decls_in_stmt(
-                    body,
-                    local_types,
-                    global_counts,
-                    declared,
-                )),
-            }
-        }
-        CStmt::Switch {
-            expr,
-            cases,
-            default,
-        } => CStmt::Switch {
-            expr: expr.clone(),
-            cases: cases
-                .iter()
-                .map(|case| crate::ast::SwitchCase {
-                    value: case.value.clone(),
-                    body: inline_decls_in_stmt_list(
-                        &case.body,
-                        local_types,
-                        global_counts,
-                        declared,
-                    ),
-                })
-                .collect(),
-            default: default.as_ref().map(|stmts| {
-                inline_decls_in_stmt_list(stmts, local_types, global_counts, declared)
-            }),
-        },
-        other => other.clone(),
-    }
-}
-
-fn can_inline_decl(
-    name: crate::symbol::SymbolId,
-    init: &CExpr,
-    local_types: &HashMap<crate::symbol::SymbolId, CType>,
-    global_counts: &HashMap<crate::symbol::SymbolId, usize>,
-    scope_counts: &HashMap<crate::symbol::SymbolId, usize>,
-    declared: &HashSet<crate::symbol::SymbolId>,
-) -> bool {
-    local_types.contains_key(&name)
-        && !declared.contains(&name)
-        && !expr_reads_var(init, name)
-        && global_counts.get(&name).copied().unwrap_or(0)
-            == scope_counts.get(&name).copied().unwrap_or(0)
-}
-
-fn assignment_decl_candidate(stmt: &CStmt) -> Option<(crate::symbol::SymbolId, &CExpr)> {
-    let stmt = stmt.unobserved();
-    let CStmt::Expr(expr) = stmt else {
-        return None;
-    };
-    let CExpr::Binary {
-        op: BinaryOp::Assign,
-        left,
-        right,
-    } = expr.unobserved()
-    else {
-        return None;
-    };
-    let CExpr::Var(name) = left.unobserved() else {
-        return None;
-    };
-    Some((*name, right.as_ref()))
-}
-
-fn carry_assignment_decl_observations(source: &CStmt, mut replacement: CStmt) -> CStmt {
-    let CStmt::Expr(expr) = source.unobserved() else {
-        return replacement;
-    };
-    let mut ids = Vec::new();
-    let mut cursor = expr;
-    while let CExpr::Observed { id, expr } = cursor {
-        ids.push(*id);
-        cursor = expr.as_ref();
-    }
-    let CExpr::Binary {
-        op: BinaryOp::Assign,
-        left,
-        ..
-    } = cursor
-    else {
-        return replacement;
-    };
-    let mut left = left.as_ref();
-    while let CExpr::Observed { id, expr } = left {
-        ids.push(*id);
-        left = expr.as_ref();
-    }
-    for id in ids.into_iter().rev() {
-        replacement = CStmt::observed(id, replacement);
-    }
-    replacement
-}
-
-fn expr_reads_var(expr: &CExpr, name: crate::symbol::SymbolId) -> bool {
-    let mut found = false;
-    expr.visit(&mut |node| {
-        if matches!(node, CExpr::Var(candidate) if *candidate == name) {
-            found = true;
-        }
-    });
-    found
-}
-
-fn count_vars_in_stmts(
-    stmts: &[CStmt],
-    local_types: &HashMap<crate::symbol::SymbolId, CType>,
-) -> HashMap<crate::symbol::SymbolId, usize> {
-    let mut counts = HashMap::new();
-    for stmt in stmts {
-        count_vars_in_stmt_into(stmt, local_types, &mut counts);
-    }
-    counts
-}
-
-fn count_vars_in_stmt(
-    stmt: &CStmt,
-    local_types: &HashMap<crate::symbol::SymbolId, CType>,
-) -> HashMap<crate::symbol::SymbolId, usize> {
-    let mut counts = HashMap::new();
-    count_vars_in_stmt_into(stmt, local_types, &mut counts);
-    counts
-}
-
-fn count_vars_in_stmt_into(
-    stmt: &CStmt,
-    local_types: &HashMap<crate::symbol::SymbolId, CType>,
-    counts: &mut HashMap<crate::symbol::SymbolId, usize>,
-) {
-    let stmt = stmt.unobserved();
-    match stmt {
-        CStmt::StructuredRegion { stmt, .. } => {
-            count_vars_in_stmt_into(stmt, local_types, counts);
-        }
-        CStmt::Expr(expr) | CStmt::Return(Some(expr)) => {
-            count_vars_in_expr_into(expr, local_types, counts);
-        }
-        CStmt::Decl { name, init, .. } => {
-            if local_types.contains_key(name) {
-                *counts.entry(name.clone()).or_insert(0) += 1;
-            }
-            if let Some(init) = init {
-                count_vars_in_expr_into(init, local_types, counts);
-            }
-        }
-        CStmt::Block(stmts) => {
-            for stmt in stmts {
-                count_vars_in_stmt_into(stmt, local_types, counts);
-            }
-        }
-        CStmt::If {
-            cond,
-            then_body,
-            else_body,
-        } => {
-            count_vars_in_expr_into(cond, local_types, counts);
-            count_vars_in_stmt_into(then_body, local_types, counts);
-            if let Some(else_body) = else_body {
-                count_vars_in_stmt_into(else_body, local_types, counts);
-            }
-        }
-        CStmt::While { cond, body } | CStmt::DoWhile { body, cond } => {
-            count_vars_in_expr_into(cond, local_types, counts);
-            count_vars_in_stmt_into(body, local_types, counts);
-        }
-        CStmt::For {
-            init,
-            cond,
-            update,
-            body,
-        } => {
-            if let Some(init) = init {
-                count_vars_in_stmt_into(init, local_types, counts);
-            }
-            if let Some(cond) = cond {
-                count_vars_in_expr_into(cond, local_types, counts);
-            }
-            if let Some(update) = update {
-                count_vars_in_expr_into(update, local_types, counts);
-            }
-            count_vars_in_stmt_into(body, local_types, counts);
-        }
-        CStmt::Switch {
-            expr,
-            cases,
-            default,
-        } => {
-            count_vars_in_expr_into(expr, local_types, counts);
-            for case in cases {
-                count_vars_in_expr_into(&case.value, local_types, counts);
-                for stmt in &case.body {
-                    count_vars_in_stmt_into(stmt, local_types, counts);
-                }
-            }
-            if let Some(default) = default {
-                for stmt in default {
-                    count_vars_in_stmt_into(stmt, local_types, counts);
-                }
-            }
-        }
-        CStmt::Return(None)
-        | CStmt::Empty
-        | CStmt::Break
-        | CStmt::Continue
-        | CStmt::Goto(_)
-        | CStmt::Label(_)
-        | CStmt::Comment(_) => {}
-        CStmt::Observed { .. } => unreachable!("unobserved statement expected"),
-    }
-}
-
-fn count_vars_in_expr_into(
-    expr: &CExpr,
-    local_types: &HashMap<crate::symbol::SymbolId, CType>,
-    counts: &mut HashMap<crate::symbol::SymbolId, usize>,
-) {
-    expr.visit(&mut |node| {
-        if let CExpr::Var(name) = node
-            && local_types.contains_key(name)
-        {
-            *counts.entry(*name).or_insert(0) += 1;
-        }
-    });
-}
-
 fn prepare_stmt_sequence_for_emission(stmts: &[CStmt]) -> Vec<CStmt> {
     let nested = stmts
         .iter()
@@ -1107,10 +720,9 @@ fn prepare_stmt_sequence_for_emission(stmts: &[CStmt]) -> Vec<CStmt> {
 
 fn prepare_stmt_for_emission(stmt: &CStmt) -> CStmt {
     match stmt {
-        CStmt::StructuredRegion { marker, stmt } => CStmt::structured_region(
-            *marker,
-            prepare_stmt_for_emission(stmt.as_ref()),
-        ),
+        CStmt::StructuredRegion { marker, stmt } => {
+            CStmt::structured_region(*marker, prepare_stmt_for_emission(stmt.as_ref()))
+        }
         CStmt::Observed { id, stmt } => {
             CStmt::observed(*id, prepare_stmt_for_emission(stmt.as_ref()))
         }
@@ -1490,60 +1102,9 @@ mod tests {
     }
 
     #[test]
-    fn observation_wrappers_follow_exact_codegen_occurrences() {
+    fn coalesced_updates_drop_observations_without_exact_occurrences() {
         let symbols = test_table();
         let value = crate::symbol::declare(&symbols, "value");
-        let local = CLocal {
-            ty: CType::i32(),
-            name: value,
-            stack_offset: None,
-        };
-        let assignment = CStmt::Expr(CExpr::assign(CExpr::var(value), CExpr::int(1)));
-        let plain = CFunction {
-            name: "inline_decl".to_string(),
-            ret_type: CType::Void,
-            params: vec![],
-            locals: vec![local.clone()],
-            body: vec![assignment.clone()],
-            params_known: true,
-            symbols: std::rc::Rc::new(symbols),
-        };
-        let (plain_locals, plain_body) = inline_local_declaration_initializers(&plain);
-
-        let mut owner = crate::ast::RenderObservationOwner::new();
-        let (lhs_id, lhs) = owner
-            .observe_expr(CExpr::var(value))
-            .expect("allocate lhs observation");
-        let (rhs_id, rhs) = owner
-            .observe_expr(CExpr::int(1))
-            .expect("allocate rhs observation");
-        let (assignment_id, assignment) = owner
-            .observe_expr(CExpr::assign(lhs, rhs))
-            .expect("allocate assignment observation");
-        let (stmt_id, stmt) = owner
-            .observe_stmt(CStmt::Expr(assignment))
-            .expect("allocate statement observation");
-        let observed = CFunction {
-            body: vec![stmt],
-            ..plain.clone()
-        };
-        let (observed_locals, observed_body) = inline_local_declaration_initializers(&observed);
-        let mut transformed = CFunction {
-            locals: observed_locals,
-            body: observed_body,
-            ..observed
-        };
-        let reachable =
-            crate::ast::strip_render_observations(&mut transformed, owner.expected_count())
-                .expect("declaration inlining preserved a valid observation domain");
-
-        assert_eq!(transformed.locals, plain_locals);
-        assert_eq!(transformed.body, plain_body);
-        assert_eq!(
-            reachable.ids().collect::<Vec<_>>(),
-            vec![lhs_id, rhs_id, assignment_id, stmt_id]
-        );
-
         let update = |amount| {
             CStmt::Expr(CExpr::assign(
                 CExpr::var(value),
@@ -1584,74 +1145,6 @@ mod tests {
                 "a coalesced update has no exact source occurrence for marker {id:?}"
             );
         }
-    }
-
-    #[test]
-    fn for_init_declaration_inlining_preserves_every_assignment_observation() {
-        let symbols = test_table();
-        let value = crate::symbol::declare(&symbols, "value");
-        let local = CLocal {
-            ty: CType::i32(),
-            name: value,
-            stack_offset: None,
-        };
-        let plain = CFunction {
-            name: "inline_for_init".to_string(),
-            ret_type: CType::Void,
-            params: vec![],
-            locals: vec![local],
-            body: vec![CStmt::For {
-                init: Some(Box::new(CStmt::Expr(CExpr::assign(
-                    CExpr::var(value),
-                    CExpr::int(0),
-                )))),
-                cond: None,
-                update: None,
-                body: Box::new(CStmt::Empty),
-            }],
-            params_known: true,
-            symbols: std::rc::Rc::new(symbols),
-        };
-        let (plain_locals, plain_body) = inline_local_declaration_initializers(&plain);
-
-        let mut owner = crate::ast::RenderObservationOwner::new();
-        let (lhs_id, lhs) = owner
-            .observe_expr(CExpr::var(value))
-            .expect("allocate lhs observation");
-        let (rhs_id, rhs) = owner
-            .observe_expr(CExpr::int(0))
-            .expect("allocate rhs observation");
-        let (assignment_id, assignment) = owner
-            .observe_expr(CExpr::assign(lhs, rhs))
-            .expect("allocate assignment observation");
-        let (stmt_id, init) = owner
-            .observe_stmt(CStmt::Expr(assignment))
-            .expect("allocate init statement observation");
-        let observed = CFunction {
-            body: vec![CStmt::For {
-                init: Some(Box::new(init)),
-                cond: None,
-                update: None,
-                body: Box::new(CStmt::Empty),
-            }],
-            ..plain.clone()
-        };
-        let (locals, body) = inline_local_declaration_initializers(&observed);
-        let mut transformed = CFunction {
-            locals,
-            body,
-            ..observed
-        };
-        let reachable =
-            crate::ast::strip_render_observations(&mut transformed, owner.expected_count())
-                .expect("for-init declaration inlining preserved a valid observation domain");
-
-        assert_eq!(transformed.locals, plain_locals);
-        assert_eq!(transformed.body, plain_body);
-        assert_eq!(
-            reachable.ids().collect::<Vec<_>>(),
-            vec![lhs_id, rhs_id, assignment_id, stmt_id]
-        );
     }
 
     #[test]
@@ -1833,8 +1326,9 @@ mod tests {
     }
 
     #[test]
-    fn test_function_with_locals() {
+    fn emission_preserves_placement_owned_local_declarations() {
         let symbols = test_table();
+        let x = crate::symbol::declare(&symbols, "x");
         let func = CFunction {
             name: "test".to_string(),
             ret_type: CType::Void,
@@ -1842,7 +1336,7 @@ mod tests {
             locals: vec![
                 CLocal {
                     ty: CType::i32(),
-                    name: crate::symbol::declare(&symbols, "x"),
+                    name: x,
                     stack_offset: Some(-8),
                 },
                 CLocal {
@@ -1851,7 +1345,10 @@ mod tests {
                     stack_offset: Some(-16),
                 },
             ],
-            body: vec![CStmt::Return(None)],
+            body: vec![
+                CStmt::expr(CExpr::assign(CExpr::var(x), CExpr::int(1))),
+                CStmt::Return(None),
+            ],
             params_known: true,
             symbols: std::rc::Rc::new(symbols),
         };
@@ -1859,6 +1356,8 @@ mod tests {
         let code = generate(&func);
         assert!(code.contains("int32_t x;"));
         assert!(code.contains("int8_t* p;"));
+        assert!(code.contains("x = 1;"));
+        assert!(!code.contains("int32_t x = 1;"));
     }
 
     #[test]
