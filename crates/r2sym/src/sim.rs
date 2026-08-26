@@ -171,7 +171,7 @@ enum CallConvRegisters {
     /// Exact ABI identity retained from one prepared artifact.
     SourceOwned {
         argument_storages: Vec<CanonicalStorageId>,
-        result_storage: CanonicalStorageId,
+        result_storage: Option<CanonicalStorageId>,
         register_storages_by_name: BTreeMap<String, CanonicalStorageId>,
     },
 }
@@ -261,13 +261,14 @@ impl CallConv {
             .enumerate()
             .map(|(index, slot)| (slot.index() as usize == index).then_some(slot.storage()))
             .collect::<Option<Vec<_>>>()?;
-        let [result_slot] = abi.return_registers() else {
-            return None;
+        let result_storage = match abi.return_registers() {
+            [] => None,
+            [result_slot] => Some(result_slot.storage()),
+            _ => return None,
         };
-        let result_storage = result_slot.storage();
         if argument_storages
             .iter()
-            .chain(std::iter::once(&result_storage))
+            .chain(result_storage.iter())
             .any(|storage| {
                 storage.space != CanonicalStorageSpace::Register
                     || storage.size == 0
@@ -293,7 +294,9 @@ impl CallConv {
         {
             return None;
         }
-        let ret_bits = result_storage.size.checked_mul(8)?;
+        let ret_bits = result_storage
+            .map(|storage| storage.size.checked_mul(8))
+            .unwrap_or(Some(address_bits))?;
 
         Some(Self {
             registers: CallConvRegisters::SourceOwned {
@@ -410,11 +413,13 @@ impl CallConv {
                 register_storages_by_name,
                 ..
             } => {
-                let mut keys =
-                    source_state_keys(state, register_storages_by_name, *result_storage);
+                let Some(result_storage) = *result_storage else {
+                    return;
+                };
+                let mut keys = source_state_keys(state, register_storages_by_name, result_storage);
                 if keys.is_empty()
                     && let Some(name) =
-                        source_presentation_name(register_storages_by_name, *result_storage)
+                        source_presentation_name(register_storages_by_name, result_storage)
                 {
                     keys.insert(format!("{}_0", name.to_ascii_uppercase()));
                 }
@@ -472,7 +477,8 @@ impl CallConv {
                 result_storage,
                 register_storages_by_name,
                 ..
-            } => source_presentation_name(register_storages_by_name, *result_storage),
+            } => result_storage
+                .and_then(|storage| source_presentation_name(register_storages_by_name, storage)),
         }
     }
 
@@ -485,7 +491,8 @@ impl CallConv {
                 result_storage,
                 register_storages_by_name,
                 ..
-            } => source_state_key(state, register_storages_by_name, *result_storage)
+            } => result_storage
+                .and_then(|storage| source_state_key(state, register_storages_by_name, storage))
                 .map(|key| state.get_register_sized(&key, self.ret_bits))
                 .unwrap_or_else(|| SymValue::unknown(self.ret_bits)),
         }
@@ -494,7 +501,7 @@ impl CallConv {
     pub(crate) fn result_storage(&self) -> Option<CanonicalStorageId> {
         match &self.registers {
             CallConvRegisters::AdvisoryNames { .. } => None,
-            CallConvRegisters::SourceOwned { result_storage, .. } => Some(*result_storage),
+            CallConvRegisters::SourceOwned { result_storage, .. } => *result_storage,
         }
     }
 
@@ -4031,7 +4038,7 @@ mod tests {
         let callconv = CallConv {
             registers: CallConvRegisters::SourceOwned {
                 argument_storages: vec![argument],
-                result_storage: result,
+                result_storage: Some(result),
                 register_storages_by_name: BTreeMap::new(),
             },
             arg_bits: 64,
@@ -4062,11 +4069,11 @@ mod tests {
                     offset: 0x00,
                     size: 8,
                 }],
-                result_storage: CanonicalStorageId {
+                result_storage: Some(CanonicalStorageId {
                     space: CanonicalStorageSpace::Register,
                     offset: 0x08,
                     size: 8,
-                },
+                }),
                 register_storages_by_name: BTreeMap::new(),
             },
             arg_bits: 64,
