@@ -31,7 +31,9 @@ pub(crate) struct LegacyBindingId(pub(crate) u32);
 /// What the legacy value analysis claimed for one dense `ValueId`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LegacyValueObservation {
-    Bound { binding: LegacyBindingId },
+    Bound {
+        binding: LegacyBindingId,
+    },
     InlineConstant,
     /// A surviving expression that is not a source-backed literal proof.
     InlineNonLiteral,
@@ -158,7 +160,6 @@ impl LegacyAnalysisSnapshot {
             .filter(|cell| cell.site == site)
             .map(|cell| cell.observation)
     }
-
 }
 
 /// Typed pointer to the canonical evidence used for a classification.

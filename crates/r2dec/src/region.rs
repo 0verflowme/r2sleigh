@@ -8,9 +8,9 @@
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
-use r2ssa::{CFGEdge, SSAFunction, SsaExecutionStopReason, SsaWorkControl, domtree::DomTree};
 #[cfg(test)]
 use r2ssa::SSAOp;
+use r2ssa::{CFGEdge, SSAFunction, SsaExecutionStopReason, SsaWorkControl, domtree::DomTree};
 
 /// A control flow region.
 #[derive(Debug, Clone)]
@@ -1983,11 +1983,7 @@ impl WorkingGraph {
             }
         }
 
-        let loop_region = self.make_loop_region(
-            analyzer,
-            loop_info,
-            &internal_nodes,
-        );
+        let loop_region = self.make_loop_region(analyzer, loop_info, &internal_nodes);
         let mut collapsed_blocks = BTreeSet::new();
         for node_id in &internal_nodes {
             if !analyzer.poll() {

@@ -18,9 +18,9 @@ use crate::op::SSAOp;
 use crate::semantic::CallSiteId;
 pub use r2source::{
     CanonicalStorageId, CanonicalStorageSpace, SOURCE_CALL_SITE_INTERFACE_SCHEMA_VERSION,
-    SOURCE_FUNCTION_INTERFACE_SCHEMA_VERSION, SOURCE_TYPE_GRAPH_SCHEMA_VERSION,
-    SourceAbiClass, SourceAbiParameterSpec, SourceAggregateLayout, SourceAggregateMember,
-    SourceCallArgumentSpec, SourceCallResult, SourceCallSiteIdentity, SourceCallSiteInterface,
+    SOURCE_FUNCTION_INTERFACE_SCHEMA_VERSION, SOURCE_TYPE_GRAPH_SCHEMA_VERSION, SourceAbiClass,
+    SourceAbiParameterSpec, SourceAggregateLayout, SourceAggregateMember, SourceCallArgumentSpec,
+    SourceCallResult, SourceCallSiteIdentity, SourceCallSiteInterface,
     SourceCallSiteInterfaceError, SourceCarrierKind, SourceCarrierProjection,
     SourceConventionSlots, SourceFunctionInterface, SourceFunctionInterfaceError,
     SourceFunctionReturn, SourceLogicalValue, SourceMachineRoles, SourceStackAllocationContract,
@@ -1895,8 +1895,14 @@ mod tests {
         let system_v = context("amd64");
         let microsoft_synonym = context("windows-x64");
 
-        assert_eq!(microsoft.convention_slots().unwrap().calling_convention(), "ms");
-        assert_eq!(microsoft.effective_abi_class(), SourceAbiClass::MicrosoftX64);
+        assert_eq!(
+            microsoft.convention_slots().unwrap().calling_convention(),
+            "ms"
+        );
+        assert_eq!(
+            microsoft.effective_abi_class(),
+            SourceAbiClass::MicrosoftX64
+        );
         assert_eq!(system_v.effective_abi_class(), SourceAbiClass::SystemVAMD64);
         assert_eq!(
             microsoft_synonym.effective_abi_class(),

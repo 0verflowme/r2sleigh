@@ -106,8 +106,7 @@ pub(super) fn project_machine_use(
     };
     let target_width = conversion.to_width_bits();
     let source_width = slice.width_bits();
-    if c_bitvector_width_is_supported(source_width)
-        || c_bitvector_width_is_supported(target_width)
+    if c_bitvector_width_is_supported(source_width) || c_bitvector_width_is_supported(target_width)
     {
         // A width-changing wide conversion needs its own source-owned semantic
         // contract (especially for signed extension). The prelude currently
@@ -167,9 +166,7 @@ pub(super) fn project_machine_write(
                 return Ok((
                     lhs,
                     bitvector_helper(
-                        format!(
-                            "r2sleigh_bits_zero_extend_{from_width_bits}_{to_width_bits}"
-                        ),
+                        format!("r2sleigh_bits_zero_extend_{from_width_bits}_{to_width_bits}"),
                         vec![rhs],
                     ),
                 ));
@@ -208,14 +205,8 @@ pub(super) fn project_machine_write(
                 return Ok((
                     lhs,
                     bitvector_helper(
-                        format!(
-                            "r2sleigh_bits_insert_{carrier_width_bits}_{width_bits}"
-                        ),
-                        vec![
-                            preserved,
-                            rhs,
-                            CExpr::UIntLit(u64::from(bit_offset)),
-                        ],
+                        format!("r2sleigh_bits_insert_{carrier_width_bits}_{width_bits}"),
+                        vec![preserved, rhs, CExpr::UIntLit(u64::from(bit_offset))],
                     ),
                 ));
             }
@@ -265,10 +256,7 @@ pub(super) fn project_machine_write(
             };
             Ok((
                 lhs,
-                CExpr::cast(
-                    carrier,
-                    CExpr::binary(BinaryOp::BitOr, preserved, inserted),
-                ),
+                CExpr::cast(carrier, CExpr::binary(BinaryOp::BitOr, preserved, inserted)),
             ))
         }
     }
@@ -292,8 +280,9 @@ mod tests {
     fn full_write_does_not_invent_a_conversion() {
         let lhs = binding_expr();
         let rhs = CExpr::UIntLit(7);
-        let projected = project_machine_write(lhs.clone(), rhs.clone(), MachineWriteProjection::Full)
-            .expect("full write");
+        let projected =
+            project_machine_write(lhs.clone(), rhs.clone(), MachineWriteProjection::Full)
+                .expect("full write");
         assert!(projected.0.transparently_eq(&lhs));
         assert!(projected.1.transparently_eq(&rhs));
     }
@@ -354,7 +343,10 @@ mod tests {
         else {
             panic!("insert must mask the old carrier");
         };
-        let CExpr::Cast { expr: old_value, .. } = *preserved_carrier else {
+        let CExpr::Cast {
+            expr: old_value, ..
+        } = *preserved_carrier
+        else {
             panic!("insert must read the old carrier at carrier width");
         };
         assert!(old_value.transparently_eq(&lhs));

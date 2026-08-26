@@ -11,8 +11,7 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use r2ssa::{
-    BlockTerminator, CallArgObservation, SSAOp, SourceAbiClass, SsaArtifact,
-    observe_call_arguments,
+    BlockTerminator, CallArgObservation, SSAOp, SourceAbiClass, SsaArtifact, observe_call_arguments,
 };
 use z3::Context;
 
@@ -3380,10 +3379,7 @@ mod tests {
                             .into_iter()
                             .enumerate()
                             .map(|(index, offset)| {
-                                r2ssa::SourceCallArgumentSpec::new(
-                                    index as u32,
-                                    storage(offset),
-                                )
+                                r2ssa::SourceCallArgumentSpec::new(index as u32, storage(offset))
                             }),
                         false,
                         false,

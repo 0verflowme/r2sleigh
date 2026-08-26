@@ -3,9 +3,7 @@ use std::fs::OpenOptions;
 use std::io::Write;
 
 use r2il::ArchSpec;
-use r2ssa::{
-    CanonicalStorageId, ObjectKind, SSAVar, SourceAbiClass, SsaArtifact,
-};
+use r2ssa::{CanonicalStorageId, ObjectKind, SSAVar, SourceAbiClass, SsaArtifact};
 
 use crate::PathExplorer;
 use crate::executor::{CallHookResult, CallHookTag};
@@ -518,10 +516,7 @@ pub fn seed_memory_regions_for_arch<'ctx>(
 }
 
 /// Seed memory regions using only canonical prepared-machine facts.
-pub fn seed_memory_regions_for_prepared<'ctx>(
-    state: &mut SymState<'ctx>,
-    prepared: &SsaArtifact,
-) {
+pub fn seed_memory_regions_for_prepared<'ctx>(state: &mut SymState<'ctx>, prepared: &SsaArtifact) {
     let stack_value = exact_stack_value(prepared);
     let stack_pointer_is_projectable = prepared
         .machine_context()
@@ -950,9 +945,7 @@ mod tests {
         let mut state = SymState::new(&ctx, prepared.entry);
 
         assert!(super::seed_scope_state_for_prepared(
-            &mut state,
-            &prepared,
-            &scope,
+            &mut state, &prepared, &scope,
         ));
         assert!(state.get_register("RCX_0").is_symbolic());
         assert!(state.get_register("RDX_0").is_symbolic());

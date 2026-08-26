@@ -43,13 +43,9 @@ pub(crate) fn drop_values_from_void_returns(func: &mut CFunction) {
 
 fn drop_void_return_value(stmt: CStmt) -> CStmt {
     match stmt {
-        CStmt::Observed { id, stmt } => {
-            CStmt::observed(id, drop_void_return_value(*stmt))
-        }
+        CStmt::Observed { id, stmt } => CStmt::observed(id, drop_void_return_value(*stmt)),
         CStmt::Return(Some(_)) => CStmt::Return(None),
-        CStmt::Block(body) => {
-            CStmt::Block(body.into_iter().map(drop_void_return_value).collect())
-        }
+        CStmt::Block(body) => CStmt::Block(body.into_iter().map(drop_void_return_value).collect()),
         CStmt::If {
             cond,
             then_body,
@@ -91,8 +87,7 @@ fn drop_void_return_value(stmt: CStmt) -> CStmt {
                     ..case
                 })
                 .collect(),
-            default: default
-                .map(|body| body.into_iter().map(drop_void_return_value).collect()),
+            default: default.map(|body| body.into_iter().map(drop_void_return_value).collect()),
         },
         other => other,
     }
@@ -137,9 +132,9 @@ fn collect_goto_targets(stmt: &CStmt, out: &mut std::collections::BTreeSet<Strin
                 collect_goto_targets(body, out);
             }
         }
-        CStmt::While { body, .. }
-        | CStmt::DoWhile { body, .. }
-        | CStmt::For { body, .. } => collect_goto_targets(body, out),
+        CStmt::While { body, .. } | CStmt::DoWhile { body, .. } | CStmt::For { body, .. } => {
+            collect_goto_targets(body, out)
+        }
         CStmt::Switch { cases, default, .. } => {
             for case in cases {
                 for inner in &case.body {
@@ -161,8 +156,9 @@ fn drop_labels_outside(
     targeted: &std::collections::BTreeSet<String>,
 ) -> Option<CStmt> {
     match stmt {
-        CStmt::Observed { id, stmt } => drop_labels_outside(*stmt, targeted)
-            .map(|stmt| CStmt::observed(id, stmt)),
+        CStmt::Observed { id, stmt } => {
+            drop_labels_outside(*stmt, targeted).map(|stmt| CStmt::observed(id, stmt))
+        }
         CStmt::Label(name) if !targeted.contains(&name) => None,
         CStmt::Block(body) => Some(CStmt::Block(
             body.into_iter()
@@ -175,9 +171,7 @@ fn drop_labels_outside(
             else_body,
         } => Some(CStmt::If {
             cond,
-            then_body: Box::new(
-                drop_labels_outside(*then_body, targeted).unwrap_or(CStmt::Empty),
-            ),
+            then_body: Box::new(drop_labels_outside(*then_body, targeted).unwrap_or(CStmt::Empty)),
             else_body: else_body
                 .map(|body| Box::new(drop_labels_outside(*body, targeted).unwrap_or(CStmt::Empty))),
         }),

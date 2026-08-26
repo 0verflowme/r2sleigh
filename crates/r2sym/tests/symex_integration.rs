@@ -1107,8 +1107,8 @@ fn test_query_compiles_bounded_indexed_memory_range() {
             op_metadata: Default::default(),
         },
     ];
-    let func = SsaArtifact::for_symbolic_with_interface(&blocks, Some(&arch), interface)
-        .expect("ssa");
+    let func =
+        SsaArtifact::for_symbolic_with_interface(&blocks, Some(&arch), interface).expect("ssa");
     let ctx = Context::thread_local();
 
     let mut state = SymState::new(&ctx, 0x1000);

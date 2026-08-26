@@ -47,10 +47,16 @@ fn production_has_no_legacy_name_identity_or_repair_answerers() {
     files.sort();
 
     let forbidden = [
-        ("find_ssa_name_for_rendered_alias", "rendered-alias reverse lookup"),
+        (
+            "find_ssa_name_for_rendered_alias",
+            "rendered-alias reverse lookup",
+        ),
         ("resolve_undeclared_carriers", "undeclared-carrier repair"),
         ("resolve_stack_var", "stack spelling identity lookup"),
-        ("build_param_register_aliases", "positional parameter aliasing"),
+        (
+            "build_param_register_aliases",
+            "positional parameter aliasing",
+        ),
         ("NameSource for", "parallel naming owner"),
         (".note_ssa_name(", "SSA-name side-table write"),
         ("fn note_ssa_name(", "SSA-name side-table owner"),
@@ -86,10 +92,7 @@ fn production_has_no_legacy_name_identity_or_repair_answerers() {
                     continue;
                 }
                 if trimmed.contains(token) {
-                    violations.push(format!(
-                        "{rel}:{} [{reason}] {trimmed}",
-                        line_idx + 1
-                    ));
+                    violations.push(format!("{rel}:{} [{reason}] {trimmed}", line_idx + 1));
                 }
             }
         }

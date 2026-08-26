@@ -65,9 +65,10 @@ impl<'a> FoldingContext<'a> {
     fn normalized_output_projection(
         &self,
         site: crate::normalize::NormalizedOpSite,
-    ) -> Result<crate::normalize::NormalizedOutputProjection, crate::observation_journal::LegacyObservationJournalError,
-    >
-    {
+    ) -> Result<
+        crate::normalize::NormalizedOutputProjection,
+        crate::observation_journal::LegacyObservationJournalError,
+    > {
         let prepared = self.inputs.prepared_ssa.ok_or(
             crate::observation_journal::LegacyObservationJournalError::MissingNormalizedSiteContext,
         )?;
@@ -125,7 +126,9 @@ impl<'a> FoldingContext<'a> {
                 ),
             ),
             Err(_) => Err(
-                crate::observation_journal::LegacyObservationJournalError::InvalidWrite(output.inst),
+                crate::observation_journal::LegacyObservationJournalError::InvalidWrite(
+                    output.inst,
+                ),
             ),
         }
     }
@@ -320,8 +323,9 @@ impl<'a> FoldingContext<'a> {
             );
         };
         let first_disposition = match names.require_use(first_site) {
-            Ok(disposition @ (r2ssa::MachineUseDisposition::Exact(_)
-            | r2ssa::MachineUseDisposition::MemoryAddress(_)),
+            Ok(
+                disposition @ (r2ssa::MachineUseDisposition::Exact(_)
+                | r2ssa::MachineUseDisposition::MemoryAddress(_)),
             ) => *disposition,
             Ok(r2ssa::MachineUseDisposition::Refused(_)) => {
                 unreachable!("require_use cannot return a refused disposition")
@@ -422,9 +426,7 @@ impl<'a> FoldingContext<'a> {
                 ),
             ),
             r2ssa::MachineUseDisposition::Refused(_) => {
-                unreachable!(
-                "the refused source use returned before projection"
-            )
+                unreachable!("the refused source use returned before projection")
             }
         }
     }
@@ -527,7 +529,11 @@ impl<'a> FoldingContext<'a> {
         )?;
         let value = self.normalized_output_projection(site)?.value;
         let Some(names) = self.inputs.binding_names else {
-            return Err(crate::observation_journal::LegacyObservationJournalError::MissingPlannedValue(value));
+            return Err(
+                crate::observation_journal::LegacyObservationJournalError::MissingPlannedValue(
+                    value,
+                ),
+            );
         };
         match names.require_value(value) {
             Ok(crate::binding_plan::PlannedValueSymbol::Bound(symbol)) => {
@@ -580,11 +586,7 @@ impl<'a> FoldingContext<'a> {
                     return expr;
                 }
             };
-            self.observe_optional_normalized_input_uses_expr(
-                frame.normalized_site,
-                input_idx,
-                expr,
-            )
+            self.observe_optional_normalized_input_uses_expr(frame.normalized_site, input_idx, expr)
         } else {
             expr
         }
@@ -609,11 +611,7 @@ impl<'a> FoldingContext<'a> {
                 return fallback;
             }
         };
-        self.observe_optional_normalized_input_uses_expr(
-            frame.normalized_site,
-            input_idx,
-            expr,
-        )
+        self.observe_optional_normalized_input_uses_expr(frame.normalized_site, input_idx, expr)
     }
 
     pub(super) fn lowered_from_stmt(stmt: CStmt) -> LoweredOp {
@@ -678,11 +676,7 @@ impl<'a> FoldingContext<'a> {
             }
             Self::indirect_callable_expr(planned)
         };
-        Ok(self.observe_optional_normalized_input_uses_expr(
-            frame.normalized_site,
-            0,
-            target,
-        ))
+        Ok(self.observe_optional_normalized_input_uses_expr(frame.normalized_site, 0, target))
     }
 
     pub(super) fn lower_op(
@@ -705,8 +699,7 @@ impl<'a> FoldingContext<'a> {
                                     OpLoweringRefusal::MissingMachineProjectionAuthorization,
                                 );
                             };
-                            let (cert, _) =
-                                self.admitted_callsite(source_block, source_op_idx)?;
+                            let (cert, _) = self.admitted_callsite(source_block, source_op_idx)?;
                             let func_expr =
                                 self.certified_call_target_expr(frame, target, cert, true)?;
                             let certified_args =
@@ -716,12 +709,14 @@ impl<'a> FoldingContext<'a> {
                                 func_expr,
                                 certified_args.args.clone(),
                             );
-                            return self.finish_lowering_transaction(self.lower_certified_statement_call(
-                                source_block,
-                                source_op_idx,
-                                call,
-                                certified_args,
-                            ));
+                            return self.finish_lowering_transaction(
+                                self.lower_certified_statement_call(
+                                    source_block,
+                                    source_op_idx,
+                                    call,
+                                    certified_args,
+                                ),
+                            );
                         }
                         SSAOp::CallInd { target } => {
                             let Some((source_block, source_op_idx)) = frame.source_call_site else {
@@ -729,8 +724,7 @@ impl<'a> FoldingContext<'a> {
                                     OpLoweringRefusal::MissingMachineProjectionAuthorization,
                                 );
                             };
-                            let (cert, _) =
-                                self.admitted_callsite(source_block, source_op_idx)?;
+                            let (cert, _) = self.admitted_callsite(source_block, source_op_idx)?;
                             let func_expr =
                                 self.certified_call_target_expr(frame, target, cert, false)?;
                             let certified_args =
@@ -740,12 +734,14 @@ impl<'a> FoldingContext<'a> {
                                 func_expr,
                                 certified_args.args.clone(),
                             );
-                            return self.finish_lowering_transaction(self.lower_certified_statement_call(
-                                source_block,
-                                source_op_idx,
-                                call,
-                                certified_args,
-                            ));
+                            return self.finish_lowering_transaction(
+                                self.lower_certified_statement_call(
+                                    source_block,
+                                    source_op_idx,
+                                    call,
+                                    certified_args,
+                                ),
+                            );
                         }
                         _ => {}
                     }
@@ -838,8 +834,8 @@ mod typed_output_contract_tests {
         assert!(!operation_requires_final_write_projection(&SSAOp::Call {
             target: input.clone(),
         }));
-        assert!(!operation_requires_final_write_projection(&SSAOp::CallInd {
-            target: input,
-        }));
+        assert!(!operation_requires_final_write_projection(
+            &SSAOp::CallInd { target: input }
+        ));
     }
 }

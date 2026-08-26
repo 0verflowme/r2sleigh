@@ -666,7 +666,6 @@ impl UseInfo {
         }
         self.condition_values.contains(&value)
     }
-
 }
 
 impl StackInfo {}

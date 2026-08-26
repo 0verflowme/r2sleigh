@@ -99,5 +99,4 @@ impl SymExecutionControl {
     pub fn poll(&self) -> Result<(), SymExecutionStopReason> {
         self.stop_reason().map_or(Ok(()), Err)
     }
-
 }

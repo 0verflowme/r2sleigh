@@ -3242,7 +3242,10 @@ mod sccp_tests {
         let removed_phi = merge
             .phis
             .iter_mut()
-            .find(|phi| phi.canonical_storage.is_some_and(|storage| storage.offset == 0))
+            .find(|phi| {
+                phi.canonical_storage
+                    .is_some_and(|storage| storage.offset == 0)
+            })
             .expect("first register phi");
         let shared_source = removed_phi.sources[0].1.clone();
         for (_, source) in &mut removed_phi.sources {

@@ -17,9 +17,9 @@
 
 use std::collections::BTreeSet;
 
+use crate::CanonicalStorageId;
 use crate::function::SSAFunction;
 use crate::graph::{SsaGraph, ValueId};
-use crate::CanonicalStorageId;
 
 /// The values a function hands back to its caller.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -104,10 +104,9 @@ impl FunctionLiveOut {
                     continue;
                 }
                 let overwritten = block.ops.iter().any(|op| {
-                    op.dst()
-                        .is_some_and(|dst| {
-                            graph.canonical_storage_for_var(dst) == Some(return_storage)
-                        })
+                    op.dst().is_some_and(|dst| {
+                        graph.canonical_storage_for_var(dst) == Some(return_storage)
+                    })
                 });
                 if overwritten {
                     continue;
@@ -162,8 +161,8 @@ pub fn is_read(graph: &SsaGraph, live_out: &FunctionLiveOut, value: ValueId) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::function::SSAFunction;
     use crate::CanonicalStorageSpace;
+    use crate::function::SSAFunction;
     use r2il::{ArchSpec, R2ILBlock, R2ILOp, RegisterDef, SpaceId, Varnode};
 
     fn reg(offset: u64, size: u32) -> Varnode {
@@ -244,7 +243,11 @@ mod tests {
         let graph = SsaGraph::from_function(&func);
         let live = FunctionLiveOut::compute(&func, &graph, &x86_64_return_storages());
 
-        assert_eq!(live.len(), 1, "the return register value should be live out");
+        assert_eq!(
+            live.len(),
+            1,
+            "the return register value should be live out"
+        );
         let value = live.iter().next().expect("one live value");
         // This is the case the use list alone gets wrong.
         assert!(graph.use_sites(value).is_empty());
@@ -261,8 +264,7 @@ mod tests {
             }],
             ..R2ILBlock::default()
         };
-        let func =
-            SSAFunction::from_blocks_with_arch(&[block], Some(&x86_64_arch())).expect("ssa");
+        let func = SSAFunction::from_blocks_with_arch(&[block], Some(&x86_64_arch())).expect("ssa");
         let graph = SsaGraph::from_function(&func);
 
         let live = FunctionLiveOut::compute(&func, &graph, &x86_64_return_storages());
@@ -292,8 +294,7 @@ mod tests {
             ],
             ..R2ILBlock::default()
         };
-        let func =
-            SSAFunction::from_blocks_with_arch(&[block], Some(&x86_64_arch())).expect("ssa");
+        let func = SSAFunction::from_blocks_with_arch(&[block], Some(&x86_64_arch())).expect("ssa");
         let graph = SsaGraph::from_function(&func);
         let live = FunctionLiveOut::compute(&func, &graph, &x86_64_return_storages());
 

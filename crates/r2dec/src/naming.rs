@@ -10,8 +10,8 @@
 //! The precedence lives in `spell_var` and nowhere else. What differs between
 //! layers is the tables they can see, so that is what `NameSource` carries.
 
-use crate::analysis::utils::ssa_render_base_name;
 use crate::analysis::utils::parse_const_value;
+use crate::analysis::utils::ssa_render_base_name;
 use r2ssa::SSAVar;
 
 /// The tables a layer can consult when spelling a value.

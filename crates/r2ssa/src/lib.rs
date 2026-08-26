@@ -24,8 +24,8 @@ pub mod block;
 pub mod cfg;
 pub mod control;
 pub mod data_ref;
-pub mod defuse;
 pub mod deadphi;
+pub mod defuse;
 pub mod domtree;
 pub mod execution;
 pub mod fingerprint;
@@ -33,18 +33,18 @@ pub mod function;
 pub mod graph;
 pub mod indirect;
 pub mod integrity;
-pub mod proven;
 pub mod interproc;
 pub mod ledger;
 pub mod liveout;
 pub mod machine;
 pub mod machine_context;
-mod naming;
 pub mod mirror;
+mod naming;
 pub mod obligation;
 pub mod op;
 pub mod optimize;
 pub mod phi;
+pub mod proven;
 pub mod recover_interface;
 pub mod rename;
 pub mod semantic;
@@ -90,9 +90,7 @@ pub use function::{
 pub use graph::{
     BlockId, GraphBlock, GraphInst, GraphValue, InstId, InstPayload, SsaGraph, UseSite, ValueId,
 };
-pub use integrity::{
-    ScalarWidthRule, SsaIntegrityError, SsaValueSite, validate_ssa_function,
-};
+pub use integrity::{ScalarWidthRule, SsaIntegrityError, SsaValueSite, validate_ssa_function};
 pub use interproc::{
     CallArgObservation, FunctionSemanticLinkage, FunctionSemanticSummary, InterprocFunctionId,
     InterprocFunctionInput, InterprocSolveConfig, InterprocSummaryDiagnostics, InterprocSummarySet,
@@ -107,27 +105,26 @@ pub use interproc::{
 pub use machine::{
     MachineAddressProvenance, MachineAddressSpace, MachineArithmeticFlagOp, MachineArithmeticMode,
     MachineArithmeticOp, MachineBitVector, MachineBitwiseOp, MachineBooleanOp, MachineBuildError,
-    MachineCastKind, MachineComparisonOp, MachineEntity, MachineExpr, MachineExprArena,
-    MachineExprId, MachineExprKind, MachineFunction, MachineOvershiftBehavior, MachineProjection,
-    MachineProjectionFailure, MachineShiftKind, MachineSignedness, MachineStackBase, MachineType,
-    MachineDirectValueGeometry, MachineRegisterValueGeometry, MachineUseConversion,
-    MachineUseDisposition, MachineUseRefusal, MachineUseSlice, MachineValueBinding,
-    MachineValueGeometryDisposition, MachineValueGeometryRefusal, MachineValueUse,
-    MachineWriteDisposition, MachineWriteProjection, MachineWriteRefusal,
-    MachineZeroDivisorBehavior, machine_address_provenance,
+    MachineCastKind, MachineComparisonOp, MachineDirectValueGeometry, MachineEntity, MachineExpr,
+    MachineExprArena, MachineExprId, MachineExprKind, MachineFunction, MachineOvershiftBehavior,
+    MachineProjection, MachineProjectionFailure, MachineRegisterValueGeometry, MachineShiftKind,
+    MachineSignedness, MachineStackBase, MachineType, MachineUseConversion, MachineUseDisposition,
+    MachineUseRefusal, MachineUseSlice, MachineValueBinding, MachineValueGeometryDisposition,
+    MachineValueGeometryRefusal, MachineValueUse, MachineWriteDisposition, MachineWriteProjection,
+    MachineWriteRefusal, MachineZeroDivisorBehavior, machine_address_provenance,
 };
 pub use machine_context::{
     MACHINE_CONTEXT_SCHEMA_VERSION, MachineAbiModel, MachineAbiRegisterSlot,
     MachineArchitectureFamily, MachineMemoryEndianness, MachineMemoryModel, MachineMemorySpace,
-    MachineRegisterGeometryState,
-    SOURCE_CALL_SITE_INTERFACE_SCHEMA_VERSION, SOURCE_FUNCTION_INTERFACE_SCHEMA_VERSION,
-    SOURCE_TYPE_GRAPH_SCHEMA_VERSION, SourceAbiClass, SourceAbiParameterSpec, SourceAggregateLayout,
-    SourceAggregateMember, SourceCallArgumentSpec, SourceCallResult, SourceCallSiteIdentity,
-    SourceCallSiteInterface, SourceCallSiteInterfaceError, SourceCarrierKind,
-    SourceCarrierProjection, SourceFunctionInterface, SourceFunctionInterfaceError,
-    SourceFunctionReturn, SourceLogicalValue, SourceMachineContext, SourceStackAllocationContract,
-    SourceStackGrowth, SourceStackSlotRole, SourceStackSlotSpec, SourceType, SourceTypeGraph,
-    SourceTypeGraphError, SourceTypeKind,
+    MachineRegisterGeometryState, SOURCE_CALL_SITE_INTERFACE_SCHEMA_VERSION,
+    SOURCE_FUNCTION_INTERFACE_SCHEMA_VERSION, SOURCE_TYPE_GRAPH_SCHEMA_VERSION, SourceAbiClass,
+    SourceAbiParameterSpec, SourceAggregateLayout, SourceAggregateMember, SourceCallArgumentSpec,
+    SourceCallResult, SourceCallSiteIdentity, SourceCallSiteInterface,
+    SourceCallSiteInterfaceError, SourceCarrierKind, SourceCarrierProjection,
+    SourceFunctionInterface, SourceFunctionInterfaceError, SourceFunctionReturn,
+    SourceLogicalValue, SourceMachineContext, SourceStackAllocationContract, SourceStackGrowth,
+    SourceStackSlotRole, SourceStackSlotSpec, SourceType, SourceTypeGraph, SourceTypeGraphError,
+    SourceTypeKind,
 };
 pub use obligation::{
     CanonicalInstructionId, CanonicalInstructionSite, ObligationCoverageReport,
@@ -149,15 +146,14 @@ pub use semantic::{
     CallSiteFact, CallSiteFacts, CallSiteId, CallsiteCertificate, CompareKind, CompareProvenance,
     ControlDomain, ControlDomainFacts, ControlDomainId, ControlGuard, GlobalObjectKey,
     IfRegionCertificate, LoopCarrierEdgeValue, LoopCarrierFact, LoopCarrierMemberFact,
-    LoopCarrierMemberRole, LoopCarrierUpdateFact, LoopCertificate, LoopId,
-    MemoryAccessCertificate, MemoryDefFact, MemoryLocation,
-    MemoryObjectKey, MemoryPhiFact, MemorySSAFacts, MemoryUseFact, MemoryVersion, ObjectFact,
-    ObjectId, ObjectKind, ObjectModel, ObjectSpaceId, ParameterObjectKey, PredicateFact,
-    PredicateFacts, PredicateId, PreparedAssumptionBinding, PreparedAssumptionBindingKind,
-    PreparedFunctionCertificates, PreparedFunctionFacts, PreparedProofFailure, ProofNodeId,
-    RelativeMemoryAddress, ReturnCarrier, ReturnValueCertificate,
-    SOURCE_RETURN_REGISTER_COMPOSITION_SCHEMA_VERSION, SemanticId, SourceBoundaryFacts,
-    SourceCallArgumentFact, SourceCallArgumentValue, SourceCallBoundaryFact,
+    LoopCarrierMemberRole, LoopCarrierUpdateFact, LoopCertificate, LoopId, MemoryAccessCertificate,
+    MemoryDefFact, MemoryLocation, MemoryObjectKey, MemoryPhiFact, MemorySSAFacts, MemoryUseFact,
+    MemoryVersion, ObjectFact, ObjectId, ObjectKind, ObjectModel, ObjectSpaceId,
+    ParameterObjectKey, PredicateFact, PredicateFacts, PredicateId, PreparedAssumptionBinding,
+    PreparedAssumptionBindingKind, PreparedFunctionCertificates, PreparedFunctionFacts,
+    PreparedProofFailure, ProofNodeId, RelativeMemoryAddress, ReturnCarrier,
+    ReturnValueCertificate, SOURCE_RETURN_REGISTER_COMPOSITION_SCHEMA_VERSION, SemanticId,
+    SourceBoundaryFacts, SourceCallArgumentFact, SourceCallArgumentValue, SourceCallBoundaryFact,
     SourceFormalParameterFact, SourceReturnAddressFact, SourceReturnBoundaryFact,
     SourceReturnRegisterCompositionFact, SourceReturnRegisterDefinitionFact,
     SourceReturnRegisterOverlayFact, SourceReturnStackPointerFact, StackObjectKey,

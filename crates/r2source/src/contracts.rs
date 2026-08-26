@@ -132,11 +132,10 @@ impl SourceAbiClass {
         match normalized.as_str() {
             "" | "unknown" | "unspecified" | "default" | "none" => Self::Unknown,
             "ms" | "msvc" | "microsoft" => Self::Microsoft,
-            "ms64" | "msx64" | "win64" | "windowsx64" | "microsoftx64"
-            | "x64windows" | "amd64windows" => Self::MicrosoftX64,
+            "ms64" | "msx64" | "win64" | "windowsx64" | "microsoftx64" | "x64windows"
+            | "amd64windows" => Self::MicrosoftX64,
             "sysv" | "systemv" => Self::SystemV,
-            "amd64" | "sysv64" | "sysvamd64" | "systemvamd64" | "amd64sysv"
-            | "x8664sysv" => {
+            "amd64" | "sysv64" | "sysvamd64" | "systemvamd64" | "amd64sysv" | "x8664sysv" => {
                 Self::SystemVAMD64
             }
             "aapcs" => Self::Aapcs,
@@ -1853,8 +1852,8 @@ mod tests {
     #[test]
     fn abi_class_preserves_renamed_other_spellings_as_presentation_only() {
         let first = SourceConventionSlots::new("vendor-abi-a", [], None).expect("first slots");
-        let renamed = SourceConventionSlots::new("renamed-vendor-abi", [], None)
-            .expect("renamed slots");
+        let renamed =
+            SourceConventionSlots::new("renamed-vendor-abi", [], None).expect("renamed slots");
 
         assert_eq!(first.abi_class(), SourceAbiClass::Other);
         assert_eq!(renamed.abi_class(), SourceAbiClass::Other);
@@ -1877,7 +1876,10 @@ mod tests {
             .abi_class(),
             SourceAbiClass::Unknown
         );
-        assert_eq!(test_call_site("default").abi_class(), SourceAbiClass::Unknown);
+        assert_eq!(
+            test_call_site("default").abi_class(),
+            SourceAbiClass::Unknown
+        );
         assert_eq!(
             SourceAbiClass::from_source_spelling("amd64"),
             SourceAbiClass::SystemVAMD64,

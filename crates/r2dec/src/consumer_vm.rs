@@ -315,17 +315,17 @@ mod tests {
         ] {
             arch.add_register(RegisterDef::new(name, offset, size));
         }
-        let projection = |written: RegisterStorage,
-                          carrier: RegisterStorage,
-                          size_bits: u64| RegisterProjection {
-            written,
-            disposition: RegisterProjectionDisposition::Bound {
-                carrier,
-                slice: RegisterBitSlice {
-                    lsb_bit_offset: 0,
-                    size_bits,
+        let projection = |written: RegisterStorage, carrier: RegisterStorage, size_bits: u64| {
+            RegisterProjection {
+                written,
+                disposition: RegisterProjectionDisposition::Bound {
+                    carrier,
+                    slice: RegisterBitSlice {
+                        lsb_bit_offset: 0,
+                        size_bits,
+                    },
                 },
-            },
+            }
         };
         arch.register_projections = vec![
             projection(

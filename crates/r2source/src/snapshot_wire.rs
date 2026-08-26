@@ -51,7 +51,10 @@ pub enum SnapshotWireError {
     /// A tag names a case this schema does not define; `record` says which record it came from.
     UnknownDiscriminant { record: &'static str, tag: u64 },
     /// The bytes decoded but the contract refused them; `contract` names the constructor that said no and `reason` says what it objected to.
-    RejectedContract { contract: &'static str, reason: String },
+    RejectedContract {
+        contract: &'static str,
+        reason: String,
+    },
 }
 
 impl std::fmt::Display for SnapshotWireError {
@@ -342,8 +345,8 @@ impl<'a> SnapshotWireReader<'a> {
 // ---------------------------------------------------------------------------
 
 use crate::contracts::{
-    CanonicalStorageId, CanonicalStorageSpace, SourceAbiParameterSpec, SourceAggregateLayout,
-    SourceAbiClass, SourceAggregateMember, SourceCallArgumentSpec, SourceCallResult,
+    CanonicalStorageId, CanonicalStorageSpace, SourceAbiClass, SourceAbiParameterSpec,
+    SourceAggregateLayout, SourceAggregateMember, SourceCallArgumentSpec, SourceCallResult,
     SourceCarrierKind, SourceCarrierProjection, SourceConventionSlots, SourceFunctionInterface,
     SourceFunctionReturn, SourceLogicalValue, SourceMachineRoles, SourceReturnMechanism,
     SourceStackAllocationContract, SourceStackGrowth, SourceStackSlotRole, SourceStackSlotSpec,
@@ -1711,20 +1714,20 @@ pub fn read_interface(
             })?;
     }
     if let Some(storage) = stack_pointer_storage {
-        interface = interface.with_stack_pointer_storage(storage).map_err(|error| {
-            SnapshotWireError::RejectedContract {
+        interface = interface
+            .with_stack_pointer_storage(storage)
+            .map_err(|error| SnapshotWireError::RejectedContract {
                 contract: "SourceFunctionInterface::with_stack_pointer_storage",
                 reason: format!("{error:?}"),
-            }
-        })?;
+            })?;
     }
     if let Some(storage) = frame_pointer_storage {
-        interface = interface.with_frame_pointer_storage(storage).map_err(|error| {
-            SnapshotWireError::RejectedContract {
+        interface = interface
+            .with_frame_pointer_storage(storage)
+            .map_err(|error| SnapshotWireError::RejectedContract {
                 contract: "SourceFunctionInterface::with_frame_pointer_storage",
                 reason: format!("{error:?}"),
-            }
-        })?;
+            })?;
     }
     if let Some(SourceReturnMechanism::Stacked {
         stack_offset,
@@ -2013,7 +2016,10 @@ mod tests {
             panic!("a type graph the constructor refuses must be refused here too");
         };
         assert_eq!(contract, "SourceTypeGraph::new");
-        assert!(!reason.is_empty(), "a refusal has to say what it objected to");
+        assert!(
+            !reason.is_empty(),
+            "a refusal has to say what it objected to"
+        );
     }
 
     #[test]

@@ -298,10 +298,8 @@ fn assert_aarch64_opaque_vector_userop_feeds_exact_wide_uses(
     instructions: &[u8],
     expected_userop: u32,
 ) {
-    let (artifact, projection, _) = genuine_projection_allowing_residuals(
-        TrustedSleighProfile::Aarch64Le,
-        instructions,
-    );
+    let (artifact, projection, _) =
+        genuine_projection_allowing_residuals(TrustedSleighProfile::Aarch64Le, instructions);
     let graph = artifact.graph();
     let callother = graph
         .insts
@@ -328,7 +326,10 @@ fn assert_aarch64_opaque_vector_userop_feeds_exact_wide_uses(
         .uses_of
         .get(output.0 as usize)
         .expect("dense uses for userop output");
-    assert!(!uses.is_empty(), "test block must consume the userop result");
+    assert!(
+        !uses.is_empty(),
+        "test block must consume the userop result"
+    );
     assert!(uses.iter().all(|site| {
         matches!(
             projection.use_disposition(*site),
