@@ -6,14 +6,15 @@
 //! dominator tree, fails closed when the derivation does not complete, and
 //! carries the reason it holds so a reader can check it.
 
-use crate::function::{SSABlock, SSAFunction};
 use crate::cfg::{BlockTerminator, CFG};
+use crate::function::{SSABlock, SSAFunction, SsaArtifact};
+use crate::graph::SsaGraph;
 
 use crate::indirect::{
-    PointerTable, ResolvedIndirectCall, definitions, resolve_constant, resolve_indirect_calls,
+    PointerTable, ResolvedIndirectCall, exact_input, resolve_constant, resolve_indirect_calls,
 };
-use crate::SSAOp;
-use std::collections::HashMap;
+use crate::{SSAOp, SSAVar};
+use std::collections::BTreeMap;
 
 /// A block no execution can enter.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -44,7 +45,7 @@ impl ProvenFacts {
 /// it is the same evaluator -- hardware builds a condition out of flags and
 /// copies, and only following all of that reaches the comparison underneath.
 fn decided_condition(
-    defs: &HashMap<String, (&SSAOp, u64)>,
+    defs: &BTreeMap<SSAVar, &SSAOp>,
     blocks: &[SSABlock],
     block_addr: u64,
 ) -> Option<bool> {
@@ -52,7 +53,34 @@ fn decided_condition(
     let SSAOp::CBranch { cond, .. } = block.ops.last()? else {
         return None;
     };
-    resolve_constant(defs, cond, 0).map(|value| value != 0)
+    resolve_var_constant(defs, cond, 0).map(|value| value != 0)
+}
+
+fn resolve_var_constant(
+    defs: &BTreeMap<SSAVar, &SSAOp>,
+    var: &SSAVar,
+    depth: usize,
+) -> Option<u64> {
+    if let Some(bits) = var.constant_bits() {
+        return Some(bits);
+    }
+    if depth >= 32 {
+        return None;
+    }
+    let op = defs.get(var)?;
+    let fold = |input| resolve_var_constant(defs, input, depth + 1);
+    match op {
+        SSAOp::Copy { src, .. } => fold(src),
+        SSAOp::BoolNot { src, .. } => Some(u64::from(fold(src)? == 0)),
+        SSAOp::IntEqual { a, b, .. } => Some(u64::from(fold(a)? == fold(b)?)),
+        SSAOp::IntNotEqual { a, b, .. } => Some(u64::from(fold(a)? != fold(b)?)),
+        SSAOp::IntLess { a, b, .. } => Some(u64::from(fold(a)? < fold(b)?)),
+        SSAOp::IntLessEqual { a, b, .. } => Some(u64::from(fold(a)? <= fold(b)?)),
+        SSAOp::BoolAnd { a, b, .. } => Some(u64::from(fold(a)? != 0 && fold(b)? != 0)),
+        SSAOp::BoolOr { a, b, .. } => Some(u64::from(fold(a)? != 0 || fold(b)? != 0)),
+        SSAOp::BoolXor { a, b, .. } => Some(u64::from((fold(a)? != 0) != (fold(b)? != 0))),
+        _ => None,
+    }
 }
 
 /// Blocks that no execution reaches.
@@ -63,21 +91,62 @@ fn decided_condition(
 /// block reached only through a path we failed to lift, say -- is left alone,
 /// because marking live code dead is the worst error this can make.
 pub fn unreachable_blocks(blocks: &[SSABlock], cfg: &CFG) -> Vec<UnreachableBlock> {
+    let defs = blocks
+        .iter()
+        .flat_map(|block| block.ops.iter())
+        .filter_map(|op| op.dst().cloned().map(|dst| (dst, op)))
+        .collect::<BTreeMap<_, _>>();
+    unreachable_blocks_with_decisions(cfg, |addr| decided_condition(&defs, blocks, addr))
+}
+
+fn decided_condition_in_graph(
+    function: &SSAFunction,
+    graph: &SsaGraph,
+    block_addr: u64,
+) -> Option<bool> {
+    let block = function.get_block(block_addr)?;
+    let (op_idx, SSAOp::CBranch { cond, .. }) = block.ops.iter().enumerate().next_back()? else {
+        return None;
+    };
+    let inst = graph
+        .inst_id_for_op_site(block_addr, op_idx)
+        .and_then(|inst| graph.inst(inst))?;
+    let condition = exact_input(graph, inst, 1)?;
+    if graph.value_id_for_var(cond) != Some(condition) {
+        return None;
+    }
+    resolve_constant(graph, condition, 0).map(|value| value != 0)
+}
+
+fn unreachable_blocks_in_graph(function: &SSAFunction, graph: &SsaGraph) -> Vec<UnreachableBlock> {
+    unreachable_blocks_with_decisions(function.cfg(), |addr| {
+        decided_condition_in_graph(function, graph, addr)
+    })
+}
+
+fn unreachable_blocks_with_decisions(
+    cfg: &CFG,
+    mut decided_condition: impl FnMut(u64) -> Option<bool>,
+) -> Vec<UnreachableBlock> {
     let Some(entry) = cfg.entry_block().map(|block| block.addr) else {
         return Vec::new();
     };
     // Walk forward from the entry, refusing to follow an edge a decided
     // condition proves is never taken. What the walk misses is unreachable.
-    let defs = definitions(blocks);
-    let mut reached = std::collections::HashSet::new();
+    let mut reached = std::collections::BTreeSet::new();
     let mut queue = vec![entry];
     reached.insert(entry);
     while let Some(addr) = queue.pop() {
-        let decided = decided_condition(&defs, blocks, addr);
+        let decided = decided_condition(addr);
         let terminator = cfg.get_block(addr).map(|block| block.terminator.clone());
         for successor in cfg.successors(addr) {
-            if let (Some(taken), Some(BlockTerminator::ConditionalBranch { true_target, false_target })) =
-                (decided, terminator.as_ref())
+            if let (
+                Some(taken),
+                Some(BlockTerminator::ConditionalBranch {
+                    true_target,
+                    false_target,
+                }),
+            ) = (decided, terminator.as_ref())
             {
                 let never = if taken { *false_target } else { *true_target };
                 // Only skip the dead edge when the two edges are distinct: a
@@ -91,7 +160,7 @@ pub fn unreachable_blocks(blocks: &[SSABlock], cfg: &CFG) -> Vec<UnreachableBloc
             }
         }
     }
-    let mut unreachable: Vec<_> = cfg
+    let mut unreachable = cfg
         .block_addrs()
         .filter(|addr| !reached.contains(addr))
         .map(|addr| UnreachableBlock {
@@ -103,17 +172,16 @@ pub fn unreachable_blocks(blocks: &[SSABlock], cfg: &CFG) -> Vec<UnreachableBloc
                     .to_string()
             },
         })
-        .collect();
+        .collect::<Vec<_>>();
     unreachable.sort_by_key(|block| block.addr);
     unreachable
 }
 
 /// Gather every fact the function proves.
-pub fn prove<T: PointerTable>(function: &SSAFunction, tables: &[T]) -> ProvenFacts {
-    let blocks = function.blocks().cloned().collect::<Vec<_>>();
+pub fn prove<T: PointerTable>(artifact: &SsaArtifact, tables: &[T]) -> ProvenFacts {
     ProvenFacts {
-        indirect_calls: resolve_indirect_calls(blocks.as_slice(), function.cfg(), function.domtree(), tables),
-        unreachable_blocks: unreachable_blocks(blocks.as_slice(), function.cfg()),
+        indirect_calls: resolve_indirect_calls(artifact, tables),
+        unreachable_blocks: unreachable_blocks_in_graph(artifact.function(), artifact.graph()),
     }
 }
 
@@ -145,7 +213,12 @@ mod tests {
             cond: cond.clone(),
         });
         let blocks = vec![
-            SSABlock { addr: 0, phis: Vec::new(), size: 0x10, ops },
+            SSABlock {
+                addr: 0,
+                phis: Vec::new(),
+                size: 0x10,
+                ops,
+            },
             SSABlock {
                 addr: 0x10,
                 phis: Vec::new(),
@@ -164,7 +237,10 @@ mod tests {
             let mut basic = BasicBlock::new(block.addr);
             basic.size = block.size;
             basic.terminator = if block.addr == 0 {
-                BlockTerminator::ConditionalBranch { true_target: 0x20, false_target: 0x10 }
+                BlockTerminator::ConditionalBranch {
+                    true_target: 0x20,
+                    false_target: 0x10,
+                }
             } else {
                 BlockTerminator::Return
             };
@@ -217,8 +293,14 @@ mod tests {
                         a: SSAVar::constant(3, 4),
                         b: SSAVar::constant(1, 4),
                     },
-                    SSAOp::Copy { dst: carried.clone(), src: flag.clone() },
-                    SSAOp::BoolNot { dst: negated.clone(), src: carried.clone() },
+                    SSAOp::Copy {
+                        dst: carried.clone(),
+                        src: flag.clone(),
+                    },
+                    SSAOp::BoolNot {
+                        dst: negated.clone(),
+                        src: carried.clone(),
+                    },
                     SSAOp::CBranch {
                         target: SSAVar::constant(0x20, 8),
                         cond: negated.clone(),
@@ -243,7 +325,10 @@ mod tests {
             let mut basic = BasicBlock::new(block.addr);
             basic.size = block.size;
             basic.terminator = if block.addr == 0 {
-                BlockTerminator::ConditionalBranch { true_target: 0x20, false_target: 0x10 }
+                BlockTerminator::ConditionalBranch {
+                    true_target: 0x20,
+                    false_target: 0x10,
+                }
             } else {
                 BlockTerminator::Return
             };

@@ -12,8 +12,8 @@ use r2il::{ArchSpec, MemoryOrdering, SpaceId};
 use serde::{Deserialize, Serialize};
 
 use crate::abi::AbiProfile;
-use crate::function::{SSAFunction, SsaArtifact};
-use crate::graph::{InstPayload, ValueId};
+use crate::function::SsaArtifact;
+use crate::graph::{InstPayload, UseSite, ValueId};
 use crate::op::SSAOp;
 use crate::semantic::ObjectKind;
 use crate::{CallSiteId, SSAVar};
@@ -611,8 +611,18 @@ pub struct PreparedInterprocFunctionInput<'a> {
     pub prepared: &'a Arc<SsaArtifact>,
 }
 
-fn formal_arg_index_for_var(abi: &AbiProfile, var: &SSAVar) -> Option<usize> {
-    abi.formal_argument_index(var)
+fn formal_arg_index_for_var(prepared: &SsaArtifact, var: &SSAVar) -> Option<usize> {
+    let value = prepared.graph().value_id_for_var(var)?;
+    prepared
+        .facts()
+        .boundaries
+        .parameters
+        .iter()
+        .find_map(|(index, parameter)| {
+            (parameter.value == value)
+                .then(|| usize::try_from(*index).ok())
+                .flatten()
+        })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1804,7 +1814,6 @@ fn collect_local_summary_facts_with_obligation_authority(
                 SSAOp::Return { target } => {
                     out.return_observations.push(classify_return_target(
                         prepared,
-                        function,
                         abi,
                         block.addr,
                         op_idx,
@@ -1941,7 +1950,7 @@ fn classify_memory_access_location_value(
 
     for candidate in &candidates {
         if let Some(var) = prepared.value_var(*candidate)
-            && let Some(idx) = formal_arg_index_for_var(abi, var)
+            && let Some(idx) = formal_arg_index_for_var(prepared, var)
         {
             return arg_location(idx, Some(0), Some(width));
         }
@@ -1960,9 +1969,7 @@ fn classify_memory_access_location_value(
                 expression.terms.is_empty().then_some(width),
             );
         }
-        if let Some(var) = prepared.value_var(*candidate)
-            && let Some(address) = parse_const_name(&var.name)
-        {
+        if let Some(address) = exact_constant_value(prepared, *candidate) {
             return global_location(address, Some(0), Some(width));
         }
 
@@ -2123,9 +2130,7 @@ fn summary_const_value(
 ) -> Option<u64> {
     match classify_value_operand(prepared, abi, value_id, depth) {
         SummaryOperand::Const(value) => Some(value),
-        _ => prepared
-            .value_var(canonical_root_value(prepared, value_id))
-            .and_then(|var| parse_const_name(&var.name)),
+        _ => exact_constant_value(prepared, canonical_root_value(prepared, value_id)),
     }
 }
 
@@ -2143,17 +2148,15 @@ fn collect_call_arg_state_with_iteration_limit(
     let entry_state = tracked
         .iter()
         .map(|carrier| {
-            let value = match carrier {
-                CallCarrierKey::Storage(storage) => prepared
-                    .machine_context()
-                    .abi_model()
-                    .argument_registers()
-                    .iter()
-                    .find(|slot| slot.storage() == *storage)
-                    .map(|slot| CallCarrierState::EntryArg(slot.index() as usize))
-                    .unwrap_or(CallCarrierState::Unknown),
-                CallCarrierKey::LegacyArg(index) => CallCarrierState::EntryArg(*index),
-            };
+            let CallCarrierKey::Storage(storage) = carrier;
+            let value = prepared
+                .machine_context()
+                .abi_model()
+                .argument_registers()
+                .iter()
+                .find(|slot| slot.storage() == *storage)
+                .map(|slot| CallCarrierState::EntryArg(slot.index() as usize))
+                .unwrap_or(CallCarrierState::Unknown);
             (*carrier, value)
         })
         .collect::<BTreeMap<_, _>>();
@@ -2267,16 +2270,13 @@ enum CallCarrierState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum CallCarrierKey {
     Storage(crate::CanonicalStorageId),
-    LegacyArg(usize),
 }
 
 type CallCarrierMap = BTreeMap<CallCarrierKey, CallCarrierState>;
 
 fn tracked_call_carriers(prepared: &SsaArtifact, abi: &AbiProfile) -> BTreeSet<CallCarrierKey> {
     if !abi.is_source_owned() {
-        return (0..abi.argument_count())
-            .map(CallCarrierKey::LegacyArg)
-            .collect();
+        return BTreeSet::new();
     }
     prepared
         .machine_context()
@@ -2307,7 +2307,7 @@ fn storages_overlap(left: crate::CanonicalStorageId, right: crate::CanonicalStor
 
 fn update_call_carrier_state(
     prepared: &SsaArtifact,
-    abi: &AbiProfile,
+    _abi: &AbiProfile,
     state: &mut CallCarrierMap,
     var: &SSAVar,
 ) {
@@ -2318,9 +2318,6 @@ fn update_call_carrier_state(
         .graph()
         .value(value_id)
         .and_then(|value| value.canonical_storage);
-    let legacy_arg = (!abi.is_source_owned())
-        .then(|| abi.argument_index(&var.name))
-        .flatten();
     for (carrier, value) in state.iter_mut() {
         match *carrier {
             CallCarrierKey::Storage(carrier) => {
@@ -2330,10 +2327,6 @@ fn update_call_carrier_state(
                     *value = CallCarrierState::Unknown;
                 }
             }
-            CallCarrierKey::LegacyArg(index) if legacy_arg == Some(index) => {
-                *value = CallCarrierState::Value(value_id);
-            }
-            CallCarrierKey::LegacyArg(_) => {}
         }
     }
 }
@@ -2345,11 +2338,7 @@ fn call_argument_carriers(
 ) -> Option<Vec<CallCarrierKey>> {
     let machine = prepared.machine_context();
     if !abi.is_source_owned() {
-        return Some(
-            (0..abi.argument_count())
-                .map(CallCarrierKey::LegacyArg)
-                .collect(),
-        );
+        return None;
     }
     let interface = machine.call_site_interface(call_id)?;
     interface.is_complete().then(|| {
@@ -2445,41 +2434,15 @@ fn merge_call_carrier_states(
 
 fn classify_return_target(
     prepared: &SsaArtifact,
-    function: &SSAFunction,
     abi: &AbiProfile,
     block_addr: u64,
     return_op_idx: usize,
     target: &SSAVar,
     calls: &BTreeMap<CallSiteId, CallObservation>,
 ) -> SummaryValueObservation {
-    if let Some(target_id) = prepared.graph().value_id_for_var(target) {
-        let rooted_id = canonical_root_value(prepared, target_id);
-        if prepared
-            .value_var(rooted_id)
-            .is_some_and(|rooted| is_instruction_pointer_like(&rooted.name))
-            && let Some(observation) = recover_return_observation_from_epilogue(
-                prepared,
-                function,
-                abi,
-                block_addr,
-                return_op_idx,
-                calls,
-            )
-        {
-            return observation;
-        }
-        return classify_value_observation(prepared, abi, rooted_id, calls);
-    }
-
-    if is_instruction_pointer_like(&target.name)
-        && let Some(observation) = recover_return_observation_from_epilogue(
-            prepared,
-            function,
-            abi,
-            block_addr,
-            return_op_idx,
-            calls,
-        )
+    if let Some(return_inst) = exact_return_address_use(prepared, block_addr, return_op_idx, target)
+        && let Some(observation) =
+            exact_return_boundary_observation(prepared, abi, return_inst, calls)
     {
         return observation;
     }
@@ -2490,57 +2453,55 @@ fn classify_return_target(
     }
 }
 
-fn is_instruction_pointer_like(name: &str) -> bool {
-    matches!(
-        name.to_ascii_lowercase().as_str(),
-        "rip" | "eip" | "ip" | "pc"
-    )
-}
-
-fn recover_return_observation_from_epilogue(
+fn exact_return_address_use(
     prepared: &SsaArtifact,
-    function: &SSAFunction,
-    abi: &AbiProfile,
     block_addr: u64,
     return_op_idx: usize,
+    target: &SSAVar,
+) -> Option<crate::graph::InstId> {
+    let graph = prepared.graph();
+    let inst = graph.inst_id_for_op_site(block_addr, return_op_idx)?;
+    let boundary = prepared.facts().boundaries.returns.get(&inst)?;
+    let return_address = boundary.return_address?;
+    let target_value = graph.value_id_for_var(target)?;
+    let use_site = UseSite { inst, input_idx: 0 };
+    (return_address.value == target_value
+        && graph
+            .inst(inst)
+            .and_then(|return_inst| return_inst.inputs.first())
+            == Some(&target_value)
+        && graph.use_sites(target_value).contains(&use_site))
+    .then_some(inst)
+}
+
+fn exact_return_boundary_observation(
+    prepared: &SsaArtifact,
+    abi: &AbiProfile,
+    return_inst: crate::graph::InstId,
     calls: &BTreeMap<CallSiteId, CallObservation>,
 ) -> Option<SummaryValueObservation> {
-    let block = function.get_block(block_addr)?;
-    for scan_idx in (0..return_op_idx).rev() {
-        let op = block.ops.get(scan_idx)?;
-        match op {
-            SSAOp::Call { .. } | SSAOp::CallInd { .. } => {
-                let call_id = prepared
-                    .graph()
-                    .inst_id_for_op_site(block_addr, scan_idx)
-                    .and_then(|inst_id| prepared.call_sites().by_inst.get(&inst_id).copied())?;
-                let call = calls.get(&call_id)?;
-                let result_storage = call.result_storage?;
-                if Some(result_storage) != exact_function_return_storage(prepared) {
-                    return None;
-                }
-                return Some(SummaryValueObservation::Call(call.clone()));
-            }
-            _ => {
-                let Some(dst) = op.dst() else {
-                    continue;
-                };
-                if !abi.is_return_register(&dst.name) {
-                    continue;
-                }
-                if let Some(dst_id) = prepared.graph().value_id_for_var(dst) {
-                    let rooted_id = canonical_root_value(prepared, dst_id);
-                    return Some(classify_value_observation(prepared, abi, rooted_id, calls));
-                }
-                return Some(match classify_var_operand(prepared, abi, dst, 0) {
-                    SummaryOperand::Arg(idx) => SummaryValueObservation::Arg(idx),
-                    SummaryOperand::Const(value) => SummaryValueObservation::Const(value),
-                    SummaryOperand::Unknown => SummaryValueObservation::Unknown,
-                });
-            }
-        }
+    let expected_storage = exact_function_return_storage(prepared)?;
+    let boundary = prepared.facts().boundaries.returns.get(&return_inst)?;
+    if !boundary.complete {
+        return None;
     }
-    None
+    let values = boundary
+        .values
+        .iter()
+        .filter_map(|value| match value.slot {
+            crate::semantic::CallBoundarySlot::Register { storage, .. }
+                if storage == expected_storage =>
+            {
+                Some(value.value)
+            }
+            crate::semantic::CallBoundarySlot::Register { .. }
+            | crate::semantic::CallBoundarySlot::Stack(_) => None,
+        })
+        .collect::<Vec<_>>();
+    let [value] = values.as_slice() else {
+        return None;
+    };
+    Some(classify_value_observation(prepared, abi, *value, calls))
 }
 
 fn classify_value_observation(
@@ -2553,7 +2514,7 @@ fn classify_value_observation(
         SummaryOperand::Arg(idx) => SummaryValueObservation::Arg(idx),
         SummaryOperand::Const(value) => SummaryValueObservation::Const(value),
         SummaryOperand::Unknown => {
-            if let Some(call_id) = return_call_site_for_value(prepared, abi, value_id, calls)
+            if let Some(call_id) = return_call_site_for_value(prepared, value_id, calls)
                 && let Some(call) = calls.get(&call_id)
             {
                 SummaryValueObservation::Call(call.clone())
@@ -2568,7 +2529,6 @@ fn classify_value_observation(
 
 fn return_call_site_for_value(
     prepared: &SsaArtifact,
-    abi: &AbiProfile,
     value_id: ValueId,
     calls: &BTreeMap<CallSiteId, CallObservation>,
 ) -> Option<CallSiteId> {
@@ -2578,8 +2538,8 @@ fn return_call_site_for_value(
             .flatten()
     };
     let graph = prepared.graph();
-    let var = prepared.value_var(value_id)?;
-    if !abi.is_return_register(&var.name) {
+    let return_storage = exact_function_return_storage(prepared)?;
+    if graph.value(value_id)?.canonical_storage != Some(return_storage) {
         return None;
     }
 
@@ -2636,15 +2596,15 @@ fn classify_var_operand(
     if depth > 8 {
         return SummaryOperand::Unknown;
     }
-    if var.is_const() {
-        return parse_const_name(&var.name).map_or(SummaryOperand::Unknown, SummaryOperand::Const);
-    }
-    if let Some(idx) = formal_arg_index_for_var(abi, var) {
-        return SummaryOperand::Arg(idx);
-    }
     let Some(value_id) = prepared.graph().value_id_for_var(var) else {
         return SummaryOperand::Unknown;
     };
+    if let Some(bits) = exact_constant_value(prepared, value_id) {
+        return SummaryOperand::Const(bits);
+    }
+    if let Some(idx) = formal_arg_index_for_var(prepared, var) {
+        return SummaryOperand::Arg(idx);
+    }
     classify_value_operand(prepared, abi, value_id, depth)
 }
 
@@ -2661,11 +2621,10 @@ fn classify_value_operand(
     let Some(root_var) = prepared.value_var(rooted) else {
         return SummaryOperand::Unknown;
     };
-    if root_var.is_const() {
-        return parse_const_name(&root_var.name)
-            .map_or(SummaryOperand::Unknown, SummaryOperand::Const);
+    if let Some(bits) = exact_constant_value(prepared, rooted) {
+        return SummaryOperand::Const(bits);
     }
-    if let Some(idx) = formal_arg_index_for_var(abi, root_var) {
+    if let Some(idx) = formal_arg_index_for_var(prepared, root_var) {
         return SummaryOperand::Arg(idx);
     }
 
@@ -2748,9 +2707,16 @@ fn global_address_for_value_id(prepared: &SsaArtifact, value_id: ValueId) -> Opt
     }
 }
 
-fn parse_const_name(name: &str) -> Option<u64> {
-    name.strip_prefix("const:")
-        .and_then(|value| u64::from_str_radix(value.trim_start_matches("0x"), 16).ok())
+fn exact_constant_value(prepared: &SsaArtifact, value_id: ValueId) -> Option<u64> {
+    let value = prepared.graph().value(value_id)?;
+    let bits = value.var.constant_bits()?;
+    (value.canonical_storage
+        == Some(crate::CanonicalStorageId {
+            space: crate::CanonicalStorageSpace::Constant,
+            offset: bits,
+            size: value.var.size,
+        }))
+    .then_some(bits)
 }
 
 #[cfg(test)]
@@ -2940,6 +2906,64 @@ mod tests {
         assert_eq!(profile.argument_index("rdi"), Some(0));
         assert_eq!(profile.argument_index("rsi"), Some(1));
         assert!(profile.is_return_register("rax"));
+    }
+
+    #[test]
+    fn exact_return_boundary_ignores_misleading_carrier_names() {
+        let mut arch = x86_64_arch();
+        for register in &mut arch.registers {
+            let renamed = match register.offset {
+                0 => Some("rdi"),
+                8 => Some("rax"),
+                16 => Some("not_the_ip"),
+                24 => Some("not_the_sp"),
+                _ => None,
+            };
+            if let Some(renamed) = renamed {
+                register.name = renamed.to_string();
+            }
+        }
+        let storage = |offset| crate::CanonicalStorageId {
+            space: crate::CanonicalStorageSpace::Register,
+            offset,
+            size: 8,
+        };
+        let interface = crate::SourceFunctionInterface::new_exact(
+            b"misleading-return-names".to_vec(),
+            "sysv64",
+            [],
+            crate::SourceFunctionReturn::Register {
+                storage: storage(0),
+            },
+            [],
+        )
+        .and_then(|interface| interface.with_return_address_storage(storage(16)))
+        .and_then(|interface| interface.with_stack_pointer_storage(storage(24)))
+        .expect("exact function interface");
+        let prepared = SsaArtifact::for_decompile_with_interface(
+            &[block(
+                0x4100,
+                vec![
+                    R2ILOp::Copy {
+                        dst: reg(0, 8),
+                        src: c(7, 8),
+                    },
+                    R2ILOp::Return { target: reg(16, 8) },
+                ],
+            )],
+            Some(&arch),
+            interface,
+        )
+        .expect("exact return artifact");
+        let abi =
+            AbiProfile::from_machine_context(prepared.machine_context()).expect("source-owned ABI");
+
+        let local = collect_local_summary_facts(&prepared, &abi);
+
+        assert_eq!(
+            local.return_observations,
+            vec![SummaryValueObservation::Const(7)]
+        );
     }
 
     fn reg(offset: u64, size: u32) -> Varnode {

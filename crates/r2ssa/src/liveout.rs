@@ -17,9 +17,9 @@
 
 use std::collections::BTreeSet;
 
-use crate::abi::AbiProfile;
 use crate::function::SSAFunction;
 use crate::graph::{SsaGraph, ValueId};
+use crate::CanonicalStorageId;
 
 /// The values a function hands back to its caller.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -31,7 +31,11 @@ pub struct FunctionLiveOut {
 
 impl FunctionLiveOut {
     /// Work out what leaves through the return registers of every returning block.
-    pub fn compute(func: &SSAFunction, graph: &SsaGraph, abi: &AbiProfile) -> Self {
+    pub fn compute(
+        func: &SSAFunction,
+        graph: &SsaGraph,
+        return_storages: &[CanonicalStorageId],
+    ) -> Self {
         let mut live = Self::default();
         for block in func.blocks() {
             let returns = func
@@ -47,7 +51,11 @@ impl FunctionLiveOut {
             // made a function with an early-return arm report one live value and
             // one unresolved block, and left the value the loop computed
             // observed by nothing.
-            if !live.collect_reaching(func, graph, abi, block.addr) {
+            let mut complete = !return_storages.is_empty();
+            for storage in return_storages {
+                complete &= live.collect_reaching(func, graph, *storage, block.addr);
+            }
+            if !complete {
                 live.unresolved.insert(block.addr);
             }
         }
@@ -64,7 +72,7 @@ impl FunctionLiveOut {
         &mut self,
         func: &SSAFunction,
         graph: &SsaGraph,
-        abi: &AbiProfile,
+        return_storage: CanonicalStorageId,
         from: u64,
     ) -> bool {
         let mut found = false;
@@ -83,7 +91,7 @@ impl FunctionLiveOut {
                 let Some(dst) = op.dst() else {
                     continue;
                 };
-                if !abi.is_return_register(&dst.name.to_ascii_lowercase()) {
+                if graph.canonical_storage_for_var(dst) != Some(return_storage) {
                     continue;
                 }
                 if let Some(value) = graph.value_id_for_var(dst) {
@@ -92,12 +100,14 @@ impl FunctionLiveOut {
                 }
             }
             for phi in &block.phis {
-                if !abi.is_return_register(&phi.dst.name.to_ascii_lowercase()) {
+                if graph.canonical_storage_for_var(&phi.dst) != Some(return_storage) {
                     continue;
                 }
                 let overwritten = block.ops.iter().any(|op| {
                     op.dst()
-                        .is_some_and(|dst| dst.name == phi.dst.name && dst.size == phi.dst.size)
+                        .is_some_and(|dst| {
+                            graph.canonical_storage_for_var(dst) == Some(return_storage)
+                        })
                 });
                 if overwritten {
                     continue;
@@ -153,6 +163,7 @@ pub fn is_read(graph: &SsaGraph, live_out: &FunctionLiveOut, value: ValueId) -> 
 mod tests {
     use super::*;
     use crate::function::SSAFunction;
+    use crate::CanonicalStorageSpace;
     use r2il::{ArchSpec, R2ILBlock, R2ILOp, RegisterDef, SpaceId, Varnode};
 
     fn reg(offset: u64, size: u32) -> Varnode {
@@ -188,17 +199,50 @@ mod tests {
         SSAFunction::from_blocks_with_arch(&[block], Some(&x86_64_arch())).expect("ssa")
     }
 
-    fn x86_64_abi() -> AbiProfile {
-        AbiProfile::from_arch(Some(&x86_64_arch()))
+    #[test]
+    fn canonical_return_storage_is_invariant_under_abi_name_collision() {
+        let mut renamed = x86_64_arch();
+        for register in &mut renamed.registers {
+            if register.offset == 0 {
+                register.name = if register.size == 8 { "rdi" } else { "edi" }.to_string();
+            }
+        }
+        let block = R2ILBlock {
+            addr: 0x1000,
+            size: 4,
+            ops: vec![
+                R2ILOp::Copy {
+                    dst: reg(0, 8),
+                    src: Varnode::constant(7, 8),
+                },
+                R2ILOp::Return {
+                    target: reg(0x288, 8),
+                },
+            ],
+            ..R2ILBlock::default()
+        };
+        let function = SSAFunction::from_blocks_with_arch(&[block], Some(&renamed)).expect("ssa");
+        let graph = SsaGraph::from_function(&function);
+
+        let live = FunctionLiveOut::compute(&function, &graph, &x86_64_return_storages());
+
+        assert_eq!(live.len(), 1);
+        assert!(live.unresolved_blocks().next().is_none());
+    }
+
+    fn x86_64_return_storages() -> [CanonicalStorageId; 1] {
+        [CanonicalStorageId {
+            space: CanonicalStorageSpace::Register,
+            offset: 0,
+            size: 8,
+        }]
     }
 
     #[test]
     fn the_value_a_function_returns_is_read_even_with_no_use_sites() {
         let func = returning_function();
         let graph = SsaGraph::from_function(&func);
-        let abi = x86_64_abi();
-
-        let live = FunctionLiveOut::compute(&func, &graph, &abi);
+        let live = FunctionLiveOut::compute(&func, &graph, &x86_64_return_storages());
 
         assert_eq!(live.len(), 1, "the return register value should be live out");
         let value = live.iter().next().expect("one live value");
@@ -221,7 +265,7 @@ mod tests {
             SSAFunction::from_blocks_with_arch(&[block], Some(&x86_64_arch())).expect("ssa");
         let graph = SsaGraph::from_function(&func);
 
-        let live = FunctionLiveOut::compute(&func, &graph, &x86_64_abi());
+        let live = FunctionLiveOut::compute(&func, &graph, &x86_64_return_storages());
 
         assert!(live.is_empty());
         assert_eq!(live.unresolved_blocks().collect::<Vec<_>>(), vec![0x1000]);
@@ -251,7 +295,7 @@ mod tests {
         let func =
             SSAFunction::from_blocks_with_arch(&[block], Some(&x86_64_arch())).expect("ssa");
         let graph = SsaGraph::from_function(&func);
-        let live = FunctionLiveOut::compute(&func, &graph, &x86_64_abi());
+        let live = FunctionLiveOut::compute(&func, &graph, &x86_64_return_storages());
 
         let returned = graph
             .values

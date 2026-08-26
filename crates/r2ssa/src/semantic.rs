@@ -1095,7 +1095,7 @@ pub struct CallArgumentCertificate {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CallArgumentLocation {
     Register {
-        name: String,
+        storage: CanonicalStorageId,
     },
     Stack {
         object: ObjectId,
@@ -1320,10 +1320,13 @@ impl PreparedFunctionFacts {
         let predicates = collect_predicate_facts(function, graph);
         let boundaries =
             collect_source_boundary_facts(function, graph, &call_sites, machine_context);
-        let live_out = machine_context
-            .and_then(crate::abi::AbiProfile::from_machine_context)
-            .map(|abi| crate::liveout::FunctionLiveOut::compute(function, graph, &abi))
-            .unwrap_or_default();
+        let return_storages = machine_context
+            .into_iter()
+            .flat_map(|context| context.abi_model().return_registers())
+            .map(|slot| slot.storage())
+            .collect::<Vec<_>>();
+        let live_out =
+            crate::liveout::FunctionLiveOut::compute(function, graph, &return_storages);
         let structured = collect_structured_dataflow_facts(
             function,
             graph,
@@ -2443,63 +2446,12 @@ fn collect_source_boundary_facts(
     call_sites: &CallSiteFacts,
     machine_context: Option<&SourceMachineContext>,
 ) -> SourceBoundaryFacts {
-    let mut facts = SourceBoundaryFacts::default();
-
-    if let Some(machine_context) = machine_context
-        .filter(|context| context.abi_model().is_available() && context.abi_model().is_coherent())
-        && let Some(interface) = machine_context.function_interface()
-        && let Some(type_graph) = interface.type_graph()
-        && interface.schema_version() == SOURCE_FUNCTION_INTERFACE_SCHEMA_VERSION
-        && type_graph.schema_version() == SOURCE_TYPE_GRAPH_SCHEMA_VERSION
-        && interface.parameters().len() == interface.parameter_logical_values().len()
-        && machine_context.abi_model().argument_registers().len() == interface.parameters().len()
-    {
-        for (parameter, logical_value) in interface
-            .parameters()
-            .iter()
-            .zip(interface.parameter_logical_values())
-        {
-            let abi_storage = parameter.storage();
-            if machine_context
-                .abi_model()
-                .argument_registers()
-                .iter()
-                .filter(|slot| slot.index() == parameter.index() && slot.storage() == abi_storage)
-                .count()
-                != 1
-            {
-                continue;
-            }
-            let Some(graph_storage) =
-                projected_formal_parameter_storage(abi_storage, *logical_value, type_graph)
-            else {
-                continue;
-            };
-            let candidates = graph
-                .values
-                .iter()
-                .filter(|value| {
-                    graph.def_inst(value.id).is_none()
-                        && value.var.version == 0
-                        && value.var.size == graph_storage.size
-                        && value.canonical_storage == Some(graph_storage)
-                })
-                .map(|value| value.id)
-                .collect::<Vec<_>>();
-            if let [value] = candidates.as_slice() {
-                facts.parameters.insert(
-                    parameter.index(),
-                    SourceFormalParameterFact {
-                        index: parameter.index(),
-                        abi_storage,
-                        graph_storage,
-                        logical_value: *logical_value,
-                        value: *value,
-                    },
-                );
-            }
-        }
-    }
+    let mut facts = SourceBoundaryFacts {
+        parameters: machine_context
+            .map(|machine_context| collect_source_formal_parameter_facts(graph, machine_context))
+            .unwrap_or_default(),
+        ..SourceBoundaryFacts::default()
+    };
 
     for call_site in call_sites.by_id.values() {
         let mut boundary = SourceCallBoundaryFact {
@@ -2688,6 +2640,81 @@ fn collect_source_boundary_facts(
                     exit_stack_pointer,
                     complete,
                     machine_state_complete,
+                },
+            );
+        }
+    }
+    facts
+}
+
+/// The single authoritative projection from source ABI parameter slots to
+/// entry SSA values. Preparation and published boundary facts consume this
+/// same answer; register spelling is never an identity input.
+pub(crate) fn collect_source_formal_parameter_facts(
+    graph: &SsaGraph,
+    machine_context: &SourceMachineContext,
+) -> BTreeMap<u32, SourceFormalParameterFact> {
+    if !machine_context.abi_model().is_available()
+        || !machine_context.abi_model().is_coherent()
+    {
+        return BTreeMap::new();
+    }
+    let Some(interface) = machine_context.function_interface() else {
+        return BTreeMap::new();
+    };
+    let Some(type_graph) = interface.type_graph() else {
+        return BTreeMap::new();
+    };
+    if interface.schema_version() != SOURCE_FUNCTION_INTERFACE_SCHEMA_VERSION
+        || type_graph.schema_version() != SOURCE_TYPE_GRAPH_SCHEMA_VERSION
+        || interface.parameters().len() != interface.parameter_logical_values().len()
+        || machine_context.abi_model().argument_registers().len() != interface.parameters().len()
+    {
+        return BTreeMap::new();
+    }
+
+    let mut facts = BTreeMap::new();
+    for (parameter, logical_value) in interface
+        .parameters()
+        .iter()
+        .zip(interface.parameter_logical_values())
+    {
+        let abi_storage = parameter.storage();
+        if machine_context
+            .abi_model()
+            .argument_registers()
+            .iter()
+            .filter(|slot| slot.index() == parameter.index() && slot.storage() == abi_storage)
+            .count()
+            != 1
+        {
+            continue;
+        }
+        let Some(graph_storage) =
+            projected_formal_parameter_storage(abi_storage, *logical_value, type_graph)
+        else {
+            continue;
+        };
+        let candidates = graph
+            .values
+            .iter()
+            .filter(|value| {
+                graph.def_inst(value.id).is_none()
+                    && value.var.version == 0
+                    && value.var.size == graph_storage.size
+                    && value.canonical_storage == Some(graph_storage)
+            })
+            .map(|value| value.id)
+            .collect::<Vec<_>>();
+        if let [value] = candidates.as_slice() {
+            facts.insert(
+                parameter.index(),
+                SourceFormalParameterFact {
+                    index: parameter.index(),
+                    abi_storage,
+                    graph_storage,
+                    logical_value: *logical_value,
+                    value: *value,
                 },
             );
         }
@@ -3540,8 +3567,12 @@ fn collect_prepared_function_certificates(
             let (block_addr, op_index) = graph.op_site_for_inst(fact.at).unwrap_or_default();
             let stack_argument_values =
                 collect_stack_call_argument_values(function, graph, objects, structured, fact);
-            let mut argument_certificates =
-                collect_register_call_argument_certificates(function, graph, fact);
+            let (argument_values, mut argument_certificates) = boundaries
+                .calls
+                .get(id)
+                .filter(|boundary| boundary.complete && boundary.at == fact.at)
+                .map(|boundary| exact_register_call_arguments(boundary, graph))
+                .unwrap_or_default();
             argument_certificates.extend(collect_stack_call_argument_certificates(
                 &stack_argument_values,
                 structured,
@@ -3557,7 +3588,7 @@ fn collect_prepared_function_certificates(
                     target: fact.target,
                     direct_target: fact.direct_target,
                     fallthrough: fact.fallthrough,
-                    argument_values: collect_call_argument_values(function, graph, fact),
+                    argument_values,
                     stack_argument_values,
                     argument_certificates,
                 },
@@ -5731,38 +5762,20 @@ fn loop_induction_values(
                 value_depends_on(graph, comparison.lhs, output)
                     || value_depends_on(graph, comparison.rhs, output)
             });
-        let low_value_rank = is_low_value_induction_phi(graph, output);
         let candidate = (
             usize::from(!condition_dependency_rank),
-            usize::from(low_value_rank),
             output,
             init,
             update,
         );
         if best.as_ref().is_none_or(
-            |current: &(usize, usize, ValueId, Option<ValueId>, Option<ValueId>)| {
-                candidate < *current
-            },
+            |current: &(usize, ValueId, Option<ValueId>, Option<ValueId>)| candidate < *current,
         ) {
             best = Some(candidate);
         }
     }
-    best.map(|(_, _, phi, init, update)| (Some(phi), init, update))
+    best.map(|(_, phi, init, update)| (Some(phi), init, update))
         .unwrap_or((None, None, None))
-}
-
-fn is_low_value_induction_phi(graph: &SsaGraph, value: ValueId) -> bool {
-    let Some(var) = graph.value(value).map(|value| &value.var) else {
-        return true;
-    };
-    let name = var.name.trim_start_matches("reg:").to_ascii_lowercase();
-    matches!(name.as_str(), "cf" | "pf" | "af" | "zf" | "sf" | "of")
-        || name.starts_with("flag")
-        || name.starts_with("tmp")
-        || name == "rsp"
-        || name == "esp"
-        || name == "rbp"
-        || name == "ebp"
 }
 
 fn loop_bound_value(
@@ -6450,92 +6463,46 @@ fn collect_call_sites(
     CallSiteFacts { by_id, by_inst }
 }
 
-fn collect_call_argument_values(
-    function: &SSAFunction,
+fn exact_register_call_arguments(
+    boundary: &SourceCallBoundaryFact,
     graph: &SsaGraph,
-    call_site: &CallSiteFact,
-) -> Vec<ValueId> {
-    let mut by_index = collect_call_argument_slots(function, graph, call_site)
-        .into_iter()
-        .collect::<BTreeMap<_, _>>();
-    let mut values = Vec::new();
-    for index in 0..16 {
-        let Some(value) = by_index.remove(&index) else {
-            break;
+) -> (Vec<ValueId>, Vec<CallArgumentCertificate>) {
+    let mut by_index = BTreeMap::new();
+    for argument in &boundary.arguments {
+        let CallBoundarySlot::Register { index, storage } = argument.slot else {
+            return (Vec::new(), Vec::new());
         };
-        values.push(value);
-    }
-    values
-}
-
-fn collect_call_argument_slots(
-    function: &SSAFunction,
-    graph: &SsaGraph,
-    call_site: &CallSiteFact,
-) -> Vec<(usize, ValueId)> {
-    let Some((block_addr, op_idx)) = graph.op_site_for_inst(call_site.at) else {
-        return Vec::new();
-    };
-    let Some(block) = function.get_block(block_addr) else {
-        return Vec::new();
-    };
-
-    let mut by_index = BTreeMap::<usize, ValueId>::new();
-    for op in block.ops[..op_idx].iter().rev() {
-        if matches!(
-            op,
-            SSAOp::Call { .. } | SSAOp::CallInd { .. } | SSAOp::Return { .. }
-        ) {
-            break;
+        let SourceCallArgumentValue::Value(value) = argument.value else {
+            return (Vec::new(), Vec::new());
+        };
+        let Ok(index) = usize::try_from(index) else {
+            return (Vec::new(), Vec::new());
+        };
+        let Some(graph_value) = graph.value(value) else {
+            return (Vec::new(), Vec::new());
+        };
+        if graph_value.canonical_storage != Some(storage)
+            || by_index
+                .insert(
+                    index,
+                    CallArgumentCertificate {
+                        index,
+                        value,
+                        location: CallArgumentLocation::Register { storage },
+                        source_inst: graph.def_inst(value),
+                    },
+                )
+                .is_some()
+        {
+            return (Vec::new(), Vec::new());
         }
-        let Some((index, value, _)) = call_argument_value_for_op(op, graph) else {
-            continue;
-        };
-        by_index.entry(index).or_insert(value);
     }
-
-    by_index.into_iter().collect()
-}
-
-fn collect_register_call_argument_certificates(
-    function: &SSAFunction,
-    graph: &SsaGraph,
-    call_site: &CallSiteFact,
-) -> Vec<CallArgumentCertificate> {
-    let Some((block_addr, op_idx)) = graph.op_site_for_inst(call_site.at) else {
-        return Vec::new();
-    };
-    let Some(block) = function.get_block(block_addr) else {
-        return Vec::new();
-    };
-
-    let mut by_index = BTreeMap::<usize, CallArgumentCertificate>::new();
-    for (producer_idx, op) in block.ops[..op_idx].iter().enumerate().rev() {
-        if matches!(
-            op,
-            SSAOp::Call { .. } | SSAOp::CallInd { .. } | SSAOp::Return { .. }
-        ) {
-            break;
-        }
-        let Some((index, value, register)) = call_argument_value_for_op(op, graph) else {
-            continue;
-        };
-        by_index.entry(index).or_insert(CallArgumentCertificate {
-            index,
-            value,
-            location: CallArgumentLocation::Register { name: register },
-            source_inst: graph.inst_id_for_op_site(block_addr, producer_idx),
-        });
+    if by_index.keys().copied().ne(0..by_index.len()) {
+        return (Vec::new(), Vec::new());
     }
-
-    let mut certificates = Vec::new();
-    for index in 0..16 {
-        let Some(certificate) = by_index.remove(&index) else {
-            break;
-        };
-        certificates.push(certificate);
-    }
-    certificates
+    let certificates = by_index.into_values().collect::<Vec<_>>();
+    let values = certificates.iter().map(|argument| argument.value).collect();
+    (values, certificates)
 }
 
 fn collect_stack_call_argument_values(
@@ -6659,50 +6626,6 @@ fn stack_object_root(objects: &ObjectModel, object: ObjectId) -> Option<(StackAd
             base,
             offset,
         } => Some((base, offset)),
-        _ => None,
-    }
-}
-
-fn call_argument_value_for_op(op: &SSAOp, graph: &SsaGraph) -> Option<(usize, ValueId, String)> {
-    // A call defines every register the callee may destroy, and those
-    // definitions are emitted after it, so the walk back from the next call
-    // reaches them before it reaches the call that made them. Their
-    // destinations are argument registers, but they are what a call leaves
-    // behind rather than what the next one was given.
-    if matches!(op, SSAOp::CallDefine { .. }) {
-        return None;
-    }
-    let dst = op.dst()?;
-    let index = canonical_abi_arg_index(&dst.name)?;
-    let source = match op {
-        SSAOp::Copy { src, .. }
-        | SSAOp::IntZExt { src, .. }
-        | SSAOp::IntSExt { src, .. }
-        | SSAOp::Trunc { src, .. }
-        | SSAOp::Cast { src, .. }
-        | SSAOp::Subpiece { src, .. } => graph.value_id_for_var(src),
-        _ => None,
-    }
-    .or_else(|| graph.value_id_for_var(dst))?;
-    Some((index, source, dst.name.clone()))
-}
-
-fn canonical_abi_arg_index(name: &str) -> Option<usize> {
-    match name.to_ascii_lowercase().as_str() {
-        "rdi" | "edi" | "di" | "dil" => Some(0),
-        "rsi" | "esi" | "si" | "sil" => Some(1),
-        "rdx" | "edx" | "dx" | "dl" => Some(2),
-        "rcx" | "ecx" | "cx" | "cl" => Some(3),
-        "r8" | "r8d" | "r8w" | "r8b" => Some(4),
-        "r9" | "r9d" | "r9w" | "r9b" => Some(5),
-        "x0" | "w0" | "a0" => Some(0),
-        "x1" | "w1" | "a1" => Some(1),
-        "x2" | "w2" | "a2" => Some(2),
-        "x3" | "w3" | "a3" => Some(3),
-        "x4" | "w4" | "a4" => Some(4),
-        "x5" | "w5" | "a5" => Some(5),
-        "x6" | "w6" | "a6" => Some(6),
-        "x7" | "w7" | "a7" => Some(7),
         _ => None,
     }
 }

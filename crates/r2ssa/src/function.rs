@@ -30,6 +30,8 @@ use crate::machine_context::{
     SourceCallSiteIdentity, SourceCallSiteInterface, SourceFunctionInterface, SourceMachineContext,
     SourceMachineRoles,
 };
+#[cfg(test)]
+use crate::machine_context::{SourceCallArgumentSpec, SourceCallResult};
 use crate::naming::{ARCH_DERIVED_CACHE_MAX_ENTRIES, ArchCacheTag, cached_register_name_map};
 use crate::op::SSAOp;
 use crate::phi::{PhiPlacement, collect_defs_from_cfg_with_names_storage_and_control};
@@ -280,7 +282,7 @@ impl SsaArtifact {
     }
 
     fn new_with_context_control_and_provenance<C: SsaWorkControl + ?Sized>(
-        function: SSAFunction,
+        mut function: SSAFunction,
         mode: FunctionPrepareMode,
         mut machine_context: SourceMachineContext,
         provenance: SsaArtifactProvenance,
@@ -290,11 +292,23 @@ impl SsaArtifact {
         validate_ssa_function(&function).map_err(|_| SsaPrepareError::MalformedInput)?;
         machine_context.remap_memory_sites_to_prepared(&function);
         let graph = SsaGraph::from_function_with_storage(&function);
+        let formal_parameters = crate::semantic::collect_source_formal_parameter_facts(
+            &graph,
+            &machine_context,
+        );
+        function.install_exact_formal_parameters(&graph, &formal_parameters);
         let storage_spans = StorageSpans::compute(&function, &graph);
-        let live_out = match crate::abi::AbiProfile::from_machine_context(&machine_context) {
-            Some(abi) => crate::liveout::FunctionLiveOut::compute(&function, &graph, &abi),
-            None => crate::liveout::FunctionLiveOut::default(),
-        };
+        let return_storages = machine_context
+            .abi_model()
+            .return_registers()
+            .iter()
+            .map(|slot| slot.storage())
+            .collect::<Vec<_>>();
+        let live_out = crate::liveout::FunctionLiveOut::compute(
+            &function,
+            &graph,
+            &return_storages,
+        );
         let unobserved_merges = crate::deadphi::DeadPhis::find(&function, &graph, &live_out);
         control.poll()?;
         let facts = PreparedFunctionFacts::collect_with_context(
@@ -1267,7 +1281,7 @@ impl TrustedSsaArtifact {
     /// reach the call. Both are needed, and only here are both in hand.
     pub fn proven_facts(&self) -> crate::proven::ProvenFacts {
         crate::proven::prove(
-            self.artifact.function(),
+            self.artifact(),
             self.source().image().code_pointer_tables(),
         )
     }
@@ -1831,6 +1845,31 @@ fn decompile_call_boundary_config(arch: Option<&ArchSpec>) -> Option<CallBoundar
 }
 
 impl SSAFunction {
+    #[cfg(test)]
+    pub(crate) fn from_exact_test_blocks(blocks: &[SSABlock], cfg: CFG) -> Self {
+        let entry = cfg
+            .entry_block()
+            .map(|block| block.addr)
+            .unwrap_or_default();
+        let domtree = DomTree::compute(&cfg);
+        let block_order = cfg.reverse_postorder();
+        Self {
+            name: None,
+            entry,
+            cfg,
+            domtree,
+            blocks: blocks
+                .iter()
+                .cloned()
+                .map(|block| (block.addr, block))
+                .collect(),
+            block_order,
+            canonical_storage_by_var: BTreeMap::new(),
+            decompile_prep_facts: None,
+            query_index: RwLock::new(None),
+        }
+    }
+
     /// Build an SSA function from a sequence of r2il blocks.
     pub fn from_blocks(blocks: &[R2ILBlock]) -> Option<Self> {
         Self::from_blocks_with_arch(blocks, None)
@@ -2699,6 +2738,43 @@ impl SSAFunction {
         self.decompile_prep_facts.as_ref()
     }
 
+    /// Install the canonical source-boundary parameter projection into the
+    /// decompiler preparation view. This deliberately accepts `ValueId`
+    /// facts, then resolves the already-built graph value back to its `SSAVar`;
+    /// no register spelling participates in slot identity.
+    fn install_exact_formal_parameters(
+        &mut self,
+        graph: &SsaGraph,
+        parameters: &BTreeMap<u32, crate::semantic::SourceFormalParameterFact>,
+    ) {
+        let Some(prep) = self.decompile_prep_facts.as_mut() else {
+            return;
+        };
+        prep.formal_parameters.clear();
+        prep.formal_parameter_bases.clear();
+        for (slot, parameter) in parameters {
+            let Ok(index) = usize::try_from(*slot) else {
+                continue;
+            };
+            let Some(value) = graph.value(parameter.value) else {
+                continue;
+            };
+            if parameter.index != *slot
+                || graph.def_inst(parameter.value).is_some()
+                || value.var.version != 0
+                || value.var.size != parameter.graph_storage.size
+                || value.canonical_storage != Some(parameter.graph_storage)
+            {
+                continue;
+            }
+            prep.formal_parameters.insert(value.var.clone(), index);
+            if parameter.graph_storage == parameter.abi_storage {
+                prep.formal_parameter_bases
+                    .insert(value.var.clone(), index);
+            }
+        }
+    }
+
     /// Refresh the cached decompiler-prep facts for the current SSA state.
     pub fn refresh_decompile_prep_facts(&mut self, arch: Option<&ArchSpec>) {
         self.refresh_decompile_prep_facts_with_interface_and_control(
@@ -2737,7 +2813,6 @@ impl SSAFunction {
         control: &C,
     ) -> Result<DecompilePrepFacts, SsaExecutionStopReason> {
         control.poll()?;
-        let abi = crate::AbiProfile::from_arch(arch);
         let cached_family_info = arch.map(cached_register_family_info);
         let empty_family_info = RegisterFamilyInfo::default();
         let family_info = cached_family_info.as_deref().unwrap_or(&empty_family_info);
@@ -2810,49 +2885,6 @@ impl SSAFunction {
                 }
             }
         }
-        for block in self.blocks() {
-            control.poll()?;
-            for phi in &block.phis {
-                control.poll()?;
-                for var in
-                    std::iter::once(&phi.dst).chain(phi.sources.iter().map(|(_, source)| source))
-                {
-                    if let Some(index) = abi.formal_argument_index(var) {
-                        facts.formal_parameters.insert(var.clone(), index);
-                    }
-                    if let Some(index) = abi.formal_address_argument_index(var) {
-                        facts.formal_parameter_bases.insert(var.clone(), index);
-                    }
-                }
-            }
-            for op in &block.ops {
-                control.poll()?;
-                if let Some(dst) = op.dst()
-                    && let Some(index) = abi.formal_argument_index(dst)
-                {
-                    facts.formal_parameters.insert(dst.clone(), index);
-                }
-                if let Some(dst) = op.dst()
-                    && let Some(index) = abi.formal_address_argument_index(dst)
-                {
-                    facts.formal_parameter_bases.insert(dst.clone(), index);
-                }
-                // A register cleared by cancelling itself is not read: the result
-                // does not depend on the operand, so `xor ecx, ecx` is a zeroing
-                // and not evidence that the function was passed anything in rcx.
-                if !op_cancels_its_own_operand(op) {
-                    op.for_each_source(&mut |source| {
-                        if let Some(index) = abi.formal_argument_index(source) {
-                            facts.formal_parameters.insert(source.clone(), index);
-                        }
-                        if let Some(index) = abi.formal_address_argument_index(source) {
-                            facts.formal_parameter_bases.insert(source.clone(), index);
-                        }
-                    });
-                }
-            }
-        }
-
         let mut changed = true;
         while changed {
             control.poll()?;
@@ -4190,15 +4222,6 @@ fn rewrite_decompile_family_subpiece(
 /// containing definition, so `family_root_slice_for_range` refuses it. The parts
 /// are still there, and concatenating them is what the machine did, so this
 /// reports the tiling and the caller writes the `Piece` that says so.
-/// Whether this operation clears its destination by cancelling one value with
-/// itself, which reads the operand in name only.
-fn op_cancels_its_own_operand(op: &SSAOp) -> bool {
-    match op {
-        SSAOp::IntXor { a, b, .. } | SSAOp::IntSub { a, b, .. } => a == b,
-        _ => false,
-    }
-}
-
 fn family_root_tiles_for_range(
     state: &FamilyRootState,
     requested: RegisterFamilySlot,
@@ -6752,7 +6775,12 @@ mod tests {
 
     #[test]
     fn prepared_certificates_index_call_args_memory_and_returns() {
-        let arch = make_arm64_alias_arch();
+        let mut arch = make_arm64_alias_arch();
+        for register in &mut arch.registers {
+            if register.offset == 0 {
+                register.name = if register.size == 8 { "rdx" } else { "edx" }.to_string();
+            }
+        }
         let blocks = vec![R2ILBlock {
             addr: 0x1600,
             size: 4,
@@ -6777,7 +6805,39 @@ mod tests {
             op_metadata: Default::default(),
         }];
 
-        let prepared = SsaArtifact::for_decompile(&blocks, Some(&arch)).expect("prepared SSA");
+        let call_interface = SourceCallSiteInterface::new(
+            b"renamed-register-call-args".to_vec(),
+            SourceCallSiteIdentity::new(
+                0x1600,
+                2,
+                CanonicalStorageId {
+                    space: CanonicalStorageSpace::Constant,
+                    offset: 0x2000,
+                    size: 8,
+                },
+            ),
+            true,
+            "aapcs64",
+            [SourceCallArgumentSpec::new(
+                0,
+                CanonicalStorageId {
+                    space: CanonicalStorageSpace::Register,
+                    offset: 0,
+                    size: 8,
+                },
+            )],
+            false,
+            false,
+            SourceCallResult::Void,
+        )
+        .expect("exact callsite interface");
+        let prepared = SsaArtifact::for_decompile_with_interfaces(
+            &blocks,
+            Some(&arch),
+            None,
+            vec![call_interface],
+        )
+        .expect("prepared SSA");
         let call = prepared
             .callsite_certificate_for_op(0x1600, 2)
             .expect("callsite certificate");
@@ -6797,7 +6857,14 @@ mod tests {
             "register call argument proof must identify the producer instruction"
         );
         match &typed_arg.location {
-            CallArgumentLocation::Register { name } => assert_eq!(name, "x0"),
+            CallArgumentLocation::Register { storage } => assert_eq!(
+                *storage,
+                CanonicalStorageId {
+                    space: CanonicalStorageSpace::Register,
+                    offset: 0,
+                    size: 8,
+                }
+            ),
             CallArgumentLocation::Stack { .. } => {
                 panic!("register argument should not be certified as stack")
             }

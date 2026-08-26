@@ -141,11 +141,19 @@ impl DeadPhis {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::abi::AbiProfile;
+    use crate::{CanonicalStorageId, CanonicalStorageSpace};
     use r2il::{ArchSpec, R2ILBlock, R2ILOp, RegisterDef, SpaceId, Varnode};
 
     fn reg(offset: u64, size: u32) -> Varnode {
         Varnode::new(SpaceId::Register, offset, size)
+    }
+
+    fn return_storages() -> [CanonicalStorageId; 1] {
+        [CanonicalStorageId {
+            space: CanonicalStorageSpace::Register,
+            offset: 0,
+            size: 8,
+        }]
     }
 
     fn arch() -> ArchSpec {
@@ -231,7 +239,7 @@ mod tests {
     fn a_flag_merged_at_a_join_and_never_tested_again_is_not_part_of_the_program() {
         let func = merging_function();
         let graph = SsaGraph::from_function(&func);
-        let live = FunctionLiveOut::compute(&func, &graph, &AbiProfile::from_arch(Some(&arch())));
+        let live = FunctionLiveOut::compute(&func, &graph, &return_storages());
 
         let dead = DeadPhis::find(&func, &graph, &live);
 
@@ -251,7 +259,7 @@ mod tests {
     fn the_merge_holding_the_returned_value_survives() {
         let func = merging_function();
         let graph = SsaGraph::from_function(&func);
-        let live = FunctionLiveOut::compute(&func, &graph, &AbiProfile::from_arch(Some(&arch())));
+        let live = FunctionLiveOut::compute(&func, &graph, &return_storages());
 
         let dead = DeadPhis::find(&func, &graph, &live);
 
@@ -273,7 +281,7 @@ mod tests {
     fn a_flag_a_branch_still_tests_survives() {
         let func = merging_function();
         let graph = SsaGraph::from_function(&func);
-        let live = FunctionLiveOut::compute(&func, &graph, &AbiProfile::from_arch(Some(&arch())));
+        let live = FunctionLiveOut::compute(&func, &graph, &return_storages());
 
         let dead = DeadPhis::find(&func, &graph, &live);
 

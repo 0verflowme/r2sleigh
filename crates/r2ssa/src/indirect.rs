@@ -16,11 +16,11 @@
 //! Failing closed is the point. An unproven target set would be a guess about
 //! control flow, and a wrong edge is worse than a missing one.
 
-use crate::cfg::{BlockTerminator, CFG};
-use crate::domtree::DomTree;
-use crate::function::SSABlock;
-use crate::{SSAOp, SSAVar};
-use std::collections::HashMap;
+use crate::cfg::BlockTerminator;
+use crate::function::{SSAFunction, SsaArtifact};
+use crate::graph::{GraphInst, InstPayload, SsaGraph, UseSite, ValueId};
+use crate::{CanonicalStorageId, CanonicalStorageSpace, SSAOp};
+use std::collections::BTreeMap;
 
 /// A call site and the table entries it can reach.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -99,17 +99,28 @@ impl PointerTable for r2source::SourceCodePointerTable {
 /// the end simply proves nothing.
 const MAX_DEFINITION_DEPTH: usize = 32;
 
-/// Map every defined name to the operation that defines it.
-pub(crate) fn definitions(blocks: &[SSABlock]) -> HashMap<String, (&SSAOp, u64)> {
-    let mut defs = HashMap::new();
-    for block in blocks {
-        for op in &block.ops {
-            if let Some(dst) = op.dst() {
-                defs.insert(dst.display_name(), (op, block.addr));
-            }
-        }
-    }
-    defs
+pub(crate) fn exact_input(graph: &SsaGraph, inst: &GraphInst, input_idx: usize) -> Option<ValueId> {
+    let value = *inst.inputs.get(input_idx)?;
+    graph
+        .use_sites(value)
+        .binary_search(&UseSite {
+            inst: inst.id,
+            input_idx,
+        })
+        .is_ok()
+        .then_some(value)
+}
+
+fn exact_constant(graph: &SsaGraph, value: ValueId) -> Option<u64> {
+    let value = graph.value(value)?;
+    let bits = value.var.constant_bits()?;
+    (value.canonical_storage
+        == Some(CanonicalStorageId {
+            space: CanonicalStorageSpace::Constant,
+            offset: bits,
+            size: value.var.size,
+        }))
+    .then_some(bits)
 }
 
 /// Read a folded value as signed at the width it was computed at.
@@ -136,76 +147,88 @@ fn truncate(value: u64, size: u32) -> u64 {
 /// temporaries before it is used. Each step folded here is exact -- a copy, a
 /// widening, or arithmetic on values already pinned -- so what comes back is
 /// the value, not an estimate of it.
-pub(crate) fn resolve_constant(
-    defs: &HashMap<String, (&SSAOp, u64)>,
-    var: &SSAVar,
-    depth: usize,
-) -> Option<u64> {
-    if let Some(value) = var.constant_bits() {
+pub(crate) fn resolve_constant(graph: &SsaGraph, value: ValueId, depth: usize) -> Option<u64> {
+    if let Some(value) = exact_constant(graph, value) {
         return Some(value);
     }
     if depth >= MAX_DEFINITION_DEPTH {
         return None;
     }
-    let (op, _) = defs.get(&var.display_name())?;
-    let fold = |value: &SSAVar| resolve_constant(defs, value, depth + 1);
+    let inst = graph.def_inst(value).and_then(|inst| graph.inst(inst))?;
+    let InstPayload::Op(op) = &inst.payload else {
+        return None;
+    };
+    let fold = |input_idx| resolve_constant(graph, exact_input(graph, inst, input_idx)?, depth + 1);
     let folded = match op {
-        SSAOp::Copy { src, .. } => fold(src)?,
-        SSAOp::IntZExt { src, .. } => fold(src)?,
-        SSAOp::IntSExt { src, dst } => {
-            let value = fold(src)?;
+        SSAOp::Copy { .. } | SSAOp::IntZExt { .. } => fold(0)?,
+        SSAOp::IntSExt { .. } => {
+            let source = exact_input(graph, inst, 0)?;
+            let source_value = graph.value(source)?;
+            let output = graph.value(value)?;
+            let value = fold(0)?;
             // Sign-extending is only exact if we know the width it came from.
-            let bits = src.size * 8;
-            if bits == 0 || bits >= 64 || dst.size <= src.size {
+            let bits = source_value.var.size * 8;
+            if bits == 0 || bits >= 64 || output.var.size <= source_value.var.size {
                 return None;
             }
             ((value as i64) << (64 - bits) >> (64 - bits)) as u64
         }
-        SSAOp::IntAdd { a, b, .. } => fold(a)?.wrapping_add(fold(b)?),
-        SSAOp::IntSub { a, b, .. } => fold(a)?.wrapping_sub(fold(b)?),
-        SSAOp::IntMult { a, b, .. } => fold(a)?.wrapping_mul(fold(b)?),
-        SSAOp::IntLeft { a, b, .. } => {
-            let shift = fold(b)?;
+        SSAOp::IntAdd { .. } => fold(0)?.wrapping_add(fold(1)?),
+        SSAOp::IntSub { .. } => fold(0)?.wrapping_sub(fold(1)?),
+        SSAOp::IntMult { .. } => fold(0)?.wrapping_mul(fold(1)?),
+        SSAOp::IntLeft { .. } => {
+            let shift = fold(1)?;
             if shift >= 64 {
                 return None;
             }
-            fold(a)?.wrapping_shl(u32::try_from(shift).ok()?)
+            fold(0)?.wrapping_shl(u32::try_from(shift).ok()?)
         }
-        SSAOp::IntOr { a, b, .. } => fold(a)? | fold(b)?,
-        SSAOp::IntAnd { a, b, .. } => fold(a)? & fold(b)?,
+        SSAOp::IntOr { .. } => fold(0)? | fold(1)?,
+        SSAOp::IntAnd { .. } => fold(0)? & fold(1)?,
         // A condition is decided when the comparison behind it is, which is
         // what makes a branch on it not a branch at all.
-        SSAOp::IntEqual { a, b, .. } => u64::from(fold(a)? == fold(b)?),
-        SSAOp::IntNotEqual { a, b, .. } => u64::from(fold(a)? != fold(b)?),
-        SSAOp::IntLess { a, b, .. } => u64::from(fold(a)? < fold(b)?),
-        SSAOp::IntLessEqual { a, b, .. } => u64::from(fold(a)? <= fold(b)?),
-        SSAOp::IntSLess { a, b, .. } => u64::from(signed(fold(a)?, a.size) < signed(fold(b)?, b.size)),
-        SSAOp::IntSLessEqual { a, b, .. } => {
-            u64::from(signed(fold(a)?, a.size) <= signed(fold(b)?, b.size))
+        SSAOp::IntEqual { .. } => u64::from(fold(0)? == fold(1)?),
+        SSAOp::IntNotEqual { .. } => u64::from(fold(0)? != fold(1)?),
+        SSAOp::IntLess { .. } => u64::from(fold(0)? < fold(1)?),
+        SSAOp::IntLessEqual { .. } => u64::from(fold(0)? <= fold(1)?),
+        SSAOp::IntSLess { .. } => {
+            let left = graph.value(exact_input(graph, inst, 0)?)?;
+            let right = graph.value(exact_input(graph, inst, 1)?)?;
+            u64::from(signed(fold(0)?, left.var.size) < signed(fold(1)?, right.var.size))
         }
-        SSAOp::BoolNot { src, .. } => u64::from(fold(src)? == 0),
-        SSAOp::BoolAnd { a, b, .. } => u64::from(fold(a)? != 0 && fold(b)? != 0),
-        SSAOp::BoolOr { a, b, .. } => u64::from(fold(a)? != 0 || fold(b)? != 0),
-        SSAOp::BoolXor { a, b, .. } => u64::from((fold(a)? != 0) != (fold(b)? != 0)),
+        SSAOp::IntSLessEqual { .. } => {
+            let left = graph.value(exact_input(graph, inst, 0)?)?;
+            let right = graph.value(exact_input(graph, inst, 1)?)?;
+            u64::from(signed(fold(0)?, left.var.size) <= signed(fold(1)?, right.var.size))
+        }
+        SSAOp::BoolNot { .. } => u64::from(fold(0)? == 0),
+        SSAOp::BoolAnd { .. } => u64::from(fold(0)? != 0 && fold(1)? != 0),
+        SSAOp::BoolOr { .. } => u64::from(fold(0)? != 0 || fold(1)? != 0),
+        SSAOp::BoolXor { .. } => u64::from((fold(0)? != 0) != (fold(1)? != 0)),
         _ => return None,
     };
-    Some(truncate(folded, var.size))
+    Some(truncate(folded, graph.value(value)?.var.size))
 }
 
-/// The name a value ultimately stands for.
+/// The exact SSA value a copied/projected value ultimately stands for.
 ///
 /// A bound is proven against the value one instruction compared, and the index
 /// is read several copies later. They are the same value, and the proof only
 /// connects them if both are named by where the value came from rather than by
 /// which temporary happened to be holding it.
-fn canonical_name(defs: &HashMap<String, (&SSAOp, u64)>, var: &SSAVar) -> String {
-    let mut current = var.display_name();
+fn canonical_value(graph: &SsaGraph, value: ValueId) -> ValueId {
+    let mut current = value;
     for _ in 0..MAX_DEFINITION_DEPTH {
-        let Some((op, _)) = defs.get(&current) else {
+        let Some(inst) = graph.def_inst(current).and_then(|inst| graph.inst(inst)) else {
             return current;
         };
-        let next = match op {
-            SSAOp::Copy { src, .. } | SSAOp::IntZExt { src, .. } => src.display_name(),
+        let next = match &inst.payload {
+            InstPayload::Op(SSAOp::Copy { .. } | SSAOp::IntZExt { .. }) => {
+                let Some(input) = exact_input(graph, inst, 0) else {
+                    return current;
+                };
+                input
+            }
             _ => return current,
         };
         if next == current {
@@ -226,52 +249,58 @@ fn canonical_name(defs: &HashMap<String, (&SSAOp, u64)>, var: &SSAVar) -> String
 /// Shifting is exact only while it stays inside the width the subtraction was
 /// done at. Past that the machine wraps, the true set of values wraps with it,
 /// and an interval can no longer describe it -- so the bound is dropped.
-fn rebase(
-    defs: &HashMap<String, (&SSAOp, u64)>,
-    name: String,
-    interval: Interval,
-) -> (String, Interval) {
-    let mut name = name;
+fn rebase(graph: &SsaGraph, value: ValueId, interval: Interval) -> Option<(ValueId, Interval)> {
+    let mut value = value;
     let mut interval = interval;
     for _ in 0..MAX_DEFINITION_DEPTH {
-        let Some((op, _)) = defs.get(&name) else {
-            return (name, interval);
+        let Some(inst) = graph.def_inst(value).and_then(|inst| graph.inst(inst)) else {
+            return Some((value, interval));
         };
-        let (source, offset) = match op {
-            SSAOp::IntSub { a, b, .. } => match resolve_constant(defs, b, 0) {
-                Some(value) => (a, i128::from(value)),
-                None => return (name, interval),
-            },
-            SSAOp::IntAdd { a, b, .. } => {
-                match (resolve_constant(defs, b, 0), resolve_constant(defs, a, 0)) {
-                    (Some(value), _) => (a, -i128::from(value)),
-                    (_, Some(value)) => (b, -i128::from(value)),
-                    _ => return (name, interval),
+        let (source, offset) = match &inst.payload {
+            InstPayload::Op(SSAOp::IntSub { .. }) => {
+                match resolve_constant(graph, exact_input(graph, inst, 1)?, 0) {
+                    Some(constant) => (exact_input(graph, inst, 0)?, i128::from(constant)),
+                    None => return Some((value, interval)),
                 }
             }
-            _ => return (name, interval),
+            InstPayload::Op(SSAOp::IntAdd { .. }) => {
+                let left = exact_input(graph, inst, 0)?;
+                let right = exact_input(graph, inst, 1)?;
+                match (
+                    resolve_constant(graph, right, 0),
+                    resolve_constant(graph, left, 0),
+                ) {
+                    (Some(constant), _) => (left, -i128::from(constant)),
+                    (_, Some(constant)) => (right, -i128::from(constant)),
+                    _ => return Some((value, interval)),
+                }
+            }
+            _ => return Some((value, interval)),
         };
-        let width = u32::from(source.size) * 8;
+        let width = graph.value(source)?.var.size * 8;
         if width == 0 || width > 64 {
-            return (name, interval);
+            return Some((value, interval));
         }
         let ceiling = 1i128 << width;
         let shifted = Interval {
-            low: interval.low + offset,
-            high: interval.high + offset,
+            low: interval.low.checked_add(offset)?,
+            high: interval.high.checked_add(offset)?,
         };
-        if interval.low < 0 || interval.high >= ceiling || shifted.low < 0 || shifted.high >= ceiling
+        if interval.low < 0
+            || interval.high >= ceiling
+            || shifted.low < 0
+            || shifted.high >= ceiling
         {
-            return (name, interval);
+            return Some((value, interval));
         }
-        let next = canonical_name(defs, source);
-        if next == name {
-            return (name, interval);
+        let next = canonical_value(graph, source);
+        if next == value {
+            return Some((value, interval));
         }
-        name = next;
+        value = next;
         interval = shifted;
     }
-    (name, interval)
+    Some((value, interval))
 }
 
 /// The bound a comparison places on one side when it is known to hold.
@@ -279,44 +308,54 @@ fn rebase(
 /// Only a comparison against a value we can pin says anything usable here: two
 /// unknown values bound each other and neither is pinned.
 fn bound_from_comparison(
-    defs: &HashMap<String, (&SSAOp, u64)>,
-    op: &SSAOp,
+    graph: &SsaGraph,
+    inst: &GraphInst,
     holds: bool,
-) -> Option<(String, Interval)> {
+) -> Option<(ValueId, Interval)> {
+    let InstPayload::Op(op) = &inst.payload else {
+        return None;
+    };
     // Equality pins a value exactly when it holds, and says nothing usable when
     // it does not: "anything but seven" is not a range.
-    if let SSAOp::IntEqual { a, b, .. } | SSAOp::IntNotEqual { a, b, .. } = op {
+    if let SSAOp::IntEqual { .. } | SSAOp::IntNotEqual { .. } = op {
         let equal = matches!(op, SSAOp::IntEqual { .. }) == holds;
         if !equal {
             return None;
         }
-        for (value, other) in [(a, b), (b, a)] {
-            if let Some(pinned) = resolve_constant(defs, other, 0) {
+        let left = exact_input(graph, inst, 0)?;
+        let right = exact_input(graph, inst, 1)?;
+        for (value, other) in [(left, right), (right, left)] {
+            if let Some(pinned) = resolve_constant(graph, other, 0) {
                 let pinned = i128::from(pinned);
-                return Some(rebase(
-                    defs,
-                    canonical_name(defs, value),
-                    Interval { low: pinned, high: pinned },
-                ));
+                return rebase(
+                    graph,
+                    canonical_value(graph, value),
+                    Interval {
+                        low: pinned,
+                        high: pinned,
+                    },
+                );
             }
         }
         return None;
     }
-    let (a, b, strict, signed) = match op {
-        SSAOp::IntSLess { a, b, .. } => (a, b, true, true),
-        SSAOp::IntSLessEqual { a, b, .. } => (a, b, false, true),
-        SSAOp::IntLess { a, b, .. } => (a, b, true, false),
-        SSAOp::IntLessEqual { a, b, .. } => (a, b, false, false),
+    let (strict, signed) = match op {
+        SSAOp::IntSLess { .. } => (true, true),
+        SSAOp::IntSLessEqual { .. } => (false, true),
+        SSAOp::IntLess { .. } => (true, false),
+        SSAOp::IntLessEqual { .. } => (false, false),
         _ => return None,
     };
+    let a = exact_input(graph, inst, 0)?;
+    let b = exact_input(graph, inst, 1)?;
     // An unsigned comparison also proves the value is not negative, which is
     // half the bound a table index needs.
     let floor = if signed { i128::MIN } else { 0 };
     // A signed comparison reads its literal as signed at the compared width;
     // an unsigned one reads the same bits as a magnitude.
-    let literal = |var: &SSAVar| -> Option<i128> {
-        let bits = resolve_constant(defs, var, 0)?;
-        let width = var.size * 8;
+    let literal = |value: ValueId| -> Option<i128> {
+        let bits = resolve_constant(graph, value, 0)?;
+        let width = graph.value(value)?.var.size * 8;
         if signed && (1..64).contains(&width) {
             Some(i128::from((bits as i64) << (64 - width) >> (64 - width)))
         } else if signed {
@@ -338,7 +377,7 @@ fn bound_from_comparison(
                 high: i128::MAX,
             }
         };
-        return Some(rebase(defs, canonical_name(defs, a), interval));
+        return rebase(graph, canonical_value(graph, a), interval);
     }
     if let Some(limit) = literal(a) {
         // limit < b, or its negation b <= limit
@@ -353,7 +392,7 @@ fn bound_from_comparison(
                 high: if strict { limit } else { limit - 1 },
             }
         };
-        return Some(rebase(defs, canonical_name(defs, b), interval));
+        return rebase(graph, canonical_value(graph, b), interval);
     }
     None
 }
@@ -365,26 +404,37 @@ fn bound_from_comparison(
 /// those is followed here, because the proof is about the comparison and not
 /// about which register the answer travelled in.
 fn bound_from_condition(
-    defs: &HashMap<String, (&SSAOp, u64)>,
-    cond: &SSAVar,
+    graph: &SsaGraph,
+    condition: ValueId,
     holds: bool,
     depth: usize,
-) -> Option<(String, Interval)> {
+) -> Option<(ValueId, Interval)> {
     if depth >= MAX_DEFINITION_DEPTH {
         return None;
     }
-    let (op, _) = defs.get(&cond.display_name())?;
+    let inst = graph
+        .def_inst(condition)
+        .and_then(|inst| graph.inst(inst))?;
+    let InstPayload::Op(op) = &inst.payload else {
+        return None;
+    };
     match op {
-        SSAOp::Copy { src, .. } => bound_from_condition(defs, src, holds, depth + 1),
-        SSAOp::BoolNot { src, .. } => bound_from_condition(defs, src, !holds, depth + 1),
+        SSAOp::Copy { .. } => {
+            bound_from_condition(graph, exact_input(graph, inst, 0)?, holds, depth + 1)
+        }
+        SSAOp::BoolNot { .. } => {
+            bound_from_condition(graph, exact_input(graph, inst, 0)?, !holds, depth + 1)
+        }
         // A condition built from two others bounds a value only when both sides
         // bound the same value: otherwise each says something about a different
         // thing and neither survives the combination.
-        SSAOp::BoolOr { a, b, .. } | SSAOp::BoolAnd { a, b, .. } => {
+        SSAOp::BoolOr { .. } | SSAOp::BoolAnd { .. } => {
             let disjunction = matches!(op, SSAOp::BoolOr { .. }) == holds;
-            let (left_name, left) = bound_from_condition(defs, a, holds, depth + 1)?;
-            let (right_name, right) = bound_from_condition(defs, b, holds, depth + 1)?;
-            if left_name != right_name {
+            let (left_value, left) =
+                bound_from_condition(graph, exact_input(graph, inst, 0)?, holds, depth + 1)?;
+            let (right_value, right) =
+                bound_from_condition(graph, exact_input(graph, inst, 1)?, holds, depth + 1)?;
+            if left_value != right_value {
                 return None;
             }
             // Either side may hold, so the union; both must hold, so the
@@ -394,9 +444,9 @@ fn bound_from_condition(
             } else {
                 left.meet(right)
             };
-            Some((left_name, combined))
+            Some((left_value, combined))
         }
-        _ => bound_from_comparison(defs, op, holds),
+        _ => bound_from_comparison(graph, inst, holds),
     }
 }
 
@@ -407,110 +457,154 @@ fn bound_from_condition(
 /// that disagreed with it about which edge goes where would be proving
 /// something about a different function.
 fn proven_bounds(
-    blocks: &[SSABlock],
-    cfg: &CFG,
-    domtree: &DomTree,
-    defs: &HashMap<String, (&SSAOp, u64)>,
+    function: &SSAFunction,
+    graph: &SsaGraph,
     call_block: u64,
-) -> HashMap<String, Interval> {
-    let mut bounds: HashMap<String, Interval> = HashMap::new();
-    for block in blocks {
-        if block.addr == call_block || !domtree.dominates(block.addr, call_block) {
+) -> BTreeMap<ValueId, Interval> {
+    let mut bounds = BTreeMap::new();
+    for block in function.blocks() {
+        if block.addr == call_block || !function.domtree().dominates(block.addr, call_block) {
             continue;
         }
-        let Some(SSAOp::CBranch { cond, .. }) = block.ops.last() else {
+        let Some((op_index, SSAOp::CBranch { cond, .. })) =
+            block.ops.iter().enumerate().next_back()
+        else {
             continue;
         };
+        let Some(branch_inst) = graph
+            .inst_id_for_op_site(block.addr, op_index)
+            .and_then(|inst| graph.inst(inst))
+        else {
+            continue;
+        };
+        // CBranch input zero is its control target; the predicate is the
+        // second exact graph use.
+        let Some(condition) = exact_input(graph, branch_inst, 1) else {
+            continue;
+        };
+        if graph.value_id_for_var(cond) != Some(condition) {
+            continue;
+        }
         let Some(BlockTerminator::ConditionalBranch {
             true_target,
             false_target,
-        }) = cfg.get_block(block.addr).map(|basic| &basic.terminator)
+        }) = function
+            .cfg()
+            .get_block(block.addr)
+            .map(|basic| &basic.terminator)
         else {
             continue;
         };
         // The branch tells us which way we came only when one side leads here
         // and the other cannot. If both reach the call, it says nothing.
         let holds = match (
-            domtree.dominates(*true_target, call_block),
-            domtree.dominates(*false_target, call_block),
+            function.domtree().dominates(*true_target, call_block),
+            function.domtree().dominates(*false_target, call_block),
         ) {
             (true, false) => true,
             (false, true) => false,
             _ => continue,
         };
-        if let Some((name, interval)) = bound_from_condition(defs, cond, holds, 0) {
+        if let Some((value, interval)) = bound_from_condition(graph, condition, holds, 0) {
             let merged = bounds
-                .get(&name)
+                .get(&value)
                 .copied()
                 .unwrap_or_else(Interval::unbounded)
                 .meet(interval);
-            bounds.insert(name, merged);
+            bounds.insert(value, merged);
         }
     }
     bounds
 }
 
 /// Split an address into the table it indexes and the value indexing it.
-fn table_and_index(
-    defs: &HashMap<String, (&SSAOp, u64)>,
-    addr: &SSAVar,
-) -> Option<(u64, String, u64)> {
-    let (SSAOp::IntAdd { a, b, .. }, _) = defs.get(&addr.display_name())? else {
+fn table_and_index(graph: &SsaGraph, address: ValueId) -> Option<(u64, ValueId, u64)> {
+    let address = canonical_value(graph, address);
+    let inst = graph.def_inst(address).and_then(|inst| graph.inst(inst))?;
+    let InstPayload::Op(SSAOp::IntAdd { .. }) = &inst.payload else {
         return None;
     };
+    let left = exact_input(graph, inst, 0)?;
+    let right = exact_input(graph, inst, 1)?;
     // Either operand may carry the base; the other has to scale an index.
-    for (base, scaled) in [(a, b), (b, a)] {
-        let Some(base_value) = resolve_constant(defs, base, 0) else {
+    for (base, scaled) in [(left, right), (right, left)] {
+        let Some(base_value) = resolve_constant(graph, base, 0) else {
             continue;
         };
-        let Some((scale_op, _)) = defs.get(&canonical_name(defs, scaled)) else {
+        let scaled = canonical_value(graph, scaled);
+        let Some(scale_inst) = graph.def_inst(scaled).and_then(|inst| graph.inst(inst)) else {
             continue;
         };
-        let (index, scale) = match scale_op {
-            SSAOp::IntMult { a, b, .. } => {
-                match (resolve_constant(defs, b, 0), resolve_constant(defs, a, 0)) {
+        let (index, scale) = match &scale_inst.payload {
+            InstPayload::Op(SSAOp::IntMult { .. }) => {
+                let a = exact_input(graph, scale_inst, 0)?;
+                let b = exact_input(graph, scale_inst, 1)?;
+                match (resolve_constant(graph, b, 0), resolve_constant(graph, a, 0)) {
                     (Some(scale), _) => (a, scale),
                     (_, Some(scale)) => (b, scale),
                     _ => continue,
                 }
             }
-            SSAOp::IntLeft { a, b, .. } => match resolve_constant(defs, b, 0) {
-                Some(shift) if shift < 8 => (a, 1u64 << shift),
-                _ => continue,
-            },
+            InstPayload::Op(SSAOp::IntLeft { .. }) => {
+                let index = exact_input(graph, scale_inst, 0)?;
+                let shift = exact_input(graph, scale_inst, 1)?;
+                match resolve_constant(graph, shift, 0) {
+                    Some(shift) if shift < 8 => (index, 1u64 << shift),
+                    _ => continue,
+                }
+            }
             _ => continue,
         };
         if scale == 0 {
             continue;
         }
-        return Some((base_value, canonical_name(defs, index), scale));
+        return Some((base_value, canonical_value(graph, index), scale));
     }
     None
 }
 
 /// Resolve every indirect transfer whose reachable target set can be proven.
-pub fn resolve_indirect_calls<T: PointerTable>(
-    blocks: &[SSABlock],
-    cfg: &CFG,
-    domtree: &DomTree,
+fn resolve_indirect_calls_in_graph<T: PointerTable>(
+    function: &SSAFunction,
+    graph: &SsaGraph,
     tables: &[T],
 ) -> Vec<ResolvedIndirectCall> {
-    let defs = definitions(blocks);
     let mut resolved = Vec::new();
-    for block in blocks {
+    for block in function.blocks() {
         for (op_index, op) in block.ops.iter().enumerate() {
             // A tail call through a table is a branch, not a call, and it
             // reaches the same set of functions either way.
             let (SSAOp::CallInd { target } | SSAOp::BranchInd { target }) = op else {
                 continue;
             };
-            // The callee is whatever the table held, so the target has to be a
-            // load rather than a computed address.
-            let Some((SSAOp::Load { addr, .. }, _)) = defs.get(&canonical_name(&defs, target))
+            let Some(call_inst) = graph
+                .inst_id_for_op_site(block.addr, op_index)
+                .and_then(|inst| graph.inst(inst))
             else {
                 continue;
             };
-            let Some((base, index, scale)) = table_and_index(&defs, addr) else {
+            let Some(target_value) = exact_input(graph, call_inst, 0) else {
+                continue;
+            };
+            if graph.value_id_for_var(target) != Some(target_value) {
+                continue;
+            }
+            // The callee is whatever the table held, so the target has to be a
+            // load rather than a computed address.
+            let target_value = canonical_value(graph, target_value);
+            let Some(load_inst) = graph
+                .def_inst(target_value)
+                .and_then(|inst| graph.inst(inst))
+            else {
+                continue;
+            };
+            let InstPayload::Op(SSAOp::Load { .. }) = &load_inst.payload else {
+                continue;
+            };
+            let Some(address) = exact_input(graph, load_inst, 0) else {
+                continue;
+            };
+            let Some((base, index, scale)) = table_and_index(graph, address) else {
                 continue;
             };
             // The base need not be the address the table was read from: a table
@@ -531,7 +625,7 @@ pub fn resolve_indirect_calls<T: PointerTable>(
             if scale != u64::from(table.entry_size()) {
                 continue;
             }
-            let bounds = proven_bounds(blocks, cfg, domtree, &defs, block.addr);
+            let bounds = proven_bounds(function, graph, block.addr);
             let Some(interval) = bounds.get(&index).copied() else {
                 continue;
             };
@@ -540,8 +634,12 @@ pub fn resolve_indirect_calls<T: PointerTable>(
             }
             let first = (base - table.address()) / u64::from(table.entry_size());
             let entries = i128::try_from(table.targets().len()).unwrap_or(0);
-            let low = interval.low + i128::from(first);
-            let high = interval.high + i128::from(first);
+            let Some(low) = interval.low.checked_add(i128::from(first)) else {
+                continue;
+            };
+            let Some(high) = interval.high.checked_add(i128::from(first)) else {
+                continue;
+            };
             // A range reaching past the last entry we read is not proven: the
             // table may continue where the read stopped.
             if high >= entries {
@@ -566,9 +664,22 @@ pub fn resolve_indirect_calls<T: PointerTable>(
     resolved
 }
 
+/// Resolve every indirect transfer against the graph retained by the artifact.
+/// The function and graph therefore share one `ValueId`/`InstId` universe.
+pub fn resolve_indirect_calls<T: PointerTable>(
+    artifact: &SsaArtifact,
+    tables: &[T],
+) -> Vec<ResolvedIndirectCall> {
+    resolve_indirect_calls_in_graph(artifact.function(), artifact.graph(), tables)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::SSAVar;
+    use crate::cfg::CFG;
+    use crate::domtree::DomTree;
+    use crate::function::SSABlock;
 
     struct Table {
         address: u64,
@@ -586,6 +697,17 @@ mod tests {
         fn targets(&self) -> &[u64] {
             &self.targets
         }
+    }
+
+    fn resolve_test_indirect_calls<T: PointerTable>(
+        blocks: &[SSABlock],
+        cfg: &CFG,
+        _domtree: &DomTree,
+        tables: &[T],
+    ) -> Vec<ResolvedIndirectCall> {
+        let function = SSAFunction::from_exact_test_blocks(blocks, cfg.clone());
+        let graph = SsaGraph::from_function(&function);
+        resolve_indirect_calls_in_graph(&function, &graph, tables)
     }
 
     /// The graph for a straight guard: entry dominates both arms.
@@ -690,7 +812,7 @@ mod tests {
     fn a_guarded_index_resolves_to_exactly_the_entries_it_can_select() {
         let (blocks, tables) = guarded_dispatch(5, 5);
         let (cfg, domtree) = graph_for(&blocks, 0x20, Some(0x10));
-        let resolved = resolve_indirect_calls(&blocks, &cfg, &domtree, &tables);
+        let resolved = resolve_test_indirect_calls(&blocks, &cfg, &domtree, &tables);
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].table_address, 0xc000);
         assert_eq!(resolved[0].targets, tables[0].targets);
@@ -702,7 +824,7 @@ mod tests {
         // set is unknown and must stay unknown rather than be truncated.
         let (blocks, tables) = guarded_dispatch(9, 5);
         let (cfg, domtree) = graph_for(&blocks, 0x20, Some(0x10));
-        assert!(resolve_indirect_calls(&blocks, &cfg, &domtree, &tables).is_empty());
+        assert!(resolve_test_indirect_calls(&blocks, &cfg, &domtree, &tables).is_empty());
     }
 
     #[test]
@@ -712,7 +834,7 @@ mod tests {
         let (blocks, mut tables) = guarded_dispatch(5, 5);
         tables[0].entry_size = 4;
         let (cfg, domtree) = graph_for(&blocks, 0x20, Some(0x10));
-        assert!(resolve_indirect_calls(&blocks, &cfg, &domtree, &tables).is_empty());
+        assert!(resolve_test_indirect_calls(&blocks, &cfg, &domtree, &tables).is_empty());
     }
 
     /// The shape hardware actually emits, taken from an arm64 -O1 dispatch.
@@ -829,7 +951,7 @@ mod tests {
         // Two entries precede the base the code indexes from, and four follow.
         let (blocks, tables) = hardware_dispatch(6);
         let (cfg, domtree) = graph_for(&blocks, 0x20, Some(0x10));
-        let resolved = resolve_indirect_calls(&blocks, &cfg, &domtree, &tables);
+        let resolved = resolve_test_indirect_calls(&blocks, &cfg, &domtree, &tables);
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].table_address, 0xc010);
         assert_eq!(resolved[0].targets, tables[0].targets[2..6]);
@@ -841,7 +963,7 @@ mod tests {
         // the read only describes three of them.
         let (blocks, tables) = hardware_dispatch(5);
         let (cfg, domtree) = graph_for(&blocks, 0x20, Some(0x10));
-        assert!(resolve_indirect_calls(&blocks, &cfg, &domtree, &tables).is_empty());
+        assert!(resolve_test_indirect_calls(&blocks, &cfg, &domtree, &tables).is_empty());
     }
 
     #[test]
@@ -881,6 +1003,72 @@ mod tests {
             entry_size: 8,
             targets: vec![0x1000, 0x1020],
         }];
-        assert!(resolve_indirect_calls(&blocks, &cfg, &domtree, &tables).is_empty());
+        assert!(resolve_test_indirect_calls(&blocks, &cfg, &domtree, &tables).is_empty());
+    }
+
+    #[test]
+    fn colliding_display_spelling_cannot_transfer_a_bound_between_values() {
+        let narrow_index = SSAVar::new("index", 1, 4);
+        let wide_index = SSAVar::new("index", 1, 8);
+        assert_eq!(narrow_index.display_name(), wide_index.display_name());
+        let condition = var("condition");
+        let scaled = var("scaled");
+        let address = var("address");
+        let callee = var("callee");
+        let blocks = vec![
+            SSABlock {
+                addr: 0,
+                phis: Vec::new(),
+                size: 0x10,
+                ops: vec![
+                    SSAOp::IntLess {
+                        dst: condition.clone(),
+                        a: narrow_index,
+                        b: SSAVar::constant(2, 4),
+                    },
+                    SSAOp::CBranch {
+                        target: SSAVar::constant(0x20, 8),
+                        cond: condition,
+                    },
+                ],
+            },
+            SSABlock {
+                addr: 0x10,
+                phis: Vec::new(),
+                size: 0x10,
+                ops: vec![SSAOp::Return { target: var("ret") }],
+            },
+            SSABlock {
+                addr: 0x20,
+                phis: Vec::new(),
+                size: 0x10,
+                ops: vec![
+                    SSAOp::IntMult {
+                        dst: scaled.clone(),
+                        a: wide_index,
+                        b: SSAVar::constant(8, 8),
+                    },
+                    SSAOp::IntAdd {
+                        dst: address.clone(),
+                        a: SSAVar::constant(0xc000, 8),
+                        b: scaled,
+                    },
+                    SSAOp::Load {
+                        dst: callee.clone(),
+                        space: r2il::SpaceId::Ram,
+                        addr: address,
+                    },
+                    SSAOp::CallInd { target: callee },
+                ],
+            },
+        ];
+        let (cfg, domtree) = graph_for(&blocks, 0x20, Some(0x10));
+        let tables = [Table {
+            address: 0xc000,
+            entry_size: 8,
+            targets: vec![0x1000, 0x1020],
+        }];
+
+        assert!(resolve_test_indirect_calls(&blocks, &cfg, &domtree, &tables).is_empty());
     }
 }
