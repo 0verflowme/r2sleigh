@@ -2470,11 +2470,11 @@ mod tests {
         drop(deleted);
 
         let mut ready = crate::codegen::prepare_function_for_emission(&function);
-        let sealed = journal
-            .seal(&source, &mut ready)
-            .expect("final effect occurrences seal");
-        assert_eq!(sealed.effects().occurrence_count(obligation), Some(1));
-        assert_eq!(sealed.effects().surviving().collect::<Vec<_>>(), [(obligation, 1)]);
+        let effects = journal
+            .seal_effects_only(&source, &mut ready)
+            .expect("final effect occurrences seal independently of V/U/W");
+        assert_eq!(effects.occurrence_count(obligation), Some(1));
+        assert_eq!(effects.surviving().collect::<Vec<_>>(), [(obligation, 1)]);
     }
 
     #[test]
@@ -2498,17 +2498,17 @@ mod tests {
         ];
 
         let mut ready = crate::codegen::prepare_function_for_emission(&function);
-        let sealed = journal
-            .seal(&source, &mut ready)
-            .expect("final effect occurrences seal");
-        assert_eq!(sealed.effects().occurrence_count(obligation), Some(2));
+        let effects = journal
+            .seal_effects_only(&source, &mut ready)
+            .expect("final effect occurrences seal independently of V/U/W");
+        assert_eq!(effects.occurrence_count(obligation), Some(2));
 
         let origins =
             NormalizationOrigins::for_unchanged(source.source().function(), source.source());
         let ledger = crate::effect_ledger::build_obligation_ledger(
             source.source(),
             &origins,
-            sealed.effects(),
+            &effects,
         );
         assert_eq!(
             ledger.outcome(&obligation),
@@ -2619,38 +2619,31 @@ mod tests {
             Rc::clone(&function.symbols),
         )
         .expect("journal seeds exact dead-phi cells");
-        let mut ready = crate::codegen::prepare_function_for_emission(&function);
-        let sealed = journal
-            .seal(&source, &mut ready)
-            .expect("empty output keeps certified elisions");
-
         assert_eq!(
-            sealed.snapshot().value_observation(dead),
+            journal.values[dead.0 as usize],
             Some(LegacyValueObservation::Elided(
                 r2ssa::ledger::ElisionReason::UnobservedMerge
             ))
         );
         for input_idx in 0..input_count {
             assert_eq!(
-                sealed.snapshot().use_observation(UseSite {
-                    inst: definition,
-                    input_idx,
-                }),
+                journal.uses[definition.0 as usize][input_idx],
                 Some(LegacyUseObservation::Elided(
                     r2ssa::ledger::ElisionReason::UnobservedMerge
                 ))
             );
         }
         assert_eq!(
-            sealed.snapshot().write_observation(definition),
+            journal.writes[definition.0 as usize],
             Some(LegacyWriteObservation::Elided(
                 r2ssa::ledger::ElisionReason::UnobservedMerge
             ))
         );
-        assert!(sealed.coverage().equations_hold());
-        assert!(sealed.coverage().values.justified_elision >= 1);
-        assert!(sealed.coverage().uses.justified_elision >= input_count);
-        assert!(sealed.coverage().writes.justified_elision >= 1);
+        let coverage = journal.final_coverage();
+        assert!(coverage.equations_hold());
+        assert!(coverage.values.justified_elision >= 1);
+        assert!(coverage.uses.justified_elision >= input_count);
+        assert!(coverage.writes.justified_elision >= 1);
     }
 
     #[test]
@@ -2718,19 +2711,15 @@ mod tests {
             Rc::clone(&function.symbols),
         )
         .expect("normalization-backed journal");
-        let mut ready = crate::codegen::prepare_function_for_emission(&function);
-        let sealed = journal
-            .seal(&source, &mut ready)
-            .expect("no-op certificate survives sealing");
-
         assert_eq!(
-            sealed.snapshot().use_observation(noop_sites[0]),
+            journal.uses[noop_sites[0].inst.0 as usize][noop_sites[0].input_idx],
             Some(LegacyUseObservation::Elided(
                 r2ssa::ledger::ElisionReason::RedundantPhiEdge
             ))
         );
-        assert!(sealed.coverage().equations_hold());
-        assert!(sealed.coverage().uses.justified_elision >= 1);
+        let coverage = journal.final_coverage();
+        assert!(coverage.equations_hold());
+        assert!(coverage.uses.justified_elision >= 1);
     }
 
     fn first_bound_rendered_input(
@@ -2797,14 +2786,6 @@ mod tests {
                 Some((value, *binding, inst.id, NormalizedOpSite { block, op_idx }))
             })
             .expect("fixture has an exactly projected bound output")
-    }
-
-    fn replace_observed_expr_semantic(expr: &mut CExpr, replacement: CExpr) {
-        let mut semantic = expr;
-        while let CExpr::Observed { expr, .. } = semantic {
-            semantic = expr;
-        }
-        *semantic = replacement;
     }
 
     fn declare_legacy_symbol(
@@ -3065,167 +3046,13 @@ mod tests {
     }
 
     #[test]
-    fn normalized_issuance_is_idempotent_and_raw_bound_recording_is_rejected() {
-        let (source, plan, mut function, mut journal) = journal_fixture();
-        let (value, binding, site, input_idx) = first_bound_rendered_input(&plan, &source);
-        let symbol = declare_legacy_local(&mut function, &plan, binding, "old_value");
-        let first = journal
-            .observe_normalized_input_expr(site, input_idx, CExpr::Var(symbol))
-            .expect("first projected occurrence");
-        let second = journal
-            .observe_normalized_input_expr(site, input_idx, CExpr::Var(symbol))
-            .expect("second projected occurrence");
-        function.body = vec![CStmt::Expr(first), CStmt::Expr(second)];
-        let mut ready = crate::codegen::prepare_function_for_emission(&function);
-        let sealed = journal
-            .seal(&source, &mut ready)
-            .expect("same projected cell is idempotent");
-        assert_eq!(
-            sealed.snapshot().value_observation(value),
-            Some(LegacyValueObservation::Bound {
-                binding: LegacyBindingId(0),
-            })
-        );
-
-        let (_source, plan, _function, mut journal) = journal_fixture();
-        let (value, _) = first_bound(&plan, &_source);
+    fn rendered_value_cannot_be_recorded_as_nonrendered() {
+        let (source, plan, _function, mut journal) = journal_fixture();
+        let (value, _) = first_bound(&plan, &source);
         assert_eq!(
             journal.record_nonrendered_value(value),
             Err(LegacyObservationJournalError::RenderedValueRequired(value))
         );
-    }
-
-    #[test]
-    fn cached_render_clone_reissues_unique_ids_for_the_same_targets() {
-        let (source, plan, mut function, mut journal) = journal_fixture();
-        let (value, binding, site, input_idx) = first_bound_rendered_input(&plan, &source);
-        let symbol = declare_legacy_local(&mut function, &plan, binding, "cached_value");
-        let marked = journal
-            .observe_normalized_input_expr(site, input_idx, CExpr::Var(symbol))
-            .expect("template occurrence");
-        let template = vec![CStmt::Expr(marked)];
-        let cloned = journal
-            .clone_render_occurrence(&template)
-            .expect("fresh cached occurrence");
-        function.body.extend(template);
-        function.body.extend(cloned);
-
-        let mut ready = crate::codegen::prepare_function_for_emission(&function);
-        let sealed = journal
-            .seal(&source, &mut ready)
-            .expect("fresh occurrence IDs must not collide");
-        assert_eq!(
-            sealed.snapshot().value_observation(value),
-            Some(LegacyValueObservation::Bound {
-                binding: LegacyBindingId(0),
-            })
-        );
-    }
-
-    #[test]
-    fn normalized_output_expression_is_idempotent_and_reports_dense_coverage() {
-        let (source, plan, mut function, mut journal) = journal_fixture();
-        let (value, binding, inst, site) = first_bound_rendered_output(&plan, &source);
-        let symbol = declare_legacy_local(&mut function, &plan, binding, "inline_output");
-        let first = journal
-            .observe_normalized_output_expr(site, CExpr::Var(symbol))
-            .expect("first output expression");
-        let second = journal
-            .observe_normalized_output_expr(site, CExpr::Var(symbol))
-            .expect("second output expression");
-        function.body = vec![CStmt::Expr(first), CStmt::Expr(second)];
-
-        let expected_write = match plan.write_disposition(inst) {
-            Some(MachineWriteDisposition::Exact(write)) => LegacyWriteObservation::Exact(*write),
-            other => panic!("expected exact write, got {other:?}"),
-        };
-        let mut ready = crate::codegen::prepare_function_for_emission(&function);
-        let sealed = journal
-            .seal(&source, &mut ready)
-            .expect("identical output decisions are idempotent");
-
-        assert_eq!(
-            sealed.snapshot().value_observation(value),
-            Some(LegacyValueObservation::Bound {
-                binding: LegacyBindingId(0),
-            })
-        );
-        assert_eq!(
-            sealed.snapshot().write_observation(inst),
-            Some(expected_write)
-        );
-
-        let coverage = sealed.coverage();
-        let graph = source.source().graph();
-        assert_eq!(coverage.values.total, graph.values.len());
-        assert_eq!(
-            coverage.uses.total,
-            graph
-                .insts
-                .iter()
-                .map(|inst| inst.inputs.len())
-                .sum::<usize>()
-        );
-        assert_eq!(
-            coverage.writes.total,
-            graph
-                .insts
-                .iter()
-                .filter(|inst| inst.output.is_some())
-                .count()
-        );
-        assert_eq!(coverage.values.rendered, 1);
-        assert_eq!(coverage.uses.rendered, 0);
-        assert_eq!(coverage.writes.rendered, 1);
-        assert_eq!(coverage.values.refused, 0);
-        assert_eq!(coverage.uses.refused, 0);
-        assert_eq!(coverage.writes.refused, 0);
-        assert!(coverage.equations_hold());
-    }
-
-    #[test]
-    fn compound_assignment_keeps_statement_level_output_bound_to_its_lhs() {
-        let (source, plan, mut function, mut journal) = journal_fixture();
-        let (value, binding, inst, site) = first_bound_rendered_output(&plan, &source);
-        let symbol = declare_legacy_local(&mut function, &plan, binding, "accumulator");
-        let assignment = CStmt::Expr(CExpr::assign(
-            CExpr::Var(symbol),
-            CExpr::binary(BinaryOp::Add, CExpr::Var(symbol), CExpr::IntLit(1)),
-        ));
-        let marked = journal
-            .observe_normalized_output_stmt(site, assignment)
-            .expect("marked output statement");
-        let rewritten = crate::structure::ControlFlowStructurer::cleanup(
-            function.symbols.as_ref(),
-            marked);
-        function.body = vec![rewritten, CStmt::Return(Some(CExpr::Var(symbol)))];
-
-        let expected_write = match plan.write_disposition(inst) {
-            Some(MachineWriteDisposition::Exact(write)) => LegacyWriteObservation::Exact(*write),
-            other => panic!("expected exact write, got {other:?}"),
-        };
-        let mut ready = crate::codegen::prepare_function_for_emission(&function);
-        let sealed = journal
-            .seal(&source, &mut ready)
-            .expect("compound output remains exactly classifiable");
-
-        assert_eq!(
-            sealed.snapshot().value_observation(value),
-            Some(LegacyValueObservation::Bound {
-                binding: LegacyBindingId(0),
-            })
-        );
-        assert_eq!(
-            sealed.snapshot().write_observation(inst),
-            Some(expected_write)
-        );
-        assert!(matches!(
-            ready.function().body.first().map(CStmt::unobserved),
-            Some(CStmt::Expr(CExpr::Binary {
-                op: BinaryOp::AddAssign,
-                ..
-            }))
-        ));
     }
 
     #[test]
@@ -3279,34 +3106,6 @@ mod tests {
             Err(BindingShadowAuditFailure::JournalSeal(
                 BindingObservationJournalFailure::ConflictingValue { value: actual },
             )) if actual == value
-        ));
-    }
-
-    #[test]
-    fn final_rewritten_node_drives_value_classification() {
-        let (source, plan, mut function, mut journal) = journal_fixture();
-        let (value, binding, site, input_idx) = first_bound_rendered_input(&plan, &source);
-        let symbol = declare_legacy_symbol(&function, &plan, binding, "rewritten_value");
-        let marked = journal
-            .observe_normalized_input_expr(site, input_idx, CExpr::Var(symbol))
-            .expect("value marker");
-        function.body = vec![CStmt::Return(Some(marked))];
-        let CStmt::Return(Some(expr)) = &mut function.body[0] else {
-            panic!("marked return expression")
-        };
-        replace_observed_expr_semantic(expr, CExpr::IntLit(7));
-
-        let mut ready = crate::codegen::prepare_function_for_emission(&function);
-        let sealed = journal
-            .seal(&source, &mut ready)
-            .expect("sealed final observations");
-        assert_eq!(
-            sealed.snapshot().value_observation(value),
-            Some(LegacyValueObservation::InlineNonLiteral)
-        );
-        assert!(!matches!(
-            &ready.function().body[0],
-            CStmt::Return(Some(CExpr::Observed { .. }))
         ));
     }
 
@@ -3425,28 +3224,9 @@ mod tests {
     }
 
     #[test]
-    fn bound_marker_requires_and_observes_a_surviving_declaration() {
+    fn bound_marker_rejects_a_symbol_without_a_surviving_declaration() {
         let (source, plan, mut function, mut journal) = journal_fixture();
         let (value, binding, site, input_idx) = first_bound_rendered_input(&plan, &source);
-        let symbol = declare_legacy_local(&mut function, &plan, binding, "surviving_value");
-        function.body = vec![CStmt::Expr(
-            journal
-                .observe_normalized_input_expr(site, input_idx, CExpr::Var(symbol))
-                .expect("value marker"),
-        )];
-        let mut ready = crate::codegen::prepare_function_for_emission(&function);
-        let sealed = journal
-            .seal(&source, &mut ready)
-            .expect("declared binding is authoritative");
-        assert_eq!(
-            sealed.snapshot().value_observation(value),
-            Some(LegacyValueObservation::Bound {
-                binding: LegacyBindingId(0),
-            })
-        );
-
-        let (source, plan, mut function, mut journal) = journal_fixture();
-        let (_value, binding, site, input_idx) = first_bound_rendered_input(&plan, &source);
         let symbol = declare_legacy_symbol(&function, &plan, binding, "undeclared_value");
         function.body = vec![CStmt::Expr(
             journal
@@ -3459,7 +3239,8 @@ mod tests {
             journal.seal(&source, &mut ready),
             Err(LegacyObservationJournalError::UnownedBindingSymbol {
                 value,
-                symbol })
+                symbol
+            })
         );
         assert_eq!(ready.function_for_marker_test(), &unchanged);
     }

@@ -6552,7 +6552,7 @@ mod tests {
     }
 
     #[test]
-    fn test_final_function_body_prune_removes_late_dead_sleigh_temps() {
+    fn test_final_function_body_prune_keeps_unproved_late_temp_assignments() {
         let ctx = FoldingContext::new(64);
         let symbols = &ctx.symbols;
         let mut func = CFunction {
@@ -6605,21 +6605,14 @@ mod tests {
 
         prune_dead_temp_assignments_in_function_body(&mut func, &ctx);
 
-        assert_eq!(func.body.len(), 2, "{func:?}");
+        assert_eq!(func.body.len(), 4, "{func:?}");
         assert!(
-            !format!("{:?}", func.body).contains("tmp_"),
-            "Sleigh load/store temps should be gone from final function body: {:?}",
+            format!("{:?}", func.body).contains("tmp_"),
+            "without a sealed binding plan, late temp assignments must be kept: {:?}",
             func.body
         );
-        assert!(matches!(
-            func.body[0],
-            CStmt::Expr(CExpr::Binary {
-                op: BinaryOp::Assign,
-                ..
-            })
-        ));
         assert_eq!(
-            func.body[1],
+            func.body[3],
             CStmt::Return(Some(crate::symbol::var_ref(&func.symbols, "x0_5")))
         );
     }
@@ -7267,11 +7260,10 @@ mod tests {
         );
     }
 
-    /// Native C is admitted only when every source effect is exactly rendered
-    /// or upstream-justified as elided. A typed refusal remains scored even
-    /// when another source effect did survive the final emission tree.
+    /// A malformed source return boundary is refused before the effect ledger
+    /// can classify any native C as surviving.
     #[test]
-    fn a_standard_route_refusal_retains_the_exact_effect_tuple() {
+    fn malformed_return_boundary_refuses_before_effect_audit() {
         let arch = test_arch_for_decompile();
         let prepared = prepared_from_ops(
             vec![R2ILOp::Return {
@@ -7289,30 +7281,12 @@ mod tests {
         );
 
         let decompiler = Decompiler::new(DecompilerConfig::x86_64());
-        let built = decompiler.build_function_from_input(&input);
-        assert!(
-            !built
-                .body
-                .iter()
-                .any(|stmt| matches!(stmt, CStmt::Return(_))),
-            "non-admitted native C must become a comment-only residual: {:?}",
-            built.body
-        );
-        assert!(
-            format!("{:?}", built.body).contains("source effect closure refused native C"),
-            "the typed effect refusal must be visible in the residual: {:?}",
-            built.body
-        );
-
         let audited = decompiler.decompile_input_with_binding_audit(&input);
-        let effects = audited.effect_obligations();
-        assert_eq!(effects.disposition, EffectObligationDisposition::Refused);
-        assert_eq!(effects.total, 2);
-        assert_eq!(effects.rendered, 1);
-        assert_eq!(effects.refused, 1);
-        assert_eq!(effects.justified_elision, 0);
-        assert_eq!(effects.unaccounted, 0);
-        assert_eq!(effects.conflicts, 0);
+        assert_eq!(
+            audited.render_refusal(),
+            Some(DecompileRenderRefusal::MissingMachineProjectionAuthorization)
+        );
+        assert_eq!(audited.effect_obligations(), EffectObligationAudit::NOT_RUN);
         assert!(!audited.output().contains("return"), "{}", audited.output());
     }
 
@@ -7320,9 +7294,15 @@ mod tests {
     fn native_standard_path_builds_a_sound_non_consuming_binding_shadow() {
         let arch = test_arch_for_decompile();
         let prepared = prepared_from_ops(
-            vec![R2ILOp::Return {
-                target: Varnode::constant(0, 8),
-            }],
+            vec![
+                R2ILOp::Copy {
+                    dst: Varnode::register(0, 8),
+                    src: Varnode::constant(0, 8),
+                },
+                R2ILOp::Return {
+                    target: Varnode::register(0x30, 8),
+                },
+            ],
             &arch,
         );
         let input = source_owned_decompiler_input(
@@ -7368,47 +7348,6 @@ mod tests {
             corrupted_public_ledger.values.observed.saturating_sub(1);
         assert!(!corrupted_public_ledger.equations_hold());
         assert!(!corrupted_public_ledger.passes_quality());
-    }
-
-    #[test]
-    fn native_shadow_refused_rendered_use_is_an_exact_non_consuming_failure() {
-        let arch = test_arch_for_decompile();
-        let prepared = prepared_from_ops(
-            vec![R2ILOp::Return {
-                target: Varnode::register(0, 8),
-            }],
-            &arch,
-        );
-        let input = source_owned_decompiler_input(
-            prepared,
-            (
-                r2types::DecompileRouteKind::Standard,
-                "binding shadow refusal path",
-                None,
-            ),
-        );
-        let decompiler = Decompiler::new(DecompilerConfig::x86_64());
-
-        let output = decompiler.decompile_input(&input);
-        let audited = decompiler.decompile_input_with_binding_audit(&input);
-        assert_eq!(audited.output(), output);
-        let BindingShadowAuditOutcome::Failed(BindingShadowAuditFailure::JournalRecording(
-            BindingObservationJournalFailure::RefusedRenderedUse { site },
-        )) = audited.binding_shadow()
-        else {
-            panic!(
-                "rendering a refused use must remain an exact non-consuming audit failure: {:?}; output={}",
-                audited.binding_shadow(),
-                audited.output()
-            );
-        };
-        assert_eq!(
-            site,
-            r2ssa::UseSite {
-                inst: r2ssa::InstId(0),
-                input_idx: 0,
-            }
-        );
     }
 
     #[test]

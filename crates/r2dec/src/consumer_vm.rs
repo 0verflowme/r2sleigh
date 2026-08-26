@@ -331,7 +331,7 @@ mod tests {
             src: Varnode::constant(0, 4),
         });
         block.push(R2ILOp::Return {
-            target: Varnode::register(0x00, 4),
+            target: Varnode::register(0x30, 8),
         });
 
         let storage = |offset| r2ssa::CanonicalStorageId {
