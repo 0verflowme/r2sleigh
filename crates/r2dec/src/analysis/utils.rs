@@ -191,6 +191,7 @@ pub(crate) fn uf_find(parent: &mut HashMap<String, String>, x: &str) -> String {
 ///
 /// So this reconstructs the variable and asks the same question `spell_var`
 /// asks. There is one spelling of a value, and this is not a second one.
+#[cfg(test)]
 pub(crate) fn format_traced_name(key: &str, var_aliases: &HashMap<String, String>) -> String {
     if let Some(alias) = var_aliases.get(key) {
         return alias.clone();
@@ -210,6 +211,7 @@ pub(crate) fn format_traced_name(key: &str, var_aliases: &HashMap<String, String
 ///
 /// `display_name` joins them with an underscore, and a machine name may contain
 /// underscores of its own, so only a numeric tail is a version.
+#[cfg(test)]
 pub(crate) fn split_display_name(key: &str) -> (&str, u32) {
     match key.rsplit_once('_') {
         Some((base, tail)) => match tail.parse::<u32>() {
@@ -271,6 +273,7 @@ pub(crate) fn is_low_signal_ssa_storage_name(name: &str) -> bool {
     )
 }
 
+#[cfg(test)]
 pub(crate) fn ssa_render_base_name(var: &SSAVar) -> String {
     match var.name_kind() {
         SSAVarNameKind::RegisterAlias => {
@@ -289,6 +292,7 @@ pub(crate) fn ssa_render_base_name(var: &SSAVar) -> String {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn trace_ssa_var_to_source(
     var: &SSAVar,
     copy_source: &impl Fn(&str) -> Option<String>,
@@ -523,6 +527,7 @@ pub(crate) fn normalize_stack_address(symbols: &std::cell::RefCell<crate::symbol
     addr_key
 }
 
+#[cfg(test)]
 pub(crate) fn arg_alias_for_register_name(reg_name: &str) -> Option<String> {
     let reg = reg_name.to_lowercase();
     if reg.contains("rdi") || reg.contains("edi") {
@@ -546,6 +551,7 @@ pub(crate) fn arg_alias_for_register_name(reg_name: &str) -> Option<String> {
     None
 }
 
+#[cfg(test)]
 pub(crate) fn arg_alias_for_ssa_name(ssa_name: &str) -> Option<String> {
     let (base, version) = ssa_name.rsplit_once('_')?;
     if version != "0" {
@@ -554,6 +560,7 @@ pub(crate) fn arg_alias_for_ssa_name(ssa_name: &str) -> Option<String> {
     arg_alias_for_register_name(base)
 }
 
+#[cfg(test)]
 pub(crate) fn param_register_alias_for_ssa_name(
     ssa_name: &str,
     param_register_aliases: &HashMap<String, String>,
@@ -575,6 +582,7 @@ pub(crate) fn param_register_alias_for_ssa_name(
 /// `copy_source` answers "what was copied into this name". It used to be a
 /// name-to-name map handed in whole; it is now a lookup, because the copies are
 /// recorded between identities and the names are recovered from them.
+#[cfg(test)]
 pub(crate) fn arg_alias_for_store_source(
     src: &SSAVar,
     copy_source: impl Fn(&str) -> Option<String>,

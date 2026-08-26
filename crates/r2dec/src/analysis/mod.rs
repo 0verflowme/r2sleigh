@@ -5,7 +5,9 @@ use std::sync::OnceLock;
 use r2ssa::{FunctionSSABlock, SSAVar, ValueId};
 use r2types::{CalleeFact, CalleeResolutionFacts, InterprocSummaryView, TypeOracle};
 
-use crate::ast::{CExpr, CType};
+use crate::ast::CExpr;
+#[cfg(test)]
+use crate::ast::CType;
 
 pub(crate) type SSABlock = FunctionSSABlock;
 
@@ -23,7 +25,8 @@ pub(crate) use ownership::{
 };
 pub(crate) use predicate::{PredicateAnalysisView, PredicateSimplifier};
 pub(crate) use prepared_semantic::{
-    PreparedCallView, PreparedSemanticView, PreparedSemanticViewInputs,
+    PreparedCallView, PreparedRuntimeFactsError, PreparedSemanticView,
+    PreparedSemanticViewInputs,
     build_prepared_runtime_facts_with_control,
 };
 
@@ -82,6 +85,7 @@ pub(crate) fn no_flag_registers() -> &'static std::collections::HashSet<String> 
     EMPTY.get_or_init(std::collections::HashSet::new)
 }
 
+#[cfg(test)]
 pub(crate) fn no_carrier_aliases() -> &'static HashMap<String, String> {
     static EMPTY: std::sync::OnceLock<HashMap<String, String>> = std::sync::OnceLock::new();
     EMPTY.get_or_init(HashMap::new)
@@ -115,12 +119,16 @@ pub(crate) struct PassEnv<'a> {
     pub(crate) callee_resolution: Option<&'a CalleeResolutionFacts>,
     pub(crate) summary_view: Option<&'a InterprocSummaryView>,
     pub(crate) arg_regs: &'a [String],
+    #[cfg(test)]
     pub(crate) param_register_aliases: &'a HashMap<String, String>,
-    /// One name per certified loop carrier, shared by every version it passes through.
+    #[cfg(test)]
     pub(crate) carrier_aliases: &'a HashMap<String, String>,
     /// Where a rendered name is written down, so building a reference can mint one.
     pub(crate) symbols: &'a std::cell::RefCell<crate::symbol::SymbolTable>,
     pub(crate) caller_saved_regs: &'a HashSet<String>,
+    /// Legacy spelling-keyed type hints exist only for fixtures. Production
+    /// asks `TypeOracle` with the exact `SSAVar` whose type is needed.
+    #[cfg(test)]
     pub(crate) type_hints: &'a HashMap<String, CType>,
     pub(crate) type_oracle: Option<&'a dyn TypeOracle>,
 }
@@ -143,6 +151,7 @@ pub(crate) struct UseInfo {
     pub(crate) frame_slot_merges: HashMap<String, FrameSlotMergeSummary>,
     pub(crate) frame_object_field_roots: HashMap<FrameObjectFieldKey, SemanticValue>,
     pub(crate) phi_sources: HashMap<String, Vec<SSAVar>>,
+    #[cfg(test)]
     pub(crate) formatted_defs: HashMap<String, CExpr>,
     pub(crate) copy_sources_by_value: BTreeMap<ValueId, ValueId>,
     pub(crate) memory_stores: HashMap<String, String>,
@@ -157,7 +166,9 @@ pub(crate) struct UseInfo {
     pub(crate) direct_call_result_aliases: HashSet<String>,
     pub(crate) switch_selector_roots: BTreeMap<u64, SemanticValue>,
     pub(crate) consumed_by_call: HashSet<String>,
+    #[cfg(test)]
     pub(crate) var_aliases: HashMap<String, String>,
+    #[cfg(test)]
     pub(crate) type_hints: HashMap<String, CType>,
     pub(crate) stack_slots_by_value: BTreeMap<ValueId, StackSlotProvenance>,
     pub(crate) stable_stack_values: HashMap<i64, SemanticValue>,
@@ -1004,12 +1015,11 @@ impl UseInfo {
     }
 
     pub(crate) fn has_renderable_named_fact(&self, name: &str) -> bool {
-        lookup_name_key(&self.var_aliases, name).is_some()
-            || self.value_id_for_name(name).is_some_and(|value_id| {
-                self.definitions_by_value.contains_key(&value_id)
-                    || self.semantic_values_by_value.contains_key(&value_id)
-                    || self.copy_sources_by_value.contains_key(&value_id)
-            })
+        self.value_id_for_name(name).is_some_and(|value_id| {
+            self.definitions_by_value.contains_key(&value_id)
+                || self.semantic_values_by_value.contains_key(&value_id)
+                || self.copy_sources_by_value.contains_key(&value_id)
+        })
     }
 
     /// Every name any pass has something to say about, borrowed.
@@ -1021,7 +1031,6 @@ impl UseInfo {
         self.definitions_by_value
             .keys()
             .filter_map(move |value_id| names.get(value_id).cloned())
-            .chain(self.var_aliases.keys().cloned())
     }
 
     /// A spelling for each value, preferring the variable that owns it.
@@ -1132,8 +1141,8 @@ impl UseInfo {
             .is_some_and(|value_id| self.condition_values.contains(&value_id))
     }
 
+    #[cfg(test)]
     pub(crate) fn call_result_source_for_name(&self, name: &str) -> Option<(u64, usize)> {
-
         if self.ambiguous_value_names.contains(name) {
             return None;
         }

@@ -17,7 +17,7 @@ use super::super::{
     StackSlotProvenance, StackSlotValueKind, UseInfo, ValueProvenance,
     ValueRef, lower::LowerCtx, utils,
 };
-use crate::ast::{BinaryOp, CExpr, CType};
+use crate::ast::{BinaryOp, CExpr};
 use crate::control::{DecompileExecutionStop, DecompileWorkControl, DecompileWorkPhase};
 use crate::registers::register_family_name;
 
@@ -28,23 +28,47 @@ pub(crate) struct UseScratch {
 }
 
 #[derive(Debug, Default)]
-struct SemanticTypeHintCache {
-    names_by_var: HashMap<String, Vec<String>>,
-    stack_slot_names_by_offset: HashMap<i64, Vec<String>>,
+struct SemanticTypeHintCache;
+
+fn exact_parameter_slot_for_var(
+    info: &UseInfo,
+    var: &SSAVar,
+    env: &PassEnv<'_>,
+) -> Option<u32> {
+    let resolver = env.binding_names?;
+    let value = info.exact_value_id_for_var(var)?;
+    let crate::binding_plan::PlannedValueSymbol::Bound(symbol) =
+        resolver.require_value(value).ok()?
+    else {
+        return None;
+    };
+    resolver
+        .parameters()
+        .filter_map(Result::ok)
+        .find_map(|parameter| (parameter.symbol == symbol).then_some(parameter.slot))
+}
+
+fn exact_parameter_slot_for_symbol(
+    env: &PassEnv<'_>,
+    symbol: crate::symbol::SymbolId,
+) -> Option<u32> {
+    env.binding_names?
+        .parameters()
+        .filter_map(Result::ok)
+        .find_map(|parameter| (parameter.symbol == symbol).then_some(parameter.slot))
+}
+
+fn exact_var_has_pointer_type(var: &SSAVar, env: &PassEnv<'_>) -> bool {
+    let Some(oracle) = env.type_oracle else {
+        return false;
+    };
+    let ty = oracle.type_of(var);
+    oracle.is_pointer(ty) || oracle.is_array(ty) || oracle.struct_shape(ty).is_some()
 }
 
 impl SemanticTypeHintCache {
-    fn from_info(info: &UseInfo) -> Self {
-        let mut stack_slot_names_by_offset: HashMap<i64, Vec<String>> = HashMap::new();
-        for (slot_name, slot) in info.stack_slots_with_names() {
-            let entry = stack_slot_names_by_offset.entry(slot.offset).or_default();
-            push_unique_casefold(entry, slot_name.clone());
-            push_unique_casefold(entry, slot_name.to_ascii_lowercase());
-        }
-        Self {
-            names_by_var: HashMap::new(),
-            stack_slot_names_by_offset,
-        }
+    fn from_info(_info: &UseInfo) -> Self {
+        Self
     }
 }
 
@@ -104,17 +128,14 @@ fn analyze_value_facts(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
 ) -> Result<UseScratch, DecompileExecutionStop> {
     control.poll()?;
     let mut scratch = UseScratch::default();
-    scratch.info.type_hints = env.type_hints.clone();
+    #[cfg(test)]
+    {
+        scratch.info.type_hints = env.type_hints.clone();
+    }
     scratch.info.flag_regs = env.flag_regs.clone();
     seed_local_value_ids(&mut scratch, blocks);
+    #[cfg(test)]
     seed_entry_param_aliases(&mut scratch, blocks, env);
-    for (version, name) in env.carrier_aliases {
-        scratch
-            .info
-            .var_aliases
-            .entry(version.clone())
-            .or_insert_with(|| name.clone());
-    }
 
     for block in blocks {
         control.poll()?;
@@ -134,6 +155,7 @@ fn analyze_value_facts(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
 
     analyze_call_args(symbols, &mut scratch, blocks, env);
     bind_single_use_call_result_definitions(symbols, &mut scratch, blocks, env);
+    #[cfg(test)]
     propagate_call_result_aliases(symbols, &mut scratch.info, control)?;
     rerun_semantic_call_analysis_after_result_binding(symbols, &mut scratch, blocks, env, control)?;
     Ok(scratch)
@@ -157,9 +179,12 @@ fn name_values_for_rendering(
     env: &PassEnv<'_>,
     control: DecompileWorkControl<'_>,
 ) -> Result<(), DecompileExecutionStop> {
-    coalesce_variables(scratch, blocks, env, control)?;
-    pin_aliases_for_pinned_values(&mut scratch.info);
-    build_formatted_defs(symbols, scratch, env);
+    #[cfg(test)]
+    {
+        coalesce_variables(scratch, blocks, env, control)?;
+        pin_aliases_for_pinned_values(&mut scratch.info);
+        build_formatted_defs(symbols, scratch, env);
+    }
     control.poll()
 }
 
@@ -214,6 +239,7 @@ fn rerun_semantic_call_analysis_after_result_binding(symbols: &std::cell::RefCel
     refresh_semantic_values(symbols, scratch, blocks, env);
     analyze_call_args(symbols, scratch, blocks, env);
     bind_single_use_call_result_definitions(symbols, scratch, blocks, env);
+    #[cfg(test)]
     propagate_call_result_aliases(symbols, &mut scratch.info, control)?;
     Ok(())
 }
@@ -269,6 +295,18 @@ fn exact_call_arg_source_value_id(info: &UseInfo, source_var: &SSAVar) -> Option
     info.exact_value_id_for_var(source_var)
 }
 
+fn legacy_program_expr_for_var(lower: &LowerCtx<'_>, var: &SSAVar) -> Option<CExpr> {
+    #[cfg(test)]
+    {
+        Some(lower.expr_for_ssa_name(&var.display_name()))
+    }
+    #[cfg(not(test))]
+    {
+        let _ = (lower, var);
+        None
+    }
+}
+
 fn same_register_family_call_arg_source(src: &SSAVar, dst: &SSAVar) -> bool {
     let Some(src_family) = register_family_name(&src.name) else {
         return false;
@@ -277,25 +315,6 @@ fn same_register_family_call_arg_source(src: &SSAVar, dst: &SSAVar) -> bool {
         return false;
     };
     src_family == dst_family
-}
-
-fn push_unique_casefold(names: &mut Vec<String>, name: String) {
-    if !names
-        .iter()
-        .any(|existing| existing.eq_ignore_ascii_case(&name))
-    {
-        names.push(name);
-    }
-}
-
-fn lookup_type_hint<'a>(info: &'a UseInfo, env: &'a PassEnv<'_>, name: &str) -> Option<&'a CType> {
-
-    let lower = name.to_ascii_lowercase();
-    info.type_hints
-        .get(name)
-        .or_else(|| info.type_hints.get(&lower))
-        .or_else(|| env.type_hints.get(name))
-        .or_else(|| env.type_hints.get(&lower))
 }
 
 fn record_call_result_alias(info: &mut UseInfo, source_call: (u64, usize), alias: &str) {
@@ -343,7 +362,7 @@ fn semantic_value_preservation_score(symbols: &std::cell::RefCell<crate::symbol:
             if root.var.version == 0 {
                 score += 40;
             }
-            score + call_arg_expr_preservation_score(symbols, &crate::symbol::var_ref(symbols, root.display_name()), 0)
+            score + 70
         }
         SemanticValue::Address(addr) => 220 + normalized_addr_rank(addr),
         SemanticValue::Load { addr, .. } => 260 + normalized_addr_rank(addr),
@@ -615,12 +634,8 @@ fn canonical_value_ref_key(
         return canonical_value_ref_key(info, &ValueRef::from(source_var), env, depth + 1);
     }
 
-    if value.var.version == 0
-        && let Some(alias) = env
-            .param_register_aliases
-            .get(&value.var.name.to_ascii_lowercase())
-    {
-        return format!("param:{alias}");
+    if let Some(slot) = exact_parameter_slot_for_var(info, &value.var, env) {
+        return format!("param:{slot}");
     }
 
     key
@@ -1387,17 +1402,8 @@ fn switch_selector_candidate_score(symbols: &std::cell::RefCell<crate::symbol::S
             } else {
                 score += 100;
             }
-            let display = root.display_name();
-            if let Some(alias) = info.var_aliases.get(&display) {
-                if alias.eq_ignore_ascii_case("argc")
-                    || alias.eq_ignore_ascii_case("argv")
-                    || alias.eq_ignore_ascii_case("envp")
-                    || alias.starts_with("arg")
-                {
-                    score -= 80;
-                } else {
-                    score += 80;
-                }
+            if root.var.version == 0 {
+                score -= 80;
             }
         }
         SemanticValue::Scalar(ScalarValue::Expr(expr)) => {
@@ -1516,9 +1522,16 @@ fn arg_slot_for_value_ref(
         return None;
     }
 
-    let key = value_ref.var.name.to_ascii_lowercase();
+    if let Some(slot) = exact_parameter_slot_for_var(info, &value_ref.var, env)
+        .and_then(|slot| usize::try_from(slot).ok())
+    {
+        return Some(slot);
+    }
+    #[cfg(test)]
     if value_ref.var.version == 0
-        && let Some(slot) = arg_slot_map.get(&key).copied()
+        && let Some(slot) = arg_slot_map
+            .get(&value_ref.var.name.to_ascii_lowercase())
+            .copied()
     {
         return Some(slot);
     }
@@ -1569,18 +1582,10 @@ fn arg_slot_for_value_ref(
         );
     }
 
-    if let Some(alias) = env.param_register_aliases.get(&key)
-        && let Some(slot) = alias
-            .strip_prefix("arg")
-            .and_then(|suffix| suffix.parse::<usize>().ok())
-            .and_then(|idx| idx.checked_sub(1))
-    {
-        return Some(slot);
-    }
-
     None
 }
 
+#[cfg(test)]
 fn seed_entry_param_aliases(scratch: &mut UseScratch, blocks: &[SSABlock], env: &PassEnv<'_>) {
     for block in blocks {
         block.for_each_source(|src| {
@@ -1683,6 +1688,7 @@ fn pin_phi_materialized_var(info: &mut UseInfo, var: &SSAVar) {
     info.pinned.insert(display.to_ascii_lowercase());
 }
 
+#[cfg(test)]
 fn pin_aliases_for_pinned_values(info: &mut UseInfo) {
     let mut aliases = Vec::new();
     for pinned in &info.pinned {
@@ -1965,8 +1971,11 @@ fn collect_definitions(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
                         string_literals: env.string_literals,
                         use_info: Some(&scratch.info),
                         pinned: &scratch.info.pinned,
+                        #[cfg(test)]
                         var_aliases: &scratch.info.var_aliases,
+                        #[cfg(test)]
                         param_register_aliases: env.param_register_aliases,
+                        #[cfg(test)]
                         type_hints: &scratch.info.type_hints,
                         type_oracle: env.type_oracle,
                     };
@@ -1977,7 +1986,8 @@ fn collect_definitions(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
                 match lowered {
                     Ok(expr) => scratch.info.insert_definition_for_var(dst, expr),
                     Err(
-                        crate::analysis::lower::OpLoweringRefusal::MissingMachineProjectionAuthorization
+                        crate::analysis::lower::OpLoweringRefusal::MissingProgramVariableAuthorization
+                        | crate::analysis::lower::OpLoweringRefusal::MissingMachineProjectionAuthorization
                         | crate::analysis::lower::OpLoweringRefusal::UnrepresentableOperation,
                     ) => {
                         // Definitions are advisory here. The canonical machine
@@ -2042,8 +2052,11 @@ fn rebuild_definitions(
                     string_literals: env.string_literals,
                     use_info: Some(&scratch.info),
                     pinned: &scratch.info.pinned,
+                    #[cfg(test)]
                     var_aliases: &scratch.info.var_aliases,
+                    #[cfg(test)]
                     param_register_aliases: env.param_register_aliases,
+                    #[cfg(test)]
                     type_hints: &scratch.info.type_hints,
                     type_oracle: env.type_oracle,
                 };
@@ -2059,7 +2072,8 @@ fn rebuild_definitions(
             match lowered {
                 Ok(expr) => scratch.info.insert_definition_for_var(dst, expr),
                 Err(
-                    crate::analysis::lower::OpLoweringRefusal::MissingMachineProjectionAuthorization
+                    crate::analysis::lower::OpLoweringRefusal::MissingProgramVariableAuthorization
+                    | crate::analysis::lower::OpLoweringRefusal::MissingMachineProjectionAuthorization
                     | crate::analysis::lower::OpLoweringRefusal::UnrepresentableOperation,
                 ) => {
                     // Keep the definition absent rather than caching a guessed
@@ -2766,36 +2780,6 @@ fn var_is_ptr_sized_entry_arg_root(var: &SSAVar, env: &PassEnv<'_>) -> bool {
             .any(|reg_name| reg_name.eq_ignore_ascii_case(&var.name))
 }
 
-fn entry_arg_root_type_hint_allows_pointer_base(
-    info: &UseInfo,
-    var: &SSAVar,
-    env: &PassEnv<'_>,
-) -> bool {
-    let mut saw_type_hint = false;
-    for name in semantic_type_hint_names(info, var, env) {
-        let hint = info
-            .type_hints
-            .get(&name)
-            .or_else(|| info.type_hints.get(&name.to_ascii_lowercase()))
-            .or_else(|| env.type_hints.get(&name))
-            .or_else(|| env.type_hints.get(&name.to_ascii_lowercase()));
-        let Some(hint) = hint else {
-            continue;
-        };
-        saw_type_hint = true;
-        if matches!(
-            hint,
-            crate::ast::CType::Pointer(_)
-                | crate::ast::CType::Struct(_)
-                | crate::ast::CType::Array(_, _)
-        ) {
-            return true;
-        }
-    }
-
-    !saw_type_hint
-}
-
 fn resolve_ptr_sized_entry_arg_root_var(
     info: &UseInfo,
     var: &SSAVar,
@@ -2807,7 +2791,7 @@ fn resolve_ptr_sized_entry_arg_root_var(
     }
 
     if var_is_ptr_sized_entry_arg_root(var, env)
-        && entry_arg_root_type_hint_allows_pointer_base(info, var, env)
+        && (env.type_oracle.is_none() || exact_var_has_pointer_type(var, env))
     {
         return Some(var.clone());
     }
@@ -2931,22 +2915,7 @@ fn semantic_var_is_pointer_like(info: &UseInfo, var: &SSAVar, env: &PassEnv<'_>)
     {
         return true;
     }
-    if let Some(oracle) = env.type_oracle {
-        let ty = oracle.type_of(var);
-        if oracle.is_pointer(ty) || oracle.is_array(ty) {
-            return true;
-        }
-    }
-    semantic_type_hint_names(info, var, env)
-        .into_iter()
-        .find_map(|name| lookup_type_hint(info, env, &name))
-        .map(|ty| {
-            matches!(
-                ty,
-                CType::Pointer(_) | CType::Struct(_) | CType::Array(_, _)
-            )
-        })
-        .unwrap_or(false)
+    exact_var_has_pointer_type(var, env)
 }
 
 fn semantic_var_is_pointer_like_cached(
@@ -2996,33 +2965,16 @@ fn semantic_var_is_pointer_like_cached(
     {
         return true;
     }
-    if let Some(oracle) = env.type_oracle {
-        let ty = oracle.type_of(var);
-        if oracle.is_pointer(ty) || oracle.is_array(ty) {
-            return true;
-        }
-    }
-    semantic_type_hint_names_cached(info, var, env, cache)
-        .into_iter()
-        .find_map(|name| lookup_type_hint(info, env, &name))
-        .map(|ty| {
-            matches!(
-                ty,
-                CType::Pointer(_) | CType::Struct(_) | CType::Array(_, _)
-            )
-        })
-        .unwrap_or(false)
+    let _ = cache;
+    exact_var_has_pointer_type(var, env)
 }
 
-fn stack_slot_offset_has_pointer_type_hint(info: &UseInfo, offset: i64, env: &PassEnv<'_>) -> bool {
-    info.stack_slots_with_names().any(|(name, slot)| {
+fn stack_slot_offset_has_pointer_type(info: &UseInfo, offset: i64, env: &PassEnv<'_>) -> bool {
+    info.stack_slots_by_value.iter().any(|(value, slot)| {
         slot.offset == offset
-            && lookup_type_hint(info, env, &name).is_some_and(|ty| {
-                matches!(
-                    ty,
-                    CType::Pointer(_) | CType::Struct(_) | CType::Array(_, _)
-                )
-            })
+            && info
+                .var_for_value_id(*value)
+                .is_some_and(|var| exact_var_has_pointer_type(var, env))
     })
 }
 
@@ -3030,153 +2982,12 @@ fn typed_pointer_stack_slot_for_name(info: &UseInfo, name: &str, env: &PassEnv<'
     info.forwarded_value_for_name(name)
         .and_then(|prov| prov.stack_slot)
         .or_else(|| info.stack_slot_for_name(name).map(|slot| slot.offset))
-        .filter(|offset| stack_slot_offset_has_pointer_type_hint(info, *offset, env))
+        .filter(|offset| stack_slot_offset_has_pointer_type(info, *offset, env))
 }
 
 fn stack_reloaded_value_slot_for_name(info: &UseInfo, name: &str) -> Option<i64> {
     info.forwarded_value_for_name(name)
         .and_then(|prov| prov.stack_slot)
-}
-
-fn semantic_type_hint_names(info: &UseInfo, var: &SSAVar, env: &PassEnv<'_>) -> Vec<String> {
-    let mut names = Vec::new();
-    let push_stack_slot_names = |names: &mut Vec<String>, offset: i64| {
-        for (slot_name, slot) in info.stack_slots_with_names() {
-            if slot.offset == offset {
-                push_unique_casefold(names, slot_name.clone());
-                push_unique_casefold(names, slot_name.to_ascii_lowercase());
-            }
-        }
-    };
-
-    let key = var.display_name();
-    push_unique_casefold(&mut names, key.clone());
-    push_unique_casefold(&mut names, key.to_ascii_lowercase());
-
-    if let Some(offset) = info
-        .forwarded_value_for_name(&key)
-        .and_then(|prov| prov.stack_slot)
-        .or_else(|| info.stack_slot_for_name(&key).map(|slot| slot.offset))
-    {
-        push_stack_slot_names(&mut names, offset);
-    }
-
-    if let Some(alias) = info.var_aliases.get(&key) {
-        push_unique_casefold(&mut names, alias.clone());
-        push_unique_casefold(&mut names, alias.to_ascii_lowercase());
-    }
-
-    if let Some(alias) = env
-        .param_register_aliases
-        .get(&var.name.to_ascii_lowercase())
-    {
-        push_unique_casefold(&mut names, alias.clone());
-        push_unique_casefold(&mut names, alias.to_ascii_lowercase());
-    }
-
-    let root = resolve_copy_root_name(info, &key);
-    if root != key {
-        push_unique_casefold(&mut names, root.clone());
-        push_unique_casefold(&mut names, root.to_ascii_lowercase());
-        if let Some(offset) = info
-            .forwarded_value_for_name(&root)
-            .and_then(|prov| prov.stack_slot)
-            .or_else(|| info.stack_slot_for_name(&root).map(|slot| slot.offset))
-        {
-            push_stack_slot_names(&mut names, offset);
-        }
-        if let Some(alias) = info.var_aliases.get(&root) {
-            push_unique_casefold(&mut names, alias.clone());
-            push_unique_casefold(&mut names, alias.to_ascii_lowercase());
-        }
-    }
-
-    names
-}
-
-fn semantic_type_hint_names_cached(
-    info: &UseInfo,
-    var: &SSAVar,
-    env: &PassEnv<'_>,
-    cache: &mut SemanticTypeHintCache,
-) -> Vec<String> {
-    let ensure_stack_slot_names = |cache: &mut SemanticTypeHintCache, offset: i64| {
-        cache
-            .stack_slot_names_by_offset
-            .entry(offset)
-            .or_insert_with(|| {
-                let mut slot_names = Vec::new();
-                for (slot_name, slot) in info.stack_slots_with_names() {
-                    if slot.offset == offset {
-                        push_unique_casefold(&mut slot_names, slot_name.clone());
-                        push_unique_casefold(&mut slot_names, slot_name.to_ascii_lowercase());
-                    }
-                }
-                slot_names
-            });
-    };
-
-    let key = var.display_name();
-    if let Some(names) = cache.names_by_var.get(&key) {
-        return names.clone();
-    }
-
-    let mut names = Vec::new();
-    push_unique_casefold(&mut names, key.clone());
-    push_unique_casefold(&mut names, key.to_ascii_lowercase());
-
-    if let Some(offset) = info
-        .forwarded_value_for_name(&key)
-        .and_then(|prov| prov.stack_slot)
-        .or_else(|| info.stack_slot_for_name(&key).map(|slot| slot.offset))
-    {
-        ensure_stack_slot_names(cache, offset);
-        let Some(slot_names) = cache.stack_slot_names_by_offset.get(&offset) else {
-            unreachable!("stack slot names cache should contain requested offset");
-        };
-        for slot_name in slot_names {
-            push_unique_casefold(&mut names, slot_name.clone());
-        }
-    }
-
-    if let Some(alias) = info.var_aliases.get(&key) {
-        push_unique_casefold(&mut names, alias.clone());
-        push_unique_casefold(&mut names, alias.to_ascii_lowercase());
-    }
-
-    if let Some(alias) = env
-        .param_register_aliases
-        .get(&var.name.to_ascii_lowercase())
-    {
-        push_unique_casefold(&mut names, alias.clone());
-        push_unique_casefold(&mut names, alias.to_ascii_lowercase());
-    }
-
-    let root = resolve_copy_root_name(info, &key);
-    if root != key {
-        push_unique_casefold(&mut names, root.clone());
-        push_unique_casefold(&mut names, root.to_ascii_lowercase());
-        if let Some(offset) = info
-            .forwarded_value_for_name(&root)
-            .and_then(|prov| prov.stack_slot)
-            .or_else(|| info.stack_slot_for_name(&root).map(|slot| slot.offset))
-        {
-            ensure_stack_slot_names(cache, offset);
-            let Some(slot_names) = cache.stack_slot_names_by_offset.get(&offset) else {
-                unreachable!("stack slot names cache should contain requested offset");
-            };
-            for slot_name in slot_names {
-                push_unique_casefold(&mut names, slot_name.clone());
-            }
-        }
-        if let Some(alias) = info.var_aliases.get(&root) {
-            push_unique_casefold(&mut names, alias.clone());
-            push_unique_casefold(&mut names, alias.to_ascii_lowercase());
-        }
-    }
-
-    cache.names_by_var.insert(key, names.clone());
-    names
 }
 
 fn normalized_addr_from_base_var(var: &SSAVar) -> NormalizedAddr {
@@ -3281,10 +3092,8 @@ fn semantic_addr_for_var_with_depth(symbols: &std::cell::RefCell<crate::symbol::
     if let Some(SemanticValue::Scalar(ScalarValue::Expr(CExpr::Var(alias)))) =
         info.semantic_value_for_name(&key)
         && var.size == ptr_bytes
-        && let Some(slot) = crate::symbol::spelling(symbols, *alias)
-            .strip_prefix("arg")
-            .and_then(|suffix| suffix.parse::<usize>().ok())
-            .and_then(|idx| idx.checked_sub(1))
+        && let Some(slot) = exact_parameter_slot_for_symbol(env, *alias)
+            .and_then(|slot| usize::try_from(slot).ok())
         && let Some(reg_name) = env.arg_regs.get(slot)
     {
         return Some(normalized_addr_from_base_var(&SSAVar::new(
@@ -3478,10 +3287,8 @@ fn should_preserve_rooted_structured_load_identity_for_stable_memory(
         return false;
     }
 
-    env.param_register_aliases.contains_key(&lower)
-        || semantic_type_hint_names(info, &base_ref.var, env)
-            .iter()
-            .any(|name| env.type_hints.contains_key(name))
+    exact_parameter_slot_for_var(info, &base_ref.var, env).is_some()
+        || exact_var_has_pointer_type(&base_ref.var, env)
 }
 
 fn insert_semantic_value(info: &mut UseInfo, key: String, candidate: SemanticValue) {
@@ -3641,8 +3448,13 @@ fn semantic_or_scalar_source_value(symbols: &std::cell::RefCell<crate::symbol::S
         return Some(SemanticValue::Scalar(ScalarValue::Expr(expr)));
     }
 
+    #[cfg(not(test))]
+    return None;
+    #[cfg(test)]
     let rendered = utils::format_traced_name(&root, &info.var_aliases);
+    #[cfg(test)]
     let lower = rendered.to_ascii_lowercase();
+    #[cfg(test)]
     if is_raw_temporary_or_memory_like_name(&root)
         || lower == "stack"
         || lower == "saved_fp"
@@ -3651,6 +3463,7 @@ fn semantic_or_scalar_source_value(symbols: &std::cell::RefCell<crate::symbol::S
         return None;
     }
 
+    #[cfg(test)]
     Some(SemanticValue::Scalar(ScalarValue::Expr(crate::symbol::var_ref(
         symbols, rendered,
     ))))
@@ -3739,6 +3552,7 @@ fn invalidates_semantic_stack_values(op: &SSAOp) -> bool {
     )
 }
 
+#[cfg(test)]
 fn build_formatted_defs(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, scratch: &mut UseScratch, env: &PassEnv<'_>) {
     scratch.info.formatted_defs.clear();
     let mut defs: Vec<(String, CExpr)> = scratch
@@ -4273,6 +4087,7 @@ fn pair_interferes(
     false
 }
 
+#[cfg(test)]
 fn coalesce_variables(
     scratch: &mut UseScratch,
     blocks: &[SSABlock],
@@ -4673,8 +4488,11 @@ fn analyze_call_args(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, s
                 string_literals: env.string_literals,
                 use_info: None,
                 pinned: &scratch.info.pinned,
+                #[cfg(test)]
                 var_aliases: &scratch.info.var_aliases,
+                #[cfg(test)]
                 param_register_aliases: env.param_register_aliases,
+                #[cfg(test)]
                 type_hints: &scratch.info.type_hints,
                 type_oracle: env.type_oracle,
             };
@@ -4702,7 +4520,9 @@ fn analyze_call_args(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, s
                         None
                     } else {
                         let dst_key = dst.display_name();
-                        let expr = lower.expr_for_ssa_name(&dst_key);
+                        let Some(expr) = legacy_program_expr_for_var(&lower, dst) else {
+                            continue;
+                        };
                         let (input_var, input_expr) = match prev_op {
                             SSAOp::Copy { src, .. }
                             | SSAOp::IntZExt { src, .. }
@@ -4710,24 +4530,16 @@ fn analyze_call_args(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, s
                             | SSAOp::Trunc { src, .. }
                             | SSAOp::Cast { src, .. }
                             | SSAOp::Subpiece { src, .. } => {
-                                let source_expr = lower.expr_for_ssa_name(&src.display_name());
+                                let Some(source_expr) = legacy_program_expr_for_var(&lower, src)
+                                else {
+                                    continue;
+                                };
                                 (src, source_expr)
                             }
                             _ => (dst, expr.clone()),
                         };
                         let result_candidate =
-                            call_result_expr_for_post_call_source(symbols, &post_call_query, i, dst)
-                                .or_else(|| {
-                                    lowered_var_alias_from_expr(symbols, &expr, dst.size)
-                                        .filter(|alias| alias.display_name() != dst_key)
-                                        .and_then(|alias| {
-                                            call_result_expr_for_post_call_source(symbols,
-                                                &post_call_query,
-                                                i,
-                                                &alias,
-                                            )
-                                        })
-                                });
+                            call_result_expr_for_post_call_source(symbols, &post_call_query, i, dst);
                         let mut binding = result_candidate
                             .map(|(result_call_idx, expr)| {
                                 CallArgBinding::result(SemanticCallArg::FallbackExpr(expr))
@@ -4907,8 +4719,11 @@ fn analyze_call_args(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, s
                     string_literals: env.string_literals,
                     use_info: Some(&scratch.info),
                     pinned: &scratch.info.pinned,
+                    #[cfg(test)]
                     var_aliases: &scratch.info.var_aliases,
+                    #[cfg(test)]
                     param_register_aliases: env.param_register_aliases,
+                    #[cfg(test)]
                     type_hints: &scratch.info.type_hints,
                     type_oracle: env.type_oracle,
                 };
@@ -4993,8 +4808,11 @@ fn bind_single_use_call_result_definitions(symbols: &std::cell::RefCell<crate::s
                 string_literals: env.string_literals,
                 use_info: None,
                 pinned: &scratch.info.pinned,
+                #[cfg(test)]
                 var_aliases: &scratch.info.var_aliases,
+                #[cfg(test)]
                 param_register_aliases: env.param_register_aliases,
+                #[cfg(test)]
                 type_hints: &scratch.info.type_hints,
                 type_oracle: env.type_oracle,
             };
@@ -5091,8 +4909,11 @@ fn bind_call_result_alias_definitions(symbols: &std::cell::RefCell<crate::symbol
                     string_literals: env.string_literals,
                     use_info: Some(info),
                     pinned: &info.pinned,
+                    #[cfg(test)]
                     var_aliases: &info.var_aliases,
+                    #[cfg(test)]
                     param_register_aliases: env.param_register_aliases,
+                    #[cfg(test)]
                     type_hints: &info.type_hints,
                     type_oracle: env.type_oracle,
                 };
@@ -5131,6 +4952,7 @@ fn bind_call_result_alias_definitions(symbols: &std::cell::RefCell<crate::symbol
     }
 }
 
+#[cfg(test)]
 fn call_result_source_for_alias(info: &UseInfo, alias: &str) -> Option<(u64, usize)> {
     info.call_result_source_for_name(alias).or_else(|| {
         let lowered = alias.to_ascii_lowercase();
@@ -5140,6 +4962,7 @@ fn call_result_source_for_alias(info: &UseInfo, alias: &str) -> Option<(u64, usi
     })
 }
 
+#[cfg(test)]
 fn propagate_call_result_aliases(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
     info: &mut UseInfo,
     control: DecompileWorkControl<'_>,
@@ -5206,9 +5029,7 @@ fn propagate_call_result_aliases(symbols: &std::cell::RefCell<crate::symbol::Sym
             control.poll()?;
             let source_alias = match value {
                 SemanticValue::Scalar(ScalarValue::Root(root)) => Some(root.display_name()),
-                SemanticValue::Scalar(ScalarValue::Expr(expr)) => {
-                    lowered_var_alias_from_expr(symbols, &expr, 0).map(|alias| alias.display_name())
-                }
+                SemanticValue::Scalar(ScalarValue::Expr(_)) => None,
                 SemanticValue::Address(NormalizedAddr {
                     base: BaseRef::Value(root),
                     index: None,
@@ -5271,7 +5092,7 @@ fn call_result_expr_for_call_at(symbols: &std::cell::RefCell<crate::symbol::Symb
     Some(CExpr::call(func, args))
 }
 
-fn resolved_callee_expr_for_site(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
+fn resolved_callee_expr_for_site(_symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
     block_addr: u64,
     op_idx: usize,
     env: &PassEnv<'_>,
@@ -5289,14 +5110,20 @@ fn resolved_callee_expr_for_site(symbols: &std::cell::RefCell<crate::symbol::Sym
         },
         callee_facts: env.callee_facts,
     })?;
-    Some(crate::symbol::var_ref(
-        symbols,
-        resolved
-            .identity
-            .display_name
-            .clone()
-            .unwrap_or_else(|| resolved.identity.primary_key()),
-    ))
+    let name = resolved
+        .identity
+        .display_name
+        .clone()
+        .unwrap_or_else(|| resolved.identity.primary_key());
+    let kind = match resolved.identity.class {
+        r2types::CalleeClass::Imported => crate::symbol::ExternalKind::Import,
+        r2types::CalleeClass::ExternalSymbol => crate::symbol::ExternalKind::Global,
+        r2types::CalleeClass::Internal
+        | r2types::CalleeClass::RawAddress
+        | r2types::CalleeClass::Indirect
+        | r2types::CalleeClass::Unknown => crate::symbol::ExternalKind::Function,
+    };
+    Some(CExpr::External { name, kind })
 }
 
 fn call_arg_expr_for_definition(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
@@ -5344,9 +5171,9 @@ fn render_call_arg_semantic_value_for_definition(symbols: &std::cell::RefCell<cr
             if !visited.insert(visit_key.clone()) {
                 return None;
             }
-            let rendered = lower.expr_for_ssa_name(&key);
+            let rendered = legacy_program_expr_for_var(lower, &root.var);
             visited.remove(&visit_key);
-            Some(rendered)
+            rendered
         }
         SemanticValue::Address(addr) => {
             render_call_arg_addr_for_definition(symbols, info, lower, addr, depth + 1, visited)
@@ -5429,16 +5256,30 @@ fn render_visible_stack_slot_expr_for_definition(symbols: &std::cell::RefCell<cr
         return None;
     }
 
-    let visible_local = {
-        let mut stack_slot_names = info
-            .stack_slots_with_names()
-            .filter_map(|(name, slot)| (slot.offset == offset).then_some(name))
-            .collect::<BTreeSet<_>>();
-        stack_slot_names
-            .pop_first()
-            .map(|name| lower.expr_for_ssa_name(&name))
-            .filter(|x| expr_is_valid_for_synthesized_call_arg(symbols, x))
-            .or_else(|| (offset < 0).then(|| crate::symbol::var_ref(symbols, format!("local_{:x}", (-offset) as u64))))
+    let visible_local = if lower.binding_names.is_some() {
+        info.stack_slots_by_value
+            .iter()
+            .filter(|(_, slot)| slot.offset == offset)
+            .filter_map(|(value, _)| info.var_for_value_id(*value))
+            .min_by_key(|var| var.display_name())
+            .map(|var| lower.get_expr(var))
+            .filter(|expr| expr_is_valid_for_synthesized_call_arg(symbols, expr))
+    } else {
+        #[cfg(test)]
+        {
+            let mut stack_slot_names = info
+                .stack_slots_with_names()
+                .filter_map(|(name, slot)| (slot.offset == offset).then_some(name))
+                .collect::<BTreeSet<_>>();
+            stack_slot_names
+                .pop_first()
+                .map(|name| lower.expr_for_ssa_name(&name))
+                .filter(|expr| expr_is_valid_for_synthesized_call_arg(symbols, expr))
+        }
+        #[cfg(not(test))]
+        {
+            None
+        }
     };
 
     let stable_value = info.stable_stack_values.get(&offset).and_then(|value| {
@@ -5474,14 +5315,22 @@ fn normalize_call_arg_expr_for_definition(symbols: &std::cell::RefCell<crate::sy
         // An external name has no definition in this function to normalise to.
         external @ CExpr::External { .. } => Some(external),
         CExpr::Var(name) => {
-            normalize_call_arg_var_for_definition(
-                symbols,
-                info,
-                lower,
-                crate::symbol::spelling(symbols, name).to_string(),
-                depth,
-                visited,
-            )
+            if lower.binding_names.is_some() {
+                return Some(CExpr::Var(name));
+            }
+            #[cfg(test)]
+            {
+                return normalize_call_arg_var_for_definition(
+                    symbols,
+                    info,
+                    lower,
+                    crate::symbol::spelling(symbols, name).to_string(),
+                    depth,
+                    visited,
+                );
+            }
+            #[cfg(not(test))]
+            None
         }
         CExpr::Paren(inner) => {
             normalize_call_arg_expr_for_definition(symbols, info, lower, *inner, depth + 1, visited)
@@ -5594,6 +5443,7 @@ fn normalize_call_arg_expr_for_definition(symbols: &std::cell::RefCell<crate::sy
     }
 }
 
+#[cfg(test)]
 fn normalize_call_arg_var_for_definition(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
     info: &UseInfo,
     lower: &LowerCtx<'_>,
@@ -5852,28 +5702,7 @@ fn collect_immediate_stack_call_args(symbols: &std::cell::RefCell<crate::symbol:
                     let key = val.display_name();
                     let expr = visible_call_arg_seed_expr(symbols, lower, val);
                     let raw_result_candidate =
-                        call_result_expr_for_post_call_source(symbols, &post_call_query, i, val)
-                            .or_else(|| {
-                                lowered_var_alias_from_expr(symbols, &expr, val.size)
-                                    .filter(|alias| alias.display_name() != key)
-                                    .and_then(|alias| {
-                                        call_result_expr_for_post_call_source(symbols,
-                                            &post_call_query,
-                                            i,
-                                            &alias,
-                                        )
-                                    })
-                            })
-                            .or_else(|| {
-                                let ret_family =
-                                    register_family_name(post_call_query.env.ret_reg_name)?;
-                                lowered_var_alias_from_expr(symbols, &expr, val.size)
-                                    .filter(|alias| {
-                                        register_family_name(&alias.name).as_deref()
-                                            == Some(ret_family.as_str())
-                                    })
-                                    .and_then(|_| latest_preceding_call_expr(symbols, &post_call_query, i))
-                            });
+                        call_result_expr_for_post_call_source(symbols, &post_call_query, i, val);
                     let (call_result_candidate, duplicate_result_binding) =
                         if let Some((result_call_idx, expr)) = raw_result_candidate {
                             let stack_home_query = StackHomeQuery {
@@ -6087,7 +5916,7 @@ fn semantic_call_arg_is_transient_register_fallback(symbols: &std::cell::RefCell
                 let lower = crate::symbol::spelling(symbols, *name).to_ascii_lowercase();
                 is_call_arg_placeholder_name(&lower)
                     || is_call_arg_transient_name(symbols, &lower)
-                    || env.param_register_aliases.contains_key(&lower)
+                    || exact_parameter_slot_for_symbol(env, *name).is_some()
             }
             CExpr::Paren(inner) | CExpr::Cast { expr: inner, .. } => {
                 semantic_call_arg_is_transient_register_fallback(
@@ -6155,12 +5984,8 @@ fn improve_call_arg_binding_from_copy_root(symbols: &std::cell::RefCell<crate::s
     }
 }
 
-fn visible_call_arg_seed_expr(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, lower: &LowerCtx<'_>, var: &SSAVar) -> CExpr {
-    if var.is_const() {
-        return lower.get_expr(var);
-    }
-
-    crate::symbol::var_ref(symbols, lower.var_name(var))
+fn visible_call_arg_seed_expr(_symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, lower: &LowerCtx<'_>, var: &SSAVar) -> CExpr {
+    lower.get_expr(var)
 }
 
 fn call_result_expr_for_post_call_source(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
@@ -6177,16 +6002,6 @@ fn call_result_expr_for_post_call_source(symbols: &std::cell::RefCell<crate::sym
         query.env,
         0,
     )
-    .or_else(|| {
-        lowered_post_call_result_source_var(symbols,
-            query.info,
-            query.lower,
-            query.ops,
-            query.producers,
-            var,
-            query.env,
-        )
-    })
     .unwrap_or_else(|| var.clone());
     if register_family_name(&source_var.name).as_deref() != Some(ret_family.as_str()) {
         return None;
@@ -6364,13 +6179,7 @@ fn semantic_post_call_result_alias_var(symbols: &std::cell::RefCell<crate::symbo
             semantic_post_call_result_alias_var(symbols, info, &root.var, depth + 1)
                 .or(Some(root.var.clone()))
         }
-        Some(SemanticValue::Scalar(ScalarValue::Expr(expr))) => {
-            lowered_var_alias_from_expr(symbols, expr, var.size)
-                .filter(|alias| alias != var)
-                .and_then(|alias| {
-                    semantic_post_call_result_alias_var(symbols, info, &alias, depth + 1).or(Some(alias))
-                })
-        }
+        Some(SemanticValue::Scalar(ScalarValue::Expr(_))) => None,
         _ => None,
     }
 }
@@ -6519,60 +6328,6 @@ fn producer_entry_for_var(
     })
 }
 
-fn lowered_post_call_result_source_var(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
-    info: &UseInfo,
-    lower: &LowerCtx<'_>,
-    ops: &[SSAOp],
-    producers: &HashMap<String, usize>,
-    var: &SSAVar,
-    env: &PassEnv<'_>,
-) -> Option<SSAVar> {
-    lowered_var_alias_from_expr(symbols, &lower.expr_for_ssa_name(&var.display_name()), var.size).and_then(
-        |alias| {
-            resolve_post_call_result_source_var_with_facts(symbols, info, ops, producers, &alias, env, 0)
-                .or(Some(alias))
-        },
-    )
-}
-
-fn lowered_var_alias_from_expr(
-    symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
-    expr: &CExpr,
-    default_size: u32,
-) -> Option<SSAVar> {
-    match expr.unobserved() {
-        CExpr::Var(name) => {
-            ssa_var_from_display_name(&crate::symbol::spelling(symbols, *name), default_size)
-        }
-        CExpr::Paren(inner) | CExpr::Cast { expr: inner, .. } => {
-            lowered_var_alias_from_expr(symbols, inner, default_size)
-        }
-        _ => None,
-    }
-}
-
-fn latest_preceding_call_expr(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
-    query: &PostCallResultQuery<'_, '_>,
-    use_idx: usize,
-) -> Option<(usize, CExpr)> {
-    let (call_idx, call_op) = query
-        .ops
-        .iter()
-        .enumerate()
-        .take(use_idx)
-        .rev()
-        .find(|(_, op)| matches!(op, SSAOp::Call { .. } | SSAOp::CallInd { .. }))?;
-    call_result_expr_for_call_at(symbols,
-        query.info,
-        query.lower,
-        query.block_addr,
-        call_idx,
-        call_op,
-        query.env,
-    )
-    .map(|expr| (call_idx, expr))
-}
-
 fn merge_arm64_stack_home_call_args(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
     args: &mut Vec<CallArgBinding>,
     stack_args: &[(i64, CallArgBinding, String, String)],
@@ -6643,12 +6398,7 @@ fn call_arg_semantic_source_offset(symbols: &std::cell::RefCell<crate::symbol::S
             semantic_value_source_offset(info, value, depth + 1, visited)
         }
         SemanticCallArg::FallbackExpr(expr) => match expr.unobserved() {
-            CExpr::Var(name) => semantic_value_source_offset_by_name(
-                info,
-                &crate::symbol::spelling(symbols, *name),
-                depth + 1,
-                visited,
-            ),
+            CExpr::Var(_) => None,
             CExpr::Paren(inner) | CExpr::Cast { expr: inner, .. } => {
                 call_arg_semantic_source_offset(
                     symbols,
@@ -6797,13 +6547,7 @@ fn semantic_call_arg_is_generic_register_root(symbols: &std::cell::RefCell<crate
             .iter()
             .any(|reg| root.var.name.eq_ignore_ascii_case(reg)),
         SemanticCallArg::FallbackExpr(expr) => match expr.unobserved() {
-            CExpr::Var(name) => ssa_key_parts(&crate::symbol::spelling(symbols, *name))
-                .map(|(base, _)| {
-                    env.arg_regs
-                        .iter()
-                        .any(|reg| base.eq_ignore_ascii_case(reg.as_str()))
-                })
-                .unwrap_or(false),
+            CExpr::Var(symbol) => exact_parameter_slot_for_symbol(env, *symbol).is_some(),
             CExpr::Paren(inner) | CExpr::Cast { expr: inner, .. } => {
                 semantic_call_arg_is_generic_register_root(
                     symbols,
@@ -6951,9 +6695,6 @@ fn expr_preserves_pointer_identity_for_call_arg(
                 && !is_call_arg_transient_name(symbols, &crate::symbol::spelling(symbols, *name))
                 && !is_call_arg_low_quality_name(&crate::symbol::spelling(symbols, *name))
                 && !is_generic_entry_arg_name(&crate::symbol::spelling(symbols, *name))
-                && !env
-                    .param_register_aliases
-                    .contains_key(&crate::symbol::spelling(symbols, *name).to_ascii_lowercase())
         }
         CExpr::Subscript { .. }
         | CExpr::Member { .. }
@@ -7067,7 +6808,7 @@ fn expr_is_meaningful_stack_reload_fallback(
                 && !is_call_arg_transient_name(symbols, &lower)
                 && !is_call_arg_low_quality_name(&lower)
                 && !is_generic_entry_arg_name(&lower)
-                && !env.param_register_aliases.contains_key(&lower)
+                && exact_parameter_slot_for_symbol(env, *name).is_none()
         }
         CExpr::Subscript { .. }
         | CExpr::Member { .. }
@@ -7165,9 +6906,7 @@ fn should_use_semantic_call_arg_value(symbols: &std::cell::RefCell<crate::symbol
             .is_some_and(|offset| offset < 0);
             root.var != *var
                 && (root.var.version == 0
-                    || env
-                        .param_register_aliases
-                        .contains_key(&root.var.name.to_ascii_lowercase())
+                    || exact_parameter_slot_for_var(info, &root.var, env).is_some()
                     || semantic_var_is_pointer_like(info, &root.var, env)
                     || has_stable_negative_stack_source)
                 && !is_call_arg_placeholder_name(&root.var.display_name())
@@ -7192,11 +6931,7 @@ fn stable_negative_stack_load_size(symbols: &std::cell::RefCell<crate::symbol::S
                     default_size,
                 )
             }
-            CExpr::Var(name) => {
-                ssa_var_from_display_name(&crate::symbol::spelling(symbols, *name), default_size)
-                    .map(|var| var.size.max(1))
-                    .unwrap_or(default_size.max(1))
-            }
+            CExpr::Var(_) => default_size.max(1),
             _ => default_size.max(1),
         },
         _ => default_size.max(1),
@@ -7282,12 +7017,7 @@ fn exact_negative_stack_offset_for_call_arg(symbols: &std::cell::RefCell<crate::
             exact_negative_stack_offset_for_value(info, value, depth + 1, visited)
         }
         SemanticCallArg::FallbackExpr(expr) => match expr.unobserved() {
-            CExpr::Var(name) => exact_negative_stack_offset_by_name(
-                info,
-                &crate::symbol::spelling(symbols, *name),
-                depth + 1,
-                visited,
-            ),
+            CExpr::Var(_) => None,
             CExpr::Paren(inner) | CExpr::Cast { expr: inner, .. } => {
                 exact_negative_stack_offset_for_call_arg(
                     symbols,
@@ -7450,65 +7180,10 @@ fn semantic_call_arg_addr_from_expr(symbols: &std::cell::RefCell<crate::symbol::
     }
 
     match expr.unobserved() {
-        CExpr::Var(name) => {
-            if !visited.insert(crate::symbol::spelling(symbols, *name).to_string()) {
-                return None;
-            }
-
-            let resolved = lookup_call_arg_definition_expr(symbols, info, &crate::symbol::spelling(symbols, *name))
-                .and_then(|inner| {
-                    semantic_call_arg_addr_from_expr(symbols, info, &inner, env, depth + 1, visited)
-                })
-                .or_else(|| {
-                    lookup_call_arg_semantic_value(info, &crate::symbol::spelling(symbols, *name)).and_then(|value| match value {
-                        SemanticValue::Scalar(ScalarValue::Expr(inner)) => {
-                            semantic_call_arg_addr_from_expr(symbols, info, inner, env, depth + 1, visited)
-                        }
-                        SemanticValue::Scalar(ScalarValue::Root(root)) => {
-                            let root_expr =
-                                lookup_call_arg_definition_expr(symbols, info, &root.display_name())
-                                    .unwrap_or_else(|| crate::symbol::var_ref(symbols, root.display_name()));
-                            semantic_call_arg_string_addr_inner(symbols,
-                                info,
-                                &root.var,
-                                &root_expr,
-                                env,
-                                depth + 1,
-                                visited,
-                            )
-                        }
-                        SemanticValue::Address(NormalizedAddr {
-                            base: BaseRef::Raw(inner),
-                            index: None,
-                            scale_bytes: 0,
-                            offset_bytes: 0,
-                        }) => {
-                            semantic_call_arg_addr_from_expr(symbols, info, inner, env, depth + 1, visited)
-                        }
-                        _ => None,
-                    })
-                })
-                .or_else(|| {
-                    info.forwarded_value_for_name(&crate::symbol::spelling(symbols, *name)).and_then(|prov| {
-                        prov.source_var.as_ref().and_then(|source_var| {
-                            let source_expr =
-                                lookup_call_arg_definition_expr(symbols, info, &source_var.display_name())
-                                    .unwrap_or_else(|| crate::symbol::var_ref(symbols, source_var.display_name()));
-                            semantic_call_arg_string_addr_inner(symbols,
-                                info,
-                                source_var,
-                                &source_expr,
-                                env,
-                                depth + 1,
-                                visited,
-                            )
-                        })
-                    })
-                });
-
-            visited.remove(&*crate::symbol::spelling(symbols, *name));
-            resolved
-        }
+        // A rendered SymbolId cannot be reversed into SSA identity. Address
+        // recovery must arrive as a structured semantic value or an exact
+        // SSAVar before this expression-only boundary.
+        CExpr::Var(_) => None,
         CExpr::Paren(inner) | CExpr::AddrOf(inner) => {
             semantic_call_arg_addr_from_expr(symbols, info, inner, env, depth + 1, visited)
         }
@@ -7644,9 +7319,7 @@ fn semantic_call_arg_score(symbols: &std::cell::RefCell<crate::symbol::SymbolTab
                 score += 80;
             }
             if root.var.version == 0
-                && env
-                    .param_register_aliases
-                    .contains_key(&root.var.name.to_ascii_lowercase())
+                && exact_parameter_slot_for_var(info, &root.var, env).is_some()
             {
                 score += 40;
             } else if root.var.version != 0 {
@@ -7674,9 +7347,7 @@ fn semantic_call_arg_is_generic_entry_root(symbols: &std::cell::RefCell<crate::s
     match arg {
         SemanticCallArg::Semantic(SemanticValue::Scalar(ScalarValue::Root(root))) => {
             root.var.version == 0
-                && env
-                    .param_register_aliases
-                    .contains_key(&root.var.name.to_ascii_lowercase())
+                && env.binding_names.is_some()
         }
         SemanticCallArg::FallbackExpr(expr) => match expr.unobserved() {
             CExpr::Var(name) => {
@@ -8342,13 +8013,6 @@ mod tests {
             .insert("rdi".to_string(), "arg0".to_string());
         let env = fixture.env();
         let mut owner = crate::ast::RenderObservationOwner::new();
-
-        let alias = crate::symbol::var_ref(&symbols, "eax_3");
-        let (_, observed_alias) = owner.observe_expr(alias.clone()).unwrap();
-        assert_eq!(
-            lowered_var_alias_from_expr(&symbols, &observed_alias, 4),
-            lowered_var_alias_from_expr(&symbols, &alias, 4)
-        );
 
         let pointer = crate::symbol::var_ref(&symbols, "owned_pointer");
         let (_, observed_pointer) = owner.observe_expr(pointer.clone()).unwrap();

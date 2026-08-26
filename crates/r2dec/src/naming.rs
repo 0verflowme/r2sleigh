@@ -1,4 +1,6 @@
-//! How a value is spelled, in one place.
+#![cfg(test)]
+
+//! Legacy fixture spelling for unit tests that do not construct a binding plan.
 //!
 //! Several layers used to answer this question with their own copy of the rules,
 //! and they disagreed: only one consulted the carrier map, they lowercased
@@ -14,11 +16,6 @@ use r2ssa::SSAVar;
 
 /// The tables a layer can consult when spelling a value.
 pub(crate) trait NameSource {
-    /// The sealed renderer binding for this exact SSA value.
-    fn planned_binding_name(&self, _var: &SSAVar) -> Option<String> {
-        None
-    }
-
     /// The carrier this value belongs to, when it is part of one.
     fn carrier_alias(&self, display: &str) -> Option<String>;
 
@@ -59,9 +56,6 @@ pub(crate) fn spell_var(var: &SSAVar, source: &dyn NameSource) -> String {
     }
 
     let display = var.display_name();
-    if let Some(binding) = source.planned_binding_name(var) {
-        return binding;
-    }
     // A carrier member is the carrier, except at version zero, which is the
     // value the function was entered with and keeps the argument's name.
     if var.version > 0

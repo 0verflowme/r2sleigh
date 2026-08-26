@@ -1,18 +1,22 @@
-use std::collections::{HashMap, HashSet};
+#[cfg(test)]
+use std::collections::HashMap;
+use std::collections::HashSet;
 
 use r2ssa::{SSAOp, SSAVar};
 use r2types::TypeOracle;
 
 use super::utils::{
-    format_traced_name, is_constant_or_memory_name, is_low_signal_ssa_storage_name,
-    is_temporary_name, is_temporary_or_constant_name, parse_const_value, ssa_render_base_name,
+    is_low_signal_ssa_storage_name, is_temporary_or_constant_name, parse_const_value,
 };
 use super::{
     BaseRef, NormalizedAddr, PtrArith, ScalarValue, SemanticValue, StackSlotProvenance, UseInfo,
     ValueProvenance, ValueRef,
 };
+#[cfg(test)]
+use super::utils::{format_traced_name, ssa_render_base_name};
 use crate::address::parse_address_from_var_name;
 use crate::ast::{BinaryOp, CExpr, CType, UnaryOp};
+use crate::binding_plan::PlannedValueSymbol;
 
 /// Defensive renderer result for operations whose canonical disposition is
 /// owned by `r2ssa::MachineProjection`.
@@ -24,6 +28,7 @@ use crate::ast::{BinaryOp, CExpr, CType, UnaryOp};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum OpLoweringRefusal {
     MissingMachineProjectionAuthorization,
+    MissingProgramVariableAuthorization,
     UnrepresentableOperation,
 }
 
@@ -39,8 +44,11 @@ pub(crate) struct LowerCtx<'a> {
     pub(crate) binding_names: Option<&'a crate::binding_plan::BindingNameResolution>,
     pub(crate) use_info: Option<&'a UseInfo>,
     pub(crate) pinned: &'a HashSet<String>,
+    #[cfg(test)]
     pub(crate) var_aliases: &'a HashMap<String, String>,
+    #[cfg(test)]
     pub(crate) param_register_aliases: &'a HashMap<String, String>,
+    #[cfg(test)]
     pub(crate) type_hints: &'a HashMap<String, CType>,
     pub(crate) type_oracle: Option<&'a dyn TypeOracle>,
     /// Where a rendered name is written down, so building a reference can mint one.
@@ -56,36 +64,11 @@ impl<'a> LowerCtx<'a> {
         crate::symbol::spelling(self.symbols, id)
     }
 
-    fn lookup_type_hint(&self, name: &str) -> Option<&CType> {
-
-        self.use_info
-            .map(|info| &info.type_hints)
-            .unwrap_or(self.type_hints)
-            .get(name)
-            .or_else(|| {
-                self.use_info
-                    .map(|info| &info.type_hints)
-                    .unwrap_or(self.type_hints)
-                    .get(&name.to_ascii_lowercase())
-            })
-    }
-
     fn definition_for_name(&self, name: &str) -> Option<&CExpr> {
         self.use_info.and_then(|info| {
             info.value_id_for_name(name)
                 .and_then(|value_id| info.render_definition_for_value(value_id))
         })
-    }
-
-    /// The definition of what this identifier renders.
-    ///
-    /// A rendered spelling is not the SSA display name the definitions are keyed
-    /// by, so asking with the spelling misses a definition that is present.
-    fn definition_for_symbol(&self, id: crate::symbol::SymbolId) -> Option<&CExpr> {
-        match self.symbols.borrow().ssa_name(id) {
-            Some(ssa_name) => self.definition_for_name(&ssa_name),
-            None => self.definition_for_name(&self.spelling(id)),
-        }
     }
 
     fn definition_for_var(&self, var: &SSAVar) -> Option<&CExpr> {
@@ -134,14 +117,39 @@ impl<'a> LowerCtx<'a> {
             .is_some_and(|info| info.is_condition_name(name))
     }
 
+    #[cfg(test)]
     fn var_alias_for_name(&self, name: &str) -> Option<&String> {
         self.var_aliases.get(name)
     }
 
-
+    fn bound_program_symbol(&self, var: &SSAVar) -> Option<crate::symbol::SymbolId> {
+        let resolver = self.binding_names?;
+        let value = self
+            .use_info
+            .and_then(|info| info.exact_value_id_for_var(var))?;
+        match resolver.require_value(value).ok()? {
+            PlannedValueSymbol::Bound(symbol) => Some(symbol),
+            PlannedValueSymbol::Inline(_)
+            | PlannedValueSymbol::Elided(_)
+            | PlannedValueSymbol::Refused(_)
+            | PlannedValueSymbol::Absent => None,
+        }
+    }
 
     pub(crate) fn var_name(&self, var: &SSAVar) -> String {
-        crate::naming::spell_var(var, self)
+        if self.binding_names.is_some() {
+            let symbol = self
+                .bound_program_symbol(var)
+                .expect("lowering admitted this exact value as a bound program variable");
+            return self.spelling(symbol).to_string();
+        }
+
+        #[cfg(test)]
+        {
+            return crate::naming::spell_var(var, self);
+        }
+        #[cfg(not(test))]
+        panic!("program-variable spelling requires BindingNameResolution")
     }
 
     pub(crate) fn get_expr(&self, var: &SSAVar) -> CExpr {
@@ -176,7 +184,19 @@ impl<'a> LowerCtx<'a> {
             if trace {
                 eprintln!("RESOLVE key={key} via=forwarded source={}", prov.source);
             }
-            return self.expr_for_ssa_name_with_depth(&prov.source, depth + 1, visited);
+            if let Some(source_var) = prov.source_var.as_ref() {
+                return self.get_expr_with_depth(source_var, depth + 1, visited);
+            }
+            if let Some(source_var) = prov
+                .source_value_id
+                .and_then(|value| self.use_info?.var_for_value_id(value))
+            {
+                return self.get_expr_with_depth(source_var, depth + 1, visited);
+            }
+            #[cfg(test)]
+            if self.binding_names.is_none() {
+                return self.expr_for_ssa_name_with_depth(&prov.source, depth + 1, visited);
+            }
         }
         if let Some(expr) = self.render_semantic_value_for_var(var, depth, visited) {
             if trace {
@@ -208,11 +228,24 @@ impl<'a> LowerCtx<'a> {
                 visited.contains(&key)
             );
         }
-        crate::symbol::var_ref(self.symbols, self.var_name(var))
+        if self.binding_names.is_some() {
+            return CExpr::Var(
+                self.bound_program_symbol(var)
+                    .expect("bare value rendering requires an exact bound disposition"),
+            );
+        }
+        #[cfg(test)]
+        return crate::symbol::var_ref(self.symbols, self.var_name(var));
+        #[cfg(not(test))]
+        unreachable!("native lowering always carries BindingNameResolution")
     }
 
+    #[cfg(test)]
     pub(crate) fn expr_for_ssa_name(&self, name: &str) -> CExpr {
-
+        assert!(
+            self.binding_names.is_none(),
+            "native lowering cannot recover value identity from a rendered spelling"
+        );
         self.expr_for_ssa_name_with_depth(name, 0, &mut HashSet::new())
     }
 
@@ -220,6 +253,7 @@ impl<'a> LowerCtx<'a> {
         self.render_semantic_value(value, 0, &mut HashSet::new())
     }
 
+    #[cfg(test)]
     fn expr_for_ssa_name_with_depth(
         &self,
         name: &str,
@@ -271,6 +305,7 @@ impl<'a> LowerCtx<'a> {
     }
 
     pub(crate) fn op_to_expr(&self, op: &SSAOp) -> Result<CExpr, OpLoweringRefusal> {
+        self.require_op_value_identities(op)?;
         Ok(match op {
             SSAOp::CallOther { .. } | SSAOp::CpuId { .. } => {
                 return Err(OpLoweringRefusal::MissingMachineProjectionAuthorization);
@@ -388,24 +423,12 @@ impl<'a> LowerCtx<'a> {
             SSAOp::FloatMult { a, b, .. } => self.binary_expr(BinaryOp::Mul, a, b),
             SSAOp::FloatDiv { a, b, .. } => self.binary_expr(BinaryOp::Div, a, b),
             SSAOp::FloatNeg { src, .. } => CExpr::unary(UnaryOp::Neg, self.get_expr(src)),
-            SSAOp::FloatAbs { src, .. } => {
-                CExpr::call(crate::symbol::var_ref(self.symbols, "fabs".to_string()), vec![self.get_expr(src)])
-            }
-            SSAOp::FloatSqrt { src, .. } => {
-                CExpr::call(crate::symbol::var_ref(self.symbols, "sqrt".to_string()), vec![self.get_expr(src)])
-            }
-            SSAOp::FloatCeil { src, .. } => {
-                CExpr::call(crate::symbol::var_ref(self.symbols, "ceil".to_string()), vec![self.get_expr(src)])
-            }
-            SSAOp::FloatFloor { src, .. } => {
-                CExpr::call(crate::symbol::var_ref(self.symbols, "floor".to_string()), vec![self.get_expr(src)])
-            }
-            SSAOp::FloatRound { src, .. } => {
-                CExpr::call(crate::symbol::var_ref(self.symbols, "round".to_string()), vec![self.get_expr(src)])
-            }
-            SSAOp::FloatNaN { src, .. } => {
-                CExpr::call(crate::symbol::var_ref(self.symbols, "isnan".to_string()), vec![self.get_expr(src)])
-            }
+            SSAOp::FloatAbs { src, .. } => self.intrinsic_call("fabs", src),
+            SSAOp::FloatSqrt { src, .. } => self.intrinsic_call("sqrt", src),
+            SSAOp::FloatCeil { src, .. } => self.intrinsic_call("ceil", src),
+            SSAOp::FloatFloor { src, .. } => self.intrinsic_call("floor", src),
+            SSAOp::FloatRound { src, .. } => self.intrinsic_call("round", src),
+            SSAOp::FloatNaN { src, .. } => self.intrinsic_call("isnan", src),
             SSAOp::FloatLess { a, b, .. } => self.binary_expr(BinaryOp::Lt, a, b),
             SSAOp::FloatLessEqual { a, b, .. } => self.binary_expr(BinaryOp::Le, a, b),
             SSAOp::FloatEqual { a, b, .. } => self.binary_expr(BinaryOp::Eq, a, b),
@@ -453,6 +476,45 @@ impl<'a> LowerCtx<'a> {
                 .unwrap_or_else(|| self.ptr_arith_expr(base, index, *element_size, true)),
             _ => return Err(OpLoweringRefusal::UnrepresentableOperation),
         })
+    }
+
+    fn require_op_value_identities(&self, op: &SSAOp) -> Result<(), OpLoweringRefusal> {
+        let Some(resolver) = self.binding_names else {
+            #[cfg(test)]
+            return Ok(());
+            #[cfg(not(test))]
+            return Err(OpLoweringRefusal::MissingProgramVariableAuthorization);
+        };
+        let info = self
+            .use_info
+            .ok_or(OpLoweringRefusal::MissingProgramVariableAuthorization)?;
+        for var in op.sources() {
+            if var.is_const() {
+                continue;
+            }
+            let value = info
+                .exact_value_id_for_var(var)
+                .ok_or(OpLoweringRefusal::MissingProgramVariableAuthorization)?;
+            if !matches!(
+                resolver
+                    .require_value(value)
+                    .map_err(|_| OpLoweringRefusal::MissingProgramVariableAuthorization)?,
+                PlannedValueSymbol::Bound(_)
+            ) {
+                return Err(OpLoweringRefusal::MissingProgramVariableAuthorization);
+            }
+        }
+        Ok(())
+    }
+
+    fn intrinsic_call(&self, name: &str, source: &SSAVar) -> CExpr {
+        CExpr::call(
+            CExpr::External {
+                name: name.to_string(),
+                kind: crate::symbol::ExternalKind::Intrinsic,
+            },
+            vec![self.get_expr(source)],
+        )
     }
 
     fn render_semantic_value_by_name(
@@ -522,19 +584,6 @@ impl<'a> LowerCtx<'a> {
         depth: u32,
         visited: &mut HashSet<String>,
     ) -> Option<CExpr> {
-        if shape.index.is_none()
-            && shape.offset_bytes == 0
-            && let BaseRef::StackSlot(offset) = shape.base
-            && let Some(name) = self.stack_slot_name_for_offset(offset)
-            && (matches!(
-                self.lookup_type_hint(&name),
-                Some(CType::Pointer(_)) | Some(CType::Array(_, _))
-            ) || (elem_size < self.ptr_bytes()
-                && self.stack_slot_has_pointer_backed_source(offset, elem_size)))
-        {
-            return Some(CExpr::Deref(Box::new(crate::symbol::var_ref(self.symbols, name))));
-        }
-
         if let Some(index) = &shape.index {
             let scale = shape.scale_bytes.unsigned_abs() as u32;
             if scale == elem_size && shape.offset_bytes == 0 {
@@ -612,51 +661,27 @@ impl<'a> LowerCtx<'a> {
         }
     }
 
-    fn stack_slot_name_for_offset(&self, offset: i64) -> Option<String> {
-        self.use_info?
-            .stack_slots_with_names()
-            .filter(|(_, slot)| slot.offset == offset)
-            .map(|(name, _)| name)
-            .min_by_key(|name| {
-                let generic = name.starts_with("local_") || name.starts_with("stack_");
-                let synthetic = is_temporary_name(name) || name.contains(':');
-                (generic, synthetic, name.clone())
-            })
-    }
-
-    fn ptr_bytes(&self) -> u32 {
-        self.use_info
-            .into_iter()
-            .flat_map(|info| info.stack_slots_with_names())
-            .find_map(|(name, _)| self.lookup_type_hint(&name).and_then(|ty| ty.bits()))
-            .map(|bits| bits.div_ceil(8).max(1))
-            .unwrap_or(8)
-    }
-
-    fn stack_slot_has_pointer_backed_source(&self, offset: i64, elem_size: u32) -> bool {
-        self.use_info.is_some_and(|info| {
-            info.forwarded_values_by_value.values().any(|prov| {
-            prov.stack_slot == Some(offset)
-                && prov
-                    .source_var
-                    .as_ref()
-                    .is_some_and(|var| var.size > elem_size && var.size >= self.ptr_bytes())
-            })
-        })
-    }
-
     fn render_value_ref(
         &self,
         value: &ValueRef,
         depth: u32,
         visited: &mut HashSet<String>,
     ) -> Option<CExpr> {
-        let name = value.display_name();
-        let visit_key = format!("val:{name}");
+        let visit_key = match value.value_id {
+            Some(value) => format!("val:{}", value.0),
+            None => format!("var:{}", value.var.display_name()),
+        };
         if !visited.insert(visit_key.clone()) {
             return None;
         }
-        let expr = self.expr_for_ssa_name_with_depth(&name, depth, visited);
+        if let Some(resolver) = self.binding_names {
+            let value_id = value.value_id.or_else(|| {
+                self.use_info
+                    .and_then(|info| info.exact_value_id_for_var(&value.var))
+            })?;
+            resolver.require_value(value_id).ok()?;
+        }
+        let expr = self.get_expr_with_depth(&value.var, depth, visited);
         visited.remove(&visit_key);
         Some(expr)
     }
@@ -744,7 +769,10 @@ impl<'a> LowerCtx<'a> {
     fn binary_operand_expr(&self, var: &SSAVar) -> CExpr {
         let key = var.display_name();
         if self.should_keep_low_signal_address_temp_visible(&key) {
-            return crate::symbol::var_ref(self.symbols, self.var_name(var));
+            return CExpr::Var(
+                self.bound_program_symbol(var)
+                    .expect("visible address temporary requires an exact bound disposition"),
+            );
         }
         self.get_expr(var)
     }
@@ -804,10 +832,8 @@ impl<'a> LowerCtx<'a> {
         } else {
             uint_type_from_size(element_size)
         };
-        let base_expr =
-            self.normalize_pointer_base_expr(&self.expr_for_ssa_name(&base.display_name()), 0);
-        let index_expr =
-            self.normalize_index_expr(&self.expr_for_ssa_name(&index.display_name()), 0)?;
+        let base_expr = self.normalize_pointer_base_expr(&self.get_expr(base), 0);
+        let index_expr = self.normalize_index_expr(&self.get_expr(index), 0)?;
         self.build_subscript_expr(base_expr, index_expr, elem_ty, is_sub)
     }
 
@@ -836,16 +862,9 @@ impl<'a> LowerCtx<'a> {
             | CExpr::Subscript { .. }
             | CExpr::Member { .. }
             | CExpr::PtrMember { .. } => true,
-            CExpr::Var(name) => {
-                let lower = self.spelling(*name).to_ascii_lowercase();
-                lower.starts_with("arg")
-                    || lower.contains("ptr")
-                    || lower.contains("addr")
-                    || self
-                        .lookup_type_hint(&self.spelling(*name))
-                        .map(|ty| matches!(ty, CType::Pointer(_) | CType::Struct(_)))
-                        .unwrap_or(false)
-            }
+            // A SymbolId is a presentation handle, not a recoverable SSAVar.
+            // Exact pointer evidence is queried before this structural helper.
+            CExpr::Var(_) => false,
             CExpr::Paren(inner) => self.looks_like_pointer_expr(inner),
             _ => false,
         }
@@ -857,7 +876,7 @@ impl<'a> LowerCtx<'a> {
         {
             return Some(sub);
         }
-        let resolved = self.expr_for_ssa_name(&addr.display_name());
+        let resolved = self.get_expr(addr);
         if let Some(sub) = self.try_subscript_from_addr_expr(&resolved, elem_size) {
             return Some(sub);
         }
@@ -873,7 +892,7 @@ impl<'a> LowerCtx<'a> {
         {
             return Some(member);
         }
-        let resolved = self.expr_for_ssa_name(&addr.display_name());
+        let resolved = self.get_expr(addr);
         if let Some(member) = self.try_member_access_from_addr_expr(Some(addr), &resolved) {
             return Some(member);
         }
@@ -919,14 +938,7 @@ impl<'a> LowerCtx<'a> {
             CExpr::Cast { expr: inner, .. } | CExpr::Paren(inner) => {
                 self.extract_base_index_scale(inner)
             }
-            CExpr::Var(name) => self.definition_for_name(&*self.spelling(*name))
-                .and_then(|inner| self.extract_base_index_scale(inner))
-                .or_else(|| {
-                    let resolved = self.expr_for_ssa_name(&self.spelling(*name));
-                    (resolved != expr.clone())
-                        .then(|| self.extract_base_index_scale(&resolved))
-                        .flatten()
-                }),
+            CExpr::Var(_) => None,
             _ => None,
         }
     }
@@ -956,14 +968,7 @@ impl<'a> LowerCtx<'a> {
             CExpr::Cast { expr: inner, .. } | CExpr::Paren(inner) => {
                 self.extract_base_const_offset(inner)
             }
-            CExpr::Var(name) => self.definition_for_name(&*self.spelling(*name))
-                .and_then(|def| self.extract_base_const_offset(def))
-                .or_else(|| {
-                    let resolved = self.expr_for_ssa_name(&self.spelling(*name));
-                    (resolved != expr.clone())
-                        .then(|| self.extract_base_const_offset(&resolved))
-                        .flatten()
-                }),
+            CExpr::Var(_) => None,
             _ => None,
         }
     }
@@ -1074,27 +1079,7 @@ impl<'a> LowerCtx<'a> {
             CExpr::Cast { expr: inner, .. } | CExpr::Paren(inner) => {
                 self.extract_mul_const(inner, depth + 1)
             }
-            CExpr::Var(name) => {
-                let lower = self.spelling(*name).to_ascii_lowercase();
-                let semantic_visible_name = !is_low_signal_ssa_storage_name(&self.spelling(*name))
-                    && !lower.starts_with("local_")
-                    && !lower.starts_with('t')
-                    && !lower.starts_with('v');
-                if semantic_visible_name
-                    && !self.is_non_index_pointer_expr(expr)
-                    && self.is_semantic_index_expr(expr)
-                {
-                    return Some((expr.clone(), 1));
-                }
-                if let Some(inner) = self.definition_for_symbol(*name) {
-                    self.extract_mul_const(inner, depth + 1)
-                } else if !self.is_non_index_pointer_expr(expr) && self.is_semantic_index_expr(expr)
-                {
-                    Some((expr.clone(), 1))
-                } else {
-                    None
-                }
-            }
+            CExpr::Var(_) => Some((expr.clone(), 1)),
             _ => None,
         }
     }
@@ -1109,18 +1094,7 @@ impl<'a> LowerCtx<'a> {
 
     fn is_semantic_index_expr(&self, expr: &CExpr) -> bool {
         match expr {
-            CExpr::Var(name) => self.definition_for_name(&*self.spelling(*name))
-                .map(|inner| self.is_semantic_index_expr(inner))
-                .unwrap_or_else(|| {
-                    let lower = self.spelling(*name).to_ascii_lowercase();
-                    let stack_placeholder =
-                        lower == "stack" || lower == "saved_fp" || lower.starts_with("stack_");
-                    !is_constant_or_memory_name(&self.spelling(*name))
-                        && (!stack_placeholder
-                            && (self.use_info.and_then(|info| info.stack_slot_for_name(&self.spelling(*name))).is_none()
-                                || lower.starts_with("local_")
-                                || lower.starts_with("arg")))
-                }),
+            CExpr::Var(_) => true,
             CExpr::Unary { operand, .. } => self.is_semantic_index_expr(operand),
             CExpr::Binary { left, right, .. } => {
                 self.is_semantic_index_expr(left) || self.is_semantic_index_expr(right)
@@ -1166,16 +1140,7 @@ impl<'a> LowerCtx<'a> {
         }
 
         match expr {
-            CExpr::Var(name) => {
-                if let Some(inner) = self.definition_for_symbol(*name) {
-                    return self.normalize_pointer_base_expr(inner, depth + 1);
-                }
-                let resolved = self.expr_for_ssa_name(&self.spelling(*name));
-                if resolved != expr.clone() && self.looks_like_pointer_expr(&resolved) {
-                    return self.normalize_pointer_base_expr(&resolved, depth + 1);
-                }
-                expr.clone()
-            }
+            CExpr::Var(_) => expr.clone(),
             CExpr::Paren(inner) => {
                 CExpr::Paren(Box::new(self.normalize_pointer_base_expr(inner, depth + 1)))
             }
@@ -1193,40 +1158,7 @@ impl<'a> LowerCtx<'a> {
         }
 
         match expr {
-            CExpr::Var(name) => {
-                let lower = self.spelling(*name).to_ascii_lowercase();
-                let semantic_visible_name = !is_low_signal_ssa_storage_name(&self.spelling(*name))
-                    && !lower.starts_with("local_")
-                    && !lower.starts_with('t')
-                    && !lower.starts_with('v');
-                if semantic_visible_name
-                    && !self.is_non_index_pointer_expr(expr)
-                    && self.is_semantic_index_expr(expr)
-                {
-                    return Some(expr.clone());
-                }
-                if let Some(inner) = self.definition_for_symbol(*name)
-                    && let Some(normalized) = self.normalize_index_expr(inner, depth + 1)
-                    && !self.is_non_index_pointer_expr(&normalized)
-                {
-                    return Some(normalized);
-                }
-                let resolved = self.expr_for_ssa_name(&self.spelling(*name));
-                if resolved != expr.clone()
-                    && let Some(normalized) = self.normalize_index_expr(&resolved, depth + 1)
-                    && !self.is_non_index_pointer_expr(&normalized)
-                {
-                    return Some(normalized);
-                }
-                if self.definition_for_symbol(*name).is_some() {
-                    return None;
-                }
-                if self.is_non_index_pointer_expr(expr) {
-                    None
-                } else {
-                    self.is_semantic_index_expr(expr).then_some(expr.clone())
-                }
-            }
+            CExpr::Var(_) => Some(expr.clone()),
             CExpr::Paren(inner) => self
                 .normalize_index_expr(inner, depth + 1)
                 .map(|normalized| CExpr::Paren(Box::new(normalized))),
@@ -1244,16 +1176,9 @@ impl<'a> LowerCtx<'a> {
         match expr {
             CExpr::Cast { ty, .. } => matches!(ty, CType::Pointer(_)),
             CExpr::Deref(_) | CExpr::Subscript { .. } | CExpr::PtrMember { .. } => true,
-            CExpr::Var(name) => {
-                let lower = self.spelling(*name).to_ascii_lowercase();
-                lower.contains("ptr")
-                    || lower.contains("addr")
-                    || self.use_info.and_then(|info| info.stack_slot_for_name(&self.spelling(*name))).is_some()
-                    || self
-                        .lookup_type_hint(&self.spelling(*name))
-                        .map(|ty| matches!(ty, CType::Pointer(_) | CType::Struct(_)))
-                        .unwrap_or(false)
-            }
+            // No reverse spelling-to-type lookup. Callers with an SSAVar ask
+            // TypeOracle before reaching this structural fallback.
+            CExpr::Var(_) => false,
             CExpr::Paren(inner) => self.is_non_index_pointer_expr(inner),
             CExpr::Unary { operand, .. } => self.is_non_index_pointer_expr(operand),
             _ => false,
@@ -1262,13 +1187,7 @@ impl<'a> LowerCtx<'a> {
 
     fn is_semantic_member_base(&self, expr: &CExpr) -> bool {
         match expr {
-            CExpr::Var(name) => {
-                let lower = self.spelling(*name).to_ascii_lowercase();
-                !is_temporary_name(&self.spelling(*name))
-                    && !lower.starts_with('r')
-                    && !lower.starts_with('e')
-                    && !matches!(lower.as_str(), "stack" | "saved_fp")
-            }
+            CExpr::Var(_) => true,
             CExpr::Subscript { .. } | CExpr::Member { .. } => true,
             CExpr::Cast { expr, .. } | CExpr::Paren(expr) => self.is_semantic_member_base(expr),
             _ => self.looks_like_pointer_expr(expr),
@@ -1283,15 +1202,6 @@ impl<'a> LowerCtx<'a> {
         let base_expr = self.normalize_pointer_base_expr(expr, 0);
         if self.is_semantic_member_base(&base_expr) {
             return Some(base_expr);
-        }
-
-        if let CExpr::Var(name) = expr
-            && let Some(candidate) = self.definition_for_symbol(*name)
-        {
-            let normalized = self.normalize_pointer_base_expr(candidate, 0);
-            if self.is_semantic_member_base(&normalized) {
-                return Some(normalized);
-            }
         }
 
         None
@@ -1442,9 +1352,52 @@ mod tests {
             pinned,
             var_aliases,
             param_register_aliases,
+            #[cfg(test)]
             type_hints,
             type_oracle: None,
         }
+    }
+
+    #[test]
+    fn floating_intrinsic_is_external_not_a_program_variable() {
+        let symbols = test_table();
+        let empty_exprs = HashMap::new();
+        let empty_counts = HashMap::new();
+        let empty_names = HashSet::new();
+        let empty_aliases = HashMap::new();
+        let empty_ptrs = HashMap::new();
+        let empty_slots = HashMap::new();
+        let empty_forwarded = HashMap::new();
+        let empty_addresses = HashMap::new();
+        let ctx = make_ctx(
+            &symbols,
+            &empty_exprs,
+            &empty_counts,
+            &empty_names,
+            &empty_names,
+            &empty_aliases,
+            &empty_ptrs,
+            &empty_slots,
+            &empty_forwarded,
+            &empty_addresses,
+            &empty_addresses,
+            &empty_addresses,
+        );
+        let op = SSAOp::FloatAbs {
+            dst: SSAVar::new("tmp:dst", 1, 8),
+            src: SSAVar::constant(1, 8),
+        };
+
+        assert_eq!(
+            ctx.op_to_expr(&op),
+            Ok(CExpr::call(
+                CExpr::External {
+                    name: "fabs".to_string(),
+                    kind: crate::symbol::ExternalKind::Intrinsic,
+                },
+                vec![CExpr::IntLit(1)],
+            ))
+        );
     }
 
     #[test]
@@ -2186,12 +2139,8 @@ mod tests {
     }
 }
 
+#[cfg(test)]
 impl crate::naming::NameSource for LowerCtx<'_> {
-    fn planned_binding_name(&self, var: &SSAVar) -> Option<String> {
-        let value = self.use_info?.exact_value_id_for_var(var)?;
-        self.binding_names?.name_for_value(value)
-    }
-
     fn carrier_alias(&self, _display: &str) -> Option<String> {
         None
     }
