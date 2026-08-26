@@ -7,7 +7,11 @@ use r2ssa::{
     CanonicalStorageId, CanonicalStorageSpace, MachineUseDisposition, MachineWriteDisposition,
     SourceAbiParameterSpec, SourceFunctionInterface, SourceFunctionReturn, SsaArtifact,
 };
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::sync::Arc;
+
+use crate::symbol::SymbolTable;
 
 fn source_owned(ops: impl IntoIterator<Item = R2ILOp>) -> SourceOwnedFunctionFacts {
     let mut block = R2ILBlock::new(0x1000, 4);
@@ -327,7 +331,13 @@ fn use_and_write_dispositions_delegate_to_the_validated_projection() {
         src: Varnode::constant(7, 8),
     }]);
     let source = source_owned.source();
-    let plan = BindingPlan::build_shadow(&source_owned).expect("sealed shadow plan");
+    let plan = Rc::new(BindingPlan::build_shadow(&source_owned).expect("sealed shadow plan"));
+    let resolution = BindingNameResolution::build(
+        &source_owned,
+        Rc::clone(&plan),
+        Rc::new(RefCell::new(SymbolTable::new())),
+    )
+    .expect("exact projection resolution");
     for inst in &source.graph().insts {
         for input_idx in 0..inst.inputs.len() {
             let site = UseSite {
@@ -342,6 +352,12 @@ fn use_and_write_dispositions_delegate_to_the_validated_projection() {
                 plan.use_disposition(site),
                 Some(MachineUseDisposition::Exact(_))
             ));
+            assert!(std::ptr::eq(
+                resolution.require_use(site).expect("required exact use"),
+                plan.machine_projection()
+                    .use_disposition(site)
+                    .expect("projection use"),
+            ));
         }
         assert_eq!(
             plan.write_disposition(inst.id),
@@ -352,8 +368,30 @@ fn use_and_write_dispositions_delegate_to_the_validated_projection() {
                 plan.write_disposition(inst.id),
                 Some(MachineWriteDisposition::Exact(_))
             ));
+            assert!(std::ptr::eq(
+                resolution
+                    .require_write(inst.id)
+                    .expect("required exact write"),
+                plan.machine_projection()
+                    .write_disposition(inst.id)
+                    .expect("projection write"),
+            ));
         }
     }
+    let missing_site = UseSite {
+        inst: r2ssa::InstId(u32::MAX),
+        input_idx: 0,
+    };
+    assert_eq!(
+        resolution.require_use(missing_site),
+        Err(RenderedIdentityRefusal::MissingUseDisposition { site: missing_site })
+    );
+    assert_eq!(
+        resolution.require_write(r2ssa::InstId(u32::MAX)),
+        Err(RenderedIdentityRefusal::MissingWriteDisposition {
+            inst: r2ssa::InstId(u32::MAX)
+        })
+    );
 }
 
 #[test]
@@ -421,7 +459,13 @@ fn refused_machine_use_leaves_its_constant_explicitly_refused() {
         inputs: vec![Varnode::constant(9, 8)],
     }]);
     let source = source_owned.source();
-    let plan = BindingPlan::build_shadow(&source_owned).expect("partial shadow plan");
+    let plan = Rc::new(BindingPlan::build_shadow(&source_owned).expect("partial shadow plan"));
+    let resolution = BindingNameResolution::build(
+        &source_owned,
+        Rc::clone(&plan),
+        Rc::new(RefCell::new(SymbolTable::new())),
+    )
+    .expect("refused projection resolution");
     let constant = source
         .graph()
         .values
@@ -439,6 +483,41 @@ fn refused_machine_use_leaves_its_constant_explicitly_refused() {
         plan.use_disposition(use_site),
         Some(MachineUseDisposition::Refused(_))
     ));
+    let use_reason = match plan.machine_projection().use_disposition(use_site) {
+        Some(MachineUseDisposition::Refused(reason)) => *reason,
+        other => panic!("expected canonical use refusal, got {other:?}"),
+    };
+    assert_eq!(
+        resolution.require_use(use_site),
+        Err(RenderedIdentityRefusal::MachineUse {
+            site: use_site,
+            reason: use_reason,
+        })
+    );
+
+    let producer = source
+        .graph()
+        .insts
+        .iter()
+        .find(|inst| {
+            matches!(
+                &inst.payload,
+                r2ssa::InstPayload::Op(r2ssa::SSAOp::CallOther { .. })
+            )
+        })
+        .map(|inst| inst.id)
+        .expect("opaque operation instruction");
+    let write_reason = match plan.machine_projection().write_disposition(producer) {
+        Some(MachineWriteDisposition::Refused(reason)) => *reason,
+        other => panic!("expected canonical write refusal, got {other:?}"),
+    };
+    assert_eq!(
+        resolution.require_write(producer),
+        Err(RenderedIdentityRefusal::MachineWrite {
+            inst: producer,
+            reason: write_reason,
+        })
+    );
 }
 
 #[test]
@@ -705,6 +784,12 @@ fn certified_stack_objects_get_bindings_without_invented_value_membership() {
     );
 
     let plan = BindingPlan::build_shadow(&source_owned).expect("stack-aware plan");
+    let resolution = BindingNameResolution::build(
+        &source_owned,
+        Rc::new(plan.clone()),
+        Rc::new(RefCell::new(SymbolTable::new())),
+    )
+    .expect("stack resolution");
     for (object, _, _, size) in stack_slots {
         match (size, plan.stack_object_disposition(object)) {
             (Some(size), Some(StackObjectDisposition::Bound { binding })) if size > 0 => {
@@ -719,15 +804,37 @@ fn certified_stack_objects_get_bindings_without_invented_value_membership() {
                         SemanticId::StackSlot(certified)
                     )]) if *certified == object
                 ));
+                assert_eq!(
+                    resolution.require_stack(object),
+                    Ok(PlannedStackSymbol::Bound(
+                        resolution
+                            .symbol_for_binding(binding)
+                            .expect("stack binding symbol")
+                    ))
+                );
             }
             (
                 None,
                 Some(StackObjectDisposition::Refused {
                     reason: StackObjectRefusal::MissingWidth { object: refused },
                 }),
-            ) if refused == object => {}
+            ) if refused == object => {
+                assert_eq!(
+                    resolution.require_stack(object),
+                    Err(RenderedIdentityRefusal::StackObject {
+                        object,
+                        reason: StackObjectRefusal::MissingWidth { object }
+                    })
+                );
+            }
             other => panic!("unexpected stack object disposition: {other:?}"),
         }
     }
+    assert_eq!(
+        resolution.require_stack(r2ssa::ObjectId(u32::MAX)),
+        Err(RenderedIdentityRefusal::MissingStackDisposition {
+            object: r2ssa::ObjectId(u32::MAX)
+        })
+    );
     assert!(plan.validate_seal(&source_owned).is_ok());
 }

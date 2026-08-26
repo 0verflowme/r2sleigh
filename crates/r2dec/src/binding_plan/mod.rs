@@ -395,7 +395,8 @@ mod name_resolution;
 mod seal;
 
 pub(crate) use name_resolution::{
-    BindingNameResolution, BindingNameResolutionError, PlannedParameterSymbol, PlannedValueSymbol,
+    BindingNameResolution, BindingNameResolutionError, PlannedParameterSymbol, PlannedStackSymbol,
+    PlannedValueSymbol, RenderedIdentityRefusal,
 };
 pub(crate) use seal::build_upstream_shadow_oracle;
 
