@@ -49,6 +49,7 @@ pub mod region;
 pub(crate) mod registers;
 mod shadow_report;
 pub(crate) mod single_evaluation;
+mod structured_region;
 pub mod structure;
 pub mod symbol;
 pub(crate) mod unrendered;
