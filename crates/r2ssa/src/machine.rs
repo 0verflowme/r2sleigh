@@ -371,9 +371,9 @@ pub enum MachineArithmeticMode {
 
 /// Result policy when an integer divisor is zero.
 ///
-/// Raw p-code division does not model a processor trap or choose a quotient for
-/// this case. Keeping that absence explicit prevents a consumer from silently
-/// inheriting its host language's divide-by-zero behavior.
+/// Raw p-code division and remainder do not model a processor trap or choose a
+/// result for this case. Keeping that absence explicit prevents a consumer from
+/// silently inheriting its host language's divide-by-zero behavior.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub enum MachineZeroDivisorBehavior {
     Undefined,
@@ -595,6 +595,11 @@ pub enum MachineExprKind {
         dividend: MachineExprId,
         divisor: MachineExprId,
     },
+    UnsignedRemainder {
+        zero_divisor: MachineZeroDivisorBehavior,
+        dividend: MachineExprId,
+        divisor: MachineExprId,
+    },
     Negate {
         mode: MachineArithmeticMode,
         input: MachineExprId,
@@ -666,6 +671,9 @@ impl MachineExprKind {
             | Self::Boolean { left, right, .. }
             | Self::Compare { left, right, .. } => vec![*left, *right],
             Self::UnsignedDivide {
+                dividend, divisor, ..
+            }
+            | Self::UnsignedRemainder {
                 dividend, divisor, ..
             } => vec![*dividend, *divisor],
             Self::Concat { high, low } => vec![*high, *low],
@@ -1836,6 +1844,11 @@ impl MachineFunction {
                 zero_divisor,
                 dividend,
                 divisor,
+            }
+            | MachineExprKind::UnsignedRemainder {
+                zero_divisor,
+                dividend,
+                divisor,
             } => {
                 *zero_divisor == MachineZeroDivisorBehavior::Undefined
                     && matches!(
@@ -2618,6 +2631,17 @@ impl MachineBuilder {
                     },
                 ))
             }
+            SSAOp::IntRem { .. } => {
+                let inputs = self.exact_width_operand_nodes(graph, inst, 2, output.width_bits)?;
+                Ok((
+                    unsigned,
+                    MachineExprKind::UnsignedRemainder {
+                        zero_divisor: MachineZeroDivisorBehavior::Undefined,
+                        dividend: inputs[0],
+                        divisor: inputs[1],
+                    },
+                ))
+            }
             SSAOp::IntNegate { .. } => {
                 let inputs = self.exact_width_operand_nodes(graph, inst, 1, output.width_bits)?;
                 Ok((
@@ -3121,6 +3145,13 @@ fn machine_kind_matches_op(op: &SSAOp, kind: &MachineExprKind) -> bool {
                 }
             )
             | (
+                SSAOp::IntRem { .. },
+                MachineExprKind::UnsignedRemainder {
+                    zero_divisor: MachineZeroDivisorBehavior::Undefined,
+                    ..
+                }
+            )
+            | (
                 SSAOp::IntNegate { .. },
                 MachineExprKind::Negate {
                     mode: MachineArithmeticMode::Wrapping,
@@ -3325,6 +3356,7 @@ fn machine_type_matches_op(op: &SSAOp, ty: &MachineType, output_bits: u32) -> bo
         | SSAOp::IntSub { .. }
         | SSAOp::IntMult { .. }
         | SSAOp::IntDiv { .. }
+        | SSAOp::IntRem { .. }
         | SSAOp::IntNegate { .. }
         | SSAOp::IntAnd { .. }
         | SSAOp::IntOr { .. }
@@ -4227,18 +4259,122 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_value_operation_fails_explicitly() {
+    fn unsigned_remainder_has_exact_machine_vocabulary() {
+        let artifact = artifact_with_ops([R2ILOp::IntRem {
+            dst: Varnode::unique(0x10, 8),
+            a: Varnode::unique(0x100, 8),
+            b: Varnode::constant(0, 8),
+        }]);
+        let projection = MachineProjection::from_artifact(&artifact).expect("exact remainder");
+        assert!(projection.failures().is_empty());
+
+        let inst = artifact
+            .graph()
+            .inst_id_for_op_site(0x1000, 0)
+            .expect("remainder instruction");
+        let graph_inst = artifact.graph().inst(inst).expect("remainder graph node");
+        let entity = projection
+            .entity_for_output(graph_inst.output.expect("remainder output"))
+            .expect("remainder entity");
+        let root = projection.expr(entity.root()).expect("remainder root");
+        assert_eq!(root.ty(), &integer_type(64, MachineSignedness::Unsigned));
+        let MachineExprKind::UnsignedRemainder {
+            zero_divisor,
+            dividend,
+            divisor,
+        } = root.kind()
+        else {
+            panic!("unsigned remainder root expected");
+        };
+        assert_eq!(*zero_divisor, MachineZeroDivisorBehavior::Undefined);
+        assert_eq!(
+            operand_leaf_binding(projection.arena(), *dividend).map(|binding| binding.value()),
+            Some(graph_inst.inputs[0])
+        );
+        assert_eq!(
+            operand_leaf_binding(projection.arena(), *divisor).map(|binding| binding.value()),
+            Some(graph_inst.inputs[1])
+        );
+        for input_idx in 0..2 {
+            assert_eq!(
+                exact_use(&projection, &artifact, 0, input_idx),
+                whole_machine_use(
+                    binding_for_value(
+                        artifact
+                            .graph()
+                            .value(graph_inst.inputs[input_idx])
+                            .expect("remainder input"),
+                    )
+                    .expect("remainder input binding"),
+                )
+            );
+        }
+        assert_eq!(
+            projection.write_disposition(inst),
+            Some(&MachineWriteDisposition::Exact(
+                MachineWriteProjection::Full
+            ))
+        );
+        projection
+            .validate_against(&artifact)
+            .expect("remainder remains source-bound");
+    }
+
+    #[test]
+    fn unsigned_remainder_rejects_wrong_arity_and_width() {
         let artifact = artifact_with_ops([R2ILOp::IntRem {
             dst: Varnode::unique(0x10, 8),
             a: Varnode::register(0, 8),
-            b: Varnode::constant(3, 8),
+            b: Varnode::register(8, 8),
         }]);
-        assert!(matches!(
-            MachineFunction::from_artifact(&artifact),
-            Err(MachineBuildError::UnsupportedOperation {
+        let inst = artifact
+            .graph()
+            .inst_id_for_op_site(0x1000, 0)
+            .and_then(|inst| artifact.graph().inst(inst))
+            .expect("remainder instruction");
+        let InstPayload::Op(op) = &inst.payload else {
+            unreachable!();
+        };
+        let output = binding_for_value(
+            artifact
+                .graph()
+                .value(inst.output.expect("remainder output"))
+                .expect("remainder output value"),
+        )
+        .expect("remainder output binding");
+
+        let mut wrong_arity = inst.clone();
+        wrong_arity.inputs.pop();
+        assert_eq!(
+            MachineBuilder::for_graph(artifact.graph()).lower_op(
+                &artifact,
+                &wrong_arity,
                 op,
-                ..
-            }) if matches!(*op, SSAOp::IntRem { .. })
+                output,
+            ),
+            Err(MachineBuildError::WrongOperandCount {
+                inst: inst.id,
+                expected: 2,
+                actual: 1,
+            })
+        );
+
+        let wrong_width = MachineValueBinding {
+            width_bits: 32,
+            ..output
+        };
+        assert!(matches!(
+            MachineBuilder::for_graph(artifact.graph()).lower_op(
+                &artifact,
+                inst,
+                op,
+                wrong_width,
+            ),
+            Err(MachineBuildError::WidthMismatch {
+                inst: actual,
+                expected_bits: 32,
+                actual_bits: 64,
+            }) if actual == inst.id
         ));
     }
 
@@ -5155,7 +5291,7 @@ mod tests {
 
     #[test]
     fn dense_use_slices_cover_whole_subpiece_narrow_bitwise_casts_and_effects() {
-        let unsupported = Varnode::unique(0x60, 8);
+        let remainder = Varnode::unique(0x60, 8);
         let artifact = artifact_with_ops([
             R2ILOp::Copy {
                 dst: Varnode::unique(0x10, 8),
@@ -5193,13 +5329,13 @@ mod tests {
                 val: Varnode::unique(0x138, 4),
             },
             R2ILOp::IntRem {
-                dst: unsupported.clone(),
+                dst: remainder.clone(),
                 a: Varnode::unique(0x140, 8),
                 b: Varnode::constant(3, 8),
             },
             R2ILOp::Copy {
                 dst: Varnode::unique(0x68, 8),
-                src: unsupported,
+                src: remainder,
             },
             R2ILOp::Return {
                 target: Varnode::unique(0x148, 8),
@@ -5269,21 +5405,30 @@ mod tests {
         assert_eq!(exact_use(&projection, &artifact, 7, 0).width_bits(), 64);
         assert_eq!(exact_use(&projection, &artifact, 7, 1).width_bits(), 32);
 
-        let unsupported_inst = artifact
+        let remainder_inst = artifact
             .graph()
             .inst_id_for_op_site(0x1000, 8)
-            .expect("unsupported remainder instruction");
+            .expect("remainder instruction");
         for input_idx in 0..2 {
             assert_eq!(
-                projection.use_disposition(UseSite {
-                    inst: unsupported_inst,
-                    input_idx,
-                }),
-                Some(&MachineUseDisposition::Refused(
-                    MachineUseRefusal::UnsupportedOperation
-                ))
+                exact_use(&projection, &artifact, 8, input_idx),
+                whole_machine_use(
+                    binding_for_value(
+                        artifact
+                            .graph()
+                            .value(artifact.graph().inst(remainder_inst).unwrap().inputs[input_idx])
+                            .unwrap()
+                    )
+                    .unwrap()
+                )
             );
         }
+        assert_eq!(
+            projection.write_disposition(remainder_inst),
+            Some(&MachineWriteDisposition::Exact(
+                MachineWriteProjection::Full
+            ))
+        );
         assert_eq!(exact_use(&projection, &artifact, 9, 0).width_bits(), 64);
         assert_eq!(exact_use(&projection, &artifact, 10, 0).width_bits(), 64);
         projection
