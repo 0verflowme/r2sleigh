@@ -11613,7 +11613,6 @@ mod tests {
             .expect("source-owned route");
         assert_eq!(route.kind, crate::DecompileRouteKind::Standard);
         assert_eq!(route.reason.as_deref(), Some("test route"));
-        assert!(route.skip_runtime_type_inference);
         assert!(route.use_prepared_semantic_view);
         assert!(route.fallback_comment.is_none());
         drop(shared);

@@ -121,7 +121,6 @@ fn provisional_decompile_route(
         kind,
         reason,
         fallback_comment,
-        skip_runtime_type_inference: !matches!(kind, r2types::DecompileRouteKind::Standard),
         use_prepared_semantic_view: matches!(kind, r2types::DecompileRouteKind::Standard),
     }
 }
@@ -640,8 +639,6 @@ pub(crate) fn decompile_route_decision(
         Some(function_facts),
     );
     let mut route = route;
-    route.skip_runtime_type_inference =
-        should_skip_runtime_type_inference(prepared, function_facts);
     route.use_prepared_semantic_view = should_use_prepared_semantic_view(prepared, function_facts);
     EngineRouteDecision {
         request: EngineRequestKind::Decompile,
@@ -793,23 +790,6 @@ pub fn prefer_symbolic_large_worker_decompile(function_facts: &FunctionFacts) ->
             Some(r2sym::SliceClass::Worker | r2sym::SliceClass::GenericLarge)
         )
         && (capability.has_native_regions || capability.has_summary_islands)
-}
-
-pub(crate) fn should_skip_runtime_type_inference(
-    prepared: Option<&SsaArtifact>,
-    function_facts: &FunctionFacts,
-) -> bool {
-    if prefer_symbolic_large_worker_decompile(function_facts) {
-        return true;
-    }
-    let Some(prepared) = prepared else {
-        return false;
-    };
-    let summary = prepared.function().cfg_risk_summary();
-    summary.block_count >= 96
-        && summary.switch_block_count > 0
-        && summary.max_switch_cases >= 32
-        && summary.back_edge_count == 0
 }
 
 pub fn should_use_prepared_semantic_view(

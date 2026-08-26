@@ -1300,7 +1300,6 @@ pub struct DecompileRouteFacts {
     pub reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fallback_comment: Option<String>,
-    pub skip_runtime_type_inference: bool,
     pub use_prepared_semantic_view: bool,
 }
 
@@ -1559,7 +1558,6 @@ impl SourceOwnedFunctionFacts {
             fallback_comment: (kind == DecompileRouteKind::FallbackComment)
                 .then_some(fallback_comment)
                 .flatten(),
-            skip_runtime_type_inference: true,
             use_prepared_semantic_view,
         }));
         compatible
@@ -7675,14 +7673,12 @@ mod tests {
             kind: DecompileRouteKind::FallbackComment,
             reason: Some("typed refusal".to_string()),
             fallback_comment: Some("/* typed fallback */".to_string()),
-            skip_runtime_type_inference: true,
             use_prepared_semantic_view: false,
         };
         let standard_with_comment = DecompileRouteFacts {
             kind: DecompileRouteKind::Standard,
             reason: Some("must not render".to_string()),
             fallback_comment: Some("/* wrong route */".to_string()),
-            skip_runtime_type_inference: false,
             use_prepared_semantic_view: false,
         };
 

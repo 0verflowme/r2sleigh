@@ -514,7 +514,6 @@ mod tests {
                 kind: r2types::DecompileRouteKind::LinearWorker,
                 reason: Some("test summary".to_string()),
                 fallback_comment: None,
-                skip_runtime_type_inference: true,
                 use_prepared_semantic_view: false,
             },
             CodeGenConfig::default(),

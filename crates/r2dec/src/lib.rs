@@ -5717,7 +5717,6 @@ mod tests {
             kind,
             reason: Some(reason.to_string()),
             fallback_comment,
-            skip_runtime_type_inference: !matches!(kind, r2types::DecompileRouteKind::Standard),
             use_prepared_semantic_view: matches!(kind, r2types::DecompileRouteKind::Standard),
         }
     }

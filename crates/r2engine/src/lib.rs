@@ -5730,7 +5730,6 @@ fn seal_refused_decompile_function_facts(
         kind: r2types::DecompileRouteKind::FallbackComment,
         reason: Some(reason.to_string()),
         fallback_comment: Some(output),
-        skip_runtime_type_inference: true,
         use_prepared_semantic_view: false,
     };
     function_facts.with_decompile_route(route)
@@ -6753,7 +6752,6 @@ mod tests {
             kind,
             reason: reason.map(str::to_string),
             fallback_comment: fallback_comment.map(str::to_string),
-            skip_runtime_type_inference: kind != r2types::DecompileRouteKind::Standard,
             use_prepared_semantic_view: kind == r2types::DecompileRouteKind::Standard,
         }
     }
