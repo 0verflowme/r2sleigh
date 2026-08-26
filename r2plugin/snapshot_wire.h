@@ -5,10 +5,11 @@
  * of implementing a callback per field, so the C boundary carries one buffer
  * rather than 67 entry points and 31 struct sizes kept in lockstep.
  *
- * The encoding is owned by r2source::snapshot_wire; this writer must stay
- * byte-identical to it. Both sides assert the same framing in their conformance
- * tests, so drift in either direction fails a test rather than producing a
- * buffer the other side misreads. */
+ * The encoding is owned by r2source::snapshot_wire. This producer intentionally
+ * remains on readable format v1: ABI spelling is classified exactly once by
+ * r2source while decoding, rather than duplicated in C. The Rust reader keeps
+ * v1 migration coverage, and this writer pins the v1 framing and payload order
+ * in its own conformance test. */
 
 #ifndef R2SLEIGH_SNAPSHOT_WIRE_H
 #define R2SLEIGH_SNAPSHOT_WIRE_H

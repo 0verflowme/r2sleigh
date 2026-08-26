@@ -1,7 +1,6 @@
-/* Asserts the C wire writer produces exactly the bytes r2source's writer does.
- * The same vector is asserted in Rust (snapshot_wire::tests::
- * the_c_conformance_vector_is_byte_stable), so drift on either side fails a
- * test instead of yielding a buffer the other side misreads. */
+/* Pins the compatibility producer's v1 framing and primitive payload order.
+ * r2source owns the current writer and accepts this older framing through its
+ * explicit v1 migration path. */
 
 #include "../snapshot_wire.h"
 

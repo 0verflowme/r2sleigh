@@ -3051,12 +3051,12 @@ mod tests {
         assert!(decode_snapshot(&buffer).is_err());
     }
 
-    /// The same byte vector the C writer asserts in
-    /// r2plugin/tests/snapshot_wire_conformance.c. Both sides pin it, so a
-    /// change to either writer fails a test rather than producing a buffer the
-    /// other side misreads.
+    /// Pin the current Rust writer's framing and primitive payload order.
+    ///
+    /// The C producer intentionally remains on readable v1 so ABI spelling is
+    /// classified once here instead of reimplemented across the FFI boundary.
     #[test]
-    fn the_c_conformance_vector_is_byte_stable() {
+    fn the_current_writer_vector_is_byte_stable() {
         let mut writer = SnapshotWireWriter::new();
         writer.u8(0x7f);
         writer.bool(true);
