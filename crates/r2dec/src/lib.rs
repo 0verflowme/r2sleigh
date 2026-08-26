@@ -43,6 +43,7 @@ pub mod highlight;
 pub(crate) mod naming;
 pub(crate) mod normalize;
 mod observation_journal;
+mod placement;
 pub(crate) mod planner;
 pub(crate) mod post_rename;
 pub mod region;

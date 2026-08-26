@@ -26,6 +26,14 @@ use r2types::SourceOwnedFunctionFacts;
 pub(crate) struct BindingId(u32);
 
 impl BindingId {
+    /// Resolve an index in the sealed plan's dense binding domain.
+    ///
+    /// Callers must still validate the result against `BindingPlan::binding` or
+    /// `BindingPlan::binding_count`; this conversion only prevents truncation.
+    pub(crate) fn from_dense_index(index: usize) -> Option<Self> {
+        u32::try_from(index).ok().map(Self)
+    }
+
     pub(crate) const fn index(self) -> usize {
         self.0 as usize
     }
