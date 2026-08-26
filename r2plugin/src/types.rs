@@ -331,17 +331,6 @@ pub(crate) fn size_to_type(size: u32) -> String {
     r2types::size_to_type(size)
 }
 
-#[cfg(test)]
-pub(crate) fn get_data_refs_from_ssa_with_op_sources(
-    ssa_blocks: &[r2ssa::SSABlock],
-    op_sources: Option<&[Vec<u64>]>,
-) -> Vec<DataRef> {
-    r2ssa::data_refs_from_ssa_with_op_sources(ssa_blocks, op_sources)
-        .iter()
-        .map(data_ref_from_fact)
-        .collect()
-}
-
 fn data_refs_for_ffi(
     ctx: *const R2ILContext,
     blocks: *const *const R2ILBlock,
@@ -349,7 +338,7 @@ fn data_refs_for_ffi(
     _fcn_addr: u64,
 ) -> Option<Vec<r2ssa::DataRefFact>> {
     let input = build_function_input(ctx, blocks, num_blocks)?;
-    r2ssa::data_refs_from_blocks(input.blocks.as_slice(), input.ctx.arch, input.ctx.disasm)
+    r2ssa::data_refs_from_blocks(input.blocks.as_slice(), input.ctx.arch)
 }
 
 pub(crate) fn r2sleigh_data_refs_typed(
@@ -434,41 +423,6 @@ mod tests {
     }
 
     #[test]
-    fn get_data_refs_resolves_const_add_chain_target() {
-        let block = r2ssa::SSABlock {
-            addr: 0x401000,
-            size: 4,
-            ops: vec![
-                r2ssa::SSAOp::Copy {
-                    dst: r2ssa::SSAVar::new("tmp:base", 1, 8),
-                    src: r2ssa::SSAVar::new("const:dead0000", 0, 8),
-                },
-                r2ssa::SSAOp::IntAdd {
-                    dst: r2ssa::SSAVar::new("tmp:target", 1, 8),
-                    a: r2ssa::SSAVar::new("tmp:base", 1, 8),
-                    b: r2ssa::SSAVar::new("const:beef", 0, 8),
-                },
-                r2ssa::SSAOp::Load {
-                    dst: r2ssa::SSAVar::new("tmp:load", 1, 4),
-                    space: r2il::SpaceId::Ram,
-                    addr: r2ssa::SSAVar::new("tmp:target", 1, 8),
-                },
-            ],
-        };
-
-        let refs = get_data_refs_from_ssa_with_op_sources(&[block], None);
-        assert!(
-            refs.iter().any(|r| {
-                r.from == 0x401000
-                    && r.to == 0xdeadbeef
-                    && r.space == r2il::SpaceId::Ram
-                    && r.ref_type == "d"
-            }),
-            "const add chain should emit DATA xref to the computed target"
-        );
-    }
-
-    #[test]
     fn ffi_data_refs_preserve_exact_address_space_tags() {
         let refs = ffi_data_refs_from_refs(&[
             r2ssa::DataRefFact {
@@ -525,209 +479,6 @@ mod tests {
         assert_eq!(std::mem::offset_of!(R2SleighDataRef, custom_space), 20);
         assert_eq!(std::mem::offset_of!(R2SleighDataRef, ref_kind), 24);
         assert!(matches!(std::mem::size_of::<R2SleighDataRef>(), 28 | 32));
-    }
-
-    #[test]
-    fn get_data_refs_ignores_small_const_add_chain() {
-        let block = r2ssa::SSABlock {
-            addr: 0x402000,
-            size: 4,
-            ops: vec![r2ssa::SSAOp::IntAdd {
-                dst: r2ssa::SSAVar::new("tmp:small", 1, 8),
-                a: r2ssa::SSAVar::new("const:40", 0, 8),
-                b: r2ssa::SSAVar::new("const:2", 0, 8),
-            }],
-        };
-
-        let refs = get_data_refs_from_ssa_with_op_sources(&[block], None);
-        assert!(
-            !refs.iter().any(|r| r.to == 0x42),
-            "small immediate constants should not be treated as addresses"
-        );
-    }
-
-    #[test]
-    fn get_data_refs_resolves_const_add_chain_across_blocks() {
-        let block_a = r2ssa::SSABlock {
-            addr: 0x403000,
-            size: 4,
-            ops: vec![r2ssa::SSAOp::Copy {
-                dst: r2ssa::SSAVar::new("tmp:base", 1, 8),
-                src: r2ssa::SSAVar::new("const:dead0000", 0, 8),
-            }],
-        };
-        let block_b = r2ssa::SSABlock {
-            addr: 0x403004,
-            size: 4,
-            ops: vec![
-                r2ssa::SSAOp::IntAdd {
-                    dst: r2ssa::SSAVar::new("tmp:target", 1, 8),
-                    a: r2ssa::SSAVar::new("tmp:base", 1, 8),
-                    b: r2ssa::SSAVar::new("const:beef", 0, 8),
-                },
-                r2ssa::SSAOp::Load {
-                    dst: r2ssa::SSAVar::new("tmp:load", 1, 4),
-                    space: r2il::SpaceId::Ram,
-                    addr: r2ssa::SSAVar::new("tmp:target", 1, 8),
-                },
-            ],
-        };
-
-        let refs = get_data_refs_from_ssa_with_op_sources(&[block_a, block_b], None);
-        assert!(
-            refs.iter()
-                .any(|r| { r.from == 0x403004 && r.to == 0xdeadbeef && r.ref_type == "d" }),
-            "const add chain split across blocks should emit DATA xref to the computed target"
-        );
-    }
-
-    #[test]
-    fn get_data_refs_uses_per_op_source_addr_when_available() {
-        let block = r2ssa::SSABlock {
-            addr: 0x404000,
-            size: 0x20,
-            ops: vec![
-                r2ssa::SSAOp::Copy {
-                    dst: r2ssa::SSAVar::new("tmp:base", 1, 8),
-                    src: r2ssa::SSAVar::new("const:404d00", 0, 8),
-                },
-                r2ssa::SSAOp::IntAdd {
-                    dst: r2ssa::SSAVar::new("tmp:target", 1, 8),
-                    a: r2ssa::SSAVar::new("tmp:base", 1, 8),
-                    b: r2ssa::SSAVar::new("const:108", 0, 8),
-                },
-                r2ssa::SSAOp::Load {
-                    dst: r2ssa::SSAVar::new("tmp:load", 1, 8),
-                    space: r2il::SpaceId::Ram,
-                    addr: r2ssa::SSAVar::new("tmp:target", 1, 8),
-                },
-            ],
-        };
-        let op_sources = vec![vec![0x404008, 0x40400c, 0x404010]];
-
-        let refs = get_data_refs_from_ssa_with_op_sources(&[block], Some(&op_sources));
-        assert!(
-            refs.iter()
-                .any(|r| { r.from == 0x40400c && r.to == 0x404e08 && r.ref_type == "d" }),
-            "computed add-chain xref should use the IntAdd op source address: {refs:?}"
-        );
-    }
-
-    #[test]
-    fn get_data_refs_uses_per_op_source_addr_for_const_sub_chain() {
-        let block = r2ssa::SSABlock {
-            addr: 0x405000,
-            size: 0x20,
-            ops: vec![
-                r2ssa::SSAOp::Copy {
-                    dst: r2ssa::SSAVar::new("tmp:base", 1, 8),
-                    src: r2ssa::SSAVar::new("const:405000", 0, 8),
-                },
-                r2ssa::SSAOp::IntSub {
-                    dst: r2ssa::SSAVar::new("tmp:target", 1, 8),
-                    a: r2ssa::SSAVar::new("tmp:base", 1, 8),
-                    b: r2ssa::SSAVar::new("const:108", 0, 8),
-                },
-                r2ssa::SSAOp::Load {
-                    dst: r2ssa::SSAVar::new("tmp:load", 1, 8),
-                    space: r2il::SpaceId::Ram,
-                    addr: r2ssa::SSAVar::new("tmp:target", 1, 8),
-                },
-            ],
-        };
-        let op_sources = vec![vec![0x405008, 0x40500c, 0x405010]];
-
-        let refs = get_data_refs_from_ssa_with_op_sources(&[block], Some(&op_sources));
-        assert!(
-            refs.iter()
-                .any(|r| { r.from == 0x40500c && r.to == 0x404ef8 && r.ref_type == "d" }),
-            "computed sub-chain xref should use the IntSub op source address: {refs:?}"
-        );
-    }
-
-    #[test]
-    fn get_data_refs_ignores_small_const_sub_chain() {
-        let block = r2ssa::SSABlock {
-            addr: 0x406000,
-            size: 4,
-            ops: vec![r2ssa::SSAOp::IntSub {
-                dst: r2ssa::SSAVar::new("tmp:small", 1, 8),
-                a: r2ssa::SSAVar::new("const:40", 0, 8),
-                b: r2ssa::SSAVar::new("const:2", 0, 8),
-            }],
-        };
-
-        let refs = get_data_refs_from_ssa_with_op_sources(&[block], None);
-        assert!(
-            !refs.iter().any(|r| r.to == 0x3e),
-            "small immediate sub constants should not be treated as addresses"
-        );
-    }
-
-    #[test]
-    fn get_data_refs_resolves_const_add_chain_through_stack_spills() {
-        let block = r2ssa::SSABlock {
-            addr: 0x100001138,
-            size: 0x3c,
-            ops: vec![
-                r2ssa::SSAOp::IntSub {
-                    dst: r2ssa::SSAVar::new("SP", 1, 8),
-                    a: r2ssa::SSAVar::new("SP", 0, 8),
-                    b: r2ssa::SSAVar::new("const:10", 0, 8),
-                },
-                r2ssa::SSAOp::IntAdd {
-                    dst: r2ssa::SSAVar::new("tmp:6500", 1, 8),
-                    a: r2ssa::SSAVar::new("SP", 1, 8),
-                    b: r2ssa::SSAVar::new("const:8", 0, 8),
-                },
-                r2ssa::SSAOp::Store {
-                    space: r2il::SpaceId::Ram,
-                    addr: r2ssa::SSAVar::new("tmp:6500", 1, 8),
-                    val: r2ssa::SSAVar::new("const:404d00", 0, 8),
-                },
-                r2ssa::SSAOp::Load {
-                    dst: r2ssa::SSAVar::new("X8", 4, 8),
-                    space: r2il::SpaceId::Ram,
-                    addr: r2ssa::SSAVar::new("tmp:6500", 1, 8),
-                },
-                r2ssa::SSAOp::IntAdd {
-                    dst: r2ssa::SSAVar::new("tmp:11f80", 1, 8),
-                    a: r2ssa::SSAVar::new("X8", 4, 8),
-                    b: r2ssa::SSAVar::new("const:108", 0, 8),
-                },
-                r2ssa::SSAOp::Store {
-                    space: r2il::SpaceId::Ram,
-                    addr: r2ssa::SSAVar::new("SP", 1, 8),
-                    val: r2ssa::SSAVar::new("tmp:11f80", 1, 8),
-                },
-                r2ssa::SSAOp::Load {
-                    dst: r2ssa::SSAVar::new("X9", 1, 8),
-                    space: r2il::SpaceId::Ram,
-                    addr: r2ssa::SSAVar::new("SP", 1, 8),
-                },
-                r2ssa::SSAOp::IntSub {
-                    dst: r2ssa::SSAVar::new("tmp:cmp", 1, 8),
-                    a: r2ssa::SSAVar::new("X9", 1, 8),
-                    b: r2ssa::SSAVar::new("const:404e08", 0, 8),
-                },
-            ],
-        };
-        let op_sources = vec![vec![
-            0x100001138,
-            0x10000113c,
-            0x100001140,
-            0x100001144,
-            0x100001148,
-            0x10000114c,
-            0x100001150,
-            0x100001154,
-        ]];
-
-        let refs = get_data_refs_from_ssa_with_op_sources(&[block], Some(&op_sources));
-        assert!(
-            refs.iter().any(|r| r.to == 0x404e08 && r.ref_type == "d"),
-            "stack-spilled const add chain should emit DATA xref to the recovered target: {refs:?}"
-        );
     }
 
     #[test]

@@ -69,7 +69,7 @@ pub use control::{
     SsaWorkControl,
 };
 pub use data_ref::{
-    DataRefFact, DataRefKind, data_refs_from_blocks, data_refs_from_ssa_with_op_sources,
+    DataRefFact, DataRefKind, data_refs_from_artifact_with_op_sources, data_refs_from_blocks,
     parse_const_value,
 };
 pub use defuse::{
