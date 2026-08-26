@@ -821,7 +821,16 @@ impl BindingPlan {
                     offset,
                     size,
                     source_slot,
-                } => Some((*id, *object, *base, *offset, *size, *source_slot)),
+                    callee_allocation,
+                } => Some((
+                    *id,
+                    *object,
+                    *base,
+                    *offset,
+                    *size,
+                    *source_slot,
+                    callee_allocation.clone(),
+                )),
                 r2types::CertifiedEntity::Parameter { .. }
                 | r2types::CertifiedEntity::LoopCarrier { .. } => None,
             })
@@ -834,7 +843,9 @@ impl BindingPlan {
                 },
             ));
         }
-        for (entity, object, base, offset, size, source_slot) in expected_stack_objects {
+        for (entity, object, base, offset, size, source_slot, callee_allocation) in
+            expected_stack_objects
+        {
             let exact_certificate = source.certificates().stack_slots.get(&object);
             if exact_certificate.is_none_or(|certificate| {
                 certificate.object != object
@@ -842,16 +853,72 @@ impl BindingPlan {
                     || certificate.offset != offset
                     || certificate.size != size
                     || certificate.source_slot != source_slot
+                    || certificate.callee_allocation != callee_allocation
             }) {
                 return Err(BindingPlanBuildError::Seal(
                     BindingPlanSourceMismatch::UnexpectedStackObjectDisposition { object },
                 ));
             }
-            let expected_disposition = match source_slot {
-                None => StackObjectDisposition::Refused {
+            let expected_disposition = match (source_slot, callee_allocation) {
+                (None, None) => StackObjectDisposition::Refused {
                     reason: StackObjectRefusal::MissingSourceIdentity { object },
                 },
-                Some(source_slot)
+                (None, Some(certificate)) => {
+                    if certificate.object != object
+                        || size != Some(certificate.size_bytes)
+                        || certificate.accesses.is_empty()
+                        || certificate.active_sp_offsets.is_empty()
+                    {
+                        StackObjectDisposition::Refused {
+                            reason: StackObjectRefusal::MissingSourceIdentity { object },
+                        }
+                    } else {
+                        let Some(binding) = BindingId::from_dense_index(binding_index) else {
+                            return Err(BindingPlanBuildError::TooManyBindings {
+                                count: binding_index.saturating_add(1),
+                            });
+                        };
+                        let planned =
+                            self.bindings
+                                .get(binding_index)
+                                .ok_or(BindingPlanBuildError::Seal(
+                                    BindingPlanSourceMismatch::UnexpectedStackObjectDisposition {
+                                        object,
+                                    },
+                                ))?;
+                        let width_bits = certificate
+                            .size_bytes
+                            .checked_mul(8)
+                            .filter(|width| *width > 0);
+                        if planned.certificate.sources.as_ref()
+                            != [BindingCertificateSource::CertifiedEntity(entity)]
+                            || !actual_by_binding[binding_index].is_empty()
+                        {
+                            return Err(BindingPlanBuildError::Seal(
+                                BindingPlanSourceMismatch::StackObjectCertificate {
+                                    object,
+                                    binding,
+                                },
+                            ));
+                        }
+                        if width_bits.is_none_or(|width_bits| {
+                            planned.declaration_type != CType::machine_bits(width_bits)
+                        }) {
+                            return Err(BindingPlanBuildError::Seal(
+                                BindingPlanSourceMismatch::StackObjectDeclarationWidth {
+                                    object,
+                                    binding,
+                                },
+                            ));
+                        }
+                        binding_index += 1;
+                        StackObjectDisposition::Bound { binding }
+                    }
+                }
+                (Some(_), Some(_)) => StackObjectDisposition::Refused {
+                    reason: StackObjectRefusal::MissingSourceIdentity { object },
+                },
+                (Some(source_slot), None)
                     if source_slot.base() != base
                         || source_slot.offset() != offset
                         || size != Some(source_slot.size_bytes()) =>
@@ -860,7 +927,7 @@ impl BindingPlan {
                         reason: StackObjectRefusal::MissingSourceIdentity { object },
                     }
                 }
-                Some(source_slot) => {
+                (Some(source_slot), None) => {
                     let size_bytes = source_slot.size_bytes();
                     let Some(width_bits) = size_bytes.checked_mul(8).filter(|width| *width > 0)
                     else {

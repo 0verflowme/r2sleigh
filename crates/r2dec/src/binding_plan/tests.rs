@@ -5,7 +5,8 @@ use r2il::{
 };
 use r2ssa::{
     CanonicalStorageId, CanonicalStorageSpace, MachineUseDisposition, MachineWriteDisposition,
-    SourceAbiParameterSpec, SourceFunctionInterface, SourceFunctionReturn, SsaArtifact,
+    SourceAbiParameterSpec, SourceFunctionInterface, SourceFunctionReturn,
+    SourceStackAllocationContract, SourceStackGrowth, SsaArtifact,
 };
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -22,12 +23,13 @@ fn source_owned(ops: impl IntoIterator<Item = R2ILOp>) -> SourceOwnedFunctionFac
 }
 
 fn source_owned_blocks(blocks: &[R2ILBlock]) -> SourceOwnedFunctionFacts {
-    source_owned_blocks_with_stack_slots(blocks, Vec::new())
+    source_owned_blocks_with_stack_slots(blocks, Vec::new(), None)
 }
 
 fn source_owned_blocks_with_stack_slots(
     blocks: &[R2ILBlock],
     stack_slots: Vec<r2ssa::SourceStackSlotSpec>,
+    stack_allocation: Option<SourceStackAllocationContract>,
 ) -> SourceOwnedFunctionFacts {
     let mut arch = ArchSpec::new("x86-64");
     arch.add_space(AddressSpace::ram(8));
@@ -128,7 +130,7 @@ fn source_owned_blocks_with_stack_slots(
         offset,
         size: 8,
     };
-    let interface = SourceFunctionInterface::new_exact(
+    let mut interface = SourceFunctionInterface::new_exact(
         b"binding-plan-test-interface".to_vec(),
         "sysv64",
         [SourceAbiParameterSpec::new(0, storage(0x38))],
@@ -140,6 +142,11 @@ fn source_owned_blocks_with_stack_slots(
     .and_then(|interface| interface.with_return_address_storage(storage(0x30)))
     .and_then(|interface| interface.with_stack_pointer_storage(storage(0x28)))
     .expect("exact test source interface");
+    if let Some(contract) = stack_allocation {
+        interface = interface
+            .with_stack_allocation_contract(contract)
+            .expect("exact test allocation contract");
+    }
     let source = Arc::new(
         SsaArtifact::for_decompile_with_interface(blocks, Some(&arch), interface)
             .expect("test SSA artifact"),
@@ -972,6 +979,7 @@ fn certified_stack_objects_get_bindings_without_invented_value_membership() {
             -8,
             8,
         )],
+        None,
     );
     let stack_slots = source_owned
         .report()
@@ -1057,5 +1065,75 @@ fn certified_stack_objects_get_bindings_without_invented_value_membership() {
             object: r2ssa::ObjectId(u32::MAX)
         })
     );
+    assert!(plan.validate_seal(&source_owned).is_ok());
+}
+
+#[test]
+fn exact_callee_allocation_binds_anonymous_stack_object_without_source_identity() {
+    let address = Varnode::unique(0x80, 8);
+    let loaded = Varnode::unique(0x88, 8);
+    let mut block = R2ILBlock::new(0x1000, 4);
+    for op in [
+        R2ILOp::IntSub {
+            dst: Varnode::register(0x28, 8),
+            a: Varnode::register(0x28, 8),
+            b: Varnode::constant(8, 8),
+        },
+        R2ILOp::Copy {
+            dst: address.clone(),
+            src: Varnode::register(0x28, 8),
+        },
+        R2ILOp::Store {
+            space: SpaceId::Ram,
+            addr: address.clone(),
+            val: Varnode::constant(7, 8),
+        },
+        R2ILOp::Load {
+            dst: loaded.clone(),
+            space: SpaceId::Ram,
+            addr: address,
+        },
+        R2ILOp::Copy {
+            dst: Varnode::register(0, 8),
+            src: loaded,
+        },
+        R2ILOp::Return {
+            target: Varnode::register(0x30, 8),
+        },
+    ] {
+        block.push(op);
+    }
+    let source_owned = source_owned_blocks_with_stack_slots(
+        &[block],
+        Vec::new(),
+        Some(SourceStackAllocationContract::new(
+            SourceStackGrowth::LowerAddresses,
+        )),
+    );
+    let allocation = source_owned
+        .source()
+        .certificates()
+        .stack_slots
+        .values()
+        .find_map(|slot| slot.callee_allocation.as_ref())
+        .expect("upstream allocation certificate");
+    let object = allocation.object;
+
+    let plan = BindingPlan::build_shadow(&source_owned).expect("allocation-aware plan");
+    let Some(StackObjectDisposition::Bound { binding }) = plan.stack_object_disposition(object)
+    else {
+        panic!("certified anonymous object was not bound");
+    };
+    assert_eq!(
+        plan.binding(binding).map(Binding::declaration_type),
+        Some(&CType::u64())
+    );
+    assert!(matches!(
+        plan.binding(binding)
+            .map(|binding| binding.certificate.sources.as_ref()),
+        Some([BindingCertificateSource::CertifiedEntity(
+            SemanticId::StackSlot(certified)
+        )]) if *certified == object
+    ));
     assert!(plan.validate_seal(&source_owned).is_ok());
 }

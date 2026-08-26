@@ -887,8 +887,12 @@ pub enum CertifiedEntity {
         offset: i64,
         size: Option<u32>,
         /// Full source slot identity, including its local/parameter-home role.
-        /// Absence grants no addressable C-object authority.
+        /// Absence grants no source-variable identity; a separate upstream
+        /// callee-allocation proof is required for an anonymous C object.
         source_slot: Option<r2ssa::SourceStackSlotSpec>,
+        /// Upstream proof for a compiler-created, source-less callee-owned
+        /// stack object. Consumers may use it but must not reconstruct it.
+        callee_allocation: Option<r2ssa::CalleeStackAllocationCertificate>,
     },
     LoopCarrier {
         id: r2ssa::SemanticId,
@@ -3950,6 +3954,7 @@ fn prepared_render_facts(prepared: &r2ssa::SsaArtifact) -> FunctionRenderFacts {
                     offset: cert.offset,
                     size: cert.size,
                     source_slot: cert.source_slot,
+                    callee_allocation: cert.callee_allocation.clone(),
                 },
             )
         })
@@ -4671,6 +4676,7 @@ mod tests {
             offset: -8,
             size: Some(8),
             source_slot: None,
+            callee_allocation: None,
         };
 
         assert_eq!(forward.coalescing_values(), reversed.coalescing_values());
@@ -5022,6 +5028,7 @@ mod tests {
                             offset,
                             size: None,
                             source_slot: None,
+                            callee_allocation: None,
                         },
                     )
                 })
@@ -6832,6 +6839,7 @@ mod tests {
                     offset: -8,
                     size: None,
                     source_slot: None,
+                    callee_allocation: None,
                 },
             )]),
             certified_effects: BTreeMap::from([

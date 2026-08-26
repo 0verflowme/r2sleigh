@@ -16,8 +16,8 @@ use crate::graph::{InstId, InstPayload, SsaGraph, UseSite, ValueId};
 use crate::machine_context::{
     MachineRegisterGeometryState, SOURCE_FUNCTION_INTERFACE_SCHEMA_VERSION,
     SOURCE_TYPE_GRAPH_SCHEMA_VERSION, SourceCallResult, SourceCallSiteIdentity, SourceCarrierKind,
-    SourceFunctionReturn, SourceLogicalValue, SourceMachineContext, SourceStackSlotSpec,
-    SourceTypeKind,
+    SourceFunctionReturn, SourceLogicalValue, SourceMachineContext, SourceStackAllocationContract,
+    SourceStackSlotSpec, SourceTypeKind,
 };
 use crate::obligation::SemanticObligationInventory;
 use crate::op::SSAOp;
@@ -1064,6 +1064,26 @@ pub struct StackSlotCertificate {
     /// unique slot at this base and offset. Absence grants no local or
     /// parameter-home role downstream.
     pub source_slot: Option<SourceStackSlotSpec>,
+    /// Exact proof that a source-less object lies wholly inside storage owned
+    /// by this callee at every access. This is deliberately separate from a
+    /// source slot: compiler-created spills and temporaries are real machine
+    /// objects without becoming source variables.
+    pub callee_allocation: Option<CalleeStackAllocationCertificate>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CalleeStackAllocationCertificate {
+    pub object: ObjectId,
+    pub entry_offset: i64,
+    pub size_bytes: u32,
+    /// Every prepared access to this object, in stable access-id order.
+    pub accesses: Box<[StructuredAccessId]>,
+    /// Exact entry-SP-relative active stack-pointer offsets observed at those
+    /// accesses. Repeated offsets are canonicalized away.
+    pub active_sp_offsets: Box<[i64]>,
+    /// True when the proof uses source-declared implicit storage beyond the
+    /// active SP. Such a certificate is issued only for a call-free function.
+    pub uses_implicit_area: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2841,6 +2861,12 @@ enum ReachingAbiState {
     Value(ValueId),
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ReachingAbiPolicy {
+    allow_distinct_phi_inputs: bool,
+    calls_are_barriers: bool,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn reaching_abi_return_register_in_block(
     function: &SSAFunction,
@@ -3080,7 +3106,10 @@ fn reaching_abi_value_in_block_with_policy(
         boundary_op_index,
         storage,
         &visited,
-        allow_distinct_phi_inputs,
+        ReachingAbiPolicy {
+            allow_distinct_phi_inputs,
+            calls_are_barriers: true,
+        },
     )
 }
 
@@ -3091,7 +3120,7 @@ fn reaching_abi_value_before(
     boundary_op_index: usize,
     storage: CanonicalStorageId,
     visited: &BTreeSet<u64>,
-    allow_distinct_phi_inputs: bool,
+    policy: ReachingAbiPolicy,
 ) -> Option<ReachingAbiState> {
     if visited.contains(&block_addr) {
         return None;
@@ -3100,14 +3129,16 @@ fn reaching_abi_value_before(
     path_visited.insert(block_addr);
     let block = function.get_block(block_addr)?;
     for (op_index, op) in block.ops.get(..boundary_op_index)?.iter().enumerate().rev() {
-        if matches!(
-            op,
-            SSAOp::Call { .. }
-                | SSAOp::CallInd { .. }
-                | SSAOp::CallOther { .. }
-                | SSAOp::CallDefine { .. }
-                | SSAOp::Return { .. }
-        ) {
+        if policy.calls_are_barriers
+            && matches!(
+                op,
+                SSAOp::Call { .. }
+                    | SSAOp::CallInd { .. }
+                    | SSAOp::CallOther { .. }
+                    | SSAOp::CallDefine { .. }
+                    | SSAOp::Return { .. }
+            )
+        {
             return None;
         }
         if op.dst().is_none() {
@@ -3142,7 +3173,7 @@ fn reaching_abi_value_before(
         .collect::<Vec<_>>();
     if let [phi_inst] = phi_insts.as_slice() {
         let phi = graph.inst(*phi_inst)?;
-        if allow_distinct_phi_inputs {
+        if policy.allow_distinct_phi_inputs {
             return phi.output.map(ReachingAbiState::Value);
         }
         let [first, rest @ ..] = phi.inputs.as_slice() else {
@@ -3190,7 +3221,7 @@ fn reaching_abi_value_before(
                 predecessor_block.ops.len(),
                 storage,
                 &path_visited,
-                allow_distinct_phi_inputs,
+                policy,
             )
         })
         .collect::<Option<Vec<_>>>()?;
@@ -3427,6 +3458,215 @@ fn call_result_value_after_call(
     }
 }
 
+fn exact_active_stack_pointer_offset_before(
+    function: &SSAFunction,
+    graph: &SsaGraph,
+    block_addr: u64,
+    op_index: usize,
+    stack_pointer: CanonicalStorageId,
+) -> Option<i64> {
+    let state = reaching_abi_value_before(
+        function,
+        graph,
+        block_addr,
+        op_index,
+        stack_pointer,
+        &BTreeSet::new(),
+        ReachingAbiPolicy {
+            allow_distinct_phi_inputs: true,
+            calls_are_barriers: false,
+        },
+    )?;
+    match state {
+        ReachingAbiState::PreservedEntry => Some(0),
+        ReachingAbiState::Value(value) => {
+            let root = graph.value(value).and_then(|value| {
+                resolve_entry_stack_root(function.decompile_prep_facts(), &value.var)
+            })?;
+            (root.base == StackAddressBase::StackPointer).then_some(root.offset)
+        }
+    }
+}
+
+fn checked_ranges_overlap(
+    left_offset: i64,
+    left_size: u32,
+    right_offset: i64,
+    right_size: u32,
+) -> bool {
+    let Some(left_end) = left_offset.checked_add(i64::from(left_size)) else {
+        return true;
+    };
+    let Some(right_end) = right_offset.checked_add(i64::from(right_size)) else {
+        return true;
+    };
+    left_offset < right_end && right_offset < left_end
+}
+
+fn collect_callee_stack_allocation_certificates(
+    function: &SSAFunction,
+    graph: &SsaGraph,
+    machine_context: Option<&SourceMachineContext>,
+    objects: &ObjectModel,
+    structured: &StructuredDataflowFacts,
+    exact_stack_slots: &BTreeMap<(StackAddressBase, i64), SourceStackSlotSpec>,
+) -> BTreeMap<ObjectId, CalleeStackAllocationCertificate> {
+    let Some(interface) = machine_context.and_then(SourceMachineContext::function_interface) else {
+        return BTreeMap::new();
+    };
+    let (Some(stack_pointer), Some(contract)) = (
+        interface.stack_pointer_storage(),
+        interface.stack_allocation_contract(),
+    ) else {
+        return BTreeMap::new();
+    };
+    let contains_call = function.blocks().any(|block| {
+        block.ops.iter().any(|op| {
+            matches!(
+                op,
+                SSAOp::Call { .. } | SSAOp::CallInd { .. } | SSAOp::CallOther { .. }
+            )
+        })
+    });
+    let explicit_contract = SourceStackAllocationContract::new(contract.growth());
+    let mut candidates = BTreeMap::new();
+
+    for (object, fact) in &objects.objects {
+        let (space, base, offset) = match fact.kind {
+            ObjectKind::StackSlot {
+                space,
+                base,
+                offset,
+            }
+            | ObjectKind::FrameObject {
+                space,
+                base,
+                offset,
+            } => (space, base, offset),
+            ObjectKind::Parameter { .. }
+            | ObjectKind::Global { .. }
+            | ObjectKind::HeapAlloc { .. }
+            | ObjectKind::EscapedUnknown { .. } => continue,
+        };
+        if space != SpaceId::Ram || exact_stack_slots.contains_key(&(base, offset)) {
+            continue;
+        }
+        let Some(entry_root) = objects.entry_stack_roots.get(object).copied() else {
+            continue;
+        };
+        if entry_root.base != StackAddressBase::StackPointer {
+            continue;
+        }
+        let accesses = structured
+            .memory_accesses
+            .values()
+            .filter(|access| access.object == *object)
+            .collect::<Vec<_>>();
+        let Some(first) = accesses.first() else {
+            continue;
+        };
+        let size_bytes = first.width;
+        if size_bytes == 0
+            || accesses.iter().any(|access| {
+                access.width != size_bytes
+                    || !access.provenance_complete
+                    || !ram_memory_access_matches_source(function, graph, objects, access)
+            })
+        {
+            continue;
+        }
+
+        let mut active_sp_offsets = BTreeSet::new();
+        let mut uses_implicit_area = false;
+        let mut complete = true;
+        for access in &accesses {
+            let Some(active_sp_offset) = exact_active_stack_pointer_offset_before(
+                function,
+                graph,
+                access.block_addr,
+                access.op_index,
+                stack_pointer,
+            ) else {
+                complete = false;
+                break;
+            };
+            if !contract.owns_entry_relative_range(active_sp_offset, entry_root.offset, size_bytes)
+            {
+                complete = false;
+                break;
+            }
+            if !explicit_contract.owns_entry_relative_range(
+                active_sp_offset,
+                entry_root.offset,
+                size_bytes,
+            ) {
+                uses_implicit_area = true;
+            }
+            active_sp_offsets.insert(active_sp_offset);
+        }
+        if !complete || uses_implicit_area && contains_call {
+            continue;
+        }
+        candidates.insert(
+            *object,
+            CalleeStackAllocationCertificate {
+                object: *object,
+                entry_offset: entry_root.offset,
+                size_bytes,
+                accesses: accesses
+                    .into_iter()
+                    .map(|access| access.id)
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice(),
+                active_sp_offsets: active_sp_offsets
+                    .into_iter()
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice(),
+                uses_implicit_area,
+            },
+        );
+    }
+
+    candidates.retain(|object, certificate| {
+        !objects.objects.iter().any(|(other_object, other_fact)| {
+            if other_object == object {
+                return false;
+            }
+            let Some(other_root) = objects.entry_stack_roots.get(other_object) else {
+                return false;
+            };
+            let other_size = match other_fact.kind {
+                ObjectKind::StackSlot { base, offset, .. }
+                | ObjectKind::FrameObject { base, offset, .. } => exact_stack_slots
+                    .get(&(base, offset))
+                    .map(SourceStackSlotSpec::size_bytes)
+                    .or_else(|| {
+                        let widths = structured
+                            .memory_accesses
+                            .values()
+                            .filter(|access| access.object == *other_object && access.width > 0)
+                            .map(|access| access.width)
+                            .collect::<BTreeSet<_>>();
+                        (widths.len() == 1).then(|| *widths.first().expect("one width"))
+                    }),
+                ObjectKind::Parameter { .. }
+                | ObjectKind::Global { .. }
+                | ObjectKind::HeapAlloc { .. }
+                | ObjectKind::EscapedUnknown { .. } => None,
+            };
+            other_size.is_some_and(|other_size| {
+                checked_ranges_overlap(
+                    certificate.entry_offset,
+                    certificate.size_bytes,
+                    other_root.offset,
+                    other_size,
+                )
+            })
+        })
+    });
+    candidates
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "this single canonical certificate pass explicitly joins each upstream fact owner without a parallel wrapper"
@@ -3558,6 +3798,14 @@ fn collect_prepared_function_certificates(
         })
         .collect();
 
+    let callee_stack_allocations = collect_callee_stack_allocation_certificates(
+        function,
+        graph,
+        machine_context,
+        objects,
+        structured,
+        &exact_stack_slots,
+    );
     let stack_slots = objects
         .objects
         .iter()
@@ -3580,8 +3828,14 @@ fn collect_prepared_function_certificates(
                     offset,
                     size: exact_stack_slots
                         .get(&(base, offset))
-                        .map(SourceStackSlotSpec::size_bytes),
+                        .map(SourceStackSlotSpec::size_bytes)
+                        .or_else(|| {
+                            callee_stack_allocations
+                                .get(object)
+                                .map(|certificate| certificate.size_bytes)
+                        }),
                     source_slot: exact_stack_slots.get(&(base, offset)).copied(),
+                    callee_allocation: callee_stack_allocations.get(object).cloned(),
                 },
             )),
             ObjectKind::StackSlot { .. }
@@ -7301,9 +7555,9 @@ mod tests {
         AssumptionSet, AssumptionSubject, AssumptionValue, CanonicalStorageId,
         CanonicalStorageSpace, DecompilePrepFacts, InstId, InstPayload, SSAOp, SSAVar,
         SemanticObligationKind, SourceAbiParameterSpec, SourceCarrierKind, SourceCarrierProjection,
-        SourceFunctionInterface, SourceFunctionReturn, SourceLogicalValue, SourceStackSlotSpec,
-        SourceType, SourceTypeGraph, SourceTypeKind, SsaArtifact, StackAddressBase,
-        StackAddressRoot, ValueId,
+        SourceFunctionInterface, SourceFunctionReturn, SourceLogicalValue,
+        SourceStackAllocationContract, SourceStackGrowth, SourceStackSlotSpec, SourceType,
+        SourceTypeGraph, SourceTypeKind, SsaArtifact, StackAddressBase, StackAddressRoot, ValueId,
     };
     use r2il::{
         ArchSpec, R2ILBlock, R2ILOp, RegisterBitSlice, RegisterDef, RegisterProjection,
@@ -7979,9 +8233,12 @@ mod tests {
         .and_then(|interface| interface.with_return_address_storage(storage(16)))
         .and_then(|interface| interface.with_stack_pointer_storage(storage(0)))
         .expect("exact dual-coordinate interface");
-        let artifact =
-            SsaArtifact::for_decompile_with_interface(&[block], Some(&arch), interface.clone())
-                .expect("dual-coordinate artifact");
+        let artifact = SsaArtifact::for_decompile_with_interface(
+            &[block.clone()],
+            Some(&arch),
+            interface.clone(),
+        )
+        .expect("dual-coordinate artifact");
 
         let [save] = artifact
             .memory_defs_for_op_site(0x3600, 1)
@@ -8057,6 +8314,15 @@ mod tests {
         );
         assert_eq!(
             artifact
+                .certificates()
+                .stack_slots
+                .get(&save.location.object)
+                .and_then(|slot| slot.callee_allocation.as_ref()),
+            None,
+            "machine geometry without a source allocation contract grants no object authority"
+        );
+        assert_eq!(
+            artifact
                 .objects()
                 .entry_stack_roots
                 .get(&save.location.object),
@@ -8074,6 +8340,123 @@ mod tests {
                 base: StackAddressBase::StackPointer,
                 offset: -16,
             })
+        );
+
+        let allocated_interface = interface
+            .clone()
+            .with_stack_allocation_contract(SourceStackAllocationContract::new(
+                SourceStackGrowth::LowerAddresses,
+            ))
+            .expect("exact downward allocation contract");
+        let allocated = SsaArtifact::for_decompile_with_interface(
+            &[block.clone()],
+            Some(&arch),
+            allocated_interface,
+        )
+        .expect("allocated dual-coordinate artifact");
+        let [allocated_save] = allocated
+            .memory_defs_for_op_site(0x3600, 1)
+            .expect("allocated saved-frame definition")
+        else {
+            panic!("one allocated saved-frame definition")
+        };
+        let allocation = allocated
+            .certificates()
+            .stack_slots
+            .get(&allocated_save.location.object)
+            .and_then(|slot| slot.callee_allocation.as_ref())
+            .expect("the exact allocation envelope certifies the source-less spill");
+        assert_eq!(allocation.entry_offset, -8);
+        assert_eq!(allocation.size_bytes, 8);
+        assert_eq!(allocation.active_sp_offsets.as_ref(), [-8]);
+        assert!(!allocation.uses_implicit_area);
+
+        let mut incomplete_structured = allocated.facts().structured.clone();
+        for access in incomplete_structured
+            .memory_accesses
+            .values_mut()
+            .filter(|access| access.object == allocated_save.location.object)
+        {
+            access.provenance_complete = false;
+        }
+        let allocated_facts = allocated.facts();
+        let incomplete = super::collect_prepared_function_certificates(
+            &allocated_facts.boundaries,
+            allocated.function(),
+            allocated.graph(),
+            Some(allocated.machine_context()),
+            allocated.objects(),
+            &allocated_facts.memory,
+            &allocated_facts.predicates,
+            &allocated_facts.call_sites,
+            &incomplete_structured,
+        );
+        assert!(
+            incomplete
+                .stack_slots
+                .get(&allocated_save.location.object)
+                .and_then(|slot| slot.callee_allocation.as_ref())
+                .is_none(),
+            "incomplete access provenance must revoke allocation authority"
+        );
+
+        let allocated_local = allocated
+            .memory_defs_for_op_site(0x3600, 4)
+            .and_then(|facts| facts.first())
+            .expect("allocated local definition");
+        let mut overlapping_objects = allocated.objects().clone();
+        overlapping_objects.entry_stack_roots.insert(
+            allocated_local.location.object,
+            StackAddressRoot {
+                base: StackAddressBase::StackPointer,
+                offset: -10,
+            },
+        );
+        let overlapping = super::collect_prepared_function_certificates(
+            &allocated_facts.boundaries,
+            allocated.function(),
+            allocated.graph(),
+            Some(allocated.machine_context()),
+            &overlapping_objects,
+            &allocated_facts.memory,
+            &allocated_facts.predicates,
+            &allocated_facts.call_sites,
+            &allocated_facts.structured,
+        );
+        assert!(
+            overlapping
+                .stack_slots
+                .get(&allocated_save.location.object)
+                .and_then(|slot| slot.callee_allocation.as_ref())
+                .is_none(),
+            "an overlapping exact source object must revoke anonymous allocation authority"
+        );
+
+        let wrong_direction_interface = interface
+            .with_stack_allocation_contract(SourceStackAllocationContract::new(
+                SourceStackGrowth::HigherAddresses,
+            ))
+            .expect("exact upward allocation contract");
+        let wrong_direction = SsaArtifact::for_decompile_with_interface(
+            &[block],
+            Some(&arch),
+            wrong_direction_interface,
+        )
+        .expect("opposite-direction artifact");
+        let [wrong_direction_save] = wrong_direction
+            .memory_defs_for_op_site(0x3600, 1)
+            .expect("opposite-direction saved-frame definition")
+        else {
+            panic!("one opposite-direction saved-frame definition")
+        };
+        assert!(
+            wrong_direction
+                .certificates()
+                .stack_slots
+                .get(&wrong_direction_save.location.object)
+                .and_then(|slot| slot.callee_allocation.as_ref())
+                .is_none(),
+            "opposite source stack growth must not certify the object"
         );
     }
 

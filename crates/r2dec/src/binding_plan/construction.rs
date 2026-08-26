@@ -691,22 +691,13 @@ impl BindingPlan {
                     offset,
                     size,
                     source_slot,
+                    callee_allocation,
                 } = entity
                 else {
                     continue;
                 };
-                let Some(source_slot) = *source_slot else {
-                    stack_objects.insert(
-                        *object,
-                        StackObjectDisposition::Refused {
-                            reason: StackObjectRefusal::MissingSourceIdentity { object: *object },
-                        },
-                    );
-                    continue;
-                };
-                if source_slot.base() != *base
-                    || source_slot.offset() != *offset
-                    || *size != Some(source_slot.size_bytes())
+                if source_slot.is_none() && callee_allocation.is_none()
+                    || source_slot.is_some() && callee_allocation.is_some()
                 {
                     stack_objects.insert(
                         *object,
@@ -737,6 +728,63 @@ impl BindingPlan {
                     );
                     continue;
                 };
+                if let Some(certificate) = callee_allocation {
+                    if source_slot.is_some()
+                        || certificate.object != *object
+                        || certificate.size_bytes != size_bytes
+                        || certificate.accesses.is_empty()
+                        || certificate.active_sp_offsets.is_empty()
+                    {
+                        stack_objects.insert(
+                            *object,
+                            StackObjectDisposition::Refused {
+                                reason: StackObjectRefusal::MissingSourceIdentity {
+                                    object: *object,
+                                },
+                            },
+                        );
+                        continue;
+                    }
+                    let Some(binding) = BindingId::from_dense_index(bindings.len()) else {
+                        return Err(BindingPlanBuildError::TooManyBindings {
+                            count: bindings.len().saturating_add(1),
+                        });
+                    };
+                    bindings.push(Binding {
+                        declaration_type: CType::machine_bits(width_bits),
+                        certificate: BindingCertificate {
+                            sources: Box::new([BindingCertificateSource::CertifiedEntity(*id)]),
+                        },
+                        presentation_name_hint: Some(if certificate.entry_offset < 0 {
+                            format!("stack_m{}", certificate.entry_offset.unsigned_abs())
+                        } else {
+                            format!("stack_p{}", certificate.entry_offset.unsigned_abs())
+                        }),
+                    });
+                    stack_objects.insert(*object, StackObjectDisposition::Bound { binding });
+                    continue;
+                }
+                let Some(source_slot) = *source_slot else {
+                    stack_objects.insert(
+                        *object,
+                        StackObjectDisposition::Refused {
+                            reason: StackObjectRefusal::MissingSourceIdentity { object: *object },
+                        },
+                    );
+                    continue;
+                };
+                if source_slot.base() != *base
+                    || source_slot.offset() != *offset
+                    || size_bytes != source_slot.size_bytes()
+                {
+                    stack_objects.insert(
+                        *object,
+                        StackObjectDisposition::Refused {
+                            reason: StackObjectRefusal::MissingSourceIdentity { object: *object },
+                        },
+                    );
+                    continue;
+                }
                 match source_slot.role() {
                     r2ssa::SourceStackSlotRole::Local => {
                         let Some(binding) = BindingId::from_dense_index(bindings.len()) else {
