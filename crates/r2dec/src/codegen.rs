@@ -216,6 +216,7 @@ impl CodeGenerator {
     fn emit_stmt(&mut self, stmt: &CStmt) {
         let stmt = stmt.unobserved();
         match stmt {
+            CStmt::StructuredRegion { stmt, .. } => self.emit_stmt(stmt),
             CStmt::Empty => {}
             CStmt::Expr(expr) => {
                 self.emit_indent();
@@ -982,6 +983,9 @@ fn count_vars_in_stmt_into(
 ) {
     let stmt = stmt.unobserved();
     match stmt {
+        CStmt::StructuredRegion { stmt, .. } => {
+            count_vars_in_stmt_into(stmt, local_types, counts);
+        }
         CStmt::Expr(expr) | CStmt::Return(Some(expr)) => {
             count_vars_in_expr_into(expr, local_types, counts);
         }
@@ -1094,6 +1098,10 @@ fn prepare_stmt_sequence_for_emission(stmts: &[CStmt]) -> Vec<CStmt> {
 
 fn prepare_stmt_for_emission(stmt: &CStmt) -> CStmt {
     match stmt {
+        CStmt::StructuredRegion { marker, stmt } => CStmt::structured_region(
+            *marker,
+            prepare_stmt_for_emission(stmt.as_ref()),
+        ),
         CStmt::Observed { id, stmt } => {
             CStmt::observed(*id, prepare_stmt_for_emission(stmt.as_ref()))
         }

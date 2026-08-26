@@ -4612,7 +4612,12 @@ impl Decompiler {
         structuring_work.poll()?;
         let use_conservative_locals = routed_body.use_conservative_locals;
         let is_linear_fallback = routed_body.is_linear_fallback;
-        let mut body_stmt = routed_body.body_stmt;
+        if let Some(structured_body) = routed_body.structured_body() {
+            let mut occurrences = 0usize;
+            structured_body.visit_occurrences(|_| occurrences += 1);
+            debug_assert_eq!(occurrences, structured_body.regions().nodes().len());
+        }
+        let mut body_stmt = routed_body.into_body_stmt();
 
         if let Some(comment) = self.semantic_vm_summary_comment() {
             body_stmt = Self::prepend_comment(body_stmt, comment);
@@ -5052,6 +5057,7 @@ pub(crate) fn declarations_in_stmts(stmts: &[CStmt]) -> Vec<crate::symbol::Symbo
 pub(crate) fn collect_stmt_var_names(stmts: &[CStmt]) -> HashSet<crate::symbol::SymbolId> {
     fn visit_stmt(stmt: &CStmt, out: &mut HashSet<crate::symbol::SymbolId>) {
         match stmt {
+            CStmt::StructuredRegion { stmt, .. } => visit_stmt(stmt, out),
             CStmt::Observed { stmt, .. } => visit_stmt(stmt, out),
             CStmt::Empty
             | CStmt::Break
@@ -5856,6 +5862,7 @@ fn fold_constant_arithmetic_in_stmt(
 ) {
     let mut fold_expr = |expr: &mut CExpr| fold_constant_arithmetic_in_expr(expr, strings);
     match stmt {
+        CStmt::StructuredRegion { stmt, .. } => fold_constant_arithmetic_in_stmt(stmt, strings),
         CStmt::Observed { stmt, .. } => fold_constant_arithmetic_in_stmt(stmt, strings),
         CStmt::Empty
         | CStmt::Break
@@ -6037,6 +6044,9 @@ fn count_var_reads_in_stmt(symbols: &std::cell::RefCell<crate::symbol::SymbolTab
         });
     };
     match stmt {
+        CStmt::StructuredRegion { stmt, .. } => {
+            count_var_reads_in_stmt(symbols, stmt, name, reads)
+        }
         CStmt::Observed { stmt, .. } => count_var_reads_in_stmt(symbols, stmt, name, reads),
         CStmt::Empty
         | CStmt::Break
@@ -6115,6 +6125,7 @@ fn count_var_reads_in_stmt(symbols: &std::cell::RefCell<crate::symbol::SymbolTab
 /// Put `value` wherever `name` is read in this statement.
 fn substitute_var_in_stmt(stmt: &mut CStmt, name: crate::symbol::SymbolId, value: &CExpr) {
     match stmt {
+        CStmt::StructuredRegion { stmt, .. } => substitute_var_in_stmt(stmt, name, value),
         CStmt::Observed { stmt, .. } => substitute_var_in_stmt(stmt, name, value),
         CStmt::Empty
         | CStmt::Break
@@ -6328,6 +6339,9 @@ fn normalize_redundant_return_carrier_casts(func: &mut CFunction) {
     let symbols = &func.symbols;
     fn visit(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, stmt: &mut CStmt, ret_type: &CType, declared_types: &HashMap<String, CType>) {
         match stmt {
+            CStmt::StructuredRegion { stmt, .. } => {
+                visit(symbols, stmt, ret_type, declared_types)
+            }
             CStmt::Observed { stmt, .. } => visit(symbols, stmt, ret_type, declared_types),
             CStmt::Return(Some(expr)) => {
                 let mut target = expr;
@@ -6619,6 +6633,9 @@ fn normalize_declared_assignment_literals(func: &mut CFunction) {
 
     fn visit_stmt(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, stmt: &mut CStmt, declared_types: &HashMap<String, CType>) {
         match stmt {
+            CStmt::StructuredRegion { stmt, .. } => {
+                visit_stmt(symbols, stmt, declared_types)
+            }
             CStmt::Observed { stmt, .. } => visit_stmt(symbols, stmt, declared_types),
             CStmt::Expr(expr) => visit_expr(symbols, expr, declared_types),
             CStmt::Decl { ty, init, .. } => {
@@ -6755,6 +6772,7 @@ fn collect_function_local_reads(symbols: &std::cell::RefCell<crate::symbol::Symb
 
 fn collect_stmt_local_reads(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, stmt: &CStmt, reads: &mut HashSet<String>) {
     match stmt {
+        CStmt::StructuredRegion { stmt, .. } => collect_stmt_local_reads(symbols, stmt, reads),
         CStmt::Observed { stmt, .. } => collect_stmt_local_reads(symbols, stmt, reads),
         CStmt::Empty
         | CStmt::Break
@@ -6915,6 +6933,12 @@ fn prune_unused_pure_local_stmts(symbols: &std::cell::RefCell<crate::symbol::Sym
 
 fn prune_unused_pure_local_stmt(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, stmt: &mut CStmt, dead_locals: &HashSet<String>) {
     match stmt {
+        CStmt::StructuredRegion { stmt: inner, .. } => {
+            prune_unused_pure_local_stmt(symbols, inner, dead_locals);
+            if matches!(inner.as_ref(), CStmt::Empty) {
+                *stmt = CStmt::Empty;
+            }
+        }
         CStmt::Observed { stmt: inner, .. } => {
             let drops_dead_declaration = matches!(inner.unobserved(), CStmt::Decl { name, init: Some(init), .. }
                 if dead_locals.contains(

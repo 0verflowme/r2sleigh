@@ -15,6 +15,10 @@ use crate::control::{DecompileExecutionStop, DecompileWorkControl};
 use crate::fold::FoldingContext;
 use crate::fold::context::{EffectRenderProof, EffectRenderProofKind};
 use crate::region::{Region, RegionAnalyzer, RegionTransferKind};
+use crate::structured_region::{
+    SealedStructuredBody, StructuredRegionBuildError, StructuredRegionKind,
+    StructuredRegionMarker, SyntheticRegionKind, kind_of, seal_structured_body,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ControlRenderProofKind {
@@ -151,6 +155,8 @@ pub(crate) struct ControlFlowStructurer<'a, 'o> {
     /// blocks may be duplicated by structuring, so coverage is checked only
     /// after all occurrences are known.
     rendered_block_domains: BTreeMap<u64, Vec<RenderedBlockOccurrence>>,
+    /// True only while producing the artifact-bearing structured body.
+    retain_region_markers: bool,
     /// Basic blocks owned by the current structured region tree.
     structured_region_blocks: BTreeSet<u64>,
     /// Blocks the proof shows nothing can reach, computed once for this function.
@@ -430,6 +436,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             shared_joins: BTreeSet::new(),
             active_domains: vec![RenderedBlockDomain::default()],
             rendered_block_domains: BTreeMap::new(),
+            retain_region_markers: false,
             structured_region_blocks: BTreeSet::new(),
             proven_dead_blocks: std::cell::OnceCell::new(),
             transfer_target_domains: BTreeMap::new(),
@@ -465,6 +472,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             shared_joins: BTreeSet::new(),
             active_domains: vec![RenderedBlockDomain::default()],
             rendered_block_domains: BTreeMap::new(),
+            retain_region_markers: false,
             structured_region_blocks: BTreeSet::new(),
             proven_dead_blocks: std::cell::OnceCell::new(),
             transfer_target_domains: BTreeMap::new(),
@@ -674,18 +682,35 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
 
     /// Structure the function's control flow.
     pub(crate) fn structure(&mut self) -> CStmt {
-        let symbols = &self.fold_ctx.symbols;
+        match self.structure_with_regions() {
+            Ok(body) => body.into_stmt(),
+            Err(error) => CStmt::comment(format!(
+                "r2dec residual: structured-region sealing failed: {error:?}"
+            )),
+        }
+    }
 
-        let stmt = self.structure_preserving_render_proof_identity();
+    /// Structure the function and retain exact lexical occurrence identity.
+    pub(crate) fn structure_with_regions(
+        &mut self,
+    ) -> Result<SealedStructuredBody, StructuredRegionBuildError> {
+        let symbols = &self.fold_ctx.symbols;
+        let stmt = self.structure_preserving_render_proof_identity_marked();
         // A refusal that does not say what it refused reads as a function with no body
         if let Some(reason) = self.safety_reason.clone() {
-            return CStmt::comment(format!(
-                "r2dec residual: {}",
-                crate::sanitize_comment_text(&reason)
+            return seal_structured_body(CStmt::structured_region(
+                StructuredRegionMarker::unsealed(
+                    self.func.entry,
+                    StructuredRegionKind::FunctionBody,
+                ),
+                CStmt::comment(format!(
+                    "r2dec residual: {}",
+                    crate::sanitize_comment_text(&reason)
+                )),
             ));
         }
         // Post-process: flatten, simplify loops, remove redundant control flow.
-        Self::cleanup(symbols, stmt)
+        seal_structured_body(Self::cleanup(symbols, stmt))
     }
 
     /// Structure control flow without post-proof AST rewrites.
@@ -695,7 +720,19 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
     /// invert, merge, synthesize, or delete control nodes, so certified callers
     /// must validate the unrewritten AST or residualize.
     pub(crate) fn structure_preserving_render_proof_identity(&mut self) -> CStmt {
-        self.structure_preserving_render_proof_identity_impl()
+        match seal_structured_body(self.structure_preserving_render_proof_identity_marked()) {
+            Ok(body) => body.into_stmt(),
+            Err(error) => CStmt::comment(format!(
+                "r2dec residual: structured-region sealing failed: {error:?}"
+            )),
+        }
+    }
+
+    fn structure_preserving_render_proof_identity_marked(&mut self) -> CStmt {
+        self.retain_region_markers = true;
+        let stmt = self.structure_preserving_render_proof_identity_impl();
+        self.retain_region_markers = false;
+        stmt
     }
 
     fn structure_preserving_render_proof_identity_impl(&mut self) -> CStmt {
@@ -753,7 +790,17 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         if self.safety_reason.is_some() {
             return CStmt::Empty;
         }
-        stmt
+        if self.retain_region_markers {
+            CStmt::structured_region(
+                StructuredRegionMarker::unsealed(
+                    self.func.entry,
+                    StructuredRegionKind::FunctionBody,
+                ),
+                stmt,
+            )
+        } else {
+            stmt
+        }
     }
 
     /// Structure a region into C statements.
@@ -767,7 +814,14 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         }
         let stmt = self.structure_region_in_active_domains(region);
         self.active_domains = inherited_domains;
-        stmt
+        if !self.retain_region_markers || matches!(stmt.unobserved(), CStmt::Empty) {
+            stmt
+        } else {
+            CStmt::structured_region(
+                StructuredRegionMarker::unsealed(region.entry(), kind_of(region)),
+                stmt,
+            )
+        }
     }
 
     fn certify_transfer_domain_join(
@@ -1493,15 +1547,36 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             for addr in &chain {
                 self.structured_region_blocks.insert(*addr);
             }
+            let mut exit_stmts = Vec::new();
             for addr in &chain {
                 let block_stmt = self.structure_block(*addr);
                 if !matches!(block_stmt, CStmt::Empty) {
-                    stmts.push(block_stmt);
+                    exit_stmts.push(block_stmt);
                 }
             }
             if let Some(rejoin) = rejoin {
                 let label = self.ensure_label(rejoin);
-                stmts.push(CStmt::Goto(label));
+                exit_stmts.push(CStmt::Goto(label));
+            }
+            if !exit_stmts.is_empty() {
+                let exit_stmt = if exit_stmts.len() == 1 {
+                    exit_stmts.remove(0)
+                } else {
+                    CStmt::Block(exit_stmts)
+                };
+                stmts.push(if self.retain_region_markers {
+                    CStmt::structured_region(
+                        StructuredRegionMarker::unsealed(
+                            target,
+                            StructuredRegionKind::Synthetic(
+                                SyntheticRegionKind::DeferredSharedExit,
+                            ),
+                        ),
+                        exit_stmt,
+                    )
+                } else {
+                    exit_stmt
+                });
             }
         }
         match stmts.len() {
@@ -1629,7 +1704,18 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             if let Some(block) = self.func.get_block(addr) {
                 block_stmts.extend(self.folded_block_stmts(block, addr));
             }
-            stmts.push(CStmt::Block(block_stmts));
+            let join_stmt = CStmt::Block(block_stmts);
+            stmts.push(if self.retain_region_markers {
+                CStmt::structured_region(
+                    StructuredRegionMarker::unsealed(
+                        addr,
+                        StructuredRegionKind::Synthetic(SyntheticRegionKind::SharedJoin),
+                    ),
+                    join_stmt,
+                )
+            } else {
+                join_stmt
+            });
         }
         match stmts.len() {
             0 => CStmt::Empty,
@@ -2436,6 +2522,14 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
     /// Recursively clean up children first, then apply local simplifications.
     fn cleanup_recurse(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, stmt: CStmt) -> CStmt {
         match stmt {
+            CStmt::StructuredRegion { marker, stmt } => {
+                let cleaned = Self::cleanup_recurse(symbols, *stmt);
+                if matches!(cleaned.unobserved(), CStmt::Empty) {
+                    CStmt::Empty
+                } else {
+                    CStmt::structured_region(marker, cleaned)
+                }
+            }
             CStmt::Observed { id, stmt } => {
                 CStmt::observed(id, Self::cleanup_recurse(symbols, *stmt))
             }
@@ -3675,10 +3769,10 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                     cond,
                     then_body,
                     else_body: None,
-                } = stmts[i].unobserved()
+                } = Self::semantic_stmt(&stmts[i])
                 && let Some(terminator) = Self::single_terminator_stmt(&stmts[i + 1])
                 && Self::single_terminator_stmt(then_body.as_ref()).is_none()
-                && !matches!(then_body.unobserved(), CStmt::Empty)
+                && !matches!(Self::semantic_stmt(then_body), CStmt::Empty)
             {
                 let guard = CStmt::If {
                     cond: Self::negate_condition(cond.clone()),
@@ -4282,7 +4376,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
 
     /// Whether anything can jump into this statement.
     fn stmt_carries_label(stmt: &CStmt) -> bool {
-        match stmt.unobserved() {
+        match Self::semantic_stmt(stmt) {
             CStmt::Label(_) => true,
             CStmt::Block(stmts) => stmts.iter().any(Self::stmt_carries_label),
             CStmt::If {
@@ -4315,7 +4409,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             return true;
         }
 
-        match stmt.unobserved() {
+        match Self::semantic_stmt(stmt) {
             CStmt::Block(stmts) => stmts
                 .iter()
                 .rev()
@@ -4824,13 +4918,24 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
 
     fn stmt_is_unconditional_terminator(stmt: &CStmt) -> bool {
         matches!(
-            stmt.unobserved(),
+            Self::semantic_stmt(stmt),
             CStmt::Break | CStmt::Continue | CStmt::Return(_) | CStmt::Goto(_)
         )
     }
 
     fn stmt_is_unconditional_break(stmt: &CStmt) -> bool {
-        matches!(stmt.unobserved(), CStmt::Break)
+        matches!(Self::semantic_stmt(stmt), CStmt::Break)
+    }
+
+    /// Borrow the semantic statement through all run-local metadata wrappers.
+    fn semantic_stmt(mut stmt: &CStmt) -> &CStmt {
+        loop {
+            match stmt {
+                CStmt::Observed { stmt: inner, .. }
+                | CStmt::StructuredRegion { stmt: inner, .. } => stmt = inner,
+                semantic => return semantic,
+            }
+        }
     }
 
     fn stmt_into_vec(stmt: CStmt) -> Vec<CStmt> {
@@ -4937,6 +5042,9 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
 
     fn collect_stmt_vars_into(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, stmt: &CStmt, out: &mut HashSet<String>) {
         match stmt {
+            CStmt::StructuredRegion { stmt, .. } => {
+                Self::collect_stmt_vars_into(symbols, stmt, out)
+            }
             CStmt::Observed { stmt, .. } => Self::collect_stmt_vars_into(symbols, stmt, out),
             CStmt::Expr(expr) | CStmt::Return(Some(expr)) => {
                 Self::collect_expr_vars_into(symbols, expr, out)
@@ -5395,6 +5503,7 @@ mod tests {
     };
     use crate::fold::FoldingContext;
     use crate::region::Region;
+    use crate::structured_region::StructuredRegionKind;
     use r2il::{ArchSpec, R2ILBlock, R2ILOp, RegisterDef, Varnode};
     use r2ssa::{BlockTerminator, PhiNode, PredicateId, SSAFunction, SSAOp, SSAVar, SsaArtifact};
     use std::collections::{BTreeSet, HashMap};
@@ -5531,6 +5640,78 @@ mod tests {
         arch.add_register(RegisterDef::new("RSP", 0x28, 8));
         arch.add_register(RegisterDef::new("RIP", 0x30, 8));
         arch
+    }
+
+    #[test]
+    fn production_structurer_seals_every_emitted_region_anchor() {
+        let mut block = R2ILBlock::new(0x1000, 4);
+        block.push(R2ILOp::Copy {
+            dst: Varnode::register(0x00, 8),
+            src: Varnode::constant(7, 8),
+        });
+        block.push(R2ILOp::Return {
+            target: Varnode::constant(0, 8),
+        });
+        let func = SSAFunction::from_blocks_with_arch(&[block], Some(&test_arch()))
+            .expect("single-block SSA function");
+        let ctx = FoldingContext::new(64);
+        let mut structurer = ControlFlowStructurer::new(&func, &ctx);
+
+        let body = structurer
+            .structure_with_regions()
+            .expect("production structured body");
+        let mut visited = Vec::new();
+        body.visit_occurrences(|occurrence| {
+            visited.push((
+                occurrence.id(),
+                occurrence.anchor(),
+                occurrence.node().entry(),
+                occurrence.node().kind(),
+            ));
+        });
+
+        assert_eq!(visited.len(), body.regions().nodes().len());
+        assert_eq!(visited[0].2, 0x1000);
+        assert_eq!(visited[0].3, StructuredRegionKind::FunctionBody);
+        for (id, anchor, entry, kind) in visited {
+            let (resolved_id, node) = body
+                .regions()
+                .node_for_anchor(body.regions().authority(), anchor)
+                .expect("emitted anchor resolves in the exact sealed artifact");
+            assert_eq!(resolved_id, id);
+            assert_eq!(node.entry(), entry);
+            assert_eq!(node.kind(), kind);
+        }
+    }
+
+    #[test]
+    fn region_markers_are_transparent_to_structurer_cleanup() {
+        for func in [
+            function_with_switch_block_and_unrelated_sub(),
+            function_with_terminating_if_and_shared_merge(),
+            function_with_guarded_latch_loop_and_shared_exit(),
+        ] {
+            let plain_ctx = FoldingContext::new(64);
+            let mut plain_structurer = ControlFlowStructurer::new(&func, &plain_ctx);
+            let plain = plain_structurer.structure_preserving_render_proof_identity_impl();
+            assert!(plain_structurer.safety_reason().is_none());
+            let plain = ControlFlowStructurer::cleanup(&plain_ctx.symbols, plain);
+
+            let mut marked_ctx = FoldingContext::new(64);
+            marked_ctx.symbols = std::rc::Rc::clone(&plain_ctx.symbols);
+            let mut marked_structurer = ControlFlowStructurer::new(&func, &marked_ctx);
+            let marked = marked_structurer
+                .structure_with_regions()
+                .expect("marked production structure")
+                .into_stmt();
+            assert!(marked_structurer.safety_reason().is_none());
+
+            assert_eq!(
+                marked, plain,
+                "region metadata must not alter the cleaned semantic AST at 0x{:x}",
+                func.entry
+            );
+        }
     }
 
     fn function_with_switch_block_and_unrelated_sub() -> SSAFunction {

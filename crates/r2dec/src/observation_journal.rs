@@ -1765,6 +1765,7 @@ fn visit_stmt_declarations(stmt: &CStmt, visit: &mut impl FnMut(SymbolId)) {
         CStmt::While { body, .. } | CStmt::DoWhile { body, .. } => {
             visit_stmt_declarations(body, visit);
         }
+        CStmt::StructuredRegion { stmt, .. } => visit_stmt_declarations(stmt, visit),
         CStmt::For { init, body, .. } => {
             if let Some(init) = init {
                 visit_stmt_declarations(init, visit);

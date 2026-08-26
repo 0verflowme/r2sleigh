@@ -891,6 +891,17 @@ impl UnaryOp {
 /// A C statement.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum CStmt {
+    /// Internal lexical-region marker attached to one exact statement occurrence.
+    ///
+    /// The marker is transparent to C semantics.  It is minted and sealed by
+    /// the control-flow structurer so later lowering phases can recover exact
+    /// lexical ancestry without rebuilding it from block addresses.
+    #[doc(hidden)]
+    #[serde(skip)]
+    StructuredRegion {
+        marker: crate::structured_region::StructuredRegionMarker,
+        stmt: Box<CStmt>,
+    },
     /// Internal marker attached to one exact rendered statement occurrence.
     ///
     /// This is transparent to C rendering and must be stripped before a
@@ -997,6 +1008,17 @@ pub struct SwitchCase {
 }
 
 impl CStmt {
+    /// Attach an unsealed lexical-region marker to this statement occurrence.
+    pub(crate) fn structured_region(
+        marker: crate::structured_region::StructuredRegionMarker,
+        stmt: CStmt,
+    ) -> Self {
+        Self::StructuredRegion {
+            marker,
+            stmt: Box::new(stmt),
+        }
+    }
+
     /// Attach an internal observation marker to this exact occurrence.
     pub(crate) fn observed(id: RenderObservationId, stmt: CStmt) -> Self {
         Self::Observed {
@@ -1448,6 +1470,7 @@ pub(crate) fn remap_render_observation_ids<E>(
             return remap_stmt(stmt, remap);
         }
         match stmt {
+            CStmt::StructuredRegion { stmt, .. } => remap_stmt(stmt, remap)?,
             CStmt::Observed { .. } => unreachable!("handled before semantic statement"),
             CStmt::Expr(expr) => remap_expr(expr, remap)?,
             CStmt::Decl { init, .. } | CStmt::Return(init) => {
@@ -1734,6 +1757,7 @@ fn visit_stmt_observations<E>(
         return visit_stmt_observations(stmt, visit);
     }
     match stmt {
+        CStmt::StructuredRegion { stmt, .. } => visit_stmt_observations(stmt, visit)?,
         CStmt::Observed { .. } => unreachable!("handled before semantic statement"),
         CStmt::Expr(expr) => visit_expr_observations(expr, visit)?,
         CStmt::Decl { init, .. } | CStmt::Return(init) => {
@@ -1819,6 +1843,7 @@ fn inspect_stmt_observations<E>(
         return inspect_stmt_observations(stmt, inspect);
     }
     match stmt {
+        CStmt::StructuredRegion { stmt, .. } => inspect_stmt_observations(stmt, inspect)?,
         CStmt::Observed { .. } => unreachable!("handled before semantic statement"),
         CStmt::Expr(expr) => inspect_expr_observations(expr, inspect)?,
         CStmt::Decl { init, .. } | CStmt::Return(init) => {
@@ -1929,6 +1954,7 @@ fn strip_stmt_observations(stmt: &mut CStmt) {
         *stmt = std::mem::replace(inner.as_mut(), CStmt::Empty);
     }
     match stmt {
+        CStmt::StructuredRegion { stmt, .. } => strip_stmt_observations(stmt),
         CStmt::Observed { .. } => unreachable!("all leading observations were stripped"),
         CStmt::Expr(expr) => strip_expr_observations(expr),
         CStmt::Decl { init, .. } | CStmt::Return(init) => {

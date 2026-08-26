@@ -462,6 +462,7 @@ fn side_effect_free_assignment_name(stmt: &CStmt) -> Option<crate::symbol::Symbo
 
 fn stmt_contains_memory_like_access(stmt: &CStmt) -> bool {
     match stmt {
+        CStmt::StructuredRegion { stmt, .. } => stmt_contains_memory_like_access(stmt),
         CStmt::Observed { stmt, .. } => stmt_contains_memory_like_access(stmt),
         CStmt::Expr(expr) | CStmt::Return(Some(expr)) => expr_contains_memory_like_access(expr),
         CStmt::Decl { init, .. } => init.as_ref().is_some_and(expr_contains_memory_like_access),

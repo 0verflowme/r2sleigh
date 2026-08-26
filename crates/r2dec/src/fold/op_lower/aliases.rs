@@ -389,6 +389,9 @@ impl<'a> FoldingContext<'a> {
     }
 
     fn stmt_clears_aliases(stmt: &CStmt) -> bool {
+        if let CStmt::StructuredRegion { stmt, .. } = stmt {
+            return Self::stmt_clears_aliases(stmt);
+        }
         matches!(
             stmt.unobserved(),
             CStmt::Label(_)
@@ -408,6 +411,7 @@ impl<'a> FoldingContext<'a> {
     fn stmt_contains_call(stmt: &CStmt) -> bool {
         let mut contains_call = false;
         match stmt {
+            CStmt::StructuredRegion { stmt, .. } => return Self::stmt_contains_call(stmt),
             CStmt::Observed { stmt, .. } => return Self::stmt_contains_call(stmt),
             CStmt::Expr(expr)
             | CStmt::Return(Some(expr))
@@ -540,6 +544,7 @@ impl<'a> FoldingContext<'a> {
         let mut def = None;
 
         match stmt {
+            CStmt::StructuredRegion { stmt, .. } => return self.stmt_reads_and_def(stmt),
             CStmt::Observed { stmt, .. } => return self.stmt_reads_and_def(stmt),
             CStmt::Expr(expr) => {
                 if let CExpr::Binary {
@@ -914,6 +919,12 @@ impl<'a> FoldingContext<'a> {
                 default: default
                     .map(|stmts| self.prune_dead_temp_assignments_in_block(stmts, live_out)),
             },
+            CStmt::StructuredRegion { marker, stmt } => CStmt::StructuredRegion {
+                marker,
+                stmt: Box::new(
+                    self.prune_dead_temp_assignments_in_stmt_live_out(*stmt, live_out),
+                ),
+            },
             other => other,
         }
     }
@@ -932,6 +943,7 @@ impl<'a> FoldingContext<'a> {
 
     fn collect_call_sources_in_stmt(&self, stmt: &CStmt, out: &mut BTreeSet<(u64, usize)>) {
         match stmt {
+            CStmt::StructuredRegion { stmt, .. } => self.collect_call_sources_in_stmt(stmt, out),
             CStmt::Observed { stmt, .. } => self.collect_call_sources_in_stmt(stmt, out),
             CStmt::Expr(expr)
             | CStmt::Return(Some(expr))

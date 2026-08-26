@@ -20,6 +20,7 @@
 
 use std::sync::Arc;
 
+use crate::ast::{CStmt, SwitchCase};
 use crate::region::Region;
 
 /// Dense identity of one lexical region occurrence in a sealed artifact.
@@ -91,6 +92,41 @@ pub(crate) enum StructuredRegionKind {
     Switch,
     Irreducible,
     Synthetic(SyntheticRegionKind),
+}
+
+/// Construction metadata carried by an exact statement occurrence.
+///
+/// `anchor` is empty while the structurer is still rewriting the statement
+/// tree.  Sealing walks the final tree once in lexical preorder, assigns the
+/// dense anchor, and builds the immutable artifact from that same walk.  The
+/// marker and artifact therefore cannot disagree about occurrence identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StructuredRegionMarker {
+    entry: u64,
+    kind: StructuredRegionKind,
+    anchor: Option<RegionEmissionAnchor>,
+}
+
+impl StructuredRegionMarker {
+    pub(crate) const fn unsealed(entry: u64, kind: StructuredRegionKind) -> Self {
+        Self {
+            entry,
+            kind,
+            anchor: None,
+        }
+    }
+
+    pub(crate) const fn entry(self) -> u64 {
+        self.entry
+    }
+
+    pub(crate) const fn kind(self) -> StructuredRegionKind {
+        self.kind
+    }
+
+    pub(crate) const fn emission_anchor(self) -> Option<RegionEmissionAnchor> {
+        self.anchor
+    }
 }
 
 /// Why a statement occurrence exists outside the analyzed [`Region`] tree.
@@ -201,6 +237,9 @@ impl SealedStructuredRegionArtifact {
 pub(crate) enum StructuredRegionBuildError {
     TooManyRegions,
     RegionDepthOverflow,
+    MissingFunctionBodyMarker,
+    NestedFunctionBodyMarker,
+    MarkerAlreadySealed,
 }
 
 #[derive(Debug)]
@@ -346,7 +385,408 @@ impl StructuredRegionDraft {
     }
 }
 
-fn kind_of(region: &Region) -> StructuredRegionKind {
+/// A structured statement tree and the region artifact sealed from the same
+/// exact occurrences.
+pub(crate) struct SealedStructuredBody {
+    stmt: CStmt,
+    regions: SealedStructuredRegionArtifact,
+}
+
+impl SealedStructuredBody {
+    pub(crate) fn stmt(&self) -> &CStmt {
+        &self.stmt
+    }
+
+    pub(crate) fn regions(&self) -> &SealedStructuredRegionArtifact {
+        &self.regions
+    }
+
+    pub(crate) fn into_stmt(mut self) -> CStmt {
+        strip_region_markers(&mut self.stmt);
+        self.stmt
+    }
+
+    /// Visit every exact emitted region occurrence in lexical preorder.
+    ///
+    /// Consumers receive both the canonical artifact node and the semantic
+    /// statement it owns.  They never need to match the internal AST wrapper.
+    pub(crate) fn visit_occurrences(
+        &self,
+        mut visit: impl FnMut(StructuredRegionOccurrence<'_>),
+    ) {
+        visit_occurrences(
+            &self.stmt,
+            &self.regions,
+            self.regions.authority(),
+            &mut visit,
+        );
+    }
+
+    /// Visit semantic statement occurrences with their exact innermost region.
+    ///
+    /// Region wrappers are consumed here, not exposed to callers. Observation
+    /// chains remain intact on `stmt`, and each semantic statement position is
+    /// reported once. This is the bridge final occurrence collectors use; they
+    /// do not need an ad hoc AST matcher for lexical markers.
+    pub(crate) fn visit_scoped_statements(
+        &self,
+        mut visit: impl FnMut(ScopedStructuredStatement<'_>),
+    ) {
+        visit_scoped_stmt(
+            &self.stmt,
+            None,
+            &self.regions,
+            self.regions.authority(),
+            &mut visit,
+        );
+    }
+}
+
+/// Borrowed view of one exact emitted lexical occurrence.
+pub(crate) struct StructuredRegionOccurrence<'a> {
+    id: RegionId,
+    anchor: RegionEmissionAnchor,
+    node: &'a StructuredRegionNode,
+    stmt: &'a CStmt,
+}
+
+impl<'a> StructuredRegionOccurrence<'a> {
+    pub(crate) const fn id(&self) -> RegionId {
+        self.id
+    }
+
+    pub(crate) const fn anchor(&self) -> RegionEmissionAnchor {
+        self.anchor
+    }
+
+    pub(crate) const fn node(&self) -> &'a StructuredRegionNode {
+        self.node
+    }
+
+    pub(crate) const fn stmt(&self) -> &'a CStmt {
+        self.stmt
+    }
+}
+
+/// One semantic statement occurrence paired with its exact lexical region.
+pub(crate) struct ScopedStructuredStatement<'a> {
+    region: RegionId,
+    anchor: RegionEmissionAnchor,
+    node: &'a StructuredRegionNode,
+    stmt: &'a CStmt,
+}
+
+impl<'a> ScopedStructuredStatement<'a> {
+    pub(crate) const fn region(&self) -> RegionId {
+        self.region
+    }
+
+    pub(crate) const fn anchor(&self) -> RegionEmissionAnchor {
+        self.anchor
+    }
+
+    pub(crate) const fn node(&self) -> &'a StructuredRegionNode {
+        self.node
+    }
+
+    pub(crate) const fn stmt(&self) -> &'a CStmt {
+        self.stmt
+    }
+}
+
+/// Seal exact region markers after all structurer-local shape rewrites.
+pub(crate) fn seal_structured_body(
+    mut stmt: CStmt,
+) -> Result<SealedStructuredBody, StructuredRegionBuildError> {
+    let CStmt::StructuredRegion {
+        marker: root_marker,
+        stmt: root_stmt,
+    } = &mut stmt
+    else {
+        return Err(StructuredRegionBuildError::MissingFunctionBodyMarker);
+    };
+    if root_marker.kind != StructuredRegionKind::FunctionBody {
+        return Err(StructuredRegionBuildError::MissingFunctionBodyMarker);
+    }
+    if root_marker.anchor.is_some() {
+        return Err(StructuredRegionBuildError::MarkerAlreadySealed);
+    }
+
+    let mut draft = StructuredRegionDraft {
+        authority: StructuredRegionArtifactAuthority::new(),
+        root: RegionId(0),
+        nodes: Vec::new(),
+    };
+    let root = draft.push_node(
+        None,
+        0,
+        root_marker.entry,
+        StructuredRegionKind::FunctionBody,
+    )?;
+    debug_assert_eq!(root, draft.root);
+    root_marker.anchor = draft.emission_anchor(root);
+    seal_stmt_children(root_stmt, root, &mut draft)?;
+    let regions = draft.seal();
+    Ok(SealedStructuredBody { stmt, regions })
+}
+
+fn seal_stmt_children(
+    stmt: &mut CStmt,
+    parent: RegionId,
+    draft: &mut StructuredRegionDraft,
+) -> Result<(), StructuredRegionBuildError> {
+    match stmt {
+        CStmt::StructuredRegion { marker, stmt } => {
+            if marker.anchor.is_some() {
+                return Err(StructuredRegionBuildError::MarkerAlreadySealed);
+            }
+            if marker.kind == StructuredRegionKind::FunctionBody {
+                return Err(StructuredRegionBuildError::NestedFunctionBodyMarker);
+            }
+            let depth = draft.nodes[parent.index()]
+                .depth
+                .checked_add(1)
+                .ok_or(StructuredRegionBuildError::RegionDepthOverflow)?;
+            let id = draft.push_node(Some(parent), depth, marker.entry, marker.kind)?;
+            draft.nodes[parent.index()].children.push(id);
+            marker.anchor = draft.emission_anchor(id);
+            seal_stmt_children(stmt, id, draft)
+        }
+        CStmt::Observed { stmt, .. } => seal_stmt_children(stmt, parent, draft),
+        CStmt::Block(stmts) => {
+            for stmt in stmts {
+                seal_stmt_children(stmt, parent, draft)?;
+            }
+            Ok(())
+        }
+        CStmt::If {
+            then_body,
+            else_body,
+            ..
+        } => {
+            seal_stmt_children(then_body, parent, draft)?;
+            if let Some(else_body) = else_body {
+                seal_stmt_children(else_body, parent, draft)?;
+            }
+            Ok(())
+        }
+        CStmt::While { body, .. }
+        | CStmt::DoWhile { body, .. }
+        | CStmt::For { body, .. } => seal_stmt_children(body, parent, draft),
+        CStmt::Switch { cases, default, .. } => {
+            for SwitchCase { body, .. } in cases {
+                for stmt in body {
+                    seal_stmt_children(stmt, parent, draft)?;
+                }
+            }
+            if let Some(default) = default {
+                for stmt in default {
+                    seal_stmt_children(stmt, parent, draft)?;
+                }
+            }
+            Ok(())
+        }
+        CStmt::Empty
+        | CStmt::Expr(_)
+        | CStmt::Decl { .. }
+        | CStmt::Return(_)
+        | CStmt::Break
+        | CStmt::Continue
+        | CStmt::Goto(_)
+        | CStmt::Label(_)
+        | CStmt::Comment(_) => Ok(()),
+    }
+}
+
+fn visit_occurrences<'a>(
+    stmt: &'a CStmt,
+    regions: &'a SealedStructuredRegionArtifact,
+    authority: &StructuredRegionArtifactAuthority,
+    visit: &mut impl FnMut(StructuredRegionOccurrence<'a>),
+) {
+    match stmt {
+        CStmt::StructuredRegion { marker, stmt } => {
+            let anchor = marker
+                .emission_anchor()
+                .expect("sealed body contains only sealed region markers");
+            let (id, node) = regions
+                .node_for_anchor(authority, anchor)
+                .expect("sealed marker belongs to its structured-region artifact");
+            visit(StructuredRegionOccurrence {
+                id,
+                anchor,
+                node,
+                stmt,
+            });
+            visit_occurrences(stmt, regions, authority, visit);
+        }
+        CStmt::Observed { stmt, .. } => visit_occurrences(stmt, regions, authority, visit),
+        CStmt::Block(stmts) => {
+            for stmt in stmts {
+                visit_occurrences(stmt, regions, authority, visit);
+            }
+        }
+        CStmt::If {
+            then_body,
+            else_body,
+            ..
+        } => {
+            visit_occurrences(then_body, regions, authority, visit);
+            if let Some(else_body) = else_body {
+                visit_occurrences(else_body, regions, authority, visit);
+            }
+        }
+        CStmt::While { body, .. }
+        | CStmt::DoWhile { body, .. }
+        | CStmt::For { body, .. } => visit_occurrences(body, regions, authority, visit),
+        CStmt::Switch { cases, default, .. } => {
+            for case in cases {
+                for stmt in &case.body {
+                    visit_occurrences(stmt, regions, authority, visit);
+                }
+            }
+            if let Some(default) = default {
+                for stmt in default {
+                    visit_occurrences(stmt, regions, authority, visit);
+                }
+            }
+        }
+        CStmt::Empty
+        | CStmt::Expr(_)
+        | CStmt::Decl { .. }
+        | CStmt::Return(_)
+        | CStmt::Break
+        | CStmt::Continue
+        | CStmt::Goto(_)
+        | CStmt::Label(_)
+        | CStmt::Comment(_) => {}
+    }
+}
+
+fn visit_scoped_stmt<'a>(
+    stmt: &'a CStmt,
+    current: Option<(RegionId, RegionEmissionAnchor)>,
+    regions: &'a SealedStructuredRegionArtifact,
+    authority: &StructuredRegionArtifactAuthority,
+    visit: &mut impl FnMut(ScopedStructuredStatement<'a>),
+) {
+    if let CStmt::StructuredRegion { marker, stmt } = stmt {
+        let anchor = marker
+            .emission_anchor()
+            .expect("sealed body contains only sealed region markers");
+        let (id, _) = regions
+            .node_for_anchor(authority, anchor)
+            .expect("sealed marker belongs to its structured-region artifact");
+        visit_scoped_stmt(stmt, Some((id, anchor)), regions, authority, visit);
+        return;
+    }
+
+    let (region, anchor) = current.expect("sealed body has a function-body region marker");
+    let node = regions
+        .node(region)
+        .expect("scoped statement region belongs to its artifact");
+    visit(ScopedStructuredStatement {
+        region,
+        anchor,
+        node,
+        stmt,
+    });
+
+    // Leading observation wrappers are one statement occurrence. Recurse into
+    // child statements of the semantic node, not through the wrapper as a
+    // second occurrence.
+    let semantic = stmt.unobserved();
+    match semantic {
+        CStmt::StructuredRegion { .. } => {
+            visit_scoped_stmt(semantic, current, regions, authority, visit)
+        }
+        CStmt::Block(stmts) => {
+            for stmt in stmts {
+                visit_scoped_stmt(stmt, current, regions, authority, visit);
+            }
+        }
+        CStmt::If {
+            then_body,
+            else_body,
+            ..
+        } => {
+            visit_scoped_stmt(then_body, current, regions, authority, visit);
+            if let Some(else_body) = else_body {
+                visit_scoped_stmt(else_body, current, regions, authority, visit);
+            }
+        }
+        CStmt::While { body, .. }
+        | CStmt::DoWhile { body, .. }
+        | CStmt::For { body, .. } => {
+            visit_scoped_stmt(body, current, regions, authority, visit)
+        }
+        CStmt::Switch { cases, default, .. } => {
+            for case in cases {
+                for stmt in &case.body {
+                    visit_scoped_stmt(stmt, current, regions, authority, visit);
+                }
+            }
+            if let Some(default) = default {
+                for stmt in default {
+                    visit_scoped_stmt(stmt, current, regions, authority, visit);
+                }
+            }
+        }
+        CStmt::Observed { .. } => unreachable!("leading observations were unwrapped"),
+        CStmt::Empty
+        | CStmt::Expr(_)
+        | CStmt::Decl { .. }
+        | CStmt::Return(_)
+        | CStmt::Break
+        | CStmt::Continue
+        | CStmt::Goto(_)
+        | CStmt::Label(_)
+        | CStmt::Comment(_) => {}
+    }
+}
+
+fn strip_region_markers(stmt: &mut CStmt) {
+    while let CStmt::StructuredRegion { stmt: inner, .. } = stmt {
+        *stmt = std::mem::replace(inner.as_mut(), CStmt::Empty);
+    }
+    match stmt {
+        CStmt::Observed { stmt, .. } => strip_region_markers(stmt),
+        CStmt::Block(stmts) => stmts.iter_mut().for_each(strip_region_markers),
+        CStmt::If {
+            then_body,
+            else_body,
+            ..
+        } => {
+            strip_region_markers(then_body);
+            if let Some(else_body) = else_body {
+                strip_region_markers(else_body);
+            }
+        }
+        CStmt::While { body, .. }
+        | CStmt::DoWhile { body, .. }
+        | CStmt::For { body, .. } => strip_region_markers(body),
+        CStmt::Switch { cases, default, .. } => {
+            for case in cases {
+                case.body.iter_mut().for_each(strip_region_markers);
+            }
+            if let Some(default) = default {
+                default.iter_mut().for_each(strip_region_markers);
+            }
+        }
+        CStmt::StructuredRegion { .. } => unreachable!("leading region markers were stripped"),
+        CStmt::Empty
+        | CStmt::Expr(_)
+        | CStmt::Decl { .. }
+        | CStmt::Return(_)
+        | CStmt::Break
+        | CStmt::Continue
+        | CStmt::Goto(_)
+        | CStmt::Label(_)
+        | CStmt::Comment(_) => {}
+    }
+}
+
+pub(crate) fn kind_of(region: &Region) -> StructuredRegionKind {
     match region {
         Region::Block(_) => StructuredRegionKind::Block,
         Region::Sequence(_) => StructuredRegionKind::Sequence,
@@ -565,5 +1005,102 @@ mod tests {
                 .is_none()
         );
         assert_eq!(node_signature(&first), node_signature(&second));
+    }
+
+    #[test]
+    fn sealed_body_visits_the_exact_statement_owned_by_each_anchor() {
+        let first = CStmt::structured_region(
+            StructuredRegionMarker::unsealed(0x1010, StructuredRegionKind::Block),
+            CStmt::Comment("first".to_string()),
+        );
+        let second = CStmt::structured_region(
+            StructuredRegionMarker::unsealed(0x1010, StructuredRegionKind::Block),
+            CStmt::Comment("second".to_string()),
+        );
+        let body = seal_structured_body(CStmt::structured_region(
+            StructuredRegionMarker::unsealed(0x1000, StructuredRegionKind::FunctionBody),
+            CStmt::Block(vec![first, second]),
+        ))
+        .expect("exact occurrence tree");
+
+        let mut visited = Vec::new();
+        body.visit_occurrences(|occurrence| {
+            visited.push((
+                occurrence.id().index(),
+                occurrence.anchor().index(),
+                occurrence.node().entry(),
+                occurrence.stmt().clone_without_render_observations(),
+            ));
+        });
+
+        assert_eq!(visited.len(), 3);
+        assert_eq!(visited[0].0, 0);
+        assert_eq!(visited[0].1, 0);
+        assert_eq!(visited[1].2, 0x1010);
+        assert_eq!(visited[2].2, 0x1010);
+        assert_ne!(visited[1].0, visited[2].0);
+        assert_ne!(visited[1].1, visited[2].1);
+        assert_eq!(visited[1].3, CStmt::Comment("first".to_string()));
+        assert_eq!(visited[2].3, CStmt::Comment("second".to_string()));
+
+        let mut scoped_comments = Vec::new();
+        body.visit_scoped_statements(|scoped| {
+            if let CStmt::Comment(text) = scoped.stmt().unobserved() {
+                scoped_comments.push((
+                    scoped.region().index(),
+                    scoped.anchor().index(),
+                    scoped.node().entry(),
+                    text.clone(),
+                ));
+            }
+        });
+        assert_eq!(
+            scoped_comments,
+            vec![
+                (visited[1].0, visited[1].1, 0x1010, "first".to_string()),
+                (visited[2].0, visited[2].1, 0x1010, "second".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn sealed_body_keeps_synthetic_appends_as_function_body_children() {
+        let source = CStmt::structured_region(
+            StructuredRegionMarker::unsealed(0x1000, StructuredRegionKind::Block),
+            CStmt::Comment("source".to_string()),
+        );
+        let join = CStmt::structured_region(
+            StructuredRegionMarker::unsealed(
+                0x1040,
+                StructuredRegionKind::Synthetic(SyntheticRegionKind::SharedJoin),
+            ),
+            CStmt::Comment("join".to_string()),
+        );
+        let exit = CStmt::structured_region(
+            StructuredRegionMarker::unsealed(
+                0x1080,
+                StructuredRegionKind::Synthetic(SyntheticRegionKind::DeferredSharedExit),
+            ),
+            CStmt::Comment("exit".to_string()),
+        );
+        let body = seal_structured_body(CStmt::structured_region(
+            StructuredRegionMarker::unsealed(0x1000, StructuredRegionKind::FunctionBody),
+            CStmt::Block(vec![source, join, exit]),
+        ))
+        .expect("synthetic occurrence tree");
+
+        let children = body
+            .regions()
+            .children(body.regions().root())
+            .expect("function-body children");
+        assert_eq!(children.len(), 3);
+        assert_eq!(
+            body.regions().node(children[1]).expect("join").kind(),
+            StructuredRegionKind::Synthetic(SyntheticRegionKind::SharedJoin)
+        );
+        assert_eq!(
+            body.regions().node(children[2]).expect("exit").kind(),
+            StructuredRegionKind::Synthetic(SyntheticRegionKind::DeferredSharedExit)
+        );
     }
 }

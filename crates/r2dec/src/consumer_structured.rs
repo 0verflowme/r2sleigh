@@ -1,9 +1,25 @@
 use crate::ast::CStmt;
+use crate::structured_region::SealedStructuredBody;
 
 pub(crate) struct RoutedBody {
-    pub(crate) body_stmt: CStmt,
+    body_stmt: Option<CStmt>,
+    structured_body: Option<SealedStructuredBody>,
     pub(crate) use_conservative_locals: bool,
     pub(crate) is_linear_fallback: bool,
+}
+
+impl RoutedBody {
+    pub(crate) fn structured_body(&self) -> Option<&SealedStructuredBody> {
+        self.structured_body.as_ref()
+    }
+
+    pub(crate) fn into_body_stmt(self) -> CStmt {
+        match (self.structured_body, self.body_stmt) {
+            (Some(body), None) => body.into_stmt(),
+            (None, Some(stmt)) => stmt,
+            _ => unreachable!("a routed body has exactly one statement owner"),
+        }
+    }
 }
 
 pub(crate) fn primary_body_for_semantic_route<'a, 'o, F>(
@@ -16,19 +32,21 @@ where
 {
     match route.kind {
         r2types::DecompileRouteKind::StructuredWorker => RoutedBody {
-            body_stmt: semantic_worker_comment_only_body(
+            body_stmt: Some(semantic_worker_comment_only_body(
                 "structured_worker",
                 crate::route_reason(route),
-            ),
+            )),
+            structured_body: None,
             use_conservative_locals: true,
             is_linear_fallback: false,
         },
         r2types::DecompileRouteKind::LinearWorker | r2types::DecompileRouteKind::SummaryIslands => {
             RoutedBody {
-                body_stmt: semantic_worker_comment_only_body(
+                body_stmt: Some(semantic_worker_comment_only_body(
                     "summary_route",
                     crate::route_reason(route),
-                ),
+                )),
+                structured_body: None,
                 use_conservative_locals: true,
                 is_linear_fallback: false,
             }
@@ -36,7 +54,7 @@ where
         r2types::DecompileRouteKind::VmSummary
         | r2types::DecompileRouteKind::FallbackComment
         | r2types::DecompileRouteKind::Standard => {
-            let structured = structurer.structure();
+            let structured = structurer.structure_with_regions();
             // Structuring refuses as a whole when one edge will not lower, so a
             // function whose loop exits reach blocks the region never covered
             // rendered nothing at all: no statements, and none of its
@@ -51,15 +69,27 @@ where
                     ))];
                     stmts.extend(linearize());
                     RoutedBody {
-                        body_stmt: CStmt::Block(stmts),
+                        body_stmt: Some(CStmt::Block(stmts)),
+                        structured_body: None,
                         use_conservative_locals: true,
                         is_linear_fallback: true,
                     }
                 }
-                None => RoutedBody {
-                    body_stmt: structured,
-                    use_conservative_locals: false,
-                    is_linear_fallback: false,
+                None => match structured {
+                    Ok(structured_body) => RoutedBody {
+                        body_stmt: None,
+                        structured_body: Some(structured_body),
+                        use_conservative_locals: false,
+                        is_linear_fallback: false,
+                    },
+                    Err(error) => RoutedBody {
+                        body_stmt: Some(CStmt::comment(format!(
+                            "r2dec residual: structured-region sealing failed: {error:?}"
+                        ))),
+                        structured_body: None,
+                        use_conservative_locals: true,
+                        is_linear_fallback: false,
+                    },
                 },
             }
         }
