@@ -1218,6 +1218,12 @@ pub struct StructuredDataflowFacts {
     pub recursive_calls: BTreeMap<CallSiteId, StructuredRecursiveCallFact>,
 }
 
+/// Exact, prepared interpretation of an external assumption subject.
+///
+/// `AnalysisAssumption` keeps the user's source spelling for diagnostics. This
+/// certificate is the semantic authority: register subjects retain canonical
+/// storage and SSA value identity, and stack subjects retain a typed base and
+/// object. Consumers must not re-resolve the source spelling.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PreparedAssumptionBindingKind {
     Predicate {
@@ -1227,9 +1233,9 @@ pub enum PreparedAssumptionBindingKind {
         truth: bool,
     },
     Register {
-        name: String,
+        storage: CanonicalStorageId,
+        value: ValueId,
         state_name: String,
-        symbol_name: String,
         bits: u32,
     },
     StackSlot {
@@ -1355,8 +1361,13 @@ impl PreparedFunctionFacts {
             &call_sites,
             &structured,
         );
-        let (applied_assumption_bindings, assumption_usage) =
-            collect_prepared_assumption_usage(graph, &objects, &predicates, assumptions);
+        let (applied_assumption_bindings, assumption_usage) = collect_prepared_assumption_usage(
+            graph,
+            &objects,
+            &predicates,
+            assumptions,
+            machine_context,
+        );
         Self {
             addresses,
             objects,
@@ -1456,6 +1467,7 @@ fn collect_prepared_assumption_usage(
     objects: &ObjectModel,
     base_predicates: &PredicateFacts,
     assumptions: &AssumptionSet,
+    machine_context: Option<&SourceMachineContext>,
 ) -> (Vec<PreparedAssumptionBinding>, AssumptionUsageReport) {
     let mut bindings = Vec::new();
     let mut usage = AssumptionUsageReport::default();
@@ -1499,27 +1511,36 @@ fn collect_prepared_assumption_usage(
         }
         match (&assumption.subject, &assumption.value) {
             (AssumptionSubject::Register { name }, _) => {
-                let Some(value) = graph.values.iter().find(|value| {
-                    value.var.version == 0
-                        && value.var.is_register()
-                        && value.var.name.eq_ignore_ascii_case(name)
-                }) else {
+                let Some(machine_context) = machine_context else {
                     usage.mark_ignored(assumption);
                     continue;
                 };
+                let Some(storage) = machine_context.register_storage(name) else {
+                    usage.mark_ignored(assumption);
+                    continue;
+                };
+                let mut candidates = graph.values.iter().filter(|value| {
+                    value.var.version == 0 && value.canonical_storage == Some(storage)
+                });
+                let Some(value) = candidates.next() else {
+                    usage.mark_ignored(assumption);
+                    continue;
+                };
+                if candidates.next().is_some() {
+                    usage.mark_conflict(
+                        assumption,
+                        "canonical register storage has multiple entry SSA values",
+                    );
+                    continue;
+                }
                 usage.mark_applied(assumption);
                 bindings.push(PreparedAssumptionBinding {
                     assumption: assumption.clone(),
                     binding: PreparedAssumptionBindingKind::Register {
-                        name: value.var.name.clone(),
+                        storage,
+                        value: value.id,
                         state_name: value.var.display_name(),
-                        symbol_name: value
-                            .var
-                            .name
-                            .strip_prefix("reg:")
-                            .unwrap_or(&value.var.name)
-                            .to_ascii_lowercase(),
-                        bits: value.var.size.saturating_mul(8),
+                        bits: storage.size.saturating_mul(8),
                     },
                 });
             }
@@ -1527,16 +1548,7 @@ fn collect_prepared_assumption_usage(
                 let Some((root, object)) =
                     objects.stack_objects.iter().find_map(|(key, object)| {
                         let root = key.root;
-                        let matches_base = matches!(
-                            (base.as_str(), root.base),
-                            ("bp", StackAddressBase::FramePointer)
-                                | ("frame", StackAddressBase::FramePointer)
-                                | ("rbp", StackAddressBase::FramePointer)
-                                | ("sp", StackAddressBase::StackPointer)
-                                | ("stack", StackAddressBase::StackPointer)
-                                | ("rsp", StackAddressBase::StackPointer)
-                        );
-                        (key.space == SpaceId::Ram && matches_base && root.offset == *offset)
+                        (key.space == SpaceId::Ram && root.base == *base && root.offset == *offset)
                             .then_some((root, *object))
                     })
                 else {
@@ -1630,7 +1642,7 @@ impl<'a> ObjectModelBuilder<'a> {
             stack_roots.sort_unstable();
             stack_roots.dedup();
             for root in stack_roots {
-                self.ensure_stack_object(root, SpaceId::Ram);
+                self.ensure_stack_object(root);
             }
             for var in facts.stack_address_roots.keys() {
                 let _ = self.object_for_address_value(graph, var, SpaceId::Ram);
@@ -1643,7 +1655,7 @@ impl<'a> ObjectModelBuilder<'a> {
             .map(|expression| expression.parameter)
             .collect::<BTreeSet<_>>();
         for parameter in parameter_indices {
-            self.ensure_parameter_object(parameter, SpaceId::Ram);
+            self.ensure_parameter_object(parameter);
         }
 
         for block in function.blocks() {
@@ -1695,13 +1707,13 @@ impl<'a> ObjectModelBuilder<'a> {
         let _ = self.ensure_escaped_unknown(space);
         let object = if space == SpaceId::Ram {
             if let Some(root) = resolve_stack_root(self.facts, value) {
-                let object = self.ensure_stack_object(root, space);
+                let object = self.ensure_stack_object(root);
                 if let Some(entry_root) = resolve_entry_stack_root(self.facts, value) {
                     self.record_entry_stack_root(object, entry_root);
                 }
                 object
             } else if let Some(expression) = self.addresses.parameter_expression(value_id) {
-                self.ensure_parameter_object(expression.parameter, space)
+                self.ensure_parameter_object(expression.parameter)
             } else if let Some(address) = resolve_const_value(self.facts, value) {
                 self.ensure_global_object(GlobalObjectKey { space, address })
             } else {
@@ -1716,9 +1728,11 @@ impl<'a> ObjectModelBuilder<'a> {
         object
     }
 
-    fn ensure_stack_object(&mut self, root: StackAddressRoot, space: SpaceId) -> ObjectId {
-        debug_assert_eq!(space, SpaceId::Ram);
-        let key = StackObjectKey { root, space };
+    fn ensure_stack_object(&mut self, root: StackAddressRoot) -> ObjectId {
+        let key = StackObjectKey {
+            root,
+            space: SpaceId::Ram,
+        };
         if let Some(object) = self.stack_objects.get(&key).copied() {
             return object;
         }
@@ -1728,7 +1742,7 @@ impl<'a> ObjectModelBuilder<'a> {
             ObjectFact {
                 id,
                 kind: ObjectKind::StackSlot {
-                    space,
+                    space: SpaceId::Ram,
                     base: root.base,
                     offset: root.offset,
                 },
@@ -1773,9 +1787,11 @@ impl<'a> ObjectModelBuilder<'a> {
         }
     }
 
-    fn ensure_parameter_object(&mut self, index: usize, space: SpaceId) -> ObjectId {
-        debug_assert_eq!(space, SpaceId::Ram);
-        let key = ParameterObjectKey { index, space };
+    fn ensure_parameter_object(&mut self, index: usize) -> ObjectId {
+        let key = ParameterObjectKey {
+            index,
+            space: SpaceId::Ram,
+        };
         if let Some(object) = self.parameter_objects.get(&key).copied() {
             return object;
         }
@@ -1784,7 +1800,10 @@ impl<'a> ObjectModelBuilder<'a> {
             id,
             ObjectFact {
                 id,
-                kind: ObjectKind::Parameter { space, index },
+                kind: ObjectKind::Parameter {
+                    space: SpaceId::Ram,
+                    index,
+                },
             },
         );
         self.parameter_objects.insert(key, id);
@@ -8302,6 +8321,146 @@ mod tests {
             scope: AssumptionScope::Query,
             provenance: AssumptionProvenance::User,
         }
+    }
+
+    fn register_assumption(name: impl Into<String>) -> AnalysisAssumption {
+        AnalysisAssumption {
+            id: Some("register-assumption-test".to_string()),
+            subject: AssumptionSubject::Register { name: name.into() },
+            value: AssumptionValue::Constant { value: 7 },
+            scope: AssumptionScope::Query,
+            provenance: AssumptionProvenance::User,
+        }
+    }
+
+    fn entry_register_artifact(arch: Option<&ArchSpec>) -> SsaArtifact {
+        let mut block = R2ILBlock::new(0x8f00, 4);
+        block.push(R2ILOp::Copy {
+            dst: Varnode::unique(0x80, 8),
+            src: Varnode::register(0, 8),
+        });
+        SsaArtifact::for_symbolic(&[block], arch).expect("entry register artifact")
+    }
+
+    #[test]
+    fn register_assumption_does_not_treat_an_ssa_display_name_as_storage_proof() {
+        let base = entry_register_artifact(None);
+        let display_name = base
+            .graph()
+            .values
+            .iter()
+            .find(|value| value.var.version == 0 && value.var.is_register())
+            .expect("entry register")
+            .var
+            .name
+            .clone();
+        let assumption = register_assumption(display_name);
+        let conditioned = base.with_assumptions(&AssumptionSet::new(vec![assumption.clone()]));
+
+        assert!(conditioned.facts().applied_assumption_bindings.is_empty());
+        assert!(conditioned.facts().assumption_usage.applied.is_empty());
+        assert_eq!(conditioned.facts().assumption_usage.ignored, [assumption]);
+        assert!(conditioned.facts().assumption_usage.conflicts.is_empty());
+    }
+
+    #[test]
+    fn register_assumption_certificate_is_bound_to_source_storage_and_value() {
+        let mut arch = ArchSpec::new("assumption-storage-test");
+        arch.addr_size = 8;
+        arch.add_register(RegisterDef::new("argument_carrier", 0, 8));
+        let base = entry_register_artifact(Some(&arch));
+        let assumption = register_assumption("ARGUMENT_CARRIER");
+        let conditioned = base.with_assumptions(&AssumptionSet::new(vec![assumption.clone()]));
+
+        assert_eq!(conditioned.facts().assumption_usage.applied, [assumption]);
+        let [binding] = conditioned.facts().applied_assumption_bindings.as_slice() else {
+            panic!("one exact register binding expected");
+        };
+        let super::PreparedAssumptionBindingKind::Register {
+            storage,
+            value,
+            bits,
+            ..
+        } = &binding.binding
+        else {
+            panic!("register binding expected");
+        };
+        assert_eq!(*storage, register_storage(0, 8));
+        assert_eq!(*bits, 64);
+        assert_eq!(
+            conditioned
+                .graph()
+                .value(*value)
+                .and_then(|value| value.canonical_storage),
+            Some(*storage)
+        );
+    }
+
+    #[test]
+    fn stack_assumption_certificate_uses_the_typed_stack_base() {
+        let mut arch = ArchSpec::new("assumption-stack-role-test");
+        arch.addr_size = 8;
+        arch.add_register(RegisterDef::new("stack_carrier", 0, 8));
+        arch.add_register(RegisterDef::new("return_link", 16, 8));
+        arch.add_space(r2il::AddressSpace::ram(8));
+        let stack_address = Varnode::unique(0x90, 8);
+        let mut block = R2ILBlock::new(0x8f40, 4);
+        block.push(R2ILOp::IntSub {
+            dst: stack_address.clone(),
+            a: Varnode::register(0, 8),
+            b: Varnode::constant(8, 8),
+        });
+        block.push(R2ILOp::Load {
+            dst: Varnode::unique(0x98, 8),
+            space: SpaceId::Ram,
+            addr: stack_address,
+        });
+        block.push(R2ILOp::Return {
+            target: Varnode::register(16, 8),
+        });
+        let interface = SourceFunctionInterface::new_exact(
+            b"assumption-stack-role-revision-1".to_vec(),
+            "test-abi",
+            [],
+            SourceFunctionReturn::Void,
+            [SourceStackSlotSpec::new_local(
+                StackAddressBase::StackPointer,
+                register_storage(0, 8),
+                -8,
+                8,
+            )],
+        )
+        .and_then(|interface| interface.with_return_address_storage(register_storage(16, 8)))
+        .and_then(|interface| interface.with_stack_pointer_storage(register_storage(0, 8)))
+        .expect("exact stack roles");
+        let base = SsaArtifact::for_decompile_with_interface(&[block], Some(&arch), interface)
+            .expect("stack-role artifact");
+        let assumption = AnalysisAssumption {
+            id: Some("typed-stack-assumption-test".to_string()),
+            subject: AssumptionSubject::StackSlot {
+                base: StackAddressBase::StackPointer,
+                offset: -8,
+            },
+            value: AssumptionValue::TypeHint {
+                ty: "uint64_t".to_string(),
+            },
+            scope: AssumptionScope::Function,
+            provenance: AssumptionProvenance::ImportedContext,
+        };
+        let conditioned = base.with_assumptions(&AssumptionSet::new(vec![assumption.clone()]));
+
+        assert_eq!(conditioned.facts().assumption_usage.applied, [assumption]);
+        assert!(matches!(
+            conditioned.facts().applied_assumption_bindings.as_slice(),
+            [super::PreparedAssumptionBinding {
+                binding: super::PreparedAssumptionBindingKind::StackSlot {
+                    base: StackAddressBase::StackPointer,
+                    offset: -8,
+                    ..
+                },
+                ..
+            }]
+        ));
     }
 
     fn assert_conflicting_predicate_assumption_preserves_semantics(

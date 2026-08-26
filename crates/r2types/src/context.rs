@@ -71,12 +71,29 @@ impl Default for ExternalStackBase {
 }
 
 impl ExternalStackBase {
+    pub fn assumption_base(&self) -> Option<r2ssa::StackAddressBase> {
+        match self {
+            Self::FramePointer => Some(r2ssa::StackAddressBase::FramePointer),
+            Self::StackPointer => Some(r2ssa::StackAddressBase::StackPointer),
+            Self::Named(_) => None,
+        }
+    }
+
     pub fn legacy_name(&self) -> Option<String> {
         match self {
             Self::FramePointer => Some("rbp".to_string()),
             Self::StackPointer => Some("rsp".to_string()),
             Self::Named(name) if !name.is_empty() => Some(name.clone()),
             Self::Named(_) => None,
+        }
+    }
+}
+
+impl From<r2ssa::StackAddressBase> for ExternalStackBase {
+    fn from(base: r2ssa::StackAddressBase) -> Self {
+        match base {
+            r2ssa::StackAddressBase::FramePointer => Self::FramePointer,
+            r2ssa::StackAddressBase::StackPointer => Self::StackPointer,
         }
     }
 }
@@ -838,16 +855,15 @@ fn imported_assumptions_from_context(
         if let Some(ty) = slot.ty.as_ref()
             && context_binding_type_is_meaningful(&slot.name, ty, ptr_bits)
         {
-            maybe_push_type_hints(
-                r2ssa::AssumptionSubject::StackSlot {
-                    base: slot_key
-                        .base
-                        .legacy_name()
-                        .unwrap_or_else(|| "stack".to_string()),
-                    offset: slot_key.offset,
-                },
-                ty,
-            );
+            if let Some(base) = slot_key.base.assumption_base() {
+                maybe_push_type_hints(
+                    r2ssa::AssumptionSubject::StackSlot {
+                        base,
+                        offset: slot_key.offset,
+                    },
+                    ty,
+                );
+            }
             if let Some(index) = slot.param_index {
                 maybe_push_type_hints(r2ssa::AssumptionSubject::Parameter { index }, ty);
             }
@@ -2244,6 +2260,47 @@ mod tests {
         assert_eq!(sp_local.name, "sp_local");
 
         assert!(ctx.external_stack_vars.is_empty());
+        assert!(ctx.assumptions.items.iter().any(|assumption| {
+            matches!(
+                &assumption.subject,
+                r2ssa::AssumptionSubject::StackSlot {
+                    base: r2ssa::StackAddressBase::FramePointer,
+                    offset: 16,
+                }
+            )
+        }));
+        assert!(ctx.assumptions.items.iter().any(|assumption| {
+            matches!(
+                &assumption.subject,
+                r2ssa::AssumptionSubject::StackSlot {
+                    base: r2ssa::StackAddressBase::StackPointer,
+                    offset: 16,
+                }
+            )
+        }));
+    }
+
+    #[test]
+    fn named_external_stack_base_does_not_become_a_semantic_assumption() {
+        let ctx = parse_external_context_json(
+            r#"{
+                "vars":[{
+                    "kind":"stack",
+                    "name":"local_value",
+                    "type":"int32_t",
+                    "base":"custom_stack_base",
+                    "offset":-8,
+                    "role":"local"
+                }]
+            }"#,
+            64,
+        );
+
+        assert!(ctx.stack_slots.keys().any(|slot| {
+            slot.base == ExternalStackBase::Named("custom_stack_base".to_string())
+                && slot.offset == -8
+        }));
+        assert!(ctx.assumptions.is_empty());
     }
 
     #[test]

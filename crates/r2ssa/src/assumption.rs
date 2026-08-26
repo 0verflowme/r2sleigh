@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::PredicateId;
+use crate::{PredicateId, StackAddressBase};
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -27,11 +27,15 @@ pub enum AssumptionSubject {
     Parameter {
         index: usize,
     },
+    /// External selector spelling retained for diagnostics and ingress.
+    ///
+    /// This is not semantic identity. Preparation must resolve it through the
+    /// source-owned machine context and emit an exact prepared certificate.
     Register {
         name: String,
     },
     StackSlot {
-        base: String,
+        base: StackAddressBase,
         offset: i64,
     },
     Predicate {
@@ -147,19 +151,6 @@ impl AssumptionSet {
                     AssumptionSubject::Parameter { index: subject },
                     AssumptionValue::TypeHint { ty },
                 ) if *subject == index => Some(ty.as_str()),
-                _ => None,
-            }
-        })
-    }
-
-    pub fn type_hints_for_register<'a>(&'a self, reg: &'a str) -> impl Iterator<Item = &'a str> {
-        self.items.iter().filter_map(move |assumption| {
-            match (&assumption.subject, &assumption.value) {
-                (AssumptionSubject::Register { name }, AssumptionValue::TypeHint { ty })
-                    if name.eq_ignore_ascii_case(reg) =>
-                {
-                    Some(ty.as_str())
-                }
                 _ => None,
             }
         })

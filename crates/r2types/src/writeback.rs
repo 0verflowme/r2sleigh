@@ -3716,15 +3716,6 @@ fn apply_type_hint_to_signature_param(
     Ok(applied)
 }
 
-fn assumption_stack_base(base: &str) -> Option<ExternalStackBase> {
-    match base.trim().to_ascii_lowercase().as_str() {
-        "bp" | "rbp" | "ebp" | "frame" | "fp" => Some(ExternalStackBase::FramePointer),
-        "sp" | "rsp" | "esp" | "stack" => Some(ExternalStackBase::StackPointer),
-        "" => None,
-        other => Some(ExternalStackBase::Named(other.to_string())),
-    }
-}
-
 fn apply_type_hint_assumptions_to_context(
     parsed_context: &mut ParsedExternalContext,
     inferred_signature: &mut InferredSignature,
@@ -3830,12 +3821,8 @@ fn apply_type_hint_assumptions_to_context(
                 }
             }
             r2ssa::AssumptionSubject::StackSlot { base, offset } => {
-                let Some(base) = assumption_stack_base(base) else {
-                    usage.mark_ignored(assumption);
-                    continue;
-                };
                 let key = StackSlotKey {
-                    base,
+                    base: ExternalStackBase::from(*base),
                     offset: *offset,
                 };
                 let corroborated = semantic_projection.is_some_and(|projection| {
@@ -3933,12 +3920,11 @@ fn applied_type_assumption_parameter_slots(
                         || param.name.eq_ignore_ascii_case(name)
                 })
             }
-            r2ssa::AssumptionSubject::StackSlot { base, offset } => assumption_stack_base(base)
-                .and_then(|base| {
-                    parsed_context.stack_slots.get(&StackSlotKey {
-                        base,
-                        offset: *offset,
-                    })
+            r2ssa::AssumptionSubject::StackSlot { base, offset } => parsed_context
+                .stack_slots
+                .get(&StackSlotKey {
+                    base: ExternalStackBase::from(*base),
+                    offset: *offset,
                 })
                 .and_then(|slot| slot.param_index),
             r2ssa::AssumptionSubject::Predicate { .. }
@@ -17700,7 +17686,7 @@ mod tests {
         let stack_assumption = r2ssa::AnalysisAssumption {
             id: None,
             subject: r2ssa::AssumptionSubject::StackSlot {
-                base: "sp".to_string(),
+                base: r2ssa::StackAddressBase::StackPointer,
                 offset: -8,
             },
             value: r2ssa::AssumptionValue::TypeHint {

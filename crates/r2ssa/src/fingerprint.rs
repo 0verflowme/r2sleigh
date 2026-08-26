@@ -14,7 +14,7 @@ use r2il::{MemoryOrdering, SpaceId};
 /// Version of the byte-level semantic fingerprint contract.
 ///
 /// Bump this whenever a tag or field encoding below changes.
-pub const SSA_SEMANTIC_FINGERPRINT_SCHEMA_VERSION: u32 = 5;
+pub const SSA_SEMANTIC_FINGERPRINT_SCHEMA_VERSION: u32 = 6;
 
 const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
@@ -1298,6 +1298,7 @@ enum CanonicalAssumptionBindingKey {
         value: CanonicalAssumptionValueKey,
     },
     Register {
+        storage: CanonicalStorageId,
         value_id: u32,
         bits: u32,
         scope: u16,
@@ -1312,23 +1313,6 @@ enum CanonicalAssumptionBindingKey {
         provenance: u16,
         value: CanonicalAssumptionValueKey,
     },
-}
-
-fn canonical_register_binding_value(
-    artifact: &SsaArtifact,
-    value_ids: &BTreeMap<ValueId, u32>,
-    binding_name: &str,
-) -> u32 {
-    artifact
-        .graph()
-        .values
-        .iter()
-        .find(|value| {
-            value.var.version == 0 && value.var.is_register() && value.var.name == binding_name
-        })
-        .and_then(|value| value_ids.get(&value.id))
-        .copied()
-        .unwrap_or(u32::MAX)
 }
 
 fn hash_assumption_binding(
@@ -1355,6 +1339,7 @@ fn hash_assumption_binding(
             hash_assumption_value(writer, value);
         }
         CanonicalAssumptionBindingKey::Register {
+            storage,
             value_id,
             bits,
             scope,
@@ -1362,6 +1347,7 @@ fn hash_assumption_binding(
             value,
         } => {
             writer.tag(2);
+            hash_storage(writer, Some(*storage));
             writer.u32(*value_id);
             writer.u32(*bits);
             writer.tag(*scope);
@@ -1396,6 +1382,7 @@ enum CanonicalTypeHintKey {
         provenance: u16,
     },
     Register {
+        storage: CanonicalStorageId,
         value_id: u32,
         bits: u32,
         ty: String,
@@ -1427,6 +1414,7 @@ fn hash_type_hint(writer: &mut FingerprintWriter, hint: &CanonicalTypeHintKey) {
             writer.tag(*provenance);
         }
         CanonicalTypeHintKey::Register {
+            storage,
             value_id,
             bits,
             ty,
@@ -1434,6 +1422,7 @@ fn hash_type_hint(writer: &mut FingerprintWriter, hint: &CanonicalTypeHintKey) {
             provenance,
         } => {
             writer.tag(2);
+            hash_storage(writer, Some(*storage));
             writer.u32(*value_id);
             writer.u32(*bits);
             writer.string(ty);
@@ -1560,15 +1549,19 @@ fn hash_assumption_conditioned_semantics(
                     provenance,
                     value,
                 },
-                PreparedAssumptionBindingKind::Register { name, bits, .. } => {
-                    CanonicalAssumptionBindingKey::Register {
-                        value_id: canonical_register_binding_value(artifact, value_ids, name),
-                        bits: *bits,
-                        scope,
-                        provenance,
-                        value,
-                    }
-                }
+                PreparedAssumptionBindingKind::Register {
+                    storage,
+                    value: bound_value,
+                    bits,
+                    ..
+                } => CanonicalAssumptionBindingKey::Register {
+                    storage: *storage,
+                    value_id: value_ids.get(bound_value).copied().unwrap_or(u32::MAX),
+                    bits: *bits,
+                    scope,
+                    provenance,
+                    value,
+                },
                 PreparedAssumptionBindingKind::StackSlot {
                     base,
                     offset,
@@ -1602,15 +1595,19 @@ fn hash_assumption_conditioned_semantics(
             let scope = assumption_scope_tag(&binding.assumption.scope);
             let provenance = assumption_provenance_tag(&binding.assumption.provenance);
             match &binding.binding {
-                PreparedAssumptionBindingKind::Register { name, bits, .. } => {
-                    Some(CanonicalTypeHintKey::Register {
-                        value_id: canonical_register_binding_value(artifact, value_ids, name),
-                        bits: *bits,
-                        ty: ty.clone(),
-                        scope,
-                        provenance,
-                    })
-                }
+                PreparedAssumptionBindingKind::Register {
+                    storage,
+                    value: bound_value,
+                    bits,
+                    ..
+                } => Some(CanonicalTypeHintKey::Register {
+                    storage: *storage,
+                    value_id: value_ids.get(bound_value).copied().unwrap_or(u32::MAX),
+                    bits: *bits,
+                    ty: ty.clone(),
+                    scope,
+                    provenance,
+                }),
                 PreparedAssumptionBindingKind::StackSlot {
                     base,
                     offset,
@@ -2403,7 +2400,7 @@ mod tests {
     }
 
     #[test]
-    fn semantic_fingerprint_schema_is_v5() {
-        assert_eq!(SSA_SEMANTIC_FINGERPRINT_SCHEMA_VERSION, 5);
+    fn semantic_fingerprint_schema_is_v6() {
+        assert_eq!(SSA_SEMANTIC_FINGERPRINT_SCHEMA_VERSION, 6);
     }
 }
