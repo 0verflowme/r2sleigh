@@ -1824,6 +1824,7 @@ pub struct EngineInterprocTargetMetrics {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EngineInterprocTargetInput {
     pub direct_target: u64,
+    /// Advisory presentation/debug metadata; never role or linkage authority.
     pub name: Option<String>,
     pub linkage: r2ssa::FunctionSemanticLinkage,
     pub semantic_summary: Option<r2ssa::FunctionSemanticSummary>,
@@ -1890,21 +1891,6 @@ pub struct EngineRuntimeMaterializedSourcePlan {
 
 fn engine_linkage_is_imported(linkage: r2ssa::FunctionSemanticLinkage) -> bool {
     matches!(linkage, r2ssa::FunctionSemanticLinkage::Imported)
-}
-
-fn target_name_is_import_authorized(
-    name: Option<&str>,
-    linkage: r2ssa::FunctionSemanticLinkage,
-) -> bool {
-    name.is_some_and(r2types::callee_name_is_import_like) && engine_linkage_is_imported(linkage)
-}
-
-fn imported_name_authorizes_runtime_role(
-    name: Option<&str>,
-    linkage: r2ssa::FunctionSemanticLinkage,
-    predicate: impl FnOnce(&str) -> bool,
-) -> bool {
-    engine_linkage_is_imported(linkage) && name.is_some_and(predicate)
 }
 
 fn interproc_target_skip_reason_from_evidence(
@@ -2086,37 +2072,26 @@ where
     I: IntoIterator<Item = EngineInterprocTargetInput>,
 {
     let mut queued_targets = BTreeSet::new();
-    let mut registration_targets = BTreeSet::new();
     let mut runtime_copy_targets = BTreeSet::new();
     let mut decisions = Vec::new();
 
     for target in targets {
         let direct_target = target.direct_target;
         let resolved_target = target.resolved_target.filter(|addr| *addr != 0);
-        let name = target.name.as_deref();
         let semantic_summary = target.semantic_summary.as_ref();
 
-        let registration_target = imported_name_authorizes_runtime_role(
-            name,
-            target.linkage,
-            r2types::callee_name_is_windows_runtime_registration,
-        );
-        if registration_target {
-            registration_targets.insert(direct_target);
-        }
+        // No source-owned typed registration role exists yet. An import name
+        // is presentation metadata, so exact planning refuses this role.
+        let registration_target = false;
 
-        let runtime_copy_target = imported_name_authorizes_runtime_role(
-            name,
-            target.linkage,
-            r2types::callee_name_is_runtime_copy,
-        ) || semantic_summary
+        let runtime_copy_target = semantic_summary
             .is_some_and(r2sym::semantic_summary_has_runtime_copy_role);
         if runtime_copy_target {
             runtime_copy_targets.insert(direct_target);
         }
 
         let skip_reason = interproc_target_skip_reason_from_evidence(
-            target_name_is_import_authorized(name, target.linkage),
+            engine_linkage_is_imported(target.linkage),
             semantic_summary.is_some_and(r2sym::semantic_summary_has_modeled_evidence),
             target.target_materialized,
             interproc_target_metrics_within_budget(target.target_metrics.as_ref()),
@@ -2149,7 +2124,7 @@ where
 
     EngineInterprocTargetPlan {
         queued_targets: queued_targets.into_iter().collect(),
-        registration_targets: registration_targets.into_iter().collect(),
+        registration_targets: Vec::new(),
         runtime_copy_targets: runtime_copy_targets.into_iter().collect(),
         decisions,
     }
@@ -2275,27 +2250,17 @@ mod kani_proofs {
     }
 
     #[kani::proof]
-    fn imported_name_runtime_role_requires_imported_linkage() {
-        let name_matches_runtime_role: bool = kani::any();
+    fn imported_skip_authority_is_typed_linkage_only() {
         let linkage = match kani::any::<u8>() % 3 {
             0 => r2ssa::FunctionSemanticLinkage::Unknown,
             1 => r2ssa::FunctionSemanticLinkage::Internal,
             _ => r2ssa::FunctionSemanticLinkage::Imported,
         };
 
-        let authorized =
-            imported_name_authorizes_runtime_role(Some("runtime_role"), linkage, |_| {
-                name_matches_runtime_role
-            });
-
         assert_eq!(
-            authorized,
-            name_matches_runtime_role
-                && matches!(linkage, r2ssa::FunctionSemanticLinkage::Imported)
+            engine_linkage_is_imported(linkage),
+            matches!(linkage, r2ssa::FunctionSemanticLinkage::Imported)
         );
-        if linkage != r2ssa::FunctionSemanticLinkage::Imported {
-            assert!(!authorized);
-        }
     }
 
     #[kani::proof]
@@ -2464,36 +2429,59 @@ fn debug_runtime_scope_log(message: &str) {
     }
 }
 
-fn arch_supports_windows_x64_runtime_scope(arch: Option<&r2il::ArchSpec>) -> bool {
-    let Some(arch) = arch else {
-        return false;
-    };
-    let lower_name = arch.name.to_ascii_lowercase();
-    (lower_name.contains("x86") || matches!(lower_name.as_str(), "x64" | "amd64"))
-        && (arch.addr_size == 8 || lower_name.contains("64"))
+fn windows_x64_runtime_call_observations(
+    analysis: &EngineAnalysis,
+) -> Option<BTreeMap<r2ssa::CallSiteId, Vec<r2ssa::CallArgObservation>>> {
+    let prepared = analysis.ssa_func();
+    if prepared.machine_context().effective_abi_class() != r2ssa::SourceAbiClass::MicrosoftX64 {
+        return None;
+    }
+    let abi = prepared.abi()?;
+    Some(r2ssa::observe_call_arguments(prepared, &abi))
 }
 
+fn complete_windows_x64_call_arguments<'a>(
+    analysis: &EngineAnalysis,
+    observations: &'a BTreeMap<r2ssa::CallSiteId, Vec<r2ssa::CallArgObservation>>,
+    call_id: r2ssa::CallSiteId,
+) -> Option<&'a [r2ssa::CallArgObservation]> {
+    let prepared = analysis.ssa_func();
+    let machine = prepared.machine_context();
+    let interface = machine.call_site_interface(call_id)?;
+    if !interface.is_complete()
+        || machine
+            .architecture_family()
+            .refine_abi_class(interface.abi_class())
+            != r2ssa::SourceAbiClass::MicrosoftX64
+    {
+        return None;
+    }
+    let arguments = observations.get(&call_id)?;
+    (arguments.len() == interface.arguments().len()
+        && !arguments
+            .iter()
+            .any(|argument| matches!(argument, r2ssa::CallArgObservation::Unknown)))
+    .then_some(arguments)
+}
+
+/// Discover registered handlers only from an exact Microsoft x64 function ABI
+/// and complete, exact Microsoft x64 callsite observations.
 pub fn interproc_runtime_registration_targets(
     analysis: &EngineAnalysis,
-    arch: Option<&r2il::ArchSpec>,
     registration_call_targets: &[u64],
 ) -> Vec<u64> {
-    if !arch_supports_windows_x64_runtime_scope(arch) || registration_call_targets.is_empty() {
-        debug_runtime_scope_log(&format!(
-            "skip supports_windows_x64={} arch={:?} registrations={}",
-            arch_supports_windows_x64_runtime_scope(arch),
-            arch.map(|arch| arch.name.as_str()),
-            registration_call_targets.len()
-        ));
+    if registration_call_targets.is_empty() {
         return Vec::new();
     }
+    let Some(observations) = windows_x64_runtime_call_observations(analysis) else {
+        debug_runtime_scope_log("skip missing exact Microsoft x64 ABI authority");
+        return Vec::new();
+    };
 
     let registrations = registration_call_targets
         .iter()
         .copied()
         .collect::<BTreeSet<_>>();
-    let observations =
-        r2ssa::observe_call_arguments(&analysis.ssa_func, &r2ssa::AbiProfile::windows_x64());
     let mut targets = BTreeSet::new();
     for (call_id, call) in &analysis.ssa_func.call_sites().by_id {
         let Some(target) = analysis.ssa_func.resolved_call_target(call) else {
@@ -2506,9 +2494,10 @@ pub fn interproc_runtime_registration_targets(
             ));
             continue;
         }
-        let Some(args) = observations.get(call_id) else {
+        let Some(args) = complete_windows_x64_call_arguments(analysis, &observations, *call_id)
+        else {
             debug_runtime_scope_log(&format!(
-                "call_id={call_id:?} target=0x{target:x} missing_args"
+                "call_id={call_id:?} target=0x{target:x} incomplete_exact_args"
             ));
             continue;
         };
@@ -2529,18 +2518,20 @@ pub fn interproc_runtime_registration_targets(
     targets.into_iter().collect()
 }
 
+/// Discover materialized code only from the same exact ABI/callsite authority
+/// required for runtime registration targets.
 pub fn interproc_runtime_materialized_sources(
     analysis: &EngineAnalysis,
-    arch: Option<&r2il::ArchSpec>,
     copy_call_targets: &[u64],
 ) -> Vec<EngineRuntimeMaterializedSource> {
-    if !arch_supports_windows_x64_runtime_scope(arch) || copy_call_targets.is_empty() {
+    if copy_call_targets.is_empty() {
         return Vec::new();
     }
+    let Some(observations) = windows_x64_runtime_call_observations(analysis) else {
+        return Vec::new();
+    };
 
     let copy_targets = copy_call_targets.iter().copied().collect::<BTreeSet<_>>();
-    let observations =
-        r2ssa::observe_call_arguments(&analysis.ssa_func, &r2ssa::AbiProfile::windows_x64());
     let mut sources = BTreeMap::<u64, u64>::new();
     for (call_id, call) in &analysis.ssa_func.call_sites().by_id {
         let Some(target) = analysis.ssa_func.resolved_call_target(call) else {
@@ -2549,7 +2540,8 @@ pub fn interproc_runtime_materialized_sources(
         if !copy_targets.contains(&target) {
             continue;
         }
-        let Some(args) = observations.get(call_id) else {
+        let Some(args) = complete_windows_x64_call_arguments(analysis, &observations, *call_id)
+        else {
             continue;
         };
         let (
@@ -5202,31 +5194,34 @@ fn symbolic_initial_state_at<'ctx>(
     let mut initial_state = r2sym::SymState::new(context.z3_ctx, entry_addr);
     match context.seed {
         EngineSymbolicStateSeed::Default { .. } => {
-            r2sym::seed_default_state_for_arch(&mut initial_state, context.prepared, context.arch);
+            let _ = r2sym::seed_default_state_for_prepared(
+                &mut initial_state,
+                context.prepared.as_ref(),
+            );
         }
         EngineSymbolicStateSeed::Scope { .. } => {
             if let Some(scope) = symbolic_scope_for_context(context) {
-                r2sym::seed_scope_state_for_arch(
+                // The exact scope API deliberately withholds process-like
+                // `main` arguments until a typed entrypoint role exists.
+                let _ = r2sym::seed_scope_state_for_prepared(
                     &mut initial_state,
-                    context.prepared,
+                    context.prepared.as_ref(),
                     scope,
-                    context.arch,
-                );
-            } else {
-                r2sym::seed_default_state_for_arch(
-                    &mut initial_state,
-                    context.prepared,
-                    context.arch,
                 );
             }
         }
         EngineSymbolicStateSeed::Replay { seed, .. } => {
-            r2sym::seed_replay_state_for_arch(
+            if r2sym::seed_default_state_for_prepared(
                 &mut initial_state,
-                Some(context.prepared),
-                context.arch,
-                seed,
-            );
+                context.prepared.as_ref(),
+            ) {
+                r2sym::apply_replay_seed_to_state(
+                    &mut initial_state,
+                    Some(context.prepared.as_ref()),
+                    None,
+                    seed,
+                );
+            }
         }
     }
     initial_state
@@ -7113,9 +7108,21 @@ mod tests {
         let mut arch = r2il::ArchSpec::new("x86-64");
         arch.addr_size = 8;
         arch.set_memory_endianness(r2il::Endianness::Little);
-        arch.add_register(r2il::RegisterDef::new("rax", 0, 8));
-        arch.add_register(r2il::RegisterDef::new("rsp", 0x28, 8));
-        arch.add_register(r2il::RegisterDef::new("rip", 0x30, 8));
+        for (name, offset) in [("rax", 0), ("rsp", 0x28), ("rip", 0x30)] {
+            let storage = r2il::RegisterStorage { offset, size: 8 };
+            arch.add_register(r2il::RegisterDef::new(name, offset, 8));
+            arch.register_projections
+                .push(r2il::RegisterProjection {
+                    written: storage,
+                    disposition: r2il::RegisterProjectionDisposition::Bound {
+                        carrier: storage,
+                        slice: r2il::RegisterBitSlice {
+                            lsb_bit_offset: 0,
+                            size_bits: 64,
+                        },
+                    },
+                });
+        }
         arch
     }
 
@@ -7849,20 +7856,7 @@ mod tests {
         arch.add_register(r2il::RegisterDef::new("r8", 24, 8));
         arch.add_register(r2il::RegisterDef::new("r9", 32, 8));
         arch.add_register(r2il::RegisterDef::new("rip", 40, 8));
-        arch
-    }
-
-    fn x86_32_runtime_scope_arch() -> r2il::ArchSpec {
-        let mut arch = windows_x64_runtime_scope_arch();
-        arch.name = "x86".to_string();
-        arch.addr_size = 4;
-        arch
-    }
-
-    fn x86_64_generic_name_runtime_scope_arch() -> r2il::ArchSpec {
-        let mut arch = windows_x64_runtime_scope_arch();
-        arch.name = "x86".to_string();
-        arch.addr_size = 8;
+        arch.add_register(r2il::RegisterDef::new("rsp", 48, 8));
         arch
     }
 
@@ -7873,6 +7867,69 @@ mod tests {
             size,
             meta: None,
         }
+    }
+
+    fn windows_runtime_source_snapshot(
+        revision: &str,
+        function_convention: &str,
+        calls: &[(u64, usize, u64, usize, bool, &str)],
+    ) -> Arc<EngineSourceSnapshot> {
+        let revision_identity = revision.as_bytes().to_vec();
+        let register = |offset| r2ssa::CanonicalStorageId {
+            space: r2ssa::CanonicalStorageSpace::Register,
+            offset,
+            size: 8,
+        };
+        let function_interface = r2ssa::SourceFunctionInterface::new_exact(
+            revision_identity.clone(),
+            function_convention,
+            [],
+            r2ssa::SourceFunctionReturn::Void,
+            [],
+        )
+        .and_then(|interface| interface.with_return_address_storage(register(40)))
+        .and_then(|interface| interface.with_stack_pointer_storage(register(48)))
+        .expect("exact runtime function interface");
+        let argument_offsets = [8, 16, 24, 32];
+        let call_site_interfaces = calls
+            .iter()
+            .map(
+            |&(block_addr, op_index, target, argument_count, complete, convention)| {
+                r2ssa::SourceCallSiteInterface::new(
+                    revision_identity.clone(),
+                    r2ssa::SourceCallSiteIdentity::new(
+                        block_addr,
+                        op_index,
+                        r2ssa::CanonicalStorageId {
+                            space: r2ssa::CanonicalStorageSpace::Constant,
+                            offset: target,
+                            size: 8,
+                        },
+                    ),
+                    complete,
+                    convention,
+                    argument_offsets[..argument_count]
+                        .iter()
+                        .enumerate()
+                        .map(|(index, offset)| {
+                            r2ssa::SourceCallArgumentSpec::new(index as u32, register(*offset))
+                        }),
+                    false,
+                    false,
+                    r2ssa::SourceCallResult::Void,
+                )
+                .expect("exact runtime callsite interface")
+            },
+        )
+            .collect::<Vec<_>>();
+        Arc::new(
+            EngineSourceSnapshot::new(
+                revision_identity,
+                Some(function_interface),
+                call_site_interfaces,
+            )
+            .expect("exact runtime source snapshot"),
+        )
     }
 
     const VM_TEST_RAX: u64 = 0;
@@ -8358,12 +8415,26 @@ mod tests {
     }
 
     fn controlled_r2dec_render_request() -> EngineDecompileRequest {
-        let blocks = const_return_blocks(0x614000, 7);
+        let mut block = R2ILBlock::new(0x614000, 4);
+        block.push(r2il::R2ILOp::Copy {
+            dst: r2il::Varnode::register(0, 8),
+            src: r2il::Varnode::constant(7, 8),
+        });
+        block.push(r2il::R2ILOp::Return {
+            target: r2il::Varnode::register(0x30, 8),
+        });
+        let blocks = vec![block];
         let interface = r2ssa::SourceFunctionInterface::new_exact(
             b"controlled-r2dec-source".to_vec(),
             "sysv64",
             std::iter::empty::<r2ssa::SourceAbiParameterSpec>(),
-            r2ssa::SourceFunctionReturn::Void,
+            r2ssa::SourceFunctionReturn::Register {
+                storage: r2ssa::CanonicalStorageId {
+                    space: r2ssa::CanonicalStorageSpace::Register,
+                    offset: 0,
+                    size: 8,
+                },
+            },
             std::iter::empty::<r2ssa::SourceStackSlotSpec>(),
         )
         .and_then(|interface| {
@@ -8478,12 +8549,20 @@ mod tests {
             .decompile_input(&decompiler_input);
         let counting = CountingRenderControl::default();
         let controlled = session.decompile_with_r2dec_control(request.clone(), &counting);
-        assert!(legacy_output.contains("source effect closure refused native C"));
-        assert!(controlled.output.starts_with("/* r2dec fallback:"));
+        assert!(
+            legacy_output.contains("return"),
+            "the exact control fixture must reach native rendering: {legacy_output}"
+        );
+        assert!(
+            controlled.output.contains("return"),
+            "the engine path must render the same exact fixture: {}",
+            controlled.output
+        );
         assert_ne!(
             controlled.binding_audit,
             BindingShadowAuditOutcome::NotRun,
-            "the completed native render must retain its exact r2dec audit"
+            "the completed native render must retain its exact r2dec audit: {}",
+            controlled.output
         );
         assert_ne!(
             controlled.effect_obligations,
@@ -8493,7 +8572,7 @@ mod tests {
         assert_eq!(
             controlled.render_refusal,
             None,
-            "the opaque fixture is refused by its effect ledger, not a renderer-boundary failure"
+            "the exact fixture must not cross a renderer refusal boundary"
         );
         let completed_binding_audit = controlled.binding_audit;
         let completed_effect_obligations = controlled.effect_obligations;
@@ -9716,10 +9795,9 @@ mod tests {
             imported.skip_reason,
             Some(EngineInterprocTargetSkipReason::Imported)
         );
-        assert_eq!(
-            plan.runtime_copy_targets,
-            vec![0x3000],
-            "runtime-copy role is still reported for imported memcpy calls"
+        assert!(
+            plan.runtime_copy_targets.is_empty(),
+            "an imported memcpy spelling is advisory without typed semantic summary evidence"
         );
     }
 
@@ -9761,7 +9839,10 @@ mod tests {
             },
         ]);
 
-        assert_eq!(plan.registration_targets, vec![0x4100]);
+        assert!(
+            plan.registration_targets.is_empty(),
+            "registration names must refuse until a typed source role exists"
+        );
         assert_eq!(plan.runtime_copy_targets, vec![0x4200]);
         assert_eq!(
             plan.queued_targets,
@@ -9794,7 +9875,7 @@ mod tests {
             EngineInterprocTargetInput {
                 direct_target: 0x4500,
                 name: Some("sym.imp.AddVectoredExceptionHandler".to_string()),
-                linkage: r2ssa::FunctionSemanticLinkage::Unknown,
+                linkage: r2ssa::FunctionSemanticLinkage::Imported,
                 semantic_summary: None,
                 resolved_target: Some(0x4500),
                 target_materialized: true,
@@ -9804,16 +9885,16 @@ mod tests {
 
         assert!(
             plan.registration_targets.is_empty(),
-            "runtime registration must require typed imported linkage"
+            "even imported linkage plus a matching name is not a typed registration role"
         );
         assert!(
             plan.runtime_copy_targets.is_empty(),
-            "runtime copy must require typed imported linkage or explicit modeled summary evidence"
+            "runtime copy requires explicit modeled summary evidence"
         );
         assert_eq!(
             plan.queued_targets,
-            vec![0x4400, 0x4500],
-            "name-only runtime-looking helpers should stay on the native helper queue"
+            vec![0x4400],
+            "the internal helper queues normally; typed imported linkage skips the imported target without granting a runtime role"
         );
     }
 
@@ -9985,37 +10066,34 @@ mod tests {
         block.push(r2il::R2ILOp::Return {
             target: r2il::Varnode::constant(0, 8),
         });
-        let snapshot = test_source_snapshot("sym.runtime_seed/rev1");
+        let snapshot = windows_runtime_source_snapshot(
+            "sym.runtime_seed/rev1",
+            "ms",
+            &[(0x5000, 2, 0x1800_1000, 2, true, "ms")],
+        );
         let analysis =
             build_engine_analysis_from_parts("sym.runtime_seed", &[block], Some(&arch), &snapshot)
                 .expect("analysis");
 
         assert_eq!(
-            interproc_runtime_registration_targets(&analysis, Some(&arch), &[0x1800_1000]),
+            interproc_runtime_registration_targets(&analysis, &[0x1800_1000]),
             vec![0x1400_3d0f],
-            "handler comes from the canonical Windows x64 arg1 observation"
-        );
-        let generic_x86_64 = x86_64_generic_name_runtime_scope_arch();
-        assert_eq!(
-            interproc_runtime_registration_targets(
-                &analysis,
-                Some(&generic_x86_64),
-                &[0x1800_1000]
-            ),
-            vec![0x1400_3d0f],
-            "64-bit x86 should be accepted even when the arch name omits a 64 suffix"
+            "handler comes from the complete exact Microsoft x64 callsite observation"
         );
         assert!(
-            interproc_runtime_registration_targets(&analysis, Some(&arch), &[0x1800_2000])
-                .is_empty(),
+            interproc_runtime_registration_targets(&analysis, &[0x1800_2000]).is_empty(),
             "non-registration callees must not expand symbolic scope"
         );
     }
 
     #[test]
-    fn runtime_registration_scope_is_gated_to_windows_x64() {
+    fn runtime_registration_scope_refuses_absent_non_microsoft_or_incomplete_evidence() {
         let arch = windows_x64_runtime_scope_arch();
         let mut block = R2ILBlock::new(0x5000, 4);
+        block.push(r2il::R2ILOp::Copy {
+            dst: runtime_reg(8, 8),
+            src: r2il::Varnode::constant(1, 8),
+        });
         block.push(r2il::R2ILOp::Copy {
             dst: runtime_reg(16, 8),
             src: r2il::Varnode::constant(0x1400_3d0f, 8),
@@ -10023,20 +10101,99 @@ mod tests {
         block.push(r2il::R2ILOp::Call {
             target: r2il::Varnode::constant(0x1800_1000, 8),
         });
-        let snapshot = test_source_snapshot("sym.runtime_seed/gated/rev1");
-        let analysis =
-            build_engine_analysis_from_parts("sym.runtime_seed", &[block], Some(&arch), &snapshot)
-                .expect("analysis");
-
+        let absent = test_source_snapshot("sym.runtime_seed/gated/absent/rev1");
+        let absent_analysis = build_engine_analysis_from_parts(
+            "sym.runtime_seed",
+            &[block.clone()],
+            Some(&arch),
+            &absent,
+        )
+        .expect("analysis without ABI authority");
         assert!(
-            interproc_runtime_registration_targets(&analysis, None, &[0x1800_1000]).is_empty(),
-            "missing architecture must not enable Windows runtime scope expansion"
+            interproc_runtime_registration_targets(&absent_analysis, &[0x1800_1000]).is_empty(),
+            "absent source ABI authority must refuse runtime scope expansion"
         );
-        let x86_32 = x86_32_runtime_scope_arch();
+
+        let system_v = windows_runtime_source_snapshot(
+            "sym.runtime_seed/gated/system-v/rev1",
+            "amd64",
+            &[(0x5000, 2, 0x1800_1000, 2, true, "ms")],
+        );
+        let system_v_analysis = build_engine_analysis_from_parts(
+            "sym.runtime_seed",
+            &[block.clone()],
+            Some(&arch),
+            &system_v,
+        )
+        .expect("System V analysis");
         assert!(
-            interproc_runtime_registration_targets(&analysis, Some(&x86_32), &[0x1800_1000])
+            interproc_runtime_registration_targets(&system_v_analysis, &[0x1800_1000]).is_empty(),
+            "an exact System V ABI must not enable Microsoft runtime policy"
+        );
+
+        let incomplete = windows_runtime_source_snapshot(
+            "sym.runtime_seed/gated/incomplete/rev1",
+            "ms",
+            &[(0x5000, 2, 0x1800_1000, 2, false, "ms")],
+        );
+        let incomplete_analysis = build_engine_analysis_from_parts(
+            "sym.runtime_seed",
+            &[block.clone()],
+            Some(&arch),
+            &incomplete,
+        )
+        .expect("incomplete-callsite analysis");
+        assert!(
+            interproc_runtime_registration_targets(&incomplete_analysis, &[0x1800_1000])
                 .is_empty(),
-            "32-bit x86 must not enable Windows x64 runtime scope expansion"
+            "an incomplete callsite must refuse otherwise exact arguments"
+        );
+
+        let unknown_callsite_abi = windows_runtime_source_snapshot(
+            "sym.runtime_seed/gated/unknown-callsite-abi/rev1",
+            "ms",
+            &[(0x5000, 2, 0x1800_1000, 2, true, "default")],
+        );
+        let unknown_callsite_abi_analysis = build_engine_analysis_from_parts(
+            "sym.runtime_seed",
+            &[block],
+            Some(&arch),
+            &unknown_callsite_abi,
+        )
+        .expect("unknown-callsite-ABI analysis");
+        assert!(
+            interproc_runtime_registration_targets(
+                &unknown_callsite_abi_analysis,
+                &[0x1800_1000]
+            )
+            .is_empty(),
+            "an unknown callsite ABI must not inherit the function ABI"
+        );
+
+        let mut unknown_argument_block = R2ILBlock::new(0x5100, 4);
+        unknown_argument_block.push(r2il::R2ILOp::Copy {
+            dst: runtime_reg(16, 8),
+            src: r2il::Varnode::constant(0x1400_3d0f, 8),
+        });
+        unknown_argument_block.push(r2il::R2ILOp::Call {
+            target: r2il::Varnode::constant(0x1800_1000, 8),
+        });
+        let unknown_argument = windows_runtime_source_snapshot(
+            "sym.runtime_seed/gated/unknown-argument/rev1",
+            "ms",
+            &[(0x5100, 1, 0x1800_1000, 2, true, "ms")],
+        );
+        let unknown_argument_analysis = build_engine_analysis_from_parts(
+            "sym.runtime_seed",
+            &[unknown_argument_block],
+            Some(&arch),
+            &unknown_argument,
+        )
+        .expect("unknown-argument analysis");
+        assert!(
+            interproc_runtime_registration_targets(&unknown_argument_analysis, &[0x1800_1000])
+                .is_empty(),
+            "one unknown observed argument invalidates the complete call observation"
         );
     }
 
@@ -10060,6 +10217,10 @@ mod tests {
             target: r2il::Varnode::constant(0x1800_2000, 8),
         });
         block.push(r2il::R2ILOp::Copy {
+            dst: runtime_reg(8, 8),
+            src: r2il::Varnode::constant(0x7000, 8),
+        });
+        block.push(r2il::R2ILOp::Copy {
             dst: runtime_reg(16, 8),
             src: r2il::Varnode::constant(0x9000, 8),
         });
@@ -10073,24 +10234,25 @@ mod tests {
         block.push(r2il::R2ILOp::Return {
             target: r2il::Varnode::constant(0, 8),
         });
-        let snapshot = test_source_snapshot("sym.runtime_copy/rev1");
+        let snapshot = windows_runtime_source_snapshot(
+            "sym.runtime_copy/rev1",
+            "ms",
+            &[
+                (0x6000, 3, 0x1800_2000, 3, true, "ms"),
+                (0x6000, 7, 0x1800_2000, 3, true, "ms"),
+            ],
+        );
         let analysis =
             build_engine_analysis_from_parts("sym.runtime_copy", &[block], Some(&arch), &snapshot)
                 .expect("analysis");
 
         assert_eq!(
-            interproc_runtime_materialized_sources(&analysis, Some(&arch), &[0x1800_2000]),
+            interproc_runtime_materialized_sources(&analysis, &[0x1800_2000]),
             vec![EngineRuntimeMaterializedSource {
                 addr: 0x9000,
                 size: 0x40
             }],
             "duplicate copy observations must collapse to the maximum materialized size"
-        );
-        let x86_32 = x86_32_runtime_scope_arch();
-        assert!(
-            interproc_runtime_materialized_sources(&analysis, Some(&x86_32), &[0x1800_2000])
-                .is_empty(),
-            "unsupported architectures must not report materialized runtime sources even when call args are otherwise valid"
         );
     }
 
@@ -10098,6 +10260,10 @@ mod tests {
     fn runtime_materialized_sources_reject_non_code_and_zero_size_inputs() {
         let arch = windows_x64_runtime_scope_arch();
         let mut block = R2ILBlock::new(0x6000, 4);
+        block.push(r2il::R2ILOp::Copy {
+            dst: runtime_reg(8, 8),
+            src: r2il::Varnode::constant(0x7000, 8),
+        });
         block.push(r2il::R2ILOp::Copy {
             dst: runtime_reg(16, 8),
             src: r2il::Varnode::constant(0x900, 8),
@@ -10110,6 +10276,10 @@ mod tests {
             target: r2il::Varnode::constant(0x1800_2000, 8),
         });
         block.push(r2il::R2ILOp::Copy {
+            dst: runtime_reg(8, 8),
+            src: r2il::Varnode::constant(0x7000, 8),
+        });
+        block.push(r2il::R2ILOp::Copy {
             dst: runtime_reg(16, 8),
             src: r2il::Varnode::constant(0x9000, 8),
         });
@@ -10120,21 +10290,21 @@ mod tests {
         block.push(r2il::R2ILOp::Call {
             target: r2il::Varnode::constant(0x1800_2000, 8),
         });
-        let snapshot = test_source_snapshot("sym.runtime_copy/rejected/rev1");
+        let snapshot = windows_runtime_source_snapshot(
+            "sym.runtime_copy/rejected/rev1",
+            "ms",
+            &[
+                (0x6000, 3, 0x1800_2000, 3, true, "ms"),
+                (0x6000, 7, 0x1800_2000, 3, true, "ms"),
+            ],
+        );
         let analysis =
             build_engine_analysis_from_parts("sym.runtime_copy", &[block], Some(&arch), &snapshot)
                 .expect("analysis");
 
         assert!(
-            interproc_runtime_materialized_sources(&analysis, Some(&arch), &[0x1800_2000])
-                .is_empty(),
+            interproc_runtime_materialized_sources(&analysis, &[0x1800_2000]).is_empty(),
             "runtime materialization needs both a code-like source address and a nonzero size"
-        );
-        let x86_32 = x86_32_runtime_scope_arch();
-        assert!(
-            interproc_runtime_materialized_sources(&analysis, Some(&x86_32), &[0x1800_2000])
-                .is_empty(),
-            "32-bit x86 must not enable Windows x64 materialized-source collection"
         );
     }
 
@@ -11002,6 +11172,101 @@ mod tests {
         let types = plan_type_request(&function_facts, &cfg_summary, false);
         assert_eq!(types.request(), EngineRequestKind::Types);
         assert_eq!(types.engine_plan(), EnginePlan::PreparedOnly);
+    }
+
+    #[test]
+    fn symbolic_scope_seed_uses_exact_prepared_abi_without_main_name_authority() {
+        let arch = windows_x64_runtime_scope_arch();
+        let mut block = R2ILBlock::new(0x401000, 4);
+        for (unique, register) in [(0x10, 8), (0x20, 16), (0x30, 24), (0x40, 48)] {
+            block.push(r2il::R2ILOp::Copy {
+                dst: r2il::Varnode::unique(unique, 8),
+                src: runtime_reg(register, 8),
+            });
+        }
+        block.push(r2il::R2ILOp::Return {
+            target: r2il::Varnode::constant(0, 8),
+        });
+        let revision = b"main-exact-symbolic-seed".to_vec();
+        let storage = |offset| r2ssa::CanonicalStorageId {
+            space: r2ssa::CanonicalStorageSpace::Register,
+            offset,
+            size: 8,
+        };
+        let function_interface = r2ssa::SourceFunctionInterface::new_exact(
+            revision.clone(),
+            "ms",
+            [8, 16, 24].into_iter().enumerate().map(|(index, offset)| {
+                r2ssa::SourceAbiParameterSpec::new(index as u32, storage(offset))
+            }),
+            r2ssa::SourceFunctionReturn::Void,
+            [],
+        )
+        .and_then(|interface| interface.with_return_address_storage(storage(40)))
+        .and_then(|interface| interface.with_stack_pointer_storage(storage(48)))
+        .expect("exact symbolic seed interface");
+        let snapshot = EngineSourceSnapshot::new(revision, Some(function_interface), [])
+            .expect("exact symbolic seed snapshot");
+        let analysis = build_engine_analysis_from_parts("main", &[block], Some(&arch), &snapshot)
+            .expect("exact symbolic seed analysis");
+        let prepared = Arc::clone(&analysis.ssa_func);
+        let scope = r2sym::PreparedFunctionScope::new(
+            prepared.entry,
+            vec![r2sym::ScopedPreparedFunction {
+                id: r2ssa::InterprocFunctionId(prepared.entry),
+                name: Some("main".to_string()),
+                prepared: Arc::clone(&prepared),
+            }],
+        )
+        .expect("exact symbolic scope");
+        let z3_ctx = z3::Context::thread_local();
+        let symbols = r2sym::FunctionSymbolSnapshot::default();
+        let context = EngineSymbolicContextRequest {
+            z3_ctx: &z3_ctx,
+            prepared: &prepared,
+            scope: Some(&scope),
+            arch: Some(&arch),
+            symbols: &symbols,
+            merge_states: false,
+            config_profile: EngineSymbolicConfigProfile::DefaultQuery,
+            seed: EngineSymbolicStateSeed::Scope {
+                entry_addr: prepared.entry,
+            },
+        };
+
+        let state = symbolic_initial_state(&context);
+        let register = |prefix: &str| {
+            state
+                .registers()
+                .iter()
+                .find(|(name, _)| name.to_ascii_lowercase().starts_with(prefix))
+                .map(|(_, value)| value)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "exact ABI register {prefix:?} must be seeded; got {:?}",
+                        state.registers().keys().collect::<Vec<_>>()
+                    )
+                })
+        };
+        assert!(register("rcx_").is_symbolic());
+        assert!(register("rdx_").is_symbolic());
+        assert!(register("r8_").is_symbolic());
+        assert!(register("rsp_").as_concrete().is_some());
+        assert!(
+            register("rdx_").as_concrete().is_none(),
+            "the spelling main must not authorize synthetic argv construction"
+        );
+
+        let missing_scope_context = EngineSymbolicContextRequest {
+            scope: None,
+            ..context
+        };
+        assert!(
+            symbolic_initial_state(&missing_scope_context)
+                .registers()
+                .is_empty(),
+            "a scope seed without exact scope authority must refuse rather than fall back to architecture seeding"
+        );
     }
 
     #[test]
