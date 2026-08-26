@@ -93,6 +93,24 @@ pub enum FunctionPrepareMode {
     Symbolic,
 }
 
+/// Width facts that SSA construction must preserve exactly from canonical
+/// R2IL. A conversion has its own opcode; a Copy or comparison is never allowed
+/// to acquire an implicit conversion merely because two source varnodes share
+/// a display name.
+fn prepared_scalar_widths_are_coherent(op: &SSAOp) -> bool {
+    match op {
+        SSAOp::Copy { dst, src } => dst.size == src.size,
+        SSAOp::IntEqual { dst, a, b }
+        | SSAOp::IntNotEqual { dst, a, b }
+        | SSAOp::IntLess { dst, a, b }
+        | SSAOp::IntSLess { dst, a, b }
+        | SSAOp::IntLessEqual { dst, a, b }
+        | SSAOp::IntSLessEqual { dst, a, b } => dst.size == 1 && a.size == b.size,
+        SSAOp::IntZExt { dst, src } | SSAOp::IntSExt { dst, src } => dst.size > src.size,
+        _ => true,
+    }
+}
+
 /// Unforgeable run-local identity for one immutable SSA artifact.
 ///
 /// Moving or sharing an artifact through [`Arc`] retains this identity.
@@ -2081,6 +2099,14 @@ impl SSAFunction {
             && std::env::var_os("R2SLEIGH_NO_ALIAS_REPAIR").is_none()
         {
             function.normalize_register_alias_sources_with_control(arch, control)?;
+        }
+        if !function
+            .blocks
+            .values()
+            .flat_map(|block| block.ops.iter())
+            .all(prepared_scalar_widths_are_coherent)
+        {
+            return Err(SsaPrepareError::MalformedInput);
         }
         control.poll()?;
         Ok(function)
@@ -9506,7 +9532,7 @@ mod tests {
                     a: rbp,
                     b: make_const(0x10, 8),
                 },
-                R2ILOp::Copy {
+                R2ILOp::Trunc {
                     dst: make_unique(0x20, 4),
                     src: rsp.clone(),
                 },
@@ -9940,5 +9966,84 @@ mod tests {
             adapt_family_root(&canonical_constant, 4),
             Some(SSAVar::constant(0x1234, 4))
         );
+    }
+
+    #[test]
+    fn prepared_ssa_preserves_exact_widths_when_unique_offsets_are_reused() {
+        // Sleigh unique-space offsets are local scratch locations reused by
+        // unrelated instruction templates. A later 8-byte definition must not
+        // resize an earlier 16-byte IMUL overflow chain during SSA renaming.
+        let extended = make_unique(0x2d180, 16);
+        let product = make_unique(0x4b600, 16);
+        let reused = make_unique(0x2d180, 8);
+        let blocks = vec![R2ILBlock {
+            addr: 0x1000,
+            size: 4,
+            ops: vec![
+                R2ILOp::IntSExt {
+                    dst: extended.clone(),
+                    src: make_reg(0x88, 8),
+                },
+                R2ILOp::IntNotEqual {
+                    dst: make_reg(0x200, 1),
+                    a: extended,
+                    b: product,
+                },
+                R2ILOp::Copy {
+                    dst: reused,
+                    src: make_reg(0x10, 8),
+                },
+            ],
+            switch_info: None,
+            op_metadata: Default::default(),
+        }];
+
+        let artifact = SsaArtifact::raw(&blocks, None).expect("width-coherent prepared SSA");
+        let ops = &artifact
+            .function()
+            .get_block(0x1000)
+            .expect("entry block")
+            .ops;
+
+        assert!(matches!(
+            &ops[0],
+            SSAOp::IntSExt { dst, src } if dst.size == 16 && src.size == 8
+        ));
+        assert!(matches!(
+            &ops[1],
+            SSAOp::IntNotEqual { dst, a, b }
+                if dst.size == 1 && a.size == 16 && b.size == 16
+        ));
+        assert!(matches!(
+            &ops[2],
+            SSAOp::Copy { dst, src } if dst.size == 8 && src.size == 8
+        ));
+    }
+
+    #[test]
+    fn prepared_ssa_refuses_implicit_copy_and_comparison_width_changes() {
+        for op in [
+            R2ILOp::Copy {
+                dst: make_unique(0x10, 8),
+                src: make_reg(0x20, 4),
+            },
+            R2ILOp::IntNotEqual {
+                dst: make_reg(0x200, 1),
+                a: make_unique(0x10, 8),
+                b: make_unique(0x20, 16),
+            },
+        ] {
+            let blocks = vec![R2ILBlock {
+                addr: 0x1000,
+                size: 4,
+                ops: vec![op],
+                switch_info: None,
+                op_metadata: Default::default(),
+            }];
+            assert!(
+                SsaArtifact::raw(&blocks, None).is_none(),
+                "an implicit width change has no prepared-SSA proof"
+            );
+        }
     }
 }

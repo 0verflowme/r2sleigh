@@ -363,7 +363,7 @@ mod tests {
     fn a_narrow_read_still_names_the_whole_candidate_slot() {
         let mut block = R2ILBlock::new(0x1000, 4);
         // reads w0, the low half of x0: same argument, narrower view
-        block.push(R2ILOp::Copy {
+        block.push(R2ILOp::IntZExt {
             dst: Varnode::register(8, 8),
             src: Varnode::register(0, 4),
         });

@@ -101,12 +101,15 @@ impl RenameContext {
         SSAVar::new(name, version, size)
     }
 
-    /// Create an SSAVar for reading a variable, using the IL varnode width if
-    /// the name has not been defined in this function.
-    pub fn read_var_with_size(&self, name: &str, fallback_size: u32) -> SSAVar {
+    /// Create an SSAVar for reading one exact IL varnode projection.
+    ///
+    /// Sleigh's unique-space offsets are scratch locations reused by unrelated
+    /// instruction templates, and unnamed register slices can share a base
+    /// offset while differing in width. `sizes` is useful for phi placement,
+    /// but it is not authority for the width of an individual R2IL operand.
+    pub fn read_var_with_size(&self, name: &str, exact_size: u32) -> SSAVar {
         let version = self.current_version(name);
-        let size = self.sizes.get(name).copied().unwrap_or(fallback_size);
-        SSAVar::new(name, version, size)
+        SSAVar::new(name, version, exact_size)
     }
 
     /// Create an SSAVar for writing a variable (generates new version).
@@ -114,6 +117,12 @@ impl RenameContext {
         let version = self.new_version(name);
         let size = self.get_size(name);
         SSAVar::new(name, version, size)
+    }
+
+    /// Create an SSAVar for writing one exact IL varnode projection.
+    pub fn write_var_with_size(&mut self, name: &str, exact_size: u32) -> SSAVar {
+        let version = self.new_version(name);
+        SSAVar::new(name, version, exact_size)
     }
 
     /// Find initialized variable names that match a register name ignoring case.
@@ -342,7 +351,7 @@ fn rename_block<C: SsaWorkControl + ?Sized>(
             .expect("preinitialized block");
         for (phi_idx, phi) in phis.iter().enumerate() {
             control.poll()?;
-            let dst = ctx.write_var(&phi.var_name);
+            let dst = ctx.write_var_with_size(&phi.var_name, phi.var_size);
             if let Some(storage) = phi.storage {
                 record_canonical_storage(
                     &mut result.canonical_storage_by_var,
@@ -507,7 +516,7 @@ fn append_call_boundary_defs(
             if !ctx.has_size(&actual_name) {
                 ctx.init_var(&actual_name, reg.size);
             }
-            let dst = ctx.write_var(&actual_name);
+            let dst = ctx.write_var_with_size(&actual_name, reg.size);
             defined_vars.push(actual_name);
             if let Some(storage) = reg_names.and_then(|names| {
                 let mut storages = names
@@ -556,7 +565,7 @@ fn fill_phi_sources(
     let incoming = phis
         .iter()
         .map(|phi| {
-            let source = ctx.read_var(&phi.var_name);
+            let source = ctx.read_var_with_size(&phi.var_name, phi.var_size);
             if let Some(storage) = phi.storage
                 && storage.size == source.size
             {
@@ -600,7 +609,7 @@ fn rename_op(
         Copy { dst, src } => {
             let src_ssa = read_varnode(src, ctx, reg_names);
             let dst_name = varnode_to_name(dst, reg_names);
-            let dst_ssa = ctx.write_var(&dst_name);
+            let dst_ssa = ctx.write_var_with_size(&dst_name, dst.size);
             defined_vars.push(dst_name);
             SSAOp::Copy {
                 dst: dst_ssa,
@@ -611,7 +620,7 @@ fn rename_op(
         Load { dst, addr, space } => {
             let addr_ssa = read_varnode(addr, ctx, reg_names);
             let dst_name = varnode_to_name(dst, reg_names);
-            let dst_ssa = ctx.write_var(&dst_name);
+            let dst_ssa = ctx.write_var_with_size(&dst_name, dst.size);
             defined_vars.push(dst_name);
             SSAOp::Load {
                 dst: dst_ssa,
@@ -640,7 +649,7 @@ fn rename_op(
         } => {
             let addr_ssa = read_varnode(addr, ctx, reg_names);
             let dst_name = varnode_to_name(dst, reg_names);
-            let dst_ssa = ctx.write_var(&dst_name);
+            let dst_ssa = ctx.write_var_with_size(&dst_name, dst.size);
             defined_vars.push(dst_name);
             SSAOp::LoadLinked {
                 dst: dst_ssa,
@@ -660,7 +669,7 @@ fn rename_op(
             let val_ssa = read_varnode(val, ctx, reg_names);
             let result_ssa = result.as_ref().map(|r| {
                 let name = varnode_to_name(r, reg_names);
-                let ssa = ctx.write_var(&name);
+                let ssa = ctx.write_var_with_size(&name, r.size);
                 defined_vars.push(name);
                 ssa
             });
@@ -684,7 +693,7 @@ fn rename_op(
             let expected_ssa = read_varnode(expected, ctx, reg_names);
             let replacement_ssa = read_varnode(replacement, ctx, reg_names);
             let dst_name = varnode_to_name(dst, reg_names);
-            let dst_ssa = ctx.write_var(&dst_name);
+            let dst_ssa = ctx.write_var_with_size(&dst_name, dst.size);
             defined_vars.push(dst_name);
             SSAOp::AtomicCAS {
                 dst: dst_ssa,
@@ -705,7 +714,7 @@ fn rename_op(
             let addr_ssa = read_varnode(addr, ctx, reg_names);
             let guard_ssa = read_varnode(guard, ctx, reg_names);
             let dst_name = varnode_to_name(dst, reg_names);
-            let dst_ssa = ctx.write_var(&dst_name);
+            let dst_ssa = ctx.write_var_with_size(&dst_name, dst.size);
             defined_vars.push(dst_name);
             SSAOp::LoadGuarded {
                 dst: dst_ssa,
@@ -1044,7 +1053,7 @@ fn rename_op(
             let hi_ssa = read_varnode(hi, ctx, reg_names);
             let lo_ssa = read_varnode(lo, ctx, reg_names);
             let dst_name = varnode_to_name(dst, reg_names);
-            let dst_ssa = ctx.write_var(&dst_name);
+            let dst_ssa = ctx.write_var_with_size(&dst_name, dst.size);
             defined_vars.push(dst_name);
             SSAOp::Piece {
                 dst: dst_ssa,
@@ -1056,7 +1065,7 @@ fn rename_op(
         Subpiece { dst, src, offset } => {
             let src_ssa = read_varnode(src, ctx, reg_names);
             let dst_name = varnode_to_name(dst, reg_names);
-            let dst_ssa = ctx.write_var(&dst_name);
+            let dst_ssa = ctx.write_var_with_size(&dst_name, dst.size);
             defined_vars.push(dst_name);
             SSAOp::Subpiece {
                 dst: dst_ssa,
@@ -1220,7 +1229,7 @@ fn rename_op(
 
         CpuId { dst } => {
             let dst_name = varnode_to_name(dst, reg_names);
-            let dst_ssa = ctx.write_var(&dst_name);
+            let dst_ssa = ctx.write_var_with_size(&dst_name, dst.size);
             defined_vars.push(dst_name);
             SSAOp::CpuId { dst: dst_ssa }
         }
@@ -1236,7 +1245,7 @@ fn rename_op(
                 .collect();
             let output_ssa = output.as_ref().map(|v| {
                 let name = varnode_to_name(v, reg_names);
-                let ssa = ctx.write_var(&name);
+                let ssa = ctx.write_var_with_size(&name, v.size);
                 defined_vars.push(name);
                 ssa
             });
@@ -1253,7 +1262,7 @@ fn rename_op(
                 .map(|v| read_varnode(v, ctx, reg_names))
                 .collect();
             let dst_name = varnode_to_name(dst, reg_names);
-            let dst_ssa = ctx.write_var(&dst_name);
+            let dst_ssa = ctx.write_var_with_size(&dst_name, dst.size);
             defined_vars.push(dst_name);
             SSAOp::Phi {
                 dst: dst_ssa,
@@ -1269,7 +1278,7 @@ fn rename_op(
             // Indirect is used for aliasing - treat as a copy for SSA purposes
             let src_ssa = read_varnode(src, ctx, reg_names);
             let dst_name = varnode_to_name(dst, reg_names);
-            let dst_ssa = ctx.write_var(&dst_name);
+            let dst_ssa = ctx.write_var_with_size(&dst_name, dst.size);
             defined_vars.push(dst_name);
             SSAOp::Copy {
                 dst: dst_ssa,
@@ -1286,7 +1295,7 @@ fn rename_op(
             let base_ssa = read_varnode(base, ctx, reg_names);
             let index_ssa = read_varnode(index, ctx, reg_names);
             let dst_name = varnode_to_name(dst, reg_names);
-            let dst_ssa = ctx.write_var(&dst_name);
+            let dst_ssa = ctx.write_var_with_size(&dst_name, dst.size);
             defined_vars.push(dst_name);
             SSAOp::PtrAdd {
                 dst: dst_ssa,
@@ -1305,7 +1314,7 @@ fn rename_op(
             let base_ssa = read_varnode(base, ctx, reg_names);
             let index_ssa = read_varnode(index, ctx, reg_names);
             let dst_name = varnode_to_name(dst, reg_names);
-            let dst_ssa = ctx.write_var(&dst_name);
+            let dst_ssa = ctx.write_var_with_size(&dst_name, dst.size);
             defined_vars.push(dst_name);
             SSAOp::PtrSub {
                 dst: dst_ssa,
@@ -1323,7 +1332,7 @@ fn rename_op(
             let seg_ssa = read_varnode(segment, ctx, reg_names);
             let off_ssa = read_varnode(offset, ctx, reg_names);
             let dst_name = varnode_to_name(dst, reg_names);
-            let dst_ssa = ctx.write_var(&dst_name);
+            let dst_ssa = ctx.write_var_with_size(&dst_name, dst.size);
             defined_vars.push(dst_name);
             SSAOp::SegmentOp {
                 dst: dst_ssa,
@@ -1335,7 +1344,7 @@ fn rename_op(
         New { dst, src } => {
             let src_ssa = read_varnode(src, ctx, reg_names);
             let dst_name = varnode_to_name(dst, reg_names);
-            let dst_ssa = ctx.write_var(&dst_name);
+            let dst_ssa = ctx.write_var_with_size(&dst_name, dst.size);
             defined_vars.push(dst_name);
             SSAOp::New {
                 dst: dst_ssa,
@@ -1351,7 +1360,7 @@ fn rename_op(
             let src_ssa = read_varnode(src, ctx, reg_names);
             let pos_ssa = read_varnode(position, ctx, reg_names);
             let dst_name = varnode_to_name(dst, reg_names);
-            let dst_ssa = ctx.write_var(&dst_name);
+            let dst_ssa = ctx.write_var_with_size(&dst_name, dst.size);
             defined_vars.push(dst_name);
             SSAOp::Extract {
                 dst: dst_ssa,
@@ -1370,7 +1379,7 @@ fn rename_op(
             let val_ssa = read_varnode(value, ctx, reg_names);
             let pos_ssa = read_varnode(position, ctx, reg_names);
             let dst_name = varnode_to_name(dst, reg_names);
-            let dst_ssa = ctx.write_var(&dst_name);
+            let dst_ssa = ctx.write_var_with_size(&dst_name, dst.size);
             defined_vars.push(dst_name);
             SSAOp::Insert {
                 dst: dst_ssa,
@@ -1390,7 +1399,7 @@ fn rename_op(
             let true_ssa = read_varnode(if_true, ctx, reg_names);
             let false_ssa = read_varnode(if_false, ctx, reg_names);
             let dst_name = varnode_to_name(dst, reg_names);
-            let dst_ssa = ctx.write_var(&dst_name);
+            let dst_ssa = ctx.write_var_with_size(&dst_name, dst.size);
             defined_vars.push(dst_name);
             SSAOp::Select {
                 dst: dst_ssa,
@@ -1418,7 +1427,7 @@ where
     let src1_ssa = read_varnode(src1, ctx, reg_names);
     let src2_ssa = read_varnode(src2, ctx, reg_names);
     let dst_name = varnode_to_name(dst, reg_names);
-    let dst_ssa = ctx.write_var(&dst_name);
+    let dst_ssa = ctx.write_var_with_size(&dst_name, dst.size);
     defined_vars.push(dst_name);
     f(dst_ssa, src1_ssa, src2_ssa)
 }
@@ -1437,7 +1446,7 @@ where
 {
     let src_ssa = read_varnode(src, ctx, reg_names);
     let dst_name = varnode_to_name(dst, reg_names);
-    let dst_ssa = ctx.write_var(&dst_name);
+    let dst_ssa = ctx.write_var_with_size(&dst_name, dst.size);
     defined_vars.push(dst_name);
     f(dst_ssa, src_ssa)
 }

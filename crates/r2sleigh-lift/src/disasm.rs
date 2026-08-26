@@ -2855,6 +2855,64 @@ mod tests {
 
     #[cfg(feature = "x86")]
     #[test]
+    fn x86_imul_overflow_chain_retains_its_exact_128_bit_product_geometry() {
+        let disassembler = Disassembler::from_trusted_profile(TrustedSleighProfile::X86_64)
+            .expect("trusted x86-64 specification");
+        let bytes = padded_instruction([0x4c, 0x0f, 0xaf, 0xca]);
+        let lifted = disassembler
+            .lift_genuine_block(&bytes, 0x1000, 4)
+            .expect("imul r9, rdx genuine lift");
+        let arch = lifted.authority().arch_spec();
+
+        r2il::validate_block_semantic(lifted.block(), arch)
+            .expect("genuine IMUL P-code is width coherent");
+        let product = lifted.block().ops.iter().find_map(|op| match op {
+            R2ILOp::IntMult { dst, a, b } if dst.size == 16 && a.size == 16 && b.size == 16 => {
+                Some(dst)
+            }
+            _ => None,
+        });
+        let product = product.expect("exact signed 128-bit product");
+        assert!(lifted.block().ops.iter().any(|op| matches!(
+            op,
+            R2ILOp::IntSExt { dst, src } if dst.size == 16 && src.size == 8
+        )));
+        assert!(lifted.block().ops.iter().any(|op| matches!(
+            op,
+            R2ILOp::IntNotEqual { a, b, .. }
+                if a.size == 16 && b == product
+        )));
+    }
+
+    #[cfg(feature = "arm")]
+    #[test]
+    fn aarch64_dup_and_sbfx_retain_proven_width_changes() {
+        let disassembler = Disassembler::from_trusted_profile(TrustedSleighProfile::Aarch64Le)
+            .expect("trusted AArch64 specification");
+
+        let dup = disassembler
+            .lift_genuine_block(&padded_instruction([0x40, 0x0c, 0x04, 0x4e]), 0x1000, 4)
+            .expect("dup v0.4s, w2 genuine lift");
+        r2il::validate_block_semantic(dup.block(), dup.authority().arch_spec())
+            .expect("genuine DUP P-code is width coherent");
+        assert!(dup.block().ops.iter().all(|op| match op {
+            R2ILOp::Copy { dst, src } => dst.size == src.size,
+            _ => true,
+        }));
+
+        let sbfx = disassembler
+            .lift_genuine_block(&padded_instruction([0x4b, 0x01, 0x00, 0x13]), 0x2000, 4)
+            .expect("sbfx w11, w10, 0, 1 genuine lift");
+        r2il::validate_block_semantic(sbfx.block(), sbfx.authority().arch_spec())
+            .expect("genuine SBFX P-code is width coherent");
+        assert!(sbfx.block().ops.iter().any(|op| matches!(
+            op,
+            R2ILOp::IntZExt { dst, src } if dst.size == 8 && src.size == 4
+        )));
+    }
+
+    #[cfg(feature = "x86")]
+    #[test]
     fn x86_byte_register_writes_do_not_invent_full_carrier_zero_extensions() {
         for (instruction, destination_name) in [([0x88, 0xd8], "AL"), ([0x88, 0xdc], "AH")] {
             let disassembler = Disassembler::from_trusted_profile(TrustedSleighProfile::X86_64)
