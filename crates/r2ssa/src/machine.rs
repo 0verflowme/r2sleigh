@@ -188,6 +188,44 @@ impl MachineValueUse {
         )
     }
 
+    /// Derive the exact typed address projection for one graph use.
+    ///
+    /// Memory operands are contextual: the same SSA value is an integer in an
+    /// arithmetic use but an address with object provenance at a certified
+    /// load/store use. Keeping this lookup keyed by [`UseSite`] prevents a
+    /// renderer from classifying `rsp`/`rbp` spellings or applying one address
+    /// interpretation to every use of the value.
+    pub fn memory_address_for_use(
+        artifact: &SsaArtifact,
+        site: UseSite,
+    ) -> Result<Option<Self>, MachineBuildError> {
+        let inst = artifact
+            .graph()
+            .inst(site.inst)
+            .ok_or(MachineBuildError::MissingUseDisposition(site))?;
+        let is_memory_address = site.input_idx == 0
+            && matches!(
+                &inst.payload,
+                InstPayload::Op(SSAOp::Load { .. } | SSAOp::Store { .. })
+            );
+        if !is_memory_address {
+            return Ok(None);
+        }
+        let address = *inst
+            .inputs
+            .get(site.input_idx)
+            .ok_or(MachineBuildError::MissingUseDisposition(site))?;
+        let access = StructuredAccessId {
+            inst: site.inst,
+            ordinal: 0,
+        };
+        let projected = Self::memory_address_for_access(artifact, access)?;
+        if projected.binding().value() != address || projected.memory_access() != Some(access) {
+            return Err(MachineBuildError::UseDispositionMismatch(site));
+        }
+        Ok(Some(projected))
+    }
+
     fn from_artifact_with_type(
         artifact: &SsaArtifact,
         value: ValueId,
@@ -4419,6 +4457,34 @@ mod tests {
                 space: MachineAddressSpace::Ram,
                 ..
             })
+        ));
+        let load_inst = artifact
+            .graph()
+            .inst_id_for_op_site(0x1800, 0)
+            .expect("load instruction");
+        let address_use = UseSite {
+            inst: load_inst,
+            input_idx: 0,
+        };
+        let projected = MachineValueUse::memory_address_for_use(&artifact, address_use)
+            .expect("certified memory-address use")
+            .expect("load input zero is the address use");
+        assert_eq!(
+            projected.binding().value(),
+            artifact
+                .graph()
+                .inst(load_inst)
+                .expect("load graph instruction")
+                .inputs[0]
+        );
+        assert_eq!(projected.memory_access(), Some(*access));
+        assert!(matches!(
+            projected.ty(),
+            MachineType::Address {
+                width_bits: 64,
+                space: MachineAddressSpace::Ram,
+                ..
+            }
         ));
         machine
             .validate_against(&artifact)
