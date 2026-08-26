@@ -502,7 +502,6 @@ impl<'a> FoldingContext<'a> {
             .map(|bits| bits.div_ceil(8).max(1))
             .unwrap_or(1);
         let index = self.scaled_index_expr(index, elem_size)?;
-        let index = self.normalize_index_expr(&index, 0).unwrap_or(index);
         let base = self.cast_expr_if_needed(base, CType::ptr(elem_ty), base_source_ty.as_ref());
         Some(CExpr::Subscript {
             base: Box::new(base),
@@ -598,14 +597,6 @@ impl<'a> FoldingContext<'a> {
             _ => None,
         }
     }
-
-    fn has_authoritative_memory_semantics(&self, name: &str) -> bool {
-        matches!(
-            self.lookup_semantic_value(name),
-            Some(analysis::SemanticValue::Address(_)) | Some(analysis::SemanticValue::Load { .. })
-        )
-    }
-
     pub(crate) fn render_certified_value_expr_for_var(&self, var: &SSAVar) -> Option<CExpr> {
         if let Some(value) = var.constant_bits() {
             return Some(if value > 0x7fff_ffff {
@@ -959,14 +950,7 @@ impl<'a> FoldingContext<'a> {
             return None;
         }
 
-        let semantic = self.render_memory_access_by_name(name, elem_size, depth, visited);
-        let result = if semantic.is_some() || self.has_authoritative_memory_semantics(name) {
-            semantic
-        } else {
-            self.lookup_definition(name).and_then(|expr| {
-                self.render_memory_access_from_visible_expr(&expr, elem_size, depth, visited)
-            })
-        };
+        let result = self.render_memory_access_by_name(name, elem_size, depth, visited);
 
         self.leave_resolution_guard(ResolutionPhase::Memory, name);
         result
@@ -1125,12 +1109,6 @@ impl<'a> FoldingContext<'a> {
             {
                 return Ok(indexed);
             }
-            if !Self::expr_is_scalar_memory_candidate(&expr)
-                && !matches!(elem_ty, CType::Pointer(_) | CType::Array(_, _))
-                && self.normalized_addr_from_visible_expr(&expr, 0).is_some()
-            {
-                return Ok(self.typed_deref_expr(addr, expr, elem_ty));
-            }
             return Ok(expr);
         }
 
@@ -1153,10 +1131,6 @@ impl<'a> FoldingContext<'a> {
             return Ok(fallback_addr_expr);
         }
 
-        if let Some(exact) = self.resolve_literalish_call_arg_expr(&fallback_addr_expr) {
-            return Ok(exact);
-        }
-
         Ok(self.typed_deref_expr(addr, fallback_addr_expr, elem_ty))
     }
 
@@ -1176,36 +1150,11 @@ impl<'a> FoldingContext<'a> {
         &self,
         expr: &CExpr,
         elem_size: u32,
-        is_write: bool,
-        depth: u32,
-        visited: &mut HashSet<String>,
+        _is_write: bool,
+        _depth: u32,
+        _visited: &mut HashSet<String>,
     ) -> Option<CExpr> {
-        let mut try_render = |candidate: &CExpr, ctx: &FoldingContext<'_>| {
-            let canonical = ctx.canonicalize_visible_address_expr(candidate, depth + 1);
-            let addr = ctx.normalized_addr_from_visible_expr(&canonical, depth + 1)?;
-            ctx.render_access_expr_from_addr(&addr, elem_size, is_write, depth + 1, visited)
-        };
-
-        let mut semantic_visited = HashSet::new();
-        let semanticized = self.semanticize_visible_expr(expr, depth + 1, &mut semantic_visited);
-        let preferred = if self.prefers_visible_expr(expr, &semanticized) {
-            semanticized
-        } else {
-            expr.clone()
-        };
-        if let Some(rendered) = try_render(&preferred, self).or_else(|| try_render(expr, self)) {
-            return Some(rendered);
-        }
         let elem_ty = type_from_size(elem_size);
-        if let Some(indexed) = self.indexed_pointer_add_expr(&preferred, &elem_ty) {
-            return Some(indexed);
-        }
-        if preferred != *expr
-            && let Some(indexed) = self.indexed_pointer_add_expr(expr, &elem_ty)
-        {
-            return Some(indexed);
-        }
-
-        None
+        self.indexed_pointer_add_expr(expr, &elem_ty)
     }
 }

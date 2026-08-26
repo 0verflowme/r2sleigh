@@ -9,10 +9,6 @@ impl<'a> FoldingContext<'a> {
             Ok(crate::binding_plan::PlannedParameterSymbol::Bound { symbol, .. }) => {
                 Some(CExpr::Var(symbol))
             }
-            Ok(
-                crate::binding_plan::PlannedParameterSymbol::Refused(_)
-                | crate::binding_plan::PlannedParameterSymbol::Absent,
-            ) => unreachable!("require_parameter_slot cannot return absent or refused"),
             Err(_) => {
                 self.retain_first_lowering_refusal(
                     OpLoweringRefusal::MissingProgramVariableAuthorization,
@@ -40,10 +36,6 @@ impl<'a> FoldingContext<'a> {
 
     fn use_info(&self) -> &analysis::UseInfo {
         self.state.analysis_ctx.semantic()
-    }
-
-    fn flag_info(&self) -> &analysis::FlagInfo {
-        self.state.analysis_ctx.flags()
     }
 
     fn stack_info(&self) -> &analysis::StackInfo {
@@ -913,14 +905,6 @@ impl<'a> FoldingContext<'a> {
     pub(crate) fn value_id_for_name(&self, _name: &str) -> Option<r2ssa::ValueId> {
         None
     }
-    #[cfg(test)]
-    pub(crate) fn definition_for_name(&self, name: &str) -> Option<&CExpr> {
-        self.use_info().render_definition_for_name(name)
-    }
-    #[cfg(not(test))]
-    pub(crate) fn definition_for_name(&self, _name: &str) -> Option<&CExpr> {
-        None
-    }
     pub(crate) fn semantic_value_for_value_id(
         &self,
         value_id: r2ssa::ValueId,
@@ -959,27 +943,6 @@ impl<'a> FoldingContext<'a> {
         None
     }
 
-    #[cfg(test)]
-    pub(crate) fn render_copy_source_for_name(&self, name: &str) -> Option<String> {
-        self.use_info().render_copy_source_for_name(name)
-    }
-    #[cfg(not(test))]
-    pub(crate) fn render_copy_source_for_name(&self, _name: &str) -> Option<String> {
-        None
-    }
-    /// Whether a rendered name is one a condition was decided by.
-    ///
-    /// This handed back the name-keyed set so callers could ask it directly.
-    /// There is no name-keyed set now: the question goes to the value store, and
-    /// the name is resolved to an identity on the way in.
-    #[cfg(test)]
-    pub(crate) fn is_condition_name(&self, name: &str) -> bool {
-        self.use_info().is_condition_name(name)
-    }
-    #[cfg(not(test))]
-    pub(crate) fn is_condition_name(&self, name: &str) -> bool {
-        self.use_info().names_a_flag(name)
-    }
     pub(crate) fn callee_identity_for_direct_target(&self, addr: u64) -> CalleeIdentity {
         self.inputs
             .callee_resolution()
@@ -988,10 +951,6 @@ impl<'a> FoldingContext<'a> {
             .unwrap_or_else(|| CalleeIdentity::from_name(&format!("const:{addr:x}")))
     }
     pub(crate) fn callee_identity_for_name(&self, name: &str) -> CalleeIdentity {
-
-        if let Some(addr) = parse_address_from_var_name(name) {
-            return self.callee_identity_for_direct_target(addr);
-        }
         if let Some(identity) = self
             .inputs
             .callee_resolution()
@@ -1003,18 +962,6 @@ impl<'a> FoldingContext<'a> {
     }
     pub(crate) fn callee_identity_for_expr(&self, expr: &CExpr) -> Option<CalleeIdentity> {
         call_arg_callee_name(&self.symbols, expr).map(|name| self.callee_identity_for_name(&*name))
-    }
-
-    #[cfg(test)]
-    pub(crate) fn direct_target_addr_from_callee_expr(&self, expr: &CExpr) -> Option<u64> {
-        match expr {
-            CExpr::Var(name) => parse_address_from_var_name(&*self.spelling(*name)),
-            CExpr::Paren(inner) | CExpr::AddrOf(inner) | CExpr::Deref(inner) => {
-                self.direct_target_addr_from_callee_expr(inner)
-            }
-            CExpr::Cast { expr: inner, .. } => self.direct_target_addr_from_callee_expr(inner),
-            _ => None,
-        }
     }
 
     #[cfg(test)]
@@ -1045,9 +992,6 @@ impl<'a> FoldingContext<'a> {
         self.symbols.borrow().spelling(id)
     }
 
-    pub(crate) fn flag_only_values_set(&self) -> &HashSet<String> {
-        &self.flag_info().flag_only_values
-    }
     pub(crate) fn stack_vars_map(&self) -> &HashMap<i64, String> {
         &self.stack_info().stack_vars
     }
@@ -1132,97 +1076,12 @@ impl<'a> FoldingContext<'a> {
         self.inputs.stack_slots = Box::leak(Box::new(stack_slots));
     }
 
-    /// Note every name a block other than its definition's reads.
-    ///
-    /// The prune that runs at the end of a block sees only that block's
-    /// statements, so a definition whose readers are elsewhere looks unread.
-    fn record_cross_block_reads(&self, blocks: &[SSABlock]) {
-        let mut defined_in = HashMap::new();
-        for block in blocks {
-            for op in &block.ops {
-                if let Some(dst) = op.dst() {
-                    defined_in.insert(dst.display_name(), block.addr);
-                }
-            }
-        }
-        let mut reads = self.cross_block_reads.borrow_mut();
-        for block in blocks {
-            for op in &block.ops {
-                for source in op.sources() {
-                    let key = source.display_name();
-                    if defined_in.get(&key).is_some_and(|addr| *addr != block.addr) {
-                        match self.var_name(source) {
-                            Ok(name) => {
-                                reads.insert(name);
-                            }
-                            Err(refusal) => self.retain_first_lowering_refusal(refusal),
-                        }
-                    }
-                }
-            }
-            for phi in &block.phis {
-                for source in &phi.sources {
-                    match self.var_name(&source.1) {
-                        Ok(name) => {
-                            reads.insert(name);
-                        }
-                        Err(refusal) => self.retain_first_lowering_refusal(refusal),
-                    }
-                }
-            }
-        }
-    }
-
     pub(crate) fn analyze_function_structure(&mut self, _func: &SSAFunction) {
     }
 
     pub(crate) fn stack_slot_offset_for_var(&self, var: &SSAVar) -> Option<i64> {
-        let symbols = &self.symbols;
-
-        self.stack_slot_provenance_for_var(var)
-            .map(|slot| slot.offset)
-            .or_else(|| self.prepared_stack_offset_for_var(var))
-            .or_else(|| {
-                analysis::utils::extract_stack_offset_from_var(&symbols,
-                    var,
-                    &|name: &str| self.definition_of(name),
-                    &self.inputs.arch.fp_name,
-                    &self.inputs.arch.sp_name,
-                )
-            })
+        self.prepared_stack_offset_for_var(var)
     }
-
-    fn resolve_copy_root_name_in_fold(&self, name: &str) -> String {
-
-        let mut current = name.to_string();
-        let mut seen = HashSet::new();
-        while seen.insert(current.clone()) {
-            let Some(next) = self.render_copy_source_for_name(&current) else {
-                break;
-            };
-            current = next;
-        }
-        current
-    }
-
-    fn register_family_name_for_ssa(&self, var: &SSAVar) -> Option<String> {
-        register_family_name(&var.name).or_else(|| {
-            let root = self.resolve_copy_root_name_in_fold(&var.display_name());
-            (root != var.display_name())
-                .then_some(root)
-                .and_then(|root| register_family_name(&root))
-        })
-    }
-
-    fn same_storage_value(&self, a: &SSAVar, b: &SSAVar) -> bool {
-        a == b
-            || (a.version == b.version
-                && self
-                    .register_family_name_for_ssa(a)
-                    .zip(self.register_family_name_for_ssa(b))
-                    .is_some_and(|(lhs, rhs)| lhs == rhs))
-    }
-
     /// Analyze multiple blocks (for function-level folding).
     #[cfg(test)]
     pub(crate) fn analyze_blocks(&mut self, blocks: &[SSABlock]) {
@@ -1240,7 +1099,6 @@ impl<'a> FoldingContext<'a> {
     ) -> Result<(), analysis::PreparedRuntimeFactsError> {
         control.poll()?;
         if self.inputs.prepared_ssa.is_some() {
-            self.record_cross_block_reads(blocks);
             if std::env::var_os("R2SLEIGH_DEBUG_UNKEYED").is_some() {
                 let unkeyed = &self.use_info().unkeyed_writes;
                 let total: usize = unkeyed.values().sum();
@@ -1429,11 +1287,16 @@ impl<'a> FoldingContext<'a> {
 
         Ok(match op {
             // These ops do not lower to statements but still need expression form.
-            SSAOp::CBranch { cond, .. } => {
-                let cond = self
-                    .get_condition_expr(cond)
+            SSAOp::CBranch { .. } => {
+                let block_addr = self
+                    .current_block_addr
+                    .get()
                     .ok_or(OpLoweringRefusal::MissingProgramVariableAuthorization)?;
-                Some(self.observed_input(frame, 1, cond))
+                let op_idx = self
+                    .current_op_idx
+                    .get()
+                    .ok_or(OpLoweringRefusal::MissingProgramVariableAuthorization)?;
+                Some(self.planned_input_expr_at(block_addr, op_idx, 1)?)
             }
             SSAOp::Return { .. } => {
                 return Err(OpLoweringRefusal::MissingMachineProjectionAuthorization);
@@ -1953,12 +1816,7 @@ impl<'a> FoldingContext<'a> {
                     self.render_value_ref(&analysis::ValueRef::from(source), depth + 1, visited)
                 })
             })
-            .flatten()
-            .or_else(|| {
-                self.forwarded_source_var(&name).and_then(|source| {
-                    self.render_value_ref(&analysis::ValueRef::from(source), depth + 1, visited)
-                })
-            });
+            .flatten();
         let fallback = if value.var.constant_bits().is_some() {
             self.retain_lowering_result(self.const_to_expr(&value.var))
         } else {
@@ -1975,11 +1833,10 @@ impl<'a> FoldingContext<'a> {
                     }
                 })
         };
-        let rendered = match self.lookup_semantic_value(&name).or_else(|| {
-            value
-                .value_id()
-                .and_then(|value_id| self.semantic_value_for_value_id(value_id))
-        }) {
+        let rendered = match value
+            .value_id()
+            .and_then(|value_id| self.semantic_value_for_value_id(value_id))
+        {
             Some(analysis::SemanticValue::Scalar(analysis::ScalarValue::Expr(expr))) => {
                 self.render_scalar_value_ref(value, expr.clone(), fallback.clone())
             }
@@ -1992,40 +1849,7 @@ impl<'a> FoldingContext<'a> {
             Some(analysis::SemanticValue::Load { space, addr, size }) => {
                 self.render_semantic_load(*space, addr, *size, depth + 1, visited)
             }
-            Some(analysis::SemanticValue::Unknown) | None => self
-                .lookup_definition_raw_with_depth(&name, depth + 1, visited)
-                        .or_else(|| {
-                            value.value_id().and_then(|value_id| {
-                                self.definition_for_value_id(value_id).cloned()
-                            })
-                        })
-                        .map(|expr| {
-                            let semanticized =
-                                self.semanticize_visible_expr(&expr, depth + 1, visited);
-                            if self.prefers_visible_expr(&expr, &semanticized) {
-                                semanticized
-                            } else {
-                                expr
-                            }
-                        })
-                        .and_then(|expr| {
-                            self.render_scalar_value_ref(value, expr, fallback.clone())
-                        })
-                .or_else(|| {
-                    self.lookup_definition_with_depth(&name, depth + 1, visited)
-                        .and_then(|expr| {
-                            self.render_semantic_load_from_definition_expr(
-                                &expr,
-                                depth + 1,
-                                visited,
-                            )
-                        })
-                })
-                .or_else(|| {
-                    self.definition_for_name(&name).and_then(|expr| {
-                        self.render_semantic_load_from_definition_expr(expr, depth + 1, visited)
-                    })
-                }),
+            Some(analysis::SemanticValue::Unknown) | None => None,
         }
         .or(fallback);
         let rendered = self.choose_preferred_visible_expr(rendered, forwarded);
@@ -2033,42 +1857,6 @@ impl<'a> FoldingContext<'a> {
         self.value_render_in_progress.borrow_mut().remove(&name);
         visited.remove(&visit_key);
         rendered
-    }
-
-    fn render_semantic_load_from_definition_expr(
-        &self,
-        expr: &CExpr,
-        depth: u32,
-        visited: &mut HashSet<String>,
-    ) -> Option<CExpr> {
-        if depth > Self::MAX_SEMANTIC_RENDER_DEPTH {
-            return None;
-        }
-        match expr {
-            CExpr::Deref(inner) => {
-                let addr = self.normalized_addr_from_visible_expr(inner, depth + 1)?;
-                self.render_load_from_addr(&addr, 0, depth + 1, visited)
-            }
-            CExpr::Cast { expr: inner, .. } | CExpr::Paren(inner) => {
-                self.render_semantic_load_from_definition_expr(inner, depth + 1, visited)
-            }
-            _ => None,
-        }
-    }
-
-    fn forwarded_source_var(&self, name: &str) -> Option<SSAVar> {
-        if let Some(cached) = self.forwarded_source_cache.borrow().get(name).cloned() {
-            return cached;
-        }
-
-        let resolved = self
-            .forwarded_value_for_name(name)
-            .and_then(|prov| prov.source_var.clone())
-            .filter(|src| src.display_name() != name);
-        self.forwarded_source_cache
-            .borrow_mut()
-            .insert(name.to_string(), resolved.clone());
-        resolved
     }
 
     fn render_base_ref_expr(
@@ -2238,74 +2026,15 @@ impl<'a> FoldingContext<'a> {
     fn stack_offset_for_normalized_addr(
         &self,
         addr: &analysis::NormalizedAddr,
-        depth: u32,
-        visited: &mut HashSet<String>,
+        _depth: u32,
+        _visited: &mut HashSet<String>,
     ) -> Option<i64> {
-        if depth > Self::MAX_SEMANTIC_RENDER_DEPTH {
-            return None;
-        }
-
         if addr.index.is_none()
             && let analysis::BaseRef::StackSlot(base) = addr.base
         {
             return base.checked_add(addr.offset_bytes);
         }
-
-        let base_expr = self.render_base_ref_expr(&addr.base, false, depth + 1, visited)?;
-        if addr.index.is_none()
-            && let Some(base_offset) = self.extract_offset_from_expr(&base_expr)
-        {
-            return base_offset.checked_add(addr.offset_bytes);
-        }
-
-        if let Some(index) = &addr.index
-            && addr.scale_bytes == 1
-        {
-            let index_expr = self.render_value_ref(index, depth + 1, visited)?;
-            if self.is_stack_base_expr(&index_expr) {
-                let base_offset = self.expr_to_offset(&base_expr)?;
-                return base_offset.checked_add(addr.offset_bytes);
-            }
-        }
-
-        let mut full_expr = base_expr;
-        if let Some(index) = &addr.index {
-            let index_expr = self.render_value_ref(index, depth + 1, visited)?;
-            let scaled = if addr.scale_bytes.unsigned_abs() <= 1 {
-                index_expr
-            } else {
-                CExpr::binary(
-                    BinaryOp::Mul,
-                    index_expr,
-                    CExpr::IntLit(addr.scale_bytes.unsigned_abs() as i64),
-                )
-            };
-            full_expr = CExpr::binary(
-                if addr.scale_bytes < 0 {
-                    BinaryOp::Sub
-                } else {
-                    BinaryOp::Add
-                },
-                full_expr,
-                scaled,
-            );
-        }
-        if addr.offset_bytes != 0 {
-            full_expr = CExpr::binary(
-                if addr.offset_bytes < 0 {
-                    BinaryOp::Sub
-                } else {
-                    BinaryOp::Add
-                },
-                full_expr,
-                CExpr::IntLit(addr.offset_bytes.unsigned_abs() as i64),
-            );
-        }
-
-        self.extract_offset_from_expr(&full_expr).or_else(|| {
-            let canonical = self.canonicalize_visible_address_expr(&full_expr, depth + 1);
-            self.extract_offset_from_expr(&canonical)
-        })
+        None
     }
 
     fn render_address_expr_from_addr(
@@ -2341,32 +2070,7 @@ impl<'a> FoldingContext<'a> {
             return Some(CExpr::AddrOf(Box::new(rendered)));
         }
 
-        let raw_base_expr = self.render_base_ref_expr(&addr.base, false, depth + 1, visited)?;
-        let recovered_stack_slot = self
-            .stack_offset_for_normalized_addr(addr, depth + 1, visited)
-            .filter(|_| addr.index.is_some() && self.expr_to_offset(&raw_base_expr).is_some())
-            .map(|offset| analysis::NormalizedAddr {
-                base: analysis::BaseRef::StackSlot(offset),
-                index: None,
-                scale_bytes: 0,
-                offset_bytes: 0,
-            });
-        let effective_addr = if let Some(stack_slot) = recovered_stack_slot {
-            stack_slot
-        } else if matches!(addr.base, analysis::BaseRef::StackSlot(_)) {
-            addr.clone()
-        } else if addr.index.is_none() {
-            self.normalized_addr_from_visible_expr(&raw_base_expr, depth + 1)
-                .and_then(|mut normalized| {
-                    normalized.offset_bytes =
-                        normalized.offset_bytes.checked_add(addr.offset_bytes)?;
-                    Some(normalized)
-                })
-                .filter(|normalized| matches!(normalized.base, analysis::BaseRef::StackSlot(_)))
-                .unwrap_or_else(|| addr.clone())
-        } else {
-            addr.clone()
-        };
+        let effective_addr = addr.clone();
         if let Some(full_offset) = self
             .stack_offset_for_normalized_addr(&effective_addr, depth + 1, visited)
             .filter(|offset| *offset < 0)
@@ -2509,36 +2213,6 @@ impl<'a> FoldingContext<'a> {
 
         None
     }
-
-    fn exact_oracle_field_name_for_addr(
-        &self,
-        addr: &analysis::NormalizedAddr,
-        offset: u64,
-    ) -> Option<String> {
-        let oracle = self.inputs.type_oracle?;
-        match &addr.base {
-            analysis::BaseRef::Value(base_ref) => {
-                if let Some(field) = oracle
-                    .field_layout(oracle.type_of(&base_ref.var), offset)
-                    .map(|layout| layout.field_name)
-                {
-                    return Some(field);
-                }
-                let mut visited = HashSet::new();
-                if let Some(root) = self.semantic_root_var(&base_ref.var, 0, &mut visited)
-                    && let Some(field) = oracle
-                        .field_layout(oracle.type_of(&root), offset)
-                        .map(|layout| layout.field_name)
-                {
-                    return Some(field);
-                }
-            }
-            analysis::BaseRef::Raw(CExpr::Var(_)) => {}
-            analysis::BaseRef::StackSlot(_) | analysis::BaseRef::Raw(_) => {}
-        }
-        None
-    }
-
     fn field_name_from_type_hint_for_var(
         &self,
         var: &SSAVar,
@@ -2594,85 +2268,6 @@ impl<'a> FoldingContext<'a> {
     ) -> bool {
         true
     }
-
-    fn exact_field_name_from_type_hint(
-        &self,
-        ty: &CType,
-        offset: u64,
-        access_size: u32,
-    ) -> Option<String> {
-        match ty {
-            CType::Pointer(inner) | CType::Array(inner, _) => {
-                self.exact_field_name_from_type_hint(inner, offset, access_size)
-            }
-            CType::Struct(name) => {
-                self.lookup_exact_external_struct_field_name(name, offset, access_size)
-            }
-            CType::Union(name) => {
-                self.lookup_exact_external_union_field_name(name, offset, access_size)
-            }
-            CType::Typedef(name) => self
-                .lookup_exact_external_struct_field_name(name, offset, access_size)
-                .or_else(|| self.lookup_exact_external_union_field_name(name, offset, access_size)),
-            _ => None,
-        }
-    }
-
-    fn exact_field_offset_is_pointer(&self, ty: &CType, offset: u64) -> bool {
-        match ty {
-            CType::Pointer(inner) | CType::Array(inner, _) => {
-                self.exact_field_offset_is_pointer(inner, offset)
-            }
-            CType::Struct(name) => self.exact_external_field_offset_is_pointer(name, offset, true),
-            CType::Union(name) => self.exact_external_field_offset_is_pointer(name, offset, false),
-            CType::Typedef(name) => {
-                self.exact_external_field_offset_is_pointer(name, offset, true)
-                    || self.exact_external_field_offset_is_pointer(name, offset, false)
-            }
-            _ => false,
-        }
-    }
-
-    fn exact_external_field_offset_is_pointer(
-        &self,
-        type_name: &str,
-        offset: u64,
-        is_struct: bool,
-    ) -> bool {
-        let key = type_name.trim().to_ascii_lowercase();
-        let normalized = normalize_external_type_name(type_name)
-            .trim()
-            .to_ascii_lowercase();
-        let mut keys = vec![key.clone()];
-        if normalized != key {
-            keys.push(normalized);
-        }
-        keys.into_iter().any(|key| {
-            if is_struct {
-                self.inputs
-                    .external_type_db
-                    .structs
-                    .get(&key)
-                    .and_then(|st| st.fields.get(&offset))
-                    .is_some_and(|field| {
-                        external_field_type_is_pointer(field, self.inputs.arch.ptr_size)
-                    })
-            } else {
-                offset == 0
-                    && self
-                        .inputs
-                        .external_type_db
-                        .unions
-                        .get(&key)
-                        .is_some_and(|un| {
-                            un.fields.values().any(|field| {
-                                external_field_type_is_pointer(field, self.inputs.arch.ptr_size)
-                            })
-                        })
-            }
-        })
-    }
-
     fn lookup_external_field_name(
         &self,
         type_name: &str,
@@ -2726,75 +2321,6 @@ impl<'a> FoldingContext<'a> {
         }
         None
     }
-
-    fn lookup_exact_external_struct_field_name(
-        &self,
-        type_name: &str,
-        offset: u64,
-        access_size: u32,
-    ) -> Option<String> {
-        let key = type_name.trim().to_ascii_lowercase();
-        if let Some(st) = self.inputs.external_type_db.structs.get(&key)
-            && let Some(field) = exact_external_struct_field_name_for_offset(
-                st,
-                offset,
-                access_size,
-                self.inputs.arch.ptr_size,
-            )
-        {
-            return Some(field);
-        }
-        let normalized = normalize_external_type_name(type_name);
-        if normalized != key {
-            let normalized_key = normalized.trim().to_ascii_lowercase();
-            if let Some(st) = self.inputs.external_type_db.structs.get(&normalized_key)
-                && let Some(field) = exact_external_struct_field_name_for_offset(
-                    st,
-                    offset,
-                    access_size,
-                    self.inputs.arch.ptr_size,
-                )
-            {
-                return Some(field);
-            }
-        }
-        None
-    }
-
-    fn lookup_exact_external_union_field_name(
-        &self,
-        type_name: &str,
-        offset: u64,
-        access_size: u32,
-    ) -> Option<String> {
-        let key = type_name.trim().to_ascii_lowercase();
-        if let Some(un) = self.inputs.external_type_db.unions.get(&key)
-            && let Some(field) = exact_external_union_field_name_for_offset(
-                un,
-                offset,
-                access_size,
-                self.inputs.arch.ptr_size,
-            )
-        {
-            return Some(field);
-        }
-        let normalized = normalize_external_type_name(type_name);
-        if normalized != key {
-            let normalized_key = normalized.trim().to_ascii_lowercase();
-            if let Some(un) = self.inputs.external_type_db.unions.get(&normalized_key)
-                && let Some(field) = exact_external_union_field_name_for_offset(
-                    un,
-                    offset,
-                    access_size,
-                    self.inputs.arch.ptr_size,
-                )
-            {
-                return Some(field);
-            }
-        }
-        None
-    }
-
     fn semantic_root_var(
         &self,
         var: &SSAVar,
@@ -2804,18 +2330,20 @@ impl<'a> FoldingContext<'a> {
         if depth > Self::MAX_SEMANTIC_RENDER_DEPTH {
             return None;
         }
-        let name = var.display_name();
-        if !visited.insert(name.clone()) {
+        let value_id = self.prepared_value_id_for_var(var)?;
+        let visit_key = format!("value:{value_id:?}");
+        if !visited.insert(visit_key.clone()) {
             return None;
         }
 
         let resolved = self
-            .forwarded_source_var(&name)
+            .forwarded_value_for_value_id(value_id)
+            .and_then(|provenance| provenance.source_var.clone())
             .and_then(|source| {
                 self.semantic_root_var(&source, depth + 1, visited)
                     .or(Some(source))
             })
-            .or_else(|| match self.lookup_semantic_value(&name) {
+            .or_else(|| match self.semantic_value_for_value_id(value_id) {
                 Some(analysis::SemanticValue::Scalar(analysis::ScalarValue::Root(root))) => self
                     .semantic_root_var(&root.var, depth + 1, visited)
                     .or_else(|| Some(root.var.clone())),
@@ -2825,14 +2353,10 @@ impl<'a> FoldingContext<'a> {
                 })) => self
                     .semantic_root_var(&root.var, depth + 1, visited)
                     .or_else(|| Some(root.var.clone())),
-                _ => {
-                    let copy_root = self.resolve_copy_root_name_in_fold(&name);
-                    let _ = copy_root;
-                    None
-                }
+                _ => None,
             });
 
-        visited.remove(&name);
+        visited.remove(&visit_key);
         resolved
     }
 
@@ -2908,37 +2432,7 @@ impl<'a> FoldingContext<'a> {
         }
 
         let raw_base_expr = self.render_base_ref_expr(&addr.base, false, depth + 1, visited)?;
-        let recovered_stack_slot = self
-            .stack_offset_for_normalized_addr(addr, depth + 1, visited)
-            .filter(|_| addr.index.is_some() && self.expr_to_offset(&raw_base_expr).is_some())
-            .map(|offset| analysis::NormalizedAddr {
-                base: analysis::BaseRef::StackSlot(offset),
-                index: None,
-                scale_bytes: 0,
-                offset_bytes: 0,
-            });
-        let effective_addr = if let Some(stack_slot) = recovered_stack_slot {
-            stack_slot
-        } else if matches!(addr.base, analysis::BaseRef::StackSlot(_)) {
-            addr.clone()
-        } else if addr.index.is_none() {
-            self.normalized_addr_from_visible_expr(&raw_base_expr, depth + 1)
-                .and_then(|mut normalized| {
-                    normalized.offset_bytes =
-                        normalized.offset_bytes.checked_add(addr.offset_bytes)?;
-                    Some(normalized)
-                })
-                .filter(|normalized| {
-                    matches!(normalized.base, analysis::BaseRef::StackSlot(_))
-                        || normalized.index.is_some()
-                        || self
-                            .oracle_field_name_for_addr(normalized, Some(elem_size))
-                            .is_some()
-                })
-                .unwrap_or_else(|| addr.clone())
-        } else {
-            addr.clone()
-        };
+        let effective_addr = addr.clone();
         if let Some(full_offset) = self
             .stack_offset_for_normalized_addr(&effective_addr, depth + 1, visited)
             .filter(|offset| *offset < 0)
@@ -2984,14 +2478,6 @@ impl<'a> FoldingContext<'a> {
         } else {
             self.oracle_field_name_for_addr(&effective_addr, Some(elem_size))
                 .or_else(|| {
-                    let mut normalized =
-                        self.normalized_addr_from_visible_expr(&base_expr, depth + 1)?;
-                    normalized.offset_bytes = normalized
-                        .offset_bytes
-                        .checked_add(effective_addr.offset_bytes)?;
-                    self.oracle_field_name_for_addr(&normalized, Some(elem_size))
-                })
-                .or_else(|| {
                     self.expr_type_hint(&base_expr).and_then(|ty| {
                         self.field_name_from_type_hint(
                             &ty,
@@ -3029,9 +2515,6 @@ impl<'a> FoldingContext<'a> {
             let scale = effective_addr.scale_bytes.unsigned_abs() as u32;
 
             let mut index_expr = self.render_value_ref(index, depth + 1, visited)?;
-            index_expr = self
-                .normalize_index_expr(&index_expr, 0)
-                .unwrap_or(index_expr);
             let mut elem_ty =
                 self.infer_elem_type_from_base_ref(&effective_addr.base, scale.max(elem_size));
             let mut normalized_base = self.normalize_pointer_base_expr(&base_expr, 0);
@@ -3209,10 +2692,7 @@ impl<'a> FoldingContext<'a> {
                 })
         {
             let base_expr = self.render_base_ref_expr(&addr.base, false, depth + 1, visited)?;
-            let mut index_expr = self.render_value_ref(index, depth + 1, visited)?;
-            index_expr = self
-                .normalize_index_expr(&index_expr, 0)
-                .unwrap_or(index_expr);
+            let index_expr = self.render_value_ref(index, depth + 1, visited)?;
             let elem_ty = self.infer_elem_type_from_base_ref(
                 &addr.base,
                 (addr.scale_bytes.unsigned_abs() as u32).max(elem_size),
@@ -3290,392 +2770,6 @@ impl<'a> FoldingContext<'a> {
                     .map(|expr| CExpr::Deref(Box::new(expr)))
             })
     }
-
-    fn value_ref_from_visible_expr(&self, expr: &CExpr) -> Option<analysis::ValueRef> {
-        match expr {
-            CExpr::Var(name) => {
-                if let Some(value_ref) = self.certified_stack_owner_value_ref_for_name(*name) {
-                    return Some(value_ref);
-                }
-                if let Some(value_ref) =
-                    self.certified_current_array_index_stack_load_value_ref(*name)
-                {
-                    return Some(value_ref);
-                }
-                // A binding symbol may represent several SSA values. Once an
-                // expression has been reduced to `SymbolId`, it cannot be
-                // converted back into one `ValueRef` without an exact source
-                // occurrence. Keep the mismatch visible and let the caller
-                // refuse the reconstruction.
-                None
-            }
-            CExpr::Paren(inner) | CExpr::Cast { expr: inner, .. } => {
-                self.value_ref_from_visible_expr(inner)
-            }
-            _ => None,
-        }
-    }
-
-    fn certified_current_array_index_stack_load_value_ref(
-        &self,
-        _name: crate::symbol::SymbolId,
-    ) -> Option<analysis::ValueRef> {
-        let _name_id = _name;
-        let _name = &self.spelling(_name_id);
-
-        None
-    }
-
-    fn certified_stack_owner_value_ref_for_name(&self, _name: crate::symbol::SymbolId,
-    ) -> Option<analysis::ValueRef> {
-        let _name_id = _name;
-        let _name = &self.spelling(_name_id);
-
-        None
-    }
-
-    fn extract_visible_scaled_index(
-        &self,
-        expr: &CExpr,
-        depth: u32,
-    ) -> Option<(analysis::ValueRef, i64)> {
-        if depth > Self::MAX_SEMANTIC_RENDER_DEPTH {
-            return None;
-        }
-
-        match expr {
-            CExpr::Binary {
-                op: BinaryOp::Add,
-                left,
-                right,
-            } => {
-                let (left_index, left_scale) =
-                    self.extract_visible_scaled_index(left, depth + 1)?;
-                let (right_index, right_scale) =
-                    self.extract_visible_scaled_index(right, depth + 1)?;
-                if left_index != right_index {
-                    return None;
-                }
-                left_scale
-                    .checked_add(right_scale)
-                    .map(|scale| (left_index, scale))
-            }
-            CExpr::Binary {
-                op: BinaryOp::Sub,
-                left,
-                right,
-            } if self.expr_resolves_to_visible_zero(left, depth + 1) => self
-                .extract_visible_scaled_index(right, depth + 1)
-                .and_then(|(index, scale)| scale.checked_neg().map(|neg| (index, neg))),
-            CExpr::Binary {
-                op: BinaryOp::Sub,
-                left,
-                right,
-            } => {
-                let (left_index, left_scale) =
-                    self.extract_visible_scaled_index(left, depth + 1)?;
-                let (right_index, right_scale) =
-                    self.extract_visible_scaled_index(right, depth + 1)?;
-                if left_index != right_index {
-                    return None;
-                }
-                left_scale
-                    .checked_sub(right_scale)
-                    .map(|scale| (left_index, scale))
-            }
-            CExpr::Binary {
-                op: BinaryOp::Mul,
-                left,
-                right,
-            } => {
-                if let Some(scale) = self.literal_to_i64(right) {
-                    return self.extract_visible_scaled_index(left, depth + 1).and_then(
-                        |(index, inner_scale)| {
-                            inner_scale.checked_mul(scale).map(|scaled| (index, scaled))
-                        },
-                    );
-                }
-                if let Some(scale) = self.literal_to_i64(left) {
-                    return self
-                        .extract_visible_scaled_index(right, depth + 1)
-                        .and_then(|(index, inner_scale)| {
-                            inner_scale.checked_mul(scale).map(|scaled| (index, scaled))
-                        });
-                }
-                None
-            }
-            CExpr::Binary {
-                op: BinaryOp::Shl,
-                left,
-                right,
-            } => {
-                let shift = self.literal_to_i64(right)?;
-                if !(0..=62).contains(&shift) {
-                    return None;
-                }
-                self.extract_visible_scaled_index(left, depth + 1).and_then(
-                    |(index, inner_scale)| {
-                        inner_scale
-                            .checked_mul(1i64 << shift)
-                            .map(|scaled| (index, scaled))
-                    },
-                )
-            }
-            CExpr::Paren(inner) | CExpr::Cast { expr: inner, .. } => {
-                self.extract_visible_scaled_index(inner, depth + 1)
-            }
-            _ => self
-                .value_ref_from_visible_expr(expr)
-                .map(|index| (index, 1)),
-        }
-    }
-
-    fn expr_resolves_to_visible_zero(&self, expr: &CExpr, depth: u32) -> bool {
-        if depth > Self::MAX_SEMANTIC_RENDER_DEPTH {
-            return false;
-        }
-
-        match expr {
-            CExpr::IntLit(0) | CExpr::UIntLit(0) => true,
-            CExpr::Paren(inner) | CExpr::Cast { expr: inner, .. } => {
-                self.expr_resolves_to_visible_zero(inner, depth + 1)
-            }
-            CExpr::Binary {
-                op: BinaryOp::BitXor,
-                left,
-                right,
-            } if left == right => true,
-            CExpr::Var(name) => {
-                if let Some(def) = self.lookup_definition_raw(&self.spelling(*name))
-                    && !matches!(&def, CExpr::Var(inner) if inner == name)
-                    && self.expr_resolves_to_visible_zero(&def, depth + 1)
-                {
-                    return true;
-                }
-                false
-            }
-            _ => false,
-        }
-    }
-
-    fn extract_visible_scaled_index_with_offset(
-        &self,
-        expr: &CExpr,
-        depth: u32,
-    ) -> Option<(analysis::ValueRef, i64, i64)> {
-        if depth > Self::MAX_SEMANTIC_RENDER_DEPTH {
-            return None;
-        }
-
-        match expr {
-            CExpr::Binary {
-                op: BinaryOp::Add,
-                left,
-                right,
-            } => {
-                if let Some(delta) = self.literal_to_i64(right)
-                    && let Some((index, scale, offset)) =
-                        self.extract_visible_scaled_index_with_offset(left, depth + 1)
-                {
-                    return offset
-                        .checked_add(delta)
-                        .map(|combined| (index, scale, combined));
-                }
-                if let Some(delta) = self.literal_to_i64(left)
-                    && let Some((index, scale, offset)) =
-                        self.extract_visible_scaled_index_with_offset(right, depth + 1)
-                {
-                    return offset
-                        .checked_add(delta)
-                        .map(|combined| (index, scale, combined));
-                }
-                self.extract_visible_scaled_index(expr, depth + 1)
-                    .map(|(index, scale)| (index, scale, 0))
-            }
-            CExpr::Binary {
-                op: BinaryOp::Sub,
-                left,
-                right,
-            } => {
-                if let Some(delta) = self.literal_to_i64(right)
-                    && let Some((index, scale, offset)) =
-                        self.extract_visible_scaled_index_with_offset(left, depth + 1)
-                {
-                    return offset
-                        .checked_sub(delta)
-                        .map(|combined| (index, scale, combined));
-                }
-                self.extract_visible_scaled_index(expr, depth + 1)
-                    .map(|(index, scale)| (index, scale, 0))
-            }
-            CExpr::Paren(inner) | CExpr::Cast { expr: inner, .. } => {
-                self.extract_visible_scaled_index_with_offset(inner, depth + 1)
-            }
-            _ => self
-                .extract_visible_scaled_index(expr, depth + 1)
-                .map(|(index, scale)| (index, scale, 0)),
-        }
-    }
-
-    fn normalized_addr_from_visible_expr(
-        &self,
-        expr: &CExpr,
-        depth: u32,
-    ) -> Option<analysis::NormalizedAddr> {
-        if depth > Self::MAX_SEMANTIC_RENDER_DEPTH {
-            return None;
-        }
-
-        match expr {
-            CExpr::Paren(inner) | CExpr::Cast { expr: inner, .. } => {
-                self.normalized_addr_from_visible_expr(inner, depth + 1)
-            }
-            CExpr::Deref(_) => {
-                if let CExpr::Deref(inner) = expr
-                    && let Some(access) = self.render_memory_access_from_visible_expr(
-                        inner,
-                        self.inputs.arch.ptr_size.max(1),
-                        depth + 1,
-                        &mut HashSet::new(),
-                    )
-                    && access != *expr
-                    && let Some(addr) = self.normalized_addr_from_visible_expr(&access, depth + 1)
-                {
-                    return Some(addr);
-                }
-                let mut semantic_visited = HashSet::new();
-                let semantic =
-                    self.semanticize_visible_expr(expr, depth + 1, &mut semantic_visited);
-                if semantic != *expr {
-                    return self.normalized_addr_from_visible_expr(&semantic, depth + 1);
-                }
-                None
-            }
-            CExpr::Var(name) => {
-                let mut semantic_visited = HashSet::new();
-                if let Some(semantic) =
-                    self.render_semantic_value_by_name(&self.spelling(*name), depth + 1, &mut semantic_visited,
-                )
-                    && !matches!(&semantic, CExpr::Var(inner) if inner == name)
-                    && let Some(addr) = self.normalized_addr_from_visible_expr(&semantic, depth + 1)
-                {
-                    return Some(addr);
-                }
-                if let Some(def) = self
-                    .lookup_definition(&self.spelling(*name))
-                    && !matches!(&def, CExpr::Var(inner) if inner == name)
-                    && let Some(addr) = self.normalized_addr_from_visible_expr(&def, depth + 1)
-                {
-                    return Some(addr);
-                }
-                if self.is_named_scalar_local(&self.spelling(*name))
-                    || (!self.is_low_signal_visible_name(&self.spelling(*name))
-                        && !self.is_transient_visible_name(&self.spelling(*name))
-                        && !is_generic_stack_placeholder_alias(&self.spelling(*name))
-                        && self.stack_offset_for_visible_storage_name(&self.spelling(*name)).is_some())
-                {
-                    return None;
-                }
-                if let Some(offset) = self.stack_offset_for_visible_storage_name(&self.spelling(*name)) {
-                    return Some(analysis::NormalizedAddr {
-                        base: analysis::BaseRef::StackSlot(offset),
-                        index: None,
-                        scale_bytes: 0,
-                        offset_bytes: 0,
-                    });
-                }
-                None
-            }
-            CExpr::Binary {
-                op: BinaryOp::Add,
-                left,
-                right,
-            } => {
-                if let Some(delta) = self.literal_to_i64(right)
-                    && let Some(mut addr) = self.normalized_addr_from_visible_expr(left, depth + 1)
-                {
-                    addr.offset_bytes = addr.offset_bytes.saturating_add(delta);
-                    return Some(addr);
-                }
-                if let Some(delta) = self.literal_to_i64(left)
-                    && let Some(mut addr) = self.normalized_addr_from_visible_expr(right, depth + 1)
-                {
-                    addr.offset_bytes = addr.offset_bytes.saturating_add(delta);
-                    return Some(addr);
-                }
-                if let Some((index, scale)) = self.extract_visible_scaled_index(right, depth + 1)
-                    && let Some(mut addr) = self.normalized_addr_from_visible_expr(left, depth + 1)
-                    && addr.index.is_none()
-                {
-                    addr.index = Some(index);
-                    addr.scale_bytes = scale;
-                    return Some(addr);
-                }
-                if let Some((index, scale, offset)) =
-                    self.extract_visible_scaled_index_with_offset(right, depth + 1)
-                    && let Some(mut addr) = self.normalized_addr_from_visible_expr(left, depth + 1)
-                    && addr.index.is_none()
-                {
-                    addr.index = Some(index);
-                    addr.scale_bytes = scale;
-                    addr.offset_bytes = addr.offset_bytes.saturating_add(offset);
-                    return Some(addr);
-                }
-                if let Some((index, scale)) = self.extract_visible_scaled_index(left, depth + 1)
-                    && let Some(mut addr) = self.normalized_addr_from_visible_expr(right, depth + 1)
-                    && addr.index.is_none()
-                {
-                    addr.index = Some(index);
-                    addr.scale_bytes = scale;
-                    return Some(addr);
-                }
-                if let Some((index, scale, offset)) =
-                    self.extract_visible_scaled_index_with_offset(left, depth + 1)
-                    && let Some(mut addr) = self.normalized_addr_from_visible_expr(right, depth + 1)
-                    && addr.index.is_none()
-                {
-                    addr.index = Some(index);
-                    addr.scale_bytes = scale;
-                    addr.offset_bytes = addr.offset_bytes.saturating_add(offset);
-                    return Some(addr);
-                }
-                None
-            }
-            CExpr::Binary {
-                op: BinaryOp::Sub,
-                left,
-                right,
-            } => {
-                if let Some(delta) = self.literal_to_i64(right)
-                    && let Some(mut addr) = self.normalized_addr_from_visible_expr(left, depth + 1)
-                {
-                    addr.offset_bytes = addr.offset_bytes.saturating_sub(delta);
-                    return Some(addr);
-                }
-                if let Some((index, scale)) = self.extract_visible_scaled_index(right, depth + 1)
-                    && let Some(mut addr) = self.normalized_addr_from_visible_expr(left, depth + 1)
-                    && addr.index.is_none()
-                {
-                    addr.index = Some(index);
-                    addr.scale_bytes = scale.saturating_neg();
-                    return Some(addr);
-                }
-                if let Some((index, scale, offset)) =
-                    self.extract_visible_scaled_index_with_offset(right, depth + 1)
-                    && let Some(mut addr) = self.normalized_addr_from_visible_expr(left, depth + 1)
-                    && addr.index.is_none()
-                {
-                    addr.index = Some(index);
-                    addr.scale_bytes = scale.saturating_neg();
-                    addr.offset_bytes = addr.offset_bytes.saturating_sub(offset);
-                    return Some(addr);
-                }
-                None
-            }
-            _ => None,
-        }
-    }
-
     fn render_memory_access_by_name(
         &self,
         name: &str,
@@ -3699,58 +2793,6 @@ impl<'a> FoldingContext<'a> {
             }
             analysis::SemanticValue::Unknown => None,
         }
-    }
-
-    fn render_exact_member_from_raw_subscript(
-        &self,
-        base: &CExpr,
-        index: &CExpr,
-        depth: u32,
-        visited: &mut HashSet<String>,
-    ) -> Option<CExpr> {
-        if depth > Self::MAX_SEMANTIC_RENDER_DEPTH {
-            return None;
-        }
-        let subscript_index = self.literal_to_i64(index)?;
-        if subscript_index <= 0 {
-            return None;
-        }
-        let mut addr = self.normalized_addr_from_visible_expr(base, depth + 1)?;
-        if addr.offset_bytes < 0 {
-            return None;
-        }
-
-        let aggregate_ty =
-            self.infer_elem_type_from_base_ref(&addr.base, addr.scale_bytes.unsigned_abs() as u32);
-        let base_offset = u64::try_from(addr.offset_bytes).ok()?;
-        let index = u64::try_from(subscript_index).ok()?;
-        let mut widths = BTreeSet::from([1_u32, 2, 4, 8, 16]);
-        widths.insert(self.inputs.arch.ptr_size.max(1));
-        let mut candidates = widths
-            .into_iter()
-            .filter_map(|width| {
-                let field_offset = base_offset.checked_add(index.checked_mul(u64::from(width))?)?;
-                if self.exact_field_offset_is_pointer(&aggregate_ty, field_offset) {
-                    return None;
-                }
-                let field = self
-                    .exact_field_name_from_type_hint(&aggregate_ty, field_offset, width)
-                    .or_else(|| {
-                        let mut field_addr = addr.clone();
-                        field_addr.offset_bytes = i64::try_from(field_offset).ok()?;
-                        self.exact_oracle_field_name_for_addr(&field_addr, field_offset)
-                    })?;
-                Some((field_offset, width, field))
-            })
-            .collect::<Vec<_>>();
-        candidates.sort();
-        candidates.dedup();
-        let [(field_offset, access_size, _)] = candidates.as_slice() else {
-            return None;
-        };
-        addr.offset_bytes = i64::try_from(*field_offset).ok()?;
-        self.render_access_expr_from_addr(&addr, *access_size, false, depth + 1, visited)
-            .filter(Self::expr_is_structured_memory_candidate)
     }
 
     fn infer_elem_type_from_base_ref(&self, base: &analysis::BaseRef, element_size: u32) -> CType {
@@ -4038,107 +3080,6 @@ impl<'a> FoldingContext<'a> {
         !base_pointer && index_pointer
     }
 
-    fn normalize_index_expr(&self, expr: &CExpr, depth: u32) -> Option<CExpr> {
-        if depth > 4 {
-            return self.is_semantic_index_expr(expr).then_some(expr.clone());
-        }
-
-        match expr {
-            CExpr::Var(name) => {
-                let resolved_definition = self
-                    .lookup_definition(&self.spelling(*name))
-                    .or_else(|| self.best_visible_definition(&self.spelling(*name)));
-                if !self.is_low_signal_visible_name(&self.spelling(*name))
-                    && !self.is_transient_visible_name(&self.spelling(*name))
-                    && !self.is_non_index_pointer_expr(expr)
-                    && self.is_semantic_index_expr(expr)
-                {
-                    return Some(expr.clone());
-                }
-                if let Some(inner) = resolved_definition
-                    && let Some(normalized) = self.normalize_index_expr(&inner, depth + 1)
-                    && !self.is_non_index_pointer_expr(&normalized)
-                {
-                    return Some(normalized);
-                }
-                if self.lookup_definition(&self.spelling(*name)).is_some()
-                    || self.best_visible_definition(&self.spelling(*name)).is_some()
-                {
-                    return None;
-                }
-                if self.is_non_index_pointer_expr(expr) {
-                    None
-                } else {
-                    self.is_semantic_index_expr(expr).then_some(expr.clone())
-                }
-            }
-            CExpr::Paren(inner) => self
-                .normalize_index_expr(inner, depth + 1)
-                .map(|normalized| CExpr::Paren(Box::new(normalized))),
-            CExpr::Cast { ty, expr: inner } => self
-                .normalize_index_expr(inner, depth + 1)
-                .map(|normalized| CExpr::cast(ty.clone(), normalized)),
-            CExpr::Unary { op, operand } => self
-                .normalize_index_expr(operand, depth + 1)
-                .map(|normalized| CExpr::unary(*op, normalized)),
-            _ => self.is_semantic_index_expr(expr).then_some(expr.clone()),
-        }
-    }
-
-    fn is_semantic_index_expr(&self, expr: &CExpr) -> bool {
-        self.is_semantic_index_expr_with_depth(expr, 0, &mut HashSet::new())
-    }
-
-    fn is_semantic_index_expr_with_depth(
-        &self,
-        expr: &CExpr,
-        depth: u32,
-        visited: &mut HashSet<String>,
-    ) -> bool {
-        if depth > MAX_SIMPLE_EXPR_DEPTH {
-            return false;
-        }
-        match expr {
-            CExpr::Var(name) => {
-                let visit_key = format!("index:{}", self.spelling(*name).to_ascii_lowercase());
-                if !visited.insert(visit_key.clone()) {
-                    return false;
-                }
-                if let Some(inner) = self.direct_definition_expr(&self.spelling(*name))
-                    && inner != *expr
-                    && self.is_semantic_index_expr_with_depth(&inner, depth + 1, visited)
-                {
-                    visited.remove(&visit_key);
-                    return true;
-                }
-                let lower = self.spelling(*name).to_ascii_lowercase();
-                let name_kind = SSAVarNameKind::classify(&self.spelling(*name));
-                let stack_placeholder =
-                    lower == "stack" || lower == "saved_fp" || lower.starts_with("stack_");
-                let result = !name_kind.is_constant()
-                    && !name_kind.is_memory()
-                    && !stack_placeholder
-                    && (self.is_static_param_home_alias_name(*name)
-                        || self.stack_slot_provenance_for_name(&self.spelling(*name)).is_none()
-                        || lower.starts_with("local_")
-                        || lower.starts_with("arg"));
-                visited.remove(&visit_key);
-                result
-            }
-            CExpr::Unary { operand, .. } => {
-                self.is_semantic_index_expr_with_depth(operand, depth + 1, visited)
-            }
-            CExpr::Binary { left, right, .. } => {
-                self.is_semantic_index_expr_with_depth(left, depth + 1, visited)
-                    || self.is_semantic_index_expr_with_depth(right, depth + 1, visited)
-            }
-            CExpr::Paren(inner) | CExpr::Cast { expr: inner, .. } => {
-                self.is_semantic_index_expr_with_depth(inner, depth + 1, visited)
-            }
-            _ => false,
-        }
-    }
-
     fn is_non_index_pointer_expr(&self, expr: &CExpr) -> bool {
         match expr {
             CExpr::Cast { ty, .. } => matches!(ty, CType::Pointer(_)),
@@ -4206,91 +3147,6 @@ impl<'a> FoldingContext<'a> {
             return None;
         }
         Some(ty)
-    }
-
-    #[cfg(test)]
-    pub(super) fn stack_slot_provenance_for_name(
-        &self,
-        name: &str,
-    ) -> Option<analysis::StackSlotProvenance> {
-        let provenance = self.use_info().render_stack_slot_for_name(name)?;
-        Some(provenance)
-    }
-    #[cfg(not(test))]
-    pub(super) fn stack_slot_provenance_for_name(
-        &self,
-        _name: &str,
-    ) -> Option<analysis::StackSlotProvenance> {
-        None
-    }
-
-    pub(super) fn stack_slot_provenance_for_var(
-        &self,
-        var: &SSAVar,
-    ) -> Option<analysis::StackSlotProvenance> {
-        let value = self.prepared_value_id_for_var(var)?;
-        self.use_info().stack_slots_by_value.get(&value).copied()
-    }
-
-    fn is_autogenerated_stack_home_name(&self, name: &str) -> bool {
-
-        let lower = name.to_ascii_lowercase();
-        let has_hexish_suffix = |prefix: &str| {
-            lower.strip_prefix(prefix).is_some_and(|suffix| {
-                !suffix.is_empty() && suffix.chars().all(|ch| ch.is_ascii_hexdigit() || ch == 'h')
-            })
-        };
-        lower == "saved_fp"
-            || lower.starts_with("stack_")
-            || has_hexish_suffix("local_")
-            || has_hexish_suffix("var_")
-    }
-
-    fn is_static_param_home_alias_name(&self, name: crate::symbol::SymbolId) -> bool {
-        let name_id = name;
-        let name = &self.spelling(name_id);
-
-        let normalized = name.trim();
-        !normalized.is_empty()
-            && self.inputs.stack_slots.iter().any(|(_, slot)| {
-                matches!(slot.role, ExternalStackSlotRole::ParamHome)
-                    && (slot
-                        .param_name
-                        .as_deref()
-                        .map(str::trim)
-                        .is_some_and(|param_name| param_name.eq_ignore_ascii_case(normalized))
-                        || slot
-                            .source_reg
-                            .as_deref()
-                            .and_then(|reg| self.arg_alias_for_register_name(reg))
-                            .is_some_and(|alias| alias.eq_ignore_ascii_case(normalized)))
-            })
-    }
-
-    fn is_named_scalar_local(&self, name: &str) -> bool {
-
-        (self.stack_slot_provenance_for_name(name).is_some()
-            || self
-                .stack_offset_for_visible_storage_name(name)
-                .is_some_and(|offset| offset < 0))
-            && !self.is_autogenerated_stack_home_name(name)
-            && !self.is_low_signal_visible_name(name)
-            && !self.is_transient_visible_name(name)
-    }
-
-    pub(super) fn is_generic_stack_local_owner_name(&self, name: &str) -> bool {
-
-        let lower = name.to_ascii_lowercase();
-        (self
-            .stack_slot_provenance_for_name(name)
-            .is_some_and(|slot| slot.offset < 0)
-            || self
-                .stack_offset_for_visible_storage_name(name)
-                .is_some_and(|offset| offset < 0))
-            && !self.is_transient_visible_name(name)
-            && !is_generic_stack_placeholder_alias(name)
-            && lower != "saved_fp"
-            && !lower.starts_with("stack_")
     }
 
     pub(crate) fn should_materialize_call_result_at_source(
@@ -4369,115 +3225,12 @@ impl<'a> FoldingContext<'a> {
         self.prepared_semantic_view()?.call_result_source_for_var(var)
     }
 
-    pub(super) fn local_post_call_source_for_var(&self, var: &SSAVar) -> Option<(u64, usize)> {
-        let block_addr = self.current_block_addr.get()?;
-        let func = self
-            .inputs
-            .prepared_ssa
-            .map(|prepared| prepared.function())?;
-        let block = func.get_block(block_addr)?;
-        self.local_post_call_source_for_var_in_block(block, var, 0)
-    }
-
-    pub(super) fn local_post_call_source_for_var_in_block(
-        &self,
-        block: &SSABlock,
-        var: &SSAVar,
-        depth: u32,
-    ) -> Option<(u64, usize)> {
-        if depth > 16 {
-            return None;
-        }
-
-        let producer_idx = block.ops.iter().rposition(|op| op.dst() == Some(var))?;
-        let producer_op = block.ops.get(producer_idx)?;
-
-        match producer_op {
-            SSAOp::Copy { src, .. }
-            | SSAOp::Cast { src, .. }
-            | SSAOp::IntZExt { src, .. }
-            | SSAOp::IntSExt { src, .. }
-            | SSAOp::Trunc { src, .. } => {
-                self.local_post_call_source_for_var_in_block(block, src, depth + 1)
-            }
-            SSAOp::Load {
-                space: r2il::SpaceId::Ram,
-                addr,
-                ..
-            } => {
-                let load_offset = self.extract_stack_offset_from_var(addr)?;
-                block
-                    .ops
-                    .iter()
-                    .enumerate()
-                    .take(producer_idx)
-                    .rev()
-                    .find_map(|(_, op)| match op {
-                        SSAOp::Store {
-                            space: r2il::SpaceId::Ram,
-                            addr: store_addr,
-                            val,
-                            ..
-                        } if self.extract_stack_offset_from_var(store_addr)
-                            == Some(load_offset) =>
-                        {
-                            self.call_result_source_for_var(val)
-                                .or_else(|| {
-                                    self.local_post_call_source_for_var_in_block(block, val, depth + 1)
-                                })
-                        }
-                        _ => None,
-                    })
-            }
-            SSAOp::CallDefine { .. } => block
-                .ops
-                .iter()
-                .enumerate()
-                .take(producer_idx)
-                .rev()
-                .find_map(|(idx, op)| match op {
-                    SSAOp::Call { .. } | SSAOp::CallInd { .. } => Some((block.addr, idx)),
-                    _ => None,
-                }),
-            _ => None,
-        }
-    }
-
     pub(super) fn stable_owned_call_result_expr_for_var(
         &self,
         var: &SSAVar,
     ) -> Option<CExpr> {
-        let source_call = self
-            .call_result_source_for_var(var)
-            .or_else(|| self.local_post_call_source_for_var(var))?;
+        let source_call = self.call_result_source_for_var(var)?;
         self.stable_owned_call_result_expr_for_source(source_call)
-    }
-
-    pub(super) fn predicate_owned_call_result_expr_for_source(
-        &self,
-        source_call: (u64, usize),
-    ) -> Option<CExpr> {
-        let owner = self
-            .stable_owned_call_result_expr_for_source(source_call)?;
-        let CExpr::Var(owner_name) = owner else {
-            return None;
-        };
-        (!is_generic_arg_name(&self.spelling(owner_name))
-            && !self.inputs.arch.is_return_register_name(&self.spelling(owner_name))
-            && !self.is_low_signal_visible_name(&self.spelling(owner_name))
-            && !self.is_transient_visible_name(&self.spelling(owner_name))
-            && !self.spelling(owner_name).ends_with("_home")
-            && !self.spelling(owner_name).starts_with("var_")
-            && !self.spelling(owner_name).starts_with("local_")
-            && !self.spelling(owner_name).starts_with("stack_")
-            && !self.spelling(owner_name).starts_with("arg_"))
-        .then_some(CExpr::Var(owner_name))
-    }
-
-    pub(super) fn predicate_owned_call_result_expr_for_var(&self, var: &SSAVar) -> Option<CExpr> {
-        self.call_result_source_for_var(var)
-            .or_else(|| self.local_post_call_source_for_var(var))
-            .and_then(|source| self.predicate_owned_call_result_expr_for_source(source))
     }
 
     fn expr_is_stack_base_like(&self, expr: &CExpr) -> bool {
@@ -4565,13 +3318,7 @@ impl<'a> FoldingContext<'a> {
             CExpr::Member { base, .. } | CExpr::PtrMember { base, .. } => {
                 self.expr_contains_raw_stack_base_arithmetic(base)
             }
-            CExpr::Var(name) => {
-                self.is_non_index_pointer_expr(expr)
-                    && !matches!(
-                        self.stack_slot_provenance_for_name(&self.spelling(*name)),
-                        Some(slot) if slot.is_scalar_predicate_carrier() || slot.is_scalar_return_carrier()
-                    )
-            }
+            CExpr::Var(_) => false,
             CExpr::Cast { ty, expr: inner } => {
                 matches!(ty, CType::Pointer(_))
                     || self.expr_is_address_artifact_in_scalar_context(inner)
@@ -4633,19 +3380,6 @@ impl<'a> FoldingContext<'a> {
             VisibleExprContext::Generic,
         )
     }
-
-    pub(super) fn choose_preferred_scalar_predicate_expr(
-        &self,
-        current: Option<CExpr>,
-        candidate: Option<CExpr>,
-    ) -> Option<CExpr> {
-        self.choose_preferred_visible_expr_in_context(
-            current,
-            candidate,
-            VisibleExprContext::ScalarPredicate,
-        )
-    }
-
     fn choose_preferred_visible_expr_in_context(
         &self,
         current: Option<CExpr>,
@@ -4678,39 +3412,6 @@ impl<'a> FoldingContext<'a> {
             && !is_generic_stack_placeholder_alias(stripped)
     }
 
-    pub(super) fn best_visible_definition(&self, name: &str) -> Option<CExpr> {
-
-        if !self.enter_resolution_guard(ResolutionPhase::Visible, name) {
-            return self.resolution_cycle_fallback(name);
-        }
-        let result = self.best_visible_definition_in_context(name, VisibleExprContext::Generic);
-        self.leave_resolution_guard(ResolutionPhase::Visible, name);
-        result
-    }
-
-    fn best_visible_definition_in_context(
-        &self,
-        name: &str,
-        context: VisibleExprContext,
-    ) -> Option<CExpr> {
-
-        self.best_visible_definition_in_context_with_depth(name, context, 0, &mut HashSet::new())
-    }
-
-    fn best_visible_definition_in_context_with_depth(
-        &self,
-        name: &str,
-        context: VisibleExprContext,
-        depth: u32,
-        visited: &mut HashSet<String>,
-    ) -> Option<CExpr> {
-        self.choose_preferred_visible_expr_in_context(
-            self.lookup_definition_with_depth(name, depth, visited),
-            None,
-            context,
-        )
-    }
-
     fn visible_expr_quality_in_context(
         &self,
         expr: &CExpr,
@@ -4718,19 +3419,6 @@ impl<'a> FoldingContext<'a> {
     ) -> VisibleExprQuality {
         let mut quality = VisibleExprQuality::default();
         self.accumulate_visible_expr_quality(expr, &mut quality, 0, context);
-        if matches!(context, VisibleExprContext::ScalarPredicate)
-            && self.is_predicate_like_expr(expr)
-        {
-            quality.predicate_signal += 12;
-            quality.scalar_signal += 4;
-        }
-        if matches!(
-            context,
-            VisibleExprContext::ScalarPredicate
-        ) && self.expr_contains_raw_stack_base_arithmetic(expr)
-        {
-            quality.address_shape_penalty -= 24;
-        }
         quality
     }
 
@@ -4772,55 +3460,6 @@ impl<'a> FoldingContext<'a> {
                 } else {
                     quality.semantic_names += 3;
                 }
-                if matches!(
-                    context,
-                    VisibleExprContext::ScalarPredicate
-                ) {
-                    if self.arg_alias_for_rendered_name(&self.spelling(*name)).is_some() || is_generic_arg_name(&self.spelling(*name))
-                    {
-                        quality.scalar_signal += 12;
-                    }
-                    if self.lookup_predicate_expr(&self.spelling(*name)).is_some()
-                        || self.is_condition_name(&self.spelling(*name))
-                    {
-                        quality.predicate_signal += 8;
-                        quality.scalar_signal += 4;
-                    }
-                    if self.is_named_scalar_local(&self.spelling(*name)) {
-                        quality.scalar_signal += 6;
-                    }
-                    if self.is_autogenerated_stack_home_name(&self.spelling(*name))
-                        && self.stack_slot_provenance_for_name(&self.spelling(*name)).is_some()
-                        && !self.is_generic_stack_local_owner_name(&self.spelling(*name))
-                    {
-                        quality.stack_home_penalty -= 18;
-                    }
-                    if self.is_generic_stack_local_owner_name(&self.spelling(*name)) {
-                        quality.generic_stack_penalty -= 8;
-                    }
-                    if matches!(
-                        self.stack_slot_provenance_for_name(&self.spelling(*name)),
-                        Some(slot)
-                            if slot.is_scalar_predicate_carrier()
-                                || slot.is_scalar_return_carrier()
-                    ) {
-                        if self.is_named_scalar_local(&self.spelling(*name)) {
-                            quality.scalar_signal += 4;
-                        } else {
-                            quality.generic_stack_penalty -= 4;
-                        }
-                    }
-                    if self.is_non_index_pointer_expr(expr)
-                        && !matches!(
-                            self.stack_slot_provenance_for_name(&self.spelling(*name)),
-                            Some(slot)
-                                if slot.is_scalar_predicate_carrier()
-                                    || slot.is_scalar_return_carrier()
-                        )
-                    {
-                        quality.address_shape_penalty -= 20;
-                    }
-                }
             }
             CExpr::Subscript { base, index } => {
                 quality.semantic_shapes += 6;
@@ -4828,51 +3467,19 @@ impl<'a> FoldingContext<'a> {
                 if self.is_non_index_pointer_expr(index) {
                     quality.transient_reg_penalty -= 10;
                 }
-                if matches!(
-                    context,
-                    VisibleExprContext::ScalarPredicate
-                ) {
-                    quality.scalar_signal += 8;
-                }
                 self.accumulate_visible_expr_quality(base, quality, depth + 1, context);
                 self.accumulate_visible_expr_quality(index, quality, depth + 1, context);
             }
             CExpr::Member { base, .. } | CExpr::PtrMember { base, .. } => {
                 quality.semantic_shapes += 7;
                 quality.stable_pointer_shapes += 2;
-                if matches!(
-                    context,
-                    VisibleExprContext::ScalarPredicate
-                ) {
-                    quality.scalar_signal += 8;
-                }
                 self.accumulate_visible_expr_quality(base, quality, depth + 1, context);
             }
             CExpr::Deref(inner) | CExpr::AddrOf(inner) => {
                 quality.stable_pointer_shapes += 1;
-                if matches!(expr, CExpr::AddrOf(_))
-                    && matches!(
-                        context,
-                        VisibleExprContext::ScalarPredicate
-                    )
-                {
-                    quality.address_shape_penalty -= 30;
-                } else if matches!(
-                    context,
-                    VisibleExprContext::ScalarPredicate
-                ) {
-                    quality.scalar_signal += 4;
-                }
                 self.accumulate_visible_expr_quality(inner, quality, depth + 1, context);
             }
-            CExpr::Cast { ty, expr: inner } => {
-                if matches!(
-                    context,
-                    VisibleExprContext::ScalarPredicate
-                ) && matches!(ty, CType::Pointer(_))
-                {
-                    quality.address_shape_penalty -= 24;
-                }
+            CExpr::Cast { expr: inner, .. } => {
                 self.accumulate_visible_expr_quality(inner, quality, depth + 1, context);
             }
             CExpr::Paren(inner) | CExpr::Unary { operand: inner, .. } => {
@@ -4884,13 +3491,6 @@ impl<'a> FoldingContext<'a> {
                         || self.literal_to_i64(right).is_some_and(|lit| lit == 0))
                 {
                     quality.zero_offset_penalty -= 10;
-                }
-                if matches!(
-                    context,
-                    VisibleExprContext::ScalarPredicate
-                ) && self.expr_contains_raw_stack_base_arithmetic(expr)
-                {
-                    quality.address_shape_penalty -= 18;
                 }
                 self.accumulate_visible_expr_quality(left, quality, depth + 1, context);
                 self.accumulate_visible_expr_quality(right, quality, depth + 1, context);
@@ -4963,7 +3563,6 @@ impl<'a> FoldingContext<'a> {
         let base = lower.split('_').next().unwrap_or(lower.as_str());
         self.inputs.arch.is_register_like_base_name(base)
             && !Self::is_semantic_binding_name(base)
-            && self.arg_alias_for_rendered_name(name).is_none()
     }
 
     /// The type a name takes from the call whose result it owns.
@@ -5002,50 +3601,14 @@ impl<'a> FoldingContext<'a> {
         }
     }
 
-    fn root_visible_name_in_expr(&self, expr: &CExpr) -> Option<std::rc::Rc<str>> {
-        match expr.unobserved() {
-            CExpr::Var(name) => Some(self.spelling(*name)),
-            CExpr::Cast { expr: inner, .. } | CExpr::Paren(inner) => {
-                self.root_visible_name_in_expr(inner)
-            }
-            _ => None,
-        }
-    }
-
     fn should_preserve_indirect_local_deref(&self, expr: &CExpr) -> bool {
-        let is_pointer_like_owner = |ctx: &FoldingContext<'_>, name: &str, expr: &CExpr| {
-            ctx.is_named_scalar_local(name)
-                && matches!(
-                    ctx.expr_type_hint(expr),
-                    Some(CType::Pointer(_)) | Some(CType::Array(_, _))
-                )
-        };
-
-        let Some(name) = self.root_visible_name_in_expr(expr) else {
-            return false;
-        };
-        if is_pointer_like_owner(self, &*name, expr) {
-            return true;
-        }
-
-        let root = self.resolve_copy_root_name_in_fold(&*name);
-        if root.as_str() != &*name && is_pointer_like_owner(self, &root, expr) {
-            return true;
-        }
-
-        false
+        matches!(
+            self.expr_type_hint(expr),
+            Some(CType::Pointer(_)) | Some(CType::Array(_, _))
+        )
     }
 
     fn typed_deref_expr(&self, addr: &SSAVar, addr_expr: CExpr, elem_ty: CType) -> CExpr {
-        let elem_size = elem_ty.bits().map(|bits| bits.div_ceil(8)).unwrap_or(0);
-        if let Some(shape) = self.normalized_addr_from_visible_expr(&addr_expr, 0) {
-            let mut visited = HashSet::new();
-            if let Some(access) =
-                self.render_access_expr_from_addr(&shape, elem_size, false, 0, &mut visited)
-            {
-                return access;
-            }
-        }
         if let Some(indexed) = self.indexed_pointer_add_expr(&addr_expr, &elem_ty) {
             return indexed;
         }
@@ -5126,12 +3689,6 @@ impl<'a> FoldingContext<'a> {
             _ => None,
         }
     }
-
-    pub(super) fn expr_is_carrier_reference(&self, expr: &CExpr) -> bool {
-        let _ = expr;
-        false
-    }
-
     fn cast_needed(&self, target: &CType, source: Option<&CType>) -> bool {
         let Some(source) = source else {
             return false;
@@ -5353,39 +3910,7 @@ impl<'a> FoldingContext<'a> {
                     }
                 }
             }
-            _ => {
-                let name = value.display_name();
-                let mut visited = HashSet::new();
-                match self
-                    .render_semantic_value_by_name(&name, 0, &mut visited)
-                    .or_else(|| self.best_visible_definition(&name))
-                {
-                    Some(expr) => expr,
-                    None => self.retain_lowering_result(self.get_expr(value))?,
-                }
-            }
-        };
-        let elem_ty = self
-            .type_hint_for_var(value)
-            .unwrap_or_else(|| type_from_size(value.size));
-        let candidate = self
-            .indexed_pointer_add_expr(&candidate, &elem_ty)
-            .or_else(|| {
-                (!FoldingContext::expr_is_scalar_memory_candidate(&candidate)
-                    && !matches!(elem_ty, CType::Pointer(_) | CType::Array(_, _))
-                    && self
-                        .normalized_addr_from_visible_expr(&candidate, 0)
-                        .is_some())
-                .then(|| self.typed_deref_expr(value, candidate.clone(), elem_ty.clone()))
-            })
-            .unwrap_or(candidate);
-        let mut semantic_visited = HashSet::new();
-        let semanticized = self.semanticize_visible_expr(&candidate, 0, &mut semantic_visited);
-        let candidate = match self
-            .choose_preferred_visible_expr(Some(candidate), Some(semanticized))
-        {
-            Some(expr) => expr,
-            None => self.retain_lowering_result(self.get_expr(value))?,
+            _ => self.retain_lowering_result(self.get_expr(value))?,
         };
         (!expr_contains_call(&candidate)).then_some(candidate)
     }
@@ -5917,26 +4442,7 @@ impl<'a> FoldingContext<'a> {
                     .map(|arg| self.semanticize_visible_expr(arg, depth + 1, visited))
                     .collect(),
             },
-            CExpr::Subscript { base, index } => {
-                let semantic_base = self.semanticize_visible_expr(base, depth + 1, visited);
-                let semantic_index = self.semanticize_visible_expr(index, depth + 1, visited);
-                let rebuilt = CExpr::Subscript {
-                    base: Box::new(semantic_base.clone()),
-                    index: Box::new(semantic_index.clone()),
-                };
-                let access = self.render_exact_member_from_raw_subscript(
-                    &semantic_base,
-                    &semantic_index,
-                    depth + 1,
-                    visited,
-                );
-                if let Some(access) = access
-                    && self.prefers_visible_expr(&rebuilt, &access)
-                {
-                    return access;
-                }
-                rebuilt
-            }
+            CExpr::Subscript { .. } => expr.clone(),
             CExpr::Member { base, member } => CExpr::Member {
                 base: Box::new(self.semanticize_visible_expr(base, depth + 1, visited)),
                 member: member.clone(),
@@ -5980,36 +4486,6 @@ impl<'a> FoldingContext<'a> {
             | CExpr::SizeofType(_) => expr.clone(),
         }
     }
-
-    fn canonicalize_visible_address_expr(&self, expr: &CExpr, depth: u32) -> CExpr {
-        if depth > Self::MAX_SEMANTIC_RENDER_DEPTH {
-            return expr.clone();
-        }
-
-        match expr {
-            CExpr::Paren(inner) => CExpr::Paren(Box::new(
-                self.canonicalize_visible_address_expr(inner, depth + 1),
-            )),
-            CExpr::Cast { ty, expr: inner } => CExpr::cast(
-                ty.clone(),
-                self.canonicalize_visible_address_expr(inner, depth + 1),
-            ),
-            CExpr::Unary { op, operand } => CExpr::unary(
-                *op,
-                self.canonicalize_visible_address_expr(operand, depth + 1),
-            ),
-            CExpr::Binary { op, left, right } => {
-                let left = self.canonicalize_visible_address_expr(left, depth + 1);
-                let right = self.canonicalize_visible_address_expr(right, depth + 1);
-                if matches!(op, BinaryOp::BitXor) && left == right {
-                    return CExpr::IntLit(0);
-                }
-                self.identity_simplify_binary(*op, left, right, None)
-            }
-            _ => expr.clone(),
-        }
-    }
-
     fn call_result_source_for_idempotent_operand(&self, expr: &CExpr) -> Option<(u64, usize)> {
         match expr {
             // A rendered binding may cover several SSA values. Without the
@@ -6020,164 +4496,6 @@ impl<'a> FoldingContext<'a> {
             }
             _ => None,
         }
-    }
-
-    fn evaluate_constish_call_arg_expr(&self, expr: &CExpr, depth: u32) -> Option<u64> {
-        let mut visited = HashSet::new();
-        self.evaluate_constish_call_arg_expr_with_visited(expr, depth, &mut visited)
-    }
-
-    fn evaluate_constish_call_arg_expr_with_visited(
-        &self,
-        expr: &CExpr,
-        depth: u32,
-        visited: &mut HashSet<String>,
-    ) -> Option<u64> {
-        if depth > Self::MAX_SEMANTIC_RENDER_DEPTH {
-            return None;
-        }
-
-        match expr {
-            CExpr::IntLit(value) => (*value >= 0).then_some(*value as u64),
-            CExpr::UIntLit(value) => Some(*value),
-            CExpr::External { .. } => None,
-            // A rendered identifier does not prove a literal or address. Exact
-            // constants arrive as literal projections before this evaluator.
-            CExpr::Var(_) => None,
-            CExpr::Paren(inner) | CExpr::AddrOf(inner) => {
-                self.evaluate_constish_call_arg_expr_with_visited(inner, depth + 1, visited)
-            }
-            CExpr::Cast { expr: inner, .. } => {
-                self.evaluate_constish_call_arg_expr_with_visited(inner, depth + 1, visited)
-            }
-            CExpr::Binary {
-                op: BinaryOp::Add,
-                left,
-                right,
-            } => self
-                .evaluate_constish_call_arg_expr_with_visited(left, depth + 1, visited)?
-                .checked_add(self.evaluate_constish_call_arg_expr_with_visited(
-                    right,
-                    depth + 1,
-                    visited,
-                )?),
-            CExpr::Binary {
-                op: BinaryOp::Sub,
-                left,
-                right,
-            } => self
-                .evaluate_constish_call_arg_expr_with_visited(left, depth + 1, visited)?
-                .checked_sub(self.evaluate_constish_call_arg_expr_with_visited(
-                    right,
-                    depth + 1,
-                    visited,
-                )?),
-            _ => None,
-        }
-    }
-
-    fn resolve_literalish_call_arg_expr(&self, expr: &CExpr) -> Option<CExpr> {
-        let mut visited = HashSet::new();
-        self.resolve_literalish_call_arg_expr_with_visited(expr, &mut visited)
-    }
-
-    fn resolve_literalish_call_arg_expr_with_visited(
-        &self,
-        expr: &CExpr,
-        visited: &mut HashSet<String>,
-    ) -> Option<CExpr> {
-        if let CExpr::Var(name) = expr {
-            let visit_key = format!("rendered:{}", self.spelling(*name).to_ascii_lowercase());
-            if !visited.insert(visit_key.clone()) {
-                return None;
-            }
-
-            if let Some(def) = self
-                .lookup_definition_raw(&self.spelling(*name))
-                .or_else(|| self.best_visible_definition(&self.spelling(*name)))
-                && def != *expr
-                && let Some(resolved) =
-                    self.resolve_literalish_call_arg_expr_with_visited(&def, visited)
-            {
-                visited.remove(&visit_key);
-                return Some(resolved);
-            }
-            visited.remove(&visit_key);
-        }
-
-        let direct_addr = self.evaluate_constish_call_arg_expr(expr, 0);
-        let direct = direct_addr.and_then(|addr| self.literalish_call_arg_expr_for_addr(addr));
-        if direct.is_some() {
-            return direct;
-        }
-
-        let alt_addr = self.evaluate_hex_digit_offset_call_arg_expr(expr, 0)?;
-        self.literalish_call_arg_expr_for_addr(alt_addr)
-    }
-
-    fn literalish_call_arg_expr_for_addr(&self, addr: u64) -> Option<CExpr> {
-        let _ = addr;
-        None
-    }
-
-    fn evaluate_hex_digit_offset_call_arg_expr(&self, expr: &CExpr, depth: u32) -> Option<u64> {
-        if depth > Self::MAX_SEMANTIC_RENDER_DEPTH {
-            return None;
-        }
-
-        match expr {
-            CExpr::Paren(inner) | CExpr::AddrOf(inner) => {
-                self.evaluate_hex_digit_offset_call_arg_expr(inner, depth + 1)
-            }
-            CExpr::Cast { expr: inner, .. } => {
-                self.evaluate_hex_digit_offset_call_arg_expr(inner, depth + 1)
-            }
-            CExpr::Binary {
-                op: BinaryOp::Add,
-                left,
-                right,
-            } => {
-                let base = self.evaluate_constish_call_arg_expr(left, depth + 1)?;
-                let delta = self.hex_digit_literal_value(right, depth + 1)?;
-                base.checked_add(delta)
-            }
-            CExpr::Binary {
-                op: BinaryOp::Sub,
-                left,
-                right,
-            } => {
-                let base = self.evaluate_constish_call_arg_expr(left, depth + 1)?;
-                let delta = self.hex_digit_literal_value(right, depth + 1)?;
-                base.checked_sub(delta)
-            }
-            _ => None,
-        }
-    }
-
-    fn hex_digit_literal_value(&self, expr: &CExpr, depth: u32) -> Option<u64> {
-        if depth > Self::MAX_SEMANTIC_RENDER_DEPTH {
-            return None;
-        }
-
-        match expr {
-            CExpr::Paren(inner) | CExpr::AddrOf(inner) => {
-                self.hex_digit_literal_value(inner, depth + 1)
-            }
-            CExpr::Cast { expr: inner, .. } => self.hex_digit_literal_value(inner, depth + 1),
-            CExpr::IntLit(value) if *value >= 0 => {
-                self.reinterpret_decimal_digits_as_hex(*value as u64)
-            }
-            CExpr::UIntLit(value) => self.reinterpret_decimal_digits_as_hex(*value),
-            _ => None,
-        }
-    }
-
-    fn reinterpret_decimal_digits_as_hex(&self, value: u64) -> Option<u64> {
-        let digits = value.to_string();
-        if digits.is_empty() || digits.len() > 4 || !digits.chars().all(|ch| ch.is_ascii_digit()) {
-            return None;
-        }
-        u64::from_str_radix(&digits, 16).ok()
     }
 
     fn is_raw_register_public_call_arg_name(&self, name: &str) -> bool {
@@ -6429,10 +4747,7 @@ impl<'a> FoldingContext<'a> {
                 let certified_lhs =
                     self.render_certified_store_access_expr(addr, val, elem_ty.clone())?;
                 let lhs = certified_lhs.expr().clone();
-                let mut rhs = if let Some(source_call) = self
-                    .call_result_source_for_var(val)
-                    .or_else(|| self.local_post_call_source_for_var(val))
-                {
+                let mut rhs = if let Some(source_call) = self.call_result_source_for_var(val) {
                     match self
                         .call_result_exprs_map()
                         .get(&source_call)
@@ -6578,9 +4893,14 @@ impl<'a> FoldingContext<'a> {
                 BinaryOp::Div,
                 Some(uint_type_from_size(dst.size)),
             ),
-            SSAOp::IntSDiv { dst, a, b } => {
-                self.signed_divrem_stmt(frame, dst, a, b, BinaryOp::Div)
-            }
+            SSAOp::IntSDiv { dst, a, b } => self.binary_stmt_typed(
+                frame,
+                dst,
+                a,
+                b,
+                BinaryOp::Div,
+                Some(type_from_size(dst.size)),
+            ),
             SSAOp::IntRem { dst, a, b } => self.binary_stmt_typed(
                 frame,
                 dst,
@@ -6589,9 +4909,14 @@ impl<'a> FoldingContext<'a> {
                 BinaryOp::Mod,
                 Some(uint_type_from_size(dst.size)),
             ),
-            SSAOp::IntSRem { dst, a, b } => {
-                self.signed_divrem_stmt(frame, dst, a, b, BinaryOp::Mod)
-            }
+            SSAOp::IntSRem { dst, a, b } => self.binary_stmt_typed(
+                frame,
+                dst,
+                a,
+                b,
+                BinaryOp::Mod,
+                Some(type_from_size(dst.size)),
+            ),
             SSAOp::IntAnd { dst, a, b } => self.binary_stmt(frame, dst, a, b, BinaryOp::BitAnd),
             SSAOp::IntOr { dst, a, b } => self.binary_stmt(frame, dst, a, b, BinaryOp::BitOr),
             SSAOp::IntXor { dst, a, b } => self.binary_stmt(frame, dst, a, b, BinaryOp::BitXor),
@@ -6693,10 +5018,6 @@ impl<'a> FoldingContext<'a> {
                 let src_expr = input(0, src)?;
                 let rhs = if *offset == 0 && dst.size == src.size {
                     src_expr
-                } else if *offset == 0
-                    && let Some(expr) = self.signed_divrem_expr_for_value(src)
-                {
-                    expr
                 } else if *offset == 0 {
                     CExpr::cast(uint_type_from_size(dst.size), src_expr)
                 } else {
@@ -6880,10 +5201,8 @@ impl<'a> FoldingContext<'a> {
         let lhs = self.retain_lowering_result(self.assignment_lhs_expr(dst))?;
         if matches!(op, BinaryOp::BitAnd | BinaryOp::BitOr)
             && let (Some(left_source), Some(right_source)) = (
-                self.call_result_source_for_var(a)
-                    .or_else(|| self.local_post_call_source_for_var(a)),
-                self.call_result_source_for_var(b)
-                    .or_else(|| self.local_post_call_source_for_var(b)),
+                self.call_result_source_for_var(a),
+                self.call_result_source_for_var(b),
             )
             && left_source == right_source
             && let Some(call_expr) = self
@@ -6933,127 +5252,6 @@ impl<'a> FoldingContext<'a> {
         };
         let rhs = self.assignment_rhs_with_type_policy(dst, None, rhs);
         self.assign_stmt(lhs, rhs)
-    }
-
-    fn signed_divrem_stmt(
-        &self,
-        frame: &LowerFrame,
-        dst: &SSAVar,
-        dividend: &SSAVar,
-        divisor: &SSAVar,
-        op: BinaryOp,
-    ) -> Option<CStmt> {
-        let lhs = self.retain_lowering_result(self.assignment_lhs_expr(dst))?;
-        let Some(rhs) = self.signed_divrem_expr(dividend, divisor, op) else {
-            return self.binary_stmt_typed(
-                frame,
-                dst,
-                dividend,
-                divisor,
-                op,
-                Some(type_from_size(dst.size)),
-            );
-        };
-        let rhs = self.observed_input(frame, 0, rhs);
-        let rhs = self.observed_input(frame, 1, rhs);
-        let rhs = self.assignment_rhs_with_type_policy(dst, None, rhs);
-        self.assign_stmt(lhs, rhs)
-    }
-
-    fn signed_divrem_expr_for_value(&self, value: &SSAVar) -> Option<CExpr> {
-        match self.use_info().producers.get(&value.display_name())? {
-            SSAOp::IntSDiv { a, b, .. } => self.signed_divrem_expr(a, b, BinaryOp::Div),
-            SSAOp::IntSRem { a, b, .. } => self.signed_divrem_expr(a, b, BinaryOp::Mod),
-            _ => None,
-        }
-    }
-
-    fn signed_divrem_expr(
-        &self,
-        dividend: &SSAVar,
-        divisor: &SSAVar,
-        op: BinaryOp,
-    ) -> Option<CExpr> {
-        let dividend_root = self.signed_extended_dividend_low_root(dividend)?;
-        let divisor_root = self
-            .sign_extension_root(divisor)
-            .unwrap_or_else(|| divisor.clone());
-        let width = dividend_root.size.max(divisor_root.size);
-        Some(self.identity_simplify_binary(
-            op,
-            self.retain_lowering_result(self.get_expr(&dividend_root))?,
-            self.retain_lowering_result(self.get_expr(&divisor_root))?,
-            (width > 0).then_some(width),
-        ))
-    }
-
-    fn sign_extension_root(&self, value: &SSAVar) -> Option<SSAVar> {
-        match self.use_info().producers.get(&value.display_name())? {
-            SSAOp::IntSExt { src, .. } => Some(src.clone()),
-            _ => None,
-        }
-    }
-
-    fn signed_extended_dividend_low_root(&self, value: &SSAVar) -> Option<SSAVar> {
-        let SSAOp::IntOr {
-            a: high_part,
-            b: low_part,
-            ..
-        } = self.use_info().producers.get(&value.display_name())?
-        else {
-            return None;
-        };
-        self.sign_extended_pair_low_root(high_part, low_part)
-            .or_else(|| self.sign_extended_pair_low_root(low_part, high_part))
-    }
-
-    fn sign_extended_pair_low_root(
-        &self,
-        shifted_high: &SSAVar,
-        low_zext: &SSAVar,
-    ) -> Option<SSAVar> {
-        let SSAOp::IntLeft {
-            a: high_zext,
-            b: shift,
-            ..
-        } = self
-            .use_info()
-            .producers
-            .get(&shifted_high.display_name())?
-        else {
-            return None;
-        };
-        let SSAOp::IntZExt { src: high, .. } =
-            self.use_info().producers.get(&high_zext.display_name())?
-        else {
-            return None;
-        };
-        let low_root = self.signed_high_limb_low_root(high)?;
-        let SSAOp::IntZExt { src: low, .. } =
-            self.use_info().producers.get(&low_zext.display_name())?
-        else {
-            return None;
-        };
-        if self.same_storage_value(low, low_root)
-            && shift_matches_signed_concat_width(&shift.name, high, low, low_root)
-        {
-            Some(low_root.clone())
-        } else {
-            None
-        }
-    }
-
-    fn signed_high_limb_low_root<'b>(&'b self, high: &'b SSAVar) -> Option<&'b SSAVar> {
-        match self.use_info().producers.get(&high.display_name())? {
-            SSAOp::Subpiece { src: sext, .. } => {
-                match self.use_info().producers.get(&sext.display_name())? {
-                    SSAOp::IntSExt { src, .. } => Some(src),
-                    _ => None,
-                }
-            }
-            SSAOp::IntSExt { src, .. } => Some(src),
-            _ => None,
-        }
     }
 
     fn boolean_stmt(

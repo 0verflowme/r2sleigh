@@ -20,7 +20,7 @@ use r2types::{
 
 use super::lower::LowerCtx;
 use super::{
-    BaseRef, DecompilerFacts, FlagInfo, NormalizedAddr, PassEnv, SSABlock, ScalarValue,
+    BaseRef, DecompilerFacts, NormalizedAddr, PassEnv, SSABlock, ScalarValue,
     SemanticValue, StackInfo, StackSlotProvenance, StackSlotValueKind, UseInfo, ValueProvenance,
     ValueRef,
 };
@@ -65,7 +65,6 @@ pub(crate) struct PreparedSemanticView {
     pub(crate) owner_expr_by_value: HashMap<ValueId, CExpr>,
     pub(crate) stack_offset_by_value: HashMap<ValueId, i64>,
     pub(crate) predicate_expr_by_value: HashMap<ValueId, CExpr>,
-    pub(crate) branch_predicate_expr_by_block: BTreeMap<u64, CExpr>,
     pub(crate) call_view_by_site: BTreeMap<(u64, usize), PreparedCallView>,
     pub(crate) call_result_facts_by_value: BTreeMap<ValueId, r2types::CallResultFact>,
     pub(crate) call_result_source_by_value: HashMap<ValueId, (u64, usize)>,
@@ -290,10 +289,8 @@ impl PreparedSemanticView {
             Ok(disposition) => disposition,
             Err(_) => return None,
         };
-        match disposition {
-            PlannedParameterSymbol::Bound { symbol, .. } => Some(symbol),
-            PlannedParameterSymbol::Refused(_) | PlannedParameterSymbol::Absent => None,
-        }
+        let PlannedParameterSymbol::Bound { symbol, .. } = disposition;
+        Some(symbol)
     }
 
     /// Project one exact source-owned stack object. Offset and alias tables
@@ -305,10 +302,8 @@ impl PreparedSemanticView {
             Ok(disposition) => disposition,
             Err(_) => return None,
         };
-        match disposition {
-            PlannedStackSymbol::Bound(symbol) => Some(symbol),
-            PlannedStackSymbol::Refused(_) | PlannedStackSymbol::Absent => None,
-        }
+        let PlannedStackSymbol::Bound(symbol) = disposition;
+        Some(symbol)
     }
 
     pub(crate) fn var_for_value_id(&self, value_id: ValueId) -> Option<&SSAVar> {
@@ -333,10 +328,6 @@ impl PreparedSemanticView {
     #[allow(dead_code)]
     pub(crate) fn predicate_expr_for_value_id(&self, value_id: ValueId) -> Option<&CExpr> {
         self.predicate_expr_by_value.get(&value_id)
-    }
-
-    pub(crate) fn branch_expr_for_block(&self, block_addr: u64) -> Option<&CExpr> {
-        self.branch_predicate_expr_by_block.get(&block_addr)
     }
 
     pub(crate) fn call_view_for_site(&self, site: (u64, usize)) -> Option<&PreparedCallView> {
@@ -569,11 +560,10 @@ pub(crate) fn build_prepared_runtime_facts_with_control(
 ) -> Result<DecompilerFacts, PreparedRuntimeFactsError> {
     control.poll()?;
     let mut use_info = UseInfo::default();
-    let mut flag_info = FlagInfo::default();
     let mut stack_info = StackInfo::default();
 
     seed_prepared_stack_facts(symbols, &mut use_info, &mut stack_info, prepared, view);
-    collect_prepared_runtime_facts(symbols, &mut use_info, &mut flag_info, blocks, prepared, view);
+    collect_prepared_runtime_facts(symbols, &mut use_info, blocks, prepared, view);
     #[cfg(test)]
     pin_prepared_loop_carried_phi_values(&mut use_info, prepared, view);
     populate_prepared_call_runtime_facts(
@@ -591,7 +581,6 @@ pub(crate) fn build_prepared_runtime_facts_with_control(
     control.poll()?;
     Ok(DecompilerFacts {
         use_info,
-        flag_info,
         stack_info,
     })
 }
@@ -611,7 +600,7 @@ fn pin_prepared_loop_carried_phi_values(
 
 #[cfg(test)]
 fn pin_prepared_phi_materialized_var(use_info: &mut UseInfo, var: &SSAVar) {
-    if var.is_const() || var.is_temp() || use_info.names_a_flag(&var.name) {
+    if var.is_const() || var.is_temp() {
         return;
     }
     let display = var.display_name();
@@ -1528,7 +1517,6 @@ fn populate_call_result_sources(
 
 fn populate_predicates(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, view: &mut PreparedSemanticView, inputs: &PreparedSemanticViewInputs<'_>) {
     view.predicate_expr_by_value.clear();
-    view.branch_predicate_expr_by_block.clear();
 
     let Some(control_facts) = inputs.control_facts() else {
         return;
@@ -1552,8 +1540,6 @@ fn populate_predicates(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
             continue;
         };
         view.insert_predicate_expr(cond_var, expr.clone());
-        view.branch_predicate_expr_by_block
-            .insert(predicate.block_addr, expr);
     }
 
     populate_derived_predicates(symbols, view, inputs);
@@ -1622,17 +1608,6 @@ fn populate_derived_predicates(symbols: &std::cell::RefCell<crate::symbol::Symbo
         }
     }
 
-    for block in inputs.prepared.function().blocks() {
-        let Some(cond) = block.ops.iter().rev().find_map(|op| match op {
-            SSAOp::CBranch { cond, .. } => Some(cond),
-            _ => None,
-        }) else {
-            continue;
-        };
-        if let Some(expr) = view.predicate_expr_for_cond(cond).cloned() {
-            view.branch_predicate_expr_by_block.insert(block.addr, expr);
-        }
-    }
 }
 
 fn boolean_expr_for_sources(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
@@ -3221,7 +3196,6 @@ fn seed_prepared_stack_facts(symbols: &std::cell::RefCell<crate::symbol::SymbolT
 
 fn collect_prepared_runtime_facts(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
     use_info: &mut UseInfo,
-    _flag_info: &mut FlagInfo,
     blocks: &[SSABlock],
     prepared: &SsaArtifact,
     view: &PreparedSemanticView,
@@ -3266,28 +3240,6 @@ fn collect_prepared_runtime_facts(symbols: &std::cell::RefCell<crate::symbol::Sy
             // a prepared value already answered for every name, while every
             // pointer member it offered was taken because nothing else computes
             // them. So the rule moves here and the overlay goes.
-            #[cfg(test)]
-            match op {
-                SSAOp::IntAdd { dst, a, b } => {
-                    if let Some(offset) = crate::analysis::utils::parse_const_offset(a) {
-                        use_info
-                            .ptr_members
-                            .insert(dst.display_name(), (b.clone(), offset));
-                    } else if let Some(offset) = crate::analysis::utils::parse_const_offset(b) {
-                        use_info
-                            .ptr_members
-                            .insert(dst.display_name(), (a.clone(), offset));
-                    }
-                }
-                SSAOp::IntSub { dst, a, b } => {
-                    if let Some(offset) = crate::analysis::utils::parse_const_offset(b) {
-                        use_info
-                            .ptr_members
-                            .insert(dst.display_name(), (a.clone(), -offset));
-                    }
-                }
-                _ => {}
-            }
             if let SSAOp::CBranch { cond, .. } = op {
                 let _ = bind_prepared_value_id(use_info, view, cond);
                 use_info.note_condition_var(cond);
@@ -3298,10 +3250,7 @@ fn collect_prepared_runtime_facts(symbols: &std::cell::RefCell<crate::symbol::Sy
                 #[cfg(test)]
                 {
                     let dst_key = dst.display_name();
-                    use_info.producers.insert(dst_key.clone(), op.clone());
-                    if is_flag_like_name(&dst.name) || op_produces_predicate(op) {
-                        _flag_info.flag_only_values.insert(dst_key);
-                    }
+                    use_info.producers.insert(dst_key, op.clone());
                 }
                 seed_prepared_value_fact(symbols, use_info, dst, prepared, view);
             }
@@ -3706,32 +3655,6 @@ fn record_prepared_call_result_facts(symbols: &std::cell::RefCell<crate::symbol:
     }
 }
 
-#[cfg(test)]
-fn is_flag_like_name(name: &str) -> bool {
-    let lower = name.to_ascii_lowercase();
-    matches!(
-        lower.split('_').next(),
-        Some("cf" | "zf" | "sf" | "of" | "pf")
-    )
-}
-
-#[cfg(test)]
-fn op_produces_predicate(op: &SSAOp) -> bool {
-    matches!(
-        op,
-        SSAOp::BoolNot { .. }
-            | SSAOp::BoolAnd { .. }
-            | SSAOp::BoolOr { .. }
-            | SSAOp::BoolXor { .. }
-            | SSAOp::IntEqual { .. }
-            | SSAOp::IntNotEqual { .. }
-            | SSAOp::IntLess { .. }
-            | SSAOp::IntSLess { .. }
-            | SSAOp::IntLessEqual { .. }
-            | SSAOp::IntSLessEqual { .. }
-    )
-}
-
 fn normalize_prepared_inline_expr(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
     expr: CExpr,
     view: &PreparedSemanticView,
@@ -3983,30 +3906,6 @@ mod tests {
         SsaArtifact::from_blocks(&[block], None).expect("prepared call SSA artifact")
     }
 
-    fn test_prepared_branch_artifact() -> SsaArtifact {
-        let cond = Varnode::unique(0x2000, 1);
-        let mut entry = R2ILBlock::new(0x2000, 4);
-        entry.push(R2ILOp::IntEqual {
-            dst: cond.clone(),
-            a: Varnode::constant(7, 8),
-            b: Varnode::constant(9, 8),
-        });
-        entry.push(R2ILOp::CBranch {
-            target: Varnode::constant(0x2010, 8),
-            cond,
-        });
-        let mut fallthrough = R2ILBlock::new(0x2004, 1);
-        fallthrough.push(R2ILOp::Return {
-            target: Varnode::constant(0, 8),
-        });
-        let mut target = R2ILBlock::new(0x2010, 1);
-        target.push(R2ILOp::Return {
-            target: Varnode::constant(1, 8),
-        });
-        SsaArtifact::for_decompile(&[entry, fallthrough, target], None)
-            .expect("prepared branch SSA artifact")
-    }
-
     fn test_prepared_recursive_call_artifact() -> SsaArtifact {
         let mut block = R2ILBlock::new(0x1500, 8);
         block.push(R2ILOp::Call {
@@ -4109,14 +4008,14 @@ mod tests {
                     .argument_certificates
                     .iter()
                     .filter_map(|argument| {
-                        let r2ssa::CallArgumentLocation::Register { name } = &argument.location
+                        let r2ssa::CallArgumentLocation::Register { storage } = argument.location
                         else {
                             return None;
                         };
                         Some(r2types::RegisterCallArgumentLocationFact {
                             index: argument.index,
                             value: argument.value,
-                            name: name.clone(),
+                            storage,
                             source_inst: argument.source_inst,
                         })
                     })
@@ -4169,116 +4068,6 @@ mod tests {
 
     fn leak_function_facts(facts: FunctionFacts) -> &'static FunctionFacts {
         Box::leak(Box::new(facts))
-    }
-
-    fn test_control_facts(prepared: &SsaArtifact) -> r2types::FunctionControlFacts {
-        let predicates = prepared.predicates();
-        let certificates = prepared.certificates();
-        let sorted_u64s = |values: &[u64]| {
-            let mut values = values.to_vec();
-            values.sort_unstable();
-            values
-        };
-        let branch_predicates = predicates
-            .predicates
-            .values()
-            .map(|predicate| {
-                (
-                    predicate.block_addr,
-                    r2types::BranchPredicateFact {
-                        id: predicate.id,
-                        block_addr: predicate.block_addr,
-                        condition: predicate.condition,
-                        comparison: predicate.comparison.as_ref().map(|comparison| {
-                            r2types::PredicateComparisonFact {
-                                kind: comparison.kind,
-                                lhs: comparison.lhs,
-                                rhs: comparison.rhs,
-                            }
-                        }),
-                        evaluated_comparison: predicate.evaluated_comparison.as_ref().map(
-                            |comparison| r2types::PredicateComparisonFact {
-                                kind: comparison.kind,
-                                lhs: comparison.lhs,
-                                rhs: comparison.rhs,
-                            },
-                        ),
-                        render_comparison: predicate.comparison.as_ref().map(|comparison| {
-                            r2types::PredicateComparisonFact {
-                                kind: comparison.kind,
-                                lhs: comparison.lhs,
-                                rhs: comparison.rhs,
-                            }
-                        }),
-                        true_target: predicate.true_target,
-                        false_target: predicate.false_target,
-                    },
-                )
-            })
-            .collect();
-        let loops = certificates
-            .loops
-            .iter()
-            .map(|(loop_id, cert)| {
-                (
-                    *loop_id,
-                    r2types::LoopStructureFact {
-                        loop_id: *loop_id,
-                        proof_node: cert.proof_node.to_string(),
-                        header: cert.header,
-                        condition: cert.condition,
-                        condition_value: cert
-                            .condition
-                            .and_then(|id| predicates.predicates.get(&id).map(|p| p.condition)),
-                        body: sorted_u64s(&cert.body),
-                        latches: sorted_u64s(&cert.latches),
-                        exits: sorted_u64s(&cert.exits),
-                    },
-                )
-            })
-            .collect();
-        let switches = prepared
-            .predicates()
-            .switches
-            .iter()
-            .map(|(block_addr, switch)| {
-                (
-                    *block_addr,
-                    r2types::SwitchSelectorFact {
-                        proof_node: r2ssa::ProofNodeId::switch_certificate(*block_addr).to_string(),
-                        block_addr: switch.block_addr,
-                        selector: switch.selector,
-                        cases: switch.cases.clone(),
-                        default: switch.default,
-                    },
-                )
-            })
-            .collect();
-        let block_assumptions = prepared
-            .predicates()
-            .block_assumptions
-            .iter()
-            .map(|(block_addr, assumptions)| {
-                (
-                    *block_addr,
-                    assumptions
-                        .iter()
-                        .map(|assumption| r2types::ControlBlockAssumptionFact {
-                            predecessor: assumption.predecessor,
-                            predicate: assumption.predicate,
-                            truth: assumption.truth,
-                        })
-                        .collect(),
-                )
-            })
-            .collect();
-        r2types::FunctionControlFacts {
-            branch_predicates,
-            block_assumptions,
-            loops,
-            switches,
-            control_domains: prepared.control_domains().clone(),
-        }
     }
 
     #[test]
@@ -4767,63 +4556,6 @@ mod tests {
         assert!(
             view.call_result_source_by_value.is_empty(),
             "call-result source indexes must be populated from FunctionFacts, not local prepared SSA reads"
-        );
-    }
-
-    #[test]
-    fn prepared_branch_predicates_require_function_facts_control_contract() {
-        let symbols = test_table();
-        let prepared = test_prepared_branch_artifact();
-        assert!(
-            !prepared.predicates().predicates.is_empty(),
-            "fixture must expose raw prepared predicate facts"
-        );
-        let stack_slots = BTreeMap::new();
-        let visible_bindings = Vec::new();
-        let param_register_aliases = HashMap::new();
-
-        let view = PreparedSemanticView::build(&symbols, PreparedSemanticViewInputs {
-            prepared: &prepared,
-            stack_slots: &stack_slots,
-            visible_bindings: &visible_bindings,
-            param_register_aliases: &param_register_aliases,
-            function_facts: leak_function_facts(FunctionFacts::default()),
-            certified_rendering_required: false,
-        });
-
-        assert!(
-            view.branch_predicate_expr_by_block.is_empty(),
-            "prepared semantic view must not render branch predicates from raw prepared SSA side channels"
-        );
-    }
-
-    #[test]
-    fn prepared_branch_predicates_use_function_facts_control_contract() {
-        let symbols = test_table();
-        let prepared = test_prepared_branch_artifact();
-        let control_facts = test_control_facts(&prepared);
-        let stack_slots = BTreeMap::new();
-        let visible_bindings = Vec::new();
-        let param_register_aliases = HashMap::new();
-        let function_facts = FunctionFacts::default().with_control(control_facts.clone());
-
-        let view = PreparedSemanticView::build(&symbols, PreparedSemanticViewInputs {
-            prepared: &prepared,
-            stack_slots: &stack_slots,
-            visible_bindings: &visible_bindings,
-            param_register_aliases: &param_register_aliases,
-            function_facts: &function_facts,
-            certified_rendering_required: false,
-        });
-
-        assert_eq!(
-            view.branch_expr_for_block(0x2000),
-            Some(&CExpr::binary(
-                BinaryOp::Eq,
-                CExpr::IntLit(7),
-                CExpr::IntLit(9)
-            )),
-            "branch predicate rendering must be authorized by FunctionFacts control evidence"
         );
     }
 

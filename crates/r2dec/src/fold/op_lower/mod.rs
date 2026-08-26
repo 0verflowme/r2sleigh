@@ -21,12 +21,10 @@ use r2types::{
     SourceOwnedFunctionFacts, normalize_external_type_name, parse_type_like_spec,
 };
 
-use crate::address::parse_address_from_var_name;
 use crate::analysis;
 pub(crate) use crate::analysis::lower::OpLoweringRefusal;
 use crate::ast::{BinaryOp, CExpr, CStmt, CType, UnaryOp};
 use crate::binding_plan::{BindingPlan, BindingPlanSourceMismatch};
-use crate::registers::register_family_name;
 
 use super::SSABlock;
 use super::context::{EffectOccurrenceKind, FoldingContext};
@@ -172,63 +170,6 @@ fn external_field_name_for_offset(
         return Some(format!("{}[{index}]", field.name));
     }
     (rel == 0).then(|| field.name.clone())
-}
-
-fn exact_external_field_name_for_offset(
-    field: &ExternalField,
-    offset: u64,
-    access_size: u32,
-    ptr_bits: u32,
-) -> Option<String> {
-    if offset != field.offset {
-        return None;
-    }
-    let field_size = field
-        .ty
-        .as_deref()
-        .and_then(|ty| parse_type_like_spec(ty, ptr_bits))
-        .and_then(|ty| c_type_like_size_bytes(&ty, ptr_bits))?;
-    (field_size == u64::from(access_size)).then(|| field.name.clone())
-}
-
-fn external_field_type_is_pointer(field: &ExternalField, ptr_bits: u32) -> bool {
-    field
-        .ty
-        .as_deref()
-        .and_then(|ty| parse_type_like_spec(ty, ptr_bits))
-        .is_some_and(|ty| matches!(ty, CTypeLike::Pointer(_)))
-}
-
-fn exact_external_struct_field_name_for_offset(
-    st: &ExternalStruct,
-    offset: u64,
-    access_size: u32,
-    ptr_bits: u32,
-) -> Option<String> {
-    st.fields.get(&offset).and_then(|field| {
-        exact_external_field_name_for_offset(field, offset, access_size, ptr_bits)
-    })
-}
-
-fn exact_external_union_field_name_for_offset(
-    un: &ExternalUnion,
-    offset: u64,
-    access_size: u32,
-    ptr_bits: u32,
-) -> Option<String> {
-    if offset != 0 {
-        return None;
-    }
-    let mut matches = un
-        .fields
-        .values()
-        .filter_map(|field| {
-            exact_external_field_name_for_offset(field, offset, access_size, ptr_bits)
-        })
-        .collect::<Vec<_>>();
-    matches.sort();
-    matches.dedup();
-    (matches.len() == 1).then(|| matches.remove(0))
 }
 
 fn c_type_like_size_bytes(ty: &CTypeLike, ptr_bits: u32) -> Option<u64> {
@@ -390,13 +331,10 @@ struct LowerFrame {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum VisibleExprContext {
     Generic,
-    ScalarPredicate,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
 struct VisibleExprQuality {
-    scalar_signal: i32,
-    predicate_signal: i32,
     semantic_shapes: i32,
     semantic_names: i32,
     stable_pointer_shapes: i32,
@@ -404,7 +342,6 @@ struct VisibleExprQuality {
     transient_reg_penalty: i32,
     temp_penalty: i32,
     zero_offset_penalty: i32,
-    address_shape_penalty: i32,
     stack_home_penalty: i32,
     node_penalty: i32,
 }
@@ -522,10 +459,6 @@ impl<'a> CertifiedRenderPlan<'a> {
             crate::binding_plan::PlannedParameterSymbol::Bound { symbol, .. } => {
                 Some(CExpr::Var(symbol))
             }
-            crate::binding_plan::PlannedParameterSymbol::Refused(_)
-            | crate::binding_plan::PlannedParameterSymbol::Absent => {
-                unreachable!("require_parameter_slot cannot return absent or refused")
-            }
         }
     }
 }
@@ -626,13 +559,6 @@ pub(crate) fn parse_const_value(name: &str) -> Option<u64> {
     analysis::utils::parse_const_value(name)
 }
 
-fn const_value_may_equal(name: &str, expected: u64) -> bool {
-    if parse_const_value(name) == Some(expected) {
-        return true;
-    }
-    parse_address_from_var_name(name) == Some(expected)
-}
-
 fn push_linear_term(terms: &mut Vec<(CExpr, i64)>, term: CExpr, coeff: i64) -> Option<()> {
     if coeff == 0 {
         return Some(());
@@ -651,26 +577,6 @@ fn linear_coeff_expr(term: CExpr, coeff: i64) -> Option<CExpr> {
         1 => Some(term),
         _ => Some(CExpr::binary(BinaryOp::Mul, term, CExpr::IntLit(coeff))),
     }
-}
-
-fn shift_matches_signed_concat_width(
-    shift_name: &str,
-    high: &SSAVar,
-    low: &SSAVar,
-    low_root: &SSAVar,
-) -> bool {
-    [low.size, low_root.size, high.size]
-        .into_iter()
-        .filter(|size| *size > 0)
-        .any(|size| const_value_may_equal(shift_name, u64::from(size.saturating_mul(8))))
-}
-
-pub(super) fn is_generic_arg_name(name: &str) -> bool {
-    let lower = name.to_ascii_lowercase();
-    lower
-        .strip_prefix("arg")
-        .map(|suffix| !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit()))
-        .unwrap_or(false)
 }
 
 pub(crate) fn should_replace_preserved_stack_alias(existing: &str) -> bool {

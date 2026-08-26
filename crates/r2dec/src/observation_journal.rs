@@ -273,9 +273,6 @@ fn binding_plan_failure(error: &BindingPlanSourceMismatch) -> BindingObservation
                 binding_index: binding.index(),
             }
         }
-        BindingPlanSourceMismatch::NonBoundValue { value } => {
-            BindingObservationJournalFailure::BindingPlanNonBoundValue { value: *value }
-        }
         BindingPlanSourceMismatch::CertificateMembership { binding } => {
             BindingObservationJournalFailure::BindingPlanCertificateMembership {
                 binding_index: binding.index(),
@@ -340,17 +337,6 @@ fn binding_plan_failure(error: &BindingPlanSourceMismatch) -> BindingObservation
         BindingPlanSourceMismatch::ParameterDeclarationWidth { slot, binding } => {
             BindingObservationJournalFailure::BindingPlanParameterDeclarationWidth {
                 slot: *slot,
-                binding_index: binding.index(),
-            }
-        }
-        BindingPlanSourceMismatch::ParameterRole { slot, binding } => {
-            BindingObservationJournalFailure::BindingPlanParameterRole {
-                slot: *slot,
-                binding_index: binding.index(),
-            }
-        }
-        BindingPlanSourceMismatch::BindingRole { binding } => {
-            BindingObservationJournalFailure::BindingPlanBindingRole {
                 binding_index: binding.index(),
             }
         }

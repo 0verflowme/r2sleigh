@@ -1,5 +1,3 @@
-use crate::analysis::PredicateAnalysisView;
-use crate::ast::CExpr;
 use crate::control::{DecompileExecutionStop, DecompileWorkControl, DecompileWorkPhase};
 use r2ssa::{
     BlockId, InstId, SSAFunction, SSAOp, SsaArtifactAuthority, SsaExecutionControl, SsaGraph,
@@ -1118,23 +1116,6 @@ fn validate_removed_phi_input_dispositions(
             .all(|count| count.is_none_or(|count| count == 1))
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
-pub(crate) enum NormalizeMode {
-    General,
-    Predicate,
-}
-
-pub(crate) fn normalize_expr(
-    view: &(impl PredicateAnalysisView + ?Sized),
-    expr: CExpr,
-    mode: NormalizeMode,
-) -> CExpr {
-    match mode {
-        NormalizeMode::General | NormalizeMode::Predicate => view.simplify_predicate_expr(expr),
-    }
-}
-
 fn is_block_terminator(op: &SSAOp) -> bool {
     matches!(
         op,
@@ -1988,27 +1969,8 @@ pub(crate) fn materialize_certified_loop_carrier_initializers_with_control(
 mod tests {
 
     use super::*;
-    use crate::ast::{BinaryOp, UnaryOp};
-    use crate::fold::FoldingContext;
     use r2il::{ArchSpec, R2ILBlock, R2ILOp, RegisterDef, Varnode};
     use r2ssa::{PhiNode, SSAFunction, SSAVar};
-
-    #[test]
-    fn normalization_is_idempotent_for_predicates() {
-        let ctx = FoldingContext::new(64);
-        let expr = CExpr::unary(
-            UnaryOp::Not,
-            CExpr::binary(
-                BinaryOp::Eq,
-                CExpr::binary(BinaryOp::Sub, ctx.name_ref("x"), CExpr::IntLit(0)),
-                CExpr::IntLit(0),
-            ),
-        );
-
-        let once = normalize_expr(&ctx, expr.clone(), NormalizeMode::Predicate);
-        let twice = normalize_expr(&ctx, once.clone(), NormalizeMode::Predicate);
-        assert_eq!(once, twice, "Predicate normalization must be idempotent");
-    }
 
     #[test]
     fn initializer_removal_uses_exact_origin_not_duplicate_copy_shape() {

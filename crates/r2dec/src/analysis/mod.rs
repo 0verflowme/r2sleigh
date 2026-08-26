@@ -9,14 +9,10 @@ use crate::ast::CExpr;
 
 pub(crate) type SSABlock = FunctionSSABlock;
 
-// Pass dependency invariant:
-// UseInfo -> (FlagInfo, StackInfo) -> PredicateSimplifier -> statement emit.
 pub(crate) mod lower;
-pub(crate) mod predicate;
 pub(crate) mod prepared_semantic;
 pub(crate) mod utils;
 
-pub(crate) use predicate::{PredicateAnalysisView, PredicateSimplifier};
 pub(crate) use prepared_semantic::{
     PreparedCallView, PreparedRuntimeFactsError, PreparedSemanticView,
     PreparedSemanticViewInputs,
@@ -43,17 +39,12 @@ pub(crate) struct PtrArith {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct DecompilerFacts {
     pub(crate) use_info: UseInfo,
-    pub(crate) flag_info: FlagInfo,
     pub(crate) stack_info: StackInfo,
 }
 
 impl DecompilerFacts {
     pub(crate) fn semantic(&self) -> &UseInfo {
         &self.use_info
-    }
-
-    pub(crate) fn flags(&self) -> &FlagInfo {
-        &self.flag_info
     }
 
     pub(crate) fn stack(&self) -> &StackInfo {
@@ -262,16 +253,6 @@ pub(crate) struct FrameObjectFieldKey {
 }
 
 #[allow(dead_code)]
-#[derive(Debug, Clone, PartialEq, Default)]
-pub(crate) struct FlagInfo {
-    pub(crate) flag_origins: HashMap<String, (String, String)>,
-    pub(crate) compare_provenance: HashMap<String, FlagCompareProvenance>,
-    pub(crate) sub_results: HashMap<String, (String, String)>,
-    pub(crate) flag_only_values: HashSet<String>,
-    pub(crate) predicate_exprs: HashMap<String, CExpr>,
-}
-
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FlagCompareKind {
     Equality,
@@ -350,17 +331,6 @@ impl StackSlotProvenance {
         }
     }
 
-    pub(crate) fn is_scalar(self) -> bool {
-        self.value_kind == StackSlotValueKind::Scalar
-    }
-
-    pub(crate) fn is_scalar_predicate_carrier(self) -> bool {
-        self.predicate_carrier && self.is_scalar()
-    }
-
-    pub(crate) fn is_scalar_return_carrier(self) -> bool {
-        self.return_carrier && self.is_scalar()
-    }
 }
 
 fn value_ref_references_any(value: &ValueRef, ids: &BTreeSet<ValueId>) -> bool {
@@ -671,12 +641,6 @@ impl UseInfo {
             .and_then(|value_id| self.definitions_by_value.get(&value_id))
     }
 
-    /// Whether this name spells a condition code on this target.
-    pub(crate) fn names_a_flag(&self, name: &str) -> bool {
-        self.flag_regs
-            .contains(&crate::analysis::utils::flag_base_name(name))
-    }
-
     #[cfg(test)]
     pub(crate) fn render_definition_for_name(&self, name: &str) -> Option<&CExpr> {
         self.definition_for_name(name)
@@ -760,21 +724,6 @@ impl UseInfo {
         self.forwarded_value_for_name(name)
     }
 
-    /// What was copied into this name, as a name.
-    ///
-    /// The copy is recorded between identities. Spelling the answer back out
-    /// means resolving the name to a value, following the copy, and asking what
-    /// that value is called -- rather than keeping a second map of names to
-    /// names, which `lookup_name_key` matched case-insensitively and so could
-    /// answer for a different variable that happened to differ only in case.
-    #[cfg(test)]
-    pub(crate) fn render_copy_source_for_name(&self, name: &str) -> Option<String> {
-        let value_id = self.value_id_for_name(name)?;
-        let source_id = self.copy_sources_by_value.get(&value_id)?;
-        self.var_for_value_id(*source_id)
-            .map(|var| var.display_name())
-    }
-
     /// File a definition against the value a spelling names, if it has none.
     #[cfg(test)]
     pub(crate) fn insert_definition_for_name_if_absent(&mut self, name: &str, expr: CExpr) {
@@ -821,9 +770,6 @@ impl UseInfo {
             .is_some_and(|value| self.is_condition_value(value))
     }
 
-}
-
-impl FlagInfo {
 }
 
 impl StackInfo {

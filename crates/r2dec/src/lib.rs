@@ -27,7 +27,6 @@
 //! println!("{}", c_code);
 //! ```
 
-pub(crate) mod address;
 pub(crate) mod analysis;
 pub mod ast;
 mod binding_plan;
@@ -47,7 +46,6 @@ mod observation_journal;
 mod placement;
 pub(crate) mod planner;
 pub mod region;
-pub(crate) mod registers;
 mod shadow_report;
 pub(crate) mod single_evaluation;
 pub mod structure;
@@ -70,11 +68,12 @@ use crate::observation_journal::{
     LegacyObservationCoverage, LegacyObservationJournal, MarkedNativeDraft, SealedNativeFunction,
 };
 use r2ssa::SSAFunction;
+#[cfg(test)]
 use r2ssa::SSAOp;
 use r2ssa::cfg::BlockTerminator;
 use r2types::{
     CTypeLike, DecompileRouteFacts, DecompileRouteKind, FunctionFacts, FunctionTypeFacts,
-    TypeInference, TypeOracle,
+    SourceEvidenceTypeOracle, TypeOracle,
 };
 #[cfg(test)]
 use r2types::{ExternalTypeDb, FunctionType};
@@ -1936,13 +1935,6 @@ impl DecompilerContext {
         }
     }
 
-    fn skip_runtime_type_inference(&self, prepared: &r2ssa::SsaArtifact) -> bool {
-        let _ = prepared;
-        self.function_facts
-            .decompile_route()
-            .is_some_and(|route| route.skip_runtime_type_inference)
-    }
-
 }
 
 #[derive(Debug, Clone)]
@@ -2404,8 +2396,6 @@ pub enum BindingObservationJournalFailure {
     },
     BindingPlanInvalidBindingReference { value: r2ssa::ValueId, binding_index: usize,
     },
-    BindingPlanNonBoundValue { value: r2ssa::ValueId,
-    },
     BindingPlanCertificateMembership { binding_index: usize,
     },
     BindingPlanDeclarationWidth { binding_index: usize,
@@ -2431,10 +2421,6 @@ pub enum BindingObservationJournalFailure {
     BindingPlanParameterCertificate { slot: u32, binding_index: usize,
     },
     BindingPlanParameterDeclarationWidth { slot: u32, binding_index: usize,
-    },
-    BindingPlanParameterRole { slot: u32, binding_index: usize,
-    },
-    BindingPlanBindingRole { binding_index: usize,
     },
     NormalizationSourceAuthority,
     NormalizationBlockTopology,
@@ -2557,7 +2543,6 @@ impl BindingObservationJournalFailure {
             Self::BindingPlanInvalidBindingReference { .. } => {
                 "binding_plan_invalid_binding_reference"
             }
-            Self::BindingPlanNonBoundValue { .. } => "binding_plan_non_bound_value",
             Self::BindingPlanCertificateMembership { .. } => "binding_plan_certificate_membership",
             Self::BindingPlanDeclarationWidth { .. } => "binding_plan_declaration_width",
             Self::BindingPlanInvalidLiteralInline { .. } => "binding_plan_invalid_literal_inline",
@@ -2585,8 +2570,6 @@ impl BindingObservationJournalFailure {
             Self::BindingPlanParameterDeclarationWidth { .. } => {
                 "binding_plan_parameter_declaration_width"
             }
-            Self::BindingPlanParameterRole { .. } => "binding_plan_parameter_role",
-            Self::BindingPlanBindingRole { .. } => "binding_plan_binding_role",
             Self::NormalizationSourceAuthority => "normalization_source_authority",
             Self::NormalizationBlockTopology => "normalization_block_topology",
             Self::NormalizationRowCount { .. } => "normalization_row_count",
@@ -3041,14 +3024,11 @@ fn rendered_identity_refusal_category(
         | RenderedIdentityRefusal::MachineWrite { .. }
         | RenderedIdentityRefusal::MissingUseDisposition { .. }
         | RenderedIdentityRefusal::MissingWriteDisposition { .. }
-        | RenderedIdentityRefusal::MissingValueOrigin { .. }
         | RenderedIdentityRefusal::Value {
             reason:
                 ValueRefusal::MissingLiteralProjection { .. }
-                | ValueRefusal::MissingUseProjection { .. }
                 | ValueRefusal::IncoherentUseProjection { .. }
-                | ValueRefusal::IncoherentWriteProjection { .. }
-                | ValueRefusal::UnsupportedMachineExpression { .. },
+                | ValueRefusal::IncoherentWriteProjection { .. },
             ..
         } => DecompileRenderRefusal::MissingMachineProjectionAuthorization,
         RenderedIdentityRefusal::Value {
@@ -3062,10 +3042,8 @@ fn rendered_identity_refusal_category(
         | RenderedIdentityRefusal::MissingBinding { .. }
         | RenderedIdentityRefusal::MissingValueDisposition { .. }
         | RenderedIdentityRefusal::MissingParameterDisposition { .. }
-        | RenderedIdentityRefusal::InvalidParameterEntity { .. }
         | RenderedIdentityRefusal::MissingStackDisposition { .. }
-        | RenderedIdentityRefusal::MissingStackObjectOrigin { .. }
-        | RenderedIdentityRefusal::UnexpectedNonBindingDisposition { .. } => {
+        | RenderedIdentityRefusal::MissingStackObjectOrigin { .. } => {
             DecompileRenderRefusal::MissingProgramVariableAuthorization
         }
     }
@@ -4223,7 +4201,6 @@ impl Decompiler {
                         crate::binding_plan::BindingPlanSourceMismatch::MachineProjection(_),
                     ) => DecompileRenderRefusal::MissingMachineProjectionAuthorization,
                     crate::binding_plan::BindingNameResolutionError::Source(_)
-                    | crate::binding_plan::BindingNameResolutionError::MissingBinding(_)
                     | crate::binding_plan::BindingNameResolutionError::ConflictingCertifiedRoles(
                         _,
                     ) => DecompileRenderRefusal::MissingProgramVariableAuthorization,
@@ -4285,45 +4262,12 @@ impl Decompiler {
             }
         }
         let render_signature = self.context.type_facts().render_authorized_signature();
-        let skip_runtime_type_inference = self.context.skip_runtime_type_inference(prepared);
-        let type_inference = (!skip_runtime_type_inference).then(|| {
-            let mut type_inference = TypeInference::new_with_abi(
-                self.config.ptr_size,
-                self.config.arg_regs.clone(),
-                self.config.ret_regs.clone(),
-            );
-            type_inference.set_external_signature(
-                self.context
-                    .type_facts()
-                    .render_authorized_signature()
-                    .cloned(),
-            );
-            for (name, signature) in &self.context.type_facts().known_function_signatures {
-                type_inference.add_function_type(name, signature.clone());
-            }
-            type_inference.set_external_stack_slots(self.context.type_facts().stack_slots.clone());
-            if !self
-                .context
-                .type_facts()
-                .external_type_db
-                .structs
-                .is_empty()
-                || !self.context.type_facts().external_type_db.unions.is_empty()
-                || !self.context.type_facts().external_type_db.enums.is_empty()
-            {
-                type_inference
-                    .set_external_type_db(self.context.type_facts().external_type_db.clone());
-            }
-            type_inference.set_prepared_ssa(prepared);
-            type_inference.infer_function(func);
-            type_inference
-        });
-        let combined_type_oracle = type_inference
-            .as_ref()
-            .and_then(TypeInference::combined_type_oracle);
-        let type_oracle = combined_type_oracle
-            .as_ref()
-            .map(|oracle| oracle as &dyn TypeOracle);
+        let evidence_type_oracle = SourceEvidenceTypeOracle::new(
+            prepared,
+            input.source_owned_facts().evidence_types(),
+            &self.context.type_facts().external_type_db,
+        );
+        let type_oracle = Some(&evidence_type_oracle as &dyn TypeOracle);
         let params = match binding_names
             .parameters()
             .map(|resolved| {
@@ -4353,13 +4297,10 @@ impl Decompiler {
                 ));
             }
         };
-        let inferred_ret_type = type_inference
-            .as_ref()
-            .map(|type_inference| self.infer_return_type(func, type_inference))
-            .or_else(|| {
-                render_signature.and_then(|sig| sig.ret_type.as_ref().map(type_like_to_ctype))
-            })
-            .unwrap_or(CType::Unknown);
+        let inferred_ret_type = evidence_return_type(
+            prepared,
+            input.source_owned_facts().evidence_types(),
+        );
         let signature_ret_type =
             render_signature.and_then(|sig| sig.ret_type.as_ref().map(type_like_to_ctype));
         let fold_function_return_type = signature_ret_type.as_ref().or(Some(&inferred_ret_type));
@@ -4633,35 +4574,31 @@ impl Decompiler {
         }
     }
 
-    fn infer_return_type(&self, func: &SSAFunction, type_inference: &TypeInference) -> CType {
-        let mut candidates = Vec::new();
+}
 
-        for block in func.blocks() {
-            for op in &block.ops {
-                let SSAOp::Return { target } = op else {
-                    continue;
-                };
-
-                candidates.push(type_like_to_ctype(&type_inference.get_type(target)));
-            }
-        }
-
-        if candidates.is_empty() {
-            return CType::Void;
-        }
-
-        let meaningful: Vec<CType> = candidates
-            .into_iter()
-            .filter(|ty| !matches!(ty, CType::Unknown))
-            .collect();
-        if meaningful.is_empty() {
+fn evidence_return_type(
+    source: &r2ssa::SsaArtifact,
+    evidence: &r2types::EvidenceTypes,
+) -> CType {
+    let mut candidate: Option<CType> = None;
+    let mut saw_return = false;
+    for certificate in &source.certificates().returns {
+        saw_return = true;
+        let Some(ty) = evidence.value_type(certificate.value) else {
             return CType::Unknown;
+        };
+        let ty = type_like_to_ctype(ty);
+        match &candidate {
+            None => candidate = Some(ty),
+            Some(existing) if existing == &ty => {}
+            Some(_) => return CType::Unknown,
         }
-        if meaningful.iter().all(|ty| ty == &meaningful[0]) {
-            return meaningful[0].clone();
-        }
-        CType::Unknown
     }
+    candidate.unwrap_or(if saw_return {
+        CType::Unknown
+    } else {
+        CType::Void
+    })
 }
 
 fn void_function_has_value_return(func: &CFunction) -> bool {

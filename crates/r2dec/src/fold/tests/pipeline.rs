@@ -725,14 +725,14 @@ mod tests {
                     .argument_certificates
                     .iter()
                     .filter_map(|argument| {
-                        let r2ssa::CallArgumentLocation::Register { name } = &argument.location
+                        let r2ssa::CallArgumentLocation::Register { storage } = argument.location
                         else {
                             return None;
                         };
                         Some(r2types::RegisterCallArgumentLocationFact {
                             index: argument.index,
                             value: argument.value,
-                            name: name.clone(),
+                            storage,
                             source_inst: argument.source_inst,
                         })
                     })
@@ -1750,11 +1750,6 @@ mod tests {
             function_facts.set_callee_resolution(resolution);
         });
 
-        let poisoned_callee = ctx.name_ref("sym.local_copy");
-        assert!(
-            !ctx.is_modeled_call_target(&poisoned_callee),
-            "expression-only fallback should not classify the poisoned local name as modeled"
-        );
         assert!(
             ctx.is_modeled_call_target_for_site(0x1000, 0),
             "callsite identity should classify the modeled target from typed resolution"
@@ -2075,19 +2070,6 @@ mod tests {
     }
 
     #[test]
-    fn semantic_index_storage_filter_uses_typed_ssa_name_kind_without_lowering() {
-        let ctx = FoldingContext::new(64);
-
-        assert!(!ctx.is_semantic_index_expr(&ctx.name_ref("const:4_0")));
-        assert!(!ctx.is_semantic_index_expr(&ctx.name_ref("ram:401000_0")));
-        assert!(ctx.is_semantic_index_expr(&ctx.name_ref("CONST:4_0")));
-        assert!(ctx.is_semantic_index_expr(&ctx.name_ref("idx_1")));
-        assert!(!ctx.is_semantic_index_expr(&ctx.name_ref("stack")));
-        assert!(!ctx.is_semantic_index_expr(&ctx.name_ref("saved_fp")));
-        assert!(!ctx.is_semantic_index_expr(&ctx.name_ref("stack_8")));
-    }
-
-    #[test]
     fn low_signal_visible_name_uses_typed_storage_kind_and_display_heuristics() {
         let ctx = FoldingContext::new(64);
 
@@ -2100,110 +2082,6 @@ mod tests {
         assert!(!ctx.is_low_signal_visible_name("space1:20"));
         assert!(!ctx.is_low_signal_visible_name("value"));
         assert!(!ctx.is_low_signal_visible_name("rax_1"));
-    }
-
-    #[test]
-    fn test_simplify_predicate_rewrites_cmp_zero() {
-        let ctx = FoldingContext::new(64);
-        let expr = CExpr::unary(
-            UnaryOp::Not,
-            CExpr::binary(
-                BinaryOp::Eq,
-                CExpr::binary(BinaryOp::Sub, ctx.name_ref("x"), CExpr::IntLit(0)),
-                CExpr::IntLit(0),
-            ),
-        );
-        let simplified = ctx.simplify_condition_expr(expr);
-        assert_eq!(
-            simplified,
-            CExpr::binary(BinaryOp::Ne, ctx.name_ref("x"), CExpr::IntLit(0))
-        );
-    }
-
-    #[test]
-    fn test_simplify_predicate_rewrites_sub_const_cmp_zero() {
-        let ctx = FoldingContext::new(64);
-        let expr = CExpr::binary(
-            BinaryOp::Eq,
-            CExpr::binary(BinaryOp::Sub, ctx.name_ref("x"), CExpr::IntLit(0xdead)),
-            CExpr::IntLit(0),
-        );
-        let simplified = ctx.simplify_condition_expr(expr);
-        assert_eq!(
-            simplified,
-            CExpr::binary(BinaryOp::Eq, ctx.name_ref("x"), CExpr::IntLit(0xdead))
-        );
-    }
-
-    #[test]
-    fn test_simplify_predicate_rewrites_sub_var_cmp_zero() {
-        let ctx = FoldingContext::new(64);
-        let expr = CExpr::binary(
-            BinaryOp::Ne,
-            CExpr::binary(BinaryOp::Sub, ctx.name_ref("x"), ctx.name_ref("y")),
-            CExpr::IntLit(0),
-        );
-        let simplified = ctx.simplify_condition_expr(expr);
-        assert_eq!(
-            simplified,
-            CExpr::binary(BinaryOp::Ne, ctx.name_ref("x"), ctx.name_ref("y"))
-        );
-    }
-
-    #[test]
-    fn test_simplify_predicate_rewrites_sub_all_ones_cmp_zero() {
-        let ctx = FoldingContext::new(64);
-        let expr = CExpr::binary(
-            BinaryOp::Eq,
-            CExpr::binary(
-                BinaryOp::Sub,
-                ctx.name_ref("x"),
-                CExpr::UIntLit(0xffff_ffff),
-            ),
-            CExpr::IntLit(0),
-        );
-        let simplified = ctx.simplify_condition_expr(expr);
-        assert_eq!(
-            simplified,
-            CExpr::binary(BinaryOp::Eq, ctx.name_ref("x"), CExpr::UIntLit(0xffff_ffff))
-        );
-    }
-
-    #[test]
-    fn test_simplify_predicate_rewrites_ne_ge_zero_to_gt_zero() {
-        let ctx = FoldingContext::new(64);
-        let expr = CExpr::binary(
-            BinaryOp::And,
-            CExpr::binary(BinaryOp::Ne, ctx.name_ref("x"), CExpr::IntLit(0)),
-            CExpr::binary(BinaryOp::Ge, ctx.name_ref("x"), CExpr::IntLit(0)),
-        );
-        let simplified = ctx.simplify_condition_expr(expr);
-        assert_eq!(
-            simplified,
-            CExpr::binary(BinaryOp::Gt, ctx.name_ref("x"), CExpr::IntLit(0))
-        );
-    }
-
-    #[test]
-    fn test_simplify_predicate_rewrites_negated_casted_lt_or_eq_to_gt() {
-        let ctx = FoldingContext::new(64);
-        let expr = CExpr::unary(
-            UnaryOp::Not,
-            CExpr::binary(
-                BinaryOp::Or,
-                CExpr::binary(
-                    BinaryOp::Lt,
-                    CExpr::cast(CType::UInt(64), ctx.name_ref("len")),
-                    CExpr::cast(CType::UInt(64), ctx.name_ref("64")),
-                ),
-                CExpr::binary(BinaryOp::Eq, ctx.name_ref("len"), CExpr::IntLit(100)),
-            ),
-        );
-        let simplified = ctx.simplify_condition_expr(expr);
-        assert_eq!(
-            simplified,
-            CExpr::binary(BinaryOp::Gt, ctx.name_ref("len"), CExpr::IntLit(100))
-        );
     }
 
     #[test]
@@ -2774,16 +2652,12 @@ mod tests {
             .observe_expr(inner)
             .expect("outer quality observation");
 
-        for context in [
-            VisibleExprContext::Generic,
-            VisibleExprContext::ScalarPredicate,
-        ] {
-            assert_eq!(
-                ctx.debug_visible_expr_quality(&marked, context),
-                ctx.debug_visible_expr_quality(&plain, context),
-                "observation wrappers must have zero ranking weight in {context:?}"
-            );
-        }
+        let context = VisibleExprContext::Generic;
+        assert_eq!(
+            ctx.debug_visible_expr_quality(&marked, context),
+            ctx.debug_visible_expr_quality(&plain, context),
+            "observation wrappers must have zero ranking weight"
+        );
     }
 
     #[test]
@@ -3412,37 +3286,8 @@ mod tests {
             "canonical memory and field facts must allow certified member rendering: {expr:?}"
         );
     }
-
     #[test]
-    fn prepared_analyze_blocks_builds_stack_info_from_visible_bindings() {
-        let arch = make_test_arch_x86_64();
-        let mut entry = R2ILBlock::new(0x1000, 4);
-        entry.push(R2ILOp::IntSub {
-            dst: Varnode::unique(1, 8),
-            a: Varnode::register(0x20, 8),
-            b: Varnode::constant(8, 8),
-        });
-        entry.push(R2ILOp::Load {
-            dst: Varnode::register(0x00, 4),
-            space: SpaceId::Ram,
-            addr: Varnode::unique(1, 8),
-        });
-
-        let prepared = prepared_from_r2il_blocks(&[entry], &arch).with_name("prepared_stack");
-        let mut ctx = make_x86_64_ctx_with_prepared(&prepared);
-        ctx.set_external_stack_vars(HashMap::from([(
-            -8,
-            stack_var_spec("buf", Some(crate::CType::Int(32)), Some("rbp")),
-        )]));
-
-        let blocks = prepared.function().blocks().cloned().collect::<Vec<_>>();
-        ctx.analyze_blocks(&blocks);
-
-        assert_eq!(ctx.stack_vars_map().get(&-8), Some(&"buf".to_string()));
-    }
-
-    #[test]
-    fn prepared_predicate_candidate_for_branch_block_uses_block_assumptions_fallback() {
+    fn forged_block_assumption_cannot_replace_the_exact_branch_use() {
         let arch = make_test_arch_x86_64();
         let mut entry = R2ILBlock::new(0x5000, 4);
         entry.push(R2ILOp::IntEqual {
@@ -3524,302 +3369,10 @@ mod tests {
             lhs_value_id, cond_value_id,
             "test setup must force the direct predicate match to miss"
         );
-        assert!(
-            matches!(
-                ctx.prepared_predicate_candidate_for_branch_block_for_test(0x5000, &cond),
-                Some(CExpr::Binary {
-                    op: BinaryOp::Eq,
-                    ..
-                })
-            ),
-            "expected block_assumptions fallback to recover a compare expression"
-        );
-    }
-
-    #[test]
-    fn local_post_call_source_uses_nearest_call_before_calldefine() {
-        let ctx = make_x86_64_ctx();
-        let copied = make_var("tmp:out", 1, 8);
-        let rax_second = make_var("rax", 2, 8);
-        let block = make_block(vec![
-            SSAOp::Call {
-                target: make_var("ram:401000", 0, 8),
-            },
-            SSAOp::CallDefine {
-                dst: make_var("rax", 1, 8),
-            },
-            SSAOp::Call {
-                target: make_var("ram:402000", 0, 8),
-            },
-            SSAOp::CallDefine {
-                dst: rax_second.clone(),
-            },
-            SSAOp::Copy {
-                dst: copied.clone(),
-                src: rax_second,
-            },
-        ]);
-
         assert_eq!(
-            ctx.local_post_call_source_for_var_in_block(&block, &copied, 0),
-            Some((block.addr, 2)),
-            "copied post-call values must resolve to the nearest producing call"
-        );
-    }
-
-    #[test]
-    fn local_post_call_source_follows_copy_like_chain() {
-        let ctx = make_x86_64_ctx();
-        let out = make_var("tmp:out", 1, 4);
-        let eax = make_var("eax", 1, 4);
-        let c1 = make_var("tmp:c1", 1, 4);
-        let z1 = make_var("tmp:z1", 1, 8);
-        let cast = make_var("tmp:cast", 1, 8);
-        let trunc = make_var("tmp:t1", 1, 4);
-        let block = make_block(vec![
-            SSAOp::Call {
-                target: make_var("ram:401000", 0, 8),
-            },
-            SSAOp::CallDefine { dst: eax.clone() },
-            SSAOp::Copy {
-                dst: c1.clone(),
-                src: eax,
-            },
-            SSAOp::IntZExt {
-                dst: z1.clone(),
-                src: c1,
-            },
-            SSAOp::Cast {
-                dst: cast.clone(),
-                src: z1,
-            },
-            SSAOp::Trunc {
-                dst: trunc.clone(),
-                src: cast,
-            },
-            SSAOp::Copy {
-                dst: out.clone(),
-                src: trunc,
-            },
-        ]);
-
-        assert_eq!(
-            ctx.local_post_call_source_for_var_in_block(&block, &out, 0),
-            Some((block.addr, 0)),
-            "copy-like chains must preserve the producing call source"
-        );
-    }
-
-    #[test]
-    fn local_post_call_source_allows_depth_sixteen_but_limits_long_chains() {
-        let ctx = make_x86_64_ctx();
-        let rax = make_var("rax", 1, 8);
-        let direct = make_block(vec![
-            SSAOp::Call {
-                target: make_var("ram:401000", 0, 8),
-            },
-            SSAOp::CallDefine { dst: rax.clone() },
-        ]);
-        assert_eq!(
-            ctx.local_post_call_source_for_var_in_block(&direct, &rax, 16),
-            Some((direct.addr, 0)),
-            "depth 16 is still inside the recursion budget"
-        );
-
-        let mut ops = vec![
-            SSAOp::Call {
-                target: make_var("ram:401000", 0, 8),
-            },
-            SSAOp::CallDefine { dst: rax.clone() },
-        ];
-        let mut prev = rax;
-        for idx in 0..18 {
-            let next = make_var(&format!("tmp:chain{idx}"), 1, 8);
-            ops.push(SSAOp::Copy {
-                dst: next.clone(),
-                src: prev,
-            });
-            prev = next;
-        }
-        let chained = make_block(ops);
-
-        assert!(
-            ctx.local_post_call_source_for_var_in_block(&chained, &prev, 0)
-                .is_none(),
-            "copy-like source tracing must stop at the recursion budget"
-        );
-    }
-
-    #[test]
-    fn local_post_call_source_traces_stack_reload_to_call_result() {
-        let mut ctx = make_x86_64_ctx();
-        let source_call = (0x1000, 0);
-        let rax = make_var("rax", 1, 8);
-        let slot = make_var("tmp:slot", 1, 8);
-        let loaded = make_var("tmp:loaded", 1, 8);
-        let copied = make_var("rdi", 1, 8);
-        ctx.state
-            .analysis_ctx
-            .use_info
-            .insert_definition_for_name_if_absent(
-                &slot.display_name(),
-                CExpr::binary(BinaryOp::Add, ctx.name_ref("rbp"), CExpr::IntLit(-8)),
-            );
-        let block = make_block(vec![
-            SSAOp::Call {
-                target: make_var("ram:401000", 0, 8),
-            },
-            SSAOp::CallDefine { dst: rax.clone() },
-            SSAOp::Store {
-                space: r2il::SpaceId::Ram,
-                addr: slot.clone(),
-                val: rax,
-            },
-            SSAOp::Load {
-                dst: loaded.clone(),
-                space: r2il::SpaceId::Ram,
-                addr: slot,
-            },
-            SSAOp::Copy {
-                dst: copied.clone(),
-                src: loaded,
-            },
-        ]);
-
-        assert_eq!(
-            ctx.local_post_call_source_for_var_in_block(&block, &copied, 0),
-            Some(source_call),
-            "stack reloads must preserve the canonical producing call source"
-        );
-    }
-
-    #[test]
-    fn local_post_call_source_refuses_custom_space_stack_shaped_reload() {
-        let mut ctx = make_x86_64_ctx();
-        let rax = make_var("rax", 1, 8);
-        let slot = make_var("tmp:slot", 1, 8);
-        let loaded = make_var("tmp:loaded", 1, 8);
-        ctx.state
-            .analysis_ctx
-            .use_info
-            .insert_definition_for_name_if_absent(
-                &slot.display_name(),
-                CExpr::binary(BinaryOp::Add, ctx.name_ref("rbp"), CExpr::IntLit(-8)),
-            );
-        let block = make_block(vec![
-            SSAOp::Call {
-                target: make_var("ram:401000", 0, 8),
-            },
-            SSAOp::CallDefine { dst: rax.clone() },
-            SSAOp::Store {
-                space: r2il::SpaceId::Custom(7),
-                addr: slot.clone(),
-                val: rax,
-            },
-            SSAOp::Load {
-                dst: loaded.clone(),
-                space: r2il::SpaceId::Custom(7),
-                addr: slot,
-            },
-        ]);
-
-        assert!(
-            ctx.local_post_call_source_for_var_in_block(&block, &loaded, 0,)
-                .is_none(),
-            "stack-shaped accesses in a custom address space cannot inherit a RAM call-result home"
-        );
-    }
-
-    #[test]
-    fn local_post_call_source_refuses_mismatched_stack_reload_offset() {
-        let mut ctx = make_x86_64_ctx();
-        let rax = make_var("rax", 1, 8);
-        let stored_slot = make_var("tmp:stored_slot", 1, 8);
-        let loaded_slot = make_var("tmp:loaded_slot", 1, 8);
-        let loaded = make_var("tmp:loaded", 1, 8);
-        ctx.state
-            .analysis_ctx
-            .use_info
-            .insert_definition_for_name_if_absent(
-                &stored_slot.display_name(),
-                CExpr::binary(BinaryOp::Add, ctx.name_ref("rbp"), CExpr::IntLit(-8)),
-            );
-        ctx.state
-            .analysis_ctx
-            .use_info
-            .insert_definition_for_name_if_absent(
-                &loaded_slot.display_name(),
-                CExpr::binary(BinaryOp::Add, ctx.name_ref("rbp"), CExpr::IntLit(-16)),
-            );
-        let block = make_block(vec![
-            SSAOp::Call {
-                target: make_var("ram:401000", 0, 8),
-            },
-            SSAOp::CallDefine { dst: rax.clone() },
-            SSAOp::Store {
-                space: r2il::SpaceId::Ram,
-                addr: stored_slot,
-                val: rax,
-            },
-            SSAOp::Load {
-                dst: loaded.clone(),
-                space: r2il::SpaceId::Ram,
-                addr: loaded_slot,
-            },
-        ]);
-
-        assert!(
-            ctx.local_post_call_source_for_var_in_block(&block, &loaded, 0)
-                .is_none(),
-            "stack reload tracing must require the store and load offsets to match"
-        );
-    }
-
-    #[test]
-    fn local_post_call_source_limits_stack_reload_value_chain_depth() {
-        let mut ctx = make_x86_64_ctx();
-        let rax = make_var("rax", 1, 8);
-        let slot = make_var("tmp:slot", 1, 8);
-        let loaded = make_var("tmp:loaded", 1, 8);
-        ctx.state
-            .analysis_ctx
-            .use_info
-            .insert_definition_for_name_if_absent(
-                &slot.display_name(),
-                CExpr::binary(BinaryOp::Add, ctx.name_ref("rbp"), CExpr::IntLit(-8)),
-            );
-
-        let mut ops = vec![
-            SSAOp::Call {
-                target: make_var("ram:401000", 0, 8),
-            },
-            SSAOp::CallDefine { dst: rax.clone() },
-        ];
-        let mut prev = rax;
-        for idx in 0..16 {
-            let next = make_var(&format!("tmp:reload_chain{idx}"), 1, 8);
-            ops.push(SSAOp::Copy {
-                dst: next.clone(),
-                src: prev,
-            });
-            prev = next;
-        }
-        ops.push(SSAOp::Store {
-            space: r2il::SpaceId::Ram,
-            addr: slot.clone(),
-            val: prev,
-        });
-        ops.push(SSAOp::Load {
-            dst: loaded.clone(),
-            space: r2il::SpaceId::Ram,
-            addr: slot,
-        });
-        let block = make_block(ops);
-
-        assert!(
-            ctx.local_post_call_source_for_var_in_block(&block, &loaded, 0)
-                .is_none(),
-            "stack reload source tracing must enforce the recursion budget"
+            ctx.prepared_predicate_candidate_for_branch_block_for_test(0x5000, &cond),
+            None,
+            "a comparison fact whose condition ValueId does not own the terminal branch UseSite must refuse"
         );
     }
 }

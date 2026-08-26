@@ -23,7 +23,6 @@ pub(crate) enum ResolutionPhase {
     Semantic,
     Definition,
     DefinitionRaw,
-    Visible,
     Memory,
 }
 
@@ -159,7 +158,6 @@ pub(crate) struct FoldingContext<'a> {
     /// answers every question about that block, and it is rebuilt when the walk
     /// moves on.
     pub(crate) current_op_idx: Cell<Option<usize>>,
-    pub(crate) forwarded_source_cache: std::cell::RefCell<HashMap<String, Option<r2ssa::SSAVar>>>,
     pub(crate) load_expr_memo: std::cell::RefCell<HashMap<(ValueId, String), CExpr>>,
     /// Legacy cache retained only as a negative test fixture: production
     /// inlining is authorized exclusively by the sealed binding plan.
@@ -181,8 +179,6 @@ pub(crate) struct FoldingContext<'a> {
     pub(crate) resolution_guard: std::cell::RefCell<HashSet<ResolutionGuardKey>>,
     /// Blocks the fold walked, which is what expresses a merge standing at their head.
     pub(crate) folded_blocks: std::cell::RefCell<std::collections::BTreeSet<u64>>,
-    /// Names some other block reads, which a block-local prune must not delete.
-    pub(crate) cross_block_reads: std::cell::RefCell<HashSet<String>>,
     /// Names minted while folding, handed to the function when it is built.
     ///
     /// A cell because the builders take `&self`. Minting has to borrow, insert
@@ -267,14 +263,12 @@ impl FoldArchConfig {
 impl<'a> FoldingContext<'a> {
     pub(crate) fn from_inputs(inputs: FoldInputs<'a>) -> Self {
         Self {
-            cross_block_reads: std::cell::RefCell::new(HashSet::new()),
             symbols: std::rc::Rc::new(std::cell::RefCell::new(crate::symbol::SymbolTable::new())),
             inputs,
             state: FoldState::default(),
             current_block_addr: Cell::new(None),
             current_block_id: Cell::new(None),
             current_op_idx: Cell::new(None),
-            forwarded_source_cache: std::cell::RefCell::new(HashMap::new()),
             load_expr_memo: std::cell::RefCell::new(HashMap::new()),
             #[cfg(test)]
             inlined_renderings: std::cell::RefCell::new(HashMap::new()),

@@ -109,15 +109,6 @@ impl FoldArchConfig {
         false
     }
 
-    pub(crate) fn arg_alias_for_register_name(&self, reg_name: &str) -> Option<String> {
-        let base = normalized_base_name(reg_name);
-        let canonical = canonical_x86_arg_reg(&base);
-        let index = self.arg_regs.iter().position(|arg| {
-            arg.eq_ignore_ascii_case(canonical) || arg.eq_ignore_ascii_case(&base)
-        })?;
-        Some(format!("arg{index}"))
-    }
-
     pub(crate) fn is_return_register_name(&self, name: &str) -> bool {
         let base = normalized_base_name(name);
 

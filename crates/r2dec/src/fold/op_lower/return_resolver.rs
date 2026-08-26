@@ -25,13 +25,6 @@ impl<'a> FoldingContext<'a> {
     }
 
     /// Convert an SSA variable to a C variable name.
-    pub fn var_name(&self, var: &SSAVar) -> OpLoweringResult<String> {
-        match self.get_expr(var)? {
-            CExpr::Var(symbol) => Ok(self.spelling(symbol).to_string()),
-            _ => Err(OpLoweringRefusal::MissingProgramVariableAuthorization),
-        }
-    }
-
     /// Convert a constant variable to a C expression.
     pub(crate) fn const_to_expr(&self, var: &SSAVar) -> OpLoweringResult<CExpr> {
         let val = var

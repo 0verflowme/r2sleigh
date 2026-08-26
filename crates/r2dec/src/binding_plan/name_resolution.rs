@@ -3,7 +3,7 @@ use std::rc::Rc;
 
 use r2ssa::{
     InstId, MachineExprId, MachineUseDisposition, MachineUseRefusal, MachineWriteDisposition,
-    MachineWriteRefusal, ObjectId, SemanticId, SsaArtifactAuthority, UseSite, ValueId,
+    MachineWriteRefusal, ObjectId, SsaArtifactAuthority, UseSite, ValueId,
 };
 use r2types::SourceOwnedFunctionFacts;
 
@@ -31,16 +31,12 @@ pub(crate) enum PlannedValueSymbol {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PlannedStackSymbol {
     Bound(SymbolId),
-    Refused(StackObjectRefusal),
-    Absent,
 }
 
 /// Exact identifier answer for one certified ABI parameter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PlannedParameterSymbol {
     Bound { symbol: SymbolId, width_bits: u32 },
-    Refused(ParameterRefusal),
-    Absent,
 }
 
 /// One exact parameter row for C-header assembly.
@@ -94,9 +90,6 @@ pub(crate) enum RenderedIdentityRefusal {
     MissingParameterDisposition {
         slot: u32,
     },
-    InvalidParameterEntity {
-        entity: SemanticId,
-    },
     MissingStackDisposition {
         object: ObjectId,
     },
@@ -106,22 +99,10 @@ pub(crate) enum RenderedIdentityRefusal {
     MissingWriteDisposition {
         inst: InstId,
     },
-    /// A later consumer discarded the exact use identity before asking for a
-    /// rendered variable.  Package A defines the refusal; Stage 5 consumers
-    /// will use it instead of reversing a rendered spelling.
-    MissingValueOrigin {
-        site: UseSite,
-    },
     /// A later consumer retained only layout arithmetic, not the source-owned
     /// stack object whose binding would authorize an identifier.
     MissingStackObjectOrigin {
         offset: i64,
-    },
-    /// A caller required a C object for a value whose sealed answer is inline
-    /// or elided.  `require_value` itself preserves those answers; declaration
-    /// consumers use this variant when they specifically require a binding.
-    UnexpectedNonBindingDisposition {
-        value: ValueId,
     },
 }
 
@@ -130,7 +111,6 @@ pub(crate) enum RenderedIdentityRefusal {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum BindingNameResolutionError {
     Source(BindingPlanSourceMismatch),
-    MissingBinding(BindingId),
     ConflictingCertifiedRoles(BindingId),
 }
 
@@ -286,15 +266,6 @@ impl BindingNameResolution {
         self.by_binding.contains(&symbol)
     }
 
-    /// Length of the dense source ABI parameter-slot domain.
-    ///
-    /// A sparse hole is included in this count and appears as a typed missing
-    /// disposition from [`parameters`](Self::parameters); it cannot silently
-    /// shift later slots left while assembling a C header.
-    pub(crate) fn parameter_count(&self) -> usize {
-        self.plan.parameters.len()
-    }
-
     /// Exact parameter answers in ascending source ABI slot order.
     ///
     /// Refused slots stay in the iterator as typed errors. Consumers building a
@@ -341,20 +312,8 @@ impl BindingNameResolution {
             })
     }
 
-    /// Canonical declaration role derived while resolving the binding's
-    /// upstream certificate. Placement uses this to seed ABI parameters; it
-    /// never infers entry assignment from a presentation spelling.
-    pub(crate) fn role_for_binding(&self, binding: BindingId) -> Option<SymbolRole> {
-        let symbol = self.symbol_for_binding(binding)?;
-        Some(self.symbols.borrow().get(symbol).role)
-    }
-
     pub(crate) const fn plan(&self) -> &Rc<BindingPlan> {
         &self.plan
-    }
-
-    pub(crate) fn binding_role(&self, binding: BindingId) -> Option<BindingRole> {
-        self.plan.binding_role(binding)
     }
 
     pub(crate) fn binding_is_externally_declared(&self, binding: BindingId) -> Option<bool> {
@@ -364,15 +323,6 @@ impl BindingNameResolution {
     /// Resolve one plan-owned inline expression without exposing the plan.
     pub(crate) fn inline_expr(&self, expr: MachineExprId) -> Option<&r2ssa::MachineExpr> {
         self.plan.machine_projection().expr(expr)
-    }
-
-    /// Resolve one exact use projection through the sealed plan. The renderer
-    /// never reconstructs register geometry from a spelling or carrier width.
-    pub(crate) fn use_disposition(
-        &self,
-        site: r2ssa::UseSite,
-    ) -> Option<&r2ssa::MachineUseDisposition> {
-        self.plan.use_disposition(site)
     }
 
     /// Resolve one exact write projection through the sealed plan. As with
@@ -429,17 +379,6 @@ impl BindingNameResolution {
             }
             None => Err(RenderedIdentityRefusal::MissingParameterDisposition { slot }),
         }
-    }
-
-    /// Require a parameter through its canonical semantic entity.
-    pub(crate) fn require_parameter_entity(
-        &self,
-        entity: SemanticId,
-    ) -> Result<PlannedParameterSymbol, RenderedIdentityRefusal> {
-        let SemanticId::Parameter(slot) = entity else {
-            return Err(RenderedIdentityRefusal::InvalidParameterEntity { entity });
-        };
-        self.require_parameter_slot(slot)
     }
 
     /// Require one exact source-owned stack object without reconstructing it
@@ -536,87 +475,6 @@ impl BindingNameResolution {
     /// [`symbol_for_value`](Self::symbol_for_value) as a boolean.
     pub(crate) fn disposition_for_value(&self, value: ValueId) -> Option<&ValueDisposition> {
         self.plan.disposition(value)
-    }
-
-    pub(crate) fn name_for_value(&self, value: ValueId) -> Option<String> {
-        let symbol = self.symbol_for_value(value)?;
-        Some(self.symbols.borrow().name(symbol).to_string())
-    }
-
-    pub(crate) fn resolve_parameter_slot(&self, slot: u32) -> PlannedParameterSymbol {
-        match self.plan.parameter_disposition(slot) {
-            Some(ParameterDisposition::Bound {
-                binding,
-                width_bits,
-            }) => self
-                .symbol_for_binding(binding)
-                .map_or(PlannedParameterSymbol::Absent, |symbol| {
-                    PlannedParameterSymbol::Bound { symbol, width_bits }
-                }),
-            Some(ParameterDisposition::Refused { reason }) => {
-                PlannedParameterSymbol::Refused(reason)
-            }
-            None => PlannedParameterSymbol::Absent,
-        }
-    }
-
-    pub(crate) fn resolve_parameter_entity(
-        &self,
-        entity: r2ssa::SemanticId,
-    ) -> PlannedParameterSymbol {
-        let r2ssa::SemanticId::Parameter(slot) = entity else {
-            return PlannedParameterSymbol::Absent;
-        };
-        self.resolve_parameter_slot(slot)
-    }
-
-    pub(crate) fn symbol_for_parameter_slot(&self, slot: u32) -> Option<SymbolId> {
-        match self.resolve_parameter_slot(slot) {
-            PlannedParameterSymbol::Bound { symbol, .. } => Some(symbol),
-            PlannedParameterSymbol::Refused(_) | PlannedParameterSymbol::Absent => None,
-        }
-    }
-
-    pub(crate) fn symbol_for_parameter_entity(
-        &self,
-        entity: r2ssa::SemanticId,
-    ) -> Option<SymbolId> {
-        match self.resolve_parameter_entity(entity) {
-            PlannedParameterSymbol::Bound { symbol, .. } => Some(symbol),
-            PlannedParameterSymbol::Refused(_) | PlannedParameterSymbol::Absent => None,
-        }
-    }
-
-    /// Resolve one source-owned `ObjectId` without copying the plan-owned stack
-    /// disposition into a parallel table.
-    pub(crate) fn resolve_stack(&self, object: ObjectId) -> PlannedStackSymbol {
-        match self.plan.stack_object_disposition(object) {
-            Some(StackObjectDisposition::Bound { binding }) => self
-                .symbol_for_binding(binding)
-                .map_or(PlannedStackSymbol::Absent, PlannedStackSymbol::Bound),
-            Some(StackObjectDisposition::Refused { reason }) => PlannedStackSymbol::Refused(reason),
-            None => PlannedStackSymbol::Absent,
-        }
-    }
-
-    pub(crate) fn symbol_for_stack_object(&self, object: ObjectId) -> Option<SymbolId> {
-        match self.resolve_stack(object) {
-            PlannedStackSymbol::Bound(symbol) => Some(symbol),
-            PlannedStackSymbol::Refused(_) | PlannedStackSymbol::Absent => None,
-        }
-    }
-
-    pub(crate) fn name_for_stack_object(&self, object: r2ssa::ObjectId) -> Option<String> {
-        let symbol = self.symbol_for_stack_object(object)?;
-        Some(self.symbols.borrow().name(symbol).to_string())
-    }
-
-    pub(crate) fn symbols(&self) -> &Rc<RefCell<SymbolTable>> {
-        &self.symbols
-    }
-
-    pub(crate) fn validate_source(&self, source: &SourceOwnedFunctionFacts) -> bool {
-        self.authority == *source.source().authority()
     }
 
     pub(crate) fn validates_artifact(&self, source: &r2ssa::SsaArtifact) -> bool {
@@ -807,11 +665,7 @@ mod tests {
             .find(|value| plan.disposition(value.id) == Some(&ValueDisposition::Bound { binding }))
             .expect("member");
         assert_eq!(resolution.symbol_for_value(member.id), Some(symbol));
-        assert_eq!(
-            resolution.name_for_value(member.id).as_deref(),
-            Some("accumulator")
-        );
-        assert!(resolution.validate_source(&source));
+        assert_eq!(symbols.borrow().name(symbol), "accumulator");
     }
 
     #[test]
@@ -865,10 +719,6 @@ mod tests {
         };
         assert_eq!(width_bits, 64);
         assert_eq!(
-            plan.parameter_entity_disposition(r2ssa::SemanticId::Parameter(0)),
-            plan.parameter_disposition(0)
-        );
-        assert_eq!(
             plan.binding_role(binding),
             Some(BindingRole::Parameter { slot: 0 })
         );
@@ -883,45 +733,17 @@ mod tests {
             Rc::new(RefCell::new(SymbolTable::new())),
         )
         .expect("unused parameter resolution");
-        let symbol = resolution
-            .symbol_for_parameter_slot(0)
+        let PlannedParameterSymbol::Bound {
+            symbol,
+            width_bits: resolved_width,
+        } = resolution
+            .require_parameter_slot(0)
             .expect("parameter symbol");
-        assert_eq!(
-            resolution.resolve_parameter_entity(r2ssa::SemanticId::Parameter(0)),
-            PlannedParameterSymbol::Bound {
-                symbol,
-                width_bits: 64
-            }
-        );
-        assert_eq!(
-            resolution.require_parameter_slot(0),
-            Ok(PlannedParameterSymbol::Bound {
-                symbol,
-                width_bits: 64
-            })
-        );
-        assert_eq!(
-            resolution.require_parameter_entity(r2ssa::SemanticId::Parameter(0)),
-            Ok(PlannedParameterSymbol::Bound {
-                symbol,
-                width_bits: 64
-            })
-        );
+        assert_eq!(resolved_width, 64);
         assert_eq!(
             resolution.require_parameter_slot(7),
             Err(RenderedIdentityRefusal::MissingParameterDisposition { slot: 7 })
         );
-        assert_eq!(
-            resolution.require_parameter_entity(r2ssa::SemanticId::StackSlot(ObjectId(7))),
-            Err(RenderedIdentityRefusal::InvalidParameterEntity {
-                entity: r2ssa::SemanticId::StackSlot(ObjectId(7))
-            })
-        );
-        assert_eq!(
-            resolution.symbol_for_parameter_entity(r2ssa::SemanticId::Parameter(0)),
-            Some(symbol)
-        );
-        assert_eq!(resolution.parameter_count(), 1);
         assert_eq!(
             resolution.parameters().collect::<Vec<_>>(),
             vec![Ok(ResolvedParameter {
@@ -1153,7 +975,7 @@ mod tests {
     }
 
     #[test]
-    fn stack_resolution_keeps_refusal_and_absence_distinct() {
+    fn stack_require_keeps_refusal_and_absence_distinct() {
         let source = source_owned();
         let mut plan = BindingPlan::build_shadow(&source).expect("plan");
         let refused_object = ObjectId(7);
@@ -1170,28 +992,12 @@ mod tests {
             Rc::new(RefCell::new(SymbolTable::new())),
         )
         .expect("resolution");
-        let symbol = resolution
-            .symbol_for_binding(BindingId(0))
-            .expect("first binding symbol");
-        let answers = [
-            PlannedStackSymbol::Bound(symbol),
-            PlannedStackSymbol::Refused(refusal),
-            PlannedStackSymbol::Absent,
-        ];
-
-        for (index, answer) in answers.iter().enumerate() {
-            assert!(answers[index + 1..].iter().all(|other| answer != other));
-        }
         assert_eq!(
             resolution.require_stack(refused_object),
             Err(RenderedIdentityRefusal::StackObject {
                 object: refused_object,
                 reason: refusal
             })
-        );
-        assert_eq!(
-            resolution.resolve_stack(ObjectId(u32::MAX)),
-            PlannedStackSymbol::Absent
         );
         assert_eq!(
             resolution.require_stack(ObjectId(u32::MAX)),

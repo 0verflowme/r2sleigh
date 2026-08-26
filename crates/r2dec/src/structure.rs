@@ -14,6 +14,7 @@ use crate::control::{DecompileExecutionStop, DecompileWorkControl};
 use crate::fold::FoldingContext;
 use crate::fold::op_lower::OpLoweringRefusal;
 use crate::region::{Region, RegionAnalyzer, RegionTransferKind};
+use crate::symbol::SymbolId;
 use crate::structured_region::{
     SealedStructuredBody, StructuredRegionBuildError, StructuredRegionKind,
     StructuredRegionMarker, SyntheticRegionKind, kind_of, seal_structured_body,
@@ -1542,9 +1543,6 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             else {
                 return Ok(None);
             };
-            if crate::analysis::utils::is_temporary_or_constant_name(&phi.dst.display_name()) {
-                return Ok(None);
-            }
             let Some(target_value) = self.fold_ctx.prepared_value_id_for_var(&phi.dst) else {
                 return Ok(None);
             };
@@ -2530,7 +2528,6 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                     .as_ref()
                     .map(|update| Self::strip_trailing_for_update(symbols, body.clone(), update))
                     .unwrap_or(body);
-                let body = Self::remove_dead_generated_artifact_assignments(symbols, body);
                 CStmt::For {
                     init,
                     cond,
@@ -2594,11 +2591,9 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             };
         };
 
-        let Some((op, retained, eliminated)) = Self::compound_assignment_parts(
-            symbols,
-            &crate::symbol::spelling(symbols, *target_name),
-            right.as_ref(),
-        ) else {
+        let Some((op, retained, eliminated)) =
+            Self::compound_assignment_parts(*target_name, right.as_ref())
+        else {
             return CExpr::Binary {
                 op: BinaryOp::Assign,
                 left,
@@ -2616,8 +2611,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
     }
 
     fn compound_assignment_parts<'b>(
-        symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
-        target_name: &str,
+        target: SymbolId,
         rhs: &'b CExpr,
     ) -> Option<(BinaryOp, &'b CExpr, &'b CExpr)> {
         let CExpr::Binary { op, left, right } = rhs.unobserved() else {
@@ -2625,14 +2619,14 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         };
         let compound_op = Self::compound_assignment_op(*op)?;
 
-        if Self::expr_is_var_named_of(symbols, left, target_name)
+        if Self::expr_is_var(left, target)
             && crate::fold::op_lower::expr_is_side_effect_free(right)
         {
             return Some((compound_op, right, left));
         }
 
         if Self::binary_op_is_commutative_for_compound(*op)
-            && Self::expr_is_var_named_of(symbols, right, target_name)
+            && Self::expr_is_var(right, target)
             && crate::fold::op_lower::expr_is_side_effect_free(left)
         {
             return Some((compound_op, left, right));
@@ -2642,12 +2636,11 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
     }
 
     fn compound_assignment_rhs_of(
-        symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
-        target_name: &str,
+        target: SymbolId,
         rhs: &CExpr,
     ) -> Option<(BinaryOp, CExpr)> {
         let semantic = rhs.clone_without_render_observations();
-        let (op, retained, _) = Self::compound_assignment_parts(symbols, target_name, &semantic)?;
+        let (op, retained, _) = Self::compound_assignment_parts(target, &semantic)?;
         Some((op, retained.clone()))
     }
 
@@ -2674,12 +2667,8 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         )
     }
 
-    fn expr_is_var_named_of(
-        symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
-        expr: &CExpr,
-        target_name: &str,
-    ) -> bool {
-        matches!(expr.unobserved(), CExpr::Var(name) if &*crate::symbol::spelling(symbols, *name) == target_name)
+    fn expr_is_var(expr: &CExpr, target: SymbolId) -> bool {
+        matches!(expr.unobserved(), CExpr::Var(name) if *name == target)
     }
 
     fn rewrite_constant_condition_stmt(stmt: CStmt) -> CStmt {
@@ -3414,18 +3403,6 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         {
             stmts.pop();
         }
-        while stmts
-            .last()
-            .is_some_and(|x| Self::is_generated_side_effect_free_assignment(symbols, x))
-        {
-            stmts.pop();
-            while stmts
-                .last()
-                .is_some_and(|stmt| matches!(stmt.unobserved(), CStmt::Empty))
-            {
-                stmts.pop();
-            }
-        }
         let tail_stmt = stmts.pop()?;
         Self::stmt_is_self_update(symbols, &tail_stmt).then_some((stmts, tail_stmt))
     }
@@ -3447,131 +3424,6 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         Self::stmt_from_vec(stmts)
     }
 
-    fn remove_dead_generated_artifact_assignments(
-        symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
-        stmt: CStmt,
-    ) -> CStmt {
-        let (semantic, observations) = stmt.into_semantic_with_observations();
-        let (rewritten, exact_outer_statement_survives) = match semantic {
-            CStmt::Block(stmts) => {
-                let stmts = stmts
-                    .into_iter()
-                    .map(|x| Self::remove_dead_generated_artifact_assignments(symbols, x))
-                    .collect();
-                let rewritten = Self::stmt_from_vec(
-                    Self::remove_dead_generated_artifact_assignments_from_vec(
-                    symbols, stmts),
-                );
-                let preserves_block = matches!(rewritten, CStmt::Block(_));
-                (rewritten, preserves_block)
-            }
-            CStmt::If {
-                cond,
-                then_body,
-                else_body,
-            } => (
-                CStmt::If {
-                    cond,
-                    then_body: Box::new(Self::remove_dead_generated_artifact_assignments(
-                        symbols, *then_body,
-                    )),
-                    else_body: else_body.map(|body| {
-                        Box::new(Self::remove_dead_generated_artifact_assignments(
-                            symbols, *body,
-                        ))
-                    }),
-                },
-                true,
-            ),
-            CStmt::While { cond, body } => (
-                CStmt::While {
-                    cond,
-                    body: Box::new(Self::remove_dead_generated_artifact_assignments(
-                        symbols, *body,
-                    )),
-                },
-                true,
-            ),
-            CStmt::DoWhile { body, cond } => (
-                CStmt::DoWhile {
-                    body: Box::new(Self::remove_dead_generated_artifact_assignments(
-                        symbols, *body,
-                    )),
-                    cond,
-                },
-                true,
-            ),
-            CStmt::For {
-                init,
-                cond,
-                update,
-                body,
-            } => (
-                CStmt::For {
-                    init,
-                    cond,
-                    update,
-                    body: Box::new(Self::remove_dead_generated_artifact_assignments(
-                        symbols, *body,
-                    )),
-                },
-                true,
-            ),
-            CStmt::Switch {
-                expr,
-                cases,
-                default,
-            } => (
-                CStmt::Switch {
-                    expr,
-                    cases: cases
-                        .into_iter()
-                        .map(|case| crate::ast::SwitchCase {
-                            value: case.value,
-                            body: Self::remove_dead_generated_artifact_assignments_from_vec(
-                                symbols, case.body,
-                            ),
-                        })
-                        .collect(),
-                    default: default.map(|x| {
-                        Self::remove_dead_generated_artifact_assignments_from_vec(symbols, x)
-                    }),
-                },
-                true,
-            ),
-            other => (other, true),
-        };
-        if exact_outer_statement_survives {
-            observations.reapply(rewritten)
-        } else {
-            rewritten
-        }
-    }
-
-    fn remove_dead_generated_artifact_assignments_from_vec(
-        symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
-        stmts: Vec<CStmt>,
-    ) -> Vec<CStmt> {
-        let mut live = HashSet::new();
-        let mut kept = Vec::with_capacity(stmts.len());
-        for stmt in stmts.into_iter().rev() {
-            if let Some((def, reads, generated, side_effect_free)) =
-                Self::stmt_assignment_def_reads(symbols, &stmt)
-            {
-                if generated && side_effect_free && !Self::set_contains_loop_var(&live, &def) {
-                    continue;
-                }
-                Self::set_remove_loop_var_aliases(&mut live, &def);
-                live.extend(reads);
-            } else {
-                live.extend(Self::collect_stmt_vars(symbols, &stmt));
-            }
-            kept.push(stmt);
-        }
-        kept.reverse();
-        kept
-    }
-
     fn expr_matches_for_update(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, body_expr: &CExpr, for_update: &CExpr,
     ) -> bool {
         if body_expr.transparently_eq(for_update) {
@@ -3583,8 +3435,10 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             .is_some_and(|(body, update)| body == update)
     }
 
-    fn normalized_self_update_signature(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, expr: &CExpr,
-    ) -> Option<(String, BinaryOp, CExpr)> {
+    fn normalized_self_update_signature(
+        _symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
+        expr: &CExpr,
+    ) -> Option<(SymbolId, BinaryOp, CExpr)> {
         let semantic = expr.clone_without_render_observations();
         let CExpr::Binary { op, left, right } = &semantic else {
             return None;
@@ -3594,22 +3448,19 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         };
 
         if Self::is_compound_assign_op(*op) {
-            return Some((crate::symbol::spelling(symbols, *name).to_string(), *op, right.as_ref().clone(),
-            ));
+            return Some((*name, *op, right.as_ref().clone()));
         }
 
         if *op == BinaryOp::Assign
-            && let Some((compound_op, rhs)) = Self::compound_assignment_rhs_of(symbols, &crate::symbol::spelling(symbols, *name), right,
-            )
+            && let Some((compound_op, rhs)) = Self::compound_assignment_rhs_of(*name, right)
         {
-            return Some((crate::symbol::spelling(symbols, *name).to_string(), compound_op, rhs,
-            ));
+            return Some((*name, compound_op, rhs));
         }
 
         None
     }
 
-    fn stmt_is_self_update(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, stmt: &CStmt,
+    fn stmt_is_self_update(_symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, stmt: &CStmt,
     ) -> bool {
         let CStmt::Expr(expr) = stmt.unobserved() else {
             return false;
@@ -3631,8 +3482,8 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                 if *op != BinaryOp::Assign {
                     return false;
                 }
-                let rhs_vars = Self::collect_expr_vars(symbols, right);
-                Self::set_contains_loop_var(&rhs_vars, &crate::symbol::spelling(symbols, *name))
+                let rhs_vars = Self::collect_expr_vars(right);
+                rhs_vars.contains(name)
             }
             _ => false,
         }
@@ -3900,13 +3751,12 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             _ => (cond, *body),
         };
 
-        let cond_vars = Self::collect_expr_vars(symbols, &loop_cond);
-        let cond_reads_induction = Self::set_contains_loop_var(&cond_vars, &crate::symbol::spelling(symbols, induction_var),
-        );
+        let cond_vars = Self::collect_expr_vars(&loop_cond);
+        let cond_reads_induction = cond_vars.contains(&induction_var);
         let (update, body_without_update, update_links_cond) =
             Self::extract_loop_update(
                 symbols,
-                &crate::symbol::spelling(symbols, induction_var),
+                induction_var,
                 &cond_vars,
                 loop_body,
             )?;
@@ -3916,8 +3766,6 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         }
 
         let mut rewritten = prefix_stmts;
-        let body_without_update =
-            Self::remove_dead_generated_artifact_assignments(symbols, body_without_update);
         rewritten.push(CStmt::For {
             init: Some(Box::new(init_stmt)),
             cond: Some(loop_cond),
@@ -3975,8 +3823,8 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
     }
 
     fn extract_loop_update(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
-        var: &str,
-        cond_vars: &HashSet<String>,
+        var: SymbolId,
+        cond_vars: &HashSet<SymbolId>,
         body: CStmt,
     ) -> Option<(CExpr, CStmt, bool)> {
         let stmts = Self::stmt_into_vec(body);
@@ -4001,25 +3849,20 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             return None;
         }
 
-        for idx in (0..effective.len()).rev() {
-            if !effective[idx + 1..]
-                .iter()
-                .all(|stmt| {
-                Self::is_removable_trailing_loop_artifact(symbols, stmt, var, cond_vars)
-            })
-            {
-                break;
-            }
-            let prev_stmts = &effective[..idx];
-            if let Some((update, update_links_cond)) =
-                Self::update_expr_from_stmt(symbols, var, cond_vars, prev_stmts, &effective[idx])
-            {
-                let body = effective[..idx].to_vec();
-                return Some((update, Self::stmt_from_vec(body), update_links_cond));
-            }
-        }
-
-        None
+        let update_idx = effective.len() - 1;
+        let prev_stmts = &effective[..update_idx];
+        let (update, update_links_cond) = Self::update_expr_from_stmt(
+            symbols,
+            var,
+            cond_vars,
+            prev_stmts,
+            &effective[update_idx],
+        )?;
+        Some((
+            update,
+            Self::stmt_from_vec(prev_stmts.to_vec()),
+            update_links_cond,
+        ))
     }
 
     fn extract_guard_break_cond(body: CStmt) -> Option<(CExpr, CStmt)> {
@@ -4030,9 +3873,10 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         Some((break_cond, Self::stmt_from_vec(stmts)))
     }
 
-    fn update_expr_from_stmt(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
-        var: &str,
-        cond_vars: &HashSet<String>,
+    fn update_expr_from_stmt(
+        _symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
+        var: SymbolId,
+        cond_vars: &HashSet<SymbolId>,
         prev_stmts: &[CStmt],
         stmt: &CStmt,
     ) -> Option<(CExpr, bool)> {
@@ -4044,7 +3888,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                 if matches!(
                     op,
                     UnaryOp::PreInc | UnaryOp::PostInc | UnaryOp::PreDec | UnaryOp::PostDec
-                ) && matches!(operand.unobserved(), CExpr::Var(name) if Self::loop_var_equiv(&crate::symbol::spelling(symbols, *name), var)) =>
+                ) && matches!(operand.unobserved(), CExpr::Var(name) if *name == var) =>
             {
                 Some((expr.clone(), false))
             }
@@ -4052,15 +3896,14 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                 let CExpr::Var(left_name) = left.unobserved() else {
                     return None;
                 };
-                let left_is_induction = Self::loop_var_equiv(&crate::symbol::spelling(symbols, *left_name), var);
-                let left_feeds_condition = Self::set_contains_loop_var(cond_vars, &crate::symbol::spelling(symbols, *left_name),
-                );
+                let left_is_induction = *left_name == var;
+                let left_feeds_condition = cond_vars.contains(left_name);
                 if *op == BinaryOp::Assign {
-                    let rhs_vars = Self::collect_expr_vars(symbols, right);
-                    let links_cond_direct = Self::sets_overlap_loop_vars(&rhs_vars, cond_vars);
-                    let reads_induction = Self::set_contains_loop_var(&rhs_vars, var);
+                    let rhs_vars = Self::collect_expr_vars(right);
+                    let links_cond_direct = !rhs_vars.is_disjoint(cond_vars);
+                    let reads_induction = rhs_vars.contains(&var);
                     let links_cond_via_alias =
-                        Self::rhs_links_cond_via_alias(symbols, prev_stmts, &rhs_vars, cond_vars);
+                        Self::rhs_links_cond_via_alias(prev_stmts, &rhs_vars, cond_vars);
                     if (left_is_induction && reads_induction)
                         || (left_feeds_condition && (links_cond_direct || links_cond_via_alias))
                     {
@@ -4068,7 +3911,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                     }
                 }
                 if Self::is_compound_assign_op(*op)
-                    && matches!(left.unobserved(), CExpr::Var(name) if Self::loop_var_equiv(&crate::symbol::spelling(symbols, *name), var))
+                    && matches!(left.unobserved(), CExpr::Var(name) if *name == var)
                 {
                     return Some((expr.clone(), false));
                 }
@@ -4076,105 +3919,6 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             }
             _ => None,
         }
-    }
-
-    fn is_removable_trailing_loop_artifact(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
-        stmt: &CStmt,
-        var: &str,
-        cond_vars: &HashSet<String>,
-    ) -> bool {
-        let (name, rhs) = match stmt.unobserved() {
-            CStmt::Expr(expr) => {
-                let CExpr::Binary {
-                    op: BinaryOp::Assign,
-                    left,
-                    right,
-                } = expr.unobserved()
-                else {
-                    return false;
-                };
-                let CExpr::Var(name) = left.unobserved() else {
-                    return false;
-                };
-                (&*crate::symbol::spelling(symbols, *name), right.as_ref())
-            }
-            CStmt::Decl {
-                name,
-                init: Some(rhs),
-                ..
-            } => (&*crate::symbol::spelling(symbols, *name), rhs),
-            _ => return false,
-        };
-        if Self::loop_var_equiv(name, var) || Self::set_contains_loop_var(cond_vars, name) {
-            return false;
-        }
-        Self::is_generated_artifact_name(name) && crate::fold::op_lower::expr_is_side_effect_free(rhs)
-    }
-
-    fn is_generated_side_effect_free_assignment(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, stmt: &CStmt,
-    ) -> bool {
-        let (name, rhs) = match stmt.unobserved() {
-            CStmt::Expr(expr) => {
-                let CExpr::Binary {
-                    op: BinaryOp::Assign,
-                    left,
-                    right,
-                } = expr.unobserved()
-                else {
-                    return false;
-                };
-                let CExpr::Var(name) = left.unobserved() else {
-                    return false;
-                };
-                (&*crate::symbol::spelling(symbols, *name), right.as_ref())
-            }
-            CStmt::Decl {
-                name,
-                init: Some(rhs),
-                ..
-            } => (&*crate::symbol::spelling(symbols, *name), rhs),
-            _ => return false,
-        };
-        Self::is_generated_artifact_name(name) && crate::fold::op_lower::expr_is_side_effect_free(rhs)
-    }
-
-    fn is_generated_artifact_name(name: &str) -> bool {
-
-        let lower = name.to_ascii_lowercase();
-        let versioned_register = lower.rsplit_once('_').is_some_and(|(base, version)| {
-            version.bytes().all(|byte| byte.is_ascii_digit())
-                && matches!(
-                    base,
-                    "al" | "ah"
-                        | "ax"
-                        | "eax"
-                        | "rax"
-                        | "bl"
-                        | "bh"
-                        | "bx"
-                        | "ebx"
-                        | "rbx"
-                        | "cl"
-                        | "ch"
-                        | "cx"
-                        | "ecx"
-                        | "rcx"
-                        | "dl"
-                        | "dh"
-                        | "dx"
-                        | "edx"
-                        | "rdx"
-                        | "esi"
-                        | "rsi"
-                        | "edi"
-                        | "rdi"
-                )
-        });
-        lower.starts_with("value_")
-            || crate::analysis::utils::is_temporary_name(name)
-            || lower.contains(':')
-            || (lower.starts_with('t') && lower[1..].chars().all(|ch| ch.is_ascii_digit()))
-            || versioned_register
     }
 
     fn is_if_break_without_else(stmt: &CStmt) -> Option<CExpr> {
@@ -4252,30 +3996,29 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         }
     }
 
-    fn rhs_links_cond_via_alias(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
+    fn rhs_links_cond_via_alias(
         prev_stmts: &[CStmt],
-        rhs_vars: &HashSet<String>,
-        cond_vars: &HashSet<String>,
+        rhs_vars: &HashSet<SymbolId>,
+        cond_vars: &HashSet<SymbolId>,
     ) -> bool {
         let mut tracked = rhs_vars.clone();
         for stmt in prev_stmts.iter().rev().take(2) {
-            let Some((def, prev_reads)) = Self::stmt_def_and_reads(symbols, stmt) else {
+            let Some((def, prev_reads)) = Self::stmt_def_and_reads(stmt) else {
                 continue;
             };
-            if !Self::set_contains_loop_var(&tracked, &def) {
+            if !tracked.contains(&def) {
                 continue;
             }
-            if Self::sets_overlap_loop_vars(&prev_reads, cond_vars) {
+            if !prev_reads.is_disjoint(cond_vars) {
                 return true;
             }
-            Self::set_remove_loop_var_aliases(&mut tracked, &def);
+            tracked.remove(&def);
             tracked.extend(prev_reads);
         }
         false
     }
 
-    fn stmt_def_and_reads(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, stmt: &CStmt,
-    ) -> Option<(String, HashSet<String>)> {
+    fn stmt_def_and_reads(stmt: &CStmt) -> Option<(SymbolId, HashSet<SymbolId>)> {
         let CStmt::Expr(expr) = stmt.unobserved()
         else {
             return None;
@@ -4291,136 +4034,12 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         let CExpr::Var(def) = left.unobserved() else {
             return None;
         };
-        Some((crate::symbol::spelling(symbols, *def).to_string(), Self::collect_expr_vars(symbols, right),
-        ))
+        Some((*def, Self::collect_expr_vars(right)))
     }
 
-    fn stmt_assignment_def_reads(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, stmt: &CStmt,
-    ) -> Option<(String, HashSet<String>, bool, bool)> {
-        match stmt.unobserved() {
-            CStmt::Expr(expr) => {
-                let CExpr::Binary {
-                    op: BinaryOp::Assign,
-                    left,
-                    right,
-                } = expr.unobserved()
-                else {
-                    return None;
-                };
-                let CExpr::Var(def) = left.unobserved() else {
-                    return None;
-                };
-                Some((
-                    crate::symbol::spelling(symbols, *def).to_string(),
-                    Self::collect_expr_vars(symbols, right),
-                    Self::is_generated_artifact_name(&crate::symbol::spelling(symbols, *def)),
-                    crate::fold::op_lower::expr_is_side_effect_free(right),
-                ))
-            }
-            CStmt::Decl {
-                name,
-                init: Some(init),
-                ..
-            } => Some((
-                crate::symbol::spelling(symbols, *name).to_string(),
-                Self::collect_expr_vars(symbols, init),
-                Self::is_generated_artifact_name(&crate::symbol::spelling(symbols, *name)),
-                crate::fold::op_lower::expr_is_side_effect_free(init),
-            )),
-            _ => None,
-        }
-    }
-
-    fn collect_stmt_vars(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, stmt: &CStmt,
-    ) -> HashSet<String> {
+    fn collect_expr_vars(expr: &CExpr) -> HashSet<SymbolId> {
         let mut vars = HashSet::new();
-        Self::collect_stmt_vars_into(symbols, stmt, &mut vars);
-        vars
-    }
-
-    fn collect_stmt_vars_into(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, stmt: &CStmt, out: &mut HashSet<String>,
-    ) {
-        match stmt {
-            CStmt::StructuredRegion { stmt, .. } => {
-                Self::collect_stmt_vars_into(symbols, stmt, out)
-            }
-            CStmt::Observed { stmt, .. } => Self::collect_stmt_vars_into(symbols, stmt, out),
-            CStmt::Expr(expr) | CStmt::Return(Some(expr)) => {
-                Self::collect_expr_vars_into(symbols, expr, out)
-            }
-            CStmt::Decl {
-                init: Some(init), ..
-            } => Self::collect_expr_vars_into(symbols, init, out),
-            CStmt::If {
-                cond,
-                then_body,
-                else_body,
-            } => {
-                Self::collect_expr_vars_into(symbols, cond, out);
-                Self::collect_stmt_vars_into(symbols, then_body, out);
-                if let Some(else_body) = else_body.as_ref() {
-                    Self::collect_stmt_vars_into(symbols, else_body, out);
-                }
-            }
-            CStmt::While { cond, body } | CStmt::DoWhile { body, cond } => {
-                Self::collect_expr_vars_into(symbols, cond, out);
-                Self::collect_stmt_vars_into(symbols, body, out);
-            }
-            CStmt::For {
-                init,
-                cond,
-                update,
-                body,
-            } => {
-                if let Some(init) = init.as_ref() {
-                    Self::collect_stmt_vars_into(symbols, init, out);
-                }
-                if let Some(cond) = cond.as_ref() {
-                    Self::collect_expr_vars_into(symbols, cond, out);
-                }
-                if let Some(update) = update.as_ref() {
-                    Self::collect_expr_vars_into(symbols, update, out);
-                }
-                Self::collect_stmt_vars_into(symbols, body, out);
-            }
-            CStmt::Block(stmts) => {
-                for stmt in stmts {
-                    Self::collect_stmt_vars_into(symbols, stmt, out);
-                }
-            }
-            CStmt::Switch {
-                expr,
-                cases,
-                default,
-            } => {
-                Self::collect_expr_vars_into(symbols, expr, out);
-                for case in cases {
-                    Self::collect_expr_vars_into(symbols, &case.value, out);
-                    for stmt in &case.body {
-                        Self::collect_stmt_vars_into(symbols, stmt, out);
-                    }
-                }
-                if let Some(default) = default.as_ref() {
-                    for stmt in default {
-                        Self::collect_stmt_vars_into(symbols, stmt, out);
-                    }
-                }
-            }
-            CStmt::Return(None)
-            | CStmt::Decl { init: None, .. }
-            | CStmt::Break
-            | CStmt::Continue
-            | CStmt::Goto(_)
-            | CStmt::Label(_)
-            | CStmt::Comment(_)
-            | CStmt::Empty => {}
-        }
-    }
-
-    fn collect_expr_vars(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, expr: &CExpr,
-    ) -> HashSet<String> {
-        let mut vars = HashSet::new();
-        Self::collect_expr_vars_into(symbols, expr, &mut vars);
+        Self::collect_expr_vars_into(expr, &mut vars);
         vars
     }
 
@@ -4526,55 +4145,52 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         }
     }
 
-    fn collect_expr_vars_into(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, expr: &CExpr, out: &mut HashSet<String>,
-    ) {
+    fn collect_expr_vars_into(expr: &CExpr, out: &mut HashSet<SymbolId>) {
         match Self::normalize_loop_expr_refs(expr) {
-            CExpr::Observed { expr, .. } => Self::collect_expr_vars_into(symbols, expr, out),
+            CExpr::Observed { expr, .. } => Self::collect_expr_vars_into(expr, out),
             CExpr::Var(name) => {
-                out.insert(crate::symbol::spelling(symbols, *name).trim_start_matches('&').to_string(),
-                );
+                out.insert(*name);
             }
             CExpr::External { .. } => {}
             CExpr::AddrOf(inner) | CExpr::Deref(inner) => {
                 if let CExpr::Var(name) = Self::normalize_loop_expr_refs(inner) {
-                    out.insert(crate::symbol::spelling(symbols, *name).trim_start_matches('&').to_string(),
-                    );
+                    out.insert(*name);
                 }
-                Self::collect_expr_vars_into(symbols, inner, out);
+                Self::collect_expr_vars_into(inner, out);
             }
-            CExpr::Unary { operand, .. } => Self::collect_expr_vars_into(symbols, operand, out),
+            CExpr::Unary { operand, .. } => Self::collect_expr_vars_into(operand, out),
             CExpr::Binary { left, right, .. } => {
-                Self::collect_expr_vars_into(symbols, left, out);
-                Self::collect_expr_vars_into(symbols, right, out);
+                Self::collect_expr_vars_into(left, out);
+                Self::collect_expr_vars_into(right, out);
             }
             CExpr::Ternary {
                 cond,
                 then_expr,
                 else_expr,
             } => {
-                Self::collect_expr_vars_into(symbols, cond, out);
-                Self::collect_expr_vars_into(symbols, then_expr, out);
-                Self::collect_expr_vars_into(symbols, else_expr, out);
+                Self::collect_expr_vars_into(cond, out);
+                Self::collect_expr_vars_into(then_expr, out);
+                Self::collect_expr_vars_into(else_expr, out);
             }
             CExpr::Cast { expr, .. } | CExpr::Paren(expr) | CExpr::Sizeof(expr) => {
-                Self::collect_expr_vars_into(symbols, expr, out)
+                Self::collect_expr_vars_into(expr, out)
             }
             CExpr::Call { func, args, .. } => {
-                Self::collect_expr_vars_into(symbols, func, out);
+                Self::collect_expr_vars_into(func, out);
                 for arg in args {
-                    Self::collect_expr_vars_into(symbols, arg, out);
+                    Self::collect_expr_vars_into(arg, out);
                 }
             }
             CExpr::Subscript { base, index } => {
-                Self::collect_expr_vars_into(symbols, base, out);
-                Self::collect_expr_vars_into(symbols, index, out);
+                Self::collect_expr_vars_into(base, out);
+                Self::collect_expr_vars_into(index, out);
             }
             CExpr::Member { base, .. } | CExpr::PtrMember { base, .. } => {
-                Self::collect_expr_vars_into(symbols, base, out);
+                Self::collect_expr_vars_into(base, out);
             }
             CExpr::Comma(values) => {
                 for value in values {
-                    Self::collect_expr_vars_into(symbols, value, out);
+                    Self::collect_expr_vars_into(value, out);
                 }
             }
             CExpr::IntLit(_)
@@ -4583,46 +4199,6 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             | CExpr::StringLit(_)
             | CExpr::CharLit(_)
             | CExpr::SizeofType(_) => {}
-        }
-    }
-
-    fn loop_var_base(name: &str) -> &str {
-        let name = name.trim_start_matches('&');
-        if let Some((base, suffix)) = name.rsplit_once('_')
-            && !base.is_empty()
-            && suffix.chars().all(|ch| ch.is_ascii_digit())
-        {
-            return base;
-        }
-        name
-    }
-
-    fn loop_var_equiv(a: &str, b: &str) -> bool {
-
-        if a.eq_ignore_ascii_case(b) {
-            return true;
-        }
-        Self::loop_var_base(a).eq_ignore_ascii_case(Self::loop_var_base(b))
-    }
-
-    fn set_contains_loop_var(vars: &HashSet<String>, target: &str) -> bool {
-
-        vars.iter().any(|name| Self::loop_var_equiv(name, target))
-    }
-
-    fn sets_overlap_loop_vars(a: &HashSet<String>, b: &HashSet<String>) -> bool {
-        a.iter()
-            .any(|name| b.iter().any(|other| Self::loop_var_equiv(name, other)))
-    }
-
-    fn set_remove_loop_var_aliases(vars: &mut HashSet<String>, target: &str) {
-        let to_remove: Vec<String> = vars
-            .iter()
-            .filter(|name| Self::loop_var_equiv(name, target))
-            .cloned()
-            .collect();
-        for name in to_remove {
-            vars.remove(&name);
         }
     }
 
@@ -5750,7 +5326,6 @@ mod tests {
                             hash_xor.clone(),
                             hash_mul.clone(),
                             i_update.clone(),
-                            assign(&symbols, "value_1", v(&symbols, "c")),
                             CStmt::Continue,
                         ]),
                         None,
@@ -6056,7 +5631,7 @@ mod tests {
         );
         let first_work = assign(&symbols, "sum", v(&symbols, "i"));
         let second_work = assign(&symbols, "hash", v(&symbols, "byte"));
-        let dead_generated = assign(&symbols, "tmp:dead", CExpr::IntLit(9));
+        let trailing_assignment = assign(&symbols, "tmp:dead", CExpr::IntLit(9));
         let plain_input = CStmt::Block(vec![
             CStmt::For {
                 init: None,
@@ -6077,7 +5652,7 @@ mod tests {
                 update: None,
                 body: Box::new(CStmt::Block(vec![
                     second_work.clone(),
-                    dead_generated.clone(),
+                    trailing_assignment.clone(),
                 ])),
             },
         ]);
@@ -6097,7 +5672,7 @@ mod tests {
             .observe_stmt(second_work)
             .expect("second loop work observation");
         let (second_body_inner_id, second_body) = owner
-            .observe_stmt(CStmt::Block(vec![second_work, dead_generated]))
+            .observe_stmt(CStmt::Block(vec![second_work, trailing_assignment]))
             .expect("second loop body observation");
         let (second_body_outer_id, second_body) = owner
             .observe_stmt(second_body)
@@ -6506,7 +6081,7 @@ mod tests {
     }
 
     #[test]
-    fn rewrites_for_loop_past_generated_trailing_value_carrier() {
+    fn keeps_while_when_unproven_trailing_assignment_follows_update() {
         let symbols = test_table();
         let input = CStmt::Block(vec![
             CStmt::Block(vec![
@@ -6543,38 +6118,12 @@ mod tests {
 
         let cleaned = ControlFlowStructurer::cleanup(&symbols, input);
         let CStmt::Block(stmts) = cleaned else {
-            panic!("Expected block with sum init and for-loop, got {cleaned:?}");
+            panic!("Expected block with sum init and while-loop, got {cleaned:?}");
         };
         assert!(
-            matches!(
-                stmts.get(1),
-                Some(CStmt::For {
-                    update: Some(CExpr::Unary {
-                        op: UnaryOp::PostInc,
-                        ..
-                    }),
-                    ..
-                })
-            ),
-            "generated trailing value carrier should not own loop update: {stmts:?}"
+            matches!(stmts.get(1), Some(CStmt::While { .. })),
+            "an unproven trailing assignment must prevent a for-loop rewrite: {stmts:?}"
         );
-    }
-
-    #[test]
-    fn generated_artifact_name_uses_typed_temporary_kind() {
-        assert!(ControlFlowStructurer::is_generated_artifact_name(
-            "tmp:11f00_4"
-        ));
-        assert!(ControlFlowStructurer::is_generated_artifact_name(
-            "TMP:11f00_4"
-        ));
-        assert!(ControlFlowStructurer::is_generated_artifact_name(
-            "unique:12_0"
-        ));
-        assert!(ControlFlowStructurer::is_generated_artifact_name("value_1"));
-        assert!(!ControlFlowStructurer::is_generated_artifact_name(
-            "sha_state"
-        ));
     }
 
     #[test]
@@ -7140,24 +6689,37 @@ mod tests {
     }
 
     #[test]
-    fn rewrites_while_to_for_when_condition_uses_suffix_equivalent_var_name() {
-        let symbols = test_table();
-        let input = CStmt::Block(vec![
-            assign(&symbols, "local_4", CExpr::IntLit(0)),
-            CStmt::while_loop(
-                CExpr::binary(BinaryOp::Lt, CExpr::AddrOf(Box::new(v(&symbols, "local"))), v(&symbols, "n"),
+    fn distinct_suffix_and_case_var_symbols_do_not_merge_for_rewrite() {
+        for (init_name, cond_name) in [("local_4", "local"), ("Index", "index")] {
+            let symbols = test_table();
+            let input = CStmt::Block(vec![
+                assign(&symbols, init_name, CExpr::IntLit(0)),
+                CStmt::while_loop(
+                    CExpr::binary(
+                        BinaryOp::Lt,
+                        v(&symbols, cond_name),
+                        v(&symbols, "n"),
+                    ),
+                    CStmt::Block(vec![assign(
+                        &symbols,
+                        init_name,
+                        CExpr::binary(
+                            BinaryOp::Add,
+                            v(&symbols, init_name),
+                            CExpr::IntLit(1),
+                        ),
+                    )]),
                 ),
-                CStmt::Block(vec![assign(&symbols, 
-                    "local_4",
-                    CExpr::binary(BinaryOp::Add, v(&symbols, "local_4"), CExpr::IntLit(1)),
-                )]),
-            ),
-        ]);
+            ]);
 
-        let cleaned = ControlFlowStructurer::cleanup(&symbols, input);
-        assert!(
-            matches!(cleaned, CStmt::For { .. }),
-            "Suffix-equivalent loop vars (local/local_4) should be treated as matching"
-        );
+            let cleaned = ControlFlowStructurer::cleanup(&symbols, input);
+            let CStmt::Block(stmts) = cleaned else {
+                panic!("distinct symbols must retain the while form");
+            };
+            assert!(
+                matches!(stmts.get(1), Some(CStmt::While { .. })),
+                "{init_name:?} and {cond_name:?} are distinct SymbolIds"
+            );
+        }
     }
 }

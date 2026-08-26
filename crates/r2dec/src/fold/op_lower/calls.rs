@@ -96,19 +96,6 @@ impl<'a> FoldingContext<'a> {
         )
     }
 
-    #[cfg(test)]
-    pub(super) fn resolved_callee_target_for_optional_site(
-        &self,
-        source_call: Option<(u64, usize)>,
-        callee: &CExpr,
-    ) -> Option<r2types::ResolvedCalleeTarget> {
-        let prepared_direct_target = source_call
-            .is_none()
-            .then(|| self.direct_target_addr_from_callee_expr(callee))
-            .flatten();
-        self.resolved_callee_target(source_call, prepared_direct_target)
-    }
-
     pub(super) fn resolved_callee_target_for_site(
         &self,
         block_addr: u64,
@@ -261,12 +248,6 @@ impl<'a> FoldingContext<'a> {
                 Err(OpLoweringRefusal::MissingProgramVariableAuthorization)
             }
         }
-    }
-
-    #[cfg(test)]
-    pub(super) fn is_modeled_call_target(&self, callee: &CExpr) -> bool {
-        self.resolved_callee_target_for_optional_site(None, callee)
-            .is_some_and(|target| target.policy.modeled)
     }
 
     #[cfg(test)]

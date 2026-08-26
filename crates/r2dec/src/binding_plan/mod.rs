@@ -1,14 +1,8 @@
 //! Typed boundary between canonical SSA facts and C lowering.
 //!
-//! Stage 4 constructs this plan in shadow mode but does not consume it while
-//! rendering. Use and write geometry remain owned by the validated upstream
+//! Use and write geometry remain owned by the validated upstream
 //! [`MachineProjection`]; this module delegates to that table instead of
 //! copying a second answer into renderer-owned storage.
-
-#![allow(
-    dead_code,
-    reason = "Stage 4 shadow plan is sealed before the Stage 5 render cutover"
-)]
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -104,10 +98,8 @@ pub(crate) struct ValueElisionProof {
 pub(crate) enum ValueRefusal {
     MissingBindingCertificate { value: ValueId },
     MissingLiteralProjection { value: ValueId },
-    MissingUseProjection { site: UseSite },
     IncoherentUseProjection { site: UseSite },
     IncoherentWriteProjection { value: ValueId },
-    UnsupportedMachineExpression { value: ValueId },
     UnsupportedDeclarationWidth { value: ValueId, width_bits: u32 },
 }
 
@@ -313,9 +305,6 @@ pub(crate) enum BindingPlanSourceMismatch {
         value: ValueId,
         binding: BindingId,
     },
-    NonBoundValue {
-        value: ValueId,
-    },
     CertificateMembership {
         binding: BindingId,
     },
@@ -359,13 +348,6 @@ pub(crate) enum BindingPlanSourceMismatch {
     },
     ParameterDeclarationWidth {
         slot: u32,
-        binding: BindingId,
-    },
-    ParameterRole {
-        slot: u32,
-        binding: BindingId,
-    },
-    BindingRole {
         binding: BindingId,
     },
 }
@@ -487,10 +469,6 @@ use construction::binding_components;
 #[cfg(test)]
 use seal::seal_binding_components;
 impl BindingPlan {
-    pub(crate) const fn authority(&self) -> &SsaArtifactAuthority {
-        &self.authority
-    }
-
     pub(crate) const fn machine_projection(&self) -> &MachineProjection {
         &self.machine_projection
     }
@@ -522,18 +500,6 @@ impl BindingPlan {
     /// contain empty cells when the certified slot domain is sparse.
     pub(crate) fn parameter_disposition(&self, slot: u32) -> Option<ParameterDisposition> {
         self.parameters.get(slot as usize).copied().flatten()
-    }
-
-    /// Resolve a typed semantic parameter identity without a reverse spelling
-    /// table. Non-parameter identities are outside this domain.
-    pub(crate) fn parameter_entity_disposition(
-        &self,
-        entity: SemanticId,
-    ) -> Option<ParameterDisposition> {
-        let SemanticId::Parameter(slot) = entity else {
-            return None;
-        };
-        self.parameter_disposition(slot)
     }
 
     pub(crate) fn binding_role(&self, binding: BindingId) -> Option<BindingRole> {

@@ -15,8 +15,6 @@ use super::{
 use super::StackSlotProvenance;
 #[cfg(test)]
 use super::utils::format_traced_name;
-#[cfg(test)]
-use crate::address::parse_address_from_var_name;
 use crate::ast::{BinaryOp, CExpr, CType, UnaryOp};
 use crate::binding_plan::PlannedValueSymbol;
 
@@ -187,13 +185,6 @@ impl<'a> LowerCtx<'a> {
             return self.fixture_constant_to_expr(var);
         }
 
-        #[cfg(test)]
-        if let Some(addr) = parse_address_from_var_name(&var.name)
-            && let Some(expr) = self.resolve_addr_literal(addr)
-        {
-            return Ok(expr);
-        }
-
         if self.binding_names.is_none() {
             #[cfg(test)]
             return Ok(self.expr_for_ssa_name(var.display_name().as_str()));
@@ -294,12 +285,6 @@ impl<'a> LowerCtx<'a> {
             } else {
                 CExpr::IntLit(val as i64)
             };
-        }
-
-        if let Some(addr) = parse_address_from_var_name(name)
-            && let Some(expr) = self.resolve_addr_literal(addr)
-        {
-            return expr;
         }
 
         if let Some(prov) = self.forwarded_value_for_name(name)
