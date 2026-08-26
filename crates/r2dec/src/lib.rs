@@ -1903,15 +1903,6 @@ impl DecompilerConfig {
     }
 }
 
-#[cfg(test)]
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct LocalStructFieldAccess {
-    pub arg_index: usize,
-    pub field_offset: u64,
-    pub access_size: u32,
-    pub is_write: bool,
-}
-
 #[derive(Debug, Clone, Default)]
 struct DecompilerContext {
     #[cfg(test)]
@@ -4378,8 +4369,6 @@ impl Decompiler {
             symbols,
             analysis::PreparedSemanticViewInputs {
                 prepared,
-                #[cfg(test)]
-                abi_arg_regs: &self.config.arg_regs,
                 #[cfg(test)]
                 stack_slots: &self.context.type_facts().stack_slots,
                 #[cfg(test)]

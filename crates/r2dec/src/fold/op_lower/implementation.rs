@@ -859,7 +859,6 @@ impl<'a> FoldingContext<'a> {
         Some(self.prepared_semantic_view_cache.get_or_init(|| {
             analysis::PreparedSemanticView::build(&self.symbols, analysis::PreparedSemanticViewInputs {
                 prepared,
-                abi_arg_regs: &self.inputs.arch.arg_regs,
                 stack_slots: self.inputs.stack_slots,
                 visible_bindings: self.inputs.visible_bindings,
                 param_register_aliases: analysis::no_carrier_aliases(),
@@ -2054,12 +2053,6 @@ impl<'a> FoldingContext<'a> {
             return self.state.return_blocks.contains(&addr);
         }
         false
-    }
-
-    /// Analyze a block to collect use counts and definitions.
-    #[cfg(test)]
-    pub(crate) fn analyze_block(&mut self, block: &SSABlock) {
-        self.analyze_blocks(std::slice::from_ref(block));
     }
 
     /// Analyze multiple blocks (for function-level folding).
@@ -6375,7 +6368,7 @@ impl<'a> FoldingContext<'a> {
     }
 
     #[cfg(test)]
-    pub(super) fn debug_visible_expr_quality(
+    fn debug_visible_expr_quality(
         &self,
         expr: &CExpr,
         context: VisibleExprContext,
@@ -8108,14 +8101,6 @@ impl<'a> FoldingContext<'a> {
     }
 
     #[cfg(test)]
-    pub(crate) fn debug_stack_slot_provenance(
-        &self,
-        name: &str,
-    ) -> Option<analysis::StackSlotProvenance> {
-        self.stack_slot_provenance_for_name(name)
-    }
-
-    #[cfg(test)]
     pub(crate) fn debug_render_memory_access_from_visible_expr(
         &self,
         expr: &CExpr,
@@ -8123,27 +8108,6 @@ impl<'a> FoldingContext<'a> {
     ) -> Option<CExpr> {
         let mut visited = HashSet::new();
         self.render_memory_access_from_visible_expr(expr, elem_size, 0, &mut visited)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn debug_normalized_addr_from_visible_expr(
-        &self,
-        expr: &CExpr,
-    ) -> Option<analysis::NormalizedAddr> {
-        self.normalized_addr_from_visible_expr(expr, 0)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn debug_canonicalize_visible_address_expr(&self, expr: &CExpr) -> CExpr {
-        self.canonicalize_visible_address_expr(expr, 0)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn debug_extract_visible_scaled_index(
-        &self,
-        expr: &CExpr,
-    ) -> Option<(analysis::ValueRef, i64)> {
-        self.extract_visible_scaled_index(expr, 0)
     }
 
     fn evaluate_constish_call_arg_expr(&self, expr: &CExpr, depth: u32) -> Option<u64> {

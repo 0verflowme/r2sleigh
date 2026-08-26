@@ -23,9 +23,11 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use r2ssa::{
-    DecompilePrepFacts, MemoryDefFact, MemoryLocation, ObjectKind, ObjectModel,
-    PreparedFunctionFacts, SSAFunction, SSAOp, SSAVar, SSAVarNameKind, SsaArtifact, ValueId,
+    DecompilePrepFacts, MemoryLocation, ObjectKind, ObjectModel, PreparedFunctionFacts,
+    SSAFunction, SSAOp, SSAVar, SSAVarNameKind, SsaArtifact, ValueId,
 };
+#[cfg(test)]
+use r2ssa::MemoryDefFact;
 #[cfg(test)]
 use r2types::StackSlotKey;
 #[cfg(test)]

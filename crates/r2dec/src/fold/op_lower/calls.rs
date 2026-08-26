@@ -1657,15 +1657,6 @@ impl<'a> FoldingContext<'a> {
     }
 }
 
-#[cfg(test)]
-fn stack_slot_synthetic_name(offset: i64) -> String {
-    if offset < 0 {
-        format!("local_{:x}", (-offset) as u64)
-    } else {
-        format!("stack_{:x}", offset as u64)
-    }
-}
-
 /// What kind of outside thing a call names.
 ///
 /// The identity already classified it, so the rendering says what the analysis

@@ -90,8 +90,6 @@ pub(crate) struct PreparedSemanticView {
 pub(crate) struct PreparedSemanticViewInputs<'a> {
     pub(crate) prepared: &'a SsaArtifact,
     #[cfg(test)]
-    pub(crate) abi_arg_regs: &'a [String],
-    #[cfg(test)]
     pub(crate) stack_slots: &'a BTreeMap<StackSlotKey, ExternalStackSlotSpec>,
     #[cfg(test)]
     pub(crate) visible_bindings: &'a [VisibleBinding],
@@ -4116,14 +4114,6 @@ mod tests {
         SSAVar::new(name, version, size)
     }
 
-    fn test_prepared_artifact() -> SsaArtifact {
-        let mut block = R2ILBlock::new(0x1000, 1);
-        block.push(R2ILOp::Return {
-            target: Varnode::constant(0, 8),
-        });
-        SsaArtifact::from_blocks(&[block], None).expect("prepared SSA artifact")
-    }
-
     fn test_prepared_call_artifact() -> SsaArtifact {
         let mut block = R2ILBlock::new(0x1000, 5);
         block.push(R2ILOp::Call {
@@ -4521,7 +4511,6 @@ mod tests {
     fn prepared_view_prefers_typed_callee_resolution_over_raw_name_maps() {
         let symbols = test_table();
         let prepared = test_prepared_call_artifact();
-        let abi_arg_regs = vec!["rdi".to_string(), "rsi".to_string()];
         let resolution_function_names = HashMap::from([(0x401000, "sym.imp.printf".to_string())]);
         let binary_symbols = HashMap::new();
         let callee_facts = BTreeMap::new();
@@ -4550,7 +4539,6 @@ mod tests {
 
         let view = PreparedSemanticView::build(&symbols, PreparedSemanticViewInputs {
             prepared: &prepared,
-            abi_arg_regs: &abi_arg_regs,
             stack_slots: &stack_slots,
             visible_bindings: &visible_bindings,
             param_register_aliases: &param_register_aliases,
@@ -4590,7 +4578,6 @@ mod tests {
     fn prepared_view_uses_typed_direct_addr_identity_through_callsite_facts() {
         let symbols = test_table();
         let prepared = test_prepared_call_artifact();
-        let abi_arg_regs = vec!["rdi".to_string(), "rsi".to_string()];
         let key = r2types::CalleeIdentityKey::DirectAddress(0x401000);
         let mut callee_resolution = CalleeResolutionFacts::default();
         callee_resolution
@@ -4610,7 +4597,6 @@ mod tests {
 
         let view = PreparedSemanticView::build(&symbols, PreparedSemanticViewInputs {
             prepared: &prepared,
-            abi_arg_regs: &abi_arg_regs,
             stack_slots: &stack_slots,
             visible_bindings: &visible_bindings,
             param_register_aliases: &param_register_aliases,
@@ -4650,7 +4636,6 @@ mod tests {
     fn prepared_view_requires_callsite_facts_for_direct_addr_identity() {
         let symbols = test_table();
         let prepared = test_prepared_call_artifact();
-        let abi_arg_regs = vec!["rdi".to_string(), "rsi".to_string()];
         let key = r2types::CalleeIdentityKey::DirectAddress(0x401000);
         let mut callee_resolution = CalleeResolutionFacts::default();
         callee_resolution
@@ -4667,7 +4652,6 @@ mod tests {
 
         let view = PreparedSemanticView::build(&symbols, PreparedSemanticViewInputs {
             prepared: &prepared,
-            abi_arg_regs: &abi_arg_regs,
             stack_slots: &stack_slots,
             visible_bindings: &visible_bindings,
             param_register_aliases: &param_register_aliases,
@@ -4692,14 +4676,12 @@ mod tests {
     fn prepared_view_refuses_raw_callee_identity_without_typed_resolution() {
         let symbols = test_table();
         let prepared = test_prepared_call_artifact();
-        let abi_arg_regs = vec!["rdi".to_string(), "rsi".to_string()];
         let stack_slots = BTreeMap::new();
         let visible_bindings = Vec::new();
         let param_register_aliases = HashMap::new();
 
         let view = PreparedSemanticView::build(&symbols, PreparedSemanticViewInputs {
             prepared: &prepared,
-            abi_arg_regs: &abi_arg_regs,
             stack_slots: &stack_slots,
             visible_bindings: &visible_bindings,
             param_register_aliases: &param_register_aliases,
@@ -4729,14 +4711,12 @@ mod tests {
             1,
             "fixture should expose a structural recursive call"
         );
-        let abi_arg_regs = vec!["rdi".to_string(), "rsi".to_string()];
         let stack_slots = BTreeMap::new();
         let visible_bindings = Vec::new();
         let param_register_aliases = HashMap::new();
 
         let view = PreparedSemanticView::build(&symbols, PreparedSemanticViewInputs {
             prepared: &prepared,
-            abi_arg_regs: &abi_arg_regs,
             stack_slots: &stack_slots,
             visible_bindings: &visible_bindings,
             param_register_aliases: &param_register_aliases,
@@ -4757,7 +4737,6 @@ mod tests {
     fn prepared_call_arity_prefers_typed_callee_signature_over_summary_hint() {
         let symbols = test_table();
         let prepared = test_prepared_two_arg_call_artifact();
-        let abi_arg_regs = vec!["rdi".to_string(), "rsi".to_string()];
         let typed_function_names = HashMap::from([(0x401000, "sym.imp.one_arg".to_string())]);
         let binary_symbols = HashMap::new();
         let callee_facts = BTreeMap::new();
@@ -4804,7 +4783,6 @@ mod tests {
 
         let view = PreparedSemanticView::build(&symbols, PreparedSemanticViewInputs {
             prepared: &prepared,
-            abi_arg_regs: &abi_arg_regs,
             stack_slots: &stack_slots,
             visible_bindings: &visible_bindings,
             param_register_aliases: &param_register_aliases,
@@ -4829,7 +4807,6 @@ mod tests {
     fn prepared_call_args_require_function_facts_callsite_contract() {
         let symbols = test_table();
         let prepared = test_prepared_two_arg_call_artifact();
-        let abi_arg_regs = vec!["rdi".to_string(), "rsi".to_string()];
         let mut summaries = InterprocSummarySet::default();
         let summary_id = r2ssa::InterprocFunctionId(0x401000);
         let mut summary =
@@ -4842,7 +4819,6 @@ mod tests {
 
         let view = PreparedSemanticView::build(&symbols, PreparedSemanticViewInputs {
             prepared: &prepared,
-            abi_arg_regs: &abi_arg_regs,
             stack_slots: &stack_slots,
             visible_bindings: &visible_bindings,
             param_register_aliases: &param_register_aliases,
@@ -4864,7 +4840,6 @@ mod tests {
     fn prepared_call_args_require_function_facts_location_contract() {
         let symbols = test_table();
         let prepared = test_prepared_two_arg_call_artifact();
-        let abi_arg_regs = vec!["rdi".to_string(), "rsi".to_string()];
         let mut callsite_facts = test_callsite_facts(&prepared);
         let call_facts = callsite_facts
             .by_callsite
@@ -4882,7 +4857,6 @@ mod tests {
 
         let view = PreparedSemanticView::build(&symbols, PreparedSemanticViewInputs {
             prepared: &prepared,
-            abi_arg_regs: &abi_arg_regs,
             stack_slots: &stack_slots,
             visible_bindings: &visible_bindings,
             param_register_aliases: &param_register_aliases,
@@ -4904,7 +4878,6 @@ mod tests {
     fn prepared_call_args_use_function_facts_callsite_contract() {
         let symbols = test_table();
         let prepared = test_prepared_two_arg_call_artifact();
-        let abi_arg_regs = vec!["rdi".to_string(), "rsi".to_string()];
         let callsite_facts = test_callsite_facts(&prepared);
         let stack_slots = BTreeMap::new();
         let visible_bindings = Vec::new();
@@ -4913,7 +4886,6 @@ mod tests {
 
         let view = PreparedSemanticView::build(&symbols, PreparedSemanticViewInputs {
             prepared: &prepared,
-            abi_arg_regs: &abi_arg_regs,
             stack_slots: &stack_slots,
             visible_bindings: &visible_bindings,
             param_register_aliases: &param_register_aliases,
@@ -4934,7 +4906,6 @@ mod tests {
     fn prepared_call_result_owner_requires_function_facts_contract() {
         let symbols = test_table();
         let prepared = test_prepared_stack_owned_call_result_artifact();
-        let abi_arg_regs = Vec::new();
         let stack_slots = BTreeMap::from([(
             StackSlotKey {
                 base: r2types::ExternalStackBase::StackPointer,
@@ -4951,7 +4922,6 @@ mod tests {
 
         let view = PreparedSemanticView::build(&symbols, PreparedSemanticViewInputs {
             prepared: &prepared,
-            abi_arg_regs: &abi_arg_regs,
             stack_slots: &stack_slots,
             visible_bindings: &visible_bindings,
             param_register_aliases: &param_register_aliases,
@@ -4980,14 +4950,12 @@ mod tests {
             !prepared.predicates().predicates.is_empty(),
             "fixture must expose raw prepared predicate facts"
         );
-        let abi_arg_regs = Vec::new();
         let stack_slots = BTreeMap::new();
         let visible_bindings = Vec::new();
         let param_register_aliases = HashMap::new();
 
         let view = PreparedSemanticView::build(&symbols, PreparedSemanticViewInputs {
             prepared: &prepared,
-            abi_arg_regs: &abi_arg_regs,
             stack_slots: &stack_slots,
             visible_bindings: &visible_bindings,
             param_register_aliases: &param_register_aliases,
@@ -5006,7 +4974,6 @@ mod tests {
         let symbols = test_table();
         let prepared = test_prepared_branch_artifact();
         let control_facts = test_control_facts(&prepared);
-        let abi_arg_regs = Vec::new();
         let stack_slots = BTreeMap::new();
         let visible_bindings = Vec::new();
         let param_register_aliases = HashMap::new();
@@ -5014,7 +4981,6 @@ mod tests {
 
         let view = PreparedSemanticView::build(&symbols, PreparedSemanticViewInputs {
             prepared: &prepared,
-            abi_arg_regs: &abi_arg_regs,
             stack_slots: &stack_slots,
             visible_bindings: &visible_bindings,
             param_register_aliases: &param_register_aliases,

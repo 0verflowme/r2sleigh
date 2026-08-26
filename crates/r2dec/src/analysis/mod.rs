@@ -1018,15 +1018,6 @@ impl UseInfo {
             .map(|var| var.display_name())
     }
 
-    #[cfg(test)]
-    pub(crate) fn has_renderable_named_fact(&self, name: &str) -> bool {
-        self.value_id_for_name(name).is_some_and(|value_id| {
-            self.definitions_by_value.contains_key(&value_id)
-                || self.semantic_values_by_value.contains_key(&value_id)
-                || self.copy_sources_by_value.contains_key(&value_id)
-        })
-    }
-
     /// A spelling for each value, preferring the variable that owns it.
     ///
     /// A value bound only through a name -- which is how a caller holding a
@@ -1085,23 +1076,6 @@ impl UseInfo {
             .or_insert(candidate);
     }
 
-    #[cfg(test)]
-    pub(crate) fn merge_stack_slot_for_name(
-        &mut self,
-        name: &str,
-        candidate: StackSlotProvenance,
-    ) {
-        match self.value_id_for_name_or_bind(name) {
-            Some(value_id) => {
-                self.stack_slots_by_value
-                    .entry(value_id)
-                    .and_modify(|existing| *existing = existing.merge(candidate))
-                    .or_insert(candidate);
-            }
-            None => *self.unkeyed_writes.entry("stack_slots").or_default() += 1,
-        }
-    }
-
     pub(crate) fn stack_slots_mut(&mut self) -> impl Iterator<Item = &mut StackSlotProvenance> {
         self.stack_slots_by_value.values_mut()
     }
@@ -1152,12 +1126,6 @@ impl UseInfo {
             return false;
         }
         self.condition_values.contains(&value)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn is_condition_var(&self, var: &SSAVar) -> bool {
-        self.exact_value_id_for_var(var)
-            .is_some_and(|value| self.is_condition_value(value))
     }
 
     #[cfg(test)]

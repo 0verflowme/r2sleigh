@@ -797,23 +797,6 @@ impl<'a> FoldingContext<'a> {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn op_to_expr(&self, op: &SSAOp) -> OpLoweringResult<CExpr> {
-        let mut frame = LowerFrame::for_expr();
-        Ok(match self.lower_op(op, &mut frame)? {
-            LoweredOp::Expr(expr) => expr,
-            LoweredOp::Assign { lhs, rhs } => CExpr::assign(lhs, rhs),
-            LoweredOp::FinalizedStmt(CStmt::Expr(expr)) => expr,
-            LoweredOp::FinalizedStmt(CStmt::Return(Some(expr))) => expr,
-            LoweredOp::FinalizedStmt(_) => {
-                return Err(OpLoweringRefusal::UnrepresentableOperation);
-            }
-            LoweredOp::Comment(_) | LoweredOp::None => {
-                return Err(OpLoweringRefusal::UnrepresentableOperation);
-            }
-        })
-    }
-
     pub(crate) fn op_to_expr_at(
         &self,
         op: &SSAOp,

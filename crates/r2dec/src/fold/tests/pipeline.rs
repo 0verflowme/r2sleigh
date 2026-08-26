@@ -10,26 +10,6 @@ mod tests {
 
     use crate::analysis::PtrArith;
 
-    /// Say a value is read `count` times.
-    ///
-    /// Counts are kept against identities, so a test has to give the value one
-    /// before it can claim anything about how often it is read.
-    fn mark_use_counted(ctx: &mut FoldingContext<'_>, var: &SSAVar, count: usize) {
-        let info = &mut ctx.state.analysis_ctx.use_info;
-        if info.exact_value_id_for_var(var).is_none() {
-            // Reuse whatever identity the name already has. Minting a second one
-            // for the same spelling makes it ambiguous, and an ambiguous name
-            // answers nothing.
-            let next = info
-                .value_id_for_name_or_bind(&var.display_name())
-                .unwrap_or(r2ssa::ValueId(9000 + info.value_ids_by_var.len() as u32));
-            let _ = info.bind_value_id(var, next);
-        }
-        for _ in 0..count {
-            info.note_use_for_var(var);
-        }
-    }
-
     /// The same, for a test that only has the rendered spelling.
     ///
     /// The name is bound to an identity directly rather than through a
@@ -43,20 +23,6 @@ mod tests {
         }
     }
 
-    /// Record that a condition was decided by this value.
-    ///
-    /// It may already have an identity from `mark_use_counted`, so bind only
-    /// when there is nothing there.
-    fn bind_and_mark_condition(ctx: &mut FoldingContext<'_>, var: &SSAVar) {
-        let info = &mut ctx.state.analysis_ctx.use_info;
-        if info.exact_value_id_for_var(var).is_none() {
-            let next = info
-                .value_id_for_name_or_bind(&var.display_name())
-                .unwrap_or(r2ssa::ValueId(9000 + info.value_ids_by_var.len() as u32));
-            let _ = info.bind_value_id(var, next);
-        }
-        info.note_condition_var(var);
-    }
     use crate::fold::context::{EffectOccurrenceKind, empty_function_facts};
     use crate::{
         FoldArchConfig, FoldInputs,
@@ -1158,14 +1124,6 @@ mod tests {
         install_function_callsite_facts(ctx, r2types::FunctionCallsiteFacts::default());
     }
 
-    fn install_function_call_result_facts(
-        ctx: &mut FoldingContext<'_>,
-        facts: r2types::FunctionCallResultFacts,
-    ) {
-        mutate_function_facts(ctx, |function_facts| function_facts.set_call_results(facts));
-    }
-
-
     fn install_function_call_render_facts(
         ctx: &mut FoldingContext<'_>,
         facts: r2types::FunctionCallRenderFacts,
@@ -2262,48 +2220,6 @@ mod tests {
         );
     }
 
-    fn expr_contains_binary_op(expr: &CExpr, target: BinaryOp) -> bool {
-        match expr {
-            CExpr::Binary { op, left, right } => {
-                *op == target
-                    || expr_contains_binary_op(left, target)
-                    || expr_contains_binary_op(right, target)
-            }
-            CExpr::Unary { operand, .. } => expr_contains_binary_op(operand, target),
-            CExpr::Paren(inner) => expr_contains_binary_op(inner, target),
-            CExpr::Cast { expr: inner, .. } => expr_contains_binary_op(inner, target),
-            _ => false,
-        }
-    }
-
-    fn expr_contains_flag_artifact(ctx: &FoldingContext<'_>, expr: &CExpr) -> bool {
-        match expr {
-            CExpr::Var(name) => {
-                let lower = ctx.spelling(*name).to_lowercase();
-                lower.starts_with("of_")
-                    || lower.starts_with("zf_")
-                    || lower.starts_with("sf_")
-                    || lower.starts_with("cf_")
-            }
-            CExpr::Binary { left, right, .. } => {
-                expr_contains_flag_artifact(ctx, left) || expr_contains_flag_artifact(ctx, right)
-            }
-            CExpr::Unary { operand, .. } => expr_contains_flag_artifact(ctx, operand),
-            CExpr::Paren(inner) => expr_contains_flag_artifact(ctx, inner),
-            CExpr::Cast { expr: inner, .. } => expr_contains_flag_artifact(ctx, inner),
-            CExpr::Deref(inner) => expr_contains_flag_artifact(ctx, inner),
-            CExpr::Subscript { base, index } => {
-                expr_contains_flag_artifact(ctx, base) || expr_contains_flag_artifact(ctx, index)
-            }
-            CExpr::Member { base, .. } => expr_contains_flag_artifact(ctx, base),
-            CExpr::PtrMember { base, .. } => expr_contains_flag_artifact(ctx, base),
-            CExpr::Call { func, args, .. } => {
-                expr_contains_flag_artifact(ctx, func) || args.iter().any(|a| expr_contains_flag_artifact(ctx, a))
-            }
-            _ => false,
-        }
-    }
-
     fn expr_contains_var(ctx: &FoldingContext<'_>, expr: &CExpr, target: &str) -> bool {
         match expr {
             CExpr::Observed { expr, .. } => expr_contains_var(ctx, expr, target),
@@ -2386,48 +2302,6 @@ mod tests {
             | CExpr::StringLit(_)
             | CExpr::CharLit(_)
             | CExpr::SizeofType(_) => false,
-        }
-    }
-
-    fn expr_contains_sub_zero_cmp_scaffold(expr: &CExpr) -> bool {
-        fn is_zero(expr: &CExpr) -> bool {
-            matches!(expr, CExpr::IntLit(0) | CExpr::UIntLit(0))
-        }
-
-        fn is_sub_zero(expr: &CExpr) -> bool {
-            matches!(
-                expr,
-                CExpr::Binary {
-                    op: BinaryOp::Sub,
-                    right,
-                    ..
-                } if is_zero(right)
-            )
-        }
-
-        match expr {
-            CExpr::Binary { op, left, right } => {
-                ((*op == BinaryOp::Eq || *op == BinaryOp::Ne)
-                    && ((is_sub_zero(left) && is_zero(right))
-                        || (is_sub_zero(right) && is_zero(left))))
-                    || expr_contains_sub_zero_cmp_scaffold(left)
-                    || expr_contains_sub_zero_cmp_scaffold(right)
-            }
-            CExpr::Unary { operand, .. } => expr_contains_sub_zero_cmp_scaffold(operand),
-            CExpr::Paren(inner) => expr_contains_sub_zero_cmp_scaffold(inner),
-            CExpr::Cast { expr: inner, .. } => expr_contains_sub_zero_cmp_scaffold(inner),
-            CExpr::Deref(inner) => expr_contains_sub_zero_cmp_scaffold(inner),
-            CExpr::Subscript { base, index } => {
-                expr_contains_sub_zero_cmp_scaffold(base)
-                    || expr_contains_sub_zero_cmp_scaffold(index)
-            }
-            CExpr::Member { base, .. } => expr_contains_sub_zero_cmp_scaffold(base),
-            CExpr::PtrMember { base, .. } => expr_contains_sub_zero_cmp_scaffold(base),
-            CExpr::Call { func, args, .. } => {
-                expr_contains_sub_zero_cmp_scaffold(func)
-                    || args.iter().any(expr_contains_sub_zero_cmp_scaffold)
-            }
-            _ => false,
         }
     }
 

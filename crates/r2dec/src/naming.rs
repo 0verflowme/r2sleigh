@@ -31,23 +31,6 @@ pub(crate) trait NameSource {
     }
 }
 
-/// A layer that has no tables of its own.
-pub(crate) struct NoNames;
-
-impl NameSource for NoNames {
-    fn carrier_alias(&self, _display: &str) -> Option<String> {
-        None
-    }
-
-    fn var_alias(&self, _display: &str) -> Option<String> {
-        None
-    }
-
-    fn param_alias(&self, _register: &str) -> Option<String> {
-        None
-    }
-}
-
 /// How this value is spelled.
 pub(crate) fn spell_var(var: &SSAVar, source: &dyn NameSource) -> String {
     if var.is_const() {

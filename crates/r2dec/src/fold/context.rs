@@ -18,8 +18,6 @@ use r2types::{
     FunctionFacts, InterprocSummaryView, SignatureRegistry, StackSlotKey,
     TypeOracle, VisibleBinding,
 };
-#[cfg(test)]
-use r2types::FieldAccessCertificate;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum ResolutionPhase {
@@ -369,57 +367,6 @@ impl<'a> FoldingContext<'a> {
             .collect();
         match journal.borrow_mut().clone_render_occurrence(stmts) {
             Ok(clone) => clone,
-            Err(error) => {
-                self.retain_first_observation_error(error);
-                fallback
-            }
-        }
-    }
-
-    /// Wrap one exact normalized operand occurrence. The journal owns every
-    /// translation from normalized coordinates to original V/U identities.
-    #[cfg(test)]
-    pub(crate) fn observe_normalized_input_expr(
-        &self,
-        block_addr: u64,
-        op_idx: usize,
-        input_idx: usize,
-        expr: CExpr,
-    ) -> CExpr {
-        let site = match self.observation_site(block_addr, op_idx) {
-            Ok(site) => Some(site),
-            Err(error) => {
-                if self.inputs.observation_journal.is_some() {
-                    self.retain_first_observation_error(error);
-                }
-                None
-            }
-        };
-        self.observe_optional_normalized_input_expr(site, input_idx, expr)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn observe_optional_normalized_input_expr(
-        &self,
-        site: Option<crate::normalize::NormalizedOpSite>,
-        input_idx: usize,
-        expr: CExpr,
-    ) -> CExpr {
-        let Some(journal) = self.inputs.observation_journal else {
-            return expr;
-        };
-        let Some(site) = site else {
-            self.retain_first_observation_error(
-                crate::observation_journal::LegacyObservationJournalError::MissingNormalizedSiteContext,
-            );
-            return expr;
-        };
-        let fallback = expr.clone();
-        let result = journal
-            .borrow_mut()
-            .observe_normalized_input_expr(site, input_idx, expr);
-        match result {
-            Ok(marked) => marked,
             Err(error) => {
                 self.retain_first_observation_error(error);
                 fallback
@@ -946,7 +893,6 @@ impl<'a> FoldingContext<'a> {
         static EMPTY_U64_STRING: OnceLock<HashMap<u64, String>> = OnceLock::new();
         static EMPTY_STACK_SLOTS: OnceLock<BTreeMap<StackSlotKey, ExternalStackSlotSpec>> =
             OnceLock::new();
-        static EMPTY_FIELD_CERTS: OnceLock<Vec<FieldAccessCertificate>> = OnceLock::new();
         #[cfg(test)]
         static EMPTY_I64_STACK: OnceLock<HashMap<i64, ExternalStackVarSpec>> = OnceLock::new();
         static EMPTY_VISIBLE_BINDINGS: OnceLock<Vec<VisibleBinding>> = OnceLock::new();

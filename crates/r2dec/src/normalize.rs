@@ -1993,11 +1993,6 @@ mod tests {
     use r2il::{ArchSpec, R2ILBlock, R2ILOp, RegisterDef, Varnode};
     use r2ssa::{PhiNode, SSAFunction, SSAVar};
 
-    /// The names a fixture in this module declares.
-    fn test_table() -> std::cell::RefCell<crate::symbol::SymbolTable> {
-        std::cell::RefCell::new(crate::symbol::SymbolTable::new())
-    }
-
     #[test]
     fn normalization_is_idempotent_for_predicates() {
         let ctx = FoldingContext::new(64);

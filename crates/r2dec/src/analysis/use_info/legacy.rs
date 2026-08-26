@@ -76,15 +76,6 @@ impl SemanticTypeHintCache {
     }
 }
 
-#[cfg(test)]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct LocalStructFieldAccessProfile {
-    pub(crate) arg_index: usize,
-    pub(crate) field_offset: u64,
-    pub(crate) access_size: u32,
-    pub(crate) is_write: bool,
-}
-
 #[allow(dead_code)]
 pub(crate) fn analyze(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, blocks: &[SSABlock], env: &PassEnv<'_>) -> UseInfo {
     let execution = SsaExecutionControl::default();
@@ -371,25 +362,6 @@ fn is_generic_entry_arg_name(name: &str) -> bool {
         || name.strip_prefix("arg").is_some_and(|suffix| {
             !suffix.is_empty() && suffix.chars().all(|ch| ch.is_ascii_digit())
         })
-}
-
-#[cfg(test)]
-fn semantic_value_preservation_score(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, value: &SemanticValue) -> i32 {
-    match value {
-        SemanticValue::Unknown => 0,
-        SemanticValue::Scalar(ScalarValue::Expr(expr)) => {
-            40 + call_arg_expr_preservation_score(symbols, expr, 0)
-        }
-        SemanticValue::Scalar(ScalarValue::Root(root)) => {
-            let mut score = 80;
-            if root.var.version == 0 {
-                score += 40;
-            }
-            score + 70
-        }
-        SemanticValue::Address(addr) => 220 + normalized_addr_rank(addr),
-        SemanticValue::Load { addr, .. } => 260 + normalized_addr_rank(addr),
-    }
 }
 
 #[cfg(test)]
@@ -1391,173 +1363,6 @@ fn value_kind_for_block_var(symbols: &std::cell::RefCell<crate::symbol::SymbolTa
     }
 
     semantic_kind
-}
-
-#[cfg(test)]
-pub(crate) fn collect_local_struct_field_access_profiles(
-    symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
-    info: &UseInfo,
-    func: &SSAFunction,
-    env: &PassEnv<'_>,
-    arg_slot_map: &HashMap<String, usize>,
-) -> Vec<LocalStructFieldAccessProfile> {
-    let mut out = Vec::new();
-
-    for block in func.blocks() {
-        for op in &block.ops {
-            match op {
-                SSAOp::Load {
-                    dst,
-                    space: SpaceId::Ram,
-                    addr,
-                } => {
-                    if let Some(profile) = struct_field_access_profile_for_addr(&symbols,
-                        info,
-                        addr,
-                        dst.size,
-                        false,
-                        env,
-                        arg_slot_map,
-                    ) {
-                        out.push(profile);
-                    }
-                }
-                SSAOp::Store {
-                    space: SpaceId::Ram,
-                    addr,
-                    val,
-                } => {
-                    if let Some(profile) = struct_field_access_profile_for_addr(&symbols,
-                        info,
-                        addr,
-                        val.size,
-                        true,
-                        env,
-                        arg_slot_map,
-                    ) {
-                        out.push(profile);
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-
-    out.sort_by(|a, b| {
-        a.arg_index
-            .cmp(&b.arg_index)
-            .then_with(|| a.field_offset.cmp(&b.field_offset))
-            .then_with(|| a.access_size.cmp(&b.access_size))
-            .then_with(|| a.is_write.cmp(&b.is_write))
-    });
-    out.dedup();
-    out
-}
-
-#[cfg(test)]
-fn struct_field_access_profile_for_addr(
-    symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
-    info: &UseInfo,
-    addr: &SSAVar,
-    access_size: u32,
-    is_write: bool,
-    env: &PassEnv<'_>,
-    arg_slot_map: &HashMap<String, usize>,
-) -> Option<LocalStructFieldAccessProfile> {
-    let shape = semantic_addr_for_var(&symbols, info, addr, env)?;
-    if shape.offset_bytes < 0 {
-        return None;
-    }
-    if shape.offset_bytes == 0 && shape.index.is_some() {
-        return None;
-    }
-
-    let BaseRef::Value(base_ref) = &shape.base else {
-        return None;
-    };
-    let arg_index = arg_slot_for_value_ref(&symbols, info, base_ref, env, arg_slot_map, 0)?;
-
-    Some(LocalStructFieldAccessProfile {
-        arg_index,
-        field_offset: shape.offset_bytes as u64,
-        access_size,
-        is_write,
-    })
-}
-
-#[cfg(test)]
-fn arg_slot_for_value_ref(
-    symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
-    info: &UseInfo,
-    value_ref: &ValueRef,
-    env: &PassEnv<'_>,
-    arg_slot_map: &HashMap<String, usize>,
-    depth: u32,
-) -> Option<usize> {
-    if depth > 8 {
-        return None;
-    }
-
-    if let Some(slot) = exact_parameter_slot_for_var(info, &value_ref.var, env) {
-        if let Ok(slot) = usize::try_from(slot) {
-            return Some(slot);
-        }
-    }
-    #[cfg(test)]
-    if value_ref.var.version == 0
-        && let Some(slot) = arg_slot_map
-            .get(&value_ref.var.name.to_ascii_lowercase())
-            .copied()
-    {
-        return Some(slot);
-    }
-
-    if let Some(value) = info.semantic_value_for_var(&value_ref.var) {
-        match value {
-            SemanticValue::Scalar(ScalarValue::Root(root)) => {
-                if root.var != value_ref.var {
-                    return arg_slot_for_value_ref(&symbols, info, root, env, arg_slot_map, depth + 1);
-                }
-            }
-            SemanticValue::Address(NormalizedAddr {
-                base: BaseRef::Value(root),
-                ..
-            }) => {
-                if root.var != value_ref.var {
-                    return arg_slot_for_value_ref(&symbols, info, root, env, arg_slot_map, depth + 1);
-                }
-            }
-            SemanticValue::Load {
-                space: SpaceId::Ram,
-                addr:
-                    NormalizedAddr {
-                        base: BaseRef::Value(root),
-                        ..
-                    },
-                ..
-            } => {
-                if root.var != value_ref.var {
-                    return arg_slot_for_value_ref(&symbols, info, root, env, arg_slot_map, depth + 1);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    if let Some(prov) = info.forwarded_value_for_var(&value_ref.var)
-        && let Some(source_var) = &prov.source_var
-        && *source_var != value_ref.var
-    {
-        return arg_slot_for_value_ref(&symbols,
-            info,
-            &ValueRef::from(source_var),
-            env,
-            arg_slot_map,
-            depth + 1,
-        );
-    }
-
-    None
 }
 
 #[cfg(test)]
@@ -3457,19 +3262,6 @@ fn semantic_or_scalar_source_value(symbols: &std::cell::RefCell<crate::symbol::S
     Some(SemanticValue::Scalar(ScalarValue::Expr(crate::symbol::var_ref(
         symbols, rendered,
     ))))
-}
-
-#[cfg(test)]
-fn resolve_copy_root_name(info: &UseInfo, name: &str) -> String {
-    let mut current = name.to_string();
-    let mut seen = HashSet::new();
-    while seen.insert(current.clone()) {
-        let Some(next) = info.render_copy_source_for_name(&current) else {
-            break;
-        };
-        current = next;
-    }
-    current
 }
 
 fn invalidates_block_stack_values(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
