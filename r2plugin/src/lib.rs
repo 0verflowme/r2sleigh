@@ -2587,6 +2587,7 @@ pub(crate) struct EngineV2Output {
     pub(crate) binding_audit: Option<r2engine::BindingShadowAuditOutcome>,
     pub(crate) effect_obligations: Option<r2engine::EffectObligationAudit>,
     pub(crate) placement_audit: Option<r2engine::PlacementAudit>,
+    pub(crate) render_refusal: Option<r2engine::DecompileRenderRefusal>,
 }
 
 /// The name the source gives this function, when it gives one.
@@ -2649,6 +2650,7 @@ fn r2sleigh_engine_decompile_trusted_output(
         binding_audit: Some(response.binding_audit),
         effect_obligations: Some(response.effect_obligations),
         placement_audit: Some(response.placement_audit),
+        render_refusal: response.render_refusal,
     })
 }
 
@@ -2705,6 +2707,7 @@ fn r2sleigh_engine_type_function_trusted_output(
                 binding_audit: None,
                 effect_obligations: None,
                 placement_audit: None,
+                render_refusal: None,
             });
         }
     };
@@ -2734,6 +2737,7 @@ fn r2sleigh_engine_type_function_trusted_output(
         binding_audit: None,
         effect_obligations: None,
         placement_audit: None,
+        render_refusal: None,
     })
 }
 
@@ -2776,6 +2780,7 @@ fn r2sleigh_engine_proven_facts_trusted_output(
         binding_audit: None,
         effect_obligations: None,
         placement_audit: None,
+        render_refusal: None,
     })
 }
 
@@ -4947,12 +4952,15 @@ mod tests {
         assert!(emitter.contains("r_json_get (diagnostics, \"binding_audit\")"));
         assert!(emitter.contains("r_json_get (diagnostics, \"effect_obligations\")"));
         assert!(emitter.contains("r_json_get (diagnostics, \"placement_audit\")"));
+        assert!(emitter.contains("r_json_get (diagnostics, \"render_refusal\")"));
         assert!(emitter.contains("effect_obligations->type == R_JSON_OBJECT"));
         assert!(emitter.contains("placement_audit->type == R_JSON_OBJECT"));
-        assert!(emitter.contains("pj_kn (pj, \"schema_version\", 4)"));
+        assert!(emitter.contains("render_refusal->type == R_JSON_OBJECT"));
+        assert!(emitter.contains("pj_kn (pj, \"schema_version\", 5)"));
         assert!(emitter.contains("pj_k (pj, \"audit\")"));
         assert!(emitter.contains("pj_k (pj, \"effect_obligations\")"));
         assert!(emitter.contains("pj_k (pj, \"placement_audit\")"));
+        assert!(emitter.contains("pj_k (pj, \"render_refusal\")"));
         assert_eq!(
             emitter.matches("SLEIGH_BINDING_AUDIT_PREFIX").count(),
             1,

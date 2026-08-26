@@ -6,6 +6,7 @@ use r2types::{
     VisibleBindingKind,
 };
 
+#[cfg(test)]
 use crate::analysis::prepared_semantic::StackAliasView;
 use crate::analysis::utils;
 
@@ -27,7 +28,6 @@ fn is_entry_value_spelling(display_name: &str) -> bool {
 use crate::ast::{BinaryOp, CExpr};
 
 use super::context::FoldingContext;
-use super::op_lower::is_generic_arg_name;
 use super::{MAX_STACK_ALIAS_DEPTH, MAX_STACK_OFFSET_DEPTH};
 
 /// Threshold for detecting 64-bit negative values stored as unsigned.
@@ -36,6 +36,7 @@ use super::{MAX_STACK_ALIAS_DEPTH, MAX_STACK_OFFSET_DEPTH};
 const LIKELY_NEGATIVE_THRESHOLD: u64 = 0xffffffffffff0000;
 
 impl<'a> FoldingContext<'a> {
+    #[cfg(test)]
     fn preferred_prepared_stack_alias_name(&self, alias: &StackAliasView) -> Option<String> {
         let visible = alias.visible_name.trim();
         (!visible.is_empty()).then(|| visible.to_string())
@@ -105,6 +106,7 @@ impl<'a> FoldingContext<'a> {
 
     fn bound_stack_name_offset(&self, name: &str) -> Option<i64> {
         let mut offsets = HashSet::new();
+        #[cfg(test)]
         if let Some(view) = self.prepared_stack_alias_view() {
             offsets.extend(
                 view.stack_aliases_by_offset
@@ -191,8 +193,10 @@ impl<'a> FoldingContext<'a> {
     pub(super) fn is_reserved_param_alias_name(&self, name: &str) -> bool {
         let lower = name.to_ascii_lowercase();
         self.inputs
-            .param_register_aliases
-            .values()
+            .arch
+            .arg_regs
+            .iter()
+            .filter_map(|register| self.inputs.arch.arg_alias_for_register_name(register))
             .any(|alias| alias.eq_ignore_ascii_case(&lower))
     }
 
@@ -316,21 +320,6 @@ impl<'a> FoldingContext<'a> {
     }
 
     pub(super) fn arg_alias_for_register_name(&self, reg_name: &str) -> Option<String> {
-        let lower = reg_name.to_ascii_lowercase();
-        if let Some(alias) = self.inputs.param_register_aliases.get(&lower) {
-            return Some(alias.clone());
-        }
-        // Width-variant register names (e.g. `rsi` vs alias key `esi`) must
-        // resolve through their canonical argument register before giving up.
-        for (alias_reg, alias) in self.inputs.param_register_aliases {
-            if self
-                .canonical_arg_register_name_for_alias(alias_reg)
-                .eq_ignore_ascii_case(&lower)
-            {
-                return Some(alias.clone());
-            }
-        }
-
         self.inputs.arch.arg_alias_for_register_name(reg_name)
     }
 
@@ -388,12 +377,25 @@ impl<'a> FoldingContext<'a> {
         if src.version != 0 {
             return false;
         }
-
-        let Some(src_alias) = self.arg_alias_for_register_name(&src.name) else {
+        let (Some(prepared), Some(render)) = (
+            self.inputs.prepared_ssa,
+            self.inputs.function_facts.render(),
+        ) else {
             return false;
         };
-        let dst_name = self.var_name(dst);
-        is_generic_arg_name(&dst_name) && dst_name.eq_ignore_ascii_case(&src_alias)
+        let (Some(dst_value), Some(src_value)) = (
+            prepared.graph().value_id_for_var(dst),
+            prepared.graph().value_id_for_var(src),
+        ) else {
+            return false;
+        };
+        matches!(
+            (
+                render.exact_parameter_slot_for_value(dst_value),
+                render.exact_parameter_slot_for_value(src_value),
+            ),
+            (Some(dst_slot), Some(src_slot)) if dst_slot == src_slot
+        )
     }
 
     pub(super) fn is_entry_arg_alias_store(&self, addr: &SSAVar, val: &SSAVar) -> bool {
@@ -433,7 +435,8 @@ impl<'a> FoldingContext<'a> {
                         && matches!(
                             slot.role(),
                             SourceStackSlotRole::ParameterHome { parameter_index, .. }
-                                if parameter_index == parameter_slot
+                                if usize::try_from(parameter_index)
+                                    .is_ok_and(|index| index == parameter_slot)
                         )
                 });
                 matching.next().is_some() && matching.next().is_none()
@@ -578,6 +581,14 @@ impl<'a> FoldingContext<'a> {
     }
 
     pub(super) fn external_stack_name_for_offset(&self, offset: i64) -> Option<String> {
+        #[cfg(not(test))]
+        if self.inputs.binding_names.is_some() {
+            self.retain_first_lowering_refusal(
+                super::op_lower::OpLoweringRefusal::MissingProgramVariableAuthorization,
+            );
+            return None;
+        }
+        #[cfg(test)]
         if let Some(alias_name) = self
             .prepared_stack_alias_view()
             .and_then(|view| view.stack_alias_for_offset(offset))
@@ -624,17 +635,6 @@ impl<'a> FoldingContext<'a> {
     }
 
     pub(super) fn param_home_alias_for_stack_offset(&self, offset: i64) -> Option<String> {
-        if let Some(alias_name) = self
-            .prepared_stack_alias_view()
-            .and_then(|view| view.stack_alias_for_offset(offset))
-            .filter(|alias| matches!(alias.binding_kind, Some(VisibleBindingKind::HiddenHome)))
-            .and_then(|alias| alias.arg_alias.as_deref())
-            .map(str::trim)
-            .filter(|alias| self.is_valid_param_home_alias(alias))
-        {
-            return Some(alias_name.to_string());
-        }
-
         if let Some(binding) = self.visible_stack_binding_for_offset(offset)
             && matches!(binding.kind, VisibleBindingKind::HiddenHome)
             && let Some(alias) = self.visible_param_home_alias_for_binding(binding)
@@ -754,63 +754,11 @@ impl<'a> FoldingContext<'a> {
         if let CExpr::Observed { id, expr } = expr {
             return CExpr::observed(id, self.rewrite_stack_expr(*expr));
         }
-        let rewritten = expr.map_children(&mut |child| self.rewrite_stack_expr(child));
-
-        if let CExpr::Var(name) = &rewritten
-            && let Some(alias) = self.resolve_stack_alias_from_addr_expr(&CExpr::Var(*name), 0)
-            && *alias != *self.spelling(*name)
-            && !super::op_lower::is_generic_stack_placeholder_alias(&alias)
-        {
-            return self.name_ref(&alias);
-        }
-
-        if matches!(
-            rewritten.unobserved(),
-            CExpr::Binary {
-                op: BinaryOp::Add | BinaryOp::Sub,
-                ..
-            } | CExpr::Paren(_)
-                | CExpr::Cast { .. }
-        ) && let Some(alias) = self.resolve_stack_alias_from_addr_expr(&rewritten, 0)
-            && !super::op_lower::is_generic_stack_placeholder_alias(&alias)
-        {
-            return self.name_ref(&alias);
-        }
-
-        match rewritten {
-            CExpr::Deref(inner) => {
-                if let Some(alias) = self.resolve_stack_alias_from_addr_expr(&inner, 0)
-                    && !super::op_lower::is_generic_stack_placeholder_alias(&alias)
-                {
-                    return self.name_ref(&alias);
-                }
-                if let Some(var_name) = self.extract_known_stack_var_name(&inner) {
-                    return self.name_ref(&var_name);
-                }
-                CExpr::Deref(inner)
-            }
-            other => other,
-        }
-    }
-
-    pub(super) fn extract_known_stack_var_name(&self, expr: &CExpr) -> Option<String> {
-        match expr.unobserved() {
-            CExpr::Var(name) => {
-                if self
-                    .stack_vars_map()
-                    .values()
-                    .any(|candidate| candidate.as_str() == &*self.spelling(*name))
-                {
-                    Some(self.spelling(*name).to_string())
-                } else {
-                    None
-                }
-            }
-            CExpr::Paren(inner) | CExpr::Cast { expr: inner, .. } => {
-                self.extract_known_stack_var_name(inner)
-            }
-            _ => None,
-        }
+        // Once an expression contains only SymbolIds, an offset/name lookup
+        // cannot prove which source-owned stack object it denotes. Exact stack
+        // projection happens earlier from ObjectId; this late pass only walks
+        // the already-authorized expression.
+        expr.map_children(&mut |child| self.rewrite_stack_expr(child))
     }
 
     pub(super) fn is_zeroing_expr(&self, expr: &CExpr) -> bool {

@@ -437,11 +437,6 @@ struct SwitchRegionView<'r> {
 }
 
 impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
-    /// A reference to this spelling, declaring it if nothing has yet.
-    fn name_ref(&self, name: &str) -> CExpr {
-        self.fold_ctx.name_ref(name)
-    }
-
     /// Create a new structurer using a pre-analyzed folding context.
     #[cfg(test)]
     pub(crate) fn new(func: &'a SSAFunction, fold_ctx: &'o FoldingContext<'o>) -> Self {
@@ -806,7 +801,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             }
         };
         self.structured_region_blocks = region.blocks().into_iter().collect();
-        self.shared_joins = self.collect_shared_joins();
+        self.shared_joins = self.collect_shared_joins()?;
         // The jumps into a shared join need its label, and the jump back out
         // needs its successor's. Both have to exist before anything is written,
         // because a block already written can no longer be given one.
@@ -1193,7 +1188,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                             if !self.structured_region_blocks.contains(target)
                                 && self.func.predecessors(*target).len() > 1
                                 && let Some(writes) =
-                                    self.shared_exit_merge_writes(*target, *source)
+                                    self.shared_exit_merge_writes(*target, *source)?
                             {
                                 let label = self.ensure_label(*target);
                                 self.deferred_shared_exits
@@ -1687,28 +1682,46 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
     /// Nothing is written if either side renders as a carrier rather than a
     /// name the function declares, because an assignment between carriers says
     /// nothing a reader can follow.
-    fn shared_exit_merge_writes(&self, target: u64, source: u64) -> Option<Vec<CStmt>> {
-        let block = self.func.get_block(target)?;
+    fn shared_exit_merge_writes(
+        &self,
+        target: u64,
+        source: u64,
+    ) -> ControlFlowStructureResult<Option<Vec<CStmt>>> {
+        let Some(block) = self.func.get_block(target) else {
+            return Ok(None);
+        };
         let mut writes = Vec::new();
         for phi in &block.phis {
-            let value = phi
+            let Some(value) = phi
                 .sources
                 .iter()
-                .find_map(|(pred, value)| (*pred == source).then_some(value))?;
-            let target_name = self.fold_ctx.var_name(&phi.dst);
-            let value_name = self.fold_ctx.var_name(value);
-            if crate::analysis::utils::is_temporary_or_constant_name(&target_name) {
-                return None;
+                .find_map(|(pred, value)| (*pred == source).then_some(value))
+            else {
+                return Ok(None);
+            };
+            if crate::analysis::utils::is_temporary_or_constant_name(&phi.dst.display_name()) {
+                return Ok(None);
             }
-            if target_name == value_name {
+            let Some(target_value) = self.fold_ctx.prepared_value_id_for_var(&phi.dst) else {
+                return Ok(None);
+            };
+            let Some(source_value) = self.fold_ctx.prepared_value_id_for_var(value) else {
+                return Ok(None);
+            };
+            let target_expr = self
+                .fold_ctx
+                .planned_value_expr(target_value)
+                .map_err(|_| OpLoweringRefusal::MissingProgramVariableAuthorization)?;
+            let source_expr = self
+                .fold_ctx
+                .planned_value_expr(source_value)
+                .map_err(|_| OpLoweringRefusal::MissingProgramVariableAuthorization)?;
+            if target_expr.transparently_eq(&source_expr) {
                 continue;
             }
-            writes.push(CStmt::Expr(CExpr::assign(
-                self.name_ref(&target_name),
-                self.name_ref(&value_name),
-            )));
+            writes.push(CStmt::Expr(CExpr::assign(target_expr, source_expr)));
         }
-        Some(writes)
+        Ok(Some(writes))
     }
 
     /// The blocks several branches converge on that no region claimed.
@@ -1718,7 +1731,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
     /// has nowhere to put it and it goes unwritten. It is still part of the
     /// function, and every edge reaching it agrees where it runs, so it can be
     /// written once behind a label like any other shared arrival.
-    fn collect_shared_joins(&self) -> BTreeSet<u64> {
+    fn collect_shared_joins(&self) -> ControlFlowStructureResult<BTreeSet<u64>> {
         let mut joins = BTreeSet::new();
         for addr in self.func.block_addrs().to_vec() {
             if self.structured_region_blocks.contains(&addr) || self.block_is_proven_dead(addr) {
@@ -1744,15 +1757,19 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             }
             // A join merges whatever each edge brought, so every edge has to be
             // able to say which value that was on its way in.
-            if !predecessors
-                .iter()
-                .all(|pred| self.shared_exit_merge_writes(addr, *pred).is_some())
-            {
+            let mut all_edges_render = true;
+            for pred in &predecessors {
+                if self.shared_exit_merge_writes(addr, *pred)?.is_none() {
+                    all_edges_render = false;
+                    break;
+                }
+            }
+            if !all_edges_render {
                 continue;
             }
             joins.insert(addr);
         }
-        joins
+        Ok(joins)
     }
 
     /// Write the shared joins after the body, each behind its label.
@@ -1831,7 +1848,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         if let [next] = self.func.successors(addr).as_slice()
             && self.shared_joins.contains(next)
         {
-            if let Some(writes) = self.shared_exit_merge_writes(*next, addr) {
+            if let Some(writes) = self.shared_exit_merge_writes(*next, addr)? {
                 stmts.extend(writes);
             }
             let label = self.ensure_label(*next);
@@ -3620,7 +3637,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
     fn append_merged_slot_return_if_needed(
         &self,
         stmt: CStmt,
-        region: &Region,
+        _region: &Region,
         pred_addr: u64,
         summary: &crate::analysis::FrameSlotMergeSummary,
     ) -> ControlFlowStructureResult<Option<CStmt>> {
@@ -3667,7 +3684,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
 
     fn has_merged_slot_return_expr(
         &self,
-        region: &Region,
+        _region: &Region,
         pred_addr: u64,
         summary: &crate::analysis::FrameSlotMergeSummary,
     ) -> bool {
@@ -5266,15 +5283,9 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                 id,
                 Self::normalize_condition_addr_artifacts(symbols, *expr))
             }
-            CExpr::Var(name)
-                if crate::symbol::spelling(symbols, name).starts_with('&')
-                    && crate::symbol::spelling(symbols, name).len() > 1 =>
-            {
-                crate::symbol::var_ref(
-                    symbols,
-                    crate::symbol::spelling(symbols, name).trim_start_matches('&'),
-                )
-            }
+            // A SymbolId is already the binding identity. Reinterpreting its
+            // spelling as another identifier would mint a second binding.
+            CExpr::Var(name) => CExpr::Var(name),
             CExpr::Unary { op, operand } => CExpr::Unary {
                 op,
                 operand: Box::new(Self::normalize_condition_addr_artifacts(symbols, *operand)),

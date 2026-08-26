@@ -1,4 +1,6 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
+
+use r2ssa::{ObjectId, ValueId};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct CallSiteId {
@@ -25,9 +27,20 @@ pub(crate) enum CallOwnerKind {
     Parameter,
 }
 
+/// The exact upstream identity that owns one call result.
+///
+/// A rendered symbol is deliberately absent: one binding can carry several
+/// SSA values over its lifetime, and its presentation spelling cannot say
+/// which result a particular occurrence came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) enum CallOwnerIdentity {
+    Value(ValueId),
+    StackObject(ObjectId),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CallOwner {
-    pub(crate) visible_name: String,
+    pub(crate) identity: CallOwnerIdentity,
     pub(crate) kind: CallOwnerKind,
 }
 
@@ -35,16 +48,15 @@ pub(crate) struct CallOwner {
 pub(crate) struct CallOwnershipFact {
     pub(crate) source: CallSiteId,
     pub(crate) owner: Option<CallOwner>,
-    pub(crate) aliases: BTreeSet<String>,
-    pub(crate) direct_aliases: BTreeSet<String>,
+    pub(crate) aliases: BTreeSet<ValueId>,
+    pub(crate) direct_aliases: BTreeSet<ValueId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
 pub(crate) struct SemanticOwnershipFacts {
     pub(crate) call_ownership: BTreeMap<CallSiteId, CallOwnershipFact>,
-    pub(crate) alias_sources: HashMap<String, CallSiteId>,
-    pub(crate) visible_owner_sources: HashMap<String, CallSiteId>,
-    pub(crate) visible_owned_names: BTreeSet<String>,
+    pub(crate) value_sources: BTreeMap<ValueId, CallSiteId>,
+    pub(crate) object_sources: BTreeMap<ObjectId, CallSiteId>,
 }
 
 impl SemanticOwnershipFacts {
@@ -52,24 +64,11 @@ impl SemanticOwnershipFacts {
         self.call_ownership.get(&source)
     }
 
-    pub(crate) fn source_for_alias(&self, alias: &str) -> Option<CallSiteId> {
-        self.alias_sources
-            .get(alias)
-            .copied()
-            .or_else(|| self.alias_sources.get(&alias.to_ascii_lowercase()).copied())
+    pub(crate) fn source_for_value(&self, value: ValueId) -> Option<CallSiteId> {
+        self.value_sources.get(&value).copied()
     }
 
-    pub(crate) fn source_for_visible_owner_name(&self, name: &str) -> Option<CallSiteId> {
-
-        self.visible_owner_sources.get(name).copied().or_else(|| {
-            self.visible_owner_sources
-                .get(&name.to_ascii_lowercase())
-                .copied()
-        })
-    }
-
-    pub(crate) fn has_visible_owner_name(&self, name: &str) -> bool {
-        self.visible_owned_names
-            .contains(&name.to_ascii_lowercase())
+    pub(crate) fn source_for_object(&self, object: ObjectId) -> Option<CallSiteId> {
+        self.object_sources.get(&object).copied()
     }
 }

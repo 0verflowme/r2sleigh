@@ -151,6 +151,10 @@ class BindingAuditTests(unittest.TestCase):
         return {"schema_version": 1, "status": "applied"}
 
     @staticmethod
+    def no_render_refusal_record() -> dict[str, object]:
+        return {"schema_version": 1, "status": "none"}
+
+    @staticmethod
     def complete_record() -> dict[str, object]:
         observations = {
             domain: {
@@ -177,7 +181,7 @@ class BindingAuditTests(unittest.TestCase):
             for domain in verifier.BINDING_AUDIT_DOMAINS
         }
         return {
-            "schema_version": 4,
+            "schema_version": 5,
             "request_status": "completed",
             "audit": {
                 "schema_version": 2,
@@ -187,6 +191,7 @@ class BindingAuditTests(unittest.TestCase):
             },
             "effect_obligations": BindingAuditTests.admitted_effect_record(),
             "placement_audit": BindingAuditTests.applied_placement_record(),
+            "render_refusal": BindingAuditTests.no_render_refusal_record(),
         }
 
     @classmethod
@@ -199,7 +204,9 @@ class BindingAuditTests(unittest.TestCase):
     def test_exact_marker_is_removed_and_all_ledgers_are_recomputed(self) -> None:
         section = f"rendered C\n{self.marker()}\ndiagnostic tail\n"
 
-        cleaned, score, effect_score, placement_score = verifier.parse_render_audits(section)
+        cleaned, score, effect_score, placement_score, render_score = (
+            verifier.parse_render_audits(section)
+        )
 
         self.assertEqual(cleaned, "rendered C\ndiagnostic tail\n")
         self.assertEqual(score["status"], "pass")
@@ -213,6 +220,36 @@ class BindingAuditTests(unittest.TestCase):
         self.assertTrue(effect_score["equation_balanced"])
         self.assertTrue(all(effect_score["quality"].values()))
         self.assertEqual(placement_score["status"], "pass")
+        self.assertEqual(render_score["status"], "pass")
+
+    def test_render_refusal_is_typed_and_never_scores_as_a_pass(self) -> None:
+        record = self.complete_record()
+        record["request_status"] = "refused"
+        record["render_refusal"] = {
+            "schema_version": 1,
+            "status": "refused",
+            "kind": "missing_program_variable_authorization",
+        }
+
+        _, binding, effect, placement, render = verifier.parse_render_audits(
+            self.marker(record) + "\n"
+        )
+
+        self.assertEqual(binding["request_status"], "refused")
+        self.assertEqual(effect["request_status"], "refused")
+        self.assertEqual(placement["request_status"], "refused")
+        self.assertEqual(render["status"], "refused")
+        self.assertEqual(render["source_status"], "refused")
+
+    def test_refused_request_without_render_reason_is_not_a_render_pass(self) -> None:
+        record = self.complete_record()
+        record["request_status"] = "refused"
+
+        _, _, _, _, render = verifier.parse_render_audits(self.marker(record) + "\n")
+
+        self.assertEqual(render["status"], "non_quality")
+        self.assertEqual(render["source_status"], "none")
+        self.assertEqual(render["request_status"], "refused")
 
     def test_effect_schema_checker_requires_exact_typed_counts(self) -> None:
         effect = self.admitted_effect_record()
@@ -263,7 +300,7 @@ class BindingAuditTests(unittest.TestCase):
             with self.subTest(status=expected):
                 record = self.complete_record()
                 record["placement_audit"] = placement
-                _, binding, effect, scored = verifier.parse_render_audits(
+                _, binding, effect, scored, _ = verifier.parse_render_audits(
                     self.marker(record) + "\n"
                 )
                 self.assertEqual(binding["status"], "pass")
@@ -288,7 +325,7 @@ class BindingAuditTests(unittest.TestCase):
                     "status": "refused",
                     "cause": cause,
                 }
-                _, binding, effect, placement = verifier.parse_render_audits(
+                _, binding, effect, placement, _ = verifier.parse_render_audits(
                     self.marker(record) + "\n"
                 )
                 self.assertEqual(binding["status"], "pass")
@@ -307,7 +344,7 @@ class BindingAuditTests(unittest.TestCase):
 
         for candidate in (missing_effect, missing_placement, old_version, extra):
             with self.subTest(candidate=candidate):
-                _, binding_score, effect_score, placement_score = verifier.parse_render_audits(
+                _, binding_score, effect_score, placement_score, _ = verifier.parse_render_audits(
                     self.marker(candidate) + "\n"
                 )
                 self.assertEqual(binding_score["status"], "malformed")
@@ -338,7 +375,7 @@ class BindingAuditTests(unittest.TestCase):
             with self.subTest(label=label):
                 record = self.complete_record()
                 mutate(record["effect_obligations"])
-                _, binding_score, effect_score, placement_score = verifier.parse_render_audits(
+                _, binding_score, effect_score, placement_score, _ = verifier.parse_render_audits(
                     self.marker(record) + "\n"
                 )
                 self.assertEqual(binding_score["status"], "pass")
@@ -352,7 +389,7 @@ class BindingAuditTests(unittest.TestCase):
     def test_binding_and_effect_payload_failures_are_scored_independently(self) -> None:
         malformed_binding = self.complete_record()
         malformed_binding["audit"]["legacy"] = True
-        _, binding_score, effect_score, placement_score = verifier.parse_render_audits(
+        _, binding_score, effect_score, placement_score, _ = verifier.parse_render_audits(
             self.marker(malformed_binding) + "\n"
         )
         self.assertEqual(binding_score["status"], "malformed")
@@ -361,7 +398,7 @@ class BindingAuditTests(unittest.TestCase):
 
         malformed_effect = self.complete_record()
         malformed_effect["effect_obligations"]["legacy"] = True
-        _, binding_score, effect_score, placement_score = verifier.parse_render_audits(
+        _, binding_score, effect_score, placement_score, _ = verifier.parse_render_audits(
             self.marker(malformed_effect) + "\n"
         )
         self.assertEqual(binding_score["status"], "pass")
@@ -378,7 +415,7 @@ class BindingAuditTests(unittest.TestCase):
             }
         )
 
-        _, _, effect_score, _ = verifier.parse_render_audits(
+        _, _, effect_score, _, _ = verifier.parse_render_audits(
             self.marker(record) + "\n"
         )
 
@@ -402,7 +439,7 @@ class BindingAuditTests(unittest.TestCase):
         }
         for expected_status, (section, expected_cleaned, count) in cases.items():
             with self.subTest(status=expected_status):
-                cleaned, score, effect_score, placement_score = verifier.parse_render_audits(section)
+                cleaned, score, effect_score, placement_score, _ = verifier.parse_render_audits(section)
                 self.assertEqual(cleaned, expected_cleaned)
                 self.assertEqual(score["status"], expected_status)
                 self.assertEqual(score["marker_count"], count)
@@ -470,7 +507,7 @@ class BindingAuditTests(unittest.TestCase):
         record = self.complete_record()
         record["request_status"] = "refused"
 
-        _, score, effect_score, placement_score = verifier.parse_render_audits(
+        _, score, effect_score, placement_score, _ = verifier.parse_render_audits(
             self.marker(record) + "\n"
         )
 
@@ -485,7 +522,7 @@ class BindingAuditTests(unittest.TestCase):
 
     def test_failed_journal_audit_requires_an_exact_typed_cause(self) -> None:
         record = {
-            "schema_version": 4,
+            "schema_version": 5,
             "request_status": "completed",
             "audit": {
                 "schema_version": 2,
@@ -499,6 +536,7 @@ class BindingAuditTests(unittest.TestCase):
             },
             "effect_obligations": self.admitted_effect_record(),
             "placement_audit": self.applied_placement_record(),
+            "render_refusal": self.no_render_refusal_record(),
         }
 
         _, score = verifier.parse_binding_audit(self.marker(record) + "\n")
@@ -866,6 +904,10 @@ class VerificationTests(unittest.TestCase):
                         "marker_count": 0,
                     },
                     "placement_audit": {
+                        "status": "missing",
+                        "marker_count": 0,
+                    },
+                    "render_refusal": {
                         "status": "missing",
                         "marker_count": 0,
                     },

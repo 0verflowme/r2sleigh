@@ -1,5 +1,4 @@
 use super::*;
-use crate::analysis::utils::{is_temporary_or_constant_name, ssa_render_base_name};
 
 impl<'a> FoldingContext<'a> {
     fn typed_integer_literal_expr_in_context(
@@ -318,12 +317,6 @@ impl<'a> FoldingContext<'a> {
         }
         let mut has_semantic_root = false;
         if let CExpr::Var(name) = expr {
-            if self
-                .materialized_call_result_source_for_visible_name(*name)
-                .is_some()
-            {
-                return expr.clone();
-            }
             if let Some(candidate) = self.semantic_deref_candidate_for_name(&self.spelling(*name)) {
                 let should_promote = if matches!(context, VisibleExprContext::Generic) {
                     Self::expr_is_structured_memory_candidate(&candidate)
@@ -509,8 +502,10 @@ impl<'a> FoldingContext<'a> {
             // answer is the variable. Every expression reachable from its
             // sources is a value the carrier held on one path, and the one a
             // resolver reaches first is the value it held entering the loop.
-            if self.var_aliases_map().contains_key(&phi_name) {
-                let carrier = self.name_ref(&self.var_name(&phi.dst));
+            if let Some(carrier) = self
+                .prepared_value_id_for_var(&phi.dst)
+                .and_then(|value| self.certified_loop_carrier_expr_for_value(value))
+            {
                 best = self.preferred_return_candidate(best, Some(carrier));
                 continue;
             }
@@ -556,9 +551,9 @@ impl<'a> FoldingContext<'a> {
                         .arch
                         .is_return_register_name(&dst.name.to_ascii_lowercase())
                         && !self.is_control_return_target(dst)
-                });
+            });
             if let Some(dst) = written {
-                return Some(self.tracked_return_source_expr(dst));
+                return self.retain_lowering_result(self.tracked_return_source_expr(dst));
             }
             pending.extend(func.predecessors(addr));
         }
@@ -692,12 +687,12 @@ impl<'a> FoldingContext<'a> {
             return Ok(None);
         };
         let candidate = match op {
-            SSAOp::Copy { src, .. } => self.get_return_expr(src),
+            SSAOp::Copy { src, .. } => self.get_return_expr(src)?,
             SSAOp::IntZExt { dst, src }
             | SSAOp::IntSExt { dst, src }
             | SSAOp::Trunc { dst, src }
             | SSAOp::Cast { dst, src } => {
-                self.tracked_return_cast_expr(dst, src, self.tracked_return_source_expr(src))
+                self.tracked_return_cast_expr(dst, src, self.tracked_return_source_expr(src)?)
             }
             _ => {
                 let mut visited = HashSet::new();
@@ -736,8 +731,11 @@ impl<'a> FoldingContext<'a> {
                 self.render_value_ref(&analysis::ValueRef::from(source.clone()), 0, &mut visited)
             })
             .or_else(|| self.lookup_definition_with_depth(&source_name, 0, &mut visited))
-            .or_else(|| self.best_visible_definition_with_depth(&source_name, 0, &mut visited))
-            .or_else(|| Some(self.tracked_return_source_expr(source)));
+            .or_else(|| self.best_visible_definition_with_depth(&source_name, 0, &mut visited));
+        let candidate = match candidate {
+            Some(candidate) => Some(candidate),
+            None => Some(self.tracked_return_source_expr(source)?),
+        };
 
         let candidate = candidate
             .map(|expr| self.resolve_return_candidate(&expr))
@@ -770,115 +768,6 @@ impl<'a> FoldingContext<'a> {
 
         let mut visited = HashSet::new();
         self.render_authoritative_memory_access_by_name(name, 0, 0, &mut visited)
-    }
-
-    fn should_inline_in_return(&self, var_name: crate::symbol::SymbolId, depth: u32) -> bool {
-        let var_name_id = var_name;
-        let var_name = &self.spelling(var_name_id);
-
-        if depth > MAX_RETURN_INLINE_DEPTH {
-            return false;
-        }
-
-        let ssa_name = self
-            .exact_ssa_name_for_symbol(var_name_id)
-            .filter(|ssa_name| ssa_name.as_str() != &**var_name);
-        let semantic_name = ssa_name.as_deref().unwrap_or(var_name);
-        if is_temporary_or_constant_name(var_name) || is_temporary_or_constant_name(semantic_name) {
-            return true;
-        }
-
-        let lower = var_name.to_lowercase();
-        let semantic_lower = semantic_name.to_lowercase();
-        if self.inputs.arch.is_return_register_name(&lower) {
-            return true;
-        }
-        if self.inputs.arch.is_return_register_name(&semantic_lower) {
-            return true;
-        }
-
-        let is_pinned = self.pinned_set().contains(&**var_name)
-            || self.pinned_set().contains(&lower)
-            || self.pinned_set().contains(semantic_name)
-            || self.pinned_set().contains(&semantic_lower)
-            || var_name
-                .rsplit_once('_')
-                .map(|(base, ver)| {
-                    self.pinned_set()
-                        .contains(&format!("{}_{}", base.to_lowercase(), ver))
-                        || self
-                            .pinned_set()
-                            .contains(&format!("{}_{}", base.to_uppercase(), ver))
-                })
-                .unwrap_or(false);
-        if is_pinned {
-            return false;
-        }
-
-        // Six lookups used to stand here -- the name, its lowercase, both case
-        // variants of `base_version`, then the same for the semantic name --
-        // because the counts were filed under whatever spelling the writer had.
-        // They are filed under identities now, so the name is resolved once and
-        // the variants have nothing left to disagree about.
-        let use_count = match self.use_count_of(var_name) {
-            0 => self.use_count_of(semantic_name),
-            count => count,
-        };
-        if use_count == 0 || use_count > 3 {
-            return false;
-        }
-
-        self.lookup_definition(semantic_name)
-            .map(|expr| self.is_return_inline_candidate(&expr, 0))
-            .unwrap_or(false)
-    }
-
-    fn is_return_inline_candidate(&self, expr: &CExpr, depth: u32) -> bool {
-        if depth > MAX_RETURN_INLINE_CANDIDATE_DEPTH {
-            return false;
-        }
-
-        match expr {
-            CExpr::IntLit(_)
-            | CExpr::UIntLit(_)
-            | CExpr::FloatLit(_)
-            | CExpr::StringLit(_)
-            | CExpr::CharLit(_) => true,
-            CExpr::Var(_) => true,
-            CExpr::Paren(inner) | CExpr::Cast { expr: inner, .. } => {
-                self.is_return_inline_candidate(inner, depth + 1)
-            }
-            CExpr::Unary { operand, .. } => self.is_return_inline_candidate(operand, depth + 1),
-            CExpr::Binary { op, left, right } => {
-                matches!(
-                    op,
-                    BinaryOp::Add
-                        | BinaryOp::Sub
-                        | BinaryOp::Mul
-                        | BinaryOp::Div
-                        | BinaryOp::Mod
-                        | BinaryOp::Shl
-                        | BinaryOp::Shr
-                        | BinaryOp::BitAnd
-                        | BinaryOp::BitOr
-                        | BinaryOp::BitXor
-                        | BinaryOp::And
-                        | BinaryOp::Or
-                        | BinaryOp::Eq
-                        | BinaryOp::Ne
-                        | BinaryOp::Lt
-                        | BinaryOp::Le
-                        | BinaryOp::Gt
-                        | BinaryOp::Ge
-                ) && self.is_return_inline_candidate(left, depth + 1)
-                    && self.is_return_inline_candidate(right, depth + 1)
-            }
-            CExpr::Deref(inner) => self
-                .resolve_stack_alias_from_addr_expr(inner, 0)
-                .filter(|alias| !is_generic_stack_placeholder_alias(alias))
-                .is_some(),
-            _ => false,
-        }
     }
 
     pub(crate) fn stack_alias_from_deref_expr(&self, expr: &CExpr) -> Option<String> {
@@ -922,18 +811,8 @@ impl<'a> FoldingContext<'a> {
                 if let Some(memory) = self.memory_read_expr_for_name(&self.spelling(*name)) {
                     return memory;
                 }
-                if let Some(alias) = self.arg_alias_for_rendered_name(&self.spelling(*name)) {
-                    return self.name_ref(&alias);
-                }
                 if self.lookup_predicate_expr(&self.spelling(*name)).is_some() {
                     return self.simplify_condition_expr(CExpr::Var(name.clone()));
-                }
-                if let Some(source_call) = self
-                    .call_result_source_for_symbol(*name)
-                    .or_else(|| self.local_post_call_source_for_symbol(*name))
-                    && let Some(candidate) = self.synthesized_call_expr_for_source_call(source_call)
-                {
-                    return candidate;
                 }
                 if let Some(candidate) = self
                     .scalar_context_root_candidate_for_name(&self.spelling(*name), VisibleExprContext::ScalarReturn)
@@ -1024,31 +903,11 @@ impl<'a> FoldingContext<'a> {
                     };
                 }
 
-                if !self.should_inline_in_return(*name, depth) || !visited.insert(self.spelling(*name).to_string()) {
-                    return CExpr::Var(name.clone());
-                }
-
-                let resolved = self
-                    .choose_preferred_visible_expr_in_context(
-                        self.lookup_definition(&self.spelling(*name)),
-                        self.choose_preferred_visible_expr_in_context(
-                            self.semanticized_raw_definition_candidate_in_context(&self.spelling(*name), context),
-                            self.best_visible_definition_in_context(&self.spelling(*name), context),
-                            context,
-                        ),
-                        context,
-                    )
-                    .map(|inner| {
-                        self.expand_return_expr_in_context(&inner, depth + 1, visited, context)
-                    })
-                    .unwrap_or_else(|| CExpr::Var(name.clone()));
-
-                visited.remove(&*self.spelling(*name));
-                if self.is_predicate_like_expr(&resolved) {
-                    self.simplify_condition_expr(resolved)
-                } else {
-                    resolved
-                }
+                // A rendered symbol can represent several SSA versions. Once
+                // lowering has only the symbol, there is no exact definition to
+                // inline; preserving the plan-owned variable is the only sound
+                // answer.
+                CExpr::Var(name.clone())
             }
             CExpr::Deref(inner) => {
                 if let CExpr::Var(name) = inner.as_ref()
@@ -1058,23 +917,16 @@ impl<'a> FoldingContext<'a> {
                 {
                     return candidate;
                 }
-                if let Some(stack_var) = self
-                    .resolve_stack_alias_from_addr_expr(inner, 0)
-                    .filter(|alias| !is_generic_stack_placeholder_alias(alias))
-                {
-                    self.name_ref(&stack_var)
-                } else {
-                    let expanded_inner =
-                        self.expand_return_expr_in_context(inner, depth + 1, visited, context);
-                    let mut semantic_visited = HashSet::new();
-                    self.render_memory_access_from_visible_expr(
-                        &expanded_inner,
-                        0,
-                        depth + 1,
-                        &mut semantic_visited,
-                    )
-                    .unwrap_or_else(|| CExpr::Deref(Box::new(expanded_inner)))
-                }
+                let expanded_inner =
+                    self.expand_return_expr_in_context(inner, depth + 1, visited, context);
+                let mut semantic_visited = HashSet::new();
+                self.render_memory_access_from_visible_expr(
+                    &expanded_inner,
+                    0,
+                    depth + 1,
+                    &mut semantic_visited,
+                )
+                .unwrap_or_else(|| CExpr::Deref(Box::new(expanded_inner)))
             }
             CExpr::Binary { op, left, right } => {
                 let rebuilt = CExpr::binary(
@@ -1113,18 +965,18 @@ impl<'a> FoldingContext<'a> {
         }
     }
 
-    pub(super) fn get_return_expr(&self, var: &SSAVar) -> CExpr {
+    pub(super) fn get_return_expr(&self, var: &SSAVar) -> OpLoweringResult<CExpr> {
         if var.is_const() {
-            return self.rewrite_typed_return_literal_expr(
+            return Ok(self.rewrite_typed_return_literal_expr(
                 self.const_to_expr(var),
                 self.current_return_context(),
-            );
+            ));
         }
 
         let mut visited = HashSet::new();
         let root_name = var.display_name();
         let context = self.return_context_for_name(&root_name);
-        let unresolved = self.name_ref(&self.var_name(var));
+        let unresolved = self.get_expr(var)?;
         let raw_definition =
             self.semanticized_raw_definition_candidate_in_context(&root_name, context);
         let semantic_root = match (
@@ -1213,7 +1065,7 @@ impl<'a> FoldingContext<'a> {
             raw
         };
         let sanitized = self.sanitize_return_expr_in_context(simplified, root, unresolved, context);
-        self.rewrite_typed_return_literal_expr(sanitized, context)
+        Ok(self.rewrite_typed_return_literal_expr(sanitized, context))
     }
 
     #[cfg(test)]
@@ -1221,7 +1073,9 @@ impl<'a> FoldingContext<'a> {
         let mut visited = HashSet::new();
         let root_name = var.display_name();
         let context = self.return_context_for_name(&root_name);
-        let unresolved = self.name_ref(&self.var_name(var));
+        let unresolved = self
+            .get_expr(var)
+            .expect("debug return stages require an admitted value");
         let semantic_root = self.semantic_return_candidate_for_name(&root_name);
         let base_root = if let Some(semantic_root) = semantic_root.clone() {
             let best = self
@@ -1351,9 +1205,11 @@ impl<'a> FoldingContext<'a> {
     }
 
     /// Convert an SSA variable to a C variable name.
-    pub fn var_name(&self, var: &SSAVar) -> String {
-        let display = var.display_name();
-        self.spelling(self.sym_for_var(&display, var)).to_string()
+    pub fn var_name(&self, var: &SSAVar) -> OpLoweringResult<String> {
+        match self.get_expr(var)? {
+            CExpr::Var(symbol) => Ok(self.spelling(symbol).to_string()),
+            _ => Err(OpLoweringRefusal::MissingProgramVariableAuthorization),
+        }
     }
 
     /// Convert a constant variable to a C expression.

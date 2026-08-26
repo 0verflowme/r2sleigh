@@ -861,7 +861,6 @@ mod tests {
         let empty_stack_slots = Box::leak(Box::new(BTreeMap::new()));
         let empty_visible = Box::leak(Box::new(Vec::new()));
         let empty_str = Box::leak(Box::new(HashMap::new()));
-        let empty_ty = Box::leak(Box::new(HashMap::new()));
         FoldingContext::from_inputs(FoldInputs {
             normalization_origins: None,
             observation_journal: None,
@@ -878,7 +877,6 @@ mod tests {
             visible_bindings: empty_visible,
             external_type_db: Box::leak(Box::new(r2types::ExternalTypeDb::default())),
             param_register_aliases: empty_str,
-            type_hints: empty_ty,
             type_oracle: None,
             function_return_type: None,
             prepared_ssa: None,
@@ -913,7 +911,6 @@ mod tests {
         let empty_stack_slots = Box::leak(Box::new(BTreeMap::new()));
         let empty_visible = Box::leak(Box::new(Vec::new()));
         let empty_str = Box::leak(Box::new(HashMap::new()));
-        let empty_ty = Box::leak(Box::new(HashMap::new()));
         FoldingContext::from_inputs(FoldInputs {
             normalization_origins: None,
             observation_journal: None,
@@ -930,7 +927,6 @@ mod tests {
             visible_bindings: empty_visible,
             external_type_db: Box::leak(Box::new(r2types::ExternalTypeDb::default())),
             param_register_aliases: empty_str,
-            type_hints: empty_ty,
             type_oracle: None,
             function_return_type: None,
             prepared_ssa: None,
@@ -2181,11 +2177,6 @@ mod tests {
             ("x1".to_string(), "argv".to_string()),
             ("x2".to_string(), "envp".to_string()),
         ])));
-        ctx.inputs.type_hints = Box::leak(Box::new(HashMap::from([
-            ("argc".to_string(), CType::Int(32)),
-            ("argv".to_string(), CType::ptr(CType::ptr(CType::Int(8)))),
-            ("envp".to_string(), CType::ptr(CType::ptr(CType::Int(8)))),
-        ])));
     }
 
     #[test]
@@ -2209,10 +2200,6 @@ mod tests {
         ctx.inputs.visible_bindings = Box::leak(Box::new(vec![
             visible_stack_binding("sum", Some(CType::Int(32)), -8),
             visible_stack_binding("i", Some(CType::Int(32)), -4),
-        ]));
-        ctx.set_type_hints(HashMap::from([
-            ("sum".to_string(), CType::Int(32)),
-            ("i".to_string(), CType::Int(32)),
         ]));
         ctx.state.analysis_ctx.stack_info.stack_vars =
             HashMap::from([(-8, "sum".to_string()), (-4, "i".to_string())]);
@@ -4690,10 +4677,6 @@ mod tests {
             "x1".to_string(),
             "argv".to_string(),
         )])));
-        ctx.set_type_hints(HashMap::from([(
-            "argv".to_string(),
-            CType::ptr(CType::ptr(CType::Int(8))),
-        )]));
 
         let expr = CExpr::binary(
             BinaryOp::Add,
@@ -4714,11 +4697,7 @@ mod tests {
 
     #[test]
     fn test_integer_linear_addition_collects_nested_terms_deterministically() {
-        let mut ctx = FoldingContext::new(64);
-        ctx.set_type_hints(HashMap::from([
-            ("a".to_string(), CType::Int(32)),
-            ("b".to_string(), CType::Int(32)),
-        ]));
+        let ctx = FoldingContext::new(64);
 
         let expr = ctx.identity_simplify_binary(
             BinaryOp::Add,
@@ -4746,11 +4725,7 @@ mod tests {
 
     #[test]
     fn test_linear_addition_refuses_pointer_terms() {
-        let mut ctx = FoldingContext::new(64);
-        ctx.set_type_hints(HashMap::from([
-            ("buf".to_string(), CType::ptr(CType::UInt(8))),
-            ("i".to_string(), CType::Int(32)),
-        ]));
+        let ctx = FoldingContext::new(64);
 
         let expr = ctx.identity_simplify_binary(
             BinaryOp::Add,
@@ -5073,9 +5048,8 @@ mod tests {
     }
 
     #[test]
-    fn expr_type_hint_preserves_cast_and_paren_contracts() {
-        let mut ctx = make_x86_64_ctx();
-        ctx.set_type_hints(HashMap::from([("value".to_string(), CType::UInt(64))]));
+    fn expr_type_hint_preserves_cast_through_paren() {
+        let ctx = make_x86_64_ctx();
 
         assert_eq!(
             ctx.expr_type_hint(&CExpr::cast(
@@ -5085,8 +5059,11 @@ mod tests {
             Some(CType::Int(16))
         );
         assert_eq!(
-            ctx.expr_type_hint(&CExpr::Paren(Box::new(ctx.name_ref("value")))),
-            Some(CType::UInt(64))
+            ctx.expr_type_hint(&CExpr::Paren(Box::new(CExpr::cast(
+                CType::Int(16),
+                ctx.name_ref("value"),
+            )))),
+            Some(CType::Int(16))
         );
     }
 
@@ -5568,14 +5545,6 @@ mod tests {
         let base = make_var("arg1", 0, 8);
         let ret = make_var("tmp:9300", 1, 8);
         let mut ctx = FoldingContext::new(64);
-        ctx.set_type_hints(
-            [(
-                base.display_name(),
-                CType::ptr(CType::Struct("DemoStruct".to_string())),
-            )]
-            .into_iter()
-            .collect(),
-        );
         ctx.inputs.external_type_db = Box::leak(Box::new(ExternalTypeDb {
             structs: [(
                 "demostruct".to_string(),
@@ -5641,14 +5610,6 @@ mod tests {
                 .into_iter()
                 .collect(),
         ));
-        ctx.set_type_hints(
-            [(
-                "arg1".to_string(),
-                CType::ptr(CType::Struct("DemoStruct".to_string())),
-            )]
-            .into_iter()
-            .collect(),
-        );
         ctx.inputs.external_type_db = Box::leak(Box::new(ExternalTypeDb {
             structs: [(
                 "demostruct".to_string(),
@@ -5734,16 +5695,6 @@ mod tests {
                     CExpr::IntLit(4)),
             ),
         );
-        ctx.state
-            .analysis_ctx
-            .use_info
-            .type_hints
-            .insert("local_8".to_string(), CType::ptr(CType::Int(32)));
-        ctx.state
-            .analysis_ctx
-            .use_info
-            .type_hints
-            .insert("local_c".to_string(), CType::Int(32));
         ctx.state
             .analysis_ctx
             .use_info
@@ -5840,16 +5791,6 @@ mod tests {
                 value_kind: StackSlotValueKind::AddressLike,
             },
         );
-        ctx.state
-            .analysis_ctx
-            .use_info
-            .type_hints
-            .insert("len".to_string(), CType::u64());
-        ctx.state
-            .analysis_ctx
-            .use_info
-            .type_hints
-            .insert("buf".to_string(), CType::ptr(CType::i8()));
         ctx.state.analysis_ctx.use_info.insert_semantic_value_for_name(&len_value.display_name(), crate::analysis::SemanticValue::Scalar(crate::analysis::ScalarValue::Expr(CExpr::Var(
                 { let CExpr::Var(id) = ctx.name_ref("len") else { unreachable!() }; id }),
                 )),
@@ -5946,10 +5887,6 @@ mod tests {
                     CExpr::IntLit(56)),
             ),
         );
-        ctx.state.analysis_ctx.use_info.type_hints.insert(
-            base.display_name(),
-            CType::ptr(CType::Struct("DemoStruct".to_string())),
-        );
         ctx.state.analysis_ctx.use_info.insert_semantic_value_for_name(&dst.display_name(), crate::analysis::SemanticValue::Load {
                 space: r2il::SpaceId::Ram,
                 addr: crate::analysis::NormalizedAddr {
@@ -5988,16 +5925,6 @@ mod tests {
         let addr = make_var("tmp:9500", 1, 8);
         let dst = make_var("tmp:9501", 1, 4);
         let mut ctx = FoldingContext::new(64);
-        ctx.state
-            .analysis_ctx
-            .use_info
-            .type_hints
-            .insert("arg1".to_string(), CType::ptr(CType::Int(32)));
-        ctx.state
-            .analysis_ctx
-            .use_info
-            .type_hints
-            .insert("arg2".to_string(), CType::Int(32));
         ctx.state.analysis_ctx.use_info.insert_definition_for_name_if_absent(&addr.display_name(), CExpr::binary(
                 BinaryOp::Add,
                 ctx.name_ref("arg1"),
@@ -6047,16 +5974,6 @@ mod tests {
         let addr = make_var("tmp:9550", 1, 8);
         let dst = make_var("tmp:9551", 1, 1);
         let mut ctx = FoldingContext::new(64);
-        ctx.state
-            .analysis_ctx
-            .use_info
-            .type_hints
-            .insert("buf".to_string(), CType::ptr(CType::u8()));
-        ctx.state
-            .analysis_ctx
-            .use_info
-            .type_hints
-            .insert("i".to_string(), CType::u64());
         ctx.state.analysis_ctx.use_info.insert_definition_for_name_if_absent(&addr.display_name(), CExpr::binary(
                 BinaryOp::Add,
                 ctx.name_ref("i"),
@@ -6296,15 +6213,6 @@ mod tests {
                 ),
             ),
         );
-        ctx.state.analysis_ctx.use_info.type_hints.insert(
-            "arr".to_string(),
-            CType::ptr(CType::Struct("DemoStruct".to_string())),
-        );
-        ctx.state
-            .analysis_ctx
-            .use_info
-            .type_hints
-            .insert("idx".to_string(), CType::Int(32));
         ctx.state.analysis_ctx.use_info.insert_semantic_value_for_name(&dst.display_name(), crate::analysis::SemanticValue::Load {
                 space: r2il::SpaceId::Ram,
                 addr: crate::analysis::NormalizedAddr {
@@ -6355,17 +6263,6 @@ mod tests {
             .into_iter()
             .collect(),
         ));
-        ctx.set_type_hints(
-            [
-                (
-                    "arg1".to_string(),
-                    CType::ptr(CType::Typedef("DemoLayout".to_string())),
-                ),
-                ("arg2".to_string(), CType::Int(32)),
-            ]
-            .into_iter()
-            .collect(),
-        );
         ctx.inputs.external_type_db = Box::leak(Box::new(ExternalTypeDb {
             structs: [(
                 "demolayout".to_string(),
@@ -6431,14 +6328,6 @@ mod tests {
                 .into_iter()
                 .collect(),
         ));
-        ctx.set_type_hints(
-            [(
-                "obj".to_string(),
-                CType::ptr(CType::Typedef("DemoStruct".to_string())),
-            )]
-            .into_iter()
-            .collect(),
-        );
         ctx.state.analysis_ctx.use_info.insert_semantic_value_for_name(&addr.display_name(), crate::analysis::SemanticValue::Address(crate::analysis::NormalizedAddr {
                 base: crate::analysis::BaseRef::Value(crate::analysis::ValueRef::from(base)),
                 index: None,
@@ -6473,17 +6362,6 @@ mod tests {
             .into_iter()
             .collect(),
         ));
-        ctx.set_type_hints(
-            [
-                (
-                    "arg1".to_string(),
-                    CType::ptr(CType::Struct("demo_layout".to_string())),
-                ),
-                ("arg2".to_string(), CType::Int(32)),
-            ]
-            .into_iter()
-            .collect(),
-        );
         ctx.inputs.external_type_db = Box::leak(Box::new(ExternalTypeDb {
             structs: [(
                 "demo_layout".to_string(),
@@ -6601,17 +6479,6 @@ mod tests {
             .into_iter()
             .collect(),
         ));
-        ctx.set_type_hints(
-            [
-                (
-                    "items".to_string(),
-                    CType::ptr(CType::Struct("Item".to_string())),
-                ),
-                ("idx".to_string(), CType::Int(32)),
-            ]
-            .into_iter()
-            .collect(),
-        );
         ctx.inputs.external_type_db = Box::leak(Box::new(ExternalTypeDb {
             structs: [(
                 "item".to_string(),
@@ -6707,17 +6574,6 @@ mod tests {
             .into_iter()
             .collect(),
         ));
-        ctx.set_type_hints(
-            [
-                (
-                    "arr".to_string(),
-                    CType::ptr(CType::Struct("demo_layout".to_string())),
-                ),
-                ("idx".to_string(), CType::Int(32)),
-            ]
-            .into_iter()
-            .collect(),
-        );
         ctx.inputs.external_type_db = Box::leak(Box::new(ExternalTypeDb {
             structs: [(
                 "demo_layout".to_string(),
@@ -6803,18 +6659,6 @@ mod tests {
             .into_iter()
             .collect(),
         ));
-        ctx.set_type_hints(
-            [
-                (
-                    "arr".to_string(),
-                    CType::ptr(CType::Struct("demo_layout".to_string())),
-                ),
-                ("idx".to_string(), CType::Int(32)),
-                ("local_c".to_string(), CType::Int(32)),
-            ]
-            .into_iter()
-            .collect(),
-        );
         ctx.inputs.external_type_db = Box::leak(Box::new(ExternalTypeDb {
             structs: [(
                 "demo_layout".to_string(),
@@ -7052,18 +6896,6 @@ mod tests {
     }
 
     #[test]
-    fn typed_signed_assignment_normalizes_all_ones_literal() {
-        let dst = make_var("tmp:assigned", 1, 4);
-        let mut ctx = make_x86_64_ctx();
-        ctx.set_type_hints(HashMap::from([(dst.display_name(), CType::i32())]));
-
-        assert_eq!(
-            ctx.assignment_rhs_with_type_policy(&dst, None, CExpr::UIntLit(0xffff_ffff)),
-            CExpr::IntLit(-1)
-        );
-    }
-
-    #[test]
     fn test_simplify_predicate_rewrites_ne_ge_zero_to_gt_zero() {
         let ctx = FoldingContext::new(64);
         let expr = CExpr::binary(
@@ -7167,8 +6999,7 @@ mod tests {
 
     #[test]
     fn linear_identity_rewrite_does_not_guess_a_surviving_operand_occurrence() {
-        let mut ctx = FoldingContext::new(64);
-        ctx.set_type_hints(HashMap::from([("x".to_string(), CType::Int(32))]));
+        let ctx = FoldingContext::new(64);
         let mut owner = crate::ast::RenderObservationOwner::new();
         let (first_id, first) = owner
             .observe_expr(ctx.name_ref("x"))
@@ -7258,11 +7089,7 @@ mod tests {
 
     #[test]
     fn assignment_pointer_guard_is_observation_transparent() {
-        let mut ctx = FoldingContext::new(64);
-        ctx.set_type_hints(HashMap::from([(
-            "arg1".to_string(),
-            CType::ptr(CType::Int(8)),
-        )]));
+        let ctx = FoldingContext::new(64);
         let rhs = CExpr::Deref(Box::new(ctx.name_ref("arg1")));
         let plain = ctx
             .assign_stmt(ctx.name_ref("arg1"), rhs.clone())
@@ -7393,8 +7220,7 @@ mod tests {
 
     #[test]
     fn test_identity_add_repeated_scaled_term() {
-        let mut ctx = FoldingContext::new(64);
-        ctx.set_type_hints(HashMap::from([("x".to_string(), CType::Int(32))]));
+        let ctx = FoldingContext::new(64);
         let simplified = ctx.identity_simplify_binary(
             BinaryOp::Add,
             ctx.name_ref("x"),
@@ -10502,16 +10328,6 @@ mod tests {
         let arr_src = make_var("RDI", 0, 8);
         let eax = make_var("EAX", 2, 4);
         let mut ctx = FoldingContext::new(64);
-        ctx.state
-            .analysis_ctx
-            .use_info
-            .type_hints
-            .insert(arr_src.display_name(), CType::ptr(CType::Int(32)));
-        ctx.state
-            .analysis_ctx
-            .use_info
-            .type_hints
-            .insert(idx_src.display_name(), CType::Int(32));
         ctx.state.analysis_ctx.use_info.insert_semantic_value_for_name(&eax.display_name(), crate::analysis::SemanticValue::Load {
                 space: r2il::SpaceId::Ram,
                 addr: crate::analysis::NormalizedAddr {
@@ -10571,17 +10387,6 @@ mod tests {
             .into_iter()
             .collect(),
         ));
-        ctx.set_type_hints(
-            [
-                (
-                    "arg1".to_string(),
-                    CType::ptr(CType::Struct("DemoStruct".to_string())),
-                ),
-                ("arg2".to_string(), CType::Int(32)),
-            ]
-            .into_iter()
-            .collect(),
-        );
         ctx.inputs.external_type_db = Box::leak(Box::new(ExternalTypeDb {
             structs: [(
                 "demostruct".to_string(),
@@ -10678,14 +10483,6 @@ mod tests {
             .into_iter()
             .collect(),
         ));
-        ctx.set_type_hints(
-            [
-                ("arg1".to_string(), CType::ptr(CType::Int(32))),
-                ("arg2".to_string(), CType::Int(32)),
-            ]
-            .into_iter()
-            .collect(),
-        );
         ctx.state.analysis_ctx.use_info.insert_semantic_value_for_name(&ret.display_name(), crate::analysis::SemanticValue::Load {
                 space: r2il::SpaceId::Ram,
                 addr: crate::analysis::NormalizedAddr {
@@ -10722,14 +10519,6 @@ mod tests {
             .into_iter()
             .collect(),
         ));
-        ctx.set_type_hints(
-            [
-                ("arg1".to_string(), CType::ptr(CType::Int(32))),
-                ("arg2".to_string(), CType::Int(32)),
-            ]
-            .into_iter()
-            .collect(),
-        );
         ctx.state
             .analysis_ctx
             .use_info
@@ -10790,14 +10579,6 @@ mod tests {
             .into_iter()
             .collect(),
         ));
-        ctx.set_type_hints(
-            [
-                ("arg1".to_string(), CType::ptr(CType::Int(32))),
-                ("arg2".to_string(), CType::Int(32)),
-            ]
-            .into_iter()
-            .collect(),
-        );
         let raw = CExpr::Deref(Box::new(CExpr::binary(
             BinaryOp::Add,
             ctx.name_ref("arg1"),
@@ -10831,14 +10612,6 @@ mod tests {
             .into_iter()
             .collect(),
         ));
-        ctx.set_type_hints(
-            [(
-                "arg1".to_string(),
-                CType::ptr(CType::Struct("DemoStruct".to_string())),
-            )]
-            .into_iter()
-            .collect(),
-        );
         ctx.inputs.external_type_db = Box::leak(Box::new(ExternalTypeDb {
             structs: [(
                 "demostruct".to_string(),
@@ -13145,20 +12918,6 @@ mod tests {
             ("RDI".to_string(), "arg0".to_string()),
             ("rdi".to_string(), "arg0".to_string()),
         ])));
-        ctx.set_type_hints(HashMap::from([
-            (
-                "RDI".to_string(),
-                CType::ptr(CType::Struct("DemoStruct".to_string())),
-            ),
-            (
-                "rdi".to_string(),
-                CType::ptr(CType::Struct("DemoStruct".to_string())),
-            ),
-            (
-                "arg0".to_string(),
-                CType::ptr(CType::Struct("DemoStruct".to_string())),
-            ),
-        ]));
         ctx.inputs.external_type_db = Box::leak(Box::new(ExternalTypeDb {
             structs: [(
                 "demostruct".to_string(),

@@ -48,10 +48,9 @@ use crate::registers::register_family_name;
 use super::SSABlock;
 use super::context::{EffectOccurrenceKind, FoldingContext};
 use super::context::{ResolutionGuardKey, ResolutionPhase};
-use super::flags::is_cpu_flag;
 use super::{
     MAX_ALIAS_REWRITE_DEPTH, MAX_PREDICATE_OPERAND_DEPTH, MAX_RETURN_EXPR_DEPTH,
-    MAX_RETURN_INLINE_CANDIDATE_DEPTH, MAX_RETURN_INLINE_DEPTH, MAX_SIMPLE_EXPR_DEPTH,
+    MAX_SIMPLE_EXPR_DEPTH,
 };
 
 /// Stage-3 lowering seam. Construction checks that the plan, its machine
@@ -914,7 +913,9 @@ fn call_arg_callee_name(
 ) -> Option<std::rc::Rc<str>> {
     match expr {
         CExpr::Observed { expr, .. } => call_arg_callee_name(symbols, expr),
-        CExpr::Var(name) => Some(crate::symbol::spelling(symbols, *name)),
+        // A local binding may hold a function pointer, but its spelling is not
+        // the identity of the external function it may point at.
+        CExpr::Var(_) => None,
         // A call names something outside the function, so the callee is an
         // external. Matching only variables here lost the signature for every
         // call the moment callees started saying what they are.

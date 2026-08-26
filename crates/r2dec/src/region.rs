@@ -9,7 +9,7 @@ use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
 use r2ssa::{
-    BlockTerminator, CFGEdge, SSAFunction, SSAOp, SSAVar, SsaExecutionStopReason, SsaWorkControl,
+    CFGEdge, SSAFunction, SSAOp, SSAVar, SsaExecutionStopReason, SsaWorkControl,
     domtree::DomTree,
 };
 

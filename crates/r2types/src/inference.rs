@@ -1264,21 +1264,6 @@ impl TypeInference {
         }
     }
 
-    /// Export inferred types keyed by variable display/lowered names.
-    pub fn var_type_hints(&self) -> HashMap<String, CTypeLike> {
-        let mut out = HashMap::new();
-        for (var, ty) in &self.var_types {
-            let key = var.display_name();
-            out.insert(key.clone(), ty.clone());
-            out.insert(key.to_lowercase(), ty.clone());
-
-            let base = var.name.to_lowercase();
-            out.insert(base.clone(), ty.clone());
-            out.insert(format!("{}_{}", base, var.version), ty.clone());
-        }
-        out
-    }
-
     /// Register a function type.
     pub fn add_function_type<T: Into<FunctionType>>(&mut self, name: &str, func_type: T) {
         self.func_types.insert(name.to_string(), func_type.into());

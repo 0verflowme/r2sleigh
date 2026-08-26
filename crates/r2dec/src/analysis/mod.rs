@@ -6,8 +6,6 @@ use r2ssa::{FunctionSSABlock, SSAVar, ValueId};
 use r2types::{CalleeFact, CalleeResolutionFacts, InterprocSummaryView, TypeOracle};
 
 use crate::ast::CExpr;
-#[cfg(test)]
-use crate::ast::CType;
 
 pub(crate) type SSABlock = FunctionSSABlock;
 
@@ -20,9 +18,9 @@ pub(crate) mod prepared_semantic;
 pub(crate) mod use_info;
 pub(crate) mod utils;
 
-pub(crate) use ownership::{
-    CallOwner, CallOwnerKind, CallOwnershipFact, CallSiteId, SemanticOwnershipFacts,
-};
+#[cfg(test)]
+pub(crate) use ownership::{CallOwner, CallOwnerKind, CallOwnershipFact, CallSiteId};
+pub(crate) use ownership::SemanticOwnershipFacts;
 pub(crate) use predicate::{PredicateAnalysisView, PredicateSimplifier};
 pub(crate) use prepared_semantic::{
     PreparedCallView, PreparedRuntimeFactsError, PreparedSemanticView,
@@ -126,10 +124,6 @@ pub(crate) struct PassEnv<'a> {
     /// Where a rendered name is written down, so building a reference can mint one.
     pub(crate) symbols: &'a std::cell::RefCell<crate::symbol::SymbolTable>,
     pub(crate) caller_saved_regs: &'a HashSet<String>,
-    /// Legacy spelling-keyed type hints exist only for fixtures. Production
-    /// asks `TypeOracle` with the exact `SSAVar` whose type is needed.
-    #[cfg(test)]
-    pub(crate) type_hints: &'a HashMap<String, CType>,
     pub(crate) type_oracle: Option<&'a dyn TypeOracle>,
 }
 
@@ -139,7 +133,9 @@ pub(crate) struct UseInfo {
     pub(crate) value_ids_by_var: HashMap<SSAVar, ValueId>,
     pub(crate) ambiguous_value_vars: HashSet<SSAVar>,
     pub(crate) ambiguous_value_ids: BTreeSet<ValueId>,
+    #[cfg(test)]
     pub(crate) value_ids_by_name: HashMap<String, ValueId>,
+    #[cfg(test)]
     pub(crate) ambiguous_value_names: HashSet<String>,
     pub(crate) vars_by_value_id: BTreeMap<ValueId, SSAVar>,
     pub(crate) use_counts_by_value: BTreeMap<ValueId, usize>,
@@ -168,8 +164,6 @@ pub(crate) struct UseInfo {
     pub(crate) consumed_by_call: HashSet<String>,
     #[cfg(test)]
     pub(crate) var_aliases: HashMap<String, String>,
-    #[cfg(test)]
-    pub(crate) type_hints: HashMap<String, CType>,
     pub(crate) stack_slots_by_value: BTreeMap<ValueId, StackSlotProvenance>,
     pub(crate) stable_stack_values: HashMap<i64, SemanticValue>,
     pub(crate) stable_memory_values: HashMap<String, SemanticValue>,
@@ -492,23 +486,6 @@ impl StackSlotProvenance {
     }
 }
 
-fn lookup_name_key<'a, T>(map: &'a HashMap<String, T>, name: &str) -> Option<&'a T> {
-    map.get(name)
-        .or_else(|| {
-            let lower = name.to_ascii_lowercase();
-            (lower != name).then(|| map.get(&lower)).flatten()
-        })
-        .or_else(|| {
-            name.rsplit_once('_').and_then(|(base, version)| {
-                let lower = format!("{}_{}", base.to_ascii_lowercase(), version);
-                map.get(&lower).or_else(|| {
-                    let upper = format!("{}_{}", base.to_ascii_uppercase(), version);
-                    (upper != lower).then(|| map.get(&upper)).flatten()
-                })
-            })
-        })
-}
-
 fn value_ref_references_any(value: &ValueRef, ids: &BTreeSet<ValueId>) -> bool {
     value
         .value_id
@@ -581,10 +558,13 @@ impl UseInfo {
         }
         self.value_ids_by_var.insert(var.clone(), value_id);
 
-        let display = var.display_name();
-        self.bind_value_name(display, value_id);
-        if var.version == 0 {
-            self.bind_value_name(var.name.clone(), value_id);
+        #[cfg(test)]
+        {
+            let display = var.display_name();
+            self.bind_value_name(display, value_id);
+            if var.version == 0 {
+                self.bind_value_name(var.name.clone(), value_id);
+            }
         }
         self.vars_by_value_id
             .entry(value_id)
@@ -655,18 +635,23 @@ impl UseInfo {
         for var in vars {
             self.value_ids_by_var.remove(&var);
             self.ambiguous_value_vars.insert(var.clone());
-            self.invalidate_value_name(var.display_name());
-            if var.version == 0 {
-                self.invalidate_value_name(var.name);
+            #[cfg(test)]
+            {
+                self.invalidate_value_name(var.display_name());
+                if var.version == 0 {
+                    self.invalidate_value_name(var.name);
+                }
             }
         }
     }
 
+    #[cfg(test)]
     fn invalidate_value_name(&mut self, name: String) {
         self.value_ids_by_name.remove(&name);
         self.ambiguous_value_names.insert(name);
     }
 
+    #[cfg(test)]
     fn bind_value_name(&mut self, name: String, value_id: ValueId) {
         if self.ambiguous_value_names.contains(&name) {
             return;
@@ -758,15 +743,9 @@ impl UseInfo {
         }
     }
 
-    /// Record a semantic value under both keys, keeping whichever arrived first.
-    ///
-    /// The value key is supplied rather than looked up, because the caller knows
-    /// which reload this fact belongs to and the name alone does not say. Both
-    /// halves get the same value: this pairing exists once, here, instead of
-    /// being spelled again at the call site.
-    pub(crate) fn insert_semantic_value_for_name_and_value_if_absent(
+    /// Record a semantic value against the exact upstream value identity.
+    pub(crate) fn insert_semantic_value_for_value_if_absent(
         &mut self,
-        _name: String,
         value_id: Option<ValueId>,
         value: SemanticValue,
     ) {
@@ -780,6 +759,7 @@ impl UseInfo {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn insert_semantic_value_for_name(&mut self, name: &str, value: SemanticValue) {
         if let Some(value_id) = self.value_id_for_name_or_bind(name) {
             self.semantic_values_by_value.insert(value_id, value);
@@ -788,11 +768,13 @@ impl UseInfo {
         }
     }
 
-    /// Give a rendered spelling an identity, minting one if it has none.
+    /// Resolve a spelling only when it is already bound to one exact value.
     ///
-    /// Facts are filed against values, so a caller holding only a name has to
-    /// resolve it before it can say anything. Production code reaches a value
-    /// through the SSA; a test that starts from a spelling uses this.
+    /// Production never manufactures a `ValueId` for text: a spelling can
+    /// denote a binding containing several SSA values and is not upstream
+    /// evidence for any one of them. Legacy fixtures that have no SSA artifact
+    /// may allocate a private synthetic identity under `cfg(test)` only.
+    #[cfg(test)]
     pub(crate) fn value_id_for_name_or_bind(&mut self, name: &str) -> Option<ValueId> {
         if let Some(value_id) = self.value_id_for_name(name) {
             return Some(value_id);
@@ -805,6 +787,17 @@ impl UseInfo {
         self.value_id_for_name(name)
     }
 
+    pub(crate) fn insert_call_result_source_for_value(
+        &mut self,
+        value: ValueId,
+        source_call: (u64, usize),
+    ) {
+        if !self.ambiguous_value_ids.contains(&value) {
+            self.call_result_source_by_value.insert(value, source_call);
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn insert_call_result_source_alias(
         &mut self,
         alias: &str,
@@ -846,6 +839,7 @@ impl UseInfo {
             .map(|_| value_id)
     }
 
+    #[cfg(test)]
     pub(crate) fn value_id_for_name(&self, name: &str) -> Option<ValueId> {
 
         if self.ambiguous_value_names.contains(name) {
@@ -862,13 +856,10 @@ impl UseInfo {
     }
 
     pub(crate) fn definition_for_var(&self, var: &SSAVar) -> Option<&CExpr> {
-        if self.ambiguous_value_vars.contains(var)
-            || self.ambiguous_value_names.contains(&var.display_name())
-        {
+        if self.ambiguous_value_vars.contains(var) {
             return None;
         }
         self.value_id_for_var(var)
-            .or_else(|| self.value_id_for_name(&var.display_name()))
             .and_then(|value_id| self.definitions_by_value.get(&value_id))
     }
 
@@ -877,12 +868,26 @@ impl UseInfo {
         self.var_for_value_id(value_id).map(SSAVar::display_name)
     }
 
-    pub(crate) fn use_count_for_name(&self, name: &str) -> usize {
-        if self.ambiguous_value_names.contains(name) {
+    pub(crate) fn use_count_for_value(&self, value: ValueId) -> usize {
+        if self.ambiguous_value_ids.contains(&value) {
             return 0;
         }
+        self.use_counts_by_value
+            .get(&value)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    pub(crate) fn use_count_for_var(&self, var: &SSAVar) -> usize {
+        self.exact_value_id_for_var(var)
+            .map(|value| self.use_count_for_value(value))
+            .unwrap_or(0)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn use_count_for_name(&self, name: &str) -> usize {
         self.value_id_for_name(name)
-            .and_then(|value_id| self.use_counts_by_value.get(&value_id).copied())
+            .map(|value| self.use_count_for_value(value))
             .unwrap_or(0)
     }
 
@@ -905,6 +910,7 @@ impl UseInfo {
         self.definition_for_value(value_id)
     }
 
+    #[cfg(test)]
     pub(crate) fn definition_for_name(&self, name: &str) -> Option<&CExpr> {
 
         if self.ambiguous_value_names.contains(name) {
@@ -920,14 +926,13 @@ impl UseInfo {
             .contains(&crate::analysis::utils::flag_base_name(name))
     }
 
+    #[cfg(test)]
     pub(crate) fn render_definition_for_name(&self, name: &str) -> Option<&CExpr> {
         self.definition_for_name(name)
     }
 
     pub(crate) fn semantic_value_for_var(&self, var: &SSAVar) -> Option<&SemanticValue> {
-        if self.ambiguous_value_vars.contains(var)
-            || self.ambiguous_value_names.contains(&var.display_name())
-        {
+        if self.ambiguous_value_vars.contains(var) {
             return None;
         }
         self.value_id_for_var(var)
@@ -948,6 +953,7 @@ impl UseInfo {
         self.semantic_value_for_value(value_id)
     }
 
+    #[cfg(test)]
     pub(crate) fn semantic_value_for_name(&self, name: &str) -> Option<&SemanticValue> {
         if self.ambiguous_value_names.contains(name) {
             return None;
@@ -956,14 +962,13 @@ impl UseInfo {
             .and_then(|value_id| self.semantic_values_by_value.get(&value_id))
     }
 
+    #[cfg(test)]
     pub(crate) fn render_semantic_value_for_name(&self, name: &str) -> Option<&SemanticValue> {
         self.semantic_value_for_name(name)
     }
 
     pub(crate) fn forwarded_value_for_var(&self, var: &SSAVar) -> Option<&ValueProvenance> {
-        if self.ambiguous_value_vars.contains(var)
-            || self.ambiguous_value_names.contains(&var.display_name())
-        {
+        if self.ambiguous_value_vars.contains(var) {
             return None;
         }
         // Value first, as the definition accessors do. A name can be ambiguous
@@ -988,6 +993,7 @@ impl UseInfo {
         self.forwarded_value_for_value(value_id)
     }
 
+    #[cfg(test)]
     pub(crate) fn forwarded_value_for_name(&self, name: &str) -> Option<&ValueProvenance> {
         if self.ambiguous_value_names.contains(name) {
             return None;
@@ -996,6 +1002,7 @@ impl UseInfo {
             .and_then(|value_id| self.forwarded_values_by_value.get(&value_id))
     }
 
+    #[cfg(test)]
     pub(crate) fn render_forwarded_value_for_name(&self, name: &str) -> Option<&ValueProvenance> {
         self.forwarded_value_for_name(name)
     }
@@ -1007,6 +1014,7 @@ impl UseInfo {
     /// that value is called -- rather than keeping a second map of names to
     /// names, which `lookup_name_key` matched case-insensitively and so could
     /// answer for a different variable that happened to differ only in case.
+    #[cfg(test)]
     pub(crate) fn render_copy_source_for_name(&self, name: &str) -> Option<String> {
         let value_id = self.value_id_for_name(name)?;
         let source_id = self.copy_sources_by_value.get(&value_id)?;
@@ -1014,6 +1022,7 @@ impl UseInfo {
             .map(|var| var.display_name())
     }
 
+    #[cfg(test)]
     pub(crate) fn has_renderable_named_fact(&self, name: &str) -> bool {
         self.value_id_for_name(name).is_some_and(|value_id| {
             self.definitions_by_value.contains_key(&value_id)
@@ -1040,6 +1049,7 @@ impl UseInfo {
     /// the name binding answers instead.
     fn names_by_value_id(&self) -> BTreeMap<ValueId, String> {
         let mut names = BTreeMap::new();
+        #[cfg(test)]
         for (name, value_id) in &self.value_ids_by_name {
             names.entry(*value_id).or_insert_with(|| name.clone());
         }
@@ -1060,6 +1070,7 @@ impl UseInfo {
     }
 
     /// File a definition against the value a spelling names, if it has none.
+    #[cfg(test)]
     pub(crate) fn insert_definition_for_name_if_absent(&mut self, name: &str, expr: CExpr) {
         match self.value_id_for_name_or_bind(name) {
             Some(value_id) => {
@@ -1073,6 +1084,21 @@ impl UseInfo {
     ///
     /// Filed against the value: the name is resolved on the way in, and a name
     /// with no identity is counted rather than given its own entry.
+    pub(crate) fn merge_stack_slot_for_value(
+        &mut self,
+        value: ValueId,
+        candidate: StackSlotProvenance,
+    ) {
+        if self.ambiguous_value_ids.contains(&value) {
+            return;
+        }
+        self.stack_slots_by_value
+            .entry(value)
+            .and_modify(|existing| *existing = existing.merge(candidate))
+            .or_insert(candidate);
+    }
+
+    #[cfg(test)]
     pub(crate) fn merge_stack_slot_for_name(
         &mut self,
         name: &str,
@@ -1093,6 +1119,7 @@ impl UseInfo {
         self.stack_slots_by_value.values_mut()
     }
 
+    #[cfg(test)]
     pub(crate) fn stack_slot_for_name(&self, name: &str) -> Option<StackSlotProvenance> {
         if self.ambiguous_value_names.contains(name) {
             return None;
@@ -1119,26 +1146,35 @@ impl UseInfo {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn render_stack_slot_for_name(&self, name: &str) -> Option<StackSlotProvenance> {
         self.stack_slot_for_name(name)
     }
 
     pub(crate) fn ptr_arith_for_var(&self, var: &SSAVar) -> Option<&PtrArith> {
-        if self.ambiguous_value_vars.contains(var)
-            || self.ambiguous_value_names.contains(&var.display_name())
-        {
+        if self.ambiguous_value_vars.contains(var) {
             return None;
         }
         self.value_id_for_var(var)
             .and_then(|value_id| self.ptr_arith_by_value.get(&value_id))
     }
 
-    pub(crate) fn is_condition_name(&self, name: &str) -> bool {
-        if self.ambiguous_value_names.contains(name) {
+    pub(crate) fn is_condition_value(&self, value: ValueId) -> bool {
+        if self.ambiguous_value_ids.contains(&value) {
             return false;
         }
+        self.condition_values.contains(&value)
+    }
+
+    pub(crate) fn is_condition_var(&self, var: &SSAVar) -> bool {
+        self.exact_value_id_for_var(var)
+            .is_some_and(|value| self.is_condition_value(value))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_condition_name(&self, name: &str) -> bool {
         self.value_id_for_name(name)
-            .is_some_and(|value_id| self.condition_values.contains(&value_id))
+            .is_some_and(|value| self.is_condition_value(value))
     }
 
     #[cfg(test)]

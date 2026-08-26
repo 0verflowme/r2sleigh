@@ -910,16 +910,20 @@ static void sleigh_engine_v2_emit_binding_audit(R2SleighByteViewV2 view) {
 	const RJson *placement_audit = diagnostics && diagnostics->type == R_JSON_OBJECT
 		? r_json_get (diagnostics, "placement_audit")
 		: NULL;
+	const RJson *render_refusal = diagnostics && diagnostics->type == R_JSON_OBJECT
+		? r_json_get (diagnostics, "render_refusal")
+		: NULL;
 	if (outcome && outcome->type == R_JSON_STRING && outcome->str_value
 		&& (!strcmp (outcome->str_value, "completed")
 			|| !strcmp (outcome->str_value, "refused"))
 		&& audit && audit->type == R_JSON_OBJECT
 		&& effect_obligations && effect_obligations->type == R_JSON_OBJECT
-		&& placement_audit && placement_audit->type == R_JSON_OBJECT) {
+		&& placement_audit && placement_audit->type == R_JSON_OBJECT
+		&& render_refusal && render_refusal->type == R_JSON_OBJECT) {
 		PJ *pj = pj_new ();
 		if (pj) {
 			pj_o (pj);
-			pj_kn (pj, "schema_version", 4);
+			pj_kn (pj, "schema_version", 5);
 			pj_ks (pj, "request_status", outcome->str_value);
 			pj_k (pj, "audit");
 			pj_rj (pj, (RJson *)audit);
@@ -927,6 +931,8 @@ static void sleigh_engine_v2_emit_binding_audit(R2SleighByteViewV2 view) {
 			pj_rj (pj, (RJson *)effect_obligations);
 			pj_k (pj, "placement_audit");
 			pj_rj (pj, (RJson *)placement_audit);
+			pj_k (pj, "render_refusal");
+			pj_rj (pj, (RJson *)render_refusal);
 			pj_end (pj);
 			char *json = pj_drain (pj);
 			if (json) {

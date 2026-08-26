@@ -351,6 +351,13 @@ fn audit_plan_symbols(
                 .map(|symbol| (symbol, binding))
         })
         .collect::<BTreeMap<_, _>>();
+    for local in &function.locals {
+        if !by_symbol.contains_key(&local.name) {
+            return Err(PlacementAnalysisError::UnauthorizedProgramVariable {
+                symbol: local.name,
+            });
+        }
+    }
     for statement in &function.body {
         audit_statement(statement, source, names, targets, &by_symbol)?;
     }
@@ -383,7 +390,15 @@ fn audit_statement(
         CStmt::Expr(expr) | CStmt::Return(Some(expr)) => {
             audit_expr(expr, SymbolAccess::Read, &active, source, names, targets, by_symbol)?;
         }
-        CStmt::Decl { init, .. } => {
+        CStmt::Decl { name, init, .. } => {
+            audit_program_symbol(
+                *name,
+                SymbolAccess::Write,
+                &active,
+                source,
+                names,
+                by_symbol,
+            )?;
             if let Some(init) = init {
                 audit_expr(init, SymbolAccess::Read, &active, source, names, targets, by_symbol)?;
             }
@@ -484,19 +499,7 @@ fn audit_expr(
     }
     match expr {
         CExpr::Var(symbol) => {
-            let Some(binding) = by_symbol.get(symbol).copied() else {
-                return Ok(());
-            };
-            if !active.iter().copied().any(|target| {
-                target_authorizes_binding(target, access, binding, source, names)
-            }) {
-                return Err(match access {
-                    SymbolAccess::Read => PlacementAnalysisError::UnobservedBindingRead { binding },
-                    SymbolAccess::Write => {
-                        PlacementAnalysisError::UnobservedBindingWrite { binding }
-                    }
-                });
-            }
+            audit_program_symbol(*symbol, access, active, source, names, by_symbol)?;
         }
         CExpr::Observed { .. } => unreachable!("leading observation was consumed"),
         CExpr::Unary { op, operand } => {
@@ -697,6 +700,31 @@ fn audit_expr(
     Ok(())
 }
 
+fn audit_program_symbol(
+    symbol: crate::symbol::SymbolId,
+    access: SymbolAccess,
+    active: &[PlacementObservationTarget],
+    source: &r2ssa::SsaArtifact,
+    names: &BindingNameResolution,
+    by_symbol: &BTreeMap<crate::symbol::SymbolId, BindingId>,
+) -> Result<(), PlacementAnalysisError> {
+    let binding = by_symbol
+        .get(&symbol)
+        .copied()
+        .ok_or(PlacementAnalysisError::UnauthorizedProgramVariable { symbol })?;
+    if active
+        .iter()
+        .copied()
+        .any(|target| target_authorizes_binding(target, access, binding, source, names))
+    {
+        return Ok(());
+    }
+    Err(match access {
+        SymbolAccess::Read => PlacementAnalysisError::UnobservedBindingRead { binding },
+        SymbolAccess::Write => PlacementAnalysisError::UnobservedBindingWrite { binding },
+    })
+}
+
 fn target_authorizes_binding(
     target: PlacementObservationTarget,
     access: SymbolAccess,
@@ -795,6 +823,7 @@ pub(crate) enum PlacementAnalysisError {
     MissingPlannedValue { value: r2ssa::ValueId },
     RefusedPlannedValue { value: r2ssa::ValueId },
     UnscopedObservation { observation: RenderObservationId },
+    UnauthorizedProgramVariable { symbol: crate::symbol::SymbolId },
     UnobservedBindingRead { binding: BindingId },
     UnobservedBindingWrite { binding: BindingId },
 }
@@ -1546,7 +1575,7 @@ mod tests {
     use crate::region::Region;
     use crate::structured_region::{StructuredRegionDraft, StructuredRegionKind, StructuredRegionMarker, seal_structured_body,
     };
-    use crate::symbol::{SymbolOrigin, SymbolRole, SymbolTable};
+    use crate::symbol::{SymbolRole, SymbolTable};
 
     fn observation(index: u32) -> RenderObservationId {
         crate::observation_journal::test_render_observation_id(index)
@@ -1908,7 +1937,6 @@ mod tests {
             "value",
             crate::ast::CType::UInt(32),
             SymbolRole::Carrier,
-            SymbolOrigin::default(),
         );
         let marker = observation(7);
         let assignment = CStmt::observed(

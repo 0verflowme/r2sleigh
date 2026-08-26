@@ -1,4 +1,6 @@
-use std::cell::{Cell, OnceCell};
+use std::cell::Cell;
+#[cfg(test)]
+use std::cell::OnceCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 #[cfg(test)]
 use std::sync::OnceLock;
@@ -13,9 +15,11 @@ use r2ssa::{
 use r2types::ExternalStackVarSpec;
 use r2types::{
     CalleeFact, CalleeResolutionFacts, ExternalStackSlotSpec, ExternalTypeDb,
-    FieldAccessCertificate, FunctionFacts, InterprocSummaryView, SignatureRegistry, StackSlotKey,
+    FunctionFacts, InterprocSummaryView, SignatureRegistry, StackSlotKey,
     TypeOracle, VisibleBinding,
 };
+#[cfg(test)]
+use r2types::FieldAccessCertificate;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum ResolutionPhase {
@@ -76,8 +80,6 @@ pub(crate) struct FoldInputs<'a> {
     pub(crate) external_stack_vars: &'a HashMap<i64, ExternalStackVarSpec>,
     pub(crate) visible_bindings: &'a [VisibleBinding],
     pub(crate) external_type_db: &'a ExternalTypeDb,
-    pub(crate) param_register_aliases: &'a HashMap<String, String>,
-    pub(crate) type_hints: &'a HashMap<String, CType>,
     pub(crate) type_oracle: Option<&'a dyn TypeOracle>,
     pub(crate) function_return_type: Option<&'a CType>,
     pub(crate) prepared_ssa: Option<&'a SsaArtifact>,
@@ -972,8 +974,6 @@ impl<'a> FoldingContext<'a> {
         static EMPTY_I64_STACK: OnceLock<HashMap<i64, ExternalStackVarSpec>> = OnceLock::new();
         static EMPTY_VISIBLE_BINDINGS: OnceLock<Vec<VisibleBinding>> = OnceLock::new();
         static EMPTY_TYPE_DB: OnceLock<ExternalTypeDb> = OnceLock::new();
-        static EMPTY_STRING_STRING: OnceLock<HashMap<String, String>> = OnceLock::new();
-        static EMPTY_STRING_CTYPE: OnceLock<HashMap<String, CType>> = OnceLock::new();
         static ARCH64: OnceLock<FoldArchConfig> = OnceLock::new();
         static ARCH32: OnceLock<FoldArchConfig> = OnceLock::new();
 
@@ -1003,8 +1003,6 @@ impl<'a> FoldingContext<'a> {
             external_stack_vars: EMPTY_I64_STACK.get_or_init(HashMap::new),
             visible_bindings: EMPTY_VISIBLE_BINDINGS.get_or_init(Vec::new),
             external_type_db: EMPTY_TYPE_DB.get_or_init(ExternalTypeDb::default),
-            param_register_aliases: EMPTY_STRING_STRING.get_or_init(HashMap::new),
-            type_hints: EMPTY_STRING_CTYPE.get_or_init(HashMap::new),
             type_oracle: None,
             function_return_type: None,
             prepared_ssa: None,

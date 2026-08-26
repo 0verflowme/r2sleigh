@@ -241,7 +241,7 @@ impl<'a> FoldingContext<'a> {
         expr: CExpr,
         aliases: &HashMap<crate::symbol::SymbolId, CExpr>,
         depth: u32,
-        visiting: &mut HashSet<String>,
+        visiting: &mut HashSet<crate::symbol::SymbolId>,
     ) -> CExpr {
         match expr {
             CExpr::Observed { id, expr } => CExpr::observed(
@@ -275,7 +275,7 @@ impl<'a> FoldingContext<'a> {
         expr: CExpr,
         aliases: &HashMap<crate::symbol::SymbolId, CExpr>,
         depth: u32,
-        visiting: &mut HashSet<String>,
+        visiting: &mut HashSet<crate::symbol::SymbolId>,
     ) -> CExpr {
         if depth > MAX_ALIAS_REWRITE_DEPTH {
             return expr;
@@ -291,13 +291,12 @@ impl<'a> FoldingContext<'a> {
                     return CExpr::Var(name);
                 };
 
-                let key = format!("symbol:{}", name.index());
-                if !visiting.insert(key.clone()) {
+                if !visiting.insert(name) {
                     return CExpr::Var(name);
                 }
 
                 let rewritten = self.rewrite_expr_with_aliases(alias, aliases, depth + 1, visiting);
-                visiting.remove(&key);
+                visiting.remove(&name);
                 self.choose_alias_rewrite(CExpr::Var(name), rewritten)
             }
             CExpr::Subscript { base, index } => CExpr::Subscript { base, index },
@@ -469,10 +468,14 @@ impl<'a> FoldingContext<'a> {
             .is_some_and(|ty| matches!(ty, CType::Void))
     }
 
-    pub(super) fn collect_expr_reads(&self, expr: &CExpr, out: &mut HashSet<String>) {
+    pub(super) fn collect_expr_reads(
+        &self,
+        expr: &CExpr,
+        out: &mut HashSet<crate::symbol::SymbolId>,
+    ) {
         expr.visit(&mut |node| {
             if let CExpr::Var(name) = node {
-                out.insert(self.spelling(*name).to_string());
+                out.insert(*name);
             }
         });
     }
@@ -482,7 +485,10 @@ impl<'a> FoldingContext<'a> {
     pub(crate) fn stmt_reads_and_def_for_render(
         &self,
         stmt: &CStmt,
-    ) -> (HashSet<String>, Option<crate::symbol::SymbolId>) {
+    ) -> (
+        HashSet<crate::symbol::SymbolId>,
+        Option<crate::symbol::SymbolId>,
+    ) {
         self.stmt_reads_and_def(stmt)
     }
 
@@ -495,7 +501,13 @@ impl<'a> FoldingContext<'a> {
         self.stmt_is_side_effect_free_versioned_register_carrier(stmt)
     }
 
-    fn stmt_reads_and_def(&self, stmt: &CStmt) -> (HashSet<String>, Option<crate::symbol::SymbolId>) {
+    fn stmt_reads_and_def(
+        &self,
+        stmt: &CStmt,
+    ) -> (
+        HashSet<crate::symbol::SymbolId>,
+        Option<crate::symbol::SymbolId>,
+    ) {
         let mut reads = HashSet::new();
         let mut def = None;
 
@@ -639,12 +651,10 @@ impl<'a> FoldingContext<'a> {
         &self,
         stmts: Vec<CStmt>,
         demote_dead_return_register_calls: bool,
-        preserve_named_stack_owners: bool,
-        live_out: &HashSet<String>,
+        _preserve_named_stack_owners: bool,
+        live_out: &HashSet<crate::symbol::SymbolId>,
     ) -> Vec<CStmt> {
-        let mut live: HashSet<String> = live_out.clone();
-        let mut live_call_sources = BTreeSet::new();
-        let mut live_call_assignment_sources = BTreeSet::new();
+        let mut live: HashSet<crate::symbol::SymbolId> = live_out.clone();
         let mut kept_rev = Vec::with_capacity(stmts.len());
 
         for stmt in stmts.into_iter().rev() {
@@ -652,68 +662,39 @@ impl<'a> FoldingContext<'a> {
             let (mut reads, mut def) = self.stmt_reads_and_def(&stmt);
 
             let drop_stmt = if let Some((target, rhs)) = Self::assignment_target_and_rhs(&stmt) {
-                let target_lower = self.spelling(target).to_ascii_lowercase();
-                let target_is_pinned =
-                    self.pinned_set().contains(&*self.spelling(target)) || self.pinned_set().contains(&target_lower);
-                let source_call_for_target = self
-                    .call_result_source_for_symbol(target)
-                    .or_else(|| self.local_post_call_source_for_symbol(target))
-                    .or_else(|| self.source_call_for_visible_owner_name(&self.spelling(target)));
-                let call_result_candidate_names = source_call_for_target
-                    .map(|source_call| self.call_result_candidate_names(source_call, &self.spelling(target)))
-                    .unwrap_or_default();
-                let target_has_live_use = live.contains(&*self.spelling(target))
-                    || call_result_candidate_names.iter().any(|candidate| {
-                        candidate.eq_ignore_ascii_case(&self.spelling(target)) && live.contains(candidate)
-                    });
-                let dead_sleigh_memory_artifact = self.is_sleigh_memory_temp_name(&self.spelling(target))
+                let target_is_exact_local = self
+                    .inputs
+                    .binding_names
+                    .is_some_and(|names| names.authorizes_program_variable(target))
+                    && matches!(
+                        self.symbols.borrow().get(target).role,
+                        crate::symbol::SymbolRole::Carrier
+                    );
+                let target_has_live_use = live.contains(&target);
+
+                // The remaining pinned/cross-block sets have no BindingId or
+                // SymbolId key yet. While either contains an unprojected fact,
+                // it cannot safely authorize deletion of any particular
+                // assignment by comparing presentation text.
+                let has_unprojected_liveness = !self.pinned_set().is_empty()
+                    || !self.cross_block_reads.borrow().is_empty();
+
+                // The call occurrence retains its exact upstream site. A bare
+                // assignment target does not identify a result value, so no
+                // alias/owner spelling is consulted. Without the site, keep the
+                // assignment conservatively.
+                let exact_call_site = match rhs.unobserved() {
+                    CExpr::Call {
+                        site: Some(source),
+                        ..
+                    } => Some(*source),
+                    _ => None,
+                };
+                let dead_exact_call_result = demote_dead_return_register_calls
+                    && target_is_exact_local
                     && !target_has_live_use
-                    && self.expr_contains_unresolved_memory(rhs);
-                let observable_call_result_owner = self
-                    .call_result_candidate_names_have_observable_use(&call_result_candidate_names);
-                let rhs_call_source = matches!(rhs.unobserved(), CExpr::Call { .. })
-                    .then_some(source_call_for_target)
-                    .flatten();
-                let target_is_named_stack_owner =
-                    self.stack_slot_provenance_for_name(&self.spelling(target)).is_some()
-                        || self.stack_offset_for_visible_storage_name(&self.spelling(target)).is_some()
-                        || self
-                            .certified_autogenerated_stack_storage_offset(&self.spelling(target))
-                            .is_some();
-                let target_is_materialized_call_owner = rhs_call_source.is_some_and(|source| {
-                    self.stable_owned_call_result_name_for_source(source)
-                        .is_some_and(|owner| owner.eq_ignore_ascii_case(&target_lower))
-                });
-                let protected_named_call_result_owner =
-                    target_is_named_stack_owner && target_is_materialized_call_owner;
-                let target_base = target_lower
-                    .split('_')
-                    .next()
-                    .unwrap_or(&target_lower)
-                    .to_ascii_lowercase();
-                let dead_return_register_owner = demote_dead_return_register_calls
-                    && self.inputs.arch.is_return_register_name(&target_base);
-                let dead_transient_call_result = !target_has_live_use
-                    && !target_is_pinned
-                    && (dead_return_register_owner
-                        || !observable_call_result_owner
-                        || rhs_call_source
-                            .is_some_and(|source| self.source_call_expr_returns_void(source, rhs)))
-                    && matches!(rhs.unobserved(), CExpr::Call { .. })
-                    && !protected_named_call_result_owner
-                    && (self.is_low_signal_visible_name(&self.spelling(target))
-                        || self.is_prunable_dead_binding_target(&self.spelling(target)));
-                let dead_ephemeral = self.is_prunable_dead_binding_target(&self.spelling(target))
-                    && !target_is_pinned
-                    && !target_has_live_use
-                    && !self
-                        .cross_block_reads
-                        .borrow()
-                        .contains(&*self.spelling(target))
-                    && (!preserve_named_stack_owners || !target_is_named_stack_owner)
-                    && (self.expr_is_pure(rhs) || dead_sleigh_memory_artifact);
-                let dead_flag_artifact =
-                    self.inputs.arch.is_flag_name(&target_lower) && !target_has_live_use && self.expr_is_pure(rhs);
+                    && !has_unprojected_liveness
+                    && exact_call_site.is_some();
 
                 // A call is an event, so a statement carrying one can lose its
                 // target when nothing reads the result, but it can never be
@@ -721,7 +702,7 @@ impl<'a> FoldingContext<'a> {
                 // second rendering of the same site is redundant is not this
                 // pass's judgement to make -- rendering each site once is
                 // settled before the output is pruned.
-                if dead_transient_call_result {
+                if dead_exact_call_result {
                     // The call occurrence survives, but the assignment/write
                     // occurrence does not. Keeping the RHS preserves its own
                     // markers; moving the statement marker would credit a
@@ -730,7 +711,11 @@ impl<'a> FoldingContext<'a> {
                     (reads, def) = self.stmt_reads_and_def(&stmt);
                     false
                 } else {
-                    dead_ephemeral || dead_flag_artifact
+                    // This AST occurrence carries no ValueId/UseSite. Pure
+                    // assignment deletion therefore waits for exact occurrence
+                    // provenance instead of guessing from a temporary, flag,
+                    // register, or stack-looking spelling.
+                    false
                 }
             } else {
                 // A statement that is only an expression, and whose evaluation
@@ -744,11 +729,9 @@ impl<'a> FoldingContext<'a> {
             }
 
             if let Some(def_name) = def {
-                live.remove(&*self.spelling(def_name));
+                live.remove(&def_name);
             }
             live.extend(reads);
-            self.collect_call_sources_in_stmt(&stmt, &mut live_call_sources);
-            self.collect_call_assignment_sources_in_stmt(&stmt, &mut live_call_assignment_sources);
             kept_rev.push(stmt);
         }
 
@@ -757,16 +740,12 @@ impl<'a> FoldingContext<'a> {
     }
 
     pub(super) fn stmt_is_side_effect_free_versioned_register_carrier(&self, stmt: &CStmt) -> bool {
-        let Some(name) = super::side_effect_free_assignment_name(stmt) else {
-            return false;
-        };
-        let lower = self.spelling(name).to_ascii_lowercase();
-        let Some((base, version)) = lower.rsplit_once('_') else {
-            return false;
-        };
-        !version.is_empty()
-            && version.bytes().all(|byte| byte.is_ascii_digit())
-            && self.inputs.arch.is_register_like_base_name(base)
+        let _ = stmt;
+        // A SymbolId identifies a rendered binding, not the machine location
+        // of this assignment occurrence. Until the statement carries its exact
+        // write projection, treating a suffix-shaped name as a register write
+        // would make an unproved effect-elision decision.
+        false
     }
 
     pub(crate) fn prune_dead_temp_assignments_in_stmt(&self, stmt: CStmt) -> CStmt {
@@ -775,18 +754,17 @@ impl<'a> FoldingContext<'a> {
         self.prune_dead_temp_assignments_in_stmt_live_out(stmt, &HashSet::new())
     }
 
-    /// Every name this statement reads, spelled as the live set spells them.
-    fn names_read_in_stmt(&self, stmt: &CStmt) -> HashSet<String> {
+    /// Every exact rendered symbol this statement reads.
+    fn names_read_in_stmt(&self, stmt: &CStmt) -> HashSet<crate::symbol::SymbolId> {
         crate::collect_stmt_var_names(std::slice::from_ref(stmt))
             .into_iter()
-            .map(|id| self.spelling(id).to_string())
             .collect()
     }
 
     fn prune_dead_temp_assignments_in_stmt_live_out(
         &self,
         stmt: CStmt,
-        live_out: &HashSet<String>,
+        live_out: &HashSet<crate::symbol::SymbolId>,
     ) -> CStmt {
         match stmt {
             CStmt::Observed { id, stmt } => CStmt::observed(
@@ -888,7 +866,7 @@ impl<'a> FoldingContext<'a> {
     fn prune_dead_temp_assignments_in_block(
         &self,
         stmts: Vec<CStmt>,
-        live_out: &HashSet<String>,
+        live_out: &HashSet<crate::symbol::SymbolId>,
     ) -> Vec<CStmt> {
         let rewritten = stmts
             .into_iter()
@@ -897,95 +875,4 @@ impl<'a> FoldingContext<'a> {
         self.prune_dead_temp_assignments_with_options_and_live_out(rewritten, true, false, live_out)
     }
 
-    fn collect_call_sources_in_stmt(&self, stmt: &CStmt, out: &mut BTreeSet<(u64, usize)>) {
-        match stmt {
-            CStmt::StructuredRegion { stmt, .. } => self.collect_call_sources_in_stmt(stmt, out),
-            CStmt::Observed { stmt, .. } => self.collect_call_sources_in_stmt(stmt, out),
-            CStmt::Expr(expr)
-            | CStmt::Return(Some(expr))
-            | CStmt::While { cond: expr, .. }
-            | CStmt::DoWhile { cond: expr, .. } => self.collect_call_sources_in_expr(expr, out),
-            CStmt::Decl {
-                init: Some(expr), ..
-            } => self.collect_call_sources_in_expr(expr, out),
-            CStmt::If { cond, .. } => self.collect_call_sources_in_expr(cond, out),
-            CStmt::For {
-                cond: Some(expr),
-                update: Some(update),
-                ..
-            } => {
-                self.collect_call_sources_in_expr(expr, out);
-                self.collect_call_sources_in_expr(update, out);
-            }
-            CStmt::For {
-                cond: Some(expr),
-                update: None,
-                ..
-            }
-            | CStmt::For {
-                cond: None,
-                update: Some(expr),
-                ..
-            } => self.collect_call_sources_in_expr(expr, out),
-            CStmt::Switch { expr, .. } => self.collect_call_sources_in_expr(expr, out),
-            CStmt::Return(None)
-            | CStmt::Decl { init: None, .. }
-            | CStmt::Break
-            | CStmt::Continue
-            | CStmt::Goto(_)
-            | CStmt::Label(_)
-            | CStmt::Comment(_)
-            | CStmt::Empty
-            | CStmt::Block(_)
-            | CStmt::For {
-                cond: None,
-                update: None,
-                ..
-            } => {}
-        }
-    }
-
-    fn collect_call_sources_in_expr(&self, expr: &CExpr, out: &mut BTreeSet<(u64, usize)>) {
-        expr.visit(&mut |node| {
-            if let CExpr::Var(name) = node
-                && let Some(source) = self
-                    .call_result_source_for_symbol(*name)
-                    .or_else(|| self.local_post_call_source_for_symbol(*name))
-                    .or_else(|| self.materialized_call_result_source_for_visible_name(*name))
-            {
-                out.insert(source);
-            }
-        });
-    }
-
-    fn collect_call_assignment_sources_in_stmt(
-        &self,
-        stmt: &CStmt,
-        out: &mut BTreeSet<((u64, usize), String)>,
-    ) {
-        let CStmt::Expr(expr) = stmt.unobserved() else {
-            return;
-        };
-        let CExpr::Binary {
-            op: BinaryOp::Assign,
-            left,
-            right,
-        } = expr.unobserved()
-        else {
-            return;
-        };
-        let CExpr::Var(target) = left.unobserved() else {
-            return;
-        };
-        if !matches!(right.unobserved(), CExpr::Call { .. }) {
-            return;
-        }
-        if let Some(source) = self
-            .call_result_source_for_symbol(*target)
-            .or_else(|| self.local_post_call_source_for_symbol(*target))
-            .or_else(|| self.source_call_for_visible_owner_name(&self.spelling(*target)))
-        {
-            out.insert((source, self.spelling(*target).to_ascii_lowercase()));
-        }
-    }
 }

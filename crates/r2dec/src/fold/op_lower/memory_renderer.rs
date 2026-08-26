@@ -320,26 +320,18 @@ impl<'a> FoldingContext<'a> {
         };
         let render = self.inputs.render_facts()?;
         let slot = usize::try_from(slot).ok()?;
-        if render.parameter_values(slot).next().is_none()
-            || !render
+        let base_value = render.parameter_values(slot).next()?;
+        if !render
                 .certified_expr_for_value(index)
                 .is_some_and(|expr| expr.fact.renderable)
         {
             return None;
         }
-        let base = self
-            .inputs
-            .function_facts
-            .type_facts()
-            .render_authorized_signature()?
-            .params
-            .get(slot)
-            .map(|param| param.name.trim())
-            .filter(|name| !name.is_empty())?;
+        let base = self.certified_parameter_expr_for_value(base_value)?;
         let index_var = self.prepared_ssa()?.value_var(index)?;
         let index = self.render_certified_value_expr_for_var(index_var)?;
         let indexed = CExpr::Subscript {
-            base: Box::new(self.name_ref(&base.to_string())),
+            base: Box::new(base),
             index: Box::new(index),
         };
         match self.certified_member_fact_for_memory(memory) {
@@ -783,7 +775,7 @@ impl<'a> FoldingContext<'a> {
 
     pub(super) fn certified_signature_arg_alias_for_register(
         &self,
-        reg_name: &str,
+        _reg_name: &str,
     ) -> Option<String> {
         None
     }
@@ -896,7 +888,7 @@ impl<'a> FoldingContext<'a> {
         dst: &SSAVar,
         addr: &SSAVar,
         elem_ty: CType,
-    ) -> CExpr {
+    ) -> OpLoweringResult<CExpr> {
         let memo_key = self
             .prepared_value_id_for_var(dst)
             .map(|value| (value, elem_ty.to_string()));
@@ -904,9 +896,9 @@ impl<'a> FoldingContext<'a> {
             .as_ref()
             .and_then(|key| self.load_expr_memo.borrow().get(key).cloned())
         {
-            return cached;
+            return Ok(cached);
         }
-        let rendered = self.render_canonical_load_expr_uncached(dst, addr, elem_ty.clone());
+        let rendered = self.render_canonical_load_expr_uncached(dst, addr, elem_ty.clone())?;
         // A subscript on an integer base does not say what it reads, and the
         // width is known here. Left unstated, every consumer invents one: the
         // corpus harness rewrites `x[i]` as `((unsigned char *)x)[i]`, so
@@ -917,7 +909,7 @@ impl<'a> FoldingContext<'a> {
                 .borrow_mut()
                 .insert(key, rendered.clone());
         }
-        rendered
+        Ok(rendered)
     }
 
     /// State the pointee an integer-based subscript reads.
@@ -993,9 +985,9 @@ impl<'a> FoldingContext<'a> {
         dst: &SSAVar,
         addr: &SSAVar,
         elem_ty: CType,
-    ) -> CExpr {
+    ) -> OpLoweringResult<CExpr> {
         if let Some(named) = self.prepared_named_memory_expr_for_value(dst) {
-            return named;
+            return Ok(named);
         }
         let pointee_load = dst.size < addr.size;
         // One resolver. `get_expr` already tries forwarding, then semantic
@@ -1004,7 +996,7 @@ impl<'a> FoldingContext<'a> {
         // it -- so putting them first meant an address was resolved by a rule
         // that had not been told what the value forwards to, while the decision
         // to leave that value's statement out was taken by a rule that had.
-        let fallback_addr_expr = self.get_expr(addr);
+        let fallback_addr_expr = self.get_expr(addr)?;
         let mut semantic_visited = HashSet::new();
         let mut best = self.render_authoritative_memory_access_by_name(
             &dst.display_name(),
@@ -1042,41 +1034,41 @@ impl<'a> FoldingContext<'a> {
             if let CExpr::Deref(inner) = &expr
                 && let Some(indexed) = self.indexed_pointer_add_expr(inner, &elem_ty)
             {
-                return indexed;
+                return Ok(indexed);
             }
             if !Self::expr_is_scalar_memory_candidate(&expr)
                 && !matches!(elem_ty, CType::Pointer(_) | CType::Array(_, _))
                 && self.normalized_addr_from_visible_expr(&expr, 0).is_some()
             {
-                return self.typed_deref_expr(addr, expr, elem_ty);
+                return Ok(self.typed_deref_expr(addr, expr, elem_ty));
             }
-            return expr;
+            return Ok(expr);
         }
 
         if pointee_load {
             let ptr_ty = CType::ptr(elem_ty.clone());
-            let casted = self.cast_addr_expr_to_ptr_if_needed(addr, self.get_expr(addr), &ptr_ty);
-            return CExpr::Deref(Box::new(casted));
+            let casted =
+                self.cast_addr_expr_to_ptr_if_needed(addr, fallback_addr_expr.clone(), &ptr_ty);
+            return Ok(CExpr::Deref(Box::new(casted)));
         }
 
         if dst.size >= addr.size
             && let Some(stack_var) = self.stack_var_expr_for_addr_var(addr)
         {
-            return stack_var;
+            return Ok(stack_var);
         }
 
-        if addr.is_const() {
-            let direct = self.get_expr(addr);
-            if matches!(direct, CExpr::Var(_) | CExpr::StringLit(_)) {
-                return direct;
-            }
+        if addr.is_const()
+            && matches!(&fallback_addr_expr, CExpr::Var(_) | CExpr::StringLit(_))
+        {
+            return Ok(fallback_addr_expr);
         }
 
         if let Some(exact) = self.resolve_literalish_call_arg_expr(&fallback_addr_expr) {
-            return exact;
+            return Ok(exact);
         }
 
-        self.typed_deref_expr(addr, fallback_addr_expr, elem_ty)
+        Ok(self.typed_deref_expr(addr, fallback_addr_expr, elem_ty))
     }
 
     pub(super) fn render_canonical_store_target_expr(
@@ -1084,14 +1076,14 @@ impl<'a> FoldingContext<'a> {
         addr: &SSAVar,
         value_size: u32,
         elem_ty: CType,
-    ) -> CExpr {
+    ) -> OpLoweringResult<CExpr> {
         // One resolver. `get_expr` already tries forwarding, then semantic
         // values, then the recorded definition, then the name, and the two
         // lookups that used to run ahead of it are the third and a variant of
         // it -- so putting them first meant an address was resolved by a rule
         // that had not been told what the value forwards to, while the decision
         // to leave that value's statement out was taken by a rule that had.
-        let fallback_addr_expr = self.get_expr(addr);
+        let fallback_addr_expr = self.get_expr(addr)?;
         let mut semantic_visited = HashSet::new();
         let mut best = self.render_authoritative_memory_access_by_name(
             &addr.display_name(),
@@ -1121,31 +1113,30 @@ impl<'a> FoldingContext<'a> {
             self.prepared_named_memory_def_expr_for_current_op(),
         );
         if let Some(expr) = best.filter(Self::expr_is_store_target_candidate) {
-            return expr;
+            return Ok(expr);
         }
 
         if let Some(stack_var) = self.stack_var_expr_for_addr_var(addr) {
-            return stack_var;
+            return Ok(stack_var);
         }
 
-        if addr.is_const() {
-            let direct = self.get_expr(addr);
-            if matches!(direct, CExpr::Var(_) | CExpr::StringLit(_)) {
-                return direct;
-            }
+        if addr.is_const()
+            && matches!(&fallback_addr_expr, CExpr::Var(_) | CExpr::StringLit(_))
+        {
+            return Ok(fallback_addr_expr);
         }
 
         if let Some(exact) = self.resolve_literalish_call_arg_expr(&fallback_addr_expr) {
-            return exact;
+            return Ok(exact);
         }
 
         if value_size == 1
             && let Some(indexed) = self.byte_indexed_pointer_add_expr(&fallback_addr_expr)
         {
-            return indexed;
+            return Ok(indexed);
         }
 
-        self.typed_deref_expr(addr, fallback_addr_expr, elem_ty)
+        Ok(self.typed_deref_expr(addr, fallback_addr_expr, elem_ty))
     }
 
     pub(super) fn render_memory_access_from_visible_expr(

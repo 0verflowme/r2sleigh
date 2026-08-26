@@ -200,7 +200,7 @@ impl<'a> FoldingContext<'a> {
         }
     }
 
-    pub(super) fn planned_value_expr(
+    pub(crate) fn planned_value_expr(
         &self,
         value: ValueId,
     ) -> Result<CExpr, crate::observation_journal::LegacyObservationJournalError> {

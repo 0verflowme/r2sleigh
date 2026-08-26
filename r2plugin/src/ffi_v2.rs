@@ -2012,6 +2012,12 @@ fn placement_refusal_json(refusal: r2engine::PlacementAuditRefusal) -> serde_jso
         | Refusal::RefusedPlannedValue { value_id } => {
             cause.insert("value_id".to_string(), serde_json::json!(value_id));
         }
+        Refusal::UnauthorizedProgramVariable { symbol_index } => {
+            cause.insert(
+                "symbol_index".to_string(),
+                serde_json::json!(symbol_index),
+            );
+        }
         Refusal::ReadBeforeAssignment {
             binding_index,
             instruction_id,
@@ -2056,13 +2062,35 @@ fn placement_audit_json(audit: Option<r2engine::PlacementAudit>) -> serde_json::
     }
 }
 
+fn render_refusal_json(
+    refusal: Option<r2engine::DecompileRenderRefusal>,
+) -> serde_json::Value {
+    match refusal {
+        None => serde_json::json!({
+            "schema_version": 1,
+            "status": "none",
+        }),
+        Some(refusal) => serde_json::json!({
+            "schema_version": 1,
+            "status": "refused",
+            "kind": refusal.kind(),
+        }),
+    }
+}
+
 fn response_diagnostics_json(
     diagnostics: &r2engine::EngineDiagnostics,
     binding_audit: Option<r2engine::BindingShadowAuditOutcome>,
     effect_obligations: Option<r2engine::EffectObligationAudit>,
     placement_audit: Option<r2engine::PlacementAudit>,
+    render_refusal: Option<r2engine::DecompileRenderRefusal>,
 ) -> Result<String, BoundaryError> {
-    let outcome = match response_outcome(diagnostics, effect_obligations, placement_audit) {
+    let outcome = match response_outcome(
+        diagnostics,
+        effect_obligations,
+        placement_audit,
+        render_refusal,
+    ) {
         R2SLEIGH_OUTCOME_COMPLETED_V2 => "completed",
         R2SLEIGH_OUTCOME_REFUSED_V2 => "refused",
         _ => unreachable!("response outcome is a closed V2 enum"),
@@ -2076,6 +2104,7 @@ fn response_diagnostics_json(
         "binding_audit": binding_audit_json(binding_audit),
         "effect_obligations": effect_obligations_json(effect_obligations),
         "placement_audit": placement_audit_json(placement_audit),
+        "render_refusal": render_refusal_json(render_refusal),
     })
     .to_string())
 }
@@ -2107,6 +2136,7 @@ fn response_outcome(
     diagnostics: &r2engine::EngineDiagnostics,
     effect_obligations: Option<r2engine::EffectObligationAudit>,
     placement_audit: Option<r2engine::PlacementAudit>,
+    render_refusal: Option<r2engine::DecompileRenderRefusal>,
 ) -> u32 {
     if diagnostics.refusal.is_some()
         || matches!(
@@ -2122,6 +2152,7 @@ fn response_outcome(
                 || audit.conflicts != 0
         })
         || matches!(placement_audit, Some(r2engine::PlacementAudit::Refused(_)))
+        || render_refusal.is_some()
     {
         R2SLEIGH_OUTCOME_REFUSED_V2
     } else {
@@ -2164,6 +2195,7 @@ unsafe extern "C" fn execute(
                 response.output.binding_audit,
                 response.output.effect_obligations,
                 response.output.placement_audit,
+                response.output.render_refusal,
             )?;
             if diagnostics_json.len() > MAX_RESPONSE_BYTES {
                 return Err(BoundaryError::limit("response diagnostics exceed byte cap"));
@@ -2174,6 +2206,7 @@ unsafe extern "C" fn execute(
                 &response.output.diagnostics,
                 response.output.effect_obligations,
                 response.output.placement_audit,
+                response.output.render_refusal,
             );
             let phase_timings = response_phase_timings(&response.output.metrics);
             let mut owned_response = Box::new(R2SleighResponseV2 {
@@ -4177,6 +4210,7 @@ mod tests {
             Refusal::MissingPlannedValue { value_id: 17 },
             Refusal::RefusedPlannedValue { value_id: 18 },
             Refusal::UnscopedObservation { observation_id: 19 },
+            Refusal::UnauthorizedProgramVariable { symbol_index: 36 },
             Refusal::UnobservedBindingRead { binding_index: 20 },
             Refusal::UnobservedBindingWrite { binding_index: 21 },
             Refusal::NoDominatingRegion { binding_index: 22 },
@@ -4216,7 +4250,7 @@ mod tests {
             assert!(kinds.insert(kind.to_string()), "duplicate wire kind {kind}");
             causes.push(cause);
         }
-        assert_eq!(kinds.len(), 35);
+        assert_eq!(kinds.len(), 36);
 
         let checker = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../tests/corpus/check_binding_audit_schema.py");
@@ -4242,7 +4276,7 @@ mod tests {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
-        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "35");
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "36");
 
         assert_eq!(
             placement_audit_json(Some(PlacementAudit::Applied)),
@@ -4262,6 +4296,7 @@ mod tests {
             Some(r2engine::BindingShadowAuditOutcome::NotRun),
             Some(r2engine::EffectObligationAudit::NOT_RUN),
             Some(refusal),
+            None,
         )
         .expect("placement diagnostics JSON");
         let parsed: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON");
@@ -4273,9 +4308,64 @@ mod tests {
                 &r2engine::EngineDiagnostics::default(),
                 Some(r2engine::EffectObligationAudit::NOT_RUN),
                 Some(refusal),
+                None,
             ),
             R2SLEIGH_OUTCOME_REFUSED_V2,
         );
+    }
+
+    #[test]
+    fn diagnostics_json_exposes_typed_render_refusal_and_refuses_it() {
+        let cases = [
+            (
+                r2engine::DecompileRenderRefusal::MissingMachineProjectionAuthorization,
+                "missing_machine_projection_authorization",
+            ),
+            (
+                r2engine::DecompileRenderRefusal::MissingProgramVariableAuthorization,
+                "missing_program_variable_authorization",
+            ),
+            (
+                r2engine::DecompileRenderRefusal::NormalizationOriginUnavailable,
+                "normalization_origin_unavailable",
+            ),
+            (
+                r2engine::DecompileRenderRefusal::UnrepresentableControlFlow,
+                "unrepresentable_control_flow",
+            ),
+            (
+                r2engine::DecompileRenderRefusal::IncompleteEffectInventory,
+                "incomplete_effect_inventory",
+            ),
+            (
+                r2engine::DecompileRenderRefusal::UnrepresentableOperation,
+                "unrepresentable_operation",
+            ),
+        ];
+
+        for (refusal, kind) in cases {
+            let raw = response_diagnostics_json(
+                &r2engine::EngineDiagnostics::default(),
+                Some(r2engine::BindingShadowAuditOutcome::NotRun),
+                Some(r2engine::EffectObligationAudit::NOT_RUN),
+                Some(r2engine::PlacementAudit::NotRun),
+                Some(refusal),
+            )
+            .expect("render-refusal diagnostics JSON");
+            let parsed: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON");
+            assert_eq!(parsed["outcome"], "refused");
+            assert_eq!(parsed["render_refusal"]["status"], "refused");
+            assert_eq!(parsed["render_refusal"]["kind"], kind);
+            assert_eq!(
+                response_outcome(
+                    &r2engine::EngineDiagnostics::default(),
+                    Some(r2engine::EffectObligationAudit::NOT_RUN),
+                    Some(r2engine::PlacementAudit::NotRun),
+                    Some(refusal),
+                ),
+                R2SLEIGH_OUTCOME_REFUSED_V2,
+            );
+        }
     }
 
     #[test]
@@ -4538,6 +4628,7 @@ mod tests {
                 Some(audit),
                 Some(r2engine::EffectObligationAudit::NOT_RUN),
                 Some(r2engine::PlacementAudit::NotRun),
+                None,
             )
             .expect("diagnostics JSON");
             let parsed: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON");
@@ -4571,6 +4662,7 @@ mod tests {
             Some(r2engine::BindingShadowAuditOutcome::NotRun),
             Some(r2engine::EffectObligationAudit::NOT_RUN),
             Some(r2engine::PlacementAudit::NotRun),
+            None,
         )
         .expect("diagnostics JSON");
         let parsed: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON");
@@ -4581,6 +4673,7 @@ mod tests {
                 &diagnostics,
                 Some(r2engine::EffectObligationAudit::NOT_RUN),
                 Some(r2engine::PlacementAudit::NotRun),
+                None,
             ),
             R2SLEIGH_OUTCOME_REFUSED_V2
         );
@@ -4622,6 +4715,7 @@ mod tests {
             Some(r2engine::BindingShadowAuditOutcome::NotRun),
             Some(refused),
             Some(r2engine::PlacementAudit::NotRun),
+            None,
         )
         .expect("effect diagnostics JSON");
         let parsed: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON");
@@ -4635,6 +4729,7 @@ mod tests {
                 &r2engine::EngineDiagnostics::default(),
                 Some(refused),
                 Some(r2engine::PlacementAudit::NotRun),
+                None,
             ),
             R2SLEIGH_OUTCOME_REFUSED_V2,
             "an effect-refused native audit is a typed plugin refusal"
@@ -4653,6 +4748,7 @@ mod tests {
                 &r2engine::EngineDiagnostics::default(),
                 Some(inconsistent_admission),
                 Some(r2engine::PlacementAudit::NotRun),
+                None,
             ),
             R2SLEIGH_OUTCOME_REFUSED_V2,
             "nonzero refusal counts fail closed independently of disposition"
@@ -4666,6 +4762,7 @@ mod tests {
                 &r2engine::EngineDiagnostics::default(),
                 Some(r2engine::EffectObligationAudit::NOT_RUN),
                 Some(r2engine::PlacementAudit::NotRun),
+                None,
             ),
             R2SLEIGH_OUTCOME_COMPLETED_V2,
             "a non-native route is not refused merely because the audit did not run"

@@ -21,14 +21,19 @@ impl<'a> FoldingContext<'a> {
     const UNRESOLVED_CALL_ARG_EXPR_NAME: &'static str = "__r2dec_unresolved_call_arg";
 
     pub(super) fn unresolved_call_arg_expr(&self) -> CExpr {
-        self.name_ref(Self::UNRESOLVED_CALL_ARG_EXPR_NAME)
+        CExpr::External {
+            name: Self::UNRESOLVED_CALL_ARG_EXPR_NAME.to_string(),
+            kind: crate::symbol::ExternalKind::Intrinsic,
+        }
     }
 
     pub(super) fn call_arg_expr_is_unresolved_fallback(&self, expr: &CExpr) -> bool {
         match expr {
             CExpr::Observed { expr, .. } => self.call_arg_expr_is_unresolved_fallback(expr),
-            CExpr::Var(name) => &*self.spelling(*name) == Self::UNRESOLVED_CALL_ARG_EXPR_NAME,
-            CExpr::External { .. } => false,
+            // Local bindings retain their SymbolId identity. Their spelling
+            // cannot turn them into an intrinsic sentinel.
+            CExpr::Var(_) => false,
+            CExpr::External { name, .. } => name == Self::UNRESOLVED_CALL_ARG_EXPR_NAME,
             CExpr::Unary { operand, .. }
             | CExpr::Cast { expr: operand, .. }
             | CExpr::Deref(operand)
@@ -177,8 +182,6 @@ impl<'a> FoldingContext<'a> {
         block_addr: u64,
         op_idx: usize,
     ) -> Option<CExpr> {
-        let symbols = &self.symbols;
-
         self.resolved_callee_target_for_site(block_addr, op_idx)
             .map(|target| self.callee_identity_expr(&target.identity))
     }
@@ -524,12 +527,34 @@ impl<'a> FoldingContext<'a> {
     }
 
     pub(super) fn resolve_call_target(&self, target: &SSAVar) -> CExpr {
-        if let Some(addr) = parse_address_from_var_name(&target.name)
-            && let Some(name) = self.callee_identity_for_direct_target(addr).display_name
-        {
-            return self.name_ref(&name);
+        if let Some(addr) = parse_address_from_var_name(&target.name) {
+            return self.callee_identity_expr(&self.callee_identity_for_direct_target(addr));
         }
-        self.get_expr(target)
+        if target.is_const() {
+            return self.const_to_expr(target);
+        }
+        let Some(value) = self.prepared_value_id_for_var(target) else {
+            self.retain_first_lowering_refusal(
+                OpLoweringRefusal::MissingProgramVariableAuthorization,
+            );
+            return CExpr::External {
+                name: "__r2dec_unresolved_call_target".to_string(),
+                kind: crate::symbol::ExternalKind::Intrinsic,
+            };
+        };
+        match self.planned_value_expr(value) {
+            Ok(expr) => expr,
+            Err(error) => {
+                self.retain_first_observation_error(error);
+                self.retain_first_lowering_refusal(
+                    OpLoweringRefusal::MissingProgramVariableAuthorization,
+                );
+                CExpr::External {
+                    name: "__r2dec_unresolved_call_target".to_string(),
+                    kind: crate::symbol::ExternalKind::Intrinsic,
+                }
+            }
+        }
     }
 
     #[cfg(test)]
@@ -688,7 +713,6 @@ impl<'a> FoldingContext<'a> {
 
     #[cfg(test)]
     fn call_arg_requires_result_rebuild(&self, expr: &CExpr) -> bool {
-        let symbols = std::cell::RefCell::new(crate::symbol::SymbolTable::new());
         let CExpr::Call { args, .. } = expr.unobserved() else {
             return false;
         };
@@ -757,8 +781,6 @@ impl<'a> FoldingContext<'a> {
         }
         let source_value_id = binding.source_value_id?;
         let source_var = self.prepared_var_for_value_id(source_value_id)?;
-        let source_var_name = source_var.display_name();
-        let source_var_name = source_var_name.as_str();
         let preserve_stable_input_slot = binding.role == analysis::CallArgRole::Input;
         if preserve_stable_input_slot
             && let analysis::SemanticCallArg::Semantic(analysis::SemanticValue::Load {
@@ -787,41 +809,30 @@ impl<'a> FoldingContext<'a> {
             .prepared_semantic_view()
             .and_then(|prepared| prepared.owner_expr_for_value_id(source_value_id).cloned())
             .filter(|expr| !matches!(expr.unobserved(), CExpr::AddrOf(_)));
-        let mut owned_visited = HashSet::new();
-        let source_owned_expr =
-            self.recover_source_owned_expr_for_name(source_var_name, 0, &mut owned_visited);
-
         if best.is_none()
             && let Some(owner) = self.stable_owned_call_result_expr_for_var(source_var)
         {
             return Some(owner);
         }
-        best = prefer(best, source_owned_expr.clone());
 
-        let raw_expr = source_value_id
-            .and_then(|value_id| self.definition_for_value_id(value_id).cloned())
-            .or_else(|| self.lookup_definition_raw(source_var_name))
+        let raw_expr = self
+            .definition_for_value_id(source_value_id)
+            .cloned()
             .map(|raw| {
                 let mut imported_visited = HashSet::new();
                 self.resolve_imported_call_arg_expr(&raw, 0, &mut imported_visited)
             });
         best = prefer(best, raw_expr.clone());
 
-        let visible_expr = source_value_id
-            .and_then(|value_id| {
-                self.use_info()
-                    .render_definition_for_value(value_id)
-                    .cloned()
-            })
-            .or_else(|| self.lookup_definition(source_var_name))
+        let visible_expr = self
+            .use_info()
+            .render_definition_for_value(source_value_id)
+            .cloned()
             .map(|visible_def| {
                 let mut imported_visited = HashSet::new();
                 self.resolve_imported_call_arg_expr(&visible_def, 0, &mut imported_visited)
             });
         best = prefer(best, visible_expr.clone());
-
-        best = prefer(best, self.best_visible_definition(source_var_name));
-        best = prefer(best, source_owned_expr.clone());
 
         let best_is_low_signal = best.as_ref().is_none_or(|expr| {
             self.call_arg_contains_transient_name(expr, 0)
@@ -833,16 +844,9 @@ impl<'a> FoldingContext<'a> {
             let mut semantic_visited = HashSet::new();
             best = prefer(
                 best,
-                source_value_id
-                    .and_then(|value_id| self.use_info().render_semantic_value_for_value(value_id))
+                self.use_info()
+                    .render_semantic_value_for_value(source_value_id)
                     .and_then(|value| self.render_semantic_value(value, 0, &mut semantic_visited))
-                    .or_else(|| {
-                        self.render_semantic_value_by_name(
-                            source_var_name,
-                            0,
-                            &mut semantic_visited,
-                        )
-                    }),
             );
         } else if best.is_none() {
             best = prefer(best, prepared_expr.clone());
@@ -852,9 +856,7 @@ impl<'a> FoldingContext<'a> {
         let rewritten = self.rewrite_stack_expr(recovered.clone());
         let best = prefer(Some(recovered), Some(rewritten.clone())).unwrap_or(rewritten);
         if matches!(best.unobserved(), CExpr::Var(name) if self.is_autogenerated_stack_home_name(&*self.spelling(*name)))
-            && let Some(raw_best) = self
-                .lookup_definition_raw(source_var_name)
-                .or_else(|| self.lookup_definition(source_var_name))
+            && let Some(raw_best) = self.definition_for_value_id(source_value_id).cloned()
             && self.is_recovered_imported_call_arg_expr(&raw_best)
         {
             return Some(raw_best);
@@ -890,84 +892,32 @@ impl<'a> FoldingContext<'a> {
             && !self.call_arg_contains_low_quality_name(expr, 0)
     }
 
-    #[cfg(test)]
-    fn recover_source_owned_expr_for_name(
-        &self,
-        source_var_name: &str,
-        depth: usize,
-        visited: &mut HashSet<String>,
-    ) -> Option<CExpr> {
-        if depth > 16 || !visited.insert(source_var_name.to_string()) {
-            return None;
-        }
-        let source_var = self
-            .use_info()
-            .value_id_for_name(source_var_name)
-            .and_then(|value| self.prepared_var_for_value_id(value));
-        if let Some(source_call) = source_var.and_then(|source_var| {
-            self.call_result_source_for_var(source_var)
-                .or_else(|| self.local_post_call_source_for_var(source_var))
-        })
-            && let Some(owner) = self.stable_owned_call_result_expr_for_source(source_call)
-        {
-            return Some(owner);
-        }
-
-        let producer = self.use_info().producers.get(source_var_name)?;
-        match producer {
-            SSAOp::Copy { src, .. }
-            | SSAOp::Cast { src, .. }
-            | SSAOp::IntZExt { src, .. }
-            | SSAOp::IntSExt { src, .. }
-            | SSAOp::Trunc { src, .. } => {
-                Some(self.recover_source_owned_operand_expr(src, depth + 1, visited))
-            }
-            SSAOp::IntAdd { dst, a, b } => Some(self.identity_simplify_binary(
-                BinaryOp::Add,
-                self.recover_source_owned_operand_expr(a, depth + 1, visited),
-                self.recover_source_owned_operand_expr(b, depth + 1, visited),
-                (dst.size > 0).then_some(dst.size),
-            )),
-            SSAOp::IntSub { dst, a, b } => Some(self.identity_simplify_binary(
-                BinaryOp::Sub,
-                self.recover_source_owned_operand_expr(a, depth + 1, visited),
-                self.recover_source_owned_operand_expr(b, depth + 1, visited),
-                (dst.size > 0).then_some(dst.size),
-            )),
-            _ => None,
-        }
-    }
-
-    #[cfg(test)]
-    fn recover_source_owned_operand_expr(
-        &self,
-        var: &SSAVar,
-        depth: usize,
-        visited: &mut HashSet<String>,
-    ) -> CExpr {
-        if var.is_const() {
-            return self.const_to_expr(var);
-        }
-        self.recover_source_owned_expr_for_name(&var.display_name(), depth, visited)
-            .unwrap_or_else(|| self.get_expr(var))
-    }
-
     pub(super) fn expr_for_semantic_call_arg_fallback(
         &self,
         value: &analysis::SemanticValue,
     ) -> CExpr {
-        let symbols = &self.symbols;
-
         match value {
             analysis::SemanticValue::Scalar(analysis::ScalarValue::Expr(expr)) => expr.clone(),
             analysis::SemanticValue::Scalar(analysis::ScalarValue::Root(value_ref)) => {
                 if value_ref.var.is_const() {
                     self.const_to_expr(&value_ref.var)
                 } else {
-                    let rendered = self.var_name(&value_ref.var);
-                    self.arg_alias_for_rendered_name(&rendered)
-                        .map(|n| crate::symbol::var_ref(symbols, n))
-                        .unwrap_or_else(|| self.name_ref(&rendered))
+                    let Some(value) = self.prepared_value_id_for_var(&value_ref.var) else {
+                        self.retain_first_lowering_refusal(
+                            OpLoweringRefusal::MissingProgramVariableAuthorization,
+                        );
+                        return self.unresolved_call_arg_expr();
+                    };
+                    match self.planned_value_expr(value) {
+                        Ok(expr) => expr,
+                        Err(error) => {
+                            self.retain_first_observation_error(error);
+                            self.retain_first_lowering_refusal(
+                                OpLoweringRefusal::MissingProgramVariableAuthorization,
+                            );
+                            self.unresolved_call_arg_expr()
+                        }
+                    }
                 }
             }
             analysis::SemanticValue::Address(addr) => {
@@ -1411,8 +1361,6 @@ impl<'a> FoldingContext<'a> {
         depth: u32,
         visited: &mut HashSet<String>,
     ) -> CExpr {
-        let symbols = &self.symbols;
-
         if depth > Self::MAX_SEMANTIC_RENDER_DEPTH {
             return expr;
         }
@@ -1426,97 +1374,12 @@ impl<'a> FoldingContext<'a> {
                     visited,
                 ),
             ),
-            CExpr::Var(name) => {
-                if !visited.insert(self.spelling(name).to_string()) {
-                    return CExpr::Var(name);
-                }
-                let resolved = self
-                    .prepared_semantic_view()
-                    .and_then(|prepared| prepared.owner_expr_for_name(&self.spelling(name)))
-                    .cloned()
-                    .filter(|inner| {
-                        !inner.transparently_eq(&CExpr::Var(name))
-                            && !matches!(inner.unobserved(), CExpr::AddrOf(_))
-                    })
-                    .map(|inner| {
-                        self.rewrite_imported_call_arg_expr_with_prepared_owners(
-                            inner,
-                            depth + 1,
-                            visited,
-                        )
-                    })
-                    .or_else(|| {
-                        self.stack_offset_for_visible_storage_name(&self.spelling(name))
-                            .and_then(|offset| self.refuse_missing_stack_object_origin(offset))
-                            .filter(|alias| !alias.eq_ignore_ascii_case(&self.spelling(name)))
-                            .map(|n| crate::symbol::var_ref(&symbols, n))
-                    })
-                    .unwrap_or_else(|| CExpr::Var(name.clone()));
-                visited.remove(&*self.spelling(name));
-                resolved
-            }
+            // SymbolId does not identify a unique SSA value. Owner projection
+            // must happen while the exact ValueId is still present.
+            CExpr::Var(name) => CExpr::Var(name),
             other => other.map_children(&mut |child| {
                 self.rewrite_imported_call_arg_expr_with_prepared_owners(child, depth + 1, visited)
             }),
-        }
-    }
-
-    #[cfg(test)]
-    fn expr_contains_prepared_owner_alias(&self, expr: &CExpr, depth: u32) -> bool {
-        let symbols = std::cell::RefCell::new(crate::symbol::SymbolTable::new());
-        if depth > Self::MAX_SEMANTIC_RENDER_DEPTH {
-            return false;
-        }
-
-        let Some(prepared) = self.prepared_semantic_view() else {
-            return false;
-        };
-
-        match expr {
-            CExpr::Observed { expr, .. } => self.expr_contains_prepared_owner_alias(expr, depth),
-            CExpr::External { .. } => false,
-            CExpr::Var(name) => prepared.owner_expr_for_name(&*self.spelling(*name)).is_some(),
-            CExpr::Deref(inner)
-            | CExpr::AddrOf(inner)
-            | CExpr::Paren(inner)
-            | CExpr::Cast { expr: inner, .. }
-            | CExpr::Unary { operand: inner, .. }
-            | CExpr::Sizeof(inner) => self.expr_contains_prepared_owner_alias(inner, depth + 1),
-            CExpr::Binary { left, right, .. } => {
-                self.expr_contains_prepared_owner_alias(left, depth + 1)
-                    || self.expr_contains_prepared_owner_alias(right, depth + 1)
-            }
-            CExpr::Subscript { base, index } => {
-                self.expr_contains_prepared_owner_alias(base, depth + 1)
-                    || self.expr_contains_prepared_owner_alias(index, depth + 1)
-            }
-            CExpr::Member { base, .. } | CExpr::PtrMember { base, .. } => {
-                self.expr_contains_prepared_owner_alias(base, depth + 1)
-            }
-            CExpr::Call { func, args, .. } => {
-                self.expr_contains_prepared_owner_alias(func, depth + 1)
-                    || args
-                        .iter()
-                        .any(|arg| self.expr_contains_prepared_owner_alias(arg, depth + 1))
-            }
-            CExpr::Ternary {
-                cond,
-                then_expr,
-                else_expr,
-            } => {
-                self.expr_contains_prepared_owner_alias(cond, depth + 1)
-                    || self.expr_contains_prepared_owner_alias(then_expr, depth + 1)
-                    || self.expr_contains_prepared_owner_alias(else_expr, depth + 1)
-            }
-            CExpr::Comma(items) => items
-                .iter()
-                .any(|item| self.expr_contains_prepared_owner_alias(item, depth + 1)),
-            CExpr::IntLit(_)
-            | CExpr::UIntLit(_)
-            | CExpr::FloatLit(_)
-            | CExpr::StringLit(_)
-            | CExpr::CharLit(_)
-            | CExpr::SizeofType(_) => false,
         }
     }
 
@@ -1574,8 +1437,7 @@ impl<'a> FoldingContext<'a> {
             }
             analysis::SemanticValue::Scalar(analysis::ScalarValue::Expr(expr)) => {
                 let original = self.rewrite_stack_expr(expr.clone());
-                let should_try_prepared_owner_rewrite =
-                    self.expr_contains_prepared_owner_alias(expr, 0);
+                let should_try_prepared_owner_rewrite = false;
                 if !self.call_arg_contains_transient_name(&original, 0)
                     && !self.call_arg_contains_stack_placeholder(&original, 0)
                     && !self.call_arg_contains_low_quality_name(&original, 0)

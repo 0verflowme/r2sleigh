@@ -808,6 +808,11 @@ fn placement_analysis_refusal(
         Error::UnscopedObservation { observation } => Refusal::UnscopedObservation {
             observation_id: observation.index(),
         },
+        Error::UnauthorizedProgramVariable { symbol } => {
+            Refusal::UnauthorizedProgramVariable {
+                symbol_index: symbol.index(),
+            }
+        }
         Error::UnobservedBindingRead { binding } => Refusal::UnobservedBindingRead {
             binding_index: binding.index(),
         },
@@ -2322,7 +2327,7 @@ mod tests {
     use super::*;
     use crate::ast::{CLocal, CType};
     use crate::binding_plan::{BindingId, ValueDisposition, ValueRefusal};
-    use crate::symbol::{SymbolOrigin, SymbolRole};
+    use crate::symbol::SymbolRole;
 
     fn source_owned() -> SourceOwnedFunctionFacts {
         let mut block = R2ILBlock::new(0x1000, 4);
@@ -2790,7 +2795,6 @@ mod tests {
                 .declaration_type()
                 .clone(),
             SymbolRole::Carrier,
-            SymbolOrigin::default(),
         )
     }
 
@@ -2820,7 +2824,6 @@ mod tests {
             "unowned",
             CType::Int(32),
             SymbolRole::Carrier,
-            SymbolOrigin::default(),
         );
         let site = UseSite {
             inst: InstId(17),

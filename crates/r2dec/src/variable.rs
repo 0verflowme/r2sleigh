@@ -602,15 +602,10 @@ impl VariableRecovery {
             }
             return CExpr::UIntLit(val);
         }
-        // An SSA display name is an internal key, not a spelling. Minting one as
-        // a rendered identifier makes a second symbol for a value that already
-        // has one -- `X10_2` beside `x10_2` -- and the definition follows only
-        // one of them, so the other names nothing. Spell it the way every other
-        // site spells it.
-        crate::symbol::var_ref(
-            symbols,
-            crate::analysis::utils::format_traced_name(&var.display_name(), &HashMap::new()),
-        )
+        // Recovery is advisory and uses its own table. Keep the SSA key as a
+        // presentation-only symbol in that isolated table; it must never ask
+        // the renderer's naming machinery to authorize or normalize it.
+        CExpr::Var(symbols.borrow_mut().declare_or_reuse(&var.display_name()))
     }
 
     /// Generate a name for a stack variable.

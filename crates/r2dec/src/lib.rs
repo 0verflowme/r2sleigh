@@ -46,7 +46,6 @@ pub(crate) mod normalize;
 mod observation_journal;
 mod placement;
 pub(crate) mod planner;
-pub(crate) mod post_rename;
 pub mod region;
 pub(crate) mod registers;
 mod shadow_report;
@@ -76,12 +75,14 @@ use r2ssa::SSAFunction;
 use r2ssa::SSAOp;
 use r2ssa::cfg::BlockTerminator;
 use r2types::{
-    CTypeLike, DecompileRouteFacts, DecompileRouteKind, ExternalRegisterParamSpec, FunctionFacts,
-    FunctionSignatureSpec, FunctionTypeFacts, StackSlotKey, TypeInference, TypeOracle,
-    VisibleBinding, VisibleBindingKind, register_alias_names,
+    CTypeLike, DecompileRouteFacts, DecompileRouteKind, FunctionFacts, FunctionTypeFacts,
+    StackSlotKey, TypeInference, TypeOracle, VisibleBinding, register_alias_names,
 };
 #[cfg(test)]
-use r2types::{ExternalTypeDb, FunctionType};
+use r2types::{
+    ExternalRegisterParamSpec, ExternalTypeDb, FunctionSignatureSpec, FunctionType,
+    VisibleBindingKind,
+};
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::rc::Rc;
@@ -95,130 +96,6 @@ fn is_generic_arg_name(name: &str) -> bool {
         .strip_prefix("arg")
         .map(|suffix| !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit()))
         .unwrap_or(false)
-}
-
-fn seed_runtime_type_hints_from_facts_and_recovery(
-    type_facts: &FunctionTypeFacts,
-    var_recovery: &VariableRecovery,
-) -> std::collections::HashMap<String, CType> {
-    let mut type_hints = std::collections::HashMap::new();
-    let mut insert = |name: &str, ty: &CType| {
-        if matches!(ty, CType::Unknown | CType::Void) {
-            return;
-        }
-        type_hints.insert(name.to_string(), ty.clone());
-        type_hints.insert(name.to_ascii_lowercase(), ty.clone());
-    };
-
-    for var in var_recovery.parameters() {
-        insert(&var.name, &var.ty);
-    }
-    for var in var_recovery.locals() {
-        insert(&var.name, &var.ty);
-    }
-    for binding in &type_facts.visible_bindings {
-        if let Some(ty) = binding.ty.as_ref() {
-            insert(&binding.name, &type_like_to_ctype(ty));
-        }
-    }
-    for reg_param in &type_facts.register_params {
-        if let Some(ty) = reg_param.ty.as_ref() {
-            insert(&reg_param.name, &type_like_to_ctype(ty));
-        }
-    }
-    for slot in type_facts.stack_slots.values() {
-        if let Some(ty) = slot.ty.as_ref() {
-            insert(&slot.name, &type_like_to_ctype(ty));
-        }
-    }
-
-    type_hints
-}
-
-fn ctype_hint_specificity(ty: &CType) -> u8 {
-    match ty {
-        CType::Unknown => 0,
-        CType::Void => 1,
-        CType::Function { .. } => 2,
-        CType::Bool | CType::Int(_) | CType::UInt(_) | CType::BitVector(_) | CType::Float(_) => 4,
-        CType::Typedef(_) | CType::Enum(_) => 5,
-        CType::Struct(_) | CType::Union(_) => 6,
-        CType::Array(inner, _) => 12 + ctype_hint_specificity(inner).min(12),
-        CType::Pointer(inner) => 10 + ctype_hint_specificity(inner).min(12),
-    }
-}
-
-fn candidate_ctype_hint_is_better(existing: &CType, candidate: &CType) -> bool {
-    if integer_same_width_signedness_override(existing, candidate) {
-        return true;
-    }
-    if integer_narrower_canonical_hint(existing, candidate) {
-        return true;
-    }
-    ctype_hint_specificity(candidate) > ctype_hint_specificity(existing)
-}
-
-fn integer_same_width_signedness_override(existing: &CType, candidate: &CType) -> bool {
-    match (existing, candidate) {
-        (CType::Int(bits), CType::UInt(candidate_bits))
-        | (CType::UInt(bits), CType::Int(candidate_bits)) => bits == candidate_bits,
-        _ => false,
-    }
-}
-
-fn integer_narrower_canonical_hint(existing: &CType, candidate: &CType) -> bool {
-    let (existing_bits, candidate_bits) = match (existing, candidate) {
-        (
-            CType::Int(existing_bits) | CType::UInt(existing_bits),
-            CType::Int(candidate_bits) | CType::UInt(candidate_bits),
-        ) => (*existing_bits, *candidate_bits),
-        _ => return false,
-    };
-
-    matches!(candidate_bits, 8 | 16 | 32) && candidate_bits < existing_bits
-}
-
-fn merge_runtime_type_hint(
-    type_hints: &mut std::collections::HashMap<String, CType>,
-    name: String,
-    ty: CType,
-) {
-    if matches!(ty, CType::Unknown | CType::Void) {
-        return;
-    }
-    type_hints
-        .entry(name)
-        .and_modify(|existing| {
-            if candidate_ctype_hint_is_better(existing, &ty) {
-                *existing = ty.clone();
-            }
-        })
-        .or_insert(ty);
-}
-
-fn merge_runtime_type_hints(
-    type_hints: &mut std::collections::HashMap<String, CType>,
-    canonical_hints: std::collections::HashMap<String, CType>,
-) {
-    for (name, ty) in canonical_hints {
-        merge_runtime_type_hint(type_hints, name, ty);
-    }
-}
-
-fn runtime_type_hint_for_name<'a>(
-    type_hints: &'a std::collections::HashMap<String, CType>,
-    name: &str,
-) -> Option<&'a CType> {
-    type_hints
-        .get(name)
-        .or_else(|| type_hints.get(&name.to_ascii_lowercase()))
-}
-
-fn choose_more_specific_runtime_type(base: CType, hint: Option<&CType>) -> CType {
-    match hint {
-        Some(hint) if candidate_ctype_hint_is_better(&base, hint) => hint.clone(),
-        _ => base,
-    }
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -1581,7 +1458,7 @@ fn incomplete_source_obligations_reason(prepared: &r2ssa::SsaArtifact) -> Option
     let failures = obligations.construction_failures().len();
     let cycles = obligations.unstructured_cycle_blocks().len();
     Some(format!(
-        "r2dec residual: the source obligation inventory did not close, so what this function owes was never enumerated ({failures} construction failures, {cycles} unstructured cycle blocks)"
+        "r2dec refusal: the source obligation inventory did not close, so what this function owes was never enumerated ({failures} construction failures, {cycles} unstructured cycle blocks)"
     ))
 }
 
@@ -1820,59 +1697,6 @@ fn is_summary_ident_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || byte == b'_'
 }
 
-/// Name a parameter the way the source named it, where it did.
-///
-/// The renderer's own fallback is `argN`, which says only the position. The
-/// source often knows better - debug info called it `password` - and that name
-/// travelled with the snapshot all along. It is applied only where a real name
-/// exists, and never over one an external signature already supplied, because
-/// a parsed signature is the more specific statement.
-fn apply_source_parameter_names(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, params: &mut [ast::CParam], display_names: &r2types::DisplayNames,
-) {
-    for (index, param) in params.iter_mut().enumerate() {
-        if !is_generic_arg_name(&crate::symbol::spelling(symbols, param.name)) {
-            continue;
-        }
-        if let Some(name) = display_names.parameter(index) {
-            symbols.borrow_mut().rename(param.name, name);
-        }
-    }
-}
-
-fn merge_params_with_external_signature(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
-    recovered_params: Vec<ast::CParam>,
-    signature: Option<&FunctionSignatureSpec>,
-) -> Vec<ast::CParam> {
-    let Some(signature) = signature else {
-        return recovered_params;
-    };
-
-    if signature.params.is_empty() {
-        return recovered_params;
-    }
-
-    (0..signature.params.len())
-        .map(|idx| {
-            let fallback_name = format!("arg{idx}");
-            let mut param = recovered_params.get(idx).cloned().unwrap_or(ast::CParam {
-                ty: CType::Int(32),
-                name: crate::symbol::declare(&symbols, &fallback_name),
-            });
-
-            if let Some(ext) = signature.params.get(idx) {
-                if !is_generic_arg_name(&ext.name) {
-                    symbols.borrow_mut().rename(param.name, ext.name.clone());
-                }
-                if let Some(ext_ty) = &ext.ty {
-                    param.ty = type_like_to_ctype(ext_ty);
-                }
-            }
-
-            param
-        })
-        .collect()
-}
-
 pub fn normalize_sig_arch_name(arch: Option<&r2il::ArchSpec>) -> Option<String> {
     let arch = arch?;
     let lower = arch.name.to_ascii_lowercase();
@@ -1883,95 +1707,6 @@ pub fn normalize_sig_arch_name(arch: Option<&r2il::ArchSpec>) -> Option<String> 
         return Some("x86".to_string());
     }
     Some(arch.name.clone())
-}
-
-/// The float-argument registers that advance alongside an integer sequence.
-///
-/// SysV and AAPCS both keep two argument sequences and advance them
-/// independently, so walking one positional list assigns the wrong register to
-/// every parameter after the first float: in
-/// `abi_mixed_params(int a, double b, int c, ...)` a positional walk put `b` in
-/// `rsi`, which actually carries `c`, and left the register really holding `b`
-/// with no name at all.
-fn float_arg_regs_for(abi_arg_regs: &[String]) -> &'static [&'static str] {
-    match abi_arg_regs
-        .first()
-        .map(|reg| reg.to_ascii_lowercase())
-        .as_deref()
-    {
-        Some("rdi") => &["xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7",
-        ],
-        Some("x0") => &["d0", "d1", "d2", "d3", "d4", "d5", "d6", "d7"],
-        _ => &[],
-    }
-}
-
-fn param_takes_float_register(ty: &CType) -> bool {
-    match ty {
-        CType::Float(_) => true,
-        // A recovered prototype spells its types, so a double arrives as the
-        // name `double` rather than as a width.
-        CType::Typedef(name) => matches!(
-            name.trim().to_ascii_lowercase().as_str(),
-            "float" | "double" | "long double" | "__float128" | "_float16"
-        ),
-        _ => false,
-    }
-}
-
-fn build_param_register_aliases(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
-    params: &[ast::CParam],
-    recovered_params: &[(r2ssa::SSAVar, ast::CParam)],
-    register_params: &[ExternalRegisterParamSpec],
-    abi_arg_regs: &[String],
-    allow_positional_aliases: bool,
-) -> std::collections::HashMap<String, String> {
-    let mut aliases = std::collections::HashMap::new();
-
-    if allow_positional_aliases {
-        let float_regs = float_arg_regs_for(abi_arg_regs);
-        let mut integer_index = 0usize;
-        let mut float_index = 0usize;
-        for param in params {
-            let reg_name = if param_takes_float_register(&param.ty) && !float_regs.is_empty() {
-                let reg = float_regs.get(float_index).map(|reg| (*reg).to_string());
-                float_index += 1;
-                reg
-            } else {
-                let reg = abi_arg_regs.get(integer_index).cloned();
-                integer_index += 1;
-                reg
-            };
-            let Some(reg_name) = reg_name else {
-                continue;
-            };
-            for alias in register_alias_names(&reg_name) {
-                aliases.insert(alias, symbols.borrow().name(param.name).to_string());
-            }
-        }
-
-        for (idx, (ssa_var, _)) in recovered_params.iter().enumerate() {
-            if let Some(param) = params.get(idx) {
-                aliases.insert(
-                    ssa_var.name.to_ascii_lowercase(),
-                    symbols.borrow().name(param.name).to_string(),
-                );
-            }
-        }
-    }
-
-    for (idx, reg_param) in register_params.iter().enumerate() {
-        let Some(param) = params.get(idx) else {
-            continue;
-        };
-        for alias in register_alias_names(&reg_param.reg) {
-            aliases
-                .entry(alias)
-                .or_insert_with(|| symbols.borrow().name(param.name).to_string());
-        }
-    }
-
-    aliases
 }
 
 /// Decompiler configuration.
@@ -3105,6 +2840,9 @@ pub enum PlacementAuditRefusal {
     UnscopedObservation {
         observation_id: u32,
     },
+    UnauthorizedProgramVariable {
+        symbol_index: usize,
+    },
     UnobservedBindingRead {
         binding_index: usize,
     },
@@ -3178,6 +2916,9 @@ impl PlacementAuditRefusal {
             Self::MissingPlannedValue { .. } => "missing_planned_value",
             Self::RefusedPlannedValue { .. } => "refused_planned_value",
             Self::UnscopedObservation { .. } => "unscoped_observation",
+            Self::UnauthorizedProgramVariable { .. } => {
+                "unauthorized_program_variable"
+            }
             Self::UnobservedBindingRead { .. } => "unobserved_binding_read",
             Self::UnobservedBindingWrite { .. } => "unobserved_binding_write",
             Self::NoDominatingRegion { .. } => "no_dominating_region",
@@ -3217,7 +2958,29 @@ impl PlacementAudit {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DecompileRenderRefusal {
     MissingMachineProjectionAuthorization,
+    MissingProgramVariableAuthorization,
+    NormalizationOriginUnavailable,
+    UnrepresentableControlFlow,
+    IncompleteEffectInventory,
     UnrepresentableOperation,
+}
+
+impl DecompileRenderRefusal {
+    /// Stable machine-readable category used by engine and corpus boundaries.
+    pub const fn kind(self) -> &'static str {
+        match self {
+            Self::MissingMachineProjectionAuthorization => {
+                "missing_machine_projection_authorization"
+            }
+            Self::MissingProgramVariableAuthorization => {
+                "missing_program_variable_authorization"
+            }
+            Self::NormalizationOriginUnavailable => "normalization_origin_unavailable",
+            Self::UnrepresentableControlFlow => "unrepresentable_control_flow",
+            Self::IncompleteEffectInventory => "incomplete_effect_inventory",
+            Self::UnrepresentableOperation => "unrepresentable_operation",
+        }
+    }
 }
 
 impl From<crate::fold::op_lower::OpLoweringRefusal> for DecompileRenderRefusal {
@@ -3226,9 +2989,52 @@ impl From<crate::fold::op_lower::OpLoweringRefusal> for DecompileRenderRefusal {
             crate::fold::op_lower::OpLoweringRefusal::MissingMachineProjectionAuthorization => {
                 Self::MissingMachineProjectionAuthorization
             }
+            crate::fold::op_lower::OpLoweringRefusal::MissingProgramVariableAuthorization => {
+                Self::MissingProgramVariableAuthorization
+            }
             crate::fold::op_lower::OpLoweringRefusal::UnrepresentableOperation => {
                 Self::UnrepresentableOperation
             }
+        }
+    }
+}
+
+fn rendered_identity_refusal_category(
+    refusal: crate::binding_plan::RenderedIdentityRefusal,
+) -> DecompileRenderRefusal {
+    use crate::binding_plan::{RenderedIdentityRefusal, ValueRefusal};
+
+    match refusal {
+        RenderedIdentityRefusal::MachineUse { .. }
+        | RenderedIdentityRefusal::MachineWrite { .. }
+        | RenderedIdentityRefusal::MissingUseDisposition { .. }
+        | RenderedIdentityRefusal::MissingWriteDisposition { .. }
+        | RenderedIdentityRefusal::MissingValueOrigin { .. }
+        | RenderedIdentityRefusal::Value {
+            reason:
+                ValueRefusal::MissingLiteralProjection { .. }
+                | ValueRefusal::MissingUseProjection { .. }
+                | ValueRefusal::IncoherentUseProjection { .. }
+                | ValueRefusal::IncoherentWriteProjection { .. }
+                | ValueRefusal::UnsupportedMachineExpression { .. },
+            ..
+        } => DecompileRenderRefusal::MissingMachineProjectionAuthorization,
+        RenderedIdentityRefusal::Value {
+            reason:
+                ValueRefusal::MissingBindingCertificate { .. }
+                | ValueRefusal::UnsupportedDeclarationWidth { .. },
+            ..
+        }
+        | RenderedIdentityRefusal::Parameter { .. }
+        | RenderedIdentityRefusal::StackObject { .. }
+        | RenderedIdentityRefusal::MissingBinding { .. }
+        | RenderedIdentityRefusal::MissingValueDisposition { .. }
+        | RenderedIdentityRefusal::MissingParameterDisposition { .. }
+        | RenderedIdentityRefusal::InvalidParameterEntity { .. }
+        | RenderedIdentityRefusal::MissingStackDisposition { .. }
+        | RenderedIdentityRefusal::MissingStackObjectOrigin { .. }
+        | RenderedIdentityRefusal::UnexpectedNonBindingDisposition { .. } => {
+            DecompileRenderRefusal::MissingProgramVariableAuthorization
         }
     }
 }
@@ -3373,7 +3179,7 @@ impl InternalBuildProduct {
         Self::Residual(prepare_function_for_emission(&function))
     }
 
-    fn refused(function: CFunction, refusal: crate::fold::op_lower::OpLoweringRefusal) -> Self {
+    fn refused(function: CFunction, refusal: DecompileRenderRefusal) -> Self {
         Self::Refused {
             emission: prepare_function_for_emission(&function),
             refusal: refusal.into(),
@@ -4231,12 +4037,6 @@ impl Decompiler {
                         }
                     }
                 }
-                let aliases = normalize::carrier_name_aliases(prepared, facts);
-                let mut entries = aliases.into_iter().collect::<Vec<_>>();
-                entries.sort();
-                for (member, name) in entries {
-                    eprintln!("CARRIERALIAS member={member} name={name}");
-                }
             }
         }
         let normalization_refusal = |error: normalize::NormalizationOriginError| {
@@ -4260,7 +4060,10 @@ impl Decompiler {
                     Ok(result) => result,
                     Err(normalize::NormalizationFailure::Execution(error)) => return Err(error),
                     Err(normalize::NormalizationFailure::Origins(error)) => {
-                        return Ok(InternalBuildProduct::residual(normalization_refusal(error)));
+                        return Ok(InternalBuildProduct::refused(
+                            normalization_refusal(error),
+                            DecompileRenderRefusal::NormalizationOriginUnavailable,
+                        ));
                     }
                 }
             } else {
@@ -4280,7 +4083,10 @@ impl Decompiler {
                 match error {
                     normalize::NormalizationFailure::Execution(error) => return Err(error),
                     normalize::NormalizationFailure::Origins(error) => {
-                        return Ok(InternalBuildProduct::residual(normalization_refusal(error)));
+                        return Ok(InternalBuildProduct::refused(
+                            normalization_refusal(error),
+                            DecompileRenderRefusal::NormalizationOriginUnavailable,
+                        ));
                     }
                 }
             }
@@ -4294,37 +4100,56 @@ impl Decompiler {
                 .name
                 .clone()
                 .unwrap_or_else(|| format!("sub_{:x}", func.entry));
-            return Ok(InternalBuildProduct::residual(residual_function_for_render_boundary(
-                &func_name,
-                &format!("normalization origin refusal: {error:?}"),
-            ),
+            return Ok(InternalBuildProduct::refused(
+                residual_function_for_render_boundary(
+                    &func_name,
+                    &format!("normalization origin refusal: {error:?}"),
+                ),
+                DecompileRenderRefusal::NormalizationOriginUnavailable,
             ));
         }
         let binding_plan = match crate::binding_plan::BindingPlan::build_shadow(
             input.source_owned_facts()) {
             Ok(plan) => std::rc::Rc::new(plan),
             Err(error) => {
-                return Ok(InternalBuildProduct::residual(residual_function_for_render_boundary(
-                    &func
-                        .name
-                        .clone()
-                        .unwrap_or_else(|| format!("sub_{:x}", func.entry)),
-                    &format!("binding plan refusal: {error:?}"),
-                ),
-                    ));
+                let refusal = match error {
+                    crate::binding_plan::BindingPlanBuildError::MachineProjection(_)
+                    | crate::binding_plan::BindingPlanBuildError::Seal(
+                        crate::binding_plan::BindingPlanSourceMismatch::MachineProjection(_),
+                    ) => DecompileRenderRefusal::MissingMachineProjectionAuthorization,
+                    _ => DecompileRenderRefusal::MissingProgramVariableAuthorization,
+                };
+                return Ok(InternalBuildProduct::refused(
+                    residual_function_for_render_boundary(
+                        &func
+                            .name
+                            .clone()
+                            .unwrap_or_else(|| format!("sub_{:x}", func.entry)),
+                        &format!("native render refusal: {}", refusal.kind()),
+                    ),
+                    refusal,
+                ));
             }
         };
         if let Err(error) = crate::fold::op_lower::PlannedLoweringInput::try_new(
             input.source_owned_facts(),
             &binding_plan,
         ) {
-            return Ok(InternalBuildProduct::residual(residual_function_for_render_boundary(
-                &func
-                    .name
-                    .clone()
-                    .unwrap_or_else(|| format!("sub_{:x}", func.entry)),
-                &format!("binding source refusal: {error:?}"),
-            ),
+            let refusal = match error {
+                crate::binding_plan::BindingPlanSourceMismatch::MachineProjection(_) => {
+                    DecompileRenderRefusal::MissingMachineProjectionAuthorization
+                }
+                _ => DecompileRenderRefusal::MissingProgramVariableAuthorization,
+            };
+            return Ok(InternalBuildProduct::refused(
+                residual_function_for_render_boundary(
+                    &func
+                        .name
+                        .clone()
+                        .unwrap_or_else(|| format!("sub_{:x}", func.entry)),
+                    &format!("native render refusal: {}", refusal.kind()),
+                ),
+                refusal,
             ));
         }
         let binding_names = match crate::binding_plan::BindingNameResolution::build(
@@ -4334,13 +4159,24 @@ impl Decompiler {
         ) {
             Ok(names) => std::rc::Rc::new(names),
             Err(error) => {
-                return Ok(InternalBuildProduct::residual(residual_function_for_render_boundary(
+                let refusal = match error {
+                    crate::binding_plan::BindingNameResolutionError::Source(
+                        crate::binding_plan::BindingPlanSourceMismatch::MachineProjection(_),
+                    ) => DecompileRenderRefusal::MissingMachineProjectionAuthorization,
+                    crate::binding_plan::BindingNameResolutionError::Source(_)
+                    | crate::binding_plan::BindingNameResolutionError::MissingBinding(_)
+                    | crate::binding_plan::BindingNameResolutionError::ConflictingCertifiedRoles(
+                        _,
+                    ) => DecompileRenderRefusal::MissingProgramVariableAuthorization,
+                };
+                return Ok(InternalBuildProduct::refused(residual_function_for_render_boundary(
                     &func
                         .name
                         .clone()
                         .unwrap_or_else(|| format!("sub_{:x}", func.entry)),
-                    &format!("binding name refusal: {error:?}"),
+                    &format!("native render refusal: {}", refusal.kind()),
                 ),
+                    refusal,
                 ));
             }
         };
@@ -4386,15 +4222,6 @@ impl Decompiler {
             .clone()
             .unwrap_or_else(|| format!("sub_{:x}", func.entry));
         let render_signature = self.context.type_facts().render_authorized_signature();
-        // Recover variables
-        let mut var_recovery = VariableRecovery::new_with_abi(
-            &self.config.sp_name,
-            &self.config.fp_name,
-            self.config.ptr_size,
-            self.config.arg_regs.clone(),
-            self.config.ret_regs.clone(),
-        );
-        var_recovery.recover_input(input, symbols);
         let skip_runtime_type_inference = self.context.skip_runtime_type_inference(prepared);
         let type_inference = (!skip_runtime_type_inference).then(|| {
             let mut type_inference = TypeInference::new_with_abi(
@@ -4428,92 +4255,41 @@ impl Decompiler {
             type_inference.infer_function(func);
             type_inference
         });
-        let mut type_hints = if let Some(type_inference) = type_inference.as_ref() {
-            type_inference
-                .var_type_hints()
-                .into_iter()
-                .map(|(name, ty)| (name, type_like_to_ctype(&ty)))
-                .collect::<std::collections::HashMap<_, _>>()
-        } else {
-            seed_runtime_type_hints_from_facts_and_recovery(
-                self.context.type_facts(),
-                &var_recovery,
-            )
-        };
-        merge_runtime_type_hints(
-            &mut type_hints,
-            seed_runtime_type_hints_from_facts_and_recovery(
-                self.context.type_facts(),
-                &var_recovery,
-            ),
-        );
         let combined_type_oracle = type_inference
             .as_ref()
             .and_then(TypeInference::combined_type_oracle);
         let type_oracle = combined_type_oracle
             .as_ref()
             .map(|oracle| oracle as &dyn TypeOracle);
-        let recovered_param_infos: Vec<_> = var_recovery
+        let params = match binding_names
             .parameters()
-            .iter()
-            .map(|v| {
-                (
-                    v.ssa_var.clone(),
-                    ast::CParam {
-                        ty: type_inference
-                            .as_ref()
-                            .map(|type_inference| {
-                                type_like_to_ctype(&type_inference.get_type(&v.ssa_var))
-                            })
-                            .unwrap_or_else(|| v.ty.clone()),
-                        name: prepared
-                            .graph()
-                            .value_id_for_var(&v.ssa_var)
-                            .and_then(|value| binding_names.symbol_for_value(value))
-                            .unwrap_or_else(|| crate::symbol::declare(&symbols, &v.name)),
-                    },
-                )
+            .map(|resolved| {
+                let resolved = resolved?;
+                let ty = usize::try_from(resolved.slot)
+                    .ok()
+                    .and_then(|slot| render_signature.and_then(|signature| signature.params.get(slot)))
+                    .and_then(|parameter| parameter.ty.as_ref())
+                    .map(type_like_to_ctype)
+                    .unwrap_or(resolved.declaration_type);
+                Ok(ast::CParam {
+                    ty,
+                    name: resolved.symbol,
+                })
             })
-            .collect();
-        let mut params = merge_params_with_external_signature(symbols, 
-            recovered_param_infos
-                .iter()
-                .map(|(_, param)| param.clone())
-                .collect(),
-            render_signature,
-        );
-        apply_source_parameter_names(symbols, &mut params, self.context.function_facts.display_names(),
-        );
-        let param_register_aliases = build_param_register_aliases(symbols, 
-            &params,
-            &recovered_param_infos,
-            &self.context.type_facts().register_params,
-            &self.config.arg_regs,
-            true,
-        );
-        for (idx, (_ssa_var, _)) in recovered_param_infos.iter().enumerate() {
-            let Some(param) = params.get(idx) else {
-                continue;
-            };
-            let param_ty = param.ty.clone();
-            type_hints.insert(crate::symbol::spelling(symbols, param.name).to_string(), param_ty.clone(),
-            );
-            type_hints.insert(crate::symbol::spelling(symbols, param.name).to_ascii_lowercase(), param_ty,
-            );
-        }
-        for (reg_alias, param_name) in &param_register_aliases {
-            let Some(param) = params.iter().find(|param| {
-                &*crate::symbol::spelling(symbols, param.name) == param_name.as_str()
-            }) else {
-                continue;
-            };
-            type_hints
-                .entry(reg_alias.clone())
-                .or_insert_with(|| param.ty.clone());
-            type_hints
-                .entry(reg_alias.to_ascii_lowercase())
-                .or_insert_with(|| param.ty.clone());
-        }
+            .collect::<Result<Vec<_>, crate::binding_plan::RenderedIdentityRefusal>>()
+        {
+            Ok(params) => params,
+            Err(error) => {
+                let refusal = rendered_identity_refusal_category(error);
+                return Ok(InternalBuildProduct::refused(
+                    residual_function_for_render_boundary(
+                        &func_name,
+                        &format!("native render refusal: {}", refusal.kind()),
+                    ),
+                    refusal,
+                ));
+            }
+        };
         let inferred_ret_type = type_inference
             .as_ref()
             .map(|type_inference| self.infer_return_type(func, type_inference))
@@ -4546,10 +4322,12 @@ impl Decompiler {
             symbols,
             analysis::PreparedSemanticViewInputs {
                 prepared,
+                #[cfg(test)]
                 abi_arg_regs: &self.config.arg_regs,
                 stack_slots: &self.context.type_facts().stack_slots,
                 visible_bindings: &self.context.type_facts().visible_bindings,
-                param_register_aliases: &param_register_aliases,
+                #[cfg(test)]
+                param_register_aliases: &HashMap::new(),
                 function_facts: &self.context.function_facts,
                 #[cfg(test)]
                 certified_rendering_required: false,
@@ -4558,13 +4336,25 @@ impl Decompiler {
         ) {
             Ok(view) => view,
             Err(error) => {
-                return Ok(InternalBuildProduct::residual(residual_function_for_render_boundary(
+                let refusal = match error {
+                    analysis::prepared_semantic::PreparedSemanticViewBuildError::RenderedIdentity(
+                        refusal,
+                    ) => {
+                        rendered_identity_refusal_category(refusal)
+                    }
+                    analysis::prepared_semantic::PreparedSemanticViewBuildError::SourceAuthorityMismatch
+                    | analysis::prepared_semantic::PreparedSemanticViewBuildError::SymbolTableMismatch => {
+                        DecompileRenderRefusal::MissingProgramVariableAuthorization
+                    }
+                };
+                return Ok(InternalBuildProduct::refused(residual_function_for_render_boundary(
                     &func
                         .name
                         .clone()
                         .unwrap_or_else(|| format!("sub_{:x}", func.entry)),
-                    &format!("prepared semantic view refusal: {error:?}"),
+                    &format!("native render refusal: {}", refusal.kind()),
                 ),
+                    refusal,
                 ));
             }
         };
@@ -4587,8 +4377,6 @@ impl Decompiler {
             external_stack_vars: &self.context.type_facts().external_stack_vars,
             visible_bindings: &self.context.type_facts().visible_bindings,
             external_type_db: &self.context.type_facts().external_type_db,
-            param_register_aliases: &param_register_aliases,
-            type_hints: &type_hints,
             type_oracle,
             function_return_type: fold_function_return_type,
             prepared_ssa: Some(prepared),
@@ -4603,7 +4391,20 @@ impl Decompiler {
         fold_ctx.symbols = std::rc::Rc::clone(&symbol_table);
         let fold_blocks: Vec<_> = func.blocks().cloned().collect();
         let structuring_work = work.with_phase(DecompileWorkPhase::Structuring);
-        fold_ctx.analyze_blocks_with_control(&fold_blocks, structuring_work)?;
+        if let Err(error) = fold_ctx.analyze_blocks_with_control(&fold_blocks, structuring_work) {
+            match error {
+                analysis::PreparedRuntimeFactsError::ExecutionStop(stop) => return Err(stop),
+                analysis::PreparedRuntimeFactsError::Lowering(refusal) => {
+                    return Ok(InternalBuildProduct::refused(
+                        residual_function_for_render_boundary(
+                            &func_name,
+                            &format!("operation lowering refusal: {refusal:?}"),
+                        ),
+                        refusal.into(),
+                    ));
+                }
+            }
+        }
         structuring_work.poll()?;
         fold_ctx.analyze_function_structure(func);
         structuring_work.poll()?;
@@ -4611,8 +4412,6 @@ impl Decompiler {
         let mut structurer =
             ControlFlowStructurer::new_with_control(func, &fold_ctx, structuring_work)?;
 
-        // Get set of variables that survive folding before structuring.
-        let emitted_vars = structurer.emitted_var_names();
         let routed_body = match consumer_structured::primary_body_for_semantic_route(
             semantic_route,
             &mut structurer,
@@ -4627,24 +4426,25 @@ impl Decompiler {
                         .unwrap_or_else(|| format!("sub_{:x}", func.entry)),
                     &format!("operation lowering refusal: {refusal:?}"),
                 );
-                return Ok(InternalBuildProduct::refused(function, refusal));
+                return Ok(InternalBuildProduct::refused(function, refusal.into()));
             }
             Err(structure::ControlFlowStructureError::StructuredRegion(error)) => {
-                return Ok(InternalBuildProduct::residual(residual_function_for_render_boundary(
-                    &func
-                        .name
-                        .clone()
-                        .unwrap_or_else(|| format!("sub_{:x}", func.entry)),
-                    &format!("structured-region refusal: {error:?}"),
-                )));
+                return Ok(InternalBuildProduct::refused(
+                    residual_function_for_render_boundary(
+                        &func
+                            .name
+                            .clone()
+                            .unwrap_or_else(|| format!("sub_{:x}", func.entry)),
+                        &format!("structured-region refusal: {error:?}"),
+                    ),
+                    DecompileRenderRefusal::UnrepresentableControlFlow,
+                ));
             }
         };
         if let Some(stop) = structurer.execution_stop() {
             return Err(stop);
         }
         structuring_work.poll()?;
-        let use_conservative_locals = routed_body.use_conservative_locals;
-        let is_linear_fallback = routed_body.is_linear_fallback;
         if let Some(structured_body) = routed_body.structured_body() {
             let mut occurrences = 0usize;
             structured_body.visit_occurrences(|_| occurrences += 1);
@@ -4659,135 +4459,6 @@ impl Decompiler {
         // Build the C function
         // Convert body to statements
         let body = self.stmt_to_vec(body_stmt);
-        let body_visible_names = collect_stmt_var_names(&body);
-        let param_name_set = params
-            .iter()
-            .map(|param| crate::symbol::spelling(symbols, param.name).to_ascii_lowercase())
-            .collect::<HashSet<_>>();
-        let param_home_offsets = fold_ctx
-            .stack_arg_aliases_map()
-            .iter()
-            .filter_map(|(offset, alias)| {
-                param_name_set
-                    .contains(&alias.to_ascii_lowercase())
-                    .then_some(*offset)
-            })
-            .chain(
-                self.context
-                    .type_facts()
-                    .visible_bindings
-                    .iter()
-                    .filter_map(|binding| {
-                        matches!(binding.kind, VisibleBindingKind::HiddenHome)
-                            .then(|| binding.stack_slot.as_ref().map(|slot| slot.offset))
-                            .flatten()
-                    }),
-            )
-            .collect::<HashSet<_>>();
-        let body_visible_spellings = body_visible_names
-            .iter()
-            .map(|id| crate::symbol::spelling(symbols, *id).to_string())
-            .collect::<HashSet<_>>();
-        let body_visible_stack_offsets = collect_visible_stack_offsets(
-            &body_visible_spellings,
-            &self.context.type_facts().visible_bindings,
-            &self.context.type_facts().stack_slots,
-            &param_name_set,
-        );
-
-        // Collect locals -- on fallback keep locals conservatively.
-        let locals: Vec<ast::CLocal> = if use_conservative_locals {
-            var_recovery
-                .locals()
-                .iter()
-                .filter(|v| {
-                    !v.stack_offset
-                        .is_some_and(|offset| param_home_offsets.contains(&offset))
-                })
-                .map(|v| ast::CLocal {
-                    ty: choose_more_specific_runtime_type(
-                        type_inference
-                            .as_ref()
-                            .map(|type_inference| {
-                                type_like_to_ctype(&type_inference.get_type(&v.ssa_var))
-                            })
-                            .unwrap_or_else(|| v.ty.clone()),
-                        runtime_type_hint_for_name(&type_hints, &v.name),
-                    ),
-                    name: v
-                        .stack_object
-                        .and_then(|object| binding_names.symbol_for_stack_object(object))
-                        .or_else(|| {
-                            prepared
-                                .graph()
-                                .value_id_for_var(&v.ssa_var)
-                                .and_then(|value| binding_names.symbol_for_value(value))
-                        })
-                        .unwrap_or_else(|| crate::symbol::declare(&symbols, &v.name)),
-                    stack_offset: v.stack_offset,
-                })
-                .collect()
-        } else {
-            let mut selected = var_recovery
-                .locals()
-                .iter()
-                .filter(|v| {
-                    let not_param_home = !v
-                        .stack_offset
-                        .is_some_and(|offset| param_home_offsets.contains(&offset));
-                    not_param_home
-                        && (emitted_vars.contains(&v.name)
-                            || body_visible_names
-                                .iter()
-                                .any(|id| *crate::symbol::spelling(symbols, *id) == *v.name)
-                            || v.stack_offset
-                                .is_some_and(|offset| body_visible_stack_offsets.contains(&offset)))
-                })
-                .map(|v| ast::CLocal {
-                    ty: choose_more_specific_runtime_type(
-                        type_inference
-                            .as_ref()
-                            .map(|type_inference| {
-                                type_like_to_ctype(&type_inference.get_type(&v.ssa_var))
-                            })
-                            .unwrap_or_else(|| v.ty.clone()),
-                        runtime_type_hint_for_name(&type_hints, &v.name),
-                    ),
-                    name: v
-                        .stack_object
-                        .and_then(|object| binding_names.symbol_for_stack_object(object))
-                        .or_else(|| {
-                            prepared
-                                .graph()
-                                .value_id_for_var(&v.ssa_var)
-                                .and_then(|value| binding_names.symbol_for_value(value))
-                        })
-                        .unwrap_or_else(|| crate::symbol::declare(&symbols, &v.name)),
-                    stack_offset: v.stack_offset,
-                })
-                .collect::<Vec<_>>();
-            let mut seen_offsets = HashSet::new();
-            selected.retain(|local| match local.stack_offset {
-                Some(offset) => seen_offsets.insert(offset),
-                None => true,
-            });
-            selected
-        };
-        // A slot that owns a call result is declared with what the callee
-        // returns; nothing else may know its type on a binary without symbols.
-        let owned_call_result_local_types = fold_ctx.owned_call_result_types_by_stack_offset();
-        let locals = locals
-            .into_iter()
-            .map(|local| {
-                let hint = local
-                    .stack_offset
-                    .and_then(|offset| owned_call_result_local_types.get(&offset));
-                ast::CLocal {
-                    ty: choose_more_specific_runtime_type(local.ty, hint),
-                    ..local
-                }
-            })
-            .collect::<Vec<_>>();
         let mut c_function = CFunction {
             symbols: std::rc::Rc::clone(&symbol_table),
             name: func_name.clone(),
@@ -4795,7 +4466,9 @@ impl Decompiler {
                 .and_then(|sig| sig.ret_type.as_ref().map(type_like_to_ctype))
                 .unwrap_or_else(|| inferred_ret_type.clone()),
             params,
-            locals,
+            // Program locals are introduced only by the final placement pass
+            // from surviving, observed BindingId occurrences.
+            locals: Vec::new(),
             body,
             // Parameters here come from the render signature, so an empty list
             // is a recovered empty list rather than an unknown one.
@@ -4809,98 +4482,43 @@ impl Decompiler {
 
         let strings = self.context.function_facts.display_names().strings();
         fold_constant_arithmetic_in_function(&mut c_function, strings);
-        // Binding a repeated call to one name means finding the call site in
-        // the body, and that match is by expression. The body has just been
-        // folded -- an adrp/add pair is one address and that address is a
-        // string -- while the recorded site is still the unfolded form, so
-        // `strcmp(password, "secret123")` matched nothing and was printed once
-        // per use. The sites fold the same way before they are matched.
-        let mut folded_call_sites = fold_ctx.call_result_exprs_map().clone();
-        for expr in folded_call_sites.values_mut() {
-            fold_constant_arithmetic_in_expr(expr, strings);
+        if single_evaluation::bind_each_call_site_once(&mut c_function, &binding_names).is_err() {
+            let refusal = DecompileRenderRefusal::MissingProgramVariableAuthorization;
+            return Ok(InternalBuildProduct::refused(
+                residual_function_for_render_boundary(
+                    &c_function.name,
+                    &format!("native render refusal: {}", refusal.kind()),
+                ),
+                refusal,
+            ));
         }
-        single_evaluation::bind_each_call_site_once(&mut c_function, &folded_call_sites);
         simplify_identities_in_function(&mut c_function, &fold_ctx);
         debug_assigned_locals(&c_function, "simplify_identities_in_function");
         propagate_single_use_register_carriers(&mut c_function, &fold_ctx);
         debug_assigned_locals(&c_function, "propagate_single_use_register_carriers");
         drop_overwritten_assignments(&mut c_function);
         debug_assigned_locals(&c_function, "drop_overwritten_assignments");
-        rewrite_stack_synonym_uses_to_declared_locals(symbols, &mut c_function, &fold_ctx);
-        // Dropping a version suffix loses which value a name meant, so anything
-        // that resolves a name to the storage behind it has to run before this.
-        // Linear fallback intentionally keeps its raw expression-builder output.
-        if !is_linear_fallback {
-            let mut known_function_names = HashSet::new();
-            for name in self.context.type_facts().known_function_signatures.keys() {
-                known_function_names.insert(name.to_ascii_lowercase());
-            }
-            post_rename::rewrite_function_identifiers(&mut c_function, &known_function_names);
-        }
         reconstruct_flag_conditions_in_function(&mut c_function, &fold_ctx);
         debug_assigned_locals(&c_function, "reconstruct_flag_conditions_in_function");
         prune_dead_temp_assignments_in_function_body(&mut c_function, &fold_ctx);
         debug_assigned_locals(&c_function, "prune_dead_temp_assignments_in_function_body");
-        prune_unused_pure_locals(symbols, &mut c_function);
-        debug_assigned_locals(&c_function, "prune_unused_pure_locals");
-        resolve_undeclared_carriers(symbols, &mut c_function, &fold_ctx);
-        debug_assigned_locals(&c_function, "resolve_undeclared_carriers");
-        prune_unreferenced_local_declarations(symbols, &mut c_function);
-        debug_assigned_locals(&c_function, "prune_unreferenced_local_declarations");
         normalize_redundant_return_carrier_casts(&mut c_function);
         normalize_declared_assignment_literals(&mut c_function);
         normalize_comparison_operand_order(&mut c_function);
         debug_assigned_locals(&c_function, "normalize_comparison_operand_order");
         unrendered::prune_unreferenced_labels(&mut c_function);
         unrendered::drop_values_from_void_returns(&mut c_function);
-        // Declaring a carrier after the fact, and marking the ones nothing
-        // declared, were two halves of a problem a reference does not have: a
-        // name cannot be mentioned unless the table already holds it. What is
-        // left to ask is whether C can read it.
-        unrendered::spell_every_name_as_c(&mut c_function);
         // Executable C is admitted only when the source obligation inventory is
         // complete. The inventory is what says which effects the source has, so a
         // function whose inventory did not close has no account of what the output
         // owes, and rendering it says the effects were all handled when nothing
         // ever enumerated them.
         if let Some(reason) = incomplete_source_obligations_reason(prepared) {
-            return Ok(InternalBuildProduct::residual(residual_function_for_render_boundary(
-                &c_function.name,
-                &reason),
+            return Ok(InternalBuildProduct::refused(
+                residual_function_for_render_boundary(&c_function.name, &reason),
+                DecompileRenderRefusal::IncompleteEffectInventory,
             ));
         }
-        // Every name the body assigns has a declaration by now, so a name
-        // still without one is never assigned: it is read, and nothing in the
-        // function ever produced it. That is a definition the pipeline dropped
-        // or refused, not a declaration it forgot, and declaring it would turn
-        // the dangling read into valid C that reads uninitialised memory.
-        if structured_regions.is_none() {
-            unrendered::declare_assigned_names_without_a_declaration(&mut c_function);
-            let undeclared = unrendered::names_mentioned_without_a_declaration(&c_function);
-            if !undeclared.is_empty() {
-                let table = c_function.symbols.borrow();
-                let names = undeclared
-                    .iter()
-                    .map(|name| table.name(*name).to_string())
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                drop(table);
-                // Reported as a count, not a list: the comment renderer replaces
-                // machine tokens with prose, so naming them here would print the
-                // substitution rather than the name and read as a different defect.
-                c_function.body.insert(
-                    0,
-                    CStmt::Comment(format!(
-                        "r2dec defect: {} name(s) read with no definition",
-                        undeclared.len()
-                    )),
-                );
-                if std::env::var_os("R2SLEIGH_NAME_DEFECTS").is_some() {
-                    eprintln!("r2dec undeclared: {names}");
-                }
-            }
-        }
-
         let observation_error = fold_ctx.observation_error.borrow().clone();
         drop(fold_ctx);
         let mut native = match observation_journal {
@@ -4963,17 +4581,6 @@ impl Decompiler {
                     continue;
                 };
 
-                let target_name = target.name.to_ascii_lowercase();
-                if target_name.starts_with("xmm0") || target_name.starts_with("st0") {
-                    let bits = if target.size.saturating_mul(8) <= 32 {
-                        32
-                    } else {
-                        64
-                    };
-                    candidates.push(CType::Float(bits));
-                    continue;
-                }
-
                 candidates.push(type_like_to_ctype(&type_inference.get_type(target)));
             }
         }
@@ -4982,24 +4589,17 @@ impl Decompiler {
             return CType::Void;
         }
 
-        let mut meaningful: Vec<CType> = candidates
+        let meaningful: Vec<CType> = candidates
             .into_iter()
             .filter(|ty| !matches!(ty, CType::Unknown))
             .collect();
         if meaningful.is_empty() {
-            return CType::Int(32);
+            return CType::Unknown;
         }
         if meaningful.iter().all(|ty| ty == &meaningful[0]) {
-            return meaningful.remove(0);
+            return meaningful[0].clone();
         }
-        if let Some(float_ty) = meaningful
-            .iter()
-            .find(|ty| matches!(ty, CType::Float(_)))
-            .cloned()
-        {
-            return float_ty;
-        }
-        meaningful.remove(0)
+        CType::Unknown
     }
 }
 
@@ -5359,12 +4959,12 @@ fn drop_overwritten_assignments(func: &mut CFunction) {
         Some((*name, right.as_ref()))
     }
 
-    fn visit(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, stmts: &mut Vec<CStmt>) {
+    fn visit(stmts: &mut Vec<CStmt>) {
         for stmt in stmts.iter_mut() {
-            single_evaluation::for_each_child_block_mut(stmt, &mut |body, _| visit(symbols, body));
+            single_evaluation::for_each_child_block_mut(stmt, &mut |body, _| visit(body));
             if let CStmt::For { init: Some(init), .. } = stmt.unobserved_mut() {
                 let mut one = vec![(**init).clone()];
-                visit(symbols, &mut one);
+                visit(&mut one);
                 if let Some(first) = one.into_iter().next() {
                     *init = Box::new(first);
                 }
@@ -5380,20 +4980,21 @@ fn drop_overwritten_assignments(func: &mut CFunction) {
                 index += 1;
                 continue;
             }
-            let spelling = crate::symbol::spelling(symbols, name);
             let mut overwritten = None;
             for offset in index + 1..stmts.len() {
                 let stmt = &stmts[offset];
                 // The overwrite itself names the target, so it is tested before any read.
                 if let Some((target, rhs)) = assignment_target(stmt)
                     && target == name
-                    && count_var_reads_in_stmts(symbols, std::slice::from_ref(&CStmt::Expr(rhs.clone())), &spelling,
+                    && count_var_reads_in_stmts(
+                        std::slice::from_ref(&CStmt::Expr(rhs.clone())),
+                        name,
                     ) == 0
                 {
                     overwritten = Some(offset);
                     break;
                 }
-                if count_var_reads_in_stmts(symbols, std::slice::from_ref(stmt), &spelling) > 0 {
+                if count_var_reads_in_stmts(std::slice::from_ref(stmt), name) > 0 {
                     break;
                 }
                 // Only straight-line statements are crossed; anything else may read it out of order.
@@ -5409,8 +5010,7 @@ fn drop_overwritten_assignments(func: &mut CFunction) {
         }
     }
 
-    let symbols = std::rc::Rc::clone(&func.symbols);
-    visit(&symbols, &mut func.body);
+    visit(&mut func.body);
 }
 
 fn simplify_identities_in_function(func: &mut CFunction, fold_ctx: &FoldingContext<'_>) {
@@ -5474,224 +5074,6 @@ fn reconstruct_flag_conditions_in_function(func: &mut CFunction, fold_ctx: &Fold
     walk(&mut func.body, fold_ctx);
 }
 
-fn resolve_undeclared_carriers(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, func: &mut CFunction, fold_ctx: &FoldingContext<'_>,
-) {
-    let declared = func
-        .params
-        .iter()
-        .map(|param| crate::symbol::spelling(symbols, param.name).to_ascii_lowercase())
-        .chain(func.locals.iter().map(|local| crate::symbol::spelling(symbols, local.name).to_ascii_lowercase()),
-        )
-        .collect::<HashSet<_>>();
-
-    // Dropping one dead carrier can leave the value it read with no reader, so
-    // the pass repeats until a sweep removes nothing.
-    // The caller reads the return register, so a carrier that names it is never
-    // dead here however the body reads it. Dropping one would delete the value
-    // the function answers with and leave nothing saying it was ever computed.
-    let returns_value = !matches!(func.ret_type, CType::Void);
-
-    loop {
-        let reads = collect_function_local_reads(symbols, func);
-        let mut removed = false;
-        drop_dead_undeclared_carriers(symbols, 
-            &mut func.body,
-            &declared,
-            &reads,
-            fold_ctx,
-            returns_value,
-            &mut removed,
-        );
-        if !removed {
-            break;
-        }
-    }
-
-    let mut carriers = Vec::new();
-    collect_undeclared_carrier_targets(symbols, &mut func.body, &declared, &mut carriers);
-    let mut seen = HashSet::new();
-    for (name, value) in carriers {
-        if !seen.insert(name.to_ascii_lowercase()) {
-            continue;
-        }
-        let ty = fold_ctx.declared_type_for_carrier(&name, &value);
-        let name = crate::symbol::declare(&symbols, &name);
-        func.locals.push(ast::CLocal {
-            ty,
-            name,
-            stack_offset: None,
-        });
-    }
-}
-
-/// Remove every assignment to an undeclared name that nothing reads, provided
-/// evaluating its value does nothing on its own.
-fn drop_dead_undeclared_carriers(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
-    stmts: &mut Vec<CStmt>,
-    declared: &HashSet<String>,
-    reads: &HashSet<String>,
-    fold_ctx: &FoldingContext<'_>,
-    returns_value: bool,
-    removed: &mut bool,
-) {
-    for stmt in stmts.iter_mut() {
-        single_evaluation::for_each_expr_mut(stmt, &mut |expr| {
-            drop_dead_undeclared_comma_carriers(symbols, 
-                expr,
-                declared,
-                reads,
-                fold_ctx,
-                returns_value,
-                removed,
-            );
-        });
-        single_evaluation::for_each_child_block_mut(stmt, &mut |body, _| {
-            drop_dead_undeclared_carriers(symbols, 
-                body,
-                declared,
-                reads,
-                fold_ctx,
-                returns_value,
-                removed,
-            );
-        });
-        let CStmt::Expr(expr) = stmt.unobserved() else {
-            continue;
-        };
-        let CExpr::Binary {
-            op: BinaryOp::Assign,
-            left,
-            right,
-        } = expr.unobserved()
-        else {
-            continue;
-        };
-        let CExpr::Var(name) = left.unobserved() else {
-            continue;
-        };
-        let lower = crate::symbol::spelling(symbols, *name).to_ascii_lowercase();
-        if declared.contains(&lower)
-            || reads.contains(&lower)
-            || !expr_is_pure_for_dead_local_prune(right)
-            || (returns_value && fold_ctx.carrier_names_return_register(*name))
-        {
-            continue;
-        }
-        *stmt = CStmt::Empty;
-        *removed = true;
-    }
-    stmts.retain(|stmt| !matches!(stmt, CStmt::Empty));
-}
-
-/// The same rule inside a comma expression, where the lifter parks a store that
-/// a condition then evaluates: `while (t3f680 = n, i < n)` tests `i < n` and
-/// names storage nobody reads to say so.
-fn drop_dead_undeclared_comma_carriers(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
-    expr: &mut CExpr,
-    declared: &HashSet<String>,
-    reads: &HashSet<String>,
-    fold_ctx: &FoldingContext<'_>,
-    returns_value: bool,
-    removed: &mut bool,
-) {
-    if let CExpr::Observed { expr, .. } = expr {
-        drop_dead_undeclared_comma_carriers(
-            symbols,
-            expr,
-            declared,
-            reads,
-            fold_ctx,
-            returns_value,
-            removed,
-        );
-        return;
-    }
-    for child in single_evaluation::children_mut(expr) {
-        drop_dead_undeclared_comma_carriers(symbols, child, declared, reads, fold_ctx, returns_value, removed,
-        );
-    }
-    let CExpr::Comma(items) = expr else {
-        return;
-    };
-    // The last item is the value of the comma expression, so it is never a store
-    // nothing reads however the name is spelled.
-    let last = items.len().saturating_sub(1);
-    let mut index = 0;
-    items.retain(|item| {
-        let keep = index == last
-            || !dead_undeclared_carrier_assignment(symbols, 
-                item,
-                declared,
-                reads,
-                fold_ctx,
-                returns_value,
-            );
-        if !keep {
-            *removed = true;
-        }
-        index += 1;
-        keep
-    });
-    if items.len() == 1
-        && let Some(only) = items.pop()
-    {
-        *expr = only;
-    }
-}
-
-/// Whether this expression stores to a name the function never declares and
-/// nothing reads, with a value that does nothing on its own.
-fn dead_undeclared_carrier_assignment(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
-    expr: &CExpr,
-    declared: &HashSet<String>,
-    reads: &HashSet<String>,
-    fold_ctx: &FoldingContext<'_>,
-    returns_value: bool,
-) -> bool {
-    let CExpr::Binary {
-        op: BinaryOp::Assign,
-        left,
-        right,
-    } = expr.unobserved()
-    else {
-        return false;
-    };
-    let CExpr::Var(name) = left.unobserved() else {
-        return false;
-    };
-    let lower = crate::symbol::spelling(symbols, *name).to_ascii_lowercase();
-    !declared.contains(&lower)
-        && !reads.contains(&lower)
-        && expr_is_pure_for_dead_local_prune(right)
-        && !(returns_value && fold_ctx.carrier_names_return_register(*name))
-}
-
-/// Every undeclared name the body assigns, paired with the value first stored in
-/// it so the declaration can be typed from what it holds.
-fn collect_undeclared_carrier_targets(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
-    stmts: &mut Vec<CStmt>,
-    declared: &HashSet<String>,
-    out: &mut Vec<(String, CExpr)>,
-) {
-    for stmt in stmts.iter_mut() {
-        if let CStmt::Expr(expr) = stmt.unobserved()
-            && let CExpr::Binary {
-            op: BinaryOp::Assign,
-            left,
-            right,
-        } = expr.unobserved()
-            && let CExpr::Var(name) = left.unobserved()
-            && !declared.contains(&crate::symbol::spelling(symbols, *name).to_ascii_lowercase())
-        {
-            out.push((crate::symbol::spelling(symbols, *name).to_string(), right.as_ref().clone(),
-            ));
-        }
-        single_evaluation::for_each_child_block_mut(stmt, &mut |body, _| {
-            collect_undeclared_carrier_targets(symbols, body, declared, out);
-        });
-    }
-}
-
 /// A name assigned once and read once is not a variable of the program, it is
 /// the value itself with a label attached. That is true of the versioned
 /// register carriers this started with, and equally of the temporaries the
@@ -5706,7 +5088,7 @@ fn propagate_single_use_register_carriers(func: &mut CFunction, fold_ctx: &Foldi
         .chain(func.locals.iter().map(|local| local.name.clone()))
         .collect::<std::collections::HashSet<_>>();
 
-    fn visit_block(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
+    fn visit_block(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
         stmts: &mut Vec<CStmt>,
         fold_ctx: &FoldingContext<'_>,
         declared: &std::collections::HashSet<crate::symbol::SymbolId>,
@@ -5726,34 +5108,29 @@ fn propagate_single_use_register_carriers(func: &mut CFunction, fold_ctx: &Foldi
         }
         let mut index = 0;
         while index < stmts.len() {
-            let Some((name, value)) = carrier_assignment(symbols, &stmts[index], fold_ctx, declared) else {
+            let Some((name, value)) = carrier_assignment(&stmts[index], fold_ctx, declared) else {
                 index += 1;
                 continue;
             };
             let rest = &stmts[index + 1..];
-            let spelled = crate::symbol::spelling(symbols, name);
             // "The rest of this list" is not all the readers. A value computed
             // in one block and read in a later one is read once *here* and many
             // times overall: adler32 at x86-64 -O2 computes `ecx_9` in its tail
             // and returns it, and propagating it into its one local reader
             // deleted the statement, leaving the return quoting a name nothing
             // declares. The loop case below was the same mistake, caught first.
-            if count_var_reads_in_stmts(symbols, whole_body, &spelled) != 1 {
+            if count_var_reads_in_stmts(whole_body, name) != 1 {
                 index += 1;
                 continue;
             }
-            if count_var_reads_in_stmts(symbols, rest, &spelled) != 1 {
+            if count_var_reads_in_stmts(rest, name) != 1 {
                 index += 1;
                 continue;
             }
             let Some(offset) = rest
                 .iter()
                 .position(|stmt| {
-                    count_var_reads_in_stmts(
-                        symbols,
-                        std::slice::from_ref(stmt),
-                        &crate::symbol::spelling(symbols, name),
-                    ) == 1
+                    count_var_reads_in_stmts(std::slice::from_ref(stmt), name) == 1
                 })
             else {
                 index += 1;
@@ -5842,7 +5219,6 @@ fn propagate_single_use_register_carriers(func: &mut CFunction, fold_ctx: &Foldi
 
 /// The carrier assigned by this statement, when it is one worth propagating.
 fn carrier_assignment(
-    symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
     stmt: &CStmt,
     fold_ctx: &FoldingContext<'_>,
     declared: &std::collections::HashSet<crate::symbol::SymbolId>,
@@ -5908,7 +5284,7 @@ fn fold_constant_arithmetic_in_stmt(
     stmt: &mut CStmt,
     strings: &std::collections::BTreeMap<u64, String>,
 ) {
-    let mut fold_expr = |expr: &mut CExpr| fold_constant_arithmetic_in_expr(expr, strings);
+    let fold_expr = |expr: &mut CExpr| fold_constant_arithmetic_in_expr(expr, strings);
     match stmt {
         CStmt::StructuredRegion { stmt, .. } => fold_constant_arithmetic_in_stmt(stmt, strings),
         CStmt::Observed { stmt, .. } => fold_constant_arithmetic_in_stmt(stmt, strings),
@@ -6074,27 +5450,29 @@ fn fold_constant_arithmetic_in_expr(
 }
 
 /// How many times `name` is read across these statements.
-fn count_var_reads_in_stmts(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, stmts: &[CStmt], name: &str,
-) -> usize {
+fn count_var_reads_in_stmts(stmts: &[CStmt], name: crate::symbol::SymbolId) -> usize {
     let mut reads = 0;
     for stmt in stmts {
-        count_var_reads_in_stmt(symbols, stmt, name, &mut reads);
+        count_var_reads_in_stmt(stmt, name, &mut reads);
     }
     reads
 }
 
-fn count_var_reads_in_stmt(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, stmt: &CStmt, name: &str, reads: &mut usize,
+fn count_var_reads_in_stmt(
+    stmt: &CStmt,
+    name: crate::symbol::SymbolId,
+    reads: &mut usize,
 ) {
-    let mut count_expr = |expr: &CExpr, reads: &mut usize| {
+    let count_expr = |expr: &CExpr, reads: &mut usize| {
         expr.visit(&mut |node| {
-            if matches!(node, CExpr::Var(found) if crate::symbol::spelling(symbols, *found).eq_ignore_ascii_case(name)) {
+            if matches!(node, CExpr::Var(found) if *found == name) {
                 *reads += 1;
             }
         });
     };
     match stmt {
-        CStmt::StructuredRegion { stmt, .. } => count_var_reads_in_stmt(symbols, stmt, name, reads),
-        CStmt::Observed { stmt, .. } => count_var_reads_in_stmt(symbols, stmt, name, reads),
+        CStmt::StructuredRegion { stmt, .. } => count_var_reads_in_stmt(stmt, name, reads),
+        CStmt::Observed { stmt, .. } => count_var_reads_in_stmt(stmt, name, reads),
         CStmt::Empty
         | CStmt::Break
         | CStmt::Continue
@@ -6114,7 +5492,7 @@ fn count_var_reads_in_stmt(symbols: &std::cell::RefCell<crate::symbol::SymbolTab
         }
         CStmt::Block(stmts) => {
             for stmt in stmts {
-                count_var_reads_in_stmt(symbols, stmt, name, reads);
+                count_var_reads_in_stmt(stmt, name, reads);
             }
         }
         CStmt::If {
@@ -6123,14 +5501,14 @@ fn count_var_reads_in_stmt(symbols: &std::cell::RefCell<crate::symbol::SymbolTab
             else_body,
         } => {
             count_expr(cond, reads);
-            count_var_reads_in_stmt(symbols, then_body, name, reads);
+            count_var_reads_in_stmt(then_body, name, reads);
             if let Some(else_body) = else_body {
-                count_var_reads_in_stmt(symbols, else_body, name, reads);
+                count_var_reads_in_stmt(else_body, name, reads);
             }
         }
         CStmt::While { cond, body } | CStmt::DoWhile { body, cond } => {
             count_expr(cond, reads);
-            count_var_reads_in_stmt(symbols, body, name, reads);
+            count_var_reads_in_stmt(body, name, reads);
         }
         CStmt::For {
             init,
@@ -6139,7 +5517,7 @@ fn count_var_reads_in_stmt(symbols: &std::cell::RefCell<crate::symbol::SymbolTab
             body,
         } => {
             if let Some(init) = init {
-                count_var_reads_in_stmt(symbols, init, name, reads);
+                count_var_reads_in_stmt(init, name, reads);
             }
             if let Some(cond) = cond {
                 count_expr(cond, reads);
@@ -6147,7 +5525,7 @@ fn count_var_reads_in_stmt(symbols: &std::cell::RefCell<crate::symbol::SymbolTab
             if let Some(update) = update {
                 count_expr(update, reads);
             }
-            count_var_reads_in_stmt(symbols, body, name, reads);
+            count_var_reads_in_stmt(body, name, reads);
         }
         CStmt::Switch {
             expr,
@@ -6157,12 +5535,12 @@ fn count_var_reads_in_stmt(symbols: &std::cell::RefCell<crate::symbol::SymbolTab
             count_expr(expr, reads);
             for case in cases {
                 for stmt in &case.body {
-                    count_var_reads_in_stmt(symbols, stmt, name, reads);
+                    count_var_reads_in_stmt(stmt, name, reads);
                 }
             }
             if let Some(default) = default {
                 for stmt in default {
-                    count_var_reads_in_stmt(symbols, stmt, name, reads);
+                    count_var_reads_in_stmt(stmt, name, reads);
                 }
             }
         }
@@ -6304,72 +5682,6 @@ fn substitute_var_in_expr(expr: &mut CExpr, name: crate::symbol::SymbolId, value
 
 
 
-fn rewrite_stack_synonym_uses_to_declared_locals(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
-    func: &mut CFunction,
-    fold_ctx: &FoldingContext<'_>,
-) {
-    let declared_names = func
-        .params
-        .iter()
-        .map(|param| crate::symbol::spelling(symbols, param.name).to_ascii_lowercase())
-        .chain(
-            func.locals
-                .iter()
-                .map(|local| crate::symbol::spelling(symbols, local.name).to_ascii_lowercase()),
-        )
-        .collect::<HashSet<_>>();
-    let local_by_offset = func
-        .locals
-        .iter()
-        .filter_map(|local| {
-            local
-                .stack_offset
-                .map(|offset| (offset, local.name.clone()))
-        })
-        .collect::<std::collections::HashMap<_, _>>();
-    let mut pointer_locals = func
-        .locals
-        .iter()
-        .filter(|local| matches!(local.ty, CType::Pointer(_)))
-        .map(|local| local.name.clone())
-        .collect::<Vec<_>>();
-    pointer_locals.sort();
-    pointer_locals.dedup();
-    let unique_pointer_local = (pointer_locals.len() == 1).then(|| pointer_locals[0].clone());
-    if local_by_offset.is_empty() && unique_pointer_local.is_none() {
-        return;
-    }
-
-    let mut rename_map = std::collections::HashMap::new();
-    for id in collect_stmt_var_names(&func.body) {
-        let name = crate::symbol::spelling(symbols, id);
-        if declared_names.contains(&name.to_ascii_lowercase()) {
-            continue;
-        }
-        let target = if let Some(offset) = fold_ctx.stack_offset_for_visible_storage_name(&name) {
-            local_by_offset.get(&offset).cloned()
-        } else if let Some(offset) = fold_ctx.loaded_stack_offset_for_visible_name(&name) {
-            local_by_offset.get(&offset).cloned()
-        } else if name.eq_ignore_ascii_case("slot") {
-            unique_pointer_local.clone()
-        } else {
-            None
-        };
-        let Some(target) = target else {
-            continue;
-        };
-        let target = crate::symbol::spelling(symbols, target);
-        if !target.eq_ignore_ascii_case(&name) {
-            rename_map.insert(name.to_ascii_lowercase(), target.to_string());
-        }
-    }
-    if rename_map.is_empty() {
-        return;
-    }
-
-    func.symbols.borrow_mut().follow_renames(&rename_map);
-}
-
 fn prune_dead_temp_assignments_in_function_body(
     func: &mut CFunction,
     fold_ctx: &FoldingContext<'_>,
@@ -6383,12 +5695,11 @@ fn prune_dead_temp_assignments_in_function_body(
 }
 
 fn normalize_redundant_return_carrier_casts(func: &mut CFunction) {
-    let symbols = &func.symbols;
-    fn visit(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, stmt: &mut CStmt, ret_type: &CType, declared_types: &HashMap<String, CType>,
+    fn visit(stmt: &mut CStmt, ret_type: &CType, declared_types: &HashMap<crate::symbol::SymbolId, CType>,
     ) {
         match stmt {
-            CStmt::StructuredRegion { stmt, .. } => visit(symbols, stmt, ret_type, declared_types),
-            CStmt::Observed { stmt, .. } => visit(symbols, stmt, ret_type, declared_types),
+            CStmt::StructuredRegion { stmt, .. } => visit(stmt, ret_type, declared_types),
+            CStmt::Observed { stmt, .. } => visit(stmt, ret_type, declared_types),
             CStmt::Return(Some(expr)) => {
                 let mut target = expr;
                 while let CExpr::Observed { expr: inner, .. } = target {
@@ -6400,16 +5711,14 @@ fn normalize_redundant_return_carrier_casts(func: &mut CFunction) {
                 let CExpr::Var(name) = inner.unobserved() else {
                     return;
                 };
-                if declared_types
-                    .get(&crate::symbol::spelling(symbols, *name).to_ascii_lowercase())
-                    .is_some_and(|ty| ty == ret_type)
+                if declared_types.get(name).is_some_and(|ty| ty == ret_type)
                 {
                     *target = *inner.clone();
                 }
             }
             CStmt::Block(stmts) => {
                 for stmt in stmts {
-                    visit(symbols, stmt, ret_type, declared_types);
+                    visit(stmt, ret_type, declared_types);
                 }
             }
             CStmt::If {
@@ -6417,29 +5726,29 @@ fn normalize_redundant_return_carrier_casts(func: &mut CFunction) {
                 else_body,
                 ..
             } => {
-                visit(symbols, then_body, ret_type, declared_types);
+                visit(then_body, ret_type, declared_types);
                 if let Some(else_body) = else_body {
-                    visit(symbols, else_body, ret_type, declared_types);
+                    visit(else_body, ret_type, declared_types);
                 }
             }
             CStmt::While { body, .. } | CStmt::DoWhile { body, .. } => {
-                visit(symbols, body, ret_type, declared_types);
+                visit(body, ret_type, declared_types);
             }
             CStmt::For { init, body, .. } => {
                 if let Some(init) = init {
-                    visit(symbols, init, ret_type, declared_types);
+                    visit(init, ret_type, declared_types);
                 }
-                visit(symbols, body, ret_type, declared_types);
+                visit(body, ret_type, declared_types);
             }
             CStmt::Switch { cases, default, .. } => {
                 for case in cases {
                     for stmt in &mut case.body {
-                        visit(symbols, stmt, ret_type, declared_types);
+                        visit(stmt, ret_type, declared_types);
                     }
                 }
                 if let Some(default) = default {
                     for stmt in default {
-                        visit(symbols, stmt, ret_type, declared_types);
+                        visit(stmt, ret_type, declared_types);
                     }
                 }
             }
@@ -6458,20 +5767,14 @@ fn normalize_redundant_return_carrier_casts(func: &mut CFunction) {
     let declared_types = func
         .params
         .iter()
-        .map(|param| {
-            (crate::symbol::spelling(symbols, param.name).to_ascii_lowercase(), param.ty.clone(),
-            )
-        })
+        .map(|param| (param.name, param.ty.clone()))
         .chain(
             func.locals
                 .iter()
-                .map(|local| {
-            (crate::symbol::spelling(symbols, local.name).to_ascii_lowercase(), local.ty.clone(),
-            )
-        }))
+                .map(|local| (local.name, local.ty.clone())))
         .collect::<HashMap<_, _>>();
     for stmt in &mut func.body {
-        visit(symbols, stmt, &func.ret_type, &declared_types);
+        visit(stmt, &func.ret_type, &declared_types);
     }
 }
 
@@ -6610,51 +5913,46 @@ fn normalize_comparison_operand_order(func: &mut CFunction) {
     }
 }
 
-/// Key under which the function's own return type rides in the declared-type
-/// map. A local cannot be called this, so it cannot collide with one.
-const RETURN_TYPE_KEY: &str = "\u{0}return";
-
 fn normalize_declared_assignment_literals(func: &mut CFunction) {
-    let symbols = &func.symbols;
-    fn visit_expr(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, expr: &mut CExpr, declared_types: &HashMap<String, CType>,
+    fn visit_expr(expr: &mut CExpr, declared_types: &HashMap<crate::symbol::SymbolId, CType>,
     ) {
         match expr {
-            CExpr::Observed { expr, .. } => visit_expr(symbols, expr, declared_types),
+            CExpr::Observed { expr, .. } => visit_expr(expr, declared_types),
             CExpr::Unary { operand, .. }
             | CExpr::Cast { expr: operand, .. }
             | CExpr::Sizeof(operand)
             | CExpr::AddrOf(operand)
             | CExpr::Deref(operand)
-            | CExpr::Paren(operand) => visit_expr(symbols, operand, declared_types),
+            | CExpr::Paren(operand) => visit_expr(operand, declared_types),
             CExpr::Binary { left, right, .. } => {
-                visit_expr(symbols, left, declared_types);
-                visit_expr(symbols, right, declared_types);
+                visit_expr(left, declared_types);
+                visit_expr(right, declared_types);
             }
             CExpr::Ternary {
                 cond,
                 then_expr,
                 else_expr,
             } => {
-                visit_expr(symbols, cond, declared_types);
-                visit_expr(symbols, then_expr, declared_types);
-                visit_expr(symbols, else_expr, declared_types);
+                visit_expr(cond, declared_types);
+                visit_expr(then_expr, declared_types);
+                visit_expr(else_expr, declared_types);
             }
             CExpr::Call { func, args, .. } => {
-                visit_expr(symbols, func, declared_types);
+                visit_expr(func, declared_types);
                 for arg in args {
-                    visit_expr(symbols, arg, declared_types);
+                    visit_expr(arg, declared_types);
                 }
             }
             CExpr::Subscript { base, index } => {
-                visit_expr(symbols, base, declared_types);
-                visit_expr(symbols, index, declared_types);
+                visit_expr(base, declared_types);
+                visit_expr(index, declared_types);
             }
             CExpr::Member { base, .. } | CExpr::PtrMember { base, .. } => {
-                visit_expr(symbols, base, declared_types);
+                visit_expr(base, declared_types);
             }
             CExpr::Comma(exprs) => {
                 for expr in exprs {
-                    visit_expr(symbols, expr, declared_types);
+                    visit_expr(expr, declared_types);
                 }
             }
             CExpr::IntLit(_)
@@ -6678,26 +5976,29 @@ fn normalize_declared_assignment_literals(func: &mut CFunction) {
         let CExpr::Var(name) = left.unobserved() else {
             return;
         };
-        if let Some(ty) = declared_types.get(&crate::symbol::spelling(symbols, *name).to_ascii_lowercase()) {
+        if let Some(ty) = declared_types.get(name) {
             normalize_literal_for_declared_type(right, ty);
         }
     }
 
-    fn visit_stmt(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, stmt: &mut CStmt, declared_types: &HashMap<String, CType>,
+    fn visit_stmt(
+        stmt: &mut CStmt,
+        declared_types: &HashMap<crate::symbol::SymbolId, CType>,
+        ret_type: &CType,
     ) {
         match stmt {
-            CStmt::StructuredRegion { stmt, .. } => visit_stmt(symbols, stmt, declared_types),
-            CStmt::Observed { stmt, .. } => visit_stmt(symbols, stmt, declared_types),
-            CStmt::Expr(expr) => visit_expr(symbols, expr, declared_types),
+            CStmt::StructuredRegion { stmt, .. } => visit_stmt(stmt, declared_types, ret_type),
+            CStmt::Observed { stmt, .. } => visit_stmt(stmt, declared_types, ret_type),
+            CStmt::Expr(expr) => visit_expr(expr, declared_types),
             CStmt::Decl { ty, init, .. } => {
                 if let Some(init) = init {
-                    visit_expr(symbols, init, declared_types);
+                    visit_expr(init, declared_types);
                     normalize_literal_for_declared_type(init, ty);
                 }
             }
             CStmt::Block(stmts) => {
                 for stmt in stmts {
-                    visit_stmt(symbols, stmt, declared_types);
+                    visit_stmt(stmt, declared_types, ret_type);
                 }
             }
             CStmt::If {
@@ -6705,15 +6006,15 @@ fn normalize_declared_assignment_literals(func: &mut CFunction) {
                 then_body,
                 else_body,
             } => {
-                visit_expr(symbols, cond, declared_types);
-                visit_stmt(symbols, then_body, declared_types);
+                visit_expr(cond, declared_types);
+                visit_stmt(then_body, declared_types, ret_type);
                 if let Some(else_body) = else_body {
-                    visit_stmt(symbols, else_body, declared_types);
+                    visit_stmt(else_body, declared_types, ret_type);
                 }
             }
             CStmt::While { cond, body } | CStmt::DoWhile { body, cond } => {
-                visit_expr(symbols, cond, declared_types);
-                visit_stmt(symbols, body, declared_types);
+                visit_expr(cond, declared_types);
+                visit_stmt(body, declared_types, ret_type);
             }
             CStmt::For {
                 init,
@@ -6722,41 +6023,39 @@ fn normalize_declared_assignment_literals(func: &mut CFunction) {
                 body,
             } => {
                 if let Some(init) = init {
-                    visit_stmt(symbols, init, declared_types);
+                    visit_stmt(init, declared_types, ret_type);
                 }
                 if let Some(cond) = cond {
-                    visit_expr(symbols, cond, declared_types);
+                    visit_expr(cond, declared_types);
                 }
                 if let Some(update) = update {
-                    visit_expr(symbols, update, declared_types);
+                    visit_expr(update, declared_types);
                 }
-                visit_stmt(symbols, body, declared_types);
+                visit_stmt(body, declared_types, ret_type);
             }
             CStmt::Switch {
                 expr,
                 cases,
                 default,
             } => {
-                visit_expr(symbols, expr, declared_types);
+                visit_expr(expr, declared_types);
                 for case in cases {
-                    visit_expr(symbols, &mut case.value, declared_types);
+                    visit_expr(&mut case.value, declared_types);
                     for stmt in &mut case.body {
-                        visit_stmt(symbols, stmt, declared_types);
+                        visit_stmt(stmt, declared_types, ret_type);
                     }
                 }
                 if let Some(default) = default {
                     for stmt in default {
-                        visit_stmt(symbols, stmt, declared_types);
+                        visit_stmt(stmt, declared_types, ret_type);
                     }
                 }
             }
             CStmt::Return(Some(expr)) => {
-                visit_expr(symbols, expr, declared_types);
+                visit_expr(expr, declared_types);
                 // A returned literal is read as the return type, so an all-ones
                 // word coming back from an `int` function is -1, not 0xffffffff.
-                if let Some(ty) = declared_types.get(RETURN_TYPE_KEY) {
-                    normalize_literal_for_declared_type(expr, ty);
-                }
+                normalize_literal_for_declared_type(expr, ret_type);
             }
             CStmt::Empty
             | CStmt::Return(None)
@@ -6768,317 +6067,17 @@ fn normalize_declared_assignment_literals(func: &mut CFunction) {
         }
     }
 
-    let mut declared_types = func
+    let declared_types = func
         .params
         .iter()
-        .map(|param| {
-            (crate::symbol::spelling(symbols, param.name).to_ascii_lowercase(), param.ty.clone(),
-            )
-        })
+        .map(|param| (param.name, param.ty.clone()))
         .chain(
             func.locals
                 .iter()
-                .map(|local| {
-            (crate::symbol::spelling(symbols, local.name).to_ascii_lowercase(), local.ty.clone(),
-            )
-        }))
+                .map(|local| (local.name, local.ty.clone())))
         .collect::<HashMap<_, _>>();
-    declared_types.insert(RETURN_TYPE_KEY.to_string(), func.ret_type.clone());
     for stmt in &mut func.body {
-        visit_stmt(symbols, stmt, &declared_types);
-    }
-}
-
-fn prune_unused_pure_locals(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, func: &mut CFunction,
-) {
-    loop {
-        let live_reads = collect_function_local_reads(symbols, func);
-        let dead_locals = func
-            .locals
-            .iter()
-            .map(|local| crate::symbol::spelling(symbols, local.name).to_ascii_lowercase())
-            .filter(|name| !live_reads.contains(name))
-            .collect::<HashSet<_>>();
-
-        if dead_locals.is_empty() {
-            break;
-        }
-
-        func.locals
-            .retain(|local| {
-            !dead_locals.contains(&crate::symbol::spelling(symbols, local.name).to_ascii_lowercase())
-        });
-        prune_unused_pure_local_stmts(symbols, &mut func.body, &dead_locals);
-    }
-}
-
-fn prune_unreferenced_local_declarations(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, func: &mut CFunction,
-) {
-    let referenced = collect_stmt_var_names(&func.body)
-        .into_iter()
-        .map(|name| crate::symbol::spelling(symbols, name).to_ascii_lowercase())
-        .collect::<HashSet<_>>();
-    func.locals
-        .retain(|local| {
-        referenced.contains(&crate::symbol::spelling(symbols, local.name).to_ascii_lowercase())
-    });
-}
-
-fn collect_function_local_reads(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, func: &CFunction,
-) -> HashSet<String> {
-    let mut reads = HashSet::new();
-    for stmt in &func.body {
-        collect_stmt_local_reads(symbols, stmt, &mut reads);
-    }
-    reads
-}
-
-fn collect_stmt_local_reads(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, stmt: &CStmt, reads: &mut HashSet<String>,
-) {
-    match stmt {
-        CStmt::StructuredRegion { stmt, .. } => collect_stmt_local_reads(symbols, stmt, reads),
-        CStmt::Observed { stmt, .. } => collect_stmt_local_reads(symbols, stmt, reads),
-        CStmt::Empty
-        | CStmt::Break
-        | CStmt::Continue
-        | CStmt::Goto(_)
-        | CStmt::Label(_)
-        | CStmt::Comment(_) => {}
-        CStmt::Expr(CExpr::Binary {
-            op: BinaryOp::Assign,
-            left,
-            right,
-        }) => {
-            if !matches!(left.unobserved(), CExpr::Var(_)) {
-                collect_expr_local_reads(symbols, left, reads);
-            }
-            collect_expr_local_reads(symbols, right, reads);
-        }
-        CStmt::Expr(expr) => collect_expr_local_reads(symbols, expr, reads),
-        CStmt::Decl { init, .. } => {
-            if let Some(init) = init {
-                collect_expr_local_reads(symbols, init, reads);
-            }
-        }
-        CStmt::Block(stmts) => {
-            for stmt in stmts {
-                collect_stmt_local_reads(symbols, stmt, reads);
-            }
-        }
-        CStmt::If {
-            cond,
-            then_body,
-            else_body,
-        } => {
-            collect_expr_local_reads(symbols, cond, reads);
-            collect_stmt_local_reads(symbols, then_body, reads);
-            if let Some(else_body) = else_body {
-                collect_stmt_local_reads(symbols, else_body, reads);
-            }
-        }
-        CStmt::While { cond, body } => {
-            collect_expr_local_reads(symbols, cond, reads);
-            collect_stmt_local_reads(symbols, body, reads);
-        }
-        CStmt::DoWhile { body, cond } => {
-            collect_stmt_local_reads(symbols, body, reads);
-            collect_expr_local_reads(symbols, cond, reads);
-        }
-        CStmt::For {
-            init,
-            cond,
-            update,
-            body,
-        } => {
-            if let Some(init) = init {
-                collect_stmt_local_reads(symbols, init, reads);
-            }
-            if let Some(cond) = cond {
-                collect_expr_local_reads(symbols, cond, reads);
-            }
-            if let Some(update) = update {
-                collect_expr_local_reads(symbols, update, reads);
-            }
-            collect_stmt_local_reads(symbols, body, reads);
-        }
-        CStmt::Switch {
-            expr,
-            cases,
-            default,
-        } => {
-            collect_expr_local_reads(symbols, expr, reads);
-            for case in cases {
-                collect_expr_local_reads(symbols, &case.value, reads);
-                for stmt in &case.body {
-                    collect_stmt_local_reads(symbols, stmt, reads);
-                }
-            }
-            if let Some(default) = default {
-                for stmt in default {
-                    collect_stmt_local_reads(symbols, stmt, reads);
-                }
-            }
-        }
-        CStmt::Return(Some(expr)) => collect_expr_local_reads(symbols, expr, reads),
-        CStmt::Return(None) => {}
-    }
-}
-
-fn collect_expr_local_reads(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, expr: &CExpr, reads: &mut HashSet<String>,
-) {
-    match expr {
-        CExpr::Observed { expr, .. } => collect_expr_local_reads(symbols, expr, reads),
-        CExpr::Var(name) => {
-            reads.insert(crate::symbol::spelling(symbols, *name).to_ascii_lowercase());
-        }
-        // Reading an intrinsic is not reading a local.
-        CExpr::External { .. } => {}
-        CExpr::Paren(inner)
-        | CExpr::AddrOf(inner)
-        | CExpr::Deref(inner)
-        | CExpr::Cast { expr: inner, .. }
-        | CExpr::Unary { operand: inner, .. }
-        | CExpr::Sizeof(inner) => collect_expr_local_reads(symbols, inner, reads),
-        // A plain name on the left of an assignment is written, not read, wherever
-        // the assignment sits. The statement form already said so; a comma inside
-        // a condition holds the same store and has to answer the same way.
-        CExpr::Binary {
-            op: BinaryOp::Assign,
-            left,
-            right,
-        } if matches!(left.unobserved(), CExpr::Var(_)) => {
-            collect_expr_local_reads(symbols, right, reads);
-        }
-        CExpr::Binary { left, right, .. } => {
-            collect_expr_local_reads(symbols, left, reads);
-            collect_expr_local_reads(symbols, right, reads);
-        }
-        CExpr::Subscript { base, index } => {
-            collect_expr_local_reads(symbols, base, reads);
-            collect_expr_local_reads(symbols, index, reads);
-        }
-        CExpr::Member { base, .. } | CExpr::PtrMember { base, .. } => {
-            collect_expr_local_reads(symbols, base, reads);
-        }
-        CExpr::Call { func, args, .. } => {
-            collect_expr_local_reads(symbols, func, reads);
-            for arg in args {
-                collect_expr_local_reads(symbols, arg, reads);
-            }
-        }
-        CExpr::Ternary {
-            cond,
-            then_expr,
-            else_expr,
-        } => {
-            collect_expr_local_reads(symbols, cond, reads);
-            collect_expr_local_reads(symbols, then_expr, reads);
-            collect_expr_local_reads(symbols, else_expr, reads);
-        }
-        CExpr::Comma(items) => {
-            for item in items {
-                collect_expr_local_reads(symbols, item, reads);
-            }
-        }
-        CExpr::IntLit(_)
-        | CExpr::UIntLit(_)
-        | CExpr::FloatLit(_)
-        | CExpr::StringLit(_)
-        | CExpr::CharLit(_)
-        | CExpr::SizeofType(_) => {}
-    }
-}
-
-fn prune_unused_pure_local_stmts(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, stmts: &mut Vec<CStmt>, dead_locals: &HashSet<String>,
-) {
-    for stmt in stmts.iter_mut() {
-        prune_unused_pure_local_stmt(symbols, stmt, dead_locals);
-    }
-    stmts.retain(|stmt| !matches!(stmt, CStmt::Empty));
-}
-
-fn prune_unused_pure_local_stmt(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, stmt: &mut CStmt, dead_locals: &HashSet<String>,
-) {
-    match stmt {
-        CStmt::StructuredRegion { stmt: inner, .. } => {
-            prune_unused_pure_local_stmt(symbols, inner, dead_locals);
-            if matches!(inner.as_ref(), CStmt::Empty) {
-                *stmt = CStmt::Empty;
-            }
-        }
-        CStmt::Observed { stmt: inner, .. } => {
-            let drops_dead_declaration = matches!(inner.unobserved(), CStmt::Decl { name, init: Some(init), .. }
-                if dead_locals.contains(
-                    &crate::symbol::spelling(symbols, *name).to_ascii_lowercase()
-                ) && !expr_is_pure_for_dead_local_prune(init));
-            prune_unused_pure_local_stmt(symbols, inner, dead_locals);
-            if matches!(inner.as_ref(), CStmt::Empty) {
-                *stmt = CStmt::Empty;
-            } else if drops_dead_declaration {
-                *stmt = std::mem::replace(inner.as_mut(), CStmt::Empty);
-            }
-        }
-        CStmt::Expr(expr) => {
-            if let CExpr::Binary {
-                op: BinaryOp::Assign,
-                left,
-                right,
-            } = expr.unobserved()
-                && let CExpr::Var(name) = left.unobserved()
-                && dead_locals
-                    .contains(&crate::symbol::spelling(symbols, *name).to_ascii_lowercase())
-                && expr_is_pure_for_dead_local_prune(right)
-            {
-                *stmt = CStmt::Empty;
-            }
-        }
-        CStmt::Decl { name, init, .. } => {
-            if dead_locals.contains(&crate::symbol::spelling(symbols, *name).to_ascii_lowercase()) {
-                match init.take() {
-                    Some(expr) if !expr_is_pure_for_dead_local_prune(&expr) => {
-                        *stmt = CStmt::Expr(expr);
-                    }
-                    _ => {
-                        *stmt = CStmt::Empty;
-                    }
-                }
-            }
-        }
-        CStmt::Block(stmts) => prune_unused_pure_local_stmts(symbols, stmts, dead_locals),
-        CStmt::If {
-            then_body,
-            else_body,
-            ..
-        } => {
-            prune_unused_pure_local_stmt(symbols, then_body, dead_locals);
-            if let Some(else_body) = else_body {
-                prune_unused_pure_local_stmt(symbols, else_body, dead_locals);
-            }
-        }
-        CStmt::While { body, .. } | CStmt::DoWhile { body, .. } => {
-            prune_unused_pure_local_stmt(symbols, body, dead_locals);
-        }
-        CStmt::For { init, body, .. } => {
-            if let Some(init) = init {
-                prune_unused_pure_local_stmt(symbols, init, dead_locals);
-            }
-            prune_unused_pure_local_stmt(symbols, body, dead_locals);
-        }
-        CStmt::Switch { cases, default, .. } => {
-            for case in cases {
-                prune_unused_pure_local_stmts(symbols, &mut case.body, dead_locals);
-            }
-            if let Some(default) = default {
-                prune_unused_pure_local_stmts(symbols, default, dead_locals);
-            }
-        }
-        CStmt::Empty
-        | CStmt::Return(_)
-        | CStmt::Break
-        | CStmt::Continue
-        | CStmt::Goto(_)
-        | CStmt::Label(_)
-        | CStmt::Comment(_) => {}
+        visit_stmt(stmt, &declared_types, &func.ret_type);
     }
 }
 
@@ -7314,8 +6313,6 @@ mod tests {
             external_stack_vars: Box::leak(Box::new(HashMap::new())),
             visible_bindings: Box::leak(Box::new(Vec::new())),
             external_type_db: Box::leak(Box::new(ExternalTypeDb::default())),
-            param_register_aliases: Box::leak(Box::new(HashMap::new())),
-            type_hints: Box::leak(Box::new(HashMap::new())),
             type_oracle: None,
             function_return_type: None,
             prepared_ssa: None,
@@ -7411,51 +6408,6 @@ mod tests {
         assert!(comment.contains("false_target=loc_1004"));
     }
 
-    #[test]
-    fn runtime_type_hints_prefer_canonical_typed_pointer_over_inferred_void_pointer() {
-        let mut hints = HashMap::from([("buf".to_string(), CType::Pointer(Box::new(CType::Void)))]);
-        merge_runtime_type_hints(
-            &mut hints,
-            HashMap::from([("buf".to_string(), CType::Pointer(Box::new(CType::Int(8))))]),
-        );
-
-        assert_eq!(
-            hints.get("buf"),
-            Some(&CType::Pointer(Box::new(CType::Int(8))))
-        );
-        assert_eq!(
-            choose_more_specific_runtime_type(
-                CType::Pointer(Box::new(CType::Void)),
-                hints.get("buf")
-            ),
-            CType::Pointer(Box::new(CType::Int(8)))
-        );
-    }
-
-    #[test]
-    fn runtime_type_hints_preserve_same_width_canonical_signedness() {
-        assert_eq!(
-            choose_more_specific_runtime_type(CType::Int(8), Some(&CType::UInt(8))),
-            CType::UInt(8)
-        );
-        assert_eq!(
-            choose_more_specific_runtime_type(CType::UInt(8), Some(&CType::Int(8))),
-            CType::Int(8)
-        );
-    }
-
-    #[test]
-    fn runtime_type_hints_prefer_canonical_narrow_integer_over_carrier_width() {
-        assert_eq!(
-            choose_more_specific_runtime_type(CType::Int(64), Some(&CType::UInt(8))),
-            CType::UInt(8)
-        );
-        assert_eq!(
-            choose_more_specific_runtime_type(CType::UInt(64), Some(&CType::Int(16))),
-            CType::Int(16)
-        );
-    }
-
     fn prepared_from_ops(ops: Vec<R2ILOp>, arch: &ArchSpec) -> r2ssa::SsaArtifact {
         let mut block = R2ILBlock::new(0x1000, 4);
         for op in ops {
@@ -7524,46 +6476,6 @@ mod tests {
         arch.add_register(RegisterDef::new("RSP", 0x28, 8));
         arch.add_register(RegisterDef::new("RIP", 0x30, 8));
         arch
-    }
-
-    #[test]
-    fn param_register_aliases_keep_abi_order_over_misaligned_external_regs() {
-        let symbols = test_table();
-        let params = vec![
-            ast::CParam {
-                ty: CType::Pointer(Box::new(CType::Int(32))),
-                name: crate::symbol::declare(&symbols, "arr"),
-            },
-            ast::CParam {
-                ty: CType::Int(32),
-                name: crate::symbol::declare(&symbols, "len"),
-            },
-        ];
-        let register_params = vec![
-            ExternalRegisterParamSpec {
-                name: "al".to_string(),
-                ty: Some(CTypeLike::Typedef("int32_t".to_string())),
-                reg: "AL".to_string(),
-            },
-            ExternalRegisterParamSpec {
-                name: "rdi".to_string(),
-                ty: Some(CTypeLike::Pointer(Box::new(CTypeLike::Typedef(
-                    "int32_t".to_string(),
-                )))),
-                reg: "rdi".to_string(),
-            },
-        ];
-        let aliases = build_param_register_aliases(&symbols, 
-            &params,
-            &[],
-            &register_params,
-            &["rdi".to_string(), "rsi".to_string()],
-            true,
-        );
-
-        assert_eq!(aliases.get("rdi").map(String::as_str), Some("arr"));
-        assert_eq!(aliases.get("edi").map(String::as_str), Some("arr"));
-        assert_eq!(aliases.get("rsi").map(String::as_str), Some("len"));
     }
 
     fn signature_spec(
@@ -7731,90 +6643,6 @@ mod tests {
     }
 
     #[test]
-    fn authoritative_external_signature_can_shrink_recovered_header_params() {
-        let symbols = test_table();
-        let recovered = vec![
-            ast::CParam {
-                ty: CType::Int(32),
-                name: crate::symbol::declare(&symbols, "arg1"),
-            },
-            ast::CParam {
-                ty: CType::Int(32),
-                name: crate::symbol::declare(&symbols, "arg2"),
-            },
-            ast::CParam {
-                ty: CType::Int(32),
-                name: crate::symbol::declare(&symbols, "arg3"),
-            },
-        ];
-        let signature = signature_spec(
-            Some(CType::Pointer(Box::new(CType::Int(8)))),
-            vec![
-                ("src", Some(CType::Pointer(Box::new(CType::Int(8))))),
-                ("len", Some(CType::UInt(64))),
-            ],
-        );
-
-        let params = merge_params_with_external_signature(&symbols, recovered, Some(&signature));
-        assert_eq!(
-            params.len(),
-            2,
-            "typed/named external signature should be authoritative for the visible header"
-        );
-        assert_eq!(params[0].name, crate::symbol::declare(&symbols, "src"));
-        assert_eq!(params[1].name, crate::symbol::declare(&symbols, "len"));
-        assert!(matches!(params[1].ty, CType::UInt(64)));
-    }
-
-    #[test]
-    fn generic_external_signature_still_owns_header_arity() {
-        let symbols = test_table();
-        let recovered = vec![
-            ast::CParam {
-                ty: CType::Int(32),
-                name: crate::symbol::declare(&symbols, "arg1"),
-            },
-            ast::CParam {
-                ty: CType::Int(32),
-                name: crate::symbol::declare(&symbols, "arg2"),
-            },
-            ast::CParam {
-                ty: CType::Int(32),
-                name: crate::symbol::declare(&symbols, "arg3"),
-            },
-        ];
-        let signature = signature_spec(None, vec![("arg1", None), ("arg2", None)]);
-
-        let params = merge_params_with_external_signature(&symbols, recovered, Some(&signature));
-        assert_eq!(
-            params.len(),
-            2,
-            "certified signature arity must be the visible header authority even when generic"
-        );
-        assert!(
-            params.iter().all(|param| param.name != crate::symbol::declare(&symbols, "arg3")),
-            "local recovery must not append surplus header params beyond FunctionFacts signature"
-        );
-    }
-
-    #[test]
-    fn external_signature_can_extend_empty_recovered_header_params() {
-        let symbols = test_table();
-        let signature = signature_spec(
-            None,
-            vec![
-                ("buf", Some(CType::Pointer(Box::new(CType::Int(8))))),
-                ("count", Some(CType::UInt(64))),
-            ],
-        );
-
-        let params = merge_params_with_external_signature(&symbols, Vec::new(), Some(&signature));
-        assert_eq!(params.len(), 2);
-        assert_eq!(params[0].name, crate::symbol::declare(&symbols, "buf"));
-        assert_eq!(params[1].name, crate::symbol::declare(&symbols, "count"));
-    }
-
-    #[test]
     fn redundant_return_carrier_cast_yields_to_declared_c_type() {
         let symbols = test_table();
         let mut func = CFunction::new("carrier", CType::Int(32)).with_body(vec![CStmt::if_stmt(
@@ -7924,76 +6752,6 @@ mod tests {
             function.body,
             vec![CStmt::Return(Some(CExpr::StringLit("text".to_string())))]
         );
-    }
-
-    #[test]
-    fn unreferenced_local_declaration_is_removed_without_touching_live_locals() {
-        let symbols = test_table();
-        let mut func = CFunction::new("locals", CType::Int(32))
-            .with_body(vec![CStmt::Return(Some(CExpr::var(crate::symbol::declare(&symbols, "live"))),
-        )]);
-        func.locals = vec![
-            ast::CLocal {
-                ty: CType::Int(32),
-                name: crate::symbol::declare(&symbols, "dead_return_slot"),
-                stack_offset: Some(-4),
-            },
-            ast::CLocal {
-                ty: CType::Int(32),
-                name: crate::symbol::declare(&symbols, "live"),
-                stack_offset: Some(-8),
-            },
-        ];
-        func.symbols = std::rc::Rc::new(symbols);
-
-        prune_unreferenced_local_declarations(&func.symbols.clone(), &mut func);
-
-        assert_eq!(func.locals.len(), 1);
-        assert_eq!(func.symbols.borrow().name(func.locals[0].name), "live");
-    }
-
-    #[test]
-    fn dead_declaration_drops_write_marker_but_keeps_impure_initializer_marker() {
-        let symbols = test_table();
-        let dead = crate::symbol::declare(&symbols, "dead");
-        let mut observations = crate::ast::RenderObservationOwner::new();
-        let (initializer_id, initializer) = observations
-            .observe_expr(CExpr::call(
-                CExpr::External {
-                    name: "effect".to_string(),
-                    kind: crate::symbol::ExternalKind::Function,
-                },
-                Vec::new(),
-            ))
-            .expect("initializer observation");
-        let (write_id, declaration) = observations
-            .observe_stmt(CStmt::Decl {
-                ty: CType::Int(32),
-                name: dead,
-                init: Some(initializer),
-            })
-            .expect("declaration write observation");
-        let mut func = CFunction::new("dead_init", CType::Void).with_body(vec![declaration]);
-        func.locals.push(ast::CLocal {
-            ty: CType::Int(32),
-            name: dead,
-            stack_offset: None,
-        });
-        func.symbols = std::rc::Rc::new(symbols);
-
-        prune_unused_pure_locals(&func.symbols.clone(), &mut func);
-
-        assert!(func.locals.is_empty());
-        let reachable = crate::ast::strip_render_observations(
-            &mut func,
-            observations.expected_count())
-        .expect("remaining marker domain is valid");
-        assert!(reachable.contains(initializer_id));
-        assert!(!reachable.contains(write_id));
-        assert!(matches!(
-            func.body.as_slice(),
-            [CStmt::Expr(CExpr::Call { .. })]
-        ));
     }
 
     #[test]

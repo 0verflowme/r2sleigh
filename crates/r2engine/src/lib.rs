@@ -5290,6 +5290,18 @@ fn render_refusal_reason(refusal: DecompileRenderRefusal) -> &'static str {
         DecompileRenderRefusal::MissingMachineProjectionAuthorization => {
             "native rendering refused: missing machine projection authorization"
         }
+        DecompileRenderRefusal::MissingProgramVariableAuthorization => {
+            "native rendering refused: missing program-variable authorization"
+        }
+        DecompileRenderRefusal::NormalizationOriginUnavailable => {
+            "native rendering refused: normalization origin unavailable"
+        }
+        DecompileRenderRefusal::UnrepresentableControlFlow => {
+            "native rendering refused: unrepresentable control flow"
+        }
+        DecompileRenderRefusal::IncompleteEffectInventory => {
+            "native rendering refused: incomplete effect inventory"
+        }
         DecompileRenderRefusal::UnrepresentableOperation => {
             "native rendering refused: unrepresentable operation"
         }

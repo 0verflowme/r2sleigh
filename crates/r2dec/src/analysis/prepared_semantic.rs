@@ -10,9 +10,11 @@ use r2ssa::{
 use r2ssa::SSAVarNameKind;
 use r2types::{
     CalleeIdentity, CalleeResolutionFacts, CalleeTargetIdentityRequest, CallsiteKey,
-    ExternalStackBase, ExternalStackSlotRole, ExternalStackSlotSpec, FunctionCallResultFacts,
-    FunctionCallsiteFacts, FunctionFacts, StackSlotKey, VisibleBinding, VisibleBindingKind,
+    ExternalStackSlotSpec, FunctionCallResultFacts, FunctionCallsiteFacts, FunctionFacts,
+    StackSlotKey, VisibleBinding, VisibleBindingKind,
 };
+#[cfg(test)]
+use r2types::{ExternalStackBase, ExternalStackSlotRole};
 
 use super::lower::LowerCtx;
 use super::{
@@ -53,6 +55,7 @@ pub(crate) struct PreparedSemanticView {
     /// the resolver itself avoids a second ValueId/name table that could drift
     /// from the sealed binding plan.
     pub(crate) binding_names: Option<Rc<crate::binding_plan::BindingNameResolution>>,
+    #[cfg(test)]
     pub(crate) stack_aliases_by_offset: BTreeMap<i64, StackAliasView>,
     #[cfg(test)]
     pub(crate) param_alias_by_reg: HashMap<String, String>,
@@ -72,7 +75,9 @@ pub(crate) struct PreparedSemanticView {
     /// these: the offset reaches a field, and its stride is not an element size.
     pub(crate) member_projected_accesses: HashSet<(u64, u32)>,
     pub(crate) certified_rendering_required: bool,
+    #[cfg(test)]
     pub(crate) authorized_stack_owner_names: BTreeMap<i64, BTreeSet<String>>,
+    #[cfg(test)]
     pub(crate) authorized_stack_owner_names_by_object:
         BTreeMap<(r2ssa::ObjectId, i64), BTreeSet<String>>,
     pub(crate) certified_loop_carrier_values: BTreeSet<ValueId>,
@@ -220,8 +225,10 @@ impl PreparedSemanticView {
         };
         view.init_value_indexes(inputs.prepared);
 
+        #[cfg(test)]
         populate_stack_aliases(&mut view, &inputs);
         populate_stack_offsets(&mut view, inputs.prepared);
+        #[cfg(test)]
         populate_authorized_stack_owner_names(&mut view, &inputs);
         populate_owner_exprs(symbols, &mut view, &inputs);
         populate_call_result_sources(&mut view, inputs.call_result_facts());
@@ -231,6 +238,7 @@ impl PreparedSemanticView {
         view
     }
 
+    #[cfg(test)]
     pub(crate) fn stack_alias_for_offset(&self, offset: i64) -> Option<&StackAliasView> {
         self.stack_aliases_by_offset.get(&offset)
     }
@@ -247,10 +255,11 @@ impl PreparedSemanticView {
     fn admitted_value_symbol(&self, var: &SSAVar) -> Option<crate::symbol::SymbolId> {
         let resolver = self.binding_names.as_ref()?;
         let value = self.value_id_for_var(var)?;
-        match resolver
-            .require_value(value)
-            .expect("rendered identity was admitted before semantic analysis")
-        {
+        let disposition = match resolver.require_value(value) {
+            Ok(disposition) => disposition,
+            Err(_) => return None,
+        };
+        match disposition {
             PlannedValueSymbol::Bound(symbol) => Some(symbol),
             PlannedValueSymbol::Inline(_)
             | PlannedValueSymbol::Elided(_)
@@ -271,12 +280,15 @@ impl PreparedSemanticView {
             .decompile_prep_facts()?
             .formal_parameter_of(var)?;
         let slot = u32::try_from(slot).ok()?;
-        match self
+        let disposition = match self
             .binding_names
             .as_ref()?
             .require_parameter_slot(slot)
-            .expect("formal parameter identity was admitted before semantic analysis")
         {
+            Ok(disposition) => disposition,
+            Err(_) => return None,
+        };
+        match disposition {
             PlannedParameterSymbol::Bound { symbol, .. } => Some(symbol),
             PlannedParameterSymbol::Refused(_) | PlannedParameterSymbol::Absent => None,
         }
@@ -287,10 +299,11 @@ impl PreparedSemanticView {
     fn admitted_stack_symbol(&self, object: r2ssa::ObjectId) -> Option<crate::symbol::SymbolId> {
         let resolver = self.binding_names.as_ref()?;
         let _ = resolver.plan().stack_object_disposition(object)?;
-        match resolver
-            .require_stack(object)
-            .expect("stack identity was admitted before semantic analysis")
-        {
+        let disposition = match resolver.require_stack(object) {
+            Ok(disposition) => disposition,
+            Err(_) => return None,
+        };
+        match disposition {
             PlannedStackSymbol::Bound(symbol) => Some(symbol),
             PlannedStackSymbol::Refused(_) | PlannedStackSymbol::Absent => None,
         }
@@ -575,16 +588,13 @@ pub(crate) fn build_prepared_runtime_facts_with_control(
     control: crate::DecompileWorkControl<'_>,
 ) -> Result<DecompilerFacts, PreparedRuntimeFactsError> {
     control.poll()?;
-    let mut use_info = UseInfo {
-        #[cfg(test)]
-        type_hints: env.type_hints.clone(),
-        ..UseInfo::default()
-    };
+    let mut use_info = UseInfo::default();
     let mut flag_info = FlagInfo::default();
     let mut stack_info = StackInfo::default();
 
     seed_prepared_stack_facts(symbols, &mut use_info, &mut stack_info, prepared, view);
     collect_prepared_runtime_facts(symbols, &mut use_info, &mut flag_info, blocks, env, prepared, view);
+    #[cfg(test)]
     pin_prepared_loop_carried_phi_values(&mut use_info, prepared, view);
     populate_prepared_call_runtime_facts(
         symbols,
@@ -607,6 +617,7 @@ pub(crate) fn build_prepared_runtime_facts_with_control(
     })
 }
 
+#[cfg(test)]
 fn pin_prepared_loop_carried_phi_values(
     use_info: &mut UseInfo,
     prepared: &SsaArtifact,
@@ -619,6 +630,7 @@ fn pin_prepared_loop_carried_phi_values(
     }
 }
 
+#[cfg(test)]
 fn pin_prepared_phi_materialized_var(use_info: &mut UseInfo, var: &SSAVar) {
     if var.is_const() || var.is_temp() || use_info.names_a_flag(&var.name) {
         return;
@@ -649,8 +661,6 @@ fn populate_prepared_render_definitions(symbols: &std::cell::RefCell<crate::symb
                     string_literals: crate::analysis::lower::no_string_literals(),
                     use_info: Some(use_info),
                     pinned: &use_info.pinned,
-                    #[cfg(test)]
-                    type_hints: &use_info.type_hints,
                     type_oracle: env.type_oracle,
                 };
                 match lower.op_to_expr(op) {
@@ -857,6 +867,7 @@ fn is_self_render_definition_for_value(
     }
 }
 
+#[cfg(test)]
 fn populate_stack_aliases(
     view: &mut PreparedSemanticView,
     inputs: &PreparedSemanticViewInputs<'_>,
@@ -902,6 +913,7 @@ fn populate_stack_aliases(
     }
 }
 
+#[cfg(test)]
 fn prepared_stack_slot_offset(slot: &StackSlotKey) -> i64 {
     match slot.base {
         ExternalStackBase::FramePointer => slot.offset.saturating_abs().saturating_neg(),
@@ -909,6 +921,7 @@ fn prepared_stack_slot_offset(slot: &StackSlotKey) -> i64 {
     }
 }
 
+#[cfg(test)]
 fn record_authorized_stack_owner_name(
     view: &mut PreparedSemanticView,
     function_facts: &FunctionFacts,
@@ -941,6 +954,7 @@ fn record_authorized_stack_owner_name(
     }
 }
 
+#[cfg(test)]
 fn populate_authorized_stack_owner_names(
     view: &mut PreparedSemanticView,
     inputs: &PreparedSemanticViewInputs<'_>,
@@ -1020,17 +1034,18 @@ fn populate_owner_exprs(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>
         }
     }
 
-    for (value, offset) in view.stack_offset_entries() {
+    for (value, _offset) in view.stack_offset_entries() {
         if !is_prepared_stack_address_carrier(prepared, &value) {
+            continue;
+        }
+        if prepared_stack_object_for_var(prepared, &value).is_none() {
             continue;
         }
         let Some(stack_expr) = prepared_stack_program_expr_for_var(symbols, view, prepared, &value)
         else {
             continue;
         };
-        if prepared_stack_owner_offset_authorized(view, offset) {
-            view.insert_owner_expr(&value, CExpr::AddrOf(Box::new(stack_expr)));
-        }
+        view.insert_owner_expr(&value, CExpr::AddrOf(Box::new(stack_expr)));
     }
 
     for block in prepared.function().blocks() {
@@ -1350,6 +1365,12 @@ fn prepared_load_owner_candidate_should_replace(symbols: &std::cell::RefCell<cra
 }
 
 fn prepared_expr_is_generic_scalar_alias(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, expr: &CExpr) -> bool {
+    #[cfg(not(test))]
+    {
+        let _ = (symbols, expr);
+        return false;
+    }
+    #[cfg(test)]
     match expr {
         CExpr::Var(name) => is_generic_prepared_stack_alias(&crate::symbol::spelling(symbols, *name)) || crate::symbol::spelling(symbols, *name).ends_with("_home"),
         CExpr::Paren(inner) | CExpr::Cast { expr: inner, .. } => {
@@ -2236,11 +2257,19 @@ fn prepared_stack_owner_recovery_allowed(
 }
 
 fn prepared_stack_owner_offset_authorized(view: &PreparedSemanticView, offset: i64) -> bool {
-    !view.certified_rendering_required
-        || view
-            .authorized_stack_owner_names
-            .get(&offset)
-            .is_some_and(|names| !names.is_empty())
+    #[cfg(test)]
+    {
+        return !view.certified_rendering_required
+            || view
+                .authorized_stack_owner_names
+                .get(&offset)
+                .is_some_and(|names| !names.is_empty());
+    }
+    #[cfg(not(test))]
+    {
+        let _ = (view, offset);
+        false
+    }
 }
 
 #[cfg(test)]
@@ -2248,7 +2277,7 @@ fn prepared_stack_alias_name_for_object_offset(
     symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
     view: &PreparedSemanticView,
     object: r2ssa::ObjectId,
-    offset: i64,
+    _offset: i64,
 ) -> Option<String> {
     let authorized = view
         .authorized_stack_owner_names_by_object
@@ -2277,34 +2306,22 @@ fn prepared_stack_program_expr_for_object_offset(
     object: r2ssa::ObjectId,
     offset: i64,
 ) -> Option<CExpr> {
-    let _ = view
-        .authorized_stack_owner_names_by_object
-        .get(&(object, offset))?;
     if view.binding_names.is_some() {
         return view.admitted_stack_symbol(object).map(CExpr::Var);
     }
     #[cfg(test)]
     {
+        let _ = view
+            .authorized_stack_owner_names_by_object
+            .get(&(object, offset))?;
         prepared_stack_alias_name_for_object_offset(symbols, view, object, offset)
             .map(|name| crate::symbol::var_ref(symbols, name))
     }
     #[cfg(not(test))]
     {
-        let _ = symbols;
+        let _ = (symbols, offset);
         None
     }
-}
-
-fn admitted_stack_object_for_offset(
-    view: &PreparedSemanticView,
-    offset: i64,
-) -> Option<r2ssa::ObjectId> {
-    let mut objects = view
-        .authorized_stack_owner_names_by_object
-        .keys()
-        .filter_map(|(object, candidate_offset)| (*candidate_offset == offset).then_some(*object));
-    let object = objects.next()?;
-    objects.next().is_none().then_some(object)
 }
 
 fn prepared_stack_object_for_var(
@@ -2358,19 +2375,17 @@ fn prepared_stack_alias_name_for_offset(
 }
 
 fn prepared_stack_alias_expr_for_offset(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, view: &PreparedSemanticView, offset: i64) -> Option<CExpr> {
-    if view.binding_names.is_some() {
-        return admitted_stack_object_for_offset(view, offset)
-            .and_then(|object| view.admitted_stack_symbol(object))
-            .map(CExpr::Var);
-    }
     #[cfg(test)]
     {
-        prepared_stack_alias_name_for_offset(view, offset)
-            .map(|name| crate::symbol::var_ref(symbols, name))
+        if view.binding_names.is_none() {
+            return prepared_stack_alias_name_for_offset(view, offset)
+                .map(|name| crate::symbol::var_ref(symbols, name));
+        }
+        None
     }
     #[cfg(not(test))]
     {
-        let _ = symbols;
+        let _ = (symbols, view, offset);
         None
     }
 }
@@ -2468,6 +2483,7 @@ fn expr_for_compare_operand_with_width(symbols: &std::cell::RefCell<crate::symbo
         return expr;
     }
 
+    #[cfg(test)]
     if preferred_non_generic_stack_alias(view, &var).is_some()
         && let Some(expr) = prepared_stack_program_expr_for_var(
             symbols,
@@ -2478,6 +2494,7 @@ fn expr_for_compare_operand_with_width(symbols: &std::cell::RefCell<crate::symbo
     {
         return expr;
     }
+    #[cfg(test)]
     if preferred_non_generic_stack_alias(view, &root).is_some()
         && let Some(expr) = prepared_stack_program_expr_for_var(
             symbols,
@@ -2996,6 +3013,7 @@ fn is_prepared_stack_address_carrier(prepared: &SsaArtifact, value: &SSAVar) -> 
         .is_some_and(|object| stack_offset_for_object_kind(&object.kind).is_some())
 }
 
+#[cfg(test)]
 fn preferred_non_generic_stack_alias(view: &PreparedSemanticView, var: &SSAVar) -> Option<String> {
     view.stack_offset_for_var(var)
         .and_then(|offset| preferred_stack_alias_name(view, offset))
@@ -3055,6 +3073,7 @@ fn prepared_fallback_visible_expr(symbols: &std::cell::RefCell<crate::symbol::Sy
     prepared_value_program_expr(symbols, view, var)
 }
 
+#[cfg(test)]
 fn local_store_owner_expr_for_offset(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
     view: &PreparedSemanticView,
     prepared: &SsaArtifact,
@@ -3099,12 +3118,26 @@ fn local_store_owner_expr_for_offset(symbols: &std::cell::RefCell<crate::symbol:
     prepared_stack_alias_expr_for_offset(symbols, view, offset)
 }
 
+#[cfg(not(test))]
+fn local_store_owner_expr_for_offset(
+    _symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
+    _view: &PreparedSemanticView,
+    _prepared: &SsaArtifact,
+    _block: &r2ssa::FunctionSSABlock,
+    _before_idx: usize,
+    _offset: i64,
+) -> Option<CExpr> {
+    None
+}
+
+#[cfg(test)]
 fn preferred_stack_alias_name(view: &PreparedSemanticView, offset: i64) -> Option<String> {
     let alias = view.stack_alias_for_offset(offset)?;
     let visible = alias.visible_name.trim();
     (!visible.is_empty()).then(|| visible.to_string())
 }
 
+#[cfg(test)]
 fn is_generic_prepared_stack_alias(name: &str) -> bool {
 
     name.starts_with("var_")
@@ -3113,6 +3146,7 @@ fn is_generic_prepared_stack_alias(name: &str) -> bool {
         || name.starts_with("arg_")
 }
 
+#[cfg(test)]
 fn prepared_stack_visible_name(slot: &ExternalStackSlotSpec) -> Option<String> {
     (!slot.name.is_empty()
         && matches!(
@@ -3124,6 +3158,7 @@ fn prepared_stack_visible_name(slot: &ExternalStackSlotSpec) -> Option<String> {
     .then(|| slot.name.clone())
 }
 
+#[cfg(test)]
 fn synthetic_stack_name(offset: i64) -> String {
     if offset < 0 {
         format!("local_{:x}", (-offset) as u64)
@@ -3134,17 +3169,20 @@ fn synthetic_stack_name(offset: i64) -> String {
 
 fn seed_prepared_stack_facts(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
     use_info: &mut UseInfo,
-    stack_info: &mut StackInfo,
+    _stack_info: &mut StackInfo,
     prepared: &SsaArtifact,
     view: &PreparedSemanticView,
 ) {
+    #[cfg(not(test))]
+    let _ = symbols;
+    #[cfg(test)]
     for (offset, alias) in &view.stack_aliases_by_offset {
         if let Some(stack_expr) = prepared_stack_alias_expr_for_offset(symbols, view, *offset) {
             let CExpr::Var(stack_symbol) = stack_expr else {
                 continue;
             };
             let name = crate::symbol::spelling(symbols, stack_symbol).to_string();
-            stack_info.stack_vars.entry(*offset).or_insert(name.clone());
+            _stack_info.stack_vars.entry(*offset).or_insert(name.clone());
             let provenance = StackSlotProvenance {
                 offset: *offset,
                 predicate_carrier: false,
@@ -3155,7 +3193,7 @@ fn seed_prepared_stack_facts(symbols: &std::cell::RefCell<crate::symbol::SymbolT
                     StackSlotValueKind::Scalar
                 },
             };
-            merge_prepared_stack_slot(use_info, &name, None, provenance);
+            merge_prepared_stack_slot(use_info, None, provenance);
             if *offset < 0 {
                 use_info
                     .stable_stack_values
@@ -3182,14 +3220,13 @@ fn seed_prepared_stack_facts(symbols: &std::cell::RefCell<crate::symbol::SymbolT
         if use_info.bind_value_id(value, value_id).is_none() {
             continue;
         }
-        let key = value.display_name();
         let provenance = StackSlotProvenance {
             offset,
             predicate_carrier: false,
             return_carrier: false,
             value_kind: StackSlotValueKind::AddressLike,
         };
-        merge_prepared_stack_slot(use_info, &key, Some(value_id), provenance);
+        merge_prepared_stack_slot(use_info, Some(value_id), provenance);
         if let Some(stack_expr) = view
             .admitted_stack_symbol(*object_id)
             .map(CExpr::Var)
@@ -3205,9 +3242,10 @@ fn seed_prepared_stack_facts(symbols: &std::cell::RefCell<crate::symbol::SymbolT
                 }
             })
         {
-            stack_info
+            #[cfg(test)]
+            _stack_info
                 .definition_overrides
-                .entry(key.clone())
+                .entry(value.display_name())
                 .or_insert_with(|| CExpr::AddrOf(Box::new(stack_expr.clone())));
             if offset < 0 {
                 use_info
@@ -3221,7 +3259,7 @@ fn seed_prepared_stack_facts(symbols: &std::cell::RefCell<crate::symbol::SymbolT
 
 fn collect_prepared_runtime_facts(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
     use_info: &mut UseInfo,
-    flag_info: &mut FlagInfo,
+    _flag_info: &mut FlagInfo,
     blocks: &[SSABlock],
     env: &PassEnv<'_>,
     prepared: &SsaArtifact,
@@ -3230,18 +3268,21 @@ fn collect_prepared_runtime_facts(symbols: &std::cell::RefCell<crate::symbol::Sy
     for block in blocks {
         for phi in &block.phis {
             let _ = bind_prepared_value_id(use_info, view, &phi.dst);
-            let dst_key = phi.dst.display_name();
-            use_info.phi_sources.insert(
-                dst_key.clone(),
-                phi.sources.iter().map(|(_, src)| src.clone()).collect(),
-            );
-            use_info.producers.insert(
-                dst_key.clone(),
-                SSAOp::Phi {
-                    dst: phi.dst.clone(),
-                    sources: phi.sources.iter().map(|(_, src)| src.clone()).collect(),
-                },
-            );
+            #[cfg(test)]
+            {
+                let dst_key = phi.dst.display_name();
+                use_info.phi_sources.insert(
+                    dst_key.clone(),
+                    phi.sources.iter().map(|(_, src)| src.clone()).collect(),
+                );
+                use_info.producers.insert(
+                    dst_key,
+                    SSAOp::Phi {
+                        dst: phi.dst.clone(),
+                        sources: phi.sources.iter().map(|(_, src)| src.clone()).collect(),
+                    },
+                );
+            }
             for (_, src) in &phi.sources {
                 // Bind first, then let the one helper write both halves.
                 // Writing them here as well meant a second copy of the pairing
@@ -3264,6 +3305,7 @@ fn collect_prepared_runtime_facts(symbols: &std::cell::RefCell<crate::symbol::Sy
             // a prepared value already answered for every name, while every
             // pointer member it offered was taken because nothing else computes
             // them. So the rule moves here and the overlay goes.
+            #[cfg(test)]
             match op {
                 SSAOp::IntAdd { dst, a, b } => {
                     if let Some(offset) = crate::analysis::utils::parse_const_offset(a) {
@@ -3291,11 +3333,14 @@ fn collect_prepared_runtime_facts(symbols: &std::cell::RefCell<crate::symbol::Sy
             }
 
             if let Some(dst) = op.dst() {
-                let dst_key = dst.display_name();
                 let _ = bind_prepared_value_id(use_info, view, dst);
-                use_info.producers.insert(dst_key.clone(), op.clone());
-                if is_flag_like_name(&dst.name) || op_produces_predicate(op) {
-                    flag_info.flag_only_values.insert(dst_key.clone());
+                #[cfg(test)]
+                {
+                    let dst_key = dst.display_name();
+                    use_info.producers.insert(dst_key.clone(), op.clone());
+                    if is_flag_like_name(&dst.name) || op_produces_predicate(op) {
+                        _flag_info.flag_only_values.insert(dst_key);
+                    }
                 }
                 seed_prepared_value_fact(symbols, use_info, dst, prepared, view);
             }
@@ -3307,8 +3352,6 @@ fn collect_prepared_runtime_facts(symbols: &std::cell::RefCell<crate::symbol::Sy
                 | SSAOp::Trunc { dst, src }
                 | SSAOp::Cast { dst, src, .. }
                 | SSAOp::Subpiece { dst, src, .. } => {
-                    let dst_key = dst.display_name();
-                    let src_key = src.display_name();
                     let bound_copy = bind_prepared_copy_ids(use_info, view, dst, src);
                     let bound_dst_id = bound_copy.map(|(dst_id, _)| dst_id);
                     let bound_src_id = bound_copy.map(|(_, src_id)| src_id);
@@ -3320,7 +3363,7 @@ fn collect_prepared_runtime_facts(symbols: &std::cell::RefCell<crate::symbol::Sy
                             .forwarded_value_for_var(src)
                             .cloned()
                             .unwrap_or(ValueProvenance {
-                                source: src_key.clone(),
+                                source: src.display_name(),
                                 source_value_id: bound_src_id,
                                 source_var: Some(src.clone()),
                                 stack_slot: view
@@ -3366,7 +3409,6 @@ fn collect_prepared_runtime_facts(symbols: &std::cell::RefCell<crate::symbol::Sy
                     else {
                         continue;
                     };
-                    let key = dst.display_name();
                     let reload_value = bind_prepared_value_id(use_info, view, dst);
                     let provenance = StackSlotProvenance {
                         offset,
@@ -3374,14 +3416,10 @@ fn collect_prepared_runtime_facts(symbols: &std::cell::RefCell<crate::symbol::Sy
                         return_carrier: false,
                         value_kind: StackSlotValueKind::Scalar,
                     };
-                    merge_prepared_stack_slot(use_info, &key, reload_value, provenance);
-                    let reload_param_expr = prepared_stack_owner_offset_authorized(view, offset)
-                        .then(|| {
-                            reload_value.and_then(|value_id| {
-                                prepared_stack_reload_param_alias_expr(prepared, view, value_id)
-                            })
-                        })
-                        .flatten();
+                    merge_prepared_stack_slot(use_info, reload_value, provenance);
+                    let reload_param_expr = reload_value.and_then(|value_id| {
+                        prepared_stack_reload_param_alias_expr(prepared, view, value_id)
+                    });
                     let stack_alias_expr = prepared_stack_alias_expr_for_offset(symbols, view, offset);
                     if let Some(expr) = reload_param_expr.or(stack_alias_expr) {
                         if let Some(value_id) = reload_value {
@@ -3392,8 +3430,7 @@ fn collect_prepared_runtime_facts(symbols: &std::cell::RefCell<crate::symbol::Sy
                         } else {
                             *use_info.unkeyed_writes.entry("definitions").or_default() += 1;
                         }
-                        use_info.insert_semantic_value_for_name_and_value_if_absent(
-                            key,
+                        use_info.insert_semantic_value_for_value_if_absent(
                             reload_value,
                             SemanticValue::Scalar(ScalarValue::Expr(expr.clone())),
                         );
@@ -3464,8 +3501,9 @@ fn populate_prepared_call_runtime_facts(symbols: &std::cell::RefCell<crate::symb
 
             if let Some(call_expr) = prepared_call_expr(site, symbols, call_view, view, env) {
                 use_info.call_result_exprs.insert(site, call_expr.clone());
+                #[cfg(test)]
                 record_prepared_consumed_by_call(use_info, block, op_idx, env, prepared, view);
-                record_prepared_call_result_aliases(symbols,
+                record_prepared_call_result_facts(symbols,
                     use_info, site, prepared, view, &call_expr,
                 );
             }
@@ -3485,10 +3523,7 @@ fn overlay_prepared_switch_roots(
         use_info.switch_selector_roots.insert(
             *block_addr,
             SemanticValue::Scalar(ScalarValue::Root(
-                use_info
-                    .value_id_for_var(selector)
-                    .map(|value_id| ValueRef::with_value_id(value_id, selector.clone()))
-                    .unwrap_or_else(|| ValueRef::new(selector.clone())),
+                ValueRef::with_value_id(*selector_value, selector.clone()),
             )),
         );
     }
@@ -3496,17 +3531,17 @@ fn overlay_prepared_switch_roots(
 
 fn merge_prepared_stack_slot(
     use_info: &mut UseInfo,
-    name: &str,
     value_id: Option<ValueId>,
     provenance: StackSlotProvenance,
 ) {
-    use_info.merge_stack_slot_for_name(name, provenance);
     if let Some(value_id) = value_id {
         use_info
             .stack_slots_by_value
             .entry(value_id)
             .and_modify(|existing| *existing = existing.merge(provenance))
             .or_insert(provenance);
+    } else {
+        *use_info.unkeyed_writes.entry("stack_slots").or_default() += 1;
     }
 }
 
@@ -3517,7 +3552,6 @@ fn seed_prepared_value_fact(symbols: &std::cell::RefCell<crate::symbol::SymbolTa
     view: &PreparedSemanticView,
 ) {
     let bound_value_id = bind_prepared_value_id(use_info, view, var);
-    let key = var.display_name();
     if let Some(expr) = view
         .predicate_expr_for_cond(var)
         .cloned()
@@ -3543,7 +3577,6 @@ fn seed_prepared_value_fact(symbols: &std::cell::RefCell<crate::symbol::SymbolTa
         {
             merge_prepared_stack_slot(
                 use_info,
-                &key,
                 bound_value_id,
                 StackSlotProvenance {
                     offset,
@@ -3565,7 +3598,6 @@ fn seed_prepared_value_fact(symbols: &std::cell::RefCell<crate::symbol::SymbolTa
     {
         merge_prepared_stack_slot(
             use_info,
-            &key,
             bound_value_id,
             StackSlotProvenance {
                 offset,
@@ -3683,6 +3715,7 @@ fn prepared_call_render_authorized(call_view: &PreparedCallView) -> bool {
             .eq(call_view.authoritative_arg_values.iter().copied())
 }
 
+#[cfg(test)]
 fn record_prepared_consumed_by_call(
     use_info: &mut UseInfo,
     block: &SSABlock,
@@ -3738,10 +3771,10 @@ fn record_prepared_consumed_by_call(
     }
 }
 
-fn record_prepared_call_result_aliases(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
+fn record_prepared_call_result_facts(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
     use_info: &mut UseInfo,
     source_site: (u64, usize),
-    prepared: &SsaArtifact,
+    _prepared: &SsaArtifact,
     view: &PreparedSemanticView,
     call_expr: &CExpr,
 ) {
@@ -3754,26 +3787,35 @@ fn record_prepared_call_result_aliases(symbols: &std::cell::RefCell<crate::symbo
                 && cert.callsite.op_index == source_site.1
         })
     {
-        let Some(var) = prepared.value_var(cert.value) else {
-            continue;
-        };
         let direct = matches!(cert.owner.as_ref(), Some(ValueOwner::Value(_)))
             && matches!(&cert.carrier, ReturnCarrier::Register { .. });
-        let alias = var.display_name();
-        record_prepared_call_alias(use_info, site, &alias, direct);
-        if direct {
-            use_info.insert_definition_for_name_if_absent(&alias, call_expr.clone());
+        use_info.insert_call_result_source_for_value(cert.value, site);
+        #[cfg(test)]
+        if let Some(var) = _prepared.value_var(cert.value) {
+            record_prepared_call_alias(use_info, site, &var.display_name(), direct);
         }
-        if let Some(ValueOwner::StackSlot { object, offset }) = cert.owner.as_ref()
-            && let Some(expr @ CExpr::Var(symbol)) = prepared_stack_program_expr_for_object_offset(
+        if direct {
+            use_info
+                .definitions_by_value
+                .entry(cert.value)
+                .or_insert_with(|| call_expr.clone());
+        }
+        if let Some(ValueOwner::StackSlot { object, offset }) = cert.owner.as_ref() {
+            let Some(expr @ CExpr::Var(_symbol)) = prepared_stack_program_expr_for_object_offset(
                 symbols,
                 view,
                 *object,
                 *offset,
             )
-        {
-            let alias = crate::symbol::spelling(symbols, symbol).to_string();
-            record_prepared_call_alias(use_info, site, &alias, false);
+            else {
+                *use_info.unkeyed_writes.entry("stack_slots").or_default() += 1;
+                continue;
+            };
+            #[cfg(test)]
+            {
+                let alias = crate::symbol::spelling(symbols, _symbol).to_string();
+                record_prepared_call_alias(use_info, site, &alias, false);
+            }
             if *offset < 0 {
                 use_info
                     .stable_stack_values
@@ -3784,6 +3826,7 @@ fn record_prepared_call_result_aliases(symbols: &std::cell::RefCell<crate::symbo
     }
 }
 
+#[cfg(test)]
 fn record_prepared_call_alias(
     use_info: &mut UseInfo,
     site: (u64, usize),
@@ -3798,7 +3841,6 @@ fn record_prepared_call_alias(
         .entry(site)
         .or_default()
         .insert(alias.to_string());
-    use_info.insert_call_result_source_alias(alias, site);
     if direct {
         use_info
             .direct_call_result_aliases
@@ -3806,6 +3848,7 @@ fn record_prepared_call_alias(
     }
 }
 
+#[cfg(test)]
 fn is_flag_like_name(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     matches!(
@@ -3814,6 +3857,7 @@ fn is_flag_like_name(name: &str) -> bool {
     )
 }
 
+#[cfg(test)]
 fn op_produces_predicate(op: &SSAOp) -> bool {
     matches!(
         op,
@@ -4996,7 +5040,6 @@ mod tests {
         let arg_regs = vec!["RDI".to_string()];
         let param_register_aliases = HashMap::new();
         let caller_saved_regs = HashSet::from(["RCX".to_string()]);
-        let type_hints: HashMap<String, crate::ast::CType> = HashMap::new();
         let env = PassEnv {
             binding_names: None,
             carrier_aliases: crate::analysis::no_carrier_aliases(),
@@ -5016,7 +5059,6 @@ mod tests {
             arg_regs: &arg_regs,
             param_register_aliases: &param_register_aliases,
             caller_saved_regs: &caller_saved_regs,
-            type_hints: &type_hints,
             type_oracle: None,
         };
 

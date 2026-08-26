@@ -240,6 +240,7 @@ PLACEMENT_AUDIT_CAUSE_FIELDS = {
     "missing_planned_value": frozenset({"value_id"}),
     "refused_planned_value": frozenset({"value_id"}),
     "unscoped_observation": frozenset({"observation_id"}),
+    "unauthorized_program_variable": frozenset({"symbol_index"}),
     "unobserved_binding_read": frozenset({"binding_index"}),
     "unobserved_binding_write": frozenset({"binding_index"}),
     "no_dominating_region": frozenset({"binding_index"}),
@@ -256,6 +257,14 @@ PLACEMENT_AUDIT_CAUSE_FIELDS = {
     "duplicate_inline_write": frozenset({"instruction_id"}),
     "missing_binding_role": frozenset({"binding_index"}),
     "undeclared_names": frozenset({"count"}),
+}
+RENDER_REFUSAL_KINDS = {
+    "incomplete_effect_inventory",
+    "missing_machine_projection_authorization",
+    "missing_program_variable_authorization",
+    "normalization_origin_unavailable",
+    "unrepresentable_control_flow",
+    "unrepresentable_operation",
 }
 BINDING_AUDIT_LINE = re.compile(
     rf"^{re.escape(BINDING_AUDIT_PREFIX)}(?P<payload>[^\r\n]*)(?:\r?\n|$)",
@@ -701,18 +710,58 @@ def _score_binding_audit(envelope: dict[str, Any]) -> dict[str, Any]:
     raise BindingAuditFormatError(f"unsupported binding audit status: {status!r}")
 
 
+def _score_render_refusal(envelope: dict[str, Any]) -> dict[str, Any]:
+    refusal = envelope["render_refusal"]
+    if not isinstance(refusal, dict):
+        raise BindingAuditFormatError("render refusal must be an object")
+    status = refusal.get("status")
+    if status == "none":
+        _exact_object(
+            refusal,
+            {"schema_version", "status"},
+            context="render refusal",
+        )
+    elif status == "refused":
+        _exact_object(
+            refusal,
+            {"schema_version", "status", "kind"},
+            context="render refusal",
+        )
+        if refusal["kind"] not in RENDER_REFUSAL_KINDS:
+            raise BindingAuditFormatError("render refusal kind is invalid")
+    else:
+        raise BindingAuditFormatError("render refusal status is invalid")
+    if isinstance(refusal["schema_version"], bool) or refusal["schema_version"] != 1:
+        raise BindingAuditFormatError("render refusal schema_version must be 1")
+    request_status = envelope["request_status"]
+    scored_status = (
+        "refused"
+        if status == "refused"
+        else "pass"
+        if request_status == "completed"
+        else "non_quality"
+    )
+    return {
+        "status": scored_status,
+        "source_status": status,
+        "request_status": request_status,
+        "marker_count": 1,
+        "record": envelope,
+    }
+
+
 def parse_render_audits(
     section: str,
-) -> tuple[str, dict[str, Any], dict[str, Any], dict[str, Any]]:
-    """Remove and independently score binding, effect, and placement audits."""
+) -> tuple[str, dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any]]:
+    """Remove and independently score binding, effect, placement, and render audits."""
     matches = list(BINDING_AUDIT_LINE.finditer(section))
     cleaned = BINDING_AUDIT_LINE.sub("", section)
     if not matches:
         missing = {"status": "missing", "marker_count": 0}
-        return cleaned, missing.copy(), missing.copy(), missing
+        return cleaned, missing.copy(), missing.copy(), missing.copy(), missing
     if len(matches) != 1:
         duplicate = {"status": "duplicate", "marker_count": len(matches)}
-        return cleaned, duplicate.copy(), duplicate.copy(), duplicate
+        return cleaned, duplicate.copy(), duplicate.copy(), duplicate.copy(), duplicate
 
     payload = matches[0].group("payload")
     try:
@@ -735,12 +784,13 @@ def parse_render_audits(
                 "audit",
                 "effect_obligations",
                 "placement_audit",
+                "render_refusal",
             },
             context="binding audit envelope",
         )
-        if isinstance(record["schema_version"], bool) or record["schema_version"] != 4:
+        if isinstance(record["schema_version"], bool) or record["schema_version"] != 5:
             raise BindingAuditFormatError(
-                "binding audit envelope schema_version must be 4"
+                "binding audit envelope schema_version must be 5"
             )
         request_status = record["request_status"]
         if request_status not in {"completed", "refused"}:
@@ -753,7 +803,7 @@ def parse_render_audits(
             "marker_count": 1,
             "error": str(error),
         }
-        return cleaned, malformed.copy(), malformed.copy(), malformed
+        return cleaned, malformed.copy(), malformed.copy(), malformed.copy(), malformed
 
     try:
         binding_score = _score_binding_audit(record)
@@ -779,12 +829,20 @@ def parse_render_audits(
             "marker_count": 1,
             "error": str(error),
         }
-    return cleaned, binding_score, effect_score, placement_score
+    try:
+        render_score = _score_render_refusal(record)
+    except BindingAuditFormatError as error:
+        render_score = {
+            "status": "malformed",
+            "marker_count": 1,
+            "error": str(error),
+        }
+    return cleaned, binding_score, effect_score, placement_score, render_score
 
 
 def parse_binding_audit(section: str) -> tuple[str, dict[str, Any]]:
     """Compatibility entry point returning only the binding side of the sidecar."""
-    cleaned, binding_score, _, _ = parse_render_audits(section)
+    cleaned, binding_score, _, _, _ = parse_render_audits(section)
     return cleaned, binding_score
 
 
@@ -1308,6 +1366,7 @@ def verify(args: argparse.Namespace) -> dict[str, Any]:
             "binding_audit": {"status": "missing", "marker_count": 0},
             "effect_obligations": {"status": "missing", "marker_count": 0},
             "placement_audit": {"status": "missing", "marker_count": 0},
+            "render_refusal": {"status": "missing", "marker_count": 0},
         }
         found = sections.get(name, [])
         entry["generation"]["section_count"] = len(found)
@@ -1320,6 +1379,7 @@ def verify(args: argparse.Namespace) -> dict[str, Any]:
             entry["binding_audit"],
             entry["effect_obligations"],
             entry["placement_audit"],
+            entry["render_refusal"],
         ) = parse_render_audits(found[0])
         section_dir = artifact_root / "raw-sections"
         section_dir.mkdir(parents=True, exist_ok=True)
@@ -1531,7 +1591,8 @@ def print_summary(report: dict[str, Any]) -> None:
             f"snapshot={entry['snapshot']['status']:<10} "
             f"binding_audit={entry['binding_audit']['status']:<12} "
             f"effect_obligations={entry['effect_obligations']['status']:<12} "
-            f"placement_audit={entry['placement_audit']['status']}"
+            f"placement_audit={entry['placement_audit']['status']:<12} "
+            f"render_refusal={entry['render_refusal']['status']}"
         )
         if entry["raw"].get("status") == "failed":
             print(f"    raw: {first_error(entry['raw'])}")
