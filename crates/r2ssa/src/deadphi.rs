@@ -72,9 +72,9 @@ impl DeadPhis {
     pub fn find(func: &SSAFunction, graph: &SsaGraph, live_out: &FunctionLiveOut) -> Self {
         let mut observed = BTreeSet::new();
         let mut pending = VecDeque::new();
-        let mut observe = |value: ValueId,
-                           observed: &mut BTreeSet<ValueId>,
-                           pending: &mut VecDeque<ValueId>| {
+        let observe = |value: ValueId,
+                       observed: &mut BTreeSet<ValueId>,
+                       pending: &mut VecDeque<ValueId>| {
             if observed.insert(value) {
                 pending.push_back(value);
             }

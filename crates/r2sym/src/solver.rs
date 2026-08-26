@@ -6,7 +6,6 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
-use std::time::Duration;
 
 use z3::ast::{Ast, BV, Bool, Dynamic};
 use z3::{AstKind, Context, DeclKind, Model, Params, Solver};

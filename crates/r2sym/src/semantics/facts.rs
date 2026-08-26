@@ -1,5 +1,4 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
-use std::time::Duration;
 
 use r2il::ArchSpec;
 use r2ssa::{

@@ -5360,13 +5360,6 @@ enum EngineRenderedProduct {
 }
 
 impl EngineRenderedProduct {
-    fn output(&self) -> &str {
-        match self {
-            Self::Ready { output, .. } => output,
-            Self::Pending(pending) => pending.output(),
-        }
-    }
-
     fn finalize(
         self,
     ) -> (

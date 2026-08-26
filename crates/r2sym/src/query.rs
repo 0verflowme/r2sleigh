@@ -7,7 +7,6 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::OpenOptions;
 use std::io::Write;
-use std::time::Duration;
 
 use r2il::ArchSpec;
 use z3::Context;

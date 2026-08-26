@@ -4077,7 +4077,7 @@ fn piece_family_tiles(
 ) -> Option<SSAVar> {
     let tiles = family_root_tiles_for_range(state, requested)?;
     let mut part = 0usize;
-    let mut name = |part: &mut usize| {
+    let name = |part: &mut usize| {
         let named = SSAVar::new(
             format!("tmp:regpiece:{block_addr:x}:{op_index:x}:{source_index:x}:{part:x}"),
             1,

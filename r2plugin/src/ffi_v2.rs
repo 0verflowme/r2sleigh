@@ -192,13 +192,6 @@ pub struct R2SleighStringViewV2 {
     pub len: usize,
 }
 
-macro_rules! assert_wire_layout {
-    ($wire:ty, $source:ty) => {
-        const _: [(); size_of::<$wire>()] = [(); size_of::<$source>()];
-        const _: [(); align_of::<$wire>()] = [(); align_of::<$source>()];
-    };
-}
-
 const _: [(); R2SLEIGH_RADARE_SNAPSHOT_CONTRACT_V2 as usize] =
     [(); r2source::RADARE_SNAPSHOT_CONTRACT_VERSION as usize];
 const _: [(); R2SLEIGH_RADARE_FUNCTION_SNAPSHOT_SCHEMA_V2 as usize] =
@@ -2742,42 +2735,6 @@ extern "C" fn lift_block_mnemonic(
         let bytes = unsafe { CString::from_raw(mnemonic) };
         let handle = registry.insert_owned_bytes(owner, R2SleighOwnedBytesV2 { bytes })?;
         unsafe { *output = handle };
-        Ok(())
-    })
-}
-
-extern "C" fn lift_block_type(block: *const R2ILBlock, output: *mut u32) -> u32 {
-    lift_boundary_for(block, || {
-        valid_output_ptr(output, "block type output")?;
-        unsafe { *output = 0 };
-        let key = lift_handle_key(block, "lifted block")?;
-        let registry = lock_lift_registry();
-        let payload = registry.payload::<R2ILBlock>(key, LiftHandleKind::Block, "lifted block")?;
-        unsafe { *output = super::r2il_block_type(payload) };
-        Ok(())
-    })
-}
-
-extern "C" fn lift_block_jump(block: *const R2ILBlock, output: *mut u64) -> u32 {
-    lift_boundary_for(block, || {
-        valid_output_ptr(output, "block jump output")?;
-        unsafe { *output = 0 };
-        let key = lift_handle_key(block, "lifted block")?;
-        let registry = lock_lift_registry();
-        let payload = registry.payload::<R2ILBlock>(key, LiftHandleKind::Block, "lifted block")?;
-        unsafe { *output = super::r2il_block_jump(payload) };
-        Ok(())
-    })
-}
-
-extern "C" fn lift_block_fail(block: *const R2ILBlock, output: *mut u64) -> u32 {
-    lift_boundary_for(block, || {
-        valid_output_ptr(output, "block fail output")?;
-        unsafe { *output = 0 };
-        let key = lift_handle_key(block, "lifted block")?;
-        let registry = lock_lift_registry();
-        let payload = registry.payload::<R2ILBlock>(key, LiftHandleKind::Block, "lifted block")?;
-        unsafe { *output = super::r2il_block_fail(payload) };
         Ok(())
     })
 }
