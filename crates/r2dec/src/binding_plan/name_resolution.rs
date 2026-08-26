@@ -130,6 +130,15 @@ impl BindingNameResolution {
         self.plan.machine_projection().expr(expr)
     }
 
+    /// Resolve one exact use projection through the sealed plan. The renderer
+    /// never reconstructs register geometry from a spelling or carrier width.
+    pub(crate) fn use_disposition(
+        &self,
+        site: r2ssa::UseSite,
+    ) -> Option<&r2ssa::MachineUseDisposition> {
+        self.plan.use_disposition(site)
+    }
+
     pub(crate) fn symbol_for_value(&self, value: ValueId) -> Option<SymbolId> {
         match self.resolve_value(value) {
             PlannedValueSymbol::Bound(symbol) => Some(symbol),

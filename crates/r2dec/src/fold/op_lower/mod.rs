@@ -308,6 +308,7 @@ mod aliases;
 mod calls;
 mod lowering;
 mod memory_renderer;
+mod projection;
 mod return_resolver;
 
 #[derive(Debug, Clone, PartialEq)]

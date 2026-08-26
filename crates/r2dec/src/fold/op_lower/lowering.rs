@@ -1,4 +1,5 @@
 use super::calls::CertifiedCallArgs;
+use super::projection::project_machine_use;
 use super::*;
 
 impl<'a> FoldingContext<'a> {
@@ -95,17 +96,84 @@ impl<'a> FoldingContext<'a> {
                     site,
                 ),
             )?;
-        let value = projection
-            .inputs
-            .get(input_idx)
-            .map(|input| input.value)
-            .ok_or(
-                crate::observation_journal::LegacyObservationJournalError::InvalidNormalizedInput {
-                    site,
-                    input_idx,
-                },
-            )?;
-        self.planned_value_expr(value)
+        let input = projection.inputs.get(input_idx).ok_or(
+            crate::observation_journal::LegacyObservationJournalError::InvalidNormalizedInput {
+                site,
+                input_idx,
+            },
+        )?;
+        let base = self.observe_optional_normalized_input_value_expr(
+            frame.normalized_site,
+            input_idx,
+            self.planned_value_expr(input.value)?,
+        );
+        let Some(first_site) = input.uses.first().copied() else {
+            // Synthetic preservation inputs have no original graph use and
+            // therefore no source-owned projection to apply.
+            return Ok(base);
+        };
+        let Some(names) = self.inputs.binding_names else {
+            return Err(
+                crate::observation_journal::LegacyObservationJournalError::RenderedValueRequired(
+                    input.value,
+                ),
+            );
+        };
+        let first_slice = match names.use_disposition(first_site) {
+            Some(r2ssa::MachineUseDisposition::Exact(slice)) => *slice,
+            Some(r2ssa::MachineUseDisposition::Refused(_)) => {
+                return Err(
+                    crate::observation_journal::LegacyObservationJournalError::RefusedRenderedUse(
+                        first_site,
+                    ),
+                );
+            }
+            None => {
+                return Err(
+                    crate::observation_journal::LegacyObservationJournalError::InvalidUse(
+                        first_site,
+                    ),
+                );
+            }
+        };
+        for use_site in input.uses.iter().copied().skip(1) {
+            match names.use_disposition(use_site) {
+                Some(r2ssa::MachineUseDisposition::Exact(slice)) if *slice == first_slice => {}
+                Some(r2ssa::MachineUseDisposition::Refused(_)) => {
+                    return Err(
+                        crate::observation_journal::LegacyObservationJournalError::RefusedRenderedUse(
+                            use_site,
+                        ),
+                    );
+                }
+                Some(r2ssa::MachineUseDisposition::Exact(_)) => {
+                    // One relocated normalized expression cannot implement two
+                    // different source projections. Keep the normalized site
+                    // typed and refuse the projection instead of choosing one.
+                    return Err(
+                        crate::observation_journal::LegacyObservationJournalError::InvalidNormalizedInput {
+                            site,
+                            input_idx,
+                        },
+                    );
+                }
+                None => {
+                    return Err(
+                        crate::observation_journal::LegacyObservationJournalError::InvalidUse(
+                            use_site,
+                        ),
+                    );
+                }
+            }
+        }
+        project_machine_use(base, first_slice).map_err(|_| {
+            // The machine use is exact, but the strict C dialect cannot spell
+            // this projection without more type evidence. Refuse the emitted
+            // occurrence instead of inventing an integer or pointer type.
+            crate::observation_journal::LegacyObservationJournalError::RefusedRenderedUse(
+                first_site,
+            )
+        })
     }
 
     pub(super) fn planned_current_output_expr(
@@ -190,7 +258,7 @@ impl<'a> FoldingContext<'a> {
                     return expr;
                 }
             };
-            self.observe_optional_normalized_input_expr(frame.normalized_site, input_idx, expr)
+            self.observe_optional_normalized_input_uses_expr(frame.normalized_site, input_idx, expr)
         } else {
             expr
         }
@@ -323,8 +391,8 @@ impl<'a> FoldingContext<'a> {
                                 ));
                             };
                             let mut args = certified_args.args.clone();
-                            if let Some(max_arity) = self
-                                .non_variadic_call_arity_for_site(source_block, source_op_idx)
+                            if let Some(max_arity) =
+                                self.non_variadic_call_arity_for_site(source_block, source_op_idx)
                             {
                                 args.truncate(max_arity);
                                 certified_args.values.truncate(max_arity);

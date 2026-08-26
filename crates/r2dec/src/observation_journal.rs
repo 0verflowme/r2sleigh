@@ -988,6 +988,19 @@ impl LegacyObservationJournal {
         input_idx: usize,
         expr: CExpr,
     ) -> Result<CExpr, LegacyObservationJournalError> {
+        let marked = self.observe_normalized_input_value_expr(site, input_idx, expr)?;
+        self.observe_normalized_input_uses_expr(site, input_idx, marked)
+    }
+
+    /// Mark the base SSA value before any per-use machine projection is
+    /// applied. This keeps one value disposition independent from the several
+    /// exact widths or slices at which that value may be consumed.
+    pub(crate) fn observe_normalized_input_value_expr(
+        &mut self,
+        site: NormalizedOpSite,
+        input_idx: usize,
+        expr: CExpr,
+    ) -> Result<CExpr, LegacyObservationJournalError> {
         let input = self
             .normalized_projection(site)?
             .inputs
@@ -996,8 +1009,28 @@ impl LegacyObservationJournal {
             .ok_or(LegacyObservationJournalError::InvalidNormalizedInput { site, input_idx })?;
         let value = input.value;
         self.value_slot(value)?;
-        let mut targets = Vec::with_capacity(1 + input.uses.len());
-        targets.push(ObservationTarget::Value(value));
+        let id = self
+            .allocate_many(vec![ObservationTarget::Value(value)])?
+            .into_iter()
+            .next()
+            .ok_or(LegacyObservationJournalError::TooManyObservations)?;
+        Ok(CExpr::observed(id, expr))
+    }
+
+    /// Mark every exact original use outside the already-projected expression.
+    pub(crate) fn observe_normalized_input_uses_expr(
+        &mut self,
+        site: NormalizedOpSite,
+        input_idx: usize,
+        expr: CExpr,
+    ) -> Result<CExpr, LegacyObservationJournalError> {
+        let input = self
+            .normalized_projection(site)?
+            .inputs
+            .get(input_idx)
+            .cloned()
+            .ok_or(LegacyObservationJournalError::InvalidNormalizedInput { site, input_idx })?;
+        let mut targets = Vec::with_capacity(input.uses.len());
         for use_site in input.uses {
             let observation = self.rendered_use_observation(use_site)?;
             targets.push(ObservationTarget::Use {
@@ -1005,12 +1038,8 @@ impl LegacyObservationJournal {
                 observation,
             });
         }
-        let mut ids = self.allocate_many(targets)?.into_iter();
-        let value_id = ids
-            .next()
-            .expect("a normalized input always allocates its value observation");
-        let mut marked = CExpr::observed(value_id, expr);
-        for id in ids {
+        let mut marked = expr;
+        for id in self.allocate_many(targets)? {
             marked = CExpr::observed(id, marked);
         }
         Ok(marked)

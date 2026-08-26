@@ -66,7 +66,10 @@ mod tests {
         },
         ast::{CFunction, CLocal},
     };
-    use r2il::{ArchSpec, R2ILBlock, R2ILOp, RegisterDef, SpaceId, Varnode};
+    use r2il::{
+        ArchSpec, R2ILBlock, R2ILOp, RegisterBitSlice, RegisterDef, RegisterProjection,
+        RegisterProjectionDisposition, RegisterStorage, SpaceId, Varnode,
+    };
     /// The names a fixture in this module declares.
     fn test_table() -> std::cell::RefCell<crate::symbol::SymbolTable> {
         std::cell::RefCell::new(crate::symbol::SymbolTable::new())
@@ -1461,13 +1464,22 @@ mod tests {
             matches!(rhs.as_ref(), CExpr::Observed { .. }),
             "right input observations must stay on the right occurrence"
         );
+        let is_exact_projected_binding = |expr: &CExpr| {
+            matches!(
+                expr.unobserved(),
+                CExpr::Cast {
+                    ty: CType::UInt(64),
+                    expr,
+                } if matches!(expr.unobserved(), CExpr::Var(symbol) if *symbol == input_symbol)
+            )
+        };
         assert!(
-            matches!(lhs.unobserved(), CExpr::Var(symbol) if *symbol == input_symbol),
-            "the exact bound value must render through its planned symbol"
+            is_exact_projected_binding(lhs),
+            "the exact bound value must render through its planned symbol and use width"
         );
         assert!(
-            matches!(rhs.unobserved(), CExpr::Var(symbol) if *symbol == input_symbol),
-            "equal operands must independently use the same planned binding"
+            is_exact_projected_binding(rhs),
+            "equal operands must independently project the same planned binding"
         );
         assert_eq!(*ctx.observation_error.borrow(), None);
         let symbols = Rc::clone(&ctx.symbols);
@@ -1495,6 +1507,109 @@ mod tests {
             Some(exact_legacy_write(&plan, inst)),
             "the supported expression result must retain its exact output occurrence"
         );
+    }
+
+    #[test]
+    fn observed_narrow_register_use_projects_the_exact_carrier_slice() {
+        let mut arch = make_test_arch_x86_64();
+        let mut register_projections = arch
+            .registers
+            .iter()
+            .map(|register| {
+                let written = register.storage();
+                let carrier = match register.name.as_str() {
+                    "EAX" => RegisterStorage { offset: 0, size: 8 },
+                    "EDI" => RegisterStorage {
+                        offset: 0x10,
+                        size: 8,
+                    },
+                    "ESI" => RegisterStorage {
+                        offset: 0x18,
+                        size: 8,
+                    },
+                    _ => written,
+                };
+                RegisterProjection {
+                    written,
+                    disposition: RegisterProjectionDisposition::Bound {
+                        carrier,
+                        slice: RegisterBitSlice {
+                            lsb_bit_offset: 0,
+                            size_bits: u64::from(register.size) * 8,
+                        },
+                    },
+                }
+            })
+            .collect::<Vec<_>>();
+        register_projections.sort_by_key(|projection| projection.written);
+        arch.register_projections = register_projections;
+        let mut entry = R2ILBlock::new(0x1000, 4);
+        entry.push(R2ILOp::Copy {
+            dst: Varnode::unique(0x20, 4),
+            src: Varnode::register(0, 4),
+        });
+        let prepared = prepared_from_r2il_blocks(&[entry], &arch)
+            .with_name("observed_narrow_register_projection");
+        let block = prepared.function().get_block(0x1000).expect("entry block");
+        let op_idx = block
+            .ops
+            .iter()
+            .position(|op| {
+                matches!(op, SSAOp::Copy { dst, .. } if dst.name == "tmp:20" && dst.size == 4)
+            })
+            .expect("narrow register copy");
+        let inst = prepared
+            .graph()
+            .inst_id_for_op_site(block.addr, op_idx)
+            .expect("copy graph instruction");
+        let graph_inst = prepared.graph().inst(inst).expect("copy graph row");
+        let site = r2ssa::UseSite { inst, input_idx: 0 };
+
+        let mut ctx = make_x86_64_ctx_with_prepared(&prepared);
+        let (plan, names, _journal) = install_observed_lowering(&mut ctx, &prepared);
+        let slice = match plan.use_disposition(site) {
+            Some(r2ssa::MachineUseDisposition::Exact(slice)) => *slice,
+            other => panic!("expected exact narrow-register use, got {other:?}"),
+        };
+        assert_eq!(slice.bit_offset(), 0);
+        assert_eq!(slice.width_bits(), 32);
+        assert_eq!(
+            slice.carrier_width_bits(),
+            64,
+            "graph input={:?}; storage={:?}",
+            prepared.graph().value(graph_inst.inputs[0]),
+            prepared
+                .graph()
+                .value(graph_inst.inputs[0])
+                .and_then(|value| value.canonical_storage)
+                .and_then(|storage| prepared.machine_context().register_projection(storage))
+        );
+
+        let LoweredExprAt::Rendered(expr) =
+            ctx.op_to_expr_at(&block.ops[op_idx], block.addr, op_idx)
+        else {
+            panic!("narrow register copy must lower to an expression");
+        };
+        let input_symbol = names
+            .symbol_for_value(graph_inst.inputs[0])
+            .expect("carrier input symbol");
+        assert!(
+            matches!(
+                expr.unobserved(),
+                CExpr::Cast {
+                    ty: CType::UInt(32),
+                    expr,
+                } if matches!(
+                    expr.as_ref(),
+                    CExpr::Cast {
+                        ty: CType::UInt(64),
+                        expr,
+                    } if matches!(expr.unobserved(), CExpr::Var(symbol) if *symbol == input_symbol)
+                )
+            ),
+            "narrow read must be selected from the unsigned canonical carrier: {expr:?}"
+        );
+        assert_eq!(*ctx.observation_error.borrow(), None);
     }
 
     fn assert_observed_call_marks_only_graph_target(indirect: bool) {

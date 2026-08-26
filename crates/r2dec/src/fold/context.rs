@@ -620,6 +620,62 @@ impl<'a> FoldingContext<'a> {
         }
     }
 
+    pub(crate) fn observe_optional_normalized_input_value_expr(
+        &self,
+        site: Option<crate::normalize::NormalizedOpSite>,
+        input_idx: usize,
+        expr: CExpr,
+    ) -> CExpr {
+        let Some(journal) = self.inputs.observation_journal else {
+            return expr;
+        };
+        let Some(site) = site else {
+            self.retain_first_observation_error(
+                crate::observation_journal::LegacyObservationJournalError::MissingNormalizedSiteContext,
+            );
+            return expr;
+        };
+        let fallback = expr.clone();
+        match journal
+            .borrow_mut()
+            .observe_normalized_input_value_expr(site, input_idx, expr)
+        {
+            Ok(marked) => marked,
+            Err(error) => {
+                self.retain_first_observation_error(error);
+                fallback
+            }
+        }
+    }
+
+    pub(crate) fn observe_optional_normalized_input_uses_expr(
+        &self,
+        site: Option<crate::normalize::NormalizedOpSite>,
+        input_idx: usize,
+        expr: CExpr,
+    ) -> CExpr {
+        let Some(journal) = self.inputs.observation_journal else {
+            return expr;
+        };
+        let Some(site) = site else {
+            self.retain_first_observation_error(
+                crate::observation_journal::LegacyObservationJournalError::MissingNormalizedSiteContext,
+            );
+            return expr;
+        };
+        let fallback = expr.clone();
+        match journal
+            .borrow_mut()
+            .observe_normalized_input_uses_expr(site, input_idx, expr)
+        {
+            Ok(marked) => marked,
+            Err(error) => {
+                self.retain_first_observation_error(error);
+                fallback
+            }
+        }
+    }
+
     pub(crate) fn observe_current_normalized_input_expr(
         &self,
         input_idx: usize,
