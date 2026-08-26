@@ -686,11 +686,188 @@ struct NativePlacementInput {
 
 #[derive(Debug)]
 enum NativePlacementFailure {
+    MissingStructuredRegionArtifact,
     Analysis(crate::placement::PlacementAnalysisError),
     Application(crate::placement::PlacementApplicationError),
     MissingBindingRole { binding: crate::binding_plan::BindingId },
     UndeclaredNames { count: usize },
     RegionFinalization(crate::structured_region::StructuredRegionFinalizationError),
+}
+
+fn region_marker_refusal(
+    error: crate::structured_region::StructuredRegionFinalizationError,
+) -> crate::PlacementAuditRefusal {
+    use crate::PlacementAuditRefusal as Refusal;
+    use crate::structured_region::StructuredRegionFinalizationError as Error;
+
+    match error {
+        Error::UnsealedMarker => Refusal::RegionMarkerUnsealed,
+        Error::ForeignMarker { anchor } => Refusal::RegionMarkerForeign {
+            anchor_index: anchor.index(),
+        },
+        Error::DuplicateMarker { region } => Refusal::RegionMarkerDuplicate {
+            region_index: region.index(),
+        },
+        Error::MissingMarker { region } => Refusal::RegionMarkerMissing {
+            region_index: region.index(),
+        },
+    }
+}
+
+fn observation_marker_refusal(
+    error: crate::ast::RenderObservationStripError,
+) -> crate::PlacementAuditRefusal {
+    use crate::PlacementAuditRefusal as Refusal;
+    use crate::ast::RenderObservationStripError as Error;
+
+    match error {
+        Error::DomainTooLarge { expected_count } => {
+            Refusal::ObservationDomainTooLarge { expected_count }
+        }
+        Error::CapacityUnavailable { expected_count } => {
+            Refusal::ObservationCapacityUnavailable { expected_count }
+        }
+        Error::OutOfRange { id, expected_count } => Refusal::ObservationOutOfRange {
+            observation_id: id.index(),
+            expected_count,
+        },
+        Error::Duplicate { id } => Refusal::DuplicateObservation {
+            observation_id: id.index(),
+        },
+    }
+}
+
+fn placement_refusal(
+    refusal: crate::binding_plan::PlacementRefusal,
+) -> crate::PlacementAuditRefusal {
+    use crate::PlacementAuditRefusal as Public;
+    use crate::binding_plan::PlacementRefusal as Private;
+
+    match refusal {
+        Private::NoDominatingRegion { binding } => Public::NoDominatingRegion {
+            binding_index: binding.index(),
+        },
+        Private::MissingDefinition { binding } => Public::MissingDefinition {
+            binding_index: binding.index(),
+        },
+        Private::ReadBeforeAssignment { binding, site } => Public::ReadBeforeAssignment {
+            binding_index: binding.index(),
+            instruction_id: site.inst.0,
+            input_index: site.input_idx,
+        },
+    }
+}
+
+fn placement_analysis_refusal(
+    error: crate::placement::PlacementAnalysisError,
+) -> crate::PlacementAuditRefusal {
+    use crate::PlacementAuditRefusal as Refusal;
+    use crate::placement::PlacementAnalysisError as Error;
+
+    match error {
+        Error::BindingOutsidePlan { binding } => Refusal::BindingOutsidePlan {
+            binding_index: binding.index(),
+        },
+        Error::RegionOutsideArtifact { region } => Refusal::RegionOutsideArtifact {
+            region_index: region.index(),
+        },
+        Error::BlockOutsideFunction { block } => Refusal::BlockOutsideFunction {
+            block_address: block,
+        },
+        Error::RegionDoesNotDominateOccurrence { region, block } => {
+            Refusal::RegionDoesNotDominateOccurrence {
+                region_index: region.index(),
+                block_address: block,
+            }
+        }
+        Error::ExternalBindingOutsidePlan { binding } => {
+            Refusal::ExternalBindingOutsidePlan {
+                binding_index: binding.index(),
+            }
+        }
+        Error::RegionMarkers(error) => region_marker_refusal(error),
+        Error::ObservationMarkers(error) => observation_marker_refusal(error),
+        Error::MissingObservationTarget { observation } => {
+            Refusal::MissingObservationTarget {
+                observation_id: observation.index(),
+            }
+        }
+        Error::InvalidUse { site } => Refusal::InvalidUse {
+            instruction_id: site.inst.0,
+            input_index: site.input_idx,
+        },
+        Error::InvalidWrite { inst } => Refusal::InvalidWrite {
+            instruction_id: inst.0,
+        },
+        Error::MissingPlannedValue { value } => Refusal::MissingPlannedValue {
+            value_id: value.0,
+        },
+        Error::RefusedPlannedValue { value } => Refusal::RefusedPlannedValue {
+            value_id: value.0,
+        },
+        Error::UnscopedObservation { observation } => Refusal::UnscopedObservation {
+            observation_id: observation.index(),
+        },
+        Error::UnobservedBindingRead { binding } => Refusal::UnobservedBindingRead {
+            binding_index: binding.index(),
+        },
+        Error::UnobservedBindingWrite { binding } => Refusal::UnobservedBindingWrite {
+            binding_index: binding.index(),
+        },
+    }
+}
+
+fn placement_application_refusal(
+    error: crate::placement::PlacementApplicationError,
+) -> crate::PlacementAuditRefusal {
+    use crate::PlacementAuditRefusal as Refusal;
+    use crate::placement::PlacementApplicationError as Error;
+
+    match error {
+        Error::Refused(refusal) => placement_refusal(refusal),
+        Error::MissingBinding { binding } => Refusal::MissingBinding {
+            binding_index: binding.index(),
+        },
+        Error::MissingBindingSymbol { binding } => Refusal::MissingBindingSymbol {
+            binding_index: binding.index(),
+        },
+        Error::ExternalBindingMissingParameter { binding } => {
+            Refusal::ExternalBindingMissingParameter {
+                binding_index: binding.index(),
+            }
+        }
+        Error::MissingRegion { region } => Refusal::MissingRegion {
+            region_index: region.index(),
+        },
+        Error::DuplicateRegion { region } => Refusal::DuplicateRegion {
+            region_index: region.index(),
+        },
+        Error::MissingInlineWrite { inst } => Refusal::MissingInlineWrite {
+            instruction_id: inst.0,
+        },
+        Error::DuplicateInlineWrite { inst } => Refusal::DuplicateInlineWrite {
+            instruction_id: inst.0,
+        },
+    }
+}
+
+impl From<NativePlacementFailure> for crate::PlacementAuditRefusal {
+    fn from(failure: NativePlacementFailure) -> Self {
+        match failure {
+            NativePlacementFailure::MissingStructuredRegionArtifact => {
+                Self::MissingStructuredRegionArtifact
+            }
+            NativePlacementFailure::Analysis(error) => placement_analysis_refusal(error),
+            NativePlacementFailure::Application(error) => placement_application_refusal(error),
+            NativePlacementFailure::MissingBindingRole { binding } => Self::MissingBindingRole {
+                binding_index: binding.index(),
+            },
+            NativePlacementFailure::UndeclaredNames { count } => {
+                Self::UndeclaredNames { count }
+            }
+            NativePlacementFailure::RegionFinalization(error) => region_marker_refusal(error),
+        }
+    }
 }
 
 impl MarkedNativeDraft {
@@ -720,7 +897,7 @@ impl MarkedNativeDraft {
         source: &SourceOwnedFunctionFacts,
     ) -> Result<(), NativePlacementFailure> {
         let Some(placement) = self.placement.as_ref() else {
-            return Ok(());
+            return Err(NativePlacementFailure::MissingStructuredRegionArtifact);
         };
         let occurrences = crate::placement::collect_final_placement_occurrences(
             &self.function,
@@ -779,6 +956,7 @@ impl MarkedNativeDraft {
             observations: Some(observations),
             fallback_effects: None,
             effect_audit: crate::EffectObligationAudit::NOT_RUN,
+            placement_audit: crate::PlacementAudit::NotRun,
             observation_failure: None,
             plan,
         })
@@ -844,30 +1022,24 @@ impl MarkedNativeDraft {
                 }
             }
         };
-        let region_failure = if placement_failure.is_none() {
-            self.placement.as_ref().and_then(|placement| {
-                ready
-                    .strip_structured_region_markers(&placement.regions)
-                    .err()
-                    .map(NativePlacementFailure::RegionFinalization)
-            })
+        let region_failure = self.placement.as_ref().and_then(|placement| {
+            ready
+                .strip_structured_region_markers(&placement.regions)
+                .err()
+                .map(NativePlacementFailure::RegionFinalization)
+        });
+        let placement_audit = if let Some(failure) = placement_failure.or(region_failure) {
+            let refusal = crate::PlacementAuditRefusal::from(failure);
+            crate::PlacementAudit::Refused(refusal)
         } else {
-            None
+            crate::PlacementAudit::Applied
         };
-        if let Some(failure) = placement_failure.or(region_failure) {
-            let function_name = ready.function().name.clone();
-            ready = prepare_function_for_emission(
-                &crate::residual_function_for_render_boundary(
-                    &function_name,
-                    &format!("placement refusal: {failure:?}"),
-                ),
-            );
-        }
         SealedNativeFunction {
             ready,
             observations,
             fallback_effects,
             effect_audit: crate::EffectObligationAudit::NOT_RUN,
+            placement_audit,
             observation_failure,
             plan,
         }
@@ -882,6 +1054,7 @@ pub(crate) struct SealedNativeFunction {
     /// A run owns effects here or inside `observations`, never in both.
     fallback_effects: Option<SurvivingEffectObservations>,
     effect_audit: crate::EffectObligationAudit,
+    placement_audit: crate::PlacementAudit,
     observation_failure: Option<BindingShadowAuditFailure>,
     plan: Rc<BindingPlan>,
 }
@@ -894,12 +1067,14 @@ impl SealedNativeFunction {
         plan: Rc<BindingPlan>,
         source: &SsaArtifact,
         failure: BindingShadowAuditFailure,
+        placement_audit: crate::PlacementAudit,
     ) -> Self {
         Self {
             ready: prepare_function_for_emission(&function),
             observations: None,
             fallback_effects: Some(SurvivingEffectObservations::empty(source)),
             effect_audit: crate::EffectObligationAudit::NOT_RUN,
+            placement_audit,
             observation_failure: Some(failure),
             plan,
         }
@@ -973,6 +1148,10 @@ impl SealedNativeFunction {
 
     pub(crate) const fn effect_obligation_audit(&self) -> crate::EffectObligationAudit {
         self.effect_audit
+    }
+
+    pub(crate) const fn placement_audit(&self) -> crate::PlacementAudit {
+        self.placement_audit
     }
 
     pub(crate) fn into_function(self) -> CFunction {
@@ -3183,6 +3362,12 @@ mod tests {
             ))
         );
         assert_eq!(native.emission().function(), expected.function());
+        assert_eq!(
+            native.placement_audit(),
+            crate::PlacementAudit::Refused(
+                crate::PlacementAuditRefusal::MissingStructuredRegionArtifact
+            )
+        );
         assert!(!crate::ast::has_render_observations(
             native.emission().function()
         ));
@@ -3223,6 +3408,12 @@ mod tests {
             ))
         );
         assert_eq!(native.emission().function(), expected.function());
+        assert_eq!(
+            native.placement_audit(),
+            crate::PlacementAudit::Refused(
+                crate::PlacementAuditRefusal::MissingStructuredRegionArtifact
+            )
+        );
         assert!(!crate::ast::has_render_observations(
             native.emission().function()
         ));

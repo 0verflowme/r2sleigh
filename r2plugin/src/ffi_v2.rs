@@ -1907,12 +1907,169 @@ fn binding_audit_json(audit: Option<r2engine::BindingShadowAuditOutcome>) -> ser
     }
 }
 
+fn placement_refusal_json(refusal: r2engine::PlacementAuditRefusal) -> serde_json::Value {
+    use r2engine::PlacementAuditRefusal as Refusal;
+
+    let mut cause = serde_json::Map::new();
+    cause.insert("kind".to_string(), serde_json::json!(refusal.kind()));
+    match refusal {
+        Refusal::MissingStructuredRegionArtifact
+        | Refusal::ObservationJournalUnavailable
+        | Refusal::RegionMarkerUnsealed => {}
+        Refusal::BindingOutsidePlan { binding_index }
+        | Refusal::ExternalBindingOutsidePlan { binding_index }
+        | Refusal::UnobservedBindingRead { binding_index }
+        | Refusal::UnobservedBindingWrite { binding_index }
+        | Refusal::NoDominatingRegion { binding_index }
+        | Refusal::MissingDefinition { binding_index }
+        | Refusal::MissingBinding { binding_index }
+        | Refusal::MissingBindingSymbol { binding_index }
+        | Refusal::ExternalBindingMissingParameter { binding_index }
+        | Refusal::MissingBindingRole { binding_index } => {
+            cause.insert(
+                "binding_index".to_string(),
+                serde_json::json!(binding_index),
+            );
+        }
+        Refusal::RegionOutsideArtifact { region_index }
+        | Refusal::RegionMarkerDuplicate { region_index }
+        | Refusal::RegionMarkerMissing { region_index }
+        | Refusal::MissingRegion { region_index }
+        | Refusal::DuplicateRegion { region_index } => {
+            cause.insert(
+                "region_index".to_string(),
+                serde_json::json!(region_index),
+            );
+        }
+        Refusal::BlockOutsideFunction { block_address } => {
+            cause.insert(
+                "block_address".to_string(),
+                serde_json::json!(block_address),
+            );
+        }
+        Refusal::RegionDoesNotDominateOccurrence {
+            region_index,
+            block_address,
+        } => {
+            cause.insert(
+                "region_index".to_string(),
+                serde_json::json!(region_index),
+            );
+            cause.insert(
+                "block_address".to_string(),
+                serde_json::json!(block_address),
+            );
+        }
+        Refusal::RegionMarkerForeign { anchor_index } => {
+            cause.insert(
+                "anchor_index".to_string(),
+                serde_json::json!(anchor_index),
+            );
+        }
+        Refusal::ObservationDomainTooLarge { expected_count }
+        | Refusal::ObservationCapacityUnavailable { expected_count } => {
+            cause.insert(
+                "expected_count".to_string(),
+                serde_json::json!(expected_count),
+            );
+        }
+        Refusal::ObservationOutOfRange {
+            observation_id,
+            expected_count,
+        } => {
+            cause.insert(
+                "observation_id".to_string(),
+                serde_json::json!(observation_id),
+            );
+            cause.insert(
+                "expected_count".to_string(),
+                serde_json::json!(expected_count),
+            );
+        }
+        Refusal::DuplicateObservation { observation_id }
+        | Refusal::MissingObservationTarget { observation_id }
+        | Refusal::UnscopedObservation { observation_id } => {
+            cause.insert(
+                "observation_id".to_string(),
+                serde_json::json!(observation_id),
+            );
+        }
+        Refusal::InvalidUse {
+            instruction_id,
+            input_index,
+        } => {
+            cause.insert(
+                "instruction_id".to_string(),
+                serde_json::json!(instruction_id),
+            );
+            cause.insert(
+                "input_index".to_string(),
+                serde_json::json!(input_index),
+            );
+        }
+        Refusal::InvalidWrite { instruction_id }
+        | Refusal::MissingInlineWrite { instruction_id }
+        | Refusal::DuplicateInlineWrite { instruction_id } => {
+            cause.insert(
+                "instruction_id".to_string(),
+                serde_json::json!(instruction_id),
+            );
+        }
+        Refusal::MissingPlannedValue { value_id }
+        | Refusal::RefusedPlannedValue { value_id } => {
+            cause.insert("value_id".to_string(), serde_json::json!(value_id));
+        }
+        Refusal::ReadBeforeAssignment {
+            binding_index,
+            instruction_id,
+            input_index,
+        } => {
+            cause.insert(
+                "binding_index".to_string(),
+                serde_json::json!(binding_index),
+            );
+            cause.insert(
+                "instruction_id".to_string(),
+                serde_json::json!(instruction_id),
+            );
+            cause.insert(
+                "input_index".to_string(),
+                serde_json::json!(input_index),
+            );
+        }
+        Refusal::UndeclaredNames { count } => {
+            cause.insert("count".to_string(), serde_json::json!(count));
+        }
+    }
+    serde_json::Value::Object(cause)
+}
+
+fn placement_audit_json(audit: Option<r2engine::PlacementAudit>) -> serde_json::Value {
+    match audit {
+        None => serde_json::Value::Null,
+        Some(r2engine::PlacementAudit::Applied) => serde_json::json!({
+            "schema_version": 1,
+            "status": "applied",
+        }),
+        Some(r2engine::PlacementAudit::NotRun) => serde_json::json!({
+            "schema_version": 1,
+            "status": "not_run",
+        }),
+        Some(r2engine::PlacementAudit::Refused(refusal)) => serde_json::json!({
+            "schema_version": 1,
+            "status": "refused",
+            "cause": placement_refusal_json(refusal),
+        }),
+    }
+}
+
 fn response_diagnostics_json(
     diagnostics: &r2engine::EngineDiagnostics,
     binding_audit: Option<r2engine::BindingShadowAuditOutcome>,
     effect_obligations: Option<r2engine::EffectObligationAudit>,
+    placement_audit: Option<r2engine::PlacementAudit>,
 ) -> Result<String, BoundaryError> {
-    let outcome = match response_outcome(diagnostics, effect_obligations) {
+    let outcome = match response_outcome(diagnostics, effect_obligations, placement_audit) {
         R2SLEIGH_OUTCOME_COMPLETED_V2 => "completed",
         R2SLEIGH_OUTCOME_REFUSED_V2 => "refused",
         _ => unreachable!("response outcome is a closed V2 enum"),
@@ -1925,6 +2082,7 @@ fn response_diagnostics_json(
         "refusal": diagnostics.refusal.as_deref(),
         "binding_audit": binding_audit_json(binding_audit),
         "effect_obligations": effect_obligations_json(effect_obligations),
+        "placement_audit": placement_audit_json(placement_audit),
     })
     .to_string())
 }
@@ -1955,6 +2113,7 @@ fn effect_obligations_json(
 fn response_outcome(
     diagnostics: &r2engine::EngineDiagnostics,
     effect_obligations: Option<r2engine::EffectObligationAudit>,
+    placement_audit: Option<r2engine::PlacementAudit>,
 ) -> u32 {
     if diagnostics.refusal.is_some()
         || matches!(
@@ -1969,6 +2128,7 @@ fn response_outcome(
                 || audit.unaccounted != 0
                 || audit.conflicts != 0
         })
+        || matches!(placement_audit, Some(r2engine::PlacementAudit::Refused(_)))
     {
         R2SLEIGH_OUTCOME_REFUSED_V2
     } else {
@@ -2010,6 +2170,7 @@ unsafe extern "C" fn execute(
                 &response.output.diagnostics,
                 response.output.binding_audit,
                 response.output.effect_obligations,
+                response.output.placement_audit,
             )?;
             if diagnostics_json.len() > MAX_RESPONSE_BYTES {
                 return Err(BoundaryError::limit("response diagnostics exceed byte cap"));
@@ -2019,6 +2180,7 @@ unsafe extern "C" fn execute(
             let outcome = response_outcome(
                 &response.output.diagnostics,
                 response.output.effect_obligations,
+                response.output.placement_audit,
             );
             let phase_timings = response_phase_timings(&response.output.metrics);
             let mut owned_response = Box::new(R2SleighResponseV2 {
@@ -4022,6 +4184,143 @@ mod tests {
         assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "93");
     }
 
+    fn every_placement_refusal_wire_leaf() -> Vec<r2engine::PlacementAuditRefusal> {
+        use r2engine::PlacementAuditRefusal as Refusal;
+
+        vec![
+            Refusal::MissingStructuredRegionArtifact,
+            Refusal::ObservationJournalUnavailable,
+            Refusal::BindingOutsidePlan { binding_index: 1 },
+            Refusal::RegionOutsideArtifact { region_index: 2 },
+            Refusal::BlockOutsideFunction {
+                block_address: 0x3000,
+            },
+            Refusal::RegionDoesNotDominateOccurrence {
+                region_index: 3,
+                block_address: 0x3004,
+            },
+            Refusal::ExternalBindingOutsidePlan { binding_index: 4 },
+            Refusal::RegionMarkerUnsealed,
+            Refusal::RegionMarkerForeign { anchor_index: 5 },
+            Refusal::RegionMarkerDuplicate { region_index: 6 },
+            Refusal::RegionMarkerMissing { region_index: 7 },
+            Refusal::ObservationDomainTooLarge { expected_count: 8 },
+            Refusal::ObservationCapacityUnavailable { expected_count: 9 },
+            Refusal::ObservationOutOfRange {
+                observation_id: 10,
+                expected_count: 11,
+            },
+            Refusal::DuplicateObservation { observation_id: 12 },
+            Refusal::MissingObservationTarget { observation_id: 13 },
+            Refusal::InvalidUse {
+                instruction_id: 14,
+                input_index: 15,
+            },
+            Refusal::InvalidWrite { instruction_id: 16 },
+            Refusal::MissingPlannedValue { value_id: 17 },
+            Refusal::RefusedPlannedValue { value_id: 18 },
+            Refusal::UnscopedObservation { observation_id: 19 },
+            Refusal::UnobservedBindingRead { binding_index: 20 },
+            Refusal::UnobservedBindingWrite { binding_index: 21 },
+            Refusal::NoDominatingRegion { binding_index: 22 },
+            Refusal::MissingDefinition { binding_index: 23 },
+            Refusal::ReadBeforeAssignment {
+                binding_index: 24,
+                instruction_id: 25,
+                input_index: 26,
+            },
+            Refusal::MissingBinding { binding_index: 27 },
+            Refusal::MissingBindingSymbol { binding_index: 28 },
+            Refusal::ExternalBindingMissingParameter { binding_index: 29 },
+            Refusal::MissingRegion { region_index: 30 },
+            Refusal::DuplicateRegion { region_index: 31 },
+            Refusal::MissingInlineWrite { instruction_id: 32 },
+            Refusal::DuplicateInlineWrite { instruction_id: 33 },
+            Refusal::MissingBindingRole { binding_index: 34 },
+            Refusal::UndeclaredNames { count: 35 },
+        ]
+    }
+
+    #[test]
+    fn diagnostics_json_preserves_every_placement_refusal_wire_leaf() {
+        use r2engine::{PlacementAudit, PlacementAuditRefusal};
+
+        let mut kinds = std::collections::BTreeSet::new();
+        let mut causes = Vec::new();
+        for refusal in every_placement_refusal_wire_leaf() {
+            let payload = placement_audit_json(Some(PlacementAudit::Refused(refusal)));
+            assert_eq!(payload["schema_version"], 1);
+            assert_eq!(payload["status"], "refused");
+            assert_eq!(payload.as_object().map(serde_json::Map::len), Some(3));
+            let cause = payload["cause"].clone();
+            let kind = cause["kind"]
+                .as_str()
+                .expect("typed placement cause kind is a string");
+            assert!(kinds.insert(kind.to_string()), "duplicate wire kind {kind}");
+            causes.push(cause);
+        }
+        assert_eq!(kinds.len(), 35);
+
+        let checker = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../tests/corpus/check_binding_audit_schema.py");
+        let mut child = std::process::Command::new("python3")
+            .arg(&checker)
+            .arg("--placement")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap_or_else(|error| panic!("failed to run {}: {error}", checker.display()));
+        let oracle_json = serde_json::to_vec(&causes).expect("serialize placement causes");
+        std::io::Write::write_all(
+            child.stdin.as_mut().expect("schema checker stdin"),
+            &oracle_json,
+        )
+        .expect("write typed placement causes to schema checker");
+        drop(child.stdin.take());
+        let output = child.wait_with_output().expect("wait for schema checker");
+        assert!(
+            output.status.success(),
+            "Python placement schema rejected the Rust typed oracle: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "35");
+
+        assert_eq!(
+            placement_audit_json(Some(PlacementAudit::Applied)),
+            serde_json::json!({"schema_version": 1, "status": "applied"}),
+        );
+        assert_eq!(
+            placement_audit_json(Some(PlacementAudit::NotRun)),
+            serde_json::json!({"schema_version": 1, "status": "not_run"}),
+        );
+        assert!(placement_audit_json(None).is_null());
+
+        let refusal = PlacementAudit::Refused(PlacementAuditRefusal::MissingDefinition {
+            binding_index: 7,
+        });
+        let raw = response_diagnostics_json(
+            &r2engine::EngineDiagnostics::default(),
+            Some(r2engine::BindingShadowAuditOutcome::NotRun),
+            Some(r2engine::EffectObligationAudit::NOT_RUN),
+            Some(refusal),
+        )
+        .expect("placement diagnostics JSON");
+        let parsed: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON");
+        assert_eq!(parsed["outcome"], "refused");
+        assert_eq!(parsed["placement_audit"]["cause"]["kind"], "missing_definition");
+        assert_eq!(parsed["placement_audit"]["cause"]["binding_index"], 7);
+        assert_eq!(
+            response_outcome(
+                &r2engine::EngineDiagnostics::default(),
+                Some(r2engine::EffectObligationAudit::NOT_RUN),
+                Some(refusal),
+            ),
+            R2SLEIGH_OUTCOME_REFUSED_V2,
+        );
+    }
+
     #[test]
     fn diagnostics_json_preserves_representative_binding_journal_failure_payloads() {
         use r2engine::{
@@ -4281,6 +4580,7 @@ mod tests {
                 &r2engine::EngineDiagnostics::default(),
                 Some(audit),
                 Some(r2engine::EffectObligationAudit::NOT_RUN),
+                Some(r2engine::PlacementAudit::NotRun),
             )
             .expect("diagnostics JSON");
             let parsed: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON");
@@ -4313,6 +4613,7 @@ mod tests {
             &diagnostics,
             Some(r2engine::BindingShadowAuditOutcome::NotRun),
             Some(r2engine::EffectObligationAudit::NOT_RUN),
+            Some(r2engine::PlacementAudit::NotRun),
         )
         .expect("diagnostics JSON");
         let parsed: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON");
@@ -4321,7 +4622,8 @@ mod tests {
         assert_eq!(
             response_outcome(
                 &diagnostics,
-                Some(r2engine::EffectObligationAudit::NOT_RUN)
+                Some(r2engine::EffectObligationAudit::NOT_RUN),
+                Some(r2engine::PlacementAudit::NotRun),
             ),
             R2SLEIGH_OUTCOME_REFUSED_V2
         );
@@ -4362,6 +4664,7 @@ mod tests {
             &r2engine::EngineDiagnostics::default(),
             Some(r2engine::BindingShadowAuditOutcome::NotRun),
             Some(refused),
+            Some(r2engine::PlacementAudit::NotRun),
         )
         .expect("effect diagnostics JSON");
         let parsed: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON");
@@ -4371,7 +4674,11 @@ mod tests {
         assert_eq!(parsed["effect_obligations"]["unaccounted"], 1);
         assert_eq!(parsed["effect_obligations"]["conflicts"], 1);
         assert_eq!(
-            response_outcome(&r2engine::EngineDiagnostics::default(), Some(refused)),
+            response_outcome(
+                &r2engine::EngineDiagnostics::default(),
+                Some(refused),
+                Some(r2engine::PlacementAudit::NotRun),
+            ),
             R2SLEIGH_OUTCOME_REFUSED_V2,
             "an effect-refused native audit is a typed plugin refusal"
         );
@@ -4387,7 +4694,8 @@ mod tests {
         assert_eq!(
             response_outcome(
                 &r2engine::EngineDiagnostics::default(),
-                Some(inconsistent_admission)
+                Some(inconsistent_admission),
+                Some(r2engine::PlacementAudit::NotRun),
             ),
             R2SLEIGH_OUTCOME_REFUSED_V2,
             "nonzero refusal counts fail closed independently of disposition"
@@ -4399,7 +4707,8 @@ mod tests {
         assert_eq!(
             response_outcome(
                 &r2engine::EngineDiagnostics::default(),
-                Some(r2engine::EffectObligationAudit::NOT_RUN)
+                Some(r2engine::EffectObligationAudit::NOT_RUN),
+                Some(r2engine::PlacementAudit::NotRun),
             ),
             R2SLEIGH_OUTCOME_COMPLETED_V2,
             "a non-native route is not refused merely because the audit did not run"

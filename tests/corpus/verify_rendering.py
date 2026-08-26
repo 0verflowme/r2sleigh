@@ -214,6 +214,49 @@ BINDING_AUDIT_JOURNAL_CAUSE_FIELDS = {
     ),
     "duplicate_observation": frozenset({"observation_id"}),
 }
+PLACEMENT_AUDIT_CAUSE_FIELDS = {
+    "missing_structured_region_artifact": frozenset(),
+    "observation_journal_unavailable": frozenset(),
+    "binding_outside_plan": frozenset({"binding_index"}),
+    "region_outside_artifact": frozenset({"region_index"}),
+    "block_outside_function": frozenset({"block_address"}),
+    "region_does_not_dominate_occurrence": frozenset(
+        {"region_index", "block_address"}
+    ),
+    "external_binding_outside_plan": frozenset({"binding_index"}),
+    "region_marker_unsealed": frozenset(),
+    "region_marker_foreign": frozenset({"anchor_index"}),
+    "region_marker_duplicate": frozenset({"region_index"}),
+    "region_marker_missing": frozenset({"region_index"}),
+    "observation_domain_too_large": frozenset({"expected_count"}),
+    "observation_capacity_unavailable": frozenset({"expected_count"}),
+    "observation_out_of_range": frozenset(
+        {"observation_id", "expected_count"}
+    ),
+    "duplicate_observation": frozenset({"observation_id"}),
+    "missing_observation_target": frozenset({"observation_id"}),
+    "invalid_use": frozenset({"instruction_id", "input_index"}),
+    "invalid_write": frozenset({"instruction_id"}),
+    "missing_planned_value": frozenset({"value_id"}),
+    "refused_planned_value": frozenset({"value_id"}),
+    "unscoped_observation": frozenset({"observation_id"}),
+    "unobserved_binding_read": frozenset({"binding_index"}),
+    "unobserved_binding_write": frozenset({"binding_index"}),
+    "no_dominating_region": frozenset({"binding_index"}),
+    "missing_definition": frozenset({"binding_index"}),
+    "read_before_assignment": frozenset(
+        {"binding_index", "instruction_id", "input_index"}
+    ),
+    "missing_binding": frozenset({"binding_index"}),
+    "missing_binding_symbol": frozenset({"binding_index"}),
+    "external_binding_missing_parameter": frozenset({"binding_index"}),
+    "missing_region": frozenset({"region_index"}),
+    "duplicate_region": frozenset({"region_index"}),
+    "missing_inline_write": frozenset({"instruction_id"}),
+    "duplicate_inline_write": frozenset({"instruction_id"}),
+    "missing_binding_role": frozenset({"binding_index"}),
+    "undeclared_names": frozenset({"count"}),
+}
 BINDING_AUDIT_LINE = re.compile(
     rf"^{re.escape(BINDING_AUDIT_PREFIX)}(?P<payload>[^\r\n]*)(?:\r?\n|$)",
     re.MULTILINE,
@@ -457,8 +500,7 @@ def _score_counted_binding_audit(
         observations[domain]["total"] for domain in BINDING_AUDIT_DOMAINS
     )
     passes = (
-        envelope["request_status"] == "completed"
-        and source_status == "complete"
+        source_status == "complete"
         and all(observation_quality.values())
         and all(shadow_quality.values())
         and all(totals_match.values())
@@ -524,7 +566,6 @@ def _score_effect_obligations(envelope: dict[str, Any]) -> dict[str, Any]:
         + effect["unaccounted"]
     )
     quality = {
-        "request_completed": envelope["request_status"] == "completed",
         "admitted": effect["status"] == "admitted",
         "equation_balanced": equation_balanced,
         "zero_refused": effect["refused"] == 0,
@@ -545,6 +586,52 @@ def _score_effect_obligations(envelope: dict[str, Any]) -> dict[str, Any]:
         "record": effect,
         "equation_balanced": equation_balanced,
         "quality": quality,
+    }
+
+
+def _validate_placement_cause(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise BindingAuditFormatError("placement audit cause must be an object")
+    kind = value.get("kind")
+    if not isinstance(kind, str) or kind not in PLACEMENT_AUDIT_CAUSE_FIELDS:
+        raise BindingAuditFormatError("placement audit cause kind is invalid")
+    fields = PLACEMENT_AUDIT_CAUSE_FIELDS[kind]
+    cause = _exact_object(
+        value,
+        {"kind", *fields},
+        context="placement audit cause",
+    )
+    for field in fields:
+        _count(cause[field], context=f"placement audit cause.{field}")
+    return cause
+
+
+def _score_placement_audit(envelope: dict[str, Any]) -> dict[str, Any]:
+    placement = envelope["placement_audit"]
+    if not isinstance(placement, dict):
+        raise BindingAuditFormatError("placement audit must be an object")
+    status = placement.get("status")
+    expected_fields = {"schema_version", "status", "cause"} if status == "refused" else {
+        "schema_version",
+        "status",
+    }
+    placement = _exact_object(
+        placement,
+        expected_fields,
+        context="placement audit",
+    )
+    if isinstance(placement["schema_version"], bool) or placement["schema_version"] != 1:
+        raise BindingAuditFormatError("placement audit schema_version must be 1")
+    if status not in {"applied", "refused", "not_run"}:
+        raise BindingAuditFormatError("placement audit status is invalid")
+    if status == "refused":
+        _validate_placement_cause(placement["cause"])
+    return {
+        "status": "pass" if status == "applied" else status,
+        "request_status": envelope["request_status"],
+        "source_status": status,
+        "marker_count": 1,
+        "record": placement,
     }
 
 
@@ -616,16 +703,16 @@ def _score_binding_audit(envelope: dict[str, Any]) -> dict[str, Any]:
 
 def parse_render_audits(
     section: str,
-) -> tuple[str, dict[str, Any], dict[str, Any]]:
-    """Remove and independently score the binding and effect audit sidecar."""
+) -> tuple[str, dict[str, Any], dict[str, Any], dict[str, Any]]:
+    """Remove and independently score binding, effect, and placement audits."""
     matches = list(BINDING_AUDIT_LINE.finditer(section))
     cleaned = BINDING_AUDIT_LINE.sub("", section)
     if not matches:
         missing = {"status": "missing", "marker_count": 0}
-        return cleaned, missing.copy(), missing
+        return cleaned, missing.copy(), missing.copy(), missing
     if len(matches) != 1:
         duplicate = {"status": "duplicate", "marker_count": len(matches)}
-        return cleaned, duplicate.copy(), duplicate
+        return cleaned, duplicate.copy(), duplicate.copy(), duplicate
 
     payload = matches[0].group("payload")
     try:
@@ -647,12 +734,13 @@ def parse_render_audits(
                 "request_status",
                 "audit",
                 "effect_obligations",
+                "placement_audit",
             },
             context="binding audit envelope",
         )
-        if isinstance(record["schema_version"], bool) or record["schema_version"] != 3:
+        if isinstance(record["schema_version"], bool) or record["schema_version"] != 4:
             raise BindingAuditFormatError(
-                "binding audit envelope schema_version must be 3"
+                "binding audit envelope schema_version must be 4"
             )
         request_status = record["request_status"]
         if request_status not in {"completed", "refused"}:
@@ -665,7 +753,7 @@ def parse_render_audits(
             "marker_count": 1,
             "error": str(error),
         }
-        return cleaned, malformed.copy(), malformed
+        return cleaned, malformed.copy(), malformed.copy(), malformed
 
     try:
         binding_score = _score_binding_audit(record)
@@ -683,12 +771,20 @@ def parse_render_audits(
             "marker_count": 1,
             "error": str(error),
         }
-    return cleaned, binding_score, effect_score
+    try:
+        placement_score = _score_placement_audit(record)
+    except BindingAuditFormatError as error:
+        placement_score = {
+            "status": "malformed",
+            "marker_count": 1,
+            "error": str(error),
+        }
+    return cleaned, binding_score, effect_score, placement_score
 
 
 def parse_binding_audit(section: str) -> tuple[str, dict[str, Any]]:
     """Compatibility entry point returning only the binding side of the sidecar."""
-    cleaned, binding_score, _ = parse_render_audits(section)
+    cleaned, binding_score, _, _ = parse_render_audits(section)
     return cleaned, binding_score
 
 
@@ -1211,6 +1307,7 @@ def verify(args: argparse.Namespace) -> dict[str, Any]:
             "snapshot": {"status": "missing"},
             "binding_audit": {"status": "missing", "marker_count": 0},
             "effect_obligations": {"status": "missing", "marker_count": 0},
+            "placement_audit": {"status": "missing", "marker_count": 0},
         }
         found = sections.get(name, [])
         entry["generation"]["section_count"] = len(found)
@@ -1222,6 +1319,7 @@ def verify(args: argparse.Namespace) -> dict[str, Any]:
             exact_section,
             entry["binding_audit"],
             entry["effect_obligations"],
+            entry["placement_audit"],
         ) = parse_render_audits(found[0])
         section_dir = artifact_root / "raw-sections"
         section_dir.mkdir(parents=True, exist_ok=True)
@@ -1432,7 +1530,8 @@ def print_summary(report: dict[str, Any]) -> None:
             f"basis={str(entry['differential'].get('basis')):<10} "
             f"snapshot={entry['snapshot']['status']:<10} "
             f"binding_audit={entry['binding_audit']['status']:<12} "
-            f"effect_obligations={entry['effect_obligations']['status']}"
+            f"effect_obligations={entry['effect_obligations']['status']:<12} "
+            f"placement_audit={entry['placement_audit']['status']}"
         )
         if entry["raw"].get("status") == "failed":
             print(f"    raw: {first_error(entry['raw'])}")

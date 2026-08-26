@@ -106,6 +106,33 @@ class BindingAuditTests(unittest.TestCase):
                     with self.assertRaises(verifier.BindingAuditFormatError):
                         schema_checker.validate_oracle(candidate)
 
+    def test_placement_cause_oracle_requires_exact_unique_schema_coverage(self) -> None:
+        schema = {
+            "no_fields": frozenset(),
+            "one_field": frozenset({"binding_index"}),
+        }
+        with mock.patch.object(verifier, "PLACEMENT_AUDIT_CAUSE_FIELDS", schema):
+            self.assertEqual(
+                schema_checker.validate_placement_oracle(
+                    [
+                        {"kind": "no_fields"},
+                        {"kind": "one_field", "binding_index": 7},
+                    ]
+                ),
+                2,
+            )
+            for candidate in (
+                [{"kind": "no_fields"}],
+                [{"kind": "no_fields"}, {"kind": "no_fields"}],
+                [
+                    {"kind": "no_fields"},
+                    {"kind": "one_field", "binding_index": 7, "legacy": 1},
+                ],
+            ):
+                with self.subTest(candidate=candidate):
+                    with self.assertRaises(verifier.BindingAuditFormatError):
+                        schema_checker.validate_placement_oracle(candidate)
+
     @staticmethod
     def admitted_effect_record() -> dict[str, object]:
         return {
@@ -118,6 +145,10 @@ class BindingAuditTests(unittest.TestCase):
             "unaccounted": 0,
             "conflicts": 0,
         }
+
+    @staticmethod
+    def applied_placement_record() -> dict[str, object]:
+        return {"schema_version": 1, "status": "applied"}
 
     @staticmethod
     def complete_record() -> dict[str, object]:
@@ -146,7 +177,7 @@ class BindingAuditTests(unittest.TestCase):
             for domain in verifier.BINDING_AUDIT_DOMAINS
         }
         return {
-            "schema_version": 3,
+            "schema_version": 4,
             "request_status": "completed",
             "audit": {
                 "schema_version": 2,
@@ -155,6 +186,7 @@ class BindingAuditTests(unittest.TestCase):
                 "shadow": shadow,
             },
             "effect_obligations": BindingAuditTests.admitted_effect_record(),
+            "placement_audit": BindingAuditTests.applied_placement_record(),
         }
 
     @classmethod
@@ -164,10 +196,10 @@ class BindingAuditTests(unittest.TestCase):
             payload, separators=(",", ":")
         )
 
-    def test_exact_marker_is_removed_and_both_ledgers_are_recomputed(self) -> None:
+    def test_exact_marker_is_removed_and_all_ledgers_are_recomputed(self) -> None:
         section = f"rendered C\n{self.marker()}\ndiagnostic tail\n"
 
-        cleaned, score, effect_score = verifier.parse_render_audits(section)
+        cleaned, score, effect_score, placement_score = verifier.parse_render_audits(section)
 
         self.assertEqual(cleaned, "rendered C\ndiagnostic tail\n")
         self.assertEqual(score["status"], "pass")
@@ -180,6 +212,7 @@ class BindingAuditTests(unittest.TestCase):
         self.assertEqual(effect_score["status"], "pass")
         self.assertTrue(effect_score["equation_balanced"])
         self.assertTrue(all(effect_score["quality"].values()))
+        self.assertEqual(placement_score["status"], "pass")
 
     def test_effect_schema_checker_requires_exact_typed_counts(self) -> None:
         effect = self.admitted_effect_record()
@@ -208,21 +241,78 @@ class BindingAuditTests(unittest.TestCase):
                 with self.assertRaises(verifier.BindingAuditFormatError):
                     schema_checker.validate_effect_obligations(candidate)
 
-    def test_sidecar_requires_v3_and_both_independent_audits(self) -> None:
+    def test_placement_audit_scores_all_states_and_requires_exact_typed_causes(self) -> None:
+        cases = (
+            ({"schema_version": 1, "status": "applied"}, "pass"),
+            ({"schema_version": 1, "status": "not_run"}, "not_run"),
+            (
+                {
+                    "schema_version": 1,
+                    "status": "refused",
+                    "cause": {
+                        "kind": "read_before_assignment",
+                        "binding_index": 2,
+                        "instruction_id": 7,
+                        "input_index": 1,
+                    },
+                },
+                "refused",
+            ),
+        )
+        for placement, expected in cases:
+            with self.subTest(status=expected):
+                record = self.complete_record()
+                record["placement_audit"] = placement
+                _, binding, effect, scored = verifier.parse_render_audits(
+                    self.marker(record) + "\n"
+                )
+                self.assertEqual(binding["status"], "pass")
+                self.assertEqual(effect["status"], "pass")
+                self.assertEqual(scored["status"], expected)
+
+        for cause in (
+            {"kind": "read_before_assignment", "binding_index": 2},
+            {
+                "kind": "read_before_assignment",
+                "binding_index": 2,
+                "instruction_id": 7,
+                "input_index": 1,
+                "debug": "private error text",
+            },
+            {"kind": "unknown"},
+        ):
+            with self.subTest(cause=cause):
+                record = self.complete_record()
+                record["placement_audit"] = {
+                    "schema_version": 1,
+                    "status": "refused",
+                    "cause": cause,
+                }
+                _, binding, effect, placement = verifier.parse_render_audits(
+                    self.marker(record) + "\n"
+                )
+                self.assertEqual(binding["status"], "pass")
+                self.assertEqual(effect["status"], "pass")
+                self.assertEqual(placement["status"], "malformed")
+
+    def test_sidecar_requires_v4_and_all_independent_audits(self) -> None:
         missing_effect = self.complete_record()
         del missing_effect["effect_obligations"]
+        missing_placement = self.complete_record()
+        del missing_placement["placement_audit"]
         old_version = self.complete_record()
-        old_version["schema_version"] = 2
+        old_version["schema_version"] = 3
         extra = self.complete_record()
         extra["legacy"] = None
 
-        for candidate in (missing_effect, old_version, extra):
+        for candidate in (missing_effect, missing_placement, old_version, extra):
             with self.subTest(candidate=candidate):
-                _, binding_score, effect_score = verifier.parse_render_audits(
+                _, binding_score, effect_score, placement_score = verifier.parse_render_audits(
                     self.marker(candidate) + "\n"
                 )
                 self.assertEqual(binding_score["status"], "malformed")
                 self.assertEqual(effect_score["status"], "malformed")
+                self.assertEqual(placement_score["status"], "malformed")
 
     def test_effect_gate_requires_admission_balance_and_zero_defects(self) -> None:
         mutations = {
@@ -248,10 +338,11 @@ class BindingAuditTests(unittest.TestCase):
             with self.subTest(label=label):
                 record = self.complete_record()
                 mutate(record["effect_obligations"])
-                _, binding_score, effect_score = verifier.parse_render_audits(
+                _, binding_score, effect_score, placement_score = verifier.parse_render_audits(
                     self.marker(record) + "\n"
                 )
                 self.assertEqual(binding_score["status"], "pass")
+                self.assertEqual(placement_score["status"], "pass")
                 expected_status = {
                     "refused_status": "refused",
                     "not_run": "not_run",
@@ -261,19 +352,21 @@ class BindingAuditTests(unittest.TestCase):
     def test_binding_and_effect_payload_failures_are_scored_independently(self) -> None:
         malformed_binding = self.complete_record()
         malformed_binding["audit"]["legacy"] = True
-        _, binding_score, effect_score = verifier.parse_render_audits(
+        _, binding_score, effect_score, placement_score = verifier.parse_render_audits(
             self.marker(malformed_binding) + "\n"
         )
         self.assertEqual(binding_score["status"], "malformed")
         self.assertEqual(effect_score["status"], "pass")
+        self.assertEqual(placement_score["status"], "pass")
 
         malformed_effect = self.complete_record()
         malformed_effect["effect_obligations"]["legacy"] = True
-        _, binding_score, effect_score = verifier.parse_render_audits(
+        _, binding_score, effect_score, placement_score = verifier.parse_render_audits(
             self.marker(malformed_effect) + "\n"
         )
         self.assertEqual(binding_score["status"], "pass")
         self.assertEqual(effect_score["status"], "malformed")
+        self.assertEqual(placement_score["status"], "pass")
 
     def test_zero_effects_can_be_admitted_when_the_ledger_is_closed(self) -> None:
         record = self.complete_record()
@@ -285,7 +378,7 @@ class BindingAuditTests(unittest.TestCase):
             }
         )
 
-        _, _, effect_score = verifier.parse_render_audits(
+        _, _, effect_score, _ = verifier.parse_render_audits(
             self.marker(record) + "\n"
         )
 
@@ -309,12 +402,14 @@ class BindingAuditTests(unittest.TestCase):
         }
         for expected_status, (section, expected_cleaned, count) in cases.items():
             with self.subTest(status=expected_status):
-                cleaned, score, effect_score = verifier.parse_render_audits(section)
+                cleaned, score, effect_score, placement_score = verifier.parse_render_audits(section)
                 self.assertEqual(cleaned, expected_cleaned)
                 self.assertEqual(score["status"], expected_status)
                 self.assertEqual(score["marker_count"], count)
                 self.assertEqual(effect_score["status"], expected_status)
                 self.assertEqual(effect_score["marker_count"], count)
+                self.assertEqual(placement_score["status"], expected_status)
+                self.assertEqual(placement_score["marker_count"], count)
 
     def test_balanced_unaccounted_refusal_or_shadow_defect_cannot_pass(self) -> None:
         mutations = {
@@ -371,24 +466,26 @@ class BindingAuditTests(unittest.TestCase):
         _, score = verifier.parse_binding_audit(self.marker(extra) + "\n")
         self.assertEqual(score["status"], "malformed")
 
-    def test_refused_request_cannot_pass_a_complete_audit(self) -> None:
+    def test_individual_audits_remain_diagnostic_when_request_is_refused(self) -> None:
         record = self.complete_record()
         record["request_status"] = "refused"
 
-        _, score, effect_score = verifier.parse_render_audits(
+        _, score, effect_score, placement_score = verifier.parse_render_audits(
             self.marker(record) + "\n"
         )
 
-        self.assertEqual(score["status"], "non_quality")
+        self.assertEqual(score["status"], "pass")
         self.assertEqual(score["request_status"], "refused")
         self.assertTrue(all(score["quality"]["observations"].values()))
         self.assertTrue(all(score["quality"]["shadow"].values()))
-        self.assertEqual(effect_score["status"], "non_quality")
-        self.assertFalse(effect_score["quality"]["request_completed"])
+        self.assertEqual(effect_score["status"], "pass")
+        self.assertEqual(effect_score["request_status"], "refused")
+        self.assertEqual(placement_score["status"], "pass")
+        self.assertEqual(placement_score["request_status"], "refused")
 
     def test_failed_journal_audit_requires_an_exact_typed_cause(self) -> None:
         record = {
-            "schema_version": 3,
+            "schema_version": 4,
             "request_status": "completed",
             "audit": {
                 "schema_version": 2,
@@ -401,6 +498,7 @@ class BindingAuditTests(unittest.TestCase):
                 },
             },
             "effect_obligations": self.admitted_effect_record(),
+            "placement_audit": self.applied_placement_record(),
         }
 
         _, score = verifier.parse_binding_audit(self.marker(record) + "\n")
@@ -767,6 +865,10 @@ class VerificationTests(unittest.TestCase):
                         "status": "missing",
                         "marker_count": 0,
                     },
+                    "placement_audit": {
+                        "status": "missing",
+                        "marker_count": 0,
+                    },
                 }
                 for name in verifier.SPECS
             ]
@@ -830,6 +932,7 @@ class VerificationTests(unittest.TestCase):
         )
         self.assertEqual(entry["binding_audit"]["status"], "pass")
         self.assertEqual(entry["effect_obligations"]["status"], "pass")
+        self.assertEqual(entry["placement_audit"]["status"], "pass")
         for stage in ("raw", "diagnostic", "differential"):
             self.assertEqual(entry[stage]["status"], "blocked_generation")
 

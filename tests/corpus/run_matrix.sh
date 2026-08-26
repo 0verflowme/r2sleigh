@@ -15,24 +15,24 @@ while [[ $# -gt 0 ]]; do
             ;;
         --gate)
             if [[ $# -lt 2 ]]; then
-                echo "--gate requires measurement, snapshot, raw, differential, binding-audit, or effect-audit" >&2
+                echo "--gate requires measurement, snapshot, raw, differential, binding-audit, effect-audit, placement-audit, or native-admission" >&2
                 exit 64
             fi
             gate=$2
             shift 2
             ;;
         *)
-            echo "usage: $0 [--accept-baseline] [--gate measurement|snapshot|raw|differential|binding-audit|effect-audit]" >&2
+            echo "usage: $0 [--accept-baseline] [--gate measurement|snapshot|raw|differential|binding-audit|effect-audit|placement-audit|native-admission]" >&2
             exit 64
             ;;
     esac
 done
 if [[ -z $gate ]]; then
-    echo "--gate is required: measurement, snapshot, raw, differential, binding-audit, or effect-audit" >&2
+    echo "--gate is required: measurement, snapshot, raw, differential, binding-audit, effect-audit, placement-audit, or native-admission" >&2
     exit 64
 fi
 case $gate in
-    measurement|snapshot|raw|differential|binding-audit|effect-audit) ;;
+    measurement|snapshot|raw|differential|binding-audit|effect-audit|placement-audit|native-admission) ;;
     *)
         echo "unsupported gate: $gate" >&2
         exit 64
@@ -151,7 +151,7 @@ combined = {"schema_version": 1, "expected_entries": 54, "entries": entries}
 
 for score in (
     "generation", "raw", "diagnostic", "differential", "snapshot",
-    "binding_audit", "effect_obligations",
+    "binding_audit", "effect_obligations", "placement_audit",
 ):
     counts = {}
     for entry in entries:
@@ -190,6 +190,28 @@ for entry in entries:
             f"{key}: effect_obligations={effect['status']} "
             f"source={effect.get('source_status')}"
         )
+    if gate == "placement-audit" and entry["placement_audit"]["status"] != "pass":
+        placement = entry["placement_audit"]
+        failures.append(
+            f"{key}: placement_audit={placement['status']} "
+            f"source={placement.get('source_status')}"
+        )
+    if gate == "native-admission":
+        binding = entry["binding_audit"]
+        effect = entry["effect_obligations"]
+        placement = entry["placement_audit"]
+        request_status = placement.get("request_status")
+        if (
+            request_status != "completed"
+            or binding["status"] != "pass"
+            or effect["status"] != "pass"
+            or placement["status"] != "pass"
+        ):
+            failures.append(
+                f"{key}: native_admission request={request_status} "
+                f"binding={binding['status']} effect={effect['status']} "
+                f"placement={placement['status']}"
+            )
     if gate in {"snapshot", "raw", "differential"} and entry["snapshot"]["status"] not in {
         "match", "accepted"
     }:

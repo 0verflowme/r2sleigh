@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Check Rust-produced binding and effect records against the corpus schema."""
+"""Check Rust-produced binding, effect, and placement records against the corpus schema."""
 
 from __future__ import annotations
 
@@ -40,6 +40,29 @@ def validate_effect_obligations(value: Any) -> dict[str, Any]:
     return verifier._validate_effect_obligations(value)
 
 
+def validate_placement_oracle(value: Any) -> int:
+    if not isinstance(value, list):
+        raise verifier.BindingAuditFormatError(
+            "placement cause oracle must be a JSON array"
+        )
+    seen: set[str] = set()
+    for index, candidate in enumerate(value):
+        cause = verifier._validate_placement_cause(candidate)
+        kind = cause["kind"]
+        if kind in seen:
+            raise verifier.BindingAuditFormatError(
+                f"placement cause oracle repeats kind {kind!r} at index {index}"
+            )
+        seen.add(kind)
+    expected = set(verifier.PLACEMENT_AUDIT_CAUSE_FIELDS)
+    if seen != expected:
+        raise verifier.BindingAuditFormatError(
+            "placement cause oracle kind mismatch: "
+            f"missing={sorted(expected - seen)} unexpected={sorted(seen - expected)}"
+        )
+    return len(seen)
+
+
 def validate_schema(value: Any) -> int:
     if isinstance(value, list):
         return validate_oracle(value)
@@ -48,8 +71,16 @@ def validate_schema(value: Any) -> int:
 
 
 def main() -> int:
+    if sys.argv[1:] not in ([], ["--placement"]):
+        print("usage: check_binding_audit_schema.py [--placement]", file=sys.stderr)
+        return 64
     try:
-        count = validate_schema(json.load(sys.stdin))
+        value = json.load(sys.stdin)
+        count = (
+            validate_placement_oracle(value)
+            if sys.argv[1:] == ["--placement"]
+            else validate_schema(value)
+        )
     except (json.JSONDecodeError, verifier.BindingAuditFormatError) as error:
         print(error, file=sys.stderr)
         return 1

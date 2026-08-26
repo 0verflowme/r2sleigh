@@ -2586,6 +2586,7 @@ pub(crate) struct EngineV2Output {
     pub(crate) diagnostics: r2engine::EngineDiagnostics,
     pub(crate) binding_audit: Option<r2engine::BindingShadowAuditOutcome>,
     pub(crate) effect_obligations: Option<r2engine::EffectObligationAudit>,
+    pub(crate) placement_audit: Option<r2engine::PlacementAudit>,
 }
 
 /// The name the source gives this function, when it gives one.
@@ -2647,6 +2648,7 @@ fn r2sleigh_engine_decompile_trusted_output(
         diagnostics: response.diagnostics,
         binding_audit: Some(response.binding_audit),
         effect_obligations: Some(response.effect_obligations),
+        placement_audit: Some(response.placement_audit),
     })
 }
 
@@ -2702,6 +2704,7 @@ fn r2sleigh_engine_type_function_trusted_output(
                 diagnostics: *refusal.diagnostics,
                 binding_audit: None,
                 effect_obligations: None,
+                placement_audit: None,
             });
         }
     };
@@ -2730,6 +2733,7 @@ fn r2sleigh_engine_type_function_trusted_output(
         diagnostics,
         binding_audit: None,
         effect_obligations: None,
+        placement_audit: None,
     })
 }
 
@@ -2771,6 +2775,7 @@ fn r2sleigh_engine_proven_facts_trusted_output(
         diagnostics: r2engine::EngineDiagnostics::default(),
         binding_audit: None,
         effect_obligations: None,
+        placement_audit: None,
     })
 }
 
@@ -4932,7 +4937,7 @@ mod tests {
     }
 
     #[test]
-    fn c_plugin_emits_one_versioned_sidecar_with_both_independent_audits() {
+    fn c_plugin_emits_one_versioned_sidecar_with_all_independent_audits() {
         let c_source = include_str!("../r_anal_sleigh.c");
         let emitter = c_source
             .split("static void sleigh_engine_v2_emit_binding_audit")
@@ -4941,10 +4946,13 @@ mod tests {
 
         assert!(emitter.contains("r_json_get (diagnostics, \"binding_audit\")"));
         assert!(emitter.contains("r_json_get (diagnostics, \"effect_obligations\")"));
+        assert!(emitter.contains("r_json_get (diagnostics, \"placement_audit\")"));
         assert!(emitter.contains("effect_obligations->type == R_JSON_OBJECT"));
-        assert!(emitter.contains("pj_kn (pj, \"schema_version\", 3)"));
+        assert!(emitter.contains("placement_audit->type == R_JSON_OBJECT"));
+        assert!(emitter.contains("pj_kn (pj, \"schema_version\", 4)"));
         assert!(emitter.contains("pj_k (pj, \"audit\")"));
         assert!(emitter.contains("pj_k (pj, \"effect_obligations\")"));
+        assert!(emitter.contains("pj_k (pj, \"placement_audit\")"));
         assert_eq!(
             emitter.matches("SLEIGH_BINDING_AUDIT_PREFIX").count(),
             1,
@@ -8430,14 +8438,30 @@ mod integration_tests {
                 )
             });
         assert_eq!(len_home.name, "arg1");
-        // Certified facts stay inspectable even when the effect ledger refuses
-        // executable C and the engine replaces only the route with a comment.
+        let binding_index = match response.placement_audit {
+            r2engine::PlacementAudit::Refused(
+                r2engine::PlacementAuditRefusal::UnobservedBindingRead { binding_index },
+            ) => binding_index,
+            other => panic!("expected exact unobserved-binding-read refusal, got {other:?}"),
+        };
+        assert_eq!(
+            response.placement_audit,
+            r2engine::PlacementAudit::Refused(
+                r2engine::PlacementAuditRefusal::UnobservedBindingRead { binding_index }
+            )
+        );
+        // Temporary admission gate: the occurrence cutover must eventually
+        // make this audit Applied, but may not hide the missing read meanwhile.
+        // Certified facts stay inspectable while the engine replaces only the
+        // refused native route with a comment.
         assert!(
             response.output.starts_with("/* r2dec fallback:")
-                && response.output.contains("native effect obligations refused:")
+                && response
+                    .output
+                    .contains("native declaration placement refused: unobserved_binding_read")
                 && !response.output.contains("for (int32_t var_14h = 0;")
                 && !response.output.contains("return var_10h;"),
-            "certified facts must remain inspectable while a refused effect audit leaves only a fallback comment; output={} render_facts={:?}",
+            "certified facts must remain inspectable while exact placement refusal leaves only a fallback comment; output={} render_facts={:?}",
             response.output,
             response.function_facts.render_facts()
         );

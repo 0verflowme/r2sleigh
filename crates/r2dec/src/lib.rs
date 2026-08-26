@@ -3038,6 +3038,181 @@ impl EffectObligationAudit {
     }
 }
 
+/// Stable reason the final native declaration-placement pass refused C.
+///
+/// Payloads contain only deterministic dense identities and counts. Private
+/// renderer errors are projected into this type before crossing the r2dec API
+/// boundary; their debug representations are never part of the contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlacementAuditRefusal {
+    MissingStructuredRegionArtifact,
+    ObservationJournalUnavailable,
+    BindingOutsidePlan {
+        binding_index: usize,
+    },
+    RegionOutsideArtifact {
+        region_index: usize,
+    },
+    BlockOutsideFunction {
+        block_address: u64,
+    },
+    RegionDoesNotDominateOccurrence {
+        region_index: usize,
+        block_address: u64,
+    },
+    ExternalBindingOutsidePlan {
+        binding_index: usize,
+    },
+    RegionMarkerUnsealed,
+    RegionMarkerForeign {
+        anchor_index: usize,
+    },
+    RegionMarkerDuplicate {
+        region_index: usize,
+    },
+    RegionMarkerMissing {
+        region_index: usize,
+    },
+    ObservationDomainTooLarge {
+        expected_count: usize,
+    },
+    ObservationCapacityUnavailable {
+        expected_count: usize,
+    },
+    ObservationOutOfRange {
+        observation_id: u32,
+        expected_count: usize,
+    },
+    DuplicateObservation {
+        observation_id: u32,
+    },
+    MissingObservationTarget {
+        observation_id: u32,
+    },
+    InvalidUse {
+        instruction_id: u32,
+        input_index: usize,
+    },
+    InvalidWrite {
+        instruction_id: u32,
+    },
+    MissingPlannedValue {
+        value_id: u32,
+    },
+    RefusedPlannedValue {
+        value_id: u32,
+    },
+    UnscopedObservation {
+        observation_id: u32,
+    },
+    UnobservedBindingRead {
+        binding_index: usize,
+    },
+    UnobservedBindingWrite {
+        binding_index: usize,
+    },
+    NoDominatingRegion {
+        binding_index: usize,
+    },
+    MissingDefinition {
+        binding_index: usize,
+    },
+    ReadBeforeAssignment {
+        binding_index: usize,
+        instruction_id: u32,
+        input_index: usize,
+    },
+    MissingBinding {
+        binding_index: usize,
+    },
+    MissingBindingSymbol {
+        binding_index: usize,
+    },
+    ExternalBindingMissingParameter {
+        binding_index: usize,
+    },
+    MissingRegion {
+        region_index: usize,
+    },
+    DuplicateRegion {
+        region_index: usize,
+    },
+    MissingInlineWrite {
+        instruction_id: u32,
+    },
+    DuplicateInlineWrite {
+        instruction_id: u32,
+    },
+    MissingBindingRole {
+        binding_index: usize,
+    },
+    UndeclaredNames {
+        count: usize,
+    },
+}
+
+impl PlacementAuditRefusal {
+    /// Stable machine-readable category used by engine and plugin boundaries.
+    pub const fn kind(self) -> &'static str {
+        match self {
+            Self::MissingStructuredRegionArtifact => "missing_structured_region_artifact",
+            Self::ObservationJournalUnavailable => "observation_journal_unavailable",
+            Self::BindingOutsidePlan { .. } => "binding_outside_plan",
+            Self::RegionOutsideArtifact { .. } => "region_outside_artifact",
+            Self::BlockOutsideFunction { .. } => "block_outside_function",
+            Self::RegionDoesNotDominateOccurrence { .. } => {
+                "region_does_not_dominate_occurrence"
+            }
+            Self::ExternalBindingOutsidePlan { .. } => "external_binding_outside_plan",
+            Self::RegionMarkerUnsealed => "region_marker_unsealed",
+            Self::RegionMarkerForeign { .. } => "region_marker_foreign",
+            Self::RegionMarkerDuplicate { .. } => "region_marker_duplicate",
+            Self::RegionMarkerMissing { .. } => "region_marker_missing",
+            Self::ObservationDomainTooLarge { .. } => "observation_domain_too_large",
+            Self::ObservationCapacityUnavailable { .. } => "observation_capacity_unavailable",
+            Self::ObservationOutOfRange { .. } => "observation_out_of_range",
+            Self::DuplicateObservation { .. } => "duplicate_observation",
+            Self::MissingObservationTarget { .. } => "missing_observation_target",
+            Self::InvalidUse { .. } => "invalid_use",
+            Self::InvalidWrite { .. } => "invalid_write",
+            Self::MissingPlannedValue { .. } => "missing_planned_value",
+            Self::RefusedPlannedValue { .. } => "refused_planned_value",
+            Self::UnscopedObservation { .. } => "unscoped_observation",
+            Self::UnobservedBindingRead { .. } => "unobserved_binding_read",
+            Self::UnobservedBindingWrite { .. } => "unobserved_binding_write",
+            Self::NoDominatingRegion { .. } => "no_dominating_region",
+            Self::MissingDefinition { .. } => "missing_definition",
+            Self::ReadBeforeAssignment { .. } => "read_before_assignment",
+            Self::MissingBinding { .. } => "missing_binding",
+            Self::MissingBindingSymbol { .. } => "missing_binding_symbol",
+            Self::ExternalBindingMissingParameter { .. } => {
+                "external_binding_missing_parameter"
+            }
+            Self::MissingRegion { .. } => "missing_region",
+            Self::DuplicateRegion { .. } => "duplicate_region",
+            Self::MissingInlineWrite { .. } => "missing_inline_write",
+            Self::DuplicateInlineWrite { .. } => "duplicate_inline_write",
+            Self::MissingBindingRole { .. } => "missing_binding_role",
+            Self::UndeclaredNames { .. } => "undeclared_names",
+        }
+    }
+}
+
+/// Independent final-tree declaration-placement audit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlacementAudit {
+    Applied,
+    Refused(PlacementAuditRefusal),
+    /// The selected route never entered native declaration placement.
+    NotRun,
+}
+
+impl PlacementAudit {
+    pub const fn is_applied(self) -> bool {
+        matches!(self, Self::Applied)
+    }
+}
+
 /// Rendered C paired with the non-consuming Stage 4 binding audit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DecompileRenderRefusal {
@@ -3063,6 +3238,7 @@ pub struct DecompileBindingAudit {
     output: String,
     binding_shadow: BindingShadowAuditOutcome,
     effect_obligations: EffectObligationAudit,
+    placement_audit: PlacementAudit,
     render_refusal: Option<DecompileRenderRefusal>,
 }
 
@@ -3072,6 +3248,7 @@ impl DecompileBindingAudit {
             output,
             binding_shadow: BindingShadowAuditOutcome::NotRun,
             effect_obligations: EffectObligationAudit::NOT_RUN,
+            placement_audit: PlacementAudit::NotRun,
             render_refusal: None,
         }
     }
@@ -3090,6 +3267,10 @@ impl DecompileBindingAudit {
 
     pub const fn effect_obligations(&self) -> EffectObligationAudit {
         self.effect_obligations
+    }
+
+    pub const fn placement_audit(&self) -> PlacementAudit {
+        self.placement_audit
     }
 
     pub const fn render_refusal(&self) -> Option<DecompileRenderRefusal> {
@@ -3111,6 +3292,7 @@ pub struct PendingDecompileBindingAudit {
     )>,
     ready: BindingShadowAuditOutcome,
     ready_effects: EffectObligationAudit,
+    ready_placement: PlacementAudit,
     ready_refusal: Option<DecompileRenderRefusal>,
 }
 
@@ -3121,6 +3303,7 @@ impl PendingDecompileBindingAudit {
             product: None,
             ready: audit.binding_shadow,
             ready_effects: audit.effect_obligations,
+            ready_placement: audit.placement_audit,
             ready_refusal: audit.render_refusal,
         }
     }
@@ -3135,6 +3318,7 @@ impl PendingDecompileBindingAudit {
             product: Some((product, source)),
             ready: BindingShadowAuditOutcome::NotRun,
             ready_effects: EffectObligationAudit::NOT_RUN,
+            ready_placement: PlacementAudit::NotRun,
             ready_refusal: None,
         }
     }
@@ -3148,10 +3332,11 @@ impl PendingDecompileBindingAudit {
     }
 
     pub fn finalize(self) -> DecompileBindingAudit {
-        let (binding_shadow, effect_obligations, render_refusal) = self.product.map_or((self.ready, self.ready_effects, self.ready_refusal), |(product, source)| {
+        let (binding_shadow, effect_obligations, placement_audit, render_refusal) = self.product.map_or((self.ready, self.ready_effects, self.ready_placement, self.ready_refusal), |(product, source)| {
                     (
                         product.binding_shadow(&source),
                         product.effect_obligations(),
+                        product.placement_audit(),
                         product.render_refusal(),
                     )
                 });
@@ -3159,6 +3344,7 @@ impl PendingDecompileBindingAudit {
             output: self.output,
             binding_shadow,
             effect_obligations,
+            placement_audit,
             render_refusal,
         }
     }
@@ -3231,6 +3417,13 @@ impl InternalBuildProduct {
         match self {
             Self::Native(native) => native.effect_obligation_audit(),
             Self::Residual(_) | Self::Refused { .. } => EffectObligationAudit::NOT_RUN,
+        }
+    }
+
+    fn placement_audit(&self) -> PlacementAudit {
+        match self {
+            Self::Native(native) => native.placement_audit(),
+            Self::Residual(_) | Self::Refused { .. } => PlacementAudit::NotRun,
         }
     }
 
@@ -3426,10 +3619,12 @@ impl Decompiler {
         render_work.poll()?;
         let binding_shadow = product.binding_shadow(input.source_owned_facts());
         let effect_obligations = product.effect_obligations();
+        let placement_audit = product.placement_audit();
         Ok(DecompileBindingAudit {
             output,
             binding_shadow,
             effect_obligations,
+            placement_audit,
             render_refusal: product.render_refusal(),
         })
     }
@@ -4716,20 +4911,25 @@ impl Decompiler {
                 Rc::clone(&binding_names),
             )
             .finish_non_consuming(input.source_owned_facts(), observation_error),
-            None => SealedNativeFunction::without_observations(
-                if structured_regions.is_some() {
-                    residual_function_for_render_boundary(
-                        &c_function.name,
-                        "placement refusal: observation journal unavailable",
-                    )
+            None => {
+                let refusal = if structured_regions.is_some() {
+                    PlacementAuditRefusal::ObservationJournalUnavailable
                 } else {
-                    c_function
-                },
-                binding_plan,
-                prepared,
-                observation_failure
-                    .expect("missing observation journal retains its construction failure"),
-            ),
+                    PlacementAuditRefusal::MissingStructuredRegionArtifact
+                };
+                let function = residual_function_for_render_boundary(
+                    &c_function.name,
+                    &format!("placement refusal: {}", refusal.kind()),
+                );
+                SealedNativeFunction::without_observations(
+                    function,
+                    binding_plan,
+                    prepared,
+                    observation_failure
+                        .expect("missing observation journal retains its construction failure"),
+                    PlacementAudit::Refused(refusal),
+                )
+            }
         };
         let ledger = effect_ledger::build_obligation_ledger(
             prepared,

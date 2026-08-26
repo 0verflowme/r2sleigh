@@ -36,7 +36,8 @@ pub use r2dec::{
     BindingMachineProjectionFailure, BindingObservationAudit, BindingObservationDomainAudit,
     BindingObservationJournalFailure, BindingShadowAuditFailure, BindingShadowAuditLedger,
     BindingShadowAuditOutcome, BindingShadowDomainAudit, EffectObligationAudit,
-    EffectObligationDisposition, DecompileRenderRefusal,
+    EffectObligationDisposition, DecompileRenderRefusal, PlacementAudit,
+    PlacementAuditRefusal,
 };
 #[cfg(test)]
 use route::{decompile_probe_decision, plan_decompile_request, semantic_route_reason};
@@ -4077,6 +4078,7 @@ pub struct EngineDecompileResponse {
     pub output: String,
     pub binding_audit: BindingShadowAuditOutcome,
     pub effect_obligations: EffectObligationAudit,
+    pub placement_audit: PlacementAudit,
     pub render_refusal: Option<DecompileRenderRefusal>,
     pub function_facts: FunctionFacts,
     pub input_quality: Option<r2types::FunctionInputQualityFacts>,
@@ -4421,6 +4423,7 @@ impl EngineSession {
                 Some(analyzed_function_facts),
                 BindingShadowAuditOutcome::NotRun,
                 EffectObligationAudit::NOT_RUN,
+                PlacementAudit::NotRun,
                 None,
             );
         };
@@ -4435,6 +4438,7 @@ impl EngineSession {
                 Some(analyzed_function_facts),
                 BindingShadowAuditOutcome::NotRun,
                 EffectObligationAudit::NOT_RUN,
+                PlacementAudit::NotRun,
                 None,
             );
         }
@@ -4451,6 +4455,7 @@ impl EngineSession {
                 Some(analyzed_function_facts),
                 BindingShadowAuditOutcome::NotRun,
                 EffectObligationAudit::NOT_RUN,
+                PlacementAudit::NotRun,
                 None,
             );
         }
@@ -4489,6 +4494,7 @@ impl EngineSession {
                     Some(analyzed_function_facts),
                     BindingShadowAuditOutcome::NotRun,
                     EffectObligationAudit::NOT_RUN,
+                    PlacementAudit::NotRun,
                     None,
                 );
             }
@@ -4560,6 +4566,7 @@ impl EngineSession {
                 Some(response_function_facts),
                 BindingShadowAuditOutcome::NotRun,
                 EffectObligationAudit::NOT_RUN,
+                PlacementAudit::NotRun,
                 None,
             );
         }
@@ -4580,6 +4587,7 @@ impl EngineSession {
                 Some(response_function_facts),
                 BindingShadowAuditOutcome::NotRun,
                 EffectObligationAudit::NOT_RUN,
+                PlacementAudit::NotRun,
                 None,
             );
         }
@@ -4597,6 +4605,7 @@ impl EngineSession {
                 );
                 let binding_audit = stop.binding_audit;
                 let effect_obligations = stop.effect_obligations;
+                let placement_audit = stop.placement_audit;
                 let render_refusal = stop.render_refusal;
                 let refusal = engine_render_execution_refusal(stop.reason, stop.phase, metrics);
                 return refused_decompile_response_with_metrics_and_audits(
@@ -4608,6 +4617,7 @@ impl EngineSession {
                     Some(response_function_facts),
                     binding_audit,
                     effect_obligations,
+                    placement_audit,
                     render_refusal,
                 );
             }
@@ -4657,7 +4667,26 @@ impl EngineSession {
         metrics.planning_time += planning_time;
         metrics.render_time = render_time;
         let rendering_stopped = rendered.stopped.is_some();
-        let (output, binding_audit, effect_obligations, render_refusal) = rendered.product.finalize();
+        let (output, binding_audit, effect_obligations, placement_audit, render_refusal) = rendered.product.finalize();
+        if !rendering_stopped && let Some(reason) = placement_refusal_reason(placement_audit) {
+            metrics.record_phase(
+                EnginePhase::Rendering,
+                EnginePhaseStatus::Refused,
+                render_time,
+            );
+            return refused_decompile_response_with_metrics_and_audits(
+                &request.function_name,
+                &reason,
+                input_quality,
+                metrics,
+                diagnostics,
+                Some(response_function_facts),
+                binding_audit,
+                effect_obligations,
+                placement_audit,
+                render_refusal,
+            );
+        }
         if !rendering_stopped && let Some(refusal) = render_refusal {
             let reason = render_refusal_reason(refusal);
             metrics.record_phase(
@@ -4674,6 +4703,7 @@ impl EngineSession {
                 Some(response_function_facts),
                 binding_audit,
                 effect_obligations,
+                placement_audit,
                 Some(refusal),
             );
         }
@@ -4692,6 +4722,7 @@ impl EngineSession {
                 Some(response_function_facts),
                 binding_audit,
                 effect_obligations,
+                placement_audit,
                 None,
             );
         }
@@ -4707,6 +4738,7 @@ impl EngineSession {
                 Some(response_function_facts),
                 binding_audit,
                 effect_obligations,
+                placement_audit,
                 None,
             );
         }
@@ -4714,6 +4746,7 @@ impl EngineSession {
             output,
             binding_audit,
             effect_obligations,
+            placement_audit,
             render_refusal,
             function_facts: response_function_facts,
             input_quality,
@@ -5242,6 +5275,16 @@ fn effect_obligation_refusal_reason(audit: EffectObligationAudit) -> Option<Stri
     })
 }
 
+fn placement_refusal_reason(audit: PlacementAudit) -> Option<String> {
+    match audit {
+        PlacementAudit::Refused(refusal) => Some(format!(
+            "native declaration placement refused: {}",
+            refusal.kind()
+        )),
+        PlacementAudit::Applied | PlacementAudit::NotRun => None,
+    }
+}
+
 fn render_refusal_reason(refusal: DecompileRenderRefusal) -> &'static str {
     match refusal {
         DecompileRenderRefusal::MissingMachineProjectionAuthorization => {
@@ -5310,6 +5353,7 @@ enum EngineRenderedProduct {
         output: String,
         binding_audit: BindingShadowAuditOutcome,
         effect_obligations: EffectObligationAudit,
+        placement_audit: PlacementAudit,
         render_refusal: Option<DecompileRenderRefusal>,
     },
     Pending(r2dec::PendingDecompileBindingAudit),
@@ -5329,6 +5373,7 @@ impl EngineRenderedProduct {
         String,
         BindingShadowAuditOutcome,
         EffectObligationAudit,
+        PlacementAudit,
         Option<DecompileRenderRefusal>,
     ) {
         match self {
@@ -5336,14 +5381,16 @@ impl EngineRenderedProduct {
                 output,
                 binding_audit,
                 effect_obligations,
+                placement_audit,
                 render_refusal,
-            } => (output, binding_audit, effect_obligations, render_refusal),
+            } => (output, binding_audit, effect_obligations, placement_audit, render_refusal),
             Self::Pending(pending) => {
                 let audited = pending.finalize();
                 let binding_audit = audited.binding_shadow();
                 let effect_obligations = audited.effect_obligations();
+                let placement_audit = audited.placement_audit();
                 let render_refusal = audited.render_refusal();
-                (audited.into_output(), binding_audit, effect_obligations, render_refusal)
+                (audited.into_output(), binding_audit, effect_obligations, placement_audit, render_refusal)
             }
         }
     }
@@ -5355,6 +5402,7 @@ struct EngineRenderExecutionStop {
     phase: EnginePhase,
     binding_audit: BindingShadowAuditOutcome,
     effect_obligations: EffectObligationAudit,
+    placement_audit: PlacementAudit,
     render_refusal: Option<DecompileRenderRefusal>,
     certification_completed: bool,
     normalization_completed: bool,
@@ -5400,6 +5448,7 @@ fn engine_render_stop_reason(
         phase,
         binding_audit: BindingShadowAuditOutcome::NotRun,
         effect_obligations: EffectObligationAudit::NOT_RUN,
+        placement_audit: PlacementAudit::NotRun,
         render_refusal: None,
         certification_completed: false,
         normalization_completed: false,
@@ -5432,6 +5481,7 @@ fn engine_render_stop_from_decompiler(
     stop: r2dec::DecompileExecutionStop,
     binding_audit: BindingShadowAuditOutcome,
     effect_obligations: EffectObligationAudit,
+    placement_audit: PlacementAudit,
     render_refusal: Option<DecompileRenderRefusal>,
 ) -> EngineRenderExecutionStop {
     let phase = match stop.phase() {
@@ -5442,6 +5492,7 @@ fn engine_render_stop_from_decompiler(
     let mut mapped = engine_render_stop_reason(stop.reason(), phase);
     mapped.binding_audit = binding_audit;
     mapped.effect_obligations = effect_obligations;
+    mapped.placement_audit = placement_audit;
     mapped.render_refusal = render_refusal;
     match stop.phase() {
         r2dec::DecompileWorkPhase::Normalization => {}
@@ -5472,6 +5523,7 @@ fn render_engine_decompile_request<C: r2ssa::SsaWorkControl>(
                 output,
                 binding_audit: BindingShadowAuditOutcome::NotRun,
                 effect_obligations: EffectObligationAudit::NOT_RUN,
+                placement_audit: PlacementAudit::NotRun,
                 render_refusal: None,
             },
             semantic_kernel_warnings: Vec::new(),
@@ -5492,6 +5544,7 @@ fn render_engine_decompile_request<C: r2ssa::SsaWorkControl>(
             let audited = partial.finalize();
             let binding_audit = audited.binding_shadow();
             let effect_obligations = audited.effect_obligations();
+            let placement_audit = audited.placement_audit();
             let render_refusal = audited.render_refusal();
             let output = audited.into_output();
             return Ok(EngineRenderedDecompile {
@@ -5499,6 +5552,7 @@ fn render_engine_decompile_request<C: r2ssa::SsaWorkControl>(
                     output,
                     binding_audit,
                     effect_obligations,
+                    placement_audit,
                     render_refusal,
                 },
                 semantic_kernel_warnings: vec![format!(
@@ -5511,22 +5565,25 @@ fn render_engine_decompile_request<C: r2ssa::SsaWorkControl>(
                     stop,
                     binding_audit,
                     effect_obligations,
+                    placement_audit,
                     render_refusal,
                 )),
             });
         }
         Err((stop, partial)) => {
-            let (binding_audit, effect_obligations, render_refusal) = partial
+            let (binding_audit, effect_obligations, placement_audit, render_refusal) = partial
                 .map(r2dec::PendingDecompileBindingAudit::finalize)
                 .map_or(
                     (
                         BindingShadowAuditOutcome::NotRun,
                         EffectObligationAudit::NOT_RUN,
+                        PlacementAudit::NotRun,
                         None,
                     ),
                     |audit| (
                         audit.binding_shadow(),
                         audit.effect_obligations(),
+                        audit.placement_audit(),
                         audit.render_refusal(),
                     ),
                 );
@@ -5534,6 +5591,7 @@ fn render_engine_decompile_request<C: r2ssa::SsaWorkControl>(
                 stop,
                 binding_audit,
                 effect_obligations,
+                placement_audit,
                 render_refusal,
             ));
         }
@@ -5550,6 +5608,7 @@ fn render_engine_decompile_request<C: r2ssa::SsaWorkControl>(
     let audited = audited.finalize();
     let binding_audit = audited.binding_shadow();
     let effect_obligations = audited.effect_obligations();
+    let placement_audit = audited.placement_audit();
     let render_refusal = audited.render_refusal();
     Ok(EngineRenderedDecompile {
         product: EngineRenderedProduct::Ready {
@@ -5560,6 +5619,7 @@ fn render_engine_decompile_request<C: r2ssa::SsaWorkControl>(
             .unwrap_or_default(),
             binding_audit,
             effect_obligations,
+            placement_audit,
             render_refusal,
         },
         semantic_kernel_warnings: Vec::new(),
@@ -5608,6 +5668,7 @@ fn refused_decompile_response_with_metrics(
         None,
         BindingShadowAuditOutcome::NotRun,
         EffectObligationAudit::NOT_RUN,
+        PlacementAudit::NotRun,
         None,
     )
 }
@@ -5621,6 +5682,7 @@ fn refused_decompile_response_with_metrics_and_audits(
     existing_function_facts: Option<FunctionFacts>,
     binding_audit: BindingShadowAuditOutcome,
     effect_obligations: EffectObligationAudit,
+    placement_audit: PlacementAudit,
     render_refusal: Option<DecompileRenderRefusal>,
 ) -> EngineDecompileResponse {
     let function_facts = seal_refused_decompile_function_facts(
@@ -5638,6 +5700,7 @@ fn refused_decompile_response_with_metrics_and_audits(
         output,
         binding_audit,
         effect_obligations,
+        placement_audit,
         render_refusal,
         function_facts,
         input_quality,
@@ -8594,6 +8657,7 @@ mod tests {
                         unaccounted: 2,
                         conflicts: 1,
                     },
+                    PlacementAudit::NotRun,
                     Some(DecompileRenderRefusal::UnrepresentableOperation),
                 );
                 assert_eq!(mapped.phase, engine_phase);
@@ -8604,6 +8668,7 @@ mod tests {
                 assert_eq!(mapped.effect_obligations.refused, 1);
                 assert_eq!(mapped.effect_obligations.unaccounted, 2);
                 assert_eq!(mapped.effect_obligations.conflicts, 1);
+                assert_eq!(mapped.placement_audit, PlacementAudit::NotRun);
                 assert_eq!(
                     mapped.render_refusal,
                     Some(DecompileRenderRefusal::UnrepresentableOperation)
@@ -8679,6 +8744,7 @@ mod tests {
             Some(FunctionFacts::default().with_input_quality(sentinel_quality.clone())),
             BindingShadowAuditOutcome::NotRun,
             effect_obligations,
+            PlacementAudit::NotRun,
             None,
         );
 
@@ -8706,6 +8772,52 @@ mod tests {
     }
 
     #[test]
+    fn refused_placement_produces_a_typed_engine_refusal() {
+        let placement_audit = PlacementAudit::Refused(
+            PlacementAuditRefusal::ReadBeforeAssignment {
+                binding_index: 3,
+                instruction_id: 11,
+                input_index: 2,
+            },
+        );
+        let reason = placement_refusal_reason(placement_audit)
+            .expect("refused placement must refuse the native engine outcome");
+        let mut metrics = EngineMetrics::default();
+        metrics.record_phase(
+            EnginePhase::Rendering,
+            EnginePhaseStatus::Refused,
+            Duration::from_micros(18),
+        );
+        let response = refused_decompile_response_with_metrics_and_audits(
+            "sym.placement_refusal",
+            &reason,
+            None,
+            metrics,
+            EngineDiagnostics::default(),
+            None,
+            BindingShadowAuditOutcome::NotRun,
+            EffectObligationAudit::NOT_RUN,
+            placement_audit,
+            None,
+        );
+
+        assert_eq!(response.placement_audit, placement_audit);
+        assert_eq!(
+            response.metrics.phase_timings[EnginePhase::Rendering as usize].status,
+            EnginePhaseStatus::Refused,
+        );
+        assert_eq!(response.diagnostics.route_reason.as_deref(), Some(reason.as_str()));
+        assert!(response
+            .diagnostics
+            .refusal
+            .as_deref()
+            .is_some_and(|value| value.contains(&reason)));
+        assert!(response.output.starts_with("/* r2dec fallback:"));
+        assert!(placement_refusal_reason(PlacementAudit::Applied).is_none());
+        assert!(placement_refusal_reason(PlacementAudit::NotRun).is_none());
+    }
+
+    #[test]
     fn renderer_boundary_refusal_produces_a_typed_engine_refusal() {
         let render_refusal = DecompileRenderRefusal::MissingMachineProjectionAuthorization;
         let reason = render_refusal_reason(render_refusal);
@@ -8725,6 +8837,7 @@ mod tests {
             None,
             BindingShadowAuditOutcome::NotRun,
             EffectObligationAudit::NOT_RUN,
+            PlacementAudit::NotRun,
             Some(render_refusal),
         );
 
