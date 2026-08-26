@@ -4383,7 +4383,7 @@ impl Decompiler {
             structured_body.visit_occurrences(|_| occurrences += 1);
             debug_assert_eq!(occurrences, structured_body.regions().nodes().len());
         }
-        let mut body_stmt = routed_body.into_body_stmt();
+        let (mut body_stmt, structured_regions) = routed_body.into_marked_body();
 
         if let Some(comment) = self.semantic_vm_summary_comment() {
             body_stmt = Self::prepend_comment(body_stmt, comment);
@@ -4607,38 +4607,52 @@ impl Decompiler {
         // function ever produced it. That is a definition the pipeline dropped
         // or refused, not a declaration it forgot, and declaring it would turn
         // the dangling read into valid C that reads uninitialised memory.
-        unrendered::declare_assigned_names_without_a_declaration(&mut c_function);
-        let undeclared = unrendered::names_mentioned_without_a_declaration(&c_function);
-        if !undeclared.is_empty() {
-            let table = c_function.symbols.borrow();
-            let names = undeclared
-                .iter()
-                .map(|name| table.name(*name).to_string())
-                .collect::<Vec<_>>()
-                .join(", ");
-            drop(table);
-            // Reported as a count, not a list: the comment renderer replaces
-            // machine tokens with prose, so naming them here would print the
-            // substitution rather than the name and read as a different defect.
-            c_function.body.insert(
-                0,
-                CStmt::Comment(format!(
-                    "r2dec defect: {} name(s) read with no definition",
-                    undeclared.len()
-                )),
-            );
-            if std::env::var_os("R2SLEIGH_NAME_DEFECTS").is_some() {
-                eprintln!("r2dec undeclared: {names}");
+        if structured_regions.is_none() {
+            unrendered::declare_assigned_names_without_a_declaration(&mut c_function);
+            let undeclared = unrendered::names_mentioned_without_a_declaration(&c_function);
+            if !undeclared.is_empty() {
+                let table = c_function.symbols.borrow();
+                let names = undeclared
+                    .iter()
+                    .map(|name| table.name(*name).to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                drop(table);
+                // Reported as a count, not a list: the comment renderer replaces
+                // machine tokens with prose, so naming them here would print the
+                // substitution rather than the name and read as a different defect.
+                c_function.body.insert(
+                    0,
+                    CStmt::Comment(format!(
+                        "r2dec defect: {} name(s) read with no definition",
+                        undeclared.len()
+                    )),
+                );
+                if std::env::var_os("R2SLEIGH_NAME_DEFECTS").is_some() {
+                    eprintln!("r2dec undeclared: {names}");
+                }
             }
         }
 
         let observation_error = fold_ctx.observation_error.borrow().clone();
         drop(fold_ctx);
         let mut native = match observation_journal {
-            Some(journal) => MarkedNativeDraft::new(c_function, journal.into_inner())
-                .finish_non_consuming(input.source_owned_facts(), observation_error),
-            None => SealedNativeFunction::without_observations(
+            Some(journal) => MarkedNativeDraft::new_with_placement(
                 c_function,
+                journal.into_inner(),
+                structured_regions,
+                Rc::clone(&binding_names),
+            )
+            .finish_non_consuming(input.source_owned_facts(), observation_error),
+            None => SealedNativeFunction::without_observations(
+                if structured_regions.is_some() {
+                    residual_function_for_render_boundary(
+                        &c_function.name,
+                        "placement refusal: observation journal unavailable",
+                    )
+                } else {
+                    c_function
+                },
                 binding_plan,
                 prepared,
                 observation_failure

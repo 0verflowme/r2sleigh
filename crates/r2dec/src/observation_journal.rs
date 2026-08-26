@@ -52,6 +52,10 @@ impl RenderObservationId {
         self.0
     }
 
+    pub(crate) fn from_dense_index(index: usize) -> Self {
+        Self(u32::try_from(index).expect("validated observation domain fits u32"))
+    }
+
     #[cfg(test)]
     pub(crate) const fn from_index(index: u32) -> Self {
         Self(index)
@@ -672,11 +676,95 @@ enum LegacyObservationSeal {
 pub(crate) struct MarkedNativeDraft {
     function: CFunction,
     journal: LegacyObservationJournal,
+    placement: Option<NativePlacementInput>,
+}
+
+struct NativePlacementInput {
+    regions: crate::structured_region::SealedStructuredRegionArtifact,
+    names: Rc<crate::binding_plan::BindingNameResolution>,
+}
+
+#[derive(Debug)]
+enum NativePlacementFailure {
+    Analysis(crate::placement::PlacementAnalysisError),
+    Application(crate::placement::PlacementApplicationError),
+    MissingBindingRole { binding: crate::binding_plan::BindingId },
+    UndeclaredNames { count: usize },
+    RegionFinalization(crate::structured_region::StructuredRegionFinalizationError),
 }
 
 impl MarkedNativeDraft {
     pub(crate) fn new(function: CFunction, journal: LegacyObservationJournal) -> Self {
-        Self { function, journal }
+        Self {
+            function,
+            journal,
+            placement: None,
+        }
+    }
+
+    pub(crate) fn new_with_placement(
+        function: CFunction,
+        journal: LegacyObservationJournal,
+        regions: Option<crate::structured_region::SealedStructuredRegionArtifact>,
+        names: Rc<crate::binding_plan::BindingNameResolution>,
+    ) -> Self {
+        Self {
+            function,
+            journal,
+            placement: regions.map(|regions| NativePlacementInput { regions, names }),
+        }
+    }
+
+    fn derive_and_apply_placement(
+        &mut self,
+        source: &SourceOwnedFunctionFacts,
+    ) -> Result<(), NativePlacementFailure> {
+        let Some(placement) = self.placement.as_ref() else {
+            return Ok(());
+        };
+        let occurrences = crate::placement::collect_final_placement_occurrences(
+            &self.function,
+            &placement.regions,
+            source.source(),
+            &placement.names,
+            self.journal.placement_target_count(),
+            |id| self.journal.placement_target(id),
+        )
+        .map_err(NativePlacementFailure::Analysis)?;
+        let mut externally_declared = BTreeSet::new();
+        for (binding, _) in placement.names.plan().bindings() {
+            match placement.names.binding_is_externally_declared(binding) {
+                Some(true) => {
+                    externally_declared.insert(binding);
+                }
+                Some(false) => {}
+                None => return Err(NativePlacementFailure::MissingBindingRole { binding }),
+            }
+        }
+        let decisions = crate::placement::derive_placement_decisions(
+            &placement.regions,
+            source.source().function(),
+            placement.names.plan().binding_count(),
+            &externally_declared,
+            occurrences.reads(),
+            occurrences.writes(),
+        )
+        .map_err(NativePlacementFailure::Analysis)?;
+        crate::placement::apply_placement_decisions(
+            &mut self.function,
+            &placement.regions,
+            &placement.names,
+            &decisions,
+            occurrences.writes(),
+        )
+        .map_err(NativePlacementFailure::Application)?;
+        let undeclared = crate::unrendered::names_mentioned_without_a_declaration(&self.function);
+        if !undeclared.is_empty() {
+            return Err(NativePlacementFailure::UndeclaredNames {
+                count: undeclared.len(),
+            });
+        }
+        Ok(())
     }
 
     pub(crate) fn seal(
@@ -704,10 +792,11 @@ impl MarkedNativeDraft {
     /// retained as unavailable evidence, every internal marker is discarded,
     /// and the same prepared native AST remains the emission product.
     pub(crate) fn finish_non_consuming(
-        self,
+        mut self,
         source: &SourceOwnedFunctionFacts,
         recording_failure: Option<LegacyObservationJournalError>,
     ) -> SealedNativeFunction {
+        let placement_failure = self.derive_and_apply_placement(source).err();
         let mut ready = prepare_function_for_emission(&self.function);
         let plan = Rc::clone(&self.journal.plan);
         let (observations, fallback_effects, observation_failure) = if let Some(error) = recording_failure {
@@ -755,6 +844,25 @@ impl MarkedNativeDraft {
                 }
             }
         };
+        let region_failure = if placement_failure.is_none() {
+            self.placement.as_ref().and_then(|placement| {
+                ready
+                    .strip_structured_region_markers(&placement.regions)
+                    .err()
+                    .map(NativePlacementFailure::RegionFinalization)
+            })
+        } else {
+            None
+        };
+        if let Some(failure) = placement_failure.or(region_failure) {
+            let function_name = ready.function().name.clone();
+            ready = prepare_function_for_emission(
+                &crate::residual_function_for_render_boundary(
+                    &function_name,
+                    &format!("placement refusal: {failure:?}"),
+                ),
+            );
+        }
         SealedNativeFunction {
             ready,
             observations,
@@ -873,6 +981,27 @@ impl SealedNativeFunction {
 }
 
 impl LegacyObservationJournal {
+    pub(crate) fn placement_target_count(&self) -> usize {
+        self.targets.len()
+    }
+
+    pub(crate) fn placement_target(
+        &self,
+        id: RenderObservationId,
+    ) -> Option<crate::placement::PlacementObservationTarget> {
+        match self.targets.get(id.index() as usize)? {
+            ObservationTarget::Use { site, .. } => {
+                Some(crate::placement::PlacementObservationTarget::Use(*site))
+            }
+            ObservationTarget::Write { inst, .. } => {
+                Some(crate::placement::PlacementObservationTarget::Write(*inst))
+            }
+            ObservationTarget::Value(_) | ObservationTarget::Effect(_) => {
+                Some(crate::placement::PlacementObservationTarget::Other)
+            }
+        }
+    }
+
     pub(crate) fn new(
         source: &SourceOwnedFunctionFacts,
         normalized: &SSAFunction,

@@ -13,10 +13,21 @@ impl RoutedBody {
         self.structured_body.as_ref()
     }
 
-    pub(crate) fn into_body_stmt(self) -> CStmt {
+    /// Transfer the final statement and its exact lexical authority together.
+    /// Unstructured routes have no region proof and therefore cannot silently
+    /// participate in declaration placement.
+    pub(crate) fn into_marked_body(
+        self,
+    ) -> (
+        CStmt,
+        Option<crate::structured_region::SealedStructuredRegionArtifact>,
+    ) {
         match (self.structured_body, self.body_stmt) {
-            (Some(body), None) => body.into_stmt(),
-            (None, Some(stmt)) => stmt,
+            (Some(body), None) => {
+                let (stmt, regions) = body.into_marked_parts();
+                (stmt, Some(regions))
+            }
+            (None, Some(stmt)) => (stmt, None),
             _ => unreachable!("a routed body has exactly one statement owner"),
         }
     }

@@ -17,7 +17,11 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::binding_plan::{BindingId, PlacementRefusal};
+use crate::ast::{
+    BinaryOp, CExpr, CFunction, CStmt, RenderObservationId, RenderObservationNode,
+    inspect_render_observations,
+};
+use crate::binding_plan::{BindingId, BindingNameResolution, PlacementRefusal, ValueDisposition};
 use crate::structured_region::{RegionId, SealedStructuredRegionArtifact};
 use r2ssa::{InstId, SSAFunction, UseSite};
 
@@ -46,11 +50,701 @@ pub(crate) struct FinalBindingWrite {
     pub(crate) region: RegionId,
     pub(crate) block: u64,
     pub(crate) order: FinalOccurrenceOrder,
+    /// Exact surviving marker that owns this write occurrence.
+    pub(crate) observation: RenderObservationId,
+    /// Whether this exact occurrence is a statement assignment that C permits
+    /// the final emitter to replace with a declaration initializer.
+    pub(crate) inline_eligible: bool,
+}
+
+/// Placement-relevant projection of the observation journal's private target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PlacementObservationTarget {
+    Use(UseSite),
+    Write(InstId),
+    Other,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FinalPlacementOccurrences {
+    reads: Box<[FinalBindingRead]>,
+    writes: Box<[FinalBindingWrite]>,
+}
+
+impl FinalPlacementOccurrences {
+    pub(crate) fn reads(&self) -> &[FinalBindingRead] {
+        &self.reads
+    }
+
+    pub(crate) fn writes(&self) -> &[FinalBindingWrite] {
+        &self.writes
+    }
+}
+
+/// Join the final marker-bearing AST to the canonical source graph and sealed
+/// binding plan. This is intentionally a one-shot emit-time calculation.
+pub(crate) fn collect_final_placement_occurrences(
+    function: &CFunction,
+    regions: &SealedStructuredRegionArtifact,
+    source: &r2ssa::SsaArtifact,
+    names: &BindingNameResolution,
+    expected_observations: usize,
+    mut target_for: impl FnMut(RenderObservationId) -> Option<PlacementObservationTarget>,
+) -> Result<FinalPlacementOccurrences, PlacementAnalysisError> {
+    crate::structured_region::validate_final_region_marker_tree(&function.body, regions)
+        .map_err(PlacementAnalysisError::RegionMarkers)?;
+    let mut targets = vec![None; expected_observations];
+    let mut statement_assignment = vec![None; expected_observations];
+    inspect_render_observations(function, expected_observations, |id, node| {
+        let target = target_for(id)
+            .ok_or(PlacementAnalysisError::MissingObservationTarget { observation: id })?;
+        let index = id.index() as usize;
+        targets[index] = Some(target);
+        statement_assignment[index] = match node {
+            RenderObservationNode::Stmt(stmt) => assigned_symbol(stmt),
+            RenderObservationNode::Expr(_) => None,
+        };
+        Ok(())
+    })
+    .map_err(|error| match error {
+        crate::ast::RenderObservationInspectError::Markers(error) => {
+            PlacementAnalysisError::ObservationMarkers(error)
+        }
+        crate::ast::RenderObservationInspectError::Observer(error) => error,
+    })?;
+
+    let mut scoped = vec![None; expected_observations];
+    let mut statement_order = 0_u64;
+    regions.visit_final_scoped_statements(&function.body, |occurrence| {
+        let order = FinalOccurrenceOrder(statement_order);
+        statement_order = statement_order.saturating_add(1);
+        visit_direct_observations(occurrence.stmt(), &mut |id| {
+            scoped[id.index() as usize] = Some((occurrence.region(), order));
+        });
+    });
+
+    for (index, target) in targets.iter().copied().enumerate() {
+        if matches!(target, Some(PlacementObservationTarget::Use(_)
+            | PlacementObservationTarget::Write(_)))
+            && scoped[index].is_none()
+        {
+            return Err(PlacementAnalysisError::UnscopedObservation {
+                observation: RenderObservationId::from_dense_index(index),
+            });
+        }
+    }
+
+    let graph = source.graph();
+    let mut reads = Vec::new();
+    let mut writes = Vec::new();
+    for (index, target) in targets.iter().copied().enumerate() {
+        let Some((region, order)) = scoped[index] else {
+            continue;
+        };
+        let observation = RenderObservationId::from_dense_index(index);
+        match target.expect("only reachable observations receive a scope") {
+            PlacementObservationTarget::Use(site) => {
+                let inst = graph
+                    .inst(site.inst)
+                    .ok_or(PlacementAnalysisError::InvalidUse { site })?;
+                let value = *inst
+                    .inputs
+                    .get(site.input_idx)
+                    .ok_or(PlacementAnalysisError::InvalidUse { site })?;
+                if let Some(binding) = bound_value(names, value)? {
+                    let block = graph
+                        .block(inst.block)
+                        .ok_or(PlacementAnalysisError::InvalidUse { site })?
+                        .addr;
+                    reads.push(FinalBindingRead {
+                        binding,
+                        site,
+                        region,
+                        block,
+                        order,
+                    });
+                }
+            }
+            PlacementObservationTarget::Write(inst_id) => {
+                let inst = graph
+                    .inst(inst_id)
+                    .ok_or(PlacementAnalysisError::InvalidWrite { inst: inst_id })?;
+                let value = inst
+                    .output
+                    .ok_or(PlacementAnalysisError::InvalidWrite { inst: inst_id })?;
+                if let Some(binding) = bound_value(names, value)? {
+                    let block = graph
+                        .block(inst.block)
+                        .ok_or(PlacementAnalysisError::InvalidWrite { inst: inst_id })?
+                        .addr;
+                    writes.push(FinalBindingWrite {
+                        binding,
+                        inst: inst_id,
+                        region,
+                        block,
+                        order,
+                        observation,
+                        inline_eligible: statement_assignment[index]
+                            == names.symbol_for_binding(binding),
+                    });
+                }
+            }
+            PlacementObservationTarget::Other => {}
+        }
+    }
+
+    audit_plan_symbols(function, source, names, &targets)?;
+    reads.sort_by_key(|read| (read.order, read.binding, read.site));
+    writes.sort_by_key(|write| (write.order, write.binding, write.inst));
+    Ok(FinalPlacementOccurrences {
+        reads: reads.into_boxed_slice(),
+        writes: writes.into_boxed_slice(),
+    })
+}
+
+fn bound_value(
+    names: &BindingNameResolution,
+    value: r2ssa::ValueId,
+) -> Result<Option<BindingId>, PlacementAnalysisError> {
+    match names.disposition_for_value(value) {
+        Some(ValueDisposition::Bound { binding }) => Ok(Some(*binding)),
+        Some(ValueDisposition::Inline { .. } | ValueDisposition::Elided { .. }) => Ok(None),
+        Some(ValueDisposition::Refused { .. }) => {
+            Err(PlacementAnalysisError::RefusedPlannedValue { value })
+        }
+        None => Err(PlacementAnalysisError::MissingPlannedValue { value }),
+    }
+}
+
+fn assigned_symbol(statement: &CStmt) -> Option<crate::symbol::SymbolId> {
+    let CStmt::Expr(CExpr::Binary {
+        op: BinaryOp::Assign,
+        left,
+        ..
+    }) = statement.unobserved()
+    else {
+        return None;
+    };
+    match left.unobserved() {
+        CExpr::Var(symbol) => Some(*symbol),
+        _ => None,
+    }
+}
+
+fn visit_direct_observations(statement: &CStmt, visit: &mut impl FnMut(RenderObservationId)) {
+    let mut statement = statement;
+    while let CStmt::Observed { id, stmt } = statement {
+        visit(*id);
+        statement = stmt;
+    }
+    match statement {
+        CStmt::StructuredRegion { .. } | CStmt::Block(_) => {}
+        CStmt::Expr(expr) | CStmt::Return(Some(expr)) => visit_expr_observations(expr, visit),
+        CStmt::Decl { init, .. } => {
+            if let Some(init) = init {
+                visit_expr_observations(init, visit);
+            }
+        }
+        CStmt::If { cond, .. } | CStmt::While { cond, .. } => {
+            visit_expr_observations(cond, visit);
+        }
+        CStmt::DoWhile { cond, .. } => visit_expr_observations(cond, visit),
+        CStmt::For { cond, update, .. } => {
+            if let Some(cond) = cond {
+                visit_expr_observations(cond, visit);
+            }
+            if let Some(update) = update {
+                visit_expr_observations(update, visit);
+            }
+        }
+        CStmt::Switch { expr, cases, .. } => {
+            visit_expr_observations(expr, visit);
+            for case in cases {
+                visit_expr_observations(&case.value, visit);
+            }
+        }
+        CStmt::Observed { .. } => unreachable!("leading observations were consumed"),
+        CStmt::Empty
+        | CStmt::Return(None)
+        | CStmt::Break
+        | CStmt::Continue
+        | CStmt::Goto(_)
+        | CStmt::Label(_)
+        | CStmt::Comment(_) => {}
+    }
+}
+
+fn visit_expr_observations(expr: &CExpr, visit: &mut impl FnMut(RenderObservationId)) {
+    if let CExpr::Observed { id, expr } = expr {
+        visit(*id);
+        visit_expr_observations(expr, visit);
+        return;
+    }
+    match expr {
+        CExpr::Observed { .. } => unreachable!("leading observation was consumed"),
+        CExpr::Unary { operand, .. }
+        | CExpr::Cast { expr: operand, .. }
+        | CExpr::Sizeof(operand)
+        | CExpr::AddrOf(operand)
+        | CExpr::Deref(operand)
+        | CExpr::Paren(operand) => visit_expr_observations(operand, visit),
+        CExpr::Binary { left, right, .. } => {
+            visit_expr_observations(left, visit);
+            visit_expr_observations(right, visit);
+        }
+        CExpr::Ternary {
+            cond,
+            then_expr,
+            else_expr,
+        } => {
+            visit_expr_observations(cond, visit);
+            visit_expr_observations(then_expr, visit);
+            visit_expr_observations(else_expr, visit);
+        }
+        CExpr::Call { func, args, .. } => {
+            visit_expr_observations(func, visit);
+            for arg in args {
+                visit_expr_observations(arg, visit);
+            }
+        }
+        CExpr::Subscript { base, index } => {
+            visit_expr_observations(base, visit);
+            visit_expr_observations(index, visit);
+        }
+        CExpr::Member { base, .. } | CExpr::PtrMember { base, .. } => {
+            visit_expr_observations(base, visit);
+        }
+        CExpr::Comma(items) => {
+            for item in items {
+                visit_expr_observations(item, visit);
+            }
+        }
+        CExpr::IntLit(_)
+        | CExpr::UIntLit(_)
+        | CExpr::FloatLit(_)
+        | CExpr::StringLit(_)
+        | CExpr::CharLit(_)
+        | CExpr::Var(_)
+        | CExpr::External { .. }
+        | CExpr::SizeofType(_) => {}
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SymbolAccess {
+    Read,
+    Write,
+}
+
+fn audit_plan_symbols(
+    function: &CFunction,
+    source: &r2ssa::SsaArtifact,
+    names: &BindingNameResolution,
+    targets: &[Option<PlacementObservationTarget>],
+) -> Result<(), PlacementAnalysisError> {
+    let by_symbol = names
+        .plan()
+        .bindings()
+        .filter_map(|(binding, _)| {
+            names
+                .symbol_for_binding(binding)
+                .map(|symbol| (symbol, binding))
+        })
+        .collect::<BTreeMap<_, _>>();
+    for statement in &function.body {
+        audit_statement(statement, source, names, targets, &by_symbol)?;
+    }
+    Ok(())
+}
+
+fn audit_statement(
+    statement: &CStmt,
+    source: &r2ssa::SsaArtifact,
+    names: &BindingNameResolution,
+    targets: &[Option<PlacementObservationTarget>],
+    by_symbol: &BTreeMap<crate::symbol::SymbolId, BindingId>,
+) -> Result<(), PlacementAnalysisError> {
+    if let CStmt::StructuredRegion { stmt, .. } = statement {
+        return audit_statement(stmt, source, names, targets, by_symbol);
+    }
+    let mut active = Vec::new();
+    let mut semantic = statement;
+    while let CStmt::Observed { id, stmt } = semantic {
+        if let Some(target) = targets.get(id.index() as usize).copied().flatten() {
+            active.push(target);
+        }
+        semantic = stmt;
+    }
+    match semantic {
+        CStmt::StructuredRegion { stmt, .. } => {
+            audit_statement(stmt, source, names, targets, by_symbol)?;
+        }
+        CStmt::Observed { .. } => unreachable!("leading observations were consumed"),
+        CStmt::Expr(expr) | CStmt::Return(Some(expr)) => {
+            audit_expr(expr, SymbolAccess::Read, &active, source, names, targets, by_symbol)?;
+        }
+        CStmt::Decl { init, .. } => {
+            if let Some(init) = init {
+                audit_expr(init, SymbolAccess::Read, &active, source, names, targets, by_symbol)?;
+            }
+        }
+        CStmt::Block(statements) => {
+            for statement in statements {
+                audit_statement(statement, source, names, targets, by_symbol)?;
+            }
+        }
+        CStmt::If {
+            cond,
+            then_body,
+            else_body,
+        } => {
+            audit_expr(cond, SymbolAccess::Read, &active, source, names, targets, by_symbol)?;
+            audit_statement(then_body, source, names, targets, by_symbol)?;
+            if let Some(else_body) = else_body {
+                audit_statement(else_body, source, names, targets, by_symbol)?;
+            }
+        }
+        CStmt::While { cond, body } => {
+            audit_expr(cond, SymbolAccess::Read, &active, source, names, targets, by_symbol)?;
+            audit_statement(body, source, names, targets, by_symbol)?;
+        }
+        CStmt::DoWhile { body, cond } => {
+            audit_statement(body, source, names, targets, by_symbol)?;
+            audit_expr(cond, SymbolAccess::Read, &active, source, names, targets, by_symbol)?;
+        }
+        CStmt::For {
+            init,
+            cond,
+            update,
+            body,
+        } => {
+            if let Some(init) = init {
+                audit_statement(init, source, names, targets, by_symbol)?;
+            }
+            if let Some(cond) = cond {
+                audit_expr(cond, SymbolAccess::Read, &active, source, names, targets, by_symbol)?;
+            }
+            if let Some(update) = update {
+                audit_expr(update, SymbolAccess::Read, &active, source, names, targets, by_symbol)?;
+            }
+            audit_statement(body, source, names, targets, by_symbol)?;
+        }
+        CStmt::Switch {
+            expr,
+            cases,
+            default,
+        } => {
+            audit_expr(expr, SymbolAccess::Read, &active, source, names, targets, by_symbol)?;
+            for case in cases {
+                audit_expr(
+                    &case.value,
+                    SymbolAccess::Read,
+                    &active,
+                    source,
+                    names,
+                    targets,
+                    by_symbol,
+                )?;
+                for statement in &case.body {
+                    audit_statement(statement, source, names, targets, by_symbol)?;
+                }
+            }
+            if let Some(default) = default {
+                for statement in default {
+                    audit_statement(statement, source, names, targets, by_symbol)?;
+                }
+            }
+        }
+        CStmt::Empty
+        | CStmt::Return(None)
+        | CStmt::Break
+        | CStmt::Continue
+        | CStmt::Goto(_)
+        | CStmt::Label(_)
+        | CStmt::Comment(_) => {}
+    }
+    Ok(())
+}
+
+fn audit_expr(
+    expr: &CExpr,
+    access: SymbolAccess,
+    active: &[PlacementObservationTarget],
+    source: &r2ssa::SsaArtifact,
+    names: &BindingNameResolution,
+    targets: &[Option<PlacementObservationTarget>],
+    by_symbol: &BTreeMap<crate::symbol::SymbolId, BindingId>,
+) -> Result<(), PlacementAnalysisError> {
+    if let CExpr::Observed { id, expr } = expr {
+        let mut nested = active.to_vec();
+        if let Some(target) = targets.get(id.index() as usize).copied().flatten() {
+            nested.push(target);
+        }
+        return audit_expr(expr, access, &nested, source, names, targets, by_symbol);
+    }
+    match expr {
+        CExpr::Var(symbol) => {
+            let Some(binding) = by_symbol.get(symbol).copied() else {
+                return Ok(());
+            };
+            if !active.iter().copied().any(|target| {
+                target_authorizes_binding(target, access, binding, source, names)
+            }) {
+                return Err(match access {
+                    SymbolAccess::Read => PlacementAnalysisError::UnobservedBindingRead { binding },
+                    SymbolAccess::Write => {
+                        PlacementAnalysisError::UnobservedBindingWrite { binding }
+                    }
+                });
+            }
+        }
+        CExpr::Observed { .. } => unreachable!("leading observation was consumed"),
+        CExpr::Unary { op, operand } => {
+            if matches!(
+                op,
+                crate::ast::UnaryOp::PreInc
+                    | crate::ast::UnaryOp::PreDec
+                    | crate::ast::UnaryOp::PostInc
+                    | crate::ast::UnaryOp::PostDec
+            ) && matches!(operand.unobserved(), CExpr::Var(_))
+            {
+                audit_expr(
+                    operand,
+                    SymbolAccess::Read,
+                    active,
+                    source,
+                    names,
+                    targets,
+                    by_symbol,
+                )?;
+                audit_expr(
+                    operand,
+                    SymbolAccess::Write,
+                    active,
+                    source,
+                    names,
+                    targets,
+                    by_symbol,
+                )?;
+            } else {
+                audit_expr(
+                    operand,
+                    SymbolAccess::Read,
+                    active,
+                    source,
+                    names,
+                    targets,
+                    by_symbol,
+                )?;
+            }
+        }
+        CExpr::Binary { op, left, right } => {
+            let assignment = matches!(
+                op,
+                BinaryOp::Assign
+                    | BinaryOp::AddAssign
+                    | BinaryOp::SubAssign
+                    | BinaryOp::MulAssign
+                    | BinaryOp::DivAssign
+                    | BinaryOp::ModAssign
+                    | BinaryOp::BitAndAssign
+                    | BinaryOp::BitOrAssign
+                    | BinaryOp::BitXorAssign
+                    | BinaryOp::ShlAssign
+                    | BinaryOp::ShrAssign
+            );
+            if assignment && matches!(left.unobserved(), CExpr::Var(_)) {
+                if *op != BinaryOp::Assign {
+                    audit_expr(
+                        left,
+                        SymbolAccess::Read,
+                        active,
+                        source,
+                        names,
+                        targets,
+                        by_symbol,
+                    )?;
+                }
+                audit_expr(
+                    left,
+                    SymbolAccess::Write,
+                    active,
+                    source,
+                    names,
+                    targets,
+                    by_symbol,
+                )?;
+            } else {
+                audit_expr(
+                    left,
+                    SymbolAccess::Read,
+                    active,
+                    source,
+                    names,
+                    targets,
+                    by_symbol,
+                )?;
+            }
+            audit_expr(
+                right,
+                SymbolAccess::Read,
+                active,
+                source,
+                names,
+                targets,
+                by_symbol,
+            )?;
+        }
+        CExpr::Ternary {
+            cond,
+            then_expr,
+            else_expr,
+        } => {
+            for expr in [cond.as_ref(), then_expr.as_ref(), else_expr.as_ref()] {
+                audit_expr(
+                    expr,
+                    SymbolAccess::Read,
+                    active,
+                    source,
+                    names,
+                    targets,
+                    by_symbol,
+                )?;
+            }
+        }
+        CExpr::Cast { expr, .. }
+        | CExpr::Sizeof(expr)
+        | CExpr::AddrOf(expr)
+        | CExpr::Deref(expr)
+        | CExpr::Paren(expr) => {
+            audit_expr(
+                expr,
+                SymbolAccess::Read,
+                active,
+                source,
+                names,
+                targets,
+                by_symbol,
+            )?;
+        }
+        CExpr::Call { func, args, .. } => {
+            audit_expr(
+                func,
+                SymbolAccess::Read,
+                active,
+                source,
+                names,
+                targets,
+                by_symbol,
+            )?;
+            for arg in args {
+                audit_expr(
+                    arg,
+                    SymbolAccess::Read,
+                    active,
+                    source,
+                    names,
+                    targets,
+                    by_symbol,
+                )?;
+            }
+        }
+        CExpr::Subscript { base, index } => {
+            for expr in [base.as_ref(), index.as_ref()] {
+                audit_expr(
+                    expr,
+                    SymbolAccess::Read,
+                    active,
+                    source,
+                    names,
+                    targets,
+                    by_symbol,
+                )?;
+            }
+        }
+        CExpr::Member { base, .. } | CExpr::PtrMember { base, .. } => {
+            audit_expr(
+                base,
+                SymbolAccess::Read,
+                active,
+                source,
+                names,
+                targets,
+                by_symbol,
+            )?;
+        }
+        CExpr::Comma(items) => {
+            for item in items {
+                audit_expr(
+                    item,
+                    SymbolAccess::Read,
+                    active,
+                    source,
+                    names,
+                    targets,
+                    by_symbol,
+                )?;
+            }
+        }
+        CExpr::IntLit(_)
+        | CExpr::UIntLit(_)
+        | CExpr::FloatLit(_)
+        | CExpr::StringLit(_)
+        | CExpr::CharLit(_)
+        | CExpr::External { .. }
+        | CExpr::SizeofType(_) => {}
+    }
+    Ok(())
+}
+
+fn target_authorizes_binding(
+    target: PlacementObservationTarget,
+    access: SymbolAccess,
+    binding: BindingId,
+    source: &r2ssa::SsaArtifact,
+    names: &BindingNameResolution,
+) -> bool {
+    let graph = source.graph();
+    match (target, access) {
+        (PlacementObservationTarget::Use(site), SymbolAccess::Read) => graph
+            .inst(site.inst)
+            .and_then(|inst| inst.inputs.get(site.input_idx))
+            .and_then(|value| names.disposition_for_value(*value))
+            .is_some_and(|disposition| {
+                matches!(disposition, ValueDisposition::Bound { binding: owner } if *owner == binding)
+            }),
+        (PlacementObservationTarget::Write(inst), SymbolAccess::Write) => graph
+            .inst(inst)
+            .and_then(|inst| inst.output)
+            .and_then(|value| names.disposition_for_value(value))
+            .is_some_and(|disposition| {
+                matches!(disposition, ValueDisposition::Bound { binding: owner } if *owner == binding)
+            }),
+        (PlacementObservationTarget::Write(inst), SymbolAccess::Read) => {
+            matches!(
+                names.write_disposition(inst),
+                Some(r2ssa::MachineWriteDisposition::Exact(
+                    r2ssa::MachineWriteProjection::Insert { .. }
+                ))
+            ) && graph
+                .inst(inst)
+                .and_then(|inst| inst.output)
+                .and_then(|value| names.disposition_for_value(value))
+                .is_some_and(|disposition| {
+                    matches!(disposition, ValueDisposition::Bound { binding: owner } if *owner == binding)
+                })
+        }
+        (PlacementObservationTarget::Use(_), SymbolAccess::Write)
+        | (PlacementObservationTarget::Other, _) => false,
+    }
 }
 
 /// A decision consumed immediately by final emission.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PlacementDecision {
+    /// The binding is already declared by the function signature and is
+    /// assigned on function entry by the calling convention.
+    ExternallyDeclared,
     /// Declare at the start of the lowest valid lexical region, then assign at
     /// each surviving write occurrence.
     LexicalDeclaration { region: RegionId },
@@ -73,15 +767,339 @@ impl PlacementDecisions {
     pub(crate) fn decision(&self, binding: BindingId) -> Option<PlacementDecision> {
         self.decisions.get(binding.index()).copied().flatten()
     }
+
+    pub(crate) fn iter(
+        &self,
+    ) -> impl ExactSizeIterator<Item = (BindingId, Option<PlacementDecision>)> + '_ {
+        self.decisions.iter().enumerate().map(|(index, decision)| {
+            let binding = BindingId::from_dense_index(index)
+                .expect("placement decision count fits BindingId");
+            (binding, *decision)
+        })
+    }
 }
 
 /// Structural mismatch between final occurrences and their two authorities.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum PlacementAnalysisError {
     BindingOutsidePlan { binding: BindingId },
     RegionOutsideArtifact { region: RegionId },
     BlockOutsideFunction { block: u64 },
     RegionDoesNotDominateOccurrence { region: RegionId, block: u64 },
+    ExternalBindingOutsidePlan { binding: BindingId },
+    RegionMarkers(crate::structured_region::StructuredRegionFinalizationError),
+    ObservationMarkers(crate::ast::RenderObservationStripError),
+    MissingObservationTarget { observation: RenderObservationId },
+    InvalidUse { site: UseSite },
+    InvalidWrite { inst: InstId },
+    MissingPlannedValue { value: r2ssa::ValueId },
+    RefusedPlannedValue { value: r2ssa::ValueId },
+    UnscopedObservation { observation: RenderObservationId },
+    UnobservedBindingRead { binding: BindingId },
+    UnobservedBindingWrite { binding: BindingId },
+}
+
+/// Failure to apply a derived decision to the exact final marked tree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PlacementApplicationError {
+    Refused(PlacementRefusal),
+    MissingBinding { binding: BindingId },
+    MissingBindingSymbol { binding: BindingId },
+    ExternalBindingMissingParameter { binding: BindingId },
+    MissingRegion { region: RegionId },
+    DuplicateRegion { region: RegionId },
+    MissingInlineWrite { inst: InstId },
+    DuplicateInlineWrite { inst: InstId },
+}
+
+/// Apply a decision set transactionally to the exact marker-bearing function.
+pub(crate) fn apply_placement_decisions(
+    function: &mut CFunction,
+    regions: &SealedStructuredRegionArtifact,
+    names: &BindingNameResolution,
+    decisions: &PlacementDecisions,
+    writes: &[FinalBindingWrite],
+) -> Result<(), PlacementApplicationError> {
+    let mut candidate = function.clone();
+    let mut declarations =
+        BTreeMap::<RegionId, Vec<(BindingId, crate::ast::CType, crate::symbol::SymbolId)>>::new();
+    let plan = names.plan();
+
+    for (binding, decision) in decisions.iter() {
+        let symbol = names
+            .symbol_for_binding(binding)
+            .ok_or(PlacementApplicationError::MissingBindingSymbol { binding })?;
+        let binding_fact = plan
+            .binding(binding)
+            .ok_or(PlacementApplicationError::MissingBinding { binding })?;
+        match decision {
+            None => candidate.locals.retain(|local| local.name != symbol),
+            Some(PlacementDecision::ExternallyDeclared) => {
+                if !candidate.params.iter().any(|param| param.name == symbol) {
+                    return Err(PlacementApplicationError::ExternalBindingMissingParameter {
+                        binding,
+                    });
+                }
+                candidate.locals.retain(|local| local.name != symbol);
+            }
+            Some(PlacementDecision::LexicalDeclaration { region }) => {
+                candidate.locals.retain(|local| local.name != symbol);
+                declarations.entry(region).or_default().push((
+                    binding,
+                    binding_fact.declaration_type().clone(),
+                    symbol,
+                ));
+            }
+            Some(PlacementDecision::Inline { write }) => {
+                candidate.locals.retain(|local| local.name != symbol);
+                let matching = writes
+                    .iter()
+                    .filter(|occurrence| occurrence.binding == binding && occurrence.inst == write)
+                    .collect::<Vec<_>>();
+                let [occurrence] = matching.as_slice() else {
+                    return Err(if matching.is_empty() {
+                        PlacementApplicationError::MissingInlineWrite { inst: write }
+                    } else {
+                        PlacementApplicationError::DuplicateInlineWrite { inst: write }
+                    });
+                };
+                let replacements = inline_exact_write(
+                    &mut candidate.body,
+                    occurrence.observation,
+                    symbol,
+                    binding_fact.declaration_type(),
+                );
+                if replacements != 1 {
+                    return Err(if replacements == 0 {
+                        PlacementApplicationError::MissingInlineWrite { inst: write }
+                    } else {
+                        PlacementApplicationError::DuplicateInlineWrite { inst: write }
+                    });
+                }
+            }
+            Some(PlacementDecision::Refused(reason)) => {
+                return Err(PlacementApplicationError::Refused(reason));
+            }
+        }
+    }
+
+    for (region, declarations) in &mut declarations {
+        declarations.sort_by_key(|(binding, _, _)| *binding);
+        let statements = declarations
+            .iter()
+            .map(|(_, ty, name)| CStmt::Decl {
+                ty: ty.clone(),
+                name: *name,
+                init: None,
+            })
+            .collect::<Vec<_>>();
+        match insert_region_declarations(&mut candidate.body, regions, *region, &statements) {
+            0 => return Err(PlacementApplicationError::MissingRegion { region: *region }),
+            1 => {}
+            _ => return Err(PlacementApplicationError::DuplicateRegion { region: *region }),
+        }
+    }
+
+    *function = candidate;
+    Ok(())
+}
+
+fn insert_region_declarations(
+    statements: &mut [CStmt],
+    regions: &SealedStructuredRegionArtifact,
+    target: RegionId,
+    declarations: &[CStmt],
+) -> usize {
+    statements
+        .iter_mut()
+        .map(|statement| {
+            insert_region_declarations_in_stmt(statement, regions, target, declarations)
+        })
+        .sum()
+}
+
+fn insert_region_declarations_in_stmt(
+    statement: &mut CStmt,
+    regions: &SealedStructuredRegionArtifact,
+    target: RegionId,
+    declarations: &[CStmt],
+) -> usize {
+    if let CStmt::StructuredRegion { marker, stmt } = statement {
+        let is_target = marker
+            .emission_anchor()
+            .and_then(|anchor| regions.node_for_anchor(regions.authority(), anchor))
+            .is_some_and(|(region, _)| region == target);
+        if is_target {
+            let semantic = std::mem::replace(stmt.as_mut(), CStmt::Empty);
+            *stmt = Box::new(match semantic {
+                CStmt::Block(mut statements) => {
+                    let mut placed = declarations.to_vec();
+                    placed.append(&mut statements);
+                    CStmt::Block(placed)
+                }
+                semantic => {
+                    let mut placed = declarations.to_vec();
+                    placed.push(semantic);
+                    CStmt::Block(placed)
+                }
+            });
+            return 1;
+        }
+        return insert_region_declarations_in_stmt(stmt, regions, target, declarations);
+    }
+
+    if let CStmt::Observed { stmt, .. } = statement {
+        return insert_region_declarations_in_stmt(stmt, regions, target, declarations);
+    }
+
+    match statement {
+        CStmt::StructuredRegion { .. } | CStmt::Observed { .. } => {
+            unreachable!("leading wrappers handled above")
+        }
+        CStmt::Block(statements) => {
+            insert_region_declarations(statements, regions, target, declarations)
+        }
+        CStmt::If {
+            then_body,
+            else_body,
+            ..
+        } => {
+            insert_region_declarations_in_stmt(then_body, regions, target, declarations)
+                + else_body.as_deref_mut().map_or(0, |body| {
+                    insert_region_declarations_in_stmt(body, regions, target, declarations)
+                })
+        }
+        CStmt::While { body, .. } | CStmt::DoWhile { body, .. } => {
+            insert_region_declarations_in_stmt(body, regions, target, declarations)
+        }
+        CStmt::For { init, body, .. } => {
+            init.as_deref_mut().map_or(0, |init| {
+                insert_region_declarations_in_stmt(init, regions, target, declarations)
+            }) + insert_region_declarations_in_stmt(body, regions, target, declarations)
+        }
+        CStmt::Switch { cases, default, .. } => {
+            let cases = cases
+                .iter_mut()
+                .map(|case| {
+                    insert_region_declarations(&mut case.body, regions, target, declarations)
+                })
+                .sum::<usize>();
+            cases
+                + default.as_mut().map_or(0, |body| {
+                    insert_region_declarations(body, regions, target, declarations)
+                })
+        }
+        CStmt::Empty
+        | CStmt::Expr(_)
+        | CStmt::Decl { .. }
+        | CStmt::Return(_)
+        | CStmt::Break
+        | CStmt::Continue
+        | CStmt::Goto(_)
+        | CStmt::Label(_)
+        | CStmt::Comment(_) => 0,
+    }
+}
+
+fn inline_exact_write(
+    statements: &mut [CStmt],
+    target: RenderObservationId,
+    symbol: crate::symbol::SymbolId,
+    ty: &crate::ast::CType,
+) -> usize {
+    statements
+        .iter_mut()
+        .map(|statement| inline_exact_write_in_stmt(statement, target, symbol, ty))
+        .sum()
+}
+
+fn inline_exact_write_in_stmt(
+    statement: &mut CStmt,
+    target: RenderObservationId,
+    symbol: crate::symbol::SymbolId,
+    ty: &crate::ast::CType,
+) -> usize {
+    if let CStmt::Observed { id, stmt } = statement {
+        if *id == target {
+            return usize::from(replace_assignment_with_declaration(stmt, symbol, ty));
+        }
+        return inline_exact_write_in_stmt(stmt, target, symbol, ty);
+    }
+    match statement {
+        CStmt::StructuredRegion { stmt, .. } => {
+            inline_exact_write_in_stmt(stmt, target, symbol, ty)
+        }
+        CStmt::Block(statements) => inline_exact_write(statements, target, symbol, ty),
+        CStmt::If {
+            then_body,
+            else_body,
+            ..
+        } => {
+            inline_exact_write_in_stmt(then_body, target, symbol, ty)
+                + else_body.as_deref_mut().map_or(0, |body| {
+                    inline_exact_write_in_stmt(body, target, symbol, ty)
+                })
+        }
+        CStmt::While { body, .. } | CStmt::DoWhile { body, .. } => {
+            inline_exact_write_in_stmt(body, target, symbol, ty)
+        }
+        CStmt::For { init, body, .. } => {
+            init.as_deref_mut().map_or(0, |init| {
+                inline_exact_write_in_stmt(init, target, symbol, ty)
+            }) + inline_exact_write_in_stmt(body, target, symbol, ty)
+        }
+        CStmt::Switch { cases, default, .. } => {
+            let cases = cases
+                .iter_mut()
+                .map(|case| inline_exact_write(&mut case.body, target, symbol, ty))
+                .sum::<usize>();
+            cases
+                + default
+                    .as_mut()
+                    .map_or(0, |body| inline_exact_write(body, target, symbol, ty))
+        }
+        CStmt::Observed { .. } => unreachable!("leading observation handled above"),
+        CStmt::Empty
+        | CStmt::Expr(_)
+        | CStmt::Decl { .. }
+        | CStmt::Return(_)
+        | CStmt::Break
+        | CStmt::Continue
+        | CStmt::Goto(_)
+        | CStmt::Label(_)
+        | CStmt::Comment(_) => 0,
+    }
+}
+
+fn replace_assignment_with_declaration(
+    statement: &mut CStmt,
+    symbol: crate::symbol::SymbolId,
+    ty: &crate::ast::CType,
+) -> bool {
+    if let CStmt::Observed { stmt, .. } = statement {
+        return replace_assignment_with_declaration(stmt, symbol, ty);
+    }
+    let CStmt::Expr(CExpr::Binary {
+        op: BinaryOp::Assign,
+        left,
+        ..
+    }) = statement
+    else {
+        return false;
+    };
+    if !matches!(left.unobserved(), CExpr::Var(name) if *name == symbol) {
+        return false;
+    }
+    let CStmt::Expr(CExpr::Binary { right, .. }) = std::mem::replace(statement, CStmt::Empty)
+    else {
+        unreachable!("assignment shape was checked before move")
+    };
+    *statement = CStmt::Decl {
+        ty: ty.clone(),
+        name: symbol,
+        init: Some(*right),
+    };
+    true
 }
 
 /// Derive all declaration decisions from canonical facts and final occurrences.
@@ -89,10 +1107,14 @@ pub(crate) fn derive_placement_decisions(
     regions: &SealedStructuredRegionArtifact,
     function: &SSAFunction,
     binding_count: usize,
+    externally_declared: &BTreeSet<BindingId>,
     reads: &[FinalBindingRead],
     writes: &[FinalBindingWrite],
 ) -> Result<PlacementDecisions, PlacementAnalysisError> {
-    derive_with_cfg(regions, function, binding_count, reads, writes)
+    derive_with_cfg(regions, function, binding_count,
+        externally_declared,
+        reads, writes,
+    )
 }
 
 trait PlacementControlFlow {
@@ -129,6 +1151,7 @@ fn derive_with_cfg<C: PlacementControlFlow + ?Sized>(
     regions: &SealedStructuredRegionArtifact,
     cfg: &C,
     binding_count: usize,
+    externally_declared: &BTreeSet<BindingId>,
     reads: &[FinalBindingRead],
     writes: &[FinalBindingWrite],
 ) -> Result<PlacementDecisions, PlacementAnalysisError> {
@@ -141,6 +1164,14 @@ fn derive_with_cfg<C: PlacementControlFlow + ?Sized>(
         .enumerate()
         .map(|(index, block)| (block, index))
         .collect::<BTreeMap<_, _>>();
+
+    if let Some(binding) = externally_declared
+        .iter()
+        .copied()
+        .find(|binding| binding.index() >= binding_count)
+    {
+        return Err(PlacementAnalysisError::ExternalBindingOutsidePlan { binding });
+    }
 
     for read in reads {
         validate_occurrence(
@@ -179,7 +1210,10 @@ fn derive_with_cfg<C: PlacementControlFlow + ?Sized>(
             region: write.region,
             block: write.block,
             order: write.order,
-            kind: OccurrenceKind::Write(write.inst),
+            kind: OccurrenceKind::Write {
+                inst: write.inst,
+                inline_eligible: write.inline_eligible,
+            },
         });
     }
     for binding_occurrences in &mut occurrences {
@@ -192,6 +1226,7 @@ fn derive_with_cfg<C: PlacementControlFlow + ?Sized>(
         &block_addrs,
         &block_indices,
         &occurrences,
+        externally_declared,
     );
     let mut decisions = vec![None; binding_count];
 
@@ -204,10 +1239,17 @@ fn derive_with_cfg<C: PlacementControlFlow + ?Sized>(
         let writes_for_binding = binding_occurrences
             .iter()
             .filter_map(|occurrence| match occurrence.kind {
-                OccurrenceKind::Write(inst) => Some((occurrence, inst)),
+                OccurrenceKind::Write {
+                    inst,
+                    inline_eligible,
+                } => Some((occurrence, inst, inline_eligible)),
                 OccurrenceKind::Read(_) => None,
             })
             .collect::<Vec<_>>();
+        if externally_declared.contains(&binding) {
+            decisions[binding_index] = Some(PlacementDecision::ExternallyDeclared);
+            continue;
+        }
         if writes_for_binding.is_empty() {
             decisions[binding_index] = Some(PlacementDecision::Refused(
                 PlacementRefusal::MissingDefinition { binding },
@@ -231,9 +1273,10 @@ fn derive_with_cfg<C: PlacementControlFlow + ?Sized>(
             continue;
         };
 
-        if let [(write, inst)] = writes_for_binding.as_slice()
+        if let [(write, inst, inline_eligible)] = writes_for_binding.as_slice()
+            && *inline_eligible
             && binding_occurrences.iter().all(|occurrence| {
-                matches!(occurrence.kind, OccurrenceKind::Write(_))
+                matches!(occurrence.kind, OccurrenceKind::Write { .. })
                     || (write.order <= occurrence.order
                         && cfg.dominates(write.block, occurrence.block))
             })
@@ -292,7 +1335,7 @@ impl Occurrence {
                 site.inst.0,
                 site.input_idx,
             ),
-            OccurrenceKind::Write(inst) => {
+            OccurrenceKind::Write { inst, .. } => {
                 (self.order, 1, self.block, self.region.index(), inst.0, 0)
             }
         }
@@ -302,7 +1345,7 @@ impl Occurrence {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OccurrenceKind {
     Read(UseSite),
-    Write(InstId),
+    Write { inst: InstId, inline_eligible: bool },
 }
 
 fn lowest_dominating_region<C: PlacementControlFlow + ?Sized>(
@@ -371,7 +1414,7 @@ fn first_read_before_assignment(
             match occurrence.kind {
                 OccurrenceKind::Read(site) if !assigned => return Some(site),
                 OccurrenceKind::Read(_) => {}
-                OccurrenceKind::Write(_) => assigned = true,
+                OccurrenceKind::Write { .. } => assigned = true,
             }
         }
     }
@@ -384,13 +1427,14 @@ fn must_assignment_inputs<C: PlacementControlFlow + ?Sized>(
     block_addrs: &[u64],
     block_indices: &BTreeMap<u64, usize>,
     occurrences: &[Vec<Occurrence>],
+    externally_declared: &BTreeSet<BindingId>,
 ) -> Vec<DenseBindingSet> {
     let mut generated = vec![DenseBindingSet::empty(binding_count); block_addrs.len()];
     for (binding_index, binding_occurrences) in occurrences.iter().enumerate() {
         let binding = BindingId::from_dense_index(binding_index)
             .expect("binding occurrence index fits BindingId");
         for occurrence in binding_occurrences {
-            if matches!(occurrence.kind, OccurrenceKind::Write(_)) {
+            if matches!(occurrence.kind, OccurrenceKind::Write { .. }) {
                 generated[block_indices[&occurrence.block]].insert(binding);
             }
         }
@@ -404,7 +1448,9 @@ fn must_assignment_inputs<C: PlacementControlFlow + ?Sized>(
         let mut predecessors = cfg.predecessors(block);
         predecessors.sort_unstable();
         predecessors.dedup();
-        let next_input = if block == cfg.entry() || predecessors.is_empty() {
+        let next_input = if block == cfg.entry() {
+            DenseBindingSet::from_bindings(binding_count, externally_declared)
+        } else if predecessors.is_empty() {
             DenseBindingSet::empty(binding_count)
         } else {
             let first = predecessors.remove(0);
@@ -459,6 +1505,14 @@ impl DenseBindingSet {
         set
     }
 
+    fn from_bindings(binding_count: usize, bindings: &BTreeSet<BindingId>) -> Self {
+        let mut set = Self::empty(binding_count);
+        for binding in bindings {
+            set.insert(*binding);
+        }
+        set
+    }
+
     fn contains(&self, binding: BindingId) -> bool {
         let index = binding.index();
         index < self.binding_count
@@ -490,7 +1544,13 @@ impl DenseBindingSet {
 mod tests {
     use super::*;
     use crate::region::Region;
-    use crate::structured_region::{StructuredRegionDraft, StructuredRegionKind};
+    use crate::structured_region::{StructuredRegionDraft, StructuredRegionKind, StructuredRegionMarker, seal_structured_body,
+    };
+    use crate::symbol::{SymbolOrigin, SymbolRole, SymbolTable};
+
+    fn observation(index: u32) -> RenderObservationId {
+        crate::observation_journal::test_render_observation_id(index)
+    }
 
     #[derive(Debug)]
     struct TestCfg {
@@ -643,6 +1703,8 @@ mod tests {
                 region: then_region,
                 block: 0x1010,
                 order: FinalOccurrenceOrder(1),
+                observation: observation(1),
+                inline_eligible: true,
             },
             FinalBindingWrite {
                 binding,
@@ -650,6 +1712,8 @@ mod tests {
                 region: else_region,
                 block: 0x1020,
                 order: FinalOccurrenceOrder(2),
+                observation: observation(2),
+                inline_eligible: true,
             },
         ];
         let reads = [FinalBindingRead {
@@ -663,7 +1727,7 @@ mod tests {
             order: FinalOccurrenceOrder(3),
         }];
 
-        let decisions = derive_with_cfg(&regions, &cfg, 1, &reads, &writes).expect("placement");
+        let decisions = derive_with_cfg(&regions, &cfg, 1, &BTreeSet::new(), &reads, &writes).expect("placement");
         let sequence = regions.source_root();
         assert_eq!(
             decisions.decision(binding),
@@ -688,6 +1752,8 @@ mod tests {
             region: then_region,
             block: 0x1010,
             order: FinalOccurrenceOrder(1),
+            observation: observation(1),
+            inline_eligible: true,
         }];
         let reads = [FinalBindingRead {
             binding,
@@ -697,7 +1763,7 @@ mod tests {
             order: FinalOccurrenceOrder(2),
         }];
 
-        let decisions = derive_with_cfg(&regions, &cfg, 1, &reads, &writes).expect("placement");
+        let decisions = derive_with_cfg(&regions, &cfg, 1, &BTreeSet::new(), &reads, &writes).expect("placement");
         assert_eq!(
             decisions.decision(binding),
             Some(PlacementDecision::Refused(
@@ -721,6 +1787,7 @@ mod tests {
             &regions,
             &cfg,
             1,
+            &BTreeSet::new(),
             &[FinalBindingRead {
                 binding,
                 site: UseSite {
@@ -737,6 +1804,8 @@ mod tests {
                 region: write_region,
                 block: 0x1000,
                 order: FinalOccurrenceOrder(1),
+                observation: observation(1),
+                inline_eligible: true,
             }],
         )
         .expect("placement");
@@ -744,6 +1813,127 @@ mod tests {
         assert_eq!(
             decisions.decision(binding),
             Some(PlacementDecision::Inline { write })
+        );
+    }
+
+    #[test]
+    fn certified_parameter_read_uses_entry_assignment_without_a_local() {
+        let region = Region::Block(0x1000);
+        let regions = StructuredRegionDraft::from_region(0x1000, &region)
+            .expect("parameter region")
+            .seal();
+        let cfg = TestCfg::new(0x1000, &[]);
+        let binding = BindingId::from_dense_index(0).expect("binding");
+        let block_region = region_with_entry(&regions, 0x1000, StructuredRegionKind::Block);
+        let reads = [FinalBindingRead {
+            binding,
+            site: UseSite {
+                inst: InstId(0),
+                input_idx: 0,
+            },
+            region: block_region,
+            block: 0x1000,
+            order: FinalOccurrenceOrder(0),
+        }];
+
+        let decisions = derive_with_cfg(&regions, &cfg, 1, &BTreeSet::from([binding]), &reads, &[])
+            .expect("parameter placement");
+        assert_eq!(
+            decisions.decision(binding),
+            Some(PlacementDecision::ExternallyDeclared)
+        );
+
+        let uncertified = derive_with_cfg(&regions, &cfg, 1, &BTreeSet::new(), &reads, &[])
+            .expect("uncertified placement");
+        assert_eq!(
+            uncertified.decision(binding),
+            Some(PlacementDecision::Refused(
+                PlacementRefusal::MissingDefinition { binding }
+            ))
+        );
+    }
+
+    #[test]
+    fn exact_region_insertion_uses_the_sealed_anchor_not_the_block_address() {
+        let repeated_entry = CStmt::structured_region(
+            StructuredRegionMarker::unsealed(0x1000, StructuredRegionKind::FunctionBody),
+            CStmt::Block(vec![
+                CStmt::structured_region(
+                    StructuredRegionMarker::unsealed(0x1010, StructuredRegionKind::Block),
+                    CStmt::comment("first"),
+                ),
+                CStmt::structured_region(
+                    StructuredRegionMarker::unsealed(0x1010, StructuredRegionKind::Block),
+                    CStmt::comment("second"),
+                ),
+            ]),
+        );
+        let sealed = seal_structured_body(repeated_entry).expect("sealed occurrences");
+        let target = sealed
+            .regions()
+            .node_for_anchor(
+                sealed.regions().authority(),
+                sealed.regions().nodes()[2].emission_anchor(),
+            )
+            .expect("second occurrence")
+            .0;
+        let (statement, regions) = sealed.into_marked_parts();
+        let mut statements = vec![statement];
+        let declaration = CStmt::comment("declaration");
+
+        assert_eq!(
+            insert_region_declarations(&mut statements, &regions, target, &[declaration]),
+            1
+        );
+        let CStmt::StructuredRegion { stmt: root, .. } = &statements[0] else {
+            panic!("function marker")
+        };
+        let CStmt::Block(children) = root.as_ref() else {
+            panic!("function body")
+        };
+        let CStmt::StructuredRegion { stmt: first, .. } = &children[0] else {
+            panic!("first marker")
+        };
+        let CStmt::StructuredRegion { stmt: second, .. } = &children[1] else {
+            panic!("second marker")
+        };
+        assert!(!format!("{first:?}").contains("declaration"));
+        assert!(format!("{second:?}").contains("declaration"));
+    }
+
+    #[test]
+    fn inline_replaces_only_the_exact_marked_assignment() {
+        let symbols = std::rc::Rc::new(std::cell::RefCell::new(SymbolTable::new()));
+        let symbol = symbols.borrow_mut().declare(
+            "value",
+            crate::ast::CType::UInt(32),
+            SymbolRole::Carrier,
+            SymbolOrigin::default(),
+        );
+        let marker = observation(7);
+        let assignment = CStmt::observed(
+            marker,
+            CStmt::expr(CExpr::assign(CExpr::Var(symbol), CExpr::UIntLit(9))),
+        );
+        let mut statements = vec![assignment, CStmt::comment("untouched")];
+
+        assert_eq!(
+            inline_exact_write(
+                &mut statements,
+                marker,
+                symbol,
+                &crate::ast::CType::UInt(32),
+            ),
+            1
+        );
+        assert!(matches!(
+            statements[0].unobserved(),
+            CStmt::Decl {
+                name,
+                init: Some(CExpr::UIntLit(9)),
+                ..
+            } if *name == symbol
+        )
         );
     }
 }

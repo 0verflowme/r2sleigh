@@ -88,6 +88,15 @@ impl EmissionReadyFunction {
         crate::ast::discard_render_observations(&mut self.function);
     }
 
+    /// Remove lexical proof markers only after exact observation sealing has
+    /// inspected the same emission-ready tree.
+    pub(crate) fn strip_structured_region_markers(
+        &mut self,
+        regions: &crate::structured_region::SealedStructuredRegionArtifact,
+    ) -> Result<(), crate::structured_region::StructuredRegionFinalizationError> {
+        crate::structured_region::strip_final_region_markers(&mut self.function.body, regions)
+    }
+
     #[allow(
         dead_code,
         reason = "used by public Stage 5 AST boundaries after markers are sealed"
