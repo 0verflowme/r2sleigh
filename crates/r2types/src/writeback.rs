@@ -1200,6 +1200,8 @@ pub enum TypeWritebackAnalysisError {
     AssumptionSetMismatch,
     FunctionFactsSourceMismatch,
     IncompatibleDecompileRoute,
+    DerivedSignatureMismatch,
+    DerivedTypeFactsMismatch,
     SourceEnrichmentFailed,
 }
 
@@ -4469,8 +4471,12 @@ pub fn build_source_owned_type_writeback_analysis(
     if let Some(interproc_summary) = interproc_summary {
         function_facts = function_facts.with_prepared_interproc_summary(interproc_summary);
     }
-    debug_assert_eq!(derived.signature, derived.plan.signature);
-    debug_assert_eq!(derived.type_facts, *function_facts.type_facts());
+    if derived.signature != derived.plan.signature {
+        return Err(TypeWritebackAnalysisError::DerivedSignatureMismatch);
+    }
+    if derived.type_facts != *function_facts.type_facts() {
+        return Err(TypeWritebackAnalysisError::DerivedTypeFactsMismatch);
+    }
     let exact_source_fields = field_access_certificates_from_source_aggregate_accesses(&source);
     if !exact_source_fields.is_empty() {
         let mut type_facts = function_facts.type_facts().clone();
