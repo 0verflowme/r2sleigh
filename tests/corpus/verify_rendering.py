@@ -312,7 +312,7 @@ def marked_sections(text: str) -> dict[str, list[str]]:
 
 
 class BindingAuditFormatError(ValueError):
-    """One binding-audit marker is present but does not match schema version 2."""
+    """One audit sidecar is present but does not match its exact schema."""
 
 
 def _exact_object(
@@ -484,6 +484,70 @@ def _score_counted_binding_audit(
     }
 
 
+def _validate_effect_obligations(value: Any) -> dict[str, Any]:
+    effect = _exact_object(
+        value,
+        {
+            "schema_version",
+            "status",
+            "total",
+            "rendered",
+            "justified_elision",
+            "refused",
+            "unaccounted",
+            "conflicts",
+        },
+        context="effect obligations",
+    )
+    if isinstance(effect["schema_version"], bool) or effect["schema_version"] != 1:
+        raise BindingAuditFormatError("effect obligations schema_version must be 1")
+    if effect["status"] not in {"admitted", "refused", "not_run"}:
+        raise BindingAuditFormatError("effect obligations status is invalid")
+    for field in (
+        "total",
+        "rendered",
+        "justified_elision",
+        "refused",
+        "unaccounted",
+        "conflicts",
+    ):
+        _count(effect[field], context=f"effect obligations.{field}")
+    return effect
+
+
+def _score_effect_obligations(envelope: dict[str, Any]) -> dict[str, Any]:
+    effect = _validate_effect_obligations(envelope["effect_obligations"])
+    equation_balanced = effect["total"] == (
+        effect["rendered"]
+        + effect["justified_elision"]
+        + effect["refused"]
+        + effect["unaccounted"]
+    )
+    quality = {
+        "request_completed": envelope["request_status"] == "completed",
+        "admitted": effect["status"] == "admitted",
+        "equation_balanced": equation_balanced,
+        "zero_refused": effect["refused"] == 0,
+        "zero_unaccounted": effect["unaccounted"] == 0,
+        "zero_conflicts": effect["conflicts"] == 0,
+    }
+    if effect["status"] == "refused":
+        score_status = "refused"
+    elif effect["status"] == "not_run":
+        score_status = "not_run"
+    else:
+        score_status = "pass" if all(quality.values()) else "non_quality"
+    return {
+        "status": score_status,
+        "request_status": envelope["request_status"],
+        "source_status": effect["status"],
+        "marker_count": 1,
+        "record": effect,
+        "equation_balanced": equation_balanced,
+        "quality": quality,
+    }
+
+
 def _validate_binding_journal_cause(value: Any) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise BindingAuditFormatError("binding audit seal cause must be an object")
@@ -501,14 +565,67 @@ def _validate_binding_journal_cause(value: Any) -> dict[str, Any]:
     return cause
 
 
-def parse_binding_audit(section: str) -> tuple[str, dict[str, Any]]:
-    """Remove and score the one exact out-of-band audit line in a section."""
+def _score_binding_audit(envelope: dict[str, Any]) -> dict[str, Any]:
+    request_status = envelope["request_status"]
+    audit = envelope["audit"]
+    if not isinstance(audit, dict):
+        raise BindingAuditFormatError("binding audit audit must be a JSON object")
+    status = audit.get("status")
+    if status in {"complete", "incomplete_observations", "non_quality"}:
+        return _score_counted_binding_audit(envelope, audit)
+    if status == "failed":
+        reason = audit.get("reason")
+        if reason not in BINDING_AUDIT_FAILURE_REASONS:
+            raise BindingAuditFormatError(
+                "failed binding audit reason is not in the schema"
+            )
+        expected_fields = {"schema_version", "status", "reason"}
+        if reason in BINDING_AUDIT_JOURNAL_FAILURE_REASONS:
+            expected_fields.add("cause")
+        _exact_object(
+            audit,
+            expected_fields,
+            context="failed binding audit",
+        )
+        if isinstance(audit["schema_version"], bool) or audit["schema_version"] != 2:
+            raise BindingAuditFormatError("binding audit schema_version must be 2")
+        if reason in BINDING_AUDIT_JOURNAL_FAILURE_REASONS:
+            _validate_binding_journal_cause(audit["cause"])
+        return {
+            "status": "failed",
+            "request_status": request_status,
+            "marker_count": 1,
+            "record": envelope,
+        }
+    if status == "not_run":
+        _exact_object(
+            audit,
+            {"schema_version", "status"},
+            context="not-run binding audit",
+        )
+        if isinstance(audit["schema_version"], bool) or audit["schema_version"] != 2:
+            raise BindingAuditFormatError("binding audit schema_version must be 2")
+        return {
+            "status": "not_run",
+            "request_status": request_status,
+            "marker_count": 1,
+            "record": envelope,
+        }
+    raise BindingAuditFormatError(f"unsupported binding audit status: {status!r}")
+
+
+def parse_render_audits(
+    section: str,
+) -> tuple[str, dict[str, Any], dict[str, Any]]:
+    """Remove and independently score the binding and effect audit sidecar."""
     matches = list(BINDING_AUDIT_LINE.finditer(section))
     cleaned = BINDING_AUDIT_LINE.sub("", section)
     if not matches:
-        return cleaned, {"status": "missing", "marker_count": 0}
+        missing = {"status": "missing", "marker_count": 0}
+        return cleaned, missing.copy(), missing
     if len(matches) != 1:
-        return cleaned, {"status": "duplicate", "marker_count": len(matches)}
+        duplicate = {"status": "duplicate", "marker_count": len(matches)}
+        return cleaned, duplicate.copy(), duplicate
 
     payload = matches[0].group("payload")
     try:
@@ -525,69 +642,54 @@ def parse_binding_audit(section: str) -> tuple[str, dict[str, Any]]:
             )
         record = _exact_object(
             record,
-            {"schema_version", "request_status", "audit"},
+            {
+                "schema_version",
+                "request_status",
+                "audit",
+                "effect_obligations",
+            },
             context="binding audit envelope",
         )
-        if isinstance(record["schema_version"], bool) or record["schema_version"] != 2:
+        if isinstance(record["schema_version"], bool) or record["schema_version"] != 3:
             raise BindingAuditFormatError(
-                "binding audit envelope schema_version must be 2"
+                "binding audit envelope schema_version must be 3"
             )
         request_status = record["request_status"]
         if request_status not in {"completed", "refused"}:
             raise BindingAuditFormatError(
                 "binding audit request_status must be completed or refused"
             )
-        audit = record["audit"]
-        if not isinstance(audit, dict):
-            raise BindingAuditFormatError("binding audit audit must be a JSON object")
-        status = audit.get("status")
-        if status in {"complete", "incomplete_observations", "non_quality"}:
-            return cleaned, _score_counted_binding_audit(record, audit)
-        if status == "failed":
-            reason = audit.get("reason")
-            if reason not in BINDING_AUDIT_FAILURE_REASONS:
-                raise BindingAuditFormatError(
-                    "failed binding audit reason is not in the schema"
-                )
-            expected_fields = {"schema_version", "status", "reason"}
-            if reason in BINDING_AUDIT_JOURNAL_FAILURE_REASONS:
-                expected_fields.add("cause")
-            _exact_object(
-                audit,
-                expected_fields,
-                context="failed binding audit",
-            )
-            if isinstance(audit["schema_version"], bool) or audit["schema_version"] != 2:
-                raise BindingAuditFormatError("binding audit schema_version must be 2")
-            if reason in BINDING_AUDIT_JOURNAL_FAILURE_REASONS:
-                _validate_binding_journal_cause(audit["cause"])
-            return cleaned, {
-                "status": "failed",
-                "request_status": request_status,
-                "marker_count": 1,
-                "record": record,
-            }
-        if status == "not_run":
-            _exact_object(
-                audit,
-                {"schema_version", "status"},
-                context="not-run binding audit",
-            )
-            if isinstance(audit["schema_version"], bool) or audit["schema_version"] != 2:
-                raise BindingAuditFormatError("binding audit schema_version must be 2")
-            return cleaned, {
-                "status": "not_run",
-                "request_status": request_status,
-                "marker_count": 1,
-                "record": record,
-            }
-        raise BindingAuditFormatError(f"unsupported binding audit status: {status!r}")
     except (json.JSONDecodeError, BindingAuditFormatError) as error:
-        return cleaned, {
+        malformed = {
             "status": "malformed",
             "marker_count": 1,
             "error": str(error),
         }
+        return cleaned, malformed.copy(), malformed
+
+    try:
+        binding_score = _score_binding_audit(record)
+    except BindingAuditFormatError as error:
+        binding_score = {
+            "status": "malformed",
+            "marker_count": 1,
+            "error": str(error),
+        }
+    try:
+        effect_score = _score_effect_obligations(record)
+    except BindingAuditFormatError as error:
+        effect_score = {
+            "status": "malformed",
+            "marker_count": 1,
+            "error": str(error),
+        }
+    return cleaned, binding_score, effect_score
+
+
+def parse_binding_audit(section: str) -> tuple[str, dict[str, Any]]:
+    """Compatibility entry point returning only the binding side of the sidecar."""
+    cleaned, binding_score, _ = parse_render_audits(section)
+    return cleaned, binding_score
 
 
 def _matching_brace(text: str, opening: int) -> int | None:
@@ -1108,6 +1210,7 @@ def verify(args: argparse.Namespace) -> dict[str, Any]:
             "differential": {"status": "not_run", "cases": []},
             "snapshot": {"status": "missing"},
             "binding_audit": {"status": "missing", "marker_count": 0},
+            "effect_obligations": {"status": "missing", "marker_count": 0},
         }
         found = sections.get(name, [])
         entry["generation"]["section_count"] = len(found)
@@ -1115,7 +1218,11 @@ def verify(args: argparse.Namespace) -> dict[str, Any]:
             entry["generation"]["status"] = "missing" if not found else "duplicate"
             entries.append(entry)
             continue
-        exact_section, entry["binding_audit"] = parse_binding_audit(found[0])
+        (
+            exact_section,
+            entry["binding_audit"],
+            entry["effect_obligations"],
+        ) = parse_render_audits(found[0])
         section_dir = artifact_root / "raw-sections"
         section_dir.mkdir(parents=True, exist_ok=True)
         section_path = section_dir / f"{args.config}_{name}.txt"
@@ -1324,7 +1431,8 @@ def print_summary(report: dict[str, Any]) -> None:
             f"diff={entry['differential']['status']:<16} "
             f"basis={str(entry['differential'].get('basis')):<10} "
             f"snapshot={entry['snapshot']['status']:<10} "
-            f"binding_audit={entry['binding_audit']['status']}"
+            f"binding_audit={entry['binding_audit']['status']:<12} "
+            f"effect_obligations={entry['effect_obligations']['status']}"
         )
         if entry["raw"].get("status") == "failed":
             print(f"    raw: {first_error(entry['raw'])}")

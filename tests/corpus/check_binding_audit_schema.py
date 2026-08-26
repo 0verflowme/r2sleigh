@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Check Rust-produced binding-journal causes against the corpus schema."""
+"""Check Rust-produced binding and effect records against the corpus schema."""
 
 from __future__ import annotations
 
@@ -35,9 +35,21 @@ def validate_oracle(value: Any) -> int:
     return len(seen)
 
 
+def validate_effect_obligations(value: Any) -> dict[str, Any]:
+    """Validate one Rust-produced effect ledger against the corpus schema."""
+    return verifier._validate_effect_obligations(value)
+
+
+def validate_schema(value: Any) -> int:
+    if isinstance(value, list):
+        return validate_oracle(value)
+    validate_effect_obligations(value)
+    return 1
+
+
 def main() -> int:
     try:
-        count = validate_oracle(json.load(sys.stdin))
+        count = validate_schema(json.load(sys.stdin))
     except (json.JSONDecodeError, verifier.BindingAuditFormatError) as error:
         print(error, file=sys.stderr)
         return 1
