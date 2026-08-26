@@ -1194,6 +1194,7 @@ impl LegacyObservationJournal {
         let mut writes = self.writes.clone();
         let targets = &self.targets;
         let value_is_literal = &self.value_is_literal;
+        let plan = &self.plan;
         let symbol_bindings = declared_legacy_bindings(function);
         inspect_and_strip_render_observations(
             function,
@@ -1209,6 +1210,26 @@ impl LegacyObservationJournal {
                 })?;
                 match target {
                     ObservationTarget::Value(value) => {
+                        match plan.disposition(value) {
+                            Some(ValueDisposition::Elided { reason, .. }) => {
+                                return Err(
+                                    LegacyObservationJournalError::PlannedElidedValueRendered {
+                                        value,
+                                        reason: *reason,
+                                    },
+                                );
+                            }
+                            Some(ValueDisposition::Refused { reason }) => {
+                                return Err(
+                                    LegacyObservationJournalError::PlannedRefusedValueRendered {
+                                        value,
+                                        reason: *reason,
+                                    },
+                                );
+                            }
+                            Some(ValueDisposition::Bound { .. } | ValueDisposition::Inline { .. })
+                            | None => {}
+                        }
                         let observation =
                             classify_value_node(value, node, value_is_literal, &symbol_bindings)?;
                         record_same(&mut values[value.0 as usize], observation)

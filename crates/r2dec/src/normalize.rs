@@ -1205,6 +1205,12 @@ pub(crate) fn materialize_certified_loop_carriers_with_control(
             let Some(value) = graph.value_id_for_var(&phi.dst) else {
                 return false;
             };
+            // Carrier identity is evidence about value equivalence, not proof
+            // that the post-loop merge has a surviving read. Deadness owns
+            // materialization admission and therefore has to win first.
+            if dead.contains(value) {
+                return false;
+            }
             if render_facts.loop_carrier_for_value(value).is_some() {
                 return true;
             }
@@ -1218,11 +1224,9 @@ pub(crate) fn materialize_certified_loop_carriers_with_control(
             // spell that. It rendered nothing at all, and the reader never saw that
             // a value went missing -- `djb2` at x86-64 -O2 dropped the `+ rdx` its
             // remainder loop starts from and returned a plausible wrong hash.
-            !dead.contains(value)
-                && phi
-                    .sources
-                    .iter()
-                    .any(|(pred, _)| func.successors(*pred).len() > 1)
+            phi.sources
+                .iter()
+                .any(|(pred, _)| func.successors(*pred).len() > 1)
         },
     )
 }

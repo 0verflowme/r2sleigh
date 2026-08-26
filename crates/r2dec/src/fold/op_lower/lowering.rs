@@ -224,18 +224,14 @@ impl<'a> FoldingContext<'a> {
                     expr,
                 },
             ),
-            Some(crate::binding_plan::PlannedValueSymbol::Elided(reason)) => Err(
-                crate::observation_journal::LegacyObservationJournalError::PlannedElidedValueRendered {
-                    value,
-                    reason,
-                },
-            ),
-            Some(crate::binding_plan::PlannedValueSymbol::Refused(reason)) => Err(
-                crate::observation_journal::LegacyObservationJournalError::PlannedRefusedValueRendered {
-                    value,
-                    reason,
-                },
-            ),
+            // An attempted lowering is not a rendered occurrence. Keep the
+            // legacy candidate long enough for dead-code and structuring
+            // rewrites to delete it; the final surviving value marker is the
+            // only place allowed to turn either disposition into an error.
+            Some(
+                crate::binding_plan::PlannedValueSymbol::Elided(_)
+                | crate::binding_plan::PlannedValueSymbol::Refused(_),
+            ) => Ok(None),
             Some(crate::binding_plan::PlannedValueSymbol::Absent) | None => Err(
                 crate::observation_journal::LegacyObservationJournalError::MissingPlannedValue(
                     value,
@@ -253,6 +249,16 @@ impl<'a> FoldingContext<'a> {
         if frame.observe_inputs {
             let expr = match self.planned_input_expr(frame, input_idx) {
                 Ok(planned) => planned,
+                Err(
+                    crate::observation_journal::LegacyObservationJournalError::PlannedElidedValueRendered { .. }
+                    | crate::observation_journal::LegacyObservationJournalError::PlannedRefusedValueRendered { .. },
+                ) => {
+                    return self.observe_optional_normalized_input_expr(
+                        frame.normalized_site,
+                        input_idx,
+                        expr,
+                    );
+                }
                 Err(error) => {
                     self.retain_first_observation_error(error);
                     return expr;
