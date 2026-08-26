@@ -2272,41 +2272,57 @@ impl MachineBuilder {
             });
         }
         let mut inputs = Vec::with_capacity(expected);
-        for (input_idx, value) in inst.inputs.iter().copied().enumerate() {
-            let graph_value = graph
-                .value(value)
-                .ok_or(MachineBuildError::MissingGraphValue(value))?;
-            let input = self.intern_value(graph_value)?;
-            let input_bits = self.nodes[input.index()].ty.width_bits();
-            if input_bits < result_bits {
-                return Err(MachineBuildError::WidthMismatch {
-                    inst: inst.id,
-                    expected_bits: result_bits,
-                    actual_bits: input_bits,
-                });
-            }
-            self.record_use(
-                graph,
-                inst,
-                input_idx,
-                MachineUseSlice {
-                    bit_offset: 0,
-                    width_bits: result_bits,
-                    carrier_width_bits: input_bits,
-                    conversion: None,
-                },
-            )?;
-            if input_bits == result_bits {
-                inputs.push(input);
-                continue;
-            }
-            inputs.push(self.push(
-                integer_type(result_bits, MachineSignedness::Unsigned),
-                None,
-                MachineExprKind::Extract { input, lsb_bits: 0 },
-            ));
+        for input_idx in 0..expected {
+            inputs.push(self.narrowed_operand_node(graph, inst, input_idx, result_bits)?);
         }
         Ok(inputs)
+    }
+
+    fn narrowed_operand_node(
+        &mut self,
+        graph: &crate::graph::SsaGraph,
+        inst: &GraphInst,
+        input_idx: usize,
+        result_bits: u32,
+    ) -> Result<MachineExprId, MachineBuildError> {
+        let value = *inst
+            .inputs
+            .get(input_idx)
+            .ok_or(MachineBuildError::MissingUseDisposition(UseSite {
+                inst: inst.id,
+                input_idx,
+            }))?;
+        let graph_value = graph
+            .value(value)
+            .ok_or(MachineBuildError::MissingGraphValue(value))?;
+        let input = self.intern_value(graph_value)?;
+        let input_bits = self.nodes[input.index()].ty.width_bits();
+        if input_bits < result_bits {
+            return Err(MachineBuildError::WidthMismatch {
+                inst: inst.id,
+                expected_bits: result_bits,
+                actual_bits: input_bits,
+            });
+        }
+        self.record_use(
+            graph,
+            inst,
+            input_idx,
+            MachineUseSlice {
+                bit_offset: 0,
+                width_bits: result_bits,
+                carrier_width_bits: input_bits,
+                conversion: None,
+            },
+        )?;
+        if input_bits == result_bits {
+            return Ok(input);
+        }
+        Ok(self.push(
+            integer_type(result_bits, MachineSignedness::Unsigned),
+            None,
+            MachineExprKind::Extract { input, lsb_bits: 0 },
+        ))
     }
 
     fn lower_inst(
@@ -2557,7 +2573,24 @@ impl MachineBuilder {
                 ))
             }
             SSAOp::IntLeft { .. } | SSAOp::IntRight { .. } | SSAOp::IntSRight { .. } => {
-                let inputs = self.operand_nodes(graph, inst, 2)?;
+                if inst.inputs.len() != 2 {
+                    return Err(MachineBuildError::WrongOperandCount {
+                        inst: inst.id,
+                        expected: 2,
+                        actual: inst.inputs.len(),
+                    });
+                }
+                // The shifted value is evaluated at the result width. Sleigh
+                // can express this by writing the low part of a wider value
+                // directly into a narrower destination, so retain that exact
+                // low-bit use as an explicit Extract. The count is an
+                // independent operand and keeps its source width.
+                let value = self.narrowed_operand_node(graph, inst, 0, output.width_bits)?;
+                let count_value = graph
+                    .value(inst.inputs[1])
+                    .ok_or(MachineBuildError::MissingGraphValue(inst.inputs[1]))?;
+                let count = self.intern_value(count_value)?;
+                self.record_whole_use(graph, inst, 1)?;
                 let (kind, overshift, ty) = match op {
                     SSAOp::IntLeft { .. } => (
                         MachineShiftKind::Left,
@@ -2581,8 +2614,8 @@ impl MachineBuilder {
                     MachineExprKind::Shift {
                         kind,
                         overshift,
-                        value: inputs[0],
-                        count: inputs[1],
+                        value,
+                        count,
                     },
                 ))
             }
@@ -3378,6 +3411,154 @@ mod tests {
         machine
             .validate_against(&artifact)
             .expect("narrow bitwise expression remains source-bound");
+    }
+
+    #[test]
+    fn narrow_shifts_extract_only_the_value_and_keep_the_count_width() {
+        let arch = register_geometry_arch();
+        let artifact = artifact_with_arch(
+            [
+                R2ILOp::IntLeft {
+                    dst: Varnode::unique(0x10, 4),
+                    a: Varnode::register(0, 8),
+                    b: Varnode::constant(1, 1),
+                },
+                R2ILOp::IntRight {
+                    dst: Varnode::unique(0x18, 4),
+                    a: Varnode::register(0, 8),
+                    b: Varnode::constant(2, 1),
+                },
+                R2ILOp::IntSRight {
+                    dst: Varnode::unique(0x20, 4),
+                    a: Varnode::register(0, 8),
+                    b: Varnode::constant(3, 1),
+                },
+            ],
+            &arch,
+        );
+
+        let projection =
+            MachineProjection::from_artifact(&artifact).expect("typed narrow shift projection");
+        assert!(
+            projection.failures().is_empty(),
+            "narrow shifts must not become projection refusals: {:?}",
+            projection.failures()
+        );
+        assert_eq!(
+            projection,
+            MachineProjection::from_artifact(&artifact).expect("repeated narrow shift projection")
+        );
+
+        for (op_index, expected_kind) in [
+            (0, MachineShiftKind::Left),
+            (1, MachineShiftKind::LogicalRight),
+            (2, MachineShiftKind::ArithmeticRight),
+        ] {
+            let inst = artifact
+                .graph()
+                .inst_id_for_op_site(0x1000, op_index)
+                .expect("shift instruction");
+            let output = artifact
+                .graph()
+                .inst(inst)
+                .and_then(|inst| inst.output)
+                .expect("shift output");
+            let root = projection
+                .entity_for_output(output)
+                .and_then(|entity| projection.expr(entity.root()))
+                .expect("shift expression");
+            let MachineExprKind::Shift {
+                kind, value, count, ..
+            } = root.kind()
+            else {
+                panic!("expected shift root, got {:?}", root.kind());
+            };
+            assert_eq!(*kind, expected_kind);
+            assert_eq!(root.ty().width_bits(), 32);
+
+            let narrowed = projection.expr(*value).expect("narrowed shift value");
+            assert_eq!(narrowed.ty().width_bits(), 32);
+            let MachineExprKind::Extract { input, lsb_bits } = narrowed.kind() else {
+                panic!(
+                    "narrow shift value must be an explicit extract, got {:?}",
+                    narrowed.kind()
+                );
+            };
+            assert_eq!(*lsb_bits, 0);
+            assert_eq!(
+                projection
+                    .expr(*input)
+                    .expect("wide shift source")
+                    .ty()
+                    .width_bits(),
+                64
+            );
+            assert_eq!(
+                projection
+                    .expr(*count)
+                    .expect("shift count source")
+                    .ty()
+                    .width_bits(),
+                8
+            );
+            assert_eq!(
+                exact_use(&projection, &artifact, op_index, 0),
+                MachineUseSlice {
+                    bit_offset: 0,
+                    width_bits: 32,
+                    carrier_width_bits: 64,
+                    conversion: None,
+                }
+            );
+            assert_eq!(
+                exact_use(&projection, &artifact, op_index, 1),
+                MachineUseSlice {
+                    bit_offset: 0,
+                    width_bits: 8,
+                    carrier_width_bits: 8,
+                    conversion: None,
+                }
+            );
+        }
+        projection
+            .validate_against(&artifact)
+            .expect("narrow shift projection remains source-bound");
+    }
+
+    #[test]
+    fn shift_value_narrower_than_result_reports_instruction_width_mismatch() {
+        let artifact = artifact_with_ops([R2ILOp::IntRight {
+            dst: Varnode::unique(0x10, 8),
+            a: Varnode::unique(0x100, 4),
+            b: Varnode::constant(1, 1),
+        }]);
+        let inst = artifact
+            .graph()
+            .inst_id_for_op_site(0x1000, 0)
+            .expect("shift instruction");
+        let projection =
+            MachineProjection::from_artifact(&artifact).expect("partial shift projection");
+
+        assert_eq!(projection.failures().len(), 1);
+        assert_eq!(
+            projection.failures()[0].error(),
+            &MachineBuildError::WidthMismatch {
+                inst,
+                expected_bits: 64,
+                actual_bits: 32,
+            }
+        );
+        for input_idx in 0..2 {
+            assert_eq!(
+                projection.use_disposition(UseSite { inst, input_idx }),
+                Some(&MachineUseDisposition::Refused(
+                    MachineUseRefusal::IncoherentOperation
+                ))
+            );
+        }
+        projection
+            .validate_against(&artifact)
+            .expect("width refusal remains source-bound");
     }
 
     #[test]
