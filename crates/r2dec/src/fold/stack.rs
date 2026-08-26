@@ -405,9 +405,9 @@ impl<'a> FoldingContext<'a> {
             Some(object) => object,
             None => return false,
         };
-        let (base, offset) = match prepared.objects().object(object).map(|fact| fact.kind) {
+        let (base, offset) = match prepared.objects().object(object).map(|fact| &fact.kind) {
             Some(ObjectKind::StackSlot { base, offset, .. })
-            | Some(ObjectKind::FrameObject { base, offset, .. }) => (base, offset),
+            | Some(ObjectKind::FrameObject { base, offset, .. }) => (*base, *offset),
             _ => return false,
         };
         let value = match prepared.graph().value_id_for_var(val) {
