@@ -13,8 +13,9 @@
 )]
 
 use r2ssa::{
-    InstId, MachineUseDisposition, MachineUseRefusal, MachineUseSlice, MachineWriteDisposition,
-    MachineWriteProjection, MachineWriteRefusal, SsaArtifactAuthority, UseSite, ValueId,
+    InstId, MachineUseDisposition, MachineUseRefusal, MachineUseSlice, MachineValueUse,
+    MachineWriteDisposition, MachineWriteProjection, MachineWriteRefusal, SsaArtifactAuthority,
+    UseSite, ValueId,
 };
 use r2types::SourceOwnedFunctionFacts;
 
@@ -51,6 +52,7 @@ pub(crate) enum LegacyValueObservation {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LegacyUseObservation {
     Exact(MachineUseSlice),
+    MemoryAddress(MachineValueUse),
     Elided(r2ssa::ledger::ElisionReason),
     Refused(MachineUseRefusal),
     LegacyAbsent,

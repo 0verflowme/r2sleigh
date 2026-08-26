@@ -132,6 +132,9 @@ fn exact_uses_from_storage(
                 .expect("dense storage use disposition")
             {
                 MachineUseDisposition::Exact(slice) => slice,
+                MachineUseDisposition::MemoryAddress(address) => {
+                    panic!("expected bit slice, got contextual address {address:?}")
+                }
                 MachineUseDisposition::Refused(reason) => {
                     panic!("storage use must be exact, got {reason:?}")
                 }

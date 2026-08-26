@@ -113,6 +113,9 @@ fn matching_snapshot(
         for cell in row {
             cell.observation = match plan.use_disposition(cell.site).expect("dense use") {
                 MachineUseDisposition::Exact(slice) => LegacyUseObservation::Exact(*slice),
+                MachineUseDisposition::MemoryAddress(address) => {
+                    LegacyUseObservation::MemoryAddress(*address)
+                }
                 MachineUseDisposition::Refused(reason) => LegacyUseObservation::Refused(*reason),
             };
         }
@@ -271,6 +274,44 @@ fn refusal_is_exact_and_legacy_absence_is_not_refusal() {
         refused_use.old,
         SideJudgment::Wrong(WrongReason::LegacyAbsent)
     );
+}
+
+#[test]
+fn contextual_memory_use_is_not_equal_to_an_integer_slice_observation() {
+    let source = source_owned([R2ILOp::Store {
+        space: r2il::SpaceId::Ram,
+        addr: Varnode::register(0x28, 8),
+        val: Varnode::constant(7, 8),
+    }]);
+    let plan = BindingPlan::build_shadow(&source).expect("sealed memory plan");
+    let inst = source
+        .source()
+        .graph()
+        .inst_id_for_op_site(0x1000, 0)
+        .expect("store instruction");
+    let address_site = UseSite { inst, input_idx: 0 };
+    let value_site = UseSite { inst, input_idx: 1 };
+    assert!(matches!(
+        plan.use_disposition(address_site),
+        Some(MachineUseDisposition::MemoryAddress(_))
+    ));
+    let wrong_slice = match plan.use_disposition(value_site) {
+        Some(MachineUseDisposition::Exact(slice)) => *slice,
+        other => panic!("store value must have an integer slice: {other:?}"),
+    };
+
+    let mut snapshot = matching_snapshot(&source, &plan, 0);
+    snapshot.uses[inst.0 as usize][0].observation = LegacyUseObservation::Exact(wrong_slice);
+    let report = ShadowReport::build(&plan, &source, &snapshot).expect("classified report");
+    let address = &report.uses()[inst.0 as usize][0];
+    assert_eq!(address.key(), address_site);
+    assert_eq!(address.classification(), ShadowClassification::OldWrong);
+    assert_eq!(
+        address.old_judgment(),
+        SideJudgment::Wrong(WrongReason::DispositionMismatch),
+        "a contextual memory projection must never be reported as an exact bit slice"
+    );
+    assert_eq!(address.shadow_judgment(), SideJudgment::Correct);
 }
 
 #[test]

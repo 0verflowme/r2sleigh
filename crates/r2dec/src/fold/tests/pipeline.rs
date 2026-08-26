@@ -1395,6 +1395,9 @@ mod tests {
             Some(r2ssa::MachineUseDisposition::Exact(slice)) => {
                 crate::shadow_report::LegacyUseObservation::Exact(*slice)
             }
+            Some(r2ssa::MachineUseDisposition::MemoryAddress(address)) => {
+                crate::shadow_report::LegacyUseObservation::MemoryAddress(*address)
+            }
             other => panic!("expected exact machine use at {site:?}, got {other:?}"),
         }
     }
@@ -1699,6 +1702,171 @@ mod tests {
             } if matches!(expr.unobserved(), CExpr::Binary { op: BinaryOp::BitOr, .. })
         ));
 
+        assert_eq!(*ctx.observation_error.borrow(), None);
+    }
+
+    #[test]
+    fn observed_stack_load_keeps_contextual_access_with_an_opaque_base_name() {
+        let mut arch = make_test_arch_x86_64();
+        arch.registers
+            .iter_mut()
+            .find(|register| register.offset == 0x20 && register.size == 8)
+            .expect("frame-pointer storage")
+            .name = "opaque_machine_base".to_string();
+
+        let mut entry = R2ILBlock::new(0x1000, 4);
+        entry.push(R2ILOp::IntSub {
+            dst: Varnode::unique(0x100, 8),
+            a: Varnode::register(0x20, 8),
+            b: Varnode::constant(8, 8),
+        });
+        entry.push(R2ILOp::Load {
+            dst: Varnode::unique(0x200, 4),
+            space: SpaceId::Ram,
+            addr: Varnode::unique(0x100, 8),
+        });
+        let prepared = prepared_x86_with_stack_slot(
+            &[entry],
+            &arch,
+            r2ssa::StackAddressBase::FramePointer,
+            -8,
+            4,
+        )
+        .with_name("observed_contextual_stack_load");
+        let block = prepared.function().get_block(0x1000).expect("entry block");
+        let load_idx = block
+            .ops
+            .iter()
+            .position(|op| matches!(op, SSAOp::Load { .. }))
+            .expect("stack load");
+        let load_inst = prepared
+            .graph()
+            .inst_id_for_op_site(block.addr, load_idx)
+            .expect("load graph instruction");
+        let address_site = r2ssa::UseSite {
+            inst: load_inst,
+            input_idx: 0,
+        };
+
+        let mut ctx = make_x86_64_ctx_with_prepared(&prepared);
+        let (plan, names, _journal) = install_observed_lowering(&mut ctx, &prepared);
+        let address = match plan.use_disposition(address_site) {
+            Some(r2ssa::MachineUseDisposition::MemoryAddress(address)) => *address,
+            other => panic!("expected contextual memory address, got {other:?}"),
+        };
+        assert_eq!(
+            address.memory_access(),
+            Some(r2ssa::StructuredAccessId {
+                inst: load_inst,
+                ordinal: 0,
+            })
+        );
+
+        let stmt = ctx
+            .op_to_stmt_with_args(&block.ops[load_idx], block.addr, load_idx)
+            .expect("structured stack load");
+        let CStmt::Expr(assignment) = stmt.unobserved() else {
+            panic!("load must remain an assignment: {stmt:?}");
+        };
+        let CExpr::Binary {
+            op: BinaryOp::Assign,
+            right,
+            ..
+        } = assignment.unobserved()
+        else {
+            panic!("load must retain its assignment expression: {assignment:?}");
+        };
+        let rendered = spelled(&ctx, right);
+        assert!(
+            !rendered.contains("opaque_machine_base"),
+            "the contextual use must not fall back to its opaque machine binding: {rendered}"
+        );
+        let address_symbol = names
+            .symbol_for_value(address.binding().value())
+            .expect("ordinary address binding remains available for non-contextual uses");
+        assert!(
+            !matches!(right.unobserved(), CExpr::Var(symbol) if *symbol == address_symbol),
+            "the load expression must not be replaced by the address value's binding"
+        );
+        assert_eq!(*ctx.observation_error.borrow(), None);
+    }
+
+    #[test]
+    fn observed_stack_store_keeps_contextual_target_with_an_opaque_base_name() {
+        let mut arch = make_test_arch_x86_64();
+        arch.registers
+            .iter_mut()
+            .find(|register| register.offset == 0x28 && register.size == 8)
+            .expect("stack-pointer storage")
+            .name = "opaque_store_base".to_string();
+
+        let mut entry = R2ILBlock::new(0x1000, 4);
+        entry.push(R2ILOp::IntSub {
+            dst: Varnode::unique(0x300, 8),
+            a: Varnode::register(0x28, 8),
+            b: Varnode::constant(8, 8),
+        });
+        entry.push(R2ILOp::Store {
+            space: SpaceId::Ram,
+            addr: Varnode::unique(0x300, 8),
+            val: Varnode::constant(0x55, 4),
+        });
+        let prepared = prepared_x86_with_stack_slot(
+            &[entry],
+            &arch,
+            r2ssa::StackAddressBase::StackPointer,
+            -8,
+            4,
+        )
+        .with_name("observed_contextual_stack_store");
+        let block = prepared.function().get_block(0x1000).expect("entry block");
+        let store_idx = block
+            .ops
+            .iter()
+            .position(|op| matches!(op, SSAOp::Store { .. }))
+            .expect("stack store");
+        let store_inst = prepared
+            .graph()
+            .inst_id_for_op_site(block.addr, store_idx)
+            .expect("store graph instruction");
+        let address_site = r2ssa::UseSite {
+            inst: store_inst,
+            input_idx: 0,
+        };
+
+        let mut ctx = make_x86_64_ctx_with_prepared(&prepared);
+        let (plan, names, _journal) = install_observed_lowering(&mut ctx, &prepared);
+        let address = match plan.use_disposition(address_site) {
+            Some(r2ssa::MachineUseDisposition::MemoryAddress(address)) => *address,
+            other => panic!("expected contextual store address, got {other:?}"),
+        };
+        let address_symbol = names
+            .symbol_for_value(address.binding().value())
+            .expect("ordinary address binding remains available for non-contextual uses");
+
+        let stmt = ctx
+            .op_to_stmt_with_args(&block.ops[store_idx], block.addr, store_idx)
+            .expect("structured stack store");
+        let CStmt::Expr(assignment) = stmt.unobserved() else {
+            panic!("store must remain an assignment: {stmt:?}");
+        };
+        let CExpr::Binary {
+            op: BinaryOp::Assign,
+            left,
+            ..
+        } = assignment.unobserved()
+        else {
+            panic!("store must retain its assignment expression: {assignment:?}");
+        };
+        let rendered = spelled(&ctx, left);
+        assert!(
+            !rendered.contains("opaque_store_base"),
+            "the contextual store must not fall back to its opaque machine binding: {rendered}"
+        );
+        assert!(
+            !matches!(left.unobserved(), CExpr::Var(symbol) if *symbol == address_symbol),
+            "the store target must not be replaced by the address value's binding"
+        );
         assert_eq!(*ctx.observation_error.borrow(), None);
     }
 

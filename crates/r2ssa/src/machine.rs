@@ -92,7 +92,7 @@ impl MachineValueBinding {
 }
 
 /// Exact use of one artifact-local machine value.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct MachineValueUse {
     binding: MachineValueBinding,
     ty: MachineType,
@@ -335,7 +335,7 @@ pub enum MachineStackBase {
     StackPointer,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub enum MachineType {
     Bool {
         storage_bits: u32,
@@ -547,6 +547,14 @@ pub enum MachineUseRefusal {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum MachineUseDisposition {
     Exact(MachineUseSlice),
+    /// The exact structured load/store address interpretation for this use.
+    ///
+    /// Address interpretation is contextual: the same SSA value may be an
+    /// integer elsewhere.  Keeping the existing source-owned value-use
+    /// certificate in the dense `UseSite` cell prevents a renderer from
+    /// replacing a certified stack/object access with a register spelling or
+    /// from reporting that it rendered a bit slice instead.
+    MemoryAddress(MachineValueUse),
     Refused(MachineUseRefusal),
 }
 
@@ -1291,6 +1299,13 @@ fn canonical_machine_use_disposition(
     validate_machine_use_slice(slice, source.width_bits)
         .map_err(|_| MachineBuildError::UseDispositionMismatch(site))?;
 
+    if let Some(address_use) = MachineValueUse::memory_address_for_use(artifact, site)? {
+        if address_use.binding().value() != input {
+            return Err(MachineBuildError::UseDispositionMismatch(site));
+        }
+        return Ok(MachineUseDisposition::MemoryAddress(address_use));
+    }
+
     let Some(storage) = graph_value.canonical_storage else {
         return Ok(MachineUseDisposition::Exact(slice));
     };
@@ -1336,6 +1351,13 @@ fn validate_canonical_machine_use_disposition(
         .ok_or(MachineBuildError::MissingGraphValue(input))?;
     let source = binding_for_value(graph_value)?;
     validate_machine_use_slice(operation_slice, source.width_bits).map_err(|_| mismatch())?;
+
+    if let Some(address_use) = MachineValueUse::memory_address_for_use(artifact, site)? {
+        return (address_use.binding().value() == input
+            && actual == MachineUseDisposition::MemoryAddress(address_use))
+        .then_some(())
+        .ok_or_else(mismatch);
+    }
 
     let Some(storage) = graph_value.canonical_storage else {
         return (actual == MachineUseDisposition::Exact(operation_slice))
@@ -4486,6 +4508,13 @@ mod tests {
                 ..
             }
         ));
+        let projection = MachineProjection::from_artifact(&artifact)
+            .expect("source-owned machine projection");
+        assert_eq!(
+            projection.use_disposition(address_use),
+            Some(&MachineUseDisposition::MemoryAddress(projected)),
+            "the contextual address certificate, not an integer slice, owns this UseSite"
+        );
         machine
             .validate_against(&artifact)
             .expect("valid machine load");
@@ -4751,6 +4780,9 @@ mod tests {
             .expect("dense use disposition")
         {
             MachineUseDisposition::Exact(slice) => slice,
+            MachineUseDisposition::MemoryAddress(address) => {
+                panic!("expected bit-slice use projection, got contextual address {address:?}")
+            }
             MachineUseDisposition::Refused(reason) => {
                 panic!("expected exact use projection, got {reason:?}")
             }

@@ -1207,7 +1207,10 @@ impl LegacyObservationJournal {
     ) -> Result<(), LegacyObservationJournalError> {
         let observation = match self.plan.use_disposition(site) {
             Some(MachineUseDisposition::Refused(reason)) => LegacyUseObservation::Refused(*reason),
-            Some(MachineUseDisposition::Exact(_)) | None => {
+            Some(
+                MachineUseDisposition::Exact(_) | MachineUseDisposition::MemoryAddress(_),
+            )
+            | None => {
                 return Err(
                     LegacyObservationJournalError::ExactUseRequiresRenderedOccurrence(site),
                 );
@@ -1263,6 +1266,9 @@ impl LegacyObservationJournal {
     ) -> Result<LegacyUseObservation, LegacyObservationJournalError> {
         match self.plan.use_disposition(site) {
             Some(MachineUseDisposition::Exact(slice)) => Ok(LegacyUseObservation::Exact(*slice)),
+            Some(MachineUseDisposition::MemoryAddress(address)) => {
+                Ok(LegacyUseObservation::MemoryAddress(*address))
+            }
             Some(MachineUseDisposition::Refused(_)) => {
                 Err(LegacyObservationJournalError::RefusedRenderedUse(site))
             }
@@ -1413,7 +1419,15 @@ impl LegacyObservationJournal {
             .uses
             .iter()
             .flat_map(|row| row.iter())
-            .filter(|cell| matches!(cell, Some(LegacyUseObservation::Exact(_))))
+            .filter(|cell| {
+                matches!(
+                    cell,
+                    Some(
+                        LegacyUseObservation::Exact(_)
+                            | LegacyUseObservation::MemoryAddress(_)
+                    )
+                )
+            })
             .count();
         let use_refused = self
             .uses
@@ -2160,7 +2174,10 @@ mod tests {
                                 inst: inst.id,
                                 input_idx,
                             }),
-                            Some(MachineUseDisposition::Exact(_))
+                            Some(
+                                MachineUseDisposition::Exact(_)
+                                    | MachineUseDisposition::MemoryAddress(_)
+                            )
                         )
                         .then_some((
                             value,

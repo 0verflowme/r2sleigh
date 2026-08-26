@@ -201,6 +201,7 @@ impl<'a> FoldingContext<'a> {
         &self,
         frame: &LowerFrame,
         input_idx: usize,
+        contextual_expr: CExpr,
     ) -> Result<CExpr, crate::observation_journal::LegacyObservationJournalError> {
         let site = frame.normalized_site.ok_or(
             crate::observation_journal::LegacyObservationJournalError::MissingNormalizedSiteContext,
@@ -227,15 +228,14 @@ impl<'a> FoldingContext<'a> {
                 input_idx,
             },
         )?;
-        let base = self.observe_optional_normalized_input_value_expr(
-            frame.normalized_site,
-            input_idx,
-            self.planned_value_expr(input.value)?,
-        );
         let Some(first_site) = input.uses.first().copied() else {
             // Synthetic preservation inputs have no original graph use and
             // therefore no source-owned projection to apply.
-            return Ok(base);
+            return Ok(self.observe_optional_normalized_input_value_expr(
+                frame.normalized_site,
+                input_idx,
+                self.planned_value_expr(input.value)?,
+            ));
         };
         let Some(names) = self.inputs.binding_names else {
             return Err(
@@ -244,8 +244,9 @@ impl<'a> FoldingContext<'a> {
                 ),
             );
         };
-        let first_slice = match names.use_disposition(first_site) {
-            Some(r2ssa::MachineUseDisposition::Exact(slice)) => *slice,
+        let first_disposition = match names.use_disposition(first_site) {
+            Some(disposition @ (r2ssa::MachineUseDisposition::Exact(_)
+            | r2ssa::MachineUseDisposition::MemoryAddress(_))) => *disposition,
             Some(r2ssa::MachineUseDisposition::Refused(_)) => {
                 return Err(
                     crate::observation_journal::LegacyObservationJournalError::RefusedRenderedUse(
@@ -263,7 +264,7 @@ impl<'a> FoldingContext<'a> {
         };
         for use_site in input.uses.iter().copied().skip(1) {
             match names.use_disposition(use_site) {
-                Some(r2ssa::MachineUseDisposition::Exact(slice)) if *slice == first_slice => {}
+                Some(disposition) if *disposition == first_disposition => {}
                 Some(r2ssa::MachineUseDisposition::Refused(_)) => {
                     return Err(
                         crate::observation_journal::LegacyObservationJournalError::RefusedRenderedUse(
@@ -271,7 +272,10 @@ impl<'a> FoldingContext<'a> {
                         ),
                     );
                 }
-                Some(r2ssa::MachineUseDisposition::Exact(_)) => {
+                Some(
+                    r2ssa::MachineUseDisposition::Exact(_)
+                    | r2ssa::MachineUseDisposition::MemoryAddress(_),
+                ) => {
                     // One relocated normalized expression cannot implement two
                     // different source projections. Keep the normalized site
                     // typed and refuse the projection instead of choosing one.
@@ -291,14 +295,47 @@ impl<'a> FoldingContext<'a> {
                 }
             }
         }
-        project_machine_use(base, first_slice).map_err(|_| {
-            // The machine use is exact, but the strict C dialect cannot spell
-            // this projection without more type evidence. Refuse the emitted
-            // occurrence instead of inventing an integer or pointer type.
-            crate::observation_journal::LegacyObservationJournalError::RefusedRenderedUse(
-                first_site,
-            )
-        })
+        match first_disposition {
+            r2ssa::MachineUseDisposition::Exact(slice) => {
+                let base = self.observe_optional_normalized_input_value_expr(
+                    frame.normalized_site,
+                    input_idx,
+                    self.planned_value_expr(input.value)?,
+                );
+                project_machine_use(base, slice).map_err(|_| {
+                    // The machine use is exact, but the strict C dialect cannot spell
+                    // this projection without more type evidence. Refuse the emitted
+                    // occurrence instead of inventing an integer or pointer type.
+                    crate::observation_journal::LegacyObservationJournalError::RefusedRenderedUse(
+                        first_site,
+                    )
+                })
+            }
+            r2ssa::MachineUseDisposition::MemoryAddress(address) => {
+                if address.binding().value() != input.value
+                    || address.memory_access().is_none()
+                {
+                    return Err(
+                        crate::observation_journal::LegacyObservationJournalError::InvalidUse(
+                            first_site,
+                        ),
+                    );
+                }
+                // The load/store renderer has already consumed the source-owned
+                // structured-access certificate. Preserve that contextual AST:
+                // substituting the value's ordinary binding here would turn a
+                // certified stack/object access back into an SP/RBP expression.
+                // This node is the contextual projection, not an occurrence
+                // of the value's ordinary binding. Mark only the exact
+                // `UseSite`; wrapping it as a bound `ValueId` would make the
+                // audit claim that a C variable was rendered where the AST in
+                // fact contains a structured memory access.
+                Ok(contextual_expr)
+            }
+            r2ssa::MachineUseDisposition::Refused(_) => unreachable!(
+                "the refused source use returned before projection"
+            ),
+        }
     }
 
     pub(super) fn planned_current_output_expr(
@@ -352,7 +389,7 @@ impl<'a> FoldingContext<'a> {
         expr: CExpr,
     ) -> CExpr {
         if frame.observe_inputs {
-            let expr = match self.planned_input_expr(frame, input_idx) {
+            let expr = match self.planned_input_expr(frame, input_idx, expr.clone()) {
                 Ok(planned) => planned,
                 Err(
                     crate::observation_journal::LegacyObservationJournalError::PlannedElidedValueRendered { .. }

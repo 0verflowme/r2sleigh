@@ -73,6 +73,7 @@ enum NormalizedValueObservation {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NormalizedUseObservation {
     Exact(MachineUseSlice),
+    MemoryAddress(r2ssa::MachineValueUse),
     Elided(r2ssa::ledger::ElisionReason),
     Refused(MachineUseRefusal),
     LegacyAbsent,
@@ -437,6 +438,9 @@ fn canonical_value_kind(canonical: NormalizedValueObservation) -> CanonicalDispo
 fn normalized_machine_use(disposition: &MachineUseDisposition) -> NormalizedUseObservation {
     match *disposition {
         MachineUseDisposition::Exact(slice) => NormalizedUseObservation::Exact(slice),
+        MachineUseDisposition::MemoryAddress(address) => {
+            NormalizedUseObservation::MemoryAddress(address)
+        }
         MachineUseDisposition::Refused(reason) => NormalizedUseObservation::Refused(reason),
     }
 }
@@ -444,6 +448,9 @@ fn normalized_machine_use(disposition: &MachineUseDisposition) -> NormalizedUseO
 fn normalized_legacy_use(observation: LegacyUseObservation) -> NormalizedUseObservation {
     match observation {
         LegacyUseObservation::Exact(slice) => NormalizedUseObservation::Exact(slice),
+        LegacyUseObservation::MemoryAddress(address) => {
+            NormalizedUseObservation::MemoryAddress(address)
+        }
         LegacyUseObservation::Elided(reason) => NormalizedUseObservation::Elided(reason),
         LegacyUseObservation::Refused(reason) => NormalizedUseObservation::Refused(reason),
         LegacyUseObservation::LegacyAbsent => NormalizedUseObservation::LegacyAbsent,
@@ -465,7 +472,9 @@ fn judge_use(
 
 fn canonical_use_kind(disposition: &MachineUseDisposition) -> CanonicalDispositionKind {
     match disposition {
-        MachineUseDisposition::Exact(_) => CanonicalDispositionKind::Representable,
+        MachineUseDisposition::Exact(_) | MachineUseDisposition::MemoryAddress(_) => {
+            CanonicalDispositionKind::Representable
+        }
         MachineUseDisposition::Refused(_) => CanonicalDispositionKind::Refused,
     }
 }
