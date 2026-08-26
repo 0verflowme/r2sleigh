@@ -1920,6 +1920,7 @@ fn placement_refusal_json(refusal: r2engine::PlacementAuditRefusal) -> serde_jso
     match refusal {
         Refusal::MissingStructuredRegionArtifact
         | Refusal::ObservationJournalUnavailable
+        | Refusal::SourceAuthorityMismatch
         | Refusal::RegionMarkerUnsealed => {}
         Refusal::BindingOutsidePlan { binding_index }
         | Refusal::ExternalBindingOutsidePlan { binding_index }
@@ -1927,6 +1928,7 @@ fn placement_refusal_json(refusal: r2engine::PlacementAuditRefusal) -> serde_jso
         | Refusal::UnobservedBindingWrite { binding_index }
         | Refusal::NoDominatingRegion { binding_index }
         | Refusal::MissingDefinition { binding_index }
+        | Refusal::UnprovableExecutionOrder { binding_index }
         | Refusal::MissingBinding { binding_index }
         | Refusal::MissingBindingSymbol { binding_index }
         | Refusal::ExternalBindingMissingParameter { binding_index }
@@ -1939,12 +1941,10 @@ fn placement_refusal_json(refusal: r2engine::PlacementAuditRefusal) -> serde_jso
         Refusal::RegionOutsideArtifact { region_index }
         | Refusal::RegionMarkerDuplicate { region_index }
         | Refusal::RegionMarkerMissing { region_index }
+        | Refusal::RegionMarkerParentMismatch { region_index }
         | Refusal::MissingRegion { region_index }
         | Refusal::DuplicateRegion { region_index } => {
-            cause.insert(
-                "region_index".to_string(),
-                serde_json::json!(region_index),
-            );
+            cause.insert("region_index".to_string(), serde_json::json!(region_index));
         }
         Refusal::BlockOutsideFunction { block_address } => {
             cause.insert(
@@ -1956,19 +1956,23 @@ fn placement_refusal_json(refusal: r2engine::PlacementAuditRefusal) -> serde_jso
             region_index,
             block_address,
         } => {
-            cause.insert(
-                "region_index".to_string(),
-                serde_json::json!(region_index),
-            );
+            cause.insert("region_index".to_string(), serde_json::json!(region_index));
             cause.insert(
                 "block_address".to_string(),
                 serde_json::json!(block_address),
             );
         }
         Refusal::RegionMarkerForeign { anchor_index } => {
+            cause.insert("anchor_index".to_string(), serde_json::json!(anchor_index));
+        }
+        Refusal::RegionMarkerOutOfOrder {
+            region_index,
+            expected_region_index,
+        } => {
+            cause.insert("region_index".to_string(), serde_json::json!(region_index));
             cause.insert(
-                "anchor_index".to_string(),
-                serde_json::json!(anchor_index),
+                "expected_region_index".to_string(),
+                serde_json::json!(expected_region_index),
             );
         }
         Refusal::ObservationDomainTooLarge { expected_count }
@@ -1993,7 +1997,8 @@ fn placement_refusal_json(refusal: r2engine::PlacementAuditRefusal) -> serde_jso
         }
         Refusal::DuplicateObservation { observation_id }
         | Refusal::MissingObservationTarget { observation_id }
-        | Refusal::UnscopedObservation { observation_id } => {
+        | Refusal::UnscopedObservation { observation_id }
+        | Refusal::AmbiguousObservationExecutionOrder { observation_id } => {
             cause.insert(
                 "observation_id".to_string(),
                 serde_json::json!(observation_id),
@@ -2007,10 +2012,7 @@ fn placement_refusal_json(refusal: r2engine::PlacementAuditRefusal) -> serde_jso
                 "instruction_id".to_string(),
                 serde_json::json!(instruction_id),
             );
-            cause.insert(
-                "input_index".to_string(),
-                serde_json::json!(input_index),
-            );
+            cause.insert("input_index".to_string(), serde_json::json!(input_index));
         }
         Refusal::InvalidWrite { instruction_id }
         | Refusal::MissingInlineWrite { instruction_id }
@@ -2030,15 +2032,11 @@ fn placement_refusal_json(refusal: r2engine::PlacementAuditRefusal) -> serde_jso
                 serde_json::json!(instruction_id),
             );
         }
-        Refusal::MissingPlannedValue { value_id }
-        | Refusal::RefusedPlannedValue { value_id } => {
+        Refusal::MissingPlannedValue { value_id } | Refusal::RefusedPlannedValue { value_id } => {
             cause.insert("value_id".to_string(), serde_json::json!(value_id));
         }
         Refusal::UnauthorizedProgramVariable { symbol_index } => {
-            cause.insert(
-                "symbol_index".to_string(),
-                serde_json::json!(symbol_index),
-            );
+            cause.insert("symbol_index".to_string(), serde_json::json!(symbol_index));
         }
         Refusal::ReadBeforeAssignment {
             binding_index,
@@ -2053,10 +2051,7 @@ fn placement_refusal_json(refusal: r2engine::PlacementAuditRefusal) -> serde_jso
                 "instruction_id".to_string(),
                 serde_json::json!(instruction_id),
             );
-            cause.insert(
-                "input_index".to_string(),
-                serde_json::json!(input_index),
-            );
+            cause.insert("input_index".to_string(), serde_json::json!(input_index));
         }
         Refusal::CertifiedValueReadBeforeAssignment {
             binding_index,
@@ -2099,9 +2094,7 @@ fn placement_audit_json(audit: Option<r2engine::PlacementAudit>) -> serde_json::
     }
 }
 
-fn render_refusal_json(
-    refusal: Option<r2engine::DecompileRenderRefusal>,
-) -> serde_json::Value {
+fn render_refusal_json(refusal: Option<r2engine::DecompileRenderRefusal>) -> serde_json::Value {
     match refusal {
         None => serde_json::json!({
             "schema_version": 1,
@@ -2115,14 +2108,14 @@ fn render_refusal_json(
                 "cause": placement_refusal_json(refusal),
             })
         }
-        Some(r2engine::DecompileRenderRefusal::RefusedBindingDisposition {
-            observations,
-        }) => serde_json::json!({
-            "schema_version": 1,
-            "status": "refused",
-            "kind": "refused_binding_disposition",
-            "observations": binding_observations_json(observations),
-        }),
+        Some(r2engine::DecompileRenderRefusal::RefusedBindingDisposition { observations }) => {
+            serde_json::json!({
+                "schema_version": 1,
+                "status": "refused",
+                "kind": "refused_binding_disposition",
+                "observations": binding_observations_json(observations),
+            })
+        }
         Some(refusal) => serde_json::json!({
             "schema_version": 1,
             "status": "refused",
@@ -2163,9 +2156,7 @@ fn response_diagnostics_json(
     .to_string())
 }
 
-fn effect_obligations_json(
-    audit: Option<r2engine::EffectObligationAudit>,
-) -> serde_json::Value {
+fn effect_obligations_json(audit: Option<r2engine::EffectObligationAudit>) -> serde_json::Value {
     let Some(audit) = audit else {
         return serde_json::Value::Null;
     };
@@ -3953,6 +3944,14 @@ mod tests {
             inst,
             input_idx: 23,
         };
+        let obligation = r2ssa::SemanticObligationId {
+            instruction: r2ssa::CanonicalInstructionId {
+                block_addr: 0x8000,
+                site: r2ssa::CanonicalInstructionSite::Op(0),
+            },
+            kind: r2ssa::SemanticObligationKind::ControlTransfer,
+            component: r2ssa::SemanticObligationComponent::Whole,
+        };
         let mut cases = vec![Failure::SourceAuthority, Failure::BindingPlanAuthority];
         let mut machine = vec![
             MachineFailure::UntrustedArtifactProvenance,
@@ -4097,6 +4096,19 @@ mod tests {
                 object,
                 binding_index: 58,
             },
+            Failure::BindingPlanParameterCount {
+                expected: 73,
+                actual: 74,
+            },
+            Failure::BindingPlanUnexpectedParameterDisposition { slot: 75 },
+            Failure::BindingPlanParameterCertificate {
+                slot: 76,
+                binding_index: 77,
+            },
+            Failure::BindingPlanParameterDeclarationWidth {
+                slot: 78,
+                binding_index: 79,
+            },
             Failure::NormalizationSourceAuthority,
             Failure::NormalizationBlockTopology,
             Failure::NormalizationRowCount {
@@ -4123,6 +4135,7 @@ mod tests {
             Failure::InvalidCertifiedValueRead { value, at: inst },
             Failure::InvalidUse { site },
             Failure::InvalidWrite { inst },
+            Failure::InvalidEffectObligation { obligation },
             Failure::OutputlessWrite { inst },
             Failure::InvalidNormalizedSite { block, op_idx: 62 },
             Failure::MissingNormalizedBlock { address: 0x7000 },
@@ -4163,7 +4176,7 @@ mod tests {
         ]);
         assert_eq!(
             cases.len(),
-            94,
+            98,
             "public journal wire-leaf inventory drifted"
         );
         cases
@@ -4209,7 +4222,7 @@ mod tests {
             }
             causes.push(expected_cause);
         }
-        assert_eq!(kinds.len(), 94);
+        assert_eq!(kinds.len(), 98);
 
         let checker = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../tests/corpus/check_binding_audit_schema.py");
@@ -4234,7 +4247,7 @@ mod tests {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
-        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "94");
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "98");
     }
 
     fn every_placement_refusal_wire_leaf() -> Vec<r2engine::PlacementAuditRefusal> {
@@ -4243,6 +4256,7 @@ mod tests {
         vec![
             Refusal::MissingStructuredRegionArtifact,
             Refusal::ObservationJournalUnavailable,
+            Refusal::SourceAuthorityMismatch,
             Refusal::BindingOutsidePlan { binding_index: 1 },
             Refusal::RegionOutsideArtifact { region_index: 2 },
             Refusal::BlockOutsideFunction {
@@ -4257,6 +4271,11 @@ mod tests {
             Refusal::RegionMarkerForeign { anchor_index: 5 },
             Refusal::RegionMarkerDuplicate { region_index: 6 },
             Refusal::RegionMarkerMissing { region_index: 7 },
+            Refusal::RegionMarkerParentMismatch { region_index: 8 },
+            Refusal::RegionMarkerOutOfOrder {
+                region_index: 9,
+                expected_region_index: 10,
+            },
             Refusal::ObservationDomainTooLarge { expected_count: 8 },
             Refusal::ObservationCapacityUnavailable { expected_count: 9 },
             Refusal::ObservationOutOfRange {
@@ -4292,6 +4311,8 @@ mod tests {
                 value_id: 28,
                 instruction_id: 29,
             },
+            Refusal::UnprovableExecutionOrder { binding_index: 30 },
+            Refusal::AmbiguousObservationExecutionOrder { observation_id: 31 },
             Refusal::MissingBinding { binding_index: 27 },
             Refusal::MissingBindingSymbol { binding_index: 28 },
             Refusal::ExternalBindingMissingParameter { binding_index: 29 },
@@ -4322,7 +4343,7 @@ mod tests {
             assert!(kinds.insert(kind.to_string()), "duplicate wire kind {kind}");
             causes.push(cause);
         }
-        assert_eq!(kinds.len(), 38);
+        assert_eq!(kinds.len(), 43);
 
         let checker = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../tests/corpus/check_binding_audit_schema.py");
@@ -4348,7 +4369,7 @@ mod tests {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
-        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "38");
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "43");
 
         assert_eq!(
             placement_audit_json(Some(PlacementAudit::Applied)),
@@ -4360,9 +4381,8 @@ mod tests {
         );
         assert!(placement_audit_json(None).is_null());
 
-        let refusal = PlacementAudit::Refused(PlacementAuditRefusal::MissingDefinition {
-            binding_index: 7,
-        });
+        let refusal =
+            PlacementAudit::Refused(PlacementAuditRefusal::MissingDefinition { binding_index: 7 });
         let raw = response_diagnostics_json(
             &r2engine::EngineDiagnostics::default(),
             Some(r2engine::BindingShadowAuditOutcome::NotRun),
@@ -4373,7 +4393,10 @@ mod tests {
         .expect("placement diagnostics JSON");
         let parsed: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON");
         assert_eq!(parsed["outcome"], "refused");
-        assert_eq!(parsed["placement_audit"]["cause"]["kind"], "missing_definition");
+        assert_eq!(
+            parsed["placement_audit"]["cause"]["kind"],
+            "missing_definition"
+        );
         assert_eq!(parsed["placement_audit"]["cause"]["binding_index"], 7);
         assert_eq!(
             response_outcome(
@@ -4756,13 +4779,11 @@ mod tests {
             }
         }
 
-        let refused_observations = binding_audit_json(Some(
-            BindingShadowAuditOutcome::Failed(
-                BindingShadowAuditFailure::NonQualityObservations {
-                    observations: binding_observations(0, 0, 1, 0),
-                },
-            ),
-        ));
+        let refused_observations = binding_audit_json(Some(BindingShadowAuditOutcome::Failed(
+            BindingShadowAuditFailure::NonQualityObservations {
+                observations: binding_observations(0, 0, 1, 0),
+            },
+        )));
         assert_eq!(refused_observations["status"], "non_quality_observations");
         assert_eq!(refused_observations["observations"]["values"]["refused"], 1);
         assert!(refused_observations.get("shadow").is_none());

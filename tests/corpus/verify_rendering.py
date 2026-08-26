@@ -158,7 +158,6 @@ BINDING_AUDIT_JOURNAL_CAUSE_FIELDS = {
     "binding_plan_invalid_binding_reference": frozenset(
         {"value_id", "binding_index"}
     ),
-    "binding_plan_non_bound_value": frozenset({"value_id"}),
     "binding_plan_certificate_membership": frozenset({"binding_index"}),
     "binding_plan_declaration_width": frozenset({"binding_index"}),
     "binding_plan_invalid_literal_inline": frozenset({"value_id"}),
@@ -171,6 +170,18 @@ BINDING_AUDIT_JOURNAL_CAUSE_FIELDS = {
     ),
     "binding_plan_stack_object_declaration_width": frozenset(
         {"object_id", "binding_index"}
+    ),
+    "binding_plan_parameter_count": frozenset(
+        {"expected_count", "actual_count"}
+    ),
+    "binding_plan_unexpected_parameter_disposition": frozenset(
+        {"parameter_slot"}
+    ),
+    "binding_plan_parameter_certificate": frozenset(
+        {"parameter_slot", "binding_index"}
+    ),
+    "binding_plan_parameter_declaration_width": frozenset(
+        {"parameter_slot", "binding_index"}
     ),
     "normalization_source_authority": frozenset(),
     "normalization_block_topology": frozenset(),
@@ -191,6 +202,7 @@ BINDING_AUDIT_JOURNAL_CAUSE_FIELDS = {
     ),
     "invalid_use": frozenset({"instruction_id", "input_index"}),
     "invalid_write": frozenset({"instruction_id"}),
+    "invalid_effect_obligation": frozenset({"obligation"}),
     "outputless_write": frozenset({"instruction_id"}),
     "invalid_normalized_site": frozenset({"block_id", "op_index"}),
     "missing_normalized_block": frozenset({"address"}),
@@ -225,6 +237,7 @@ BINDING_AUDIT_JOURNAL_CAUSE_FIELDS = {
 PLACEMENT_AUDIT_CAUSE_FIELDS = {
     "missing_structured_region_artifact": frozenset(),
     "observation_journal_unavailable": frozenset(),
+    "source_authority_mismatch": frozenset(),
     "binding_outside_plan": frozenset({"binding_index"}),
     "region_outside_artifact": frozenset({"region_index"}),
     "block_outside_function": frozenset({"block_address"}),
@@ -236,6 +249,10 @@ PLACEMENT_AUDIT_CAUSE_FIELDS = {
     "region_marker_foreign": frozenset({"anchor_index"}),
     "region_marker_duplicate": frozenset({"region_index"}),
     "region_marker_missing": frozenset({"region_index"}),
+    "region_marker_parent_mismatch": frozenset({"region_index"}),
+    "region_marker_out_of_order": frozenset(
+        {"region_index", "expected_region_index"}
+    ),
     "observation_domain_too_large": frozenset({"expected_count"}),
     "observation_capacity_unavailable": frozenset({"expected_count"}),
     "observation_out_of_range": frozenset(
@@ -262,6 +279,8 @@ PLACEMENT_AUDIT_CAUSE_FIELDS = {
     "certified_value_read_before_assignment": frozenset(
         {"binding_index", "value_id", "instruction_id"}
     ),
+    "unprovable_execution_order": frozenset({"binding_index"}),
+    "ambiguous_observation_execution_order": frozenset({"observation_id"}),
     "missing_binding": frozenset({"binding_index"}),
     "missing_binding_symbol": frozenset({"binding_index"}),
     "external_binding_missing_parameter": frozenset({"binding_index"}),
@@ -709,6 +728,139 @@ def _score_placement_audit(envelope: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _validate_canonical_storage(value: Any, *, context: str) -> dict[str, Any]:
+    storage = _exact_object(
+        value,
+        {"space", "offset", "size"},
+        context=context,
+    )
+    space = storage["space"]
+    if isinstance(space, str):
+        if space not in {"Ram", "Register", "Unique", "Constant", "Unknown"}:
+            raise BindingAuditFormatError(f"{context}.space is invalid")
+    else:
+        custom = _exact_object(space, {"Custom"}, context=f"{context}.space")
+        _count(custom["Custom"], context=f"{context}.space.Custom")
+    _count(storage["offset"], context=f"{context}.offset")
+    _count(storage["size"], context=f"{context}.size")
+    return storage
+
+
+def _validate_semantic_obligation(value: Any, *, context: str) -> dict[str, Any]:
+    obligation = _exact_object(
+        value,
+        {"instruction", "kind", "component"},
+        context=context,
+    )
+    instruction = _exact_object(
+        obligation["instruction"],
+        {"block_addr", "site"},
+        context=f"{context}.instruction",
+    )
+    _count(instruction["block_addr"], context=f"{context}.instruction.block_addr")
+    site = instruction["site"]
+    if not isinstance(site, dict) or len(site) != 1:
+        raise BindingAuditFormatError(f"{context}.instruction.site is invalid")
+    site_kind, site_value = next(iter(site.items()))
+    if site_kind == "Phi":
+        _validate_canonical_storage(site_value, context=f"{context}.instruction.site.Phi")
+    elif site_kind == "Op":
+        _count(site_value, context=f"{context}.instruction.site.Op")
+    elif site_kind == "NativeSpan":
+        native = _exact_object(
+            site_value,
+            {"instruction_addr", "size"},
+            context=f"{context}.instruction.site.NativeSpan",
+        )
+        _count(
+            native["instruction_addr"],
+            context=f"{context}.instruction.site.NativeSpan.instruction_addr",
+        )
+        _count(native["size"], context=f"{context}.instruction.site.NativeSpan.size")
+    else:
+        raise BindingAuditFormatError(f"{context}.instruction.site is invalid")
+
+    if obligation["kind"] not in {
+        "ObservableMemoryRead",
+        "ObservableMemoryWrite",
+        "Call",
+        "CallArgument",
+        "CallResult",
+        "Return",
+        "ReturnValue",
+        "ControlPredicate",
+        "ControlTransfer",
+        "Trap",
+        "Atomicity",
+        "MemoryOrdering",
+        "VolatileOrUnknownEffect",
+        "LoopCarriedState",
+        "LiveStateTransition",
+        "LiveValueProducer",
+    }:
+        raise BindingAuditFormatError(f"{context}.kind is invalid")
+
+    component = obligation["component"]
+    if isinstance(component, str):
+        if component not in {"Whole", "PredicateOperand"}:
+            raise BindingAuditFormatError(f"{context}.component is invalid")
+        return obligation
+    if not isinstance(component, dict) or len(component) != 1:
+        raise BindingAuditFormatError(f"{context}.component is invalid")
+    component_kind, component_value = next(iter(component.items()))
+    if component_kind in {"MemoryAccess", "Index"}:
+        _count(component_value, context=f"{context}.component.{component_kind}")
+    elif component_kind == "RegisterSlot":
+        slot = _exact_object(
+            component_value,
+            {"index", "storage"},
+            context=f"{context}.component.RegisterSlot",
+        )
+        _count(slot["index"], context=f"{context}.component.RegisterSlot.index")
+        _validate_canonical_storage(
+            slot["storage"], context=f"{context}.component.RegisterSlot.storage"
+        )
+    elif component_kind == "StackOffset":
+        if (
+            isinstance(component_value, bool)
+            or not isinstance(component_value, int)
+            or component_value < -(1 << 63)
+            or component_value >= (1 << 63)
+        ):
+            raise BindingAuditFormatError(
+                f"{context}.component.StackOffset must be a signed 64-bit integer"
+            )
+    elif component_kind == "LoopTransition":
+        transition = _exact_object(
+            component_value,
+            {"carrier", "predecessor"},
+            context=f"{context}.component.LoopTransition",
+        )
+        _validate_canonical_storage(
+            transition["carrier"],
+            context=f"{context}.component.LoopTransition.carrier",
+        )
+        _count(
+            transition["predecessor"],
+            context=f"{context}.component.LoopTransition.predecessor",
+        )
+    elif component_kind == "MemoryOrdering":
+        if component_value not in {
+            "Relaxed",
+            "Acquire",
+            "Release",
+            "AcqRel",
+            "SeqCst",
+            "Unknown",
+        }:
+            raise BindingAuditFormatError(
+                f"{context}.component.MemoryOrdering is invalid"
+            )
+    else:
+        raise BindingAuditFormatError(f"{context}.component is invalid")
+    return obligation
+
+
 def _validate_binding_journal_cause(value: Any) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise BindingAuditFormatError("binding audit seal cause must be an object")
@@ -722,7 +874,12 @@ def _validate_binding_journal_cause(value: Any) -> dict[str, Any]:
         context="binding audit seal cause",
     )
     for field in fields:
-        _count(cause[field], context=f"binding audit seal cause.{field}")
+        if field == "obligation":
+            _validate_semantic_obligation(
+                cause[field], context="binding audit seal cause.obligation"
+            )
+        else:
+            _count(cause[field], context=f"binding audit seal cause.{field}")
     return cause
 
 
