@@ -13,7 +13,7 @@ use crate::backward::{
     BackwardMemoryRegion, compile_branch_preconditions_with_summaries,
 };
 use crate::path::{ExploreConfig, PathExplorer};
-use crate::runtime::seed_default_state_for_arch;
+use crate::runtime::{seed_default_state_for_arch, seed_default_state_for_prepared};
 use crate::semantics::{
     SemanticArtifact, SemanticArtifactBody, SemanticEvidence, SemanticEvidenceAmbiguity,
     SemanticEvidenceCoverage, SemanticEvidenceProvenance, SemanticEvidenceReason,
@@ -804,7 +804,11 @@ where
 
         let make_state = || {
             let mut state = SymState::new_symbolic(ctx, func.entry);
-            seed_default_state_for_arch(&mut state, func, Some(arch));
+            if func.provenance_kind() == r2ssa::SsaArtifactProvenanceKind::Manual {
+                seed_default_state_for_arch(&mut state, func, Some(arch));
+            } else {
+                let _ = seed_default_state_for_prepared(&mut state, func);
+            }
             state
         };
 

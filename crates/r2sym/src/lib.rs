@@ -113,8 +113,9 @@ pub use replay::{
     stable_replay_seed_fingerprint,
 };
 pub use runtime::{
-    install_runtime_hooks_for_scope, seed_default_state_for_arch, seed_memory_regions_for_arch,
-    seed_scope_state_for_arch,
+    install_runtime_hooks_for_arch_advisory, install_runtime_hooks_for_scope,
+    seed_default_state_for_arch, seed_default_state_for_prepared, seed_memory_regions_for_arch,
+    seed_memory_regions_for_prepared, seed_scope_state_for_arch, seed_scope_state_for_prepared,
 };
 pub use semantic_report::{
     CompiledSemanticInfo, InterpreterDispatchInfo, MemorySummaryInfo, VmGuardConditionInfo,

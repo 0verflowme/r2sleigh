@@ -10,7 +10,10 @@ use std::io::Write;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use r2ssa::{AbiProfile, BlockTerminator, SSAOp, SsaArtifact, observe_call_arguments};
+use r2ssa::{
+    BlockTerminator, CallArgObservation, SSAOp, SourceAbiClass, SsaArtifact,
+    observe_call_arguments,
+};
 use z3::Context;
 
 use crate::backward::DerivedCallSummaryView;
@@ -33,6 +36,12 @@ const TARGET_DISTANCE_CACHE_LIMIT: usize = 128;
 const EXACT_RUNTIME_LOOP_MAX_ITERS: u64 = 4096;
 const EXACT_RUNTIME_LOOP_MAX_BLOCK_STEPS: u64 = 200_000;
 const SYMBOLIC_CONTINUATION_MAX_TARGETS: usize = 512;
+
+fn has_exact_registration_handler(arguments: &[CallArgObservation]) -> bool {
+    arguments
+        .get(1)
+        .is_some_and(|argument| !matches!(argument, CallArgObservation::Unknown))
+}
 
 #[derive(Debug, Default)]
 struct TargetDistanceCache {
@@ -1231,7 +1240,12 @@ impl<'ctx> PathExplorer<'ctx> {
         if !self.exception_bridge_guidance_enabled {
             return None;
         }
-        let scope = scope?;
+        let scope = scope?.exact_for_artifact(root)?;
+        if root.machine_context().effective_abi_class() != SourceAbiClass::MicrosoftX64 {
+            return None;
+        }
+        let _callconv = CallConv::for_prepared(root)?;
+        let abi = root.abi()?;
         let target_func = self.resolve_scope_function(root, Some(scope), target_addr);
         if target_func.is_some_and(|target_func| target_func.entry == root.entry) {
             let distances = self.target_distance_map(root, target_addr);
@@ -1240,7 +1254,7 @@ impl<'ctx> PathExplorer<'ctx> {
             }
         }
 
-        let observations = observe_call_arguments(root, &AbiProfile::windows_x64());
+        let observations = observe_call_arguments(root, &abi);
         let mut registration_sites = Vec::new();
         let mut raise_sites = Vec::new();
 
@@ -1250,7 +1264,10 @@ impl<'ctx> PathExplorer<'ctx> {
             };
             match self.executor.call_hook_tag(target) {
                 Some(crate::executor::CallHookTag::WindowsAddVectoredExceptionHandler) => {
-                    if observations.contains_key(call_id) {
+                    if observations
+                        .get(call_id)
+                        .is_some_and(|arguments| has_exact_registration_handler(arguments))
+                    {
                         if let Some((block_addr, _)) = root.inst_op_site(call.at) {
                             registration_sites.push(block_addr);
                         } else {
@@ -3301,7 +3318,90 @@ mod tests {
         arch.add_register(RegisterDef::new("EAX", RAX, 4));
         arch.add_register(RegisterDef::new("RAX", RAX, 8));
         arch.add_register(RegisterDef::new("RDI", RDI, 8));
+        arch.add_register(RegisterDef::new("RSP", 0xa0, 8));
+        arch.add_register(RegisterDef::new("RIP", 0xa8, 8));
         arch
+    }
+
+    #[test]
+    fn unknown_registration_handler_observation_is_not_bridge_evidence() {
+        assert!(!has_exact_registration_handler(&[
+            CallArgObservation::Const(1),
+            CallArgObservation::Unknown,
+        ]));
+        assert!(has_exact_registration_handler(&[
+            CallArgObservation::Const(1),
+            CallArgObservation::Const(0x2000),
+        ]));
+    }
+
+    fn exact_windows_artifact(blocks: &[R2ILBlock], arch: &ArchSpec) -> SsaArtifact {
+        let revision = b"r2sym-path-windows-abi";
+        let storage = |offset| r2ssa::CanonicalStorageId {
+            space: r2ssa::CanonicalStorageSpace::Register,
+            offset,
+            size: 8,
+        };
+        let interface = r2ssa::SourceFunctionInterface::new_exact(
+            revision.to_vec(),
+            "ms64",
+            [0x80, 0x88, 0x90, 0x98]
+                .into_iter()
+                .enumerate()
+                .map(|(index, offset)| {
+                    r2ssa::SourceAbiParameterSpec::new(index as u32, storage(offset))
+                }),
+            r2ssa::SourceFunctionReturn::Register {
+                storage: storage(RAX),
+            },
+            std::iter::empty::<r2ssa::SourceStackSlotSpec>(),
+        )
+        .and_then(|interface| interface.with_stack_pointer_storage(storage(0xa0)))
+        .and_then(|interface| interface.with_return_address_storage(storage(0xa8)))
+        .expect("exact Windows interface");
+        let mut call_interfaces = Vec::new();
+        for block in blocks {
+            for (op_index, op) in block.ops.iter().enumerate() {
+                let target = match op {
+                    R2ILOp::Call { target } | R2ILOp::CallInd { target } => target,
+                    _ => continue,
+                };
+                call_interfaces.push(
+                    r2ssa::SourceCallSiteInterface::new(
+                        revision.to_vec(),
+                        r2ssa::SourceCallSiteIdentity::new(
+                            block.addr,
+                            op_index,
+                            r2ssa::CanonicalStorageId::from_varnode(target),
+                        ),
+                        true,
+                        "ms64",
+                        [0x80, 0x88, 0x90, 0x98]
+                            .into_iter()
+                            .enumerate()
+                            .map(|(index, offset)| {
+                                r2ssa::SourceCallArgumentSpec::new(
+                                    index as u32,
+                                    storage(offset),
+                                )
+                            }),
+                        false,
+                        false,
+                        r2ssa::SourceCallResult::Register {
+                            storage: storage(RAX),
+                        },
+                    )
+                    .expect("exact Windows callsite interface"),
+                );
+            }
+        }
+        SsaArtifact::for_decompile_with_interfaces(
+            blocks,
+            Some(arch),
+            Some(interface),
+            call_interfaces,
+        )
+        .expect("exact Windows artifact")
     }
 
     #[test]
@@ -4650,11 +4750,8 @@ mod tests {
                 target: make_const(0, 8),
             }],
         }];
-        let root =
-            Arc::new(SsaArtifact::for_symbolic(&root_blocks, Some(&arch)).expect("root symbolic"));
-        let handler = Arc::new(
-            SsaArtifact::for_symbolic(&handler_blocks, Some(&arch)).expect("handler symbolic"),
-        );
+        let root = Arc::new(exact_windows_artifact(&root_blocks, &arch));
+        let handler = Arc::new(exact_windows_artifact(&handler_blocks, &arch));
         let scope = crate::PreparedFunctionScope::new(
             0x1000,
             vec![
@@ -4762,11 +4859,8 @@ mod tests {
                 target: make_const(0, 8),
             }],
         }];
-        let root =
-            Arc::new(SsaArtifact::for_symbolic(&root_blocks, Some(&arch)).expect("root symbolic"));
-        let handler = Arc::new(
-            SsaArtifact::for_symbolic(&handler_blocks, Some(&arch)).expect("handler symbolic"),
-        );
+        let root = Arc::new(exact_windows_artifact(&root_blocks, &arch));
+        let handler = Arc::new(exact_windows_artifact(&handler_blocks, &arch));
         let scope = crate::PreparedFunctionScope::new(
             0x1000,
             vec![
@@ -4883,11 +4977,8 @@ mod tests {
                 target: make_const(0, 8),
             }],
         }];
-        let root =
-            Arc::new(SsaArtifact::for_symbolic(&root_blocks, Some(&arch)).expect("root symbolic"));
-        let handler = Arc::new(
-            SsaArtifact::for_symbolic(&handler_blocks, Some(&arch)).expect("handler symbolic"),
-        );
+        let root = Arc::new(exact_windows_artifact(&root_blocks, &arch));
+        let handler = Arc::new(exact_windows_artifact(&handler_blocks, &arch));
         let scope = crate::PreparedFunctionScope::new(
             0x1000,
             vec![
@@ -5015,11 +5106,8 @@ mod tests {
                 target: make_const(0, 8),
             }],
         }];
-        let root =
-            Arc::new(SsaArtifact::for_symbolic(&root_blocks, Some(&arch)).expect("root symbolic"));
-        let handler = Arc::new(
-            SsaArtifact::for_symbolic(&handler_blocks, Some(&arch)).expect("handler symbolic"),
-        );
+        let root = Arc::new(exact_windows_artifact(&root_blocks, &arch));
+        let handler = Arc::new(exact_windows_artifact(&handler_blocks, &arch));
         let scope = crate::PreparedFunctionScope::new(
             0x1000,
             vec![
@@ -5056,7 +5144,7 @@ mod tests {
     }
 
     #[test]
-    fn test_import_mediated_bridge_works_with_installed_runtime_hooks() {
+    fn test_import_mediated_bridge_requires_explicit_advisory_runtime_hooks_without_typed_roles() {
         let ctx = Context::thread_local();
         let mut arch = make_x86_64_arch();
         arch.add_register(RegisterDef::new("RCX", 0x80, 8));
@@ -5138,8 +5226,7 @@ mod tests {
                 ],
             },
         ];
-        let root =
-            Arc::new(SsaArtifact::for_symbolic(&root_blocks, Some(&arch)).expect("root symbolic"));
+        let root = Arc::new(exact_windows_artifact(&root_blocks, &arch));
         let scope = crate::PreparedFunctionScope::new(
             0x1000,
             vec![crate::ScopedPreparedFunction {
@@ -5150,7 +5237,6 @@ mod tests {
         )
         .expect("scope");
 
-        let mut explorer = PathExplorer::new(&ctx);
         let symbol_map = HashMap::from([
             (
                 0x1400a6010,
@@ -5161,7 +5247,22 @@ mod tests {
                 "sym.imp.KERNEL32.dll_RaiseException".to_string(),
             ),
         ]);
+        let mut exact_explorer = PathExplorer::new(&ctx);
         crate::install_runtime_hooks_for_scope(
+            &mut exact_explorer,
+            &root,
+            &scope,
+            Some(&arch),
+            &symbol_map,
+        );
+        assert_eq!(
+            exact_explorer.exception_bridge_guidance_target(&root, Some(&scope), 0x7000),
+            None,
+            "import names must not authorize exact source-owned runtime roles"
+        );
+
+        let mut explorer = PathExplorer::new(&ctx);
+        crate::install_runtime_hooks_for_arch_advisory(
             &mut explorer,
             &root,
             &scope,

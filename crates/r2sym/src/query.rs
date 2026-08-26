@@ -551,22 +551,37 @@ pub fn install_symbolic_hooks_for_query_policy<'ctx>(
     let Some(scope) = scope.exact_for_artifact(prepared) else {
         return;
     };
+    let registry = if prepared.provenance_kind() == r2ssa::SsaArtifactProvenanceKind::Manual {
+        arch.and_then(|arch| {
+            SummaryRegistry::with_profile_for_arch_and_symbols(
+                arch,
+                symbol_map,
+                summary_profile,
+            )
+        })
+    } else {
+        SummaryRegistry::with_profile_for_prepared(prepared, summary_profile)
+    };
     if policy.install_scope_summaries
-        && let Some(arch) = arch
-        && let Some(registry) =
-            SummaryRegistry::with_profile_for_arch_and_symbols(arch, symbol_map, summary_profile)
+        && let Some(registry) = registry
     {
         let _ = registry.install_scope_summaries_for_explorer(
             explorer,
             z3_ctx,
             prepared,
             scope,
-            Some(arch),
+            arch,
             symbol_map,
         );
     }
     if policy.install_runtime_hooks {
-        install_runtime_hooks_for_scope(explorer, prepared, scope, arch, symbol_map);
+        if prepared.provenance_kind() == r2ssa::SsaArtifactProvenanceKind::Manual {
+            crate::runtime::install_runtime_hooks_for_arch_advisory(
+                explorer, prepared, scope, arch, symbol_map,
+            );
+        } else {
+            install_runtime_hooks_for_scope(explorer, prepared, scope, arch, symbol_map);
+        }
     }
 }
 

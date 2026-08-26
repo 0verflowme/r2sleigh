@@ -247,6 +247,9 @@ impl CallConv {
     /// Retain the exact source-owned ABI storages from one prepared artifact.
     pub(crate) fn for_prepared(prepared: &SsaArtifact) -> Option<Self> {
         let context = prepared.machine_context();
+        if context.effective_abi_class() == r2ssa::SourceAbiClass::Unknown {
+            return None;
+        }
         let abi = context.abi_model();
         if !abi.is_available() || !abi.is_coherent() {
             return None;
@@ -495,8 +498,7 @@ impl CallConv {
         }
     }
 
-    #[cfg(test)]
-    fn argument_storage(&self, index: usize) -> Option<CanonicalStorageId> {
+    pub(crate) fn argument_storage(&self, index: usize) -> Option<CanonicalStorageId> {
         match &self.registers {
             CallConvRegisters::AdvisoryNames { .. } => None,
             CallConvRegisters::SourceOwned {
@@ -504,6 +506,28 @@ impl CallConv {
                 ..
             } => argument_storages.get(index).copied(),
         }
+    }
+
+    fn has_same_source_storage_contract(&self, other: &Self) -> bool {
+        match (&self.registers, &other.registers) {
+            (
+                CallConvRegisters::SourceOwned {
+                    argument_storages: left_arguments,
+                    result_storage: left_result,
+                    ..
+                },
+                CallConvRegisters::SourceOwned {
+                    argument_storages: right_arguments,
+                    result_storage: right_result,
+                    ..
+                },
+            ) => left_arguments == right_arguments && left_result == right_result,
+            _ => false,
+        }
+    }
+
+    fn is_source_owned(&self) -> bool {
+        matches!(&self.registers, CallConvRegisters::SourceOwned { .. })
     }
 }
 
@@ -828,12 +852,31 @@ fn scope_helper_is_source_coherent(
 ) -> bool {
     let root_context = root.prepared.machine_context();
     let helper_context = helper.prepared.machine_context();
+    let root_abi_class = root_context.effective_abi_class();
+    let helper_abi_class = helper_context.effective_abi_class();
     if provenance.is_none()
         || root_context.architecture_family() != helper_context.architecture_family()
         || root_context.memory_model() != helper_context.memory_model()
-        || root_context.register_storages_by_name() != helper_context.register_storages_by_name()
     {
         return false;
+    }
+    let source_owned = root.prepared.provenance_kind() != SsaArtifactProvenanceKind::Manual
+        || helper.prepared.provenance_kind() != SsaArtifactProvenanceKind::Manual;
+    if source_owned {
+        if root_abi_class == r2ssa::SourceAbiClass::Unknown
+            || root_abi_class != helper_abi_class
+        {
+            return false;
+        }
+        let Some(root_callconv) = CallConv::for_prepared(&root.prepared) else {
+            return false;
+        };
+        let Some(helper_callconv) = CallConv::for_prepared(&helper.prepared) else {
+            return false;
+        };
+        if !root_callconv.has_same_source_storage_contract(&helper_callconv) {
+            return false;
+        }
     }
     if provenance == Some(ScopedFunctionProvenance::RuntimeMaterialized) {
         return true;
@@ -1720,7 +1763,11 @@ fn derive_symbolic_summary_for_function<'ctx>(
         symbol_map,
     } = inputs;
     let mut state = SymState::new(ctx, function.prepared.entry);
-    crate::runtime::seed_default_state_for_arch(&mut state, &function.prepared, arch);
+    if registry.callconv.is_source_owned() {
+        let _ = crate::runtime::seed_default_state_for_prepared(&mut state, &function.prepared);
+    } else {
+        crate::runtime::seed_default_state_for_arch(&mut state, &function.prepared, arch);
+    }
     let defines_return_value = function_defines_return_value(function, &registry.callconv);
     let opaque_return = matches!(
         static_summary.return_relation,
@@ -4002,6 +4049,31 @@ mod tests {
 
         callconv.write_return(&mut state, SymValue::concrete(7, 64));
         assert!(state.registers().is_empty());
+    }
+
+    #[test]
+    fn source_scope_callconv_coherence_ignores_presentation_name_maps() {
+        let prepared = exact_callconv_artifact();
+        let named = CallConv::for_prepared(&prepared).expect("named exact callconv");
+        let unnamed = CallConv {
+            registers: CallConvRegisters::SourceOwned {
+                argument_storages: vec![CanonicalStorageId {
+                    space: CanonicalStorageSpace::Register,
+                    offset: 0x00,
+                    size: 8,
+                }],
+                result_storage: CanonicalStorageId {
+                    space: CanonicalStorageSpace::Register,
+                    offset: 0x08,
+                    size: 8,
+                },
+                register_storages_by_name: BTreeMap::new(),
+            },
+            arg_bits: 64,
+            ret_bits: 64,
+        };
+
+        assert!(named.has_same_source_storage_contract(&unnamed));
     }
 
     #[test]

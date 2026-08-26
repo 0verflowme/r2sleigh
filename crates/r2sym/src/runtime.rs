@@ -3,7 +3,9 @@ use std::fs::OpenOptions;
 use std::io::Write;
 
 use r2il::ArchSpec;
-use r2ssa::{ObjectKind, SSAVar, SsaArtifact};
+use r2ssa::{
+    CanonicalStorageId, ObjectKind, SSAVar, SourceAbiClass, SsaArtifact,
+};
 
 use crate::PathExplorer;
 use crate::executor::{CallHookResult, CallHookTag};
@@ -316,6 +318,8 @@ fn seed_process_like_main_arguments<'ctx>(
     debug_main_seed_log(&format!("seeded registers {:?}", seeded));
 }
 
+/// Explicit advisory seed mode for callers that have only an architecture
+/// profile. Exact prepared workflows use [`seed_default_state_for_prepared`].
 pub fn seed_default_state_for_arch<'ctx>(
     state: &mut SymState<'ctx>,
     prepared: &SsaArtifact,
@@ -358,6 +362,91 @@ pub fn seed_default_state_for_arch<'ctx>(
     seed_memory_regions_for_arch(state, prepared, arch);
 }
 
+fn exact_version_zero_registers_for_storage(
+    prepared: &SsaArtifact,
+    storage: CanonicalStorageId,
+) -> BTreeMap<String, u32> {
+    let mut registers = BTreeMap::new();
+    let mut record = |var: &SSAVar| {
+        if var.is_register()
+            && var.version == 0
+            && prepared.graph().canonical_storage_for_var(var) == Some(storage)
+        {
+            registers
+                .entry(var.display_name())
+                .or_insert(var.size.saturating_mul(8));
+        }
+    };
+    for block in prepared.blocks() {
+        block.for_each_def(|def| record(def.var));
+        block.for_each_source(|src| record(src.var));
+    }
+    registers
+}
+
+fn exact_stack_value(prepared: &SsaArtifact) -> Option<u64> {
+    let memory = prepared.machine_context().memory_model();
+    if !memory.is_available() || !memory.is_coherent() {
+        return None;
+    }
+    match memory.default_address_bits() {
+        32 => Some(0x7fff_0000),
+        64 => Some(0x7fff_ffff_0000),
+        _ => None,
+    }
+}
+
+/// Seed initial registers from the exact ABI and canonical machine roles of
+/// one prepared artifact. Missing typed facts refuse seeding; this path never
+/// falls back to architecture or register-name classification.
+pub fn seed_default_state_for_prepared<'ctx>(
+    state: &mut SymState<'ctx>,
+    prepared: &SsaArtifact,
+) -> bool {
+    if prepared.machine_context().effective_abi_class() == SourceAbiClass::Unknown {
+        return false;
+    }
+    let Some(callconv) = CallConv::for_prepared(prepared) else {
+        return false;
+    };
+
+    for index in 0..callconv.arg_capacity() {
+        let Some(storage) = callconv.argument_storage(index) else {
+            return false;
+        };
+        for (key, bits) in exact_version_zero_registers_for_storage(prepared, storage) {
+            state.make_symbolic_named(&key, &format!("arg_{index}"), bits);
+        }
+    }
+
+    if let (Some(stack_pointer), Some(stack_value)) = (
+        prepared.machine_context().stack_pointer_carrier(),
+        exact_stack_value(prepared),
+    ) {
+        for (key, bits) in exact_version_zero_registers_for_storage(prepared, stack_pointer) {
+            state.set_concrete(&key, stack_value, bits);
+        }
+    }
+    seed_memory_regions_for_prepared(state, prepared);
+    true
+}
+
+/// Seed one exact source-owned scope. Process-entry argument construction is
+/// intentionally withheld until the source contract carries a typed entrypoint
+/// role; function names are not evidence for that role.
+pub fn seed_scope_state_for_prepared<'ctx>(
+    state: &mut SymState<'ctx>,
+    prepared: &SsaArtifact,
+    scope: &PreparedFunctionScope,
+) -> bool {
+    if scope.exact_for_artifact(prepared).is_none() {
+        return false;
+    }
+    seed_default_state_for_prepared(state, prepared)
+}
+
+/// Explicit advisory scope seed mode, including legacy name-based process
+/// entry projection.
 pub fn seed_scope_state_for_arch<'ctx>(
     state: &mut SymState<'ctx>,
     prepared: &SsaArtifact,
@@ -375,6 +464,7 @@ const STACK_WINDOW_SIZE: u64 = 0x10000;
 const GLOBAL_TAIL_EXTENT: u64 = 0x1000;
 const MAIN_ARGV1_SYMBOLIC_BYTES: u64 = 0x40;
 
+/// Explicit advisory memory seed mode for architecture-only callers.
 pub fn seed_memory_regions_for_arch<'ctx>(
     state: &mut SymState<'ctx>,
     prepared: &SsaArtifact,
@@ -427,6 +517,62 @@ pub fn seed_memory_regions_for_arch<'ctx>(
     }
 }
 
+/// Seed memory regions using only canonical prepared-machine facts.
+pub fn seed_memory_regions_for_prepared<'ctx>(
+    state: &mut SymState<'ctx>,
+    prepared: &SsaArtifact,
+) {
+    let stack_value = exact_stack_value(prepared);
+    let stack_pointer_is_projectable = prepared
+        .machine_context()
+        .stack_pointer_carrier()
+        .is_some_and(|storage| {
+            !exact_version_zero_registers_for_storage(prepared, storage).is_empty()
+        });
+    let has_stack_objects = prepared.objects().objects.values().any(|object| {
+        matches!(
+            object.kind,
+            ObjectKind::StackSlot { .. } | ObjectKind::FrameObject { .. }
+        )
+    });
+    if has_stack_objects
+        && stack_pointer_is_projectable
+        && let Some(stack_value) = stack_value
+    {
+        state.define_memory_region(
+            MemoryRegionKind::Stack,
+            "stack_window",
+            Some(stack_value.saturating_sub(STACK_WINDOW_BELOW)),
+            Some(STACK_WINDOW_SIZE),
+        );
+    }
+
+    let mut globals = prepared
+        .objects()
+        .objects
+        .values()
+        .filter_map(|object| match &object.kind {
+            ObjectKind::Global { address, .. } => Some(*address),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    globals.sort_unstable();
+    globals.dedup();
+    for (index, address) in globals.iter().copied().enumerate() {
+        let next = globals.get(index + 1).copied();
+        let extent = next
+            .and_then(|next| next.checked_sub(address))
+            .filter(|extent| *extent > 0)
+            .unwrap_or(GLOBAL_TAIL_EXTENT);
+        state.define_memory_region(
+            MemoryRegionKind::Global,
+            &format!("global_{address:x}"),
+            Some(address),
+            Some(extent),
+        );
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum WindowsRuntimeHook {
     AddVectoredExceptionHandler,
@@ -450,13 +596,13 @@ impl WindowsRuntimeHook {
     }
 }
 
-fn arch_supports_windows_runtime(arch: &ArchSpec) -> bool {
+fn advisory_arch_supports_windows_runtime(arch: &ArchSpec) -> bool {
     let name = arch.name.to_ascii_lowercase();
     (name.contains("x86") || name == "x64" || name == "amd64")
         && (arch.addr_size == 8 || name.contains("64"))
 }
 
-fn windows_x64_callconv() -> CallConv {
+fn advisory_windows_x64_callconv() -> CallConv {
     CallConv::new(vec!["RCX", "RDX", "R8", "R9"], "RAX", 64, 64)
 }
 
@@ -494,8 +640,8 @@ fn seed_exception_continuation<'ctx>(
 fn apply_windows_runtime_hook<'ctx>(
     state: &mut SymState<'ctx>,
     hook: WindowsRuntimeHook,
+    callconv: &CallConv,
 ) -> CallHookResult {
-    let callconv = windows_x64_callconv();
     let call = callconv.collect_call_info(state, 4);
     match hook {
         WindowsRuntimeHook::AddVectoredExceptionHandler => {
@@ -579,7 +725,34 @@ fn apply_windows_runtime_hook<'ctx>(
     }
 }
 
+/// Install source-owned runtime hooks for an exact prepared scope.
+///
+/// The current source contract carries ABI class and storage identity but no
+/// typed callee/runtime role. Symbol spellings therefore cannot authorize a
+/// hook, and this path deliberately installs none until that upstream role is
+/// available.
 pub fn install_runtime_hooks_for_scope<'ctx>(
+    explorer: &mut PathExplorer<'ctx>,
+    prepared: &SsaArtifact,
+    scope: &PreparedFunctionScope,
+    _arch: Option<&ArchSpec>,
+    _symbol_map: &HashMap<u64, String>,
+) {
+    let Some(_scope) = scope.exact_for_artifact(prepared) else {
+        return;
+    };
+    if prepared.machine_context().effective_abi_class() != SourceAbiClass::MicrosoftX64 {
+        return;
+    }
+    let Some(_callconv) = CallConv::for_prepared(prepared) else {
+        return;
+    };
+    let _ = explorer;
+}
+
+/// Explicit advisory compatibility mode for callers that have only an
+/// architecture profile and import-name hints.
+pub fn install_runtime_hooks_for_arch_advisory<'ctx>(
     explorer: &mut PathExplorer<'ctx>,
     prepared: &SsaArtifact,
     scope: &PreparedFunctionScope,
@@ -592,9 +765,10 @@ pub fn install_runtime_hooks_for_scope<'ctx>(
     let Some(arch) = arch else {
         return;
     };
-    if !arch_supports_windows_runtime(arch) {
+    if !advisory_arch_supports_windows_runtime(arch) {
         return;
     }
+    let callconv = advisory_windows_x64_callconv();
 
     let mut targets = BTreeMap::new();
     for function in scope.functions().values() {
@@ -616,8 +790,9 @@ pub fn install_runtime_hooks_for_scope<'ctx>(
     }
 
     for (target, kind) in targets {
+        let callconv = callconv.clone();
         explorer.register_tagged_call_hook(target, kind.call_hook_tag(), move |state| {
-            apply_windows_runtime_hook(state, kind)
+            apply_windows_runtime_hook(state, kind, &callconv)
         });
     }
 }
@@ -625,8 +800,8 @@ pub fn install_runtime_hooks_for_scope<'ctx>(
 #[cfg(test)]
 mod tests {
     use super::{
-        WindowsRuntimeHook, apply_windows_runtime_hook, install_runtime_hooks_for_scope,
-        seed_scope_state_for_arch,
+        WindowsRuntimeHook, advisory_windows_x64_callconv, apply_windows_runtime_hook,
+        install_runtime_hooks_for_arch_advisory, seed_scope_state_for_arch,
     };
     use crate::executor::CallHookResult;
     use crate::path::PathExplorer;
@@ -648,7 +823,61 @@ mod tests {
         arch.add_register(RegisterDef::new("EDX", 0x88, 4));
         arch.add_register(RegisterDef::new("R8", 0x90, 8));
         arch.add_register(RegisterDef::new("R8D", 0x90, 4));
+        arch.add_register(RegisterDef::new("RAX", 0x70, 8));
+        arch.add_register(RegisterDef::new("RSP", 0xa0, 8));
+        arch.add_register(RegisterDef::new("RIP", 0xa8, 8));
         arch
+    }
+
+    fn make_exact_seed_scope() -> (Arc<SsaArtifact>, PreparedFunctionScope) {
+        let arch = make_main_seed_arch(8);
+        let mut block = R2ILBlock::new(0x1800, 1);
+        for (unique, register) in [(0x10, 0x80), (0x20, 0x88), (0x30, 0x90), (0x40, 0xa0)] {
+            block.push(R2ILOp::Copy {
+                dst: Varnode::unique(unique, 8),
+                src: Varnode::register(register, 8),
+            });
+        }
+        block.push(R2ILOp::Return {
+            target: Varnode::constant(0, 8),
+        });
+        let storage = |offset| r2ssa::CanonicalStorageId {
+            space: r2ssa::CanonicalStorageSpace::Register,
+            offset,
+            size: 8,
+        };
+        let interface = r2ssa::SourceFunctionInterface::new_exact(
+            b"r2sym-runtime-exact-seed".to_vec(),
+            "ms64",
+            [0x80, 0x88, 0x90]
+                .into_iter()
+                .enumerate()
+                .map(|(index, offset)| {
+                    r2ssa::SourceAbiParameterSpec::new(index as u32, storage(offset))
+                }),
+            r2ssa::SourceFunctionReturn::Register {
+                storage: storage(0x70),
+            },
+            std::iter::empty::<r2ssa::SourceStackSlotSpec>(),
+        )
+        .and_then(|interface| interface.with_stack_pointer_storage(storage(0xa0)))
+        .and_then(|interface| interface.with_return_address_storage(storage(0xa8)))
+        .expect("exact runtime seed interface");
+        let prepared = Arc::new(
+            SsaArtifact::for_decompile_with_interface(&[block], Some(&arch), interface)
+                .expect("exact runtime seed artifact")
+                .with_name("main"),
+        );
+        let scope = PreparedFunctionScope::new(
+            prepared.entry,
+            vec![ScopedPreparedFunction {
+                id: InterprocFunctionId(prepared.entry),
+                name: Some("main".to_string()),
+                prepared: Arc::clone(&prepared),
+            }],
+        )
+        .expect("exact runtime seed scope");
+        (prepared, scope)
     }
 
     fn make_main_seed_scope(arch: &ArchSpec) -> (Arc<SsaArtifact>, PreparedFunctionScope) {
@@ -695,7 +924,11 @@ mod tests {
         state.set_concrete("R9_4", 0x40, 64);
         state.set_concrete("RAX_7", 0xdead_beef, 64);
 
-        let result = apply_windows_runtime_hook(&mut state, WindowsRuntimeHook::VirtualAlloc);
+        let result = apply_windows_runtime_hook(
+            &mut state,
+            WindowsRuntimeHook::VirtualAlloc,
+            &advisory_windows_x64_callconv(),
+        );
         assert_eq!(result, CallHookResult::Fallthrough);
 
         let base_addr = state
@@ -708,6 +941,30 @@ mod tests {
             .expect("allocated runtime region should be registered");
         assert!(region.executable);
         assert_eq!(region.size, 0x1000);
+    }
+
+    #[test]
+    fn exact_initial_state_uses_canonical_abi_without_main_name_projection() {
+        let ctx = Context::thread_local();
+        let (prepared, scope) = make_exact_seed_scope();
+        let mut state = SymState::new(&ctx, prepared.entry);
+
+        assert!(super::seed_scope_state_for_prepared(
+            &mut state,
+            &prepared,
+            &scope,
+        ));
+        assert!(state.get_register("RCX_0").is_symbolic());
+        assert!(state.get_register("RDX_0").is_symbolic());
+        assert!(state.get_register("R8_0").is_symbolic());
+        assert!(state.get_register("RSP_0").as_concrete().is_some());
+        assert!(
+            state
+                .registers()
+                .keys()
+                .all(|name| !name.starts_with("main_")),
+            "the exact path must not infer a process-entry role from the function name"
+        );
     }
 
     #[test]
@@ -842,7 +1099,13 @@ mod tests {
         let mut explorer = PathExplorer::new(&ctx);
         let symbol_map =
             HashMap::from([(0x401000, "sym.imp.KERNEL32.dll_VirtualAlloc".to_string())]);
-        install_runtime_hooks_for_scope(&mut explorer, &func, &scope, Some(&arch), &symbol_map);
+        install_runtime_hooks_for_arch_advisory(
+            &mut explorer,
+            &func,
+            &scope,
+            Some(&arch),
+            &symbol_map,
+        );
 
         let mut state = SymState::new(&ctx, 0x2000);
         state.set_concrete("RDX_0", 0x1000, 64);
