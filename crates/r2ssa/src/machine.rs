@@ -91,6 +91,86 @@ impl MachineValueBinding {
     }
 }
 
+/// Exact geometry of one register-backed SSA value in its canonical carrier.
+///
+/// The carrier is retained as source-owned storage, not reconstructed from a
+/// register spelling. Its location is derived from that storage so the two
+/// answers cannot drift.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct MachineRegisterValueGeometry {
+    carrier: CanonicalStorageId,
+    bit_offset: u32,
+    value_width_bits: u32,
+    carrier_width_bits: u32,
+}
+
+impl MachineRegisterValueGeometry {
+    pub const fn carrier_storage(self) -> CanonicalStorageId {
+        self.carrier
+    }
+
+    pub const fn carrier_location(self) -> r2source::CanonicalLocation {
+        self.carrier.location()
+    }
+
+    pub const fn bit_offset(self) -> u32 {
+        self.bit_offset
+    }
+
+    pub const fn value_width_bits(self) -> u32 {
+        self.value_width_bits
+    }
+
+    pub const fn carrier_width_bits(self) -> u32 {
+        self.carrier_width_bits
+    }
+}
+
+/// Exact direct geometry for a value that is not register-backed.
+///
+/// Synthetic SSA values have no source storage, but still receive this explicit
+/// disposition and width. `None` therefore means "source-owned direct value
+/// without storage", never "geometry was not computed".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct MachineDirectValueGeometry {
+    storage: Option<CanonicalStorageId>,
+    value_width_bits: u32,
+}
+
+impl MachineDirectValueGeometry {
+    pub const fn storage(self) -> Option<CanonicalStorageId> {
+        self.storage
+    }
+
+    pub const fn location(self) -> Option<r2source::CanonicalLocation> {
+        match self.storage {
+            Some(storage) => Some(storage.location()),
+            None => None,
+        }
+    }
+
+    pub const fn value_width_bits(self) -> u32 {
+        self.value_width_bits
+    }
+}
+
+/// Why one register-backed value has no honest canonical-carrier geometry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum MachineValueGeometryRefusal {
+    MissingRegisterGeometry,
+    MalformedRegisterGeometry,
+    RegisterGeometry(r2il::RegisterProjectionRefusal),
+    InvalidBitRange,
+}
+
+/// Complete dense geometry disposition for one [`ValueId`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum MachineValueGeometryDisposition {
+    ExactRegister(MachineRegisterValueGeometry),
+    Direct(MachineDirectValueGeometry),
+    Refused(MachineValueGeometryRefusal),
+}
+
 /// Exact use of one artifact-local machine value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct MachineValueUse {
@@ -917,6 +997,8 @@ impl MachineProjectionFailure {
 pub struct MachineProjection {
     machine: MachineFunction,
     failures: Box<[MachineProjectionFailure]>,
+    /// Dense by `ValueId`; every graph value has one explicit geometry disposition.
+    value_geometries: Box<[MachineValueGeometryDisposition]>,
     use_dispositions: Box<[Box<[MachineUseDisposition]>]>,
     /// Dense by `InstId`; `None` is reserved for graph instructions with no output.
     write_dispositions: Box<[Option<MachineWriteDisposition>]>,
@@ -928,6 +1010,7 @@ impl MachineProjection {
             return Err(MachineBuildError::IncompleteObligationInventory);
         }
         let graph = artifact.graph();
+        let value_geometries = canonical_machine_value_geometries(artifact)?;
         let mut builder = MachineBuilder::for_graph(graph);
         let mut entities = Vec::new();
         let mut failures = Vec::new();
@@ -990,6 +1073,7 @@ impl MachineProjection {
                 entities: entities.into_boxed_slice(),
             },
             failures: failures.into_boxed_slice(),
+            value_geometries: value_geometries.into_boxed_slice(),
             use_dispositions: use_dispositions
                 .into_iter()
                 .map(Vec::into_boxed_slice)
@@ -1011,6 +1095,19 @@ impl MachineProjection {
 
     pub const fn failures(&self) -> &[MachineProjectionFailure] {
         &self.failures
+    }
+
+    /// Dense O(1) lookup for one exact graph value's source-owned geometry.
+    pub fn value_geometry(
+        &self,
+        value: ValueId,
+    ) -> Option<&MachineValueGeometryDisposition> {
+        self.value_geometries.get(value.0 as usize)
+    }
+
+    /// Dense cells indexed by `ValueId`.
+    pub const fn value_geometries(&self) -> &[MachineValueGeometryDisposition] {
+        &self.value_geometries
     }
 
     /// Dense O(1) lookup for the disposition of one exact graph input use.
@@ -1080,8 +1177,20 @@ impl MachineProjection {
                 return Err(MachineBuildError::EntityMismatch(inst.id));
             }
         }
+        self.validate_value_geometries(artifact)?;
         self.validate_use_dispositions(artifact, &entities, &failed_outputs)?;
         self.validate_write_dispositions(artifact, &entities, &failed_outputs)?;
+        Ok(())
+    }
+
+    fn validate_value_geometries(
+        &self,
+        artifact: &SsaArtifact,
+    ) -> Result<(), MachineBuildError> {
+        let expected = canonical_machine_value_geometries(artifact)?;
+        if self.value_geometries.as_ref() != expected.as_slice() {
+            return Err(MachineBuildError::TopologyMismatch);
+        }
         Ok(())
     }
 
@@ -1244,6 +1353,71 @@ fn write_refusal_for_error(error: &MachineBuildError) -> MachineWriteRefusal {
         MachineBuildError::UnsupportedOperation { .. } => MachineWriteRefusal::UnsupportedOperation,
         _ => MachineWriteRefusal::IncoherentOperation,
     }
+}
+
+fn canonical_machine_value_geometries(
+    artifact: &SsaArtifact,
+) -> Result<Vec<MachineValueGeometryDisposition>, MachineBuildError> {
+    let graph = artifact.graph();
+    let mut geometries = Vec::with_capacity(graph.values.len());
+    for (index, value) in graph.values.iter().enumerate() {
+        if value.id.0 as usize != index {
+            return Err(MachineBuildError::TopologyMismatch);
+        }
+        geometries.push(canonical_machine_value_geometry(artifact, value)?);
+    }
+    Ok(geometries)
+}
+
+fn canonical_machine_value_geometry(
+    artifact: &SsaArtifact,
+    value: &GraphValue,
+) -> Result<MachineValueGeometryDisposition, MachineBuildError> {
+    let binding = binding_for_value(value)?;
+    let Some(storage) = value.canonical_storage else {
+        return Ok(MachineValueGeometryDisposition::Direct(
+            MachineDirectValueGeometry {
+                storage: None,
+                value_width_bits: binding.width_bits,
+            },
+        ));
+    };
+    if storage.space != CanonicalStorageSpace::Register {
+        let storage_width_bits = storage.size.checked_mul(8);
+        if storage_width_bits != Some(binding.width_bits) {
+            return Ok(MachineValueGeometryDisposition::Refused(
+                MachineValueGeometryRefusal::InvalidBitRange,
+            ));
+        }
+        return Ok(MachineValueGeometryDisposition::Direct(
+            MachineDirectValueGeometry {
+                storage: Some(storage),
+                value_width_bits: binding.width_bits,
+            },
+        ));
+    }
+
+    let geometry = match exact_register_geometry(artifact, storage) {
+        Ok(geometry) => geometry,
+        Err(reason) => {
+            return Ok(MachineValueGeometryDisposition::Refused(
+                value_refusal_for_register_geometry(reason),
+            ));
+        }
+    };
+    if geometry.width_bits != binding.width_bits {
+        return Ok(MachineValueGeometryDisposition::Refused(
+            MachineValueGeometryRefusal::InvalidBitRange,
+        ));
+    }
+    Ok(MachineValueGeometryDisposition::ExactRegister(
+        MachineRegisterValueGeometry {
+            carrier: geometry.carrier,
+            bit_offset: geometry.bit_offset,
+            value_width_bits: geometry.width_bits,
+            carrier_width_bits: geometry.carrier_bits,
+        },
+    ))
 }
 
 fn canonical_machine_use_dispositions(
@@ -1426,6 +1600,25 @@ enum MachineRegisterGeometryRefusal {
     InvalidBitRange,
 }
 
+fn value_refusal_for_register_geometry(
+    reason: MachineRegisterGeometryRefusal,
+) -> MachineValueGeometryRefusal {
+    match reason {
+        MachineRegisterGeometryRefusal::Missing => {
+            MachineValueGeometryRefusal::MissingRegisterGeometry
+        }
+        MachineRegisterGeometryRefusal::Malformed => {
+            MachineValueGeometryRefusal::MalformedRegisterGeometry
+        }
+        MachineRegisterGeometryRefusal::Upstream(reason) => {
+            MachineValueGeometryRefusal::RegisterGeometry(reason)
+        }
+        MachineRegisterGeometryRefusal::InvalidBitRange => {
+            MachineValueGeometryRefusal::InvalidBitRange
+        }
+    }
+}
+
 fn use_refusal_for_register_geometry(reason: MachineRegisterGeometryRefusal) -> MachineUseRefusal {
     match reason {
         MachineRegisterGeometryRefusal::Missing => MachineUseRefusal::MissingRegisterGeometry,
@@ -1470,6 +1663,7 @@ fn compose_machine_use_slice(
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ExactRegisterGeometry {
+    carrier: CanonicalStorageId,
     bit_offset: u32,
     width_bits: u32,
     carrier_bits: u32,
@@ -1530,6 +1724,11 @@ fn exact_register_geometry(
         return Err(MachineRegisterGeometryRefusal::InvalidBitRange);
     }
     Ok(ExactRegisterGeometry {
+        carrier: CanonicalStorageId {
+            space: CanonicalStorageSpace::Register,
+            offset: carrier.offset,
+            size: carrier.size,
+        },
         bit_offset,
         width_bits,
         carrier_bits,
@@ -3574,6 +3773,33 @@ mod tests {
         arch
     }
 
+    fn value_geometry_for_storage(
+        projection: &MachineProjection,
+        artifact: &SsaArtifact,
+        storage: CanonicalStorageId,
+    ) -> MachineValueGeometryDisposition {
+        let dispositions = artifact
+            .graph()
+            .values
+            .iter()
+            .filter(|value| value.canonical_storage == Some(storage))
+            .map(|value| {
+                projection
+                    .value_geometry(value.id)
+                    .copied()
+                    .expect("dense value geometry")
+            })
+            .collect::<Vec<_>>();
+        let first = *dispositions
+            .first()
+            .expect("fixture value with requested canonical storage");
+        assert!(
+            dispositions.iter().all(|disposition| *disposition == first),
+            "versions of one exact storage must retain one geometry"
+        );
+        first
+    }
+
     fn big_endian_register_geometry_arch() -> ArchSpec {
         let carrier = RegisterStorage { offset: 0, size: 8 };
         let high_byte = RegisterStorage { offset: 6, size: 1 };
@@ -3621,6 +3847,239 @@ mod tests {
         assert_eq!(MachineBitVector::zero(0), None);
         assert_eq!(MachineBitVector::zero(65), None);
         assert_eq!(MachineBitVector::zero(u32::MAX), None);
+    }
+
+    #[test]
+    fn value_geometry_is_dense_and_keeps_ah_in_the_rax_carrier() {
+        let arch = register_geometry_arch();
+        let artifact = artifact_with_arch(
+            [
+                R2ILOp::Copy {
+                    dst: Varnode::unique(0x10, 1),
+                    src: Varnode::register(1, 1),
+                },
+                R2ILOp::IntAdd {
+                    dst: Varnode::register(0, 4),
+                    a: Varnode::unique(0x20, 4),
+                    b: Varnode::constant(1, 4),
+                },
+            ],
+            &arch,
+        );
+        let projection = MachineProjection::from_artifact(&artifact).expect("machine projection");
+
+        assert_eq!(
+            projection.value_geometries().len(),
+            artifact.graph().values.len()
+        );
+        for (index, value) in artifact.graph().values.iter().enumerate() {
+            assert_eq!(value.id.0 as usize, index);
+            assert_eq!(
+                projection.value_geometry(value.id),
+                projection.value_geometries().get(index)
+            );
+            if value
+                .canonical_storage
+                .is_none_or(|storage| storage.space != CanonicalStorageSpace::Register)
+            {
+                assert!(matches!(
+                    projection.value_geometry(value.id),
+                    Some(MachineValueGeometryDisposition::Direct(_))
+                ));
+            }
+        }
+        assert_eq!(
+            projection.value_geometry(ValueId(artifact.graph().values.len() as u32)),
+            None
+        );
+
+        let ah = CanonicalStorageId {
+            space: CanonicalStorageSpace::Register,
+            offset: 1,
+            size: 1,
+        };
+        let rax = CanonicalStorageId {
+            space: CanonicalStorageSpace::Register,
+            offset: 0,
+            size: 8,
+        };
+        let geometry = value_geometry_for_storage(&projection, &artifact, ah);
+        assert_eq!(
+            geometry,
+            MachineValueGeometryDisposition::ExactRegister(MachineRegisterValueGeometry {
+                carrier: rax,
+                bit_offset: 8,
+                value_width_bits: 8,
+                carrier_width_bits: 64,
+            })
+        );
+        let MachineValueGeometryDisposition::ExactRegister(geometry) = geometry else {
+            panic!("AH must have exact register geometry");
+        };
+        assert_eq!(geometry.carrier_storage(), rax);
+        assert_eq!(geometry.carrier_location(), rax.location());
+
+        let eax = CanonicalStorageId {
+            space: CanonicalStorageSpace::Register,
+            offset: 0,
+            size: 4,
+        };
+        assert_eq!(
+            value_geometry_for_storage(&projection, &artifact, eax),
+            MachineValueGeometryDisposition::ExactRegister(MachineRegisterValueGeometry {
+                carrier: rax,
+                bit_offset: 0,
+                value_width_bits: 32,
+                carrier_width_bits: 64,
+            })
+        );
+        projection
+            .validate_against(&artifact)
+            .expect("every dense geometry remains source-bound");
+
+        let mut corrupted = projection;
+        corrupted.value_geometries[0] = MachineValueGeometryDisposition::Refused(
+            MachineValueGeometryRefusal::InvalidBitRange,
+        );
+        assert_eq!(
+            corrupted.validate_against(&artifact),
+            Err(MachineBuildError::TopologyMismatch)
+        );
+    }
+
+    #[test]
+    fn value_geometry_ignores_register_names_and_definition_order() {
+        let original = register_geometry_arch();
+        let mut renamed = register_geometry_arch();
+        for register in &mut renamed.registers {
+            register.name = match (register.offset, register.size) {
+                (0, 4) => "narrow_accumulator".to_string(),
+                (0, 8) => "wide_accumulator".to_string(),
+                (1, 1) => "upper_low_byte".to_string(),
+                _ => unreachable!("geometry fixture has three registers"),
+            };
+        }
+        renamed.registers.reverse();
+        let ops = || {
+            [
+                R2ILOp::Copy {
+                    dst: Varnode::unique(0x10, 1),
+                    src: Varnode::register(1, 1),
+                },
+                R2ILOp::Copy {
+                    dst: Varnode::unique(0x20, 4),
+                    src: Varnode::register(0, 4),
+                },
+            ]
+        };
+        let original_artifact = artifact_with_arch(ops(), &original);
+        let renamed_artifact = artifact_with_arch(ops(), &renamed);
+        let original_projection =
+            MachineProjection::from_artifact(&original_artifact).expect("original projection");
+        let renamed_projection =
+            MachineProjection::from_artifact(&renamed_artifact).expect("renamed projection");
+
+        for storage in [
+            CanonicalStorageId {
+                space: CanonicalStorageSpace::Register,
+                offset: 1,
+                size: 1,
+            },
+            CanonicalStorageId {
+                space: CanonicalStorageSpace::Register,
+                offset: 0,
+                size: 4,
+            },
+        ] {
+            assert_eq!(
+                value_geometry_for_storage(
+                    &original_projection,
+                    &original_artifact,
+                    storage,
+                ),
+                value_geometry_for_storage(&renamed_projection, &renamed_artifact, storage)
+            );
+            let original_name = &original_artifact
+                .graph()
+                .values
+                .iter()
+                .find(|value| value.canonical_storage == Some(storage))
+                .expect("original register value")
+                .var
+                .name;
+            let renamed_name = &renamed_artifact
+                .graph()
+                .values
+                .iter()
+                .find(|value| value.canonical_storage == Some(storage))
+                .expect("renamed register value")
+                .var
+                .name;
+            assert_ne!(original_name, renamed_name);
+        }
+    }
+
+    #[test]
+    fn value_geometry_preserves_register_geometry_refusals() {
+        let source = Varnode::register(1, 1);
+        let read = |arch: &ArchSpec| {
+            let artifact = artifact_with_arch(
+                [R2ILOp::Copy {
+                    dst: Varnode::unique(0x10, 1),
+                    src: source.clone(),
+                }],
+                arch,
+            );
+            let projection = MachineProjection::from_artifact(&artifact).expect("typed geometry");
+            value_geometry_for_storage(
+                &projection,
+                &artifact,
+                CanonicalStorageId {
+                    space: CanonicalStorageSpace::Register,
+                    offset: 1,
+                    size: 1,
+                },
+            )
+        };
+
+        let mut missing = register_geometry_arch();
+        missing.register_projections.clear();
+        assert_eq!(
+            read(&missing),
+            MachineValueGeometryDisposition::Refused(
+                MachineValueGeometryRefusal::MissingRegisterGeometry
+            )
+        );
+
+        let mut refused = register_geometry_arch();
+        for projection in &mut refused.register_projections {
+            projection.disposition = RegisterProjectionDisposition::Refused {
+                reason: RegisterProjectionRefusal::MissingRegisterEndianness,
+            };
+        }
+        assert_eq!(
+            read(&refused),
+            MachineValueGeometryDisposition::Refused(
+                MachineValueGeometryRefusal::RegisterGeometry(
+                    RegisterProjectionRefusal::MissingRegisterEndianness
+                )
+            )
+        );
+
+        let mut malformed = refused;
+        malformed.register_projections[0].disposition = RegisterProjectionDisposition::Bound {
+            carrier: RegisterStorage { offset: 0, size: 8 },
+            slice: RegisterBitSlice {
+                lsb_bit_offset: 0,
+                size_bits: 32,
+            },
+        };
+        assert_eq!(
+            read(&malformed),
+            MachineValueGeometryDisposition::Refused(
+                MachineValueGeometryRefusal::MalformedRegisterGeometry
+            )
+        );
     }
 
     #[test]

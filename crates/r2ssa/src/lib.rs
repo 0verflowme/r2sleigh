@@ -110,9 +110,11 @@ pub use machine::{
     MachineCastKind, MachineComparisonOp, MachineEntity, MachineExpr, MachineExprArena,
     MachineExprId, MachineExprKind, MachineFunction, MachineOvershiftBehavior, MachineProjection,
     MachineProjectionFailure, MachineShiftKind, MachineSignedness, MachineStackBase, MachineType,
-    MachineUseConversion, MachineUseDisposition, MachineUseRefusal, MachineUseSlice,
-    MachineValueBinding, MachineValueUse, MachineWriteDisposition, MachineWriteProjection,
-    MachineWriteRefusal, MachineZeroDivisorBehavior, machine_address_provenance,
+    MachineDirectValueGeometry, MachineRegisterValueGeometry, MachineUseConversion,
+    MachineUseDisposition, MachineUseRefusal, MachineUseSlice, MachineValueBinding,
+    MachineValueGeometryDisposition, MachineValueGeometryRefusal, MachineValueUse,
+    MachineWriteDisposition, MachineWriteProjection, MachineWriteRefusal,
+    MachineZeroDivisorBehavior, machine_address_provenance,
 };
 pub use machine_context::{
     MACHINE_CONTEXT_SCHEMA_VERSION, MachineAbiModel, MachineAbiRegisterSlot,
