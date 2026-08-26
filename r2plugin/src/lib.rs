@@ -6831,12 +6831,47 @@ mod integration_tests {
                 Some(type_graph),
             )
         } else {
-            r2ssa::SourceFunctionInterface::new_exact(
+            let parameter_logical_values = parameters
+                .iter()
+                .enumerate()
+                .map(|(index, storage)| {
+                    let width_bits = parameter_homes
+                        .iter()
+                        .find_map(|(parameter, _, size)| {
+                            (*parameter == index as u32)
+                                .then_some(u64::from(size.saturating_mul(8)))
+                        })
+                        .unwrap_or_else(|| u64::from(storage.storage().size.saturating_mul(8)));
+                    let (type_id, kind) = match width_bits {
+                        32 => (0, r2ssa::SourceCarrierKind::LowBits),
+                        64 => (1, r2ssa::SourceCarrierKind::Full),
+                        other => panic!("unsupported exact fixture parameter width {other}"),
+                    };
+                    r2ssa::SourceLogicalValue::new(
+                        type_id,
+                        r2ssa::SourceCarrierProjection::new(kind, 0, width_bits),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let scalar_carrier =
+                r2ssa::SourceCarrierProjection::new(r2ssa::SourceCarrierKind::LowBits, 0, 32);
+            let type_graph = r2ssa::SourceTypeGraph::new(
+                [
+                    r2ssa::SourceType::new(0, r2ssa::SourceTypeKind::SignedInteger, 32, 32),
+                    r2ssa::SourceType::new(1, r2ssa::SourceTypeKind::UnsignedInteger, 64, 64),
+                ],
+                [],
+            )
+            .expect("x86-64 scalar parameter type graph");
+            r2ssa::SourceFunctionInterface::new_exact_with_logical_types(
                 revision.clone(),
                 "sysv64",
                 parameters,
                 return_kind,
                 stack_slots,
+                parameter_logical_values,
+                Some(r2ssa::SourceLogicalValue::new(0, scalar_carrier)),
+                Some(type_graph),
             )
         }
         .and_then(|interface| {
@@ -6846,6 +6881,15 @@ mod integration_tests {
             interface.with_stack_pointer_storage(x86_register_storage(arch, "RSP"))
         })
         .and_then(|interface| interface.with_frame_pointer_storage(rbp))
+        .and_then(|interface| interface.with_exact_stacked_return(0, 8, 8, 8))
+        .and_then(|interface| {
+            interface.with_stack_allocation_contract(
+                r2ssa::SourceStackAllocationContract::with_implicit_active_sp_bytes(
+                    r2ssa::SourceStackGrowth::LowerAddresses,
+                    128,
+                ),
+            )
+        })
         .expect("exact x86-64 test source interface");
         std::sync::Arc::new(
             r2engine::EngineSourceSnapshot::new(revision, Some(interface), call_sites)
@@ -8367,7 +8411,7 @@ mod integration_tests {
             .collect::<Vec<_>>();
         let host_signature = r2types::FunctionSignatureSpec {
             ret_type: Some(r2types::CTypeLike::Int {
-                bits: 64,
+                bits: 32,
                 signedness: r2types::Signedness::Signed,
             }),
             params: vec![
@@ -8378,7 +8422,7 @@ mod integration_tests {
                 r2types::FunctionParamSpec {
                     name: "arg1".to_string(),
                     ty: Some(r2types::CTypeLike::Int {
-                        bits: 64,
+                        bits: 32,
                         signedness: r2types::Signedness::Signed,
                     }),
                 },
@@ -8396,7 +8440,7 @@ mod integration_tests {
                 r2types::ExternalRegisterParamSpec {
                     name: "arg1".to_string(),
                     ty: Some(r2types::CTypeLike::Int {
-                        bits: 64,
+                        bits: 32,
                         signedness: r2types::Signedness::Signed,
                     }),
                     reg: "RSI".to_string(),
@@ -8446,30 +8490,27 @@ mod integration_tests {
                 )
             });
         assert_eq!(len_home.name, "arg1");
-        let binding_index = match response.placement_audit {
-            r2engine::PlacementAudit::Refused(
-                r2engine::PlacementAuditRefusal::UnobservedBindingRead { binding_index },
-            ) => binding_index,
-            other => panic!("expected exact unobserved-binding-read refusal, got {other:?}"),
-        };
+        // The saved-frame-pointer store is a live machine stack effect, but
+        // this source snapshot does not certify that object as a C program
+        // variable.  Native lowering must refuse at that first surviving use;
+        // it may not invent a local merely because the object has an offset.
+        assert_eq!(response.placement_audit, r2engine::PlacementAudit::NotRun);
         assert_eq!(
-            response.placement_audit,
-            r2engine::PlacementAudit::Refused(
-                r2engine::PlacementAuditRefusal::UnobservedBindingRead { binding_index }
-            )
+            response.binding_audit,
+            r2engine::BindingShadowAuditOutcome::NotRun
         );
-        // Temporary admission gate: the occurrence cutover must eventually
-        // make this audit Applied, but may not hide the missing read meanwhile.
-        // Certified facts stay inspectable while the engine replaces only the
-        // refused native route with a comment.
+        assert_eq!(
+            response.render_refusal,
+            Some(r2engine::DecompileRenderRefusal::MissingProgramVariableAuthorization)
+        );
         assert!(
             response.output.starts_with("/* r2dec fallback:")
                 && response
                     .output
-                    .contains("native declaration placement refused: unobserved_binding_read")
+                    .contains("native rendering refused: missing program-variable authorization")
                 && !response.output.contains("for (int32_t var_14h = 0;")
                 && !response.output.contains("return var_10h;"),
-            "certified facts must remain inspectable while exact placement refusal leaves only a fallback comment; output={} render_facts={:?}",
+            "certified facts must remain inspectable while the live unauthorized stack object leaves only a fallback comment; output={} render_facts={:?}",
             response.output,
             response.function_facts.render_facts()
         );

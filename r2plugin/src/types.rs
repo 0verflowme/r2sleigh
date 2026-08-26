@@ -533,7 +533,7 @@ mod tests {
                 r2ssa::SSAOp::IntAdd {
                     dst: r2ssa::SSAVar::new("X10", 1, 8),
                     a: r2ssa::SSAVar::new("X0", 0, 8),
-                    b: r2ssa::SSAVar::new("const:1", 0, 8),
+                    b: r2ssa::SSAVar::constant(1, 8),
                 },
             ],
         }];

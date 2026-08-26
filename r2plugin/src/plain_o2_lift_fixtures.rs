@@ -278,28 +278,57 @@ fn assert_captured_abi_facts(function: &FunctionCapture, ssa: &Value, blocks: &[
     let formal_parameters = prepared["formal_parameters"]
         .as_array()
         .expect("formal parameters");
-    for (parameter_index, parameter) in function.source_abi.parameters.iter().enumerate() {
-        assert!(!parameter.name.is_empty());
-        assert!(
-            formal_parameters.iter().any(|formal| {
-                formal["parameter"] == parameter_index
-                    && formal["value_id"].is_u64()
-                    && formal["value"]["name"]
-                        .as_str()
-                        .is_some_and(|value| value.eq_ignore_ascii_case(&parameter.register))
-                    && formal["value"]["version"].is_u64()
-                    && formal["value"]["size"].is_u64()
-                    && formal["canonical_storage"].is_object()
-            }),
-            "{} source ABI parameter {} in {} must bind {}",
-            function.name,
-            parameter.name,
-            parameter_index,
-            parameter.register
-        );
-    }
-
     let (arch, _) = create_disassembler_for_arch("x86-64").expect("x86-64 disassembler");
+    assert!(
+        formal_parameters.is_empty(),
+        "the legacy block-only SSA endpoint has no immutable source interface and must not mint formal-parameter authority"
+    );
+    assert!(
+        prepared["parameter_addresses"]
+            .as_array()
+            .expect("parameter addresses")
+            .is_empty(),
+        "the legacy block-only SSA endpoint must not project machine addresses onto source parameters"
+    );
+
+    let full_register_at = |name: &str| {
+        let declared = arch
+            .get_register(name)
+            .unwrap_or_else(|| panic!("missing captured ABI register {name}"));
+        let full = arch
+            .registers
+            .iter()
+            .filter(|candidate| candidate.offset == declared.offset)
+            .max_by_key(|candidate| candidate.size)
+            .expect("register location has a full-width carrier");
+        r2source::CanonicalStorageId {
+            space: r2source::CanonicalStorageSpace::Register,
+            offset: full.offset,
+            size: full.size,
+        }
+    };
+    let convention_slots = r2source::SourceConventionSlots::new(
+        &function.source_abi.calling_convention,
+        function
+            .source_abi
+            .parameters
+            .iter()
+            .map(|parameter| full_register_at(&parameter.register)),
+        Some(full_register_at("RAX")),
+    )
+    .expect("captured SysV AMD64 convention slots");
+    let recovered_function = r2ssa::SSAFunction::from_blocks_with_arch(blocks, Some(&arch))
+        .expect("machine-only SSA fixture");
+    let recovered =
+        r2ssa::recover_interface::recover_interface(&recovered_function, &convention_slots)
+            .expect("machine-code ABI recovery");
+    assert_eq!(
+        recovered.parameters(),
+        convention_slots.argument_slots(),
+        "{} machine code must independently recover the captured contiguous ABI inputs without granting the legacy JSON endpoint source authority",
+        function.name
+    );
+
     let prepared_ssa =
         r2ssa::SsaArtifact::for_patterns(blocks, Some(&arch)).expect("pattern SSA fixture");
     let inferred = r2types::recover_signature_params_from_ssa(
@@ -345,19 +374,45 @@ fn assert_captured_abi_facts(function: &FunctionCapture, ssa: &Value, blocks: &[
             aggregate.member_offsets,
             (0..14).map(|index| index * 4).collect::<Vec<_>>()
         );
-        let parameter_addresses = prepared["parameter_addresses"]
-            .as_array()
-            .expect("parameter addresses");
+        let recovered_interface = r2ssa::SourceFunctionInterface::new(
+            b"plain-o2-machine-recovered-interface".to_vec(),
+            &function.source_abi.calling_convention,
+            recovered
+                .parameters()
+                .iter()
+                .enumerate()
+                .map(|(index, storage)| {
+                    r2ssa::SourceAbiParameterSpec::new(
+                        u32::try_from(index).expect("parameter index fits u32"),
+                        *storage,
+                    )
+                }),
+            recovered
+                .result()
+                .map_or(r2ssa::SourceFunctionReturn::Void, |storage| {
+                    r2ssa::SourceFunctionReturn::Register { storage }
+                }),
+            [],
+        )
+        .expect("interface from machine-recovered storages");
+        let recovered_artifact = r2ssa::SsaArtifact::for_decompile_with_interface(
+            blocks,
+            Some(&arch),
+            recovered_interface,
+        )
+        .expect("SSA with the independently recovered machine interface");
         for offset in [8, 52] {
             assert!(
-                parameter_addresses.iter().any(|address| {
-                    address["parameter"] == 0
-                        && address["offset"] == offset
-                        && address["terms"]
-                            .as_array()
-                            .is_some_and(|terms| terms.iter().any(|term| term["coefficient"] == 56))
-                }),
-                "{} must retain DemoStruct stride 56 at offset {offset}",
+                recovered_artifact
+                    .addresses()
+                    .parameter_expressions
+                    .values()
+                    .any(|address| {
+                        address.parameter == 0
+                            && address.offset == offset
+                            && address.terms.iter().any(|term| term.coefficient == 56)
+                    }),
+                "{} machine recovery must retain stride 56 at offset {offset} without assigning source authority to the legacy endpoint",
                 function.name
             );
         }
