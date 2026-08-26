@@ -553,11 +553,7 @@ pub fn install_symbolic_hooks_for_query_policy<'ctx>(
     };
     let registry = if prepared.provenance_kind() == r2ssa::SsaArtifactProvenanceKind::Manual {
         arch.and_then(|arch| {
-            SummaryRegistry::with_profile_for_arch_and_symbols(
-                arch,
-                symbol_map,
-                summary_profile,
-            )
+            SummaryRegistry::with_profile_for_arch_and_symbols(arch, symbol_map, summary_profile)
         })
     } else {
         SummaryRegistry::with_profile_for_prepared(prepared, summary_profile)
@@ -566,12 +562,7 @@ pub fn install_symbolic_hooks_for_query_policy<'ctx>(
         && let Some(registry) = registry
     {
         let _ = registry.install_scope_summaries_for_explorer(
-            explorer,
-            z3_ctx,
-            prepared,
-            scope,
-            arch,
-            symbol_map,
+            explorer, z3_ctx, prepared, scope, arch, symbol_map,
         );
     }
     if policy.install_runtime_hooks {
@@ -2410,7 +2401,7 @@ mod tests {
         TargetQueryExecutionRoute, TargetQueryPlan, VmBinaryOp, VmGuardCondition, VmGuardedExit,
         VmStateUpdate, VmStepSummary, VmTransferArm, VmValueExpr,
     };
-    use r2il::{R2ILBlock, R2ILOp, SpaceId, Varnode};
+    use r2il::{ArchSpec, R2ILBlock, R2ILOp, RegisterDef, SpaceId, Varnode};
     use r2ssa::{
         AnalysisAssumption, AssumptionProvenance, AssumptionScope, AssumptionSet,
         AssumptionSubject, AssumptionValue, SsaArtifact, ValueId,
@@ -2810,16 +2801,24 @@ mod tests {
     #[test]
     fn register_assumptions_condition_query_results() {
         let blocks = make_residual_precondition_blocks();
-        let base = SsaArtifact::for_symbolic(&blocks, None).expect("ssa");
-        let reg_name = base
+        let mut arch = ArchSpec::new("assumption-query-test");
+        arch.addr_size = 8;
+        arch.add_register(RegisterDef::new("QUERY_ARG", RDI, 8));
+        arch.add_register(RegisterDef::new("QUERY_TMP0", TMP0, 1));
+        arch.add_register(RegisterDef::new("QUERY_TMP1", TMP1, 1));
+        let base = SsaArtifact::for_symbolic(&blocks, Some(&arch)).expect("ssa");
+        let reg_storage = base
             .graph()
             .values
             .iter()
             .find(|value| value.var.version == 0 && value.var.is_register() && value.var.size == 8)
             .expect("version-zero input register")
-            .var
-            .name
-            .clone();
+            .canonical_storage
+            .expect("input register has exact storage");
+        let reg_name = base
+            .machine_context()
+            .register_name(reg_storage)
+            .expect("source register map names the input storage");
         let func = base.with_assumptions(&AssumptionSet::new(vec![AnalysisAssumption {
             id: Some("force-rdi".to_string()),
             subject: AssumptionSubject::Register { name: reg_name },

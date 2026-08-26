@@ -1,11 +1,12 @@
 use std::borrow::Cow;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 
 use r2il::ArchSpec;
-use r2ssa::SsaArtifact;
+use r2ssa::{CanonicalStorageId, CanonicalStorageSpace, SsaArtifact};
 
 use crate::memory::MemoryRegionKind;
-use crate::runtime::seed_memory_regions_for_arch;
+use crate::runtime::{seed_memory_regions_for_arch, seed_memory_regions_for_prepared};
 use crate::state::SymState;
 
 #[derive(Debug, Clone, Default)]
@@ -44,6 +45,81 @@ pub struct ReplayMemoryOverlay {
     pub addr: u64,
     pub size: u32,
     pub name: String,
+}
+
+/// Why a replay register snapshot could not be bound to one prepared machine.
+///
+/// Raw debugger/register names are input syntax only. The exact replay path
+/// resolves them through the source-owned register map before selecting an SSA
+/// entry value or a state presentation key. It never guesses aliases or widths.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PreparedReplaySeedError {
+    UnknownRegister(String),
+    InvalidRegisterStorage {
+        name: String,
+        storage: CanonicalStorageId,
+    },
+    MissingEntryValue(CanonicalStorageId),
+    AmbiguousEntryValue(CanonicalStorageId),
+    ConflictingRegisterLocation {
+        first: String,
+        second: String,
+    },
+    RegisterWidthOverflow(CanonicalStorageId),
+}
+
+impl fmt::Display for PreparedReplaySeedError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnknownRegister(name) => {
+                write!(f, "replay register {name:?} has no source-owned storage")
+            }
+            Self::InvalidRegisterStorage { name, storage } => write!(
+                f,
+                "replay register {name:?} resolved to invalid storage {storage:?}"
+            ),
+            Self::MissingEntryValue(storage) => {
+                write!(f, "replay storage {storage:?} has no SSA entry value")
+            }
+            Self::AmbiguousEntryValue(storage) => {
+                write!(
+                    f,
+                    "replay storage {storage:?} has multiple SSA entry values"
+                )
+            }
+            Self::ConflictingRegisterLocation { first, second } => write!(
+                f,
+                "replay registers {first:?} and {second:?} address one machine location"
+            ),
+            Self::RegisterWidthOverflow(storage) => {
+                write!(f, "replay storage {storage:?} has an overflowing bit width")
+            }
+        }
+    }
+}
+
+impl std::error::Error for PreparedReplaySeedError {}
+
+#[derive(Debug)]
+struct PreparedReplayRegisterValue<'a> {
+    state_key: String,
+    bits: u32,
+    value: u64,
+    _source_name: &'a str,
+}
+
+#[derive(Debug)]
+struct PreparedReplayRegisterOverlay<'a> {
+    state_key: String,
+    bits: u32,
+    symbol: &'a str,
+    _source_name: &'a str,
+}
+
+#[derive(Debug)]
+struct PreparedReplayRegisters<'a> {
+    concrete: Vec<PreparedReplayRegisterValue<'a>>,
+    symbolic: Vec<PreparedReplayRegisterOverlay<'a>>,
 }
 
 const REPLAY_FINGERPRINT_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
@@ -189,6 +265,149 @@ pub fn stable_replay_seed_fingerprint(seed: &ReplaySeed) -> u64 {
     state
 }
 
+fn exact_replay_state_key(
+    prepared: &SsaArtifact,
+    storage: CanonicalStorageId,
+) -> Result<(String, u32), PreparedReplaySeedError> {
+    let mut entry_values = prepared
+        .graph()
+        .values
+        .iter()
+        .filter(|value| value.canonical_storage == Some(storage))
+        .filter(|value| prepared.graph().def_inst(value.id).is_none());
+    let first = entry_values
+        .next()
+        .ok_or(PreparedReplaySeedError::MissingEntryValue(storage))?;
+    if entry_values.next().is_some() {
+        return Err(PreparedReplaySeedError::AmbiguousEntryValue(storage));
+    }
+
+    let bits = first
+        .var
+        .size
+        .checked_mul(8)
+        .ok_or(PreparedReplaySeedError::RegisterWidthOverflow(storage))?;
+    if first.var.size != storage.size || bits == 0 {
+        return Err(PreparedReplaySeedError::InvalidRegisterStorage {
+            name: first.var.display_name(),
+            storage,
+        });
+    }
+    Ok((first.var.display_name(), bits))
+}
+
+fn bind_prepared_replay_registers<'a>(
+    prepared: &SsaArtifact,
+    seed: &'a ReplaySeed,
+) -> Result<PreparedReplayRegisters<'a>, PreparedReplaySeedError> {
+    let mut occupied_locations = BTreeMap::new();
+    let mut exact_storages = BTreeSet::new();
+    let mut concrete = Vec::with_capacity(seed.registers.len());
+    let mut symbolic = Vec::with_capacity(seed.register_overlays.len());
+
+    let mut bind = |name: &'a str| {
+        let storage = prepared
+            .machine_context()
+            .register_storage(name)
+            .ok_or_else(|| PreparedReplaySeedError::UnknownRegister(name.to_string()))?;
+        if storage.space != CanonicalStorageSpace::Register || storage.size == 0 {
+            return Err(PreparedReplaySeedError::InvalidRegisterStorage {
+                name: name.to_string(),
+                storage,
+            });
+        }
+        if !exact_storages.insert(storage) {
+            let first = occupied_locations
+                .get(&storage.location())
+                .cloned()
+                .unwrap_or_else(|| name.to_string());
+            return Err(PreparedReplaySeedError::ConflictingRegisterLocation {
+                first,
+                second: name.to_string(),
+            });
+        }
+        if let Some(first) = occupied_locations.insert(storage.location(), name.to_string()) {
+            return Err(PreparedReplaySeedError::ConflictingRegisterLocation {
+                first,
+                second: name.to_string(),
+            });
+        }
+        let (state_key, bits) = exact_replay_state_key(prepared, storage)?;
+        Ok((state_key, bits))
+    };
+
+    for register in &seed.registers {
+        let (state_key, bits) = bind(&register.name)?;
+        concrete.push(PreparedReplayRegisterValue {
+            state_key,
+            bits,
+            value: register.value,
+            _source_name: &register.name,
+        });
+    }
+    for overlay in &seed.register_overlays {
+        let (state_key, bits) = bind(&overlay.name)?;
+        symbolic.push(PreparedReplayRegisterOverlay {
+            state_key,
+            bits,
+            symbol: &overlay.symbol,
+            _source_name: &overlay.name,
+        });
+    }
+
+    Ok(PreparedReplayRegisters { concrete, symbolic })
+}
+
+/// Apply one replay seed through the exact source-owned machine/SSA contract.
+///
+/// Register bindings are validated as a whole before state is mutated. Unknown
+/// names, overlapping aliases, ambiguous SSA entry values, and invalid widths
+/// are typed refusals rather than architecture-derived guesses.
+pub fn apply_replay_seed_to_prepared<'ctx>(
+    state: &mut SymState<'ctx>,
+    prepared: &SsaArtifact,
+    seed: &ReplaySeed,
+) -> Result<(), PreparedReplaySeedError> {
+    let registers = bind_prepared_replay_registers(prepared, seed)?;
+    apply_bound_prepared_replay(state, seed, registers);
+    Ok(())
+}
+
+/// Seed canonical prepared memory regions, then apply an exact replay seed.
+pub fn seed_replay_state_for_prepared<'ctx>(
+    state: &mut SymState<'ctx>,
+    prepared: &SsaArtifact,
+    seed: &ReplaySeed,
+) -> Result<(), PreparedReplaySeedError> {
+    // Bind first so a rejected register contract leaves the state untouched.
+    let registers = bind_prepared_replay_registers(prepared, seed)?;
+    seed_memory_regions_for_prepared(state, prepared);
+    apply_bound_prepared_replay(state, seed, registers);
+    Ok(())
+}
+
+fn apply_bound_prepared_replay<'ctx>(
+    state: &mut SymState<'ctx>,
+    seed: &ReplaySeed,
+    registers: PreparedReplayRegisters<'_>,
+) {
+    if let Some(entry_pc) = seed.entry_pc {
+        state.set_static_execution_pc(entry_pc);
+    }
+    for register in registers.concrete {
+        state.set_concrete(&register.state_key, register.value, register.bits);
+    }
+    apply_replay_memory_and_policy(state, seed);
+    for overlay in registers.symbolic {
+        state.make_symbolic_named(&overlay.state_key, overlay.symbol, overlay.bits);
+    }
+}
+
+/// Apply replay input using advisory register names and architecture widths.
+///
+/// This compatibility API is for manual/unprepared callers only. Exact engine
+/// requests must use [`seed_replay_state_for_prepared`] or
+/// [`apply_replay_seed_to_prepared`].
 pub fn seed_replay_state_for_arch<'ctx>(
     state: &mut SymState<'ctx>,
     prepared: Option<&SsaArtifact>,
@@ -201,6 +420,11 @@ pub fn seed_replay_state_for_arch<'ctx>(
     apply_replay_seed_to_state(state, prepared, arch, seed);
 }
 
+/// Legacy advisory/manual replay projection from register spellings.
+///
+/// Passing a prepared artifact here only improves presentation-name matching;
+/// it does not make this API source-owned. Exact engine paths must use
+/// [`apply_replay_seed_to_prepared`].
 pub fn apply_replay_seed_to_state<'ctx>(
     state: &mut SymState<'ctx>,
     prepared: Option<&SsaArtifact>,
@@ -224,6 +448,22 @@ pub fn apply_replay_seed_to_state<'ctx>(
         state.set_concrete(&seed_name, register.value, bits);
     }
 
+    apply_replay_memory_and_policy(state, seed);
+
+    for overlay in &seed.register_overlays {
+        let (seed_name, bits) = register_layout
+            .resolve_register(&overlay.name)
+            .unwrap_or_else(|| {
+                (
+                    overlay.name.to_ascii_uppercase(),
+                    default_register_bits(arch),
+                )
+            });
+        state.make_symbolic_named(&seed_name, &overlay.symbol, bits);
+    }
+}
+
+fn apply_replay_memory_and_policy<'ctx>(state: &mut SymState<'ctx>, seed: &ReplaySeed) {
     for (index, window) in seed.memory.iter().enumerate() {
         if window.bytes.is_empty() {
             continue;
@@ -240,18 +480,6 @@ pub fn apply_replay_seed_to_state<'ctx>(
             Some(window.bytes.len() as u64),
         );
         state.seed_region_bytes(region_id, 0, &window.bytes);
-    }
-
-    for overlay in &seed.register_overlays {
-        let (seed_name, bits) = register_layout
-            .resolve_register(&overlay.name)
-            .unwrap_or_else(|| {
-                (
-                    overlay.name.to_ascii_uppercase(),
-                    default_register_bits(arch),
-                )
-            });
-        state.make_symbolic_named(&seed_name, &overlay.symbol, bits);
     }
 
     for overlay in &seed.memory_overlays {
@@ -600,7 +828,47 @@ fn parse_numbered_x86_register_alias(base: &str) -> Option<RegisterAliasSpec> {
 mod tests {
     use super::*;
     use crate::value::SymValue;
+    use r2il::{AddressSpace, ArchSpec, R2ILBlock, R2ILOp, RegisterDef, Varnode};
+    use r2ssa::{SourceAbiParameterSpec, SourceFunctionInterface, SourceFunctionReturn};
     use z3::Context;
+
+    fn exact_replay_artifact() -> SsaArtifact {
+        let mut arch = ArchSpec::new("x86-64");
+        arch.addr_size = 8;
+        arch.add_space(AddressSpace::ram(8));
+        arch.add_register(RegisterDef::new("ACC", 0, 8));
+        arch.add_register(RegisterDef::new("ACC32", 0, 4));
+        arch.add_register(RegisterDef::new("IDX", 8, 8));
+        arch.add_register(RegisterDef::new("UNUSED", 16, 8));
+
+        let mut block = R2ILBlock::new(0x1000, 1);
+        block.push(R2ILOp::Copy {
+            dst: Varnode::unique(0x10, 8),
+            src: Varnode::register(0, 8),
+        });
+        block.push(R2ILOp::Copy {
+            dst: Varnode::unique(0x18, 8),
+            src: Varnode::register(8, 8),
+        });
+        block.push(R2ILOp::Return {
+            target: Varnode::constant(0, 8),
+        });
+        let acc = CanonicalStorageId {
+            space: CanonicalStorageSpace::Register,
+            offset: 0,
+            size: 8,
+        };
+        let interface = SourceFunctionInterface::new_exact(
+            b"r2sym-exact-replay".to_vec(),
+            "sysv",
+            [SourceAbiParameterSpec::new(0, acc)],
+            SourceFunctionReturn::Void,
+            [],
+        )
+        .expect("exact replay interface");
+        SsaArtifact::for_symbolic_with_interface(&[block], Some(&arch), interface)
+            .expect("exact replay artifact")
+    }
 
     #[test]
     fn replay_seed_imports_replay_regions_and_symbolic_overlays() {
@@ -746,5 +1014,93 @@ mod tests {
             stable_replay_seed_fingerprint(&base),
             stable_replay_seed_fingerprint(&different)
         );
+    }
+
+    #[test]
+    fn prepared_replay_binds_source_storage_before_state_projection() {
+        let prepared = exact_replay_artifact();
+        let ctx = Context::thread_local();
+        let mut state = SymState::new(&ctx, 0x1000);
+        let seed = ReplaySeed {
+            registers: vec![ReplayRegisterValue {
+                name: "acc".to_string(),
+                value: 0x1122,
+            }],
+            register_overlays: vec![ReplayRegisterOverlay {
+                name: "idx".to_string(),
+                symbol: "replay_idx".to_string(),
+            }],
+            ..ReplaySeed::default()
+        };
+
+        apply_replay_seed_to_prepared(&mut state, &prepared, &seed)
+            .expect("source-owned replay binding");
+
+        assert_eq!(state.get_register("ACC_0").as_concrete(), Some(0x1122));
+        assert!(state.get_register("IDX_0").is_symbolic());
+    }
+
+    #[test]
+    fn prepared_replay_refuses_unknown_and_overlapping_register_inputs_atomically() {
+        let prepared = exact_replay_artifact();
+        let ctx = Context::thread_local();
+        let mut state = SymState::new(&ctx, 0x1000);
+        let unknown = ReplaySeed {
+            entry_pc: Some(0x2000),
+            registers: vec![ReplayRegisterValue {
+                name: "RAX".to_string(),
+                value: 1,
+            }],
+            ..ReplaySeed::default()
+        };
+        assert!(matches!(
+            apply_replay_seed_to_prepared(&mut state, &prepared, &unknown),
+            Err(PreparedReplaySeedError::UnknownRegister(name)) if name == "RAX"
+        ));
+        assert_eq!(state.pc(), 0x1000);
+
+        let overlapping = ReplaySeed {
+            registers: vec![
+                ReplayRegisterValue {
+                    name: "ACC".to_string(),
+                    value: 1,
+                },
+                ReplayRegisterValue {
+                    name: "ACC32".to_string(),
+                    value: 2,
+                },
+            ],
+            ..ReplaySeed::default()
+        };
+        assert!(matches!(
+            apply_replay_seed_to_prepared(&mut state, &prepared, &overlapping),
+            Err(PreparedReplaySeedError::ConflictingRegisterLocation { .. })
+        ));
+        assert!(state.registers().is_empty());
+    }
+
+    #[test]
+    fn prepared_replay_refuses_source_storage_without_an_entry_value() {
+        let prepared = exact_replay_artifact();
+        let ctx = Context::thread_local();
+        let mut state = SymState::new(&ctx, 0x1000);
+        let seed = ReplaySeed {
+            register_overlays: vec![ReplayRegisterOverlay {
+                name: "UNUSED".to_string(),
+                symbol: "must_not_exist".to_string(),
+            }],
+            ..ReplaySeed::default()
+        };
+        let unused = CanonicalStorageId {
+            space: CanonicalStorageSpace::Register,
+            offset: 16,
+            size: 8,
+        };
+
+        assert_eq!(
+            apply_replay_seed_to_prepared(&mut state, &prepared, &seed),
+            Err(PreparedReplaySeedError::MissingEntryValue(unused))
+        );
+        assert!(state.registers().is_empty());
     }
 }

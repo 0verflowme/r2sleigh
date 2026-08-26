@@ -22,6 +22,12 @@ use serde::{Deserialize, Serialize};
 
 mod route;
 
+pub use r2dec::{
+    BindingMachineProjectionFailure, BindingObservationAudit, BindingObservationDomainAudit,
+    BindingObservationJournalFailure, BindingShadowAuditFailure, BindingShadowAuditLedger,
+    BindingShadowAuditOutcome, BindingShadowDomainAudit, DecompileRenderRefusal,
+    EffectObligationAudit, EffectObligationDisposition, PlacementAudit, PlacementAuditRefusal,
+};
 pub use route::{
     DecompileProbeDecision, EngineDiagnostics, EngineFunctionIdentity, EnginePlan,
     EngineRequestKind, EngineRequestPlan, EngineRouteContext, EngineRouteDecision,
@@ -31,13 +37,6 @@ pub use route::{
     semantic_or_cfg_prefers_bounded_type_plan, should_guard_program_orchestrator_decompile,
     should_use_prepared_semantic_view, type_cfg_allows_semantic_plan, type_cfg_bounded_reason,
     type_cfg_forces_bounded_plan, type_cfg_prefers_bounded_plan, type_route_decision,
-};
-pub use r2dec::{
-    BindingMachineProjectionFailure, BindingObservationAudit, BindingObservationDomainAudit,
-    BindingObservationJournalFailure, BindingShadowAuditFailure, BindingShadowAuditLedger,
-    BindingShadowAuditOutcome, BindingShadowDomainAudit, EffectObligationAudit,
-    EffectObligationDisposition, DecompileRenderRefusal, PlacementAudit,
-    PlacementAuditRefusal,
 };
 #[cfg(test)]
 use route::{decompile_probe_decision, plan_decompile_request, semantic_route_reason};
@@ -2084,8 +2083,8 @@ where
         // is presentation metadata, so exact planning refuses this role.
         let registration_target = false;
 
-        let runtime_copy_target = semantic_summary
-            .is_some_and(r2sym::semantic_summary_has_runtime_copy_role);
+        let runtime_copy_target =
+            semantic_summary.is_some_and(r2sym::semantic_summary_has_runtime_copy_role);
         if runtime_copy_target {
             runtime_copy_targets.insert(direct_target);
         }
@@ -3709,6 +3708,36 @@ pub struct EngineSymbolicContextRequest<'ctx, 'a> {
     pub seed: EngineSymbolicStateSeed<'a>,
 }
 
+/// Typed refusal/stop boundary shared by symbolic engine requests.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EngineSymbolicRequestError {
+    ExecutionStopped(r2sym::SymExecutionStopReason),
+    ReplaySeed(r2sym::PreparedReplaySeedError),
+}
+
+impl std::fmt::Display for EngineSymbolicRequestError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ExecutionStopped(reason) => reason.fmt(formatter),
+            Self::ReplaySeed(reason) => reason.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for EngineSymbolicRequestError {}
+
+impl From<r2sym::SymExecutionStopReason> for EngineSymbolicRequestError {
+    fn from(reason: r2sym::SymExecutionStopReason) -> Self {
+        Self::ExecutionStopped(reason)
+    }
+}
+
+impl From<r2sym::PreparedReplaySeedError> for EngineSymbolicRequestError {
+    fn from(reason: r2sym::PreparedReplaySeedError) -> Self {
+        Self::ReplaySeed(reason)
+    }
+}
+
 pub struct EngineSymbolicSummaryRequest<'ctx, 'a> {
     pub context: EngineSymbolicContextRequest<'ctx, 'a>,
     pub compile_semantics: bool,
@@ -3780,6 +3809,7 @@ pub struct EngineRunSpecResponse<'ctx> {
 pub enum EngineSymbolicRunError {
     InvalidSpec(String),
     ExecutionStopped(r2sym::SymExecutionStopReason),
+    ReplaySeed(r2sym::PreparedReplaySeedError),
 }
 
 impl std::fmt::Display for EngineSymbolicRunError {
@@ -3787,6 +3817,7 @@ impl std::fmt::Display for EngineSymbolicRunError {
         match self {
             Self::InvalidSpec(reason) => formatter.write_str(reason),
             Self::ExecutionStopped(reason) => reason.fmt(formatter),
+            Self::ReplaySeed(reason) => reason.fmt(formatter),
         }
     }
 }
@@ -4659,7 +4690,8 @@ impl EngineSession {
         metrics.planning_time += planning_time;
         metrics.render_time = render_time;
         let rendering_stopped = rendered.stopped.is_some();
-        let (output, binding_audit, effect_obligations, placement_audit, render_refusal) = rendered.product.finalize();
+        let (output, binding_audit, effect_obligations, placement_audit, render_refusal) =
+            rendered.product.finalize();
         if !rendering_stopped && let Some(reason) = placement_refusal_reason(placement_audit) {
             metrics.record_phase(
                 EnginePhase::Rendering,
@@ -4699,7 +4731,9 @@ impl EngineSession {
                 Some(refusal),
             );
         }
-        if !rendering_stopped && let Some(reason) = effect_obligation_refusal_reason(effect_obligations) {
+        if !rendering_stopped
+            && let Some(reason) = effect_obligation_refusal_reason(effect_obligations)
+        {
             metrics.record_phase(
                 EnginePhase::Rendering,
                 EnginePhaseStatus::Refused,
@@ -4750,18 +4784,19 @@ impl EngineSession {
     pub fn symbolic_summary<'ctx>(
         &self,
         request: EngineSymbolicSummaryRequest<'ctx, '_>,
-    ) -> EngineSymbolicSummaryResponse<'ctx> {
+    ) -> Result<EngineSymbolicSummaryResponse<'ctx>, EngineSymbolicRequestError> {
         self.symbolic_summary_with_execution_control(request, EngineExecutionControl::default())
-            .expect("default symbolic execution control cannot stop")
     }
 
     pub fn symbolic_summary_with_execution_control<'ctx>(
         &self,
         request: EngineSymbolicSummaryRequest<'ctx, '_>,
         execution: EngineExecutionControl,
-    ) -> Result<EngineSymbolicSummaryResponse<'ctx>, r2sym::SymExecutionStopReason> {
+    ) -> Result<EngineSymbolicSummaryResponse<'ctx>, EngineSymbolicRequestError> {
         let symbolic_execution = execution.symbolic_execution_control();
-        symbolic_execution.poll()?;
+        symbolic_execution
+            .poll()
+            .map_err(EngineSymbolicRequestError::ExecutionStopped)?;
         let context = request.context;
         let (assumption_usage, assumption_conditioned) =
             prepared_assumption_conditioning(context.prepared);
@@ -4775,12 +4810,14 @@ impl EngineSession {
                 query_config.summary_profile,
             )
         });
-        symbolic_execution.poll()?;
+        symbolic_execution
+            .poll()
+            .map_err(EngineSymbolicRequestError::ExecutionStopped)?;
         if compiled
             .as_ref()
             .is_some_and(should_skip_expensive_symbolic_summary)
         {
-            let initial_state = symbolic_initial_state(&context);
+            let initial_state = symbolic_initial_state(&context)?;
             let query_policy = symbolic_query_policy_for_state(
                 &mut query_config,
                 context.prepared,
@@ -4796,7 +4833,7 @@ impl EngineSession {
             });
         }
 
-        let initial_state = symbolic_initial_state(&context);
+        let initial_state = symbolic_initial_state(&context)?;
         let query_policy = symbolic_query_policy_for_state(
             &mut query_config,
             context.prepared,
@@ -4815,30 +4852,31 @@ impl EngineSession {
                 assumption_usage,
                 assumption_conditioned,
             }),
-            Err,
+            |reason| Err(EngineSymbolicRequestError::ExecutionStopped(reason)),
         )
     }
 
     pub fn symbolic_paths<'ctx>(
         &self,
         request: EngineSymbolicPathsRequest<'ctx, '_>,
-    ) -> EngineSymbolicPathsResponse<'ctx> {
+    ) -> Result<EngineSymbolicPathsResponse<'ctx>, EngineSymbolicRequestError> {
         self.symbolic_paths_with_execution_control(request, EngineExecutionControl::default())
-            .expect("default symbolic execution control cannot stop")
     }
 
     pub fn symbolic_paths_with_execution_control<'ctx>(
         &self,
         request: EngineSymbolicPathsRequest<'ctx, '_>,
         execution: EngineExecutionControl,
-    ) -> Result<EngineSymbolicPathsResponse<'ctx>, r2sym::SymExecutionStopReason> {
+    ) -> Result<EngineSymbolicPathsResponse<'ctx>, EngineSymbolicRequestError> {
         let symbolic_execution = execution.symbolic_execution_control();
-        symbolic_execution.poll()?;
+        symbolic_execution
+            .poll()
+            .map_err(EngineSymbolicRequestError::ExecutionStopped)?;
         let context = request.context;
         let (assumption_usage, assumption_conditioned) =
             prepared_assumption_conditioning(context.prepared);
         let mut query_config = symbolic_query_config_for_context(&context);
-        let initial_state = symbolic_initial_state(&context);
+        let initial_state = symbolic_initial_state(&context)?;
         let query_policy = symbolic_query_policy_for_state(
             &mut query_config,
             context.prepared,
@@ -4859,28 +4897,29 @@ impl EngineSession {
                 assumption_usage,
                 assumption_conditioned,
             }),
-            Err,
+            |reason| Err(EngineSymbolicRequestError::ExecutionStopped(reason)),
         )
     }
 
     pub fn symbolic_target_explore<'ctx>(
         &self,
         request: EngineTargetExploreRequest<'ctx, '_>,
-    ) -> EngineTargetExploreResponse<'ctx> {
+    ) -> Result<EngineTargetExploreResponse<'ctx>, EngineSymbolicRequestError> {
         self.symbolic_target_explore_with_execution_control(
             request,
             EngineExecutionControl::default(),
         )
-        .expect("default symbolic execution control cannot stop")
     }
 
     pub fn symbolic_target_explore_with_execution_control<'ctx>(
         &self,
         request: EngineTargetExploreRequest<'ctx, '_>,
         execution: EngineExecutionControl,
-    ) -> Result<EngineTargetExploreResponse<'ctx>, r2sym::SymExecutionStopReason> {
+    ) -> Result<EngineTargetExploreResponse<'ctx>, EngineSymbolicRequestError> {
         let symbolic_execution = execution.symbolic_execution_control();
-        symbolic_execution.poll()?;
+        symbolic_execution
+            .poll()
+            .map_err(EngineSymbolicRequestError::ExecutionStopped)?;
         let context = request.context;
         let mut query_config = symbolic_query_config_for_context(&context);
         let scope = symbolic_scope_for_context(&context);
@@ -4891,8 +4930,10 @@ impl EngineSession {
             request.target_addr,
             query_config.summary_profile,
         );
-        symbolic_execution.poll()?;
-        let initial_state = symbolic_initial_state(&context);
+        symbolic_execution
+            .poll()
+            .map_err(EngineSymbolicRequestError::ExecutionStopped)?;
+        let initial_state = symbolic_initial_state(&context)?;
         let selected_route = target_query_route_decision(TargetQueryRouteInput {
             z3_ctx: context.z3_ctx,
             compiled: &compiled,
@@ -4930,28 +4971,29 @@ impl EngineSession {
                 selected_route,
                 query_policy,
             }),
-            Err,
+            |reason| Err(EngineSymbolicRequestError::ExecutionStopped(reason)),
         )
     }
 
     pub fn symbolic_target_solve<'ctx>(
         &self,
         request: EngineTargetSolveRequest<'ctx, '_>,
-    ) -> EngineTargetSolveResponse<'ctx> {
+    ) -> Result<EngineTargetSolveResponse<'ctx>, EngineSymbolicRequestError> {
         self.symbolic_target_solve_with_execution_control(
             request,
             EngineExecutionControl::default(),
         )
-        .expect("default symbolic execution control cannot stop")
     }
 
     pub fn symbolic_target_solve_with_execution_control<'ctx>(
         &self,
         request: EngineTargetSolveRequest<'ctx, '_>,
         execution: EngineExecutionControl,
-    ) -> Result<EngineTargetSolveResponse<'ctx>, r2sym::SymExecutionStopReason> {
+    ) -> Result<EngineTargetSolveResponse<'ctx>, EngineSymbolicRequestError> {
         let symbolic_execution = execution.symbolic_execution_control();
-        symbolic_execution.poll()?;
+        symbolic_execution
+            .poll()
+            .map_err(EngineSymbolicRequestError::ExecutionStopped)?;
         let context = request.context;
         let mut query_config = symbolic_query_config_for_context(&context);
         let scope = symbolic_scope_for_context(&context);
@@ -4962,8 +5004,10 @@ impl EngineSession {
             request.target_addr,
             query_config.summary_profile,
         );
-        symbolic_execution.poll()?;
-        let initial_state = symbolic_initial_state(&context);
+        symbolic_execution
+            .poll()
+            .map_err(EngineSymbolicRequestError::ExecutionStopped)?;
+        let initial_state = symbolic_initial_state(&context)?;
         let selected_route = target_query_route_decision(TargetQueryRouteInput {
             z3_ctx: context.z3_ctx,
             compiled: &compiled,
@@ -5001,16 +5045,15 @@ impl EngineSession {
                 selected_route,
                 query_policy,
             }),
-            Err,
+            |reason| Err(EngineSymbolicRequestError::ExecutionStopped(reason)),
         )
     }
 
     pub fn symbolic_run_spec<'ctx>(
         &self,
         request: EngineRunSpecRequest<'ctx, '_>,
-    ) -> Result<EngineRunSpecResponse<'ctx>, String> {
+    ) -> Result<EngineRunSpecResponse<'ctx>, EngineSymbolicRunError> {
         self.symbolic_run_spec_with_execution_control(request, EngineExecutionControl::default())
-            .map_err(|error| error.to_string())
     }
 
     pub fn symbolic_run_spec_with_execution_control<'ctx>(
@@ -5030,7 +5073,8 @@ impl EngineSession {
             .spec
             .start_pc(context.seed.entry_addr())
             .map_err(EngineSymbolicRunError::InvalidSpec)?;
-        let mut initial_state = symbolic_initial_state_at(&context, start_pc);
+        let mut initial_state = symbolic_initial_state_at(&context, start_pc)
+            .map_err(EngineSymbolicRunError::ReplaySeed)?;
         request.spec.apply_to_state(&mut initial_state);
         let query_policy = symbolic_query_policy_for_state(
             &mut query_config,
@@ -5183,14 +5227,15 @@ fn symbolic_scope_for_context<'a>(
 
 fn symbolic_initial_state<'ctx>(
     context: &EngineSymbolicContextRequest<'ctx, '_>,
-) -> r2sym::SymState<'ctx> {
+) -> Result<r2sym::SymState<'ctx>, EngineSymbolicRequestError> {
     symbolic_initial_state_at(context, context.seed.display_entry_addr())
+        .map_err(EngineSymbolicRequestError::ReplaySeed)
 }
 
 fn symbolic_initial_state_at<'ctx>(
     context: &EngineSymbolicContextRequest<'ctx, '_>,
     entry_addr: u64,
-) -> r2sym::SymState<'ctx> {
+) -> Result<r2sym::SymState<'ctx>, r2sym::PreparedReplaySeedError> {
     let mut initial_state = r2sym::SymState::new(context.z3_ctx, entry_addr);
     match context.seed {
         EngineSymbolicStateSeed::Default { .. } => {
@@ -5211,20 +5256,14 @@ fn symbolic_initial_state_at<'ctx>(
             }
         }
         EngineSymbolicStateSeed::Replay { seed, .. } => {
-            if r2sym::seed_default_state_for_prepared(
+            r2sym::seed_replay_state_for_prepared(
                 &mut initial_state,
                 context.prepared.as_ref(),
-            ) {
-                r2sym::apply_replay_seed_to_state(
-                    &mut initial_state,
-                    Some(context.prepared.as_ref()),
-                    None,
-                    seed,
-                );
-            }
+                seed,
+            )?;
         }
     }
-    initial_state
+    Ok(initial_state)
 }
 
 fn install_symbolic_hooks_for_context<'ctx>(
@@ -5262,12 +5301,13 @@ fn effect_obligation_refusal_reason(audit: EffectObligationAudit) -> Option<Stri
     (matches!(audit.disposition, EffectObligationDisposition::Refused)
         || audit.refused != 0
         || audit.unaccounted != 0
-        || audit.conflicts != 0).then(|| {
-        format!(
-            "native effect obligations refused: {} refused, {} unaccounted, {} conflicts",
-            audit.refused, audit.unaccounted, audit.conflicts
-        )
-    })
+        || audit.conflicts != 0)
+        .then(|| {
+            format!(
+                "native effect obligations refused: {} refused, {} unaccounted, {} conflicts",
+                audit.refused, audit.unaccounted, audit.conflicts
+            )
+        })
 }
 
 fn placement_refusal_reason(audit: PlacementAudit) -> Option<String> {
@@ -5389,14 +5429,26 @@ impl EngineRenderedProduct {
                 effect_obligations,
                 placement_audit,
                 render_refusal,
-            } => (output, binding_audit, effect_obligations, placement_audit, render_refusal),
+            } => (
+                output,
+                binding_audit,
+                effect_obligations,
+                placement_audit,
+                render_refusal,
+            ),
             Self::Pending(pending) => {
                 let audited = pending.finalize();
                 let binding_audit = audited.binding_shadow();
                 let effect_obligations = audited.effect_obligations();
                 let placement_audit = audited.placement_audit();
                 let render_refusal = audited.render_refusal();
-                (audited.into_output(), binding_audit, effect_obligations, placement_audit, render_refusal)
+                (
+                    audited.into_output(),
+                    binding_audit,
+                    effect_obligations,
+                    placement_audit,
+                    render_refusal,
+                )
             }
         }
     }
@@ -5586,12 +5638,14 @@ fn render_engine_decompile_request<C: r2ssa::SsaWorkControl>(
                         PlacementAudit::NotRun,
                         None,
                     ),
-                    |audit| (
-                        audit.binding_shadow(),
-                        audit.effect_obligations(),
-                        audit.placement_audit(),
-                        audit.render_refusal(),
-                    ),
+                    |audit| {
+                        (
+                            audit.binding_shadow(),
+                            audit.effect_obligations(),
+                            audit.placement_audit(),
+                            audit.render_refusal(),
+                        )
+                    },
                 );
             return Err(engine_render_stop_from_decompiler(
                 stop,
@@ -7111,17 +7165,16 @@ mod tests {
         for (name, offset) in [("rax", 0), ("rsp", 0x28), ("rip", 0x30)] {
             let storage = r2il::RegisterStorage { offset, size: 8 };
             arch.add_register(r2il::RegisterDef::new(name, offset, 8));
-            arch.register_projections
-                .push(r2il::RegisterProjection {
-                    written: storage,
-                    disposition: r2il::RegisterProjectionDisposition::Bound {
-                        carrier: storage,
-                        slice: r2il::RegisterBitSlice {
-                            lsb_bit_offset: 0,
-                            size_bits: 64,
-                        },
+            arch.register_projections.push(r2il::RegisterProjection {
+                written: storage,
+                disposition: r2il::RegisterProjectionDisposition::Bound {
+                    carrier: storage,
+                    slice: r2il::RegisterBitSlice {
+                        lsb_bit_offset: 0,
+                        size_bits: 64,
                     },
-                });
+                },
+            });
         }
         arch
     }
@@ -7894,33 +7947,32 @@ mod tests {
         let call_site_interfaces = calls
             .iter()
             .map(
-            |&(block_addr, op_index, target, argument_count, complete, convention)| {
-                r2ssa::SourceCallSiteInterface::new(
-                    revision_identity.clone(),
-                    r2ssa::SourceCallSiteIdentity::new(
-                        block_addr,
-                        op_index,
-                        r2ssa::CanonicalStorageId {
-                            space: r2ssa::CanonicalStorageSpace::Constant,
-                            offset: target,
-                            size: 8,
-                        },
-                    ),
-                    complete,
-                    convention,
-                    argument_offsets[..argument_count]
-                        .iter()
-                        .enumerate()
-                        .map(|(index, offset)| {
-                            r2ssa::SourceCallArgumentSpec::new(index as u32, register(*offset))
-                        }),
-                    false,
-                    false,
-                    r2ssa::SourceCallResult::Void,
-                )
-                .expect("exact runtime callsite interface")
-            },
-        )
+                |&(block_addr, op_index, target, argument_count, complete, convention)| {
+                    r2ssa::SourceCallSiteInterface::new(
+                        revision_identity.clone(),
+                        r2ssa::SourceCallSiteIdentity::new(
+                            block_addr,
+                            op_index,
+                            r2ssa::CanonicalStorageId {
+                                space: r2ssa::CanonicalStorageSpace::Constant,
+                                offset: target,
+                                size: 8,
+                            },
+                        ),
+                        complete,
+                        convention,
+                        argument_offsets[..argument_count].iter().enumerate().map(
+                            |(index, offset)| {
+                                r2ssa::SourceCallArgumentSpec::new(index as u32, register(*offset))
+                            },
+                        ),
+                        false,
+                        false,
+                        r2ssa::SourceCallResult::Void,
+                    )
+                    .expect("exact runtime callsite interface")
+                },
+            )
             .collect::<Vec<_>>();
         Arc::new(
             EngineSourceSnapshot::new(
@@ -7976,16 +8028,27 @@ mod tests {
         vec![block, fallthrough, target]
     }
 
+    fn symbolic_register_branch_arch() -> r2il::ArchSpec {
+        let mut arch = r2il::ArchSpec::new("symbolic-assumption-test");
+        arch.addr_size = 8;
+        arch.add_register(r2il::RegisterDef::new("QUERY_ARG", 0x38, 8));
+        arch.add_register(r2il::RegisterDef::new("QUERY_PREDICATE", 0x80, 1));
+        arch
+    }
+
     fn symbolic_register_assumption(prepared: &r2ssa::SsaArtifact) -> r2ssa::AnalysisAssumption {
-        let reg_name = prepared
+        let storage = prepared
             .graph()
             .values
             .iter()
             .find(|value| value.var.version == 0 && value.var.is_register() && value.var.size == 8)
             .expect("version-zero input register")
-            .var
-            .name
-            .clone();
+            .canonical_storage
+            .expect("input register has exact storage");
+        let reg_name = prepared
+            .machine_context()
+            .register_name(storage)
+            .expect("source register map names the input storage");
         r2ssa::AnalysisAssumption {
             id: Some("force-input-register".to_string()),
             subject: r2ssa::AssumptionSubject::Register { name: reg_name },
@@ -8570,8 +8633,7 @@ mod tests {
             "the completed native render must retain its exact effect audit"
         );
         assert_eq!(
-            controlled.render_refusal,
-            None,
+            controlled.render_refusal, None,
             "the exact fixture must not cross a renderer refusal boundary"
         );
         let completed_binding_audit = controlled.binding_audit;
@@ -8671,7 +8733,11 @@ mod tests {
                     "the stopped render retains the partial output it reached"
                 );
                 assert!(
-                    response.diagnostics.refusal.as_deref().is_some_and(|value| value.contains(&expected_reason)),
+                    response
+                        .diagnostics
+                        .refusal
+                        .as_deref()
+                        .is_some_and(|value| value.contains(&expected_reason)),
                     "the execution stop must remain the response refusal: {}",
                     response.output
                 );
@@ -8824,10 +8890,21 @@ mod tests {
         );
 
         assert_eq!(response.effect_obligations, effect_obligations);
-        assert_eq!(response.metrics.phase_timings[EnginePhase::Rendering as usize].status,
-            EnginePhaseStatus::Refused);
-        assert_eq!(response.diagnostics.route_reason.as_deref(), Some(reason.as_str()));
-        assert!(response.diagnostics.refusal.as_deref().is_some_and(|value| value.contains(&reason)));
+        assert_eq!(
+            response.metrics.phase_timings[EnginePhase::Rendering as usize].status,
+            EnginePhaseStatus::Refused
+        );
+        assert_eq!(
+            response.diagnostics.route_reason.as_deref(),
+            Some(reason.as_str())
+        );
+        assert!(
+            response
+                .diagnostics
+                .refusal
+                .as_deref()
+                .is_some_and(|value| value.contains(&reason))
+        );
         assert!(response.output.starts_with("/* r2dec fallback:"));
         assert!(effect_obligation_refusal_reason(EffectObligationAudit::NOT_RUN).is_none());
         assert_eq!(
@@ -8835,26 +8912,29 @@ mod tests {
             Some(&sentinel_quality),
             "late effect refusal replaces only the route and retains existing function facts"
         );
-        assert!(effect_obligation_refusal_reason(EffectObligationAudit {
-            disposition: EffectObligationDisposition::Admitted,
-            total: 1,
-            rendered: 0,
-            justified_elision: 0,
-            refused: 1,
-            unaccounted: 0,
-            conflicts: 0,
-        }).is_some(), "nonzero refusal counts fail closed independently of disposition");
+        assert!(
+            effect_obligation_refusal_reason(EffectObligationAudit {
+                disposition: EffectObligationDisposition::Admitted,
+                total: 1,
+                rendered: 0,
+                justified_elision: 0,
+                refused: 1,
+                unaccounted: 0,
+                conflicts: 0,
+            })
+            .is_some(),
+            "nonzero refusal counts fail closed independently of disposition"
+        );
     }
 
     #[test]
     fn refused_placement_produces_a_typed_engine_refusal() {
-        let placement_audit = PlacementAudit::Refused(
-            PlacementAuditRefusal::ReadBeforeAssignment {
+        let placement_audit =
+            PlacementAudit::Refused(PlacementAuditRefusal::ReadBeforeAssignment {
                 binding_index: 3,
                 instruction_id: 11,
                 input_index: 2,
-            },
-        );
+            });
         let reason = placement_refusal_reason(placement_audit)
             .expect("refused placement must refuse the native engine outcome");
         let mut metrics = EngineMetrics::default();
@@ -8881,12 +8961,17 @@ mod tests {
             response.metrics.phase_timings[EnginePhase::Rendering as usize].status,
             EnginePhaseStatus::Refused,
         );
-        assert_eq!(response.diagnostics.route_reason.as_deref(), Some(reason.as_str()));
-        assert!(response
-            .diagnostics
-            .refusal
-            .as_deref()
-            .is_some_and(|value| value.contains(&reason)));
+        assert_eq!(
+            response.diagnostics.route_reason.as_deref(),
+            Some(reason.as_str())
+        );
+        assert!(
+            response
+                .diagnostics
+                .refusal
+                .as_deref()
+                .is_some_and(|value| value.contains(&reason))
+        );
         assert!(response.output.starts_with("/* r2dec fallback:"));
         assert!(placement_refusal_reason(PlacementAudit::Applied).is_none());
         assert!(placement_refusal_reason(PlacementAudit::NotRun).is_none());
@@ -8918,10 +9003,18 @@ mod tests {
 
         assert_eq!(response.render_refusal, Some(render_refusal));
         assert_eq!(response.effect_obligations, EffectObligationAudit::NOT_RUN);
-        assert_eq!(response.metrics.phase_timings[EnginePhase::Rendering as usize].status,
-            EnginePhaseStatus::Refused);
+        assert_eq!(
+            response.metrics.phase_timings[EnginePhase::Rendering as usize].status,
+            EnginePhaseStatus::Refused
+        );
         assert_eq!(response.diagnostics.route_reason.as_deref(), Some(reason));
-        assert!(response.diagnostics.refusal.as_deref().is_some_and(|value| value.contains(reason)));
+        assert!(
+            response
+                .diagnostics
+                .refusal
+                .as_deref()
+                .is_some_and(|value| value.contains(reason))
+        );
         assert!(response.output.starts_with("/* r2dec fallback:"));
         assert!(!response.output.contains("() {"));
     }
@@ -10144,8 +10237,7 @@ mod tests {
         )
         .expect("incomplete-callsite analysis");
         assert!(
-            interproc_runtime_registration_targets(&incomplete_analysis, &[0x1800_1000])
-                .is_empty(),
+            interproc_runtime_registration_targets(&incomplete_analysis, &[0x1800_1000]).is_empty(),
             "an incomplete callsite must refuse otherwise exact arguments"
         );
 
@@ -10162,11 +10254,8 @@ mod tests {
         )
         .expect("unknown-callsite-ABI analysis");
         assert!(
-            interproc_runtime_registration_targets(
-                &unknown_callsite_abi_analysis,
-                &[0x1800_1000]
-            )
-            .is_empty(),
+            interproc_runtime_registration_targets(&unknown_callsite_abi_analysis, &[0x1800_1000])
+                .is_empty(),
             "an unknown callsite ABI must not inherit the function ABI"
         );
 
@@ -11234,7 +11323,7 @@ mod tests {
             },
         };
 
-        let state = symbolic_initial_state(&context);
+        let state = symbolic_initial_state(&context).expect("exact scope seed");
         let register = |prefix: &str| {
             state
                 .registers()
@@ -11257,12 +11346,50 @@ mod tests {
             "the spelling main must not authorize synthetic argv construction"
         );
 
+        let rejected_replay = r2sym::ReplaySeed {
+            registers: vec![r2sym::ReplayRegisterValue {
+                name: "UNDECLARED_REGISTER".to_string(),
+                value: 0xdead_beef,
+            }],
+            ..r2sym::ReplaySeed::default()
+        };
+        let replay_context = EngineSymbolicContextRequest {
+            z3_ctx: &z3_ctx,
+            prepared: &prepared,
+            scope: Some(&scope),
+            arch: Some(&arch),
+            symbols: &symbols,
+            merge_states: false,
+            config_profile: EngineSymbolicConfigProfile::DefaultQuery,
+            seed: EngineSymbolicStateSeed::Replay {
+                entry_addr: prepared.entry,
+                seed: &rejected_replay,
+            },
+        };
+        assert!(matches!(
+            symbolic_initial_state(&replay_context),
+            Err(EngineSymbolicRequestError::ReplaySeed(
+                r2sym::PreparedReplaySeedError::UnknownRegister(name)
+            )) if name == "UNDECLARED_REGISTER"
+        ));
+
+        let replay_request = EngineSymbolicPathsRequest {
+            context: replay_context,
+        };
+        assert!(matches!(
+            EngineSession::new().symbolic_paths(replay_request),
+            Err(EngineSymbolicRequestError::ReplaySeed(
+                r2sym::PreparedReplaySeedError::UnknownRegister(name)
+            )) if name == "UNDECLARED_REGISTER"
+        ));
+
         let missing_scope_context = EngineSymbolicContextRequest {
             scope: None,
             ..context
         };
         assert!(
             symbolic_initial_state(&missing_scope_context)
+                .expect("missing exact scope leaves an empty state")
                 .registers()
                 .is_empty(),
             "a scope seed without exact scope authority must refuse rather than fall back to architecture seeding"
@@ -11286,20 +11413,22 @@ mod tests {
         let symbols = r2sym::FunctionSymbolSnapshot::default();
         let session = EngineSession::new();
 
-        let response = session.symbolic_paths(EngineSymbolicPathsRequest {
-            context: EngineSymbolicContextRequest {
-                z3_ctx: &z3_ctx,
-                prepared: &prepared,
-                scope: Some(&scope),
-                arch: None,
-                symbols: &symbols,
-                merge_states: false,
-                config_profile: EngineSymbolicConfigProfile::PathListing,
-                seed: EngineSymbolicStateSeed::Default {
-                    entry_addr: 0x401000,
+        let response = session
+            .symbolic_paths(EngineSymbolicPathsRequest {
+                context: EngineSymbolicContextRequest {
+                    z3_ctx: &z3_ctx,
+                    prepared: &prepared,
+                    scope: Some(&scope),
+                    arch: None,
+                    symbols: &symbols,
+                    merge_states: false,
+                    config_profile: EngineSymbolicConfigProfile::PathListing,
+                    seed: EngineSymbolicStateSeed::Default {
+                        entry_addr: 0x401000,
+                    },
                 },
-            },
-        });
+            })
+            .expect("symbolic paths");
 
         assert_eq!(
             response.query_policy.route,
@@ -11341,14 +11470,18 @@ mod tests {
 
         assert!(matches!(
             result,
-            Err(r2sym::SymExecutionStopReason::Cancelled)
+            Err(EngineSymbolicRequestError::ExecutionStopped(
+                r2sym::SymExecutionStopReason::Cancelled
+            ))
         ));
     }
 
     #[test]
     fn engine_conditions_symbolic_scope_with_root_assumptions() {
         let blocks = symbolic_register_branch_blocks(0x501000);
-        let prepared = Arc::new(r2ssa::SsaArtifact::for_symbolic(&blocks, None).expect("prepared"));
+        let arch = symbolic_register_branch_arch();
+        let prepared =
+            Arc::new(r2ssa::SsaArtifact::for_symbolic(&blocks, Some(&arch)).expect("prepared"));
         let scope = r2sym::PreparedFunctionScope::new(
             0x501000,
             vec![r2sym::ScopedPreparedFunction {
@@ -11431,7 +11564,9 @@ mod tests {
     #[test]
     fn symbolic_summary_reports_prepared_assumption_usage() {
         let blocks = symbolic_register_branch_blocks(0x502000);
-        let prepared = Arc::new(r2ssa::SsaArtifact::for_symbolic(&blocks, None).expect("prepared"));
+        let arch = symbolic_register_branch_arch();
+        let prepared =
+            Arc::new(r2ssa::SsaArtifact::for_symbolic(&blocks, Some(&arch)).expect("prepared"));
         let scope = r2sym::PreparedFunctionScope::new(
             0x502000,
             vec![r2sym::ScopedPreparedFunction {
@@ -11449,21 +11584,23 @@ mod tests {
         let symbols = r2sym::FunctionSymbolSnapshot::default();
         let session = EngineSession::new();
 
-        let response = session.symbolic_summary(EngineSymbolicSummaryRequest {
-            context: EngineSymbolicContextRequest {
-                z3_ctx: &z3_ctx,
-                prepared: &conditioned.prepared,
-                scope: Some(&conditioned.scope),
-                arch: None,
-                symbols: &symbols,
-                merge_states: false,
-                config_profile: EngineSymbolicConfigProfile::PathListing,
-                seed: EngineSymbolicStateSeed::Scope {
-                    entry_addr: 0x502000,
+        let response = session
+            .symbolic_summary(EngineSymbolicSummaryRequest {
+                context: EngineSymbolicContextRequest {
+                    z3_ctx: &z3_ctx,
+                    prepared: &conditioned.prepared,
+                    scope: Some(&conditioned.scope),
+                    arch: None,
+                    symbols: &symbols,
+                    merge_states: false,
+                    config_profile: EngineSymbolicConfigProfile::PathListing,
+                    seed: EngineSymbolicStateSeed::Scope {
+                        entry_addr: 0x502000,
+                    },
                 },
-            },
-            compile_semantics: false,
-        });
+                compile_semantics: false,
+            })
+            .expect("symbolic summary");
 
         assert!(response.assumption_conditioned);
         assert_eq!(response.assumption_usage.applied, vec![assumption]);

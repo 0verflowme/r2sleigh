@@ -3,7 +3,10 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::rc::Rc;
 
 use r2ssa::graph::{InstPayload, ValueId};
-use r2ssa::{CallSiteId, PredicateId, SsaArtifact};
+use r2ssa::{
+    CallBoundarySlot, CallSiteId, CanonicalStorageSpace, PredicateId, SourceCallArgumentValue,
+    SsaArtifact,
+};
 use serde::{Deserialize, Serialize};
 use z3::Context;
 use z3::ast::{Ast, BV, Bool};
@@ -413,16 +416,21 @@ impl<'a, 'ctx> ValueTranslator<'a, 'ctx> {
             return Err(EvalUnsupported::Cycle);
         }
 
-        let var = self
+        let graph_value = self
             .func
-            .value_var(value_id)
+            .graph()
+            .value(value_id)
             .ok_or(EvalUnsupported::Unsupported)?;
-        let result = if var.is_const() {
-            eval_const_var(var)
-        } else if let Some(hex) = var.name.strip_prefix("ram:") {
-            u64::from_str_radix(hex, 16)
-                .map(|value| SymValue::concrete(value, var.size * 8))
-                .map_err(|_| EvalUnsupported::Unsupported)
+        let var = &graph_value.var;
+        let literal = graph_value.canonical_storage.filter(|storage| {
+            storage.size == var.size
+                && matches!(
+                    storage.space,
+                    CanonicalStorageSpace::Constant | CanonicalStorageSpace::Ram
+                )
+        });
+        let result = if let Some(storage) = literal {
+            Ok(SymValue::concrete(storage.offset, var.size * 8))
         } else if let Some(inst_id) = self.func.graph().def_inst(value_id) {
             let inst = self
                 .func
@@ -448,8 +456,10 @@ impl<'a, 'ctx> ValueTranslator<'a, 'ctx> {
                         .ok_or(EvalUnsupported::Unsupported)?;
                     let phi = block
                         .phis
-                        .iter()
-                        .find(|phi| phi.dst == *var)
+                        .get(inst.ordinal)
+                        .filter(|phi| {
+                            self.func.graph().value_id_for_var(&phi.dst) == Some(value_id)
+                        })
                         .ok_or(EvalUnsupported::Unsupported)?;
                     let source = phi
                         .sources
@@ -483,7 +493,7 @@ impl<'a, 'ctx> ValueTranslator<'a, 'ctx> {
             let value = self.eval_value_id(value_id)?;
             Ok(adjust_bits(self.state.context(), value, var.size * 8))
         } else {
-            Ok(read_input_var(self.state, var))
+            Err(EvalUnsupported::Unsupported)
         }
     }
 
@@ -666,17 +676,19 @@ impl<'a, 'ctx> ValueTranslator<'a, 'ctx> {
         let Some(call_ctx) = self.call_context_for_inst(inst_id, block_addr) else {
             return Err(EvalUnsupported::Unsupported);
         };
-        let is_result = if let Some(result_storage) = call_ctx.callconv.result_storage() {
-            self.func.graph().canonical_storage_for_var(dst) == Some(result_storage)
-        } else {
+        let is_result = if call_ctx.callconv.is_source_owned() {
             call_ctx
                 .callconv
-                .ret_register_name()
-                .is_some_and(|name| {
-                    register_aliases(name)
-                        .iter()
-                        .any(|alias| dst.name.eq_ignore_ascii_case(alias))
+                .result_storage()
+                .is_some_and(|result_storage| {
+                    self.func.graph().canonical_storage_for_var(dst) == Some(result_storage)
                 })
+        } else {
+            call_ctx.callconv.ret_register_name().is_some_and(|name| {
+                register_aliases(name)
+                    .iter()
+                    .any(|alias| dst.name.eq_ignore_ascii_case(alias))
+            })
         };
         if !is_result {
             return Err(EvalUnsupported::Unsupported);
@@ -694,7 +706,9 @@ impl<'a, 'ctx> ValueTranslator<'a, 'ctx> {
         block_addr: u64,
     ) -> Option<&CallTransformContext<'ctx>> {
         let (inst_block_addr, op_idx) = self.func.inst_op_site(inst_id)?;
-        debug_assert_eq!(inst_block_addr, block_addr);
+        if inst_block_addr != block_addr {
+            return None;
+        }
         self.func.get_block(block_addr)?;
         for scan_idx in (0..op_idx).rev() {
             let scan_inst = self
@@ -1781,7 +1795,10 @@ fn build_call_transform_contexts<'ctx>(
     }
 
     let sequence = path_block_sequence(path);
-    let mut arg_state = BTreeMap::<usize, ValueId>::new();
+    // This map is retained only for explicitly advisory/manual call
+    // conventions. Source-owned summaries consume the sealed call-boundary
+    // facts below and never classify an SSA variable by spelling.
+    let mut advisory_arg_state = BTreeMap::<usize, ValueId>::new();
     let mut contexts = HashMap::new();
 
     for (seq_index, block_addr) in sequence.iter().enumerate() {
@@ -1791,12 +1808,12 @@ fn build_call_transform_contexts<'ctx>(
         if seq_index > 0 {
             let predecessor = sequence[seq_index - 1];
             for phi in &block.phis {
-                if let Some(arg_index) = ssa_call_arg_slot_index(&phi.dst)
+                if let Some(arg_index) = advisory_ssa_call_arg_slot_index(&phi.dst)
                     && let Some((_, source)) =
                         phi.sources.iter().find(|(pred, _)| *pred == predecessor)
                     && let Some(value_id) = func.graph().value_id_for_var(source)
                 {
-                    arg_state.insert(arg_index, value_id);
+                    advisory_arg_state.insert(arg_index, value_id);
                 }
             }
         }
@@ -1818,26 +1835,44 @@ fn build_call_transform_contexts<'ctx>(
                     &path.phi_predecessors,
                     &context_snapshot,
                 );
-                let args = (0..view.callconv.arg_capacity())
-                    .map(|index| {
-                        arg_state
-                            .get(&index)
-                            .copied()
-                            .and_then(|value_id| translator.eval_value_id(value_id).ok())
-                            .unwrap_or_else(|| {
-                                view.callconv
-                                    .arg_register_name(index)
-                                    .map(|reg| {
-                                        read_register_from_state(
-                                            initial_state,
-                                            reg,
-                                            view.callconv.arg_bits(),
-                                        )
+                let args = if view.callconv.is_source_owned() {
+                    exact_source_call_arguments(
+                        func,
+                        initial_state,
+                        call_id,
+                        callsite.at,
+                        view,
+                        &mut translator,
+                    )
+                } else {
+                    Some(
+                        (0..view.callconv.arg_capacity())
+                            .map(|index| {
+                                advisory_arg_state
+                                    .get(&index)
+                                    .copied()
+                                    .and_then(|value_id| translator.eval_value_id(value_id).ok())
+                                    .unwrap_or_else(|| {
+                                        view.callconv
+                                            .arg_register_name(index)
+                                            .map(|reg| {
+                                                read_register_from_state(
+                                                    initial_state,
+                                                    reg,
+                                                    view.callconv.arg_bits(),
+                                                )
+                                            })
+                                            .unwrap_or_else(|| {
+                                                SymValue::unknown(view.callconv.arg_bits())
+                                            })
                                     })
-                                    .unwrap_or_else(|| SymValue::unknown(view.callconv.arg_bits()))
                             })
-                    })
-                    .collect::<Vec<_>>();
+                            .collect::<Vec<_>>(),
+                    )
+                };
+                let Some(args) = args else {
+                    continue;
+                };
                 contexts.insert(
                     call_id,
                     CallTransformContext {
@@ -1849,15 +1884,66 @@ fn build_call_transform_contexts<'ctx>(
             }
 
             if let Some(dst) = op.dst()
-                && let Some(arg_index) = ssa_call_arg_slot_index(dst)
+                && let Some(arg_index) = advisory_ssa_call_arg_slot_index(dst)
                 && let Some(value_id) = func.graph().value_id_for_var(dst)
             {
-                arg_state.insert(arg_index, value_id);
+                advisory_arg_state.insert(arg_index, value_id);
             }
         }
     }
 
     contexts
+}
+
+fn exact_source_call_arguments<'ctx>(
+    func: &SsaArtifact,
+    initial_state: &SymState<'ctx>,
+    call_id: CallSiteId,
+    call_inst: r2ssa::graph::InstId,
+    view: &DerivedCallSummaryView<'ctx>,
+    translator: &mut ValueTranslator<'_, 'ctx>,
+) -> Option<Vec<SymValue<'ctx>>> {
+    let boundary = func.facts().boundaries.calls.get(&call_id)?;
+    if !boundary.complete || boundary.call_site != call_id || boundary.at != call_inst {
+        return None;
+    }
+
+    let mut by_index = BTreeMap::new();
+    for argument in &boundary.arguments {
+        let CallBoundarySlot::Register { index, storage } = argument.slot else {
+            // Stack arguments need an exact memory-boundary projection; a
+            // register CallConv cannot silently reinterpret them.
+            return None;
+        };
+        let index = usize::try_from(index).ok()?;
+        if view.callconv.argument_storage(index) != Some(storage) {
+            return None;
+        }
+        let value = match argument.value {
+            SourceCallArgumentValue::Value(value_id) => {
+                let graph_value = func.graph().value(value_id)?;
+                if graph_value.canonical_storage != Some(storage) {
+                    return None;
+                }
+                translator.eval_value_id(value_id).ok()?
+            }
+            SourceCallArgumentValue::PreservedEntry => {
+                view.callconv.read_argument(initial_state, index)?
+            }
+        };
+        if value.is_unknown() {
+            return None;
+        }
+        if by_index.insert(index, value).is_some() {
+            return None;
+        }
+    }
+    if by_index.keys().copied().ne(0..by_index.len())
+        || by_index.len() < view.summary.arg_count_hint
+    {
+        return None;
+    }
+    Some(by_index.into_values().collect())
 }
 
 fn path_block_sequence(path: &ReversePath) -> Vec<u64> {
@@ -1893,25 +1979,11 @@ fn or_all(_ctx: &Context, terms: &[Bool]) -> Bool {
     }
 }
 
-fn eval_const_var<'ctx>(var: &r2ssa::SSAVar) -> Result<SymValue<'ctx>, EvalUnsupported> {
-    if let Some(hex) = var.name.strip_prefix("const:") {
-        u64::from_str_radix(hex, 16)
-            .map(|value| SymValue::concrete(value, var.size * 8))
-            .map_err(|_| EvalUnsupported::Unsupported)
-    } else {
-        Err(EvalUnsupported::Unsupported)
-    }
-}
-
 fn read_input_var<'ctx>(state: &SymState<'ctx>, var: &r2ssa::SSAVar) -> SymValue<'ctx> {
-    let key = var.display_name();
-    let value = state.get_register_sized(&key, var.size * 8);
-    if value.is_unknown() && var.version == 0 {
-        let base = var.name.strip_prefix("reg:").unwrap_or(&var.name);
-        state.get_register_sized(&base.to_ascii_uppercase(), var.size * 8)
-    } else {
-        value
-    }
+    // The caller reached this variable through its authoritative ValueId.
+    // `display_name` is only the symbolic state's presentation key; no lookup
+    // or alias decision is made from it here.
+    state.get_register_sized(&var.display_name(), var.size * 8)
 }
 
 fn value_to_bool(ctx: &Context, value: &SymValue<'_>) -> Bool {
@@ -2330,7 +2402,7 @@ fn is_specific_memory_location(location: &NormalizedMemoryLocation) -> bool {
     )
 }
 
-fn ssa_call_arg_slot_index(var: &r2ssa::SSAVar) -> Option<usize> {
+fn advisory_ssa_call_arg_slot_index(var: &r2ssa::SSAVar) -> Option<usize> {
     ssa_register_arg_index(var)
 }
 
@@ -2489,10 +2561,11 @@ fn adjust_bits<'ctx>(ctx: &'ctx Context, value: SymValue<'ctx>, bits: u32) -> Sy
 
 #[cfg(test)]
 mod tests {
-    use r2il::{ArchSpec, R2ILBlock, R2ILOp, RegisterDef, SpaceId, Varnode};
+    use r2il::{AddressSpace, ArchSpec, R2ILBlock, R2ILOp, RegisterDef, SpaceId, Varnode};
     use r2ssa::{
-        CanonicalStorageId, CanonicalStorageSpace, SourceAbiParameterSpec,
-        SourceFunctionInterface, SourceFunctionReturn,
+        CanonicalStorageId, CanonicalStorageSpace, SourceAbiParameterSpec, SourceCallArgumentSpec,
+        SourceCallResult, SourceCallSiteIdentity, SourceCallSiteInterface, SourceFunctionInterface,
+        SourceFunctionReturn,
     };
     use z3::Context;
 
@@ -2514,6 +2587,88 @@ mod tests {
             size,
             meta: None,
         }
+    }
+
+    fn exact_call_boundary_artifact(include_call_interface: bool) -> SsaArtifact {
+        let mut arch = ArchSpec::new("x86-64");
+        arch.addr_size = 8;
+        arch.add_space(AddressSpace::ram(8));
+        arch.add_register(RegisterDef::new("ARG_A", 0x20, 8));
+        arch.add_register(RegisterDef::new("ARG_B", 0x28, 8));
+        arch.add_register(RegisterDef::new("SP", 0x30, 8));
+        arch.add_register(RegisterDef::new("RA", 0x38, 8));
+
+        let arg_a = CanonicalStorageId {
+            space: CanonicalStorageSpace::Register,
+            offset: 0x20,
+            size: 8,
+        };
+        let arg_b = CanonicalStorageId {
+            space: CanonicalStorageSpace::Register,
+            offset: 0x28,
+            size: 8,
+        };
+        let stack_pointer = CanonicalStorageId {
+            space: CanonicalStorageSpace::Register,
+            offset: 0x30,
+            size: 8,
+        };
+        let return_address = CanonicalStorageId {
+            space: CanonicalStorageSpace::Register,
+            offset: 0x38,
+            size: 8,
+        };
+        let target = Varnode::constant(0x2000, 8);
+        let mut block = R2ILBlock::new(0x1000, 4);
+        block.push(R2ILOp::Call {
+            target: target.clone(),
+        });
+        block.push(R2ILOp::Return {
+            target: Varnode::constant(0, 8),
+        });
+        let interface = SourceFunctionInterface::new_exact(
+            b"r2sym-exact-backward-call".to_vec(),
+            "sysv",
+            [
+                SourceAbiParameterSpec::new(0, arg_a),
+                SourceAbiParameterSpec::new(1, arg_b),
+            ],
+            SourceFunctionReturn::Void,
+            [],
+        )
+        .and_then(|interface| interface.with_stack_pointer_storage(stack_pointer))
+        .and_then(|interface| interface.with_return_address_storage(return_address))
+        .expect("exact caller interface");
+        let call_interfaces = include_call_interface
+            .then(|| {
+                SourceCallSiteInterface::new(
+                    b"r2sym-exact-backward-call".to_vec(),
+                    SourceCallSiteIdentity::new(
+                        0x1000,
+                        0,
+                        CanonicalStorageId::from_varnode(&target),
+                    ),
+                    true,
+                    "sysv",
+                    [
+                        SourceCallArgumentSpec::new(0, arg_a),
+                        SourceCallArgumentSpec::new(1, arg_b),
+                    ],
+                    false,
+                    false,
+                    SourceCallResult::Void,
+                )
+                .expect("exact callsite interface")
+            })
+            .into_iter()
+            .collect::<Vec<_>>();
+        SsaArtifact::for_decompile_with_interfaces(
+            &[block],
+            Some(&arch),
+            Some(interface),
+            call_interfaces,
+        )
+        .expect("exact backward call artifact")
     }
 
     #[test]
@@ -2697,18 +2852,108 @@ mod tests {
     }
 
     #[test]
-    fn ssa_call_arg_slot_index_tracks_written_abi_registers() {
+    fn advisory_ssa_call_arg_slot_index_tracks_written_abi_registers() {
         assert_eq!(
-            ssa_call_arg_slot_index(&r2ssa::SSAVar::new("RDI", 1, 8)),
+            advisory_ssa_call_arg_slot_index(&r2ssa::SSAVar::new("RDI", 1, 8)),
             Some(0)
         );
         assert_eq!(
-            ssa_call_arg_slot_index(&r2ssa::SSAVar::new("EDX", 3, 4)),
+            advisory_ssa_call_arg_slot_index(&r2ssa::SSAVar::new("EDX", 3, 4)),
             Some(2)
         );
         assert_eq!(
-            ssa_call_arg_slot_index(&r2ssa::SSAVar::new("RAX", 1, 8)),
+            advisory_ssa_call_arg_slot_index(&r2ssa::SSAVar::new("RAX", 1, 8)),
             None
+        );
+    }
+
+    #[test]
+    fn exact_backward_call_arguments_use_sealed_storage_boundary_not_register_names() {
+        let func = exact_call_boundary_artifact(true);
+        let (&call_id, callsite) = func.call_sites().by_id.iter().next().expect("callsite");
+        let callconv = CallConv::for_prepared(&func).expect("source-owned callconv");
+        let ctx = Context::thread_local();
+        let mut state = SymState::new(&ctx, func.entry);
+        state.set_concrete("ARG_A_0", 0x11, 64);
+        state.set_concrete("ARG_B_0", 0x22, 64);
+        let view = DerivedCallSummaryView {
+            summary: Rc::new(DerivedFunctionSummary {
+                id: r2ssa::InterprocFunctionId(0x2000),
+                name: None,
+                arg_count_hint: 2,
+                arg_symbols: Vec::new(),
+                memory_inputs: Vec::new(),
+                cases: Vec::new(),
+                completion: crate::sim::DerivedSummaryCompletion::Exact,
+            }),
+            callconv,
+        };
+        let memory_index = BackwardMemoryIndex::new(&func);
+        let phi_predecessors = BTreeMap::new();
+        let call_contexts = HashMap::new();
+        let mut translator = ValueTranslator::new(
+            &func,
+            &state,
+            &memory_index,
+            &phi_predecessors,
+            &call_contexts,
+        );
+
+        let args = exact_source_call_arguments(
+            &func,
+            &state,
+            call_id,
+            callsite.at,
+            &view,
+            &mut translator,
+        )
+        .expect("sealed source call arguments");
+
+        assert_eq!(args.len(), 2);
+        assert_eq!(args[0].as_concrete(), Some(0x11));
+        assert_eq!(args[1].as_concrete(), Some(0x22));
+    }
+
+    #[test]
+    fn exact_backward_call_arguments_refuse_incomplete_source_boundary() {
+        let func = exact_call_boundary_artifact(false);
+        let (&call_id, callsite) = func.call_sites().by_id.iter().next().expect("callsite");
+        let callconv = CallConv::for_prepared(&func).expect("source-owned callconv");
+        let ctx = Context::thread_local();
+        let state = SymState::new(&ctx, func.entry);
+        let view = DerivedCallSummaryView {
+            summary: Rc::new(DerivedFunctionSummary {
+                id: r2ssa::InterprocFunctionId(0x2000),
+                name: None,
+                arg_count_hint: 2,
+                arg_symbols: Vec::new(),
+                memory_inputs: Vec::new(),
+                cases: Vec::new(),
+                completion: crate::sim::DerivedSummaryCompletion::Exact,
+            }),
+            callconv,
+        };
+        let memory_index = BackwardMemoryIndex::new(&func);
+        let phi_predecessors = BTreeMap::new();
+        let call_contexts = HashMap::new();
+        let mut translator = ValueTranslator::new(
+            &func,
+            &state,
+            &memory_index,
+            &phi_predecessors,
+            &call_contexts,
+        );
+
+        assert!(
+            exact_source_call_arguments(
+                &func,
+                &state,
+                call_id,
+                callsite.at,
+                &view,
+                &mut translator,
+            )
+            .is_none()
         );
     }
 

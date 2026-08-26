@@ -346,7 +346,7 @@ impl CallConv {
         SymValue::unknown(self.arg_bits)
     }
 
-    fn read_argument<'ctx>(
+    pub(crate) fn read_argument<'ctx>(
         &self,
         state: &SymState<'ctx>,
         index: usize,
@@ -367,11 +367,7 @@ impl CallConv {
         }
     }
 
-    fn argument_state_key<'ctx>(
-        &self,
-        state: &SymState<'ctx>,
-        index: usize,
-    ) -> Option<String> {
+    fn argument_state_key<'ctx>(&self, state: &SymState<'ctx>, index: usize) -> Option<String> {
         match &self.registers {
             CallConvRegisters::AdvisoryNames { argument_names, .. } => {
                 let name = argument_names.get(index)?;
@@ -446,9 +442,9 @@ impl CallConv {
                 argument_storages,
                 register_storages_by_name,
                 ..
-            } => argument_storages.get(index).and_then(|storage| {
-                source_presentation_name(register_storages_by_name, *storage)
-            }),
+            } => argument_storages
+                .get(index)
+                .and_then(|storage| source_presentation_name(register_storages_by_name, *storage)),
         }
     }
 
@@ -456,8 +452,7 @@ impl CallConv {
         match &self.registers {
             CallConvRegisters::AdvisoryNames { argument_names, .. } => argument_names.len(),
             CallConvRegisters::SourceOwned {
-                argument_storages,
-                ..
+                argument_storages, ..
             } => argument_storages.len(),
         }
     }
@@ -509,8 +504,7 @@ impl CallConv {
         match &self.registers {
             CallConvRegisters::AdvisoryNames { .. } => None,
             CallConvRegisters::SourceOwned {
-                argument_storages,
-                ..
+                argument_storages, ..
             } => argument_storages.get(index).copied(),
         }
     }
@@ -533,7 +527,7 @@ impl CallConv {
         }
     }
 
-    fn is_source_owned(&self) -> bool {
+    pub(crate) fn is_source_owned(&self) -> bool {
         matches!(&self.registers, CallConvRegisters::SourceOwned { .. })
     }
 }
@@ -574,7 +568,9 @@ fn source_state_key<'ctx>(
             let right_version = split_version(right)
                 .map(|(_, version)| version)
                 .unwrap_or(0);
-            left_version.cmp(&right_version).then_with(|| left.cmp(right))
+            left_version
+                .cmp(&right_version)
+                .then_with(|| left.cmp(right))
         })
 }
 
@@ -870,9 +866,7 @@ fn scope_helper_is_source_coherent(
     let source_owned = root.prepared.provenance_kind() != SsaArtifactProvenanceKind::Manual
         || helper.prepared.provenance_kind() != SsaArtifactProvenanceKind::Manual;
     if source_owned {
-        if root_abi_class == r2ssa::SourceAbiClass::Unknown
-            || root_abi_class != helper_abi_class
-        {
+        if root_abi_class == r2ssa::SourceAbiClass::Unknown || root_abi_class != helper_abi_class {
             return false;
         }
         let Some(root_callconv) = CallConv::for_prepared(&root.prepared) else {
@@ -1064,7 +1058,10 @@ impl<'ctx> SummaryRegistry<'ctx> {
         prepared: &SsaArtifact,
         profile: SummaryProfile,
     ) -> Option<Self> {
-        Some(Self::with_profile(CallConv::for_prepared(prepared)?, profile))
+        Some(Self::with_profile(
+            CallConv::for_prepared(prepared)?,
+            profile,
+        ))
     }
 
     /// Create a registry using symbol-map environment hints when the architecture is ambiguous.
@@ -1913,8 +1910,7 @@ fn function_defines_return_value(function: &ScopedPreparedFunction, callconv: &C
         return function.prepared.blocks().any(|block| {
             block.ops.iter().any(|op| {
                 op.dst().is_some_and(|dst| {
-                    function.prepared.graph().canonical_storage_for_var(dst)
-                        == Some(result_storage)
+                    function.prepared.graph().canonical_storage_for_var(dst) == Some(result_storage)
                 })
             })
         });
@@ -3984,11 +3980,8 @@ mod tests {
         assert_eq!(callconv.argument_storage(0), Some(argument));
         assert_eq!(callconv.result_storage(), Some(result));
         assert!(
-            SummaryRegistry::with_profile_for_prepared(
-                &prepared,
-                SummaryProfile::PathListing,
-            )
-            .is_some()
+            SummaryRegistry::with_profile_for_prepared(&prepared, SummaryProfile::PathListing,)
+                .is_some()
         );
     }
 
@@ -4014,11 +4007,17 @@ mod tests {
 
         callconv.write_return(&mut state, SymValue::concrete(0x55, 64));
         assert_eq!(
-            state.registers().get("RAX_4").and_then(SymValue::as_concrete),
+            state
+                .registers()
+                .get("RAX_4")
+                .and_then(SymValue::as_concrete),
             Some(0x55)
         );
         assert_eq!(
-            state.registers().get("EAX_9").and_then(SymValue::as_concrete),
+            state
+                .registers()
+                .get("EAX_9")
+                .and_then(SymValue::as_concrete),
             Some(0x22)
         );
     }

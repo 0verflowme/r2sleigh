@@ -108,9 +108,9 @@ pub use query::{
 };
 pub use r2api::{R2Api, R2Error};
 pub use replay::{
-    ReplayMemoryOverlay, ReplayMemoryWindow, ReplayRegisterOverlay, ReplayRegisterValue,
-    ReplaySeed, apply_replay_seed_to_state, seed_replay_state_for_arch,
-    stable_replay_seed_fingerprint,
+    PreparedReplaySeedError, ReplayMemoryOverlay, ReplayMemoryWindow, ReplayRegisterOverlay,
+    ReplayRegisterValue, ReplaySeed, apply_replay_seed_to_prepared, apply_replay_seed_to_state,
+    seed_replay_state_for_arch, seed_replay_state_for_prepared, stable_replay_seed_fingerprint,
 };
 pub use runtime::{
     install_runtime_hooks_for_arch_advisory, install_runtime_hooks_for_scope,
