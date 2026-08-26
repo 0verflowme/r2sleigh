@@ -717,7 +717,7 @@ fn prepare_stmt_sequence_for_emission(stmts: &[CStmt]) -> Vec<CStmt> {
 fn prepare_stmt_for_emission(stmt: &CStmt) -> CStmt {
     match stmt {
         CStmt::StructuredRegion { marker, stmt } => {
-            CStmt::structured_region(*marker, prepare_stmt_for_emission(stmt.as_ref()))
+            CStmt::structured_region(marker.clone(), prepare_stmt_for_emission(stmt.as_ref()))
         }
         CStmt::Observed { id, stmt } => {
             CStmt::observed(*id, prepare_stmt_for_emission(stmt.as_ref()))

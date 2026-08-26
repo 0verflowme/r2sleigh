@@ -694,6 +694,13 @@ fn region_marker_refusal(
         Error::MissingMarker { region } => Refusal::RegionMarkerMissing {
             region_index: region.index(),
         },
+        Error::ParentMismatch { region } => Refusal::RegionMarkerParentMismatch {
+            region_index: region.index(),
+        },
+        Error::OutOfOrder { region, expected } => Refusal::RegionMarkerOutOfOrder {
+            region_index: region.index(),
+            expected_region_index: expected.index(),
+        },
     }
 }
 
@@ -748,6 +755,9 @@ fn placement_refusal(
             binding_index: binding.index(),
             value_id: value.0,
             instruction_id: at.0,
+        },
+        Private::UnprovableExecutionOrder { binding } => Public::UnprovableExecutionOrder {
+            binding_index: binding.index(),
         },
     }
 }
@@ -808,6 +818,11 @@ fn placement_analysis_refusal(
         Error::UnscopedObservation { observation } => Refusal::UnscopedObservation {
             observation_id: observation.index(),
         },
+        Error::AmbiguousExecutionOrder { observation } => {
+            Refusal::AmbiguousObservationExecutionOrder {
+                observation_id: observation.index(),
+            }
+        }
         Error::UnauthorizedProgramVariable { symbol } => {
             Refusal::UnauthorizedProgramVariable {
                 symbol_index: symbol.index(),

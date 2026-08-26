@@ -203,11 +203,20 @@ mod tests {
         blocks: &[R2ILBlock],
         arch: &ArchSpec,
     ) -> SourceOwnedPreparedFixture {
+        prepared_from_r2il_blocks_with_call_arguments(blocks, arch, 0)
+    }
+
+    fn prepared_from_r2il_blocks_with_call_arguments(
+        blocks: &[R2ILBlock],
+        arch: &ArchSpec,
+        call_argument_count: usize,
+    ) -> SourceOwnedPreparedFixture {
         let storage = |offset| r2ssa::CanonicalStorageId {
             space: r2ssa::CanonicalStorageSpace::Register,
             offset,
             size: 8,
         };
+        let revision = b"r2dec-fold-pipeline-source-v1";
         let (calling_convention, parameter_offsets, return_storage, return_address, stack_pointer) =
             if arch.name.eq_ignore_ascii_case("aarch64") {
                 (
@@ -227,14 +236,15 @@ mod tests {
                 )
             };
         let parameters = parameter_offsets
-            .into_iter()
+            .iter()
+            .copied()
             .enumerate()
             .map(|(index, offset)| {
                 r2ssa::SourceAbiParameterSpec::new(index as u32, storage(offset))
             })
             .collect::<Vec<_>>();
         let interface = r2ssa::SourceFunctionInterface::new_exact(
-            b"r2dec-fold-pipeline-source-v1".to_vec(),
+            revision.to_vec(),
             calling_convention,
             parameters,
             r2ssa::SourceFunctionReturn::Register {
@@ -245,9 +255,57 @@ mod tests {
         .and_then(|interface| interface.with_return_address_storage(return_address))
         .and_then(|interface| interface.with_stack_pointer_storage(stack_pointer))
         .expect("exact source interface");
+        assert!(call_argument_count <= parameter_offsets.len());
+        let call_site_interfaces = blocks
+            .iter()
+            .flat_map(|block| {
+                block
+                    .ops
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(op_index, op)| {
+                        let target = match op {
+                            R2ILOp::Call { target } | R2ILOp::CallInd { target } => target,
+                            _ => return None,
+                        };
+                        Some(
+                            r2ssa::SourceCallSiteInterface::new(
+                                revision.to_vec(),
+                                r2ssa::SourceCallSiteIdentity::new(
+                                    block.addr,
+                                    op_index,
+                                    r2ssa::CanonicalStorageId::from_varnode(target),
+                                ),
+                                true,
+                                calling_convention,
+                                parameter_offsets
+                                    .iter()
+                                    .copied()
+                                    .take(call_argument_count)
+                                    .enumerate()
+                                    .map(|(index, offset)| {
+                                        r2ssa::SourceCallArgumentSpec::new(
+                                            index as u32,
+                                            storage(offset),
+                                        )
+                                    }),
+                                false,
+                                false,
+                                r2ssa::SourceCallResult::Void,
+                            )
+                            .expect("exact test callsite interface"),
+                        )
+                    })
+            })
+            .collect();
         source_owned_fixture(
-            r2ssa::SsaArtifact::for_decompile_with_interface(blocks, Some(arch), interface)
-                .expect("prepared SSA should build"),
+            r2ssa::SsaArtifact::for_decompile_with_interfaces(
+                blocks,
+                Some(arch),
+                Some(interface),
+                call_site_interfaces,
+            )
+            .expect("prepared SSA should build"),
         )
     }
 
@@ -1263,11 +1321,13 @@ mod tests {
         } else {
             entry.push(R2ILOp::Call { target });
         }
-        let prepared = prepared_from_r2il_blocks(&[entry], &arch).with_name(if indirect {
-            "observed_indirect_call_target"
-        } else {
-            "observed_direct_call_target"
-        });
+        let prepared = prepared_from_r2il_blocks_with_call_arguments(&[entry], &arch, 1).with_name(
+            if indirect {
+                "observed_indirect_call_target"
+            } else {
+                "observed_direct_call_target"
+            },
+        );
         let block = prepared.function().get_block(0x1000).expect("entry block");
         let op_idx = block
             .ops
@@ -1328,7 +1388,9 @@ mod tests {
         };
         assert!(
             !args.is_empty(),
-            "fixture must render at least one semantic argument"
+            "fixture must render at least one semantic argument: boundary={:?}; certificate={:?}",
+            prepared.facts().boundaries.calls.values().next(),
+            prepared.callsite_certificate_for_op(block.addr, op_idx),
         );
         assert_eq!(*ctx.observation_error.borrow(), None);
         body.push(stmt);
@@ -2381,7 +2443,8 @@ mod tests {
             target: Varnode::unique(1, 8),
         });
 
-        let prepared = prepared_from_r2il_blocks(&[entry], &arch).with_name("certified_call_arg");
+        let prepared = prepared_from_r2il_blocks_with_call_arguments(&[entry], &arch, 1)
+            .with_name("certified_call_arg");
         let mut ctx = make_x86_64_ctx_with_prepared(&prepared);
         install_certified_function_facts(&mut ctx);
         ctx.set_function_names(HashMap::from([(0x401050, "sym.helper".to_string())]));
@@ -2649,8 +2712,8 @@ mod tests {
             target: Varnode::unique(1, 8),
         });
 
-        let prepared =
-            prepared_from_r2il_blocks(&[entry], &arch).with_name("certified_prepared_view_arg");
+        let prepared = prepared_from_r2il_blocks_with_call_arguments(&[entry], &arch, 1)
+            .with_name("certified_prepared_view_arg");
         let arg_value = prepared
             .callsite_certificate_for_op(0x1000, 2)
             .expect("prepared callsite certificate")

@@ -29,6 +29,15 @@ use r2ssa::{InstId, SSAFunction, UseSite};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct FinalOccurrenceOrder(pub(crate) u64);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FinalObservationScope {
+    Exact {
+        region: RegionId,
+        order: FinalOccurrenceOrder,
+    },
+    Ambiguous,
+}
+
 /// One binding read that survived all AST rewriting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct FinalBindingRead {
@@ -133,15 +142,7 @@ pub(crate) fn collect_final_placement_occurrences(
         crate::ast::RenderObservationInspectError::Observer(error) => error,
     })?;
 
-    let mut scoped = vec![None; expected_observations];
-    let mut statement_order = 0_u64;
-    regions.visit_final_scoped_statements(&function.body, |occurrence| {
-        let order = FinalOccurrenceOrder(statement_order);
-        statement_order = statement_order.saturating_add(1);
-        visit_direct_observations(occurrence.stmt(), &mut |id| {
-            scoped[id.index() as usize] = Some((occurrence.region(), order));
-        });
-    });
+    let scoped = collect_final_observation_scopes(&function.body, regions, expected_observations);
 
     for (index, target) in targets.iter().copied().enumerate() {
         if matches!(
@@ -151,11 +152,20 @@ pub(crate) fn collect_final_placement_occurrences(
                     | PlacementObservationTarget::CertifiedValueRead { .. }
                     | PlacementObservationTarget::Write(_)
             )
-        ) && scoped[index].is_none()
-        {
-            return Err(PlacementAnalysisError::UnscopedObservation {
-                observation: RenderObservationId::from_dense_index(index),
-            });
+        ) {
+            match scoped[index] {
+                None => {
+                    return Err(PlacementAnalysisError::UnscopedObservation {
+                        observation: RenderObservationId::from_dense_index(index),
+                    });
+                }
+                Some(FinalObservationScope::Ambiguous) => {
+                    return Err(PlacementAnalysisError::AmbiguousExecutionOrder {
+                        observation: RenderObservationId::from_dense_index(index),
+                    });
+                }
+                Some(FinalObservationScope::Exact { .. }) => {}
+            }
         }
     }
 
@@ -163,7 +173,7 @@ pub(crate) fn collect_final_placement_occurrences(
     let mut reads = Vec::new();
     let mut writes = Vec::new();
     for (index, target) in targets.iter().copied().enumerate() {
-        let Some((region, order)) = scoped[index] else {
+        let Some(FinalObservationScope::Exact { region, order }) = scoped[index] else {
             continue;
         };
         let observation = RenderObservationId::from_dense_index(index);
@@ -279,36 +289,158 @@ fn assigned_symbol(statement: &CStmt) -> Option<crate::symbol::SymbolId> {
     }
 }
 
-fn visit_direct_observations(statement: &CStmt, visit: &mut impl FnMut(RenderObservationId)) {
-    let mut statement = statement;
-    while let CStmt::Observed { id, stmt } = statement {
-        visit(*id);
-        statement = stmt;
+fn collect_final_observation_scopes(
+    statements: &[CStmt],
+    regions: &SealedStructuredRegionArtifact,
+    expected_observations: usize,
+) -> Vec<Option<FinalObservationScope>> {
+    let mut scoped = vec![None; expected_observations];
+    let mut order = 0_u64;
+    for statement in statements {
+        collect_stmt_observation_scopes(statement, None, regions, &mut order, &mut scoped);
     }
-    match statement {
-        CStmt::StructuredRegion { .. } | CStmt::Block(_) => {}
-        CStmt::Expr(expr) | CStmt::Return(Some(expr)) => visit_expr_observations(expr, visit),
+    scoped
+}
+
+fn record_observation_group(
+    ids: &[RenderObservationId],
+    region: Option<RegionId>,
+    ambiguous: bool,
+    order: &mut u64,
+    scoped: &mut [Option<FinalObservationScope>],
+) {
+    let current = FinalOccurrenceOrder(*order);
+    *order = order.saturating_add(1);
+    let Some(region) = region else { return };
+    for id in ids {
+        scoped[id.index() as usize] = Some(if ambiguous {
+            FinalObservationScope::Ambiguous
+        } else {
+            FinalObservationScope::Exact {
+                region,
+                order: current,
+            }
+        });
+    }
+}
+
+fn collect_expr_observation_ids(expr: &CExpr) -> Vec<RenderObservationId> {
+    let mut ids = Vec::new();
+    visit_expr_observations(expr, &mut |id| ids.push(id));
+    ids
+}
+
+fn record_exact_expr_group(
+    expr: &CExpr,
+    leading: &mut Vec<RenderObservationId>,
+    current: Option<RegionId>,
+    order: &mut u64,
+    scoped: &mut [Option<FinalObservationScope>],
+) {
+    let mut ids = std::mem::take(leading);
+    ids.extend(collect_expr_observation_ids(expr));
+    record_observation_group(&ids, current, false, order, scoped);
+}
+
+fn collect_stmt_observation_scopes(
+    statement: &CStmt,
+    current: Option<RegionId>,
+    regions: &SealedStructuredRegionArtifact,
+    order: &mut u64,
+    scoped: &mut [Option<FinalObservationScope>],
+) {
+    if let CStmt::StructuredRegion { marker, stmt } = statement {
+        let (region, _) = regions
+            .node_for_marker(marker)
+            .expect("the final marker tree was validated before scope collection");
+        collect_stmt_observation_scopes(stmt, Some(region), regions, order, scoped);
+        return;
+    }
+    let mut leading = Vec::new();
+    let mut semantic = statement;
+    while let CStmt::Observed { id, stmt } = semantic {
+        leading.push(*id);
+        semantic = stmt;
+    }
+    match semantic {
+        CStmt::StructuredRegion { .. } => {
+            record_observation_group(&leading, current, true, order, scoped);
+            collect_stmt_observation_scopes(semantic, current, regions, order, scoped);
+        }
+        CStmt::Expr(expr) | CStmt::Return(Some(expr)) => {
+            record_exact_expr_group(expr, &mut leading, current, order, scoped);
+        }
         CStmt::Decl { init, .. } => {
             if let Some(init) = init {
-                visit_expr_observations(init, visit);
+                record_exact_expr_group(init, &mut leading, current, order, scoped);
+            } else {
+                record_observation_group(&leading, current, false, order, scoped);
             }
         }
-        CStmt::If { cond, .. } | CStmt::While { cond, .. } => {
-            visit_expr_observations(cond, visit);
+        CStmt::If {
+            cond,
+            then_body,
+            else_body,
+        } => {
+            record_exact_expr_group(cond, &mut leading, current, order, scoped);
+            collect_stmt_observation_scopes(then_body, current, regions, order, scoped);
+            if let Some(else_body) = else_body {
+                collect_stmt_observation_scopes(else_body, current, regions, order, scoped);
+            }
         }
-        CStmt::DoWhile { cond, .. } => visit_expr_observations(cond, visit),
-        CStmt::For { cond, update, .. } => {
+        CStmt::While { cond, body } => {
+            record_exact_expr_group(cond, &mut leading, current, order, scoped);
+            collect_stmt_observation_scopes(body, current, regions, order, scoped);
+        }
+        CStmt::DoWhile { body, cond } => {
+            record_observation_group(&leading, current, true, order, scoped);
+            collect_stmt_observation_scopes(body, current, regions, order, scoped);
+            let ids = collect_expr_observation_ids(cond);
+            record_observation_group(&ids, current, false, order, scoped);
+        }
+        CStmt::For {
+            init,
+            cond,
+            update,
+            body,
+        } => {
+            record_observation_group(&leading, current, true, order, scoped);
+            if let Some(init) = init {
+                collect_stmt_observation_scopes(init, current, regions, order, scoped);
+            }
             if let Some(cond) = cond {
-                visit_expr_observations(cond, visit);
+                let ids = collect_expr_observation_ids(cond);
+                record_observation_group(&ids, current, false, order, scoped);
             }
+            collect_stmt_observation_scopes(body, current, regions, order, scoped);
             if let Some(update) = update {
-                visit_expr_observations(update, visit);
+                let ids = collect_expr_observation_ids(update);
+                record_observation_group(&ids, current, false, order, scoped);
             }
         }
-        CStmt::Switch { expr, cases, .. } => {
-            visit_expr_observations(expr, visit);
+        CStmt::Switch {
+            expr,
+            cases,
+            default,
+        } => {
+            record_exact_expr_group(expr, &mut leading, current, order, scoped);
             for case in cases {
-                visit_expr_observations(&case.value, visit);
+                let ids = collect_expr_observation_ids(&case.value);
+                record_observation_group(&ids, current, true, order, scoped);
+                for statement in &case.body {
+                    collect_stmt_observation_scopes(statement, current, regions, order, scoped);
+                }
+            }
+            if let Some(default) = default {
+                for statement in default {
+                    collect_stmt_observation_scopes(statement, current, regions, order, scoped);
+                }
+            }
+        }
+        CStmt::Block(statements) => {
+            record_observation_group(&leading, current, true, order, scoped);
+            for statement in statements {
+                collect_stmt_observation_scopes(statement, current, regions, order, scoped);
             }
         }
         CStmt::Observed { .. } => unreachable!("leading observations were consumed"),
@@ -318,7 +450,9 @@ fn visit_direct_observations(statement: &CStmt, visit: &mut impl FnMut(RenderObs
         | CStmt::Continue
         | CStmt::Goto(_)
         | CStmt::Label(_)
-        | CStmt::Comment(_) => {}
+        | CStmt::Comment(_) => {
+            record_observation_group(&leading, current, false, order, scoped);
+        }
     }
 }
 
@@ -1042,6 +1176,7 @@ pub(crate) enum PlacementAnalysisError {
     MissingPlannedValue { value: r2ssa::ValueId },
     RefusedPlannedValue { value: r2ssa::ValueId },
     UnscopedObservation { observation: RenderObservationId },
+    AmbiguousExecutionOrder { observation: RenderObservationId },
     UnauthorizedProgramVariable { symbol: crate::symbol::SymbolId },
     UnobservedBindingRead { binding: BindingId },
     UnobservedBindingWrite { binding: BindingId },
@@ -1173,9 +1308,8 @@ fn insert_region_declarations_in_stmt(
     declarations: &[CStmt],
 ) -> usize {
     if let CStmt::StructuredRegion { marker, stmt } = statement {
-        let is_target = marker
-            .emission_anchor()
-            .and_then(|anchor| regions.node_for_anchor(regions.authority(), anchor))
+        let is_target = regions
+            .node_for_marker(marker)
             .is_some_and(|(region, _)| region == target);
         if is_target {
             let semantic = std::mem::replace(stmt.as_mut(), CStmt::Empty);
@@ -1509,6 +1643,13 @@ fn derive_with_cfg<C: PlacementControlFlow + ?Sized>(
             continue;
         }
 
+        if !occurrence_regions_have_proven_order(regions, binding_occurrences) {
+            decisions[binding_index] = Some(PlacementDecision::Refused(
+                PlacementRefusal::UnprovableExecutionOrder { binding },
+            ));
+            continue;
+        }
+
         if let Some(read) =
             first_read_before_assignment(binding, binding_occurrences, &must_in, &block_indices)
         {
@@ -1542,6 +1683,43 @@ fn derive_with_cfg<C: PlacementControlFlow + ?Sized>(
     Ok(PlacementDecisions {
         decisions: decisions.into_boxed_slice(),
     })
+}
+
+fn occurrence_regions_have_proven_order(
+    regions: &SealedStructuredRegionArtifact,
+    occurrences: &[Occurrence],
+) -> bool {
+    let mut by_block = BTreeMap::<u64, BTreeSet<RegionId>>::new();
+    for occurrence in occurrences {
+        by_block
+            .entry(occurrence.block)
+            .or_default()
+            .insert(occurrence.region);
+    }
+    by_block.values().all(|block_regions| {
+        block_regions.iter().all(|left| {
+            block_regions.iter().all(|right| {
+                region_is_ancestor(regions, *left, *right)
+                    || region_is_ancestor(regions, *right, *left)
+            })
+        })
+    })
+}
+
+fn region_is_ancestor(
+    regions: &SealedStructuredRegionArtifact,
+    ancestor: RegionId,
+    mut region: RegionId,
+) -> bool {
+    loop {
+        if region == ancestor {
+            return true;
+        }
+        let Some(parent) = regions.node(region).and_then(|node| node.parent()) else {
+            return false;
+        };
+        region = parent;
+    }
 }
 
 fn validate_occurrence<C: PlacementControlFlow + ?Sized>(
@@ -1658,15 +1836,15 @@ fn first_read_before_assignment(
     must_in: &[DenseBindingSet],
     block_indices: &BTreeMap<u64, usize>,
 ) -> Option<PlacementRead> {
-    let mut by_rendered_block = BTreeMap::<(u64, RegionId), Vec<&Occurrence>>::new();
+    let mut by_rendered_block = BTreeMap::<u64, Vec<&Occurrence>>::new();
     for occurrence in occurrences {
         by_rendered_block
-            .entry((occurrence.block, occurrence.region))
+            .entry(occurrence.block)
             .or_default()
             .push(occurrence);
     }
 
-    for ((block, _region), mut block_occurrences) in by_rendered_block {
+    for (block, mut block_occurrences) in by_rendered_block {
         block_occurrences.sort_by_key(|occurrence| occurrence.sort_key());
         let block_index = block_indices[&block];
         let mut assigned = must_in[block_index].contains(binding);
@@ -2198,5 +2376,53 @@ mod tests {
                 ..
             } if *name == symbol
         ));
+    }
+
+    #[test]
+    fn final_scope_order_matches_do_while_execution() {
+        let body_id = observation(0);
+        let condition_id = observation(1);
+        let sealed = seal_structured_body(CStmt::structured_region(
+            StructuredRegionMarker::unsealed(0x1000, StructuredRegionKind::FunctionBody),
+            CStmt::DoWhile {
+                body: Box::new(CStmt::observed(body_id, CStmt::Empty)),
+                cond: CExpr::observed(condition_id, CExpr::UIntLit(1)),
+            },
+        ))
+        .expect("sealed do-while");
+        let (statement, regions) = sealed.into_marked_parts();
+        let scopes = collect_final_observation_scopes(&[statement], &regions, 2);
+        let order_of = |index| match scopes[index] {
+            Some(FinalObservationScope::Exact { order, .. }) => order,
+            other => panic!("expected exact scope, got {other:?}"),
+        };
+        assert!(order_of(0) < order_of(1));
+    }
+
+    #[test]
+    fn final_scope_order_matches_for_execution_phases() {
+        let init_id = observation(0);
+        let condition_id = observation(1);
+        let body_id = observation(2);
+        let update_id = observation(3);
+        let sealed = seal_structured_body(CStmt::structured_region(
+            StructuredRegionMarker::unsealed(0x1000, StructuredRegionKind::FunctionBody),
+            CStmt::For {
+                init: Some(Box::new(CStmt::observed(init_id, CStmt::Empty))),
+                cond: Some(CExpr::observed(condition_id, CExpr::UIntLit(1))),
+                update: Some(CExpr::observed(update_id, CExpr::UIntLit(0))),
+                body: Box::new(CStmt::observed(body_id, CStmt::Empty)),
+            },
+        ))
+        .expect("sealed for");
+        let (statement, regions) = sealed.into_marked_parts();
+        let scopes = collect_final_observation_scopes(&[statement], &regions, 4);
+        let order_of = |index| match scopes[index] {
+            Some(FinalObservationScope::Exact { order, .. }) => order,
+            other => panic!("expected exact scope, got {other:?}"),
+        };
+        assert!(order_of(0) < order_of(1));
+        assert!(order_of(1) < order_of(2));
+        assert!(order_of(2) < order_of(3));
     }
 }

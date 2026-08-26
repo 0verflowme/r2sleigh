@@ -95,11 +95,12 @@ pub(crate) enum StructuredRegionKind {
 /// tree.  Sealing walks the final tree once in lexical preorder, assigns the
 /// dense anchor, and builds the immutable artifact from that same walk.  The
 /// marker and artifact therefore cannot disagree about occurrence identity.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StructuredRegionMarker {
     entry: u64,
     kind: StructuredRegionKind,
     anchor: Option<RegionEmissionAnchor>,
+    authority: Option<StructuredRegionArtifactAuthority>,
 }
 
 impl StructuredRegionMarker {
@@ -108,11 +109,16 @@ impl StructuredRegionMarker {
             entry,
             kind,
             anchor: None,
+            authority: None,
         }
     }
 
-    pub(crate) const fn emission_anchor(self) -> Option<RegionEmissionAnchor> {
+    pub(crate) const fn emission_anchor(&self) -> Option<RegionEmissionAnchor> {
         self.anchor
+    }
+
+    fn authority(&self) -> Option<&StructuredRegionArtifactAuthority> {
+        self.authority.as_ref()
     }
 }
 
@@ -207,22 +213,6 @@ impl SealedStructuredRegionArtifact {
         self.nodes.get(id.index())
     }
 
-    /// Visit final semantic statements that remain inside this artifact's
-    /// exact markers after function-level late rewrites.
-    ///
-    /// Statements inserted outside the sealed function-body marker are not
-    /// assigned a guessed region. A final occurrence collector can therefore
-    /// reject any source observation that survives outside the callback stream.
-    pub(crate) fn visit_final_scoped_statements(
-        &self,
-        statements: &[CStmt],
-        mut visit: impl FnMut(ScopedStructuredStatement<'_>),
-    ) {
-        for statement in statements {
-            visit_scoped_stmt(statement, None, self, self.authority(), &mut visit);
-        }
-    }
-
     /// Resolve an emitted occurrence without scanning the region tree.
     ///
     /// Anchors and nodes are minted in the same dense order.  Keeping this
@@ -237,6 +227,20 @@ impl SealedStructuredRegionArtifact {
         }
         let node = self.nodes.get(anchor.index())?;
         Some((RegionId(anchor.0), node))
+    }
+
+    /// Resolve one marker only when it was sealed by this exact artifact.
+    ///
+    /// The dense anchor is deliberately insufficient by itself: independent
+    /// artifacts reuse the same small integer domain.  Consumers of a final
+    /// marker tree must carry the run-local authority minted with the marker.
+    pub(crate) fn node_for_marker(
+        &self,
+        marker: &StructuredRegionMarker,
+    ) -> Option<(RegionId, &StructuredRegionNode)> {
+        let authority = marker.authority()?;
+        let anchor = marker.emission_anchor()?;
+        self.node_for_anchor(authority, anchor)
     }
 }
 
@@ -254,9 +258,22 @@ pub(crate) enum StructuredRegionBuildError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum StructuredRegionFinalizationError {
     UnsealedMarker,
-    ForeignMarker { anchor: RegionEmissionAnchor },
-    DuplicateMarker { region: RegionId },
-    MissingMarker { region: RegionId },
+    ForeignMarker {
+        anchor: RegionEmissionAnchor,
+    },
+    DuplicateMarker {
+        region: RegionId,
+    },
+    MissingMarker {
+        region: RegionId,
+    },
+    ParentMismatch {
+        region: RegionId,
+    },
+    OutOfOrder {
+        region: RegionId,
+        expected: RegionId,
+    },
 }
 
 /// Validate and remove region markers at the final emission boundary.
@@ -275,8 +292,9 @@ pub(crate) fn validate_final_region_marker_tree(
     regions: &SealedStructuredRegionArtifact,
 ) -> Result<(), StructuredRegionFinalizationError> {
     let mut seen = vec![false; regions.nodes().len()];
+    let mut next_preorder = 0usize;
     for statement in statements {
-        validate_final_region_markers(statement, regions, &mut seen)?;
+        validate_final_region_markers(statement, regions, None, &mut seen, &mut next_preorder)?;
     }
     if let Some(index) = seen.iter().position(|seen| !seen) {
         return Err(StructuredRegionFinalizationError::MissingMarker {
@@ -289,22 +307,35 @@ pub(crate) fn validate_final_region_marker_tree(
 fn validate_final_region_markers(
     statement: &CStmt,
     regions: &SealedStructuredRegionArtifact,
+    parent: Option<RegionId>,
     seen: &mut [bool],
+    next_preorder: &mut usize,
 ) -> Result<(), StructuredRegionFinalizationError> {
     if let CStmt::StructuredRegion { marker, stmt } = statement {
         let anchor = marker
             .emission_anchor()
             .ok_or(StructuredRegionFinalizationError::UnsealedMarker)?;
-        let (region, _) = regions
-            .node_for_anchor(regions.authority(), anchor)
+        let (region, node) = regions
+            .node_for_marker(marker)
             .ok_or(StructuredRegionFinalizationError::ForeignMarker { anchor })?;
         if std::mem::replace(&mut seen[region.index()], true) {
             return Err(StructuredRegionFinalizationError::DuplicateMarker { region });
         }
-        return validate_final_region_markers(stmt, regions, seen);
+        if node.parent() != parent {
+            return Err(StructuredRegionFinalizationError::ParentMismatch { region });
+        }
+        let expected = RegionId(
+            u32::try_from(*next_preorder)
+                .expect("a validated dense region domain already fits RegionId"),
+        );
+        if region != expected {
+            return Err(StructuredRegionFinalizationError::OutOfOrder { region, expected });
+        }
+        *next_preorder += 1;
+        return validate_final_region_markers(stmt, regions, Some(region), seen, next_preorder);
     }
     if let CStmt::Observed { stmt, .. } = statement {
-        return validate_final_region_markers(stmt, regions, seen);
+        return validate_final_region_markers(stmt, regions, parent, seen, next_preorder);
     }
     match statement {
         CStmt::StructuredRegion { .. } | CStmt::Observed { .. } => {
@@ -312,7 +343,7 @@ fn validate_final_region_markers(
         }
         CStmt::Block(statements) => {
             for statement in statements {
-                validate_final_region_markers(statement, regions, seen)?;
+                validate_final_region_markers(statement, regions, parent, seen, next_preorder)?;
             }
         }
         CStmt::If {
@@ -320,29 +351,29 @@ fn validate_final_region_markers(
             else_body,
             ..
         } => {
-            validate_final_region_markers(then_body, regions, seen)?;
+            validate_final_region_markers(then_body, regions, parent, seen, next_preorder)?;
             if let Some(else_body) = else_body {
-                validate_final_region_markers(else_body, regions, seen)?;
+                validate_final_region_markers(else_body, regions, parent, seen, next_preorder)?;
             }
         }
         CStmt::While { body, .. } | CStmt::DoWhile { body, .. } => {
-            validate_final_region_markers(body, regions, seen)?
+            validate_final_region_markers(body, regions, parent, seen, next_preorder)?
         }
         CStmt::For { init, body, .. } => {
             if let Some(init) = init {
-                validate_final_region_markers(init, regions, seen)?;
+                validate_final_region_markers(init, regions, parent, seen, next_preorder)?;
             }
-            validate_final_region_markers(body, regions, seen)?;
+            validate_final_region_markers(body, regions, parent, seen, next_preorder)?;
         }
         CStmt::Switch { cases, default, .. } => {
             for case in cases {
                 for statement in &case.body {
-                    validate_final_region_markers(statement, regions, seen)?;
+                    validate_final_region_markers(statement, regions, parent, seen, next_preorder)?;
                 }
             }
             if let Some(default) = default {
                 for statement in default {
-                    validate_final_region_markers(statement, regions, seen)?;
+                    validate_final_region_markers(statement, regions, parent, seen, next_preorder)?;
                 }
             }
         }
@@ -597,26 +628,24 @@ impl<'a> StructuredRegionOccurrence<'a> {
 }
 
 /// One semantic statement occurrence paired with its exact lexical region.
+#[cfg(test)]
 pub(crate) struct ScopedStructuredStatement<'a> {
     region: RegionId,
-    #[cfg(test)]
     anchor: RegionEmissionAnchor,
-    #[cfg(test)]
     node: &'a StructuredRegionNode,
     stmt: &'a CStmt,
 }
 
+#[cfg(test)]
 impl<'a> ScopedStructuredStatement<'a> {
     pub(crate) const fn region(&self) -> RegionId {
         self.region
     }
 
-    #[cfg(test)]
     pub(crate) const fn anchor(&self) -> RegionEmissionAnchor {
         self.anchor
     }
 
-    #[cfg(test)]
     pub(crate) const fn node(&self) -> &'a StructuredRegionNode {
         self.node
     }
@@ -640,7 +669,7 @@ pub(crate) fn seal_structured_body(
     if root_marker.kind != StructuredRegionKind::FunctionBody {
         return Err(StructuredRegionBuildError::MissingFunctionBodyMarker);
     }
-    if root_marker.anchor.is_some() {
+    if root_marker.anchor.is_some() || root_marker.authority.is_some() {
         return Err(StructuredRegionBuildError::MarkerAlreadySealed);
     }
 
@@ -659,6 +688,7 @@ pub(crate) fn seal_structured_body(
     #[cfg(test)]
     debug_assert_eq!(root, draft.root);
     root_marker.anchor = draft.emission_anchor(root);
+    root_marker.authority = Some(draft.authority.clone());
     seal_stmt_children(root_stmt, root, &mut draft)?;
     let regions = draft.seal();
     Ok(SealedStructuredBody { stmt, regions })
@@ -671,7 +701,7 @@ fn seal_stmt_children(
 ) -> Result<(), StructuredRegionBuildError> {
     match stmt {
         CStmt::StructuredRegion { marker, stmt } => {
-            if marker.anchor.is_some() {
+            if marker.anchor.is_some() || marker.authority.is_some() {
                 return Err(StructuredRegionBuildError::MarkerAlreadySealed);
             }
             if marker.kind == StructuredRegionKind::FunctionBody {
@@ -685,6 +715,7 @@ fn seal_stmt_children(
             #[cfg(test)]
             draft.nodes[parent.index()].children.push(id);
             marker.anchor = draft.emission_anchor(id);
+            marker.authority = Some(draft.authority.clone());
             seal_stmt_children(stmt, id, draft)
         }
         CStmt::Observed { stmt, .. } => seal_stmt_children(stmt, parent, draft),
@@ -751,7 +782,7 @@ fn visit_occurrences<'a>(
                 .emission_anchor()
                 .expect("sealed body contains only sealed region markers");
             let (_id, _node) = regions
-                .node_for_anchor(authority, anchor)
+                .node_for_marker(marker)
                 .expect("sealed marker belongs to its structured-region artifact");
             visit(StructuredRegionOccurrence {
                 #[cfg(test)]
@@ -816,6 +847,7 @@ fn visit_occurrences<'a>(
     }
 }
 
+#[cfg(test)]
 fn visit_scoped_stmt<'a>(
     stmt: &'a CStmt,
     current: Option<(RegionId, RegionEmissionAnchor)>,
@@ -828,7 +860,7 @@ fn visit_scoped_stmt<'a>(
             .emission_anchor()
             .expect("sealed body contains only sealed region markers");
         let (id, _) = regions
-            .node_for_anchor(authority, anchor)
+            .node_for_marker(marker)
             .expect("sealed marker belongs to its structured-region artifact");
         visit_scoped_stmt(stmt, Some((id, anchor)), regions, authority, visit);
         return;
@@ -840,9 +872,7 @@ fn visit_scoped_stmt<'a>(
             .expect("scoped statement region belongs to its artifact");
         visit(ScopedStructuredStatement {
             region,
-            #[cfg(test)]
             anchor: _anchor,
-            #[cfg(test)]
             node: _node,
             stmt,
         });
@@ -1170,6 +1200,84 @@ mod tests {
                 .is_none()
         );
         assert_eq!(node_signature(&first), node_signature(&second));
+    }
+
+    #[test]
+    fn final_tree_rejects_same_index_markers_from_another_artifact() {
+        let local = seal_structured_body(CStmt::structured_region(
+            StructuredRegionMarker::unsealed(0x1000, StructuredRegionKind::FunctionBody),
+            CStmt::structured_region(
+                StructuredRegionMarker::unsealed(0x1010, StructuredRegionKind::Block),
+                CStmt::Empty,
+            ),
+        ))
+        .expect("local artifact");
+        let foreign = seal_structured_body(CStmt::structured_region(
+            StructuredRegionMarker::unsealed(0x2000, StructuredRegionKind::FunctionBody),
+            CStmt::structured_region(
+                StructuredRegionMarker::unsealed(0x2010, StructuredRegionKind::Block),
+                CStmt::Empty,
+            ),
+        ))
+        .expect("foreign artifact");
+        let (_, local_regions) = local.into_marked_parts();
+        let (foreign_stmt, _) = foreign.into_marked_parts();
+
+        assert!(matches!(
+            validate_final_region_marker_tree(&[foreign_stmt], &local_regions),
+            Err(StructuredRegionFinalizationError::ForeignMarker { anchor })
+                if anchor.index() == 0
+        ));
+    }
+
+    #[test]
+    fn final_tree_rejects_reparented_sealed_marker() {
+        let sealed = seal_structured_body(CStmt::structured_region(
+            StructuredRegionMarker::unsealed(0x1000, StructuredRegionKind::FunctionBody),
+            CStmt::structured_region(
+                StructuredRegionMarker::unsealed(0x1010, StructuredRegionKind::Sequence),
+                CStmt::structured_region(
+                    StructuredRegionMarker::unsealed(0x1020, StructuredRegionKind::Block),
+                    CStmt::Empty,
+                ),
+            ),
+        ))
+        .expect("nested artifact");
+        let (stmt, regions) = sealed.into_marked_parts();
+        let CStmt::StructuredRegion {
+            marker: root_marker,
+            stmt: sequence,
+        } = stmt
+        else {
+            panic!("root marker")
+        };
+        let CStmt::StructuredRegion {
+            marker: sequence_marker,
+            stmt: child,
+        } = *sequence
+        else {
+            panic!("sequence marker")
+        };
+        let CStmt::StructuredRegion {
+            marker: child_marker,
+            stmt: child_body,
+        } = *child
+        else {
+            panic!("child marker")
+        };
+        let reparented = CStmt::structured_region(
+            root_marker,
+            CStmt::Block(vec![
+                CStmt::structured_region(sequence_marker, CStmt::Empty),
+                CStmt::structured_region(child_marker, *child_body),
+            ]),
+        );
+
+        assert!(matches!(
+            validate_final_region_marker_tree(&[reparented], &regions),
+            Err(StructuredRegionFinalizationError::ParentMismatch { region })
+                if region.index() == 2
+        ));
     }
 
     #[test]

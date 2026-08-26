@@ -198,6 +198,9 @@ pub(crate) enum PlacementRefusal {
         binding: BindingId,
         read: PlacementRead,
     },
+    UnprovableExecutionOrder {
+        binding: BindingId,
+    },
 }
 
 /// Typed disposition of an addressable stack object. Stack objects do not have

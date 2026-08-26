@@ -5622,7 +5622,7 @@ mod tests {
     }
 
     #[test]
-    fn split_for_body_observations_remain_unaccounted_without_shape_changes() {
+    fn for_body_observations_track_only_actual_body_splits() {
         let symbols = test_table();
         let update = CExpr::assign(
             v(&symbols, "i"),
@@ -5699,18 +5699,18 @@ mod tests {
         );
 
         let (stripped, reachable) = strip_test_observations(&owner, marked);
-        for id in [first_work_id, second_work_id] {
-            assert!(reachable.contains(id));
-        }
         for id in [
-            first_body_inner_id,
-            first_body_outer_id,
+            first_work_id,
+            second_work_id,
             second_body_inner_id,
             second_body_outer_id,
         ] {
+            assert!(reachable.contains(id));
+        }
+        for id in [first_body_inner_id, first_body_outer_id] {
             assert!(
                 !reachable.contains(id),
-                "a split loop body has no exact child occurrence that can inherit its marker"
+                "a body split to remove the explicit for-update has no exact child occurrence that can inherit its wrapper"
             );
         }
         assert_eq!(

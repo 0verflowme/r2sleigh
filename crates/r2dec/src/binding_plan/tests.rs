@@ -22,6 +22,13 @@ fn source_owned(ops: impl IntoIterator<Item = R2ILOp>) -> SourceOwnedFunctionFac
 }
 
 fn source_owned_blocks(blocks: &[R2ILBlock]) -> SourceOwnedFunctionFacts {
+    source_owned_blocks_with_stack_slots(blocks, Vec::new())
+}
+
+fn source_owned_blocks_with_stack_slots(
+    blocks: &[R2ILBlock],
+    stack_slots: Vec<r2ssa::SourceStackSlotSpec>,
+) -> SourceOwnedFunctionFacts {
     let mut arch = ArchSpec::new("x86-64");
     arch.add_space(AddressSpace::ram(8));
     arch.add_register(RegisterDef::new("RAX", 0, 8));
@@ -128,7 +135,7 @@ fn source_owned_blocks(blocks: &[R2ILBlock]) -> SourceOwnedFunctionFacts {
         SourceFunctionReturn::Register {
             storage: storage(0),
         },
-        std::iter::empty(),
+        stack_slots,
     )
     .and_then(|interface| interface.with_return_address_storage(storage(0x30)))
     .and_then(|interface| interface.with_stack_pointer_storage(storage(0x28)))
@@ -762,6 +769,11 @@ fn overlapping_parameter_and_span_certificates_close_transitively_in_canonical_o
             a: Varnode::register(0x38, 8),
             b: Varnode::constant(1, 8),
         },
+        R2ILOp::IntAdd {
+            dst: Varnode::register(0x38, 8),
+            a: Varnode::register(0x38, 8),
+            b: Varnode::constant(2, 8),
+        },
         R2ILOp::Copy {
             dst: Varnode::register(0, 8),
             src: Varnode::register(0x38, 8),
@@ -835,7 +847,8 @@ fn overlapping_parameter_and_span_certificates_close_transitively_in_canonical_o
 #[test]
 fn certified_stack_objects_get_bindings_without_invented_value_membership() {
     let address = Varnode::unique(0x80, 8);
-    let source_owned = source_owned([
+    let mut block = R2ILBlock::new(0x1000, 4);
+    for op in [
         R2ILOp::IntSub {
             dst: address.clone(),
             a: Varnode::register(0x28, 8),
@@ -851,7 +864,22 @@ fn certified_stack_objects_get_bindings_without_invented_value_membership() {
             space: SpaceId::Ram,
             addr: address,
         },
-    ]);
+    ] {
+        block.push(op);
+    }
+    let source_owned = source_owned_blocks_with_stack_slots(
+        &[block],
+        vec![r2ssa::SourceStackSlotSpec::new_local(
+            r2ssa::StackAddressBase::StackPointer,
+            CanonicalStorageId {
+                space: CanonicalStorageSpace::Register,
+                offset: 0x28,
+                size: 8,
+            },
+            -8,
+            8,
+        )],
+    );
     let stack_slots = source_owned
         .report()
         .render()
@@ -870,9 +898,11 @@ fn certified_stack_objects_get_bindings_without_invented_value_membership() {
         Rc::new(RefCell::new(SymbolTable::new())),
     )
     .expect("stack resolution");
+    let mut bound_stack_objects = 0;
     for (object, _, _, size) in stack_slots {
         match (size, plan.stack_object_disposition(object)) {
             (Some(size), Some(StackObjectDisposition::Bound { binding })) if size > 0 => {
+                bound_stack_objects += 1;
                 assert_eq!(
                     plan.binding(binding).map(Binding::declaration_type),
                     Some(&CType::UInt(size * 8))
@@ -907,9 +937,27 @@ fn certified_stack_objects_get_bindings_without_invented_value_membership() {
                     })
                 );
             }
+            (
+                None,
+                Some(StackObjectDisposition::Refused {
+                    reason: StackObjectRefusal::MissingSourceIdentity { object: refused },
+                }),
+            ) if refused == object => {
+                assert_eq!(
+                    resolution.require_stack(object),
+                    Err(RenderedIdentityRefusal::StackObject {
+                        object,
+                        reason: StackObjectRefusal::MissingSourceIdentity { object }
+                    })
+                );
+            }
             other => panic!("unexpected stack object disposition: {other:?}"),
         }
     }
+    assert_eq!(
+        bound_stack_objects, 1,
+        "only the exact source-declared stack slot may become a C binding"
+    );
     assert_eq!(
         resolution.require_stack(r2ssa::ObjectId(u32::MAX)),
         Err(RenderedIdentityRefusal::MissingStackDisposition {

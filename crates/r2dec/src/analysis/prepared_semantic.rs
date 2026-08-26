@@ -3965,6 +3965,8 @@ mod tests {
         let mut arch = ArchSpec::new("x86-64");
         arch.add_register(RegisterDef::new("RDI", 0x10, 8));
         arch.add_register(RegisterDef::new("RSI", 0x18, 8));
+        arch.add_register(RegisterDef::new("RSP", 0x28, 8));
+        arch.add_register(RegisterDef::new("RIP", 0x30, 8));
         arch
     }
 
@@ -3994,8 +3996,51 @@ mod tests {
         block.push(R2ILOp::Return {
             target: Varnode::constant(0, 8),
         });
-        SsaArtifact::for_decompile(&[block], Some(&arch))
-            .expect("prepared two-arg call SSA artifact")
+        let storage = |offset| r2ssa::CanonicalStorageId {
+            space: r2ssa::CanonicalStorageSpace::Register,
+            offset,
+            size: 8,
+        };
+        let revision = b"prepared-semantic-two-arg-call";
+        let function_interface = r2ssa::SourceFunctionInterface::new_exact(
+            revision.to_vec(),
+            "sysv64",
+            [
+                r2ssa::SourceAbiParameterSpec::new(0, storage(0x10)),
+                r2ssa::SourceAbiParameterSpec::new(1, storage(0x18)),
+            ],
+            r2ssa::SourceFunctionReturn::Void,
+            [],
+        )
+        .and_then(|interface| interface.with_stack_pointer_storage(storage(0x28)))
+        .and_then(|interface| interface.with_return_address_storage(storage(0x30)))
+        .expect("exact two-arg function interface");
+        let call_target = Varnode::constant(0x401000, 8);
+        let call_interface = r2ssa::SourceCallSiteInterface::new(
+            revision.to_vec(),
+            r2ssa::SourceCallSiteIdentity::new(
+                0x1000,
+                2,
+                r2ssa::CanonicalStorageId::from_varnode(&call_target),
+            ),
+            true,
+            "sysv64",
+            [
+                r2ssa::SourceCallArgumentSpec::new(0, storage(0x10)),
+                r2ssa::SourceCallArgumentSpec::new(1, storage(0x18)),
+            ],
+            false,
+            false,
+            r2ssa::SourceCallResult::Void,
+        )
+        .expect("exact two-arg callsite interface");
+        SsaArtifact::for_decompile_with_interfaces(
+            &[block],
+            Some(&arch),
+            Some(function_interface),
+            vec![call_interface],
+        )
+        .expect("prepared two-arg call SSA artifact")
     }
 
     fn test_prepared_stack_owned_call_result_artifact() -> SsaArtifact {

@@ -2014,10 +2014,7 @@ impl BindingShadowOutcome {
         if !ledger.passes_quality() || !coverage.passes_quality() {
             return Self::Failed(BindingShadowFailure::NonQuality { ledger, coverage });
         }
-        Self::Complete(BindingShadow {
-            ledger,
-            coverage,
-        })
+        Self::Complete(BindingShadow { ledger, coverage })
     }
 }
 
@@ -2808,6 +2805,13 @@ pub enum PlacementAuditRefusal {
     RegionMarkerMissing {
         region_index: usize,
     },
+    RegionMarkerParentMismatch {
+        region_index: usize,
+    },
+    RegionMarkerOutOfOrder {
+        region_index: usize,
+        expected_region_index: usize,
+    },
     ObservationDomainTooLarge {
         expected_count: usize,
     },
@@ -2869,6 +2873,12 @@ pub enum PlacementAuditRefusal {
         value_id: u32,
         instruction_id: u32,
     },
+    UnprovableExecutionOrder {
+        binding_index: usize,
+    },
+    AmbiguousObservationExecutionOrder {
+        observation_id: u32,
+    },
     MissingBinding {
         binding_index: usize,
     },
@@ -2913,6 +2923,8 @@ impl PlacementAuditRefusal {
             Self::RegionMarkerForeign { .. } => "region_marker_foreign",
             Self::RegionMarkerDuplicate { .. } => "region_marker_duplicate",
             Self::RegionMarkerMissing { .. } => "region_marker_missing",
+            Self::RegionMarkerParentMismatch { .. } => "region_marker_parent_mismatch",
+            Self::RegionMarkerOutOfOrder { .. } => "region_marker_out_of_order",
             Self::ObservationDomainTooLarge { .. } => "observation_domain_too_large",
             Self::ObservationCapacityUnavailable { .. } => "observation_capacity_unavailable",
             Self::ObservationOutOfRange { .. } => "observation_out_of_range",
@@ -2932,6 +2944,10 @@ impl PlacementAuditRefusal {
             Self::ReadBeforeAssignment { .. } => "read_before_assignment",
             Self::CertifiedValueReadBeforeAssignment { .. } => {
                 "certified_value_read_before_assignment"
+            }
+            Self::UnprovableExecutionOrder { .. } => "unprovable_execution_order",
+            Self::AmbiguousObservationExecutionOrder { .. } => {
+                "ambiguous_observation_execution_order"
             }
             Self::MissingBinding { .. } => "missing_binding",
             Self::MissingBindingSymbol { .. } => "missing_binding_symbol",
