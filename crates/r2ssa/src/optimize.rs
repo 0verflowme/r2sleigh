@@ -176,6 +176,7 @@ struct VarKey {
     name: String,
     version: u32,
     size: u32,
+    rename_disambiguator: u32,
 }
 
 type SccpResult = (HashMap<VarKey, u64>, HashSet<(u64, u64)>);
@@ -215,17 +216,25 @@ impl VarKey {
             name: var.name.clone(),
             version: var.version,
             size: var.size,
+            rename_disambiguator: var.rename_disambiguator(),
         }
     }
 }
 
 impl Ord for VarKey {
     fn cmp(&self, other: &Self) -> Ordering {
-        (self.name.as_str(), self.version, self.size).cmp(&(
-            other.name.as_str(),
-            other.version,
-            other.size,
-        ))
+        (
+            self.name.as_str(),
+            self.version,
+            self.size,
+            self.rename_disambiguator,
+        )
+            .cmp(&(
+                other.name.as_str(),
+                other.version,
+                other.size,
+                other.rename_disambiguator,
+            ))
     }
 }
 

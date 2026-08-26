@@ -2012,7 +2012,7 @@ impl SSAFunction {
         let reg_names_ref = reg_names.as_deref();
 
         // Collect variable definitions and sizes
-        let (defs, var_sizes, storage_by_name) =
+        let (defs, storage_by_identity) =
             collect_defs_from_cfg_with_names_storage_and_control(&cfg, reg_names_ref, control)?;
 
         // Place phi nodes
@@ -2020,8 +2020,7 @@ impl SSAFunction {
             &cfg,
             &domtree,
             &defs,
-            &var_sizes,
-            &storage_by_name,
+            &storage_by_identity,
             control,
         )?;
 
@@ -2030,7 +2029,7 @@ impl SSAFunction {
             &cfg,
             &domtree,
             &phi_placement,
-            &var_sizes,
+            &defs,
             reg_names_ref,
             call_boundaries,
             control,
@@ -4248,7 +4247,7 @@ fn adapt_family_root(root: &SSAVar, width: u32) -> Option<SSAVar> {
         return Some(SSAVar::constant(mask_const_to_width(value, width), width));
     }
     if root.size > width && can_width_adapt_register_family_root(root) {
-        return Some(SSAVar::new(root.name.clone(), root.version, width));
+        return Some(root.with_size(width));
     }
     None
 }

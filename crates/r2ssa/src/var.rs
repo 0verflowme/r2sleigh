@@ -107,6 +107,17 @@ pub struct SSAVar {
     /// not be parsed by proof-bearing consumers to recover a constant value.
     #[serde(default)]
     constant_bits: Option<u64>,
+    /// Deterministic construction-time discriminator for two exact source
+    /// storages that project to the same display name and width.
+    ///
+    /// This is identity only, not storage authority. Canonical storage remains
+    /// in the source-retained graph facts.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    rename_disambiguator: u32,
+}
+
+const fn is_zero(value: &u32) -> bool {
+    *value == 0
 }
 
 impl SSAVar {
@@ -117,6 +128,28 @@ impl SSAVar {
             version,
             size,
             constant_bits: None,
+            rename_disambiguator: 0,
+        }
+    }
+
+    /// Attach the deterministic source-identity projection selected by SSA
+    /// construction while leaving the user-facing name unchanged.
+    pub(crate) fn with_rename_disambiguator(mut self, disambiguator: u32) -> Self {
+        self.rename_disambiguator = disambiguator;
+        self
+    }
+
+    pub(crate) const fn rename_disambiguator(&self) -> u32 {
+        self.rename_disambiguator
+    }
+
+    pub(crate) fn with_size(&self, size: u32) -> Self {
+        Self {
+            name: self.name.clone(),
+            version: self.version,
+            size,
+            constant_bits: self.constant_bits,
+            rename_disambiguator: self.rename_disambiguator,
         }
     }
 
@@ -132,6 +165,7 @@ impl SSAVar {
             version: 0,
             size,
             constant_bits: Some(value),
+            rename_disambiguator: 0,
         }
     }
 
@@ -145,6 +179,7 @@ impl SSAVar {
             version: self.version.checked_add(1)?,
             size: self.size,
             constant_bits: self.constant_bits,
+            rename_disambiguator: self.rename_disambiguator,
         })
     }
 

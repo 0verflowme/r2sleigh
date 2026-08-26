@@ -3,38 +3,69 @@
 //! This module implements the phi-node placement algorithm using the
 //! iterated dominance frontier, as described by Cytron et al.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use crate::cfg::{BasicBlock, CFG};
 use crate::control::{SsaExecutionStopReason, SsaWorkControl, UncheckedSsaWorkControl};
 use crate::domtree::DomTree;
 use crate::naming::{RegisterNameMap, varnode_to_name};
-use crate::op::SSAOp;
 use crate::var::{CanonicalStorageId, SSAVar};
 
-pub type DefinitionSitesByName = HashMap<String, HashSet<u64>>;
-pub type DefinitionSizesByName = HashMap<String, u32>;
-pub type CanonicalStorageByName = HashMap<String, CanonicalStorageId>;
-pub type DefinitionCollection = (
-    DefinitionSitesByName,
-    DefinitionSizesByName,
-    CanonicalStorageByName,
-);
+/// Exact identity used by phi placement and SSA renaming.
+///
+/// The semantic name remains presentation advice. Width is part of the
+/// identity because Sleigh may reuse one Unique offset for unrelated scratch
+/// values of different widths, and register-name maps may expose multiple
+/// slices under one spelling. Canonical storage completes the identity; the
+/// name remains a separate presentation projection.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RenameIdentity {
+    pub name: String,
+    pub size: u32,
+    pub storage: CanonicalStorageId,
+}
+
+impl RenameIdentity {
+    pub fn new(name: impl Into<String>, storage: CanonicalStorageId) -> Self {
+        Self {
+            name: name.into(),
+            size: storage.size,
+            storage,
+        }
+    }
+
+    pub fn from_varnode(varnode: &r2il::Varnode, reg_names: Option<&RegisterNameMap>) -> Self {
+        Self::new(
+            varnode_to_name(varnode, reg_names),
+            CanonicalStorageId::from_varnode(varnode),
+        )
+    }
+
+    pub fn synthetic(name: impl Into<String>, size: u32) -> Self {
+        Self::new(name, CanonicalStorageId::unknown(0, size))
+    }
+
+    pub fn as_var(&self, version: u32, disambiguator: u32) -> SSAVar {
+        SSAVar::new(&self.name, version, self.size).with_rename_disambiguator(disambiguator)
+    }
+}
+
+pub type DefinitionSitesByIdentity = BTreeMap<RenameIdentity, BTreeSet<u64>>;
+pub type CanonicalStorageByIdentity = BTreeMap<RenameIdentity, CanonicalStorageId>;
+pub type DefinitionCollection = (DefinitionSitesByIdentity, CanonicalStorageByIdentity);
 
 /// Information about phi nodes to be placed in the CFG.
 #[derive(Debug, Clone, Default)]
 pub struct PhiPlacement {
-    /// Phi nodes to place at each block: block addr -> list of (variable name, predecessor addrs)
+    /// Phi nodes to place at each block, keyed internally by exact rename identity.
     pub phis: HashMap<u64, Vec<PhiInfo>>,
 }
 
 /// Information about a single phi node.
 #[derive(Debug, Clone)]
 pub struct PhiInfo {
-    /// The variable name (base name without version).
-    pub var_name: String,
-    /// The size of the variable in bytes.
-    pub var_size: u32,
+    /// Typed rename identity. The name inside it is retained for presentation.
+    pub identity: RenameIdentity,
     /// Lifted storage identity, independent of register/display names.
     pub storage: Option<CanonicalStorageId>,
     /// The predecessor blocks that contribute values.
@@ -52,30 +83,22 @@ impl PhiPlacement {
     /// # Arguments
     /// * `cfg` - The control flow graph
     /// * `domtree` - The dominator tree for the CFG
-    /// * `defs` - Map from variable name to the blocks where it's defined
-    /// * `var_sizes` - Map from variable name to its size in bytes
-    pub fn compute(
-        cfg: &CFG,
-        domtree: &DomTree,
-        defs: &HashMap<String, HashSet<u64>>,
-        var_sizes: &HashMap<String, u32>,
-    ) -> Self {
-        Self::compute_with_storage(cfg, domtree, defs, var_sizes, &HashMap::new())
+    /// * `defs` - Map from exact rename identity to definition blocks
+    pub fn compute(cfg: &CFG, domtree: &DomTree, defs: &DefinitionSitesByIdentity) -> Self {
+        Self::compute_with_storage(cfg, domtree, defs, &BTreeMap::new())
     }
 
     pub fn compute_with_storage(
         cfg: &CFG,
         domtree: &DomTree,
-        defs: &HashMap<String, HashSet<u64>>,
-        var_sizes: &HashMap<String, u32>,
-        storage_by_name: &HashMap<String, CanonicalStorageId>,
+        defs: &DefinitionSitesByIdentity,
+        storage_by_identity: &CanonicalStorageByIdentity,
     ) -> Self {
         Self::compute_with_storage_and_control(
             cfg,
             domtree,
             defs,
-            var_sizes,
-            storage_by_name,
+            storage_by_identity,
             &UncheckedSsaWorkControl,
         )
         .expect("unchecked phi placement cannot stop")
@@ -85,18 +108,14 @@ impl PhiPlacement {
     pub fn compute_with_storage_and_control<C: SsaWorkControl + ?Sized>(
         cfg: &CFG,
         domtree: &DomTree,
-        defs: &HashMap<String, HashSet<u64>>,
-        var_sizes: &HashMap<String, u32>,
-        storage_by_name: &HashMap<String, CanonicalStorageId>,
+        defs: &DefinitionSitesByIdentity,
+        storage_by_identity: &CanonicalStorageByIdentity,
         control: &C,
     ) -> Result<Self, SsaExecutionStopReason> {
         control.poll()?;
         let mut placement = Self::new();
 
-        let mut defs_by_name: Vec<(&String, &HashSet<u64>)> = defs.iter().collect();
-        defs_by_name.sort_unstable_by(|(lhs, _), (rhs, _)| lhs.cmp(rhs));
-
-        for (var_name, def_blocks) in defs_by_name {
+        for (identity, def_blocks) in defs {
             control.poll()?;
             let mut def_list: Vec<u64> = def_blocks.iter().copied().collect();
             def_list.sort_unstable();
@@ -110,14 +129,9 @@ impl PhiPlacement {
                 control.poll()?;
                 let preds = cfg.predecessors(phi_block);
                 if preds.len() >= 2 {
-                    let size = var_sizes.get(var_name).copied().unwrap_or(8);
-                    let storage = storage_by_name.get(var_name).copied().map(|mut storage| {
-                        storage.size = size;
-                        storage
-                    });
+                    let storage = storage_by_identity.get(identity).copied();
                     let phi_info = PhiInfo {
-                        var_name: var_name.clone(),
-                        var_size: size,
+                        identity: identity.clone(),
                         storage,
                         predecessors: preds,
                     };
@@ -129,9 +143,8 @@ impl PhiPlacement {
         for phis in placement.phis.values_mut() {
             control.poll()?;
             phis.sort_unstable_by(|lhs, rhs| {
-                lhs.var_name
-                    .cmp(&rhs.var_name)
-                    .then(lhs.var_size.cmp(&rhs.var_size))
+                lhs.identity
+                    .cmp(&rhs.identity)
                     .then(lhs.predecessors.cmp(&rhs.predecessors))
             });
         }
@@ -165,13 +178,13 @@ impl PhiPlacement {
 
 /// Collect variable definitions from a basic block's operations.
 ///
-/// Returns a map from variable name to whether it's defined in this block.
-pub fn collect_defs_from_block(block: &BasicBlock) -> HashSet<String> {
-    let mut defs = HashSet::new();
+/// Returns the exact rename identities defined in this block.
+pub fn collect_defs_from_block(block: &BasicBlock) -> BTreeSet<RenameIdentity> {
+    let mut defs = BTreeSet::new();
 
     for op in &block.ops {
-        if let Some(dst) = get_op_output(op) {
-            defs.insert(dst);
+        if let Some(dst) = get_op_output_varnode(op) {
+            defs.insert(RenameIdentity::from_varnode(dst, None));
         }
     }
 
@@ -181,9 +194,8 @@ pub fn collect_defs_from_block(block: &BasicBlock) -> HashSet<String> {
 /// Collect variable definitions from a CFG.
 ///
 /// Returns:
-/// - `defs`: Map from variable name to set of blocks where it's defined
-/// - `var_sizes`: Map from variable name to its size
-pub fn collect_defs_from_cfg(cfg: &CFG) -> (HashMap<String, HashSet<u64>>, HashMap<String, u32>) {
+/// - `defs`: Map from exact rename identity to definition blocks
+pub fn collect_defs_from_cfg(cfg: &CFG) -> DefinitionSitesByIdentity {
     collect_defs_from_cfg_with_names(cfg, None)
 }
 
@@ -191,16 +203,12 @@ pub fn collect_defs_from_cfg(cfg: &CFG) -> (HashMap<String, HashSet<u64>>, HashM
 pub fn collect_defs_from_cfg_with_names(
     cfg: &CFG,
     reg_names: Option<&RegisterNameMap>,
-) -> (HashMap<String, HashSet<u64>>, HashMap<String, u32>) {
-    let (defs, var_sizes, _) = collect_defs_from_cfg_with_names_and_storage(cfg, reg_names);
-    (defs, var_sizes)
+) -> DefinitionSitesByIdentity {
+    collect_defs_from_cfg_with_names_and_storage(cfg, reg_names).0
 }
 
-/// Collect definitions while retaining the lifted storage behind each name.
-/// Aliases with different storage bases are deliberately omitted from the
-/// storage map so callers fail closed rather than attach the wrong canonical
-/// identity. Different widths of the same lifted storage base are retained;
-/// phi placement applies the phi's exact width to that base.
+/// Collect definitions while retaining lifted storage per exact typed identity.
+/// Widths and storage slices sharing one spelling remain distinct.
 pub fn collect_defs_from_cfg_with_names_and_storage(
     cfg: &CFG,
     reg_names: Option<&RegisterNameMap>,
@@ -216,10 +224,8 @@ pub fn collect_defs_from_cfg_with_names_storage_and_control<C: SsaWorkControl + 
     control: &C,
 ) -> Result<DefinitionCollection, SsaExecutionStopReason> {
     control.poll()?;
-    let mut defs: HashMap<String, HashSet<u64>> = HashMap::new();
-    let mut var_sizes: HashMap<String, u32> = HashMap::new();
-    let mut storage_by_name = HashMap::<String, CanonicalStorageId>::new();
-    let mut ambiguous_names = HashSet::new();
+    let mut defs = DefinitionSitesByIdentity::new();
+    let mut storage_by_identity = CanonicalStorageByIdentity::new();
 
     for addr in cfg.block_addrs() {
         control.poll()?;
@@ -228,39 +234,23 @@ pub fn collect_defs_from_cfg_with_names_storage_and_control<C: SsaWorkControl + 
         };
         for op in &block.ops {
             control.poll()?;
-            if let Some(varnode) = get_op_output_varnode(op) {
-                let name = varnode_to_name(varnode, reg_names);
-                let size = varnode.size;
-                defs.entry(name.clone()).or_default().insert(block.addr);
-                var_sizes.insert(name.clone(), size);
-                let storage = CanonicalStorageId::from_varnode(varnode);
-                if storage_by_name.get(&name).is_some_and(|existing| {
-                    existing.space != storage.space || existing.offset != storage.offset
-                }) {
-                    ambiguous_names.insert(name.clone());
-                } else {
-                    storage_by_name.insert(name, storage);
+            for varnode in op.inputs() {
+                if !matches!(varnode.space, r2il::SpaceId::Const) {
+                    let identity = RenameIdentity::from_varnode(varnode, reg_names);
+                    defs.entry(identity.clone()).or_default();
+                    storage_by_identity.insert(identity.clone(), identity.storage);
                 }
+            }
+            if let Some(varnode) = get_op_output_varnode(op) {
+                let identity = RenameIdentity::from_varnode(varnode, reg_names);
+                defs.entry(identity.clone()).or_default().insert(block.addr);
+                storage_by_identity.insert(identity.clone(), identity.storage);
             }
         }
     }
 
-    storage_by_name.retain(|name, _| !ambiguous_names.contains(name));
     control.poll()?;
-    Ok((defs, var_sizes, storage_by_name))
-}
-
-/// Get the output variable name from an r2il operation.
-fn get_op_output(op: &r2il::R2ILOp) -> Option<String> {
-    get_op_output_with_size(op, None).map(|(name, _)| name)
-}
-
-/// Get the output variable name and size from an r2il operation.
-fn get_op_output_with_size(
-    op: &r2il::R2ILOp,
-    reg_names: Option<&RegisterNameMap>,
-) -> Option<(String, u32)> {
-    get_op_output_varnode(op).map(|vn| (varnode_to_name(vn, reg_names), vn.size))
+    Ok((defs, storage_by_identity))
 }
 
 fn get_op_output_varnode(op: &r2il::R2ILOp) -> Option<&r2il::Varnode> {
@@ -335,29 +325,6 @@ fn get_op_output_varnode(op: &r2il::R2ILOp) -> Option<&r2il::Varnode> {
         CallOther { output, .. } => output.as_ref(),
         _ => None,
     }
-}
-
-/// Create SSA phi operations from phi placement info.
-pub fn create_phi_ops(placement: &PhiPlacement, block_addr: u64) -> Vec<SSAOp> {
-    let mut ops = Vec::new();
-
-    for phi_info in placement.get_phis(block_addr) {
-        // Create placeholder sources - these will be filled in during renaming
-        let sources: Vec<SSAVar> = phi_info
-            .predecessors
-            .iter()
-            .map(|_| SSAVar::new(&phi_info.var_name, 0, phi_info.var_size))
-            .collect();
-
-        let phi_op = SSAOp::Phi {
-            dst: SSAVar::new(&phi_info.var_name, 0, phi_info.var_size),
-            sources,
-        };
-
-        ops.push(phi_op);
-    }
-
-    ops
 }
 
 #[cfg(test)]
@@ -449,27 +416,28 @@ mod tests {
 
         let cfg = CFG::from_blocks(&blocks).unwrap();
         let domtree = DomTree::compute(&cfg);
-        let (defs, var_sizes) = collect_defs_from_cfg(&cfg);
+        let defs = collect_defs_from_cfg(&cfg);
 
-        let placement = PhiPlacement::compute(&cfg, &domtree, &defs, &var_sizes);
+        let placement = PhiPlacement::compute(&cfg, &domtree, &defs);
 
         // Should have a phi at block D (0x100c) for reg:0
         assert!(placement.has_phis(0x100c));
         let phis = placement.get_phis(0x100c);
         assert_eq!(phis.len(), 1);
-        assert_eq!(phis[0].var_name, "reg:0");
+        let identity = RenameIdentity::from_varnode(&make_reg(0, 8), None);
+        assert_eq!(phis[0].identity, identity);
         assert_eq!(phis[0].predecessors.len(), 2);
 
-        let storage_by_name = HashMap::from([(
-            "reg:0".to_string(),
+        let storage_by_identity = BTreeMap::from([(
+            identity,
             CanonicalStorageId {
                 space: crate::CanonicalStorageSpace::Register,
                 offset: 0,
-                size: 4,
+                size: 8,
             },
         )]);
         let placement =
-            PhiPlacement::compute_with_storage(&cfg, &domtree, &defs, &var_sizes, &storage_by_name);
+            PhiPlacement::compute_with_storage(&cfg, &domtree, &defs, &storage_by_identity);
         assert_eq!(
             placement.get_phis(0x100c)[0].storage,
             Some(CanonicalStorageId {
@@ -481,7 +449,7 @@ mod tests {
     }
 
     #[test]
-    fn storage_collection_retains_one_base_across_widths_and_refuses_two_bases() {
+    fn storage_collection_keeps_widths_and_same_named_storages_distinct() {
         let block = R2ILBlock {
             addr: 0x1000,
             size: 4,
@@ -499,12 +467,16 @@ mod tests {
             op_metadata: Default::default(),
         };
         let cfg = CFG::from_blocks(&[block]).expect("single block CFG");
-        let (_, _, storage_by_name) = collect_defs_from_cfg_with_names_and_storage(&cfg, None);
-        let storage = storage_by_name
-            .get("tmp:200")
-            .expect("same lifted base remains canonical");
-        assert_eq!(storage.space, crate::CanonicalStorageSpace::Unique);
-        assert_eq!(storage.offset, 0x200);
+        let (defs, storage_by_identity) = collect_defs_from_cfg_with_names_and_storage(&cfg, None);
+        assert!(defs.contains_key(&RenameIdentity::from_varnode(
+            &Varnode::unique(0x200, 4),
+            None
+        )));
+        assert!(defs.contains_key(&RenameIdentity::from_varnode(
+            &Varnode::unique(0x200, 8),
+            None
+        )));
+        assert_eq!(storage_by_identity.len(), 2);
 
         let block = R2ILBlock {
             addr: 0x2000,
@@ -525,9 +497,14 @@ mod tests {
         let cfg = CFG::from_blocks(&[block]).expect("single block CFG");
         let register_names =
             RegisterNameMap::from([((0, 8), "alias".to_string()), ((8, 8), "alias".to_string())]);
-        let (_, _, storage_by_name) =
+        let (_, storage_by_identity) =
             collect_defs_from_cfg_with_names_and_storage(&cfg, Some(&register_names));
-        assert!(!storage_by_name.contains_key("alias"));
+        assert_eq!(storage_by_identity.len(), 2);
+        assert!(
+            storage_by_identity
+                .keys()
+                .all(|identity| identity.name == "alias")
+        );
     }
 
     #[test]
@@ -557,9 +534,9 @@ mod tests {
 
         let cfg = CFG::from_blocks(&blocks).unwrap();
         let domtree = DomTree::compute(&cfg);
-        let (defs, var_sizes) = collect_defs_from_cfg(&cfg);
+        let defs = collect_defs_from_cfg(&cfg);
 
-        let placement = PhiPlacement::compute(&cfg, &domtree, &defs, &var_sizes);
+        let placement = PhiPlacement::compute(&cfg, &domtree, &defs);
 
         // No phis needed in linear CFG
         assert_eq!(placement.total_phis(), 0);
@@ -597,18 +574,16 @@ mod tests {
         ];
 
         let cfg = CFG::from_blocks(&blocks).unwrap();
-        let (defs, var_sizes) = collect_defs_from_cfg(&cfg);
+        let defs = collect_defs_from_cfg(&cfg);
+        let reg0 = RenameIdentity::from_varnode(&make_reg(0, 8), None);
+        let reg8 = RenameIdentity::from_varnode(&make_reg(8, 8), None);
 
         // reg:0 defined in both blocks
-        assert!(defs.contains_key("reg:0"));
-        assert_eq!(defs["reg:0"].len(), 2);
+        assert!(defs.contains_key(&reg0));
+        assert_eq!(defs[&reg0].len(), 2);
 
         // reg:8 defined only in first block
-        assert!(defs.contains_key("reg:8"));
-        assert_eq!(defs["reg:8"].len(), 1);
-
-        // Sizes should be recorded
-        assert_eq!(var_sizes.get("reg:0"), Some(&8));
-        assert_eq!(var_sizes.get("reg:8"), Some(&8));
+        assert!(defs.contains_key(&reg8));
+        assert_eq!(defs[&reg8].len(), 1);
     }
 }
