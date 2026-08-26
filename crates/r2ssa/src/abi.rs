@@ -1,15 +1,16 @@
 //! Canonical calling-convention register facts used by SSA analyses.
 
-use std::collections::{BTreeMap, BTreeSet};
+#[cfg(test)]
+use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 
 use r2il::ArchSpec;
 
 use crate::machine_context::SourceMachineContext;
-use crate::{CanonicalStorageId, CanonicalStorageSpace, MachineArchitectureFamily, SSAVar};
+use crate::{CanonicalStorageId, CanonicalStorageSpace, MachineArchitectureFamily};
 
 #[derive(Debug, Clone)]
 struct AbiSlot {
-    size: u32,
     storage: Option<CanonicalStorageId>,
 }
 
@@ -17,8 +18,9 @@ struct AbiSlot {
 #[derive(Debug, Clone, Default)]
 pub struct AbiProfile {
     args: Vec<AbiSlot>,
-    ret_aliases: BTreeSet<String>,
+    #[cfg(test)]
     alias_to_arg: BTreeMap<String, usize>,
+    #[cfg(test)]
     alias_is_ret: BTreeSet<String>,
     source_owned: bool,
 }
@@ -34,7 +36,31 @@ impl AbiProfile {
         {
             return None;
         }
-        let expected_bits = match context.architecture_family() {
+        let arguments = abi
+            .argument_registers()
+            .iter()
+            .map(|slot| (slot.index(), slot.storage()))
+            .collect::<Vec<_>>();
+        let returns = abi
+            .return_registers()
+            .iter()
+            .map(|slot| slot.storage())
+            .collect::<Vec<_>>();
+        Self::from_canonical_storage_model(
+            context.architecture_family(),
+            memory.default_address_bits(),
+            &arguments,
+            &returns,
+        )
+    }
+
+    fn from_canonical_storage_model(
+        architecture_family: MachineArchitectureFamily,
+        address_bits: u32,
+        argument_registers: &[(u32, CanonicalStorageId)],
+        return_registers: &[CanonicalStorageId],
+    ) -> Option<Self> {
+        let expected_bits = match architecture_family {
             MachineArchitectureFamily::X86
             | MachineArchitectureFamily::Arm
             | MachineArchitectureFamily::RiscV32
@@ -47,16 +73,16 @@ impl AbiProfile {
             | MachineArchitectureFamily::PowerPc64 => 64,
             MachineArchitectureFamily::Unknown => return None,
         };
-        if memory.default_address_bits() != expected_bits {
+        if address_bits != expected_bits {
             return None;
         }
 
-        let mut arguments = abi.argument_registers().to_vec();
-        arguments.sort_by_key(|slot| slot.index());
+        let mut arguments = argument_registers.to_vec();
+        arguments.sort_by_key(|(index, _)| *index);
         if arguments
             .iter()
             .enumerate()
-            .any(|(index, slot)| slot.index() as usize != index)
+            .any(|(expected, (index, _))| *index as usize != expected)
         {
             return None;
         }
@@ -65,8 +91,7 @@ impl AbiProfile {
             ..Self::default()
         };
         let mut argument_storages = BTreeSet::new();
-        for slot in arguments {
-            let storage = slot.storage();
+        for (_, storage) in arguments {
             if storage.space != CanonicalStorageSpace::Register
                 || storage.size == 0
                 || !argument_storages.insert(storage)
@@ -74,35 +99,12 @@ impl AbiProfile {
                 return None;
             }
             out.args.push(AbiSlot {
-                size: storage.size,
                 storage: Some(storage),
             });
-            let mut aliases = 0usize;
-            for (name, candidate) in context.register_storages_by_name() {
-                if storage_contains(storage, *candidate) {
-                    out.alias_to_arg.insert(name.clone(), slot.index() as usize);
-                    aliases += 1;
-                }
-            }
-            if aliases == 0 {
-                return None;
-            }
         }
 
-        for slot in abi.return_registers() {
-            let storage = slot.storage();
+        for &storage in return_registers {
             if storage.space != CanonicalStorageSpace::Register || storage.size == 0 {
-                return None;
-            }
-            let mut aliases = 0usize;
-            for (name, candidate) in context.register_storages_by_name() {
-                if storage_contains(storage, *candidate) {
-                    out.ret_aliases.insert(name.clone());
-                    out.alias_is_ret.insert(name.clone());
-                    aliases += 1;
-                }
-            }
-            if aliases == 0 {
                 return None;
             }
         }
@@ -226,44 +228,32 @@ impl AbiProfile {
 
     fn new(
         args: Vec<(&'static str, u32, &'static [&'static str])>,
-        rets: &[(&'static str, &'static [&'static str])],
+        _rets: &[(&'static str, &'static [&'static str])],
     ) -> Self {
         let mut out = Self::default();
-        for (index, (primary, size, aliases)) in args.into_iter().enumerate() {
-            out.args.push(AbiSlot {
-                size,
-                storage: None,
-            });
-            out.alias_to_arg.insert(primary.to_string(), index);
-            for alias in aliases {
-                out.alias_to_arg.insert((*alias).to_string(), index);
+        for (_index, (_primary, _size, _aliases)) in args.into_iter().enumerate() {
+            out.args.push(AbiSlot { storage: None });
+            #[cfg(test)]
+            {
+                out.alias_to_arg.insert(_primary.to_string(), _index);
+                for alias in _aliases {
+                    out.alias_to_arg.insert((*alias).to_string(), _index);
+                }
             }
         }
-        for (primary, aliases) in rets {
-            out.ret_aliases.insert((*primary).to_string());
+        #[cfg(test)]
+        for (primary, aliases) in _rets {
             out.alias_is_ret.insert((*primary).to_string());
             for alias in *aliases {
-                out.ret_aliases.insert((*alias).to_string());
                 out.alias_is_ret.insert((*alias).to_string());
             }
         }
         out
     }
 
-    pub fn argument_index(&self, name: &str) -> Option<usize> {
+    #[cfg(test)]
+    pub(crate) fn argument_index(&self, name: &str) -> Option<usize> {
         self.alias_to_arg.get(&name.to_ascii_lowercase()).copied()
-    }
-
-    pub fn formal_argument_index(&self, var: &SSAVar) -> Option<usize> {
-        (var.version == 0)
-            .then(|| self.argument_index(&var.name))
-            .flatten()
-    }
-
-    pub fn formal_address_argument_index(&self, var: &SSAVar) -> Option<usize> {
-        let index = self.formal_argument_index(var)?;
-        let slot = self.args.get(index)?;
-        (var.size == slot.size).then_some(index)
     }
 
     pub(crate) fn exact_argument_index_for_storage(
@@ -279,7 +269,8 @@ impl AbiProfile {
         self.source_owned
     }
 
-    pub fn is_return_register(&self, name: &str) -> bool {
+    #[cfg(test)]
+    pub(crate) fn is_return_register(&self, name: &str) -> bool {
         self.alias_is_ret.contains(&name.to_ascii_lowercase())
     }
 
@@ -288,15 +279,123 @@ impl AbiProfile {
     }
 }
 
-fn storage_contains(container: CanonicalStorageId, candidate: CanonicalStorageId) -> bool {
-    if container.space != candidate.space || candidate.size == 0 {
-        return false;
+#[cfg(test)]
+mod tests {
+    use r2il::{AddressSpace, RegisterDef};
+
+    use super::*;
+    use crate::machine_context::{
+        SourceAbiParameterSpec, SourceFunctionInterface, SourceFunctionReturn, SourceMachineRoles,
+    };
+
+    const ARGUMENT: CanonicalStorageId = register_storage(0, 8);
+    const RETURNED: CanonicalStorageId = register_storage(8, 8);
+    const STACK_POINTER: CanonicalStorageId = register_storage(16, 8);
+    const RETURN_ADDRESS: CanonicalStorageId = register_storage(24, 8);
+
+    const fn register_storage(offset: u64, size: u32) -> CanonicalStorageId {
+        CanonicalStorageId {
+            space: CanonicalStorageSpace::Register,
+            offset,
+            size,
+        }
     }
-    candidate
-        .offset
-        .checked_add(u64::from(candidate.size))
-        .zip(container.offset.checked_add(u64::from(container.size)))
-        .is_some_and(|(candidate_end, container_end)| {
-            candidate.offset >= container.offset && candidate_end <= container_end
-        })
+
+    fn exact_context(argument_names: &[&str], return_names: &[&str]) -> SourceMachineContext {
+        let mut arch = ArchSpec::new("x86-64");
+        arch.addr_size = 8;
+        arch.add_space(AddressSpace::ram(8));
+        for name in argument_names {
+            arch.add_register(RegisterDef::new(*name, ARGUMENT.offset, ARGUMENT.size));
+        }
+        for name in return_names {
+            arch.add_register(RegisterDef::new(*name, RETURNED.offset, RETURNED.size));
+        }
+        arch.add_register(RegisterDef::new(
+            "source_sp",
+            STACK_POINTER.offset,
+            STACK_POINTER.size,
+        ));
+        arch.add_register(RegisterDef::new(
+            "source_ra",
+            RETURN_ADDRESS.offset,
+            RETURN_ADDRESS.size,
+        ));
+        arch.return_registers = vec![RegisterDef::new(
+            return_names[0],
+            RETURNED.offset,
+            RETURNED.size,
+        )];
+        let interface = SourceFunctionInterface::new_exact(
+            b"abi-storage-only-test".to_vec(),
+            "test-abi",
+            [SourceAbiParameterSpec::new(0, ARGUMENT)],
+            SourceFunctionReturn::Register { storage: RETURNED },
+            [],
+        )
+        .and_then(|interface| interface.with_return_address_storage(RETURN_ADDRESS))
+        .and_then(|interface| interface.with_stack_pointer_storage(STACK_POINTER))
+        .expect("exact interface");
+        let context = SourceMachineContext::from_blocks_with_interfaces(
+            &[],
+            Some(&arch),
+            Some(interface),
+            SourceMachineRoles::default(),
+            None,
+            Vec::new(),
+        );
+        assert!(context.abi_model().is_coherent());
+        context
+    }
+
+    #[test]
+    fn exact_storage_model_requires_no_presentation_aliases() {
+        let profile = AbiProfile::from_canonical_storage_model(
+            MachineArchitectureFamily::X86_64,
+            64,
+            &[(0, ARGUMENT)],
+            &[RETURNED],
+        )
+        .expect("canonical storage is sufficient");
+
+        assert!(profile.is_source_owned());
+        assert_eq!(profile.argument_count(), 1);
+        assert_eq!(profile.exact_argument_index_for_storage(ARGUMENT), Some(0));
+        assert!(profile.alias_to_arg.is_empty());
+        assert!(profile.alias_is_ret.is_empty());
+    }
+
+    #[test]
+    fn exact_machine_profile_ignores_multiple_presentation_aliases() {
+        let context = exact_context(
+            &["argument", "argument_alias", "another_argument_alias"],
+            &["result", "result_alias"],
+        );
+        let profile = AbiProfile::from_machine_context(&context)
+            .expect("presentation alias count does not affect exact ABI storage");
+
+        assert_eq!(profile.exact_argument_index_for_storage(ARGUMENT), Some(0));
+        assert!(profile.alias_to_arg.is_empty());
+        assert!(profile.alias_is_ret.is_empty());
+    }
+
+    #[test]
+    fn exact_machine_profile_ignores_renamed_presentation_aliases() {
+        let first =
+            AbiProfile::from_machine_context(&exact_context(&["first_arg"], &["first_ret"]))
+                .expect("first spelling set");
+        let renamed = AbiProfile::from_machine_context(&exact_context(
+            &["completely_renamed_arg"],
+            &["completely_renamed_ret"],
+        ))
+        .expect("renamed spelling set");
+
+        for profile in [&first, &renamed] {
+            assert!(profile.is_source_owned());
+            assert_eq!(profile.argument_count(), 1);
+            assert_eq!(profile.exact_argument_index_for_storage(ARGUMENT), Some(0));
+            assert!(profile.alias_to_arg.is_empty());
+            assert!(profile.alias_is_ret.is_empty());
+        }
+    }
 }
