@@ -2487,6 +2487,10 @@ impl SSAFunction {
     }
 
     /// Seal-check the complete SSA definition/use, phi, storage, and width contract.
+    #[expect(
+        clippy::result_large_err,
+        reason = "the public validator returns the exact typed SSA failure; validation is an artifact-boundary operation"
+    )]
     pub fn validate_integrity(&self) -> Result<(), SsaIntegrityError> {
         validate_ssa_function(self)
     }
@@ -3796,7 +3800,7 @@ impl RegisterFamilyInfo {
         let idx = self
             .family_ranges
             .partition_point(|(start, _, _)| *start <= offset);
-        let (start, family_end, family_id) = *self.family_ranges[..idx].iter().rev().next()?;
+        let (start, family_end, family_id) = *self.family_ranges[..idx].iter().next_back()?;
         if offset < start || end > family_end {
             return None;
         }

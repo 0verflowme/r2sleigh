@@ -896,12 +896,12 @@ impl<'a> FoldingContext<'a> {
         control: crate::DecompileWorkControl<'_>,
     ) -> Result<(), analysis::PreparedRuntimeFactsError> {
         control.poll()?;
-        if self.inputs.prepared_ssa.is_some() {
-            if std::env::var_os("R2SLEIGH_DEBUG_UNKEYED").is_some() {
-                let unkeyed = &self.use_info().unkeyed_writes;
-                let total: usize = unkeyed.values().sum();
-                eprintln!("UNKEYED total={total} by_store={unkeyed:?}");
-            }
+        if self.inputs.prepared_ssa.is_some()
+            && std::env::var_os("R2SLEIGH_DEBUG_UNKEYED").is_some()
+        {
+            let unkeyed = &self.use_info().unkeyed_writes;
+            let total: usize = unkeyed.values().sum();
+            eprintln!("UNKEYED total={total} by_store={unkeyed:?}");
         }
         let symbols = &self.symbols;
 
@@ -916,7 +916,7 @@ impl<'a> FoldingContext<'a> {
                 .normalization_origins
                 .expect("prepared folding requires sealed normalization origins");
             self.state.analysis_ctx = analysis::build_prepared_runtime_facts_with_control(
-                &symbols,
+                symbols,
                 blocks,
                 &env,
                 prepared,

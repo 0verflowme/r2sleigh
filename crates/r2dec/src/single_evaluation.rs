@@ -267,10 +267,7 @@ mod tests {
         site: CallSite,
     ) -> CExpr {
         CExpr::Call {
-            func: Box::new(CExpr::Var(crate::symbol::declare(
-                &symbols,
-                &name.to_string(),
-            ))),
+            func: Box::new(CExpr::Var(crate::symbol::declare(symbols, name))),
             args: vec![CExpr::IntLit(16)],
             site: Some(site),
         }

@@ -154,7 +154,7 @@ impl<'a> LowerCtx<'a> {
 
         #[cfg(test)]
         {
-            return Ok(crate::naming::spell_var(var, self));
+            Ok(crate::naming::spell_var(var, self))
         }
         #[cfg(not(test))]
         Err(OpLoweringRefusal::MissingProgramVariableAuthorization)
@@ -1009,10 +1009,7 @@ impl<'a> LowerCtx<'a> {
         if abs == 0 {
             return None;
         }
-        match u32::try_from(abs) {
-            Ok(value) => Some(value),
-            Err(_) => None,
-        }
+        u32::try_from(abs).ok()
     }
 
     fn extract_mul_const(&self, expr: &CExpr, depth: u32) -> Option<(CExpr, i64)> {
@@ -1105,10 +1102,7 @@ impl<'a> LowerCtx<'a> {
     fn literal_to_i64(&self, expr: &CExpr) -> Option<i64> {
         match expr {
             CExpr::IntLit(v) => Some(*v),
-            CExpr::UIntLit(v) => match i64::try_from(*v) {
-                Ok(value) => Some(value),
-                Err(_) => None,
-            },
+            CExpr::UIntLit(v) => i64::try_from(*v).ok(),
             _ => None,
         }
     }
@@ -1287,6 +1281,23 @@ fn uint_type_from_size(size: u32) -> CType {
 }
 
 #[cfg(test)]
+impl crate::naming::NameSource for LowerCtx<'_> {
+    fn carrier_alias(&self, _display: &str) -> Option<String> {
+        None
+    }
+
+    fn var_alias(&self, display: &str) -> Option<String> {
+        self.var_alias_for_name(display).cloned()
+    }
+
+    fn param_alias(&self, register: &str) -> Option<String> {
+        self.param_register_aliases
+            .get(&register.to_ascii_lowercase())
+            .cloned()
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1308,7 +1319,7 @@ mod tests {
         _forwarded_values: &'a HashMap<String, ValueProvenance>,
         #[cfg(test)] _function_names: &'a HashMap<u64, String>,
         #[cfg(test)] _strings: &'a HashMap<u64, String>,
-        #[cfg(test)] _symbols: &'a HashMap<u64, String>,
+        #[cfg(test)] _symbol_names: &'a HashMap<u64, String>,
     ) -> LowerCtx<'a> {
         let param_register_aliases = Box::leak(Box::new(HashMap::new()));
         LowerCtx {
@@ -2066,22 +2077,5 @@ mod tests {
             Err(OpLoweringRefusal::MissingProgramVariableAuthorization),
             "name-keyed pointer arithmetic cannot authorize an exact projection"
         );
-    }
-}
-
-#[cfg(test)]
-impl crate::naming::NameSource for LowerCtx<'_> {
-    fn carrier_alias(&self, _display: &str) -> Option<String> {
-        None
-    }
-
-    fn var_alias(&self, display: &str) -> Option<String> {
-        self.var_alias_for_name(display).cloned()
-    }
-
-    fn param_alias(&self, register: &str) -> Option<String> {
-        self.param_register_aliases
-            .get(&register.to_ascii_lowercase())
-            .cloned()
     }
 }

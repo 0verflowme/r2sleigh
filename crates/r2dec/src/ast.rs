@@ -440,10 +440,7 @@ impl CExpr {
                     base: right_base,
                     index: right_index,
                 },
-            ) => {
-                left_base.transparently_eq(right_base)
-                    && left_index.transparently_eq(right_index)
-            }
+            ) => left_base.transparently_eq(right_base) && left_index.transparently_eq(right_index),
             (
                 Self::Member {
                     base: left_base,
@@ -1220,9 +1217,9 @@ impl ReachableObservations {
             .enumerate()
             .filter_map(|(index, reachable)| {
                 if *reachable {
-                        u32::try_from(index)
-                            .ok()
-                            .map(crate::observation_journal::test_render_observation_id)
+                    u32::try_from(index)
+                        .ok()
+                        .map(crate::observation_journal::test_render_observation_id)
                 } else {
                     None
                 }
@@ -2081,25 +2078,37 @@ mod tests {
         let expr = CExpr::binary(
             BinaryOp::Add,
             CExpr::var(crate::symbol::declare(&symbols, "a")),
-            CExpr::call(CExpr::var(crate::symbol::declare(&symbols, "f")), vec![CExpr::int(1), CExpr::var(crate::symbol::declare(&symbols, "b"))]),
+            CExpr::call(
+                CExpr::var(crate::symbol::declare(&symbols, "f")),
+                vec![
+                    CExpr::int(1),
+                    CExpr::var(crate::symbol::declare(&symbols, "b")),
+                ],
+            ),
         );
         let mut vars = Vec::new();
         expr.visit(&mut |node| {
             if let CExpr::Var(name) = node {
-                vars.push(name.clone());
+                vars.push(*name);
             }
         });
-        assert!(vars.iter().any(|v| &*symbols.borrow().name(*v) == "a"));
-        assert!(vars.iter().any(|v| &*symbols.borrow().name(*v) == "f"));
-        assert!(vars.iter().any(|v| &*symbols.borrow().name(*v) == "b"));
+        assert!(vars.iter().any(|v| symbols.borrow().name(*v) == "a"));
+        assert!(vars.iter().any(|v| symbols.borrow().name(*v) == "f"));
+        assert!(vars.iter().any(|v| symbols.borrow().name(*v) == "b"));
     }
 
     #[test]
     fn test_expr_map_children_updates_direct_children() {
         let symbols = test_table();
-        let expr = CExpr::binary(BinaryOp::Add, CExpr::var(crate::symbol::declare(&symbols, "a")), CExpr::int(1));
+        let expr = CExpr::binary(
+            BinaryOp::Add,
+            CExpr::var(crate::symbol::declare(&symbols, "a")),
+            CExpr::int(1),
+        );
         let mut mapper = |child: CExpr| match child {
-            CExpr::Var(name) if name == crate::symbol::declare(&symbols, "a") => CExpr::var(crate::symbol::declare(&symbols, "x")),
+            CExpr::Var(name) if name == crate::symbol::declare(&symbols, "a") => {
+                CExpr::var(crate::symbol::declare(&symbols, "x"))
+            }
             other => other,
         };
         let rewritten = expr.map_children(&mut mapper);
@@ -2123,11 +2132,7 @@ mod tests {
         let (id, observed_one) = owner
             .observe_expr(CExpr::IntLit(1))
             .expect("allocate observation");
-        let rewritten = rewrite(CExpr::binary(
-            BinaryOp::Add,
-            observed_one,
-            CExpr::IntLit(1),
-        ));
+        let rewritten = rewrite(CExpr::binary(BinaryOp::Add, observed_one, CExpr::IntLit(1)));
         assert_eq!(
             rewritten,
             CExpr::binary(
@@ -2171,18 +2176,20 @@ mod tests {
         let (index_id, index) = owner
             .observe_expr(CExpr::IntLit(2))
             .expect("index observation");
-        let function = CFunction::new("inspect", CType::Void).with_body(vec![CStmt::Expr(
-            CExpr::Subscript {
+        let function =
+            CFunction::new("inspect", CType::Void).with_body(vec![CStmt::Expr(CExpr::Subscript {
                 base: Box::new(base),
                 index: Box::new(index),
-            },
-        )]);
+            })]);
         let mut visited = Vec::new();
         inspect_render_observations(
             &function,
             owner.expected_count(),
             |id, node| -> Result<(), std::convert::Infallible> {
-                assert!(matches!(node, RenderObservationNode::Expr(CExpr::IntLit(_))));
+                assert!(matches!(
+                    node,
+                    RenderObservationNode::Expr(CExpr::IntLit(_))
+                ));
                 visited.push(id);
                 Ok(())
             },
@@ -2229,11 +2236,7 @@ mod tests {
             .observe_expr(CExpr::IntLit(1))
             .expect("allocate nested expression observation");
         let (expr_id, expr) = owner
-            .observe_expr(CExpr::binary(
-                BinaryOp::Add,
-                nested_expr,
-                CExpr::IntLit(2),
-            ))
+            .observe_expr(CExpr::binary(BinaryOp::Add, nested_expr, CExpr::IntLit(2)))
             .expect("allocate expression observation");
         let (stmt_id, stmt) = owner
             .observe_stmt(CStmt::Block(vec![CStmt::Expr(expr)]))
@@ -2241,10 +2244,7 @@ mod tests {
         let (dropped_id, dropped_stmt) = owner
             .observe_stmt(CStmt::Expr(CExpr::IntLit(99)))
             .expect("allocate dropped observation");
-        plain.body = vec![
-            stmt,
-            dropped_stmt,
-        ];
+        plain.body = vec![stmt, dropped_stmt];
 
         plain.body.pop();
         let reachable = strip_render_observations(&mut plain, owner.expected_count())
@@ -2270,10 +2270,8 @@ mod tests {
 
         assert!(serde_json::to_string(&function).is_err());
         assert!(
-            serde_json::from_str::<CStmt>(
-                r#"{"Observed":{"id":0,"stmt":{"Expr":{"IntLit":1}}}}"#,
-            )
-            .is_err()
+            serde_json::from_str::<CStmt>(r#"{"Observed":{"id":0,"stmt":{"Expr":{"IntLit":1}}}}"#,)
+                .is_err()
         );
 
         let reachable = strip_render_observations(&mut function, owner.expected_count())
@@ -2286,12 +2284,11 @@ mod tests {
     #[test]
     fn stripping_rejects_duplicate_and_out_of_range_observations_without_mutation() {
         let duplicate = RenderObservationId::from_index(0);
-        let mut duplicate_function = CFunction::new("duplicate", CType::Void).with_body(vec![
-            CStmt::observed(
+        let mut duplicate_function =
+            CFunction::new("duplicate", CType::Void).with_body(vec![CStmt::observed(
                 duplicate,
                 CStmt::Expr(CExpr::observed(duplicate, CExpr::IntLit(1))),
-            ),
-        ]);
+            )]);
         let duplicate_before = duplicate_function.clone();
         assert_eq!(
             strip_render_observations(&mut duplicate_function, 1),
@@ -2300,9 +2297,8 @@ mod tests {
         assert_eq!(duplicate_function, duplicate_before);
 
         let out_of_range = RenderObservationId::from_index(1);
-        let mut out_of_range_function = CFunction::new("range", CType::Void).with_body(vec![
-            CStmt::observed(out_of_range, CStmt::Empty),
-        ]);
+        let mut out_of_range_function = CFunction::new("range", CType::Void)
+            .with_body(vec![CStmt::observed(out_of_range, CStmt::Empty)]);
         let out_of_range_before = out_of_range_function.clone();
         assert_eq!(
             strip_render_observations(&mut out_of_range_function, 1),

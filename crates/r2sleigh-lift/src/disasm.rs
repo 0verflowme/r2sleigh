@@ -1335,15 +1335,14 @@ impl Disassembler {
         // wrong rather than merely missing. Agreement between the interface and
         // the captured field flags is already an invariant established when the
         // snapshot is constructed, so it is not re-checked here.
-        if let Some(interface) = source.function_interface() {
-            if !captured_frame_pointer_storage_matches_arch(interface, trusted_arch)
-                || !captured_return_mechanism_matches_arch(interface, trusted_arch)
-            {
-                return Err(LiftError::Unsupported(
-                    "captured frame/return mechanism conflicts with the exact lifted machine"
-                        .to_string(),
-                ));
-            }
+        if let Some(interface) = source.function_interface()
+            && (!captured_frame_pointer_storage_matches_arch(interface, trusted_arch)
+                || !captured_return_mechanism_matches_arch(interface, trusted_arch))
+        {
+            return Err(LiftError::Unsupported(
+                "captured frame/return mechanism conflicts with the exact lifted machine"
+                    .to_string(),
+            ));
         }
         let mut ranges = Vec::with_capacity(source.image().blocks().len());
         let mut blocks = Vec::with_capacity(source.image().blocks().len());

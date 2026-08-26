@@ -450,10 +450,10 @@ fn prepared_value_program_expr(
 
     #[cfg(test)]
     {
-        return Some(crate::symbol::var_ref(
+        Some(crate::symbol::var_ref(
             symbols,
             crate::naming::spell_var(var, view),
-        ));
+        ))
     }
     #[cfg(not(test))]
     {
@@ -476,11 +476,10 @@ fn prepared_parameter_program_expr(
 
     #[cfg(test)]
     {
-        return view
-            .param_alias_by_reg
+        view.param_alias_by_reg
             .get(&var.name.to_ascii_lowercase())
             .cloned()
-            .map(|name| crate::symbol::var_ref(symbols, name));
+            .map(|name| crate::symbol::var_ref(symbols, name))
     }
     #[cfg(not(test))]
     {
@@ -572,15 +571,7 @@ pub(crate) fn build_prepared_runtime_facts_with_control(
     collect_prepared_runtime_facts(symbols, &mut use_info, blocks, prepared, view);
     #[cfg(test)]
     pin_prepared_loop_carried_phi_values(&mut use_info, prepared, view);
-    populate_prepared_call_runtime_facts(
-        symbols,
-        &mut use_info,
-        blocks,
-        env,
-        prepared,
-        view,
-        origins,
-    );
+    populate_prepared_call_runtime_facts(symbols, &mut use_info, blocks, prepared, view, origins);
     overlay_prepared_switch_roots(&mut use_info, prepared, view);
     populate_prepared_render_definitions(symbols, &mut use_info, blocks, env, view)?;
 
@@ -809,7 +800,7 @@ fn is_self_render_definition(
     } else {
         dst.name.to_ascii_lowercase()
     };
-    matches!(expr, CExpr::Var(name) if &*crate::symbol::spelling(symbols, *name) == &dst_display || crate::symbol::spelling(symbols, *name).eq_ignore_ascii_case(&dst_rendered))
+    matches!(expr, CExpr::Var(name) if *crate::symbol::spelling(symbols, *name) == dst_display || crate::symbol::spelling(symbols, *name).eq_ignore_ascii_case(&dst_rendered))
 }
 
 fn is_self_render_definition_for_value(
@@ -830,7 +821,7 @@ fn is_self_render_definition_for_value(
     }
     #[cfg(test)]
     {
-        return is_self_render_definition(symbols, dst, expr);
+        is_self_render_definition(symbols, dst, expr)
     }
     #[cfg(not(test))]
     {
@@ -1466,22 +1457,24 @@ fn prepared_expr_is_generic_scalar_alias(
     #[cfg(not(test))]
     {
         let _ = (symbols, expr);
-        return false;
+        false
     }
     #[cfg(test)]
-    match expr {
-        CExpr::Var(name) => {
-            is_generic_prepared_stack_alias(&crate::symbol::spelling(symbols, *name))
-                || crate::symbol::spelling(symbols, *name).ends_with("_home")
+    {
+        match expr {
+            CExpr::Var(name) => {
+                is_generic_prepared_stack_alias(&crate::symbol::spelling(symbols, *name))
+                    || crate::symbol::spelling(symbols, *name).ends_with("_home")
+            }
+            CExpr::Paren(inner) | CExpr::Cast { expr: inner, .. } => {
+                prepared_expr_is_generic_scalar_alias(symbols, inner)
+            }
+            CExpr::Binary { left, right, .. } => {
+                prepared_expr_is_generic_scalar_alias(symbols, left)
+                    && prepared_expr_is_generic_scalar_alias(symbols, right)
+            }
+            _ => false,
         }
-        CExpr::Paren(inner) | CExpr::Cast { expr: inner, .. } => {
-            prepared_expr_is_generic_scalar_alias(symbols, inner)
-        }
-        CExpr::Binary { left, right, .. } => {
-            prepared_expr_is_generic_scalar_alias(symbols, left)
-                && prepared_expr_is_generic_scalar_alias(symbols, right)
-        }
-        _ => false,
     }
 }
 
@@ -2458,9 +2451,9 @@ fn prepared_stack_alias_name_for_object_offset(
     }
     #[cfg(test)]
     {
-        return preferred_stack_alias_name(view, offset)
+        preferred_stack_alias_name(view, offset)
             .filter(|alias| authorized.contains(&alias.to_ascii_lowercase()))
-            .or_else(|| authorized.iter().next().cloned());
+            .or_else(|| authorized.iter().next().cloned())
     }
     #[cfg(not(test))]
     {
@@ -2882,8 +2875,8 @@ fn prepared_simplify_linear_addition(
 ) -> Option<CExpr> {
     let mut terms = Vec::new();
     let mut constant = 0i64;
-    prepared_collect_linear_add_terms(symbols, view, left, 1, &mut terms, &mut constant)?;
-    prepared_collect_linear_add_terms(symbols, view, right, 1, &mut terms, &mut constant)?;
+    prepared_collect_linear_add_terms(view, left, 1, &mut terms, &mut constant)?;
+    prepared_collect_linear_add_terms(view, right, 1, &mut terms, &mut constant)?;
     terms.retain(|(_, coeff)| *coeff != 0);
     terms.sort_by_key(|(term, _)| prepared_expr_order_key(symbols, view, term));
 
@@ -2901,7 +2894,6 @@ fn prepared_simplify_linear_addition(
 }
 
 fn prepared_collect_linear_add_terms(
-    symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
     view: &PreparedSemanticView,
     expr: &CExpr,
     scale: i64,
@@ -2914,8 +2906,8 @@ fn prepared_collect_linear_add_terms(
             left,
             right,
         } => {
-            prepared_collect_linear_add_terms(symbols, view, left, scale, terms, constant)?;
-            prepared_collect_linear_add_terms(symbols, view, right, scale, terms, constant)
+            prepared_collect_linear_add_terms(view, left, scale, terms, constant)?;
+            prepared_collect_linear_add_terms(view, right, scale, terms, constant)
         }
         CExpr::Binary {
             op: BinaryOp::Mul,
@@ -2923,12 +2915,12 @@ fn prepared_collect_linear_add_terms(
             right,
         } => {
             if let Some(coeff) = prepared_literal_i64(right)
-                && let Some(term) = prepared_linear_atom_expr(symbols, view, left)
+                && let Some(term) = prepared_linear_atom_expr(view, left)
             {
                 return prepared_push_linear_term(terms, term, scale.checked_mul(coeff)?);
             }
             if let Some(coeff) = prepared_literal_i64(left)
-                && let Some(term) = prepared_linear_atom_expr(symbols, view, right)
+                && let Some(term) = prepared_linear_atom_expr(view, right)
             {
                 return prepared_push_linear_term(terms, term, scale.checked_mul(coeff)?);
             }
@@ -2944,10 +2936,10 @@ fn prepared_collect_linear_add_terms(
             Some(())
         }
         CExpr::Paren(inner) => {
-            prepared_collect_linear_add_terms(symbols, view, inner, scale, terms, constant)
+            prepared_collect_linear_add_terms(view, inner, scale, terms, constant)
         }
         _ => {
-            let term = prepared_linear_atom_expr(symbols, view, expr)?;
+            let term = prepared_linear_atom_expr(view, expr)?;
             prepared_push_linear_term(terms, term, scale)
         }
     }
@@ -2968,16 +2960,12 @@ fn prepared_parameter_rank(
         })
 }
 
-fn prepared_linear_atom_expr(
-    symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
-    view: &PreparedSemanticView,
-    expr: &CExpr,
-) -> Option<CExpr> {
+fn prepared_linear_atom_expr(view: &PreparedSemanticView, expr: &CExpr) -> Option<CExpr> {
     match expr {
         CExpr::Var(name) if prepared_parameter_rank(view, *name).is_some() => Some(expr.clone()),
-        CExpr::Paren(inner) => prepared_linear_atom_expr(symbols, view, inner),
+        CExpr::Paren(inner) => prepared_linear_atom_expr(view, inner),
         CExpr::Cast { ty, expr: inner }
-            if ty.is_integer() && prepared_linear_atom_expr(symbols, view, inner).is_some() =>
+            if ty.is_integer() && prepared_linear_atom_expr(view, inner).is_some() =>
         {
             Some(expr.clone())
         }
@@ -3427,20 +3415,15 @@ fn seed_prepared_stack_facts(
             value_kind: StackSlotValueKind::AddressLike,
         };
         merge_prepared_stack_slot(use_info, Some(value_id), provenance);
+        #[cfg(test)]
+        let test_alias = preferred_stack_alias_name(view, offset)
+            .map(|name| crate::symbol::var_ref(symbols, name));
+        #[cfg(not(test))]
+        let test_alias = None;
         if let Some(stack_expr) = view
             .admitted_stack_symbol(*object_id)
             .map(CExpr::Var)
-            .or_else(|| {
-                #[cfg(test)]
-                {
-                    return preferred_stack_alias_name(view, offset)
-                        .map(|name| crate::symbol::var_ref(symbols, name));
-                }
-                #[cfg(not(test))]
-                {
-                    None
-                }
-            })
+            .or(test_alias)
         {
             #[cfg(test)]
             _stack_info
@@ -3615,7 +3598,6 @@ fn populate_prepared_call_runtime_facts(
     symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
     use_info: &mut UseInfo,
     blocks: &[SSABlock],
-    env: &PassEnv<'_>,
     prepared: &SsaArtifact,
     view: &PreparedSemanticView,
     origins: &crate::normalize::NormalizationOrigins,
@@ -3647,7 +3629,7 @@ fn populate_prepared_call_runtime_facts(
                 continue;
             }
 
-            if let Some(call_expr) = prepared_call_expr(site, symbols, call_view, view, env) {
+            if let Some(call_expr) = prepared_call_expr(site, symbols, call_view) {
                 use_info.call_result_exprs.insert(site, call_expr.clone());
                 record_prepared_call_result_facts(
                     symbols, use_info, site, prepared, view, &call_expr,
@@ -3794,8 +3776,6 @@ fn prepared_call_expr(
     site: (u64, usize),
     symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
     call_view: &PreparedCallView,
-    view: &PreparedSemanticView,
-    env: &PassEnv<'_>,
 ) -> Option<CExpr> {
     if !prepared_call_render_authorized(call_view) {
         return None;
@@ -3807,9 +3787,7 @@ fn prepared_call_expr(
     let args = call_view
         .authoritative_args
         .iter()
-        .map(|arg| {
-            normalize_prepared_inline_expr(symbols, arg.clone(), view, env, 0, &mut HashSet::new())
-        })
+        .map(|arg| normalize_prepared_inline_expr(arg.clone(), 0))
         .collect();
     Some(CExpr::call_at(site, callee, args))
 }
@@ -3911,14 +3889,7 @@ fn record_prepared_call_result_facts(
     }
 }
 
-fn normalize_prepared_inline_expr(
-    symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
-    expr: CExpr,
-    view: &PreparedSemanticView,
-    env: &PassEnv<'_>,
-    depth: u32,
-    visited: &mut HashSet<String>,
-) -> CExpr {
+fn normalize_prepared_inline_expr(expr: CExpr, depth: u32) -> CExpr {
     if depth > 8 {
         return expr;
     }
@@ -3927,98 +3898,44 @@ fn normalize_prepared_inline_expr(
         // SymbolId already is the exact rendered identity. No presentation
         // spelling is reversed to discover another value.
         CExpr::Var(name) => CExpr::Var(name),
-        CExpr::Paren(inner) => CExpr::Paren(Box::new(normalize_prepared_inline_expr(
-            symbols,
-            *inner,
-            view,
-            env,
-            depth + 1,
-            visited,
-        ))),
-        CExpr::Cast { ty, expr } => CExpr::cast(
-            ty,
-            normalize_prepared_inline_expr(symbols, *expr, view, env, depth + 1, visited),
-        ),
-        CExpr::AddrOf(inner) => CExpr::AddrOf(Box::new(normalize_prepared_inline_expr(
-            symbols,
-            *inner,
-            view,
-            env,
-            depth + 1,
-            visited,
-        ))),
-        CExpr::Deref(inner) => CExpr::Deref(Box::new(normalize_prepared_inline_expr(
-            symbols,
-            *inner,
-            view,
-            env,
-            depth + 1,
-            visited,
-        ))),
-        CExpr::Unary { op, operand } => CExpr::unary(
-            op,
-            normalize_prepared_inline_expr(symbols, *operand, view, env, depth + 1, visited),
-        ),
+        CExpr::Paren(inner) => {
+            CExpr::Paren(Box::new(normalize_prepared_inline_expr(*inner, depth + 1)))
+        }
+        CExpr::Cast { ty, expr } => {
+            CExpr::cast(ty, normalize_prepared_inline_expr(*expr, depth + 1))
+        }
+        CExpr::AddrOf(inner) => {
+            CExpr::AddrOf(Box::new(normalize_prepared_inline_expr(*inner, depth + 1)))
+        }
+        CExpr::Deref(inner) => {
+            CExpr::Deref(Box::new(normalize_prepared_inline_expr(*inner, depth + 1)))
+        }
+        CExpr::Unary { op, operand } => {
+            CExpr::unary(op, normalize_prepared_inline_expr(*operand, depth + 1))
+        }
         CExpr::Binary { op, left, right } => CExpr::binary(
             op,
-            normalize_prepared_inline_expr(symbols, *left, view, env, depth + 1, visited),
-            normalize_prepared_inline_expr(symbols, *right, view, env, depth + 1, visited),
+            normalize_prepared_inline_expr(*left, depth + 1),
+            normalize_prepared_inline_expr(*right, depth + 1),
         ),
         CExpr::Subscript { base, index } => CExpr::Subscript {
-            base: Box::new(normalize_prepared_inline_expr(
-                symbols,
-                *base,
-                view,
-                env,
-                depth + 1,
-                visited,
-            )),
-            index: Box::new(normalize_prepared_inline_expr(
-                symbols,
-                *index,
-                view,
-                env,
-                depth + 1,
-                visited,
-            )),
+            base: Box::new(normalize_prepared_inline_expr(*base, depth + 1)),
+            index: Box::new(normalize_prepared_inline_expr(*index, depth + 1)),
         },
         CExpr::Member { base, member } => CExpr::Member {
-            base: Box::new(normalize_prepared_inline_expr(
-                symbols,
-                *base,
-                view,
-                env,
-                depth + 1,
-                visited,
-            )),
+            base: Box::new(normalize_prepared_inline_expr(*base, depth + 1)),
             member,
         },
         CExpr::PtrMember { base, member } => CExpr::PtrMember {
-            base: Box::new(normalize_prepared_inline_expr(
-                symbols,
-                *base,
-                view,
-                env,
-                depth + 1,
-                visited,
-            )),
+            base: Box::new(normalize_prepared_inline_expr(*base, depth + 1)),
             member,
         },
         CExpr::Call { func, args, site } => CExpr::Call {
             site,
-            func: Box::new(normalize_prepared_inline_expr(
-                symbols,
-                *func,
-                view,
-                env,
-                depth + 1,
-                visited,
-            )),
+            func: Box::new(normalize_prepared_inline_expr(*func, depth + 1)),
             args: args
                 .into_iter()
-                .map(|arg| {
-                    normalize_prepared_inline_expr(symbols, arg, view, env, depth + 1, visited)
-                })
+                .map(|arg| normalize_prepared_inline_expr(arg, depth + 1))
                 .collect(),
         },
         CExpr::Ternary {
@@ -4026,40 +3943,34 @@ fn normalize_prepared_inline_expr(
             then_expr,
             else_expr,
         } => CExpr::Ternary {
-            cond: Box::new(normalize_prepared_inline_expr(
-                symbols,
-                *cond,
-                view,
-                env,
-                depth + 1,
-                visited,
-            )),
-            then_expr: Box::new(normalize_prepared_inline_expr(
-                symbols,
-                *then_expr,
-                view,
-                env,
-                depth + 1,
-                visited,
-            )),
-            else_expr: Box::new(normalize_prepared_inline_expr(
-                symbols,
-                *else_expr,
-                view,
-                env,
-                depth + 1,
-                visited,
-            )),
+            cond: Box::new(normalize_prepared_inline_expr(*cond, depth + 1)),
+            then_expr: Box::new(normalize_prepared_inline_expr(*then_expr, depth + 1)),
+            else_expr: Box::new(normalize_prepared_inline_expr(*else_expr, depth + 1)),
         },
         CExpr::Comma(items) => CExpr::Comma(
             items
                 .into_iter()
-                .map(|item| {
-                    normalize_prepared_inline_expr(symbols, item, view, env, depth + 1, visited)
-                })
+                .map(|item| normalize_prepared_inline_expr(item, depth + 1))
                 .collect(),
         ),
         other => other,
+    }
+}
+
+#[cfg(test)]
+impl crate::naming::NameSource for PreparedSemanticView {
+    fn carrier_alias(&self, _display: &str) -> Option<String> {
+        None
+    }
+
+    fn var_alias(&self, _display: &str) -> Option<String> {
+        None
+    }
+
+    fn param_alias(&self, register: &str) -> Option<String> {
+        self.param_alias_by_reg
+            .get(&register.to_ascii_lowercase())
+            .cloned()
     }
 }
 
@@ -4983,7 +4894,7 @@ mod tests {
             sp_name: "RSP",
             fp_name: "RBP",
             ret_reg_name: "RAX",
-            flag_regs: &crate::analysis::no_flag_registers(),
+            flag_regs: crate::analysis::no_flag_registers(),
             function_names: &function_names,
             strings: &strings,
             binary_symbols: &binary_symbols,
@@ -5058,7 +4969,7 @@ mod tests {
         assert!(is_self_render_definition(
             &symbols,
             &dst,
-            &CExpr::Var(crate::symbol::declare(&symbols, &dst.display_name()))
+            &CExpr::Var(crate::symbol::declare(&symbols, dst.display_name()))
         ));
         assert!(!is_self_render_definition(
             &symbols,
@@ -5111,22 +5022,5 @@ mod tests {
             if_true: test_var("W0", 1, 4),
             if_false: test_var("W1", 1, 4),
         }));
-    }
-}
-
-#[cfg(test)]
-impl crate::naming::NameSource for PreparedSemanticView {
-    fn carrier_alias(&self, _display: &str) -> Option<String> {
-        None
-    }
-
-    fn var_alias(&self, _display: &str) -> Option<String> {
-        None
-    }
-
-    fn param_alias(&self, register: &str) -> Option<String> {
-        self.param_alias_by_reg
-            .get(&register.to_ascii_lowercase())
-            .cloned()
     }
 }

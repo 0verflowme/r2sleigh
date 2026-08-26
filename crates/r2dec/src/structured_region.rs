@@ -192,6 +192,7 @@ pub(crate) struct SealedStructuredRegionArtifact {
 }
 
 impl SealedStructuredRegionArtifact {
+    #[cfg(test)]
     pub(crate) const fn authority(&self) -> &StructuredRegionArtifactAuthority {
         &self.authority
     }
@@ -578,12 +579,7 @@ impl SealedStructuredBody {
     /// Consumers receive both the canonical artifact node and the semantic
     /// statement it owns.  They never need to match the internal AST wrapper.
     pub(crate) fn visit_occurrences(&self, mut visit: impl FnMut(StructuredRegionOccurrence<'_>)) {
-        visit_occurrences(
-            &self.stmt,
-            &self.regions,
-            self.regions.authority(),
-            &mut visit,
-        );
+        visit_occurrences(&self.stmt, &self.regions, &mut visit);
     }
 
     /// Visit semantic statement occurrences with their exact innermost region.
@@ -597,13 +593,7 @@ impl SealedStructuredBody {
         &self,
         mut visit: impl FnMut(ScopedStructuredStatement<'_>),
     ) {
-        visit_scoped_stmt(
-            &self.stmt,
-            None,
-            &self.regions,
-            self.regions.authority(),
-            &mut visit,
-        );
+        visit_scoped_stmt(&self.stmt, None, &self.regions, &mut visit);
     }
 }
 
@@ -810,7 +800,6 @@ fn seal_stmt_children(
 fn visit_occurrences<'a>(
     stmt: &'a CStmt,
     regions: &'a SealedStructuredRegionArtifact,
-    authority: &StructuredRegionArtifactAuthority,
     visit: &mut impl FnMut(StructuredRegionOccurrence<'a>),
 ) {
     match stmt {
@@ -833,12 +822,12 @@ fn visit_occurrences<'a>(
                 #[cfg(not(test))]
                 _marker: std::marker::PhantomData,
             });
-            visit_occurrences(stmt, regions, authority, visit);
+            visit_occurrences(stmt, regions, visit);
         }
-        CStmt::Observed { stmt, .. } => visit_occurrences(stmt, regions, authority, visit),
+        CStmt::Observed { stmt, .. } => visit_occurrences(stmt, regions, visit),
         CStmt::Block(stmts) => {
             for stmt in stmts {
-                visit_occurrences(stmt, regions, authority, visit);
+                visit_occurrences(stmt, regions, visit);
             }
         }
         CStmt::If {
@@ -846,29 +835,29 @@ fn visit_occurrences<'a>(
             else_body,
             ..
         } => {
-            visit_occurrences(then_body, regions, authority, visit);
+            visit_occurrences(then_body, regions, visit);
             if let Some(else_body) = else_body {
-                visit_occurrences(else_body, regions, authority, visit);
+                visit_occurrences(else_body, regions, visit);
             }
         }
         CStmt::While { body, .. } | CStmt::DoWhile { body, .. } => {
-            visit_occurrences(body, regions, authority, visit)
+            visit_occurrences(body, regions, visit)
         }
         CStmt::For { init, body, .. } => {
             if let Some(init) = init {
-                visit_occurrences(init, regions, authority, visit);
+                visit_occurrences(init, regions, visit);
             }
-            visit_occurrences(body, regions, authority, visit);
+            visit_occurrences(body, regions, visit);
         }
         CStmt::Switch { cases, default, .. } => {
             for case in cases {
                 for stmt in &case.body {
-                    visit_occurrences(stmt, regions, authority, visit);
+                    visit_occurrences(stmt, regions, visit);
                 }
             }
             if let Some(default) = default {
                 for stmt in default {
-                    visit_occurrences(stmt, regions, authority, visit);
+                    visit_occurrences(stmt, regions, visit);
                 }
             }
         }
@@ -889,7 +878,6 @@ fn visit_scoped_stmt<'a>(
     stmt: &'a CStmt,
     current: Option<(RegionId, RegionEmissionAnchor)>,
     regions: &'a SealedStructuredRegionArtifact,
-    authority: &StructuredRegionArtifactAuthority,
     visit: &mut impl FnMut(ScopedStructuredStatement<'a>),
 ) {
     if let CStmt::StructuredRegion { marker, stmt } = stmt {
@@ -899,7 +887,7 @@ fn visit_scoped_stmt<'a>(
         let (id, _) = regions
             .node_for_marker(marker)
             .expect("sealed marker belongs to its structured-region artifact");
-        visit_scoped_stmt(stmt, Some((id, anchor)), regions, authority, visit);
+        visit_scoped_stmt(stmt, Some((id, anchor)), regions, visit);
         return;
     }
 
@@ -920,12 +908,10 @@ fn visit_scoped_stmt<'a>(
     // second occurrence.
     let semantic = stmt.unobserved();
     match semantic {
-        CStmt::StructuredRegion { .. } => {
-            visit_scoped_stmt(semantic, current, regions, authority, visit)
-        }
+        CStmt::StructuredRegion { .. } => visit_scoped_stmt(semantic, current, regions, visit),
         CStmt::Block(stmts) => {
             for stmt in stmts {
-                visit_scoped_stmt(stmt, current, regions, authority, visit);
+                visit_scoped_stmt(stmt, current, regions, visit);
             }
         }
         CStmt::If {
@@ -933,29 +919,29 @@ fn visit_scoped_stmt<'a>(
             else_body,
             ..
         } => {
-            visit_scoped_stmt(then_body, current, regions, authority, visit);
+            visit_scoped_stmt(then_body, current, regions, visit);
             if let Some(else_body) = else_body {
-                visit_scoped_stmt(else_body, current, regions, authority, visit);
+                visit_scoped_stmt(else_body, current, regions, visit);
             }
         }
         CStmt::While { body, .. } | CStmt::DoWhile { body, .. } => {
-            visit_scoped_stmt(body, current, regions, authority, visit)
+            visit_scoped_stmt(body, current, regions, visit)
         }
         CStmt::For { init, body, .. } => {
             if let Some(init) = init {
-                visit_scoped_stmt(init, current, regions, authority, visit);
+                visit_scoped_stmt(init, current, regions, visit);
             }
-            visit_scoped_stmt(body, current, regions, authority, visit)
+            visit_scoped_stmt(body, current, regions, visit)
         }
         CStmt::Switch { cases, default, .. } => {
             for case in cases {
                 for stmt in &case.body {
-                    visit_scoped_stmt(stmt, current, regions, authority, visit);
+                    visit_scoped_stmt(stmt, current, regions, visit);
                 }
             }
             if let Some(default) = default {
                 for stmt in default {
-                    visit_scoped_stmt(stmt, current, regions, authority, visit);
+                    visit_scoped_stmt(stmt, current, regions, visit);
                 }
             }
         }
@@ -1065,20 +1051,20 @@ fn direct_children(region: &Region) -> Vec<&Region> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::seal_structured_body_for_test as seal_structured_body;
+    use super::*;
     use crate::region::RegionTransferKind;
 
-    fn node_signature(
-        artifact: &SealedStructuredRegionArtifact,
-    ) -> Vec<(
+    type NodeSignature = (
         Option<usize>,
         u32,
         u64,
         Vec<usize>,
         usize,
         StructuredRegionKind,
-    )> {
+    );
+
+    fn node_signature(artifact: &SealedStructuredRegionArtifact) -> Vec<NodeSignature> {
         artifact
             .nodes()
             .iter()

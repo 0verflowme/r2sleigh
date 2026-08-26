@@ -5,9 +5,9 @@
 //! only when those plans authorize them; lowering itself does not infer either
 //! policy from use counts, names, or expression shape.
 
+use std::collections::BTreeSet;
 #[cfg(test)]
 use std::collections::HashMap;
-use std::collections::BTreeSet;
 
 use r2ssa::{DecompilePrepFacts, SSAOp, SSAVar, SsaArtifact, ValueId};
 #[cfg(test)]
@@ -387,8 +387,6 @@ impl LowerFrame {
     }
 }
 
-include!("implementation.rs");
-
 /// Parse a constant value from a name like "const:0x42" or "const:42".
 #[cfg(test)]
 pub(crate) fn parse_const_value(name: &str) -> Option<u64> {
@@ -450,3 +448,5 @@ fn memory_ordering_name(ordering: &r2il::MemoryOrdering) -> &'static str {
         r2il::MemoryOrdering::Unknown => "unknown",
     }
 }
+
+include!("implementation.rs");

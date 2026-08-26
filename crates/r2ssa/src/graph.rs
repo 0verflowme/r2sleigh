@@ -75,6 +75,10 @@ pub struct GraphValue {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "graph instructions keep canonical SSA operations inline to avoid one heap allocation per instruction"
+)]
 pub enum InstPayload {
     Phi { predecessors: Vec<BlockId> },
     Op(SSAOp),
@@ -124,6 +128,10 @@ impl SsaGraph {
     }
 
     /// Build a graph only after sealing the complete function-level SSA contract.
+    #[expect(
+        clippy::result_large_err,
+        reason = "graph construction preserves the exact typed SSA validation failure at this artifact boundary"
+    )]
     pub fn try_from_function(function: &SSAFunction) -> Result<Self, crate::SsaIntegrityError> {
         crate::validate_ssa_function(function)?;
         Ok(Self::from_function_with_storage(function))

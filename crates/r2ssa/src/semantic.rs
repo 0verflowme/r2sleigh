@@ -3427,6 +3427,10 @@ fn call_result_value_after_call(
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "this single canonical certificate pass explicitly joins each upstream fact owner without a parallel wrapper"
+)]
 fn collect_prepared_function_certificates(
     boundaries: &SourceBoundaryFacts,
     function: &SSAFunction,
@@ -4981,6 +4985,10 @@ fn collect_unstructured_cycle_blocks(
         .collect()
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "loop-carrier certification explicitly receives every proof input and stores no duplicate analysis context"
+)]
 fn loop_carrier_facts(
     function: &SSAFunction,
     graph: &SsaGraph,

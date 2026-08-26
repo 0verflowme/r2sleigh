@@ -253,6 +253,10 @@ struct BlockTopology {
 /// version must match one exact [`SSAVar`] definition. The scan is
 /// deterministic and linear in definitions, uses, and CFG edges (with
 /// expected constant-time hash lookups).
+#[expect(
+    clippy::result_large_err,
+    reason = "integrity diagnostics retain the exact offending SSA operation and values; validation runs only at artifact boundaries"
+)]
 pub fn validate_ssa_function(function: &SSAFunction) -> Result<(), SsaIntegrityError> {
     let ordered = function.block_addrs();
     let block_domain = ordered.iter().copied().collect::<HashSet<_>>();

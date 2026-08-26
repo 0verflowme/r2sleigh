@@ -3176,7 +3176,9 @@ fn source_member_element_count(
     if total_bits == 0 || total_bits == element_bits {
         return Some(1);
     }
-    (total_bits % element_bits == 0).then(|| total_bits / element_bits)
+    total_bits
+        .is_multiple_of(element_bits)
+        .then(|| total_bits / element_bits)
 }
 
 /// The prototype the source recovered, spelled as the source spells it.
@@ -4626,10 +4628,10 @@ impl EngineSession {
                     planning_time,
                     render_time,
                 );
-                let binding_audit = stop.binding_audit;
-                let effect_obligations = stop.effect_obligations;
+                let binding_audit = *stop.binding_audit;
+                let effect_obligations = *stop.effect_obligations;
                 let placement_audit = stop.placement_audit;
-                let render_refusal = stop.render_refusal;
+                let render_refusal = stop.render_refusal.map(|refusal| *refusal);
                 let refusal = engine_render_execution_refusal(stop.reason, stop.phase, metrics);
                 return refused_decompile_response_with_metrics_and_audits(
                     &request.function_name,
@@ -5401,15 +5403,17 @@ struct EngineRenderedDecompile {
     stopped: Option<EngineRenderExecutionStop>,
 }
 
+struct ReadyEngineRenderedProduct {
+    output: String,
+    binding_audit: BindingShadowAuditOutcome,
+    effect_obligations: EffectObligationAudit,
+    placement_audit: PlacementAudit,
+    render_refusal: Option<DecompileRenderRefusal>,
+}
+
 enum EngineRenderedProduct {
-    Ready {
-        output: String,
-        binding_audit: BindingShadowAuditOutcome,
-        effect_obligations: EffectObligationAudit,
-        placement_audit: PlacementAudit,
-        render_refusal: Option<DecompileRenderRefusal>,
-    },
-    Pending(r2dec::PendingDecompileBindingAudit),
+    Ready(Box<ReadyEngineRenderedProduct>),
+    Pending(Box<r2dec::PendingDecompileBindingAudit>),
 }
 
 impl EngineRenderedProduct {
@@ -5423,21 +5427,24 @@ impl EngineRenderedProduct {
         Option<DecompileRenderRefusal>,
     ) {
         match self {
-            Self::Ready {
-                output,
-                binding_audit,
-                effect_obligations,
-                placement_audit,
-                render_refusal,
-            } => (
-                output,
-                binding_audit,
-                effect_obligations,
-                placement_audit,
-                render_refusal,
-            ),
+            Self::Ready(ready) => {
+                let ReadyEngineRenderedProduct {
+                    output,
+                    binding_audit,
+                    effect_obligations,
+                    placement_audit,
+                    render_refusal,
+                } = *ready;
+                (
+                    output,
+                    binding_audit,
+                    effect_obligations,
+                    placement_audit,
+                    render_refusal,
+                )
+            }
             Self::Pending(pending) => {
-                let audited = pending.finalize();
+                let audited = (*pending).finalize();
                 let binding_audit = audited.binding_shadow();
                 let effect_obligations = audited.effect_obligations();
                 let placement_audit = audited.placement_audit();
@@ -5458,10 +5465,10 @@ impl EngineRenderedProduct {
 struct EngineRenderExecutionStop {
     reason: String,
     phase: EnginePhase,
-    binding_audit: BindingShadowAuditOutcome,
-    effect_obligations: EffectObligationAudit,
+    binding_audit: Box<BindingShadowAuditOutcome>,
+    effect_obligations: Box<EffectObligationAudit>,
     placement_audit: PlacementAudit,
-    render_refusal: Option<DecompileRenderRefusal>,
+    render_refusal: Option<Box<DecompileRenderRefusal>>,
     certification_completed: bool,
     normalization_completed: bool,
     structuring_completed: bool,
@@ -5504,8 +5511,8 @@ fn engine_render_stop_reason(
     EngineRenderExecutionStop {
         reason,
         phase,
-        binding_audit: BindingShadowAuditOutcome::NotRun,
-        effect_obligations: EffectObligationAudit::NOT_RUN,
+        binding_audit: Box::new(BindingShadowAuditOutcome::NotRun),
+        effect_obligations: Box::new(EffectObligationAudit::NOT_RUN),
         placement_audit: PlacementAudit::NotRun,
         render_refusal: None,
         certification_completed: false,
@@ -5548,10 +5555,10 @@ fn engine_render_stop_from_decompiler(
         r2dec::DecompileWorkPhase::Rendering => EnginePhase::Rendering,
     };
     let mut mapped = engine_render_stop_reason(stop.reason(), phase);
-    mapped.binding_audit = binding_audit;
-    mapped.effect_obligations = effect_obligations;
+    mapped.binding_audit = Box::new(binding_audit);
+    mapped.effect_obligations = Box::new(effect_obligations);
     mapped.placement_audit = placement_audit;
-    mapped.render_refusal = render_refusal;
+    mapped.render_refusal = render_refusal.map(Box::new);
     match stop.phase() {
         r2dec::DecompileWorkPhase::Normalization => {}
         r2dec::DecompileWorkPhase::Structuring => {
@@ -5577,13 +5584,13 @@ fn render_engine_decompile_request<C: r2ssa::SsaWorkControl>(
     ) {
         poll_engine_render_control(control, EnginePhase::Rendering)?;
         return Ok(EngineRenderedDecompile {
-            product: EngineRenderedProduct::Ready {
+            product: EngineRenderedProduct::Ready(Box::new(ReadyEngineRenderedProduct {
                 output,
                 binding_audit: BindingShadowAuditOutcome::NotRun,
                 effect_obligations: EffectObligationAudit::NOT_RUN,
                 placement_audit: PlacementAudit::NotRun,
                 render_refusal: None,
-            },
+            })),
             semantic_kernel_warnings: Vec::new(),
             structuring_executed: false,
             stopped: None,
@@ -5606,13 +5613,13 @@ fn render_engine_decompile_request<C: r2ssa::SsaWorkControl>(
             let render_refusal = audited.render_refusal();
             let output = audited.into_output();
             return Ok(EngineRenderedDecompile {
-                product: EngineRenderedProduct::Ready {
+                product: EngineRenderedProduct::Ready(Box::new(ReadyEngineRenderedProduct {
                     output,
                     binding_audit,
                     effect_obligations,
                     placement_audit,
                     render_refusal,
-                },
+                })),
                 semantic_kernel_warnings: vec![format!(
                     "rendering stopped in {:?}: {}; the body above is what was reached",
                     stop.phase(),
@@ -5658,7 +5665,7 @@ fn render_engine_decompile_request<C: r2ssa::SsaWorkControl>(
     };
     if !audited.output().trim().is_empty() {
         return Ok(EngineRenderedDecompile {
-            product: EngineRenderedProduct::Pending(audited),
+            product: EngineRenderedProduct::Pending(Box::new(audited)),
             semantic_kernel_warnings: Vec::new(),
             structuring_executed: true,
             stopped: None,
@@ -5671,7 +5678,7 @@ fn render_engine_decompile_request<C: r2ssa::SsaWorkControl>(
     let placement_audit = audited.placement_audit();
     let render_refusal = audited.render_refusal();
     Ok(EngineRenderedDecompile {
-        product: EngineRenderedProduct::Ready {
+        product: EngineRenderedProduct::Ready(Box::new(ReadyEngineRenderedProduct {
             output: decompile_route_output_from_function_facts(
                 &request.function_name,
                 request.function_facts(),
@@ -5681,7 +5688,7 @@ fn render_engine_decompile_request<C: r2ssa::SsaWorkControl>(
             effect_obligations,
             placement_audit,
             render_refusal,
-        },
+        })),
         semantic_kernel_warnings: Vec::new(),
         structuring_executed: false,
         stopped: None,
@@ -5733,6 +5740,10 @@ fn refused_decompile_response_with_metrics(
     )
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the sole refusal constructor receives each independent typed ledger explicitly so none can be silently defaulted or reconstructed"
+)]
 fn refused_decompile_response_with_metrics_and_audits(
     function_name: &str,
     reason: &str,
@@ -8802,7 +8813,7 @@ mod tests {
                     Some(DecompileRenderRefusal::UnrepresentableOperation),
                 );
                 assert_eq!(mapped.phase, engine_phase);
-                assert_eq!(mapped.binding_audit, BindingShadowAuditOutcome::NotRun);
+                assert_eq!(*mapped.binding_audit, BindingShadowAuditOutcome::NotRun);
                 assert_eq!(mapped.effect_obligations.total, 11);
                 assert_eq!(mapped.effect_obligations.rendered, 5);
                 assert_eq!(mapped.effect_obligations.justified_elision, 2);
@@ -8811,8 +8822,8 @@ mod tests {
                 assert_eq!(mapped.effect_obligations.conflicts, 1);
                 assert_eq!(mapped.placement_audit, PlacementAudit::NotRun);
                 assert_eq!(
-                    mapped.render_refusal,
-                    Some(DecompileRenderRefusal::UnrepresentableOperation)
+                    mapped.render_refusal.as_deref(),
+                    Some(&DecompileRenderRefusal::UnrepresentableOperation)
                 );
                 assert_eq!(
                     mapped.normalization_completed,

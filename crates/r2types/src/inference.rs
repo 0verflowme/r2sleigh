@@ -1051,26 +1051,25 @@ impl TypeInference {
     ) -> Option<ResolvedSignature> {
         let name = self.function_names.get(&direct_target?)?;
 
-        for candidate in [name.as_str()] {
-            if let Some(sig) = self.func_types.get(candidate) {
-                let params = sig
-                    .params
-                    .iter()
-                    .map(|ty| self.type_like_to_typeid(ty, arena).0)
-                    .collect();
-                let ret = self.type_like_to_typeid(&sig.return_type, arena).0;
-                return Some(ResolvedSignature {
-                    ret,
-                    params,
-                    variadic: sig.variadic,
-                });
-            }
-            if let Some(sig) = self
-                .signature_registry
-                .resolve(&candidate, arena, self.ptr_size)
-            {
-                return Some(sig);
-            }
+        let candidate = name.as_str();
+        if let Some(sig) = self.func_types.get(candidate) {
+            let params = sig
+                .params
+                .iter()
+                .map(|ty| self.type_like_to_typeid(ty, arena).0)
+                .collect();
+            let ret = self.type_like_to_typeid(&sig.return_type, arena).0;
+            return Some(ResolvedSignature {
+                ret,
+                params,
+                variadic: sig.variadic,
+            });
+        }
+        if let Some(sig) = self
+            .signature_registry
+            .resolve(candidate, arena, self.ptr_size)
+        {
+            return Some(sig);
         }
 
         None

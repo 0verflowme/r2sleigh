@@ -979,6 +979,10 @@ impl MarkedNativeDraft {
     /// A missing marker, conflicting observation, or journal failure rejects
     /// the native product. The caller may cross the typed residual boundary,
     /// but it cannot recover the marker-free executable tree from this draft.
+    #[expect(
+        clippy::result_large_err,
+        reason = "the typed refusal retains the complete value/use/write ledger at the final audit boundary"
+    )]
     pub(crate) fn finish_enforcing(
         mut self,
         source: &SourceOwnedFunctionFacts,
@@ -1059,6 +1063,10 @@ impl SealedNativeFunction {
             .expect("strictly sealed native function must retain observations")
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "audit consumers receive the complete typed failure ledger rather than a lossy summary"
+    )]
     pub(crate) fn audit_observations(
         &self,
     ) -> Result<(&LegacyAnalysisSnapshot, LegacyObservationCoverage), BindingShadowAuditFailure>
@@ -1449,7 +1457,7 @@ impl LegacyObservationJournal {
                 expected_count: self.targets.len(),
             })
         })?;
-        let target = self.targets.get(index).cloned().ok_or_else(|| {
+        let target = self.targets.get(index).cloned().ok_or({
             LegacyObservationJournalError::Markers(RenderObservationStripError::OutOfRange {
                 id,
                 expected_count: self.targets.len(),
@@ -1860,7 +1868,7 @@ impl LegacyObservationJournal {
             function,
             targets.len(),
             |id, _node| -> Result<(), LegacyObservationJournalError> {
-                let target = targets.get(id.index() as usize).copied().ok_or_else(|| {
+                let target = targets.get(id.index() as usize).copied().ok_or({
                     LegacyObservationJournalError::Markers(
                         RenderObservationStripError::OutOfRange {
                             id,
@@ -1933,7 +1941,7 @@ impl LegacyObservationJournal {
             function,
             targets.len(),
             |id, node| -> Result<(), LegacyObservationJournalError> {
-                let target = targets.get(id.index() as usize).copied().ok_or_else(|| {
+                let target = targets.get(id.index() as usize).copied().ok_or({
                     LegacyObservationJournalError::Markers(
                         RenderObservationStripError::OutOfRange {
                             id,

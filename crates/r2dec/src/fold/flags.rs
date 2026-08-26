@@ -1,9 +1,7 @@
-use std::collections::HashSet;
-
 use r2ssa::{FunctionSSABlock, SSAOp, SSAVar};
 
-use super::context::FoldingContext;
 use super::MAX_PREDICATE_OPERAND_DEPTH;
+use super::context::FoldingContext;
 use crate::ast::{BinaryOp, CExpr, UnaryOp};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum CompareContext {
@@ -208,12 +206,13 @@ impl<'a> FoldingContext<'a> {
                 op: BinaryOp::Ne, ..
             } => self.reconstruct_signed_lt_from_ne(expr),
             CExpr::Paren(inner) => self.try_reconstruct_condition_semantic(inner),
-            CExpr::Cast { ty, expr: inner } => self
-                .try_reconstruct_condition_semantic(inner)
-                .map(|reconstructed| CExpr::Cast {
-                    ty: ty.clone(),
-                    expr: Box::new(reconstructed),
-                }),
+            CExpr::Cast { ty, expr: inner } => {
+                self.try_reconstruct_condition_semantic(inner)
+                    .map(|reconstructed| CExpr::Cast {
+                        ty: ty.clone(),
+                        expr: Box::new(reconstructed),
+                    })
+            }
             CExpr::Unary {
                 op: UnaryOp::Not,
                 operand,
@@ -227,10 +226,10 @@ impl<'a> FoldingContext<'a> {
     // ========== Helper functions for flag pattern detection ==========
 
     pub(super) fn extract_flag_name(&self, expr: &CExpr, flag: &str) -> Option<String> {
-        if let CExpr::Var(name) = expr {
-            if is_specific_flag_name(&self.spelling(*name), flag) {
-                return Some(self.spelling(*name).to_string());
-            }
+        if let CExpr::Var(name) = expr
+            && is_specific_flag_name(&self.spelling(*name), flag)
+        {
+            return Some(self.spelling(*name).to_string());
         }
         None
     }
@@ -333,8 +332,8 @@ impl<'a> FoldingContext<'a> {
                 left,
                 right,
             } => Some(self.normalize_compare_tuple(CompareTuple {
-                lhs: self.resolve_predicate_operand(left, 0, &mut HashSet::new()),
-                rhs: self.resolve_predicate_operand(right, 0, &mut HashSet::new()),
+                lhs: self.resolve_predicate_operand(left, 0),
+                rhs: self.resolve_predicate_operand(right, 0),
                 context: CompareContext::Eq,
             })),
             CExpr::Binary {
@@ -342,8 +341,8 @@ impl<'a> FoldingContext<'a> {
                 left,
                 right,
             } => Some(self.normalize_compare_tuple(CompareTuple {
-                lhs: self.resolve_predicate_operand(left, 0, &mut HashSet::new()),
-                rhs: self.resolve_predicate_operand(right, 0, &mut HashSet::new()),
+                lhs: self.resolve_predicate_operand(left, 0),
+                rhs: self.resolve_predicate_operand(right, 0),
                 context: CompareContext::Ne,
             })),
             CExpr::Binary {
@@ -353,13 +352,13 @@ impl<'a> FoldingContext<'a> {
             } if self.is_zero_expr(right) => {
                 if let Some((sub_lhs, sub_rhs)) = self.extract_sub_operands(left) {
                     return Some(self.normalize_compare_tuple(CompareTuple {
-                        lhs: self.resolve_predicate_operand(&sub_lhs, 0, &mut HashSet::new()),
-                        rhs: self.resolve_predicate_operand(&sub_rhs, 0, &mut HashSet::new()),
+                        lhs: self.resolve_predicate_operand(&sub_lhs, 0),
+                        rhs: self.resolve_predicate_operand(&sub_rhs, 0),
                         context: CompareContext::SignedNegative,
                     }));
                 }
                 Some(self.normalize_compare_tuple(CompareTuple {
-                    lhs: self.resolve_predicate_operand(left, 0, &mut HashSet::new()),
+                    lhs: self.resolve_predicate_operand(left, 0),
                     rhs: CExpr::IntLit(0),
                     context: CompareContext::SignedNegative,
                 }))
@@ -371,15 +370,10 @@ impl<'a> FoldingContext<'a> {
     }
 
     pub(super) fn extract_sub_operands(&self, expr: &CExpr) -> Option<(CExpr, CExpr)> {
-        self.extract_sub_operands_with_seen(expr, 0, &mut HashSet::new())
+        self.extract_sub_operands_with_depth(expr, 0)
     }
 
-    fn extract_sub_operands_with_seen(
-        &self,
-        expr: &CExpr,
-        depth: u32,
-        seen: &mut HashSet<String>,
-    ) -> Option<(CExpr, CExpr)> {
+    fn extract_sub_operands_with_depth(&self, expr: &CExpr, depth: u32) -> Option<(CExpr, CExpr)> {
         if depth > 32 {
             return None;
         }
@@ -389,9 +383,9 @@ impl<'a> FoldingContext<'a> {
                 left,
                 right,
             } => Some((left.as_ref().clone(), right.as_ref().clone())),
-            CExpr::Paren(inner) => self.extract_sub_operands_with_seen(inner, depth + 1, seen),
+            CExpr::Paren(inner) => self.extract_sub_operands_with_depth(inner, depth + 1),
             CExpr::Cast { expr: inner, .. } => {
-                self.extract_sub_operands_with_seen(inner, depth + 1, seen)
+                self.extract_sub_operands_with_depth(inner, depth + 1)
             }
             CExpr::Var(_) => None,
             _ => None,
@@ -412,21 +406,14 @@ impl<'a> FoldingContext<'a> {
         a.lhs.transparently_eq(&b.lhs) && a.rhs.transparently_eq(&b.rhs)
     }
 
-    pub(super) fn resolve_predicate_operand(
-        &self,
-        expr: &CExpr,
-        depth: u32,
-        visited: &mut HashSet<String>,
-    ) -> CExpr {
+    pub(super) fn resolve_predicate_operand(&self, expr: &CExpr, depth: u32) -> CExpr {
         if depth > MAX_PREDICATE_OPERAND_DEPTH {
             return expr.clone();
         }
 
         match expr {
-            CExpr::Paren(inner) => self.resolve_predicate_operand(inner, depth + 1, visited),
-            CExpr::Cast { expr: inner, .. } => {
-                self.resolve_predicate_operand(inner, depth + 1, visited)
-            }
+            CExpr::Paren(inner) => self.resolve_predicate_operand(inner, depth + 1),
+            CExpr::Cast { expr: inner, .. } => self.resolve_predicate_operand(inner, depth + 1),
             CExpr::Deref(_) => expr.clone(),
             // SymbolId is a rendered binding identity, never a definition or
             // literal oracle. Exact predicate operands arrive from planned
@@ -442,7 +429,6 @@ impl<'a> FoldingContext<'a> {
             CExpr::IntLit(_) | CExpr::UIntLit(_) | CExpr::FloatLit(_) | CExpr::CharLit(_)
         )
     }
-
 }
 
 fn is_specific_flag_name(name: &str, flag: &str) -> bool {

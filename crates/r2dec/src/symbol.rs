@@ -164,12 +164,7 @@ impl SymbolTable {
     /// being merged, because two distinct values sharing one identifier is how a
     /// rendering says something it does not mean.
     #[track_caller]
-    pub fn declare(
-        &mut self,
-        name: impl Into<String>,
-        ty: CType,
-        role: SymbolRole,
-    ) -> SymbolId {
+    pub fn declare(&mut self, name: impl Into<String>, ty: CType, role: SymbolRole) -> SymbolId {
         let requested = name.into();
         if let Ok(want) = std::env::var("R2SLEIGH_TRACE_NAME")
             && requested.eq_ignore_ascii_case(&want)
@@ -360,11 +355,7 @@ mod tests {
     #[test]
     fn declaring_is_what_produces_a_reference() {
         let mut symbols = table();
-        let id = symbols.declare(
-            "total",
-            CType::Int(32),
-            SymbolRole::Carrier,
-        );
+        let id = symbols.declare("total", CType::Int(32), SymbolRole::Carrier);
 
         assert_eq!(symbols.name(id), "total");
         assert_eq!(symbols.by_name("total"), Some(id));
@@ -375,16 +366,8 @@ mod tests {
     #[test]
     fn two_declarations_never_share_one_identifier() {
         let mut symbols = table();
-        let first = symbols.declare(
-            "h",
-            CType::Int(32),
-            SymbolRole::Carrier,
-        );
-        let second = symbols.declare(
-            "h",
-            CType::Int(64),
-            SymbolRole::Carrier,
-        );
+        let first = symbols.declare("h", CType::Int(32), SymbolRole::Carrier);
+        let second = symbols.declare("h", CType::Int(64), SymbolRole::Carrier);
 
         assert_ne!(first, second);
         assert_eq!(symbols.name(first), "h");
@@ -405,11 +388,7 @@ mod tests {
     #[test]
     fn renaming_moves_the_spelling_and_leaves_the_reference_alone() {
         let mut symbols = table();
-        let id = symbols.declare(
-            "x0_2",
-            CType::Int(64),
-            SymbolRole::Carrier,
-        );
+        let id = symbols.declare("x0_2", CType::Int(64), SymbolRole::Carrier);
 
         symbols.rename(id, "hash");
 
@@ -421,16 +400,8 @@ mod tests {
     #[test]
     fn renaming_onto_a_taken_spelling_does_not_merge_two_symbols() {
         let mut symbols = table();
-        let taken = symbols.declare(
-            "hash",
-            CType::Int(32),
-            SymbolRole::Carrier,
-        );
-        let other = symbols.declare(
-            "x0_2",
-            CType::Int(64),
-            SymbolRole::Carrier,
-        );
+        let taken = symbols.declare("hash", CType::Int(32), SymbolRole::Carrier);
+        let other = symbols.declare("x0_2", CType::Int(64), SymbolRole::Carrier);
 
         symbols.rename(other, "hash");
 
@@ -469,11 +440,7 @@ mod reuse_tests {
     fn a_declared_name_is_not_reissued_by_reuse() {
         // declare() is what mints a distinct variable; reuse must respect it.
         let mut symbols = SymbolTable::new();
-        let declared = symbols.declare(
-            "total",
-            CType::Int(32),
-            SymbolRole::Carrier,
-        );
+        let declared = symbols.declare("total", CType::Int(32), SymbolRole::Carrier);
 
         assert_eq!(symbols.declare_or_reuse("total"), declared);
         assert_eq!(symbols.len(), 1);
@@ -488,7 +455,7 @@ mod reuse_tests {
 #[track_caller]
 #[inline(always)]
 pub fn var_ref(symbols: &RefCell<SymbolTable>, name: impl AsRef<str>) -> CExpr {
-    CExpr::Var(crate::symbol::declare(&symbols, name.as_ref()))
+    CExpr::Var(crate::symbol::declare(symbols, name.as_ref()))
 }
 
 /// Declare this spelling, or return the identifier it already has.

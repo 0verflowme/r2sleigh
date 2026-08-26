@@ -2095,6 +2095,49 @@ fn infer_usage_register_type_hints(
     (hints, pointer_vars)
 }
 
+/// What the source calls the member at each offset of this function's
+/// aggregates.
+///
+/// A binary that carried debug info already said what its struct fields are
+/// called, and the access projections keep that beside the access that
+/// reached them. Without it a field is named after its offset, so something
+/// the source calls `next` prints as `f_10`.
+///
+/// The projections are read only under the identity they were sealed with,
+/// and an offset two aggregates disagree about is dropped rather than
+/// guessed.
+pub fn source_field_names(prepared: &SsaArtifact) -> HashMap<u64, String> {
+    let Some(interface) = prepared.machine_context().function_interface() else {
+        return HashMap::new();
+    };
+    let Some(projections) = prepared
+        .aggregate_accesses()
+        .projections_for_revision(interface.revision_identity())
+    else {
+        return HashMap::new();
+    };
+    let mut names: HashMap<u64, String> = HashMap::new();
+    let mut disputed = HashSet::new();
+    for projection in projections.values() {
+        if projection.member_name.is_empty() {
+            continue;
+        }
+        match names.get(&projection.byte_offset) {
+            Some(existing) if existing.as_str() != &*projection.member_name => {
+                disputed.insert(projection.byte_offset);
+            }
+            Some(_) => {}
+            None => {
+                names.insert(projection.byte_offset, projection.member_name.to_string());
+            }
+        }
+    }
+    for offset in disputed {
+        names.remove(&offset);
+    }
+    names
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3043,47 +3086,4 @@ mod tests {
         assert_eq!(params[0].name, "arg1");
         assert_eq!(params[0].ssa_var, SSAVar::new("x1", 0, 8));
     }
-}
-
-/// What the source calls the member at each offset of this function's
-/// aggregates.
-///
-/// A binary that carried debug info already said what its struct fields are
-/// called, and the access projections keep that beside the access that
-/// reached them. Without it a field is named after its offset, so something
-/// the source calls `next` prints as `f_10`.
-///
-/// The projections are read only under the identity they were sealed with,
-/// and an offset two aggregates disagree about is dropped rather than
-/// guessed.
-pub fn source_field_names(prepared: &SsaArtifact) -> HashMap<u64, String> {
-    let Some(interface) = prepared.machine_context().function_interface() else {
-        return HashMap::new();
-    };
-    let Some(projections) = prepared
-        .aggregate_accesses()
-        .projections_for_revision(interface.revision_identity())
-    else {
-        return HashMap::new();
-    };
-    let mut names: HashMap<u64, String> = HashMap::new();
-    let mut disputed = HashSet::new();
-    for projection in projections.values() {
-        if projection.member_name.is_empty() {
-            continue;
-        }
-        match names.get(&projection.byte_offset) {
-            Some(existing) if existing.as_str() != &*projection.member_name => {
-                disputed.insert(projection.byte_offset);
-            }
-            Some(_) => {}
-            None => {
-                names.insert(projection.byte_offset, projection.member_name.to_string());
-            }
-        }
-    }
-    for offset in disputed {
-        names.remove(&offset);
-    }
-    names
 }

@@ -603,26 +603,25 @@ impl CarrierEdgeCertificates {
                     }
                 }
             }
-            if identity_values.len() >= 2 {
-                if let [initializer] = dominating_initializers.as_slice() {
-                    if entries.iter().any(|entry| entry.value == initializer.value) {
-                        let definition = OriginalPhiDefinition {
-                            inst: graph.def_inst(*phi)?,
-                            value: *phi,
-                        };
-                        let relocation = result.relocations_by_value.get_mut(phi.0 as usize)?;
-                        if relocation.is_some() {
-                            return None;
-                        }
-                        *relocation = Some(RelocationCertificate {
-                            definition,
-                            source_value: initializer.value,
-                            initializer_predecessor: initializer.predecessor,
-                            initializer_site: initializer.site,
-                            entries: entries.clone(),
-                        });
-                    }
+            if identity_values.len() >= 2
+                && let [initializer] = dominating_initializers.as_slice()
+                && entries.iter().any(|entry| entry.value == initializer.value)
+            {
+                let definition = OriginalPhiDefinition {
+                    inst: graph.def_inst(*phi)?,
+                    value: *phi,
+                };
+                let relocation = result.relocations_by_value.get_mut(phi.0 as usize)?;
+                if relocation.is_some() {
+                    return None;
                 }
+                *relocation = Some(RelocationCertificate {
+                    definition,
+                    source_value: initializer.value,
+                    initializer_predecessor: initializer.predecessor,
+                    initializer_site: initializer.site,
+                    entries: entries.clone(),
+                });
             }
         }
         Some(result)
@@ -1163,7 +1162,7 @@ pub(crate) fn materialize_certified_loop_carriers_with_control(
     // and cost nothing.
     let graph = prepared.graph();
     let live = prepared.live_out();
-    let dead = r2ssa::deadphi::DeadPhis::find(func, graph, &live);
+    let dead = r2ssa::deadphi::DeadPhis::find(func, graph, live);
     materialize_phis_where_with_control(
         func,
         graph,

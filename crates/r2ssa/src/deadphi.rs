@@ -57,7 +57,7 @@ fn has_effect(op: &SSAOp) -> bool {
             | SSAOp::CallInd { .. }
             | SSAOp::CallDefine { .. }
             | SSAOp::CallOther { .. }
-            | SSAOp::Unimplemented { .. }
+            | SSAOp::Unimplemented
     )
 }
 
@@ -72,13 +72,12 @@ impl DeadPhis {
     pub fn find(func: &SSAFunction, graph: &SsaGraph, live_out: &FunctionLiveOut) -> Self {
         let mut observed = BTreeSet::new();
         let mut pending = VecDeque::new();
-        let observe = |value: ValueId,
-                       observed: &mut BTreeSet<ValueId>,
-                       pending: &mut VecDeque<ValueId>| {
-            if observed.insert(value) {
-                pending.push_back(value);
-            }
-        };
+        let observe =
+            |value: ValueId, observed: &mut BTreeSet<ValueId>, pending: &mut VecDeque<ValueId>| {
+                if observed.insert(value) {
+                    pending.push_back(value);
+                }
+            };
 
         for value in live_out.iter() {
             observe(value, &mut observed, &mut pending);
@@ -231,8 +230,7 @@ mod tests {
             }],
             ..R2ILBlock::default()
         };
-        SSAFunction::from_blocks_with_arch(&[entry, left, right, exit], Some(&arch()))
-            .expect("ssa")
+        SSAFunction::from_blocks_with_arch(&[entry, left, right, exit], Some(&arch())).expect("ssa")
     }
 
     #[test]

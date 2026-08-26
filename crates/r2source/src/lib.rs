@@ -696,14 +696,12 @@ impl OwnedFunctionSnapshot {
         // views of the function contradict each other.
         if let Some(interface) = &function_interface
             && !machine_roles.is_empty()
-        {
-            if interface.return_address_storage().is_some()
+            && (interface.return_address_storage().is_some()
                 && interface.return_address_storage() != machine_roles.return_address_storage()
                 || interface.stack_pointer_storage().is_some()
-                    && interface.stack_pointer_storage() != machine_roles.stack_pointer_storage()
-            {
-                return Err(SnapshotValidationError::InvalidFunctionInterface);
-            }
+                    && interface.stack_pointer_storage() != machine_roles.stack_pointer_storage())
+        {
+            return Err(SnapshotValidationError::InvalidFunctionInterface);
         }
         if let Some(interface) = &function_interface {
             if interface.revision_identity() != source_revision_identity.as_ref()

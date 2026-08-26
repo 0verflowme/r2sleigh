@@ -601,7 +601,6 @@ fn bench_explore_symbolic_branching(c: &mut Criterion) {
     let config = ExploreConfig {
         max_states: 64,
         max_depth: 32,
-        timeout: None,
         ..Default::default()
     };
 
@@ -624,7 +623,6 @@ fn bench_explore_branch_tree(c: &mut Criterion) {
     let config = ExploreConfig {
         max_states: 256,
         max_depth: 64,
-        timeout: None,
         strategy: ExploreStrategy::Bfs,
         ..Default::default()
     };
@@ -651,7 +649,6 @@ fn bench_explore_same_pc_merge(c: &mut Criterion) {
         let config = ExploreConfig {
             max_states: 256,
             max_depth: 96,
-            timeout: None,
             strategy: ExploreStrategy::Bfs,
             merge_states,
             ..Default::default()
@@ -680,7 +677,6 @@ fn bench_run_spec_symbolic_fd_input(c: &mut Criterion) {
     let config = ExploreConfig {
         max_states: 64,
         max_depth: 64,
-        timeout: None,
         ..Default::default()
     };
     let spec = ExplorationSpec {

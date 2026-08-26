@@ -1098,10 +1098,7 @@ impl MachineProjection {
     }
 
     /// Dense O(1) lookup for one exact graph value's source-owned geometry.
-    pub fn value_geometry(
-        &self,
-        value: ValueId,
-    ) -> Option<&MachineValueGeometryDisposition> {
+    pub fn value_geometry(&self, value: ValueId) -> Option<&MachineValueGeometryDisposition> {
         self.value_geometries.get(value.0 as usize)
     }
 
@@ -1183,10 +1180,7 @@ impl MachineProjection {
         Ok(())
     }
 
-    fn validate_value_geometries(
-        &self,
-        artifact: &SsaArtifact,
-    ) -> Result<(), MachineBuildError> {
+    fn validate_value_geometries(&self, artifact: &SsaArtifact) -> Result<(), MachineBuildError> {
         let expected = canonical_machine_value_geometries(artifact)?;
         if self.value_geometries.as_ref() != expected.as_slice() {
             return Err(MachineBuildError::TopologyMismatch);
@@ -2541,7 +2535,7 @@ impl MachineBuilder {
         ty: MachineType,
     ) -> Result<MachineExprId, MachineBuildError> {
         let binding = binding_for_value(value)?;
-        let key = (value.id, ty.clone());
+        let key = (value.id, ty);
         if let Some(id) = self.value_nodes.get(&key).copied() {
             return Ok(id);
         }
@@ -3279,8 +3273,8 @@ impl MachineBuilder {
                 let if_false_value = graph
                     .value(inst.inputs[2])
                     .ok_or(MachineBuildError::MissingGraphValue(inst.inputs[2]))?;
-                let if_true = self.intern_value_with_type(if_true_value, unsigned.clone())?;
-                let if_false = self.intern_value_with_type(if_false_value, unsigned.clone())?;
+                let if_true = self.intern_value_with_type(if_true_value, unsigned)?;
+                let if_false = self.intern_value_with_type(if_false_value, unsigned)?;
                 self.record_whole_use(graph, inst, 0)?;
                 self.record_whole_use(graph, inst, 1)?;
                 self.record_whole_use(graph, inst, 2)?;
@@ -3938,9 +3932,8 @@ mod tests {
             .expect("every dense geometry remains source-bound");
 
         let mut corrupted = projection;
-        corrupted.value_geometries[0] = MachineValueGeometryDisposition::Refused(
-            MachineValueGeometryRefusal::InvalidBitRange,
-        );
+        corrupted.value_geometries[0] =
+            MachineValueGeometryDisposition::Refused(MachineValueGeometryRefusal::InvalidBitRange);
         assert_eq!(
             corrupted.validate_against(&artifact),
             Err(MachineBuildError::TopologyMismatch)
@@ -3992,11 +3985,7 @@ mod tests {
             },
         ] {
             assert_eq!(
-                value_geometry_for_storage(
-                    &original_projection,
-                    &original_artifact,
-                    storage,
-                ),
+                value_geometry_for_storage(&original_projection, &original_artifact, storage,),
                 value_geometry_for_storage(&renamed_projection, &renamed_artifact, storage)
             );
             let original_name = &original_artifact
@@ -4989,8 +4978,8 @@ mod tests {
                 ..
             }
         ));
-        let projection = MachineProjection::from_artifact(&artifact)
-            .expect("source-owned machine projection");
+        let projection =
+            MachineProjection::from_artifact(&artifact).expect("source-owned machine projection");
         assert_eq!(
             projection.use_disposition(address_use),
             Some(&MachineUseDisposition::MemoryAddress(projected)),

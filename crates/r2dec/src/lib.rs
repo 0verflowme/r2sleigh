@@ -3243,6 +3243,10 @@ enum InternalBuildProduct {
     },
 }
 
+#[expect(
+    clippy::large_enum_variant,
+    reason = "both variants are request-local decompile products; boxing either would add allocation without shrinking the dominant audit payload"
+)]
 enum PreparedDecompile {
     Immediate(DecompileBindingAudit),
     NativeOrResidual(InternalBuildProduct),
@@ -3256,7 +3260,7 @@ impl InternalBuildProduct {
     fn refused(function: CFunction, refusal: DecompileRenderRefusal) -> Self {
         Self::Refused {
             emission: prepare_function_for_emission(&function),
-            refusal: refusal.into(),
+            refusal,
             binding_shadow: BindingShadowAuditOutcome::NotRun,
             placement_audit: PlacementAudit::NotRun,
         }
@@ -3560,6 +3564,10 @@ impl Decompiler {
     /// work-control poll. Stops before a product exists therefore retain no
     /// partial; either rendering poll retains the already sealed product's C and
     /// audit together.
+    #[expect(
+        clippy::result_large_err,
+        reason = "a stopped request retains its exact same-run binding audit rather than a lossy or reconstructed diagnostic"
+    )]
     pub fn decompile_input_keeping_partial_with_binding_audit<'a>(
         &self,
         input: &'a DecompilerInput,
@@ -3573,6 +3581,10 @@ impl Decompiler {
 
     /// Render while deferring non-consuming binding classification until the
     /// caller has made every production control decision.
+    #[expect(
+        clippy::result_large_err,
+        reason = "a stopped request retains the sealed request-local product so classification cannot be rebuilt from different facts"
+    )]
     pub fn decompile_input_keeping_partial_with_pending_binding_audit<'a>(
         &self,
         input: &'a DecompilerInput,
@@ -4050,7 +4062,7 @@ impl Decompiler {
         if std::env::var_os("R2SLEIGH_DEBUG_MERGES").is_some() {
             let graph = prepared.graph();
             let live = prepared.live_out();
-            let dead = r2ssa::deadphi::DeadPhis::find(func, graph, &live);
+            let dead = r2ssa::deadphi::DeadPhis::find(func, graph, live);
             let total: usize = func.blocks().map(|b| b.phis.len()).sum();
             eprintln!(
                 "MERGES fn={:#x} phis={} unobserved={} live_out={} unresolved={}",
@@ -4172,8 +4184,8 @@ impl Decompiler {
                     normalize::NormalizationOrigins::for_unchanged(func, prepared),
                 )
             };
-        if let Some(render_facts) = self.context.function_facts.render() {
-            if let Err(error) =
+        if let Some(render_facts) = self.context.function_facts.render()
+            && let Err(error) =
                 normalize::materialize_certified_loop_carrier_initializers_with_control(
                     &mut normalized_func,
                     &mut normalization_origins,
@@ -4181,15 +4193,14 @@ impl Decompiler {
                     render_facts,
                     work,
                 )
-            {
-                match error {
-                    normalize::NormalizationFailure::Execution(error) => return Err(error),
-                    normalize::NormalizationFailure::Origins(error) => {
-                        return Ok(InternalBuildProduct::refused(
-                            normalization_refusal(error),
-                            DecompileRenderRefusal::NormalizationOriginUnavailable,
-                        ));
-                    }
+        {
+            match error {
+                normalize::NormalizationFailure::Execution(error) => return Err(error),
+                normalize::NormalizationFailure::Origins(error) => {
+                    return Ok(InternalBuildProduct::refused(
+                        normalization_refusal(error),
+                        DecompileRenderRefusal::NormalizationOriginUnavailable,
+                    ));
                 }
             }
         }
@@ -4314,10 +4325,7 @@ impl Decompiler {
                 for (index, op) in block.ops.iter().enumerate() {
                     let op: &r2ssa::SSAOp = op;
                     let kind = format!("{op:?}");
-                    let kind = kind
-                        .split(|c: char| c == ' ' || c == '{')
-                        .next()
-                        .unwrap_or("?");
+                    let kind = kind.split([' ', '{']).next().unwrap_or("?");
                     eprintln!(
                         "NORMOP block={:#x} idx={index} kind={kind} dst={:?} srcs={:?}",
                         block.addr,
@@ -5026,8 +5034,8 @@ fn reconstruct_flag_conditions_in_function(func: &mut CFunction, fold_ctx: &Fold
         ctx.try_reconstruct_condition(&expr).unwrap_or(expr)
     }
 
-    fn walk(stmts: &mut Vec<CStmt>, ctx: &FoldingContext<'_>) {
-        for stmt in stmts.iter_mut() {
+    fn walk(stmts: &mut [CStmt], ctx: &FoldingContext<'_>) {
+        for stmt in stmts {
             single_evaluation::for_each_expr_mut(stmt, &mut |expr| {
                 let taken = std::mem::replace(expr, CExpr::IntLit(0));
                 *expr = rewrite(taken, ctx);
@@ -7224,9 +7232,6 @@ mod tests {
             "the string compatibility mapper must add no work-control decision"
         );
     }
-
-    /// Nothing in this function is unproven, so it carries no proof note. A
-    /// note on clean output would be noise readers learn to ignore.
 
     /// The marks the structurer leaves are counted wherever they sit, including
     /// inside a loop or a switch arm, and the function says how many it carries.

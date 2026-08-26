@@ -14,11 +14,11 @@ use crate::control::{DecompileExecutionStop, DecompileWorkControl};
 use crate::fold::FoldingContext;
 use crate::fold::op_lower::OpLoweringRefusal;
 use crate::region::{Region, RegionAnalyzer, RegionTransferKind};
-use crate::symbol::SymbolId;
 use crate::structured_region::{
-    SealedStructuredBody, StructuredRegionBuildError, StructuredRegionKind,
-    StructuredRegionMarker, SyntheticRegionKind, kind_of, seal_structured_body,
+    SealedStructuredBody, StructuredRegionBuildError, StructuredRegionKind, StructuredRegionMarker,
+    SyntheticRegionKind, kind_of, seal_structured_body,
 };
+use crate::symbol::SymbolId;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ControlFlowStructureError {
@@ -725,7 +725,10 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             .control_facts()
             .ok_or_else(|| format!("missing canonical control facts for loop 0x{header:x}"))?;
         let loop_fact = facts.loops.get(&loop_id).ok_or_else(|| {
-            format!("missing canonical loop fact {:?} for header 0x{header:x}", loop_id)
+            format!(
+                "missing canonical loop fact {:?} for header 0x{header:x}",
+                loop_id
+            )
         })?;
         let rendered = self.loop_render_proof(header, condition, condition_value, body);
         if loop_fact.condition != rendered.loop_condition
@@ -1128,7 +1131,8 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                     Self::stmt_guarantees_termination(&then_stmt)
                         && Self::stmt_guarantees_termination(else_stmt)
                 });
-                let if_stmt = self.observe_control_ownership(*cond_block,
+                let if_stmt = self.observe_control_ownership(
+                    *cond_block,
                     CStmt::if_stmt(cond, then_stmt, else_stmt),
                 );
                 let mut prefix = self.structure_block_prefix_stmts(*cond_block)?;
@@ -1156,18 +1160,14 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                 if self.loop_needs_condition_inversion(*header, body) {
                     cond = Self::negate_condition(cond);
                 }
-                let loop_id = match self.exact_rendered_loop_id(
-                    *header,
-                    predicate,
-                    condition_value,
-                    body,
-                ) {
-                    Ok(loop_id) => loop_id,
-                    Err(reason) => {
-                        self.safety_reason = Some(reason);
-                        return Ok(CStmt::Empty);
-                    }
-                };
+                let loop_id =
+                    match self.exact_rendered_loop_id(*header, predicate, condition_value, body) {
+                        Ok(loop_id) => loop_id,
+                        Err(reason) => {
+                            self.safety_reason = Some(reason);
+                            return Ok(CStmt::Empty);
+                        }
+                    };
                 self.record_loop_render_proof(*header, predicate, condition_value, body);
 
                 let outer_domains = self.active_domains.clone();
@@ -1199,18 +1199,14 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                     cond = Self::negate_condition(cond);
                 }
                 let anchor = body.entry();
-                let loop_id = match self.exact_rendered_loop_id(
-                    anchor,
-                    predicate,
-                    condition_value,
-                    body,
-                ) {
-                    Ok(loop_id) => loop_id,
-                    Err(reason) => {
-                        self.safety_reason = Some(reason);
-                        return Ok(CStmt::Empty);
-                    }
-                };
+                let loop_id =
+                    match self.exact_rendered_loop_id(anchor, predicate, condition_value, body) {
+                        Ok(loop_id) => loop_id,
+                        Err(reason) => {
+                            self.safety_reason = Some(reason);
+                            return Ok(CStmt::Empty);
+                        }
+                    };
                 self.record_loop_render_proof(anchor, predicate, condition_value, body);
 
                 let outer_domains = self.active_domains.clone();
@@ -1233,9 +1229,9 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                 self.observe_control_ownership(
                     *cond_block,
                     CStmt::DoWhile {
-                    body: Box::new(body_stmt),
-                    cond,
-                },
+                        body: Box::new(body_stmt),
+                        cond,
+                    },
                 )
             }
             Region::MultiExit { head, exits } => {
@@ -1335,10 +1331,12 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                                 // blocks instead. The second went further, so
                                 // it is the one with something to say about why
                                 // the exit could not be lowered.
-                                Err(ExitContinuationError::Placement(chain_reason)) => Some(match chain_reason {
-                                    Some(chain_reason) => chain_reason,
-                                    None => reason,
-                                }),
+                                Err(ExitContinuationError::Placement(chain_reason)) => {
+                                    Some(match chain_reason {
+                                        Some(chain_reason) => chain_reason,
+                                        None => reason,
+                                    })
+                                }
                             }
                         }
                     }
@@ -1362,9 +1360,12 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                 cases,
                 default,
                 merge_block,
-            } => {
-                self.structure_switch_region(*switch_block, cases, default.as_deref(), *merge_block)?
-            }
+            } => self.structure_switch_region(
+                *switch_block,
+                cases,
+                default.as_deref(),
+                *merge_block,
+            )?,
             Region::Irreducible { entry, blocks } => self.structure_irreducible(*entry, blocks)?,
         })
     }
@@ -1395,23 +1396,22 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         successor: u64,
     ) -> Result<Option<ControlGuard>, String> {
         let facts = self.fold_ctx.control_facts().ok_or_else(|| {
-            format!(
-                "missing canonical control facts for edge 0x{predecessor:x} -> 0x{successor:x}"
-            )
+            format!("missing canonical control facts for edge 0x{predecessor:x} -> 0x{successor:x}")
         })?;
         Self::exact_control_domain(&facts.control_domains, predecessor)?;
         Self::exact_control_domain(&facts.control_domains, successor)?;
-        let block = self.func.cfg().get_block(predecessor).ok_or_else(|| {
-            format!("missing CFG block for control edge from 0x{predecessor:x}")
-        })?;
+        let block =
+            self.func.cfg().get_block(predecessor).ok_or_else(|| {
+                format!("missing CFG block for control edge from 0x{predecessor:x}")
+            })?;
         match &block.terminator {
             BlockTerminator::ConditionalBranch {
                 true_target,
                 false_target,
             } => {
-                let predicate = facts.branch_for_block(predecessor).ok_or_else(|| {
-                    format!("missing canonical branch fact at 0x{predecessor:x}")
-                })?;
+                let predicate = facts
+                    .branch_for_block(predecessor)
+                    .ok_or_else(|| format!("missing canonical branch fact at 0x{predecessor:x}"))?;
                 if predicate.block_addr != predecessor
                     || predicate.true_target != *true_target
                     || predicate.false_target != *false_target
@@ -1435,9 +1435,9 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                 }))
             }
             BlockTerminator::Switch { cases, default } => {
-                let switch = facts.switch_for_block(predecessor).ok_or_else(|| {
-                    format!("missing canonical switch fact at 0x{predecessor:x}")
-                })?;
+                let switch = facts
+                    .switch_for_block(predecessor)
+                    .ok_or_else(|| format!("missing canonical switch fact at 0x{predecessor:x}"))?;
                 let mut cfg_cases = cases.clone();
                 cfg_cases.sort_unstable();
                 let mut fact_cases = switch.cases.clone();
@@ -1468,26 +1468,23 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                     includes_default,
                 }))
             }
-            BlockTerminator::IndirectBranch if self.func.successors(predecessor).len() > 1 => {
-                Err(format!(
-                    "uncertified indirect control edge 0x{predecessor:x} -> 0x{successor:x}"
-                ))
-            }
+            BlockTerminator::IndirectBranch if self.func.successors(predecessor).len() > 1 => Err(
+                format!("uncertified indirect control edge 0x{predecessor:x} -> 0x{successor:x}"),
+            ),
             _ if matches!(
                 self.func.successors(predecessor).as_slice(),
                 [only] if *only == successor
-            ) => Ok(None),
+            ) =>
+            {
+                Ok(None)
+            }
             _ => Err(format!(
                 "edge 0x{predecessor:x} -> 0x{successor:x} is not an exact CFG edge"
             )),
         }
     }
 
-    fn push_exact_edge_guard(
-        &mut self,
-        predecessor: u64,
-        successor: u64,
-    ) -> Result<(), String> {
+    fn push_exact_edge_guard(&mut self, predecessor: u64, successor: u64) -> Result<(), String> {
         let guard = self.exact_control_guard_for_edge(predecessor, successor)?;
         if let Some(guard) = guard {
             for domain in &mut self.active_domains {
@@ -1570,9 +1567,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         rendered_cases.sort_unstable();
         let mut certified_cases = control_fact.cases.clone();
         certified_cases.sort_unstable();
-        if rendered_cases != certified_cases
-            || default.map(Region::entry) != control_fact.default
-        {
+        if rendered_cases != certified_cases || default.map(Region::entry) != control_fact.default {
             return Ok(CStmt::Block(vec![CStmt::comment(format!(
                 "r2dec residual: switch control mismatch at 0x{switch_block:x}"
             ))]));
@@ -1650,10 +1645,10 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         let switch_stmt = self.observe_control_ownership(
             switch_block,
             CStmt::Switch {
-            expr: switch_expr,
-            cases: switch_cases,
-            default: default_body,
-        },
+                expr: switch_expr,
+                cases: switch_cases,
+                default: default_body,
+            },
         );
 
         let mut prefix = self.structure_block_prefix_stmts(switch_block)?;
@@ -1715,10 +1710,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
     /// at one and the other cannot reach it, put it at both and it runs twice.
     /// Written once at the end with a label, every exit jumps to it and it runs
     /// where all of them agree it does.
-    fn append_deferred_shared_exits(
-        &mut self,
-        stmt: CStmt,
-    ) -> ControlFlowStructureResult<CStmt> {
+    fn append_deferred_shared_exits(&mut self, stmt: CStmt) -> ControlFlowStructureResult<CStmt> {
         if self.deferred_shared_exits.is_empty() {
             return Ok(stmt);
         }
@@ -2199,10 +2191,10 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             stmts.push(self.observe_control_ownership(
                 branch,
                 CStmt::If {
-                cond,
-                then_body: Box::new(then_stmt),
-                else_body: Some(Box::new(else_stmt)),
-            },
+                    cond,
+                    then_body: Box::new(then_stmt),
+                    else_body: Some(Box::new(else_stmt)),
+                },
             ));
         }
         Ok(match stmts.len() {
@@ -2470,8 +2462,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             if std::env::var_os("R2SLEIGH_DEBUG_MERGES").is_some() {
                 eprintln!("FOLDCACHE hit block={addr:#x} stmts={}", folded.stmts.len());
             }
-            self.fold_ctx
-                .clone_cached_render_occurrence(&folded.stmts)
+            self.fold_ctx.clone_cached_render_occurrence(&folded.stmts)
         } else {
             let stmts = self.fold_ctx.fold_block(block, addr)?;
             if std::env::var_os("R2SLEIGH_DEBUG_MERGES").is_some() {
@@ -2908,7 +2899,9 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
     /// - Fix B: Remove trailing `continue` in loop bodies (implicit) and
     ///   trailing `break` in single-exit if-then inside loops.
     /// - Fix C: Convert `do { if (c) break; ... } while(1)` to `while(!c) { ... }`.
-    pub(crate) fn cleanup(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, stmt: CStmt,
+    pub(crate) fn cleanup(
+        symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
+        stmt: CStmt,
     ) -> CStmt {
         // Recurse first, then simplify
         let stmt = Self::cleanup_recurse(symbols, stmt);
@@ -2916,7 +2909,9 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
     }
 
     /// Recursively clean up children first, then apply local simplifications.
-    fn cleanup_recurse(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, stmt: CStmt,
+    fn cleanup_recurse(
+        symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
+        stmt: CStmt,
     ) -> CStmt {
         match stmt {
             CStmt::StructuredRegion { marker, stmt } => {
@@ -2954,7 +2949,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                 then_body,
                 else_body,
             } => {
-                let cond = Self::normalize_condition_addr_artifacts(symbols, cond);
+                let cond = Self::normalize_condition_addr_artifacts(cond);
                 let then_body = Box::new(Self::cleanup_recurse(symbols, *then_body));
                 let else_body = else_body
                     .map(|e| Box::new(Self::cleanup_recurse(symbols, *e)))
@@ -2971,7 +2966,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                 Self::rewrite_guarded_switch_with_trailing_return(stmt)
             }
             CStmt::While { cond, body } => {
-                let cond = Self::normalize_condition_addr_artifacts(symbols, cond);
+                let cond = Self::normalize_condition_addr_artifacts(cond);
                 let body = Self::strip_trailing_continue(Self::cleanup_recurse(symbols, *body));
                 CStmt::While {
                     cond,
@@ -2980,7 +2975,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             }
             CStmt::DoWhile { body, cond } => {
                 let body = Self::strip_trailing_continue(Self::cleanup_recurse(symbols, *body));
-                let cond = Self::normalize_condition_addr_artifacts(symbols, cond);
+                let cond = Self::normalize_condition_addr_artifacts(cond);
                 // Fix C: do { if (c) break; rest } while(1) -> while(!c) { rest }
                 Self::try_convert_do_while_to_while(body, cond)
             }
@@ -2990,7 +2985,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                 update,
                 body,
             } => {
-                let cond = cond.map(|x| Self::normalize_condition_addr_artifacts(symbols, x));
+                let cond = cond.map(Self::normalize_condition_addr_artifacts);
                 let body = Self::strip_trailing_continue(Self::cleanup_recurse(symbols, *body));
                 let body = update
                     .as_ref()
@@ -3022,12 +3017,14 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                     default,
                 }
             }
-            CStmt::Expr(expr) => CStmt::Expr(Self::rewrite_compound_assignment_expr(symbols, expr)),
+            CStmt::Expr(expr) => CStmt::Expr(Self::rewrite_compound_assignment_expr(expr)),
             other => other,
         }
     }
 
-    fn cleanup_switch_body(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, stmts: Vec<CStmt>,
+    fn cleanup_switch_body(
+        symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
+        stmts: Vec<CStmt>,
     ) -> Vec<CStmt> {
         let cleaned = stmts
             .into_iter()
@@ -3037,10 +3034,9 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         Self::truncate_dead_straight_line_tail(cleaned)
     }
 
-    fn rewrite_compound_assignment_expr(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, expr: CExpr,
-    ) -> CExpr {
+    fn rewrite_compound_assignment_expr(expr: CExpr) -> CExpr {
         if let CExpr::Observed { id, expr } = expr {
-            return CExpr::observed(id, Self::rewrite_compound_assignment_expr(symbols, *expr));
+            return CExpr::observed(id, Self::rewrite_compound_assignment_expr(*expr));
         }
         let CExpr::Binary {
             op: BinaryOp::Assign,
@@ -3078,17 +3074,16 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         crate::ast::carry_outer_expr_observations(right.as_ref(), rewritten)
     }
 
-    fn compound_assignment_parts<'b>(
+    fn compound_assignment_parts(
         target: SymbolId,
-        rhs: &'b CExpr,
-    ) -> Option<(BinaryOp, &'b CExpr, &'b CExpr)> {
+        rhs: &CExpr,
+    ) -> Option<(BinaryOp, &CExpr, &CExpr)> {
         let CExpr::Binary { op, left, right } = rhs.unobserved() else {
             return None;
         };
         let compound_op = Self::compound_assignment_op(*op)?;
 
-        if Self::expr_is_var(left, target)
-            && crate::fold::op_lower::expr_is_side_effect_free(right)
+        if Self::expr_is_var(left, target) && crate::fold::op_lower::expr_is_side_effect_free(right)
         {
             return Some((compound_op, right, left));
         }
@@ -3103,10 +3098,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         None
     }
 
-    fn compound_assignment_rhs_of(
-        target: SymbolId,
-        rhs: &CExpr,
-    ) -> Option<(BinaryOp, CExpr)> {
+    fn compound_assignment_rhs_of(target: SymbolId, rhs: &CExpr) -> Option<(BinaryOp, CExpr)> {
         let semantic = rhs.clone_without_render_observations();
         let (op, retained, _) = Self::compound_assignment_parts(target, &semantic)?;
         Some((op, retained.clone()))
@@ -3195,10 +3187,10 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         // if (a) { T } else if (b) { T } -> if (a || b) { T }
         if let Some(else_stmt) = else_body.as_deref()
             && let CStmt::If {
-            cond: right_cond,
-            then_body: right_then,
-            else_body: None,
-        } = else_stmt.unobserved()
+                cond: right_cond,
+                then_body: right_then,
+                else_body: None,
+            } = else_stmt.unobserved()
             && Self::stmt_transparently_eq(then_body.as_ref(), right_then)
         {
             let rewritten = CStmt::If {
@@ -3577,7 +3569,9 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         rewritten
     }
 
-    fn rewrite_continue_tail_merges(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, stmts: Vec<CStmt>,
+    fn rewrite_continue_tail_merges(
+        symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
+        stmts: Vec<CStmt>,
     ) -> Vec<CStmt> {
         let mut rewritten = Vec::with_capacity(stmts.len());
         let mut i = 0;
@@ -3624,7 +3618,10 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                 .is_some_and(|(then_stmt, else_stmt)| {
                     Self::stmt_transparently_eq(then_stmt, else_stmt)
                 })
-            && !matches!(then_stmts.last().map(CStmt::unobserved), Some(CStmt::Return(_)))
+            && !matches!(
+                then_stmts.last().map(CStmt::unobserved),
+                Some(CStmt::Return(_))
+            )
             && !Self::stmt_list_contains_control_transfer(&then_stmts[..then_stmts.len() - 1])
             && !Self::stmt_list_contains_control_transfer(&else_stmts[..else_stmts.len() - 1])
         {
@@ -3849,7 +3846,9 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         }
     }
 
-    fn split_trailing_update_continue(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, stmt: CStmt,
+    fn split_trailing_update_continue(
+        symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
+        stmt: CStmt,
     ) -> Option<(Vec<CStmt>, CStmt)> {
         let mut stmts = Self::stmt_into_vec(stmt);
         while stmts
@@ -3875,7 +3874,10 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         Self::stmt_is_self_update(symbols, &tail_stmt).then_some((stmts, tail_stmt))
     }
 
-    fn strip_trailing_for_update(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, body: CStmt, update: &CExpr,
+    fn strip_trailing_for_update(
+        symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
+        body: CStmt,
+        update: &CExpr,
     ) -> CStmt {
         let mut stmts = Self::stmt_into_vec(body);
         while stmts
@@ -3892,7 +3894,10 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         Self::stmt_from_vec(stmts)
     }
 
-    fn expr_matches_for_update(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, body_expr: &CExpr, for_update: &CExpr,
+    fn expr_matches_for_update(
+        symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
+        body_expr: &CExpr,
+        for_update: &CExpr,
     ) -> bool {
         if body_expr.transparently_eq(for_update) {
             return true;
@@ -3928,7 +3933,9 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         None
     }
 
-    fn stmt_is_self_update(_symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, stmt: &CStmt,
+    fn stmt_is_self_update(
+        _symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
+        stmt: &CStmt,
     ) -> bool {
         let CStmt::Expr(expr) = stmt.unobserved() else {
             return false;
@@ -3995,9 +4002,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                         .as_ref()
                         .is_some_and(|body| Self::stmt_carries_label(body))
             }
-            CStmt::While { body, .. }
-            | CStmt::DoWhile { body, .. }
-            | CStmt::For { body, .. } => {
+            CStmt::While { body, .. } | CStmt::DoWhile { body, .. } | CStmt::For { body, .. } => {
                 Self::stmt_carries_label(body)
             }
             CStmt::Switch { cases, default, .. } => {
@@ -4054,8 +4059,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         match stmt.unobserved() {
             CStmt::Switch { .. } => Some(stmt.clone()),
             CStmt::Block(stmts)
-                if stmts.len() == 1
-                    && matches!(stmts[0].unobserved(), CStmt::Switch { .. }) =>
+                if stmts.len() == 1 && matches!(stmts[0].unobserved(), CStmt::Switch { .. }) =>
             {
                 Some(stmts[0].clone())
             }
@@ -4179,13 +4183,16 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
     }
 
     /// Rewrite adjacent `init; while (...) { ...; update; }` into `for (...)`.
-    fn rewrite_block_loops_to_for(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, stmts: Vec<CStmt>,
+    fn rewrite_block_loops_to_for(
+        symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
+        stmts: Vec<CStmt>,
     ) -> Vec<CStmt> {
         let mut rewritten = Vec::with_capacity(stmts.len());
         let mut i = 0;
         while i < stmts.len() {
             if i + 1 < stmts.len()
-                && let Some(mut for_stmts) = Self::try_rewrite_while_with_preheader_init(symbols,
+                && let Some(mut for_stmts) = Self::try_rewrite_while_with_preheader_init(
+                    symbols,
                     stmts[i].clone(),
                     stmts[i + 1].clone(),
                 )
@@ -4200,13 +4207,13 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         rewritten
     }
 
-    fn try_rewrite_while_with_preheader_init(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
+    fn try_rewrite_while_with_preheader_init(
+        symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
         preheader_stmt: CStmt,
         while_stmt: CStmt,
     ) -> Option<Vec<CStmt>> {
         let (prefix_stmts, init_stmt, induction_var) = Self::split_preheader_init(preheader_stmt)?;
-        let (while_semantic, _while_observations) =
-            while_stmt.into_semantic_with_observations();
+        let (while_semantic, _while_observations) = while_stmt.into_semantic_with_observations();
         let CStmt::While { cond, body } = while_semantic else {
             return None;
         };
@@ -4222,12 +4229,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         let cond_vars = Self::collect_expr_vars(&loop_cond);
         let cond_reads_induction = cond_vars.contains(&induction_var);
         let (update, body_without_update, update_links_cond) =
-            Self::extract_loop_update(
-                symbols,
-                induction_var,
-                &cond_vars,
-                loop_body,
-            )?;
+            Self::extract_loop_update(symbols, induction_var, &cond_vars, loop_body)?;
 
         if !cond_reads_induction && !update_links_cond {
             return None;
@@ -4268,14 +4270,14 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         }
     }
 
-    fn split_preheader_init(preheader_stmt: CStmt,
+    fn split_preheader_init(
+        preheader_stmt: CStmt,
     ) -> Option<(Vec<CStmt>, CStmt, crate::symbol::SymbolId)> {
         if let Some(var) = Self::extract_induction_var_from_init(&preheader_stmt) {
             return Some((Vec::new(), preheader_stmt, var));
         }
 
-        let (semantic, _block_observations) =
-            preheader_stmt.into_semantic_with_observations();
+        let (semantic, _block_observations) = preheader_stmt.into_semantic_with_observations();
         let CStmt::Block(mut prefix) = semantic else {
             return None;
         };
@@ -4290,7 +4292,8 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         Some((prefix, init_stmt, var))
     }
 
-    fn extract_loop_update(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
+    fn extract_loop_update(
+        symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
         var: SymbolId,
         cond_vars: &HashSet<SymbolId>,
         body: CStmt,
@@ -4310,7 +4313,10 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             }
         }
 
-        while effective.last().is_some_and(|stmt| matches!(stmt.unobserved(), CStmt::Empty | CStmt::Continue)) {
+        while effective
+            .last()
+            .is_some_and(|stmt| matches!(stmt.unobserved(), CStmt::Empty | CStmt::Continue))
+        {
             effective.pop();
         }
         if effective.is_empty() {
@@ -4487,8 +4493,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
     }
 
     fn stmt_def_and_reads(stmt: &CStmt) -> Option<(SymbolId, HashSet<SymbolId>)> {
-        let CStmt::Expr(expr) = stmt.unobserved()
-        else {
+        let CStmt::Expr(expr) = stmt.unobserved() else {
             return None;
         };
         let CExpr::Binary {
@@ -4529,65 +4534,61 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         }
     }
 
-    fn normalize_condition_addr_artifacts(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, expr: CExpr,
-    ) -> CExpr {
+    fn normalize_condition_addr_artifacts(expr: CExpr) -> CExpr {
         match expr {
             CExpr::Observed { id, expr } => {
-                CExpr::observed(
-                id,
-                Self::normalize_condition_addr_artifacts(symbols, *expr))
+                CExpr::observed(id, Self::normalize_condition_addr_artifacts(*expr))
             }
             // A SymbolId is already the binding identity. Reinterpreting its
             // spelling as another identifier would mint a second binding.
             CExpr::Var(name) => CExpr::Var(name),
             CExpr::Unary { op, operand } => CExpr::Unary {
                 op,
-                operand: Box::new(Self::normalize_condition_addr_artifacts(symbols, *operand)),
+                operand: Box::new(Self::normalize_condition_addr_artifacts(*operand)),
             },
             CExpr::Binary { op, left, right } => CExpr::Binary {
                 op,
-                left: Box::new(Self::normalize_condition_addr_artifacts(symbols, *left)),
-                right: Box::new(Self::normalize_condition_addr_artifacts(symbols, *right)),
+                left: Box::new(Self::normalize_condition_addr_artifacts(*left)),
+                right: Box::new(Self::normalize_condition_addr_artifacts(*right)),
             },
             CExpr::Ternary {
                 cond,
                 then_expr,
                 else_expr,
             } => CExpr::Ternary {
-                cond: Box::new(Self::normalize_condition_addr_artifacts(symbols, *cond)),
-                then_expr: Box::new(Self::normalize_condition_addr_artifacts(symbols, *then_expr,
-                )),
-                else_expr: Box::new(Self::normalize_condition_addr_artifacts(symbols, *else_expr,
-                )),
+                cond: Box::new(Self::normalize_condition_addr_artifacts(*cond)),
+                then_expr: Box::new(Self::normalize_condition_addr_artifacts(*then_expr)),
+                else_expr: Box::new(Self::normalize_condition_addr_artifacts(*else_expr)),
             },
             CExpr::Cast { ty, expr } => CExpr::Cast {
                 ty,
-                expr: Box::new(Self::normalize_condition_addr_artifacts(symbols, *expr)),
+                expr: Box::new(Self::normalize_condition_addr_artifacts(*expr)),
             },
             CExpr::Call { func, args, site } => CExpr::Call {
                 site,
-                func: Box::new(Self::normalize_condition_addr_artifacts(symbols, *func)),
+                func: Box::new(Self::normalize_condition_addr_artifacts(*func)),
                 args: args
                     .into_iter()
-                    .map(|x| Self::normalize_condition_addr_artifacts(symbols, x))
+                    .map(Self::normalize_condition_addr_artifacts)
                     .collect(),
             },
             CExpr::Subscript { base, index } => CExpr::Subscript {
-                base: Box::new(Self::normalize_condition_addr_artifacts(symbols, *base)),
-                index: Box::new(Self::normalize_condition_addr_artifacts(symbols, *index)),
+                base: Box::new(Self::normalize_condition_addr_artifacts(*base)),
+                index: Box::new(Self::normalize_condition_addr_artifacts(*index)),
             },
             CExpr::Member { base, member } => CExpr::Member {
-                base: Box::new(Self::normalize_condition_addr_artifacts(symbols, *base)),
+                base: Box::new(Self::normalize_condition_addr_artifacts(*base)),
                 member,
             },
             CExpr::PtrMember { base, member } => CExpr::PtrMember {
-                base: Box::new(Self::normalize_condition_addr_artifacts(symbols, *base)),
+                base: Box::new(Self::normalize_condition_addr_artifacts(*base)),
                 member,
             },
-            CExpr::Sizeof(inner) => CExpr::Sizeof(Box::new(Self::normalize_condition_addr_artifacts(symbols, *inner),
-            )),
+            CExpr::Sizeof(inner) => {
+                CExpr::Sizeof(Box::new(Self::normalize_condition_addr_artifacts(*inner)))
+            }
             CExpr::AddrOf(inner) => {
-                let normalized = Self::normalize_condition_addr_artifacts(symbols, *inner);
+                let normalized = Self::normalize_condition_addr_artifacts(*inner);
                 match normalized {
                     CExpr::Deref(inner2) => *inner2,
                     CExpr::Var(name) => CExpr::Var(name),
@@ -4595,7 +4596,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                 }
             }
             CExpr::Deref(inner) => {
-                let normalized = Self::normalize_condition_addr_artifacts(symbols, *inner);
+                let normalized = Self::normalize_condition_addr_artifacts(*inner);
                 match normalized {
                     CExpr::AddrOf(inner2) => *inner2,
                     other => CExpr::Deref(Box::new(other)),
@@ -4604,11 +4605,12 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             CExpr::Comma(values) => CExpr::Comma(
                 values
                     .into_iter()
-                    .map(|x| Self::normalize_condition_addr_artifacts(symbols, x))
+                    .map(Self::normalize_condition_addr_artifacts)
                     .collect(),
             ),
-            CExpr::Paren(inner) => CExpr::Paren(Box::new(Self::normalize_condition_addr_artifacts(symbols, *inner),
-            )),
+            CExpr::Paren(inner) => {
+                CExpr::Paren(Box::new(Self::normalize_condition_addr_artifacts(*inner)))
+            }
             other => other,
         }
     }
@@ -4734,7 +4736,10 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             }
             CStmt::Break | CStmt::Continue => CStmt::Empty,
             CStmt::Block(mut stmts) => {
-                while stmts.last().is_some_and(|stmt| matches!(stmt.unobserved(), CStmt::Break | CStmt::Continue)) {
+                while stmts
+                    .last()
+                    .is_some_and(|stmt| matches!(stmt.unobserved(), CStmt::Break | CStmt::Continue))
+                {
                     stmts.pop();
                 }
                 if stmts.is_empty() {
@@ -4990,8 +4995,7 @@ mod tests {
             .expect("certified block occurrence")
             .clone();
         assert_eq!(
-            structurer
-                .rendered_branch_occurrences_cover_source(0x1010, &occurrences),
+            structurer.rendered_branch_occurrences_cover_source(0x1010, &occurrences),
             Ok(true),
             "the recorded exact branch guard must cover the canonical source domain"
         );
@@ -5017,7 +5021,10 @@ mod tests {
             .expect_err("an edge without canonical facts must be refused");
 
         assert!(reason.contains("missing canonical control facts"));
-        assert_eq!(structurer.active_domains, vec![RenderedBlockDomain::default()]);
+        assert_eq!(
+            structurer.active_domains,
+            vec![RenderedBlockDomain::default()]
+        );
     }
 
     #[test]
@@ -5067,8 +5074,8 @@ mod tests {
         owner: &RenderObservationOwner,
         stmt: CStmt,
     ) -> (CStmt, crate::ast::ReachableObservations) {
-        let mut function = CFunction::new("observed_structure", CType::Int(32))
-            .with_body(vec![stmt]);
+        let mut function =
+            CFunction::new("observed_structure", CType::Int(32)).with_body(vec![stmt]);
         let reachable = strip_render_observations(&mut function, owner.expected_count())
             .expect("structure rewrite must retain each observation at most once");
         let stmt = function.body.pop().unwrap_or(CStmt::Empty);
@@ -5078,7 +5085,9 @@ mod tests {
     #[test]
     fn loop_condition_prefix_preserves_sequential_effects() {
         let symbols = test_table();
-        let load = CExpr::assign(v(&symbols, "byte"), CExpr::Deref(Box::new(v(&symbols, "cursor"))),
+        let load = CExpr::assign(
+            v(&symbols, "byte"),
+            CExpr::Deref(Box::new(v(&symbols, "cursor"))),
         );
         let condition = CExpr::binary(BinaryOp::Ne, v(&symbols, "byte"), CExpr::IntLit(0));
 
@@ -5108,19 +5117,15 @@ mod tests {
         let (outer_stmt_id, observed_stmt) = owner
             .observe_stmt(observed_stmt)
             .expect("outer prefix statement observation");
-        let condition = CExpr::binary(
-            BinaryOp::Ne,
-            v(&symbols, "byte"),
-            CExpr::IntLit(0));
+        let condition = CExpr::binary(BinaryOp::Ne, v(&symbols, "byte"), CExpr::IntLit(0));
 
         let combined = ControlFlowStructurer::combine_loop_condition_prefix(
             vec![observed_stmt],
             condition.clone(),
         )
         .expect("observation metadata must not reject a valid loop prefix");
-        let (plain, reachable) = strip_test_observations(
-            &owner,
-            CStmt::while_loop(combined, CStmt::Empty));
+        let (plain, reachable) =
+            strip_test_observations(&owner, CStmt::while_loop(combined, CStmt::Empty));
 
         assert!(reachable.contains(outer_stmt_id));
         assert!(reachable.contains(inner_stmt_id));
@@ -5134,11 +5139,41 @@ mod tests {
     fn test_arch() -> ArchSpec {
         let mut arch = ArchSpec::new("x86-64");
         let registers = [
-            ("RAX", RegisterStorage { offset: 0x00, size: 8 }),
-            ("RDI", RegisterStorage { offset: 0x10, size: 8 }),
-            ("RBP", RegisterStorage { offset: 0x20, size: 8 }),
-            ("RSP", RegisterStorage { offset: 0x28, size: 8 }),
-            ("RIP", RegisterStorage { offset: 0x30, size: 8 }),
+            (
+                "RAX",
+                RegisterStorage {
+                    offset: 0x00,
+                    size: 8,
+                },
+            ),
+            (
+                "RDI",
+                RegisterStorage {
+                    offset: 0x10,
+                    size: 8,
+                },
+            ),
+            (
+                "RBP",
+                RegisterStorage {
+                    offset: 0x20,
+                    size: 8,
+                },
+            ),
+            (
+                "RSP",
+                RegisterStorage {
+                    offset: 0x28,
+                    size: 8,
+                },
+            ),
+            (
+                "RIP",
+                RegisterStorage {
+                    offset: 0x30,
+                    size: 8,
+                },
+            ),
         ];
         for (name, storage) in registers {
             arch.add_register(RegisterDef::new(name, storage.offset, storage.size));
@@ -5572,18 +5607,17 @@ mod tests {
                     .iter()
                     .enumerate()
                     .find_map(|(op_idx, _)| {
-                        match origins.origin(
-                        crate::normalize::NormalizedOpSite {
+                        match origins.origin(crate::normalize::NormalizedOpSite {
                             block: *block_id,
                             op_idx,
                         }) {
-                        Some(crate::normalize::NormalizedOpOrigin::PhiEdgeCopy(origin))
-                            if origin.guarded.is_none() =>
-                        {
-                            Some((block_addr, op_idx, origin.target))
+                            Some(crate::normalize::NormalizedOpOrigin::PhiEdgeCopy(origin))
+                                if origin.guarded.is_none() =>
+                            {
+                                Some((block_addr, op_idx, origin.target))
+                            }
+                            _ => None,
                         }
-                        _ => None,
-                    }
                     })
             })
             .expect("loop normalization emits an unconditional phi-edge copy");
@@ -5719,13 +5753,10 @@ mod tests {
         assert_eq!(transferred.len(), 1);
         assert!(transferred[0].loops.is_empty());
         assert!(
-            transferred[0].guards.iter().any(|guard| matches!(
-                guard,
-                ControlGuard::Branch {
-                    truth: false,
-                    ..
-                }
-            )),
+            transferred[0]
+                .guards
+                .iter()
+                .any(|guard| matches!(guard, ControlGuard::Branch { truth: false, .. })),
             "the exact exit predicate must survive loop-domain projection"
         );
     }
@@ -5765,7 +5796,9 @@ mod tests {
     #[test]
     fn post_test_loop_removes_implicit_latch_break() {
         let symbols = test_table();
-        let body = CStmt::Block(vec![assign(&symbols, "hash", v(&symbols, "next_hash")), CStmt::Break,
+        let body = CStmt::Block(vec![
+            assign(&symbols, "hash", v(&symbols, "next_hash")),
+            CStmt::Break,
         ]);
 
         let stripped = ControlFlowStructurer::strip_trailing_latch_marker(body);
@@ -5816,9 +5849,15 @@ mod tests {
             CStmt::while_loop(
                 CExpr::binary(BinaryOp::Lt, v(&symbols, "i"), CExpr::IntLit(10)),
                 CStmt::Block(vec![
-                    assign(&symbols, "sum", CExpr::binary(BinaryOp::Add, v(&symbols, "sum"), v(&symbols, "i")),
+                    assign(
+                        &symbols,
+                        "sum",
+                        CExpr::binary(BinaryOp::Add, v(&symbols, "sum"), v(&symbols, "i")),
                     ),
-                    assign(&symbols, "i", CExpr::binary(BinaryOp::Add, v(&symbols, "i"), CExpr::IntLit(1)),
+                    assign(
+                        &symbols,
+                        "i",
+                        CExpr::binary(BinaryOp::Add, v(&symbols, "i"), CExpr::IntLit(1)),
                     ),
                 ]),
             ),
@@ -5857,7 +5896,8 @@ mod tests {
             CStmt::while_loop(
                 CExpr::binary(BinaryOp::Lt, v(&symbols, "i"), v(&symbols, "n")),
                 CStmt::Block(vec![
-                    assign(&symbols, 
+                    assign(
+                        &symbols,
                         "c",
                         CExpr::Subscript {
                             base: Box::new(v(&symbols, "buf")),
@@ -5869,20 +5909,28 @@ mod tests {
                         CStmt::Block(vec![
                             CStmt::if_stmt(
                                 CExpr::binary(BinaryOp::Eq, v(&symbols, "c"), v(&symbols, "b")),
-                                assign(&symbols, 
+                                assign(
+                                    &symbols,
                                     "count",
-                                    CExpr::binary(BinaryOp::Add, v(&symbols, "count"), CExpr::IntLit(1),
+                                    CExpr::binary(
+                                        BinaryOp::Add,
+                                        v(&symbols, "count"),
+                                        CExpr::IntLit(1),
                                     ),
                                 ),
                                 None,
                             ),
-                            assign(&symbols, "i", CExpr::binary(BinaryOp::Add, v(&symbols, "i"), CExpr::IntLit(1)),
+                            assign(
+                                &symbols,
+                                "i",
+                                CExpr::binary(BinaryOp::Add, v(&symbols, "i"), CExpr::IntLit(1)),
                             ),
                             CStmt::Continue,
                         ]),
                         None,
                     ),
-                    assign(&symbols, 
+                    assign(
+                        &symbols,
                         "count",
                         CExpr::binary(BinaryOp::Add, v(&symbols, "count"), CExpr::IntLit(1)),
                     ),
@@ -5969,14 +6017,24 @@ mod tests {
     #[test]
     fn rewrites_continue_tail_with_common_suffix_before_shared_latch() {
         let symbols = test_table();
-        let hash_xor = assign(&symbols, "hash", CExpr::binary(BinaryOp::BitXor, v(&symbols, "c"), v(&symbols, "hash")),
-        );
-        let hash_mul = assign(&symbols, 
+        let hash_xor = assign(
+            &symbols,
             "hash",
-            CExpr::binary(BinaryOp::Mul, v(&symbols, "hash"), CExpr::UIntLit(0x100000001b3),
+            CExpr::binary(BinaryOp::BitXor, v(&symbols, "c"), v(&symbols, "hash")),
+        );
+        let hash_mul = assign(
+            &symbols,
+            "hash",
+            CExpr::binary(
+                BinaryOp::Mul,
+                v(&symbols, "hash"),
+                CExpr::UIntLit(0x100000001b3),
             ),
         );
-        let i_update = assign(&symbols, "i", CExpr::binary(BinaryOp::Add, v(&symbols, "i"), CExpr::IntLit(1)),
+        let i_update = assign(
+            &symbols,
+            "i",
+            CExpr::binary(BinaryOp::Add, v(&symbols, "i"), CExpr::IntLit(1)),
         );
         let lowercase_update = CStmt::Expr(CExpr::binary(
             BinaryOp::AddAssign,
@@ -5990,7 +6048,8 @@ mod tests {
             CStmt::while_loop(
                 CExpr::binary(BinaryOp::Lt, v(&symbols, "i"), v(&symbols, "n")),
                 CStmt::Block(vec![
-                    assign(&symbols, 
+                    assign(
+                        &symbols,
                         "c",
                         CExpr::Subscript {
                             base: Box::new(v(&symbols, "buf")),
@@ -6083,11 +6142,17 @@ mod tests {
             v(&symbols, "i"),
             CExpr::binary(BinaryOp::Add, v(&symbols, "i"), CExpr::IntLit(1)),
         );
-        let hash_update = assign(&symbols, "hash", CExpr::binary(BinaryOp::BitXor, v(&symbols, "c"), v(&symbols, "hash")),
+        let hash_update = assign(
+            &symbols,
+            "hash",
+            CExpr::binary(BinaryOp::BitXor, v(&symbols, "c"), v(&symbols, "hash")),
         );
         let input = CStmt::For {
             init: Some(Box::new(assign(&symbols, "i", CExpr::IntLit(0)))),
-            cond: Some(CExpr::binary(BinaryOp::Lt, v(&symbols, "i"), v(&symbols, "n"),
+            cond: Some(CExpr::binary(
+                BinaryOp::Lt,
+                v(&symbols, "i"),
+                v(&symbols, "n"),
             )),
             update: Some(i_update_expr.clone()),
             body: Box::new(CStmt::Block(vec![
@@ -6102,7 +6167,11 @@ mod tests {
         };
         assert_eq!(
             body.as_ref(),
-            &CStmt::Expr(CExpr::binary(BinaryOp::BitXorAssign, v(&symbols, "hash"), v(&symbols, "c"))),
+            &CStmt::Expr(CExpr::binary(
+                BinaryOp::BitXorAssign,
+                v(&symbols, "hash"),
+                v(&symbols, "c")
+            )),
             "for latch update should own the duplicated trailing body update"
         );
     }
@@ -6120,10 +6189,10 @@ mod tests {
         let (rhs_id, rhs) = owner
             .observe_expr(CExpr::binary(BinaryOp::Shl, read, retained))
             .expect("rhs observation");
-        let rewritten = ControlFlowStructurer::rewrite_compound_assignment_expr(
-            &symbols,
-            CExpr::assign(v(&symbols, "value"), rhs),
-        );
+        let rewritten = ControlFlowStructurer::rewrite_compound_assignment_expr(CExpr::assign(
+            v(&symbols, "value"),
+            rhs,
+        ));
 
         assert_eq!(
             rewritten,
@@ -6145,8 +6214,7 @@ mod tests {
             ))
         );
 
-        let (plain, reachable) =
-            strip_test_observations(&owner, CStmt::Expr(rewritten));
+        let (plain, reachable) = strip_test_observations(&owner, CStmt::Expr(rewritten));
         assert!(reachable.contains(read_id));
         assert!(reachable.contains(retained_id));
         assert!(reachable.contains(rhs_id));
@@ -6241,8 +6309,7 @@ mod tests {
             &symbols,
             vec![preheader, while_stmt],
         );
-        let (stripped, reachable) =
-            strip_test_observations(&owner, CStmt::Block(marked));
+        let (stripped, reachable) = strip_test_observations(&owner, CStmt::Block(marked));
 
         for id in [prefix_id, init_id, cond_id, work_id, update_id] {
             assert!(reachable.contains(id), "exact child occurrence was lost");
@@ -6412,9 +6479,9 @@ mod tests {
         assert!(ControlFlowStructurer::stmt_guarantees_termination(
             &observed_return
         ));
-        let extracted = ControlFlowStructurer::single_terminator_stmt(&CStmt::Block(vec![
-            observed_return]))
-        .expect("observed terminator must classify through its wrapper");
+        let extracted =
+            ControlFlowStructurer::single_terminator_stmt(&CStmt::Block(vec![observed_return]))
+                .expect("observed terminator must classify through its wrapper");
 
         let (body_id, body_stmt) = owner
             .observe_stmt(assign(&symbols, "x", CExpr::IntLit(1)))
@@ -6429,8 +6496,7 @@ mod tests {
         let (break_id, trailing_break) = owner
             .observe_stmt(CStmt::Break)
             .expect("latch marker observation");
-        let stripped_latch =
-            ControlFlowStructurer::strip_trailing_latch_marker(trailing_break);
+        let stripped_latch = ControlFlowStructurer::strip_trailing_latch_marker(trailing_break);
 
         let (plain, reachable) = strip_test_observations(
             &owner,
@@ -6508,11 +6574,9 @@ mod tests {
         let (direct_if_id, direct_if) = direct_owner
             .observe_stmt(CStmt::if_stmt(direct_cond, CStmt::Break, None))
             .expect("direct guard observation");
-        let direct = ControlFlowStructurer::try_convert_do_while_to_while(
-            direct_if,
-            infinite.clone());
-        let (direct_plain, direct_reachable) =
-            strip_test_observations(&direct_owner, direct);
+        let direct =
+            ControlFlowStructurer::try_convert_do_while_to_while(direct_if, infinite.clone());
+        let (direct_plain, direct_reachable) = strip_test_observations(&direct_owner, direct);
 
         let mut block_owner = RenderObservationOwner::new();
         let (block_cond_id, block_cond) = block_owner
@@ -6539,14 +6603,22 @@ mod tests {
     fn rewrites_side_effect_free_assignments_to_compound_assignments() {
         let symbols = test_table();
         let input = CStmt::Block(vec![
-            assign(&symbols, "hash", CExpr::binary(BinaryOp::BitXor, v(&symbols, "c"), v(&symbols, "hash")),
-            ),
-            assign(&symbols, 
+            assign(
+                &symbols,
                 "hash",
-                CExpr::binary(BinaryOp::Mul, v(&symbols, "hash"), CExpr::UIntLit(0x100000001b3),
+                CExpr::binary(BinaryOp::BitXor, v(&symbols, "c"), v(&symbols, "hash")),
+            ),
+            assign(
+                &symbols,
+                "hash",
+                CExpr::binary(
+                    BinaryOp::Mul,
+                    v(&symbols, "hash"),
+                    CExpr::UIntLit(0x100000001b3),
                 ),
             ),
-            assign(&symbols, 
+            assign(
+                &symbols,
                 "hash",
                 CExpr::binary(
                     BinaryOp::Add,
@@ -6566,7 +6638,11 @@ mod tests {
         };
         assert_eq!(
             stmts[0],
-            CStmt::Expr(CExpr::binary(BinaryOp::BitXorAssign, v(&symbols, "hash"), v(&symbols, "c")))
+            CStmt::Expr(CExpr::binary(
+                BinaryOp::BitXorAssign,
+                v(&symbols, "hash"),
+                v(&symbols, "c")
+            ))
         );
         assert_eq!(
             stmts[1],
@@ -6627,7 +6703,10 @@ mod tests {
                         CStmt::Break,
                         None,
                     ),
-                    assign(&symbols, "sum", CExpr::binary(BinaryOp::Add, v(&symbols, "sum"), v(&symbols, "i")),
+                    assign(
+                        &symbols,
+                        "sum",
+                        CExpr::binary(BinaryOp::Add, v(&symbols, "sum"), v(&symbols, "i")),
                     ),
                     expr_stmt(CExpr::Unary {
                         op: UnaryOp::PostInc,
@@ -6675,7 +6754,8 @@ mod tests {
             assign(&symbols, "i", CExpr::IntLit(0)),
             CStmt::while_loop(
                 CExpr::binary(BinaryOp::Lt, v(&symbols, "i"), CExpr::IntLit(10)),
-                CStmt::Block(vec![assign(&symbols, 
+                CStmt::Block(vec![assign(
+                    &symbols,
                     "sum",
                     CExpr::binary(BinaryOp::Add, v(&symbols, "sum"), CExpr::IntLit(1)),
                 )]),
@@ -6699,7 +6779,8 @@ mod tests {
             assign(&symbols, "i", CExpr::IntLit(0)),
             CStmt::while_loop(
                 CExpr::binary(BinaryOp::Lt, v(&symbols, "j"), CExpr::IntLit(10)),
-                CStmt::Block(vec![assign(&symbols, 
+                CStmt::Block(vec![assign(
+                    &symbols,
                     "i",
                     CExpr::binary(BinaryOp::Add, v(&symbols, "i"), CExpr::IntLit(1)),
                 )]),
@@ -6729,7 +6810,9 @@ mod tests {
             CExpr::binary(
                 BinaryOp::Assign,
                 v(&symbols, "i"),
-                CExpr::call(v(&symbols, "next_i"), vec![v(&symbols, "i"), v(&symbols, "x")],
+                CExpr::call(
+                    v(&symbols, "next_i"),
+                    vec![v(&symbols, "i"), v(&symbols, "x")],
                 ),
             ),
         ];
@@ -6740,7 +6823,10 @@ mod tests {
                 CStmt::while_loop(
                     CExpr::binary(BinaryOp::Lt, v(&symbols, "i"), v(&symbols, "n")),
                     CStmt::Block(vec![
-                        assign(&symbols, "sum", CExpr::binary(BinaryOp::Add, v(&symbols, "sum"), v(&symbols, "i")),
+                        assign(
+                            &symbols,
+                            "sum",
+                            CExpr::binary(BinaryOp::Add, v(&symbols, "sum"), v(&symbols, "i")),
                         ),
                         expr_stmt(update_expr.clone()),
                     ]),
@@ -6841,7 +6927,11 @@ mod tests {
         let cleaned = ControlFlowStructurer::cleanup(&symbols, input);
         assert_eq!(
             cleaned,
-            CStmt::if_stmt(CExpr::binary(BinaryOp::Or, v(&symbols, "a"), v(&symbols, "b")), body, None)
+            CStmt::if_stmt(
+                CExpr::binary(BinaryOp::Or, v(&symbols, "a"), v(&symbols, "b")),
+                body,
+                None
+            )
         );
     }
 
@@ -6879,7 +6969,10 @@ mod tests {
         let (stripped, reachable) = strip_test_observations(&owner, marked);
 
         for id in [left_cond_id, right_cond_id, left_body_id, outer_if_id] {
-            assert!(reachable.contains(id), "exact surviving occurrence was lost");
+            assert!(
+                reachable.contains(id),
+                "exact surviving occurrence was lost"
+            );
         }
         for id in [right_body_id, inner_if_id] {
             assert!(
@@ -6931,9 +7024,15 @@ mod tests {
         let input = CStmt::if_stmt(
             CExpr::binary(BinaryOp::Lt, v(&symbols, "x"), v(&symbols, "limit")),
             CStmt::Block(vec![
-                CStmt::Expr(CExpr::binary(BinaryOp::AddAssign, v(&symbols, "sum"), v(&symbols, "x"),
+                CStmt::Expr(CExpr::binary(
+                    BinaryOp::AddAssign,
+                    v(&symbols, "sum"),
+                    v(&symbols, "x"),
                 )),
-                CStmt::Expr(CExpr::binary(BinaryOp::AddAssign, v(&symbols, "x"), CExpr::IntLit(1),
+                CStmt::Expr(CExpr::binary(
+                    BinaryOp::AddAssign,
+                    v(&symbols, "x"),
+                    CExpr::IntLit(1),
                 )),
             ]),
             Some(CStmt::ret(Some(CExpr::IntLit(0)))),
@@ -6948,8 +7047,16 @@ mod tests {
                     CStmt::ret(Some(CExpr::IntLit(0))),
                     None
                 ),
-                CStmt::Expr(CExpr::binary(BinaryOp::AddAssign, v(&symbols, "sum"), v(&symbols, "x"))),
-                CStmt::Expr(CExpr::binary(BinaryOp::AddAssign, v(&symbols, "x"), CExpr::IntLit(1),)),
+                CStmt::Expr(CExpr::binary(
+                    BinaryOp::AddAssign,
+                    v(&symbols, "sum"),
+                    v(&symbols, "x")
+                )),
+                CStmt::Expr(CExpr::binary(
+                    BinaryOp::AddAssign,
+                    v(&symbols, "x"),
+                    CExpr::IntLit(1),
+                )),
             ])
         );
     }
@@ -6961,9 +7068,15 @@ mod tests {
             v(&symbols, "is_error"),
             CStmt::ret(Some(CExpr::IntLit(-1))),
             Some(CStmt::Block(vec![
-                CStmt::Expr(CExpr::binary(BinaryOp::AddAssign, v(&symbols, "sum"), v(&symbols, "x"),
+                CStmt::Expr(CExpr::binary(
+                    BinaryOp::AddAssign,
+                    v(&symbols, "sum"),
+                    v(&symbols, "x"),
                 )),
-                CStmt::Expr(CExpr::binary(BinaryOp::AddAssign, v(&symbols, "x"), CExpr::IntLit(1),
+                CStmt::Expr(CExpr::binary(
+                    BinaryOp::AddAssign,
+                    v(&symbols, "x"),
+                    CExpr::IntLit(1),
                 )),
             ])),
         );
@@ -6972,9 +7085,21 @@ mod tests {
         assert_eq!(
             cleaned,
             CStmt::Block(vec![
-                CStmt::if_stmt(v(&symbols, "is_error"), CStmt::ret(Some(CExpr::IntLit(-1))), None),
-                CStmt::Expr(CExpr::binary(BinaryOp::AddAssign, v(&symbols, "sum"), v(&symbols, "x"))),
-                CStmt::Expr(CExpr::binary(BinaryOp::AddAssign, v(&symbols, "x"), CExpr::IntLit(1),)),
+                CStmt::if_stmt(
+                    v(&symbols, "is_error"),
+                    CStmt::ret(Some(CExpr::IntLit(-1))),
+                    None
+                ),
+                CStmt::Expr(CExpr::binary(
+                    BinaryOp::AddAssign,
+                    v(&symbols, "sum"),
+                    v(&symbols, "x")
+                )),
+                CStmt::Expr(CExpr::binary(
+                    BinaryOp::AddAssign,
+                    v(&symbols, "x"),
+                    CExpr::IntLit(1),
+                )),
             ])
         );
     }
@@ -7014,9 +7139,8 @@ mod tests {
         let (if_id, guarded) = owner
             .observe_stmt(CStmt::if_stmt(cond, body, None))
             .expect("split if observation");
-        let cleaned = ControlFlowStructurer::cleanup(
-            &symbols,
-            CStmt::Block(vec![guarded, terminator]));
+        let cleaned =
+            ControlFlowStructurer::cleanup(&symbols, CStmt::Block(vec![guarded, terminator]));
 
         let (plain, reachable) = strip_test_observations(&owner, cleaned);
         assert!(reachable.contains(cond_id));
@@ -7053,8 +7177,7 @@ mod tests {
             vec![then_suffix],
             vec![else_suffix],
         );
-        let (plain, reachable) =
-            strip_test_observations(&owner, CStmt::Block(factored));
+        let (plain, reachable) = strip_test_observations(&owner, CStmt::Block(factored));
         assert!(!reachable.contains(then_id));
         assert!(!reachable.contains(else_id));
         assert_eq!(plain, CStmt::Block(vec![suffix]));
@@ -7086,7 +7209,10 @@ mod tests {
     fn does_not_rewrite_trailing_guard_when_following_stmt_is_not_terminator() {
         let symbols = test_table();
         let input = CStmt::Block(vec![
-            CStmt::if_stmt(v(&symbols, "ready"), assign(&symbols, "x", CExpr::IntLit(1)), None,
+            CStmt::if_stmt(
+                v(&symbols, "ready"),
+                assign(&symbols, "x", CExpr::IntLit(1)),
+                None,
             ),
             assign(&symbols, "y", CExpr::IntLit(2)),
         ]);
@@ -7123,7 +7249,10 @@ mod tests {
         let symbols = test_table();
         let input = CStmt::if_stmt(
             CExpr::binary(BinaryOp::Lt, v(&symbols, "x"), v(&symbols, "limit")),
-            assign(&symbols, "sum", CExpr::binary(BinaryOp::Add, v(&symbols, "sum"), v(&symbols, "x")),
+            assign(
+                &symbols,
+                "sum",
+                CExpr::binary(BinaryOp::Add, v(&symbols, "sum"), v(&symbols, "x")),
             ),
             Some(CStmt::ret(Some(CExpr::IntLit(0)))),
         );
@@ -7145,12 +7274,19 @@ mod tests {
     #[test]
     fn removes_empty_else_branch() {
         let symbols = test_table();
-        let input = CStmt::if_stmt(v(&symbols, "a"), assign(&symbols, "x", CExpr::IntLit(1)), Some(CStmt::Empty),
+        let input = CStmt::if_stmt(
+            v(&symbols, "a"),
+            assign(&symbols, "x", CExpr::IntLit(1)),
+            Some(CStmt::Empty),
         );
         let cleaned = ControlFlowStructurer::cleanup(&symbols, input);
         assert_eq!(
             cleaned,
-            CStmt::if_stmt(v(&symbols, "a"), assign(&symbols, "x", CExpr::IntLit(1)), None)
+            CStmt::if_stmt(
+                v(&symbols, "a"),
+                assign(&symbols, "x", CExpr::IntLit(1)),
+                None
+            )
         );
     }
 
@@ -7165,7 +7301,10 @@ mod tests {
     #[test]
     fn constant_true_if_collapses_to_then_body() {
         let symbols = test_table();
-        let input = CStmt::if_stmt(CExpr::IntLit(1), assign(&symbols, "x", CExpr::IntLit(7)), None,
+        let input = CStmt::if_stmt(
+            CExpr::IntLit(1),
+            assign(&symbols, "x", CExpr::IntLit(7)),
+            None,
         );
         let cleaned = ControlFlowStructurer::cleanup(&symbols, input);
         assert_eq!(cleaned, assign(&symbols, "x", CExpr::IntLit(7)));
@@ -7262,12 +7401,21 @@ mod tests {
         let input = CStmt::Block(vec![
             assign(&symbols, "i", CExpr::IntLit(0)),
             CStmt::while_loop(
-                CExpr::binary(BinaryOp::Lt, CExpr::AddrOf(Box::new(v(&symbols, "i"))), v(&symbols, "n"),
+                CExpr::binary(
+                    BinaryOp::Lt,
+                    CExpr::AddrOf(Box::new(v(&symbols, "i"))),
+                    v(&symbols, "n"),
                 ),
                 CStmt::Block(vec![
-                    assign(&symbols, "sum", CExpr::binary(BinaryOp::Add, v(&symbols, "sum"), v(&symbols, "i")),
+                    assign(
+                        &symbols,
+                        "sum",
+                        CExpr::binary(BinaryOp::Add, v(&symbols, "sum"), v(&symbols, "i")),
                     ),
-                    assign(&symbols, "i", CExpr::binary(BinaryOp::Add, v(&symbols, "i"), CExpr::IntLit(1)),
+                    assign(
+                        &symbols,
+                        "i",
+                        CExpr::binary(BinaryOp::Add, v(&symbols, "i"), CExpr::IntLit(1)),
                     ),
                 ]),
             ),
@@ -7286,9 +7434,13 @@ mod tests {
         let input = CStmt::Block(vec![
             assign(&symbols, "i", CExpr::IntLit(0)),
             CStmt::while_loop(
-                CExpr::binary(BinaryOp::Lt, CExpr::AddrOf(Box::new(v(&symbols, "local"))), v(&symbols, "n"),
+                CExpr::binary(
+                    BinaryOp::Lt,
+                    CExpr::AddrOf(Box::new(v(&symbols, "local"))),
+                    v(&symbols, "n"),
                 ),
-                CStmt::Block(vec![assign(&symbols, 
+                CStmt::Block(vec![assign(
+                    &symbols,
                     "sum",
                     CExpr::binary(BinaryOp::Add, v(&symbols, "sum"), CExpr::IntLit(1)),
                 )]),
@@ -7326,7 +7478,8 @@ mod tests {
                 CStmt::Block(vec![
                     assign(&symbols, "tmp1", v(&symbols, "i")),
                     assign(&symbols, "tmp2", v(&symbols, "tmp1")),
-                    assign(&symbols, 
+                    assign(
+                        &symbols,
                         "i",
                         CExpr::binary(BinaryOp::Add, v(&symbols, "tmp2"), CExpr::IntLit(1)),
                     ),
@@ -7352,7 +7505,8 @@ mod tests {
                     assign(&symbols, "tmp1", v(&symbols, "i")),
                     assign(&symbols, "tmp2", v(&symbols, "tmp1")),
                     assign(&symbols, "tmp3", v(&symbols, "tmp2")),
-                    assign(&symbols, 
+                    assign(
+                        &symbols,
                         "i",
                         CExpr::binary(BinaryOp::Add, v(&symbols, "tmp3"), CExpr::IntLit(1)),
                     ),
@@ -7377,19 +7531,11 @@ mod tests {
             let input = CStmt::Block(vec![
                 assign(&symbols, init_name, CExpr::IntLit(0)),
                 CStmt::while_loop(
-                    CExpr::binary(
-                        BinaryOp::Lt,
-                        v(&symbols, cond_name),
-                        v(&symbols, "n"),
-                    ),
+                    CExpr::binary(BinaryOp::Lt, v(&symbols, cond_name), v(&symbols, "n")),
                     CStmt::Block(vec![assign(
                         &symbols,
                         init_name,
-                        CExpr::binary(
-                            BinaryOp::Add,
-                            v(&symbols, init_name),
-                            CExpr::IntLit(1),
-                        ),
+                        CExpr::binary(BinaryOp::Add, v(&symbols, init_name), CExpr::IntLit(1)),
                     )]),
                 ),
             ]);

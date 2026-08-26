@@ -300,14 +300,7 @@ fn collect_final_observation_scopes(
     let mut scoped = vec![None; targets.len()];
     let mut order = 0_u64;
     for statement in statements {
-        collect_stmt_observation_scopes(
-            statement,
-            None,
-            regions,
-            targets,
-            &mut order,
-            &mut scoped,
-        );
+        collect_stmt_observation_scopes(statement, None, regions, targets, &mut order, &mut scoped);
     }
     scoped
 }
@@ -442,9 +435,11 @@ fn collect_expr_observation_scopes(
                 collect_expr_observation_scopes(item, current, targets, order, scoped);
             }
         }
-        CExpr::Binary { op, left, right }
-            if matches!(op, BinaryOp::And | BinaryOp::Or) =>
-        {
+        CExpr::Binary {
+            op: BinaryOp::And | BinaryOp::Or,
+            left,
+            right,
+        } => {
             collect_expr_observation_scopes(left, current, targets, order, scoped);
             if expression_has_placement_write(right, targets) {
                 record_ambiguous_expr_group([right.as_ref()], current, order, scoped);
@@ -1526,7 +1521,7 @@ fn insert_region_declarations_in_stmt(
             .is_some_and(|(region, _)| region == target);
         if is_target {
             let semantic = std::mem::replace(stmt.as_mut(), CStmt::Empty);
-            *stmt = Box::new(match semantic {
+            **stmt = match semantic {
                 CStmt::Block(mut statements) => {
                     let mut placed = declarations.to_vec();
                     placed.append(&mut statements);
@@ -1537,7 +1532,7 @@ fn insert_region_declarations_in_stmt(
                     placed.push(semantic);
                     CStmt::Block(placed)
                 }
-            });
+            };
             return 1;
         }
         return insert_region_declarations_in_stmt(stmt, regions, target, declarations);

@@ -231,13 +231,15 @@ impl AbiProfile {
         _rets: &[(&'static str, &'static [&'static str])],
     ) -> Self {
         let mut out = Self::default();
-        for (_index, (_primary, _size, _aliases)) in args.into_iter().enumerate() {
+        for (_primary, _size, _aliases) in args {
+            #[cfg(test)]
+            let index = out.args.len();
             out.args.push(AbiSlot { storage: None });
             #[cfg(test)]
             {
-                out.alias_to_arg.insert(_primary.to_string(), _index);
+                out.alias_to_arg.insert(_primary.to_string(), index);
                 for alias in _aliases {
-                    out.alias_to_arg.insert((*alias).to_string(), _index);
+                    out.alias_to_arg.insert((*alias).to_string(), index);
                 }
             }
         }

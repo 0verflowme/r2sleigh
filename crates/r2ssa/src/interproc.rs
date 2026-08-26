@@ -1814,7 +1814,6 @@ fn collect_local_summary_facts_with_obligation_authority(
                 SSAOp::Return { target } => {
                     out.return_observations.push(classify_return_target(
                         prepared,
-                        abi,
                         block.addr,
                         op_idx,
                         target,
@@ -1825,7 +1824,7 @@ fn collect_local_summary_facts_with_obligation_authority(
                     has_volatile_or_unknown_effects = true;
                     let args = inputs
                         .iter()
-                        .map(|input| classify_var_operand(prepared, abi, input, 0))
+                        .map(|input| classify_var_operand(prepared, input, 0))
                         .collect::<Vec<_>>();
                     mark_unknown_call_effects(
                         &mut out.has_unknown_calls,
@@ -2096,8 +2095,8 @@ fn classify_memory_additive_location(
     right_id: ValueId,
     ctx: AdditiveLocationCtx,
 ) -> SummaryMemoryLocation {
-    let left_const = summary_const_value(prepared, abi, left_id, ctx.depth);
-    let right_const = summary_const_value(prepared, abi, right_id, ctx.depth);
+    let left_const = summary_const_value(prepared, left_id, ctx.depth);
+    let right_const = summary_const_value(prepared, right_id, ctx.depth);
 
     if let Some(k) = right_const {
         let mut base = classify_memory_access_location_value(
@@ -2122,13 +2121,8 @@ fn classify_memory_additive_location(
     unknown_location()
 }
 
-fn summary_const_value(
-    prepared: &SsaArtifact,
-    abi: &AbiProfile,
-    value_id: ValueId,
-    depth: u32,
-) -> Option<u64> {
-    match classify_value_operand(prepared, abi, value_id, depth) {
+fn summary_const_value(prepared: &SsaArtifact, value_id: ValueId, depth: u32) -> Option<u64> {
+    match classify_value_operand(prepared, value_id, depth) {
         SummaryOperand::Const(value) => Some(value),
         _ => exact_constant_value(prepared, canonical_root_value(prepared, value_id)),
     }
@@ -2234,7 +2228,7 @@ fn collect_call_arg_state_with_iteration_limit(
                                     SummaryOperand::Arg(*index)
                                 }
                                 Some(CallCarrierState::Value(value_id)) => {
-                                    classify_value_operand(prepared, abi, *value_id, 0)
+                                    classify_value_operand(prepared, *value_id, 0)
                                 }
                                 Some(CallCarrierState::Unknown) | None => SummaryOperand::Unknown,
                             })
@@ -2434,19 +2428,17 @@ fn merge_call_carrier_states(
 
 fn classify_return_target(
     prepared: &SsaArtifact,
-    abi: &AbiProfile,
     block_addr: u64,
     return_op_idx: usize,
     target: &SSAVar,
     calls: &BTreeMap<CallSiteId, CallObservation>,
 ) -> SummaryValueObservation {
     if let Some(return_inst) = exact_return_address_use(prepared, block_addr, return_op_idx, target)
-        && let Some(observation) =
-            exact_return_boundary_observation(prepared, abi, return_inst, calls)
+        && let Some(observation) = exact_return_boundary_observation(prepared, return_inst, calls)
     {
         return observation;
     }
-    match classify_var_operand(prepared, abi, target, 0) {
+    match classify_var_operand(prepared, target, 0) {
         SummaryOperand::Arg(idx) => SummaryValueObservation::Arg(idx),
         SummaryOperand::Const(value) => SummaryValueObservation::Const(value),
         SummaryOperand::Unknown => SummaryValueObservation::Unknown,
@@ -2476,7 +2468,6 @@ fn exact_return_address_use(
 
 fn exact_return_boundary_observation(
     prepared: &SsaArtifact,
-    abi: &AbiProfile,
     return_inst: crate::graph::InstId,
     calls: &BTreeMap<CallSiteId, CallObservation>,
 ) -> Option<SummaryValueObservation> {
@@ -2501,16 +2492,15 @@ fn exact_return_boundary_observation(
     let [value] = values.as_slice() else {
         return None;
     };
-    Some(classify_value_observation(prepared, abi, *value, calls))
+    Some(classify_value_observation(prepared, *value, calls))
 }
 
 fn classify_value_observation(
     prepared: &SsaArtifact,
-    abi: &AbiProfile,
     value_id: ValueId,
     calls: &BTreeMap<CallSiteId, CallObservation>,
 ) -> SummaryValueObservation {
-    match classify_value_operand(prepared, abi, value_id, 0) {
+    match classify_value_operand(prepared, value_id, 0) {
         SummaryOperand::Arg(idx) => SummaryValueObservation::Arg(idx),
         SummaryOperand::Const(value) => SummaryValueObservation::Const(value),
         SummaryOperand::Unknown => {
@@ -2587,12 +2577,7 @@ fn return_call_site_for_value(
     single_call_site().and_then(exact_result_matches)
 }
 
-fn classify_var_operand(
-    prepared: &SsaArtifact,
-    abi: &AbiProfile,
-    var: &SSAVar,
-    depth: u32,
-) -> SummaryOperand {
+fn classify_var_operand(prepared: &SsaArtifact, var: &SSAVar, depth: u32) -> SummaryOperand {
     if depth > 8 {
         return SummaryOperand::Unknown;
     }
@@ -2605,15 +2590,10 @@ fn classify_var_operand(
     if let Some(idx) = formal_arg_index_for_var(prepared, var) {
         return SummaryOperand::Arg(idx);
     }
-    classify_value_operand(prepared, abi, value_id, depth)
+    classify_value_operand(prepared, value_id, depth)
 }
 
-fn classify_value_operand(
-    prepared: &SsaArtifact,
-    abi: &AbiProfile,
-    value_id: ValueId,
-    depth: u32,
-) -> SummaryOperand {
+fn classify_value_operand(prepared: &SsaArtifact, value_id: ValueId, depth: u32) -> SummaryOperand {
     if depth > 8 {
         return SummaryOperand::Unknown;
     }
@@ -2645,7 +2625,7 @@ fn classify_value_operand(
             .inputs
             .first()
             .copied()
-            .map(|src| classify_value_operand(prepared, abi, src, depth + 1))
+            .map(|src| classify_value_operand(prepared, src, depth + 1))
             .unwrap_or(SummaryOperand::Unknown),
         SSAOp::IntAdd { .. }
         | SSAOp::IntSub { .. }
@@ -2657,8 +2637,8 @@ fn classify_value_operand(
             let Some(&right_id) = inst.inputs.get(1) else {
                 return SummaryOperand::Unknown;
             };
-            let left = classify_value_operand(prepared, abi, left_id, depth + 1);
-            let right = classify_value_operand(prepared, abi, right_id, depth + 1);
+            let left = classify_value_operand(prepared, left_id, depth + 1);
+            let right = classify_value_operand(prepared, right_id, depth + 1);
             match (left, right) {
                 (SummaryOperand::Arg(idx), SummaryOperand::Const(_))
                 | (SummaryOperand::Const(_), SummaryOperand::Arg(idx)) => SummaryOperand::Arg(idx),
@@ -4458,7 +4438,7 @@ mod tests {
         let InstPayload::Op(op) = &inst.payload else {
             panic!("expected op payload");
         };
-        assert_eq!(summary_const_value(&prepared, &abi, right_id, 0), Some(2));
+        assert_eq!(summary_const_value(&prepared, right_id, 0), Some(2));
         assert_eq!(
             classify_memory_access_location_value(
                 &prepared,
@@ -4559,7 +4539,7 @@ mod tests {
         let InstPayload::Op(op) = &inst.payload else {
             panic!("expected op payload");
         };
-        assert_eq!(summary_const_value(&prepared, &abi, right_id, 0), Some(1));
+        assert_eq!(summary_const_value(&prepared, right_id, 0), Some(1));
         assert_eq!(
             classify_memory_access_location_value(
                 &prepared,
