@@ -243,23 +243,6 @@ pub(crate) struct FrameObjectFieldKey {
 }
 
 #[allow(dead_code)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum FlagCompareKind {
-    Equality,
-    UnsignedLess,
-    SignedNegative,
-    Overflow,
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct FlagCompareProvenance {
-    pub(crate) lhs: String,
-    pub(crate) rhs: String,
-    pub(crate) kind: FlagCompareKind,
-}
-
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Default)]
 pub(crate) struct StackInfo {
     pub(crate) stack_vars: HashMap<i64, String>,
