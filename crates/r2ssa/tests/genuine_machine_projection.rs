@@ -44,6 +44,26 @@ fn genuine_optimized_projection(
     (artifact, projection, arch)
 }
 
+fn genuine_projection_allowing_residuals(
+    profile: TrustedSleighProfile,
+    instructions: &[u8],
+) -> (SsaArtifact, MachineProjection, r2il::ArchSpec) {
+    assert!(!instructions.is_empty() && instructions.len() <= 16);
+    let disassembler =
+        Disassembler::from_trusted_profile(profile).expect("trusted embedded profile");
+    let mut bytes = [0_u8; 16];
+    bytes[..instructions.len()].copy_from_slice(instructions);
+    let lifted = disassembler
+        .lift_genuine_block(&bytes, 0x1000, instructions.len())
+        .expect("complete genuine instruction lift");
+    let arch = lifted.authority().arch_spec().clone();
+    let blocks = [lifted.block().clone()];
+    let artifact = SsaArtifact::for_decompile(&blocks, Some(&arch))
+        .expect("decompiler-optimized SSA artifact");
+    let projection = MachineProjection::from_artifact(&artifact).expect("typed machine projection");
+    (artifact, projection, arch)
+}
+
 fn exact_single_write_to_storage(
     artifact: &SsaArtifact,
     projection: &MachineProjection,
@@ -223,4 +243,101 @@ fn genuine_x86_eax_read_is_relative_to_rax() {
     assert!(slices.iter().all(|slice| {
         slice.bit_offset() == 0 && slice.width_bits() == 32 && slice.carrier_width_bits() == 64
     }));
+}
+
+#[test]
+fn genuine_x86_xmm_subpieces_retain_the_source_owned_512_bit_carrier() {
+    let disassembler = Disassembler::from_trusted_profile(TrustedSleighProfile::X86_64)
+        .expect("trusted embedded profile");
+    let lifted = disassembler
+        .lift_genuine_block(&[0x90], 0x1000, 1)
+        .expect("genuine x86 authority");
+    let arch = lifted.authority().arch_spec().clone();
+    let xmm2 = declared_register_storage(&arch, "XMM2");
+    let blocks = [r2il::R2ILBlock {
+        addr: 0x1000,
+        size: 1,
+        ops: vec![r2il::R2ILOp::Subpiece {
+            dst: r2il::Varnode::unique(0x10, 4),
+            src: r2il::Varnode::register(xmm2.offset, xmm2.size),
+            offset: 4,
+        }],
+        switch_info: None,
+        op_metadata: Default::default(),
+    }];
+    let artifact = SsaArtifact::raw(&blocks, Some(&arch)).expect("x86 vector subpiece SSA");
+    let projection = MachineProjection::from_artifact(&artifact).expect("machine projection");
+
+    let slices = exact_uses_from_storage(&artifact, &projection, xmm2);
+    assert!(slices.iter().any(|slice| {
+        slice.width_bits() == 32
+            && slice.carrier_width_bits() == 512
+            && slice.conversion().is_none()
+    }));
+}
+
+fn assert_aarch64_opaque_vector_userop_feeds_exact_wide_uses(
+    instructions: &[u8],
+    expected_userop: u32,
+) {
+    let (artifact, projection, _) = genuine_projection_allowing_residuals(
+        TrustedSleighProfile::Aarch64Le,
+        instructions,
+    );
+    let graph = artifact.graph();
+    let callother = graph
+        .insts
+        .iter()
+        .find(|inst| {
+            matches!(
+                &inst.payload,
+                r2ssa::InstPayload::Op(r2ssa::SSAOp::CallOther { userop, .. })
+                    if *userop == expected_userop
+            )
+        })
+        .unwrap_or_else(|| panic!("genuine lift is missing CallOther({expected_userop})"));
+    let output = callother.output.expect("vector userop result");
+    assert!(matches!(
+        projection
+            .failure_for_output(output)
+            .map(r2ssa::MachineProjectionFailure::error),
+        Some(r2ssa::MachineBuildError::UnsupportedOperation { inst, op })
+            if *inst == callother.id
+                && matches!(&**op, r2ssa::SSAOp::CallOther { userop, .. }
+                    if *userop == expected_userop)
+    ));
+    let uses = graph
+        .uses_of
+        .get(output.0 as usize)
+        .expect("dense uses for userop output");
+    assert!(!uses.is_empty(), "test block must consume the userop result");
+    assert!(uses.iter().all(|site| {
+        matches!(
+            projection.use_disposition(*site),
+            Some(MachineUseDisposition::Exact(slice))
+                if slice.carrier_width_bits() == 256 && slice.conversion().is_none()
+        )
+    }));
+}
+
+#[test]
+fn genuine_aarch64_neon_ext_is_opaque_but_its_result_uses_keep_exact_geometry() {
+    assert_aarch64_opaque_vector_userop_feeds_exact_wide_uses(
+        &[
+            0x43, 0x40, 0x02, 0x6e, // ext v3.16b, v2.16b, v2.16b, 8
+            0x42, 0x1c, 0x23, 0x2e, // eor v2.8b, v2.8b, v3.8b
+        ],
+        150,
+    );
+}
+
+#[test]
+fn genuine_aarch64_neon_ushl_is_opaque_but_its_result_uses_keep_exact_geometry() {
+    assert_aarch64_opaque_vector_userop_feeds_exact_wide_uses(
+        &[
+            0x01, 0x44, 0xa1, 0x6e, // ushl v1.4s, v0.4s, v1.4s
+            0x00, 0x1c, 0xa1, 0x4e, // orr v0.16b, v0.16b, v1.16b
+        ],
+        294,
+    );
 }
