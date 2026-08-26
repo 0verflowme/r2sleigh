@@ -691,18 +691,11 @@ impl<'a> FoldingContext<'a> {
                                 target,
                             )?;
                             let func_expr = self.observed_input(frame, 0, func_expr);
-                            let raw_args = self
-                                .call_args_map()
-                                .get(&(source_block, source_op_idx))
-                                .cloned()
-                                .unwrap_or_default();
                             let Some(mut certified_args) = self
                                 .certified_call_args_for_site_with_direct_target(
                                     source_block,
                                     source_op_idx,
-                                    &func_expr,
                                     direct_target,
-                                    raw_args,
                                 )
                             else {
                                 return self.finish_lowering_transaction(LoweredOp::Comment(format!(
@@ -743,16 +736,9 @@ impl<'a> FoldingContext<'a> {
                             )?;
                             let resolved_target = self.observed_input(frame, 0, resolved_target);
                             let func_expr = Self::indirect_callable_expr(resolved_target);
-                            let raw_args = self
-                                .call_args_map()
-                                .get(&(source_block, source_op_idx))
-                                .cloned()
-                                .unwrap_or_default();
                             let Some(mut certified_args) = self.certified_call_args_for_site(
                                 source_block,
                                 source_op_idx,
-                                &func_expr,
-                                raw_args,
                             ) else {
                                 return self.finish_lowering_transaction(LoweredOp::Comment(format!(
                                     "r2sleigh residual: uncertified indirect-call arguments at 0x{:x}:{}",

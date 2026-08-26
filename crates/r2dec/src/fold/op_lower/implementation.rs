@@ -1029,9 +1029,6 @@ impl<'a> FoldingContext<'a> {
     pub(crate) fn pinned_set(&self) -> &HashSet<String> {
         &self.use_info().pinned
     }
-    pub(crate) fn call_args_map(&self) -> &HashMap<(u64, usize), Vec<analysis::CallArgBinding>> {
-        &self.use_info().call_args
-    }
     pub(crate) fn callee_identity_for_direct_target(&self, addr: u64) -> CalleeIdentity {
         self.inputs
             .callee_resolution()
@@ -1076,24 +1073,13 @@ impl<'a> FoldingContext<'a> {
     ) -> r2types::CalleeTargetPolicyDecision {
         identity.target_policy_decision(self.inputs.callee_resolution(), self.inputs.callee_facts())
     }
-    pub(crate) fn call_result_aliases_map(
-        &self,
-    ) -> &std::collections::BTreeMap<(u64, usize), std::collections::BTreeSet<String>> {
-        &self.use_info().call_result_aliases
-    }
     pub(crate) fn call_result_exprs_map(&self) -> &std::collections::BTreeMap<(u64, usize), CExpr> {
         &self.use_info().call_result_exprs
-    }
-    pub(crate) fn direct_call_result_aliases_set(&self) -> &HashSet<String> {
-        &self.use_info().direct_call_result_aliases
     }
     pub(crate) fn switch_selector_roots_map(
         &self,
     ) -> &std::collections::BTreeMap<u64, analysis::SemanticValue> {
         &self.use_info().switch_selector_roots
-    }
-    pub(crate) fn consumed_by_call_set(&self) -> &HashSet<String> {
-        &self.use_info().consumed_by_call
     }
     /// Fixture-only spelling constructor. Native rendering has no generic
     /// identifier mint: program variables come from BindingNameResolution and
@@ -1113,9 +1099,6 @@ impl<'a> FoldingContext<'a> {
         self.symbols.borrow().spelling(id)
     }
 
-    pub(crate) fn flag_origins_map(&self) -> &HashMap<String, (String, String)> {
-        &self.flag_info().flag_origins
-    }
     pub(crate) fn flag_only_values_set(&self) -> &HashSet<String> {
         &self.flag_info().flag_only_values
     }
@@ -1222,11 +1205,7 @@ impl<'a> FoldingContext<'a> {
                     if self.is_dead(dst) {
                         continue;
                     }
-                    let key = dst.display_name();
                     if self.should_inline(dst) {
-                        continue;
-                    }
-                    if self.consumed_by_call_set().contains(&key) {
                         continue;
                     }
                 }
@@ -1485,13 +1464,7 @@ impl<'a> FoldingContext<'a> {
             op_idx,
             self.prepared_var_for_value_id(cert.target)?,
         ))?;
-        let raw_args = self
-            .call_args_map()
-            .get(&source_call)
-            .cloned()
-            .unwrap_or_default();
-        let certified_args =
-            self.certified_call_args_for_site(block_addr, op_idx, &func, raw_args)?;
+        let certified_args = self.certified_call_args_for_site(block_addr, op_idx)?;
         let func = self
             .resolved_callee_identity_expr_for_site(block_addr, op_idx)
             .unwrap_or(func);
@@ -1558,11 +1531,6 @@ impl<'a> FoldingContext<'a> {
         }
 
         if lower.starts_with('q') && lower.chars().nth(1).is_some_and(|ch| ch.is_ascii_digit()) {
-            return true;
-        }
-
-        // Variables consumed by call argument collection are dead
-        if self.consumed_by_call_set().contains(&key) {
             return true;
         }
 
@@ -5019,15 +4987,6 @@ impl<'a> FoldingContext<'a> {
         identity.is_internal_name_hint()
     }
 
-    #[cfg(test)]
-    fn fallback_owned_call_result_return_name_for_source(
-        &self,
-        source_call: (u64, usize),
-    ) -> Option<String> {
-        let _ = source_call;
-        None
-    }
-
     pub(crate) fn stable_owned_call_result_name_for_source(
         &self,
         source_call: (u64, usize),
@@ -5414,12 +5373,7 @@ impl<'a> FoldingContext<'a> {
         };
         let owner_name = self.stable_owned_call_result_name_for_source(source_call);
         let Some(owner_name) = owner_name else {
-            return self
-                .direct_call_result_aliases_set()
-                .contains(&dst.display_name())
-                && self.call_result_exprs_map().contains_key(&source_call)
-                && (self.is_low_signal_visible_name(&rendered)
-                    || self.is_transient_visible_name(&rendered));
+            return false;
         };
         if owner_name.eq_ignore_ascii_case(&rendered)
             && self
@@ -7730,12 +7684,6 @@ impl<'a> FoldingContext<'a> {
             .is_some_and(|target| target.policy.imported)
     }
 
-    #[cfg(test)]
-    fn is_imported_call_target_for_site(&self, block_addr: u64, op_idx: usize) -> bool {
-        self.resolved_callee_target_for_site(block_addr, op_idx)
-            .is_some_and(|target| target.policy.imported)
-    }
-
     fn call_arg_contains_stack_placeholder(&self, expr: &CExpr, depth: u32) -> bool {
         if depth > Self::MAX_SEMANTIC_RENDER_DEPTH {
             return false;
@@ -8821,13 +8769,6 @@ impl<'a> FoldingContext<'a> {
                 continue;
             }
 
-            if self.is_consumed_immediate_call_home_store(block, op_idx, op) {
-                // The call may subsume this presentation-level home store, but
-                // no memory statement was emitted here. Only an exact canonical
-                // elision certificate may discharge its write obligation.
-                continue;
-            }
-
             if let SSAOp::Return { .. } = op {
                 let (source_inst, boundary) = self
                     .source_return_boundary_for_normalized_op(block.addr, op_idx)
@@ -8910,7 +8851,6 @@ impl<'a> FoldingContext<'a> {
                 }
 
                 // Skip if this will be inlined
-                let key = dst.display_name();
                 if self.should_inline(dst) {
                     // The exact ValueId disposition is the complete admission
                     // proof. Its machine expression is rendered directly by
@@ -8919,10 +8859,6 @@ impl<'a> FoldingContext<'a> {
                     continue;
                 }
 
-                // Skip if this op's destination was consumed by call argument collection
-                if self.consumed_by_call_set().contains(&key) {
-                    continue;
-                }
             }
 
             if let Some(stmt) = self.op_to_stmt_with_args(op, block.addr, op_idx)? {
@@ -8960,56 +8896,6 @@ impl<'a> FoldingContext<'a> {
     ) -> bool {
         if !matches!(op, SSAOp::Call { .. } | SSAOp::CallInd { .. }) {
             return false;
-        }
-
-        false
-    }
-
-    fn is_consumed_immediate_call_home_store(
-        &self,
-        block: &SSABlock,
-        op_idx: usize,
-        op: &SSAOp,
-    ) -> bool {
-        let SSAOp::Store {
-            space: r2il::SpaceId::Ram,
-            addr,
-            val,
-        } = op
-        else {
-            return false;
-        };
-
-        let addr_key = addr.display_name();
-        let val_key = val.display_name();
-        if !self.consumed_by_call_set().contains(&addr_key)
-            && !self.consumed_by_call_set().contains(&val_key)
-        {
-            return false;
-        }
-
-        if let Some(offset) = self.stack_slot_offset_for_var(addr)
-            && offset < 0
-            && let Some(name) = self.refuse_missing_stack_object_origin(offset)
-            && !is_generic_stack_placeholder_alias(&name)
-            && !self.is_autogenerated_stack_home_name(&name)
-            && !name.ends_with("_home")
-        {
-            return false;
-        }
-
-        for next_idx in (op_idx + 1)..block.ops.len() {
-            match &block.ops[next_idx] {
-                SSAOp::Call { .. } | SSAOp::CallInd { .. } => {
-                    return self
-                        .source_op_site_for_normalized_op(block.addr, next_idx)
-                        .is_some_and(|site| self.call_args_map().contains_key(&site));
-                }
-                SSAOp::Branch { .. } | SSAOp::CBranch { .. } | SSAOp::Return { .. } => {
-                    return false;
-                }
-                _ => {}
-            }
         }
 
         false
@@ -9201,37 +9087,7 @@ impl<'a> FoldingContext<'a> {
                                 FinalExprNormalizeContext::DefinitionRoot,
                             )
                         })
-                        .or_else(|| {
-                            self.call_result_aliases_map()
-                                .get(&source_call)
-                                .into_iter()
-                                .flat_map(|aliases| aliases.iter())
-                                .find_map(|alias| {
-                                    self.direct_definition_expr(alias)
-                                        .or_else(|| self.lookup_definition_raw(alias))
-                                        .filter(|expr| matches!(expr, CExpr::Call { .. }))
-                                        .map(|expr| {
-                                            self.normalize_call_expr_for_source_call(
-                                                source_call,
-                                                expr,
-                                                FinalExprNormalizeContext::DefinitionRoot,
-                                            )
-                                        })
-                                })
-                        })
                         .or_else(|| self.synthesized_call_expr_for_source_call(source_call))
-                        .or_else(|| {
-                            self.direct_definition_expr(&val.display_name())
-                                .or_else(|| self.lookup_definition_raw(&val.display_name()))
-                                .filter(|expr| matches!(expr, CExpr::Call { .. }))
-                                .map(|expr| {
-                                    self.normalize_call_expr_for_source_call(
-                                        source_call,
-                                        expr,
-                                        FinalExprNormalizeContext::DefinitionRoot,
-                                    )
-                                })
-                        })
                     {
                         Some(expr) => expr,
                         None => self.get_expr(val)?,

@@ -147,13 +147,9 @@ pub(crate) struct UseInfo {
     pub(crate) ptr_members: HashMap<String, (r2ssa::SSAVar, i64)>,
     pub(crate) condition_values: BTreeSet<ValueId>,
     pub(crate) pinned: HashSet<String>,
-    pub(crate) call_args: HashMap<(u64, usize), Vec<CallArgBinding>>,
-    pub(crate) call_result_aliases: BTreeMap<(u64, usize), BTreeSet<String>>,
     pub(crate) call_result_exprs: BTreeMap<(u64, usize), CExpr>,
     pub(crate) call_result_source_by_value: BTreeMap<ValueId, (u64, usize)>,
-    pub(crate) direct_call_result_aliases: HashSet<String>,
     pub(crate) switch_selector_roots: BTreeMap<u64, SemanticValue>,
-    pub(crate) consumed_by_call: HashSet<String>,
     #[cfg(test)]
     pub(crate) var_aliases: HashMap<String, String>,
     pub(crate) stack_slots_by_value: BTreeMap<ValueId, StackSlotProvenance>,
@@ -171,107 +167,6 @@ pub(crate) struct UseInfo {
     /// stored, so counting them measures what is left of that step instead of
     /// asserting it.
     pub(crate) unkeyed_writes: std::collections::BTreeMap<&'static str, usize>,
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) enum SemanticCallArg {
-    Semantic(SemanticValue),
-    StringAddr(u64),
-    FallbackExpr(CExpr),
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CallArgRole {
-    Input,
-    Result,
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct CallArgBinding {
-    pub(crate) arg: SemanticCallArg,
-    pub(crate) role: CallArgRole,
-    pub(crate) stack_offset: Option<i64>,
-    pub(crate) source_call: Option<(u64, usize)>,
-    pub(crate) source_value_id: Option<ValueId>,
-    pub(crate) source_var_name: Option<String>,
-}
-
-impl CallArgBinding {
-    pub(crate) fn new(arg: SemanticCallArg, role: CallArgRole, stack_offset: Option<i64>) -> Self {
-        Self {
-            arg,
-            role,
-            stack_offset,
-            source_call: None,
-            source_value_id: None,
-            source_var_name: None,
-        }
-    }
-
-    pub(crate) fn input(arg: SemanticCallArg) -> Self {
-        Self::new(arg, CallArgRole::Input, None)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn result(arg: SemanticCallArg) -> Self {
-        Self::new(arg, CallArgRole::Result, None)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn with_stack_offset(mut self, stack_offset: i64) -> Self {
-        self.stack_offset = Some(stack_offset);
-        self
-    }
-
-    #[cfg(test)]
-    pub(crate) fn with_source_call(mut self, block_addr: u64, op_idx: usize) -> Self {
-        self.source_call = Some((block_addr, op_idx));
-        self
-    }
-
-    #[cfg(test)]
-    pub(crate) fn with_source_var(mut self, source_var: &SSAVar) -> Self {
-        self.source_var_name = Some(source_var.display_name());
-        self
-    }
-
-    pub(crate) fn with_source_value_id(mut self, value_id: ValueId) -> Self {
-        self.source_value_id = Some(value_id);
-        self
-    }
-
-}
-
-impl From<SemanticCallArg> for CallArgBinding {
-    fn from(arg: SemanticCallArg) -> Self {
-        Self::input(arg)
-    }
-}
-
-impl From<CExpr> for CallArgBinding {
-    fn from(expr: CExpr) -> Self {
-        Self::input(SemanticCallArg::from(expr))
-    }
-}
-
-impl SemanticCallArg {
-    #[cfg(test)]
-    pub(crate) fn semantic(value: SemanticValue) -> Self {
-        Self::Semantic(value)
-    }
-
-    pub(crate) fn expr_only(expr: CExpr) -> Self {
-        Self::FallbackExpr(expr)
-    }
-}
-
-impl From<CExpr> for SemanticCallArg {
-    fn from(expr: CExpr) -> Self {
-        Self::expr_only(expr)
-    }
 }
 
 #[allow(dead_code)]
@@ -497,15 +392,6 @@ fn semantic_value_references_any(value: &SemanticValue, ids: &BTreeSet<ValueId>)
     }
 }
 
-fn call_arg_references_any(arg: &CallArgBinding, ids: &BTreeSet<ValueId>) -> bool {
-    arg.source_value_id
-        .is_some_and(|value_id| ids.contains(&value_id))
-        || matches!(
-            &arg.arg,
-            SemanticCallArg::Semantic(value) if semantic_value_references_any(value, ids)
-        )
-}
-
 impl UseInfo {
     pub(crate) fn bind_value_id(&mut self, var: &SSAVar, value_id: ValueId) -> Option<ValueId> {
         let conflicting_value = self
@@ -606,10 +492,6 @@ impl UseInfo {
             .retain(|_, value| !semantic_value_references_any(value, &values));
         self.stable_memory_values
             .retain(|_, value| !semantic_value_references_any(value, &values));
-        self.call_args.retain(|_, args| {
-            args.iter()
-                .all(|arg| !call_arg_references_any(arg, &values))
-        });
         for var in vars {
             self.value_ids_by_var.remove(&var);
             self.ambiguous_value_vars.insert(var.clone());
@@ -664,24 +546,6 @@ impl UseInfo {
     pub(crate) fn insert_stack_slot_for_name(&mut self, name: &str, slot: StackSlotProvenance) {
         if let Some(value_id) = self.value_id_for_name_or_bind(name) {
             self.stack_slots_by_value.insert(value_id, slot);
-        }
-    }
-
-    /// Record that one value was copied from another.
-    ///
-    /// Both ends need an identity: a copy between names could be written when
-    /// only one side was known, and the name-keyed half then held an edge the
-    /// value-keyed half did not, which is how the two disagreed.
-    #[cfg(test)]
-    pub(crate) fn insert_copy_source_for_vars(&mut self, dst: &SSAVar, src: &SSAVar) {
-        match (
-            self.exact_value_id_for_var(dst),
-            self.exact_value_id_for_var(src),
-        ) {
-            (Some(dst_id), Some(src_id)) => {
-                self.copy_sources_by_value.insert(dst_id, src_id);
-            }
-            _ => *self.unkeyed_writes.entry("copy_sources").or_default() += 1,
         }
     }
 

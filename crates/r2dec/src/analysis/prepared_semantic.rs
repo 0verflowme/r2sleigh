@@ -20,8 +20,8 @@ use r2types::{
 
 use super::lower::LowerCtx;
 use super::{
-    BaseRef, CallArgBinding, DecompilerFacts, FlagInfo, NormalizedAddr, PassEnv, SSABlock,
-    ScalarValue, SemanticCallArg, SemanticOwnershipFacts, SemanticValue, StackInfo,
+    BaseRef, DecompilerFacts, FlagInfo, NormalizedAddr, PassEnv, SSABlock, ScalarValue,
+    SemanticOwnershipFacts, SemanticValue, StackInfo,
     StackSlotProvenance, StackSlotValueKind, UseInfo, ValueProvenance, ValueRef,
 };
 use crate::analysis::utils::{
@@ -323,11 +323,6 @@ impl PreparedSemanticView {
     pub(crate) fn owner_expr_for_var(&self, var: &SSAVar) -> Option<&CExpr> {
         self.value_id_for_var(var)
             .and_then(|value_id| self.owner_expr_by_value.get(&value_id))
-    }
-
-    #[cfg(test)]
-    pub(crate) fn owner_expr_for_value_id(&self, value_id: ValueId) -> Option<&CExpr> {
-        self.owner_expr_by_value.get(&value_id)
     }
 
     pub(crate) fn predicate_expr_for_cond(&self, var: &SSAVar) -> Option<&CExpr> {
@@ -3469,24 +3464,8 @@ fn populate_prepared_call_runtime_facts(symbols: &std::cell::RefCell<crate::symb
                 continue;
             }
 
-            let args = call_view
-                .authoritative_args
-                .iter()
-                .cloned()
-                .zip(call_view.authoritative_arg_values.iter().copied())
-                .map(|(expr, value)| {
-                    CallArgBinding::input(SemanticCallArg::FallbackExpr(expr))
-                        .with_source_value_id(value)
-                })
-                .collect::<Vec<_>>();
-            if !args.is_empty() {
-                use_info.call_args.insert(site, args);
-            }
-
             if let Some(call_expr) = prepared_call_expr(site, symbols, call_view, view, env) {
                 use_info.call_result_exprs.insert(site, call_expr.clone());
-                #[cfg(test)]
-                record_prepared_consumed_by_call(use_info, block, op_idx, env, prepared, view);
                 record_prepared_call_result_facts(symbols,
                     use_info, site, prepared, view, &call_expr,
                 );
@@ -3699,62 +3678,6 @@ fn prepared_call_render_authorized(call_view: &PreparedCallView) -> bool {
             .eq(call_view.authoritative_arg_values.iter().copied())
 }
 
-#[cfg(test)]
-fn record_prepared_consumed_by_call(
-    use_info: &mut UseInfo,
-    block: &SSABlock,
-    call_idx: usize,
-    env: &PassEnv<'_>,
-    prepared: &SsaArtifact,
-    view: &PreparedSemanticView,
-) {
-    for op in block.ops[..call_idx].iter().rev() {
-        match op {
-            SSAOp::Call { .. } | SSAOp::CallInd { .. } => break,
-            SSAOp::Branch { .. } | SSAOp::CBranch { .. } | SSAOp::Return { .. } => break,
-            SSAOp::Store {
-                space: r2il::SpaceId::Ram,
-                addr,
-                val,
-            } => {
-                if view
-                    .stack_offset_for_var(addr)
-                    .or_else(|| stack_offset_for_value(prepared, addr))
-                    .is_some()
-                {
-                    use_info.consumed_by_call.insert(addr.display_name());
-                    use_info.consumed_by_call.insert(val.display_name());
-                }
-            }
-            SSAOp::Copy { dst, src }
-            | SSAOp::IntZExt { dst, src }
-            | SSAOp::IntSExt { dst, src }
-            | SSAOp::Trunc { dst, src }
-            | SSAOp::Cast { dst, src, .. }
-            | SSAOp::Subpiece { dst, src, .. } => {
-                if env
-                    .arg_regs
-                    .iter()
-                    .any(|reg| dst.name.eq_ignore_ascii_case(reg))
-                {
-                    use_info.consumed_by_call.insert(dst.display_name());
-                    use_info.consumed_by_call.insert(src.display_name());
-                }
-            }
-            other => {
-                if let Some(dst) = other.dst()
-                    && env
-                        .arg_regs
-                        .iter()
-                        .any(|reg| dst.name.eq_ignore_ascii_case(reg))
-                {
-                    use_info.consumed_by_call.insert(dst.display_name());
-                }
-            }
-        }
-    }
-}
-
 fn record_prepared_call_result_facts(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
     use_info: &mut UseInfo,
     source_site: (u64, usize),
@@ -3774,10 +3697,6 @@ fn record_prepared_call_result_facts(symbols: &std::cell::RefCell<crate::symbol:
         let direct = matches!(cert.owner.as_ref(), Some(ValueOwner::Value(_)))
             && matches!(&cert.carrier, ReturnCarrier::Register { .. });
         use_info.insert_call_result_source_for_value(cert.value, site);
-        #[cfg(test)]
-        if let Some(var) = _prepared.value_var(cert.value) {
-            record_prepared_call_alias(use_info, site, &var.display_name(), direct);
-        }
         if direct {
             use_info
                 .definitions_by_value
@@ -3795,11 +3714,6 @@ fn record_prepared_call_result_facts(symbols: &std::cell::RefCell<crate::symbol:
                 *use_info.unkeyed_writes.entry("stack_slots").or_default() += 1;
                 continue;
             };
-            #[cfg(test)]
-            {
-                let alias = crate::symbol::spelling(symbols, _symbol).to_string();
-                record_prepared_call_alias(use_info, site, &alias, false);
-            }
             if *offset < 0 {
                 use_info
                     .stable_stack_values
@@ -3807,28 +3721,6 @@ fn record_prepared_call_result_facts(symbols: &std::cell::RefCell<crate::symbol:
                     .or_insert_with(|| SemanticValue::Scalar(ScalarValue::Expr(expr)));
             }
         }
-    }
-}
-
-#[cfg(test)]
-fn record_prepared_call_alias(
-    use_info: &mut UseInfo,
-    site: (u64, usize),
-    alias: &str,
-    direct: bool,
-) {
-    if alias.is_empty() {
-        return;
-    }
-    use_info
-        .call_result_aliases
-        .entry(site)
-        .or_default()
-        .insert(alias.to_string());
-    if direct {
-        use_info
-            .direct_call_result_aliases
-            .insert(alias.to_string());
     }
 }
 
