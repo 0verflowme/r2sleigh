@@ -72,6 +72,16 @@ tests/corpus/run_matrix.sh --accept-baseline --gate measurement
 The gate is always explicit. Use `--gate snapshot` for byte-preserving stages,
 `--gate raw` once all emitted C must compile under the strict type tripwire, and
 `--gate differential` only when every raw executable must also match the oracle.
+The final rewrite gate is deliberately conjunctive:
+
+```bash
+tests/corpus/run_matrix.sh --gate cutover
+```
+
+It refuses a dirty tracked tree, repeats generation, and requires byte-identical
+raw output together with completed binding, effect, placement, and render audits,
+strict raw compilation, and the complete raw-backed differential vector set in
+all 54 cells.
 
 Before accepting, inspect the raw files and the matrix report. Never update the
 manifest merely to make a mechanical stage pass; a changed byte during such a

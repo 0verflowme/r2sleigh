@@ -235,6 +235,9 @@ run cargo mutants --no-config \
     --no-times \
     --output target/quality-gate/mutants-r2ssa-var
 
+phase "Binding-spine cutover corpus"
+run tests/corpus/run_matrix.sh --gate cutover
+
 phase "Differential ESIL against radare2's own lifter"
 # Needs the plugin installed, so it is opt-in: R2SLEIGH_ESIL_DIFF_BINARY names an
 # x86-64 binary to step through. Without it the phase is skipped rather than

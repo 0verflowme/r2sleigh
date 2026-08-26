@@ -15,24 +15,24 @@ while [[ $# -gt 0 ]]; do
             ;;
         --gate)
             if [[ $# -lt 2 ]]; then
-                echo "--gate requires measurement, snapshot, raw, differential, binding-audit, effect-audit, placement-audit, render-audit, or native-admission" >&2
+                echo "--gate requires measurement, snapshot, raw, differential, binding-audit, effect-audit, placement-audit, render-audit, native-admission, or cutover" >&2
                 exit 64
             fi
             gate=$2
             shift 2
             ;;
         *)
-            echo "usage: $0 [--accept-baseline] [--gate measurement|snapshot|raw|differential|binding-audit|effect-audit|placement-audit|render-audit|native-admission]" >&2
+            echo "usage: $0 [--accept-baseline] [--gate measurement|snapshot|raw|differential|binding-audit|effect-audit|placement-audit|render-audit|native-admission|cutover]" >&2
             exit 64
             ;;
     esac
 done
 if [[ -z $gate ]]; then
-    echo "--gate is required: measurement, snapshot, raw, differential, binding-audit, effect-audit, placement-audit, render-audit, or native-admission" >&2
+    echo "--gate is required: measurement, snapshot, raw, differential, binding-audit, effect-audit, placement-audit, render-audit, native-admission, or cutover" >&2
     exit 64
 fi
 case $gate in
-    measurement|snapshot|raw|differential|binding-audit|effect-audit|placement-audit|render-audit|native-admission) ;;
+    measurement|snapshot|raw|differential|binding-audit|effect-audit|placement-audit|render-audit|native-admission|cutover) ;;
     *)
         echo "unsupported gate: $gate" >&2
         exit 64
@@ -40,6 +40,12 @@ case $gate in
 esac
 
 mkdir -p "$artifact_root/bin" "$artifact_root/dumps" "$artifact_root/results"
+
+git_tree_status=$(git -C "$repo_root" status --porcelain --untracked-files=no)
+if [[ $gate == cutover && -n $git_tree_status ]]; then
+    echo "cutover gate requires a clean tracked worktree" >&2
+    exit 65
+fi
 
 install_log="$artifact_root/plugin-install.log"
 make -C "$repo_root/r2plugin" RUST_FEATURES=all-archs install 2>&1 | tee "$install_log"
@@ -52,6 +58,11 @@ provenance="$artifact_root/provenance.txt"
 {
     echo "git_head=$(git -C "$repo_root" rev-parse HEAD)"
     echo "git_branch=$(git -C "$repo_root" branch --show-current)"
+    if [[ -n $git_tree_status ]]; then
+        echo "git_tree=dirty"
+    else
+        echo "git_tree=clean"
+    fi
     echo "clang=$(command -v clang)"
     clang --version | head -n 1
     echo "r2=$(command -v r2)"
@@ -83,10 +94,23 @@ for index in "${!configs[@]}"; do
         --artifact-root "$artifact_root"
     )
     python3 "$script_dir/verify_rendering.py" "${verify_args[@]}"
+
+    if [[ $gate == cutover ]]; then
+        repeat_root="$artifact_root/repeat"
+        repeat_dump="$repeat_root/dumps/out_${config}.txt"
+        mkdir -p "$repeat_root/dumps"
+        "$script_dir/sweep.sh" "$binary" > "$repeat_dump"
+        python3 "$script_dir/verify_rendering.py" \
+            "$config" \
+            --input "$repeat_dump" \
+            --binary "$binary" \
+            --oracle "$oracle" \
+            --artifact-root "$repeat_root"
+    fi
 done
 
 python3 - "$artifact_root/results" "$script_dir/raw-baseline-sha256.json" \
-    "$accept_baseline" "$gate" <<'PY'
+    "$accept_baseline" "$gate" "$artifact_root/repeat/results" <<'PY'
 import json
 import os
 import sys
@@ -97,6 +121,7 @@ result_dir = Path(sys.argv[1])
 baseline_path = Path(sys.argv[2])
 accept_baseline = sys.argv[3] == "1"
 gate = sys.argv[4]
+repeat_result_dir = Path(sys.argv[5])
 configs = ("x64_O0", "x64_O1", "x64_O2", "arm64_O0", "arm64_O1", "arm64_O2")
 functions = (
     "fnv1a32", "fnv1a64", "djb2", "sdbm", "adler32", "crc32_bitwise",
@@ -104,6 +129,17 @@ functions = (
 )
 reports = [json.loads((result_dir / f"{config}.json").read_text()) for config in configs]
 entries = [entry for report in reports for entry in report["entries"]]
+repeat_entries = {}
+if gate == "cutover":
+    repeat_reports = [
+        json.loads((repeat_result_dir / f"{config}.json").read_text())
+        for config in configs
+    ]
+    repeat_entries = {
+        (entry["config"], entry["function"]): entry
+        for report in repeat_reports
+        for entry in report["entries"]
+    }
 if len(entries) != 54:
     raise SystemExit(f"matrix is incomplete: expected 54 entries, found {len(entries)}")
 keys = {(entry["config"], entry["function"]) for entry in entries}
@@ -112,6 +148,15 @@ if keys != expected_keys:
     missing = sorted(expected_keys - keys)
     unexpected = sorted(keys - expected_keys)
     raise SystemExit(f"matrix key mismatch: missing={missing} unexpected={unexpected}")
+if gate == "cutover" and (
+    len(repeat_entries) != 54 or set(repeat_entries) != expected_keys
+):
+    missing = sorted(expected_keys - set(repeat_entries))
+    unexpected = sorted(set(repeat_entries) - expected_keys)
+    raise SystemExit(
+        "repeat matrix key mismatch: "
+        f"count={len(repeat_entries)} missing={missing} unexpected={unexpected}"
+    )
 
 if accept_baseline:
     raw_hashes = {}
@@ -202,21 +247,26 @@ for entry in entries:
             f"{key}: render_refusal={render['status']} "
             f"source={render.get('source_status')}"
         )
-    if gate == "native-admission":
+    if gate in {"native-admission", "cutover"}:
         binding = entry["binding_audit"]
         effect = entry["effect_obligations"]
         placement = entry["placement_audit"]
         render = entry["render_refusal"]
-        request_status = placement.get("request_status")
+        request_statuses = {
+            binding.get("request_status"),
+            effect.get("request_status"),
+            placement.get("request_status"),
+            render.get("request_status"),
+        }
         if (
-            request_status != "completed"
+            request_statuses != {"completed"}
             or binding["status"] != "pass"
             or effect["status"] != "pass"
             or placement["status"] != "pass"
             or render["status"] != "pass"
         ):
             failures.append(
-                f"{key}: native_admission request={request_status} "
+                f"{key}: native_admission requests={sorted(map(str, request_statuses))} "
                 f"binding={binding['status']} effect={effect['status']} "
                 f"placement={placement['status']} render={render['status']}"
             )
@@ -224,9 +274,9 @@ for entry in entries:
         "match", "accepted"
     }:
         failures.append(f"{key}: snapshot={entry['snapshot']['status']}")
-    if gate in {"raw", "differential"} and entry["raw"]["status"] != "pass":
+    if gate in {"raw", "differential", "cutover"} and entry["raw"]["status"] != "pass":
         failures.append(f"{key}: raw={entry['raw']['status']}")
-    if gate == "differential" and (
+    if gate in {"differential", "cutover"} and (
         entry["differential"]["status"] != "pass"
         or entry["differential"].get("basis") != "raw"
     ):
@@ -234,7 +284,7 @@ for entry in entries:
             f"{key}: differential={entry['differential']['status']} "
             f"basis={entry['differential'].get('basis')}"
         )
-    if gate == "differential":
+    if gate in {"differential", "cutover"}:
         expected_case_ids = list(common_case_ids)
         if entry["function"] in seeded_functions:
             seed_values = dict.fromkeys(
@@ -249,6 +299,14 @@ for entry in entries:
             failures.append(
                 f"{key}: differential case set/status does not match the required vector set"
             )
+    if gate == "cutover":
+        repeated = repeat_entries.get((entry["config"], entry["function"]))
+        if repeated is None:
+            failures.append(f"{key}: missing deterministic repeat entry")
+        elif repeated["generation"].get("section_sha256") != entry["generation"].get(
+            "section_sha256"
+        ):
+            failures.append(f"{key}: raw rendering changed across repeated generation")
 if failures:
     print("gate failures:", file=sys.stderr)
     for failure in failures:
