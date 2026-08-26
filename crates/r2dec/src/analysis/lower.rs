@@ -1625,7 +1625,7 @@ mod tests {
     }
 
     #[test]
-    fn load_generic_deref_casts_non_pointer_like_address() {
+    fn ram_load_without_exact_value_bindings_is_refused() {
         let symbols = test_table();
         let fn_map = HashMap::new();
         let str_map = HashMap::new();
@@ -1653,23 +1653,14 @@ mod tests {
             &sym_map,
         );
 
-        let expr = ctx.op_to_expr(&SSAOp::Load {
-            dst: SSAVar::new("tmp:5001", 1, 4),
-            space: r2il::SpaceId::Ram,
-            addr: SSAVar::new("tmp:5000", 1, 8),
-        }).expect("RAM load is supported");
-        let CExpr::Deref(inner) = expr else {
-            panic!("expected dereference expression");
-        };
-        assert!(
-            matches!(
-                inner.as_ref(),
-                CExpr::Cast {
-                    ty: CType::Pointer(_),
-                    ..
-                }
-            ),
-            "generic lower path should cast non-pointer-like address expressions"
+        assert_eq!(
+            ctx.op_to_expr(&SSAOp::Load {
+                dst: SSAVar::new("tmp:5001", 1, 4),
+                space: r2il::SpaceId::Ram,
+                addr: SSAVar::new("tmp:5000", 1, 8),
+            }),
+            Err(OpLoweringRefusal::MissingProgramVariableAuthorization),
+            "a raw SSA spelling cannot authorize an executable memory expression"
         );
     }
 
@@ -1715,7 +1706,7 @@ mod tests {
     }
 
     #[test]
-    fn semantic_load_rendering_preserves_exact_memory_space() {
+    fn semantic_load_rendering_requires_exact_value_identity_for_ram() {
         let symbols = test_table();
         let definitions = HashMap::new();
         let use_counts = HashMap::new();
@@ -1748,28 +1739,27 @@ mod tests {
             scale_bytes: 0,
             offset_bytes: 0,
         };
-        let ram = ctx
-            .expr_for_semantic_value(&SemanticValue::Load {
-                space: r2il::SpaceId::Ram,
-                addr: addr.clone(),
-                size: 4,
-            })
-            .expect("semantic lowering result")
-            .expect("RAM semantic load");
-        let custom = ctx
-            .expr_for_semantic_value(&SemanticValue::Load {
-                space: r2il::SpaceId::Custom(7),
-                addr,
-                size: 4,
-            })
-            .expect("semantic lowering result");
+        let ram = ctx.expr_for_semantic_value(&SemanticValue::Load {
+            space: r2il::SpaceId::Ram,
+            addr: addr.clone(),
+            size: 4,
+        });
+        let custom = ctx.expr_for_semantic_value(&SemanticValue::Load {
+            space: r2il::SpaceId::Custom(7),
+            addr,
+            size: 4,
+        });
 
-        assert!(matches!(ram, CExpr::Deref(_)));
-        assert_eq!(custom, None);
+        assert_eq!(
+            ram,
+            Err(OpLoweringRefusal::MissingProgramVariableAuthorization),
+            "a raw value root cannot authorize an executable RAM access"
+        );
+        assert_eq!(custom, Ok(None));
     }
 
     #[test]
-    fn load_generic_deref_avoids_cast_for_pointer_like_address() {
+    fn pointer_spelling_does_not_authorize_a_ram_load() {
         let symbols = test_table();
         let fn_map = HashMap::new();
         let str_map = HashMap::new();
@@ -1797,28 +1787,19 @@ mod tests {
             &sym_map,
         );
 
-        let expr = ctx.op_to_expr(&SSAOp::Load {
-            dst: SSAVar::new("tmp:5101", 1, 4),
-            space: r2il::SpaceId::Ram,
-            addr: SSAVar::new("arg1", 0, 8),
-        }).expect("RAM load is supported");
-        let CExpr::Deref(inner) = expr else {
-            panic!("expected dereference expression");
-        };
-        assert!(
-            !matches!(
-                inner.as_ref(),
-                CExpr::Cast {
-                    ty: CType::Pointer(_),
-                    ..
-                }
-            ),
-            "pointer-like address expressions should not be re-cast"
+        assert_eq!(
+            ctx.op_to_expr(&SSAOp::Load {
+                dst: SSAVar::new("tmp:5101", 1, 4),
+                space: r2il::SpaceId::Ram,
+                addr: SSAVar::new("arg1", 0, 8),
+            }),
+            Err(OpLoweringRefusal::MissingProgramVariableAuthorization),
+            "a pointer-like spelling is not a machine projection certificate"
         );
     }
 
     #[test]
-    fn load_preserves_negative_index_subscript_shape() {
+    fn name_keyed_negative_index_definition_does_not_authorize_a_load() {
         let symbols = test_table();
         let fn_map = HashMap::new();
         let str_map = HashMap::new();
@@ -1860,28 +1841,19 @@ mod tests {
             &sym_map,
         );
 
-        let expr = ctx.op_to_expr(&SSAOp::Load {
-            dst: SSAVar::new("tmp:5002", 1, 4),
-            space: r2il::SpaceId::Ram,
-            addr: SSAVar::new("tmp:addr", 1, 8),
-        }).expect("RAM load is supported");
-
-        let CExpr::Subscript { base, index } = expr else {
-            panic!("expected subscript expression");
-        };
-        assert!(matches!(base.as_ref(), CExpr::Cast { .. }));
-        assert!(
-            matches!(
-                index.as_ref(),
-                CExpr::Cast { expr, .. }
-                    if matches!(expr.as_ref(), CExpr::Unary { op: UnaryOp::Neg, .. })
-            ),
-            "negative index shape should survive lowering"
+        assert_eq!(
+            ctx.op_to_expr(&SSAOp::Load {
+                dst: SSAVar::new("tmp:5002", 1, 4),
+                space: r2il::SpaceId::Ram,
+                addr: SSAVar::new("tmp:addr", 1, 8),
+            }),
+            Err(OpLoweringRefusal::MissingProgramVariableAuthorization),
+            "a name-keyed address definition cannot authorize a subscript"
         );
     }
 
     #[test]
-    fn load_does_not_fabricate_stack_slot_aliases() {
+    fn name_keyed_stack_slot_does_not_authorize_a_load() {
         let symbols = test_table();
         let fn_map = HashMap::new();
         let str_map = HashMap::new();
@@ -1912,23 +1884,19 @@ mod tests {
             &sym_map,
         );
 
-        let expr = ctx.op_to_expr(&SSAOp::Load {
-            dst: SSAVar::new("tmp:5003", 1, 4),
-            space: r2il::SpaceId::Ram,
-            addr: SSAVar::new("tmp:stackaddr", 1, 8),
-        }).expect("RAM load is supported");
-
-        let CExpr::Deref(inner) = expr else {
-            panic!("expected conservative dereference expression");
-        };
-        assert!(
-            !matches!(inner.as_ref(), CExpr::Var(name) if ctx.spelling(*name).starts_with("local_") || &*crate::symbol::spelling(&symbols, *name) == "stack"),
-            "analysis lowering should not fabricate visible stack aliases"
+        assert_eq!(
+            ctx.op_to_expr(&SSAOp::Load {
+                dst: SSAVar::new("tmp:5003", 1, 4),
+                space: r2il::SpaceId::Ram,
+                addr: SSAVar::new("tmp:stackaddr", 1, 8),
+            }),
+            Err(OpLoweringRefusal::MissingProgramVariableAuthorization),
+            "a name-keyed stack offset is not an ObjectId-backed projection"
         );
     }
 
     #[test]
-    fn load_base_plus_const_does_not_become_fake_subscript() {
+    fn name_keyed_base_plus_const_does_not_authorize_a_load() {
         let symbols = test_table();
         let fn_map = HashMap::new();
         let str_map = HashMap::new();
@@ -1963,20 +1931,19 @@ mod tests {
             &sym_map,
         );
 
-        let expr = ctx.op_to_expr(&SSAOp::Load {
-            dst: SSAVar::new("tmp:5004", 1, 4),
-            space: r2il::SpaceId::Ram,
-            addr: SSAVar::new("tmp:addr", 1, 8),
-        }).expect("RAM load is supported");
-
-        assert!(
-            !matches!(expr, CExpr::Subscript { .. }),
-            "base + const should stay as pointer arithmetic/deref, not fake subscript"
+        assert_eq!(
+            ctx.op_to_expr(&SSAOp::Load {
+                dst: SSAVar::new("tmp:5004", 1, 4),
+                space: r2il::SpaceId::Ram,
+                addr: SSAVar::new("tmp:addr", 1, 8),
+            }),
+            Err(OpLoweringRefusal::MissingProgramVariableAuthorization),
+            "a name-keyed expression cannot authorize pointer arithmetic"
         );
     }
 
     #[test]
-    fn load_alias_expanded_const_index_does_not_become_fake_subscript() {
+    fn name_keyed_const_index_alias_does_not_authorize_a_load() {
         let symbols = test_table();
         let fn_map = HashMap::new();
         let str_map = HashMap::new();
@@ -2018,20 +1985,19 @@ mod tests {
             &sym_map,
         );
 
-        let expr = ctx.op_to_expr(&SSAOp::Load {
-            dst: SSAVar::new("tmp:5005", 1, 4),
-            space: r2il::SpaceId::Ram,
-            addr: SSAVar::new("tmp:addr", 1, 8),
-        }).expect("RAM load is supported");
-
-        assert!(
-            !matches!(expr, CExpr::Subscript { .. }),
-            "constant-resolved index carriers must not become fake array subscripts"
+        assert_eq!(
+            ctx.op_to_expr(&SSAOp::Load {
+                dst: SSAVar::new("tmp:5005", 1, 4),
+                space: r2il::SpaceId::Ram,
+                addr: SSAVar::new("tmp:addr", 1, 8),
+            }),
+            Err(OpLoweringRefusal::MissingProgramVariableAuthorization),
+            "a name-keyed alias chain cannot authorize an array subscript"
         );
     }
 
     #[test]
-    fn load_unstable_alias_expanded_base_does_not_become_member_access() {
+    fn name_keyed_base_alias_does_not_authorize_a_load() {
         let symbols = test_table();
         let fn_map = HashMap::new();
         let str_map = HashMap::new();
@@ -2069,20 +2035,19 @@ mod tests {
             &sym_map,
         );
 
-        let expr = ctx.op_to_expr(&SSAOp::Load {
-            dst: SSAVar::new("tmp:5006", 1, 4),
-            space: r2il::SpaceId::Ram,
-            addr: SSAVar::new("tmp:addr", 1, 8),
-        }).expect("RAM load is supported");
-
-        assert!(
-            !matches!(expr, CExpr::PtrMember { .. }),
-            "unstable alias-expanded bases must not become pointer member syntax"
+        assert_eq!(
+            ctx.op_to_expr(&SSAOp::Load {
+                dst: SSAVar::new("tmp:5006", 1, 4),
+                space: r2il::SpaceId::Ram,
+                addr: SSAVar::new("tmp:addr", 1, 8),
+            }),
+            Err(OpLoweringRefusal::MissingProgramVariableAuthorization),
+            "a name-keyed base alias cannot authorize member syntax"
         );
     }
 
     #[test]
-    fn ptr_arith_prefers_expression_recovered_real_index_over_pointer_local() {
+    fn name_keyed_pointer_arithmetic_does_not_authorize_a_load() {
         let symbols = test_table();
         let fn_map = HashMap::new();
         let str_map = HashMap::new();
@@ -2140,22 +2105,14 @@ mod tests {
             &sym_map,
         );
 
-        let expr = ctx.op_to_expr(&SSAOp::Load {
-            dst: SSAVar::new("tmp:5007", 1, 4),
-            space: r2il::SpaceId::Ram,
-            addr,
-        }).expect("RAM load is supported");
-
-        let CExpr::Subscript { base, index } = expr else {
-            panic!("expected subscript expression");
-        };
-        assert!(
-            matches!(base.as_ref(), CExpr::Cast { expr, .. } if matches!(expr.as_ref(), CExpr::Var(name) if &*crate::symbol::spelling(&symbols, *name) == "arg1")),
-            "subscript base should normalize back to the semantic pointer source"
-        );
-        assert!(
-            matches!(index.as_ref(), CExpr::Var(name) if &*crate::symbol::spelling(&symbols, *name) == "arg2"),
-            "subscript index should use the semantic index source, not the pointer local alias: {index:?}"
+        assert_eq!(
+            ctx.op_to_expr(&SSAOp::Load {
+                dst: SSAVar::new("tmp:5007", 1, 4),
+                space: r2il::SpaceId::Ram,
+                addr,
+            }),
+            Err(OpLoweringRefusal::MissingProgramVariableAuthorization),
+            "name-keyed pointer arithmetic cannot authorize an exact projection"
         );
     }
 }

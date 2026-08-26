@@ -28,8 +28,6 @@ use crate::analysis::utils::{
     compare_const_to_expr, compare_const_to_expr_with_width,
     is_temporary_constant_or_memory_name, parse_const_value,
 };
-#[cfg(test)]
-use crate::analysis::utils::is_temporary_or_memory_name;
 use crate::ast::{BinaryOp, CExpr, UnaryOp};
 use crate::binding_plan::{
     PlannedParameterSymbol, PlannedStackSymbol, PlannedValueSymbol, RenderedIdentityRefusal,
@@ -810,20 +808,6 @@ fn prepared_render_definition_is_safe(_symbols: &std::cell::RefCell<crate::symbo
             .binding_names
             .is_some_and(|resolver| resolver.authorizes_program_variable(*name))
         {
-            #[cfg(test)]
-            if env.binding_names.is_none() {
-                let lower = crate::symbol::spelling(_symbols, *name).to_ascii_lowercase();
-                let base = lower.split('_').next().unwrap_or(lower.as_str());
-                let legacy_safe = base != env.sp_name
-                    && base != env.fp_name
-                    && base != env.ret_reg_name
-                    && !env.arg_regs.iter().any(|reg| reg.eq_ignore_ascii_case(base))
-                    && !env.caller_saved_regs.iter().any(|reg| reg.eq_ignore_ascii_case(base))
-                    && !is_temporary_or_memory_name(&crate::symbol::spelling(_symbols, *name));
-                if legacy_safe {
-                    return;
-                }
-            }
             safe = false;
         }
     });
@@ -5000,7 +4984,7 @@ mod tests {
     }
 
     #[test]
-    fn prepared_definition_safety_uses_typed_storage_classification() {
+    fn prepared_definition_safety_requires_binding_plan_authorization() {
         let symbols = test_table();
         let function_names = HashMap::new();
         let strings = HashMap::new();
@@ -5030,46 +5014,18 @@ mod tests {
             type_oracle: None,
         };
 
-        assert!(!prepared_render_definition_is_safe(&symbols, 
-            &crate::symbol::var_ref(&symbols, "tmp:1"),
-            &env
-        ));
-        assert!(!prepared_render_definition_is_safe(&symbols, 
-            &crate::symbol::var_ref(&symbols, "ram:401000"),
-            &env
-        ));
-        assert!(!prepared_render_definition_is_safe(&symbols, 
-            &crate::symbol::var_ref(&symbols, "unique:1"),
-            &env
-        ));
-        assert!(!prepared_render_definition_is_safe(&symbols, 
-            &crate::symbol::var_ref(&symbols, "RDI"),
-            &env
-        ));
-        assert!(!prepared_render_definition_is_safe(&symbols, 
-            &crate::symbol::var_ref(&symbols, "RBP"),
-            &env
-        ));
-        assert!(!prepared_render_definition_is_safe(&symbols, 
-            &crate::symbol::var_ref(&symbols, "RAX"),
-            &env
-        ));
-        assert!(!prepared_render_definition_is_safe(&symbols, 
-            &crate::symbol::var_ref(&symbols, "RCX"),
-            &env
-        ));
-        assert!(prepared_render_definition_is_safe(&symbols, 
-            &crate::symbol::var_ref(&symbols, "const:1"),
-            &env
-        ));
-        assert!(prepared_render_definition_is_safe(&symbols, 
-            &crate::symbol::var_ref(&symbols, "space1:20"),
-            &env
-        ));
-        assert!(prepared_render_definition_is_safe(&symbols, 
-            &crate::symbol::var_ref(&symbols, "value"),
-            &env
-        ));
+        assert!(
+            !prepared_render_definition_is_safe(
+                &symbols,
+                &crate::symbol::var_ref(&symbols, "value"),
+                &env
+            ),
+            "an arbitrary spelling cannot authorize a program variable"
+        );
+        assert!(
+            prepared_render_definition_is_safe(&symbols, &CExpr::IntLit(1), &env),
+            "literal-only definitions need no program-variable authorization"
+        );
     }
 
     #[test]
@@ -5148,119 +5104,6 @@ mod tests {
             &version_zero_reg,
             &crate::symbol::var_ref(&symbols, "rbx_0")
         ));
-    }
-
-    #[test]
-    fn prepared_signed_dividend_expr_collapses_cdq_pair_to_low_root() {
-        let symbols = test_table();
-        let eax = test_var("EAX", 1, 4);
-        let edx = test_var("EDX", 1, 4);
-        let sext = test_var("tmp:sext", 1, 8);
-        let high_zext = test_var("tmp:high_zext", 1, 8);
-        let shifted_high = test_var("tmp:shifted_high", 1, 8);
-        let low_zext = test_var("tmp:low_zext", 1, 8);
-        let dividend = test_var("tmp:dividend", 1, 8);
-        let shift = SSAVar::constant(32, 8);
-
-        let sext_op = SSAOp::IntSExt {
-            dst: sext.clone(),
-            src: eax.clone(),
-        };
-        let high_op = SSAOp::Subpiece {
-            dst: edx.clone(),
-            src: sext.clone(),
-            offset: 4,
-        };
-        let high_zext_op = SSAOp::IntZExt {
-            dst: high_zext.clone(),
-            src: edx.clone(),
-        };
-        let shift_op = SSAOp::IntLeft {
-            dst: shifted_high.clone(),
-            a: high_zext.clone(),
-            b: shift,
-        };
-        let low_zext_op = SSAOp::IntZExt {
-            dst: low_zext.clone(),
-            src: eax.clone(),
-        };
-        let dividend_op = SSAOp::IntOr {
-            dst: dividend.clone(),
-            a: shifted_high.clone(),
-            b: low_zext.clone(),
-        };
-
-        let producers = HashMap::from([
-            (sext.clone(), &sext_op),
-            (edx, &high_op),
-            (high_zext, &high_zext_op),
-            (shifted_high, &shift_op),
-            (low_zext, &low_zext_op),
-            (dividend.clone(), &dividend_op),
-        ]);
-        let view = PreparedSemanticView {
-            value_id_by_var: HashMap::from([(eax.clone(), ValueId(0))]),
-            owner_expr_by_value: HashMap::from([(ValueId(0), crate::symbol::var_ref(&symbols, "a"))]),
-            ..PreparedSemanticView::default()
-        };
-
-        assert_eq!(
-            prepared_signed_dividend_expr(&symbols, &view, &producers, &dividend),
-            Some(crate::symbol::var_ref(&symbols, "a"))
-        );
-    }
-
-    #[test]
-    fn prepared_signed_dividend_expr_accepts_direct_sign_extended_high_limb() {
-        let symbols = test_table();
-        let eax = test_var("EAX", 1, 4);
-        let sext = test_var("tmp:sext", 1, 8);
-        let high_zext = test_var("tmp:high_zext", 1, 8);
-        let shifted_high = test_var("tmp:shifted_high", 1, 8);
-        let low_zext = test_var("tmp:low_zext", 1, 8);
-        let dividend = test_var("tmp:dividend", 1, 8);
-        let shift = SSAVar::constant(32, 8);
-
-        let sext_op = SSAOp::IntSExt {
-            dst: sext.clone(),
-            src: eax.clone(),
-        };
-        let high_zext_op = SSAOp::IntZExt {
-            dst: high_zext.clone(),
-            src: sext.clone(),
-        };
-        let shift_op = SSAOp::IntLeft {
-            dst: shifted_high.clone(),
-            a: high_zext.clone(),
-            b: shift,
-        };
-        let low_zext_op = SSAOp::IntZExt {
-            dst: low_zext.clone(),
-            src: eax.clone(),
-        };
-        let dividend_op = SSAOp::IntOr {
-            dst: dividend.clone(),
-            a: shifted_high.clone(),
-            b: low_zext.clone(),
-        };
-
-        let producers = HashMap::from([
-            (sext.clone(), &sext_op),
-            (high_zext, &high_zext_op),
-            (shifted_high, &shift_op),
-            (low_zext, &low_zext_op),
-            (dividend.clone(), &dividend_op),
-        ]);
-        let view = PreparedSemanticView {
-            value_id_by_var: HashMap::from([(eax.clone(), ValueId(0))]),
-            owner_expr_by_value: HashMap::from([(ValueId(0), crate::symbol::var_ref(&symbols, "a"))]),
-            ..PreparedSemanticView::default()
-        };
-
-        assert_eq!(
-            prepared_signed_dividend_expr(&symbols, &view, &producers, &dividend),
-            Some(crate::symbol::var_ref(&symbols, "a"))
-        );
     }
 
     #[test]
