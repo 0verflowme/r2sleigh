@@ -2267,7 +2267,7 @@ mod tests {
             },
         ];
         func.get_block_mut(0x100c).expect("exit").ops = vec![SSAOp::Return {
-            target: SSAVar::new("RIP", 1, 8),
+            target: SSAVar::new("const:0", 0, 8),
         }];
 
         let normalized = materialize_all_phis(&func);
@@ -2383,7 +2383,7 @@ mod tests {
                 src: hash_2.clone(),
             },
             SSAOp::Return {
-                target: SSAVar::new("RIP", 1, 8),
+                target: SSAVar::new("const:0", 0, 8),
             },
         ];
 
@@ -2481,9 +2481,15 @@ mod tests {
         let value_2 = SSAVar::new("RAX", 2, 8);
         let value_4 = SSAVar::new("RAX", 4, 8);
         let mut func = loop_backedge_phi_fixture();
-        func.get_block_mut(0x1000).expect("entry").ops = vec![SSAOp::Branch {
-            target: SSAVar::new("ram:1004", 0, 8),
-        }];
+        func.get_block_mut(0x1000).expect("entry").ops = vec![
+            SSAOp::Copy {
+                dst: value_1.clone(),
+                src: SSAVar::new("const:1", 0, 8),
+            },
+            SSAOp::Branch {
+                target: SSAVar::new("ram:1004", 0, 8),
+            },
+        ];
         func.get_block_mut(0x1004).expect("header").phis = vec![PhiNode {
             dst: value_2.clone(),
             sources: vec![(0x1000, value_1), (0x1008, value_4.clone())],
@@ -2527,6 +2533,19 @@ mod tests {
         let a = SSAVar::new("RAX", 2, 8);
         let b = SSAVar::new("RBX", 2, 8);
         let mut func = loop_backedge_phi_fixture();
+        func.get_block_mut(0x1000).expect("entry").ops = vec![
+            SSAOp::Copy {
+                dst: SSAVar::new("RAX", 1, 8),
+                src: SSAVar::new("const:1", 0, 8),
+            },
+            SSAOp::Copy {
+                dst: SSAVar::new("RBX", 1, 8),
+                src: SSAVar::new("const:2", 0, 8),
+            },
+            SSAOp::Branch {
+                target: SSAVar::new("ram:1004", 0, 8),
+            },
+        ];
         func.get_block_mut(0x1004).expect("header").phis = vec![
             PhiNode {
                 dst: a.clone(),
