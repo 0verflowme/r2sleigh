@@ -47,7 +47,7 @@ pub use opcode::{R2ILBlock, R2ILOp, SwitchCase, SwitchInfo};
 pub use regname::select_register_name;
 pub use serialize::{
     ArchSpec, RegisterBitSlice, RegisterDef, RegisterProjection, RegisterProjectionDisposition,
-    RegisterProjectionRefusal, RegisterStorage,
+    RegisterProjectionQuery, RegisterProjectionRefusal, RegisterStorage,
 };
 pub use space::{AddressSpace, SpaceId};
 pub use validate::{

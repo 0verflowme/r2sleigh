@@ -8,7 +8,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use r2il::{
     ArchSpec, Endianness, R2ILBlock, R2ILOp, RegisterProjection, RegisterProjectionDisposition,
-    RegisterProjectionRefusal, RegisterStorage, SpaceId, effective_arch_address_size,
+    RegisterProjectionQuery, RegisterProjectionRefusal, RegisterStorage, SpaceId,
+    effective_arch_address_size,
 };
 use serde::Serialize;
 
@@ -27,7 +28,7 @@ pub use r2source::{
     SourceTypeGraphError, SourceTypeKind, StackAddressBase,
 };
 
-pub const MACHINE_CONTEXT_SCHEMA_VERSION: u32 = 17;
+pub const MACHINE_CONTEXT_SCHEMA_VERSION: u32 = 18;
 
 /// Canonical architecture family captured from the exact lifting profile.
 ///
@@ -800,6 +801,24 @@ fn write_call_site_interface(
     }
 }
 
+/// Unique register-space ranges the lifted body actually reads or writes.
+///
+/// The architecture query owns projection policy. This pass only supplies the
+/// exact observed ranges once so the immutable function context can retain a
+/// sorted `O(log n)` lookup table for every later consumer.
+fn observed_register_storages(blocks: &[R2ILBlock]) -> BTreeSet<RegisterStorage> {
+    blocks
+        .iter()
+        .flat_map(|block| &block.ops)
+        .flat_map(|op| op.inputs().into_iter().chain(op.output()))
+        .filter(|varnode| varnode.space == SpaceId::Register)
+        .map(|varnode| RegisterStorage {
+            offset: varnode.offset,
+            size: varnode.size,
+        })
+        .collect()
+}
+
 impl SourceMachineContext {
     pub(crate) fn from_blocks(blocks: &[R2ILBlock], arch: Option<&ArchSpec>) -> Self {
         Self::from_blocks_with_interfaces(
@@ -861,15 +880,28 @@ impl SourceMachineContext {
                 .collect();
         let (register_geometry_state, register_projections) = match arch {
             None => (MachineRegisterGeometryState::Unavailable, Box::default()),
-            Some(arch) => match r2il::validate_register_geometry(arch) {
+            Some(arch) => match RegisterProjectionQuery::from_arch(arch) {
                 Err(_) => (MachineRegisterGeometryState::Malformed, Box::default()),
-                Ok(()) if arch.register_projections.is_empty() => {
-                    (MachineRegisterGeometryState::Unavailable, Box::default())
+                Ok(None) => (MachineRegisterGeometryState::Unavailable, Box::default()),
+                Ok(Some(query)) => {
+                    let mut projections = arch
+                        .register_projections
+                        .iter()
+                        .map(|projection| (projection.written, *projection))
+                        .collect::<BTreeMap<_, _>>();
+                    for storage in observed_register_storages(blocks) {
+                        projections
+                            .entry(storage)
+                            .or_insert_with(|| query.project(storage));
+                    }
+                    (
+                        MachineRegisterGeometryState::Available,
+                        projections
+                            .into_values()
+                            .collect::<Vec<_>>()
+                            .into_boxed_slice(),
+                    )
                 }
-                Ok(()) => (
-                    MachineRegisterGeometryState::Available,
-                    arch.register_projections.clone().into_boxed_slice(),
-                ),
             },
         };
         let memory_model = MachineMemoryModel::from_arch(arch);
@@ -1168,7 +1200,8 @@ impl SourceMachineContext {
         self.register_geometry_state
     }
 
-    /// Exact source-owned register carrier geometry.
+    /// Exact source-owned register carrier geometry for declared and observed
+    /// register-space ranges.
     ///
     /// A non-empty slice is the validated, sorted `r2il` contract without any
     /// downstream reconstruction or architecture-specific write policy. When
@@ -1608,6 +1641,107 @@ mod tests {
     }
 
     #[test]
+    fn source_register_geometry_caches_canonical_observed_lane_projections() {
+        let q0 = RegisterStorage {
+            offset: 0x5000,
+            size: 16,
+        };
+        let s0 = RegisterStorage {
+            offset: 0x5000,
+            size: 4,
+        };
+        let q4 = RegisterStorage {
+            offset: 0x5040,
+            size: 16,
+        };
+        let b4 = RegisterStorage {
+            offset: 0x5040,
+            size: 1,
+        };
+        let mut arch = ArchSpec::new("aarch64-vector-lanes");
+        for (name, storage) in [("q0", q0), ("s0", s0), ("q4", q4), ("b4", b4)] {
+            arch.add_register(RegisterDef::new(name, storage.offset, storage.size));
+        }
+        arch.register_projections = vec![
+            RegisterProjection {
+                written: s0,
+                disposition: RegisterProjectionDisposition::Bound {
+                    carrier: q0,
+                    slice: r2il::RegisterBitSlice {
+                        lsb_bit_offset: 0,
+                        size_bits: 32,
+                    },
+                },
+            },
+            RegisterProjection {
+                written: q0,
+                disposition: RegisterProjectionDisposition::Bound {
+                    carrier: q0,
+                    slice: r2il::RegisterBitSlice {
+                        lsb_bit_offset: 0,
+                        size_bits: 128,
+                    },
+                },
+            },
+            RegisterProjection {
+                written: b4,
+                disposition: RegisterProjectionDisposition::Bound {
+                    carrier: q4,
+                    slice: r2il::RegisterBitSlice {
+                        lsb_bit_offset: 0,
+                        size_bits: 8,
+                    },
+                },
+            },
+            RegisterProjection {
+                written: q4,
+                disposition: RegisterProjectionDisposition::Bound {
+                    carrier: q4,
+                    slice: r2il::RegisterBitSlice {
+                        lsb_bit_offset: 0,
+                        size_bits: 128,
+                    },
+                },
+            },
+        ];
+        let mut block = R2ILBlock::new(0x1000, 4);
+        block.push(R2ILOp::Copy {
+            dst: Varnode::register(0x5004, 4),
+            src: Varnode::constant(1, 4),
+        });
+        block.push(R2ILOp::Copy {
+            dst: Varnode::register(0x5041, 1),
+            src: Varnode::constant(1, 1),
+        });
+
+        let context = SourceMachineContext::from_blocks(&[block], Some(&arch));
+        assert_eq!(
+            context
+                .register_projection(register_storage(0x5004, 4))
+                .map(|projection| projection.disposition),
+            Some(RegisterProjectionDisposition::Bound {
+                carrier: q0,
+                slice: r2il::RegisterBitSlice {
+                    lsb_bit_offset: 32,
+                    size_bits: 32,
+                },
+            })
+        );
+        assert_eq!(
+            context
+                .register_projection(register_storage(0x5041, 1))
+                .map(|projection| projection.disposition),
+            Some(RegisterProjectionDisposition::Bound {
+                carrier: q4,
+                slice: r2il::RegisterBitSlice {
+                    lsb_bit_offset: 8,
+                    size_bits: 8,
+                },
+            })
+        );
+    }
+
+    #[test]
     fn argument_registers_come_from_the_convention_not_the_pointer_width() {
         let mut arch = ArchSpec::new("AARCH64:LE:64:v8A");
         arch.addr_size = 8;
@@ -1656,8 +1790,8 @@ mod tests {
         let x86_context = SourceMachineContext::from_blocks(&[], Some(&x86));
         let arm_context = SourceMachineContext::from_blocks(&[], Some(&arm));
 
-        assert_eq!(MACHINE_CONTEXT_SCHEMA_VERSION, 17);
-        assert_eq!(x86_context.schema_version(), 17);
+        assert_eq!(MACHINE_CONTEXT_SCHEMA_VERSION, 18);
+        assert_eq!(x86_context.schema_version(), 18);
         assert_eq!(
             x86_context.architecture_family(),
             MachineArchitectureFamily::X86_64

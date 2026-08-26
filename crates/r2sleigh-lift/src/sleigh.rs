@@ -626,6 +626,63 @@ mod tests {
         );
     }
 
+    #[test]
+    fn extracted_geometry_answers_observed_unnamed_vector_lanes() {
+        let q0 = RegisterStorage {
+            offset: 0x5000,
+            size: 16,
+        };
+        let s0 = RegisterStorage {
+            offset: 0x5000,
+            size: 4,
+        };
+        let q4 = RegisterStorage {
+            offset: 0x5040,
+            size: 16,
+        };
+        let b4 = RegisterStorage {
+            offset: 0x5040,
+            size: 1,
+        };
+        let mut arch = ArchSpec::new("aarch64-vector-lanes");
+        for (name, storage) in [("q0", q0), ("s0", s0), ("q4", q4), ("b4", b4)] {
+            arch.add_register(r2il::RegisterDef::new(name, storage.offset, storage.size));
+        }
+        arch.register_projections = derive_register_projections([
+            declaration(q0.offset, q0.size, Some(false)),
+            declaration(s0.offset, s0.size, Some(false)),
+            declaration(q4.offset, q4.size, Some(false)),
+            declaration(b4.offset, b4.size, Some(false)),
+        ]);
+        let query = r2il::RegisterProjectionQuery::from_arch(&arch)
+            .expect("extracted geometry validates")
+            .expect("extracted geometry is available");
+
+        for (written, carrier, bit_offset) in [
+            (
+                RegisterStorage {
+                    offset: 0x5004,
+                    size: 4,
+                },
+                q0,
+                32,
+            ),
+            (
+                RegisterStorage {
+                    offset: 0x5041,
+                    size: 1,
+                },
+                q4,
+                8,
+            ),
+        ] {
+            assert_eq!(
+                query.project(written),
+                expected_bound(written, carrier, bit_offset)
+            );
+        }
+    }
+
     #[cfg(feature = "x86")]
     #[test]
     fn embedded_x86_64_geometry_is_exact_and_trust_independent() {

@@ -369,6 +369,16 @@ pub enum MachineArithmeticMode {
     Checked,
 }
 
+/// Result policy when an integer divisor is zero.
+///
+/// Raw p-code division does not model a processor trap or choose a quotient for
+/// this case. Keeping that absence explicit prevents a consumer from silently
+/// inheriting its host language's divide-by-zero behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+pub enum MachineZeroDivisorBehavior {
+    Undefined,
+}
+
 /// Exact carry/overflow predicate produced by a fixed-width machine operation.
 ///
 /// These are boolean results over the input bit patterns. They are distinct
@@ -580,6 +590,15 @@ pub enum MachineExprKind {
         left: MachineExprId,
         right: MachineExprId,
     },
+    UnsignedDivide {
+        zero_divisor: MachineZeroDivisorBehavior,
+        dividend: MachineExprId,
+        divisor: MachineExprId,
+    },
+    Negate {
+        mode: MachineArithmeticMode,
+        input: MachineExprId,
+    },
     Bitwise {
         op: MachineBitwiseOp,
         left: MachineExprId,
@@ -616,6 +635,10 @@ pub enum MachineExprKind {
         input: MachineExprId,
         lsb_bits: u32,
     },
+    Concat {
+        high: MachineExprId,
+        low: MachineExprId,
+    },
     Select {
         condition: MachineExprId,
         if_true: MachineExprId,
@@ -634,6 +657,7 @@ impl MachineExprKind {
             Self::Copy { input }
             | Self::BitwiseNot { input }
             | Self::BooleanNot { input }
+            | Self::Negate { input, .. }
             | Self::Cast { input, .. }
             | Self::Extract { input, .. } => vec![*input],
             Self::Arithmetic { left, right, .. }
@@ -641,6 +665,10 @@ impl MachineExprKind {
             | Self::Bitwise { left, right, .. }
             | Self::Boolean { left, right, .. }
             | Self::Compare { left, right, .. } => vec![*left, *right],
+            Self::UnsignedDivide {
+                dividend, divisor, ..
+            } => vec![*dividend, *divisor],
+            Self::Concat { high, low } => vec![*high, *low],
             Self::Shift { value, count, .. } => vec![*value, *count],
             Self::Select {
                 condition,
@@ -1804,6 +1832,33 @@ impl MachineFunction {
             | MachineExprKind::Bitwise { left, right, .. } => {
                 same_width(child(*left)?) && same_width(child(*right)?)
             }
+            MachineExprKind::UnsignedDivide {
+                zero_divisor,
+                dividend,
+                divisor,
+            } => {
+                *zero_divisor == MachineZeroDivisorBehavior::Undefined
+                    && matches!(
+                        expr.ty,
+                        MachineType::Integer {
+                            signedness: MachineSignedness::Unsigned,
+                            ..
+                        }
+                    )
+                    && child(*dividend)?.ty == expr.ty
+                    && child(*divisor)?.ty == expr.ty
+            }
+            MachineExprKind::Negate { mode, input } => {
+                *mode == MachineArithmeticMode::Wrapping
+                    && matches!(
+                        expr.ty,
+                        MachineType::Integer {
+                            signedness: MachineSignedness::Unsigned,
+                            ..
+                        }
+                    )
+                    && child(*input)?.ty == expr.ty
+            }
             MachineExprKind::ArithmeticFlag { left, right, .. } => {
                 matches!(expr.ty, MachineType::Bool { .. })
                     && child(*left)?.ty.width_bits() == child(*right)?.ty.width_bits()
@@ -1849,6 +1904,30 @@ impl MachineFunction {
                 lsb_bits
                     .checked_add(expr.ty.width_bits())
                     .is_some_and(|end| end <= input_bits)
+            }
+            MachineExprKind::Concat { high, low } => {
+                let high = child(*high)?;
+                let low = child(*low)?;
+                matches!(
+                    expr.ty,
+                    MachineType::Integer {
+                        signedness: MachineSignedness::Unsigned,
+                        ..
+                    }
+                ) && matches!(
+                    high.ty,
+                    MachineType::Integer {
+                        signedness: MachineSignedness::Unsigned,
+                        ..
+                    }
+                ) && matches!(
+                    low.ty,
+                    MachineType::Integer {
+                        signedness: MachineSignedness::Unsigned,
+                        ..
+                    }
+                ) && high.ty.width_bits().checked_add(low.ty.width_bits())
+                    == Some(expr.ty.width_bits())
             }
             MachineExprKind::Select {
                 condition,
@@ -2355,6 +2434,27 @@ impl MachineBuilder {
         Ok(input)
     }
 
+    fn exact_width_operand_nodes(
+        &mut self,
+        graph: &crate::graph::SsaGraph,
+        inst: &GraphInst,
+        expected: usize,
+        expected_bits: u32,
+    ) -> Result<Vec<MachineExprId>, MachineBuildError> {
+        if inst.inputs.len() != expected {
+            return Err(MachineBuildError::WrongOperandCount {
+                inst: inst.id,
+                expected,
+                actual: inst.inputs.len(),
+            });
+        }
+        let mut inputs = Vec::with_capacity(expected);
+        for input_idx in 0..expected {
+            inputs.push(self.exact_width_operand_node(graph, inst, input_idx, expected_bits)?);
+        }
+        Ok(inputs)
+    }
+
     fn lower_inst(
         &mut self,
         artifact: &SsaArtifact,
@@ -2504,6 +2604,27 @@ impl MachineBuilder {
                         mode: MachineArithmeticMode::Wrapping,
                         left: inputs[0],
                         right: inputs[1],
+                    },
+                ))
+            }
+            SSAOp::IntDiv { .. } => {
+                let inputs = self.exact_width_operand_nodes(graph, inst, 2, output.width_bits)?;
+                Ok((
+                    unsigned,
+                    MachineExprKind::UnsignedDivide {
+                        zero_divisor: MachineZeroDivisorBehavior::Undefined,
+                        dividend: inputs[0],
+                        divisor: inputs[1],
+                    },
+                ))
+            }
+            SSAOp::IntNegate { .. } => {
+                let inputs = self.exact_width_operand_nodes(graph, inst, 1, output.width_bits)?;
+                Ok((
+                    unsigned,
+                    MachineExprKind::Negate {
+                        mode: MachineArithmeticMode::Wrapping,
+                        input: inputs[0],
                     },
                 ))
             }
@@ -2799,6 +2920,42 @@ impl MachineBuilder {
                 )?;
                 Ok((unsigned, MachineExprKind::Extract { input, lsb_bits }))
             }
+            SSAOp::Piece { .. } => {
+                if inst.inputs.len() != 2 {
+                    return Err(MachineBuildError::WrongOperandCount {
+                        inst: inst.id,
+                        expected: 2,
+                        actual: inst.inputs.len(),
+                    });
+                }
+                let high_value = graph
+                    .value(inst.inputs[0])
+                    .ok_or(MachineBuildError::MissingGraphValue(inst.inputs[0]))?;
+                let low_value = graph
+                    .value(inst.inputs[1])
+                    .ok_or(MachineBuildError::MissingGraphValue(inst.inputs[1]))?;
+                let high_bits = binding_for_value(high_value)?.width_bits;
+                let low_bits = binding_for_value(low_value)?.width_bits;
+                let Some(actual_bits) = high_bits.checked_add(low_bits) else {
+                    return Err(MachineBuildError::WidthMismatch {
+                        inst: inst.id,
+                        expected_bits: output.width_bits,
+                        actual_bits: u32::MAX,
+                    });
+                };
+                if actual_bits != output.width_bits {
+                    return Err(MachineBuildError::WidthMismatch {
+                        inst: inst.id,
+                        expected_bits: output.width_bits,
+                        actual_bits,
+                    });
+                }
+                let high = self.intern_value(high_value)?;
+                let low = self.intern_value(low_value)?;
+                self.record_whole_use(graph, inst, 0)?;
+                self.record_whole_use(graph, inst, 1)?;
+                Ok((unsigned, MachineExprKind::Concat { high, low }))
+            }
             SSAOp::Select { .. } => {
                 if inst.inputs.len() != 3 {
                     return Err(MachineBuildError::WrongOperandCount {
@@ -2952,6 +3109,20 @@ fn machine_kind_matches_op(op: &SSAOp, kind: &MachineExprKind) -> bool {
                 SSAOp::IntMult { .. },
                 MachineExprKind::Arithmetic {
                     op: MachineArithmeticOp::Multiply,
+                    mode: MachineArithmeticMode::Wrapping,
+                    ..
+                }
+            )
+            | (
+                SSAOp::IntDiv { .. },
+                MachineExprKind::UnsignedDivide {
+                    zero_divisor: MachineZeroDivisorBehavior::Undefined,
+                    ..
+                }
+            )
+            | (
+                SSAOp::IntNegate { .. },
+                MachineExprKind::Negate {
                     mode: MachineArithmeticMode::Wrapping,
                     ..
                 }
@@ -3121,6 +3292,7 @@ fn machine_kind_matches_op(op: &SSAOp, kind: &MachineExprKind) -> bool {
                     ..
                 }
             )
+            | (SSAOp::Piece { .. }, MachineExprKind::Concat { .. })
             | (SSAOp::Select { .. }, MachineExprKind::Select { .. })
     )
 }
@@ -3152,6 +3324,8 @@ fn machine_type_matches_op(op: &SSAOp, ty: &MachineType, output_bits: u32) -> bo
         | SSAOp::IntAdd { .. }
         | SSAOp::IntSub { .. }
         | SSAOp::IntMult { .. }
+        | SSAOp::IntDiv { .. }
+        | SSAOp::IntNegate { .. }
         | SSAOp::IntAnd { .. }
         | SSAOp::IntOr { .. }
         | SSAOp::IntXor { .. }
@@ -3161,6 +3335,7 @@ fn machine_type_matches_op(op: &SSAOp, ty: &MachineType, output_bits: u32) -> bo
         | SSAOp::IntZExt { .. }
         | SSAOp::Trunc { .. }
         | SSAOp::Cast { .. }
+        | SSAOp::Piece { .. }
         | SSAOp::Subpiece { .. }
         | SSAOp::Select { .. } => *ty == unsigned,
         _ => false,
@@ -3885,8 +4060,175 @@ mod tests {
     }
 
     #[test]
+    fn divide_negate_and_piece_have_exact_machine_vocabulary() {
+        let artifact = artifact_with_ops([
+            R2ILOp::IntDiv {
+                dst: Varnode::unique(0x10, 4),
+                a: Varnode::unique(0x100, 4),
+                b: Varnode::constant(0, 4),
+            },
+            R2ILOp::IntNegate {
+                dst: Varnode::unique(0x18, 8),
+                src: Varnode::unique(0x108, 8),
+            },
+            R2ILOp::Piece {
+                dst: Varnode::unique(0x20, 8),
+                hi: Varnode::unique(0x110, 4),
+                lo: Varnode::unique(0x118, 4),
+            },
+        ]);
+        let projection = MachineProjection::from_artifact(&artifact).expect("exact projection");
+        assert!(projection.failures().is_empty());
+
+        for (op_index, expected_width, expected_inputs) in
+            [(0, 32, 2_usize), (1, 64, 1), (2, 64, 2)]
+        {
+            let inst = artifact
+                .graph()
+                .inst_id_for_op_site(0x1000, op_index)
+                .expect("projected instruction");
+            let output = artifact
+                .graph()
+                .inst(inst)
+                .and_then(|inst| inst.output)
+                .expect("projected output");
+            let root = projection
+                .entity_for_output(output)
+                .and_then(|entity| projection.expr(entity.root()))
+                .expect("projected root");
+            assert_eq!(
+                root.ty(),
+                &integer_type(expected_width, MachineSignedness::Unsigned)
+            );
+            assert_eq!(root.kind().children().len(), expected_inputs);
+            for input_idx in 0..expected_inputs {
+                assert_eq!(
+                    exact_use(&projection, &artifact, op_index, input_idx),
+                    whole_machine_use(
+                        binding_for_value(
+                            artifact
+                                .graph()
+                                .value(artifact.graph().inst(inst).unwrap().inputs[input_idx])
+                                .unwrap()
+                        )
+                        .unwrap()
+                    )
+                );
+            }
+            assert_eq!(
+                projection.write_disposition(inst),
+                Some(&MachineWriteDisposition::Exact(
+                    MachineWriteProjection::Full
+                ))
+            );
+        }
+
+        let divide = projection
+            .entity_for_output(artifact.graph().inst(InstId(0)).unwrap().output.unwrap())
+            .and_then(|entity| projection.expr(entity.root()))
+            .expect("divide root");
+        assert!(matches!(
+            divide.kind(),
+            MachineExprKind::UnsignedDivide {
+                zero_divisor: MachineZeroDivisorBehavior::Undefined,
+                ..
+            }
+        ));
+        let negate = projection
+            .entity_for_output(artifact.graph().inst(InstId(1)).unwrap().output.unwrap())
+            .and_then(|entity| projection.expr(entity.root()))
+            .expect("negate root");
+        assert!(matches!(
+            negate.kind(),
+            MachineExprKind::Negate {
+                mode: MachineArithmeticMode::Wrapping,
+                ..
+            }
+        ));
+        let piece = projection
+            .entity_for_output(artifact.graph().inst(InstId(2)).unwrap().output.unwrap())
+            .and_then(|entity| projection.expr(entity.root()))
+            .expect("piece root");
+        assert!(matches!(piece.kind(), MachineExprKind::Concat { .. }));
+        projection
+            .validate_against(&artifact)
+            .expect("new vocabulary remains source-bound");
+    }
+
+    #[test]
+    fn divide_negate_and_piece_reject_wrong_arity_and_width() {
+        let artifact = artifact_with_ops([
+            R2ILOp::IntDiv {
+                dst: Varnode::unique(0x10, 8),
+                a: Varnode::register(0, 8),
+                b: Varnode::register(8, 8),
+            },
+            R2ILOp::IntNegate {
+                dst: Varnode::unique(0x18, 8),
+                src: Varnode::register(16, 8),
+            },
+            R2ILOp::Piece {
+                dst: Varnode::unique(0x20, 8),
+                hi: Varnode::register(24, 4),
+                lo: Varnode::register(28, 4),
+            },
+        ]);
+        for (op_index, expected_arity) in [(0, 2_usize), (1, 1), (2, 2)] {
+            let inst = artifact
+                .graph()
+                .inst_id_for_op_site(0x1000, op_index)
+                .and_then(|inst| artifact.graph().inst(inst))
+                .expect("test instruction");
+            let InstPayload::Op(op) = &inst.payload else {
+                unreachable!();
+            };
+            let output = binding_for_value(
+                artifact
+                    .graph()
+                    .value(inst.output.expect("test output"))
+                    .expect("test output value"),
+            )
+            .expect("test output binding");
+
+            let mut wrong_arity = inst.clone();
+            wrong_arity.inputs.pop();
+            assert_eq!(
+                MachineBuilder::for_graph(artifact.graph()).lower_op(
+                    &artifact,
+                    &wrong_arity,
+                    op,
+                    output,
+                ),
+                Err(MachineBuildError::WrongOperandCount {
+                    inst: inst.id,
+                    expected: expected_arity,
+                    actual: expected_arity - 1,
+                })
+            );
+
+            let wrong_width = MachineValueBinding {
+                width_bits: 32,
+                ..output
+            };
+            assert!(matches!(
+                MachineBuilder::for_graph(artifact.graph()).lower_op(
+                    &artifact,
+                    inst,
+                    op,
+                    wrong_width,
+                ),
+                Err(MachineBuildError::WidthMismatch {
+                    inst: actual,
+                    expected_bits: 32,
+                    actual_bits: 64,
+                }) if actual == inst.id
+            ));
+        }
+    }
+
+    #[test]
     fn unsupported_value_operation_fails_explicitly() {
-        let artifact = artifact_with_ops([R2ILOp::IntDiv {
+        let artifact = artifact_with_ops([R2ILOp::IntRem {
             dst: Varnode::unique(0x10, 8),
             a: Varnode::register(0, 8),
             b: Varnode::constant(3, 8),
@@ -3896,7 +4238,7 @@ mod tests {
             Err(MachineBuildError::UnsupportedOperation {
                 op,
                 ..
-            }) if matches!(*op, SSAOp::IntDiv { .. })
+            }) if matches!(*op, SSAOp::IntRem { .. })
         ));
     }
 
@@ -4556,7 +4898,9 @@ mod tests {
         let arch = register_geometry_arch();
         assert_eq!(
             read(&arch, Varnode::register(0x80, 1)),
-            MachineUseDisposition::Refused(MachineUseRefusal::InvalidBitRange)
+            MachineUseDisposition::Refused(MachineUseRefusal::RegisterGeometry(
+                RegisterProjectionRefusal::NoContainingCarrier
+            ))
         );
     }
 
@@ -4644,6 +4988,116 @@ mod tests {
             malformed_artifact
                 .machine_context()
                 .semantic_identity_bytes()
+        );
+    }
+
+    #[test]
+    fn write_projection_uses_source_certified_unnamed_vector_lanes() {
+        let q0 = RegisterStorage {
+            offset: 0x5000,
+            size: 16,
+        };
+        let s0 = RegisterStorage {
+            offset: 0x5000,
+            size: 4,
+        };
+        let q4 = RegisterStorage {
+            offset: 0x5040,
+            size: 16,
+        };
+        let b4 = RegisterStorage {
+            offset: 0x5040,
+            size: 1,
+        };
+        let mut arch = ArchSpec::new("aarch64-vector-lanes");
+        for (name, storage) in [("q0", q0), ("s0", s0), ("q4", q4), ("b4", b4)] {
+            arch.add_register(RegisterDef::new(name, storage.offset, storage.size));
+        }
+        arch.register_projections = vec![
+            RegisterProjection {
+                written: s0,
+                disposition: RegisterProjectionDisposition::Bound {
+                    carrier: q0,
+                    slice: RegisterBitSlice {
+                        lsb_bit_offset: 0,
+                        size_bits: 32,
+                    },
+                },
+            },
+            RegisterProjection {
+                written: q0,
+                disposition: RegisterProjectionDisposition::Bound {
+                    carrier: q0,
+                    slice: RegisterBitSlice {
+                        lsb_bit_offset: 0,
+                        size_bits: 128,
+                    },
+                },
+            },
+            RegisterProjection {
+                written: b4,
+                disposition: RegisterProjectionDisposition::Bound {
+                    carrier: q4,
+                    slice: RegisterBitSlice {
+                        lsb_bit_offset: 0,
+                        size_bits: 8,
+                    },
+                },
+            },
+            RegisterProjection {
+                written: q4,
+                disposition: RegisterProjectionDisposition::Bound {
+                    carrier: q4,
+                    slice: RegisterBitSlice {
+                        lsb_bit_offset: 0,
+                        size_bits: 128,
+                    },
+                },
+            },
+        ];
+        let artifact = artifact_with_arch(
+            [
+                R2ILOp::IntAdd {
+                    dst: Varnode::register(0x5004, 4),
+                    a: Varnode::unique(0x10, 4),
+                    b: Varnode::unique(0x14, 4),
+                },
+                R2ILOp::IntAnd {
+                    dst: Varnode::register(0x5041, 1),
+                    a: Varnode::unique(0x18, 1),
+                    b: Varnode::unique(0x19, 1),
+                },
+            ],
+            &arch,
+        );
+        let projection = MachineProjection::from_artifact(&artifact).expect("machine projection");
+        let word_inst = artifact
+            .graph()
+            .inst_id_for_op_site(0x1000, 0)
+            .expect("word-lane instruction");
+        let byte_inst = artifact
+            .graph()
+            .inst_id_for_op_site(0x1000, 1)
+            .expect("byte-lane instruction");
+        assert_eq!(
+            projection.write_disposition(word_inst),
+            Some(&MachineWriteDisposition::Exact(
+                MachineWriteProjection::Insert {
+                    bit_offset: 32,
+                    width_bits: 32,
+                    carrier_width_bits: 128,
+                }
+            ))
+        );
+        assert_eq!(
+            projection.write_disposition(byte_inst),
+            Some(&MachineWriteDisposition::Exact(
+                MachineWriteProjection::Insert {
+                    bit_offset: 8,
+                    width_bits: 8,
+                    carrier_width_bits: 128,
+                }
+            ))
         );
     }
 
@@ -4738,7 +5192,7 @@ mod tests {
                 addr: Varnode::unique(0x130, 8),
                 val: Varnode::unique(0x138, 4),
             },
-            R2ILOp::IntDiv {
+            R2ILOp::IntRem {
                 dst: unsupported.clone(),
                 a: Varnode::unique(0x140, 8),
                 b: Varnode::constant(3, 8),
@@ -4818,7 +5272,7 @@ mod tests {
         let unsupported_inst = artifact
             .graph()
             .inst_id_for_op_site(0x1000, 8)
-            .expect("division instruction");
+            .expect("unsupported remainder instruction");
         for input_idx in 0..2 {
             assert_eq!(
                 projection.use_disposition(UseSite {

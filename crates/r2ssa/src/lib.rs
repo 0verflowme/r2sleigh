@@ -112,7 +112,7 @@ pub use machine::{
     MachineProjectionFailure, MachineShiftKind, MachineSignedness, MachineStackBase, MachineType,
     MachineUseConversion, MachineUseDisposition, MachineUseRefusal, MachineUseSlice,
     MachineValueBinding, MachineValueUse, MachineWriteDisposition, MachineWriteProjection,
-    MachineWriteRefusal, machine_address_provenance,
+    MachineWriteRefusal, MachineZeroDivisorBehavior, machine_address_provenance,
 };
 pub use machine_context::{
     MACHINE_CONTEXT_SCHEMA_VERSION, MachineAbiModel, MachineAbiRegisterSlot,
