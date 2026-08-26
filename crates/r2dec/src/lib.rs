@@ -3060,6 +3060,9 @@ pub enum BindingObservationJournalFailure {
     InvalidWrite {
         inst: r2ssa::InstId,
     },
+    InvalidEffectObligation {
+        obligation: r2ssa::SemanticObligationId,
+    },
     OutputlessWrite {
         inst: r2ssa::InstId,
     },
@@ -3190,6 +3193,7 @@ impl BindingObservationJournalFailure {
             Self::InvalidValue { .. } => "invalid_value",
             Self::InvalidUse { .. } => "invalid_use",
             Self::InvalidWrite { .. } => "invalid_write",
+            Self::InvalidEffectObligation { .. } => "invalid_effect_obligation",
             Self::OutputlessWrite { .. } => "outputless_write",
             Self::InvalidNormalizedSite { .. } => "invalid_normalized_site",
             Self::MissingNormalizedBlock { .. } => "missing_normalized_block",

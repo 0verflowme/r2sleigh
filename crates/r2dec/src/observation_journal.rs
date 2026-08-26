@@ -11,12 +11,12 @@
 )]
 
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 
 use r2ssa::{
     InstId, MachineUseDisposition, MachineWriteDisposition, SSAFunction, SsaArtifactAuthority,
-    UseSite, ValueId,
+    SemanticObligationId, UseSite, ValueId,
 };
 use r2types::SourceOwnedFunctionFacts;
 
@@ -84,6 +84,13 @@ enum ObservationTarget {
         inst: InstId,
         observation: LegacyWriteObservation,
     },
+    /// One exact cell from the source-owned semantic obligation inventory.
+    ///
+    /// Unlike the legacy fold-side proof vector, this target belongs to one
+    /// concrete AST occurrence. If a later rewrite deletes that occurrence,
+    /// the final inspection never visits this target and therefore cannot
+    /// count the obligation as rendered.
+    Effect(SemanticObligationId),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -95,6 +102,7 @@ pub(crate) enum LegacyObservationJournalError {
     InvalidValue(ValueId),
     InvalidUse(UseSite),
     InvalidWrite(InstId),
+    InvalidEffectObligation(SemanticObligationId),
     OutputlessWrite(InstId),
     InvalidNormalizedSite(NormalizedOpSite),
     MissingNormalizedBlock(u64),
@@ -365,6 +373,11 @@ impl From<&LegacyObservationJournalError> for BindingObservationJournalFailure {
             LegacyObservationJournalError::InvalidWrite(inst) => {
                 Self::InvalidWrite { inst: *inst }
             }
+            LegacyObservationJournalError::InvalidEffectObligation(obligation) => {
+                Self::InvalidEffectObligation {
+                    obligation: *obligation,
+                }
+            }
             LegacyObservationJournalError::OutputlessWrite(inst) => {
                 Self::OutputlessWrite { inst: *inst }
             }
@@ -544,6 +557,7 @@ impl LegacyObservationCoverage {
 pub(crate) struct SealedLegacyObservations {
     snapshot: LegacyAnalysisSnapshot,
     coverage: LegacyObservationCoverage,
+    effects: SurvivingEffectObservations,
 }
 
 impl SealedLegacyObservations {
@@ -553,6 +567,36 @@ impl SealedLegacyObservations {
 
     pub(crate) const fn coverage(&self) -> LegacyObservationCoverage {
         self.coverage
+    }
+
+    pub(crate) const fn effects(&self) -> &SurvivingEffectObservations {
+        &self.effects
+    }
+}
+
+/// Final occurrence counts for the canonical source obligation domain.
+///
+/// The map is opened from the source inventory before lowering. A zero count
+/// therefore means that no marker for that exact source cell survived the
+/// finished AST; it never means that the source cell was omitted from the
+/// accounting domain. Counts remain visible so duplicated render occurrences
+/// cannot collapse into a misleading boolean "rendered" answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SurvivingEffectObservations {
+    occurrences: BTreeMap<SemanticObligationId, usize>,
+}
+
+impl SurvivingEffectObservations {
+    pub(crate) fn occurrence_count(&self, id: SemanticObligationId) -> Option<usize> {
+        self.occurrences.get(&id).copied()
+    }
+
+    pub(crate) fn surviving(
+        &self,
+    ) -> impl Iterator<Item = (SemanticObligationId, usize)> + '_ {
+        self.occurrences
+            .iter()
+            .filter_map(|(id, count)| (*count > 0).then_some((*id, *count)))
     }
 }
 
@@ -567,6 +611,7 @@ pub(crate) struct LegacyObservationJournal {
     uses: Box<[Box<[Option<LegacyUseObservation>]>]>,
     write_has_output: Box<[bool]>,
     writes: Box<[Option<LegacyWriteObservation>]>,
+    effect_occurrences: BTreeMap<SemanticObligationId, usize>,
     targets: Vec<ObservationTarget>,
 }
 
@@ -705,6 +750,13 @@ impl SealedNativeFunction {
         &self.plan
     }
 
+    pub(crate) fn effect_observations(&self) -> &SurvivingEffectObservations {
+        self.observations
+            .as_ref()
+            .map(SealedLegacyObservations::effects)
+            .expect("strictly sealed native function must retain effect observations")
+    }
+
     pub(crate) fn into_function(self) -> CFunction {
         self.ready.into_function()
     }
@@ -769,6 +821,14 @@ impl LegacyObservationJournal {
             .collect::<Vec<_>>()
             .into_boxed_slice();
         let writes = vec![None; graph.insts.len()].into_boxed_slice();
+        let effect_occurrences = source
+            .source()
+            .obligations()
+            .obligations()
+            .keys()
+            .copied()
+            .map(|id| (id, 0))
+            .collect();
 
         let mut journal = Self {
             authority: source.source().authority().clone(),
@@ -780,6 +840,7 @@ impl LegacyObservationJournal {
             uses,
             write_has_output,
             writes,
+            effect_occurrences,
             targets: Vec::new(),
         };
         journal.record_upstream_nonrendered_dispositions(source, origins)?;
@@ -1070,6 +1131,55 @@ impl LegacyObservationJournal {
         Ok(CExpr::observed(write_id, CExpr::observed(value_id, expr)))
     }
 
+    fn allocate_effect_targets(
+        &mut self,
+        obligation_ids: &BTreeSet<SemanticObligationId>,
+    ) -> Result<Vec<RenderObservationId>, LegacyObservationJournalError> {
+        for id in obligation_ids {
+            if !self.effect_occurrences.contains_key(id) {
+                return Err(LegacyObservationJournalError::InvalidEffectObligation(*id));
+            }
+        }
+        self.allocate_many(
+            obligation_ids
+                .iter()
+                .copied()
+                .map(ObservationTarget::Effect)
+                .collect(),
+        )
+    }
+
+    /// Attach exact source-obligation cells to one concrete statement.
+    ///
+    /// Call this only after the upstream render certificate has selected the
+    /// exact obligation IDs discharged by the construct. The IDs are checked
+    /// against this journal's source-owned inventory, allocated in canonical
+    /// order, and counted only if this statement occurrence reaches sealing.
+    pub(crate) fn observe_effect_stmt(
+        &mut self,
+        obligation_ids: &BTreeSet<SemanticObligationId>,
+        stmt: CStmt,
+    ) -> Result<CStmt, LegacyObservationJournalError> {
+        let mut marked = stmt;
+        for id in self.allocate_effect_targets(obligation_ids)? {
+            marked = CStmt::observed(id, marked);
+        }
+        Ok(marked)
+    }
+
+    /// Expression twin of [`Self::observe_effect_stmt`].
+    pub(crate) fn observe_effect_expr(
+        &mut self,
+        obligation_ids: &BTreeSet<SemanticObligationId>,
+        expr: CExpr,
+    ) -> Result<CExpr, LegacyObservationJournalError> {
+        let mut marked = expr;
+        for id in self.allocate_effect_targets(obligation_ids)? {
+            marked = CExpr::observed(id, marked);
+        }
+        Ok(marked)
+    }
+
     /// Record a value only when the sealed plan proves that no rendered AST
     /// occurrence is allowed for it.
     pub(crate) fn record_nonrendered_value(
@@ -1192,6 +1302,7 @@ impl LegacyObservationJournal {
         let mut values = self.values.clone();
         let mut uses = self.uses.clone();
         let mut writes = self.writes.clone();
+        let mut effect_occurrences = self.effect_occurrences.clone();
         let targets = &self.targets;
         let value_is_literal = &self.value_is_literal;
         let plan = &self.plan;
@@ -1243,6 +1354,15 @@ impl LegacyObservationJournal {
                         record_same(&mut writes[inst.0 as usize], observation)
                             .map_err(|()| LegacyObservationJournalError::ConflictingWrite(inst))
                     }
+                    ObservationTarget::Effect(id) => {
+                        let occurrences = effect_occurrences
+                            .get_mut(&id)
+                            .ok_or(LegacyObservationJournalError::InvalidEffectObligation(id))?;
+                        *occurrences = occurrences
+                            .checked_add(1)
+                            .ok_or(LegacyObservationJournalError::TooManyObservations)?;
+                        Ok(())
+                    }
                 }
             },
         )
@@ -1256,6 +1376,7 @@ impl LegacyObservationJournal {
         self.values = values;
         self.uses = uses;
         self.writes = writes;
+        self.effect_occurrences = effect_occurrences;
         Ok(self.into_sealed_observations(source))
     }
 
@@ -1379,8 +1500,15 @@ impl LegacyObservationJournal {
         source: &SourceOwnedFunctionFacts,
     ) -> SealedLegacyObservations {
         let coverage = self.final_coverage();
+        let effects = SurvivingEffectObservations {
+            occurrences: self.effect_occurrences.clone(),
+        };
         let snapshot = self.into_snapshot(source);
-        SealedLegacyObservations { snapshot, coverage }
+        SealedLegacyObservations {
+            snapshot,
+            coverage,
+            effects,
+        }
     }
 
     fn into_snapshot(self, source: &SourceOwnedFunctionFacts) -> LegacyAnalysisSnapshot {
@@ -1763,6 +1891,56 @@ mod tests {
         )
         .expect("authority-bound journal");
         (source, plan, function, journal)
+    }
+
+    #[test]
+    fn effect_observations_count_only_final_ast_occurrences() {
+        let (source, _plan, mut function, mut journal) = journal_fixture();
+        let obligation = *source
+            .source()
+            .obligations()
+            .obligations()
+            .keys()
+            .next()
+            .expect("fixture has source obligations");
+        let obligations = BTreeSet::from([obligation]);
+
+        let surviving = journal
+            .observe_effect_stmt(&obligations, CStmt::Return(None))
+            .expect("source-owned effect marker");
+        let deleted = journal
+            .observe_effect_stmt(&obligations, CStmt::Empty)
+            .expect("second concrete marker occurrence");
+        function.body.push(surviving);
+        drop(deleted);
+
+        let mut ready = crate::codegen::prepare_function_for_emission(&function);
+        let sealed = journal
+            .seal(&source, &mut ready)
+            .expect("final effect occurrences seal");
+        assert_eq!(sealed.effects().occurrence_count(obligation), Some(1));
+        assert_eq!(sealed.effects().surviving().collect::<Vec<_>>(), [(obligation, 1)]);
+    }
+
+    #[test]
+    fn effect_observations_reject_cells_outside_source_inventory() {
+        let (source, _plan, _function, mut journal) = journal_fixture();
+        let mut obligation = *source
+            .source()
+            .obligations()
+            .obligations()
+            .keys()
+            .next()
+            .expect("fixture has source obligations");
+        obligation.instruction.block_addr ^= 1;
+        let obligations = BTreeSet::from([obligation]);
+
+        assert_eq!(
+            journal.observe_effect_expr(&obligations, CExpr::UIntLit(0)),
+            Err(LegacyObservationJournalError::InvalidEffectObligation(
+                obligation
+            ))
+        );
     }
 
     fn first_bound(plan: &BindingPlan, source: &SourceOwnedFunctionFacts) -> (ValueId, BindingId) {
