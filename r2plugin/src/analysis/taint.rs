@@ -1,5 +1,5 @@
 use crate::blocks::BlockSlice;
-use crate::{R2ILBlock, R2ILContext, SSA_JSON_SCHEMA_VERSION, SSAOpInfo, ssa_op_to_info};
+use crate::{R2ILBlock, R2ILContext, SSAOpInfo, ssa_op_to_info};
 use r2ssa::TaintPolicy;
 use serde::Serialize;
 use std::ffi::CString;
@@ -10,6 +10,12 @@ const R2TAINT_OP_OTHER: u32 = 0;
 const R2TAINT_OP_CALL: u32 = 1;
 const R2TAINT_OP_CALL_IND: u32 = 2;
 const R2TAINT_OP_STORE: u32 = 3;
+
+/// Exact schema for the standalone taint report document.
+///
+/// Nested SSA operations use the shared typed operation shape, but changes to
+/// the SSA document envelope do not version the taint document.
+const TAINT_JSON_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Serialize)]
 struct TaintSourceJson {
@@ -341,7 +347,7 @@ pub(crate) fn r2taint_function_json(
     tainted_vars.sort_by(|a, b| a.var.cmp(&b.var));
 
     let report = TaintReportJson {
-        schema_version: SSA_JSON_SCHEMA_VERSION,
+        schema_version: TAINT_JSON_SCHEMA_VERSION,
         sources,
         sinks,
         sink_hits: collect_taint_sink_hits(&result),
@@ -433,7 +439,7 @@ mod tests {
             src: r2ssa::SSAVar::new("src", 1, 8),
         };
         let value = serde_json::to_value(TaintReportJson {
-            schema_version: SSA_JSON_SCHEMA_VERSION,
+            schema_version: TAINT_JSON_SCHEMA_VERSION,
             sources: Vec::new(),
             sinks: vec![TaintSinkJson {
                 block: 0x1000,
@@ -446,7 +452,8 @@ mod tests {
         })
         .expect("taint JSON");
 
-        assert_eq!(value["schema_version"], SSA_JSON_SCHEMA_VERSION);
+        assert_eq!(value["schema_version"], TAINT_JSON_SCHEMA_VERSION);
+        assert_eq!(value["schema_version"], 1);
         assert!(value["sinks"][0]["op"].get("schema_version").is_none());
     }
 }

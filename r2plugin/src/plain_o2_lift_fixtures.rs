@@ -283,9 +283,13 @@ fn assert_captured_abi_facts(function: &FunctionCapture, ssa: &Value, blocks: &[
         assert!(
             formal_parameters.iter().any(|formal| {
                 formal["parameter"] == parameter_index
-                    && formal["value"]
+                    && formal["value_id"].is_u64()
+                    && formal["value"]["name"]
                         .as_str()
-                        .is_some_and(|value| value.starts_with(&parameter.register))
+                        .is_some_and(|value| value.eq_ignore_ascii_case(&parameter.register))
+                    && formal["value"]["version"].is_u64()
+                    && formal["value"]["size"].is_u64()
+                    && formal["canonical_storage"].is_object()
             }),
             "{} source ABI parameter {} in {} must bind {}",
             function.name,

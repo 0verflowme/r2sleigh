@@ -33,7 +33,7 @@ DISCOVERY_ONE_TARGET = json.dumps(
 )
 VALID_DEC = "int _IOMalloc(void) {\n  return 0;\n}\n"
 VALID_PAYLOAD = {
-    "schema_version": 1,
+    "schema_version": 2,
     "entry": 0x1000,
     "entry_hex": "0x1000",
     "num_blocks": 1,
@@ -162,8 +162,8 @@ class KernelSmokeTests(unittest.TestCase):
 
         invalid_payloads = (
             (without("schema_version"), "missing"),
-            ({**VALID_PAYLOAD, "schema_version": 2}, "future"),
-            ({**VALID_PAYLOAD, "schema_version": "1"}, "wrong type"),
+            ({**VALID_PAYLOAD, "schema_version": 3}, "future"),
+            ({**VALID_PAYLOAD, "schema_version": "2"}, "wrong type"),
         )
         for payload, label in invalid_payloads:
             with self.subTest(label=label):

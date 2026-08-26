@@ -403,7 +403,7 @@ def collect_target(
                     prepared = payload.get("prepared")
                     entry["ssa_report_valid"] = (
                         type(schema_version) is int
-                        and schema_version == 1
+                        and schema_version == 2
                         and type(function_entry) is int
                         and function_entry == addr
                         and entry_hex_addr == addr

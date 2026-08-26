@@ -50,7 +50,7 @@ DISCOVERY = json.dumps(
 
 def ssa_function_report_payload(entry: int = 0x1000) -> dict:
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "entry": entry,
         "entry_hex": f"0x{entry:x}",
         "num_blocks": 1,
@@ -3473,7 +3473,7 @@ class ReversingBenchmarkTests(unittest.TestCase):
         self.assertEqual(
             valid_summary["ssa_function_report_metrics"],
             {
-                "schema_version": 1,
+                "schema_version": 2,
                 "entry": 0x1000,
                 "entry_hex": "0x1000",
                 "num_blocks": 1,
@@ -3532,9 +3532,9 @@ class ReversingBenchmarkTests(unittest.TestCase):
         invalid_payloads = (
             ([], "JSON object"),
             (without_top("schema_version"), "schema version"),
-            (top("schema_version", 2), "schema version"),
+            (top("schema_version", 3), "schema version"),
             (top("schema_version", True), "schema version"),
-            (top("schema_version", "1"), "schema version"),
+            (top("schema_version", "2"), "schema version"),
             (without_top("entry"), "numeric entry"),
             (top("entry", "0x1000"), "numeric entry"),
             (top("entry", True), "numeric entry"),
@@ -3574,7 +3574,7 @@ class ReversingBenchmarkTests(unittest.TestCase):
             (prepared(parameter_addresses={}), "parameter_addresses"),
             (
                 {
-                    "schema_version": 1,
+                    "schema_version": 2,
                     "entry": 0x1000,
                     "entry_hex": "0x1000",
                     "num_blocks": 1,

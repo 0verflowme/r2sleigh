@@ -120,7 +120,7 @@ EOF_EXPECT
 CMDS=<<EOF_CMDS
 wx 4883c001000000000000000000000000
 s 0 >/dev/null
-a:sla.debug.ssa | jq -c '(.schema_version==1) and ([.operations[]|select(.op=="IntAdd")]|length)==1 and ([.operations[]|select(.op=="IntAdd")][0].dst=="RAX_1") and (([.operations[]|select(.op=="IntAdd")][0].sources|index("RAX_0"))!=null)'
+a:sla.debug.ssa | jq -c '(.schema_version==2) and ([.operations[]|select(.op=="IntAdd")]|length)==1 and ([.operations[]|select(.op=="IntAdd")][0].dst=="RAX_1") and (([.operations[]|select(.op=="IntAdd")][0].sources|index("RAX_0"))!=null)'
 EOF_CMDS
 RUN
 
@@ -185,7 +185,7 @@ EOF_EXPECT
 CMDS=<<EOF_CMDS
 s `isq~check_secret[0]` >/dev/null
 af
-a:sla.debug.ssa.func | jq -c --argjson target `?vi $$` --arg target_hex `?v $$` '(.schema_version==1) and (.entry==$target) and (.entry_hex==$target_hex) and has("blocks") and (.blocks|type=="array") and ((.blocks|length)>0) and ((.blocks|map(has("phis"))|all)) and (.prepared|has("formal_parameters") and has("parameter_addresses"))'
+a:sla.debug.ssa.func | jq -c --argjson target `?vi $$` --arg target_hex `?v $$` '(.schema_version==2) and (.entry==$target) and (.entry_hex==$target_hex) and has("blocks") and (.blocks|type=="array") and ((.blocks|length)>0) and ((.blocks|map(has("phis"))|all)) and (.prepared|has("formal_parameters") and has("parameter_addresses"))'
 EOF_CMDS
 RUN
 
