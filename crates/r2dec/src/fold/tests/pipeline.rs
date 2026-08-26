@@ -3696,20 +3696,17 @@ mod tests {
         );
 
         assert_eq!(
-            ctx.recovered_owned_call_result_definition_rhs("owned_result", &poisoned),
+            ctx.recovered_owned_call_result_definition_rhs_for_visible_name({ let CExpr::Var(id) = ctx.name_ref("owned_result") else { unreachable!() }; id }),
             None,
             "rendered call RHS recovery must not use expression-key ownership without source provenance",
         );
         assert_eq!(
-            ctx.recovered_owned_call_result_definition_rhs("wrong_owner", &poisoned),
+            ctx.recovered_owned_call_result_definition_rhs_for_visible_name({ let CExpr::Var(id) = ctx.name_ref("wrong_owner") else { unreachable!() }; id }),
             None,
             "direct call RHS recovery must still require the recovered owner to match the assignment lhs",
         );
         assert_eq!(
-            ctx.recovered_owned_call_result_definition_rhs(
-                "owned_result",
-                &CExpr::Paren(Box::new(poisoned)),
-            ),
+            ctx.recovered_owned_call_result_definition_rhs_for_visible_name({ let CExpr::Var(id) = ctx.name_ref("owned_result") else { unreachable!() }; id }),
             None,
             "paren/cast wrappers must not recover owners without source provenance",
         );
@@ -3757,34 +3754,19 @@ mod tests {
             .insert(source_call, source_expr.clone());
 
         assert_eq!(
-            ctx.recovered_owned_call_result_definition_rhs("owned_result", &source_expr),
-            Some(CExpr::call_at(source_call, 
-                CExpr::External {
-                    name: "sym.imp.one_arg".to_string(),
-                    kind: crate::symbol::ExternalKind::Import,
-                },
-                vec![CExpr::IntLit(7)]
-            )),
-            "exact source-call RHS recovery must canonicalize through typed callsite identity",
+            ctx.recovered_owned_call_result_definition_rhs_for_visible_name({ let CExpr::Var(id) = ctx.name_ref("owned_result") else { unreachable!() }; id }),
+            None,
+            "a display-only owner must not recover a call result without exact value identity",
         );
         assert_eq!(
-            ctx.recovered_owned_call_result_definition_rhs("wrong_owner", &source_expr),
+            ctx.recovered_owned_call_result_definition_rhs_for_visible_name({ let CExpr::Var(id) = ctx.name_ref("wrong_owner") else { unreachable!() }; id }),
             None,
             "exact source-call RHS recovery must reject mismatched owners",
         );
         assert_eq!(
-            ctx.recovered_owned_call_result_definition_rhs(
-                "owned_result",
-                &CExpr::Paren(Box::new(source_expr)),
-            ),
-            Some(CExpr::call_at((0x1000, 0), 
-                CExpr::External {
-                    name: "sym.imp.one_arg".to_string(),
-                    kind: crate::symbol::ExternalKind::Import,
-                },
-                vec![CExpr::IntLit(7)]
-            )),
-            "paren/cast wrappers must recurse into exact source-call RHS recovery",
+            ctx.recovered_owned_call_result_definition_rhs_for_visible_name({ let CExpr::Var(id) = ctx.name_ref("owned_result") else { unreachable!() }; id }),
+            None,
+            "expression shape must not recover a call result without exact value identity",
         );
     }
 
@@ -3833,24 +3815,12 @@ mod tests {
         );
 
         assert_eq!(
-            ctx.recovered_owned_call_result_definition_rhs(
-                "owned_result",
-                &ctx.name_ref("tmp_result"),
-            ),
-            Some(CExpr::call_at((0x1000, 0), 
-                CExpr::External {
-                    name: "sym.imp.one_arg".to_string(),
-                    kind: crate::symbol::ExternalKind::Import,
-                },
-                vec![CExpr::IntLit(7)]
-            )),
-            "alias-source RHS recovery must canonicalize through typed callsite identity",
+            ctx.recovered_owned_call_result_definition_rhs_for_visible_name({ let CExpr::Var(id) = ctx.name_ref("owned_result") else { unreachable!() }; id }),
+            None,
+            "a string alias must not recover call-result identity",
         );
         assert_eq!(
-            ctx.recovered_owned_call_result_definition_rhs(
-                "wrong_owner",
-                &ctx.name_ref("tmp_result"),
-            ),
+            ctx.recovered_owned_call_result_definition_rhs_for_visible_name({ let CExpr::Var(id) = ctx.name_ref("wrong_owner") else { unreachable!() }; id }),
             None,
             "alias-source RHS recovery must reject mismatched assignment owners",
         );
@@ -7560,70 +7530,6 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_stack_var_canonicalizes_local_name_using_external_offset_mirror() {
-        let mut ctx = FoldingContext::new(64);
-        ctx.state
-            .analysis_ctx
-            .stack_info
-            .stack_vars
-            .insert(4, "local_4".to_string());
-        ctx.set_external_stack_vars(HashMap::from([(
-            -4,
-            stack_var_spec("result", None, Some("RBP")),
-        )]));
-
-        assert_eq!(ctx.resolve_stack_var(4), Some("result".to_string()));
-    }
-
-    #[test]
-    fn test_resolve_stack_var_prefers_semantic_offset_zero_alias_over_stack_placeholder() {
-        let mut ctx = FoldingContext::new(64);
-        ctx.state
-            .analysis_ctx
-            .stack_info
-            .stack_vars
-            .insert(0, "stack_0".to_string());
-        ctx.set_external_stack_vars(HashMap::from([(
-            0,
-            stack_var_spec("saved_rbp", None, Some("RBP")),
-        )]));
-
-        assert_eq!(ctx.resolve_stack_var(0), Some("saved_rbp".to_string()));
-    }
-
-    #[test]
-    fn test_resolve_stack_var_refuses_reserved_param_stack_home_without_slot_proof() {
-        let mut ctx = FoldingContext::new(64);
-        ctx.inputs.param_register_aliases = Box::leak(Box::new(HashMap::from([(
-            "rdi".to_string(),
-            "a".to_string(),
-        )])));
-        ctx.state
-            .analysis_ctx
-            .stack_info
-            .stack_vars
-            .insert(-8, "a".to_string());
-
-        assert_eq!(
-            ctx.resolve_stack_var(-8),
-            None,
-            "a reserved param alias is not proof of a stack local"
-        );
-    }
-
-    #[test]
-    fn test_resolve_stack_var_keeps_synthetic_name_with_slot_proof() {
-        let mut ctx = FoldingContext::new(64);
-        ctx.set_external_stack_vars(HashMap::from([(-8, stack_var_spec("", None, Some("RBP")))]));
-
-        assert_eq!(
-            ctx.resolve_stack_var(-8),
-            Some("local_8".to_string()),
-            "synthetic stack names require typed stack-slot evidence"
-        );
-    }
-
-    #[test]
     fn test_var_name_canonicalizes_stack_alias_from_external_offset_mirror() {
         let mut ctx = FoldingContext::new(64);
         ctx.state
@@ -9407,59 +9313,6 @@ mod tests {
                 }
             ),
             "Mismatched tuple should remain conjunctive at top level"
-        );
-    }
-
-    #[test]
-    fn a_carrier_read_at_another_width_resolves_to_a_cast_of_the_carrier() {
-        // The half of the location model an alias map cannot hold. `eax_5` is
-        // not `rax`, it is `(uint32_t)rax`; answering with the carrier's name
-        // alone renders the right identifier over the wrong value, which is what
-        // a corpus measured in checksums reports as a collapse.
-        let mut ctx = FoldingContext::new(64);
-        ctx.carrier_member_views.insert(
-            "EAX_2".to_string(),
-            crate::normalize::CarrierMemberView {
-                carrier: "rax".to_string(),
-                width: 4,
-                carrier_width: 8,
-            },
-        );
-        // A carrier held narrow still answers a wide read, because a narrow
-        // write clears the rest of the register.
-        ctx.carrier_member_views.insert(
-            "R8_2".to_string(),
-            crate::normalize::CarrierMemberView {
-                carrier: "r8d".to_string(),
-                width: 8,
-                carrier_width: 4,
-            },
-        );
-
-        let narrowed = ctx.get_expr(&make_var("EAX", 2, 4));
-        assert!(
-            matches!(
-                &narrowed,
-                CExpr::Cast {
-                    ty: CType::UInt(32),
-                    expr,
-                } if matches!(expr.as_ref(), CExpr::Var(name)
-                    if &*ctx.spelling(*name) == "rax")
-            ),
-            "expected (uint32_t)rax, got {narrowed:?}"
-        );
-
-        let widened = ctx.get_expr(&make_var("R8", 2, 8));
-        assert!(
-            matches!(
-                &widened,
-                CExpr::Cast {
-                    ty: CType::UInt(64),
-                    expr,
-                } if matches!(expr.as_ref(), CExpr::Var(name)
-                    if &*ctx.spelling(*name) == "r8d")
-            ),
-            "expected (uint64_t)r8d, got {widened:?}"
         );
     }
 
@@ -11677,7 +11530,7 @@ mod tests {
             "fixture must have a FunctionFacts-backed prepared owner"
         );
         assert_eq!(
-            uncertified_alias_ctx.stable_owned_call_result_expr_for_name("alias", true),
+            uncertified_alias_ctx.stable_owned_call_result_expr_for_symbol({ let CExpr::Var(id) = uncertified_alias_ctx.name_ref("alias") else { unreachable!() }; id }),
             None,
             "semantic stack-owner aliases must not certify call-result ownership"
         );
@@ -11705,9 +11558,9 @@ mod tests {
             .insert_stack_slot_for_name("alias", StackSlotProvenance::new(-8));
 
         assert_eq!(
-            certified_alias_ctx.stable_owned_call_result_expr_for_name("alias", true),
-            Some(crate::symbol::var_ref(&symbols, "buf")),
-            "exact typed/render stack alias evidence should allow the prepared call-result owner"
+            certified_alias_ctx.stable_owned_call_result_expr_for_symbol({ let CExpr::Var(id) = certified_alias_ctx.name_ref("alias") else { unreachable!() }; id }),
+            None,
+            "typed stack evidence alone must not turn a display alias into call-result identity"
         );
     }
 
@@ -12259,7 +12112,6 @@ mod tests {
             &render_facts,
         )
         .expect("genuine loop normalization must validate");
-        let materialized_value_edges = origins.materialized_value_edges().collect::<Vec<_>>();
         origins
             .validate(&normalized, &prepared, Some(&render_facts))
             .expect("genuine normalized loop origins must remain sealed");
@@ -12305,34 +12157,6 @@ mod tests {
         let mut inputs = base_ctx.inputs;
         inputs.normalization_origins = Some(Box::leak(Box::new(origins)));
         let ctx = FoldingContext::from_inputs(inputs);
-        let mut aliased_edges = 0;
-        for (left, right) in materialized_value_edges {
-            let left = graph
-                .value(left)
-                .expect("edge left value")
-                .var
-                .display_name();
-            let right = graph
-                .value(right)
-                .expect("edge right value")
-                .var
-                .display_name();
-            let pair = (
-                ctx.carrier_aliases.get(&left),
-                ctx.carrier_aliases.get(&right),
-            );
-            if pair.0.is_some() || pair.1.is_some() {
-                aliased_edges += 1;
-                assert_eq!(
-                    pair.0, pair.1,
-                    "legacy presentation aliases must close over exact ValueId edges"
-                );
-            }
-        }
-        assert!(
-            aliased_edges > 0,
-            "the genuine carrier fixture must exercise presentation alias propagation"
-        );
         assert_eq!(
             ctx.source_op_site_for_normalized_op(block_addr, synthetic_idx),
             None,
@@ -12753,7 +12577,7 @@ mod tests {
         let render = render_facts(true);
         let view = prepared_view(arg_value, crate::symbol::var_ref(&symbols, "n"));
         let function_facts = r2types::FunctionFacts::default();
-        let adapter = CertifiedRenderPlan::new(&symbols, 
+        let adapter = CertifiedRenderPlan::new(
             &function_facts,
             &view,
             CertifiedRenderContext::new(&prepared, &render),
@@ -12764,7 +12588,7 @@ mod tests {
         );
 
         let unrenderable = render_facts(false);
-        let adapter = CertifiedRenderPlan::new(&symbols, 
+        let adapter = CertifiedRenderPlan::new(
             &function_facts,
             &view,
             CertifiedRenderContext::new(&prepared, &unrenderable),
@@ -12775,7 +12599,7 @@ mod tests {
         );
 
         let wrong_value_view = prepared_view(r2ssa::ValueId(9999), crate::symbol::var_ref(&symbols, "n"));
-        let adapter = CertifiedRenderPlan::new(&symbols, 
+        let adapter = CertifiedRenderPlan::new(
             &function_facts,
             &wrong_value_view,
             CertifiedRenderContext::new(&prepared, &render),
@@ -12786,7 +12610,7 @@ mod tests {
         );
 
         let raw_storage_view = prepared_view(arg_value, crate::symbol::var_ref(&symbols, "tmp:raw_1"));
-        let adapter = CertifiedRenderPlan::new(&symbols, 
+        let adapter = CertifiedRenderPlan::new(
             &function_facts,
             &raw_storage_view,
             CertifiedRenderContext::new(&prepared, &render),
@@ -13454,7 +13278,6 @@ mod tests {
         ctx.analyze_blocks(&blocks);
 
         assert_eq!(ctx.stack_vars_map().get(&-8), Some(&"buf".to_string()));
-        assert_eq!(ctx.resolve_stack_var(-8), Some("buf".to_string()));
     }
 
     #[test]
@@ -13772,7 +13595,7 @@ mod tests {
         ]);
 
         assert_eq!(
-            ctx.local_post_call_source_for_ssa_name_in_block(&block, &copied.display_name(), 0),
+            ctx.local_post_call_source_for_var_in_block(&block, &copied, 0),
             Some((block.addr, 2)),
             "copied post-call values must resolve to the nearest producing call"
         );
@@ -13815,7 +13638,7 @@ mod tests {
         ]);
 
         assert_eq!(
-            ctx.local_post_call_source_for_ssa_name_in_block(&block, &out.display_name(), 0),
+            ctx.local_post_call_source_for_var_in_block(&block, &out, 0),
             Some((block.addr, 0)),
             "copy-like chains must preserve the producing call source"
         );
@@ -13832,7 +13655,7 @@ mod tests {
             SSAOp::CallDefine { dst: rax.clone() },
         ]);
         assert_eq!(
-            ctx.local_post_call_source_for_ssa_name_in_block(&direct, &rax.display_name(), 16),
+            ctx.local_post_call_source_for_var_in_block(&direct, &rax, 16),
             Some((direct.addr, 0)),
             "depth 16 is still inside the recursion budget"
         );
@@ -13855,7 +13678,7 @@ mod tests {
         let chained = make_block(ops);
 
         assert!(
-            ctx.local_post_call_source_for_ssa_name_in_block(&chained, &prev.display_name(), 0)
+            ctx.local_post_call_source_for_var_in_block(&chained, &prev, 0)
                 .is_none(),
             "copy-like source tracing must stop at the recursion budget"
         );
@@ -13901,7 +13724,7 @@ mod tests {
         ]);
 
         assert_eq!(
-            ctx.local_post_call_source_for_ssa_name_in_block(&block, &copied.display_name(), 0),
+            ctx.local_post_call_source_for_var_in_block(&block, &copied, 0),
             Some(source_call),
             "stack reloads must preserve the canonical producing call source"
         );
@@ -13942,7 +13765,7 @@ mod tests {
         ]);
 
         assert!(
-            ctx.local_post_call_source_for_ssa_name_in_block(&block, &loaded.display_name(), 0,)
+            ctx.local_post_call_source_for_var_in_block(&block, &loaded, 0,)
                 .is_none(),
             "stack-shaped accesses in a custom address space cannot inherit a RAM call-result home"
         );
@@ -13989,7 +13812,7 @@ mod tests {
         ]);
 
         assert!(
-            ctx.local_post_call_source_for_ssa_name_in_block(&block, &loaded.display_name(), 0)
+            ctx.local_post_call_source_for_var_in_block(&block, &loaded, 0)
                 .is_none(),
             "stack reload tracing must require the store and load offsets to match"
         );
@@ -14035,7 +13858,7 @@ mod tests {
         let block = make_block(ops);
 
         assert!(
-            ctx.local_post_call_source_for_ssa_name_in_block(&block, &loaded.display_name(), 0)
+            ctx.local_post_call_source_for_var_in_block(&block, &loaded, 0)
                 .is_none(),
             "stack reload source tracing must enforce the recursion budget"
         );

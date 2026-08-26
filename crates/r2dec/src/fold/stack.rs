@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use r2ssa::{ObjectId, ObjectKind, SSAOp, SSAVar};
+use r2ssa::{ObjectId, ObjectKind, SSAOp, SSAVar, SourceStackSlotRole};
 use r2types::{
     ExternalStackBase, ExternalStackSlotRole, ExternalStackSlotSpec, StackSlotKey, VisibleBinding,
     VisibleBindingKind,
@@ -38,21 +38,7 @@ const LIKELY_NEGATIVE_THRESHOLD: u64 = 0xffffffffffff0000;
 impl<'a> FoldingContext<'a> {
     fn preferred_prepared_stack_alias_name(&self, alias: &StackAliasView) -> Option<String> {
         let visible = alias.visible_name.trim();
-        alias
-            .arg_alias
-            .as_ref()
-            .filter(|arg_alias| {
-                !arg_alias.is_empty()
-                    && (visible.is_empty()
-                        || visible.ends_with("_home")
-                        || visible.starts_with("var_")
-                        || visible.starts_with("local_")
-                        || visible.starts_with("stack_")
-                        || visible.starts_with("arg_"))
-            })
-            .cloned()
-            .or_else(|| (!visible.is_empty()).then(|| visible.to_string()))
-            .or_else(|| alias.arg_alias.clone())
+        (!visible.is_empty()).then(|| visible.to_string())
     }
 
     fn prepared_stack_alias_view(&self) -> Option<&crate::analysis::PreparedSemanticView> {
@@ -171,14 +157,6 @@ impl<'a> FoldingContext<'a> {
         matches!(slot.base, ExternalStackBase::FramePointer) && -slot.offset == offset
     }
 
-    fn has_typed_stack_slot_for_offset(&self, offset: i64) -> bool {
-        self.inputs
-            .stack_slots
-            .keys()
-            .any(|slot_key| Self::stack_slot_matches_offset(slot_key, offset))
-            || self.stack_slots().any(|slot| slot.offset == offset)
-    }
-
     fn visible_stack_binding_for_offset(&self, offset: i64) -> Option<&VisibleBinding> {
         self.inputs.visible_bindings.iter().find(|binding| {
             binding
@@ -188,66 +166,26 @@ impl<'a> FoldingContext<'a> {
         })
     }
 
-    fn certified_stack_owner_candidate_names(&self, offset: i64) -> Vec<String> {
-        let prepared_alias = self
-            .prepared_stack_alias_view()
-            .and_then(|view| view.stack_alias_for_offset(offset))
-            .and_then(|alias| self.preferred_prepared_stack_alias_name(alias));
-        let mut names: Vec<String> = prepared_alias.into_iter().collect();
-        names.extend(
-            self.inputs
-                .visible_bindings
-                .iter()
-                .filter(move |binding| {
-                    matches!(
-                        binding.kind,
-                        VisibleBindingKind::Param
-                            | VisibleBindingKind::Local
-                            | VisibleBindingKind::StackObject
-                    ) && binding
-                        .stack_slot
-                        .as_ref()
-                        .is_some_and(|slot| Self::stack_slot_matches_offset(slot, offset))
-                })
-                .map(|binding| binding.name.trim().to_string()),
-        );
-        names.extend(
-            self.inputs
-                .stack_slots
-                .iter()
-                .filter(move |(slot_key, slot)| {
-                    matches!(
-                        slot.role,
-                        ExternalStackSlotRole::Local | ExternalStackSlotRole::StackArg
-                    ) && Self::stack_slot_matches_offset(slot_key, offset)
-                })
-                .map(|(_, slot)| slot.name.trim().to_string()),
-        );
-        names
-    }
-
-    pub(super) fn certified_stack_var_name_for_object_offset(
+    pub(super) fn certified_stack_var_expr_for_object(
         &self,
         object: ObjectId,
-        offset: i64,
-    ) -> Option<String> {
-        let function_facts = self.inputs.function_facts;
-        self.certified_stack_owner_candidate_names(offset)
-            .into_iter()
-            .filter(|name| {
-                !name.is_empty()
-                    && !self.is_reserved_param_alias_name(name)
-                    && !super::op_lower::is_generic_stack_placeholder_alias(name)
-            })
-            .find(|name| {
-                function_facts
-                    .authorized_stack_slot_owner_render(object, offset, name)
-                    .or_else(|| {
-                        function_facts
-                            .authorized_recovered_stack_slot_owner_render(object, offset, name)
-                    })
-                    .is_some()
-            })
+    ) -> Option<CExpr> {
+        let names = self.inputs.binding_names?;
+        match names.require_stack(object) {
+            Ok(crate::binding_plan::PlannedStackSymbol::Bound(symbol)) => {
+                Some(CExpr::Var(symbol))
+            }
+            Ok(
+                crate::binding_plan::PlannedStackSymbol::Refused(_)
+                | crate::binding_plan::PlannedStackSymbol::Absent,
+            ) => unreachable!("require_stack cannot return absent or refused"),
+            Err(_) => {
+                self.retain_first_lowering_refusal(
+                    super::op_lower::OpLoweringRefusal::MissingProgramVariableAuthorization,
+                );
+                None
+            }
+        }
     }
 
     pub(super) fn is_reserved_param_alias_name(&self, name: &str) -> bool {
@@ -398,11 +336,6 @@ impl<'a> FoldingContext<'a> {
 
     pub(super) fn arg_alias_for_rendered_name(&self, name: &str) -> Option<String> {
         let lower = name.to_lowercase();
-        // A carrier holds whatever the loop last put there, so it is never an
-        // argument, even though it is spelled bare like an entry value is.
-        if self.is_carrier_rendered_name(&lower) {
-            return None;
-        }
         if let Some((base, version)) = lower.rsplit_once('_') {
             if version != "0" {
                 return None;
@@ -429,13 +362,26 @@ impl<'a> FoldingContext<'a> {
         if src.version == 0 {
             return false;
         }
-        let (Some(dst_carrier), Some(src_carrier)) = (
-            self.carrier_aliases.get(&dst.display_name()),
-            self.carrier_aliases.get(&src.display_name()),
+        let (Some(dst_value), Some(src_value), Some(names), Some(render)) = (
+            self.prepared_value_id_for_var(dst),
+            self.prepared_value_id_for_var(src),
+            self.inputs.binding_names,
+            self.inputs.render_facts(),
         ) else {
             return false;
         };
-        dst_carrier == src_carrier
+        if render.loop_carrier_for_value(dst_value).is_none()
+            || render.loop_carrier_for_value(src_value).is_none()
+        {
+            return false;
+        }
+        matches!(
+            (names.require_value(dst_value), names.require_value(src_value)),
+            (
+                Ok(crate::binding_plan::PlannedValueSymbol::Bound(dst_symbol)),
+                Ok(crate::binding_plan::PlannedValueSymbol::Bound(src_symbol)),
+            ) if dst_symbol == src_symbol
+        )
     }
 
     pub(super) fn is_entry_arg_alias_copy(&self, dst: &SSAVar, src: &SSAVar) -> bool {
@@ -451,23 +397,47 @@ impl<'a> FoldingContext<'a> {
     }
 
     pub(super) fn is_entry_arg_alias_store(&self, addr: &SSAVar, val: &SSAVar) -> bool {
-        let entry_arg_alias = utils::arg_alias_for_store_source(
-            val,
-            |name| self.copy_source_of(name),
-            self.var_aliases_map(),
-            self.inputs.param_register_aliases,
-        )
-        .or_else(|| {
-            self.lookup_definition_raw(&val.display_name())
-                .and_then(|expr| self.arg_alias_for_expr(&expr))
-        });
-        if entry_arg_alias.is_none() {
-            return false;
-        }
-        self.stack_slot_provenance_for_var(addr)
-            .map(|slot| slot.offset)
-            .or_else(|| self.extract_stack_offset_from_var(addr))
-            .is_some()
+        let prepared = match self.inputs.prepared_ssa {
+            Some(prepared) => prepared,
+            None => return false,
+        };
+        let object = match prepared.object_for_var(addr, r2il::SpaceId::Ram) {
+            Some(object) => object,
+            None => return false,
+        };
+        let (base, offset) = match prepared.objects().object(object).map(|fact| fact.kind) {
+            Some(ObjectKind::StackSlot { base, offset, .. })
+            | Some(ObjectKind::FrameObject { base, offset, .. }) => (base, offset),
+            _ => return false,
+        };
+        let value = match prepared.graph().value_id_for_var(val) {
+            Some(value) => value,
+            None => return false,
+        };
+        let parameter_slot = match self
+            .inputs
+            .function_facts
+            .render()
+            .and_then(|render| render.exact_parameter_slot_for_value(value))
+        {
+            Some(slot) => slot,
+            None => return false,
+        };
+        prepared
+            .machine_context()
+            .function_interface()
+            .is_some_and(|interface| {
+                let mut matching = interface.stack_slots().iter().filter(|slot| {
+                    slot.base() == base
+                        && slot.offset() == offset
+                        && matches!(
+                            slot.role(),
+                            SourceStackSlotRole::ParameterHome { parameter_index, .. }
+                                if parameter_index == parameter_slot
+                        )
+                });
+                matching.next().is_some() && matching.next().is_none()
+            })
     }
 
     pub(super) fn arg_alias_for_expr(&self, expr: &CExpr) -> Option<String> {
@@ -537,7 +507,7 @@ impl<'a> FoldingContext<'a> {
         }
 
         if let Some(offset) = self.extract_offset_from_expr(addr_expr) {
-            return self.resolve_stack_var(offset);
+            return self.refuse_missing_stack_object_origin(offset);
         }
         None
     }
@@ -547,6 +517,12 @@ impl<'a> FoldingContext<'a> {
         expr: &CExpr,
         depth: u32,
     ) -> Option<String> {
+        // Shape-derived aliases are a legacy presentation aid. Once a sealed
+        // binding plan owns program-variable identity, only an ObjectId may
+        // authorize a stack symbol.
+        if self.inputs.binding_names.is_some() {
+            return None;
+        }
         if depth > MAX_STACK_ALIAS_DEPTH {
             return None;
         }
@@ -562,12 +538,12 @@ impl<'a> FoldingContext<'a> {
                 }
                 if let Some(offset) = self.bound_stack_name_offset(&self.spelling(*name)) {
                     return self
-                        .resolve_stack_var(offset)
+                        .refuse_missing_stack_object_origin(offset)
                         .or_else(|| Some(self.spelling(*name).to_string()));
                 }
                 let parsed_offset = Self::autogenerated_stack_name_offset(&self.spelling(*name));
                 if let Some(offset) = parsed_offset
-                    && let Some(alias) = self.resolve_stack_var(offset)
+                    && let Some(alias) = self.refuse_missing_stack_object_origin(offset)
                 {
                     return Some(alias);
                 }
@@ -583,34 +559,22 @@ impl<'a> FoldingContext<'a> {
             _ => None,
         }
     }
-    pub(crate) fn stack_var_for_addr_var(&self, addr: &SSAVar) -> Option<String> {
-        if let Some(expr) = self
-            .prepared_stack_alias_view()
-            .and_then(|view| view.owner_expr_for_var(addr))
-        {
-            match expr.unobserved() {
-                CExpr::Var(name) => return Some(self.spelling(*name).to_string()),
-                CExpr::AddrOf(inner) => {
-                    if let CExpr::Var(name) = inner.unobserved() {
-                        return Some(self.spelling(*name).to_string());
-                    }
-                }
-                _ => {}
-            }
+    pub(crate) fn stack_var_expr_for_addr_var(&self, addr: &SSAVar) -> Option<CExpr> {
+        let prepared = self.inputs.prepared_ssa?;
+        let object = prepared
+            .object_for_var(addr, r2il::SpaceId::Ram)
+            .or_else(|| {
+                self.prepared_canonical_value_root(addr)
+                    .and_then(|root| prepared.object_for_var(&root, r2il::SpaceId::Ram))
+            })?;
+        let fact = prepared.objects().object(object)?;
+        if !matches!(
+            fact.kind,
+            ObjectKind::StackSlot { .. } | ObjectKind::FrameObject { .. }
+        ) {
+            return None;
         }
-        let addr_key = addr.display_name();
-        if let Some(alias) =
-            self.resolve_stack_alias_from_addr_expr(&self.name_ref(&addr_key.clone()), 0)
-        {
-            return Some(alias);
-        }
-        if let Some(alias) =
-            self.resolve_stack_alias_from_addr_expr(&self.name_ref(&self.var_name(addr)), 0)
-        {
-            return Some(alias);
-        }
-        self.extract_stack_offset_from_var(addr)
-            .and_then(|offset| self.resolve_stack_var(offset))
+        self.certified_stack_var_expr_for_object(object)
     }
 
     pub(super) fn external_stack_name_for_offset(&self, offset: i64) -> Option<String> {
@@ -776,45 +740,14 @@ impl<'a> FoldingContext<'a> {
         utils::is_temporary_name(&addr.name) && self.stack_slot_offset_for_var(addr).is_some()
     }
 
-    pub fn resolve_stack_var(&self, offset: i64) -> Option<String> {
-        if let Some(alias_name) = self
-            .prepared_stack_alias_view()
-            .and_then(|view| view.stack_alias_for_offset(offset))
-            .and_then(|alias| self.preferred_prepared_stack_alias_name(alias))
-        {
-            return Some(alias_name);
+    pub(crate) fn refuse_missing_stack_object_origin(&self, offset: i64) -> Option<String> {
+        let _ = crate::binding_plan::RenderedIdentityRefusal::MissingStackObjectOrigin { offset };
+        if self.inputs.binding_names.is_some() {
+            self.retain_first_lowering_refusal(
+                super::op_lower::OpLoweringRefusal::MissingProgramVariableAuthorization,
+            );
         }
-        let external_name = self.external_stack_name_for_offset(offset);
-        let resolved = self
-            .stack_vars_map()
-            .get(&offset)
-            .cloned()
-            .map(|name| self.canonicalize_stack_name(&name).unwrap_or(name))
-            .map(|name| {
-                if (name == "saved_fp"
-                    || name.starts_with("local_")
-                    || name.starts_with("stack_")
-                    || name.starts_with("arg_"))
-                    && external_name.is_some()
-                {
-                    external_name.clone().unwrap()
-                } else {
-                    name
-                }
-            })
-            .or_else(|| external_name.clone())
-            .or_else(|| {
-                self.has_typed_stack_slot_for_offset(offset)
-                    .then(|| Self::stack_synthetic_name(offset))
-            });
-        resolved.and_then(|name| {
-            if self.is_reserved_param_alias_name(&name) {
-                self.has_typed_stack_slot_for_offset(offset)
-                    .then(|| Self::stack_synthetic_name(offset))
-            } else {
-                Some(name)
-            }
-        })
+        None
     }
 
     pub(super) fn rewrite_stack_expr(&self, expr: CExpr) -> CExpr {
@@ -1077,44 +1010,6 @@ mod observation_transparency_tests {
         assert_eq!(ctx.extract_offset_from_expr(&address), Some(-8));
         let stripped = validate_and_strip_expr(address, &owner);
         assert_eq!(ctx.extract_offset_from_expr(&stripped), Some(-8));
-    }
-
-    #[test]
-    fn stack_alias_rewrite_leaves_eliminated_address_markers_unaccounted() {
-        let mut ctx = FoldingContext::new(64);
-        ctx.state
-            .analysis_ctx
-            .stack_info
-            .stack_vars
-            .insert(-8, "value".to_string());
-        let mut owner = RenderObservationOwner::new();
-        let address = marked_stack_address(&ctx, &mut owner);
-        assert_eq!(ctx.extract_offset_from_expr(&address), Some(-8));
-        assert_eq!(ctx.resolve_stack_var(-8), Some("value".to_string()));
-        assert_eq!(
-            ctx.resolve_stack_alias_from_addr_expr(&address, 0),
-            Some("value".to_string())
-        );
-        let rewritten_address = ctx.rewrite_stack_expr(address.clone());
-        assert!(
-            rewritten_address.transparently_eq(&ctx.name_ref("value")),
-            "unexpected address rewrite: {rewritten_address:?}"
-        );
-        let rewritten = ctx.rewrite_stack_expr(CExpr::Deref(Box::new(address)));
-
-        assert!(
-            rewritten.transparently_eq(&ctx.name_ref("value")),
-            "unexpected stack rewrite: {rewritten:?}"
-        );
-        let mut function = CFunction::new("stack_alias", CType::Void)
-            .with_body(vec![CStmt::Expr(rewritten)]);
-        let reachable = strip_render_observations(&mut function, owner.expected_count())
-            .expect("stack alias rewrite preserves a valid marker domain");
-        assert_eq!(reachable.ids().count(), 0);
-        assert_eq!(
-            function.body,
-            vec![CStmt::Expr(ctx.name_ref("value"))]
-        );
     }
 
     #[test]

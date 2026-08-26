@@ -62,8 +62,8 @@ impl<'a> FoldingContext<'a> {
 
         match expr {
             CExpr::Var(name) => self
-                .call_result_source_for_ssa_name(&self.spelling(name))
-                .or_else(|| self.local_post_call_source_for_ssa_name(&self.spelling(name)))
+                .call_result_source_for_symbol(name)
+                .or_else(|| self.local_post_call_source_for_symbol(name))
                 .and_then(|source| self.predicate_owned_call_result_expr_for_source(source))
                 .unwrap_or(CExpr::Var(name)),
             CExpr::Deref(inner)
@@ -476,15 +476,13 @@ impl<'a> FoldingContext<'a> {
             };
             if let Some(fact) = comparison {
                 eprintln!(
-                    "PREDCMP block={:#x} kind={:?} lhs={:?}({}) rhs={:?}({}) alias_lhs={:?} alias_rhs={:?}",
+                    "PREDCMP block={:#x} kind={:?} lhs={:?}({}) rhs={:?}({})",
                     block.addr,
                     fact.kind,
                     fact.lhs,
                     var_of(fact.lhs),
                     fact.rhs,
                     var_of(fact.rhs),
-                    self.carrier_aliases.get(&var_of(fact.lhs)),
-                    self.carrier_aliases.get(&var_of(fact.rhs)),
                 );
             }
         }
@@ -597,11 +595,6 @@ impl<'a> FoldingContext<'a> {
         }
         let lower = name.to_ascii_lowercase();
         if let Some(expr) = self.predicate_exprs_map().get(&lower) {
-            return Some(expr.clone());
-        }
-        if let Some(ssa_name) = self.find_ssa_name_for_rendered_alias(name)
-            && let Some(expr) = self.predicate_exprs_map().get(&ssa_name)
-        {
             return Some(expr.clone());
         }
         None
@@ -829,9 +822,10 @@ impl<'a> FoldingContext<'a> {
         // runs. The guard before a loop compares exactly that, and naming it after
         // the carrier put `if (x1 == 0)` above the line that assigns `x1`.
         if var.version != 0
-            && let Some(name) = self.carrier_aliases.get(&var.display_name())
+            && let Some(value) = self.prepared_value_id_for_var(var)
+            && let Some(expr) = self.certified_loop_carrier_expr_for_value(value)
         {
-            return crate::symbol::var_ref(symbols, name);
+            return expr;
         }
         let original_name = var.display_name();
         let rooted_name = rooted.display_name();
@@ -863,7 +857,7 @@ impl<'a> FoldingContext<'a> {
                 .stack_slot_provenance_for_name(&candidate_name)
                 .filter(|slot| slot.is_scalar_predicate_carrier())
                 .map(|slot| slot.offset)
-                .and_then(|offset| self.resolve_stack_var(offset))
+                .and_then(|offset| self.refuse_missing_stack_object_origin(offset))
                 .filter(|alias| {
                     !self.is_low_signal_visible_name(alias)
                         && !self.is_transient_visible_name(alias)
@@ -872,7 +866,7 @@ impl<'a> FoldingContext<'a> {
                 best = self.choose_preferred_scalar_predicate_expr(best, Some(self.name_ref(&alias)));
             }
             if let Some(call_result_candidate) =
-                self.predicate_owned_call_result_expr_for_name(&candidate_name)
+                self.predicate_owned_call_result_expr_for_var(candidate)
             {
                 best =
                     self.choose_preferred_scalar_predicate_expr(best, Some(call_result_candidate));
@@ -883,7 +877,7 @@ impl<'a> FoldingContext<'a> {
                 self.stack_slot_provenance_for_name(&candidate_name)
                     .map(|slot| slot.offset)
                     .or_else(|| self.extract_stack_offset_from_var(candidate))
-                    .and_then(|offset| self.resolve_stack_var(offset))
+                    .and_then(|offset| self.refuse_missing_stack_object_origin(offset))
                     .filter(|name| {
                         !self.is_low_signal_visible_name(name)
                             && !self.is_transient_visible_name(name)
@@ -1168,10 +1162,9 @@ impl<'a> FoldingContext<'a> {
         }
 
         if var.version != 0 {
-            let var_name = var.display_name();
             if let Some(source) = self
-                .call_result_source_for_ssa_name(&var_name)
-                .or_else(|| self.local_post_call_source_for_ssa_name_in_block(block, &var_name, 0))
+                .call_result_source_for_var(var)
+                .or_else(|| self.local_post_call_source_for_var_in_block(block, var, 0))
             {
                 return self.predicate_owned_call_result_expr_for_source(source);
             }
@@ -1618,7 +1611,7 @@ impl<'a> FoldingContext<'a> {
         if let Some(alias) = self
             .stack_slot_provenance_for_name(&name)
             .map(|slot| slot.offset)
-            .and_then(|offset| self.resolve_stack_var(offset))
+            .and_then(|offset| self.refuse_missing_stack_object_origin(offset))
             .filter(|alias| !alias.eq_ignore_ascii_case(&name))
         {
             return self.name_ref(&alias);
@@ -2431,12 +2424,12 @@ impl<'a> FoldingContext<'a> {
                 if let Some(alias) = self.arg_alias_for_rendered_name(&self.spelling(*name)) {
                     return self.name_ref(&alias);
                 }
-                if let Some(owner) = self.predicate_owned_call_result_expr_for_name(&self.spelling(*name)) {
+                if let Some(owner) = self.predicate_owned_call_result_expr_for_symbol(*name) {
                     return owner;
                 }
                 if self
-                    .call_result_source_for_ssa_name(&self.spelling(*name))
-                    .or_else(|| self.local_post_call_source_for_ssa_name(&self.spelling(*name)))
+                    .call_result_source_for_symbol(*name)
+                    .or_else(|| self.local_post_call_source_for_symbol(*name))
                     .is_some()
                 {
                     return CExpr::Var(name.clone());
@@ -3320,7 +3313,6 @@ impl<'a> FoldingContext<'a> {
         let display = var.display_name();
         if self.stack_slot_offset_for_var(var).is_none()
             && self.var_aliases_map().get(&display).is_none()
-            && self.carrier_aliases.get(&display).is_none()
             && self.parse_expr_from_name(&display).is_none()
         {
             return self.var_ref(var);
@@ -3332,14 +3324,10 @@ impl<'a> FoldingContext<'a> {
         if let Some(parsed) = self.parse_expr_from_name(name) {
             return parsed;
         }
-        // An origin is an SSA display name. If something already minted an
-        // identifier to render that value, this is the same value and takes the
-        // same identifier; minting a second one from the raw string is how
-        // `tmp:4700_7` came to be spelled `t4700_7` in a statement and
-        // `tmp_4700_7` in a condition, with neither seeing the other and the
-        // statement then dropped as dead.
-        if let Some(id) = self.symbols.borrow().for_ssa_name(name) {
-            return CExpr::Var(id);
+        if self.inputs.binding_names.is_some() {
+            self.retain_first_lowering_refusal(
+                crate::analysis::lower::OpLoweringRefusal::MissingProgramVariableAuthorization,
+            );
         }
         self.name_ref(name)
     }
@@ -3437,7 +3425,7 @@ impl<'a> FoldingContext<'a> {
                     .stack_slot_provenance_for_name(&self.spelling(*name))
                     .filter(|slot| slot.offset < 0)
                     .and_then(|slot| {
-                        self.resolve_stack_var(slot.offset).map(|stack_name| {
+                        self.refuse_missing_stack_object_origin(slot.offset).map(|stack_name| {
                             (slot.is_scalar_predicate_carrier(), self.name_ref(&stack_name))
                         })
                     });
@@ -3446,12 +3434,12 @@ impl<'a> FoldingContext<'a> {
                 {
                     return CExpr::Var(alias.clone());
                 }
-                if let Some(owner) = self.predicate_owned_call_result_expr_for_name(&self.spelling(*name)) {
+                if let Some(owner) = self.predicate_owned_call_result_expr_for_symbol(*name) {
                     return owner;
                 }
                 if self
-                    .call_result_source_for_ssa_name(&self.spelling(*name))
-                    .or_else(|| self.local_post_call_source_for_ssa_name(&self.spelling(*name)))
+                    .call_result_source_for_symbol(*name)
+                    .or_else(|| self.local_post_call_source_for_symbol(*name))
                     .is_some()
                 {
                     return CExpr::Var(name.clone());

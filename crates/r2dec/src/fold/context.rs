@@ -164,20 +164,9 @@ pub(crate) struct FoldingContext<'a> {
     /// so a block with many definitions costs the square of its size. One pass
     /// answers every question about that block, and it is rebuilt when the walk
     /// moves on.
-    pub(crate) block_producer_sites: std::cell::RefCell<Option<(u64, HashMap<String, usize>)>>,
-    /// Known names grouped by SSA version.
-    ///
-    /// Resolving a rendered alias needs the names sharing one version, and
-    /// finding them by filtering every known name costs a pass per question. The
-    /// names do not change once the analysis is built, so one pass answers all
-    /// of them.
-    pub(crate) names_by_version: OnceCell<BTreeMap<u32, Vec<String>>>,
     pub(crate) current_op_idx: Cell<Option<usize>>,
     pub(crate) hide_stack_frame: bool,
     pub(crate) signature_registry: SignatureRegistry,
-    pub(crate) rendered_alias_lookup_cache: std::cell::RefCell<HashMap<String, Option<String>>>,
-    pub(crate) preferred_entry_arg_lookup_cache:
-        std::cell::RefCell<HashMap<String, Option<String>>>,
     pub(crate) forwarded_source_cache: std::cell::RefCell<HashMap<String, Option<r2ssa::SSAVar>>>,
     pub(crate) load_expr_memo: std::cell::RefCell<HashMap<(ValueId, String), CExpr>>,
     /// What a value renders as, for values whose statement was left out.
@@ -189,9 +178,6 @@ pub(crate) struct FoldingContext<'a> {
     /// recorded here as it is skipped, so the rule that decides and the rule that
     /// renders are reading the same answer.
     pub(crate) inlined_renderings: std::cell::RefCell<HashMap<String, CExpr>>,
-    pub(crate) call_result_owner_name_cache:
-        std::cell::RefCell<BTreeMap<(u64, usize), Option<String>>>,
-    pub(crate) owned_call_visible_names_cache: std::cell::RefCell<Option<HashSet<String>>>,
     #[cfg(test)]
     pub(crate) prepared_semantic_view_cache: OnceCell<analysis::PreparedSemanticView>,
     pub(crate) semantic_render_in_progress: std::cell::RefCell<HashSet<String>>,
@@ -201,10 +187,6 @@ pub(crate) struct FoldingContext<'a> {
     pub(crate) resolution_guard: std::cell::RefCell<HashSet<ResolutionGuardKey>>,
     /// Blocks the fold walked, which is what expresses a merge standing at their head.
     pub(crate) folded_blocks: std::cell::RefCell<std::collections::BTreeSet<u64>>,
-    /// One name per certified loop carrier, derived once because it is settled once.
-    pub(crate) carrier_aliases: HashMap<String, String>,
-    /// Values that are a carrier read at one of its other widths.
-    pub(crate) carrier_member_views: HashMap<String, crate::normalize::CarrierMemberView>,
     /// Names some other block reads, which a block-local prune must not delete.
     pub(crate) cross_block_reads: std::cell::RefCell<HashSet<String>>,
     /// Names minted while folding, handed to the function when it is built.
@@ -222,6 +204,11 @@ pub(crate) struct FoldingContext<'a> {
     /// native program.
     pub(crate) observation_error:
         std::cell::RefCell<Option<crate::observation_journal::LegacyObservationJournalError>>,
+    /// Transaction-local lowering failure. Legacy helpers are still mostly
+    /// expression-returning, so an exact projection failure records this flag
+    /// and the operation boundary discards the whole candidate AST.
+    pub(crate) pending_lowering_refusal:
+        Cell<Option<crate::fold::op_lower::OpLoweringRefusal>>,
 }
 
 impl FoldArchConfig {
@@ -283,175 +270,21 @@ impl FoldArchConfig {
     }
 }
 
-/// Extend the legacy presentation-name table across exact normalized value
-/// edges while Stage 5 still renders through that table.
-///
-/// The normalization certificate owns edge identity. This temporary adapter
-/// uses only its `ValueId`s, closes them with a sorted worklist, and converts to
-/// display spelling only at the legacy boundary. Naming cutover deletes it.
-fn extend_legacy_carrier_aliases_over_normalization(
-    aliases: &mut HashMap<String, String>,
-    prepared: &SsaArtifact,
-    origins: &crate::normalize::NormalizationOrigins,
-) {
-    let graph = prepared.graph();
-    let mut neighbors = BTreeMap::<ValueId, BTreeSet<ValueId>>::new();
-    for (left, right) in origins.materialized_value_edges() {
-        neighbors.entry(left).or_default().insert(right);
-        neighbors.entry(right).or_default().insert(left);
-    }
-
-    let mut binding_by_value = BTreeMap::<ValueId, String>::new();
-    for value in &graph.values {
-        if let Some(binding) = aliases.get(&value.var.display_name()) {
-            binding_by_value.insert(value.id, binding.clone());
-        }
-    }
-
-    close_unambiguous_normalization_components(&neighbors, &mut binding_by_value);
-
-    for (value, binding) in binding_by_value {
-        if let Some(value) = graph.value(value) {
-            aliases.entry(value.var.display_name()).or_insert(binding);
-        }
-    }
-}
-
-fn close_unambiguous_normalization_components(
-    neighbors: &BTreeMap<ValueId, BTreeSet<ValueId>>,
-    binding_by_value: &mut BTreeMap<ValueId, String>,
-) {
-    let mut visited = BTreeSet::<ValueId>::new();
-    for start in neighbors.keys().copied() {
-        if visited.contains(&start) {
-            continue;
-        }
-        let mut pending = BTreeSet::from([start]);
-        let mut component = BTreeSet::new();
-        while let Some(value) = pending.pop_first() {
-            if !visited.insert(value) {
-                continue;
-            }
-            component.insert(value);
-            pending.extend(
-                neighbors
-                    .get(&value)
-                    .into_iter()
-                    .flatten()
-                    .filter(|neighbor| !visited.contains(neighbor))
-                    .copied(),
-            );
-        }
-        let mut bindings = component
-            .iter()
-            .filter_map(|value| binding_by_value.get(value))
-            .cloned()
-            .collect::<BTreeSet<_>>();
-        if bindings.len() != 1 {
-            // No seed means there is nothing to extend. More than one seed is a
-            // conflict; this presentation adapter must leave the whole newly
-            // reached component unaliased rather than choosing by worklist order.
-            continue;
-        }
-        let Some(binding) = bindings.pop_first() else {
-            continue;
-        };
-        for value in component {
-            binding_by_value
-                .entry(value)
-                .or_insert_with(|| binding.clone());
-        }
-    }
-}
-
-#[cfg(test)]
-mod normalization_alias_tests {
-    use super::*;
-
-    #[test]
-    fn conflicted_component_leaves_every_unseeded_member_unaliased() {
-        let neighbors = BTreeMap::from([
-            (ValueId(0), BTreeSet::from([ValueId(1)])),
-            (ValueId(1), BTreeSet::from([ValueId(0), ValueId(2)])),
-            (ValueId(2), BTreeSet::from([ValueId(1), ValueId(3)])),
-            (ValueId(3), BTreeSet::from([ValueId(2)])),
-        ]);
-        let mut bindings = BTreeMap::from([
-            (ValueId(0), "left".to_string()),
-            (ValueId(3), "right".to_string()),
-        ]);
-
-        close_unambiguous_normalization_components(&neighbors, &mut bindings);
-
-        assert_eq!(
-            bindings,
-            BTreeMap::from([
-                (ValueId(0), "left".to_string()),
-                (ValueId(3), "right".to_string()),
-            ]),
-            "a conflicted component must not be partially filled by ValueId order"
-        );
-    }
-}
-
 impl<'a> FoldingContext<'a> {
     pub(crate) fn from_inputs(inputs: FoldInputs<'a>) -> Self {
-        let mut carrier_aliases = match (inputs.prepared_ssa, inputs.function_facts.render()) {
-            (Some(prepared), Some(render)) => {
-                crate::normalize::carrier_name_aliases(prepared, render)
-            }
-            _ => HashMap::new(),
-        };
-        if let (Some(prepared), Some(origins)) = (inputs.prepared_ssa, inputs.normalization_origins)
-        {
-            extend_legacy_carrier_aliases_over_normalization(
-                &mut carrier_aliases,
-                prepared,
-                origins,
-            );
-        }
-        let carrier_member_views = match (inputs.prepared_ssa, inputs.function_facts.render()) {
-            (Some(prepared), Some(render)) => {
-                crate::normalize::carrier_member_views(prepared, render, &carrier_aliases)
-            }
-            _ => HashMap::new(),
-        };
-        if std::env::var_os("R2SLEIGH_DEBUG_MERGES").is_some() {
-            let mut entries = carrier_aliases.iter().collect::<Vec<_>>();
-            entries.sort();
-            for (member, name) in entries {
-                eprintln!("FOLDALIAS member={member} name={name}");
-            }
-            let mut views = carrier_member_views.iter().collect::<Vec<_>>();
-            views.sort_by(|left, right| left.0.cmp(right.0));
-            for (member, view) in views {
-                eprintln!(
-                    "FOLDVIEW member={member} carrier={} width={} carrier_width={}",
-                    view.carrier, view.width, view.carrier_width
-                );
-            }
-        }
         Self {
-            carrier_aliases,
-            carrier_member_views,
             cross_block_reads: std::cell::RefCell::new(HashSet::new()),
             symbols: std::rc::Rc::new(std::cell::RefCell::new(crate::symbol::SymbolTable::new())),
             inputs,
             state: FoldState::default(),
             current_block_addr: Cell::new(None),
             current_block_id: Cell::new(None),
-            block_producer_sites: std::cell::RefCell::new(None),
-            names_by_version: OnceCell::new(),
             current_op_idx: Cell::new(None),
             hide_stack_frame: true,
             signature_registry: SignatureRegistry::from_embedded_json(),
-            rendered_alias_lookup_cache: std::cell::RefCell::new(HashMap::new()),
-            preferred_entry_arg_lookup_cache: std::cell::RefCell::new(HashMap::new()),
             forwarded_source_cache: std::cell::RefCell::new(HashMap::new()),
             load_expr_memo: std::cell::RefCell::new(HashMap::new()),
             inlined_renderings: std::cell::RefCell::new(HashMap::new()),
-            call_result_owner_name_cache: std::cell::RefCell::new(BTreeMap::new()),
-            owned_call_visible_names_cache: std::cell::RefCell::new(None),
             #[cfg(test)]
             prepared_semantic_view_cache: OnceCell::new(),
             semantic_render_in_progress: std::cell::RefCell::new(HashSet::new()),
@@ -461,6 +294,7 @@ impl<'a> FoldingContext<'a> {
             resolution_guard: std::cell::RefCell::new(HashSet::new()),
             folded_blocks: std::cell::RefCell::new(std::collections::BTreeSet::new()),
             observation_error: std::cell::RefCell::new(None),
+            pending_lowering_refusal: Cell::new(None),
         }
     }
 
@@ -503,6 +337,15 @@ impl<'a> FoldingContext<'a> {
         let mut first = self.observation_error.borrow_mut();
         if first.is_none() {
             *first = Some(error);
+        }
+    }
+
+    pub(super) fn retain_first_lowering_refusal(
+        &self,
+        refusal: crate::fold::op_lower::OpLoweringRefusal,
+    ) {
+        if self.pending_lowering_refusal.get().is_none() {
+            self.pending_lowering_refusal.set(Some(refusal));
         }
     }
 

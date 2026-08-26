@@ -755,15 +755,9 @@ impl<'a> FoldingContext<'a> {
         {
             return Some(owner);
         }
-        let source_value_id = binding.source_value_id.or_else(|| {
-            binding
-                .source_var_name
-                .as_deref()
-                .and_then(|name| self.use_info().value_id_for_name(name))
-        });
-        let source_var_name = binding.source_var_name.clone().or_else(|| {
-            source_value_id.and_then(|value_id| self.use_info().display_name_for_value_id(value_id))
-        })?;
+        let source_value_id = binding.source_value_id?;
+        let source_var = self.prepared_var_for_value_id(source_value_id)?;
+        let source_var_name = source_var.display_name();
         let source_var_name = source_var_name.as_str();
         let preserve_stable_input_slot = binding.role == analysis::CallArgRole::Input;
         if preserve_stable_input_slot
@@ -776,7 +770,7 @@ impl<'a> FoldingContext<'a> {
             && addr.offset_bytes == 0
             && addr.scale_bytes == 0
             && let analysis::BaseRef::StackSlot(offset) = addr.base
-            && let Some(alias) = self.resolve_stack_var(offset)
+            && let Some(alias) = self.refuse_missing_stack_object_origin(offset)
         {
             return Some(self.name_ref(&alias));
         }
@@ -791,24 +785,14 @@ impl<'a> FoldingContext<'a> {
         let mut best = None;
         let prepared_expr = self
             .prepared_semantic_view()
-            .and_then(|prepared| {
-                source_value_id
-                    .and_then(|value_id| prepared.owner_expr_for_value_id(value_id))
-                    .or_else(|| prepared.owner_expr_for_name(source_var_name))
-                    .or_else(|| {
-                        self.find_ssa_name_for_rendered_alias(source_var_name)
-                            .as_deref()
-                            .and_then(|resolved| prepared.owner_expr_for_name(resolved))
-                    })
-                    .cloned()
-            })
+            .and_then(|prepared| prepared.owner_expr_for_value_id(source_value_id).cloned())
             .filter(|expr| !matches!(expr.unobserved(), CExpr::AddrOf(_)));
         let mut owned_visited = HashSet::new();
         let source_owned_expr =
             self.recover_source_owned_expr_for_name(source_var_name, 0, &mut owned_visited);
 
         if best.is_none()
-            && let Some(owner) = self.stable_owned_call_result_expr_for_name(source_var_name, true)
+            && let Some(owner) = self.stable_owned_call_result_expr_for_var(source_var)
         {
             return Some(owner);
         }
@@ -916,9 +900,14 @@ impl<'a> FoldingContext<'a> {
         if depth > 16 || !visited.insert(source_var_name.to_string()) {
             return None;
         }
-        if let Some(source_call) = self
-            .call_result_source_for_ssa_name(source_var_name)
-            .or_else(|| self.local_post_call_source_for_ssa_name(source_var_name))
+        let source_var = self
+            .use_info()
+            .value_id_for_name(source_var_name)
+            .and_then(|value| self.prepared_var_for_value_id(value));
+        if let Some(source_call) = source_var.and_then(|source_var| {
+            self.call_result_source_for_var(source_var)
+                .or_else(|| self.local_post_call_source_for_var(source_var))
+        })
             && let Some(owner) = self.stable_owned_call_result_expr_for_source(source_call)
         {
             return Some(owner);
@@ -1279,7 +1268,7 @@ impl<'a> FoldingContext<'a> {
             analysis::SemanticCallArg::Semantic(analysis::SemanticValue::Load { addr, .. })
             | analysis::SemanticCallArg::Semantic(analysis::SemanticValue::Address(addr)) => {
                 if let analysis::BaseRef::StackSlot(offset) = addr.base
-                    && let Some(name) = self.resolve_stack_var(offset)
+                    && let Some(name) = self.refuse_missing_stack_object_origin(offset)
                 {
                     let expr = self.name_ref(&name);
                     return self.is_preserved_imported_input_expr(&expr)
@@ -1458,7 +1447,7 @@ impl<'a> FoldingContext<'a> {
                     })
                     .or_else(|| {
                         self.stack_offset_for_visible_storage_name(&self.spelling(name))
-                            .and_then(|offset| self.resolve_stack_var(offset))
+                            .and_then(|offset| self.refuse_missing_stack_object_origin(offset))
                             .filter(|alias| !alias.eq_ignore_ascii_case(&self.spelling(name)))
                             .map(|n| crate::symbol::var_ref(&symbols, n))
                     })
@@ -1567,7 +1556,7 @@ impl<'a> FoldingContext<'a> {
                 .or_else(|| {
                     prepared
                         .stack_offset_for_var(var)
-                        .and_then(|offset| self.resolve_stack_var(offset))
+                        .and_then(|offset| self.refuse_missing_stack_object_origin(offset))
                         .map(|n| crate::symbol::var_ref(&self.symbols, n))
                 })
         };
@@ -1617,7 +1606,7 @@ impl<'a> FoldingContext<'a> {
                 analysis::BaseRef::StackSlot(offset)
                     if addr.index.is_none() && addr.offset_bytes == 0 && addr.scale_bytes == 0 =>
                 {
-                    self.resolve_stack_var(*offset).map(|n| crate::symbol::var_ref(&self.symbols, n)).map(|expr| {
+                    self.refuse_missing_stack_object_origin(*offset).map(|n| crate::symbol::var_ref(&self.symbols, n)).map(|expr| {
                         if preserve_pointer_identity {
                             CExpr::AddrOf(Box::new(expr))
                         } else {
@@ -1636,7 +1625,7 @@ impl<'a> FoldingContext<'a> {
                 analysis::BaseRef::StackSlot(offset)
                     if addr.index.is_none() && addr.offset_bytes == 0 && addr.scale_bytes == 0 =>
                 {
-                    self.resolve_stack_var(*offset).map(|n| crate::symbol::var_ref(&self.symbols, n))
+                    self.refuse_missing_stack_object_origin(*offset).map(|n| crate::symbol::var_ref(&self.symbols, n))
                 }
                 _ => None,
             },
@@ -1700,8 +1689,7 @@ impl<'a> FoldingContext<'a> {
         };
 
         let base_name = self
-            .resolve_stack_var(base_offset)
-            .unwrap_or_else(|| stack_slot_synthetic_name(base_offset));
+            .refuse_missing_stack_object_origin(base_offset)?;
         let mut expr = CExpr::AddrOf(Box::new(self.name_ref(&base_name)));
         if let Some(index) = &addr.index {
             let mut visited = HashSet::new();

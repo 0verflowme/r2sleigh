@@ -3,6 +3,22 @@ use super::projection::{project_machine_use, project_machine_write};
 use super::*;
 
 impl<'a> FoldingContext<'a> {
+    fn observation_lowering_refusal(
+        error: &crate::observation_journal::LegacyObservationJournalError,
+    ) -> OpLoweringRefusal {
+        use crate::observation_journal::LegacyObservationJournalError as Error;
+        match error {
+            Error::RenderedValueRequired(_)
+            | Error::InvalidPlannedInline { .. }
+            | Error::PlannedElidedValueRendered { .. }
+            | Error::PlannedRefusedValueRendered { .. }
+            | Error::MissingPlannedValue(_) => {
+                OpLoweringRefusal::MissingProgramVariableAuthorization
+            }
+            _ => OpLoweringRefusal::MissingMachineProjectionAuthorization,
+        }
+    }
+
     fn exact_normalized_op_effects(
         &self,
         op: &SSAOp,
@@ -78,27 +94,32 @@ impl<'a> FoldingContext<'a> {
         let Some(site) = site else {
             return Ok((lhs, rhs));
         };
-        let Some(names) = self.inputs.binding_names else {
-            return Ok((lhs, rhs));
-        };
         let output = self.normalized_output_projection(site)?;
-        match names.write_disposition(output.inst) {
-            Some(r2ssa::MachineWriteDisposition::Exact(projection)) => {
+        let Some(names) = self.inputs.binding_names else {
+            return Err(
+                crate::observation_journal::LegacyObservationJournalError::MissingPlannedValue(
+                    output.value,
+                ),
+            );
+        };
+        match names.require_write(output.inst) {
+            Ok(r2ssa::MachineWriteDisposition::Exact(projection)) => {
                 project_machine_write(lhs, rhs, *projection).map_err(|_| {
                     crate::observation_journal::LegacyObservationJournalError::RefusedRenderedWrite(
                         output.inst,
                     )
                 })
             }
-            Some(r2ssa::MachineWriteDisposition::Refused(_)) => Err(
+            Ok(r2ssa::MachineWriteDisposition::Refused(_)) => {
+                unreachable!("require_write cannot return a refused disposition")
+            }
+            Err(crate::binding_plan::RenderedIdentityRefusal::MachineWrite { .. }) => Err(
                 crate::observation_journal::LegacyObservationJournalError::RefusedRenderedWrite(
                     output.inst,
                 ),
             ),
-            None => Err(
-                crate::observation_journal::LegacyObservationJournalError::InvalidWrite(
-                    output.inst,
-                ),
+            Err(_) => Err(
+                crate::observation_journal::LegacyObservationJournalError::InvalidWrite(output.inst),
             ),
         }
     }
@@ -107,41 +128,53 @@ impl<'a> FoldingContext<'a> {
         &self,
         site: Option<crate::normalize::NormalizedOpSite>,
         lowered: LoweredOp,
-    ) -> LoweredOp {
+    ) -> OpLoweringResult<LoweredOp> {
         let LoweredOp::Assign { lhs, rhs } = lowered else {
-            return lowered;
+            return Ok(lowered);
         };
         match self.project_planned_assignment(site, lhs.clone(), rhs.clone()) {
-            Ok((lhs, rhs)) => LoweredOp::Assign { lhs, rhs },
+            Ok((lhs, rhs)) => Ok(LoweredOp::Assign { lhs, rhs }),
             Err(error) => {
+                let refusal = Self::observation_lowering_refusal(&error);
                 self.retain_first_observation_error(error);
-                LoweredOp::Assign { lhs, rhs }
+                Err(refusal)
             }
         }
     }
 
     /// Apply a source write only when the finalized statement targets the
-    /// exact plan-owned output binding. Synthetic assignments emitted while
-    /// folding the same opcode (for example a recovered return slot) are not
-    /// definitions of that `InstId` and must not inherit its machine effect.
+    /// exact plan-owned output binding. A different target has no typed
+    /// synthetic-origin certificate, so it cannot waive the `InstId` write
+    /// projection.
     fn project_finalized_assignment_stmt(
         &self,
         site: Option<crate::normalize::NormalizedOpSite>,
         stmt: CStmt,
-    ) -> CStmt {
+    ) -> OpLoweringResult<CStmt> {
         let Some(site) = site else {
-            return stmt;
+            return Ok(stmt);
         };
-        let Ok(output) = self.normalized_output_projection(site) else {
-            return stmt;
+        let output = match self.normalized_output_projection(site) {
+            Ok(output) => output,
+            Err(error) => {
+                self.retain_first_observation_error(error);
+                return Err(OpLoweringRefusal::MissingMachineProjectionAuthorization);
+            }
         };
         let Some(names) = self.inputs.binding_names else {
-            return stmt;
+            return Err(OpLoweringRefusal::MissingProgramVariableAuthorization);
         };
-        let crate::binding_plan::PlannedValueSymbol::Bound(symbol) =
-            names.resolve_value(output.value)
-        else {
-            return stmt;
+        let symbol = match names.require_value(output.value) {
+            Ok(crate::binding_plan::PlannedValueSymbol::Bound(symbol)) => symbol,
+            Ok(
+                crate::binding_plan::PlannedValueSymbol::Inline(_)
+                | crate::binding_plan::PlannedValueSymbol::Elided(_),
+            ) => return Ok(stmt),
+            Ok(
+                crate::binding_plan::PlannedValueSymbol::Refused(_)
+                | crate::binding_plan::PlannedValueSymbol::Absent,
+            ) => unreachable!("require_value cannot return an absent or refused disposition"),
+            Err(_) => return Err(OpLoweringRefusal::MissingProgramVariableAuthorization),
         };
         let CStmt::Expr(CExpr::Binary {
             op: BinaryOp::Assign,
@@ -149,24 +182,25 @@ impl<'a> FoldingContext<'a> {
             right,
         }) = stmt
         else {
-            return stmt;
+            return Ok(stmt);
         };
         let lhs = *left;
         let rhs = *right;
         let planned_lhs = CExpr::Var(symbol);
         if !lhs.transparently_eq(&planned_lhs) {
-            return CStmt::Expr(CExpr::assign(lhs, rhs));
+            return Err(OpLoweringRefusal::MissingProgramVariableAuthorization);
         }
         match self.project_planned_assignment(Some(site), lhs.clone(), rhs.clone()) {
-            Ok((lhs, rhs)) => CStmt::Expr(CExpr::assign(lhs, rhs)),
+            Ok((lhs, rhs)) => Ok(CStmt::Expr(CExpr::assign(lhs, rhs))),
             Err(error) => {
+                let refusal = Self::observation_lowering_refusal(&error);
                 self.retain_first_observation_error(error);
-                CStmt::Expr(CExpr::assign(lhs, rhs))
+                Err(refusal)
             }
         }
     }
 
-    fn planned_value_expr(
+    pub(super) fn planned_value_expr(
         &self,
         value: ValueId,
     ) -> Result<CExpr, crate::observation_journal::LegacyObservationJournalError> {
@@ -177,9 +211,9 @@ impl<'a> FoldingContext<'a> {
                 ),
             );
         };
-        match names.resolve_value(value) {
-            crate::binding_plan::PlannedValueSymbol::Bound(symbol) => Ok(CExpr::Var(symbol)),
-            crate::binding_plan::PlannedValueSymbol::Inline(expr) => {
+        match names.require_value(value) {
+            Ok(crate::binding_plan::PlannedValueSymbol::Bound(symbol)) => Ok(CExpr::Var(symbol)),
+            Ok(crate::binding_plan::PlannedValueSymbol::Inline(expr)) => {
                 let Some(machine_expr) = names.inline_expr(expr) else {
                     return Err(
                         crate::observation_journal::LegacyObservationJournalError::InvalidPlannedInline {
@@ -215,19 +249,23 @@ impl<'a> FoldingContext<'a> {
                     CExpr::IntLit(bits as i64)
                 })
             }
-            crate::binding_plan::PlannedValueSymbol::Elided(reason) => Err(
+            Ok(crate::binding_plan::PlannedValueSymbol::Elided(reason)) => Err(
                 crate::observation_journal::LegacyObservationJournalError::PlannedElidedValueRendered {
                     value,
                     reason,
                 },
             ),
-            crate::binding_plan::PlannedValueSymbol::Refused(reason) => Err(
+            Ok(
+                crate::binding_plan::PlannedValueSymbol::Refused(_)
+                | crate::binding_plan::PlannedValueSymbol::Absent,
+            ) => unreachable!("require_value cannot return an absent or refused disposition"),
+            Err(crate::binding_plan::RenderedIdentityRefusal::Value { reason, .. }) => Err(
                 crate::observation_journal::LegacyObservationJournalError::PlannedRefusedValueRendered {
                     value,
                     reason,
                 },
             ),
-            crate::binding_plan::PlannedValueSymbol::Absent => Err(
+            Err(_) => Err(
                 crate::observation_journal::LegacyObservationJournalError::MissingPlannedValue(
                     value,
                 ),
@@ -282,18 +320,21 @@ impl<'a> FoldingContext<'a> {
                 ),
             );
         };
-        let first_disposition = match names.use_disposition(first_site) {
-            Some(disposition @ (r2ssa::MachineUseDisposition::Exact(_)
+        let first_disposition = match names.require_use(first_site) {
+            Ok(disposition @ (r2ssa::MachineUseDisposition::Exact(_)
             | r2ssa::MachineUseDisposition::MemoryAddress(_)),
             ) => *disposition,
-            Some(r2ssa::MachineUseDisposition::Refused(_)) => {
+            Ok(r2ssa::MachineUseDisposition::Refused(_)) => {
+                unreachable!("require_use cannot return a refused disposition")
+            }
+            Err(crate::binding_plan::RenderedIdentityRefusal::MachineUse { .. }) => {
                 return Err(
                     crate::observation_journal::LegacyObservationJournalError::RefusedRenderedUse(
                         first_site,
                     ),
                 );
             }
-            None => {
+            Err(_) => {
                 return Err(
                     crate::observation_journal::LegacyObservationJournalError::InvalidUse(
                         first_site,
@@ -302,16 +343,19 @@ impl<'a> FoldingContext<'a> {
             }
         };
         for use_site in input.uses.iter().copied().skip(1) {
-            match names.use_disposition(use_site) {
-                Some(disposition) if *disposition == first_disposition => {}
-                Some(r2ssa::MachineUseDisposition::Refused(_)) => {
+            match names.require_use(use_site) {
+                Ok(disposition) if *disposition == first_disposition => {}
+                Ok(r2ssa::MachineUseDisposition::Refused(_)) => {
+                    unreachable!("require_use cannot return a refused disposition")
+                }
+                Err(crate::binding_plan::RenderedIdentityRefusal::MachineUse { .. }) => {
                     return Err(
                         crate::observation_journal::LegacyObservationJournalError::RefusedRenderedUse(
                             use_site,
                         ),
                     );
                 }
-                Some(
+                Ok(
                     r2ssa::MachineUseDisposition::Exact(_)
                     | r2ssa::MachineUseDisposition::MemoryAddress(_),
                 ) => {
@@ -325,7 +369,7 @@ impl<'a> FoldingContext<'a> {
                         },
                     );
                 }
-                None => {
+                Err(_) => {
                     return Err(
                         crate::observation_journal::LegacyObservationJournalError::InvalidUse(
                             use_site,
@@ -397,11 +441,14 @@ impl<'a> FoldingContext<'a> {
             ),
         )?;
         let value = self.normalized_output_projection(site)?.value;
-        match self.inputs.binding_names.map(|names| names.resolve_value(value)) {
-            Some(crate::binding_plan::PlannedValueSymbol::Bound(symbol)) => {
+        let Some(names) = self.inputs.binding_names else {
+            return Err(crate::observation_journal::LegacyObservationJournalError::MissingPlannedValue(value));
+        };
+        match names.require_value(value) {
+            Ok(crate::binding_plan::PlannedValueSymbol::Bound(symbol)) => {
                 Ok(Some(CExpr::Var(symbol)))
             }
-            Some(crate::binding_plan::PlannedValueSymbol::Inline(expr)) => Err(
+            Ok(crate::binding_plan::PlannedValueSymbol::Inline(expr)) => Err(
                 crate::observation_journal::LegacyObservationJournalError::InvalidPlannedInline {
                     value,
                     expr,
@@ -411,11 +458,20 @@ impl<'a> FoldingContext<'a> {
             // legacy candidate long enough for dead-code and structuring
             // rewrites to delete it; the final surviving value marker is the
             // only place allowed to turn either disposition into an error.
-            Some(
+            Ok(
                 crate::binding_plan::PlannedValueSymbol::Elided(_)
-                | crate::binding_plan::PlannedValueSymbol::Refused(_),
             ) => Ok(None),
-            Some(crate::binding_plan::PlannedValueSymbol::Absent) | None => Err(
+            Ok(
+                crate::binding_plan::PlannedValueSymbol::Refused(_)
+                | crate::binding_plan::PlannedValueSymbol::Absent,
+            ) => unreachable!("require_value cannot return an absent or refused disposition"),
+            Err(crate::binding_plan::RenderedIdentityRefusal::Value { reason, .. }) => Err(
+                crate::observation_journal::LegacyObservationJournalError::PlannedRefusedValueRendered {
+                    value,
+                    reason,
+                },
+            ),
+            Err(_) => Err(
                 crate::observation_journal::LegacyObservationJournalError::MissingPlannedValue(
                     value,
                 ),
@@ -432,22 +488,18 @@ impl<'a> FoldingContext<'a> {
         if frame.observe_inputs {
             let expr = match self.planned_input_expr(frame, input_idx, expr.clone()) {
                 Ok(planned) => planned,
-                Err(
-                    crate::observation_journal::LegacyObservationJournalError::PlannedElidedValueRendered { .. }
-                    | crate::observation_journal::LegacyObservationJournalError::PlannedRefusedValueRendered { .. },
-                ) => {
-                    return self.observe_optional_normalized_input_expr(
-                        frame.normalized_site,
-                        input_idx,
-                        expr,
-                    );
-                }
                 Err(error) => {
+                    let refusal = Self::observation_lowering_refusal(&error);
                     self.retain_first_observation_error(error);
+                    self.retain_first_lowering_refusal(refusal);
                     return expr;
                 }
             };
-            self.observe_optional_normalized_input_uses_expr(frame.normalized_site, input_idx, expr)
+            self.observe_optional_normalized_input_uses_expr(
+                frame.normalized_site,
+                input_idx,
+                expr,
+            )
         } else {
             expr
         }
@@ -494,7 +546,8 @@ impl<'a> FoldingContext<'a> {
         op: &SSAOp,
         frame: &mut LowerFrame,
     ) -> OpLoweringResult<LoweredOp> {
-        Ok(match frame.mode {
+        self.pending_lowering_refusal.set(None);
+        let lowered = match frame.mode {
             LowerMode::Expr => self
                 .op_to_expr_impl(op, frame)?
                 .map(LoweredOp::Expr)
@@ -529,7 +582,7 @@ impl<'a> FoldingContext<'a> {
                                     raw_args,
                                 )
                             else {
-                                return Ok(LoweredOp::Comment(format!(
+                                return self.finish_lowering_transaction(LoweredOp::Comment(format!(
                                     "r2sleigh residual: uncertified callsite arguments at 0x{:x}:{}",
                                     source_block, source_op_idx
                                 )));
@@ -547,7 +600,7 @@ impl<'a> FoldingContext<'a> {
                             }
                             let call =
                                 CExpr::call_at((source_block, source_op_idx), func_expr, args);
-                            return Ok(self.lower_certified_statement_call(
+                            return self.finish_lowering_transaction(self.lower_certified_statement_call(
                                 source_block,
                                 source_op_idx,
                                 call,
@@ -578,7 +631,7 @@ impl<'a> FoldingContext<'a> {
                                 &func_expr,
                                 raw_args,
                             ) else {
-                                return Ok(LoweredOp::Comment(format!(
+                                return self.finish_lowering_transaction(LoweredOp::Comment(format!(
                                     "r2sleigh residual: uncertified indirect-call arguments at 0x{:x}:{}",
                                     source_block, source_op_idx
                                 )));
@@ -590,8 +643,12 @@ impl<'a> FoldingContext<'a> {
                                 args.truncate(max_arity);
                                 certified_args.values.truncate(max_arity);
                             }
-                            let call = CExpr::call(func_expr, args);
-                            return Ok(self.lower_certified_statement_call(
+                            let call = CExpr::call_at(
+                                (source_block, source_op_idx),
+                                func_expr,
+                                args,
+                            );
+                            return self.finish_lowering_transaction(self.lower_certified_statement_call(
                                 source_block,
                                 source_op_idx,
                                 call,
@@ -606,7 +663,15 @@ impl<'a> FoldingContext<'a> {
                     .map(Self::lowered_from_stmt)
                     .unwrap_or(LoweredOp::None)
             }
-        })
+        };
+        self.finish_lowering_transaction(lowered)
+    }
+
+    fn finish_lowering_transaction(&self, lowered: LoweredOp) -> OpLoweringResult<LoweredOp> {
+        match self.pending_lowering_refusal.take() {
+            Some(refusal) => Err(refusal),
+            None => Ok(lowered),
+        }
     }
 
     pub(crate) fn op_to_expr(&self, op: &SSAOp) -> OpLoweringResult<CExpr> {
@@ -643,7 +708,7 @@ impl<'a> FoldingContext<'a> {
         let lowered = self.project_lowered_assignment(
             normalized_site,
             self.lower_op(op, &mut frame)?,
-        );
+        )?;
         let lowered = match lowered {
             LoweredOp::Expr(expr) => LoweredExprAt::Rendered(expr),
             LoweredOp::Assign { lhs, rhs } => LoweredExprAt::Rendered(CExpr::assign(lhs, rhs)),
@@ -716,7 +781,7 @@ impl<'a> FoldingContext<'a> {
         let Some(stmt) = self.lowered_to_stmt(lowered) else {
             return Ok(None);
         };
-        let stmt = self.project_finalized_assignment_stmt(normalized_site, stmt);
+        let stmt = self.project_finalized_assignment_stmt(normalized_site, stmt)?;
 
         let obligations = self.exact_normalized_op_effects(
             op,

@@ -600,7 +600,6 @@ enum RenderCandidateSource {
     ValueDefinition,
     SemanticValue,
     ForwardedValue,
-    AliasDefinition,
     RawDefinition,
 }
 
@@ -612,7 +611,6 @@ struct RenderCandidate {
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct CertifiedRenderPlan<'a> {
-    symbols: &'a std::cell::RefCell<crate::symbol::SymbolTable>,
     function_facts: &'a r2types::FunctionFacts,
     prepared_view: &'a analysis::PreparedSemanticView,
     proof: CertifiedRenderContext<'a>,
@@ -620,13 +618,11 @@ pub(crate) struct CertifiedRenderPlan<'a> {
 
 impl<'a> CertifiedRenderPlan<'a> {
     fn new(
-        symbols: &'a std::cell::RefCell<crate::symbol::SymbolTable>,
         function_facts: &'a r2types::FunctionFacts,
         prepared_view: &'a analysis::PreparedSemanticView,
         proof: CertifiedRenderContext<'a>,
     ) -> Self {
         Self {
-            symbols,
             function_facts,
             prepared_view,
             proof,
@@ -676,15 +672,41 @@ impl<'a> CertifiedRenderPlan<'a> {
     fn stack_param_expr_for_memory_fact(
         &self,
         fact: &r2types::MemoryAccessRenderFact,
+        names: &crate::binding_plan::BindingNameResolution,
     ) -> Option<CExpr> {
         if fact.is_write || fact.width == 0 {
             return None;
         }
         let offset = self.proof.render_facts.stack_slot_offset(fact.object)?;
-        let authorization = self
+        self
             .function_facts
             .authorized_stack_param_owner_render(fact.object, offset)?;
-        Some(crate::symbol::var_ref(self.symbols, &authorization.name))
+        let mut matching_slots = self
+            .function_facts
+            .type_facts()
+            .stack_slots
+            .iter()
+            .filter(|(key, slot)| {
+                key.offset == offset
+                    && matches!(
+                        slot.role,
+                        ExternalStackSlotRole::StackArg | ExternalStackSlotRole::ParamHome
+                    )
+            });
+        let (_, slot) = matching_slots.next()?;
+        if matching_slots.next().is_some() {
+            return None;
+        }
+        let slot = u32::try_from(slot.param_index?).ok()?;
+        match names.require_parameter_slot(slot).ok()? {
+            crate::binding_plan::PlannedParameterSymbol::Bound { symbol, .. } => {
+                Some(CExpr::Var(symbol))
+            }
+            crate::binding_plan::PlannedParameterSymbol::Refused(_)
+            | crate::binding_plan::PlannedParameterSymbol::Absent => {
+                unreachable!("require_parameter_slot cannot return absent or refused")
+            }
+        }
     }
 }
 

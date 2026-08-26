@@ -287,10 +287,6 @@ impl<'a> FoldingContext<'a> {
             });
         best = self.preferred_return_candidate_in_context(best, merged, context);
 
-        if let Some(candidate) = self.stable_owned_call_result_expr_for_name(name, true) {
-            best = self.preferred_return_candidate_in_context(best, Some(candidate), context);
-        }
-
         let mut semantic_visited = HashSet::new();
         let candidate = self.preferred_return_candidate_in_context(
             best,
@@ -774,20 +770,6 @@ impl<'a> FoldingContext<'a> {
 
         let mut visited = HashSet::new();
         self.render_authoritative_memory_access_by_name(name, 0, 0, &mut visited)
-            .or_else(|| {
-                self.find_ssa_name_for_rendered_alias(name)
-                    .and_then(|ssa_name| {
-                        (ssa_name.as_str() != name).then(|| {
-                            let mut alias_visited = HashSet::new();
-                            self.render_authoritative_memory_access_by_name(
-                                &ssa_name,
-                                0,
-                                0,
-                                &mut alias_visited,
-                            )
-                        })?
-                    })
-            })
     }
 
     fn should_inline_in_return(&self, var_name: crate::symbol::SymbolId, depth: u32) -> bool {
@@ -799,7 +781,7 @@ impl<'a> FoldingContext<'a> {
         }
 
         let ssa_name = self
-            .find_ssa_name_for_rendered_alias(&self.spelling(var_name_id))
+            .exact_ssa_name_for_symbol(var_name_id)
             .filter(|ssa_name| ssa_name.as_str() != &**var_name);
         let semantic_name = ssa_name.as_deref().unwrap_or(var_name);
         if is_temporary_or_constant_name(var_name) || is_temporary_or_constant_name(semantic_name) {
@@ -932,16 +914,6 @@ impl<'a> FoldingContext<'a> {
 
         match expr {
             CExpr::Var(name) => {
-                // A carrier holds a different value on each iteration, so its
-                // definition is only one of them and expanding it here answers
-                // the return with whichever one that is. adler32 returned
-                // `eax_4 << 16 | 1` where `| r8d` was meant -- the accumulator's
-                // initialiser, read as its result. The predicate path already
-                // declines to expand a carrier for the same reason; this is the
-                // second table that answered for one.
-                if self.is_carrier_rendered_name(&self.spelling(*name)) {
-                    return expr.clone();
-                }
                 if let Some(val) = parse_const_value(&self.spelling(*name)) {
                     return self.typed_integer_literal_expr_in_context(val, context);
                 }
@@ -957,8 +929,8 @@ impl<'a> FoldingContext<'a> {
                     return self.simplify_condition_expr(CExpr::Var(name.clone()));
                 }
                 if let Some(source_call) = self
-                    .call_result_source_for_ssa_name(&self.spelling(*name))
-                    .or_else(|| self.local_post_call_source_for_ssa_name(&self.spelling(*name)))
+                    .call_result_source_for_symbol(*name)
+                    .or_else(|| self.local_post_call_source_for_symbol(*name))
                     && let Some(candidate) = self.synthesized_call_expr_for_source_call(source_call)
                 {
                     return candidate;
@@ -1380,7 +1352,8 @@ impl<'a> FoldingContext<'a> {
 
     /// Convert an SSA variable to a C variable name.
     pub fn var_name(&self, var: &SSAVar) -> String {
-        crate::naming::spell_var(var, self)
+        let display = var.display_name();
+        self.spelling(self.sym_for_var(&display, var)).to_string()
     }
 
     /// Convert a constant variable to a C expression.
@@ -1391,29 +1364,5 @@ impl<'a> FoldingContext<'a> {
         } else {
             CExpr::IntLit(val as i64)
         }
-    }
-}
-
-impl crate::naming::NameSource for FoldingContext<'_> {
-    fn planned_binding_name(&self, var: &SSAVar) -> Option<String> {
-        let prepared = self.inputs.prepared_ssa?;
-        let value = prepared.graph().value_id_for_var(var)?;
-        self.inputs.binding_names?.name_for_value(value)
-    }
-
-    fn carrier_alias(&self, display: &str) -> Option<String> {
-        self.carrier_aliases.get(display).cloned()
-    }
-
-    fn var_alias(&self, display: &str) -> Option<String> {
-        self.var_aliases_map().get(display).cloned()
-    }
-
-    fn param_alias(&self, register: &str) -> Option<String> {
-        self.arg_alias_for_register_name(register)
-    }
-
-    fn canonical_stack_name(&self, alias: &str) -> Option<String> {
-        self.canonicalize_stack_name(alias)
     }
 }

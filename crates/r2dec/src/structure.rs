@@ -3225,7 +3225,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                 then_region,
                 pred,
                 summary,
-            )
+            )?
         {
             then_stmt = rewritten;
             rewrote_any = true;
@@ -3237,7 +3237,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                 else_region,
                 pred,
                 summary,
-            )
+            )?
         {
             else_stmt = rewritten;
             rewrote_any = true;
@@ -3623,7 +3623,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         region: &Region,
         pred_addr: u64,
         summary: &crate::analysis::FrameSlotMergeSummary,
-    ) -> Option<CStmt> {
+    ) -> ControlFlowStructureResult<Option<CStmt>> {
         let mut visited = std::collections::HashSet::new();
         let expr = summary
             .incoming
@@ -3632,7 +3632,10 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             .or_else(|| {
                 self.fold_ctx
                     .merged_return_candidate_for_block_slot(pred_addr, summary.slot_offset)
-            })?;
+            });
+        let Some(expr) = expr else {
+            return Ok(None);
+        };
         // What reaches the merged slot is recorded as the SSA carrier that
         // wrote it, `x8_8`, which is a version of a machine register and not a
         // name the function declares. Whether that reads as a program name has
@@ -3643,23 +3646,23 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         // here says the value in both cases, which is what the assignment
         // prepended just below has always done with the same expression.
         let expr = self.fold_ctx.resolve_return_candidate(&expr);
-        let stmt = self.prepend_named_merged_slot_assignment_if_needed(stmt, summary, &expr);
+        let stmt = self.prepend_named_merged_slot_assignment_if_needed(stmt, summary, &expr)?;
         if let Some(rewritten) = self.rewrite_trailing_return_with_merged_expr(&stmt, &expr) {
-            return Some(rewritten);
+            return Ok(Some(rewritten));
         }
         if Self::single_terminator_stmt(&stmt).is_some() {
-            return Some(stmt);
+            return Ok(Some(stmt));
         }
         let mut stmts = Vec::new();
         Self::append_stmt_body_flat(&mut stmts, stmt);
         stmts.push(CStmt::Return(Some(
             expr.clone_without_render_observations(),
         )));
-        Some(if stmts.len() == 1 {
+        Ok(Some(if stmts.len() == 1 {
             stmts.into_iter().next().unwrap_or(CStmt::Empty)
         } else {
             CStmt::Block(stmts)
-        })
+        }))
     }
 
     fn has_merged_slot_return_expr(
@@ -3815,40 +3818,9 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         stmt: CStmt,
         summary: &crate::analysis::FrameSlotMergeSummary,
         expr: &CExpr,
-    ) -> CStmt {
-        let Some(local_name) = self
-            .fold_ctx
-            .resolve_stack_var(summary.slot_offset)
-            .filter(|name| !crate::fold::op_lower::is_generic_stack_placeholder_alias(name))
-        else {
-            return stmt;
-        };
-
-        let lhs = self.name_ref(&local_name);
-        let resolved_expr = self.fold_ctx.resolve_return_candidate(expr);
-        if lhs == *expr || lhs == resolved_expr {
-            return stmt;
-        }
-
-        let assignment = CStmt::Expr(CExpr::assign(lhs, resolved_expr.clone()));
-        if Self::stmt_starts_with_assignment(&stmt, &assignment) {
-            return stmt;
-        }
-        match stmt {
-            CStmt::Empty => assignment,
-            CStmt::Block(mut stmts) => {
-                stmts.insert(0, assignment);
-                CStmt::Block(stmts)
-            }
-            other => CStmt::Block(vec![assignment, other]),
-        }
-    }
-
-    fn stmt_starts_with_assignment(stmt: &CStmt, assignment: &CStmt) -> bool {
-        match stmt {
-            CStmt::Block(stmts) => stmts.first().is_some_and(|first| first == assignment),
-            other => other == assignment,
-        }
+    ) -> ControlFlowStructureResult<CStmt> {
+        let _ = (stmt, summary.slot_offset, expr);
+        Err(OpLoweringRefusal::MissingProgramVariableAuthorization.into())
     }
 
     fn rewrite_trailing_return_with_merged_expr(

@@ -26,37 +26,41 @@ impl<'a> FoldingContext<'a> {
         let CExpr::Var(name) = expr else {
             return false;
         };
-        if self
-            .inputs
-            .function_facts
-            .type_facts()
-            .render_authorized_signature()
-            .is_some_and(|signature| {
-                signature.params.iter().any(|param| {
-                    param.name.eq_ignore_ascii_case(&self.spelling(*name))
-                        && param.ty.as_ref().is_some_and(|ty| {
-                            matches!(
-                                crate::type_like_to_ctype(ty),
-                                CType::Pointer(_) | CType::Array(_, _)
-                            )
-                        })
+        let role = self.symbols.borrow().get(*name).role;
+        if let crate::symbol::SymbolRole::Parameter(slot) = role
+            && self
+                .inputs
+                .function_facts
+                .type_facts()
+                .render_authorized_signature()
+                .and_then(|signature| signature.params.get(slot as usize))
+                .and_then(|parameter| parameter.ty.as_ref())
+                .is_some_and(|ty| {
+                    matches!(
+                        crate::type_like_to_ctype(ty),
+                        CType::Pointer(_) | CType::Array(_, _)
+                    )
                 })
-            })
         {
             return true;
         }
+        let Some(names) = self.inputs.binding_names else {
+            return false;
+        };
         self.inputs.render_facts().is_some_and(|render| {
             render.loop_carriers().any(|entity| {
                 let r2types::CertifiedEntity::LoopCarrier { phi, ty, .. } = entity else {
                     return false;
                 };
-                crate::certified_loop_carrier_name(*phi).eq_ignore_ascii_case(&self.spelling(*name))
-                    && ty.as_ref().is_some_and(|ty| {
-                        matches!(
-                            crate::type_like_to_ctype(ty),
-                            CType::Pointer(_) | CType::Array(_, _)
-                        )
-                    })
+                matches!(
+                    names.require_value(*phi),
+                    Ok(crate::binding_plan::PlannedValueSymbol::Bound(symbol)) if symbol == *name
+                ) && ty.as_ref().is_some_and(|ty| {
+                    matches!(
+                        crate::type_like_to_ctype(ty),
+                        CType::Pointer(_) | CType::Array(_, _)
+                    )
+                })
             })
         })
     }
@@ -508,8 +512,6 @@ impl<'a> FoldingContext<'a> {
     }
 
     pub(crate) fn render_certified_value_expr_for_var(&self, var: &SSAVar) -> Option<CExpr> {
-        let symbols = &self.symbols;
-
         if var.is_const() {
             let value = parse_const_value(&var.name)?;
             return Some(if value > 0x7fff_ffff {
@@ -520,11 +522,11 @@ impl<'a> FoldingContext<'a> {
         }
 
         let value = self.prepared_value_id_for_var(var)?;
-        if let Some(name) = self.certified_loop_carrier_name_for_value(value) {
-            return Some(self.name_ref(&name));
+        if let Some(expr) = self.certified_loop_carrier_expr_for_value(value) {
+            return Some(expr);
         }
-        if let Some(name) = self.certified_memory_result_name_for_value(value) {
-            return Some(self.name_ref(&name));
+        if let Some(expr) = self.certified_memory_result_expr_for_value(value) {
+            return Some(expr);
         }
         if self.prepared_ssa().is_some_and(|prepared| {
             prepared
@@ -554,12 +556,16 @@ impl<'a> FoldingContext<'a> {
         if var.version == 0 && var.is_register() && self.stable_semantic_ids_are_required() {
             return None;
         }
-        let rendered = self.var_name(var);
-        Some(
-            self.arg_alias_for_rendered_name(&rendered)
-                .map(|n| crate::symbol::var_ref(&symbols, n))
-                .unwrap_or_else(|| self.name_ref(&rendered)),
-        )
+        match self.planned_value_expr(value) {
+            Ok(expr) => Some(expr),
+            Err(error) => {
+                self.retain_first_observation_error(error);
+                self.retain_first_lowering_refusal(
+                    OpLoweringRefusal::MissingProgramVariableAuthorization,
+                );
+                None
+            }
+        }
     }
 
     fn render_certified_stack_param_value_expr(
@@ -637,8 +643,6 @@ impl<'a> FoldingContext<'a> {
         depth: u32,
         visited: &mut HashSet<r2ssa::ValueId>,
     ) -> Option<CExpr> {
-        let symbols = &self.symbols;
-
         if depth > Self::MAX_SEMANTIC_RENDER_DEPTH {
             return None;
         }
@@ -647,8 +651,8 @@ impl<'a> FoldingContext<'a> {
         }
         let prepared = self.prepared_ssa()?;
         let value = self.prepared_value_id_for_var(var)?;
-        if let Some(name) = self.certified_loop_carrier_name_for_value(value) {
-            return Some(self.name_ref(&name));
+        if let Some(expr) = self.certified_loop_carrier_expr_for_value(value) {
+            return Some(expr);
         }
         if var.version == 0 && var.is_register() {
             if let Some(expr) = self.certified_parameter_expr_for_value(value) {
@@ -657,13 +661,16 @@ impl<'a> FoldingContext<'a> {
             if self.stable_semantic_ids_are_required() {
                 return None;
             }
-            let rendered = self.var_name(var);
-            return Some(
-                self.arg_alias_for_rendered_name(&rendered)
-                    .or_else(|| self.certified_signature_arg_alias_for_register(&rendered))
-                    .map(|n| crate::symbol::var_ref(&symbols, n))
-                    .unwrap_or_else(|| self.name_ref(&rendered)),
-            );
+            return match self.planned_value_expr(value) {
+                Ok(expr) => Some(expr),
+                Err(error) => {
+                    self.retain_first_observation_error(error);
+                    self.retain_first_lowering_refusal(
+                        OpLoweringRefusal::MissingProgramVariableAuthorization,
+                    );
+                    None
+                }
+            };
         }
 
         if !visited.insert(value) {
@@ -819,24 +826,14 @@ impl<'a> FoldingContext<'a> {
         if let Some(plan) = self
             .certified_render_context()
             .and_then(|proof| self.certified_render_plan(proof))
-            && let Some(expr) = plan.stack_param_expr_for_memory_fact(fact)
+            && let Some(expr) = self.inputs.binding_names.and_then(|names| {
+                plan.stack_param_expr_for_memory_fact(fact, names)
+            })
         {
             return Some(expr);
         }
-        let offset = self.inputs.render_facts()?.stack_slot_offset(fact.object)?;
-        let name = self
-            .certified_stack_var_name_for_object_offset(fact.object, offset)
-            .unwrap_or_else(|| {
-                format!(
-                    "var_{}h",
-                    if offset >= 0 {
-                        format!("{:x}", offset)
-                    } else {
-                        format!("{:x}", -offset)
-                    }
-                )
-            });
-        Some(self.name_ref(&name))
+        self.inputs.render_facts()?.stack_slot_offset(fact.object)?;
+        self.certified_stack_var_expr_for_object(fact.object)
     }
 
     fn certified_const_value_for_address_var(&self, var: &SSAVar, depth: u32) -> Option<u64> {
@@ -1063,9 +1060,9 @@ impl<'a> FoldingContext<'a> {
         }
 
         if dst.size >= addr.size
-            && let Some(stack_var) = self.stack_var_for_addr_var(addr)
+            && let Some(stack_var) = self.stack_var_expr_for_addr_var(addr)
         {
-            return self.name_ref(&stack_var);
+            return stack_var;
         }
 
         if addr.is_const() {
@@ -1127,8 +1124,8 @@ impl<'a> FoldingContext<'a> {
             return expr;
         }
 
-        if let Some(stack_var) = self.stack_var_for_addr_var(addr) {
-            return self.name_ref(&stack_var);
+        if let Some(stack_var) = self.stack_var_expr_for_addr_var(addr) {
+            return stack_var;
         }
 
         if addr.is_const() {
