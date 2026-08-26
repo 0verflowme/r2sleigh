@@ -961,6 +961,48 @@ impl SsaArtifact {
         self.graph.value(value_id).map(|value| &value.var)
     }
 
+    /// Exact stack-relative coordinate proved for one artifact-local SSA value.
+    ///
+    /// Consumers must not recover this fact from a register spelling such as
+    /// `rsp`, `rbp`, or `sp`. The decompiler-preparation pass owns the typed
+    /// stack-carrier proof; this method only projects that proof onto the
+    /// graph's stable [`ValueId`](crate::graph::ValueId) identity.
+    pub fn stack_address_root_for_value(
+        &self,
+        value_id: crate::graph::ValueId,
+    ) -> Option<StackAddressRoot> {
+        let facts = self.function.decompile_prep_facts()?;
+        let value = self.value_var(value_id)?;
+        facts.stack_address_root_of(value).copied().or_else(|| {
+            let root = canonical_root_value_id(self, value_id);
+            self.value_var(root)
+                .and_then(|root| facts.stack_address_root_of(root))
+                .copied()
+        })
+    }
+
+    /// Entry-stack-relative coordinate proved for one artifact-local SSA value.
+    ///
+    /// This is deliberately separate from [`Self::stack_address_root_for_value`]:
+    /// a frame-pointer-relative value can have a current-frame coordinate while
+    /// lacking the stronger entry-stack proof after an unknown machine effect.
+    pub fn entry_stack_address_root_for_value(
+        &self,
+        value_id: crate::graph::ValueId,
+    ) -> Option<StackAddressRoot> {
+        let facts = self.function.decompile_prep_facts()?;
+        let value = self.value_var(value_id)?;
+        facts
+            .entry_stack_address_root_of(value)
+            .copied()
+            .or_else(|| {
+                let root = canonical_root_value_id(self, value_id);
+                self.value_var(root)
+                    .and_then(|root| facts.entry_stack_address_root_of(root))
+                    .copied()
+            })
+    }
+
     pub fn inst_op_site(&self, inst_id: crate::graph::InstId) -> Option<(u64, usize)> {
         self.graph.op_site_for_inst(inst_id)
     }
@@ -9774,6 +9816,116 @@ mod tests {
                 .stack_address_roots
                 .is_empty(),
             "register names and architecture storage alone cannot grant stack roots"
+        );
+    }
+
+    #[test]
+    fn artifact_projects_typed_stack_roots_by_value_id_without_register_aliases() {
+        let mut arch = ArchSpec::new("opaque-stack-registers");
+        arch.addr_size = 8;
+        arch.add_register(RegisterDef::new("machine_base_alpha", 16, 8));
+        arch.add_register(RegisterDef::new("machine_base_beta", 24, 8));
+        arch.add_register(RegisterDef::new("machine_return_gamma", 32, 8));
+
+        let stack_pointer = make_reg(16, 8);
+        let frame_pointer = make_reg(24, 8);
+        let blocks = vec![R2ILBlock {
+            addr: 0x3400,
+            size: 4,
+            ops: vec![
+                R2ILOp::Copy {
+                    dst: frame_pointer.clone(),
+                    src: stack_pointer,
+                },
+                R2ILOp::IntSub {
+                    dst: make_unique(0x48, 8),
+                    a: frame_pointer,
+                    b: make_const(0x18, 8),
+                },
+                R2ILOp::Return {
+                    target: make_ram(0, 8),
+                },
+            ],
+            switch_info: None,
+            op_metadata: Default::default(),
+        }];
+        let sp_storage = CanonicalStorageId {
+            space: crate::CanonicalStorageSpace::Register,
+            offset: 16,
+            size: 8,
+        };
+        let fp_storage = CanonicalStorageId {
+            space: crate::CanonicalStorageSpace::Register,
+            offset: 24,
+            size: 8,
+        };
+        let ra_storage = CanonicalStorageId {
+            space: crate::CanonicalStorageSpace::Register,
+            offset: 32,
+            size: 8,
+        };
+        let interface = SourceFunctionInterface::new_exact(
+            b"opaque-stack-registers".to_vec(),
+            "opaque",
+            [],
+            SourceFunctionReturn::Void,
+            [SourceStackSlotSpec::new_local(
+                StackAddressBase::FramePointer,
+                fp_storage,
+                -0x18,
+                8,
+            )],
+        )
+        .expect("typed interface")
+        .with_return_address_storage(ra_storage)
+        .expect("return-address carrier")
+        .with_stack_pointer_storage(sp_storage)
+        .expect("stack-pointer carrier")
+        .with_frame_pointer_storage(fp_storage)
+        .expect("frame-pointer carrier");
+
+        let artifact = SsaArtifact::for_decompile_with_interface(&blocks, Some(&arch), interface)
+            .expect("typed decompile artifact");
+        let frame_setup = artifact
+            .graph()
+            .inst_id_for_op_site(0x3400, 0)
+            .and_then(|inst| artifact.graph().inst(inst))
+            .expect("frame setup graph instruction");
+        let entry_sp = frame_setup.inputs[0];
+        let local_address = artifact
+            .graph()
+            .inst_id_for_op_site(0x3400, 1)
+            .and_then(|inst| artifact.graph().inst(inst))
+            .and_then(|inst| inst.output)
+            .expect("local-address graph value");
+
+        assert_eq!(
+            artifact.stack_address_root_for_value(entry_sp),
+            Some(StackAddressRoot {
+                base: StackAddressBase::StackPointer,
+                offset: 0,
+            })
+        );
+        assert_eq!(
+            artifact.stack_address_root_for_value(local_address),
+            Some(StackAddressRoot {
+                base: StackAddressBase::FramePointer,
+                offset: -0x18,
+            })
+        );
+        assert_eq!(
+            artifact.entry_stack_address_root_for_value(local_address),
+            Some(StackAddressRoot {
+                base: StackAddressBase::StackPointer,
+                offset: -0x18,
+            })
+        );
+        assert!(
+            [entry_sp, local_address].iter().all(|value| {
+                let name = &artifact.graph().value(*value).expect("graph value").var.name;
+                !matches!(name.to_ascii_lowercase().as_str(), "sp" | "rsp" | "fp" | "rbp")
+            }),
+            "the typed ValueId projection must not depend on conventional raw aliases"
         );
     }
 
