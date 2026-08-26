@@ -192,9 +192,9 @@ impl<'a> FoldingContext<'a> {
         block_addr: u64,
         op_idx: usize,
         target: &SSAVar,
-    ) -> CExpr {
+    ) -> OpLoweringResult<CExpr> {
         if let Some(resolved) = self.resolved_callee_identity_expr_for_site(block_addr, op_idx) {
-            return resolved;
+            return Ok(resolved);
         }
         self.resolve_call_target(target)
     }
@@ -528,33 +528,26 @@ impl<'a> FoldingContext<'a> {
             .map(|decision| decision.arity)
     }
 
-    pub(super) fn resolve_call_target(&self, target: &SSAVar) -> CExpr {
-        if let Some(addr) = parse_address_from_var_name(&target.name) {
-            return self.callee_identity_expr(&self.callee_identity_for_direct_target(addr));
-        }
-        if target.is_const() {
-            return self.const_to_expr(target);
-        }
-        let Some(value) = self.prepared_value_id_for_var(target) else {
-            self.retain_first_lowering_refusal(
-                OpLoweringRefusal::MissingProgramVariableAuthorization,
+    pub(super) fn resolve_call_target(&self, target: &SSAVar) -> OpLoweringResult<CExpr> {
+        if let Some(addr) = target.constant_bits() {
+            return Ok(
+                self.callee_identity_expr(&self.callee_identity_for_direct_target(addr))
             );
-            return CExpr::External {
-                name: "__r2dec_unresolved_call_target".to_string(),
-                kind: crate::symbol::ExternalKind::Intrinsic,
-            };
-        };
+        }
+        if target.name_kind().is_constant() {
+            return Err(OpLoweringRefusal::MissingProgramVariableAuthorization);
+        }
+        if let Some(addr) = parse_address_from_var_name(&target.name) {
+            return Ok(self.callee_identity_expr(&self.callee_identity_for_direct_target(addr)));
+        }
+        let value = self
+            .prepared_value_id_for_var(target)
+            .ok_or(OpLoweringRefusal::MissingProgramVariableAuthorization)?;
         match self.planned_value_expr(value) {
-            Ok(expr) => expr,
+            Ok(expr) => Ok(expr),
             Err(error) => {
                 self.retain_first_observation_error(error);
-                self.retain_first_lowering_refusal(
-                    OpLoweringRefusal::MissingProgramVariableAuthorization,
-                );
-                CExpr::External {
-                    name: "__r2dec_unresolved_call_target".to_string(),
-                    kind: crate::symbol::ExternalKind::Intrinsic,
-                }
+                Err(OpLoweringRefusal::MissingProgramVariableAuthorization)
             }
         }
     }
@@ -586,7 +579,12 @@ impl<'a> FoldingContext<'a> {
                 let mut visited = HashSet::new();
                 let expr = self
                     .render_semantic_value(&value, 0, &mut visited)
-                    .unwrap_or_else(|| self.expr_for_semantic_call_arg_fallback(&value));
+                    .unwrap_or_else(|| {
+                        self.retain_lowering_result(
+                            self.expr_for_semantic_call_arg_fallback(&value),
+                        )
+                        .unwrap_or_else(|| self.unresolved_call_arg_expr())
+                    });
                 self.normalize_call_arg_expr_for_callee(callee, expr)
             }
             analysis::SemanticCallArg::StringAddr(addr) => CExpr::UIntLit(addr),
@@ -603,7 +601,12 @@ impl<'a> FoldingContext<'a> {
                 let mut visited = HashSet::new();
                 let expr = self
                     .render_semantic_value(&value, 0, &mut visited)
-                    .unwrap_or_else(|| self.expr_for_semantic_call_arg_fallback(&value));
+                    .unwrap_or_else(|| {
+                        self.retain_lowering_result(
+                            self.expr_for_semantic_call_arg_fallback(&value),
+                        )
+                        .unwrap_or_else(|| self.unresolved_call_arg_expr())
+                    });
                 self.normalize_call_arg_expr_with_import_policy(expr, false)
             }
             analysis::SemanticCallArg::StringAddr(addr) => CExpr::UIntLit(addr),
@@ -691,7 +694,12 @@ impl<'a> FoldingContext<'a> {
                 }
                 let expr = self
                     .render_imported_semantic_arg_value(&value, !allow_string_like_resolution)
-                    .unwrap_or_else(|| self.expr_for_semantic_call_arg_fallback(&value));
+                    .unwrap_or_else(|| {
+                        self.retain_lowering_result(
+                            self.expr_for_semantic_call_arg_fallback(&value),
+                        )
+                        .unwrap_or_else(|| self.unresolved_call_arg_expr())
+                    });
                 let finalized = self.finalize_authoritative_imported_call_arg_expr(
                     expr,
                     preserve_stable_input_slot,
@@ -897,27 +905,23 @@ impl<'a> FoldingContext<'a> {
     pub(super) fn expr_for_semantic_call_arg_fallback(
         &self,
         value: &analysis::SemanticValue,
-    ) -> CExpr {
+    ) -> OpLoweringResult<CExpr> {
         match value {
-            analysis::SemanticValue::Scalar(analysis::ScalarValue::Expr(expr)) => expr.clone(),
+            analysis::SemanticValue::Scalar(analysis::ScalarValue::Expr(expr)) => {
+                Ok(expr.clone())
+            }
             analysis::SemanticValue::Scalar(analysis::ScalarValue::Root(value_ref)) => {
-                if value_ref.var.is_const() {
+                if value_ref.var.constant_bits().is_some() {
                     self.const_to_expr(&value_ref.var)
                 } else {
-                    let Some(value) = self.prepared_value_id_for_var(&value_ref.var) else {
-                        self.retain_first_lowering_refusal(
-                            OpLoweringRefusal::MissingProgramVariableAuthorization,
-                        );
-                        return self.unresolved_call_arg_expr();
-                    };
+                    let value = self
+                        .prepared_value_id_for_var(&value_ref.var)
+                        .ok_or(OpLoweringRefusal::MissingProgramVariableAuthorization)?;
                     match self.planned_value_expr(value) {
-                        Ok(expr) => expr,
+                        Ok(expr) => Ok(expr),
                         Err(error) => {
                             self.retain_first_observation_error(error);
-                            self.retain_first_lowering_refusal(
-                                OpLoweringRefusal::MissingProgramVariableAuthorization,
-                            );
-                            self.unresolved_call_arg_expr()
+                            Err(OpLoweringRefusal::MissingProgramVariableAuthorization)
                         }
                     }
                 }
@@ -926,7 +930,7 @@ impl<'a> FoldingContext<'a> {
                 let mut visited = HashSet::new();
                 self.render_address_expr_from_addr(addr, 0, &mut visited)
                     .or_else(|| self.render_base_ref_expr(&addr.base, true, 0, &mut visited))
-                    .unwrap_or_else(|| self.unresolved_call_arg_expr())
+                    .ok_or(OpLoweringRefusal::MissingProgramVariableAuthorization)
             }
             analysis::SemanticValue::Load { space, addr, size } => {
                 let mut visited = HashSet::new();
@@ -937,9 +941,11 @@ impl<'a> FoldingContext<'a> {
                             self.render_address_expr_from_addr(addr, 0, &mut visited)?;
                         Some(CExpr::Deref(Box::new(addr_expr)))
                     })
-                    .unwrap_or_else(|| self.unresolved_call_arg_expr())
+                    .ok_or(OpLoweringRefusal::MissingProgramVariableAuthorization)
             }
-            analysis::SemanticValue::Unknown => self.unresolved_call_arg_expr(),
+            analysis::SemanticValue::Unknown => {
+                Err(OpLoweringRefusal::MissingProgramVariableAuthorization)
+            }
         }
     }
 
@@ -1415,8 +1421,17 @@ impl<'a> FoldingContext<'a> {
 
             preferred
                 .or_else(|| {
-                    let rendered = self.var_name(var);
-                    self.arg_alias_for_rendered_name(&rendered).map(|n| crate::symbol::var_ref(&self.symbols, n))
+                    let value = self.prepared_value_id_for_var(var)?;
+                    match self.planned_value_expr(value) {
+                        Ok(expr) => Some(expr),
+                        Err(error) => {
+                            self.retain_first_observation_error(error);
+                            self.retain_first_lowering_refusal(
+                                super::OpLoweringRefusal::MissingProgramVariableAuthorization,
+                            );
+                            None
+                        }
+                    }
                 })
                 .or_else(|| {
                     prepared

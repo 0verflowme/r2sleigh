@@ -1,40 +1,5 @@
 use super::*;
 use crate::fold::FoldingContext;
-use std::collections::BTreeSet;
-
-fn install_call_owner(
-    ctx: &mut FoldingContext<'_>,
-    source_call: (u64, usize),
-    owner_name: &str,
-    alias: &str,
-) {
-    let source_id = analysis::CallSiteId::from(source_call);
-    ctx.state.analysis_ctx.ownership.call_ownership.insert(
-        source_id,
-        analysis::CallOwnershipFact {
-            source: source_id,
-            owner: Some(analysis::CallOwner {
-                visible_name: owner_name.to_string(),
-                kind: analysis::CallOwnerKind::StableLocal,
-            }),
-            aliases: BTreeSet::from([alias.to_string()]),
-            direct_aliases: BTreeSet::from([alias.to_string()]),
-        },
-    );
-    ctx.state
-        .analysis_ctx
-        .ownership
-        .alias_sources
-        .insert(alias.to_string(), source_id);
-    ctx.state.analysis_ctx.use_info.insert_call_result_source_alias(&alias.to_string(), source_call);
-}
-
-fn wrap_parens(mut expr: CExpr, count: usize) -> CExpr {
-    for _ in 0..count {
-        expr = CExpr::Paren(Box::new(expr));
-    }
-    expr
-}
 
 #[test]
 fn expr_contains_opaque_temp_uses_visit_over_nested_nodes() {
@@ -62,35 +27,6 @@ fn expr_contains_opaque_temp_uses_visit_over_nested_nodes() {
         CExpr::IntLit(0),
     );
     assert!(!ctx.expr_contains_opaque_temp(&clean));
-}
-
-#[test]
-fn call_result_predicate_owner_rewrite_depth_guard_is_inclusive() {
-    let mut ctx = FoldingContext::new(64);
-    install_call_owner(&mut ctx, (0x1000, 2), "loc", "rax_1");
-
-    let at_max = wrap_parens(
-        ctx.name_ref("rax_1"),
-        MAX_PREDICATE_OPERAND_DEPTH as usize,
-    );
-    assert_eq!(
-        ctx.rewrite_call_result_predicate_owners(at_max, 0),
-        wrap_parens(
-            ctx.name_ref("loc"),
-            MAX_PREDICATE_OPERAND_DEPTH as usize,
-        ),
-        "owner aliases at exactly MAX_PREDICATE_OPERAND_DEPTH must still rewrite"
-    );
-
-    let beyond_max = wrap_parens(
-        ctx.name_ref("rax_1"),
-        MAX_PREDICATE_OPERAND_DEPTH as usize + 1,
-    );
-    assert_eq!(
-        ctx.rewrite_call_result_predicate_owners(beyond_max.clone(), 0),
-        beyond_max,
-        "owner aliases beyond MAX_PREDICATE_OPERAND_DEPTH must be left untouched"
-    );
 }
 
 #[test]

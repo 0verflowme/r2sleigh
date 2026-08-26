@@ -4,16 +4,28 @@ use std::collections::HashSet;
 #[test]
 fn collect_expr_reads_visits_nested_children() {
     let ctx = FoldingContext::new(64);
+    let CExpr::Var(a) = ctx.name_ref("a_1") else {
+        unreachable!("fixture name reference")
+    };
+    let CExpr::Var(callee) = ctx.name_ref("callee_0") else {
+        unreachable!("fixture name reference")
+    };
+    let CExpr::Var(b) = ctx.name_ref("b_2") else {
+        unreachable!("fixture name reference")
+    };
+    let CExpr::Var(c) = ctx.name_ref("c_3") else {
+        unreachable!("fixture name reference")
+    };
     let expr = CExpr::binary(
         BinaryOp::Add,
-        ctx.name_ref("a_1"),
+        CExpr::Var(a),
         CExpr::call(
-            ctx.name_ref("callee_0"),
+            CExpr::Var(callee),
             vec![
-                CExpr::Deref(Box::new(ctx.name_ref("b_2"))),
+                CExpr::Deref(Box::new(CExpr::Var(b))),
                 CExpr::Paren(Box::new(CExpr::cast(
                     CType::Int(32),
-                    ctx.name_ref("c_3"),
+                    CExpr::Var(c),
                 ))),
             ],
         ),
@@ -22,10 +34,10 @@ fn collect_expr_reads_visits_nested_children() {
     let mut reads = HashSet::new();
     ctx.collect_expr_reads(&expr, &mut reads);
 
-    assert!(reads.contains("a_1"));
-    assert!(reads.contains("callee_0"));
-    assert!(reads.contains("b_2"));
-    assert!(reads.contains("c_3"));
+    assert!(reads.contains(&a));
+    assert!(reads.contains(&callee));
+    assert!(reads.contains(&b));
+    assert!(reads.contains(&c));
 }
 
 #[test]

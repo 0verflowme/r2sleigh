@@ -61,11 +61,16 @@ BINDING_AUDIT_JOURNAL_FAILURE_REASONS = {
     "journal_recording_failure",
     "journal_seal_failure",
 }
-BINDING_AUDIT_FAILURE_REASONS = BINDING_AUDIT_JOURNAL_FAILURE_REASONS | {
-    "plan_build_failure",
-    "source_pairing_failure",
-    "report_failure",
-}
+BINDING_AUDIT_PLACEMENT_FAILURE_REASONS = {"placement_refusal"}
+BINDING_AUDIT_FAILURE_REASONS = (
+    BINDING_AUDIT_JOURNAL_FAILURE_REASONS
+    | BINDING_AUDIT_PLACEMENT_FAILURE_REASONS
+    | {
+        "plan_build_failure",
+        "source_pairing_failure",
+        "report_failure",
+    }
+)
 BINDING_AUDIT_MAX_COUNT = (1 << 64) - 1
 BINDING_AUDIT_JOURNAL_CAUSE_FIELDS = {
     "source_authority": frozenset(),
@@ -535,6 +540,57 @@ def _score_counted_binding_audit(
     }
 
 
+def _score_observation_only_binding_audit(
+    envelope: dict[str, Any], audit: dict[str, Any]
+) -> dict[str, Any]:
+    audit = _exact_object(
+        audit,
+        {"schema_version", "status", "observations"},
+        context="observation-only binding audit",
+    )
+    if isinstance(audit["schema_version"], bool) or audit["schema_version"] != 2:
+        raise BindingAuditFormatError("binding audit schema_version must be 2")
+    if audit["status"] != "non_quality_observations":
+        raise BindingAuditFormatError("observation-only binding audit status is invalid")
+    observations = _audit_domains(
+        audit["observations"],
+        (
+            "total",
+            "rendered",
+            "justified_elision",
+            "refused",
+            "unaccounted",
+        ),
+        context="binding audit observations",
+    )
+    equations = {
+        domain: counts["total"]
+        == counts["rendered"]
+        + counts["justified_elision"]
+        + counts["refused"]
+        + counts["unaccounted"]
+        for domain, counts in observations.items()
+    }
+    quality = {
+        domain: equations[domain]
+        and counts["refused"] == 0
+        and counts["unaccounted"] == 0
+        for domain, counts in observations.items()
+    }
+    return {
+        "status": "non_quality",
+        "request_status": envelope["request_status"],
+        "source_status": audit["status"],
+        "marker_count": 1,
+        "record": envelope,
+        "equations": {"observations": equations},
+        "quality": {"observations": quality},
+        "canonical_total": sum(
+            observations[domain]["total"] for domain in BINDING_AUDIT_DOMAINS
+        ),
+    }
+
+
 def _validate_effect_obligations(value: Any) -> dict[str, Any]:
     effect = _exact_object(
         value,
@@ -669,6 +725,8 @@ def _score_binding_audit(envelope: dict[str, Any]) -> dict[str, Any]:
     status = audit.get("status")
     if status in {"complete", "incomplete_observations", "non_quality"}:
         return _score_counted_binding_audit(envelope, audit)
+    if status == "non_quality_observations":
+        return _score_observation_only_binding_audit(envelope, audit)
     if status == "failed":
         reason = audit.get("reason")
         if reason not in BINDING_AUDIT_FAILURE_REASONS:
@@ -676,7 +734,10 @@ def _score_binding_audit(envelope: dict[str, Any]) -> dict[str, Any]:
                 "failed binding audit reason is not in the schema"
             )
         expected_fields = {"schema_version", "status", "reason"}
-        if reason in BINDING_AUDIT_JOURNAL_FAILURE_REASONS:
+        if reason in (
+            BINDING_AUDIT_JOURNAL_FAILURE_REASONS
+            | BINDING_AUDIT_PLACEMENT_FAILURE_REASONS
+        ):
             expected_fields.add("cause")
         _exact_object(
             audit,
@@ -687,6 +748,8 @@ def _score_binding_audit(envelope: dict[str, Any]) -> dict[str, Any]:
             raise BindingAuditFormatError("binding audit schema_version must be 2")
         if reason in BINDING_AUDIT_JOURNAL_FAILURE_REASONS:
             _validate_binding_journal_cause(audit["cause"])
+        elif reason in BINDING_AUDIT_PLACEMENT_FAILURE_REASONS:
+            _validate_placement_cause(audit["cause"])
         return {
             "status": "failed",
             "request_status": request_status,
@@ -722,12 +785,42 @@ def _score_render_refusal(envelope: dict[str, Any]) -> dict[str, Any]:
             context="render refusal",
         )
     elif status == "refused":
-        _exact_object(
-            refusal,
-            {"schema_version", "status", "kind"},
-            context="render refusal",
-        )
-        if refusal["kind"] not in RENDER_REFUSAL_KINDS:
+        kind = refusal.get("kind")
+        if kind == "refused_binding_disposition":
+            refusal = _exact_object(
+                refusal,
+                {"schema_version", "status", "kind", "observations"},
+                context="binding-disposition render refusal",
+            )
+            _audit_domains(
+                refusal["observations"],
+                (
+                    "total",
+                    "rendered",
+                    "justified_elision",
+                    "refused",
+                    "unaccounted",
+                ),
+                context="render refusal observations",
+            )
+        elif kind in PLACEMENT_AUDIT_CAUSE_FIELDS:
+            refusal = _exact_object(
+                refusal,
+                {"schema_version", "status", "kind", "cause"},
+                context="placement render refusal",
+            )
+            cause = _validate_placement_cause(refusal["cause"])
+            if cause["kind"] != kind:
+                raise BindingAuditFormatError(
+                    "placement render refusal kind disagrees with its cause"
+                )
+        elif kind in RENDER_REFUSAL_KINDS:
+            _exact_object(
+                refusal,
+                {"schema_version", "status", "kind"},
+                context="render refusal",
+            )
+        else:
             raise BindingAuditFormatError("render refusal kind is invalid")
     else:
         raise BindingAuditFormatError("render refusal status is invalid")

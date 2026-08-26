@@ -8,10 +8,9 @@
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
-use r2ssa::{
-    CFGEdge, SSAFunction, SSAOp, SSAVar, SsaExecutionStopReason, SsaWorkControl,
-    domtree::DomTree,
-};
+use r2ssa::{CFGEdge, SSAFunction, SsaExecutionStopReason, SsaWorkControl, domtree::DomTree};
+#[cfg(test)]
+use r2ssa::SSAOp;
 
 /// A control flow region.
 #[derive(Debug, Clone)]
@@ -200,13 +199,6 @@ struct NormalizedSwitchInfo {
 struct SwitchInfoCandidate {
     cases: Vec<(u64, u64)>,
     default: Option<u64>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct SwitchChainCase {
-    selector_key: String,
-    case_value: u64,
-    match_when_true: bool,
 }
 
 type LocalSwitchTargets = (Vec<(u64, u64)>, Option<u64>);
@@ -574,11 +566,6 @@ impl<'a> RegionAnalyzer<'a> {
             2 => {
                 // Conditional - prefer CFG edge polarity over successor order.
                 if let Some((true_target, false_target)) = self.resolve_conditional_targets(entry) {
-                    if let Some(switch_region) =
-                        self.detect_conditional_switch_chain(entry, true_target, false_target)
-                    {
-                        return switch_region;
-                    }
                     self.analyze_conditional(entry, true_target, false_target)
                 } else {
                     // Fallback: preserve existing successor order when labels are unavailable.
@@ -1082,87 +1069,6 @@ impl<'a> RegionAnalyzer<'a> {
         }
     }
 
-    fn detect_conditional_switch_chain(
-        &mut self,
-        entry: u64,
-        true_target: u64,
-        false_target: u64,
-    ) -> Option<Region> {
-        let mut processed_blocks = vec![entry];
-        let mut switch_cases = Vec::new();
-        let mut compare_block = entry;
-        let mut current_true = true_target;
-        let mut current_false = false_target;
-        let mut selector_key = None;
-
-        for _ in 0..16 {
-            if !self.poll() {
-                return None;
-            }
-            let compare = self.extract_switch_chain_case(compare_block)?;
-            if let Some(expected) = selector_key.as_ref() {
-                if expected != &compare.selector_key {
-                    return None;
-                }
-            } else {
-                selector_key = Some(compare.selector_key.clone());
-            }
-
-            let true_path = self.follow_branch_only_chain(current_true);
-            let false_path = self.follow_branch_only_chain(current_false);
-            let next_selector = selector_key.as_ref()?;
-            let true_compare = self
-                .extract_switch_chain_case(true_path)
-                .filter(|next| next.selector_key == *next_selector);
-            let false_compare = self
-                .extract_switch_chain_case(false_path)
-                .filter(|next| next.selector_key == *next_selector);
-
-            match (true_compare, false_compare) {
-                (Some(_), Some(_)) => return None,
-                (Some(_), None) => {
-                    switch_cases.push((compare.case_value, false_path));
-                    let (next_true, next_false) = self.resolve_conditional_targets(true_path)?;
-                    processed_blocks.push(true_path);
-                    compare_block = true_path;
-                    current_true = next_true;
-                    current_false = next_false;
-                }
-                (None, Some(_)) => {
-                    switch_cases.push((compare.case_value, true_path));
-                    let (next_true, next_false) = self.resolve_conditional_targets(false_path)?;
-                    processed_blocks.push(false_path);
-                    compare_block = false_path;
-                    current_true = next_true;
-                    current_false = next_false;
-                }
-                (None, None) => {
-                    let (case_target, default_target) = if compare.match_when_true {
-                        (true_path, false_path)
-                    } else {
-                        (false_path, true_path)
-                    };
-                    switch_cases.push((compare.case_value, case_target));
-                    if switch_cases.len() < 4 {
-                        return None;
-                    }
-                    switch_cases.sort_unstable_by_key(|(value, _)| *value);
-                    switch_cases.dedup_by_key(|(value, _)| *value);
-                    for block in processed_blocks {
-                        self.processed.insert(block);
-                    }
-                    return Some(self.analyze_switch_with_cases(
-                        entry,
-                        &switch_cases,
-                        Some(default_target),
-                    ));
-                }
-            }
-        }
-
-        None
-    }
-
     fn normalized_switch_info(&self, entry: u64) -> Option<NormalizedSwitchInfo> {
         if !self.poll() {
             return None;
@@ -1207,163 +1113,6 @@ impl<'a> RegionAnalyzer<'a> {
         let cases = self.canonical_switch_cases(&cases);
 
         Some(NormalizedSwitchInfo { cases, default })
-    }
-
-    fn follow_branch_only_chain(&self, start: u64) -> u64 {
-        let mut current = start;
-        let mut seen = HashSet::new();
-        while seen.insert(current) {
-            if !self.poll() {
-                break;
-            }
-            let Some(block) = self.func.get_block(current) else {
-                break;
-            };
-            let succs = self.func.successors(current);
-            if succs.len() != 1
-                || !block.phis.is_empty()
-                || !block
-                    .ops
-                    .iter()
-                    .all(|op| matches!(op, SSAOp::Branch { .. }))
-            {
-                break;
-            }
-            current = succs[0];
-        }
-        current
-    }
-
-    fn extract_switch_chain_case(&self, block_addr: u64) -> Option<SwitchChainCase> {
-        let block = self.func.get_block(block_addr)?;
-        let cond = block.ops.iter().rev().find_map(|op| match op {
-            SSAOp::CBranch { cond, .. } => Some(cond),
-            _ => None,
-        })?;
-        self.extract_switch_chain_case_from_var(block, cond, 0)
-    }
-
-    fn extract_switch_chain_case_from_var(
-        &self,
-        block: &r2ssa::FunctionSSABlock,
-        var: &SSAVar,
-        depth: usize,
-    ) -> Option<SwitchChainCase> {
-        if depth > 8 {
-            return None;
-        }
-        let defining_op = block.ops.iter().rev().find(|op| op.dst() == Some(var))?;
-        match defining_op {
-            SSAOp::Copy { src, .. }
-            | SSAOp::Cast { src, .. }
-            | SSAOp::New { src, .. }
-            | SSAOp::IntZExt { src, .. }
-            | SSAOp::IntSExt { src, .. }
-            | SSAOp::Subpiece { src, .. } => {
-                self.extract_switch_chain_case_from_var(block, src, depth + 1)
-            }
-            SSAOp::BoolNot { src, .. } => {
-                let mut compare = self.extract_switch_chain_case_from_var(block, src, depth + 1)?;
-                compare.match_when_true = !compare.match_when_true;
-                Some(compare)
-            }
-            SSAOp::IntEqual { a, b, .. } => {
-                self.extract_switch_chain_case_from_compare(block, a, b, true)
-            }
-            SSAOp::IntNotEqual { a, b, .. } => {
-                self.extract_switch_chain_case_from_compare(block, a, b, false)
-            }
-            _ => None,
-        }
-    }
-
-    fn extract_switch_chain_case_from_compare(
-        &self,
-        block: &r2ssa::FunctionSSABlock,
-        a: &SSAVar,
-        b: &SSAVar,
-        match_when_true: bool,
-    ) -> Option<SwitchChainCase> {
-        if let Some(raw) = crate::analysis::utils::parse_const_value(&a.name) {
-            return self
-                .extract_selector_root(block, b, 0)
-                .map(|selector_key| SwitchChainCase {
-                    selector_key,
-                    case_value: raw,
-                    match_when_true,
-                });
-        }
-        if let Some(raw) = crate::analysis::utils::parse_const_value(&b.name) {
-            if raw == 0
-                && let Some((selector_key, case_value)) =
-                    self.extract_selector_minus_const(block, a, 0)
-            {
-                return Some(SwitchChainCase {
-                    selector_key,
-                    case_value,
-                    match_when_true,
-                });
-            }
-            return self
-                .extract_selector_root(block, a, 0)
-                .map(|selector_key| SwitchChainCase {
-                    selector_key,
-                    case_value: raw,
-                    match_when_true,
-                });
-        }
-        None
-    }
-
-    fn extract_selector_minus_const(
-        &self,
-        block: &r2ssa::FunctionSSABlock,
-        var: &SSAVar,
-        depth: usize,
-    ) -> Option<(String, u64)> {
-        if depth > 8 {
-            return None;
-        }
-        let defining_op = block.ops.iter().rev().find(|op| op.dst() == Some(var))?;
-        match defining_op {
-            SSAOp::Copy { src, .. }
-            | SSAOp::Cast { src, .. }
-            | SSAOp::New { src, .. }
-            | SSAOp::IntZExt { src, .. }
-            | SSAOp::IntSExt { src, .. }
-            | SSAOp::Subpiece { src, .. } => {
-                self.extract_selector_minus_const(block, src, depth + 1)
-            }
-            SSAOp::IntSub { a, b, .. } => {
-                let raw = crate::analysis::utils::parse_const_value(&b.name)?;
-                let selector_key = self.extract_selector_root(block, a, depth + 1)?;
-                Some((selector_key, raw))
-            }
-            _ => None,
-        }
-    }
-
-    fn extract_selector_root(
-        &self,
-        block: &r2ssa::FunctionSSABlock,
-        var: &SSAVar,
-        depth: usize,
-    ) -> Option<String> {
-        if depth > 8 || crate::analysis::utils::parse_const_value(&var.name).is_some() {
-            return None;
-        }
-        let Some(defining_op) = block.ops.iter().rev().find(|op| op.dst() == Some(var)) else {
-            return Some(var.display_name());
-        };
-        match defining_op {
-            SSAOp::Copy { src, .. }
-            | SSAOp::Cast { src, .. }
-            | SSAOp::New { src, .. }
-            | SSAOp::IntZExt { src, .. }
-            | SSAOp::IntSExt { src, .. }
-            | SSAOp::Subpiece { src, .. } => self.extract_selector_root(block, src, depth + 1),
-            _ => Some(var.display_name()),
-        }
     }
 
     fn is_better_switch_candidate(
@@ -2619,7 +2368,7 @@ mod tests {
     use crate::fold::FoldingContext;
     use crate::structure::ControlFlowStructurer;
     use r2il::{R2ILBlock, R2ILOp, Varnode};
-    use r2ssa::{BlockTerminator, SSAFunction};
+    use r2ssa::{BlockTerminator, SSAFunction, SSAVar};
 
     // Note: Full tests would require constructing SSAFunctions
     // which requires r2il blocks. These are placeholder tests.
@@ -4278,59 +4027,47 @@ mod tests {
     }
 
     #[test]
-    fn detects_conditional_switch_chain_from_equality_ladder() {
+    fn equality_ladder_remains_nested_conditionals_without_switch_metadata() {
         let func = build_equality_switch_chain_cfg();
         let mut analyzer = RegionAnalyzer::new(&func);
 
-        let region = analyzer
-            .detect_conditional_switch_chain(0x1000, 0x1100, 0x1004)
-            .expect("switch chain region");
-        let Region::Switch {
-            switch_block,
-            cases,
-            default,
-            merge_block,
-        } = region
-        else {
-            panic!("expected switch region from equality ladder");
-        };
+        let region = analyzer.analyze_region_recursive(0x1000);
 
-        assert_eq!(switch_block, 0x1000);
-        let values: Vec<u64> = cases
-            .iter()
-            .map(|(value, _)| value.expect("case value"))
-            .collect();
-        assert_eq!(values, vec![0, 1, 2, 3]);
-        assert_eq!(default.map(|region| region.entry()), Some(0x1140));
-        assert_eq!(merge_block, Some(0x1200));
+        assert!(matches!(
+            &region,
+            Region::IfThenElse {
+                cond_block: 0x1000,
+                ..
+            }
+        ));
+        for cond_block in [0x1000, 0x1008, 0x1010, 0x1018] {
+            assert!(
+                region_contains_cond_block(&region, cond_block),
+                "equality ladder condition 0x{cond_block:x} must remain explicit"
+            );
+        }
     }
 
     #[test]
-    fn detects_conditional_switch_chain_from_flag_zero_ladder() {
+    fn flag_zero_ladder_remains_nested_conditionals_without_switch_metadata() {
         let func = build_flag_switch_chain_cfg();
         let mut analyzer = RegionAnalyzer::new(&func);
 
-        let region = analyzer
-            .detect_conditional_switch_chain(0x1000, 0x1100, 0x1004)
-            .expect("switch chain region");
-        let Region::Switch {
-            switch_block,
-            cases,
-            default,
-            merge_block,
-        } = region
-        else {
-            panic!("expected switch region from flag ladder");
-        };
+        let region = analyzer.analyze_region_recursive(0x1000);
 
-        assert_eq!(switch_block, 0x1000);
-        let values: Vec<u64> = cases
-            .iter()
-            .map(|(value, _)| value.expect("case value"))
-            .collect();
-        assert_eq!(values, vec![0, 1, 2, 3]);
-        assert_eq!(default.map(|region| region.entry()), Some(0x1140));
-        assert_eq!(merge_block, Some(0x1200));
+        assert!(matches!(
+            &region,
+            Region::IfThenElse {
+                cond_block: 0x1000,
+                ..
+            }
+        ));
+        for cond_block in [0x1000, 0x1008, 0x1010, 0x1018] {
+            assert!(
+                region_contains_cond_block(&region, cond_block),
+                "flag ladder condition 0x{cond_block:x} must remain explicit"
+            );
+        }
     }
 
     #[test]

@@ -5293,6 +5293,12 @@ fn render_refusal_reason(refusal: DecompileRenderRefusal) -> &'static str {
         DecompileRenderRefusal::MissingProgramVariableAuthorization => {
             "native rendering refused: missing program-variable authorization"
         }
+        DecompileRenderRefusal::DeclarationPlacement(_) => {
+            "native rendering refused: declaration placement"
+        }
+        DecompileRenderRefusal::RefusedBindingDisposition { .. } => {
+            "native rendering refused: refused binding disposition"
+        }
         DecompileRenderRefusal::NormalizationOriginUnavailable => {
             "native rendering refused: normalization origin unavailable"
         }

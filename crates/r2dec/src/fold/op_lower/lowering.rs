@@ -1,4 +1,5 @@
 use super::calls::CertifiedCallArgs;
+use super::memory_renderer::CertifiedMemoryAccessExpr;
 use super::projection::{project_machine_use, project_machine_write};
 use super::*;
 
@@ -273,12 +274,17 @@ impl<'a> FoldingContext<'a> {
         }
     }
 
-    fn planned_input_expr(
+    fn normalized_input_projection(
         &self,
         frame: &LowerFrame,
         input_idx: usize,
-        contextual_expr: CExpr,
-    ) -> Result<CExpr, crate::observation_journal::LegacyObservationJournalError> {
+    ) -> Result<
+        (
+            crate::normalize::NormalizedOpSite,
+            crate::normalize::NormalizedInputProjection,
+        ),
+        crate::observation_journal::LegacyObservationJournalError,
+    > {
         let site = frame.normalized_site.ok_or(
             crate::observation_journal::LegacyObservationJournalError::MissingNormalizedSiteContext,
         )?;
@@ -298,20 +304,26 @@ impl<'a> FoldingContext<'a> {
                     site,
                 ),
             )?;
-        let input = projection.inputs.get(input_idx).ok_or(
+        let input = projection.inputs.get(input_idx).cloned().ok_or(
             crate::observation_journal::LegacyObservationJournalError::InvalidNormalizedInput {
                 site,
                 input_idx,
             },
         )?;
+        Ok((site, input))
+    }
+
+    fn uniform_planned_input_disposition(
+        &self,
+        site: crate::normalize::NormalizedOpSite,
+        input_idx: usize,
+        input: &crate::normalize::NormalizedInputProjection,
+    ) -> Result<
+        Option<(r2ssa::UseSite, r2ssa::MachineUseDisposition)>,
+        crate::observation_journal::LegacyObservationJournalError,
+    > {
         let Some(first_site) = input.uses.first().copied() else {
-            // Synthetic preservation inputs have no original graph use and
-            // therefore no source-owned projection to apply.
-            return Ok(self.observe_optional_normalized_input_value_expr(
-                frame.normalized_site,
-                input_idx,
-                self.planned_value_expr(input.value)?,
-            ));
+            return Ok(None);
         };
         let Some(names) = self.inputs.binding_names else {
             return Err(
@@ -378,6 +390,26 @@ impl<'a> FoldingContext<'a> {
                 }
             }
         }
+        Ok(Some((first_site, first_disposition)))
+    }
+
+    fn planned_input_expr(
+        &self,
+        frame: &LowerFrame,
+        input_idx: usize,
+    ) -> Result<CExpr, crate::observation_journal::LegacyObservationJournalError> {
+        let (site, input) = self.normalized_input_projection(frame, input_idx)?;
+        let Some((first_site, first_disposition)) =
+            self.uniform_planned_input_disposition(site, input_idx, &input)?
+        else {
+            // Synthetic preservation inputs have no original graph use and
+            // therefore no source-owned projection to apply.
+            return Ok(self.observe_optional_normalized_input_value_expr(
+                frame.normalized_site,
+                input_idx,
+                self.planned_value_expr(input.value)?,
+            ));
+        };
         match first_disposition {
             r2ssa::MachineUseDisposition::Exact(slice) => {
                 let base = self.observe_optional_normalized_input_value_expr(
@@ -394,31 +426,97 @@ impl<'a> FoldingContext<'a> {
                     )
                 })
             }
-            r2ssa::MachineUseDisposition::MemoryAddress(address) => {
-                if address.binding().value() != input.value
-                    || address.memory_access().is_none()
-                {
-                    return Err(
-                        crate::observation_journal::LegacyObservationJournalError::InvalidUse(
-                            first_site,
-                        ),
-                    );
-                }
-                // The load/store renderer has already consumed the source-owned
-                // structured-access certificate. Preserve that contextual AST:
-                // substituting the value's ordinary binding here would turn a
-                // certified stack/object access back into an SP/RBP expression.
-                // This node is the contextual projection, not an occurrence
-                // of the value's ordinary binding. Mark only the exact
-                // `UseSite`; wrapping it as a bound `ValueId` would make the
-                // audit claim that a C variable was rendered where the AST in
-                // fact contains a structured memory access.
-                Ok(contextual_expr)
-            }
+            // A contextual address cannot be projected from an arbitrary AST.
+            // Only `planned_memory_input_expr` accepts the opaque expression
+            // minted from the exact structured-access render fact.
+            r2ssa::MachineUseDisposition::MemoryAddress(_) => Err(
+                crate::observation_journal::LegacyObservationJournalError::RefusedRenderedUse(
+                    first_site,
+                ),
+            ),
             r2ssa::MachineUseDisposition::Refused(_) => {
                 unreachable!(
                 "the refused source use returned before projection"
             )
+            }
+        }
+    }
+
+    fn planned_memory_input_expr(
+        &self,
+        frame: &LowerFrame,
+        input_idx: usize,
+        certified: CertifiedMemoryAccessExpr,
+    ) -> Result<CExpr, crate::observation_journal::LegacyObservationJournalError> {
+        let (site, input) = self.normalized_input_projection(frame, input_idx)?;
+        let Some((first_site, disposition)) =
+            self.uniform_planned_input_disposition(site, input_idx, &input)?
+        else {
+            return Err(
+                crate::observation_journal::LegacyObservationJournalError::InvalidNormalizedInput {
+                    site,
+                    input_idx,
+                },
+            );
+        };
+        let r2ssa::MachineUseDisposition::MemoryAddress(address) = disposition else {
+            return Err(
+                crate::observation_journal::LegacyObservationJournalError::RefusedRenderedUse(
+                    first_site,
+                ),
+            );
+        };
+        let Some(access) = address.memory_access() else {
+            return Err(
+                crate::observation_journal::LegacyObservationJournalError::InvalidUse(first_site),
+            );
+        };
+        let source_is_write = match self
+            .inputs
+            .prepared_ssa
+            .and_then(|prepared| prepared.graph().inst(first_site.inst))
+            .map(|inst| &inst.payload)
+        {
+            Some(r2ssa::InstPayload::Op(SSAOp::Load { .. })) => false,
+            Some(r2ssa::InstPayload::Op(SSAOp::Store { .. })) => true,
+            _ => {
+                return Err(
+                    crate::observation_journal::LegacyObservationJournalError::InvalidUse(
+                        first_site,
+                    ),
+                );
+            }
+        };
+        if address.binding().value() != input.value
+            || certified.address() != input.value
+            || certified.access() != access
+            || certified.access().inst != first_site.inst
+            || certified.is_write() != source_is_write
+        {
+            return Err(
+                crate::observation_journal::LegacyObservationJournalError::InvalidUse(first_site),
+            );
+        }
+        Ok(certified.into_expr())
+    }
+
+    pub(crate) fn planned_input_expr_at(
+        &self,
+        block_addr: u64,
+        op_idx: usize,
+        input_idx: usize,
+    ) -> OpLoweringResult<CExpr> {
+        let frame = LowerFrame::for_observed_expr(self.normalized_site(block_addr, op_idx));
+        match self.planned_input_expr(&frame, input_idx) {
+            Ok(expr) => Ok(self.observe_optional_normalized_input_uses_expr(
+                frame.normalized_site,
+                input_idx,
+                expr,
+            )),
+            Err(error) => {
+                let refusal = Self::observation_lowering_refusal(&error);
+                self.retain_first_observation_error(error);
+                Err(refusal)
             }
         }
     }
@@ -486,7 +584,7 @@ impl<'a> FoldingContext<'a> {
         expr: CExpr,
     ) -> CExpr {
         if frame.observe_inputs {
-            let expr = match self.planned_input_expr(frame, input_idx, expr.clone()) {
+            let expr = match self.planned_input_expr(frame, input_idx) {
                 Ok(planned) => planned,
                 Err(error) => {
                     let refusal = Self::observation_lowering_refusal(&error);
@@ -503,6 +601,32 @@ impl<'a> FoldingContext<'a> {
         } else {
             expr
         }
+    }
+
+    pub(super) fn observed_memory_input(
+        &self,
+        frame: &LowerFrame,
+        input_idx: usize,
+        certified: CertifiedMemoryAccessExpr,
+    ) -> CExpr {
+        let fallback = certified.expr().clone();
+        if !frame.observe_inputs {
+            return fallback;
+        }
+        let expr = match self.planned_memory_input_expr(frame, input_idx, certified) {
+            Ok(planned) => planned,
+            Err(error) => {
+                let refusal = Self::observation_lowering_refusal(&error);
+                self.retain_first_observation_error(error);
+                self.retain_first_lowering_refusal(refusal);
+                return fallback;
+            }
+        };
+        self.observe_optional_normalized_input_uses_expr(
+            frame.normalized_site,
+            input_idx,
+            expr,
+        )
     }
 
     pub(super) fn lowered_from_stmt(stmt: CStmt) -> LoweredOp {
@@ -565,7 +689,7 @@ impl<'a> FoldingContext<'a> {
                                 source_block,
                                 source_op_idx,
                                 target,
-                            );
+                            )?;
                             let func_expr = self.observed_input(frame, 0, func_expr);
                             let raw_args = self
                                 .call_args_map()
@@ -616,7 +740,7 @@ impl<'a> FoldingContext<'a> {
                                 source_block,
                                 source_op_idx,
                                 target,
-                            );
+                            )?;
                             let resolved_target = self.observed_input(frame, 0, resolved_target);
                             let func_expr = Self::indirect_callable_expr(resolved_target);
                             let raw_args = self
@@ -673,6 +797,7 @@ impl<'a> FoldingContext<'a> {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn op_to_expr(&self, op: &SSAOp) -> OpLoweringResult<CExpr> {
         let mut frame = LowerFrame::for_expr();
         Ok(match self.lower_op(op, &mut frame)? {

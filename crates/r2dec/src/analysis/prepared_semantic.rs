@@ -667,6 +667,10 @@ fn populate_prepared_render_definitions(symbols: &std::cell::RefCell<crate::symb
                     string_literals: crate::analysis::lower::no_string_literals(),
                     use_info: Some(use_info),
                     pinned: &use_info.pinned,
+                    #[cfg(test)]
+                    var_aliases: &use_info.var_aliases,
+                    #[cfg(test)]
+                    param_register_aliases: env.param_register_aliases,
                     type_oracle: env.type_oracle,
                 };
                 match lower.op_to_expr(op) {
@@ -2276,7 +2280,7 @@ fn prepared_stack_alias_name_for_object_offset(
     symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
     view: &PreparedSemanticView,
     object: r2ssa::ObjectId,
-    _offset: i64,
+    offset: i64,
 ) -> Option<String> {
     let authorized = view
         .authorized_stack_owner_names_by_object

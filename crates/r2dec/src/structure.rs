@@ -9,7 +9,6 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use r2ssa::cfg::BlockTerminator;
 use r2ssa::{CFGEdge, ControlGuard, LoopId, PredicateId, SSAFunction, SSAOp, ValueId};
 
-use crate::address::parse_address_from_var_name;
 use crate::ast::{BinaryOp, CExpr, CStmt, UnaryOp};
 use crate::control::{DecompileExecutionStop, DecompileWorkControl};
 use crate::fold::FoldingContext;
@@ -3492,7 +3491,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             if self.func.successors(current).contains(&merge_block) {
                 return Some(current);
             }
-            let successors = self.transparent_branch_successors(current, block);
+            let successors = self.transparent_branch_successors(current);
             let [successor] = successors.as_slice() else {
                 return None;
             };
@@ -3516,7 +3515,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
 
     fn transparent_branch_successor_to_merge(&self, addr: u64, merge_block: u64) -> Option<u64> {
         let block = self.func.get_block(addr)?;
-        let successors = self.transparent_branch_successors(addr, block);
+        let successors = self.transparent_branch_successors(addr);
         let [successor] = successors.as_slice() else {
             return None;
         };
@@ -3561,52 +3560,22 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         }
     }
 
-    fn transparent_branch_successors(
-        &self,
-        addr: u64,
-        block: &r2ssa::FunctionSSABlock,
-    ) -> Vec<u64> {
-        let successors = self.func.successors(addr);
-        if !successors.is_empty() {
-            return successors;
-        }
-        let mut targets = block
-            .ops
-            .iter()
-            .filter_map(|op| match op {
-                SSAOp::Branch { target } => parse_address_from_var_name(&target.name),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        targets.sort_unstable();
-        targets.dedup();
-        targets
+    fn transparent_branch_successors(&self, addr: u64) -> Vec<u64> {
+        self.func.successors(addr)
     }
 
     fn block_flows_to_merge(&self, addr: u64, merge_block: u64) -> bool {
         if self.func.successors(addr).contains(&merge_block) {
             return true;
         }
-        let Some(block) = self.func.get_block(addr) else {
-            return false;
-        };
-        if block.ops.iter().any(|op| {
-            matches!(
-                op,
-                SSAOp::Branch { target }
-                    if parse_address_from_var_name(&target.name) == Some(merge_block)
-            )
-        }) {
-            return true;
-        }
-        if block.addr.checked_add(u64::from(block.size)) != Some(merge_block) {
-            return false;
-        }
-        self.func.cfg().get_block(addr).is_none_or(|cfg_block| {
+        self.func.cfg().get_block(addr).is_some_and(|cfg_block| {
             matches!(
                 &cfg_block.terminator,
+                BlockTerminator::Branch { target } if *target == merge_block
+            ) || matches!(
+                &cfg_block.terminator,
                 BlockTerminator::Fallthrough { next } if *next == merge_block
-            ) || matches!(&cfg_block.terminator, BlockTerminator::None)
+            )
         })
     }
 

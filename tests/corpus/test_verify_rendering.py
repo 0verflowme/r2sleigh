@@ -241,6 +241,121 @@ class BindingAuditTests(unittest.TestCase):
         self.assertEqual(render["status"], "refused")
         self.assertEqual(render["source_status"], "refused")
 
+    def test_admission_refusal_envelopes_preserve_exact_causes_and_counts(self) -> None:
+        observation_refusal = self.complete_record()
+        observation_refusal["request_status"] = "refused"
+        observations = observation_refusal["audit"]["observations"]
+        observations["values"].update(
+            {"rendered": 1, "justified_elision": 1, "refused": 1}
+        )
+        observation_refusal["audit"] = {
+            "schema_version": 2,
+            "status": "non_quality_observations",
+            "observations": observations,
+        }
+        observation_refusal["render_refusal"] = {
+            "schema_version": 1,
+            "status": "refused",
+            "kind": "refused_binding_disposition",
+            "observations": observations,
+        }
+
+        _, binding, _, _, render = verifier.parse_render_audits(
+            self.marker(observation_refusal) + "\n"
+        )
+
+        self.assertEqual(binding["status"], "non_quality")
+        self.assertEqual(binding["source_status"], "non_quality_observations")
+        self.assertEqual(
+            binding["record"]["audit"]["observations"]["values"]["refused"],
+            1,
+        )
+        self.assertFalse(binding["quality"]["observations"]["values"])
+        self.assertEqual(render["status"], "refused")
+        self.assertEqual(
+            render["record"]["render_refusal"]["observations"]["values"][
+                "refused"
+            ],
+            1,
+        )
+
+        placement_refusal = self.complete_record()
+        placement_refusal["request_status"] = "refused"
+        cause = {
+            "kind": "read_before_assignment",
+            "binding_index": 7,
+            "instruction_id": 11,
+            "input_index": 13,
+        }
+        placement_refusal["audit"] = {
+            "schema_version": 2,
+            "status": "failed",
+            "reason": "placement_refusal",
+            "cause": cause,
+        }
+        placement_refusal["placement_audit"] = {
+            "schema_version": 1,
+            "status": "refused",
+            "cause": cause,
+        }
+        placement_refusal["render_refusal"] = {
+            "schema_version": 1,
+            "status": "refused",
+            "kind": "read_before_assignment",
+            "cause": cause,
+        }
+
+        _, binding, _, placement, render = verifier.parse_render_audits(
+            self.marker(placement_refusal) + "\n"
+        )
+
+        self.assertEqual(binding["status"], "failed")
+        self.assertEqual(binding["record"]["audit"]["cause"], cause)
+        self.assertEqual(placement["status"], "refused")
+        self.assertEqual(render["status"], "refused")
+        self.assertEqual(render["record"]["render_refusal"]["cause"], cause)
+
+    def test_admission_refusal_envelopes_reject_parallel_or_mismatched_fields(self) -> None:
+        observation_refusal = self.complete_record()
+        observations = observation_refusal["audit"]["observations"]
+        observation_refusal["audit"] = {
+            "schema_version": 2,
+            "status": "non_quality_observations",
+            "observations": observations,
+            "shadow": observation_refusal["audit"]["shadow"],
+        }
+        _, binding = verifier.parse_binding_audit(
+            self.marker(observation_refusal) + "\n"
+        )
+        self.assertEqual(binding["status"], "malformed")
+
+        placement_refusal = self.complete_record()
+        placement_refusal["request_status"] = "refused"
+        placement_refusal["audit"] = {
+            "schema_version": 2,
+            "status": "failed",
+            "reason": "placement_refusal",
+            "cause": {"kind": "missing_definition", "binding_index": 17},
+        }
+        placement_refusal["render_refusal"] = {
+            "schema_version": 1,
+            "status": "refused",
+            "kind": "missing_definition",
+            "cause": {"kind": "missing_definition", "binding_index": 17},
+            "legacy": True,
+        }
+        _, binding, _, _, render = verifier.parse_render_audits(
+            self.marker(placement_refusal) + "\n"
+        )
+        self.assertEqual(binding["status"], "failed")
+        self.assertEqual(render["status"], "malformed")
+
+        mismatch = json.loads(json.dumps(placement_refusal))
+        del mismatch["render_refusal"]["legacy"]
+        mismatch["render_refusal"]["kind"] = "read_before_assignment"
+        _, _, _, _, render = verifier.parse_render_audits(self.marker(mismatch) + "\n")
+        self.assertEqual(render["status"], "malformed")
+
     def test_refused_request_without_render_reason_is_not_a_render_pass(self) -> None:
         record = self.complete_record()
         record["request_status"] = "refused"

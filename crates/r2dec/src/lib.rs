@@ -79,10 +79,7 @@ use r2types::{
     TypeInference, TypeOracle,
 };
 #[cfg(test)]
-use r2types::{
-    ExternalRegisterParamSpec, ExternalTypeDb, FunctionSignatureSpec, FunctionType,
-    VisibleBindingKind,
-};
+use r2types::{ExternalTypeDb, FunctionType};
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::rc::Rc;
@@ -2654,6 +2651,10 @@ pub enum BindingShadowAuditFailure {
     JournalConstruction(BindingObservationJournalFailure),
     JournalRecording(BindingObservationJournalFailure),
     JournalSeal(BindingObservationJournalFailure),
+    Placement(PlacementAuditRefusal),
+    NonQualityObservations {
+        observations: BindingObservationAudit,
+    },
     Report,
     IncompleteObservations {
         ledger: BindingShadowAuditLedger,
@@ -2956,6 +2957,10 @@ impl PlacementAudit {
 pub enum DecompileRenderRefusal {
     MissingMachineProjectionAuthorization,
     MissingProgramVariableAuthorization,
+    DeclarationPlacement(PlacementAuditRefusal),
+    RefusedBindingDisposition {
+        observations: BindingObservationAudit,
+    },
     NormalizationOriginUnavailable,
     UnrepresentableControlFlow,
     IncompleteEffectInventory,
@@ -2972,10 +2977,33 @@ impl DecompileRenderRefusal {
             Self::MissingProgramVariableAuthorization => {
                 "missing_program_variable_authorization"
             }
+            Self::DeclarationPlacement(refusal) => refusal.kind(),
+            Self::RefusedBindingDisposition { .. } => "refused_binding_disposition",
             Self::NormalizationOriginUnavailable => "normalization_origin_unavailable",
             Self::UnrepresentableControlFlow => "unrepresentable_control_flow",
             Self::IncompleteEffectInventory => "incomplete_effect_inventory",
             Self::UnrepresentableOperation => "unrepresentable_operation",
+        }
+    }
+}
+
+impl From<BindingShadowAuditFailure> for DecompileRenderRefusal {
+    fn from(failure: BindingShadowAuditFailure) -> Self {
+        match failure {
+            BindingShadowAuditFailure::Placement(refusal) => Self::DeclarationPlacement(refusal),
+            BindingShadowAuditFailure::NonQualityObservations { observations } => {
+                Self::RefusedBindingDisposition { observations }
+            }
+            BindingShadowAuditFailure::PlanBuild
+            | BindingShadowAuditFailure::SourcePairing
+            | BindingShadowAuditFailure::JournalConstruction(_)
+            | BindingShadowAuditFailure::JournalRecording(_)
+            | BindingShadowAuditFailure::JournalSeal(_)
+            | BindingShadowAuditFailure::Report
+            | BindingShadowAuditFailure::IncompleteObservations { .. }
+            | BindingShadowAuditFailure::NonQuality { .. } => {
+                Self::MissingMachineProjectionAuthorization
+            }
         }
     }
 }
@@ -3163,6 +3191,8 @@ enum InternalBuildProduct {
     Refused {
         emission: EmissionReadyFunction,
         refusal: DecompileRenderRefusal,
+        binding_shadow: BindingShadowAuditOutcome,
+        placement_audit: PlacementAudit,
     },
 }
 
@@ -3180,6 +3210,26 @@ impl InternalBuildProduct {
         Self::Refused {
             emission: prepare_function_for_emission(&function),
             refusal: refusal.into(),
+            binding_shadow: BindingShadowAuditOutcome::NotRun,
+            placement_audit: PlacementAudit::NotRun,
+        }
+    }
+
+    fn refused_after_native_admission(
+        function: CFunction,
+        failure: BindingShadowAuditFailure,
+    ) -> Self {
+        let refusal = DecompileRenderRefusal::from(failure);
+        let placement_audit = match failure {
+            BindingShadowAuditFailure::Placement(refusal) => PlacementAudit::Refused(refusal),
+            BindingShadowAuditFailure::NonQualityObservations { .. } => PlacementAudit::Applied,
+            _ => PlacementAudit::NotRun,
+        };
+        Self::Refused {
+            emission: prepare_function_for_emission(&function),
+            refusal,
+            binding_shadow: BindingShadowAuditOutcome::Failed(failure),
+            placement_audit,
         }
     }
 
@@ -3201,8 +3251,10 @@ impl InternalBuildProduct {
 
     fn binding_shadow(&self, source: &r2types::SourceOwnedFunctionFacts,
     ) -> BindingShadowAuditOutcome {
-        let Self::Native(native) = self else {
-            return BindingShadowAuditOutcome::NotRun;
+        let native = match self {
+            Self::Native(native) => native,
+            Self::Refused { binding_shadow, .. } => return *binding_shadow,
+            Self::Residual(_) => return BindingShadowAuditOutcome::NotRun,
         };
         let (observations, coverage) = match native.audit_observations() {
             Ok(observations) => observations,
@@ -3226,7 +3278,10 @@ impl InternalBuildProduct {
     fn placement_audit(&self) -> PlacementAudit {
         match self {
             Self::Native(native) => native.placement_audit(),
-            Self::Residual(_) | Self::Refused { .. } => PlacementAudit::NotRun,
+            Self::Refused {
+                placement_audit, ..
+            } => *placement_audit,
+            Self::Residual(_) => PlacementAudit::NotRun,
         }
     }
 
@@ -4177,20 +4232,29 @@ impl Decompiler {
                 ));
             }
         };
-        let (observation_journal, observation_failure) = match LegacyObservationJournal::new(
+        let func = &normalized_func;
+        let func_name = func
+            .name
+            .clone()
+            .unwrap_or_else(|| format!("sub_{:x}", func.entry));
+        let observation_journal = match LegacyObservationJournal::new(
             input.source_owned_facts(),
             &normalized_func,
             &normalization_origins,
             Rc::clone(&binding_plan),
             Rc::clone(&symbol_table),
         ) {
-            Ok(journal) => (Some(std::cell::RefCell::new(journal)), None),
-            Err(error) => (
-                None,
-                Some(BindingShadowAuditFailure::JournalConstruction(
-                    BindingObservationJournalFailure::from(&error),
-                )),
-            ),
+            Ok(journal) => std::cell::RefCell::new(journal),
+            Err(_) => {
+                let refusal = DecompileRenderRefusal::MissingMachineProjectionAuthorization;
+                return Ok(InternalBuildProduct::refused(
+                    residual_function_for_render_boundary(
+                        &func_name,
+                        &format!("native render refusal: {}", refusal.kind()),
+                    ),
+                    refusal,
+                ));
+            }
         };
         work.poll()?;
         if std::env::var_os("R2SLEIGH_DEBUG_MERGES").is_some() {
@@ -4213,11 +4277,6 @@ impl Decompiler {
                 }
             }
         }
-        let func = &normalized_func;
-        let func_name = func
-            .name
-            .clone()
-            .unwrap_or_else(|| format!("sub_{:x}", func.entry));
         let render_signature = self.context.type_facts().render_authorized_signature();
         let skip_runtime_type_inference = self.context.skip_runtime_type_inference(prepared);
         let type_inference = (!skip_runtime_type_inference).then(|| {
@@ -4359,7 +4418,7 @@ impl Decompiler {
         };
         let fold_inputs = FoldInputs {
             normalization_origins: Some(&normalization_origins),
-            observation_journal: observation_journal.as_ref(),
+            observation_journal: Some(&observation_journal),
             arch: &fold_arch,
             display_names: self.context.function_facts.display_names(),
             #[cfg(test)]
@@ -4520,32 +4579,24 @@ impl Decompiler {
         }
         let observation_error = fold_ctx.observation_error.borrow().clone();
         drop(fold_ctx);
-        let mut native = match observation_journal {
-            Some(journal) => MarkedNativeDraft::new_with_placement(
-                c_function,
-                journal.into_inner(),
-                structured_regions,
-                Rc::clone(&binding_names),
-            )
-            .finish_non_consuming(input.source_owned_facts(), observation_error),
-            None => {
-                let refusal = if structured_regions.is_some() {
-                    PlacementAuditRefusal::ObservationJournalUnavailable
-                } else {
-                    PlacementAuditRefusal::MissingStructuredRegionArtifact
-                };
-                let function = residual_function_for_render_boundary(
-                    &c_function.name,
-                    &format!("placement refusal: {}", refusal.kind()),
-                );
-                SealedNativeFunction::without_observations(
-                    function,
-                    binding_plan,
-                    prepared,
-                    observation_failure
-                        .expect("missing observation journal retains its construction failure"),
-                    PlacementAudit::Refused(refusal),
-                )
+        let mut native = match MarkedNativeDraft::new_with_placement(
+            c_function,
+            observation_journal.into_inner(),
+            structured_regions,
+            Rc::clone(&binding_names),
+        )
+        .finish_enforcing(input.source_owned_facts(), observation_error)
+        {
+            Ok(native) => native,
+            Err(failure) => {
+                let refusal = DecompileRenderRefusal::from(failure);
+                return Ok(InternalBuildProduct::refused_after_native_admission(
+                    residual_function_for_render_boundary(
+                        &func_name,
+                        &format!("native render refusal: {}", refusal.kind()),
+                    ),
+                    failure,
+                ));
             }
         };
         let ledger = effect_ledger::build_obligation_ledger(
@@ -6147,9 +6198,8 @@ mod tests {
     use r2il::{ArchSpec, R2ILBlock, R2ILOp, RegisterDef, SpaceId, Varnode};
     use r2ssa::SSAFunction;
     use r2types::{
-        ExternalField, ExternalRegisterParamSpec, ExternalStruct, ExternalTypeDb, FunctionFacts,
-        FunctionParamSpec, FunctionSignatureSpec, FunctionTypeFacts, SignatureCertificate,
-        SignatureCertificateSource,
+        ExternalRegisterParamSpec, ExternalStruct, ExternalTypeDb, FunctionFacts,
+        FunctionParamSpec, FunctionSignatureSpec, FunctionTypeFacts,
     };
     use std::collections::{BTreeMap, BTreeSet, HashMap};
 

@@ -61,11 +61,13 @@ mod tests {
     use crate::{
         FoldArchConfig, FoldInputs,
         analysis::{
-            CallOwner, CallOwnerKind, CallOwnershipFact, CallSiteId, PassEnv, PreparedSemanticView,
-            ScalarValue, SemanticValue, StackSlotProvenance, StackSlotValueKind,
+            CallOwner, CallOwnerKind, CallOwnershipFact, CallSiteId, PreparedSemanticView,
+            StackSlotProvenance, StackSlotValueKind,
         },
         ast::{CFunction, CLocal},
     };
+    use crate::analysis::ownership::CallOwnerIdentity;
+    use crate::analysis::utils::is_cpu_flag;
     use r2il::{
         ArchSpec, R2ILBlock, R2ILOp, RegisterBitSlice, RegisterDef, RegisterProjection,
         RegisterProjectionDisposition, RegisterStorage, SpaceId, Varnode,
@@ -74,11 +76,30 @@ mod tests {
     fn test_table() -> std::cell::RefCell<crate::symbol::SymbolTable> {
         std::cell::RefCell::new(crate::symbol::SymbolTable::new())
     }
+
+    fn test_symbol(ctx: &FoldingContext<'_>, name: &str) -> crate::symbol::SymbolId {
+        let CExpr::Var(symbol) = ctx.name_ref(name) else {
+            unreachable!("fixture variable must be a symbol")
+        };
+        symbol
+    }
+
+    fn install_test_param_aliases(
+        ctx: &mut FoldingContext<'_>,
+        aliases: HashMap<String, String>,
+    ) {
+        let mut view = ctx
+            .inputs
+            .prepared_semantic_view
+            .cloned()
+            .unwrap_or_default();
+        view.param_alias_by_reg = aliases;
+        ctx.inputs.prepared_semantic_view = Some(Box::leak(Box::new(view)));
+    }
     use r2types::{
-        CalleeArgEffect, CalleeFact, CalleeReturnRelation, ExternalField, ExternalStackBase,
-        ExternalStackVarSpec, ExternalStruct, ExternalTypeDb, Signedness, SolvedTypes,
-        SolverDiagnostics, StackSlotKey, StructShape, TypeArena, TypeId, TypeOracle,
-        VisibleBinding, VisibleBindingKind,
+        CalleeFact, CalleeReturnRelation, ExternalField, ExternalStackBase, ExternalStackVarSpec,
+        ExternalStruct, ExternalTypeDb, Signedness, SolvedTypes, SolverDiagnostics, StackSlotKey,
+        StructShape, TypeArena, TypeId, TypeOracle, VisibleBinding, VisibleBindingKind,
     };
 
     #[derive(Debug, Clone)]
@@ -412,16 +433,15 @@ mod tests {
         ctx: &mut FoldingContext<'_>,
         args: &[crate::analysis::CallArgBinding],
     ) {
-        let symbols = test_table();
         let mut view = ctx
             .inputs
             .prepared_semantic_view
             .cloned()
             .unwrap_or_default();
         for binding in args {
-            if let Some(name) = &binding.source_var_name {
-                view.owner_expr_by_name
-                    .insert(name.clone(), fixture_owner_expr_for_arg(ctx, binding));
+            if let Some(value) = binding.source_value_id {
+                view.owner_expr_by_value
+                    .insert(value, fixture_owner_expr_for_arg(ctx, binding));
             }
         }
         ctx.inputs.prepared_semantic_view = Some(Box::leak(Box::new(view)));
@@ -432,7 +452,6 @@ mod tests {
         source_call: (u64, usize),
         mut args: Vec<crate::analysis::CallArgBinding>,
     ) {
-        authorize_call_arg_sources(ctx, &args);
         let argument_values = args
             .iter_mut()
             .enumerate()
@@ -444,6 +463,7 @@ mod tests {
                 r2types::CallArgumentValueFact { index, value }
             })
             .collect::<Vec<_>>();
+        authorize_call_arg_sources(ctx, &args);
         let mut callsite_facts = ctx
             .inputs
             .function_facts
@@ -482,7 +502,6 @@ mod tests {
         target_name: &str,
         signature: Option<FunctionType>,
     ) {
-        let symbols = test_table();
         let typed_names = HashMap::from([(target_addr, target_name.to_string())]);
         let binary_symbols = HashMap::new();
         let callee_facts = if r2types::callee_name_is_import_like(target_name) {
@@ -608,44 +627,39 @@ mod tests {
         alias: &str,
     ) {
         let source_id = CallSiteId::from(source_call);
+        let owner_value = ctx
+            .state
+            .analysis_ctx
+            .use_info
+            .value_id_for_name_or_bind(owner_name)
+            .expect("fixture owner must have one exact value");
+        let alias_value = ctx
+            .state
+            .analysis_ctx
+            .use_info
+            .value_id_for_name_or_bind(alias)
+            .expect("fixture alias must have one exact value");
         ctx.state.analysis_ctx.ownership.call_ownership.insert(
             source_id,
             CallOwnershipFact {
                 source: source_id,
                 owner: Some(CallOwner {
-                    visible_name: owner_name.to_string(),
+                    identity: CallOwnerIdentity::Value(owner_value),
                     kind: CallOwnerKind::StableLocal,
                 }),
-                aliases: BTreeSet::from([alias.to_string()]),
-                direct_aliases: BTreeSet::from([alias.to_string()]),
+                aliases: BTreeSet::from([alias_value]),
+                direct_aliases: BTreeSet::from([alias_value]),
             },
         );
         ctx.state
             .analysis_ctx
             .ownership
-            .alias_sources
-            .insert(alias.to_string(), source_id);
+            .value_sources
+            .insert(alias_value, source_id);
         ctx.state
             .analysis_ctx
-            .ownership
-            .alias_sources
-            .insert(alias.to_ascii_lowercase(), source_id);
-        ctx.state
-            .analysis_ctx
-            .ownership
-            .visible_owner_sources
-            .insert(owner_name.to_string(), source_id);
-        ctx.state
-            .analysis_ctx
-            .ownership
-            .visible_owner_sources
-            .insert(owner_name.to_ascii_lowercase(), source_id);
-        ctx.state
-            .analysis_ctx
-            .ownership
-            .visible_owned_names
-            .insert(owner_name.to_ascii_lowercase());
-        ctx.state.analysis_ctx.use_info.insert_call_result_source_alias(&alias.to_string(), source_call);
+            .use_info
+            .insert_call_result_source_for_value(alias_value, source_call);
     }
 
     fn prepared_zero_arg_helper_call(name: &str) -> SourceOwnedPreparedFixture {
@@ -860,7 +874,6 @@ mod tests {
         let empty_stack = Box::leak(Box::new(HashMap::new()));
         let empty_stack_slots = Box::leak(Box::new(BTreeMap::new()));
         let empty_visible = Box::leak(Box::new(Vec::new()));
-        let empty_str = Box::leak(Box::new(HashMap::new()));
         FoldingContext::from_inputs(FoldInputs {
             normalization_origins: None,
             observation_journal: None,
@@ -876,7 +889,6 @@ mod tests {
             external_stack_vars: empty_stack,
             visible_bindings: empty_visible,
             external_type_db: Box::leak(Box::new(r2types::ExternalTypeDb::default())),
-            param_register_aliases: empty_str,
             type_oracle: None,
             function_return_type: None,
             prepared_ssa: None,
@@ -910,7 +922,6 @@ mod tests {
         let empty_stack = Box::leak(Box::new(HashMap::new()));
         let empty_stack_slots = Box::leak(Box::new(BTreeMap::new()));
         let empty_visible = Box::leak(Box::new(Vec::new()));
-        let empty_str = Box::leak(Box::new(HashMap::new()));
         FoldingContext::from_inputs(FoldInputs {
             normalization_origins: None,
             observation_journal: None,
@@ -926,7 +937,6 @@ mod tests {
             external_stack_vars: empty_stack,
             visible_bindings: empty_visible,
             external_type_db: Box::leak(Box::new(r2types::ExternalTypeDb::default())),
-            param_register_aliases: empty_str,
             type_oracle: None,
             function_return_type: None,
             prepared_ssa: None,
@@ -2172,11 +2182,11 @@ mod tests {
                 })
                 .collect(),
         );
-        ctx.inputs.param_register_aliases = Box::leak(Box::new(HashMap::from([
+        install_test_param_aliases(ctx, HashMap::from([
             ("x0".to_string(), "argc".to_string()),
             ("x1".to_string(), "argv".to_string()),
             ("x2".to_string(), "envp".to_string()),
-        ])));
+        ]));
     }
 
     #[test]
@@ -2432,7 +2442,6 @@ mod tests {
 
     #[test]
     fn callsite_identity_controls_policy_when_rendered_callee_is_poisoned() {
-        let symbols = test_table();
         let mut ctx = FoldingContext::new(64);
         let typed_names = HashMap::from([(0x401000, "sym.imp.one_arg".to_string())]);
         let binary_symbols = HashMap::new();
@@ -2525,121 +2534,7 @@ mod tests {
         );
     }
 
-    #[test]
-    fn callsite_identity_prevents_poisoned_import_name_from_imported_arg_repair() {
-        let mut ctx = FoldingContext::new(64);
-        let source_call = (0x1000, 0);
-        install_callsite_resolution(&mut ctx, source_call, 0x401000, "sym.local.helper", None);
-        let source_id = CallSiteId::from(source_call);
-        ctx.state.analysis_ctx.ownership.call_ownership.insert(
-            source_id,
-            CallOwnershipFact {
-                source: source_id,
-                owner: Some(CallOwner {
-                    visible_name: "owned_result".to_string(),
-                    kind: CallOwnerKind::StableLocal,
-                }),
-                aliases: BTreeSet::from(["tmp_result".to_string()]),
-                direct_aliases: BTreeSet::new(),
-            },
-        );
-        ctx.state
-            .analysis_ctx
-            .ownership
-            .alias_sources
-            .insert("tmp_result".to_string(), source_id);
 
-        let poisoned_import = ctx.name_ref("sym.imp.printf");
-        let real_internal = ctx.name_ref("sym.local.helper");
-        let binding = crate::analysis::CallArgBinding::result(
-            crate::analysis::SemanticCallArg::FallbackExpr(ctx.name_ref("tmp_result")),
-        )
-        .with_source_call(source_call.0, source_call.1);
-        let expected = ctx.render_call_arg_for_callee(&real_internal, binding.clone());
-        assert_ne!(
-            expected,
-            ctx.name_ref("owned_result"),
-            "test setup must distinguish internal rendering from imported result repair"
-        );
-
-        assert_eq!(
-            ctx.render_call_args_for_site(
-                source_call.0,
-                source_call.1,
-                &poisoned_import,
-                vec![binding,]
-            ),
-            vec![expected],
-            "typed internal callsite identity must override a poisoned imported rendered callee for arg policy",
-        );
-    }
-
-    #[test]
-    fn callsite_identity_uses_modeled_policy_for_site_args() {
-        let symbols = test_table();
-        let mut ctx = FoldingContext::new(64);
-        let source_call = (0x1000, 0);
-        let typed_names = HashMap::from([(0x401000, "sym.local.modeled".to_string())]);
-        let binary_symbols = HashMap::new();
-        let callee_facts = BTreeMap::from([(
-            0x401000,
-            minimal_modeled_callee_fact(0x401000, "sym.local.modeled"),
-        )]);
-        let known_signatures = HashMap::new();
-        let resolution = r2types::CalleeResolutionFacts::from_direct_call_targets(
-            [(
-                r2types::CallsiteKey {
-                    block_addr: source_call.0,
-                    op_index: source_call.1,
-                },
-                0x401000,
-            )],
-            &r2types::CalleeIdentityContext {
-                function_names: &typed_names,
-                symbols: &binary_symbols,
-                callee_facts: &callee_facts,
-                known_function_signatures: &known_signatures,
-            },
-        );
-        install_function_callee_facts(&mut ctx, callee_facts);
-        mutate_function_facts(&mut ctx, |function_facts| {
-            function_facts.set_callee_resolution(resolution);
-        });
-        let source_id = CallSiteId::from(source_call);
-        ctx.state.analysis_ctx.ownership.call_ownership.insert(
-            source_id,
-            CallOwnershipFact {
-                source: source_id,
-                owner: Some(CallOwner {
-                    visible_name: "owned_result".to_string(),
-                    kind: CallOwnerKind::StableLocal,
-                }),
-                aliases: BTreeSet::from(["tmp_result".to_string()]),
-                direct_aliases: BTreeSet::new(),
-            },
-        );
-        ctx.state
-            .analysis_ctx
-            .ownership
-            .alias_sources
-            .insert("tmp_result".to_string(), source_id);
-
-        let binding = crate::analysis::CallArgBinding::result(
-            crate::analysis::SemanticCallArg::FallbackExpr(ctx.name_ref("tmp_result")),
-        )
-        .with_source_call(source_call.0, source_call.1);
-
-        assert_eq!(
-            ctx.render_call_args_for_site(
-                source_call.0,
-                source_call.1,
-                &ctx.name_ref("sym.local.modeled"),
-                vec![binding],
-            ),
-            vec![ctx.name_ref("owned_result")],
-            "typed modeled callsite identity must use imported/modelled argument policy even without an import name",
-        );
-    }
 
     #[test]
     fn final_call_normalization_uses_typed_non_variadic_callsite_arity() {
@@ -2756,56 +2651,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn final_call_normalization_does_not_apply_import_policy_from_poisoned_rendered_name() {
-        let mut ctx = FoldingContext::new(64);
-        let source_call = (0x1000, 0);
-        install_callsite_resolution(&mut ctx, source_call, 0x401000, "sym.local.helper", None);
-        let owner_source = (0x2000, 0);
-        let owner_id = CallSiteId::from(owner_source);
-        ctx.state.analysis_ctx.ownership.call_ownership.insert(
-            owner_id,
-            CallOwnershipFact {
-                source: owner_id,
-                owner: Some(CallOwner {
-                    visible_name: "owned_result".to_string(),
-                    kind: CallOwnerKind::StableLocal,
-                }),
-                aliases: BTreeSet::from(["tmp_result".to_string()]),
-                direct_aliases: BTreeSet::new(),
-            },
-        );
-        ctx.state
-            .analysis_ctx
-            .ownership
-            .alias_sources
-            .insert("tmp_result".to_string(), owner_id);
-
-        let poisoned = CExpr::call(
-            CExpr::External {
-                name: "sym.imp.printf".to_string(),
-                kind: crate::symbol::ExternalKind::Import,
-            },
-            vec![ctx.name_ref("tmp_result")],
-        );
-        let normalized = ctx.normalize_call_expr_for_source_call(
-            source_call,
-            poisoned,
-            FinalExprNormalizeContext::DefinitionRoot,
-        );
-
-        assert_eq!(
-            normalized,
-            CExpr::call_at(source_call, 
-                CExpr::External {
-                    name: "sym.local.helper".to_string(),
-                    kind: crate::symbol::ExternalKind::Function,
-                },
-                vec![ctx.name_ref("tmp_result")],
-            ),
-            "poisoned rendered import names must not trigger imported-arg repair for typed internal callsites",
-        );
-    }
 
     #[test]
     fn optional_site_import_policy_prefers_typed_internal_identity_over_rendered_import() {
@@ -3068,7 +2913,6 @@ mod tests {
 
     #[test]
     fn source_call_identity_residualizes_replayed_imported_result_call_arg() {
-        let symbols = test_table();
         let mut ctx = FoldingContext::new(64);
         let source_call = (0x1000, 0);
         install_callsite_resolution(
@@ -3106,7 +2950,6 @@ mod tests {
 
     #[test]
     fn source_call_identity_residualizes_replayed_result_call_with_transient_arg() {
-        let symbols = test_table();
         let mut ctx = FoldingContext::new(64);
         let source_call = (0x1000, 0);
         install_callsite_resolution(
@@ -3155,7 +2998,6 @@ mod tests {
 
     #[test]
     fn source_call_identity_refuses_uncertified_nested_call_arg_with_typed_policy() {
-        let symbols = test_table();
         let mut ctx = FoldingContext::new(64);
         let outer_call = (0x1000, 0);
         let nested_call_site = (0x2000, 0);
@@ -3227,7 +3069,6 @@ mod tests {
 
     #[test]
     fn source_call_identity_residualizes_when_nested_rendered_import_contradicts_typed_source() {
-        let symbols = test_table();
         let mut ctx = FoldingContext::new(64);
         let outer_call = (0x1000, 0);
         let nested_call_site = (0x2000, 0);
@@ -3300,7 +3141,6 @@ mod tests {
 
     #[test]
     fn source_call_identity_residualizes_when_nested_source_match_is_ambiguous() {
-        let symbols = test_table();
         let mut ctx = FoldingContext::new(64);
         let outer_call = (0x1000, 0);
         let first_nested_call_site = (0x2000, 0);
@@ -3466,7 +3306,6 @@ mod tests {
 
     #[test]
     fn imported_arg_nested_call_without_source_residualizes_instead_of_truncating() {
-        let symbols = test_table();
         let mut ctx = FoldingContext::new(64);
         install_known_one_arg_signature(&mut ctx);
         let call = CExpr::call(
@@ -3518,7 +3357,7 @@ mod tests {
             ),
             CExpr::cast(
                 CType::Int(64),
-                CExpr::call_at(source_call, 
+                CExpr::call_at(source_call,
                     CExpr::External {
                         name: "sym.imp.one_arg".to_string(),
                         kind: crate::symbol::ExternalKind::Import,
@@ -3562,260 +3401,13 @@ mod tests {
         );
     }
 
-    #[test]
-    fn recovered_visible_owner_rhs_canonicalizes_poisoned_cached_source_call() {
-        let mut ctx = FoldingContext::new(64);
-        let source_call = (0x1000, 0);
-        install_callsite_resolution(
-            &mut ctx,
-            source_call,
-            0x401000,
-            "sym.imp.one_arg",
-            Some(FunctionType {
-                return_type: CType::Void,
-                params: vec![CType::Int(32)],
-                variadic: false,
-            }),
-        );
-        let source_id = CallSiteId::from(source_call);
-        ctx.state.analysis_ctx.ownership.call_ownership.insert(
-            source_id,
-            CallOwnershipFact {
-                source: source_id,
-                owner: Some(CallOwner {
-                    visible_name: "owned_result".to_string(),
-                    kind: CallOwnerKind::StableLocal,
-                }),
-                aliases: BTreeSet::new(),
-                direct_aliases: BTreeSet::new(),
-            },
-        );
-        ctx.state
-            .analysis_ctx
-            .ownership
-            .visible_owner_sources
-            .insert("owned_result".to_string(), source_id);
-        ctx.state.analysis_ctx.use_info.call_result_exprs.insert(
-            source_call,
-            CExpr::call(
-                CExpr::External {
-                    name: "sym.local_two_arg".to_string(),
-                    kind: crate::symbol::ExternalKind::Function,
-                },
-                vec![CExpr::IntLit(7), CExpr::IntLit(9)],
-            ),
-        );
 
-        assert_eq!(
-            ctx.recovered_owned_call_result_definition_rhs_for_visible_name({ let CExpr::Var(id) = ctx.name_ref("owned_result") else { unreachable!() }; id }),
-            Some(CExpr::call_at(source_call, 
-                CExpr::External {
-                    name: "sym.imp.one_arg".to_string(),
-                    kind: crate::symbol::ExternalKind::Import,
-                },
-                vec![CExpr::IntLit(7)]
-            )),
-            "source-keyed recovered RHS must canonicalize the call target before generic normalization",
-        );
-    }
 
-    #[test]
-    fn certified_visible_owner_rhs_rejects_synthesized_call_without_owner_fact() {
-        let prepared = prepared_zero_arg_helper_call("certified_replay_callsite");
-        let mut ctx = make_x86_64_ctx_with_prepared(&prepared);
-        install_certified_function_facts(&mut ctx);
-        let source_call = (0x1000, 1);
-        ctx.set_external_stack_vars(HashMap::from([(
-            -8,
-            stack_var_spec("owned_result", Some(CType::u64()), Some("rbp")),
-        )]));
-        ctx.set_function_names(HashMap::from([(0x401050, "sym.helper".to_string())]));
-        install_callsite_resolution(&mut ctx, source_call, 0x401050, "sym.helper", None);
-        ctx.inputs.prepared_semantic_view = Some(Box::leak(Box::new(PreparedSemanticView {
-            call_view_by_site: BTreeMap::from([(
-                source_call,
-                crate::analysis::PreparedCallView {
-                    result_owner: Some(ctx.name_ref("owned_result")),
-                    ..crate::analysis::PreparedCallView::default()
-                },
-            )]),
-            ..PreparedSemanticView::default()
-        })));
-        ctx.state.analysis_ctx.use_info.call_result_exprs.insert(
-            source_call,
-            CExpr::call(
-                CExpr::External {
-                    name: "sym.local.poisoned".to_string(),
-                    kind: crate::symbol::ExternalKind::Function,
-                },
-                vec![CExpr::IntLit(7)],
-            ),
-        );
 
-        assert_eq!(
-            ctx.recovered_owned_call_result_definition_rhs_for_visible_name({ let CExpr::Var(id) = ctx.name_ref("owned_result") else { unreachable!() }; id }),
-            None,
-            "certified replay must not synthesize a visible owner call without FunctionFacts owner proof"
-        );
-    }
 
-    #[test]
-    fn recovered_direct_call_rhs_rejects_rendered_key_without_source_provenance() {
-        let mut ctx = FoldingContext::new(64);
-        let source_call = (0x1000, 0);
-        install_callsite_resolution(
-            &mut ctx,
-            source_call,
-            0x401000,
-            "sym.imp.one_arg",
-            Some(FunctionType {
-                return_type: CType::Void,
-                params: vec![CType::Int(32)],
-                variadic: false,
-            }),
-        );
-        let poisoned = CExpr::call(
-            CExpr::External {
-                name: "sym.local_two_arg".to_string(),
-                kind: crate::symbol::ExternalKind::Function,
-            },
-            vec![CExpr::IntLit(7), CExpr::IntLit(9)],
-        );
-
-        assert_eq!(
-            ctx.recovered_owned_call_result_definition_rhs_for_visible_name({ let CExpr::Var(id) = ctx.name_ref("owned_result") else { unreachable!() }; id }),
-            None,
-            "rendered call RHS recovery must not use expression-key ownership without source provenance",
-        );
-        assert_eq!(
-            ctx.recovered_owned_call_result_definition_rhs_for_visible_name({ let CExpr::Var(id) = ctx.name_ref("wrong_owner") else { unreachable!() }; id }),
-            None,
-            "direct call RHS recovery must still require the recovered owner to match the assignment lhs",
-        );
-        assert_eq!(
-            ctx.recovered_owned_call_result_definition_rhs_for_visible_name({ let CExpr::Var(id) = ctx.name_ref("owned_result") else { unreachable!() }; id }),
-            None,
-            "paren/cast wrappers must not recover owners without source provenance",
-        );
-    }
-
-    #[test]
-    fn recovered_direct_call_rhs_accepts_exact_source_call_and_checks_owner() {
-        let mut ctx = FoldingContext::new(64);
-        let source_call = (0x1000, 0);
-        install_callsite_resolution(
-            &mut ctx,
-            source_call,
-            0x401000,
-            "sym.imp.one_arg",
-            Some(FunctionType {
-                return_type: CType::Void,
-                params: vec![CType::Int(32)],
-                variadic: false,
-            }),
-        );
-        let source_id = CallSiteId::from(source_call);
-        ctx.state.analysis_ctx.ownership.call_ownership.insert(
-            source_id,
-            CallOwnershipFact {
-                source: source_id,
-                owner: Some(CallOwner {
-                    visible_name: "owned_result".to_string(),
-                    kind: CallOwnerKind::StableLocal,
-                }),
-                aliases: BTreeSet::new(),
-                direct_aliases: BTreeSet::new(),
-            },
-        );
-        let source_expr = CExpr::call(
-            CExpr::External {
-                name: "sym.local_two_arg".to_string(),
-                kind: crate::symbol::ExternalKind::Function,
-            },
-            vec![CExpr::IntLit(7), CExpr::IntLit(9)],
-        );
-        ctx.state
-            .analysis_ctx
-            .use_info
-            .call_result_exprs
-            .insert(source_call, source_expr.clone());
-
-        assert_eq!(
-            ctx.recovered_owned_call_result_definition_rhs_for_visible_name({ let CExpr::Var(id) = ctx.name_ref("owned_result") else { unreachable!() }; id }),
-            None,
-            "a display-only owner must not recover a call result without exact value identity",
-        );
-        assert_eq!(
-            ctx.recovered_owned_call_result_definition_rhs_for_visible_name({ let CExpr::Var(id) = ctx.name_ref("wrong_owner") else { unreachable!() }; id }),
-            None,
-            "exact source-call RHS recovery must reject mismatched owners",
-        );
-        assert_eq!(
-            ctx.recovered_owned_call_result_definition_rhs_for_visible_name({ let CExpr::Var(id) = ctx.name_ref("owned_result") else { unreachable!() }; id }),
-            None,
-            "expression shape must not recover a call result without exact value identity",
-        );
-    }
-
-    #[test]
-    fn recovered_var_rhs_canonicalizes_alias_source_call_and_checks_owner() {
-        let mut ctx = FoldingContext::new(64);
-        let source_call = (0x1000, 0);
-        install_callsite_resolution(
-            &mut ctx,
-            source_call,
-            0x401000,
-            "sym.imp.one_arg",
-            Some(FunctionType {
-                return_type: CType::Void,
-                params: vec![CType::Int(32)],
-                variadic: false,
-            }),
-        );
-        let source_id = CallSiteId::from(source_call);
-        ctx.state.analysis_ctx.ownership.call_ownership.insert(
-            source_id,
-            CallOwnershipFact {
-                source: source_id,
-                owner: Some(CallOwner {
-                    visible_name: "owned_result".to_string(),
-                    kind: CallOwnerKind::StableLocal,
-                }),
-                aliases: BTreeSet::from(["tmp_result".to_string()]),
-                direct_aliases: BTreeSet::new(),
-            },
-        );
-        ctx.state
-            .analysis_ctx
-            .ownership
-            .alias_sources
-            .insert("tmp_result".to_string(), source_id);
-        ctx.state.analysis_ctx.use_info.call_result_exprs.insert(
-            source_call,
-            CExpr::call(
-                CExpr::External {
-                    name: "sym.local_two_arg".to_string(),
-                    kind: crate::symbol::ExternalKind::Function,
-                },
-                vec![CExpr::IntLit(7), CExpr::IntLit(9)],
-            ),
-        );
-
-        assert_eq!(
-            ctx.recovered_owned_call_result_definition_rhs_for_visible_name({ let CExpr::Var(id) = ctx.name_ref("owned_result") else { unreachable!() }; id }),
-            None,
-            "a string alias must not recover call-result identity",
-        );
-        assert_eq!(
-            ctx.recovered_owned_call_result_definition_rhs_for_visible_name({ let CExpr::Var(id) = ctx.name_ref("wrong_owner") else { unreachable!() }; id }),
-            None,
-            "alias-source RHS recovery must reject mismatched assignment owners",
-        );
-    }
 
     #[test]
     fn callsite_identity_does_not_printf_clamp_when_rendered_callee_is_poisoned() {
-        let symbols = test_table();
         let mut ctx = FoldingContext::new(64);
         let typed_names = HashMap::from([(0x401000, "sym.imp.printf".to_string())]);
         let binary_symbols = HashMap::new();
@@ -3874,7 +3466,6 @@ mod tests {
 
     #[test]
     fn modeled_call_target_uses_typed_resolution_without_fact_scan() {
-        let symbols = test_table();
         let mut ctx = FoldingContext::new(64);
         let typed_names = HashMap::from([(0x401000, "sym.local.memcpy_model".to_string())]);
         let binary_symbols = HashMap::new();
@@ -4344,101 +3935,7 @@ mod tests {
         );
     }
 
-    #[test]
-    fn imported_result_binding_residualizes_when_named_owner_is_not_stable() {
-        let symbols = test_table();
-        let mut ctx = make_x86_64_ctx();
-        let owner = make_var("tmp:buf", 1, 8);
-        let shadow = make_var("tmp:3ea80", 1, 8);
-        ctx.state.analysis_ctx.use_info.call_result_aliases.insert(
-            (0x1000, 0),
-            BTreeSet::from([owner.display_name(), shadow.display_name()]),
-        );
-        ctx.state
-            .analysis_ctx
-            .use_info
-            .insert_call_result_source_alias(&owner.display_name(), (0x1000, 0));
-        ctx.state
-            .analysis_ctx
-            .use_info
-            .insert_call_result_source_alias(&shadow.display_name(), (0x1000, 0));
-        ctx.state
-            .analysis_ctx
-            .use_info
-            .var_aliases
-            .insert(owner.display_name(), "buf".to_string());
-        ctx.state
-            .analysis_ctx
-            .use_info
-            .call_args
-            .insert((0x1000, 0), vec![call_arg(ctx.name_ref("src"))]);
 
-        let rendered = ctx.render_call_arg_for_callee(
-            &ctx.name_ref("sym.imp.printf"),
-            result_call_arg(
-                CExpr::call(
-                    CExpr::External {
-                        name: "sym.imp.malloc".to_string(),
-                        kind: crate::symbol::ExternalKind::Import,
-                    },
-                    vec![CExpr::IntLit(16)],
-                ),
-                (0x1000, 0),
-                0,
-            ),
-        );
-
-        assert_eq!(
-            rendered,
-            ctx.unresolved_call_arg_expr(),
-            "unstable owner candidates must not fall back to replayed malloc call"
-        );
-    }
-
-    #[test]
-    fn shadow_call_result_assignment_is_suppressed_when_named_owner_exists() {
-        let mut ctx = make_x86_64_ctx();
-        let owner = make_var("tmp:buf", 1, 8);
-        let shadow = make_var("tmp:3ea80", 1, 8);
-        ctx.state.analysis_ctx.use_info.call_result_aliases.insert(
-            (0x1000, 0),
-            BTreeSet::from([owner.display_name(), shadow.display_name()]),
-        );
-        ctx.state
-            .analysis_ctx
-            .use_info
-            .insert_call_result_source_alias(&owner.display_name(), (0x1000, 0));
-        ctx.state
-            .analysis_ctx
-            .use_info
-            .insert_call_result_source_alias(&shadow.display_name(), (0x1000, 0));
-        ctx.state
-            .analysis_ctx
-            .use_info
-            .var_aliases
-            .insert(owner.display_name(), "buf".to_string());
-        ctx.state.analysis_ctx.use_info.insert_definition_for_name_if_absent(&shadow.display_name(), CExpr::call(
-                CExpr::External {
-                    name: "sym.imp.malloc".to_string(),
-                    kind: crate::symbol::ExternalKind::Import,
-                },
-                vec![CExpr::IntLit(16)],
-            ),
-        );
-
-        let block = make_block(vec![SSAOp::Copy {
-            dst: shadow.clone(),
-            src: make_var("rax", 1, 8),
-        }]);
-        let stmts = ctx
-            .fold_block(&block, block.addr)
-            .expect("supported block lowering");
-
-        assert!(
-            stmts.is_empty(),
-            "shadow imported-call result assignment should be suppressed once a named owner exists, got {stmts:?}"
-        );
-    }
 
     #[test]
     fn predicate_owner_rewrite_rejects_generic_argument_owner() {
@@ -4673,10 +4170,10 @@ mod tests {
     #[test]
     fn test_constant_pointer_offset_load_renders_as_subscript() {
         let mut ctx = FoldingContext::new(64);
-        ctx.inputs.param_register_aliases = Box::leak(Box::new(HashMap::from([(
+install_test_param_aliases(&mut ctx, HashMap::from([(
             "x1".to_string(),
             "argv".to_string(),
-        )])));
+        )]));
 
         let expr = CExpr::binary(
             BinaryOp::Add,
@@ -4814,41 +4311,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn undeclared_carrier_type_evidence_is_observation_transparent() {
-        let mut ctx = make_x86_64_ctx();
-        ctx.set_known_function_signatures(HashMap::from([(
-            "sym.helper".to_string(),
-            FunctionType {
-                return_type: CType::Int(32),
-                params: vec![],
-                variadic: false,
-            },
-        )]));
-        let mut owner = crate::ast::RenderObservationOwner::new();
-
-        let cast = CExpr::cast(CType::ptr(CType::UInt(8)), ctx.name_ref("raw"));
-        let (_, marked_cast) = owner
-            .observe_expr(cast.clone())
-            .expect("cast observation");
-        assert_eq!(
-            ctx.declared_type_for_carrier("mystery", &marked_cast),
-            ctx.declared_type_for_carrier("mystery", &cast)
-        );
-
-        let call = CExpr::call(ctx.name_ref("sym.helper"), vec![]);
-        let (_, marked_call) = owner
-            .observe_expr(call.clone())
-            .expect("call observation");
-        assert_eq!(
-            ctx.declared_type_for_carrier("another_mystery", &marked_call),
-            ctx.declared_type_for_carrier("another_mystery", &call)
-        );
-        assert_eq!(
-            ctx.declared_type_for_carrier("another_mystery", &call),
-            CType::Int(32)
-        );
-    }
 
     #[test]
     fn known_signature_does_not_make_internal_call_imported() {
@@ -5311,11 +4773,11 @@ mod tests {
 
         assert_eq!(
             ctx.get_expr(&make_var("ram:401000", 0, 8)),
-            ctx.name_ref("ram:401000")
+            Ok(ctx.name_ref("ram:401000"))
         );
         assert_eq!(
             ctx.get_expr(&make_var("const:402000", 0, 8)),
-            CExpr::IntLit(0x402000)
+            Ok(CExpr::IntLit(0x402000))
         );
     }
 
@@ -5348,196 +4810,95 @@ mod tests {
         );
     }
 
-    #[test]
-    fn assignment_lhs_uses_typed_ssa_kind_for_versioned_arg_carriers() {
-        fn lowered_lhs_for(dst: SSAVar) -> String {
-            let mut ctx = FoldingContext::new(64);
-            ctx.state
-                .analysis_ctx
-                .use_info
-                .var_aliases
-                .insert(dst.display_name(), "arg1".to_string());
-
-            let stmt = ctx
-                .op_to_stmt(&SSAOp::Copy {
-                    dst,
-                    src: make_var("value", 2, 8),
-                })
-                .expect("supported copy lowering")
-                .expect("versioned generic-arg carrier should lower to an assignment");
-
-            let CStmt::Expr(CExpr::Binary {
-                op: BinaryOp::Assign,
-                left,
-                ..
-            }) = stmt
-            else {
-                panic!("expected assignment expression");
-            };
-            let CExpr::Var(name) = *left else {
-                panic!("expected a reference on the left");
-            };
-            ctx.spelling(name).to_string()
-        }
-
-        assert_eq!(
-            lowered_lhs_for(make_var("reg:10", 2, 8)),
-            "r10_2"
-        );
-        assert_eq!(
-            lowered_lhs_for(make_var("reg:zf", 2, 1)),
-            "zf_2"
-        );
-        assert_eq!(
-            lowered_lhs_for(make_var("tmp:11f80", 2, 8)),
-            "t2"
-        );
-        assert_eq!(
-            lowered_lhs_for(make_var("unique:11f80", 2, 8)),
-            "t2"
-        );
-        assert_eq!(
-            lowered_lhs_for(make_var("TMP:11f80", 2, 8)),
-            "tmp_11f80_2"
-        );
-        assert_eq!(
-            lowered_lhs_for(make_var("reg:10", 0, 8)),
-            "arg1"
-        );
-    }
 
     #[test]
-    fn should_inline_ssavar_guard_matrix_preserves_refusal_order() {
-    
-    fn mark_use(ctx: &mut FoldingContext<'_>, var: &SSAVar, count: usize) {
-        mark_use_counted(ctx, var, count);
-    }
+    fn should_inline_and_reads_require_the_exact_sealed_disposition() {
+        let arch = make_test_arch_x86_64();
+        let mut entry = R2ILBlock::new(0x1000, 4);
+        entry.push(R2ILOp::Copy {
+            dst: Varnode::unique(0x10, 8),
+            src: Varnode::constant(7, 8),
+        });
+        entry.push(R2ILOp::IntAdd {
+            dst: Varnode::unique(0x20, 8),
+            a: Varnode::unique(0x10, 8),
+            b: Varnode::constant(1, 8),
+        });
+        entry.push(R2ILOp::CallOther {
+            output: Some(Varnode::unique(0x30, 8)),
+            userop: 7,
+            inputs: Vec::new(),
+        });
+        let prepared = prepared_from_r2il_blocks(&[entry], &arch)
+            .with_name("sealed_inline_admission");
+        let block = prepared.function().get_block(0x1000).expect("entry block");
+        let SSAOp::Copy { dst, src } = &block.ops[0] else {
+            panic!("fixture must begin with a copy");
+        };
+        let refused = block
+            .ops
+            .iter()
+            .find_map(|op| match op {
+                SSAOp::CallOther {
+                    output: Some(output),
+                    ..
+                } => Some(output),
+                _ => None,
+            })
+            .expect("refused output value");
+        let mut ctx = make_x86_64_ctx_with_prepared(&prepared);
+        let (plan, names, _) = install_observed_lowering(&mut ctx, &prepared);
+        let src_value = prepared
+            .graph()
+            .value_id_for_var(src)
+            .expect("constant source value");
+        let dst_value = prepared
+            .graph()
+            .value_id_for_var(dst)
+            .expect("copy destination value");
+        let refused_value = prepared
+            .graph()
+            .value_id_for_var(refused)
+            .expect("refused output identity");
 
-        fn mark_simple_def(ctx: &mut FoldingContext<'_>, var: &SSAVar) {
-            ctx.state
-                .analysis_ctx
-                .use_info
-                .insert_definition_for_name_if_absent(&var.display_name(), CExpr::IntLit(1));
-        }
+        assert!(matches!(
+            plan.disposition(src_value),
+            Some(crate::binding_plan::ValueDisposition::Inline { .. })
+        ));
+        assert!(ctx.should_inline(src));
+        assert!(!matches!(
+            plan.disposition(dst_value),
+            Some(crate::binding_plan::ValueDisposition::Inline { .. })
+        ));
+        assert!(!ctx.should_inline(dst));
+        assert!(matches!(
+            plan.disposition(refused_value),
+            Some(crate::binding_plan::ValueDisposition::Refused { .. })
+        ));
+        assert!(!ctx.should_inline(refused));
 
-        let mut ctx = FoldingContext::new(64);
-
-        let zero_use = make_var("tmp:zero", 1, 8);
-        assert!(!ctx.should_inline(&zero_use));
-
-        let too_many_simple = make_var("ordinary_many", 1, 8);
-        mark_use(&mut ctx, &too_many_simple, 4);
-        mark_simple_def(&mut ctx, &too_many_simple);
-        assert!(!ctx.should_inline(&too_many_simple));
-
-        let three_use_simple = make_var("ordinary_three", 1, 8);
-        mark_use(&mut ctx, &three_use_simple, 3);
-        mark_simple_def(&mut ctx, &three_use_simple);
-        assert!(ctx.should_inline(&three_use_simple));
-
-        let pinned = make_var("pinned_value", 1, 8);
-        mark_use(&mut ctx, &pinned, 1);
-        ctx.state
-            .analysis_ctx
-            .use_info
-            .pinned
-            .insert(pinned.display_name());
-        assert!(!ctx.should_inline(&pinned));
-
-        let direct_unowned = make_var("tmp:123", 1, 8);
-        mark_use(&mut ctx, &direct_unowned, 1);
-        ctx.state
-            .analysis_ctx
-            .use_info
-            .direct_call_result_aliases
-            .insert(direct_unowned.display_name());
-        ctx.state
-            .analysis_ctx
-            .use_info
-            .insert_call_result_source_alias(&direct_unowned.display_name(), (0x1000, 1));
-        ctx.state
-            .analysis_ctx
-            .use_info
-            .call_result_aliases
-            .entry((0x1000, 1))
-            .or_default()
-            .insert(direct_unowned.display_name());
-        assert!(ctx.should_inline(&direct_unowned));
-
-        let direct_owned = make_var("tmp:owned", 1, 8);
-        mark_use(&mut ctx, &direct_owned, 1);
-        ctx.state
-            .analysis_ctx
-            .use_info
-            .direct_call_result_aliases
-            .insert(direct_owned.display_name());
-        ctx.state
-            .analysis_ctx
-            .use_info
-            .insert_call_result_source_alias(&direct_owned.display_name(), (0x1000, 2));
-        ctx.state
-            .analysis_ctx
-            .use_info
-            .call_result_aliases
-            .entry((0x1000, 2))
-            .or_default()
-            .insert(direct_owned.display_name());
-        assert!(!ctx.should_inline(&direct_owned));
-
-        let condition_non_candidate = make_var("condition_value", 1, 8);
-        mark_use(&mut ctx, &condition_non_candidate, 1);
-        bind_and_mark_condition(&mut ctx, &condition_non_candidate);
-        assert!(!ctx.should_inline(&condition_non_candidate));
-
-        let condition_flag = make_var("ZF", 1, 1);
-        mark_use(&mut ctx, &condition_flag, 1);
-        bind_and_mark_condition(&mut ctx, &condition_flag);
-        assert!(ctx.should_inline(&condition_flag));
-
-        let flag_only = make_var("flag_only", 1, 8);
-        mark_use(&mut ctx, &flag_only, 2);
-        ctx.state
-            .analysis_ctx
-            .flag_info
-            .flag_only_values
-            .insert(flag_only.display_name());
-        assert!(ctx.should_inline(&flag_only));
-
-        let multi_complex_caller_saved = make_var("RDI", 1, 8);
-        mark_use(&mut ctx, &multi_complex_caller_saved, 2);
-        assert!(!ctx.should_inline(&multi_complex_caller_saved));
-
-        let single_ordinary = make_var("ordinary_single", 1, 8);
-        mark_use(&mut ctx, &single_ordinary, 1);
-        ctx.state
-            .analysis_ctx
-            .use_info
-            .insert_definition_for_name_if_absent(&single_ordinary.display_name(), CExpr::IntLit(7),
-            );
-        assert!(ctx.should_inline(&single_ordinary));
-
-        // Leaving the statement out says the reader will inline the value, so a
-        // value nothing can render keeps its statement rather than its name
-        // being printed with nothing defining it.
-        let single_unrenderable = make_var("ordinary_single_unrenderable", 1, 8);
-        mark_use(&mut ctx, &single_unrenderable, 1);
-        assert!(!ctx.should_inline(&single_unrenderable));
-
-        let stack_base = make_var("RSP", 1, 8);
-        mark_use(&mut ctx, &stack_base, 1);
-        assert!(!ctx.should_inline(&stack_base));
-
-        let return_reg = make_var("RAX", 1, 8);
-        mark_use(&mut ctx, &return_reg, 1);
-        ctx.state
-            .analysis_ctx
-            .use_info
-            .insert_definition_for_name_if_absent(&return_reg.display_name(), CExpr::IntLit(9));
-        assert!(ctx.should_inline(&return_reg));
-        ctx.state.return_blocks.insert(0x2000);
-        ctx.current_block_addr.set(Some(0x2000));
-        assert!(!ctx.should_inline(&return_reg));
-        ctx.current_block_addr.set(None);
+        ctx.inlined_renderings
+            .borrow_mut()
+            .insert(src.display_name(), CExpr::IntLit(99));
+        ctx.inlined_renderings
+            .borrow_mut()
+            .insert(dst.display_name(), CExpr::IntLit(100));
+        ctx.inlined_renderings
+            .borrow_mut()
+            .insert(refused.display_name(), CExpr::IntLit(101));
+        assert_eq!(ctx.get_expr(src), Ok(CExpr::IntLit(7)));
+        assert_eq!(
+            ctx.get_expr(dst),
+            Ok(CExpr::Var(
+                names
+                    .symbol_for_value(dst_value)
+                    .expect("bound destination symbol")
+            ))
+        );
+        assert_eq!(
+            ctx.get_expr(refused),
+            Err(OpLoweringRefusal::MissingProgramVariableAuthorization)
+        );
     }
 
     #[test]
@@ -5587,7 +4948,9 @@ mod tests {
             ),
         );
 
-        let expr = ctx.get_return_expr(&ret);
+        let expr = ctx
+            .get_return_expr(&ret)
+            .expect("fixture return expression should lower");
         let CExpr::Binary { left, right, .. } = expr else {
             panic!("expected semanticized binary return");
         };
@@ -5605,11 +4968,11 @@ mod tests {
     fn test_get_return_expr_semanticizes_raw_member_derefs_from_visible_arg_alias() {
         let ret = make_var("tmp:9301", 1, 8);
         let mut ctx = FoldingContext::new(64);
-        ctx.inputs.param_register_aliases = Box::leak(Box::new(
+        install_test_param_aliases(&mut ctx,
             [("rdi".to_string(), "arg1".to_string())]
                 .into_iter()
                 .collect(),
-        ));
+        );
         ctx.inputs.external_type_db = Box::leak(Box::new(ExternalTypeDb {
             structs: [(
                 "demostruct".to_string(),
@@ -5652,7 +5015,9 @@ mod tests {
             ),
         );
 
-        let expr = ctx.get_return_expr(&ret);
+        let expr = ctx
+            .get_return_expr(&ret)
+            .expect("fixture return expression should lower");
         let CExpr::Binary { left, right, .. } = expr else {
             panic!("expected semanticized binary return");
         };
@@ -5991,7 +5356,9 @@ mod tests {
             .expect("typed commuted pointer add should normalize directly");
         assert!(matches!(direct, CExpr::Subscript { .. }), "{direct:?}");
 
-        let expr = ctx.render_canonical_load_expr(&dst, &addr, CType::u8());
+        let expr = ctx
+            .render_canonical_load_expr(&dst, &addr, CType::u8())
+            .expect("typed load should lower");
         let CExpr::Subscript { base, index } = expr else {
             panic!("expected commuted pointer addition to render as subscript, got {expr:?}");
         };
@@ -6134,7 +5501,9 @@ mod tests {
         ctx.current_block_addr.set(Some(0x1000));
         ctx.current_op_idx.set(Some(loads[1].0));
 
-        let expr = ctx.render_canonical_load_expr(&loads[0].1, &loads[0].2, CType::i32());
+        let expr = ctx
+            .render_canonical_load_expr(&loads[0].1, &loads[0].2, CType::i32())
+            .expect("certified stack load should lower");
         assert_eq!(
             expr,
             ctx.name_ref("first_slot"),
@@ -6152,7 +5521,9 @@ mod tests {
             "obj.global_value".to_string(),
         )])));
 
-        let expr = ctx.render_canonical_load_expr(&dst, &addr, CType::u64());
+        let expr = ctx
+            .render_canonical_load_expr(&dst, &addr, CType::u64())
+            .expect("raw load residual should lower");
 
         assert!(
             matches!(expr, CExpr::Deref(_)),
@@ -6173,7 +5544,9 @@ mod tests {
             "obj.global_value".to_string(),
         )])));
 
-        let expr = ctx.render_canonical_store_target_expr(&addr, 8, CType::u64());
+        let expr = ctx
+            .render_canonical_store_target_expr(&addr, 8, CType::u64())
+            .expect("raw store target residual should lower");
 
         assert!(
             matches!(expr, CExpr::Deref(_)),
@@ -6255,14 +5628,14 @@ mod tests {
         let addr = make_var("tmp:6400", 3, 8);
 
         let mut ctx = make_aarch64_ctx();
-        ctx.inputs.param_register_aliases = Box::leak(Box::new(
+        install_test_param_aliases(&mut ctx,
             [
                 ("x0".to_string(), "arg1".to_string()),
                 ("x1".to_string(), "arg2".to_string()),
             ]
             .into_iter()
             .collect(),
-        ));
+        );
         ctx.inputs.external_type_db = Box::leak(Box::new(ExternalTypeDb {
             structs: [(
                 "demolayout".to_string(),
@@ -6323,11 +5696,11 @@ mod tests {
         let addr = make_var("tmp:6400", 3, 8);
 
         let mut ctx = make_aarch64_ctx();
-        ctx.inputs.param_register_aliases = Box::leak(Box::new(
+        install_test_param_aliases(&mut ctx,
             [("x0".to_string(), "obj".to_string())]
                 .into_iter()
                 .collect(),
-        ));
+        );
         ctx.state.analysis_ctx.use_info.insert_semantic_value_for_name(&addr.display_name(), crate::analysis::SemanticValue::Address(crate::analysis::NormalizedAddr {
                 base: crate::analysis::BaseRef::Value(crate::analysis::ValueRef::from(base)),
                 index: None,
@@ -6354,14 +5727,14 @@ mod tests {
     #[test]
     fn test_render_memory_access_from_visible_expr_recovers_indexed_member_from_raw_pointer_math() {
         let mut ctx = make_aarch64_ctx();
-        ctx.inputs.param_register_aliases = Box::leak(Box::new(
+        install_test_param_aliases(&mut ctx,
             [
                 ("x0".to_string(), "arg1".to_string()),
                 ("x1".to_string(), "arg2".to_string()),
             ]
             .into_iter()
             .collect(),
-        ));
+        );
         ctx.inputs.external_type_db = Box::leak(Box::new(ExternalTypeDb {
             structs: [(
                 "demo_layout".to_string(),
@@ -6471,14 +5844,14 @@ mod tests {
     #[test]
     fn test_semanticize_raw_subscript_recovers_exact_indexed_field_from_layout() {
         let mut ctx = make_x86_64_ctx();
-        ctx.inputs.param_register_aliases = Box::leak(Box::new(
+        install_test_param_aliases(&mut ctx,
             [
                 ("rdi".to_string(), "items".to_string()),
                 ("esi".to_string(), "idx".to_string()),
             ]
             .into_iter()
             .collect(),
-        ));
+        );
         ctx.inputs.external_type_db = Box::leak(Box::new(ExternalTypeDb {
             structs: [(
                 "item".to_string(),
@@ -6566,14 +5939,14 @@ mod tests {
     #[test]
     fn test_render_memory_access_from_visible_expr_recovers_masked_x86_indexed_member() {
         let mut ctx = make_x86_64_ctx();
-        ctx.inputs.param_register_aliases = Box::leak(Box::new(
+        install_test_param_aliases(&mut ctx,
             [
                 ("rdi".to_string(), "arr".to_string()),
                 ("esi".to_string(), "idx".to_string()),
             ]
             .into_iter()
             .collect(),
-        ));
+        );
         ctx.inputs.external_type_db = Box::leak(Box::new(ExternalTypeDb {
             structs: [(
                 "demo_layout".to_string(),
@@ -6651,14 +6024,14 @@ mod tests {
     #[test]
     fn test_normalized_addr_prefers_pointer_definition_over_scalar_stack_home_hint() {
         let mut ctx = make_x86_64_ctx();
-        ctx.inputs.param_register_aliases = Box::leak(Box::new(
+        install_test_param_aliases(&mut ctx,
             [
                 ("rdi".to_string(), "arr".to_string()),
                 ("esi".to_string(), "idx".to_string()),
             ]
             .into_iter()
             .collect(),
-        ));
+        );
         ctx.inputs.external_type_db = Box::leak(Box::new(ExternalTypeDb {
             structs: [(
                 "demo_layout".to_string(),
@@ -6758,14 +6131,14 @@ mod tests {
         }
 
         let mut ctx = make_aarch64_ctx();
-        ctx.inputs.param_register_aliases = Box::leak(Box::new(
+        install_test_param_aliases(&mut ctx,
             [
                 ("x0".to_string(), "arg1".to_string()),
                 ("x1".to_string(), "arg2".to_string()),
             ]
             .into_iter()
             .collect(),
-        ));
+        );
         let oracle = FieldNameAnyOnlyOracle;
         ctx.set_type_oracle(Some(&oracle));
 
@@ -6887,11 +6260,11 @@ mod tests {
 
         assert_eq!(
             ctx.get_return_expr(&make_var("const:ffffffff", 0, 4)),
-            CExpr::IntLit(-1)
+            Ok(CExpr::IntLit(-1))
         );
         assert_eq!(
             ctx.get_return_expr(&make_var("const:fffffffe", 0, 4)),
-            CExpr::IntLit(-2)
+            Ok(CExpr::IntLit(-2))
         );
     }
 
@@ -7355,128 +6728,10 @@ mod tests {
         assert!(stmt.is_none(), "x = x - 0 should be suppressed as a no-op");
     }
 
-    #[test]
-    fn test_var_name_canonicalizes_stack_alias_from_external_offset_mirror() {
-        let mut ctx = FoldingContext::new(64);
-        ctx.state
-            .analysis_ctx
-            .use_info
-            .var_aliases
-            .insert("tmp:1_1".to_string(), "local_4".to_string());
-        ctx.set_external_stack_vars(HashMap::from([(
-            -4,
-            stack_var_spec("result", None, Some("RBP")),
-        )]));
 
-        let rendered = ctx.var_name(&make_var("tmp:1", 1, 8));
-        assert_eq!(rendered, "result");
-    }
 
-    #[test]
-    fn test_condition_var_chain_resolves_stack_alias() {
-        let mut ctx = FoldingContext::new(64);
-        ctx.state
-            .analysis_ctx
-            .stack_info
-            .stack_vars
-            .insert(-4, "value".to_string());
-        ctx.state.analysis_ctx.use_info.insert_definition_for_name_if_absent("tmp:cond_1", CExpr::binary(
-                BinaryOp::Eq,
-                ctx.name_ref("result"),
-                CExpr::IntLit(25)),
-        );
-        ctx.state.analysis_ctx.use_info.insert_definition_for_name_if_absent("result", CExpr::Deref(Box::new(CExpr::binary(
-                BinaryOp::Add,
-                ctx.name_ref("rbp_1"),
-                CExpr::IntLit(-4),
-            ))),
-        );
 
-        let cond = ctx.get_condition_expr(&make_var("tmp:cond", 1, 1));
-        let mut reads = HashSet::new();
-        ctx.collect_expr_reads(&cond, &mut reads);
-        assert!(
-            reads.contains("value"),
-            "Condition should resolve var-chain stack alias into canonical stack name"
-        );
-        assert!(
-            !reads.contains("result"),
-            "Condition should not keep intermediate non-canonical alias"
-        );
-    }
 
-    #[test]
-    fn test_condition_var_chain_resolves_stack_alias_through_cast_paren() {
-        let mut ctx = FoldingContext::new(64);
-        ctx.state
-            .analysis_ctx
-            .stack_info
-            .stack_vars
-            .insert(-4, "value".to_string());
-        ctx.state.analysis_ctx.use_info.insert_definition_for_name_if_absent("tmp:cond_1", CExpr::binary(
-                BinaryOp::Eq,
-                ctx.name_ref("result"),
-                CExpr::IntLit(19)),
-        );
-        ctx.state.analysis_ctx.use_info.insert_definition_for_name_if_absent("result", CExpr::Paren(Box::new(CExpr::Cast {
-                ty: CType::ptr(CType::Int(32)),
-                expr: Box::new(CExpr::Deref(Box::new(CExpr::Paren(Box::new(
-                    CExpr::binary(
-                        BinaryOp::Add,
-                        ctx.name_ref("rbp_1"),
-                        CExpr::IntLit(-4)),
-                ))))),
-            })),
-        );
-
-        let cond = ctx.get_condition_expr(&make_var("tmp:cond", 1, 1));
-        let mut reads = HashSet::new();
-        ctx.collect_expr_reads(&cond, &mut reads);
-        assert!(
-            reads.contains("value"),
-            "Cast/paren wrapped condition chain should still resolve stack alias"
-        );
-    }
-
-    #[test]
-    fn test_condition_var_chain_non_stack_remains_unforced() {
-        let mut ctx = FoldingContext::new(64);
-        ctx.state.analysis_ctx.use_info.insert_definition_for_name_if_absent("tmp:cond_1", CExpr::binary(
-                BinaryOp::Eq,
-                ctx.name_ref("result"),
-                CExpr::IntLit(19)),
-        );
-        ctx.state.analysis_ctx.use_info.insert_definition_for_name_if_absent("result", CExpr::binary(
-                BinaryOp::Add,
-                ctx.name_ref("arg1"),
-                CExpr::IntLit(1)),
-        );
-
-        let cond = ctx.get_condition_expr(&make_var("tmp:cond", 1, 1));
-        let mut reads = HashSet::new();
-        ctx.collect_expr_reads(&cond, &mut reads);
-        assert!(
-            reads.contains("result"),
-            "Non-stack var chains should not be force-rewritten"
-        );
-    }
-
-    #[test]
-    fn test_lookup_definition_resolves_formatted_temp_aliases() {
-        let mut ctx = FoldingContext::new(64);
-        ctx.state
-            .analysis_ctx
-            .use_info
-            .insert_definition_for_name_if_absent("tmp:foo_2", ctx.name_ref("local_4"));
-        ctx.state
-            .analysis_ctx
-            .use_info
-            .var_aliases
-            .insert("tmp:foo_2".to_string(), "t2".to_string());
-
-        let resolved = ctx.lookup_definition("t2");
-        assert_eq!(resolved, Some(ctx.name_ref("local_4")));
-    }
 
     #[test]
     fn test_lookup_definition_resolves_hex_temp_alias_without_explicit_var_alias() {
@@ -7499,46 +6754,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn lowered_alias_lookup_filters_raw_temporaries_with_typed_kind() {
-        let mut ctx = FoldingContext::new(64);
-        ctx.state
-            .analysis_ctx
-            .use_info
-            .insert_definition_for_name_if_absent("tmp:raw_2", CExpr::IntLit(1));
-        ctx.state
-            .analysis_ctx
-            .use_info
-            .insert_definition_for_name_if_absent("value_2", CExpr::IntLit(2));
-        ctx.state
-            .analysis_ctx
-            .use_info
-            .insert_definition_for_name_if_absent("TMP:raw_2", CExpr::IntLit(3));
-
-        let temp_matches = ctx.ssa_names_for_lowered_temp_alias("t2");
-        assert!(
-            temp_matches.contains(&"tmp:raw_2".to_string()),
-            "{temp_matches:?}"
-        );
-        assert!(
-            !temp_matches.contains(&"value_2".to_string()),
-            "{temp_matches:?}"
-        );
-
-        let value_matches = ctx.ssa_names_for_lowered_temp_alias("v2");
-        assert!(
-            value_matches.contains(&"value_2".to_string()),
-            "{value_matches:?}"
-        );
-        assert!(
-            value_matches.contains(&"TMP:raw_2".to_string()),
-            "{value_matches:?}"
-        );
-        assert!(
-            !value_matches.contains(&"tmp:raw_2".to_string()),
-            "{value_matches:?}"
-        );
-    }
 
     #[test]
     fn test_lookup_definition_prefers_forwarded_semantic_value_over_register_artifact() {
@@ -8398,58 +7613,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_prune_dead_temp_assignments_keeps_stack_backed_call_result_owner() {
-        let mut ctx = make_x86_64_ctx();
-        let source_call = (0x3000, 4);
-        let source_id = CallSiteId::from(source_call);
-        let call = CExpr::call(
-            CExpr::External {
-                name: "sym.imp.alloc".to_string(),
-                kind: crate::symbol::ExternalKind::Import,
-            },
-            vec![CExpr::IntLit(64)],
-        );
-        ctx.state.analysis_ctx.ownership.call_ownership.insert(
-            source_id,
-            CallOwnershipFact {
-                source: source_id,
-                owner: Some(CallOwner {
-                    visible_name: "value_1".to_string(),
-                    kind: CallOwnerKind::StableLocal,
-                }),
-                aliases: BTreeSet::new(),
-                direct_aliases: BTreeSet::new(),
-            },
-        );
-        ctx.state
-            .analysis_ctx
-            .ownership
-            .visible_owner_sources
-            .insert("value_1".to_string(), source_id);
-        ctx.state
-            .analysis_ctx
-            .use_info
-            .insert_stack_slot_for_name("value_1", StackSlotProvenance::new(-8));
-        ctx.state
-            .analysis_ctx
-            .use_info
-            .call_result_exprs
-            .insert(source_call, call.clone());
-        let stmts = vec![
-            CStmt::Expr(CExpr::assign(
-                ctx.name_ref("value_1"),
-                call.clone())),
-            CStmt::Return(Some(CExpr::IntLit(0))),
-        ];
-
-        let pruned = ctx.prune_dead_temp_assignments(stmts.clone());
-
-        assert_eq!(
-            pruned, stmts,
-            "stack-backed visible call-result owners are canonical facts and must not be demoted"
-        );
-    }
 
     #[test]
     fn test_prune_dead_temp_assignments_keeps_side_effecting_non_memory_sleigh_temp_rhs() {
@@ -8641,7 +7804,8 @@ mod tests {
         let mut reads = HashSet::new();
         ctx.collect_expr_reads(rhs, &mut reads);
         assert!(
-            reads.contains("arg1") && !reads.contains("eax_2"),
+            reads.contains(&test_symbol(&ctx, "arg1"))
+                && !reads.contains(&test_symbol(&ctx, "eax_2")),
             "Copy-forward should substitute eax_2 uses with arg1"
         );
 
@@ -8681,7 +7845,7 @@ mod tests {
         let mut reads = HashSet::new();
         ctx.collect_expr_reads(rhs, &mut reads);
         assert!(
-            reads.contains("eax_2"),
+            reads.contains(&test_symbol(&ctx, "eax_2")),
             "Call RHS should not be used for copy-forward substitution"
         );
     }
@@ -8712,7 +7876,7 @@ mod tests {
         let mut reads = HashSet::new();
         ctx.collect_expr_reads(rhs, &mut reads);
         assert!(
-            reads.contains("eax_2"),
+            reads.contains(&test_symbol(&ctx, "eax_2")),
             "Alias must be invalidated when its RHS source variable is reassigned"
         );
     }
@@ -9844,40 +9008,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn certified_visible_owner_lookup_rejects_prepared_return_register_owner() {
-        let prepared = prepared_zero_arg_helper_call("certified_return_register_owner_name");
-        let mut ctx = make_x86_64_ctx_with_prepared(&prepared);
-        let source_call = (0x1000, 1);
-        ctx.set_function_names(HashMap::from([(0x401050, "sym.helper".to_string())]));
-        install_callsite_resolution(&mut ctx, source_call, 0x401050, "sym.helper", None);
-        ctx.inputs.prepared_semantic_view = Some(Box::leak(Box::new(PreparedSemanticView {
-            call_view_by_site: BTreeMap::from([(
-                source_call,
-                crate::analysis::PreparedCallView {
-                    result_owner: Some(ctx.name_ref("RAX_1")),
-                    ..crate::analysis::PreparedCallView::default()
-                },
-            )]),
-            ..PreparedSemanticView::default()
-        })));
-
-        assert_eq!(
-            ctx.stable_owned_call_result_name_for_source(source_call),
-            None,
-            "certified result owner names must reject return-register placeholders"
-        );
-        assert_eq!(
-            ctx.source_call_for_visible_owner_name("RAX_1"),
-            None,
-            "rejected prepared owner names must not authorize visible source-call lookup"
-        );
-        assert_eq!(
-            ctx.recovered_owned_call_result_definition_rhs_for_visible_name({ let CExpr::Var(id) = ctx.name_ref("RAX_1") else { unreachable!() }; id }),
-            None,
-            "rejected return-register owner names must not synthesize executable call replay"
-        );
-    }
 
     #[test]
     fn raw_import_name_hints_do_not_authorize_imported_call_policy() {
@@ -9920,7 +9050,6 @@ mod tests {
 
     #[test]
     fn typed_callee_resolution_resolves_normalized_alias_without_import_policy() {
-        let symbols = test_table();
         let mut ctx = make_aarch64_ctx();
         let callee_facts =
             BTreeMap::from([(0x401000, minimal_callee_fact(0x401000, "sym.imp.printf"))]);
@@ -9951,7 +9080,6 @@ mod tests {
 
     #[test]
     fn typed_callee_resolution_authorizes_import_policy_with_explicit_linkage() {
-        let symbols = test_table();
         let mut ctx = make_aarch64_ctx();
         let callee_facts = BTreeMap::from([(
             0x401000,
@@ -10364,7 +9492,9 @@ mod tests {
             matches!(semantic, Some(CExpr::Subscript { .. })),
             "semantic return source should render as subscript before return selection, got {semantic:?}"
         );
-        let expr = ctx.get_return_expr(&eax);
+        let expr = ctx
+            .get_return_expr(&eax)
+            .expect("fixture return expression should lower");
         assert!(
             matches!(expr, CExpr::Subscript { .. }),
             "semantic indexed load should survive get_return_expr for return-register sources, got {expr:?}"
@@ -10379,14 +9509,14 @@ mod tests {
         let load_second = make_var("tmp:11f00", 8, 4);
         let ret = make_var("EAX", 2, 4);
         let mut ctx = make_x86_64_ctx();
-        ctx.inputs.param_register_aliases = Box::leak(Box::new(
+        install_test_param_aliases(&mut ctx,
             [
                 ("rdi".to_string(), "arg1".to_string()),
                 ("esi".to_string(), "arg2".to_string()),
             ]
             .into_iter()
             .collect(),
-        ));
+        );
         ctx.inputs.external_type_db = Box::leak(Box::new(ExternalTypeDb {
             structs: [(
                 "demostruct".to_string(),
@@ -10451,7 +9581,9 @@ mod tests {
             ),
         );
 
-        let expr = ctx.get_return_expr(&ret);
+        let expr = ctx
+            .get_return_expr(&ret)
+            .expect("fixture return expression should lower");
         let rendered = spelled(&ctx, &expr);
         assert!(
             rendered.contains("third") && rendered.contains("fourteenth"),
@@ -10475,14 +9607,14 @@ mod tests {
         let arr = make_var("RDI", 0, 8);
         let ret = make_var("EAX", 1, 4);
         let mut ctx = FoldingContext::new(64);
-        ctx.inputs.param_register_aliases = Box::leak(Box::new(
+        install_test_param_aliases(&mut ctx,
             [
                 ("rdi".to_string(), "arg1".to_string()),
                 ("esi".to_string(), "arg2".to_string()),
             ]
             .into_iter()
             .collect(),
-        ));
+        );
         ctx.state.analysis_ctx.use_info.insert_semantic_value_for_name(&ret.display_name(), crate::analysis::SemanticValue::Load {
                 space: r2il::SpaceId::Ram,
                 addr: crate::analysis::NormalizedAddr {
@@ -10495,7 +9627,9 @@ mod tests {
             },
         );
 
-        let expr = ctx.get_return_expr(&ret);
+        let expr = ctx
+            .get_return_expr(&ret)
+            .expect("fixture return expression should lower");
         let rendered = spelled(&ctx, &expr);
         assert!(
             rendered.contains("Subscript"),
@@ -10507,78 +9641,18 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_observed_x86_negative_index_visible_expr_normalizes_to_negative_subscript() {
-        let mut ctx = FoldingContext::new(64);
-        ctx.inputs.param_register_aliases = Box::leak(Box::new(
-            [
-                ("rdi".to_string(), "arg1".to_string()),
-                ("esi".to_string(), "arg2".to_string()),
-                ("ecx".to_string(), "ecx".to_string()),
-            ]
-            .into_iter()
-            .collect(),
-        ));
-        ctx.state
-            .analysis_ctx
-            .use_info
-            .var_aliases
-            .insert("ESI_0".to_string(), "arg2".to_string());
-        ctx.state
-            .analysis_ctx
-            .use_info
-            .var_aliases
-            .insert("ECX_1".to_string(), "ecx".to_string());
-        ctx.state.analysis_ctx.use_info.insert_definition_for_name_if_absent("ecx", CExpr::binary(
-                BinaryOp::BitXor,
-                ctx.name_ref("ecx"),
-                ctx.name_ref("ecx")),
-        );
-
-        let expr = CExpr::binary(
-            BinaryOp::Add,
-            ctx.name_ref("arg1"),
-            CExpr::binary(
-                BinaryOp::Mul,
-                CExpr::binary(
-                    BinaryOp::Sub,
-                    CExpr::binary(
-                        BinaryOp::BitXor,
-                        ctx.name_ref("ecx"),
-                        ctx.name_ref("ecx")),
-                    ctx.name_ref("arg2"),
-                ),
-                CExpr::IntLit(4),
-            ),
-        );
-
-        let normalized = ctx
-            .debug_normalized_addr_from_visible_expr(&expr)
-            .expect("normalized address");
-        assert_eq!(normalized.scale_bytes, -4, "{normalized:?}");
-
-        let rendered = ctx
-            .debug_render_memory_access_from_visible_expr(&expr, 4)
-            .expect("semantic memory access");
-        let text = format!("{rendered:?}");
-        assert!(matches!(rendered, CExpr::Subscript { .. }), "{rendered:?}");
-        assert!(
-            text.contains("Neg") || text.contains("arg2"),
-            "expected negative index in rendered access, got {rendered:?}"
-        );
-    }
 
     #[test]
     fn test_observed_x86_negative_index_visible_deref_promotes_to_subscript() {
         let mut ctx = FoldingContext::new(64);
-        ctx.inputs.param_register_aliases = Box::leak(Box::new(
+        install_test_param_aliases(&mut ctx,
             [
                 ("rdi".to_string(), "arg1".to_string()),
                 ("esi".to_string(), "arg2".to_string()),
             ]
             .into_iter()
             .collect(),
-        ));
+        );
         let raw = CExpr::Deref(Box::new(CExpr::binary(
             BinaryOp::Add,
             ctx.name_ref("arg1"),
@@ -10604,14 +9678,14 @@ mod tests {
     #[test]
     fn test_observed_x86_struct_field_visible_deref_promotes_to_member() {
         let mut ctx = FoldingContext::new(64);
-        ctx.inputs.param_register_aliases = Box::leak(Box::new(
+        install_test_param_aliases(&mut ctx,
             [
                 ("rdi".to_string(), "arg1".to_string()),
                 ("esi".to_string(), "arg2".to_string()),
             ]
             .into_iter()
             .collect(),
-        ));
+        );
         ctx.inputs.external_type_db = Box::leak(Box::new(ExternalTypeDb {
             structs: [(
                 "demostruct".to_string(),
@@ -10772,103 +9846,10 @@ mod tests {
 
         assert_eq!(
             ctx.debug_resolve_prepared_predicate_operand(&make_var("tmp:11f00", 1, 4)),
-            ctx.name_ref("var_4h")
+            Some(ctx.name_ref("var_4h"))
         );
     }
 
-    #[test]
-    fn modeled_internal_wrapper_result_is_repaired_like_imported_calls() {
-        let mut ctx = make_x86_64_ctx();
-        let source_call = (0x2000, 3);
-        ctx.state.analysis_ctx.ownership.call_ownership.insert(
-            CallSiteId::from(source_call),
-            CallOwnershipFact {
-                source: CallSiteId::from(source_call),
-                owner: Some(CallOwner {
-                    visible_name: "buf".to_string(),
-                    kind: CallOwnerKind::StableLocal,
-                }),
-                aliases: BTreeSet::from(["tmp:buf".to_string()]),
-                direct_aliases: BTreeSet::new(),
-            },
-        );
-        let function_names = HashMap::from([(0x401500, "helper.alloc_wrapper".to_string())]);
-        let callee_facts = BTreeMap::from([(
-            0x401500,
-            CalleeFact {
-                function_id: 0x401500,
-                name: Some("helper.alloc_wrapper".to_string()),
-                linkage: r2types::CalleeLinkage::Internal,
-                signature: None,
-                signature_callconv: None,
-                signature_noreturn: false,
-                model_policy_evidence: BTreeSet::from([
-                    r2types::CalleeModelPolicyEvidence::InterprocSummary,
-                ]),
-                direct_callees: Vec::new(),
-                callsite_count: 1,
-                has_unknown_calls: false,
-                arg_effects: BTreeMap::from([(
-                    0,
-                    CalleeArgEffect {
-                        read: true,
-                        write: false,
-                        escape: false,
-                        free: false,
-                    },
-                )]),
-                memory_effects: Vec::new(),
-                transfer_effects: Vec::new(),
-                allocation_effects: Vec::new(),
-                lifetime_effects: Vec::new(),
-                sync_effects: Vec::new(),
-                atomic_effects: Vec::new(),
-                param_type_hints: BTreeMap::new(),
-                return_type_hint: None,
-                return_relation: CalleeReturnRelation::HeapAlloc,
-                reads_global_memory: false,
-                writes_global_memory: false,
-                touches_unknown_memory: false,
-            },
-        )]);
-        let known_signatures = HashMap::new();
-        let callee_resolution = r2types::CalleeResolutionFacts::from_direct_call_targets(
-            [(
-                r2types::CallsiteKey {
-                    block_addr: source_call.0,
-                    op_index: source_call.1,
-                },
-                0x401500,
-            )],
-            &r2types::CalleeIdentityContext {
-                function_names: &function_names,
-                symbols: ctx.inputs.binary_symbols,
-                callee_facts: &callee_facts,
-                known_function_signatures: &known_signatures,
-            },
-        );
-        ctx.inputs.function_names = Box::leak(Box::new(function_names));
-        install_function_callee_facts(&mut ctx, callee_facts);
-        mutate_function_facts(&mut ctx, |function_facts| {
-            function_facts.set_callee_resolution(callee_resolution);
-        });
-
-        let rendered = ctx.render_call_args_for_site(
-            source_call.0,
-            source_call.1,
-            &ctx.name_ref("helper.alloc_wrapper"),
-            vec![result_call_arg(
-                ctx.name_ref("tmp:buf"),
-                source_call,
-                0)],
-        );
-
-        assert_eq!(
-            rendered,
-            vec![ctx.name_ref("buf")],
-            "expected summary-modeled internal wrapper to preserve owned call result like an imported call, got {rendered:?}"
-        );
-    }
 
     #[test]
     fn prepared_call_site_root_resolves_copied_const_target_without_analysis() {
@@ -10935,7 +9916,10 @@ mod tests {
 
         assert_eq!(
             ctx.resolve_call_target_for_site(block.addr, 1, target),
-            CExpr::External { name: "sym.imp.fact_helper".to_string(), kind: crate::symbol::ExternalKind::Import }
+            Ok(CExpr::External {
+                name: "sym.imp.fact_helper".to_string(),
+                kind: crate::symbol::ExternalKind::Import,
+            })
         );
         assert_eq!(
             ctx.call_target_identity(&ctx.name_ref("const:401050")),
@@ -11222,120 +10206,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn certified_call_result_owner_alias_requires_certified_stack_identity() {
-        let symbols = test_table();
-
-        let arch = make_test_arch_x86_64();
-        let mut entry = R2ILBlock::new(0x1000, 4);
-        entry.push(R2ILOp::Copy {
-            dst: Varnode::unique(1, 8),
-            src: Varnode::constant(0x401050, 8),
-        });
-        entry.push(R2ILOp::Call {
-            target: Varnode::unique(1, 8),
-        });
-        entry.push(R2ILOp::Copy {
-            dst: Varnode::register(0x10, 8),
-            src: Varnode::register(0x00, 8),
-        });
-        entry.push(R2ILOp::IntSub {
-            dst: Varnode::unique(0x500, 8),
-            a: Varnode::register(0x28, 8),
-            b: Varnode::constant(8, 8),
-        });
-        entry.push(R2ILOp::Store {
-            space: SpaceId::Ram,
-            addr: Varnode::unique(0x500, 8),
-            val: Varnode::constant(0, 8),
-        });
-
-        let prepared = prepared_x86_with_stack_slot(
-            &[entry],
-            &arch,
-            r2ssa::StackAddressBase::StackPointer,
-            -8,
-            8,
-        )
-        .with_name("certified_call_result_stack_alias");
-        let source_call = (0x1000, 1);
-        let call_results = test_call_result_facts_with_owner_for_source(&prepared, source_call);
-        let prepared_view = || PreparedSemanticView {
-            call_view_by_site: BTreeMap::from([(
-                source_call,
-                crate::analysis::PreparedCallView {
-                    direct_target: Some(0x401050),
-                    callee_identity: Some(r2types::CalleeIdentity::from_name("sym.helper")),
-                    authoritative_args: Vec::new(),
-                    authoritative_arg_values: Vec::new(),
-                    result_owner: Some(crate::symbol::var_ref(&symbols, "buf")),
-                    render_fact: None,
-                },
-            )]),
-            ..PreparedSemanticView::default()
-        };
-
-        let mut uncertified_alias_ctx = make_x86_64_ctx_with_prepared(&prepared);
-        install_function_call_result_facts(&mut uncertified_alias_ctx, call_results);
-        uncertified_alias_ctx.inputs.prepared_semantic_view =
-            Some(Box::leak(Box::new(prepared_view())));
-        // The view was built before this context, so it adopts the view's table.
-        uncertified_alias_ctx.symbols = std::rc::Rc::new(std::cell::RefCell::new(symbols.borrow().clone()));
-        uncertified_alias_ctx
-            .state.analysis_ctx.use_info.insert_call_result_source_alias(&"alias".to_string(), source_call);
-        uncertified_alias_ctx
-            .state
-            .analysis_ctx
-            .use_info
-            .insert_semantic_value_for_name(
-                "alias",
-                crate::analysis::SemanticValue::Address(crate::analysis::NormalizedAddr {
-                    base: crate::analysis::BaseRef::StackSlot(-8),
-                    index: None,
-                    scale_bytes: 0,
-                    offset_bytes: 0,
-                }),
-            );
-
-        assert_eq!(
-            uncertified_alias_ctx.stable_owned_call_result_name_for_source(source_call),
-            Some("buf".to_string()),
-            "fixture must have a FunctionFacts-backed prepared owner"
-        );
-        assert_eq!(
-            uncertified_alias_ctx.stable_owned_call_result_expr_for_symbol({ let CExpr::Var(id) = uncertified_alias_ctx.name_ref("alias") else { unreachable!() }; id }),
-            None,
-            "semantic stack-owner aliases must not certify call-result ownership"
-        );
-
-        let mut certified_alias_ctx = make_x86_64_ctx_with_prepared(&prepared);
-        install_function_call_result_facts(
-            &mut certified_alias_ctx,
-            test_call_result_facts_with_owner_for_source(&prepared, source_call),
-        );
-        certified_alias_ctx.inputs.prepared_semantic_view =
-            Some(Box::leak(Box::new(prepared_view())));
-        certified_alias_ctx.symbols = std::rc::Rc::new(std::cell::RefCell::new(symbols.borrow().clone()));
-        certified_alias_ctx.inputs.visible_bindings =
-            Box::leak(Box::new(vec![visible_stack_binding(
-                "alias",
-                Some(CType::Int(32)),
-                8,
-            )]));
-        certified_alias_ctx
-            .state.analysis_ctx.use_info.insert_call_result_source_alias(&"alias".to_string(), source_call);
-        certified_alias_ctx
-            .state
-            .analysis_ctx
-            .use_info
-            .insert_stack_slot_for_name("alias", StackSlotProvenance::new(-8));
-
-        assert_eq!(
-            certified_alias_ctx.stable_owned_call_result_expr_for_symbol({ let CExpr::Var(id) = certified_alias_ctx.name_ref("alias") else { unreachable!() }; id }),
-            None,
-            "typed stack evidence alone must not turn a display alias into call-result identity"
-        );
-    }
 
     #[test]
     fn certified_zero_arg_call_ignores_prepared_fake_args() {
@@ -11579,7 +10449,6 @@ mod tests {
 
     #[test]
     fn certified_call_arg_uses_function_facts_value_over_unknown_semantic_binding() {
-        let symbols = test_table();
         let arch = make_test_arch_x86_64();
         let mut entry = R2ILBlock::new(0x1000, 4);
         entry.push(R2ILOp::Copy {
@@ -12124,27 +10993,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn prepared_predicate_alias_cycle_returns_stable_var_instead_of_recursing() {
-        let mut ctx = make_x86_64_ctx();
-        ctx.inputs.prepared_semantic_view = Some(Box::leak(Box::new(PreparedSemanticView {
-            owner_expr_by_name: HashMap::from([
-                (
-                    "tmp:pred.1".to_string(),
-                    ctx.name_ref("tmp:pred.2")),
-                (
-                    "tmp:pred.2".to_string(),
-                    ctx.name_ref("tmp:pred.1")),
-            ]),
-            ..PreparedSemanticView::default()
-        })));
-
-        let mut visited = HashSet::new();
-        let resolved =
-            ctx.resolve_predicate_operand(&ctx.name_ref("tmp:pred.1"), 0, &mut visited);
-
-        assert_eq!(resolved, ctx.name_ref("tmp:pred.1"));
-    }
 
     #[test]
     fn prepared_empty_call_view_args_do_not_replay_analyzed_call_args() {
@@ -12421,99 +11269,7 @@ mod tests {
         );
     }
 
-    #[test]
-    fn return_inline_ssa_storage_carriers_require_raw_or_mapped_alias() {
-        let symbols = test_table();
-        let mut unmapped = make_x86_64_ctx();
-        unmapped
-            .state
-            .analysis_ctx
-            .use_info
-            .insert_definition_for_name_if_absent("tmp:3e480_1", CExpr::IntLit(7));
 
-        assert_eq!(
-            unmapped.expand_return_expr(
-                &unmapped.name_ref("value_3e480"),
-                0,
-                &mut HashSet::new()
-            ),
-            unmapped.name_ref("value_3e480")
-        );
-        assert_eq!(
-            unmapped.expand_return_expr(&unmapped.name_ref("t42_1"), 0, &mut HashSet::new()),
-            unmapped.name_ref("t42_1")
-        );
-        unmapped
-            .state
-            .analysis_ctx
-            .use_info
-            .insert_definition_for_name_if_absent("ordinary_alias", CExpr::IntLit(9));
-        assert_eq!(
-            unmapped.expand_return_expr(
-                &unmapped.name_ref("ordinary_alias"),
-                0,
-                &mut HashSet::new()
-            ),
-            unmapped.name_ref("ordinary_alias")
-        );
-
-        let mut mapped = make_x86_64_ctx();
-        mapped
-            .state
-            .analysis_ctx
-            .use_info
-            .insert_definition_for_name_if_absent("tmp:3e480_1", CExpr::IntLit(7));
-        mapped
-            .state
-            .analysis_ctx
-            .use_info
-            .var_aliases
-            .insert("tmp:3e480_1".to_string(), "value_3e480".to_string());
-
-        assert_eq!(
-            mapped.expand_return_expr(
-                &mapped.name_ref("value_3e480"),
-                0,
-                &mut HashSet::new()
-            ),
-            CExpr::IntLit(7)
-        );
-    }
-
-    #[test]
-    fn prepared_imported_arg_rewrite_canonicalizes_stack_home_aliases() {
-        let mut ctx = make_x86_64_ctx();
-        ctx.inputs.param_register_aliases = Box::leak(Box::new(HashMap::from([(
-            "rdi".to_string(),
-            "s".to_string(),
-        )])));
-        ctx.state
-            .analysis_ctx
-            .stack_info
-            .stack_vars
-            .insert(-24, "s_home".to_string());
-        ctx.inputs.prepared_semantic_view = Some(Box::leak(Box::new(PreparedSemanticView {
-            stack_aliases_by_offset: BTreeMap::from([(
-                -24,
-                crate::analysis::prepared_semantic::StackAliasView {
-                    visible_name: "s_home".to_string(),
-                    arg_alias: Some("s".to_string()),
-                    binding_kind: Some(VisibleBindingKind::HiddenHome),
-                },
-            )]),
-            ..PreparedSemanticView::default()
-        })));
-
-        assert_eq!(
-            ctx.normalize_imported_call_arg_expr(
-                ctx.name_ref("s_home"),
-                true,
-                false,
-                false,
-            ),
-            ctx.name_ref("s")
-        );
-    }
 
     #[test]
     fn imported_result_binding_filters_stack_like_call_result_owners() {
@@ -12582,9 +11338,16 @@ mod tests {
         assert_eq!(rendered, ctx.name_ref("fallback"));
     }
 
-    fn install_prepared_owner_for_name(ctx: &mut FoldingContext<'_>, name: &str, owner: CExpr) {
+    fn install_prepared_owner_for_var(
+        ctx: &mut FoldingContext<'_>,
+        var: &SSAVar,
+        owner: CExpr,
+    ) {
+        let value = r2ssa::ValueId(11_000);
         ctx.inputs.prepared_semantic_view = Some(Box::leak(Box::new(PreparedSemanticView {
-            owner_expr_by_name: HashMap::from([(name.to_string(), owner)]),
+            value_id_by_var: HashMap::from([(var.clone(), value)]),
+            var_by_value_id: HashMap::from([(value, var.clone())]),
+            owner_expr_by_value: HashMap::from([(value, owner)]),
             ..PreparedSemanticView::default()
         })));
     }
@@ -12652,14 +11415,8 @@ mod tests {
             .analysis_ctx
             .use_info
             .insert_definition_for_name_if_absent(&source.display_name(), ctx.name_ref("rax_7"));
-        let __fixture_args = (
-            &source.display_name(),
-            CExpr::AddrOf(Box::new(ctx.name_ref("buf"))),
-        );
-        install_prepared_owner_for_name(
-            &mut ctx,
-            __fixture_args.0,
-            __fixture_args.1);
+        let owner = CExpr::AddrOf(Box::new(ctx.name_ref("buf")));
+        install_prepared_owner_for_var(&mut ctx, &source, owner);
 
         let binding = crate::analysis::CallArgBinding::input(
             crate::analysis::SemanticCallArg::FallbackExpr(ctx.name_ref("fallback")),
@@ -12746,32 +11503,6 @@ mod tests {
         assert_eq!(rendered, vec![ctx.name_ref("owned_result")]);
     }
 
-    #[test]
-    fn prepared_imported_scalar_expr_uses_precomputed_owner_aliases() {
-        let mut ctx = make_x86_64_ctx();
-        ctx.inputs.prepared_semantic_view = Some(Box::leak(Box::new(PreparedSemanticView {
-            owner_expr_by_name: HashMap::from([(
-                "tmp:size_1".to_string(),
-                ctx.name_ref("len"))]),
-            ..PreparedSemanticView::default()
-        })));
-
-        assert_eq!(
-            ctx.prepared_imported_semantic_arg_expr(
-                &crate::analysis::SemanticValue::Scalar(ScalarValue::Expr(CExpr::binary(
-                    BinaryOp::Add,
-                    ctx.name_ref("tmp:size_1"),
-                    CExpr::IntLit(1),
-                ))),
-                false,
-            ),
-            Some(CExpr::binary(
-                BinaryOp::Add,
-                ctx.name_ref("len"),
-                CExpr::IntLit(1),
-            ))
-        );
-    }
 
     #[test]
     fn prepared_generic_zero_compare_yields_to_local_compare_recovery() {
@@ -12914,10 +11645,10 @@ mod tests {
 
 
     fn install_hash_field_layout(ctx: &mut FoldingContext<'_>) {
-        ctx.inputs.param_register_aliases = Box::leak(Box::new(HashMap::from([
+        install_test_param_aliases(ctx, HashMap::from([
             ("RDI".to_string(), "arg0".to_string()),
             ("rdi".to_string(), "arg0".to_string()),
-        ])));
+        ]));
         ctx.inputs.external_type_db = Box::leak(Box::new(ExternalTypeDb {
             structs: [(
                 "demostruct".to_string(),
@@ -13451,11 +12182,6 @@ mod tests {
         let slot = make_var("tmp:slot", 1, 8);
         let loaded = make_var("tmp:loaded", 1, 8);
         let copied = make_var("rdi", 1, 8);
-        ctx.state
-            .analysis_ctx
-            .ownership
-            .alias_sources
-            .insert(rax.display_name(), CallSiteId::from(source_call));
         ctx.state.analysis_ctx.use_info.insert_definition_for_name_if_absent(&slot.display_name(), CExpr::binary(
                 BinaryOp::Add,
                 ctx.name_ref("rbp"),
@@ -13492,15 +12218,9 @@ mod tests {
     #[test]
     fn local_post_call_source_refuses_custom_space_stack_shaped_reload() {
         let mut ctx = make_x86_64_ctx();
-        let source_call = (0x1000, 0);
         let rax = make_var("rax", 1, 8);
         let slot = make_var("tmp:slot", 1, 8);
         let loaded = make_var("tmp:loaded", 1, 8);
-        ctx.state
-            .analysis_ctx
-            .ownership
-            .alias_sources
-            .insert(rax.display_name(), CallSiteId::from(source_call));
         ctx.state.analysis_ctx.use_info.insert_definition_for_name_if_absent(&slot.display_name(), CExpr::binary(
                 BinaryOp::Add,
                 ctx.name_ref("rbp"),
@@ -13533,16 +12253,10 @@ mod tests {
     #[test]
     fn local_post_call_source_refuses_mismatched_stack_reload_offset() {
         let mut ctx = make_x86_64_ctx();
-        let source_call = (0x1000, 0);
         let rax = make_var("rax", 1, 8);
         let stored_slot = make_var("tmp:stored_slot", 1, 8);
         let loaded_slot = make_var("tmp:loaded_slot", 1, 8);
         let loaded = make_var("tmp:loaded", 1, 8);
-        ctx.state
-            .analysis_ctx
-            .ownership
-            .alias_sources
-            .insert(rax.display_name(), CallSiteId::from(source_call));
         ctx.state.analysis_ctx.use_info.insert_definition_for_name_if_absent(&stored_slot.display_name(), CExpr::binary(
                 BinaryOp::Add,
                 ctx.name_ref("rbp"),

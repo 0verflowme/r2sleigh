@@ -775,6 +775,7 @@ impl<'a> CertifiedRenderContext<'a> {
 }
 
 impl LowerFrame {
+    #[cfg(test)]
     fn for_expr() -> Self {
         Self {
             mode: LowerMode::Expr,

@@ -29,6 +29,14 @@ fn carry_flag_rewrite_observations(source: CExpr, replacement: CExpr) -> CExpr {
     crate::ast::carry_outer_expr_observations(&source, replacement)
 }
 
+fn constant_bits_to_expr(value: u64) -> CExpr {
+    if value > 0x7fff_ffff {
+        CExpr::UIntLit(value)
+    } else {
+        CExpr::IntLit(value as i64)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum CompareContext {
     Eq,
@@ -290,6 +298,20 @@ impl<'a> FoldingContext<'a> {
         }
     }
 
+    fn exact_branch_input_expr(
+        &self,
+        block_addr: u64,
+        branch_idx: usize,
+    ) -> Option<CExpr> {
+        match self.planned_input_expr_at(block_addr, branch_idx, 1) {
+            Ok(expr) => Some(expr),
+            Err(refusal) => {
+                self.retain_first_lowering_refusal(refusal);
+                None
+            }
+        }
+    }
+
     pub fn extract_condition_from_block(&self, block: &FunctionSSABlock) -> Option<CExpr> {
         let (branch_idx, cond) = block
             .ops
@@ -301,11 +323,8 @@ impl<'a> FoldingContext<'a> {
                 _ => None,
             })?;
         if self.inputs.prepared_ssa.is_some() {
-            return self
-                .certified_branch_condition_from_block(block)
-                .map(|(expr, _, _)| {
-                    self.observe_normalized_input_expr(block.addr, branch_idx, 1, expr)
-                });
+            self.certified_branch_condition_from_block(block)?;
+            return self.exact_branch_input_expr(block.addr, branch_idx);
         }
         let prepared_branch_candidate = self.prepared_branch_condition_expr(block.addr);
         let prepared_block_candidate =
@@ -331,8 +350,8 @@ impl<'a> FoldingContext<'a> {
         });
         self.current_block_addr.set(prev_block_addr);
         self.current_op_idx.set(prev_op_idx);
-        if let Some(expr) = strong_prepared {
-            return Some(self.observe_normalized_input_expr(block.addr, branch_idx, 1, expr));
+        if strong_prepared.is_some() {
+            return self.exact_branch_input_expr(block.addr, branch_idx);
         }
 
         let allow_legacy_flag_provenance = ![
@@ -380,9 +399,10 @@ impl<'a> FoldingContext<'a> {
             let result = result.map(|expr| self.finalize_condition_expr(expr));
             self.current_block_addr.set(prev_block_addr);
             self.current_op_idx.set(prev_op_idx);
-            return result.map(|expr| {
-                self.observe_normalized_input_expr(block.addr, branch_idx, 1, expr)
-            });
+            if result.is_some() {
+                return self.exact_branch_input_expr(block.addr, branch_idx);
+            }
+            return None;
         }
         {
             let mut consider = |candidate: Option<CExpr>| {
@@ -436,9 +456,8 @@ impl<'a> FoldingContext<'a> {
 
         self.current_block_addr.set(prev_block_addr);
         self.current_op_idx.set(prev_op_idx);
-        result.map(|expr| {
-            self.observe_normalized_input_expr(block.addr, branch_idx, 1, expr)
-        })
+        result?;
+        self.exact_branch_input_expr(block.addr, branch_idx)
     }
 
     pub(super) fn certified_branch_condition_from_block(
@@ -614,7 +633,7 @@ impl<'a> FoldingContext<'a> {
                     .filter(|expr| self.is_assignment_predicate_expr(expr))
             })
             .or_else(|| {
-                let rendered = self.var_name(var).ok()?;
+                let rendered = self.retain_lowering_result(self.var_name(var))?;
                 if self.is_transient_visible_name(&rendered)
                     || self.is_low_signal_visible_name(&rendered)
                 {
@@ -771,16 +790,13 @@ impl<'a> FoldingContext<'a> {
     fn resolve_prepared_predicate_operand_with_width(
         &self,
         var: &SSAVar,
-        compare_width: u32,
+        _compare_width: u32,
     ) -> Option<CExpr> {
         let rooted = self
             .prepared_canonical_value_root(var)
             .unwrap_or_else(|| var.clone());
-        if rooted.is_const() {
-            return Some(utils::compare_const_to_expr_with_width(
-                &rooted,
-                compare_width.max(rooted.size),
-            ));
+        if let Some(value) = rooted.constant_bits() {
+            return Some(constant_bits_to_expr(value));
         }
         // A carrier is spelled by its own name wherever it appears, and a
         // predicate is not an exception. Resolving the operand through its
@@ -849,11 +865,13 @@ impl<'a> FoldingContext<'a> {
                 self.best_visible_definition(&candidate_name),
             );
         }
+        let rooted_expr = self.retain_lowering_result(self.get_expr(&rooted))?;
         let resolved =
-            self.resolve_predicate_operand(&self.get_expr(&rooted).ok()?, 0, &mut HashSet::new());
+            self.resolve_predicate_operand(&rooted_expr, 0, &mut HashSet::new());
         if !original_name.eq_ignore_ascii_case(&rooted_name) {
+            let original_expr = self.retain_lowering_result(self.get_expr(var))?;
             let original_resolved =
-                self.resolve_predicate_operand(&self.get_expr(var).ok()?, 0, &mut HashSet::new());
+                self.resolve_predicate_operand(&original_expr, 0, &mut HashSet::new());
             if best_from_call_result
                 && self.prepared_predicate_operand_is_generic_entry_or_return(&original_resolved)
             {
@@ -999,8 +1017,8 @@ impl<'a> FoldingContext<'a> {
             return None;
         }
 
-        if cond.is_const() {
-            return Some(self.const_to_expr(cond));
+        if let Some(value) = cond.constant_bits() {
+            return Some(constant_bits_to_expr(value));
         }
 
         let cond_name = cond.display_name();
@@ -1051,7 +1069,7 @@ impl<'a> FoldingContext<'a> {
         }
 
         self.predicate_candidate_for_var(cond)
-            .or_else(|| self.get_expr(cond).ok())
+            .or_else(|| self.retain_lowering_result(self.get_expr(cond)))
     }
 
     fn local_compare_expr(
@@ -1075,10 +1093,10 @@ impl<'a> FoldingContext<'a> {
         op_idx: usize,
         var: &SSAVar,
         depth: u32,
-        compare_width: u32,
+        _compare_width: u32,
     ) -> Option<CExpr> {
-        if var.is_const() {
-            return Some(utils::compare_const_to_expr_with_width(var, compare_width));
+        if let Some(value) = var.constant_bits() {
+            return Some(constant_bits_to_expr(value));
         }
         self.local_expr_for_var(block, op_idx, var, depth)
     }
@@ -1090,8 +1108,8 @@ impl<'a> FoldingContext<'a> {
         var: &SSAVar,
         depth: u32,
     ) -> Option<CExpr> {
-        if var.is_const() {
-            return Some(self.const_to_expr(var));
+        if let Some(value) = var.constant_bits() {
+            return Some(constant_bits_to_expr(value));
         }
 
         let lower_name = var.name.to_ascii_lowercase();
@@ -1115,11 +1133,11 @@ impl<'a> FoldingContext<'a> {
             {
                 return Some(call_expr);
             }
-            return self.get_expr(var).ok();
+            return self.retain_lowering_result(self.get_expr(var));
         }
 
         if depth > MAX_PREDICATE_OPERAND_DEPTH {
-            return self.get_expr(var).ok();
+            return self.retain_lowering_result(self.get_expr(var));
         }
 
         for (idx, op) in block.ops[..before_idx].iter().enumerate().rev() {
@@ -1212,7 +1230,7 @@ impl<'a> FoldingContext<'a> {
             return Some(expr);
         }
 
-        self.get_expr(var).ok()
+        self.retain_lowering_result(self.get_expr(var))
     }
 
     fn local_return_register_chain_is_call_result(
@@ -1256,14 +1274,13 @@ impl<'a> FoldingContext<'a> {
         rhs: &SSAVar,
         depth: u32,
     ) -> Option<CExpr> {
-        let compare_width = lhs.size.max(rhs.size);
-        let lhs = if lhs.is_const() {
-            Some(utils::compare_const_to_expr_with_width(lhs, compare_width))
+        let lhs = if let Some(value) = lhs.constant_bits() {
+            Some(constant_bits_to_expr(value))
         } else {
             self.local_expr_for_var(block, op_idx, lhs, depth)
         }?;
-        let rhs = if rhs.is_const() {
-            Some(utils::compare_const_to_expr_with_width(rhs, compare_width))
+        let rhs = if let Some(value) = rhs.constant_bits() {
+            Some(constant_bits_to_expr(value))
         } else {
             self.local_expr_for_var(block, op_idx, rhs, depth)
         }?;
@@ -1478,13 +1495,13 @@ impl<'a> FoldingContext<'a> {
     /// want to see the actual condition expression, not a temp variable name.
     pub(super) fn get_condition_expr(&self, var: &SSAVar) -> Option<CExpr> {
         // Always inline constants
-        if var.is_const() {
-            return Some(self.const_to_expr(var));
+        if let Some(value) = var.constant_bits() {
+            return Some(constant_bits_to_expr(value));
         }
 
         let expr = self
             .predicate_candidate_for_var(var)
-            .or_else(|| self.get_expr(var).ok())?;
+            .or_else(|| self.retain_lowering_result(self.get_expr(var)))?;
         let expr = self.rewrite_stack_expr(expr);
         let expr = self.rewrite_condition_stack_aliases(expr);
         let expr = self.simplify_condition_expr(expr);
@@ -3433,7 +3450,7 @@ impl<'a> FoldingContext<'a> {
     pub fn extract_switch_expr(&self, op: &SSAOp) -> Option<CExpr> {
         // Look for indirect branch (BranchInd) which typically holds the switch variable
         if let SSAOp::BranchInd { target } = op {
-            return self.get_expr(target).ok();
+            return self.retain_lowering_result(self.get_expr(target));
         }
         None
     }
@@ -3720,14 +3737,6 @@ fn is_flag_base_name(name: &str) -> bool {
             | "tmpov"
     )
 }
-
-/// Whether this name is a condition code.
-///
-/// One list, in `analysis::utils`. This module carried a byte-identical copy of
-/// it, so the two could disagree about what a flag is while every rule here
-/// assumed they could not.
-#[cfg(test)]
-pub(crate) use crate::analysis::utils::is_cpu_flag;
 
 #[cfg(test)]
 mod observation_transparency_tests {

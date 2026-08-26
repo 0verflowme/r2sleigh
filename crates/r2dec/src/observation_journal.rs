@@ -967,87 +967,62 @@ impl MarkedNativeDraft {
         })
     }
 
-    /// Finish the native product without allowing shadow-audit failure to
-    /// change the rendered program.
+    /// Seal the final native tree as a required render proof.
     ///
-    /// The strict [`Self::seal`] API remains available to tests of the journal
-    /// contract. Production shadowing uses this boundary: a failed audit is
-    /// retained as unavailable evidence, every internal marker is discarded,
-    /// and the same prepared native AST remains the emission product.
-    pub(crate) fn finish_non_consuming(
+    /// A missing marker, conflicting observation, or journal failure rejects
+    /// the native product. The caller may cross the typed residual boundary,
+    /// but it cannot recover the marker-free executable tree from this draft.
+    pub(crate) fn finish_enforcing(
         mut self,
         source: &SourceOwnedFunctionFacts,
         recording_failure: Option<LegacyObservationJournalError>,
-    ) -> SealedNativeFunction {
-        let placement_failure = self.derive_and_apply_placement(source).err();
+    ) -> Result<SealedNativeFunction, BindingShadowAuditFailure> {
+        let placement_failure = self
+            .derive_and_apply_placement(source)
+            .err()
+            .map(crate::PlacementAuditRefusal::from);
         let mut ready = prepare_function_for_emission(&self.function);
         let plan = Rc::clone(&self.journal.plan);
-        let (observations, fallback_effects, observation_failure) = if let Some(error) = recording_failure {
-            let effects = match self.journal.seal_effects_only(source, &mut ready) {
-                Ok(effects) => effects,
-                Err(_) => {
-                    let mut authority = ObservationSealAuthority::new();
-                    ready.discard_observation_markers(&mut authority);
-                    SurvivingEffectObservations::empty(source.source())
-                }
-            };
-            (
-                None,
-                Some(effects),
-                Some(BindingShadowAuditFailure::JournalRecording(
+        if let Some(error) = recording_failure {
+            return Err(BindingShadowAuditFailure::JournalRecording(
+                BindingObservationJournalFailure::from(&error),
+            ));
+        }
+        let observations = match self.journal.seal_preserving_effects(source, &mut ready) {
+            Ok(LegacyObservationSeal::Complete(observations)) => observations,
+            Ok(LegacyObservationSeal::BindingFailure { error, .. }) | Err(error) => {
+                return Err(BindingShadowAuditFailure::JournalSeal(
                     BindingObservationJournalFailure::from(&error),
-                )),
-            )
-        } else {
-            match self.journal.seal_preserving_effects(source, &mut ready) {
-                Ok(LegacyObservationSeal::Complete(observations)) => {
-                    (Some(observations), None, None)
-                }
-                Ok(LegacyObservationSeal::BindingFailure { error, effects }) => {
-                    let mut authority = ObservationSealAuthority::new();
-                    ready.discard_observation_markers(&mut authority);
-                    (
-                        None,
-                        Some(effects),
-                        Some(BindingShadowAuditFailure::JournalSeal(
-                            BindingObservationJournalFailure::from(&error),
-                        )),
-                    )
-                }
-                Err(error) => {
-                    let mut authority = ObservationSealAuthority::new();
-                    ready.discard_observation_markers(&mut authority);
-                    (
-                        None,
-                        Some(SurvivingEffectObservations::empty(source.source())),
-                        Some(BindingShadowAuditFailure::JournalSeal(
-                            BindingObservationJournalFailure::from(&error),
-                        )),
-                    )
-                }
+                ));
             }
         };
-        let region_failure = self.placement.as_ref().and_then(|placement| {
+        if let Some(refusal) = placement_failure {
+            return Err(BindingShadowAuditFailure::Placement(refusal));
+        }
+        if let Some(placement) = self.placement.as_ref() {
             ready
                 .strip_structured_region_markers(&placement.regions)
-                .err()
-                .map(NativePlacementFailure::RegionFinalization)
-        });
-        let placement_audit = if let Some(failure) = placement_failure.or(region_failure) {
-            let refusal = crate::PlacementAuditRefusal::from(failure);
-            crate::PlacementAudit::Refused(refusal)
-        } else {
-            crate::PlacementAudit::Applied
-        };
-        SealedNativeFunction {
-            ready,
-            observations,
-            fallback_effects,
-            effect_audit: crate::EffectObligationAudit::NOT_RUN,
-            placement_audit,
-            observation_failure,
-            plan,
+                .map_err(|error| {
+                    BindingShadowAuditFailure::Placement(crate::PlacementAuditRefusal::from(
+                        NativePlacementFailure::RegionFinalization(error),
+                    ))
+                })?;
         }
+        let coverage = observations.coverage();
+        if !coverage.passes_quality() {
+            return Err(BindingShadowAuditFailure::NonQualityObservations {
+                observations: coverage.into(),
+            });
+        }
+        Ok(SealedNativeFunction {
+            ready,
+            observations: Some(observations),
+            fallback_effects: None,
+            effect_audit: crate::EffectObligationAudit::NOT_RUN,
+            placement_audit: crate::PlacementAudit::Applied,
+            observation_failure: None,
+            plan,
+        })
     }
 }
 
@@ -1467,6 +1442,7 @@ impl LegacyObservationJournal {
     /// Callers cannot supply a `ValueId`, `UseSite`, or machine disposition:
     /// all three come from the authority-checked normalization projection and
     /// binding plan retained by this journal.
+    #[cfg(test)]
     pub(crate) fn observe_normalized_input_expr(
         &mut self,
         site: NormalizedOpSite,
@@ -1500,6 +1476,47 @@ impl LegacyObservationJournal {
             .next()
             .ok_or(LegacyObservationJournalError::TooManyObservations)?;
         Ok(CExpr::observed(id, expr))
+    }
+
+    fn first_unaccounted_render_observation(
+        &self,
+    ) -> Option<LegacyObservationJournalError> {
+        for (index, observation) in self.values.iter().enumerate() {
+            if observation.is_none() {
+                return Some(LegacyObservationJournalError::RenderedValueRequired(ValueId(
+                    index as u32,
+                )));
+            }
+        }
+        for (inst, row) in self.uses.iter().enumerate() {
+            for (input_idx, observation) in row.iter().enumerate() {
+                if observation.is_none() {
+                    return Some(
+                        LegacyObservationJournalError::ExactUseRequiresRenderedOccurrence(
+                            UseSite {
+                                inst: InstId(inst as u32),
+                                input_idx,
+                            },
+                        ),
+                    );
+                }
+            }
+        }
+        for (index, (observation, has_output)) in self
+            .writes
+            .iter()
+            .zip(self.write_has_output.iter())
+            .enumerate()
+        {
+            if *has_output && observation.is_none() {
+                return Some(
+                    LegacyObservationJournalError::ExactWriteRequiresRenderedOccurrence(InstId(
+                        index as u32,
+                    )),
+                );
+            }
+        }
+        None
     }
 
     /// Mark every exact original use outside the already-projected expression.
@@ -1897,6 +1914,14 @@ impl LegacyObservationJournal {
         self.uses = uses;
         self.writes = writes;
         self.effect_occurrences = effect_occurrences;
+        if let Some(error) = self.first_unaccounted_render_observation() {
+            return Ok(LegacyObservationSeal::BindingFailure {
+                error,
+                effects: SurvivingEffectObservations {
+                    occurrences: std::mem::take(&mut self.effect_occurrences),
+                },
+            });
+        }
         Ok(LegacyObservationSeal::Complete(
             self.into_sealed_observations(source),
         ))
@@ -3226,7 +3251,7 @@ mod tests {
     }
 
     #[test]
-    fn production_binding_classification_failure_keeps_later_effect_occurrences() {
+    fn production_binding_classification_failure_refuses_the_native_product() {
         let (source, plan, mut function, mut journal) = journal_fixture();
         let (value, binding, _inst, site) = first_bound_rendered_output(&plan, &source);
         let symbol = declare_legacy_local(&mut function, &plan, binding, "conflicting_output");
@@ -3248,19 +3273,13 @@ mod tests {
             .expect("independent effect occurrence");
         function.body = vec![CStmt::Expr(bound), CStmt::Expr(inline), effect];
 
-        let native = MarkedNativeDraft::new(function, journal)
-            .finish_non_consuming(&source, None);
-        assert_eq!(
-            native.audit_observations(),
+        let result = MarkedNativeDraft::new(function, journal).finish_enforcing(&source, None);
+        assert!(matches!(
+            result,
             Err(BindingShadowAuditFailure::JournalSeal(
-                BindingObservationJournalFailure::ConflictingValue { value },
-            ))
-        );
-        assert_eq!(
-            native.effect_observations().occurrence_count(obligation),
-            Some(1),
-            "a V/U/W classification failure must not stop the final effect traversal"
-        );
+                BindingObservationJournalFailure::ConflictingValue { value: actual },
+            )) if actual == value
+        ));
     }
 
     #[test]
@@ -3294,7 +3313,7 @@ mod tests {
     #[test]
     fn invalid_or_duplicate_markers_leave_ast_unchanged() {
         let (source, plan, mut duplicate_function, mut duplicate_journal) = journal_fixture();
-        let (value, binding, site, input_idx) = first_bound_rendered_input(&plan, &source);
+        let (_value, binding, site, input_idx) = first_bound_rendered_input(&plan, &source);
         let symbol = declare_legacy_symbol(&duplicate_function, &plan, binding, "duplicate_value");
         let marked = duplicate_journal
             .observe_normalized_input_expr(site, input_idx, CExpr::Var(symbol))
@@ -3334,7 +3353,7 @@ mod tests {
     }
 
     #[test]
-    fn production_audit_failure_keeps_the_marker_free_native_product() {
+    fn production_audit_failure_refuses_the_native_product() {
         let (source, plan, mut function, mut journal) = journal_fixture();
         let (_value, binding, site, input_idx) = first_bound_rendered_input(&plan, &source);
         let symbol = declare_legacy_symbol(&function, &plan, binding, "duplicate_native_value");
@@ -3350,34 +3369,19 @@ mod tests {
         let duplicate_id = duplicate_id.index();
         function.body = vec![CStmt::Expr(marked.clone()), CStmt::Expr(marked)];
 
-        let mut expected_function = function.clone();
-        crate::ast::discard_render_observations(&mut expected_function);
-        let expected = crate::codegen::prepare_function_for_emission(&expected_function);
-        let native =
-            MarkedNativeDraft::new(function, journal).finish_non_consuming(&source, None);
-
-        assert_eq!(
-            native.audit_observations(),
+        let result = MarkedNativeDraft::new(function, journal).finish_enforcing(&source, None);
+        assert!(matches!(
+            result,
             Err(BindingShadowAuditFailure::JournalSeal(
                 BindingObservationJournalFailure::DuplicateObservation {
-                    observation_id: duplicate_id,
+                    observation_id: actual,
                 },
-            ))
-        );
-        assert_eq!(native.emission().function(), expected.function());
-        assert_eq!(
-            native.placement_audit(),
-            crate::PlacementAudit::Refused(
-                crate::PlacementAuditRefusal::MissingStructuredRegionArtifact
-            )
-        );
-        assert!(!crate::ast::has_render_observations(
-            native.emission().function()
+            )) if actual == duplicate_id
         ));
     }
 
     #[test]
-    fn production_recording_failure_keeps_its_exact_cause_and_native_product() {
+    fn production_recording_failure_refuses_with_its_exact_cause() {
         let (source, plan, mut function, mut journal) = journal_fixture();
         let (_value, binding, site, input_idx) = first_bound_rendered_input(&plan, &source);
         let symbol = declare_legacy_symbol(&function, &plan, binding, "recording_value");
@@ -3396,35 +3400,16 @@ mod tests {
             .expect("independent effect marker");
         function.body = vec![CStmt::Expr(marked)];
 
-        let mut expected_function = function.clone();
-        crate::ast::discard_render_observations(&mut expected_function);
-        let expected = crate::codegen::prepare_function_for_emission(&expected_function);
-        let native = MarkedNativeDraft::new(function, journal).finish_non_consuming(
+        let result = MarkedNativeDraft::new(function, journal).finish_enforcing(
             &source,
             Some(LegacyObservationJournalError::MissingNormalizedSiteContext),
         );
-
-        assert_eq!(
-            native.audit_observations(),
+        assert!(matches!(
+            result,
             Err(BindingShadowAuditFailure::JournalRecording(
                 BindingObservationJournalFailure::MissingNormalizedSiteContext,
             ))
-        );
-        assert_eq!(native.emission().function(), expected.function());
-        assert_eq!(
-            native.placement_audit(),
-            crate::PlacementAudit::Refused(
-                crate::PlacementAuditRefusal::MissingStructuredRegionArtifact
-            )
-        );
-        assert!(!crate::ast::has_render_observations(
-            native.emission().function()
         ));
-        assert_eq!(
-            native.effect_observations().occurrence_count(obligation),
-            Some(1),
-            "binding recording failure must not erase the final effect stream"
-        );
     }
 
     #[test]

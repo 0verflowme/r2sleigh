@@ -14,7 +14,7 @@ use super::{
 #[cfg(test)]
 use super::StackSlotProvenance;
 #[cfg(test)]
-use super::utils::{format_traced_name, ssa_render_base_name};
+use super::utils::format_traced_name;
 #[cfg(test)]
 use crate::address::parse_address_from_var_name;
 use crate::ast::{BinaryOp, CExpr, CType, UnaryOp};
@@ -1327,7 +1327,6 @@ mod tests {
         #[cfg(test)] _strings: &'a HashMap<u64, String>,
         #[cfg(test)] _symbols: &'a HashMap<u64, String>,
     ) -> LowerCtx<'a> {
-        let semantic_values: &'static HashMap<String, SemanticValue> = Box::leak(Box::new(HashMap::new()));
         let param_register_aliases = Box::leak(Box::new(HashMap::new()));
         LowerCtx {
             binding_names: None,

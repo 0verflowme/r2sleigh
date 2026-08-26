@@ -160,7 +160,7 @@ fn analyze_value_facts(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
     analyze_call_args(symbols, &mut scratch, blocks, env);
     bind_single_use_call_result_definitions(symbols, &mut scratch, blocks, env);
     #[cfg(test)]
-    propagate_call_result_aliases(symbols, &mut scratch.info, control)?;
+    propagate_call_result_aliases(&mut scratch.info, control)?;
     rerun_semantic_call_analysis_after_result_binding(symbols, &mut scratch, blocks, env, control)?;
     Ok(scratch)
 }
@@ -242,7 +242,7 @@ fn rerun_semantic_call_analysis_after_result_binding(symbols: &std::cell::RefCel
     analyze_call_args(symbols, scratch, blocks, env);
     bind_single_use_call_result_definitions(symbols, scratch, blocks, env);
     #[cfg(test)]
-    propagate_call_result_aliases(symbols, &mut scratch.info, control)?;
+    propagate_call_result_aliases(&mut scratch.info, control)?;
     Ok(())
 }
 
@@ -4982,8 +4982,7 @@ fn call_result_source_for_alias(info: &UseInfo, alias: &str) -> Option<(u64, usi
 }
 
 #[cfg(test)]
-fn propagate_call_result_aliases(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
-    info: &mut UseInfo,
+fn propagate_call_result_aliases(info: &mut UseInfo,
     control: DecompileWorkControl<'_>,
 ) -> Result<(), DecompileExecutionStop> {
     let mut changed = true;
@@ -8347,7 +8346,6 @@ mod tests {
 
     #[test]
     fn call_target_import_policy_uses_typed_callee_identity() {
-        let symbols = test_table();
         let op = SSAOp::Call {
             target: mk("ram:401000", 0, 8),
         };
@@ -8559,7 +8557,6 @@ mod tests {
 
     #[test]
     fn call_target_import_policy_requires_callsite_resolution_not_raw_direct_address() {
-        let symbols = test_table();
         let op = SSAOp::Call {
             target: mk("ram:402000", 0, 8),
         };
@@ -8596,7 +8593,6 @@ mod tests {
 
     #[test]
     fn call_target_import_policy_uses_callsite_resolution_over_raw_import_address() {
-        let symbols = test_table();
         let op = SSAOp::Call {
             target: mk("ram:402000", 0, 8),
         };
@@ -8639,7 +8635,6 @@ mod tests {
 
     #[test]
     fn call_target_import_policy_uses_callsite_resolution_over_raw_local_address() {
-        let symbols = test_table();
         let op = SSAOp::Call {
             target: mk("ram:402000", 0, 8),
         };
@@ -9928,7 +9923,6 @@ mod tests {
 
     #[test]
     fn semantic_name_filters_use_typed_ssa_storage_and_register_kinds() {
-        let symbols = test_table();
         for name in [
             "tmp:1",
             "TMP:1",
@@ -9958,7 +9952,6 @@ mod tests {
 
     #[test]
     fn call_arg_name_filters_use_typed_ssa_storage_kinds() {
-        let symbols = test_table();
         let fixture = TestEnvFixture::new();
         let env = fixture.env();
 

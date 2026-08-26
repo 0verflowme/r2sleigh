@@ -4,6 +4,41 @@ use r2ssa::SSAVar;
 
 use super::*;
 
+/// Opaque proof that one rendered lvalue came from the exact source-owned
+/// structured memory-access fact for the current operation.
+///
+/// The fields stay private to this module so an arbitrary contextual AST
+/// cannot be presented as a certified address occurrence downstream.
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct CertifiedMemoryAccessExpr {
+    access: r2ssa::StructuredAccessId,
+    address: r2ssa::ValueId,
+    is_write: bool,
+    expr: CExpr,
+}
+
+impl CertifiedMemoryAccessExpr {
+    pub(super) const fn access(&self) -> r2ssa::StructuredAccessId {
+        self.access
+    }
+
+    pub(super) const fn address(&self) -> r2ssa::ValueId {
+        self.address
+    }
+
+    pub(super) const fn is_write(&self) -> bool {
+        self.is_write
+    }
+
+    pub(super) const fn expr(&self) -> &CExpr {
+        &self.expr
+    }
+
+    pub(super) fn into_expr(self) -> CExpr {
+        self.expr
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 struct CertifiedLinearAddress {
     base: CExpr,
@@ -18,6 +53,77 @@ struct CertifiedLinearIndex {
 }
 
 impl<'a> FoldingContext<'a> {
+    fn certified_memory_access_expr(
+        &self,
+        address: r2ssa::ValueId,
+        value: r2ssa::ValueId,
+        width: u32,
+        is_write: bool,
+        elem_ty: CType,
+    ) -> OpLoweringResult<CertifiedMemoryAccessExpr> {
+        let (block_addr, op_idx) = self
+            .current_source_op_site()
+            .ok_or(OpLoweringRefusal::MissingMachineProjectionAuthorization)?;
+        let fact = self
+            .certified_memory_access_for_current_op(is_write)
+            .filter(|fact| {
+                fact.block_addr == block_addr
+                    && fact.op_index == op_idx
+                    && fact.space == r2il::SpaceId::Ram
+                    && fact.address == address
+                    && fact.value == Some(value)
+                    && fact.is_write == is_write
+                    && fact.width == width
+            })
+            .ok_or(OpLoweringRefusal::MissingMachineProjectionAuthorization)?;
+        let expr = self
+            .render_certified_memory_expr_for_fact(fact, elem_ty.clone())
+            .ok_or(OpLoweringRefusal::MissingMachineProjectionAuthorization)?;
+        let expr = if is_write {
+            Self::expr_is_store_target_candidate(&expr)
+                .then_some(expr)
+                .ok_or(OpLoweringRefusal::MissingMachineProjectionAuthorization)?
+        } else {
+            self.typed_subscript_access(expr, &elem_ty)
+        };
+        Ok(CertifiedMemoryAccessExpr {
+            access: fact.access,
+            address: fact.address,
+            is_write: fact.is_write,
+            expr,
+        })
+    }
+
+    pub(super) fn render_certified_load_access_expr(
+        &self,
+        dst: &SSAVar,
+        addr: &SSAVar,
+        elem_ty: CType,
+    ) -> OpLoweringResult<CertifiedMemoryAccessExpr> {
+        let address = self
+            .prepared_value_id_for_var(addr)
+            .ok_or(OpLoweringRefusal::MissingMachineProjectionAuthorization)?;
+        let value = self
+            .prepared_value_id_for_var(dst)
+            .ok_or(OpLoweringRefusal::MissingMachineProjectionAuthorization)?;
+        self.certified_memory_access_expr(address, value, dst.size, false, elem_ty)
+    }
+
+    pub(super) fn render_certified_store_access_expr(
+        &self,
+        addr: &SSAVar,
+        val: &SSAVar,
+        elem_ty: CType,
+    ) -> OpLoweringResult<CertifiedMemoryAccessExpr> {
+        let address = self
+            .prepared_value_id_for_var(addr)
+            .ok_or(OpLoweringRefusal::MissingMachineProjectionAuthorization)?;
+        let value = self
+            .prepared_value_id_for_var(val)
+            .ok_or(OpLoweringRefusal::MissingMachineProjectionAuthorization)?;
+        self.certified_memory_access_expr(address, value, val.size, true, elem_ty)
+    }
+
     fn certified_pointer_base_expr(&self, expr: &CExpr) -> bool {
         let expr = match expr {
             CExpr::Paren(inner) | CExpr::Cast { expr: inner, .. } => inner.as_ref(),
@@ -357,6 +463,7 @@ impl<'a> FoldingContext<'a> {
         }
     }
 
+    #[cfg(test)]
     fn byte_indexed_pointer_add_expr(&self, expr: &CExpr) -> Option<CExpr> {
         self.indexed_pointer_add_expr(expr, &CType::u8())
     }
@@ -504,8 +611,7 @@ impl<'a> FoldingContext<'a> {
     }
 
     pub(crate) fn render_certified_value_expr_for_var(&self, var: &SSAVar) -> Option<CExpr> {
-        if var.is_const() {
-            let value = parse_const_value(&var.name)?;
+        if let Some(value) = var.constant_bits() {
             return Some(if value > 0x7fff_ffff {
                 CExpr::UIntLit(value)
             } else {
@@ -638,7 +744,7 @@ impl<'a> FoldingContext<'a> {
         if depth > Self::MAX_SEMANTIC_RENDER_DEPTH {
             return None;
         }
-        if var.is_const() {
+        if var.constant_bits().is_some() {
             return self.render_certified_value_expr_for_var(var);
         }
         let prepared = self.prepared_ssa()?;
@@ -825,7 +931,7 @@ impl<'a> FoldingContext<'a> {
         if depth > 4 {
             return None;
         }
-        if let Some(value) = parse_const_value(&var.name) {
+        if let Some(value) = var.constant_bits() {
             return Some(value);
         }
         let prepared = self.prepared_ssa()?;
@@ -1051,7 +1157,7 @@ impl<'a> FoldingContext<'a> {
             return Ok(stack_var);
         }
 
-        if addr.is_const()
+        if addr.constant_bits().is_some()
             && matches!(&fallback_addr_expr, CExpr::Var(_) | CExpr::StringLit(_))
         {
             return Ok(fallback_addr_expr);
@@ -1064,6 +1170,7 @@ impl<'a> FoldingContext<'a> {
         Ok(self.typed_deref_expr(addr, fallback_addr_expr, elem_ty))
     }
 
+    #[cfg(test)]
     pub(super) fn render_canonical_store_target_expr(
         &self,
         addr: &SSAVar,
@@ -1113,7 +1220,7 @@ impl<'a> FoldingContext<'a> {
             return Ok(stack_var);
         }
 
-        if addr.is_const()
+        if addr.constant_bits().is_some()
             && matches!(&fallback_addr_expr, CExpr::Var(_) | CExpr::StringLit(_))
         {
             return Ok(fallback_addr_expr);

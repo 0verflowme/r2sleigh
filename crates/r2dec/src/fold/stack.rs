@@ -10,22 +10,6 @@ use r2types::{
 #[cfg(test)]
 use crate::analysis::prepared_semantic::StackAliasView;
 use crate::analysis::utils;
-
-/// Whether this spelling names the value a register was entered with.
-///
-/// Version zero reaches here spelled both ways: `display_name` drops the suffix
-/// for it, while the copy-source route keeps it and writes `x30_0`. Only a
-/// suffix naming a later version means the register was written since entry.
-fn is_entry_value_spelling(display_name: &str) -> bool {
-    match display_name.rsplit_once('_') {
-        Some((_, version))
-            if !version.is_empty() && version.chars().all(|c| c.is_ascii_digit()) =>
-        {
-            version.parse::<u32>().is_ok_and(|version| version == 0)
-        }
-        _ => true,
-    }
-}
 use crate::ast::{BinaryOp, CExpr};
 
 use super::context::FoldingContext;
@@ -455,6 +439,51 @@ impl<'a> FoldingContext<'a> {
         self.prepared_transparent_source_var_inner(var, 0, &mut HashSet::new())
     }
 
+    fn transparent_source_var(&self, var: &SSAVar) -> Option<SSAVar> {
+        if let Some(source) = self.prepared_transparent_source_var(var) {
+            return Some(source);
+        }
+        #[cfg(test)]
+        {
+            return self.fixture_transparent_source_var_inner(
+                var,
+                0,
+                &mut HashSet::new(),
+            );
+        }
+        #[cfg(not(test))]
+        None
+    }
+
+    #[cfg(test)]
+    fn fixture_transparent_source_var_inner(
+        &self,
+        var: &SSAVar,
+        depth: u32,
+        visited: &mut HashSet<r2ssa::ValueId>,
+    ) -> Option<SSAVar> {
+        if depth > MAX_STACK_ALIAS_DEPTH {
+            return None;
+        }
+        if var.version == 0 && var.is_register() {
+            return Some(var.clone());
+        }
+        let info = self.state.analysis_ctx.semantic();
+        let value = info.exact_value_id_for_var(var)?;
+        if !visited.insert(value) {
+            return None;
+        }
+        let result = info
+            .copy_sources_by_value
+            .get(&value)
+            .and_then(|source| info.var_for_value_id(*source))
+            .and_then(|source| {
+                self.fixture_transparent_source_var_inner(source, depth + 1, visited)
+            });
+        visited.remove(&value);
+        result
+    }
+
     fn prepared_transparent_source_var_inner(
         &self,
         var: &SSAVar,
@@ -815,23 +844,18 @@ impl<'a> FoldingContext<'a> {
                     // same register is a scratch use and its store is real.
                     if self.inputs.arch.is_callee_saved_name(&val_name)
                         || (self.inputs.arch.is_frame_record_name(&val_name)
-                            && is_entry_value_spelling(&val_name))
+                            && val.version == 0)
                     {
                         return true;
                     }
-                    // Indirect: val is a temp, trace it back via copy_sources
+                    // Indirect: retain the exact upstream SSA variable while
+                    // tracing transparent copies.
                     if utils::is_temporary_name(&val.name) {
-                        let val_key = val.display_name();
-                        if let Some(src_key) =
-                            self.render_copy_source_for_name(&val_key).or_else(|| {
-                                self.prepared_transparent_source_var(val)
-                                    .map(|src| src.display_name())
-                            })
-                        {
-                            let src_lower = src_key.to_lowercase();
+                        if let Some(src) = self.transparent_source_var(val) {
+                            let src_lower = src.name.to_lowercase();
                             if self.inputs.arch.is_callee_saved_name(&src_lower)
                                 || (self.inputs.arch.is_frame_record_name(&src_lower)
-                                    && is_entry_value_spelling(&src_lower))
+                                    && src.version == 0)
                             {
                                 return true;
                             }

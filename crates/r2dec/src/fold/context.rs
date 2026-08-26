@@ -171,7 +171,8 @@ pub(crate) struct FoldingContext<'a> {
     pub(crate) signature_registry: SignatureRegistry,
     pub(crate) forwarded_source_cache: std::cell::RefCell<HashMap<String, Option<r2ssa::SSAVar>>>,
     pub(crate) load_expr_memo: std::cell::RefCell<HashMap<(ValueId, String), CExpr>>,
-    /// What a value renders as, for values whose statement was left out.
+    /// Legacy cache retained only as a negative test fixture: production
+    /// inlining is authorized exclusively by the sealed binding plan.
     ///
     /// Leaving a statement out is a promise that the reader will show the value
     /// instead. The promise used to be made by one rule and kept by another, and
@@ -179,6 +180,7 @@ pub(crate) struct FoldingContext<'a> {
     /// defined it. The expression the skipped statement would have carried is
     /// recorded here as it is skipped, so the rule that decides and the rule that
     /// renders are reading the same answer.
+    #[cfg(test)]
     pub(crate) inlined_renderings: std::cell::RefCell<HashMap<String, CExpr>>,
     #[cfg(test)]
     pub(crate) prepared_semantic_view_cache: OnceCell<analysis::PreparedSemanticView>,
@@ -286,6 +288,7 @@ impl<'a> FoldingContext<'a> {
             signature_registry: SignatureRegistry::from_embedded_json(),
             forwarded_source_cache: std::cell::RefCell::new(HashMap::new()),
             load_expr_memo: std::cell::RefCell::new(HashMap::new()),
+            #[cfg(test)]
             inlined_renderings: std::cell::RefCell::new(HashMap::new()),
             #[cfg(test)]
             prepared_semantic_view_cache: OnceCell::new(),
@@ -375,6 +378,7 @@ impl<'a> FoldingContext<'a> {
 
     /// Wrap one exact normalized operand occurrence. The journal owns every
     /// translation from normalized coordinates to original V/U identities.
+    #[cfg(test)]
     pub(crate) fn observe_normalized_input_expr(
         &self,
         block_addr: u64,
@@ -394,6 +398,7 @@ impl<'a> FoldingContext<'a> {
         self.observe_optional_normalized_input_expr(site, input_idx, expr)
     }
 
+    #[cfg(test)]
     pub(crate) fn observe_optional_normalized_input_expr(
         &self,
         site: Option<crate::normalize::NormalizedOpSite>,

@@ -1852,6 +1852,21 @@ fn binding_audit_json(audit: Option<r2engine::BindingShadowAuditOutcome>) -> ser
             ledger,
             observations,
         })) => counted_binding_audit_json("non_quality", ledger, observations),
+        Some(BindingShadowAuditOutcome::Failed(
+            BindingShadowAuditFailure::NonQualityObservations { observations },
+        )) => serde_json::json!({
+            "schema_version": 2,
+            "status": "non_quality_observations",
+            "observations": binding_observations_json(observations),
+        }),
+        Some(BindingShadowAuditOutcome::Failed(BindingShadowAuditFailure::Placement(refusal))) => {
+            serde_json::json!({
+                "schema_version": 2,
+                "status": "failed",
+                "reason": "placement_refusal",
+                "cause": placement_refusal_json(refusal),
+            })
+        }
         Some(BindingShadowAuditOutcome::Failed(BindingShadowAuditFailure::JournalSeal(cause))) => {
             serde_json::json!({
                 "schema_version": 2,
@@ -1885,6 +1900,10 @@ fn binding_audit_json(audit: Option<r2engine::BindingShadowAuditOutcome>) -> ser
                 | BindingShadowAuditFailure::JournalRecording(_)
                 | BindingShadowAuditFailure::JournalSeal(_) => {
                     unreachable!("typed journal failures are matched above")
+                }
+                BindingShadowAuditFailure::Placement(_)
+                | BindingShadowAuditFailure::NonQualityObservations { .. } => {
+                    unreachable!("typed admission failures are matched above")
                 }
                 BindingShadowAuditFailure::IncompleteObservations { .. }
                 | BindingShadowAuditFailure::NonQuality { .. } => {
@@ -2070,6 +2089,22 @@ fn render_refusal_json(
             "schema_version": 1,
             "status": "none",
         }),
+        Some(r2engine::DecompileRenderRefusal::DeclarationPlacement(refusal)) => {
+            serde_json::json!({
+                "schema_version": 1,
+                "status": "refused",
+                "kind": refusal.kind(),
+                "cause": placement_refusal_json(refusal),
+            })
+        }
+        Some(r2engine::DecompileRenderRefusal::RefusedBindingDisposition {
+            observations,
+        }) => serde_json::json!({
+            "schema_version": 1,
+            "status": "refused",
+            "kind": "refused_binding_disposition",
+            "observations": binding_observations_json(observations),
+        }),
         Some(refusal) => serde_json::json!({
             "schema_version": 1,
             "status": "refused",
@@ -2087,6 +2122,7 @@ fn response_diagnostics_json(
 ) -> Result<String, BoundaryError> {
     let outcome = match response_outcome(
         diagnostics,
+        binding_audit,
         effect_obligations,
         placement_audit,
         render_refusal,
@@ -2134,6 +2170,7 @@ fn effect_obligations_json(
 
 fn response_outcome(
     diagnostics: &r2engine::EngineDiagnostics,
+    binding_audit: Option<r2engine::BindingShadowAuditOutcome>,
     effect_obligations: Option<r2engine::EffectObligationAudit>,
     placement_audit: Option<r2engine::PlacementAudit>,
     render_refusal: Option<r2engine::DecompileRenderRefusal>,
@@ -2142,6 +2179,13 @@ fn response_outcome(
         || matches!(
             diagnostics.plan,
             Some(r2engine::EnginePlan::RefuseWithEvidence)
+        )
+        || matches!(
+            binding_audit,
+            Some(r2engine::BindingShadowAuditOutcome::Failed(
+                r2engine::BindingShadowAuditFailure::Placement(_)
+                    | r2engine::BindingShadowAuditFailure::NonQualityObservations { .. }
+            ))
         )
         || effect_obligations.is_some_and(|audit| {
             matches!(
@@ -2204,6 +2248,7 @@ unsafe extern "C" fn execute(
                 .map_err(|_| BoundaryError::engine("diagnostics contain an interior NUL"))?;
             let outcome = response_outcome(
                 &response.output.diagnostics,
+                response.output.binding_audit,
                 response.output.effect_obligations,
                 response.output.placement_audit,
                 response.output.render_refusal,
@@ -4306,6 +4351,7 @@ mod tests {
         assert_eq!(
             response_outcome(
                 &r2engine::EngineDiagnostics::default(),
+                Some(r2engine::BindingShadowAuditOutcome::NotRun),
                 Some(r2engine::EffectObligationAudit::NOT_RUN),
                 Some(refusal),
                 None,
@@ -4324,6 +4370,18 @@ mod tests {
             (
                 r2engine::DecompileRenderRefusal::MissingProgramVariableAuthorization,
                 "missing_program_variable_authorization",
+            ),
+            (
+                r2engine::DecompileRenderRefusal::DeclarationPlacement(
+                    r2engine::PlacementAuditRefusal::MissingDefinition { binding_index: 17 },
+                ),
+                "missing_definition",
+            ),
+            (
+                r2engine::DecompileRenderRefusal::RefusedBindingDisposition {
+                    observations: binding_observations(0, 0, 1, 0),
+                },
+                "refused_binding_disposition",
             ),
             (
                 r2engine::DecompileRenderRefusal::NormalizationOriginUnavailable,
@@ -4359,6 +4417,7 @@ mod tests {
             assert_eq!(
                 response_outcome(
                     &r2engine::EngineDiagnostics::default(),
+                    Some(r2engine::BindingShadowAuditOutcome::NotRun),
                     Some(r2engine::EffectObligationAudit::NOT_RUN),
                     Some(r2engine::PlacementAudit::NotRun),
                     Some(refusal),
@@ -4366,6 +4425,27 @@ mod tests {
                 R2SLEIGH_OUTCOME_REFUSED_V2,
             );
         }
+
+        let placement = render_refusal_json(Some(
+            r2engine::DecompileRenderRefusal::DeclarationPlacement(
+                r2engine::PlacementAuditRefusal::ReadBeforeAssignment {
+                    binding_index: 19,
+                    instruction_id: 23,
+                    input_index: 29,
+                },
+            ),
+        ));
+        assert_eq!(placement["cause"]["kind"], "read_before_assignment");
+        assert_eq!(placement["cause"]["binding_index"], 19);
+        assert_eq!(placement["cause"]["instruction_id"], 23);
+        assert_eq!(placement["cause"]["input_index"], 29);
+
+        let observations = render_refusal_json(Some(
+            r2engine::DecompileRenderRefusal::RefusedBindingDisposition {
+                observations: binding_observations(0, 0, 1, 0),
+            },
+        ));
+        assert_eq!(observations["observations"]["values"]["refused"], 1);
     }
 
     #[test]
@@ -4648,6 +4728,43 @@ mod tests {
                 assert!(payload.get("passes_quality").is_none());
             }
         }
+
+        let refused_observations = binding_audit_json(Some(
+            BindingShadowAuditOutcome::Failed(
+                BindingShadowAuditFailure::NonQualityObservations {
+                    observations: binding_observations(0, 0, 1, 0),
+                },
+            ),
+        ));
+        assert_eq!(refused_observations["status"], "non_quality_observations");
+        assert_eq!(refused_observations["observations"]["values"]["refused"], 1);
+        assert!(refused_observations.get("shadow").is_none());
+
+        let placement = binding_audit_json(Some(BindingShadowAuditOutcome::Failed(
+            BindingShadowAuditFailure::Placement(
+                r2engine::PlacementAuditRefusal::MissingDefinition { binding_index: 31 },
+            ),
+        )));
+        assert_eq!(placement["status"], "failed");
+        assert_eq!(placement["reason"], "placement_refusal");
+        assert_eq!(placement["cause"]["kind"], "missing_definition");
+        assert_eq!(placement["cause"]["binding_index"], 31);
+
+        assert_eq!(
+            response_outcome(
+                &r2engine::EngineDiagnostics::default(),
+                Some(BindingShadowAuditOutcome::Failed(
+                    BindingShadowAuditFailure::NonQualityObservations {
+                        observations: binding_observations(0, 0, 1, 0),
+                    },
+                )),
+                Some(r2engine::EffectObligationAudit::NOT_RUN),
+                Some(r2engine::PlacementAudit::Applied),
+                None,
+            ),
+            R2SLEIGH_OUTCOME_REFUSED_V2,
+            "a binding-disposition admission refusal cannot be reported as completed",
+        );
     }
 
     #[test]
@@ -4671,6 +4788,7 @@ mod tests {
         assert_eq!(
             response_outcome(
                 &diagnostics,
+                Some(r2engine::BindingShadowAuditOutcome::NotRun),
                 Some(r2engine::EffectObligationAudit::NOT_RUN),
                 Some(r2engine::PlacementAudit::NotRun),
                 None,
@@ -4727,6 +4845,7 @@ mod tests {
         assert_eq!(
             response_outcome(
                 &r2engine::EngineDiagnostics::default(),
+                Some(r2engine::BindingShadowAuditOutcome::NotRun),
                 Some(refused),
                 Some(r2engine::PlacementAudit::NotRun),
                 None,
@@ -4746,6 +4865,7 @@ mod tests {
         assert_eq!(
             response_outcome(
                 &r2engine::EngineDiagnostics::default(),
+                Some(r2engine::BindingShadowAuditOutcome::NotRun),
                 Some(inconsistent_admission),
                 Some(r2engine::PlacementAudit::NotRun),
                 None,
@@ -4760,6 +4880,7 @@ mod tests {
         assert_eq!(
             response_outcome(
                 &r2engine::EngineDiagnostics::default(),
+                Some(r2engine::BindingShadowAuditOutcome::NotRun),
                 Some(r2engine::EffectObligationAudit::NOT_RUN),
                 Some(r2engine::PlacementAudit::NotRun),
                 None,

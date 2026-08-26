@@ -862,6 +862,7 @@ impl<'a> FoldingContext<'a> {
                 abi_arg_regs: &self.inputs.arch.arg_regs,
                 stack_slots: self.inputs.stack_slots,
                 visible_bindings: self.inputs.visible_bindings,
+                param_register_aliases: analysis::no_carrier_aliases(),
                 function_facts: self.inputs.function_facts,
                 #[cfg(test)]
                 certified_rendering_required: false,
@@ -923,6 +924,7 @@ impl<'a> FoldingContext<'a> {
             .and_then(|view| view.call_view_for_site((block_addr, op_idx)))
     }
 
+    #[cfg(test)]
     pub(crate) fn prepared_memory_defs_for_current_op(&self) -> Option<&[MemoryDefFact]> {
         let prepared = self.inputs.prepared_ssa?;
         let (block_addr, op_idx) = self.current_source_op_site()?;
@@ -1184,6 +1186,10 @@ impl<'a> FoldingContext<'a> {
             callee_resolution: self.inputs.callee_resolution(),
             summary_view: self.inputs.summary_view(),
             arg_regs: &self.inputs.arch.arg_regs,
+            #[cfg(test)]
+            param_register_aliases: analysis::no_carrier_aliases(),
+            #[cfg(test)]
+            carrier_aliases: analysis::no_carrier_aliases(),
             caller_saved_regs: &self.inputs.arch.caller_saved_regs,
             type_oracle: self.inputs.type_oracle,
         }
@@ -1458,6 +1464,10 @@ impl<'a> FoldingContext<'a> {
             callee_resolution: self.inputs.callee_resolution(),
             summary_view: self.inputs.summary_view(),
             arg_regs: &self.inputs.arch.arg_regs,
+            #[cfg(test)]
+            param_register_aliases: analysis::no_carrier_aliases(),
+            #[cfg(test)]
+            carrier_aliases: analysis::no_carrier_aliases(),
             caller_saved_regs: &self.inputs.arch.caller_saved_regs,
             type_oracle: self.inputs.type_oracle,
         };
@@ -1899,7 +1909,7 @@ impl<'a> FoldingContext<'a> {
             return Ok(None);
         };
 
-        for op in block.ops[..op_idx].iter().rev() {
+        for (candidate_idx, op) in block.ops[..op_idx].iter().enumerate().rev() {
             match op {
                 SSAOp::Call { .. } | SSAOp::CallInd { .. } | SSAOp::CallOther { .. } => break,
                 _ => {}
@@ -1925,7 +1935,8 @@ impl<'a> FoldingContext<'a> {
                 }
                 _ => {
                     let mut visited = HashSet::new();
-                    let raw = self.op_to_expr(op)?;
+                    let LoweredExprAt::Rendered(raw) =
+                        self.op_to_expr_at(op, block.addr, candidate_idx)?;
                     let expanded = self.expand_return_expr(&raw, 0, &mut visited);
                     let mut semantic_visited = HashSet::new();
                     let semanticized =
@@ -2142,11 +2153,11 @@ impl<'a> FoldingContext<'a> {
         if !target_is_certified {
             return None;
         }
-        let func = self.resolve_call_target_for_site(
+        let func = self.retain_lowering_result(self.resolve_call_target_for_site(
             block_addr,
             op_idx,
             self.prepared_var_for_value_id(cert.target)?,
-        );
+        ))?;
         let raw_args = self
             .call_args_map()
             .get(&source_call)
@@ -2165,176 +2176,20 @@ impl<'a> FoldingContext<'a> {
         })
     }
 
-    /// Whether anything other than the value's own name can render it.
-    ///
-    /// Leaving a statement out says its reader will inline the value. If nothing
-    /// can produce it, the reader prints the name instead and the name has no
-    /// definition, so the promise has to be checked rather than assumed.
-    fn value_has_something_to_render(&self, var: &SSAVar) -> bool {
-        let var_name = var.display_name();
-        let value = self.prepared_value_id_for_var(var);
-        value
-            .and_then(|value| self.definition_for_value_id(value))
-            .is_some()
-            || self.call_result_source_for_var(var).is_some()
-            || self.local_post_call_source_for_var(var).is_some()
-            || value
-                .and_then(|value| self.semantic_value_for_value_id(value))
-                .is_some()
-            // A carrier is rendered by its own name, which it always has.
-            || self
-                .prepared_value_id_for_var(var)
-                .and_then(|value| self.inputs.binding_names?.require_value(value).ok())
-                .is_some()
-            // A flag is rendered by the comparison it spells, not by a table.
-            || self.inputs.arch.is_flag_name(&var_name)
-            || self.is_condition_name(&var_name)
-    }
-
+    /// A definition may disappear only when the sealed exact-value plan owns
+    /// the corresponding inline proof. Legacy use counts, expression shape,
+    /// register class, and cached spellings are not admission evidence.
     fn should_inline(&self, var: &SSAVar) -> bool {
-        let var_name = var.display_name();
-        let use_count = self.use_info().use_count_for_var(var);
-
-        if use_count == 0 || use_count > 3 {
+        let Some(value) = self.prepared_value_id_for_var(var) else {
             return false;
-        }
-
-        if self
-            .call_result_source_for_var(var)
-            .or_else(|| self.local_post_call_source_for_var(var))
-            .and_then(|source| self.stable_owned_call_result_name_for_source(source))
-            .is_some()
-        {
+        };
+        let Some(names) = self.inputs.binding_names else {
             return false;
-        }
-
-        if self.pinned_set().contains(&var_name) {
-            return false;
-        }
-
-        if self.is_condition_var(var)
-            && !self.is_condition_inline_candidate(&var_name)
-        {
-            return false;
-        }
-
-        // Values that only feed flag computation should always disappear.
-        if self.flag_only_values_set().contains(&var_name) {
-            return true;
-        }
-
-        // After the zero/>3 guard above, any non-1 count is multi-use.
-        if use_count != 1 && !self.is_simple_inline_candidate_for_var(var) {
-            return false;
-        }
-
-        // Inline single-use or trivially small values after preserving
-        // structural return/stack registers.
-        {
-            let base_lower = var.name.to_lowercase();
-            // Don't inline return register assignments in return blocks
-            if self.inputs.arch.is_return_register_name(&base_lower)
-                && self.is_current_return_block()
-            {
-                return false;
-            }
-            // Don't inline stack/frame pointer versions - they're structural
-            if self.inputs.arch.is_stack_base_name(&base_lower) {
-                return false;
-            }
-            // Inline calling-convention argument registers (consumed by call
-            // args), but only when something can render the value where it is
-            // read. The branch below already asks; this one did not, and being
-            // caller-saved says a register may be clobbered across a call, not
-            // that its definition can be reproduced at its use.
-            //
-            // arm64 -O0 loses its loop counter to this: `x9` is caller-saved, so
-            // the load that fills it is skipped on the promise of inlining, and
-            // the reader prints `x9_3` with nothing defining it. Four functions
-            // fail to compile for that reason.
-            if self.inputs.arch.is_caller_saved_name(&base_lower) {
-                return self.value_has_something_to_render(var);
-            }
-            // Inline any register with a definition when it is single-use
-            // or the definition is trivially small. A value with no definition
-            // to inline is not inlined by being left out: the reader prints its
-            // name, and dropping the statement leaves that name undefined.
-            if (use_count == 1 && self.value_has_something_to_render(var))
-                || self.is_simple_inline_candidate_for_var(var)
-            {
-                return true;
-            }
-        }
-
-        false
-    }
-
-    fn is_condition_inline_candidate(&self, var_name: &str) -> bool {
-        if self.flag_only_values_set().contains(var_name) {
-            return true;
-        }
-
-        if self.inputs.arch.is_flag_name(var_name) {
-            return true;
-        }
-
-        self.is_simple_inline_candidate(var_name)
-    }
-
-    fn is_condition_var(&self, var: &SSAVar) -> bool {
-        self.prepared_value_id_for_var(var)
-            .is_some_and(|value| self.use_info().condition_values.contains(&value))
-            || self.inputs.arch.is_flag_name(&var.name)
-    }
-
-    fn is_simple_inline_candidate_for_var(&self, var: &SSAVar) -> bool {
-        self.prepared_value_id_for_var(var)
-            .and_then(|value| self.definition_for_value_id(value))
-            .is_some_and(|expr| self.is_simple_expr(expr, 0))
-    }
-
-    fn is_simple_inline_candidate(&self, var_name: &str) -> bool {
-        self.definition_for_name(var_name)
-            .map(|expr| self.is_simple_expr(expr, 0))
-            .unwrap_or(false)
-    }
-
-    fn is_simple_expr(&self, expr: &CExpr, depth: u32) -> bool {
-        if depth > MAX_SIMPLE_EXPR_DEPTH {
-            return false;
-        }
-
-        match expr {
-            CExpr::IntLit(_)
-            | CExpr::UIntLit(_)
-            | CExpr::FloatLit(_)
-            | CExpr::StringLit(_)
-            | CExpr::CharLit(_) => true,
-            CExpr::Var(name) => {
-                if self.inputs.arch.is_flag_name(&self.spelling(*name)) {
-                    return true;
-                }
-                true
-            }
-            CExpr::Cast { expr, .. } | CExpr::Paren(expr) => self.is_simple_expr(expr, depth + 1),
-            CExpr::Unary { operand, .. } => self.is_simple_expr(operand, depth + 1),
-            CExpr::Binary { op, left, right } => {
-                matches!(
-                    op,
-                    BinaryOp::Add
-                        | BinaryOp::Sub
-                        | BinaryOp::Eq
-                        | BinaryOp::Ne
-                        | BinaryOp::BitAnd
-                        | BinaryOp::BitOr
-                        | BinaryOp::BitXor
-                        | BinaryOp::And
-                        | BinaryOp::Or
-                ) && self.is_simple_expr(left, depth + 1)
-                    && self.is_simple_expr(right, depth + 1)
-            }
-            _ => false,
-        }
+        };
+        matches!(
+            names.disposition_for_value(value),
+            Some(crate::binding_plan::ValueDisposition::Inline { .. })
+        )
     }
 
     pub fn is_dead(&self, var: &SSAVar) -> bool {
@@ -2402,7 +2257,6 @@ impl<'a> FoldingContext<'a> {
         false
     }
 
-    /// Get the expression for a variable, potentially inlining its definition.
     /// What this name reads, when what defines it is a read of memory.
     ///
     /// This is the one answer to that question. Anything that expands a name
@@ -2421,10 +2275,8 @@ impl<'a> FoldingContext<'a> {
 
     pub fn get_expr(&self, var: &SSAVar) -> OpLoweringResult<CExpr> {
         let answer = self.get_expr_inner(var);
-        // What this resolver actually hands back for a value, so a name reaching
-        // the page with nothing defining it can be told from a name the resolver
-        // never saw. `get_expr` mints its fallback reference on the way in, so
-        // watching the symbol table cannot tell those apart.
+        // Trace the sealed exact-value answer, never a spelling-recovered
+        // definition candidate.
         if let Ok(want) = std::env::var("R2SLEIGH_TRACE_NAME")
             && var.display_name().eq_ignore_ascii_case(&want)
         {
@@ -2444,130 +2296,23 @@ impl<'a> FoldingContext<'a> {
     }
 
     fn get_expr_inner(&self, var: &SSAVar) -> OpLoweringResult<CExpr> {
-        let key = var.display_name();
-
-        // Always inline constants
-        if var.is_const() {
-            return Ok(self.const_to_expr(var));
-        }
-
-        // A statement that was left out on the promise of being inlined recorded
-        // what it would have shown. That is the answer, not a candidate.
-        if let Some(inlined) = self.inlined_renderings.borrow().get(&key) {
-            return Ok(inlined.clone());
-        }
-
         let Some(value) = self.prepared_value_id_for_var(var) else {
             return Err(OpLoweringRefusal::MissingProgramVariableAuthorization);
         };
-        let fallback = match self.planned_value_expr(value) {
+        let Some(names) = self.inputs.binding_names else {
+            return Err(OpLoweringRefusal::MissingProgramVariableAuthorization);
+        };
+        if names.disposition_for_value(value).is_none() {
+            return Err(OpLoweringRefusal::MissingProgramVariableAuthorization);
+        }
+        let expr = match self.planned_value_expr(value) {
             Ok(expr) => expr,
             Err(error) => {
                 self.retain_first_observation_error(error);
                 return Err(OpLoweringRefusal::MissingProgramVariableAuthorization);
             }
         };
-        if let Some(expr) = self.signed_divrem_expr_for_value(var) {
-            return Ok(expr);
-        }
-        let producer_load_expr = match self.producer_for_value(var) {
-            Some(SSAOp::Load {
-                dst,
-                space: r2il::SpaceId::Ram,
-                addr,
-            }) if dst.size < addr.size => {
-                // A load is unsigned unless something sign-extends it, and
-                // Sleigh says so explicitly with `IntSExt` when it does. Giving
-                // a bare byte load a signed pointee makes C sign-extend where
-                // the machine does not: `pearson` reads its table with
-                // `mov al, byte [rax + rcx]`, and rendering that as `int8_t*`
-                // turns any entry at or above 0x80 negative, which then corrupts
-                // the next index.
-                let elem_ty = self
-                    .type_hint_for_var(dst)
-                    .unwrap_or_else(|| uint_type_from_size(dst.size));
-                let expr = self.render_canonical_load_expr(dst, addr, elem_ty)?;
-                (Self::expr_is_scalar_memory_candidate(&expr)
-                    || Self::expr_is_structured_memory_candidate(&expr))
-                .then_some(expr)
-            }
-            _ => None,
-        };
-        if let Some(load_expr) = producer_load_expr {
-            return Ok(load_expr);
-        }
-        let raw_memory_expr = self.memory_read_expr_for_name(&key);
-        // A value whose own definition reads memory is that read. The aliases
-        // below answer a different question -- which stack slot a value was
-        // forwarded from -- and that is where an address came from, not what
-        // was found at it. A load through an argument pointer is forwarded
-        // from the slot homing the argument, so letting the alias win renders
-        // `*obj` as `obj`, and a struct field read prints the pointer.
-        if let Some(raw_memory) = raw_memory_expr.clone() {
-            return Ok(raw_memory);
-        }
-        if let Some(offset) = self
-            .forwarded_value_for_value_id(value)
-            .and_then(|prov| prov.stack_slot)
-        {
-            let _ = self.refuse_missing_stack_object_origin(offset);
-        }
-        if let Some(slot) = self.stack_slot_provenance_for_var(var)
-            && slot.offset < 0
-        {
-            let _ = self.refuse_missing_stack_object_origin(slot.offset);
-        }
-        if let Some(owner) = self.stable_owned_call_result_expr_for_var(var) {
-            return Ok(owner);
-        }
-        if matches!(
-            self.semantic_value_for_value_id(value),
-            Some(analysis::SemanticValue::Address(_))
-        ) && let Some(candidate) = self.definition_for_value_id(value).cloned()
-        {
-            let candidate = self.rewrite_stack_expr(candidate);
-            if !matches!(candidate, CExpr::AddrOf(_))
-                && self.prefers_visible_expr(&fallback, &candidate)
-            {
-                return Ok(candidate);
-            }
-        }
-        let mut semantic_visited = HashSet::new();
-        if let Some(semantic) = self
-            .semantic_value_for_value_id(value)
-            .and_then(|semantic| self.render_semantic_value(semantic, 0, &mut semantic_visited))
-        {
-            if let Some(raw_memory) = raw_memory_expr.clone()
-                && !Self::expr_is_scalar_memory_candidate(&semantic)
-                && !Self::expr_is_structured_memory_candidate(&semantic)
-            {
-                return Ok(raw_memory);
-            }
-            if self.prefers_visible_expr(&fallback, &semantic) {
-                return Ok(semantic);
-            }
-        }
-        if let Some(raw_memory) = raw_memory_expr {
-            return Ok(raw_memory);
-        }
-
-        // Try to inline if appropriate
-        if self.should_inline(var)
-            && let Some(expr) = self.definition_for_value_id(value)
-        {
-            return Ok(expr.clone());
-        }
-
-        if std::env::var_os("R2SLEIGH_DEBUG_MERGES").is_some() {
-            eprintln!(
-                "FOLDBARE key={key} fwd={} ambiguous={} has_def={}",
-                self.forwarded_value_for_value_id(value).is_some(),
-                self.use_info().ambiguous_value_ids.contains(&value),
-                self.definition_for_value_id(value).is_some()
-            );
-        }
-        // Otherwise return a variable reference
-        Ok(fallback)
+        Ok(expr)
     }
 
     fn op_to_expr_impl(
@@ -3258,9 +3003,12 @@ impl<'a> FoldingContext<'a> {
         }
         let value = self.switch_selector_roots_map().get(&block_addr)?;
         let mut visited = HashSet::new();
-        let rendered = self
-            .render_semantic_value(value, 0, &mut visited)
-            .unwrap_or_else(|| self.expr_for_semantic_call_arg_fallback(value));
+        let rendered =
+            if let Some(rendered) = self.render_semantic_value(value, 0, &mut visited) {
+                rendered
+            } else {
+                self.retain_lowering_result(self.expr_for_semantic_call_arg_fallback(value))?
+            };
         let mut semantic_visited = HashSet::new();
         let semanticized = self.semanticize_visible_expr(&rendered, 0, &mut semantic_visited);
         self.choose_preferred_visible_expr(Some(rendered), Some(semanticized))
@@ -3283,8 +3031,8 @@ impl<'a> FoldingContext<'a> {
             let rooted = self
                 .prepared_canonical_value_root(selector)
                 .unwrap_or_else(|| selector.clone());
-            let rendered = if rooted.is_const() {
-                self.const_to_expr(&rooted)
+            let rendered = if rooted.constant_bits().is_some() {
+                self.retain_lowering_result(self.const_to_expr(&rooted))?
             } else {
                 self.retain_lowering_result(self.get_expr(&rooted))?
             };
@@ -3427,8 +3175,8 @@ impl<'a> FoldingContext<'a> {
                     self.render_value_ref(&analysis::ValueRef::from(source), depth + 1, visited)
                 })
             });
-        let fallback = if value.var.is_const() {
-            Some(self.const_to_expr(&value.var))
+        let fallback = if value.var.constant_bits().is_some() {
+            self.retain_lowering_result(self.const_to_expr(&value.var))
         } else {
             value
                 .value_id()
@@ -3607,6 +3355,7 @@ impl<'a> FoldingContext<'a> {
             .and_then(|fact| self.prepared_named_expr_for_memory_location(&fact.location))
     }
 
+    #[cfg(test)]
     fn prepared_named_memory_def_expr_for_current_op(&self) -> Option<CExpr> {
         let defs = self.prepared_memory_defs_for_current_op()?;
         (defs.len() == 1)
@@ -8354,7 +8103,7 @@ impl<'a> FoldingContext<'a> {
     }
 
     #[cfg(test)]
-    pub(crate) fn debug_resolve_prepared_predicate_operand(&self, var: &SSAVar) -> CExpr {
+    pub(crate) fn debug_resolve_prepared_predicate_operand(&self, var: &SSAVar) -> Option<CExpr> {
         self.resolve_prepared_predicate_operand(var)
     }
 
@@ -10025,7 +9774,8 @@ impl<'a> FoldingContext<'a> {
                             && !self.is_control_return_target(dst)
                         {
                             let mut visited = HashSet::new();
-                            let raw = self.op_to_expr(op)?;
+                            let LoweredExprAt::Rendered(raw) =
+                                self.op_to_expr_at(op, block.addr, op_idx)?;
                             let expanded = self.expand_return_expr(&raw, 0, &mut visited);
                             let final_expr = if self.is_certified_rendered_call_expr(&expanded) {
                                 expanded.clone()
@@ -10170,6 +9920,7 @@ impl<'a> FoldingContext<'a> {
                     )));
                     break;
                 }
+                let final_expr = self.planned_input_expr_at(block.addr, op_idx, 0)?;
                 let final_expr = block
                     .ops
                     .get(return_op_idx)
@@ -10182,11 +9933,6 @@ impl<'a> FoldingContext<'a> {
                             final_expr,
                         )
                     });
-                let final_expr = self.observe_normalized_input_expr(
-                    block.addr,
-                    op_idx,
-                    0,
-                    final_expr);
                 let obligations = self.exact_effect_obligations_for_normalized_value(
                     EffectOccurrenceKind::Return,
                     block.addr,
@@ -10233,15 +9979,10 @@ impl<'a> FoldingContext<'a> {
                 // Skip if this will be inlined
                 let key = dst.display_name();
                 if self.should_inline(dst) {
-                    // Leaving the statement out promises the reader will show the
-                    // value. Record the expression this statement would have
-                    // carried, so the promise is kept from the same answer that
-                    // made it rather than reconstructed later by another rule.
-                    let inlined = self.op_to_expr_at(op, block.addr, op_idx)?;
-                    let LoweredExprAt::Rendered(inlined) = inlined;
-                    self.inlined_renderings
-                        .borrow_mut()
-                        .insert(key.clone(), inlined);
+                    // The exact ValueId disposition is the complete admission
+                    // proof. Its machine expression is rendered directly by
+                    // `planned_value_expr`; no spelling-keyed definition cache
+                    // participates in the decision or in later reads.
                     continue;
                 }
 
@@ -10593,27 +10334,8 @@ impl<'a> FoldingContext<'a> {
                 let elem_ty = self
                     .type_hint_for_var(dst)
                     .unwrap_or_else(|| uint_type_from_size(dst.size));
-                let rhs = self.render_canonical_load_expr(dst, addr, elem_ty.clone())?;
-                let rhs = if let Some(source_call) = self
-                    .call_result_source_for_var(dst)
-                    .or_else(|| self.local_post_call_source_for_var(dst))
-                {
-                    self.call_result_exprs_map()
-                        .get(&source_call)
-                        .cloned()
-                        .map(|expr| {
-                            self.normalize_call_expr_for_source_call(
-                                source_call,
-                                expr,
-                                FinalExprNormalizeContext::DefinitionRoot,
-                            )
-                        })
-                        .or_else(|| self.synthesized_call_expr_for_source_call(source_call))
-                        .unwrap_or(rhs)
-                } else {
-                    rhs
-                };
-                let rhs = self.observed_input(frame, 0, rhs);
+                let rhs = self.render_certified_load_access_expr(dst, addr, elem_ty)?;
+                let rhs = self.observed_memory_input(frame, 0, rhs);
                 self.assign_stmt(lhs, rhs)
             }
             SSAOp::Store { addr, val, space } => {
@@ -10634,8 +10356,9 @@ impl<'a> FoldingContext<'a> {
                 let elem_ty = self
                     .type_hint_for_var(val)
                     .unwrap_or_else(|| type_from_size(val.size));
-                let lhs =
-                    self.render_canonical_store_target_expr(addr, val.size, elem_ty.clone())?;
+                let certified_lhs =
+                    self.render_certified_store_access_expr(addr, val, elem_ty.clone())?;
+                let lhs = certified_lhs.expr().clone();
                 let mut rhs = if let Some(source_call) = self
                     .call_result_source_for_var(val)
                     .or_else(|| self.local_post_call_source_for_var(val))
@@ -10707,7 +10430,7 @@ impl<'a> FoldingContext<'a> {
                 {
                     rhs = CExpr::cast(val_ty, rhs);
                 }
-                let lhs = self.observed_input(frame, 0, lhs);
+                let lhs = self.observed_memory_input(frame, 0, certified_lhs);
                 let rhs = self.observed_input(frame, 1, rhs);
                 self.assign_stmt(lhs, rhs)
             }
@@ -11018,7 +10741,7 @@ impl<'a> FoldingContext<'a> {
                         self.resolve_call_target_for_site(block_addr, op_idx, target)
                     }
                     _ => self.resolve_call_target(target),
-                };
+                }?;
                 let func_expr = self.observed_input(frame, 0, func_expr);
                 let call = CExpr::call(func_expr, vec![]);
                 Some(CStmt::Expr(call))

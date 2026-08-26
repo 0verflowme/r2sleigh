@@ -678,7 +678,7 @@ impl<'a> FoldingContext<'a> {
         let Some(block) = func.get_block(pred_addr) else {
             return Ok(None);
         };
-        let Some((_, op)) = block
+        let Some((op_idx, op)) = block
             .ops
             .iter()
             .enumerate()
@@ -696,7 +696,8 @@ impl<'a> FoldingContext<'a> {
             }
             _ => {
                 let mut visited = HashSet::new();
-                let raw = self.op_to_expr(op)?;
+                let LoweredExprAt::Rendered(raw) =
+                    self.op_to_expr_at(op, pred_addr, op_idx)?;
                 let expanded = self.expand_return_expr(&raw, 0, &mut visited);
                 let mut semantic_visited = HashSet::new();
                 let semanticized =
@@ -955,9 +956,9 @@ impl<'a> FoldingContext<'a> {
     }
 
     pub(super) fn get_return_expr(&self, var: &SSAVar) -> OpLoweringResult<CExpr> {
-        if var.is_const() {
+        if var.constant_bits().is_some() {
             return Ok(self.rewrite_typed_return_literal_expr(
-                self.const_to_expr(var),
+                self.const_to_expr(var)?,
                 self.current_return_context(),
             ));
         }
@@ -1202,12 +1203,14 @@ impl<'a> FoldingContext<'a> {
     }
 
     /// Convert a constant variable to a C expression.
-    pub(crate) fn const_to_expr(&self, var: &SSAVar) -> CExpr {
-        let val = parse_const_value(&var.name).unwrap_or(0);
+    pub(crate) fn const_to_expr(&self, var: &SSAVar) -> OpLoweringResult<CExpr> {
+        let val = var
+            .constant_bits()
+            .ok_or(OpLoweringRefusal::MissingProgramVariableAuthorization)?;
         if val > 0x7fffffff {
-            CExpr::UIntLit(val)
+            Ok(CExpr::UIntLit(val))
         } else {
-            CExpr::IntLit(val as i64)
+            Ok(CExpr::IntLit(val as i64))
         }
     }
 }
