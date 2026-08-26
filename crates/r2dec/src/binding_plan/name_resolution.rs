@@ -139,6 +139,16 @@ impl BindingNameResolution {
         self.plan.use_disposition(site)
     }
 
+    /// Resolve one exact write projection through the sealed plan. As with
+    /// uses, register geometry remains owned by the source-backed machine
+    /// projection rather than being reconstructed from a rendered name.
+    pub(crate) fn write_disposition(
+        &self,
+        inst: r2ssa::InstId,
+    ) -> Option<&r2ssa::MachineWriteDisposition> {
+        self.plan.write_disposition(inst)
+    }
+
     pub(crate) fn symbol_for_value(&self, value: ValueId) -> Option<SymbolId> {
         match self.resolve_value(value) {
             PlannedValueSymbol::Bound(symbol) => Some(symbol),

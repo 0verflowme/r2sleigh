@@ -1,8 +1,133 @@
 use super::calls::CertifiedCallArgs;
-use super::projection::project_machine_use;
+use super::projection::{project_machine_use, project_machine_write};
 use super::*;
 
 impl<'a> FoldingContext<'a> {
+    fn normalized_output_projection(
+        &self,
+        site: crate::normalize::NormalizedOpSite,
+    ) -> Result<crate::normalize::NormalizedOutputProjection, crate::observation_journal::LegacyObservationJournalError>
+    {
+        let prepared = self.inputs.prepared_ssa.ok_or(
+            crate::observation_journal::LegacyObservationJournalError::MissingNormalizedSiteContext,
+        )?;
+        self.inputs
+            .normalization_origins
+            .ok_or(
+                crate::observation_journal::LegacyObservationJournalError::MissingNormalizedSiteContext,
+            )?
+            .projection(site, prepared)
+            .map_err(crate::observation_journal::LegacyObservationJournalError::Normalization)?
+            .ok_or(
+                crate::observation_journal::LegacyObservationJournalError::InvalidNormalizedSite(
+                    site,
+                ),
+            )?
+            .output
+            .ok_or(
+                crate::observation_journal::LegacyObservationJournalError::MissingNormalizedOutput(
+                    site,
+                ),
+            )
+    }
+
+    fn project_planned_assignment(
+        &self,
+        site: Option<crate::normalize::NormalizedOpSite>,
+        lhs: CExpr,
+        rhs: CExpr,
+    ) -> Result<(CExpr, CExpr), crate::observation_journal::LegacyObservationJournalError> {
+        let Some(site) = site else {
+            return Ok((lhs, rhs));
+        };
+        let Some(names) = self.inputs.binding_names else {
+            return Ok((lhs, rhs));
+        };
+        let output = self.normalized_output_projection(site)?;
+        match names.write_disposition(output.inst) {
+            Some(r2ssa::MachineWriteDisposition::Exact(projection)) => {
+                project_machine_write(lhs, rhs, *projection).map_err(|_| {
+                    crate::observation_journal::LegacyObservationJournalError::RefusedRenderedWrite(
+                        output.inst,
+                    )
+                })
+            }
+            Some(r2ssa::MachineWriteDisposition::Refused(_)) => Err(
+                crate::observation_journal::LegacyObservationJournalError::RefusedRenderedWrite(
+                    output.inst,
+                ),
+            ),
+            None => Err(
+                crate::observation_journal::LegacyObservationJournalError::InvalidWrite(
+                    output.inst,
+                ),
+            ),
+        }
+    }
+
+    fn project_lowered_assignment(
+        &self,
+        site: Option<crate::normalize::NormalizedOpSite>,
+        lowered: LoweredOp,
+    ) -> LoweredOp {
+        let LoweredOp::Assign { lhs, rhs } = lowered else {
+            return lowered;
+        };
+        match self.project_planned_assignment(site, lhs.clone(), rhs.clone()) {
+            Ok((lhs, rhs)) => LoweredOp::Assign { lhs, rhs },
+            Err(error) => {
+                self.retain_first_observation_error(error);
+                LoweredOp::Assign { lhs, rhs }
+            }
+        }
+    }
+
+    /// Apply a source write only when the finalized statement targets the
+    /// exact plan-owned output binding. Synthetic assignments emitted while
+    /// folding the same opcode (for example a recovered return slot) are not
+    /// definitions of that `InstId` and must not inherit its machine effect.
+    fn project_finalized_assignment_stmt(
+        &self,
+        site: Option<crate::normalize::NormalizedOpSite>,
+        stmt: CStmt,
+    ) -> CStmt {
+        let Some(site) = site else {
+            return stmt;
+        };
+        let Ok(output) = self.normalized_output_projection(site) else {
+            return stmt;
+        };
+        let Some(names) = self.inputs.binding_names else {
+            return stmt;
+        };
+        let crate::binding_plan::PlannedValueSymbol::Bound(symbol) =
+            names.resolve_value(output.value)
+        else {
+            return stmt;
+        };
+        let CStmt::Expr(CExpr::Binary {
+            op: BinaryOp::Assign,
+            left,
+            right,
+        }) = stmt
+        else {
+            return stmt;
+        };
+        let lhs = *left;
+        let rhs = *right;
+        let planned_lhs = CExpr::Var(symbol);
+        if !lhs.transparently_eq(&planned_lhs) {
+            return CStmt::Expr(CExpr::assign(lhs, rhs));
+        }
+        match self.project_planned_assignment(Some(site), lhs.clone(), rhs.clone()) {
+            Ok((lhs, rhs)) => CStmt::Expr(CExpr::assign(lhs, rhs)),
+            Err(error) => {
+                self.retain_first_observation_error(error);
+                CStmt::Expr(CExpr::assign(lhs, rhs))
+            }
+        }
+    }
+
     fn planned_value_expr(
         &self,
         value: ValueId,
@@ -193,27 +318,7 @@ impl<'a> FoldingContext<'a> {
                 block_addr,
             ),
         )?;
-        let prepared = self.inputs.prepared_ssa.ok_or(
-            crate::observation_journal::LegacyObservationJournalError::MissingNormalizedSiteContext,
-        )?;
-        let projection = self
-            .inputs
-            .normalization_origins
-            .ok_or(
-                crate::observation_journal::LegacyObservationJournalError::MissingNormalizedSiteContext,
-            )?
-            .projection(site, prepared)
-            .map_err(crate::observation_journal::LegacyObservationJournalError::Normalization)?
-            .ok_or(
-                crate::observation_journal::LegacyObservationJournalError::InvalidNormalizedSite(
-                    site,
-                ),
-            )?;
-        let value = projection.output.map(|output| output.value).ok_or(
-            crate::observation_journal::LegacyObservationJournalError::MissingNormalizedOutput(
-                site,
-            ),
-        )?;
+        let value = self.normalized_output_projection(site)?.value;
         match self.inputs.binding_names.map(|names| names.resolve_value(value)) {
             Some(crate::binding_plan::PlannedValueSymbol::Bound(symbol)) => {
                 Ok(Some(CExpr::Var(symbol)))
@@ -460,8 +565,12 @@ impl<'a> FoldingContext<'a> {
         // Operand observations are attached while their exact expression
         // positions still exist. Wrapping the completed expression once per
         // input would falsely make every operand own the same aggregate node.
-        let mut frame = LowerFrame::for_observed_expr(self.normalized_site(block_addr, op_idx));
-        let lowered = self.lower_op(op, &mut frame);
+        let normalized_site = self.normalized_site(block_addr, op_idx);
+        let mut frame = LowerFrame::for_observed_expr(normalized_site);
+        let lowered = self.project_lowered_assignment(
+            normalized_site,
+            self.lower_op(op, &mut frame),
+        );
         let lowered = match lowered {
             LoweredOp::Expr(expr) => LoweredExprAt::Rendered(expr),
             LoweredOp::Assign { lhs, rhs } => LoweredExprAt::Rendered(CExpr::assign(lhs, rhs)),
@@ -530,7 +639,9 @@ impl<'a> FoldingContext<'a> {
         let normalized_site = self.normalized_site(block_addr, op_idx);
         let source_call_site = source_site.or(Some((block_addr, op_idx)));
         let mut frame = LowerFrame::for_stmt(normalized_site, source_call_site, true);
-        let stmt = self.lowered_to_stmt(self.lower_op(op, &mut frame))?;
+        let lowered = self.lower_op(op, &mut frame);
+        let stmt = self.lowered_to_stmt(lowered)?;
+        let stmt = self.project_finalized_assignment_stmt(normalized_site, stmt);
 
         if stmt_contains_memory_like_access(&stmt) {
             match op {

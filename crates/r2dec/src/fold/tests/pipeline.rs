@@ -1612,6 +1612,96 @@ mod tests {
         assert_eq!(*ctx.observation_error.borrow(), None);
     }
 
+    #[test]
+    fn observed_narrow_register_write_applies_the_exact_insert_effect() {
+        let mut arch = make_test_arch_x86_64();
+        let mut register_projections = arch
+            .registers
+            .iter()
+            .map(|register| {
+                let written = register.storage();
+                let carrier = match register.name.as_str() {
+                    "EAX" => RegisterStorage { offset: 0, size: 8 },
+                    "EDI" => RegisterStorage {
+                        offset: 0x10,
+                        size: 8,
+                    },
+                    "ESI" => RegisterStorage {
+                        offset: 0x18,
+                        size: 8,
+                    },
+                    _ => written,
+                };
+                RegisterProjection {
+                    written,
+                    disposition: RegisterProjectionDisposition::Bound {
+                        carrier,
+                        slice: RegisterBitSlice {
+                            lsb_bit_offset: 0,
+                            size_bits: u64::from(register.size) * 8,
+                        },
+                    },
+                }
+            })
+            .collect::<Vec<_>>();
+        register_projections.sort_by_key(|projection| projection.written);
+        arch.register_projections = register_projections;
+
+        let mut entry = R2ILBlock::new(0x1000, 4);
+        entry.push(R2ILOp::Copy {
+            dst: Varnode::register(0, 4),
+            src: Varnode::constant(0xaa, 4),
+        });
+        let prepared = prepared_from_r2il_blocks(&[entry], &arch)
+            .with_name("observed_exact_narrow_register_write");
+        let block = prepared.function().get_block(0x1000).expect("entry block");
+        let copy_idx = block
+            .ops
+            .iter()
+            .position(|op| matches!(op, SSAOp::Copy { dst, .. } if dst.size == 4))
+            .expect("low-register write");
+        let copy_inst = prepared
+            .graph()
+            .inst_id_for_op_site(block.addr, copy_idx)
+            .expect("copy graph instruction");
+
+        let mut ctx = make_x86_64_ctx_with_prepared(&prepared);
+        let (plan, _, _) = install_observed_lowering(&mut ctx, &prepared);
+        assert!(matches!(
+            plan.write_disposition(copy_inst),
+            Some(r2ssa::MachineWriteDisposition::Exact(
+                r2ssa::MachineWriteProjection::Insert {
+                    bit_offset: 0,
+                    width_bits: 32,
+                    carrier_width_bits: 64,
+                }
+            ))
+        ));
+        let copy_stmt = ctx
+            .op_to_stmt_with_args(&block.ops[copy_idx], block.addr, copy_idx)
+            .expect("low-register assignment");
+        let CStmt::Expr(copy_expr) = copy_stmt.unobserved() else {
+            panic!("low-register write must remain an assignment");
+        };
+        let CExpr::Binary {
+            op: BinaryOp::Assign,
+            right: copy_rhs,
+            ..
+        } = copy_expr.unobserved()
+        else {
+            panic!("low-register write must remain an assignment expression");
+        };
+        assert!(matches!(
+            copy_rhs.unobserved(),
+            CExpr::Cast {
+                ty: CType::UInt(64),
+                expr,
+            } if matches!(expr.unobserved(), CExpr::Binary { op: BinaryOp::BitOr, .. })
+        ));
+
+        assert_eq!(*ctx.observation_error.borrow(), None);
+    }
+
     fn assert_observed_call_marks_only_graph_target(indirect: bool) {
         let arch = make_test_arch_x86_64();
         let mut entry = R2ILBlock::new(0x1000, 4);
