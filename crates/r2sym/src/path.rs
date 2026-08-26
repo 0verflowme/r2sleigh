@@ -3893,6 +3893,16 @@ mod tests {
         let ctx = Context::thread_local();
         let blocks = vec![
             R2ILBlock {
+                addr: 0x0ffc,
+                size: 4,
+                ops: vec![R2ILOp::CBranch {
+                    target: make_const(0x3000, 8),
+                    cond: make_reg(RAX, 1),
+                }],
+                switch_info: None,
+                op_metadata: Default::default(),
+            },
+            R2ILBlock {
                 addr: 0x1000,
                 size: 4,
                 ops: vec![
@@ -3904,6 +3914,13 @@ mod tests {
                         target: make_const(0x1020, 8),
                     },
                 ],
+                switch_info: None,
+                op_metadata: Default::default(),
+            },
+            R2ILBlock {
+                addr: 0x1020,
+                size: 1,
+                ops: vec![R2ILOp::Nop],
                 switch_info: None,
                 op_metadata: Default::default(),
             },
@@ -3922,32 +3939,15 @@ mod tests {
                 switch_info: None,
                 op_metadata: Default::default(),
             },
-            R2ILBlock {
-                addr: 0x1020,
-                size: 1,
-                ops: vec![R2ILOp::Nop],
-                switch_info: None,
-                op_metadata: Default::default(),
-            },
         ];
         let func = Arc::new(SsaArtifact::for_symbolic(&blocks, None).expect("symbolic function"));
-        let runtime_source = Arc::new(
-            SsaArtifact::for_symbolic(&[blocks[1].clone()], None).expect("runtime source function"),
-        );
         let scope = crate::PreparedFunctionScope::new(
-            0x1000,
-            vec![
-                crate::ScopedPreparedFunction {
-                    id: InterprocFunctionId(0x1000),
-                    name: Some("root".to_string()),
-                    prepared: Arc::clone(&func),
-                },
-                crate::ScopedPreparedFunction {
-                    id: InterprocFunctionId(0x3000),
-                    name: Some("runtime_source".to_string()),
-                    prepared: runtime_source,
-                },
-            ],
+            0x0ffc,
+            vec![crate::ScopedPreparedFunction {
+                id: InterprocFunctionId(0x0ffc),
+                name: Some("root".to_string()),
+                prepared: Arc::clone(&func),
+            }],
         )
         .expect("scope");
         let join = func.get_block(0x1020).expect("join block");

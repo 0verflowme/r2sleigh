@@ -31,6 +31,25 @@ pub enum SsaIntegrityError {
         ordered: Vec<u64>,
         stored_count: usize,
     },
+    EntryOutsideBlockDomain {
+        entry: u64,
+    },
+    PredecessorOutsideBlockDomain {
+        block_addr: u64,
+        predecessor: u64,
+    },
+    SuccessorOutsideBlockDomain {
+        block_addr: u64,
+        successor: u64,
+    },
+    PredecessorNotReciprocal {
+        block_addr: u64,
+        predecessor: u64,
+    },
+    SuccessorNotReciprocal {
+        block_addr: u64,
+        successor: u64,
+    },
     DefinitionAtVersionZero {
         block_addr: u64,
         site: DefSite,
@@ -97,6 +116,38 @@ impl fmt::Display for SsaIntegrityError {
             } => write!(
                 f,
                 "SSA block order {ordered:?} does not bijectively cover {stored_count} stored blocks"
+            ),
+            Self::EntryOutsideBlockDomain { entry } => write!(
+                f,
+                "SSA entry 0x{entry:x} is not present in the stored block domain"
+            ),
+            Self::PredecessorOutsideBlockDomain {
+                block_addr,
+                predecessor,
+            } => write!(
+                f,
+                "SSA block 0x{block_addr:x} has CFG predecessor 0x{predecessor:x} outside the stored block domain"
+            ),
+            Self::SuccessorOutsideBlockDomain {
+                block_addr,
+                successor,
+            } => write!(
+                f,
+                "SSA block 0x{block_addr:x} has CFG successor 0x{successor:x} outside the stored block domain"
+            ),
+            Self::PredecessorNotReciprocal {
+                block_addr,
+                predecessor,
+            } => write!(
+                f,
+                "SSA block 0x{block_addr:x} names CFG predecessor 0x{predecessor:x}, but that predecessor does not name the block as a successor"
+            ),
+            Self::SuccessorNotReciprocal {
+                block_addr,
+                successor,
+            } => write!(
+                f,
+                "SSA block 0x{block_addr:x} names CFG successor 0x{successor:x}, but that successor does not name the block as a predecessor"
             ),
             Self::DefinitionAtVersionZero {
                 block_addr,
@@ -187,6 +238,14 @@ struct DefinitionLocation {
     site: DefSite,
 }
 
+#[derive(Debug)]
+struct BlockTopology {
+    predecessors: Vec<u64>,
+    successors: Vec<u64>,
+    predecessor_set: HashSet<u64>,
+    successor_set: HashSet<u64>,
+}
+
 /// Validate the structural and scalar-width invariants of one SSA function.
 ///
 /// Version zero is the explicit entry/live-in domain, so version-zero sources
@@ -207,6 +266,72 @@ pub fn validate_ssa_function(function: &SSAFunction) -> Result<(), SsaIntegrityE
             ordered: ordered.to_vec(),
             stored_count: function.num_blocks(),
         });
+    }
+    if !block_domain.contains(&function.entry) {
+        return Err(SsaIntegrityError::EntryOutsideBlockDomain {
+            entry: function.entry,
+        });
+    }
+
+    // `SsaGraph` stores only `block_order`, so every retained CFG edge must be
+    // closed over that exact domain. Cache both directions once: deterministic
+    // iteration follows `block_order` and the CFG's stable adjacency order,
+    // while reciprocal membership remains expected O(1) per edge.
+    let topology = ordered
+        .iter()
+        .map(|addr| {
+            let predecessors = function.predecessors(*addr);
+            let successors = function.successors(*addr);
+            (
+                *addr,
+                BlockTopology {
+                    predecessor_set: predecessors.iter().copied().collect(),
+                    successor_set: successors.iter().copied().collect(),
+                    predecessors,
+                    successors,
+                },
+            )
+        })
+        .collect::<HashMap<_, _>>();
+
+    for block_addr in ordered {
+        let block_topology = topology
+            .get(block_addr)
+            .expect("topology is indexed from the validated block order");
+        for predecessor in &block_topology.predecessors {
+            if !block_domain.contains(predecessor) {
+                return Err(SsaIntegrityError::PredecessorOutsideBlockDomain {
+                    block_addr: *block_addr,
+                    predecessor: *predecessor,
+                });
+            }
+            let predecessor_topology = topology
+                .get(predecessor)
+                .expect("stored-domain predecessor has cached topology");
+            if !predecessor_topology.successor_set.contains(block_addr) {
+                return Err(SsaIntegrityError::PredecessorNotReciprocal {
+                    block_addr: *block_addr,
+                    predecessor: *predecessor,
+                });
+            }
+        }
+        for successor in &block_topology.successors {
+            if !block_domain.contains(successor) {
+                return Err(SsaIntegrityError::SuccessorOutsideBlockDomain {
+                    block_addr: *block_addr,
+                    successor: *successor,
+                });
+            }
+            let successor_topology = topology
+                .get(successor)
+                .expect("stored-domain successor has cached topology");
+            if !successor_topology.predecessor_set.contains(block_addr) {
+                return Err(SsaIntegrityError::SuccessorNotReciprocal {
+                    block_addr: *block_addr,
+                    successor: *successor,
+                });
+            }
+        }
     }
 
     let mut definitions = HashMap::<SSAVar, DefinitionLocation>::new();
@@ -258,7 +383,11 @@ pub fn validate_ssa_function(function: &SSAFunction) -> Result<(), SsaIntegrityE
     for block in function.blocks() {
         // Query once per block so the full validator remains linear in CFG
         // edges even when a merge block carries several phi values.
-        let expected_predecessors = function.predecessors(block.addr);
+        let expected_predecessors = topology
+            .get(&block.addr)
+            .expect("validated SSA block has cached topology")
+            .predecessors
+            .clone();
 
         for (phi_idx, phi) in block.phis.iter().enumerate() {
             let actual_predecessors = phi
@@ -407,6 +536,7 @@ fn scalar_width_violation(op: &SSAOp) -> Option<ScalarWidthRule> {
 mod tests {
     use super::*;
     use crate::PhiNode;
+    use crate::cfg::{BasicBlock, BlockTerminator};
     use r2il::{R2ILBlock, R2ILOp, SpaceId, Varnode};
 
     fn constant(value: u64, size: u32) -> Varnode {
@@ -478,6 +608,147 @@ mod tests {
     #[test]
     fn accepts_a_well_formed_function() {
         validate_ssa_function(&diamond()).expect("constructed SSA must be internally coherent");
+    }
+
+    #[test]
+    fn rejects_entry_outside_the_stored_block_domain() {
+        let mut function = diamond();
+        function.remove_block(function.entry);
+
+        assert_eq!(
+            validate_ssa_function(&function),
+            Err(SsaIntegrityError::EntryOutsideBlockDomain { entry: 0x1000 })
+        );
+    }
+
+    #[test]
+    fn rejects_cfg_edges_that_leave_the_stored_block_domain() {
+        let mut predecessor = diamond();
+        let mut orphan = BasicBlock::new(0x3000);
+        orphan.terminator = BlockTerminator::Branch { target: 0x100c };
+        predecessor.cfg_mut().add_block(orphan);
+        predecessor.cfg_mut().rebuild_edges();
+        assert_eq!(
+            validate_ssa_function(&predecessor),
+            Err(SsaIntegrityError::PredecessorOutsideBlockDomain {
+                block_addr: 0x100c,
+                predecessor: 0x3000,
+            })
+        );
+
+        let mut successor = diamond();
+        let mut orphan = BasicBlock::new(0x3000);
+        orphan.terminator = BlockTerminator::Return;
+        successor.cfg_mut().add_block(orphan);
+        successor
+            .cfg_mut()
+            .set_terminator(0x1004, BlockTerminator::Branch { target: 0x3000 });
+        assert_eq!(
+            validate_ssa_function(&successor),
+            Err(SsaIntegrityError::SuccessorOutsideBlockDomain {
+                block_addr: 0x1004,
+                successor: 0x3000,
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_nonreciprocal_cfg_topology_before_graph_construction() {
+        let mut function = diamond();
+        // A duplicate CFG address makes the address index name the new node,
+        // while existing edges still target the old node. The public topology
+        // queries then disagree even though every reported address is stored.
+        function.cfg_mut().add_block(BasicBlock::new(0x1008));
+
+        assert_eq!(
+            validate_ssa_function(&function),
+            Err(SsaIntegrityError::SuccessorNotReciprocal {
+                block_addr: 0x1000,
+                successor: 0x1008,
+            })
+        );
+    }
+
+    #[test]
+    fn symbolic_constructor_refuses_runtime_alias_overlap_with_disconnected_predecessor() {
+        let blocks = vec![
+            R2ILBlock {
+                addr: 0x1000,
+                size: 4,
+                ops: vec![
+                    R2ILOp::Copy {
+                        dst: register(0, 8),
+                        src: constant(0x11, 8),
+                    },
+                    R2ILOp::Branch {
+                        target: constant(0x1020, 8),
+                    },
+                ],
+                switch_info: None,
+                op_metadata: Default::default(),
+            },
+            R2ILBlock {
+                addr: 0x3000,
+                size: 4,
+                ops: vec![
+                    R2ILOp::Copy {
+                        dst: register(0, 8),
+                        src: constant(0x22, 8),
+                    },
+                    R2ILOp::Branch {
+                        target: constant(0x1020, 8),
+                    },
+                ],
+                switch_info: None,
+                op_metadata: Default::default(),
+            },
+            R2ILBlock {
+                addr: 0x1020,
+                size: 1,
+                ops: vec![R2ILOp::Nop],
+                switch_info: None,
+                op_metadata: Default::default(),
+            },
+        ];
+
+        assert!(crate::SsaArtifact::for_symbolic(&blocks, None).is_none());
+    }
+
+    #[test]
+    fn symbolic_constructor_refuses_large_fanout_with_disconnected_tail() {
+        let mut blocks = Vec::new();
+        for idx in 0..50u64 {
+            blocks.push(R2ILBlock {
+                addr: 0x3000 + idx * 8,
+                size: 4,
+                ops: vec![R2ILOp::CBranch {
+                    target: constant(0x3100, 8),
+                    cond: register(0, 1),
+                }],
+                switch_info: None,
+                op_metadata: Default::default(),
+            });
+            blocks.push(R2ILBlock {
+                addr: 0x3004 + idx * 8,
+                size: 4,
+                ops: vec![R2ILOp::Branch {
+                    target: constant(0x3008 + idx * 8, 8),
+                }],
+                switch_info: None,
+                op_metadata: Default::default(),
+            });
+        }
+        blocks.push(R2ILBlock {
+            addr: 0x3100,
+            size: 4,
+            ops: vec![R2ILOp::Return {
+                target: register(0, 8),
+            }],
+            switch_info: None,
+            op_metadata: Default::default(),
+        });
+
+        assert!(crate::SsaArtifact::for_symbolic(&blocks, None).is_none());
     }
 
     #[test]

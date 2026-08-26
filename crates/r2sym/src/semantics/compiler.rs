@@ -1298,7 +1298,7 @@ mod tests {
                 addr: 0x3000 + idx * 8,
                 size: 4,
                 ops: vec![R2ILOp::CBranch {
-                    target: make_const(0x3100, 8),
+                    target: make_const(0x4000, 8),
                     cond: make_reg(RAX, 1),
                 }],
                 switch_info: None,
@@ -1307,15 +1307,21 @@ mod tests {
             blocks.push(R2ILBlock {
                 addr: 0x3004 + idx * 8,
                 size: 4,
-                ops: vec![R2ILOp::Branch {
-                    target: make_const(0x3008 + idx * 8, 8),
-                }],
+                ops: if idx + 1 < 50 {
+                    vec![R2ILOp::Branch {
+                        target: make_const(0x3008 + idx * 8, 8),
+                    }]
+                } else {
+                    vec![R2ILOp::Return {
+                        target: make_reg(RAX, 8),
+                    }]
+                },
                 switch_info: None,
                 op_metadata: Default::default(),
             });
         }
         blocks.push(R2ILBlock {
-            addr: 0x3100,
+            addr: 0x4000,
             size: 4,
             ops: vec![R2ILOp::Return {
                 target: make_reg(RAX, 8),
