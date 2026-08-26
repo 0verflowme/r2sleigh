@@ -666,10 +666,19 @@ impl<'a, 'ctx> ValueTranslator<'a, 'ctx> {
         let Some(call_ctx) = self.call_context_for_inst(inst_id, block_addr) else {
             return Err(EvalUnsupported::Unsupported);
         };
-        if !register_aliases(call_ctx.callconv.ret_register_name())
-            .iter()
-            .any(|alias| dst.name.eq_ignore_ascii_case(alias))
-        {
+        let is_result = if let Some(result_storage) = call_ctx.callconv.result_storage() {
+            self.func.graph().canonical_storage_for_var(dst) == Some(result_storage)
+        } else {
+            call_ctx
+                .callconv
+                .ret_register_name()
+                .is_some_and(|name| {
+                    register_aliases(name)
+                        .iter()
+                        .any(|alias| dst.name.eq_ignore_ascii_case(alias))
+                })
+        };
+        if !is_result {
             return Err(EvalUnsupported::Unsupported);
         }
         let (value, coverage) = summary_return_value(self.state, call_ctx)?;

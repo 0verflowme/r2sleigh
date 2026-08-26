@@ -161,17 +161,34 @@ pub trait FunctionSummary<'ctx>: Send + Sync {
     fn execute(&self, state: &mut SymState<'ctx>, call: &CallInfo<'ctx>) -> SummaryEffect<'ctx>;
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum CallConvRegisters {
+    /// Compatibility surface for callers that have architecture advice only.
+    AdvisoryNames {
+        argument_names: Vec<String>,
+        result_name: String,
+    },
+    /// Exact ABI identity retained from one prepared artifact.
+    SourceOwned {
+        argument_storages: Vec<CanonicalStorageId>,
+        result_storage: CanonicalStorageId,
+        register_storages_by_name: BTreeMap<String, CanonicalStorageId>,
+    },
+}
+
 /// Calling convention description for retrieving arguments and return values.
 #[derive(Clone, Debug)]
 pub struct CallConv {
-    arg_registers: Vec<String>,
-    ret_register: String,
+    registers: CallConvRegisters,
     arg_bits: u32,
     ret_bits: u32,
 }
 
 impl CallConv {
-    /// Create a calling convention with explicit registers and widths.
+    /// Create a legacy/advisory calling convention from presentation names.
+    ///
+    /// Exact prepared workflows must use [`Self::for_prepared`] so register
+    /// spellings never become ABI identity.
     pub fn new(
         arg_registers: Vec<&'static str>,
         ret_register: &'static str,
@@ -179,8 +196,10 @@ impl CallConv {
         ret_bits: u32,
     ) -> Self {
         Self {
-            arg_registers: arg_registers.into_iter().map(str::to_string).collect(),
-            ret_register: ret_register.to_string(),
+            registers: CallConvRegisters::AdvisoryNames {
+                argument_names: arg_registers.into_iter().map(str::to_string).collect(),
+                result_name: ret_register.to_string(),
+            },
             arg_bits,
             ret_bits,
         }
@@ -196,11 +215,12 @@ impl CallConv {
         Self::new(vec!["RCX", "RDX", "R8", "R9"], "RAX", 64, 64)
     }
 
-    /// Architecture-derived calling convention used by the symbolic runtime.
+    /// Legacy/advisory architecture-derived calling convention.
+    ///
+    /// This constructor intentionally remains name-based for callers without a
+    /// prepared artifact. It must not be used to reconstruct exact source ABI
+    /// identity.
     pub fn for_arch_spec(arch: &ArchSpec) -> Option<Self> {
-        if let Some(callconv) = source_owned_callconv_from_arch_projection(arch) {
-            return callconv;
-        }
         let arch_name = arch.name.to_ascii_lowercase();
         let looks_x86 = arch_name.contains("x86") || arch_name == "x64" || arch_name == "amd64";
         let looks_64 = arch.addr_size == 8 || arch.addr_size == 64 || arch_name.contains("64");
@@ -224,6 +244,65 @@ impl CallConv {
         None
     }
 
+    /// Retain the exact source-owned ABI storages from one prepared artifact.
+    pub(crate) fn for_prepared(prepared: &SsaArtifact) -> Option<Self> {
+        let context = prepared.machine_context();
+        let abi = context.abi_model();
+        if !abi.is_available() || !abi.is_coherent() {
+            return None;
+        }
+
+        let argument_storages = abi
+            .argument_registers()
+            .iter()
+            .enumerate()
+            .map(|(index, slot)| (slot.index() as usize == index).then_some(slot.storage()))
+            .collect::<Option<Vec<_>>>()?;
+        let [result_slot] = abi.return_registers() else {
+            return None;
+        };
+        let result_storage = result_slot.storage();
+        if argument_storages
+            .iter()
+            .chain(std::iter::once(&result_storage))
+            .any(|storage| {
+                storage.space != CanonicalStorageSpace::Register
+                    || storage.size == 0
+                    || storage.size.checked_mul(8).is_none()
+            })
+        {
+            return None;
+        }
+
+        let memory = context.memory_model();
+        if !memory.is_available() || !memory.is_coherent() {
+            return None;
+        }
+        let address_bits = memory.default_address_bits();
+        let arg_bits = match argument_storages.first() {
+            Some(storage) => storage.size.checked_mul(8)?,
+            None => address_bits,
+        };
+        if arg_bits == 0
+            || argument_storages
+                .iter()
+                .any(|storage| storage.size.checked_mul(8) != Some(arg_bits))
+        {
+            return None;
+        }
+        let ret_bits = result_storage.size.checked_mul(8)?;
+
+        Some(Self {
+            registers: CallConvRegisters::SourceOwned {
+                argument_storages,
+                result_storage,
+                register_storages_by_name: context.register_storages_by_name().clone(),
+            },
+            arg_bits,
+            ret_bits,
+        })
+    }
+
     /// Architecture-derived calling convention with binary-environment hints.
     pub fn for_arch_spec_and_symbols(
         arch: &ArchSpec,
@@ -240,11 +319,10 @@ impl CallConv {
     ) -> CallInfo<'ctx> {
         let mut args = Vec::with_capacity(arity);
         for i in 0..arity {
-            if let Some(reg) = self.arg_registers.get(i) {
-                args.push(self.read_register(state, reg));
-            } else {
-                args.push(SymValue::unknown(self.arg_bits));
-            }
+            args.push(
+                self.read_argument(state, i)
+                    .unwrap_or_else(|| SymValue::unknown(self.arg_bits)),
+            );
         }
         CallInfo {
             args,
@@ -253,7 +331,7 @@ impl CallConv {
         }
     }
 
-    fn read_register<'ctx>(&self, state: &SymState<'ctx>, base: &str) -> SymValue<'ctx> {
+    fn read_named_register<'ctx>(&self, state: &SymState<'ctx>, base: &str) -> SymValue<'ctx> {
         for alias in register_aliases(base) {
             if let Some(key) = find_register_key(state, alias) {
                 return state.get_register_sized(&key, self.arg_bits);
@@ -262,16 +340,84 @@ impl CallConv {
         SymValue::unknown(self.arg_bits)
     }
 
-    pub(crate) fn write_return<'ctx>(&self, state: &mut SymState<'ctx>, value: SymValue<'ctx>) {
-        let mut keys = BTreeSet::new();
-        for alias in register_aliases(&self.ret_register) {
-            if let Some(key) = find_register_key(state, alias) {
-                keys.insert(key);
+    fn read_argument<'ctx>(
+        &self,
+        state: &SymState<'ctx>,
+        index: usize,
+    ) -> Option<SymValue<'ctx>> {
+        match &self.registers {
+            CallConvRegisters::AdvisoryNames { argument_names, .. } => argument_names
+                .get(index)
+                .map(|name| self.read_named_register(state, name)),
+            CallConvRegisters::SourceOwned {
+                argument_storages,
+                register_storages_by_name,
+                ..
+            } => argument_storages.get(index).map(|storage| {
+                source_state_key(state, register_storages_by_name, *storage)
+                    .map(|key| state.get_register_sized(&key, self.arg_bits))
+                    .unwrap_or_else(|| SymValue::unknown(self.arg_bits))
+            }),
+        }
+    }
+
+    fn argument_state_key<'ctx>(
+        &self,
+        state: &SymState<'ctx>,
+        index: usize,
+    ) -> Option<String> {
+        match &self.registers {
+            CallConvRegisters::AdvisoryNames { argument_names, .. } => {
+                let name = argument_names.get(index)?;
+                Some(
+                    find_register_key(state, name)
+                        .unwrap_or_else(|| format!("{}_0", name.to_ascii_uppercase())),
+                )
+            }
+            CallConvRegisters::SourceOwned {
+                argument_storages,
+                register_storages_by_name,
+                ..
+            } => {
+                let storage = *argument_storages.get(index)?;
+                source_state_key(state, register_storages_by_name, storage).or_else(|| {
+                    source_presentation_name(register_storages_by_name, storage)
+                        .map(|name| format!("{}_0", name.to_ascii_uppercase()))
+                })
             }
         }
-        if keys.is_empty() {
-            keys.insert(format!("{}_0", self.ret_register));
-        }
+    }
+
+    pub(crate) fn write_return<'ctx>(&self, state: &mut SymState<'ctx>, value: SymValue<'ctx>) {
+        let keys = match &self.registers {
+            CallConvRegisters::AdvisoryNames { result_name, .. } => {
+                let mut keys = BTreeSet::new();
+                for alias in register_aliases(result_name) {
+                    if let Some(key) = find_register_key(state, alias) {
+                        keys.insert(key);
+                    }
+                }
+                if keys.is_empty() {
+                    keys.insert(format!("{result_name}_0"));
+                }
+                keys
+            }
+            CallConvRegisters::SourceOwned {
+                result_storage,
+                register_storages_by_name,
+                ..
+            } => {
+                let mut keys =
+                    source_state_keys(state, register_storages_by_name, *result_storage);
+                if keys.is_empty()
+                    && let Some(name) =
+                        source_presentation_name(register_storages_by_name, *result_storage)
+                {
+                    keys.insert(format!("{}_0", name.to_ascii_uppercase()));
+                }
+                keys
+            }
+        };
         for key in keys {
             let key_bits = state
                 .registers()
@@ -284,11 +430,28 @@ impl CallConv {
     }
 
     pub(crate) fn arg_register_name(&self, index: usize) -> Option<&str> {
-        self.arg_registers.get(index).map(String::as_str)
+        match &self.registers {
+            CallConvRegisters::AdvisoryNames { argument_names, .. } => {
+                argument_names.get(index).map(String::as_str)
+            }
+            CallConvRegisters::SourceOwned {
+                argument_storages,
+                register_storages_by_name,
+                ..
+            } => argument_storages.get(index).and_then(|storage| {
+                source_presentation_name(register_storages_by_name, *storage)
+            }),
+        }
     }
 
     pub(crate) fn arg_capacity(&self) -> usize {
-        self.arg_registers.len()
+        match &self.registers {
+            CallConvRegisters::AdvisoryNames { argument_names, .. } => argument_names.len(),
+            CallConvRegisters::SourceOwned {
+                argument_storages,
+                ..
+            } => argument_storages.len(),
+        }
     }
 
     pub(crate) fn arg_bits(&self) -> u32 {
@@ -299,56 +462,89 @@ impl CallConv {
         self.ret_bits
     }
 
-    pub(crate) fn ret_register_name(&self) -> &str {
-        &self.ret_register
+    pub(crate) fn ret_register_name(&self) -> Option<&str> {
+        match &self.registers {
+            CallConvRegisters::AdvisoryNames { result_name, .. } => Some(result_name),
+            CallConvRegisters::SourceOwned {
+                result_storage,
+                register_storages_by_name,
+                ..
+            } => source_presentation_name(register_storages_by_name, *result_storage),
+        }
     }
 
     pub(crate) fn return_value<'ctx>(&self, state: &SymState<'ctx>) -> SymValue<'ctx> {
-        self.read_register(state, &self.ret_register)
+        match &self.registers {
+            CallConvRegisters::AdvisoryNames { result_name, .. } => {
+                self.read_named_register(state, result_name)
+            }
+            CallConvRegisters::SourceOwned {
+                result_storage,
+                register_storages_by_name,
+                ..
+            } => source_state_key(state, register_storages_by_name, *result_storage)
+                .map(|key| state.get_register_sized(&key, self.ret_bits))
+                .unwrap_or_else(|| SymValue::unknown(self.ret_bits)),
+        }
+    }
+
+    pub(crate) fn result_storage(&self) -> Option<CanonicalStorageId> {
+        match &self.registers {
+            CallConvRegisters::AdvisoryNames { .. } => None,
+            CallConvRegisters::SourceOwned { result_storage, .. } => Some(*result_storage),
+        }
+    }
+
+    #[cfg(test)]
+    fn argument_storage(&self, index: usize) -> Option<CanonicalStorageId> {
+        match &self.registers {
+            CallConvRegisters::AdvisoryNames { .. } => None,
+            CallConvRegisters::SourceOwned {
+                argument_storages,
+                ..
+            } => argument_storages.get(index).copied(),
+        }
     }
 }
 
-const SOURCE_ABI_VARIANT_PREFIX: &str = "r2sym-source-abi-v1:";
-const SOURCE_ABI_UNAVAILABLE_VARIANT: &str = "r2sym-source-abi-v1:unavailable";
-
-fn source_owned_callconv_from_arch_projection(arch: &ArchSpec) -> Option<Option<CallConv>> {
-    if arch.variant == SOURCE_ABI_UNAVAILABLE_VARIANT {
-        return Some(None);
-    }
-    let payload = arch.variant.strip_prefix(SOURCE_ABI_VARIANT_PREFIX)?;
-    let mut fields = payload.split(';');
-    let arguments = fields.next()?.strip_prefix("args=")?;
-    let arg_bits = fields.next()?.strip_prefix("argbits=")?.parse().ok()?;
-    let ret_register = fields.next()?.strip_prefix("ret=")?.trim();
-    let ret_bits = fields.next()?.strip_prefix("retbits=")?.parse().ok()?;
-    if fields.next().is_some() || arg_bits == 0 || ret_bits == 0 {
-        return Some(None);
-    }
-    if ret_register.is_empty() {
-        return Some(None);
-    }
-    let arg_registers = arguments
-        .split(',')
-        .filter(|name| !name.is_empty())
-        .map(str::to_string)
-        .collect::<Vec<_>>();
-    Some(Some(CallConv {
-        arg_registers,
-        ret_register: ret_register.to_string(),
-        arg_bits,
-        ret_bits,
-    }))
-}
-
-fn source_register_name(prepared: &SsaArtifact, storage: CanonicalStorageId) -> Option<String> {
-    prepared
-        .machine_context()
-        .register_storages_by_name()
+fn source_presentation_name(
+    register_storages_by_name: &BTreeMap<String, CanonicalStorageId>,
+    storage: CanonicalStorageId,
+) -> Option<&str> {
+    register_storages_by_name
         .iter()
         .filter(|(_, candidate)| **candidate == storage)
         .map(|(name, _)| name)
-        .cloned()
         .min()
+        .map(String::as_str)
+}
+
+fn source_state_keys<'ctx>(
+    state: &SymState<'ctx>,
+    register_storages_by_name: &BTreeMap<String, CanonicalStorageId>,
+    storage: CanonicalStorageId,
+) -> BTreeSet<String> {
+    register_storages_by_name
+        .iter()
+        .filter(|(_, candidate)| **candidate == storage)
+        .filter_map(|(name, _)| find_register_key(state, name))
+        .collect()
+}
+
+fn source_state_key<'ctx>(
+    state: &SymState<'ctx>,
+    register_storages_by_name: &BTreeMap<String, CanonicalStorageId>,
+    storage: CanonicalStorageId,
+) -> Option<String> {
+    source_state_keys(state, register_storages_by_name, storage)
+        .into_iter()
+        .max_by(|left, right| {
+            let left_version = split_version(left).map(|(_, version)| version).unwrap_or(0);
+            let right_version = split_version(right)
+                .map(|(_, version)| version)
+                .unwrap_or(0);
+            left_version.cmp(&right_version).then_with(|| left.cmp(right))
+        })
 }
 
 fn source_endianness(endianness: MachineMemoryEndianness) -> Option<Endianness> {
@@ -419,37 +615,6 @@ pub(crate) fn source_arch_spec(prepared: &SsaArtifact) -> Option<ArchSpec> {
         .filter(|(_, storage)| storage.space == CanonicalStorageSpace::Register)
         .map(|(name, storage)| RegisterDef::new(name.clone(), storage.offset, storage.size))
         .collect();
-
-    let abi = context.abi_model();
-    arch.variant = if abi.is_available() && abi.is_coherent() {
-        let argument_slots = abi.argument_registers();
-        let arguments = argument_slots
-            .iter()
-            .map(|slot| source_register_name(prepared, slot.storage()))
-            .collect::<Option<Vec<_>>>()?;
-        let arg_bits = match argument_slots.first() {
-            Some(slot) => slot.storage().size.checked_mul(8)?,
-            None => address_bits,
-        };
-        if argument_slots
-            .iter()
-            .any(|slot| slot.storage().size.checked_mul(8) != Some(arg_bits))
-        {
-            return None;
-        }
-        let Some(returned_slot) = abi.return_registers().first() else {
-            arch.variant = SOURCE_ABI_UNAVAILABLE_VARIANT.to_string();
-            return Some(arch);
-        };
-        let returned = source_register_name(prepared, returned_slot.storage())?;
-        let ret_bits = returned_slot.storage().size.checked_mul(8)?;
-        format!(
-            "{SOURCE_ABI_VARIANT_PREFIX}args={};argbits={arg_bits};ret={returned};retbits={ret_bits}",
-            arguments.join(",")
-        )
-    } else {
-        SOURCE_ABI_UNAVAILABLE_VARIANT.to_string()
-    };
     Some(arch)
 }
 
@@ -849,8 +1014,7 @@ impl<'ctx> SummaryRegistry<'ctx> {
         prepared: &SsaArtifact,
         profile: SummaryProfile,
     ) -> Option<Self> {
-        let arch = source_arch_spec(prepared)?;
-        Some(Self::with_profile(CallConv::for_arch_spec(&arch)?, profile))
+        Some(Self::with_profile(CallConv::for_prepared(prepared)?, profile))
     }
 
     /// Create a registry using symbol-map environment hints when the architecture is ambiguous.
@@ -1572,9 +1736,7 @@ fn derive_symbolic_summary_for_function<'ctx>(
     let pointer_inputs = collect_pointer_memory_windows(static_summary);
 
     for index in 0..registry.callconv.arg_capacity() {
-        if let Some(reg) = registry.callconv.arg_register_name(index) {
-            let key = find_register_key(&state, reg)
-                .unwrap_or_else(|| format!("{}_0", reg.to_ascii_uppercase()));
+        if let Some(key) = registry.callconv.argument_state_key(&state, index) {
             let arg_bits = static_summary_arg_bits(&registry.callconv);
             if let Some(window) = pointer_inputs.get(&index).copied() {
                 let ptr_base = helper_arg_region_base(function.id, index);
@@ -1693,7 +1855,20 @@ fn derive_symbolic_summary_for_function<'ctx>(
 }
 
 fn function_defines_return_value(function: &ScopedPreparedFunction, callconv: &CallConv) -> bool {
-    let aliases = register_aliases(callconv.ret_register_name());
+    if let Some(result_storage) = callconv.result_storage() {
+        return function.prepared.blocks().any(|block| {
+            block.ops.iter().any(|op| {
+                op.dst().is_some_and(|dst| {
+                    function.prepared.graph().canonical_storage_for_var(dst)
+                        == Some(result_storage)
+                })
+            })
+        });
+    }
+    let Some(result_name) = callconv.ret_register_name() else {
+        return false;
+    };
+    let aliases = register_aliases(result_name);
     function.prepared.blocks().any(|block| {
         block.ops.iter().any(|op| {
             op.dst().is_some_and(|dst| {
@@ -3331,6 +3506,52 @@ mod tests {
         arch
     }
 
+    fn exact_callconv_artifact() -> SsaArtifact {
+        let mut arch = ArchSpec::new("x86-64");
+        arch.addr_size = 8;
+        for (name, offset, size) in [
+            ("RDI", 0x00, 8),
+            ("EDI", 0x00, 4),
+            ("RAX", 0x08, 8),
+            ("EAX", 0x08, 4),
+            ("RSP", 0x10, 8),
+            ("RIP", 0x18, 8),
+        ] {
+            arch.add_register(RegisterDef::new(name, offset, size));
+        }
+        let storage = |offset, size| CanonicalStorageId {
+            space: CanonicalStorageSpace::Register,
+            offset,
+            size,
+        };
+        let interface = r2ssa::SourceFunctionInterface::new_exact(
+            b"r2sym-exact-callconv-owner".to_vec(),
+            "exact-test-abi",
+            [r2ssa::SourceAbiParameterSpec::new(0, storage(0x00, 8))],
+            r2ssa::SourceFunctionReturn::Register {
+                storage: storage(0x08, 8),
+            },
+            std::iter::empty::<r2ssa::SourceStackSlotSpec>(),
+        )
+        .and_then(|interface| interface.with_stack_pointer_storage(storage(0x10, 8)))
+        .and_then(|interface| interface.with_return_address_storage(storage(0x18, 8)))
+        .expect("exact callconv interface");
+        SsaArtifact::for_decompile_with_interface(
+            &[R2ILBlock {
+                addr: 0x401000,
+                size: 1,
+                ops: vec![R2ILOp::Return {
+                    target: const_vn(0, 8),
+                }],
+                switch_info: None,
+                op_metadata: Default::default(),
+            }],
+            Some(&arch),
+            interface,
+        )
+        .expect("exact callconv artifact")
+    }
+
     fn exact_interproc_artifact(addr: u64, ops: Vec<R2ILOp>) -> Arc<SsaArtifact> {
         let arch = exact_interproc_arch();
         let storage = |offset| r2ssa::CanonicalStorageId {
@@ -3689,6 +3910,101 @@ mod tests {
     }
 
     #[test]
+    fn prepared_callconv_retains_storage_identity_without_arch_variant_encoding() {
+        let prepared = exact_callconv_artifact();
+        let argument = CanonicalStorageId {
+            space: CanonicalStorageSpace::Register,
+            offset: 0x00,
+            size: 8,
+        };
+        let result = CanonicalStorageId {
+            space: CanonicalStorageSpace::Register,
+            offset: 0x08,
+            size: 8,
+        };
+
+        let projected = source_arch_spec(&prepared).expect("source presentation profile");
+        let callconv = CallConv::for_prepared(&prepared).expect("exact source-owned callconv");
+
+        assert_eq!(projected.variant, "default");
+        assert_eq!(callconv.argument_storage(0), Some(argument));
+        assert_eq!(callconv.result_storage(), Some(result));
+        assert!(
+            SummaryRegistry::with_profile_for_prepared(
+                &prepared,
+                SummaryProfile::PathListing,
+            )
+            .is_some()
+        );
+    }
+
+    #[test]
+    fn prepared_callconv_projects_state_keys_only_after_storage_selection() {
+        let prepared = exact_callconv_artifact();
+        let callconv = CallConv::for_prepared(&prepared).expect("exact source-owned callconv");
+        let ctx = z3::Context::thread_local();
+        let mut state = SymState::new(&ctx, prepared.entry);
+
+        state.set_register("EDI_7", SymValue::concrete(0x11, 32));
+        state.set_register("EAX_9", SymValue::concrete(0x22, 32));
+        assert!(callconv.collect_call_info(&state, 1).args[0].is_unknown());
+        assert!(callconv.return_value(&state).is_unknown());
+
+        state.set_register("RDI_3", SymValue::concrete(0x33, 64));
+        state.set_register("RAX_4", SymValue::concrete(0x44, 64));
+        assert_eq!(
+            callconv.collect_call_info(&state, 1).args[0].as_concrete(),
+            Some(0x33)
+        );
+        assert_eq!(callconv.return_value(&state).as_concrete(), Some(0x44));
+
+        callconv.write_return(&mut state, SymValue::concrete(0x55, 64));
+        assert_eq!(
+            state.registers().get("RAX_4").and_then(SymValue::as_concrete),
+            Some(0x55)
+        );
+        assert_eq!(
+            state.registers().get("EAX_9").and_then(SymValue::as_concrete),
+            Some(0x22)
+        );
+    }
+
+    #[test]
+    fn source_owned_callconv_keeps_storage_when_no_presentation_alias_exists() {
+        let argument = CanonicalStorageId {
+            space: CanonicalStorageSpace::Register,
+            offset: 0x20,
+            size: 8,
+        };
+        let result = CanonicalStorageId {
+            space: CanonicalStorageSpace::Register,
+            offset: 0x28,
+            size: 8,
+        };
+        let callconv = CallConv {
+            registers: CallConvRegisters::SourceOwned {
+                argument_storages: vec![argument],
+                result_storage: result,
+                register_storages_by_name: BTreeMap::new(),
+            },
+            arg_bits: 64,
+            ret_bits: 64,
+        };
+        let ctx = z3::Context::thread_local();
+        let mut state = SymState::new(&ctx, 0x401000);
+
+        assert_eq!(callconv.argument_storage(0), Some(argument));
+        assert_eq!(callconv.result_storage(), Some(result));
+        assert_eq!(callconv.arg_register_name(0), None);
+        assert_eq!(callconv.ret_register_name(), None);
+        assert!(callconv.collect_call_info(&state, 1).args[0].is_unknown());
+        assert!(callconv.return_value(&state).is_unknown());
+
+        callconv.write_return(&mut state, SymValue::concrete(7, 64));
+        assert!(state.registers().is_empty());
+    }
+
+    #[test]
     fn imported_names_do_not_select_a_detached_calling_convention() {
         let arch = test_arch();
         let imported = HashMap::from([(0x2000, "kernel32.dll_VirtualAlloc".to_string())]);
@@ -3698,8 +4014,7 @@ mod tests {
         let without_import =
             CallConv::for_arch_spec_and_symbols(&arch, &empty).expect("x86 callconv");
 
-        assert_eq!(with_import.arg_registers, without_import.arg_registers);
-        assert_eq!(with_import.ret_register, without_import.ret_register);
+        assert_eq!(with_import.registers, without_import.registers);
     }
 
     #[test]
