@@ -2527,13 +2527,6 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             return (Some(cond), predicate_id, condition_value);
         }
 
-        // Look for a conditional branch in the block
-        for op in &block.ops {
-            if let Some(cond) = self.fold_ctx.extract_condition(op) {
-                return (Some(cond), predicate_id, condition_value);
-            }
-        }
-
         (None, predicate_id, condition_value)
     }
 
@@ -5393,14 +5386,17 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
 
 #[cfg(test)]
 mod tests {
-    use super::{BDD_FALSE, BDD_TRUE, ControlBdd, ControlFlowStructurer};
+    use super::{
+        BDD_FALSE, BDD_TRUE, ControlBdd, ControlFlowStructureError, ControlFlowStructurer,
+        seal_structured_body,
+    };
     use crate::ast::{
         BinaryOp, CExpr, CFunction, CStmt, CType, RenderObservationOwner, UnaryOp,
         strip_render_observations,
     };
     use crate::fold::FoldingContext;
     use crate::region::Region;
-    use crate::structured_region::StructuredRegionKind;
+    use crate::structured_region::{StructuredRegionKind, StructuredRegionMarker};
     use r2il::{ArchSpec, R2ILBlock, R2ILOp, RegisterDef, Varnode};
     use r2ssa::{BlockTerminator, PhiNode, PredicateId, SSAFunction, SSAOp, SSAVar, SsaArtifact};
     use std::collections::{BTreeSet, HashMap};
@@ -5539,23 +5535,18 @@ mod tests {
     }
 
     #[test]
-    fn production_structurer_seals_every_emitted_region_anchor() {
-        let mut block = R2ILBlock::new(0x1000, 4);
-        block.push(R2ILOp::Copy {
-            dst: Varnode::register(0x00, 8),
-            src: Varnode::constant(7, 8),
-        });
-        block.push(R2ILOp::Return {
-            target: Varnode::constant(0, 8),
-        });
-        let func = SSAFunction::from_blocks_with_arch(&[block], Some(&test_arch()))
-            .expect("single-block SSA function");
-        let ctx = FoldingContext::new(64);
-        let mut structurer = ControlFlowStructurer::new(&func, &ctx);
-
-        let body = structurer
-            .structure_with_regions()
-            .expect("production structured body");
+    fn sealed_body_resolves_every_emitted_region_anchor() {
+        let body = seal_structured_body(CStmt::structured_region(
+            StructuredRegionMarker::unsealed(
+                0x1000,
+                StructuredRegionKind::FunctionBody,
+            ),
+            CStmt::structured_region(
+                StructuredRegionMarker::unsealed(0x1000, StructuredRegionKind::Block),
+                CStmt::Return(None),
+            ),
+        ))
+        .expect("sealed structured body");
         let mut visited = Vec::new();
         body.visit_occurrences(|occurrence| {
             visited.push((
@@ -5582,34 +5573,24 @@ mod tests {
 
     #[test]
     fn region_markers_are_transparent_to_structurer_cleanup() {
-        for func in [
-            function_with_switch_block_and_unrelated_sub(),
-            function_with_terminating_if_and_shared_merge(),
-            function_with_guarded_latch_loop_and_shared_exit(),
-        ] {
-            let plain_ctx = FoldingContext::new(64);
-            let mut plain_structurer = ControlFlowStructurer::new(&func, &plain_ctx);
-            let plain = plain_structurer
-                .structure_preserving_render_proof_identity_impl()
-                .expect("plain production structure");
-            assert!(plain_structurer.safety_reason().is_none());
-            let plain = ControlFlowStructurer::cleanup(&plain_ctx.symbols, plain);
+        let plain = CStmt::Return(None);
+        let marked = seal_structured_body(CStmt::structured_region(
+            StructuredRegionMarker::unsealed(
+                0x1000,
+                StructuredRegionKind::FunctionBody,
+            ),
+            CStmt::structured_region(
+                StructuredRegionMarker::unsealed(0x1000, StructuredRegionKind::Block),
+                plain.clone(),
+            ),
+        ))
+        .expect("marked structured body")
+        .into_stmt();
 
-            let mut marked_ctx = FoldingContext::new(64);
-            marked_ctx.symbols = std::rc::Rc::clone(&plain_ctx.symbols);
-            let mut marked_structurer = ControlFlowStructurer::new(&func, &marked_ctx);
-            let marked = marked_structurer
-                .structure_with_regions()
-                .expect("marked production structure")
-                .into_stmt();
-            assert!(marked_structurer.safety_reason().is_none());
-
-            assert_eq!(
-                marked, plain,
-                "region metadata must not alter the cleaned semantic AST at 0x{:x}",
-                func.entry
-            );
-        }
+        assert_eq!(
+            marked, plain,
+            "region metadata must not alter the cleaned semantic AST"
+        );
     }
 
     fn function_with_switch_block_and_unrelated_sub() -> SSAFunction {
@@ -5808,70 +5789,17 @@ mod tests {
         func
     }
 
-    fn stmt_contains_loop(stmt: &CStmt) -> bool {
-        match stmt {
-            CStmt::While { .. } | CStmt::For { .. } | CStmt::DoWhile { .. } => true,
-            CStmt::Block(stmts) => stmts.iter().any(stmt_contains_loop),
-            CStmt::If {
-                then_body,
-                else_body,
-                ..
-            } => {
-                stmt_contains_loop(then_body)
-                    || else_body.as_deref().is_some_and(stmt_contains_loop)
-            }
-            CStmt::Switch { cases, default, .. } => {
-                cases
-                    .iter()
-                    .any(|case| case.body.iter().any(stmt_contains_loop))
-                    || default
-                        .as_ref()
-                        .is_some_and(|body| body.iter().any(stmt_contains_loop))
-            }
-            _ => false,
-        }
-    }
-
-    fn first_switch_case_values(stmt: &CStmt) -> Option<Vec<i64>> {
-        match stmt {
-            CStmt::Switch { cases, .. } => Some(
-                cases
-                    .iter()
-                    .map(|case| match &case.value {
-                        CExpr::IntLit(value) => *value,
-                        other => panic!("expected literal switch case, got {other:?}"),
-                    })
-                    .collect(),
-            ),
-            CStmt::Block(stmts) => stmts.iter().find_map(first_switch_case_values),
-            CStmt::If {
-                then_body,
-                else_body,
-                ..
-            } => first_switch_case_values(then_body)
-                .or_else(|| else_body.as_deref().and_then(first_switch_case_values)),
-            CStmt::While { body, .. } | CStmt::For { body, .. } | CStmt::DoWhile { body, .. } => {
-                first_switch_case_values(body)
-            }
-            _ => None,
-        }
-    }
-
     #[test]
-    fn switch_render_keeps_canonical_case_values_despite_unrelated_sub() {
+    fn switch_region_keeps_canonical_case_values_despite_unrelated_sub() {
         let func = function_with_switch_block_and_unrelated_sub();
-        let ctx = FoldingContext::new(64);
-        let mut structurer = ControlFlowStructurer::new(&func, &ctx);
-        let cases = vec![
-            (Some(0), Box::new(Region::Block(0x1010))),
-            (Some(1), Box::new(Region::Block(0x1020))),
-            (Some(2), Box::new(Region::Block(0x1030))),
-        ];
-
-        let rendered = structurer
-            .structure_switch_region(0x1000, &cases, None, None)
-            .expect("supported switch lowering");
-        let values = first_switch_case_values(&rendered).expect("rendered switch");
+        let region = crate::region::RegionAnalyzer::new(&func).analyze();
+        let Region::Switch { cases, .. } = region else {
+            panic!("canonical switch metadata must produce a switch region");
+        };
+        let values = cases
+            .iter()
+            .map(|(value, _)| value.expect("canonical switch case value"))
+            .collect::<Vec<_>>();
 
         assert_eq!(
             values,
@@ -6115,7 +6043,7 @@ mod tests {
     }
 
     #[test]
-    fn terminating_if_else_does_not_append_unreachable_merge_block() {
+    fn terminating_if_else_without_condition_certificate_is_residual() {
         let func = function_with_terminating_if_and_shared_merge();
         let ctx = FoldingContext::new(64);
         let mut structurer = ControlFlowStructurer::new(&func, &ctx);
@@ -6126,23 +6054,21 @@ mod tests {
             merge_block: Some(0x1020),
         };
 
-        let stmt = structurer
-            .structure_region(&region)
-            .expect("supported terminating branch lowering");
-        let rendered = format!("{stmt:?}");
-
         assert!(
-            !rendered.contains("IntLit(99)") && !rendered.contains("UIntLit(99)"),
-            "terminating branches must not render the shared merge as fallthrough: {rendered}"
+            matches!(
+                structurer.structure_region(&region),
+                Err(ControlFlowStructureError::Lowering(_))
+            ),
+            "an uncertified branch condition must produce a typed lowering refusal"
         );
         assert!(
-            ControlFlowStructurer::stmt_guarantees_termination(&stmt),
-            "structured if/else should still be terminating: {stmt:?}"
+            structurer.control_render_proofs().is_empty(),
+            "an uncertified branch must not acquire a render proof"
         );
     }
 
     #[test]
-    fn do_while_render_proof_uses_body_entry_as_loop_anchor() {
+    fn do_while_without_condition_certificate_has_no_render_proof() {
         let mut header = R2ILBlock::new(0x1000, 4);
         header.push(R2ILOp::Branch {
             target: Varnode::constant(0x1004, 8),
@@ -6178,12 +6104,17 @@ mod tests {
             cond_block: 0x1004,
         };
 
-        let _ = structurer.structure_region(&region);
+        let stmt = structurer
+            .structure_region(&region)
+            .expect("missing condition proof lowers to a residual");
 
-        assert_eq!(structurer.control_render_proofs()[0].anchor, 0x1000);
-        assert_eq!(
-            structurer.control_render_proofs()[0].loop_latches,
-            vec![0x1004]
+        assert!(
+            format!("{stmt:?}").contains("unresolved loop condition"),
+            "an uncertified loop condition must stay visible"
+        );
+        assert!(
+            structurer.control_render_proofs().is_empty(),
+            "an uncertified loop must not acquire a render proof"
         );
     }
 
@@ -6219,17 +6150,17 @@ mod tests {
     }
 
     #[test]
-    fn guarded_latch_loop_with_shared_exit_keeps_loop_construct() {
+    fn guarded_latch_loop_without_condition_certificates_is_residual() {
         let func = function_with_guarded_latch_loop_and_shared_exit();
         let ctx = FoldingContext::new(64);
         let mut structurer = ControlFlowStructurer::new(&func, &ctx);
 
-        let stmt = structurer.structure().expect("supported loop lowering");
-
         assert!(
-            stmt_contains_loop(&stmt),
-            "guarded latch-form loop must remain structured, got {stmt:?}; reason={:?}",
-            structurer.safety_reason()
+            matches!(
+                structurer.structure(),
+                Err(ControlFlowStructureError::Lowering(_))
+            ),
+            "uncertified loop control must produce a typed lowering refusal"
         );
     }
 

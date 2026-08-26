@@ -313,267 +313,40 @@ impl<'a> FoldingContext<'a> {
     }
 
     pub fn extract_condition_from_block(&self, block: &FunctionSSABlock) -> Option<CExpr> {
-        let (branch_idx, cond) = block
-            .ops
-            .iter()
-            .enumerate()
-            .rev()
-            .find_map(|(idx, op)| match op {
-                SSAOp::CBranch { cond, .. } => Some((idx, cond)),
-                _ => None,
-            })?;
-        if self.inputs.prepared_ssa.is_some() {
-            self.certified_branch_condition_from_block(block)?;
-            return self.exact_branch_input_expr(block.addr, branch_idx);
-        }
-        let prepared_branch_candidate = self.prepared_branch_condition_expr(block.addr);
-        let prepared_block_candidate =
-            self.prepared_predicate_candidate_for_branch_block(block.addr, cond);
-        let prepared_var_candidate = self.prepared_predicate_candidate_for_var(cond);
-
-        let prev_block_addr = self.current_block_addr.replace(Some(block.addr));
-        let prev_op_idx = self.current_op_idx.replace(Some(branch_idx));
-        let local_branch_candidate = self.local_branch_condition_expr(block, branch_idx, cond, 0);
-        let strong_prepared = [
-            local_branch_candidate,
-            prepared_block_candidate.clone(),
-            prepared_var_candidate.clone(),
-            prepared_branch_candidate.clone(),
-        ]
-        .into_iter()
-        .flatten()
-        .find_map(|expr| {
-            let finalized = self.finalize_condition_expr(expr);
-            (!self.is_degenerate_constant_condition(&finalized)
-                && !self.prepared_candidate_needs_legacy_compare_help(&finalized))
-            .then_some(finalized)
-        });
-        self.current_block_addr.set(prev_block_addr);
-        self.current_op_idx.set(prev_op_idx);
-        if strong_prepared.is_some() {
-            return self.exact_branch_input_expr(block.addr, branch_idx);
-        }
-
-        let allow_legacy_flag_provenance = ![
-            prepared_branch_candidate.as_ref(),
-            prepared_block_candidate.as_ref(),
-            prepared_var_candidate.as_ref(),
-        ]
-        .into_iter()
-        .flatten()
-        .any(|expr| !self.prepared_candidate_needs_legacy_compare_help(expr));
-
-        let prev_block_addr = self.current_block_addr.replace(Some(block.addr));
-        let prev_op_idx = self.current_op_idx.replace(Some(branch_idx));
-
-        let mut result = None;
-        {
-            let mut consider = |candidate: Option<CExpr>| {
-                if let Some(expr) = candidate {
-                    let finalized = self.finalize_condition_expr(expr);
-                    if !self.is_degenerate_constant_condition(&finalized) {
-                        if let Some(current) = result.as_ref()
-                            && self.structured_predicate_candidate_should_win(current, &finalized)
-                        {
-                            result = Some(finalized);
-                            return;
-                        }
-                        if result.as_ref().is_some_and(|current| {
-                            self.prepared_candidate_needs_legacy_compare_help(current)
-                                && !self.prepared_candidate_needs_legacy_compare_help(&finalized)
-                        }) {
-                            result = Some(finalized);
-                            return;
-                        }
-                        result = self
-                            .choose_preferred_scalar_predicate_expr(result.take(), Some(finalized));
-                    }
-                }
-            };
-
-            consider(prepared_branch_candidate);
-            consider(prepared_block_candidate);
-            consider(prepared_var_candidate);
-        }
-        if result.is_some() && !allow_legacy_flag_provenance {
-            let result = result.map(|expr| self.finalize_condition_expr(expr));
-            self.current_block_addr.set(prev_block_addr);
-            self.current_op_idx.set(prev_op_idx);
-            if result.is_some() {
-                return self.exact_branch_input_expr(block.addr, branch_idx);
-            }
-            return None;
-        }
-        {
-            let mut consider = |candidate: Option<CExpr>| {
-                if let Some(expr) = candidate {
-                    let finalized = self.finalize_condition_expr(expr);
-                    if !self.is_degenerate_constant_condition(&finalized) {
-                        if let Some(current) = result.as_ref()
-                            && self.structured_predicate_candidate_should_win(current, &finalized)
-                        {
-                            result = Some(finalized);
-                            return;
-                        }
-                        result = self
-                            .choose_preferred_scalar_predicate_expr(result.take(), Some(finalized));
-                    }
-                }
-            };
-
-            consider(self.local_branch_condition_expr(block, branch_idx, cond, 0));
-            if allow_legacy_flag_provenance {
-                consider(self.branch_compare_provenance_expr(block, branch_idx, cond, 0));
-                let cond_name = cond.display_name();
-                if let Some(prov) = self.lookup_flag_compare_provenance(&cond_name) {
-                    consider(self.compare_provenance_expr_for_branch(&prov));
-                }
-            }
-        }
-
-        let fallback = self.finalize_condition_expr(self.get_condition_expr(cond)?);
-        let result = match result {
-            Some(current) => {
-                if self.structured_predicate_candidate_should_win(&fallback, &current) {
-                    Some(current)
-                } else if self.structured_predicate_candidate_should_win(&current, &fallback) {
-                    Some(fallback)
-                } else if self.prepared_candidate_needs_legacy_compare_help(&fallback)
-                    && !self.prepared_candidate_needs_legacy_compare_help(&current)
-                {
-                    Some(current)
-                } else {
-                    self.choose_preferred_scalar_predicate_expr(
-                        Some(current),
-                        Some(fallback.clone()),
-                    )
-                    .or(Some(fallback))
-                }
-            }
-            None => Some(fallback),
-        };
-        let result = result.map(|expr| self.finalize_condition_expr(expr));
-
-        self.current_block_addr.set(prev_block_addr);
-        self.current_op_idx.set(prev_op_idx);
-        result?;
-        self.exact_branch_input_expr(block.addr, branch_idx)
+        self.certified_branch_condition_from_block(block)
+            .map(|(expr, _, _)| expr)
     }
 
     pub(super) fn certified_branch_condition_from_block(
         &self,
         block: &FunctionSSABlock,
     ) -> Option<(CExpr, r2ssa::PredicateId, r2ssa::ValueId)> {
-        let cond = block.ops.iter().rev().find_map(|op| match op {
-            SSAOp::CBranch { cond, .. } => Some(cond),
-            _ => None,
-        })?;
+        let (branch_idx, cond) =
+            block
+                .ops
+                .iter()
+                .enumerate()
+                .rev()
+                .find_map(|(idx, op)| match op {
+                    SSAOp::CBranch { cond, .. } => Some((idx, cond)),
+                    _ => None,
+                })?;
         let predicate = self.control_facts()?.branch_for_block(block.addr)?;
         if self.prepared_value_id_for_var(cond) != Some(predicate.condition) {
             return None;
         }
-        let comparison = self.prepared_predicate_comparison_at_block(predicate, block.addr);
-        if std::env::var_os("R2SLEIGH_DEBUG_MERGES").is_some() {
-            let var_of = |value: r2ssa::ValueId| {
-                self.inputs
-                    .prepared_ssa
-                    .and_then(|prepared| prepared.graph().value(value))
-                    .map(|value| value.var.display_name())
-                    .unwrap_or_default()
-            };
-            if let Some(fact) = comparison {
-                eprintln!(
-                    "PREDCMP block={:#x} kind={:?} lhs={:?}({}) rhs={:?}({})",
-                    block.addr,
-                    fact.kind,
-                    fact.lhs,
-                    var_of(fact.lhs),
-                    fact.rhs,
-                    var_of(fact.rhs),
-                );
-            }
-        }
-        let expr = comparison
-            .and_then(|comparison| {
-                self.prepared_compare_provenance_expr(comparison, Some(block.addr))
-            })?;
-        let expr = self.finalize_condition_expr(expr);
-        (!self.is_degenerate_constant_condition(&expr)).then_some((
-            expr,
-            predicate.id,
-            predicate.condition,
-        ))
+        let expr = self.exact_branch_input_expr(block.addr, branch_idx)?;
+        let expr = self.simplify_predicate_expr(expr);
+        Some((expr, predicate.id, predicate.condition))
     }
 
     pub(super) fn certified_predicate_expr_for_id(
         &self,
-        predicate_id: r2ssa::PredicateId,
+        _predicate_id: r2ssa::PredicateId,
     ) -> Option<CExpr> {
-        let predicate = self
-            .control_facts()?
-            .branch_predicates
-            .values()
-            .find(|predicate| predicate.id == predicate_id)?;
-        let expr = self
-            .prepared_predicate_comparison_at_block(predicate, predicate.block_addr)
-            .and_then(|comparison| {
-                self.prepared_compare_provenance_expr(comparison, Some(predicate.block_addr))
-            })?;
-        let expr = self.finalize_condition_expr(expr);
-        (!self.is_degenerate_constant_condition(&expr)).then_some(expr)
-    }
-
-    fn branch_compare_provenance_expr(
-        &self,
-        block: &FunctionSSABlock,
-        branch_idx: usize,
-        cond: &SSAVar,
-        depth: u32,
-    ) -> Option<CExpr> {
-        if depth > MAX_PREDICATE_OPERAND_DEPTH {
-            return None;
-        }
-
-        let cond_name = cond.display_name();
-        let allow_legacy_flag_provenance = self
-            .current_block_addr
-            .get()
-            .and_then(|block_addr| {
-                self.prepared_branch_condition_expr(block_addr)
-                    .or_else(|| {
-                        self.prepared_predicate_candidate_for_branch_block(block_addr, cond)
-                    })
-                    .or_else(|| self.prepared_predicate_candidate_for_var(cond))
-            })
-            .as_ref()
-            .map(|expr| self.prepared_candidate_needs_legacy_compare_help(expr))
-            .unwrap_or(true);
-        if allow_legacy_flag_provenance
-            && let Some(prov) = self.lookup_flag_compare_provenance(&cond_name)
-            && let Some(expr) = self.compare_provenance_expr_for_branch(&prov)
-        {
-            return Some(expr);
-        }
-
-        for (idx, op) in block.ops[..branch_idx].iter().enumerate().rev() {
-            if op.dst() != Some(cond) {
-                continue;
-            }
-
-            return match op {
-                SSAOp::Copy { src, .. }
-                | SSAOp::IntZExt { src, .. }
-                | SSAOp::IntSExt { src, .. }
-                | SSAOp::Subpiece { src, .. } => {
-                    self.branch_compare_provenance_expr(block, idx, src, depth + 1)
-                }
-                SSAOp::BoolNot { src, .. } => self
-                    .branch_compare_provenance_expr(block, idx, src, depth + 1)
-                    .map(|expr| CExpr::unary(UnaryOp::Not, expr)),
-                _ => None,
-            };
-        }
-
+        // This path has a PredicateId but no normalized branch operation, so
+        // it cannot name the exact source UseSite whose machine projection is
+        // required. Refuse rather than reconstructing the comparison operands.
         None
     }
 
@@ -585,25 +358,10 @@ impl<'a> FoldingContext<'a> {
         }
     }
 
-    pub(super) fn predicate_exprs_map(&self) -> &std::collections::HashMap<String, CExpr> {
-        &self.state.analysis_ctx.flags().predicate_exprs
-    }
-
-    pub(super) fn flag_compare_provenance_map(
-        &self,
-    ) -> &std::collections::HashMap<String, FlagCompareProvenance> {
-        &self.state.analysis_ctx.flags().compare_provenance
-    }
-
-    pub(super) fn lookup_predicate_expr(&self, name: &str) -> Option<CExpr> {
-
-        if let Some(expr) = self.predicate_exprs_map().get(name) {
-            return Some(expr.clone());
-        }
-        let lower = name.to_ascii_lowercase();
-        if let Some(expr) = self.predicate_exprs_map().get(&lower) {
-            return Some(expr.clone());
-        }
+    pub(super) fn lookup_predicate_expr(&self, _name: &str) -> Option<CExpr> {
+        // FlagInfo's spelling-keyed predicate table is intentionally not an
+        // authority surface. Native branch rendering starts from an exact
+        // FunctionControlFacts condition and its planned source UseSite.
         None
     }
 
@@ -695,6 +453,7 @@ impl<'a> FoldingContext<'a> {
         )
     }
 
+    #[cfg(test)]
     fn prepared_predicate_candidate_for_branch_block(
         &self,
         block_addr: u64,
@@ -974,319 +733,6 @@ impl<'a> FoldingContext<'a> {
         }
     }
 
-    /// Extract a condition expression from a branch operation.
-    pub fn extract_condition(&self, op: &SSAOp) -> Option<CExpr> {
-        match op {
-            SSAOp::CBranch { cond, .. } => {
-                if let Some(expr) = self.prepared_predicate_candidate_for_var(cond) {
-                    let finalized = self.finalize_condition_expr(expr);
-                    if !self.prepared_candidate_needs_legacy_compare_help(&finalized) {
-                        return Some(finalized);
-                    }
-                    return Some(
-                        self.choose_preferred_scalar_predicate_expr(
-                            Some(finalized.clone()),
-                            self.lookup_flag_compare_provenance(&cond.display_name())
-                                .and_then(|prov| self.compare_provenance_expr_for_branch(&prov))
-                                .map(|expr| self.finalize_condition_expr(expr)),
-                        )
-                        .unwrap_or(finalized),
-                    );
-                }
-                let cond_name = cond.display_name();
-                if let Some(prov) = self.lookup_flag_compare_provenance(&cond_name)
-                    && let Some(expr) = self.compare_provenance_expr_for_branch(&prov)
-                {
-                    return Some(self.finalize_condition_expr(expr));
-                }
-                let expr = self.get_condition_expr(cond)?;
-                Some(self.finalize_condition_expr(expr))
-            }
-            _ => None,
-        }
-    }
-
-    fn local_branch_condition_expr(
-        &self,
-        block: &FunctionSSABlock,
-        branch_idx: usize,
-        cond: &SSAVar,
-        depth: u32,
-    ) -> Option<CExpr> {
-        if depth > MAX_PREDICATE_OPERAND_DEPTH {
-            return None;
-        }
-
-        if let Some(value) = cond.constant_bits() {
-            return Some(constant_bits_to_expr(value));
-        }
-
-        let cond_name = cond.display_name();
-        for (idx, op) in block.ops[..branch_idx].iter().enumerate().rev() {
-            if op.dst() != Some(cond) {
-                continue;
-            }
-            return match op {
-                SSAOp::Copy { src, .. }
-                | SSAOp::IntZExt { src, .. }
-                | SSAOp::IntSExt { src, .. }
-                | SSAOp::Subpiece { src, .. } => self.choose_preferred_scalar_predicate_expr(
-                    self.local_branch_condition_expr(block, idx, src, depth + 1),
-                    self.local_expr_for_var(block, idx, src, depth + 1),
-                ),
-                SSAOp::BoolNot { src, .. } => self
-                    .choose_preferred_scalar_predicate_expr(
-                        self.local_branch_condition_expr(block, idx, src, depth + 1),
-                        self.local_expr_for_var(block, idx, src, depth + 1),
-                    )
-                    .map(|expr| CExpr::unary(UnaryOp::Not, expr)),
-                SSAOp::IntEqual { a, b, .. } => {
-                    self.local_compare_expr(block, idx, BinaryOp::Eq, a, b, depth + 1)
-                }
-                SSAOp::IntNotEqual { a, b, .. } => {
-                    self.local_compare_expr(block, idx, BinaryOp::Ne, a, b, depth + 1)
-                }
-                SSAOp::IntLess { a, b, .. } => {
-                    self.local_compare_expr(block, idx, BinaryOp::Lt, a, b, depth + 1)
-                }
-                SSAOp::IntSLess { a, b, .. } => {
-                    self.local_compare_expr(block, idx, BinaryOp::Lt, a, b, depth + 1)
-                }
-                SSAOp::IntLessEqual { a, b, .. } => {
-                    self.local_compare_expr(block, idx, BinaryOp::Le, a, b, depth + 1)
-                }
-                SSAOp::IntSLessEqual { a, b, .. } => {
-                    self.local_compare_expr(block, idx, BinaryOp::Le, a, b, depth + 1)
-                }
-                _ => None,
-            };
-        }
-
-        if let Some(prov) = self.lookup_flag_compare_provenance(&cond_name)
-            && let Some(expr) = self.compare_provenance_expr_for_branch(&prov)
-        {
-            return Some(expr);
-        }
-
-        self.predicate_candidate_for_var(cond)
-            .or_else(|| self.retain_lowering_result(self.get_expr(cond)))
-    }
-
-    fn local_compare_expr(
-        &self,
-        block: &FunctionSSABlock,
-        op_idx: usize,
-        op: BinaryOp,
-        lhs: &SSAVar,
-        rhs: &SSAVar,
-        depth: u32,
-    ) -> Option<CExpr> {
-        let compare_width = lhs.size.max(rhs.size);
-        let lhs = self.local_compare_operand_expr(block, op_idx, lhs, depth, compare_width)?;
-        let rhs = self.local_compare_operand_expr(block, op_idx, rhs, depth, compare_width)?;
-        Some(CExpr::binary(op, lhs, rhs))
-    }
-
-    fn local_compare_operand_expr(
-        &self,
-        block: &FunctionSSABlock,
-        op_idx: usize,
-        var: &SSAVar,
-        depth: u32,
-        _compare_width: u32,
-    ) -> Option<CExpr> {
-        if let Some(value) = var.constant_bits() {
-            return Some(constant_bits_to_expr(value));
-        }
-        self.local_expr_for_var(block, op_idx, var, depth)
-    }
-
-    fn local_expr_for_var(
-        &self,
-        block: &FunctionSSABlock,
-        before_idx: usize,
-        var: &SSAVar,
-        depth: u32,
-    ) -> Option<CExpr> {
-        if let Some(value) = var.constant_bits() {
-            return Some(constant_bits_to_expr(value));
-        }
-
-        let lower_name = var.name.to_ascii_lowercase();
-
-        if var.version != 0 {
-            if let Some(source) = self
-                .call_result_source_for_var(var)
-                .or_else(|| self.local_post_call_source_for_var_in_block(block, var, 0))
-            {
-                return self.predicate_owned_call_result_expr_for_source(source);
-            }
-        }
-
-        if depth > 0
-            && self.inputs.arch.is_return_register_name(&lower_name)
-            && self.local_return_register_chain_is_call_result(block, before_idx, var, 0)
-        {
-            if let Some(call_expr) = self
-                .lookup_definition(&var.display_name())
-                .filter(|expr| matches!(expr, CExpr::Call { .. }))
-            {
-                return Some(call_expr);
-            }
-            return self.retain_lowering_result(self.get_expr(var));
-        }
-
-        if depth > MAX_PREDICATE_OPERAND_DEPTH {
-            return self.retain_lowering_result(self.get_expr(var));
-        }
-
-        for (idx, op) in block.ops[..before_idx].iter().enumerate().rev() {
-            if op.dst() != Some(var) {
-                continue;
-            }
-            return match op {
-                SSAOp::Copy { src, .. }
-                | SSAOp::IntZExt { src, .. }
-                | SSAOp::IntSExt { src, .. }
-                | SSAOp::Subpiece { src, .. } => {
-                    self.local_expr_for_var(block, idx, src, depth + 1)
-                }
-                SSAOp::Load {
-                    space: r2il::SpaceId::Ram,
-                    addr,
-                    ..
-                } => self.local_load_expr(block, idx, addr, depth + 1),
-                SSAOp::Load { .. } => None,
-                SSAOp::IntEqual { a, b, .. } => {
-                    self.local_compare_expr(block, idx, BinaryOp::Eq, a, b, depth + 1)
-                }
-                SSAOp::IntNotEqual { a, b, .. } => {
-                    self.local_compare_expr(block, idx, BinaryOp::Ne, a, b, depth + 1)
-                }
-                SSAOp::IntLess { a, b, .. } => {
-                    self.local_compare_expr(block, idx, BinaryOp::Lt, a, b, depth + 1)
-                }
-                SSAOp::IntSLess { a, b, .. } => {
-                    self.local_compare_expr(block, idx, BinaryOp::Lt, a, b, depth + 1)
-                }
-                SSAOp::IntLessEqual { a, b, .. } => {
-                    self.local_compare_expr(block, idx, BinaryOp::Le, a, b, depth + 1)
-                }
-                SSAOp::IntSLessEqual { a, b, .. } => {
-                    self.local_compare_expr(block, idx, BinaryOp::Le, a, b, depth + 1)
-                }
-                SSAOp::IntAdd { a, b, .. } => {
-                    self.local_binary_expr(block, idx, BinaryOp::Add, a, b, depth + 1)
-                }
-                SSAOp::IntSub { a, b, .. } => {
-                    self.local_binary_expr(block, idx, BinaryOp::Sub, a, b, depth + 1)
-                }
-                SSAOp::IntMult { a, b, .. } => {
-                    self.local_binary_expr(block, idx, BinaryOp::Mul, a, b, depth + 1)
-                }
-                SSAOp::IntDiv { a, b, .. } | SSAOp::IntSDiv { a, b, .. } => {
-                    self.local_binary_expr(block, idx, BinaryOp::Div, a, b, depth + 1)
-                }
-                SSAOp::IntRem { a, b, .. } | SSAOp::IntSRem { a, b, .. } => {
-                    self.local_binary_expr(block, idx, BinaryOp::Mod, a, b, depth + 1)
-                }
-                SSAOp::IntAnd { a, b, .. } => {
-                    self.local_binary_expr(block, idx, BinaryOp::BitAnd, a, b, depth + 1)
-                }
-                SSAOp::IntOr { a, b, .. } => {
-                    self.local_binary_expr(block, idx, BinaryOp::BitOr, a, b, depth + 1)
-                }
-                SSAOp::IntXor { a, b, .. } => {
-                    self.local_binary_expr(block, idx, BinaryOp::BitXor, a, b, depth + 1)
-                }
-                SSAOp::IntLeft { a, b, .. } => {
-                    self.local_binary_expr(block, idx, BinaryOp::Shl, a, b, depth + 1)
-                }
-                SSAOp::IntRight { a, b, .. } | SSAOp::IntSRight { a, b, .. } => {
-                    self.local_binary_expr(block, idx, BinaryOp::Shr, a, b, depth + 1)
-                }
-                SSAOp::BoolAnd { a, b, .. } => {
-                    self.local_binary_expr(block, idx, BinaryOp::And, a, b, depth + 1)
-                }
-                SSAOp::BoolOr { a, b, .. } => {
-                    self.local_binary_expr(block, idx, BinaryOp::Or, a, b, depth + 1)
-                }
-                SSAOp::IntNot { src, .. } => self
-                    .local_expr_for_var(block, idx, src, depth + 1)
-                    .map(|expr| CExpr::unary(UnaryOp::BitNot, expr)),
-                SSAOp::IntNegate { src, .. } => self
-                    .local_expr_for_var(block, idx, src, depth + 1)
-                    .map(|expr| CExpr::unary(UnaryOp::Neg, expr)),
-                SSAOp::BoolNot { src, .. } => self
-                    .local_expr_for_var(block, idx, src, depth + 1)
-                    .map(|expr| CExpr::unary(UnaryOp::Not, expr)),
-                _ => None,
-            };
-        }
-
-        if let Some(expr) = self.lookup_definition(&var.display_name())
-            && matches!(expr, CExpr::Call { .. })
-        {
-            return Some(expr);
-        }
-
-        self.retain_lowering_result(self.get_expr(var))
-    }
-
-    fn local_return_register_chain_is_call_result(
-        &self,
-        block: &FunctionSSABlock,
-        before_idx: usize,
-        var: &SSAVar,
-        depth: u32,
-    ) -> bool {
-        if depth > MAX_PREDICATE_OPERAND_DEPTH {
-            return false;
-        }
-
-        let Some((idx, op)) = block.ops[..before_idx]
-            .iter()
-            .enumerate()
-            .rev()
-            .find(|(_, op)| op.dst() == Some(var))
-        else {
-            return false;
-        };
-
-        match op {
-            SSAOp::CallDefine { .. } => true,
-            SSAOp::Copy { src, .. }
-            | SSAOp::IntZExt { src, .. }
-            | SSAOp::IntSExt { src, .. }
-            | SSAOp::Subpiece { src, .. } => {
-                self.local_return_register_chain_is_call_result(block, idx, src, depth + 1)
-            }
-            _ => false,
-        }
-    }
-
-    fn local_binary_expr(
-        &self,
-        block: &FunctionSSABlock,
-        op_idx: usize,
-        op: BinaryOp,
-        lhs: &SSAVar,
-        rhs: &SSAVar,
-        depth: u32,
-    ) -> Option<CExpr> {
-        let lhs = if let Some(value) = lhs.constant_bits() {
-            Some(constant_bits_to_expr(value))
-        } else {
-            self.local_expr_for_var(block, op_idx, lhs, depth)
-        }?;
-        let rhs = if let Some(value) = rhs.constant_bits() {
-            Some(constant_bits_to_expr(value))
-        } else {
-            self.local_expr_for_var(block, op_idx, rhs, depth)
-        }?;
-        Some(CExpr::binary(op, lhs, rhs))
-    }
-
     fn normalize_local_branch_expr(&self, expr: CExpr) -> CExpr {
         let semantic = expr.clone_without_render_observations();
         let normalized = self.normalize_local_branch_expr_semantic(semantic);
@@ -1349,36 +795,6 @@ impl<'a> FoldingContext<'a> {
         }
     }
 
-    fn is_degenerate_constant_condition(&self, expr: &CExpr) -> bool {
-        let semantic = expr.clone_without_render_observations();
-        self.is_degenerate_constant_condition_semantic(&semantic)
-    }
-
-    fn is_degenerate_constant_condition_semantic(&self, expr: &CExpr) -> bool {
-        match expr {
-            CExpr::IntLit(_) | CExpr::UIntLit(_) => true,
-            CExpr::Paren(inner) | CExpr::Cast { expr: inner, .. } => {
-                self.is_degenerate_constant_condition_semantic(inner)
-            }
-            CExpr::Unary {
-                op: UnaryOp::Not,
-                operand,
-            } => self.is_degenerate_constant_condition_semantic(operand),
-            CExpr::Binary {
-                op:
-                    BinaryOp::Eq
-                    | BinaryOp::Ne
-                    | BinaryOp::Lt
-                    | BinaryOp::Le
-                    | BinaryOp::Gt
-                    | BinaryOp::Ge,
-                left,
-                right,
-            } => self.is_literal_expr(left) && self.is_literal_expr(right),
-            _ => false,
-        }
-    }
-
     fn strip_sub_zero_local(expr: &CExpr) -> Option<CExpr> {
         match expr {
             CExpr::Binary {
@@ -1405,89 +821,6 @@ impl<'a> FoldingContext<'a> {
             CExpr::Cast { expr: inner, .. } => Self::strip_test_self_local(inner),
             _ => None,
         }
-    }
-
-    fn local_load_expr(
-        &self,
-        block: &FunctionSSABlock,
-        op_idx: usize,
-        addr: &SSAVar,
-        depth: u32,
-    ) -> Option<CExpr> {
-        let slot = self.stack_slot_provenance_for_var(addr);
-        for (store_idx, op) in block.ops[..op_idx].iter().enumerate().rev() {
-            if let SSAOp::Store {
-                space: r2il::SpaceId::Ram,
-                addr: store_addr,
-                val,
-            } = op
-                && self.local_addrs_match(block, store_idx, store_addr, op_idx, addr, depth + 1)
-            {
-                let stored = self.local_expr_for_var(block, store_idx, val, depth + 1);
-                if slot.is_some_and(|slot| slot.is_scalar_predicate_carrier()) {
-                    if let Some(stored) = stored {
-                        return Some(stored);
-                    }
-                    let alias = self
-                        .inputs
-                        .prepared_ssa
-                        .and_then(|prepared| {
-                            prepared.object_for_var(addr, r2il::SpaceId::Ram)
-                        })
-                        .and_then(|object| self.certified_stack_var_expr_for_object(object));
-                    if alias.is_some() {
-                        return alias;
-                    }
-                    continue;
-                }
-                if let Some(stored) = stored {
-                    return Some(stored);
-                }
-                continue;
-            }
-        }
-
-        let addr_expr = self.local_expr_for_var(block, op_idx, addr, depth + 1)?;
-        if slot.is_some_and(|slot| slot.is_scalar_predicate_carrier()) {
-            return None;
-        }
-
-        Some(CExpr::deref(addr_expr))
-    }
-
-    fn local_addrs_match(
-        &self,
-        block: &FunctionSSABlock,
-        left_idx: usize,
-        left: &SSAVar,
-        right_idx: usize,
-        right: &SSAVar,
-        depth: u32,
-    ) -> bool {
-        if left == right {
-            return true;
-        }
-
-        if self
-            .extract_stack_offset_from_var(left)
-            .zip(self.extract_stack_offset_from_var(right))
-            .map(|(lhs, rhs)| lhs == rhs)
-            .unwrap_or(false)
-        {
-            return true;
-        }
-
-        self.local_expr_for_var(block, left_idx, left, depth + 1)
-            .zip(self.local_expr_for_var(block, right_idx, right, depth + 1))
-            .map(|(lhs, rhs)| {
-                lhs == rhs
-                    || self
-                        .simplify_stack_access(&lhs)
-                        .zip(self.simplify_stack_access(&rhs))
-                        .map(|(lhs_alias, rhs_alias)| lhs_alias == rhs_alias)
-                        .unwrap_or(false)
-            })
-            .unwrap_or(false)
     }
 
     /// Get the expression for a condition variable, always inlining its definition.
@@ -3456,137 +2789,15 @@ impl<'a> FoldingContext<'a> {
     }
 
     /// Look up the original comparison operands for a flag variable.
-    pub(super) fn lookup_flag_origin(&self, flag_name: &str) -> Option<(String, String)> {
-
-        if let Some(prov) = self.lookup_flag_compare_provenance(flag_name) {
-            return Some((prov.lhs, prov.rhs));
-        }
-
-        let (flag_base, flag_version) = parse_flag_name(flag_name)?;
-
-        let exact_matches = self.collect_matching_flag_origins(&flag_base, flag_version.as_deref());
-        if let Some((_, origin)) = exact_matches.into_iter().next() {
-            return Some(origin);
-        }
-
-        // Fallback by base-name only when there is exactly one candidate.
-        // This avoids picking an arbitrary origin for unsuffixed flags.
-        let candidates = self.collect_matching_flag_origins(&flag_base, None);
-
-        if candidates.len() == 1 {
-            return candidates.into_iter().next().map(|(_, origin)| origin);
-        }
-
+    pub(super) fn lookup_flag_origin(&self, _flag_name: &str) -> Option<(String, String)> {
         None
     }
 
     pub(super) fn lookup_flag_compare_provenance(
         &self,
-        flag_name: &str,
+        _flag_name: &str,
     ) -> Option<FlagCompareProvenance> {
-
-        let (flag_base, flag_version) = parse_flag_name(flag_name)?;
-
-        let exact_matches =
-            self.collect_matching_flag_compare_provenance(&flag_base, flag_version.as_deref());
-        if let Some((_, prov)) = exact_matches.into_iter().next() {
-            return Some(prov);
-        }
-
-        let candidates = self.collect_matching_flag_compare_provenance(&flag_base, None);
-
-        if candidates.len() == 1 {
-            return candidates.into_iter().next().map(|(_, prov)| prov);
-        }
-
         None
-    }
-
-    fn collect_matching_flag_origins(
-        &self,
-        flag_base: &str,
-        version: Option<&str>,
-    ) -> Vec<(String, (String, String))> {
-        let mut candidates = self
-            .flag_origins_map()
-            .iter()
-            .filter_map(|(key, origin)| {
-                let (key_base, key_version) = parse_flag_name(key)?;
-                (key_base == flag_base
-                    && version.is_none_or(|expected| key_version.as_deref() == Some(expected)))
-                .then_some((key.clone(), origin.clone()))
-            })
-            .collect::<Vec<_>>();
-        candidates.sort_by(|a, b| {
-            self.flag_origin_selection_key(&b.1)
-                .cmp(&self.flag_origin_selection_key(&a.1))
-                .then_with(|| a.0.cmp(&b.0))
-        });
-        candidates
-    }
-
-    fn collect_matching_flag_compare_provenance(
-        &self,
-        flag_base: &str,
-        version: Option<&str>,
-    ) -> Vec<(String, FlagCompareProvenance)> {
-        let mut candidates = self
-            .flag_compare_provenance_map()
-            .iter()
-            .filter_map(|(key, prov)| {
-                let (key_base, key_version) = parse_flag_name(key)?;
-                (key_base == flag_base
-                    && version.is_none_or(|expected| key_version.as_deref() == Some(expected)))
-                .then_some((key.clone(), prov.clone()))
-            })
-            .collect::<Vec<_>>();
-        candidates.sort_by(|a, b| {
-            self.flag_compare_provenance_selection_key(&b.1)
-                .cmp(&self.flag_compare_provenance_selection_key(&a.1))
-                .then_with(|| a.0.cmp(&b.0))
-        });
-        candidates
-    }
-
-    fn flag_origin_selection_key(&self, origin: &(String, String)) -> (i32, i32) {
-        (
-            self.flag_operand_quality(&origin.0) + self.flag_operand_quality(&origin.1),
-            self.flag_operand_quality(&origin.0)
-                .max(self.flag_operand_quality(&origin.1)),
-        )
-    }
-
-    fn flag_compare_provenance_selection_key(
-        &self,
-        prov: &FlagCompareProvenance,
-    ) -> (i32, i32, u8) {
-        (
-            self.flag_operand_quality(&prov.lhs) + self.flag_operand_quality(&prov.rhs),
-            self.flag_operand_quality(&prov.lhs)
-                .max(self.flag_operand_quality(&prov.rhs)),
-            match prov.kind {
-                FlagCompareKind::Equality => 3,
-                FlagCompareKind::UnsignedLess => 2,
-                FlagCompareKind::SignedNegative => 1,
-                FlagCompareKind::Overflow => 0,
-            },
-        )
-    }
-
-    fn flag_operand_quality(&self, name: &str) -> i32 {
-        if self.arg_alias_for_rendered_name(name).is_some() || name.starts_with("arg") {
-            return 40;
-        }
-        if self.parse_expr_from_name(name).is_some() {
-            return 30;
-        }
-        if self.is_low_signal_visible_name(name) {
-            return 0;
-        }
-        if self.is_transient_visible_name(name) {
-            return 10;
-        }
-        20
     }
 
     pub(super) fn compare_provenance_expr(&self, prov: &FlagCompareProvenance) -> Option<CExpr> {
@@ -3615,35 +2826,6 @@ impl<'a> FoldingContext<'a> {
         }
     }
 
-    pub(super) fn compare_provenance_expr_for_branch(
-        &self,
-        prov: &FlagCompareProvenance,
-    ) -> Option<CExpr> {
-        let depth_seed = MAX_PREDICATE_OPERAND_DEPTH.saturating_sub(1);
-        let lhs_origin = self.origin_name_to_expr(&prov.lhs)?;
-        let rhs_origin = self.origin_name_to_expr(&prov.rhs)?;
-        let lhs = self.resolve_predicate_operand(
-            &lhs_origin,
-            depth_seed,
-            &mut HashSet::new(),
-        );
-        let rhs = self.resolve_predicate_operand(
-            &rhs_origin,
-            depth_seed,
-            &mut HashSet::new(),
-        );
-
-        match prov.kind {
-            FlagCompareKind::Equality => Some(CExpr::binary(BinaryOp::Eq, lhs, rhs)),
-            FlagCompareKind::UnsignedLess => Some(CExpr::binary(BinaryOp::Lt, lhs, rhs)),
-            FlagCompareKind::SignedNegative => Some(CExpr::binary(
-                BinaryOp::Lt,
-                CExpr::binary(BinaryOp::Sub, lhs, rhs),
-                CExpr::IntLit(0),
-            )),
-            FlagCompareKind::Overflow => None,
-        }
-    }
 }
 
 impl<'o> analysis::PredicateAnalysisView for FoldingContext<'o> {
@@ -3663,21 +2845,6 @@ impl<'o> analysis::PredicateAnalysisView for FoldingContext<'o> {
     fn simplify_predicate_expr(&self, expr: CExpr) -> CExpr {
         FoldingContext::simplify_predicate_expr(self, expr)
     }
-}
-
-fn parse_flag_name(name: &str) -> Option<(String, Option<String>)> {
-    let lower = name.to_ascii_lowercase();
-    if is_flag_base_name(&lower) {
-        return Some((lower, None));
-    }
-
-    let (base, suffix) = lower.split_once('_')?;
-    if is_flag_base_name(base) && !suffix.is_empty() && suffix.chars().all(|ch| ch.is_ascii_digit())
-    {
-        return Some((base.to_string(), Some(suffix.to_string())));
-    }
-
-    None
 }
 
 fn is_specific_flag_name(name: &str, flag: &str) -> bool {
@@ -3710,34 +2877,6 @@ fn flag_name_matches(base: &str, flag: &str) -> bool {
     )
 }
 
-fn is_flag_base_name(name: &str) -> bool {
-    matches!(
-        name,
-        "cf" | "pf"
-            | "af"
-            | "zf"
-            | "sf"
-            | "of"
-            | "cy"
-            | "zr"
-            | "ng"
-            | "ov"
-            | "nf"
-            | "vf"
-            | "df"
-            | "tf"
-            | "if"
-            | "iopl"
-            | "nt"
-            | "rf"
-            | "vm"
-            | "tmpcy"
-            | "tmpzr"
-            | "tmpng"
-            | "tmpov"
-    )
-}
-
 #[cfg(test)]
 mod observation_transparency_tests {
     use super::*;
@@ -3759,34 +2898,6 @@ mod observation_transparency_tests {
             panic!("fixture must remain one returned expression");
         };
         (expr, reachable)
-    }
-
-    #[test]
-    fn reconstructed_flag_condition_keeps_only_its_root_observation() {
-        let mut ctx = FoldingContext::new(64);
-        ctx.state.analysis_ctx.flag_info.flag_origins.insert(
-            "zf_1".to_string(),
-            ("left".to_string(), "right".to_string()),
-        );
-        let mut owner = RenderObservationOwner::new();
-        let (operand_id, operand) = owner
-            .observe_expr(ctx.name_ref("zf_1"))
-            .expect("test observation ID");
-        let (root_id, source) = owner
-            .observe_expr(CExpr::unary(UnaryOp::Not, operand))
-            .expect("test observation ID");
-
-        let rewritten = ctx
-            .try_reconstruct_condition(&source)
-            .expect("a marked !ZF operand must still reconstruct");
-        let (semantic, reachable) = strip_expression(&ctx, rewritten, &owner);
-
-        assert_eq!(
-            semantic,
-            CExpr::binary(BinaryOp::Ne, ctx.name_ref("left"), ctx.name_ref("right"),)
-        );
-        assert!(reachable.contains(root_id));
-        assert!(!reachable.contains(operand_id));
     }
 
     #[test]

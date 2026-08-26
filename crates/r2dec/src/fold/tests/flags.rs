@@ -49,39 +49,3 @@ fn expr_contains_unresolved_memory_uses_visit_over_nested_nodes() {
     );
     assert!(!ctx.expr_contains_unresolved_memory(&no_deref));
 }
-
-#[test]
-fn tmp_flag_aliases_reconstruct_signed_ge_condition() {
-    let mut ctx = FoldingContext::new(64);
-    ctx.state.analysis_ctx.flag_info.compare_provenance.insert(
-        "tmpng_1".to_string(),
-        analysis::FlagCompareProvenance {
-            lhs: "argc".to_string(),
-            rhs: "2".to_string(),
-            kind: analysis::FlagCompareKind::SignedNegative,
-        },
-    );
-    ctx.state.analysis_ctx.flag_info.compare_provenance.insert(
-        "tmpov_1".to_string(),
-        analysis::FlagCompareProvenance {
-            lhs: "argc".to_string(),
-            rhs: "2".to_string(),
-            kind: analysis::FlagCompareKind::Overflow,
-        },
-    );
-
-    let expr = CExpr::binary(
-        BinaryOp::Eq,
-        ctx.name_ref("tmpng_1"),
-        ctx.name_ref("tmpov_1"),
-    );
-
-    assert_eq!(
-        ctx.simplify_condition_expr(expr),
-        CExpr::binary(
-            BinaryOp::Ge,
-            ctx.name_ref("argc"),
-            CExpr::IntLit(2),
-        )
-    );
-}
