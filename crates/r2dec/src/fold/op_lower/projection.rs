@@ -26,6 +26,20 @@ const fn c_integer_width_is_spellable(width_bits: u32) -> bool {
     matches!(width_bits, 8 | 16 | 32 | 64 | 128)
 }
 
+const fn c_bitvector_width_is_supported(width_bits: u32) -> bool {
+    matches!(width_bits, 256 | 512)
+}
+
+fn bitvector_helper(name: String, args: Vec<CExpr>) -> CExpr {
+    CExpr::call(
+        CExpr::External {
+            name,
+            kind: crate::symbol::ExternalKind::Intrinsic,
+        },
+        args,
+    )
+}
+
 fn checked_uint_type(width_bits: u32) -> Result<CType, MachineUseProjectionError> {
     c_integer_width_is_spellable(width_bits)
         .then_some(CType::UInt(width_bits))
@@ -49,25 +63,59 @@ pub(super) fn project_machine_use(
     base: CExpr,
     slice: MachineUseSlice,
 ) -> Result<CExpr, MachineUseProjectionError> {
-    let carrier_type = checked_uint_type(slice.carrier_width_bits())?;
-    let selected_type = checked_uint_type(slice.width_bits())?;
-
-    let mut projected = CExpr::cast(carrier_type, base);
-    if slice.bit_offset() != 0 {
-        projected = CExpr::binary(
-            BinaryOp::Shr,
-            projected,
-            CExpr::UIntLit(u64::from(slice.bit_offset())),
-        );
-    }
-    if slice.bit_offset() != 0 || slice.width_bits() != slice.carrier_width_bits() {
-        projected = CExpr::cast(selected_type, projected);
-    }
+    let projected = if c_integer_width_is_spellable(slice.carrier_width_bits()) {
+        let carrier_type = checked_uint_type(slice.carrier_width_bits())?;
+        let selected_type = checked_uint_type(slice.width_bits())?;
+        let mut projected = CExpr::cast(carrier_type, base);
+        if slice.bit_offset() != 0 {
+            projected = CExpr::binary(
+                BinaryOp::Shr,
+                projected,
+                CExpr::UIntLit(u64::from(slice.bit_offset())),
+            );
+        }
+        if slice.bit_offset() != 0 || slice.width_bits() != slice.carrier_width_bits() {
+            projected = CExpr::cast(selected_type, projected);
+        }
+        projected
+    } else if c_bitvector_width_is_supported(slice.carrier_width_bits()) {
+        if slice.bit_offset() == 0 && slice.width_bits() == slice.carrier_width_bits() {
+            base
+        } else if c_integer_width_is_spellable(slice.width_bits()) {
+            bitvector_helper(
+                format!(
+                    "r2sleigh_bits_extract_{}_{}",
+                    slice.carrier_width_bits(),
+                    slice.width_bits()
+                ),
+                vec![base, CExpr::UIntLit(u64::from(slice.bit_offset()))],
+            )
+        } else {
+            return Err(MachineUseProjectionError::UnsupportedIntegerWidth(
+                slice.width_bits(),
+            ));
+        }
+    } else {
+        return Err(MachineUseProjectionError::UnsupportedIntegerWidth(
+            slice.carrier_width_bits(),
+        ));
+    };
 
     let Some(conversion) = slice.conversion() else {
         return Ok(projected);
     };
     let target_width = conversion.to_width_bits();
+    let source_width = slice.width_bits();
+    if c_bitvector_width_is_supported(source_width)
+        || c_bitvector_width_is_supported(target_width)
+    {
+        // A width-changing wide conversion needs its own source-owned semantic
+        // contract (especially for signed extension). The prelude currently
+        // certifies only exact extraction/insertion and zero-extending writes.
+        return Err(MachineUseProjectionError::UnsupportedIntegerWidth(
+            target_width.max(source_width),
+        ));
+    }
     match conversion.kind() {
         MachineCastKind::ZeroExtend
         | MachineCastKind::Truncate
@@ -110,6 +158,22 @@ pub(super) fn project_machine_write(
             from_width_bits,
             to_width_bits,
         } => {
+            if c_bitvector_width_is_supported(to_width_bits) {
+                if !c_integer_width_is_spellable(from_width_bits) {
+                    return Err(MachineWriteProjectionError::UnsupportedIntegerWidth(
+                        from_width_bits,
+                    ));
+                }
+                return Ok((
+                    lhs,
+                    bitvector_helper(
+                        format!(
+                            "r2sleigh_bits_zero_extend_{from_width_bits}_{to_width_bits}"
+                        ),
+                        vec![rhs],
+                    ),
+                ));
+            }
             let from = checked_write_uint_type(from_width_bits)?;
             let to = checked_write_uint_type(to_width_bits)?;
             Ok((lhs, CExpr::cast(to, CExpr::cast(from, rhs))))
@@ -132,6 +196,28 @@ pub(super) fn project_machine_write(
                     width_bits,
                     carrier_width_bits,
                 });
+            }
+
+            if c_bitvector_width_is_supported(carrier_width_bits) {
+                if !c_integer_width_is_spellable(width_bits) {
+                    return Err(MachineWriteProjectionError::UnsupportedIntegerWidth(
+                        width_bits,
+                    ));
+                }
+                let preserved = lhs.clone_without_render_observations();
+                return Ok((
+                    lhs,
+                    bitvector_helper(
+                        format!(
+                            "r2sleigh_bits_insert_{carrier_width_bits}_{width_bits}"
+                        ),
+                        vec![
+                            preserved,
+                            rhs,
+                            CExpr::UIntLit(u64::from(bit_offset)),
+                        ],
+                    ),
+                ));
             }
 
             let carrier = checked_write_uint_type(carrier_width_bits)?;
@@ -272,5 +358,40 @@ mod tests {
             panic!("insert must read the old carrier at carrier width");
         };
         assert!(old_value.transparently_eq(&lhs));
+    }
+
+    #[test]
+    fn wide_insert_uses_the_exact_external_bitvector_contract() {
+        let lhs = binding_expr();
+        let (_, rhs) = project_machine_write(
+            lhs.clone(),
+            CExpr::UIntLit(0xa5),
+            MachineWriteProjection::Insert {
+                bit_offset: 127,
+                width_bits: 8,
+                carrier_width_bits: 256,
+            },
+        )
+        .expect("wide inserted write");
+
+        let CExpr::Call { func, args, .. } = rhs else {
+            panic!("wide insertion must lower through the certified prelude helper");
+        };
+        assert!(matches!(
+            func.as_ref(),
+            CExpr::External { name, .. } if name == "r2sleigh_bits_insert_256_8"
+        ));
+        assert_eq!(args.len(), 3);
+        assert!(args[0].transparently_eq(&lhs));
+        assert_eq!(args[2], CExpr::UIntLit(127));
+    }
+
+    #[test]
+    fn wide_machine_type_is_not_an_invented_integer_typedef() {
+        assert_eq!(
+            CType::machine_bits(256).to_string(),
+            "struct r2sleigh_bits_256"
+        );
+        assert_eq!(CType::machine_bits(128), CType::UInt(128));
     }
 }

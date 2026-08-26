@@ -15,6 +15,12 @@ pub enum CType {
     Int(u32),
     /// Unsigned integer with bit width.
     UInt(u32),
+    /// Exact machine bitvector wider than C's native integer domain.
+    ///
+    /// The external C prelude owns the concrete limb representation. Keeping
+    /// this distinct from `UInt` prevents ordinary C arithmetic and casts from
+    /// being emitted for a value the language cannot represent as a scalar.
+    BitVector(u32),
     /// Floating point with bit width.
     Float(u32),
     /// Pointer to another type.
@@ -36,6 +42,19 @@ pub enum CType {
 }
 
 impl CType {
+    /// Exact unsigned machine storage type.
+    ///
+    /// C has scalar integer spellings through 128 bits in the supported
+    /// compiler contract. Wider carriers use the limb-backed external prelude
+    /// instead of inventing names such as `uint256_t`.
+    pub const fn machine_bits(bits: u32) -> Self {
+        if bits <= 128 {
+            Self::UInt(bits)
+        } else {
+            Self::BitVector(bits)
+        }
+    }
+
     /// Create an 8-bit signed integer type.
     pub fn i8() -> Self {
         Self::Int(8)
@@ -90,7 +109,9 @@ impl CType {
     pub fn bits(&self) -> Option<u32> {
         match self {
             Self::Bool => Some(1),
-            Self::Int(bits) | Self::UInt(bits) | Self::Float(bits) => Some(*bits),
+            Self::Int(bits) | Self::UInt(bits) | Self::BitVector(bits) | Self::Float(bits) => {
+                Some(*bits)
+            }
             Self::Pointer(_) => Some(64), // Assume 64-bit pointers
             _ => None,
         }
@@ -132,6 +153,7 @@ impl std::fmt::Display for CType {
             // is not a C type. `__uint128_t` is the spelling compilers give it.
             Self::UInt(128) => write!(f, "__uint128_t"),
             Self::UInt(bits) => write!(f, "uint{}_t", bits),
+            Self::BitVector(bits) => write!(f, "struct r2sleigh_bits_{}", bits),
             Self::Float(32) => write!(f, "float"),
             Self::Float(64) => write!(f, "double"),
             Self::Float(bits) => write!(f, "float{}", bits),

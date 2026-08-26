@@ -139,7 +139,7 @@ fn ctype_hint_specificity(ty: &CType) -> u8 {
         CType::Unknown => 0,
         CType::Void => 1,
         CType::Function { .. } => 2,
-        CType::Bool | CType::Int(_) | CType::UInt(_) | CType::Float(_) => 4,
+        CType::Bool | CType::Int(_) | CType::UInt(_) | CType::BitVector(_) | CType::Float(_) => 4,
         CType::Typedef(_) | CType::Enum(_) => 5,
         CType::Struct(_) | CType::Union(_) => 6,
         CType::Array(inner, _) => 12 + ctype_hint_specificity(inner).min(12),
@@ -233,6 +233,10 @@ fn ctype_to_type_like(ty: &CType) -> CTypeLike {
             bits: *bits,
             signedness: r2types::Signedness::Unsigned,
         },
+        CType::BitVector(bits) => CTypeLike::Int {
+            bits: *bits,
+            signedness: r2types::Signedness::Unsigned,
+        },
         CType::Float(bits) => CTypeLike::Float(*bits),
         CType::Pointer(inner) => CTypeLike::Pointer(Box::new(ctype_to_type_like(inner))),
         CType::Array(inner, len) => CTypeLike::Array(Box::new(ctype_to_type_like(inner)), *len),
@@ -249,6 +253,7 @@ fn type_like_to_ctype(ty: &CTypeLike) -> CType {
         CTypeLike::Void => CType::Void,
         CTypeLike::Bool => CType::Bool,
         CTypeLike::Int { bits, signedness } => match signedness {
+            r2types::Signedness::Unsigned if *bits > 128 => CType::BitVector(*bits),
             r2types::Signedness::Unsigned => CType::UInt(*bits),
             _ => CType::Int(*bits),
         },

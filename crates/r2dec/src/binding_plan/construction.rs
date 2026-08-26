@@ -352,7 +352,7 @@ impl BindingPlan {
                     BindingPlanSourceMismatch::CertificateMembership { binding },
                 ))?;
             bindings.push(Binding {
-                declaration_type: CType::UInt(width_bits),
+                declaration_type: CType::machine_bits(width_bits),
                 certificate: BindingCertificate {
                     sources: component
                         .sources
@@ -400,7 +400,7 @@ impl BindingPlan {
                 };
                 let binding = BindingId(bindings.len() as u32);
                 bindings.push(Binding {
-                    declaration_type: CType::UInt(width_bits),
+                    declaration_type: CType::machine_bits(width_bits),
                     certificate: BindingCertificate {
                         sources: Box::new([BindingCertificateSource::CertifiedEntity(*id)]),
                     },

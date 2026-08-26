@@ -871,7 +871,8 @@ impl VariableRecovery {
             2 => CType::Int(16),
             4 => CType::Int(32),
             8 => CType::Int(64),
-            _ => CType::Int(size.saturating_mul(8)),
+            16 => CType::Int(128),
+            _ => CType::BitVector(size.saturating_mul(8)),
         }
     }
 

@@ -32,6 +32,9 @@ from typing import Any, Callable
 
 
 ROOT = Path(__file__).resolve().parent
+BITVECTOR_PRELUDE = (
+    ROOT.parents[1] / "crates" / "r2dec" / "include" / "r2sleigh_bitvectors.h"
+).read_text()
 LEGACY_MESSAGE = b"The quick brown fox jumps over the lazy dog, 0123456789abcdef"
 CONFIGS = {
     "x64_O0": "h_x64_O0",
@@ -998,6 +1001,7 @@ def runner_source(
             "#include <stdint.h>",
             "#include <stdio.h>",
             "#include <stdlib.h>",
+            BITVECTOR_PRELUDE,
             *blobs,
             *arrays,
             function_source,

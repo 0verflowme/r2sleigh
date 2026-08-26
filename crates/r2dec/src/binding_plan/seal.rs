@@ -1,5 +1,13 @@
 use super::*;
 
+fn binding_declaration_width(ty: &CType) -> Option<u32> {
+    match ty {
+        CType::UInt(bits) if *bits <= 128 => Some(*bits),
+        CType::BitVector(bits) if *bits > 128 => Some(*bits),
+        _ => None,
+    }
+}
+
 /// Resolve the certificate relation independently of construction's union-find.
 ///
 /// The graph is bipartite: values point to every exact upstream certificate that
@@ -443,7 +451,8 @@ impl BindingPlan {
                             },
                         ));
                     }
-                    let CType::UInt(width_bits) = &binding.declaration_type else {
+                    let Some(width_bits) = binding_declaration_width(&binding.declaration_type)
+                    else {
                         return Err(BindingPlanBuildError::Seal(
                             BindingPlanSourceMismatch::DeclarationWidth {
                                 binding: binding_id,
@@ -452,9 +461,9 @@ impl BindingPlan {
                     };
                     let satisfies_every_bound = lower_bounds
                         .iter()
-                        .all(|lower_bound| lower_bound <= width_bits);
-                    let has_minimality_witness = lower_bounds.contains(width_bits);
-                    if *width_bits == 0 || !satisfies_every_bound || !has_minimality_witness {
+                        .all(|lower_bound| *lower_bound <= width_bits);
+                    let has_minimality_witness = lower_bounds.contains(&width_bits);
+                    if width_bits == 0 || !satisfies_every_bound || !has_minimality_witness {
                         return Err(BindingPlanBuildError::Seal(
                             BindingPlanSourceMismatch::DeclarationWidth {
                                 binding: binding_id,
@@ -524,7 +533,7 @@ impl BindingPlan {
                                 },
                             ));
                         }
-                        if planned.declaration_type != CType::UInt(width_bits) {
+                        if planned.declaration_type != CType::machine_bits(width_bits) {
                             return Err(BindingPlanBuildError::Seal(
                                 BindingPlanSourceMismatch::StackObjectDeclarationWidth {
                                     object,

@@ -533,6 +533,9 @@ impl MachineUseSlice {
 /// Why one graph use has no honest machine slice projection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum MachineUseRefusal {
+    /// A load/store address exists, but its source-owned memory model cannot
+    /// certify the contextual address type and object provenance.
+    MissingMemoryContext,
     MissingRegisterGeometry,
     MalformedRegisterGeometry,
     RegisterGeometry(r2il::RegisterProjectionRefusal),
@@ -1299,7 +1302,16 @@ fn canonical_machine_use_disposition(
     validate_machine_use_slice(slice, source.width_bits)
         .map_err(|_| MachineBuildError::UseDispositionMismatch(site))?;
 
-    if let Some(address_use) = MachineValueUse::memory_address_for_use(artifact, site)? {
+    let address_use = match MachineValueUse::memory_address_for_use(artifact, site) {
+        Ok(address_use) => address_use,
+        Err(MachineBuildError::MachineContextMismatch) => {
+            return Ok(MachineUseDisposition::Refused(
+                MachineUseRefusal::MissingMemoryContext,
+            ));
+        }
+        Err(error) => return Err(error),
+    };
+    if let Some(address_use) = address_use {
         if address_use.binding().value() != input {
             return Err(MachineBuildError::UseDispositionMismatch(site));
         }
@@ -1352,7 +1364,17 @@ fn validate_canonical_machine_use_disposition(
     let source = binding_for_value(graph_value)?;
     validate_machine_use_slice(operation_slice, source.width_bits).map_err(|_| mismatch())?;
 
-    if let Some(address_use) = MachineValueUse::memory_address_for_use(artifact, site)? {
+    let address_use = match MachineValueUse::memory_address_for_use(artifact, site) {
+        Ok(address_use) => address_use,
+        Err(MachineBuildError::MachineContextMismatch) => {
+            return (actual
+                == MachineUseDisposition::Refused(MachineUseRefusal::MissingMemoryContext))
+            .then_some(())
+            .ok_or_else(mismatch);
+        }
+        Err(error) => return Err(error),
+    };
+    if let Some(address_use) = address_use {
         return (address_use.binding().value() == input
             && actual == MachineUseDisposition::MemoryAddress(address_use))
         .then_some(())
@@ -5500,7 +5522,20 @@ mod tests {
                 }
             );
         }
-        assert_eq!(exact_use(&projection, &artifact, 7, 0).width_bits(), 64);
+        let store_inst = artifact
+            .graph()
+            .inst_id_for_op_site(0x1000, 7)
+            .expect("store instruction");
+        assert_eq!(
+            projection.use_disposition(UseSite {
+                inst: store_inst,
+                input_idx: 0,
+            }),
+            Some(&MachineUseDisposition::Refused(
+                MachineUseRefusal::MissingMemoryContext
+            )),
+            "an address without an exact memory model must not masquerade as an integer slice"
+        );
         assert_eq!(exact_use(&projection, &artifact, 7, 1).width_bits(), 32);
 
         let remainder_inst = artifact
