@@ -3039,11 +3039,31 @@ impl EffectObligationAudit {
 }
 
 /// Rendered C paired with the non-consuming Stage 4 binding audit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecompileRenderRefusal {
+    MissingMachineProjectionAuthorization,
+    UnrepresentableOperation,
+}
+
+impl From<crate::fold::op_lower::OpLoweringRefusal> for DecompileRenderRefusal {
+    fn from(refusal: crate::fold::op_lower::OpLoweringRefusal) -> Self {
+        match refusal {
+            crate::fold::op_lower::OpLoweringRefusal::MissingMachineProjectionAuthorization => {
+                Self::MissingMachineProjectionAuthorization
+            }
+            crate::fold::op_lower::OpLoweringRefusal::UnrepresentableOperation => {
+                Self::UnrepresentableOperation
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DecompileBindingAudit {
     output: String,
     binding_shadow: BindingShadowAuditOutcome,
     effect_obligations: EffectObligationAudit,
+    render_refusal: Option<DecompileRenderRefusal>,
 }
 
 impl DecompileBindingAudit {
@@ -3052,6 +3072,7 @@ impl DecompileBindingAudit {
             output,
             binding_shadow: BindingShadowAuditOutcome::NotRun,
             effect_obligations: EffectObligationAudit::NOT_RUN,
+            render_refusal: None,
         }
     }
 
@@ -3070,6 +3091,10 @@ impl DecompileBindingAudit {
     pub const fn effect_obligations(&self) -> EffectObligationAudit {
         self.effect_obligations
     }
+
+    pub const fn render_refusal(&self) -> Option<DecompileRenderRefusal> {
+        self.render_refusal
+    }
 }
 
 /// Rendered C whose same-run binding classification is deliberately deferred.
@@ -3086,6 +3111,7 @@ pub struct PendingDecompileBindingAudit {
     )>,
     ready: BindingShadowAuditOutcome,
     ready_effects: EffectObligationAudit,
+    ready_refusal: Option<DecompileRenderRefusal>,
 }
 
 impl PendingDecompileBindingAudit {
@@ -3095,6 +3121,7 @@ impl PendingDecompileBindingAudit {
             product: None,
             ready: audit.binding_shadow,
             ready_effects: audit.effect_obligations,
+            ready_refusal: audit.render_refusal,
         }
     }
 
@@ -3108,6 +3135,7 @@ impl PendingDecompileBindingAudit {
             product: Some((product, source)),
             ready: BindingShadowAuditOutcome::NotRun,
             ready_effects: EffectObligationAudit::NOT_RUN,
+            ready_refusal: None,
         }
     }
 
@@ -3120,16 +3148,18 @@ impl PendingDecompileBindingAudit {
     }
 
     pub fn finalize(self) -> DecompileBindingAudit {
-        let (binding_shadow, effect_obligations) = self.product.map_or((self.ready, self.ready_effects), |(product, source)| {
+        let (binding_shadow, effect_obligations, render_refusal) = self.product.map_or((self.ready, self.ready_effects, self.ready_refusal), |(product, source)| {
                     (
                         product.binding_shadow(&source),
                         product.effect_obligations(),
+                        product.render_refusal(),
                     )
                 });
         DecompileBindingAudit {
             output: self.output,
             binding_shadow,
             effect_obligations,
+            render_refusal,
         }
     }
 }
@@ -3141,6 +3171,10 @@ impl PendingDecompileBindingAudit {
 enum InternalBuildProduct {
     Native(SealedNativeFunction),
     Residual(EmissionReadyFunction),
+    Refused {
+        emission: EmissionReadyFunction,
+        refusal: DecompileRenderRefusal,
+    },
 }
 
 enum PreparedDecompile {
@@ -3153,10 +3187,18 @@ impl InternalBuildProduct {
         Self::Residual(prepare_function_for_emission(&function))
     }
 
+    fn refused(function: CFunction, refusal: crate::fold::op_lower::OpLoweringRefusal) -> Self {
+        Self::Refused {
+            emission: prepare_function_for_emission(&function),
+            refusal: refusal.into(),
+        }
+    }
+
     fn emission(&self) -> &EmissionReadyFunction {
         match self {
             Self::Native(native) => native.emission(),
             Self::Residual(ready) => ready,
+            Self::Refused { emission, .. } => emission,
         }
     }
 
@@ -3164,6 +3206,7 @@ impl InternalBuildProduct {
         match self {
             Self::Native(native) => native.into_function(),
             Self::Residual(ready) => ready.into_function(),
+            Self::Refused { emission, .. } => emission.into_function(),
         }
     }
 
@@ -3187,7 +3230,14 @@ impl InternalBuildProduct {
     fn effect_obligations(&self) -> EffectObligationAudit {
         match self {
             Self::Native(native) => native.effect_obligation_audit(),
-            Self::Residual(_) => EffectObligationAudit::NOT_RUN,
+            Self::Residual(_) | Self::Refused { .. } => EffectObligationAudit::NOT_RUN,
+        }
+    }
+
+    fn render_refusal(&self) -> Option<DecompileRenderRefusal> {
+        match self {
+            Self::Refused { refusal, .. } => Some(*refusal),
+            Self::Native(_) | Self::Residual(_) => None,
         }
     }
 }
@@ -3380,6 +3430,7 @@ impl Decompiler {
             output,
             binding_shadow,
             effect_obligations,
+            render_refusal: product.render_refusal(),
         })
     }
 
@@ -3797,13 +3848,13 @@ impl Decompiler {
         &self,
         func: &SSAFunction,
         fold_ctx: &FoldingContext<'_>,
-    ) -> Vec<CStmt> {
+    ) -> structure::ControlFlowStructureResult<Vec<CStmt>> {
         let blocks: Vec<_> = func.blocks().cloned().collect();
         let mut stmts = Vec::new();
 
         for block in &blocks {
             stmts.push(CStmt::Label(Self::linear_block_label(block.addr)));
-            for stmt in fold_ctx.fold_block(block, block.addr) {
+            for stmt in fold_ctx.fold_block(block, block.addr)? {
                 if !matches!(stmt, CStmt::Empty) {
                     stmts.push(stmt);
                 }
@@ -3813,7 +3864,7 @@ impl Decompiler {
             }
         }
 
-        stmts
+        Ok(stmts)
     }
 
     fn linear_block_label(addr: u64) -> String {
@@ -4367,11 +4418,32 @@ impl Decompiler {
 
         // Get set of variables that survive folding before structuring.
         let emitted_vars = structurer.emitted_var_names();
-        let routed_body = consumer_structured::primary_body_for_semantic_route(
+        let routed_body = match consumer_structured::primary_body_for_semantic_route(
             semantic_route,
             &mut structurer,
             || self.linearize_function_body(func, &fold_ctx),
-        );
+        ) {
+            Ok(body) => body,
+            Err(structure::ControlFlowStructureError::Lowering(refusal)) => {
+                let function = residual_function_for_render_boundary(
+                    &func
+                        .name
+                        .clone()
+                        .unwrap_or_else(|| format!("sub_{:x}", func.entry)),
+                    &format!("operation lowering refusal: {refusal:?}"),
+                );
+                return Ok(InternalBuildProduct::refused(function, refusal));
+            }
+            Err(structure::ControlFlowStructureError::StructuredRegion(error)) => {
+                return Ok(InternalBuildProduct::residual(residual_function_for_render_boundary(
+                    &func
+                        .name
+                        .clone()
+                        .unwrap_or_else(|| format!("sub_{:x}", func.entry)),
+                    &format!("structured-region refusal: {error:?}"),
+                )));
+            }
+        };
         if let Some(stop) = structurer.execution_stop() {
             return Err(stop);
         }

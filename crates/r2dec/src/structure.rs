@@ -14,11 +14,43 @@ use crate::ast::{BinaryOp, CExpr, CStmt, UnaryOp};
 use crate::control::{DecompileExecutionStop, DecompileWorkControl};
 use crate::fold::FoldingContext;
 use crate::fold::context::EffectOccurrenceKind;
+use crate::fold::op_lower::OpLoweringRefusal;
 use crate::region::{Region, RegionAnalyzer, RegionTransferKind};
 use crate::structured_region::{
     SealedStructuredBody, StructuredRegionBuildError, StructuredRegionKind,
     StructuredRegionMarker, SyntheticRegionKind, kind_of, seal_structured_body,
 };
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ControlFlowStructureError {
+    Lowering(OpLoweringRefusal),
+    StructuredRegion(StructuredRegionBuildError),
+}
+
+impl From<OpLoweringRefusal> for ControlFlowStructureError {
+    fn from(error: OpLoweringRefusal) -> Self {
+        Self::Lowering(error)
+    }
+}
+
+impl From<StructuredRegionBuildError> for ControlFlowStructureError {
+    fn from(error: StructuredRegionBuildError) -> Self {
+        Self::StructuredRegion(error)
+    }
+}
+
+pub(crate) type ControlFlowStructureResult<T> = Result<T, ControlFlowStructureError>;
+
+enum ExitContinuationError {
+    Placement(Option<String>),
+    Structure(ControlFlowStructureError),
+}
+
+impl From<ControlFlowStructureError> for ExitContinuationError {
+    fn from(error: ControlFlowStructureError) -> Self {
+        Self::Structure(error)
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ControlRenderProofKind {
@@ -679,21 +711,16 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
     }
 
     /// Structure the function's control flow.
-    pub(crate) fn structure(&mut self) -> CStmt {
-        match self.structure_with_regions() {
-            Ok(body) => body.into_stmt(),
-            Err(error) => CStmt::comment(format!(
-                "r2dec residual: structured-region sealing failed: {error:?}"
-            )),
-        }
+    pub(crate) fn structure(&mut self) -> ControlFlowStructureResult<CStmt> {
+        self.structure_with_regions().map(SealedStructuredBody::into_stmt)
     }
 
     /// Structure the function and retain exact lexical occurrence identity.
     pub(crate) fn structure_with_regions(
         &mut self,
-    ) -> Result<SealedStructuredBody, StructuredRegionBuildError> {
+    ) -> ControlFlowStructureResult<SealedStructuredBody> {
         let symbols = &self.fold_ctx.symbols;
-        let stmt = self.structure_preserving_render_proof_identity_marked();
+        let stmt = self.structure_preserving_render_proof_identity_marked()?;
         // A refusal that does not say what it refused reads as a function with no body
         if let Some(reason) = self.safety_reason.clone() {
             return seal_structured_body(CStmt::structured_region(
@@ -705,10 +732,11 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                     "r2dec residual: {}",
                     crate::sanitize_comment_text(&reason)
                 )),
-            ));
+            ))
+            .map_err(ControlFlowStructureError::from);
         }
         // Post-process: flatten, simplify loops, remove redundant control flow.
-        seal_structured_body(Self::cleanup(symbols, stmt))
+        seal_structured_body(Self::cleanup(symbols, stmt)).map_err(ControlFlowStructureError::from)
     }
 
     /// Structure control flow without post-proof AST rewrites.
@@ -717,23 +745,27 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
     /// `FunctionFacts` proof identities recorded while structuring. Cleanup can
     /// invert, merge, synthesize, or delete control nodes, so certified callers
     /// must validate the unrewritten AST or residualize.
-    pub(crate) fn structure_preserving_render_proof_identity(&mut self) -> CStmt {
-        match seal_structured_body(self.structure_preserving_render_proof_identity_marked()) {
-            Ok(body) => body.into_stmt(),
-            Err(error) => CStmt::comment(format!(
-                "r2dec residual: structured-region sealing failed: {error:?}"
-            )),
-        }
+    pub(crate) fn structure_preserving_render_proof_identity(
+        &mut self,
+    ) -> ControlFlowStructureResult<CStmt> {
+        let stmt = self.structure_preserving_render_proof_identity_marked()?;
+        seal_structured_body(stmt)
+            .map(SealedStructuredBody::into_stmt)
+            .map_err(ControlFlowStructureError::from)
     }
 
-    fn structure_preserving_render_proof_identity_marked(&mut self) -> CStmt {
+    fn structure_preserving_render_proof_identity_marked(
+        &mut self,
+    ) -> ControlFlowStructureResult<CStmt> {
         self.retain_region_markers = true;
         let stmt = self.structure_preserving_render_proof_identity_impl();
         self.retain_region_markers = false;
         stmt
     }
 
-    fn structure_preserving_render_proof_identity_impl(&mut self) -> CStmt {
+    fn structure_preserving_render_proof_identity_impl(
+        &mut self,
+    ) -> ControlFlowStructureResult<CStmt> {
         self.reset_safety_budget();
         self.control_render_proofs.clear();
         self.active_domains = vec![RenderedBlockDomain::default()];
@@ -781,14 +813,14 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         for join in self.shared_joins.clone() {
             self.ensure_label(join);
         }
-        let stmt = self.structure_region(&region);
-        let stmt = self.append_shared_joins(stmt);
-        let stmt = self.append_deferred_shared_exits(stmt);
+        let stmt = self.structure_region(&region)?;
+        let stmt = self.append_shared_joins(stmt)?;
+        let stmt = self.append_deferred_shared_exits(stmt)?;
         self.validate_rendered_block_domain_coverage();
         if self.safety_reason.is_some() {
-            return CStmt::Empty;
+            return Ok(CStmt::Empty);
         }
-        if self.retain_region_markers {
+        Ok(if self.retain_region_markers {
             CStmt::structured_region(
                 StructuredRegionMarker::unsealed(
                     self.func.entry,
@@ -798,27 +830,27 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             )
         } else {
             stmt
-        }
+        })
     }
 
     /// Structure a region into C statements.
-    fn structure_region(&mut self, region: &Region) -> CStmt {
+    fn structure_region(&mut self, region: &Region) -> ControlFlowStructureResult<CStmt> {
         if !self.poll() || !self.consume_safety_budget(1) {
-            return CStmt::Empty;
+            return Ok(CStmt::Empty);
         }
         let inherited_domains = self.active_domains.clone();
         if let Some(domains) = self.transfer_target_domains.remove(&region.entry()) {
             self.certify_transfer_domain_join(region.entry(), domains);
         }
-        let stmt = self.structure_region_in_active_domains(region);
+        let stmt = self.structure_region_in_active_domains(region)?;
         self.active_domains = inherited_domains;
         if !self.retain_region_markers || matches!(stmt.unobserved(), CStmt::Empty) {
-            stmt
+            Ok(stmt)
         } else {
-            CStmt::structured_region(
+            Ok(CStmt::structured_region(
                 StructuredRegionMarker::unsealed(region.entry(), kind_of(region)),
                 stmt,
-            )
+            ))
         }
     }
 
@@ -885,9 +917,12 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         }
     }
 
-    fn structure_region_in_active_domains(&mut self, region: &Region) -> CStmt {
-        match region {
-            Region::Block(addr) => self.structure_block(*addr),
+    fn structure_region_in_active_domains(
+        &mut self,
+        region: &Region,
+    ) -> ControlFlowStructureResult<CStmt> {
+        Ok(match region {
+            Region::Block(addr) => self.structure_block(*addr)?,
             Region::Sequence(regions) => {
                 let mut stmts = Vec::with_capacity(regions.len());
                 for (index, region) in regions.iter().enumerate() {
@@ -895,7 +930,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                     if let Some(merge) = deferred_merge {
                         self.deferred_merge_blocks.push(merge);
                     }
-                    let stmt = self.structure_region(region);
+                    let stmt = self.structure_region(region)?;
                     if let Some(merge) = deferred_merge {
                         debug_assert_eq!(self.deferred_merge_blocks.pop(), Some(merge));
                     }
@@ -931,9 +966,9 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                         then_region,
                         else_region.as_deref(),
                         *merge_block,
-                    )
+                    )?
                 {
-                    return rewritten;
+                    return Ok(rewritten);
                 }
                 if !merge_owned_by_ancestor
                     && let Some(rewritten) = self.try_structure_if_else_with_register_merge_returns(
@@ -941,31 +976,31 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                         then_region,
                         else_region.as_deref(),
                         *merge_block,
-                    )
+                    )?
                 {
-                    return rewritten;
+                    return Ok(rewritten);
                 }
                 if let Some(rewritten) = self.try_structure_guarded_switch_with_default(
                     *cond_block,
                     then_region,
                     else_region.as_deref(),
                     *merge_block,
-                ) {
-                    return rewritten;
+                )? {
+                    return Ok(rewritten);
                 }
                 self.deferred_merge_blocks.truncate(deferred_before);
                 let (cond, predicate, condition_value) =
                     self.get_branch_condition_with_predicate(*cond_block);
                 let Some(mut cond) = cond else {
-                    let mut prefix = self.structure_block_prefix_stmts(*cond_block);
+                    let mut prefix = self.structure_block_prefix_stmts(*cond_block)?;
                     prefix.push(CStmt::comment(format!(
                         "r2dec residual: unresolved branch condition at 0x{cond_block:x}"
                     )));
-                    return if prefix.len() == 1 {
+                    return Ok(if prefix.len() == 1 {
                         prefix.into_iter().next().unwrap_or(CStmt::Empty)
                     } else {
                         CStmt::Block(prefix)
-                    };
+                    });
                 };
                 if else_region.is_none()
                     && let Some(merge_addr) = merge_block
@@ -982,10 +1017,11 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                 if let Some(merge) = merge_block {
                     self.deferred_merge_blocks.push(*merge);
                 }
-                let then_stmt = self.structure_branch_region(*cond_block, then_region);
-                let else_stmt = else_region
-                    .as_ref()
-                    .map(|r| self.structure_branch_region(*cond_block, r));
+                let then_stmt = self.structure_branch_region(*cond_block, then_region)?;
+                let else_stmt = match else_region.as_ref() {
+                    Some(region) => Some(self.structure_branch_region(*cond_block, region)?),
+                    None => None,
+                };
                 if let Some(merge) = merge_block {
                     debug_assert_eq!(self.deferred_merge_blocks.pop(), Some(*merge));
                 }
@@ -996,13 +1032,13 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                 let if_stmt = self.observe_control_ownership(*cond_block,
                     CStmt::if_stmt(cond, then_stmt, else_stmt),
                 );
-                let mut prefix = self.structure_block_prefix_stmts(*cond_block);
+                let mut prefix = self.structure_block_prefix_stmts(*cond_block)?;
                 prefix.push(if_stmt);
                 if let Some(merge_addr) = merge_block
                     && !branches_terminate
                     && !merge_owned_by_ancestor
                 {
-                    Self::append_stmt_body_flat(&mut prefix, self.structure_block(*merge_addr));
+                    Self::append_stmt_body_flat(&mut prefix, self.structure_block(*merge_addr)?);
                 }
                 if prefix.len() == 1 {
                     prefix.into_iter().next().unwrap_or(CStmt::Empty)
@@ -1014,9 +1050,9 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                 let (cond, predicate, condition_value) =
                     self.get_branch_condition_with_predicate(*header);
                 let Some(mut cond) = cond else {
-                    return CStmt::Block(vec![CStmt::comment(format!(
+                    return Ok(CStmt::Block(vec![CStmt::comment(format!(
                         "r2dec residual: unresolved loop condition at 0x{header:x}"
-                    ))]);
+                    ))]));
                 };
                 if self.loop_needs_condition_inversion(*header, body) {
                     cond = Self::negate_condition(cond);
@@ -1029,7 +1065,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                 if let Some(loop_id) = loop_id {
                     self.push_active_loop(loop_id);
                 }
-                let prefix = self.structure_block_prefix_stmts(*header);
+                let prefix = self.structure_block_prefix_stmts(*header)?;
                 let cond = match Self::combine_loop_condition_prefix(prefix, cond) {
                     Ok(cond) => cond,
                     Err(reason) => {
@@ -1037,10 +1073,10 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                             "loop header 0x{header:x} effects cannot be preserved: {reason}"
                         ));
                         self.active_domains = outer_domains;
-                        return CStmt::Empty;
+                        return Ok(CStmt::Empty);
                     }
                 };
-                let body_stmt = Self::strip_trailing_continue(self.structure_loop_body(body));
+                let body_stmt = Self::strip_trailing_continue(self.structure_loop_body(body)?);
                 self.active_domains = outer_domains;
                 self.observe_control_ownership(*header, CStmt::while_loop(cond, body_stmt))
             }
@@ -1048,9 +1084,9 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                 let (cond, predicate, condition_value) =
                     self.get_branch_condition_with_predicate(*cond_block);
                 let Some(mut cond) = cond else {
-                    return CStmt::Block(vec![CStmt::comment(format!(
+                    return Ok(CStmt::Block(vec![CStmt::comment(format!(
                         "r2dec residual: unresolved loop condition at 0x{cond_block:x}"
-                    ))]);
+                    ))]));
                 };
                 if self.loop_needs_condition_inversion(*cond_block, body) {
                     cond = Self::negate_condition(cond);
@@ -1069,11 +1105,11 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                     self.deferred_merge_blocks.push(*cond_block);
                 }
                 let mut body_stmt =
-                    Self::strip_trailing_latch_marker(self.structure_loop_body(body));
+                    Self::strip_trailing_latch_marker(self.structure_loop_body(body)?);
                 if !cond_owned_by_body {
                     debug_assert_eq!(self.deferred_merge_blocks.pop(), Some(*cond_block));
                     let mut stmts = Self::stmt_into_vec(body_stmt);
-                    Self::append_stmt_body_flat(&mut stmts, self.structure_block(*cond_block));
+                    Self::append_stmt_body_flat(&mut stmts, self.structure_block(*cond_block)?);
                     body_stmt = Self::stmt_from_vec(stmts);
                 }
                 self.active_domains = outer_domains;
@@ -1138,9 +1174,9 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                             }
                             let label = self.ensure_label(lowered_target);
                             if !self.record_transfer_target_domain(*loop_header, lowered_target) {
-                                return CStmt::Empty;
+                                return Ok(CStmt::Empty);
                             }
-                            return CStmt::Goto(label);
+                            return Ok(CStmt::Goto(label));
                         }
                         Err(reason) => {
                             // An exit that runs into blocks no region claimed has
@@ -1165,23 +1201,24 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                                     .or_default()
                                     .insert(*source);
                                 if !self.record_transfer_target_domain(*loop_header, *target) {
-                                    return CStmt::Empty;
+                                    return Ok(CStmt::Empty);
                                 }
                                 if writes.is_empty() {
-                                    return CStmt::Goto(label);
+                                    return Ok(CStmt::Goto(label));
                                 }
                                 let mut stmts = writes;
                                 stmts.push(CStmt::Goto(label));
-                                return CStmt::Block(stmts);
+                                return Ok(CStmt::Block(stmts));
                             }
                             match self.exit_continuation_stmt(*target) {
-                                Ok(stmt) => return stmt,
+                                Ok(stmt) => return Ok(stmt),
+                                Err(ExitContinuationError::Structure(error)) => return Err(error),
                                 // Two walks refused this edge: the one looking
                                 // for a label and the one trying to render the
                                 // blocks instead. The second went further, so
                                 // it is the one with something to say about why
                                 // the exit could not be lowered.
-                                Err(chain_reason) => Some(match chain_reason {
+                                Err(ExitContinuationError::Placement(chain_reason)) => Some(match chain_reason {
                                     Some(chain_reason) => chain_reason,
                                     None => reason,
                                 }),
@@ -1209,13 +1246,17 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                 default,
                 merge_block,
             } => {
-                self.structure_switch_region(*switch_block, cases, default.as_deref(), *merge_block)
+                self.structure_switch_region(*switch_block, cases, default.as_deref(), *merge_block)?
             }
-            Region::Irreducible { entry, blocks } => self.structure_irreducible(*entry, blocks),
-        }
+            Region::Irreducible { entry, blocks } => self.structure_irreducible(*entry, blocks)?,
+        })
     }
 
-    fn structure_branch_region(&mut self, pred_block: u64, region: &Region) -> CStmt {
+    fn structure_branch_region(
+        &mut self,
+        pred_block: u64,
+        region: &Region,
+    ) -> ControlFlowStructureResult<CStmt> {
         let direct_successor = self.func.successors(pred_block).contains(&region.entry());
         if direct_successor {
             self.structure_region_from_predecessor(region, pred_block)
@@ -1224,34 +1265,47 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         }
     }
 
-    fn structure_region_from_predecessor(&mut self, region: &Region, pred_block: u64) -> CStmt {
+    fn structure_region_from_predecessor(
+        &mut self,
+        region: &Region,
+        pred_block: u64,
+    ) -> ControlFlowStructureResult<CStmt> {
         match region {
             Region::Block(addr) => self.structure_block_from_predecessor(*addr, pred_block),
             _ => self.structure_region(region),
         }
     }
 
-    fn structure_block_from_predecessor(&mut self, addr: u64, pred_block: u64) -> CStmt {
+    fn structure_block_from_predecessor(
+        &mut self,
+        addr: u64,
+        pred_block: u64,
+    ) -> ControlFlowStructureResult<CStmt> {
         // A branch that runs into the merge its own `if` deferred must not print
         // it: the `if` prints it once the branches are done. Printing it here as
         // well renders the same statements twice, and the copy inside the branch
         // reads names the copy after it declares -- murmur3 at arm64 -O1.
         if self.deferred_merge_blocks.contains(&addr) {
-            return CStmt::Empty;
+            return Ok(CStmt::Empty);
         }
-        let stmt = self.structure_block(addr);
+        let stmt = self.structure_block(addr)?;
         if !self.block_allows_predecessor_return_register_rewrite(addr) {
-            return stmt;
+            return Ok(stmt);
         }
         let Some((expr, proof_block, proof_op, proof_value)) =
-            self.return_register_candidate_for_merge_predecessor(addr, pred_block)
+            self.return_register_candidate_for_merge_predecessor(addr, pred_block)?
         else {
-            return stmt;
+            return Ok(stmt);
         };
         if let Some(rewritten) = self.rewrite_trailing_return_with_merged_expr(&stmt, &expr) {
-            self.observe_return_value_ownership(rewritten, proof_block, proof_op, proof_value)
+            Ok(self.observe_return_value_ownership(
+                rewritten,
+                proof_block,
+                proof_op,
+                proof_value,
+            ))
         } else {
-            stmt
+            Ok(stmt)
         }
     }
 
@@ -1274,18 +1328,22 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         &self,
         merge_addr: u64,
         pred_addr: u64,
-    ) -> Option<(CExpr, u64, usize, ValueId)> {
+    ) -> ControlFlowStructureResult<Option<(CExpr, u64, usize, ValueId)>> {
         if !self.block_allows_predecessor_return_register_rewrite(merge_addr) {
-            return None;
+            return Ok(None);
         }
-        self.fold_ctx
+        let candidate = self
+            .fold_ctx
             .merged_return_register_candidate_for_block_predecessor_with_proof(
                 merge_addr, pred_addr,
-            )
-            .or_else(|| {
-                self.fold_ctx
-                    .predecessor_return_register_candidate_with_proof(pred_addr)
-            })
+            )?;
+        match candidate {
+            Some(candidate) => Ok(Some(candidate)),
+            None => self
+                .fold_ctx
+                .predecessor_return_register_candidate_with_proof(pred_addr)
+                .map_err(ControlFlowStructureError::from),
+        }
     }
 
     /// Get the switch expression from a block.
@@ -1381,18 +1439,18 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         cases: &[(Option<u64>, Box<Region>)],
         default: Option<&Region>,
         merge_block: Option<u64>,
-    ) -> CStmt {
+    ) -> ControlFlowStructureResult<CStmt> {
         let merge_owned_by_ancestor =
             merge_block.is_some_and(|merge| self.deferred_merge_blocks.contains(&merge));
         let Some((switch_expr, switch_selector)) = self.get_switch_expression(switch_block) else {
-            return CStmt::Block(vec![CStmt::comment(format!(
+            return Ok(CStmt::Block(vec![CStmt::comment(format!(
                 "r2dec residual: unresolved switch selector at 0x{switch_block:x}"
-            ))]);
+            ))]));
         };
         if cases.iter().any(|(case_value, _)| case_value.is_none()) {
-            return CStmt::Block(vec![CStmt::comment(format!(
+            return Ok(CStmt::Block(vec![CStmt::comment(format!(
                 "r2dec residual: unresolved switch case value at 0x{switch_block:x}"
-            ))]);
+            ))]));
         }
         self.record_switch_render_proof(switch_block, switch_selector, cases, default);
 
@@ -1424,7 +1482,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                     .iter()
                     .any(|succ| case_entries.contains(succ) && !region_blocks.contains(succ))
             });
-            let case_stmt = self.structure_region(case_region);
+            let case_stmt = self.structure_region(case_region)?;
             self.active_domains = outer_domains;
             let body = if falls_through {
                 vec![case_stmt]
@@ -1439,7 +1497,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
 
         let default_body = if let Some(region) = default {
             let outer_domains = self.active_domains.clone();
-            let stmt = self.structure_region(region);
+            let stmt = self.structure_region(region)?;
             self.active_domains = outer_domains;
             Some(vec![stmt])
         } else {
@@ -1457,15 +1515,15 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         },
         );
 
-        let mut prefix = self.structure_block_prefix_stmts(switch_block);
+        let mut prefix = self.structure_block_prefix_stmts(switch_block)?;
         prefix.push(switch_stmt);
         if let Some(merge_addr) = merge_block.filter(|_| !merge_owned_by_ancestor) {
-            Self::append_stmt_body_flat(&mut prefix, self.structure_block(merge_addr));
+            Self::append_stmt_body_flat(&mut prefix, self.structure_block(merge_addr)?);
         }
         if prefix.len() == 1 {
-            prefix.into_iter().next().unwrap_or(CStmt::Empty)
+            Ok(prefix.into_iter().next().unwrap_or(CStmt::Empty))
         } else {
-            CStmt::Block(prefix)
+            Ok(CStmt::Block(prefix))
         }
     }
 
@@ -1516,9 +1574,12 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
     /// at one and the other cannot reach it, put it at both and it runs twice.
     /// Written once at the end with a label, every exit jumps to it and it runs
     /// where all of them agree it does.
-    fn append_deferred_shared_exits(&mut self, stmt: CStmt) -> CStmt {
+    fn append_deferred_shared_exits(
+        &mut self,
+        stmt: CStmt,
+    ) -> ControlFlowStructureResult<CStmt> {
         if self.deferred_shared_exits.is_empty() {
-            return stmt;
+            return Ok(stmt);
         }
         let deferred = std::mem::take(&mut self.deferred_shared_exits);
         let mut stmts = Vec::new();
@@ -1535,7 +1596,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                 self.safety_reason = Some(format!(
                     "shared exit block 0x{target:x} is also reached by control this did not lower"
                 ));
-                return CStmt::Empty;
+                return Ok(CStmt::Empty);
             }
             // The head is reached by several edges -- that is why it is here
             // rather than at one of them -- so the walk starts past it.
@@ -1545,7 +1606,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                     self.safety_reason = Some(reason.unwrap_or_else(|| {
                         format!("shared exit block 0x{target:x} could not be placed")
                     }));
-                    return CStmt::Empty;
+                    return Ok(CStmt::Empty);
                 }
             };
             for addr in &chain {
@@ -1553,7 +1614,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             }
             let mut exit_stmts = Vec::new();
             for addr in &chain {
-                let block_stmt = self.structure_block(*addr);
+                let block_stmt = self.structure_block(*addr)?;
                 if !matches!(block_stmt, CStmt::Empty) {
                     exit_stmts.push(block_stmt);
                 }
@@ -1583,11 +1644,11 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                 });
             }
         }
-        match stmts.len() {
+        Ok(match stmts.len() {
             0 => CStmt::Empty,
             1 => stmts.remove(0),
             _ => CStmt::Block(stmts),
-        }
+        })
     }
 
     /// The blocks a shared exit runs through, starting at the shared head.
@@ -1695,9 +1756,9 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
     }
 
     /// Write the shared joins after the body, each behind its label.
-    fn append_shared_joins(&mut self, stmt: CStmt) -> CStmt {
+    fn append_shared_joins(&mut self, stmt: CStmt) -> ControlFlowStructureResult<CStmt> {
         if self.shared_joins.is_empty() {
-            return stmt;
+            return Ok(stmt);
         }
         let joins = std::mem::take(&mut self.shared_joins);
         let mut stmts = Vec::new();
@@ -1706,7 +1767,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             self.structured_region_blocks.insert(addr);
             let mut block_stmts = vec![CStmt::Label(self.ensure_label(addr))];
             if let Some(block) = self.func.get_block(addr) {
-                block_stmts.extend(self.folded_block_stmts(block, addr));
+                block_stmts.extend(self.folded_block_stmts(block, addr)?);
             }
             let join_stmt = CStmt::Block(block_stmts);
             stmts.push(if self.retain_region_markers {
@@ -1721,14 +1782,14 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                 join_stmt
             });
         }
-        match stmts.len() {
+        Ok(match stmts.len() {
             0 => CStmt::Empty,
             1 => stmts.remove(0),
             _ => CStmt::Block(stmts),
-        }
+        })
     }
 
-    fn structure_block(&mut self, addr: u64) -> CStmt {
+    fn structure_block(&mut self, addr: u64) -> ControlFlowStructureResult<CStmt> {
         if self.is_unresolved_indirect_dispatch_block(addr) {
             // Where this block goes was never recovered, so there is no shape
             // to give it. Saying that is still saying something, and rendering
@@ -1740,19 +1801,19 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                 stmts.push(CStmt::Label(label));
             }
             if let Some(block) = self.func.get_block(addr) {
-                stmts.extend(self.folded_block_stmts(block, addr));
+                stmts.extend(self.folded_block_stmts(block, addr)?);
             }
             stmts.push(CStmt::comment(
                 "indirect branch target unresolved".to_string(),
             ));
-            return match stmts.len() {
+            return Ok(match stmts.len() {
                 1 => stmts.remove(0),
                 _ => CStmt::Block(stmts),
-            };
+            });
         }
         let block = match self.func.get_block(addr) {
             Some(b) => b,
-            None => return CStmt::Empty,
+            None => return Ok(CStmt::Empty),
         };
 
         let mut stmts = Vec::new();
@@ -1763,7 +1824,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         }
 
         // Convert operations to statements
-        stmts.extend(self.folded_block_stmts(block, addr));
+        stmts.extend(self.folded_block_stmts(block, addr)?);
 
         // Control leaving here for a shared join has no structure to carry it,
         // so it says what it brought and where it goes.
@@ -1778,17 +1839,17 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         }
 
         if stmts.is_empty() {
-            CStmt::Empty
+            Ok(CStmt::Empty)
         } else if stmts.len() == 1 {
-            stmts.remove(0)
+            Ok(stmts.remove(0))
         } else {
-            CStmt::Block(stmts)
+            Ok(CStmt::Block(stmts))
         }
     }
 
     /// Structure a loop body region, flattening block sequences into a single
     /// statement list to avoid nested `{ ...; break; } { ...; continue; }` braces.
-    fn structure_loop_body(&mut self, body: &Region) -> CStmt {
+    fn structure_loop_body(&mut self, body: &Region) -> ControlFlowStructureResult<CStmt> {
         // If the body is a Sequence of Blocks, flatten all block statements
         // into one continuous list instead of wrapping each in CStmt::Block.
         if let Region::Sequence(regions) = body {
@@ -1801,11 +1862,11 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                 match region {
                     Region::Block(addr) => {
                         // Inline the block's statements directly
-                        self.structure_block_stmts_into(*addr, &mut all_stmts);
+                        self.structure_block_stmts_into(*addr, &mut all_stmts)?;
                     }
                     _ => {
                         // Non-block region: structure normally and append
-                        let stmt = self.structure_region(region);
+                        let stmt = self.structure_region(region)?;
                         if !matches!(stmt, CStmt::Empty) {
                             all_stmts.push(stmt);
                         }
@@ -1816,11 +1877,11 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                 }
             }
             if all_stmts.is_empty() {
-                CStmt::Empty
+                Ok(CStmt::Empty)
             } else if all_stmts.len() == 1 {
-                all_stmts.remove(0)
+                Ok(all_stmts.remove(0))
             } else {
-                CStmt::Block(all_stmts)
+                Ok(CStmt::Block(all_stmts))
             }
         } else {
             self.structure_region(body)
@@ -1889,13 +1950,17 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
 
     /// Emit statements for a block directly into an existing statement list
     /// (without wrapping in CStmt::Block). Used for loop body flattening.
-    fn structure_block_stmts_into(&mut self, addr: u64, stmts: &mut Vec<CStmt>) {
+    fn structure_block_stmts_into(
+        &mut self,
+        addr: u64,
+        stmts: &mut Vec<CStmt>,
+    ) -> ControlFlowStructureResult<()> {
         if self.is_unresolved_indirect_dispatch_block(addr) {
-            return;
+            return Ok(());
         }
         let block = match self.func.get_block(addr) {
             Some(b) => b,
-            None => return,
+            None => return Ok(()),
         };
 
         // Add label if needed
@@ -1904,7 +1969,8 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         }
 
         // Convert operations to statements
-        stmts.extend(self.folded_block_stmts(block, addr));
+        stmts.extend(self.folded_block_stmts(block, addr)?);
+        Ok(())
     }
 
     fn ensure_label(&mut self, addr: u64) -> String {
@@ -1931,14 +1997,16 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
     /// that stops holding: a block another edge also reaches, or one that merges
     /// values, or one that branches, could not be placed here without saying
     /// something the function does not do.
-    fn exit_continuation_stmt(&mut self, target: u64) -> Result<CStmt, Option<String>> {
-        let (chain, rejoin) = self.exit_continuation_chain(target)?;
+    fn exit_continuation_stmt(&mut self, target: u64) -> Result<CStmt, ExitContinuationError> {
+        let (chain, rejoin) = self
+            .exit_continuation_chain(target)
+            .map_err(ExitContinuationError::Placement)?;
         for addr in &chain {
             self.structured_region_blocks.insert(*addr);
         }
         let mut stmts = Vec::new();
         for addr in &chain {
-            let stmt = self.structure_block(*addr);
+            let stmt = self.structure_block(*addr)?;
             if !matches!(stmt, CStmt::Empty) {
                 stmts.push(stmt);
             }
@@ -1961,9 +2029,9 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             let (cond, predicate, condition_value) =
                 self.get_branch_condition_with_predicate(branch);
             let Some(cond) = cond else {
-                return Err(Some(format!(
+                return Err(ExitContinuationError::Placement(Some(format!(
                     "exit continuation block 0x{branch:x} branches on nothing this can read"
-                )));
+                ))));
             };
             self.record_branch_render_proof(branch, predicate, condition_value);
             stmts.push(self.observe_control_ownership(
@@ -2120,21 +2188,24 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
     /// Emit side-effecting statements for a block without labels or loop markers.
     /// Used for condition/switch header blocks where statements must appear before
     /// the structured control-flow construct.
-    fn structure_block_prefix_stmts(&mut self, addr: u64) -> Vec<CStmt> {
+    fn structure_block_prefix_stmts(
+        &mut self,
+        addr: u64,
+    ) -> ControlFlowStructureResult<Vec<CStmt>> {
         if self.is_unresolved_indirect_dispatch_block(addr) {
-            return Vec::new();
+            return Ok(Vec::new());
         }
         let block = match self.func.get_block(addr) {
             Some(b) => b,
-            None => return Vec::new(),
+            None => return Ok(Vec::new()),
         };
 
         let mut stmts = Vec::new();
         if let Some(label) = self.take_block_label(addr) {
             stmts.push(CStmt::Label(label));
         }
-        stmts.extend(self.folded_block_stmts(block, addr));
-        stmts
+        stmts.extend(self.folded_block_stmts(block, addr)?);
+        Ok(stmts)
     }
 
     fn combine_loop_condition_prefix(
@@ -2165,7 +2236,11 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         }
     }
 
-    fn folded_block_stmts(&mut self, block: &r2ssa::FunctionSSABlock, addr: u64) -> Vec<CStmt> {
+    fn folded_block_stmts(
+        &mut self,
+        block: &r2ssa::FunctionSSABlock,
+        addr: u64,
+    ) -> ControlFlowStructureResult<Vec<CStmt>> {
         self.fold_ctx.folded_blocks.borrow_mut().insert(addr);
         let stmts = if let Some(folded) = self.folded_block_cache.get(&addr) {
             if std::env::var_os("R2SLEIGH_DEBUG_MERGES").is_some() {
@@ -2174,7 +2249,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             self.fold_ctx
                 .clone_cached_render_occurrence(&folded.stmts)
         } else {
-            let stmts = self.fold_ctx.fold_block(block, addr);
+            let stmts = self.fold_ctx.fold_block(block, addr)?;
             if std::env::var_os("R2SLEIGH_DEBUG_MERGES").is_some() {
                 eprintln!("FOLDCACHE miss block={addr:#x} stmts={}", stmts.len());
             }
@@ -2216,7 +2291,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                 eprintln!("  FSTMT {index} target={target} reads={names:?}");
             }
         }
-        stmts
+        Ok(stmts)
     }
 
     fn validate_certified_block_domain(&mut self, _block_addr: u64, _stmts: &[CStmt]) {}
@@ -2477,7 +2552,11 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
     }
 
     /// Structure an irreducible region using gotos.
-    fn structure_irreducible(&mut self, entry: u64, blocks: &[u64]) -> CStmt {
+    fn structure_irreducible(
+        &mut self,
+        entry: u64,
+        blocks: &[u64],
+    ) -> ControlFlowStructureResult<CStmt> {
         // Assign labels to all blocks
         for &addr in blocks {
             if !self.labels.contains_key(&addr) {
@@ -2488,16 +2567,16 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         }
 
         // Start with the entry block
-        let mut stmts = vec![self.structure_block(entry)];
+        let mut stmts = vec![self.structure_block(entry)?];
 
         // Add remaining blocks with gotos
         for &addr in blocks {
             if addr != entry {
-                stmts.push(self.structure_block(addr));
+                stmts.push(self.structure_block(addr)?);
             }
         }
 
-        CStmt::Block(stmts)
+        Ok(CStmt::Block(stmts))
     }
 
     // TODO: gen_label() and goto_block() are reserved for future use when
@@ -3106,9 +3185,13 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         then_region: &Region,
         else_region: Option<&Region>,
         merge_block: Option<u64>,
-    ) -> Option<CStmt> {
-        let merge_block = merge_block?;
-        let else_region = else_region?;
+    ) -> ControlFlowStructureResult<Option<CStmt>> {
+        let Some(merge_block) = merge_block else {
+            return Ok(None);
+        };
+        let Some(else_region) = else_region else {
+            return Ok(None);
+        };
 
         let summaries = self
             .fold_ctx
@@ -3117,7 +3200,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             .filter(|summary| summary.merge_block_addr == merge_block)
             .collect::<Vec<_>>();
         let [summary] = summaries.as_slice() else {
-            return None;
+            return Ok(None);
         };
 
         let then_pred = self.unique_region_predecessor_to_merge(then_region, merge_block);
@@ -3127,12 +3210,12 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         let else_can_rewrite = else_pred
             .is_some_and(|pred| self.has_merged_slot_return_expr(else_region, pred, summary));
         if !then_can_rewrite && !else_can_rewrite {
-            return None;
+            return Ok(None);
         }
 
         let control_proof_checkpoint = self.control_render_proofs.len();
-        let mut then_stmt = self.structure_region(then_region);
-        let mut else_stmt = self.structure_region(else_region);
+        let mut then_stmt = self.structure_region(then_region)?;
+        let mut else_stmt = self.structure_region(else_region)?;
         let mut rewrote_any = false;
 
         if then_can_rewrite
@@ -3165,12 +3248,14 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         {
             self.control_render_proofs
                 .truncate(control_proof_checkpoint);
-            return None;
+            return Ok(None);
         }
 
         let (cond, predicate, condition_value) =
             self.get_branch_condition_with_predicate(cond_block);
-        let cond = cond?;
+        let Some(cond) = cond else {
+            return Ok(None);
+        };
         let if_stmt = self.observe_control_ownership(
             cond_block,
             CStmt::If {
@@ -3181,13 +3266,13 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         );
         self.note_merge_block_rendered_by_duplication(merge_block);
         self.record_branch_render_proof(cond_block, predicate, condition_value);
-        let mut prefix = self.structure_block_prefix_stmts(cond_block);
+        let mut prefix = self.structure_block_prefix_stmts(cond_block)?;
         prefix.push(if_stmt);
-        Some(if prefix.len() == 1 {
+        Ok(Some(if prefix.len() == 1 {
             prefix.into_iter().next().unwrap_or(CStmt::Empty)
         } else {
             CStmt::Block(prefix)
-        })
+        }))
     }
 
     fn try_structure_if_else_with_register_merge_returns(
@@ -3196,19 +3281,27 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         then_region: &Region,
         else_region: Option<&Region>,
         merge_block: Option<u64>,
-    ) -> Option<CStmt> {
-        let merge_block = merge_block?;
-        let else_region = else_region?;
+    ) -> ControlFlowStructureResult<Option<CStmt>> {
+        let Some(merge_block) = merge_block else {
+            return Ok(None);
+        };
+        let Some(else_region) = else_region else {
+            return Ok(None);
+        };
         let then_pred = self.unique_region_predecessor_to_merge(then_region, merge_block);
         let else_pred = self.unique_region_predecessor_to_merge(else_region, merge_block);
-        let mut then_can_rewrite =
-            then_pred.is_some_and(|pred| self.has_merged_register_return_expr(merge_block, pred));
-        let mut else_can_rewrite =
-            else_pred.is_some_and(|pred| self.has_merged_register_return_expr(merge_block, pred));
+        let mut then_can_rewrite = match then_pred {
+            Some(pred) => self.has_merged_register_return_expr(merge_block, pred)?,
+            None => false,
+        };
+        let mut else_can_rewrite = match else_pred {
+            Some(pred) => self.has_merged_register_return_expr(merge_block, pred)?,
+            None => false,
+        };
         let control_proof_checkpoint = self.control_render_proofs.len();
 
-        let mut then_stmt = self.structure_region(then_region);
-        let mut else_stmt = self.structure_region(else_region);
+        let mut then_stmt = self.structure_region(then_region)?;
+        let mut else_stmt = self.structure_region(else_region)?;
         then_can_rewrite |= then_pred.is_some_and(|pred| {
             self.stmt_has_predecessor_return_register_certificate(&then_stmt, pred)
         });
@@ -3218,14 +3311,14 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         if !then_can_rewrite && !else_can_rewrite {
             self.control_render_proofs
                 .truncate(control_proof_checkpoint);
-            return None;
+            return Ok(None);
         }
         let mut rewrote_any = false;
 
         if then_can_rewrite
             && let Some(pred) = then_pred
             && let Some(rewritten) =
-                self.append_merged_register_return_if_needed(then_stmt.clone(), merge_block, pred)
+                self.append_merged_register_return_if_needed(then_stmt.clone(), merge_block, pred)?
         {
             then_stmt = rewritten;
             rewrote_any = true;
@@ -3233,7 +3326,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         if else_can_rewrite
             && let Some(pred) = else_pred
             && let Some(rewritten) =
-                self.append_merged_register_return_if_needed(else_stmt.clone(), merge_block, pred)
+                self.append_merged_register_return_if_needed(else_stmt.clone(), merge_block, pred)?
         {
             else_stmt = rewritten;
             rewrote_any = true;
@@ -3244,12 +3337,14 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         {
             self.control_render_proofs
                 .truncate(control_proof_checkpoint);
-            return None;
+            return Ok(None);
         }
 
         let (cond, predicate, condition_value) =
             self.get_branch_condition_with_predicate(cond_block);
-        let cond = cond?;
+        let Some(cond) = cond else {
+            return Ok(None);
+        };
         let if_stmt = self.observe_control_ownership(
             cond_block,
             CStmt::If {
@@ -3261,13 +3356,13 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         self.note_merge_block_rendered_by_duplication(merge_block);
         self.record_branch_render_proof(cond_block, predicate, condition_value);
 
-        let mut prefix = self.structure_block_prefix_stmts(cond_block);
+        let mut prefix = self.structure_block_prefix_stmts(cond_block)?;
         prefix.push(if_stmt);
-        Some(if prefix.len() == 1 {
+        Ok(Some(if prefix.len() == 1 {
             prefix.into_iter().next().unwrap_or(CStmt::Empty)
         } else {
             CStmt::Block(prefix)
-        })
+        }))
     }
 
     fn try_structure_guarded_switch_with_default(
@@ -3276,51 +3371,53 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         then_region: &Region,
         else_region: Option<&Region>,
         merge_block: Option<u64>,
-    ) -> Option<CStmt> {
-        let else_region = else_region?;
+    ) -> ControlFlowStructureResult<Option<CStmt>> {
+        let Some(else_region) = else_region else {
+            return Ok(None);
+        };
         let (switch_view, default_region) = match (
             Self::switch_region_view(then_region),
             Self::switch_region_view(else_region),
         ) {
             (Some(switch_view), None) => (switch_view, else_region),
             (None, Some(switch_view)) => (switch_view, then_region),
-            _ => return None,
+            _ => return Ok(None),
         };
 
         if self.func.switch_info(switch_view.switch_block).is_some() {
-            return None;
+            return Ok(None);
         }
         if switch_view.default.is_some() || switch_view.cases.len() < 4 {
-            return None;
+            return Ok(None);
         }
         if !self
             .func
             .successors(cond_block)
             .contains(&switch_view.entry_block)
         {
-            return None;
+            return Ok(None);
         }
 
         let combined_merge = merge_block.or(switch_view.merge_block);
-        let mut prefix = self.structure_block_prefix_stmts(cond_block);
+        let mut prefix = self.structure_block_prefix_stmts(cond_block)?;
         for region in switch_view.prefix_regions {
-            Self::append_stmt_body_flat(&mut prefix, self.structure_region(region));
+            Self::append_stmt_body_flat(&mut prefix, self.structure_region(region)?);
         }
         let switch_stmt = self.structure_switch_region(
             switch_view.switch_block,
             switch_view.cases,
             Some(default_region),
             None,
-        );
+        )?;
         Self::append_stmt_body_flat(&mut prefix, switch_stmt);
         if let Some(merge_addr) = combined_merge {
-            Self::append_stmt_body_flat(&mut prefix, self.structure_block(merge_addr));
+            Self::append_stmt_body_flat(&mut prefix, self.structure_block(merge_addr)?);
         }
-        Some(if prefix.len() == 1 {
+        Ok(Some(if prefix.len() == 1 {
             prefix.into_iter().next().unwrap_or(CStmt::Empty)
         } else {
             CStmt::Block(prefix)
-        })
+        }))
     }
 
     fn switch_region_view(region: &Region) -> Option<SwitchRegionView<'_>> {
@@ -3583,32 +3680,32 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         stmt: CStmt,
         merge_addr: u64,
         pred_addr: u64,
-    ) -> Option<CStmt> {
+    ) -> ControlFlowStructureResult<Option<CStmt>> {
         if !self.block_allows_predecessor_return_register_rewrite(merge_addr) {
-            return None;
+            return Ok(None);
         }
         let Some((expr, proof_block, proof_op, proof_value)) =
-            self.return_register_candidate_for_merge_predecessor(merge_addr, pred_addr)
+            self.return_register_candidate_for_merge_predecessor(merge_addr, pred_addr)?
         else {
             if Self::single_return_expr(&stmt).is_some()
                 && let Some((proof_block, proof_op, proof_value)) =
                     self.predecessor_return_register_certificate(pred_addr)
             {
-                return Some(self.observe_return_value_ownership(
+                return Ok(Some(self.observe_return_value_ownership(
                     stmt,
                     proof_block, proof_op, proof_value,
-                ));
+                )));
             }
-            return None;
+            return Ok(None);
         };
         if let Some(rewritten) = self.rewrite_trailing_return_with_merged_expr(&stmt, &expr) {
-            return Some(self.observe_return_value_ownership(
+            return Ok(Some(self.observe_return_value_ownership(
                 rewritten,
                 proof_block, proof_op, proof_value,
-            ));
+            )));
         }
         if Self::single_terminator_stmt(&stmt).is_some() {
-            return Some(stmt);
+            return Ok(Some(stmt));
         }
         let mut stmts = Vec::new();
         Self::append_stmt_body_flat(&mut stmts, stmt);
@@ -3620,7 +3717,12 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         } else {
             CStmt::Block(stmts)
         };
-        Some(self.observe_return_value_ownership(rewritten, proof_block, proof_op, proof_value))
+        Ok(Some(self.observe_return_value_ownership(
+            rewritten,
+            proof_block,
+            proof_op,
+            proof_value,
+        )))
     }
 
     fn predecessor_return_register_certificate(
@@ -3649,9 +3751,14 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                 .is_some()
     }
 
-    fn has_merged_register_return_expr(&self, merge_addr: u64, pred_addr: u64) -> bool {
-        self.return_register_candidate_for_merge_predecessor(merge_addr, pred_addr)
-            .is_some()
+    fn has_merged_register_return_expr(
+        &self,
+        merge_addr: u64,
+        pred_addr: u64,
+    ) -> ControlFlowStructureResult<bool> {
+        Ok(self
+            .return_register_candidate_for_merge_predecessor(merge_addr, pred_addr)?
+            .is_some())
     }
 
     /// Record that a merge block reached the output through its predecessors.
@@ -5732,7 +5839,9 @@ mod tests {
         ] {
             let plain_ctx = FoldingContext::new(64);
             let mut plain_structurer = ControlFlowStructurer::new(&func, &plain_ctx);
-            let plain = plain_structurer.structure_preserving_render_proof_identity_impl();
+            let plain = plain_structurer
+                .structure_preserving_render_proof_identity_impl()
+                .expect("plain production structure");
             assert!(plain_structurer.safety_reason().is_none());
             let plain = ControlFlowStructurer::cleanup(&plain_ctx.symbols, plain);
 
@@ -6009,7 +6118,9 @@ mod tests {
             (Some(2), Box::new(Region::Block(0x1030))),
         ];
 
-        let rendered = structurer.structure_switch_region(0x1000, &cases, None, None);
+        let rendered = structurer
+            .structure_switch_region(0x1000, &cases, None, None)
+            .expect("supported switch lowering");
         let values = first_switch_case_values(&rendered).expect("rendered switch");
 
         assert_eq!(
@@ -6265,7 +6376,9 @@ mod tests {
             merge_block: Some(0x1020),
         };
 
-        let stmt = structurer.structure_region(&region);
+        let stmt = structurer
+            .structure_region(&region)
+            .expect("supported terminating branch lowering");
         let rendered = format!("{stmt:?}");
 
         assert!(
@@ -6361,7 +6474,7 @@ mod tests {
         let ctx = FoldingContext::new(64);
         let mut structurer = ControlFlowStructurer::new(&func, &ctx);
 
-        let stmt = structurer.structure();
+        let stmt = structurer.structure().expect("supported loop lowering");
 
         assert!(
             stmt_contains_loop(&stmt),

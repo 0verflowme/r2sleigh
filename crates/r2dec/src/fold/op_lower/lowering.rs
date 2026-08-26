@@ -489,10 +489,14 @@ impl<'a> FoldingContext<'a> {
         LoweredOp::Expr(call)
     }
 
-    pub(super) fn lower_op(&self, op: &SSAOp, frame: &mut LowerFrame) -> LoweredOp {
-        match frame.mode {
+    pub(super) fn lower_op(
+        &self,
+        op: &SSAOp,
+        frame: &mut LowerFrame,
+    ) -> OpLoweringResult<LoweredOp> {
+        Ok(match frame.mode {
             LowerMode::Expr => self
-                .op_to_expr_impl(op, frame)
+                .op_to_expr_impl(op, frame)?
                 .map(LoweredOp::Expr)
                 .unwrap_or(LoweredOp::None),
             LowerMode::Stmt => {
@@ -500,9 +504,9 @@ impl<'a> FoldingContext<'a> {
                     match op {
                         SSAOp::Call { target } => {
                             let Some((source_block, source_op_idx)) = frame.source_call_site else {
-                                return LoweredOp::Comment(
+                                return Ok(LoweredOp::Comment(
                                     "r2sleigh residual: missing exact source callsite".to_string(),
-                                );
+                                ));
                             };
                             let direct_target = parse_address_from_var_name(&target.name);
                             let func_expr = self.resolve_call_target_for_site(
@@ -525,10 +529,10 @@ impl<'a> FoldingContext<'a> {
                                     raw_args,
                                 )
                             else {
-                                return LoweredOp::Comment(format!(
+                                return Ok(LoweredOp::Comment(format!(
                                     "r2sleigh residual: uncertified callsite arguments at 0x{:x}:{}",
                                     source_block, source_op_idx
-                                ));
+                                )));
                             };
                             let mut args = certified_args.args.clone();
                             if let Some(max_arity) = self
@@ -543,18 +547,18 @@ impl<'a> FoldingContext<'a> {
                             }
                             let call =
                                 CExpr::call_at((source_block, source_op_idx), func_expr, args);
-                            return self.lower_certified_statement_call(
+                            return Ok(self.lower_certified_statement_call(
                                 source_block,
                                 source_op_idx,
                                 call,
                                 certified_args,
-                            );
+                            ));
                         }
                         SSAOp::CallInd { target } => {
                             let Some((source_block, source_op_idx)) = frame.source_call_site else {
-                                return LoweredOp::Comment(
+                                return Ok(LoweredOp::Comment(
                                     "r2sleigh residual: missing exact source callsite".to_string(),
-                                );
+                                ));
                             };
                             let resolved_target = self.resolve_call_target_for_site(
                                 source_block,
@@ -574,10 +578,10 @@ impl<'a> FoldingContext<'a> {
                                 &func_expr,
                                 raw_args,
                             ) else {
-                                return LoweredOp::Comment(format!(
+                                return Ok(LoweredOp::Comment(format!(
                                     "r2sleigh residual: uncertified indirect-call arguments at 0x{:x}:{}",
                                     source_block, source_op_idx
-                                ));
+                                )));
                             };
                             let mut args = certified_args.args.clone();
                             if let Some(max_arity) =
@@ -587,51 +591,42 @@ impl<'a> FoldingContext<'a> {
                                 certified_args.values.truncate(max_arity);
                             }
                             let call = CExpr::call(func_expr, args);
-                            return self.lower_certified_statement_call(
+                            return Ok(self.lower_certified_statement_call(
                                 source_block,
                                 source_op_idx,
                                 call,
                                 certified_args,
-                            );
+                            ));
                         }
                         _ => {}
                     }
                 }
 
-                self.op_to_stmt_impl(op, frame)
+                self.op_to_stmt_impl(op, frame)?
                     .map(Self::lowered_from_stmt)
                     .unwrap_or(LoweredOp::None)
             }
-        }
+        })
     }
 
-    pub(crate) fn op_to_expr(&self, op: &SSAOp) -> CExpr {
+    pub(crate) fn op_to_expr(&self, op: &SSAOp) -> OpLoweringResult<CExpr> {
         let mut frame = LowerFrame::for_expr();
-        match self.lower_op(op, &mut frame) {
+        Ok(match self.lower_op(op, &mut frame)? {
             LoweredOp::Expr(expr) => expr,
             LoweredOp::Assign { lhs, rhs } => CExpr::assign(lhs, rhs),
             LoweredOp::FinalizedStmt(CStmt::Expr(expr)) => expr,
             LoweredOp::FinalizedStmt(CStmt::Return(Some(expr))) => expr,
-            LoweredOp::FinalizedStmt(_) => CExpr::External {
-                name: "__unhandled_op__".to_string(),
-                kind: crate::symbol::ExternalKind::Intrinsic,
-            },
-            LoweredOp::Return(Some(expr)) => expr,
-            LoweredOp::Return(None) => CExpr::External {
-                name: "return".to_string(),
-                kind: crate::symbol::ExternalKind::Intrinsic,
-            },
-            LoweredOp::Comment(_) | LoweredOp::None => {
-                if let Some(dst) = op.dst() {
-                    self.name_ref(&self.var_name(dst))
-                } else {
-                    CExpr::External {
-                        name: "__unhandled_op__".to_string(),
-                        kind: crate::symbol::ExternalKind::Intrinsic,
-                    }
-                }
+            LoweredOp::FinalizedStmt(_) => {
+                return Err(OpLoweringRefusal::UnrepresentableOperation);
             }
-        }
+            LoweredOp::Return(Some(expr)) => expr,
+            LoweredOp::Return(None) => {
+                return Err(OpLoweringRefusal::UnrepresentableOperation);
+            }
+            LoweredOp::Comment(_) | LoweredOp::None => {
+                return Err(OpLoweringRefusal::UnrepresentableOperation);
+            }
+        })
     }
 
     pub(crate) fn op_to_expr_at(
@@ -639,7 +634,7 @@ impl<'a> FoldingContext<'a> {
         op: &SSAOp,
         block_addr: u64,
         op_idx: usize,
-    ) -> LoweredExprAt {
+    ) -> OpLoweringResult<LoweredExprAt> {
         // Operand observations are attached while their exact expression
         // positions still exist. Wrapping the completed expression once per
         // input would falsely make every operand own the same aggregate node.
@@ -647,33 +642,25 @@ impl<'a> FoldingContext<'a> {
         let mut frame = LowerFrame::for_observed_expr(normalized_site);
         let lowered = self.project_lowered_assignment(
             normalized_site,
-            self.lower_op(op, &mut frame));
+            self.lower_op(op, &mut frame)?,
+        );
         let lowered = match lowered {
             LoweredOp::Expr(expr) => LoweredExprAt::Rendered(expr),
             LoweredOp::Assign { lhs, rhs } => LoweredExprAt::Rendered(CExpr::assign(lhs, rhs)),
             LoweredOp::FinalizedStmt(CStmt::Expr(expr)) => LoweredExprAt::Rendered(expr),
             LoweredOp::FinalizedStmt(CStmt::Return(Some(expr))) => LoweredExprAt::Rendered(expr),
-            LoweredOp::FinalizedStmt(_) => LoweredExprAt::DestinationFallback(CExpr::External {
-                name: "__unhandled_op__".to_string(),
-                kind: crate::symbol::ExternalKind::Intrinsic,
-            }),
+            LoweredOp::FinalizedStmt(_) => {
+                return Err(OpLoweringRefusal::UnrepresentableOperation);
+            }
             LoweredOp::Return(Some(expr)) => LoweredExprAt::Rendered(expr),
-            LoweredOp::Return(None) => LoweredExprAt::Rendered(CExpr::External {
-                name: "return".to_string(),
-                kind: crate::symbol::ExternalKind::Intrinsic,
-            }),
+            LoweredOp::Return(None) => {
+                return Err(OpLoweringRefusal::UnrepresentableOperation);
+            }
             LoweredOp::Comment(_) | LoweredOp::None => {
-                LoweredExprAt::DestinationFallback(if let Some(dst) = op.dst() {
-                    self.name_ref(&self.var_name(dst))
-                } else {
-                    CExpr::External {
-                        name: "__unhandled_op__".to_string(),
-                        kind: crate::symbol::ExternalKind::Intrinsic,
-                    }
-                })
+                return Err(OpLoweringRefusal::UnrepresentableOperation);
             }
         };
-        match lowered {
+        Ok(match lowered {
             LoweredExprAt::Rendered(expr) => {
                 let obligations = self.exact_normalized_op_effects(
                     op,
@@ -688,8 +675,7 @@ impl<'a> FoldingContext<'a> {
                 };
                 LoweredExprAt::Rendered(self.observe_effect_expr(&obligations, expr))
             }
-            fallback @ LoweredExprAt::DestinationFallback(_) => fallback,
-        }
+        })
     }
 
     /// Attach only the exact result identity to a custom producer expression.
@@ -716,18 +702,20 @@ impl<'a> FoldingContext<'a> {
         op: &SSAOp,
         block_addr: u64,
         op_idx: usize,
-    ) -> Option<CStmt> {
+    ) -> OpLoweringResult<Option<CStmt>> {
         let source_site = self.source_op_site_for_normalized_op(block_addr, op_idx);
         if matches!(op, SSAOp::Call { .. } | SSAOp::CallInd { .. }) && source_site.is_none() {
-            return Some(self.certified_residual_comment(format!(
+            return Ok(Some(self.certified_residual_comment(format!(
                 "synthetic operation cannot carry callsite facts at 0x{block_addr:x}:{op_idx}"
-            )));
+            ))));
         }
         let normalized_site = self.normalized_site(block_addr, op_idx);
         let source_call_site = source_site.or(Some((block_addr, op_idx)));
         let mut frame = LowerFrame::for_stmt(normalized_site, source_call_site, true);
-        let lowered = self.lower_op(op, &mut frame);
-        let stmt = self.lowered_to_stmt(lowered)?;
+        let lowered = self.lower_op(op, &mut frame)?;
+        let Some(stmt) = self.lowered_to_stmt(lowered) else {
+            return Ok(None);
+        };
         let stmt = self.project_finalized_assignment_stmt(normalized_site, stmt);
 
         let obligations = self.exact_normalized_op_effects(
@@ -743,7 +731,7 @@ impl<'a> FoldingContext<'a> {
         } else {
             stmt
         };
-        Some(self.observe_effect_stmt(&obligations, stmt))
+        Ok(Some(self.observe_effect_stmt(&obligations, stmt)))
     }
 
     /// Render one resolved indirect-call target without letting occurrence

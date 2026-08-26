@@ -573,13 +573,14 @@ impl<'a> FoldingContext<'a> {
         &self,
         block_addr: u64,
         pred_addr: u64,
-    ) -> Option<(CExpr, u64, usize, r2ssa::ValueId)> {
-        let func = self
-            .inputs
-            .prepared_ssa
-            .map(|prepared| prepared.function())?;
-        let prepared = self.inputs.prepared_ssa?;
-        let block = func.get_block(block_addr)?;
+    ) -> OpLoweringResult<Option<(CExpr, u64, usize, r2ssa::ValueId)>> {
+        let Some(prepared) = self.inputs.prepared_ssa else {
+            return Ok(None);
+        };
+        let func = prepared.function();
+        let Some(block) = func.get_block(block_addr) else {
+            return Ok(None);
+        };
         let mut best = None;
 
         for phi in &block.phis {
@@ -595,8 +596,8 @@ impl<'a> FoldingContext<'a> {
                 if *source_pred != pred_addr {
                     continue;
                 }
-                let candidate =
-                    self.return_register_candidate_for_phi_source_in_predecessor(pred_addr, source);
+                let candidate = self
+                    .return_register_candidate_for_phi_source_in_predecessor(pred_addr, source)?;
                 let Some(expr) = candidate else {
                     continue;
                 };
@@ -633,50 +634,67 @@ impl<'a> FoldingContext<'a> {
             }
         }
 
-        best
+        Ok(best)
     }
 
     pub(crate) fn predecessor_return_register_candidate_with_proof(
         &self,
         pred_addr: u64,
-    ) -> Option<(CExpr, u64, usize, r2ssa::ValueId)> {
-        let prepared = self.inputs.prepared_ssa?;
-        let cert = prepared
+    ) -> OpLoweringResult<Option<(CExpr, u64, usize, r2ssa::ValueId)>> {
+        let Some(prepared) = self.inputs.prepared_ssa else {
+            return Ok(None);
+        };
+        let Some(cert) = prepared
             .certificates()
             .returns
             .iter()
             .filter(|cert| cert.block_addr == pred_addr)
-            .max_by_key(|cert| cert.op_index)?;
-        let source = prepared.value_var(cert.value)?;
-        let expr = self
-            .return_register_candidate_from_predecessor_definition(pred_addr, source)
-            .or_else(|| self.return_register_candidate_for_phi_source(source))?;
-        Some((expr, cert.block_addr, cert.op_index, cert.value))
+            .max_by_key(|cert| cert.op_index)
+        else {
+            return Ok(None);
+        };
+        let Some(source) = prepared.value_var(cert.value) else {
+            return Ok(None);
+        };
+        let expr = match self.return_register_candidate_from_predecessor_definition(
+            pred_addr, source,
+        )? {
+            Some(expr) => Some(expr),
+            None => self.return_register_candidate_for_phi_source(source)?,
+        };
+        Ok(expr.map(|expr| (expr, cert.block_addr, cert.op_index, cert.value)))
     }
 
     fn return_register_candidate_for_phi_source_in_predecessor(
         &self,
         pred_addr: u64,
         source: &SSAVar,
-    ) -> Option<CExpr> {
-        self.return_register_candidate_for_phi_source(source)
-            .or_else(|| {
-                self.return_register_candidate_from_predecessor_definition(pred_addr, source)
-            })
+    ) -> OpLoweringResult<Option<CExpr>> {
+        if let Some(candidate) = self.return_register_candidate_for_phi_source(source)? {
+            return Ok(Some(candidate));
+        }
+        self.return_register_candidate_from_predecessor_definition(pred_addr, source)
     }
 
     fn return_register_candidate_from_predecessor_definition(
         &self,
         pred_addr: u64,
         source: &SSAVar,
-    ) -> Option<CExpr> {
-        let func = self.inputs.prepared_ssa?.function();
-        let block = func.get_block(pred_addr)?;
-        let (_, op) = block
+    ) -> OpLoweringResult<Option<CExpr>> {
+        let Some(func) = self.inputs.prepared_ssa.map(|prepared| prepared.function()) else {
+            return Ok(None);
+        };
+        let Some(block) = func.get_block(pred_addr) else {
+            return Ok(None);
+        };
+        let Some((_, op)) = block
             .ops
             .iter()
             .enumerate()
-            .find(|(_, op)| op.dst().is_some_and(|dst| dst == source))?;
+            .find(|(_, op)| op.dst().is_some_and(|dst| dst == source))
+        else {
+            return Ok(None);
+        };
         let candidate = match op {
             SSAOp::Copy { src, .. } => self.get_return_expr(src),
             SSAOp::IntZExt { dst, src }
@@ -687,7 +705,7 @@ impl<'a> FoldingContext<'a> {
             }
             _ => {
                 let mut visited = HashSet::new();
-                let raw = self.op_to_expr(op);
+                let raw = self.op_to_expr(op)?;
                 let expanded = self.expand_return_expr(&raw, 0, &mut visited);
                 let mut semantic_visited = HashSet::new();
                 let semanticized =
@@ -700,13 +718,16 @@ impl<'a> FoldingContext<'a> {
             }
         };
         let normalized = self.normalize_final_return_candidate(candidate.clone());
-        let sanitized = self.sanitize_final_return_expr(normalized, candidate);
-        (!self
+        let sanitized = self.sanitize_final_return_expr(normalized, candidate)?;
+        Ok((!self
             .expr_is_bad_return_candidate_in_context(&sanitized, VisibleExprContext::ScalarReturn))
-        .then_some(sanitized)
+        .then_some(sanitized))
     }
 
-    fn return_register_candidate_for_phi_source(&self, source: &SSAVar) -> Option<CExpr> {
+    fn return_register_candidate_for_phi_source(
+        &self,
+        source: &SSAVar,
+    ) -> OpLoweringResult<Option<CExpr>> {
         let source_name = source.display_name();
         let mut visited = HashSet::new();
         let candidate = self
@@ -722,17 +743,19 @@ impl<'a> FoldingContext<'a> {
             .or_else(|| self.best_visible_definition_with_depth(&source_name, 0, &mut visited))
             .or_else(|| Some(self.tracked_return_source_expr(source)));
 
-        candidate
+        let candidate = candidate
             .map(|expr| self.resolve_return_candidate(&expr))
-            .filter(|expr| !self.expr_is_transient_return_artifact(expr))
-            .map(|expr| {
-                let normalized = self.normalize_final_return_candidate(expr.clone());
-                self.sanitize_final_return_expr(normalized, expr)
-            })
-            .filter(|expr| {
-                !self
-                    .expr_is_bad_return_candidate_in_context(expr, VisibleExprContext::ScalarReturn)
-            })
+            .filter(|expr| !self.expr_is_transient_return_artifact(expr));
+        let Some(candidate) = candidate else {
+            return Ok(None);
+        };
+        let normalized = self.normalize_final_return_candidate(candidate.clone());
+        let candidate = self.sanitize_final_return_expr(normalized, candidate)?;
+        Ok((!self.expr_is_bad_return_candidate_in_context(
+            &candidate,
+            VisibleExprContext::ScalarReturn,
+        ))
+        .then_some(candidate))
     }
 
     pub(super) fn expr_is_transient_return_artifact(&self, expr: &CExpr) -> bool {
@@ -1307,19 +1330,23 @@ impl<'a> FoldingContext<'a> {
         .unwrap_or(unresolved)
     }
 
-    pub(super) fn sanitize_final_return_expr(&self, expr: CExpr, fallback: CExpr) -> CExpr {
+    pub(super) fn sanitize_final_return_expr(
+        &self,
+        expr: CExpr,
+        fallback: CExpr,
+    ) -> OpLoweringResult<CExpr> {
         if self.carrier_answers_the_return(&expr) {
-            return expr;
+            return Ok(expr);
         }
         if self.is_certified_rendered_call_expr(&expr) {
-            return self
+            return Ok(self
                 .stable_owner_for_certified_rendered_call_expr(&expr)
-                .unwrap_or(expr);
+                .unwrap_or(expr));
         }
         if self.is_certified_rendered_call_expr(&fallback) {
-            return self
+            return Ok(self
                 .stable_owner_for_certified_rendered_call_expr(&fallback)
-                .unwrap_or(fallback);
+                .unwrap_or(fallback));
         }
         let context = self.return_context_for_candidates(Some(&expr), Some(&fallback));
         self.preferred_return_candidate_in_context(
@@ -1331,10 +1358,7 @@ impl<'a> FoldingContext<'a> {
             let expr = self.rewrite_typed_return_literal_expr(expr, context);
             self.strip_widening_cast_for_function_return(expr)
         })
-        .unwrap_or_else(|| CExpr::External {
-            name: "return".to_string(),
-            kind: crate::symbol::ExternalKind::Intrinsic,
-        })
+        .ok_or(OpLoweringRefusal::UnrepresentableOperation)
     }
 
     fn strip_widening_cast_for_function_return(&self, expr: CExpr) -> CExpr {

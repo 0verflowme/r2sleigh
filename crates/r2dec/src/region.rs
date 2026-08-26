@@ -3526,7 +3526,9 @@ mod tests {
 
         let ctx = FoldingContext::new(64);
         let mut structurer = ControlFlowStructurer::new(&func, &ctx);
-        let rendered = structurer.structure();
+        let rendered = structurer
+            .structure()
+            .expect("supported irreducible-region lowering");
         let proof_anchors = structurer
             .control_render_proofs()
             .iter()

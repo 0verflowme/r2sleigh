@@ -1955,7 +1955,7 @@ fn collect_definitions(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
             if let Some(expr) = definition_overrides.get(&key).cloned() {
                 scratch.info.insert_definition_for_var(dst, expr);
             } else {
-                let expr = {
+                let lowered = {
                     let lower = LowerCtx {
                         // Legacy UseInfo numbers values in traversal order and
                         // has no source-authority seal. Its numeric IDs must
@@ -1974,7 +1974,17 @@ fn collect_definitions(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
                     // rule that precedes it, so the resolver applies it.
                     lower.op_to_expr(op)
                 };
-                scratch.info.insert_definition_for_var(dst, expr);
+                match lowered {
+                    Ok(expr) => scratch.info.insert_definition_for_var(dst, expr),
+                    Err(
+                        crate::analysis::lower::OpLoweringRefusal::MissingMachineProjectionAuthorization
+                        | crate::analysis::lower::OpLoweringRefusal::UnrepresentableOperation,
+                    ) => {
+                        // Definitions are advisory here. The canonical machine
+                        // disposition remains upstream, and no executable
+                        // expression is installed in its place.
+                    }
+                }
             }
         }
 
@@ -2023,8 +2033,8 @@ fn rebuild_definitions(
                 continue;
             };
             let key = dst.display_name();
-            let expr = if let Some(expr) = definition_overrides.get(&key).cloned() {
-                expr
+            let lowered = if let Some(expr) = definition_overrides.get(&key).cloned() {
+                Ok(expr)
             } else {
                 let lower = LowerCtx {
                     binding_names: None,
@@ -2046,7 +2056,16 @@ fn rebuild_definitions(
             // the end; with one store, a definition the lowering wants has to be
             // where the lowering looks.
             let _ = key;
-            scratch.info.insert_definition_for_var(dst, expr);
+            match lowered {
+                Ok(expr) => scratch.info.insert_definition_for_var(dst, expr),
+                Err(
+                    crate::analysis::lower::OpLoweringRefusal::MissingMachineProjectionAuthorization
+                    | crate::analysis::lower::OpLoweringRefusal::UnrepresentableOperation,
+                ) => {
+                    // Keep the definition absent rather than caching a guessed
+                    // expression; BindingPlan owns the eventual refusal.
+                }
+            }
         }
     }
 }

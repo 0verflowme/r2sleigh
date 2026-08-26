@@ -1,4 +1,5 @@
 use crate::ast::CStmt;
+use crate::structure::{ControlFlowStructureError, ControlFlowStructureResult};
 use crate::structured_region::SealedStructuredBody;
 
 pub(crate) struct RoutedBody {
@@ -37,12 +38,12 @@ pub(crate) fn primary_body_for_semantic_route<'a, 'o, F>(
     route: &r2types::DecompileRouteFacts,
     structurer: &mut crate::ControlFlowStructurer<'a, 'o>,
     mut linearize: F,
-) -> RoutedBody
+) -> ControlFlowStructureResult<RoutedBody>
 where
-    F: FnMut() -> Vec<CStmt>,
+    F: FnMut() -> ControlFlowStructureResult<Vec<CStmt>>,
 {
     match route.kind {
-        r2types::DecompileRouteKind::StructuredWorker => RoutedBody {
+        r2types::DecompileRouteKind::StructuredWorker => Ok(RoutedBody {
             body_stmt: Some(semantic_worker_comment_only_body(
                 "structured_worker",
                 crate::route_reason(route),
@@ -50,9 +51,9 @@ where
             structured_body: None,
             use_conservative_locals: true,
             is_linear_fallback: false,
-        },
+        }),
         r2types::DecompileRouteKind::LinearWorker | r2types::DecompileRouteKind::SummaryIslands => {
-            RoutedBody {
+            Ok(RoutedBody {
                 body_stmt: Some(semantic_worker_comment_only_body(
                     "summary_route",
                     crate::route_reason(route),
@@ -60,12 +61,15 @@ where
                 structured_body: None,
                 use_conservative_locals: true,
                 is_linear_fallback: false,
-            }
+            })
         }
         r2types::DecompileRouteKind::VmSummary
         | r2types::DecompileRouteKind::FallbackComment
         | r2types::DecompileRouteKind::Standard => {
             let structured = structurer.structure_with_regions();
+            if let Err(ControlFlowStructureError::Lowering(error)) = &structured {
+                return Err(ControlFlowStructureError::Lowering(*error));
+            }
             // Structuring refuses as a whole when one edge will not lower, so a
             // function whose loop exits reach blocks the region never covered
             // rendered nothing at all: no statements, and none of its
@@ -78,29 +82,32 @@ where
                         "r2dec residual: {}; body rendered without structure",
                         crate::sanitize_comment_text(reason)
                     ))];
-                    stmts.extend(linearize());
-                    RoutedBody {
+                    stmts.extend(linearize()?);
+                    Ok(RoutedBody {
                         body_stmt: Some(CStmt::Block(stmts)),
                         structured_body: None,
                         use_conservative_locals: true,
                         is_linear_fallback: true,
-                    }
+                    })
                 }
                 None => match structured {
-                    Ok(structured_body) => RoutedBody {
+                    Ok(structured_body) => Ok(RoutedBody {
                         body_stmt: None,
                         structured_body: Some(structured_body),
                         use_conservative_locals: false,
                         is_linear_fallback: false,
-                    },
-                    Err(error) => RoutedBody {
+                    }),
+                    Err(ControlFlowStructureError::StructuredRegion(error)) => Ok(RoutedBody {
                         body_stmt: Some(CStmt::comment(format!(
                             "r2dec residual: structured-region sealing failed: {error:?}"
                         ))),
                         structured_body: None,
                         use_conservative_locals: true,
                         is_linear_fallback: false,
-                    },
+                    }),
+                    Err(ControlFlowStructureError::Lowering(_)) => {
+                        unreachable!("lowering refusal returned before route fallback")
+                    }
                 },
             }
         }

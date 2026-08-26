@@ -40,6 +40,7 @@ use r2types::{
 
 use crate::address::parse_address_from_var_name;
 use crate::analysis;
+pub(crate) use crate::analysis::lower::OpLoweringRefusal;
 use crate::ast::{BinaryOp, CExpr, CStmt, CType, UnaryOp};
 use crate::binding_plan::{BindingPlan, BindingPlanSourceMismatch};
 use crate::registers::register_family_name;
@@ -319,15 +320,12 @@ enum LoweredOp {
     Comment(String),
 }
 
+pub(crate) type OpLoweringResult<T> = Result<T, OpLoweringRefusal>;
+
 /// The authoritative result of lowering one operation for expression use.
-///
-/// A destination fallback is a name for a value whose definition could not be
-/// rendered. It must never be inferred from the expression spelling because
-/// binding-name resolution can map that fallback onto another C symbol.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum LoweredExprAt {
     Rendered(CExpr),
-    DestinationFallback(CExpr),
 }
 
 #[derive(Debug, Clone, PartialEq)]

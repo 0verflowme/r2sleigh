@@ -14,6 +14,19 @@ use super::{
 use crate::address::parse_address_from_var_name;
 use crate::ast::{BinaryOp, CExpr, CType, UnaryOp};
 
+/// Defensive renderer result for operations whose canonical disposition is
+/// owned by `r2ssa::MachineProjection`.
+///
+/// This is not a second support classifier: production must already have
+/// received `MachineBuildError::UnsupportedOperation` from the projection.
+/// The renderer result exists only so legacy helpers cannot turn an opaque
+/// operation into executable C when called directly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OpLoweringRefusal {
+    MissingMachineProjectionAuthorization,
+    UnrepresentableOperation,
+}
+
 pub(crate) fn no_string_literals() -> &'static std::collections::BTreeMap<u64, String> {
     static EMPTY: std::sync::OnceLock<std::collections::BTreeMap<u64, String>> =
         std::sync::OnceLock::new();
@@ -257,17 +270,15 @@ impl<'a> LowerCtx<'a> {
         crate::symbol::var_ref(self.symbols, format_traced_name(name, self.var_aliases))
     }
 
-    pub(crate) fn op_to_expr(&self, op: &SSAOp) -> CExpr {
-        match op {
+    pub(crate) fn op_to_expr(&self, op: &SSAOp) -> Result<CExpr, OpLoweringRefusal> {
+        Ok(match op {
+            SSAOp::CallOther { .. } | SSAOp::CpuId { .. } => {
+                return Err(OpLoweringRefusal::MissingMachineProjectionAuthorization);
+            }
+            SSAOp::Load { space, .. } if *space != r2il::SpaceId::Ram => {
+                return Err(OpLoweringRefusal::MissingMachineProjectionAuthorization);
+            }
             SSAOp::Copy { src, .. } => self.get_expr(src),
-            SSAOp::Load { dst, addr, space } if *space != r2il::SpaceId::Ram => CExpr::call(
-                crate::symbol::var_ref(self.symbols, "r2s_unsupported_space_load".to_string()),
-                vec![
-                    CExpr::StringLit(space.to_string()),
-                    self.get_expr(addr),
-                    CExpr::UIntLit(u64::from(dst.size)),
-                ],
-            ),
             SSAOp::Load { dst, addr, .. } => {
                 let prefer_memory_access = matches!(
                     self.semantic_value_for_var(dst),
@@ -275,10 +286,10 @@ impl<'a> LowerCtx<'a> {
                 );
                 if prefer_memory_access {
                     if let Some(sub) = self.try_subscript_from_var(addr, dst.size) {
-                        return sub;
+                        return Ok(sub);
                     }
                     if let Some(member) = self.try_member_access_from_var(addr) {
-                        return member;
+                        return Ok(member);
                     }
                 }
                 if let Some(expr) = self.render_semantic_value_for_var(dst, 0, &mut HashSet::new())
@@ -424,28 +435,6 @@ impl<'a> LowerCtx<'a> {
             SSAOp::CallInd { target } => {
                 CExpr::call(CExpr::Deref(Box::new(self.get_expr(target))), vec![])
             }
-            SSAOp::CallOther {
-                output: _,
-                userop,
-                inputs,
-            } => {
-                let mut args = Vec::with_capacity(inputs.len() + 1);
-                args.push(CExpr::StringLit(format!("userop_{}", userop)));
-                for input in inputs {
-                    args.push(self.get_expr(input));
-                }
-                CExpr::call(CExpr::External {
-                    name: "callother".to_string(),
-                    kind: crate::symbol::ExternalKind::Intrinsic,
-                }, args)
-            }
-            SSAOp::CpuId { .. } => CExpr::call(
-                CExpr::External {
-                    name: "callother".to_string(),
-                    kind: crate::symbol::ExternalKind::Intrinsic,
-                },
-                vec![CExpr::StringLit("cpuid".to_string())],
-            ),
             SSAOp::PtrAdd {
                 dst,
                 base,
@@ -462,17 +451,8 @@ impl<'a> LowerCtx<'a> {
             } => self
                 .render_semantic_value_for_var(dst, 0, &mut HashSet::new())
                 .unwrap_or_else(|| self.ptr_arith_expr(base, index, *element_size, true)),
-            _ => {
-                if let Some(dst) = op.dst() {
-                    crate::symbol::var_ref(self.symbols, self.var_name(dst))
-                } else {
-                    CExpr::External {
-                        name: "__unhandled_op__".to_string(),
-                        kind: crate::symbol::ExternalKind::Intrinsic,
-                    }
-                }
-            }
-        }
+            _ => return Err(OpLoweringRefusal::UnrepresentableOperation),
+        })
     }
 
     fn render_semantic_value_by_name(
@@ -523,11 +503,14 @@ impl<'a> LowerCtx<'a> {
                 self.render_value_ref(value, depth, visited)
             }
             SemanticValue::Address(shape) => self.render_addr_shape(shape, depth, visited),
-            SemanticValue::Load { space, addr, size } => Some(if *space == r2il::SpaceId::Ram {
-                self.render_load_from_shape(addr, *size, depth, visited)?
-            } else {
-                self.unsupported_space_load_expr(*space, addr, *size, depth, visited)
-            }),
+            SemanticValue::Load { space, addr, size } => {
+                // This cache is advisory only. MachineProjection owns whether a
+                // load is renderable; omission here can never authorize an AST
+                // node for a non-RAM space.
+                (*space == r2il::SpaceId::Ram)
+                    .then(|| self.render_load_from_shape(addr, *size, depth, visited))
+                    .flatten()
+            }
             SemanticValue::Unknown => None,
         }
     }
@@ -568,27 +551,6 @@ impl<'a> LowerCtx<'a> {
 
         self.render_addr_shape(shape, depth + 1, visited)
             .map(|expr| CExpr::Deref(Box::new(expr)))
-    }
-
-    fn unsupported_space_load_expr(
-        &self,
-        space: r2il::SpaceId,
-        addr: &NormalizedAddr,
-        size: u32,
-        depth: u32,
-        visited: &mut HashSet<String>,
-    ) -> CExpr {
-        let addr = self
-            .render_addr_shape(addr, depth + 1, visited)
-            .unwrap_or_else(|| crate::symbol::var_ref(self.symbols, "r2s_unresolved_memory_address".to_string()));
-        CExpr::call(
-            crate::symbol::var_ref(self.symbols, "r2s_unsupported_space_load".to_string()),
-            vec![
-                CExpr::StringLit(space.to_string()),
-                addr,
-                CExpr::UIntLit(u64::from(size)),
-            ],
-        )
     }
 
     fn render_addr_shape(
@@ -1566,7 +1528,7 @@ mod tests {
     }
 
     #[test]
-    fn callother_ids_share_explicit_lowering() {
+    fn opaque_machine_operations_cannot_be_lowered_to_executable_c() {
         let symbols = test_table();
         let fn_map = HashMap::new();
         let str_map = HashMap::new();
@@ -1594,27 +1556,21 @@ mod tests {
             &sym_map,
         );
 
-        for userop in [7, 0x7fff_ffff, 0x8000_0000, u32::MAX] {
-            let expr = ctx.op_to_expr(&SSAOp::CallOther {
+        let opaque = [
+            SSAOp::CallOther {
                 output: Some(SSAVar::new("X30", 1, 8)),
-                userop,
+                userop: 7,
                 inputs: vec![SSAVar::new("X30", 0, 8), SSAVar::new("SP", 0, 8)],
-            });
-
+            },
+            SSAOp::CpuId {
+                dst: SSAVar::new("EAX", 1, 4),
+            },
+        ];
+        for op in opaque {
             assert_eq!(
-                expr,
-                CExpr::call(
-                    CExpr::External {
-                    name: "callother".to_string(),
-                    kind: crate::symbol::ExternalKind::Intrinsic,
-                },
-                    vec![
-                        CExpr::StringLit(format!("userop_{userop}")),
-                        crate::symbol::var_ref(&symbols, "x30"),
-                        crate::symbol::var_ref(&symbols, "sp"),
-                    ],
-                ),
-                "numeric userop must remain an explicit CallOther"
+                ctx.op_to_expr(&op),
+                Err(OpLoweringRefusal::MissingMachineProjectionAuthorization),
+                "opaque operations must retain the canonical machine refusal"
             );
         }
     }
@@ -1655,11 +1611,11 @@ mod tests {
                 if_true: SSAVar::new("when_true", 0, 4),
                 if_false: SSAVar::new("when_false", 0, 4),
             }),
-            CExpr::Ternary {
+            Ok(CExpr::Ternary {
                 cond: Box::new(crate::symbol::var_ref(&symbols, "cond")),
                 then_expr: Box::new(crate::symbol::var_ref(&symbols, "when_true")),
                 else_expr: Box::new(crate::symbol::var_ref(&symbols, "when_false")),
-            }
+            })
         );
     }
 
@@ -1730,7 +1686,7 @@ mod tests {
             dst: SSAVar::new("tmp:5001", 1, 4),
             space: r2il::SpaceId::Ram,
             addr: SSAVar::new("tmp:5000", 1, 8),
-        });
+        }).expect("RAM load is supported");
         let CExpr::Deref(inner) = expr else {
             panic!("expected dereference expression");
         };
@@ -1774,20 +1730,16 @@ mod tests {
             &strings,
             &binary_symbols,
         );
-        let expr = ctx.op_to_expr(&SSAOp::Load {
+        let refusal = ctx.op_to_expr(&SSAOp::Load {
             dst: SSAVar::new("tmp:custom_result", 1, 4),
             space: r2il::SpaceId::Custom(7),
             addr: SSAVar::new("tmp:custom_addr", 1, 8),
         });
 
-        assert!(
-            matches!(
-                expr,
-                CExpr::Call { ref func, ref args, .. }
-                    if **func == crate::symbol::var_ref(&symbols, "r2s_unsupported_space_load")
-                        && args.first() == Some(&CExpr::StringLit("space7".to_string()))
-            ),
-            "custom-space memory must stay explicit and unsupported: {expr:?}"
+        assert_eq!(
+            refusal,
+            Err(OpLoweringRefusal::MissingMachineProjectionAuthorization),
+            "custom-space memory requires an upstream machine projection"
         );
     }
 
@@ -1832,21 +1784,14 @@ mod tests {
                 size: 4,
             })
             .expect("RAM semantic load");
-        let custom = ctx
-            .expr_for_semantic_value(&SemanticValue::Load {
+        let custom = ctx.expr_for_semantic_value(&SemanticValue::Load {
                 space: r2il::SpaceId::Custom(7),
                 addr,
                 size: 4,
-            })
-            .expect("Custom semantic load refusal");
+            });
 
         assert!(matches!(ram, CExpr::Deref(_)));
-        assert!(matches!(
-            custom,
-            CExpr::Call { ref func, ref args, .. }
-                if **func == crate::symbol::var_ref(&symbols, "r2s_unsupported_space_load")
-                    && args.first() == Some(&CExpr::StringLit("space7".to_string()))
-        ));
+        assert_eq!(custom, None);
     }
 
     #[test]
@@ -1882,7 +1827,7 @@ mod tests {
             dst: SSAVar::new("tmp:5101", 1, 4),
             space: r2il::SpaceId::Ram,
             addr: SSAVar::new("arg1", 0, 8),
-        });
+        }).expect("RAM load is supported");
         let CExpr::Deref(inner) = expr else {
             panic!("expected dereference expression");
         };
@@ -1945,7 +1890,7 @@ mod tests {
             dst: SSAVar::new("tmp:5002", 1, 4),
             space: r2il::SpaceId::Ram,
             addr: SSAVar::new("tmp:addr", 1, 8),
-        });
+        }).expect("RAM load is supported");
 
         let CExpr::Subscript { base, index } = expr else {
             panic!("expected subscript expression");
@@ -1997,7 +1942,7 @@ mod tests {
             dst: SSAVar::new("tmp:5003", 1, 4),
             space: r2il::SpaceId::Ram,
             addr: SSAVar::new("tmp:stackaddr", 1, 8),
-        });
+        }).expect("RAM load is supported");
 
         let CExpr::Deref(inner) = expr else {
             panic!("expected conservative dereference expression");
@@ -2048,7 +1993,7 @@ mod tests {
             dst: SSAVar::new("tmp:5004", 1, 4),
             space: r2il::SpaceId::Ram,
             addr: SSAVar::new("tmp:addr", 1, 8),
-        });
+        }).expect("RAM load is supported");
 
         assert!(
             !matches!(expr, CExpr::Subscript { .. }),
@@ -2103,7 +2048,7 @@ mod tests {
             dst: SSAVar::new("tmp:5005", 1, 4),
             space: r2il::SpaceId::Ram,
             addr: SSAVar::new("tmp:addr", 1, 8),
-        });
+        }).expect("RAM load is supported");
 
         assert!(
             !matches!(expr, CExpr::Subscript { .. }),
@@ -2154,7 +2099,7 @@ mod tests {
             dst: SSAVar::new("tmp:5006", 1, 4),
             space: r2il::SpaceId::Ram,
             addr: SSAVar::new("tmp:addr", 1, 8),
-        });
+        }).expect("RAM load is supported");
 
         assert!(
             !matches!(expr, CExpr::PtrMember { .. }),
@@ -2225,7 +2170,7 @@ mod tests {
             dst: SSAVar::new("tmp:5007", 1, 4),
             space: r2il::SpaceId::Ram,
             addr,
-        });
+        }).expect("RAM load is supported");
 
         let CExpr::Subscript { base, index } = expr else {
             panic!("expected subscript expression");

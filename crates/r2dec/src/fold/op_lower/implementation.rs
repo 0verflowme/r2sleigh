@@ -1982,8 +1982,10 @@ impl<'a> FoldingContext<'a> {
         block: &SSABlock,
         op_idx: usize,
         var: &SSAVar,
-    ) -> Option<CExpr> {
-        let family = self.register_family_name_for_ssa(var)?;
+    ) -> OpLoweringResult<Option<CExpr>> {
+        let Some(family) = self.register_family_name_for_ssa(var) else {
+            return Ok(None);
+        };
 
         for op in block.ops[..op_idx].iter().rev() {
             match op {
@@ -2011,7 +2013,7 @@ impl<'a> FoldingContext<'a> {
                 }
                 _ => {
                     let mut visited = HashSet::new();
-                    let raw = self.op_to_expr(op);
+                    let raw = self.op_to_expr(op)?;
                     let expanded = self.expand_return_expr(&raw, 0, &mut visited);
                     let mut semantic_visited = HashSet::new();
                     let semanticized =
@@ -2031,10 +2033,10 @@ impl<'a> FoldingContext<'a> {
                 continue;
             }
 
-            return Some(self.resolve_return_candidate(&candidate));
+            return Ok(Some(self.resolve_return_candidate(&candidate)));
         }
 
-        None
+        Ok(None)
     }
 
     fn expr_is_generic_entry_arg_like(&self, expr: &CExpr) -> bool {
@@ -2810,13 +2812,17 @@ impl<'a> FoldingContext<'a> {
         fallback
     }
 
-    fn op_to_expr_impl(&self, op: &SSAOp, frame: &LowerFrame) -> Option<CExpr> {
+    fn op_to_expr_impl(
+        &self,
+        op: &SSAOp,
+        frame: &LowerFrame,
+    ) -> OpLoweringResult<Option<CExpr>> {
         if let SSAOp::Copy { src, .. } = op {
-            return Some(self.observed_input(frame, 0, self.get_expr(src)));
+            return Ok(Some(self.observed_input(frame, 0, self.get_expr(src))));
         }
 
-        if let Some(stmt) = self.op_to_stmt_impl(op, frame) {
-            return match Self::lowered_from_stmt(stmt) {
+        if let Some(stmt) = self.op_to_stmt_impl(op, frame)? {
+            return Ok(match Self::lowered_from_stmt(stmt) {
                 LoweredOp::Assign { rhs, .. } => Some(rhs),
                 LoweredOp::FinalizedStmt(CStmt::Expr(CExpr::Binary {
                     op: BinaryOp::Assign,
@@ -2828,15 +2834,14 @@ impl<'a> FoldingContext<'a> {
                 LoweredOp::FinalizedStmt(_) => None,
                 LoweredOp::Expr(expr) => Some(expr),
                 LoweredOp::Return(Some(expr)) => Some(expr),
-                LoweredOp::Return(None) => Some(CExpr::External {
-                    name: "return".to_string(),
-                    kind: crate::symbol::ExternalKind::Intrinsic,
-                }),
+                LoweredOp::Return(None) => {
+                    return Err(OpLoweringRefusal::UnrepresentableOperation);
+                }
                 LoweredOp::Comment(_) | LoweredOp::None => None,
-            };
+            });
         }
 
-        match op {
+        Ok(match op {
             // These ops do not lower to statements but still need expression form.
             SSAOp::CBranch { cond, .. } => {
                 Some(self.observed_input(frame, 1, self.get_condition_expr(cond)))
@@ -2845,7 +2850,7 @@ impl<'a> FoldingContext<'a> {
                 Some(self.observed_input(frame, 0, self.get_return_expr(target)))
             }
             _ => None,
-        }
+        })
     }
 
     /// Create a binary expression.
@@ -5123,20 +5128,13 @@ impl<'a> FoldingContext<'a> {
         depth: u32,
         visited: &mut HashSet<String>,
     ) -> Option<CExpr> {
-        if space == r2il::SpaceId::Ram {
-            return self.render_load_from_addr(addr, elem_size, depth, visited);
+        if space != r2il::SpaceId::Ram {
+            // Semantic values are an advisory expression cache. The sealed
+            // MachineProjection is the only authority that may admit a load;
+            // omitting this cache entry cannot create executable fallback C.
+            return None;
         }
-        let address = self
-            .render_address_expr_from_addr(addr, depth + 1, visited)
-            .unwrap_or_else(|| self.name_ref(&"r2s_unresolved_memory_address".to_string()));
-        Some(CExpr::call(
-            self.name_ref(&"r2s_unsupported_space_load".to_string()),
-            vec![
-                CExpr::StringLit(space.to_string()),
-                address,
-                CExpr::UIntLit(u64::from(elem_size)),
-            ],
-        ))
+        self.render_load_from_addr(addr, elem_size, depth, visited)
     }
 
     fn render_load_from_addr(
@@ -12029,7 +12027,11 @@ impl<'a> FoldingContext<'a> {
         })
     }
 
-    pub(crate) fn fold_block(&self, block: &SSABlock, current_block_addr: u64) -> Vec<CStmt> {
+    pub(crate) fn fold_block(
+        &self,
+        block: &SSABlock,
+        current_block_addr: u64,
+    ) -> OpLoweringResult<Vec<CStmt>> {
         self.current_block_addr.set(Some(current_block_addr));
         self.current_block_id.set(
             self.inputs
@@ -12076,7 +12078,7 @@ impl<'a> FoldingContext<'a> {
             {
                 let direct_value = self.get_return_expr(val);
                 let local_value =
-                    match self.recent_same_family_return_expr_before(block, op_idx, val) {
+                    match self.recent_same_family_return_expr_before(block, op_idx, val)? {
                         Some(recent)
                             if self.should_prefer_recent_same_family_return_expr(
                                 &recent,
@@ -12189,7 +12191,7 @@ impl<'a> FoldingContext<'a> {
                             && !self.is_control_return_target(dst)
                         {
                             let mut visited = HashSet::new();
-                            let raw = self.op_to_expr(op);
+                            let raw = self.op_to_expr(op)?;
                             let expanded = self.expand_return_expr(&raw, 0, &mut visited);
                             let final_expr = if self.is_certified_rendered_call_expr(&expanded) {
                                 expanded.clone()
@@ -12325,7 +12327,7 @@ impl<'a> FoldingContext<'a> {
                 };
                 let final_expr = {
                     let normalized = self.normalize_final_return_candidate(expr.clone());
-                    self.sanitize_final_return_expr(normalized, expr)
+                    self.sanitize_final_return_expr(normalized, expr)?
                 };
                 if !self.certified_return_members_have_external_layout(&final_expr) {
                     stmts.push(self.certified_residual_comment(format!(
@@ -12401,12 +12403,11 @@ impl<'a> FoldingContext<'a> {
                     // value. Record the expression this statement would have
                     // carried, so the promise is kept from the same answer that
                     // made it rather than reconstructed later by another rule.
-                    let inlined = self.op_to_expr_at(op, block.addr, op_idx);
-                    if let LoweredExprAt::Rendered(inlined) = inlined {
-                        self.inlined_renderings
-                            .borrow_mut()
-                            .insert(key.clone(), inlined);
-                    }
+                    let inlined = self.op_to_expr_at(op, block.addr, op_idx)?;
+                    let LoweredExprAt::Rendered(inlined) = inlined;
+                    self.inlined_renderings
+                        .borrow_mut()
+                        .insert(key.clone(), inlined);
                     continue;
                 }
 
@@ -12416,7 +12417,7 @@ impl<'a> FoldingContext<'a> {
                 }
             }
 
-            if let Some(stmt) = self.op_to_stmt_with_args(op, block.addr, op_idx) {
+            if let Some(stmt) = self.op_to_stmt_with_args(op, block.addr, op_idx)? {
                 let is_return = matches!(stmt.unobserved(), CStmt::Return(_));
                 stmts.push(stmt);
                 if is_return {
@@ -12434,7 +12435,7 @@ impl<'a> FoldingContext<'a> {
             if let Some((expr, certified_value)) = return_expr {
                 let final_expr = {
                     let normalized = self.normalize_final_return_candidate(expr.clone());
-                    self.sanitize_final_return_expr(normalized, expr)
+                    self.sanitize_final_return_expr(normalized, expr)?
                 };
                 if !self.certified_return_members_have_external_layout(&final_expr) {
                     stmts.push(self.certified_residual_comment(format!(
@@ -12495,7 +12496,7 @@ impl<'a> FoldingContext<'a> {
         self.current_block_addr.set(None);
         self.current_block_id.set(None);
         self.current_op_idx.set(None);
-        out
+        Ok(out)
     }
 
     pub(super) fn prune_redundant_return_slot_assignments(&self, stmts: Vec<CStmt>) -> Vec<CStmt> {
@@ -12646,20 +12647,30 @@ impl<'a> FoldingContext<'a> {
         })
     }
 
-    fn op_to_stmt_impl(&self, op: &SSAOp, frame: &LowerFrame) -> Option<CStmt> {
+    fn op_to_stmt_impl(
+        &self,
+        op: &SSAOp,
+        frame: &LowerFrame,
+    ) -> OpLoweringResult<Option<CStmt>> {
         let input = |input_idx: usize, var: &SSAVar| {
             self.observed_input(frame, input_idx, self.get_expr(var))
         };
-        match op {
+        Ok(match op {
+            SSAOp::CallOther { .. } | SSAOp::CpuId { .. } => {
+                return Err(OpLoweringRefusal::MissingMachineProjectionAuthorization);
+            }
+            SSAOp::Load { space, .. } if *space != r2il::SpaceId::Ram => {
+                return Err(OpLoweringRefusal::MissingMachineProjectionAuthorization);
+            }
             SSAOp::Copy { dst, src } => {
                 if self.is_carrier_self_copy(dst, src) {
-                    return None;
+                    return Ok(None);
                 }
                 if self.is_entry_arg_alias_copy(dst, src) {
-                    return None;
+                    return Ok(None);
                 }
                 if self.is_uninitialized_return_register_copy(dst, src) {
-                    return None;
+                    return Ok(None);
                 }
                 let lhs = self.assignment_lhs_expr(dst);
                 let certified_rhs: Option<CExpr> = None;
@@ -12728,12 +12739,12 @@ impl<'a> FoldingContext<'a> {
             }
             SSAOp::Load { dst, addr, space } => {
                 if *space != r2il::SpaceId::Ram {
-                    return Some(self.certified_residual_comment(format!(
+                    return Ok(Some(self.certified_residual_comment(format!(
                         "unsupported exact memory load space {} at 0x{:x}:{}",
                         space,
                         self.current_block_addr.get().unwrap_or_default(),
                         self.current_op_idx.get().unwrap_or_default()
-                    )));
+                    ))));
                 }
                 let lhs = self.assignment_lhs_expr(dst);
                 // A load is unsigned unless something sign-extends it, and
@@ -12779,18 +12790,18 @@ impl<'a> FoldingContext<'a> {
             }
             SSAOp::Store { addr, val, space } => {
                 if *space != r2il::SpaceId::Ram {
-                    return Some(self.certified_residual_comment(format!(
+                    return Ok(Some(self.certified_residual_comment(format!(
                         "unsupported exact memory store space {} at 0x{:x}:{}",
                         space,
                         self.current_block_addr.get().unwrap_or_default(),
                         self.current_op_idx.get().unwrap_or_default()
-                    )));
+                    ))));
                 }
                 if self.is_entry_arg_alias_store(addr, val) {
-                    return None;
+                    return Ok(None);
                 }
                 if self.is_materialized_call_result_stack_home_store(addr, val) {
-                    return None;
+                    return Ok(None);
                 }
                 let elem_ty = self
                     .type_hint_for_var(val)
@@ -13221,39 +13232,6 @@ impl<'a> FoldingContext<'a> {
                 let call = CExpr::call(func_expr, vec![]);
                 Some(CStmt::Expr(call))
             }
-            SSAOp::CallOther {
-                output,
-                userop,
-                inputs,
-            } => {
-                let mut args = Vec::with_capacity(inputs.len() + 1);
-                args.push(CExpr::StringLit(format!("userop_{}", userop)));
-                for (input_idx, input_var) in inputs.iter().enumerate() {
-                    args.push(input(input_idx, input_var));
-                }
-                let call = CExpr::call(CExpr::External {
-                    name: "callother".to_string(),
-                    kind: crate::symbol::ExternalKind::Intrinsic,
-                }, args,
-                );
-                if let Some(dst) = output {
-                    let lhs = self.assignment_lhs_expr(dst);
-                    Some(CStmt::Expr(CExpr::assign(lhs, call)))
-                } else {
-                    Some(CStmt::Expr(call))
-                }
-            }
-            SSAOp::CpuId { dst } => {
-                let call = CExpr::call(
-                    CExpr::External {
-                    name: "callother".to_string(),
-                    kind: crate::symbol::ExternalKind::Intrinsic,
-                },
-                    vec![CExpr::StringLit("cpuid".to_string())],
-                );
-                let lhs = self.assignment_lhs_expr(dst);
-                Some(CStmt::Expr(CExpr::assign(lhs, call)))
-            }
             SSAOp::PtrAdd {
                 dst,
                 base,
@@ -13317,7 +13295,7 @@ impl<'a> FoldingContext<'a> {
             SSAOp::Nop => None,
             SSAOp::Unimplemented => Some(CStmt::comment("Unimplemented operation")),
             _ => None,
-        }
+        })
     }
 
     /// Create a binary operation statement.
@@ -13542,59 +13520,35 @@ impl<'a> FoldingContext<'a> {
 
 #[cfg(test)]
 #[test]
-fn callother_ids_share_effect_and_result_lowering() {
+fn opaque_operations_are_typed_refusals_before_ast_lowering() {
     let ctx = FoldingContext::new(64);
     let input = SSAVar::new("X30", 0, 8);
     let output = SSAVar::new("X30", 1, 8);
     let frame = LowerFrame::for_expr();
 
-    for userop in [7, 0x7fff_ffff, 0x8000_0000, u32::MAX] {
-        let stmt = ctx.op_to_stmt_impl(&SSAOp::CallOther {
+    let opaque = [
+        SSAOp::CallOther {
             output: Some(output.clone()),
-            userop,
+            userop: u32::MAX,
             inputs: vec![input.clone()],
-        }, &frame,
-        );
+        },
+        SSAOp::CallOther {
+            output: None,
+            userop: 7,
+            inputs: vec![input],
+        },
+        SSAOp::CpuId {
+            dst: SSAVar::new("EAX", 1, 4),
+        },
+    ];
+
+    for op in opaque {
         assert_eq!(
-            stmt,
-            Some(CStmt::Expr(CExpr::assign(
-                ctx.name_ref("x30_1"),
-                CExpr::call(
-                    CExpr::External {
-                    name: "callother".to_string(),
-                    kind: crate::symbol::ExternalKind::Intrinsic,
-                },
-                    vec![
-                        CExpr::StringLit(format!("userop_{userop}")),
-                        ctx.name_ref("x30"),
-                    ],
-                ),
-            ))),
-            "numeric userop must retain its explicit result assignment"
+            ctx.op_to_stmt_impl(&op, &frame),
+            Err(OpLoweringRefusal::MissingMachineProjectionAuthorization),
+            "opaque operations must never manufacture an executable AST node"
         );
     }
-
-    let effect_userop = u32::MAX;
-    let stmt = ctx.op_to_stmt_impl(&SSAOp::CallOther {
-        output: None,
-        userop: effect_userop,
-        inputs: vec![input],
-    }, &frame,
-    );
-    assert_eq!(
-        stmt,
-        Some(CStmt::Expr(CExpr::call(
-            CExpr::External {
-                    name: "callother".to_string(),
-                    kind: crate::symbol::ExternalKind::Intrinsic,
-                },
-            vec![
-                CExpr::StringLit(format!("userop_{effect_userop}")),
-                ctx.name_ref("x30"),
-            ],
-        ))),
-        "outputless CallOther must retain its explicit effect"
-    );
 }
 
 #[cfg(test)]

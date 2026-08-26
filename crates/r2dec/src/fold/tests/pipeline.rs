@@ -1449,9 +1449,7 @@ mod tests {
         let (plan, names, journal) = install_observed_lowering(&mut ctx, &prepared);
         let LoweredExprAt::Rendered(expr) =
             ctx.op_to_expr_at(&block.ops[op_idx], block.addr, op_idx)
-        else {
-            panic!("integer addition must lower to a rendered expression");
-        };
+                .expect("integer addition lowering");
         let CExpr::Binary { left: lhs, right: rhs, .. } = expr.unobserved() else {
             panic!("integer addition must retain its binary operand positions");
         };
@@ -1589,9 +1587,7 @@ mod tests {
 
         let LoweredExprAt::Rendered(expr) =
             ctx.op_to_expr_at(&block.ops[op_idx], block.addr, op_idx)
-        else {
-            panic!("narrow register copy must lower to an expression");
-        };
+                .expect("narrow register copy lowering");
         let input_symbol = names
             .symbol_for_value(graph_inst.inputs[0])
             .expect("carrier input symbol");
@@ -1681,6 +1677,7 @@ mod tests {
         ));
         let copy_stmt = ctx
             .op_to_stmt_with_args(&block.ops[copy_idx], block.addr, copy_idx)
+            .expect("supported copy lowering")
             .expect("low-register assignment");
         let CStmt::Expr(copy_expr) = copy_stmt.unobserved() else {
             panic!("low-register write must remain an assignment");
@@ -1763,6 +1760,7 @@ mod tests {
 
         let stmt = ctx
             .op_to_stmt_with_args(&block.ops[load_idx], block.addr, load_idx)
+            .expect("supported load lowering")
             .expect("structured stack load");
         let CStmt::Expr(assignment) = stmt.unobserved() else {
             panic!("load must remain an assignment: {stmt:?}");
@@ -1845,6 +1843,7 @@ mod tests {
 
         let stmt = ctx
             .op_to_stmt_with_args(&block.ops[store_idx], block.addr, store_idx)
+            .expect("supported store lowering")
             .expect("structured stack store");
         let CStmt::Expr(assignment) = stmt.unobserved() else {
             panic!("store must remain an assignment: {stmt:?}");
@@ -1920,6 +1919,7 @@ mod tests {
         let (plan, names, journal) = install_observed_lowering(&mut ctx, &prepared);
         let stmt = ctx
             .op_to_stmt_with_args(&block.ops[op_idx], block.addr, op_idx)
+            .expect("supported call lowering")
             .expect("certified call statement");
         let CStmt::Expr(call) = stmt.unobserved() else {
             panic!("expected call expression, got {stmt:?}");
@@ -1993,9 +1993,11 @@ mod tests {
         );
         let direct = ctx
             .op_to_stmt_impl(&block.ops[op_idx], &frame)
+            .expect("supported direct lowering")
             .expect("direct finalized statement");
         let lowered = ctx
             .op_to_stmt_with_args(&block.ops[op_idx], block.addr, op_idx)
+            .expect("supported public lowering")
             .expect("public statement lowering");
 
         assert_eq!(
@@ -2006,7 +2008,7 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_expression_fallback_does_not_claim_output() {
+    fn unsupported_expression_is_typed_refusal_before_ast_lowering() {
         let arch = make_test_arch_x86_64();
         let mut entry = R2ILBlock::new(0x1000, 4);
         entry.push(R2ILOp::IntCarry {
@@ -2036,7 +2038,7 @@ mod tests {
         );
 
         let mut ctx = make_x86_64_ctx_with_prepared(&prepared);
-        let (plan, names, journal) = install_observed_lowering(&mut ctx, &prepared);
+        let (plan, _, _) = install_observed_lowering(&mut ctx, &prepared);
         assert!(
             matches!(
                 plan.write_disposition(inst),
@@ -2044,29 +2046,73 @@ mod tests {
             ),
             "absence is meaningful only for an exact upstream write"
         );
-        let LoweredExprAt::DestinationFallback(fallback) =
-            ctx.op_to_expr_at(&block.ops[op_idx], block.addr, op_idx)
-        else {
-            panic!("unsupported carry must remain a typed destination fallback");
-        };
-        assert!(matches!(fallback.unobserved(), CExpr::Var(_)));
-        assert_eq!(*ctx.observation_error.borrow(), None);
-        let symbols = Rc::clone(&ctx.symbols);
-        drop(ctx);
-        let sealed = seal_observed_lowering(
-            &prepared,
-            plan,
-            names,
-            journal,
-            symbols,
-            CType::UInt(8),
-            vec![CStmt::Return(Some(fallback))],
-        );
-
         assert_eq!(
-            sealed.observations().write_observation(inst),
-            Some(crate::shadow_report::LegacyWriteObservation::LegacyAbsent),
-            "a destination-name fallback is not a rendered definition"
+            ctx.op_to_expr_at(&block.ops[op_idx], block.addr, op_idx),
+            Err(OpLoweringRefusal::UnrepresentableOperation),
+            "an expression-required renderer gap must not manufacture its destination"
+        );
+        assert_eq!(*ctx.observation_error.borrow(), None);
+    }
+
+    #[test]
+    fn opaque_pipeline_refusal_retains_the_upstream_machine_failures() {
+        let arch = make_test_arch_x86_64();
+        let mut entry = R2ILBlock::new(0x1000, 4);
+        entry.push(R2ILOp::CallOther {
+            output: Some(Varnode::unique(0x20, 8)),
+            userop: 7,
+            inputs: vec![Varnode::register(0x10, 8)],
+        });
+        entry.push(R2ILOp::CpuId {
+            dst: Varnode::unique(0x28, 8),
+        });
+        let prepared = prepared_from_r2il_blocks(&[entry], &arch).with_name("opaque_pipeline");
+        let plan = crate::binding_plan::BindingPlan::build_shadow(&prepared.facts)
+            .expect("partial binding plan retains upstream refusal cells");
+        let failures = plan.machine_projection().failures();
+
+        assert!(failures.iter().any(|failure| {
+            matches!(
+                failure.error(),
+                r2ssa::MachineBuildError::UnsupportedOperation { op, .. }
+                    if matches!(op.as_ref(), SSAOp::CallOther { .. })
+            )
+        }));
+        assert!(failures.iter().any(|failure| {
+            matches!(
+                failure.error(),
+                r2ssa::MachineBuildError::UnsupportedOperation { op, .. }
+                    if matches!(op.as_ref(), SSAOp::CpuId { .. })
+            )
+        }));
+
+        let input = crate::DecompilerInput::new(prepared.facts.clone());
+        let audit = crate::Decompiler::new(crate::DecompilerConfig::x86_64())
+            .decompile_input_with_binding_audit(&input);
+        assert!(matches!(
+            audit.binding_shadow(),
+            crate::BindingShadowAuditOutcome::Failed(_)
+        ));
+        let effects = audit.effect_obligations();
+        assert_eq!(
+            effects.disposition,
+            crate::EffectObligationDisposition::Refused
+        );
+        assert_eq!(effects.total, 2);
+        assert_eq!(effects.rendered, 0);
+        assert_eq!(effects.justified_elision, 0);
+        assert_eq!(effects.refused, 2);
+        assert_eq!(effects.unaccounted, 0);
+        assert_eq!(effects.conflicts, 0);
+        assert_eq!(
+            audit.render_refusal(),
+            None,
+            "the production path must stop on the upstream machine failure before defensive renderer classification"
+        );
+        assert!(
+            !audit.output().contains("callother(") && !audit.output().contains("CPUID"),
+            "opaque operations must not survive as executable helper-shaped C: {}",
+            audit.output()
         );
     }
 
@@ -3928,6 +3974,7 @@ mod tests {
                 target: make_var("X16", 0, 8),
             }, &super::LowerFrame::for_expr(),
             )
+            .expect("supported indirect-call lowering")
             .expect("fallback indirect call statement");
 
         assert_eq!(
@@ -3981,6 +4028,7 @@ mod tests {
                 source_call.0,
                 source_call.1,
             )
+            .expect("supported call lowering")
             .expect("call-with-args fallback statement");
 
         assert!(
@@ -4003,6 +4051,7 @@ mod tests {
                 source_call.0,
                 source_call.1,
             )
+            .expect("supported indirect-call lowering")
             .expect("indirect call-with-args fallback statement");
 
         assert!(
@@ -4029,6 +4078,7 @@ mod tests {
                 0x1000,
                 0,
             )
+            .expect("supported indirect-call lowering")
             .expect("indirect call should emit residual statement");
 
         let CStmt::Comment(comment) = stmt else {
@@ -4108,6 +4158,7 @@ mod tests {
                 0x1000,
                 1,
             )
+            .expect("supported call lowering")
             .expect("printf call should emit statement");
 
         let CStmt::Comment(comment) = stmt else {
@@ -4193,6 +4244,7 @@ mod tests {
                 0x1000,
                 1,
             )
+            .expect("supported call lowering")
             .expect("printf call should emit statement");
 
         let CStmt::Comment(comment) = stmt else {
@@ -4249,6 +4301,7 @@ mod tests {
                 0x2000,
                 1,
             )
+            .expect("supported call lowering")
             .expect("printf call should emit statement");
 
         let CStmt::Comment(comment) = stmt else {
@@ -4322,6 +4375,7 @@ mod tests {
                 0x3000,
                 1,
             )
+            .expect("supported call lowering")
             .expect("printf call should emit statement");
 
         let CStmt::Comment(comment) = stmt else {
@@ -4419,7 +4473,9 @@ mod tests {
             dst: shadow.clone(),
             src: make_var("rax", 1, 8),
         }]);
-        let stmts = ctx.fold_block(&block, block.addr);
+        let stmts = ctx
+            .fold_block(&block, block.addr)
+            .expect("supported block lowering");
 
         assert!(
             stmts.is_empty(),
@@ -5324,6 +5380,7 @@ mod tests {
                 dst: make_var("ram:401000", 1, 8),
                 src: make_var("value", 2, 8),
             })
+            .expect("supported copy lowering")
             .expect("memory-destination copy should emit an assignment");
 
         let CStmt::Expr(CExpr::Binary {
@@ -5359,6 +5416,7 @@ mod tests {
                     dst,
                     src: make_var("value", 2, 8),
                 })
+                .expect("supported copy lowering")
                 .expect("versioned generic-arg carrier should lower to an assignment");
 
             let CStmt::Expr(CExpr::Binary {
@@ -5781,16 +5839,14 @@ mod tests {
                 0,
                 &mut HashSet::new(),
             )
-            .expect("semantic load rendering")
         };
 
-        assert!(matches!(render(SpaceId::Ram), CExpr::Deref(_)));
-        assert!(matches!(
+        assert!(matches!(render(SpaceId::Ram), Some(CExpr::Deref(_))));
+        assert_eq!(
             render(SpaceId::Custom(7)),
-            CExpr::Call { ref func, ref args, .. }
-                if **func == ctx.name_ref("r2s_unsupported_space_load")
-                    && args.first() == Some(&CExpr::StringLit("space7".to_string()))
-        ));
+            None,
+            "the advisory semantic cache cannot authorize executable non-RAM loads"
+        );
     }
 
     #[test]
@@ -9003,7 +9059,7 @@ mod tests {
         let stmt = ctx.op_to_stmt(&SSAOp::Copy {
             dst: make_var("arg0", 0, 4),
             src: make_var("EDI", 0, 4),
-        });
+        }).expect("supported copy lowering");
         assert!(
             stmt.is_none(),
             "arg0 = edi entry alias copy should be suppressed"
@@ -9016,7 +9072,7 @@ mod tests {
         let stmt = ctx.op_to_stmt(&SSAOp::Copy {
             dst: make_var("EAX", 1, 4),
             src: make_var("EAX", 0, 4),
-        });
+        }).expect("supported copy lowering");
         assert!(
             stmt.is_none(),
             "version-0 return-register phi carriers should not render as source assignments"
@@ -9025,7 +9081,7 @@ mod tests {
         let real_copy = ctx.op_to_stmt(&SSAOp::Copy {
             dst: make_var("EAX", 1, 4),
             src: make_var("EDI", 0, 4),
-        });
+        }).expect("supported copy lowering");
         assert!(
             real_copy.is_some(),
             "only uninitialized return-register carriers should be suppressed"
@@ -10570,7 +10626,9 @@ mod tests {
         ctx.analyze_function_structure(func);
 
         let exit_block = func.get_block(0x100c).expect("exit block");
-        let stmts = ctx.fold_block(exit_block, exit_block.addr);
+        let stmts = ctx
+            .fold_block(exit_block, exit_block.addr)
+            .expect("supported block lowering");
         assert!(
             stmts
                 .iter()
@@ -11351,6 +11409,7 @@ mod tests {
         let block = prepared.function().get_block(0x1000).expect("entry");
         let stmt = ctx
             .op_to_stmt_with_args(&block.ops[2], block.addr, 2)
+            .expect("supported call lowering")
             .expect("call stmt");
 
         let CStmt::Expr(CExpr::Call { func, args, .. }) = stmt else {
@@ -11405,6 +11464,7 @@ mod tests {
         let block = prepared.function().get_block(0x1000).expect("entry");
         let stmt = ctx
             .op_to_stmt_with_args(&block.ops[2], block.addr, 2)
+            .expect("supported call lowering")
             .expect("residual stmt");
 
         assert!(
@@ -11459,6 +11519,7 @@ mod tests {
         let block = prepared.function().get_block(0x1000).expect("entry");
         let stmt = ctx
             .op_to_stmt_with_args(&block.ops[2], block.addr, 2)
+            .expect("supported call lowering")
             .expect("certified call stmt");
 
         let CStmt::Expr(CExpr::Call { func, args, .. }) = stmt else {
@@ -11676,6 +11737,7 @@ mod tests {
         let block = prepared.function().get_block(0x1000).expect("entry");
         let stmt = ctx
             .op_to_stmt_with_args(&block.ops[0], block.addr, 0)
+            .expect("supported call lowering")
             .expect("certified call stmt");
 
         let CStmt::Expr(CExpr::Call { func, args, .. }) = stmt else {
@@ -11713,6 +11775,7 @@ mod tests {
                 0x1000,
                 0,
             )
+            .expect("supported call lowering")
             .expect("residual stmt");
 
         let CStmt::Comment(comment) = stmt else {
@@ -11746,6 +11809,7 @@ mod tests {
                 0x1000,
                 0,
             )
+            .expect("supported call lowering")
             .expect("residual stmt");
 
         let CStmt::Comment(comment) = stmt else {
@@ -11780,6 +11844,7 @@ mod tests {
                 0x1000,
                 0,
             )
+            .expect("supported call lowering")
             .expect("residual stmt");
 
         let CStmt::Comment(comment) = stmt else {
@@ -11850,6 +11915,7 @@ mod tests {
                 0x1000,
                 0,
             )
+            .expect("supported call lowering")
             .expect("residual stmt");
         assert!(
             matches!(&source_name_stmt, CStmt::Comment(comment) if comment.contains("uncertified callsite arguments")),
@@ -11877,6 +11943,7 @@ mod tests {
                 0x1000,
                 0,
             )
+            .expect("supported call lowering")
             .expect("residual stmt");
         assert!(
             matches!(&value_stmt, CStmt::Comment(comment) if comment.contains("uncertified callsite arguments")),
@@ -11955,6 +12022,7 @@ mod tests {
 
         let stmt = ctx
             .op_to_stmt_with_args(&block.ops[2], block.addr, 2)
+            .expect("supported call lowering")
             .expect("certified call stmt");
 
         let CStmt::Expr(CExpr::Call { args, .. }) = stmt else {
@@ -12010,6 +12078,7 @@ mod tests {
         let block = prepared.function().get_block(0x1000).expect("entry");
         let stmt = ctx
             .op_to_stmt_with_args(&block.ops[2], block.addr, 2)
+            .expect("supported call lowering")
             .expect("certified call stmt");
 
         let CStmt::Expr(CExpr::Call { args, .. }) = stmt else {
@@ -12062,6 +12131,7 @@ mod tests {
         let block = prepared.function().get_block(0x1000).expect("entry");
         let stmt = ctx
             .op_to_stmt_with_args(&block.ops[2], block.addr, 2)
+            .expect("supported call lowering")
             .expect("certified call stmt");
 
         let CStmt::Expr(CExpr::Call { args, .. }) = stmt else {
@@ -12131,11 +12201,11 @@ mod tests {
         let left_stmts = ctx.fold_block(
             normalized.get_block(0x1814).expect("left predecessor"),
             0x1814,
-        );
+        ).expect("supported left-block lowering");
         let right_stmts = ctx.fold_block(
             normalized.get_block(0x1818).expect("right predecessor"),
             0x1818,
-        );
+        ).expect("supported right-block lowering");
         let mut rendered = Vec::new();
         rendered.extend(left_stmts.iter().map(|stmt| format!("{stmt:?}")));
         rendered.extend(right_stmts.iter().map(|stmt| format!("{stmt:?}")));
@@ -13218,6 +13288,7 @@ mod tests {
         ctx.current_op_idx.set(Some(1));
         let stmt = ctx
             .op_to_stmt_with_args(&block.ops[1], block.addr, 1)
+            .expect("supported load lowering")
             .expect("load stmt");
         ctx.current_block_addr.set(None);
         ctx.current_op_idx.set(None);
@@ -13558,6 +13629,7 @@ mod tests {
 
             assert!(
                 ctx.recent_same_family_return_expr_before(&block, 2, &new_rax)
+                    .expect("return-expression scan")
                     .is_none(),
                 "recent return value recovery must not cross call-like barriers"
             );
@@ -13576,6 +13648,7 @@ mod tests {
 
         assert!(
             ctx.recent_same_family_return_expr_before(&block, 1, &rax)
+                .expect("return-expression scan")
                 .is_none(),
             "recent return value recovery must be keyed by storage family"
         );
@@ -13597,7 +13670,9 @@ mod tests {
             },
         ]);
 
-        let recovered = ctx.recent_same_family_return_expr_before(&block, 1, &new_rax);
+        let recovered = ctx
+            .recent_same_family_return_expr_before(&block, 1, &new_rax)
+            .expect("return-expression scan");
         assert!(
             matches!(recovered, Some(CExpr::IntLit(42) | CExpr::UIntLit(42))),
             "expected prior same-family value recovery, got {recovered:?}"
@@ -13616,7 +13691,7 @@ mod tests {
 
         assert_eq!(
             ctx.recent_same_family_return_expr_before(&block, 1, &target),
-            Some(CExpr::IntLit(-1)),
+            Ok(Some(CExpr::IntLit(-1))),
             "Copy recovery must use return-context literal rewriting"
         );
     }
@@ -13633,7 +13708,7 @@ mod tests {
 
         assert_eq!(
             ctx.recent_same_family_return_expr_before(&block, 1, &target),
-            Some(CExpr::IntLit(-1)),
+            Ok(Some(CExpr::IntLit(-1))),
             "cast-like recovery must preserve declared narrow return expressions"
         );
     }
@@ -13653,6 +13728,7 @@ mod tests {
             }]);
             assert!(
                 ctx.recent_same_family_return_expr_before(&block, 1, &target)
+                    .expect("return-expression scan")
                     .is_none(),
                 "recent return recovery must not surface transient return artifacts"
             );
@@ -13665,6 +13741,7 @@ mod tests {
         }]);
         assert!(
             ctx.recent_same_family_return_expr_before(&stack_load, 1, &target)
+                .expect("return-expression scan")
                 .is_none(),
             "recent return recovery must not surface low-level stack dereference artifacts"
         );

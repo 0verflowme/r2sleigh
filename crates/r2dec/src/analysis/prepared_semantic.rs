@@ -551,7 +551,19 @@ fn populate_prepared_render_definitions(symbols: &std::cell::RefCell<crate::symb
                     type_hints: &use_info.type_hints,
                     type_oracle: env.type_oracle,
                 };
-                lower.op_to_expr(op)
+                match lower.op_to_expr(op) {
+                    Ok(expr) => expr,
+                    Err(
+                        crate::analysis::lower::OpLoweringRefusal::MissingMachineProjectionAuthorization
+                        | crate::analysis::lower::OpLoweringRefusal::UnrepresentableOperation,
+                    ) => {
+                        // This table is an advisory expression cache, not an
+                        // effect disposition. Omitting the definition cannot
+                        // authorize executable fallback; BindingPlan retains
+                        // the canonical MachineProjection refusal.
+                        continue;
+                    }
+                }
             };
             if std::env::var("R2SLEIGH_TRACE_DEFFILTER").as_deref()
                 == Ok(&*dst.display_name())
@@ -649,11 +661,6 @@ fn prepared_op_has_render_definition(op: &SSAOp) -> bool {
             | SSAOp::Select { .. }
             | SSAOp::PtrAdd { .. }
             | SSAOp::PtrSub { .. }
-            | SSAOp::CallOther {
-                output: Some(_),
-                ..
-            }
-            | SSAOp::CpuId { .. }
     )
 }
 
