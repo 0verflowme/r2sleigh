@@ -282,7 +282,7 @@ fn c_type_size_bytes(ty: &CType, ptr_size: u32) -> Option<u64> {
     match ty {
         CType::Void | CType::Unknown | CType::Function { .. } => None,
         CType::Bool => Some(1),
-        CType::Int(bits) | CType::UInt(bits) | CType::Float(bits) => {
+        CType::Int(bits) | CType::UInt(bits) | CType::BitVector(bits) | CType::Float(bits) => {
             Some((u64::from(*bits).saturating_add(7) / 8).max(1))
         }
         CType::Pointer(_) => Some(u64::from(ptr_size.max(1))),
@@ -921,7 +921,8 @@ fn type_from_size(size: u32) -> CType {
         2 => CType::Int(16),
         4 => CType::Int(32),
         8 => CType::Int(64),
-        _ => CType::Int(size.saturating_mul(8)),
+        16 => CType::Int(128),
+        _ => CType::BitVector(size.saturating_mul(8)),
     }
 }
 
@@ -932,9 +933,8 @@ fn uint_type_from_size(size: u32) -> CType {
         2 => CType::UInt(16),
         4 => CType::UInt(32),
         8 => CType::UInt(64),
-        // A width C cannot spell is held in the next one it can, which is what
-        // the value already is: the bits above it are zero.
-        _ => CType::UInt(size.next_power_of_two().max(1).saturating_mul(8)),
+        16 => CType::UInt(128),
+        _ => CType::BitVector(size.saturating_mul(8)),
     }
 }
 
