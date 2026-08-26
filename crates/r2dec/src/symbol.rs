@@ -68,37 +68,12 @@ pub enum SymbolRole {
     Carrier,
 }
 
-/// Where a declared name came from, so a rendered name can be traced back.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub struct SymbolOrigin {
-    /// The canonical value this name stands for, when one value defines it.
-    pub value: Option<r2ssa::ValueId>,
-}
-
-/// Which SSA value a rendered spelling stands for.
-///
-/// One spelling can be reused for two SSA values, and then it names neither, so
-/// the ambiguous case is recorded rather than resolved by guessing.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub enum SsaOrigin {
-    /// Nothing has said which SSA value this spelling renders.
-    #[default]
-    Unset,
-    /// This spelling renders exactly this SSA display name.
-    One(Rc<str>),
-    /// More than one SSA value renders as this spelling.
-    Ambiguous,
-}
-
 /// One declared name.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Symbol {
     pub name: Rc<str>,
-    /// The SSA display name this spelling renders, when it renders just one.
-    pub ssa: SsaOrigin,
     pub ty: CType,
     pub role: SymbolRole,
-    pub origin: SymbolOrigin,
 }
 
 /// Why a name that the function does not declare is allowed to appear.
@@ -138,21 +113,6 @@ pub struct SymbolTable {
     symbols: Vec<Symbol>,
     /// Which identifiers are taken, so a second declaration cannot shadow a first.
     by_name: HashMap<String, SymbolId>,
-    /// Which identifier was minted to render a given SSA value, by that value's
-    /// display name.
-    ///
-    /// The forward direction is already stored per symbol as `SsaOrigin`. This
-    /// is the reverse, so a layer holding a raw SSA name can reach the
-    /// identifier that already renders it instead of minting a second one --
-    /// which is how `tmp:4700_7` came to be spelled `t4700_7` in a statement and
-    /// `tmp_4700_7` in a condition, with neither seeing the other.
-    ///
-    /// A name minted for more than one value is removed rather than answered
-    /// for, on the same rule the table applies everywhere: two values must not
-    /// become one identifier.
-    by_ssa_name: HashMap<String, SymbolId>,
-    /// Which value each name stands for, so asking twice costs one probe, not a scan.
-    by_value: HashMap<r2ssa::ValueId, SymbolId>,
 }
 
 impl SymbolTable {
@@ -175,7 +135,7 @@ impl SymbolTable {
         ty: CType,
         role: SymbolRole,
     ) -> SymbolId {
-        self.declare(presentation_name, ty, role, SymbolOrigin::default())
+        self.declare(presentation_name, ty, role)
     }
 
     /// Mint an identifier for a position in this table.
@@ -209,7 +169,6 @@ impl SymbolTable {
         name: impl Into<String>,
         ty: CType,
         role: SymbolRole,
-        origin: SymbolOrigin,
     ) -> SymbolId {
         let requested = name.into();
         if let Ok(want) = std::env::var("R2SLEIGH_TRACE_NAME")
@@ -223,73 +182,8 @@ impl SymbolTable {
         let name: Rc<str> = Rc::from(self.unique_name(requested));
         let id = self.id_at(self.symbols.len());
         self.by_name.insert(name.to_string(), id);
-        if let Some(value) = origin.value {
-            self.by_value.entry(value).or_insert(id);
-        }
-        self.symbols.push(Symbol {
-            name,
-            ssa: SsaOrigin::Unset,
-            ty,
-            role,
-            origin,
-        });
+        self.symbols.push(Symbol { name, ty, role });
         id
-    }
-
-    /// Declare a name for a value, or return the one that value already has.
-    pub fn declare_value(
-        &mut self,
-        value: r2ssa::ValueId,
-        name: impl Into<String>,
-        ty: CType,
-        role: SymbolRole,
-    ) -> SymbolId {
-        if let Some(existing) = self.for_value(value) {
-            return existing;
-        }
-        self.declare(name, ty, role, SymbolOrigin { value: Some(value) })
-    }
-
-    /// The identifier for this spelling, declaring it if nothing has yet.
-    ///
-    /// Expression building asks for a name many times over as it walks a value,
-    /// and every ask means the same variable. Minting a second identifier for the
-    /// second ask would put two variables on the page for one value, so the
-    /// spelling is what decides identity here.
-    /// The SSA display name this identifier renders, when it renders just one.
-    ///
-    /// A rendered spelling and an SSA display name are different strings for the
-    /// same value, so a side table keyed by the latter must be asked with this.
-    pub fn ssa_name(&self, id: SymbolId) -> Option<Rc<str>> {
-        match &self.get(id).ssa {
-            SsaOrigin::One(name) => Some(Rc::clone(name)),
-            SsaOrigin::Unset | SsaOrigin::Ambiguous => None,
-        }
-    }
-
-    /// Record which SSA value this identifier was minted to render.
-    pub fn note_ssa_name(&mut self, id: SymbolId, ssa_name: &str) {
-        let index = self.resolve(id);
-        let slot = &mut self.symbols[index].ssa;
-        *slot = match slot {
-            SsaOrigin::Unset => SsaOrigin::One(Rc::from(ssa_name)),
-            SsaOrigin::One(current) if &**current == ssa_name => return,
-            SsaOrigin::One(_) | SsaOrigin::Ambiguous => SsaOrigin::Ambiguous,
-        };
-        match self.by_ssa_name.entry(ssa_name.to_string()) {
-            std::collections::hash_map::Entry::Vacant(slot) => {
-                slot.insert(id);
-            }
-            std::collections::hash_map::Entry::Occupied(slot) if *slot.get() != id => {
-                slot.remove();
-            }
-            std::collections::hash_map::Entry::Occupied(_) => {}
-        }
-    }
-
-    /// The identifier already minted to render this SSA value, if exactly one is.
-    pub fn for_ssa_name(&self, ssa_name: &str) -> Option<SymbolId> {
-        self.by_ssa_name.get(ssa_name).copied()
     }
 
     #[track_caller]
@@ -329,10 +223,8 @@ impl SymbolTable {
         self.by_name.insert(name.to_string(), id);
         self.symbols.push(Symbol {
             name: Rc::from(name),
-            ssa: SsaOrigin::Unset,
             ty: CType::Unknown,
             role: SymbolRole::Carrier,
-            origin: SymbolOrigin::default(),
         });
         id
     }
@@ -436,11 +328,6 @@ impl SymbolTable {
         self.symbols[index].ty = ty;
     }
 
-    /// The identifier standing for a canonical value, if one was declared for it.
-    pub fn for_value(&self, value: r2ssa::ValueId) -> Option<SymbolId> {
-        self.by_value.get(&value).copied()
-    }
-
     /// The identifier spelled this way, if any declaration took that spelling.
     pub fn by_name(&self, name: &str) -> Option<SymbolId> {
         self.by_name.get(name).copied()
@@ -477,7 +364,6 @@ mod tests {
             "total",
             CType::Int(32),
             SymbolRole::Carrier,
-            SymbolOrigin::default(),
         );
 
         assert_eq!(symbols.name(id), "total");
@@ -493,13 +379,11 @@ mod tests {
             "h",
             CType::Int(32),
             SymbolRole::Carrier,
-            SymbolOrigin::default(),
         );
         let second = symbols.declare(
             "h",
             CType::Int(64),
             SymbolRole::Carrier,
-            SymbolOrigin::default(),
         );
 
         assert_ne!(first, second);
@@ -508,15 +392,14 @@ mod tests {
     }
 
     #[test]
-    fn one_value_gets_one_name_however_often_it_is_asked_for() {
+    fn presentation_lookup_does_not_merge_distinct_declarations() {
         let mut symbols = table();
-        let value = r2ssa::ValueId(7);
-        let first = symbols.declare_value(value, "h", CType::Int(32), SymbolRole::Carrier);
-        let again = symbols.declare_value(value, "other", CType::Int(32), SymbolRole::Carrier);
+        let first = symbols.declare("h", CType::Int(32), SymbolRole::Carrier);
+        let second = symbols.declare("h", CType::Int(32), SymbolRole::Carrier);
 
-        assert_eq!(first, again);
-        assert_eq!(symbols.len(), 1);
-        assert_eq!(symbols.for_value(value), Some(first));
+        assert_ne!(first, second);
+        assert_eq!(symbols.by_name("h"), Some(first));
+        assert_eq!(symbols.by_name("h_2"), Some(second));
     }
 
     #[test]
@@ -526,7 +409,6 @@ mod tests {
             "x0_2",
             CType::Int(64),
             SymbolRole::Carrier,
-            SymbolOrigin::default(),
         );
 
         symbols.rename(id, "hash");
@@ -543,13 +425,11 @@ mod tests {
             "hash",
             CType::Int(32),
             SymbolRole::Carrier,
-            SymbolOrigin::default(),
         );
         let other = symbols.declare(
             "x0_2",
             CType::Int(64),
             SymbolRole::Carrier,
-            SymbolOrigin::default(),
         );
 
         symbols.rename(other, "hash");
@@ -593,7 +473,6 @@ mod reuse_tests {
             "total",
             CType::Int(32),
             SymbolRole::Carrier,
-            SymbolOrigin::default(),
         );
 
         assert_eq!(symbols.declare_or_reuse("total"), declared);

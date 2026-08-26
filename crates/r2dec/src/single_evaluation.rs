@@ -9,9 +9,11 @@
 //! reading a program that does not exist.
 //!
 //! This pass restores the invariant on the rendered function. Within a scope,
-//! the first occurrence of a multiply-rendered call site becomes its binding
-//! and every later occurrence becomes a mention of the bound name. Sites that
-//! appear once are left exactly as they are.
+//! the first occurrence of a multiply-rendered call site is assigned to the
+//! program variable already authorized for that site, and every later
+//! occurrence becomes a mention of that binding. Sites that appear once are
+//! left exactly as they are. A repeated site without such a target is refused;
+//! this pass never invents a local or its type.
 //!
 //! Sibling branches do not share bindings. A name bound in one arm of an `if`
 //! is neither in scope nor in effect in the other, so each arm starts from the
@@ -21,152 +23,119 @@
 
 use std::collections::BTreeMap;
 
-use crate::ast::{BinaryOp, CExpr, CFunction, CStmt, CType};
+use crate::ast::{BinaryOp, CExpr, CFunction, CStmt};
+use crate::binding_plan::BindingNameResolution;
 
 /// A call site, identified by the address of the call and its index there.
-type Source = (u64, usize);
+pub(crate) type CallSite = (u64, usize);
 
-/// Resolves a rendered call expression back to the site it came from.
-///
-/// Two distinct sites can render identically -- a program may well call
-/// `malloc(len + 1)` twice -- and in that case the rendering carries no
-/// evidence of which site it is. Such expressions are reported as unresolved
-/// rather than guessed at, because merging two real calls into one would
-/// delete an event the program performs.
-struct CallIndex<'a> {
-    entries: Vec<(&'a CExpr, Source)>,
+/// A repeated call site has no binding-plan-authorized assignment target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SingleEvaluationError {
+    MissingAssignmentTarget { site: CallSite },
 }
 
-impl<'a> CallIndex<'a> {
-    fn new(call_exprs: &'a BTreeMap<Source, CExpr>) -> Self {
-        Self {
-            entries: call_exprs
-                .iter()
-                .filter(|(_, expr)| matches!(expr.unobserved(), CExpr::Call { .. }))
-                .map(|(source, expr)| (expr, *source))
-                .collect(),
-        }
-    }
-
-    fn source_of(&self, expr: &CExpr) -> Option<Source> {
-        let semantic_expr = expr.unobserved();
-        // A call that knows its site says which site it is. Comparing shapes
-        // only works while every layer builds the same expression for a call,
-        // and they do not: the analysis layer and the fold each build their own.
-        if let CExpr::Call {
+fn source_of(expr: &CExpr) -> Option<CallSite> {
+    match expr.unobserved() {
+        CExpr::Call {
             site: Some(site), ..
-        } = semantic_expr
-        {
-            return Some(*site);
-        }
-        if !matches!(semantic_expr, CExpr::Call { .. }) {
-            return None;
-        }
-        let mut found = None;
-        for (candidate, source) in &self.entries {
-            if candidate.transparently_eq(expr) {
-                if found.is_some() {
-                    return None;
-                }
-                found = Some(*source);
-            }
-        }
-        found
+        } => Some(*site),
+        _ => None,
     }
 }
 
 /// Give every call site in `func` exactly one evaluation.
-pub(crate) fn bind_each_call_site_once(func: &mut CFunction, call_exprs: &BTreeMap<Source, CExpr>) {
-    let index = CallIndex::new(call_exprs);
-    if index.entries.is_empty() {
-        return;
-    }
+pub(crate) fn bind_each_call_site_once(
+    func: &mut CFunction,
+    names: &BindingNameResolution,
+) -> Result<(), SingleEvaluationError> {
+    bind_each_call_site_once_with(func, |symbol| {
+        names.authorizes_program_variable(symbol)
+    })
+}
 
-    let mut counts: BTreeMap<Source, usize> = BTreeMap::new();
+fn bind_each_call_site_once_with(
+    func: &mut CFunction,
+    target_is_authorized: impl Fn(crate::symbol::SymbolId) -> bool,
+) -> Result<(), SingleEvaluationError> {
+    let mut counts: BTreeMap<CallSite, usize> = BTreeMap::new();
     for stmt in &func.body {
-        count_in_stmt(stmt, &index, &mut counts);
+        count_in_stmt(stmt, &mut counts);
     }
-    let repeated: Vec<Source> = counts
+    let repeated: Vec<CallSite> = counts
         .into_iter()
         .filter(|(_, count)| *count > 1)
         .map(|(source, _)| source)
         .collect();
     if repeated.is_empty() {
-        return;
+        return Ok(());
     }
 
     // A site that is already assigned to a variable somewhere in the body has
     // a name the rest of the function already uses; binding to that same name
     // keeps the two consistent instead of introducing a synonym.
-    let mut preferred: BTreeMap<Source, crate::symbol::SymbolId> = BTreeMap::new();
+    let mut preferred: BTreeMap<CallSite, crate::symbol::SymbolId> = BTreeMap::new();
     for stmt in &func.body {
-        collect_assignment_names(stmt, &index, &repeated, &mut preferred);
+        collect_assignment_names(
+            stmt,
+            &repeated,
+            &target_is_authorized,
+            &mut preferred,
+        );
+    }
+    if let Some(site) = repeated
+        .iter()
+        .copied()
+        .find(|site| !preferred.contains_key(site))
+    {
+        return Err(SingleEvaluationError::MissingAssignmentTarget { site });
     }
 
-    let mut introduced: Vec<crate::symbol::SymbolId> = Vec::new();
-    let mut bound: BTreeMap<Source, crate::symbol::SymbolId> = BTreeMap::new();
+    let mut bound: BTreeMap<CallSite, crate::symbol::SymbolId> = BTreeMap::new();
     let body = std::mem::take(&mut func.body);
-    let mut symbols = func.symbols.borrow_mut();
     func.body = rewrite_block(
         body,
-        &index,
         &repeated,
         &preferred,
+        &target_is_authorized,
         &mut bound,
-        &mut introduced,
-        &mut symbols,
     );
-    drop(symbols);
 
     // Binding a site evaluates it at the binding, so a bare statement for the
     // same site evaluates it twice. The fold emits one because at that point
     // nothing owned the result, which is what this pass has just changed.
-    drop_bare_statements_for_bound_sites(&mut func.body, &index, &bound);
-
-    for name in introduced {
-        if !func.locals.iter().any(|local| local.name == name)
-            && !func.params.iter().any(|param| param.name == name)
-        {
-            func.locals.push(crate::ast::CLocal {
-                ty: CType::UInt(64),
-                name,
-                stack_offset: None,
-            });
-        }
-    }
+    drop_bare_statements_for_bound_sites(&mut func.body, &bound);
+    Ok(())
 }
 
 /// Remove a bare evaluation of a call site this pass has bound to a name.
 fn drop_bare_statements_for_bound_sites(
     body: &mut Vec<CStmt>,
-    index: &CallIndex<'_>,
-    bound: &BTreeMap<Source, crate::symbol::SymbolId>,
+    bound: &BTreeMap<CallSite, crate::symbol::SymbolId>,
 ) {
     body.retain(|stmt| match stmt.unobserved() {
-        CStmt::Expr(expr) => index
-            .source_of(expr)
-            .is_none_or(|source| !bound.contains_key(&source)),
+        CStmt::Expr(expr) => source_of(expr).is_none_or(|source| !bound.contains_key(&source)),
         _ => true,
     });
     for stmt in body.iter_mut() {
         for_each_child_block_mut(stmt, &mut |inner, _| {
-            drop_bare_statements_for_bound_sites(inner, index, bound);
+            drop_bare_statements_for_bound_sites(inner, bound);
         });
     }
 }
 
-fn count_in_stmt(stmt: &CStmt, index: &CallIndex<'_>, counts: &mut BTreeMap<Source, usize>) {
-    for_each_expr(stmt, &mut |expr| count_in_expr(expr, index, counts));
+fn count_in_stmt(stmt: &CStmt, counts: &mut BTreeMap<CallSite, usize>) {
+    for_each_expr(stmt, &mut |expr| count_in_expr(expr, counts));
     for_each_child_block(stmt, &mut |stmts| {
         for inner in stmts {
-            count_in_stmt(inner, index, counts);
+            count_in_stmt(inner, counts);
         }
     });
 }
 
-fn count_in_expr(expr: &CExpr, index: &CallIndex<'_>, counts: &mut BTreeMap<Source, usize>) {
+fn count_in_expr(expr: &CExpr, counts: &mut BTreeMap<CallSite, usize>) {
     expr.visit(&mut |node| {
-        if let Some(source) = index.source_of(node) {
+        if let Some(source) = source_of(node) {
             *counts.entry(source).or_insert(0) += 1;
         }
     });
@@ -174,20 +143,21 @@ fn count_in_expr(expr: &CExpr, index: &CallIndex<'_>, counts: &mut BTreeMap<Sour
 
 fn collect_assignment_names(
     stmt: &CStmt,
-    index: &CallIndex<'_>,
-    repeated: &[Source],
-    out: &mut BTreeMap<Source, crate::symbol::SymbolId>,
+    repeated: &[CallSite],
+    target_is_authorized: &impl Fn(crate::symbol::SymbolId) -> bool,
+    out: &mut BTreeMap<CallSite, crate::symbol::SymbolId>,
 ) {
     if let Some((left, right)) = assignment_parts(stmt)
         && let CExpr::Var(name) = left.unobserved()
-        && let Some(source) = index.source_of(right)
+        && target_is_authorized(*name)
+        && let Some(source) = source_of(right)
         && repeated.contains(&source)
     {
         out.entry(source).or_insert(*name);
     }
     for_each_child_block(stmt, &mut |stmts| {
         for inner in stmts {
-            collect_assignment_names(inner, index, repeated, out);
+            collect_assignment_names(inner, repeated, target_is_authorized, out);
         }
     });
 }
@@ -209,12 +179,10 @@ fn assignment_parts(stmt: &CStmt) -> Option<(&CExpr, &CExpr)> {
 
 fn rewrite_block(
     stmts: Vec<CStmt>,
-    index: &CallIndex<'_>,
-    repeated: &[Source],
-    preferred: &BTreeMap<Source, crate::symbol::SymbolId>,
-    bound: &mut BTreeMap<Source, crate::symbol::SymbolId>,
-    introduced: &mut Vec<crate::symbol::SymbolId>,
-    symbols: &mut crate::symbol::SymbolTable,
+    repeated: &[CallSite],
+    preferred: &BTreeMap<CallSite, crate::symbol::SymbolId>,
+    target_is_authorized: &impl Fn(crate::symbol::SymbolId) -> bool,
+    bound: &mut BTreeMap<CallSite, crate::symbol::SymbolId>,
 ) -> Vec<CStmt> {
     let mut out: Vec<CStmt> = Vec::with_capacity(stmts.len());
     for mut stmt in stmts {
@@ -224,8 +192,9 @@ fn rewrite_block(
         // case the assignment is a second evaluation and becomes a copy.
         if let Some((left, right)) = assignment_parts(&stmt)
             && let CExpr::Var(name) = left.unobserved()
-            && let Some(source) = index.source_of(right)
+            && let Some(source) = source_of(right)
             && repeated.contains(&source)
+            && target_is_authorized(*name)
             && !bound.contains_key(&source)
         {
             bound.insert(source, *name);
@@ -237,23 +206,12 @@ fn rewrite_block(
         // of it. Rewriting turns the right-hand side into the bound name, and
         // what is left says only that the variable still holds what it holds.
         let reassigns_bound_site = assignment_parts(&stmt).is_some_and(|(_, right)| {
-            index
-                .source_of(right)
-                .is_some_and(|source| bound.contains_key(&source))
+            source_of(right).is_some_and(|source| bound.contains_key(&source))
         });
 
         let mut hoists: Vec<CStmt> = Vec::new();
         for_each_expr_mut(&mut stmt, &mut |expr| {
-            rewrite_expr(
-                expr,
-                index,
-                repeated,
-                preferred,
-                bound,
-                introduced,
-                symbols,
-                &mut hoists,
-            )
+            rewrite_expr(expr, repeated, preferred, bound, &mut hoists)
         });
         out.extend(hoists);
 
@@ -270,11 +228,22 @@ fn rewrite_block(
         for_each_child_block_mut(&mut stmt, &mut |stmts, shares_scope| {
             let taken = std::mem::take(stmts);
             if shares_scope {
-                *stmts = rewrite_block(taken, index, repeated, preferred, bound, introduced, symbols);
+                *stmts = rewrite_block(
+                    taken,
+                    repeated,
+                    preferred,
+                    target_is_authorized,
+                    bound,
+                );
             } else {
                 let mut nested = bound.clone();
-                *stmts =
-                    rewrite_block(taken, index, repeated, preferred, &mut nested, introduced, symbols);
+                *stmts = rewrite_block(
+                    taken,
+                    repeated,
+                    preferred,
+                    target_is_authorized,
+                    &mut nested,
+                );
             }
         });
 
@@ -295,22 +264,19 @@ fn is_self_assignment(stmt: &CStmt) -> bool {
 
 fn rewrite_expr(
     expr: &mut CExpr,
-    index: &CallIndex<'_>,
-    repeated: &[Source],
-    preferred: &BTreeMap<Source, crate::symbol::SymbolId>,
-    bound: &mut BTreeMap<Source, crate::symbol::SymbolId>,
-    introduced: &mut Vec<crate::symbol::SymbolId>,
-    symbols: &mut crate::symbol::SymbolTable,
+    repeated: &[CallSite],
+    preferred: &BTreeMap<CallSite, crate::symbol::SymbolId>,
+    bound: &mut BTreeMap<CallSite, crate::symbol::SymbolId>,
     hoists: &mut Vec<CStmt>,
 ) {
     // Children first: a call nested in another call's arguments is evaluated
     // before the call that consumes it, and hoisting in that order keeps the
     // statements in the order the program runs them.
     for child in children_mut(expr) {
-        rewrite_expr(child, index, repeated, preferred, bound, introduced, symbols, hoists);
+        rewrite_expr(child, repeated, preferred, bound, hoists);
     }
 
-    let Some(source) = index.source_of(expr) else {
+    let Some(source) = source_of(expr) else {
         return;
     };
     if !repeated.contains(&source) {
@@ -322,62 +288,17 @@ fn rewrite_expr(
         return;
     }
 
-    let name = preferred.get(&source).copied().unwrap_or_else(|| {
-        let spelling = introduced_name_for(expr, introduced, symbols);
-        let name = symbols.declare_or_reuse(&spelling);
-        introduced.push(name);
-        name
-    });
-    let call = std::mem::replace(expr, CExpr::Var(name.clone()));
+    let name = preferred
+        .get(&source)
+        .copied()
+        .expect("single-evaluation preflight requires an authorized assignment target");
+    let call = std::mem::replace(expr, CExpr::Var(name));
     hoists.push(CStmt::Expr(CExpr::Binary {
         op: BinaryOp::Assign,
-        left: Box::new(CExpr::Var(name.clone())),
+        left: Box::new(CExpr::Var(name)),
         right: Box::new(call),
     }));
     bound.insert(source, name);
-}
-
-/// A name for a site the body never assigned anywhere, derived from the callee
-/// so the binding still says what it holds.
-fn introduced_name_for(
-    expr: &CExpr,
-    introduced: &[crate::symbol::SymbolId],
-    symbols: &crate::symbol::SymbolTable,
-) -> String {
-    let callee = match expr.unobserved() {
-        CExpr::Call { func, .. } => match func.unobserved() {
-            CExpr::Var(id) => {
-                let name = symbols.name(*id);
-                let tail = name.rsplit('.').next().unwrap_or(name);
-                if tail.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_') {
-                    tail.to_string()
-                } else {
-                    name.replace(|c: char| !c.is_ascii_alphanumeric(), "_")
-                }
-            }
-            _ => "call".to_string(),
-        },
-        _ => "call".to_string(),
-    };
-    // The table settles collisions when the name is declared, so this only has
-    // to avoid re-proposing one this pass has already introduced.
-    let base = format!("{callee}_result");
-    let taken = |candidate: &str| {
-        introduced
-            .iter()
-            .any(|name| symbols.name(*name) == candidate)
-    };
-    if !taken(&base) {
-        return base;
-    }
-    let mut suffix = 2;
-    loop {
-        let candidate = format!("{base}_{suffix}");
-        if !taken(&candidate) {
-            return candidate;
-        }
-        suffix += 1;
-    }
 }
 
 pub(crate) fn children_mut(expr: &mut CExpr) -> Vec<&mut CExpr> {
@@ -557,11 +478,15 @@ mod tests {
         std::cell::RefCell::new(crate::symbol::SymbolTable::new())
     }
 
-    fn call(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, name: &str) -> CExpr {
+    fn call(
+        symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
+        name: &str,
+        site: CallSite,
+    ) -> CExpr {
         CExpr::Call {
             func: Box::new(CExpr::Var(crate::symbol::declare(&symbols, &name.to_string()))),
             args: vec![CExpr::IntLit(16)],
-            site: None,
+            site: Some(site),
         }
     }
 
@@ -590,25 +515,35 @@ mod tests {
         }
     }
 
-    fn one_site(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>) -> BTreeMap<Source, CExpr> {
-        BTreeMap::from([((0x1000, 0), call(symbols, "fcn.1000"))])
+    fn bind_with_targets(
+        func: &mut CFunction,
+        target_names: &[&str],
+    ) -> Result<(), SingleEvaluationError> {
+        let targets = {
+            let symbols = func.symbols.borrow();
+            target_names
+                .iter()
+                .map(|name| symbols.by_name(name).expect("authorized test target"))
+                .collect::<Vec<_>>()
+        };
+        bind_each_call_site_once_with(func, |symbol| targets.contains(&symbol))
     }
 
     #[test]
     fn a_second_assignment_of_the_same_site_becomes_a_copy() {
         let symbols = test_table();
         let mut func = function_from(&symbols, vec![
-            assign(&symbols, "x0_3", call(&symbols, "fcn.1000")),
-            assign(&symbols, "x0_4", call(&symbols, "fcn.1000")),
+            assign(&symbols, "x0_3", call(&symbols, "fcn.1000", (0x1000, 0))),
+            assign(&symbols, "x0_4", call(&symbols, "fcn.1000", (0x1000, 0))),
             CStmt::Return(Some(crate::symbol::var_ref(&symbols, "x0_3"))),
         ]);
 
-        bind_each_call_site_once(&mut func, &one_site(&symbols));
+        bind_with_targets(&mut func, &["x0_3", "x0_4"]).expect("authorized targets");
 
         assert_eq!(
             func.body,
             vec![
-                assign(&symbols, "x0_3", call(&symbols, "fcn.1000")),
+                assign(&symbols, "x0_3", call(&symbols, "fcn.1000", (0x1000, 0))),
                 assign(&symbols, "x0_4", crate::symbol::var_ref(&symbols, "x0_3")),
                 CStmt::Return(Some(crate::symbol::var_ref(&symbols, "x0_3"))),
             ]
@@ -619,17 +554,17 @@ mod tests {
     fn reassigning_the_same_target_leaves_nothing_to_say() {
         let symbols = test_table();
         let mut func = function_from(&symbols, vec![
-            assign(&symbols, "owned", call(&symbols, "fcn.1000")),
-            assign(&symbols, "owned", call(&symbols, "fcn.1000")),
+            assign(&symbols, "owned", call(&symbols, "fcn.1000", (0x1000, 0))),
+            assign(&symbols, "owned", call(&symbols, "fcn.1000", (0x1000, 0))),
             CStmt::Return(Some(crate::symbol::var_ref(&symbols, "owned"))),
         ]);
 
-        bind_each_call_site_once(&mut func, &one_site(&symbols));
+        bind_with_targets(&mut func, &["owned"]).expect("authorized target");
 
         assert_eq!(
             func.body,
             vec![
-                assign(&symbols, "owned", call(&symbols, "fcn.1000")),
+                assign(&symbols, "owned", call(&symbols, "fcn.1000", (0x1000, 0))),
                 CStmt::Return(Some(crate::symbol::var_ref(&symbols, "owned"))),
             ]
         );
@@ -640,25 +575,25 @@ mod tests {
         let symbols = test_table();
         let outer = CExpr::Call {
             func: Box::new(crate::symbol::var_ref(&symbols, "use")),
-            args: vec![call(&symbols, "fcn.1000")],
-            site: None,
+            args: vec![call(&symbols, "fcn.1000", (0x1000, 0))],
+            site: Some((0x2000, 0)),
         };
         let mut func = function_from(&symbols, vec![
             CStmt::Expr(outer),
-            assign(&symbols, "owned", call(&symbols, "fcn.1000")),
+            assign(&symbols, "owned", call(&symbols, "fcn.1000", (0x1000, 0))),
             CStmt::Return(Some(crate::symbol::var_ref(&symbols, "owned"))),
         ]);
 
-        bind_each_call_site_once(&mut func, &one_site(&symbols));
+        bind_with_targets(&mut func, &["owned"]).expect("authorized target");
 
         assert_eq!(
             func.body,
             vec![
-                assign(&symbols, "owned", call(&symbols, "fcn.1000")),
+                assign(&symbols, "owned", call(&symbols, "fcn.1000", (0x1000, 0))),
                 CStmt::Expr(CExpr::Call {
                     func: Box::new(crate::symbol::var_ref(&symbols, "use")),
                     args: vec![crate::symbol::var_ref(&symbols, "owned")],
-                    site: None,
+                    site: Some((0x2000, 0)),
                 }),
                 CStmt::Return(Some(crate::symbol::var_ref(&symbols, "owned"))),
             ]
@@ -666,24 +601,24 @@ mod tests {
     }
 
     #[test]
-    fn a_site_the_body_never_names_gets_a_declared_binding() {
+    fn a_repeated_site_without_an_authorized_target_is_refused_transactionally() {
         let symbols = test_table();
         let mut func = function_from(&symbols, vec![
-            CStmt::Expr(call(&symbols, "fcn.1000")),
-            CStmt::Return(Some(call(&symbols, "fcn.1000"))),
+            CStmt::Expr(call(&symbols, "fcn.1000", (0x1000, 0))),
+            CStmt::Return(Some(call(&symbols, "fcn.1000", (0x1000, 0)))),
         ]);
+        let before = func.body.clone();
 
-        bind_each_call_site_once(&mut func, &one_site(&symbols));
+        let refusal = bind_with_targets(&mut func, &[]);
 
         assert_eq!(
-            func.body,
-            vec![
-                assign(&symbols, "fcn_1000_result", call(&symbols, "fcn.1000")),
-                CStmt::Return(Some(crate::symbol::var_ref(&symbols, "fcn_1000_result"))),
-            ]
+            refusal,
+            Err(SingleEvaluationError::MissingAssignmentTarget {
+                site: (0x1000, 0)
+            })
         );
-        assert_eq!(func.locals.len(), 1);
-        assert_eq!(func.locals[0].name, crate::symbol::declare(&symbols, "fcn_1000_result"));
+        assert_eq!(func.body, before);
+        assert!(func.locals.is_empty(), "the pass must never mint a local");
     }
 
     #[test]
@@ -691,7 +626,11 @@ mod tests {
         let symbols = test_table();
         let arm = |target: &str| {
             Box::new(CStmt::Block(vec![
-                assign(&symbols, target, call(&symbols, "fcn.1000")),
+                assign(
+                    &symbols,
+                    target,
+                    call(&symbols, "fcn.1000", (0x1000, 0)),
+                ),
                 CStmt::Return(Some(CExpr::Var(crate::symbol::declare(&symbols, &target.to_string())))),
             ]))
         };
@@ -702,7 +641,7 @@ mod tests {
         }]);
         let before = func.body.clone();
 
-        bind_each_call_site_once(&mut func, &one_site(&symbols));
+        bind_with_targets(&mut func, &["a", "b"]).expect("authorized branch targets");
 
         assert_eq!(func.body, before);
     }
@@ -710,18 +649,14 @@ mod tests {
     #[test]
     fn two_sites_that_render_alike_are_left_alone() {
         let symbols = test_table();
-        let sites = BTreeMap::from([
-            ((0x1000, 0), call(&symbols, "fcn.1000")),
-            ((0x2000, 0), call(&symbols, "fcn.1000")),
-        ]);
         let mut func = function_from(&symbols, vec![
-            assign(&symbols, "a", call(&symbols, "fcn.1000")),
-            assign(&symbols, "b", call(&symbols, "fcn.1000")),
+            assign(&symbols, "a", call(&symbols, "fcn.1000", (0x1000, 0))),
+            assign(&symbols, "b", call(&symbols, "fcn.1000", (0x2000, 0))),
             CStmt::Return(Some(crate::symbol::var_ref(&symbols, "b"))),
         ]);
         let before = func.body.clone();
 
-        bind_each_call_site_once(&mut func, &sites);
+        bind_with_targets(&mut func, &["a", "b"]).expect("authorized targets");
 
         assert_eq!(func.body, before);
     }
@@ -730,12 +665,12 @@ mod tests {
     fn a_site_rendered_once_is_untouched() {
         let symbols = test_table();
         let mut func = function_from(&symbols, vec![
-            assign(&symbols, "a", call(&symbols, "fcn.1000")),
+            assign(&symbols, "a", call(&symbols, "fcn.1000", (0x1000, 0))),
             CStmt::Return(Some(crate::symbol::var_ref(&symbols, "a"))),
         ]);
         let before = func.body.clone();
 
-        bind_each_call_site_once(&mut func, &one_site(&symbols));
+        bind_with_targets(&mut func, &["a"]).expect("authorized target");
 
         assert_eq!(func.body, before);
         assert!(func.locals.is_empty());
@@ -746,20 +681,21 @@ mod tests {
         let symbols = test_table();
         let mut observations = RenderObservationOwner::new();
         let (dropped, dropped_stmt) = observations
-            .observe_stmt(CStmt::Expr(call(&symbols, "fcn.1000")))
+            .observe_stmt(CStmt::Expr(call(&symbols, "fcn.1000", (0x1000, 0))))
             .unwrap();
         let (surviving, surviving_expr) = observations
-            .observe_expr(call(&symbols, "fcn.1000"))
+            .observe_expr(call(&symbols, "fcn.1000", (0x1000, 0)))
             .unwrap();
         let mut func = function_from(
             &symbols,
             vec![
                 dropped_stmt,
                 CStmt::Return(Some(surviving_expr)),
+                assign(&symbols, "owned", call(&symbols, "fcn.1000", (0x1000, 0))),
             ],
         );
 
-        bind_each_call_site_once(&mut func, &one_site(&symbols));
+        bind_with_targets(&mut func, &["owned"]).expect("authorized target");
         let reachable = strip_render_observations(&mut func, observations.expected_count())
             .expect("single-evaluation rewriting must preserve unique observation IDs");
 

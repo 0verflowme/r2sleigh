@@ -43,6 +43,20 @@ pub(crate) enum PlannedParameterSymbol {
     Absent,
 }
 
+/// One exact parameter row for C-header assembly.
+///
+/// The declaration type comes from the same sealed binding certificate as the
+/// symbol. Consumers may refine it from the render-authorized signature at this
+/// exact slot, but never recover a type or identity positionally.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ResolvedParameter {
+    pub(crate) slot: u32,
+    pub(crate) binding: BindingId,
+    pub(crate) symbol: SymbolId,
+    pub(crate) width_bits: u32,
+    pub(crate) declaration_type: crate::ast::CType,
+}
+
 /// Typed failure to obtain one exact renderer identity or machine projection.
 ///
 /// Every variant retains the source-owned identity that failed.  Presentation
@@ -120,6 +134,64 @@ pub(crate) enum BindingNameResolutionError {
     ConflictingCertifiedRoles(BindingId),
 }
 
+/// Convert one upstream presentation hint into a C identifier before minting.
+///
+/// This is deliberately a spelling projection, not an identity lookup. The
+/// binding plan already decided which program variable exists; sanitizing its
+/// hint here keeps initial presentation under the same resolver and leaves the
+/// symbol table responsible only for deterministic spelling collisions.
+fn c_identifier_for_presentation(hint: &str) -> String {
+    let mut identifier = hint
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
+        .collect::<String>();
+    if identifier.starts_with(|ch: char| ch.is_ascii_digit()) {
+        identifier.insert(0, '_');
+    }
+    if identifier.is_empty() {
+        identifier.push('_');
+    }
+    identifier
+}
+
+/// Best source-owned presentation for one certified parameter slot.
+///
+/// Slot identity is supplied by `BindingRole::Parameter`; these strings can
+/// only improve how that already-proven variable is printed. A render-authorized
+/// signature is more specific than the source display-name snapshot, and a
+/// generic signature placeholder yields to the snapshot.
+fn source_parameter_presentation<'a>(
+    source_owned: &'a SourceOwnedFunctionFacts,
+    slot: u32,
+    plan_hint: Option<&'a str>,
+) -> Option<&'a str> {
+    let Ok(slot) = usize::try_from(slot) else {
+        return plan_hint;
+    };
+    let signature_name = source_owned
+        .report()
+        .type_facts()
+        .render_authorized_signature()
+        .and_then(|signature| signature.params.get(slot))
+        .map(|parameter| parameter.name.as_str());
+    preferred_parameter_presentation(
+        signature_name,
+        source_owned.report().display_names().parameter(slot),
+        plan_hint,
+    )
+}
+
+fn preferred_parameter_presentation<'a>(
+    signature_name: Option<&'a str>,
+    display_name: Option<&'a str>,
+    plan_hint: Option<&'a str>,
+) -> Option<&'a str> {
+    signature_name
+        .filter(|name| !r2types::is_generic_arg_name(name))
+        .or(display_name)
+        .or(plan_hint)
+}
+
 /// The only projection from [`BindingId`] to a rendered program-variable
 /// identity.
 ///
@@ -175,9 +247,17 @@ impl BindingNameResolution {
                     ));
                 }
             };
-            let presentation = binding
-                .presentation_name_hint()
-                .map(ToOwned::to_owned)
+            let presentation = match role {
+                SymbolRole::Parameter(slot) => source_parameter_presentation(
+                    source_owned,
+                    slot,
+                    binding.presentation_name_hint(),
+                ),
+                SymbolRole::StackLocal(_) | SymbolRole::Carrier => {
+                    binding.presentation_name_hint()
+                }
+            }
+                .map(c_identifier_for_presentation)
                 .unwrap_or_else(|| format!("binding_{}", binding_id.index()));
             let symbol = symbols.borrow_mut().reserve_binding(
                 presentation,
@@ -197,6 +277,71 @@ impl BindingNameResolution {
 
     pub(crate) fn symbol_for_binding(&self, binding: BindingId) -> Option<SymbolId> {
         self.by_binding.get(binding.index()).copied()
+    }
+
+    /// Whether this exact symbol was minted from one sealed renderer binding.
+    ///
+    /// Consumers use the `SymbolId`, never its current presentation spelling,
+    /// when they need proof that an existing assignment target is a program
+    /// variable authorized by the binding plan.
+    pub(crate) fn authorizes_program_variable(&self, symbol: SymbolId) -> bool {
+        self.by_binding.contains(&symbol)
+    }
+
+    /// Length of the dense source ABI parameter-slot domain.
+    ///
+    /// A sparse hole is included in this count and appears as a typed missing
+    /// disposition from [`parameters`](Self::parameters); it cannot silently
+    /// shift later slots left while assembling a C header.
+    pub(crate) fn parameter_count(&self) -> usize {
+        self.plan.parameters.len()
+    }
+
+    /// Exact parameter answers in ascending source ABI slot order.
+    ///
+    /// Refused slots stay in the iterator as typed errors. Consumers building a
+    /// C header therefore cannot skip an unsupported parameter and shift every
+    /// later slot into the wrong position.
+    pub(crate) fn parameters(
+        &self,
+    ) -> impl ExactSizeIterator<
+        Item = Result<ResolvedParameter, RenderedIdentityRefusal>,
+    > + '_ {
+        self.plan
+            .parameters
+            .iter()
+            .enumerate()
+            .map(move |(slot, disposition)| {
+                let slot = u32::try_from(slot)
+                    .expect("sealed parameter domain fits the source ABI slot domain");
+                match *disposition {
+                    None => Err(RenderedIdentityRefusal::MissingParameterDisposition { slot }),
+                    Some(ParameterDisposition::Bound {
+                        binding,
+                        width_bits,
+                    }) => {
+                        let symbol = self
+                            .symbol_for_binding(binding)
+                            .ok_or(RenderedIdentityRefusal::MissingBinding { binding })?;
+                        let declaration_type = self
+                            .plan
+                            .binding(binding)
+                            .ok_or(RenderedIdentityRefusal::MissingBinding { binding })?
+                            .declaration_type()
+                            .clone();
+                        Ok(ResolvedParameter {
+                            slot,
+                            binding,
+                            symbol,
+                            width_bits,
+                            declaration_type,
+                        })
+                    }
+                    Some(ParameterDisposition::Refused { reason }) => {
+                        Err(RenderedIdentityRefusal::Parameter { slot, reason })
+                    }
+                }
+            })
     }
 
     /// Canonical declaration role derived while resolving the binding's
@@ -500,6 +645,30 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn presentation_hints_are_sanitized_before_symbol_minting() {
+        assert_eq!(c_identifier_for_presentation("tmp:11f80"), "tmp_11f80");
+        assert_eq!(c_identifier_for_presentation("7th-value"), "_7th_value");
+        assert_eq!(c_identifier_for_presentation(""), "_");
+        assert_eq!(c_identifier_for_presentation("already_c"), "already_c");
+    }
+
+    #[test]
+    fn parameter_presentation_priority_is_source_owned_and_deterministic() {
+        assert_eq!(
+            preferred_parameter_presentation(Some("length"), Some("count"), Some("rdi")),
+            Some("length")
+        );
+        assert_eq!(
+            preferred_parameter_presentation(Some("arg0"), Some("count"), Some("rdi")),
+            Some("count")
+        );
+        assert_eq!(
+            preferred_parameter_presentation(Some("arg0"), None, Some("rdi")),
+            Some("rdi")
+        );
+    }
+
     fn source_owned() -> r2types::SourceOwnedFunctionFacts {
         let mut block = R2ILBlock::new(0x1000, 4);
         block.push(R2ILOp::Copy {
@@ -748,6 +917,22 @@ mod tests {
         assert_eq!(
             resolution.symbol_for_parameter_entity(r2ssa::SemanticId::Parameter(0)),
             Some(symbol)
+        );
+        assert_eq!(resolution.parameter_count(), 1);
+        assert_eq!(
+            resolution.parameters().collect::<Vec<_>>(),
+            vec![Ok(ResolvedParameter {
+                slot: 0,
+                binding,
+                symbol,
+                width_bits: 64,
+                declaration_type: resolution
+                    .plan()
+                    .binding(binding)
+                    .expect("parameter binding")
+                    .declaration_type()
+                    .clone(),
+            })]
         );
     }
 
