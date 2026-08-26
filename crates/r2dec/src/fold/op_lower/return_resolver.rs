@@ -96,24 +96,8 @@ impl<'a> FoldingContext<'a> {
         self.choose_preferred_visible_expr_in_context(Some(raw), Some(semanticized), context)
     }
 
-    fn return_context_for_slot_offset(&self, slot_offset: i64) -> VisibleExprContext {
-        self.stack_slots()
-            .find(|slot| slot.offset == slot_offset && slot.is_scalar_return_carrier())
-            .map(|_| VisibleExprContext::ScalarReturn)
-            .unwrap_or(VisibleExprContext::Generic)
-    }
-
     pub(super) fn current_return_context(&self) -> VisibleExprContext {
-        if self
-            .state
-            .return_stack_slots
-            .iter()
-            .copied()
-            .any(|slot_offset| {
-                self.return_context_for_slot_offset(slot_offset) == VisibleExprContext::ScalarReturn
-            })
-            || self.function_return_int_bits().is_some()
-        {
+        if self.function_return_int_bits().is_some() {
             VisibleExprContext::ScalarReturn
         } else {
             VisibleExprContext::Generic
@@ -257,14 +241,7 @@ impl<'a> FoldingContext<'a> {
             return None;
         }
         let context = self.return_context_for_name(name);
-        let lower = name.to_ascii_lowercase();
-        let mut best = if self.inputs.arch.is_return_register_name(&lower)
-            && let Some(block_addr) = self.current_block_addr.get()
-        {
-            self.merged_return_candidate_for_current_block(block_addr)
-        } else {
-            None
-        };
+        let mut best = None;
 
         if let Some(candidate) =
             self.scalar_context_root_candidate_for_name(name, VisibleExprContext::ScalarReturn)
@@ -275,16 +252,6 @@ impl<'a> FoldingContext<'a> {
         if let Some(candidate) = self.scalar_context_root_candidate_for_name(name, context) {
             best = self.preferred_return_candidate_in_context(best, Some(candidate), context);
         }
-
-        let merged = self
-            .stack_slot_provenance_for_name(name)
-            .filter(|slot| self.state.return_stack_slots.contains(&slot.offset))
-            .and_then(|slot| {
-                self.current_block_addr.get().and_then(|block_addr| {
-                    self.merged_return_candidate_for_block_slot(block_addr, slot.offset)
-                })
-            });
-        best = self.preferred_return_candidate_in_context(best, merged, context);
 
         let mut semantic_visited = HashSet::new();
         let candidate = self.preferred_return_candidate_in_context(
@@ -441,123 +408,6 @@ impl<'a> FoldingContext<'a> {
                 )
             }
         }
-    }
-
-    pub(crate) fn merged_return_candidate_for_block_slot(
-        &self,
-        block_addr: u64,
-        slot_offset: i64,
-    ) -> Option<CExpr> {
-        let mut best = None;
-        let context = self.return_context_for_slot_offset(slot_offset);
-        for summary in self.frame_slot_merges_map().values() {
-            if summary.slot_offset != slot_offset {
-                continue;
-            }
-            let Some(value) = summary.incoming.get(&block_addr) else {
-                continue;
-            };
-            let mut visited = HashSet::new();
-            let rendered = self
-                .render_semantic_value(value, 0, &mut visited)
-                .map(|expr| self.resolve_return_candidate_in_context(&expr, context));
-            best = self.preferred_return_candidate_in_context(best, rendered, context);
-        }
-        best
-    }
-
-    fn merged_return_candidate_for_current_block(&self, block_addr: u64) -> Option<CExpr> {
-        let mut best = None;
-        for slot_offset in &self.state.return_stack_slots {
-            best = self.preferred_return_candidate(
-                best,
-                self.merged_return_candidate_for_block_slot(block_addr, *slot_offset),
-            );
-        }
-        best
-    }
-
-    pub(crate) fn merged_return_register_candidate_for_block(
-        &self,
-        block_addr: u64,
-    ) -> Option<CExpr> {
-        let func = self
-            .inputs
-            .prepared_ssa
-            .map(|prepared| prepared.function())?;
-        let block = func.get_block(block_addr)?;
-        let mut best = None;
-
-        for phi in &block.phis {
-            if !self
-                .inputs
-                .arch
-                .is_return_register_name(&phi.dst.name.to_ascii_lowercase())
-            {
-                continue;
-            }
-
-            let phi_name = phi.dst.display_name();
-            // A merge that carries a loop carrier is mutable state, so the
-            // answer is the variable. Every expression reachable from its
-            // sources is a value the carrier held on one path, and the one a
-            // resolver reaches first is the value it held entering the loop.
-            if let Some(carrier) = self
-                .prepared_value_id_for_var(&phi.dst)
-                .and_then(|value| self.certified_loop_carrier_expr_for_value(value))
-            {
-                best = self.preferred_return_candidate(best, Some(carrier));
-                continue;
-            }
-            let mut visited = HashSet::new();
-            let candidate = self
-                .resolve_expr_from_phi_sources(&phi_name, 0, &mut visited, false)
-                .or_else(|| self.best_visible_definition(&phi_name));
-            best = self.preferred_return_candidate(best, candidate);
-        }
-
-        best
-    }
-
-    /// The definition of the return register that reaches this return.
-    ///
-    /// A function whose accumulator already sits in the return register emits no
-    /// move in its epilogue, so the returning block writes nothing and carries no
-    /// merge, and asking only that block answers with the return address. What
-    /// the machine returns is the last write on the way here, so this walks back
-    /// to it.
-    pub(crate) fn reaching_return_register_candidate(&self, block_addr: u64) -> Option<CExpr> {
-        let func = self
-            .inputs
-            .prepared_ssa
-            .map(|prepared| prepared.function())?;
-        let mut visited = HashSet::new();
-        let mut pending = vec![block_addr];
-        while let Some(addr) = pending.pop() {
-            if !visited.insert(addr) {
-                continue;
-            }
-            let Some(block) = func.get_block(addr) else {
-                continue;
-            };
-            let written = block
-                .ops
-                .iter()
-                .rev()
-                .filter_map(|op| op.dst())
-                .chain(block.phis.iter().map(|phi| &phi.dst))
-                .find(|dst| {
-                    self.inputs
-                        .arch
-                        .is_return_register_name(&dst.name.to_ascii_lowercase())
-                        && !self.is_control_return_target(dst)
-            });
-            if let Some(dst) = written {
-                return self.retain_lowering_result(self.tracked_return_source_expr(dst));
-            }
-            pending.extend(func.predecessors(addr));
-        }
-        None
     }
 
     pub(crate) fn merged_return_register_candidate_for_block_predecessor_with_proof(

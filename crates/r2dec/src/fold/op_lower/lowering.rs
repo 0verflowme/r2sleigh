@@ -842,24 +842,6 @@ impl<'a> FoldingContext<'a> {
         })
     }
 
-    /// Attach only the exact result identity to a custom producer expression.
-    ///
-    /// Its operand positions no longer correspond to ordinary opcode lowering,
-    /// so claiming them on the aggregate expression would relocate every input.
-    pub(crate) fn observe_normalized_result_expr(
-        &self,
-        op: &SSAOp,
-        block_addr: u64,
-        op_idx: usize,
-        expr: CExpr,
-    ) -> CExpr {
-        if op.dst().is_some() {
-            self.observe_normalized_output_expr(block_addr, op_idx, expr)
-        } else {
-            expr
-        }
-    }
-
     /// Convert an SSA operation to a C statement, with call argument context.
     pub(super) fn op_to_stmt_with_args(
         &self,

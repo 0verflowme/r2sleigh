@@ -5322,7 +5322,11 @@ mod tests {
                         width: 8,
                         relation: r2ssa::CallResultValueRelation::Identity,
                         carrier: r2ssa::ReturnCarrier::Register {
-                            name: "rax".to_string(),
+                            storage: r2ssa::CanonicalStorageId {
+                                space: r2ssa::CanonicalStorageSpace::Register,
+                                offset: 0x10,
+                                size: 8,
+                            },
                         },
                         owner: Some(owner.clone()),
                     },
@@ -5337,7 +5341,11 @@ mod tests {
                         width: 4,
                         relation: r2ssa::CallResultValueRelation::Derived,
                         carrier: r2ssa::ReturnCarrier::Register {
-                            name: "eax".to_string(),
+                            storage: r2ssa::CanonicalStorageId {
+                                space: r2ssa::CanonicalStorageSpace::Register,
+                                offset: 0x10,
+                                size: 4,
+                            },
                         },
                         owner: Some(r2ssa::ValueOwner::StackSlot {
                             object: r2ssa::ObjectId(4),

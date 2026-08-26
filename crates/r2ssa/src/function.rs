@@ -4897,7 +4897,7 @@ mod tests {
         );
     }
     use super::*;
-    use crate::semantic::{CallArgumentLocation, ReturnCarrier, SemanticId, ValueOwner};
+    use crate::semantic::{CallArgumentLocation, SemanticId};
     use crate::{CanonicalStorageSpace, SourceFunctionReturn, SourceStackSlotSpec, ValueId};
     use r2il::{R2ILOp, RegisterDef, SpaceId, SwitchCase, SwitchInfo as R2ILSwitchInfo, Varnode};
     use std::cell::Cell;
@@ -5863,7 +5863,7 @@ mod tests {
     }
 
     #[test]
-    fn prepared_function_certifies_only_the_control_return_effect() {
+    fn prepared_function_refuses_return_without_source_boundary_authority() {
         let arch = make_x86_64_prep_arch();
         let blocks = vec![
             R2ILBlock {
@@ -5919,14 +5919,14 @@ mod tests {
 
         let prepared =
             SsaArtifact::for_decompile(&blocks, Some(&arch)).expect("prepared SSA should build");
-        assert_eq!(prepared.certificates().returns.len(), 1);
-        assert!(prepared.return_certificate_for_op(0x1014, 0).is_some());
+        assert!(prepared.certificates().returns.is_empty());
+        assert!(prepared.return_certificate_for_op(0x1014, 0).is_none());
         assert!(prepared.return_certificate_for_op(0x1004, 0).is_none());
         assert!(prepared.return_certificate_for_op(0x1010, 0).is_none());
     }
 
     #[test]
-    fn prepared_function_certifies_unique_return_phi_at_control_return() {
+    fn prepared_function_does_not_infer_return_phi_without_source_boundary_authority() {
         let arch = make_x86_64_prep_arch();
         let blocks = vec![
             R2ILBlock {
@@ -5982,32 +5982,12 @@ mod tests {
 
         let prepared =
             SsaArtifact::for_decompile(&blocks, Some(&arch)).expect("prepared SSA should build");
-        let cert = prepared
-            .return_certificate_for_op(0x1114, 0)
-            .expect("control return should certify unique return phi");
-        let value = prepared.value_var(cert.value).expect("return value var");
-        assert!(
-            value.name.eq_ignore_ascii_case("rax"),
-            "control return certificate must bind the return-register phi, got {value:?}"
-        );
-        assert_eq!(
-            cert.carrier,
-            Some(ReturnCarrier::Register {
-                name: value.name.clone()
-            })
-        );
-        assert!(
-            prepared
-                .certificates()
-                .expressions
-                .get(&cert.value)
-                .is_some_and(|expr| expr.renderable),
-            "identity return phi should carry a renderable expression certificate"
-        );
+        assert!(prepared.certificates().returns.is_empty());
+        assert!(prepared.return_certificate_for_op(0x1114, 0).is_none());
     }
 
     #[test]
-    fn prepared_function_does_not_render_memory_backed_return_phi_at_control_return() {
+    fn prepared_function_does_not_infer_memory_backed_return_phi() {
         let arch = make_x86_64_prep_arch();
         let blocks = vec![
             R2ILBlock {
@@ -6065,17 +6045,8 @@ mod tests {
 
         let prepared =
             SsaArtifact::for_decompile(&blocks, Some(&arch)).expect("prepared SSA should build");
-        let cert = prepared
-            .return_certificate_for_op(0x1214, 0)
-            .expect("control return should identify the unique return phi");
-        assert!(
-            prepared
-                .certificates()
-                .expressions
-                .get(&cert.value)
-                .is_some_and(|expr| expr.renderable),
-            "memory-backed phi should be renderable; structurer handles rejection"
-        );
+        assert!(prepared.certificates().returns.is_empty());
+        assert!(prepared.return_certificate_for_op(0x1214, 0).is_none());
     }
 
     #[test]
@@ -6141,26 +6112,10 @@ mod tests {
                     .position(|op| matches!(op, SSAOp::Return { target } if target.name.eq_ignore_ascii_case("rip")))
             })
             .expect("control return op");
-        let cert = prepared
-            .return_certificate_for_op(0x1890, return_op_idx)
-            .expect("control return should certify the preceding stack reload");
-
-        assert_eq!(
-            cert.carrier,
-            Some(ReturnCarrier::Register {
-                name: "rax".to_string()
-            })
-        );
         assert!(
             prepared
-                .stack_reload_certificate_for_value(cert.value)
+                .return_certificate_for_op(0x1890, return_op_idx)
                 .is_none()
-        );
-        assert!(
-            prepared
-                .call_result_certificate_for_value(cert.value)
-                .is_none_or(|call| !matches!(call.owner, Some(ValueOwner::StackSlot { .. }))),
-            "display-named stack storage cannot establish an owning stack slot"
         );
     }
 
@@ -6258,13 +6213,9 @@ mod tests {
                     .position(|op| matches!(op, SSAOp::Return { target } if target.name.eq_ignore_ascii_case("rip")))
             })
             .expect("control return op");
-        let cert = prepared
-            .return_certificate_for_op(0x190c, return_op_idx)
-            .expect("control return should merge equality-proven return values");
-
         assert!(
             prepared
-                .stack_reload_certificate_for_value(cert.value)
+                .return_certificate_for_op(0x190c, return_op_idx)
                 .is_none()
         );
     }
@@ -6409,9 +6360,6 @@ mod tests {
 
         let prepared =
             SsaArtifact::for_decompile(&blocks, Some(&arch)).expect("prepared SSA should build");
-        let call = prepared
-            .callsite_certificate_for_op(0x1400, 1)
-            .expect("callsite certificate");
         let ops = &prepared.get_block(0x1400).expect("entry block").ops;
         let post_call_x0 = ops
             .iter()
@@ -6443,16 +6391,10 @@ mod tests {
             .graph()
             .value_id_for_var(&post_call_x0)
             .expect("post-call x0 value");
-        let x0_cert = prepared
-            .call_result_certificate_for_value(x0_value)
-            .expect("x0 call-result certificate");
-        assert_eq!(x0_cert.block_addr, 0x1400);
-        assert_eq!(x0_cert.call_site, call.call_site);
-        assert_eq!(
-            x0_cert.carrier,
-            ReturnCarrier::Register {
-                name: "x0".to_string()
-            }
+        assert!(
+            prepared
+                .call_result_certificate_for_value(x0_value)
+                .is_none()
         );
 
         let copied_x8_dst = ops
@@ -6468,11 +6410,11 @@ mod tests {
             .graph()
             .value_id_for_var(&copied_x8_dst)
             .expect("copied x8 value");
-        let copied_x8_cert = prepared
-            .call_result_certificate_for_value(copied_x8_value)
-            .expect("x8 alias certificate");
-        assert_eq!(copied_x8_cert.call_site, call.call_site);
-        assert_eq!(copied_x8_cert.owner, Some(ValueOwner::Value(x0_value)));
+        assert!(
+            prepared
+                .call_result_certificate_for_value(copied_x8_value)
+                .is_none()
+        );
 
         for op in ops {
             if let SSAOp::CallDefine { dst } = op
@@ -6758,7 +6700,7 @@ mod tests {
             certificates.memory_accesses.len(),
             structured.memory_accesses.len()
         );
-        assert!(!certificates.returns.is_empty());
+        assert!(certificates.returns.is_empty());
 
         let recursive_blocks = vec![
             R2ILBlock {
@@ -6863,12 +6805,11 @@ mod tests {
                     .position(|op| matches!(op, SSAOp::Return { .. }))
             })
             .expect("return op index");
-        let ret = prepared
-            .return_certificate_for_op(0x1600, return_idx)
-            .expect("return certificate");
-        assert_eq!(ret.block_addr, 0x1600);
-        assert_eq!(ret.op_index, return_idx);
-        assert_eq!(ret.width, 8);
+        assert!(
+            prepared
+                .return_certificate_for_op(0x1600, return_idx)
+                .is_none()
+        );
 
         let result = prepared
             .function()
@@ -6884,27 +6825,20 @@ mod tests {
                     })
             })
             .expect("post-call result op");
-        let result_cert = prepared
-            .call_result_certificate_for_op(0x1600, result.0)
-            .expect("call-result certificate by op");
-        assert_eq!(result_cert.call_site, call.call_site);
-        assert_eq!(
-            result_cert.carrier,
-            ReturnCarrier::Register {
-                name: "x0".to_string()
-            }
-        );
-        let by_callsite = prepared.call_result_certificates_for_callsite(call.call_site);
         assert!(
-            by_callsite
-                .iter()
-                .any(|cert| cert.value == result_cert.value),
-            "callsite index should contain the direct result value"
+            prepared
+                .call_result_certificate_for_op(0x1600, result.0)
+                .is_none()
+        );
+        assert!(
+            prepared
+                .call_result_certificates_for_callsite(call.call_site)
+                .is_empty()
         );
     }
 
     #[test]
-    fn prepared_call_result_certificates_stop_at_next_call_and_are_stable() {
+    fn incomplete_call_boundaries_do_not_create_call_result_certificates() {
         let arch = make_x86_64_prep_arch();
         let blocks = vec![R2ILBlock {
             addr: 0x1680,
@@ -6939,51 +6873,8 @@ mod tests {
             "call-result certificates must be deterministic"
         );
 
-        let first_call = first
-            .call_sites()
-            .by_id
-            .values()
-            .find(|call| call.direct_target == Some(0x401000))
-            .expect("first call");
-        let second_call = first
-            .call_sites()
-            .by_id
-            .values()
-            .find(|call| call.direct_target == Some(0x402000))
-            .expect("second call");
-        let aliases = first
-            .function()
-            .get_block(0x1680)
-            .expect("entry block")
-            .ops
-            .iter()
-            .filter_map(|op| match op {
-                SSAOp::Copy { dst, .. } if dst.name_kind().is_temporary() => first
-                    .graph()
-                    .value_id_for_var(dst)
-                    .map(|value| (dst.name.clone(), value)),
-                _ => None,
-            })
-            .collect::<BTreeMap<_, _>>();
-        let first_alias = *aliases.get("tmp:20").expect("first call alias");
-        let second_alias = *aliases.get("tmp:30").expect("second call alias");
-
-        let first_values = first
-            .certificates()
-            .call_results_by_callsite
-            .get(&first_call.id)
-            .expect("first call result values");
-        assert!(first_values.contains(&first_alias));
-        assert!(
-            !first_values.contains(&second_alias),
-            "first call certificate scan must stop at the second call"
-        );
-        let second_values = first
-            .certificates()
-            .call_results_by_callsite
-            .get(&second_call.id)
-            .expect("second call result values");
-        assert!(second_values.contains(&second_alias));
+        assert!(first.certificates().call_results.is_empty());
+        assert!(first.certificates().call_results_by_callsite.is_empty());
     }
 
     #[test]
@@ -7198,13 +7089,16 @@ mod tests {
             op_metadata: Default::default(),
         }];
         let pure = SsaArtifact::raw(&pure_blocks, None).expect("pure SSA");
-        let pure_ret = pure
-            .return_certificate_for_op(0x1700, 2)
-            .expect("pure return certificate");
+        let pure_value = pure
+            .graph()
+            .inst_id_for_op_site(0x1700, 1)
+            .and_then(|inst| pure.graph().inst(inst))
+            .and_then(|inst| inst.output)
+            .expect("pure expression output");
         assert!(
             pure.certificates()
                 .expressions
-                .get(&pure_ret.value)
+                .get(&pure_value)
                 .is_some_and(|cert| cert.renderable),
             "pure expression outputs should be renderable"
         );
@@ -7226,14 +7120,17 @@ mod tests {
             op_metadata: Default::default(),
         }];
         let loaded = SsaArtifact::raw(&load_blocks, None).expect("load SSA");
-        let loaded_ret = loaded
-            .return_certificate_for_op(0x1710, 1)
-            .expect("loaded return certificate");
+        let loaded_value = loaded
+            .graph()
+            .inst_id_for_op_site(0x1710, 0)
+            .and_then(|inst| loaded.graph().inst(inst))
+            .and_then(|inst| inst.output)
+            .expect("load output");
         assert!(
             loaded
                 .certificates()
                 .expressions
-                .get(&loaded_ret.value)
+                .get(&loaded_value)
                 .is_some_and(|cert| cert.renderable),
             "memory-load expression outputs require a structured memory-read certificate"
         );
@@ -7259,14 +7156,17 @@ mod tests {
             op_metadata: Default::default(),
         }];
         let userop = SsaArtifact::raw(&userop_blocks, None).expect("userop SSA");
-        let userop_ret = userop
-            .return_certificate_for_op(0x1720, 1)
-            .expect("userop return certificate");
+        let userop_value = userop
+            .graph()
+            .inst_id_for_op_site(0x1720, 0)
+            .and_then(|inst| userop.graph().inst(inst))
+            .and_then(|inst| inst.output)
+            .expect("userop output");
         assert!(
             userop
                 .certificates()
                 .expressions
-                .get(&userop_ret.value)
+                .get(&userop_value)
                 .is_some_and(|cert| !cert.renderable),
             "opaque userop outputs must not be renderable by width alone"
         );
@@ -7310,22 +7210,17 @@ mod tests {
             op_metadata: Default::default(),
         }];
         let prepared = SsaArtifact::for_decompile(&blocks, Some(&arch)).expect("prepared SSA");
-        let ret = prepared
-            .certificates()
-            .returns
-            .iter()
-            .find(|cert| {
-                cert.block_addr == 0x1740
-                    && prepared
-                        .value_var(cert.value)
-                        .is_some_and(|var| var.name.eq_ignore_ascii_case("rax"))
-            })
-            .expect("return-register certificate");
+        let return_value = prepared
+            .graph()
+            .inst_id_for_op_site(0x1740, 2)
+            .and_then(|inst| prepared.graph().inst(inst))
+            .and_then(|inst| inst.output)
+            .expect("zero-extended return-register value");
 
         let expr_cert = prepared
             .certificates()
             .expressions
-            .get(&ret.value)
+            .get(&return_value)
             .expect("return value expression certificate");
         let input_debug = expr_cert
             .inputs
@@ -7367,14 +7262,14 @@ mod tests {
         assert!(
             expr_cert.renderable,
             "return-register subpiece/zext chain should be renderable; ret={:?} inputs={:?} tmp_inputs={:?}",
-            prepared.value_var(ret.value),
+            prepared.value_var(return_value),
             input_debug,
             tmp_debug
         );
     }
 
     #[test]
-    fn prepared_return_certificates_exclude_predecessor_register_writes() {
+    fn prepared_return_certificates_require_complete_source_boundary() {
         let arch = make_x86_64_prep_arch();
         let blocks = vec![
             R2ILBlock {
@@ -7410,8 +7305,8 @@ mod tests {
         ];
         let prepared = SsaArtifact::for_decompile(&blocks, Some(&arch)).expect("prepared SSA");
 
-        assert_eq!(prepared.certificates().returns.len(), 1);
-        assert!(prepared.return_certificate_for_op(0x1770, 1).is_some());
+        assert!(prepared.certificates().returns.is_empty());
+        assert!(prepared.return_certificate_for_op(0x1770, 1).is_none());
         assert!(
             prepared.return_certificate_for_op(0x1760, 0).is_none(),
             "a predecessor return-register write is dataflow, not a return effect"
@@ -7477,27 +7372,33 @@ mod tests {
         }
 
         let identity_phi = prepared_with_phi_values(7, 7);
-        let identity_ret = identity_phi
-            .return_certificate_for_op(0x1730, 0)
-            .expect("identity phi return certificate");
+        let identity_value = identity_phi
+            .graph()
+            .inst_id_for_op_site(0x1730, 0)
+            .and_then(|inst| identity_phi.graph().inst(inst))
+            .and_then(|inst| inst.inputs.first().copied())
+            .expect("identity phi return input");
         assert!(
             identity_phi
                 .certificates()
                 .expressions
-                .get(&identity_ret.value)
+                .get(&identity_value)
                 .is_some_and(|cert| cert.renderable),
             "identity phi over one renderable ValueId should be renderable"
         );
 
         let mixed_phi = prepared_with_phi_values(7, 9);
-        let mixed_ret = mixed_phi
-            .return_certificate_for_op(0x1730, 0)
-            .expect("mixed phi return certificate");
+        let mixed_value = mixed_phi
+            .graph()
+            .inst_id_for_op_site(0x1730, 0)
+            .and_then(|inst| mixed_phi.graph().inst(inst))
+            .and_then(|inst| inst.inputs.first().copied())
+            .expect("mixed phi return input");
         assert!(
             mixed_phi
                 .certificates()
                 .expressions
-                .get(&mixed_ret.value)
+                .get(&mixed_value)
                 .is_some_and(|cert| cert.renderable),
             "non-memory phi with sibling values should be renderable; divergence handled by structurer"
         );
@@ -7591,14 +7492,11 @@ mod tests {
             "same-width copy sources retain exact update identity at the latch program point"
         );
         assert!(carrier.identity_values.contains(&carrier.phi));
-        let ret = prepared
-            .return_certificate_for_op(0x1814, 0)
-            .expect("loop-carried return certificate");
         assert!(
             prepared
                 .certificates()
                 .expressions
-                .get(&ret.value)
+                .get(&carrier.phi)
                 .is_some_and(|cert| cert.renderable),
             "loop-header phi is renderable when the loop certificate proves the backedge and the update is pure modulo that phi"
         );

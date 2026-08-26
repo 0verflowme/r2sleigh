@@ -208,8 +208,19 @@ impl<'a> FoldingContext<'a> {
             .return_for_op(block_addr, op_idx)
     }
 
-    pub(crate) fn current_return_target_is_certified(&self, _target: &SSAVar) -> bool {
-        true
+    fn source_return_boundary_for_normalized_op(
+        &self,
+        block_addr: u64,
+        op_idx: usize,
+    ) -> Option<(r2ssa::InstId, &r2ssa::SourceReturnBoundaryFact)> {
+        let source_inst = self.source_inst_for_normalized_op(block_addr, op_idx)?;
+        let boundary = self
+            .prepared_ssa()?
+            .facts()
+            .boundaries
+            .returns
+            .get(&source_inst)?;
+        Some((source_inst, boundary))
     }
 
     fn certified_expr_for_prepared_var(
@@ -802,38 +813,6 @@ impl<'a> FoldingContext<'a> {
         self.synthesized_call_expr_for_source_call(source_call)
     }
 
-    fn certified_return_members_have_external_layout(&self, expr: &CExpr) -> bool {
-        let mut members = BTreeSet::new();
-        expr.visit(&mut |node| {
-            if let CExpr::Member { member, .. } | CExpr::PtrMember { member, .. } = node {
-                members.insert(member.to_ascii_lowercase());
-            }
-        });
-        if members.is_empty() {
-            return true;
-        }
-
-        let mut external_names = BTreeSet::new();
-        for structure in self.inputs.external_type_db.structs.values() {
-            external_names.extend(
-                structure
-                    .fields
-                    .values()
-                    .map(|field| field.name.to_ascii_lowercase()),
-            );
-        }
-        for union in self.inputs.external_type_db.unions.values() {
-            external_names.extend(
-                union
-                    .fields
-                    .values()
-                    .map(|field| field.name.to_ascii_lowercase()),
-            );
-        }
-
-        !external_names.is_empty() && members.iter().all(|member| external_names.contains(member))
-    }
-
     pub(crate) fn summary_view(&self) -> Option<&r2types::InterprocSummaryView> {
         self.inputs.summary_view()
     }
@@ -953,20 +932,6 @@ impl<'a> FoldingContext<'a> {
         Some(current)
     }
 
-    /// How many times a value is read, asked by one of its names.
-    ///
-    /// The map this replaced was keyed by name, so callers open-coded a ladder
-    /// of case variants to find the entry. The count belongs to the value.
-    #[cfg(test)]
-    pub(crate) fn use_count_of(&self, name: &str) -> usize {
-        self.use_info().use_count_for_name(name)
-    }
-    #[cfg(not(test))]
-    pub(crate) fn use_count_of(&self, _name: &str) -> usize {
-        // A spelling can denote several SSA values. Unknown use count must keep
-        // the binding alive rather than authorize inlining or dead-code removal.
-        usize::MAX
-    }
     /// What defines a value, asked by one of its names.
     #[cfg(test)]
     pub(crate) fn definition_of(&self, name: &str) -> Option<CExpr> {
@@ -975,11 +940,6 @@ impl<'a> FoldingContext<'a> {
     #[cfg(not(test))]
     pub(crate) fn definition_of(&self, _name: &str) -> Option<CExpr> {
         None
-    }
-    pub(crate) fn frame_slot_merges_map(
-        &self,
-    ) -> &HashMap<String, analysis::FrameSlotMergeSummary> {
-        &self.use_info().frame_slot_merges
     }
     #[cfg(test)]
     pub(crate) fn phi_sources_map(&self) -> &HashMap<String, Vec<SSAVar>> {
@@ -1052,9 +1012,6 @@ impl<'a> FoldingContext<'a> {
     #[cfg(not(test))]
     pub(crate) fn render_copy_source_for_name(&self, _name: &str) -> Option<String> {
         None
-    }
-    pub(crate) fn stack_slots(&self) -> impl Iterator<Item = analysis::StackSlotProvenance> + '_ {
-        self.use_info().stack_slots()
     }
     /// Whether a rendered name is one a condition was decided by.
     ///
@@ -1348,376 +1305,7 @@ impl<'a> FoldingContext<'a> {
         }
     }
 
-    pub(crate) fn analyze_function_structure(&mut self, func: &SSAFunction) {
-        self.state.return_blocks.clear();
-        self.state.return_stack_slots.clear();
-        // Find exit block (the block containing SSAOp::Return)
-        for block in func.blocks() {
-            for op in &block.ops {
-                if matches!(op, SSAOp::Return { .. }) {
-                    self.state.exit_block = Some(block.addr);
-                    break;
-                }
-            }
-            if self.state.exit_block.is_some() {
-                break;
-            }
-        }
-
-        // Find blocks that branch directly to the exit block
-        if let Some(exit_addr) = self.state.exit_block {
-            let pure_control_exit = func
-                .get_block(exit_addr)
-                .is_some_and(|block| self.exit_block_is_control_only_epilogue(block));
-
-            // Treat the exit block itself as a return context.
-            self.state.return_blocks.insert(exit_addr);
-            self.detect_return_stack_slots(func, exit_addr);
-
-            // Predecessors are only return contexts when they materially carry
-            // the returned value into the exit block. Marking every predecessor
-            // as a return block causes non-return body blocks to sprout
-            // synthesized returns.
-            for pred in func.predecessors(exit_addr) {
-                if pred != exit_addr
-                    && self.block_is_exit_return_context(
-                        func,
-                        pred,
-                        exit_addr,
-                        pure_control_exit,
-                    )
-                {
-                    self.state.return_blocks.insert(pred);
-                }
-            }
-
-            // Phi metadata can preserve predecessor edges even when CFG recovery
-            // is sparse, but only keep them when the source block really carries
-            // the eventual return value.
-            if let Some(exit_blk) = func.get_block(exit_addr) {
-                for phi in &exit_blk.phis {
-                    for (src_addr, _) in &phi.sources {
-                        // src_addr is already u64
-                        if *src_addr != exit_addr
-                            && self.block_is_exit_return_context(
-                                func,
-                                *src_addr,
-                                exit_addr,
-                                pure_control_exit,
-                            )
-                        {
-                            self.state.return_blocks.insert(*src_addr);
-                        }
-                    }
-                }
-            }
-        }
-        let filtered_return_stack_slots = self
-            .state
-            .return_stack_slots
-            .iter()
-            .copied()
-            .filter(|offset| {
-                !matches!(
-                    self.refuse_missing_stack_object_origin(*offset).as_deref(),
-                    Some("stack") | Some("saved_fp")
-                )
-            })
-            .collect();
-        self.state.return_stack_slots = filtered_return_stack_slots;
-    }
-
-    fn block_is_exit_return_context(
-        &self,
-        func: &SSAFunction,
-        block_addr: u64,
-        exit_addr: u64,
-        pure_control_exit: bool,
-    ) -> bool {
-        let Some(block) = func.get_block(block_addr) else {
-            return false;
-        };
-
-        if self.block_has_non_exit_successor(func, block_addr, exit_addr) {
-            return false;
-        }
-
-        if !self.state.return_stack_slots.is_empty()
-            && self
-                .return_stack_slot_written_before_exit(block)
-                .is_some_and(|slot| self.state.return_stack_slots.contains(&slot))
-        {
-            return true;
-        }
-
-        pure_control_exit && self.block_writes_return_register_before_exit(block)
-    }
-
-    fn block_has_non_exit_successor(
-        &self,
-        func: &SSAFunction,
-        block_addr: u64,
-        exit_addr: u64,
-    ) -> bool {
-        func.successors(block_addr)
-            .iter()
-            .any(|succ| *succ != exit_addr)
-    }
-
-    fn block_writes_return_register_before_exit(&self, block: &SSABlock) -> bool {
-        for op in block.ops.iter().rev() {
-            if let Some(dst) = op.dst()
-                && self
-                    .inputs
-                    .arch
-                    .is_return_register_name(&dst.name.to_ascii_lowercase())
-            {
-                return true;
-            }
-        }
-        false
-    }
-
-    fn detect_return_stack_slots(&mut self, func: &SSAFunction, exit_addr: u64) {
-        let Some(exit_block) = func.get_block(exit_addr) else {
-            return;
-        };
-        let pure_control_exit = self.exit_block_is_control_only_epilogue(exit_block);
-        let exit_loaded_slot = if pure_control_exit {
-            None
-        } else {
-            self.return_stack_slot_loaded_before_control_return(exit_block)
-        };
-        if !pure_control_exit && exit_loaded_slot.is_none() {
-            return;
-        }
-
-        if let Some(exit_slot) = exit_loaded_slot {
-            self.state.return_stack_slots.insert(exit_slot);
-        }
-
-        let preds = func.predecessors(exit_addr);
-        if preds.is_empty() {
-            return;
-        }
-
-        let mut common_slot: Option<i64> = None;
-        for pred_addr in preds {
-            let Some(pred_block) = func.get_block(pred_addr) else {
-                return;
-            };
-            let Some(slot) = self.return_stack_slot_written_before_exit(pred_block) else {
-                return;
-            };
-            match common_slot {
-                Some(existing) if existing != slot => return,
-                None => common_slot = Some(slot),
-                Some(_) => {}
-            }
-        }
-
-        if let Some(exit_slot) = exit_loaded_slot
-            && common_slot != Some(exit_slot)
-        {
-            return;
-        }
-
-        if let Some(slot) = common_slot.or(exit_loaded_slot) {
-            self.state.return_stack_slots.insert(slot);
-        }
-    }
-
-    fn exit_block_is_control_only_epilogue(&self, block: &SSABlock) -> bool {
-        block.ops.iter().enumerate().all(|(op_idx, op)| match op {
-            SSAOp::Return { target } => self.is_control_return_target(target),
-            SSAOp::Load {
-                dst,
-                space: r2il::SpaceId::Ram,
-                ..
-            } => {
-                self.is_control_return_target(dst)
-                    || self
-                        .inputs
-                        .arch
-                        .is_stack_pointer_name(&dst.name.to_ascii_lowercase())
-                    || self
-                        .inputs
-                        .arch
-                        .is_frame_pointer_name(&dst.name.to_ascii_lowercase())
-                    || self.load_is_control_epilogue_artifact(block, op_idx, dst)
-            }
-            SSAOp::Copy { dst, src }
-            | SSAOp::IntZExt { dst, src }
-            | SSAOp::IntSExt { dst, src }
-            | SSAOp::Trunc { dst, src }
-            | SSAOp::Cast { dst, src } => {
-                let dst_lower = dst.name.to_ascii_lowercase();
-                let src_lower = src.name.to_ascii_lowercase();
-                self.is_control_return_target(dst)
-                    || dst.name.eq_ignore_ascii_case(&self.inputs.arch.sp_name)
-                    || self.inputs.arch.is_frame_pointer_name(&dst_lower)
-                        && (self.inputs.arch.is_stack_pointer_name(&src_lower)
-                            || matches!(
-                                block.ops.iter().enumerate().take(op_idx).find_map(
-                                    |(idx, prior)| match prior {
-                                        SSAOp::Load {
-                                            dst: load_dst,
-                                            space: r2il::SpaceId::Ram,
-                                            ..
-                                        } if load_dst == src => {
-                                            Some(self.load_is_control_epilogue_artifact(
-                                                block, idx, load_dst,
-                                            ))
-                                        }
-                                        _ => None,
-                                    }
-                                ),
-                                Some(true)
-                            ))
-                    || matches!(op, SSAOp::Copy { .. })
-                        && src.is_const()
-                        && self
-                            .seed_copy_is_overwritten_by_control_epilogue_load(block, op_idx, dst)
-            }
-            SSAOp::IntAdd { dst, .. } | SSAOp::IntSub { dst, .. } => {
-                dst.name.eq_ignore_ascii_case(&self.inputs.arch.sp_name)
-            }
-            _ => false,
-        })
-    }
-
-    fn return_stack_slot_written_before_exit(&self, block: &SSABlock) -> Option<i64> {
-        for op in block.ops.iter().rev() {
-            match op {
-                SSAOp::Store {
-                    space: r2il::SpaceId::Ram,
-                    addr,
-                    ..
-                } => {
-                    let offset = self.stack_slot_offset_for_var(addr);
-                    if offset.is_some() {
-                        return offset;
-                    }
-                }
-                _ => {}
-            }
-        }
-        None
-    }
-
-    fn seed_copy_is_overwritten_by_control_epilogue_load(
-        &self,
-        block: &SSABlock,
-        op_idx: usize,
-        dst: &SSAVar,
-    ) -> bool {
-        let same_storage =
-            |lhs: &SSAVar, rhs: &SSAVar| lhs.name == rhs.name && lhs.size == rhs.size;
-        for (later_idx, later_op) in block.ops.iter().enumerate().skip(op_idx + 1) {
-            if later_op.sources().iter().any(|src| same_storage(src, dst)) {
-                return false;
-            }
-            let Some(later_dst) = later_op.dst() else {
-                continue;
-            };
-            if !same_storage(later_dst, dst) {
-                continue;
-            }
-            return matches!(
-                later_op,
-                SSAOp::Load {
-                    dst: load_dst,
-                    space: r2il::SpaceId::Ram,
-                    ..
-                }
-                    if self.load_is_control_epilogue_artifact(block, later_idx, load_dst)
-            );
-        }
-        false
-    }
-
-    fn return_stack_slot_loaded_before_control_return(&self, block: &SSABlock) -> Option<i64> {
-        let mut loaded_slots = HashSet::new();
-        let mut saw_control_return = false;
-
-        for (op_idx, op) in block.ops.iter().enumerate() {
-            match op {
-                SSAOp::Load {
-                    dst,
-                    space: r2il::SpaceId::Ram,
-                    addr,
-                } => {
-                    if self.is_control_return_target(dst)
-                        || self.load_is_control_epilogue_artifact(block, op_idx, dst)
-                    {
-                        continue;
-                    }
-                    if let Some(offset) = self.stack_slot_offset_for_var(addr) {
-                        loaded_slots.insert(offset);
-                    }
-                }
-                SSAOp::Return { target } => {
-                    if !self.is_control_return_target(target) {
-                        return None;
-                    }
-                    saw_control_return = true;
-                }
-                SSAOp::Copy { .. }
-                | SSAOp::IntZExt { .. }
-                | SSAOp::IntSExt { .. }
-                | SSAOp::Trunc { .. }
-                | SSAOp::Cast { .. }
-                | SSAOp::IntAdd { .. }
-                | SSAOp::IntCarry { .. }
-                | SSAOp::IntSCarry { .. }
-                | SSAOp::IntSLess { .. }
-                | SSAOp::IntEqual { .. } => {}
-                _ => return None,
-            }
-        }
-
-        if !saw_control_return || loaded_slots.len() != 1 {
-            return None;
-        }
-
-        loaded_slots.into_iter().next()
-    }
-
-    fn load_is_control_epilogue_artifact(
-        &self,
-        block: &SSABlock,
-        load_idx: usize,
-        loaded_dst: &SSAVar,
-    ) -> bool {
-        let mut saw_use = false;
-        for op in block.ops.iter().skip(load_idx + 1) {
-            let uses_dst = op.sources().contains(&loaded_dst);
-            if !uses_dst {
-                continue;
-            }
-            saw_use = true;
-            match op {
-                SSAOp::Copy { dst, src }
-                | SSAOp::IntZExt { dst, src }
-                | SSAOp::IntSExt { dst, src }
-                | SSAOp::Trunc { dst, src }
-                | SSAOp::Cast { dst, src }
-                    if src == loaded_dst =>
-                {
-                    let lower = dst.name.to_ascii_lowercase();
-                    if self.is_control_return_target(dst)
-                        || self.inputs.arch.is_stack_pointer_name(&lower)
-                        || self.inputs.arch.is_frame_pointer_name(&lower)
-                    {
-                        continue;
-                    }
-                    return false;
-                }
-                _ => return false,
-            }
-        }
-
-        saw_use
+    pub(crate) fn analyze_function_structure(&mut self, _func: &SSAFunction) {
     }
 
     pub(crate) fn stack_slot_offset_for_var(&self, var: &SSAVar) -> Option<i64> {
@@ -1767,69 +1355,6 @@ impl<'a> FoldingContext<'a> {
                     .is_some_and(|(lhs, rhs)| lhs == rhs))
     }
 
-    fn recent_same_family_return_expr_before(
-        &self,
-        block: &SSABlock,
-        op_idx: usize,
-        var: &SSAVar,
-    ) -> OpLoweringResult<Option<CExpr>> {
-        let Some(family) = self.register_family_name_for_ssa(var) else {
-            return Ok(None);
-        };
-
-        for (candidate_idx, op) in block.ops[..op_idx].iter().enumerate().rev() {
-            match op {
-                SSAOp::Call { .. } | SSAOp::CallInd { .. } | SSAOp::CallOther { .. } => break,
-                _ => {}
-            }
-
-            let Some(dst) = op.dst() else {
-                continue;
-            };
-            let Some(dst_family) = self.register_family_name_for_ssa(dst) else {
-                continue;
-            };
-            if dst_family != family {
-                continue;
-            }
-
-            let candidate = match op {
-                SSAOp::Copy { src, .. } => self.get_return_expr(src)?,
-                SSAOp::IntZExt { dst, src }
-                | SSAOp::IntSExt { dst, src }
-                | SSAOp::Trunc { dst, src }
-                | SSAOp::Cast { dst, src } => {
-                    self.tracked_return_cast_expr(dst, src, self.get_return_expr(src)?)
-                }
-                _ => {
-                    let mut visited = HashSet::new();
-                    let LoweredExprAt::Rendered(raw) =
-                        self.op_to_expr_at(op, block.addr, candidate_idx)?;
-                    let expanded = self.expand_return_expr(&raw, 0, &mut visited);
-                    let mut semantic_visited = HashSet::new();
-                    let semanticized =
-                        self.semanticize_visible_expr(&expanded, 0, &mut semantic_visited);
-                    if self.is_predicate_like_expr(&semanticized) {
-                        self.simplify_condition_expr(semanticized)
-                    } else {
-                        semanticized
-                    }
-                }
-            };
-
-            if self.is_low_level_return_artifact(&candidate)
-                || self.is_uninitialized_return_reg(&candidate)
-                || self.expr_is_transient_return_artifact(&candidate)
-            {
-                continue;
-            }
-
-            return Ok(Some(self.resolve_return_candidate(&candidate)));
-        }
-
-        Ok(None)
-    }
-
     fn expr_is_generic_entry_arg_like(&self, expr: &CExpr) -> bool {
         match expr {
             CExpr::Var(name) => {
@@ -1843,13 +1368,6 @@ impl<'a> FoldingContext<'a> {
             }
             _ => false,
         }
-    }
-
-    fn should_prefer_recent_same_family_return_expr(&self, recent: &CExpr, direct: &CExpr) -> bool {
-        self.expr_is_generic_entry_arg_like(direct)
-            && !self.expr_is_generic_entry_arg_like(recent)
-            && (self.is_direct_constish_visible_expr(recent, 0)
-                || !self.is_direct_constish_visible_expr(direct, 0))
     }
 
     /// Check if the current block is a return block.
@@ -1869,50 +1387,6 @@ impl<'a> FoldingContext<'a> {
     /// narrowing is not carried here without a case that wants it.
     pub(crate) fn carrier_answers_the_return(&self, expr: &CExpr) -> bool {
         self.expr_is_carrier_reference(expr)
-    }
-
-    /// Whether the block being folded returns and computes a return-register
-    /// value the carrier does not answer for.
-    ///
-    /// A loop latch writing `w0` in the block that returns *is* the carrier, so
-    /// the write alone says nothing -- testing it coarsely takes arm64 from
-    /// thirteen correct to nine. What counts is a write no carrier claims, which
-    /// is what `adler32`'s `shl eax, 0x10; or eax, ecx` is.
-    pub(crate) fn current_return_block_computes_result(&self) -> bool {
-        if !self.is_current_return_block() {
-            return false;
-        }
-        let Some(addr) = self.current_block_addr.get() else {
-            return false;
-        };
-        let Some(prepared) = self.inputs.prepared_ssa else {
-            return false;
-        };
-        let Some(block) = prepared.function().get_block(addr) else {
-            return false;
-        };
-        block.ops.iter().any(|op| {
-            op.dst().is_some_and(|dst| {
-                self.inputs
-                    .arch
-                    .is_return_register_name(&dst.name.to_ascii_lowercase())
-                    && self
-                        .prepared_value_id_for_var(dst)
-                        .and_then(|value| {
-                            self.certified_render_context()?
-                                .render_facts
-                                .loop_carrier_for_value(value)
-                        })
-                        .is_none()
-            })
-        })
-    }
-
-    fn is_current_return_block(&self) -> bool {
-        if let Some(addr) = self.current_block_addr.get() {
-            return self.state.return_blocks.contains(&addr);
-        }
-        false
     }
 
     /// Analyze multiple blocks (for function-level folding).
@@ -2201,8 +1675,8 @@ impl<'a> FoldingContext<'a> {
                     .ok_or(OpLoweringRefusal::MissingProgramVariableAuthorization)?;
                 Some(self.observed_input(frame, 1, cond))
             }
-            SSAOp::Return { target } => {
-                Some(self.observed_input(frame, 0, self.get_return_expr(target)?))
+            SSAOp::Return { .. } => {
+                return Err(OpLoweringRefusal::MissingMachineProjectionAuthorization);
             }
             _ => None,
         })
@@ -7142,44 +6616,6 @@ impl<'a> FoldingContext<'a> {
         }
     }
 
-    fn expr_mentions_stack_or_ip(&self, expr: &CExpr) -> bool {
-        match expr {
-            CExpr::Var(name) => {
-                let lower = self.spelling(*name).to_lowercase();
-                self.inputs.arch.is_stack_pointer_name(&lower)
-                    || self.inputs.arch.is_frame_pointer_name(&lower)
-                    || lower == "pc"
-                    || lower.starts_with("pc_")
-                    || lower == "lr"
-                    || lower.starts_with("lr_")
-                    || lower == "ra"
-                    || lower.starts_with("ra_")
-                    || lower == "x30"
-                    || lower.starts_with("x30_")
-                    || lower.contains("rip")
-                    || lower.contains("eip")
-            }
-            CExpr::Unary { operand, .. } => self.expr_mentions_stack_or_ip(operand),
-            CExpr::Binary { left, right, .. } => {
-                self.expr_mentions_stack_or_ip(left) || self.expr_mentions_stack_or_ip(right)
-            }
-            CExpr::Paren(inner) => self.expr_mentions_stack_or_ip(inner),
-            CExpr::Cast { expr: inner, .. } => self.expr_mentions_stack_or_ip(inner),
-            CExpr::Deref(inner) => self.expr_mentions_stack_or_ip(inner),
-            _ => false,
-        }
-    }
-
-    fn is_low_level_return_artifact(&self, expr: &CExpr) -> bool {
-        match expr {
-            CExpr::Deref(inner) => self.expr_mentions_stack_or_ip(inner),
-            CExpr::Var(_) => self.expr_mentions_stack_or_ip(expr),
-            CExpr::Paren(inner) => self.is_low_level_return_artifact(inner),
-            CExpr::Cast { expr: inner, .. } => self.is_low_level_return_artifact(inner),
-            _ => false,
-        }
-    }
-
     /// Check if `expr` is a version-0 return register (e.g. `RAX_0`, `EAX_0`,
     /// `XMM0_0`).  These appear in exit blocks when phi nodes merge uninitialized
     /// entry values and should be replaced by the last meaningful computed value.
@@ -7255,30 +6691,6 @@ impl<'a> FoldingContext<'a> {
         }
     }
 
-    fn resolve_return_target_expr(
-        &self,
-        target_expr: CExpr,
-        last_ret_value: Option<CExpr>,
-    ) -> CExpr {
-        if self.carrier_answers_the_return(&target_expr) {
-            return target_expr;
-        }
-        let mut best = Some(target_expr.clone());
-        let mut visited = HashSet::new();
-        if let Some(resolved) = self.resolve_return_expr_from_defs(&target_expr, 0, &mut visited)
-            && resolved != target_expr
-        {
-            best = self.preferred_return_candidate(best, Some(resolved));
-        }
-
-        if let Some(last) = last_ret_value {
-            let last = self.resolve_return_candidate(&last);
-            best = self.preferred_return_candidate(best, Some(last));
-        }
-
-        best.unwrap_or(target_expr)
-    }
-
     fn normalize_final_return_candidate(&self, expr: CExpr) -> CExpr {
         if self.carrier_answers_the_return(&expr) {
             return expr;
@@ -7329,46 +6741,6 @@ impl<'a> FoldingContext<'a> {
             CExpr::Var(_) => None,
             _ => Some(owner),
         }
-    }
-
-    fn should_emit_return_slot_assignment(&self, offset: i64, value: &CExpr) -> bool {
-        let is_scalar_return_slot = self
-            .use_info()
-            .stack_slots()
-            .any(|slot| slot.offset == offset && slot.is_scalar_return_carrier());
-        let is_return_slot =
-            is_scalar_return_slot || self.state.return_stack_slots.contains(&offset);
-        if !is_return_slot {
-            return true;
-        }
-
-        match value {
-            CExpr::Var(name) => {
-                !(self.arg_alias_for_rendered_name(&self.spelling(*name)).is_some()
-                    || is_generic_arg_name(&self.spelling(*name))
-                    || self.is_named_scalar_local(&self.spelling(*name)))
-            }
-            CExpr::Paren(inner) | CExpr::Cast { expr: inner, .. } => {
-                self.should_emit_return_slot_assignment(offset, inner)
-            }
-            _ => true,
-        }
-    }
-
-    fn is_control_return_target(&self, target: &SSAVar) -> bool {
-        let lower = target.name.to_ascii_lowercase();
-        lower == "pc"
-            || lower == "lr"
-            || lower == "ra"
-            || lower == "x30"
-            || lower.starts_with("pc_")
-            || lower.starts_with("lr_")
-            || lower.starts_with("ra_")
-            || lower.starts_with("x30_")
-            || lower == "rip"
-            || lower == "eip"
-            || lower.starts_with("rip_")
-            || lower.starts_with("eip_")
     }
 
     pub(super) fn lookup_definition(&self, name: &str) -> Option<CExpr> {
@@ -9423,17 +8795,6 @@ impl<'a> FoldingContext<'a> {
     }
 
     /// Convert a block to folded C statements.
-    /// Whether this block puts a value in the register a return reads.
-    fn block_defines_return_value_register(&self, block: &SSABlock) -> bool {
-        block.ops.iter().any(|op| {
-            op.dst().is_some_and(|dst| {
-                self.inputs
-                    .arch
-                    .is_return_register_name(&dst.name.to_ascii_lowercase())
-            })
-        })
-    }
-
     pub(crate) fn fold_block(
         &self,
         block: &SSABlock,
@@ -9448,13 +8809,6 @@ impl<'a> FoldingContext<'a> {
         self.current_op_idx.set(None);
         self.folded_blocks.borrow_mut().insert(block.addr);
         let mut stmts = Vec::new();
-        let mut last_ret_value: Option<CExpr> = None;
-        let mut last_ret_value_op_idx: Option<usize> = None;
-        let track_return_value = self.is_current_return_block()
-            || block
-                .ops
-                .iter()
-                .any(|op| matches!(op, SSAOp::Return { .. }));
 
         for (op_idx, op) in block.ops.iter().enumerate() {
             self.current_op_idx.set(Some(op_idx));
@@ -9474,318 +8828,73 @@ impl<'a> FoldingContext<'a> {
                 continue;
             }
 
-            if let SSAOp::Store {
-                space: r2il::SpaceId::Ram,
-                addr,
-                val,
-            } = op
-                && self.is_current_return_block()
-                && let Some(offset) = self.stack_slot_offset_for_var(addr)
-                && self.state.return_stack_slots.contains(&offset)
-            {
-                let direct_value = self.get_return_expr(val)?;
-                let local_value =
-                    match self.recent_same_family_return_expr_before(block, op_idx, val)? {
-                        Some(recent)
-                            if self.should_prefer_recent_same_family_return_expr(
-                                &recent,
-                                &direct_value,
-                            ) =>
-                        {
-                            Some(recent)
-                        }
-                        Some(recent) => {
-                            self.preferred_return_candidate(Some(recent), Some(direct_value))
-                        }
-                        None => Some(direct_value),
-                    };
-                last_ret_value = self.preferred_return_candidate(
-                    local_value,
-                    self.merged_return_candidate_for_block_slot(block.addr, offset),
-                );
-                last_ret_value_op_idx = self
-                    .certified_return_for_normalized_op(block.addr, op_idx)
-                    .map(|_| op_idx);
-                // An offset does not identify one source-owned stack object.
-                // Without the ObjectId this late return scan cannot authorize
-                // an assignment target; the earlier exact effect path owns it.
-                let _ = self.refuse_missing_stack_object_origin(offset);
-                continue;
-            }
-
-            if let SSAOp::Load {
-                space: r2il::SpaceId::Ram,
-                addr,
-                ..
-            } = op
-                && block.addr == self.state.exit_block.unwrap_or(0)
-                && self.is_current_return_block()
-                && let Some(offset) = self.stack_slot_offset_for_var(addr)
-                && self.state.return_stack_slots.contains(&offset)
-            {
-                continue;
-            }
-
-            if track_return_value {
-                match op {
-                    SSAOp::Copy { dst, src }
-                        if self
-                            .inputs
-                            .arch
-                            .is_return_register_name(&dst.name.to_lowercase()) =>
-                    {
-                        if self.is_control_return_target(dst) {
-                            continue;
-                        }
-                        let src_expr = if self
-                            .inputs
-                            .arch
-                            .is_return_register_name(&src.name.to_lowercase())
-                        {
-                            match last_ret_value
-                                .clone()
-                                .or_else(|| self.lookup_definition(&src.display_name()))
-                            {
-                                Some(expr) => expr,
-                                None => self.get_expr(src)?,
-                            }
-                        } else {
-                            self.tracked_return_source_expr(src)?
-                        };
-                        last_ret_value = Some(src_expr);
-                        last_ret_value_op_idx = self
-                            .certified_return_for_normalized_op(block.addr, op_idx)
-                            .map(|_| op_idx);
-                    }
-                    SSAOp::IntZExt { dst, src }
-                    | SSAOp::IntSExt { dst, src }
-                    | SSAOp::Trunc { dst, src }
-                    | SSAOp::Cast { dst, src }
-                        if self
-                            .inputs
-                            .arch
-                            .is_return_register_name(&dst.name.to_lowercase()) =>
-                    {
-                        if self.is_control_return_target(dst) {
-                            continue;
-                        }
-                        let src_expr = if self
-                            .inputs
-                            .arch
-                            .is_return_register_name(&src.name.to_lowercase())
-                        {
-                            match last_ret_value
-                                .clone()
-                                .or_else(|| self.lookup_definition(&src.display_name()))
-                            {
-                                Some(expr) => expr,
-                                None => self.get_expr(src)?,
-                            }
-                        } else {
-                            self.tracked_return_source_expr(src)?
-                        };
-                        last_ret_value = Some(self.tracked_return_cast_expr(dst, src, src_expr));
-                        last_ret_value_op_idx = self
-                            .certified_return_for_normalized_op(block.addr, op_idx)
-                            .map(|_| op_idx);
-                    }
-                    _ => {
-                        if let Some(dst) = op.dst()
-                            && self
-                                .inputs
-                                .arch
-                                .is_return_register_name(&dst.name.to_lowercase())
-                            && !self.is_control_return_target(dst)
-                        {
-                            let mut visited = HashSet::new();
-                            let LoweredExprAt::Rendered(raw) =
-                                self.op_to_expr_at(op, block.addr, op_idx)?;
-                            let expanded = self.expand_return_expr(&raw, 0, &mut visited);
-                            let final_expr = if self.is_certified_rendered_call_expr(&expanded) {
-                                expanded.clone()
-                            } else {
-                                let mut semantic_visited = HashSet::new();
-                                let semanticized = self.semanticize_visible_expr(
-                                    &expanded,
-                                    0,
-                                    &mut semantic_visited,
-                                );
-                                if self.is_predicate_like_expr(&semanticized) {
-                                    self.simplify_condition_expr(semanticized)
-                                } else {
-                                    semanticized
-                                }
-                            };
-                            last_ret_value = Some(final_expr);
-                            last_ret_value_op_idx = self
-                                .certified_return_for_normalized_op(block.addr, op_idx)
-                                .map(|_| op_idx);
-                        }
-                    }
-                }
-            }
-
-            if let SSAOp::Return { target } = op {
-                // Leaving without a return says the value is coming from a slot
-                // store this pass will render instead. That holds when the store
-                // is in this block, and `last_ret_value` is how it says so. When
-                // the store is in another block -- a loop body writing the
-                // accumulator every iteration -- there is nothing here to stand
-                // in for it, and the function ends with no return at all.
-                //
-                // This block loads the value into the return register before
-                // returning, so there is something to say. Four renderings on
-                // three configurations fall off the end of a non-void function
-                // for want of it, each with a correct loop above.
-                if block.addr == self.state.exit_block.unwrap_or(0)
-                    && self.is_control_return_target(target)
-                    && !self.state.return_stack_slots.is_empty()
-                    && last_ret_value.is_none()
-                    && !self.block_defines_return_value_register(block)
+            if let SSAOp::Return { .. } = op {
+                let (source_inst, boundary) = self
+                    .source_return_boundary_for_normalized_op(block.addr, op_idx)
+                    .ok_or(OpLoweringRefusal::MissingMachineProjectionAuthorization)?;
+                if boundary.at != source_inst
+                    || !boundary.complete
+                    || !boundary.register_compositions.is_empty()
                 {
-                    break;
-                }
-                let return_op_idx = if self.is_control_return_target(target) {
-                    last_ret_value_op_idx.unwrap_or(op_idx)
-                } else {
-                    op_idx
-                };
-                let certified_return_expr = None;
-
-                if !self.current_return_target_is_certified(target) {
-                    stmts.push(self.certified_residual_comment(format!(
-                        "uncertified return value at 0x{:x}:{}",
-                        block.addr, op_idx
-                    )));
-                    break;
+                    return Err(OpLoweringRefusal::MissingMachineProjectionAuthorization);
                 }
 
-                let (expr, certified_value) = if let Some((expr, value)) = certified_return_expr {
-                    (expr, Some(value))
-                } else {
-                    let unresolved = self.get_return_expr(target)?;
-                    // What the returned name denotes is a question the value
-                    // renderer already answers, and answering it again here
-                    // reached somewhere else: a value loaded through a pointer
-                    // came back as the pointer, so a struct field was returned
-                    // as the address holding it. The read the value carries
-                    // wins; everything else keeps the previous preference.
-                    let mut visited = HashSet::new();
-                    let target_expr = self
-                        .memory_read_expr_for_name(&target.display_name())
-                        .or_else(|| {
-                            self.choose_preferred_visible_expr(
-                                self.render_semantic_value_by_name(
-                                    &target.display_name(),
-                                    0,
-                                    &mut visited,
-                                ),
-                                Some(unresolved.clone()),
-                            )
-                            .and_then(|expr| {
-                                self.choose_preferred_visible_expr(
-                                    Some(expr),
-                                    self.best_visible_definition(&target.display_name()),
-                                )
-                            })
-                        })
-                        .unwrap_or(unresolved);
-                    let expr = if self.is_control_return_target(target) {
-                        // The value of the last `Ret` op and the merge over the
-                        // return register are two answers to one question, and
-                        // taking the first that exists let a constant win over a
-                        // carrier. A carrier is mutable state: any other
-                        // expression for it is what it held on one path, in
-                        // practice the value it was entered with. `fnv1a32` at
-                        // x86-64 -O1 renders a correct loop and returns its seed
-                        // because `last_ret_value` short-circuits the merge that
-                        // knows better.
-                        let merged = self.current_block_addr.get().and_then(|block_addr| {
-                            self.merged_return_register_candidate_for_block(block_addr)
-                                .or_else(|| self.reaching_return_register_candidate(block_addr))
-                        });
-                        // ...unless this block went on to compute the result
-                        // from the carrier. `adler32` carries its accumulator in
-                        // `rax` and then composes with `shl eax, 0x10; or eax,
-                        // ecx` here; preferring the carrier drops the compose,
-                        // and nothing reads it afterwards so the pruner removes
-                        // it and the reader sees `return rax`.
-                        let control_return_value = match (last_ret_value.clone(), merged) {
-                            (Some(last), Some(merged))
-                                if self.expr_is_carrier_reference(&merged)
-                                    && !self.expr_is_carrier_reference(&last)
-                                    && !self.current_return_block_computes_result() =>
-                            {
-                                Some(merged)
-                            }
-                            (last, merged) => last.or(merged),
-                        };
-                        if let Some(last) = control_return_value {
-                            self.resolve_return_target_expr(last, None)
-                        } else {
-                            self.resolve_return_target_expr(target_expr, None)
+                let (return_value, stmt) = match boundary.values.as_slice() {
+                    [] => {
+                        if self
+                            .certified_return_for_normalized_op(block.addr, op_idx)
+                            .is_some()
+                        {
+                            return Err(OpLoweringRefusal::MissingMachineProjectionAuthorization);
                         }
-                    } else {
-                        self.resolve_return_target_expr(target_expr, last_ret_value.clone())
-                    };
-                    let value = self
-                        .certified_return_for_normalized_op(block.addr, return_op_idx)
-                        .map(|cert| cert.value);
-                    (expr, value)
+                        (None, CStmt::Return(None))
+                    }
+                    [boundary_value] => {
+                        let prepared = self
+                            .prepared_ssa()
+                            .ok_or(OpLoweringRefusal::MissingMachineProjectionAuthorization)?;
+                        let (source_block, source_op) = prepared
+                            .inst_op_site(source_inst)
+                            .ok_or(OpLoweringRefusal::MissingMachineProjectionAuthorization)?;
+                        let certificate = prepared
+                            .return_certificate_for_op(source_block, source_op)
+                            .ok_or(OpLoweringRefusal::MissingMachineProjectionAuthorization)?;
+                        let certified = self
+                            .certified_return_for_normalized_op(block.addr, op_idx)
+                            .ok_or(OpLoweringRefusal::MissingMachineProjectionAuthorization)?;
+                        if certificate.at != source_inst
+                            || certificate.block_addr != source_block
+                            || certificate.op_index != source_op
+                            || certificate.value != boundary_value.value
+                            || certified.block_addr != source_block
+                            || certified.op_index != source_op
+                            || certified.value != certificate.value
+                            || certified.width != certificate.width
+                        {
+                            return Err(OpLoweringRefusal::MissingMachineProjectionAuthorization);
+                        }
+                        let expr = match self.planned_value_expr(certified.value) {
+                            Ok(expr) => expr,
+                            Err(error) => {
+                                self.retain_first_observation_error(error);
+                                return Err(
+                                    OpLoweringRefusal::MissingMachineProjectionAuthorization,
+                                );
+                            }
+                        };
+                        (Some(certified.value), CStmt::Return(Some(expr)))
+                    }
+                    _ => return Err(OpLoweringRefusal::MissingMachineProjectionAuthorization),
                 };
-                let final_expr = {
-                    let normalized = self.normalize_final_return_candidate(expr.clone());
-                    self.sanitize_final_return_expr(normalized, expr)?
-                };
-                if !self.certified_return_members_have_external_layout(&final_expr) {
-                    stmts.push(self.certified_residual_comment(format!(
-                        "uncertified return expression at 0x{:x}:{}",
-                        block.addr, return_op_idx
-                    )));
-                    break;
-                }
-                let final_expr = self.planned_input_expr_at(block.addr, op_idx, 0)?;
-                let final_expr = block
-                    .ops
-                    .get(return_op_idx)
-                    .filter(|producer| producer.dst().is_some())
-                    .map_or(final_expr.clone(), |producer| {
-                        self.observe_normalized_result_expr(
-                            producer,
-                            block.addr,
-                            return_op_idx,
-                            final_expr,
-                        )
-                    });
                 let obligations = self.exact_effect_obligations_for_normalized_value(
                     EffectOccurrenceKind::Return,
                     block.addr,
                     op_idx,
-                    certified_value,
+                    return_value,
                 );
-                stmts.push(self.observe_effect_stmt(&obligations, CStmt::Return(Some(final_expr))));
+                stmts.push(self.observe_effect_stmt(&obligations, stmt));
 
                 break;
-            }
-
-            // In return-context blocks, keep return-register writes as tracking-only.
-            // Emit a single high-level return at the SSA Return terminator.
-            //
-            // Only when the return is the value's one reader. A return register
-            // is an ordinary register until the function ends, so the tail can
-            // compute in it and read the result again: `EAX_4 = Subpiece(...)`
-            // in xxhash32 is read eight more times by the statements that finish
-            // the hash. Dropping its write on the promise of a single `return`
-            // left all eight reading a name nothing defined.
-            if track_return_value
-                && let Some(dst) = op.dst()
-                && self
-                    .inputs
-                    .arch
-                    .is_return_register_name(&dst.name.to_lowercase())
-                && self.use_count_of(&dst.display_name()) <= 1
-            {
-                continue;
             }
 
             if let Some(dst) = op.dst()
@@ -9825,57 +8934,6 @@ impl<'a> FoldingContext<'a> {
             }
         }
 
-        if self.is_current_return_block()
-            && !stmts.iter().any(|stmt| matches!(stmt, CStmt::Return(_)))
-            && let Some(expr) = last_ret_value
-        {
-            let return_expr = Some((expr, None));
-
-            if let Some((expr, certified_value)) = return_expr {
-                let final_expr = {
-                    let normalized = self.normalize_final_return_candidate(expr.clone());
-                    self.sanitize_final_return_expr(normalized, expr)?
-                };
-                if !self.certified_return_members_have_external_layout(&final_expr) {
-                    stmts.push(self.certified_residual_comment(format!(
-                        "uncertified return expression at 0x{:x}:{}",
-                        block.addr,
-                        last_ret_value_op_idx.unwrap_or(0)
-                    )));
-                } else {
-                    if let Some(op_idx) = last_ret_value_op_idx {
-                        let final_expr = block
-                            .ops
-                            .get(op_idx)
-                            .filter(|producer| producer.dst().is_some())
-                            .map_or(final_expr.clone(), |producer| {
-                                self.observe_normalized_result_expr(
-                                    producer,
-                                    block.addr,
-                                    op_idx,
-                                    final_expr,
-                                )
-                            });
-                        let value = certified_value.or_else(|| {
-                            self.certified_return_for_normalized_op(block.addr, op_idx)
-                                .map(|cert| cert.value)
-                        });
-                        let obligations = self.exact_effect_obligations_for_normalized_value(
-                            EffectOccurrenceKind::Return,
-                            block.addr,
-                            op_idx,
-                            value,
-                        );
-                        stmts.push(
-                            self.observe_effect_stmt(&obligations, CStmt::Return(Some(final_expr))),
-                        );
-                    } else {
-                        stmts.push(CStmt::Return(Some(final_expr)));
-                    }
-                };
-            }
-        }
-
         let trace = std::env::var_os("R2SLEIGH_DEBUG_MERGES").is_some();
         if trace {
             eprintln!("FOLDPOST block={:#x} built={}", block.addr, stmts.len());
@@ -9888,65 +8946,10 @@ impl<'a> FoldingContext<'a> {
         if trace {
             eprintln!("FOLDPOST block={:#x} after_prune={}", block.addr, stmts.len());
         }
-        let out = self.prune_redundant_return_slot_assignments(stmts);
-        if trace {
-            eprintln!("FOLDPOST block={:#x} after_slots={}", block.addr, out.len());
-        }
         self.current_block_addr.set(None);
         self.current_block_id.set(None);
         self.current_op_idx.set(None);
-        Ok(out)
-    }
-
-    pub(super) fn prune_redundant_return_slot_assignments(&self, stmts: Vec<CStmt>) -> Vec<CStmt> {
-        if stmts.len() < 2 {
-            return stmts;
-        }
-
-        let mut out = Vec::with_capacity(stmts.len());
-        let mut idx = 0;
-        while idx < stmts.len() {
-            let current = stmts[idx].clone_without_render_observations();
-            let next = stmts
-                .get(idx + 1)
-                .map(CStmt::clone_without_render_observations);
-            let skip_assignment = if let Some(CStmt::Return(Some(ret_expr))) = next.as_ref() {
-                match &current {
-                    CStmt::Expr(CExpr::Binary {
-                        op: BinaryOp::Assign,
-                        left,
-                        right,
-                    }) => match left.as_ref() {
-                        CExpr::Var(name) => {
-                            match self.stack_offset_for_visible_storage_name(&self.spelling(*name)) {
-                                Some(offset) => {
-                                    let rhs = self.resolve_return_candidate(right);
-                                    let ret = self.resolve_return_candidate(ret_expr);
-                                    rhs.transparently_eq(&ret)
-                                        && self.state.return_stack_slots.contains(&offset)
-                                        && !self.should_emit_return_slot_assignment(offset, &rhs)
-                                }
-                                None => false,
-                            }
-                        }
-                        _ => false,
-                    },
-                    _ => false,
-                }
-            } else {
-                false
-            };
-
-            if skip_assignment {
-                idx += 1;
-                continue;
-            }
-
-            out.push(stmts[idx].clone());
-            idx += 1;
-        }
-
-        out
+        Ok(stmts)
     }
 
     fn is_inlined_single_use_call_result(
@@ -10630,12 +9633,9 @@ impl<'a> FoldingContext<'a> {
                 let rhs = self.assignment_rhs_with_type_policy(dst, None, rhs);
                 self.assign_stmt(lhs, rhs)
             }
-            SSAOp::Return { target } => Some(CStmt::Return(Some(
-                self.observed_input(
-                    frame,
-                    0,
-                    self.rewrite_stack_expr(self.get_return_expr(target)?),
-                )))),
+            SSAOp::Return { .. } => {
+                return Err(OpLoweringRefusal::MissingMachineProjectionAuthorization);
+            }
             SSAOp::Branch { .. } | SSAOp::CBranch { .. } => {
                 // Handled by control flow structuring
                 None

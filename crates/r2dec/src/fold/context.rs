@@ -139,9 +139,6 @@ pub(crate) fn empty_function_facts() -> &'static FunctionFacts {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct FoldState {
     pub(crate) analysis_ctx: analysis::DecompilerFacts,
-    pub(crate) exit_block: Option<u64>,
-    pub(crate) return_blocks: HashSet<u64>,
-    pub(crate) return_stack_slots: HashSet<i64>,
 }
 
 /// Internal executable-folding state.

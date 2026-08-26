@@ -844,13 +844,6 @@ impl UseInfo {
             .unwrap_or(0)
     }
 
-    #[cfg(test)]
-    pub(crate) fn use_count_for_name(&self, name: &str) -> usize {
-        self.value_id_for_name(name)
-            .map(|value| self.use_count_for_value(value))
-            .unwrap_or(0)
-    }
-
     pub(crate) fn definition_for_value(&self, value_id: ValueId) -> Option<&CExpr> {
         if self.ambiguous_value_ids.contains(&value_id) {
             return None;
@@ -1003,10 +996,6 @@ impl UseInfo {
         }
         self.value_id_for_name(name)
             .and_then(|value_id| self.stack_slots_by_value.get(&value_id).copied())
-    }
-
-    pub(crate) fn stack_slots(&self) -> impl Iterator<Item = StackSlotProvenance> + '_ {
-        self.stack_slots_by_value.values().copied()
     }
 
     #[cfg(test)]

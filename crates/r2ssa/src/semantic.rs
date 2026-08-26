@@ -1129,7 +1129,7 @@ impl CallResultValueRelation {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReturnCarrier {
     Register {
-        name: String,
+        storage: CanonicalStorageId,
     },
     StackSlot {
         object: ObjectId,
@@ -1333,7 +1333,7 @@ impl PreparedFunctionFacts {
         let control_domains = collect_control_domain_facts(function, &predicates, &structured);
         let obligations = SemanticObligationInventory::collect(graph, &structured, &boundaries);
         let certificates = collect_prepared_function_certificates(
-            machine_context,
+            &boundaries,
             function,
             graph,
             &objects,
@@ -3363,7 +3363,7 @@ fn call_result_value_after_call(
 }
 
 fn collect_prepared_function_certificates(
-    machine_context: Option<&SourceMachineContext>,
+    boundaries: &SourceBoundaryFacts,
     function: &SSAFunction,
     graph: &SsaGraph,
     objects: &ObjectModel,
@@ -3540,17 +3540,13 @@ fn collect_prepared_function_certificates(
         .collect();
 
     let (call_results, call_results_by_inst, call_results_by_callsite) =
-        collect_call_result_certificates(function, graph, objects, call_sites, structured);
+        collect_call_result_certificates(
+            boundaries, function, graph, objects, call_sites, structured,
+        );
     let stack_reloads =
         collect_stack_reload_source_certificates(function, graph, objects, memory, structured);
-    let (returns, returns_by_inst) = collect_return_value_certificates(
-        machine_context,
-        function,
-        graph,
-        predicates,
-        &call_results,
-        &stack_reloads,
-    );
+    let (returns, returns_by_inst) =
+        collect_return_value_certificates(boundaries, graph, &stack_reloads);
 
     PreparedFunctionCertificates {
         loops,
@@ -3964,517 +3960,68 @@ fn expression_op_is_pure(op: &SSAOp) -> bool {
 }
 
 fn collect_return_value_certificates(
-    machine_context: Option<&SourceMachineContext>,
-    function: &SSAFunction,
+    boundaries: &SourceBoundaryFacts,
     graph: &SsaGraph,
-    predicates: &PredicateFacts,
-    call_results: &BTreeMap<ValueId, CallResultCertificate>,
     stack_reloads: &BTreeMap<ValueId, StackReloadSourceCertificate>,
 ) -> (Vec<ReturnValueCertificate>, BTreeMap<InstId, usize>) {
     let mut returns = Vec::new();
     let mut returns_by_inst = BTreeMap::new();
-    let mut return_blocks = BTreeSet::new();
 
-    for block in function.blocks() {
-        let cfg_return = function
-            .cfg()
-            .get_block(block.addr)
-            .is_some_and(|cfg_block| matches!(cfg_block.terminator, BlockTerminator::Return));
-        if cfg_return
-            || block
-                .ops
-                .iter()
-                .any(|op| matches!(op, SSAOp::Return { .. }))
+    for (boundary_at, boundary) in &boundaries.returns {
+        if boundary.at != *boundary_at
+            || !boundary.complete
+            || !boundary.register_compositions.is_empty()
         {
-            return_blocks.insert(block.addr);
+            continue;
         }
-    }
-
-    let mut return_context_blocks = return_blocks.clone();
-    for block in function.blocks() {
-        if function
-            .successors(block.addr)
-            .iter()
-            .any(|succ| return_blocks.contains(succ))
-        {
-            return_context_blocks.insert(block.addr);
+        let [boundary_value] = boundary.values.as_slice() else {
+            // A complete void boundary is authoritative, but it owns no value.
+            continue;
+        };
+        let Some((block_addr, op_index)) = graph.op_site_for_inst(boundary.at) else {
+            continue;
+        };
+        let Some(inst) = graph.inst(boundary.at) else {
+            continue;
+        };
+        if !matches!(inst.payload, InstPayload::Op(SSAOp::Return { .. })) {
+            continue;
         }
-    }
-
-    let reaching_control_returns = collect_reaching_control_return_values(
-        function,
-        graph,
-        predicates,
-        call_results,
-        stack_reloads,
-    );
-
-    for block in function.blocks() {
-        let mut last_return_value_write = None;
-        let mut has_explicit_return = false;
-        for (op_idx, op) in block.ops.iter().enumerate() {
-            if let SSAOp::Return { target } = op {
-                has_explicit_return = true;
-                if is_return_value_register(target) {
-                    push_return_value_certificate(
-                        graph,
-                        &mut returns,
-                        &mut returns_by_inst,
-                        block.addr,
-                        op_idx,
-                        target,
-                    );
-                } else if is_control_return_target(target) {
-                    if let Some((_, value)) = last_return_value_write {
-                        push_return_value_certificate(
-                            graph,
-                            &mut returns,
-                            &mut returns_by_inst,
-                            block.addr,
-                            op_idx,
-                            value,
-                        );
-                    } else if let Some(value) =
-                        reaching_control_returns.get(&(block.addr, op_idx)).copied()
-                    {
-                        push_return_value_certificate_for_value(
-                            graph,
-                            &mut returns,
-                            &mut returns_by_inst,
-                            block.addr,
-                            op_idx,
-                            value,
-                        );
-                    } else if let Some(return_phi) =
-                        unique_return_value_phi_for_block(machine_context, block)
-                    {
-                        push_return_value_certificate(
-                            graph,
-                            &mut returns,
-                            &mut returns_by_inst,
-                            block.addr,
-                            op_idx,
-                            return_phi,
-                        );
-                    }
-                } else {
-                    push_return_value_certificate(
-                        graph,
-                        &mut returns,
-                        &mut returns_by_inst,
-                        block.addr,
-                        op_idx,
-                        target,
-                    );
-                }
-                continue;
-            }
-
-            if return_context_blocks.contains(&block.addr)
-                && let Some(dst) = op.dst()
-                && is_return_value_register(dst)
-            {
-                let preserve_wider_call_alias = matches!(op, SSAOp::CallDefine { .. })
-                    && last_return_value_write.is_some_and(|(_, current)| {
-                        synthetic_call_results_share_site(graph, call_results, current, dst)
-                            && current.size > dst.size
-                    });
-                if !preserve_wider_call_alias {
-                    last_return_value_write = Some((op_idx, dst));
-                }
-            }
-        }
-
-        if !has_explicit_return
-            && return_blocks.contains(&block.addr)
-            && let Some((op_idx, dst)) = last_return_value_write
-        {
-            push_return_value_certificate(
-                graph,
-                &mut returns,
-                &mut returns_by_inst,
-                block.addr,
-                op_idx,
-                dst,
-            );
-        }
+        let Some(value) = graph.value(boundary_value.value) else {
+            continue;
+        };
+        let carrier = return_carrier_for_boundary_value(boundary_value, stack_reloads);
+        returns_by_inst.insert(boundary.at, returns.len());
+        returns.push(ReturnValueCertificate {
+            at: boundary.at,
+            block_addr,
+            op_index,
+            value: boundary_value.value,
+            width: value.var.size,
+            carrier,
+        });
     }
 
     (returns, returns_by_inst)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ReachingReturnValue {
-    value: ValueId,
-    identity: ReturnSemanticIdentity,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum ReturnSemanticIdentity {
-    CallResult(CallSiteId),
-    StackSlot(ObjectId, i64),
-    Value(ValueId),
-    Const(u64),
-}
-
-fn collect_reaching_control_return_values(
-    function: &SSAFunction,
-    graph: &SsaGraph,
-    predicates: &PredicateFacts,
-    call_results: &BTreeMap<ValueId, CallResultCertificate>,
+fn return_carrier_for_boundary_value(
+    boundary: &CallBoundaryValueFact,
     stack_reloads: &BTreeMap<ValueId, StackReloadSourceCertificate>,
-) -> BTreeMap<(u64, usize), ValueId> {
-    let mut in_states = BTreeMap::<u64, Option<ReachingReturnValue>>::new();
-    let mut out_states = BTreeMap::<u64, Option<ReachingReturnValue>>::new();
-    let mut returns_by_op = BTreeMap::new();
-    let mut worklist = function
-        .blocks()
-        .map(|block| block.addr)
-        .collect::<VecDeque<_>>();
-    let mut queued = function
-        .blocks()
-        .map(|block| block.addr)
-        .collect::<BTreeSet<_>>();
-
-    while let Some(block_addr) = worklist.pop_front() {
-        queued.remove(&block_addr);
-        let input = merge_reaching_return_predecessors(
-            function,
-            graph,
-            predicates,
-            call_results,
-            stack_reloads,
-            &out_states,
-            block_addr,
-        );
-        if in_states.get(&block_addr) != Some(&input) {
-            in_states.insert(block_addr, input);
-        }
-        let Some(block) = function.get_block(block_addr) else {
-            continue;
-        };
-        let (output, block_returns) =
-            process_reaching_return_block(graph, call_results, stack_reloads, block, input);
-        for (site, value) in block_returns {
-            returns_by_op.insert(site, value);
-        }
-        if out_states.get(&block_addr) == Some(&output) {
-            continue;
-        }
-        out_states.insert(block_addr, output);
-        for succ in function.successors(block_addr) {
-            if queued.insert(succ) {
-                worklist.push_back(succ);
-            }
+) -> Option<ReturnCarrier> {
+    match boundary.slot {
+        CallBoundarySlot::Register { .. } => return_carrier_for_boundary_slot(boundary.slot),
+        CallBoundarySlot::Stack(offset) => {
+            let reload = stack_reloads.get(&boundary.value)?;
+            (reload.offset == offset).then_some(ReturnCarrier::StackSlot {
+                object: reload.object,
+                offset: reload.offset,
+                memory_access: Some(reload.load_access),
+            })
         }
     }
-
-    returns_by_op
 }
 
-fn merge_reaching_return_predecessors(
-    function: &SSAFunction,
-    graph: &SsaGraph,
-    predicates: &PredicateFacts,
-    call_results: &BTreeMap<ValueId, CallResultCertificate>,
-    stack_reloads: &BTreeMap<ValueId, StackReloadSourceCertificate>,
-    out_states: &BTreeMap<u64, Option<ReachingReturnValue>>,
-    block_addr: u64,
-) -> Option<ReachingReturnValue> {
-    let preds = function.predecessors(block_addr);
-    let (first, rest) = preds.split_first()?;
-    let first_state = out_states.get(first).copied().flatten()?;
-    let mut common = return_identity_candidates_for_block(
-        *first,
-        first_state,
-        graph,
-        predicates,
-        call_results,
-        stack_reloads,
-    );
-    let mut all_states = vec![first_state];
-    for pred in rest {
-        if let Some(pred_state) = out_states.get(pred).copied().flatten() {
-            let pred_candidates = return_identity_candidates_for_block(
-                *pred,
-                pred_state,
-                graph,
-                predicates,
-                call_results,
-                stack_reloads,
-            );
-            common.retain(|identity| pred_candidates.contains(identity));
-            all_states.push(pred_state);
-        }
-    }
-    if !common.is_empty() {
-        let identity = common
-            .iter()
-            .find(|identity| !matches!(identity, ReturnSemanticIdentity::Const(_)))
-            .copied()
-            .or_else(|| common.iter().next().copied())?;
-        let value = preds
-            .iter()
-            .filter_map(|pred| out_states.get(pred).copied().flatten())
-            .find(|state| state.identity == identity)
-            .map(|state| state.value)
-            .unwrap_or(first_state.value);
-        return Some(ReachingReturnValue { value, identity });
-    }
-
-    let non_const_states: Vec<_> = all_states
-        .iter()
-        .filter(|state| !matches!(state.identity, ReturnSemanticIdentity::Const(_)))
-        .copied()
-        .collect();
-    if non_const_states.len() == 1 {
-        return Some(non_const_states[0]);
-    }
-
-    None
-}
-
-fn process_reaching_return_block(
-    graph: &SsaGraph,
-    call_results: &BTreeMap<ValueId, CallResultCertificate>,
-    stack_reloads: &BTreeMap<ValueId, StackReloadSourceCertificate>,
-    block: &crate::function::SSABlock,
-    mut state: Option<ReachingReturnValue>,
-) -> (Option<ReachingReturnValue>, BTreeMap<(u64, usize), ValueId>) {
-    let mut returns_by_op = BTreeMap::new();
-    let return_phis = block
-        .phis
-        .iter()
-        .filter(|phi| is_return_value_register(&phi.dst))
-        .filter_map(|phi| {
-            reaching_return_value_for_var(graph, call_results, stack_reloads, &phi.dst)
-        })
-        .collect::<Vec<_>>();
-    match return_phis.as_slice() {
-        [return_phi] if state.is_none() => state = Some(*return_phi),
-        [] | [_] => {}
-        _ => state = None,
-    }
-    for (op_idx, op) in block.ops.iter().enumerate() {
-        if let SSAOp::Return { target } = op
-            && is_control_return_target(target)
-            && let Some(state) = state
-        {
-            returns_by_op.insert((block.addr, op_idx), state.value);
-        }
-        if matches!(op, SSAOp::Call { .. } | SSAOp::CallInd { .. }) {
-            state = None;
-        }
-        if let Some(dst) = op.dst()
-            && is_return_value_register(dst)
-        {
-            let candidate = reaching_return_value_for_var(graph, call_results, stack_reloads, dst);
-            let preserve_wider_call_alias = matches!(op, SSAOp::CallDefine { .. })
-                && state.is_some_and(|current| {
-                    candidate.is_some_and(|candidate| {
-                        current.identity == candidate.identity
-                            && graph
-                                .value(current.value)
-                                .zip(graph.value(candidate.value))
-                                .is_some_and(|(current, candidate)| {
-                                    current.var.size > candidate.var.size
-                                })
-                    })
-                });
-            if !preserve_wider_call_alias {
-                state = candidate;
-            }
-        }
-    }
-    (state, returns_by_op)
-}
-
-fn synthetic_call_results_share_site(
-    graph: &SsaGraph,
-    call_results: &BTreeMap<ValueId, CallResultCertificate>,
-    lhs: &SSAVar,
-    rhs: &SSAVar,
-) -> bool {
-    graph
-        .value_id_for_var(lhs)
-        .and_then(|value| call_results.get(&value))
-        .zip(
-            graph
-                .value_id_for_var(rhs)
-                .and_then(|value| call_results.get(&value)),
-        )
-        .is_some_and(|(lhs, rhs)| lhs.call_site == rhs.call_site)
-}
-
-fn reaching_return_value_for_var(
-    graph: &SsaGraph,
-    call_results: &BTreeMap<ValueId, CallResultCertificate>,
-    stack_reloads: &BTreeMap<ValueId, StackReloadSourceCertificate>,
-    var: &SSAVar,
-) -> Option<ReachingReturnValue> {
-    let value = graph.value_id_for_var(var)?;
-    Some(ReachingReturnValue {
-        value,
-        identity: return_semantic_identity_for_value(graph, call_results, stack_reloads, value),
-    })
-}
-
-fn return_identity_candidates_for_block(
-    block_addr: u64,
-    state: ReachingReturnValue,
-    graph: &SsaGraph,
-    predicates: &PredicateFacts,
-    call_results: &BTreeMap<ValueId, CallResultCertificate>,
-    stack_reloads: &BTreeMap<ValueId, StackReloadSourceCertificate>,
-) -> BTreeSet<ReturnSemanticIdentity> {
-    let mut candidates = BTreeSet::from([state.identity]);
-    let Some(assumptions) = predicates.block_assumptions.get(&block_addr) else {
-        return candidates;
-    };
-
-    let mut changed = true;
-    while changed {
-        changed = false;
-        for assumption in assumptions {
-            let Some(predicate) = predicates.predicates.get(&assumption.predicate) else {
-                continue;
-            };
-            let Some(compare) = &predicate.comparison else {
-                continue;
-            };
-            if !assumption_proves_equality(compare.kind, assumption.truth) {
-                continue;
-            }
-            let lhs =
-                return_semantic_identity_for_value(graph, call_results, stack_reloads, compare.lhs);
-            let rhs =
-                return_semantic_identity_for_value(graph, call_results, stack_reloads, compare.rhs);
-            if candidates.contains(&lhs) && candidates.insert(rhs) {
-                changed = true;
-            }
-            if candidates.contains(&rhs) && candidates.insert(lhs) {
-                changed = true;
-            }
-        }
-    }
-
-    candidates
-}
-
-fn assumption_proves_equality(kind: CompareKind, truth: bool) -> bool {
-    matches!(
-        (kind, truth),
-        (CompareKind::Equal, true) | (CompareKind::NotEqual, false)
-    )
-}
-
-fn return_semantic_identity_for_value(
-    graph: &SsaGraph,
-    call_results: &BTreeMap<ValueId, CallResultCertificate>,
-    stack_reloads: &BTreeMap<ValueId, StackReloadSourceCertificate>,
-    value: ValueId,
-) -> ReturnSemanticIdentity {
-    if let Some(call_result) = call_results.get(&value) {
-        if let Some(ValueOwner::StackSlot { object, offset }) = call_result.owner {
-            return ReturnSemanticIdentity::StackSlot(object, offset);
-        }
-        return ReturnSemanticIdentity::CallResult(call_result.call_site);
-    }
-    if let Some(reload) = stack_reloads.get(&value) {
-        return ReturnSemanticIdentity::StackSlot(reload.object, reload.offset);
-    }
-    let canonical = canonical_graph_value_root(graph, value);
-    if let Some(var) = graph.value(canonical).map(|value| &value.var)
-        && let Some(literal) = const_value(var)
-    {
-        return ReturnSemanticIdentity::Const(literal);
-    }
-    ReturnSemanticIdentity::Value(canonical)
-}
-
-fn canonical_graph_value_root(graph: &SsaGraph, value: ValueId) -> ValueId {
-    let mut current = value;
-    for _ in 0..32 {
-        let Some(def_inst) = graph.def_inst(current) else {
-            break;
-        };
-        let Some(inst) = graph.inst(def_inst) else {
-            break;
-        };
-        let next = match &inst.payload {
-            InstPayload::Phi { .. } => {
-                let Some(first) = inst.inputs.first().copied() else {
-                    break;
-                };
-                if inst.inputs.iter().all(|input| *input == first) {
-                    first
-                } else {
-                    break;
-                }
-            }
-            InstPayload::Op(SSAOp::Copy { .. }) => {
-                let Some(first) = inst.inputs.first().copied() else {
-                    break;
-                };
-                first
-            }
-            _ => break,
-        };
-        if next == current {
-            break;
-        }
-        current = next;
-    }
-    current
-}
-
-/// The widest register a return value can arrive in, for one that can arrive in several.
-///
-/// `rax` and `eax` are not two places a value might be; they are one register
-/// read at two widths. A lifter that keeps them as separate storage gives an
-/// exit block one merge for each, and a rule that wanted a single candidate
-/// found two and concluded there was no return value at all.
-/// The one value a block leaves in the result register, if there is one.
-///
-/// Slices of one register are one place: a write to `EAX` and a write to `RAX`
-/// land in the same location and differ only in how much of it they took, so
-/// the widest of them carries the others and there is still one candidate. Two
-/// writes of equal width to that location are two answers, and this rule has no
-/// basis for choosing between them.
-///
-/// The convention states which location carries a result, so this holds on any
-/// architecture rather than the ones somebody wrote into a table of register
-/// spellings.
-fn unique_return_value_phi_for_block<'b>(
-    machine_context: Option<&SourceMachineContext>,
-    block: &'b crate::function::SSABlock,
-) -> Option<&'b SSAVar> {
-    // Without a machine there is no result location, and guessing one from a
-    // register spelling is what this replaced.
-    let machine_context = machine_context?;
-    let result_location = machine_context.return_value_carrier()?.location();
-    let mut candidates = block
-        .phis
-        .iter()
-        .filter_map(|phi| {
-            // The lifter recorded which varnode produced this phi, so the
-            // location comes from provenance rather than from looking the
-            // rendered name back up in a register table.
-            let storage = phi.canonical_storage.or_else(|| {
-                phi.dst
-                    .is_register()
-                    .then(|| machine_context.register_storage(&phi.dst.name))
-                    .flatten()
-            })?;
-            (storage.location() == result_location).then_some(&phi.dst)
-        })
-        .collect::<Vec<_>>();
-    candidates.sort_by_key(|var| std::cmp::Reverse(var.size));
-    if candidates.len() > 1 && candidates[0].size == candidates[1].size {
-        return None;
-    }
-    candidates.first().copied()
-}
 fn ram_memory_access_matches_source(
     function: &SSAFunction,
     graph: &SsaGraph,
@@ -4747,6 +4294,7 @@ type CallResultCertificateIndexes = (
 );
 
 fn collect_call_result_certificates(
+    boundaries: &SourceBoundaryFacts,
     function: &SSAFunction,
     graph: &SsaGraph,
     objects: &ObjectModel,
@@ -4778,6 +4326,7 @@ fn collect_call_result_certificates(
         };
         let input = merge_call_result_flow_predecessors(function, &out_states, block_addr);
         let output = process_call_result_flow_block(
+            boundaries,
             function,
             block,
             graph,
@@ -4839,6 +4388,7 @@ fn merge_call_result_flow_predecessors(
 
 #[allow(clippy::too_many_arguments)]
 fn process_call_result_flow_block(
+    boundaries: &SourceBoundaryFacts,
     function: &SSAFunction,
     block: &crate::FunctionSSABlock,
     graph: &SsaGraph,
@@ -4855,7 +4405,7 @@ fn process_call_result_flow_block(
     for (op_index, op) in block.ops.iter().enumerate() {
         match op {
             SSAOp::Call { .. } | SSAOp::CallInd { .. } => {
-                kill_return_register_flow_values(&mut state, graph);
+                kill_return_register_flow_values(&mut state);
                 active_call = callsites_by_op.get(&(block.addr, op_index)).copied();
             }
             SSAOp::CallDefine { dst } => {
@@ -4865,10 +4415,27 @@ fn process_call_result_flow_block(
                 let Some(call_site) = call_sites.by_id.get(&call_site_id) else {
                     continue;
                 };
-                let Some(carrier) = return_carrier_for_value(dst) else {
+                let Some(value) = graph.value_id_for_var(dst) else {
                     continue;
                 };
-                let Some(value) = graph.value_id_for_var(dst) else {
+                let Some(boundary) = boundaries
+                    .calls
+                    .get(&call_site_id)
+                    .filter(|boundary| boundary.complete)
+                else {
+                    continue;
+                };
+                let mut exact_results = boundary
+                    .results
+                    .iter()
+                    .filter(|result| result.value == value);
+                let Some(result) = exact_results.next() else {
+                    continue;
+                };
+                if exact_results.next().is_some() {
+                    continue;
+                }
+                let Some(carrier) = return_carrier_for_boundary_slot(result.slot) else {
                     continue;
                 };
                 let cert = CallResultCertificate {
@@ -5070,12 +4637,10 @@ fn process_call_result_flow_block(
     state
 }
 
-fn kill_return_register_flow_values(state: &mut CallResultFlowState, graph: &SsaGraph) {
-    state.tracked.retain(|value, _| {
-        graph
-            .value(*value)
-            .is_none_or(|value| !is_return_value_register(&value.var))
-    });
+fn kill_return_register_flow_values(state: &mut CallResultFlowState) {
+    state
+        .tracked
+        .retain(|_, certificate| !matches!(certificate.carrier, ReturnCarrier::Register { .. }));
 }
 
 fn insert_call_result_certificate(
@@ -5131,96 +4696,11 @@ fn stack_memory_access_at(
         .next()
 }
 
-fn push_return_value_certificate(
-    graph: &SsaGraph,
-    returns: &mut Vec<ReturnValueCertificate>,
-    returns_by_inst: &mut BTreeMap<InstId, usize>,
-    block_addr: u64,
-    op_idx: usize,
-    value_var: &SSAVar,
-) {
-    let Some(at) = graph.inst_id_for_op_site(block_addr, op_idx) else {
-        return;
-    };
-    if returns_by_inst.contains_key(&at) {
-        return;
+fn return_carrier_for_boundary_slot(slot: CallBoundarySlot) -> Option<ReturnCarrier> {
+    match slot {
+        CallBoundarySlot::Register { storage, .. } => Some(ReturnCarrier::Register { storage }),
+        CallBoundarySlot::Stack(_) => None,
     }
-    let Some(value) = graph.value_id_for_var(value_var) else {
-        return;
-    };
-    returns_by_inst.insert(at, returns.len());
-    returns.push(ReturnValueCertificate {
-        at,
-        block_addr,
-        op_index: op_idx,
-        value,
-        width: value_var.size,
-        carrier: return_carrier_for_value(value_var),
-    });
-}
-
-fn push_return_value_certificate_for_value(
-    graph: &SsaGraph,
-    returns: &mut Vec<ReturnValueCertificate>,
-    returns_by_inst: &mut BTreeMap<InstId, usize>,
-    block_addr: u64,
-    op_idx: usize,
-    value: ValueId,
-) {
-    let Some(at) = graph.inst_id_for_op_site(block_addr, op_idx) else {
-        return;
-    };
-    if returns_by_inst.contains_key(&at) {
-        return;
-    }
-    let Some(value_var) = graph.value(value).map(|value| &value.var) else {
-        return;
-    };
-    returns_by_inst.insert(at, returns.len());
-    returns.push(ReturnValueCertificate {
-        at,
-        block_addr,
-        op_index: op_idx,
-        value,
-        width: value_var.size,
-        carrier: return_carrier_for_value(value_var),
-    });
-}
-
-fn return_carrier_for_value(value: &SSAVar) -> Option<ReturnCarrier> {
-    if is_return_value_register(value) {
-        return Some(ReturnCarrier::Register {
-            name: value.name.clone(),
-        });
-    }
-    None
-}
-
-fn is_return_value_register(value: &SSAVar) -> bool {
-    if !value.is_register() {
-        return false;
-    }
-    let name = value
-        .name
-        .trim()
-        .trim_start_matches('$')
-        .to_ascii_lowercase();
-    matches!(
-        name.as_str(),
-        "rax" | "eax" | "ax" | "al" | "xmm0" | "st0" | "x0" | "w0" | "r0" | "v0" | "a0" | "r3"
-    )
-}
-
-fn is_control_return_target(value: &SSAVar) -> bool {
-    if !value.is_register() {
-        return false;
-    }
-    let name = value
-        .name
-        .trim()
-        .trim_start_matches('$')
-        .to_ascii_lowercase();
-    matches!(name.as_str(), "pc" | "lr" | "ra" | "x30" | "rip" | "eip")
 }
 
 fn collect_structured_loop_facts(
@@ -7767,11 +7247,12 @@ fn const_value(var: &SSAVar) -> Option<u64> {
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
 
-    use super::unique_return_value_phi_for_block;
     use super::{
-        ControlGuard, GlobalObjectKey, MemoryDefFact, MemoryLocation, MemorySSAFacts,
-        MemoryUseFact, MemoryVersion, ObjectFact, ObjectId, ObjectKind, ObjectModel,
-        ObjectModelBuilder, ObjectSpaceId, RelativeMemoryAddress, StructuredAccessId,
+        CallBoundarySlot, ControlGuard, GlobalObjectKey, MemoryDefFact, MemoryLocation,
+        MemorySSAFacts, MemoryUseFact, MemoryVersion, ObjectFact, ObjectId, ObjectKind,
+        ObjectModel, ObjectModelBuilder, ObjectSpaceId, RelativeMemoryAddress, ReturnCarrier,
+        SOURCE_RETURN_REGISTER_COMPOSITION_SCHEMA_VERSION, SourceReturnRegisterCompositionFact,
+        SourceReturnRegisterDefinitionFact, StackReloadSourceCertificate, StructuredAccessId,
         memory_locations_may_alias,
     };
     use crate::{
@@ -8074,7 +7555,7 @@ mod tests {
         );
         let facts = artifact.facts();
         let certificates = super::collect_prepared_function_certificates(
-            None,
+            &facts.boundaries,
             artifact.function(),
             artifact.graph(),
             &objects,
@@ -8117,7 +7598,7 @@ mod tests {
             &access,
         ));
         let certificates = super::collect_prepared_function_certificates(
-            None,
+            &facts.boundaries,
             artifact.function(),
             artifact.graph(),
             &mismatched_objects,
@@ -9000,6 +8481,177 @@ mod tests {
         .expect("typed return-address and stack-pointer roles")
     }
 
+    fn complete_return_interface(return_kind: SourceFunctionReturn) -> SourceFunctionInterface {
+        SourceFunctionInterface::new_exact(
+            b"complete-return-certificate-revision-1".to_vec(),
+            "test-register-abi",
+            [],
+            return_kind,
+            [],
+        )
+        .and_then(|interface| interface.with_return_address_storage(register_storage(16, 8)))
+        .and_then(|interface| interface.with_stack_pointer_storage(register_storage(32, 8)))
+        .expect("complete return interface")
+    }
+
+    fn complete_return_artifact(return_kind: SourceFunctionReturn) -> SsaArtifact {
+        let mut block = R2ILBlock::new(0x2f00, 4);
+        block.push(R2ILOp::Copy {
+            dst: Varnode::register(0, 8),
+            src: Varnode::constant(7, 8),
+        });
+        block.push(R2ILOp::Return {
+            target: Varnode::register(16, 8),
+        });
+        SsaArtifact::for_decompile_with_interface(
+            &[block],
+            Some(&return_boundary_arch()),
+            complete_return_interface(return_kind),
+        )
+        .expect("complete return artifact")
+    }
+
+    #[test]
+    fn return_certificate_requires_one_complete_source_boundary_value() {
+        let storage = register_storage(0, 8);
+        let artifact = complete_return_artifact(SourceFunctionReturn::Register { storage });
+        let boundary = artifact
+            .facts()
+            .boundaries
+            .returns
+            .values()
+            .next()
+            .expect("return boundary");
+        assert!(boundary.complete);
+        assert!(boundary.register_compositions.is_empty());
+        let [boundary_value] = boundary.values.as_slice() else {
+            panic!("complete register return must expose one value")
+        };
+        let (block_addr, op_index) = artifact
+            .graph()
+            .op_site_for_inst(boundary.at)
+            .expect("return op site");
+        let certificate = artifact
+            .return_certificate_for_op(block_addr, op_index)
+            .expect("complete boundary value certificate");
+        assert_eq!(certificate.at, boundary.at);
+        assert_eq!(certificate.value, boundary_value.value);
+        assert_eq!(certificate.width, 8);
+        assert_eq!(
+            certificate.carrier,
+            Some(ReturnCarrier::Register { storage })
+        );
+
+        let mut ambiguous = artifact.facts().boundaries.clone();
+        ambiguous
+            .returns
+            .get_mut(&boundary.at)
+            .expect("return boundary")
+            .values
+            .push(*boundary_value);
+        let (certificates, by_inst) = super::collect_return_value_certificates(
+            &ambiguous,
+            artifact.graph(),
+            &artifact.certificates().stack_reloads,
+        );
+        assert!(certificates.is_empty());
+        assert!(by_inst.is_empty());
+
+        let mut composed = artifact.facts().boundaries.clone();
+        let producer = artifact
+            .graph()
+            .def_inst(boundary_value.value)
+            .expect("returned value producer");
+        composed
+            .returns
+            .get_mut(&boundary.at)
+            .expect("return boundary")
+            .register_compositions
+            .push(SourceReturnRegisterCompositionFact {
+                schema_version: SOURCE_RETURN_REGISTER_COMPOSITION_SCHEMA_VERSION,
+                slot: boundary_value.slot,
+                base: SourceReturnRegisterDefinitionFact {
+                    storage,
+                    value: boundary_value.value,
+                    producer,
+                },
+                overlays: Vec::new(),
+            });
+        let (certificates, by_inst) = super::collect_return_value_certificates(
+            &composed,
+            artifact.graph(),
+            &artifact.certificates().stack_reloads,
+        );
+        assert!(certificates.is_empty());
+        assert!(by_inst.is_empty());
+    }
+
+    #[test]
+    fn complete_void_boundary_owns_no_return_value_certificate() {
+        let artifact = complete_return_artifact(SourceFunctionReturn::Void);
+        let boundary = artifact
+            .facts()
+            .boundaries
+            .returns
+            .values()
+            .next()
+            .expect("return boundary");
+        assert!(boundary.complete);
+        assert!(boundary.values.is_empty());
+        assert!(artifact.certificates().returns.is_empty());
+    }
+
+    #[test]
+    fn stack_return_carrier_requires_stack_reload_certificate() {
+        let storage = register_storage(0, 8);
+        let artifact = complete_return_artifact(SourceFunctionReturn::Register { storage });
+        let boundary = artifact
+            .facts()
+            .boundaries
+            .returns
+            .values()
+            .next()
+            .expect("return boundary");
+        let mut value = boundary.values[0];
+        value.slot = CallBoundarySlot::Stack(-8);
+        assert_eq!(
+            super::return_carrier_for_boundary_value(&value, &BTreeMap::new()),
+            None
+        );
+
+        let access = StructuredAccessId {
+            inst: boundary.at,
+            ordinal: 0,
+        };
+        let object = ObjectId(7);
+        let reload = StackReloadSourceCertificate {
+            value: value.value,
+            reload: value.value,
+            source: value.value,
+            canonical_source: value.value,
+            object,
+            base: StackAddressBase::StackPointer,
+            offset: -8,
+            value_width: 8,
+            memory_width: 8,
+            store_access: access,
+            load_access: access,
+            store_inst: boundary.at,
+            load_inst: boundary.at,
+        };
+        assert_eq!(
+            super::return_carrier_for_boundary_value(
+                &value,
+                &BTreeMap::from([(value.value, reload)]),
+            ),
+            Some(ReturnCarrier::StackSlot {
+                object,
+                offset: -8,
+                memory_access: Some(access),
+            })
+        );
+    }
+
     fn composed_return_arch(whole_name: &str, slice_name: &str, pc_name: &str) -> ArchSpec {
         let mut arch = ArchSpec::new("return-composition-test");
         arch.add_register(RegisterDef::new(whole_name, 0, 4));
@@ -9792,102 +9444,5 @@ mod tests {
             .expect("merge domain");
         assert!(merge.complete);
         assert!(merge.guards.is_empty());
-    }
-    /// A machine whose convention leaves its result in RAX, so a phi picker can
-    /// ask which location that is instead of matching a register spelling.
-    fn machine_returning_in_rax() -> crate::machine_context::SourceMachineContext {
-        use r2il::{AddressSpace, ArchSpec, RegisterDef};
-        let mut arch = ArchSpec::new("return-location-test");
-        arch.addr_size = 8;
-        arch.alignment = 1;
-        arch.add_space(AddressSpace::ram(8));
-        arch.add_register(RegisterDef::new("RAX", 0, 8));
-        arch.add_register(RegisterDef::new("EAX", 0, 4));
-        arch.add_register(RegisterDef::new("RCX", 8, 8));
-        arch.add_register(RegisterDef::new("RDX", 16, 8));
-        arch.add_register(RegisterDef::new("XMM0", 24, 16));
-        let rax = r2source::CanonicalStorageId {
-            space: r2source::CanonicalStorageSpace::Register,
-            offset: 0,
-            size: 8,
-        };
-        let slots = r2source::SourceConventionSlots::new("test", [], Some(rax))
-            .expect("result slot");
-        crate::machine_context::SourceMachineContext::from_blocks_with_interfaces(
-            &[],
-            Some(&arch),
-            None,
-            r2source::SourceMachineRoles::default(),
-            Some(slots),
-            Vec::new(),
-        )
-    }
-
-    fn phi_of(name: &str, size: u32) -> crate::function::PhiNode {
-        crate::function::PhiNode {
-            dst: SSAVar::new(name, 1, size),
-            sources: Vec::new(),
-            canonical_storage: None,
-        }
-    }
-
-    fn block_with_phis(phis: Vec<crate::function::PhiNode>) -> crate::function::SSABlock {
-        crate::function::SSABlock {
-            addr: 0x1000,
-            size: 0,
-            ops: Vec::new(),
-            phis,
-        }
-    }
-
-    #[test]
-    fn two_widths_of_one_return_register_are_one_candidate() {
-        let machine = machine_returning_in_rax();
-        // An exit block merges both RAX and EAX because the lifter keeps them as
-        // separate storage. They are one register, so the widest carries the value.
-        let block = block_with_phis(vec![phi_of("EAX", 4), phi_of("RAX", 8)]);
-        let chosen = unique_return_value_phi_for_block(Some(&machine), &block).expect("one candidate");
-        assert_eq!(chosen.name, "RAX");
-        assert_eq!(chosen.size, 8);
-    }
-
-    #[test]
-    fn one_return_register_on_its_own_is_still_chosen() {
-        let machine = machine_returning_in_rax();
-        let block = block_with_phis(vec![phi_of("EAX", 4)]);
-        assert_eq!(
-            unique_return_value_phi_for_block(Some(&machine), &block).map(|var| var.name.as_str()),
-            Some("EAX")
-        );
-    }
-
-    #[test]
-    fn a_register_the_convention_does_not_return_in_is_not_a_candidate() {
-        let machine = machine_returning_in_rax();
-        // The old rule had a table of return-register spellings and refused
-        // when two of them merged, because it had no way to say which one the
-        // convention returns in. The convention says, so XMM0 is simply not a
-        // candidate here.
-        let block = block_with_phis(vec![phi_of("RAX", 8), phi_of("XMM0", 16)]);
-        assert_eq!(
-            unique_return_value_phi_for_block(Some(&machine), &block).map(|var| var.name.as_str()),
-            Some("RAX")
-        );
-    }
-
-    #[test]
-    fn two_equal_width_writes_to_the_result_location_are_two_answers() {
-        let machine = machine_returning_in_rax();
-        // One location, two writes of the same width: nothing here can say
-        // which of them the function answers with.
-        let block = block_with_phis(vec![phi_of("RAX", 8), phi_of("RAX", 8)]);
-        assert_eq!(unique_return_value_phi_for_block(Some(&machine), &block), None);
-    }
-
-    #[test]
-    fn a_block_merging_no_return_register_offers_nothing() {
-        let machine = machine_returning_in_rax();
-        let block = block_with_phis(vec![phi_of("RCX", 8), phi_of("RDX", 8)]);
-        assert_eq!(unique_return_value_phi_for_block(Some(&machine), &block), None);
     }
 }
