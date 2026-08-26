@@ -402,13 +402,6 @@ mod tests {
             PlannedValueSymbol::Absent
         );
 
-        let obligation = *source
-            .source()
-            .obligations()
-            .obligations()
-            .keys()
-            .next()
-            .expect("semantic obligation");
         let mut elided_plan = plan.clone();
         elided_plan.replace_value_disposition_for_shadow_test(
             bound.0,
@@ -416,7 +409,7 @@ mod tests {
                 reason: r2ssa::ledger::ElisionReason::DeadUnusedTemporary,
                 proof: crate::binding_plan::DeadValueProof {
                     authority: source.source().authority().clone(),
-                    obligation,
+                    value: bound.0,
                 },
             },
         );

@@ -88,7 +88,7 @@ fn matching_value_cells(
                     binding: LegacyBindingId(binding.index() as u32 + class_bias),
                 },
                 ValueDisposition::Inline { .. } => LegacyValueObservation::InlineConstant,
-                ValueDisposition::Elided { .. } => LegacyValueObservation::Elided,
+                ValueDisposition::Elided { reason, .. } => LegacyValueObservation::Elided(*reason),
                 ValueDisposition::Refused { reason } => LegacyValueObservation::Refused(*reason),
             };
             LegacyValueCell {

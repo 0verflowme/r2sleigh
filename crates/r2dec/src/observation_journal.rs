@@ -255,6 +255,9 @@ fn binding_plan_failure(error: &BindingPlanSourceMismatch) -> BindingObservation
         BindingPlanSourceMismatch::InvalidLiteralInline { value } => {
             BindingObservationJournalFailure::BindingPlanInvalidLiteralInline { value: *value }
         }
+        BindingPlanSourceMismatch::InvalidElisionProof { value } => {
+            BindingObservationJournalFailure::BindingPlanInvalidElisionProof { value: *value }
+        }
         BindingPlanSourceMismatch::UnexpectedValueDisposition { value } => {
             BindingObservationJournalFailure::BindingPlanUnexpectedValueDisposition {
                 value: *value,
@@ -747,7 +750,7 @@ impl LegacyObservationJournal {
             writes,
             targets: Vec::new(),
         };
-        journal.record_upstream_nonrendered_dispositions()?;
+        journal.record_upstream_nonrendered_dispositions(source, origins)?;
         Ok(journal)
     }
 
@@ -756,7 +759,10 @@ impl LegacyObservationJournal {
     /// absent until a marker actually survives final emission.
     fn record_upstream_nonrendered_dispositions(
         &mut self,
+        source: &SourceOwnedFunctionFacts,
+        origins: &NormalizationOrigins,
     ) -> Result<(), LegacyObservationJournalError> {
+        let graph = source.source().graph();
         let nonrendered_values = (0..self.values.len())
             .filter_map(|index| {
                 let value = ValueId(index as u32);
@@ -767,6 +773,38 @@ impl LegacyObservationJournal {
                 .then_some(value)
             })
             .collect::<Vec<_>>();
+        let mut elided_uses =
+            std::collections::BTreeMap::<UseSite, r2ssa::ledger::ElisionReason>::new();
+        let mut elided_writes =
+            std::collections::BTreeMap::<InstId, r2ssa::ledger::ElisionReason>::new();
+        for value in source.source().unobserved_merges().iter() {
+            let Some(inst) = graph.def_inst(value) else {
+                return Err(LegacyObservationJournalError::InvalidValue(value));
+            };
+            let Some(definition) = graph.inst(inst) else {
+                return Err(LegacyObservationJournalError::InvalidWrite(inst));
+            };
+            if !matches!(definition.payload, r2ssa::InstPayload::Phi { .. })
+                || definition.output != Some(value)
+            {
+                return Err(LegacyObservationJournalError::InvalidWrite(inst));
+            }
+            elided_writes.insert(inst, r2ssa::ledger::ElisionReason::UnobservedMerge);
+            for input_idx in 0..definition.inputs.len() {
+                elided_uses.insert(
+                    UseSite { inst, input_idx },
+                    r2ssa::ledger::ElisionReason::UnobservedMerge,
+                );
+            }
+        }
+        for site in origins.noop_sites() {
+            match elided_uses
+                .insert(site, r2ssa::ledger::ElisionReason::RedundantPhiEdge)
+            {
+                Some(r2ssa::ledger::ElisionReason::RedundantPhiEdge) | None => {}
+                Some(_) => return Err(LegacyObservationJournalError::ConflictingUse(site)),
+            }
+        }
         let refused_uses = self
             .plan
             .machine_projection()
@@ -796,6 +834,16 @@ impl LegacyObservationJournal {
 
         for value in nonrendered_values {
             self.record_nonrendered_value(value)?;
+        }
+        for (site, reason) in elided_uses {
+            let slot = self.use_slot_mut(site)?;
+            record_same(slot, LegacyUseObservation::Elided(reason))
+                .map_err(|()| LegacyObservationJournalError::ConflictingUse(site))?;
+        }
+        for (inst, reason) in elided_writes {
+            let slot = self.write_slot_mut(inst)?;
+            record_same(slot, LegacyWriteObservation::Elided(reason))
+                .map_err(|()| LegacyObservationJournalError::ConflictingWrite(inst))?;
         }
         for site in refused_uses {
             self.record_refused_use(site)?;
@@ -968,7 +1016,9 @@ impl LegacyObservationJournal {
         value: ValueId,
     ) -> Result<(), LegacyObservationJournalError> {
         let observation = match self.plan.disposition(value) {
-            Some(ValueDisposition::Elided { .. }) => LegacyValueObservation::Elided,
+            Some(ValueDisposition::Elided { reason, .. }) => {
+                LegacyValueObservation::Elided(*reason)
+            }
             Some(ValueDisposition::Refused { reason }) => LegacyValueObservation::Refused(*reason),
             Some(ValueDisposition::Bound { .. } | ValueDisposition::Inline { .. }) | None => {
                 return Err(LegacyObservationJournalError::RenderedValueRequired(value));
@@ -1146,7 +1196,7 @@ impl LegacyObservationJournal {
         let value_justified_elision = self
             .values
             .iter()
-            .filter(|cell| matches!(cell, Some(LegacyValueObservation::Elided)))
+            .filter(|cell| matches!(cell, Some(LegacyValueObservation::Elided(_))))
             .count();
         let value_refused = self
             .values
@@ -1167,6 +1217,12 @@ impl LegacyObservationJournal {
             .iter()
             .flat_map(|row| row.iter())
             .filter(|cell| matches!(cell, Some(LegacyUseObservation::Refused(_))))
+            .count();
+        let use_justified_elision = self
+            .uses
+            .iter()
+            .flat_map(|row| row.iter())
+            .filter(|cell| matches!(cell, Some(LegacyUseObservation::Elided(_))))
             .count();
         let use_unaccounted = self
             .uses
@@ -1196,6 +1252,14 @@ impl LegacyObservationJournal {
                 **has_output && matches!(cell, Some(LegacyWriteObservation::Refused(_)))
             })
             .count();
+        let write_justified_elision = self
+            .writes
+            .iter()
+            .zip(self.write_has_output.iter())
+            .filter(|(cell, has_output)| {
+                **has_output && matches!(cell, Some(LegacyWriteObservation::Elided(_)))
+            })
+            .count();
         let write_unaccounted = self
             .writes
             .iter()
@@ -1214,14 +1278,14 @@ impl LegacyObservationJournal {
             uses: LegacyObservationDomainCoverage::from_counts(
                 use_total,
                 use_rendered,
-                0,
+                use_justified_elision,
                 use_refused,
                 use_unaccounted,
             ),
             writes: LegacyObservationDomainCoverage::from_counts(
                 write_total,
                 write_rendered,
-                0,
+                write_justified_elision,
                 write_refused,
                 write_unaccounted,
             ),
@@ -1535,6 +1599,10 @@ mod tests {
         block.push(R2ILOp::Return {
             target: Varnode::unique(0x20, 8),
         });
+        source_owned_from_blocks(&[block])
+    }
+
+    fn source_owned_from_blocks(blocks: &[R2ILBlock]) -> SourceOwnedFunctionFacts {
         let mut arch = ArchSpec::new("x86-64");
         arch.add_space(AddressSpace::ram(8));
         arch.add_register(RegisterDef::new("RAX", 0, 8));
@@ -1571,7 +1639,7 @@ mod tests {
         .and_then(|interface| interface.with_stack_pointer_storage(storage(0x28)))
         .expect("exact test source interface");
         let source = Arc::new(
-            SsaArtifact::for_decompile_with_interface(&[block], Some(&arch), interface)
+            SsaArtifact::for_decompile_with_interface(blocks, Some(&arch), interface)
                 .expect("test SSA artifact"),
         );
         let request = r2types::TypeWritebackAnalysisRequest::new(
@@ -1622,6 +1690,186 @@ mod tests {
                 _ => None,
             })
             .expect("fixture has a bound value")
+    }
+
+    #[test]
+    fn source_certified_dead_phi_accounts_for_value_edges_and_write() {
+        let mut entry = R2ILBlock::new(0x1000, 4);
+        entry.push(R2ILOp::CBranch {
+            cond: Varnode::constant(1, 1),
+            target: Varnode::constant(0x1008, 8),
+        });
+        let mut left = R2ILBlock::new(0x1004, 4);
+        left.push(R2ILOp::Copy {
+            dst: Varnode::unique(0x90, 8),
+            src: Varnode::constant(11, 8),
+        });
+        left.push(R2ILOp::Branch {
+            target: Varnode::constant(0x100c, 8),
+        });
+        let mut right = R2ILBlock::new(0x1008, 4);
+        right.push(R2ILOp::Copy {
+            dst: Varnode::unique(0x90, 8),
+            src: Varnode::constant(12, 8),
+        });
+        right.push(R2ILOp::Branch {
+            target: Varnode::constant(0x100c, 8),
+        });
+        let mut join = R2ILBlock::new(0x100c, 4);
+        join.push(R2ILOp::Return {
+            target: Varnode::register(0x30, 8),
+        });
+        let source = source_owned_from_blocks(&[entry, left, right, join]);
+        let dead = source
+            .source()
+            .unobserved_merges()
+            .iter()
+            .find(|value| {
+                source.source().graph().value(*value).is_some_and(|value| {
+                    value.canonical_storage.is_some_and(|storage| {
+                        storage.space == CanonicalStorageSpace::Unique
+                            && storage.offset == 0x90
+                            && storage.size == 8
+                    })
+                })
+            })
+            .expect("unused unique-space merge");
+        let definition = source
+            .source()
+            .graph()
+            .def_inst(dead)
+            .expect("dead merge definition");
+        let input_count = source
+            .source()
+            .graph()
+            .inst(definition)
+            .expect("dead merge instruction")
+            .inputs
+            .len();
+        let plan = Rc::new(BindingPlan::build_shadow(&source).expect("dead-merge-aware plan"));
+        let function = CFunction::new("dead_phi", CType::Void);
+        let normalized = source.source().function().clone();
+        let origins = NormalizationOrigins::for_unchanged(&normalized, source.source());
+        let journal = LegacyObservationJournal::new(
+            &source,
+            &normalized,
+            &origins,
+            plan,
+            Rc::clone(&function.symbols),
+        )
+        .expect("journal seeds exact dead-phi cells");
+        let mut ready = crate::codegen::prepare_function_for_emission(&function);
+        let sealed = journal
+            .seal(&source, &mut ready)
+            .expect("empty output keeps certified elisions");
+
+        assert_eq!(
+            sealed.snapshot().value_observation(dead),
+            Some(LegacyValueObservation::Elided(
+                r2ssa::ledger::ElisionReason::UnobservedMerge
+            ))
+        );
+        for input_idx in 0..input_count {
+            assert_eq!(
+                sealed.snapshot().use_observation(UseSite {
+                    inst: definition,
+                    input_idx,
+                }),
+                Some(LegacyUseObservation::Elided(
+                    r2ssa::ledger::ElisionReason::UnobservedMerge
+                ))
+            );
+        }
+        assert_eq!(
+            sealed.snapshot().write_observation(definition),
+            Some(LegacyWriteObservation::Elided(
+                r2ssa::ledger::ElisionReason::UnobservedMerge
+            ))
+        );
+        assert!(sealed.coverage().equations_hold());
+        assert!(sealed.coverage().values.justified_elision >= 1);
+        assert!(sealed.coverage().uses.justified_elision >= input_count);
+        assert!(sealed.coverage().writes.justified_elision >= 1);
+    }
+
+    #[test]
+    fn normalized_identity_phi_edge_is_a_precise_elision_not_an_absence() {
+        let mut entry = R2ILBlock::new(0x2000, 4);
+        entry.push(R2ILOp::Copy {
+            dst: Varnode::register(0, 8),
+            src: Varnode::constant(1, 8),
+        });
+        entry.push(R2ILOp::Branch {
+            target: Varnode::constant(0x2004, 8),
+        });
+        let mut header = R2ILBlock::new(0x2004, 4);
+        header.push(R2ILOp::CBranch {
+            cond: Varnode::constant(1, 1),
+            target: Varnode::constant(0x2014, 8),
+        });
+        let mut choose_latch = R2ILBlock::new(0x2008, 4);
+        choose_latch.push(R2ILOp::CBranch {
+            cond: Varnode::constant(1, 1),
+            target: Varnode::constant(0x2010, 8),
+        });
+        let mut identity_latch = R2ILBlock::new(0x200c, 4);
+        identity_latch.push(R2ILOp::Branch {
+            target: Varnode::constant(0x2004, 8),
+        });
+        let mut update_latch = R2ILBlock::new(0x2010, 4);
+        update_latch.push(R2ILOp::IntAdd {
+            dst: Varnode::register(0, 8),
+            a: Varnode::register(0, 8),
+            b: Varnode::constant(1, 8),
+        });
+        update_latch.push(R2ILOp::Branch {
+            target: Varnode::constant(0x2004, 8),
+        });
+        let mut exit = R2ILBlock::new(0x2014, 4);
+        exit.push(R2ILOp::Return {
+            target: Varnode::register(0x30, 8),
+        });
+        let source = source_owned_from_blocks(&[
+            entry,
+            header,
+            choose_latch,
+            identity_latch,
+            update_latch,
+            exit,
+        ]);
+        let render = source.report().render().expect("render facts");
+        let (normalized, origins) = crate::normalize::materialize_certified_loop_carriers(
+            source.source().function(),
+            source.source(),
+            render,
+        )
+        .expect("certified carrier normalization");
+        let noop_sites = origins.noop_sites().collect::<Vec<_>>();
+        assert_eq!(noop_sites.len(), 1, "self-carried edge is the sole no-op");
+
+        let plan = Rc::new(BindingPlan::build_shadow(&source).expect("sealed plan"));
+        let function = CFunction::new("identity_phi", CType::Void);
+        let journal = LegacyObservationJournal::new(
+            &source,
+            &normalized,
+            &origins,
+            plan,
+            Rc::clone(&function.symbols),
+        )
+        .expect("normalization-backed journal");
+        let mut ready = crate::codegen::prepare_function_for_emission(&function);
+        let sealed = journal
+            .seal(&source, &mut ready)
+            .expect("no-op certificate survives sealing");
+
+        assert_eq!(
+            sealed.snapshot().use_observation(noop_sites[0]),
+            Some(LegacyUseObservation::Elided(
+                r2ssa::ledger::ElisionReason::RedundantPhiEdge
+            ))
+        );
+        assert!(sealed.coverage().equations_hold());
+        assert!(sealed.coverage().uses.justified_elision >= 1);
     }
 
     fn first_bound_rendered_input(

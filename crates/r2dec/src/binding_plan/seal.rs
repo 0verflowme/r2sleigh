@@ -12,10 +12,11 @@ pub(super) fn seal_binding_components(
     let source = source_owned.source();
     let graph = source.graph();
     let value_count = graph.values.len();
+    let unobserved_merges = source.unobserved_merges();
     let eligible = graph
         .values
         .iter()
-        .map(|value| value.var.constant_bits().is_none())
+        .map(|value| value.var.constant_bits().is_none() && !unobserved_merges.contains(value.id))
         .collect::<Vec<_>>();
     let mut members_by_source = BTreeMap::<BindingCertificateSource, BTreeSet<ValueId>>::new();
 
@@ -244,6 +245,12 @@ pub(crate) fn build_upstream_shadow_oracle(
         .collect::<BTreeSet<_>>();
     let mut values = vec![None; graph.values.len()];
     for graph_value in &graph.values {
+        if source.unobserved_merges().contains(graph_value.id) {
+            values[graph_value.id.0 as usize] = Some(UpstreamValueDisposition::Elided(
+                r2ssa::ledger::ElisionReason::UnobservedMerge,
+            ));
+            continue;
+        }
         if graph_value.var.constant_bits().is_none() {
             continue;
         }
@@ -316,6 +323,7 @@ impl BindingPlan {
         }
 
         let expected = seal_binding_components(source_owned)?;
+        let unobserved_merges = source.unobserved_merges();
         for (index, graph_value) in graph.values.iter().enumerate() {
             if graph_value.id.0 as usize != index {
                 return Err(BindingPlanBuildError::Seal(
@@ -397,8 +405,20 @@ impl BindingPlan {
                 ValueDisposition::Refused {
                     reason: ValueRefusal::MissingLiteralProjection { value: refused },
                 } if *refused == value && graph_value.var.constant_bits().is_some() => {}
-                ValueDisposition::Refused { .. } if graph_value.var.constant_bits().is_none() => {}
-                ValueDisposition::Refused { .. } | ValueDisposition::Elided { .. } => {
+                ValueDisposition::Refused { .. }
+                    if graph_value.var.constant_bits().is_none()
+                        && !unobserved_merges.contains(value) => {}
+                ValueDisposition::Elided { reason, proof }
+                    if *reason == r2ssa::ledger::ElisionReason::UnobservedMerge
+                        && proof.authority == *source.authority()
+                        && proof.value == value
+                        && unobserved_merges.contains(value) => {}
+                ValueDisposition::Elided { .. } => {
+                    return Err(BindingPlanBuildError::Seal(
+                        BindingPlanSourceMismatch::InvalidElisionProof { value },
+                    ));
+                }
+                ValueDisposition::Refused { .. } => {
                     return Err(BindingPlanBuildError::Seal(
                         BindingPlanSourceMismatch::UnexpectedValueDisposition { value },
                     ));

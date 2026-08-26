@@ -16,8 +16,8 @@ use crate::ast::CType;
 use r2ssa::span::SpanId;
 use r2ssa::{
     InstId, MachineExprId, MachineExprKind, MachineProjection, MachineUseDisposition,
-    MachineWriteDisposition, MachineWriteProjection, SemanticId, SemanticObligationId,
-    SsaArtifactAuthority, UseSite, ValueId,
+    MachineWriteDisposition, MachineWriteProjection, SemanticId, SsaArtifactAuthority, UseSite,
+    ValueId,
 };
 use r2types::SourceOwnedFunctionFacts;
 
@@ -74,7 +74,7 @@ pub(crate) struct InlineProof {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DeadValueProof {
     authority: SsaArtifactAuthority,
-    obligation: SemanticObligationId,
+    value: ValueId,
 }
 
 /// Typed reason that a value cannot be represented honestly.
@@ -169,6 +169,9 @@ pub(crate) enum BindingPlanSourceMismatch {
     InvalidLiteralInline {
         value: ValueId,
     },
+    InvalidElisionProof {
+        value: ValueId,
+    },
     UnexpectedValueDisposition {
         value: ValueId,
     },
@@ -240,6 +243,7 @@ impl CanonicalComponentId {
 pub(crate) enum UpstreamValueDisposition {
     Bound { component: CanonicalComponentId },
     InlineConstant,
+    Elided(r2ssa::ledger::ElisionReason),
     Refused(ValueRefusal),
 }
 

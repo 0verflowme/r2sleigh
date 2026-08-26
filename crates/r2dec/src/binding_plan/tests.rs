@@ -14,6 +14,10 @@ fn source_owned(ops: impl IntoIterator<Item = R2ILOp>) -> SourceOwnedFunctionFac
     for op in ops {
         block.push(op);
     }
+    source_owned_blocks(&[block])
+}
+
+fn source_owned_blocks(blocks: &[R2ILBlock]) -> SourceOwnedFunctionFacts {
     let mut arch = ArchSpec::new("x86-64");
     arch.add_space(AddressSpace::ram(8));
     arch.add_register(RegisterDef::new("RAX", 0, 8));
@@ -126,7 +130,7 @@ fn source_owned(ops: impl IntoIterator<Item = R2ILOp>) -> SourceOwnedFunctionFac
     .and_then(|interface| interface.with_stack_pointer_storage(storage(0x28)))
     .expect("exact test source interface");
     let source = Arc::new(
-        SsaArtifact::for_decompile_with_interface(&[block], Some(&arch), interface)
+        SsaArtifact::for_decompile_with_interface(blocks, Some(&arch), interface)
             .expect("test SSA artifact"),
     );
     let request = r2types::TypeWritebackAnalysisRequest::new(
@@ -197,6 +201,123 @@ fn shadow_plan_groups_spans_and_inlines_only_upstream_literals() {
     }
     assert_eq!(plan.validate_source(source), Ok(()));
     assert!(plan.validate_seal(&source_owned).is_ok());
+}
+
+#[test]
+fn unobserved_merge_is_elided_by_its_source_certificate_not_bound() {
+    let mut entry = R2ILBlock::new(0x1000, 4);
+    entry.push(R2ILOp::CBranch {
+        cond: Varnode::constant(1, 1),
+        target: Varnode::constant(0x1008, 8),
+    });
+    let mut left = R2ILBlock::new(0x1004, 4);
+    left.push(R2ILOp::Copy {
+        dst: Varnode::register(0, 8),
+        src: Varnode::constant(1, 8),
+    });
+    left.push(R2ILOp::Copy {
+        dst: Varnode::register(0x38, 8),
+        src: Varnode::constant(11, 8),
+    });
+    left.push(R2ILOp::Branch {
+        target: Varnode::constant(0x100c, 8),
+    });
+    let mut right = R2ILBlock::new(0x1008, 4);
+    right.push(R2ILOp::Copy {
+        dst: Varnode::register(0, 8),
+        src: Varnode::constant(2, 8),
+    });
+    right.push(R2ILOp::Copy {
+        dst: Varnode::register(0x38, 8),
+        src: Varnode::constant(12, 8),
+    });
+    right.push(R2ILOp::Branch {
+        target: Varnode::constant(0x100c, 8),
+    });
+    let mut join = R2ILBlock::new(0x100c, 4);
+    join.push(R2ILOp::Return {
+        target: Varnode::register(0x30, 8),
+    });
+
+    let source_owned = source_owned_blocks(&[entry, left, right, join]);
+    let source = source_owned.source();
+    let graph = source.graph();
+    let dead = source
+        .unobserved_merges()
+        .iter()
+        .find(|value| {
+            graph.value(*value).is_some_and(|value| {
+                value.canonical_storage.is_some_and(|storage| {
+                    storage.space == CanonicalStorageSpace::Register
+                        && storage.offset == 0x38
+                        && storage.size == 8
+                })
+            })
+        })
+        .expect("unused RDI merge has an upstream dead-phi certificate");
+    let live = graph
+        .insts
+        .iter()
+        .filter(|inst| matches!(inst.payload, r2ssa::InstPayload::Phi { .. }))
+        .filter_map(|inst| inst.output)
+        .find(|value| {
+            graph.value(*value).is_some_and(|value| {
+                value.canonical_storage.is_some_and(|storage| {
+                    storage.space == CanonicalStorageSpace::Register
+                        && storage.offset == 0
+                        && storage.size == 8
+                })
+            })
+        })
+        .expect("returned RAX merge");
+    assert!(!source.unobserved_merges().contains(live));
+
+    let plan = BindingPlan::build_shadow(&source_owned).expect("dead-merge-aware plan");
+    assert!(matches!(
+        plan.disposition(dead),
+        Some(ValueDisposition::Elided {
+            reason: r2ssa::ledger::ElisionReason::UnobservedMerge,
+            proof,
+        }) if proof.authority == *source.authority() && proof.value == dead
+    ));
+    assert!(matches!(
+        plan.disposition(live),
+        Some(ValueDisposition::Bound { .. })
+    ));
+    assert!(
+        binding_components(&source_owned)
+            .expect("construction components")
+            .iter()
+            .all(|component| !component.members.contains(&dead))
+    );
+    assert!(
+        seal_binding_components(&source_owned)
+            .expect("independent components")
+            .iter()
+            .all(|component| !component.members.contains(&dead))
+    );
+    let oracle = build_upstream_shadow_oracle(&source_owned).expect("upstream oracle");
+    assert_eq!(
+        oracle.value_disposition(dead),
+        Some(UpstreamValueDisposition::Elided(
+            r2ssa::ledger::ElisionReason::UnobservedMerge
+        ))
+    );
+
+    let mut forged = plan;
+    forged.dispositions[dead.0 as usize] = ValueDisposition::Elided {
+        reason: r2ssa::ledger::ElisionReason::UnobservedMerge,
+        proof: DeadValueProof {
+            authority: source.authority().clone(),
+            value: live,
+        },
+    };
+    assert_eq!(
+        forged.validate_seal(&source_owned),
+        Err(BindingPlanBuildError::Seal(
+            BindingPlanSourceMismatch::InvalidElisionProof { value: dead }
+        ))
+    );
 }
 
 #[test]

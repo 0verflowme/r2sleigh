@@ -1657,6 +1657,7 @@ fn binding_observation_journal_failure_json(
         }
         Failure::BindingPlanNonBoundValue { value }
         | Failure::BindingPlanInvalidLiteralInline { value }
+        | Failure::BindingPlanInvalidElisionProof { value }
         | Failure::BindingPlanUnexpectedValueDisposition { value } => {
             cause.insert("value_id".to_string(), serde_json::json!(value.0));
         }
@@ -3782,6 +3783,7 @@ mod tests {
             Failure::BindingPlanCertificateMembership { binding_index: 53 },
             Failure::BindingPlanDeclarationWidth { binding_index: 54 },
             Failure::BindingPlanInvalidLiteralInline { value },
+            Failure::BindingPlanInvalidElisionProof { value },
             Failure::BindingPlanUnexpectedValueDisposition { value },
             Failure::BindingPlanStackObjectCount {
                 expected: 55,
@@ -3851,7 +3853,7 @@ mod tests {
         ]);
         assert_eq!(
             cases.len(),
-            88,
+            89,
             "public journal wire-leaf inventory drifted"
         );
         cases
@@ -3897,7 +3899,7 @@ mod tests {
             }
             causes.push(expected_cause);
         }
-        assert_eq!(kinds.len(), 88);
+        assert_eq!(kinds.len(), 89);
 
         let checker = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../tests/corpus/check_binding_audit_schema.py");
@@ -3922,7 +3924,7 @@ mod tests {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
-        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "88");
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "89");
     }
 
     #[test]

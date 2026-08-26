@@ -148,6 +148,8 @@ pub struct SsaArtifact {
     function: SSAFunction,
     graph: SsaGraph,
     storage_spans: StorageSpans,
+    live_out: crate::liveout::FunctionLiveOut,
+    unobserved_merges: crate::deadphi::DeadPhis,
     mode: FunctionPrepareMode,
     facts: PreparedFunctionFacts,
     machine_context: SourceMachineContext,
@@ -290,6 +292,11 @@ impl SsaArtifact {
         machine_context.remap_memory_sites_to_prepared(&function);
         let graph = SsaGraph::from_function_with_storage(&function);
         let storage_spans = StorageSpans::compute(&function, &graph);
+        let live_out = match crate::abi::AbiProfile::from_machine_context(&machine_context) {
+            Some(abi) => crate::liveout::FunctionLiveOut::compute(&function, &graph, &abi),
+            None => crate::liveout::FunctionLiveOut::default(),
+        };
+        let unobserved_merges = crate::deadphi::DeadPhis::find(&function, &graph, &live_out);
         control.poll()?;
         let facts = PreparedFunctionFacts::collect_with_context(
             &function,
@@ -310,6 +317,8 @@ impl SsaArtifact {
             function,
             graph,
             storage_spans,
+            live_out,
+            unobserved_merges,
             mode,
             facts,
             machine_context,
@@ -713,18 +722,13 @@ impl SsaArtifact {
     /// Published rather than removed. Rules choosing among candidates should skip
     /// these; rules simulating machine state still need them, because a merge can
     /// be the only statement of what a register holds at a loop head.
-    pub fn unobserved_merges(&self) -> crate::deadphi::DeadPhis {
-        crate::deadphi::DeadPhis::find(&self.function, &self.graph, &self.live_out())
+    pub const fn unobserved_merges(&self) -> &crate::deadphi::DeadPhis {
+        &self.unobserved_merges
     }
 
     /// The values this function hands back, which have no reader inside it.
-    pub fn live_out(&self) -> crate::liveout::FunctionLiveOut {
-        match self.abi() {
-            Some(abi) => {
-                crate::liveout::FunctionLiveOut::compute(&self.function, &self.graph, &abi)
-            }
-            None => crate::liveout::FunctionLiveOut::default(),
-        }
+    pub const fn live_out(&self) -> &crate::liveout::FunctionLiveOut {
+        &self.live_out
     }
 
     pub fn graph(&self) -> &SsaGraph {
@@ -781,6 +785,8 @@ impl SsaArtifact {
             function: self.function.clone(),
             graph: self.graph.clone(),
             storage_spans: self.storage_spans.clone(),
+            live_out: self.live_out.clone(),
+            unobserved_merges: self.unobserved_merges.clone(),
             mode: self.mode,
             facts,
             machine_context: self.machine_context.clone(),

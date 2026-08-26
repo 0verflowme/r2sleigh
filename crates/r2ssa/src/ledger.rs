@@ -63,6 +63,9 @@ pub enum ElisionReason {
     DeadStackBase,
     /// A merge no observation depends on, so nothing reads what it decides.
     UnobservedMerge,
+    /// A removed merge input already names the merge result, so its edge copy
+    /// would be the identity assignment `x = x`.
+    RedundantPhiEdge,
     /// Proven dead, with no rule yet naming which kind of dead it is.
     DeadUnclassified,
 }
@@ -78,6 +81,7 @@ impl std::fmt::Display for ElisionReason {
             Self::DeadCallArgument => "dead-call-arg",
             Self::DeadStackBase => "dead-stack-base",
             Self::UnobservedMerge => "unobserved-merge",
+            Self::RedundantPhiEdge => "redundant-phi-edge",
             Self::DeadUnclassified => "dead-unclassified",
         })
     }

@@ -39,7 +39,7 @@ pub(crate) enum LegacyValueObservation {
     InlineConstant,
     /// A surviving expression that is not a source-backed literal proof.
     InlineNonLiteral,
-    Elided,
+    Elided(r2ssa::ledger::ElisionReason),
     Refused(ValueRefusal),
     LegacyAbsent,
 }
@@ -51,6 +51,7 @@ pub(crate) enum LegacyValueObservation {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LegacyUseObservation {
     Exact(MachineUseSlice),
+    Elided(r2ssa::ledger::ElisionReason),
     Refused(MachineUseRefusal),
     LegacyAbsent,
 }
@@ -61,6 +62,7 @@ pub(crate) enum LegacyUseObservation {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LegacyWriteObservation {
     Exact(MachineWriteProjection),
+    Elided(r2ssa::ledger::ElisionReason),
     Refused(MachineWriteRefusal),
     LegacyAbsent,
 }
@@ -190,6 +192,9 @@ pub(crate) enum ShadowEvidenceKey {
         component: CanonicalComponentId,
     },
     UpstreamLiteral {
+        value: ValueId,
+    },
+    UpstreamValueElision {
         value: ValueId,
     },
     UpstreamValueRefusal {

@@ -12,10 +12,11 @@ pub(super) fn binding_components(
     let source = source_owned.source();
     let graph = source.graph();
     let value_count = graph.values.len();
+    let unobserved_merges = source.unobserved_merges();
     let eligible = graph
         .values
         .iter()
-        .map(|value| value.var.constant_bits().is_none())
+        .map(|value| value.var.constant_bits().is_none() && !unobserved_merges.contains(value.id))
         .collect::<Vec<_>>();
     let mut parent = (0..value_count).collect::<Vec<_>>();
     let mut rank = vec![0_u8; value_count];
@@ -294,7 +295,15 @@ impl BindingPlan {
                     },
                 ));
             }
-            if graph_value.var.constant_bits().is_some() {
+            if source.unobserved_merges().contains(graph_value.id) {
+                dispositions[index] = ValueDisposition::Elided {
+                    reason: r2ssa::ledger::ElisionReason::UnobservedMerge,
+                    proof: DeadValueProof {
+                        authority: source.authority().clone(),
+                        value: graph_value.id,
+                    },
+                };
+            } else if graph_value.var.constant_bits().is_some() {
                 dispositions[index] = match literal_by_value.get(&graph_value.id).copied() {
                     Some(expr) => ValueDisposition::Inline {
                         expr,
@@ -309,7 +318,6 @@ impl BindingPlan {
                         },
                     },
                 };
-                continue;
             }
         }
 

@@ -1783,7 +1783,7 @@ fn build_obligation_ledger(
                         .get(&inst)
                         .is_some_and(|removed| removed.noop_sites().contains(&site)) =>
                 {
-                    Outcome::Elided(ElisionReason::DeadUnclassified)
+                    Outcome::Elided(ElisionReason::RedundantPhiEdge)
                 }
                 _ => Outcome::Refused {
                     layer: LedgerLayer::Fold,
@@ -1815,7 +1815,7 @@ fn build_obligation_ledger(
                                 op_idx: 0,
                             }
                         } else {
-                            Outcome::Elided(ElisionReason::DeadUnclassified)
+                            Outcome::Elided(ElisionReason::RedundantPhiEdge)
                         }
                     }
                     _ => Outcome::Refused {
@@ -1874,6 +1874,7 @@ fn elision_reason(reason: &str) -> r2ssa::ledger::ElisionReason {
         "dead-caller-saved" => ElisionReason::DeadCallerSaved,
         "dead-call-arg" => ElisionReason::DeadCallArgument,
         "dead-stack-base" => ElisionReason::DeadStackBase,
+        "redundant-phi-edge" => ElisionReason::RedundantPhiEdge,
         _ => ElisionReason::DeadUnclassified,
     }
 }
@@ -3032,6 +3033,7 @@ pub enum BindingObservationJournalFailure {
     BindingPlanCertificateMembership { binding_index: usize },
     BindingPlanDeclarationWidth { binding_index: usize },
     BindingPlanInvalidLiteralInline { value: r2ssa::ValueId },
+    BindingPlanInvalidElisionProof { value: r2ssa::ValueId },
     BindingPlanUnexpectedValueDisposition { value: r2ssa::ValueId },
     BindingPlanStackObjectCount { expected: usize, actual: usize },
     BindingPlanUnexpectedStackObjectDisposition { object: r2ssa::ObjectId },
@@ -3139,6 +3141,7 @@ impl BindingObservationJournalFailure {
             }
             Self::BindingPlanDeclarationWidth { .. } => "binding_plan_declaration_width",
             Self::BindingPlanInvalidLiteralInline { .. } => "binding_plan_invalid_literal_inline",
+            Self::BindingPlanInvalidElisionProof { .. } => "binding_plan_invalid_elision_proof",
             Self::BindingPlanUnexpectedValueDisposition { .. } => {
                 "binding_plan_unexpected_value_disposition"
             }

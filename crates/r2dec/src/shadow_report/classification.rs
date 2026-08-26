@@ -65,7 +65,7 @@ enum NormalizedValueObservation {
     Bound(ValueClassId),
     InlineConstant,
     InlineNonLiteral,
-    Elided,
+    Elided(r2ssa::ledger::ElisionReason),
     Refused(ValueRefusal),
     LegacyAbsent,
 }
@@ -73,6 +73,7 @@ enum NormalizedValueObservation {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NormalizedUseObservation {
     Exact(MachineUseSlice),
+    Elided(r2ssa::ledger::ElisionReason),
     Refused(MachineUseRefusal),
     LegacyAbsent,
 }
@@ -80,6 +81,7 @@ enum NormalizedUseObservation {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NormalizedWriteObservation {
     Exact(MachineWriteProjection),
+    Elided(r2ssa::ledger::ElisionReason),
     Refused(MachineWriteRefusal),
     LegacyAbsent,
 }
@@ -334,6 +336,7 @@ fn normalized_upstream_value(
             .map(NormalizedValueObservation::Bound)
             .ok_or(ShadowReportError::MissingCanonicalComponent { component }),
         UpstreamValueDisposition::InlineConstant => Ok(NormalizedValueObservation::InlineConstant),
+        UpstreamValueDisposition::Elided(reason) => Ok(NormalizedValueObservation::Elided(reason)),
         UpstreamValueDisposition::Refused(reason) => {
             Ok(NormalizedValueObservation::Refused(reason))
         }
@@ -356,7 +359,7 @@ fn normalized_candidate_value(
             .map(NormalizedValueObservation::Bound)
             .ok_or(ShadowReportError::InvalidPlanValue { value }),
         ValueDisposition::Inline { .. } => Ok(NormalizedValueObservation::InlineConstant),
-        ValueDisposition::Elided { .. } => Ok(NormalizedValueObservation::Elided),
+        ValueDisposition::Elided { reason, .. } => Ok(NormalizedValueObservation::Elided(*reason)),
         ValueDisposition::Refused { reason } => Ok(NormalizedValueObservation::Refused(*reason)),
     }
 }
@@ -376,7 +379,7 @@ fn normalized_legacy_value(
         LegacyValueObservation::InlineNonLiteral => {
             Ok(NormalizedValueObservation::InlineNonLiteral)
         }
-        LegacyValueObservation::Elided => Ok(NormalizedValueObservation::Elided),
+        LegacyValueObservation::Elided(reason) => Ok(NormalizedValueObservation::Elided(reason)),
         LegacyValueObservation::Refused(reason) => Ok(NormalizedValueObservation::Refused(reason)),
         LegacyValueObservation::LegacyAbsent => Ok(NormalizedValueObservation::LegacyAbsent),
     }
@@ -395,6 +398,9 @@ fn upstream_value_evidence(
         }
         UpstreamValueDisposition::InlineConstant => {
             Ok(ShadowEvidenceKey::UpstreamLiteral { value })
+        }
+        UpstreamValueDisposition::Elided(_) => {
+            Ok(ShadowEvidenceKey::UpstreamValueElision { value })
         }
         UpstreamValueDisposition::Refused(_) => {
             Ok(ShadowEvidenceKey::UpstreamValueRefusal { value })
@@ -438,6 +444,7 @@ fn normalized_machine_use(disposition: &MachineUseDisposition) -> NormalizedUseO
 fn normalized_legacy_use(observation: LegacyUseObservation) -> NormalizedUseObservation {
     match observation {
         LegacyUseObservation::Exact(slice) => NormalizedUseObservation::Exact(slice),
+        LegacyUseObservation::Elided(reason) => NormalizedUseObservation::Elided(reason),
         LegacyUseObservation::Refused(reason) => NormalizedUseObservation::Refused(reason),
         LegacyUseObservation::LegacyAbsent => NormalizedUseObservation::LegacyAbsent,
     }
@@ -473,6 +480,7 @@ fn normalized_machine_write(disposition: &MachineWriteDisposition) -> Normalized
 fn normalized_legacy_write(observation: LegacyWriteObservation) -> NormalizedWriteObservation {
     match observation {
         LegacyWriteObservation::Exact(write) => NormalizedWriteObservation::Exact(write),
+        LegacyWriteObservation::Elided(reason) => NormalizedWriteObservation::Elided(reason),
         LegacyWriteObservation::Refused(reason) => NormalizedWriteObservation::Refused(reason),
         LegacyWriteObservation::LegacyAbsent => NormalizedWriteObservation::LegacyAbsent,
     }

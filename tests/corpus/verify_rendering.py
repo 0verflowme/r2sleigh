@@ -154,6 +154,7 @@ BINDING_AUDIT_JOURNAL_CAUSE_FIELDS = {
     "binding_plan_certificate_membership": frozenset({"binding_index"}),
     "binding_plan_declaration_width": frozenset({"binding_index"}),
     "binding_plan_invalid_literal_inline": frozenset({"value_id"}),
+    "binding_plan_invalid_elision_proof": frozenset({"value_id"}),
     "binding_plan_unexpected_value_disposition": frozenset({"value_id"}),
     "binding_plan_stack_object_count": frozenset({"expected_count", "actual_count"}),
     "binding_plan_unexpected_stack_object_disposition": frozenset({"object_id"}),
