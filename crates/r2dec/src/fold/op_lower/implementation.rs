@@ -1351,11 +1351,6 @@ impl<'a> FoldingContext<'a> {
     pub(crate) fn analyze_function_structure(&mut self, func: &SSAFunction) {
         self.state.return_blocks.clear();
         self.state.return_stack_slots.clear();
-        self.state
-            .analysis_ctx
-            .semantic_mut()
-            .frame_slot_merges
-            .clear();
         // Find exit block (the block containing SSAOp::Return)
         for block in func.blocks() {
             for op in &block.ops {
@@ -1390,35 +1385,9 @@ impl<'a> FoldingContext<'a> {
                         pred,
                         exit_addr,
                         pure_control_exit,
-                        true,
                     )
                 {
                     self.state.return_blocks.insert(pred);
-                }
-            }
-
-            for block in func.blocks() {
-                // Skip the exit block itself
-                if block.addr == exit_addr {
-                    continue;
-                }
-
-                for op in &block.ops {
-                    if let SSAOp::Branch { target } = op {
-                        // Extract address from the target variable (e.g., "ram:401256_0")
-                        if let Some(addr) = self.extract_branch_target_address(target)
-                            && addr == exit_addr
-                            && self.block_is_exit_return_context(
-                                func,
-                                block.addr,
-                                exit_addr,
-                                pure_control_exit,
-                                false,
-                            )
-                        {
-                            self.state.return_blocks.insert(block.addr);
-                        }
-                    }
                 }
             }
 
@@ -1435,7 +1404,6 @@ impl<'a> FoldingContext<'a> {
                                 *src_addr,
                                 exit_addr,
                                 pure_control_exit,
-                                false,
                             )
                         {
                             self.state.return_blocks.insert(*src_addr);
@@ -1444,54 +1412,6 @@ impl<'a> FoldingContext<'a> {
                 }
             }
         }
-        let env = analysis::PassEnv {
-            binding_names: self.inputs.binding_names.map(std::rc::Rc::as_ref),
-            symbols: &self.symbols,
-            string_literals: self.inputs.display_names.strings(),
-            ptr_size: self.inputs.arch.ptr_size,
-            sp_name: &self.inputs.arch.sp_name,
-            fp_name: &self.inputs.arch.fp_name,
-            ret_reg_name: &self.inputs.arch.ret_reg_name,
-            flag_regs: &self.inputs.arch.flag_regs,
-            #[cfg(test)]
-            function_names: self.inputs.function_names,
-            #[cfg(test)]
-            strings: self.inputs.strings,
-            #[cfg(test)]
-            binary_symbols: self.inputs.binary_symbols,
-            callee_facts: self.inputs.callee_facts(),
-            callee_resolution: self.inputs.callee_resolution(),
-            summary_view: self.inputs.summary_view(),
-            arg_regs: &self.inputs.arch.arg_regs,
-            #[cfg(test)]
-            param_register_aliases: analysis::no_carrier_aliases(),
-            #[cfg(test)]
-            carrier_aliases: analysis::no_carrier_aliases(),
-            caller_saved_regs: &self.inputs.arch.caller_saved_regs,
-            type_oracle: self.inputs.type_oracle,
-        };
-        analysis::use_info::populate_frame_slot_merges(
-            &self.symbols,
-            self.state.analysis_ctx.semantic_mut(),
-            func,
-            &env,
-            self.inputs.prepared_ssa,
-        );
-        // Switch selectors come from the prepared artifact, which every
-        // decompile carries; recovering them from the blocks was the other
-        // builder's job.
-        self.state
-            .analysis_ctx
-            .semantic_mut()
-            .switch_selector_roots
-            .clear();
-        analysis::use_info::annotate_stack_slot_semantics(
-            &self.symbols,
-            self.state.analysis_ctx.semantic_mut(),
-            func,
-            &self.state.return_stack_slots,
-            &env,
-        );
         let filtered_return_stack_slots = self
             .state
             .return_stack_slots
@@ -1513,15 +1433,10 @@ impl<'a> FoldingContext<'a> {
         block_addr: u64,
         exit_addr: u64,
         pure_control_exit: bool,
-        edge_known: bool,
     ) -> bool {
         let Some(block) = func.get_block(block_addr) else {
             return false;
         };
-
-        if !edge_known && !self.block_can_reach_exit_via_terminator(block, exit_addr) {
-            return false;
-        }
 
         if self.block_has_non_exit_successor(func, block_addr, exit_addr) {
             return false;
@@ -1529,14 +1444,13 @@ impl<'a> FoldingContext<'a> {
 
         if !self.state.return_stack_slots.is_empty()
             && self
-                .return_stack_slot_written_before_exit(block, exit_addr, edge_known)
+                .return_stack_slot_written_before_exit(block)
                 .is_some_and(|slot| self.state.return_stack_slots.contains(&slot))
         {
             return true;
         }
 
-        pure_control_exit
-            && self.block_writes_return_register_before_exit(block, exit_addr, edge_known)
+        pure_control_exit && self.block_writes_return_register_before_exit(block)
     }
 
     fn block_has_non_exit_successor(
@@ -1550,40 +1464,15 @@ impl<'a> FoldingContext<'a> {
             .any(|succ| *succ != exit_addr)
     }
 
-    fn block_can_reach_exit_via_terminator(&self, block: &SSABlock, exit_addr: u64) -> bool {
-        block.ops.iter().rev().any(|op| match op {
-            SSAOp::Branch { target } | SSAOp::CBranch { target, .. } => {
-                self.extract_branch_target_address(target) == Some(exit_addr)
-            }
-            _ => false,
-        })
-    }
-
-    fn block_writes_return_register_before_exit(
-        &self,
-        block: &SSABlock,
-        exit_addr: u64,
-        edge_known: bool,
-    ) -> bool {
-        let mut reaches_exit = edge_known;
+    fn block_writes_return_register_before_exit(&self, block: &SSABlock) -> bool {
         for op in block.ops.iter().rev() {
-            match op {
-                SSAOp::Branch { target } | SSAOp::CBranch { target, .. } => {
-                    if self.extract_branch_target_address(target) == Some(exit_addr) {
-                        reaches_exit = true;
-                    }
-                }
-                _ if reaches_exit => {
-                    if let Some(dst) = op.dst()
-                        && self
-                            .inputs
-                            .arch
-                            .is_return_register_name(&dst.name.to_ascii_lowercase())
-                    {
-                        return true;
-                    }
-                }
-                _ => {}
+            if let Some(dst) = op.dst()
+                && self
+                    .inputs
+                    .arch
+                    .is_return_register_name(&dst.name.to_ascii_lowercase())
+            {
+                return true;
             }
         }
         false
@@ -1617,9 +1506,7 @@ impl<'a> FoldingContext<'a> {
             let Some(pred_block) = func.get_block(pred_addr) else {
                 return;
             };
-            let Some(slot) =
-                self.return_stack_slot_written_before_exit(pred_block, exit_addr, true)
-            else {
+            let Some(slot) = self.return_stack_slot_written_before_exit(pred_block) else {
                 return;
             };
             match common_slot {
@@ -1699,35 +1586,17 @@ impl<'a> FoldingContext<'a> {
         })
     }
 
-    fn return_stack_slot_written_before_exit(
-        &self,
-        block: &SSABlock,
-        exit_addr: u64,
-        edge_known: bool,
-    ) -> Option<i64> {
-        let mut branches_to_exit = edge_known;
+    fn return_stack_slot_written_before_exit(&self, block: &SSABlock) -> Option<i64> {
         for op in block.ops.iter().rev() {
             match op {
-                SSAOp::Branch { target } => {
-                    if self.extract_branch_target_address(target) == Some(exit_addr) {
-                        branches_to_exit = true;
-                    }
-                }
-                SSAOp::CBranch { target, .. } => {
-                    if self.extract_branch_target_address(target) == Some(exit_addr) {
-                        branches_to_exit = true;
-                    }
-                }
                 SSAOp::Store {
                     space: r2il::SpaceId::Ram,
                     addr,
                     ..
                 } => {
-                    if branches_to_exit || self.is_current_return_context_candidate(block.addr) {
-                        let offset = self.stack_slot_offset_for_var(addr);
-                        if offset.is_some() {
-                            return offset;
-                        }
+                    let offset = self.stack_slot_offset_for_var(addr);
+                    if offset.is_some() {
+                        return offset;
                     }
                 }
                 _ => {}
@@ -1981,15 +1850,6 @@ impl<'a> FoldingContext<'a> {
             && !self.expr_is_generic_entry_arg_like(recent)
             && (self.is_direct_constish_visible_expr(recent, 0)
                 || !self.is_direct_constish_visible_expr(direct, 0))
-    }
-
-    fn is_current_return_context_candidate(&self, addr: u64) -> bool {
-        self.state.return_blocks.contains(&addr)
-    }
-
-    /// Extract address from a branch target variable.
-    fn extract_branch_target_address(&self, target: &SSAVar) -> Option<u64> {
-        crate::address::parse_address_from_var_name(&target.name)
     }
 
     /// Check if the current block is a return block.

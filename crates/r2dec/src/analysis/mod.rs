@@ -15,7 +15,6 @@ pub(crate) mod lower;
 pub(crate) mod ownership;
 pub(crate) mod predicate;
 pub(crate) mod prepared_semantic;
-pub(crate) mod use_info;
 pub(crate) mod utils;
 
 #[cfg(test)]
@@ -56,10 +55,6 @@ pub(crate) struct DecompilerFacts {
 impl DecompilerFacts {
     pub(crate) fn semantic(&self) -> &UseInfo {
         &self.use_info
-    }
-
-    pub(crate) fn semantic_mut(&mut self) -> &mut UseInfo {
-        &mut self.use_info
     }
 
     pub(crate) fn flags(&self) -> &FlagInfo {
@@ -220,20 +215,24 @@ impl CallArgBinding {
         Self::new(arg, CallArgRole::Input, None)
     }
 
+    #[cfg(test)]
     pub(crate) fn result(arg: SemanticCallArg) -> Self {
         Self::new(arg, CallArgRole::Result, None)
     }
 
+    #[cfg(test)]
     pub(crate) fn with_stack_offset(mut self, stack_offset: i64) -> Self {
         self.stack_offset = Some(stack_offset);
         self
     }
 
+    #[cfg(test)]
     pub(crate) fn with_source_call(mut self, block_addr: u64, op_idx: usize) -> Self {
         self.source_call = Some((block_addr, op_idx));
         self
     }
 
+    #[cfg(test)]
     pub(crate) fn with_source_var(mut self, source_var: &SSAVar) -> Self {
         self.source_var_name = Some(source_var.display_name());
         self
@@ -244,9 +243,6 @@ impl CallArgBinding {
         self
     }
 
-    pub(crate) fn is_result(&self) -> bool {
-        self.role == CallArgRole::Result
-    }
 }
 
 impl From<SemanticCallArg> for CallArgBinding {
@@ -262,12 +258,9 @@ impl From<CExpr> for CallArgBinding {
 }
 
 impl SemanticCallArg {
+    #[cfg(test)]
     pub(crate) fn semantic(value: SemanticValue) -> Self {
         Self::Semantic(value)
-    }
-
-    pub(crate) fn value_root(var: impl Into<ValueRef>) -> Self {
-        Self::Semantic(SemanticValue::Scalar(ScalarValue::Root(var.into())))
     }
 
     pub(crate) fn expr_only(expr: CExpr) -> Self {
@@ -441,6 +434,7 @@ pub(crate) struct ValueProvenance {
 }
 
 impl StackSlotProvenance {
+    #[cfg(test)]
     pub(crate) fn new(offset: i64) -> Self {
         Self {
             offset,
@@ -513,15 +507,6 @@ fn call_arg_references_any(arg: &CallArgBinding, ids: &BTreeSet<ValueId>) -> boo
 }
 
 impl UseInfo {
-    #[allow(dead_code)]
-    pub(crate) fn analyze_with_definition_overrides(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
-        blocks: &[SSABlock],
-        env: &PassEnv<'_>,
-        definition_overrides: &HashMap<String, CExpr>,
-    ) -> Self {
-        use_info::analyze_with_definition_overrides(symbols, blocks, env, definition_overrides)
-    }
-
     pub(crate) fn bind_value_id(&mut self, var: &SSAVar, value_id: ValueId) -> Option<ValueId> {
         let conflicting_value = self
             .value_ids_by_var
@@ -675,22 +660,6 @@ impl UseInfo {
         }
     }
 
-    pub(crate) fn insert_definition_for_var(&mut self, var: &SSAVar, expr: CExpr) {
-        if let Some(value_id) = self.value_id_for_var(var) {
-            self.definitions_by_value.insert(value_id, expr);
-        } else {
-            *self.unkeyed_writes.entry("definitions").or_default() += 1;
-        }
-    }
-
-    pub(crate) fn insert_stack_slot_for_var(&mut self, var: &SSAVar, slot: StackSlotProvenance) {
-        if let Some(value_id) = self.exact_value_id_for_var(var) {
-            self.stack_slots_by_value.insert(value_id, slot);
-        } else {
-            *self.unkeyed_writes.entry("stack_slots").or_default() += 1;
-        }
-    }
-
     #[cfg(test)]
     pub(crate) fn insert_stack_slot_for_name(&mut self, name: &str, slot: StackSlotProvenance) {
         if let Some(value_id) = self.value_id_for_name_or_bind(name) {
@@ -703,6 +672,7 @@ impl UseInfo {
     /// Both ends need an identity: a copy between names could be written when
     /// only one side was known, and the name-keyed half then held an edge the
     /// value-keyed half did not, which is how the two disagreed.
+    #[cfg(test)]
     pub(crate) fn insert_copy_source_for_vars(&mut self, dst: &SSAVar, src: &SSAVar) {
         match (
             self.exact_value_id_for_var(dst),
@@ -715,6 +685,7 @@ impl UseInfo {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn insert_ptr_arith_for_var(&mut self, var: &SSAVar, ptr: PtrArith) {
         if let Some(value_id) = self.exact_value_id_for_var(var) {
             self.ptr_arith_by_value.insert(value_id, ptr.clone());
@@ -723,6 +694,7 @@ impl UseInfo {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn insert_forwarded_value_for_var(
         &mut self,
         var: &SSAVar,
@@ -854,11 +826,6 @@ impl UseInfo {
         }
         self.value_id_for_var(var)
             .and_then(|value_id| self.definitions_by_value.get(&value_id))
-    }
-
-    #[cfg(test)]
-    pub(crate) fn display_name_for_value_id(&self, value_id: ValueId) -> Option<String> {
-        self.var_for_value_id(value_id).map(SSAVar::display_name)
     }
 
     pub(crate) fn use_count_for_value(&self, value: ValueId) -> usize {
@@ -1018,35 +985,6 @@ impl UseInfo {
             .map(|var| var.display_name())
     }
 
-    /// A spelling for each value, preferring the variable that owns it.
-    ///
-    /// A value bound only through a name -- which is how a caller holding a
-    /// spelling reaches one -- has no variable to recover the spelling from, so
-    /// the name binding answers instead.
-    #[cfg(test)]
-    fn names_by_value_id(&self) -> BTreeMap<ValueId, String> {
-        let mut names = BTreeMap::new();
-        #[cfg(test)]
-        for (name, value_id) in &self.value_ids_by_name {
-            names.entry(*value_id).or_insert_with(|| name.clone());
-        }
-        for (value_id, var) in &self.vars_by_value_id {
-            names.insert(*value_id, var.display_name());
-        }
-        names
-    }
-
-    /// Every definition with a name for the value it defines.
-    #[cfg(test)]
-    pub(crate) fn definitions_with_names(&self) -> impl Iterator<Item = (String, &CExpr)> + '_ {
-        let names = self.names_by_value_id();
-        self.definitions_by_value
-            .iter()
-            .filter_map(move |(value_id, expr)| {
-                names.get(value_id).cloned().map(|name| (name, expr))
-            })
-    }
-
     /// File a definition against the value a spelling names, if it has none.
     #[cfg(test)]
     pub(crate) fn insert_definition_for_name_if_absent(&mut self, name: &str, expr: CExpr) {
@@ -1056,28 +994,6 @@ impl UseInfo {
             }
             None => *self.unkeyed_writes.entry("definitions").or_default() += 1,
         }
-    }
-
-    /// Merge a stack-slot fact into whatever this value already had.
-    ///
-    /// Filed against the value: the name is resolved on the way in, and a name
-    /// with no identity is counted rather than given its own entry.
-    pub(crate) fn merge_stack_slot_for_value(
-        &mut self,
-        value: ValueId,
-        candidate: StackSlotProvenance,
-    ) {
-        if self.ambiguous_value_ids.contains(&value) {
-            return;
-        }
-        self.stack_slots_by_value
-            .entry(value)
-            .and_modify(|existing| *existing = existing.merge(candidate))
-            .or_insert(candidate);
-    }
-
-    pub(crate) fn stack_slots_mut(&mut self) -> impl Iterator<Item = &mut StackSlotProvenance> {
-        self.stack_slots_by_value.values_mut()
     }
 
     #[cfg(test)]
@@ -1091,21 +1007,6 @@ impl UseInfo {
 
     pub(crate) fn stack_slots(&self) -> impl Iterator<Item = StackSlotProvenance> + '_ {
         self.stack_slots_by_value.values().copied()
-    }
-
-    /// Every stack slot with a name for the value that owns it.
-    ///
-    /// Slots are filed against values; a caller that needs to print one, or to
-    /// pick the most readable of several names for the same offset, recovers the
-    /// spelling here rather than from a second map keyed by name.
-    #[cfg(test)]
-    pub(crate) fn stack_slots_with_names(
-        &self,
-    ) -> impl Iterator<Item = (String, StackSlotProvenance)> + '_ {
-        self.stack_slots_by_value.iter().filter_map(|(value_id, slot)| {
-            self.var_for_value_id(*value_id)
-                .map(|var| (var.display_name(), *slot))
-        })
     }
 
     #[cfg(test)]
@@ -1134,14 +1035,6 @@ impl UseInfo {
             .is_some_and(|value| self.is_condition_value(value))
     }
 
-    #[cfg(test)]
-    pub(crate) fn call_result_source_for_name(&self, name: &str) -> Option<(u64, usize)> {
-        if self.ambiguous_value_names.contains(name) {
-            return None;
-        }
-        self.value_id_for_name(name)
-            .and_then(|value_id| self.call_result_source_by_value.get(&value_id).copied())
-    }
 }
 
 impl FlagInfo {
