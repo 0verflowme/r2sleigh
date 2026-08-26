@@ -48,10 +48,9 @@ impl CType {
     /// compiler contract. Wider carriers use the limb-backed external prelude
     /// instead of inventing names such as `uint256_t`.
     pub const fn machine_bits(bits: u32) -> Self {
-        if bits <= 128 {
-            Self::UInt(bits)
-        } else {
-            Self::BitVector(bits)
+        match bits {
+            8 | 16 | 32 | 64 | 128 => Self::UInt(bits),
+            _ => Self::BitVector(bits),
         }
     }
 

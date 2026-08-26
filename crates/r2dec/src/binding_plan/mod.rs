@@ -94,6 +94,11 @@ pub(crate) enum ValueRefusal {
     IncoherentUseProjection { site: UseSite },
     IncoherentWriteProjection { value: ValueId },
     UnsupportedMachineExpression { value: ValueId },
+    UnsupportedDeclarationWidth { value: ValueId, width_bits: u32 },
+}
+
+const fn declaration_width_is_supported(width_bits: u32) -> bool {
+    matches!(width_bits, 8 | 16 | 32 | 64 | 128 | 256 | 512)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

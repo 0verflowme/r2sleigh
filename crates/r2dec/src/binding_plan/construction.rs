@@ -251,6 +251,19 @@ fn binding_width(
         };
         binding_width_bits = binding_width_bits.max(carrier_width_bits);
     }
+    if !declaration_width_is_supported(binding_width_bits) {
+        let value = component
+            .members
+            .first()
+            .copied()
+            .expect("binding components are non-empty");
+        return Ok(BindingWidth::Refused(
+            ValueRefusal::UnsupportedDeclarationWidth {
+                value,
+                width_bits: binding_width_bits,
+            },
+        ));
+    }
     Ok(BindingWidth::Exact(binding_width_bits))
 }
 

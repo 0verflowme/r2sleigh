@@ -218,6 +218,17 @@ fn seal_width_evidence(
             }
         }
     }
+    let width_bits = lower_bounds.iter().copied().max().unwrap_or(0);
+    if !declaration_width_is_supported(width_bits) {
+        let value = component
+            .members
+            .first()
+            .copied()
+            .expect("seal binding components are non-empty");
+        return Ok(SealWidthEvidence::Refused(
+            ValueRefusal::UnsupportedDeclarationWidth { value, width_bits },
+        ));
+    }
     Ok(SealWidthEvidence::Exact { lower_bounds })
 }
 

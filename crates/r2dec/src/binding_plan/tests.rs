@@ -442,6 +442,33 @@ fn refused_machine_use_leaves_its_constant_explicitly_refused() {
 }
 
 #[test]
+fn unsupported_c_scalar_width_is_a_typed_value_refusal() {
+    let source_owned = source_owned([R2ILOp::Copy {
+        dst: Varnode::unique(0x10, 3),
+        src: Varnode::constant(0x12_3456, 3),
+    }]);
+    let output = source_owned
+        .source()
+        .graph()
+        .insts
+        .iter()
+        .find_map(|inst| inst.output)
+        .expect("copy output");
+    let plan = BindingPlan::build_shadow(&source_owned).expect("typed refusal plan");
+
+    assert!(matches!(
+        plan.disposition(output),
+        Some(ValueDisposition::Refused {
+            reason: ValueRefusal::UnsupportedDeclarationWidth {
+                value,
+                width_bits: 24,
+            },
+        }) if *value == output
+    ));
+    assert!(plan.validate_seal(&source_owned).is_ok());
+}
+
+#[test]
 fn seal_rejects_foreign_authority_and_inverse_membership_drift() {
     let ops = || {
         [
