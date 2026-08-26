@@ -38,6 +38,7 @@ pub(crate) mod consumer_structured;
 pub(crate) mod consumer_summary;
 pub(crate) mod consumer_vm;
 pub mod control;
+mod effect_ledger;
 pub(crate) mod fold;
 pub mod highlight;
 pub(crate) mod naming;
@@ -50,8 +51,8 @@ pub mod region;
 pub(crate) mod registers;
 mod shadow_report;
 pub(crate) mod single_evaluation;
-mod structured_region;
 pub mod structure;
+mod structured_region;
 pub mod symbol;
 pub(crate) mod unrendered;
 pub mod variable;
@@ -1434,7 +1435,8 @@ pub(crate) fn empty_display_names() -> &'static r2types::DisplayNames {
 /// number in the line rather than an absence from it. An unaccounted count is
 /// never zero because nothing went wrong; it is zero only when every obligation
 /// was reached by a rule that named its fate.
-fn note_unproven_constructs(func: &mut CFunction, ledger: Option<&r2ssa::ledger::ObligationLedger>) {
+fn note_unproven_constructs(func: &mut CFunction, ledger: Option<&r2ssa::ledger::ObligationLedger>,
+) {
     let rendered_nothing = func.body.is_empty();
     let residuals = count_residual_markers(&func.body);
     let detail = if rendered_nothing {
@@ -1448,16 +1450,8 @@ fn note_unproven_constructs(func: &mut CFunction, ledger: Option<&r2ssa::ledger:
     };
     let detail = match ledger.map(r2ssa::ledger::ObligationLedger::close) {
         Some(closure) if closure.total > 0 => {
-            // "built", not "rendered". The fold records the claim when it builds an
-            // expression for a site, and structuring deletes statements afterwards
-            // with nothing revisiting it, so the count is what was constructed and
-            // not what reached the page. Printing the statements the body actually
-            // holds beside it puts the difference in the line rather than leaving a
-            // reader to assume the two agree: a function claiming 1693 against 29
-            // statements says so on its face. Witnessing each claim needs a rendered
-            // name to say which value it stands for, which is the location model.
             let mut line = format!(
-                "{detail}; {} source obligations: {} built, {} elided, {} refused",
+                "{detail}; {} source obligations: {} rendered, {} elided, {} refused",
                 closure.total, closure.rendered, closure.elided, closure.refused
             );
             // The column that used to have no name. Saying nothing here is what let a
@@ -1481,132 +1475,6 @@ fn note_unproven_constructs(func: &mut CFunction, ledger: Option<&r2ssa::ledger:
         0,
         CStmt::comment(sanitize_comment_text(&format!("r2dec proof: {detail}"))),
     );
-}
-
-/// Take back every rendering claim when the body that would carry them is empty.
-///
-/// Proofs are taken while folding, and a structuring that then emits nothing has
-/// discharged none of them. Claiming otherwise is how a function with no output
-/// reported most of its obligations owned. This works at whole-function
-/// granularity because that is what can be proven without statement provenance;
-/// a statement that survives structuring cannot yet name the obligations it carries.
-fn reconcile_ledger_with_body(
-    ledger: &mut r2ssa::ledger::ObligationLedger,
-    func: &CFunction,
-    prepared: &r2ssa::SsaArtifact,
-    proofs: &[crate::fold::context::EffectRenderProof],
-) {
-    use r2ssa::ledger::{LedgerLayer, Outcome, RefusalReason};
-    debug_log_render_witness(ledger, func, prepared, proofs);
-    let rendered_any_statement = func
-        .body
-        .iter()
-        .any(|stmt| !matches!(stmt.unobserved(), CStmt::Comment(_) | CStmt::Empty));
-    if rendered_any_statement {
-        return;
-    }
-    let claimed = ledger
-        .entries()
-        .filter(|(_, outcome)| matches!(outcome, Outcome::Rendered { .. }))
-        .map(|(id, _)| *id)
-        .collect::<Vec<_>>();
-    for id in claimed {
-        ledger.overwrite(
-            id,
-            Outcome::Refused {
-                layer: LedgerLayer::Structure,
-                reason: RefusalReason::BlockNotRendered,
-            },
-        );
-    }
-}
-
-/// How much of what the ledger calls rendered the finished body can be shown to carry.
-///
-/// `Rendered` is recorded when the fold *builds* an expression for a site, and
-/// building is not output: structuring and cleanup delete statements afterwards,
-/// and nothing revisits the claim. A function reported 1693 of 1754 obligations
-/// rendered with five lines on the page, and the line read as an account of a
-/// complete rendering.
-///
-/// A claim can be witnessed when the value the site produces is one the body
-/// still names, because a name is a reference the symbol table issued and the
-/// table records which value each name stands for. A value the fold inlined into
-/// a surviving expression has no name and so cannot be witnessed this way, which
-/// is why this measures rather than decides: the question is whether the witness
-/// separates an honest rendering from a hollow one before it is allowed to
-/// retract anything.
-fn debug_log_render_witness(
-    ledger: &r2ssa::ledger::ObligationLedger,
-    func: &CFunction,
-    prepared: &r2ssa::SsaArtifact,
-    proofs: &[crate::fold::context::EffectRenderProof],
-) {
-    if !unowned_report_requested() {
-        return;
-    }
-    use r2ssa::ledger::Outcome;
-    let named_values = {
-        let table = func.symbols.borrow();
-        collect_stmt_var_names(&func.body)
-            .into_iter()
-            .chain(func.params.iter().map(|param| param.name))
-            .chain(func.locals.iter().map(|local| local.name))
-            .filter_map(|id| table.get(id).origin.value)
-            .collect::<HashSet<_>>()
-    };
-    // A site names every value its proof touches, so one lookup answers for all
-    // of them rather than one per field.
-    let mut witnessed_sites = HashSet::new();
-    for proof in proofs {
-        let touches = proof
-            .target
-            .iter()
-            .chain(proof.value.iter())
-            .chain(proof.address.iter())
-            .chain(proof.values.iter())
-            .any(|value| named_values.contains(value));
-        if touches {
-            for id in &proof.obligation_ids {
-                match id.instruction.site {
-                    r2ssa::CanonicalInstructionSite::Phi(_) => {
-                        witnessed_sites.insert((id.instruction.block_addr, 0));
-                    }
-                    r2ssa::CanonicalInstructionSite::Op(op_idx) => {
-                        if let Ok(op_idx) = usize::try_from(op_idx) {
-                            witnessed_sites.insert((id.instruction.block_addr, op_idx));
-                        }
-                    }
-                    r2ssa::CanonicalInstructionSite::NativeSpan { .. } => {}
-                }
-            }
-        }
-    }
-    let (claimed, witnessed) = ledger.entries().fold((0usize, 0usize), |(all, seen), (_, outcome)| {
-        match outcome {
-            Outcome::Rendered { block_addr, op_idx } => (
-                all + 1,
-                seen + usize::from(witnessed_sites.contains(&(block_addr, op_idx))),
-            ),
-            _ => (all, seen),
-        }
-    });
-    let statements = count_body_statements(&func.body);
-    let message = format!(
-        "WITNESS fn={} claimed-rendered={claimed} witnessed={witnessed} body-statements={statements} named-values={}",
-        func.name,
-        named_values.len(),
-    );
-    let path = std::env::var("R2SLEIGH_DEBUG_UNOWNED_LOG")
-        .unwrap_or_else(|_| "/tmp/r2sleigh_unowned.log".to_string());
-    if let Ok(mut file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-    {
-        use std::io::Write;
-        let _ = writeln!(file, "{message}");
-    }
 }
 
 /// Statements the body holds, counting the ones nested inside control flow.
@@ -1638,252 +1506,6 @@ fn count_body_statements(stmts: &[CStmt]) -> usize {
         }
     }
     stmts.iter().map(visit).sum()
-}
-
-/// What became of every obligation this function's source inventory recorded.
-///
-/// Ownership used to be inferred at the end by asking whether anything had been
-/// proven about each entry, and an entry nothing had an opinion about fell out of
-/// every total. Attribution now writes into a ledger that already holds each
-/// obligation, so an entry no rule reaches stays visible as undecided instead of
-/// disappearing, and the counts sum to the inventory by construction.
-fn build_obligation_ledger(
-    prepared: &r2ssa::SsaArtifact,
-    normalized: &r2ssa::SSAFunction,
-    origins: &crate::normalize::NormalizationOrigins,
-    proofs: &[crate::fold::context::EffectRenderProof],
-    folded_blocks: &std::collections::BTreeSet<u64>,
-    elided_obligations: &std::collections::BTreeMap<r2ssa::SemanticObligationId, &'static str>,
-) -> r2ssa::ledger::ObligationLedger {
-    use r2ssa::{
-        CanonicalInstructionSite, SemanticObligationComponent, SemanticObligationKind as Kind,
-        UseSite,
-    };
-    use r2ssa::ledger::{ElisionReason, LedgerLayer, ObligationLedger, Outcome, RefusalReason};
-
-    let obligations = prepared.obligations();
-    let graph = prepared.graph();
-    let unobserved = prepared.unobserved_merges();
-    let mut ledger = ObligationLedger::open(obligations);
-
-    let canonical_render_site = |id: r2ssa::SemanticObligationId| match id.instruction.site {
-        CanonicalInstructionSite::Phi(_) => Some((id.instruction.block_addr, 0)),
-        CanonicalInstructionSite::Op(op_idx) => {
-            usize::try_from(op_idx).ok().map(|op_idx| (id.instruction.block_addr, op_idx))
-        }
-        CanonicalInstructionSite::NativeSpan { .. } => None,
-    };
-    let mut rendered = std::collections::BTreeMap::new();
-    let mut rendered_phi_sites = std::collections::BTreeSet::<UseSite>::new();
-    for proof in proofs {
-        for id in &proof.obligation_ids {
-            if let Some(site) = canonical_render_site(*id) {
-                rendered.insert(*id, site);
-            }
-        }
-        if let Some(phi_edge) = &proof.phi_edge {
-            rendered_phi_sites.extend(phi_edge.sites.iter().copied());
-        }
-    }
-
-    // The normalized sidecar is the sole authority for how each removed phi
-    // input survived. Build a compact inverse once; no operation shape, name,
-    // or folded-block membership participates in this decision.
-    let mut materialized_phi_sites = std::collections::BTreeSet::<UseSite>::new();
-    for block_id in &graph.block_order {
-        let Some(block_addr) = graph.block(*block_id).map(|block| block.addr) else {
-            continue;
-        };
-        let Some(block) = normalized.get_block(block_addr) else {
-            continue;
-        };
-        for op_idx in 0..block.ops.len() {
-            match origins.origin(crate::normalize::NormalizedOpSite {
-                block: *block_id,
-                op_idx,
-            }) {
-                Some(crate::normalize::NormalizedOpOrigin::PhiEdgeCopy(origin)) => {
-                    materialized_phi_sites.insert(origin.incoming);
-                }
-                Some(crate::normalize::NormalizedOpOrigin::RelocatedInitializer(origin)) => {
-                    materialized_phi_sites.extend(origin.replaced_sites.iter().copied());
-                }
-                Some(crate::normalize::NormalizedOpOrigin::Original(_)) | None => {}
-            }
-        }
-    }
-    let removed_phi = origins
-        .removed_phis()
-        .iter()
-        .map(|removed| (removed.definition.inst, removed))
-        .collect::<std::collections::BTreeMap<_, _>>();
-    let phi_site_for_predecessor = |inst: r2ssa::InstId, predecessor: u64| {
-        let definition = graph.inst(inst)?;
-        let r2ssa::InstPayload::Phi { predecessors } = &definition.payload else {
-            return None;
-        };
-        let mut matches = predecessors.iter().enumerate().filter_map(|(input_idx, block)| {
-            (graph.block(*block)?.addr == predecessor).then_some(UseSite { inst, input_idx })
-        });
-        let first = matches.next()?;
-        matches.next().is_none().then_some(first)
-    };
-
-    for id in obligations.obligations().keys() {
-        // The admission rule asks these to residualize rather than be owned, which
-        // is a refusal with a reason and not an absence.
-        if matches!(id.kind, Kind::VolatileOrUnknownEffect | Kind::Trap) {
-            ledger.record(
-                *id,
-                Outcome::Refused {
-                    layer: LedgerLayer::Ssa,
-                    reason: RefusalReason::UnsupportedEffect,
-                },
-            );
-            continue;
-        }
-        // A merge no observation depends on decides nothing a reader could see, so
-        // it owes no output. Leaving it unaccounted said the rendering had lost
-        // something, when what it had was an effect the program does not have.
-        if let r2ssa::CanonicalInstructionSite::Phi(_) = id.instruction.site
-            && obligations
-                .instructions()
-                .get(&id.instruction)
-                .and_then(|disposition| disposition.source.graph_inst())
-                .and_then(|inst| graph.inst(inst))
-                .and_then(|inst| inst.output)
-                .is_some_and(|value| unobserved.contains(value))
-        {
-            ledger.record(*id, Outcome::Elided(ElisionReason::UnobservedMerge));
-            continue;
-        }
-        if let Some(reason) = elided_obligations.get(id) {
-            ledger.record(*id, Outcome::Elided(elision_reason(reason)));
-            continue;
-        }
-        if !matches!(id.instruction.site, CanonicalInstructionSite::Phi(_))
-            && let Some((block_addr, op_idx)) = rendered.get(id).copied()
-        {
-            ledger.record(*id, Outcome::Rendered { block_addr, op_idx });
-            continue;
-        }
-        let block_rendered = folded_blocks.contains(&id.instruction.block_addr);
-        let source_inst = obligations
-            .instructions()
-            .get(&id.instruction)
-            .and_then(|disposition| disposition.source.graph_inst());
-        let outcome = match (id.instruction.site, id.kind, id.component, source_inst) {
-            (
-                CanonicalInstructionSite::Phi(_),
-                Kind::LiveStateTransition,
-                SemanticObligationComponent::LoopTransition { predecessor, .. },
-                Some(inst),
-            ) => match phi_site_for_predecessor(inst, predecessor) {
-                Some(site)
-                    if materialized_phi_sites.contains(&site)
-                        && rendered_phi_sites.contains(&site) => Outcome::Rendered {
-                    block_addr: id.instruction.block_addr,
-                    op_idx: 0,
-                },
-                Some(site)
-                    if removed_phi
-                        .get(&inst)
-                        .is_some_and(|removed| removed.noop_sites().contains(&site)) =>
-                {
-                    Outcome::Elided(ElisionReason::RedundantPhiEdge)
-                }
-                _ => Outcome::Refused {
-                    layer: LedgerLayer::Fold,
-                    reason: RefusalReason::Unclassified,
-                },
-            },
-            (CanonicalInstructionSite::Phi(_), Kind::LoopCarriedState, _, Some(inst)) => {
-                match removed_phi.get(&inst) {
-                    Some(removed)
-                        if removed
-                            .incoming_sites
-                            .iter()
-                            .all(|site| {
-                                (materialized_phi_sites.contains(site)
-                                    && rendered_phi_sites.contains(site))
-                                    || removed.noop_sites().contains(site)
-                            }) =>
-                    {
-                        if removed
-                            .incoming_sites
-                            .iter()
-                            .any(|site| {
-                                materialized_phi_sites.contains(site)
-                                    && rendered_phi_sites.contains(site)
-                            })
-                        {
-                            Outcome::Rendered {
-                                block_addr: id.instruction.block_addr,
-                                op_idx: 0,
-                            }
-                        } else {
-                            Outcome::Elided(ElisionReason::RedundantPhiEdge)
-                        }
-                    }
-                    _ => Outcome::Refused {
-                        layer: LedgerLayer::Fold,
-                        reason: RefusalReason::Unclassified,
-                    },
-                }
-            }
-            (CanonicalInstructionSite::Phi(_), _, _, _) => Outcome::Refused {
-                layer: LedgerLayer::Fold,
-                reason: RefusalReason::Unclassified,
-            },
-            _ if !block_rendered => Outcome::Refused {
-                layer: LedgerLayer::Structure,
-                reason: RefusalReason::BlockNotRendered,
-            },
-            _ => Outcome::Refused {
-                layer: LedgerLayer::Fold,
-                reason: RefusalReason::Unclassified,
-            },
-        };
-        ledger.record(*id, outcome);
-    }
-
-    if unowned_report_requested() {
-        // Which operation sites the fold proved it rendered, so a site with no
-        // proof and no elision can be named rather than counted.
-        let mut sites = proofs
-            .iter()
-            .flat_map(|proof| proof.obligation_ids.iter().copied())
-            .filter_map(canonical_render_site)
-            .collect::<Vec<_>>();
-        sites.sort_unstable();
-        sites.dedup();
-        for (block_addr, op_idx) in sites {
-            eprintln!("PROOFSITE block={block_addr:#x} idx={op_idx}");
-        }
-        for (id, reason) in elided_obligations {
-            if let Some((block_addr, op_idx)) = canonical_render_site(*id) {
-                eprintln!("ELIDEDSITE block={block_addr:#x} idx={op_idx} reason={reason}");
-            }
-        }
-    }
-    debug_log_ledger(prepared, &ledger);
-    ledger
-}
-
-/// Read the fold's elision label as the reason it names.
-fn elision_reason(reason: &str) -> r2ssa::ledger::ElisionReason {
-    use r2ssa::ledger::ElisionReason;
-    match reason {
-        "stack-frame" => ElisionReason::StackFrame,
-        "dead-cpu-flag" => ElisionReason::DeadCpuFlag,
-        "dead-flag-only" => ElisionReason::DeadFlagOnly,
-        "dead-unused-temp" => ElisionReason::DeadUnusedTemporary,
-        "dead-caller-saved" => ElisionReason::DeadCallerSaved,
-        "dead-call-arg" => ElisionReason::DeadCallArgument,
-        "dead-stack-base" => ElisionReason::DeadStackBase,
-        "redundant-phi-edge" => ElisionReason::RedundantPhiEdge,
-        _ => ElisionReason::DeadUnclassified,
-    }
 }
 
 /// Whether a run was asked to report what the rendering left unaccounted for.
@@ -2205,7 +1827,8 @@ fn is_summary_ident_byte(byte: u8) -> bool {
 /// travelled with the snapshot all along. It is applied only where a real name
 /// exists, and never over one an external signature already supplied, because
 /// a parsed signature is the more specific statement.
-fn apply_source_parameter_names(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, params: &mut [ast::CParam], display_names: &r2types::DisplayNames) {
+fn apply_source_parameter_names(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, params: &mut [ast::CParam], display_names: &r2types::DisplayNames,
+) {
     for (index, param) in params.iter_mut().enumerate() {
         if !is_generic_arg_name(&crate::symbol::spelling(symbols, param.name)) {
             continue;
@@ -2276,7 +1899,8 @@ fn float_arg_regs_for(abi_arg_regs: &[String]) -> &'static [&'static str] {
         .map(|reg| reg.to_ascii_lowercase())
         .as_deref()
     {
-        Some("rdi") => &["xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7"],
+        Some("rdi") => &["xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7",
+        ],
         Some("x0") => &["d0", "d1", "d2", "d3", "d4", "d5", "d6", "d7"],
         _ => &[],
     }
@@ -2692,8 +2316,7 @@ impl BindingShadowOutcome {
         if !coverage.is_complete() {
             return Self::Failed(BindingShadowFailure::IncompleteObservations {
                 ledger,
-                coverage,
-            });
+                coverage });
         }
         if !ledger.passes_quality() || !coverage.passes_quality() {
             return Self::Failed(BindingShadowFailure::NonQuality { ledger, coverage });
@@ -2904,20 +2527,32 @@ impl From<crate::shadow_report::ShadowLedger> for BindingShadowAuditLedger {
 pub enum BindingMachineProjectionFailure {
     UntrustedArtifactProvenance,
     IncompleteObligationInventory,
-    MissingGraphValue { value: r2ssa::ValueId },
-    MissingGraphBlock { block: r2ssa::BlockId },
-    DuplicateBlockAddress { address: u64 },
+    MissingGraphValue { value: r2ssa::ValueId,
+    },
+    MissingGraphBlock { block: r2ssa::BlockId,
+    },
+    DuplicateBlockAddress { address: u64,
+    },
     TopologyMismatch,
     MachineContextMismatch,
-    MissingInstruction { inst: r2ssa::InstId },
-    MissingInstructionDisposition { inst: r2ssa::InstId },
-    MissingUseDisposition { site: r2ssa::UseSite },
-    MissingWriteDisposition { inst: r2ssa::InstId },
-    MissingOutput { inst: r2ssa::InstId },
-    InvalidValueWidth { value: r2ssa::ValueId, size_bytes: u32 },
-    ConstantTooWide { value: r2ssa::ValueId, width_bits: u32 },
-    WrongOperandCount { inst: r2ssa::InstId, expected: usize, actual: usize },
-    WidthMismatch { inst: r2ssa::InstId, expected_bits: u32, actual_bits: u32 },
+    MissingInstruction { inst: r2ssa::InstId,
+    },
+    MissingInstructionDisposition { inst: r2ssa::InstId,
+    },
+    MissingUseDisposition { site: r2ssa::UseSite,
+    },
+    MissingWriteDisposition { inst: r2ssa::InstId,
+    },
+    MissingOutput { inst: r2ssa::InstId,
+    },
+    InvalidValueWidth { value: r2ssa::ValueId, size_bytes: u32,
+    },
+    ConstantTooWide { value: r2ssa::ValueId, width_bits: u32,
+    },
+    WrongOperandCount { inst: r2ssa::InstId, expected: usize, actual: usize,
+    },
+    WidthMismatch { inst: r2ssa::InstId, expected_bits: u32, actual_bits: u32,
+    },
     InvalidCastWidth {
         inst: r2ssa::InstId,
         kind: r2ssa::MachineCastKind,
@@ -2930,22 +2565,35 @@ pub enum BindingMachineProjectionFailure {
         result_bits: u32,
         lsb_bits: u32,
     },
-    InvalidChild { expr_index: usize, child_index: usize },
-    InvalidExpressionType { expr_index: usize },
-    DuplicateEntity { value: r2ssa::ValueId },
-    EntityMismatch { inst: r2ssa::InstId },
-    ObligationMismatch { inst: r2ssa::InstId },
-    UseDispositionMismatch { site: r2ssa::UseSite },
-    WriteDispositionMismatch { inst: r2ssa::InstId },
-    ObligationSourceMismatch { instruction: r2ssa::CanonicalInstructionId },
-    UnsupportedOperation { inst: r2ssa::InstId },
+    InvalidChild { expr_index: usize, child_index: usize,
+    },
+    InvalidExpressionType { expr_index: usize,
+    },
+    DuplicateEntity { value: r2ssa::ValueId,
+    },
+    EntityMismatch { inst: r2ssa::InstId,
+    },
+    ObligationMismatch { inst: r2ssa::InstId,
+    },
+    UseDispositionMismatch { site: r2ssa::UseSite,
+    },
+    WriteDispositionMismatch { inst: r2ssa::InstId,
+    },
+    ObligationSourceMismatch { instruction: r2ssa::CanonicalInstructionId,
+    },
+    UnsupportedOperation { inst: r2ssa::InstId,
+    },
 }
 
 impl BindingMachineProjectionFailure {
     pub const fn kind(self) -> &'static str {
         match self {
-            Self::UntrustedArtifactProvenance => "binding_plan_machine_untrusted_artifact_provenance",
-            Self::IncompleteObligationInventory => "binding_plan_machine_incomplete_obligation_inventory",
+            Self::UntrustedArtifactProvenance => {
+                "binding_plan_machine_untrusted_artifact_provenance"
+            }
+            Self::IncompleteObligationInventory => {
+                "binding_plan_machine_incomplete_obligation_inventory"
+            }
             Self::MissingGraphValue { .. } => "binding_plan_machine_missing_graph_value",
             Self::MissingGraphBlock { .. } => "binding_plan_machine_missing_graph_block",
             Self::DuplicateBlockAddress { .. } => "binding_plan_machine_duplicate_block_address",
@@ -2971,9 +2619,7 @@ impl BindingMachineProjectionFailure {
                 r2ssa::MachineCastKind::SignExtend => {
                     "binding_plan_machine_invalid_sign_extend_width"
                 }
-                r2ssa::MachineCastKind::Truncate => {
-                    "binding_plan_machine_invalid_truncate_width"
-                }
+                r2ssa::MachineCastKind::Truncate => "binding_plan_machine_invalid_truncate_width",
                 r2ssa::MachineCastKind::BitReinterpret => {
                     "binding_plan_machine_invalid_bit_reinterpret_width"
                 }
@@ -3032,27 +2678,57 @@ pub enum BindingObservationJournalFailure {
     SourceAuthority,
     BindingPlanAuthority,
     BindingPlanMachineProjection(BindingMachineProjectionFailure),
-    BindingPlanValueTopology { index: usize, value: r2ssa::ValueId },
-    BindingPlanDispositionCount { expected: usize, actual: usize },
-    BindingPlanBindingCount { expected: usize, actual: usize },
-    BindingPlanInvalidBindingReference { value: r2ssa::ValueId, binding_index: usize },
-    BindingPlanNonBoundValue { value: r2ssa::ValueId },
-    BindingPlanCertificateMembership { binding_index: usize },
-    BindingPlanDeclarationWidth { binding_index: usize },
-    BindingPlanInvalidLiteralInline { value: r2ssa::ValueId },
-    BindingPlanInvalidElisionProof { value: r2ssa::ValueId },
-    BindingPlanUnexpectedValueDisposition { value: r2ssa::ValueId },
-    BindingPlanStackObjectCount { expected: usize, actual: usize },
-    BindingPlanUnexpectedStackObjectDisposition { object: r2ssa::ObjectId },
-    BindingPlanStackObjectCertificate { object: r2ssa::ObjectId, binding_index: usize },
-    BindingPlanStackObjectDeclarationWidth { object: r2ssa::ObjectId, binding_index: usize },
+    BindingPlanValueTopology { index: usize, value: r2ssa::ValueId,
+    },
+    BindingPlanDispositionCount { expected: usize, actual: usize,
+    },
+    BindingPlanBindingCount { expected: usize, actual: usize,
+    },
+    BindingPlanInvalidBindingReference { value: r2ssa::ValueId, binding_index: usize,
+    },
+    BindingPlanNonBoundValue { value: r2ssa::ValueId,
+    },
+    BindingPlanCertificateMembership { binding_index: usize,
+    },
+    BindingPlanDeclarationWidth { binding_index: usize,
+    },
+    BindingPlanInvalidLiteralInline { value: r2ssa::ValueId,
+    },
+    BindingPlanInvalidElisionProof { value: r2ssa::ValueId,
+    },
+    BindingPlanUnexpectedValueDisposition { value: r2ssa::ValueId,
+    },
+    BindingPlanStackObjectCount { expected: usize, actual: usize,
+    },
+    BindingPlanUnexpectedStackObjectDisposition { object: r2ssa::ObjectId,
+    },
+    BindingPlanStackObjectCertificate { object: r2ssa::ObjectId, binding_index: usize,
+    },
+    BindingPlanStackObjectDeclarationWidth { object: r2ssa::ObjectId, binding_index: usize,
+    },
+    BindingPlanParameterCount { expected: usize, actual: usize,
+    },
+    BindingPlanUnexpectedParameterDisposition { slot: u32,
+    },
+    BindingPlanParameterCertificate { slot: u32, binding_index: usize,
+    },
+    BindingPlanParameterDeclarationWidth { slot: u32, binding_index: usize,
+    },
+    BindingPlanParameterRole { slot: u32, binding_index: usize,
+    },
+    BindingPlanBindingRole { binding_index: usize,
+    },
     NormalizationSourceAuthority,
     NormalizationBlockTopology,
-    NormalizationRowCount { block_address: u64 },
-    NormalizationOriginalInstruction { block_address: u64, op_idx: usize },
+    NormalizationRowCount { block_address: u64,
+    },
+    NormalizationOriginalInstruction { block_address: u64, op_idx: usize,
+    },
     NormalizationOriginalCoverage,
-    NormalizationPhiEdge { block_address: u64, op_idx: usize },
-    NormalizationRelocatedInitializer { block_address: u64, op_idx: usize },
+    NormalizationPhiEdge { block_address: u64, op_idx: usize,
+    },
+    NormalizationRelocatedInitializer { block_address: u64, op_idx: usize,
+    },
     NormalizationRemovedPhi,
     NormalizationRemovedPhiEdge,
     NormalizationInvalidCarrierCertificates,
@@ -3160,9 +2836,7 @@ impl BindingObservationJournalFailure {
                 "binding_plan_invalid_binding_reference"
             }
             Self::BindingPlanNonBoundValue { .. } => "binding_plan_non_bound_value",
-            Self::BindingPlanCertificateMembership { .. } => {
-                "binding_plan_certificate_membership"
-            }
+            Self::BindingPlanCertificateMembership { .. } => "binding_plan_certificate_membership",
             Self::BindingPlanDeclarationWidth { .. } => "binding_plan_declaration_width",
             Self::BindingPlanInvalidLiteralInline { .. } => "binding_plan_invalid_literal_inline",
             Self::BindingPlanInvalidElisionProof { .. } => "binding_plan_invalid_elision_proof",
@@ -3179,17 +2853,25 @@ impl BindingObservationJournalFailure {
             Self::BindingPlanStackObjectDeclarationWidth { .. } => {
                 "binding_plan_stack_object_declaration_width"
             }
+            Self::BindingPlanParameterCount { .. } => "binding_plan_parameter_count",
+            Self::BindingPlanUnexpectedParameterDisposition { .. } => {
+                "binding_plan_unexpected_parameter_disposition"
+            }
+            Self::BindingPlanParameterCertificate { .. } => {
+                "binding_plan_parameter_certificate"
+            }
+            Self::BindingPlanParameterDeclarationWidth { .. } => {
+                "binding_plan_parameter_declaration_width"
+            }
+            Self::BindingPlanParameterRole { .. } => "binding_plan_parameter_role",
+            Self::BindingPlanBindingRole { .. } => "binding_plan_binding_role",
             Self::NormalizationSourceAuthority => "normalization_source_authority",
             Self::NormalizationBlockTopology => "normalization_block_topology",
             Self::NormalizationRowCount { .. } => "normalization_row_count",
-            Self::NormalizationOriginalInstruction { .. } => {
-                "normalization_original_instruction"
-            }
+            Self::NormalizationOriginalInstruction { .. } => "normalization_original_instruction",
             Self::NormalizationOriginalCoverage => "normalization_original_coverage",
             Self::NormalizationPhiEdge { .. } => "normalization_phi_edge",
-            Self::NormalizationRelocatedInitializer { .. } => {
-                "normalization_relocated_initializer"
-            }
+            Self::NormalizationRelocatedInitializer { .. } => "normalization_relocated_initializer",
             Self::NormalizationRemovedPhi => "normalization_removed_phi",
             Self::NormalizationRemovedPhiEdge => "normalization_removed_phi_edge",
             Self::NormalizationInvalidCarrierCertificates => {
@@ -3225,9 +2907,7 @@ impl BindingObservationJournalFailure {
             Self::ConflictingUse { .. } => "conflicting_use",
             Self::ConflictingWrite { .. } => "conflicting_write",
             Self::ObservationDomainTooLarge { .. } => "observation_domain_too_large",
-            Self::ObservationCapacityUnavailable { .. } => {
-                "observation_capacity_unavailable"
-            }
+            Self::ObservationCapacityUnavailable { .. } => "observation_capacity_unavailable",
             Self::ObservationOutOfRange { .. } => "observation_out_of_range",
             Self::DuplicateObservation { .. } => "duplicate_observation",
         }
@@ -3290,8 +2970,7 @@ impl BindingShadowAuditOutcome {
             }),
             BindingShadowOutcome::Failed(BindingShadowFailure::NonQuality {
                 ledger,
-                coverage,
-            }) => {
+                coverage }) => {
                 Self::Failed(BindingShadowAuditFailure::NonQuality {
                     ledger: (*ledger).into(),
                     observations: (*coverage).into(),
@@ -3301,11 +2980,70 @@ impl BindingShadowAuditOutcome {
     }
 }
 
+/// Whether the final emission tree satisfied the source effect inventory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EffectObligationDisposition {
+    Admitted,
+    Refused,
+    /// The selected route never entered the native Standard renderer.
+    NotRun,
+}
+
+/// Stable source-effect tuple exposed independently of binding quality.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EffectObligationAudit {
+    pub disposition: EffectObligationDisposition,
+    pub total: usize,
+    pub rendered: usize,
+    pub justified_elision: usize,
+    pub refused: usize,
+    pub unaccounted: usize,
+    pub conflicts: usize,
+}
+
+impl EffectObligationAudit {
+    pub const NOT_RUN: Self = Self {
+        disposition: EffectObligationDisposition::NotRun,
+        total: 0,
+        rendered: 0,
+        justified_elision: 0,
+        refused: 0,
+        unaccounted: 0,
+        conflicts: 0,
+    };
+
+    fn from_ledger(ledger: &r2ssa::ledger::ObligationLedger) -> Self {
+        let closure = ledger.close();
+        let admitted = closure.refused == 0
+            && closure.unattributed == 0
+            && closure.conflicts == 0
+            && closure.is_closed();
+        Self {
+            disposition: if admitted {
+                EffectObligationDisposition::Admitted
+            } else {
+                EffectObligationDisposition::Refused
+            },
+            total: closure.total,
+            rendered: closure.rendered,
+            justified_elision: closure.elided,
+            refused: closure.refused,
+            unaccounted: closure.unattributed,
+            conflicts: closure.conflicts,
+        }
+    }
+
+    pub const fn is_admitted(self) -> bool {
+        matches!(self.disposition, EffectObligationDisposition::Admitted)
+    }
+}
+
 /// Rendered C paired with the non-consuming Stage 4 binding audit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DecompileBindingAudit {
     output: String,
     binding_shadow: BindingShadowAuditOutcome,
+    effect_obligations: EffectObligationAudit,
 }
 
 impl DecompileBindingAudit {
@@ -3313,6 +3051,7 @@ impl DecompileBindingAudit {
         Self {
             output,
             binding_shadow: BindingShadowAuditOutcome::NotRun,
+            effect_obligations: EffectObligationAudit::NOT_RUN,
         }
     }
 
@@ -3326,6 +3065,10 @@ impl DecompileBindingAudit {
 
     pub const fn binding_shadow(&self) -> BindingShadowAuditOutcome {
         self.binding_shadow
+    }
+
+    pub const fn effect_obligations(&self) -> EffectObligationAudit {
+        self.effect_obligations
     }
 }
 
@@ -3342,6 +3085,7 @@ pub struct PendingDecompileBindingAudit {
         r2types::function_facts::SourceOwnedFunctionFacts,
     )>,
     ready: BindingShadowAuditOutcome,
+    ready_effects: EffectObligationAudit,
 }
 
 impl PendingDecompileBindingAudit {
@@ -3350,6 +3094,7 @@ impl PendingDecompileBindingAudit {
             output: audit.output,
             product: None,
             ready: audit.binding_shadow,
+            ready_effects: audit.effect_obligations,
         }
     }
 
@@ -3362,6 +3107,7 @@ impl PendingDecompileBindingAudit {
             output,
             product: Some((product, source)),
             ready: BindingShadowAuditOutcome::NotRun,
+            ready_effects: EffectObligationAudit::NOT_RUN,
         }
     }
 
@@ -3374,12 +3120,16 @@ impl PendingDecompileBindingAudit {
     }
 
     pub fn finalize(self) -> DecompileBindingAudit {
-        let binding_shadow = self.product.map_or(self.ready, |(product, source)| {
-            product.binding_shadow(&source)
-        });
+        let (binding_shadow, effect_obligations) = self.product.map_or((self.ready, self.ready_effects), |(product, source)| {
+                    (
+                        product.binding_shadow(&source),
+                        product.effect_obligations(),
+                    )
+                });
         DecompileBindingAudit {
             output: self.output,
             binding_shadow,
+            effect_obligations,
         }
     }
 }
@@ -3417,7 +3167,8 @@ impl InternalBuildProduct {
         }
     }
 
-    fn binding_shadow(&self, source: &r2types::SourceOwnedFunctionFacts) -> BindingShadowAuditOutcome {
+    fn binding_shadow(&self, source: &r2types::SourceOwnedFunctionFacts,
+    ) -> BindingShadowAuditOutcome {
         let Self::Native(native) = self else {
             return BindingShadowAuditOutcome::NotRun;
         };
@@ -3429,9 +3180,15 @@ impl InternalBuildProduct {
             native.plan(),
             source,
             observations,
-            coverage,
-        );
+            coverage);
         BindingShadowAuditOutcome::from_internal(&outcome)
+    }
+
+    fn effect_obligations(&self) -> EffectObligationAudit {
+        match self {
+            Self::Native(native) => native.effect_obligation_audit(),
+            Self::Residual(_) => EffectObligationAudit::NOT_RUN,
+        }
     }
 }
 
@@ -3566,8 +3323,7 @@ impl Decompiler {
         if let Some(reason) = route_fallback_reason(semantic_route) {
             return Ok(PreparedDecompile::Immediate(
                 DecompileBindingAudit::not_run(artifact_guard_fallback_comment(
-                    &func_name, reason,
-                )),
+                    &func_name, reason)),
             ));
         }
         if let Some(reason) = summary_only_semantics_standard_render_residual_reason(
@@ -3619,9 +3375,11 @@ impl Decompiler {
         // Everything below classifies the already sealed observation journal.
         render_work.poll()?;
         let binding_shadow = product.binding_shadow(input.source_owned_facts());
+        let effect_obligations = product.effect_obligations();
         Ok(DecompileBindingAudit {
             output,
             binding_shadow,
+            effect_obligations,
         })
     }
 
@@ -3646,8 +3404,7 @@ impl Decompiler {
             .map_err(|(stop, partial)| {
                 (
                     stop,
-                    partial.map(PendingDecompileBindingAudit::into_output),
-                )
+                    partial.map(PendingDecompileBindingAudit::into_output))
             })
     }
 
@@ -3665,9 +3422,7 @@ impl Decompiler {
     ) -> Result<DecompileBindingAudit, (DecompileExecutionStop, Option<DecompileBindingAudit>)> {
         self.decompile_input_keeping_partial_with_pending_binding_audit(input, control)
             .map(PendingDecompileBindingAudit::finalize)
-            .map_err(|(stop, partial)| {
-                (stop, partial.map(PendingDecompileBindingAudit::finalize))
-            })
+            .map_err(|(stop, partial)| (stop, partial.map(PendingDecompileBindingAudit::finalize)))
     }
 
     /// Render while deferring non-consuming binding classification until the
@@ -3753,29 +3508,33 @@ impl Decompiler {
             return Ok(InternalBuildProduct::residual(residual_function_for_render_boundary(
                 &func_name,
                 &block_guard_fallback_comment(&func_name, block_count, self.config.max_blocks),
-            )));
+            ),
+            ));
         }
         let decompiler = Self::new(self.config.clone()).with_context(input.context_projection());
         let Some(semantic_route) = decompiler.context.function_facts.decompile_route() else {
             return Ok(InternalBuildProduct::residual(residual_function_for_render_boundary(
                 &func_name,
                 &missing_decompile_route_residual_comment(&func_name),
-            )));
+            ),
+            ));
         };
         if let Some(reason) = route_fallback_reason(semantic_route) {
-            return Ok(InternalBuildProduct::residual(residual_function_for_render_boundary(&func_name, reason)));
+            return Ok(InternalBuildProduct::residual(residual_function_for_render_boundary(&func_name, reason),
+            ));
         }
         if let Some(reason) = summary_only_semantics_standard_render_residual_reason(
             decompiler.context.function_facts.decompile_route(),
             decompiler.context.function_facts.semantic_report(),
         ) {
-            return Ok(InternalBuildProduct::residual(residual_function_for_render_boundary(&func_name, &reason)));
+            return Ok(InternalBuildProduct::residual(residual_function_for_render_boundary(&func_name, &reason),
+            ));
         }
         if route_is_summary_boundary(semantic_route) {
             return Ok(InternalBuildProduct::residual(residual_function_for_summary_route_boundary(
                 &func_name,
-                semantic_route,
-            )));
+                semantic_route),
+            ));
         }
         decompiler.build_function_internal_with_control(input, semantic_route, work)
     }
@@ -4160,9 +3919,7 @@ impl Decompiler {
                 for phi in &block.phis {
                     let value = graph.value_id_for_var(&phi.dst);
                     let carrier = value.is_some_and(|value| {
-                        render_facts.is_some_and(|facts| {
-                            facts.loop_carrier_for_value(value).is_some()
-                        })
+                        render_facts.is_some_and(|facts| facts.loop_carrier_for_value(value).is_some())
                     });
                     eprintln!(
                         "MERGEPHI block={:#x} dst={} size={} value={:?} carrier={}",
@@ -4294,11 +4051,11 @@ impl Decompiler {
             return Ok(InternalBuildProduct::residual(residual_function_for_render_boundary(
                 &func_name,
                 &format!("normalization origin refusal: {error:?}"),
-            )));
+            ),
+            ));
         }
         let binding_plan = match crate::binding_plan::BindingPlan::build_shadow(
-            input.source_owned_facts(),
-        ) {
+            input.source_owned_facts()) {
             Ok(plan) => std::rc::Rc::new(plan),
             Err(error) => {
                 return Ok(InternalBuildProduct::residual(residual_function_for_render_boundary(
@@ -4307,7 +4064,8 @@ impl Decompiler {
                         .clone()
                         .unwrap_or_else(|| format!("sub_{:x}", func.entry)),
                     &format!("binding plan refusal: {error:?}"),
-                )));
+                ),
+                    ));
             }
         };
         if let Err(error) = crate::fold::op_lower::PlannedLoweringInput::try_new(
@@ -4320,7 +4078,8 @@ impl Decompiler {
                     .clone()
                     .unwrap_or_else(|| format!("sub_{:x}", func.entry)),
                 &format!("binding source refusal: {error:?}"),
-            )));
+            ),
+            ));
         }
         let binding_names = match crate::binding_plan::BindingNameResolution::build(
             input.source_owned_facts(),
@@ -4335,7 +4094,8 @@ impl Decompiler {
                         .clone()
                         .unwrap_or_else(|| format!("sub_{:x}", func.entry)),
                     &format!("binding name refusal: {error:?}"),
-                )));
+                ),
+                ));
             }
         };
         let (observation_journal, observation_failure) = match LegacyObservationJournal::new(
@@ -4476,7 +4236,8 @@ impl Decompiler {
                 .collect(),
             render_signature,
         );
-        apply_source_parameter_names(symbols, &mut params, self.context.function_facts.display_names());
+        apply_source_parameter_names(symbols, &mut params, self.context.function_facts.display_names(),
+        );
         let param_register_aliases = build_param_register_aliases(symbols, 
             &params,
             &recovered_param_infos,
@@ -4489,11 +4250,15 @@ impl Decompiler {
                 continue;
             };
             let param_ty = param.ty.clone();
-            type_hints.insert(crate::symbol::spelling(symbols, param.name).to_string(), param_ty.clone());
-            type_hints.insert(crate::symbol::spelling(symbols, param.name).to_ascii_lowercase(), param_ty);
+            type_hints.insert(crate::symbol::spelling(symbols, param.name).to_string(), param_ty.clone(),
+            );
+            type_hints.insert(crate::symbol::spelling(symbols, param.name).to_ascii_lowercase(), param_ty,
+            );
         }
         for (reg_alias, param_name) in &param_register_aliases {
-            let Some(param) = params.iter().find(|param| &*crate::symbol::spelling(symbols, param.name) == param_name.as_str()) else {
+            let Some(param) = params.iter().find(|param| {
+                &*crate::symbol::spelling(symbols, param.name) == param_name.as_str()
+            }) else {
                 continue;
             };
             type_hints
@@ -4553,7 +4318,8 @@ impl Decompiler {
                         .clone()
                         .unwrap_or_else(|| format!("sub_{:x}", func.entry)),
                     &format!("prepared semantic view refusal: {error:?}"),
-                )));
+                ),
+                ));
             }
         };
         let fold_inputs = FoldInputs {
@@ -4833,24 +4599,9 @@ impl Decompiler {
         if let Some(reason) = incomplete_source_obligations_reason(prepared) {
             return Ok(InternalBuildProduct::residual(residual_function_for_render_boundary(
                 &c_function.name,
-                &reason,
-            )));
+                &reason),
+            ));
         }
-        let mut ledger = build_obligation_ledger(
-            prepared,
-            &normalized_func,
-            &normalization_origins,
-            &fold_ctx.effect_render_proofs_since(0),
-            &fold_ctx.folded_block_addrs(),
-            &fold_ctx.elided_obligations(),
-        );
-        reconcile_ledger_with_body(
-            &mut ledger,
-            &c_function,
-            prepared,
-            &fold_ctx.effect_render_proofs_since(0),
-        );
-        note_unproven_constructs(&mut c_function, Some(&ledger));
         // Every name the body assigns has a declaration by now, so a name
         // still without one is never assigned: it is read, and nothing in the
         // function ever produced it. That is a definition the pipeline dropped
@@ -4883,16 +4634,24 @@ impl Decompiler {
 
         let observation_error = fold_ctx.observation_error.borrow().clone();
         drop(fold_ctx);
-        let native = match observation_journal {
+        let mut native = match observation_journal {
             Some(journal) => MarkedNativeDraft::new(c_function, journal.into_inner())
                 .finish_non_consuming(input.source_owned_facts(), observation_error),
             None => SealedNativeFunction::without_observations(
                 c_function,
                 binding_plan,
+                prepared,
                 observation_failure
                     .expect("missing observation journal retains its construction failure"),
             ),
         };
+        let ledger = effect_ledger::build_obligation_ledger(
+            prepared,
+            &normalization_origins,
+            native.effect_observations(),
+        );
+        debug_log_ledger(prepared, &ledger);
+        native.finalize_effect_ledger(&ledger);
         Ok(InternalBuildProduct::Native(native))
     }
 
@@ -5283,9 +5042,7 @@ fn debug_assigned_locals(func: &CFunction, after: &str) {
                         n += count_returns(std::slice::from_ref(body));
                     }
                 }
-                CStmt::While { body, .. } | CStmt::DoWhile { body, .. } | CStmt::For { body, .. } => {
-                    n += count_returns(std::slice::from_ref(body))
-                }
+                CStmt::While { body, .. } | CStmt::DoWhile { body, .. } | CStmt::For { body, .. } => n += count_returns(std::slice::from_ref(body)),
                 _ => {}
             }
         }
@@ -5344,7 +5101,8 @@ fn drop_overwritten_assignments(func: &mut CFunction) {
                 // The overwrite itself names the target, so it is tested before any read.
                 if let Some((target, rhs)) = assignment_target(stmt)
                     && target == name
-                    && count_var_reads_in_stmts(symbols, std::slice::from_ref(&CStmt::Expr(rhs.clone())), &spelling) == 0
+                    && count_var_reads_in_stmts(symbols, std::slice::from_ref(&CStmt::Expr(rhs.clone())), &spelling,
+                    ) == 0
                 {
                     overwritten = Some(offset);
                     break;
@@ -5430,12 +5188,14 @@ fn reconstruct_flag_conditions_in_function(func: &mut CFunction, fold_ctx: &Fold
     walk(&mut func.body, fold_ctx);
 }
 
-fn resolve_undeclared_carriers(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, func: &mut CFunction, fold_ctx: &FoldingContext<'_>) {
+fn resolve_undeclared_carriers(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, func: &mut CFunction, fold_ctx: &FoldingContext<'_>,
+) {
     let declared = func
         .params
         .iter()
         .map(|param| crate::symbol::spelling(symbols, param.name).to_ascii_lowercase())
-        .chain(func.locals.iter().map(|local| crate::symbol::spelling(symbols, local.name).to_ascii_lowercase()))
+        .chain(func.locals.iter().map(|local| crate::symbol::spelling(symbols, local.name).to_ascii_lowercase()),
+        )
         .collect::<HashSet<_>>();
 
     // Dropping one dead carrier can leave the value it read with no reader, so
@@ -5561,7 +5321,8 @@ fn drop_dead_undeclared_comma_carriers(symbols: &std::cell::RefCell<crate::symbo
         return;
     }
     for child in single_evaluation::children_mut(expr) {
-        drop_dead_undeclared_comma_carriers(symbols, child, declared, reads, fold_ctx, returns_value, removed);
+        drop_dead_undeclared_comma_carriers(symbols, child, declared, reads, fold_ctx, returns_value, removed,
+        );
     }
     let CExpr::Comma(items) = expr else {
         return;
@@ -5636,7 +5397,8 @@ fn collect_undeclared_carrier_targets(symbols: &std::cell::RefCell<crate::symbol
             && let CExpr::Var(name) = left.unobserved()
             && !declared.contains(&crate::symbol::spelling(symbols, *name).to_ascii_lowercase())
         {
-            out.push((crate::symbol::spelling(symbols, *name).to_string(), right.as_ref().clone()));
+            out.push((crate::symbol::spelling(symbols, *name).to_string(), right.as_ref().clone(),
+            ));
         }
         single_evaluation::for_each_child_block_mut(stmt, &mut |body, _| {
             collect_undeclared_carrier_targets(symbols, body, declared, out);
@@ -6021,13 +5783,13 @@ fn fold_constant_arithmetic_in_expr(
         let source = std::mem::replace(expr, CExpr::IntLit(0));
         *expr = crate::ast::carry_outer_expr_observations(
             &source,
-            CExpr::StringLit(text.clone()),
-        );
+            CExpr::StringLit(text.clone()));
     }
 }
 
 /// How many times `name` is read across these statements.
-fn count_var_reads_in_stmts(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, stmts: &[CStmt], name: &str) -> usize {
+fn count_var_reads_in_stmts(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, stmts: &[CStmt], name: &str,
+) -> usize {
     let mut reads = 0;
     for stmt in stmts {
         count_var_reads_in_stmt(symbols, stmt, name, &mut reads);
@@ -6035,7 +5797,8 @@ fn count_var_reads_in_stmts(symbols: &std::cell::RefCell<crate::symbol::SymbolTa
     reads
 }
 
-fn count_var_reads_in_stmt(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, stmt: &CStmt, name: &str, reads: &mut usize) {
+fn count_var_reads_in_stmt(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, stmt: &CStmt, name: &str, reads: &mut usize,
+) {
     let mut count_expr = |expr: &CExpr, reads: &mut usize| {
         expr.visit(&mut |node| {
             if matches!(node, CExpr::Var(found) if crate::symbol::spelling(symbols, *found).eq_ignore_ascii_case(name)) {
@@ -6044,9 +5807,7 @@ fn count_var_reads_in_stmt(symbols: &std::cell::RefCell<crate::symbol::SymbolTab
         });
     };
     match stmt {
-        CStmt::StructuredRegion { stmt, .. } => {
-            count_var_reads_in_stmt(symbols, stmt, name, reads)
-        }
+        CStmt::StructuredRegion { stmt, .. } => count_var_reads_in_stmt(symbols, stmt, name, reads),
         CStmt::Observed { stmt, .. } => count_var_reads_in_stmt(symbols, stmt, name, reads),
         CStmt::Empty
         | CStmt::Break
@@ -6337,11 +6098,10 @@ fn prune_dead_temp_assignments_in_function_body(
 
 fn normalize_redundant_return_carrier_casts(func: &mut CFunction) {
     let symbols = &func.symbols;
-    fn visit(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, stmt: &mut CStmt, ret_type: &CType, declared_types: &HashMap<String, CType>) {
+    fn visit(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, stmt: &mut CStmt, ret_type: &CType, declared_types: &HashMap<String, CType>,
+    ) {
         match stmt {
-            CStmt::StructuredRegion { stmt, .. } => {
-                visit(symbols, stmt, ret_type, declared_types)
-            }
+            CStmt::StructuredRegion { stmt, .. } => visit(symbols, stmt, ret_type, declared_types),
             CStmt::Observed { stmt, .. } => visit(symbols, stmt, ret_type, declared_types),
             CStmt::Return(Some(expr)) => {
                 let mut target = expr;
@@ -6412,12 +6172,17 @@ fn normalize_redundant_return_carrier_casts(func: &mut CFunction) {
     let declared_types = func
         .params
         .iter()
-        .map(|param| (crate::symbol::spelling(symbols, param.name).to_ascii_lowercase(), param.ty.clone()))
+        .map(|param| {
+            (crate::symbol::spelling(symbols, param.name).to_ascii_lowercase(), param.ty.clone(),
+            )
+        })
         .chain(
             func.locals
                 .iter()
-                .map(|local| (crate::symbol::spelling(symbols, local.name).to_ascii_lowercase(), local.ty.clone())),
-        )
+                .map(|local| {
+            (crate::symbol::spelling(symbols, local.name).to_ascii_lowercase(), local.ty.clone(),
+            )
+        }))
         .collect::<HashMap<_, _>>();
     for stmt in &mut func.body {
         visit(symbols, stmt, &func.ret_type, &declared_types);
@@ -6565,7 +6330,8 @@ const RETURN_TYPE_KEY: &str = "\u{0}return";
 
 fn normalize_declared_assignment_literals(func: &mut CFunction) {
     let symbols = &func.symbols;
-    fn visit_expr(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, expr: &mut CExpr, declared_types: &HashMap<String, CType>) {
+    fn visit_expr(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, expr: &mut CExpr, declared_types: &HashMap<String, CType>,
+    ) {
         match expr {
             CExpr::Observed { expr, .. } => visit_expr(symbols, expr, declared_types),
             CExpr::Unary { operand, .. }
@@ -6631,11 +6397,10 @@ fn normalize_declared_assignment_literals(func: &mut CFunction) {
         }
     }
 
-    fn visit_stmt(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, stmt: &mut CStmt, declared_types: &HashMap<String, CType>) {
+    fn visit_stmt(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, stmt: &mut CStmt, declared_types: &HashMap<String, CType>,
+    ) {
         match stmt {
-            CStmt::StructuredRegion { stmt, .. } => {
-                visit_stmt(symbols, stmt, declared_types)
-            }
+            CStmt::StructuredRegion { stmt, .. } => visit_stmt(symbols, stmt, declared_types),
             CStmt::Observed { stmt, .. } => visit_stmt(symbols, stmt, declared_types),
             CStmt::Expr(expr) => visit_expr(symbols, expr, declared_types),
             CStmt::Decl { ty, init, .. } => {
@@ -6720,12 +6485,17 @@ fn normalize_declared_assignment_literals(func: &mut CFunction) {
     let mut declared_types = func
         .params
         .iter()
-        .map(|param| (crate::symbol::spelling(symbols, param.name).to_ascii_lowercase(), param.ty.clone()))
+        .map(|param| {
+            (crate::symbol::spelling(symbols, param.name).to_ascii_lowercase(), param.ty.clone(),
+            )
+        })
         .chain(
             func.locals
                 .iter()
-                .map(|local| (crate::symbol::spelling(symbols, local.name).to_ascii_lowercase(), local.ty.clone())),
-        )
+                .map(|local| {
+            (crate::symbol::spelling(symbols, local.name).to_ascii_lowercase(), local.ty.clone(),
+            )
+        }))
         .collect::<HashMap<_, _>>();
     declared_types.insert(RETURN_TYPE_KEY.to_string(), func.ret_type.clone());
     for stmt in &mut func.body {
@@ -6733,7 +6503,8 @@ fn normalize_declared_assignment_literals(func: &mut CFunction) {
     }
 }
 
-fn prune_unused_pure_locals(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, func: &mut CFunction) {
+fn prune_unused_pure_locals(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, func: &mut CFunction,
+) {
     loop {
         let live_reads = collect_function_local_reads(symbols, func);
         let dead_locals = func
@@ -6748,21 +6519,27 @@ fn prune_unused_pure_locals(symbols: &std::cell::RefCell<crate::symbol::SymbolTa
         }
 
         func.locals
-            .retain(|local| !dead_locals.contains(&crate::symbol::spelling(symbols, local.name).to_ascii_lowercase()));
+            .retain(|local| {
+            !dead_locals.contains(&crate::symbol::spelling(symbols, local.name).to_ascii_lowercase())
+        });
         prune_unused_pure_local_stmts(symbols, &mut func.body, &dead_locals);
     }
 }
 
-fn prune_unreferenced_local_declarations(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, func: &mut CFunction) {
+fn prune_unreferenced_local_declarations(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, func: &mut CFunction,
+) {
     let referenced = collect_stmt_var_names(&func.body)
         .into_iter()
         .map(|name| crate::symbol::spelling(symbols, name).to_ascii_lowercase())
         .collect::<HashSet<_>>();
     func.locals
-        .retain(|local| referenced.contains(&crate::symbol::spelling(symbols, local.name).to_ascii_lowercase()));
+        .retain(|local| {
+        referenced.contains(&crate::symbol::spelling(symbols, local.name).to_ascii_lowercase())
+    });
 }
 
-fn collect_function_local_reads(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, func: &CFunction) -> HashSet<String> {
+fn collect_function_local_reads(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, func: &CFunction,
+) -> HashSet<String> {
     let mut reads = HashSet::new();
     for stmt in &func.body {
         collect_stmt_local_reads(symbols, stmt, &mut reads);
@@ -6770,7 +6547,8 @@ fn collect_function_local_reads(symbols: &std::cell::RefCell<crate::symbol::Symb
     reads
 }
 
-fn collect_stmt_local_reads(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, stmt: &CStmt, reads: &mut HashSet<String>) {
+fn collect_stmt_local_reads(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, stmt: &CStmt, reads: &mut HashSet<String>,
+) {
     match stmt {
         CStmt::StructuredRegion { stmt, .. } => collect_stmt_local_reads(symbols, stmt, reads),
         CStmt::Observed { stmt, .. } => collect_stmt_local_reads(symbols, stmt, reads),
@@ -6860,7 +6638,8 @@ fn collect_stmt_local_reads(symbols: &std::cell::RefCell<crate::symbol::SymbolTa
     }
 }
 
-fn collect_expr_local_reads(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, expr: &CExpr, reads: &mut HashSet<String>) {
+fn collect_expr_local_reads(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, expr: &CExpr, reads: &mut HashSet<String>,
+) {
     match expr {
         CExpr::Observed { expr, .. } => collect_expr_local_reads(symbols, expr, reads),
         CExpr::Var(name) => {
@@ -6924,14 +6703,16 @@ fn collect_expr_local_reads(symbols: &std::cell::RefCell<crate::symbol::SymbolTa
     }
 }
 
-fn prune_unused_pure_local_stmts(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, stmts: &mut Vec<CStmt>, dead_locals: &HashSet<String>) {
+fn prune_unused_pure_local_stmts(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, stmts: &mut Vec<CStmt>, dead_locals: &HashSet<String>,
+) {
     for stmt in stmts.iter_mut() {
         prune_unused_pure_local_stmt(symbols, stmt, dead_locals);
     }
     stmts.retain(|stmt| !matches!(stmt, CStmt::Empty));
 }
 
-fn prune_unused_pure_local_stmt(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, stmt: &mut CStmt, dead_locals: &HashSet<String>) {
+fn prune_unused_pure_local_stmt(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, stmt: &mut CStmt, dead_locals: &HashSet<String>,
+) {
     match stmt {
         CStmt::StructuredRegion { stmt: inner, .. } => {
             prune_unused_pure_local_stmt(symbols, inner, dead_locals);
@@ -7154,7 +6935,8 @@ mod tests {
             crate::symbol::var_ref(&symbols, "local_4"),
             crate::symbol::var_ref(&symbols, "local_4"),
         ));
-        substitute_var_in_stmt(&mut stmt, crate::symbol::declare(&symbols, "local_4"), &CExpr::IntLit(1));
+        substitute_var_in_stmt(&mut stmt, crate::symbol::declare(&symbols, "local_4"), &CExpr::IntLit(1),
+        );
         assert_eq!(
             stmt,
             CStmt::Expr(CExpr::assign(
@@ -7172,7 +6954,8 @@ mod tests {
             crate::symbol::var_ref(&symbols, "local_4"),
             crate::symbol::var_ref(&symbols, "local_4"),
         ));
-        substitute_var_in_stmt(&mut stmt, crate::symbol::declare(&symbols, "local_4"), &CExpr::IntLit(1));
+        substitute_var_in_stmt(&mut stmt, crate::symbol::declare(&symbols, "local_4"), &CExpr::IntLit(1),
+        );
         assert_eq!(
             stmt,
             CStmt::Expr(CExpr::binary(
@@ -7750,7 +7533,8 @@ mod tests {
         let symbols = test_table();
         let mut func = CFunction::new("carrier", CType::Int(32)).with_body(vec![CStmt::if_stmt(
             CExpr::IntLit(1),
-            CStmt::Return(Some(CExpr::cast(CType::Int(64), CExpr::var(crate::symbol::declare(&symbols, "result"))))),
+            CStmt::Return(Some(CExpr::cast(CType::Int(64), CExpr::var(crate::symbol::declare(&symbols, "result")),
+            ))),
             None,
         )]);
         func.locals.push(ast::CLocal {
@@ -7844,8 +7628,7 @@ mod tests {
             .with_body(vec![CStmt::Return(Some(expr))]);
         let reachable = crate::ast::strip_render_observations(
             &mut function,
-            observations.expected_count(),
-        )
+            observations.expected_count())
         .expect("constant folding preserves a valid marker domain");
 
         assert!(reachable.contains(root_id));
@@ -7861,7 +7644,8 @@ mod tests {
     fn unreferenced_local_declaration_is_removed_without_touching_live_locals() {
         let symbols = test_table();
         let mut func = CFunction::new("locals", CType::Int(32))
-            .with_body(vec![CStmt::Return(Some(CExpr::var(crate::symbol::declare(&symbols, "live"))))]);
+            .with_body(vec![CStmt::Return(Some(CExpr::var(crate::symbol::declare(&symbols, "live"))),
+        )]);
         func.locals = vec![
             ast::CLocal {
                 ty: CType::Int(32),
@@ -7916,8 +7700,7 @@ mod tests {
         assert!(func.locals.is_empty());
         let reachable = crate::ast::strip_render_observations(
             &mut func,
-            observations.expected_count(),
-        )
+            observations.expected_count())
         .expect("remaining marker domain is valid");
         assert!(reachable.contains(initializer_id));
         assert!(!reachable.contains(write_id));
@@ -7946,8 +7729,7 @@ mod tests {
             .with_body(vec![commented]);
         let reachable = crate::ast::strip_render_observations(
             &mut function,
-            observations.expected_count(),
-        )
+            observations.expected_count())
         .expect("comment insertion preserves a valid marker domain");
         assert!(reachable.contains(stmt_id));
     }
@@ -7970,8 +7752,7 @@ mod tests {
 
         let reachable = crate::ast::strip_render_observations(
             &mut function,
-            observations.expected_count(),
-        )
+            observations.expected_count())
         .expect("comment insertion preserves a valid marker domain");
         assert!(reachable.contains(child_id));
         assert!(
@@ -8006,8 +7787,7 @@ mod tests {
 
         let reachable = crate::ast::strip_render_observations(
             &mut function,
-            observations.expected_count(),
-        )
+            observations.expected_count())
         .expect("block decomposition preserves a valid marker domain");
         assert!(reachable.contains(first_id));
         assert!(
@@ -8461,12 +8241,11 @@ mod tests {
         );
     }
 
-    /// A route the certification kernel did not claim used to lose its whole
-    /// function: rendering returned a single comment and nothing else, so one
-    /// unproven construct cost every proven one beside it. The structurer marks
-    /// what it cannot prove, so the function is rendered either way.
+    /// Native C is admitted only when every source effect is exactly rendered
+    /// or upstream-justified as elided. A typed refusal remains scored even
+    /// when another source effect did survive the final emission tree.
     #[test]
-    fn a_standard_route_renders_instead_of_refusing_the_whole_function() {
+    fn a_standard_route_refusal_retains_the_exact_effect_tuple() {
         let arch = test_arch_for_decompile();
         let prepared = prepared_from_ops(
             vec![R2ILOp::Return {
@@ -8486,21 +8265,29 @@ mod tests {
         let decompiler = Decompiler::new(DecompilerConfig::x86_64());
         let built = decompiler.build_function_from_input(&input);
         assert!(
-            built
+            !built
                 .body
                 .iter()
                 .any(|stmt| matches!(stmt, CStmt::Return(_))),
-            "standard route must render its return, got {:?}",
+            "non-admitted native C must become a comment-only residual: {:?}",
             built.body
         );
         assert!(
-            !format!("{:?}", built.body).contains("Standard executable rendering is unavailable"),
-            "standard route must not refuse the function wholesale: {:?}",
+            format!("{:?}", built.body).contains("source effect closure refused native C"),
+            "the typed effect refusal must be visible in the residual: {:?}",
             built.body
         );
 
-        let output = decompiler.decompile_input(&input);
-        assert!(output.contains("return"), "{output}");
+        let audited = decompiler.decompile_input_with_binding_audit(&input);
+        let effects = audited.effect_obligations();
+        assert_eq!(effects.disposition, EffectObligationDisposition::Refused);
+        assert_eq!(effects.total, 2);
+        assert_eq!(effects.rendered, 1);
+        assert_eq!(effects.refused, 1);
+        assert_eq!(effects.justified_elision, 0);
+        assert_eq!(effects.unaccounted, 0);
+        assert_eq!(effects.conflicts, 0);
+        assert!(!audited.output().contains("return"), "{}", audited.output());
     }
 
     #[test]

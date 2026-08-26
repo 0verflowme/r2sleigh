@@ -45,9 +45,7 @@ use crate::binding_plan::{BindingPlan, BindingPlanSourceMismatch};
 use crate::registers::register_family_name;
 
 use super::SSABlock;
-use super::context::{
-    EffectRenderProofKind, FoldingContext, PhiEdgeRenderKind, PhiEdgeRenderProof,
-};
+use super::context::{EffectOccurrenceKind, FoldingContext};
 use super::context::{ResolutionGuardKey, ResolutionPhase};
 use super::flags::is_cpu_flag;
 use super::{

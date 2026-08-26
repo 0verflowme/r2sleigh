@@ -412,15 +412,15 @@ impl<'a> FoldingContext<'a> {
                         {
                             return None;
                         }
-                        self.record_effect_render_proof_for_source_memory(
-                            EffectRenderProofKind::MemoryRead,
+                        let obligations = self.exact_effect_obligations_for_source_memory(
+                            EffectOccurrenceKind::MemoryRead,
                             block_addr,
                             op_idx,
                             fact.space,
                             Some(fact.address),
                             fact.value,
                         );
-                        Some(rendered)
+                        Some(self.observe_effect_expr(&obligations, rendered))
                     }
                     SSAOp::IntAdd { a, b, .. } => {
                         self.certified_binary_return_expr(BinaryOp::Add, a, b, depth, visited)
@@ -852,7 +852,8 @@ impl<'a> FoldingContext<'a> {
                 function_facts: self.inputs.function_facts,
                 #[cfg(test)]
                 certified_rendering_required: false,
-            })
+            },
+                )
         }))
         }
     }
@@ -2564,36 +2565,6 @@ impl<'a> FoldingContext<'a> {
         }
     }
 
-    /// Check if a variable is dead (never used).
-    /// Which rule in `is_dead` answered for this value, for the unowned report.
-    pub(crate) fn dead_value_reason(&self, var: &SSAVar) -> &'static str {
-        let key = var.display_name();
-        let lower = var.name.to_lowercase();
-        if self.inputs.arch.is_flag_name(&lower) {
-            return "dead-cpu-flag";
-        }
-        if self.flag_only_values_set().contains(&key) {
-            return "dead-flag-only";
-        }
-        if self.use_count_of(&key) > 0 {
-            return "dead-used";
-        }
-        if var.is_temp() || var.is_const() || matches!(var.name_kind(), SSAVarNameKind::RegisterAlias)
-        {
-            return "dead-unused-temp";
-        }
-        if self.inputs.arch.is_caller_saved_name(&lower) {
-            return "dead-caller-saved";
-        }
-        if self.consumed_by_call_set().contains(&key) {
-            return "dead-call-arg";
-        }
-        if self.inputs.arch.is_stack_base_name(&lower) {
-            return "dead-stack-base";
-        }
-        "dead-other"
-    }
-
     pub fn is_dead(&self, var: &SSAVar) -> bool {
         let key = var.display_name();
         let use_count = self.use_count_of(&key);
@@ -2998,15 +2969,13 @@ impl<'a> FoldingContext<'a> {
                 {
                     let replacement = self.simplify_linear_scale(
                         &left.clone_without_render_observations(),
-                        coeff,
-                    );
+                        coeff);
                     Self::finish_nonpositional_identity_rewrite(op, left, right, replacement)
                 } else if let Some(coeff) = self.literal_to_i64(&left)
                 {
                     let replacement = self.simplify_linear_scale(
                         &right.clone_without_render_observations(),
-                        coeff,
-                    );
+                        coeff);
                     Self::finish_nonpositional_identity_rewrite(op, left, right, replacement)
                 } else {
                     CExpr::binary(op, left, right)
@@ -3654,7 +3623,9 @@ impl<'a> FoldingContext<'a> {
                 self.call_result_source_for_ssa_name(&self.spelling(*name))
                     .or_else(|| self.local_post_call_source_for_ssa_name(&self.spelling(*name)))
                     .and_then(|source| self.stable_owned_call_result_expr_for_source(source))
-                    .or_else(|| self.stable_owned_call_result_expr_for_name(&self.spelling(*name), true))
+                    .or_else(|| {
+                        self.stable_owned_call_result_expr_for_name(&self.spelling(*name), true)
+                    })
                     .or_else(|| self.best_visible_definition(&self.spelling(*name)))
                     .map(|candidate| {
                         self.simplify_switch_selector_expr(self.rewrite_stack_expr(candidate))
@@ -3900,15 +3871,13 @@ impl<'a> FoldingContext<'a> {
 
         match base {
             analysis::BaseRef::Value(value) => self.render_value_ref(value, depth + 1, visited),
-            analysis::BaseRef::StackSlot(offset) => {
-                self.resolve_stack_var(*offset).map(|n| crate::symbol::var_ref(&symbols, n)).map(|expr| {
+            analysis::BaseRef::StackSlot(offset) => self.resolve_stack_var(*offset).map(|n| crate::symbol::var_ref(&symbols, n)).map(|expr| {
                     if as_address {
                         CExpr::AddrOf(Box::new(expr))
                     } else {
                         expr
                     }
-                })
-            }
+                }),
             analysis::BaseRef::Raw(expr) => {
                 if let Some(owner) = self.stable_owned_call_result_expr_for_raw_call(expr) {
                     return Some(owner);
@@ -5323,7 +5292,8 @@ impl<'a> FoldingContext<'a> {
         None
     }
 
-    fn certified_stack_owner_value_ref_for_name(&self, _name: crate::symbol::SymbolId) -> Option<analysis::ValueRef> {
+    fn certified_stack_owner_value_ref_for_name(&self, _name: crate::symbol::SymbolId,
+    ) -> Option<analysis::ValueRef> {
         let _name_id = _name;
         let _name = &self.spelling(_name_id);
 
@@ -5579,7 +5549,8 @@ impl<'a> FoldingContext<'a> {
                 }
                 let mut semantic_visited = HashSet::new();
                 if let Some(semantic) =
-                    self.render_semantic_value_by_name(&self.spelling(*name), depth + 1, &mut semantic_visited)
+                    self.render_semantic_value_by_name(&self.spelling(*name), depth + 1, &mut semantic_visited,
+                )
                     && !matches!(&semantic, CExpr::Var(inner) if inner == name)
                     && let Some(addr) = self.normalized_addr_from_visible_expr(&semantic, depth + 1)
                 {
@@ -7424,7 +7395,8 @@ impl<'a> FoldingContext<'a> {
 
     fn call_target_identity(&self, expr: &CExpr) -> Option<String> {
         match expr {
-            CExpr::Var(name) => Some(self.callee_identity_for_name(&self.spelling(*name)).primary_key()),
+            CExpr::Var(name) => Some(self.callee_identity_for_name(&self.spelling(*name)).primary_key(),
+            ),
             CExpr::Paren(inner) | CExpr::AddrOf(inner) | CExpr::Deref(inner) => {
                 self.call_target_identity(inner)
             }
@@ -7498,7 +7470,8 @@ impl<'a> FoldingContext<'a> {
             .or_else(|| self.synthesized_call_expr_for_source_call(source_call))
     }
 
-    pub(super) fn should_preserve_owned_call_result_visible_name(&self, name: crate::symbol::SymbolId) -> bool {
+    pub(super) fn should_preserve_owned_call_result_visible_name(&self, name: crate::symbol::SymbolId,
+    ) -> bool {
         let name_id = name;
         let name = &self.spelling(name_id);
 
@@ -7863,9 +7836,7 @@ impl<'a> FoldingContext<'a> {
 
     fn expr_contains_raw_stack_base_arithmetic(&self, expr: &CExpr) -> bool {
         match expr {
-            CExpr::Observed { expr, .. } => {
-                self.expr_contains_raw_stack_base_arithmetic(expr)
-            }
+            CExpr::Observed { expr, .. } => self.expr_contains_raw_stack_base_arithmetic(expr),
             CExpr::Binary {
                 op: BinaryOp::Add | BinaryOp::Sub,
                 left,
@@ -8370,7 +8341,8 @@ impl<'a> FoldingContext<'a> {
             || Self::is_low_quality_imported_call_arg_name(&symbols, name_id)
     }
 
-    fn is_low_quality_imported_call_arg_name(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, name: crate::symbol::SymbolId) -> bool {
+    fn is_low_quality_imported_call_arg_name(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, name: crate::symbol::SymbolId,
+    ) -> bool {
         let name_id = name;
         let name = &crate::symbol::spelling(symbols, name_id);
 
@@ -8492,7 +8464,9 @@ impl<'a> FoldingContext<'a> {
                         .and_then(|ssa_name| self.guess_ssa_var_from_name(&ssa_name))
                         .and_then(|var| self.type_hint_for_var(&var))
                 })
-                .or_else(|| self.owned_call_result_return_type_for_visible_name(&self.spelling(*name))),
+                .or_else(|| {
+                    self.owned_call_result_return_type_for_visible_name(&self.spelling(*name))
+                }),
             CExpr::Call { func, .. } => self
                 .known_signature_for_callee_expr(func)
                 .map(|sig| crate::variable::type_like_to_ctype(&sig.return_type)),
@@ -9959,7 +9933,8 @@ impl<'a> FoldingContext<'a> {
                 let visit_key = format!("vis:{}", self.spelling(*name));
                 if visited.insert(visit_key.clone()) {
                     if let Some(def) =
-                        self.lookup_definition_raw_with_depth(&self.spelling(*name), depth + 1, visited)
+                        self.lookup_definition_raw_with_depth(&self.spelling(*name), depth + 1, visited,
+                    )
                         && !matches!(&def, CExpr::Var(inner) if inner == name)
                     {
                         let semanticized = self.semanticize_visible_expr(&def, depth + 1, visited);
@@ -10317,7 +10292,8 @@ impl<'a> FoldingContext<'a> {
                             })
                     })
                     .or_else(|| {
-                        self.resolve_expr_from_phi_sources(&self.spelling(*name), depth + 1, visited, true)
+                        self.resolve_expr_from_phi_sources(&self.spelling(*name), depth + 1, visited, true,
+                        )
                             .and_then(|expr| {
                                 self.evaluate_constish_call_arg_expr_with_visited(
                                     &expr,
@@ -10635,7 +10611,8 @@ impl<'a> FoldingContext<'a> {
 
                 let mut semantic_visited = HashSet::new();
                 if let Some(semantic) =
-                    self.render_semantic_value_by_name(&self.spelling(*name), depth + 1, &mut semantic_visited)
+                    self.render_semantic_value_by_name(&self.spelling(*name), depth + 1, &mut semantic_visited,
+                )
                     && self.prefers_visible_expr(expr, &semantic)
                 {
                     let visit_key = format!("call-sem:{}", self.spelling(*name));
@@ -10652,7 +10629,10 @@ impl<'a> FoldingContext<'a> {
                         self.lookup_definition_raw(&self.spelling(*name)),
                         self.lookup_definition(&self.spelling(*name)),
                     )
-                    .or_else(|| self.resolve_expr_from_phi_sources(&self.spelling(*name), depth + 1, visited, true))
+                    .or_else(|| {
+                        self.resolve_expr_from_phi_sources(&self.spelling(*name), depth + 1, visited, true,
+                        )
+                    })
                     .or_else(|| self.best_visible_definition(&self.spelling(*name)));
                 if let Some(candidate) = candidate
                     && !matches!(&candidate, CExpr::Var(inner) if inner == name)
@@ -11216,7 +11196,8 @@ impl<'a> FoldingContext<'a> {
                     }
                 }
                 if let Some(best) =
-                    self.resolve_expr_from_phi_sources(&self.spelling(*name), depth + 1, visited, true)
+                    self.resolve_expr_from_phi_sources(&self.spelling(*name), depth + 1, visited, true,
+                )
                     && !matches!(&best, CExpr::Var(inner) if self.spelling(*inner).eq_ignore_ascii_case(&self.spelling(*name)))
                 {
                     return best;
@@ -11382,7 +11363,8 @@ impl<'a> FoldingContext<'a> {
                         )
                     })
                     .or_else(|| {
-                        self.resolve_expr_from_phi_sources(&self.spelling(*name), depth + 1, visited, true)
+                        self.resolve_expr_from_phi_sources(&self.spelling(*name), depth + 1, visited, true,
+                        )
                             .and_then(|candidate| {
                                 self.resolve_string_like_imported_call_arg_expr(
                                     &candidate,
@@ -11794,7 +11776,8 @@ impl<'a> FoldingContext<'a> {
         self.inputs.arch.is_register_like_base_name(base) && !Self::is_semantic_binding_name(base)
     }
 
-    fn opaque_public_call_arg_display_name(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, name: crate::symbol::SymbolId) -> String {
+    fn opaque_public_call_arg_display_name(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, name: crate::symbol::SymbolId,
+    ) -> String {
         let name_id = name;
         let name = &crate::symbol::spelling(symbols, name_id);
 
@@ -12068,22 +12051,10 @@ impl<'a> FoldingContext<'a> {
             self.current_op_idx.set(Some(op_idx));
             // Skip stack frame setup/teardown if enabled
             if self.is_stack_frame_op(op) {
-                self.note_elided_normalized_op(block.addr, op_idx, "stack-frame");
                 continue;
             }
 
-            // An op that renders inside an expression rather than as a statement is
-            // still rendered, and the expression that consumed it owns it. Recording
-            // the site here is what says so; without it the only ops on record are
-            // the ones that happened to become statements, and an accounting of what
-            // the output owes reads every inlined effect as missing.
             if self.is_inlined_single_use_call_result(block, op_idx, op) {
-                self.record_effect_render_proof_for_normalized_value(
-                    EffectRenderProofKind::Expression,
-                    block.addr,
-                    op_idx,
-                    op.dst().and_then(|dst| self.value_id_for_rendered_op(dst)),
-                );
                 continue;
             }
 
@@ -12149,16 +12120,6 @@ impl<'a> FoldingContext<'a> {
                 && let Some(offset) = self.stack_slot_offset_for_var(addr)
                 && self.state.return_stack_slots.contains(&offset)
             {
-                if let SSAOp::Load { dst, space, addr } = op {
-                    self.record_effect_render_proof_for_normalized_memory(
-                        EffectRenderProofKind::MemoryRead,
-                        block.addr,
-                        op_idx,
-                        *space,
-                        self.value_id_for_rendered_op(addr),
-                        self.value_id_for_rendered_op(dst),
-                    );
-                }
                 continue;
             }
 
@@ -12389,16 +12350,14 @@ impl<'a> FoldingContext<'a> {
                     block.addr,
                     op_idx,
                     0,
-                    final_expr,
-                );
-                let return_stmt = CStmt::Return(Some(final_expr));
-                self.record_effect_render_proof_for_normalized_value(
-                    EffectRenderProofKind::Return,
+                    final_expr);
+                let obligations = self.exact_effect_obligations_for_normalized_value(
+                    EffectOccurrenceKind::Return,
                     block.addr,
-                    return_op_idx,
+                    op_idx,
                     certified_value,
                 );
-                stmts.push(return_stmt);
+                stmts.push(self.observe_effect_stmt(&obligations, CStmt::Return(Some(final_expr))));
 
                 break;
             }
@@ -12432,7 +12391,6 @@ impl<'a> FoldingContext<'a> {
             // Skip operations that produce dead values
             if let Some(dst) = op.dst() {
                 if self.is_dead(dst) {
-                    self.note_elided_normalized_op(block.addr, op_idx, self.dead_value_reason(dst));
                     continue;
                 }
 
@@ -12448,62 +12406,22 @@ impl<'a> FoldingContext<'a> {
                         self.inlined_renderings
                             .borrow_mut()
                             .insert(key.clone(), inlined);
-                        // This event has a concrete expression for the omitted
-                        // producer. A raw destination fallback has rendered no
-                        // definition and must not mint a proof.
-                        self.record_effect_render_proof_for_normalized_value(
-                            EffectRenderProofKind::Expression,
-                            block.addr,
-                            op_idx,
-                            self.value_id_for_rendered_op(dst),
-                        );
                     }
                     continue;
                 }
 
                 // Skip if this op's destination was consumed by call argument collection
                 if self.consumed_by_call_set().contains(&key) {
-                    self.record_effect_render_proof_for_normalized_value(
-                        EffectRenderProofKind::Expression,
-                        block.addr,
-                        op_idx,
-                        self.value_id_for_rendered_op(dst),
-                    );
                     continue;
                 }
             }
 
             if let Some(stmt) = self.op_to_stmt_with_args(op, block.addr, op_idx) {
-                // An op that became a statement is owned by that statement. Only the
-                // memory ones were on record, so arithmetic, copies and everything
-                // else that reached the page read as unaccounted for.
-                if !matches!(stmt.unobserved(), CStmt::Comment(_) | CStmt::Empty) {
-                    self.record_effect_render_proof_for_normalized_value(
-                        EffectRenderProofKind::Expression,
-                        block.addr,
-                        op_idx,
-                        op.dst().and_then(|dst| self.value_id_for_rendered_op(dst)),
-                    );
-                }
-                let is_return = matches!(stmt, CStmt::Return(_));
+                let is_return = matches!(stmt.unobserved(), CStmt::Return(_));
                 stmts.push(stmt);
                 if is_return {
                     break;
                 }
-            } else if let Some(dst) = op.dst()
-                && self.use_count_of(&dst.display_name()) > 0
-            {
-                // No statement means the value renders inside an expression rather
-                // than on its own line, and the expression that reads it owns it.
-                // A value nothing reads is a different case and stays unrecorded,
-                // because that is exactly what an accounting of the output has to
-                // be able to see.
-                self.record_effect_render_proof_for_normalized_value(
-                    EffectRenderProofKind::Expression,
-                    block.addr,
-                    op_idx,
-                    self.value_id_for_rendered_op(dst),
-                );
             }
         }
 
@@ -12538,18 +12456,19 @@ impl<'a> FoldingContext<'a> {
                                     final_expr,
                                 )
                             });
-                        let return_stmt = CStmt::Return(Some(final_expr));
                         let value = certified_value.or_else(|| {
                             self.certified_return_for_normalized_op(block.addr, op_idx)
                                 .map(|cert| cert.value)
                         });
-                        self.record_effect_render_proof_for_normalized_value(
-                            EffectRenderProofKind::Return,
+                        let obligations = self.exact_effect_obligations_for_normalized_value(
+                            EffectOccurrenceKind::Return,
                             block.addr,
                             op_idx,
                             value,
                         );
-                        stmts.push(return_stmt);
+                        stmts.push(
+                            self.observe_effect_stmt(&obligations, CStmt::Return(Some(final_expr))),
+                        );
                     } else {
                         stmts.push(CStmt::Return(Some(final_expr)));
                     }
@@ -12876,7 +12795,6 @@ impl<'a> FoldingContext<'a> {
                 let elem_ty = self
                     .type_hint_for_var(val)
                     .unwrap_or_else(|| type_from_size(val.size));
-                let mut certified_store_fact = None;
                 let lhs = self.render_canonical_store_target_expr(addr, val.size, elem_ty.clone());
                 let mut rhs = if let CExpr::Var(lhs_name) = &lhs
                     && let Some(source_call) = self
@@ -12886,7 +12804,8 @@ impl<'a> FoldingContext<'a> {
                         .stable_owned_call_result_name_for_source(source_call)
                         .is_some_and(|owner| {
                             owner.eq_ignore_ascii_case(&self.spelling(*lhs_name))
-                                || self.visible_names_share_stack_slot(&owner, &self.spelling(*lhs_name))
+                                || self.visible_names_share_stack_slot(&owner, &self.spelling(*lhs_name),
+                                )
                         })
                         || self
                             .stack_offset_for_visible_storage_name(&self.spelling(*lhs_name))
@@ -12972,16 +12891,6 @@ impl<'a> FoldingContext<'a> {
                     && !self.looks_like_pointer(&rhs)
                 {
                     rhs = CExpr::cast(val_ty, rhs);
-                }
-                if let Some((block_addr, op_idx, space, address, value)) = certified_store_fact {
-                    self.record_effect_render_proof_for_source_memory(
-                        EffectRenderProofKind::MemoryWrite,
-                        block_addr,
-                        op_idx,
-                        space,
-                        address,
-                        value,
-                    );
                 }
                 let lhs = self.observed_input(frame, 0, lhs);
                 let rhs = self.observed_input(frame, 1, rhs);
@@ -13098,7 +13007,9 @@ impl<'a> FoldingContext<'a> {
                 BinaryOp::Div,
                 Some(uint_type_from_size(dst.size)),
             ),
-            SSAOp::IntSDiv { dst, a, b } => self.signed_divrem_stmt(frame, dst, a, b, BinaryOp::Div),
+            SSAOp::IntSDiv { dst, a, b } => {
+                self.signed_divrem_stmt(frame, dst, a, b, BinaryOp::Div)
+            }
             SSAOp::IntRem { dst, a, b } => self.binary_stmt_typed(
                 frame,
                 dst,
@@ -13107,7 +13018,9 @@ impl<'a> FoldingContext<'a> {
                 BinaryOp::Mod,
                 Some(uint_type_from_size(dst.size)),
             ),
-            SSAOp::IntSRem { dst, a, b } => self.signed_divrem_stmt(frame, dst, a, b, BinaryOp::Mod),
+            SSAOp::IntSRem { dst, a, b } => {
+                self.signed_divrem_stmt(frame, dst, a, b, BinaryOp::Mod)
+            }
             SSAOp::IntAnd { dst, a, b } => self.binary_stmt(frame, dst, a, b, BinaryOp::BitAnd),
             SSAOp::IntOr { dst, a, b } => self.binary_stmt(frame, dst, a, b, BinaryOp::BitOr),
             SSAOp::IntXor { dst, a, b } => self.binary_stmt(frame, dst, a, b, BinaryOp::BitXor),
@@ -13120,9 +13033,8 @@ impl<'a> FoldingContext<'a> {
                 BinaryOp::Shr,
                 Some(uint_type_from_size(dst.size)),
             ),
-            SSAOp::IntSRight { dst, a, b } => {
-                self.binary_stmt_typed(frame, dst, a, b, BinaryOp::Shr, Some(type_from_size(dst.size)))
-            }
+            SSAOp::IntSRight { dst, a, b } => self.binary_stmt_typed(frame, dst, a, b, BinaryOp::Shr, Some(type_from_size(dst.size)),
+            ),
             SSAOp::IntLess { dst, a, b } => self.binary_stmt_typed(
                 frame,
                 dst,
@@ -13174,8 +13086,7 @@ impl<'a> FoldingContext<'a> {
                 let lhs = self.assignment_lhs_expr(dst);
                 let rhs = self.resolve_predicate_rhs_for_var(
                     dst,
-                    CExpr::unary(UnaryOp::Not, input(0, src)),
-                );
+                    CExpr::unary(UnaryOp::Not, input(0, src)));
                 self.assign_stmt(lhs, rhs)
             }
             SSAOp::IntZExt { dst, src } | SSAOp::IntSExt { dst, src } => {
@@ -13323,7 +13234,8 @@ impl<'a> FoldingContext<'a> {
                 let call = CExpr::call(CExpr::External {
                     name: "callother".to_string(),
                     kind: crate::symbol::ExternalKind::Intrinsic,
-                }, args);
+                }, args,
+                );
                 if let Some(dst) = output {
                     let lhs = self.assignment_lhs_expr(dst);
                     Some(CStmt::Expr(CExpr::assign(lhs, call)))
@@ -13381,11 +13293,9 @@ impl<'a> FoldingContext<'a> {
                 let rhs = CExpr::Ternary {
                     cond: Box::new(certified(cond).unwrap_or_else(|| input(0, cond))),
                     then_expr: Box::new(
-                        certified(if_true).unwrap_or_else(|| input(1, if_true)),
-                    ),
+                        certified(if_true).unwrap_or_else(|| input(1, if_true))),
                     else_expr: Box::new(
-                        certified(if_false).unwrap_or_else(|| input(2, if_false)),
-                    ),
+                        certified(if_false).unwrap_or_else(|| input(2, if_false))),
                 };
                 let rhs = self.assignment_rhs_with_type_policy(dst, None, rhs);
                 self.assign_stmt(lhs, rhs)
@@ -13395,8 +13305,7 @@ impl<'a> FoldingContext<'a> {
                     frame,
                     0,
                     self.rewrite_stack_expr(self.get_return_expr(target)),
-                ),
-            ))),
+                )))),
             SSAOp::Branch { .. } | SSAOp::CBranch { .. } => {
                 // Handled by control flow structuring
                 None
@@ -13644,7 +13553,8 @@ fn callother_ids_share_effect_and_result_lowering() {
             output: Some(output.clone()),
             userop,
             inputs: vec![input.clone()],
-        }, &frame);
+        }, &frame,
+        );
         assert_eq!(
             stmt,
             Some(CStmt::Expr(CExpr::assign(
@@ -13669,7 +13579,8 @@ fn callother_ids_share_effect_and_result_lowering() {
         output: None,
         userop: effect_userop,
         inputs: vec![input],
-    }, &frame);
+    }, &frame,
+    );
     assert_eq!(
         stmt,
         Some(CStmt::Expr(CExpr::call(

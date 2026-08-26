@@ -35,43 +35,11 @@ pub(crate) struct ResolutionGuardKey {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum EffectRenderProofKind {
-    Call,
+pub(crate) enum EffectOccurrenceKind {
     Expression,
     MemoryRead,
     MemoryWrite,
     Return,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum PhiEdgeRenderKind {
-    Direct,
-    UnconditionalDeadOnOtherEdges,
-    Guarded { condition: ValueId, truth: bool },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) struct PhiEdgeRenderProof {
-    /// Exact original phi inputs implemented by this normalized operation.
-    pub(crate) sites: Box<[UseSite]>,
-    pub(crate) kind: PhiEdgeRenderKind,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) struct EffectRenderProof {
-    pub(crate) kind: EffectRenderProofKind,
-    /// Exact canonical source obligations discharged by this render event.
-    ///
-    /// Keeping the IDs on the event prevents one rendered component from
-    /// silently claiming every obligation owned by the same instruction.
-    pub(crate) obligation_ids: BTreeSet<SemanticObligationId>,
-    pub(crate) call_disposition: Option<r2types::CallsiteRenderDisposition>,
-    pub(crate) target: Option<ValueId>,
-    pub(crate) space: Option<r2il::SpaceId>,
-    pub(crate) address: Option<ValueId>,
-    pub(crate) value: Option<ValueId>,
-    pub(crate) values: Vec<ValueId>,
-    pub(crate) phi_edge: Option<PhiEdgeRenderProof>,
 }
 
 #[derive(Debug, Clone)]
@@ -231,7 +199,6 @@ pub(crate) struct FoldingContext<'a> {
     pub(crate) definition_lookup_in_progress: std::cell::RefCell<HashSet<String>>,
     pub(crate) definition_raw_in_progress: std::cell::RefCell<HashSet<String>>,
     pub(crate) resolution_guard: std::cell::RefCell<HashSet<ResolutionGuardKey>>,
-    pub(crate) effect_render_proofs: std::cell::RefCell<Vec<EffectRenderProof>>,
     /// Blocks the fold walked, which is what expresses a merge standing at their head.
     pub(crate) folded_blocks: std::cell::RefCell<std::collections::BTreeSet<u64>>,
     /// One name per certified loop carrier, derived once because it is settled once.
@@ -249,10 +216,6 @@ pub(crate) struct FoldingContext<'a> {
     /// the same function. An identifier only means something in the table that
     /// issued it, so the passes cannot each hold a copy.
     pub(crate) symbols: std::rc::Rc<std::cell::RefCell<crate::symbol::SymbolTable>>,
-    /// Exact canonical obligations the fold can prove do not require output.
-    /// Downstream dead-name heuristics are not authority to populate this map.
-    pub(crate) elided_obligations:
-        std::cell::RefCell<std::collections::BTreeMap<SemanticObligationId, &'static str>>,
     /// First exact-observation failure. Lowering is largely `Option`-based, so
     /// marker issuance records the typed failure here and the native boundary
     /// retains it in the non-consuming audit while emitting the same marker-free
@@ -496,9 +459,7 @@ impl<'a> FoldingContext<'a> {
             definition_lookup_in_progress: std::cell::RefCell::new(HashSet::new()),
             definition_raw_in_progress: std::cell::RefCell::new(HashSet::new()),
             resolution_guard: std::cell::RefCell::new(HashSet::new()),
-            effect_render_proofs: std::cell::RefCell::new(Vec::new()),
             folded_blocks: std::cell::RefCell::new(std::collections::BTreeSet::new()),
-            elided_obligations: std::cell::RefCell::new(std::collections::BTreeMap::new()),
             observation_error: std::cell::RefCell::new(None),
         }
     }
@@ -750,6 +711,58 @@ impl<'a> FoldingContext<'a> {
         }
     }
 
+    /// Attach exact source-effect cells to the statement occurrence that
+    /// discharges them. No construction-time side table participates: if this
+    /// statement is deleted, its markers are deleted with it.
+    pub(crate) fn observe_effect_stmt(
+        &self,
+        obligation_ids: &BTreeSet<SemanticObligationId>,
+        stmt: crate::ast::CStmt,
+    ) -> crate::ast::CStmt {
+        let Some(journal) = self.inputs.observation_journal else {
+            return stmt;
+        };
+        if obligation_ids.is_empty() {
+            return stmt;
+        }
+        let fallback = stmt.clone();
+        match journal
+            .borrow_mut()
+            .observe_effect_stmt(obligation_ids, stmt)
+        {
+            Ok(marked) => marked,
+            Err(error) => {
+                self.retain_first_observation_error(error);
+                fallback
+            }
+        }
+    }
+
+    /// Expression twin of [`Self::observe_effect_stmt`].
+    pub(crate) fn observe_effect_expr(
+        &self,
+        obligation_ids: &BTreeSet<SemanticObligationId>,
+        expr: CExpr,
+    ) -> CExpr {
+        let Some(journal) = self.inputs.observation_journal else {
+            return expr;
+        };
+        if obligation_ids.is_empty() {
+            return expr;
+        }
+        let fallback = expr.clone();
+        match journal
+            .borrow_mut()
+            .observe_effect_expr(obligation_ids, expr)
+        {
+            Ok(marked) => marked,
+            Err(error) => {
+                self.retain_first_observation_error(error);
+                fallback
+            }
+        }
+    }
+
     /// O(1) origin lookup once the caller holds the normalized block's dense id.
     pub(crate) fn source_inst_for_normalized_site(
         &self,
@@ -820,63 +833,19 @@ impl<'a> FoldingContext<'a> {
             .is_some_and(|origins| origins.is_unconditional_phi_edge_copy(site, successor))
     }
 
-    pub(crate) fn note_elided_normalized_op(
-        &self,
-        _block_addr: u64,
-        _op_idx: usize,
-        _reason: &'static str,
-    ) {
-        // Stack-frame/dead-name pruning is a renderer heuristic, not canonical
-        // evidence that a source semantic obligation may be erased. Keep such
-        // operations as unpaid obligations so the ledger refuses conservatively.
-    }
-
-    pub(crate) fn elided_obligations(
-        &self,
-    ) -> std::collections::BTreeMap<SemanticObligationId, &'static str> {
-        self.elided_obligations.borrow().clone()
-    }
-
-    pub(crate) fn effect_render_proofs_since(&self, checkpoint: usize) -> Vec<EffectRenderProof> {
-        self.effect_render_proofs
-            .borrow()
-            .get(checkpoint..)
-            .unwrap_or_default()
-            .to_vec()
-    }
-
-    pub(crate) fn append_effect_render_proofs(&self, proofs: &[EffectRenderProof]) {
-        self.effect_render_proofs
-            .borrow_mut()
-            .extend_from_slice(proofs);
-    }
-
-    pub(crate) fn effect_render_proof_checkpoint(&self) -> usize {
-        self.effect_render_proofs.borrow().len()
-    }
-
-    pub(crate) fn truncate_effect_render_proofs(&self, checkpoint: usize) {
-        self.effect_render_proofs.borrow_mut().truncate(checkpoint);
-    }
-
     fn exact_value_obligations(
         &self,
-        kind: EffectRenderProofKind,
+        kind: EffectOccurrenceKind,
         source_inst: InstId,
         value: Option<ValueId>,
-    ) -> (
-        BTreeSet<SemanticObligationId>,
-        Option<r2types::CallsiteRenderDisposition>,
-        Option<ValueId>,
-        Vec<ValueId>,
-    ) {
+    ) -> BTreeSet<SemanticObligationId> {
         use r2ssa::SemanticObligationKind as ObligationKind;
 
         let Some(prepared) = self.inputs.prepared_ssa else {
-            return (BTreeSet::new(), None, None, Vec::new());
+            return BTreeSet::new();
         };
         let Some(inst) = prepared.graph().inst(source_inst) else {
-            return (BTreeSet::new(), None, None, Vec::new());
+            return BTreeSet::new();
         };
         let source_site = prepared.inst_op_site(source_inst);
         let call_fact = source_site.and_then(|(block_addr, op_idx)| {
@@ -884,8 +853,7 @@ impl<'a> FoldingContext<'a> {
                 r2types::CallsiteKey {
                     block_addr,
                     op_index: op_idx,
-                },
-            )
+                })
         });
         let return_certified = source_site
             .and_then(|(block_addr, op_idx)| {
@@ -925,17 +893,14 @@ impl<'a> FoldingContext<'a> {
         let mut obligation_ids = BTreeSet::new();
         for obligation in prepared.obligations().obligations_for_inst(source_inst) {
             let exact = match kind {
-                EffectRenderProofKind::Return => {
+                EffectOccurrenceKind::Return => {
                     return_certified
                         && (obligation.id.kind == ObligationKind::Return
                             || (obligation.id.kind == ObligationKind::ReturnValue
                                 && unique_return_value
                                 && obligation.inputs.as_slice() == value.as_slice()))
                 }
-                EffectRenderProofKind::Call => {
-                    rendered_call.is_some() && obligation.id.kind == ObligationKind::Call
-                }
-                EffectRenderProofKind::Expression => match &inst.payload {
+                EffectOccurrenceKind::Expression => match &inst.payload {
                     r2ssa::InstPayload::Op(
                         r2ssa::SSAOp::Branch { .. } | r2ssa::SSAOp::BranchInd { .. },
                     ) => obligation.id.kind == ObligationKind::ControlTransfer,
@@ -945,7 +910,8 @@ impl<'a> FoldingContext<'a> {
                     ),
                     r2ssa::InstPayload::Op(
                         r2ssa::SSAOp::Call { .. } | r2ssa::SSAOp::CallInd { .. },
-                    ) => rendered_call.is_some()
+                    ) => {
+                        rendered_call.is_some()
                         && (obligation.id.kind == ObligationKind::Call
                             || (obligation.id.kind == ObligationKind::CallArgument
                                 && !obligation.inputs.is_empty()
@@ -955,115 +921,32 @@ impl<'a> FoldingContext<'a> {
                                 }))
                             || (obligation.id.kind == ObligationKind::CallResult
                                 && unique_call_result
-                                && obligation.inputs.as_slice() == value.as_slice())),
-                    _ => obligation.id.kind == ObligationKind::LiveValueProducer
-                        && inst.output == value,
+                                && obligation.inputs.as_slice() == value.as_slice()))
+                    }
+                    _ => {
+                        obligation.id.kind == ObligationKind::LiveValueProducer
+                        && inst.output == value
+                    }
                 },
-                EffectRenderProofKind::MemoryRead | EffectRenderProofKind::MemoryWrite => false,
+                EffectOccurrenceKind::MemoryRead | EffectOccurrenceKind::MemoryWrite => false,
             };
             if exact {
                 obligation_ids.insert(obligation.id);
             }
         }
-        (
-            obligation_ids,
-            rendered_call.map(|fact| fact.disposition),
-            rendered_call.and_then(|fact| fact.target),
-            rendered_call
-                .map(|fact| fact.proof_values.clone())
-                .unwrap_or_default(),
-        )
+        obligation_ids
     }
 
-    fn record_effect_render_proof_for_inst_value(
+    fn exact_effect_obligations_for_phi_edges(
         &self,
-        kind: EffectRenderProofKind,
-        source_inst: InstId,
-        value: Option<ValueId>,
-    ) {
-        let (obligation_ids, call_disposition, target, values) =
-            self.exact_value_obligations(kind, source_inst, value);
-        if obligation_ids.is_empty() {
-            return;
-        }
-        self.effect_render_proofs.borrow_mut().push(EffectRenderProof {
-            kind,
-            obligation_ids,
-            call_disposition,
-            target,
-            space: None,
-            address: None,
-            value,
-            values,
-            phi_edge: None,
-        });
-    }
-
-    pub(crate) fn record_effect_render_proof_for_normalized_value(
-        &self,
-        kind: EffectRenderProofKind,
-        block_addr: u64,
-        op_idx: usize,
-        value: Option<ValueId>,
-    ) {
-        let Some(site) = self.normalized_site(block_addr, op_idx) else {
-            return;
-        };
-        let Some(origins) = self.inputs.normalization_origins else {
-            if let Some(inst) = self.source_inst_for_normalized_site(site) {
-                self.record_effect_render_proof_for_inst_value(kind, inst, value);
-            }
-            return;
-        };
-        match origins.origin(site) {
-            Some(crate::normalize::NormalizedOpOrigin::Original(inst)) => {
-                self.record_effect_render_proof_for_inst_value(kind, *inst, value);
-            }
-            Some(crate::normalize::NormalizedOpOrigin::PhiEdgeCopy(origin)) => {
-                self.record_phi_edge_render_proof(
-                    kind,
-                    origin.definition.inst,
-                    std::slice::from_ref(&origin.incoming),
-                    origin.guarded.map_or(PhiEdgeRenderKind::Direct, |guarded| {
-                        PhiEdgeRenderKind::Guarded {
-                            condition: self
-                                .inputs
-                                .prepared_ssa
-                                .and_then(|prepared| prepared.graph().inst(guarded.guard.inst))
-                                .and_then(|inst| inst.inputs.get(guarded.guard.input_idx))
-                                .copied()
-                                .unwrap_or(origin.incoming_value),
-                            truth: origin.incoming_input_idx == 1,
-                        }
-                    }),
-                    value,
-                );
-            }
-            Some(crate::normalize::NormalizedOpOrigin::RelocatedInitializer(origin)) => {
-                self.record_phi_edge_render_proof(
-                    kind,
-                    origin.definition.inst,
-                    &origin.replaced_sites,
-                    PhiEdgeRenderKind::Direct,
-                    value,
-                );
-            }
-            None => {}
-        }
-    }
-
-    fn record_phi_edge_render_proof(
-        &self,
-        kind: EffectRenderProofKind,
         definition: InstId,
         sites: &[UseSite],
-        edge_kind: PhiEdgeRenderKind,
-        value: Option<ValueId>,
-    ) {
+    ) -> BTreeSet<SemanticObligationId> {
         use r2ssa::{SemanticObligationComponent, SemanticObligationKind};
 
-        let Some(prepared) = self.inputs.prepared_ssa else {
-            return;
+        let Some(prepared) =
+            self.inputs.prepared_ssa else {
+            return BTreeSet::new();
         };
         let graph = prepared.graph();
         let mut obligation_ids = BTreeSet::new();
@@ -1091,58 +974,78 @@ impl<'a> FoldingContext<'a> {
                             .collect::<Vec<_>>()
                 {
                     obligation_ids.insert(obligation.id);
-                }
+    }
             }
         }
-        self.effect_render_proofs.borrow_mut().push(EffectRenderProof {
-            kind,
-            obligation_ids,
-            call_disposition: None,
-            target: None,
-            space: None,
-            address: None,
-            value,
-            values: Vec::new(),
-            phi_edge: Some(PhiEdgeRenderProof {
-                sites: sites.to_vec().into_boxed_slice(),
-                kind: edge_kind,
-            }),
-        });
+        obligation_ids
     }
 
-    pub(crate) fn record_effect_render_proof_for_source_value(
+    /// Exact source obligations discharged by one normalized value
+    /// occurrence. Synthetic phi copies project only their named original
+    /// edge obligations; ordinary operations project only their source InstId.
+    pub(crate) fn exact_effect_obligations_for_normalized_value(
         &self,
-        kind: EffectRenderProofKind,
+        kind: EffectOccurrenceKind,
         block_addr: u64,
         op_idx: usize,
         value: Option<ValueId>,
-    ) {
-        if let Some(inst) = self
+    ) -> BTreeSet<SemanticObligationId> {
+        let Some(site) = self.normalized_site(block_addr, op_idx) else {
+            return BTreeSet::new();
+        };
+        let Some(origins) = self.inputs.normalization_origins else {
+            return self.source_inst_for_normalized_site(site)
+                .map(|inst| self.exact_value_obligations(kind, inst, value))
+                .unwrap_or_default();
+        };
+        match origins.origin(site) {
+            Some(crate::normalize::NormalizedOpOrigin::Original(inst)) => {
+                self.exact_value_obligations(kind, *inst, value)
+            }
+            Some(crate::normalize::NormalizedOpOrigin::PhiEdgeCopy(origin)) => self.exact_effect_obligations_for_phi_edges(
+                    origin.definition.inst,
+                    std::slice::from_ref(&origin.incoming),
+                ),
+            Some(crate::normalize::NormalizedOpOrigin::RelocatedInitializer(origin)) => self.exact_effect_obligations_for_phi_edges(
+                    origin.definition.inst,
+                    &origin.replaced_sites,
+                ),
+            None => BTreeSet::new(),
+            }
+    }
+
+    pub(crate) fn exact_effect_obligations_for_source_value(
+        &self,
+        kind: EffectOccurrenceKind,
+        block_addr: u64,
+        op_idx: usize,
+        value: Option<ValueId>,
+    ) -> BTreeSet<SemanticObligationId> {
+        self
             .inputs
             .prepared_ssa
             .and_then(|prepared| prepared.graph().inst_id_for_op_site(block_addr, op_idx))
-        {
-            self.record_effect_render_proof_for_inst_value(kind, inst, value);
-        }
+            .map(|inst| self.exact_value_obligations(kind, inst, value))
+            .unwrap_or_default()
     }
 
-    fn record_effect_render_proof_for_inst_memory(
+    fn exact_effect_obligations_for_inst_memory(
         &self,
-        kind: EffectRenderProofKind,
+        kind: EffectOccurrenceKind,
         source_inst: InstId,
         space: r2il::SpaceId,
         address: Option<ValueId>,
         value: Option<ValueId>,
-    ) {
+    ) -> BTreeSet<SemanticObligationId> {
         use r2ssa::{SemanticObligationComponent, SemanticObligationKind};
 
         let Some(prepared) = self.inputs.prepared_ssa else {
-            return;
+            return BTreeSet::new();
         };
         let Some((block_addr, op_idx)) = prepared.inst_op_site(source_inst) else {
-            return;
+            return BTreeSet::new();
         };
-        let is_write = kind == EffectRenderProofKind::MemoryWrite;
+        let is_write = kind == EffectOccurrenceKind::MemoryWrite;
         let Some(fact) = self
             .inputs
             .render_facts()
@@ -1154,13 +1057,13 @@ impl<'a> FoldingContext<'a> {
                     && fact.is_write == is_write
             })
         else {
-            return;
+            return BTreeSet::new();
         };
         let expected_inputs = address
             .into_iter()
             .chain(is_write.then_some(value).flatten())
             .collect::<Vec<ValueId>>();
-        let obligation_ids = prepared
+        prepared
             .obligations()
             .obligations_for_inst(source_inst)
             .filter(|obligation| {
@@ -1175,57 +1078,42 @@ impl<'a> FoldingContext<'a> {
                     && obligation.inputs == expected_inputs
             })
             .map(|obligation| obligation.id)
-            .collect::<BTreeSet<_>>();
-        if obligation_ids.is_empty() {
-            return;
-        }
-        let proof = EffectRenderProof {
-            kind,
-            obligation_ids,
-            call_disposition: None,
-            target: None,
-            space: Some(space),
-            address,
-            value,
-            values: Vec::new(),
-            phi_edge: None,
-        };
-        let mut proofs = self.effect_render_proofs.borrow_mut();
-        if !proofs.contains(&proof) {
-            proofs.push(proof);
-        }
+            .collect::<BTreeSet<_>>()
     }
 
-    pub(crate) fn record_effect_render_proof_for_normalized_memory(
+    pub(crate) fn exact_effect_obligations_for_normalized_memory(
         &self,
-        kind: EffectRenderProofKind,
+        kind: EffectOccurrenceKind,
         block_addr: u64,
         op_idx: usize,
         space: r2il::SpaceId,
         address: Option<ValueId>,
         value: Option<ValueId>,
-    ) {
-        if let Some(inst) = self.source_inst_for_normalized_op(block_addr, op_idx) {
-            self.record_effect_render_proof_for_inst_memory(kind, inst, space, address, value);
-        }
+    ) -> BTreeSet<SemanticObligationId> {
+        self.source_inst_for_normalized_op(block_addr, op_idx)
+            .map(|inst| {
+            self.exact_effect_obligations_for_inst_memory(kind, inst, space, address, value)
+            })
+            .unwrap_or_default()
     }
 
-    pub(crate) fn record_effect_render_proof_for_source_memory(
+    pub(crate) fn exact_effect_obligations_for_source_memory(
         &self,
-        kind: EffectRenderProofKind,
+        kind: EffectOccurrenceKind,
         block_addr: u64,
         op_idx: usize,
         space: r2il::SpaceId,
         address: Option<ValueId>,
         value: Option<ValueId>,
-    ) {
-        if let Some(inst) = self
+    ) -> BTreeSet<SemanticObligationId> {
+        self
             .inputs
             .prepared_ssa
             .and_then(|prepared| prepared.graph().inst_id_for_op_site(block_addr, op_idx))
-        {
-            self.record_effect_render_proof_for_inst_memory(kind, inst, space, address, value);
-        }
+            .map(|inst| {
+            self.exact_effect_obligations_for_inst_memory(kind, inst, space, address, value)
+            })
+            .unwrap_or_default()
     }
 
     /// Internal/test convenience constructor. It deliberately has no

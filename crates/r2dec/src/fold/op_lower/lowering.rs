@@ -3,10 +3,48 @@ use super::projection::{project_machine_use, project_machine_write};
 use super::*;
 
 impl<'a> FoldingContext<'a> {
+    fn exact_normalized_op_effects(
+        &self,
+        op: &SSAOp,
+        block_addr: u64,
+        op_idx: usize,
+        contains_memory: bool,
+    ) -> std::collections::BTreeSet<r2ssa::SemanticObligationId> {
+        let mut obligations = self.exact_effect_obligations_for_normalized_value(
+            EffectOccurrenceKind::Expression,
+            block_addr,
+            op_idx,
+            op.dst().and_then(|dst| self.value_id_for_rendered_op(dst)),
+        );
+        if contains_memory {
+            let memory = match op {
+                SSAOp::Load { .. } => self
+                    .certified_memory_access_for_current_op(false)
+                    .map(|cert| (EffectOccurrenceKind::MemoryRead, cert)),
+                SSAOp::Store { .. } => self
+                    .certified_memory_access_for_current_op(true)
+                    .map(|cert| (EffectOccurrenceKind::MemoryWrite, cert)),
+                _ => None,
+            };
+            if let Some((kind, cert)) = memory {
+                obligations.extend(self.exact_effect_obligations_for_normalized_memory(
+                    kind,
+                    block_addr,
+                    op_idx,
+                    cert.space,
+                    Some(cert.address),
+                    cert.value,
+                ));
+            }
+        }
+        obligations
+    }
+
     fn normalized_output_projection(
         &self,
         site: crate::normalize::NormalizedOpSite,
-    ) -> Result<crate::normalize::NormalizedOutputProjection, crate::observation_journal::LegacyObservationJournalError>
+    ) -> Result<crate::normalize::NormalizedOutputProjection, crate::observation_journal::LegacyObservationJournalError,
+    >
     {
         let prepared = self.inputs.prepared_ssa.ok_or(
             crate::observation_journal::LegacyObservationJournalError::MissingNormalizedSiteContext,
@@ -246,7 +284,8 @@ impl<'a> FoldingContext<'a> {
         };
         let first_disposition = match names.use_disposition(first_site) {
             Some(disposition @ (r2ssa::MachineUseDisposition::Exact(_)
-            | r2ssa::MachineUseDisposition::MemoryAddress(_))) => *disposition,
+            | r2ssa::MachineUseDisposition::MemoryAddress(_)),
+            ) => *disposition,
             Some(r2ssa::MachineUseDisposition::Refused(_)) => {
                 return Err(
                     crate::observation_journal::LegacyObservationJournalError::RefusedRenderedUse(
@@ -332,9 +371,11 @@ impl<'a> FoldingContext<'a> {
                 // fact contains a structured memory access.
                 Ok(contextual_expr)
             }
-            r2ssa::MachineUseDisposition::Refused(_) => unreachable!(
+            r2ssa::MachineUseDisposition::Refused(_) => {
+                unreachable!(
                 "the refused source use returned before projection"
-            ),
+            )
+            }
         }
     }
 
@@ -606,8 +647,7 @@ impl<'a> FoldingContext<'a> {
         let mut frame = LowerFrame::for_observed_expr(normalized_site);
         let lowered = self.project_lowered_assignment(
             normalized_site,
-            self.lower_op(op, &mut frame),
-        );
+            self.lower_op(op, &mut frame));
         let lowered = match lowered {
             LoweredOp::Expr(expr) => LoweredExprAt::Rendered(expr),
             LoweredOp::Assign { lhs, rhs } => LoweredExprAt::Rendered(CExpr::assign(lhs, rhs)),
@@ -634,10 +674,20 @@ impl<'a> FoldingContext<'a> {
             }
         };
         match lowered {
-            LoweredExprAt::Rendered(expr) if op.dst().is_some() => LoweredExprAt::Rendered(
-                self.observe_normalized_output_expr(block_addr, op_idx, expr),
-            ),
-            LoweredExprAt::Rendered(expr) => LoweredExprAt::Rendered(expr),
+            LoweredExprAt::Rendered(expr) => {
+                let obligations = self.exact_normalized_op_effects(
+                    op,
+                    block_addr,
+                    op_idx,
+                    expr_contains_memory_like_access(&expr),
+                );
+                let expr = if op.dst().is_some() {
+                    self.observe_normalized_output_expr(block_addr, op_idx, expr)
+                } else {
+                    expr
+                };
+                LoweredExprAt::Rendered(self.observe_effect_expr(&obligations, expr))
+            }
             fallback @ LoweredExprAt::DestinationFallback(_) => fallback,
         }
     }
@@ -680,41 +730,12 @@ impl<'a> FoldingContext<'a> {
         let stmt = self.lowered_to_stmt(lowered)?;
         let stmt = self.project_finalized_assignment_stmt(normalized_site, stmt);
 
-        if stmt_contains_memory_like_access(&stmt) {
-            match op {
-                SSAOp::Load { .. } => {
-                    if let Some((space, address, value)) = self
-                        .certified_memory_access_for_current_op(false)
-                        .map(|cert| (cert.space, cert.address, cert.value))
-                    {
-                        self.record_effect_render_proof_for_normalized_memory(
-                            EffectRenderProofKind::MemoryRead,
-                            block_addr,
-                            op_idx,
-                            space,
-                            Some(address),
-                            value,
+        let obligations = self.exact_normalized_op_effects(
+            op,
+            block_addr,
+            op_idx,
+            stmt_contains_memory_like_access(&stmt),
                         );
-                    }
-                }
-                SSAOp::Store { .. } => {
-                    if let Some((space, address, value)) = self
-                        .certified_memory_access_for_current_op(true)
-                        .map(|cert| (cert.space, cert.address, cert.value))
-                    {
-                        self.record_effect_render_proof_for_normalized_memory(
-                            EffectRenderProofKind::MemoryWrite,
-                            block_addr,
-                            op_idx,
-                            space,
-                            Some(address),
-                            value,
-                        );
-                    }
-                }
-                _ => {}
-            }
-        }
         let stmt = if op.dst().is_some()
             && !matches!(stmt.unobserved(), CStmt::Comment(_) | CStmt::Empty)
         {
@@ -722,7 +743,7 @@ impl<'a> FoldingContext<'a> {
         } else {
             stmt
         };
-        Some(stmt)
+        Some(self.observe_effect_stmt(&obligations, stmt))
     }
 
     /// Render one resolved indirect-call target without letting occurrence

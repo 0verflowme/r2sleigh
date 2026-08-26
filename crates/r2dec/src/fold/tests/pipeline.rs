@@ -57,7 +57,7 @@ mod tests {
         }
         info.note_condition_var(var);
     }
-    use crate::fold::context::{EffectRenderProofKind, empty_function_facts};
+    use crate::fold::context::{EffectOccurrenceKind, empty_function_facts};
     use crate::{
         FoldArchConfig, FoldInputs,
         analysis::{
@@ -1557,9 +1557,8 @@ mod tests {
         let op_idx = block
             .ops
             .iter()
-            .position(|op| {
-                matches!(op, SSAOp::Copy { dst, .. } if dst.name == "tmp:20" && dst.size == 4)
-            })
+            .position(|op| matches!(op, SSAOp::Copy { dst, .. } if dst.name == "tmp:20" && dst.size == 4),
+            )
             .expect("narrow register copy");
         let inst = prepared
             .graph()
@@ -2182,12 +2181,10 @@ mod tests {
         ));
         let i_rhs = ctx.rewrite_scalar_stack_placeholder_rhs(
             &ctx.name_ref("i"),
-            ctx.name_ref("local_3"),
-        );
+            ctx.name_ref("local_3"));
         let cross_slot_rhs = ctx.rewrite_scalar_stack_placeholder_rhs(
             &ctx.name_ref("sum"),
-            ctx.name_ref("local_17"),
-        );
+            ctx.name_ref("local_17"));
 
         assert!(
             expr_contains_var(&ctx, &sum_rhs, "sum") && !expr_contains_addr_of(&sum_rhs),
@@ -3929,7 +3926,8 @@ mod tests {
         let stmt = ctx
             .op_to_stmt_impl(&SSAOp::CallInd {
                 target: make_var("X16", 0, 8),
-            }, &super::LowerFrame::for_expr())
+            }, &super::LowerFrame::for_expr(),
+            )
             .expect("fallback indirect call statement");
 
         assert_eq!(
@@ -3958,8 +3956,7 @@ mod tests {
 
         let reachable = crate::ast::strip_render_observations(
             &mut function,
-            owner.expected_count(),
-        )
+            owner.expected_count())
         .expect("target marker must survive exactly once");
 
         assert!(reachable.contains(target_id));
@@ -4101,8 +4098,7 @@ mod tests {
         insert_authorized_call_args(
             &mut ctx,
             __fixture_args.0,
-            __fixture_args.1,
-        );
+            __fixture_args.1);
 
         let stmt = ctx
             .op_to_stmt_with_args(
@@ -4163,8 +4159,7 @@ mod tests {
         insert_authorized_call_args(
             &mut ctx,
             __fixture_args.0,
-            __fixture_args.1,
-        );
+            __fixture_args.1);
         let helper_call = CExpr::call(
             CExpr::External {
                 name: "sym._unlock".to_string(),
@@ -4173,8 +4168,7 @@ mod tests {
             vec![
                 ctx.name_ref("a"),
                 ctx.name_ref("b"),
-                ctx.name_ref("c"),
-            ],
+                ctx.name_ref("c")],
         );
         let __fixture_args = (
             (0x1000, 1),
@@ -4189,8 +4183,7 @@ mod tests {
         insert_authorized_call_args(
             &mut ctx,
             __fixture_args.0,
-            __fixture_args.1,
-        );
+            __fixture_args.1);
 
         let stmt = ctx
             .op_to_stmt_with_args(
@@ -4246,8 +4239,7 @@ mod tests {
         insert_authorized_call_args(
             &mut ctx,
             __fixture_args.0,
-            __fixture_args.1,
-        );
+            __fixture_args.1);
 
         let stmt = ctx
             .op_to_stmt_with_args(
@@ -4320,8 +4312,7 @@ mod tests {
         insert_authorized_call_args(
             &mut ctx,
             __fixture_args.0,
-            __fixture_args.1,
-        );
+            __fixture_args.1);
 
         let stmt = ctx
             .op_to_stmt_with_args(
@@ -4444,8 +4435,7 @@ mod tests {
         let predicate = CExpr::binary(
             BinaryOp::Eq,
             ctx.name_ref("rax_1"),
-            CExpr::IntLit(0),
-        );
+            CExpr::IntLit(0));
 
         assert_eq!(
             ctx.normalize_assignment_predicate_rhs(predicate.clone()),
@@ -4462,8 +4452,7 @@ mod tests {
         let predicate = CExpr::binary(
             BinaryOp::Eq,
             ctx.name_ref("rax_1"),
-            CExpr::IntLit(0),
-        );
+            CExpr::IntLit(0));
 
         assert_eq!(
             ctx.normalize_assignment_predicate_rhs(predicate),
@@ -4485,8 +4474,7 @@ mod tests {
             BinaryOp::Eq,
             CExpr::call(
                 ctx.name_ref("helper"),
-                vec![ctx.name_ref("rax_1")],
-            ),
+                vec![ctx.name_ref("rax_1")]),
             CExpr::IntLit(0),
         );
 
@@ -4512,8 +4500,7 @@ mod tests {
         let predicate = CExpr::binary(
             BinaryOp::Ne,
             ctx.name_ref("rax_1"),
-            CExpr::IntLit(0),
-        );
+            CExpr::IntLit(0));
 
         assert_eq!(
             ctx.normalize_assignment_predicate_rhs(predicate.clone()),
@@ -4530,8 +4517,7 @@ mod tests {
         let predicate = CExpr::binary(
             BinaryOp::Eq,
             ctx.name_ref("rax_1"),
-            CExpr::IntLit(0),
-        );
+            CExpr::IntLit(0));
 
         assert_eq!(
             ctx.normalize_assignment_predicate_rhs(predicate.clone()),
@@ -4549,8 +4535,7 @@ mod tests {
             let predicate = CExpr::binary(
                 BinaryOp::Eq,
                 ctx.name_ref("rax_1"),
-                CExpr::IntLit(0),
-            );
+                CExpr::IntLit(0));
 
             assert_eq!(
                 ctx.normalize_assignment_predicate_rhs(predicate.clone()),
@@ -4687,8 +4672,7 @@ mod tests {
         let expr = CExpr::binary(
             BinaryOp::Add,
             ctx.name_ref("argv"),
-            CExpr::IntLit(8),
-        );
+            CExpr::IntLit(8));
         let rendered = ctx
             .debug_render_memory_access_from_visible_expr(&expr, 8)
             .expect("pointer offset load should render");
@@ -4719,8 +4703,7 @@ mod tests {
                 CExpr::binary(
                     BinaryOp::Add,
                     ctx.name_ref("a"),
-                    ctx.name_ref("a"),
-                ),
+                    ctx.name_ref("a")),
             ),
             Some(4),
         );
@@ -4749,8 +4732,7 @@ mod tests {
             CExpr::binary(
                 BinaryOp::Add,
                 ctx.name_ref("i"),
-                ctx.name_ref("i"),
-            ),
+                ctx.name_ref("i")),
             Some(8),
         );
 
@@ -4879,7 +4861,8 @@ mod tests {
             },
         )]));
 
-        let callee = CExpr::External { name: "sym.helper".to_string(), kind: crate::symbol::ExternalKind::Function };
+        let callee = CExpr::External { name: "sym.helper".to_string(), kind: crate::symbol::ExternalKind::Function,
+        };
         assert_eq!(ctx.non_variadic_call_arity(&callee), Some(1));
         assert!(
             ctx.known_signature_for_callee_expr(&callee).is_some(),
@@ -5104,14 +5087,12 @@ mod tests {
 
         let carrier = CStmt::Expr(CExpr::assign(
             ctx.name_ref("x8_9"),
-            CExpr::IntLit(1),
-        ));
+            CExpr::IntLit(1)));
         assert!(ctx.stmt_is_side_effect_free_versioned_register_carrier(&carrier));
 
         let local = CStmt::Expr(CExpr::assign(
             ctx.name_ref("var_8h"),
-            CExpr::IntLit(1),
-        ));
+            CExpr::IntLit(1)));
         assert!(!ctx.stmt_is_side_effect_free_versioned_register_carrier(&local));
     }
 
@@ -5526,7 +5507,8 @@ mod tests {
         ctx.state
             .analysis_ctx
             .use_info
-            .insert_definition_for_name_if_absent(&single_ordinary.display_name(), CExpr::IntLit(7));
+            .insert_definition_for_name_if_absent(&single_ordinary.display_name(), CExpr::IntLit(7),
+            );
         assert!(ctx.should_inline(&single_ordinary));
 
         // Leaving the statement out says the reader will inline the value, so a
@@ -5721,8 +5703,7 @@ mod tests {
                 CExpr::binary(
                     BinaryOp::Mul,
                     ctx.name_ref("local_c"),
-                    CExpr::IntLit(4),
-                ),
+                    CExpr::IntLit(4)),
             ),
         );
         ctx.state
@@ -5738,10 +5719,11 @@ mod tests {
         ctx.state
             .analysis_ctx
             .use_info
-            .insert_definition_for_name_if_absent(&real_index.display_name(), ctx.name_ref("local_c"));
+            .insert_definition_for_name_if_absent(&real_index.display_name(), ctx.name_ref("local_c"),
+            );
         ctx.state.analysis_ctx.use_info.insert_semantic_value_for_name(&real_index.display_name(), crate::analysis::SemanticValue::Scalar(crate::analysis::ScalarValue::Expr(CExpr::Var(
-                { let CExpr::Var(id) = ctx.name_ref("local_c") else { unreachable!() }; id },
-            ))),
+                { let CExpr::Var(id) = ctx.name_ref("local_c") else { unreachable!() }; id }),
+                )),
         );
         ctx.state.analysis_ctx.use_info.insert_semantic_value_for_name(&load.display_name(), crate::analysis::SemanticValue::Load {
                 space: r2il::SpaceId::Ram,
@@ -5843,12 +5825,12 @@ mod tests {
             .type_hints
             .insert("buf".to_string(), CType::ptr(CType::i8()));
         ctx.state.analysis_ctx.use_info.insert_semantic_value_for_name(&len_value.display_name(), crate::analysis::SemanticValue::Scalar(crate::analysis::ScalarValue::Expr(CExpr::Var(
-                { let CExpr::Var(id) = ctx.name_ref("len") else { unreachable!() }; id },
-            ))),
+                { let CExpr::Var(id) = ctx.name_ref("len") else { unreachable!() }; id }),
+                )),
         );
         ctx.state.analysis_ctx.use_info.insert_semantic_value_for_name(&buf_value.display_name(), crate::analysis::SemanticValue::Scalar(crate::analysis::ScalarValue::Expr(CExpr::Var(
-                { let CExpr::Var(id) = ctx.name_ref("buf") else { unreachable!() }; id },
-            ))),
+                { let CExpr::Var(id) = ctx.name_ref("buf") else { unreachable!() }; id }),
+                )),
         );
         ctx.state.analysis_ctx.use_info.insert_semantic_value_for_name(&store_addr.display_name(), crate::analysis::SemanticValue::Load {
                 space: r2il::SpaceId::Ram,
@@ -5935,8 +5917,7 @@ mod tests {
                 CExpr::binary(
                     BinaryOp::Mul,
                     ctx.name_ref("arg2"),
-                    CExpr::IntLit(56),
-                ),
+                    CExpr::IntLit(56)),
             ),
         );
         ctx.state.analysis_ctx.use_info.type_hints.insert(
@@ -5997,8 +5978,7 @@ mod tests {
                 CExpr::binary(
                     BinaryOp::Shl,
                     ctx.name_ref("arg2"),
-                    CExpr::IntLit(2),
-                ),
+                    CExpr::IntLit(2)),
             ),
         );
         ctx.state.analysis_ctx.use_info.insert_semantic_value_for_name(&dst.display_name(), crate::analysis::SemanticValue::Load {
@@ -6054,8 +6034,7 @@ mod tests {
         ctx.state.analysis_ctx.use_info.insert_definition_for_name_if_absent(&addr.display_name(), CExpr::binary(
                 BinaryOp::Add,
                 ctx.name_ref("i"),
-                ctx.name_ref("buf"),
-            ),
+                ctx.name_ref("buf")),
         );
 
         let direct = ctx
@@ -6063,8 +6042,7 @@ mod tests {
                 &CExpr::binary(
                     BinaryOp::Add,
                     ctx.name_ref("i"),
-                    ctx.name_ref("buf"),
-                ),
+                    ctx.name_ref("buf")),
                 &CType::u8(),
             )
             .expect("typed commuted pointer add should normalize directly");
@@ -6285,8 +6263,7 @@ mod tests {
                         CExpr::binary(
                             BinaryOp::Shl,
                             ctx.name_ref("idx"),
-                            CExpr::IntLit(3),
-                        ),
+                            CExpr::IntLit(3)),
                         ctx.name_ref("idx"),
                     ),
                     CExpr::IntLit(3),
@@ -6521,8 +6498,7 @@ mod tests {
                 CExpr::binary(
                     BinaryOp::Mul,
                     ctx.name_ref("arg2"),
-                    CExpr::IntLit(56),
-                ),
+                    CExpr::IntLit(56)),
             ),
             CExpr::IntLit(8),
         );
@@ -6673,8 +6649,7 @@ mod tests {
                 CExpr::binary(
                     BinaryOp::Mul,
                     ctx.name_ref("idx"),
-                    CExpr::IntLit(40),
-                ),
+                    CExpr::IntLit(40)),
             )),
             index: Box::new(CExpr::IntLit(3)),
         };
@@ -6757,8 +6732,7 @@ mod tests {
                 CExpr::binary(
                     BinaryOp::Shl,
                     ctx.name_ref("idx"),
-                    shift_mask.clone(),
-                ),
+                    shift_mask.clone()),
                 ctx.name_ref("idx"),
             ),
             shift_mask,
@@ -6852,16 +6826,14 @@ mod tests {
                 CExpr::binary(
                     BinaryOp::Mul,
                     ctx.name_ref("idx"),
-                    CExpr::IntLit(56),
-                ),
+                    CExpr::IntLit(56)),
             ),
         );
 
         let addr = CExpr::binary(
             BinaryOp::Add,
             ctx.name_ref("local_c"),
-            CExpr::IntLit(0x34),
-        );
+            CExpr::IntLit(0x34));
         let shape = ctx
             .normalized_addr_from_visible_expr(&addr, 0)
             .expect("scalar stack-home alias should still resolve through pointer definition");
@@ -6933,8 +6905,7 @@ mod tests {
             CExpr::binary(
                 BinaryOp::Mul,
                 ctx.name_ref("arg2"),
-                CExpr::IntLit(4),
-            ),
+                CExpr::IntLit(4)),
         );
 
         let mut visited = HashSet::new();
@@ -6979,8 +6950,7 @@ mod tests {
             CExpr::binary(
                 BinaryOp::Sub,
                 ctx.name_ref("x"),
-                CExpr::IntLit(0xdead),
-            ),
+                CExpr::IntLit(0xdead)),
             CExpr::IntLit(0),
         );
         let simplified = ctx.simplify_condition_expr(expr);
@@ -7002,8 +6972,7 @@ mod tests {
             CExpr::binary(
                 BinaryOp::Sub,
                 ctx.name_ref("x"),
-                ctx.name_ref("y"),
-            ),
+                ctx.name_ref("y")),
             CExpr::IntLit(0),
         );
         let simplified = ctx.simplify_condition_expr(expr);
@@ -7098,8 +7067,7 @@ mod tests {
                 CExpr::binary(
                     BinaryOp::Eq,
                     ctx.name_ref("len"),
-                    CExpr::IntLit(100),
-                ),
+                    CExpr::IntLit(100)),
             ),
         );
         let simplified = ctx.simplify_condition_expr(expr);
@@ -7156,8 +7124,7 @@ mod tests {
 
         let reachable = crate::ast::strip_render_observations(
             &mut function,
-            owner.expected_count(),
-        )
+            owner.expected_count())
         .expect("surviving identity observations remain well formed");
 
         assert!(reachable.contains(value_id));
@@ -7197,8 +7164,7 @@ mod tests {
 
         let reachable = crate::ast::strip_render_observations(
             &mut function,
-            owner.expected_count(),
-        )
+            owner.expected_count())
         .expect("linear identity observations remain well formed");
 
         assert!(reachable.contains(result_id));
@@ -7256,8 +7222,7 @@ mod tests {
         let mut function = CFunction::new("assign", CType::Void).with_body(vec![marked]);
         let reachable = crate::ast::strip_render_observations(
             &mut function,
-            owner.expected_count(),
-        )
+            owner.expected_count())
         .expect("the source observation must survive exactly once");
 
         assert!(reachable.contains(write_id));
@@ -7286,8 +7251,7 @@ mod tests {
         let mut function = CFunction::new("assign", CType::Void).with_body(vec![marked]);
         let reachable = crate::ast::strip_render_observations(
             &mut function,
-            owner.expected_count(),
-        )
+            owner.expected_count())
         .expect("the pointer observation must survive exactly once");
 
         assert!(reachable.contains(use_id));
@@ -7327,8 +7291,7 @@ mod tests {
             .with_body(vec![CStmt::Expr(marked)]);
         let reachable = crate::ast::strip_render_observations(
             &mut function,
-            owner.expected_count(),
-        )
+            owner.expected_count())
         .expect("the cast observation must survive exactly once");
 
         assert!(reachable.contains(use_id));
@@ -7350,8 +7313,7 @@ mod tests {
             .with_body(vec![CStmt::Expr(marked)]);
         let reachable = crate::ast::strip_render_observations(
             &mut function,
-            owner.expected_count(),
-        )
+            owner.expected_count())
         .expect("the literal observation must survive exactly once");
 
         assert!(reachable.contains(use_id));
@@ -7365,17 +7327,14 @@ mod tests {
         ctx.state.return_stack_slots.insert(-8);
         let assignment = CStmt::Expr(CExpr::assign(
             ctx.name_ref("local_8"),
-            ctx.name_ref("arg1"),
-        ));
+            ctx.name_ref("arg1")));
         let ret = CStmt::Return(Some(ctx.name_ref("arg1")));
         let plain = ctx.prune_redundant_return_slot_assignments(vec![
             assignment.clone(),
-            ret.clone(),
-        ]);
+            ret.clone()]);
         let repeated_plain = ctx.prune_redundant_return_slot_assignments(vec![
             assignment.clone(),
-            ret.clone(),
-        ]);
+            ret.clone()]);
         assert_eq!(repeated_plain, plain, "the pruning decision must be repeatable");
 
         let mut owner = crate::ast::RenderObservationOwner::new();
@@ -7397,8 +7356,7 @@ mod tests {
         );
         let marked = ctx.prune_redundant_return_slot_assignments(vec![
             marked_assignment,
-            marked_return,
-        ]);
+            marked_return]);
         let mut function = CFunction::new("return_slot", CType::Int(32)).with_body(marked);
         crate::ast::strip_render_observations(&mut function, owner.expected_count())
             .expect("surviving observations remain well formed");
@@ -7637,8 +7595,7 @@ mod tests {
         ctx.state.analysis_ctx.use_info.insert_definition_for_name_if_absent("tmp:cond_1", CExpr::binary(
                 BinaryOp::Eq,
                 ctx.name_ref("result"),
-                CExpr::IntLit(25),
-            ),
+                CExpr::IntLit(25)),
         );
         ctx.state.analysis_ctx.use_info.insert_definition_for_name_if_absent("result", CExpr::Deref(Box::new(CExpr::binary(
                 BinaryOp::Add,
@@ -7671,8 +7628,7 @@ mod tests {
         ctx.state.analysis_ctx.use_info.insert_definition_for_name_if_absent("tmp:cond_1", CExpr::binary(
                 BinaryOp::Eq,
                 ctx.name_ref("result"),
-                CExpr::IntLit(19),
-            ),
+                CExpr::IntLit(19)),
         );
         ctx.state.analysis_ctx.use_info.insert_definition_for_name_if_absent("result", CExpr::Paren(Box::new(CExpr::Cast {
                 ty: CType::ptr(CType::Int(32)),
@@ -7680,8 +7636,7 @@ mod tests {
                     CExpr::binary(
                         BinaryOp::Add,
                         ctx.name_ref("rbp_1"),
-                        CExpr::IntLit(-4),
-                    ),
+                        CExpr::IntLit(-4)),
                 ))))),
             })),
         );
@@ -7701,14 +7656,12 @@ mod tests {
         ctx.state.analysis_ctx.use_info.insert_definition_for_name_if_absent("tmp:cond_1", CExpr::binary(
                 BinaryOp::Eq,
                 ctx.name_ref("result"),
-                CExpr::IntLit(19),
-            ),
+                CExpr::IntLit(19)),
         );
         ctx.state.analysis_ctx.use_info.insert_definition_for_name_if_absent("result", CExpr::binary(
                 BinaryOp::Add,
                 ctx.name_ref("arg1"),
-                CExpr::IntLit(1),
-            ),
+                CExpr::IntLit(1)),
         );
 
         let cond = ctx.get_condition_expr(&make_var("tmp:cond", 1, 1));
@@ -7863,12 +7816,10 @@ mod tests {
         let stmts = vec![
             CStmt::Expr(CExpr::assign(
                 ctx.name_ref("t1_1"),
-                ctx.name_ref("arg1"),
-            )),
+                ctx.name_ref("arg1"))),
             CStmt::Expr(CExpr::assign(
                 ctx.name_ref("t2_2"),
-                ctx.name_ref("arg2"),
-            )),
+                ctx.name_ref("arg2"))),
             CStmt::Return(Some(ctx.name_ref("t2_2"))),
         ];
 
@@ -7921,8 +7872,7 @@ mod tests {
             BinaryOp::Add,
             CExpr::call(
                 ctx.name_ref("fcn.1000"),
-                vec![ctx.name_ref("ctx")],
-            ),
+                vec![ctx.name_ref("ctx")]),
             CExpr::IntLit(50),
         );
         let stmts = vec![
@@ -7998,8 +7948,7 @@ mod tests {
         let mut function = CFunction::new("dead_call_result", CType::Void).with_body(pruned);
         let reachable = crate::ast::strip_render_observations(
             &mut function,
-            observations.expected_count(),
-        )
+            observations.expected_count())
         .expect("demoted call preserves a valid marker domain");
 
         assert_eq!(
@@ -8071,8 +8020,7 @@ mod tests {
         let stmts = vec![
             CStmt::Expr(CExpr::assign(
                 ctx.name_ref("value_1"),
-                call.clone(),
-            )),
+                call.clone())),
             CStmt::Return(Some(CExpr::IntLit(0))),
         ];
 
@@ -8192,8 +8140,7 @@ mod tests {
         let stmts = vec![
             CStmt::Expr(CExpr::assign(
                 ctx.name_ref("value_1"),
-                call.clone(),
-            )),
+                call.clone())),
             CStmt::Return(Some(CExpr::IntLit(0))),
         ];
 
@@ -8274,8 +8221,7 @@ mod tests {
         let stmts = vec![
             CStmt::Expr(CExpr::assign(
                 ctx.name_ref("v3ea00"),
-                call.clone(),
-            )),
+                call.clone())),
             CStmt::Expr(call.clone()),
             CStmt::Return(Some(CExpr::IntLit(0))),
         ];
@@ -8323,8 +8269,7 @@ mod tests {
         let stmts = vec![
             CStmt::Expr(CExpr::assign(
                 ctx.name_ref("local_10"),
-                ctx.name_ref("v"),
-            )),
+                ctx.name_ref("v"))),
             CStmt::Expr(CExpr::assign(
                 CExpr::Member {
                     base: Box::new(CExpr::Subscript {
@@ -8416,15 +8361,13 @@ mod tests {
                 CExpr::binary(
                     BinaryOp::Sub,
                     ctx.name_ref("len"),
-                    CExpr::IntLit(64),
-                ),
+                    CExpr::IntLit(64)),
             )),
             CStmt::If {
                 cond: CExpr::binary(
                     BinaryOp::Gt,
                     ctx.name_ref("len"),
-                    CExpr::IntLit(100),
-                ),
+                    CExpr::IntLit(100)),
                 then_body: Box::new(CStmt::Return(Some(CExpr::IntLit(-1)))),
                 else_body: Some(Box::new(CStmt::Return(Some(CExpr::IntLit(-2))))),
             },
@@ -8482,8 +8425,7 @@ mod tests {
                 CExpr::binary(
                     BinaryOp::Add,
                     ctx.name_ref("rax_3"),
-                    CExpr::IntLit(1),
-                ),
+                    CExpr::IntLit(1)),
             )),
             CStmt::Return(Some(CExpr::IntLit(0))),
         ];
@@ -8655,8 +8597,7 @@ mod tests {
         let stmts = vec![
             CStmt::Expr(CExpr::assign(
                 ctx.name_ref("value_1"),
-                call.clone(),
-            )),
+                call.clone())),
             CStmt::Return(Some(CExpr::IntLit(0))),
         ];
 
@@ -8710,8 +8651,7 @@ mod tests {
         let stmts = vec![
             CStmt::Expr(CExpr::assign(
                 ctx.name_ref("value_1"),
-                call.clone(),
-            )),
+                call.clone())),
             CStmt::Return(Some(CExpr::IntLit(0))),
         ];
 
@@ -8734,8 +8674,7 @@ mod tests {
         let stmts = vec![
             CStmt::Expr(CExpr::assign(
                 ctx.name_ref("tmp_ldwn_1"),
-                rhs.clone(),
-            )),
+                rhs.clone())),
             CStmt::Return(Some(CExpr::IntLit(0))),
         ];
 
@@ -8790,20 +8729,17 @@ mod tests {
         let stmts = vec![
             CStmt::Expr(CExpr::assign(
                 ctx.name_ref("local_c"),
-                ctx.name_ref("arg2"),
-            )),
+                ctx.name_ref("arg2"))),
             CStmt::Expr(CExpr::assign(
                 ctx.name_ref("local_10"),
                 ctx.name_ref("arg3"),
             )),
             CStmt::Expr(CExpr::assign(
                 ctx.name_ref("stack_8"),
-                ctx.name_ref("arg1"),
-            )),
+                ctx.name_ref("arg1"))),
             CStmt::Expr(CExpr::assign(
                 ctx.name_ref("stack"),
-                ctx.name_ref("arg2"),
-            )),
+                ctx.name_ref("arg2"))),
             CStmt::Return(Some(CExpr::Subscript {
                 base: Box::new(CExpr::cast(
                     CType::ptr(CType::UInt(32)),
@@ -8899,15 +8835,13 @@ mod tests {
         let stmts = vec![
             CStmt::Expr(CExpr::assign(
                 ctx.name_ref("eax_2"),
-                ctx.name_ref("arg1"),
-            )),
+                ctx.name_ref("arg1"))),
             CStmt::Expr(CExpr::assign(
                 ctx.name_ref("eax_3"),
                 CExpr::binary(
                     BinaryOp::Add,
                     ctx.name_ref("eax_2"),
-                    ctx.name_ref("eax_2"),
-                ),
+                    ctx.name_ref("eax_2")),
             )),
             CStmt::Return(Some(ctx.name_ref("eax_3"))),
         ];
@@ -8948,8 +8882,7 @@ mod tests {
                 CExpr::binary(
                     BinaryOp::Add,
                     ctx.name_ref("eax_2"),
-                    CExpr::IntLit(1),
-                ),
+                    CExpr::IntLit(1)),
             )),
         ];
 
@@ -8971,19 +8904,16 @@ mod tests {
         let stmts = vec![
             CStmt::Expr(CExpr::assign(
                 ctx.name_ref("eax_2"),
-                ctx.name_ref("rdi_1"),
-            )),
+                ctx.name_ref("rdi_1"))),
             CStmt::Expr(CExpr::assign(
                 ctx.name_ref("rdi_1"),
-                CExpr::IntLit(42),
-            )),
+                CExpr::IntLit(42))),
             CStmt::Expr(CExpr::assign(
                 ctx.name_ref("eax_3"),
                 CExpr::binary(
                     BinaryOp::Add,
                     ctx.name_ref("eax_2"),
-                    CExpr::IntLit(1),
-                ),
+                    CExpr::IntLit(1)),
             )),
         ];
 
@@ -9015,8 +8945,7 @@ mod tests {
                 CExpr::binary(
                     BinaryOp::Add,
                     ctx.name_ref("eax_2"),
-                    CExpr::IntLit(1),
-                ),
+                    CExpr::IntLit(1)),
             )),
         ];
 
@@ -9108,8 +9037,7 @@ mod tests {
         let ctx = FoldingContext::new(64);
         let stmt = ctx.assign_stmt(
             ctx.name_ref("arg0"),
-            ctx.name_ref("edi"),
-        );
+            ctx.name_ref("edi"));
         assert!(
             stmt.is_none(),
             "arg0 = edi should be suppressed even after non-copy normalization paths"
@@ -9198,8 +9126,7 @@ mod tests {
                 CExpr::binary(
                     BinaryOp::Sub,
                     ctx.name_ref("a"),
-                    ctx.name_ref("b"),
-                ),
+                    ctx.name_ref("b")),
                 CExpr::IntLit(0),
             ),
         );
@@ -9232,8 +9159,7 @@ mod tests {
                 CExpr::binary(
                     BinaryOp::Sub,
                     ctx.name_ref("a"),
-                    ctx.name_ref("b"),
-                ),
+                    ctx.name_ref("b")),
                 CExpr::IntLit(0),
             ),
         );
@@ -9365,8 +9291,7 @@ mod tests {
             CExpr::binary(
                 BinaryOp::Or,
                 ctx.name_ref("cf_1"),
-                ctx.name_ref("zf_1"),
-            ),
+                ctx.name_ref("zf_1")),
         ));
 
         assert_eq!(
@@ -9908,7 +9833,9 @@ mod tests {
         )]));
         ctx.state.analysis_ctx.use_info.call_result_exprs.insert(
             source_call,
-            CExpr::call(CExpr::External { name: "sym.helper".to_string(), kind: crate::symbol::ExternalKind::Function }, vec![]),
+            CExpr::call(CExpr::External { name: "sym.helper".to_string(), kind: crate::symbol::ExternalKind::Function,
+                }, vec![],
+            ),
         );
 
         assert!(
@@ -10173,8 +10100,7 @@ mod tests {
         ctx.state.analysis_ctx.use_info.insert_definition_for_name_if_absent(&addr.display_name(), CExpr::binary(
                 BinaryOp::Add,
                 ctx.name_ref("rbp"),
-                CExpr::IntLit(-8),
-            ),
+                CExpr::IntLit(-8)),
         );
 
         assert!(
@@ -10678,7 +10604,8 @@ mod tests {
         ctx.state.analysis_ctx.use_info.insert_semantic_value_for_name(&eax.display_name(), crate::analysis::SemanticValue::Load {
                 space: r2il::SpaceId::Ram,
                 addr: crate::analysis::NormalizedAddr {
-                    base: crate::analysis::BaseRef::Value(crate::analysis::ValueRef::from(arr_src)),
+                    base: crate::analysis::BaseRef::Value(crate::analysis::ValueRef::from(arr_src,
+                        )),
                     index: Some(crate::analysis::ValueRef::from(idx_src)),
                     scale_bytes: 4,
                     offset_bytes: 0,
@@ -10905,8 +10832,7 @@ mod tests {
         ctx.state.analysis_ctx.use_info.insert_definition_for_name_if_absent("ecx", CExpr::binary(
                 BinaryOp::BitXor,
                 ctx.name_ref("ecx"),
-                ctx.name_ref("ecx"),
-            ),
+                ctx.name_ref("ecx")),
         );
 
         let expr = CExpr::binary(
@@ -10919,8 +10845,7 @@ mod tests {
                     CExpr::binary(
                         BinaryOp::BitXor,
                         ctx.name_ref("ecx"),
-                        ctx.name_ref("ecx"),
-                    ),
+                        ctx.name_ref("ecx")),
                     ctx.name_ref("arg2"),
                 ),
                 CExpr::IntLit(4),
@@ -10970,8 +10895,7 @@ mod tests {
                 CExpr::binary(
                     BinaryOp::Sub,
                     CExpr::IntLit(0),
-                    ctx.name_ref("arg2"),
-                ),
+                    ctx.name_ref("arg2")),
                 CExpr::IntLit(4),
             ),
         )));
@@ -11125,8 +11049,7 @@ mod tests {
         let plain = CExpr::binary(
             BinaryOp::Ne,
             ctx.name_ref("arg1"),
-            CExpr::IntLit(0),
-        );
+            CExpr::IntLit(0));
         let mut owner = crate::ast::RenderObservationOwner::new();
         let (_, inner) = owner
             .observe_expr(plain.clone())
@@ -11253,8 +11176,7 @@ mod tests {
             vec![result_call_arg(
                 ctx.name_ref("tmp:buf"),
                 source_call,
-                0,
-            )],
+                0)],
         );
 
         assert_eq!(
@@ -11844,8 +11766,7 @@ mod tests {
             vec![
                 crate::analysis::CallArgBinding::input(
                     crate::analysis::SemanticCallArg::FallbackExpr(CExpr::Var(
-                        { let CExpr::Var(id) = ctx.name_ref("fake_arg") else { unreachable!() }; id },
-                    )),
+                        { let CExpr::Var(id) = ctx.name_ref("fake_arg") else { unreachable!() }; id })),
                 )
                 .with_source_call(0x1000, 0),
             ],
@@ -12018,7 +11939,8 @@ mod tests {
         let rendered_args = ctx.render_call_args_for_site_with_direct_target(
             block.addr,
             2,
-            &CExpr::External { name: "sym.helper".to_string(), kind: crate::symbol::ExternalKind::Function },
+            &CExpr::External { name: "sym.helper".to_string(), kind: crate::symbol::ExternalKind::Function,
+            },
             Some(0x401050),
             ctx.call_args_map()
                 .get(&(0x1000, 2))
@@ -12351,54 +12273,36 @@ mod tests {
             graph.op_site_for_inst(shifted_inst),
             "the shifted original must resolve through its exact InstId"
         );
-        let proof_checkpoint = ctx.effect_render_proof_checkpoint();
-        ctx.record_effect_render_proof_for_normalized_value(
-            EffectRenderProofKind::Expression,
+        let synthetic_obligations = ctx.exact_effect_obligations_for_normalized_value(
+            EffectOccurrenceKind::Expression,
             block_addr,
             synthetic_idx,
             None,
         );
-        let synthetic_proofs = ctx.effect_render_proofs_since(proof_checkpoint);
-        assert_eq!(synthetic_proofs.len(), 1);
         assert!(
-            synthetic_proofs[0]
-                .phi_edge
-                .as_ref()
-                .is_some_and(|edge| !edge.sites.is_empty()),
-            "a synthetic phi operation may carry only its exact original input evidence"
+            synthetic_obligations.iter().all(|id| {
+                id.kind == r2ssa::SemanticObligationKind::LiveStateTransition
+                    && matches!(id.instruction.site, r2ssa::CanonicalInstructionSite::Phi(_))
+            }),
+            "a synthetic phi operation may carry only an obligation that exists for its exact original input edge"
         );
-        ctx.note_elided_normalized_op(block_addr, synthetic_idx, "synthetic test");
-        assert!(
-            ctx.elided_obligations().is_empty(),
-            "a renderer heuristic must not discharge the canonical elision ledger"
-        );
-
-        let shifted_checkpoint = ctx.effect_render_proof_checkpoint();
-        ctx.record_effect_render_proof_for_normalized_value(
-            EffectRenderProofKind::Expression,
+        let obligations = ctx.exact_effect_obligations_for_normalized_value(
+            EffectOccurrenceKind::Expression,
             block_addr,
             shifted_idx,
             None,
         );
-        let proofs = ctx.effect_render_proofs_since(shifted_checkpoint);
-        assert_eq!(proofs.len(), 1);
         let shifted_instruction = prepared
             .obligations()
             .instruction_for_inst(shifted_inst)
             .expect("shifted source terminator has canonical identity")
             .id;
         assert!(
-            !proofs[0].obligation_ids.is_empty()
-                && proofs[0]
-                    .obligation_ids
+            !obligations.is_empty()
+                && obligations
                     .iter()
                     .all(|id| id.instruction == shifted_instruction),
             "the shifted normalized index must discharge only exact obligations of its original InstId"
-        );
-        ctx.note_elided_normalized_op(block_addr, shifted_idx, "shifted source test");
-        assert!(
-            ctx.elided_obligations().is_empty(),
-            "a shifted renderer heuristic still cannot mint canonical elision evidence"
         );
     }
 
@@ -12421,9 +12325,7 @@ mod tests {
         let fact = ctx
             .inputs
             .render_facts()
-            .and_then(|facts| {
-                facts.memory_access_for_op(0x1920, 0, false, r2il::SpaceId::Ram)
-            })
+            .and_then(|facts| facts.memory_access_for_op(0x1920, 0, false, r2il::SpaceId::Ram))
             .expect("genuine load has one canonical memory fact")
             .clone();
         assert!(
@@ -12436,9 +12338,8 @@ mod tests {
             "fixture must put multiple obligations on the load instruction"
         );
 
-        let checkpoint = ctx.effect_render_proof_checkpoint();
-        ctx.record_effect_render_proof_for_source_memory(
-            EffectRenderProofKind::MemoryRead,
+        let obligations = ctx.exact_effect_obligations_for_source_memory(
+            EffectOccurrenceKind::MemoryRead,
             fact.block_addr,
             fact.op_index,
             fact.space,
@@ -12446,10 +12347,8 @@ mod tests {
             fact.value,
         );
 
-        let proofs = ctx.effect_render_proofs_since(checkpoint);
-        assert_eq!(proofs.len(), 1);
-        assert_eq!(proofs[0].obligation_ids.len(), 1);
-        assert!(proofs[0].obligation_ids.iter().all(|id| {
+        assert_eq!(obligations.len(), 1);
+        assert!(obligations.iter().all(|id| {
             id.kind == r2ssa::SemanticObligationKind::ObservableMemoryRead
                 && id.component
                     == r2ssa::SemanticObligationComponent::MemoryAccess(fact.access.ordinal)
@@ -12565,12 +12464,10 @@ mod tests {
             owner_expr_by_name: HashMap::from([
                 (
                     "tmp:pred.1".to_string(),
-                    ctx.name_ref("tmp:pred.2"),
-                ),
+                    ctx.name_ref("tmp:pred.2")),
                 (
                     "tmp:pred.2".to_string(),
-                    ctx.name_ref("tmp:pred.1"),
-                ),
+                    ctx.name_ref("tmp:pred.1")),
             ]),
             ..PreparedSemanticView::default()
         })));
@@ -12836,8 +12733,7 @@ mod tests {
         ctx.state.analysis_ctx.use_info.insert_definition_for_name_if_absent("tmp:ret_1", CExpr::binary(
                 BinaryOp::BitXor,
                 ctx.name_ref("value"),
-                CExpr::IntLit(1),
-            ),
+                CExpr::IntLit(1)),
         );
         ctx.state
             .analysis_ctx
@@ -12969,8 +12865,7 @@ mod tests {
                 &ctx.name_ref("sym.imp.printf"),
                 crate::analysis::CallArgBinding::result(
                     crate::analysis::SemanticCallArg::FallbackExpr(CExpr::Var(
-                        { let CExpr::Var(id) = ctx.name_ref("fallback") else { unreachable!() }; id },
-                    )),
+                        { let CExpr::Var(id) = ctx.name_ref("fallback") else { unreachable!() }; id })),
                 )
                 .with_source_call(0x1000, 0),
             );
@@ -13006,7 +12901,8 @@ mod tests {
         ctx.state
             .analysis_ctx
             .use_info
-            .insert_definition_for_name_if_absent(&source.display_name(), ctx.name_ref("stack_slot"));
+            .insert_definition_for_name_if_absent(&source.display_name(), ctx.name_ref("stack_slot"),
+            );
 
         let binding = crate::analysis::CallArgBinding::input(
             crate::analysis::SemanticCallArg::FallbackExpr(ctx.name_ref("fallback")),
@@ -13096,8 +12992,7 @@ mod tests {
         install_prepared_owner_for_name(
             &mut ctx,
             __fixture_args.0,
-            __fixture_args.1,
-        );
+            __fixture_args.1);
 
         let binding = crate::analysis::CallArgBinding::input(
             crate::analysis::SemanticCallArg::FallbackExpr(ctx.name_ref("fallback")),
@@ -13175,8 +13070,7 @@ mod tests {
             vec![
                 crate::analysis::CallArgBinding::result(
                     crate::analysis::SemanticCallArg::FallbackExpr(CExpr::Var(
-                        { let CExpr::Var(id) = ctx.name_ref("fallback") else { unreachable!() }; id },
-                    )),
+                        { let CExpr::Var(id) = ctx.name_ref("fallback") else { unreachable!() }; id })),
                 )
                 .with_source_call(source_call.0, source_call.1),
             ],
@@ -13191,8 +13085,7 @@ mod tests {
         ctx.inputs.prepared_semantic_view = Some(Box::leak(Box::new(PreparedSemanticView {
             owner_expr_by_name: HashMap::from([(
                 "tmp:size_1".to_string(),
-                ctx.name_ref("len"),
-            )]),
+                ctx.name_ref("len"))]),
             ..PreparedSemanticView::default()
         })));
 
@@ -13222,8 +13115,7 @@ mod tests {
                 CExpr::binary(
                     BinaryOp::Ne,
                     ctx.name_ref("var_8h"),
-                    CExpr::IntLit(0),
-                ),
+                    CExpr::IntLit(0)),
             )]),
             ..PreparedSemanticView::default()
         })));
@@ -13908,8 +13800,7 @@ mod tests {
         ctx.state.analysis_ctx.use_info.insert_definition_for_name_if_absent(&slot.display_name(), CExpr::binary(
                 BinaryOp::Add,
                 ctx.name_ref("rbp"),
-                CExpr::IntLit(-8),
-            ),
+                CExpr::IntLit(-8)),
         );
         let block = make_block(vec![
             SSAOp::Call {
@@ -13954,8 +13845,7 @@ mod tests {
         ctx.state.analysis_ctx.use_info.insert_definition_for_name_if_absent(&slot.display_name(), CExpr::binary(
                 BinaryOp::Add,
                 ctx.name_ref("rbp"),
-                CExpr::IntLit(-8),
-            ),
+                CExpr::IntLit(-8)),
         );
         let block = make_block(vec![
             SSAOp::Call {
@@ -13997,14 +13887,12 @@ mod tests {
         ctx.state.analysis_ctx.use_info.insert_definition_for_name_if_absent(&stored_slot.display_name(), CExpr::binary(
                 BinaryOp::Add,
                 ctx.name_ref("rbp"),
-                CExpr::IntLit(-8),
-            ),
+                CExpr::IntLit(-8)),
         );
         ctx.state.analysis_ctx.use_info.insert_definition_for_name_if_absent(&loaded_slot.display_name(), CExpr::binary(
                 BinaryOp::Add,
                 ctx.name_ref("rbp"),
-                CExpr::IntLit(-16),
-            ),
+                CExpr::IntLit(-16)),
         );
         let block = make_block(vec![
             SSAOp::Call {
@@ -14039,8 +13927,7 @@ mod tests {
         ctx.state.analysis_ctx.use_info.insert_definition_for_name_if_absent(&slot.display_name(), CExpr::binary(
                 BinaryOp::Add,
                 ctx.name_ref("rbp"),
-                CExpr::IntLit(-8),
-            ),
+                CExpr::IntLit(-8)),
         );
 
         let mut ops = vec![
@@ -14179,8 +14066,7 @@ mod tests {
         ctx.state.analysis_ctx.use_info.insert_definition_for_name_if_absent(&addr.display_name(), CExpr::binary(
                 BinaryOp::Add,
                 ctx.name_ref("rbp"),
-                CExpr::IntLit(-8),
-            ),
+                CExpr::IntLit(-8)),
         );
         ctx.state
             .analysis_ctx
@@ -14223,8 +14109,7 @@ mod tests {
         ctx.state.analysis_ctx.use_info.insert_definition_for_name_if_absent(&addr.display_name(), CExpr::binary(
                 BinaryOp::Add,
                 ctx.name_ref("rbp"),
-                CExpr::IntLit(0),
-            ),
+                CExpr::IntLit(0)),
         );
         ctx.state
             .analysis_ctx
@@ -14439,7 +14324,8 @@ mod tests {
                 rbp_input.clone(),
                 false,
                 |ctx, store_val, source_call| {
-                    ctx.state.analysis_ctx.use_info.insert_call_result_source_alias(&store_val.to_ascii_lowercase(), source_call);
+                    ctx.state.analysis_ctx.use_info.insert_call_result_source_alias(&store_val.to_ascii_lowercase(), source_call,
+                        );
                     BTreeSet::new()
                 }
             ),
@@ -14465,7 +14351,8 @@ mod tests {
                     ctx.state
                         .analysis_ctx
                         .use_info
-                        .insert_call_result_source_alias(&store_val.to_string(), (source_call.0, source_call.1 + 1));
+                        .insert_call_result_source_alias(&store_val.to_string(), (source_call.0, source_call.1 + 1),
+                        );
                     BTreeSet::new()
                 }
             ),

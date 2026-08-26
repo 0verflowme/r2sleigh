@@ -15,14 +15,15 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 
 use r2ssa::{
-    InstId, MachineUseDisposition, MachineWriteDisposition, SSAFunction, SsaArtifactAuthority,
-    SemanticObligationId, UseSite, ValueId,
+    InstId, MachineUseDisposition, MachineWriteDisposition, SSAFunction, SemanticObligationId,
+    SsaArtifact, SsaArtifactAuthority, UseSite, ValueId,
 };
 use r2types::SourceOwnedFunctionFacts;
 
 use crate::ast::{
     BinaryOp, CExpr, CFunction, CStmt, RenderObservationInspectError, RenderObservationNode,
     RenderObservationStripError, inspect_and_strip_render_observations,
+    inspect_render_observations,
 };
 use crate::binding_plan::{BindingPlan, BindingPlanSourceMismatch, ValueDisposition};
 use crate::codegen::{EmissionReadyFunction, prepare_function_for_emission};
@@ -159,9 +160,7 @@ impl From<&r2ssa::MachineBuildError> for BindingMachineProjectionFailure {
                 Self::MissingInstructionDisposition { inst: *inst }
             }
             Error::MissingUseDisposition(site) => Self::MissingUseDisposition { site: *site },
-            Error::MissingWriteDisposition(inst) => {
-                Self::MissingWriteDisposition { inst: *inst }
-            }
+            Error::MissingWriteDisposition(inst) => Self::MissingWriteDisposition { inst: *inst },
             Error::MissingOutput(inst) => Self::MissingOutput { inst: *inst },
             Error::InvalidValueWidth { value, size_bytes } => Self::InvalidValueWidth {
                 value: *value,
@@ -222,9 +221,7 @@ impl From<&r2ssa::MachineBuildError> for BindingMachineProjectionFailure {
             Error::EntityMismatch(inst) => Self::EntityMismatch { inst: *inst },
             Error::ObligationMismatch(inst) => Self::ObligationMismatch { inst: *inst },
             Error::UseDispositionMismatch(site) => Self::UseDispositionMismatch { site: *site },
-            Error::WriteDispositionMismatch(inst) => {
-                Self::WriteDispositionMismatch { inst: *inst }
-            }
+            Error::WriteDispositionMismatch(inst) => Self::WriteDispositionMismatch { inst: *inst },
             Error::ObligationSourceMismatch(instruction) => Self::ObligationSourceMismatch {
                 instruction: *instruction,
             },
@@ -235,7 +232,9 @@ impl From<&r2ssa::MachineBuildError> for BindingMachineProjectionFailure {
 
 fn binding_plan_failure(error: &BindingPlanSourceMismatch) -> BindingObservationJournalFailure {
     match error {
-        BindingPlanSourceMismatch::Authority => BindingObservationJournalFailure::BindingPlanAuthority,
+        BindingPlanSourceMismatch::Authority => {
+            BindingObservationJournalFailure::BindingPlanAuthority
+        }
         BindingPlanSourceMismatch::MachineProjection(error) => {
             BindingObservationJournalFailure::BindingPlanMachineProjection(error.into())
         }
@@ -310,6 +309,40 @@ fn binding_plan_failure(error: &BindingPlanSourceMismatch) -> BindingObservation
                 binding_index: binding.index(),
             }
         }
+        BindingPlanSourceMismatch::ParameterCount { expected, actual } => {
+            BindingObservationJournalFailure::BindingPlanParameterCount {
+                expected: *expected,
+                actual: *actual,
+            }
+        }
+        BindingPlanSourceMismatch::UnexpectedParameterDisposition { slot } => {
+            BindingObservationJournalFailure::BindingPlanUnexpectedParameterDisposition {
+                slot: *slot,
+            }
+        }
+        BindingPlanSourceMismatch::ParameterCertificate { slot, binding } => {
+            BindingObservationJournalFailure::BindingPlanParameterCertificate {
+                slot: *slot,
+                binding_index: binding.index(),
+            }
+        }
+        BindingPlanSourceMismatch::ParameterDeclarationWidth { slot, binding } => {
+            BindingObservationJournalFailure::BindingPlanParameterDeclarationWidth {
+                slot: *slot,
+                binding_index: binding.index(),
+            }
+        }
+        BindingPlanSourceMismatch::ParameterRole { slot, binding } => {
+            BindingObservationJournalFailure::BindingPlanParameterRole {
+                slot: *slot,
+                binding_index: binding.index(),
+            }
+        }
+        BindingPlanSourceMismatch::BindingRole { binding } => {
+            BindingObservationJournalFailure::BindingPlanBindingRole {
+                binding_index: binding.index(),
+            }
+        }
     }
 }
 
@@ -370,9 +403,7 @@ impl From<&LegacyObservationJournalError> for BindingObservationJournalFailure {
                 Self::InvalidValue { value: *value }
             }
             LegacyObservationJournalError::InvalidUse(site) => Self::InvalidUse { site: *site },
-            LegacyObservationJournalError::InvalidWrite(inst) => {
-                Self::InvalidWrite { inst: *inst }
-            }
+            LegacyObservationJournalError::InvalidWrite(inst) => Self::InvalidWrite { inst: *inst },
             LegacyObservationJournalError::InvalidEffectObligation(obligation) => {
                 Self::InvalidEffectObligation {
                     obligation: *obligation,
@@ -587,13 +618,23 @@ pub(crate) struct SurvivingEffectObservations {
 }
 
 impl SurvivingEffectObservations {
+    fn empty(source: &SsaArtifact) -> Self {
+        Self {
+            occurrences: source
+                .obligations()
+                .obligations()
+                .keys()
+                .map(|id| (*id, 0))
+                .collect(),
+        }
+    }
+
     pub(crate) fn occurrence_count(&self, id: SemanticObligationId) -> Option<usize> {
         self.occurrences.get(&id).copied()
     }
 
     pub(crate) fn surviving(
-        &self,
-    ) -> impl Iterator<Item = (SemanticObligationId, usize)> + '_ {
+        &self) -> impl Iterator<Item = (SemanticObligationId, usize)> + '_ {
         self.occurrences
             .iter()
             .filter_map(|(id, count)| (*count > 0).then_some((*id, *count)))
@@ -613,6 +654,14 @@ pub(crate) struct LegacyObservationJournal {
     writes: Box<[Option<LegacyWriteObservation>]>,
     effect_occurrences: BTreeMap<SemanticObligationId, usize>,
     targets: Vec<ObservationTarget>,
+}
+
+enum LegacyObservationSeal {
+    Complete(SealedLegacyObservations),
+    BindingFailure {
+        error: LegacyObservationJournalError,
+        effects: SurvivingEffectObservations,
+    },
 }
 
 /// Internal ownership boundary for an AST that may still contain markers.
@@ -640,6 +689,8 @@ impl MarkedNativeDraft {
         Ok(SealedNativeFunction {
             ready,
             observations: Some(observations),
+            fallback_effects: None,
+            effect_audit: crate::EffectObligationAudit::NOT_RUN,
             observation_failure: None,
             plan,
         })
@@ -659,23 +710,44 @@ impl MarkedNativeDraft {
     ) -> SealedNativeFunction {
         let mut ready = prepare_function_for_emission(&self.function);
         let plan = Rc::clone(&self.journal.plan);
-        let (observations, observation_failure) = if let Some(error) = recording_failure {
-            let mut authority = ObservationSealAuthority::new();
-            ready.discard_observation_markers(&mut authority);
+        let (observations, fallback_effects, observation_failure) = if let Some(error) = recording_failure {
+            let effects = match self.journal.seal_effects_only(source, &mut ready) {
+                Ok(effects) => effects,
+                Err(_) => {
+                    let mut authority = ObservationSealAuthority::new();
+                    ready.discard_observation_markers(&mut authority);
+                    SurvivingEffectObservations::empty(source.source())
+                }
+            };
             (
                 None,
+                Some(effects),
                 Some(BindingShadowAuditFailure::JournalRecording(
                     BindingObservationJournalFailure::from(&error),
                 )),
             )
         } else {
-            match self.journal.seal(source, &mut ready) {
-                Ok(observations) => (Some(observations), None),
+            match self.journal.seal_preserving_effects(source, &mut ready) {
+                Ok(LegacyObservationSeal::Complete(observations)) => {
+                    (Some(observations), None, None)
+                }
+                Ok(LegacyObservationSeal::BindingFailure { error, effects }) => {
+                    let mut authority = ObservationSealAuthority::new();
+                    ready.discard_observation_markers(&mut authority);
+                    (
+                        None,
+                        Some(effects),
+                        Some(BindingShadowAuditFailure::JournalSeal(
+                            BindingObservationJournalFailure::from(&error),
+                        )),
+                    )
+                }
                 Err(error) => {
                     let mut authority = ObservationSealAuthority::new();
                     ready.discard_observation_markers(&mut authority);
                     (
                         None,
+                        Some(SurvivingEffectObservations::empty(source.source())),
                         Some(BindingShadowAuditFailure::JournalSeal(
                             BindingObservationJournalFailure::from(&error),
                         )),
@@ -686,6 +758,8 @@ impl MarkedNativeDraft {
         SealedNativeFunction {
             ready,
             observations,
+            fallback_effects,
+            effect_audit: crate::EffectObligationAudit::NOT_RUN,
             observation_failure,
             plan,
         }
@@ -696,6 +770,10 @@ impl MarkedNativeDraft {
 pub(crate) struct SealedNativeFunction {
     ready: EmissionReadyFunction,
     observations: Option<SealedLegacyObservations>,
+    /// Exact effect stream when the independent legacy V/U/W audit failed.
+    /// A run owns effects here or inside `observations`, never in both.
+    fallback_effects: Option<SurvivingEffectObservations>,
+    effect_audit: crate::EffectObligationAudit,
     observation_failure: Option<BindingShadowAuditFailure>,
     plan: Rc<BindingPlan>,
 }
@@ -706,11 +784,14 @@ impl SealedNativeFunction {
     pub(crate) fn without_observations(
         function: CFunction,
         plan: Rc<BindingPlan>,
+        source: &SsaArtifact,
         failure: BindingShadowAuditFailure,
     ) -> Self {
         Self {
             ready: prepare_function_for_emission(&function),
             observations: None,
+            fallback_effects: Some(SurvivingEffectObservations::empty(source)),
+            effect_audit: crate::EffectObligationAudit::NOT_RUN,
             observation_failure: Some(failure),
             plan,
         }
@@ -754,7 +835,36 @@ impl SealedNativeFunction {
         self.observations
             .as_ref()
             .map(SealedLegacyObservations::effects)
-            .expect("strictly sealed native function must retain effect observations")
+            .or(self.fallback_effects.as_ref())
+            .expect("every native function retains the source effect domain")
+    }
+
+    /// Finalize native admission from the exact sealed effect stream.
+    ///
+    /// The public audit retains the tuple even when admission fails. Refused
+    /// output is comment-only: keeping the executable body beside a refusal
+    /// would still expose unproven semantics to ordinary decompile callers.
+    pub(crate) fn finalize_effect_ledger(&mut self, ledger: &r2ssa::ledger::ObligationLedger) {
+        self.effect_audit = crate::EffectObligationAudit::from_ledger(ledger);
+        if !self.effect_audit.is_admitted() {
+            let function_name = self.ready.function().name.clone();
+            let reason = format!(
+                "r2dec residual: source effect closure refused native C ({} refused, {} unaccounted, {} conflicting)",
+                self.effect_audit.refused,
+                self.effect_audit.unaccounted,
+                self.effect_audit.conflicts,
+            );
+            self.ready = prepare_function_for_emission(
+                &crate::residual_function_for_render_boundary(&function_name, &reason),
+            );
+        }
+        let mut function = self.ready.function().clone();
+        crate::note_unproven_constructs(&mut function, Some(ledger));
+        self.ready = prepare_function_for_emission(&function);
+    }
+
+    pub(crate) const fn effect_obligation_audit(&self) -> crate::EffectObligationAudit {
+        self.effect_audit
     }
 
     pub(crate) fn into_function(self) -> CFunction {
@@ -909,7 +1019,8 @@ impl LegacyObservationJournal {
                     matches!(disposition, MachineUseDisposition::Refused(_)).then_some(UseSite {
                         inst: InstId(inst as u32),
                         input_idx,
-                    })
+                    },
+                        )
                 })
             })
             .collect::<Vec<_>>();
@@ -1208,8 +1319,7 @@ impl LegacyObservationJournal {
         let observation = match self.plan.use_disposition(site) {
             Some(MachineUseDisposition::Refused(reason)) => LegacyUseObservation::Refused(*reason),
             Some(
-                MachineUseDisposition::Exact(_) | MachineUseDisposition::MemoryAddress(_),
-            )
+                MachineUseDisposition::Exact(_) | MachineUseDisposition::MemoryAddress(_))
             | None => {
                 return Err(
                     LegacyObservationJournalError::ExactUseRequiresRenderedOccurrence(site),
@@ -1291,11 +1401,78 @@ impl LegacyObservationJournal {
         }
     }
 
+    /// Seal only the source-effect occurrence stream.
+    ///
+    /// Binding shadow recording is diagnostic and may already have failed by
+    /// this point. Effect markers have an independent source domain, so that
+    /// failure must not erase the exact effect occurrences that reached the
+    /// final emission tree.
+    fn seal_effects_only(
+        self,
+        source: &SourceOwnedFunctionFacts,
+        ready: &mut EmissionReadyFunction,
+    ) -> Result<SurvivingEffectObservations, LegacyObservationJournalError> {
+        if self.authority != *source.source().authority() {
+            return Err(LegacyObservationJournalError::SourceAuthority);
+        }
+        let mut seal_authority = ObservationSealAuthority::new();
+        let function = ready.function_mut_for_observation_seal(&mut seal_authority);
+        let mut effect_occurrences = self.effect_occurrences;
+        let targets = self.targets;
+        inspect_and_strip_render_observations(
+            function,
+            targets.len(),
+            |id, _node| -> Result<(), LegacyObservationJournalError> {
+                let target = targets.get(id.index() as usize).copied().ok_or_else(|| {
+                    LegacyObservationJournalError::Markers(
+                        RenderObservationStripError::OutOfRange {
+                            id,
+                            expected_count: targets.len(),
+                        },
+                    )
+                })?;
+                if let ObservationTarget::Effect(id) = target {
+                    let occurrences = effect_occurrences
+                        .get_mut(&id)
+                        .ok_or(LegacyObservationJournalError::InvalidEffectObligation(id))?;
+                    *occurrences = occurrences
+                        .checked_add(1)
+                        .ok_or(LegacyObservationJournalError::TooManyObservations)?;
+                }
+                Ok(())
+            },
+        )
+        .map_err(|error| match error {
+            RenderObservationInspectError::Markers(error) => {
+                LegacyObservationJournalError::Markers(error)
+            }
+            RenderObservationInspectError::Observer(error) => error,
+        })?;
+        Ok(SurvivingEffectObservations {
+            occurrences: effect_occurrences,
+        })
+    }
+
     pub(crate) fn seal(
-        mut self,
+        self,
         source: &SourceOwnedFunctionFacts,
         ready: &mut EmissionReadyFunction,
     ) -> Result<SealedLegacyObservations, LegacyObservationJournalError> {
+        match self.seal_preserving_effects(source, ready)? {
+            LegacyObservationSeal::Complete(observations) => Ok(observations),
+            LegacyObservationSeal::BindingFailure { error, .. } => Err(error),
+        }
+    }
+
+    /// Inspect the final marker tree once, always accumulating the independent
+    /// effect stream while retaining the first legacy binding-classification
+    /// failure. A binding failure leaves the marker tree unchanged so the
+    /// caller can discard it only after taking ownership of the effect counts.
+    fn seal_preserving_effects(
+        mut self,
+        source: &SourceOwnedFunctionFacts,
+        ready: &mut EmissionReadyFunction,
+    ) -> Result<LegacyObservationSeal, LegacyObservationJournalError> {
         if self.authority != *source.source().authority() {
             return Err(LegacyObservationJournalError::SourceAuthority);
         }
@@ -1305,15 +1482,16 @@ impl LegacyObservationJournal {
             return Err(LegacyObservationJournalError::SymbolTableMismatch);
         }
 
-        let mut values = self.values.clone();
-        let mut uses = self.uses.clone();
-        let mut writes = self.writes.clone();
-        let mut effect_occurrences = self.effect_occurrences.clone();
+        let mut values = std::mem::take(&mut self.values);
+        let mut uses = std::mem::take(&mut self.uses);
+        let mut writes = std::mem::take(&mut self.writes);
+        let mut effect_occurrences = std::mem::take(&mut self.effect_occurrences);
         let targets = &self.targets;
         let value_is_literal = &self.value_is_literal;
         let plan = &self.plan;
         let symbol_bindings = declared_legacy_bindings(function);
-        inspect_and_strip_render_observations(
+        let mut binding_failure = None;
+        inspect_render_observations(
             function,
             targets.len(),
             |id, node| -> Result<(), LegacyObservationJournalError> {
@@ -1325,32 +1503,40 @@ impl LegacyObservationJournal {
                         },
                     )
                 })?;
-                match target {
+                if binding_failure.is_some() && !matches!(target, ObservationTarget::Effect(_)) {
+                    return Ok(());
+                }
+                let result = match target {
                     ObservationTarget::Value(value) => {
                         match plan.disposition(value) {
                             Some(ValueDisposition::Elided { reason, .. }) => {
-                                return Err(
+                                binding_failure = Some(
                                     LegacyObservationJournalError::PlannedElidedValueRendered {
                                         value,
                                         reason: *reason,
                                     },
                                 );
+                                return Ok(());
                             }
                             Some(ValueDisposition::Refused { reason }) => {
-                                return Err(
+                                binding_failure = Some(
                                     LegacyObservationJournalError::PlannedRefusedValueRendered {
                                         value,
                                         reason: *reason,
                                     },
                                 );
+                                return Ok(());
                             }
-                            Some(ValueDisposition::Bound { .. } | ValueDisposition::Inline { .. })
+                            Some(ValueDisposition::Bound { .. } | ValueDisposition::Inline { .. },
+                            )
                             | None => {}
                         }
-                        let observation =
-                            classify_value_node(value, node, value_is_literal, &symbol_bindings)?;
-                        record_same(&mut values[value.0 as usize], observation)
-                            .map_err(|()| LegacyObservationJournalError::ConflictingValue(value))
+                        classify_value_node(value, node, value_is_literal, &symbol_bindings)
+                            .and_then(|observation| {
+                                record_same(&mut values[value.0 as usize], observation).map_err(
+                                    |()| LegacyObservationJournalError::ConflictingValue(value),
+                                )
+                            })
                     }
                     ObservationTarget::Use { site, observation } => {
                         record_same(&mut uses[site.inst.0 as usize][site.input_idx], observation)
@@ -1367,9 +1553,13 @@ impl LegacyObservationJournal {
                         *occurrences = occurrences
                             .checked_add(1)
                             .ok_or(LegacyObservationJournalError::TooManyObservations)?;
-                        Ok(())
+                        return Ok(());
                     }
+                };
+                if let Err(error) = result {
+                    binding_failure = Some(error);
                 }
+                Ok(())
             },
         )
         .map_err(|error| match error {
@@ -1379,11 +1569,24 @@ impl LegacyObservationJournal {
             RenderObservationInspectError::Observer(error) => error,
         })?;
 
+        if let Some(error) = binding_failure {
+            return Ok(LegacyObservationSeal::BindingFailure {
+                error,
+                effects: SurvivingEffectObservations {
+                    occurrences: effect_occurrences,
+                },
+            });
+        }
+
+        let mut seal_authority = ObservationSealAuthority::new();
+        ready.discard_observation_markers(&mut seal_authority);
         self.values = values;
         self.uses = uses;
         self.writes = writes;
         self.effect_occurrences = effect_occurrences;
-        Ok(self.into_sealed_observations(source))
+        Ok(LegacyObservationSeal::Complete(
+            self.into_sealed_observations(source),
+        ))
     }
 
     fn final_coverage(&self) -> LegacyObservationCoverage {
@@ -1510,12 +1713,12 @@ impl LegacyObservationJournal {
     }
 
     fn into_sealed_observations(
-        self,
+        mut self,
         source: &SourceOwnedFunctionFacts,
     ) -> SealedLegacyObservations {
         let coverage = self.final_coverage();
         let effects = SurvivingEffectObservations {
-            occurrences: self.effect_occurrences.clone(),
+            occurrences: std::mem::take(&mut self.effect_occurrences),
         };
         let snapshot = self.into_snapshot(source);
         SealedLegacyObservations {
@@ -1718,8 +1921,7 @@ fn classify_symbol(
         .copied()
         .ok_or(LegacyObservationJournalError::UnownedBindingSymbol {
             value,
-            symbol,
-        })?;
+            symbol })?;
     Ok(LegacyValueObservation::Bound { binding })
 }
 
@@ -1935,6 +2137,48 @@ mod tests {
             .expect("final effect occurrences seal");
         assert_eq!(sealed.effects().occurrence_count(obligation), Some(1));
         assert_eq!(sealed.effects().surviving().collect::<Vec<_>>(), [(obligation, 1)]);
+    }
+
+    #[test]
+    fn duplicate_surviving_effect_occurrence_is_a_codegen_refusal() {
+        let (source, _plan, mut function, mut journal) = journal_fixture();
+        let obligation = *source
+            .source()
+            .obligations()
+            .obligations()
+            .keys()
+            .next()
+            .expect("fixture has source obligations");
+        let obligations = BTreeSet::from([obligation]);
+        function.body = vec![
+            journal
+                .observe_effect_stmt(&obligations, CStmt::Return(None))
+                .expect("first concrete effect occurrence"),
+            journal
+                .observe_effect_stmt(&obligations, CStmt::Return(None))
+                .expect("second concrete effect occurrence"),
+        ];
+
+        let mut ready = crate::codegen::prepare_function_for_emission(&function);
+        let sealed = journal
+            .seal(&source, &mut ready)
+            .expect("final effect occurrences seal");
+        assert_eq!(sealed.effects().occurrence_count(obligation), Some(2));
+
+        let origins =
+            NormalizationOrigins::for_unchanged(source.source().function(), source.source());
+        let ledger = crate::effect_ledger::build_obligation_ledger(
+            source.source(),
+            &origins,
+            sealed.effects(),
+        );
+        assert_eq!(
+            ledger.outcome(&obligation),
+            r2ssa::ledger::Outcome::Refused {
+                layer: r2ssa::ledger::LedgerLayer::Codegen,
+                reason: r2ssa::ledger::RefusalReason::DuplicateRenderedOccurrence,
+            }
+        );
     }
 
     #[test]
@@ -2300,8 +2544,7 @@ mod tests {
             ),
             (
                 LegacyObservationJournalError::BindingPlan(
-                    BindingPlanSourceMismatch::Authority,
-                ),
+                    BindingPlanSourceMismatch::Authority),
                 BindingObservationJournalFailure::BindingPlanAuthority,
             ),
             (
@@ -2381,15 +2624,13 @@ mod tests {
                     reason: r2ssa::ledger::ElisionReason::DeadUnusedTemporary,
                 },
                 BindingObservationJournalFailure::PlannedElidedValueRendered {
-                    value: ValueId(32),
-                },
+                    value: ValueId(32) },
             ),
             (
                 LegacyObservationJournalError::PlannedRefusedValueRendered {
                     value: ValueId(33),
                     reason: ValueRefusal::MissingBindingCertificate {
-                        value: ValueId(33),
-                    },
+                        value: ValueId(33) },
                 },
                 BindingObservationJournalFailure::PlannedRefusedValueRendered {
                     value: ValueId(33),
@@ -2398,8 +2639,7 @@ mod tests {
             (
                 LegacyObservationJournalError::MissingPlannedValue(ValueId(34)),
                 BindingObservationJournalFailure::MissingPlannedValue {
-                    value: ValueId(34),
-                },
+                    value: ValueId(34) },
             ),
             (
                 LegacyObservationJournalError::InvalidPlannedInline {
@@ -2452,8 +2692,7 @@ mod tests {
                     RenderObservationStripError::DomainTooLarge { expected_count: 47 },
                 ),
                 BindingObservationJournalFailure::ObservationDomainTooLarge {
-                    expected_count: 47,
-                },
+                    expected_count: 47 },
             ),
             (
                 LegacyObservationJournalError::Markers(
@@ -2468,8 +2707,7 @@ mod tests {
                     RenderObservationStripError::OutOfRange {
                         id: marker,
                         expected_count: 59,
-                    },
-                ),
+                    }),
                 BindingObservationJournalFailure::ObservationOutOfRange {
                     observation_id: 11,
                     expected_count: 59,
@@ -2480,8 +2718,7 @@ mod tests {
                     id: marker,
                 }),
                 BindingObservationJournalFailure::DuplicateObservation {
-                    observation_id: 11,
-                },
+                    observation_id: 11 },
             ),
         ];
 
@@ -2624,8 +2861,7 @@ mod tests {
             .expect("marked output statement");
         let rewritten = crate::structure::ControlFlowStructurer::cleanup(
             function.symbols.as_ref(),
-            marked,
-        );
+            marked);
         function.body = vec![rewritten, CStmt::Return(Some(CExpr::Var(symbol)))];
 
         let expected_write = match plan.write_disposition(inst) {
@@ -2676,6 +2912,44 @@ mod tests {
             Err(LegacyObservationJournalError::ConflictingValue(value))
         );
         assert_eq!(ready.function_for_marker_test(), &unchanged);
+    }
+
+    #[test]
+    fn production_binding_classification_failure_keeps_later_effect_occurrences() {
+        let (source, plan, mut function, mut journal) = journal_fixture();
+        let (value, binding, _inst, site) = first_bound_rendered_output(&plan, &source);
+        let symbol = declare_legacy_local(&mut function, &plan, binding, "conflicting_output");
+        let bound = journal
+            .observe_normalized_output_expr(site, CExpr::Var(symbol))
+            .expect("bound output expression");
+        let inline = journal
+            .observe_normalized_output_expr(site, CExpr::IntLit(7))
+            .expect("inline output expression");
+        let obligation = *source
+            .source()
+            .obligations()
+            .obligations()
+            .keys()
+            .next()
+            .expect("fixture has a source effect");
+        let effect = journal
+            .observe_effect_stmt(&BTreeSet::from([obligation]), CStmt::Return(None))
+            .expect("independent effect occurrence");
+        function.body = vec![CStmt::Expr(bound), CStmt::Expr(inline), effect];
+
+        let native = MarkedNativeDraft::new(function, journal)
+            .finish_non_consuming(&source, None);
+        assert_eq!(
+            native.audit_observations(),
+            Err(BindingShadowAuditFailure::JournalSeal(
+                BindingObservationJournalFailure::ConflictingValue { value },
+            ))
+        );
+        assert_eq!(
+            native.effect_observations().occurrence_count(obligation),
+            Some(1),
+            "a V/U/W classification failure must not stop the final effect traversal"
+        );
     }
 
     #[test]
@@ -2793,6 +3067,16 @@ mod tests {
         let marked = journal
             .observe_normalized_input_expr(site, input_idx, CExpr::Var(symbol))
             .expect("value marker");
+        let obligation = *source
+            .source()
+            .obligations()
+            .obligations()
+            .keys()
+            .next()
+            .expect("fixture has a source effect");
+        let marked = journal
+            .observe_effect_expr(&BTreeSet::from([obligation]), marked)
+            .expect("independent effect marker");
         function.body = vec![CStmt::Expr(marked)];
 
         let mut expected_function = function.clone();
@@ -2813,6 +3097,11 @@ mod tests {
         assert!(!crate::ast::has_render_observations(
             native.emission().function()
         ));
+        assert_eq!(
+            native.effect_observations().occurrence_count(obligation),
+            Some(1),
+            "binding recording failure must not erase the final effect stream"
+        );
     }
 
     #[test]
@@ -2862,8 +3151,7 @@ mod tests {
             journal.seal(&source, &mut ready),
             Err(LegacyObservationJournalError::UnownedBindingSymbol {
                 value,
-                symbol,
-            })
+                symbol })
         );
         assert_eq!(ready.function_for_marker_test(), &unchanged);
     }

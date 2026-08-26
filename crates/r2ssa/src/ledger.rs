@@ -98,6 +98,12 @@ pub enum RefusalReason {
     ValueUnbound,
     /// A phase ran out of its budget before reaching this obligation.
     BudgetExhausted,
+    /// More than one final output occurrence claimed the same source effect.
+    ///
+    /// One source obligation is one semantic event. Rendering it twice is not
+    /// successful coverage: it changes program behavior and must therefore be
+    /// scored as a refusal at the final emission boundary.
+    DuplicateRenderedOccurrence,
     /// The layer refused and the reason is not yet one this enum distinguishes.
     Unclassified,
 }
@@ -109,6 +115,7 @@ impl std::fmt::Display for RefusalReason {
             Self::BlockNotRendered => "block-not-rendered",
             Self::ValueUnbound => "value-unbound",
             Self::BudgetExhausted => "budget-exhausted",
+            Self::DuplicateRenderedOccurrence => "duplicate-rendered-occurrence",
             Self::Unclassified => "unclassified",
         })
     }
@@ -432,5 +439,13 @@ mod tests {
             Record::Unknown
         );
         assert_eq!(ledger.close().total, 1);
+    }
+
+    #[test]
+    fn duplicate_render_refusal_has_a_stable_diagnostic_name() {
+        assert_eq!(
+            RefusalReason::DuplicateRenderedOccurrence.to_string(),
+            "duplicate-rendered-occurrence"
+        );
     }
 }
