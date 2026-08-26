@@ -14,12 +14,13 @@ use crate::cfg::BlockTerminator;
 use crate::function::{DecompilePrepFacts, SSAFunction, StackAddressBase, StackAddressRoot};
 use crate::graph::{InstId, InstPayload, SsaGraph, UseSite, ValueId};
 use crate::machine_context::{
-    SOURCE_FUNCTION_INTERFACE_SCHEMA_VERSION, SOURCE_TYPE_GRAPH_SCHEMA_VERSION, SourceCallResult,
-    SourceCallSiteIdentity, SourceCarrierKind, SourceFunctionReturn, SourceLogicalValue,
-    SourceMachineContext, SourceTypeKind,
+    MachineRegisterGeometryState, SOURCE_FUNCTION_INTERFACE_SCHEMA_VERSION,
+    SOURCE_TYPE_GRAPH_SCHEMA_VERSION, SourceCallResult, SourceCallSiteIdentity, SourceCarrierKind,
+    SourceFunctionReturn, SourceLogicalValue, SourceMachineContext, SourceTypeKind,
 };
 use crate::obligation::SemanticObligationInventory;
 use crate::op::SSAOp;
+use crate::span::StorageSpans;
 use crate::var::{CanonicalStorageId, CanonicalStorageSpace, SSAVar};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -780,6 +781,31 @@ pub struct LoopCarrierUpdateFact {
     pub identity_values: BTreeSet<ValueId>,
 }
 
+/// Exact program-point role one SSA value has in a certified loop carrier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum LoopCarrierMemberRole {
+    HeaderPhi,
+    Entry,
+    LatchUpdate,
+    UpdateIdentity,
+    DominatingInitializer,
+    StorageContinuation,
+    PostLoopMerge,
+    ProjectedPeer,
+}
+
+/// One sorted, source-owned member row for a loop carrier.
+///
+/// A value may have more than one role: for example, an update value is also
+/// one of its exact copy-chain identities. The dense graph remains the owner of
+/// definitions and uses; this row only seals the coalescing relation already
+/// proven by those facts.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct LoopCarrierMemberFact {
+    pub value: ValueId,
+    pub roles: BTreeSet<LoopCarrierMemberRole>,
+}
+
 impl LoopCarrierUpdateFact {
     /// Prove that this update names the exact indexed input and predecessor of
     /// a canonical graph phi. This is O(1) in the size of the graph.
@@ -807,9 +833,20 @@ pub struct LoopCarrierFact {
     /// Entry-valued predecessor edges that dominate the loop header and can
     /// initialize the coalesced carrier before zero-iteration exits.
     pub dominating_initializers: Vec<LoopCarrierEdgeValue>,
+    /// Complete exact members, sorted by `ValueId` and sealed from the role
+    /// facts above plus post-loop and projected-peer certificates.
+    pub members: Vec<LoopCarrierMemberFact>,
 }
 
 impl LoopCarrierFact {
+    /// Exact source-owned coalescing membership for this carrier.
+    ///
+    /// The rows are sealed in [`StructuredLoopFact::validate_carrier_members`];
+    /// this projection deliberately contains no second membership algorithm.
+    pub fn coalescing_values(&self) -> BTreeSet<ValueId> {
+        self.members.iter().map(|member| member.value).collect()
+    }
+
     /// Validate every retained edge against the graph that owns this fact.
     ///
     /// Entry and update sites must be inputs of this carrier's header phi.
@@ -890,6 +927,49 @@ pub struct StructuredLoopFact {
     pub induction_init: Option<ValueId>,
     pub induction_update: Option<ValueId>,
     pub bound: Option<ValueId>,
+}
+
+impl StructuredLoopFact {
+    /// Recompute and validate the sorted carrier-member rows against their
+    /// exact graph, storage-run, and source machine contracts.
+    ///
+    /// A single [`LoopCarrierFact`] cannot validate projected peers because
+    /// peerhood is a relation among the carriers in one loop. Keeping this
+    /// check on the loop fact prevents a stored peer row and its owning loop
+    /// from becoming two independently mutable answers.
+    pub fn validate_carrier_members(
+        &self,
+        graph: &SsaGraph,
+        storage_spans: &StorageSpans,
+        machine_context: Option<&SourceMachineContext>,
+    ) -> bool {
+        if self.carriers.iter().any(|carrier| {
+            carrier.loop_id != self.id
+                || carrier.header != self.header
+                || !carrier.validate(graph)
+        }) {
+            return false;
+        }
+        let body = self.body.iter().copied().collect::<BTreeSet<_>>();
+        let latches = self.latches.iter().copied().collect::<BTreeSet<_>>();
+        loop_carrier_member_rows(
+            graph,
+            self.header,
+            &latches,
+            &body,
+            storage_spans,
+            machine_context,
+            &self.carriers,
+        )
+        .is_some_and(|expected| {
+            expected.len() == self.carriers.len()
+                && self
+                    .carriers
+                    .iter()
+                    .zip(expected)
+                    .all(|(carrier, expected)| carrier.members == expected)
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -1174,7 +1254,14 @@ pub struct PreparedFunctionFacts {
 
 impl PreparedFunctionFacts {
     pub fn collect(function: &SSAFunction, graph: &SsaGraph) -> Self {
-        Self::collect_inner(function, graph, &AssumptionSet::default(), None)
+        let storage_spans = StorageSpans::compute(function, graph);
+        Self::collect_inner(
+            function,
+            graph,
+            &storage_spans,
+            &AssumptionSet::default(),
+            None,
+        )
     }
 
     pub fn collect_with_assumptions(
@@ -1182,21 +1269,30 @@ impl PreparedFunctionFacts {
         graph: &SsaGraph,
         assumptions: &AssumptionSet,
     ) -> Self {
-        Self::collect_inner(function, graph, assumptions, None)
+        let storage_spans = StorageSpans::compute(function, graph);
+        Self::collect_inner(function, graph, &storage_spans, assumptions, None)
     }
 
     pub(crate) fn collect_with_context(
         function: &SSAFunction,
         graph: &SsaGraph,
+        storage_spans: &StorageSpans,
         assumptions: &AssumptionSet,
         machine_context: &SourceMachineContext,
     ) -> Self {
-        Self::collect_inner(function, graph, assumptions, Some(machine_context))
+        Self::collect_inner(
+            function,
+            graph,
+            storage_spans,
+            assumptions,
+            Some(machine_context),
+        )
     }
 
     fn collect_inner(
         function: &SSAFunction,
         graph: &SsaGraph,
+        storage_spans: &StorageSpans,
         assumptions: &AssumptionSet,
         machine_context: Option<&SourceMachineContext>,
     ) -> Self {
@@ -1230,6 +1326,8 @@ impl PreparedFunctionFacts {
                 predicates: &predicates,
                 call_sites: &call_sites,
                 live_out: &live_out,
+                storage_spans,
+                machine_context,
             },
         );
         let control_domains = collect_control_domain_facts(function, &predicates, &structured);
@@ -2300,6 +2398,8 @@ struct StructuredCollectionInputs<'a> {
     /// What the caller reads, so a value with no reader in this body is not
     /// mistaken for one nothing reads at all.
     live_out: &'a crate::liveout::FunctionLiveOut,
+    storage_spans: &'a StorageSpans,
+    machine_context: Option<&'a SourceMachineContext>,
 }
 
 fn collect_structured_dataflow_facts(
@@ -2307,7 +2407,14 @@ fn collect_structured_dataflow_facts(
     graph: &SsaGraph,
     inputs: StructuredCollectionInputs<'_>,
 ) -> StructuredDataflowFacts {
-    let loops = collect_structured_loop_facts(function, graph, inputs.predicates, inputs.live_out);
+    let loops = collect_structured_loop_facts(
+        function,
+        graph,
+        inputs.predicates,
+        inputs.live_out,
+        inputs.storage_spans,
+        inputs.machine_context,
+    );
     let memory_accesses =
         collect_structured_memory_access_facts(function, graph, inputs.objects, inputs.memory);
     StructuredDataflowFacts {
@@ -5121,6 +5228,8 @@ fn collect_structured_loop_facts(
     graph: &SsaGraph,
     predicates: &PredicateFacts,
     live_out: &crate::liveout::FunctionLiveOut,
+    storage_spans: &StorageSpans,
+    machine_context: Option<&SourceMachineContext>,
 ) -> BTreeMap<LoopId, StructuredLoopFact> {
     let mut latches_by_header = BTreeMap::<u64, BTreeSet<u64>>::new();
     for &block_addr in function.block_addrs() {
@@ -5141,7 +5250,17 @@ fn collect_structured_loop_facts(
         let body = body_set.iter().copied().collect::<Vec<_>>();
         let exits = loop_exits(function, &body_set);
         let condition = loop_condition(predicates, header, &body_set, &exits);
-        let carriers = loop_carrier_facts(function, graph, id, header, &latches, live_out);
+        let carriers = loop_carrier_facts(
+            function,
+            graph,
+            id,
+            header,
+            &latches,
+            &body_set,
+            live_out,
+            storage_spans,
+            machine_context,
+        );
         let (induction_phi, induction_init, induction_update) =
             loop_induction_values(graph, predicates, condition, header, &latches, &body_set);
         let bound = loop_bound_value(
@@ -5214,7 +5333,10 @@ fn loop_carrier_facts(
     loop_id: LoopId,
     header: u64,
     latches: &BTreeSet<u64>,
+    loop_body: &BTreeSet<u64>,
     live_out: &crate::liveout::FunctionLiveOut,
+    storage_spans: &StorageSpans,
+    machine_context: Option<&SourceMachineContext>,
 ) -> Vec<LoopCarrierFact> {
     let Some(header_block) = function.get_block(header) else {
         return Vec::new();
@@ -5276,94 +5398,150 @@ fn loop_carrier_facts(
                 entries,
                 updates,
                 dominating_initializers: Vec::new(),
+                members: Vec::new(),
             })
         })
         .collect::<Vec<_>>();
 
     // A post-loop phi such as `result = phi(init, update)` denotes the same
-    // mutable carrier after structured control flow. Discover these aliases by
-    // exact ValueId membership, never by storage names.
-    let mut changed = true;
-    while changed {
-        changed = false;
-        for block in function.blocks() {
-            if block.addr == header {
-                continue;
+    // mutable carrier after structured control flow. Resolve the transitive
+    // relation through a sorted worklist: every phi edge is reconsidered only
+    // when a newly certified output can change its answer.
+    let mut owners_by_value = BTreeMap::<ValueId, BTreeSet<usize>>::new();
+    let mut continuing_owners_by_value = BTreeMap::<ValueId, BTreeSet<usize>>::new();
+    for (carrier_index, carrier) in carriers.iter().enumerate() {
+        for value in carrier
+            .identity_values
+            .iter()
+            .copied()
+            .chain(carrier.entries.iter().map(|edge| edge.value))
+            .chain(carrier.updates.iter().flat_map(|update| {
+                std::iter::once(update.value).chain(update.identity_values.iter().copied())
+            }))
+        {
+            owners_by_value
+                .entry(value)
+                .or_default()
+                .insert(carrier_index);
+        }
+        for value in carrier
+            .identity_values
+            .iter()
+            .copied()
+            .chain(carrier.updates.iter().flat_map(|update| {
+                std::iter::once(update.value).chain(update.identity_values.iter().copied())
+            }))
+        {
+            continuing_owners_by_value
+                .entry(value)
+                .or_default()
+                .insert(carrier_index);
+        }
+    }
+    let mut pending = graph
+        .insts
+        .iter()
+        .filter(|inst| {
+            matches!(inst.payload, InstPayload::Phi { .. })
+                && graph
+                    .block(inst.block)
+                    .is_some_and(|block| block.addr != header)
+        })
+        .map(|inst| inst.id)
+        .collect::<BTreeSet<_>>();
+    while let Some(phi_inst) = pending.pop_first() {
+        let Some(inst) = graph.inst(phi_inst) else {
+            continue;
+        };
+        let InstPayload::Phi { predecessors } = &inst.payload else {
+            continue;
+        };
+        let Some(output) = inst.output else {
+            continue;
+        };
+        if owners_by_value.contains_key(&output)
+            || predecessors.len() != inst.inputs.len()
+            || inst.inputs.is_empty()
+            || inst.inputs.iter().copied().collect::<BTreeSet<_>>().len() != inst.inputs.len()
+        {
+            continue;
+        }
+        let Some(mut candidate_owners) = inst
+            .inputs
+            .first()
+            .and_then(|input| owners_by_value.get(input))
+            .cloned()
+        else {
+            continue;
+        };
+        for input in inst.inputs.iter().skip(1) {
+            let Some(input_owners) = owners_by_value.get(input) else {
+                candidate_owners.clear();
+                break;
+            };
+            candidate_owners.retain(|owner| input_owners.contains(owner));
+        }
+        candidate_owners.retain(|owner| {
+            inst.inputs.iter().any(|input| {
+                continuing_owners_by_value
+                    .get(input)
+                    .is_some_and(|owners| owners.contains(owner))
+            })
+        });
+        if candidate_owners.len() != 1 {
+            continue;
+        }
+        let carrier_index = *candidate_owners
+            .first()
+            .expect("one exact carrier owner remains");
+        let source_edges = predecessors
+            .iter()
+            .copied()
+            .zip(inst.inputs.iter().copied())
+            .enumerate()
+            .filter_map(|(input_idx, (predecessor, value))| {
+                let edge = LoopCarrierEdgeValue {
+                    predecessor: graph.block(predecessor)?.addr,
+                    value,
+                    site: UseSite {
+                        inst: phi_inst,
+                        input_idx,
+                    },
+                };
+                edge.validate(graph).then_some(edge)
+            })
+            .collect::<Vec<_>>();
+        if source_edges.len() != inst.inputs.len()
+            || !carriers[carrier_index].identity_values.insert(output)
+        {
+            continue;
+        }
+        for edge in source_edges {
+            if carriers[carrier_index]
+                .entries
+                .iter()
+                .any(|entry| entry.value == edge.value)
+                && function.dominates(edge.predecessor, header)
+            {
+                carriers[carrier_index]
+                    .dominating_initializers
+                    .push(edge);
             }
-            for phi in &block.phis {
-                let Some(output) = graph.value_id_for_var(&phi.dst) else {
-                    continue;
-                };
-                let Some(phi_inst) = graph.def_inst(output) else {
-                    continue;
-                };
-                if carriers
-                    .iter()
-                    .any(|carrier| carrier.identity_values.contains(&output))
-                {
-                    continue;
-                }
-                let Some(source_edges) = phi
-                    .sources
-                    .iter()
-                    .enumerate()
-                    .map(|(input_idx, (predecessor, source))| {
-                        let edge = LoopCarrierEdgeValue {
-                            predecessor: *predecessor,
-                            value: graph.value_id_for_var(source)?,
-                            site: UseSite {
-                                inst: phi_inst,
-                                input_idx,
-                            },
-                        };
-                        edge.validate(graph).then_some(edge)
-                    })
-                    .collect::<Option<Vec<_>>>()
-                else {
-                    continue;
-                };
-                let inputs = source_edges
-                    .iter()
-                    .map(|edge| edge.value)
-                    .collect::<BTreeSet<_>>();
-                if inputs.len() != source_edges.len() || inputs.is_empty() {
-                    continue;
-                }
-                let mut matches = carriers.iter_mut().filter(|carrier| {
-                    let state_values = carrier
-                        .identity_values
-                        .iter()
-                        .copied()
-                        .chain(carrier.entries.iter().map(|edge| edge.value))
-                        .chain(carrier.updates.iter().flat_map(|update| {
-                            std::iter::once(update.value)
-                                .chain(update.identity_values.iter().copied())
-                        }))
-                        .collect::<BTreeSet<_>>();
-                    inputs.iter().all(|input| state_values.contains(input))
-                        && inputs.iter().any(|input| {
-                            carrier.identity_values.contains(input)
-                                || carrier.updates.iter().any(|update| {
-                                    update.value == *input || update.identity_values.contains(input)
-                                })
-                        })
-                });
-                let Some(carrier) = matches.next() else {
-                    continue;
-                };
-                if matches.next().is_none() && carrier.identity_values.insert(output) {
-                    for edge in source_edges {
-                        if carrier
-                            .entries
-                            .iter()
-                            .any(|entry| entry.value == edge.value)
-                            && function.dominates(edge.predecessor, header)
-                        {
-                            carrier.dominating_initializers.push(edge);
-                        }
-                    }
-                    changed = true;
-                }
+        }
+        owners_by_value
+            .entry(output)
+            .or_default()
+            .insert(carrier_index);
+        continuing_owners_by_value
+            .entry(output)
+            .or_default()
+            .insert(carrier_index);
+        for site in graph.use_sites(output) {
+            if graph
+                .inst(site.inst)
+                .is_some_and(|use_inst| matches!(use_inst.payload, InstPayload::Phi { .. }))
+            {
+                pending.insert(site.inst);
             }
         }
     }
@@ -5374,7 +5552,486 @@ fn loop_carrier_facts(
     }
     carriers.retain(|carrier| carrier.validate(graph));
     carriers.sort_by_key(|carrier| carrier.phi);
+    let Some(member_rows) = loop_carrier_member_rows(
+        graph,
+        header,
+        latches,
+        loop_body,
+        storage_spans,
+        machine_context,
+        &carriers,
+    ) else {
+        return Vec::new();
+    };
+    for (carrier, members) in carriers.iter_mut().zip(member_rows) {
+        carrier.members = members;
+    }
     carriers
+}
+
+#[derive(Debug, Clone)]
+struct LoopCarrierPeerCandidate {
+    phi: ValueId,
+    width: u32,
+    entries: Vec<LoopCarrierEdgeValue>,
+    updates: Vec<LoopCarrierUpdateFact>,
+}
+
+type LoopCarrierMemberRoles = BTreeMap<ValueId, BTreeSet<LoopCarrierMemberRole>>;
+
+fn insert_loop_carrier_member_role(
+    rows: &mut LoopCarrierMemberRoles,
+    value: ValueId,
+    role: LoopCarrierMemberRole,
+) -> bool {
+    rows.entry(value).or_default().insert(role)
+}
+
+fn insert_loop_carrier_peer_roles(
+    rows: &mut LoopCarrierMemberRoles,
+    peer: &LoopCarrierPeerCandidate,
+) {
+    insert_loop_carrier_member_role(rows, peer.phi, LoopCarrierMemberRole::ProjectedPeer);
+    for entry in &peer.entries {
+        insert_loop_carrier_member_role(rows, entry.value, LoopCarrierMemberRole::Entry);
+        insert_loop_carrier_member_role(
+            rows,
+            entry.value,
+            LoopCarrierMemberRole::ProjectedPeer,
+        );
+    }
+    for update in &peer.updates {
+        insert_loop_carrier_member_role(rows, update.value, LoopCarrierMemberRole::LatchUpdate);
+        insert_loop_carrier_member_role(
+            rows,
+            update.value,
+            LoopCarrierMemberRole::ProjectedPeer,
+        );
+        for identity in &update.identity_values {
+            insert_loop_carrier_member_role(
+                rows,
+                *identity,
+                LoopCarrierMemberRole::UpdateIdentity,
+            );
+            insert_loop_carrier_member_role(
+                rows,
+                *identity,
+                LoopCarrierMemberRole::ProjectedPeer,
+            );
+        }
+    }
+}
+
+fn loop_carrier_peer_candidates(
+    graph: &SsaGraph,
+    header: u64,
+    latches: &BTreeSet<u64>,
+) -> Vec<LoopCarrierPeerCandidate> {
+    let Some(header_block) = graph
+        .block_id_for_addr(header)
+        .and_then(|block| graph.block(block))
+    else {
+        return Vec::new();
+    };
+    let mut candidates = header_block
+        .insts
+        .iter()
+        .filter_map(|inst_id| {
+            let inst = graph.inst(*inst_id)?;
+            let InstPayload::Phi { predecessors } = &inst.payload else {
+                return None;
+            };
+            let phi = inst.output?;
+            let width = graph.value(phi)?.var.size;
+            if predecessors.len() != inst.inputs.len() || inst.inputs.is_empty() {
+                return None;
+            }
+            let mut entries = Vec::new();
+            let mut updates = Vec::new();
+            for (input_idx, (predecessor, value)) in predecessors
+                .iter()
+                .copied()
+                .zip(inst.inputs.iter().copied())
+                .enumerate()
+            {
+                let predecessor = graph.block(predecessor)?.addr;
+                let site = UseSite {
+                    inst: *inst_id,
+                    input_idx,
+                };
+                let edge = LoopCarrierEdgeValue {
+                    predecessor,
+                    value,
+                    site,
+                };
+                if !edge.validate(graph) {
+                    return None;
+                }
+                if latches.contains(&predecessor) {
+                    updates.push(LoopCarrierUpdateFact {
+                        predecessor,
+                        value,
+                        site,
+                        identity_values: exact_copy_identity_values(graph, value),
+                    });
+                } else {
+                    entries.push(edge);
+                }
+            }
+            if entries.is_empty() || updates.is_empty() {
+                return None;
+            }
+            entries.sort_unstable();
+            entries.dedup();
+            updates.sort_unstable();
+            updates.dedup();
+            Some(LoopCarrierPeerCandidate {
+                phi,
+                width,
+                entries,
+                updates,
+            })
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by_key(|candidate| candidate.phi);
+    candidates.dedup_by_key(|candidate| candidate.phi);
+    candidates
+}
+
+fn exact_loop_carrier_register_storage(
+    graph: &SsaGraph,
+    machine_context: &SourceMachineContext,
+    value: ValueId,
+) -> Option<CanonicalStorageId> {
+    if machine_context.register_geometry_state() != MachineRegisterGeometryState::Available {
+        return None;
+    }
+    let written = graph.value(value)?.canonical_storage?;
+    if written.space != CanonicalStorageSpace::Register {
+        return None;
+    }
+    let projection = machine_context.register_projection(written)?;
+    if projection.written.offset != written.offset || projection.written.size != written.size {
+        return None;
+    }
+    let r2il::RegisterProjectionDisposition::Bound { carrier, .. } = projection.disposition else {
+        return None;
+    };
+    Some(CanonicalStorageId {
+        space: CanonicalStorageSpace::Register,
+        offset: carrier.offset,
+        size: carrier.size,
+    })
+}
+
+fn loop_carrier_projection_key(
+    graph: &SsaGraph,
+    storage_spans: &StorageSpans,
+    machine_context: &SourceMachineContext,
+    candidate: &LoopCarrierPeerCandidate,
+) -> Option<(
+    CanonicalStorageId,
+    crate::span::SpanId,
+    Vec<u64>,
+    Vec<u64>,
+)> {
+    let carrier = exact_loop_carrier_register_storage(graph, machine_context, candidate.phi)?;
+    let state = std::iter::once(candidate.phi)
+        .chain(candidate.updates.iter().flat_map(|update| {
+            std::iter::once(update.value).chain(update.identity_values.iter().copied())
+        }))
+        .collect::<BTreeSet<_>>();
+    if !storage_spans.all_one_span(state.iter().copied()) {
+        return None;
+    }
+    let span = storage_spans.span_of(candidate.phi)?;
+    let entry_predecessors = candidate
+        .entries
+        .iter()
+        .map(|edge| edge.predecessor)
+        .collect::<Vec<_>>();
+    let update_predecessors = candidate
+        .updates
+        .iter()
+        .map(|update| update.predecessor)
+        .collect::<Vec<_>>();
+    Some((carrier, span, entry_predecessors, update_predecessors))
+}
+
+fn expand_loop_carrier_storage_continuations(
+    graph: &SsaGraph,
+    storage_spans: &StorageSpans,
+    rows: &mut LoopCarrierMemberRoles,
+) -> Option<()> {
+    let spans = rows
+        .keys()
+        .copied()
+        .map(|value| storage_spans.span_of(value))
+        .collect::<Option<BTreeSet<_>>>()?;
+    for span in spans {
+        for value in storage_spans.members(span)? {
+            let graph_value = graph.value(*value)?;
+            if graph_value.var.is_const() {
+                continue;
+            }
+            insert_loop_carrier_member_role(
+                rows,
+                *value,
+                LoopCarrierMemberRole::StorageContinuation,
+            );
+        }
+    }
+    Some(())
+}
+
+fn loop_carrier_member_rows(
+    graph: &SsaGraph,
+    header: u64,
+    latches: &BTreeSet<u64>,
+    loop_body: &BTreeSet<u64>,
+    storage_spans: &StorageSpans,
+    machine_context: Option<&SourceMachineContext>,
+    carriers: &[LoopCarrierFact],
+) -> Option<Vec<Vec<LoopCarrierMemberFact>>> {
+    if carriers
+        .iter()
+        .any(|carrier| carrier.header != header || !carrier.validate(graph))
+    {
+        return None;
+    }
+
+    let mut rows = carriers
+        .iter()
+        .map(|carrier| {
+            let mut rows = LoopCarrierMemberRoles::new();
+            insert_loop_carrier_member_role(
+                &mut rows,
+                carrier.phi,
+                LoopCarrierMemberRole::HeaderPhi,
+            );
+            for identity in &carrier.identity_values {
+                if *identity == carrier.phi {
+                    continue;
+                }
+                let role = graph
+                    .def_inst(*identity)
+                    .and_then(|inst| graph.inst(inst))
+                    .and_then(|inst| graph.block(inst.block))
+                    .map(|block| {
+                        if loop_body.contains(&block.addr) {
+                            LoopCarrierMemberRole::StorageContinuation
+                        } else {
+                            LoopCarrierMemberRole::PostLoopMerge
+                        }
+                    })?;
+                insert_loop_carrier_member_role(&mut rows, *identity, role);
+            }
+            for entry in &carrier.entries {
+                insert_loop_carrier_member_role(
+                    &mut rows,
+                    entry.value,
+                    LoopCarrierMemberRole::Entry,
+                );
+            }
+            for update in &carrier.updates {
+                insert_loop_carrier_member_role(
+                    &mut rows,
+                    update.value,
+                    LoopCarrierMemberRole::LatchUpdate,
+                );
+                for identity in &update.identity_values {
+                    insert_loop_carrier_member_role(
+                        &mut rows,
+                        *identity,
+                        LoopCarrierMemberRole::UpdateIdentity,
+                    );
+                }
+            }
+            for initializer in &carrier.dominating_initializers {
+                insert_loop_carrier_member_role(
+                    &mut rows,
+                    initializer.value,
+                    LoopCarrierMemberRole::DominatingInitializer,
+                );
+            }
+            Some(rows)
+        })
+        .collect::<Option<Vec<_>>>()?;
+
+    let candidates = loop_carrier_peer_candidates(graph, header, latches);
+    let mut leader_by_carrier = (0..carriers.len()).collect::<Vec<_>>();
+    if let Some(machine_context) = machine_context {
+        let mut candidates_by_key = BTreeMap::<_, Vec<usize>>::new();
+        for (index, candidate) in candidates.iter().enumerate() {
+            let Some(key) = loop_carrier_projection_key(
+                graph,
+                storage_spans,
+                machine_context,
+                candidate,
+            ) else {
+                continue;
+            };
+            candidates_by_key.entry(key).or_default().push(index);
+        }
+        let carrier_by_phi = carriers
+            .iter()
+            .enumerate()
+            .map(|(index, carrier)| (carrier.phi, index))
+            .collect::<BTreeMap<_, _>>();
+        for candidate_group in candidates_by_key.values() {
+            let Some((leader, leader_candidate)) = candidate_group
+                .iter()
+                .filter_map(|candidate_index| {
+                    let candidate = &candidates[*candidate_index];
+                    carrier_by_phi
+                        .get(&candidate.phi)
+                        .copied()
+                        .map(|carrier_index| (carrier_index, *candidate_index))
+                })
+                .max_by_key(|(carrier_index, candidate_index)| {
+                    (
+                        candidates[*candidate_index].width,
+                        std::cmp::Reverse(carriers[*carrier_index].phi),
+                    )
+                })
+            else {
+                continue;
+            };
+            let leader_width = candidates[leader_candidate].width;
+            for candidate_index in candidate_group {
+                let candidate = &candidates[*candidate_index];
+                if let Some(peer_carrier) = carrier_by_phi.get(&candidate.phi).copied() {
+                    leader_by_carrier[peer_carrier] = leader;
+                }
+                if candidate.width == leader_width {
+                    continue;
+                }
+                insert_loop_carrier_peer_roles(&mut rows[leader], candidate);
+                if let Some(peer_carrier) = carrier_by_phi.get(&candidate.phi).copied() {
+                    insert_loop_carrier_peer_roles(
+                        &mut rows[peer_carrier],
+                        &candidates[leader_candidate],
+                    );
+                }
+            }
+        }
+    }
+
+    for row in &mut rows {
+        expand_loop_carrier_storage_continuations(graph, storage_spans, row)?;
+    }
+
+    let mut roots_by_span = BTreeMap::<crate::span::SpanId, BTreeSet<usize>>::new();
+    for (carrier_index, row) in rows.iter().enumerate() {
+        let root = leader_by_carrier[carrier_index];
+        if root != carrier_index {
+            continue;
+        }
+        for value in row.keys() {
+            roots_by_span
+                .entry(storage_spans.span_of(*value)?)
+                .or_default()
+                .insert(root);
+        }
+    }
+
+    let mut pending = graph
+        .insts
+        .iter()
+        .filter(|inst| matches!(inst.payload, InstPayload::Phi { .. }))
+        .filter_map(|inst| {
+            graph
+                .block(inst.block)
+                .map(|block| (inst.id, block.addr))
+        })
+        .filter(|(_, block_addr)| *block_addr != header && !loop_body.contains(block_addr))
+        .map(|(inst, _)| inst)
+        .collect::<BTreeSet<_>>();
+    while let Some(inst_id) = pending.pop_first() {
+        let inst = graph.inst(inst_id)?;
+        let InstPayload::Phi { .. } = &inst.payload else {
+            continue;
+        };
+        let output = inst.output?;
+        let block_addr = graph.block(inst.block)?.addr;
+        if block_addr == header || loop_body.contains(&block_addr) || inst.inputs.len() < 2 {
+            continue;
+        }
+        let output_span = storage_spans.span_of(output)?;
+        let Some(candidate_roots) = roots_by_span.get(&output_span) else {
+            continue;
+        };
+        let output_width = graph.value(output)?.var.size;
+        let mut matches = candidate_roots
+            .iter()
+            .copied()
+            .filter(|root| {
+                let row = &rows[*root];
+                let all_owned = inst.inputs.iter().all(|input| row.contains_key(input));
+                let has_carried_state = inst.inputs.iter().any(|input| {
+                    row.get(input).is_some_and(|roles| {
+                        roles.contains(&LoopCarrierMemberRole::LatchUpdate)
+                            || roles.contains(&LoopCarrierMemberRole::UpdateIdentity)
+                            || roles.contains(&LoopCarrierMemberRole::PostLoopMerge)
+                    })
+                });
+                let has_other_state = inst.inputs.iter().any(|input| {
+                    row.get(input).is_some_and(|roles| {
+                        !roles.contains(&LoopCarrierMemberRole::LatchUpdate)
+                            && !roles.contains(&LoopCarrierMemberRole::UpdateIdentity)
+                            && !roles.contains(&LoopCarrierMemberRole::PostLoopMerge)
+                    })
+                });
+                let carrier = &carriers[*root];
+                let width_is_exact = output_width == carrier.width;
+                let projected_width_is_exact = !width_is_exact
+                    && machine_context.is_some_and(|context| {
+                        match (
+                            exact_loop_carrier_register_storage(graph, context, output),
+                            exact_loop_carrier_register_storage(graph, context, carrier.phi),
+                        ) {
+                            (Some(output), Some(carrier)) => output == carrier,
+                            _ => false,
+                        }
+                    });
+                all_owned
+                    && has_carried_state
+                    && has_other_state
+                    && (width_is_exact || projected_width_is_exact)
+            });
+        let Some(root) = matches.next() else {
+            continue;
+        };
+        if matches.next().is_some() {
+            continue;
+        }
+        if insert_loop_carrier_member_role(
+            &mut rows[root],
+            output,
+            LoopCarrierMemberRole::PostLoopMerge,
+        ) {
+            for site in graph.use_sites(output) {
+                if graph.inst(site.inst).is_some_and(|use_inst| {
+                    matches!(use_inst.payload, InstPayload::Phi { .. })
+                        && graph.block(use_inst.block).is_some_and(|block| {
+                            block.addr != header && !loop_body.contains(&block.addr)
+                        })
+                }) {
+                    pending.insert(site.inst);
+                }
+            }
+        }
+    }
+
+    Some(
+        rows.into_iter()
+            .map(|rows| {
+                rows.into_iter()
+                    .map(|(value, roles)| LoopCarrierMemberFact { value, roles })
+                    .collect()
+            })
+            .collect(),
+    )
 }
 
 fn exact_copy_identity_values(graph: &SsaGraph, root: ValueId) -> BTreeSet<ValueId> {

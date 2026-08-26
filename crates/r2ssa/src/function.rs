@@ -301,6 +301,7 @@ impl SsaArtifact {
         let facts = PreparedFunctionFacts::collect_with_context(
             &function,
             &graph,
+            &storage_spans,
             &AssumptionSet::default(),
             &machine_context,
         );
@@ -643,7 +644,7 @@ impl SsaArtifact {
         let mut spanning = std::collections::BTreeSet::new();
         for loop_fact in self.facts.structured.loops.values() {
             for carrier in &loop_fact.carriers {
-                let members = crate::mirror::carrier_members(carrier);
+                let members = carrier.coalescing_values();
                 let occupants = self.carrier_storage_occupants(carrier, &members);
                 if !spans.all_one_span(occupants.iter().copied()) {
                     spanning.insert(carrier.id);
@@ -702,7 +703,7 @@ impl SsaArtifact {
         let mut mirrored = std::collections::BTreeSet::new();
         for loop_fact in structured.loops.values() {
             for carrier in &loop_fact.carriers {
-                let members = crate::mirror::carrier_members(carrier);
+                let members = carrier.coalescing_values();
                 if crate::mirror::carrier_mirrors_memory(
                     structured,
                     objects,
@@ -770,6 +771,7 @@ impl SsaArtifact {
         let facts = PreparedFunctionFacts::collect_with_context(
             &self.function,
             &self.graph,
+            &self.storage_spans,
             assumptions,
             &self.machine_context,
         );
@@ -4896,7 +4898,7 @@ mod tests {
     }
     use super::*;
     use crate::semantic::{CallArgumentLocation, ReturnCarrier, SemanticId, ValueOwner};
-    use crate::{SourceFunctionReturn, SourceStackSlotSpec};
+    use crate::{CanonicalStorageSpace, SourceFunctionReturn, SourceStackSlotSpec, ValueId};
     use r2il::{R2ILOp, RegisterDef, SpaceId, SwitchCase, SwitchInfo as R2ILSwitchInfo, Varnode};
     use std::cell::Cell;
     use std::collections::BTreeSet;
@@ -7815,6 +7817,25 @@ mod tests {
             },
             R2ILBlock {
                 addr: 0x1a30,
+                size: 0x10,
+                ops: vec![R2ILOp::CBranch {
+                    target: make_ram(0x1a50, 8),
+                    cond: make_const(1, 1),
+                }],
+                switch_info: None,
+                op_metadata: Default::default(),
+            },
+            R2ILBlock {
+                addr: 0x1a40,
+                size: 0x10,
+                ops: vec![R2ILOp::Branch {
+                    target: make_ram(0x1a50, 8),
+                }],
+                switch_info: None,
+                op_metadata: Default::default(),
+            },
+            R2ILBlock {
+                addr: 0x1a50,
                 size: 0x4,
                 ops: vec![R2ILOp::Return {
                     target: make_const(0, 8),
@@ -7830,6 +7851,7 @@ mod tests {
         let update_source = SSAVar::new("tmp:update", 1, 8);
         let update = SSAVar::new("RAX", 3, 8);
         let result = SSAVar::new("RAX", 4, 8);
+        let chained_result = SSAVar::new("RAX", 5, 8);
         function.get_block_mut(0x1a20).expect("loop header").phis = vec![PhiNode {
             dst: phi.clone(),
             sources: vec![(0x1a10, init.clone()), (0x1a20, update.clone())],
@@ -7855,8 +7877,20 @@ mod tests {
             sources: vec![(0x1a00, init.clone()), (0x1a20, update.clone())],
             canonical_storage: None,
         }];
-        function.get_block_mut(0x1a30).expect("loop exit").ops = vec![SSAOp::Return {
-            target: result.clone(),
+        function.get_block_mut(0x1a30).expect("loop exit").ops = vec![SSAOp::CBranch {
+            target: SSAVar::new("ram:1a50", 0, 8),
+            cond: SSAVar::constant(1, 1),
+        }];
+        function.get_block_mut(0x1a40).expect("exit bypass").ops = vec![SSAOp::Branch {
+            target: SSAVar::new("ram:1a50", 0, 8),
+        }];
+        function.get_block_mut(0x1a50).expect("final exit").phis = vec![PhiNode {
+            dst: chained_result.clone(),
+            sources: vec![(0x1a30, result.clone()), (0x1a40, init.clone())],
+            canonical_storage: None,
+        }];
+        function.get_block_mut(0x1a50).expect("final exit").ops = vec![SSAOp::Return {
+            target: chained_result.clone(),
         }];
 
         let prepared = SsaArtifact::new(function, FunctionPrepareMode::Raw);
@@ -7864,17 +7898,39 @@ mod tests {
         let init_value = prepared.graph().value_id_for_var(&init).unwrap();
         let update_value = prepared.graph().value_id_for_var(&update).unwrap();
         let result_value = prepared.graph().value_id_for_var(&result).unwrap();
+        let chained_result_value = prepared
+            .graph()
+            .value_id_for_var(&chained_result)
+            .unwrap();
         let phi_inst = prepared.graph().def_inst(phi_value).unwrap();
         let result_inst = prepared.graph().def_inst(result_value).unwrap();
-        let carrier = prepared
+        let loop_fact = prepared
             .structured()
             .loops
             .values()
-            .flat_map(|loop_fact| loop_fact.carriers.iter())
+            .find(|loop_fact| loop_fact.carriers.iter().any(|carrier| carrier.phi == phi_value))
+            .expect("structured loop fact");
+        let carrier = loop_fact
+            .carriers
+            .iter()
             .find(|carrier| carrier.phi == phi_value)
             .expect("loop carrier");
         assert!(carrier.validate(prepared.graph()));
         assert!(carrier.identity_values.contains(&result_value));
+        assert!(carrier.identity_values.contains(&chained_result_value));
+        assert!(loop_fact.validate_carrier_members(
+            prepared.graph(),
+            prepared.storage_spans(),
+            Some(prepared.machine_context()),
+        ));
+        for result in [result_value, chained_result_value] {
+            assert!(carrier.members.iter().any(|member| {
+                member.value == result
+                    && member
+                        .roles
+                        .contains(&crate::LoopCarrierMemberRole::PostLoopMerge)
+            }));
+        }
         assert_eq!(
             carrier.entries,
             vec![crate::LoopCarrierEdgeValue {
@@ -7914,6 +7970,369 @@ mod tests {
             !forged.validate(prepared.graph()),
             "a carrier must reject a site that names a different phi input"
         );
+        let mut forged_loop = loop_fact.clone();
+        forged_loop.carriers[0].members[0]
+            .roles
+            .insert(crate::LoopCarrierMemberRole::ProjectedPeer);
+        assert!(
+            !forged_loop.validate_carrier_members(
+                prepared.graph(),
+                prepared.storage_spans(),
+                Some(prepared.machine_context()),
+            ),
+            "stored membership must not validate against its own tampered rows"
+        );
+    }
+
+    fn projected_peer_loop_artifact(
+        phi_order: &[usize],
+        name_prefix: &str,
+        coherent_storage_run: bool,
+    ) -> SsaArtifact {
+        let blocks = vec![
+            R2ILBlock {
+                addr: 0x1b00,
+                size: 0x10,
+                ops: vec![R2ILOp::Branch {
+                    target: make_ram(0x1b10, 8),
+                }],
+                switch_info: None,
+                op_metadata: Default::default(),
+            },
+            R2ILBlock {
+                addr: 0x1b10,
+                size: 0x10,
+                ops: vec![R2ILOp::CBranch {
+                    target: make_ram(0x1b30, 8),
+                    cond: make_const(1, 1),
+                }],
+                switch_info: None,
+                op_metadata: Default::default(),
+            },
+            R2ILBlock {
+                addr: 0x1b20,
+                size: 0x10,
+                ops: vec![R2ILOp::Branch {
+                    target: make_ram(0x1b10, 8),
+                }],
+                switch_info: None,
+                op_metadata: Default::default(),
+            },
+            R2ILBlock {
+                addr: 0x1b30,
+                size: 0x4,
+                ops: vec![R2ILOp::Return {
+                    target: make_const(0, 8),
+                }],
+                switch_info: None,
+                op_metadata: Default::default(),
+            },
+        ];
+        let widths = [8_u32, 4, 2];
+        let entries = widths
+            .iter()
+            .enumerate()
+            .map(|(index, width)| SSAVar::new(format!("{name_prefix}:entry:{index}"), 0, *width))
+            .collect::<Vec<_>>();
+        let phis = widths
+            .iter()
+            .enumerate()
+            .map(|(index, width)| SSAVar::new(format!("{name_prefix}:phi:{index}"), 1, *width))
+            .collect::<Vec<_>>();
+        let updates = widths
+            .iter()
+            .enumerate()
+            .map(|(index, width)| SSAVar::new(format!("{name_prefix}:update:{index}"), 2, *width))
+            .collect::<Vec<_>>();
+        let storage = |size| CanonicalStorageId {
+            space: CanonicalStorageSpace::Register,
+            offset: 0,
+            size,
+        };
+        let phi_nodes = widths
+            .iter()
+            .enumerate()
+            .map(|(index, width)| PhiNode {
+                dst: phis[index].clone(),
+                sources: vec![
+                    (0x1b00, entries[index].clone()),
+                    (0x1b20, updates[index].clone()),
+                ],
+                canonical_storage: Some(storage(*width)),
+            })
+            .collect::<Vec<_>>();
+
+        let mut function =
+            SSAFunction::from_blocks_raw_no_arch(&blocks).expect("raw peer loop should build");
+        function.get_block_mut(0x1b10).expect("loop header").phis = phi_order
+            .iter()
+            .map(|index| phi_nodes[*index].clone())
+            .collect();
+        function.get_block_mut(0x1b10).expect("loop header").ops = vec![SSAOp::CBranch {
+            target: SSAVar::new("ram:1b30", 0, 8),
+            cond: SSAVar::constant(1, 1),
+        }];
+        function.get_block_mut(0x1b20).expect("loop latch").ops = if coherent_storage_run {
+            vec![
+                SSAOp::IntZExt {
+                    dst: updates[0].clone(),
+                    src: phis[1].clone(),
+                },
+                SSAOp::IntZExt {
+                    dst: updates[1].clone(),
+                    src: phis[2].clone(),
+                },
+                SSAOp::Subpiece {
+                    dst: updates[2].clone(),
+                    src: phis[0].clone(),
+                    offset: 0,
+                },
+                SSAOp::Branch {
+                    target: SSAVar::new("ram:1b10", 0, 8),
+                },
+            ]
+        } else {
+            vec![
+                SSAOp::IntAdd {
+                    dst: updates[0].clone(),
+                    a: phis[0].clone(),
+                    b: SSAVar::constant(1, 8),
+                },
+                SSAOp::IntAdd {
+                    dst: updates[1].clone(),
+                    a: phis[1].clone(),
+                    b: SSAVar::constant(1, 4),
+                },
+                SSAOp::IntAdd {
+                    dst: updates[2].clone(),
+                    a: phis[2].clone(),
+                    b: SSAVar::constant(1, 2),
+                },
+                SSAOp::Branch {
+                    target: SSAVar::new("ram:1b10", 0, 8),
+                },
+            ]
+        };
+        function.get_block_mut(0x1b30).expect("loop exit").ops = vec![SSAOp::Return {
+            target: phis[0].clone(),
+        }];
+        for (index, width) in widths.iter().copied().enumerate() {
+            for value in [&entries[index], &phis[index], &updates[index]] {
+                function
+                    .canonical_storage_by_var
+                    .insert(value.clone(), storage(width));
+            }
+        }
+
+        let mut arch = ArchSpec::new("x86-64");
+        arch.addr_size = 8;
+        arch.add_register(RegisterDef::new("RAX", 0, 8));
+        arch.add_register(RegisterDef::sub("EAX", 0, 4, "RAX"));
+        arch.add_register(RegisterDef::sub("AX", 0, 2, "RAX"));
+        let rax = r2il::RegisterStorage { offset: 0, size: 8 };
+        let eax = r2il::RegisterStorage { offset: 0, size: 4 };
+        let ax = r2il::RegisterStorage { offset: 0, size: 2 };
+        arch.register_projections = vec![
+            r2il::RegisterProjection {
+                written: ax,
+                disposition: r2il::RegisterProjectionDisposition::Bound {
+                    carrier: rax,
+                    slice: r2il::RegisterBitSlice {
+                        lsb_bit_offset: 0,
+                        size_bits: 16,
+                    },
+                },
+            },
+            r2il::RegisterProjection {
+                written: eax,
+                disposition: r2il::RegisterProjectionDisposition::Bound {
+                    carrier: rax,
+                    slice: r2il::RegisterBitSlice {
+                        lsb_bit_offset: 0,
+                        size_bits: 32,
+                    },
+                },
+            },
+            r2il::RegisterProjection {
+                written: rax,
+                disposition: r2il::RegisterProjectionDisposition::Bound {
+                    carrier: rax,
+                    slice: r2il::RegisterBitSlice {
+                        lsb_bit_offset: 0,
+                        size_bits: 64,
+                    },
+                },
+            },
+        ];
+        let mut geometry_blocks = blocks.clone();
+        geometry_blocks[0].ops = vec![
+            R2ILOp::Copy {
+                dst: make_unique(0x1b00, 8),
+                src: make_reg(0, 8),
+            },
+            R2ILOp::Copy {
+                dst: make_unique(0x1b10, 4),
+                src: make_reg(0, 4),
+            },
+            R2ILOp::Copy {
+                dst: make_unique(0x1b20, 2),
+                src: make_reg(0, 2),
+            },
+        ];
+        let machine_context = SourceMachineContext::from_blocks(&geometry_blocks, Some(&arch));
+        assert_eq!(
+            machine_context.register_geometry_state(),
+            crate::MachineRegisterGeometryState::Available,
+        );
+        for written in [ax, eax, rax] {
+            assert!(matches!(
+                machine_context
+                    .register_projection(CanonicalStorageId {
+                        space: CanonicalStorageSpace::Register,
+                        offset: written.offset,
+                        size: written.size,
+                    })
+                    .map(|projection| projection.disposition),
+                Some(r2il::RegisterProjectionDisposition::Bound { carrier, .. })
+                    if carrier == rax
+            ));
+        }
+        SsaArtifact::new_with_context(function, FunctionPrepareMode::Raw, machine_context)
+    }
+
+    fn projected_peer_role_signature(
+        prepared: &SsaArtifact,
+    ) -> Vec<(u32, Vec<crate::LoopCarrierMemberRole>)> {
+        let loop_fact = prepared
+            .structured()
+            .loops
+            .values()
+            .next()
+            .expect("projected peer loop");
+        let leader = loop_fact
+            .carriers
+            .iter()
+            .max_by_key(|carrier| carrier.width)
+            .expect("wide loop carrier");
+        let mut signature = leader
+            .members
+            .iter()
+            .map(|member| {
+                (
+                    prepared
+                        .graph()
+                        .value(member.value)
+                        .and_then(|value| value.canonical_storage)
+                        .map_or(0, |storage| storage.size),
+                    member.roles.iter().copied().collect::<Vec<_>>(),
+                )
+            })
+            .collect::<Vec<_>>();
+        signature.sort();
+        signature
+    }
+
+    fn projected_peer_certificate_component(
+        loop_fact: &crate::StructuredLoopFact,
+    ) -> BTreeSet<ValueId> {
+        let mut sets = loop_fact
+            .carriers
+            .iter()
+            .map(crate::LoopCarrierFact::coalescing_values)
+            .collect::<Vec<_>>();
+        sets.sort_by_key(|members| members.first().copied());
+        let mut component = sets.first().cloned().unwrap_or_default();
+        let mut pending = sets.into_iter().skip(1).collect::<Vec<_>>();
+        loop {
+            let mut changed = false;
+            pending.retain(|members| {
+                if component.is_disjoint(members) {
+                    true
+                } else {
+                    component.extend(members.iter().copied());
+                    changed = true;
+                    false
+                }
+            });
+            if !changed {
+                break;
+            }
+        }
+        component
+    }
+
+    #[test]
+    fn projected_loop_peers_form_one_order_and_name_independent_component() {
+        let forward = projected_peer_loop_artifact(&[0, 1, 2], "named", true);
+        let shuffled = projected_peer_loop_artifact(&[2, 0, 1], "renamed", true);
+
+        assert_eq!(
+            projected_peer_role_signature(&forward),
+            projected_peer_role_signature(&shuffled),
+            "role membership is keyed by source storage and SSA evidence, not names or phi order"
+        );
+        for prepared in [&forward, &shuffled] {
+            let loop_fact = prepared
+                .structured()
+                .loops
+                .values()
+                .next()
+                .expect("projected peer loop");
+            assert!(loop_fact.validate_carrier_members(
+                prepared.graph(),
+                prepared.storage_spans(),
+                Some(prepared.machine_context()),
+            ));
+            assert_eq!(loop_fact.carriers.len(), 3);
+            let component = projected_peer_certificate_component(loop_fact);
+            assert!(loop_fact
+                .carriers
+                .iter()
+                .all(|carrier| component.contains(&carrier.phi)));
+            let leader = loop_fact
+                .carriers
+                .iter()
+                .max_by_key(|carrier| carrier.width)
+                .expect("wide carrier");
+            assert_eq!(
+                leader
+                    .members
+                    .iter()
+                    .filter(|member| {
+                        member
+                            .roles
+                            .contains(&crate::LoopCarrierMemberRole::ProjectedPeer)
+                            && loop_fact
+                                .carriers
+                                .iter()
+                                .any(|carrier| carrier.phi == member.value)
+                    })
+                    .count(),
+                2,
+            );
+        }
+    }
+
+    #[test]
+    fn projected_loop_peers_require_one_coherent_storage_run() {
+        let prepared = projected_peer_loop_artifact(&[0, 1, 2], "separate", false);
+        let loop_fact = prepared
+            .structured()
+            .loops
+            .values()
+            .next()
+            .expect("separate peer loop");
+        assert!(loop_fact.validate_carrier_members(
+            prepared.graph(),
+            prepared.storage_spans(),
+            Some(prepared.machine_context()),
+        ));
+        assert!(loop_fact.carriers.iter().all(|carrier| carrier
+            .members
+            .iter()
+            .all(|member| !member
+                .roles
+                .contains(&crate::LoopCarrierMemberRole::ProjectedPeer))));
     }
 
     #[test]

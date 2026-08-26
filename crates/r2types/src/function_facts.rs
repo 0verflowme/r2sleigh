@@ -691,9 +691,11 @@ impl FunctionRenderFacts {
             match self.certified_entities.get(binding) {
                 Some(
                     entity @ CertifiedEntity::LoopCarrier {
-                        identity_values, ..
+                        members, ..
                     },
-                ) if identity_values.contains(&value) => Some(entity),
+                ) if members
+                    .binary_search_by_key(&value, |member| member.value)
+                    .is_ok() => Some(entity),
                 _ => None,
             }
         });
@@ -1056,6 +1058,7 @@ pub enum CertifiedEntity {
         entries: Vec<r2ssa::LoopCarrierEdgeValue>,
         updates: Vec<r2ssa::LoopCarrierUpdateFact>,
         dominating_initializers: Vec<r2ssa::LoopCarrierEdgeValue>,
+        members: Vec<r2ssa::LoopCarrierMemberFact>,
         ty: Option<CTypeLike>,
     },
 }
@@ -1080,24 +1083,8 @@ impl CertifiedEntity {
     pub fn coalescing_values(&self) -> Option<BTreeSet<r2ssa::ValueId>> {
         match self {
             Self::Parameter { entry_values, .. } => Some(entry_values.clone()),
-            Self::LoopCarrier {
-                identity_values,
-                entries,
-                updates,
-                dominating_initializers,
-                ..
-            } => {
-                let mut values = identity_values.clone();
-                values.extend(entries.iter().map(|entry| entry.value));
-                values.extend(updates.iter().flat_map(|update| {
-                    std::iter::once(update.value).chain(update.identity_values.iter().copied())
-                }));
-                values.extend(
-                    dominating_initializers
-                        .iter()
-                        .map(|initializer| initializer.value),
-                );
-                Some(values)
+            Self::LoopCarrier { members, .. } => {
+                Some(members.iter().map(|member| member.value).collect())
             }
             Self::StackSlot { .. } => None,
         }
@@ -2755,27 +2742,19 @@ impl FunctionFacts {
             .filter_map(|entity| match entity {
                 CertifiedEntity::LoopCarrier {
                     id,
-                    phi,
-                    identity_values,
+                    members,
                     ..
-                } => Some((*id, *phi, identity_values.clone())),
+                } => Some((*id, members.clone())),
                 _ => None,
             })
             .collect::<Vec<_>>();
 
-        for (id, phi, identity_values) in carriers {
+        for (id, members) in carriers {
             let mut candidates = Vec::<CTypeLike>::new();
-            let mut carrier_values = identity_values;
-            carrier_values.insert(phi);
-            if let Some(CertifiedEntity::LoopCarrier {
-                entries, updates, ..
-            }) = self.render.certified_entities.get(&id)
-            {
-                carrier_values.extend(entries.iter().map(|entry| entry.value));
-                carrier_values.extend(updates.iter().flat_map(|update| {
-                    std::iter::once(update.value).chain(update.identity_values.iter().copied())
-                }));
-            }
+            let carrier_values = members
+                .into_iter()
+                .map(|member| member.value)
+                .collect::<BTreeSet<_>>();
             for value in &carrier_values {
                 if let Some(slot) = self.render.exact_parameter_slot_for_value(*value)
                     && let Some(ty) = signature
@@ -4181,15 +4160,7 @@ fn prepared_render_facts(prepared: &r2ssa::SsaArtifact) -> FunctionRenderFacts {
         carrier_identity_values.extend(carrier.identity_values.iter().copied());
         carrier_edge_roots.extend(carrier.entries.iter().map(|entry| entry.value));
         carrier_edge_roots.extend(carrier.updates.iter().map(|update| update.value));
-        for value in carrier
-            .identity_values
-            .iter()
-            .copied()
-            .chain(carrier.entries.iter().map(|edge| edge.value))
-            .chain(carrier.updates.iter().flat_map(|update| {
-                std::iter::once(update.value).chain(update.identity_values.iter().copied())
-            }))
-        {
+        for value in carrier.members.iter().map(|member| member.value) {
             if let Some(expr) = certified_exprs.get_mut(&r2ssa::SemanticId::expression(value)) {
                 expr.bindings.insert(carrier.id);
             }
@@ -4206,6 +4177,7 @@ fn prepared_render_facts(prepared: &r2ssa::SsaArtifact) -> FunctionRenderFacts {
                 entries: carrier.entries.clone(),
                 updates: carrier.updates.clone(),
                 dominating_initializers: carrier.dominating_initializers.clone(),
+                members: carrier.members.clone(),
                 ty: None,
             },
         );
@@ -4721,6 +4693,13 @@ mod tests {
                     },
                 },
             ],
+            members: [1, 2, 3, 4, 6, 7, 8, 9]
+                .into_iter()
+                .map(|value| r2ssa::LoopCarrierMemberFact {
+                    value: r2ssa::ValueId(value),
+                    roles: BTreeSet::from([r2ssa::LoopCarrierMemberRole::StorageContinuation]),
+                })
+                .collect(),
             ty: None,
         };
 
@@ -4759,7 +4738,7 @@ mod tests {
             identity_values: identities,
         };
         let make_carrier =
-            |entries, updates, dominating_initializers| CertifiedEntity::LoopCarrier {
+            |entries, updates, dominating_initializers, members| CertifiedEntity::LoopCarrier {
                 id: r2ssa::SemanticId::LoopCarrier(r2ssa::ValueId(1)),
                 loop_id: r2ssa::LoopId(0),
                 header: 0x401000,
@@ -4769,8 +4748,18 @@ mod tests {
                 entries,
                 updates,
                 dominating_initializers,
+                members,
                 ty: None,
             };
+        let members = |values: Vec<u32>| {
+            values
+                .into_iter()
+                .map(|value| r2ssa::LoopCarrierMemberFact {
+                    value: r2ssa::ValueId(value),
+                    roles: BTreeSet::from([r2ssa::LoopCarrierMemberRole::StorageContinuation]),
+                })
+                .collect::<Vec<_>>()
+        };
         let forward = make_carrier(
             vec![edge(10, 2), edge(20, 3)],
             vec![
@@ -4778,6 +4767,7 @@ mod tests {
                 update(40, 7, BTreeSet::from([r2ssa::ValueId(8)])),
             ],
             vec![edge(50, 9), edge(60, 10)],
+            members(vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]),
         );
         let reversed = make_carrier(
             vec![edge(20, 3), edge(10, 2)],
@@ -4786,6 +4776,7 @@ mod tests {
                 update(30, 4, BTreeSet::from([r2ssa::ValueId(6)])),
             ],
             vec![edge(60, 10), edge(50, 9)],
+            members(vec![10, 9, 8, 7, 6, 5, 4, 3, 2, 1]),
         );
         let object = r2ssa::ObjectId(3);
         let stack_slot = CertifiedEntity::StackSlot {
@@ -5674,10 +5665,12 @@ mod tests {
                 entries,
                 updates,
                 dominating_initializers,
+                members,
                 ..
             } if entries == &upstream_carrier.entries
                 && updates == &upstream_carrier.updates
                 && dominating_initializers == &upstream_carrier.dominating_initializers
+                && members == &upstream_carrier.members
         ));
         facts.populate_member_access_render_facts_from_field_certificates(
             &prepared,

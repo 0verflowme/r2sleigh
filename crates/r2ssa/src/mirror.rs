@@ -79,16 +79,3 @@ pub fn carrier_mirrors_memory(
     }
     false
 }
-
-/// Every value one carrier passes through, which is what a spill has to name.
-pub fn carrier_members(carrier: &crate::semantic::LoopCarrierFact) -> BTreeSet<ValueId> {
-    carrier
-        .identity_values
-        .iter()
-        .copied()
-        .chain(carrier.entries.iter().map(|edge| edge.value))
-        .chain(carrier.updates.iter().flat_map(|update| {
-            std::iter::once(update.value).chain(update.identity_values.iter().copied())
-        }))
-        .collect()
-}

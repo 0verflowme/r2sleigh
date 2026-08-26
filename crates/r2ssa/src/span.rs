@@ -34,6 +34,7 @@ pub struct SpanId(u32);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StorageSpans {
     span_by_value: Vec<SpanId>,
+    members_by_span: Vec<Box<[ValueId]>>,
 }
 
 /// Mutable construction state that cannot escape as a semantic artifact.
@@ -100,6 +101,11 @@ impl StorageSpans {
     /// The run this value belongs to.
     pub fn span_of(&self, value: ValueId) -> Option<SpanId> {
         self.span_by_value.get(value.0 as usize).copied()
+    }
+
+    /// Exact members of one run, sorted by dense [`ValueId`].
+    pub fn members(&self, span: SpanId) -> Option<&[ValueId]> {
+        self.members_by_span.get(span.0 as usize).map(Box::as_ref)
     }
 
     /// Whether every one of these values is the same storage holding one value.
@@ -184,8 +190,18 @@ impl StorageSpanBuilder {
                 span_by_minimum[minimum as usize]
                     .expect("every component minimum has a canonical span")
             })
-            .collect();
-        StorageSpans { span_by_value }
+            .collect::<Vec<_>>();
+        let mut members_by_span = vec![Vec::new(); next_span as usize];
+        for (index, span) in span_by_value.iter().copied().enumerate() {
+            members_by_span[span.0 as usize].push(ValueId(index as u32));
+        }
+        StorageSpans {
+            span_by_value,
+            members_by_span: members_by_span
+                .into_iter()
+                .map(Vec::into_boxed_slice)
+                .collect(),
+        }
     }
 }
 
@@ -311,6 +327,16 @@ mod tests {
         assert_eq!(spans.span_of(ValueId(2)), Some(SpanId(1)));
         assert_eq!(spans.span_of(ValueId(3)), Some(SpanId(2)));
         assert_eq!(spans.span_of(ValueId(6)), None);
+        assert_eq!(
+            spans.members(SpanId(0)),
+            Some([ValueId(0), ValueId(4), ValueId(5)].as_slice())
+        );
+        assert_eq!(
+            spans.members(SpanId(1)),
+            Some([ValueId(1), ValueId(2)].as_slice())
+        );
+        assert_eq!(spans.members(SpanId(2)), Some([ValueId(3)].as_slice()));
+        assert_eq!(spans.members(SpanId(3)), None);
     }
 
     #[test]
