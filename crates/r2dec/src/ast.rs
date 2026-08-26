@@ -1204,6 +1204,7 @@ pub(crate) struct ReachableObservations {
 }
 
 impl ReachableObservations {
+    #[cfg(test)]
     pub(crate) fn contains(&self, id: RenderObservationId) -> bool {
         usize::try_from(id.index())
             .ok()
@@ -1371,6 +1372,7 @@ pub(crate) fn inspect_and_strip_render_observations<E>(
 /// Validation is a read-only linear pass over a fixed-size dense bitset. The
 /// AST is stripped only after every reachable marker is proven unique and in
 /// range, so an error leaves the input unchanged.
+#[cfg(test)]
 pub(crate) fn strip_render_observations(
     function: &mut CFunction,
     expected_count: usize,
@@ -1918,19 +1920,6 @@ fn inspect_stmt_observations<E>(
         | CStmt::Comment(_) => {}
     }
     Ok(())
-}
-
-pub(crate) fn carry_outer_stmt_observations(source: &CStmt, mut replacement: CStmt) -> CStmt {
-    let mut source = source;
-    let mut ids = Vec::new();
-    while let CStmt::Observed { id, stmt } = source {
-        ids.push(*id);
-        source = stmt;
-    }
-    for id in ids.into_iter().rev() {
-        replacement = CStmt::observed(id, replacement);
-    }
-    replacement
 }
 
 /// Move only a source expression's leading observation wrappers onto a

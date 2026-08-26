@@ -168,6 +168,7 @@ pub(crate) fn parse_const_offset(var: &SSAVar) -> Option<i64> {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn uf_find(parent: &mut HashMap<String, String>, x: &str) -> String {
     let p = parent.get(x).cloned().unwrap_or_else(|| x.to_string());
     if p == x {
@@ -239,6 +240,7 @@ pub(crate) fn is_temporary_or_constant_name(name: &str) -> bool {
     )
 }
 
+#[cfg(test)]
 pub(crate) fn is_temporary_or_memory_name(name: &str) -> bool {
 
     matches!(
@@ -254,6 +256,7 @@ pub(crate) fn is_temporary_constant_or_memory_name(name: &str) -> bool {
     )
 }
 
+#[cfg(test)]
 pub(crate) fn is_constant_or_memory_name(name: &str) -> bool {
 
     matches!(
@@ -262,6 +265,7 @@ pub(crate) fn is_constant_or_memory_name(name: &str) -> bool {
     )
 }
 
+#[cfg(test)]
 pub(crate) fn is_low_signal_ssa_storage_name(name: &str) -> bool {
 
     matches!(
@@ -615,6 +619,7 @@ pub(crate) fn arg_alias_for_store_source(
         .or_else(|| arg_alias_for_register_name(&traced))
 }
 
+#[cfg(test)]
 fn is_hex_name(value: &str) -> bool {
     !value.is_empty() && value.chars().all(|c| c.is_ascii_hexdigit())
 }

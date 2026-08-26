@@ -70,9 +70,6 @@ impl DecompilerFacts {
         &self.stack_info
     }
 
-    pub(crate) fn ownership(&self) -> &SemanticOwnershipFacts {
-        &self.ownership
-    }
 }
 
 /// No condition codes, for a fixture whose target states none.
@@ -471,10 +468,6 @@ impl StackSlotProvenance {
 
     pub(crate) fn is_scalar(self) -> bool {
         self.value_kind == StackSlotValueKind::Scalar
-    }
-
-    pub(crate) fn is_address_like(self) -> bool {
-        self.value_kind == StackSlotValueKind::AddressLike
     }
 
     pub(crate) fn is_scalar_predicate_carrier(self) -> bool {
@@ -906,6 +899,7 @@ impl UseInfo {
     /// depending on which accessor a caller happened to reach for. A value is
     /// the identity here -- a name can be ambiguous and a value cannot -- so the
     /// value-keyed store wins, as it does everywhere else.
+    #[cfg(test)]
     pub(crate) fn render_definition_for_value(&self, value_id: ValueId) -> Option<&CExpr> {
         self.definition_for_value(value_id)
     }
@@ -946,6 +940,7 @@ impl UseInfo {
         self.semantic_values_by_value.get(&value_id)
     }
 
+    #[cfg(test)]
     pub(crate) fn render_semantic_value_for_value(
         &self,
         value_id: ValueId,
@@ -986,6 +981,7 @@ impl UseInfo {
         self.forwarded_values_by_value.get(&value_id)
     }
 
+    #[cfg(test)]
     pub(crate) fn render_forwarded_value_for_value(
         &self,
         value_id: ValueId,
@@ -1031,22 +1027,12 @@ impl UseInfo {
         })
     }
 
-    /// Every name any pass has something to say about, borrowed.
-    ///
-    /// A caller that filters these does not need them copied first, and copying
-    /// them costs one allocation per name on every question asked.
-    pub(crate) fn named_values(&self) -> impl Iterator<Item = String> + '_ {
-        let names = self.names_by_value_id();
-        self.definitions_by_value
-            .keys()
-            .filter_map(move |value_id| names.get(value_id).cloned())
-    }
-
     /// A spelling for each value, preferring the variable that owns it.
     ///
     /// A value bound only through a name -- which is how a caller holding a
     /// spelling reaches one -- has no variable to recover the spelling from, so
     /// the name binding answers instead.
+    #[cfg(test)]
     fn names_by_value_id(&self) -> BTreeMap<ValueId, String> {
         let mut names = BTreeMap::new();
         #[cfg(test)]
@@ -1060,6 +1046,7 @@ impl UseInfo {
     }
 
     /// Every definition with a name for the value it defines.
+    #[cfg(test)]
     pub(crate) fn definitions_with_names(&self) -> impl Iterator<Item = (String, &CExpr)> + '_ {
         let names = self.names_by_value_id();
         self.definitions_by_value
@@ -1137,6 +1124,7 @@ impl UseInfo {
     /// Slots are filed against values; a caller that needs to print one, or to
     /// pick the most readable of several names for the same offset, recovers the
     /// spelling here rather than from a second map keyed by name.
+    #[cfg(test)]
     pub(crate) fn stack_slots_with_names(
         &self,
     ) -> impl Iterator<Item = (String, StackSlotProvenance)> + '_ {
@@ -1166,6 +1154,7 @@ impl UseInfo {
         self.condition_values.contains(&value)
     }
 
+    #[cfg(test)]
     pub(crate) fn is_condition_var(&self, var: &SSAVar) -> bool {
         self.exact_value_id_for_var(var)
             .is_some_and(|value| self.is_condition_value(value))

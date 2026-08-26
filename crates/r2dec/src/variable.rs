@@ -11,7 +11,6 @@ use r2types::{
     VisibleBinding, VisibleBindingKind, register_alias_names,
 };
 
-use crate::DecompilerInput;
 use crate::analysis::utils;
 use crate::ast::{BinaryOp, CExpr, CType};
 
@@ -296,20 +295,6 @@ impl VariableRecovery {
         // First pass: identify stack variables
         self.find_stack_variables(func, None, symbols);
 
-        self.recover_non_stack_variables(func);
-    }
-
-    /// Recover variables from one source-owned decompiler input.
-    pub(crate) fn recover_input(
-        &mut self,
-        input: &DecompilerInput,
-        symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
-    ) {
-
-        self.type_facts = input.function_facts().type_facts().clone();
-        let prepared = input.prepared_ssa();
-        let func = prepared.function();
-        self.find_stack_variables(func, Some(prepared), symbols);
         self.recover_non_stack_variables(func);
     }
 

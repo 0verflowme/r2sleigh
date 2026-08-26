@@ -517,7 +517,6 @@ impl<'a> FoldingContext<'a> {
             LoweredOp::Assign { lhs, rhs } => self.assign_stmt(lhs, rhs),
             LoweredOp::FinalizedStmt(stmt) => Some(stmt),
             LoweredOp::Expr(expr) => Some(CStmt::Expr(expr)),
-            LoweredOp::Return(expr) => Some(CStmt::Return(expr)),
             LoweredOp::Comment(text) => Some(CStmt::Comment(text)),
             LoweredOp::None => None,
         }
@@ -684,10 +683,6 @@ impl<'a> FoldingContext<'a> {
             LoweredOp::FinalizedStmt(_) => {
                 return Err(OpLoweringRefusal::UnrepresentableOperation);
             }
-            LoweredOp::Return(Some(expr)) => expr,
-            LoweredOp::Return(None) => {
-                return Err(OpLoweringRefusal::UnrepresentableOperation);
-            }
             LoweredOp::Comment(_) | LoweredOp::None => {
                 return Err(OpLoweringRefusal::UnrepresentableOperation);
             }
@@ -715,10 +710,6 @@ impl<'a> FoldingContext<'a> {
             LoweredOp::FinalizedStmt(CStmt::Expr(expr)) => LoweredExprAt::Rendered(expr),
             LoweredOp::FinalizedStmt(CStmt::Return(Some(expr))) => LoweredExprAt::Rendered(expr),
             LoweredOp::FinalizedStmt(_) => {
-                return Err(OpLoweringRefusal::UnrepresentableOperation);
-            }
-            LoweredOp::Return(Some(expr)) => LoweredExprAt::Rendered(expr),
-            LoweredOp::Return(None) => {
                 return Err(OpLoweringRefusal::UnrepresentableOperation);
             }
             LoweredOp::Comment(_) | LoweredOp::None => {

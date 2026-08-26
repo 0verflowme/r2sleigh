@@ -300,10 +300,6 @@ impl<'a> FoldingContext<'a> {
         }
     }
 
-    pub(crate) fn folded_block_addrs(&self) -> std::collections::BTreeSet<u64> {
-        self.folded_blocks.borrow().clone()
-    }
-
     pub(crate) fn normalized_site(
         &self,
         block_addr: u64,
@@ -480,30 +476,6 @@ impl<'a> FoldingContext<'a> {
                 fallback
             }
         }
-    }
-
-    pub(crate) fn observe_current_normalized_input_expr(
-        &self,
-        input_idx: usize,
-        expr: CExpr,
-    ) -> CExpr {
-        let Some(block_addr) = self.current_block_addr.get() else {
-            if self.inputs.observation_journal.is_some() {
-                self.retain_first_observation_error(
-                    crate::observation_journal::LegacyObservationJournalError::MissingNormalizedSiteContext,
-                );
-            }
-            return expr;
-        };
-        let Some(op_idx) = self.current_op_idx.get() else {
-            if self.inputs.observation_journal.is_some() {
-                self.retain_first_observation_error(
-                    crate::observation_journal::LegacyObservationJournalError::MissingNormalizedSiteContext,
-                );
-            }
-            return expr;
-        };
-        self.observe_normalized_input_expr(block_addr, op_idx, input_idx, expr)
     }
 
     /// Wrap one exact normalized definition that survives as a statement.

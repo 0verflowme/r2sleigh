@@ -5,8 +5,6 @@ use crate::structured_region::SealedStructuredBody;
 pub(crate) struct RoutedBody {
     body_stmt: Option<CStmt>,
     structured_body: Option<SealedStructuredBody>,
-    pub(crate) use_conservative_locals: bool,
-    pub(crate) is_linear_fallback: bool,
 }
 
 impl RoutedBody {
@@ -49,8 +47,6 @@ where
                 crate::route_reason(route),
             )),
             structured_body: None,
-            use_conservative_locals: true,
-            is_linear_fallback: false,
         }),
         r2types::DecompileRouteKind::LinearWorker | r2types::DecompileRouteKind::SummaryIslands => {
             Ok(RoutedBody {
@@ -59,8 +55,6 @@ where
                     crate::route_reason(route),
                 )),
                 structured_body: None,
-                use_conservative_locals: true,
-                is_linear_fallback: false,
             })
         }
         r2types::DecompileRouteKind::VmSummary
@@ -86,24 +80,18 @@ where
                     Ok(RoutedBody {
                         body_stmt: Some(CStmt::Block(stmts)),
                         structured_body: None,
-                        use_conservative_locals: true,
-                        is_linear_fallback: true,
                     })
                 }
                 None => match structured {
                     Ok(structured_body) => Ok(RoutedBody {
                         body_stmt: None,
                         structured_body: Some(structured_body),
-                        use_conservative_locals: false,
-                        is_linear_fallback: false,
                     }),
                     Err(ControlFlowStructureError::StructuredRegion(error)) => Ok(RoutedBody {
                         body_stmt: Some(CStmt::comment(format!(
                             "r2dec residual: structured-region sealing failed: {error:?}"
                         ))),
                         structured_body: None,
-                        use_conservative_locals: true,
-                        is_linear_fallback: false,
                     }),
                     Err(ControlFlowStructureError::Lowering(_)) => {
                         unreachable!("lowering refusal returned before route fallback")

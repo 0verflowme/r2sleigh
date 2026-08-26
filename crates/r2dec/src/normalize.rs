@@ -370,23 +370,9 @@ impl NormalizationOrigins {
         &self.removed_phis
     }
 
+    #[cfg(test)]
     pub(crate) fn replaced_phi_edges(&self) -> &[PhiEdgeOrigin] {
         &self.replaced_phi_edges
-    }
-
-    pub(crate) fn materialized_value_edges(&self) -> impl Iterator<Item = (ValueId, ValueId)> + '_ {
-        self.blocks
-            .iter()
-            .flat_map(|block| block.rows.iter())
-            .filter_map(|origin| match origin {
-                NormalizedOpOrigin::PhiEdgeCopy(origin) => {
-                    Some((origin.definition.value, origin.incoming_value))
-                }
-                NormalizedOpOrigin::RelocatedInitializer(origin) => {
-                    Some((origin.definition.value, origin.source_value))
-                }
-                NormalizedOpOrigin::Original(_) => None,
-            })
     }
 
     pub(crate) fn is_unconditional_phi_edge_copy(

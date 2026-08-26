@@ -773,13 +773,6 @@ impl<'a> FoldingContext<'a> {
         result
     }
 
-    pub(super) fn certified_signature_arg_alias_for_register(
-        &self,
-        _reg_name: &str,
-    ) -> Option<String> {
-        None
-    }
-
     pub(super) fn render_certified_memory_expr_for_fact(
         &self,
         fact: &r2types::MemoryAccessRenderFact,

@@ -6,6 +6,7 @@ pub(super) struct CertifiedCallArgs {
     pub(super) values: Vec<r2ssa::ValueId>,
 }
 
+#[cfg(test)]
 fn dereference_rendered_address(expr: CExpr, unwrap_direct_address: bool) -> CExpr {
     match expr {
         CExpr::Observed { id, expr } => CExpr::observed(
@@ -444,6 +445,7 @@ impl<'a> FoldingContext<'a> {
             .and_then(|identity| identity.known_signature().cloned())
     }
 
+    #[cfg(test)]
     pub(super) fn known_signature_for_site(
         &self,
         block_addr: u64,

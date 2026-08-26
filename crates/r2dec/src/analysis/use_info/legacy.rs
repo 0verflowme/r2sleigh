@@ -1,5 +1,4 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::hash::Hash;
 
 use r2il::SpaceId;
 use r2ssa::{
@@ -119,9 +118,13 @@ pub(crate) fn analyze_with_definition_overrides_with_control(symbols: &std::cell
     definition_overrides: &HashMap<String, CExpr>,
     control: DecompileWorkControl<'_>,
 ) -> Result<UseInfo, DecompileExecutionStop> {
-    let mut scratch =
-        analyze_value_facts(symbols, blocks, env, definition_overrides, control)?;
+    let scratch = analyze_value_facts(symbols, blocks, env, definition_overrides, control)?;
+    #[cfg(test)]
+    let mut scratch = scratch;
+    #[cfg(test)]
     name_values_for_rendering(symbols, &mut scratch, blocks, env, control)?;
+    #[cfg(not(test))]
+    control.poll()?;
     Ok(seal_value_facts(scratch))
 }
 
@@ -173,6 +176,7 @@ fn seal_value_facts(mut scratch: UseScratch) -> UseInfo {
 /// Coalescing and formatting choose how values are spelled, which only a
 /// renderer cares about, so an analysis that just reads structure stops short of
 /// them rather than switching them off.
+#[cfg(test)]
 fn name_values_for_rendering(
     symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
     scratch: &mut UseScratch,
@@ -180,12 +184,9 @@ fn name_values_for_rendering(
     env: &PassEnv<'_>,
     control: DecompileWorkControl<'_>,
 ) -> Result<(), DecompileExecutionStop> {
-    #[cfg(test)]
-    {
-        coalesce_variables(scratch, blocks, env, control)?;
-        pin_aliases_for_pinned_values(&mut scratch.info);
-        build_formatted_defs(symbols, scratch, env);
-    }
+    coalesce_variables(scratch, blocks, env, control)?;
+    pin_aliases_for_pinned_values(&mut scratch.info);
+    build_formatted_defs(symbols, scratch, env);
     control.poll()
 }
 
@@ -372,6 +373,7 @@ fn is_generic_entry_arg_name(name: &str) -> bool {
         })
 }
 
+#[cfg(test)]
 fn semantic_value_preservation_score(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, value: &SemanticValue) -> i32 {
     match value {
         SemanticValue::Unknown => 0,
@@ -390,6 +392,7 @@ fn semantic_value_preservation_score(symbols: &std::cell::RefCell<crate::symbol:
     }
 }
 
+#[cfg(test)]
 fn call_arg_expr_preservation_score(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, expr: &CExpr, depth: u32) -> i32 {
     if depth > 8 {
         return 0;
@@ -403,7 +406,7 @@ fn call_arg_expr_preservation_score(symbols: &std::cell::RefCell<crate::symbol::
         CExpr::Var(name) => {
             if is_call_arg_placeholder_name(&crate::symbol::spelling(symbols, *name)) {
                 -120
-            } else if is_call_arg_transient_name(symbols, &crate::symbol::spelling(symbols, *name)) {
+            } else if is_call_arg_transient_name(&crate::symbol::spelling(symbols, *name)) {
                 -60
             } else if is_symbol_or_object_name(&crate::symbol::spelling(symbols, *name))
                 || crate::symbol::spelling(symbols, *name).eq_ignore_ascii_case("argc")
@@ -1390,57 +1393,6 @@ fn value_kind_for_block_var(symbols: &std::cell::RefCell<crate::symbol::SymbolTa
     semantic_kind
 }
 
-struct SwitchSelectorLoadCtx<'a, 'b> {
-    func: &'a SSAFunction,
-    block: &'a SSABlock,
-    preds: &'b [u64],
-    env: &'a PassEnv<'a>,
-}
-
-fn preferred_switch_selector_value(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
-    info: &UseInfo,
-    current: Option<SemanticValue>,
-    candidate: Option<SemanticValue>,
-) -> Option<SemanticValue> {
-    match (current, candidate) {
-        (None, other) => other,
-        (some @ Some(_), None) => some,
-        (Some(current), Some(candidate)) => {
-            let current_score = switch_selector_candidate_score(symbols, info, &current);
-            let candidate_score = switch_selector_candidate_score(symbols, info, &candidate);
-            if candidate_score > current_score {
-                Some(candidate)
-            } else {
-                Some(current)
-            }
-        }
-    }
-}
-
-fn switch_selector_candidate_score(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, info: &UseInfo, value: &SemanticValue) -> i32 {
-    let mut score = semantic_value_preservation_score(symbols, value);
-    match value {
-        SemanticValue::Scalar(ScalarValue::Root(root)) => {
-            if root.var.version == 0 {
-                score -= 120;
-            } else {
-                score += 100;
-            }
-            if root.var.version == 0 {
-                score -= 80;
-            }
-        }
-        SemanticValue::Scalar(ScalarValue::Expr(expr)) => {
-            score += call_arg_expr_preservation_score(symbols, expr, 0);
-        }
-        SemanticValue::Address(_) | SemanticValue::Load { .. } => {
-            score -= 40;
-        }
-        SemanticValue::Unknown => score = -1,
-    }
-    score
-}
-
 #[cfg(test)]
 pub(crate) fn collect_local_struct_field_access_profiles(
     symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
@@ -2024,7 +1976,7 @@ fn collect_definitions(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
             scratch.producers.insert(dst.display_name(), op.clone());
         }
 
-        if invalidates_block_stack_values(symbols, op, &scratch.info, env) {
+        if invalidates_block_stack_values(symbols, op, env) {
             if is_call_like_stack_boundary_op(op) {
                 preserved_positive_stack_values = block_stack_values
                     .iter()
@@ -3522,7 +3474,6 @@ fn resolve_copy_root_name(info: &UseInfo, name: &str) -> String {
 
 fn invalidates_block_stack_values(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
     op: &SSAOp,
-    info: &UseInfo,
     env: &PassEnv<'_>,
 ) -> bool {
     match op {
@@ -3631,6 +3582,7 @@ fn build_formatted_defs(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>
     }
 }
 
+#[cfg(test)]
 fn is_preferred_formatted_def_candidate(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
     candidate: &str,
     candidate_expr: &CExpr,
@@ -3646,6 +3598,7 @@ fn is_preferred_formatted_def_candidate(symbols: &std::cell::RefCell<crate::symb
     is_preferred_formatted_def(candidate, incumbent)
 }
 
+#[cfg(test)]
 fn is_preferred_formatted_def(candidate: &str, incumbent: &str) -> bool {
     let candidate_version = ssa_key_parts(candidate)
         .map(|(_, version)| version)
@@ -3657,12 +3610,14 @@ fn is_preferred_formatted_def(candidate: &str, incumbent: &str) -> bool {
         || (candidate_version == incumbent_version && candidate < incumbent)
 }
 
+#[cfg(test)]
 fn formatted_def_expr_quality(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, expr: &CExpr, env: &PassEnv<'_>) -> (i32, i32, i32, i32, i32, i32) {
     let mut quality = (0, 0, 0, 0, 0, 0);
     accumulate_formatted_def_expr_quality(symbols, expr, env, &mut quality);
     quality
 }
 
+#[cfg(test)]
 fn accumulate_formatted_def_expr_quality(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
     expr: &CExpr,
     env: &PassEnv<'_>,
@@ -3742,10 +3697,12 @@ fn accumulate_formatted_def_expr_quality(symbols: &std::cell::RefCell<crate::sym
     }
 }
 
+#[cfg(test)]
 fn literal_zero(expr: &CExpr) -> bool {
     matches!(expr.unobserved(), CExpr::IntLit(0) | CExpr::UIntLit(0))
 }
 
+#[cfg(test)]
 fn is_generic_stack_alias_name(name: &str) -> bool {
 
     name == "stack"
@@ -3754,6 +3711,7 @@ fn is_generic_stack_alias_name(name: &str) -> bool {
         || name == "saved_fp"
 }
 
+#[cfg(test)]
 fn is_raw_ssa_storage_or_register_name(name: &str) -> bool {
     matches!(
         utils::ssa_name_kind(name),
@@ -3772,6 +3730,7 @@ fn is_raw_temporary_or_memory_like_name(name: &str) -> bool {
     )
 }
 
+#[cfg(test)]
 fn is_symbol_or_object_name(name: &str) -> bool {
 
     matches!(
@@ -3780,6 +3739,7 @@ fn is_symbol_or_object_name(name: &str) -> bool {
     )
 }
 
+#[cfg(test)]
 fn is_low_signal_name(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     is_raw_ssa_storage_or_register_name(name)
@@ -3798,6 +3758,7 @@ fn ssa_key_parts(name: &str) -> Option<(&str, u32)> {
     Some((base, parsed))
 }
 
+#[cfg(test)]
 fn is_semantic_binding_base(base: &str) -> bool {
     let lower = base.to_ascii_lowercase();
     lower.starts_with("local_")
@@ -3811,6 +3772,7 @@ fn is_semantic_binding_base(base: &str) -> bool {
         || is_raw_ssa_storage_or_register_name(base)
 }
 
+#[cfg(test)]
 fn is_decimal_suffix(name: &str, prefix: &str) -> bool {
     let Some(rest) = name.strip_prefix(prefix) else {
         return false;
@@ -3818,6 +3780,7 @@ fn is_decimal_suffix(name: &str, prefix: &str) -> bool {
     !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit())
 }
 
+#[cfg(test)]
 fn is_x86_register_base(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     if matches!(
@@ -3889,6 +3852,7 @@ fn is_x86_register_base(name: &str) -> bool {
             && matches!(lower.chars().last(), Some('b' | 'w' | 'd')))
 }
 
+#[cfg(test)]
 fn is_arm_like_register_base(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     matches!(lower.as_str(), "sp" | "fp" | "lr" | "pc" | "cpsr" | "nzcv")
@@ -3897,6 +3861,7 @@ fn is_arm_like_register_base(name: &str) -> bool {
         || is_decimal_suffix(&lower, "w")
 }
 
+#[cfg(test)]
 fn is_mips_like_register_base(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     if matches!(
@@ -3923,6 +3888,7 @@ fn is_mips_like_register_base(name: &str) -> bool {
         || is_decimal_suffix(&lower, "k")
 }
 
+#[cfg(test)]
 fn is_riscv_like_register_base(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     if matches!(
@@ -3941,6 +3907,7 @@ fn is_riscv_like_register_base(name: &str) -> bool {
         || is_decimal_suffix(&lower, "v")
 }
 
+#[cfg(test)]
 fn is_register_candidate_base(base: &str, env: &PassEnv<'_>) -> bool {
 
     if is_semantic_binding_base(base) {
@@ -3968,6 +3935,7 @@ fn is_register_candidate_base(base: &str, env: &PassEnv<'_>) -> bool {
         .any(|arg| arg.eq_ignore_ascii_case(base))
 }
 
+#[cfg(test)]
 fn is_register_candidate_key(key: &str, env: &PassEnv<'_>) -> bool {
     let Some((base, _)) = ssa_key_parts(key) else {
         return false;
@@ -3975,6 +3943,7 @@ fn is_register_candidate_key(key: &str, env: &PassEnv<'_>) -> bool {
     is_register_candidate_base(base, env)
 }
 
+#[cfg(test)]
 fn is_register_candidate_var(var: &r2ssa::SSAVar, env: &PassEnv<'_>) -> bool {
     is_register_candidate_base(&var.name, env)
 }
@@ -4030,6 +3999,7 @@ fn infer_successors(
     }
 }
 
+#[cfg(test)]
 fn pair_key(a: &str, b: &str) -> (String, String) {
     if a <= b {
         (a.to_string(), b.to_string())
@@ -4038,6 +4008,7 @@ fn pair_key(a: &str, b: &str) -> (String, String) {
     }
 }
 
+#[cfg(test)]
 fn sort_members_by_version(members: &mut [String], version_by_name: &HashMap<String, u32>) {
     members.sort_by(|a, b| {
         version_by_name
@@ -4049,6 +4020,7 @@ fn sort_members_by_version(members: &mut [String], version_by_name: &HashMap<Str
     });
 }
 
+#[cfg(test)]
 fn alias_class_sort_key(
     class: &[String],
     version_by_name: &HashMap<String, u32>,
@@ -4067,6 +4039,7 @@ fn alias_class_sort_key(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 fn pair_interferes(
     a: &str,
     b: &str,
@@ -6006,7 +5979,7 @@ fn semantic_call_arg_is_transient_register_fallback(symbols: &std::cell::RefCell
             CExpr::Var(name) => {
                 let lower = crate::symbol::spelling(symbols, *name).to_ascii_lowercase();
                 is_call_arg_placeholder_name(&lower)
-                    || is_call_arg_transient_name(symbols, &lower)
+                    || is_call_arg_transient_name(&lower)
                     || exact_parameter_slot_for_symbol(env, *name).is_some()
             }
             CExpr::Paren(inner) | CExpr::Cast { expr: inner, .. } => {
@@ -6605,7 +6578,7 @@ fn semantic_call_arg_is_transient_fallback(symbols: &std::cell::RefCell<crate::s
     match arg {
         SemanticCallArg::FallbackExpr(expr) => match expr.unobserved() {
             CExpr::Var(name) => {
-                is_call_arg_transient_name(symbols, &crate::symbol::spelling(symbols, *name))
+                is_call_arg_transient_name(&crate::symbol::spelling(symbols, *name))
                     || is_call_arg_placeholder_name(&crate::symbol::spelling(symbols, *name))
             }
             CExpr::Paren(inner) | CExpr::Cast { expr: inner, .. } => {
@@ -6772,7 +6745,7 @@ fn expr_preserves_pointer_identity_for_call_arg(
     match expr.unobserved() {
         CExpr::Var(name) => {
             !is_call_arg_placeholder_name(&crate::symbol::spelling(symbols, *name))
-                && !is_call_arg_transient_name(symbols, &crate::symbol::spelling(symbols, *name))
+                && !is_call_arg_transient_name(&crate::symbol::spelling(symbols, *name))
                 && !is_call_arg_low_quality_name(&crate::symbol::spelling(symbols, *name))
                 && !is_generic_entry_arg_name(&crate::symbol::spelling(symbols, *name))
         }
@@ -6885,7 +6858,7 @@ fn expr_is_meaningful_stack_reload_fallback(
                 && !crate::symbol::spelling(symbols, *name).eq_ignore_ascii_case("argv")
                 && !crate::symbol::spelling(symbols, *name).eq_ignore_ascii_case("envp")
                 && !is_call_arg_placeholder_name(&lower)
-                && !is_call_arg_transient_name(symbols, &lower)
+                && !is_call_arg_transient_name(&lower)
                 && !is_call_arg_low_quality_name(&lower)
                 && !is_generic_entry_arg_name(&lower)
                 && exact_parameter_slot_for_symbol(env, *name).is_none()
@@ -6990,7 +6963,7 @@ fn should_use_semantic_call_arg_value(symbols: &std::cell::RefCell<crate::symbol
                     || semantic_var_is_pointer_like(info, &root.var, env)
                     || has_stable_negative_stack_source)
                 && !is_call_arg_placeholder_name(&root.var.display_name())
-                && (!is_call_arg_transient_name(symbols, &root.var.display_name())
+                && (!is_call_arg_transient_name(&root.var.display_name())
                     || has_stable_negative_stack_source)
         }
         SemanticValue::Unknown => false,
@@ -7595,7 +7568,7 @@ fn call_arg_expr_semantic_weight(symbols: &std::cell::RefCell<crate::symbol::Sym
                 -20
             } else if is_call_arg_low_quality_name(&crate::symbol::spelling(symbols, *name)) {
                 -15
-            } else if is_call_arg_transient_name(symbols, &crate::symbol::spelling(symbols, *name)) {
+            } else if is_call_arg_transient_name(&crate::symbol::spelling(symbols, *name)) {
                 -10
             } else {
                 25
@@ -7687,7 +7660,7 @@ fn call_arg_expr_contains_transient_name(symbols: &std::cell::RefCell<crate::sym
     match expr {
         CExpr::Observed { expr, .. } => call_arg_expr_contains_transient_name(symbols, expr, depth),
         CExpr::External { .. } => false,
-        CExpr::Var(name) => is_call_arg_transient_name(symbols, &crate::symbol::spelling(symbols, *name)),
+        CExpr::Var(name) => is_call_arg_transient_name(&crate::symbol::spelling(symbols, *name)),
         CExpr::Deref(inner)
         | CExpr::AddrOf(inner)
         | CExpr::Paren(inner)
@@ -7869,7 +7842,7 @@ fn is_call_arg_low_quality_name(name: &str) -> bool {
         || is_generic_entry_arg_name(&lower)
 }
 
-fn is_call_arg_transient_name(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, name: &str) -> bool {
+fn is_call_arg_transient_name(name: &str) -> bool {
 
     let lower = name.to_ascii_lowercase();
     utils::is_temporary_constant_or_memory_name(name)
@@ -10006,15 +9979,15 @@ mod tests {
             "RAM:401000",
         ] {
             assert!(
-                is_call_arg_transient_name(&symbols, name),
+                is_call_arg_transient_name(name),
                 "{name} should be a transient call-argument carrier"
             );
         }
 
-        assert!(is_call_arg_transient_name(&symbols, "rax_1"));
-        assert!(is_call_arg_transient_name(&symbols, "x8_0"));
-        assert!(!is_call_arg_transient_name(&symbols, "space1:20"));
-        assert!(!is_call_arg_transient_name(&symbols, "value"));
+        assert!(is_call_arg_transient_name("rax_1"));
+        assert!(is_call_arg_transient_name("x8_0"));
+        assert!(!is_call_arg_transient_name("space1:20"));
+        assert!(!is_call_arg_transient_name("value"));
     }
 
     #[test]

@@ -455,6 +455,7 @@ impl<'a> FoldingContext<'a> {
             .is_some_and(|sig| matches!(sig.return_type, r2types::CTypeLike::Void))
     }
 
+    #[cfg(test)]
     pub(super) fn source_call_expr_returns_void(
         &self,
         source_call: (u64, usize),
@@ -612,6 +613,7 @@ impl<'a> FoldingContext<'a> {
         (reads, def)
     }
 
+    #[cfg(test)]
     pub(super) fn prune_dead_temp_assignments(&self, stmts: Vec<CStmt>) -> Vec<CStmt> {
         self.prune_dead_temp_assignments_with_options(stmts, true, false)
     }

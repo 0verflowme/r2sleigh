@@ -770,17 +770,6 @@ impl<'a> FoldingContext<'a> {
         self.render_authoritative_memory_access_by_name(name, 0, 0, &mut visited)
     }
 
-    pub(crate) fn stack_alias_from_deref_expr(&self, expr: &CExpr) -> Option<String> {
-        match expr {
-            CExpr::Deref(inner) => self
-                .resolve_stack_alias_from_addr_expr(inner, 0)
-                .filter(|alias| !is_generic_stack_placeholder_alias(alias)),
-            CExpr::Paren(inner) => self.stack_alias_from_deref_expr(inner),
-            CExpr::Cast { expr: inner, .. } => self.stack_alias_from_deref_expr(inner),
-            _ => None,
-        }
-    }
-
     pub(super) fn expand_return_expr(
         &self,
         expr: &CExpr,

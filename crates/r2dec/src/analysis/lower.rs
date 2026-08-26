@@ -5,6 +5,7 @@ use std::collections::HashSet;
 use r2ssa::{SSAOp, SSAVar, ValueId};
 use r2types::TypeOracle;
 
+#[cfg(test)]
 use super::utils::parse_const_value;
 use super::{
     BaseRef, NormalizedAddr, PtrArith, ScalarValue, SemanticValue, UseInfo, ValueProvenance,
@@ -14,6 +15,7 @@ use super::{
 use super::StackSlotProvenance;
 #[cfg(test)]
 use super::utils::{format_traced_name, ssa_render_base_name};
+#[cfg(test)]
 use crate::address::parse_address_from_var_name;
 use crate::ast::{BinaryOp, CExpr, CType, UnaryOp};
 use crate::binding_plan::PlannedValueSymbol;
@@ -49,7 +51,8 @@ pub(crate) struct LowerCtx<'a> {
     #[cfg(test)]
     pub(crate) param_register_aliases: &'a HashMap<String, String>,
     pub(crate) type_oracle: Option<&'a dyn TypeOracle>,
-    /// Where a rendered name is written down, so building a reference can mint one.
+    /// The table that owns plan-minted presentation handles. Production only
+    /// reads an already-sealed handle; fixture adapters may mint test symbols.
     pub(crate) symbols: &'a std::cell::RefCell<crate::symbol::SymbolTable>,
     /// String literals the source recorded, for rendering a constant that
     /// points at text as the text.
@@ -175,10 +178,16 @@ impl<'a> LowerCtx<'a> {
         depth: u32,
         visited: &mut HashSet<ValueId>,
     ) -> Result<CExpr, OpLoweringRefusal> {
-        if var.is_const() {
-            return Ok(self.const_to_expr(var));
+        if let Some(value) = var.constant_bits() {
+            return Ok(self.constant_to_expr(value));
         }
 
+        #[cfg(test)]
+        if var.is_const() {
+            return self.fixture_constant_to_expr(var);
+        }
+
+        #[cfg(test)]
         if let Some(addr) = parse_address_from_var_name(&var.name)
             && let Some(expr) = self.resolve_addr_literal(addr)
         {
@@ -503,7 +512,7 @@ impl<'a> LowerCtx<'a> {
             .use_info
             .ok_or(OpLoweringRefusal::MissingProgramVariableAuthorization)?;
         for var in op.sources() {
-            if var.is_const() {
+            if var.constant_bits().is_some() {
                 continue;
             }
             let value = info
@@ -547,13 +556,10 @@ impl<'a> LowerCtx<'a> {
             return None;
         }
 
-        let rendered = self
-            .semantic_value_for_name(name)
-            .and_then(|value| {
-                self.render_semantic_value(value, depth + 1, &mut HashSet::new())
-                    .ok()
-                    .flatten()
-            });
+        let rendered = self.semantic_value_for_name(name).and_then(|value| {
+            self.render_semantic_value(value, depth + 1, &mut HashSet::new())
+                .expect("fixture semantic value must have render authorization")
+        });
         visited.remove(&format!("sem:{name}"));
         rendered
     }
@@ -705,13 +711,10 @@ impl<'a> LowerCtx<'a> {
         depth: u32,
         visited: &mut HashSet<ValueId>,
     ) -> Result<Option<CExpr>, OpLoweringRefusal> {
-        let value_id = value
-            .value_id
-            .or_else(|| {
-                self.use_info
-                    .and_then(|info| info.exact_value_id_for_var(&value.var))
-            })
-            .ok_or(OpLoweringRefusal::MissingProgramVariableAuthorization)?;
+        let value_id = self.exact_value_id(&value.var)?;
+        if value.value_id.is_some_and(|certificate| certificate != value_id) {
+            return Err(OpLoweringRefusal::MissingProgramVariableAuthorization);
+        }
         if !visited.insert(value_id) {
             return Ok(None);
         }
@@ -744,14 +747,8 @@ impl<'a> LowerCtx<'a> {
         use_count == 1
     }
 
-    fn const_to_expr(&self, var: &SSAVar) -> CExpr {
-        let val = parse_const_value(&var.name).unwrap_or(0);
+    fn constant_to_expr(&self, val: u64) -> CExpr {
         if let Some(expr) = self.resolve_addr_literal(val) {
-            return expr;
-        }
-        if let Some(addr) = parse_address_from_var_name(&var.name)
-            && let Some(expr) = self.resolve_addr_literal(addr)
-        {
             return expr;
         }
         if val > 0x7fffffff {
@@ -759,6 +756,13 @@ impl<'a> LowerCtx<'a> {
         } else {
             CExpr::IntLit(val as i64)
         }
+    }
+
+    #[cfg(test)]
+    fn fixture_constant_to_expr(&self, var: &SSAVar) -> Result<CExpr, OpLoweringRefusal> {
+        let value = parse_const_value(&var.name)
+            .ok_or(OpLoweringRefusal::MissingProgramVariableAuthorization)?;
+        Ok(self.constant_to_expr(value))
     }
 
     /// The literal stored at `addr`, when the source said what is there.
@@ -1022,7 +1026,10 @@ impl<'a> LowerCtx<'a> {
         if abs == 0 {
             return None;
         }
-        u32::try_from(abs).ok()
+        match u32::try_from(abs) {
+            Ok(value) => Some(value),
+            Err(_) => None,
+        }
     }
 
     fn extract_mul_const(&self, expr: &CExpr, depth: u32) -> Option<(CExpr, i64)> {
@@ -1115,7 +1122,10 @@ impl<'a> LowerCtx<'a> {
     fn literal_to_i64(&self, expr: &CExpr) -> Option<i64> {
         match expr {
             CExpr::IntLit(v) => Some(*v),
-            CExpr::UIntLit(v) => i64::try_from(*v).ok(),
+            CExpr::UIntLit(v) => match i64::try_from(*v) {
+                Ok(value) => Some(value),
+                Err(_) => None,
+            },
             _ => None,
         }
     }

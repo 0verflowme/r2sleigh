@@ -3292,11 +3292,6 @@ impl<'a> FoldingContext<'a> {
         false
     }
 
-    pub(super) fn is_sleigh_memory_temp_name(&self, name: &str) -> bool {
-        let lower = name.to_ascii_lowercase();
-        lower.starts_with("tmp_ld") || lower.starts_with("tmp_st")
-    }
-
     pub(super) fn is_semantic_binding_name(name: &str) -> bool {
 
         let lower = name.to_ascii_lowercase();

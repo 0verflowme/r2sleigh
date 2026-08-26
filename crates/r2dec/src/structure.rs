@@ -699,13 +699,8 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         (latches.into_iter().collect(), exits.into_iter().collect())
     }
 
-    /// Get the set of variable names that survive folding (for filtering declarations).
-    pub(crate) fn emitted_var_names(&self) -> HashSet<String> {
-        let blocks: Vec<_> = self.func.blocks().cloned().collect();
-        self.fold_ctx.emitted_var_names(&blocks)
-    }
-
     /// Structure the function's control flow.
+    #[cfg(test)]
     pub(crate) fn structure(&mut self) -> ControlFlowStructureResult<CStmt> {
         self.structure_with_regions().map(SealedStructuredBody::into_stmt)
     }
@@ -732,21 +727,6 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         }
         // Post-process: flatten, simplify loops, remove redundant control flow.
         seal_structured_body(Self::cleanup(symbols, stmt)).map_err(ControlFlowStructureError::from)
-    }
-
-    /// Structure control flow without post-proof AST rewrites.
-    ///
-    /// Certified rendering validates final executable control nodes against the
-    /// `FunctionFacts` proof identities recorded while structuring. Cleanup can
-    /// invert, merge, synthesize, or delete control nodes, so certified callers
-    /// must validate the unrewritten AST or residualize.
-    pub(crate) fn structure_preserving_render_proof_identity(
-        &mut self,
-    ) -> ControlFlowStructureResult<CStmt> {
-        let stmt = self.structure_preserving_render_proof_identity_marked()?;
-        seal_structured_body(stmt)
-            .map(SealedStructuredBody::into_stmt)
-            .map_err(ControlFlowStructureError::from)
     }
 
     fn structure_preserving_render_proof_identity_marked(
@@ -2850,10 +2830,6 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         target_name: &str,
     ) -> bool {
         matches!(expr.unobserved(), CExpr::Var(name) if &*crate::symbol::spelling(symbols, *name) == target_name)
-    }
-
-    fn is_assignment_like_op(op: BinaryOp) -> bool {
-        op == BinaryOp::Assign || Self::is_compound_assign_op(op)
     }
 
     fn rewrite_constant_condition_stmt(stmt: CStmt) -> CStmt {

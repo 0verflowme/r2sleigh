@@ -314,7 +314,6 @@ enum LoweredOp {
     Assign { lhs: CExpr, rhs: CExpr },
     FinalizedStmt(CStmt),
     Expr(CExpr),
-    Return(Option<CExpr>),
     None,
     Comment(String),
 }
@@ -424,35 +423,6 @@ fn is_static_jump_table_base_name(name: &str) -> bool {
     lower
         .strip_prefix("0x")
         .is_some_and(|hex| !hex.is_empty() && u64::from_str_radix(hex, 16).is_ok())
-}
-
-fn side_effect_free_assignment_name(stmt: &CStmt) -> Option<crate::symbol::SymbolId> {
-    if let CStmt::Observed { stmt, .. } = stmt {
-        return side_effect_free_assignment_name(stmt);
-    }
-    let (name, rhs) = match stmt {
-        CStmt::Expr(expr) => {
-            let CExpr::Binary {
-                op: BinaryOp::Assign,
-                left,
-                right,
-            } = expr.unobserved()
-            else {
-                return None;
-            };
-            let CExpr::Var(name) = left.unobserved() else {
-                return None;
-            };
-            (*name, right.as_ref())
-        }
-        CStmt::Decl {
-            name,
-            init: Some(init),
-            ..
-        } => (*name, init),
-        _ => return None,
-    };
-    expr_is_side_effect_free(rhs).then_some(name)
 }
 
 fn stmt_contains_memory_like_access(stmt: &CStmt) -> bool {
@@ -926,11 +896,6 @@ fn call_arg_callee_name(
         CExpr::Cast { expr: inner, .. } => call_arg_callee_name(symbols, inner),
         _ => None,
     }
-}
-
-/// Check if a string looks like a hex number.
-fn is_hex_name(value: &str) -> bool {
-    !value.is_empty() && value.chars().all(|c| c.is_ascii_hexdigit())
 }
 
 /// Get a C type from a bit size.

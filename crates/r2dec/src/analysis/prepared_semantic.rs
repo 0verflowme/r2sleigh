@@ -10,11 +10,13 @@ use r2ssa::{
 use r2ssa::SSAVarNameKind;
 use r2types::{
     CalleeIdentity, CalleeResolutionFacts, CalleeTargetIdentityRequest, CallsiteKey,
-    ExternalStackSlotSpec, FunctionCallResultFacts, FunctionCallsiteFacts, FunctionFacts,
-    StackSlotKey, VisibleBinding, VisibleBindingKind,
+    FunctionCallResultFacts, FunctionCallsiteFacts, FunctionFacts,
 };
 #[cfg(test)]
-use r2types::{ExternalStackBase, ExternalStackSlotRole};
+use r2types::{
+    ExternalStackBase, ExternalStackSlotRole, ExternalStackSlotSpec, StackSlotKey, VisibleBinding,
+    VisibleBindingKind,
+};
 
 use super::lower::LowerCtx;
 use super::{
@@ -23,7 +25,7 @@ use super::{
     StackSlotProvenance, StackSlotValueKind, UseInfo, ValueProvenance, ValueRef,
 };
 use crate::analysis::utils::{
-    compare_const_to_expr, compare_const_to_expr_with_width, is_cpu_flag,
+    compare_const_to_expr, compare_const_to_expr_with_width,
     is_temporary_constant_or_memory_name, parse_const_value,
 };
 #[cfg(test)]
@@ -33,6 +35,7 @@ use crate::binding_plan::{
     PlannedParameterSymbol, PlannedStackSymbol, PlannedValueSymbol, RenderedIdentityRefusal,
 };
 
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StackAliasView {
     pub(crate) visible_name: String,
@@ -74,6 +77,7 @@ pub(crate) struct PreparedSemanticView {
     /// member rather than an array element. An index must not be invented for
     /// these: the offset reaches a field, and its stride is not an element size.
     pub(crate) member_projected_accesses: HashSet<(u64, u32)>,
+    #[cfg(test)]
     pub(crate) certified_rendering_required: bool,
     #[cfg(test)]
     pub(crate) authorized_stack_owner_names: BTreeMap<i64, BTreeSet<String>>,
@@ -87,7 +91,9 @@ pub(crate) struct PreparedSemanticViewInputs<'a> {
     pub(crate) prepared: &'a SsaArtifact,
     #[cfg(test)]
     pub(crate) abi_arg_regs: &'a [String],
+    #[cfg(test)]
     pub(crate) stack_slots: &'a BTreeMap<StackSlotKey, ExternalStackSlotSpec>,
+    #[cfg(test)]
     pub(crate) visible_bindings: &'a [VisibleBinding],
     #[cfg(test)]
     pub(crate) param_register_aliases: &'a HashMap<String, String>,
@@ -144,6 +150,7 @@ impl<'a> PreparedSemanticViewInputs<'a> {
 }
 
 impl PreparedSemanticView {
+    #[cfg(test)]
     pub(crate) fn build(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, inputs: PreparedSemanticViewInputs<'_>) -> Self {
         Self::build_inner(symbols, inputs, None)
     }
@@ -171,12 +178,11 @@ impl PreparedSemanticView {
     ) -> Self {
         #[cfg(test)]
         let certified_rendering_required = inputs.certified_rendering_required;
-        #[cfg(not(test))]
-        let certified_rendering_required = false;
         let mut view = Self {
             binding_names,
             #[cfg(test)]
             param_alias_by_reg: inputs.param_register_aliases.clone(),
+            #[cfg(test)]
             certified_rendering_required,
             member_projected_accesses: inputs
                 .prepared
@@ -593,7 +599,7 @@ pub(crate) fn build_prepared_runtime_facts_with_control(
     let mut stack_info = StackInfo::default();
 
     seed_prepared_stack_facts(symbols, &mut use_info, &mut stack_info, prepared, view);
-    collect_prepared_runtime_facts(symbols, &mut use_info, &mut flag_info, blocks, env, prepared, view);
+    collect_prepared_runtime_facts(symbols, &mut use_info, &mut flag_info, blocks, prepared, view);
     #[cfg(test)]
     pin_prepared_loop_carried_phi_values(&mut use_info, prepared, view);
     populate_prepared_call_runtime_facts(
@@ -1774,7 +1780,7 @@ fn predicate_expr_for_operand_with_depth(
     var: &SSAVar,
     depth: u32,
 ) -> Option<CExpr> {
-    fn is_flag_name(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, name: &str) -> bool {
+    fn is_flag_name(name: &str) -> bool {
         let lower = name.to_ascii_lowercase();
         matches!(
             lower.split('_').next(),
@@ -1792,7 +1798,7 @@ fn predicate_expr_for_operand_with_depth(
     if var.is_const() {
         return Some(compare_const_to_expr(var));
     }
-    if is_flag_name(symbols, &var.name) {
+    if is_flag_name(&var.name) {
         if let Some(expr) = compare_def_expr_for_flag_operand(symbols, view, inputs, var, depth + 1) {
             return Some(expr);
         }
@@ -2256,20 +2262,13 @@ fn prepared_stack_owner_recovery_allowed(
             .is_some_and(|names| names.contains(&name.to_ascii_lowercase()))
 }
 
+#[cfg(test)]
 fn prepared_stack_owner_offset_authorized(view: &PreparedSemanticView, offset: i64) -> bool {
-    #[cfg(test)]
-    {
-        return !view.certified_rendering_required
-            || view
-                .authorized_stack_owner_names
-                .get(&offset)
-                .is_some_and(|names| !names.is_empty());
-    }
-    #[cfg(not(test))]
-    {
-        let _ = (view, offset);
-        false
-    }
+    !view.certified_rendering_required
+        || view
+            .authorized_stack_owner_names
+            .get(&offset)
+            .is_some_and(|names| !names.is_empty())
 }
 
 #[cfg(test)]
@@ -3261,7 +3260,6 @@ fn collect_prepared_runtime_facts(symbols: &std::cell::RefCell<crate::symbol::Sy
     use_info: &mut UseInfo,
     _flag_info: &mut FlagInfo,
     blocks: &[SSABlock],
-    env: &PassEnv<'_>,
     prepared: &SsaArtifact,
     view: &PreparedSemanticView,
 ) {

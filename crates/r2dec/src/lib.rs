@@ -76,7 +76,7 @@ use r2ssa::SSAOp;
 use r2ssa::cfg::BlockTerminator;
 use r2types::{
     CTypeLike, DecompileRouteFacts, DecompileRouteKind, FunctionFacts, FunctionTypeFacts,
-    StackSlotKey, TypeInference, TypeOracle, VisibleBinding, register_alias_names,
+    TypeInference, TypeOracle,
 };
 #[cfg(test)]
 use r2types::{
@@ -146,10 +146,7 @@ fn type_like_to_ctype(ty: &CTypeLike) -> CType {
     }
 }
 
-pub(crate) fn certified_loop_carrier_name(phi: r2ssa::ValueId) -> String {
-    format!("loop_value_{}", phi.0)
-}
-
+#[cfg(test)]
 pub(crate) fn certified_memory_result_name(access: r2ssa::StructuredAccessId) -> String {
     format!("memory_value_{}_{}", access.inst.0, access.ordinal)
 }
@@ -4324,7 +4321,9 @@ impl Decompiler {
                 prepared,
                 #[cfg(test)]
                 abi_arg_regs: &self.config.arg_regs,
+                #[cfg(test)]
                 stack_slots: &self.context.type_facts().stack_slots,
+                #[cfg(test)]
                 visible_bindings: &self.context.type_facts().visible_bindings,
                 #[cfg(test)]
                 param_register_aliases: &HashMap::new(),
@@ -4788,60 +4787,6 @@ pub(crate) fn collect_stmt_var_names(stmts: &[CStmt]) -> HashSet<crate::symbol::
         visit_stmt(stmt, &mut names);
     }
     names
-}
-
-fn parse_visible_stack_offset(
-    name: &str,
-    visible_bindings: &[VisibleBinding],
-    stack_slots: &std::collections::BTreeMap<StackSlotKey, r2types::ExternalStackSlotSpec>,
-    param_names: &HashSet<String>,
-) -> Option<i64> {
-    let lower = name.trim().to_ascii_lowercase();
-    if param_names.contains(&lower) {
-        return None;
-    }
-    if lower == "saved_fp" {
-        return Some(0);
-    }
-    if let Some(rest) = lower.strip_prefix("stack_") {
-        return i64::from_str_radix(rest, 16).ok();
-    }
-    if let Some(rest) = lower.strip_prefix("local_") {
-        return i64::from_str_radix(rest, 16).ok().map(|v| -v);
-    }
-    if let Some(rest) = lower.strip_prefix("arg_") {
-        return i64::from_str_radix(rest, 16).ok().map(|v| -v);
-    }
-    if let Some(rest) = lower.strip_prefix("var_") {
-        let trimmed = rest.strip_suffix('h').unwrap_or(rest);
-        if !trimmed.is_empty() && trimmed.chars().all(|ch| ch.is_ascii_hexdigit()) {
-            return i64::from_str_radix(trimmed, 16).ok().map(|v| -v);
-        }
-    }
-    visible_bindings
-        .iter()
-        .find(|binding| binding.name.eq_ignore_ascii_case(name))
-        .and_then(|binding| binding.stack_slot.as_ref().map(|slot| slot.offset))
-        .or_else(|| {
-            stack_slots
-                .iter()
-                .find(|(_, slot_spec)| slot_spec.name.eq_ignore_ascii_case(name))
-                .map(|(slot_key, _)| slot_key.offset)
-        })
-}
-
-fn collect_visible_stack_offsets(
-    names: &HashSet<String>,
-    visible_bindings: &[VisibleBinding],
-    stack_slots: &std::collections::BTreeMap<StackSlotKey, r2types::ExternalStackSlotSpec>,
-    param_names: &HashSet<String>,
-) -> HashSet<i64> {
-    names
-        .iter()
-        .filter_map(|name| {
-            parse_visible_stack_offset(name, visible_bindings, stack_slots, param_names)
-        })
-        .collect()
 }
 
 /// Replace a single-use SSA register carrier with the value it copied.
