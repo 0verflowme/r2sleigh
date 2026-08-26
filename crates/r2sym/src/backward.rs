@@ -2481,6 +2481,10 @@ fn adjust_bits<'ctx>(ctx: &'ctx Context, value: SymValue<'ctx>, bits: u32) -> Sy
 #[cfg(test)]
 mod tests {
     use r2il::{ArchSpec, R2ILBlock, R2ILOp, RegisterDef, SpaceId, Varnode};
+    use r2ssa::{
+        CanonicalStorageId, CanonicalStorageSpace, SourceAbiParameterSpec,
+        SourceFunctionInterface, SourceFunctionReturn,
+    };
     use z3::Context;
 
     use super::*;
@@ -2562,6 +2566,19 @@ mod tests {
         let mut arch = ArchSpec::new("x86-64");
         arch.addr_size = 8;
         arch.add_register(RegisterDef::new("RDI", 56, 8));
+        let rdi = CanonicalStorageId {
+            space: CanonicalStorageSpace::Register,
+            offset: 56,
+            size: 8,
+        };
+        let interface = SourceFunctionInterface::new_exact(
+            b"paired-symbolic-memory-input-v1".to_vec(),
+            "x86-64",
+            [SourceAbiParameterSpec::new(0, rdi)],
+            SourceFunctionReturn::Void,
+            [],
+        )
+        .expect("exact untyped RDI parameter interface");
         let mut branch = R2ILBlock::new(0x1000, 4);
         branch.push(R2ILOp::Load {
             dst: Varnode::unique(0x10, 4),
@@ -2585,8 +2602,12 @@ mod tests {
         true_exit.push(R2ILOp::Return {
             target: make_const(1, 8),
         });
-        let func =
-            SsaArtifact::for_symbolic(&[branch, false_exit, true_exit], Some(&arch)).expect("ssa");
+        let func = SsaArtifact::for_symbolic_with_interface(
+            &[branch, false_exit, true_exit],
+            Some(&arch),
+            interface,
+        )
+        .expect("ssa");
         let ctx = Context::thread_local();
         let mut state = SymState::new(&ctx, 0x1000);
         crate::runtime::seed_default_state_for_arch(&mut state, &func, Some(&arch));

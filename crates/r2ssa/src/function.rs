@@ -612,12 +612,38 @@ impl SsaArtifact {
     }
 
     pub fn for_symbolic(blocks: &[R2ILBlock], arch: Option<&ArchSpec>) -> Option<Self> {
+        Self::for_symbolic_with_interfaces(blocks, arch, None, Vec::new())
+    }
+
+    /// Build symbolic SSA with an explicit, revision-bound function interface.
+    pub fn for_symbolic_with_interface(
+        blocks: &[R2ILBlock],
+        arch: Option<&ArchSpec>,
+        function_interface: SourceFunctionInterface,
+    ) -> Option<Self> {
+        Self::for_symbolic_with_interfaces(blocks, arch, Some(function_interface), Vec::new())
+    }
+
+    /// Build symbolic SSA with exact function and callsite interfaces.
+    pub fn for_symbolic_with_interfaces(
+        blocks: &[R2ILBlock],
+        arch: Option<&ArchSpec>,
+        function_interface: Option<SourceFunctionInterface>,
+        call_site_interfaces: Vec<SourceCallSiteInterface>,
+    ) -> Option<Self> {
         let mut function = SSAFunction::from_blocks_raw(blocks, arch)?;
         function.refresh_decompile_prep_facts(arch);
         Some(Self::new_with_context(
             function,
             FunctionPrepareMode::Symbolic,
-            SourceMachineContext::from_blocks(blocks, arch),
+            SourceMachineContext::from_blocks_with_interfaces(
+                blocks,
+                arch,
+                function_interface,
+                SourceMachineRoles::default(),
+                None,
+                call_site_interfaces,
+            ),
         ))
     }
 

@@ -1352,6 +1352,14 @@ mod tests {
         let mut arch = ArchSpec::new("aarch64");
         arch.addr_size = 8;
         arch.add_register(RegisterDef::new("x0", 0x00, 8));
+        let interface = SourceFunctionInterface::new_exact(
+            b"disjoint-parameter-store-v1".to_vec(),
+            "aarch64",
+            [SourceAbiParameterSpec::new(0, register_storage(0x00, 8))],
+            SourceFunctionReturn::Void,
+            [],
+        )
+        .expect("exact untyped x0 parameter interface");
 
         let mut branch = r2il::R2ILBlock::new(0x1000, 4);
         branch.push(r2il::R2ILOp::Store {
@@ -1386,8 +1394,12 @@ mod tests {
         true_exit.push(r2il::R2ILOp::Return {
             target: Varnode::constant(1, 8),
         });
-        let artifact = SsaArtifact::for_symbolic(&[branch, false_exit, true_exit], Some(&arch))
-            .expect("memory branch fixture should build SSA");
+        let artifact = SsaArtifact::for_symbolic_with_interface(
+            &[branch, false_exit, true_exit],
+            Some(&arch),
+            interface,
+        )
+        .expect("memory branch fixture should build SSA");
         let ctx = Context::thread_local();
 
         let (observations, diagnostics) = collect_branch_observations_for_branch_blocks(

@@ -4,7 +4,10 @@
 //! with real SSA functions and Z3 constraint solving.
 
 use r2il::{ArchSpec, R2ILBlock, R2ILOp, RegisterDef, SpaceId, Varnode};
-use r2ssa::SsaArtifact;
+use r2ssa::{
+    CanonicalStorageId, CanonicalStorageSpace, SourceAbiParameterSpec, SourceFunctionInterface,
+    SourceFunctionReturn, SsaArtifact,
+};
 use r2sym::SymSolver;
 use r2sym::path::ExploreStrategy;
 use r2sym::sim::{
@@ -103,6 +106,29 @@ fn make_x86_64_arch() -> ArchSpec {
     arch.add_register(RegisterDef::new("RSI", RSI, 8));
     arch.add_register(RegisterDef::new("RDX", RDX, 8));
     arch
+}
+
+fn exact_x86_symbolic_interface(
+    revision: &str,
+    parameters: impl IntoIterator<Item = (u32, u64, u32)>,
+) -> SourceFunctionInterface {
+    SourceFunctionInterface::new_exact(
+        revision.as_bytes().to_vec(),
+        "x86-64",
+        parameters.into_iter().map(|(index, offset, size)| {
+            SourceAbiParameterSpec::new(
+                index,
+                CanonicalStorageId {
+                    space: CanonicalStorageSpace::Register,
+                    offset,
+                    size,
+                },
+            )
+        }),
+        SourceFunctionReturn::Void,
+        [],
+    )
+    .expect("coherent exact x86 symbolic interface")
 }
 
 // Simulated x86-64 register offsets
@@ -1033,6 +1059,7 @@ fn test_replay_seeded_query_solve_with_register_overlay() {
 #[test]
 fn test_query_compiles_bounded_indexed_memory_range() {
     let arch = make_x86_64_arch();
+    let interface = exact_x86_symbolic_interface("bounded-indexed-memory-v1", [(0, RDI, 8)]);
     let blocks = vec![
         R2ILBlock {
             addr: 0x1000,
@@ -1080,7 +1107,8 @@ fn test_query_compiles_bounded_indexed_memory_range() {
             op_metadata: Default::default(),
         },
     ];
-    let func = SsaArtifact::for_symbolic(&blocks, Some(&arch)).expect("ssa");
+    let func = SsaArtifact::for_symbolic_with_interface(&blocks, Some(&arch), interface)
+        .expect("ssa");
     let ctx = Context::thread_local();
 
     let mut state = SymState::new(&ctx, 0x1000);
@@ -2851,10 +2879,18 @@ fn derived_helper_summary_preserves_pointer_write_value() {
         ],
     }];
 
-    let root =
-        SsaArtifact::for_symbolic(&root_blocks, Some(&arch)).expect("root symbolic function");
-    let helper =
-        SsaArtifact::for_symbolic(&helper_blocks, Some(&arch)).expect("helper symbolic function");
+    let root = SsaArtifact::for_symbolic_with_interface(
+        &root_blocks,
+        Some(&arch),
+        exact_x86_symbolic_interface("pointer-write-value-v1", []),
+    )
+    .expect("root symbolic function");
+    let helper = SsaArtifact::for_symbolic_with_interface(
+        &helper_blocks,
+        Some(&arch),
+        exact_x86_symbolic_interface("pointer-write-value-v1", [(0, RDI, 8), (1, RSI, 8)]),
+    )
+    .expect("helper symbolic function");
     let root = Arc::new(root);
     let helper = Arc::new(helper);
     let scope = r2sym::PreparedFunctionScope::new(
@@ -2972,10 +3008,18 @@ fn derived_helper_summary_compiles_backward_memory_terms() {
         ],
     }];
 
-    let root =
-        SsaArtifact::for_symbolic(&root_blocks, Some(&arch)).expect("root symbolic function");
-    let helper =
-        SsaArtifact::for_symbolic(&helper_blocks, Some(&arch)).expect("helper symbolic function");
+    let root = SsaArtifact::for_symbolic_with_interface(
+        &root_blocks,
+        Some(&arch),
+        exact_x86_symbolic_interface("backward-memory-terms-v1", []),
+    )
+    .expect("root symbolic function");
+    let helper = SsaArtifact::for_symbolic_with_interface(
+        &helper_blocks,
+        Some(&arch),
+        exact_x86_symbolic_interface("backward-memory-terms-v1", [(0, RDI, 8), (1, RSI, 8)]),
+    )
+    .expect("helper symbolic function");
     let root = Arc::new(root);
     let helper = Arc::new(helper);
     let scope = r2sym::PreparedFunctionScope::new(
@@ -3065,6 +3109,7 @@ fn derived_helper_summary_compiles_backward_memory_terms() {
 #[test]
 fn derived_helper_summary_compiles_backward_memory_terms_through_cast_pointer() {
     let arch = make_x86_64_arch();
+    let interface = exact_x86_symbolic_interface("cast-pointer-memory-v1", [(0, RDI, 8)]);
     let cast_ptr = make_reg(0x90, 8);
     let loaded = make_reg(0x98, 1);
     let cond = make_reg(0xa0, 1);
@@ -3114,8 +3159,8 @@ fn derived_helper_summary_compiles_backward_memory_terms_through_cast_pointer() 
             }],
         },
     ];
-    let root =
-        SsaArtifact::for_symbolic(&root_blocks, Some(&arch)).expect("root symbolic function");
+    let root = SsaArtifact::for_symbolic_with_interface(&root_blocks, Some(&arch), interface)
+        .expect("root symbolic function");
     let ctx = Context::thread_local();
     let mut state = SymState::new(&ctx, 0x1000);
     state.make_symbolic("reg:56_0", 64);
@@ -3791,10 +3836,18 @@ fn derived_helper_summary_coalesces_adjacent_byte_writes_into_slice() {
         ],
     }];
 
-    let root =
-        SsaArtifact::for_symbolic(&root_blocks, Some(&arch)).expect("root symbolic function");
-    let helper =
-        SsaArtifact::for_symbolic(&helper_blocks, Some(&arch)).expect("helper symbolic function");
+    let root = SsaArtifact::for_symbolic_with_interface(
+        &root_blocks,
+        Some(&arch),
+        exact_x86_symbolic_interface("coalesced-byte-writes-v1", []),
+    )
+    .expect("root symbolic function");
+    let helper = SsaArtifact::for_symbolic_with_interface(
+        &helper_blocks,
+        Some(&arch),
+        exact_x86_symbolic_interface("coalesced-byte-writes-v1", [(0, RDI, 8), (1, RSI, 8)]),
+    )
+    .expect("helper symbolic function");
     let root = Arc::new(root);
     let helper = Arc::new(helper);
     let scope = r2sym::PreparedFunctionScope::new(
@@ -3951,10 +4004,18 @@ fn derived_helper_summary_compiles_backward_memory_slice_at_offset() {
         ],
     }];
 
-    let root =
-        SsaArtifact::for_symbolic(&root_blocks, Some(&arch)).expect("root symbolic function");
-    let helper =
-        SsaArtifact::for_symbolic(&helper_blocks, Some(&arch)).expect("helper symbolic function");
+    let root = SsaArtifact::for_symbolic_with_interface(
+        &root_blocks,
+        Some(&arch),
+        exact_x86_symbolic_interface("memory-slice-offset-v1", []),
+    )
+    .expect("root symbolic function");
+    let helper = SsaArtifact::for_symbolic_with_interface(
+        &helper_blocks,
+        Some(&arch),
+        exact_x86_symbolic_interface("memory-slice-offset-v1", [(0, RDI, 8), (1, RSI, 8)]),
+    )
+    .expect("helper symbolic function");
     let root = Arc::new(root);
     let helper = Arc::new(helper);
     let scope = r2sym::PreparedFunctionScope::new(
@@ -4120,10 +4181,18 @@ fn derived_helper_summary_compiles_backward_memory_slice_via_ptradd() {
         ],
     }];
 
-    let root =
-        SsaArtifact::for_symbolic(&root_blocks, Some(&arch)).expect("root symbolic function");
-    let helper =
-        SsaArtifact::for_symbolic(&helper_blocks, Some(&arch)).expect("helper symbolic function");
+    let root = SsaArtifact::for_symbolic_with_interface(
+        &root_blocks,
+        Some(&arch),
+        exact_x86_symbolic_interface("memory-slice-ptradd-v1", []),
+    )
+    .expect("root symbolic function");
+    let helper = SsaArtifact::for_symbolic_with_interface(
+        &helper_blocks,
+        Some(&arch),
+        exact_x86_symbolic_interface("memory-slice-ptradd-v1", [(0, RDI, 8), (1, RSI, 8)]),
+    )
+    .expect("helper symbolic function");
     let root = Arc::new(root);
     let helper = Arc::new(helper);
     let scope = r2sym::PreparedFunctionScope::new(
@@ -4271,10 +4340,18 @@ fn derived_helper_summary_preserves_negative_pointer_write_value() {
         ],
     }];
 
-    let root =
-        SsaArtifact::for_symbolic(&root_blocks, Some(&arch)).expect("root symbolic function");
-    let helper =
-        SsaArtifact::for_symbolic(&helper_blocks, Some(&arch)).expect("helper symbolic function");
+    let root = SsaArtifact::for_symbolic_with_interface(
+        &root_blocks,
+        Some(&arch),
+        exact_x86_symbolic_interface("negative-pointer-write-v1", []),
+    )
+    .expect("root symbolic function");
+    let helper = SsaArtifact::for_symbolic_with_interface(
+        &helper_blocks,
+        Some(&arch),
+        exact_x86_symbolic_interface("negative-pointer-write-v1", [(0, RDI, 8), (1, RSI, 8)]),
+    )
+    .expect("helper symbolic function");
     let root = Arc::new(root);
     let helper = Arc::new(helper);
     let scope = r2sym::PreparedFunctionScope::new(
@@ -4452,10 +4529,18 @@ fn derived_helper_summary_compiles_backward_memory_slice_via_ptrsub() {
         ],
     }];
 
-    let root =
-        SsaArtifact::for_symbolic(&root_blocks, Some(&arch)).expect("root symbolic function");
-    let helper =
-        SsaArtifact::for_symbolic(&helper_blocks, Some(&arch)).expect("helper symbolic function");
+    let root = SsaArtifact::for_symbolic_with_interface(
+        &root_blocks,
+        Some(&arch),
+        exact_x86_symbolic_interface("memory-slice-ptrsub-v1", []),
+    )
+    .expect("root symbolic function");
+    let helper = SsaArtifact::for_symbolic_with_interface(
+        &helper_blocks,
+        Some(&arch),
+        exact_x86_symbolic_interface("memory-slice-ptrsub-v1", [(0, RDI, 8), (1, RSI, 8)]),
+    )
+    .expect("helper symbolic function");
     let root = Arc::new(root);
     let helper = Arc::new(helper);
     let scope = r2sym::PreparedFunctionScope::new(
