@@ -203,6 +203,10 @@ impl MachineValueUse {
             .graph()
             .inst(site.inst)
             .ok_or(MachineBuildError::MissingUseDisposition(site))?;
+        let used_value = *inst
+            .inputs
+            .get(site.input_idx)
+            .ok_or(MachineBuildError::MissingUseDisposition(site))?;
         let is_memory_address = site.input_idx == 0
             && matches!(
                 &inst.payload,
@@ -211,16 +215,12 @@ impl MachineValueUse {
         if !is_memory_address {
             return Ok(None);
         }
-        let address = *inst
-            .inputs
-            .get(site.input_idx)
-            .ok_or(MachineBuildError::MissingUseDisposition(site))?;
         let access = StructuredAccessId {
             inst: site.inst,
             ordinal: 0,
         };
         let projected = Self::memory_address_for_access(artifact, access)?;
-        if projected.binding().value() != address || projected.memory_access() != Some(access) {
+        if projected.binding().value() != used_value || projected.memory_access() != Some(access) {
             return Err(MachineBuildError::UseDispositionMismatch(site));
         }
         Ok(Some(projected))
