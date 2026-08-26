@@ -2802,6 +2802,7 @@ mod tests {
         arch.add_register(RegisterDef::new("r8", 24, 8));
         arch.add_register(RegisterDef::new("r9", 32, 8));
         arch.add_register(RegisterDef::new("rip", 40, 8));
+        arch.add_register(RegisterDef::new("rsp", 48, 8));
         arch
     }
 
@@ -3000,6 +3001,97 @@ mod tests {
             switch_info: None,
             op_metadata: Default::default(),
         }
+    }
+
+    fn register_storage(offset: u64) -> crate::CanonicalStorageId {
+        crate::CanonicalStorageId {
+            space: crate::CanonicalStorageSpace::Register,
+            offset,
+            size: 8,
+        }
+    }
+
+    /// Build an untyped fixture whose ABI and call carriers still come from
+    /// exact source-owned storage identities. Interproc tests must not recover
+    /// those facts from register or calling-convention names.
+    fn exact_untyped_artifact(
+        blocks: &[R2ILBlock],
+        arch: &ArchSpec,
+        revision: &[u8],
+        calling_convention: &str,
+        parameter_offsets: &[u64],
+        return_address_offset: u64,
+        stack_pointer_offset: u64,
+    ) -> SsaArtifact {
+        let parameters = parameter_offsets
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(index, offset)| {
+                crate::SourceAbiParameterSpec::new(index as u32, register_storage(offset))
+            })
+            .collect::<Vec<_>>();
+        let function_interface = crate::SourceFunctionInterface::new_exact(
+            revision.to_vec(),
+            calling_convention,
+            parameters,
+            crate::SourceFunctionReturn::Void,
+            [],
+        )
+        .and_then(|interface| {
+            interface.with_return_address_storage(register_storage(return_address_offset))
+        })
+        .and_then(|interface| {
+            interface.with_stack_pointer_storage(register_storage(stack_pointer_offset))
+        })
+        .expect("exact untyped function interface");
+        let call_arguments = || {
+            parameter_offsets
+                .iter()
+                .copied()
+                .enumerate()
+                .map(|(index, offset)| {
+                    crate::SourceCallArgumentSpec::new(index as u32, register_storage(offset))
+                })
+                .collect::<Vec<_>>()
+        };
+        let call_site_interfaces = blocks
+            .iter()
+            .flat_map(|block| {
+                block
+                    .ops
+                    .iter()
+                    .enumerate()
+                    .filter_map(move |(op_index, op)| match op {
+                        R2ILOp::Call { target } | R2ILOp::CallInd { target } => Some(
+                            crate::SourceCallSiteInterface::new(
+                                revision.to_vec(),
+                                crate::SourceCallSiteIdentity::new(
+                                    block.addr,
+                                    op_index,
+                                    crate::CanonicalStorageId::from_varnode(target),
+                                ),
+                                true,
+                                calling_convention,
+                                call_arguments(),
+                                false,
+                                false,
+                                crate::SourceCallResult::Void,
+                            )
+                            .expect("exact untyped callsite interface"),
+                        ),
+                        _ => None,
+                    })
+            })
+            .collect();
+
+        SsaArtifact::for_decompile_with_interfaces(
+            blocks,
+            Some(arch),
+            Some(function_interface),
+            call_site_interfaces,
+        )
+        .expect("exact untyped SSA artifact")
     }
 
     fn prepared_owner(addr: u64, arch: &ArchSpec) -> Arc<SsaArtifact> {
@@ -4054,7 +4146,15 @@ mod tests {
                 R2ILOp::Return { target: c(0, 4) },
             ],
         );
-        let prepared = SsaArtifact::for_decompile(&[blk], Some(&arch)).expect("ssa");
+        let prepared = exact_untyped_artifact(
+            &[blk],
+            &arch,
+            b"direct-pointer-load",
+            "sysv64",
+            &[8],
+            16,
+            24,
+        );
         let set = solve_interproc_summary_set(
             &[InterprocFunctionInput {
                 id: InterprocFunctionId(0x4000),
@@ -4186,7 +4286,8 @@ mod tests {
                 R2ILOp::Return { target: reg(16, 8) },
             ],
         );
-        let prepared = SsaArtifact::for_decompile(&[blk], Some(&arch)).expect("ssa");
+        let prepared =
+            exact_untyped_artifact(&[blk], &arch, b"store-conditional", "sysv64", &[8], 16, 24);
         let set = solve_interproc_summary_set(
             &[InterprocFunctionInput {
                 id: InterprocFunctionId(0x4100),
@@ -4257,7 +4358,7 @@ mod tests {
                 R2ILOp::Return { target: reg(16, 8) },
             ],
         );
-        let prepared = SsaArtifact::for_decompile(&[blk], Some(&arch)).expect("ssa");
+        let prepared = exact_untyped_artifact(&[blk], &arch, b"atomic-cas", "sysv64", &[8], 16, 24);
         let set = solve_interproc_summary_set(
             &[InterprocFunctionInput {
                 id: InterprocFunctionId(0x4200),
@@ -4314,27 +4415,32 @@ mod tests {
     #[test]
     fn symbolic_store_plus_constant_preserves_arg_offset_range() {
         let arch = x86_64_arch();
-        let prepared = SsaArtifact::for_symbolic(
-            &[block(
-                0x4300,
-                vec![
-                    R2ILOp::IntAdd {
-                        dst: reg(0x80, 8),
-                        a: reg(8, 8),
-                        b: c(2, 8),
-                    },
-                    R2ILOp::Store {
-                        addr: reg(0x80, 8),
-                        val: reg(16, 2),
-                        space: SpaceId::Ram,
-                    },
-                    R2ILOp::Return { target: c(0, 8) },
-                ],
-            )],
-            Some(&arch),
-        )
-        .expect("ssa");
-        let abi = AbiProfile::from_arch(Some(&arch));
+        let blocks = [block(
+            0x4300,
+            vec![
+                R2ILOp::IntAdd {
+                    dst: reg(0x80, 8),
+                    a: reg(8, 8),
+                    b: c(2, 8),
+                },
+                R2ILOp::Store {
+                    addr: reg(0x80, 8),
+                    val: reg(16, 2),
+                    space: SpaceId::Ram,
+                },
+                R2ILOp::Return { target: c(0, 8) },
+            ],
+        )];
+        let prepared = exact_untyped_artifact(
+            &blocks,
+            &arch,
+            b"symbolic-store-plus",
+            "sysv64",
+            &[8],
+            16,
+            24,
+        );
+        let abi = prepared.abi().expect("exact ABI");
         let block = prepared.function().get_block(0x4300).expect("block");
         let SSAOp::Store { addr, val, .. } = &block.ops[1] else {
             panic!("expected store");
@@ -4410,27 +4516,32 @@ mod tests {
     #[test]
     fn symbolic_store_minus_constant_preserves_arg_offset_range() {
         let arch = x86_64_arch();
-        let prepared = SsaArtifact::for_symbolic(
-            &[block(
-                0x4310,
-                vec![
-                    R2ILOp::IntSub {
-                        dst: reg(0x80, 8),
-                        a: reg(8, 8),
-                        b: c(1, 8),
-                    },
-                    R2ILOp::Store {
-                        addr: reg(0x80, 8),
-                        val: reg(16, 1),
-                        space: SpaceId::Ram,
-                    },
-                    R2ILOp::Return { target: c(0, 8) },
-                ],
-            )],
-            Some(&arch),
-        )
-        .expect("ssa");
-        let abi = AbiProfile::from_arch(Some(&arch));
+        let blocks = [block(
+            0x4310,
+            vec![
+                R2ILOp::IntSub {
+                    dst: reg(0x80, 8),
+                    a: reg(8, 8),
+                    b: c(1, 8),
+                },
+                R2ILOp::Store {
+                    addr: reg(0x80, 8),
+                    val: reg(16, 1),
+                    space: SpaceId::Ram,
+                },
+                R2ILOp::Return { target: c(0, 8) },
+            ],
+        )];
+        let prepared = exact_untyped_artifact(
+            &blocks,
+            &arch,
+            b"symbolic-store-minus",
+            "sysv64",
+            &[8],
+            16,
+            24,
+        );
+        let abi = prepared.abi().expect("exact ABI");
         let block = prepared.function().get_block(0x4310).expect("block");
         let SSAOp::Store { addr, val, .. } = &block.ops[1] else {
             panic!("expected store");
@@ -4506,29 +4617,35 @@ mod tests {
     #[test]
     fn windows_x64_call_arg_observer_tracks_registration_handler_constant() {
         let arch = windows_x64_arch();
-        let prepared = SsaArtifact::for_symbolic(
-            &[block(
-                0x5000,
-                vec![
-                    R2ILOp::Copy {
-                        dst: reg(8, 8),
-                        src: c(1, 8),
-                    },
-                    R2ILOp::Copy {
-                        dst: reg(16, 8),
-                        src: c(0x1400_3d0f, 8),
-                    },
-                    R2ILOp::Call {
-                        target: c(0x1800_1000, 8),
-                    },
-                    R2ILOp::Return { target: c(0, 8) },
-                ],
-            )],
-            Some(&arch),
-        )
-        .expect("ssa");
+        let blocks = [block(
+            0x5000,
+            vec![
+                R2ILOp::Copy {
+                    dst: reg(8, 8),
+                    src: c(1, 8),
+                },
+                R2ILOp::Copy {
+                    dst: reg(16, 8),
+                    src: c(0x1400_3d0f, 8),
+                },
+                R2ILOp::Call {
+                    target: c(0x1800_1000, 8),
+                },
+                R2ILOp::Return { target: c(0, 8) },
+            ],
+        )];
+        let prepared = exact_untyped_artifact(
+            &blocks,
+            &arch,
+            b"windows-handler-call",
+            "windows-x64",
+            &[8, 16, 24, 32],
+            40,
+            48,
+        );
 
-        let observations = observe_call_arguments(&prepared, &AbiProfile::windows_x64());
+        let observations =
+            observe_call_arguments(&prepared, &prepared.abi().expect("exact Windows ABI"));
         let call_id = prepared
             .call_sites()
             .by_id
@@ -4544,28 +4661,34 @@ mod tests {
     #[test]
     fn call_arg_observer_does_not_reuse_pre_call_carriers_after_call() {
         let arch = windows_x64_arch();
-        let prepared = SsaArtifact::for_symbolic(
-            &[block(
-                0x6000,
-                vec![
-                    R2ILOp::Copy {
-                        dst: reg(8, 8),
-                        src: c(7, 8),
-                    },
-                    R2ILOp::Call {
-                        target: c(0x7000, 8),
-                    },
-                    R2ILOp::Call {
-                        target: c(0x8000, 8),
-                    },
-                    R2ILOp::Return { target: c(0, 8) },
-                ],
-            )],
-            Some(&arch),
-        )
-        .expect("ssa");
+        let blocks = [block(
+            0x6000,
+            vec![
+                R2ILOp::Copy {
+                    dst: reg(8, 8),
+                    src: c(7, 8),
+                },
+                R2ILOp::Call {
+                    target: c(0x7000, 8),
+                },
+                R2ILOp::Call {
+                    target: c(0x8000, 8),
+                },
+                R2ILOp::Return { target: c(0, 8) },
+            ],
+        )];
+        let prepared = exact_untyped_artifact(
+            &blocks,
+            &arch,
+            b"windows-two-call-carriers",
+            "windows-x64",
+            &[8, 16, 24, 32],
+            40,
+            48,
+        );
 
-        let observations = observe_call_arguments(&prepared, &AbiProfile::windows_x64());
+        let observations =
+            observe_call_arguments(&prepared, &prepared.abi().expect("exact Windows ABI"));
         let mut calls = prepared
             .call_sites()
             .by_id
@@ -4695,22 +4818,28 @@ mod tests {
     #[test]
     fn callother_maps_explicit_argument_and_unknown_escape() {
         let arch = x86_64_arch();
-        let prepared = SsaArtifact::for_symbolic(
-            &[block(
-                0x69a0,
-                vec![
-                    R2ILOp::CallOther {
-                        output: None,
-                        userop: 11,
-                        inputs: vec![reg(8, 8)],
-                    },
-                    R2ILOp::Return { target: c(0, 8) },
-                ],
-            )],
-            Some(&arch),
-        )
-        .expect("callother SSA");
-        let local = collect_local_summary_facts(&prepared, &AbiProfile::from_arch(Some(&arch)));
+        let blocks = [block(
+            0x69a0,
+            vec![
+                R2ILOp::CallOther {
+                    output: None,
+                    userop: 11,
+                    inputs: vec![reg(8, 8)],
+                },
+                R2ILOp::Return { target: c(0, 8) },
+            ],
+        )];
+        let prepared = exact_untyped_artifact(
+            &blocks,
+            &arch,
+            b"callother-explicit-argument",
+            "sysv64",
+            &[8],
+            16,
+            24,
+        );
+        let local =
+            collect_local_summary_facts(&prepared, &prepared.abi().expect("exact SysV ABI"));
 
         assert_eq!(
             local.arg_effects.get(&0),

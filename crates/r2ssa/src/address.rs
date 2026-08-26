@@ -531,6 +531,29 @@ mod tests {
         arch
     }
 
+    fn exact_parameter_interface(
+        revision: &[u8],
+        parameter_count: usize,
+    ) -> SourceFunctionInterface {
+        SourceFunctionInterface::new_exact(
+            revision.to_vec(),
+            "aarch64-test",
+            (0..parameter_count).map(|index| {
+                SourceAbiParameterSpec::new(
+                    index as u32,
+                    CanonicalStorageId {
+                        space: CanonicalStorageSpace::Register,
+                        offset: (index as u64) * 8,
+                        size: 8,
+                    },
+                )
+            }),
+            SourceFunctionReturn::Void,
+            [],
+        )
+        .expect("valid exact parameter interface")
+    }
+
     #[test]
     fn context_free_parameter_spill_does_not_invent_a_stack_root() {
         let arch = aarch64_two_arg_arch();
@@ -895,7 +918,12 @@ mod tests {
             space: SpaceId::Ram,
             addr: Varnode::unique(0x40, 8),
         });
-        let artifact = SsaArtifact::for_symbolic(&[block], Some(&arch)).expect("artifact");
+        let artifact = SsaArtifact::for_decompile_with_interface(
+            &[block],
+            Some(&arch),
+            exact_parameter_interface(b"affine-field-ranges", 2),
+        )
+        .expect("source-bound artifact");
         let (load_index, _) = artifact
             .get_block(0x1000)
             .expect("block")
@@ -937,7 +965,12 @@ mod tests {
             space: SpaceId::Ram,
             addr: Varnode::register(8, 8),
         });
-        let artifact = SsaArtifact::for_symbolic(&[block], Some(&arch)).expect("artifact");
+        let artifact = SsaArtifact::for_decompile_with_interface(
+            &[block],
+            Some(&arch),
+            exact_parameter_interface(b"distinct-parameter-bases", 2),
+        )
+        .expect("source-bound artifact");
         let block = artifact.get_block(0x1000).expect("block");
         let store_index = block
             .ops

@@ -1978,7 +1978,7 @@ mod tests {
     }
 
     #[test]
-    fn indirect_call_and_revision_mismatch_interfaces_fail_closed() {
+    fn indirect_call_uses_exact_interface_while_revision_mismatch_fails_closed() {
         let target = Varnode::register(8, 8);
         let mut indirect_block = R2ILBlock::new(0x3100, 4);
         indirect_block.push(R2ILOp::CallInd {
@@ -2009,9 +2009,11 @@ mod tests {
         assert!(indirect_call.call_site.eq(&crate::semantic::CallSiteId(0)));
         assert_eq!(
             indirect.facts().call_sites.by_id[&crate::semantic::CallSiteId(0)].raw_identity,
-            None
+            Some(direct_call_identity(0x3100, 0, &target))
         );
-        assert!(!indirect_call.complete);
+        assert!(indirect_call.complete);
+        assert!(indirect_call.arguments.is_empty());
+        assert_eq!(indirect_call.result_kind, Some(SourceCallResult::Void));
 
         let direct_target = Varnode::ram(0x4400, 8);
         let mut direct_block = R2ILBlock::new(0x3140, 4);
@@ -2092,7 +2094,7 @@ mod tests {
     }
 
     #[test]
-    fn synthetic_interface_without_typed_machine_roles_is_refused() {
+    fn untyped_interface_keeps_exact_parameter_but_refuses_incomplete_return_roles() {
         let mut block = R2ILBlock::new(0x3140, 4);
         block.push(R2ILOp::Copy {
             dst: Varnode::unique(0x10, 8),
@@ -2136,7 +2138,15 @@ mod tests {
             .values()
             .next()
             .expect("return boundary");
-        assert!(artifact.facts().boundaries.parameters.is_empty());
+        let parameter = artifact
+            .facts()
+            .boundaries
+            .parameters
+            .get(&0)
+            .expect("exact ABI parameter identity");
+        assert_eq!(parameter.abi_storage, parameter_storage);
+        assert_eq!(parameter.graph_storage, parameter_storage);
+        assert_eq!(parameter.logical_value, None);
         assert!(!returned.complete);
         assert!(returned.values.is_empty());
         let producer = artifact

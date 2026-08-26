@@ -21127,8 +21127,25 @@ mod tests {
             space: r2il::SpaceId::Custom(7),
             addr: r2il::Varnode::unique(2, 8),
         });
-        let prepared = r2ssa::SsaArtifact::for_decompile(&[block], Some(&arch))
-            .expect("prepared indexed load");
+        let register_storage = |offset| r2ssa::CanonicalStorageId {
+            space: r2ssa::CanonicalStorageSpace::Register,
+            offset,
+            size: 8,
+        };
+        let interface = r2ssa::SourceFunctionInterface::new_exact(
+            b"prepared-indexed-access-fixture".to_vec(),
+            "sysv64",
+            [
+                r2ssa::SourceAbiParameterSpec::new(0, register_storage(0x10)),
+                r2ssa::SourceAbiParameterSpec::new(1, register_storage(0x18)),
+            ],
+            r2ssa::SourceFunctionReturn::Void,
+            [],
+        )
+        .expect("exact indexed-access interface");
+        let prepared =
+            r2ssa::SsaArtifact::for_decompile_with_interface(&[block], Some(&arch), interface)
+                .expect("prepared indexed load");
         let address = prepared
             .memory_certificate_for_op_site(0x401000, 2, false)
             .expect("memory certificate");

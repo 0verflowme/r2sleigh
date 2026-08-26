@@ -509,7 +509,9 @@ pub(crate) fn recover_signature_params_from_prepared_ssa(
     prepared_formal_parameters(prepared)
         .into_iter()
         .map(|(index, var)| {
-            let initial_ty = if source_parameter_is_logical_pointer(prepared, index, ptr_bits) {
+            let initial_ty = if source_parameter_is_logical_pointer(prepared, index, ptr_bits)
+                || source_parameter_has_certified_memory_use(prepared, index)
+            {
                 crate::CTypeLike::Pointer(Box::new(crate::CTypeLike::Void))
             } else {
                 size_to_neutral_int_type_like(var.size)
@@ -537,7 +539,7 @@ fn source_parameter_is_logical_pointer(
     ptr_bits: u32,
 ) -> bool {
     let context = prepared.machine_context();
-    if !context.abi_model().is_available() || !context.abi_model().is_coherent() {
+    if !context.abi_model().is_available() {
         return false;
     }
     let Some(interface) = context.function_interface() else {
@@ -549,13 +551,18 @@ fn source_parameter_is_logical_pointer(
     else {
         return false;
     };
-    let Some(parameter) = interface.parameters().get(index) else {
+    let Some(parameter) = prepared
+        .facts()
+        .boundaries
+        .parameters
+        .get(&u32::try_from(index).unwrap_or(u32::MAX))
+    else {
         return false;
     };
-    if parameter.index() as usize != index {
+    if parameter.index as usize != index {
         return false;
     }
-    let Some(logical_value) = interface.parameter_logical_values().get(index) else {
+    let Some(logical_value) = parameter.logical_value else {
         return false;
     };
     graph
@@ -563,6 +570,26 @@ fn source_parameter_is_logical_pointer(
         .get(logical_value.type_id() as usize)
         .is_some_and(|source_type| {
             matches!(source_type.kind(), r2ssa::SourceTypeKind::Pointer { .. })
+        })
+}
+
+fn source_parameter_has_certified_memory_use(prepared: &r2ssa::SsaArtifact, index: usize) -> bool {
+    prepared
+        .certificates()
+        .memory_accesses
+        .values()
+        .filter(|access| {
+            access.space == r2il::SpaceId::Ram
+                && prepared
+                    .machine_context()
+                    .memory_space_at(access.block_addr, access.op_index)
+                    == Some(access.space)
+        })
+        .any(|access| {
+            prepared
+                .addresses()
+                .parameter_expression(access.address)
+                .is_some_and(|address| address.parameter == index)
         })
 }
 

@@ -13,7 +13,6 @@ use r2sleigh_lift::{GenuineLiftedFunction, GenuineLiftedFunctionAuthority, Trust
 use r2source::OwnedFunctionSnapshot;
 use serde::{Deserialize, Serialize};
 
-use crate::{AssumptionSet, CanonicalStorageId, CanonicalStorageSpace};
 use crate::aggregate_access::{
     AggregateAccessProjectionFacts, collect_aggregate_access_projections,
 };
@@ -26,12 +25,12 @@ use crate::defuse::{BackwardSlice, SliceOpRef, backward_slice_from_op, backward_
 use crate::domtree::DomTree;
 use crate::graph::SsaGraph;
 use crate::integrity::{SsaIntegrityError, validate_ssa_function};
+#[cfg(test)]
+use crate::machine_context::{SourceCallArgumentSpec, SourceCallResult};
 use crate::machine_context::{
     SourceCallSiteIdentity, SourceCallSiteInterface, SourceFunctionInterface, SourceMachineContext,
     SourceMachineRoles,
 };
-#[cfg(test)]
-use crate::machine_context::{SourceCallArgumentSpec, SourceCallResult};
 use crate::naming::{ARCH_DERIVED_CACHE_MAX_ENTRIES, ArchCacheTag, cached_register_name_map};
 use crate::op::SSAOp;
 use crate::phi::{PhiPlacement, collect_defs_from_cfg_with_names_storage_and_control};
@@ -46,6 +45,7 @@ use crate::semantic::{
 };
 use crate::span::StorageSpans;
 use crate::var::{SSAVar, SSAVarNameKind};
+use crate::{AssumptionSet, CanonicalStorageId, CanonicalStorageSpace};
 
 /// Switch case information: Vec of (case_value, target_address) pairs and optional default target.
 pub type SwitchInfo = (Vec<(u64, u64)>, Option<u64>);
@@ -292,10 +292,8 @@ impl SsaArtifact {
         validate_ssa_function(&function).map_err(|_| SsaPrepareError::MalformedInput)?;
         machine_context.remap_memory_sites_to_prepared(&function);
         let graph = SsaGraph::from_function_with_storage(&function);
-        let formal_parameters = crate::semantic::collect_source_formal_parameter_facts(
-            &graph,
-            &machine_context,
-        );
+        let formal_parameters =
+            crate::semantic::collect_source_formal_parameter_facts(&graph, &machine_context);
         function.install_exact_formal_parameters(&graph, &formal_parameters);
         let storage_spans = StorageSpans::compute(&function, &graph);
         let return_storages = machine_context
@@ -304,11 +302,8 @@ impl SsaArtifact {
             .iter()
             .map(|slot| slot.storage())
             .collect::<Vec<_>>();
-        let live_out = crate::liveout::FunctionLiveOut::compute(
-            &function,
-            &graph,
-            &return_storages,
-        );
+        let live_out =
+            crate::liveout::FunctionLiveOut::compute(&function, &graph, &return_storages);
         let unobserved_merges = crate::deadphi::DeadPhis::find(&function, &graph, &live_out);
         control.poll()?;
         let facts = PreparedFunctionFacts::collect_with_context(
@@ -1280,10 +1275,7 @@ impl TrustedSsaArtifact {
     /// range of each index comes from the branches that had to be taken to
     /// reach the call. Both are needed, and only here are both in hand.
     pub fn proven_facts(&self) -> crate::proven::ProvenFacts {
-        crate::proven::prove(
-            self.artifact(),
-            self.source().image().code_pointer_tables(),
-        )
+        crate::proven::prove(self.artifact(), self.source().image().code_pointer_tables())
     }
 
     pub fn source(&self) -> &OwnedFunctionSnapshot {
@@ -2769,8 +2761,7 @@ impl SSAFunction {
             }
             prep.formal_parameters.insert(value.var.clone(), index);
             if parameter.graph_storage == parameter.abi_storage {
-                prep.formal_parameter_bases
-                    .insert(value.var.clone(), index);
+                prep.formal_parameter_bases.insert(value.var.clone(), index);
             }
         }
     }
@@ -4428,7 +4419,9 @@ fn kill_overlapping_family_roots(state: &mut FamilyRootState, written: RegisterF
             if width == 0 {
                 return;
             }
-            let Some(shift) = start.checked_sub(slot.offset).and_then(|s| u32::try_from(s).ok())
+            let Some(shift) = start
+                .checked_sub(slot.offset)
+                .and_then(|s| u32::try_from(s).ok())
             else {
                 return;
             };
@@ -6805,6 +6798,11 @@ mod tests {
             op_metadata: Default::default(),
         }];
 
+        let argument_storage = CanonicalStorageId {
+            space: CanonicalStorageSpace::Register,
+            offset: 0,
+            size: 8,
+        };
         let call_interface = SourceCallSiteInterface::new(
             b"renamed-register-call-args".to_vec(),
             SourceCallSiteIdentity::new(
@@ -6818,14 +6816,7 @@ mod tests {
             ),
             true,
             "aapcs64",
-            [SourceCallArgumentSpec::new(
-                0,
-                CanonicalStorageId {
-                    space: CanonicalStorageSpace::Register,
-                    offset: 0,
-                    size: 8,
-                },
-            )],
+            [SourceCallArgumentSpec::new(0, argument_storage)],
             false,
             false,
             SourceCallResult::Void,
@@ -6844,27 +6835,39 @@ mod tests {
         assert_eq!(call.block_addr, 0x1600);
         assert_eq!(call.op_index, 2);
         assert_eq!(call.argument_values.len(), 1);
-        let arg = prepared
-            .value_var(call.argument_values[0])
-            .expect("arg value");
-        assert!(arg.is_const());
+        let arg_value = call.argument_values[0];
+        let arg = prepared.graph().value(arg_value).expect("arg value");
+        assert_eq!(arg.canonical_storage, Some(argument_storage));
+        let arg_source = prepared
+            .graph()
+            .def_inst(arg_value)
+            .expect("register argument producer");
+        let producer = prepared
+            .graph()
+            .inst(arg_source)
+            .expect("argument producer");
+        assert!(matches!(
+            producer.payload,
+            crate::graph::InstPayload::Op(SSAOp::Copy { .. })
+        ));
+        let [input] = producer.inputs.as_slice() else {
+            panic!("register argument copy must have one exact input");
+        };
+        assert!(
+            prepared
+                .graph()
+                .value(*input)
+                .is_some_and(|value| value.var.constant_bits() == Some(7))
+        );
         assert_eq!(call.argument_certificates.len(), 1);
         let typed_arg = &call.argument_certificates[0];
         assert_eq!(typed_arg.index, 0);
-        assert_eq!(typed_arg.value, call.argument_values[0]);
-        assert!(
-            typed_arg.source_inst.is_some(),
-            "register call argument proof must identify the producer instruction"
-        );
+        assert_eq!(typed_arg.value, arg_value);
+        assert_eq!(typed_arg.source_inst, Some(arg_source));
         match &typed_arg.location {
-            CallArgumentLocation::Register { storage } => assert_eq!(
-                *storage,
-                CanonicalStorageId {
-                    space: CanonicalStorageSpace::Register,
-                    offset: 0,
-                    size: 8,
-                }
-            ),
+            CallArgumentLocation::Register { storage } => {
+                assert_eq!(*storage, argument_storage)
+            }
             CallArgumentLocation::Stack { .. } => {
                 panic!("register argument should not be certified as stack")
             }
@@ -6902,7 +6905,7 @@ mod tests {
                     .iter()
                     .enumerate()
                     .find_map(|(op_idx, op)| match op {
-                        SSAOp::CallDefine { dst } if dst.name == "x0" => Some((op_idx, dst)),
+                        SSAOp::CallDefine { dst } => Some((op_idx, dst)),
                         _ => None,
                     })
             })
@@ -7878,17 +7881,19 @@ mod tests {
         let init_value = prepared.graph().value_id_for_var(&init).unwrap();
         let update_value = prepared.graph().value_id_for_var(&update).unwrap();
         let result_value = prepared.graph().value_id_for_var(&result).unwrap();
-        let chained_result_value = prepared
-            .graph()
-            .value_id_for_var(&chained_result)
-            .unwrap();
+        let chained_result_value = prepared.graph().value_id_for_var(&chained_result).unwrap();
         let phi_inst = prepared.graph().def_inst(phi_value).unwrap();
         let result_inst = prepared.graph().def_inst(result_value).unwrap();
         let loop_fact = prepared
             .structured()
             .loops
             .values()
-            .find(|loop_fact| loop_fact.carriers.iter().any(|carrier| carrier.phi == phi_value))
+            .find(|loop_fact| {
+                loop_fact
+                    .carriers
+                    .iter()
+                    .any(|carrier| carrier.phi == phi_value)
+            })
             .expect("structured loop fact");
         let carrier = loop_fact
             .carriers
@@ -8265,10 +8270,12 @@ mod tests {
             ));
             assert_eq!(loop_fact.carriers.len(), 3);
             let component = projected_peer_certificate_component(loop_fact);
-            assert!(loop_fact
-                .carriers
-                .iter()
-                .all(|carrier| component.contains(&carrier.phi)));
+            assert!(
+                loop_fact
+                    .carriers
+                    .iter()
+                    .all(|carrier| component.contains(&carrier.phi))
+            );
             let leader = loop_fact
                 .carriers
                 .iter()
@@ -8307,12 +8314,14 @@ mod tests {
             prepared.storage_spans(),
             Some(prepared.machine_context()),
         ));
-        assert!(loop_fact.carriers.iter().all(|carrier| carrier
-            .members
-            .iter()
-            .all(|member| !member
-                .roles
-                .contains(&crate::LoopCarrierMemberRole::ProjectedPeer))));
+        assert!(
+            loop_fact
+                .carriers
+                .iter()
+                .all(|carrier| carrier.members.iter().all(|member| !member
+                    .roles
+                    .contains(&crate::LoopCarrierMemberRole::ProjectedPeer)))
+        );
     }
 
     #[test]
@@ -9289,8 +9298,14 @@ mod tests {
         // is what the machine holds there: the two parts, concatenated.
         let low_half = source_of("tmp:affected_low_half").expect("low half source");
         let (hi, lo) = piece_of(&low_half.name).expect("low half is pieced");
-        assert_eq!(subpiece_of(&hi.name), Some((SSAVar::new("tmp:new_mid", 1, 8), 0)));
-        assert_eq!(subpiece_of(&lo.name), Some((SSAVar::new("tmp:wide", 1, 16), 0)));
+        assert_eq!(
+            subpiece_of(&hi.name),
+            Some((SSAVar::new("tmp:new_mid", 1, 8), 0))
+        );
+        assert_eq!(
+            subpiece_of(&lo.name),
+            Some((SSAVar::new("tmp:wide", 1, 16), 0))
+        );
 
         // The whole register is the same story across three parts.
         let whole = source_of("tmp:unresolved_whole").expect("whole source");
@@ -9301,7 +9316,10 @@ mod tests {
         );
         let (mid, low) = piece_of(&whole_lo.name).expect("whole low is pieced");
         assert_eq!(mid, SSAVar::new("tmp:new_mid", 1, 8));
-        assert_eq!(subpiece_of(&low.name), Some((SSAVar::new("tmp:wide", 1, 16), 0)));
+        assert_eq!(
+            subpiece_of(&low.name),
+            Some((SSAVar::new("tmp:wide", 1, 16), 0))
+        );
     }
 
     #[test]
@@ -10343,8 +10361,16 @@ mod tests {
         );
         assert!(
             [entry_sp, local_address].iter().all(|value| {
-                let name = &artifact.graph().value(*value).expect("graph value").var.name;
-                !matches!(name.to_ascii_lowercase().as_str(), "sp" | "rsp" | "fp" | "rbp")
+                let name = &artifact
+                    .graph()
+                    .value(*value)
+                    .expect("graph value")
+                    .var
+                    .name;
+                !matches!(
+                    name.to_ascii_lowercase().as_str(),
+                    "sp" | "rsp" | "fp" | "rbp"
+                )
             }),
             "the typed ValueId projection must not depend on conventional raw aliases"
         );

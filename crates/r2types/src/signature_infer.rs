@@ -891,7 +891,7 @@ fn infer_signature_return_type_from_prepared(
         .iter()
         .map(|certificate| {
             transparent_return_source_value(prepared, certificate.value)
-                .unwrap_or(certificate.value)
+                .unwrap_or((certificate.value, None))
         })
         .collect::<Vec<_>>();
     return_values.sort();
@@ -906,8 +906,9 @@ fn infer_signature_return_type_from_prepared(
 fn transparent_return_source_value(
     prepared: &SsaArtifact,
     start: r2ssa::ValueId,
-) -> Option<r2ssa::ValueId> {
+) -> Option<(r2ssa::ValueId, Option<Signedness>)> {
     let mut current = start;
+    let mut signedness = None;
     let mut visited = HashSet::new();
     while visited.insert(current) {
         let Some(inst) = prepared
@@ -915,22 +916,28 @@ fn transparent_return_source_value(
             .def_inst(current)
             .and_then(|inst| prepared.graph().inst(inst))
         else {
-            return Some(current);
+            return Some((current, signedness));
         };
         let r2ssa::InstPayload::Op(op) = &inst.payload else {
-            return Some(current);
+            return Some((current, signedness));
         };
         match op {
+            SSAOp::IntZExt { .. } if signedness.is_none() => {
+                signedness = Some(Signedness::Unsigned);
+            }
+            SSAOp::IntSExt { .. } if signedness.is_none() => {
+                signedness = Some(Signedness::Signed);
+            }
             SSAOp::Copy { .. }
             | SSAOp::New { .. }
             | SSAOp::IntZExt { .. }
             | SSAOp::IntSExt { .. }
             | SSAOp::Trunc { .. }
             | SSAOp::Subpiece { offset: 0, .. } => {}
-            _ => return Some(current),
+            _ => return Some((current, signedness)),
         };
         let Some(source_value) = inst.inputs.first().copied() else {
-            return Some(current);
+            return Some((current, signedness));
         };
         current = source_value;
     }
@@ -955,21 +962,27 @@ fn exact_signature_type_evidence(ty: &CTypeLike) -> SignatureTypeEvidence {
 
 fn infer_signature_return_type_from_values(
     prepared: &SsaArtifact,
-    return_values: &[r2ssa::ValueId],
+    return_values: &[(r2ssa::ValueId, Option<Signedness>)],
     evidence_types: &crate::EvidenceTypes,
     ptr_bits: u32,
 ) -> (CTypeLike, SignatureTypeEvidence) {
     let mut candidates = Vec::new();
     let mut candidate_evidence = Vec::new();
     let mut candidate_constants = Vec::new();
-    for value in return_values {
+    for (value, signedness) in return_values {
         let Some(var) = prepared.value_var(*value) else {
             continue;
         };
-        let initial_ty = evidence_types
+        let mut initial_ty = evidence_types
             .value_type(*value)
             .cloned()
             .unwrap_or_else(|| fallback_scalar_type_like(var.size, &Default::default(), ptr_bits));
+        if let (CTypeLike::Int { bits, .. }, Some(signedness)) = (&initial_ty, signedness) {
+            initial_ty = CTypeLike::Int {
+                bits: *bits,
+                signedness: *signedness,
+            };
+        }
         let evidence = exact_signature_type_evidence(&initial_ty);
         let ty = resolve_evidence_driven_signature_type(initial_ty, var.size, ptr_bits, &evidence);
         candidates.push(ty);

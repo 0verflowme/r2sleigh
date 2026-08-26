@@ -654,7 +654,10 @@ pub struct SourceFormalParameterFact {
     pub index: u32,
     pub abi_storage: CanonicalStorageId,
     pub graph_storage: CanonicalStorageId,
-    pub logical_value: SourceLogicalValue,
+    /// Exact logical projection when the source supplied one. A full-width
+    /// physical ABI parameter remains authoritative without a type graph; in
+    /// that case `graph_storage == abi_storage` and this field is absent.
+    pub logical_value: Option<SourceLogicalValue>,
     pub value: ValueId,
 }
 
@@ -1325,8 +1328,7 @@ impl PreparedFunctionFacts {
             .flat_map(|context| context.abi_model().return_registers())
             .map(|slot| slot.storage())
             .collect::<Vec<_>>();
-        let live_out =
-            crate::liveout::FunctionLiveOut::compute(function, graph, &return_storages);
+        let live_out = crate::liveout::FunctionLiveOut::compute(function, graph, &return_storages);
         let structured = collect_structured_dataflow_facts(
             function,
             graph,
@@ -2654,31 +2656,29 @@ pub(crate) fn collect_source_formal_parameter_facts(
     graph: &SsaGraph,
     machine_context: &SourceMachineContext,
 ) -> BTreeMap<u32, SourceFormalParameterFact> {
-    if !machine_context.abi_model().is_available()
-        || !machine_context.abi_model().is_coherent()
-    {
+    // Whole-ABI coherence also covers return and stack roles. Those unrelated
+    // roles cannot invalidate an exact parameter/type projection; each slot is
+    // checked against the interface and graph below before it becomes a fact.
+    if !machine_context.abi_model().is_available() {
         return BTreeMap::new();
     }
     let Some(interface) = machine_context.function_interface() else {
         return BTreeMap::new();
     };
-    let Some(type_graph) = interface.type_graph() else {
-        return BTreeMap::new();
-    };
     if interface.schema_version() != SOURCE_FUNCTION_INTERFACE_SCHEMA_VERSION
-        || type_graph.schema_version() != SOURCE_TYPE_GRAPH_SCHEMA_VERSION
-        || interface.parameters().len() != interface.parameter_logical_values().len()
-        || machine_context.abi_model().argument_registers().len() != interface.parameters().len()
+        || match interface.type_graph() {
+            Some(type_graph) => {
+                type_graph.schema_version() != SOURCE_TYPE_GRAPH_SCHEMA_VERSION
+                    || interface.parameters().len() != interface.parameter_logical_values().len()
+            }
+            None => !interface.parameter_logical_values().is_empty(),
+        }
     {
         return BTreeMap::new();
     }
 
     let mut facts = BTreeMap::new();
-    for (parameter, logical_value) in interface
-        .parameters()
-        .iter()
-        .zip(interface.parameter_logical_values())
-    {
+    for (parameter_position, parameter) in interface.parameters().iter().enumerate() {
         let abi_storage = parameter.storage();
         if machine_context
             .abi_model()
@@ -2690,10 +2690,21 @@ pub(crate) fn collect_source_formal_parameter_facts(
         {
             continue;
         }
-        let Some(graph_storage) =
-            projected_formal_parameter_storage(abi_storage, *logical_value, type_graph)
-        else {
-            continue;
+        let logical_value = interface
+            .parameter_logical_values()
+            .get(parameter_position)
+            .copied();
+        let graph_storage = match (logical_value, interface.type_graph()) {
+            (Some(logical_value), Some(type_graph)) => {
+                let Some(storage) =
+                    projected_formal_parameter_storage(abi_storage, logical_value, type_graph)
+                else {
+                    continue;
+                };
+                storage
+            }
+            (None, None) => abi_storage,
+            (Some(_), None) | (None, Some(_)) => continue,
         };
         let candidates = graph
             .values
@@ -2713,7 +2724,7 @@ pub(crate) fn collect_source_formal_parameter_facts(
                     index: parameter.index(),
                     abi_storage,
                     graph_storage,
-                    logical_value: *logical_value,
+                    logical_value,
                     value: *value,
                 },
             );
@@ -7308,6 +7319,37 @@ mod tests {
         .expect("dual-space artifact")
     }
 
+    fn dual_space_exact_parameter_artifact(arch: &ArchSpec) -> SsaArtifact {
+        let mut block = R2ILBlock::new(0x1000, 4);
+        block.push(R2ILOp::Load {
+            dst: Varnode::unique(0x100, 8),
+            space: SpaceId::Ram,
+            addr: Varnode::register(0, 8),
+        });
+        block.push(R2ILOp::Load {
+            dst: Varnode::unique(0x108, 8),
+            space: SpaceId::Custom(7),
+            addr: Varnode::register(0, 8),
+        });
+        let interface = SourceFunctionInterface::new_exact(
+            b"dual-space-exact-parameter".to_vec(),
+            "aarch64-test",
+            [SourceAbiParameterSpec::new(
+                0,
+                CanonicalStorageId {
+                    space: CanonicalStorageSpace::Register,
+                    offset: 0,
+                    size: 8,
+                },
+            )],
+            SourceFunctionReturn::Void,
+            [],
+        )
+        .expect("valid exact parameter interface");
+        SsaArtifact::for_decompile_with_interface(&[block], Some(arch), interface)
+            .expect("dual-space exact parameter artifact")
+    }
+
     fn dual_space_locations(artifact: &SsaArtifact) -> (MemoryLocation, MemoryLocation) {
         let block = artifact.get_block(0x1000).expect("dual-space block");
         let mut loads = block
@@ -7389,7 +7431,7 @@ mod tests {
         arch.add_register(RegisterDef::new("x0", 0, 8));
         arch.add_register(RegisterDef::new("sp", 16, 8));
 
-        let parameter = dual_space_artifact(Vec::new(), Varnode::register(0, 8), Some(&arch));
+        let parameter = dual_space_exact_parameter_artifact(&arch);
         assert_dual_space_objects_are_distinct(&parameter);
         let (ram_parameter, custom_parameter) = dual_space_locations(&parameter);
         assert!(matches!(

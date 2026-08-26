@@ -1707,11 +1707,7 @@ fn exact_source_param_slot_resolver(source: &r2ssa::SsaArtifact) -> Option<Param
     let context = source.machine_context();
     let interface = context.function_interface()?;
     let abi = context.abi_model();
-    if !abi.is_available()
-        || !abi.is_coherent()
-        || abi.argument_registers().len() != interface.parameters().len()
-        || source.facts().boundaries.parameters.len() != interface.parameters().len()
-    {
+    if !abi.is_available() {
         return None;
     }
     let mut resolver = ParamSlotResolver::default();
@@ -5634,8 +5630,7 @@ mod tests {
         block.push(R2ILOp::Call {
             target: Varnode::constant(0x402000, 8),
         });
-        let prepared = r2ssa::SsaArtifact::for_decompile(&[block], Some(&x86_stack_home_arch()))
-            .expect("prepared");
+        let prepared = x86_stack_home_prepared(&[block]);
         let callsite = CallsiteKey {
             block_addr: 0x401000,
             op_index: 0,
@@ -5807,8 +5802,7 @@ mod tests {
             space: SpaceId::Ram,
             addr: Varnode::unique(0x100, 8),
         });
-        let prepared = r2ssa::SsaArtifact::for_decompile(&[block], Some(&x86_stack_home_arch()))
-            .expect("prepared");
+        let prepared = x86_stack_home_prepared(&[block]);
         let type_facts = FunctionTypeFacts {
             field_access_certificates: vec![crate::facts::FieldAccessCertificate {
                 slot: 0,
@@ -5877,11 +5871,7 @@ mod tests {
         exit.push(R2ILOp::Return {
             target: Varnode::register(0x08, 8),
         });
-        let prepared = r2ssa::SsaArtifact::for_decompile(
-            &[entry, header, latch, exit],
-            Some(&x86_stack_home_arch()),
-        )
-        .expect("prepared loop");
+        let prepared = x86_stack_home_prepared(&[entry, header, latch, exit]);
         let type_facts = FunctionTypeFacts {
             field_access_certificates: vec![
                 crate::facts::FieldAccessCertificate {
@@ -5964,8 +5954,7 @@ mod tests {
             space: SpaceId::Ram,
             addr: Varnode::unique(0x100, 8),
         });
-        let prepared = r2ssa::SsaArtifact::for_decompile(&[block], Some(&x86_stack_home_arch()))
-            .expect("prepared");
+        let prepared = x86_stack_home_prepared(&[block]);
         let type_facts = FunctionTypeFacts {
             field_access_certificates: vec![crate::facts::FieldAccessCertificate {
                 slot: 0,
@@ -6004,8 +5993,7 @@ mod tests {
             space: SpaceId::Ram,
             addr: Varnode::unique(0x100, 8),
         });
-        let prepared = r2ssa::SsaArtifact::for_decompile(&[block], Some(&x86_stack_home_arch()))
-            .expect("prepared");
+        let prepared = x86_stack_home_prepared(&[block]);
         let type_facts = FunctionTypeFacts {
             field_access_certificates: vec![crate::facts::FieldAccessCertificate {
                 slot: 0,
@@ -6076,10 +6064,14 @@ mod tests {
         };
         let frame_pointer = register_storage(0x20);
         let parameter = register_storage(0x10);
+        let second_parameter = register_storage(0x18);
         let interface = r2ssa::SourceFunctionInterface::new_exact(
             b"x86-stack-home-fixture".to_vec(),
             "sysv64",
-            [r2ssa::SourceAbiParameterSpec::new(0, parameter)],
+            [
+                r2ssa::SourceAbiParameterSpec::new(0, parameter),
+                r2ssa::SourceAbiParameterSpec::new(1, second_parameter),
+            ],
             r2ssa::SourceFunctionReturn::Register {
                 storage: register_storage(0x00),
             },
@@ -6328,8 +6320,7 @@ mod tests {
         block.push(R2ILOp::Return {
             target: Varnode::constant(0, 8),
         });
-        let prepared = r2ssa::SsaArtifact::for_decompile(&[block], Some(&x86_stack_home_arch()))
-            .expect("prepared");
+        let prepared = x86_stack_home_prepared(&[block]);
         let render = FunctionRenderFacts::from_prepared(&prepared);
         let read = render
             .memory_accesses()
@@ -6358,8 +6349,7 @@ mod tests {
         block.push(R2ILOp::Return {
             target: Varnode::constant(0, 8),
         });
-        let prepared = r2ssa::SsaArtifact::for_decompile(&[block], Some(&x86_stack_home_arch()))
-            .expect("prepared");
+        let prepared = x86_stack_home_prepared(&[block]);
         let render = FunctionRenderFacts::from_prepared(&prepared);
         let read = render
             .memory_accesses()
@@ -6387,8 +6377,7 @@ mod tests {
         block.push(R2ILOp::Return {
             target: Varnode::unique(0x108, 8),
         });
-        let prepared = r2ssa::SsaArtifact::for_decompile(&[block], Some(&x86_stack_home_arch()))
-            .expect("prepared");
+        let prepared = x86_stack_home_prepared(&[block]);
         let mut facts = FunctionFacts::default();
         facts.attach_prepared_decompile_evidence(&prepared);
         facts.populate_certified_parameter_exprs(&prepared, &x86_stack_home_param_slots(&prepared));
@@ -6587,8 +6576,7 @@ mod tests {
             space: SpaceId::Ram,
             addr: Varnode::unique(0x118, 8),
         });
-        let prepared = r2ssa::SsaArtifact::for_decompile(&[block], Some(&x86_stack_home_arch()))
-            .expect("prepared");
+        let prepared = x86_stack_home_prepared(&[block]);
         let index_value = prepared
             .memory_certificate_for_op_site(0x401000, 4, false)
             .expect("array load certificate")
@@ -6668,8 +6656,7 @@ mod tests {
             space: SpaceId::Ram,
             addr: Varnode::register(0x18, 8),
         });
-        let prepared = r2ssa::SsaArtifact::for_decompile(&[block], Some(&x86_stack_home_arch()))
-            .expect("prepared");
+        let prepared = x86_stack_home_prepared(&[block]);
         let type_facts_for_slot = |slot| FunctionTypeFacts {
             array_index_certificates: vec![crate::facts::ArrayIndexCertificate {
                 slot,

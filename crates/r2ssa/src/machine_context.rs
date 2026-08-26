@@ -1462,7 +1462,7 @@ fn collect_raw_call_site_identities(
                 .iter()
                 .enumerate()
                 .filter_map(move |(op_index, op)| match op {
-                    R2ILOp::Call { target } => Some((
+                    R2ILOp::Call { target } | R2ILOp::CallInd { target } => Some((
                         block.addr,
                         op_index,
                         Some(SourceCallSiteIdentity::new(
@@ -1471,7 +1471,6 @@ fn collect_raw_call_site_identities(
                             CanonicalStorageId::from_varnode(target),
                         )),
                     )),
-                    R2ILOp::CallInd { .. } => Some((block.addr, op_index, None)),
                     _ => None,
                 })
         })
@@ -2846,12 +2845,16 @@ mod tests {
     }
 
     #[test]
-    fn raw_direct_callsite_ids_are_sorted_and_retain_exact_targets() {
+    fn raw_callsite_ids_are_sorted_and_retain_exact_direct_and_indirect_targets() {
         let low_target = Varnode::ram(0x3000, 8);
         let high_target = Varnode::ram(0x4000, 8);
+        let indirect_target = Varnode::register(0x18, 8);
         let mut high = R2ILBlock::new(0x2000, 4);
         high.push(R2ILOp::Call {
             target: high_target.clone(),
+        });
+        high.push(R2ILOp::CallInd {
+            target: indirect_target.clone(),
         });
         let mut low = R2ILBlock::new(0x1000, 4);
         low.push(R2ILOp::Call {
@@ -2873,6 +2876,14 @@ mod tests {
                 0x2000,
                 0,
                 CanonicalStorageId::from_varnode(&high_target),
+            ))
+        );
+        assert_eq!(
+            context.raw_call_site_identity(CallSiteId(2)),
+            Some(SourceCallSiteIdentity::new(
+                0x2000,
+                1,
+                CanonicalStorageId::from_varnode(&indirect_target),
             ))
         );
     }

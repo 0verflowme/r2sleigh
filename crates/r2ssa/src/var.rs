@@ -25,6 +25,8 @@ pub enum SSAVarNameKind {
 
 impl SSAVarNameKind {
     pub fn classify(name: &str) -> Self {
+        let name = name.to_ascii_lowercase();
+        let name = name.as_str();
         if name.strip_prefix("reg:").is_some() {
             Self::RegisterAlias
         } else if name.strip_prefix("tmp:").is_some() || name.strip_prefix("unique:").is_some() {
@@ -309,6 +311,10 @@ mod tests {
             assert_eq!(SSAVarNameKind::classify(name), expected);
             assert_eq!(SSAVar::new(name, 0, 8).name_kind(), expected);
         }
+        assert_eq!(
+            SSAVarNameKind::classify("CONST:0x42"),
+            SSAVarNameKind::Constant
+        );
     }
 
     #[test]
